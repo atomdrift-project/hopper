@@ -377,3 +377,37 @@ func TestSamplesByLabel(t *testing.T) {
 		t.Errorf("got %d, want 2", len(got))
 	}
 }
+
+func TestSanitizeJSONB(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty", "", ""},
+		{"no escapes", `{"a":"b"}`, `{"a":"b"}`},
+		// Single-backslash \u0000 should be stripped.
+		{"null escape", `{"v":"\u0000"}`, `{"v":""}`},
+		// Double-backslash \\u0000 is a literal backslash + "u0000" — must be preserved.
+		{"escaped backslash u0000", `{"v":"\\u0000"}`, `{"v":"\\u0000"}`},
+		// \x86 (single backslash) → \u0086
+		{"hex escape", `{"v":"\x86"}`, `{"v":"\u0086"}`},
+		// \\x86 is a literal backslash + "x86" — must be preserved.
+		{"escaped backslash x86", `{"v":"\\x86"}`, `{"v":"\\x86"}`},
+		// Mixed: real null inside a range pattern.
+		{"null in range", `{"v":"/[^\u0000-\u001f]/"}`, `{"v":"/[^-\u001f]/"}`},
+		// \\u0000 inside a JS regex pattern should be left alone.
+		{"escaped null in range", `{"v":"/[^\\u0000-\\u001f]/"}`, `{"v":"/[^\\u0000-\\u001f]/"}`},
+		// \x00 → \u0000 → stripped
+		{"hex null", `{"v":"\x00"}`, `{"v":""}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := string(sanitizeJSONB([]byte(tt.in)))
+			if got != tt.want {
+				t.Errorf("sanitizeJSONB(%q)\n  got  %q\n  want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}

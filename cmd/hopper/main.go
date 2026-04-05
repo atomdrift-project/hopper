@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -69,6 +70,15 @@ func run(ctx context.Context) error {
 	}
 }
 
+// redactDSN strips the password from a DSN for safe logging.
+func redactDSN(dsn string) string {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return dsn
+	}
+	return u.Redacted()
+}
+
 func openDB(ctx context.Context, dsn string) (*hopper.DB, error) {
 	if dsn == "" {
 		dsn = os.Getenv("DATABASE_URL")
@@ -76,7 +86,7 @@ func openDB(ctx context.Context, dsn string) (*hopper.DB, error) {
 	if dsn == "" {
 		dsn = "postgres://hopper@localhost:5432/hopper"
 	}
-	slog.Info("connecting to database", "dsn", dsn)
+	slog.Info("connecting to database", "dsn", redactDSN(dsn)) //nolint:gosec // dsn is redacted before logging
 	return hopper.Open(ctx, dsn)
 }
 

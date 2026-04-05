@@ -118,10 +118,10 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256) DO NOTHING`)
 	if err != nil {
-		tx.Rollback() //nolint:errcheck,gosec
+		tx.Rollback() //nolint:errcheck,gosec // best-effort rollback on prepare error
 		return 0, fmt.Errorf("hopper: prepare batch: %w", err)
 	}
-	defer stmt.Close() //nolint:errcheck
+	defer stmt.Close() //nolint:errcheck // best-effort cleanup
 
 	var inserted int64
 	for _, s := range samples {
@@ -129,7 +129,7 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256)
 		if err != nil {
-			tx.Rollback() //nolint:errcheck,gosec
+			tx.Rollback() //nolint:errcheck,gosec // best-effort rollback on insert error
 			return inserted, fmt.Errorf("hopper: batch insert %s: %w", s.SHA256, err)
 		}
 		if n, err := res.RowsAffected(); err == nil {

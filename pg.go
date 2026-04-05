@@ -112,7 +112,7 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (int64
 	if err != nil {
 		return 0, fmt.Errorf("hopper: begin batch: %w", err)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
+	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
 
 	if _, err := tx.Exec(ctx, insertBatchStagingDDL); err != nil {
 		return 0, fmt.Errorf("hopper: create staging: %w", err)
@@ -143,7 +143,7 @@ func (db *DB) updateCleaveResultPG(ctx context.Context, sha256 string, result []
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET cleave_result = $2, risk = $3, finding_count = $4,
 			canonical_sha256 = $5, analyzed_at = now(), updated_at = now()
-		WHERE sha256 = $1`, sha256, result, risk, findings, canonical)
+		WHERE sha256 = $1`, sha256, sanitizeJSONB(result), risk, findings, canonical)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
 	}
@@ -230,7 +230,7 @@ func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result 
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET status = $2, cleave_result = $3, risk = $4, finding_count = $5,
 			canonical_sha256 = $6, analyzed_at = now(), updated_at = now()
-		WHERE sha256 = $1`, sha256, status, result, risk, findings, canonical)
+		WHERE sha256 = $1`, sha256, status, sanitizeJSONB(result), risk, findings, canonical)
 	if err != nil {
 		return fmt.Errorf("hopper: update sample: %w", err)
 	}

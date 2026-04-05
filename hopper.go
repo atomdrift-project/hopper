@@ -7,6 +7,7 @@
 package hopper
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	_ "embed"
@@ -18,6 +19,66 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/mattn/go-sqlite3" // register sqlite3 driver
 )
+
+// sanitizeJSONB fixes JSON that is valid in lenient parsers but rejected by
+// PostgreSQL's strict JSONB parser:
+//   - \u0000 (null bytes): PG uses C-style null-terminated strings internally
+//   - \xNN (hex escapes): not valid JSON, must be \u00NN
+//
+// Both are common in malware analysis output where cleave reports binary
+// strings as-is. Only single-backslash sequences are replaced; \\u0000 and
+// \\xNN (escaped backslash + literal text) are left intact.
+func sanitizeJSONB(b []byte) []byte {
+	if len(b) == 0 {
+		return b
+	}
+	needsHex := bytes.Contains(b, []byte(`\x`))
+	needsNull := bytes.Contains(b, []byte(`\u0000`))
+	if !needsHex && !needsNull {
+		return b
+	}
+
+	// Single pass: scan for backslash sequences, rewriting as needed.
+	// We track whether the current backslash is escaped (preceded by \).
+	out := make([]byte, 0, len(b))
+	for i := 0; i < len(b); i++ {
+		if b[i] != '\\' || i+1 >= len(b) {
+			out = append(out, b[i])
+			continue
+		}
+
+		next := b[i+1]
+		switch {
+		case next == '\\':
+			// Escaped backslash — emit both and skip ahead so the
+			// second \ is not treated as starting a new escape.
+			out = append(out, '\\', '\\')
+			i++
+
+		case next == 'x' && needsHex && i+3 < len(b) && isHex(b[i+2]) && isHex(b[i+3]):
+			// \xNN → \u00NN, but drop \x00 entirely (it becomes \u0000)
+			if b[i+2] == '0' && b[i+3] == '0' {
+				i += 3
+			} else {
+				out = append(out, `\u00`...)
+				out = append(out, b[i+2], b[i+3])
+				i += 3
+			}
+
+		case next == 'u' && needsNull && i+5 < len(b) && b[i+2] == '0' && b[i+3] == '0' && b[i+4] == '0' && b[i+5] == '0':
+			// \u0000 → drop entirely
+			i += 5
+
+		default:
+			out = append(out, b[i])
+		}
+	}
+	return out
+}
+
+func isHex(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
 
 //go:embed schema.sql
 var schemaPG string

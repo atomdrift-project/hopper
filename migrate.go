@@ -226,7 +226,14 @@ func migrateLegacyPG(ctx context.Context, dst *DB, rows *sql.Rows, total int64) 
 		label := labelFromLegacyStatus(status)
 		var cleaveResult []byte
 		if cleaveJSON.Valid && cleaveJSON.String != "" {
-			cleaveResult = []byte(cleaveJSON.String)
+			cleaveResult = sanitizeJSONB([]byte(cleaveJSON.String))
+		}
+		// PG JSONB has a 256MB limit per value.
+		const maxJSONB = 268_435_455
+		if len(cleaveResult) > maxJSONB {
+			slog.Warn("cleave result exceeds PG JSONB limit, storing without result",
+				"sha256", sha256, "size_bytes", len(cleaveResult))
+			cleaveResult = nil
 		}
 		canonical := canonicalSHA(sha256, cleaveResult)
 
@@ -525,7 +532,7 @@ func flushSamplesPG(ctx context.Context, dst *DB, samples []*Sample) (int64, err
 		rows[i] = []any{
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
-			s.Note, s.CanonicalSHA256, s.Risk, s.FindingCount, s.CleaveResult,
+			s.Note, s.CanonicalSHA256, s.Risk, s.FindingCount, sanitizeJSONB(s.CleaveResult),
 			s.AnalyzedAt, s.CreatedAt, s.UpdatedAt,
 		}
 	}
@@ -620,7 +627,29 @@ func flushReportsSQLite(ctx context.Context, dst *DB, reports []*Report) (int64,
 // copyBatchPG writes rows to PG via COPY into a temp staging table, then
 // inserts into the real table with ON CONFLICT handling. The staging table
 // is created with ON COMMIT DROP so it is cleaned up automatically.
+//
+// If COPY fails (e.g. invalid Unicode in JSONB), falls back to row-by-row
+// inserts so only the bad rows are skipped.
 func copyBatchPG(ctx context.Context, dst *DB, ddl, insertSQL string, cols []string, rows [][]any) (int64, error) {
+	n, err := copyBatchPGFast(ctx, dst, ddl, insertSQL, cols, rows)
+	if err == nil {
+		return n, nil
+	}
+
+	// Log the COPY error with batch context and fall back to row-by-row.
+	firstSHA := "<unknown>"
+	if len(rows) > 0 && len(rows[0]) > 0 {
+		if s, ok := rows[0][0].(string); ok {
+			firstSHA = s
+		}
+	}
+	slog.Warn("COPY batch failed, falling back to row-by-row",
+		"error", err, "batch_size", len(rows), "first_sha256", firstSHA)
+
+	return copyBatchPGSlow(ctx, dst, ddl, insertSQL, cols, rows)
+}
+
+func copyBatchPGFast(ctx context.Context, dst *DB, ddl, insertSQL string, cols []string, rows [][]any) (int64, error) {
 	tx, err := dst.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin: %w", err)
@@ -644,6 +673,28 @@ func copyBatchPG(ctx context.Context, dst *DB, ddl, insertSQL string, cols []str
 		return 0, fmt.Errorf("commit: %w", err)
 	}
 	return tag.RowsAffected(), nil
+}
+
+// copyBatchPGSlow inserts rows one at a time via individual transactions,
+// logging and skipping any that fail. Used as a fallback when COPY hits
+// encoding or data errors.
+func copyBatchPGSlow(ctx context.Context, dst *DB, ddl, insertSQL string, cols []string, rows [][]any) (int64, error) {
+	var inserted int64
+	for _, row := range rows {
+		n, err := copyBatchPGFast(ctx, dst, ddl, insertSQL, cols, [][]any{row})
+		if err != nil {
+			sha := "<unknown>"
+			if len(row) > 0 {
+				if s, ok := row[0].(string); ok {
+					sha = s
+				}
+			}
+			slog.Warn("skipping row", "sha256", sha, "error", err)
+			continue
+		}
+		inserted += n
+	}
+	return inserted, nil
 }
 
 func labelFromLegacyStatus(status string) string {
