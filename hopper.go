@@ -140,6 +140,20 @@ func (db *DB) InsertSampleNew(ctx context.Context, s *Sample) (bool, error) {
 	return db.insertSampleNewSQLite(ctx, s)
 }
 
+// InsertSampleBatch inserts multiple samples in a single transaction/COPY.
+// Returns the number of new rows inserted (duplicates are silently skipped).
+// Much faster than calling InsertSampleNew in a loop, especially for SQLite
+// where each individual INSERT acquires the single-writer lock.
+func (db *DB) InsertSampleBatch(ctx context.Context, samples []*Sample) (int64, error) {
+	if len(samples) == 0 {
+		return 0, nil
+	}
+	if db.pool != nil {
+		return db.insertSampleBatchPG(ctx, samples)
+	}
+	return db.insertSampleBatchSQLite(ctx, samples)
+}
+
 // SampleBySHA256 retrieves a sample by its hash.
 // Returns ErrNotFound if no such sample exists.
 func (db *DB) SampleBySHA256(ctx context.Context, sha256 string) (*Sample, error) {
@@ -257,12 +271,17 @@ func (db *DB) CountByStatusInPaths(ctx context.Context, prefixes []string) (map[
 	return db.countByStatusInPathsSQLite(ctx, prefixes)
 }
 
-// AgesByPaths returns a map of path → updated_at for samples under the given prefixes.
-func (db *DB) AgesByPaths(ctx context.Context, prefixes []string) (map[string]time.Time, error) {
-	if db.pool != nil {
-		return db.agesByPathsPG(ctx, prefixes)
+// AgesByPaths returns a map of path → updated_at for samples under the given
+// prefixes. Results are limited to avoid unbounded memory usage; pass 0 for
+// a reasonable default (10000).
+func (db *DB) AgesByPaths(ctx context.Context, prefixes []string, limit int) (map[string]time.Time, error) {
+	if limit <= 0 {
+		limit = 10000
 	}
-	return db.agesByPathsSQLite(ctx, prefixes)
+	if db.pool != nil {
+		return db.agesByPathsPG(ctx, prefixes, limit)
+	}
+	return db.agesByPathsSQLite(ctx, prefixes, limit)
 }
 
 // StaleSamples returns samples under the given path prefixes whose updated_at

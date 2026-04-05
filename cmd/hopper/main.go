@@ -74,8 +74,9 @@ func openDB(ctx context.Context, dsn string) (*hopper.DB, error) {
 		dsn = os.Getenv("DATABASE_URL")
 	}
 	if dsn == "" {
-		return nil, errors.New("set DATABASE_URL or pass --db")
+		dsn = "postgres://hopper@localhost:5432/hopper"
 	}
+	slog.Info("connecting to database", "dsn", dsn)
 	return hopper.Open(ctx, dsn)
 }
 
@@ -179,14 +180,17 @@ func cmdImportLegacy(ctx context.Context) error {
 		return errors.New("pass --from /path/to/cyclotron.db")
 	}
 
+	slog.Info("opening legacy database", "path", *legacy, "resume_after", *after)
 	db, err := openDB(ctx, *dsn)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
+	slog.Info("running schema migrations")
 	if err := db.Migrate(ctx); err != nil {
 		return err
 	}
+	slog.Info("schema up to date, starting legacy import")
 
 	n, err := hopper.MigrateLegacy(ctx, db, *legacy, *after)
 	if err != nil {
@@ -213,16 +217,19 @@ func cmdImport(ctx context.Context) error {
 		return err
 	}
 	defer dst.Close()
+	slog.Info("running schema migrations on destination")
 	if err := dst.Migrate(ctx); err != nil {
 		return err
 	}
 
+	slog.Info("opening source database", "dsn", *srcDSN)
 	src, err := hopper.Open(ctx, *srcDSN)
 	if err != nil {
 		return fmt.Errorf("open source: %w", err)
 	}
 	defer src.Close()
 
+	slog.Info("starting transfer", "resume_after_sample", *afterSample, "resume_after_report", *afterReport)
 	samples, reports, err := hopper.TransferSamples(ctx, dst, src, *afterSample, *afterReport)
 	if err != nil {
 		return err
@@ -248,11 +255,16 @@ func cmdLoad(ctx context.Context) error {
 		return errors.New("pass --bad and/or --good")
 	}
 
+	slog.Info("load starting", "bad", *bad, "good", *good, "workers", *workers, "rescan", *rescan)
 	db, err := openDB(ctx, *dsn)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
+	slog.Info("running schema migrations")
+	if err := db.Migrate(ctx); err != nil {
+		return err
+	}
 
 	// Collect directories for cleave's --dangerous-local-file-paths.
 	var dirs []string
@@ -306,50 +318,152 @@ type loadJob struct {
 	sha  string // set after hashing
 }
 
+// hashedFile is a file that has been read and hashed, ready for DB insert.
+type hashedFile struct {
+	sample *hopper.Sample
+	path   string
+}
+
+// loadProgress tracks counters across concurrent load workers.
+type loadProgress struct {
+	walked   atomic.Int64
+	hashed   atomic.Int64
+	inserted atomic.Int64
+	skipped  atomic.Int64
+	analyzed atomic.Int64
+	errors   atomic.Int64
+}
+
+const loadBatchSize = 500
+
 func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, dir, label, source string, nworkers int, rescan bool) int {
+	slog.Info("loading directory", "dir", dir, "label", label, "workers", nworkers)
+	start := time.Now()
+	var progress loadProgress
+
 	paths := make(chan string, nworkers*2)
-	var wg sync.WaitGroup
-	var count atomic.Int64
+	hashed := make(chan hashedFile, nworkers*2)
+	var hashWG sync.WaitGroup
 
 	// Analysis queue: nil if cleave is not configured.
 	var analyzeQueue chan loadJob
 	var analyzeWG sync.WaitGroup
 	if cleave != nil {
 		analyzeQueue = make(chan loadJob, cleave.Workers()*2)
-		startAnalysisWorkers(ctx, db, cleave, analyzeQueue, &analyzeWG)
+		startAnalysisWorkers(ctx, db, cleave, analyzeQueue, &analyzeWG, &progress)
 	}
 
-	// Hash/insert workers.
+	// Periodic progress reporting.
+	ticker := time.NewTicker(5 * time.Second)
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				elapsed := time.Since(start).Seconds()
+				slog.Info("load progress", "dir", dir,
+					"walked", progress.walked.Load(), "hashed", progress.hashed.Load(),
+					"inserted", progress.inserted.Load(),
+					"skipped", progress.skipped.Load(), "analyzed", progress.analyzed.Load(),
+					"errors", progress.errors.Load(),
+					"files_per_sec", int(float64(progress.hashed.Load())/elapsed))
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// Hash workers: read files and compute SHA256, send to batch inserter.
 	for range nworkers {
-		wg.Go(func() {
+		hashWG.Go(func() {
 			for path := range paths {
 				if ctx.Err() != nil {
 					return
 				}
-				sha, isNew, err := loadFile(ctx, db, path, label, source)
+				sample, err := hashFile(path, label, source)
 				if err != nil {
+					progress.errors.Add(1)
 					slog.Warn("skipping file", "path", path, "error", err)
 					continue
 				}
-				count.Add(1)
-				enqueueAnalysis(ctx, analyzeQueue, path, sha, isNew, rescan)
+				progress.hashed.Add(1)
+				select {
+				case hashed <- hashedFile{sample: sample, path: path}:
+				case <-ctx.Done():
+					return
+				}
 			}
 		})
 	}
 
-	walkFiles(ctx, dir, paths)
+	// Batch inserter: collects hashed files and flushes in batches.
+	var insertWG sync.WaitGroup
+	insertWG.Go(func() {
+		batch := make([]hashedFile, 0, loadBatchSize)
+
+		flush := func() {
+			if len(batch) == 0 {
+				return
+			}
+			samples := make([]*hopper.Sample, len(batch))
+			for i, h := range batch {
+				samples[i] = h.sample
+			}
+			n, err := db.InsertSampleBatch(ctx, samples)
+			if err != nil {
+				slog.Error("batch insert failed", "error", err, "batch_size", len(batch))
+				progress.errors.Add(int64(len(batch)))
+				batch = batch[:0]
+				return
+			}
+			progress.inserted.Add(n)
+			progress.skipped.Add(int64(len(batch)) - n)
+
+			// Enqueue for cleave analysis. With --rescan, enqueue everything.
+			// Without, enqueue all samples from batches that had any new inserts —
+			// analysis is idempotent so re-analyzing a few duplicates is fine,
+			// and avoids per-row DB lookups to check which were new.
+			hasNew := n > 0
+			for _, h := range batch {
+				enqueueAnalysis(ctx, analyzeQueue, h.path, h.sample.SHA256, hasNew, rescan)
+			}
+			batch = batch[:0]
+		}
+
+		for h := range hashed {
+			batch = append(batch, h)
+			if len(batch) >= loadBatchSize {
+				flush()
+			}
+		}
+		flush()
+	})
+
+	walkFiles(ctx, dir, paths, &progress)
 	close(paths)
-	wg.Wait()
+	hashWG.Wait()
+	close(hashed)
+	insertWG.Wait()
 
 	if analyzeQueue != nil {
 		close(analyzeQueue)
 		analyzeWG.Wait()
 	}
 
-	return int(count.Load())
+	ticker.Stop()
+	close(done)
+
+	slog.Info("directory complete", "dir", dir,
+		"walked", progress.walked.Load(), "hashed", progress.hashed.Load(),
+		"inserted", progress.inserted.Load(),
+		"skipped", progress.skipped.Load(), "analyzed", progress.analyzed.Load(),
+		"errors", progress.errors.Load(),
+		"elapsed", time.Since(start).Round(time.Millisecond))
+
+	return int(progress.inserted.Load() + progress.skipped.Load())
 }
 
-func startAnalysisWorkers(ctx context.Context, db *hopper.DB, cleave *cleaveServer, queue chan loadJob, wg *sync.WaitGroup) {
+func startAnalysisWorkers(ctx context.Context, db *hopper.DB, cleave *cleaveServer, queue chan loadJob, wg *sync.WaitGroup, progress *loadProgress) {
 	for range cleave.Workers() {
 		wg.Go(func() {
 			for job := range queue {
@@ -358,24 +472,26 @@ func startAnalysisWorkers(ctx context.Context, db *hopper.DB, cleave *cleaveServ
 				}
 				raw, result, err := cleave.Analyze(ctx, job.sha, job.path)
 				if err != nil {
+					progress.errors.Add(1)
 					slog.Warn("analysis failed", "path", job.path, "error", err)
 					continue
 				}
 				if err := db.UpdateCleaveResult(ctx, job.sha, raw, result.Risk, result.FindingCount, result.CanonicalSHA256); err != nil {
+					progress.errors.Add(1)
 					slog.Warn("storing result failed", "path", job.path, "error", err)
+					continue
 				}
+				progress.analyzed.Add(1)
 			}
 		})
 	}
 }
 
-func enqueueAnalysis(ctx context.Context, queue chan loadJob, path, sha string, isNew, rescan bool) {
+func enqueueAnalysis(ctx context.Context, queue chan loadJob, path, sha string, enqueue, rescan bool) {
 	if queue == nil {
 		return
 	}
-	// New samples have no cleave result yet — always analyze.
-	// Existing samples are skipped unless --rescan is set.
-	if !isNew && !rescan {
+	if !enqueue && !rescan {
 		return
 	}
 	select {
@@ -384,11 +500,13 @@ func enqueueAnalysis(ctx context.Context, queue chan loadJob, path, sha string, 
 	}
 }
 
-func walkFiles(ctx context.Context, dir string, paths chan<- string) {
+func walkFiles(ctx context.Context, dir string, paths chan<- string, progress *loadProgress) {
+	slog.Info("walking directory", "dir", dir)
 	filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error { //nolint:errcheck,gosec // errors logged per-file
 		if err != nil || d.IsDir() {
 			return err
 		}
+		progress.walked.Add(1)
 		select {
 		case paths <- path:
 			return nil
@@ -396,36 +514,35 @@ func walkFiles(ctx context.Context, dir string, paths chan<- string) {
 			return ctx.Err()
 		}
 	})
+	slog.Info("walk complete", "dir", dir, "files", progress.walked.Load())
 }
 
-func loadFile(ctx context.Context, db *hopper.DB, path, label, source string) (sha string, isNew bool, err error) {
+func hashFile(path, label, source string) (*hopper.Sample, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", false, err
+		return nil, err
 	}
 	defer f.Close() //nolint:errcheck // read-only file
 
 	info, err := f.Stat()
 	if err != nil {
-		return "", false, err
+		return nil, err
 	}
 
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
-		return "", false, err
+		return nil, err
 	}
 
-	sha = hex.EncodeToString(h.Sum(nil))
-	isNew, err = db.InsertSampleNew(ctx, &hopper.Sample{
-		SHA256:      sha,
+	return &hopper.Sample{
+		SHA256:      hex.EncodeToString(h.Sum(nil)),
 		Source:      source,
 		Filename:    filepath.Base(path),
 		Label:       label,
 		LabelSource: source,
 		SizeBytes:   info.Size(),
 		Path:        path,
-	})
-	return sha, isNew, err
+	}, nil
 }
 
 func cmdStats(ctx context.Context) error {

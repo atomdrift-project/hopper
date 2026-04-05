@@ -106,6 +106,43 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 	return n > 0, nil
 }
 
+func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (int64, error) {
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: begin batch: %w", err)
+	}
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
+			size_bytes, label, label_source, path, status, canonical_sha256)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (sha256) DO NOTHING`)
+	if err != nil {
+		tx.Rollback() //nolint:errcheck,gosec
+		return 0, fmt.Errorf("hopper: prepare batch: %w", err)
+	}
+	defer stmt.Close() //nolint:errcheck
+
+	var inserted int64
+	for _, s := range samples {
+		res, err := stmt.ExecContext(ctx,
+			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
+			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256)
+		if err != nil {
+			tx.Rollback() //nolint:errcheck,gosec
+			return inserted, fmt.Errorf("hopper: batch insert %s: %w", s.SHA256, err)
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			inserted += n
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return inserted, fmt.Errorf("hopper: commit batch: %w", err)
+	}
+	return inserted, nil
+}
+
 func (db *DB) sampleBySHA256SQLite(ctx context.Context, sha256 string) (*Sample, error) {
 	s, err := scanLiteSample(db.lite.QueryRowContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples WHERE sha256 = ?`, sha256))
@@ -257,7 +294,7 @@ func (db *DB) countByStatusInPathsSQLite(ctx context.Context, prefixes []string)
 	return scanLiteCounts(rows)
 }
 
-func (db *DB) agesByPathsSQLite(ctx context.Context, prefixes []string) (map[string]time.Time, error) {
+func (db *DB) agesByPathsSQLite(ctx context.Context, prefixes []string, limit int) (map[string]time.Time, error) {
 	if len(prefixes) == 0 {
 		return make(map[string]time.Time), nil
 	}
@@ -267,8 +304,9 @@ func (db *DB) agesByPathsSQLite(ctx context.Context, prefixes []string) (map[str
 		clauses = append(clauses, "path GLOB ?")
 		args = append(args, p+"/*")
 	}
+	args = append(args, limit)
 	//nolint:gosec // query structure is built from constants, values are parameterized
-	query := `SELECT path, updated_at FROM samples WHERE ` + strings.Join(clauses, " OR ")
+	query := `SELECT path, updated_at FROM samples WHERE (` + strings.Join(clauses, " OR ") + `) ORDER BY updated_at ASC LIMIT ?`
 	rows, err := db.lite.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: ages by paths: %w", err)

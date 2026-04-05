@@ -17,12 +17,23 @@ import (
 //
 // Pass afterRowID > 0 to resume from the last logged rowid.
 func MigrateLegacy(ctx context.Context, dst *DB, legacyPath string, afterRowID int64) (int, error) {
-	src, err := sql.Open("sqlite3", legacyPath+"?mode=ro&_busy_timeout=5000")
+	slog.Info("opening legacy source database", "path", legacyPath)
+	src, err := sql.Open("sqlite3", legacyPath+"?mode=ro&_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return 0, fmt.Errorf("open legacy db: %w", err)
 	}
 	defer src.Close() //nolint:errcheck // best-effort cleanup
 
+	// Estimate source rows using max(rowid) — instant on SQLite vs a full
+	// table scan for count(*). The estimate is an upper bound when resuming.
+	var total int64
+	if err := src.QueryRowContext(ctx, `SELECT max(rowid) - ? FROM samples`, afterRowID).Scan(&total); err != nil {
+		slog.Warn("could not estimate legacy rows", "error", err)
+	} else {
+		slog.Info("legacy source rows to process (estimated)", "total", total)
+	}
+
+	slog.Info("querying legacy samples", "after_rowid", afterRowID)
 	rows, err := src.QueryContext(ctx, `
 		SELECT rowid, sha256, path, status, updated_at, cleave_json, risk, finding_count
 		FROM samples
@@ -34,16 +45,18 @@ func MigrateLegacy(ctx context.Context, dst *DB, legacyPath string, afterRowID i
 	defer rows.Close() //nolint:errcheck // best-effort cleanup
 
 	if dst.pool != nil {
-		return migrateLegacyPG(ctx, dst, rows)
+		return migrateLegacyPG(ctx, dst, rows, total)
 	}
-	return migrateLegacySQLite(ctx, dst, rows)
+	return migrateLegacySQLite(ctx, dst, rows, total)
 }
 
 // Legacy to SQLite batched transactions.
 
-func migrateLegacySQLite(ctx context.Context, dst *DB, rows *sql.Rows) (int, error) {
+func migrateLegacySQLite(ctx context.Context, dst *DB, rows *sql.Rows, total int64) (int, error) {
 	const batchSize = 1000
+	slog.Info("legacy import to sqlite", "batch_size", batchSize)
 	imported := 0
+	scanned := 0
 	batch := 0
 	start := time.Now()
 
@@ -79,6 +92,7 @@ func migrateLegacySQLite(ctx context.Context, dst *DB, rows *sql.Rows) (int, err
 			return imported, fmt.Errorf("scan row: %w", err)
 		}
 		lastRowID = rowid
+		scanned++
 
 		label := labelFromLegacyStatus(status)
 		var cleaveResult sql.NullString
@@ -127,24 +141,24 @@ func migrateLegacySQLite(ctx context.Context, dst *DB, rows *sql.Rows) (int, err
 				return imported, err
 			}
 			batch = 0
-			slog.Info("migration progress", "imported", imported, "rowid", lastRowID,
-				"rows_per_sec", int(float64(imported)/time.Since(start).Seconds()))
+			slog.Info("legacy import progress", "scanned", scanned, "imported", imported,
+				"total", total, "rowid", lastRowID,
+				"rows_per_sec", int(float64(scanned)/time.Since(start).Seconds()))
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		return imported, fmt.Errorf("final commit: %w", err)
 	}
-	if imported > 0 {
-		slog.Info("migration complete", "imported", imported, "rowid", lastRowID,
-			"rows_per_sec", int(float64(imported)/time.Since(start).Seconds()))
-	}
+	slog.Info("legacy import finished", "scanned", scanned, "imported", imported,
+		"total", total, "rowid", lastRowID,
+		"elapsed", time.Since(start).Round(time.Millisecond))
 	return imported, rows.Err()
 }
 
 // Legacy to PG via COPY batches into a staging table.
 
-const legacyBatchSize = 5000
+const legacyBatchSize = 1000
 
 var legacyStagingCols = []string{
 	"sha256", "source", "filename", "label", "label_source",
@@ -168,8 +182,10 @@ SELECT sha256, source, filename, label, label_source,
 FROM _staging
 ON CONFLICT (sha256) DO NOTHING`
 
-func migrateLegacyPG(ctx context.Context, dst *DB, rows *sql.Rows) (int, error) {
+func migrateLegacyPG(ctx context.Context, dst *DB, rows *sql.Rows, total int64) (int, error) {
+	slog.Info("legacy import to postgres", "batch_size", legacyBatchSize)
 	imported := 0
+	scanned := 0
 	batch := make([][]any, 0, legacyBatchSize)
 	start := time.Now()
 	var lastRowID int64
@@ -184,8 +200,9 @@ func migrateLegacyPG(ctx context.Context, dst *DB, rows *sql.Rows) (int, error) 
 		}
 		imported += int(n)
 		batch = batch[:0]
-		slog.Info("migration progress", "imported", imported, "rowid", lastRowID,
-			"rows_per_sec", int(float64(imported)/time.Since(start).Seconds()))
+		slog.Info("legacy import progress", "scanned", scanned, "imported", imported,
+			"total", total, "rowid", lastRowID,
+			"rows_per_sec", int(float64(scanned)/time.Since(start).Seconds()))
 		return nil
 	}
 
@@ -204,6 +221,7 @@ func migrateLegacyPG(ctx context.Context, dst *DB, rows *sql.Rows) (int, error) 
 			return imported, fmt.Errorf("scan row: %w", err)
 		}
 		lastRowID = rowid
+		scanned++
 
 		label := labelFromLegacyStatus(status)
 		var cleaveResult []byte
@@ -245,26 +263,31 @@ func migrateLegacyPG(ctx context.Context, dst *DB, rows *sql.Rows) (int, error) 
 
 // Database transfer with streaming reads and batched writes.
 
-const transferBatchSize = 5000
+const transferBatchSize = 1000
 
 // TransferSamples copies samples and reports from src to dst, streaming rows
 // to avoid loading the full dataset into memory. Pass afterSampleID /
 // afterReportID > 0 to resume a previous transfer from the last logged IDs.
 func TransferSamples(ctx context.Context, dst, src *DB, afterSampleID, afterReportID int64) (samples int, reports int, err error) {
+	slog.Info("transfer phase 1/2: samples")
 	samples, err = transferSamplesPhase(ctx, dst, src, afterSampleID)
 	if err != nil {
 		return samples, 0, fmt.Errorf("transfer samples: %w", err)
 	}
+	slog.Info("transfer phase 1/2 complete", "samples", samples)
 
+	slog.Info("transfer phase 2/2: reports")
 	reports, err = transferReportsPhase(ctx, dst, src, afterReportID)
 	if err != nil {
 		return samples, reports, fmt.Errorf("transfer reports: %w", err)
 	}
+	slog.Info("transfer phase 2/2 complete", "reports", reports)
 	return samples, reports, nil
 }
 
 func transferSamplesPhase(ctx context.Context, dst, src *DB, afterID int64) (int, error) {
 	imported := 0
+	scanned := 0
 	batch := make([]*Sample, 0, transferBatchSize)
 	start := time.Now()
 	var lastID int64
@@ -287,14 +310,16 @@ func transferSamplesPhase(ctx context.Context, dst, src *DB, afterID int64) (int
 		batch = batch[:0]
 		elapsed := time.Since(start).Seconds()
 		if elapsed > 0 {
-			slog.Info("sample transfer progress", "imported", imported, "source_id", lastID,
-				"rows_per_sec", int(float64(imported)/elapsed))
+			slog.Info("sample transfer progress", "scanned", scanned, "imported", imported,
+				"source_id", lastID,
+				"rows_per_sec", int(float64(scanned)/elapsed))
 		}
 		return nil
 	}
 
 	err := eachSample(ctx, src, afterID, func(s *Sample) error {
 		lastID = s.ID
+		scanned++
 		batch = append(batch, s)
 		if len(batch) >= transferBatchSize {
 			return flush()
@@ -312,6 +337,7 @@ func transferSamplesPhase(ctx context.Context, dst, src *DB, afterID int64) (int
 
 func transferReportsPhase(ctx context.Context, dst, src *DB, afterID int64) (int, error) {
 	imported := 0
+	scanned := 0
 	batch := make([]*Report, 0, transferBatchSize)
 	start := time.Now()
 	var lastID int64
@@ -334,14 +360,16 @@ func transferReportsPhase(ctx context.Context, dst, src *DB, afterID int64) (int
 		batch = batch[:0]
 		elapsed := time.Since(start).Seconds()
 		if elapsed > 0 {
-			slog.Info("report transfer progress", "imported", imported, "source_id", lastID,
-				"rows_per_sec", int(float64(imported)/elapsed))
+			slog.Info("report transfer progress", "scanned", scanned, "imported", imported,
+				"source_id", lastID,
+				"rows_per_sec", int(float64(scanned)/elapsed))
 		}
 		return nil
 	}
 
 	err := eachReport(ctx, src, afterID, func(r *Report) error {
 		lastID = r.ID
+		scanned++
 		batch = append(batch, r)
 		if len(batch) >= transferBatchSize {
 			return flush()

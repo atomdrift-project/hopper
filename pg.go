@@ -81,6 +81,55 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 	return tag.RowsAffected() > 0, nil
 }
 
+var insertBatchStagingCols = []string{
+	"sha256", "source", "feed", "ecosystem", "filename", "file_type",
+	"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
+}
+
+const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
+	sha256 TEXT, source TEXT, feed TEXT, ecosystem TEXT, filename TEXT,
+	file_type TEXT, size_bytes BIGINT, label TEXT, label_source TEXT,
+	path TEXT, status TEXT, canonical_sha256 TEXT
+) ON COMMIT DROP`
+
+const insertBatchStagingInsert = `INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
+	size_bytes, label, label_source, path, status, canonical_sha256)
+SELECT sha256, source, feed, ecosystem, filename, file_type,
+	size_bytes, label, label_source, path, status, canonical_sha256
+FROM _staging
+ON CONFLICT (sha256) DO NOTHING`
+
+func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (int64, error) {
+	rows := make([][]any, len(samples))
+	for i, s := range samples {
+		rows[i] = []any{
+			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
+			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256,
+		}
+	}
+
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: begin batch: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if _, err := tx.Exec(ctx, insertBatchStagingDDL); err != nil {
+		return 0, fmt.Errorf("hopper: create staging: %w", err)
+	}
+	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"_staging"}, insertBatchStagingCols, pgx.CopyFromRows(rows)); err != nil {
+		return 0, fmt.Errorf("hopper: copy to staging: %w", err)
+	}
+	tag, err := tx.Exec(ctx, insertBatchStagingInsert)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: insert from staging: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("hopper: commit batch: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (db *DB) sampleBySHA256PG(ctx context.Context, sha256 string) (*Sample, error) {
 	s, err := scanPGSample(db.pool.QueryRow(ctx,
 		`SELECT `+pgSampleCols+` FROM samples WHERE sha256 = $1`, sha256))
@@ -226,7 +275,7 @@ func (db *DB) countByStatusInPathsPG(ctx context.Context, prefixes []string) (ma
 	return scanPGCounts(rows)
 }
 
-func (db *DB) agesByPathsPG(ctx context.Context, prefixes []string) (map[string]time.Time, error) {
+func (db *DB) agesByPathsPG(ctx context.Context, prefixes []string, limit int) (map[string]time.Time, error) {
 	if len(prefixes) == 0 {
 		return make(map[string]time.Time), nil
 	}
@@ -235,7 +284,7 @@ func (db *DB) agesByPathsPG(ctx context.Context, prefixes []string) (map[string]
 		patterns[i] = p + "/%"
 	}
 	rows, err := db.pool.Query(ctx,
-		`SELECT path, updated_at FROM samples WHERE path LIKE ANY($1)`, patterns)
+		`SELECT path, updated_at FROM samples WHERE path LIKE ANY($1) ORDER BY updated_at ASC LIMIT $2`, patterns, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: ages by paths: %w", err)
 	}

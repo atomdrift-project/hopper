@@ -33,16 +33,24 @@ sudo -u postgres createdb --owner=hopper hopper
 sudo -u postgres psql -c "ALTER USER hopper WITH PASSWORD 'changeme';"
 ```
 
-Then set `DATABASE_URL` (or pass `--db` to each command):
+Set up `~/.pgpass` so credentials stay out of your environment and shell history:
 
 ```bash
-export DATABASE_URL="postgres://hopper:changeme@dbhost:5432/hopper"
-
-hopper init                                     # apply schema (idempotent)
-hopper load --bad ./malware --good ./benign     # load samples
-hopper import-legacy --from /path/to/cyclotron.db  # legacy cyclotron DB
-hopper import --from ./local.db                 # transfer between hopper DBs
+# ~/.pgpass — chmod 600
+localhost:5432:hopper:hopper:changeme
 ```
+
+The default `DATABASE_URL` is `postgres://hopper@localhost:5432/hopper`, so for a local database no environment variable is needed:
+
+```bash
+hopper load --bad ./malware --good ./benign        # load samples
+hopper import-legacy --from /path/to/cyclotron.db  # legacy cyclotron DB
+hopper import --from ./local.db                    # transfer between hopper DBs
+```
+
+All commands apply schema migrations automatically before writing.
+
+Override with `DATABASE_URL` or `--db` to point at a remote host.
 
 All import commands run migrations automatically and log progress with row IDs. If interrupted, pass `--after <id>` to resume. Imports use `COPY`-based bulk inserts with staging tables, so throughput is bounded by disk I/O rather than round-trips.
 

@@ -291,7 +291,7 @@ func TestAgesByPaths(t *testing.T) {
 	mustInsert(t, ctx, db, &Sample{SHA256: "a", Source: "test", Label: "bad", LabelSource: "test", Path: "/data/s1"})
 	mustInsert(t, ctx, db, &Sample{SHA256: "b", Source: "test", Label: "bad", LabelSource: "test", Path: "/other/s2"})
 
-	ages, err := db.AgesByPaths(ctx, []string{"/data"})
+	ages, err := db.AgesByPaths(ctx, []string{"/data"}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
