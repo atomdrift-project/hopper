@@ -275,6 +275,30 @@ func (db *DB) StaleSamples(ctx context.Context, prefixes []string, olderThan tim
 	return db.staleSamplesSQLite(ctx, prefixes, olderThan, limit)
 }
 
+// SamplesByEmbeddedSHA256 returns samples whose cleave_result contains an
+// embedded file with the given SHA256. This enables cross-sample dedup and
+// incident response queries without fetching JSONB blobs into application code.
+//
+// PostgreSQL 17+ only (uses JSON_TABLE). Returns an error on SQLite.
+func (db *DB) SamplesByEmbeddedSHA256(ctx context.Context, sha256 string, limit int) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.samplesByEmbeddedSHA256PG(ctx, sha256, limit)
+	}
+	return nil, errors.New("hopper: SamplesByEmbeddedSHA256 requires PostgreSQL 17+")
+}
+
+// RecomputeCanonicalSHA256 recalculates canonical_sha256 for all analyzed
+// samples using SQL-side JSON_TABLE, avoiding the need to fetch cleave_result
+// blobs into Go. Returns the number of rows updated.
+//
+// PostgreSQL 17+ only (uses JSON_TABLE). Returns an error on SQLite.
+func (db *DB) RecomputeCanonicalSHA256(ctx context.Context) (int64, error) {
+	if db.pool != nil {
+		return db.recomputeCanonicalSHA256PG(ctx)
+	}
+	return 0, errors.New("hopper: RecomputeCanonicalSHA256 requires PostgreSQL 17+")
+}
+
 // InsertReport stores an analysis report. Multiple reports per sample are allowed;
 // LatestReport returns the most recent.
 func (db *DB) InsertReport(ctx context.Context, r *Report) error {

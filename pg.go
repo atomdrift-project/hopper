@@ -321,6 +321,48 @@ func (db *DB) latestReportPG(ctx context.Context, sha256, reportType string) (*R
 	return r, nil
 }
 
+// samplesByEmbeddedSHA256PG uses JSON_TABLE (PG17+) to find samples whose
+// cleave_result contains an embedded file matching the given SHA256.
+func (db *DB) samplesByEmbeddedSHA256PG(ctx context.Context, sha256 string, limit int) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT DISTINCT `+pgSampleCols+`
+		FROM samples,
+			JSON_TABLE(cleave_result, '$.files[*]' COLUMNS (
+				file_sha256 TEXT PATH '$.sha256'
+			)) AS jt
+		WHERE jt.file_sha256 = $1
+		ORDER BY id
+		LIMIT $2`, sha256, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: samples by embedded sha256: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
+// recomputeCanonicalSHA256PG uses JSON_TABLE (PG17+) to backfill
+// canonical_sha256 in SQL without fetching blobs into Go. Returns the
+// number of rows updated.
+func (db *DB) recomputeCanonicalSHA256PG(ctx context.Context) (int64, error) {
+	tag, err := db.pool.Exec(ctx, `
+		UPDATE samples SET canonical_sha256 = computed.canonical, updated_at = now()
+		FROM (
+			SELECT s.sha256,
+				LEAST(s.sha256, MIN(jt.file_sha256)) AS canonical
+			FROM samples s,
+				JSON_TABLE(s.cleave_result, '$.files[*]' COLUMNS (
+					file_sha256 TEXT PATH '$.sha256'
+				)) AS jt
+			WHERE length(jt.file_sha256) = 64
+			GROUP BY s.sha256
+		) AS computed
+		WHERE samples.sha256 = computed.sha256
+			AND samples.canonical_sha256 IS DISTINCT FROM computed.canonical`)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: recompute canonical sha256: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 func scanPGCounts(rows pgx.Rows) (map[string]int, error) {
 	counts := make(map[string]int)
 	for rows.Next() {
