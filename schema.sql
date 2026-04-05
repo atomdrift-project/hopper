@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS samples (
 	cleave_result JSONB,
 	risk          TEXT NOT NULL DEFAULT '',
 	finding_count INTEGER NOT NULL DEFAULT 0,
-	storage_path  TEXT NOT NULL DEFAULT '',
+	path  TEXT NOT NULL DEFAULT '',
 	status        TEXT NOT NULL DEFAULT '',
 	note          TEXT NOT NULL DEFAULT '',
 	canonical_sha256 TEXT NOT NULL DEFAULT '',
@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS samples (
 CREATE INDEX IF NOT EXISTS idx_samples_label ON samples(label);
 CREATE INDEX IF NOT EXISTS idx_samples_unanalyzed ON samples(sha256) WHERE cleave_result IS NULL;
 CREATE INDEX IF NOT EXISTS idx_samples_status ON samples(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_samples_path ON samples(path);
 
 CREATE TABLE IF NOT EXISTS reports (
 	id          BIGSERIAL PRIMARY KEY,

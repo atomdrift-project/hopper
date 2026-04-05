@@ -94,8 +94,8 @@ func TestMigrateLegacy(t *testing.T) {
 	if s.CleaveResult == nil {
 		t.Error("aaa111 should have cleave result")
 	}
-	if s.StoragePath != "/data/bad/malware.exe" {
-		t.Errorf("aaa111 storage_path = %q, want %q", s.StoragePath, "/data/bad/malware.exe")
+	if s.Path != "/data/bad/malware.exe" {
+		t.Errorf("aaa111 path = %q, want %q", s.Path, "/data/bad/malware.exe")
 	}
 	if s.Source != "legacy" {
 		t.Errorf("aaa111 source = %q, want %q", s.Source, "legacy")
@@ -168,9 +168,9 @@ func TestTransferSamples(t *testing.T) {
 	ctx := context.Background()
 
 	// Seed source with samples and reports.
-	mustInsert(t, ctx, src, &Sample{SHA256: "t1", Source: "test", Label: "bad", LabelSource: "test", Status: "bad-review", StoragePath: "/data/t1"})
-	mustInsert(t, ctx, src, &Sample{SHA256: "t2", Source: "test", Label: "good", LabelSource: "test", Status: "good", StoragePath: "/data/t2"})
-	if err := src.UpdateCleaveResult(ctx, "t1", []byte(`{"findings":[]}`), "hostile", 5); err != nil {
+	mustInsert(t, ctx, src, &Sample{SHA256: "t1", Source: "test", Label: "bad", LabelSource: "test", Status: "bad-review", Path: "/data/t1"})
+	mustInsert(t, ctx, src, &Sample{SHA256: "t2", Source: "test", Label: "good", LabelSource: "test", Status: "good", Path: "/data/t2"})
+	if err := src.UpdateCleaveResult(ctx, "t1", []byte(`{"findings":[]}`), "hostile", 5, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := src.InsertReport(ctx, &Report{SHA256: "t1", Type: "re", Content: "# Analysis", Provider: "claude"}); err != nil {

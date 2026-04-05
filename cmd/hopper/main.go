@@ -326,13 +326,13 @@ func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, dir, labe
 				if ctx.Err() != nil {
 					return
 				}
-				sha, err := loadFile(ctx, db, path, label, source)
+				sha, isNew, err := loadFile(ctx, db, path, label, source)
 				if err != nil {
 					slog.Warn("skipping file", "path", path, "error", err)
 					continue
 				}
 				count.Add(1)
-				enqueueAnalysis(ctx, db, analyzeQueue, path, sha, rescan)
+				enqueueAnalysis(ctx, analyzeQueue, path, sha, isNew, rescan)
 			}
 		})
 	}
@@ -356,12 +356,12 @@ func startAnalysisWorkers(ctx context.Context, db *hopper.DB, cleave *cleaveServ
 				if ctx.Err() != nil {
 					return
 				}
-				raw, result, err := cleave.Analyze(ctx, job.path)
+				raw, result, err := cleave.Analyze(ctx, job.sha, job.path)
 				if err != nil {
 					slog.Warn("analysis failed", "path", job.path, "error", err)
 					continue
 				}
-				if err := db.UpdateCleaveResult(ctx, job.sha, raw, result.Risk, result.FindingCount); err != nil {
+				if err := db.UpdateCleaveResult(ctx, job.sha, raw, result.Risk, result.FindingCount, result.CanonicalSHA256); err != nil {
 					slog.Warn("storing result failed", "path", job.path, "error", err)
 				}
 			}
@@ -369,14 +369,14 @@ func startAnalysisWorkers(ctx context.Context, db *hopper.DB, cleave *cleaveServ
 	}
 }
 
-func enqueueAnalysis(ctx context.Context, db *hopper.DB, queue chan loadJob, path, sha string, rescan bool) {
+func enqueueAnalysis(ctx context.Context, queue chan loadJob, path, sha string, isNew, rescan bool) {
 	if queue == nil {
 		return
 	}
-	if !rescan {
-		if s, err := db.SampleBySHA256(ctx, sha); err == nil && s.CleaveResult != nil {
-			return
-		}
+	// New samples have no cleave result yet — always analyze.
+	// Existing samples are skipped unless --rescan is set.
+	if !isNew && !rescan {
+		return
 	}
 	select {
 	case queue <- loadJob{path: path, sha: sha}:
@@ -398,34 +398,34 @@ func walkFiles(ctx context.Context, dir string, paths chan<- string) {
 	})
 }
 
-func loadFile(ctx context.Context, db *hopper.DB, path, label, source string) (string, error) {
+func loadFile(ctx context.Context, db *hopper.DB, path, label, source string) (sha string, isNew bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	defer f.Close() //nolint:errcheck // read-only file
 
 	info, err := f.Stat()
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
-		return "", err
+		return "", false, err
 	}
 
-	sha := hex.EncodeToString(h.Sum(nil))
-	err = db.InsertSample(ctx, &hopper.Sample{
+	sha = hex.EncodeToString(h.Sum(nil))
+	isNew, err = db.InsertSampleNew(ctx, &hopper.Sample{
 		SHA256:      sha,
 		Source:      source,
 		Filename:    filepath.Base(path),
 		Label:       label,
 		LabelSource: source,
 		SizeBytes:   info.Size(),
-		StoragePath: path,
+		Path:        path,
 	})
-	return sha, err
+	return sha, isNew, err
 }
 
 func cmdStats(ctx context.Context) error {

@@ -31,13 +31,13 @@ func (db *DB) migratePG(ctx context.Context) error {
 
 const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, cleave_result, risk, finding_count,
-	storage_path, status, note, canonical_sha256, created_at, updated_at, analyzed_at`
+	path, status, note, canonical_sha256, created_at, updated_at, analyzed_at`
 
 func pgSampleDest(s *Sample) []any {
 	return []any{
 		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &s.CleaveResult,
-		&s.Risk, &s.FindingCount, &s.StoragePath, &s.Status, &s.Note, &s.CanonicalSHA256,
+		&s.Risk, &s.FindingCount, &s.Path, &s.Status, &s.Note, &s.CanonicalSHA256,
 		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt,
 	}
 }
@@ -67,18 +67,18 @@ func scanPGSamples(rows pgx.Rows) ([]*Sample, error) {
 	return out, rows.Err()
 }
 
-func (db *DB) insertSamplePG(ctx context.Context, s *Sample) error {
-	_, err := db.pool.Exec(ctx, `
+func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
+	tag, err := db.pool.Exec(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-			size_bytes, label, label_source, storage_path, status, canonical_sha256)
+			size_bytes, label, label_source, path, status, canonical_sha256)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $1)
 		ON CONFLICT (sha256) DO NOTHING`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
-		s.SizeBytes, s.Label, s.LabelSource, s.StoragePath, s.Status)
+		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status)
 	if err != nil {
-		return fmt.Errorf("hopper: insert sample: %w", err)
+		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
-	return nil
+	return tag.RowsAffected() > 0, nil
 }
 
 func (db *DB) sampleBySHA256PG(ctx context.Context, sha256 string) (*Sample, error) {
@@ -90,11 +90,11 @@ func (db *DB) sampleBySHA256PG(ctx context.Context, sha256 string) (*Sample, err
 	return s, nil
 }
 
-func (db *DB) updateCleaveResultPG(ctx context.Context, sha256 string, result []byte, risk string, findings int) error {
+func (db *DB) updateCleaveResultPG(ctx context.Context, sha256 string, result []byte, risk string, findings int, canonical string) error {
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET cleave_result = $2, risk = $3, finding_count = $4,
 			canonical_sha256 = $5, analyzed_at = now(), updated_at = now()
-		WHERE sha256 = $1`, sha256, result, risk, findings, canonicalSHA(sha256, result))
+		WHERE sha256 = $1`, sha256, result, risk, findings, canonical)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
 	}
@@ -177,11 +177,11 @@ func (db *DB) countByStatusPG(ctx context.Context) (map[string]int, error) {
 	return scanPGCounts(rows)
 }
 
-func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result []byte, risk string, findings int) error {
+func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result []byte, risk string, findings int, canonical string) error {
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET status = $2, cleave_result = $3, risk = $4, finding_count = $5,
 			canonical_sha256 = $6, analyzed_at = now(), updated_at = now()
-		WHERE sha256 = $1`, sha256, status, result, risk, findings, canonicalSHA(sha256, result))
+		WHERE sha256 = $1`, sha256, status, result, risk, findings, canonical)
 	if err != nil {
 		return fmt.Errorf("hopper: update sample: %w", err)
 	}
@@ -197,7 +197,7 @@ func (db *DB) samplesByStatusInPathsPG(ctx context.Context, status string, prefi
 		patterns[i] = p + "/%"
 	}
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM samples WHERE status = $1 AND storage_path LIKE ANY($2) ORDER BY updated_at ASC LIMIT $3`,
+		`SELECT `+pgSampleCols+` FROM samples WHERE status = $1 AND path LIKE ANY($2) ORDER BY updated_at ASC LIMIT $3`,
 		status, patterns, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: samples by status in paths: %w", err)
@@ -216,7 +216,7 @@ func (db *DB) countByStatusInPathsPG(ctx context.Context, prefixes []string) (ma
 			patterns[i] = p + "/%"
 		}
 		rows, err = db.pool.Query(ctx,
-			`SELECT status, count(*) FROM samples WHERE status != '' AND storage_path LIKE ANY($1) GROUP BY status`,
+			`SELECT status, count(*) FROM samples WHERE status != '' AND path LIKE ANY($1) GROUP BY status`,
 			patterns)
 	}
 	if err != nil {
@@ -235,7 +235,7 @@ func (db *DB) agesByPathsPG(ctx context.Context, prefixes []string) (map[string]
 		patterns[i] = p + "/%"
 	}
 	rows, err := db.pool.Query(ctx,
-		`SELECT storage_path, updated_at FROM samples WHERE storage_path LIKE ANY($1)`, patterns)
+		`SELECT path, updated_at FROM samples WHERE path LIKE ANY($1)`, patterns)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: ages by paths: %w", err)
 	}
@@ -250,6 +250,29 @@ func (db *DB) agesByPathsPG(ctx context.Context, prefixes []string) (map[string]
 		ages[path] = t
 	}
 	return ages, rows.Err()
+}
+
+func (db *DB) staleSamplesPG(ctx context.Context, prefixes []string, olderThan time.Time, limit int) ([]*Sample, error) {
+	if len(prefixes) == 0 {
+		rows, err := db.pool.Query(ctx,
+			`SELECT `+pgSampleCols+` FROM samples WHERE updated_at < $1 ORDER BY updated_at ASC LIMIT $2`,
+			olderThan, limit)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: stale samples: %w", err)
+		}
+		return scanPGSamples(rows)
+	}
+	patterns := make([]string, len(prefixes))
+	for i, p := range prefixes {
+		patterns[i] = p + "/%"
+	}
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples WHERE updated_at < $1 AND path LIKE ANY($2) ORDER BY updated_at ASC LIMIT $3`,
+		olderThan, patterns, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: stale samples: %w", err)
+	}
+	return scanPGSamples(rows)
 }
 
 func (db *DB) insertReportPG(ctx context.Context, r *Report) error {

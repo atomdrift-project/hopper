@@ -39,7 +39,7 @@ func TestInsertAndLookup(t *testing.T) {
 		Filename:    "malware.exe",
 		Label:       "bad",
 		LabelSource: "test",
-		StoragePath: "/data/bad/malware.exe",
+		Path:        "/data/bad/malware.exe",
 		Status:      "bad-review",
 		Risk:        "hostile",
 	}
@@ -60,8 +60,8 @@ func TestInsertAndLookup(t *testing.T) {
 	if got.Status != "bad-review" {
 		t.Errorf("Status = %q, want %q", got.Status, "bad-review")
 	}
-	if got.StoragePath != s.StoragePath {
-		t.Errorf("StoragePath = %q, want %q", got.StoragePath, s.StoragePath)
+	if got.Path != s.Path {
+		t.Errorf("Path = %q, want %q", got.Path, s.Path)
 	}
 }
 
@@ -112,7 +112,7 @@ func TestUpdateCleaveResult(t *testing.T) {
 	ctx := context.Background()
 
 	mustInsert(t, ctx, db, &Sample{SHA256: "c1", Source: "test", Label: "bad", LabelSource: "test"})
-	if err := db.UpdateCleaveResult(ctx, "c1", []byte(`{"findings":[]}`), "suspicious", 3); err != nil {
+	if err := db.UpdateCleaveResult(ctx, "c1", []byte(`{"findings":[]}`), "suspicious", 3, ""); err != nil {
 		t.Fatal(err)
 	}
 	got, err := db.SampleBySHA256(ctx, "c1")
@@ -138,7 +138,7 @@ func TestUpdateSample(t *testing.T) {
 	ctx := context.Background()
 
 	mustInsert(t, ctx, db, &Sample{SHA256: "u1", Source: "test", Label: "bad", LabelSource: "test", Status: "bad-review"})
-	if err := db.UpdateSample(ctx, "u1", "bad-reversed", []byte(`{"f":1}`), "hostile", 5); err != nil {
+	if err := db.UpdateSample(ctx, "u1", "bad-reversed", []byte(`{"f":1}`), "hostile", 5, ""); err != nil {
 		t.Fatal(err)
 	}
 	got, err := db.SampleBySHA256(ctx, "u1")
@@ -234,9 +234,9 @@ func TestSamplesByStatusInPaths(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
-	mustInsert(t, ctx, db, &Sample{SHA256: "a", Source: "test", Label: "bad", LabelSource: "test", Status: "bad-review", StoragePath: "/data/bad/elf/s1"})
-	mustInsert(t, ctx, db, &Sample{SHA256: "b", Source: "test", Label: "bad", LabelSource: "test", Status: "bad-review", StoragePath: "/data/bad/pe/s2"})
-	mustInsert(t, ctx, db, &Sample{SHA256: "c", Source: "test", Label: "good", LabelSource: "test", Status: "good", StoragePath: "/data/good/s3"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "a", Source: "test", Label: "bad", LabelSource: "test", Status: "bad-review", Path: "/data/bad/elf/s1"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "b", Source: "test", Label: "bad", LabelSource: "test", Status: "bad-review", Path: "/data/bad/pe/s2"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "c", Source: "test", Label: "good", LabelSource: "test", Status: "good", Path: "/data/good/s3"})
 
 	got, err := db.SamplesByStatusInPaths(ctx, "bad-review", []string{"/data/bad/elf"}, 10)
 	if err != nil {
@@ -268,9 +268,9 @@ func TestCountByStatusInPaths(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
-	mustInsert(t, ctx, db, &Sample{SHA256: "a", Source: "test", Label: "bad", LabelSource: "test", Status: "bad", StoragePath: "/data/bad/s1"})
-	mustInsert(t, ctx, db, &Sample{SHA256: "b", Source: "test", Label: "bad", LabelSource: "test", Status: "bad", StoragePath: "/data/bad/s2"})
-	mustInsert(t, ctx, db, &Sample{SHA256: "c", Source: "test", Label: "bad", LabelSource: "test", Status: "bad-review", StoragePath: "/other/s3"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "a", Source: "test", Label: "bad", LabelSource: "test", Status: "bad", Path: "/data/bad/s1"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "b", Source: "test", Label: "bad", LabelSource: "test", Status: "bad", Path: "/data/bad/s2"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "c", Source: "test", Label: "bad", LabelSource: "test", Status: "bad-review", Path: "/other/s3"})
 
 	counts, err := db.CountByStatusInPaths(ctx, []string{"/data/bad"})
 	if err != nil {
@@ -288,8 +288,8 @@ func TestAgesByPaths(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
-	mustInsert(t, ctx, db, &Sample{SHA256: "a", Source: "test", Label: "bad", LabelSource: "test", StoragePath: "/data/s1"})
-	mustInsert(t, ctx, db, &Sample{SHA256: "b", Source: "test", Label: "bad", LabelSource: "test", StoragePath: "/other/s2"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "a", Source: "test", Label: "bad", LabelSource: "test", Path: "/data/s1"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "b", Source: "test", Label: "bad", LabelSource: "test", Path: "/other/s2"})
 
 	ages, err := db.AgesByPaths(ctx, []string{"/data"})
 	if err != nil {
@@ -309,7 +309,7 @@ func TestUnanalyzed(t *testing.T) {
 
 	mustInsert(t, ctx, db, &Sample{SHA256: "a", Source: "test", Label: "bad", LabelSource: "test"})
 	mustInsert(t, ctx, db, &Sample{SHA256: "b", Source: "test", Label: "bad", LabelSource: "test"})
-	if err := db.UpdateCleaveResult(ctx, "b", []byte(`{}`), "none", 0); err != nil {
+	if err := db.UpdateCleaveResult(ctx, "b", []byte(`{}`), "none", 0, ""); err != nil {
 		t.Fatal(err)
 	}
 

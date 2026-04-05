@@ -10,7 +10,7 @@ import (
 )
 
 func openSQLite(ctx context.Context, dsn string) (*DB, error) {
-	lite, err := sql.Open("sqlite3", dsn+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=ON&_synchronous=NORMAL")
+	lite, err := sql.Open("sqlite3", dsn+"?_journal_mode=WAL&_busy_timeout=30000&_foreign_keys=ON&_synchronous=NORMAL")
 	if err != nil {
 		return nil, fmt.Errorf("hopper: open sqlite: %w", err)
 	}
@@ -33,7 +33,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 
 const liteSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, cleave_result, risk, finding_count,
-	storage_path, status, note, canonical_sha256, created_at, updated_at, analyzed_at`
+	path, status, note, canonical_sha256, created_at, updated_at, analyzed_at`
 
 func scanLiteSample(row *sql.Row) (*Sample, error) {
 	s := &Sample{}
@@ -41,7 +41,7 @@ func scanLiteSample(row *sql.Row) (*Sample, error) {
 	var analyzedAt sql.NullTime
 	err := row.Scan(&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult,
-		&risk, &s.FindingCount, &s.StoragePath, &status, &s.Note, &s.CanonicalSHA256,
+		&risk, &s.FindingCount, &s.Path, &status, &s.Note, &s.CanonicalSHA256,
 		&s.CreatedAt, &s.UpdatedAt, &analyzedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -69,7 +69,7 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 		var analyzedAt sql.NullTime
 		if err := rows.Scan(&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult,
-			&risk, &s.FindingCount, &s.StoragePath, &status, &s.Note, &s.CanonicalSHA256,
+			&risk, &s.FindingCount, &s.Path, &status, &s.Note, &s.CanonicalSHA256,
 			&s.CreatedAt, &s.UpdatedAt, &analyzedAt); err != nil {
 			return nil, err
 		}
@@ -88,18 +88,22 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
-func (db *DB) insertSampleSQLite(ctx context.Context, s *Sample) error {
-	_, err := db.lite.ExecContext(ctx, `
+func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error) {
+	res, err := db.lite.ExecContext(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-			size_bytes, label, label_source, storage_path, status, canonical_sha256)
+			size_bytes, label, label_source, path, status, canonical_sha256)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256) DO NOTHING`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
-		s.SizeBytes, s.Label, s.LabelSource, s.StoragePath, s.Status, s.SHA256)
+		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256)
 	if err != nil {
-		return fmt.Errorf("hopper: insert sample: %w", err)
+		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
-	return nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("hopper: rows affected: %w", err)
+	}
+	return n > 0, nil
 }
 
 func (db *DB) sampleBySHA256SQLite(ctx context.Context, sha256 string) (*Sample, error) {
@@ -111,12 +115,12 @@ func (db *DB) sampleBySHA256SQLite(ctx context.Context, sha256 string) (*Sample,
 	return s, nil
 }
 
-func (db *DB) updateCleaveResultSQLite(ctx context.Context, sha256 string, result []byte, risk string, findings int) error {
+func (db *DB) updateCleaveResultSQLite(ctx context.Context, sha256 string, result []byte, risk string, findings int, canonical string) error {
 	n := now()
 	_, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET cleave_result = ?, risk = ?, finding_count = ?,
 			canonical_sha256 = ?, analyzed_at = ?, updated_at = ?
-		WHERE sha256 = ?`, string(result), risk, findings, canonicalSHA(sha256, result), n, n, sha256)
+		WHERE sha256 = ?`, string(result), risk, findings, canonical, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
 	}
@@ -199,12 +203,12 @@ func (db *DB) countByStatusSQLite(ctx context.Context) (map[string]int, error) {
 	return scanLiteCounts(rows)
 }
 
-func (db *DB) updateSampleSQLite(ctx context.Context, sha256, status string, result []byte, risk string, findings int) error {
+func (db *DB) updateSampleSQLite(ctx context.Context, sha256, status string, result []byte, risk string, findings int, canonical string) error {
 	n := now()
 	_, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET status = ?, cleave_result = ?, risk = ?, finding_count = ?,
 			canonical_sha256 = ?, analyzed_at = ?, updated_at = ?
-		WHERE sha256 = ?`, status, string(result), risk, findings, canonicalSHA(sha256, result), n, n, sha256)
+		WHERE sha256 = ?`, status, string(result), risk, findings, canonical, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update sample: %w", err)
 	}
@@ -218,7 +222,7 @@ func (db *DB) samplesByStatusInPathsSQLite(ctx context.Context, status string, p
 	var clauses []string
 	args := []any{status}
 	for _, p := range prefixes {
-		clauses = append(clauses, "storage_path GLOB ?")
+		clauses = append(clauses, "path GLOB ?")
 		args = append(args, p+"/*")
 	}
 	args = append(args, limit)
@@ -239,7 +243,7 @@ func (db *DB) countByStatusInPathsSQLite(ctx context.Context, prefixes []string)
 	var clauses []string
 	var args []any
 	for _, p := range prefixes {
-		clauses = append(clauses, "storage_path GLOB ?")
+		clauses = append(clauses, "path GLOB ?")
 		args = append(args, p+"/*")
 	}
 	//nolint:gosec // query structure is built from constants, values are parameterized
@@ -260,11 +264,11 @@ func (db *DB) agesByPathsSQLite(ctx context.Context, prefixes []string) (map[str
 	var clauses []string
 	var args []any
 	for _, p := range prefixes {
-		clauses = append(clauses, "storage_path GLOB ?")
+		clauses = append(clauses, "path GLOB ?")
 		args = append(args, p+"/*")
 	}
 	//nolint:gosec // query structure is built from constants, values are parameterized
-	query := `SELECT storage_path, updated_at FROM samples WHERE ` + strings.Join(clauses, " OR ")
+	query := `SELECT path, updated_at FROM samples WHERE ` + strings.Join(clauses, " OR ")
 	rows, err := db.lite.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: ages by paths: %w", err)
@@ -280,6 +284,34 @@ func (db *DB) agesByPathsSQLite(ctx context.Context, prefixes []string) (map[str
 		ages[path] = t
 	}
 	return ages, rows.Err()
+}
+
+func (db *DB) staleSamplesSQLite(ctx context.Context, prefixes []string, olderThan time.Time, limit int) ([]*Sample, error) {
+	threshold := olderThan.UTC().Format(time.RFC3339Nano)
+	if len(prefixes) == 0 {
+		rows, err := db.lite.QueryContext(ctx,
+			`SELECT `+liteSampleCols+` FROM samples WHERE updated_at < ? ORDER BY updated_at ASC LIMIT ?`,
+			threshold, limit)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: stale samples: %w", err)
+		}
+		return scanLiteSamples(rows)
+	}
+	var clauses []string
+	args := []any{threshold}
+	for _, p := range prefixes {
+		clauses = append(clauses, "path GLOB ?")
+		args = append(args, p+"/*")
+	}
+	args = append(args, limit)
+	//nolint:gosec // query structure is built from constants, values are parameterized
+	query := `SELECT ` + liteSampleCols + ` FROM samples WHERE updated_at < ? AND (` +
+		strings.Join(clauses, " OR ") + `) ORDER BY updated_at ASC LIMIT ?`
+	rows, err := db.lite.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: stale samples: %w", err)
+	}
+	return scanLiteSamples(rows)
 }
 
 func (db *DB) insertReportSQLite(ctx context.Context, r *Report) error {

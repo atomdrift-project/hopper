@@ -1,52 +1,52 @@
 # hopper
 
-Sample registry for the [atomdrift](https://codeberg.org/atomdrift) malware detection pipeline. Stores binary samples, cleave analysis results, and reverse engineering reports in PostgreSQL or SQLite.
+Hopper is a sample registry for malware research. You point it at directories of binaries — known-bad, known-good, or both — and it catalogs them, runs static analysis via [cleave](https://codeberg.org/atomdrift/cleave), and stores everything in a database that downstream tools can query.
 
-Hopper is the canonical data store between **cyclotron** (LLM-driven reverse engineering and trait improvement) and **collimator** (ML training). Cyclotron reads work items from hopper and writes results back. Collimator reads labeled samples and cleave results for training.
+It's the shared data layer for the [atomdrift](https://codeberg.org/atomdrift) pipeline: [cyclotron](https://github.com/atomdrift/cyclotron) reads samples from hopper to drive LLM-powered reverse engineering, and [collimator](https://codeberg.org/atomdrift/collimator) reads cleave results to train detection models. But hopper is useful on its own — if you have a pile of samples and want them analyzed and organized, this is where you start.
 
-## CLI
+## Quick start
 
+```bash
+# Initialize a local SQLite database and load samples with cleave analysis:
+hopper init --db samples.db
+hopper load --db samples.db --bad ./malware --good ./benign
+
+# Or use PostgreSQL for production scale:
+hopper serve                          # starts a local postgres instance
+hopper load --bad ./malware --good ./benign   # uses DATABASE_URL
 ```
-hopper serve             # start a local postgres with hopper schema
-hopper init --db <dsn>   # create/migrate the database
-hopper load --bad ./malware --good ./benign [--rescan]
-hopper import --db <dst> --from <src>
-hopper import-legacy --db <dst> --from /path/to/cyclotron.db
-hopper stats --db <dsn>
-```
 
-The `load` command hashes files, inserts samples, and runs cleave analysis by default. Cleave is auto-started as a managed server with health monitoring, OOM-aware memory limits, and automatic restart on crash. Pass `--cleave=""` to disable analysis, or `--cleave /path/to/cleave` to use a specific binary. Pass `--rescan` to re-analyze samples that already have results.
+When loading, hopper auto-starts a cleave server, manages its memory, restarts it if it crashes, and parallelizes analysis across your samples. Pass `--rescan` to re-analyze samples that already have results.
 
-Set `DATABASE_URL` to avoid passing `--db` every time.
-
-## Library
+## As a Go library
 
 ```go
 db, _ := hopper.Open(ctx, "postgres://localhost:5433/hopper")
 defer db.Close()
-db.Migrate(ctx)
-db.InsertSample(ctx, &hopper.Sample{SHA256: "abc...", Label: "bad", StoragePath: "/data/s1"})
-db.UpdateCleaveResult(ctx, "abc...", rawJSON, "hostile", 5)
+
+db.InsertSample(ctx, &hopper.Sample{SHA256: sha, Label: "bad", StoragePath: path})
+db.UpdateCleaveResult(ctx, sha, cleaveJSON, "hostile", 5)
+
+samples, _ := db.SamplesByStatus(ctx, "bad-review", 100)
 ```
 
-Dual backend: `postgres://` or `postgresql://` DSNs use PostgreSQL; everything else is treated as a SQLite file path. Detected automatically.
+PostgreSQL or SQLite — detected automatically from the DSN.
 
-## Schema
-
-Two tables: **samples** (metadata, labels, cleave results, canonical SHA for train/test splits) and **reports** (analysis reports keyed by SHA256 and type). See `schema.sql` / `schema_sqlite.sql`.
-
-The `canonical_sha256` column is the lexicographic minimum SHA256 across a sample and all its embedded archive files. Collimator uses this for deterministic train/test partitioning — archives sharing an inner file get the same canonical SHA and land in the same partition.
-
-## Data flow
+## How it fits together
 
 ```
-files on disk → hopper load [--cleave] → hopper DB ← cyclotron (RE/traits)
-                                              ↓
-                                         collimator (ML training)
+samples on disk ──→ hopper load ──→ hopper DB ←── cyclotron (RE + traits)
+                        │                │
+                     cleave              └──→ collimator (ML training)
+                   (auto-managed)
 ```
 
-## Requirements
+## Building
 
-- Go 1.25+, CGO enabled (for go-sqlite3)
-- PostgreSQL 14+ (for `serve` command and production use)
-- cleave binary (optional, for `--cleave` analysis during load)
+Requires Go 1.25+ with CGO enabled (for SQLite). PostgreSQL 14+ for the `serve` command.
+
+```bash
+make build    # produces ./hopper
+make test
+make lint
+```

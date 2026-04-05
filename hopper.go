@@ -48,7 +48,7 @@ type Sample struct {
 	Label           string // "bad", "good", "unknown"
 	LabelSource     string
 	Risk            string
-	StoragePath     string
+	Path            string
 	Status          string
 	Note            string
 	CanonicalSHA256 string // min SHA256 across sample + embedded files; for train/test split
@@ -127,10 +127,17 @@ func (db *DB) Migrate(ctx context.Context) error {
 
 // InsertSample adds a sample. Duplicate SHA256 values are silently ignored.
 func (db *DB) InsertSample(ctx context.Context, s *Sample) error {
+	_, err := db.InsertSampleNew(ctx, s)
+	return err
+}
+
+// InsertSampleNew adds a sample and reports whether the row was actually inserted
+// (true) or was a duplicate that was silently skipped (false).
+func (db *DB) InsertSampleNew(ctx context.Context, s *Sample) (bool, error) {
 	if db.pool != nil {
-		return db.insertSamplePG(ctx, s)
+		return db.insertSampleNewPG(ctx, s)
 	}
-	return db.insertSampleSQLite(ctx, s)
+	return db.insertSampleNewSQLite(ctx, s)
 }
 
 // SampleBySHA256 retrieves a sample by its hash.
@@ -143,11 +150,16 @@ func (db *DB) SampleBySHA256(ctx context.Context, sha256 string) (*Sample, error
 }
 
 // UpdateCleaveResult stores analysis output for a sample.
-func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []byte, risk string, findings int) error {
-	if db.pool != nil {
-		return db.updateCleaveResultPG(ctx, sha256, result, risk, findings)
+// Pass canonicalSHA256 as the minimum SHA256 across the sample and its embedded
+// files (for train/test splits). Pass "" to compute it from result automatically.
+func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []byte, risk string, findings int, canonicalSHA256 string) error {
+	if canonicalSHA256 == "" {
+		canonicalSHA256 = canonicalSHA(sha256, result)
 	}
-	return db.updateCleaveResultSQLite(ctx, sha256, result, risk, findings)
+	if db.pool != nil {
+		return db.updateCleaveResultPG(ctx, sha256, result, risk, findings, canonicalSHA256)
+	}
+	return db.updateCleaveResultSQLite(ctx, sha256, result, risk, findings, canonicalSHA256)
 }
 
 // Reclassify changes a sample's label.
@@ -217,14 +229,17 @@ func (db *DB) CountByStatus(ctx context.Context) (map[string]int, error) {
 }
 
 // UpdateSample updates status, cleave result, and updated_at in one operation.
-func (db *DB) UpdateSample(ctx context.Context, sha256, status string, result []byte, risk string, findings int) error {
-	if db.pool != nil {
-		return db.updateSamplePG(ctx, sha256, status, result, risk, findings)
+func (db *DB) UpdateSample(ctx context.Context, sha256, status string, result []byte, risk string, findings int, canonicalSHA256 string) error {
+	if canonicalSHA256 == "" {
+		canonicalSHA256 = canonicalSHA(sha256, result)
 	}
-	return db.updateSampleSQLite(ctx, sha256, status, result, risk, findings)
+	if db.pool != nil {
+		return db.updateSamplePG(ctx, sha256, status, result, risk, findings, canonicalSHA256)
+	}
+	return db.updateSampleSQLite(ctx, sha256, status, result, risk, findings, canonicalSHA256)
 }
 
-// SamplesByStatusInPaths returns samples matching status whose storage_path
+// SamplesByStatusInPaths returns samples matching status whose path
 // starts with one of the given prefixes, ordered by updated_at ASC.
 func (db *DB) SamplesByStatusInPaths(ctx context.Context, status string, prefixes []string, limit int) ([]*Sample, error) {
 	if db.pool != nil {
@@ -234,7 +249,7 @@ func (db *DB) SamplesByStatusInPaths(ctx context.Context, status string, prefixe
 }
 
 // CountByStatusInPaths returns sample counts grouped by status, filtered to
-// samples whose storage_path starts with one of the given prefixes.
+// samples whose path starts with one of the given prefixes.
 func (db *DB) CountByStatusInPaths(ctx context.Context, prefixes []string) (map[string]int, error) {
 	if db.pool != nil {
 		return db.countByStatusInPathsPG(ctx, prefixes)
@@ -242,12 +257,22 @@ func (db *DB) CountByStatusInPaths(ctx context.Context, prefixes []string) (map[
 	return db.countByStatusInPathsSQLite(ctx, prefixes)
 }
 
-// AgesByPaths returns a map of storage_path → updated_at for samples under the given prefixes.
+// AgesByPaths returns a map of path → updated_at for samples under the given prefixes.
 func (db *DB) AgesByPaths(ctx context.Context, prefixes []string) (map[string]time.Time, error) {
 	if db.pool != nil {
 		return db.agesByPathsPG(ctx, prefixes)
 	}
 	return db.agesByPathsSQLite(ctx, prefixes)
+}
+
+// StaleSamples returns samples under the given path prefixes whose updated_at
+// is older than the given threshold, up to limit. Useful for finding samples
+// that need re-analysis without loading all ages into memory.
+func (db *DB) StaleSamples(ctx context.Context, prefixes []string, olderThan time.Time, limit int) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.staleSamplesPG(ctx, prefixes, olderThan, limit)
+	}
+	return db.staleSamplesSQLite(ctx, prefixes, olderThan, limit)
 }
 
 // InsertReport stores an analysis report. Multiple reports per sample are allowed;

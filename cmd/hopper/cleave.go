@@ -195,14 +195,15 @@ func (s *cleaveServer) waitHealthy(ctx context.Context) error {
 
 // cleaveResult is the subset of the cleave response we extract for the DB.
 type cleaveResult struct {
-	Risk         string
-	FindingCount int
+	Risk            string
+	CanonicalSHA256 string
+	FindingCount    int
 }
 
 // Analyze sends a file to the cleave server for analysis.
 // Returns the raw JSON response and extracted metadata.
 // Retries on 503 (memory pressure / overload) with backoff.
-func (s *cleaveServer) Analyze(ctx context.Context, path string) (json.RawMessage, *cleaveResult, error) {
+func (s *cleaveServer) Analyze(ctx context.Context, sha256, path string) (json.RawMessage, *cleaveResult, error) {
 	body, err := json.Marshal(struct {
 		Path string `json:"path"`
 	}{Path: path})
@@ -212,7 +213,7 @@ func (s *cleaveServer) Analyze(ctx context.Context, path string) (json.RawMessag
 
 	const maxRetries = 5
 	for attempt := range maxRetries {
-		raw, result, err := s.doAnalyze(ctx, body)
+		raw, result, err := s.doAnalyze(ctx, sha256, body)
 		if err == nil {
 			return raw, result, nil
 		}
@@ -232,7 +233,7 @@ func (s *cleaveServer) Analyze(ctx context.Context, path string) (json.RawMessag
 
 var errRetryable = errors.New("service unavailable")
 
-func (s *cleaveServer) doAnalyze(ctx context.Context, body []byte) (json.RawMessage, *cleaveResult, error) {
+func (s *cleaveServer) doAnalyze(ctx context.Context, sha256 string, body []byte) (json.RawMessage, *cleaveResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url+"/analyze-path", bytes.NewReader(body))
 	if err != nil {
 		return nil, nil, err
@@ -258,7 +259,7 @@ func (s *cleaveServer) doAnalyze(ctx context.Context, body []byte) (json.RawMess
 		return nil, nil, fmt.Errorf("cleave: read response: %w", err)
 	}
 
-	result, err := extractCleaveResult(raw)
+	result, err := extractCleaveResult(sha256, raw)
 	if err != nil {
 		return raw, nil, fmt.Errorf("cleave: parse response: %w", err)
 	}
@@ -268,7 +269,7 @@ func (s *cleaveServer) doAnalyze(ctx context.Context, body []byte) (json.RawMess
 
 // extractCleaveResult pulls risk and finding count from the cleave JSON.
 // The response has summary.max_risk (string) and summary.counts (hostile/suspicious/notable).
-func extractCleaveResult(raw []byte) (*cleaveResult, error) {
+func extractCleaveResult(sha256 string, raw []byte) (*cleaveResult, error) {
 	var resp struct {
 		Summary *struct {
 			MaxRisk string `json:"max_risk"`
@@ -278,8 +279,8 @@ func extractCleaveResult(raw []byte) (*cleaveResult, error) {
 				Notable    int `json:"notable"`
 			} `json:"counts"`
 		} `json:"summary"`
-		// Fallback: single-file response may have files[0].risk
 		Files []struct {
+			SHA256   string `json:"sha256"`
 			Risk     string `json:"risk"`
 			Findings []any  `json:"findings"`
 		} `json:"files"`
@@ -296,6 +297,15 @@ func extractCleaveResult(raw []byte) (*cleaveResult, error) {
 		r.Risk = strings.ToLower(resp.Files[0].Risk)
 		r.FindingCount = len(resp.Files[0].Findings)
 	}
+
+	// Compute canonical SHA from the already-parsed files array.
+	canonical := sha256
+	for _, f := range resp.Files {
+		if len(f.SHA256) == 64 && f.SHA256 < canonical {
+			canonical = f.SHA256
+		}
+	}
+	r.CanonicalSHA256 = canonical
 	return r, nil
 }
 
