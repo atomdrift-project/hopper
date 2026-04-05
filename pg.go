@@ -1,0 +1,312 @@
+package hopper
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func openPG(ctx context.Context, dsn string) (*DB, error) {
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: connect: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("hopper: ping: %w", err)
+	}
+	return &DB{pool: pool}, nil
+}
+
+func (db *DB) migratePG(ctx context.Context) error {
+	if _, err := db.pool.Exec(ctx, schemaPG); err != nil {
+		return fmt.Errorf("hopper: migrate: %w", err)
+	}
+	return nil
+}
+
+const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
+	size_bytes, label, label_source, cleave_result, risk, finding_count,
+	storage_path, status, note, canonical_sha256, created_at, updated_at, analyzed_at`
+
+func pgSampleDest(s *Sample) []any {
+	return []any{
+		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
+		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &s.CleaveResult,
+		&s.Risk, &s.FindingCount, &s.StoragePath, &s.Status, &s.Note, &s.CanonicalSHA256,
+		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt,
+	}
+}
+
+func scanPGSample(row pgx.Row) (*Sample, error) {
+	s := &Sample{}
+	err := row.Scan(pgSampleDest(s)...)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func scanPGSamples(rows pgx.Rows) ([]*Sample, error) {
+	defer rows.Close()
+	var out []*Sample
+	for rows.Next() {
+		s := &Sample{}
+		if err := rows.Scan(pgSampleDest(s)...); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) insertSamplePG(ctx context.Context, s *Sample) error {
+	_, err := db.pool.Exec(ctx, `
+		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
+			size_bytes, label, label_source, storage_path, status, canonical_sha256)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $1)
+		ON CONFLICT (sha256) DO NOTHING`,
+		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
+		s.SizeBytes, s.Label, s.LabelSource, s.StoragePath, s.Status)
+	if err != nil {
+		return fmt.Errorf("hopper: insert sample: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) sampleBySHA256PG(ctx context.Context, sha256 string) (*Sample, error) {
+	s, err := scanPGSample(db.pool.QueryRow(ctx,
+		`SELECT `+pgSampleCols+` FROM samples WHERE sha256 = $1`, sha256))
+	if err != nil {
+		return nil, fmt.Errorf("hopper: sample %s: %w", sha256, err)
+	}
+	return s, nil
+}
+
+func (db *DB) updateCleaveResultPG(ctx context.Context, sha256 string, result []byte, risk string, findings int) error {
+	_, err := db.pool.Exec(ctx, `
+		UPDATE samples SET cleave_result = $2, risk = $3, finding_count = $4,
+			canonical_sha256 = $5, analyzed_at = now(), updated_at = now()
+		WHERE sha256 = $1`, sha256, result, risk, findings, canonicalSHA(sha256, result))
+	if err != nil {
+		return fmt.Errorf("hopper: update cleave result: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) reclassifyPG(ctx context.Context, sha256, label, source string) error {
+	_, err := db.pool.Exec(ctx, `
+		UPDATE samples SET label = $2, label_source = $3, updated_at = now() WHERE sha256 = $1`,
+		sha256, label, source)
+	if err != nil {
+		return fmt.Errorf("hopper: reclassify: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) unanalyzedPG(ctx context.Context, limit int) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples WHERE cleave_result IS NULL ORDER BY id LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: unanalyzed: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
+func (db *DB) samplesByLabelPG(ctx context.Context, label string, limit int) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples WHERE label = $1 ORDER BY id LIMIT $2`, label, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: samples by label: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
+func (db *DB) countByLabelPG(ctx context.Context) (map[string]int, error) {
+	rows, err := db.pool.Query(ctx, `SELECT label, count(*) FROM samples GROUP BY label`)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: count by label: %w", err)
+	}
+	defer rows.Close()
+	return scanPGCounts(rows)
+}
+
+func (db *DB) setNotePG(ctx context.Context, sha256, note string) error {
+	_, err := db.pool.Exec(ctx, `
+		UPDATE samples SET note = $2, updated_at = now() WHERE sha256 = $1`,
+		sha256, note)
+	if err != nil {
+		return fmt.Errorf("hopper: set note: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) setStatusPG(ctx context.Context, sha256, status string) error {
+	_, err := db.pool.Exec(ctx, `
+		UPDATE samples SET status = $2, note = '', updated_at = now() WHERE sha256 = $1`,
+		sha256, status)
+	if err != nil {
+		return fmt.Errorf("hopper: set status: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) samplesByStatusPG(ctx context.Context, status string, limit int) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples WHERE status = $1 ORDER BY updated_at ASC LIMIT $2`,
+		status, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: samples by status: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
+func (db *DB) countByStatusPG(ctx context.Context) (map[string]int, error) {
+	rows, err := db.pool.Query(ctx, `SELECT status, count(*) FROM samples WHERE status != '' GROUP BY status`)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: count by status: %w", err)
+	}
+	defer rows.Close()
+	return scanPGCounts(rows)
+}
+
+func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result []byte, risk string, findings int) error {
+	_, err := db.pool.Exec(ctx, `
+		UPDATE samples SET status = $2, cleave_result = $3, risk = $4, finding_count = $5,
+			canonical_sha256 = $6, analyzed_at = now(), updated_at = now()
+		WHERE sha256 = $1`, sha256, status, result, risk, findings, canonicalSHA(sha256, result))
+	if err != nil {
+		return fmt.Errorf("hopper: update sample: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) samplesByStatusInPathsPG(ctx context.Context, status string, prefixes []string, limit int) ([]*Sample, error) {
+	if len(prefixes) == 0 {
+		return nil, nil
+	}
+	patterns := make([]string, len(prefixes))
+	for i, p := range prefixes {
+		patterns[i] = p + "/%"
+	}
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples WHERE status = $1 AND storage_path LIKE ANY($2) ORDER BY updated_at ASC LIMIT $3`,
+		status, patterns, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: samples by status in paths: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
+func (db *DB) countByStatusInPathsPG(ctx context.Context, prefixes []string) (map[string]int, error) {
+	var rows pgx.Rows
+	var err error
+	if len(prefixes) == 0 {
+		rows, err = db.pool.Query(ctx, `SELECT status, count(*) FROM samples WHERE status != '' GROUP BY status`)
+	} else {
+		patterns := make([]string, len(prefixes))
+		for i, p := range prefixes {
+			patterns[i] = p + "/%"
+		}
+		rows, err = db.pool.Query(ctx,
+			`SELECT status, count(*) FROM samples WHERE status != '' AND storage_path LIKE ANY($1) GROUP BY status`,
+			patterns)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("hopper: count by status in paths: %w", err)
+	}
+	defer rows.Close()
+	return scanPGCounts(rows)
+}
+
+func (db *DB) agesByPathsPG(ctx context.Context, prefixes []string) (map[string]time.Time, error) {
+	if len(prefixes) == 0 {
+		return make(map[string]time.Time), nil
+	}
+	patterns := make([]string, len(prefixes))
+	for i, p := range prefixes {
+		patterns[i] = p + "/%"
+	}
+	rows, err := db.pool.Query(ctx,
+		`SELECT storage_path, updated_at FROM samples WHERE storage_path LIKE ANY($1)`, patterns)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: ages by paths: %w", err)
+	}
+	defer rows.Close()
+	ages := make(map[string]time.Time)
+	for rows.Next() {
+		var path string
+		var t time.Time
+		if err := rows.Scan(&path, &t); err != nil {
+			return nil, err
+		}
+		ages[path] = t
+	}
+	return ages, rows.Err()
+}
+
+func (db *DB) insertReportPG(ctx context.Context, r *Report) error {
+	_, err := db.pool.Exec(ctx, `
+		INSERT INTO reports (sha256, report_type, content, provider, duration_ms)
+		VALUES ($1, $2, $3, $4, $5)`,
+		r.SHA256, r.Type, r.Content, r.Provider, r.DurationMS)
+	if err != nil {
+		return fmt.Errorf("hopper: insert report: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) reportsBySHA256PG(ctx context.Context, sha256 string) ([]*Report, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT id, sha256, report_type, content, provider, duration_ms, created_at
+		FROM reports WHERE sha256 = $1 ORDER BY created_at DESC`, sha256)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: reports for %s: %w", sha256, err)
+	}
+	defer rows.Close()
+	var out []*Report
+	for rows.Next() {
+		r := &Report{}
+		if err := rows.Scan(&r.ID, &r.SHA256, &r.Type, &r.Content, &r.Provider, &r.DurationMS, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) latestReportPG(ctx context.Context, sha256, reportType string) (*Report, error) {
+	r := &Report{}
+	err := db.pool.QueryRow(ctx, `
+		SELECT id, sha256, report_type, content, provider, duration_ms, created_at
+		FROM reports WHERE sha256 = $1 AND report_type = $2
+		ORDER BY created_at DESC LIMIT 1`, sha256, reportType).Scan(
+		&r.ID, &r.SHA256, &r.Type, &r.Content, &r.Provider, &r.DurationMS, &r.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("hopper: latest report: %w", err)
+	}
+	return r, nil
+}
+
+func scanPGCounts(rows pgx.Rows) (map[string]int, error) {
+	counts := make(map[string]int)
+	for rows.Next() {
+		var key string
+		var n int
+		if err := rows.Scan(&key, &n); err != nil {
+			return nil, err
+		}
+		counts[key] = n
+	}
+	return counts, rows.Err()
+}
