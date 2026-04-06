@@ -26,19 +26,29 @@ func (db *DB) migratePG(ctx context.Context) error {
 	if _, err := db.pool.Exec(ctx, schemaPG); err != nil {
 		return fmt.Errorf("hopper: migrate: %w", err)
 	}
+	// Add columns introduced after initial schema.
+	for _, ddl := range []string{
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS parent TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS skip TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent) WHERE parent != ''`,
+	} {
+		if _, err := db.pool.Exec(ctx, ddl); err != nil {
+			return fmt.Errorf("hopper: migrate: %w", err)
+		}
+	}
 	return nil
 }
 
 const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, cleave_result, risk, finding_count,
-	path, status, note, canonical_sha256, created_at, updated_at, analyzed_at`
+	path, status, note, canonical_sha256, parent, skip, created_at, updated_at, analyzed_at`
 
 func pgSampleDest(s *Sample) []any {
 	return []any{
 		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &s.CleaveResult,
 		&s.Risk, &s.FindingCount, &s.Path, &s.Status, &s.Note, &s.CanonicalSHA256,
-		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt,
+		&s.Parent, &s.Skip, &s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt,
 	}
 }
 
@@ -70,11 +80,11 @@ func scanPGSamples(rows pgx.Rows) ([]*Sample, error) {
 func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 	tag, err := db.pool.Exec(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-			size_bytes, label, label_source, path, status, canonical_sha256)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $1)
+			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $1, $12, $13)
 		ON CONFLICT (sha256) DO NOTHING`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
-		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status)
+		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.Parent, s.Skip)
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
@@ -84,18 +94,20 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 var insertBatchStagingCols = []string{
 	"sha256", "source", "feed", "ecosystem", "filename", "file_type",
 	"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
+	"parent", "skip",
 }
 
 const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 	sha256 TEXT, source TEXT, feed TEXT, ecosystem TEXT, filename TEXT,
 	file_type TEXT, size_bytes BIGINT, label TEXT, label_source TEXT,
-	path TEXT, status TEXT, canonical_sha256 TEXT
+	path TEXT, status TEXT, canonical_sha256 TEXT,
+	parent TEXT, skip TEXT
 ) ON COMMIT DROP`
 
 const insertBatchStagingInsert = `INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, path, status, canonical_sha256)
+	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip)
 SELECT sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, path, status, canonical_sha256
+	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip
 FROM _staging
 ON CONFLICT (sha256) DO NOTHING`
 
@@ -105,6 +117,7 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (int64
 		rows[i] = []any{
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256,
+			s.Parent, s.Skip,
 		}
 	}
 
@@ -410,6 +423,16 @@ func (db *DB) recomputeCanonicalSHA256PG(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("hopper: recompute canonical sha256: %w", err)
 	}
 	return tag.RowsAffected(), nil
+}
+
+func (db *DB) setSkipPG(ctx context.Context, sha256, skip string) error {
+	_, err := db.pool.Exec(ctx, `
+		UPDATE samples SET skip = $2, updated_at = now() WHERE sha256 = $1`,
+		sha256, skip)
+	if err != nil {
+		return fmt.Errorf("hopper: set skip: %w", err)
+	}
+	return nil
 }
 
 func scanPGCounts(rows pgx.Rows) (map[string]int, error) {

@@ -492,6 +492,18 @@ func startAnalysisWorkers(ctx context.Context, db *hopper.DB, cleave *cleaveServ
 					continue
 				}
 				progress.analyzed.Add(1)
+
+				// Explode archive members into individual sample rows.
+				parent, err := db.SampleBySHA256(ctx, job.sha)
+				if err != nil {
+					slog.Warn("fetch for explosion failed", "sha256", job.sha, "error", err)
+					continue
+				}
+				if n, err := db.ExplodeArchiveMembers(ctx, parent); err != nil {
+					slog.Warn("archive explosion failed", "sha256", job.sha, "error", err)
+				} else if n > 0 {
+					slog.Info("exploded archive members", "sha256", job.sha, "members", n)
+				}
 			}
 		})
 	}

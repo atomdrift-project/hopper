@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS samples (
 	status        TEXT NOT NULL DEFAULT '',
 	note          TEXT NOT NULL DEFAULT '',
 	canonical_sha256 TEXT NOT NULL DEFAULT '',
+	parent        TEXT NOT NULL DEFAULT '',
+	skip          TEXT NOT NULL DEFAULT '',
 	created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
 	updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
 	analyzed_at   TIMESTAMPTZ
@@ -25,6 +27,7 @@ CREATE INDEX IF NOT EXISTS idx_samples_label ON samples(label);
 CREATE INDEX IF NOT EXISTS idx_samples_unanalyzed ON samples(sha256) WHERE cleave_result IS NULL;
 CREATE INDEX IF NOT EXISTS idx_samples_status ON samples(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_samples_path ON samples(path);
+CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent) WHERE parent != '';
 
 CREATE TABLE IF NOT EXISTS reports (
 	id          BIGSERIAL PRIMARY KEY,

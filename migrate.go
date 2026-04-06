@@ -433,7 +433,7 @@ func eachSampleSQLite(ctx context.Context, db *DB, afterID int64, fn func(*Sampl
 		if err := rows.Scan(&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult,
 			&risk, &s.FindingCount, &s.Path, &status, &s.Note, &s.CanonicalSHA256,
-			&s.CreatedAt, &s.UpdatedAt, &analyzedAt); err != nil {
+			&s.Parent, &s.Skip, &s.CreatedAt, &s.UpdatedAt, &analyzedAt); err != nil {
 			return fmt.Errorf("scan sample: %w", err)
 		}
 		if cleaveResult.Valid {
@@ -505,7 +505,7 @@ func eachReportSQLite(ctx context.Context, db *DB, afterID int64, fn func(*Repor
 var sampleStagingCols = []string{
 	"sha256", "source", "feed", "ecosystem", "filename", "file_type",
 	"size_bytes", "label", "label_source", "path", "status",
-	"note", "canonical_sha256", "risk", "finding_count", "cleave_result",
+	"note", "canonical_sha256", "parent", "skip", "risk", "finding_count", "cleave_result",
 	"analyzed_at", "created_at", "updated_at",
 }
 
@@ -513,16 +513,17 @@ const sampleStagingDDL = `CREATE TEMP TABLE _staging (
 	sha256 TEXT, source TEXT, feed TEXT, ecosystem TEXT, filename TEXT,
 	file_type TEXT, size_bytes BIGINT, label TEXT, label_source TEXT,
 	path TEXT, status TEXT, note TEXT, canonical_sha256 TEXT,
+	parent TEXT, skip TEXT,
 	risk TEXT, finding_count INTEGER, cleave_result JSONB,
 	analyzed_at TIMESTAMPTZ, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ
 ) ON COMMIT DROP`
 
 const sampleStagingInsert = `INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, path, status, note, canonical_sha256,
-	risk, finding_count, cleave_result, analyzed_at, created_at, updated_at)
+	parent, skip, risk, finding_count, cleave_result, analyzed_at, created_at, updated_at)
 SELECT sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, path, status, note, canonical_sha256,
-	risk, finding_count, cleave_result, analyzed_at, created_at, updated_at
+	parent, skip, risk, finding_count, cleave_result, analyzed_at, created_at, updated_at
 FROM _staging
 ON CONFLICT (sha256) DO NOTHING`
 
@@ -532,7 +533,7 @@ func flushSamplesPG(ctx context.Context, dst *DB, samples []*Sample) (int64, err
 		rows[i] = []any{
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
-			s.Note, s.CanonicalSHA256, s.Risk, s.FindingCount, sanitizeJSONB(s.CleaveResult),
+			s.Note, s.CanonicalSHA256, s.Parent, s.Skip, s.Risk, s.FindingCount, sanitizeJSONB(s.CleaveResult),
 			s.AnalyzedAt, s.CreatedAt, s.UpdatedAt,
 		}
 	}
@@ -554,12 +555,12 @@ func flushSamplesSQLite(ctx context.Context, dst *DB, samples []*Sample) (int64,
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
 				size_bytes, label, label_source, path, status, note, canonical_sha256,
-				risk, finding_count, cleave_result, analyzed_at, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				parent, skip, risk, finding_count, cleave_result, analyzed_at, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (sha256) DO NOTHING`,
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
-			s.Note, s.CanonicalSHA256, s.Risk, s.FindingCount, cr,
+			s.Note, s.CanonicalSHA256, s.Parent, s.Skip, s.Risk, s.FindingCount, cr,
 			s.AnalyzedAt, s.CreatedAt, s.UpdatedAt)
 		if err != nil {
 			tx.Rollback() //nolint:errcheck,gosec // insert error

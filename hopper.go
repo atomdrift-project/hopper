@@ -13,6 +13,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -113,6 +114,8 @@ type Sample struct {
 	Status          string
 	Note            string
 	CanonicalSHA256 string // min SHA256 across sample + embedded files; for train/test split
+	Parent          string // SHA256 of archive this was extracted from; "" for top-level
+	Skip            string // non-empty = excluded from training, value = reason
 	AnalyzedAt      *time.Time
 	CleaveResult    []byte // raw JSON, nil if unanalyzed
 	ID              int64
@@ -154,6 +157,109 @@ func canonicalSHA(sha256 string, cleaveResult []byte) string {
 		}
 	}
 	return canonical
+}
+
+// ExplodeArchiveMembers parses the cleave_result of the given sample and
+// inserts one row per embedded file (depth > 0). Each member inherits the
+// parent's label, label_source, source, feed, and canonical_sha256. Members
+// get a single-file cleave_result wrapping just their file entry.
+//
+// For bad archives, members without hostile risk or >1 suspicious finding
+// are marked skip="weak-findings". Duplicate SHA256s are silently skipped.
+// Returns the number of new rows inserted.
+func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64, error) {
+	if len(parent.CleaveResult) == 0 {
+		return 0, nil
+	}
+
+	var report struct {
+		Files []json.RawMessage `json:"files"`
+	}
+	if err := json.Unmarshal(parent.CleaveResult, &report); err != nil {
+		return 0, fmt.Errorf("hopper: parse cleave result for explosion: %w", err)
+	}
+
+	var members []*Sample
+	for _, raw := range report.Files {
+		var entry struct {
+			SHA256   string `json:"sha256"`
+			Risk     string `json:"risk"`
+			FileType string `json:"file_type"`
+			Path     string `json:"path"`
+			Findings []struct {
+				Crit string  `json:"crit"`
+				Conf float64 `json:"conf"`
+			} `json:"findings"`
+			Size  int64 `json:"size"`
+			Depth int   `json:"depth"`
+		}
+		if json.Unmarshal(raw, &entry) != nil || entry.Depth == 0 || len(entry.SHA256) != 64 {
+			continue
+		}
+
+		risk := strings.ToLower(entry.Risk)
+		findingCount := len(entry.Findings)
+
+		// Count suspicious+ findings with sufficient confidence.
+		suspiciousCount := 0
+		for _, f := range entry.Findings {
+			conf := f.Conf
+			if conf == 0 {
+				conf = 1.0
+			}
+			if conf < 0.65 {
+				continue
+			}
+			crit := strings.ToLower(f.Crit)
+			if crit == "hostile" || crit == "suspicious" {
+				suspiciousCount++
+			}
+		}
+
+		skip := ""
+		if parent.Label == "bad" && risk != "hostile" && suspiciousCount <= 1 {
+			skip = "weak-findings"
+		}
+
+		singleFile, err := json.Marshal(struct {
+			Files []json.RawMessage `json:"files"`
+		}{Files: []json.RawMessage{raw}})
+		if err != nil {
+			continue
+		}
+
+		members = append(members, &Sample{
+			SHA256:          entry.SHA256,
+			Source:          parent.Source,
+			Feed:            parent.Feed,
+			Ecosystem:       parent.Ecosystem,
+			Filename:        entry.Path,
+			FileType:        entry.FileType,
+			SizeBytes:       entry.Size,
+			Label:           parent.Label,
+			LabelSource:     parent.LabelSource,
+			Risk:            risk,
+			FindingCount:    findingCount,
+			CleaveResult:    singleFile,
+			CanonicalSHA256: parent.CanonicalSHA256,
+			Parent:          parent.SHA256,
+			Skip:            skip,
+		})
+	}
+
+	if len(members) == 0 {
+		return 0, nil
+	}
+	return db.InsertSampleBatch(ctx, members)
+}
+
+// SetSkip sets the training-exclusion reason on a sample.
+// Pass "" to clear.
+func (db *DB) SetSkip(ctx context.Context, sha256, skip string) error {
+	if db.pool != nil {
+		return db.setSkipPG(ctx, sha256, skip)
+	}
+	return db.setSkipSQLite(ctx, sha256, skip)
 }
 
 // Open connects to the registry. DSNs starting with postgres:// or
