@@ -665,7 +665,7 @@ func TestLoadDir(t *testing.T) {
 	os.MkdirAll(filepath.Join(dir, ".git"), 0o755)
 	os.WriteFile(filepath.Join(dir, ".git", "HEAD"), []byte("ref: refs/heads/main"), 0o644)
 
-	n := loadDir(ctx, db, nil, nil, dir, "bad", "test", 2, false, 1)
+	n := loadDir(ctx, func() {}, db, nil, nil, dir, "bad", "test", 2, false, 1, 0, "", &loadProgress{})
 	// 2 valid files inserted (tiny skipped, .git skipped)
 	if n != 2 {
 		t.Errorf("loadDir returned %d, want 2", n)
@@ -699,13 +699,13 @@ func TestLoadDirWithCache(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "sample.bin"), []byte("sample content!!"), 0o644)
 
 	// First load: cache miss, hashes file.
-	n1 := loadDir(ctx, db, nil, cache, dir, "bad", "test", 1, false, 1)
+	n1 := loadDir(ctx, func() {}, db, nil, cache, dir, "bad", "test", 1, false, 1, 0, "", &loadProgress{})
 	if n1 != 1 {
 		t.Errorf("first load = %d, want 1", n1)
 	}
 
 	// Second load: cache hit, same hash → duplicate skipped.
-	n2 := loadDir(ctx, db, nil, cache, dir, "bad", "test", 1, false, 1)
+	n2 := loadDir(ctx, func() {}, db, nil, cache, dir, "bad", "test", 1, false, 1, 0, "", &loadProgress{})
 	if n2 != 1 { // 1 total (0 inserted + 1 skipped)
 		t.Errorf("second load = %d, want 1", n2)
 	}
@@ -726,7 +726,7 @@ func TestLoadDirMarkers(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "malware.bin"), []byte("malicious payload!"), 0o644)
 	os.WriteFile(filepath.Join(dir, "._malware.bin.BENIGN"), nil, 0o644) // marker: actually benign
 
-	loadDir(ctx, db, nil, nil, dir, "bad", "test", 1, false, 1)
+	loadDir(ctx, func() {}, db, nil, nil, dir, "bad", "test", 1, false, 1, 0, "", &loadProgress{})
 
 	// The sample should be flipped to "good" with skip="misclassified".
 	samples, _ := db.SamplesByLabel(ctx, "good", 10)

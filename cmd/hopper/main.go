@@ -11,10 +11,12 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"math"
 	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -245,10 +247,12 @@ func cmdLoad(ctx context.Context) error {
 	source := f.String("source", "harvest", "sample source tag")
 	workers := f.Int("workers", 8, "concurrent hash/insert workers")
 	cleaveBin := f.String("cleave", "cleave", "path to cleave binary (pass empty to disable)")
-	cleaveWorkers := f.Int("cleave-workers", 8, "concurrent cleave analysis workers")
-	maxRSSGB := f.Int("max-memory-gb", 0, "cleave RSS limit in GB (default: 25% of system RAM)")
+	cleaveWorkers := f.Int("cleave-workers", max(1, runtime.NumCPU()-1), "concurrent cleave analysis workers")
+	maxRSSGB := f.Int("max-memory-gb", 32, "cleave RSS limit in GB")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have cleave results")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
+	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
+	experimentTag := f.String("experiment-tag", "", "label for experiment comparison")
 	f.Parse(os.Args[2:]) //nolint:errcheck,gosec // ExitOnError handles parse errors
 
 	if *bad == "" && *good == "" {
@@ -272,7 +276,7 @@ func cmdLoad(ctx context.Context) error {
 		}
 	}
 
-	slog.Info("load starting", "bad", *bad, "good", *good, "workers", *workers, "rescan", *rescan, "cache", cache != nil)
+	slog.Info("load starting", "bad", *bad, "good", *good, "workers", *workers, "rescan", *rescan, "cache", cache != nil, "max_analyzed", *maxAnalyzed, "experiment", *experimentTag)
 	db, err := openDB(ctx, *dsn)
 	if err != nil {
 		return err
@@ -324,13 +328,20 @@ func cmdLoad(ctx context.Context) error {
 		}
 	}
 
+	// Shared progress for --max-analyzed across all directories.
+	var shared loadProgress
+	shared.analyzeDurationMin.Store(math.MaxInt64)
+
+	loadCtx, loadCancel := context.WithCancel(ctx)
+	defer loadCancel()
+
 	var total atomic.Int64
 	var loadWG sync.WaitGroup
 	for _, d := range loadDirs {
 		loadWG.Add(1)
 		go func() {
 			defer loadWG.Done()
-			total.Add(int64(loadDir(ctx, db, cleave, cache, d.dir, d.label, *source, *workers, *rescan, len(loadDirs))))
+			total.Add(int64(loadDir(loadCtx, loadCancel, db, cleave, cache, d.dir, d.label, *source, *workers, *rescan, len(loadDirs), *maxAnalyzed, *experimentTag, &shared)))
 		}()
 	}
 	loadWG.Wait()
@@ -360,10 +371,16 @@ type loadProgress struct {
 	markers   atomic.Int64 // files skipped due to misclassification markers
 	tooSmall  atomic.Int64 // files below minFileSize
 	tooLarge  atomic.Int64 // files above maxFileSize
-	errors    atomic.Int64
-	cacheHits atomic.Int64
+	errors     atomic.Int64
+	hashErrors atomic.Int64 // hash failures (subset of errors, for % calc)
+	cacheHits  atomic.Int64
 	exploded  atomic.Int64 // archive members inserted
 	scoreSum  atomic.Int64 // sum of cleave scores for avg calculation
+
+	// Per-analysis timing (nanoseconds).
+	analyzeDurationSum atomic.Int64
+	analyzeDurationMax atomic.Int64
+	analyzeDurationMin atomic.Int64 // initialized to math.MaxInt64
 }
 
 const (
@@ -377,10 +394,11 @@ var (
 	errTooLarge = errors.New("too large")
 )
 
-func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, cache *hashCache, dir, label, source string, nworkers int, rescan bool, numDirs int) int {
+func loadDir(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, cleave *cleaveServer, cache *hashCache, dir, label, source string, nworkers int, rescan bool, numDirs int, maxAnalyzed int, experimentTag string, shared *loadProgress) int {
 	slog.Info("loading directory", "dir", dir, "label", label, "workers", nworkers)
 	start := time.Now()
 	var progress loadProgress
+	progress.analyzeDurationMin.Store(math.MaxInt64)
 
 	paths := make(chan string, nworkers*2)
 	hashed := make(chan hashedFile, nworkers*2)
@@ -393,32 +411,71 @@ func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, cache *ha
 	if cleave != nil {
 		perDir := max(1, cleave.Workers()/numDirs)
 		analyzeQueue = make(chan loadJob, perDir*2)
-		startAnalysisWorkers(ctx, db, cleave, analyzeQueue, &analyzeWG, &progress, perDir)
+		startAnalysisWorkers(ctx, cancel, db, cleave, analyzeQueue, &analyzeWG, &progress, shared, perDir, maxAnalyzed)
 	}
 
 	// Periodic progress reporting.
 	ticker := time.NewTicker(5 * time.Second)
 	done := make(chan struct{})
+	var prevAnalyzed int64
 	go func() {
 		for {
 			select {
 			case <-ticker.C:
 				elapsed := time.Since(start).Seconds()
 				analyzed := progress.analyzed.Load()
+				recentRate := float64(analyzed-prevAnalyzed) / 5.0
+				prevAnalyzed = analyzed
+				walked := progress.walked.Load()
+				hashedN := progress.hashed.Load()
+				inserted := progress.inserted.Load()
+				skipped := progress.skipped.Load()
+
+				// Stage percentages.
+				// Hash: completed = hashed + tooSmall + tooLarge + hashErrors
+				hashDone := hashedN + progress.tooSmall.Load() + progress.tooLarge.Load() + progress.hashErrors.Load()
+				// Analyze target: inserted files (capped by --max-analyzed).
+				analyzeTarget := inserted
+				if maxAnalyzed > 0 && int64(maxAnalyzed) < analyzeTarget {
+					analyzeTarget = int64(maxAnalyzed)
+				}
+
 				attrs := []any{
 					"dir", dir,
-					"walked", progress.walked.Load(), "hashed", progress.hashed.Load(),
-					"inserted", progress.inserted.Load(),
-					"skipped", progress.skipped.Load(), "markers", progress.markers.Load(),
+				}
+				if walked > 0 {
+					attrs = append(attrs, "hash_pct", fmt.Sprintf("%.0f%%", float64(hashDone)/float64(walked)*100))
+				}
+				if hashedN > 0 {
+					attrs = append(attrs, "insert_pct", fmt.Sprintf("%.0f%%", float64(inserted+skipped)/float64(hashedN)*100))
+				}
+				if analyzeTarget > 0 {
+					attrs = append(attrs, "analyze_pct", fmt.Sprintf("%.0f%%", float64(analyzed)/float64(analyzeTarget)*100))
+				}
+				attrs = append(attrs,
+					"walked", walked, "hashed", hashedN,
+					"inserted", inserted,
+					"skipped", skipped, "markers", progress.markers.Load(),
 					"too_small", progress.tooSmall.Load(), "too_large", progress.tooLarge.Load(),
 					"cache_hits", progress.cacheHits.Load(),
 					"analyzed", analyzed,
 					"exploded", progress.exploded.Load(),
 					"errors", progress.errors.Load(),
-					"analyze_per_sec", int(float64(analyzed) / elapsed),
-				}
+					"analyze_recent_per_sec", fmt.Sprintf("%.1f", recentRate),
+					"analyze_cumul_per_sec", fmt.Sprintf("%.1f", float64(analyzed)/elapsed),
+				)
 				if analyzed > 0 {
+					avgMs := progress.analyzeDurationSum.Load() / analyzed / int64(time.Millisecond)
+					maxMs := progress.analyzeDurationMax.Load() / int64(time.Millisecond)
+					attrs = append(attrs, "analyze_avg_ms", avgMs, "analyze_max_ms", maxMs)
 					attrs = append(attrs, "avg_score", int(progress.scoreSum.Load()/analyzed))
+				}
+				if analyzeTarget > 0 && recentRate > 0 {
+					remaining := analyzeTarget - analyzed
+					if remaining > 0 {
+						etaSec := float64(remaining) / recentRate
+						attrs = append(attrs, "eta", (time.Duration(etaSec)*time.Second).Round(time.Second))
+					}
 				}
 				slog.Info("load progress", attrs...)
 			case <-done:
@@ -444,6 +501,7 @@ func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, cache *ha
 						progress.tooLarge.Add(1)
 					default:
 						progress.errors.Add(1)
+						progress.hashErrors.Add(1)
 						slog.Warn("hash failed", "path", path, "error", err)
 					}
 					continue
@@ -509,8 +567,12 @@ func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, cache *ha
 
 			n, err := db.InsertSampleBatch(ctx, samples)
 			if err != nil {
-				slog.Error("batch insert failed", "error", err, "batch_size", len(batch))
-				progress.errors.Add(int64(len(batch)))
+				if ctx.Err() != nil {
+					slog.Debug("batch insert skipped (shutting down)", "batch_size", len(batch))
+				} else {
+					slog.Error("batch insert failed", "error", err, "batch_size", len(batch))
+					progress.errors.Add(int64(len(batch)))
+				}
 				batch = batch[:0]
 				return
 			}
@@ -536,6 +598,7 @@ func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, cache *ha
 				select {
 				case pendingAnalysis <- loadJob{path: h.path, sha: h.sample.SHA256}:
 				case <-ctx.Done():
+					slog.Debug("inserter flush cancelled", "dir", dir, "pending_queue_len", len(pendingAnalysis))
 					return
 				}
 			}
@@ -560,28 +623,36 @@ func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, cache *ha
 				select {
 				case analyzeQueue <- job:
 				case <-ctx.Done():
+					slog.Debug("feeder cancelled", "dir", dir, "remaining_pending", len(pendingAnalysis))
 					return
 				}
 			}
+			slog.Debug("feeder drained", "dir", dir)
 		})
 	}
 
 	walkFiles(ctx, dir, paths, &progress)
+	slog.Debug("shutdown", "dir", dir, "step", "walk complete, closing paths")
 	close(paths)
 	hashWG.Wait()
+	slog.Debug("shutdown", "dir", dir, "step", "hash workers done, closing hashed")
 	close(hashed)
-	insertWG.Wait()  // also closes pendingAnalysis
-	feederWG.Wait()  // drains pendingAnalysis into analyzeQueue
+	insertWG.Wait() // also closes pendingAnalysis
+	slog.Debug("shutdown", "dir", dir, "step", "inserter done")
+	feederWG.Wait() // drains pendingAnalysis into analyzeQueue
+	slog.Debug("shutdown", "dir", dir, "step", "feeder done")
 
 	if analyzeQueue != nil {
 		close(analyzeQueue)
 		analyzeWG.Wait()
+		slog.Debug("shutdown", "dir", dir, "step", "analysis workers done")
 	}
 
 	ticker.Stop()
 	close(done)
 
 	analyzed := progress.analyzed.Load()
+	elapsed := time.Since(start)
 	completeAttrs := []any{
 		"dir", dir,
 		"walked", progress.walked.Load(), "hashed", progress.hashed.Load(),
@@ -592,29 +663,64 @@ func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, cache *ha
 		"analyzed", analyzed,
 		"exploded", progress.exploded.Load(),
 		"errors", progress.errors.Load(),
-		"elapsed", time.Since(start).Round(time.Millisecond),
+		"elapsed", elapsed.Round(time.Millisecond),
 	}
 	if analyzed > 0 {
-		completeAttrs = append(completeAttrs, "avg_score", int(progress.scoreSum.Load()/analyzed))
+		avgMs := progress.analyzeDurationSum.Load() / analyzed / int64(time.Millisecond)
+		maxMs := progress.analyzeDurationMax.Load() / int64(time.Millisecond)
+		minMs := progress.analyzeDurationMin.Load() / int64(time.Millisecond)
+		throughput := float64(analyzed) / elapsed.Seconds()
+		completeAttrs = append(completeAttrs,
+			"avg_score", int(progress.scoreSum.Load()/analyzed),
+			"throughput_per_sec", fmt.Sprintf("%.2f", throughput),
+			"analyze_avg_ms", avgMs,
+			"analyze_min_ms", minMs,
+			"analyze_max_ms", maxMs,
+		)
+	}
+	if experimentTag != "" {
+		completeAttrs = append(completeAttrs, "experiment", experimentTag)
 	}
 	slog.Info("directory complete", completeAttrs...)
 
 	return int(progress.inserted.Load() + progress.skipped.Load())
 }
 
-func startAnalysisWorkers(ctx context.Context, db *hopper.DB, cleave *cleaveServer, queue chan loadJob, wg *sync.WaitGroup, progress *loadProgress, nworkers int) {
+func startAnalysisWorkers(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, cleave *cleaveServer, queue chan loadJob, wg *sync.WaitGroup, progress *loadProgress, shared *loadProgress, nworkers int, maxAnalyzed int) {
 	for range nworkers {
 		wg.Go(func() {
 			for job := range queue {
 				if ctx.Err() != nil {
+					slog.Debug("analysis worker exiting", "reason", "context cancelled")
 					return
 				}
+
+				t0 := time.Now()
 				raw, result, err := cleave.Analyze(ctx, job.sha, job.path)
+				dur := time.Since(t0).Nanoseconds()
+
 				if err != nil {
 					progress.errors.Add(1)
 					slog.Warn("analysis failed", "path", job.path, "error", err)
 					continue
 				}
+
+				// Track per-analysis duration.
+				progress.analyzeDurationSum.Add(dur)
+				shared.analyzeDurationSum.Add(dur)
+				for {
+					old := progress.analyzeDurationMax.Load()
+					if dur <= old || progress.analyzeDurationMax.CompareAndSwap(old, dur) {
+						break
+					}
+				}
+				for {
+					old := progress.analyzeDurationMin.Load()
+					if dur >= old || progress.analyzeDurationMin.CompareAndSwap(old, dur) {
+						break
+					}
+				}
+
 				if err := db.UpdateCleaveResult(ctx, job.sha, raw, result.CanonicalSHA256); err != nil {
 					progress.errors.Add(1)
 					slog.Warn("storing result failed", "path", job.path, "error", err)
@@ -622,6 +728,13 @@ func startAnalysisWorkers(ctx context.Context, db *hopper.DB, cleave *cleaveServ
 				}
 				progress.analyzed.Add(1)
 				progress.scoreSum.Add(int64(result.Score))
+
+				// Check global analysis cap.
+				if maxAnalyzed > 0 && shared.analyzed.Add(1) >= int64(maxAnalyzed) {
+					slog.Info("max-analyzed reached", "limit", maxAnalyzed)
+					cancel()
+					return
+				}
 
 				// Explode archive members into individual sample rows.
 				parent, err := db.SampleBySHA256(ctx, job.sha)
