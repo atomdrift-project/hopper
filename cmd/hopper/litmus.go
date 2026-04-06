@@ -21,11 +21,11 @@ import (
 	"github.com/codeGROOVE-dev/retry"
 )
 
-// cleaveServer manages a cleave API server subprocess.
-type cleaveServer struct {
+// litmusServer manages a litmus API server subprocess.
+type litmusServer struct {
 	client     *http.Client
 	cmd        *exec.Cmd
-	bin        string // path to cleave binary
+	bin        string // path to litmus binary
 	url        string // base URL (e.g. http://127.0.0.1:PORT)
 	port       string
 	dirs       []string
@@ -39,22 +39,22 @@ type cleaveServer struct {
 	consecutive503 atomic.Int64
 }
 
-// cleaveConfig holds options for starting a cleave server.
-type cleaveConfig struct {
-	Bin        string   // path to cleave binary (default: "cleave")
+// litmusConfig holds options for starting a litmus server.
+type litmusConfig struct {
+	Bin        string   // path to litmus binary (default: "litmus")
 	Dirs       []string // directories to allow for /analyze-path
-	MaxRSSGB   int      // memory limit in GB (0 = let cleave decide, 25% of system RAM)
+	MaxRSSGB   int      // memory limit in GB (0 = let litmus decide)
 	MaxWorkers int      // max concurrent analysis requests to send
 }
 
-func newCleaveServer(cfg cleaveConfig) *cleaveServer {
+func newLitmusServer(cfg litmusConfig) *litmusServer {
 	if cfg.Bin == "" {
-		cfg.Bin = "cleave"
+		cfg.Bin = "litmus"
 	}
 	if cfg.MaxWorkers < 1 {
 		cfg.MaxWorkers = 8
 	}
-	return &cleaveServer{
+	return &litmusServer{
 		bin:        cfg.Bin,
 		dirs:       cfg.Dirs,
 		maxRSSGB:   cfg.MaxRSSGB,
@@ -65,13 +65,13 @@ func newCleaveServer(cfg cleaveConfig) *cleaveServer {
 	}
 }
 
-// Start launches the cleave server and waits for it to become healthy.
+// Start launches the litmus server and waits for it to become healthy.
 // It picks a random available port.
-func (s *cleaveServer) Start(ctx context.Context) error {
+func (s *litmusServer) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	updateCleave(ctx)
+	updateLitmus(ctx)
 
 	port, err := freePort(ctx)
 	if err != nil {
@@ -83,40 +83,40 @@ func (s *cleaveServer) Start(ctx context.Context) error {
 	return s.startLocked(ctx)
 }
 
-// updateCleave attempts to build and install the latest cleave from ../cleave.
+// updateLitmus attempts to build and install the latest litmus from ../litmus.
 // On failure it logs the error and falls back to whatever version is already installed.
-func updateCleave(ctx context.Context) {
-	dir := "../cleave"
+func updateLitmus(ctx context.Context) {
+	dir := "../litmus"
 	if _, err := os.Stat(dir); err != nil {
-		slog.Warn("cleave source not found, using installed version", "dir", dir)
+		slog.Warn("litmus source not found, using installed version", "dir", dir)
 		return
 	}
 
-	slog.Info("updating cleave", "dir", dir)
+	slog.Info("updating litmus", "dir", dir)
 
 	pull := exec.CommandContext(ctx, "git", "pull")
 	pull.Dir = dir
 	if out, err := pull.CombinedOutput(); err != nil {
-		slog.Error("git pull failed for cleave, using installed version", "error", err, "output", string(out))
+		slog.Error("git pull failed for litmus, using installed version", "error", err, "output", string(out))
 		return
 	}
 
 	install := exec.CommandContext(ctx, "make", "install")
 	install.Dir = dir
 	if out, err := install.CombinedOutput(); err != nil {
-		slog.Error("make install failed for cleave, using installed version", "error", err, "output", string(out))
+		slog.Error("make install failed for litmus, using installed version", "error", err, "output", string(out))
 		return
 	}
 
-	slog.Info("cleave updated successfully")
+	slog.Info("litmus updated successfully")
 }
 
-func (s *cleaveServer) startLocked(ctx context.Context) error {
+func (s *litmusServer) startLocked(ctx context.Context) error {
 	bind := "127.0.0.1:" + s.port
 
 	args := []string{"serve", "--bind", bind}
 	if len(s.dirs) > 0 {
-		args = append(args, "--dangerous-local-file-paths", strings.Join(s.dirs, ","))
+		args = append(args, "--allowed-dirs", strings.Join(s.dirs, ","))
 	}
 	if s.maxRSSGB > 0 {
 		args = append(args, "--max-rss-gb", strconv.Itoa(s.maxRSSGB))
@@ -124,45 +124,44 @@ func (s *cleaveServer) startLocked(ctx context.Context) error {
 
 	cmd := exec.CommandContext(ctx, s.bin, args...) //nolint:gosec // bin path is from trusted CLI flag
 
-	logFile, err := os.CreateTemp("", "cleave-*.log")
+	logFile, err := os.CreateTemp("", "litmus-*.log")
 	if err != nil {
-		return fmt.Errorf("create cleave log file: %w", err)
+		return fmt.Errorf("create litmus log file: %w", err)
 	}
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
 	if err := cmd.Start(); err != nil {
 		logFile.Close() //nolint:errcheck
-		return fmt.Errorf("start cleave: %w", err)
+		return fmt.Errorf("start litmus: %w", err)
 	}
 	s.cmd = cmd
 
-	slog.Info("starting cleave server", "bind", bind, "pid", cmd.Process.Pid, "log", logFile.Name())
+	slog.Info("starting litmus server", "bind", bind, "pid", cmd.Process.Pid, "log", logFile.Name())
 
-	// Wait for health endpoint.
 	if err := s.waitHealthy(ctx); err != nil {
 		cmd.Process.Kill() //nolint:errcheck,gosec // best-effort kill
-		return fmt.Errorf("cleave not healthy: %w", err)
+		return fmt.Errorf("litmus not healthy: %w", err)
 	}
 
-	slog.Info("cleave server ready", "url", s.url)
+	slog.Info("litmus server ready", "url", s.url)
 	return nil
 }
 
-// Stop kills the cleave server.
-func (s *cleaveServer) Stop() {
+// Stop kills the litmus server.
+func (s *litmusServer) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.cmd != nil && s.cmd.Process != nil {
 		s.cmd.Process.Kill() //nolint:errcheck,gosec // best-effort kill
 		s.cmd.Wait()         //nolint:errcheck,gosec // collecting zombie
-		slog.Info("cleave server stopped")
+		slog.Info("litmus server stopped")
 	}
 }
 
-// Monitor watches the cleave process and restarts it on crash.
+// Monitor watches the litmus process and restarts it on crash.
 // Blocks until ctx is cancelled or restart limit (10) is exceeded.
-func (s *cleaveServer) Monitor(ctx context.Context) error {
+func (s *litmusServer) Monitor(ctx context.Context) error {
 	const maxRestarts = 10
 	restarts := 0
 	for {
@@ -171,14 +170,13 @@ func (s *cleaveServer) Monitor(ctx context.Context) error {
 			return ctx.Err()
 		}
 		restarts++
-		slog.Warn("cleave server crashed", "error", err, "restarts", restarts)
+		slog.Warn("litmus server crashed", "error", err, "restarts", restarts)
 		if restarts > maxRestarts {
-			return fmt.Errorf("cleave crashed %d times, giving up", restarts)
+			return fmt.Errorf("litmus crashed %d times, giving up", restarts)
 		}
 
-		// Exponential backoff: 1s, 2s, 4s, 8s, capped at 30s.
 		delay := time.Duration(1<<min(restarts-1, 4)) * time.Second
-		slog.Info("restarting cleave server", "delay", delay)
+		slog.Info("restarting litmus server", "delay", delay)
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
@@ -189,14 +187,14 @@ func (s *cleaveServer) Monitor(ctx context.Context) error {
 		err = s.startLocked(ctx)
 		s.mu.Unlock()
 		if err != nil {
-			slog.Error("failed to restart cleave", "error", err)
+			slog.Error("failed to restart litmus", "error", err)
 			continue
 		}
-		slog.Info("cleave server restarted", "restarts", restarts)
+		slog.Info("litmus server restarted", "restarts", restarts)
 	}
 }
 
-func (s *cleaveServer) waitExit(ctx context.Context) error {
+func (s *litmusServer) waitExit(ctx context.Context) error {
 	if s.cmd == nil {
 		return errors.New("no process")
 	}
@@ -210,15 +208,15 @@ func (s *cleaveServer) waitExit(ctx context.Context) error {
 	}
 }
 
-func (s *cleaveServer) waitHealthy(ctx context.Context) error {
-	deadline := time.After(90 * time.Second) // cleave takes ~27s to load traits+yara
+func (s *litmusServer) waitHealthy(ctx context.Context) error {
+	deadline := time.After(120 * time.Second) // litmus loads model + YARA, may take longer than cleave
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-deadline:
-			return errors.New("timeout waiting for cleave to start")
+			return errors.New("timeout waiting for litmus to start")
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
@@ -238,40 +236,36 @@ func (s *cleaveServer) waitHealthy(ctx context.Context) error {
 	}
 }
 
-// cleaveResult is the subset of the cleave response we extract for the DB.
-type cleaveResult struct {
-	CanonicalSHA256 string
-	Score           int
+// analyzeResult holds the split litmus response for storage in hopper.
+type analyzeResult struct {
+	ML        json.RawMessage // ml section → litmus_result column
+	Raw       json.RawMessage // raw section → cleave_result column
+	Canonical string          // canonical SHA256 from raw.fs[]
 }
 
 // restartThreshold is the number of consecutive 503s across all workers
 // before we kill and restart the server to clear orphaned tasks.
 const restartThreshold = 50
 
-// Analyze sends a file to the cleave server for analysis.
-// Returns the raw JSON response and extracted metadata.
+// Analyze sends a file to the litmus server for analysis.
+// Returns the split response (ml + raw sections) and extracted canonical SHA.
 // Retries on 503 with exponential backoff+jitter. If the server is
 // persistently stuck (orphaned tasks), triggers a restart.
-func (s *cleaveServer) Analyze(ctx context.Context, sha256, path string) (json.RawMessage, *cleaveResult, error) {
+func (s *litmusServer) Analyze(ctx context.Context, sha256, path string) (*analyzeResult, error) {
 	body, err := json.Marshal(struct {
 		Path string `json:"path"`
 	}{Path: path})
 	if err != nil {
-		return nil, nil, err
-	}
-
-	type result struct {
-		raw    json.RawMessage
-		parsed *cleaveResult
+		return nil, err
 	}
 
 	r, err := retry.DoWithData(
-		func() (result, error) {
-			raw, parsed, err := s.doAnalyze(ctx, sha256, body)
+		func() (*analyzeResult, error) {
+			result, err := s.doAnalyze(ctx, sha256, body)
 			if err != nil {
-				return result{}, err
+				return nil, err
 			}
-			return result{raw: raw, parsed: parsed}, nil
+			return result, nil
 		},
 		retry.Attempts(12),
 		retry.Context(ctx),
@@ -285,7 +279,7 @@ func (s *cleaveServer) Analyze(ctx context.Context, sha256, path string) (json.R
 		retry.OnRetry(func(attempt uint, err error) {
 			if errors.Is(err, errRetryable) {
 				n := s.consecutive503.Add(1)
-				slog.Debug("cleave overloaded, retrying", "path", path, "attempt", attempt+1, "consecutive_503s", n)
+				slog.Debug("litmus overloaded, retrying", "path", path, "attempt", attempt+1, "consecutive_503s", n)
 				if n >= restartThreshold {
 					s.triggerRestart()
 				}
@@ -294,17 +288,17 @@ func (s *cleaveServer) Analyze(ctx context.Context, sha256, path string) (json.R
 		retry.LastErrorOnly(true),
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("cleave: %s: %w", path, err)
+		return nil, fmt.Errorf("litmus: %s: %w", path, err)
 	}
 
 	s.consecutive503.Store(0)
-	return r.raw, r.parsed, nil
+	return r, nil
 }
 
-// triggerRestart kills the current cleave process to clear orphaned tasks.
+// triggerRestart kills the current litmus process to clear orphaned tasks.
 // Monitor() will detect the exit and restart it automatically.
 // Uses mu to ensure only one restart happens at a time.
-func (s *cleaveServer) triggerRestart() {
+func (s *litmusServer) triggerRestart() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -312,7 +306,7 @@ func (s *cleaveServer) triggerRestart() {
 		return
 	}
 
-	slog.Warn("cleave server stuck with orphaned tasks, killing to force restart",
+	slog.Warn("litmus server stuck with orphaned tasks, killing to force restart",
 		"consecutive_503s", s.consecutive503.Load())
 	s.consecutive503.Store(0)
 	s.cmd.Process.Kill() //nolint:errcheck,gosec // best-effort; Monitor will restart
@@ -320,70 +314,74 @@ func (s *cleaveServer) triggerRestart() {
 
 var errRetryable = errors.New("service unavailable")
 
-func (s *cleaveServer) doAnalyze(ctx context.Context, sha256 string, body []byte) (json.RawMessage, *cleaveResult, error) {
+func (s *litmusServer) doAnalyze(ctx context.Context, sha256 string, body []byte) (*analyzeResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url+"/analyze-path", bytes.NewReader(body))
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.client.Do(req) //nolint:gosec // URL is constructed from localhost + port
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer resp.Body.Close() //nolint:errcheck // HTTP response
 
 	if resp.StatusCode == http.StatusServiceUnavailable {
-		return nil, nil, errRetryable
+		return nil, errRetryable
 	}
 	s.consecutive503.Store(0) // server accepted work, clear overload counter
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512)) //nolint:errcheck // best-effort error body
-		return nil, nil, fmt.Errorf("cleave: %d %s", resp.StatusCode, msg)
+		return nil, fmt.Errorf("litmus: %d %s", resp.StatusCode, msg)
 	}
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, nil, fmt.Errorf("cleave: read response: %w", err)
+		return nil, fmt.Errorf("litmus: read response: %w", err)
 	}
 
-	result, err := extractCleaveResult(sha256, raw)
-	if err != nil {
-		return raw, nil, fmt.Errorf("cleave: parse response: %w", err)
+	// Split the {"ml": {...}, "raw": {...}} envelope.
+	var envelope struct {
+		ML  json.RawMessage `json:"ml"`
+		Raw json.RawMessage `json:"raw"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, fmt.Errorf("litmus: parse envelope: %w", err)
 	}
 
-	return raw, result, nil
+	canonical := extractCanonicalSHA(sha256, envelope.Raw)
+
+	return &analyzeResult{
+		ML:        envelope.ML,
+		Raw:       envelope.Raw,
+		Canonical: canonical,
+	}, nil
 }
 
-// extractCleaveResult pulls risk and finding count from the cleave JSON.
-// The response has summary.max_risk (string) and summary.counts (hostile/suspicious/notable).
-func extractCleaveResult(sha256 string, raw []byte) (*cleaveResult, error) {
-	var resp struct {
+// extractCanonicalSHA computes the minimum SHA256 across files in the raw cleave report.
+func extractCanonicalSHA(sha256 string, raw json.RawMessage) string {
+	var report struct {
 		Files []struct {
 			SHA256 string `json:"sha"`
 			Score  int    `json:"x"`
 			Depth  int    `json:"dp"`
 		} `json:"fs"`
 	}
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return nil, err
+	if json.Unmarshal(raw, &report) != nil {
+		return sha256
 	}
-
 	canonical := sha256
-	score := 0
-	for _, f := range resp.Files {
+	for _, f := range report.Files {
 		if len(f.SHA256) == 64 && f.SHA256 < canonical {
 			canonical = f.SHA256
 		}
-		if f.SHA256 == sha256 || f.Depth == 0 {
-			score = f.Score
-		}
 	}
-	return &cleaveResult{CanonicalSHA256: canonical, Score: score}, nil
+	return canonical
 }
 
 // Workers returns the max concurrent analysis workers.
-func (s *cleaveServer) Workers() int { return s.maxWorkers }
+func (s *litmusServer) Workers() int { return s.maxWorkers }
 
 func freePort(ctx context.Context) (string, error) {
 	var lc net.ListenConfig

@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS samples (
 	label         TEXT NOT NULL DEFAULT 'unknown',
 	label_source  TEXT NOT NULL DEFAULT '',
 	cleave_result TEXT,
+	litmus_result TEXT,
 	path  TEXT NOT NULL DEFAULT '',
 	status        TEXT NOT NULL DEFAULT '',
 	note          TEXT NOT NULL DEFAULT '',

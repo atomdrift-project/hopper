@@ -16,9 +16,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"runtime"
 	"path/filepath"
-	"strings"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -364,19 +363,19 @@ type hashedFile struct {
 
 // loadProgress tracks counters across concurrent load workers.
 type loadProgress struct {
-	walked    atomic.Int64
-	hashed    atomic.Int64
-	inserted  atomic.Int64
-	skipped   atomic.Int64
-	analyzed  atomic.Int64
-	markers   atomic.Int64 // files skipped due to misclassification markers
-	tooSmall  atomic.Int64 // files below minFileSize
-	tooLarge  atomic.Int64 // files above maxFileSize
+	walked     atomic.Int64
+	hashed     atomic.Int64
+	inserted   atomic.Int64
+	skipped    atomic.Int64
+	analyzed   atomic.Int64
+	markers    atomic.Int64 // files skipped due to misclassification markers
+	tooSmall   atomic.Int64 // files below minFileSize
+	tooLarge   atomic.Int64 // files above maxFileSize
 	errors     atomic.Int64
 	hashErrors atomic.Int64 // hash failures (subset of errors, for % calc)
 	cacheHits  atomic.Int64
-	exploded  atomic.Int64 // archive members inserted
-	scoreSum  atomic.Int64 // sum of litmus scores for avg calculation
+	exploded   atomic.Int64 // archive members inserted
+	scoreSum   atomic.Int64 // sum of litmus scores for avg calculation
 
 	// Per-analysis timing (nanoseconds).
 	analyzeDurationSum atomic.Int64
@@ -514,7 +513,7 @@ func loadDir(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 				if marker := checkMarker(path); marker != "" {
 					if (label == "bad" && marker == "benign") || (label == "good" && marker == "bad") {
 						progress.markers.Add(1)
-						sample.Label = marker                           // "benign" or "bad"
+						sample.Label = marker // "benign" or "bad"
 						if marker == "benign" {
 							sample.Label = "good"
 						}
@@ -697,7 +696,7 @@ func startAnalysisWorkers(ctx context.Context, cancel context.CancelFunc, db *ho
 				}
 
 				t0 := time.Now()
-				raw, result, err := litmus.Analyze(ctx, job.sha, job.path)
+				result, err := litmus.Analyze(ctx, job.sha, job.path)
 				dur := time.Since(t0).Nanoseconds()
 
 				if err != nil {
@@ -722,13 +721,16 @@ func startAnalysisWorkers(ctx context.Context, cancel context.CancelFunc, db *ho
 					}
 				}
 
-				if err := db.UpdateLitmusResult(ctx, job.sha, raw, result.CanonicalSHA256); err != nil {
+				// Store raw litmus report and classification envelope separately.
+				if err := db.UpdateCleaveResult(ctx, job.sha, result.Raw, result.Canonical); err != nil {
 					progress.errors.Add(1)
-					slog.Warn("storing result failed", "path", job.path, "error", err)
+					slog.Warn("storing cleave result failed", "path", job.path, "error", err)
 					continue
 				}
+				if err := db.UpdateLitmusResult(ctx, job.sha, result.ML); err != nil {
+					slog.Warn("storing litmus result failed", "path", job.path, "error", err)
+				}
 				progress.analyzed.Add(1)
-				progress.scoreSum.Add(int64(result.Score))
 
 				// Check global analysis cap.
 				if maxAnalyzed > 0 && shared.analyzed.Add(1) >= int64(maxAnalyzed) {
@@ -754,8 +756,6 @@ func startAnalysisWorkers(ctx context.Context, cancel context.CancelFunc, db *ho
 		})
 	}
 }
-
-
 
 // Marker file conventions (shared with cyclotron):
 //
@@ -860,24 +860,25 @@ func hashFile(path, label, source string, cache *hashCache) (*hopper.Sample, err
 		return nil, err
 	}
 
-digest := hex.EncodeToString(h.Sum(nil))
+	digest := hex.EncodeToString(h.Sum(nil))
 
-if cache != nil {
-	cache.store(dev, inode, info.Size(), info.ModTime(), digest)
+	if cache != nil {
+		cache.store(dev, inode, info.Size(), info.ModTime(), digest)
+	}
+
+	s := &hopper.Sample{
+		SHA256:      digest,
+		Source:      source,
+		Filename:    filepath.Base(path),
+		Label:       label,
+		LabelSource: source,
+		SizeBytes:   info.Size(),
+		Path:        path,
+	}
+	s.Feed, s.Ecosystem = extractFeedEcosystem(path, label)
+	return s, nil
 }
 
-s := &hopper.Sample{
-	SHA256:      digest,
-	Source:      source,
-	Filename:    filepath.Base(path),
-	Label:       label,
-	LabelSource: source,
-	SizeBytes:   info.Size(),
-	Path:        path,
-}
-s.Feed, s.Ecosystem = extractFeedEcosystem(path, label)
-return s, nil
-}
 // extractFeedEcosystem parses feed and ecosystem from a file path when
 // a "harvest" directory component is present.
 //

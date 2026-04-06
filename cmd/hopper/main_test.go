@@ -398,7 +398,7 @@ func TestCmdLoadIntegration(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "sample1.bin"), []byte("malicious content!"), 0o644)
 	os.WriteFile(filepath.Join(dir, "sample2.bin"), []byte("another evil file!"), 0o644)
 
-	withArgs([]string{"hopper", "load", "-db", dbPath, "-bad", dir, "-workers", "2", "-cleave", ""}, func() {
+	withArgs([]string{"hopper", "load", "-db", dbPath, "-bad", dir, "-workers", "2", "-litmus", ""}, func() {
 		if err := cmdLoad(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -447,7 +447,7 @@ func TestCmdLoadGood(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "benign.bin"), []byte("harmless content!"), 0o644)
 
-	withArgs([]string{"hopper", "load", "-db", dbPath, "-good", dir, "-workers", "1", "-cleave", "", "-no-cache"}, func() {
+	withArgs([]string{"hopper", "load", "-db", dbPath, "-good", dir, "-workers", "1", "-litmus", "", "-no-cache"}, func() {
 		if err := cmdLoad(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -469,7 +469,7 @@ func TestCmdLoadBothDirs(t *testing.T) {
 	os.WriteFile(filepath.Join(badDir, "evil.bin"), []byte("malicious payload!"), 0o644)
 	os.WriteFile(filepath.Join(goodDir, "safe.bin"), []byte("harmless content!"), 0o644)
 
-	withArgs([]string{"hopper", "load", "-db", dbPath, "-bad", badDir, "-good", goodDir, "-workers", "1", "-cleave", ""}, func() {
+	withArgs([]string{"hopper", "load", "-db", dbPath, "-bad", badDir, "-good", goodDir, "-workers", "1", "-litmus", ""}, func() {
 		if err := cmdLoad(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -544,36 +544,29 @@ func TestRedactDSN(t *testing.T) {
 	}
 }
 
-func TestExtractCleaveResult(t *testing.T) {
+func TestExtractCanonicalSHA(t *testing.T) {
 	// Embedded file has smaller SHA than the sample itself.
 	raw := []byte(`{"fs":[
 		{"sha":"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"},
 		{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
 	]}`)
-	r, err := extractCleaveResult("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.CanonicalSHA256 != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
-		t.Errorf("canonical = %q", r.CanonicalSHA256)
+	got := extractCanonicalSHA("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", raw)
+	if got != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Errorf("canonical = %q", got)
 	}
 
 	// No files: canonical is the sample SHA.
-	r, err = extractCleaveResult("abcd", []byte(`{"fs":[]}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.CanonicalSHA256 != "abcd" {
-		t.Errorf("canonical = %q, want abcd", r.CanonicalSHA256)
+	got = extractCanonicalSHA("abcd", []byte(`{"fs":[]}`))
+	if got != "abcd" {
+		t.Errorf("canonical = %q, want abcd", got)
 	}
 
-	// Invalid JSON.
-	_, err = extractCleaveResult("x", []byte(`{bad`))
-	if err == nil {
-		t.Error("expected error on invalid JSON")
+	// Invalid JSON returns input SHA.
+	got = extractCanonicalSHA("x", []byte(`{bad`))
+	if got != "x" {
+		t.Errorf("canonical = %q, want x", got)
 	}
 }
-
 func TestFreePort(t *testing.T) {
 	port, err := freePort(context.Background())
 	if err != nil {
@@ -624,19 +617,19 @@ func TestWalkFilesSkipsGitDir(t *testing.T) {
 	}
 }
 
-func TestNewCleaveServer(t *testing.T) {
-	s := newCleaveServer(cleaveConfig{Bin: "/usr/bin/cleave", MaxWorkers: 4})
+func TestNewLitmusServer(t *testing.T) {
+	s := newLitmusServer(litmusConfig{Bin: "/usr/bin/litmus", MaxWorkers: 4})
 	if s.Workers() != 4 {
 		t.Errorf("Workers = %d, want 4", s.Workers())
 	}
-	if s.bin != "/usr/bin/cleave" {
+	if s.bin != "/usr/bin/litmus" {
 		t.Errorf("bin = %q", s.bin)
 	}
 
 	// Defaults.
-	s2 := newCleaveServer(cleaveConfig{})
-	if s2.bin != "cleave" {
-		t.Errorf("default bin = %q, want cleave", s2.bin)
+	s2 := newLitmusServer(litmusConfig{})
+	if s2.bin != "litmus" {
+		t.Errorf("default bin = %q, want litmus", s2.bin)
 	}
 	if s2.Workers() != 8 {
 		t.Errorf("default Workers = %d, want 8", s2.Workers())
