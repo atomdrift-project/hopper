@@ -241,6 +241,7 @@ func (s *cleaveServer) waitHealthy(ctx context.Context) error {
 // cleaveResult is the subset of the cleave response we extract for the DB.
 type cleaveResult struct {
 	CanonicalSHA256 string
+	Score           int
 }
 
 // restartThreshold is the number of consecutive 503s across all workers
@@ -360,20 +361,25 @@ func extractCleaveResult(sha256 string, raw []byte) (*cleaveResult, error) {
 	var resp struct {
 		Files []struct {
 			SHA256 string `json:"sha"`
+			Score  int    `json:"x"`
+			Depth  int    `json:"dp"`
 		} `json:"fs"`
 	}
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return nil, err
 	}
 
-	// Compute canonical SHA from the parsed files array.
 	canonical := sha256
+	score := 0
 	for _, f := range resp.Files {
 		if len(f.SHA256) == 64 && f.SHA256 < canonical {
 			canonical = f.SHA256
 		}
+		if f.SHA256 == sha256 || f.Depth == 0 {
+			score = f.Score
+		}
 	}
-	return &cleaveResult{CanonicalSHA256: canonical}, nil
+	return &cleaveResult{CanonicalSHA256: canonical, Score: score}, nil
 }
 
 // Workers returns the max concurrent analysis workers.

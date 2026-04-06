@@ -30,7 +30,13 @@ func (db *DB) migratePG(ctx context.Context) error {
 	for _, ddl := range []string{
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS parent TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS skip TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS formula TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS elements TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS score INTEGER NOT NULL DEFAULT 0`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent) WHERE parent != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_formula ON samples(formula) WHERE formula != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_elements ON samples(elements) WHERE elements != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_score ON samples(score) WHERE score != 0`,
 	} {
 		if _, err := db.pool.Exec(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate: %w", err)
@@ -41,14 +47,14 @@ func (db *DB) migratePG(ctx context.Context) error {
 
 const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, cleave_result,
-	path, status, note, canonical_sha256, parent, skip, created_at, updated_at, analyzed_at`
+	path, status, note, canonical_sha256, parent, skip, formula, elements, score, created_at, updated_at, analyzed_at`
 
 func pgSampleDest(s *Sample) []any {
 	return []any{
 		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &s.CleaveResult,
 		&s.Path, &s.Status, &s.Note, &s.CanonicalSHA256,
-		&s.Parent, &s.Skip, &s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt,
+		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt,
 	}
 }
 
@@ -80,11 +86,11 @@ func scanPGSamples(rows pgx.Rows) ([]*Sample, error) {
 func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 	tag, err := db.pool.Exec(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $1, $12, $13)
+			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $1, $12, $13, $14, $15, $16)
 		ON CONFLICT (sha256) DO NOTHING`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
-		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.Parent, s.Skip)
+		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.Parent, s.Skip, s.Formula, s.Elements, s.Score)
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
@@ -94,20 +100,20 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 var insertBatchStagingCols = []string{
 	"sha256", "source", "feed", "ecosystem", "filename", "file_type",
 	"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
-	"parent", "skip",
+	"parent", "skip", "formula", "elements", "score",
 }
 
 const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 	sha256 TEXT, source TEXT, feed TEXT, ecosystem TEXT, filename TEXT,
 	file_type TEXT, size_bytes BIGINT, label TEXT, label_source TEXT,
 	path TEXT, status TEXT, canonical_sha256 TEXT,
-	parent TEXT, skip TEXT
+	parent TEXT, skip TEXT, formula TEXT, elements TEXT, score INTEGER
 ) ON COMMIT DROP`
 
 const insertBatchStagingInsert = `INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip)
+	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score)
 SELECT sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip
+	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score
 FROM _staging
 ON CONFLICT (sha256) DO NOTHING`
 
@@ -117,7 +123,7 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (int64
 		rows[i] = []any{
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256,
-			s.Parent, s.Skip,
+			s.Parent, s.Skip, s.Formula, s.Elements, s.Score,
 		}
 	}
 
@@ -152,11 +158,12 @@ func (db *DB) sampleBySHA256PG(ctx context.Context, sha256 string) (*Sample, err
 	return s, nil
 }
 
-func (db *DB) updateCleaveResultPG(ctx context.Context, sha256 string, result []byte, canonical string) error {
+func (db *DB) updateCleaveResultPG(ctx context.Context, sha256 string, result []byte, canonical string, fi cleaveFileInfo) error {
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET cleave_result = $2,
-			canonical_sha256 = $3, analyzed_at = now(), updated_at = now()
-		WHERE sha256 = $1`, sha256, sanitizeJSONB(result), canonical)
+			canonical_sha256 = $3, formula = $4, elements = $5, score = $6,
+			analyzed_at = now(), updated_at = now()
+		WHERE sha256 = $1`, sha256, sanitizeJSONB(result), canonical, fi.Formula, fi.Elements, fi.Score)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
 	}
@@ -239,11 +246,12 @@ func (db *DB) countByStatusPG(ctx context.Context) (map[string]int, error) {
 	return scanPGCounts(rows)
 }
 
-func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result []byte, canonical string) error {
+func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result []byte, canonical string, fi cleaveFileInfo) error {
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET status = $2, cleave_result = $3,
-			canonical_sha256 = $4, analyzed_at = now(), updated_at = now()
-		WHERE sha256 = $1`, sha256, status, sanitizeJSONB(result), canonical)
+			canonical_sha256 = $4, formula = $5, elements = $6, score = $7,
+			analyzed_at = now(), updated_at = now()
+		WHERE sha256 = $1`, sha256, status, sanitizeJSONB(result), canonical, fi.Formula, fi.Elements, fi.Score)
 	if err != nil {
 		return fmt.Errorf("hopper: update sample: %w", err)
 	}

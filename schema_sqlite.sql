@@ -16,6 +16,9 @@ CREATE TABLE IF NOT EXISTS samples (
 	canonical_sha256 TEXT NOT NULL DEFAULT '',
 	parent        TEXT NOT NULL DEFAULT '',
 	skip          TEXT NOT NULL DEFAULT '',
+	formula       TEXT NOT NULL DEFAULT '',
+	elements      TEXT NOT NULL DEFAULT '',
+	score         INTEGER NOT NULL DEFAULT 0,
 	created_at    DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
 	updated_at    DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
 	analyzed_at   DATETIME

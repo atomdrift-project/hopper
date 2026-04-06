@@ -641,6 +641,71 @@ func TestPool(t *testing.T) {
 	}
 }
 
+func TestStripSubscripts(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"O₃(C₂Er₂As)H₃(F₃OsPo₃)Md₃(PtBi)", "O(CErAs)H(FOsPo)Md(PtBi)"},
+		{"", ""},
+		{"NoPo", "NoPo"},
+		{"H₁₀", "H"},
+	}
+	for _, tt := range tests {
+		got := stripSubscripts(tt.in)
+		if got != tt.want {
+			t.Errorf("stripSubscripts(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestParseCleaveFile(t *testing.T) {
+	result := []byte(`{"fs":[{"sha":"aaa","f":"O₃H₂","x":16,"dp":0}]}`)
+	fi := parseCleaveFile("aaa", result)
+	if fi.Formula != "O₃H₂" {
+		t.Errorf("Formula = %q", fi.Formula)
+	}
+	if fi.Elements != "OH" {
+		t.Errorf("Elements = %q", fi.Elements)
+	}
+	if fi.Score != 16 {
+		t.Errorf("Score = %d", fi.Score)
+	}
+
+	// Empty result.
+	fi = parseCleaveFile("aaa", nil)
+	if fi.Formula != "" || fi.Score != 0 {
+		t.Errorf("expected empty for nil result, got %+v", fi)
+	}
+
+	// Invalid JSON.
+	fi = parseCleaveFile("aaa", []byte("{bad"))
+	if fi.Formula != "" {
+		t.Errorf("expected empty for bad JSON, got %+v", fi)
+	}
+}
+
+func TestUpdateCleaveResultSetsFormulaAndScore(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{SHA256: "fs1", Source: "test", Label: "bad", LabelSource: "test"})
+	result := []byte(`{"fs":[{"sha":"fs1","f":"O₃(C₂Er₂As)","x":42,"dp":0}]}`)
+	if err := db.UpdateCleaveResult(ctx, "fs1", result, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := db.SampleBySHA256(ctx, "fs1")
+	if got.Formula != "O₃(C₂Er₂As)" {
+		t.Errorf("Formula = %q", got.Formula)
+	}
+	if got.Elements != "O(CErAs)" {
+		t.Errorf("Elements = %q", got.Elements)
+	}
+	if got.Score != 42 {
+		t.Errorf("Score = %d", got.Score)
+	}
+}
+
 func TestSanitizeJSONB(t *testing.T) {
 	tests := []struct {
 		name string

@@ -316,16 +316,21 @@ func cmdLoad(ctx context.Context) error {
 		}()
 	}
 
+	// Count active directories to split cleave workers evenly.
+	var loadDirs []struct{ dir, label string }
+	for _, d := range []struct{ dir, label string }{{*bad, "bad"}, {*good, "good"}} {
+		if d.dir != "" {
+			loadDirs = append(loadDirs, d)
+		}
+	}
+
 	var total atomic.Int64
 	var loadWG sync.WaitGroup
-	for _, d := range []struct{ dir, label string }{{*bad, "bad"}, {*good, "good"}} {
-		if d.dir == "" {
-			continue
-		}
+	for _, d := range loadDirs {
 		loadWG.Add(1)
 		go func() {
 			defer loadWG.Done()
-			total.Add(int64(loadDir(ctx, db, cleave, cache, d.dir, d.label, *source, *workers, *rescan)))
+			total.Add(int64(loadDir(ctx, db, cleave, cache, d.dir, d.label, *source, *workers, *rescan, len(loadDirs))))
 		}()
 	}
 	loadWG.Wait()
@@ -357,6 +362,8 @@ type loadProgress struct {
 	tooLarge  atomic.Int64 // files above maxFileSize
 	errors    atomic.Int64
 	cacheHits atomic.Int64
+	exploded  atomic.Int64 // archive members inserted
+	scoreSum  atomic.Int64 // sum of cleave scores for avg calculation
 }
 
 const (
@@ -370,7 +377,7 @@ var (
 	errTooLarge = errors.New("too large")
 )
 
-func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, cache *hashCache, dir, label, source string, nworkers int, rescan bool) int {
+func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, cache *hashCache, dir, label, source string, nworkers int, rescan bool, numDirs int) int {
 	slog.Info("loading directory", "dir", dir, "label", label, "workers", nworkers)
 	start := time.Now()
 	var progress loadProgress
@@ -380,11 +387,13 @@ func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, cache *ha
 	var hashWG sync.WaitGroup
 
 	// Analysis queue: nil if cleave is not configured.
+	// Split cleave workers evenly across active directories.
 	var analyzeQueue chan loadJob
 	var analyzeWG sync.WaitGroup
 	if cleave != nil {
-		analyzeQueue = make(chan loadJob, cleave.Workers()*2)
-		startAnalysisWorkers(ctx, db, cleave, analyzeQueue, &analyzeWG, &progress)
+		perDir := max(1, cleave.Workers()/numDirs)
+		analyzeQueue = make(chan loadJob, perDir*2)
+		startAnalysisWorkers(ctx, db, cleave, analyzeQueue, &analyzeWG, &progress, perDir)
 	}
 
 	// Periodic progress reporting.
@@ -395,15 +404,23 @@ func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, cache *ha
 			select {
 			case <-ticker.C:
 				elapsed := time.Since(start).Seconds()
-				slog.Info("load progress", "dir", dir,
+				analyzed := progress.analyzed.Load()
+				attrs := []any{
+					"dir", dir,
 					"walked", progress.walked.Load(), "hashed", progress.hashed.Load(),
 					"inserted", progress.inserted.Load(),
 					"skipped", progress.skipped.Load(), "markers", progress.markers.Load(),
 					"too_small", progress.tooSmall.Load(), "too_large", progress.tooLarge.Load(),
 					"cache_hits", progress.cacheHits.Load(),
-					"analyzed", progress.analyzed.Load(),
+					"analyzed", analyzed,
+					"exploded", progress.exploded.Load(),
 					"errors", progress.errors.Load(),
-					"analyze_per_sec", int(float64(progress.analyzed.Load())/elapsed))
+					"analyze_per_sec", int(float64(analyzed) / elapsed),
+				}
+				if analyzed > 0 {
+					attrs = append(attrs, "avg_score", int(progress.scoreSum.Load()/analyzed))
+				}
+				slog.Info("load progress", attrs...)
 			case <-done:
 				return
 			}
@@ -564,21 +581,29 @@ func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, cache *ha
 	ticker.Stop()
 	close(done)
 
-	slog.Info("directory complete", "dir", dir,
+	analyzed := progress.analyzed.Load()
+	completeAttrs := []any{
+		"dir", dir,
 		"walked", progress.walked.Load(), "hashed", progress.hashed.Load(),
 		"inserted", progress.inserted.Load(),
 		"skipped", progress.skipped.Load(), "markers", progress.markers.Load(),
 		"too_small", progress.tooSmall.Load(), "too_large", progress.tooLarge.Load(),
 		"cache_hits", progress.cacheHits.Load(),
-		"analyzed", progress.analyzed.Load(),
+		"analyzed", analyzed,
+		"exploded", progress.exploded.Load(),
 		"errors", progress.errors.Load(),
-		"elapsed", time.Since(start).Round(time.Millisecond))
+		"elapsed", time.Since(start).Round(time.Millisecond),
+	}
+	if analyzed > 0 {
+		completeAttrs = append(completeAttrs, "avg_score", int(progress.scoreSum.Load()/analyzed))
+	}
+	slog.Info("directory complete", completeAttrs...)
 
 	return int(progress.inserted.Load() + progress.skipped.Load())
 }
 
-func startAnalysisWorkers(ctx context.Context, db *hopper.DB, cleave *cleaveServer, queue chan loadJob, wg *sync.WaitGroup, progress *loadProgress) {
-	for range cleave.Workers() {
+func startAnalysisWorkers(ctx context.Context, db *hopper.DB, cleave *cleaveServer, queue chan loadJob, wg *sync.WaitGroup, progress *loadProgress, nworkers int) {
+	for range nworkers {
 		wg.Go(func() {
 			for job := range queue {
 				if ctx.Err() != nil {
@@ -596,6 +621,7 @@ func startAnalysisWorkers(ctx context.Context, db *hopper.DB, cleave *cleaveServ
 					continue
 				}
 				progress.analyzed.Add(1)
+				progress.scoreSum.Add(int64(result.Score))
 
 				// Explode archive members into individual sample rows.
 				parent, err := db.SampleBySHA256(ctx, job.sha)
@@ -607,7 +633,8 @@ func startAnalysisWorkers(ctx context.Context, db *hopper.DB, cleave *cleaveServ
 				if err != nil {
 					slog.Warn("archive explosion failed", "sha256", job.sha, "error", err)
 				} else if totalMembers > 0 {
-					slog.Info("exploded archive members", "sha256", job.sha, "members", totalMembers)
+					slog.Debug("exploded archive members", "sha256", job.sha, "members", totalMembers)
+					progress.exploded.Add(totalMembers)
 				}
 			}
 		})

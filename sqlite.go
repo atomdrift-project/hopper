@@ -47,12 +47,32 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			}
 		}
 	}
+
+	var hasFormula int
+	//nolint:errcheck,gosec // best-effort column check
+	db.lite.QueryRowContext(ctx,
+		"SELECT count(*) FROM pragma_table_info('samples') WHERE name = 'formula'",
+	).Scan(&hasFormula)
+	if hasFormula == 0 {
+		for _, ddl := range []string{
+			`ALTER TABLE samples ADD COLUMN formula TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE samples ADD COLUMN elements TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE samples ADD COLUMN score INTEGER NOT NULL DEFAULT 0`,
+			`CREATE INDEX IF NOT EXISTS idx_samples_formula ON samples(formula) WHERE formula != ''`,
+			`CREATE INDEX IF NOT EXISTS idx_samples_elements ON samples(elements) WHERE elements != ''`,
+			`CREATE INDEX IF NOT EXISTS idx_samples_score ON samples(score) WHERE score != 0`,
+		} {
+			if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
+				return fmt.Errorf("hopper: migrate sqlite: %w", err)
+			}
+		}
+	}
 	return nil
 }
 
 const liteSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, cleave_result,
-	path, status, note, canonical_sha256, parent, skip, created_at, updated_at, analyzed_at`
+	path, status, note, canonical_sha256, parent, skip, formula, elements, score, created_at, updated_at, analyzed_at`
 
 func scanLiteSample(row *sql.Row) (*Sample, error) {
 	s := &Sample{}
@@ -61,7 +81,7 @@ func scanLiteSample(row *sql.Row) (*Sample, error) {
 	err := row.Scan(&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult,
 		&s.Path, &status, &s.Note, &s.CanonicalSHA256,
-		&s.Parent, &s.Skip, &s.CreatedAt, &s.UpdatedAt, &analyzedAt)
+		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -88,7 +108,7 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 		if err := rows.Scan(&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult,
 			&s.Path, &status, &s.Note, &s.CanonicalSHA256,
-			&s.Parent, &s.Skip, &s.CreatedAt, &s.UpdatedAt, &analyzedAt); err != nil {
+			&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt); err != nil {
 			return nil, err
 		}
 		if cleaveResult.Valid {
@@ -108,11 +128,11 @@ func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error) {
 	res, err := db.lite.ExecContext(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256) DO NOTHING`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
-		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256, s.Parent, s.Skip)
+		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256, s.Parent, s.Skip, s.Formula, s.Elements, s.Score)
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
@@ -131,8 +151,8 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, score)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256) DO NOTHING`)
 	if err != nil {
 		tx.Rollback() //nolint:errcheck,gosec // best-effort rollback on prepare error
@@ -144,7 +164,7 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 	for _, s := range samples {
 		res, err := stmt.ExecContext(ctx,
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
-			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256, s.Parent, s.Skip)
+			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256, s.Parent, s.Skip, s.Formula, s.Score)
 		if err != nil {
 			tx.Rollback() //nolint:errcheck,gosec // best-effort rollback on insert error
 			return inserted, fmt.Errorf("hopper: batch insert %s: %w", s.SHA256, err)
@@ -169,12 +189,13 @@ func (db *DB) sampleBySHA256SQLite(ctx context.Context, sha256 string) (*Sample,
 	return s, nil
 }
 
-func (db *DB) updateCleaveResultSQLite(ctx context.Context, sha256 string, result []byte, canonical string) error {
+func (db *DB) updateCleaveResultSQLite(ctx context.Context, sha256 string, result []byte, canonical string, fi cleaveFileInfo) error {
 	n := now()
 	_, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET cleave_result = ?,
-			canonical_sha256 = ?, analyzed_at = ?, updated_at = ?
-		WHERE sha256 = ?`, string(result), canonical, n, n, sha256)
+			canonical_sha256 = ?, formula = ?, elements = ?, score = ?,
+			analyzed_at = ?, updated_at = ?
+		WHERE sha256 = ?`, string(result), canonical, fi.Formula, fi.Elements, fi.Score, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
 	}
@@ -257,12 +278,13 @@ func (db *DB) countByStatusSQLite(ctx context.Context) (map[string]int, error) {
 	return scanLiteCounts(rows)
 }
 
-func (db *DB) updateSampleSQLite(ctx context.Context, sha256, status string, result []byte, canonical string) error {
+func (db *DB) updateSampleSQLite(ctx context.Context, sha256, status string, result []byte, canonical string, fi cleaveFileInfo) error {
 	n := now()
 	_, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET status = ?, cleave_result = ?,
-			canonical_sha256 = ?, analyzed_at = ?, updated_at = ?
-		WHERE sha256 = ?`, status, string(result), canonical, n, n, sha256)
+			canonical_sha256 = ?, formula = ?, elements = ?, score = ?,
+			analyzed_at = ?, updated_at = ?
+		WHERE sha256 = ?`, status, string(result), canonical, fi.Formula, fi.Elements, fi.Score, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update sample: %w", err)
 	}

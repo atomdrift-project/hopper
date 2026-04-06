@@ -115,10 +115,13 @@ type Sample struct {
 	CanonicalSHA256 string // min SHA256 across sample + embedded files; for train/test split
 	Parent          string // SHA256 of archive this was extracted from; "" for top-level
 	Skip            string // non-empty = excluded from training, value = reason
+	Formula         string // cleave chemical formula (behavioral signature)
+	Elements        string // formula without counts (qualitative composition)
 	AnalyzedAt      *time.Time
 	CleaveResult    []byte // raw JSON, nil if unanalyzed
 	ID              int64
 	SizeBytes       int64
+	Score           int    // cleave raw score
 }
 
 // Report is an analysis report produced by cyclotron.
@@ -130,6 +133,54 @@ type Report struct {
 	Provider   string
 	ID         int64
 	DurationMS int
+}
+
+// cleaveFileInfo holds per-file metadata extracted from a cleave result.
+type cleaveFileInfo struct {
+	Formula  string
+	Elements string
+	Score    int
+}
+
+// parseCleaveFile extracts formula, elements, and score from a cleave result
+// for the file matching the given SHA256 (depth 0 / first file).
+func parseCleaveFile(sha256 string, result []byte) cleaveFileInfo {
+	if len(result) == 0 {
+		return cleaveFileInfo{}
+	}
+	var report struct {
+		Files []struct {
+			SHA256  string `json:"sha"`
+			Formula string `json:"f"`
+			Score   int    `json:"x"`
+			Depth   int    `json:"dp"`
+		} `json:"fs"`
+	}
+	if json.Unmarshal(result, &report) != nil {
+		return cleaveFileInfo{}
+	}
+	for _, f := range report.Files {
+		if f.SHA256 == sha256 || f.Depth == 0 {
+			return cleaveFileInfo{
+				Formula:  f.Formula,
+				Elements: stripSubscripts(f.Formula),
+				Score:    f.Score,
+			}
+		}
+	}
+	return cleaveFileInfo{}
+}
+
+// stripSubscripts removes Unicode subscript digits (₀-₉) from a formula,
+// producing the qualitative element list.
+func stripSubscripts(formula string) string {
+	var b strings.Builder
+	for _, r := range formula {
+		if r < '₀' || r > '₉' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // canonicalSHA returns the lexicographic minimum SHA256 across the sample
@@ -337,10 +388,11 @@ func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []by
 	if canonicalSHA256 == "" {
 		canonicalSHA256 = canonicalSHA(sha256, result)
 	}
+	fi := parseCleaveFile(sha256, result)
 	if db.pool != nil {
-		return db.updateCleaveResultPG(ctx, sha256, result, canonicalSHA256)
+		return db.updateCleaveResultPG(ctx, sha256, result, canonicalSHA256, fi)
 	}
-	return db.updateCleaveResultSQLite(ctx, sha256, result, canonicalSHA256)
+	return db.updateCleaveResultSQLite(ctx, sha256, result, canonicalSHA256, fi)
 }
 
 // Reclassify changes a sample's label.
@@ -414,10 +466,11 @@ func (db *DB) UpdateSample(ctx context.Context, sha256, status string, result []
 	if canonicalSHA256 == "" {
 		canonicalSHA256 = canonicalSHA(sha256, result)
 	}
+	fi := parseCleaveFile(sha256, result)
 	if db.pool != nil {
-		return db.updateSamplePG(ctx, sha256, status, result, canonicalSHA256)
+		return db.updateSamplePG(ctx, sha256, status, result, canonicalSHA256, fi)
 	}
-	return db.updateSampleSQLite(ctx, sha256, status, result, canonicalSHA256)
+	return db.updateSampleSQLite(ctx, sha256, status, result, canonicalSHA256, fi)
 }
 
 // SamplesByStatusInPaths returns samples matching status whose path
