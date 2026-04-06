@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -309,16 +310,20 @@ func cmdLoad(ctx context.Context) error {
 		}()
 	}
 
-	var total int64
-	if *bad != "" {
-		n := loadDir(ctx, db, cleave, *bad, "bad", *source, *workers, *rescan)
-		total += int64(n)
+	var total atomic.Int64
+	var loadWG sync.WaitGroup
+	for _, d := range []struct{ dir, label string }{{*bad, "bad"}, {*good, "good"}} {
+		if d.dir == "" {
+			continue
+		}
+		loadWG.Add(1)
+		go func() {
+			defer loadWG.Done()
+			total.Add(int64(loadDir(ctx, db, cleave, d.dir, d.label, *source, *workers, *rescan)))
+		}()
 	}
-	if *good != "" {
-		n := loadDir(ctx, db, cleave, *good, "good", *source, *workers, *rescan)
-		total += int64(n)
-	}
-	slog.Info("load complete", "samples", total)
+	loadWG.Wait()
+	slog.Info("load complete", "samples", total.Load())
 	return nil
 }
 
@@ -341,6 +346,7 @@ type loadProgress struct {
 	inserted atomic.Int64
 	skipped  atomic.Int64
 	analyzed atomic.Int64
+	markers  atomic.Int64 // files skipped due to misclassification markers
 	errors   atomic.Int64
 }
 
@@ -374,28 +380,47 @@ func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, dir, labe
 				slog.Info("load progress", "dir", dir,
 					"walked", progress.walked.Load(), "hashed", progress.hashed.Load(),
 					"inserted", progress.inserted.Load(),
-					"skipped", progress.skipped.Load(), "analyzed", progress.analyzed.Load(),
+					"skipped", progress.skipped.Load(), "markers", progress.markers.Load(),
+					"analyzed", progress.analyzed.Load(),
 					"errors", progress.errors.Load(),
-					"files_per_sec", int(float64(progress.hashed.Load())/elapsed))
+					"analyze_per_sec", int(float64(progress.analyzed.Load())/elapsed))
 			case <-done:
 				return
 			}
 		}
 	}()
 
-	// Hash workers: read files and compute SHA256, send to batch inserter.
+	// Hash workers: read files, check markers, compute SHA256, send to batch inserter.
 	for range nworkers {
 		hashWG.Go(func() {
 			for path := range paths {
 				if ctx.Err() != nil {
 					return
 				}
+
 				sample, err := hashFile(path, label, source)
 				if err != nil {
 					progress.errors.Add(1)
 					slog.Warn("skipping file", "path", path, "error", err)
 					continue
 				}
+
+				// Check for misclassification markers that contradict the label.
+				// A BENIGN marker on a known-bad file → flip to good, skip training.
+				// A BAD marker on a known-good file → flip to bad, skip training.
+				if marker := checkMarker(path); marker != "" {
+					if (label == "bad" && marker == "benign") || (label == "good" && marker == "bad") {
+						progress.markers.Add(1)
+						sample.Label = marker                           // "benign" or "bad"
+						if marker == "benign" {
+							sample.Label = "good"
+						}
+						sample.LabelSource = "marker"
+						sample.Skip = "misclassified"
+						slog.Info("misclassified file", "path", path, "original_label", label, "marker", marker)
+					}
+				}
+
 				progress.hashed.Add(1)
 				select {
 				case hashed <- hashedFile{sample: sample, path: path}:
@@ -406,9 +431,13 @@ func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, dir, labe
 		})
 	}
 
+	// Pending analysis: unbounded buffer so the inserter never blocks on slow analysis.
+	pendingAnalysis := make(chan loadJob, 4096)
+
 	// Batch inserter: collects hashed files and flushes in batches.
 	var insertWG sync.WaitGroup
 	insertWG.Go(func() {
+		defer close(pendingAnalysis)
 		batch := make([]hashedFile, 0, loadBatchSize)
 
 		flush := func() {
@@ -419,6 +448,21 @@ func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, dir, labe
 			for i, h := range batch {
 				samples[i] = h.sample
 			}
+			// Detect intra-batch SHA256 duplicates for diagnostics.
+			seen := make(map[string]string, len(batch))
+			intraDups := 0
+			for _, h := range batch {
+				if prev, ok := seen[h.sample.SHA256]; ok {
+					intraDups++
+					slog.Info("intra-batch duplicate SHA256",
+						"sha256", h.sample.SHA256,
+						"path", h.path,
+						"duplicate_of", prev)
+				} else {
+					seen[h.sample.SHA256] = h.path
+				}
+			}
+
 			n, err := db.InsertSampleBatch(ctx, samples)
 			if err != nil {
 				slog.Error("batch insert failed", "error", err, "batch_size", len(batch))
@@ -427,15 +471,29 @@ func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, dir, labe
 				return
 			}
 			progress.inserted.Add(n)
-			progress.skipped.Add(int64(len(batch)) - n)
+			skipped := int64(len(batch)) - n
+			progress.skipped.Add(skipped)
 
-			// Enqueue for cleave analysis. With --rescan, enqueue everything.
-			// Without, enqueue all samples from batches that had any new inserts —
-			// analysis is idempotent so re-analyzing a few duplicates is fine,
-			// and avoids per-row DB lookups to check which were new.
+			crossBatchDups := skipped - int64(intraDups)
+			slog.Info("batch flush",
+				"batch_size", len(batch),
+				"inserted", n,
+				"skipped", skipped,
+				"intra_batch_dups", intraDups,
+				"cross_batch_dups", crossBatchDups,
+				"unique_hashes", len(seen))
+
+			// Send to analysis feeder without blocking the inserter.
 			hasNew := n > 0
 			for _, h := range batch {
-				enqueueAnalysis(ctx, analyzeQueue, h.path, h.sample.SHA256, hasNew, rescan)
+				if analyzeQueue == nil || (!hasNew && !rescan) {
+					continue
+				}
+				select {
+				case pendingAnalysis <- loadJob{path: h.path, sha: h.sample.SHA256}:
+				case <-ctx.Done():
+					return
+				}
 			}
 			batch = batch[:0]
 		}
@@ -449,11 +507,27 @@ func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, dir, labe
 		flush()
 	})
 
+	// Analysis feeder: drains pendingAnalysis into the bounded analyzeQueue,
+	// decoupling the inserter from slow analysis workers.
+	var feederWG sync.WaitGroup
+	if analyzeQueue != nil {
+		feederWG.Go(func() {
+			for job := range pendingAnalysis {
+				select {
+				case analyzeQueue <- job:
+				case <-ctx.Done():
+					return
+				}
+			}
+		})
+	}
+
 	walkFiles(ctx, dir, paths, &progress)
 	close(paths)
 	hashWG.Wait()
 	close(hashed)
-	insertWG.Wait()
+	insertWG.Wait()  // also closes pendingAnalysis
+	feederWG.Wait()  // drains pendingAnalysis into analyzeQueue
 
 	if analyzeQueue != nil {
 		close(analyzeQueue)
@@ -466,7 +540,8 @@ func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, dir, labe
 	slog.Info("directory complete", "dir", dir,
 		"walked", progress.walked.Load(), "hashed", progress.hashed.Load(),
 		"inserted", progress.inserted.Load(),
-		"skipped", progress.skipped.Load(), "analyzed", progress.analyzed.Load(),
+		"skipped", progress.skipped.Load(), "markers", progress.markers.Load(),
+		"analyzed", progress.analyzed.Load(),
 		"errors", progress.errors.Load(),
 		"elapsed", time.Since(start).Round(time.Millisecond))
 
@@ -499,27 +574,52 @@ func startAnalysisWorkers(ctx context.Context, db *hopper.DB, cleave *cleaveServ
 					slog.Warn("fetch for explosion failed", "sha256", job.sha, "error", err)
 					continue
 				}
-				if n, err := db.ExplodeArchiveMembers(ctx, parent); err != nil {
+				totalMembers, err := db.ExplodeArchiveMembers(ctx, parent)
+				if err != nil {
 					slog.Warn("archive explosion failed", "sha256", job.sha, "error", err)
-				} else if n > 0 {
-					slog.Info("exploded archive members", "sha256", job.sha, "members", n)
+				} else if totalMembers > 0 {
+					slog.Info("exploded archive members", "sha256", job.sha, "members", totalMembers)
 				}
 			}
 		})
 	}
 }
 
-func enqueueAnalysis(ctx context.Context, queue chan loadJob, path, sha string, enqueue, rescan bool) {
-	if queue == nil {
-		return
+
+
+// Marker file conventions (shared with cyclotron):
+//
+//	._<filename>.BENIGN — file is actually benign (overrides --bad label)
+//	._<filename>.BAD    — file is actually malicious (overrides --good label)
+const (
+	markerPrefix = "._"
+	markerBenign = ".BENIGN"
+	markerBad    = ".BAD"
+)
+
+// isMarkerFile returns true if the filename is itself a marker (e.g. ._foo.whl.BENIGN).
+func isMarkerFile(name string) bool {
+	return strings.HasPrefix(name, markerPrefix) &&
+		(strings.HasSuffix(name, markerBenign) || strings.HasSuffix(name, markerBad))
+}
+
+// checkMarker looks for a sibling marker file that contradicts the given label.
+// Returns "benign" or "bad" if a marker exists, "" otherwise.
+func checkMarker(path string) string {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+
+	benign := filepath.Join(dir, markerPrefix+base+markerBenign)
+	if _, err := os.Stat(benign); err == nil {
+		return "benign"
 	}
-	if !enqueue && !rescan {
-		return
+
+	bad := filepath.Join(dir, markerPrefix+base+markerBad)
+	if _, err := os.Stat(bad); err == nil {
+		return "bad"
 	}
-	select {
-	case queue <- loadJob{path: path, sha: sha}:
-	case <-ctx.Done():
-	}
+
+	return ""
 }
 
 func walkFiles(ctx context.Context, dir string, paths chan<- string, progress *loadProgress) {
@@ -527,6 +627,10 @@ func walkFiles(ctx context.Context, dir string, paths chan<- string, progress *l
 	filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error { //nolint:errcheck,gosec // errors logged per-file
 		if err != nil || d.IsDir() {
 			return err
+		}
+		// Skip marker files themselves — they are metadata, not samples.
+		if isMarkerFile(d.Name()) {
+			return nil
 		}
 		progress.walked.Add(1)
 		select {
@@ -549,6 +653,15 @@ func hashFile(path, label, source string) (*hopper.Sample, error) {
 	info, err := f.Stat()
 	if err != nil {
 		return nil, err
+	}
+
+	const minFileSize = 13          // skip trivially small files (markers, empty, etc.)
+	const maxFileSize = 1 << 30     // 1 GiB
+	if info.Size() < minFileSize {
+		return nil, fmt.Errorf("too small (%d bytes)", info.Size())
+	}
+	if info.Size() >= maxFileSize {
+		return nil, fmt.Errorf("too large (%d bytes)", info.Size())
 	}
 
 	h := sha256.New()

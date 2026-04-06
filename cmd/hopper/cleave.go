@@ -15,7 +15,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/codeGROOVE-dev/retry"
 )
 
 // cleaveServer manages a cleave API server subprocess.
@@ -29,6 +32,11 @@ type cleaveServer struct {
 	mu         sync.Mutex
 	maxRSSGB   int
 	maxWorkers int
+
+	// consecutive503 tracks how many 503s we've seen in a row across all workers.
+	// When this exceeds the restart threshold, we kill and restart the server
+	// to clear orphaned tasks.
+	consecutive503 atomic.Int64
 }
 
 // cleaveConfig holds options for starting a cleave server.
@@ -85,14 +93,21 @@ func (s *cleaveServer) startLocked(ctx context.Context) error {
 	}
 
 	cmd := exec.CommandContext(ctx, s.bin, args...) //nolint:gosec // bin path is from trusted CLI flag
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
+
+	logFile, err := os.CreateTemp("", "cleave-*.log")
+	if err != nil {
+		return fmt.Errorf("create cleave log file: %w", err)
+	}
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+
 	if err := cmd.Start(); err != nil {
+		logFile.Close() //nolint:errcheck
 		return fmt.Errorf("start cleave: %w", err)
 	}
 	s.cmd = cmd
 
-	slog.Info("starting cleave server", "bind", bind, "pid", cmd.Process.Pid)
+	slog.Info("starting cleave server", "bind", bind, "pid", cmd.Process.Pid, "log", logFile.Name())
 
 	// Wait for health endpoint.
 	if err := s.waitHealthy(ctx); err != nil {
@@ -198,9 +213,14 @@ type cleaveResult struct {
 	CanonicalSHA256 string
 }
 
+// restartThreshold is the number of consecutive 503s across all workers
+// before we kill and restart the server to clear orphaned tasks.
+const restartThreshold = 50
+
 // Analyze sends a file to the cleave server for analysis.
 // Returns the raw JSON response and extracted metadata.
-// Retries on 503 (memory pressure / overload) with backoff.
+// Retries on 503 with exponential backoff+jitter. If the server is
+// persistently stuck (orphaned tasks), triggers a restart.
 func (s *cleaveServer) Analyze(ctx context.Context, sha256, path string) (json.RawMessage, *cleaveResult, error) {
 	body, err := json.Marshal(struct {
 		Path string `json:"path"`
@@ -209,24 +229,62 @@ func (s *cleaveServer) Analyze(ctx context.Context, sha256, path string) (json.R
 		return nil, nil, err
 	}
 
-	const maxRetries = 5
-	for attempt := range maxRetries {
-		raw, result, err := s.doAnalyze(ctx, sha256, body)
-		if err == nil {
-			return raw, result, nil
-		}
-		if !errors.Is(err, errRetryable) {
-			return nil, nil, err
-		}
-		delay := time.Duration(1<<min(attempt, 3)) * time.Second
-		slog.Debug("cleave returned 503, backing off", "path", path, "delay", delay)
-		select {
-		case <-time.After(delay):
-		case <-ctx.Done():
-			return nil, nil, ctx.Err()
-		}
+	type result struct {
+		raw    json.RawMessage
+		parsed *cleaveResult
 	}
-	return nil, nil, fmt.Errorf("cleave: max retries exceeded for %s", path)
+
+	r, err := retry.DoWithData(
+		func() (result, error) {
+			raw, parsed, err := s.doAnalyze(ctx, sha256, body)
+			if err != nil {
+				return result{}, err
+			}
+			return result{raw: raw, parsed: parsed}, nil
+		},
+		retry.Attempts(12),
+		retry.Context(ctx),
+		retry.Delay(2*time.Second),
+		retry.MaxDelay(30*time.Second),
+		retry.DelayType(retry.CombineDelay(retry.BackOffDelay, retry.RandomDelay)),
+		retry.MaxJitter(3*time.Second),
+		retry.RetryIf(func(err error) bool {
+			return errors.Is(err, errRetryable)
+		}),
+		retry.OnRetry(func(attempt uint, err error) {
+			if errors.Is(err, errRetryable) {
+				n := s.consecutive503.Add(1)
+				slog.Debug("cleave overloaded, retrying", "path", path, "attempt", attempt+1, "consecutive_503s", n)
+				if n >= restartThreshold {
+					s.triggerRestart()
+				}
+			}
+		}),
+		retry.LastErrorOnly(true),
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("cleave: %s: %w", path, err)
+	}
+
+	s.consecutive503.Store(0)
+	return r.raw, r.parsed, nil
+}
+
+// triggerRestart kills the current cleave process to clear orphaned tasks.
+// Monitor() will detect the exit and restart it automatically.
+// Uses mu to ensure only one restart happens at a time.
+func (s *cleaveServer) triggerRestart() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.cmd == nil || s.cmd.Process == nil {
+		return
+	}
+
+	slog.Warn("cleave server stuck with orphaned tasks, killing to force restart",
+		"consecutive_503s", s.consecutive503.Load())
+	s.consecutive503.Store(0)
+	s.cmd.Process.Kill() //nolint:errcheck,gosec // best-effort; Monitor will restart
 }
 
 var errRetryable = errors.New("service unavailable")
@@ -247,6 +305,7 @@ func (s *cleaveServer) doAnalyze(ctx context.Context, sha256 string, body []byte
 	if resp.StatusCode == http.StatusServiceUnavailable {
 		return nil, nil, errRetryable
 	}
+	s.consecutive503.Store(0) // server accepted work, clear overload counter
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512)) //nolint:errcheck // best-effort error body
 		return nil, nil, fmt.Errorf("cleave: %d %s", resp.StatusCode, msg)
