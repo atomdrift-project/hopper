@@ -118,7 +118,8 @@ type Sample struct {
 	Formula         string // cleave chemical formula (behavioral signature)
 	Elements        string // formula without counts (qualitative composition)
 	AnalyzedAt      *time.Time
-	CleaveResult    []byte // raw JSON, nil if unanalyzed
+	CleaveResult    []byte // raw cleave JSON, nil if unanalyzed
+	LitmusResult    []byte // litmus classification envelope JSON, nil if unclassified
 	ID              int64
 	SizeBytes       int64
 	Score           int    // cleave raw score
@@ -395,6 +396,15 @@ func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []by
 	return db.updateCleaveResultSQLite(ctx, sha256, result, canonicalSHA256, fi)
 }
 
+// UpdateLitmusResult stores the litmus classification envelope for a sample.
+// The result should be the litmus response JSON without the embedded cleave field.
+func (db *DB) UpdateLitmusResult(ctx context.Context, sha256 string, result []byte) error {
+	if db.pool != nil {
+		return db.updateLitmusResultPG(ctx, sha256, result)
+	}
+	return db.updateLitmusResultSQLite(ctx, sha256, result)
+}
+
 // Reclassify changes a sample's label.
 func (db *DB) Reclassify(ctx context.Context, sha256, label, source string) error {
 	if db.pool != nil {
@@ -536,6 +546,61 @@ func (db *DB) RecomputeCanonicalSHA256(ctx context.Context) (int64, error) {
 		return db.recomputeCanonicalSHA256PG(ctx)
 	}
 	return 0, errors.New("hopper: RecomputeCanonicalSHA256 requires PostgreSQL 17+")
+}
+
+// FeedQuery specifies filters for paginated feed queries.
+type FeedQuery struct {
+	Source     string   // "harvest" or "upload"
+	Label      string   // "bad", "good", "unknown", or "" (match any)
+	Feeds      []string // optional: filter by feed column values
+	Ecosystems []string // optional: filter by ecosystem column values
+	Limit      int      // page size (clamped to 1–100)
+	Offset     int      // pagination offset
+}
+
+// FeedSamples returns analyzed samples matching the query, newest first.
+func (db *DB) FeedSamples(ctx context.Context, q FeedQuery) ([]*Sample, error) {
+	q.clamp()
+	if db.pool != nil {
+		return db.feedSamplesPG(ctx, q)
+	}
+	return db.feedSamplesSQLite(ctx, q)
+}
+
+// FeedSamplesCount returns the total number of samples matching the query.
+func (db *DB) FeedSamplesCount(ctx context.Context, q FeedQuery) (int, error) {
+	if db.pool != nil {
+		return db.feedSamplesCountPG(ctx, q)
+	}
+	return db.feedSamplesCountSQLite(ctx, q)
+}
+
+// FeedSources returns distinct feed values for samples matching source and label.
+func (db *DB) FeedSources(ctx context.Context, source, label string) ([]string, error) {
+	if db.pool != nil {
+		return db.feedSourcesPG(ctx, source, label)
+	}
+	return db.feedSourcesSQLite(ctx, source, label)
+}
+
+// FeedEcosystems returns distinct ecosystem values for samples matching source and label.
+func (db *DB) FeedEcosystems(ctx context.Context, source, label string) ([]string, error) {
+	if db.pool != nil {
+		return db.feedEcosystemsPG(ctx, source, label)
+	}
+	return db.feedEcosystemsSQLite(ctx, source, label)
+}
+
+func (q *FeedQuery) clamp() {
+	if q.Limit < 1 {
+		q.Limit = 1
+	}
+	if q.Limit > 100 {
+		q.Limit = 100
+	}
+	if q.Offset < 0 {
+		q.Offset = 0
+	}
 }
 
 // InsertReport stores an analysis report. Multiple reports per sample are allowed;

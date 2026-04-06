@@ -33,10 +33,14 @@ func (db *DB) migratePG(ctx context.Context) error {
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS formula TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS elements TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS score INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS litmus_result JSONB`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent) WHERE parent != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_formula ON samples(formula) WHERE formula != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_elements ON samples(elements) WHERE elements != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_score ON samples(score) WHERE score != 0`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source ON samples(source, label, analyzed_at DESC NULLS LAST) WHERE cleave_result IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_feed ON samples(feed) WHERE feed != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_ecosystem ON samples(ecosystem) WHERE ecosystem != ''`,
 	} {
 		if _, err := db.pool.Exec(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate: %w", err)
@@ -46,13 +50,13 @@ func (db *DB) migratePG(ctx context.Context) error {
 }
 
 const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, cleave_result,
+	size_bytes, label, label_source, cleave_result, litmus_result,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, created_at, updated_at, analyzed_at`
 
 func pgSampleDest(s *Sample) []any {
 	return []any{
 		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
-		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &s.CleaveResult,
+		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &s.CleaveResult, &s.LitmusResult,
 		&s.Path, &s.Status, &s.Note, &s.CanonicalSHA256,
 		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt,
 	}
@@ -166,6 +170,16 @@ func (db *DB) updateCleaveResultPG(ctx context.Context, sha256 string, result []
 		WHERE sha256 = $1`, sha256, sanitizeJSONB(result), canonical, fi.Formula, fi.Elements, fi.Score)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) updateLitmusResultPG(ctx context.Context, sha256 string, result []byte) error {
+	_, err := db.pool.Exec(ctx, `
+		UPDATE samples SET litmus_result = $2, updated_at = now()
+		WHERE sha256 = $1`, sha256, sanitizeJSONB(result))
+	if err != nil {
+		return fmt.Errorf("hopper: update litmus result: %w", err)
 	}
 	return nil
 }
@@ -449,6 +463,74 @@ func (db *DB) deleteAllPG(ctx context.Context) error {
 		return fmt.Errorf("hopper: delete all: %w", err)
 	}
 	return nil
+}
+
+func (db *DB) feedSamplesPG(ctx context.Context, q FeedQuery) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT `+pgSampleCols+` FROM samples
+		WHERE source = $1
+			AND ($2 = '' OR label = $2)
+			AND cleave_result IS NOT NULL
+			AND (cardinality($3::text[]) = 0 OR feed = ANY($3))
+			AND (cardinality($4::text[]) = 0 OR ecosystem = ANY($4))
+		ORDER BY analyzed_at DESC NULLS LAST
+		LIMIT $5 OFFSET $6`,
+		q.Source, q.Label, q.Feeds, q.Ecosystems, q.Limit, q.Offset)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: feed samples: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
+func (db *DB) feedSamplesCountPG(ctx context.Context, q FeedQuery) (int, error) {
+	var n int
+	err := db.pool.QueryRow(ctx, `
+		SELECT count(*) FROM samples
+		WHERE source = $1
+			AND ($2 = '' OR label = $2)
+			AND cleave_result IS NOT NULL
+			AND (cardinality($3::text[]) = 0 OR feed = ANY($3))
+			AND (cardinality($4::text[]) = 0 OR ecosystem = ANY($4))`,
+		q.Source, q.Label, q.Feeds, q.Ecosystems).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: feed samples count: %w", err)
+	}
+	return n, nil
+}
+
+func (db *DB) feedSourcesPG(ctx context.Context, source, label string) ([]string, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT DISTINCT feed FROM samples
+		WHERE source = $1 AND ($2 = '' OR label = $2) AND feed != ''
+		ORDER BY feed`, source, label)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: feed sources: %w", err)
+	}
+	return scanPGStrings(rows)
+}
+
+func (db *DB) feedEcosystemsPG(ctx context.Context, source, label string) ([]string, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT DISTINCT ecosystem FROM samples
+		WHERE source = $1 AND ($2 = '' OR label = $2) AND ecosystem != ''
+		ORDER BY ecosystem`, source, label)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: feed ecosystems: %w", err)
+	}
+	return scanPGStrings(rows)
+}
+
+func scanPGStrings(rows pgx.Rows) ([]string, error) {
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
 }
 
 func scanPGCounts(rows pgx.Rows) (map[string]int, error) {

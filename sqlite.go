@@ -67,19 +67,32 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			}
 		}
 	}
+
+	// Add litmus_result column.
+	var hasLitmusResult int
+	//nolint:errcheck,gosec // best-effort column check
+	db.lite.QueryRowContext(ctx,
+		"SELECT count(*) FROM pragma_table_info('samples') WHERE name = 'litmus_result'",
+	).Scan(&hasLitmusResult)
+	if hasLitmusResult == 0 {
+		if _, err := db.lite.ExecContext(ctx, `ALTER TABLE samples ADD COLUMN litmus_result TEXT`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite: %w", err)
+		}
+	}
+
 	return nil
 }
 
 const liteSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, cleave_result,
+	size_bytes, label, label_source, cleave_result, litmus_result,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, created_at, updated_at, analyzed_at`
 
 func scanLiteSample(row *sql.Row) (*Sample, error) {
 	s := &Sample{}
-	var cleaveResult, status sql.NullString
+	var cleaveResult, litmusResult, status sql.NullString
 	var analyzedAt sql.NullTime
 	err := row.Scan(&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
-		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult,
+		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult,
 		&s.Path, &status, &s.Note, &s.CanonicalSHA256,
 		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -90,6 +103,9 @@ func scanLiteSample(row *sql.Row) (*Sample, error) {
 	}
 	if cleaveResult.Valid {
 		s.CleaveResult = []byte(cleaveResult.String)
+	}
+	if litmusResult.Valid {
+		s.LitmusResult = []byte(litmusResult.String)
 	}
 	s.Status = status.String
 	if analyzedAt.Valid {
@@ -103,16 +119,19 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 	var out []*Sample
 	for rows.Next() {
 		s := &Sample{}
-		var cleaveResult, status sql.NullString
+		var cleaveResult, litmusResult, status sql.NullString
 		var analyzedAt sql.NullTime
 		if err := rows.Scan(&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
-			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult,
+			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult,
 			&s.Path, &status, &s.Note, &s.CanonicalSHA256,
 			&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt); err != nil {
 			return nil, err
 		}
 		if cleaveResult.Valid {
 			s.CleaveResult = []byte(cleaveResult.String)
+		}
+		if litmusResult.Valid {
+			s.LitmusResult = []byte(litmusResult.String)
 		}
 		s.Status = status.String
 		if analyzedAt.Valid {
@@ -198,6 +217,16 @@ func (db *DB) updateCleaveResultSQLite(ctx context.Context, sha256 string, resul
 		WHERE sha256 = ?`, string(result), canonical, fi.Formula, fi.Elements, fi.Score, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) updateLitmusResultSQLite(ctx context.Context, sha256 string, result []byte) error {
+	_, err := db.lite.ExecContext(ctx, `
+		UPDATE samples SET litmus_result = ?, updated_at = ?
+		WHERE sha256 = ?`, string(result), now(), sha256)
+	if err != nil {
+		return fmt.Errorf("hopper: update litmus result: %w", err)
 	}
 	return nil
 }
@@ -457,6 +486,22 @@ func (db *DB) deleteAllSQLite(ctx context.Context) error {
 		return fmt.Errorf("hopper: delete samples: %w", err)
 	}
 	return nil
+}
+
+func (db *DB) feedSamplesSQLite(ctx context.Context, q FeedQuery) ([]*Sample, error) {
+	return nil, errors.New("hopper: FeedSamples not implemented for SQLite")
+}
+
+func (db *DB) feedSamplesCountSQLite(ctx context.Context, q FeedQuery) (int, error) {
+	return 0, errors.New("hopper: FeedSamplesCount not implemented for SQLite")
+}
+
+func (db *DB) feedSourcesSQLite(ctx context.Context, source, label string) ([]string, error) {
+	return nil, errors.New("hopper: FeedSources not implemented for SQLite")
+}
+
+func (db *DB) feedEcosystemsSQLite(ctx context.Context, source, label string) ([]string, error) {
+	return nil, errors.New("hopper: FeedEcosystems not implemented for SQLite")
 }
 
 func scanLiteCounts(rows *sql.Rows) (map[string]int, error) {

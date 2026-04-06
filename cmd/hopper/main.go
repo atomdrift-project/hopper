@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"runtime"
 	"path/filepath"
+	"strings"
 	"strconv"
 	"strings"
 	"sync"
@@ -246,10 +247,10 @@ func cmdLoad(ctx context.Context) error {
 	good := f.String("good", "", "directory of known-good samples")
 	source := f.String("source", "harvest", "sample source tag")
 	workers := f.Int("workers", 8, "concurrent hash/insert workers")
-	cleaveBin := f.String("cleave", "cleave", "path to cleave binary (pass empty to disable)")
-	cleaveWorkers := f.Int("cleave-workers", max(1, runtime.NumCPU()-1), "concurrent cleave analysis workers")
-	maxRSSGB := f.Int("max-memory-gb", 32, "cleave RSS limit in GB")
-	rescan := f.Bool("rescan", false, "re-analyze samples that already have cleave results")
+	litmusBin := f.String("litmus", "litmus", "path to litmus binary (pass empty to disable)")
+	litmusWorkers := f.Int("litmus-workers", max(1, runtime.NumCPU()-1), "concurrent litmus analysis workers")
+	maxRSSGB := f.Int("max-memory-gb", 32, "litmus RSS limit in GB")
+	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
 	experimentTag := f.String("experiment-tag", "", "label for experiment comparison")
@@ -287,7 +288,7 @@ func cmdLoad(ctx context.Context) error {
 		return err
 	}
 
-	// Collect directories for cleave's --dangerous-local-file-paths.
+	// Collect directories for litmus's --dangerous-local-file-paths.
 	var dirs []string
 	if *bad != "" {
 		if abs, err := filepath.Abs(*bad); err == nil {
@@ -300,27 +301,27 @@ func cmdLoad(ctx context.Context) error {
 		}
 	}
 
-	// Start cleave server if requested.
-	var cleave *cleaveServer
-	if *cleaveBin != "" {
-		cleave = newCleaveServer(cleaveConfig{
-			Bin:        *cleaveBin,
+	// Start litmus server if requested.
+	var litmus *litmusServer
+	if *litmusBin != "" {
+		litmus = newLitmusServer(litmusConfig{
+			Bin:        *litmusBin,
 			Dirs:       dirs,
 			MaxRSSGB:   *maxRSSGB,
-			MaxWorkers: *cleaveWorkers,
+			MaxWorkers: *litmusWorkers,
 		})
-		if err := cleave.Start(ctx); err != nil {
+		if err := litmus.Start(ctx); err != nil {
 			return err
 		}
-		defer cleave.Stop()
+		defer litmus.Stop()
 		go func() {
-			if err := cleave.Monitor(ctx); err != nil {
-				slog.Error("cleave monitor failed", "error", err)
+			if err := litmus.Monitor(ctx); err != nil {
+				slog.Error("litmus monitor failed", "error", err)
 			}
 		}()
 	}
 
-	// Count active directories to split cleave workers evenly.
+	// Count active directories to split litmus workers evenly.
 	var loadDirs []struct{ dir, label string }
 	for _, d := range []struct{ dir, label string }{{*bad, "bad"}, {*good, "good"}} {
 		if d.dir != "" {
@@ -341,7 +342,7 @@ func cmdLoad(ctx context.Context) error {
 		loadWG.Add(1)
 		go func() {
 			defer loadWG.Done()
-			total.Add(int64(loadDir(loadCtx, loadCancel, db, cleave, cache, d.dir, d.label, *source, *workers, *rescan, len(loadDirs), *maxAnalyzed, *experimentTag, &shared)))
+			total.Add(int64(loadDir(loadCtx, loadCancel, db, litmus, cache, d.dir, d.label, *source, *workers, *rescan, len(loadDirs), *maxAnalyzed, *experimentTag, &shared)))
 		}()
 	}
 	loadWG.Wait()
@@ -375,7 +376,7 @@ type loadProgress struct {
 	hashErrors atomic.Int64 // hash failures (subset of errors, for % calc)
 	cacheHits  atomic.Int64
 	exploded  atomic.Int64 // archive members inserted
-	scoreSum  atomic.Int64 // sum of cleave scores for avg calculation
+	scoreSum  atomic.Int64 // sum of litmus scores for avg calculation
 
 	// Per-analysis timing (nanoseconds).
 	analyzeDurationSum atomic.Int64
@@ -394,7 +395,7 @@ var (
 	errTooLarge = errors.New("too large")
 )
 
-func loadDir(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, cleave *cleaveServer, cache *hashCache, dir, label, source string, nworkers int, rescan bool, numDirs int, maxAnalyzed int, experimentTag string, shared *loadProgress) int {
+func loadDir(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litmus *litmusServer, cache *hashCache, dir, label, source string, nworkers int, rescan bool, numDirs int, maxAnalyzed int, experimentTag string, shared *loadProgress) int {
 	slog.Info("loading directory", "dir", dir, "label", label, "workers", nworkers)
 	start := time.Now()
 	var progress loadProgress
@@ -404,14 +405,14 @@ func loadDir(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, clea
 	hashed := make(chan hashedFile, nworkers*2)
 	var hashWG sync.WaitGroup
 
-	// Analysis queue: nil if cleave is not configured.
-	// Split cleave workers evenly across active directories.
+	// Analysis queue: nil if litmus is not configured.
+	// Split litmus workers evenly across active directories.
 	var analyzeQueue chan loadJob
 	var analyzeWG sync.WaitGroup
-	if cleave != nil {
-		perDir := max(1, cleave.Workers()/numDirs)
+	if litmus != nil {
+		perDir := max(1, litmus.Workers()/numDirs)
 		analyzeQueue = make(chan loadJob, perDir*2)
-		startAnalysisWorkers(ctx, cancel, db, cleave, analyzeQueue, &analyzeWG, &progress, shared, perDir, maxAnalyzed)
+		startAnalysisWorkers(ctx, cancel, db, litmus, analyzeQueue, &analyzeWG, &progress, shared, perDir, maxAnalyzed)
 	}
 
 	// Periodic progress reporting.
@@ -686,7 +687,7 @@ func loadDir(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, clea
 	return int(progress.inserted.Load() + progress.skipped.Load())
 }
 
-func startAnalysisWorkers(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, cleave *cleaveServer, queue chan loadJob, wg *sync.WaitGroup, progress *loadProgress, shared *loadProgress, nworkers int, maxAnalyzed int) {
+func startAnalysisWorkers(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litmus *litmusServer, queue chan loadJob, wg *sync.WaitGroup, progress *loadProgress, shared *loadProgress, nworkers int, maxAnalyzed int) {
 	for range nworkers {
 		wg.Go(func() {
 			for job := range queue {
@@ -696,7 +697,7 @@ func startAnalysisWorkers(ctx context.Context, cancel context.CancelFunc, db *ho
 				}
 
 				t0 := time.Now()
-				raw, result, err := cleave.Analyze(ctx, job.sha, job.path)
+				raw, result, err := litmus.Analyze(ctx, job.sha, job.path)
 				dur := time.Since(t0).Nanoseconds()
 
 				if err != nil {
@@ -721,7 +722,7 @@ func startAnalysisWorkers(ctx context.Context, cancel context.CancelFunc, db *ho
 					}
 				}
 
-				if err := db.UpdateCleaveResult(ctx, job.sha, raw, result.CanonicalSHA256); err != nil {
+				if err := db.UpdateLitmusResult(ctx, job.sha, raw, result.CanonicalSHA256); err != nil {
 					progress.errors.Add(1)
 					slog.Warn("storing result failed", "path", job.path, "error", err)
 					continue
@@ -859,21 +860,60 @@ func hashFile(path, label, source string, cache *hashCache) (*hopper.Sample, err
 		return nil, err
 	}
 
-	digest := hex.EncodeToString(h.Sum(nil))
+digest := hex.EncodeToString(h.Sum(nil))
 
-	if cache != nil {
-		cache.store(dev, inode, info.Size(), info.ModTime(), digest)
+if cache != nil {
+	cache.store(dev, inode, info.Size(), info.ModTime(), digest)
+}
+
+s := &hopper.Sample{
+	SHA256:      digest,
+	Source:      source,
+	Filename:    filepath.Base(path),
+	Label:       label,
+	LabelSource: source,
+	SizeBytes:   info.Size(),
+	Path:        path,
+}
+s.Feed, s.Ecosystem = extractFeedEcosystem(path, label)
+return s, nil
+}
+// extractFeedEcosystem parses feed and ecosystem from a file path when
+// a "harvest" directory component is present.
+//
+// Known-bad:  .../harvest/<feed>/<ecosystem>/file → feed + ecosystem
+//             .../harvest/<feed>/file             → feed only
+// Known-good: .../harvest/<ecosystem>/file        → ecosystem only
+func extractFeedEcosystem(path, label string) (feed, ecosystem string) {
+	parts := strings.Split(filepath.ToSlash(path), "/")
+	idx := -1
+	for i, p := range parts {
+		if p == "harvest" {
+			idx = i
+			break
+		}
 	}
+	if idx < 0 {
+		return "", ""
+	}
+	// Directory components between "harvest" and the filename.
+	after := parts[idx+1:]
+	if len(after) < 2 {
+		return "", "" // need at least one directory + filename
+	}
+	dirs := after[:len(after)-1]
 
-	return &hopper.Sample{
-		SHA256:      digest,
-		Source:      source,
-		Filename:    filepath.Base(path),
-		Label:       label,
-		LabelSource: source,
-		SizeBytes:   info.Size(),
-		Path:        path,
-	}, nil
+	switch label {
+	case "bad":
+		switch len(dirs) {
+		case 1:
+			return dirs[0], ""
+		default:
+			return dirs[0], dirs[1]
+		}
+	default: // "good", "unknown"
+		return "", dirs[0]
+	}
 }
 
 func cmdStats(ctx context.Context) error {
