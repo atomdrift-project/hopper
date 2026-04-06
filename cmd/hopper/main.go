@@ -31,7 +31,7 @@ commands:
   serve           start a local postgres server with hopper schema
   init            create/migrate a hopper database (sqlite or postgres)
   load            load sample files from directories
-  import-legacy   import from a legacy cyclotron sqlite database
+  reset           delete all samples and reports (preserves schema)
   import          transfer samples between hopper databases (sqlite↔postgres)
   stats           show sample counts
 `
@@ -57,12 +57,12 @@ func run(ctx context.Context) error {
 		return cmdServe(ctx)
 	case "init":
 		return cmdInit(ctx)
-	case "import-legacy":
-		return cmdImportLegacy(ctx)
 	case "import":
 		return cmdImport(ctx)
 	case "load":
 		return cmdLoad(ctx)
+	case "reset":
+		return cmdReset(ctx)
 	case "stats":
 		return cmdStats(ctx)
 	default:
@@ -180,37 +180,6 @@ func cmdInit(ctx context.Context) error {
 	return nil
 }
 
-func cmdImportLegacy(ctx context.Context) error {
-	f := flag.NewFlagSet("import-legacy", flag.ExitOnError)
-	dsn := f.String("db", "", "destination database (postgres:// DSN or sqlite path)")
-	legacy := f.String("from", "", "path to legacy cyclotron sqlite database")
-	after := f.Int64("after", 0, "resume after this SQLite rowid (from progress logs)")
-	f.Parse(os.Args[2:]) //nolint:errcheck,gosec // ExitOnError handles parse errors
-
-	if *legacy == "" {
-		return errors.New("pass --from /path/to/cyclotron.db")
-	}
-
-	slog.Info("opening legacy database", "path", *legacy, "resume_after", *after)
-	db, err := openDB(ctx, *dsn)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	slog.Info("running schema migrations")
-	if err := db.Migrate(ctx); err != nil {
-		return err
-	}
-	slog.Info("schema up to date, starting legacy import")
-
-	n, err := hopper.MigrateLegacy(ctx, db, *legacy, *after)
-	if err != nil {
-		return err
-	}
-	slog.Info("legacy import complete", "samples", n)
-	return nil
-}
-
 func cmdImport(ctx context.Context) error {
 	f := flag.NewFlagSet("import", flag.ExitOnError)
 	dstDSN := f.String("db", "", "destination database")
@@ -249,6 +218,25 @@ func cmdImport(ctx context.Context) error {
 	return nil
 }
 
+func cmdReset(ctx context.Context) error {
+	f := flag.NewFlagSet("reset", flag.ExitOnError)
+	dsn := f.String("db", "", "database (postgres:// DSN or sqlite file path)")
+	f.Parse(os.Args[2:]) //nolint:errcheck,gosec // ExitOnError handles parse errors
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	slog.Info("deleting all samples and reports")
+	if err := db.DeleteAll(ctx); err != nil {
+		return err
+	}
+	slog.Info("reset complete")
+	return nil
+}
+
 func cmdLoad(ctx context.Context) error {
 	f := flag.NewFlagSet("load", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
@@ -260,13 +248,31 @@ func cmdLoad(ctx context.Context) error {
 	cleaveWorkers := f.Int("cleave-workers", 8, "concurrent cleave analysis workers")
 	maxRSSGB := f.Int("max-memory-gb", 0, "cleave RSS limit in GB (default: 25% of system RAM)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have cleave results")
+	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
 	f.Parse(os.Args[2:]) //nolint:errcheck,gosec // ExitOnError handles parse errors
 
 	if *bad == "" && *good == "" {
 		return errors.New("pass --bad and/or --good")
 	}
 
-	slog.Info("load starting", "bad", *bad, "good", *good, "workers", *workers, "rescan", *rescan)
+	// Open hash cache (default: ~/.hopper/hashcache.db).
+	var cache *hashCache
+	if !*noCache {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			home = "."
+		}
+		cacheDir := filepath.Join(home, ".hopper")
+		os.MkdirAll(cacheDir, 0o755) //nolint:errcheck,gosec // best-effort
+		cache, err = openHashCache(filepath.Join(cacheDir, "hashcache.db"))
+		if err != nil {
+			slog.Warn("hash cache unavailable, continuing without cache", "error", err)
+		} else {
+			defer cache.close()
+		}
+	}
+
+	slog.Info("load starting", "bad", *bad, "good", *good, "workers", *workers, "rescan", *rescan, "cache", cache != nil)
 	db, err := openDB(ctx, *dsn)
 	if err != nil {
 		return err
@@ -319,7 +325,7 @@ func cmdLoad(ctx context.Context) error {
 		loadWG.Add(1)
 		go func() {
 			defer loadWG.Done()
-			total.Add(int64(loadDir(ctx, db, cleave, d.dir, d.label, *source, *workers, *rescan)))
+			total.Add(int64(loadDir(ctx, db, cleave, cache, d.dir, d.label, *source, *workers, *rescan)))
 		}()
 	}
 	loadWG.Wait()
@@ -341,18 +347,30 @@ type hashedFile struct {
 
 // loadProgress tracks counters across concurrent load workers.
 type loadProgress struct {
-	walked   atomic.Int64
-	hashed   atomic.Int64
-	inserted atomic.Int64
-	skipped  atomic.Int64
-	analyzed atomic.Int64
-	markers  atomic.Int64 // files skipped due to misclassification markers
-	errors   atomic.Int64
+	walked    atomic.Int64
+	hashed    atomic.Int64
+	inserted  atomic.Int64
+	skipped   atomic.Int64
+	analyzed  atomic.Int64
+	markers   atomic.Int64 // files skipped due to misclassification markers
+	tooSmall  atomic.Int64 // files below minFileSize
+	tooLarge  atomic.Int64 // files above maxFileSize
+	errors    atomic.Int64
+	cacheHits atomic.Int64
 }
 
-const loadBatchSize = 500
+const (
+	loadBatchSize = 500
+	minFileSize   = 13      // skip trivially small files (markers, empty, etc.)
+	maxFileSize   = 1 << 30 // 1 GiB
+)
 
-func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, dir, label, source string, nworkers int, rescan bool) int {
+var (
+	errTooSmall = errors.New("too small")
+	errTooLarge = errors.New("too large")
+)
+
+func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, cache *hashCache, dir, label, source string, nworkers int, rescan bool) int {
 	slog.Info("loading directory", "dir", dir, "label", label, "workers", nworkers)
 	start := time.Now()
 	var progress loadProgress
@@ -381,6 +399,8 @@ func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, dir, labe
 					"walked", progress.walked.Load(), "hashed", progress.hashed.Load(),
 					"inserted", progress.inserted.Load(),
 					"skipped", progress.skipped.Load(), "markers", progress.markers.Load(),
+					"too_small", progress.tooSmall.Load(), "too_large", progress.tooLarge.Load(),
+					"cache_hits", progress.cacheHits.Load(),
 					"analyzed", progress.analyzed.Load(),
 					"errors", progress.errors.Load(),
 					"analyze_per_sec", int(float64(progress.analyzed.Load())/elapsed))
@@ -398,10 +418,17 @@ func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, dir, labe
 					return
 				}
 
-				sample, err := hashFile(path, label, source)
+				sample, err := hashFile(path, label, source, cache)
 				if err != nil {
-					progress.errors.Add(1)
-					slog.Warn("skipping file", "path", path, "error", err)
+					switch {
+					case errors.Is(err, errTooSmall):
+						progress.tooSmall.Add(1)
+					case errors.Is(err, errTooLarge):
+						progress.tooLarge.Add(1)
+					default:
+						progress.errors.Add(1)
+						slog.Warn("hash failed", "path", path, "error", err)
+					}
 					continue
 				}
 
@@ -541,6 +568,8 @@ func loadDir(ctx context.Context, db *hopper.DB, cleave *cleaveServer, dir, labe
 		"walked", progress.walked.Load(), "hashed", progress.hashed.Load(),
 		"inserted", progress.inserted.Load(),
 		"skipped", progress.skipped.Load(), "markers", progress.markers.Load(),
+		"too_small", progress.tooSmall.Load(), "too_large", progress.tooLarge.Load(),
+		"cache_hits", progress.cacheHits.Load(),
 		"analyzed", progress.analyzed.Load(),
 		"errors", progress.errors.Load(),
 		"elapsed", time.Since(start).Round(time.Millisecond))
@@ -625,8 +654,14 @@ func checkMarker(path string) string {
 func walkFiles(ctx context.Context, dir string, paths chan<- string, progress *loadProgress) {
 	slog.Info("walking directory", "dir", dir)
 	filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error { //nolint:errcheck,gosec // errors logged per-file
-		if err != nil || d.IsDir() {
+		if err != nil {
 			return err
+		}
+		if d.IsDir() {
+			if d.Name() == ".git" {
+				return fs.SkipDir
+			}
+			return nil
 		}
 		// Skip marker files themselves — they are metadata, not samples.
 		if isMarkerFile(d.Name()) {
@@ -643,7 +678,7 @@ func walkFiles(ctx context.Context, dir string, paths chan<- string, progress *l
 	slog.Info("walk complete", "dir", dir, "files", progress.walked.Load())
 }
 
-func hashFile(path, label, source string) (*hopper.Sample, error) {
+func hashFile(path, label, source string, cache *hashCache) (*hopper.Sample, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -655,13 +690,28 @@ func hashFile(path, label, source string) (*hopper.Sample, error) {
 		return nil, err
 	}
 
-	const minFileSize = 13          // skip trivially small files (markers, empty, etc.)
-	const maxFileSize = 1 << 30     // 1 GiB
 	if info.Size() < minFileSize {
-		return nil, fmt.Errorf("too small (%d bytes)", info.Size())
+		return nil, errTooSmall
 	}
 	if info.Size() >= maxFileSize {
-		return nil, fmt.Errorf("too large (%d bytes)", info.Size())
+		return nil, errTooLarge
+	}
+
+	dev, inode := fileStat(info)
+
+	// Check hash cache before reading file contents.
+	if cache != nil {
+		if cached, ok := cache.lookup(dev, inode, info.Size(), info.ModTime()); ok {
+			return &hopper.Sample{
+				SHA256:      cached,
+				Source:      source,
+				Filename:    filepath.Base(path),
+				Label:       label,
+				LabelSource: source,
+				SizeBytes:   info.Size(),
+				Path:        path,
+			}, nil
+		}
 	}
 
 	h := sha256.New()
@@ -669,8 +719,14 @@ func hashFile(path, label, source string) (*hopper.Sample, error) {
 		return nil, err
 	}
 
+	digest := hex.EncodeToString(h.Sum(nil))
+
+	if cache != nil {
+		cache.store(dev, inode, info.Size(), info.ModTime(), digest)
+	}
+
 	return &hopper.Sample{
-		SHA256:      hex.EncodeToString(h.Sum(nil)),
+		SHA256:      digest,
 		Source:      source,
 		Filename:    filepath.Base(path),
 		Label:       label,

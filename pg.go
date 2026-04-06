@@ -435,6 +435,14 @@ func (db *DB) setSkipPG(ctx context.Context, sha256, skip string) error {
 	return nil
 }
 
+func (db *DB) deleteAllPG(ctx context.Context) error {
+	_, err := db.pool.Exec(ctx, `TRUNCATE reports, samples`)
+	if err != nil {
+		return fmt.Errorf("hopper: delete all: %w", err)
+	}
+	return nil
+}
+
 func scanPGCounts(rows pgx.Rows) (map[string]int, error) {
 	counts := make(map[string]int)
 	for rows.Next() {

@@ -368,6 +368,279 @@ func TestSamplesByLabel(t *testing.T) {
 	}
 }
 
+func TestDeleteAll(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{SHA256: "d1", Source: "test", Label: "bad", LabelSource: "test"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "d2", Source: "test", Label: "good", LabelSource: "test"})
+	db.InsertReport(ctx, &Report{SHA256: "d1", Type: "re", Content: "report"})
+
+	if err := db.DeleteAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	counts, err := db.CountByLabel(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := 0
+	for _, n := range counts {
+		total += n
+	}
+	if total != 0 {
+		t.Errorf("expected 0 samples after DeleteAll, got %d", total)
+	}
+}
+
+func TestSetSkip(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{SHA256: "sk1", Source: "test", Label: "bad", LabelSource: "test"})
+	if err := db.SetSkip(ctx, "sk1", "weak-findings"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := db.SampleBySHA256(ctx, "sk1")
+	if got.Skip != "weak-findings" {
+		t.Errorf("Skip = %q, want %q", got.Skip, "weak-findings")
+	}
+
+	// Clear skip.
+	if err := db.SetSkip(ctx, "sk1", ""); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = db.SampleBySHA256(ctx, "sk1")
+	if got.Skip != "" {
+		t.Errorf("Skip = %q, want empty", got.Skip)
+	}
+}
+
+func TestSetNote(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{SHA256: "n1", Source: "test", Label: "bad", LabelSource: "test"})
+	if err := db.SetNote(ctx, "n1", "analysis timed out"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := db.SampleBySHA256(ctx, "n1")
+	if got.Note != "analysis timed out" {
+		t.Errorf("Note = %q, want %q", got.Note, "analysis timed out")
+	}
+
+	if err := db.SetNote(ctx, "n1", ""); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = db.SampleBySHA256(ctx, "n1")
+	if got.Note != "" {
+		t.Errorf("Note = %q, want empty", got.Note)
+	}
+}
+
+func TestInsertSampleBatch(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	samples := []*Sample{
+		{SHA256: "b1", Source: "test", Label: "bad", LabelSource: "test", SizeBytes: 100},
+		{SHA256: "b2", Source: "test", Label: "good", LabelSource: "test", SizeBytes: 200},
+		{SHA256: "b3", Source: "test", Label: "bad", LabelSource: "test", SizeBytes: 300},
+	}
+	n, err := db.InsertSampleBatch(ctx, samples)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Errorf("inserted = %d, want 3", n)
+	}
+
+	// Duplicate batch: all should be skipped.
+	n, err = db.InsertSampleBatch(ctx, samples)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("duplicate batch inserted = %d, want 0", n)
+	}
+
+	// Empty batch.
+	n, err = db.InsertSampleBatch(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("empty batch inserted = %d, want 0", n)
+	}
+}
+
+func TestStaleSamples(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{SHA256: "st1", Source: "test", Label: "bad", LabelSource: "test", Path: "/data/s1"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "st2", Source: "test", Label: "bad", LabelSource: "test", Path: "/data/s2"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "st3", Source: "test", Label: "bad", LabelSource: "test", Path: "/other/s3"})
+
+	// All samples were just inserted, so using a future threshold should return all under /data.
+	future := time.Now().Add(time.Hour)
+	got, err := db.StaleSamples(ctx, []string{"/data"}, future, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Errorf("got %d stale samples, want 2", len(got))
+	}
+
+	// Threshold in the past: no samples are stale.
+	past := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	got, err = db.StaleSamples(ctx, []string{"/data"}, past, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %d stale samples with past threshold, want 0", len(got))
+	}
+}
+
+func TestExplodeArchiveMembers(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	cleaveJSON := []byte(`{"fs":[
+		{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"elf","path":"pkg/bin","dp":0,"sz":1000,"ts":[{"l":5,"c":0.9}]},
+		{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","type":"py","path":"pkg/setup.py","dp":1,"sz":500,"ts":[{"l":5,"c":0.95}]},
+		{"sha":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","type":"txt","path":"pkg/readme.txt","dp":1,"sz":50,"ts":[{"l":1,"c":1.0}]}
+	]}`)
+
+	parent := &Sample{
+		SHA256:          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Source:          "test",
+		Label:           "bad",
+		LabelSource:     "test",
+		CleaveResult:    cleaveJSON,
+		CanonicalSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}
+	mustInsert(t, ctx, db, parent)
+
+	n, err := db.ExplodeArchiveMembers(ctx, parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 { // dp=0 is skipped, dp=1 entries inserted
+		t.Errorf("exploded = %d, want 2", n)
+	}
+
+	// The txt file with only level 1 findings should have skip="weak-findings".
+	txt, err := db.SampleBySHA256(ctx, "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if txt.Skip != "weak-findings" {
+		t.Errorf("txt Skip = %q, want %q", txt.Skip, "weak-findings")
+	}
+	if txt.Parent != parent.SHA256 {
+		t.Errorf("txt Parent = %q, want %q", txt.Parent, parent.SHA256)
+	}
+
+	// The py file with hostile level findings should NOT be skipped.
+	py, err := db.SampleBySHA256(ctx, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if py.Skip != "" {
+		t.Errorf("py Skip = %q, want empty", py.Skip)
+	}
+}
+
+func TestExplodeArchiveMembersEmpty(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// No cleave result → 0 members.
+	n, err := db.ExplodeArchiveMembers(ctx, &Sample{SHA256: "e1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("exploded empty = %d, want 0", n)
+	}
+}
+
+func TestCanonicalSHA(t *testing.T) {
+	tests := []struct {
+		name   string
+		sha    string
+		result string
+		want   string
+	}{
+		{"empty result", "ffff", "", "ffff"},
+		{"invalid json", "ffff", "{bad", "ffff"},
+		{"no files", "ffff", `{"fs":[]}`, "ffff"},
+		{"self is min", "aaaa", `{"fs":[{"sha":"bbbb"}]}`, "aaaa"},
+		{"embedded is min",
+			"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+			`{"fs":[{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}`,
+			"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		{"short sha ignored",
+			"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+			`{"fs":[{"sha":"short"}]}`,
+			"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := canonicalSHA(tt.sha, []byte(tt.result))
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInsertSampleNew(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	isNew, err := db.InsertSampleNew(ctx, &Sample{SHA256: "new1", Source: "test", Label: "bad", LabelSource: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isNew {
+		t.Error("first insert should be new")
+	}
+
+	isNew, err = db.InsertSampleNew(ctx, &Sample{SHA256: "new1", Source: "test", Label: "bad", LabelSource: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isNew {
+		t.Error("duplicate insert should not be new")
+	}
+}
+
+func TestSamplesByEmbeddedSHA256_SQLiteError(t *testing.T) {
+	db := openTestDB(t)
+	_, err := db.SamplesByEmbeddedSHA256(context.Background(), "abc", 10)
+	if err == nil {
+		t.Fatal("expected error on SQLite")
+	}
+}
+
+func TestRecomputeCanonicalSHA256_SQLiteError(t *testing.T) {
+	db := openTestDB(t)
+	_, err := db.RecomputeCanonicalSHA256(context.Background())
+	if err == nil {
+		t.Fatal("expected error on SQLite")
+	}
+}
+
+func TestPool(t *testing.T) {
+	db := openTestDB(t)
+	if db.Pool() != nil {
+		t.Error("Pool() should be nil for SQLite")
+	}
+}
+
 func TestSanitizeJSONB(t *testing.T) {
 	tests := []struct {
 		name string

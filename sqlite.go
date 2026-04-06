@@ -425,6 +425,18 @@ func (db *DB) setSkipSQLite(ctx context.Context, sha256, skip string) error {
 	return nil
 }
 
+func (db *DB) deleteAllSQLite(ctx context.Context) error {
+	_, err := db.lite.ExecContext(ctx, `DELETE FROM reports`)
+	if err != nil {
+		return fmt.Errorf("hopper: delete reports: %w", err)
+	}
+	_, err = db.lite.ExecContext(ctx, `DELETE FROM samples`)
+	if err != nil {
+		return fmt.Errorf("hopper: delete samples: %w", err)
+	}
+	return nil
+}
+
 func scanLiteCounts(rows *sql.Rows) (map[string]int, error) {
 	counts := make(map[string]int)
 	for rows.Next() {

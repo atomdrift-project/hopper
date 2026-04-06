@@ -284,6 +284,14 @@ func (db *DB) Migrate(ctx context.Context) error {
 	return db.migrateSQLite(ctx)
 }
 
+// DeleteAll removes all rows from reports and samples, preserving the schema.
+func (db *DB) DeleteAll(ctx context.Context) error {
+	if db.pool != nil {
+		return db.deleteAllPG(ctx)
+	}
+	return db.deleteAllSQLite(ctx)
+}
+
 // InsertSample adds a sample. Duplicate SHA256 values are silently ignored.
 func (db *DB) InsertSample(ctx context.Context, s *Sample) error {
 	_, err := db.InsertSampleNew(ctx, s)

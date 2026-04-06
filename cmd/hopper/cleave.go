@@ -71,6 +71,8 @@ func (s *cleaveServer) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	updateCleave(ctx)
+
 	port, err := freePort(ctx)
 	if err != nil {
 		return fmt.Errorf("find free port: %w", err)
@@ -79,6 +81,34 @@ func (s *cleaveServer) Start(ctx context.Context) error {
 	s.url = "http://127.0.0.1:" + port
 
 	return s.startLocked(ctx)
+}
+
+// updateCleave attempts to build and install the latest cleave from ../cleave.
+// On failure it logs the error and falls back to whatever version is already installed.
+func updateCleave(ctx context.Context) {
+	dir := "../cleave"
+	if _, err := os.Stat(dir); err != nil {
+		slog.Warn("cleave source not found, using installed version", "dir", dir)
+		return
+	}
+
+	slog.Info("updating cleave", "dir", dir)
+
+	pull := exec.CommandContext(ctx, "git", "pull")
+	pull.Dir = dir
+	if out, err := pull.CombinedOutput(); err != nil {
+		slog.Error("git pull failed for cleave, using installed version", "error", err, "output", string(out))
+		return
+	}
+
+	install := exec.CommandContext(ctx, "make", "install")
+	install.Dir = dir
+	if out, err := install.CombinedOutput(); err != nil {
+		slog.Error("make install failed for cleave, using installed version", "error", err, "output", string(out))
+		return
+	}
+
+	slog.Info("cleave updated successfully")
 }
 
 func (s *cleaveServer) startLocked(ctx context.Context) error {

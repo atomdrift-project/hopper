@@ -1,0 +1,775 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"codeberg.org/atomdrift/hopper"
+)
+
+func TestIsMarkerFile(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{"._malware.whl.BENIGN", true},
+		{"._malware.whl.BAD", true},
+		{"._an177-0.1.0-py3-none-any.whl.BENIGN", true},
+		{"malware.whl", false},
+		{"malware.whl.BENIGN", false},  // missing ._ prefix
+		{"._malware.whl", false},       // missing suffix
+		{".BENIGN", false},             // no ._ prefix
+		{"._foo.BAD.extra", false},     // suffix not terminal
+	}
+	for _, tt := range tests {
+		if got := isMarkerFile(tt.name); got != tt.want {
+			t.Errorf("isMarkerFile(%q) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestCheckMarker(t *testing.T) {
+	dir := t.TempDir()
+	sample := filepath.Join(dir, "malware.whl")
+	os.WriteFile(sample, []byte("sample content"), 0o644)
+
+	// No marker → empty string.
+	if got := checkMarker(sample); got != "" {
+		t.Fatalf("checkMarker with no marker = %q, want empty", got)
+	}
+
+	// Create BENIGN marker → "benign".
+	benign := filepath.Join(dir, "._malware.whl.BENIGN")
+	os.WriteFile(benign, nil, 0o644)
+	if got := checkMarker(sample); got != "benign" {
+		t.Fatalf("checkMarker with BENIGN marker = %q, want %q", got, "benign")
+	}
+
+	// Remove BENIGN, create BAD marker → "bad".
+	os.Remove(benign)
+	bad := filepath.Join(dir, "._malware.whl.BAD")
+	os.WriteFile(bad, nil, 0o644)
+	if got := checkMarker(sample); got != "bad" {
+		t.Fatalf("checkMarker with BAD marker = %q, want %q", got, "bad")
+	}
+
+	// Both markers present → BENIGN wins (checked first).
+	os.WriteFile(benign, nil, 0o644)
+	if got := checkMarker(sample); got != "benign" {
+		t.Fatalf("checkMarker with both markers = %q, want %q", got, "benign")
+	}
+}
+
+func TestCheckMarkerSubdirectory(t *testing.T) {
+	// Marker must be in the same directory as the sample.
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "subdir")
+	os.MkdirAll(sub, 0o755)
+
+	sample := filepath.Join(sub, "pkg.tar.gz")
+	os.WriteFile(sample, []byte("data"), 0o644)
+
+	// Marker in parent dir should NOT match.
+	os.WriteFile(filepath.Join(dir, "._pkg.tar.gz.BENIGN"), nil, 0o644)
+	if got := checkMarker(sample); got != "" {
+		t.Fatalf("checkMarker with marker in parent dir = %q, want empty", got)
+	}
+
+	// Marker in same dir should match.
+	os.WriteFile(filepath.Join(sub, "._pkg.tar.gz.BENIGN"), nil, 0o644)
+	if got := checkMarker(sample); got != "benign" {
+		t.Fatalf("checkMarker with marker in same dir = %q, want %q", got, "benign")
+	}
+}
+
+func TestWalkFilesSkipsMarkers(t *testing.T) {
+	dir := t.TempDir()
+	// Create a real sample and a marker file.
+	os.WriteFile(filepath.Join(dir, "malware.whl"), []byte("sample content!"), 0o644)
+	os.WriteFile(filepath.Join(dir, "._malware.whl.BENIGN"), nil, 0o644)
+	os.WriteFile(filepath.Join(dir, "._other.exe.BAD"), nil, 0o644)
+	os.WriteFile(filepath.Join(dir, "legit.bin"), []byte("another sample!"), 0o644)
+
+	paths := make(chan string, 10)
+	var progress loadProgress
+
+	walkFiles(t.Context(), dir, paths, &progress)
+	close(paths)
+
+	var got []string
+	for p := range paths {
+		got = append(got, filepath.Base(p))
+	}
+
+	// Only real samples should appear, not marker files.
+	if len(got) != 2 {
+		t.Fatalf("walkFiles returned %d files %v, want 2 (malware.whl, legit.bin)", len(got), got)
+	}
+	for _, name := range got {
+		if isMarkerFile(name) {
+			t.Errorf("walkFiles emitted marker file %q", name)
+		}
+	}
+}
+
+func TestHashFileAppliesMarker(t *testing.T) {
+	dir := t.TempDir()
+
+	// Sample in a "bad" directory with a BENIGN marker → should flip to good + misclassified.
+	samplePath := filepath.Join(dir, "malware.whl")
+	os.WriteFile(samplePath, []byte("sample content!"), 0o644)
+	os.WriteFile(filepath.Join(dir, "._malware.whl.BENIGN"), nil, 0o644)
+
+	sample, err := hashFile(samplePath, "bad", "harvest", nil)
+	if err != nil {
+		t.Fatalf("hashFile: %v", err)
+	}
+
+	// hashFile doesn't apply markers — that's done in the hash worker.
+	// Verify the raw sample has the original label.
+	if sample.Label != "bad" {
+		t.Fatalf("hashFile label = %q, want %q", sample.Label, "bad")
+	}
+
+	// Simulate the marker logic from the hash worker.
+	label := "bad"
+	if marker := checkMarker(samplePath); marker != "" {
+		if (label == "bad" && marker == "benign") || (label == "good" && marker == "bad") {
+			sample.Label = marker
+			if marker == "benign" {
+				sample.Label = "good"
+			}
+			sample.LabelSource = "marker"
+			sample.Skip = "misclassified"
+		}
+	}
+
+	if sample.Label != "good" {
+		t.Errorf("after marker: label = %q, want %q", sample.Label, "good")
+	}
+	if sample.LabelSource != "marker" {
+		t.Errorf("after marker: label_source = %q, want %q", sample.LabelSource, "marker")
+	}
+	if sample.Skip != "misclassified" {
+		t.Errorf("after marker: skip = %q, want %q", sample.Skip, "misclassified")
+	}
+}
+
+func TestHashFileMarkerNoContradiction(t *testing.T) {
+	dir := t.TempDir()
+
+	// BAD marker on a bad-labeled file is not a contradiction → no change.
+	samplePath := filepath.Join(dir, "malware.whl")
+	os.WriteFile(samplePath, []byte("sample content!"), 0o644)
+	os.WriteFile(filepath.Join(dir, "._malware.whl.BAD"), nil, 0o644)
+
+	sample, err := hashFile(samplePath, "bad", "harvest", nil)
+	if err != nil {
+		t.Fatalf("hashFile: %v", err)
+	}
+
+	label := "bad"
+	marker := checkMarker(samplePath)
+	contradicts := (label == "bad" && marker == "benign") || (label == "good" && marker == "bad")
+	if contradicts {
+		t.Fatal("BAD marker on bad-labeled file should not be a contradiction")
+	}
+
+	if sample.Label != "bad" {
+		t.Errorf("label = %q, want %q (unchanged)", sample.Label, "bad")
+	}
+	if sample.Skip != "" {
+		t.Errorf("skip = %q, want empty (no misclassification)", sample.Skip)
+	}
+}
+
+func TestHashCacheHitMiss(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "cache.db")
+	c, err := openHashCache(dbPath)
+	if err != nil {
+		t.Fatalf("openHashCache: %v", err)
+	}
+	defer c.close()
+
+	// Write a sample file to get real stat values.
+	samplePath := filepath.Join(t.TempDir(), "sample.bin")
+	os.WriteFile(samplePath, []byte("hello world 123"), 0o644)
+	info, _ := os.Stat(samplePath)
+	dev, ino := fileStat(info)
+
+	// Miss on empty cache.
+	if _, ok := c.lookup(dev, ino, info.Size(), info.ModTime()); ok {
+		t.Fatal("expected cache miss on empty cache")
+	}
+
+	// Store and hit.
+	c.store(dev, ino, info.Size(), info.ModTime(), "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234")
+	sha, ok := c.lookup(dev, ino, info.Size(), info.ModTime())
+	if !ok {
+		t.Fatal("expected cache hit after store")
+	}
+	if sha != "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234" {
+		t.Fatalf("cached sha = %q", sha)
+	}
+
+	// Miss on different size.
+	if _, ok := c.lookup(dev, ino, info.Size()+1, info.ModTime()); ok {
+		t.Fatal("expected cache miss for different size")
+	}
+
+	// Miss on different mtime.
+	if _, ok := c.lookup(dev, ino, info.Size(), info.ModTime().Add(1)); ok {
+		t.Fatal("expected cache miss for different mtime")
+	}
+}
+
+func TestHashCachePersistence(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "cache.db")
+
+	// Write an entry and close.
+	c, err := openHashCache(dbPath)
+	if err != nil {
+		t.Fatalf("openHashCache: %v", err)
+	}
+	c.store(42, 999, 1024, fixedTime(), "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234")
+	c.close()
+
+	// Reopen and verify the entry survived.
+	c2, err := openHashCache(dbPath)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer c2.close()
+
+	sha, ok := c2.lookup(42, 999, 1024, fixedTime())
+	if !ok {
+		t.Fatal("expected cache hit after reopen")
+	}
+	if sha != "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234" {
+		t.Fatalf("persisted sha = %q", sha)
+	}
+}
+
+func fixedTime() time.Time {
+	return time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+}
+
+func TestHashCacheConcurrent(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "cache.db")
+	c, err := openHashCache(dbPath)
+	if err != nil {
+		t.Fatalf("openHashCache: %v", err)
+	}
+	defer c.close()
+
+	const n = 5000
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ino := uint64(i)
+			sha := fmt.Sprintf("%064x", i)
+			c.store(1, ino, 100, fixedTime(), sha)
+			got, ok := c.lookup(1, ino, 100, fixedTime())
+			if !ok {
+				t.Errorf("miss for inode %d after store", ino)
+				return
+			}
+			if got != sha {
+				t.Errorf("inode %d: got %q, want %q", ino, got, sha)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestHashFileWithCache(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "cache.db")
+	c, err := openHashCache(dbPath)
+	if err != nil {
+		t.Fatalf("openHashCache: %v", err)
+	}
+	defer c.close()
+
+	samplePath := filepath.Join(t.TempDir(), "sample.bin")
+	os.WriteFile(samplePath, []byte("sample content!"), 0o644)
+
+	// First call: cache miss, computes hash and stores it.
+	s1, err := hashFile(samplePath, "bad", "harvest", c)
+	if err != nil {
+		t.Fatalf("hashFile (miss): %v", err)
+	}
+
+	// Second call: cache hit, should return same hash without re-reading.
+	s2, err := hashFile(samplePath, "bad", "harvest", c)
+	if err != nil {
+		t.Fatalf("hashFile (hit): %v", err)
+	}
+	if s1.SHA256 != s2.SHA256 {
+		t.Fatalf("cache returned different hash: %q vs %q", s1.SHA256, s2.SHA256)
+	}
+}
+
+func withArgs(args []string, fn func()) {
+	old := os.Args
+	os.Args = args
+	defer func() { os.Args = old }()
+	fn()
+}
+
+func TestCmdInit(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "init-test.db")
+	withArgs([]string{"hopper", "init", "-db", dbPath}, func() {
+		if err := cmdInit(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	})
+	// Verify DB was created and is usable.
+	db, err := hopper.Open(t.Context(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	_, err = db.CountByLabel(t.Context())
+	if err != nil {
+		t.Fatalf("DB not usable after init: %v", err)
+	}
+}
+
+func TestCmdReset(t *testing.T) {
+	ctx := t.Context()
+	dbPath := filepath.Join(t.TempDir(), "reset-test.db")
+	db, err := hopper.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Migrate(ctx)
+	db.InsertSample(ctx, &hopper.Sample{SHA256: "aaa", Source: "test", Label: "bad", LabelSource: "test"})
+	db.Close()
+
+	withArgs([]string{"hopper", "reset", "-db", dbPath}, func() {
+		if err := cmdReset(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	db, _ = hopper.Open(ctx, dbPath)
+	defer db.Close()
+	counts, _ := db.CountByLabel(ctx)
+	total := 0
+	for _, n := range counts {
+		total += n
+	}
+	if total != 0 {
+		t.Errorf("expected 0 samples after reset, got %d", total)
+	}
+}
+
+func TestCmdStats(t *testing.T) {
+	ctx := t.Context()
+	dbPath := filepath.Join(t.TempDir(), "stats-test.db")
+	db, err := hopper.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Migrate(ctx)
+	db.InsertSample(ctx, &hopper.Sample{SHA256: "s1", Source: "test", Label: "bad", LabelSource: "test"})
+	db.InsertSample(ctx, &hopper.Sample{SHA256: "s2", Source: "test", Label: "good", LabelSource: "test"})
+	db.Close()
+
+	withArgs([]string{"hopper", "stats", "-db", dbPath}, func() {
+		if err := cmdStats(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestCmdLoadIntegration(t *testing.T) {
+	ctx := t.Context()
+	dbPath := filepath.Join(t.TempDir(), "load-test.db")
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "sample1.bin"), []byte("malicious content!"), 0o644)
+	os.WriteFile(filepath.Join(dir, "sample2.bin"), []byte("another evil file!"), 0o644)
+
+	withArgs([]string{"hopper", "load", "-db", dbPath, "-bad", dir, "-workers", "2", "-cleave", ""}, func() {
+		if err := cmdLoad(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	db, _ := hopper.Open(ctx, dbPath)
+	defer db.Close()
+	counts, _ := db.CountByLabel(ctx)
+	if counts["bad"] != 2 {
+		t.Errorf("bad count = %d, want 2", counts["bad"])
+	}
+}
+
+func TestCmdImport(t *testing.T) {
+	ctx := t.Context()
+
+	// Set up source DB with a sample.
+	srcPath := filepath.Join(t.TempDir(), "src.db")
+	src, _ := hopper.Open(ctx, srcPath)
+	src.Migrate(ctx)
+	src.InsertSample(ctx, &hopper.Sample{SHA256: "imp1", Source: "test", Label: "bad", LabelSource: "test"})
+	src.InsertReport(ctx, &hopper.Report{SHA256: "imp1", Type: "re", Content: "report"})
+	src.Close()
+
+	dstPath := filepath.Join(t.TempDir(), "dst.db")
+	withArgs([]string{"hopper", "import", "-db", dstPath, "-from", srcPath}, func() {
+		if err := cmdImport(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	dst, _ := hopper.Open(ctx, dstPath)
+	defer dst.Close()
+	got, err := dst.SampleBySHA256(ctx, "imp1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Label != "bad" {
+		t.Errorf("label = %q, want bad", got.Label)
+	}
+}
+
+func TestCmdLoadGood(t *testing.T) {
+	ctx := t.Context()
+	dbPath := filepath.Join(t.TempDir(), "load-good.db")
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "benign.bin"), []byte("harmless content!"), 0o644)
+
+	withArgs([]string{"hopper", "load", "-db", dbPath, "-good", dir, "-workers", "1", "-cleave", "", "-no-cache"}, func() {
+		if err := cmdLoad(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	db, _ := hopper.Open(ctx, dbPath)
+	defer db.Close()
+	counts, _ := db.CountByLabel(ctx)
+	if counts["good"] != 1 {
+		t.Errorf("good count = %d, want 1", counts["good"])
+	}
+}
+
+func TestCmdLoadBothDirs(t *testing.T) {
+	ctx := t.Context()
+	dbPath := filepath.Join(t.TempDir(), "load-both.db")
+	badDir := t.TempDir()
+	goodDir := t.TempDir()
+	os.WriteFile(filepath.Join(badDir, "evil.bin"), []byte("malicious payload!"), 0o644)
+	os.WriteFile(filepath.Join(goodDir, "safe.bin"), []byte("harmless content!"), 0o644)
+
+	withArgs([]string{"hopper", "load", "-db", dbPath, "-bad", badDir, "-good", goodDir, "-workers", "1", "-cleave", ""}, func() {
+		if err := cmdLoad(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	db, _ := hopper.Open(ctx, dbPath)
+	defer db.Close()
+	counts, _ := db.CountByLabel(ctx)
+	if counts["bad"] != 1 {
+		t.Errorf("bad = %d, want 1", counts["bad"])
+	}
+	if counts["good"] != 1 {
+		t.Errorf("good = %d, want 1", counts["good"])
+	}
+}
+
+func TestRun(t *testing.T) {
+	// Unknown command returns error.
+	withArgs([]string{"hopper", "bogus"}, func() {
+		err := run(t.Context())
+		if err == nil || err.Error() != "unknown command: bogus" {
+			t.Errorf("expected unknown command error, got %v", err)
+		}
+	})
+
+	// Valid commands through run().
+	dbPath := filepath.Join(t.TempDir(), "run-test.db")
+
+	withArgs([]string{"hopper", "init", "-db", dbPath}, func() {
+		if err := run(t.Context()); err != nil {
+			t.Errorf("run init: %v", err)
+		}
+	})
+	withArgs([]string{"hopper", "stats", "-db", dbPath}, func() {
+		if err := run(t.Context()); err != nil {
+			t.Errorf("run stats: %v", err)
+		}
+	})
+	withArgs([]string{"hopper", "reset", "-db", dbPath}, func() {
+		if err := run(t.Context()); err != nil {
+			t.Errorf("run reset: %v", err)
+		}
+	})
+}
+
+func TestOpenDB(t *testing.T) {
+	ctx := t.Context()
+	// SQLite path.
+	dbPath := filepath.Join(t.TempDir(), "opendb-test.db")
+	t.Setenv("DATABASE_URL", dbPath)
+	db, err := openDB(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+}
+
+func TestRedactDSN(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"postgres://user:secret@host:5432/db", "postgres://user:xxxxx@host:5432/db"},
+		{"postgres://host/db", "postgres://host/db"},
+		{"/path/to/file.db", "/path/to/file.db"},
+		{"not a url", "not%20a%20url"},
+	}
+	for _, tt := range tests {
+		got := redactDSN(tt.in)
+		if got != tt.want {
+			t.Errorf("redactDSN(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestExtractCleaveResult(t *testing.T) {
+	// Embedded file has smaller SHA than the sample itself.
+	raw := []byte(`{"fs":[
+		{"sha":"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"},
+		{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	]}`)
+	r, err := extractCleaveResult("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.CanonicalSHA256 != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Errorf("canonical = %q", r.CanonicalSHA256)
+	}
+
+	// No files: canonical is the sample SHA.
+	r, err = extractCleaveResult("abcd", []byte(`{"fs":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.CanonicalSHA256 != "abcd" {
+		t.Errorf("canonical = %q, want abcd", r.CanonicalSHA256)
+	}
+
+	// Invalid JSON.
+	_, err = extractCleaveResult("x", []byte(`{bad`))
+	if err == nil {
+		t.Error("expected error on invalid JSON")
+	}
+}
+
+func TestFreePort(t *testing.T) {
+	port, err := freePort(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if port == "" || port == "0" {
+		t.Errorf("freePort returned %q", port)
+	}
+}
+
+func TestHashFileTooSmall(t *testing.T) {
+	dir := t.TempDir()
+	small := filepath.Join(dir, "tiny.bin")
+	os.WriteFile(small, []byte("short"), 0o644) // 5 bytes < minFileSize(13)
+
+	_, err := hashFile(small, "bad", "test", nil)
+	if !errors.Is(err, errTooSmall) {
+		t.Errorf("expected errTooSmall, got %v", err)
+	}
+}
+
+func TestHashFileTooLarge(t *testing.T) {
+	// We can't create a 1GB file in tests, but we can verify the constant.
+	if maxFileSize != 1<<30 {
+		t.Errorf("maxFileSize = %d, want %d", maxFileSize, 1<<30)
+	}
+}
+
+func TestWalkFilesSkipsGitDir(t *testing.T) {
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, ".git", "objects"), 0o755)
+	os.WriteFile(filepath.Join(dir, ".git", "objects", "pack.idx"), []byte("git internal!"), 0o644)
+	os.WriteFile(filepath.Join(dir, "sample.bin"), []byte("real sample!!!"), 0o644)
+
+	paths := make(chan string, 10)
+	var progress loadProgress
+
+	walkFiles(t.Context(), dir, paths, &progress)
+	close(paths)
+
+	var got []string
+	for p := range paths {
+		got = append(got, filepath.Base(p))
+	}
+
+	if len(got) != 1 || got[0] != "sample.bin" {
+		t.Errorf("walkFiles returned %v, want just [sample.bin]", got)
+	}
+}
+
+func TestNewCleaveServer(t *testing.T) {
+	s := newCleaveServer(cleaveConfig{Bin: "/usr/bin/cleave", MaxWorkers: 4})
+	if s.Workers() != 4 {
+		t.Errorf("Workers = %d, want 4", s.Workers())
+	}
+	if s.bin != "/usr/bin/cleave" {
+		t.Errorf("bin = %q", s.bin)
+	}
+
+	// Defaults.
+	s2 := newCleaveServer(cleaveConfig{})
+	if s2.bin != "cleave" {
+		t.Errorf("default bin = %q, want cleave", s2.bin)
+	}
+	if s2.Workers() != 8 {
+		t.Errorf("default Workers = %d, want 8", s2.Workers())
+	}
+}
+
+func TestLoadDir(t *testing.T) {
+	ctx := t.Context()
+
+	// Set up a temp SQLite DB.
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := hopper.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create sample files.
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "malware1.bin"), []byte("malicious payload one"), 0o644)
+	os.WriteFile(filepath.Join(dir, "malware2.bin"), []byte("malicious payload two"), 0o644)
+	os.WriteFile(filepath.Join(dir, "tiny"), []byte("x"), 0o644) // too small, should be skipped
+	os.MkdirAll(filepath.Join(dir, ".git"), 0o755)
+	os.WriteFile(filepath.Join(dir, ".git", "HEAD"), []byte("ref: refs/heads/main"), 0o644)
+
+	n := loadDir(ctx, db, nil, nil, dir, "bad", "test", 2, false)
+	// 2 valid files inserted (tiny skipped, .git skipped)
+	if n != 2 {
+		t.Errorf("loadDir returned %d, want 2", n)
+	}
+
+	counts, _ := db.CountByLabel(ctx)
+	if counts["bad"] != 2 {
+		t.Errorf("bad count = %d, want 2", counts["bad"])
+	}
+}
+
+func TestLoadDirWithCache(t *testing.T) {
+	ctx := t.Context()
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := hopper.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.Migrate(ctx)
+
+	cachePath := filepath.Join(t.TempDir(), "cache.db")
+	cache, err := openHashCache(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.close()
+
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "sample.bin"), []byte("sample content!!"), 0o644)
+
+	// First load: cache miss, hashes file.
+	n1 := loadDir(ctx, db, nil, cache, dir, "bad", "test", 1, false)
+	if n1 != 1 {
+		t.Errorf("first load = %d, want 1", n1)
+	}
+
+	// Second load: cache hit, same hash → duplicate skipped.
+	n2 := loadDir(ctx, db, nil, cache, dir, "bad", "test", 1, false)
+	if n2 != 1 { // 1 total (0 inserted + 1 skipped)
+		t.Errorf("second load = %d, want 1", n2)
+	}
+}
+
+func TestLoadDirMarkers(t *testing.T) {
+	ctx := t.Context()
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := hopper.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.Migrate(ctx)
+
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "malware.bin"), []byte("malicious payload!"), 0o644)
+	os.WriteFile(filepath.Join(dir, "._malware.bin.BENIGN"), nil, 0o644) // marker: actually benign
+
+	loadDir(ctx, db, nil, nil, dir, "bad", "test", 1, false)
+
+	// The sample should be flipped to "good" with skip="misclassified".
+	samples, _ := db.SamplesByLabel(ctx, "good", 10)
+	if len(samples) != 1 {
+		t.Fatalf("expected 1 good sample, got %d", len(samples))
+	}
+	if samples[0].Skip != "misclassified" {
+		t.Errorf("skip = %q, want misclassified", samples[0].Skip)
+	}
+}
+
+func TestHashFileMarkerBadOnGood(t *testing.T) {
+	dir := t.TempDir()
+
+	// BAD marker on a good-labeled file → flip to bad + misclassified.
+	samplePath := filepath.Join(dir, "legit.bin")
+	os.WriteFile(samplePath, []byte("sample content!"), 0o644)
+	os.WriteFile(filepath.Join(dir, "._legit.bin.BAD"), nil, 0o644)
+
+	sample, err := hashFile(samplePath, "good", "harvest", nil)
+	if err != nil {
+		t.Fatalf("hashFile: %v", err)
+	}
+
+	label := "good"
+	if marker := checkMarker(samplePath); marker != "" {
+		if (label == "bad" && marker == "benign") || (label == "good" && marker == "bad") {
+			sample.Label = marker
+			if marker == "benign" {
+				sample.Label = "good"
+			}
+			sample.LabelSource = "marker"
+			sample.Skip = "misclassified"
+		}
+	}
+
+	if sample.Label != "bad" {
+		t.Errorf("after marker: label = %q, want %q", sample.Label, "bad")
+	}
+	if sample.LabelSource != "marker" {
+		t.Errorf("after marker: label_source = %q, want %q", sample.LabelSource, "marker")
+	}
+	if sample.Skip != "misclassified" {
+		t.Errorf("after marker: skip = %q, want %q", sample.Skip, "misclassified")
+	}
+}

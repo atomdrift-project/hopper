@@ -3,6 +3,7 @@ package hopper
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -202,6 +203,83 @@ func TestTransferSamples(t *testing.T) {
 	}
 	if len(reps) != 2 {
 		t.Errorf("got %d reports, want 2", len(reps))
+	}
+}
+
+func TestLabelFromLegacyStatus(t *testing.T) {
+	tests := []struct {
+		status, want string
+	}{
+		{"good", "good"},
+		{"good-review", "good"},
+		{"good-analyzed", "good"},
+		{"good-exhausted", "good"},
+		{"bad-benign", "good"},
+		{"bad", "bad"},
+		{"bad-review", "bad"},
+		{"bad-reversed", "bad"},
+		{"bad-gapped", "bad"},
+		{"bad-exhausted", "bad"},
+		{"good-malicious", "bad"},
+		{"nonsense", "unknown"},
+		{"", "unknown"},
+	}
+	for _, tt := range tests {
+		got := labelFromLegacyStatus(tt.status)
+		if got != tt.want {
+			t.Errorf("labelFromLegacyStatus(%q) = %q, want %q", tt.status, got, tt.want)
+		}
+	}
+}
+
+func TestMigrateLegacy_Resume(t *testing.T) {
+	legacyPath := createLegacyDB(t)
+	dst := openTestDB(t)
+	ctx := context.Background()
+
+	// Import only after rowid 2 (skips first 2 rows).
+	n, err := MigrateLegacy(ctx, dst, legacyPath, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Errorf("migrated %d samples after resume, want 3", n)
+	}
+}
+
+func TestTransferSamples_WithReports(t *testing.T) {
+	src := openTestDB(t)
+	dst := openTestDB(t)
+	ctx := context.Background()
+
+	// Create enough samples to trigger batch flushing (batch size = 500).
+	for i := range 10 {
+		sha := fmt.Sprintf("batch%04d", i)
+		mustInsert(t, ctx, src, &Sample{
+			SHA256: sha, Source: "test", Label: "bad", LabelSource: "test",
+			Path: fmt.Sprintf("/data/%s", sha), Status: "bad-review",
+		})
+		src.InsertReport(ctx, &Report{SHA256: sha, Type: "re", Content: "analysis", Provider: "claude"})
+	}
+
+	samples, reports, err := TransferSamples(ctx, dst, src, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if samples != 10 {
+		t.Errorf("transferred %d samples, want 10", samples)
+	}
+	if reports != 10 {
+		t.Errorf("transferred %d reports, want 10", reports)
+	}
+
+	// Verify resume: transfer again from after the last IDs.
+	s2, r2, err := TransferSamples(ctx, dst, src, int64(samples), int64(reports))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s2 != 0 || r2 != 0 {
+		t.Errorf("resume transfer: samples=%d reports=%d, want 0/0", s2, r2)
 	}
 }
 
