@@ -40,14 +40,14 @@ func (db *DB) migratePG(ctx context.Context) error {
 }
 
 const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, cleave_result, risk, finding_count,
+	size_bytes, label, label_source, cleave_result,
 	path, status, note, canonical_sha256, parent, skip, created_at, updated_at, analyzed_at`
 
 func pgSampleDest(s *Sample) []any {
 	return []any{
 		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &s.CleaveResult,
-		&s.Risk, &s.FindingCount, &s.Path, &s.Status, &s.Note, &s.CanonicalSHA256,
+		&s.Path, &s.Status, &s.Note, &s.CanonicalSHA256,
 		&s.Parent, &s.Skip, &s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt,
 	}
 }
@@ -152,11 +152,11 @@ func (db *DB) sampleBySHA256PG(ctx context.Context, sha256 string) (*Sample, err
 	return s, nil
 }
 
-func (db *DB) updateCleaveResultPG(ctx context.Context, sha256 string, result []byte, risk string, findings int, canonical string) error {
+func (db *DB) updateCleaveResultPG(ctx context.Context, sha256 string, result []byte, canonical string) error {
 	_, err := db.pool.Exec(ctx, `
-		UPDATE samples SET cleave_result = $2, risk = $3, finding_count = $4,
-			canonical_sha256 = $5, analyzed_at = now(), updated_at = now()
-		WHERE sha256 = $1`, sha256, sanitizeJSONB(result), risk, findings, canonical)
+		UPDATE samples SET cleave_result = $2,
+			canonical_sha256 = $3, analyzed_at = now(), updated_at = now()
+		WHERE sha256 = $1`, sha256, sanitizeJSONB(result), canonical)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
 	}
@@ -239,11 +239,11 @@ func (db *DB) countByStatusPG(ctx context.Context) (map[string]int, error) {
 	return scanPGCounts(rows)
 }
 
-func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result []byte, risk string, findings int, canonical string) error {
+func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result []byte, canonical string) error {
 	_, err := db.pool.Exec(ctx, `
-		UPDATE samples SET status = $2, cleave_result = $3, risk = $4, finding_count = $5,
-			canonical_sha256 = $6, analyzed_at = now(), updated_at = now()
-		WHERE sha256 = $1`, sha256, status, sanitizeJSONB(result), risk, findings, canonical)
+		UPDATE samples SET status = $2, cleave_result = $3,
+			canonical_sha256 = $4, analyzed_at = now(), updated_at = now()
+		WHERE sha256 = $1`, sha256, status, sanitizeJSONB(result), canonical)
 	if err != nil {
 		return fmt.Errorf("hopper: update sample: %w", err)
 	}

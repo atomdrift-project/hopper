@@ -195,9 +195,7 @@ func (s *cleaveServer) waitHealthy(ctx context.Context) error {
 
 // cleaveResult is the subset of the cleave response we extract for the DB.
 type cleaveResult struct {
-	Risk            string
 	CanonicalSHA256 string
-	FindingCount    int
 }
 
 // Analyze sends a file to the cleave server for analysis.
@@ -271,42 +269,22 @@ func (s *cleaveServer) doAnalyze(ctx context.Context, sha256 string, body []byte
 // The response has summary.max_risk (string) and summary.counts (hostile/suspicious/notable).
 func extractCleaveResult(sha256 string, raw []byte) (*cleaveResult, error) {
 	var resp struct {
-		Summary *struct {
-			MaxRisk string `json:"max_risk"`
-			Counts  struct {
-				Hostile    int `json:"hostile"`
-				Suspicious int `json:"suspicious"`
-				Notable    int `json:"notable"`
-			} `json:"counts"`
-		} `json:"summary"`
 		Files []struct {
-			SHA256   string `json:"sha256"`
-			Risk     string `json:"risk"`
-			Findings []any  `json:"findings"`
-		} `json:"files"`
+			SHA256 string `json:"sha"`
+		} `json:"fs"`
 	}
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return nil, err
 	}
 
-	r := &cleaveResult{}
-	if resp.Summary != nil {
-		r.Risk = strings.ToLower(resp.Summary.MaxRisk)
-		r.FindingCount = resp.Summary.Counts.Hostile + resp.Summary.Counts.Suspicious + resp.Summary.Counts.Notable
-	} else if len(resp.Files) > 0 {
-		r.Risk = strings.ToLower(resp.Files[0].Risk)
-		r.FindingCount = len(resp.Files[0].Findings)
-	}
-
-	// Compute canonical SHA from the already-parsed files array.
+	// Compute canonical SHA from the parsed files array.
 	canonical := sha256
 	for _, f := range resp.Files {
 		if len(f.SHA256) == 64 && f.SHA256 < canonical {
 			canonical = f.SHA256
 		}
 	}
-	r.CanonicalSHA256 = canonical
-	return r, nil
+	return &cleaveResult{CanonicalSHA256: canonical}, nil
 }
 
 // Workers returns the max concurrent analysis workers.

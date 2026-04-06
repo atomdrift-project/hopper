@@ -486,7 +486,7 @@ func startAnalysisWorkers(ctx context.Context, db *hopper.DB, cleave *cleaveServ
 					slog.Warn("analysis failed", "path", job.path, "error", err)
 					continue
 				}
-				if err := db.UpdateCleaveResult(ctx, job.sha, raw, result.Risk, result.FindingCount, result.CanonicalSHA256); err != nil {
+				if err := db.UpdateCleaveResult(ctx, job.sha, raw, result.CanonicalSHA256); err != nil {
 					progress.errors.Add(1)
 					slog.Warn("storing result failed", "path", job.path, "error", err)
 					continue

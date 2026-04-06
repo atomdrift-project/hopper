@@ -51,16 +51,16 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 }
 
 const liteSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, cleave_result, risk, finding_count,
+	size_bytes, label, label_source, cleave_result,
 	path, status, note, canonical_sha256, parent, skip, created_at, updated_at, analyzed_at`
 
 func scanLiteSample(row *sql.Row) (*Sample, error) {
 	s := &Sample{}
-	var cleaveResult, risk, status sql.NullString
+	var cleaveResult, status sql.NullString
 	var analyzedAt sql.NullTime
 	err := row.Scan(&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult,
-		&risk, &s.FindingCount, &s.Path, &status, &s.Note, &s.CanonicalSHA256,
+		&s.Path, &status, &s.Note, &s.CanonicalSHA256,
 		&s.Parent, &s.Skip, &s.CreatedAt, &s.UpdatedAt, &analyzedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -71,7 +71,6 @@ func scanLiteSample(row *sql.Row) (*Sample, error) {
 	if cleaveResult.Valid {
 		s.CleaveResult = []byte(cleaveResult.String)
 	}
-	s.Risk = risk.String
 	s.Status = status.String
 	if analyzedAt.Valid {
 		s.AnalyzedAt = &analyzedAt.Time
@@ -84,18 +83,17 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 	var out []*Sample
 	for rows.Next() {
 		s := &Sample{}
-		var cleaveResult, risk, status sql.NullString
+		var cleaveResult, status sql.NullString
 		var analyzedAt sql.NullTime
 		if err := rows.Scan(&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult,
-			&risk, &s.FindingCount, &s.Path, &status, &s.Note, &s.CanonicalSHA256,
+			&s.Path, &status, &s.Note, &s.CanonicalSHA256,
 			&s.Parent, &s.Skip, &s.CreatedAt, &s.UpdatedAt, &analyzedAt); err != nil {
 			return nil, err
 		}
 		if cleaveResult.Valid {
 			s.CleaveResult = []byte(cleaveResult.String)
 		}
-		s.Risk = risk.String
 		s.Status = status.String
 		if analyzedAt.Valid {
 			s.AnalyzedAt = &analyzedAt.Time
@@ -171,12 +169,12 @@ func (db *DB) sampleBySHA256SQLite(ctx context.Context, sha256 string) (*Sample,
 	return s, nil
 }
 
-func (db *DB) updateCleaveResultSQLite(ctx context.Context, sha256 string, result []byte, risk string, findings int, canonical string) error {
+func (db *DB) updateCleaveResultSQLite(ctx context.Context, sha256 string, result []byte, canonical string) error {
 	n := now()
 	_, err := db.lite.ExecContext(ctx, `
-		UPDATE samples SET cleave_result = ?, risk = ?, finding_count = ?,
+		UPDATE samples SET cleave_result = ?,
 			canonical_sha256 = ?, analyzed_at = ?, updated_at = ?
-		WHERE sha256 = ?`, string(result), risk, findings, canonical, n, n, sha256)
+		WHERE sha256 = ?`, string(result), canonical, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
 	}
@@ -259,12 +257,12 @@ func (db *DB) countByStatusSQLite(ctx context.Context) (map[string]int, error) {
 	return scanLiteCounts(rows)
 }
 
-func (db *DB) updateSampleSQLite(ctx context.Context, sha256, status string, result []byte, risk string, findings int, canonical string) error {
+func (db *DB) updateSampleSQLite(ctx context.Context, sha256, status string, result []byte, canonical string) error {
 	n := now()
 	_, err := db.lite.ExecContext(ctx, `
-		UPDATE samples SET status = ?, cleave_result = ?, risk = ?, finding_count = ?,
+		UPDATE samples SET status = ?, cleave_result = ?,
 			canonical_sha256 = ?, analyzed_at = ?, updated_at = ?
-		WHERE sha256 = ?`, status, string(result), risk, findings, canonical, n, n, sha256)
+		WHERE sha256 = ?`, status, string(result), canonical, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update sample: %w", err)
 	}

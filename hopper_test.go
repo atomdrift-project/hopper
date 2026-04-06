@@ -41,7 +41,6 @@ func TestInsertAndLookup(t *testing.T) {
 		LabelSource: "test",
 		Path:        "/data/bad/malware.exe",
 		Status:      "bad-review",
-		Risk:        "hostile",
 	}
 	if err := db.InsertSample(ctx, s); err != nil {
 		t.Fatalf("InsertSample: %v", err)
@@ -112,18 +111,12 @@ func TestUpdateCleaveResult(t *testing.T) {
 	ctx := context.Background()
 
 	mustInsert(t, ctx, db, &Sample{SHA256: "c1", Source: "test", Label: "bad", LabelSource: "test"})
-	if err := db.UpdateCleaveResult(ctx, "c1", []byte(`{"findings":[]}`), "suspicious", 3, ""); err != nil {
+	if err := db.UpdateCleaveResult(ctx, "c1", []byte(`{"fs":[{"ts":[{"i":"test","l":4}]}]}`), ""); err != nil {
 		t.Fatal(err)
 	}
 	got, err := db.SampleBySHA256(ctx, "c1")
 	if err != nil {
 		t.Fatalf("SampleBySHA256: %v", err)
-	}
-	if got.Risk != "suspicious" {
-		t.Errorf("Risk = %q, want %q", got.Risk, "suspicious")
-	}
-	if got.FindingCount != 3 {
-		t.Errorf("FindingCount = %d, want 3", got.FindingCount)
 	}
 	if got.CleaveResult == nil {
 		t.Error("CleaveResult should not be nil")
@@ -138,7 +131,7 @@ func TestUpdateSample(t *testing.T) {
 	ctx := context.Background()
 
 	mustInsert(t, ctx, db, &Sample{SHA256: "u1", Source: "test", Label: "bad", LabelSource: "test", Status: "bad-review"})
-	if err := db.UpdateSample(ctx, "u1", "bad-reversed", []byte(`{"f":1}`), "hostile", 5, ""); err != nil {
+	if err := db.UpdateSample(ctx, "u1", "bad-reversed", []byte(`{"fs":[{"ts":[{"i":"test","l":5}]}]}`), ""); err != nil {
 		t.Fatal(err)
 	}
 	got, err := db.SampleBySHA256(ctx, "u1")
@@ -147,9 +140,6 @@ func TestUpdateSample(t *testing.T) {
 	}
 	if got.Status != "bad-reversed" {
 		t.Errorf("Status = %q, want %q", got.Status, "bad-reversed")
-	}
-	if got.Risk != "hostile" {
-		t.Errorf("Risk = %q, want %q", got.Risk, "hostile")
 	}
 }
 
@@ -309,7 +299,7 @@ func TestUnanalyzed(t *testing.T) {
 
 	mustInsert(t, ctx, db, &Sample{SHA256: "a", Source: "test", Label: "bad", LabelSource: "test"})
 	mustInsert(t, ctx, db, &Sample{SHA256: "b", Source: "test", Label: "bad", LabelSource: "test"})
-	if err := db.UpdateCleaveResult(ctx, "b", []byte(`{}`), "none", 0, ""); err != nil {
+	if err := db.UpdateCleaveResult(ctx, "b", []byte(`{}`), ""); err != nil {
 		t.Fatal(err)
 	}
 

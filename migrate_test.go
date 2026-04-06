@@ -88,9 +88,6 @@ func TestMigrateLegacy(t *testing.T) {
 	if s.Status != "bad-reversed" {
 		t.Errorf("aaa111 status = %q, want %q", s.Status, "bad-reversed")
 	}
-	if s.Risk != "hostile" {
-		t.Errorf("aaa111 risk = %q, want %q", s.Risk, "hostile")
-	}
 	if s.CleaveResult == nil {
 		t.Error("aaa111 should have cleave result")
 	}
@@ -170,7 +167,7 @@ func TestTransferSamples(t *testing.T) {
 	// Seed source with samples and reports.
 	mustInsert(t, ctx, src, &Sample{SHA256: "t1", Source: "test", Label: "bad", LabelSource: "test", Status: "bad-review", Path: "/data/t1"})
 	mustInsert(t, ctx, src, &Sample{SHA256: "t2", Source: "test", Label: "good", LabelSource: "test", Status: "good", Path: "/data/t2"})
-	if err := src.UpdateCleaveResult(ctx, "t1", []byte(`{"findings":[]}`), "hostile", 5, ""); err != nil {
+	if err := src.UpdateCleaveResult(ctx, "t1", []byte(`{"fs":[{"ts":[{"i":"test","l":5}]}]}`), ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := src.InsertReport(ctx, &Report{SHA256: "t1", Type: "re", Content: "# Analysis", Provider: "claude"}); err != nil {
@@ -199,10 +196,6 @@ func TestTransferSamples(t *testing.T) {
 	if got.Status != "bad-review" {
 		t.Errorf("t1 status = %q, want %q", got.Status, "bad-review")
 	}
-	if got.Risk != "hostile" {
-		t.Errorf("t1 risk = %q, want %q", got.Risk, "hostile")
-	}
-
 	reps, err := dst.ReportsBySHA256(ctx, "t1")
 	if err != nil {
 		t.Fatal(err)

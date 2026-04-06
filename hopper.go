@@ -109,7 +109,6 @@ type Sample struct {
 	FileType        string
 	Label           string // "bad", "good", "unknown"
 	LabelSource     string
-	Risk            string
 	Path            string
 	Status          string
 	Note            string
@@ -120,7 +119,6 @@ type Sample struct {
 	CleaveResult    []byte // raw JSON, nil if unanalyzed
 	ID              int64
 	SizeBytes       int64
-	FindingCount    int
 }
 
 // Report is an analysis report produced by cyclotron.
@@ -145,8 +143,8 @@ func canonicalSHA(sha256 string, cleaveResult []byte) string {
 	}
 	var report struct {
 		Files []struct {
-			SHA256 string `json:"sha256"`
-		} `json:"files"`
+			SHA256 string `json:"sha"`
+		} `json:"fs"`
 	}
 	if json.Unmarshal(cleaveResult, &report) != nil {
 		return canonical
@@ -173,7 +171,7 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 	}
 
 	var report struct {
-		Files []json.RawMessage `json:"files"`
+		Files []json.RawMessage `json:"fs"`
 	}
 	if err := json.Unmarshal(parent.CleaveResult, &report); err != nil {
 		return 0, fmt.Errorf("hopper: parse cleave result for explosion: %w", err)
@@ -182,47 +180,43 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 	var members []*Sample
 	for _, raw := range report.Files {
 		var entry struct {
-			SHA256   string `json:"sha256"`
-			Risk     string `json:"risk"`
-			FileType string `json:"file_type"`
+			SHA256   string `json:"sha"`
+			FileType string `json:"type"`
 			Path     string `json:"path"`
-			Findings []struct {
-				Crit string  `json:"crit"`
-				Conf float64 `json:"conf"`
-			} `json:"findings"`
-			Size  int64 `json:"size"`
-			Depth int   `json:"depth"`
+			Traits   []struct {
+				Level int     `json:"l"`
+				Conf  float64 `json:"c"`
+			} `json:"ts"`
+			Size  int64 `json:"sz"`
+			Depth int   `json:"dp"`
 		}
 		if json.Unmarshal(raw, &entry) != nil || entry.Depth == 0 || len(entry.SHA256) != 64 {
 			continue
 		}
 
-		risk := strings.ToLower(entry.Risk)
-		findingCount := len(entry.Findings)
-
-		// Count suspicious+ findings with sufficient confidence.
+		// Count suspicious+ findings with sufficient confidence for skip logic.
+		maxLevel := 0
 		suspiciousCount := 0
-		for _, f := range entry.Findings {
-			conf := f.Conf
+		for _, t := range entry.Traits {
+			conf := t.Conf
 			if conf == 0 {
 				conf = 1.0
 			}
-			if conf < 0.65 {
-				continue
+			if t.Level > maxLevel {
+				maxLevel = t.Level
 			}
-			crit := strings.ToLower(f.Crit)
-			if crit == "hostile" || crit == "suspicious" {
+			if conf >= 0.65 && t.Level >= 4 { // suspicious+
 				suspiciousCount++
 			}
 		}
 
 		skip := ""
-		if parent.Label == "bad" && risk != "hostile" && suspiciousCount <= 1 {
+		if parent.Label == "bad" && maxLevel < 5 && suspiciousCount <= 1 {
 			skip = "weak-findings"
 		}
 
 		singleFile, err := json.Marshal(struct {
-			Files []json.RawMessage `json:"files"`
+			Files []json.RawMessage `json:"fs"`
 		}{Files: []json.RawMessage{raw}})
 		if err != nil {
 			continue
@@ -238,8 +232,6 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 			SizeBytes:       entry.Size,
 			Label:           parent.Label,
 			LabelSource:     parent.LabelSource,
-			Risk:            risk,
-			FindingCount:    findingCount,
 			CleaveResult:    singleFile,
 			CanonicalSHA256: parent.CanonicalSHA256,
 			Parent:          parent.SHA256,
@@ -333,14 +325,14 @@ func (db *DB) SampleBySHA256(ctx context.Context, sha256 string) (*Sample, error
 // UpdateCleaveResult stores analysis output for a sample.
 // Pass canonicalSHA256 as the minimum SHA256 across the sample and its embedded
 // files (for train/test splits). Pass "" to compute it from result automatically.
-func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []byte, risk string, findings int, canonicalSHA256 string) error {
+func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []byte, canonicalSHA256 string) error {
 	if canonicalSHA256 == "" {
 		canonicalSHA256 = canonicalSHA(sha256, result)
 	}
 	if db.pool != nil {
-		return db.updateCleaveResultPG(ctx, sha256, result, risk, findings, canonicalSHA256)
+		return db.updateCleaveResultPG(ctx, sha256, result, canonicalSHA256)
 	}
-	return db.updateCleaveResultSQLite(ctx, sha256, result, risk, findings, canonicalSHA256)
+	return db.updateCleaveResultSQLite(ctx, sha256, result, canonicalSHA256)
 }
 
 // Reclassify changes a sample's label.
@@ -410,14 +402,14 @@ func (db *DB) CountByStatus(ctx context.Context) (map[string]int, error) {
 }
 
 // UpdateSample updates status, cleave result, and updated_at in one operation.
-func (db *DB) UpdateSample(ctx context.Context, sha256, status string, result []byte, risk string, findings int, canonicalSHA256 string) error {
+func (db *DB) UpdateSample(ctx context.Context, sha256, status string, result []byte, canonicalSHA256 string) error {
 	if canonicalSHA256 == "" {
 		canonicalSHA256 = canonicalSHA(sha256, result)
 	}
 	if db.pool != nil {
-		return db.updateSamplePG(ctx, sha256, status, result, risk, findings, canonicalSHA256)
+		return db.updateSamplePG(ctx, sha256, status, result, canonicalSHA256)
 	}
-	return db.updateSampleSQLite(ctx, sha256, status, result, risk, findings, canonicalSHA256)
+	return db.updateSampleSQLite(ctx, sha256, status, result, canonicalSHA256)
 }
 
 // SamplesByStatusInPaths returns samples matching status whose path
