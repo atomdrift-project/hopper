@@ -354,7 +354,7 @@ func (s *litmusServer) WatchHealth(ctx context.Context) {
 		busy, idle, workerOldestMs, workerOldestFile := s.workerSummary()
 
 		level := slog.LevelDebug
-		if health.ActiveTasks > 0 || busy > 0 {
+		if !isStdoutTTY() && (health.ActiveTasks > 0 || busy > 0) {
 			level = slog.LevelInfo
 		}
 		slog.Default().Log(ctx, level, "litmus health",
@@ -591,5 +591,10 @@ func isRetryableNetError(err error) bool {
 	return strings.Contains(s, "connection refused") ||
 		strings.Contains(s, "connection reset") ||
 		strings.Contains(s, "broken pipe")
+}
+
+func isStdoutTTY() bool {
+	fileInfo, _ := os.Stdout.Stat()
+	return (fileInfo.Mode() & os.ModeCharDevice) != 0
 }
 

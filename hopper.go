@@ -485,6 +485,14 @@ func (db *DB) CountByStatus(ctx context.Context) (map[string]int, error) {
 	return db.countByStatusSQLite(ctx)
 }
 
+// CountAnalyzed returns the number of samples with analysis results.
+func (db *DB) CountAnalyzed(ctx context.Context) (int64, error) {
+	if db.pool != nil {
+		return db.countAnalyzedPG(ctx)
+	}
+	return db.countAnalyzedSQLite(ctx)
+}
+
 // UpdateSample updates status, cleave result, and updated_at in one operation.
 func (db *DB) UpdateSample(ctx context.Context, sha256, status string, result []byte, canonicalSHA256 string) error {
 	if canonicalSHA256 == "" {

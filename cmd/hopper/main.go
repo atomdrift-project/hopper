@@ -451,12 +451,15 @@ type loadProgress struct {
 	hashErrors atomic.Int64 // hash failures (subset of errors, for % calc)
 	cacheHits  atomic.Int64
 	exploded   atomic.Int64 // archive members inserted
-	scoreSum   atomic.Int64 // sum of litmus scores for avg calculation
+	queued     atomic.Int64 // items sent for analysis
+
+	lastErr atomic.Value // string
 
 	// Per-analysis timing (nanoseconds).
 	analyzeDurationSum atomic.Int64
 	analyzeDurationMax atomic.Int64
 	analyzeDurationMin atomic.Int64 // initialized to math.MaxInt64
+	scoreSum           atomic.Int64
 }
 
 const (
@@ -476,6 +479,12 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 	var progress loadProgress
 	progress.analyzeDurationMin.Store(math.MaxInt64)
 
+	// Initialize already-analyzed count for the dashboard.
+	if n, err := db.CountAnalyzed(ctx); err == nil {
+		progress.analyzed.Store(n)
+		progress.queued.Store(n)
+	}
+
 	paths := make(chan labeledPath, nworkers*2)
 	hashed := make(chan hashedFile, nworkers*2)
 	var hashWG sync.WaitGroup
@@ -489,16 +498,23 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 	}
 
 	// Periodic progress reporting.
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(10 * time.Second)
+	if !isTTY() {
+		ticker.Reset(30 * time.Second)
+	}
+
 	done := make(chan struct{})
 	var prevAnalyzed int64
 	go func() {
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				elapsed := time.Since(start).Seconds()
 				analyzed := progress.analyzed.Load()
-				recentRate := float64(analyzed-prevAnalyzed) / 5.0
+				recentRate := float64(analyzed-prevAnalyzed) / 10.0
+				if !isTTY() {
+					recentRate = float64(analyzed-prevAnalyzed) / 30.0
+				}
 				prevAnalyzed = analyzed
 				walked := progress.walked.Load()
 				hashedN := progress.hashed.Load()
@@ -506,52 +522,73 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 				skipped := progress.skipped.Load()
 
 				// Stage percentages.
-				// Hash: completed = hashed + tooSmall + tooLarge + hashErrors
 				hashDone := hashedN + progress.tooSmall.Load() + progress.tooLarge.Load() + progress.hashErrors.Load()
-				// Analyze target: inserted files (capped by --max-analyzed).
-				analyzeTarget := inserted
+				analyzeTarget := progress.queued.Load()
 				if maxAnalyzed > 0 && int64(maxAnalyzed) < analyzeTarget {
 					analyzeTarget = int64(maxAnalyzed)
 				}
 
-				attrs := []any{
-					"dirs", len(dirs),
-				}
-				if walked > 0 {
-					attrs = append(attrs, "hash_pct", fmt.Sprintf("%.0f%%", float64(hashDone)/float64(walked)*100))
-				}
-				if hashedN > 0 {
-					attrs = append(attrs, "insert_pct", fmt.Sprintf("%.0f%%", float64(inserted+skipped)/float64(hashedN)*100))
-				}
-				if analyzeTarget > 0 {
-					attrs = append(attrs, "analyze_pct", fmt.Sprintf("%.0f%%", float64(analyzed)/float64(analyzeTarget)*100))
-				}
-				attrs = append(attrs,
-					"walked", walked, "hashed", hashedN,
-					"inserted", inserted,
-					"skipped", skipped, "markers", progress.markers.Load(),
-					"too_small", progress.tooSmall.Load(), "too_large", progress.tooLarge.Load(),
-					"cache_hits", progress.cacheHits.Load(),
-					"analyzed", analyzed,
-					"exploded", progress.exploded.Load(),
-					"errors", progress.errors.Load(),
-					"analyze_recent_per_sec", fmt.Sprintf("%.1f", recentRate),
-					"analyze_cumul_per_sec", fmt.Sprintf("%.1f", float64(analyzed)/elapsed),
-				)
-				if analyzed > 0 {
-					avgMs := progress.analyzeDurationSum.Load() / analyzed / int64(time.Millisecond)
-					maxMs := progress.analyzeDurationMax.Load() / int64(time.Millisecond)
-					attrs = append(attrs, "analyze_avg_ms", avgMs, "analyze_max_ms", maxMs)
-					attrs = append(attrs, "avg_score", int(progress.scoreSum.Load()/analyzed))
-				}
-				if analyzeTarget > 0 && recentRate > 0 {
-					remaining := analyzeTarget - analyzed
-					if remaining > 0 {
-						etaSec := float64(remaining) / recentRate
-						attrs = append(attrs, "eta", (time.Duration(etaSec)*time.Second).Round(time.Second))
+				if isTTY() {
+					// Build progress bars
+					fmt.Print("\033[H\033[2J") // Clear screen, home cursor
+					fmt.Printf("\033[1mHopper Loading Dashboard\033[0m (%s)\n", time.Since(start).Round(time.Second))
+					fmt.Println(strings.Repeat("─", 60))
+
+					drawBar("Hashing  ", hashDone, walked, "", "\033[34m")   // Blue
+					drawBar("Insertion", inserted+skipped, hashedN, "", "\033[32m") // Green
+
+					var analyzeInfo string
+					if recentRate > 0 {
+						// Overall ETA based on everything walked
+						targetTotal := walked
+						if maxAnalyzed > 0 && int64(maxAnalyzed) < targetTotal {
+							targetTotal = int64(maxAnalyzed)
+						}
+						remaining := targetTotal - analyzed
+						if remaining > 0 {
+							etaSec := float64(remaining) / recentRate
+							eta := (time.Duration(etaSec) * time.Second).Round(time.Second)
+							analyzeInfo = fmt.Sprintf("%.1f/s ETA %s", recentRate, eta)
+						}
 					}
+					// Show analysis bar out of what's already inserted, but info shows overall ETA
+					drawBar("Analysis ", analyzed, analyzeTarget, analyzeInfo, "\033[33m") // Yellow
+
+					fmt.Println(strings.Repeat("─", 60))
+					if last, ok := progress.lastErr.Load().(string); ok && last != "" {
+						fmt.Printf("\033[31mRecent Error:\033[0m %s\n", last)
+						fmt.Println(strings.Repeat("─", 60))
+					}
+
+					if litmus != nil {
+						busy, idle, oldestMs, oldestFile := litmus.workerSummary()
+						fmt.Printf("Litmus: %d busy, %d idle | oldest: %s (%s)\n", 
+							busy, idle, oldestFile, (time.Duration(oldestMs)*time.Millisecond).Round(time.Second))
+
+						health := litmus.pollHealth(ctx)
+						if health != nil {
+							fmt.Printf("Health: %.2f load, %d MB RSS, %d active tasks\n", 
+								health.Load, health.RSSMB, health.ActiveTasks)
+						}
+					}
+					fmt.Printf("Errors: %d | Walked: %d | Cache Hits: %d\n", 
+						progress.errors.Load(), walked, progress.cacheHits.Load())
+				} else {
+					// Fallback to slog for non-TTY
+					attrs := []any{
+						"dirs", len(dirs),
+						"walked", walked, "hashed", hashedN,
+						"inserted", inserted, "skipped", skipped,
+						"analyzed", analyzed, "errors", progress.errors.Load(),
+					}
+					if walked > 0 {
+						attrs = append(attrs, "hash_pct", fmt.Sprintf("%.0f%%", float64(hashDone)/float64(walked)*100))
+					}
+					if analyzeTarget > 0 {
+						attrs = append(attrs, "analyze_pct", fmt.Sprintf("%.0f%%", float64(analyzed)/float64(analyzeTarget)*100))
+					}
+					slog.Info("load progress", attrs...)
 				}
-				slog.Info("load progress", attrs...)
 			case <-done:
 				return
 			}
@@ -566,7 +603,7 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 					return
 				}
 
-				sample, err := hashFile(lp.path, lp.label, source, cache)
+				sample, err := hashFile(lp.path, lp.label, source, cache, &progress)
 				if err != nil {
 					switch {
 					case errors.Is(err, errTooSmall):
@@ -576,6 +613,7 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 					default:
 						progress.errors.Add(1)
 						progress.hashErrors.Add(1)
+						progress.lastErr.Store(fmt.Sprintf("hash: %s: %v", filepath.Base(lp.path), err))
 						slog.Warn("hash failed", "path", lp.path, "error", err)
 					}
 					continue
@@ -605,8 +643,9 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 		})
 	}
 
-	// Pending analysis: unbounded buffer so the inserter never blocks on slow analysis.
-	pendingAnalysis := make(chan loadJob, 4096)
+	// Pending analysis: large buffer so hashing can proceed even if analysis is slow.
+	pendingAnalysis := make(chan loadJob, 2_000_000)
+
 
 	// Batch inserter: collects hashed files and flushes in batches.
 	var insertWG sync.WaitGroup
@@ -684,11 +723,13 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 					}
 					select {
 					case pendingAnalysis <- loadJob{path: path, sha: sha}:
+						progress.queued.Add(1)
 					case <-ctx.Done():
 						slog.Debug("inserter flush cancelled", "dirs", len(dirs), "pending_queue_len", len(pendingAnalysis))
 						return
 					}
 				}
+
 			}
 			batch = batch[:0]
 		}
@@ -791,6 +832,7 @@ func startAnalysisWorkers(ctx context.Context, cancel context.CancelFunc, db *ho
 
 				if err != nil {
 					progress.errors.Add(1)
+					progress.lastErr.Store(fmt.Sprintf("analyze: %s: %v", filepath.Base(job.path), err))
 					slog.Warn("analysis failed", "path", job.path, "error", err)
 					continue
 				}
@@ -929,7 +971,7 @@ func walkAndShuffle(ctx context.Context, dirs []struct{ dir, label string }, pat
 	}
 }
 
-func hashFile(path, label, source string, cache *hashCache) (*hopper.Sample, error) {
+func hashFile(path, label, source string, cache *hashCache, progress *loadProgress) (*hopper.Sample, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -953,6 +995,7 @@ func hashFile(path, label, source string, cache *hashCache) (*hopper.Sample, err
 	// Check hash cache before reading file contents.
 	if cache != nil {
 		if cached, ok := cache.lookup(dev, inode, info.Size(), info.ModTime()); ok {
+			progress.cacheHits.Add(1)
 			return &hopper.Sample{
 				SHA256:      cached,
 				Source:      source,
@@ -1049,4 +1092,26 @@ func cmdStats(ctx context.Context) error {
 	}
 	fmt.Printf("%-10s %d\n", "total", total)
 	return nil
+}
+
+func isTTY() bool {
+	fileInfo, _ := os.Stdout.Stat()
+	return (fileInfo.Mode() & os.ModeCharDevice) != 0
+}
+
+func drawBar(label string, current, total int64, info string, color string) {
+	const width = 20
+	var pct float64
+	if total > 0 {
+		pct = float64(current) / float64(total)
+	}
+	if pct > 1.0 {
+		pct = 1.0
+	}
+	filled := int(float64(width) * pct)
+	if filled < 0 {
+		filled = 0
+	}
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+	fmt.Printf("%s%s\033[0m [%s] %3.0f%% (%d/%d) %s\n", color, label, bar, pct*100, current, total, info)
 }

@@ -291,6 +291,12 @@ func (db *DB) countByStatusPG(ctx context.Context) (map[string]int, error) {
 	return scanPGCounts(rows)
 }
 
+func (db *DB) countAnalyzedPG(ctx context.Context) (int64, error) {
+	var n int64
+	err := db.pool.QueryRow(ctx, "SELECT count(*) FROM samples WHERE litmus_result IS NOT NULL").Scan(&n)
+	return n, err
+}
+
 func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result []byte, canonical string, fi cleaveFileInfo) error {
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET status = $2, cleave_result = $3,

@@ -401,6 +401,12 @@ func (db *DB) countByStatusSQLite(ctx context.Context) (map[string]int, error) {
 	return scanLiteCounts(rows)
 }
 
+func (db *DB) countAnalyzedSQLite(ctx context.Context) (int64, error) {
+	var n int64
+	err := db.lite.QueryRowContext(ctx, "SELECT count(*) FROM samples WHERE litmus_result IS NOT NULL").Scan(&n)
+	return n, err
+}
+
 func (db *DB) updateSampleSQLite(ctx context.Context, sha256, status string, result []byte, canonical string, fi cleaveFileInfo) error {
 	n := now()
 	_, err := db.lite.ExecContext(ctx, `
