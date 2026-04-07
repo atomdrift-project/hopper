@@ -121,6 +121,7 @@ type Sample struct {
 	Mtime           *time.Time
 	CleaveResult    []byte // raw cleave JSON, nil if unanalyzed
 	LitmusResult    []byte // litmus classification envelope JSON, nil if unclassified
+	LitmusScore     float64 // litmus confidence score (0.0-1.0)
 	ID              int64
 	SizeBytes       int64
 	Score           int    // cleave raw score
@@ -296,7 +297,8 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 	if len(members) == 0 {
 		return 0, nil
 	}
-	return db.InsertSampleBatch(ctx, members)
+	n, _, err := db.InsertSampleBatch(ctx, members)
+	return n, err
 }
 
 // SetSkip sets the training-exclusion reason on a sample.
@@ -365,9 +367,11 @@ func (db *DB) InsertSampleNew(ctx context.Context, s *Sample) (bool, error) {
 // Returns the number of new rows inserted (duplicates are silently skipped).
 // Much faster than calling InsertSampleNew in a loop, especially for SQLite
 // where each individual INSERT acquires the single-writer lock.
-func (db *DB) InsertSampleBatch(ctx context.Context, samples []*Sample) (int64, error) {
+// InsertSampleBatch inserts a batch of samples.
+// Returns the number of newly inserted samples and a list of SHAs that lack analysis results.
+func (db *DB) InsertSampleBatch(ctx context.Context, samples []*Sample) (int64, []string, error) {
 	if len(samples) == 0 {
-		return 0, nil
+		return 0, nil, nil
 	}
 	if db.pool != nil {
 		return db.insertSampleBatchPG(ctx, samples)
@@ -401,10 +405,18 @@ func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []by
 // UpdateLitmusResult stores the litmus classification envelope for a sample.
 // The result should be the litmus response JSON without the embedded cleave field.
 func (db *DB) UpdateLitmusResult(ctx context.Context, sha256 string, result []byte) error {
-	if db.pool != nil {
-		return db.updateLitmusResultPG(ctx, sha256, result)
+	var prob float64
+	var envelope struct {
+		Prob float64 `json:"prob"`
 	}
-	return db.updateLitmusResultSQLite(ctx, sha256, result)
+	if json.Unmarshal(result, &envelope) == nil {
+		prob = envelope.Prob
+	}
+
+	if db.pool != nil {
+		return db.updateLitmusResultPG(ctx, sha256, result, prob)
+	}
+	return db.updateLitmusResultSQLite(ctx, sha256, result, prob)
 }
 
 // Reclassify changes a sample's label.

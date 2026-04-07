@@ -44,9 +44,16 @@ func main() {
 		fmt.Fprint(os.Stderr, usageText)
 		os.Exit(1)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 
-	err := run(ctx)
+	cleanup, err := setupLogging()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to setup logging: %v\n", err)
+	} else {
+		defer cleanup()
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	err = run(ctx)
 	stop()
 	if err != nil {
 		slog.Error(err.Error())
@@ -72,6 +79,72 @@ func run(ctx context.Context) error {
 		fmt.Fprint(os.Stderr, usageText)
 		return errors.New("unknown command: " + os.Args[1])
 	}
+}
+
+func xdgLogDir() string {
+	switch runtime.GOOS {
+	case "darwin":
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, "Library", "Logs", "hopper")
+		}
+	case "windows":
+		if appdata := os.Getenv("LOCALAPPDATA"); appdata != "" {
+			return filepath.Join(appdata, "hopper", "Logs")
+		}
+	}
+	// Default to XDG_STATE_HOME on Linux/Unix.
+	if s := os.Getenv("XDG_STATE_HOME"); s != "" {
+		return filepath.Join(s, "hopper")
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".local", "state", "hopper")
+	}
+	return ".hopper" // Fallback
+}
+
+func setupLogging() (func(), error) {
+	dir := xdgLogDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+
+	logPath := filepath.Join(dir, "hopper.log")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+
+	// Use a handler that writes to both stderr and the log file.
+	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
+	h := &multiHandler{
+		h1: slog.NewTextHandler(os.Stderr, opts),
+		h2: slog.NewJSONHandler(f, opts),
+	}
+	slog.SetDefault(slog.New(h))
+
+	return func() { f.Close() }, nil
+}
+
+type multiHandler struct {
+	h1, h2 slog.Handler
+}
+
+func (m *multiHandler) Enabled(ctx context.Context, l slog.Level) bool {
+	return m.h1.Enabled(ctx, l) || m.h2.Enabled(ctx, l)
+}
+func (m *multiHandler) Handle(ctx context.Context, r slog.Record) error {
+	err1 := m.h1.Handle(ctx, r)
+	err2 := m.h2.Handle(ctx, r)
+	if err1 != nil {
+		return err1
+	}
+	return err2
+}
+func (m *multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &multiHandler{h1: m.h1.WithAttrs(attrs), h2: m.h2.WithAttrs(attrs)}
+}
+func (m *multiHandler) WithGroup(name string) slog.Handler {
+	return &multiHandler{h1: m.h1.WithGroup(name), h2: m.h2.WithGroup(name)}
 }
 
 // redactDSN strips the password from a DSN for safe logging.
@@ -254,6 +327,7 @@ func cmdLoad(ctx context.Context) error {
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
 	experimentTag := f.String("experiment-tag", "", "label for experiment comparison")
+	litmusVerbose := f.Bool("litmus-verbose", false, "enable debug logging in litmus server")
 	f.Parse(os.Args[2:]) //nolint:errcheck,gosec // ExitOnError handles parse errors
 
 	if *dataDir == "" {
@@ -326,6 +400,7 @@ func cmdLoad(ctx context.Context) error {
 			MaxRSSGB:    *maxRSSGB,
 			MaxWorkers:  *litmusWorkers,
 			TimeoutSecs: *analysisTimeout,
+			Verbose:     *litmusVerbose,
 		})
 		if err := litmus.Start(ctx); err != nil {
 			return err
@@ -553,7 +628,7 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 			for _, h := range batch {
 				if prev, ok := seen[h.sample.SHA256]; ok {
 					intraDups++
-					slog.Info("intra-batch duplicate SHA256",
+					slog.Debug("intra-batch duplicate SHA256",
 						"sha256", h.sample.SHA256,
 						"path", h.path,
 						"duplicate_of", prev)
@@ -562,7 +637,7 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 				}
 			}
 
-			n, err := db.InsertSampleBatch(ctx, samples)
+			n, needsAnalysis, err := db.InsertSampleBatch(ctx, samples)
 			if err != nil {
 				if ctx.Err() != nil {
 					slog.Debug("batch insert skipped (shutting down)", "batch_size", len(batch))
@@ -578,7 +653,7 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 			progress.skipped.Add(skipped)
 
 			crossBatchDups := skipped - int64(intraDups)
-			slog.Info("batch flush",
+			slog.Debug("batch flush",
 				"batch_size", len(batch),
 				"inserted", n,
 				"skipped", skipped,
@@ -587,16 +662,32 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 				"unique_hashes", len(seen))
 
 			// Send to analysis feeder without blocking the inserter.
-			hasNew := n > 0
-			for _, h := range batch {
-				if analyzeQueue == nil || (!hasNew && !rescan) {
-					continue
+			if analyzeQueue != nil {
+				// Map SHA to path for the jobs.
+				shaToPath := make(map[string]string, len(batch))
+				for _, h := range batch {
+					shaToPath[h.sample.SHA256] = h.path
 				}
-				select {
-				case pendingAnalysis <- loadJob{path: h.path, sha: h.sample.SHA256}:
-				case <-ctx.Done():
-					slog.Debug("inserter flush cancelled", "dirs", len(dirs), "pending_queue_len", len(pendingAnalysis))
-					return
+
+				toAnalyze := needsAnalysis
+				if rescan {
+					toAnalyze = make([]string, 0, len(batch))
+					for _, h := range batch {
+						toAnalyze = append(toAnalyze, h.sample.SHA256)
+					}
+				}
+
+				for _, sha := range toAnalyze {
+					path, ok := shaToPath[sha]
+					if !ok {
+						continue // should not happen
+					}
+					select {
+					case pendingAnalysis <- loadJob{path: path, sha: sha}:
+					case <-ctx.Done():
+						slog.Debug("inserter flush cancelled", "dirs", len(dirs), "pending_queue_len", len(pendingAnalysis))
+						return
+					}
 				}
 			}
 			batch = batch[:0]
@@ -808,8 +899,8 @@ func walkAndShuffle(ctx context.Context, dirs []struct{ dir, label string }, pat
 			if err != nil {
 				return err
 			}
-			if entry.IsDir() {
-				if entry.Name() == ".git" {
+			if !entry.Type().IsRegular() {
+				if entry.IsDir() && entry.Name() == ".git" {
 					return fs.SkipDir
 				}
 				return nil

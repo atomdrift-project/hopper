@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/codeGROOVE-dev/retry"
@@ -32,6 +33,8 @@ type litmusServer struct {
 	maxRSSGB    int
 	maxWorkers  int
 	timeoutSecs int
+	verbose     bool
+	stopped     atomic.Bool
 
 	// inFlight tracks what each hopper analysis worker is currently doing.
 	inFlight sync.Map // worker ID (int) → *workerState
@@ -49,8 +52,8 @@ type litmusConfig struct {
 	MaxRSSGB    int      // memory limit in GB (0 = let litmus decide)
 	MaxWorkers  int      // max concurrent analysis requests to send
 	TimeoutSecs int      // per-request analysis timeout (0 = litmus default: 600s)
+	Verbose     bool     // enable debug logging in litmus
 }
-
 func newLitmusServer(cfg litmusConfig) *litmusServer {
 	if cfg.Bin == "" {
 		cfg.Bin = "litmus"
@@ -64,6 +67,7 @@ func newLitmusServer(cfg litmusConfig) *litmusServer {
 		maxRSSGB:    cfg.MaxRSSGB,
 		maxWorkers:  cfg.MaxWorkers,
 		timeoutSecs: cfg.TimeoutSecs,
+		verbose:     cfg.Verbose,
 		client: &http.Client{
 			// Slightly longer than litmus's analysis timeout so litmus always
 			// has a chance to return 504 before the client gives up.
@@ -78,16 +82,29 @@ func (s *litmusServer) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.cmd != nil {
+		return errors.New("litmus server already started")
+	}
+
 	updateLitmus(ctx)
 
-	port, err := freePort(ctx)
-	if err != nil {
-		return fmt.Errorf("find free port: %w", err)
-	}
-	s.port = port
-	s.url = "http://127.0.0.1:" + port
+	var lastErr error
+	for range 3 {
+		port, l, err := freePort(ctx)
+		if err != nil {
+			return fmt.Errorf("find free port: %w", err)
+		}
+		s.port = port
+		s.url = "http://127.0.0.1:" + port
 
-	return s.startLocked(ctx)
+		if err := s.startLocked(ctx, l); err != nil {
+			lastErr = err
+			slog.Warn("failed to start litmus, retrying with new port", "port", port, "error", err)
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("litmus failed to start after 3 attempts: %w", lastErr)
 }
 
 // updateLitmus attempts to build and install the latest litmus from ../litmus.
@@ -118,7 +135,10 @@ func updateLitmus(ctx context.Context) {
 	slog.Info("litmus updated successfully")
 }
 
-func (s *litmusServer) startLocked(ctx context.Context) error {
+func (s *litmusServer) startLocked(ctx context.Context, l net.Listener) error {
+	if l != nil {
+		l.Close()
+	}
 	bind := "127.0.0.1:" + s.port
 
 	args := []string{"serve", "--bind", bind}
@@ -131,13 +151,20 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 	if s.timeoutSecs > 0 {
 		args = append(args, "--timeout-secs", strconv.Itoa(s.timeoutSecs))
 	}
+	if s.verbose {
+		args = append(args, "--verbose")
+	}
 
 	cmd := exec.CommandContext(ctx, s.bin, args...) //nolint:gosec // bin path is from trusted CLI flag
 
-	logFile, err := os.CreateTemp("", "litmus-*.log")
+	logDir := xdgLogDir()
+	_ = os.MkdirAll(logDir, 0o755) // best-effort
+
+	logFile, err := os.CreateTemp(logDir, "litmus-*.log")
 	if err != nil {
 		return fmt.Errorf("create litmus log file: %w", err)
 	}
+
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
@@ -151,6 +178,8 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 
 	if err := s.waitHealthy(ctx); err != nil {
 		cmd.Process.Kill() //nolint:errcheck,gosec // best-effort kill
+		cmd.Wait()         // cleanup zombie
+		s.cmd = nil
 		return fmt.Errorf("litmus not healthy: %w", err)
 	}
 
@@ -160,23 +189,25 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 
 // Stop kills the litmus server.
 func (s *litmusServer) Stop() {
+	s.stopped.Store(true)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.cmd != nil && s.cmd.Process != nil {
 		s.cmd.Process.Kill() //nolint:errcheck,gosec // best-effort kill
 		s.cmd.Wait()         //nolint:errcheck,gosec // collecting zombie
+		s.cmd = nil
 		slog.Info("litmus server stopped")
 	}
 }
 
 // Monitor watches the litmus process and restarts it on crash.
-// Blocks until ctx is cancelled or restart limit (10) is exceeded.
+// Blocks until ctx is cancelled, Stop is called, or restart limit (10) is exceeded.
 func (s *litmusServer) Monitor(ctx context.Context) error {
 	const maxRestarts = 10
 	restarts := 0
 	for {
 		err := s.waitExit(ctx)
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || s.stopped.Load() {
 			return ctx.Err()
 		}
 		restarts++
@@ -193,8 +224,12 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 			return ctx.Err()
 		}
 
+		if s.stopped.Load() {
+			return nil
+		}
+
 		s.mu.Lock()
-		err = s.startLocked(ctx)
+		err = s.startLocked(ctx, nil)
 		s.mu.Unlock()
 		if err != nil {
 			slog.Error("failed to restart litmus", "error", err)
@@ -203,6 +238,7 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 		slog.Info("litmus server restarted", "restarts", restarts)
 	}
 }
+
 
 func (s *litmusServer) waitExit(ctx context.Context) error {
 	if s.cmd == nil {
@@ -287,6 +323,7 @@ func (s *litmusServer) WatchHealth(ctx context.Context) {
 	// Kill if any request exceeds 2x the timeout — it's clearly stuck.
 	killThreshold := 2 * stuckThreshold
 
+	healthFailures := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -294,10 +331,25 @@ func (s *litmusServer) WatchHealth(ctx context.Context) {
 		case <-ticker.C:
 		}
 
+		if s.stopped.Load() {
+			return
+		}
+
 		health := s.pollHealth(ctx)
 		if health == nil {
+			healthFailures++
+			if healthFailures >= 3 {
+				slog.Error("litmus health check failed repeatedly, killing to force restart", "failures", healthFailures)
+				s.mu.Lock()
+				if s.cmd != nil && s.cmd.Process != nil {
+					s.cmd.Process.Kill() //nolint:errcheck,gosec // Monitor will restart
+				}
+				s.mu.Unlock()
+				healthFailures = 0
+			}
 			continue
 		}
+		healthFailures = 0
 
 		busy, idle, workerOldestMs, workerOldestFile := s.workerSummary()
 
@@ -423,7 +475,7 @@ func (s *litmusServer) Analyze(ctx context.Context, sha256, path string) (*analy
 		retry.DelayType(retry.CombineDelay(retry.BackOffDelay, retry.RandomDelay)),
 		retry.MaxJitter(3*time.Second),
 		retry.RetryIf(func(err error) bool {
-			return errors.Is(err, errRetryable)
+			return errors.Is(err, errRetryable) || isRetryableNetError(err)
 		}),
 		retry.OnRetry(func(attempt uint, _ error) {
 			slog.Debug("litmus at capacity, retrying", "path", path, "attempt", attempt+1)
@@ -510,17 +562,34 @@ func extractCanonicalSHA(sha256 string, raw json.RawMessage) string {
 // Workers returns the max concurrent analysis workers.
 func (s *litmusServer) Workers() int { return s.maxWorkers }
 
-func freePort(ctx context.Context) (string, error) {
+func freePort(ctx context.Context) (string, net.Listener, error) {
 	var lc net.ListenConfig
 	l, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	addr, ok := l.Addr().(*net.TCPAddr)
 	if !ok {
 		l.Close() //nolint:errcheck,gosec // cleanup
-		return "", errors.New("unexpected listener address type")
+		return "", nil, errors.New("unexpected listener address type")
 	}
-	l.Close() //nolint:errcheck,gosec // we just need the port number
-	return strconv.Itoa(addr.Port), nil
+	return strconv.Itoa(addr.Port), l, nil
 }
+func isRetryableNetError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	// Common connection-level errors (refused, reset, broken pipe).
+	s := err.Error()
+	return strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "broken pipe")
+}
+

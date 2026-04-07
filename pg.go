@@ -36,6 +36,7 @@ func (db *DB) migratePG(ctx context.Context) error {
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS elements TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS score INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS litmus_result JSONB`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS litmus_score DOUBLE PRECISION NOT NULL DEFAULT 0`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent) WHERE parent != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_formula ON samples(formula) WHERE formula != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_elements ON samples(elements) WHERE elements != ''`,
@@ -56,13 +57,15 @@ func (db *DB) migratePG(ctx context.Context) error {
 }
 
 const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, cleave_result, litmus_result,
-	path, status, note, canonical_sha256, parent, skip, formula, elements, score, created_at, updated_at, analyzed_at, mtime`
+	size_bytes, label, label_source, cleave_result, litmus_result, litmus_score,
+	path, status, note, canonical_sha256, parent, skip, formula, elements, score,
+	created_at, updated_at, analyzed_at, mtime`
+
 
 func pgSampleDest(s *Sample) []any {
 	return []any{
 		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
-		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &s.CleaveResult, &s.LitmusResult,
+		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &s.CleaveResult, &s.LitmusResult, &s.LitmusScore,
 		&s.Path, &s.Status, &s.Note, &s.CanonicalSHA256,
 		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.Mtime,
 	}
@@ -127,7 +130,7 @@ SELECT sha256, source, feed, ecosystem, filename, file_type,
 FROM _staging
 ON CONFLICT (sha256) DO NOTHING`
 
-func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (int64, error) {
+func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (int64, []string, error) {
 	rows := make([][]any, len(samples))
 	for i, s := range samples {
 		rows[i] = []any{
@@ -139,26 +142,48 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (int64
 
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("hopper: begin batch: %w", err)
+		return 0, nil, fmt.Errorf("hopper: begin batch: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
 
 	if _, err := tx.Exec(ctx, insertBatchStagingDDL); err != nil {
-		return 0, fmt.Errorf("hopper: create staging: %w", err)
+		return 0, nil, fmt.Errorf("hopper: create staging: %w", err)
 	}
 	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"_staging"}, insertBatchStagingCols, pgx.CopyFromRows(rows)); err != nil {
-		return 0, fmt.Errorf("hopper: copy to staging: %w", err)
+		return 0, nil, fmt.Errorf("hopper: copy to staging: %w", err)
 	}
+
 	tag, err := tx.Exec(ctx, insertBatchStagingInsert)
 	if err != nil {
-		return 0, fmt.Errorf("hopper: insert from staging: %w", err)
+		return 0, nil, fmt.Errorf("hopper: insert from staging: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("hopper: commit batch: %w", err)
-	}
-	return tag.RowsAffected(), nil
-}
+	inserted := tag.RowsAffected()
 
+	// Find SHAs that lack analysis results (including ones we just skipped).
+	query := `SELECT s.sha256 FROM samples s
+		JOIN _staging st ON s.sha256 = st.sha256
+		WHERE s.litmus_result IS NULL`
+	queryRows, err := tx.Query(ctx, query)
+	if err != nil {
+		return 0, nil, fmt.Errorf("hopper: query needs analysis: %w", err)
+	}
+	defer queryRows.Close()
+
+	var needsAnalysis []string
+	for queryRows.Next() {
+		var sha string
+		if err := queryRows.Scan(&sha); err != nil {
+			return 0, nil, fmt.Errorf("hopper: scan needs analysis: %w", err)
+		}
+		needsAnalysis = append(needsAnalysis, sha)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, nil, fmt.Errorf("hopper: commit batch: %w", err)
+	}
+
+	return inserted, needsAnalysis, nil
+}
 func (db *DB) sampleBySHA256PG(ctx context.Context, sha256 string) (*Sample, error) {
 	s, err := scanPGSample(db.pool.QueryRow(ctx,
 		`SELECT `+pgSampleCols+` FROM samples WHERE sha256 = $1`, sha256))
@@ -180,10 +205,10 @@ func (db *DB) updateCleaveResultPG(ctx context.Context, sha256 string, result []
 	return nil
 }
 
-func (db *DB) updateLitmusResultPG(ctx context.Context, sha256 string, result []byte) error {
+func (db *DB) updateLitmusResultPG(ctx context.Context, sha256 string, result []byte, score float64) error {
 	_, err := db.pool.Exec(ctx, `
-		UPDATE samples SET litmus_result = $2, updated_at = now()
-		WHERE sha256 = $1`, sha256, sanitizeJSONB(result))
+		UPDATE samples SET litmus_result = $2, litmus_score = $3, updated_at = now()
+		WHERE sha256 = $1`, sha256, sanitizeJSONB(result), score)
 	if err != nil {
 		return fmt.Errorf("hopper: update litmus result: %w", err)
 	}

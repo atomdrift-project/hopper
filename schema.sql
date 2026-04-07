@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS samples (
 	label_source  TEXT NOT NULL DEFAULT '',
 	cleave_result JSONB,
 	litmus_result JSONB,
+	litmus_score  DOUBLE PRECISION NOT NULL DEFAULT 0,
 	path  TEXT NOT NULL DEFAULT '',
 	status        TEXT NOT NULL DEFAULT '',
 	note          TEXT NOT NULL DEFAULT '',

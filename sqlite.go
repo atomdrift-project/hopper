@@ -87,6 +87,18 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		}
 	}
 
+	// Add litmus_score column.
+	var hasLitmusScore int
+	//nolint:errcheck,gosec // best-effort column check
+	db.lite.QueryRowContext(ctx,
+		"SELECT count(*) FROM pragma_table_info('samples') WHERE name = 'litmus_score'",
+	).Scan(&hasLitmusScore)
+	if hasLitmusScore == 0 {
+		if _, err := db.lite.ExecContext(ctx, `ALTER TABLE samples ADD COLUMN litmus_score REAL NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite: %w", err)
+		}
+	}
+
 	// Add mtime column.
 	var hasMtime int
 	//nolint:errcheck,gosec // best-effort column check
@@ -110,7 +122,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 }
 
 const liteSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, cleave_result, litmus_result,
+	size_bytes, label, label_source, cleave_result, litmus_result, litmus_score,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, created_at, updated_at, analyzed_at, mtime`
 
 func scanLiteSample(row *sql.Row) (*Sample, error) {
@@ -118,9 +130,9 @@ func scanLiteSample(row *sql.Row) (*Sample, error) {
 	var cleaveResult, litmusResult, status sql.NullString
 	var analyzedAt, mtime sql.NullTime
 	err := row.Scan(&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
-		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult,
-		&s.Path, &status, &s.Note, &s.CanonicalSHA256,
-		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime)
+		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &s.LitmusScore,
+		&s.Path, &status, &s.Note, &s.CanonicalSHA256, &s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime)
+
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -151,7 +163,7 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 		var cleaveResult, litmusResult, status sql.NullString
 		var analyzedAt, mtime sql.NullTime
 		if err := rows.Scan(&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
-			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult,
+			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &s.LitmusScore,
 			&s.Path, &status, &s.Note, &s.CanonicalSHA256,
 			&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime); err != nil {
 			return nil, err
@@ -194,20 +206,33 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 	return n > 0, nil
 }
 
-func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (int64, error) {
+func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (int64, []string, error) {
 	tx, err := db.lite.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("hopper: begin batch: %w", err)
+		return 0, nil, fmt.Errorf("hopper: begin batch: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
+
+	cols := []string{
+		"sha256", "source", "feed", "ecosystem", "filename", "file_type",
+		"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
+		"parent", "skip", "formula", "elements", "score", "mtime",
+	}
+	placeholders := make([]string, len(cols))
+	for i := range cols {
+		placeholders[i] = "?"
 	}
 
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, mtime)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT (sha256) DO NOTHING`)
+	query := fmt.Sprintf(`
+		INSERT INTO samples (%s)
+		VALUES (%s)
+		ON CONFLICT (sha256) DO NOTHING`,
+		strings.Join(cols, ", "),
+		strings.Join(placeholders, ", "))
+
+	stmt, err := tx.PrepareContext(ctx, query)
 	if err != nil {
-		tx.Rollback() //nolint:errcheck,gosec // best-effort rollback on prepare error
-		return 0, fmt.Errorf("hopper: prepare batch: %w", err)
+		return 0, nil, fmt.Errorf("hopper: prepare batch: %w", err)
 	}
 	defer stmt.Close() //nolint:errcheck // best-effort cleanup
 
@@ -217,18 +242,55 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.Mtime)
 		if err != nil {
-			tx.Rollback() //nolint:errcheck,gosec // best-effort rollback on insert error
-			return inserted, fmt.Errorf("hopper: batch insert %s: %w", s.SHA256, err)
+			return 0, nil, fmt.Errorf("hopper: batch insert %s: %w", s.SHA256, err)
 		}
 		if n, err := res.RowsAffected(); err == nil {
 			inserted += n
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		return inserted, fmt.Errorf("hopper: commit batch: %w", err)
+	// Find SHAs that lack analysis results.
+	if _, err := tx.ExecContext(ctx, "CREATE TEMP TABLE IF NOT EXISTS _batch_shas (sha256 TEXT)"); err != nil {
+		return 0, nil, fmt.Errorf("hopper: create batch staging: %w", err)
 	}
-	return inserted, nil
+	if _, err := tx.ExecContext(ctx, "DELETE FROM _batch_shas"); err != nil {
+		return 0, nil, fmt.Errorf("hopper: clear batch staging: %w", err)
+	}
+
+	stagingStmt, err := tx.PrepareContext(ctx, "INSERT INTO _batch_shas (sha256) VALUES (?)")
+	if err != nil {
+		return 0, nil, fmt.Errorf("hopper: prepare batch staging: %w", err)
+	}
+	defer stagingStmt.Close()
+
+	for _, s := range samples {
+		if _, err := stagingStmt.ExecContext(ctx, s.SHA256); err != nil {
+			return 0, nil, fmt.Errorf("hopper: staging exec: %w", err)
+		}
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT s.sha256 FROM samples s
+		JOIN _batch_shas b ON s.sha256 = b.sha256
+		WHERE s.litmus_result IS NULL`)
+	if err != nil {
+		return 0, nil, fmt.Errorf("hopper: query needs analysis: %w", err)
+	}
+	defer rows.Close()
+
+	var needsAnalysis []string
+	for rows.Next() {
+		var sha string
+		if err := rows.Scan(&sha); err != nil {
+			return 0, nil, fmt.Errorf("hopper: scan needs analysis: %w", err)
+		}
+		needsAnalysis = append(needsAnalysis, sha)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, nil, fmt.Errorf("hopper: commit batch: %w", err)
+	}
+	return inserted, needsAnalysis, nil
 }
 
 func (db *DB) sampleBySHA256SQLite(ctx context.Context, sha256 string) (*Sample, error) {
@@ -253,10 +315,10 @@ func (db *DB) updateCleaveResultSQLite(ctx context.Context, sha256 string, resul
 	return nil
 }
 
-func (db *DB) updateLitmusResultSQLite(ctx context.Context, sha256 string, result []byte) error {
+func (db *DB) updateLitmusResultSQLite(ctx context.Context, sha256 string, result []byte, score float64) error {
 	_, err := db.lite.ExecContext(ctx, `
-		UPDATE samples SET litmus_result = ?, updated_at = ?
-		WHERE sha256 = ?`, string(result), now(), sha256)
+		UPDATE samples SET litmus_result = ?, litmus_score = ?, updated_at = ?
+		WHERE sha256 = ?`, string(result), score, now(), sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update litmus result: %w", err)
 	}

@@ -400,7 +400,10 @@ func TestCmdLoadIntegration(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "sample1.bin"), []byte("malicious content!"), 0o644)
 	os.WriteFile(filepath.Join(dir, "sample2.bin"), []byte("another evil file!"), 0o644)
 
-	withArgs([]string{"hopper", "load", "-db", dbPath, "-bad", dir, "-workers", "2", "-litmus", ""}, func() {
+	data := t.TempDir()
+	os.Mkdir(filepath.Join(data, "bad"), 0o755)
+	os.Rename(dir, filepath.Join(data, "bad", "test"))
+	withArgs([]string{"hopper", "load", "-db", dbPath, "-data", data, "-workers", "2", "-litmus", ""}, func() {
 		if err := cmdLoad(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -449,7 +452,10 @@ func TestCmdLoadGood(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "benign.bin"), []byte("harmless content!"), 0o644)
 
-	withArgs([]string{"hopper", "load", "-db", dbPath, "-good", dir, "-workers", "1", "-litmus", "", "-no-cache"}, func() {
+	data := t.TempDir()
+	os.Mkdir(filepath.Join(data, "good"), 0o755)
+	os.Rename(dir, filepath.Join(data, "good", "test"))
+	withArgs([]string{"hopper", "load", "-db", dbPath, "-data", data, "-workers", "1", "-litmus", "", "-no-cache"}, func() {
 		if err := cmdLoad(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -471,7 +477,14 @@ func TestCmdLoadBothDirs(t *testing.T) {
 	os.WriteFile(filepath.Join(badDir, "evil.bin"), []byte("malicious payload!"), 0o644)
 	os.WriteFile(filepath.Join(goodDir, "safe.bin"), []byte("harmless content!"), 0o644)
 
-	withArgs([]string{"hopper", "load", "-db", dbPath, "-bad", badDir, "-good", goodDir, "-workers", "1", "-litmus", ""}, func() {
+	data := t.TempDir()
+	os.Mkdir(filepath.Join(data, "bad"), 0o755)
+	os.Mkdir(filepath.Join(data, "good"), 0o755)
+	os.Rename(filepath.Join(badDir, "evil.bin"), filepath.Join(data, "bad", "evil.bin"))
+	os.Rename(filepath.Join(goodDir, "safe.bin"), filepath.Join(data, "good", "safe.bin"))
+
+	withArgs([]string{"hopper", "load", "-db", dbPath, "-data", data, "-workers", "1", "-litmus", ""}, func() {
+
 		if err := cmdLoad(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -570,15 +583,15 @@ func TestExtractCanonicalSHA(t *testing.T) {
 	}
 }
 func TestFreePort(t *testing.T) {
-	port, err := freePort(context.Background())
+	port, l, err := freePort(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer l.Close()
 	if port == "" || port == "0" {
 		t.Errorf("freePort returned %q", port)
 	}
 }
-
 func TestHashFileTooSmall(t *testing.T) {
 	dir := t.TempDir()
 	small := filepath.Join(dir, "tiny.bin")

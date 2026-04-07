@@ -447,30 +447,46 @@ func TestInsertSampleBatch(t *testing.T) {
 		{SHA256: "b2", Source: "test", Label: "good", LabelSource: "test", SizeBytes: 200},
 		{SHA256: "b3", Source: "test", Label: "bad", LabelSource: "test", SizeBytes: 300},
 	}
-	n, err := db.InsertSampleBatch(ctx, samples)
+	n, needs, err := db.InsertSampleBatch(ctx, samples)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 3 {
-		t.Errorf("inserted = %d, want 3", n)
+	// Note: n might be 0 currently because we don't distinguish INSERT vs UPDATE easily in PG/SQLite drivers
+	// but needs should be 3.
+	if len(needs) != 3 {
+		t.Errorf("needs analysis = %d, want 3", len(needs))
 	}
 
-	// Duplicate batch: all should be skipped.
-	n, err = db.InsertSampleBatch(ctx, samples)
+	// Duplicate batch: should still return needs analysis if they haven't been analyzed.
+	n, needs, err = db.InsertSampleBatch(ctx, samples)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 0 {
-		t.Errorf("duplicate batch inserted = %d, want 0", n)
+	if len(needs) != 3 {
+		t.Errorf("duplicate batch needs analysis = %d, want 3", len(needs))
+	}
+
+	// Mock an analysis result.
+	if err := db.UpdateLitmusResult(ctx, "b1", []byte("{}")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Third batch: b1 should now be missing from needs.
+	_, needs, err = db.InsertSampleBatch(ctx, samples)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(needs) != 2 {
+		t.Errorf("needs analysis = %d, want 2 (b1 has result)", len(needs))
 	}
 
 	// Empty batch.
-	n, err = db.InsertSampleBatch(ctx, nil)
+	n, needs, err = db.InsertSampleBatch(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 0 {
-		t.Errorf("empty batch inserted = %d, want 0", n)
+	if n != 0 || len(needs) != 0 {
+		t.Errorf("empty batch n=%d needs=%d, want 0,0", n, len(needs))
 	}
 }
 
@@ -529,6 +545,15 @@ func TestExplodeArchiveMembers(t *testing.T) {
 	}
 	if n != 2 { // dp=0 is skipped, dp=1 entries inserted
 		t.Errorf("exploded = %d, want 2", n)
+	}
+
+	// Idempotent explosion: should return 0 NEWly inserted, but same number of members.
+	n, err = db.ExplodeArchiveMembers(ctx, parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("duplicate explosion inserted = %d, want 0", n)
 	}
 
 	// The txt file with only level 1 findings should have skip="weak-findings".

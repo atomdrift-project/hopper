@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS samples (
 	label_source  TEXT NOT NULL DEFAULT '',
 	cleave_result TEXT,
 	litmus_result TEXT,
+	litmus_score  REAL NOT NULL DEFAULT 0,
 	path  TEXT NOT NULL DEFAULT '',
 	status        TEXT NOT NULL DEFAULT '',
 	note          TEXT NOT NULL DEFAULT '',
@@ -20,8 +21,9 @@ CREATE TABLE IF NOT EXISTS samples (
 	formula       TEXT NOT NULL DEFAULT '',
 	elements      TEXT NOT NULL DEFAULT '',
 	score         INTEGER NOT NULL DEFAULT 0,
-	created_at    DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-	updated_at    DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+	created_at    DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+	updated_at    DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+
 	analyzed_at   DATETIME
 );
 
