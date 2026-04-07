@@ -307,6 +307,7 @@ func (db *DB) updateCleaveResultSQLite(ctx context.Context, sha256 string, resul
 	_, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET cleave_result = ?,
 			canonical_sha256 = ?, formula = ?, elements = ?, score = ?,
+			litmus_result = NULL, litmus_score = 0,
 			analyzed_at = ?, updated_at = ?
 		WHERE sha256 = ?`, string(result), canonical, fi.Formula, fi.Elements, fi.Score, n, n, sha256)
 	if err != nil {
@@ -392,6 +393,30 @@ func (db *DB) samplesByStatusSQLite(ctx context.Context, status string, limit in
 	return scanLiteSamples(rows)
 }
 
+func (db *DB) falsePositivesSQLite(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleCols+` FROM samples
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND score >= ? AND status = ''
+		 ORDER BY score DESC LIMIT ?`,
+		scoreThreshold, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: false positives: %w", err)
+	}
+	return scanLiteSamples(rows)
+}
+
+func (db *DB) falseNegativesSQLite(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleCols+` FROM samples
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND score <= ? AND status = ''
+		 ORDER BY score ASC LIMIT ?`,
+		scoreThreshold, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: false negatives: %w", err)
+	}
+	return scanLiteSamples(rows)
+}
+
 func (db *DB) countByStatusSQLite(ctx context.Context) (map[string]int, error) {
 	rows, err := db.lite.QueryContext(ctx, `SELECT status, count(*) FROM samples WHERE status != '' GROUP BY status`)
 	if err != nil {
@@ -412,6 +437,7 @@ func (db *DB) updateSampleSQLite(ctx context.Context, sha256, status string, res
 	_, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET status = ?, cleave_result = ?,
 			canonical_sha256 = ?, formula = ?, elements = ?, score = ?,
+			litmus_result = NULL, litmus_score = 0,
 			analyzed_at = ?, updated_at = ?
 		WHERE sha256 = ?`, status, string(result), canonical, fi.Formula, fi.Elements, fi.Score, n, n, sha256)
 	if err != nil {

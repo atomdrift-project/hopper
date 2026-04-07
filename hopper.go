@@ -477,6 +477,26 @@ func (db *DB) SamplesByStatus(ctx context.Context, status string, limit int) ([]
 	return db.samplesByStatusSQLite(ctx, status, limit)
 }
 
+// FalsePositives returns analyzed good-labeled samples with score >= threshold
+// (cleave detects them as bad). These are candidates for false-positive resolution.
+// Only returns samples with empty status (not yet claimed by a pipeline).
+func (db *DB) FalsePositives(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.falsePositivesPG(ctx, scoreThreshold, limit)
+	}
+	return db.falsePositivesSQLite(ctx, scoreThreshold, limit)
+}
+
+// FalseNegatives returns analyzed bad-labeled samples with score <= threshold
+// (cleave does not detect them). These are candidates for gap-and-fix.
+// Only returns samples with empty status (not yet claimed by a pipeline).
+func (db *DB) FalseNegatives(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.falseNegativesPG(ctx, scoreThreshold, limit)
+	}
+	return db.falseNegativesSQLite(ctx, scoreThreshold, limit)
+}
+
 // CountByStatus returns sample counts grouped by status.
 func (db *DB) CountByStatus(ctx context.Context) (map[string]int, error) {
 	if db.pool != nil {

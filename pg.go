@@ -197,6 +197,7 @@ func (db *DB) updateCleaveResultPG(ctx context.Context, sha256 string, result []
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET cleave_result = $2,
 			canonical_sha256 = $3, formula = $4, elements = $5, score = $6,
+			litmus_result = NULL, litmus_score = 0,
 			analyzed_at = now(), updated_at = now()
 		WHERE sha256 = $1`, sha256, sanitizeJSONB(result), canonical, fi.Formula, fi.Elements, fi.Score)
 	if err != nil {
@@ -282,6 +283,30 @@ func (db *DB) samplesByStatusPG(ctx context.Context, status string, limit int) (
 	return scanPGSamples(rows)
 }
 
+func (db *DB) falsePositivesPG(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND score >= $1 AND status = ''
+		 ORDER BY score DESC LIMIT $2`,
+		scoreThreshold, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: false positives: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
+func (db *DB) falseNegativesPG(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND score <= $1 AND status = ''
+		 ORDER BY score ASC LIMIT $2`,
+		scoreThreshold, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: false negatives: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
 func (db *DB) countByStatusPG(ctx context.Context) (map[string]int, error) {
 	rows, err := db.pool.Query(ctx, `SELECT status, count(*) FROM samples WHERE status != '' GROUP BY status`)
 	if err != nil {
@@ -301,6 +326,7 @@ func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result 
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET status = $2, cleave_result = $3,
 			canonical_sha256 = $4, formula = $5, elements = $6, score = $7,
+			litmus_result = NULL, litmus_score = 0,
 			analyzed_at = now(), updated_at = now()
 		WHERE sha256 = $1`, sha256, status, sanitizeJSONB(result), canonical, fi.Formula, fi.Elements, fi.Score)
 	if err != nil {
