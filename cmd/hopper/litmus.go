@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/codeGROOVE-dev/retry"
@@ -23,28 +22,33 @@ import (
 
 // litmusServer manages a litmus API server subprocess.
 type litmusServer struct {
-	client     *http.Client
-	cmd        *exec.Cmd
-	bin        string // path to litmus binary
-	url        string // base URL (e.g. http://127.0.0.1:PORT)
-	port       string
-	dirs       []string
-	mu         sync.Mutex
-	maxRSSGB   int
-	maxWorkers int
+	client      *http.Client
+	cmd         *exec.Cmd
+	bin         string // path to litmus binary
+	url         string // base URL (e.g. http://127.0.0.1:PORT)
+	port        string
+	dirs        []string
+	mu          sync.Mutex
+	maxRSSGB    int
+	maxWorkers  int
+	timeoutSecs int
 
-	// consecutive503 tracks how many 503s we've seen in a row across all workers.
-	// When this exceeds the restart threshold, we kill and restart the server
-	// to clear orphaned tasks.
-	consecutive503 atomic.Int64
+	// inFlight tracks what each hopper analysis worker is currently doing.
+	inFlight sync.Map // worker ID (int) → *workerState
+}
+
+type workerState struct {
+	File      string
+	StartedAt time.Time
 }
 
 // litmusConfig holds options for starting a litmus server.
 type litmusConfig struct {
-	Bin        string   // path to litmus binary (default: "litmus")
-	Dirs       []string // directories to allow for /analyze-path
-	MaxRSSGB   int      // memory limit in GB (0 = let litmus decide)
-	MaxWorkers int      // max concurrent analysis requests to send
+	Bin         string   // path to litmus binary (default: "litmus")
+	Dirs        []string // directories to allow for /analyze-path
+	MaxRSSGB    int      // memory limit in GB (0 = let litmus decide)
+	MaxWorkers  int      // max concurrent analysis requests to send
+	TimeoutSecs int      // per-request analysis timeout (0 = litmus default: 600s)
 }
 
 func newLitmusServer(cfg litmusConfig) *litmusServer {
@@ -55,12 +59,15 @@ func newLitmusServer(cfg litmusConfig) *litmusServer {
 		cfg.MaxWorkers = 8
 	}
 	return &litmusServer{
-		bin:        cfg.Bin,
-		dirs:       cfg.Dirs,
-		maxRSSGB:   cfg.MaxRSSGB,
-		maxWorkers: cfg.MaxWorkers,
+		bin:         cfg.Bin,
+		dirs:        cfg.Dirs,
+		maxRSSGB:    cfg.MaxRSSGB,
+		maxWorkers:  cfg.MaxWorkers,
+		timeoutSecs: cfg.TimeoutSecs,
 		client: &http.Client{
-			Timeout: 15 * time.Minute,
+			// Slightly longer than litmus's analysis timeout so litmus always
+			// has a chance to return 504 before the client gives up.
+			Timeout: time.Duration(cfg.TimeoutSecs+60) * time.Second,
 		},
 	}
 }
@@ -120,6 +127,9 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 	}
 	if s.maxRSSGB > 0 {
 		args = append(args, "--max-rss-gb", strconv.Itoa(s.maxRSSGB))
+	}
+	if s.timeoutSecs > 0 {
+		args = append(args, "--timeout-secs", strconv.Itoa(s.timeoutSecs))
 	}
 
 	cmd := exec.CommandContext(ctx, s.bin, args...) //nolint:gosec // bin path is from trusted CLI flag
@@ -236,21 +246,164 @@ func (s *litmusServer) waitHealthy(ctx context.Context) error {
 	}
 }
 
+// TrackWorker registers a worker as analyzing a file. Call with "" to clear.
+func (s *litmusServer) TrackWorker(workerID int, file string) {
+	if file == "" {
+		s.inFlight.Delete(workerID)
+	} else {
+		s.inFlight.Store(workerID, &workerState{File: file, StartedAt: time.Now()})
+	}
+}
+
+// workerSummary returns counts and the oldest in-flight file for logging.
+func (s *litmusServer) workerSummary() (busy, idle int, oldestMs int64, oldestFile string) {
+	now := time.Now()
+	total := s.maxWorkers
+	s.inFlight.Range(func(_, v any) bool {
+		ws := v.(*workerState)
+		busy++
+		elapsed := now.Sub(ws.StartedAt).Milliseconds()
+		if elapsed > oldestMs {
+			oldestMs = elapsed
+			oldestFile = ws.File
+		}
+		return true
+	})
+	idle = total - busy
+	return
+}
+
+// WatchHealth periodically polls litmus /_/health and /_/requests, logs the
+// state, and kills litmus if any request has been stuck longer than the
+// configured timeout. Runs alongside Monitor; call in a separate goroutine.
+func (s *litmusServer) WatchHealth(ctx context.Context) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	stuckThreshold := time.Duration(s.timeoutSecs) * time.Second
+	if stuckThreshold == 0 {
+		stuckThreshold = 600 * time.Second
+	}
+	// Kill if any request exceeds 2x the timeout — it's clearly stuck.
+	killThreshold := 2 * stuckThreshold
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		health := s.pollHealth(ctx)
+		if health == nil {
+			continue
+		}
+
+		busy, idle, workerOldestMs, workerOldestFile := s.workerSummary()
+
+		level := slog.LevelDebug
+		if health.ActiveTasks > 0 || busy > 0 {
+			level = slog.LevelInfo
+		}
+		slog.Default().Log(ctx, level, "litmus health",
+			"live_tasks", health.LiveTasks,
+			"orphaned_tasks", health.OrphanedTasks,
+			"active_tasks", health.ActiveTasks,
+			"max_concurrent", health.MaxConcurrent,
+			"load", fmt.Sprintf("%.2f", health.Load),
+			"rss_mb", health.RSSMB,
+			"litmus_oldest_ms", health.OldestRequestMs,
+			"litmus_oldest_name", health.OldestRequestName,
+			"hopper_busy", busy,
+			"hopper_idle", idle,
+			"hopper_oldest_ms", workerOldestMs,
+			"hopper_oldest_file", workerOldestFile,
+		)
+
+		if health.OldestRequestMs > killThreshold.Milliseconds() {
+			slog.Error("litmus has stuck request, killing to force restart",
+				"oldest_request_ms", health.OldestRequestMs,
+				"oldest_request_name", health.OldestRequestName,
+				"kill_threshold_ms", killThreshold.Milliseconds(),
+			)
+			s.mu.Lock()
+			if s.cmd != nil && s.cmd.Process != nil {
+				s.cmd.Process.Kill() //nolint:errcheck,gosec // Monitor will restart
+			}
+			s.mu.Unlock()
+		}
+	}
+}
+
+type litmusHealth struct {
+	ActiveTasks       int     `json:"active_tasks"`
+	LiveTasks         int     `json:"live_tasks"`
+	OrphanedTasks     int     `json:"orphaned_tasks"`
+	MaxConcurrent     int     `json:"max_concurrent_tasks"`
+	Load              float64 `json:"load"`
+	RSSMB             int     `json:"rss_mb"`
+	OldestRequestMs   int64
+	OldestRequestName string
+}
+
+func (s *litmusServer) pollHealth(ctx context.Context) *litmusHealth {
+	// Poll health.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.url+"/_/health", http.NoBody)
+	if err != nil {
+		return nil
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	resp.Body.Close() //nolint:errcheck
+
+	var h litmusHealth
+	if json.Unmarshal(body, &h) != nil {
+		return nil
+	}
+
+	// Poll in-flight requests for oldest.
+	req, err = http.NewRequestWithContext(ctx, http.MethodGet, s.url+"/_/requests", http.NoBody)
+	if err != nil {
+		return &h
+	}
+	resp, err = s.client.Do(req)
+	if err != nil {
+		return &h
+	}
+	body, _ = io.ReadAll(io.LimitReader(resp.Body, 32768))
+	resp.Body.Close() //nolint:errcheck
+
+	var reqList struct {
+		Requests []struct {
+			Name      string `json:"name"`
+			ElapsedMs int64  `json:"elapsed_ms"`
+		} `json:"requests"`
+	}
+	if json.Unmarshal(body, &reqList) == nil && len(reqList.Requests) > 0 {
+		// Requests are sorted by elapsed descending — first is oldest.
+		h.OldestRequestMs = reqList.Requests[0].ElapsedMs
+		h.OldestRequestName = reqList.Requests[0].Name
+	}
+
+	return &h
+}
+
 // analyzeResult holds the split litmus response for storage in hopper.
 type analyzeResult struct {
 	ML        json.RawMessage // ml section → litmus_result column
 	Raw       json.RawMessage // raw section → cleave_result column
 	Canonical string          // canonical SHA256 from raw.fs[]
+	TotalMs   int64           // server-reported total analysis time (from X-Total-Ms header)
 }
 
-// restartThreshold is the number of consecutive 503s across all workers
-// before we kill and restart the server to clear orphaned tasks.
-const restartThreshold = 50
+var errRetryable = errors.New("service unavailable")
 
 // Analyze sends a file to the litmus server for analysis.
 // Returns the split response (ml + raw sections) and extracted canonical SHA.
-// Retries on 503 with exponential backoff+jitter. If the server is
-// persistently stuck (orphaned tasks), triggers a restart.
+// Retries on 503 (litmus at capacity) with exponential backoff.
 func (s *litmusServer) Analyze(ctx context.Context, sha256, path string) (*analyzeResult, error) {
 	body, err := json.Marshal(struct {
 		Path string `json:"path"`
@@ -261,11 +414,7 @@ func (s *litmusServer) Analyze(ctx context.Context, sha256, path string) (*analy
 
 	r, err := retry.DoWithData(
 		func() (*analyzeResult, error) {
-			result, err := s.doAnalyze(ctx, sha256, body)
-			if err != nil {
-				return nil, err
-			}
-			return result, nil
+			return s.doAnalyze(ctx, sha256, body)
 		},
 		retry.Attempts(12),
 		retry.Context(ctx),
@@ -276,43 +425,16 @@ func (s *litmusServer) Analyze(ctx context.Context, sha256, path string) (*analy
 		retry.RetryIf(func(err error) bool {
 			return errors.Is(err, errRetryable)
 		}),
-		retry.OnRetry(func(attempt uint, err error) {
-			if errors.Is(err, errRetryable) {
-				n := s.consecutive503.Add(1)
-				slog.Debug("litmus overloaded, retrying", "path", path, "attempt", attempt+1, "consecutive_503s", n)
-				if n >= restartThreshold {
-					s.triggerRestart()
-				}
-			}
+		retry.OnRetry(func(attempt uint, _ error) {
+			slog.Debug("litmus at capacity, retrying", "path", path, "attempt", attempt+1)
 		}),
 		retry.LastErrorOnly(true),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("litmus: %s: %w", path, err)
 	}
-
-	s.consecutive503.Store(0)
 	return r, nil
 }
-
-// triggerRestart kills the current litmus process to clear orphaned tasks.
-// Monitor() will detect the exit and restart it automatically.
-// Uses mu to ensure only one restart happens at a time.
-func (s *litmusServer) triggerRestart() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.cmd == nil || s.cmd.Process == nil {
-		return
-	}
-
-	slog.Warn("litmus server stuck with orphaned tasks, killing to force restart",
-		"consecutive_503s", s.consecutive503.Load())
-	s.consecutive503.Store(0)
-	s.cmd.Process.Kill() //nolint:errcheck,gosec // best-effort; Monitor will restart
-}
-
-var errRetryable = errors.New("service unavailable")
 
 func (s *litmusServer) doAnalyze(ctx context.Context, sha256 string, body []byte) (*analyzeResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url+"/analyze-path", bytes.NewReader(body))
@@ -330,7 +452,6 @@ func (s *litmusServer) doAnalyze(ctx context.Context, sha256 string, body []byte
 	if resp.StatusCode == http.StatusServiceUnavailable {
 		return nil, errRetryable
 	}
-	s.consecutive503.Store(0) // server accepted work, clear overload counter
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512)) //nolint:errcheck // best-effort error body
 		return nil, fmt.Errorf("litmus: %d %s", resp.StatusCode, msg)
@@ -352,10 +473,16 @@ func (s *litmusServer) doAnalyze(ctx context.Context, sha256 string, body []byte
 
 	canonical := extractCanonicalSHA(sha256, envelope.Raw)
 
+	var totalMs int64
+	if v := resp.Header.Get("X-Total-Ms"); v != "" {
+		totalMs, _ = strconv.ParseInt(v, 10, 64)
+	}
+
 	return &analyzeResult{
 		ML:        envelope.ML,
 		Raw:       envelope.Raw,
 		Canonical: canonical,
+		TotalMs:   totalMs,
 	}, nil
 }
 

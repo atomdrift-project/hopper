@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"math"
+	"math/rand/v2"
 	"net/url"
 	"os"
 	"os/exec"
@@ -242,21 +243,38 @@ func cmdReset(ctx context.Context) error {
 func cmdLoad(ctx context.Context) error {
 	f := flag.NewFlagSet("load", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
-	bad := f.String("bad", "", "directory of known-bad samples")
-	good := f.String("good", "", "directory of known-good samples")
+	dataDir := f.String("data", "", "data directory containing bad/, good/, unknown/ subdirectories")
 	source := f.String("source", "harvest", "sample source tag")
 	workers := f.Int("workers", 8, "concurrent hash/insert workers")
 	litmusBin := f.String("litmus", "litmus", "path to litmus binary (pass empty to disable)")
 	litmusWorkers := f.Int("litmus-workers", max(1, runtime.NumCPU()-1), "concurrent litmus analysis workers")
 	maxRSSGB := f.Int("max-memory-gb", 32, "litmus RSS limit in GB")
+	analysisTimeout := f.Int("analysis-timeout", 600, "per-file analysis timeout in seconds (passed to litmus)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
 	experimentTag := f.String("experiment-tag", "", "label for experiment comparison")
 	f.Parse(os.Args[2:]) //nolint:errcheck,gosec // ExitOnError handles parse errors
 
-	if *bad == "" && *good == "" {
-		return errors.New("pass --bad and/or --good")
+	if *dataDir == "" {
+		return errors.New("pass --data <directory> (expects bad/, good/, unknown/ subdirectories)")
+	}
+
+	// Discover label directories under --data.
+	// Convention: bad/ → label "bad", good/ → label "good", unknown/ → label "unknown".
+	var loadDirs []struct{ dir, label string }
+	for _, entry := range []struct{ name, label string }{
+		{"bad", "bad"},
+		{"good", "good"},
+		{"unknown", "unknown"},
+	} {
+		dir := filepath.Join(*dataDir, entry.name)
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			loadDirs = append(loadDirs, struct{ dir, label string }{dir, entry.label})
+		}
+	}
+	if len(loadDirs) == 0 {
+		return fmt.Errorf("no bad/, good/, or unknown/ subdirectories found in %s", *dataDir)
 	}
 
 	// Open hash cache (default: ~/.hopper/hashcache.db).
@@ -276,7 +294,11 @@ func cmdLoad(ctx context.Context) error {
 		}
 	}
 
-	slog.Info("load starting", "bad", *bad, "good", *good, "workers", *workers, "rescan", *rescan, "cache", cache != nil, "max_analyzed", *maxAnalyzed, "experiment", *experimentTag)
+	var dirNames []string
+	for _, d := range loadDirs {
+		dirNames = append(dirNames, d.label)
+	}
+	slog.Info("load starting", "data", *dataDir, "labels", dirNames, "workers", *workers, "rescan", *rescan, "cache", cache != nil, "max_analyzed", *maxAnalyzed, "experiment", *experimentTag)
 	db, err := openDB(ctx, *dsn)
 	if err != nil {
 		return err
@@ -287,15 +309,10 @@ func cmdLoad(ctx context.Context) error {
 		return err
 	}
 
-	// Collect directories for litmus's --dangerous-local-file-paths.
+	// Collect directories for litmus's --allowed-dirs.
 	var dirs []string
-	if *bad != "" {
-		if abs, err := filepath.Abs(*bad); err == nil {
-			dirs = append(dirs, abs)
-		}
-	}
-	if *good != "" {
-		if abs, err := filepath.Abs(*good); err == nil {
+	for _, d := range loadDirs {
+		if abs, err := filepath.Abs(d.dir); err == nil {
 			dirs = append(dirs, abs)
 		}
 	}
@@ -304,10 +321,11 @@ func cmdLoad(ctx context.Context) error {
 	var litmus *litmusServer
 	if *litmusBin != "" {
 		litmus = newLitmusServer(litmusConfig{
-			Bin:        *litmusBin,
-			Dirs:       dirs,
-			MaxRSSGB:   *maxRSSGB,
-			MaxWorkers: *litmusWorkers,
+			Bin:         *litmusBin,
+			Dirs:        dirs,
+			MaxRSSGB:    *maxRSSGB,
+			MaxWorkers:  *litmusWorkers,
+			TimeoutSecs: *analysisTimeout,
 		})
 		if err := litmus.Start(ctx); err != nil {
 			return err
@@ -318,34 +336,17 @@ func cmdLoad(ctx context.Context) error {
 				slog.Error("litmus monitor failed", "error", err)
 			}
 		}()
+		go litmus.WatchHealth(ctx)
 	}
 
-	// Count active directories to split litmus workers evenly.
-	var loadDirs []struct{ dir, label string }
-	for _, d := range []struct{ dir, label string }{{*bad, "bad"}, {*good, "good"}} {
-		if d.dir != "" {
-			loadDirs = append(loadDirs, d)
-		}
-	}
-
-	// Shared progress for --max-analyzed across all directories.
 	var shared loadProgress
 	shared.analyzeDurationMin.Store(math.MaxInt64)
 
 	loadCtx, loadCancel := context.WithCancel(ctx)
 	defer loadCancel()
 
-	var total atomic.Int64
-	var loadWG sync.WaitGroup
-	for _, d := range loadDirs {
-		loadWG.Add(1)
-		go func() {
-			defer loadWG.Done()
-			total.Add(int64(loadDir(loadCtx, loadCancel, db, litmus, cache, d.dir, d.label, *source, *workers, *rescan, len(loadDirs), *maxAnalyzed, *experimentTag, &shared)))
-		}()
-	}
-	loadWG.Wait()
-	slog.Info("load complete", "samples", total.Load())
+	total := loadAll(loadCtx, loadCancel, db, litmus, cache, loadDirs, *source, *workers, *rescan, *maxAnalyzed, *experimentTag, &shared)
+	slog.Info("load complete", "samples", total)
 	return nil
 }
 
@@ -394,28 +395,26 @@ var (
 	errTooLarge = errors.New("too large")
 )
 
-func loadDir(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litmus *litmusServer, cache *hashCache, dir, label, source string, nworkers int, rescan bool, numDirs int, maxAnalyzed int, experimentTag string, shared *loadProgress) int {
-	slog.Info("loading directory", "dir", dir, "label", label, "workers", nworkers)
+func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litmus *litmusServer, cache *hashCache, dirs []struct{ dir, label string }, source string, nworkers int, rescan bool, maxAnalyzed int, experimentTag string, shared *loadProgress) int {
+	slog.Info("loading", "dirs", len(dirs), "workers", nworkers)
 	start := time.Now()
 	var progress loadProgress
 	progress.analyzeDurationMin.Store(math.MaxInt64)
 
-	paths := make(chan string, nworkers*2)
+	paths := make(chan labeledPath, nworkers*2)
 	hashed := make(chan hashedFile, nworkers*2)
 	var hashWG sync.WaitGroup
 
 	// Analysis queue: nil if litmus is not configured.
-	// Split litmus workers evenly across active directories.
 	var analyzeQueue chan loadJob
 	var analyzeWG sync.WaitGroup
 	if litmus != nil {
-		perDir := max(1, litmus.Workers()/numDirs)
-		analyzeQueue = make(chan loadJob, perDir*2)
-		startAnalysisWorkers(ctx, cancel, db, litmus, analyzeQueue, &analyzeWG, &progress, shared, perDir, maxAnalyzed)
+		analyzeQueue = make(chan loadJob, litmus.Workers()*2)
+		startAnalysisWorkers(ctx, cancel, db, litmus, analyzeQueue, &analyzeWG, &progress, shared, litmus.Workers(), maxAnalyzed)
 	}
 
 	// Periodic progress reporting.
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(15 * time.Second)
 	done := make(chan struct{})
 	var prevAnalyzed int64
 	go func() {
@@ -441,7 +440,7 @@ func loadDir(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 				}
 
 				attrs := []any{
-					"dir", dir,
+					"dirs", len(dirs),
 				}
 				if walked > 0 {
 					attrs = append(attrs, "hash_pct", fmt.Sprintf("%.0f%%", float64(hashDone)/float64(walked)*100))
@@ -487,12 +486,12 @@ func loadDir(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 	// Hash workers: read files, check markers, compute SHA256, send to batch inserter.
 	for range nworkers {
 		hashWG.Go(func() {
-			for path := range paths {
+			for lp := range paths {
 				if ctx.Err() != nil {
 					return
 				}
 
-				sample, err := hashFile(path, label, source, cache)
+				sample, err := hashFile(lp.path, lp.label, source, cache)
 				if err != nil {
 					switch {
 					case errors.Is(err, errTooSmall):
@@ -502,30 +501,28 @@ func loadDir(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 					default:
 						progress.errors.Add(1)
 						progress.hashErrors.Add(1)
-						slog.Warn("hash failed", "path", path, "error", err)
+						slog.Warn("hash failed", "path", lp.path, "error", err)
 					}
 					continue
 				}
 
 				// Check for misclassification markers that contradict the label.
-				// A BENIGN marker on a known-bad file → flip to good, skip training.
-				// A BAD marker on a known-good file → flip to bad, skip training.
-				if marker := checkMarker(path); marker != "" {
-					if (label == "bad" && marker == "benign") || (label == "good" && marker == "bad") {
+				if marker := checkMarker(lp.path); marker != "" {
+					if (lp.label == "bad" && marker == "benign") || (lp.label == "good" && marker == "bad") {
 						progress.markers.Add(1)
-						sample.Label = marker // "benign" or "bad"
+						sample.Label = marker
 						if marker == "benign" {
 							sample.Label = "good"
 						}
 						sample.LabelSource = "marker"
 						sample.Skip = "misclassified"
-						slog.Info("misclassified file", "path", path, "original_label", label, "marker", marker)
+						slog.Info("misclassified file", "path", lp.path, "original_label", lp.label, "marker", marker)
 					}
 				}
 
 				progress.hashed.Add(1)
 				select {
-				case hashed <- hashedFile{sample: sample, path: path}:
+				case hashed <- hashedFile{sample: sample, path: lp.path}:
 				case <-ctx.Done():
 					return
 				}
@@ -598,7 +595,7 @@ func loadDir(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 				select {
 				case pendingAnalysis <- loadJob{path: h.path, sha: h.sample.SHA256}:
 				case <-ctx.Done():
-					slog.Debug("inserter flush cancelled", "dir", dir, "pending_queue_len", len(pendingAnalysis))
+					slog.Debug("inserter flush cancelled", "dirs", len(dirs), "pending_queue_len", len(pendingAnalysis))
 					return
 				}
 			}
@@ -623,29 +620,29 @@ func loadDir(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 				select {
 				case analyzeQueue <- job:
 				case <-ctx.Done():
-					slog.Debug("feeder cancelled", "dir", dir, "remaining_pending", len(pendingAnalysis))
+					slog.Debug("feeder cancelled", "dirs", len(dirs), "remaining_pending", len(pendingAnalysis))
 					return
 				}
 			}
-			slog.Debug("feeder drained", "dir", dir)
+			slog.Debug("feeder drained")
 		})
 	}
 
-	walkFiles(ctx, dir, paths, &progress)
-	slog.Debug("shutdown", "dir", dir, "step", "walk complete, closing paths")
+	walkAndShuffle(ctx, dirs, paths, &progress)
+	slog.Debug("shutdown", "step", "walk complete, closing paths")
 	close(paths)
 	hashWG.Wait()
-	slog.Debug("shutdown", "dir", dir, "step", "hash workers done, closing hashed")
+	slog.Debug("shutdown", "dirs", len(dirs), "step", "hash workers done, closing hashed")
 	close(hashed)
 	insertWG.Wait() // also closes pendingAnalysis
-	slog.Debug("shutdown", "dir", dir, "step", "inserter done")
+	slog.Debug("shutdown", "dirs", len(dirs), "step", "inserter done")
 	feederWG.Wait() // drains pendingAnalysis into analyzeQueue
-	slog.Debug("shutdown", "dir", dir, "step", "feeder done")
+	slog.Debug("shutdown", "dirs", len(dirs), "step", "feeder done")
 
 	if analyzeQueue != nil {
 		close(analyzeQueue)
 		analyzeWG.Wait()
-		slog.Debug("shutdown", "dir", dir, "step", "analysis workers done")
+		slog.Debug("shutdown", "dirs", len(dirs), "step", "analysis workers done")
 	}
 
 	ticker.Stop()
@@ -654,7 +651,7 @@ func loadDir(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 	analyzed := progress.analyzed.Load()
 	elapsed := time.Since(start)
 	completeAttrs := []any{
-		"dir", dir,
+		"dirs", len(dirs),
 		"walked", progress.walked.Load(), "hashed", progress.hashed.Load(),
 		"inserted", progress.inserted.Load(),
 		"skipped", progress.skipped.Load(), "markers", progress.markers.Load(),
@@ -687,7 +684,7 @@ func loadDir(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 }
 
 func startAnalysisWorkers(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litmus *litmusServer, queue chan loadJob, wg *sync.WaitGroup, progress *loadProgress, shared *loadProgress, nworkers int, maxAnalyzed int) {
-	for range nworkers {
+	for workerID := range nworkers {
 		wg.Go(func() {
 			for job := range queue {
 				if ctx.Err() != nil {
@@ -695,8 +692,10 @@ func startAnalysisWorkers(ctx context.Context, cancel context.CancelFunc, db *ho
 					return
 				}
 
+				litmus.TrackWorker(workerID, filepath.Base(job.path))
 				t0 := time.Now()
 				result, err := litmus.Analyze(ctx, job.sha, job.path)
+				litmus.TrackWorker(workerID, "")
 				dur := time.Since(t0).Nanoseconds()
 
 				if err != nil {
@@ -792,31 +791,51 @@ func checkMarker(path string) string {
 	return ""
 }
 
-func walkFiles(ctx context.Context, dir string, paths chan<- string, progress *loadProgress) {
-	slog.Info("walking directory", "dir", dir)
-	filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error { //nolint:errcheck,gosec // errors logged per-file
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			if d.Name() == ".git" {
-				return fs.SkipDir
+// labeledPath is a file path with its classification label.
+type labeledPath struct {
+	path  string
+	label string
+}
+
+// walkAndShuffle walks all directories, collects file paths with labels,
+// shuffles them randomly, and sends them to the channel. Shuffling ensures
+// progress across all ecosystems rather than processing one directory at a time.
+func walkAndShuffle(ctx context.Context, dirs []struct{ dir, label string }, paths chan<- labeledPath, progress *loadProgress) {
+	var all []labeledPath
+	for _, d := range dirs {
+		slog.Info("walking directory", "dir", d.dir, "label", d.label)
+		filepath.WalkDir(d.dir, func(path string, entry fs.DirEntry, err error) error { //nolint:errcheck,gosec
+			if err != nil {
+				return err
 			}
+			if entry.IsDir() {
+				if entry.Name() == ".git" {
+					return fs.SkipDir
+				}
+				return nil
+			}
+			if isMarkerFile(entry.Name()) {
+				return nil
+			}
+			all = append(all, labeledPath{path: path, label: d.label})
 			return nil
-		}
-		// Skip marker files themselves — they are metadata, not samples.
-		if isMarkerFile(d.Name()) {
-			return nil
-		}
-		progress.walked.Add(1)
+		})
+	}
+
+	// Shuffle for even progress across directories and ecosystems.
+	rng := rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())) //nolint:gosec // not crypto
+	rng.Shuffle(len(all), func(i, j int) { all[i], all[j] = all[j], all[i] })
+
+	slog.Info("walk complete", "files", len(all))
+	progress.walked.Store(int64(len(all)))
+
+	for _, lp := range all {
 		select {
-		case paths <- path:
-			return nil
+		case paths <- lp:
 		case <-ctx.Done():
-			return ctx.Err()
+			return
 		}
-	})
-	slog.Info("walk complete", "dir", dir, "files", progress.walked.Load())
+	}
 }
 
 func hashFile(path, label, source string, cache *hashCache) (*hopper.Sample, error) {

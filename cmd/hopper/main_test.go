@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -96,24 +97,25 @@ func TestWalkFilesSkipsMarkers(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "._other.exe.BAD"), nil, 0o644)
 	os.WriteFile(filepath.Join(dir, "legit.bin"), []byte("another sample!"), 0o644)
 
-	paths := make(chan string, 10)
+	paths := make(chan labeledPath, 10)
 	var progress loadProgress
 
-	walkFiles(t.Context(), dir, paths, &progress)
+	dirs := []struct{ dir, label string }{{dir, "bad"}}
+	walkAndShuffle(t.Context(), dirs, paths, &progress)
 	close(paths)
 
 	var got []string
-	for p := range paths {
-		got = append(got, filepath.Base(p))
+	for lp := range paths {
+		got = append(got, filepath.Base(lp.path))
 	}
 
 	// Only real samples should appear, not marker files.
 	if len(got) != 2 {
-		t.Fatalf("walkFiles returned %d files %v, want 2 (malware.whl, legit.bin)", len(got), got)
+		t.Fatalf("walkAndShuffle returned %d files %v, want 2 (malware.whl, legit.bin)", len(got), got)
 	}
 	for _, name := range got {
 		if isMarkerFile(name) {
-			t.Errorf("walkFiles emitted marker file %q", name)
+			t.Errorf("walkAndShuffle emitted marker file %q", name)
 		}
 	}
 }
@@ -601,19 +603,20 @@ func TestWalkFilesSkipsGitDir(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, ".git", "objects", "pack.idx"), []byte("git internal!"), 0o644)
 	os.WriteFile(filepath.Join(dir, "sample.bin"), []byte("real sample!!!"), 0o644)
 
-	paths := make(chan string, 10)
+	paths := make(chan labeledPath, 10)
 	var progress loadProgress
 
-	walkFiles(t.Context(), dir, paths, &progress)
+	dirs := []struct{ dir, label string }{{dir, "good"}}
+	walkAndShuffle(t.Context(), dirs, paths, &progress)
 	close(paths)
 
 	var got []string
-	for p := range paths {
-		got = append(got, filepath.Base(p))
+	for lp := range paths {
+		got = append(got, filepath.Base(lp.path))
 	}
 
 	if len(got) != 1 || got[0] != "sample.bin" {
-		t.Errorf("walkFiles returned %v, want just [sample.bin]", got)
+		t.Errorf("walkAndShuffle returned %v, want just [sample.bin]", got)
 	}
 }
 
@@ -658,10 +661,12 @@ func TestLoadDir(t *testing.T) {
 	os.MkdirAll(filepath.Join(dir, ".git"), 0o755)
 	os.WriteFile(filepath.Join(dir, ".git", "HEAD"), []byte("ref: refs/heads/main"), 0o644)
 
-	n := loadDir(ctx, func() {}, db, nil, nil, dir, "bad", "test", 2, false, 1, 0, "", &loadProgress{})
+	shared := &loadProgress{}
+	shared.analyzeDurationMin.Store(math.MaxInt64)
+	n := loadAll(ctx, func() {}, db, nil, nil, []struct{ dir, label string }{{dir, "bad"}}, "test", 2, false, 0, "", shared)
 	// 2 valid files inserted (tiny skipped, .git skipped)
 	if n != 2 {
-		t.Errorf("loadDir returned %d, want 2", n)
+		t.Errorf("loadAll returned %d, want 2", n)
 	}
 
 	counts, _ := db.CountByLabel(ctx)
@@ -692,13 +697,17 @@ func TestLoadDirWithCache(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "sample.bin"), []byte("sample content!!"), 0o644)
 
 	// First load: cache miss, hashes file.
-	n1 := loadDir(ctx, func() {}, db, nil, cache, dir, "bad", "test", 1, false, 1, 0, "", &loadProgress{})
+	s1 := &loadProgress{}
+	s1.analyzeDurationMin.Store(math.MaxInt64)
+	n1 := loadAll(ctx, func() {}, db, nil, cache, []struct{ dir, label string }{{dir, "bad"}}, "test", 1, false, 0, "", s1)
 	if n1 != 1 {
 		t.Errorf("first load = %d, want 1", n1)
 	}
 
 	// Second load: cache hit, same hash → duplicate skipped.
-	n2 := loadDir(ctx, func() {}, db, nil, cache, dir, "bad", "test", 1, false, 1, 0, "", &loadProgress{})
+	s2 := &loadProgress{}
+	s2.analyzeDurationMin.Store(math.MaxInt64)
+	n2 := loadAll(ctx, func() {}, db, nil, cache, []struct{ dir, label string }{{dir, "bad"}}, "test", 1, false, 0, "", s2)
 	if n2 != 1 { // 1 total (0 inserted + 1 skipped)
 		t.Errorf("second load = %d, want 1", n2)
 	}
@@ -719,7 +728,9 @@ func TestLoadDirMarkers(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "malware.bin"), []byte("malicious payload!"), 0o644)
 	os.WriteFile(filepath.Join(dir, "._malware.bin.BENIGN"), nil, 0o644) // marker: actually benign
 
-	loadDir(ctx, func() {}, db, nil, nil, dir, "bad", "test", 1, false, 1, 0, "", &loadProgress{})
+	sm := &loadProgress{}
+	sm.analyzeDurationMin.Store(math.MaxInt64)
+	loadAll(ctx, func() {}, db, nil, nil, []struct{ dir, label string }{{dir, "bad"}}, "test", 1, false, 0, "", sm)
 
 	// The sample should be flipped to "good" with skip="misclassified".
 	samples, _ := db.SamplesByLabel(ctx, "good", 10)

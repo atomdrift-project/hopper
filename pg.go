@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -23,6 +24,7 @@ func openPG(ctx context.Context, dsn string) (*DB, error) {
 }
 
 func (db *DB) migratePG(ctx context.Context) error {
+	slog.Debug("executing initial schema ddl")
 	if _, err := db.pool.Exec(ctx, schemaPG); err != nil {
 		return fmt.Errorf("hopper: migrate: %w", err)
 	}
@@ -38,10 +40,14 @@ func (db *DB) migratePG(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_samples_formula ON samples(formula) WHERE formula != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_elements ON samples(elements) WHERE elements != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_score ON samples(score) WHERE score != 0`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS mtime TIMESTAMPTZ`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source ON samples(source, label, analyzed_at DESC NULLS LAST) WHERE cleave_result IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_mtime ON samples(source, label, mtime DESC NULLS LAST) WHERE cleave_result IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed ON samples(feed) WHERE feed != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_ecosystem ON samples(ecosystem) WHERE ecosystem != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_mtime ON samples(mtime) WHERE mtime IS NOT NULL`,
 	} {
+		slog.Debug("executing migration ddl", "ddl", ddl)
 		if _, err := db.pool.Exec(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate: %w", err)
 		}
@@ -51,14 +57,14 @@ func (db *DB) migratePG(ctx context.Context) error {
 
 const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, cleave_result, litmus_result,
-	path, status, note, canonical_sha256, parent, skip, formula, elements, score, created_at, updated_at, analyzed_at`
+	path, status, note, canonical_sha256, parent, skip, formula, elements, score, created_at, updated_at, analyzed_at, mtime`
 
 func pgSampleDest(s *Sample) []any {
 	return []any{
 		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &s.CleaveResult, &s.LitmusResult,
 		&s.Path, &s.Status, &s.Note, &s.CanonicalSHA256,
-		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt,
+		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.Mtime,
 	}
 }
 
@@ -90,11 +96,11 @@ func scanPGSamples(rows pgx.Rows) ([]*Sample, error) {
 func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 	tag, err := db.pool.Exec(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $1, $12, $13, $14, $15, $16)
+			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, mtime)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $1, $12, $13, $14, $15, $16, $17)
 		ON CONFLICT (sha256) DO NOTHING`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
-		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.Parent, s.Skip, s.Formula, s.Elements, s.Score)
+		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.Mtime)
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
@@ -104,20 +110,20 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 var insertBatchStagingCols = []string{
 	"sha256", "source", "feed", "ecosystem", "filename", "file_type",
 	"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
-	"parent", "skip", "formula", "elements", "score",
+	"parent", "skip", "formula", "elements", "score", "mtime",
 }
 
 const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 	sha256 TEXT, source TEXT, feed TEXT, ecosystem TEXT, filename TEXT,
 	file_type TEXT, size_bytes BIGINT, label TEXT, label_source TEXT,
 	path TEXT, status TEXT, canonical_sha256 TEXT,
-	parent TEXT, skip TEXT, formula TEXT, elements TEXT, score INTEGER
+	parent TEXT, skip TEXT, formula TEXT, elements TEXT, score INTEGER, mtime TIMESTAMPTZ
 ) ON COMMIT DROP`
 
 const insertBatchStagingInsert = `INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score)
+	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, mtime)
 SELECT sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score
+	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, mtime
 FROM _staging
 ON CONFLICT (sha256) DO NOTHING`
 
@@ -127,7 +133,7 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (int64
 		rows[i] = []any{
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256,
-			s.Parent, s.Skip, s.Formula, s.Elements, s.Score,
+			s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.Mtime,
 		}
 	}
 
@@ -473,7 +479,7 @@ func (db *DB) feedSamplesPG(ctx context.Context, q FeedQuery) ([]*Sample, error)
 			AND cleave_result IS NOT NULL
 			AND (cardinality($3::text[]) = 0 OR feed = ANY($3))
 			AND (cardinality($4::text[]) = 0 OR ecosystem = ANY($4))
-		ORDER BY analyzed_at DESC NULLS LAST
+		ORDER BY `+q.sortBy()+` DESC NULLS LAST
 		LIMIT $5 OFFSET $6`,
 		q.Source, q.Label, q.Feeds, q.Ecosystems, q.Limit, q.Offset)
 	if err != nil {

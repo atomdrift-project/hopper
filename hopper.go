@@ -118,6 +118,7 @@ type Sample struct {
 	Formula         string // cleave chemical formula (behavioral signature)
 	Elements        string // formula without counts (qualitative composition)
 	AnalyzedAt      *time.Time
+	Mtime           *time.Time
 	CleaveResult    []byte // raw cleave JSON, nil if unanalyzed
 	LitmusResult    []byte // litmus classification envelope JSON, nil if unclassified
 	ID              int64
@@ -534,19 +535,17 @@ func (db *DB) SamplesByEmbeddedSHA256(ctx context.Context, sha256 string, limit 
 	if db.pool != nil {
 		return db.samplesByEmbeddedSHA256PG(ctx, sha256, limit)
 	}
-	return nil, errors.New("hopper: SamplesByEmbeddedSHA256 requires PostgreSQL 17+")
+	return db.samplesByEmbeddedSHA256SQLite(ctx, sha256, limit)
 }
 
 // RecomputeCanonicalSHA256 recalculates canonical_sha256 for all analyzed
 // samples using SQL-side JSON_TABLE, avoiding the need to fetch cleave_result
 // blobs into Go. Returns the number of rows updated.
-//
-// PostgreSQL 17+ only (uses JSON_TABLE). Returns an error on SQLite.
 func (db *DB) RecomputeCanonicalSHA256(ctx context.Context) (int64, error) {
 	if db.pool != nil {
 		return db.recomputeCanonicalSHA256PG(ctx)
 	}
-	return 0, errors.New("hopper: RecomputeCanonicalSHA256 requires PostgreSQL 17+")
+	return db.recomputeCanonicalSHA256SQLite(ctx)
 }
 
 // FeedQuery specifies filters for paginated feed queries.
@@ -555,6 +554,7 @@ type FeedQuery struct {
 	Label      string   // "bad", "good", "unknown", or "" (match any)
 	Feeds      []string // optional: filter by feed column values
 	Ecosystems []string // optional: filter by ecosystem column values
+	OrderBy    string   // "mtime" (default) or "analyzed_at"
 	Limit      int      // page size (clamped to 1–100)
 	Offset     int      // pagination offset
 }
@@ -601,6 +601,15 @@ func (q *FeedQuery) clamp() {
 	}
 	if q.Offset < 0 {
 		q.Offset = 0
+	}
+}
+
+func (q FeedQuery) sortBy() string {
+	switch q.OrderBy {
+	case "analyzed_at":
+		return "analyzed_at"
+	default:
+		return "mtime"
 	}
 }
 

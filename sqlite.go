@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 )
@@ -25,6 +26,7 @@ func openSQLite(ctx context.Context, dsn string) (*DB, error) {
 }
 
 func (db *DB) migrateSQLite(ctx context.Context) error {
+	slog.Debug("executing initial schema ddl")
 	if _, err := db.lite.ExecContext(ctx, schemaSQLite); err != nil {
 		return fmt.Errorf("hopper: migrate sqlite: %w", err)
 	}
@@ -42,6 +44,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			`ALTER TABLE samples ADD COLUMN skip TEXT NOT NULL DEFAULT ''`,
 			`CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent) WHERE parent != ''`,
 		} {
+			slog.Debug("executing migration ddl", "ddl", ddl)
 			if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
 				return fmt.Errorf("hopper: migrate sqlite: %w", err)
 			}
@@ -61,7 +64,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			`CREATE INDEX IF NOT EXISTS idx_samples_formula ON samples(formula) WHERE formula != ''`,
 			`CREATE INDEX IF NOT EXISTS idx_samples_elements ON samples(elements) WHERE elements != ''`,
 			`CREATE INDEX IF NOT EXISTS idx_samples_score ON samples(score) WHERE score != 0`,
+			`CREATE INDEX IF NOT EXISTS idx_samples_feed_source ON samples(source, label, analyzed_at DESC) WHERE cleave_result IS NOT NULL`,
+			`CREATE INDEX IF NOT EXISTS idx_samples_feed ON samples(feed) WHERE feed != ''`,
+			`CREATE INDEX IF NOT EXISTS idx_samples_ecosystem ON samples(ecosystem) WHERE ecosystem != ''`,
 		} {
+			slog.Debug("executing migration ddl", "ddl", ddl)
 			if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
 				return fmt.Errorf("hopper: migrate sqlite: %w", err)
 			}
@@ -80,21 +87,40 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		}
 	}
 
+	// Add mtime column.
+	var hasMtime int
+	//nolint:errcheck,gosec // best-effort column check
+	db.lite.QueryRowContext(ctx,
+		"SELECT count(*) FROM pragma_table_info('samples') WHERE name = 'mtime'",
+	).Scan(&hasMtime)
+	if hasMtime == 0 {
+		for _, ddl := range []string{
+			`ALTER TABLE samples ADD COLUMN mtime DATETIME`,
+			`CREATE INDEX IF NOT EXISTS idx_samples_mtime ON samples(mtime) WHERE mtime IS NOT NULL`,
+			`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_mtime ON samples(source, label, mtime DESC) WHERE cleave_result IS NOT NULL`,
+		} {
+			slog.Debug("executing migration ddl", "ddl", ddl)
+			if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
+				return fmt.Errorf("hopper: migrate sqlite: %w", err)
+			}
+		}
+	}
+
 	return nil
 }
 
 const liteSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, cleave_result, litmus_result,
-	path, status, note, canonical_sha256, parent, skip, formula, elements, score, created_at, updated_at, analyzed_at`
+	path, status, note, canonical_sha256, parent, skip, formula, elements, score, created_at, updated_at, analyzed_at, mtime`
 
 func scanLiteSample(row *sql.Row) (*Sample, error) {
 	s := &Sample{}
 	var cleaveResult, litmusResult, status sql.NullString
-	var analyzedAt sql.NullTime
+	var analyzedAt, mtime sql.NullTime
 	err := row.Scan(&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult,
 		&s.Path, &status, &s.Note, &s.CanonicalSHA256,
-		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt)
+		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -111,6 +137,9 @@ func scanLiteSample(row *sql.Row) (*Sample, error) {
 	if analyzedAt.Valid {
 		s.AnalyzedAt = &analyzedAt.Time
 	}
+	if mtime.Valid {
+		s.Mtime = &mtime.Time
+	}
 	return s, nil
 }
 
@@ -120,11 +149,11 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 	for rows.Next() {
 		s := &Sample{}
 		var cleaveResult, litmusResult, status sql.NullString
-		var analyzedAt sql.NullTime
+		var analyzedAt, mtime sql.NullTime
 		if err := rows.Scan(&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult,
 			&s.Path, &status, &s.Note, &s.CanonicalSHA256,
-			&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt); err != nil {
+			&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime); err != nil {
 			return nil, err
 		}
 		if cleaveResult.Valid {
@@ -137,6 +166,9 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 		if analyzedAt.Valid {
 			s.AnalyzedAt = &analyzedAt.Time
 		}
+		if mtime.Valid {
+			s.Mtime = &mtime.Time
+		}
 		out = append(out, s)
 	}
 	return out, rows.Err()
@@ -147,11 +179,11 @@ func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error) {
 	res, err := db.lite.ExecContext(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, mtime)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256) DO NOTHING`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
-		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256, s.Parent, s.Skip, s.Formula, s.Elements, s.Score)
+		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.Mtime)
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
@@ -170,8 +202,8 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, score)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, mtime)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256) DO NOTHING`)
 	if err != nil {
 		tx.Rollback() //nolint:errcheck,gosec // best-effort rollback on prepare error
@@ -183,7 +215,7 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 	for _, s := range samples {
 		res, err := stmt.ExecContext(ctx,
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
-			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256, s.Parent, s.Skip, s.Formula, s.Score)
+			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.Mtime)
 		if err != nil {
 			tx.Rollback() //nolint:errcheck,gosec // best-effort rollback on insert error
 			return inserted, fmt.Errorf("hopper: batch insert %s: %w", s.SHA256, err)
@@ -466,6 +498,40 @@ func (db *DB) latestReportSQLite(ctx context.Context, sha256, reportType string)
 	return r, nil
 }
 
+func (db *DB) samplesByEmbeddedSHA256SQLite(ctx context.Context, sha256 string, limit int) ([]*Sample, error) {
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT `+liteSampleCols+` FROM samples WHERE id IN (
+			SELECT DISTINCT s.id
+			FROM samples s, json_each(s.cleave_result, '$.files')
+			WHERE json_extract(value, '$.sha256') = ?
+		)
+		ORDER BY id
+		LIMIT ?`, sha256, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: samples by embedded sha256: %w", err)
+	}
+	return scanLiteSamples(rows)
+}
+
+func (db *DB) recomputeCanonicalSHA256SQLite(ctx context.Context) (int64, error) {
+	res, err := db.lite.ExecContext(ctx, `
+		UPDATE samples SET canonical_sha256 = (
+			SELECT MIN(v) FROM (
+				SELECT samples.sha256 AS v
+				UNION ALL
+				SELECT json_extract(value, '$.sha256') AS v
+				FROM json_each(samples.cleave_result, '$.files')
+				WHERE length(v) = 64
+			)
+		), updated_at = ?
+		WHERE cleave_result IS NOT NULL`, now())
+	if err != nil {
+		return 0, fmt.Errorf("hopper: recompute canonical sha256: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 func (db *DB) setSkipSQLite(ctx context.Context, sha256, skip string) error {
 	_, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET skip = ?, updated_at = ? WHERE sha256 = ?`,
@@ -489,19 +555,87 @@ func (db *DB) deleteAllSQLite(ctx context.Context) error {
 }
 
 func (db *DB) feedSamplesSQLite(ctx context.Context, q FeedQuery) ([]*Sample, error) {
-	return nil, errors.New("hopper: FeedSamples not implemented for SQLite")
+	where, args := q.whereSQLite()
+	query := `SELECT ` + liteSampleCols + ` FROM samples ` + where +
+		` ORDER BY ` + q.sortBy() + ` DESC LIMIT ? OFFSET ?`
+	args = append(args, q.Limit, q.Offset)
+
+	rows, err := db.lite.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: feed samples: %w", err)
+	}
+	return scanLiteSamples(rows)
 }
 
 func (db *DB) feedSamplesCountSQLite(ctx context.Context, q FeedQuery) (int, error) {
-	return 0, errors.New("hopper: FeedSamplesCount not implemented for SQLite")
+	where, args := q.whereSQLite()
+	var n int
+	err := db.lite.QueryRowContext(ctx, `SELECT count(*) FROM samples `+where, args...).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: feed samples count: %w", err)
+	}
+	return n, nil
+}
+
+func (q *FeedQuery) whereSQLite() (string, []any) {
+	clauses := []string{"source = ?", "cleave_result IS NOT NULL"}
+	args := []any{q.Source}
+
+	if q.Label != "" {
+		clauses = append(clauses, "label = ?")
+		args = append(args, q.Label)
+	}
+
+	if len(q.Feeds) > 0 {
+		placeholders := make([]string, len(q.Feeds))
+		for i := range q.Feeds {
+			placeholders[i] = "?"
+			args = append(args, q.Feeds[i])
+		}
+		clauses = append(clauses, "feed IN ("+strings.Join(placeholders, ", ")+")")
+	}
+
+	if len(q.Ecosystems) > 0 {
+		placeholders := make([]string, len(q.Ecosystems))
+		for i := range q.Ecosystems {
+			placeholders[i] = "?"
+			args = append(args, q.Ecosystems[i])
+		}
+		clauses = append(clauses, "ecosystem IN ("+strings.Join(placeholders, ", ")+")")
+	}
+
+	return "WHERE " + strings.Join(clauses, " AND "), args
 }
 
 func (db *DB) feedSourcesSQLite(ctx context.Context, source, label string) ([]string, error) {
-	return nil, errors.New("hopper: FeedSources not implemented for SQLite")
+	query := `SELECT DISTINCT feed FROM samples WHERE source = ? AND (? = '' OR label = ?) AND feed != '' ORDER BY feed`
+	rows, err := db.lite.QueryContext(ctx, query, source, label, label)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: feed sources: %w", err)
+	}
+	return scanLiteStrings(rows)
 }
 
 func (db *DB) feedEcosystemsSQLite(ctx context.Context, source, label string) ([]string, error) {
-	return nil, errors.New("hopper: FeedEcosystems not implemented for SQLite")
+	query := `SELECT DISTINCT ecosystem FROM samples WHERE source = ? AND (? = '' OR label = ?) AND ecosystem != '' ORDER BY ecosystem`
+	rows, err := db.lite.QueryContext(ctx, query, source, label, label)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: feed ecosystems: %w", err)
+	}
+	return scanLiteStrings(rows)
+}
+
+func scanLiteStrings(rows *sql.Rows) ([]string, error) {
+	defer rows.Close() //nolint:errcheck // best-effort cleanup
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
 }
 
 func scanLiteCounts(rows *sql.Rows) (map[string]int, error) {

@@ -618,19 +618,163 @@ func TestInsertSampleNew(t *testing.T) {
 	}
 }
 
-func TestSamplesByEmbeddedSHA256_SQLiteError(t *testing.T) {
+func TestSamplesByEmbeddedSHA256(t *testing.T) {
 	db := openTestDB(t)
-	_, err := db.SamplesByEmbeddedSHA256(context.Background(), "abc", 10)
-	if err == nil {
-		t.Fatal("expected error on SQLite")
+	ctx := context.Background()
+
+	cleave := []byte(`{"files": [{"sha256": "embedded1", "formula": "H2O", "score": 10}, {"sha256": "embedded2", "formula": "O2", "score": 5}]}`)
+	s := &Sample{SHA256: "parent1", Source: "test", CleaveResult: cleave}
+	if _, err := db.InsertSampleNew(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpdateCleaveResult(ctx, s.SHA256, cleave, s.SHA256); err != nil {
+		t.Fatal(err)
+	}
+
+	samples, err := db.SamplesByEmbeddedSHA256(ctx, "embedded1", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 1 {
+		t.Errorf("expected 1 sample, got %d", len(samples))
+	} else if samples[0].SHA256 != "parent1" {
+		t.Errorf("expected parent1, got %s", samples[0].SHA256)
 	}
 }
 
-func TestRecomputeCanonicalSHA256_SQLiteError(t *testing.T) {
+func TestRecomputeCanonicalSHA256(t *testing.T) {
 	db := openTestDB(t)
-	_, err := db.RecomputeCanonicalSHA256(context.Background())
-	if err == nil {
-		t.Fatal("expected error on SQLite")
+	ctx := context.Background()
+
+	parent2 := "5123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	embedded2 := "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+	// embedded2 is smaller than parent2
+	cleave := []byte(`{"files": [{"sha256": "` + embedded2 + `", "formula": "H2O", "score": 10}]}`)
+	s := &Sample{SHA256: parent2, Source: "test", CleaveResult: cleave, CanonicalSHA256: parent2}
+	if _, err := db.InsertSampleNew(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+
+	// Manually set cleave_result and "wrong" canonical_sha256 since InsertSampleNew doesn't set cleave_result
+	// and UpdateCleaveResult would set the correct canonical.
+	if _, err := db.lite.ExecContext(ctx, "UPDATE samples SET cleave_result = ?, canonical_sha256 = ? WHERE sha256 = ?", string(cleave), parent2, parent2); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := db.RecomputeCanonicalSHA256(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 row updated, got %d", n)
+	}
+
+	s2, err := db.SampleBySHA256(ctx, parent2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s2.CanonicalSHA256 != embedded2 {
+		t.Errorf("expected canonical %s, got %s", embedded2, s2.CanonicalSHA256)
+	}
+}
+
+func TestFeedSamples(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	s1 := &Sample{SHA256: "s1", Source: "test", Feed: "feed1", Ecosystem: "eco1", Label: "bad"}
+	s2 := &Sample{SHA256: "s2", Source: "test", Feed: "feed2", Ecosystem: "eco2", Label: "bad"}
+	mustInsert(t, ctx, db, s1)
+	mustInsert(t, ctx, db, s2)
+
+	// Update with cleave result and analyzed_at
+	cleave := []byte("{}")
+	if err := db.UpdateCleaveResult(ctx, "s1", cleave, "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpdateCleaveResult(ctx, "s2", cleave, "s2"); err != nil {
+		t.Fatal(err)
+	}
+
+	q := FeedQuery{Source: "test", Limit: 10}
+	samples, err := db.FeedSamples(ctx, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 2 {
+		t.Fatalf("expected 2 samples, got %d", len(samples))
+	}
+
+	q.Feeds = []string{"feed1"}
+	samples, err = db.FeedSamples(ctx, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 1 || samples[0].SHA256 != "s1" {
+		t.Errorf("expected only s1, got %v", samples)
+	}
+
+	sources, err := db.FeedSources(ctx, "test", "bad")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 2 {
+		t.Errorf("expected 2 sources, got %v", sources)
+	}
+
+	ecos, err := db.FeedEcosystems(ctx, "test", "bad")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ecos) != 2 {
+		t.Errorf("expected 2 ecosystems, got %v", ecos)
+	}
+
+	count, err := db.FeedSamplesCount(ctx, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Errorf("expected count 1, got %d", count)
+	}
+
+	// Test default sort order (should be mtime)
+	t1 := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	t2 := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
+	s3 := &Sample{SHA256: "s3", Source: "test", Mtime: &t1}
+	s4 := &Sample{SHA256: "s4", Source: "test", Mtime: &t2}
+	mustInsert(t, ctx, db, s3)
+	mustInsert(t, ctx, db, s4)
+	cleave = []byte("{}")
+	if err := db.UpdateCleaveResult(ctx, "s3", cleave, "s3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpdateCleaveResult(ctx, "s4", cleave, "s4"); err != nil {
+		t.Fatal(err)
+	}
+
+	q = FeedQuery{Source: "test", Limit: 10}
+	samples, err = db.FeedSamples(ctx, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Filter out s1, s2 which might have nil mtime or default sorting
+	var sorted []string
+	for _, s := range samples {
+		if s.SHA256 == "s3" || s.SHA256 == "s4" {
+			sorted = append(sorted, s.SHA256)
+		}
+	}
+	if len(sorted) != 2 || sorted[0] != "s4" || sorted[1] != "s3" {
+		t.Errorf("expected [s4 s3] sorted by mtime (default), got %v", sorted)
+	}
+
+	// Explicit analyzed_at sort
+	q.OrderBy = "analyzed_at"
+	samples, err = db.FeedSamples(ctx, q)
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

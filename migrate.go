@@ -429,11 +429,11 @@ func eachSampleSQLite(ctx context.Context, db *DB, afterID int64, fn func(*Sampl
 	for rows.Next() {
 		s := &Sample{}
 		var cleaveResult, litmusResult, status sql.NullString
-		var analyzedAt sql.NullTime
+		var analyzedAt, mtime sql.NullTime
 		if err := rows.Scan(&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult,
 			&s.Path, &status, &s.Note, &s.CanonicalSHA256,
-			&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt); err != nil {
+			&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime); err != nil {
 			return fmt.Errorf("scan sample: %w", err)
 		}
 		if cleaveResult.Valid {
@@ -445,6 +445,9 @@ func eachSampleSQLite(ctx context.Context, db *DB, afterID int64, fn func(*Sampl
 		s.Status = status.String
 		if analyzedAt.Valid {
 			s.AnalyzedAt = &analyzedAt.Time
+		}
+		if mtime.Valid {
+			s.Mtime = &mtime.Time
 		}
 		if err := fn(s); err != nil {
 			return err
@@ -509,7 +512,7 @@ var sampleStagingCols = []string{
 	"size_bytes", "label", "label_source", "path", "status",
 	"note", "canonical_sha256", "parent", "skip", "formula", "elements", "score",
 	"cleave_result", "litmus_result",
-	"analyzed_at", "created_at", "updated_at",
+	"analyzed_at", "created_at", "updated_at", "mtime",
 }
 
 const sampleStagingDDL = `CREATE TEMP TABLE _staging (
@@ -518,15 +521,15 @@ const sampleStagingDDL = `CREATE TEMP TABLE _staging (
 	path TEXT, status TEXT, note TEXT, canonical_sha256 TEXT,
 	parent TEXT, skip TEXT, formula TEXT, elements TEXT, score INTEGER,
 	cleave_result JSONB, litmus_result JSONB,
-	analyzed_at TIMESTAMPTZ, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ
+	analyzed_at TIMESTAMPTZ, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, mtime TIMESTAMPTZ
 ) ON COMMIT DROP`
 
 const sampleStagingInsert = `INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, path, status, note, canonical_sha256,
-	parent, skip, formula, elements, score, cleave_result, litmus_result, analyzed_at, created_at, updated_at)
+	parent, skip, formula, elements, score, cleave_result, litmus_result, analyzed_at, created_at, updated_at, mtime)
 SELECT sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, path, status, note, canonical_sha256,
-	parent, skip, formula, elements, score, cleave_result, litmus_result, analyzed_at, created_at, updated_at
+	parent, skip, formula, elements, score, cleave_result, litmus_result, analyzed_at, created_at, updated_at, mtime
 FROM _staging
 ON CONFLICT (sha256) DO NOTHING`
 
@@ -538,7 +541,7 @@ func flushSamplesPG(ctx context.Context, dst *DB, samples []*Sample) (int64, err
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 			s.Note, s.CanonicalSHA256, s.Parent, s.Skip, s.Formula, s.Elements, s.Score,
 			sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult),
-			s.AnalyzedAt, s.CreatedAt, s.UpdatedAt,
+			s.AnalyzedAt, s.CreatedAt, s.UpdatedAt, s.Mtime,
 		}
 	}
 	return copyBatchPG(ctx, dst, sampleStagingDDL, sampleStagingInsert, sampleStagingCols, rows)
@@ -562,13 +565,13 @@ func flushSamplesSQLite(ctx context.Context, dst *DB, samples []*Sample) (int64,
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
 				size_bytes, label, label_source, path, status, note, canonical_sha256,
-				parent, skip, formula, elements, score, cleave_result, litmus_result, analyzed_at, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				parent, skip, formula, elements, score, cleave_result, litmus_result, analyzed_at, created_at, updated_at, mtime)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (sha256) DO NOTHING`,
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 			s.Note, s.CanonicalSHA256, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, cr, lr,
-			s.AnalyzedAt, s.CreatedAt, s.UpdatedAt)
+			s.AnalyzedAt, s.CreatedAt, s.UpdatedAt, s.Mtime)
 		if err != nil {
 			tx.Rollback() //nolint:errcheck,gosec // insert error
 			return inserted, fmt.Errorf("insert sample %s: %w", s.SHA256, err)
