@@ -61,7 +61,6 @@ const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score,
 	created_at, updated_at, analyzed_at, mtime`
 
-
 func pgSampleDest(s *Sample) []any {
 	return []any{
 		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
@@ -130,7 +129,7 @@ SELECT sha256, source, feed, ecosystem, filename, file_type,
 FROM _staging
 ON CONFLICT (sha256) DO NOTHING`
 
-func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (int64, []string, error) {
+func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inserted int64, needsAnalysis []string, err error) {
 	rows := make([][]any, len(samples))
 	for i, s := range samples {
 		rows[i] = []any{
@@ -157,7 +156,7 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (int64
 	if err != nil {
 		return 0, nil, fmt.Errorf("hopper: insert from staging: %w", err)
 	}
-	inserted := tag.RowsAffected()
+	inserted = tag.RowsAffected()
 
 	// Find SHAs that lack analysis results (including ones we just skipped).
 	query := `SELECT s.sha256 FROM samples s
@@ -169,7 +168,6 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (int64
 	}
 	defer queryRows.Close()
 
-	var needsAnalysis []string
 	for queryRows.Next() {
 		var sha string
 		if err := queryRows.Scan(&sha); err != nil {
@@ -184,6 +182,7 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (int64
 
 	return inserted, needsAnalysis, nil
 }
+
 func (db *DB) sampleBySHA256PG(ctx context.Context, sha256 string) (*Sample, error) {
 	s, err := scanPGSample(db.pool.QueryRow(ctx,
 		`SELECT `+pgSampleCols+` FROM samples WHERE sha256 = $1`, sha256))

@@ -374,7 +374,9 @@ func TestDeleteAll(t *testing.T) {
 
 	mustInsert(t, ctx, db, &Sample{SHA256: "d1", Source: "test", Label: "bad", LabelSource: "test"})
 	mustInsert(t, ctx, db, &Sample{SHA256: "d2", Source: "test", Label: "good", LabelSource: "test"})
-	db.InsertReport(ctx, &Report{SHA256: "d1", Type: "re", Content: "report"})
+	if err := db.InsertReport(ctx, &Report{SHA256: "d1", Type: "re", Content: "report"}); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := db.DeleteAll(ctx); err != nil {
 		t.Fatal(err)
@@ -401,7 +403,10 @@ func TestSetSkip(t *testing.T) {
 	if err := db.SetSkip(ctx, "sk1", "weak-findings"); err != nil {
 		t.Fatal(err)
 	}
-	got, _ := db.SampleBySHA256(ctx, "sk1")
+	got, err := db.SampleBySHA256(ctx, "sk1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got.Skip != "weak-findings" {
 		t.Errorf("Skip = %q, want %q", got.Skip, "weak-findings")
 	}
@@ -410,7 +415,10 @@ func TestSetSkip(t *testing.T) {
 	if err := db.SetSkip(ctx, "sk1", ""); err != nil {
 		t.Fatal(err)
 	}
-	got, _ = db.SampleBySHA256(ctx, "sk1")
+	got, err = db.SampleBySHA256(ctx, "sk1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got.Skip != "" {
 		t.Errorf("Skip = %q, want empty", got.Skip)
 	}
@@ -424,7 +432,10 @@ func TestSetNote(t *testing.T) {
 	if err := db.SetNote(ctx, "n1", "analysis timed out"); err != nil {
 		t.Fatal(err)
 	}
-	got, _ := db.SampleBySHA256(ctx, "n1")
+	got, err := db.SampleBySHA256(ctx, "n1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got.Note != "analysis timed out" {
 		t.Errorf("Note = %q, want %q", got.Note, "analysis timed out")
 	}
@@ -432,7 +443,10 @@ func TestSetNote(t *testing.T) {
 	if err := db.SetNote(ctx, "n1", ""); err != nil {
 		t.Fatal(err)
 	}
-	got, _ = db.SampleBySHA256(ctx, "n1")
+	got, err = db.SampleBySHA256(ctx, "n1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got.Note != "" {
 		t.Errorf("Note = %q, want empty", got.Note)
 	}
@@ -447,7 +461,7 @@ func TestInsertSampleBatch(t *testing.T) {
 		{SHA256: "b2", Source: "test", Label: "good", LabelSource: "test", SizeBytes: 200},
 		{SHA256: "b3", Source: "test", Label: "bad", LabelSource: "test", SizeBytes: 300},
 	}
-	n, needs, err := db.InsertSampleBatch(ctx, samples)
+	_, needs, err := db.InsertSampleBatch(ctx, samples)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -458,7 +472,7 @@ func TestInsertSampleBatch(t *testing.T) {
 	}
 
 	// Duplicate batch: should still return needs analysis if they haven't been analyzed.
-	n, needs, err = db.InsertSampleBatch(ctx, samples)
+	_, needs, err = db.InsertSampleBatch(ctx, samples)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -481,7 +495,7 @@ func TestInsertSampleBatch(t *testing.T) {
 	}
 
 	// Empty batch.
-	n, needs, err = db.InsertSampleBatch(ctx, nil)
+	n, needs, err := db.InsertSampleBatch(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -603,14 +617,18 @@ func TestCanonicalSHA(t *testing.T) {
 		{"invalid json", "ffff", "{bad", "ffff"},
 		{"no files", "ffff", `{"fs":[]}`, "ffff"},
 		{"self is min", "aaaa", `{"fs":[{"sha":"bbbb"}]}`, "aaaa"},
-		{"embedded is min",
+		{
+			"embedded is min",
 			"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
 			`{"fs":[{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}`,
-			"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-		{"short sha ignored",
+			"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		},
+		{
+			"short sha ignored",
 			"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
 			`{"fs":[{"sha":"short"}]}`,
-			"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"},
+			"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -797,7 +815,7 @@ func TestFeedSamples(t *testing.T) {
 
 	// Explicit analyzed_at sort
 	q.OrderBy = "analyzed_at"
-	samples, err = db.FeedSamples(ctx, q)
+	_, err = db.FeedSamples(ctx, q)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -863,7 +881,10 @@ func TestUpdateCleaveResultSetsFormulaAndScore(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, _ := db.SampleBySHA256(ctx, "fs1")
+	got, err := db.SampleBySHA256(ctx, "fs1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got.Formula != "O₃(C₂Er₂As)" {
 		t.Errorf("Formula = %q", got.Formula)
 	}

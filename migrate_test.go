@@ -259,7 +259,9 @@ func TestTransferSamples_WithReports(t *testing.T) {
 			SHA256: sha, Source: "test", Label: "bad", LabelSource: "test",
 			Path: fmt.Sprintf("/data/%s", sha), Status: "bad-review",
 		})
-		src.InsertReport(ctx, &Report{SHA256: sha, Type: "re", Content: "analysis", Provider: "claude"})
+		if err := src.InsertReport(ctx, &Report{SHA256: sha, Type: "re", Content: "analysis", Provider: "claude"}); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	samples, reports, err := TransferSamples(ctx, dst, src, 0, 0)

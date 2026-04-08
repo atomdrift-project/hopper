@@ -39,22 +39,86 @@ commands:
   stats           show sample counts
 `
 
+func writeStderrf(format string, args ...any) {
+	if _, err := fmt.Fprintf(os.Stderr, format, args...); err != nil {
+		slog.Debug("stderr write failed", "error", err)
+	}
+}
+
+func writeStdoutf(format string, args ...any) {
+	if _, err := fmt.Printf(format, args...); err != nil {
+		slog.Debug("stdout write failed", "error", err)
+	}
+}
+
+func writeStdout(s string) {
+	if _, err := fmt.Print(s); err != nil {
+		slog.Debug("stdout write failed", "error", err)
+	}
+}
+
+func writeStdoutLine(s string) {
+	if _, err := fmt.Println(s); err != nil {
+		slog.Debug("stdout write failed", "error", err)
+	}
+}
+
+func parseFlags(f *flag.FlagSet, args []string) {
+	if err := f.Parse(args); err != nil {
+		panic(err)
+	}
+}
+
+func closeFileBestEffort(name string, f *os.File) {
+	if f == nil {
+		return
+	}
+	if err := f.Close(); err != nil {
+		slog.Warn("close file failed", "path", name, "error", err)
+	}
+}
+
+func mkdirAllBestEffort(path string, perm os.FileMode) {
+	if err := os.MkdirAll(path, perm); err != nil {
+		slog.Warn("mkdir failed", "path", path, "error", err)
+	}
+}
+
+func killProcessBestEffort(reason string, proc *os.Process) {
+	if proc == nil {
+		return
+	}
+	if err := proc.Kill(); err != nil {
+		slog.Warn(reason, "error", err)
+	}
+}
+
+func waitCmdBestEffort(reason string, cmd *exec.Cmd) {
+	if cmd == nil {
+		return
+	}
+	if err := cmd.Wait(); err != nil {
+		slog.Debug(reason, "error", err)
+	}
+}
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprint(os.Stderr, usageText)
+		writeStderrf("%s", usageText)
 		os.Exit(1)
 	}
 
 	cleanup, err := setupLogging()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to setup logging: %v\n", err)
-	} else {
-		defer cleanup()
+		writeStderrf("failed to setup logging: %v\n", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	err = run(ctx)
 	stop()
+	if cleanup != nil {
+		cleanup()
+	}
 	if err != nil {
 		slog.Error(err.Error())
 		os.Exit(1)
@@ -76,7 +140,7 @@ func run(ctx context.Context) error {
 	case "stats":
 		return cmdStats(ctx)
 	default:
-		fmt.Fprint(os.Stderr, usageText)
+		writeStderrf("%s", usageText)
 		return errors.New("unknown command: " + os.Args[1])
 	}
 }
@@ -91,6 +155,7 @@ func xdgLogDir() string {
 		if appdata := os.Getenv("LOCALAPPDATA"); appdata != "" {
 			return filepath.Join(appdata, "hopper", "Logs")
 		}
+	default:
 	}
 	// Default to XDG_STATE_HOME on Linux/Unix.
 	if s := os.Getenv("XDG_STATE_HOME"); s != "" {
@@ -104,12 +169,12 @@ func xdgLogDir() string {
 
 func setupLogging() (func(), error) {
 	dir := xdgLogDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, err
 	}
 
 	logPath := filepath.Join(dir, "hopper.log")
-	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +187,7 @@ func setupLogging() (func(), error) {
 	}
 	slog.SetDefault(slog.New(h))
 
-	return func() { f.Close() }, nil
+	return func() { closeFileBestEffort(logPath, f) }, nil
 }
 
 type multiHandler struct {
@@ -132,7 +197,8 @@ type multiHandler struct {
 func (m *multiHandler) Enabled(ctx context.Context, l slog.Level) bool {
 	return m.h1.Enabled(ctx, l) || m.h2.Enabled(ctx, l)
 }
-func (m *multiHandler) Handle(ctx context.Context, r slog.Record) error {
+
+func (m *multiHandler) Handle(ctx context.Context, r slog.Record) error { //nolint:gocritic // matches slog.Handler interface
 	err1 := m.h1.Handle(ctx, r)
 	err2 := m.h2.Handle(ctx, r)
 	if err1 != nil {
@@ -140,9 +206,11 @@ func (m *multiHandler) Handle(ctx context.Context, r slog.Record) error {
 	}
 	return err2
 }
+
 func (m *multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return &multiHandler{h1: m.h1.WithAttrs(attrs), h2: m.h2.WithAttrs(attrs)}
 }
+
 func (m *multiHandler) WithGroup(name string) slog.Handler {
 	return &multiHandler{h1: m.h1.WithGroup(name), h2: m.h2.WithGroup(name)}
 }
@@ -176,7 +244,7 @@ func cmdServe(ctx context.Context) error {
 	f := flag.NewFlagSet("serve", flag.ExitOnError)
 	dir := f.String("dir", filepath.Join(home, ".hopper"), "data directory")
 	port := f.Int("port", 5433, "listen port")
-	f.Parse(os.Args[2:]) //nolint:errcheck,gosec // ExitOnError handles parse errors
+	parseFlags(f, os.Args[2:])
 
 	pgdata := filepath.Join(*dir, "pgdata")
 	p := strconv.Itoa(*port)
@@ -214,12 +282,15 @@ func cmdServe(ctx context.Context) error {
 		time.Sleep(500 * time.Millisecond)
 	}
 	if !ready {
-		pg.Process.Kill() //nolint:errcheck,gosec // best-effort kill before exit
+		killProcessBestEffort("failed to kill postgres after readiness timeout", pg.Process)
 		return errors.New("postgres did not become ready within 15s")
 	}
 
 	// Create database (ignore "already exists" error).
-	exec.CommandContext(ctx, "createdb", "-p", p, "-h", "localhost", "hopper").Run() //nolint:errcheck,gosec // ignore "already exists"
+	createdb := exec.CommandContext(ctx, "createdb", "-p", p, "-h", "localhost", "hopper")
+	if err := createdb.Run(); err != nil {
+		slog.Debug("createdb returned non-fatal error", "error", err)
+	}
 
 	// Run migrations.
 	dsn := fmt.Sprintf("postgres://localhost:%s/hopper", p)
@@ -235,14 +306,14 @@ func cmdServe(ctx context.Context) error {
 
 	slog.Info("hopper ready", "dsn", dsn)
 
-	pg.Wait() //nolint:errcheck,gosec // exit status not relevant
+	waitCmdBestEffort("postgres exited", pg)
 	return nil
 }
 
 func cmdInit(ctx context.Context) error {
 	f := flag.NewFlagSet("init", flag.ExitOnError)
 	dsn := f.String("db", "", "database (postgres:// DSN or sqlite file path)")
-	f.Parse(os.Args[2:]) //nolint:errcheck,gosec // ExitOnError handles parse errors
+	parseFlags(f, os.Args[2:])
 
 	db, err := openDB(ctx, *dsn)
 	if err != nil {
@@ -262,7 +333,7 @@ func cmdImport(ctx context.Context) error {
 	srcDSN := f.String("from", "", "source database")
 	afterSample := f.Int64("after", 0, "resume after this source sample ID (from progress logs)")
 	afterReport := f.Int64("after-report", 0, "resume after this source report ID (from progress logs)")
-	f.Parse(os.Args[2:]) //nolint:errcheck,gosec // ExitOnError handles parse errors
+	parseFlags(f, os.Args[2:])
 
 	if *srcDSN == "" {
 		return errors.New("pass --from (source database)")
@@ -297,7 +368,7 @@ func cmdImport(ctx context.Context) error {
 func cmdReset(ctx context.Context) error {
 	f := flag.NewFlagSet("reset", flag.ExitOnError)
 	dsn := f.String("db", "", "database (postgres:// DSN or sqlite file path)")
-	f.Parse(os.Args[2:]) //nolint:errcheck,gosec // ExitOnError handles parse errors
+	parseFlags(f, os.Args[2:])
 
 	db, err := openDB(ctx, *dsn)
 	if err != nil {
@@ -328,7 +399,7 @@ func cmdLoad(ctx context.Context) error {
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
 	experimentTag := f.String("experiment-tag", "", "label for experiment comparison")
 	litmusVerbose := f.Bool("litmus-verbose", false, "enable debug logging in litmus server")
-	f.Parse(os.Args[2:]) //nolint:errcheck,gosec // ExitOnError handles parse errors
+	parseFlags(f, os.Args[2:])
 
 	if *dataDir == "" {
 		return errors.New("pass --data <directory> (expects bad/, good/, unknown/ subdirectories)")
@@ -359,12 +430,12 @@ func cmdLoad(ctx context.Context) error {
 			home = "."
 		}
 		cacheDir := filepath.Join(home, ".hopper")
-		os.MkdirAll(cacheDir, 0o755) //nolint:errcheck,gosec // best-effort
-		cache, err = openHashCache(filepath.Join(cacheDir, "hashcache.db"))
+		mkdirAllBestEffort(cacheDir, 0o755)
+		cache, err = openHashCache(ctx, filepath.Join(cacheDir, "hashcache.db"))
 		if err != nil {
 			slog.Warn("hash cache unavailable, continuing without cache", "error", err)
 		} else {
-			defer cache.close()
+			defer cache.close(ctx)
 		}
 	}
 
@@ -372,7 +443,14 @@ func cmdLoad(ctx context.Context) error {
 	for _, d := range loadDirs {
 		dirNames = append(dirNames, d.label)
 	}
-	slog.Info("load starting", "data", *dataDir, "labels", dirNames, "workers", *workers, "rescan", *rescan, "cache", cache != nil, "max_analyzed", *maxAnalyzed, "experiment", *experimentTag)
+	slog.Info("load starting",
+		"data", *dataDir,
+		"labels", dirNames,
+		"workers", *workers,
+		"rescan", *rescan,
+		"cache", cache != nil,
+		"max_analyzed", *maxAnalyzed,
+		"experiment", *experimentTag)
 	db, err := openDB(ctx, *dsn)
 	if err != nil {
 		return err
@@ -438,7 +516,7 @@ type hashedFile struct {
 }
 
 // loadProgress tracks counters across concurrent load workers.
-type loadProgress struct {
+type loadProgress struct { //nolint:govet // counters are grouped by pipeline stage for maintenance.
 	walked     atomic.Int64
 	hashed     atomic.Int64
 	inserted   atomic.Int64
@@ -473,6 +551,7 @@ var (
 	errTooLarge = errors.New("too large")
 )
 
+//nolint:gocognit,revive,maintidx // coordinates the end-to-end load pipeline in one place.
 func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litmus *litmusServer, cache *hashCache, dirs []struct{ dir, label string }, source string, nworkers int, rescan bool, maxAnalyzed int, experimentTag string, shared *loadProgress) int {
 	slog.Info("loading", "dirs", len(dirs), "workers", nworkers)
 	start := time.Now()
@@ -530,11 +609,11 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 
 				if isTTY() {
 					// Build progress bars
-					fmt.Print("\033[H\033[2J") // Clear screen, home cursor
-					fmt.Printf("\033[1mHopper Loading Dashboard\033[0m (%s)\n", time.Since(start).Round(time.Second))
-					fmt.Println(strings.Repeat("─", 60))
+					writeStdout("\033[H\033[2J")
+					writeStdoutf("\033[1mHopper Loading Dashboard\033[0m (%s)\n", time.Since(start).Round(time.Second))
+					writeStdoutLine(strings.Repeat("─", 60))
 
-					drawBar("Hashing  ", hashDone, walked, "", "\033[34m")   // Blue
+					drawBar("Hashing  ", hashDone, walked, "", "\033[34m")          // Blue
 					drawBar("Insertion", inserted+skipped, hashedN, "", "\033[32m") // Green
 
 					var analyzeInfo string
@@ -554,24 +633,25 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 					// Show analysis bar out of what's already inserted, but info shows overall ETA
 					drawBar("Analysis ", analyzed, analyzeTarget, analyzeInfo, "\033[33m") // Yellow
 
-					fmt.Println(strings.Repeat("─", 60))
+					writeStdoutLine(strings.Repeat("─", 60))
 					if last, ok := progress.lastErr.Load().(string); ok && last != "" {
-						fmt.Printf("\033[31mRecent Error:\033[0m %s\n", last)
-						fmt.Println(strings.Repeat("─", 60))
+						writeStdoutf("\033[31mRecent Error:\033[0m %s\n", last)
+						writeStdoutLine(strings.Repeat("─", 60))
 					}
 
 					if litmus != nil {
-						busy, idle, oldestMs, oldestFile := litmus.workerSummary()
-						fmt.Printf("Litmus: %d busy, %d idle | oldest: %s (%s)\n", 
-							busy, idle, oldestFile, (time.Duration(oldestMs)*time.Millisecond).Round(time.Second))
+						summary := litmus.workerSummary()
+						writeStdoutf("Litmus: %d busy, %d idle | oldest: %s (%s)\n",
+							summary.Busy, summary.Idle, summary.OldestFile,
+							(time.Duration(summary.OldestMS) * time.Millisecond).Round(time.Second))
 
 						health := litmus.pollHealth(ctx)
 						if health != nil {
-							fmt.Printf("Health: %.2f load, %d MB RSS, %d active tasks\n", 
+							writeStdoutf("Health: %.2f load, %d MB RSS, %d active tasks\n",
 								health.Load, health.RSSMB, health.ActiveTasks)
 						}
 					}
-					fmt.Printf("Errors: %d | Walked: %d | Cache Hits: %d\n", 
+					writeStdoutf("Errors: %d | Walked: %d | Cache Hits: %d\n",
 						progress.errors.Load(), walked, progress.cacheHits.Load())
 				} else {
 					// Fallback to slog for non-TTY
@@ -603,7 +683,7 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 					return
 				}
 
-				sample, err := hashFile(lp.path, lp.label, source, cache, &progress)
+				sample, err := hashFile(ctx, lp.path, lp.label, source, cache, &progress)
 				if err != nil {
 					switch {
 					case errors.Is(err, errTooSmall):
@@ -645,7 +725,6 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 
 	// Pending analysis: large buffer so hashing can proceed even if analysis is slow.
 	pendingAnalysis := make(chan loadJob, 2_000_000)
-
 
 	// Batch inserter: collects hashed files and flushes in batches.
 	var insertWG sync.WaitGroup
@@ -729,7 +808,6 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 						return
 					}
 				}
-
 			}
 			batch = batch[:0]
 		}
@@ -815,7 +893,19 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 	return int(progress.inserted.Load() + progress.skipped.Load())
 }
 
-func startAnalysisWorkers(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litmus *litmusServer, queue chan loadJob, wg *sync.WaitGroup, progress *loadProgress, shared *loadProgress, nworkers int, maxAnalyzed int) {
+//nolint:revive // config is split across explicit parameters to keep call sites direct.
+func startAnalysisWorkers(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	db *hopper.DB,
+	litmus *litmusServer,
+	queue chan loadJob,
+	wg *sync.WaitGroup,
+	progress *loadProgress,
+	shared *loadProgress,
+	nworkers int,
+	maxAnalyzed int,
+) {
 	for workerID := range nworkers {
 		wg.Go(func() {
 			for job := range queue {
@@ -937,7 +1027,7 @@ func walkAndShuffle(ctx context.Context, dirs []struct{ dir, label string }, pat
 	var all []labeledPath
 	for _, d := range dirs {
 		slog.Info("walking directory", "dir", d.dir, "label", d.label)
-		filepath.WalkDir(d.dir, func(path string, entry fs.DirEntry, err error) error { //nolint:errcheck,gosec
+		if err := filepath.WalkDir(d.dir, func(path string, entry fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
@@ -952,7 +1042,9 @@ func walkAndShuffle(ctx context.Context, dirs []struct{ dir, label string }, pat
 			}
 			all = append(all, labeledPath{path: path, label: d.label})
 			return nil
-		})
+		}); err != nil {
+			slog.Warn("walk directory failed", "dir", d.dir, "error", err)
+		}
 	}
 
 	// Shuffle for even progress across directories and ecosystems.
@@ -971,7 +1063,7 @@ func walkAndShuffle(ctx context.Context, dirs []struct{ dir, label string }, pat
 	}
 }
 
-func hashFile(path, label, source string, cache *hashCache, progress *loadProgress) (*hopper.Sample, error) {
+func hashFile(ctx context.Context, path, label, source string, cache *hashCache, progress *loadProgress) (*hopper.Sample, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -995,7 +1087,9 @@ func hashFile(path, label, source string, cache *hashCache, progress *loadProgre
 	// Check hash cache before reading file contents.
 	if cache != nil {
 		if cached, ok := cache.lookup(dev, inode, info.Size(), info.ModTime()); ok {
-			progress.cacheHits.Add(1)
+			if progress != nil {
+				progress.cacheHits.Add(1)
+			}
 			return &hopper.Sample{
 				SHA256:      cached,
 				Source:      source,
@@ -1016,7 +1110,7 @@ func hashFile(path, label, source string, cache *hashCache, progress *loadProgre
 	digest := hex.EncodeToString(h.Sum(nil))
 
 	if cache != nil {
-		cache.store(dev, inode, info.Size(), info.ModTime(), digest)
+		cache.store(ctx, dev, inode, info.Size(), info.ModTime(), digest)
 	}
 
 	s := &hopper.Sample{
@@ -1036,8 +1130,10 @@ func hashFile(path, label, source string, cache *hashCache, progress *loadProgre
 // a "harvest" directory component is present.
 //
 // Known-bad:  .../harvest/<feed>/<ecosystem>/file → feed + ecosystem
-//             .../harvest/<feed>/file             → feed only
-// Known-good: .../harvest/<ecosystem>/file        → ecosystem only
+//
+//	.../harvest/<feed>/file             → feed only
+//
+// Known-good: .../harvest/<ecosystem>/file        → ecosystem only.
 func extractFeedEcosystem(path, label string) (feed, ecosystem string) {
 	parts := strings.Split(filepath.ToSlash(path), "/")
 	idx := -1
@@ -1073,7 +1169,7 @@ func extractFeedEcosystem(path, label string) (feed, ecosystem string) {
 func cmdStats(ctx context.Context) error {
 	f := flag.NewFlagSet("stats", flag.ExitOnError)
 	dsn := f.String("db", "", "postgres connection string")
-	f.Parse(os.Args[2:]) //nolint:errcheck,gosec // ExitOnError handles parse errors
+	parseFlags(f, os.Args[2:])
 
 	db, err := openDB(ctx, *dsn)
 	if err != nil {
@@ -1087,15 +1183,18 @@ func cmdStats(ctx context.Context) error {
 	}
 	var total int
 	for label, n := range counts {
-		fmt.Printf("%-10s %d\n", label, n)
+		writeStdoutf("%-10s %d\n", label, n)
 		total += n
 	}
-	fmt.Printf("%-10s %d\n", "total", total)
+	writeStdoutf("%-10s %d\n", "total", total)
 	return nil
 }
 
 func isTTY() bool {
-	fileInfo, _ := os.Stdout.Stat()
+	fileInfo, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
 	return (fileInfo.Mode() & os.ModeCharDevice) != 0
 }
 
@@ -1108,10 +1207,7 @@ func drawBar(label string, current, total int64, info string, color string) {
 	if pct > 1.0 {
 		pct = 1.0
 	}
-	filled := int(float64(width) * pct)
-	if filled < 0 {
-		filled = 0
-	}
+	filled := max(int(float64(width)*pct), 0)
 	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
-	fmt.Printf("%s%s\033[0m [%s] %3.0f%% (%d/%d) %s\n", color, label, bar, pct*100, current, total, info)
+	writeStdoutf("%s%s\033[0m [%s] %3.0f%% (%d/%d) %s\n", color, label, bar, pct*100, current, total, info)
 }

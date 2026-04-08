@@ -21,8 +21,10 @@ import (
 	"github.com/codeGROOVE-dev/retry"
 )
 
+const restartRecoveryDelay = 15 * time.Second
+
 // litmusServer manages a litmus API server subprocess.
-type litmusServer struct {
+type litmusServer struct { //nolint:govet // field order is chosen for readability over padding minimization.
 	client      *http.Client
 	cmd         *exec.Cmd
 	bin         string // path to litmus binary
@@ -35,14 +37,22 @@ type litmusServer struct {
 	timeoutSecs int
 	verbose     bool
 	stopped     atomic.Bool
+	pid         atomic.Int64
 
 	// inFlight tracks what each hopper analysis worker is currently doing.
 	inFlight sync.Map // worker ID (int) → *workerState
 }
 
-type workerState struct {
+type workerState struct { //nolint:govet // tiny runtime-only struct; readability wins here.
 	File      string
 	StartedAt time.Time
+}
+
+type workerSnapshot struct { //nolint:govet // compact summary struct; layout is not performance-critical.
+	Busy       int
+	Idle       int
+	OldestMS   int64
+	OldestFile string
 }
 
 // litmusConfig holds options for starting a litmus server.
@@ -54,6 +64,7 @@ type litmusConfig struct {
 	TimeoutSecs int      // per-request analysis timeout (0 = litmus default: 600s)
 	Verbose     bool     // enable debug logging in litmus
 }
+
 func newLitmusServer(cfg litmusConfig) *litmusServer {
 	if cfg.Bin == "" {
 		cfg.Bin = "litmus"
@@ -74,6 +85,47 @@ func newLitmusServer(cfg litmusConfig) *litmusServer {
 			Timeout: time.Duration(cfg.TimeoutSecs+60) * time.Second,
 		},
 	}
+}
+
+func closeLogFile(name string, f *os.File) {
+	if f == nil {
+		return
+	}
+	if err := f.Close(); err != nil {
+		//nolint:gosec // value is sanitized before logging; this is a false positive on slog taint flow.
+		slog.Warn("failed to close litmus log file", "log", sanitizeLogString(name), "error", err)
+	}
+}
+
+func sanitizeLogString(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < ' ' && r != '\t' {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+func killProcess(reason string, proc *os.Process, attrs ...any) {
+	if proc == nil {
+		return
+	}
+	if err := proc.Kill(); err != nil {
+		slog.Warn(reason, append(attrs, "error", err)...)
+	}
+}
+
+func waitCommand(reason string, cmd *exec.Cmd, attrs ...any) {
+	if cmd == nil {
+		return
+	}
+	if err := cmd.Wait(); err != nil {
+		slog.Debug(reason, append(attrs, "error", err)...)
+	}
+}
+
+func (s *litmusServer) currentPID() int {
+	return int(s.pid.Load())
 }
 
 // Start launches the litmus server and waits for it to become healthy.
@@ -137,7 +189,9 @@ func updateLitmus(ctx context.Context) {
 
 func (s *litmusServer) startLocked(ctx context.Context, l net.Listener) error {
 	if l != nil {
-		l.Close()
+		if err := l.Close(); err != nil {
+			slog.Warn("failed to close probe listener", "error", err)
+		}
 	}
 	bind := "127.0.0.1:" + s.port
 
@@ -158,7 +212,9 @@ func (s *litmusServer) startLocked(ctx context.Context, l net.Listener) error {
 	cmd := exec.CommandContext(ctx, s.bin, args...) //nolint:gosec // bin path is from trusted CLI flag
 
 	logDir := xdgLogDir()
-	_ = os.MkdirAll(logDir, 0o755) // best-effort
+	if err := os.MkdirAll(logDir, 0o750); err != nil {
+		return fmt.Errorf("create litmus log directory: %w", err)
+	}
 
 	logFile, err := os.CreateTemp(logDir, "litmus-*.log")
 	if err != nil {
@@ -169,21 +225,35 @@ func (s *litmusServer) startLocked(ctx context.Context, l net.Listener) error {
 	cmd.Stderr = logFile
 
 	if err := cmd.Start(); err != nil {
-		logFile.Close() //nolint:errcheck
+		closeLogFile(logFile.Name(), logFile)
 		return fmt.Errorf("start litmus: %w", err)
 	}
 	s.cmd = cmd
+	s.pid.Store(int64(cmd.Process.Pid))
 
-	slog.Info("starting litmus server", "bind", bind, "pid", cmd.Process.Pid, "log", logFile.Name())
+	//nolint:gosec // values are sanitized or derived locally; this is a false positive on structured slog fields.
+	slog.Info("starting litmus server",
+		"bind", bind,
+		"pid", cmd.Process.Pid,
+		"log", sanitizeLogString(logFile.Name()),
+		"args", sanitizeLogString(strings.Join(args, " ")))
 
 	if err := s.waitHealthy(ctx); err != nil {
-		cmd.Process.Kill() //nolint:errcheck,gosec // best-effort kill
-		cmd.Wait()         // cleanup zombie
+		//nolint:gosec // values are sanitized or derived locally; this is a false positive on structured slog fields.
+		slog.Error("litmus server failed readiness check",
+			"pid", cmd.Process.Pid,
+			"bind", bind,
+			"error", err,
+			"log", sanitizeLogString(logFile.Name()))
+		killProcess("failed to kill unready litmus server", cmd.Process, "pid", cmd.Process.Pid)
+		waitCommand("litmus exited after readiness failure", cmd, "pid", cmd.Process.Pid)
+		closeLogFile(logFile.Name(), logFile)
 		s.cmd = nil
+		s.pid.Store(0)
 		return fmt.Errorf("litmus not healthy: %w", err)
 	}
 
-	slog.Info("litmus server ready", "url", s.url)
+	slog.Info("litmus server ready", "url", s.url, "pid", cmd.Process.Pid)
 	return nil
 }
 
@@ -193,31 +263,39 @@ func (s *litmusServer) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.cmd != nil && s.cmd.Process != nil {
-		s.cmd.Process.Kill() //nolint:errcheck,gosec // best-effort kill
-		s.cmd.Wait()         //nolint:errcheck,gosec // collecting zombie
+		slog.Info("stopping litmus server", "pid", s.cmd.Process.Pid, "url", s.url)
+		killProcess("failed to kill litmus server during stop", s.cmd.Process, "pid", s.cmd.Process.Pid)
+		waitCommand("litmus exited during stop", s.cmd, "pid", s.cmd.Process.Pid)
 		s.cmd = nil
+		s.pid.Store(0)
 		slog.Info("litmus server stopped")
 	}
 }
 
 // Monitor watches the litmus process and restarts it on crash.
-// Blocks until ctx is cancelled, Stop is called, or restart limit (10) is exceeded.
+// Blocks until ctx is cancelled or Stop is called.
 func (s *litmusServer) Monitor(ctx context.Context) error {
-	const maxRestarts = 10
 	restarts := 0
 	for {
+		pid := s.currentPID()
 		err := s.waitExit(ctx)
+		s.pid.Store(0)
 		if ctx.Err() != nil || s.stopped.Load() {
 			return ctx.Err()
 		}
 		restarts++
-		slog.Warn("litmus server crashed", "error", err, "restarts", restarts)
-		if restarts > maxRestarts {
-			return fmt.Errorf("litmus crashed %d times, giving up", restarts)
-		}
+		slog.Warn("litmus server crashed",
+			"pid", pid,
+			"url", s.url,
+			"error", err,
+			"restarts", restarts)
 
 		delay := time.Duration(1<<min(restarts-1, 4)) * time.Second
-		slog.Info("restarting litmus server", "delay", delay)
+		slog.Info("restarting litmus server",
+			"previous_pid", pid,
+			"url", s.url,
+			"delay", delay,
+			"attempt", restarts)
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
@@ -232,13 +310,30 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 		err = s.startLocked(ctx, nil)
 		s.mu.Unlock()
 		if err != nil {
-			slog.Error("failed to restart litmus", "error", err)
+			slog.Error("failed to restart litmus",
+				"previous_pid", pid,
+				"url", s.url,
+				"attempt", restarts,
+				"next_delay", time.Duration(1<<min(restarts, 4))*time.Second,
+				"error", err)
 			continue
 		}
-		slog.Info("litmus server restarted", "restarts", restarts)
+		slog.Info("litmus restart waiting for recovery window",
+			"pid", s.currentPID(),
+			"url", s.url,
+			"delay", restartRecoveryDelay,
+			"attempt", restarts)
+		select {
+		case <-time.After(restartRecoveryDelay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		slog.Info("litmus server restarted",
+			"restarts", restarts,
+			"pid", s.currentPID(),
+			"url", s.url)
 	}
 }
-
 
 func (s *litmusServer) waitExit(ctx context.Context) error {
 	if s.cmd == nil {
@@ -274,7 +369,9 @@ func (s *litmusServer) waitHealthy(ctx context.Context) error {
 			if err != nil {
 				continue
 			}
-			resp.Body.Close() //nolint:errcheck,gosec // health check
+			if err := resp.Body.Close(); err != nil {
+				slog.Debug("close litmus health body", "error", err)
+			}
 			if resp.StatusCode == http.StatusOK {
 				return nil
 			}
@@ -292,21 +389,27 @@ func (s *litmusServer) TrackWorker(workerID int, file string) {
 }
 
 // workerSummary returns counts and the oldest in-flight file for logging.
-func (s *litmusServer) workerSummary() (busy, idle int, oldestMs int64, oldestFile string) {
+func (s *litmusServer) workerSummary() workerSnapshot {
 	now := time.Now()
-	total := s.maxWorkers
+	summary := workerSnapshot{Idle: s.maxWorkers}
 	s.inFlight.Range(func(_, v any) bool {
-		ws := v.(*workerState)
-		busy++
+		ws, ok := v.(*workerState)
+		if !ok {
+			return true
+		}
+		summary.Busy++
 		elapsed := now.Sub(ws.StartedAt).Milliseconds()
-		if elapsed > oldestMs {
-			oldestMs = elapsed
-			oldestFile = ws.File
+		if elapsed > summary.OldestMS {
+			summary.OldestMS = elapsed
+			summary.OldestFile = ws.File
 		}
 		return true
 	})
-	idle = total - busy
-	return
+	summary.Idle -= summary.Busy
+	if summary.Idle < 0 {
+		summary.Idle = 0
+	}
+	return summary
 }
 
 // WatchHealth periodically polls litmus /_/health and /_/requests, logs the
@@ -339,10 +442,14 @@ func (s *litmusServer) WatchHealth(ctx context.Context) {
 		if health == nil {
 			healthFailures++
 			if healthFailures >= 3 {
-				slog.Error("litmus health check failed repeatedly, killing to force restart", "failures", healthFailures)
+				pid := s.currentPID()
+				slog.Error("litmus health check failed repeatedly, killing to force restart",
+					"failures", healthFailures,
+					"pid", pid,
+					"url", s.url)
 				s.mu.Lock()
 				if s.cmd != nil && s.cmd.Process != nil {
-					s.cmd.Process.Kill() //nolint:errcheck,gosec // Monitor will restart
+					killProcess("failed to kill unhealthy litmus server", s.cmd.Process, "pid", s.cmd.Process.Pid)
 				}
 				s.mu.Unlock()
 				healthFailures = 0
@@ -351,10 +458,10 @@ func (s *litmusServer) WatchHealth(ctx context.Context) {
 		}
 		healthFailures = 0
 
-		busy, idle, workerOldestMs, workerOldestFile := s.workerSummary()
+		summary := s.workerSummary()
 
 		level := slog.LevelDebug
-		if !isStdoutTTY() && (health.ActiveTasks > 0 || busy > 0) {
+		if !isStdoutTTY() && (health.ActiveTasks > 0 || summary.Busy > 0) {
 			level = slog.LevelInfo
 		}
 		slog.Default().Log(ctx, level, "litmus health",
@@ -366,28 +473,34 @@ func (s *litmusServer) WatchHealth(ctx context.Context) {
 			"rss_mb", health.RSSMB,
 			"litmus_oldest_ms", health.OldestRequestMs,
 			"litmus_oldest_name", health.OldestRequestName,
-			"hopper_busy", busy,
-			"hopper_idle", idle,
-			"hopper_oldest_ms", workerOldestMs,
-			"hopper_oldest_file", workerOldestFile,
+			"hopper_busy", summary.Busy,
+			"hopper_idle", summary.Idle,
+			"hopper_oldest_ms", summary.OldestMS,
+			"hopper_oldest_file", summary.OldestFile,
 		)
 
 		if health.OldestRequestMs > killThreshold.Milliseconds() {
+			pid := s.currentPID()
 			slog.Error("litmus has stuck request, killing to force restart",
 				"oldest_request_ms", health.OldestRequestMs,
 				"oldest_request_name", health.OldestRequestName,
 				"kill_threshold_ms", killThreshold.Milliseconds(),
+				"pid", pid,
+				"url", s.url,
+				"hopper_busy", summary.Busy,
+				"hopper_idle", summary.Idle,
+				"hopper_oldest_file", summary.OldestFile,
 			)
 			s.mu.Lock()
 			if s.cmd != nil && s.cmd.Process != nil {
-				s.cmd.Process.Kill() //nolint:errcheck,gosec // Monitor will restart
+				killProcess("failed to kill stuck litmus server", s.cmd.Process, "pid", s.cmd.Process.Pid)
 			}
 			s.mu.Unlock()
 		}
 	}
 }
 
-type litmusHealth struct {
+type litmusHealth struct { //nolint:govet // JSON field grouping is clearer than padding order.
 	ActiveTasks       int     `json:"active_tasks"`
 	LiveTasks         int     `json:"live_tasks"`
 	OrphanedTasks     int     `json:"orphaned_tasks"`
@@ -404,12 +517,20 @@ func (s *litmusServer) pollHealth(ctx context.Context) *litmusHealth {
 	if err != nil {
 		return nil
 	}
-	resp, err := s.client.Do(req)
+	resp, err := s.client.Do(req) //nolint:gosec // localhost only
 	if err != nil {
 		return nil
 	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	resp.Body.Close() //nolint:errcheck
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			slog.Debug("close litmus health response after read failure", "error", closeErr)
+		}
+		return nil
+	}
+	if err := resp.Body.Close(); err != nil {
+		slog.Debug("close litmus health response", "error", err)
+	}
 
 	var h litmusHealth
 	if json.Unmarshal(body, &h) != nil {
@@ -421,12 +542,20 @@ func (s *litmusServer) pollHealth(ctx context.Context) *litmusHealth {
 	if err != nil {
 		return &h
 	}
-	resp, err = s.client.Do(req)
+	resp, err = s.client.Do(req) //nolint:gosec // localhost only
 	if err != nil {
 		return &h
 	}
-	body, _ = io.ReadAll(io.LimitReader(resp.Body, 32768))
-	resp.Body.Close() //nolint:errcheck
+	body, err = io.ReadAll(io.LimitReader(resp.Body, 32768))
+	if err != nil {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			slog.Debug("close litmus requests response after read failure", "error", closeErr)
+		}
+		return &h
+	}
+	if err := resp.Body.Close(); err != nil {
+		slog.Debug("close litmus requests response", "error", err)
+	}
 
 	var reqList struct {
 		Requests []struct {
@@ -444,7 +573,7 @@ func (s *litmusServer) pollHealth(ctx context.Context) *litmusHealth {
 }
 
 // analyzeResult holds the split litmus response for storage in hopper.
-type analyzeResult struct {
+type analyzeResult struct { //nolint:govet // result fields are grouped by meaning for call sites.
 	ML        json.RawMessage // ml section → litmus_result column
 	Raw       json.RawMessage // raw section → cleave_result column
 	Canonical string          // canonical SHA256 from raw.fs[]
@@ -471,14 +600,18 @@ func (s *litmusServer) Analyze(ctx context.Context, sha256, path string) (*analy
 		retry.Attempts(12),
 		retry.Context(ctx),
 		retry.Delay(2*time.Second),
-		retry.MaxDelay(30*time.Second),
+		retry.MaxDelay(2*time.Minute),
 		retry.DelayType(retry.CombineDelay(retry.BackOffDelay, retry.RandomDelay)),
 		retry.MaxJitter(3*time.Second),
 		retry.RetryIf(func(err error) bool {
 			return errors.Is(err, errRetryable) || isRetryableNetError(err)
 		}),
 		retry.OnRetry(func(attempt uint, _ error) {
-			slog.Debug("litmus at capacity, retrying", "path", path, "attempt", attempt+1)
+			slog.Debug("litmus analyze retrying",
+				"path", path,
+				"url", s.url,
+				"pid", s.currentPID(),
+				"attempt", attempt+1)
 		}),
 		retry.LastErrorOnly(true),
 	)
@@ -527,7 +660,13 @@ func (s *litmusServer) doAnalyze(ctx context.Context, sha256 string, body []byte
 
 	var totalMs int64
 	if v := resp.Header.Get("X-Total-Ms"); v != "" {
-		totalMs, _ = strconv.ParseInt(v, 10, 64)
+		parsed, parseErr := strconv.ParseInt(v, 10, 64)
+		if parseErr != nil {
+			//nolint:gosec // header value is sanitized before logging; this is a false positive on slog taint flow.
+			slog.Debug("invalid X-Total-Ms header", "value", sanitizeLogString(v), "error", parseErr)
+		} else {
+			totalMs = parsed
+		}
 	}
 
 	return &analyzeResult{
@@ -570,11 +709,14 @@ func freePort(ctx context.Context) (string, net.Listener, error) {
 	}
 	addr, ok := l.Addr().(*net.TCPAddr)
 	if !ok {
-		l.Close() //nolint:errcheck,gosec // cleanup
+		if err := l.Close(); err != nil {
+			slog.Warn("failed to close listener with unexpected address", "error", err)
+		}
 		return "", nil, errors.New("unexpected listener address type")
 	}
 	return strconv.Itoa(addr.Port), l, nil
 }
+
 func isRetryableNetError(err error) bool {
 	if err == nil {
 		return false
@@ -594,7 +736,9 @@ func isRetryableNetError(err error) bool {
 }
 
 func isStdoutTTY() bool {
-	fileInfo, _ := os.Stdout.Stat()
+	fileInfo, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
 	return (fileInfo.Mode() & os.ModeCharDevice) != 0
 }
-

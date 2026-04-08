@@ -77,7 +77,9 @@ func migrateLegacySQLite(ctx context.Context, dst *DB, rows *sql.Rows, total int
 	var lastRowID int64
 	for rows.Next() {
 		if ctx.Err() != nil {
-			tx.Rollback() //nolint:errcheck,gosec // context cancelled
+			if err := tx.Rollback(); err != nil {
+				slog.Debug("rollback after context cancellation failed", "error", err)
+			}
 			return imported, ctx.Err()
 		}
 
@@ -88,7 +90,9 @@ func migrateLegacySQLite(ctx context.Context, dst *DB, rows *sql.Rows, total int
 		var findingCount int
 
 		if err := rows.Scan(&rowid, &sha256, &path, &status, &updatedAt, &cleaveJSON, &risk, &findingCount); err != nil {
-			tx.Rollback() //nolint:errcheck,gosec // scan error
+			if rollbackErr := tx.Rollback(); rollbackErr != nil {
+				slog.Debug("rollback after scan failure failed", "error", rollbackErr)
+			}
 			return imported, fmt.Errorf("scan row: %w", err)
 		}
 		lastRowID = rowid
@@ -573,7 +577,9 @@ func flushSamplesSQLite(ctx context.Context, dst *DB, samples []*Sample) (int64,
 			s.Note, s.CanonicalSHA256, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, cr, lr, s.LitmusScore,
 			s.AnalyzedAt, s.CreatedAt, s.UpdatedAt, s.Mtime)
 		if err != nil {
-			tx.Rollback() //nolint:errcheck,gosec // insert error
+			if rollbackErr := tx.Rollback(); rollbackErr != nil {
+				slog.Debug("rollback after insert failure failed", "error", rollbackErr)
+			}
 			return inserted, fmt.Errorf("insert sample %s: %w", s.SHA256, err)
 		}
 		if n, err := res.RowsAffected(); err == nil {

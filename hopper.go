@@ -21,6 +21,12 @@ import (
 	_ "github.com/mattn/go-sqlite3" // register sqlite3 driver
 )
 
+func closeSQLiteBestEffort(db *sql.DB) {
+	if err := db.Close(); err != nil {
+		return
+	}
+}
+
 // sanitizeJSONB fixes JSON that is valid in lenient parsers but rejected by
 // PostgreSQL's strict JSONB parser:
 //   - \u0000 (null bytes): PG uses C-style null-terminated strings internally
@@ -119,12 +125,12 @@ type Sample struct {
 	Elements        string // formula without counts (qualitative composition)
 	AnalyzedAt      *time.Time
 	Mtime           *time.Time
-	CleaveResult    []byte // raw cleave JSON, nil if unanalyzed
-	LitmusResult    []byte // litmus classification envelope JSON, nil if unclassified
+	CleaveResult    []byte  // raw cleave JSON, nil if unanalyzed
+	LitmusResult    []byte  // litmus classification envelope JSON, nil if unclassified
 	LitmusScore     float64 // litmus confidence score (0.0-1.0)
 	ID              int64
 	SizeBytes       int64
-	Score           int    // cleave raw score
+	Score           int // cleave raw score
 }
 
 // Report is an analysis report produced by cyclotron.
@@ -180,7 +186,7 @@ func stripSubscripts(formula string) string {
 	var b strings.Builder
 	for _, r := range formula {
 		if r < '₀' || r > '₉' {
-			b.WriteRune(r)
+			_, _ = b.WriteRune(r)
 		}
 	}
 	return b.String()
@@ -325,7 +331,7 @@ func (db *DB) Close() {
 		db.pool.Close()
 	}
 	if db.lite != nil {
-		db.lite.Close() //nolint:errcheck,gosec // best-effort cleanup
+		closeSQLiteBestEffort(db.lite)
 	}
 }
 
@@ -369,7 +375,7 @@ func (db *DB) InsertSampleNew(ctx context.Context, s *Sample) (bool, error) {
 // where each individual INSERT acquires the single-writer lock.
 // InsertSampleBatch inserts a batch of samples.
 // Returns the number of newly inserted samples and a list of SHAs that lack analysis results.
-func (db *DB) InsertSampleBatch(ctx context.Context, samples []*Sample) (int64, []string, error) {
+func (db *DB) InsertSampleBatch(ctx context.Context, samples []*Sample) (inserted int64, needsAnalysis []string, err error) {
 	if len(samples) == 0 {
 		return 0, nil, nil
 	}
@@ -589,7 +595,7 @@ func (db *DB) RecomputeCanonicalSHA256(ctx context.Context) (int64, error) {
 }
 
 // FeedQuery specifies filters for paginated feed queries.
-type FeedQuery struct {
+type FeedQuery struct { //nolint:govet // filter fields are grouped for readability.
 	Source     string   // "harvest" or "upload"
 	Label      string   // "bad", "good", "unknown", or "" (match any)
 	Feeds      []string // optional: filter by feed column values
@@ -644,7 +650,7 @@ func (q *FeedQuery) clamp() {
 	}
 }
 
-func (q FeedQuery) sortBy() string {
+func (q *FeedQuery) sortBy() string {
 	switch q.OrderBy {
 	case "analyzed_at":
 		return "analyzed_at"

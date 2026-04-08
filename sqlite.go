@@ -19,10 +19,23 @@ func openSQLite(ctx context.Context, dsn string) (*DB, error) {
 	// connection so database/sql never opens parallel write transactions.
 	lite.SetMaxOpenConns(1)
 	if err := lite.PingContext(ctx); err != nil {
-		lite.Close() //nolint:errcheck,gosec // best-effort cleanup on failed ping
+		if closeErr := lite.Close(); closeErr != nil {
+			slog.Debug("close sqlite after failed ping", "error", closeErr)
+		}
 		return nil, fmt.Errorf("hopper: ping sqlite: %w", err)
 	}
 	return &DB{lite: lite}, nil
+}
+
+func pragmaHasColumn(ctx context.Context, db *sql.DB, column string) int {
+	var count int
+	if err := db.QueryRowContext(ctx,
+		fmt.Sprintf("SELECT count(*) FROM pragma_table_info('samples') WHERE name = '%s'", column),
+	).Scan(&count); err != nil {
+		slog.Debug("pragma_table_info failed", "column", column, "error", err)
+		return 0
+	}
+	return count
 }
 
 func (db *DB) migrateSQLite(ctx context.Context) error {
@@ -33,11 +46,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 
 	// Add columns introduced after initial schema. SQLite lacks
 	// ALTER TABLE ... IF NOT EXISTS, so check column existence via PRAGMA.
-	var hasParent int
-	//nolint:errcheck,gosec // best-effort column check; 0 on error triggers migration
-	db.lite.QueryRowContext(ctx,
-		"SELECT count(*) FROM pragma_table_info('samples') WHERE name = 'parent'",
-	).Scan(&hasParent)
+	hasParent := pragmaHasColumn(ctx, db.lite, "parent")
 	if hasParent == 0 {
 		for _, ddl := range []string{
 			`ALTER TABLE samples ADD COLUMN parent TEXT NOT NULL DEFAULT ''`,
@@ -51,11 +60,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		}
 	}
 
-	var hasFormula int
-	//nolint:errcheck,gosec // best-effort column check
-	db.lite.QueryRowContext(ctx,
-		"SELECT count(*) FROM pragma_table_info('samples') WHERE name = 'formula'",
-	).Scan(&hasFormula)
+	hasFormula := pragmaHasColumn(ctx, db.lite, "formula")
 	if hasFormula == 0 {
 		for _, ddl := range []string{
 			`ALTER TABLE samples ADD COLUMN formula TEXT NOT NULL DEFAULT ''`,
@@ -76,11 +81,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 	}
 
 	// Add litmus_result column.
-	var hasLitmusResult int
-	//nolint:errcheck,gosec // best-effort column check
-	db.lite.QueryRowContext(ctx,
-		"SELECT count(*) FROM pragma_table_info('samples') WHERE name = 'litmus_result'",
-	).Scan(&hasLitmusResult)
+	hasLitmusResult := pragmaHasColumn(ctx, db.lite, "litmus_result")
 	if hasLitmusResult == 0 {
 		if _, err := db.lite.ExecContext(ctx, `ALTER TABLE samples ADD COLUMN litmus_result TEXT`); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite: %w", err)
@@ -88,11 +89,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 	}
 
 	// Add litmus_score column.
-	var hasLitmusScore int
-	//nolint:errcheck,gosec // best-effort column check
-	db.lite.QueryRowContext(ctx,
-		"SELECT count(*) FROM pragma_table_info('samples') WHERE name = 'litmus_score'",
-	).Scan(&hasLitmusScore)
+	hasLitmusScore := pragmaHasColumn(ctx, db.lite, "litmus_score")
 	if hasLitmusScore == 0 {
 		if _, err := db.lite.ExecContext(ctx, `ALTER TABLE samples ADD COLUMN litmus_score REAL NOT NULL DEFAULT 0`); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite: %w", err)
@@ -100,11 +97,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 	}
 
 	// Add mtime column.
-	var hasMtime int
-	//nolint:errcheck,gosec // best-effort column check
-	db.lite.QueryRowContext(ctx,
-		"SELECT count(*) FROM pragma_table_info('samples') WHERE name = 'mtime'",
-	).Scan(&hasMtime)
+	hasMtime := pragmaHasColumn(ctx, db.lite, "mtime")
 	if hasMtime == 0 {
 		for _, ddl := range []string{
 			`ALTER TABLE samples ADD COLUMN mtime DATETIME`,
@@ -129,9 +122,12 @@ func scanLiteSample(row *sql.Row) (*Sample, error) {
 	s := &Sample{}
 	var cleaveResult, litmusResult, status sql.NullString
 	var analyzedAt, mtime sql.NullTime
-	err := row.Scan(&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
+	err := row.Scan(
+		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &s.LitmusScore,
-		&s.Path, &status, &s.Note, &s.CanonicalSHA256, &s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime)
+		&s.Path, &status, &s.Note, &s.CanonicalSHA256, &s.Parent, &s.Skip, &s.Formula,
+		&s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime,
+	)
 
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -162,10 +158,12 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 		s := &Sample{}
 		var cleaveResult, litmusResult, status sql.NullString
 		var analyzedAt, mtime sql.NullTime
-		if err := rows.Scan(&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
+		if err := rows.Scan(
+			&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &s.LitmusScore,
 			&s.Path, &status, &s.Note, &s.CanonicalSHA256,
-			&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime); err != nil {
+			&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime,
+		); err != nil {
 			return nil, err
 		}
 		if cleaveResult.Valid {
@@ -206,7 +204,7 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 	return n > 0, nil
 }
 
-func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (int64, []string, error) {
+func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (inserted int64, needsAnalysis []string, err error) {
 	tx, err := db.lite.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, nil, fmt.Errorf("hopper: begin batch: %w", err)
@@ -223,7 +221,8 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		placeholders[i] = "?"
 	}
 
-	query := fmt.Sprintf(`
+	query := fmt.Sprintf( //nolint:gosec // column list and placeholders are derived from fixed local constants.
+		`
 		INSERT INTO samples (%s)
 		VALUES (%s)
 		ON CONFLICT (sha256) DO NOTHING`,
@@ -236,7 +235,6 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 	}
 	defer stmt.Close() //nolint:errcheck // best-effort cleanup
 
-	var inserted int64
 	for _, s := range samples {
 		res, err := stmt.ExecContext(ctx,
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
@@ -261,7 +259,11 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 	if err != nil {
 		return 0, nil, fmt.Errorf("hopper: prepare batch staging: %w", err)
 	}
-	defer stagingStmt.Close()
+	defer func() {
+		if closeErr := stagingStmt.Close(); closeErr != nil {
+			slog.Debug("close staging statement failed", "error", closeErr)
+		}
+	}()
 
 	for _, s := range samples {
 		if _, err := stagingStmt.ExecContext(ctx, s.SHA256); err != nil {
@@ -276,15 +278,21 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 	if err != nil {
 		return 0, nil, fmt.Errorf("hopper: query needs analysis: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			slog.Debug("close needs-analysis rows failed", "error", closeErr)
+		}
+	}()
 
-	var needsAnalysis []string
 	for rows.Next() {
 		var sha string
 		if err := rows.Scan(&sha); err != nil {
 			return 0, nil, fmt.Errorf("hopper: scan needs analysis: %w", err)
 		}
 		needsAnalysis = append(needsAnalysis, sha)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, nil, fmt.Errorf("hopper: rows needs analysis: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -622,7 +630,10 @@ func (db *DB) recomputeCanonicalSHA256SQLite(ctx context.Context) (int64, error)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: recompute canonical sha256: %w", err)
 	}
-	n, _ := res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("hopper: rows affected recompute canonical sha256: %w", err)
+	}
 	return n, nil
 }
 
@@ -650,7 +661,7 @@ func (db *DB) deleteAllSQLite(ctx context.Context) error {
 
 func (db *DB) feedSamplesSQLite(ctx context.Context, q FeedQuery) ([]*Sample, error) {
 	where, args := q.whereSQLite()
-	query := `SELECT ` + liteSampleCols + ` FROM samples ` + where +
+	query := `SELECT ` + liteSampleCols + ` FROM samples ` + where + //nolint:gosec // built from fixed query fragments and validated sort key.
 		` ORDER BY ` + q.sortBy() + ` DESC LIMIT ? OFFSET ?`
 	args = append(args, q.Limit, q.Offset)
 
@@ -671,9 +682,9 @@ func (db *DB) feedSamplesCountSQLite(ctx context.Context, q FeedQuery) (int, err
 	return n, nil
 }
 
-func (q *FeedQuery) whereSQLite() (string, []any) {
+func (q *FeedQuery) whereSQLite() (where string, args []any) {
 	clauses := []string{"source = ?", "cleave_result IS NOT NULL"}
-	args := []any{q.Source}
+	args = []any{q.Source}
 
 	if q.Label != "" {
 		clauses = append(clauses, "label = ?")
