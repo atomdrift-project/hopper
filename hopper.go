@@ -125,6 +125,7 @@ type Sample struct {
 	Elements        string // formula without counts (qualitative composition)
 	AnalyzedAt      *time.Time
 	Mtime           *time.Time
+	MarkerMtime     *time.Time
 	CleaveResult    []byte  // raw cleave JSON, nil if unanalyzed
 	LitmusResult    []byte  // litmus classification envelope JSON, nil if unclassified
 	LitmusScore     float64 // litmus confidence score (0.0-1.0)
@@ -493,6 +494,16 @@ func (db *DB) FalsePositives(ctx context.Context, scoreThreshold, limit int) ([]
 	return db.falsePositivesSQLite(ctx, scoreThreshold, limit)
 }
 
+// TruePositives returns analyzed bad-labeled samples with score >= threshold.
+// These are known-bad files that cleave also scores as bad.
+// Only returns samples with empty status and no training-skip marker.
+func (db *DB) TruePositives(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.truePositivesPG(ctx, scoreThreshold, limit)
+	}
+	return db.truePositivesSQLite(ctx, scoreThreshold, limit)
+}
+
 // FalseNegatives returns analyzed bad-labeled samples with score <= threshold
 // (cleave does not detect them). These are candidates for gap-and-fix.
 // Only returns samples with empty status (not yet claimed by a pipeline).
@@ -501,6 +512,26 @@ func (db *DB) FalseNegatives(ctx context.Context, scoreThreshold, limit int) ([]
 		return db.falseNegativesPG(ctx, scoreThreshold, limit)
 	}
 	return db.falseNegativesSQLite(ctx, scoreThreshold, limit)
+}
+
+// BenignReview returns known-bad files that were flipped to good by a BENIGN
+// marker, but whose score still looks bad enough to warrant manual review.
+// Only returns marker-labeled misclassifications with empty status.
+func (db *DB) BenignReview(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.benignReviewPG(ctx, scoreThreshold, limit)
+	}
+	return db.benignReviewSQLite(ctx, scoreThreshold, limit)
+}
+
+// BadReview returns known-good files that were flipped to bad by a BAD marker,
+// but whose score still looks benign enough to warrant manual review.
+// Only returns marker-labeled misclassifications with empty status.
+func (db *DB) BadReview(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.badReviewPG(ctx, scoreThreshold, limit)
+	}
+	return db.badReviewSQLite(ctx, scoreThreshold, limit)
 }
 
 // CountByStatus returns sample counts grouped by status.

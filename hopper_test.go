@@ -3,6 +3,7 @@ package hopper
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -26,6 +27,14 @@ func mustInsert(t *testing.T, ctx context.Context, db *DB, s *Sample) {
 	t.Helper()
 	if err := db.InsertSample(ctx, s); err != nil {
 		t.Fatalf("InsertSample: %v", err)
+	}
+}
+
+func mustAnalyze(t *testing.T, ctx context.Context, db *DB, sha string, score int) {
+	t.Helper()
+	result := []byte(fmt.Sprintf(`{"fs":[{"sha":"%s","x":%d,"dp":0}]}`, sha, score))
+	if err := db.UpdateCleaveResult(ctx, sha, result, ""); err != nil {
+		t.Fatalf("UpdateCleaveResult: %v", err)
 	}
 }
 
@@ -379,6 +388,155 @@ func TestFalseNegativesInPaths(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].SHA256 != "fn1" {
 		t.Fatalf("got %+v, want only fn1", got)
+	}
+}
+
+func TestTruePositives(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "tp1",
+		Source:      "test",
+		Label:       "bad",
+		LabelSource: "test",
+		Score:       95,
+	})
+	mustAnalyze(t, ctx, db, "tp1", 95)
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "tp2",
+		Source:      "test",
+		Label:       "bad",
+		LabelSource: "test",
+		Score:       95,
+		Skip:        "misclassified",
+	})
+	mustAnalyze(t, ctx, db, "tp2", 95)
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "tp3",
+		Source:      "test",
+		Label:       "bad",
+		LabelSource: "test",
+		Score:       70,
+	})
+	mustAnalyze(t, ctx, db, "tp3", 70)
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "tp4",
+		Source:      "test",
+		Label:       "good",
+		LabelSource: "test",
+		Score:       95,
+	})
+	mustAnalyze(t, ctx, db, "tp4", 95)
+
+	got, err := db.TruePositives(ctx, 85, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SHA256 != "tp1" {
+		t.Fatalf("got %+v, want only tp1", got)
+	}
+}
+
+func TestBenignReview(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "br1",
+		Source:      "test",
+		Label:       "good",
+		LabelSource: "marker",
+		Skip:        "misclassified",
+		Score:       92,
+	})
+	mustAnalyze(t, ctx, db, "br1", 92)
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "br2",
+		Source:      "test",
+		Label:       "good",
+		LabelSource: "marker",
+		Skip:        "misclassified",
+		Score:       60,
+	})
+	mustAnalyze(t, ctx, db, "br2", 60)
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "br3",
+		Source:      "test",
+		Label:       "good",
+		LabelSource: "test",
+		Skip:        "misclassified",
+		Score:       92,
+	})
+	mustAnalyze(t, ctx, db, "br3", 92)
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "br4",
+		Source:      "test",
+		Label:       "good",
+		LabelSource: "marker",
+		Skip:        "misclassified",
+		Status:      "claimed",
+		Score:       92,
+	})
+	mustAnalyze(t, ctx, db, "br4", 92)
+
+	got, err := db.BenignReview(ctx, 85, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SHA256 != "br1" {
+		t.Fatalf("got %+v, want only br1", got)
+	}
+}
+
+func TestBadReview(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "mr1",
+		Source:      "test",
+		Label:       "bad",
+		LabelSource: "marker",
+		Skip:        "misclassified",
+		Score:       20,
+	})
+	mustAnalyze(t, ctx, db, "mr1", 20)
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "mr2",
+		Source:      "test",
+		Label:       "bad",
+		LabelSource: "marker",
+		Skip:        "misclassified",
+		Score:       90,
+	})
+	mustAnalyze(t, ctx, db, "mr2", 90)
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "mr3",
+		Source:      "test",
+		Label:       "bad",
+		LabelSource: "test",
+		Skip:        "misclassified",
+		Score:       20,
+	})
+	mustAnalyze(t, ctx, db, "mr3", 20)
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "mr4",
+		Source:      "test",
+		Label:       "bad",
+		LabelSource: "marker",
+		Skip:        "misclassified",
+		Status:      "claimed",
+		Score:       20,
+	})
+	mustAnalyze(t, ctx, db, "mr4", 20)
+
+	got, err := db.BadReview(ctx, 25, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SHA256 != "mr1" {
+		t.Fatalf("got %+v, want only mr1", got)
 	}
 }
 

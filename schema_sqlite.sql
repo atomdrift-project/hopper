@@ -24,7 +24,9 @@ CREATE TABLE IF NOT EXISTS samples (
 	created_at    DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
 	updated_at    DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
 
-	analyzed_at   DATETIME
+	analyzed_at   DATETIME,
+	mtime         DATETIME,
+	marker_mtime  DATETIME
 );
 
 CREATE INDEX IF NOT EXISTS idx_samples_label ON samples(label);

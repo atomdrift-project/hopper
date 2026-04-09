@@ -42,6 +42,7 @@ func (db *DB) migratePG(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_samples_elements ON samples(elements) WHERE elements != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_score ON samples(score) WHERE score != 0`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS mtime TIMESTAMPTZ`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS marker_mtime TIMESTAMPTZ`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source ON samples(source, label, analyzed_at DESC NULLS LAST) WHERE cleave_result IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_mtime ON samples(source, label, mtime DESC NULLS LAST) WHERE cleave_result IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed ON samples(feed) WHERE feed != ''`,
@@ -59,14 +60,14 @@ func (db *DB) migratePG(ctx context.Context) error {
 const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, cleave_result, litmus_result, litmus_score,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score,
-	created_at, updated_at, analyzed_at, mtime`
+	created_at, updated_at, analyzed_at, mtime, marker_mtime`
 
 func pgSampleDest(s *Sample) []any {
 	return []any{
 		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &s.CleaveResult, &s.LitmusResult, &s.LitmusScore,
 		&s.Path, &s.Status, &s.Note, &s.CanonicalSHA256,
-		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.Mtime,
+		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.Mtime, &s.MarkerMtime,
 	}
 }
 
@@ -98,13 +99,18 @@ func scanPGSamples(rows pgx.Rows) ([]*Sample, error) {
 func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 	tag, err := db.pool.Exec(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, mtime)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $1, $12, $13, $14, $15, $16, $17)
+			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, mtime, marker_mtime)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $1, $12, $13, $14, $15, $16, $17, $18)
 		ON CONFLICT (sha256) DO NOTHING`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
-		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.Mtime)
+		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.Mtime, s.MarkerMtime)
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
+	}
+	if tag.RowsAffected() == 0 && s.MarkerMtime != nil {
+		if _, err := db.pool.Exec(ctx, `UPDATE samples SET marker_mtime = $2 WHERE sha256 = $1`, s.SHA256, s.MarkerMtime); err != nil {
+			return false, fmt.Errorf("hopper: refresh marker mtime: %w", err)
+		}
 	}
 	return tag.RowsAffected() > 0, nil
 }
@@ -112,20 +118,20 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 var insertBatchStagingCols = []string{
 	"sha256", "source", "feed", "ecosystem", "filename", "file_type",
 	"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
-	"parent", "skip", "formula", "elements", "score", "mtime",
+	"parent", "skip", "formula", "elements", "score", "mtime", "marker_mtime",
 }
 
 const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 	sha256 TEXT, source TEXT, feed TEXT, ecosystem TEXT, filename TEXT,
 	file_type TEXT, size_bytes BIGINT, label TEXT, label_source TEXT,
 	path TEXT, status TEXT, canonical_sha256 TEXT,
-	parent TEXT, skip TEXT, formula TEXT, elements TEXT, score INTEGER, mtime TIMESTAMPTZ
+	parent TEXT, skip TEXT, formula TEXT, elements TEXT, score INTEGER, mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ
 ) ON COMMIT DROP`
 
 const insertBatchStagingInsert = `INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, mtime)
+	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, mtime, marker_mtime)
 SELECT sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, mtime
+	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, mtime, marker_mtime
 FROM _staging
 ON CONFLICT (sha256) DO NOTHING`
 
@@ -135,7 +141,7 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 		rows[i] = []any{
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256,
-			s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.Mtime,
+			s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.Mtime, s.MarkerMtime,
 		}
 	}
 
@@ -157,6 +163,15 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 		return 0, nil, fmt.Errorf("hopper: insert from staging: %w", err)
 	}
 	inserted = tag.RowsAffected()
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE samples s
+		SET marker_mtime = st.marker_mtime
+		FROM _staging st
+		WHERE s.sha256 = st.sha256
+			AND st.marker_mtime IS NOT NULL`); err != nil {
+		return 0, nil, fmt.Errorf("hopper: refresh marker mtime: %w", err)
+	}
 
 	// Find SHAs that lack analysis results (including ones we just skipped).
 	query := `SELECT s.sha256 FROM samples s
@@ -285,7 +300,7 @@ func (db *DB) samplesByStatusPG(ctx context.Context, status string, limit int) (
 func (db *DB) falsePositivesPG(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
-		 WHERE label = 'good' AND cleave_result IS NOT NULL AND score >= $1 AND status = ''
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND score >= $1 AND status = '' AND skip = ''
 		 ORDER BY score DESC LIMIT $2`,
 		scoreThreshold, limit)
 	if err != nil {
@@ -294,14 +309,52 @@ func (db *DB) falsePositivesPG(ctx context.Context, scoreThreshold, limit int) (
 	return scanPGSamples(rows)
 }
 
+func (db *DB) truePositivesPG(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND score >= $1 AND status = '' AND skip = ''
+		 ORDER BY score DESC LIMIT $2`,
+		scoreThreshold, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: true positives: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
 func (db *DB) falseNegativesPG(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
-		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND score <= $1 AND status = ''
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND score <= $1 AND status = '' AND skip = ''
 		 ORDER BY score ASC LIMIT $2`,
 		scoreThreshold, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: false negatives: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
+func (db *DB) benignReviewPG(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE label = 'good' AND label_source = 'marker' AND skip = 'misclassified'
+			AND cleave_result IS NOT NULL AND score >= $1 AND status = ''
+		 ORDER BY score DESC LIMIT $2`,
+		scoreThreshold, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: benign review: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
+func (db *DB) badReviewPG(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE label = 'bad' AND label_source = 'marker' AND skip = 'misclassified'
+			AND cleave_result IS NOT NULL AND score <= $1 AND status = ''
+		 ORDER BY score ASC LIMIT $2`,
+		scoreThreshold, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: bad review: %w", err)
 	}
 	return scanPGSamples(rows)
 }

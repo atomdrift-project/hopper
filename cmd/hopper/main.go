@@ -36,6 +36,10 @@ commands:
   load            load sample files from directories
   reset           delete all samples and reports (preserves schema)
   import          transfer samples between hopper databases (sqlite↔postgres)
+  false-positives list known-good files that still score bad
+  true-positives  list known-bad files that also score bad
+  benign-review   list marker-benign files whose score still looks bad
+  bad-review      list marker-bad files whose score still looks benign
   stats           show sample counts
 `
 
@@ -137,6 +141,14 @@ func run(ctx context.Context) error {
 		return cmdLoad(ctx)
 	case "reset":
 		return cmdReset(ctx)
+	case "false-positives":
+		return cmdFalsePositives(ctx)
+	case "true-positives":
+		return cmdTruePositives(ctx)
+	case "benign-review":
+		return cmdBenignReview(ctx)
+	case "bad-review":
+		return cmdBadReview(ctx)
 	case "stats":
 		return cmdStats(ctx)
 	default:
@@ -700,7 +712,7 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 				}
 
 				// Check for misclassification markers that contradict the label.
-				if marker := checkMarker(lp.path); marker != "" {
+				if marker, markerMtime := markerInfo(lp.path); marker != "" {
 					if (lp.label == "bad" && marker == "benign") || (lp.label == "good" && marker == "bad") {
 						progress.markers.Add(1)
 						sample.Label = marker
@@ -709,6 +721,7 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 						}
 						sample.LabelSource = "marker"
 						sample.Skip = "misclassified"
+						sample.MarkerMtime = markerMtime
 						slog.Info("misclassified file", "path", lp.path, "original_label", lp.label, "marker", marker)
 					}
 				}
@@ -998,20 +1011,27 @@ func isMarkerFile(name string) bool {
 // checkMarker looks for a sibling marker file that contradicts the given label.
 // Returns "benign" or "bad" if a marker exists, "" otherwise.
 func checkMarker(path string) string {
+	kind, _ := markerInfo(path)
+	return kind
+}
+
+func markerInfo(path string) (kind string, mtime *time.Time) {
 	dir := filepath.Dir(path)
 	base := filepath.Base(path)
 
 	benign := filepath.Join(dir, markerPrefix+base+markerBenign)
-	if _, err := os.Stat(benign); err == nil {
-		return "benign"
+	if info, err := os.Stat(benign); err == nil {
+		t := info.ModTime()
+		return "benign", &t
 	}
 
 	bad := filepath.Join(dir, markerPrefix+base+markerBad)
-	if _, err := os.Stat(bad); err == nil {
-		return "bad"
+	if info, err := os.Stat(bad); err == nil {
+		t := info.ModTime()
+		return "bad", &t
 	}
 
-	return ""
+	return "", nil
 }
 
 // labeledPath is a file path with its classification label.
@@ -1090,6 +1110,7 @@ func hashFile(ctx context.Context, path, label, source string, cache *hashCache,
 			if progress != nil {
 				progress.cacheHits.Add(1)
 			}
+			modTime := info.ModTime()
 			return &hopper.Sample{
 				SHA256:      cached,
 				Source:      source,
@@ -1098,6 +1119,7 @@ func hashFile(ctx context.Context, path, label, source string, cache *hashCache,
 				LabelSource: source,
 				SizeBytes:   info.Size(),
 				Path:        path,
+				Mtime:       &modTime,
 			}, nil
 		}
 	}
@@ -1121,10 +1143,13 @@ func hashFile(ctx context.Context, path, label, source string, cache *hashCache,
 		LabelSource: source,
 		SizeBytes:   info.Size(),
 		Path:        path,
+		Mtime:       ptrTime(info.ModTime()),
 	}
 	s.Feed, s.Ecosystem = extractFeedEcosystem(path, label)
 	return s, nil
 }
+
+func ptrTime(t time.Time) *time.Time { return &t }
 
 // extractFeedEcosystem parses feed and ecosystem from a file path when
 // a "harvest" directory component is present.
@@ -1188,6 +1213,80 @@ func cmdStats(ctx context.Context) error {
 	}
 	writeStdoutf("%-10s %d\n", "total", total)
 	return nil
+}
+
+type sampleListFunc func(context.Context, *hopper.DB, int, int) ([]*hopper.Sample, error)
+
+func reviewFlags(name string) (*flag.FlagSet, *string, *int, *int) {
+	f := flag.NewFlagSet(name, flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	score := f.Int("score", 85, "score threshold")
+	limit := f.Int("limit", 100, "maximum rows to print")
+	return f, dsn, score, limit
+}
+
+func runReviewCommand(ctx context.Context, args []string, name string, list sampleListFunc) error {
+	f, dsn, score, limit := reviewFlags(name)
+	parseFlags(f, args)
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	samples, err := list(ctx, db, *score, *limit)
+	if err != nil {
+		return err
+	}
+	for _, s := range samples {
+		age := sampleAgeDays(s.Mtime)
+		if name == "benign-review" || name == "bad-review" {
+			age = sampleAgeDays(s.MarkerMtime)
+		}
+		writeStdoutf("%4d  %-64s  %-5d  %-4s  %-6s  %-8s  %s\n",
+			s.ID, s.SHA256, s.Score, age, s.Label, s.LabelSource, s.Path)
+	}
+	return nil
+}
+
+func sampleAgeDays(ts *time.Time) string {
+	if ts == nil {
+		return ""
+	}
+	days := int(time.Since(*ts).Hours() / 24)
+	if days < 0 {
+		days = 0
+	}
+	return strconv.Itoa(days)
+}
+
+func cmdFalsePositives(ctx context.Context) error {
+	return runReviewCommand(ctx, os.Args[2:], "false-positives",
+		func(ctx context.Context, db *hopper.DB, score, limit int) ([]*hopper.Sample, error) {
+			return db.FalsePositives(ctx, score, limit)
+		})
+}
+
+func cmdTruePositives(ctx context.Context) error {
+	return runReviewCommand(ctx, os.Args[2:], "true-positives",
+		func(ctx context.Context, db *hopper.DB, score, limit int) ([]*hopper.Sample, error) {
+			return db.TruePositives(ctx, score, limit)
+		})
+}
+
+func cmdBenignReview(ctx context.Context) error {
+	return runReviewCommand(ctx, os.Args[2:], "benign-review",
+		func(ctx context.Context, db *hopper.DB, score, limit int) ([]*hopper.Sample, error) {
+			return db.BenignReview(ctx, score, limit)
+		})
+}
+
+func cmdBadReview(ctx context.Context) error {
+	return runReviewCommand(ctx, os.Args[2:], "bad-review",
+		func(ctx context.Context, db *hopper.DB, score, limit int) ([]*hopper.Sample, error) {
+			return db.BadReview(ctx, score, limit)
+		})
 }
 
 func isTTY() bool {

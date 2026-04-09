@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -377,6 +379,32 @@ func withArgs(args []string, fn func()) {
 	fn()
 }
 
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	defer func() { os.Stdout = old }()
+
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
 func TestCmdInit(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "init-test.db")
 	withArgs([]string{"hopper", "init", "-db", dbPath}, func() {
@@ -599,6 +627,26 @@ func TestRun(t *testing.T) {
 	withArgs([]string{"hopper", "stats", "-db", dbPath}, func() {
 		if err := run(t.Context()); err != nil {
 			t.Errorf("run stats: %v", err)
+		}
+	})
+	withArgs([]string{"hopper", "false-positives", "-db", dbPath}, func() {
+		if err := run(t.Context()); err != nil {
+			t.Errorf("run false-positives: %v", err)
+		}
+	})
+	withArgs([]string{"hopper", "true-positives", "-db", dbPath}, func() {
+		if err := run(t.Context()); err != nil {
+			t.Errorf("run true-positives: %v", err)
+		}
+	})
+	withArgs([]string{"hopper", "benign-review", "-db", dbPath}, func() {
+		if err := run(t.Context()); err != nil {
+			t.Errorf("run benign-review: %v", err)
+		}
+	})
+	withArgs([]string{"hopper", "bad-review", "-db", dbPath}, func() {
+		if err := run(t.Context()); err != nil {
+			t.Errorf("run bad-review: %v", err)
 		}
 	})
 	withArgs([]string{"hopper", "reset", "-db", dbPath}, func() {
@@ -847,6 +895,65 @@ func TestLoadDirMarkers(t *testing.T) {
 	if samples[0].Skip != "misclassified" {
 		t.Errorf("skip = %q, want misclassified", samples[0].Skip)
 	}
+	if samples[0].MarkerMtime == nil {
+		t.Fatalf("marker_mtime = nil, want set")
+	}
+}
+
+func TestLoadDirMarkersRefreshMarkerMtimeOnDuplicate(t *testing.T) {
+	ctx := t.Context()
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := hopper.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	samplePath := filepath.Join(dir, "malware.bin")
+	markerPath := filepath.Join(dir, "._malware.bin.BENIGN")
+	mustWriteFile(t, samplePath, []byte("malicious payload!"))
+	mustWriteFile(t, markerPath, nil)
+
+	first := time.Now().Add(-48 * time.Hour).UTC()
+	second := time.Now().Add(-24 * time.Hour).UTC()
+	if err := os.Chtimes(markerPath, first, first); err != nil {
+		t.Fatal(err)
+	}
+
+	sm := &loadProgress{}
+	sm.analyzeDurationMin.Store(math.MaxInt64)
+	loadAll(ctx, func() {}, db, nil, nil, []struct{ dir, label string }{{dir, "bad"}}, "test", 1, false, 0, "", sm)
+
+	samples, err := db.SamplesByLabel(ctx, "good", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 1 || samples[0].MarkerMtime == nil {
+		t.Fatalf("expected first marker_mtime to be set, got %+v", samples)
+	}
+
+	if err := os.Chtimes(markerPath, second, second); err != nil {
+		t.Fatal(err)
+	}
+	sm = &loadProgress{}
+	sm.analyzeDurationMin.Store(math.MaxInt64)
+	loadAll(ctx, func() {}, db, nil, nil, []struct{ dir, label string }{{dir, "bad"}}, "test", 1, false, 0, "", sm)
+
+	samples, err = db.SamplesByLabel(ctx, "good", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 1 || samples[0].MarkerMtime == nil {
+		t.Fatalf("expected refreshed marker_mtime to be set, got %+v", samples)
+	}
+	if !samples[0].MarkerMtime.Equal(second) {
+		t.Fatalf("marker_mtime = %v, want %v", samples[0].MarkerMtime.UTC(), second)
+	}
 }
 
 func TestHashFileMarkerBadOnGood(t *testing.T) {
@@ -882,5 +989,83 @@ func TestHashFileMarkerBadOnGood(t *testing.T) {
 	}
 	if sample.Skip != "misclassified" {
 		t.Errorf("after marker: skip = %q, want %q", sample.Skip, "misclassified")
+	}
+}
+
+func TestReviewCommands(t *testing.T) {
+	ctx := t.Context()
+	dbPath := filepath.Join(t.TempDir(), "review-test.db")
+	db := mustOpenDB(t, ctx, dbPath)
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, sample := range []*hopper.Sample{
+		{
+			SHA256:      "fp",
+			Source:      "test",
+			Label:       "good",
+			LabelSource: "test",
+			Score:       90,
+			Path:        "/samples/good/fp",
+		},
+		{
+			SHA256:      "tp",
+			Source:      "test",
+			Label:       "bad",
+			LabelSource: "test",
+			Score:       90,
+			Path:        "/samples/bad/tp",
+		},
+		{
+			SHA256:      "br",
+			Source:      "test",
+			Label:       "good",
+			LabelSource: "marker",
+			Skip:        "misclassified",
+			Score:       90,
+			Path:        "/samples/bad/br",
+		},
+		{
+			SHA256:      "mr",
+			Source:      "test",
+			Label:       "bad",
+			LabelSource: "marker",
+			Skip:        "misclassified",
+			Score:       20,
+			Path:        "/samples/good/mr",
+		},
+	} {
+		if err := db.InsertSample(ctx, sample); err != nil {
+			t.Fatal(err)
+		}
+		result := []byte(fmt.Sprintf(`{"fs":[{"sha":"%s","x":%d,"dp":0}]}`, sample.SHA256, sample.Score))
+		if err := db.UpdateCleaveResult(ctx, sample.SHA256, result, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tests := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"hopper", "false-positives", "-db", dbPath, "-score", "85"}, "fp"},
+		{[]string{"hopper", "true-positives", "-db", dbPath, "-score", "85"}, "tp"},
+		{[]string{"hopper", "benign-review", "-db", dbPath, "-score", "85"}, "br"},
+		{[]string{"hopper", "bad-review", "-db", dbPath, "-score", "25"}, "mr"},
+	}
+
+	for _, tt := range tests {
+		out := captureStdout(t, func() {
+			withArgs(tt.args, func() {
+				if err := run(ctx); err != nil {
+					t.Fatalf("run(%v): %v", tt.args[1], err)
+				}
+			})
+		})
+		if !strings.Contains(out, tt.want) {
+			t.Fatalf("output for %v = %q, want substring %q", tt.args[1], out, tt.want)
+		}
 	}
 }

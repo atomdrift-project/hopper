@@ -111,22 +111,29 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		}
 	}
 
+	hasMarkerMtime := pragmaHasColumn(ctx, db.lite, "marker_mtime")
+	if hasMarkerMtime == 0 {
+		if _, err := db.lite.ExecContext(ctx, `ALTER TABLE samples ADD COLUMN marker_mtime DATETIME`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite: %w", err)
+		}
+	}
+
 	return nil
 }
 
 const liteSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, cleave_result, litmus_result, litmus_score,
-	path, status, note, canonical_sha256, parent, skip, formula, elements, score, created_at, updated_at, analyzed_at, mtime`
+	path, status, note, canonical_sha256, parent, skip, formula, elements, score, created_at, updated_at, analyzed_at, mtime, marker_mtime`
 
 func scanLiteSample(row *sql.Row) (*Sample, error) {
 	s := &Sample{}
 	var cleaveResult, litmusResult, status sql.NullString
-	var analyzedAt, mtime sql.NullTime
+	var analyzedAt, mtime, markerMtime sql.NullTime
 	err := row.Scan(
 		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &s.LitmusScore,
 		&s.Path, &status, &s.Note, &s.CanonicalSHA256, &s.Parent, &s.Skip, &s.Formula,
-		&s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime,
+		&s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime, &markerMtime,
 	)
 
 	if errors.Is(err, sql.ErrNoRows) {
@@ -148,6 +155,9 @@ func scanLiteSample(row *sql.Row) (*Sample, error) {
 	if mtime.Valid {
 		s.Mtime = &mtime.Time
 	}
+	if markerMtime.Valid {
+		s.MarkerMtime = &markerMtime.Time
+	}
 	return s, nil
 }
 
@@ -157,12 +167,12 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 	for rows.Next() {
 		s := &Sample{}
 		var cleaveResult, litmusResult, status sql.NullString
-		var analyzedAt, mtime sql.NullTime
+		var analyzedAt, mtime, markerMtime sql.NullTime
 		if err := rows.Scan(
 			&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &s.LitmusScore,
 			&s.Path, &status, &s.Note, &s.CanonicalSHA256,
-			&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime,
+			&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime, &markerMtime,
 		); err != nil {
 			return nil, err
 		}
@@ -179,6 +189,9 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 		if mtime.Valid {
 			s.Mtime = &mtime.Time
 		}
+		if markerMtime.Valid {
+			s.MarkerMtime = &markerMtime.Time
+		}
 		out = append(out, s)
 	}
 	return out, rows.Err()
@@ -189,17 +202,22 @@ func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error) {
 	res, err := db.lite.ExecContext(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, mtime)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, mtime, marker_mtime)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256) DO NOTHING`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
-		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.Mtime)
+		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.Mtime, s.MarkerMtime)
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
 		return false, fmt.Errorf("hopper: rows affected: %w", err)
+	}
+	if n == 0 && s.MarkerMtime != nil {
+		if _, err := db.lite.ExecContext(ctx, `UPDATE samples SET marker_mtime = ? WHERE sha256 = ?`, s.MarkerMtime, s.SHA256); err != nil {
+			return false, fmt.Errorf("hopper: refresh marker mtime: %w", err)
+		}
 	}
 	return n > 0, nil
 }
@@ -214,7 +232,7 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 	cols := []string{
 		"sha256", "source", "feed", "ecosystem", "filename", "file_type",
 		"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
-		"parent", "skip", "formula", "elements", "score", "mtime",
+		"parent", "skip", "formula", "elements", "score", "mtime", "marker_mtime",
 	}
 	placeholders := make([]string, len(cols))
 	for i := range cols {
@@ -238,12 +256,17 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 	for _, s := range samples {
 		res, err := stmt.ExecContext(ctx,
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
-			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.Mtime)
+			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.Mtime, s.MarkerMtime)
 		if err != nil {
 			return 0, nil, fmt.Errorf("hopper: batch insert %s: %w", s.SHA256, err)
 		}
 		if n, err := res.RowsAffected(); err == nil {
 			inserted += n
+		}
+		if s.MarkerMtime != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE samples SET marker_mtime = ? WHERE sha256 = ?`, s.MarkerMtime, s.SHA256); err != nil {
+				return 0, nil, fmt.Errorf("hopper: refresh marker mtime %s: %w", s.SHA256, err)
+			}
 		}
 	}
 
@@ -404,7 +427,7 @@ func (db *DB) samplesByStatusSQLite(ctx context.Context, status string, limit in
 func (db *DB) falsePositivesSQLite(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples
-		 WHERE label = 'good' AND cleave_result IS NOT NULL AND score >= ? AND status = ''
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND score >= ? AND status = '' AND skip = ''
 		 ORDER BY score DESC LIMIT ?`,
 		scoreThreshold, limit)
 	if err != nil {
@@ -413,14 +436,52 @@ func (db *DB) falsePositivesSQLite(ctx context.Context, scoreThreshold, limit in
 	return scanLiteSamples(rows)
 }
 
+func (db *DB) truePositivesSQLite(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleCols+` FROM samples
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND score >= ? AND status = '' AND skip = ''
+		 ORDER BY score DESC LIMIT ?`,
+		scoreThreshold, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: true positives: %w", err)
+	}
+	return scanLiteSamples(rows)
+}
+
 func (db *DB) falseNegativesSQLite(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples
-		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND score <= ? AND status = ''
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND score <= ? AND status = '' AND skip = ''
 		 ORDER BY score ASC LIMIT ?`,
 		scoreThreshold, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: false negatives: %w", err)
+	}
+	return scanLiteSamples(rows)
+}
+
+func (db *DB) benignReviewSQLite(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleCols+` FROM samples
+		 WHERE label = 'good' AND label_source = 'marker' AND skip = 'misclassified'
+			AND cleave_result IS NOT NULL AND score >= ? AND status = ''
+		 ORDER BY score DESC LIMIT ?`,
+		scoreThreshold, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: benign review: %w", err)
+	}
+	return scanLiteSamples(rows)
+}
+
+func (db *DB) badReviewSQLite(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleCols+` FROM samples
+		 WHERE label = 'bad' AND label_source = 'marker' AND skip = 'misclassified'
+			AND cleave_result IS NOT NULL AND score <= ? AND status = ''
+		 ORDER BY score ASC LIMIT ?`,
+		scoreThreshold, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: bad review: %w", err)
 	}
 	return scanLiteSamples(rows)
 }

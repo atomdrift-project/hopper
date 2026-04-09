@@ -23,7 +23,9 @@ CREATE TABLE IF NOT EXISTS samples (
 	score         INTEGER NOT NULL DEFAULT 0,
 	created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
 	updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-	analyzed_at   TIMESTAMPTZ
+	analyzed_at   TIMESTAMPTZ,
+	mtime         TIMESTAMPTZ,
+	marker_mtime  TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_samples_label ON samples(label);
