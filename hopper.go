@@ -540,6 +540,24 @@ func (db *DB) SamplesByStatusInPaths(ctx context.Context, status string, prefixe
 	return db.samplesByStatusInPathsSQLite(ctx, status, prefixes, limit)
 }
 
+// FalsePositivesInPaths returns unlabeled-queue good samples under the given
+// prefixes whose cleave score is at or above scoreFloor and that are not marked skip.
+func (db *DB) FalsePositivesInPaths(ctx context.Context, prefixes []string, scoreFloor, limit int) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.falsePositivesInPathsPG(ctx, prefixes, scoreFloor, limit)
+	}
+	return db.falsePositivesInPathsSQLite(ctx, prefixes, scoreFloor, limit)
+}
+
+// FalseNegativesInPaths returns unlabeled-queue bad samples under the given
+// prefixes whose cleave score is at or below scoreCeiling and that are not marked skip.
+func (db *DB) FalseNegativesInPaths(ctx context.Context, prefixes []string, scoreCeiling, limit int) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.falseNegativesInPathsPG(ctx, prefixes, scoreCeiling, limit)
+	}
+	return db.falseNegativesInPathsSQLite(ctx, prefixes, scoreCeiling, limit)
+}
+
 // CountByStatusInPaths returns sample counts grouped by status, filtered to
 // samples whose path starts with one of the given prefixes.
 func (db *DB) CountByStatusInPaths(ctx context.Context, prefixes []string) (map[string]int, error) {

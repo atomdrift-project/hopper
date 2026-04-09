@@ -475,6 +475,35 @@ func (db *DB) samplesByStatusInPathsSQLite(ctx context.Context, status string, p
 	return scanLiteSamples(rows)
 }
 
+func (db *DB) falsePositivesInPathsSQLite(ctx context.Context, prefixes []string, scoreFloor, limit int) ([]*Sample, error) {
+	return db.seedCandidatesInPathsSQLite(ctx, prefixes, "good", ">=", scoreFloor, limit)
+}
+
+func (db *DB) falseNegativesInPathsSQLite(ctx context.Context, prefixes []string, scoreCeiling, limit int) ([]*Sample, error) {
+	return db.seedCandidatesInPathsSQLite(ctx, prefixes, "bad", "<=", scoreCeiling, limit)
+}
+
+func (db *DB) seedCandidatesInPathsSQLite(ctx context.Context, prefixes []string, label, op string, score, limit int) ([]*Sample, error) {
+	if len(prefixes) == 0 {
+		return nil, nil
+	}
+	var clauses []string
+	args := []any{label, score}
+	for _, p := range prefixes {
+		clauses = append(clauses, "path GLOB ?")
+		args = append(args, p+"/*")
+	}
+	args = append(args, limit)
+	//nolint:gosec // query structure is built from constants, values are parameterized
+	query := `SELECT ` + liteSampleCols + ` FROM samples WHERE status = '' AND label = ? AND skip = '' AND score ` + op + ` ? AND (` +
+		strings.Join(clauses, " OR ") + `) ORDER BY updated_at ASC LIMIT ?`
+	rows, err := db.lite.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: seed candidates in paths: %w", err)
+	}
+	return scanLiteSamples(rows)
+}
+
 func (db *DB) countByStatusInPathsSQLite(ctx context.Context, prefixes []string) (map[string]int, error) {
 	if len(prefixes) == 0 {
 		return db.countByStatusSQLite(ctx)

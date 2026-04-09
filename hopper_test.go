@@ -254,6 +254,134 @@ func TestSamplesByStatusInPaths(t *testing.T) {
 	}
 }
 
+func TestFalsePositivesInPaths(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "fp1",
+		Source:      "test",
+		Label:       "good",
+		LabelSource: "test",
+		Path:        "/data/good/app1",
+		Score:       90,
+	})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "fp2",
+		Source:      "test",
+		Label:       "good",
+		LabelSource: "test",
+		Path:        "/data/good/app2",
+		Score:       90,
+		Skip:        "misclassified",
+	})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "fp3",
+		Source:      "test",
+		Label:       "good",
+		LabelSource: "test",
+		Path:        "/data/good/app3",
+		Score:       70,
+	})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "fp4",
+		Source:      "test",
+		Label:       "bad",
+		LabelSource: "test",
+		Path:        "/data/good/app4",
+		Score:       90,
+	})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "fp5",
+		Source:      "test",
+		Label:       "good",
+		LabelSource: "test",
+		Path:        "/other/good/app5",
+		Score:       90,
+	})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "fp6",
+		Source:      "test",
+		Label:       "good",
+		LabelSource: "test",
+		Path:        "/data/good/app6",
+		Status:      "good-review",
+		Score:       90,
+	})
+
+	got, err := db.FalsePositivesInPaths(ctx, []string{"/data/good"}, 85, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SHA256 != "fp1" {
+		t.Fatalf("got %+v, want only fp1", got)
+	}
+}
+
+func TestFalseNegativesInPaths(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "fn1",
+		Source:      "test",
+		Label:       "bad",
+		LabelSource: "test",
+		Path:        "/data/bad/app1",
+		Score:       40,
+	})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "fn2",
+		Source:      "test",
+		Label:       "bad",
+		LabelSource: "test",
+		Path:        "/data/bad/app2",
+		Score:       40,
+		Skip:        "misclassified",
+	})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "fn3",
+		Source:      "test",
+		Label:       "bad",
+		LabelSource: "test",
+		Path:        "/data/bad/app3",
+		Score:       90,
+	})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "fn4",
+		Source:      "test",
+		Label:       "good",
+		LabelSource: "test",
+		Path:        "/data/bad/app4",
+		Score:       40,
+	})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "fn5",
+		Source:      "test",
+		Label:       "bad",
+		LabelSource: "test",
+		Path:        "/other/bad/app5",
+		Score:       40,
+	})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "fn6",
+		Source:      "test",
+		Label:       "bad",
+		LabelSource: "test",
+		Path:        "/data/bad/app6",
+		Status:      "bad-review",
+		Score:       40,
+	})
+
+	got, err := db.FalseNegativesInPaths(ctx, []string{"/data/bad"}, 75, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SHA256 != "fn1" {
+		t.Fatalf("got %+v, want only fn1", got)
+	}
+}
+
 func TestCountByStatusInPaths(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()

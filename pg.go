@@ -351,6 +351,31 @@ func (db *DB) samplesByStatusInPathsPG(ctx context.Context, status string, prefi
 	return scanPGSamples(rows)
 }
 
+func (db *DB) falsePositivesInPathsPG(ctx context.Context, prefixes []string, scoreFloor, limit int) ([]*Sample, error) {
+	return db.seedCandidatesInPathsPG(ctx, prefixes, "good", ">=", scoreFloor, limit)
+}
+
+func (db *DB) falseNegativesInPathsPG(ctx context.Context, prefixes []string, scoreCeiling, limit int) ([]*Sample, error) {
+	return db.seedCandidatesInPathsPG(ctx, prefixes, "bad", "<=", scoreCeiling, limit)
+}
+
+func (db *DB) seedCandidatesInPathsPG(ctx context.Context, prefixes []string, label, op string, score, limit int) ([]*Sample, error) {
+	if len(prefixes) == 0 {
+		return nil, nil
+	}
+	patterns := make([]string, len(prefixes))
+	for i, p := range prefixes {
+		patterns[i] = p + "/%"
+	}
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples WHERE status = '' AND label = $1 AND skip = '' AND score `+op+` $2 AND path LIKE ANY($3) ORDER BY updated_at ASC LIMIT $4`,
+		label, score, patterns, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: seed candidates in paths: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
 func (db *DB) countByStatusInPathsPG(ctx context.Context, prefixes []string) (map[string]int, error) {
 	var rows pgx.Rows
 	var err error
