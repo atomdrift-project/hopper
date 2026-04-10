@@ -634,9 +634,9 @@ func TestRun(t *testing.T) {
 			t.Errorf("run false-positives: %v", err)
 		}
 	})
-	withArgs([]string{"hopper", "true-positives", "-db", dbPath}, func() {
+	withArgs([]string{"hopper", "false-negatives", "-db", dbPath}, func() {
 		if err := run(t.Context()); err != nil {
-			t.Errorf("run true-positives: %v", err)
+			t.Errorf("run false-negatives: %v", err)
 		}
 	})
 	withArgs([]string{"hopper", "benign-review", "-db", dbPath}, func() {
@@ -1011,12 +1011,12 @@ func TestReviewCommands(t *testing.T) {
 			Path:        "/samples/good/fp",
 		},
 		{
-			SHA256:      "tp",
+			SHA256:      "fn",
 			Source:      "test",
 			Label:       "bad",
 			LabelSource: "test",
-			Score:       90,
-			Path:        "/samples/bad/tp",
+			Score:       20,
+			Path:        "/samples/bad/fn",
 		},
 		{
 			SHA256:      "br",
@@ -1050,10 +1050,10 @@ func TestReviewCommands(t *testing.T) {
 		args []string
 		want string
 	}{
-		{[]string{"hopper", "false-positives", "-db", dbPath, "-score", "85"}, "fp"},
-		{[]string{"hopper", "true-positives", "-db", dbPath, "-score", "85"}, "tp"},
-		{[]string{"hopper", "benign-review", "-db", dbPath, "-score", "85"}, "br"},
-		{[]string{"hopper", "bad-review", "-db", dbPath, "-score", "25"}, "mr"},
+		{[]string{"hopper", "false-positives", "-db", dbPath, "-threshold", "85"}, "fp"},
+		{[]string{"hopper", "false-negatives", "-db", dbPath, "-threshold", "25"}, "fn"},
+		{[]string{"hopper", "benign-review", "-db", dbPath, "-threshold", "85"}, "br"},
+		{[]string{"hopper", "bad-review", "-db", dbPath, "-threshold", "25"}, "mr"},
 	}
 
 	for _, tt := range tests {
@@ -1067,5 +1067,97 @@ func TestReviewCommands(t *testing.T) {
 		if !strings.Contains(out, tt.want) {
 			t.Fatalf("output for %v = %q, want substring %q", tt.args[1], out, tt.want)
 		}
+	}
+}
+
+func TestReviewFlushCommands(t *testing.T) {
+	ctx := t.Context()
+	dbPath := filepath.Join(t.TempDir(), "review-flush.db")
+	db := mustOpenDB(t, ctx, dbPath)
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	benignPath := filepath.Join(dir, "marker-benign.bin")
+	badPath := filepath.Join(dir, "marker-bad.bin")
+	mustWriteFile(t, benignPath, []byte("malicious payload!"))
+	mustWriteFile(t, badPath, []byte("harmless content!"))
+	mustWriteFile(t, reviewMarkerPath("benign-review", benignPath), nil)
+	mustWriteFile(t, reviewMarkerPath("bad-review", badPath), nil)
+
+	for _, sample := range []*hopper.Sample{
+		{
+			SHA256:      "br-flush",
+			Source:      "test",
+			Label:       "good",
+			LabelSource: "marker",
+			Skip:        "misclassified",
+			Score:       90,
+			Path:        benignPath,
+		},
+		{
+			SHA256:      "mr-flush",
+			Source:      "test",
+			Label:       "bad",
+			LabelSource: "marker",
+			Skip:        "misclassified",
+			Score:       20,
+			Path:        badPath,
+		},
+	} {
+		if err := db.InsertSample(ctx, sample); err != nil {
+			t.Fatal(err)
+		}
+		result := []byte(fmt.Sprintf(`{"fs":[{"sha":"%s","x":%d,"dp":0}]}`, sample.SHA256, sample.Score))
+		if err := db.UpdateCleaveResult(ctx, sample.SHA256, result, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	out := captureStdout(t, func() {
+		withArgs([]string{"hopper", "benign-review", "-db", dbPath, "-threshold", "85", "-flush"}, func() {
+			if err := run(ctx); err != nil {
+				t.Fatalf("run benign-review --flush: %v", err)
+			}
+		})
+	})
+	if !strings.Contains(out, "br-flush") {
+		t.Fatalf("benign-review flush output = %q, want br-flush", out)
+	}
+
+	out = captureStdout(t, func() {
+		withArgs([]string{"hopper", "bad-review", "-db", dbPath, "-threshold", "25", "-flush"}, func() {
+			if err := run(ctx); err != nil {
+				t.Fatalf("run bad-review --flush: %v", err)
+			}
+		})
+	})
+	if !strings.Contains(out, "mr-flush") {
+		t.Fatalf("bad-review flush output = %q, want mr-flush", out)
+	}
+
+	if _, err := os.Stat(reviewMarkerPath("benign-review", benignPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("benign marker still exists: %v", err)
+	}
+	if _, err := os.Stat(reviewMarkerPath("bad-review", badPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("bad marker still exists: %v", err)
+	}
+
+	br, err := db.SampleBySHA256(ctx, "br-flush")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if br.Label != "bad" || br.LabelSource != "flush" || br.Skip != "" {
+		t.Fatalf("benign-review flush sample = %+v, want label=bad label_source=flush skip=''", br)
+	}
+
+	mr, err := db.SampleBySHA256(ctx, "mr-flush")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mr.Label != "good" || mr.LabelSource != "flush" || mr.Skip != "" {
+		t.Fatalf("bad-review flush sample = %+v, want label=good label_source=flush skip=''", mr)
 	}
 }

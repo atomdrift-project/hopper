@@ -37,7 +37,7 @@ commands:
   reset           delete all samples and reports (preserves schema)
   import          transfer samples between hopper databases (sqlite↔postgres)
   false-positives list known-good files that still score bad
-  true-positives  list known-bad files that also score bad
+  false-negatives list known-bad files that still score benign
   benign-review   list marker-benign files whose score still looks bad
   bad-review      list marker-bad files whose score still looks benign
   stats           show sample counts
@@ -143,8 +143,8 @@ func run(ctx context.Context) error {
 		return cmdReset(ctx)
 	case "false-positives":
 		return cmdFalsePositives(ctx)
-	case "true-positives":
-		return cmdTruePositives(ctx)
+	case "false-negatives":
+		return cmdFalseNegatives(ctx)
 	case "benign-review":
 		return cmdBenignReview(ctx)
 	case "bad-review":
@@ -1217,16 +1217,18 @@ func cmdStats(ctx context.Context) error {
 
 type sampleListFunc func(context.Context, *hopper.DB, int, int) ([]*hopper.Sample, error)
 
-func reviewFlags(name string) (*flag.FlagSet, *string, *int, *int) {
+func reviewFlags(name string) (*flag.FlagSet, *string, *int, *int, *bool) {
 	f := flag.NewFlagSet(name, flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
-	score := f.Int("score", 85, "score threshold")
+	score := f.Int("threshold", 85, "score threshold")
+	f.IntVar(score, "score", 85, "score threshold (deprecated: use --threshold)")
 	limit := f.Int("limit", 100, "maximum rows to print")
-	return f, dsn, score, limit
+	flush := f.Bool("flush", false, "delete matching review markers and restore the underlying label")
+	return f, dsn, score, limit, flush
 }
 
 func runReviewCommand(ctx context.Context, args []string, name string, list sampleListFunc) error {
-	f, dsn, score, limit := reviewFlags(name)
+	f, dsn, score, limit, flush := reviewFlags(name)
 	parseFlags(f, args)
 
 	db, err := openDB(ctx, *dsn)
@@ -1239,6 +1241,12 @@ func runReviewCommand(ctx context.Context, args []string, name string, list samp
 	if err != nil {
 		return err
 	}
+	if *flush {
+		if err := flushReviewSamples(ctx, db, name, samples); err != nil {
+			return err
+		}
+		return nil
+	}
 	for _, s := range samples {
 		age := sampleAgeDays(s.Mtime)
 		if name == "benign-review" || name == "bad-review" {
@@ -1248,6 +1256,43 @@ func runReviewCommand(ctx context.Context, args []string, name string, list samp
 			s.ID, s.SHA256, s.Score, age, s.Label, s.LabelSource, s.Path)
 	}
 	return nil
+}
+
+func flushReviewSamples(ctx context.Context, db *hopper.DB, name string, samples []*hopper.Sample) error {
+	if name != "benign-review" && name != "bad-review" {
+		return fmt.Errorf("%s does not support --flush", name)
+	}
+
+	targetLabel := "bad"
+	targetSource := "flush"
+	if name == "bad-review" {
+		targetLabel = "good"
+	}
+
+	for _, s := range samples {
+		markerPath := reviewMarkerPath(name, s.Path)
+		if err := os.Remove(markerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove marker for %s: %w", s.Path, err)
+		}
+		if err := db.Reclassify(ctx, s.SHA256, targetLabel, targetSource); err != nil {
+			return err
+		}
+		if err := db.SetSkip(ctx, s.SHA256, ""); err != nil {
+			return err
+		}
+		writeStdoutf("flushed  %-64s  %s\n", s.SHA256, s.Path)
+	}
+	return nil
+}
+
+func reviewMarkerPath(name, samplePath string) string {
+	suffix := markerBenign
+	if name == "bad-review" {
+		suffix = markerBad
+	}
+	dir := filepath.Dir(samplePath)
+	base := filepath.Base(samplePath)
+	return filepath.Join(dir, markerPrefix+base+suffix)
 }
 
 func sampleAgeDays(ts *time.Time) string {
@@ -1268,10 +1313,10 @@ func cmdFalsePositives(ctx context.Context) error {
 		})
 }
 
-func cmdTruePositives(ctx context.Context) error {
-	return runReviewCommand(ctx, os.Args[2:], "true-positives",
+func cmdFalseNegatives(ctx context.Context) error {
+	return runReviewCommand(ctx, os.Args[2:], "false-negatives",
 		func(ctx context.Context, db *hopper.DB, score, limit int) ([]*hopper.Sample, error) {
-			return db.TruePositives(ctx, score, limit)
+			return db.FalseNegatives(ctx, score, limit)
 		})
 }
 
