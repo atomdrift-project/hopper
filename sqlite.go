@@ -118,6 +118,10 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		}
 	}
 
+	if _, err := db.lite.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_samples_file_type ON samples(file_type)`); err != nil {
+		return fmt.Errorf("hopper: migrate sqlite: %w", err)
+	}
+
 	return nil
 }
 
@@ -338,9 +342,10 @@ func (db *DB) updateCleaveResultSQLite(ctx context.Context, sha256 string, resul
 	_, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET cleave_result = ?,
 			canonical_sha256 = ?, formula = ?, elements = ?, score = ?,
+			file_type = CASE WHEN ? = '' THEN file_type ELSE ? END,
 			litmus_result = NULL, litmus_score = 0,
 			analyzed_at = ?, updated_at = ?
-		WHERE sha256 = ?`, string(result), canonical, fi.Formula, fi.Elements, fi.Score, n, n, sha256)
+		WHERE sha256 = ?`, string(result), canonical, fi.Formula, fi.Elements, fi.Score, fi.FileType, fi.FileType, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
 	}
@@ -506,9 +511,10 @@ func (db *DB) updateSampleSQLite(ctx context.Context, sha256, status string, res
 	_, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET status = ?, cleave_result = ?,
 			canonical_sha256 = ?, formula = ?, elements = ?, score = ?,
+			file_type = CASE WHEN ? = '' THEN file_type ELSE ? END,
 			litmus_result = NULL, litmus_score = 0,
 			analyzed_at = ?, updated_at = ?
-		WHERE sha256 = ?`, status, string(result), canonical, fi.Formula, fi.Elements, fi.Score, n, n, sha256)
+		WHERE sha256 = ?`, status, string(result), canonical, fi.Formula, fi.Elements, fi.Score, fi.FileType, fi.FileType, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update sample: %w", err)
 	}
@@ -725,6 +731,80 @@ func (db *DB) recomputeCanonicalSHA256SQLite(ctx context.Context) (int64, error)
 		return 0, fmt.Errorf("hopper: rows affected recompute canonical sha256: %w", err)
 	}
 	return n, nil
+}
+
+// stripSubscriptsSQL is the SQLite expression equivalent of stripSubscripts:
+// chained replace() over each Unicode subscript digit. Ugly but keeps the
+// work in SQL where it's free compared to streaming blobs to Go.
+const stripSubscriptsSQL = `replace(replace(replace(replace(replace(` +
+	`replace(replace(replace(replace(replace(` +
+	`%s, '₀',''),'₁',''),'₂',''),'₃',''),'₄',''),` +
+	`'₅',''),'₆',''),'₇',''),'₈',''),'₉','')`
+
+// backfillSQLite mirrors backfillPG: SQL-side re-derivation gated on
+// file_type = '' so already-backfilled rows are skipped cheaply.
+// See backfillPG for the rationale.
+func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
+	var stats BackfillStats
+	ts := now()
+
+	if err := db.lite.QueryRowContext(ctx, `
+		SELECT count(*) FROM samples
+		WHERE file_type = ''
+			AND (cleave_result IS NOT NULL OR litmus_result IS NOT NULL)`).Scan(&stats.Scanned); err != nil {
+		return stats, fmt.Errorf("hopper: backfill count: %w", err)
+	}
+	if stats.Scanned == 0 {
+		return stats, nil
+	}
+
+	// Pass 1: formula / elements / score / file_type from cleave_result.
+	// json_each over $.fs, filter to the depth-0 entry. Rows without one
+	// are silently skipped (matches PG behavior).
+	cleaveSQL := `
+		WITH cleave_extract AS (
+			SELECT s.sha256,
+				json_extract(je.value, '$.f') AS f,
+				json_extract(je.value, '$.x') AS x,
+				json_extract(je.value, '$.type') AS t
+			FROM samples s, json_each(s.cleave_result, '$.fs') je
+			WHERE s.file_type = ''
+				AND s.cleave_result IS NOT NULL
+				AND json_extract(je.value, '$.dp') = 0
+		)
+		UPDATE samples SET
+			formula = COALESCE(j.f, ''),
+			elements = ` + fmt.Sprintf(stripSubscriptsSQL, "COALESCE(j.f, '')") + `,
+			score = COALESCE(j.x, 0),
+			file_type = CASE WHEN COALESCE(j.t, '') = '' THEN samples.file_type ELSE j.t END,
+			updated_at = ?
+		FROM cleave_extract j
+		WHERE samples.sha256 = j.sha256
+			AND samples.file_type = ''`
+	cleaveRes, err := db.lite.ExecContext(ctx, cleaveSQL, ts)
+	if err != nil {
+		return stats, fmt.Errorf("hopper: backfill cleave columns: %w", err)
+	}
+	if n, err := cleaveRes.RowsAffected(); err == nil {
+		stats.Updated += n
+	}
+
+	// Pass 2: litmus_score from litmus_result.prob, same scope.
+	litmusRes, err := db.lite.ExecContext(ctx, `
+		UPDATE samples SET
+			litmus_score = COALESCE(json_extract(litmus_result, '$.prob'), 0),
+			updated_at = ?
+		WHERE file_type = ''
+			AND litmus_result IS NOT NULL
+			AND litmus_score IS NOT COALESCE(json_extract(litmus_result, '$.prob'), 0)`, ts)
+	if err != nil {
+		return stats, fmt.Errorf("hopper: backfill litmus_score: %w", err)
+	}
+	if n, err := litmusRes.RowsAffected(); err == nil {
+		stats.Updated += n
+	}
+
+	return stats, nil
 }
 
 func (db *DB) setSkipSQLite(ctx context.Context, sha256, skip string) error {

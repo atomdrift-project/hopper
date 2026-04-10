@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS samples (
 );
 
 CREATE INDEX IF NOT EXISTS idx_samples_label ON samples(label);
+CREATE INDEX IF NOT EXISTS idx_samples_file_type ON samples(file_type);
 CREATE INDEX IF NOT EXISTS idx_samples_unanalyzed ON samples(sha256) WHERE cleave_result IS NULL;
 CREATE INDEX IF NOT EXISTS idx_samples_status ON samples(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_samples_path ON samples(path);

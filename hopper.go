@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -149,21 +150,24 @@ type Report struct {
 type cleaveFileInfo struct {
 	Formula  string
 	Elements string
+	FileType string
 	Score    int
 }
 
-// parseCleaveFile extracts formula, elements, and score from a cleave result
-// for the file matching the given SHA256 (depth 0 / first file).
+// parseCleaveFile extracts formula, elements, score, and file type from a
+// cleave result for the file matching the given SHA256 (preferring an exact
+// SHA match, then falling back to depth 0).
 func parseCleaveFile(sha256 string, result []byte) cleaveFileInfo {
 	if len(result) == 0 {
 		return cleaveFileInfo{}
 	}
 	var report struct {
 		Files []struct {
-			SHA256  string `json:"sha"`
-			Formula string `json:"f"`
-			Score   int    `json:"x"`
-			Depth   int    `json:"dp"`
+			SHA256   string `json:"sha"`
+			Formula  string `json:"f"`
+			FileType string `json:"type"`
+			Score    int    `json:"x"`
+			Depth    int    `json:"dp"`
 		} `json:"fs"`
 	}
 	if json.Unmarshal(result, &report) != nil {
@@ -174,11 +178,27 @@ func parseCleaveFile(sha256 string, result []byte) cleaveFileInfo {
 			return cleaveFileInfo{
 				Formula:  f.Formula,
 				Elements: stripSubscripts(f.Formula),
+				FileType: f.FileType,
 				Score:    f.Score,
 			}
 		}
 	}
 	return cleaveFileInfo{}
+}
+
+// parseLitmusProb extracts the litmus confidence score from a litmus result
+// envelope. Returns 0 if the envelope is missing or unparseable.
+func parseLitmusProb(result []byte) float64 {
+	if len(result) == 0 {
+		return 0
+	}
+	var envelope struct {
+		Prob float64 `json:"prob"`
+	}
+	if json.Unmarshal(result, &envelope) != nil {
+		return 0
+	}
+	return envelope.Prob
 }
 
 // stripSubscripts removes Unicode subscript digits (₀-₉) from a formula,
@@ -339,12 +359,27 @@ func (db *DB) Close() {
 // Pool returns the underlying PostgreSQL connection pool, or nil for SQLite.
 func (db *DB) Pool() *pgxpool.Pool { return db.pool }
 
-// Migrate creates the schema if it does not exist.
+// Migrate creates the schema if it does not exist, then backfills any
+// rows missing derivable columns. The backfill is gated on file_type = ''
+// so it's a single indexed count on already-migrated databases.
 func (db *DB) Migrate(ctx context.Context) error {
 	if db.pool != nil {
-		return db.migratePG(ctx)
+		if err := db.migratePG(ctx); err != nil {
+			return err
+		}
+	} else {
+		if err := db.migrateSQLite(ctx); err != nil {
+			return err
+		}
 	}
-	return db.migrateSQLite(ctx)
+	stats, err := db.Backfill(ctx)
+	if err != nil {
+		return fmt.Errorf("hopper: post-migrate backfill: %w", err)
+	}
+	if stats.Updated > 0 {
+		slog.Info("post-migrate backfill", "scanned", stats.Scanned, "updated", stats.Updated)
+	}
+	return nil
 }
 
 // DeleteAll removes all rows from reports and samples, preserving the schema.
@@ -412,14 +447,7 @@ func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []by
 // UpdateLitmusResult stores the litmus classification envelope for a sample.
 // The result should be the litmus response JSON without the embedded cleave field.
 func (db *DB) UpdateLitmusResult(ctx context.Context, sha256 string, result []byte) error {
-	var prob float64
-	var envelope struct {
-		Prob float64 `json:"prob"`
-	}
-	if json.Unmarshal(result, &envelope) == nil {
-		prob = envelope.Prob
-	}
-
+	prob := parseLitmusProb(result)
 	if db.pool != nil {
 		return db.updateLitmusResultPG(ctx, sha256, result, prob)
 	}
@@ -631,6 +659,26 @@ func (db *DB) SamplesByEmbeddedSHA256(ctx context.Context, sha256 string, limit 
 		return db.samplesByEmbeddedSHA256PG(ctx, sha256, limit)
 	}
 	return db.samplesByEmbeddedSHA256SQLite(ctx, sha256, limit)
+}
+
+// BackfillStats reports the outcome of a Backfill run.
+type BackfillStats struct {
+	Scanned int64 // rows examined
+	Updated int64 // rows where at least one derivable column changed
+}
+
+// Backfill re-derives columns from cleave_result and litmus_result for every
+// sample with at least one of those blobs, updating rows where the stored
+// values disagree with what the parsers produce. Useful after parser changes
+// or for rows that pre-date a column being populated on write.
+//
+// Currently backfills: formula, elements, score, file_type (from cleave_result)
+// and litmus_score (from litmus_result).
+func (db *DB) Backfill(ctx context.Context) (BackfillStats, error) {
+	if db.pool != nil {
+		return db.backfillPG(ctx)
+	}
+	return db.backfillSQLite(ctx)
 }
 
 // RecomputeCanonicalSHA256 recalculates canonical_sha256 for all analyzed

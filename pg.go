@@ -48,6 +48,7 @@ func (db *DB) migratePG(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed ON samples(feed) WHERE feed != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_ecosystem ON samples(ecosystem) WHERE ecosystem != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_mtime ON samples(mtime) WHERE mtime IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_file_type ON samples(file_type)`,
 	} {
 		slog.Debug("executing migration ddl", "ddl", ddl)
 		if _, err := db.pool.Exec(ctx, ddl); err != nil {
@@ -211,9 +212,10 @@ func (db *DB) updateCleaveResultPG(ctx context.Context, sha256 string, result []
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET cleave_result = $2,
 			canonical_sha256 = $3, formula = $4, elements = $5, score = $6,
+			file_type = COALESCE(NULLIF($7, ''), file_type),
 			litmus_result = NULL, litmus_score = 0,
 			analyzed_at = now(), updated_at = now()
-		WHERE sha256 = $1`, sha256, sanitizeJSONB(result), canonical, fi.Formula, fi.Elements, fi.Score)
+		WHERE sha256 = $1`, sha256, sanitizeJSONB(result), canonical, fi.Formula, fi.Elements, fi.Score, fi.FileType)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
 	}
@@ -378,9 +380,10 @@ func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result 
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET status = $2, cleave_result = $3,
 			canonical_sha256 = $4, formula = $5, elements = $6, score = $7,
+			file_type = COALESCE(NULLIF($8, ''), file_type),
 			litmus_result = NULL, litmus_score = 0,
 			analyzed_at = now(), updated_at = now()
-		WHERE sha256 = $1`, sha256, status, sanitizeJSONB(result), canonical, fi.Formula, fi.Elements, fi.Score)
+		WHERE sha256 = $1`, sha256, status, sanitizeJSONB(result), canonical, fi.Formula, fi.Elements, fi.Score, fi.FileType)
 	if err != nil {
 		return fmt.Errorf("hopper: update sample: %w", err)
 	}
@@ -585,6 +588,74 @@ func (db *DB) recomputeCanonicalSHA256PG(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("hopper: recompute canonical sha256: %w", err)
 	}
 	return tag.RowsAffected(), nil
+}
+
+// backfillPG re-derives parseCleaveFile / parseLitmusProb columns entirely
+// in SQL using JSON_TABLE (PG17+), avoiding the cost of streaming JSONB
+// blobs into Go.
+//
+// Only rows with file_type = '' are touched. file_type is the most recently
+// added column populated by writes, so an empty value is a reliable signal
+// that the row pre-dates the unified backfill path and may be missing other
+// derivable columns too. Rows backfilled previously are skipped cheaply by
+// an index lookup, so this is safe to run repeatedly.
+func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
+	var stats BackfillStats
+
+	// Candidate rows: have analysis output and file_type was never set.
+	if err := db.pool.QueryRow(ctx, `
+		SELECT count(*) FROM samples
+		WHERE file_type = ''
+			AND (cleave_result IS NOT NULL OR litmus_result IS NOT NULL)`).Scan(&stats.Scanned); err != nil {
+		return stats, fmt.Errorf("hopper: backfill count: %w", err)
+	}
+	if stats.Scanned == 0 {
+		return stats, nil
+	}
+
+	// Pass 1: formula / elements / score / file_type from cleave_result.
+	// JSON_TABLE filters to the depth-0 entry; rows without one are skipped.
+	// elements = formula with Unicode subscripts ₀..₉ stripped.
+	cleaveTag, err := db.pool.Exec(ctx, `
+		UPDATE samples s SET
+			formula = COALESCE(j.f, ''),
+			elements = translate(COALESCE(j.f, ''), '₀₁₂₃₄₅₆₇₈₉', ''),
+			score = COALESCE(j.x, 0),
+			file_type = COALESCE(NULLIF(j.t, ''), s.file_type),
+			updated_at = now()
+		FROM (
+			SELECT s2.sha256, jt.f, jt.x, jt.t
+			FROM samples s2,
+				JSON_TABLE(s2.cleave_result, '$.fs[*] ? (@.dp == 0)' COLUMNS (
+					f TEXT PATH '$.f',
+					x INTEGER PATH '$.x',
+					t TEXT PATH '$.type'
+				)) AS jt
+			WHERE s2.file_type = ''
+				AND s2.cleave_result IS NOT NULL
+		) AS j
+		WHERE s.sha256 = j.sha256
+			AND s.file_type = ''`)
+	if err != nil {
+		return stats, fmt.Errorf("hopper: backfill cleave columns: %w", err)
+	}
+	stats.Updated += cleaveTag.RowsAffected()
+
+	// Pass 2: litmus_score from litmus_result.prob, scoped to the same
+	// "stale" set so we don't pay JSON parsing on already-backfilled rows.
+	litmusTag, err := db.pool.Exec(ctx, `
+		UPDATE samples SET
+			litmus_score = COALESCE((litmus_result->>'prob')::double precision, 0),
+			updated_at = now()
+		WHERE file_type = ''
+			AND litmus_result IS NOT NULL
+			AND litmus_score IS DISTINCT FROM COALESCE((litmus_result->>'prob')::double precision, 0)`)
+	if err != nil {
+		return stats, fmt.Errorf("hopper: backfill litmus_score: %w", err)
+	}
+	stats.Updated += litmusTag.RowsAffected()
+
+	return stats, nil
 }
 
 func (db *DB) setSkipPG(ctx context.Context, sha256, skip string) error {

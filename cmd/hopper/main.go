@@ -40,6 +40,7 @@ commands:
   false-negatives list known-bad files that still score benign
   benign-review   list marker-benign files whose score still looks bad
   bad-review      list marker-bad files whose score still looks benign
+  backfill        re-derive columns from cleave_result/litmus_result blobs
   stats           show sample counts
 `
 
@@ -149,6 +150,8 @@ func run(ctx context.Context) error {
 		return cmdBenignReview(ctx)
 	case "bad-review":
 		return cmdBadReview(ctx)
+	case "backfill":
+		return cmdBackfill(ctx)
 	case "stats":
 		return cmdStats(ctx)
 	default:
@@ -1212,6 +1215,26 @@ func cmdStats(ctx context.Context) error {
 		total += n
 	}
 	writeStdoutf("%-10s %d\n", "total", total)
+	return nil
+}
+
+func cmdBackfill(ctx context.Context) error {
+	f := flag.NewFlagSet("backfill", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	parseFlags(f, os.Args[2:])
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	slog.Info("backfilling derivable columns from cleave_result and litmus_result")
+	stats, err := db.Backfill(ctx)
+	if err != nil {
+		return err
+	}
+	slog.Info("backfill complete", "scanned", stats.Scanned, "updated", stats.Updated)
 	return nil
 }
 
