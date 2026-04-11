@@ -741,8 +741,8 @@ const stripSubscriptsSQL = `replace(replace(replace(replace(replace(` +
 	`%s, '₀',''),'₁',''),'₂',''),'₃',''),'₄',''),` +
 	`'₅',''),'₆',''),'₇',''),'₈',''),'₉','')`
 
-// backfillSQLite mirrors backfillPG: SQL-side re-derivation gated on
-// file_type = '' so already-backfilled rows are skipped cheaply.
+// backfillSQLite mirrors backfillPG: SQL-side re-derivation gated on an
+// empty file_type column so already-backfilled rows are skipped cheaply.
 // See backfillPG for the rationale.
 func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 	var stats BackfillStats
@@ -760,7 +760,11 @@ func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 
 	// Pass 1: formula / elements / score / file_type from cleave_result.
 	// json_each over $.fs, filter to the depth-0 entry. Rows without one
-	// are silently skipped (matches PG behavior).
+	// are silently skipped (matches PG behavior). stripSubscriptsSQL is a
+	// compile-time format string filled with a compile-time expression,
+	// so there's no tainted input despite the string concatenation.
+	elementsExpr := fmt.Sprintf(stripSubscriptsSQL, "COALESCE(j.f, '')")
+	//nolint:gosec // constant SQL fragments, no tainted input.
 	cleaveSQL := `
 		WITH cleave_extract AS (
 			SELECT s.sha256,
@@ -774,7 +778,7 @@ func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 		)
 		UPDATE samples SET
 			formula = COALESCE(j.f, ''),
-			elements = ` + fmt.Sprintf(stripSubscriptsSQL, "COALESCE(j.f, '')") + `,
+			elements = ` + elementsExpr + `,
 			score = COALESCE(j.x, 0),
 			file_type = CASE WHEN COALESCE(j.t, '') = '' THEN samples.file_type ELSE j.t END,
 			updated_at = ?
@@ -815,6 +819,66 @@ func (db *DB) setSkipSQLite(ctx context.Context, sha256, skip string) error {
 		return fmt.Errorf("hopper: set skip: %w", err)
 	}
 	return nil
+}
+
+func (db *DB) deleteSampleSQLite(ctx context.Context, sha256 string) error {
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("hopper: begin delete: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM reports WHERE sha256 = ?`, sha256); err != nil {
+		return fmt.Errorf("hopper: delete sample reports: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM samples WHERE sha256 = ?`, sha256); err != nil {
+		return fmt.Errorf("hopper: delete sample: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("hopper: commit delete: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) purgeUnsupportedSQLite(ctx context.Context, dryRun bool) (int64, error) {
+	if dryRun {
+		var n int64
+		err := db.lite.QueryRowContext(ctx, `
+			SELECT count(*) FROM samples
+			WHERE cleave_result IS NOT NULL AND file_type = ''`).Scan(&n)
+		if err != nil {
+			return 0, fmt.Errorf("hopper: count unsupported: %w", err)
+		}
+		return n, nil
+	}
+
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: begin purge: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
+
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM reports WHERE sha256 IN (
+			SELECT sha256 FROM samples
+			WHERE cleave_result IS NOT NULL AND file_type = ''
+		)`); err != nil {
+		return 0, fmt.Errorf("hopper: purge unsupported reports: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `
+		DELETE FROM samples
+		WHERE cleave_result IS NOT NULL AND file_type = ''`)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: purge unsupported: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("hopper: purge unsupported rows affected: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("hopper: commit purge: %w", err)
+	}
+	return n, nil
 }
 
 func (db *DB) deleteAllSQLite(ctx context.Context) error {

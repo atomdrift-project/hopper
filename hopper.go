@@ -275,6 +275,13 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 			continue
 		}
 
+		// Skip members cleave couldn't classify: they have no analytical value
+		// and inserting them just pollutes the DB with rows the pipeline will
+		// never usefully act on.
+		if entry.FileType == "" {
+			continue
+		}
+
 		// Count suspicious+ findings with sufficient confidence for skip logic.
 		maxLevel := 0
 		suspiciousCount := 0
@@ -337,6 +344,29 @@ func (db *DB) SetSkip(ctx context.Context, sha256, skip string) error {
 	return db.setSkipSQLite(ctx, sha256, skip)
 }
 
+// DeleteSample removes a single sample by SHA256. Returns nil even if no
+// row matched (idempotent, like a DELETE with a WHERE clause).
+func (db *DB) DeleteSample(ctx context.Context, sha256 string) error {
+	if db.pool != nil {
+		return db.deleteSamplePG(ctx, sha256)
+	}
+	return db.deleteSampleSQLite(ctx, sha256)
+}
+
+// PurgeUnsupported deletes all samples that were analyzed but for which
+// cleave produced no recognized file type — rows that slipped past
+// ingest-time classification and carry no analytical value. Returns the
+// number of rows deleted. When dryRun is true, the query runs as a
+// SELECT count(*) and no rows are removed.
+//
+// Uses the idx_samples_file_type index, so it's cheap even on large tables.
+func (db *DB) PurgeUnsupported(ctx context.Context, dryRun bool) (int64, error) {
+	if db.pool != nil {
+		return db.purgeUnsupportedPG(ctx, dryRun)
+	}
+	return db.purgeUnsupportedSQLite(ctx, dryRun)
+}
+
 // Open connects to the registry. DSNs starting with postgres:// or
 // postgresql:// use PostgreSQL; everything else is treated as a SQLite path.
 func Open(ctx context.Context, dsn string) (*DB, error) {
@@ -360,8 +390,9 @@ func (db *DB) Close() {
 func (db *DB) Pool() *pgxpool.Pool { return db.pool }
 
 // Migrate creates the schema if it does not exist, then backfills any
-// rows missing derivable columns. The backfill is gated on file_type = ''
-// so it's a single indexed count on already-migrated databases.
+// rows missing derivable columns. The backfill is gated on the file_type
+// column being empty so it's a single indexed count on already-migrated
+// databases.
 func (db *DB) Migrate(ctx context.Context) error {
 	if db.pool != nil {
 		if err := db.migratePG(ctx); err != nil {
@@ -433,11 +464,19 @@ func (db *DB) SampleBySHA256(ctx context.Context, sha256 string) (*Sample, error
 // UpdateCleaveResult stores analysis output for a sample.
 // Pass canonicalSHA256 as the minimum SHA256 across the sample and its embedded
 // files (for train/test splits). Pass "" to compute it from result automatically.
+//
+// If cleave could not classify the file (fi.FileType == ""), the row is
+// deleted instead of updated: an unclassified row carries no analytical
+// value and only pollutes later queries. This is the belt-and-suspenders
+// complement to the ingest-time filter in cleave iter-files.
 func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []byte, canonicalSHA256 string) error {
 	if canonicalSHA256 == "" {
 		canonicalSHA256 = canonicalSHA(sha256, result)
 	}
 	fi := parseCleaveFile(sha256, result)
+	if fi.FileType == "" {
+		return db.DeleteSample(ctx, sha256)
+	}
 	if db.pool != nil {
 		return db.updateCleaveResultPG(ctx, sha256, result, canonicalSHA256, fi)
 	}
@@ -579,11 +618,18 @@ func (db *DB) CountAnalyzed(ctx context.Context) (int64, error) {
 }
 
 // UpdateSample updates status, cleave result, and updated_at in one operation.
+//
+// If cleave could not classify the file (fi.FileType == ""), the row is
+// deleted instead of updated — matches UpdateCleaveResult's belt-and-suspenders
+// rule so the two analysis-save paths stay consistent.
 func (db *DB) UpdateSample(ctx context.Context, sha256, status string, result []byte, canonicalSHA256 string) error {
 	if canonicalSHA256 == "" {
 		canonicalSHA256 = canonicalSHA(sha256, result)
 	}
 	fi := parseCleaveFile(sha256, result)
+	if fi.FileType == "" {
+		return db.DeleteSample(ctx, sha256)
+	}
 	if db.pool != nil {
 		return db.updateSamplePG(ctx, sha256, status, result, canonicalSHA256, fi)
 	}

@@ -2,17 +2,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
 	"math"
-	"math/rand/v2"
 	"net/url"
 	"os"
 	"os/exec"
@@ -31,17 +31,18 @@ import (
 const usageText = `usage: hopper <command>
 
 commands:
-  serve           start a local postgres server with hopper schema
-  init            create/migrate a hopper database (sqlite or postgres)
-  load            load sample files from directories
-  reset           delete all samples and reports (preserves schema)
-  import          transfer samples between hopper databases (sqlite↔postgres)
-  false-positives list known-good files that still score bad
-  false-negatives list known-bad files that still score benign
-  benign-review   list marker-benign files whose score still looks bad
-  bad-review      list marker-bad files whose score still looks benign
-  backfill        re-derive columns from cleave_result/litmus_result blobs
-  stats           show sample counts
+  serve              start a local postgres server with hopper schema
+  init               create/migrate a hopper database (sqlite or postgres)
+  load               load sample files from directories
+  reset              delete all samples and reports (preserves schema)
+  import             transfer samples between hopper databases (sqlite↔postgres)
+  false-positives    list known-good files that still score bad
+  false-negatives    list known-bad files that still score benign
+  benign-review      list marker-benign files whose score still looks bad
+  bad-review         list marker-bad files whose score still looks benign
+  backfill           re-derive columns from cleave_result/litmus_result blobs
+  purge-unsupported  delete analyzed rows cleave could not classify
+  stats              show sample counts
 `
 
 func writeStderrf(format string, args ...any) {
@@ -152,6 +153,8 @@ func run(ctx context.Context) error {
 		return cmdBadReview(ctx)
 	case "backfill":
 		return cmdBackfill(ctx)
+	case "purge-unsupported":
+		return cmdPurgeUnsupported(ctx)
 	case "stats":
 		return cmdStats(ctx)
 	default:
@@ -405,6 +408,7 @@ func cmdLoad(ctx context.Context) error {
 	dataDir := f.String("data", "", "data directory containing bad/, good/, unknown/ subdirectories")
 	source := f.String("source", "harvest", "sample source tag")
 	workers := f.Int("workers", 8, "concurrent hash/insert workers")
+	cleaveBinFlag := f.String("cleave", "cleave", "path to cleave binary (used for file enumeration)")
 	litmusBin := f.String("litmus", "litmus", "path to litmus binary (pass empty to disable)")
 	litmusWorkers := f.Int("litmus-workers", max(1, runtime.NumCPU()-1), "concurrent litmus analysis workers")
 	maxRSSGB := f.Int("max-memory-gb", 32, "litmus RSS limit in GB")
@@ -419,6 +423,8 @@ func cmdLoad(ctx context.Context) error {
 	if *dataDir == "" {
 		return errors.New("pass --data <directory> (expects bad/, good/, unknown/ subdirectories)")
 	}
+
+	cleaveBinary = *cleaveBinFlag
 
 	// Discover label directories under --data.
 	// Convention: bad/ → label "bad", good/ → label "good", unknown/ → label "unknown".
@@ -524,12 +530,6 @@ type loadJob struct {
 	sha  string // set after hashing
 }
 
-// hashedFile is a file that has been read and hashed, ready for DB insert.
-type hashedFile struct {
-	sample *hopper.Sample
-	path   string
-}
-
 // loadProgress tracks counters across concurrent load workers.
 type loadProgress struct { //nolint:govet // counters are grouped by pipeline stage for maintenance.
 	walked     atomic.Int64
@@ -566,317 +566,299 @@ var (
 	errTooLarge = errors.New("too large")
 )
 
-//nolint:gocognit,revive,maintidx // coordinates the end-to-end load pipeline in one place.
+// loadAll orchestrates a load: analysis workers, a progress dashboard, and
+// one per-directory pipeline goroutine that owns cleave→hash→batch→insert
+// for its directory and queues analysis jobs directly. Everything waits on
+// the directory pipelines; then the analysis queue is closed and drained;
+// then the summary is logged. nworkers bounds how many directory pipelines
+// may run concurrently (irrelevant for typical 3-dir loads).
+//
+//nolint:revive // signature matches the pipeline's top-level orchestration contract.
 func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litmus *litmusServer, cache *hashCache, dirs []struct{ dir, label string }, source string, nworkers int, rescan bool, maxAnalyzed int, experimentTag string, shared *loadProgress) int {
-	slog.Info("loading", "dirs", len(dirs), "workers", nworkers)
+	slog.Info("loading", "dirs", len(dirs))
 	start := time.Now()
 	var progress loadProgress
 	progress.analyzeDurationMin.Store(math.MaxInt64)
 
-	// Initialize already-analyzed count for the dashboard.
+	// Initialize already-analyzed count so the dashboard can subtract it
+	// off to show session-relative numbers (a user running with
+	// --max-analyzed=50 wants "N of 50 this session", not "39785 of 50").
+	var startAnalyzed int64
 	if n, err := db.CountAnalyzed(ctx); err == nil {
 		progress.analyzed.Store(n)
 		progress.queued.Store(n)
+		startAnalyzed = n
 	}
 
-	paths := make(chan labeledPath, nworkers*2)
-	hashed := make(chan hashedFile, nworkers*2)
-	var hashWG sync.WaitGroup
-
-	// Analysis queue: nil if litmus is not configured.
+	// Analysis pool: a large buffered queue absorbs bursts from the
+	// per-directory inserters so slow litmus analysis doesn't back up
+	// into the DB insert path.
 	var analyzeQueue chan loadJob
 	var analyzeWG sync.WaitGroup
 	if litmus != nil {
-		analyzeQueue = make(chan loadJob, litmus.Workers()*2)
+		analyzeQueue = make(chan loadJob, 2_000_000)
 		startAnalysisWorkers(ctx, cancel, db, litmus, analyzeQueue, &analyzeWG, &progress, shared, litmus.Workers(), maxAnalyzed)
 	}
 
-	// Periodic progress reporting.
-	ticker := time.NewTicker(10 * time.Second)
-	if !isTTY() {
-		ticker.Reset(30 * time.Second)
-	}
-
-	done := make(chan struct{})
-	var prevAnalyzed int64
-	go func() {
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				analyzed := progress.analyzed.Load()
-				recentRate := float64(analyzed-prevAnalyzed) / 10.0
-				if !isTTY() {
-					recentRate = float64(analyzed-prevAnalyzed) / 30.0
-				}
-				prevAnalyzed = analyzed
-				walked := progress.walked.Load()
-				hashedN := progress.hashed.Load()
-				inserted := progress.inserted.Load()
-				skipped := progress.skipped.Load()
-
-				// Stage percentages.
-				hashDone := hashedN + progress.tooSmall.Load() + progress.tooLarge.Load() + progress.hashErrors.Load()
-				analyzeTarget := progress.queued.Load()
-				if maxAnalyzed > 0 && int64(maxAnalyzed) < analyzeTarget {
-					analyzeTarget = int64(maxAnalyzed)
-				}
-
-				if isTTY() {
-					// Build progress bars
-					writeStdout("\033[H\033[2J")
-					writeStdoutf("\033[1mHopper Loading Dashboard\033[0m (%s)\n", time.Since(start).Round(time.Second))
-					writeStdoutLine(strings.Repeat("─", 60))
-
-					drawBar("Hashing  ", hashDone, walked, "", "\033[34m")          // Blue
-					drawBar("Insertion", inserted+skipped, hashedN, "", "\033[32m") // Green
-
-					var analyzeInfo string
-					if recentRate > 0 {
-						// Overall ETA based on everything walked
-						targetTotal := walked
-						if maxAnalyzed > 0 && int64(maxAnalyzed) < targetTotal {
-							targetTotal = int64(maxAnalyzed)
-						}
-						remaining := targetTotal - analyzed
-						if remaining > 0 {
-							etaSec := float64(remaining) / recentRate
-							eta := (time.Duration(etaSec) * time.Second).Round(time.Second)
-							analyzeInfo = fmt.Sprintf("%.1f/s ETA %s", recentRate, eta)
-						}
-					}
-					// Show analysis bar out of what's already inserted, but info shows overall ETA
-					drawBar("Analysis ", analyzed, analyzeTarget, analyzeInfo, "\033[33m") // Yellow
-
-					writeStdoutLine(strings.Repeat("─", 60))
-					if last, ok := progress.lastErr.Load().(string); ok && last != "" {
-						writeStdoutf("\033[31mRecent Error:\033[0m %s\n", last)
-						writeStdoutLine(strings.Repeat("─", 60))
-					}
-
-					if litmus != nil {
-						summary := litmus.workerSummary()
-						writeStdoutf("Litmus: %d busy, %d idle | oldest: %s (%s)\n",
-							summary.Busy, summary.Idle, summary.OldestFile,
-							(time.Duration(summary.OldestMS) * time.Millisecond).Round(time.Second))
-
-						health := litmus.pollHealth(ctx)
-						if health != nil {
-							writeStdoutf("Health: %.2f load, %d MB RSS, %d active tasks\n",
-								health.Load, health.RSSMB, health.ActiveTasks)
-						}
-					}
-					writeStdoutf("Errors: %d | Walked: %d | Cache Hits: %d\n",
-						progress.errors.Load(), walked, progress.cacheHits.Load())
-				} else {
-					// Fallback to slog for non-TTY
-					attrs := []any{
-						"dirs", len(dirs),
-						"walked", walked, "hashed", hashedN,
-						"inserted", inserted, "skipped", skipped,
-						"analyzed", analyzed, "errors", progress.errors.Load(),
-					}
-					if walked > 0 {
-						attrs = append(attrs, "hash_pct", fmt.Sprintf("%.0f%%", float64(hashDone)/float64(walked)*100))
-					}
-					if analyzeTarget > 0 {
-						attrs = append(attrs, "analyze_pct", fmt.Sprintf("%.0f%%", float64(analyzed)/float64(analyzeTarget)*100))
-					}
-					slog.Info("load progress", attrs...)
-				}
-			case <-done:
-				return
-			}
-		}
-	}()
-
-	// Hash workers: read files, check markers, compute SHA256, send to batch inserter.
-	for range nworkers {
-		hashWG.Go(func() {
-			for lp := range paths {
-				if ctx.Err() != nil {
-					return
-				}
-
-				sample, err := hashFile(ctx, lp.path, lp.label, source, cache, &progress)
-				if err != nil {
-					switch {
-					case errors.Is(err, errTooSmall):
-						progress.tooSmall.Add(1)
-					case errors.Is(err, errTooLarge):
-						progress.tooLarge.Add(1)
-					default:
-						progress.errors.Add(1)
-						progress.hashErrors.Add(1)
-						progress.lastErr.Store(fmt.Sprintf("hash: %s: %v", filepath.Base(lp.path), err))
-						slog.Warn("hash failed", "path", lp.path, "error", err)
-					}
-					continue
-				}
-
-				// Check for misclassification markers that contradict the label.
-				if marker, markerMtime := markerInfo(lp.path); marker != "" {
-					if (lp.label == "bad" && marker == "benign") || (lp.label == "good" && marker == "bad") {
-						progress.markers.Add(1)
-						sample.Label = marker
-						if marker == "benign" {
-							sample.Label = "good"
-						}
-						sample.LabelSource = "marker"
-						sample.Skip = "misclassified"
-						sample.MarkerMtime = markerMtime
-						slog.Info("misclassified file", "path", lp.path, "original_label", lp.label, "marker", marker)
-					}
-				}
-
-				progress.hashed.Add(1)
-				select {
-				case hashed <- hashedFile{sample: sample, path: lp.path}:
-				case <-ctx.Done():
-					return
-				}
-			}
-		})
-	}
-
-	// Pending analysis: large buffer so hashing can proceed even if analysis is slow.
-	pendingAnalysis := make(chan loadJob, 2_000_000)
-
-	// Batch inserter: collects hashed files and flushes in batches.
-	var insertWG sync.WaitGroup
-	insertWG.Go(func() {
-		defer close(pendingAnalysis)
-		batch := make([]hashedFile, 0, loadBatchSize)
-
-		flush := func() {
-			if len(batch) == 0 {
-				return
-			}
-			samples := make([]*hopper.Sample, len(batch))
-			for i, h := range batch {
-				samples[i] = h.sample
-			}
-			// Detect intra-batch SHA256 duplicates for diagnostics.
-			seen := make(map[string]string, len(batch))
-			intraDups := 0
-			for _, h := range batch {
-				if prev, ok := seen[h.sample.SHA256]; ok {
-					intraDups++
-					slog.Debug("intra-batch duplicate SHA256",
-						"sha256", h.sample.SHA256,
-						"path", h.path,
-						"duplicate_of", prev)
-				} else {
-					seen[h.sample.SHA256] = h.path
-				}
-			}
-
-			n, needsAnalysis, err := db.InsertSampleBatch(ctx, samples)
-			if err != nil {
-				if ctx.Err() != nil {
-					slog.Debug("batch insert skipped (shutting down)", "batch_size", len(batch))
-				} else {
-					slog.Error("batch insert failed", "error", err, "batch_size", len(batch))
-					progress.errors.Add(int64(len(batch)))
-				}
-				batch = batch[:0]
-				return
-			}
-			progress.inserted.Add(n)
-			skipped := int64(len(batch)) - n
-			progress.skipped.Add(skipped)
-
-			crossBatchDups := skipped - int64(intraDups)
-			slog.Debug("batch flush",
-				"batch_size", len(batch),
-				"inserted", n,
-				"skipped", skipped,
-				"intra_batch_dups", intraDups,
-				"cross_batch_dups", crossBatchDups,
-				"unique_hashes", len(seen))
-
-			// Send to analysis feeder without blocking the inserter.
-			if analyzeQueue != nil {
-				// Map SHA to path for the jobs.
-				shaToPath := make(map[string]string, len(batch))
-				for _, h := range batch {
-					shaToPath[h.sample.SHA256] = h.path
-				}
-
-				toAnalyze := needsAnalysis
-				if rescan {
-					toAnalyze = make([]string, 0, len(batch))
-					for _, h := range batch {
-						toAnalyze = append(toAnalyze, h.sample.SHA256)
-					}
-				}
-
-				for _, sha := range toAnalyze {
-					path, ok := shaToPath[sha]
-					if !ok {
-						continue // should not happen
-					}
-					select {
-					case pendingAnalysis <- loadJob{path: path, sha: sha}:
-						progress.queued.Add(1)
-					case <-ctx.Done():
-						slog.Debug("inserter flush cancelled", "dirs", len(dirs), "pending_queue_len", len(pendingAnalysis))
-						return
-					}
-				}
-			}
-			batch = batch[:0]
-		}
-
-		for h := range hashed {
-			batch = append(batch, h)
-			if len(batch) >= loadBatchSize {
-				flush()
-			}
-		}
-		flush()
+	// Progress dashboard: reads counters, exits when dashCtx is cancelled.
+	dashCtx, dashCancel := context.WithCancel(ctx)
+	defer dashCancel()
+	var dashWG sync.WaitGroup
+	dashWG.Go(func() {
+		runDashboard(dashCtx, &progress, litmus, start, startAnalyzed, maxAnalyzed, len(dirs))
 	})
 
-	// Analysis feeder: drains pendingAnalysis into the bounded analyzeQueue,
-	// decoupling the inserter from slow analysis workers.
-	var feederWG sync.WaitGroup
-	if analyzeQueue != nil {
-		feederWG.Go(func() {
-			for job := range pendingAnalysis {
-				select {
-				case analyzeQueue <- job:
-				case <-ctx.Done():
-					slog.Debug("feeder cancelled", "dirs", len(dirs), "remaining_pending", len(pendingAnalysis))
-					return
-				}
+	// Per-directory pipelines: each goroutine runs cleave→hash→batch→
+	// insert→queue end-to-end for its labeled directory. A semaphore
+	// bounds concurrency to nworkers (usually larger than len(dirs), so
+	// all dirs run simultaneously).
+	sem := make(chan struct{}, max(1, nworkers))
+	var pipeWG sync.WaitGroup
+	for _, d := range dirs {
+		pipeWG.Go(func() {
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
 			}
-			slog.Debug("feeder drained")
+			runDirPipeline(ctx, db, d, source, cache, &progress, analyzeQueue, rescan)
 		})
 	}
+	pipeWG.Wait()
 
-	walkAndShuffle(ctx, dirs, paths, &progress)
-	slog.Debug("shutdown", "step", "walk complete, closing paths")
-	close(paths)
-	hashWG.Wait()
-	slog.Debug("shutdown", "dirs", len(dirs), "step", "hash workers done, closing hashed")
-	close(hashed)
-	insertWG.Wait() // also closes pendingAnalysis
-	slog.Debug("shutdown", "dirs", len(dirs), "step", "inserter done")
-	feederWG.Wait() // drains pendingAnalysis into analyzeQueue
-	slog.Debug("shutdown", "dirs", len(dirs), "step", "feeder done")
-
+	// Ingest is done; drain analysis.
 	if analyzeQueue != nil {
 		close(analyzeQueue)
 		analyzeWG.Wait()
-		slog.Debug("shutdown", "dirs", len(dirs), "step", "analysis workers done")
 	}
 
-	ticker.Stop()
-	close(done)
+	dashCancel()
+	dashWG.Wait()
 
+	logLoadSummary(start, experimentTag, dirs, &progress)
+	return int(progress.inserted.Load() + progress.skipped.Load())
+}
+
+// runDirPipeline is the entire load pipeline for one labeled directory:
+// enumerate via cleave, hash each file (respecting the cache and marker
+// conventions), batch into the samples table, and queue the rows that need
+// analysis. Everything runs sequentially in this one goroutine so batches
+// stay coherent without cross-goroutine plumbing; parallelism comes from
+// running one instance per directory.
+func runDirPipeline(
+	ctx context.Context,
+	db *hopper.DB,
+	target struct{ dir, label string },
+	source string,
+	cache *hashCache,
+	progress *loadProgress,
+	analyzeQueue chan<- loadJob,
+	rescan bool,
+) {
+	batch := make([]*hopper.Sample, 0, loadBatchSize)
+	pathBySha := make(map[string]string, loadBatchSize)
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		n, needsAnalysis, err := db.InsertSampleBatch(ctx, batch)
+		if err != nil {
+			if ctx.Err() == nil {
+				progress.errors.Add(int64(len(batch)))
+				progress.lastErr.Store(fmt.Sprintf("insert: %v", err))
+				slog.Error("batch insert failed", "error", err, "batch_size", len(batch), "dir", target.dir)
+			}
+			batch = batch[:0]
+			clear(pathBySha)
+			return
+		}
+		progress.inserted.Add(n)
+		progress.skipped.Add(int64(len(batch)) - n)
+
+		if analyzeQueue != nil {
+			needs := make(map[string]struct{}, len(needsAnalysis))
+			for _, sha := range needsAnalysis {
+				needs[sha] = struct{}{}
+			}
+			for _, s := range batch {
+				if !rescan {
+					if _, ok := needs[s.SHA256]; !ok {
+						continue
+					}
+				}
+				select {
+				case analyzeQueue <- loadJob{path: pathBySha[s.SHA256], sha: s.SHA256}:
+					progress.queued.Add(1)
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+		batch = batch[:0]
+		clear(pathBySha)
+	}
+	defer flush()
+
+	slog.Info("listing files", "dir", target.dir, "label", target.label)
+	err := pathLister(ctx, target.dir, func(lp labeledPath) bool {
+		if ctx.Err() != nil {
+			return false
+		}
+		if isMarkerFile(filepath.Base(lp.path)) {
+			return true
+		}
+		lp.label = target.label
+		progress.walked.Add(1)
+
+		sample, err := hashFile(ctx, lp.path, lp.label, lp.fileType, source, cache, progress)
+		if err != nil {
+			switch {
+			case errors.Is(err, errTooSmall):
+				progress.tooSmall.Add(1)
+			case errors.Is(err, errTooLarge):
+				progress.tooLarge.Add(1)
+			default:
+				progress.errors.Add(1)
+				progress.hashErrors.Add(1)
+				progress.lastErr.Store(fmt.Sprintf("hash: %s: %v", filepath.Base(lp.path), err))
+				slog.Warn("hash failed", "path", lp.path, "error", err)
+			}
+			return true
+		}
+
+		// Apply misclassification marker if it contradicts the label.
+		if marker, markerMtime := markerInfo(lp.path); marker != "" {
+			if (lp.label == "bad" && marker == "benign") || (lp.label == "good" && marker == "bad") {
+				progress.markers.Add(1)
+				if marker == "benign" {
+					sample.Label = "good"
+				} else {
+					sample.Label = "bad"
+				}
+				sample.LabelSource = "marker"
+				sample.Skip = "misclassified"
+				sample.MarkerMtime = markerMtime
+				slog.Info("misclassified file", "path", lp.path, "original_label", lp.label, "marker", marker)
+			}
+		}
+
+		progress.hashed.Add(1)
+		batch = append(batch, sample)
+		pathBySha[sample.SHA256] = lp.path
+		if len(batch) >= loadBatchSize {
+			flush()
+		}
+		return true
+	})
+	if err != nil {
+		slog.Warn("list files failed", "dir", target.dir, "error", err)
+	}
+}
+
+// runDashboard renders the periodic progress view (TTY bars or slog lines)
+// until ctx is cancelled. It reads progress counters directly; no
+// coordination with workers is required beyond those atomic loads.
+func runDashboard(
+	ctx context.Context,
+	progress *loadProgress,
+	litmus *litmusServer,
+	start time.Time,
+	startAnalyzed int64,
+	maxAnalyzed, ndirs int,
+) {
+	interval := 10 * time.Second
+	if !isTTY() {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var prevAnalyzed int64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		analyzedAbs := progress.analyzed.Load()
+		sessionAnalyzed := max(analyzedAbs-startAnalyzed, 0)
+		recentRate := float64(analyzedAbs-prevAnalyzed) / interval.Seconds()
+		prevAnalyzed = analyzedAbs
+
+		walked := progress.walked.Load()
+		hashedN := progress.hashed.Load()
+		inserted := progress.inserted.Load()
+		skipped := progress.skipped.Load()
+		hashDone := hashedN + progress.tooSmall.Load() + progress.tooLarge.Load() + progress.hashErrors.Load()
+
+		// Session target: how many new samples we queued for analysis
+		// this run, capped at --max-analyzed if set.
+		analyzeTarget := max(progress.queued.Load()-startAnalyzed, 0)
+		if maxAnalyzed > 0 && int64(maxAnalyzed) < analyzeTarget {
+			analyzeTarget = int64(maxAnalyzed)
+		}
+
+		if !isTTY() {
+			attrs := []any{
+				"dirs", ndirs,
+				"walked", walked, "hashed", hashedN,
+				"inserted", inserted, "skipped", skipped,
+				"analyzed", sessionAnalyzed, "errors", progress.errors.Load(),
+			}
+			if walked > 0 {
+				attrs = append(attrs, "hash_pct", fmt.Sprintf("%.0f%%", float64(hashDone)/float64(walked)*100))
+			}
+			if analyzeTarget > 0 {
+				attrs = append(attrs, "analyze_pct", fmt.Sprintf("%.0f%%", float64(sessionAnalyzed)/float64(analyzeTarget)*100))
+			}
+			slog.Info("load progress", attrs...)
+			continue
+		}
+
+		writeStdout("\033[H\033[2J")
+		writeStdoutf("\033[1mHopper Loading Dashboard\033[0m (%s)\n", time.Since(start).Round(time.Second))
+		writeStdoutLine(strings.Repeat("─", 60))
+		drawBar("Hashing  ", hashDone, walked, "", "\033[34m")
+		drawBar("Insertion", inserted+skipped, hashedN, "", "\033[32m")
+
+		var analyzeInfo string
+		if recentRate > 0 {
+			if remaining := analyzeTarget - sessionAnalyzed; remaining > 0 {
+				eta := (time.Duration(float64(remaining)/recentRate) * time.Second).Round(time.Second)
+				analyzeInfo = fmt.Sprintf("%.1f/s ETA %s", recentRate, eta)
+			}
+		}
+		drawBar("Analysis ", sessionAnalyzed, analyzeTarget, analyzeInfo, "\033[33m")
+		writeStdoutLine(strings.Repeat("─", 60))
+
+		if last, ok := progress.lastErr.Load().(string); ok && last != "" {
+			writeStdoutf("\033[31mRecent Error:\033[0m %s\n", last)
+			writeStdoutLine(strings.Repeat("─", 60))
+		}
+		if litmus != nil {
+			summary := litmus.workerSummary()
+			writeStdoutf("Litmus: %d busy, %d idle | oldest: %s (%s)\n",
+				summary.Busy, summary.Idle, summary.OldestFile,
+				(time.Duration(summary.OldestMS) * time.Millisecond).Round(time.Second))
+			if health := litmus.pollHealth(ctx); health != nil {
+				writeStdoutf("Health: %.2f load, %d MB RSS, %d active tasks\n",
+					health.Load, health.RSSMB, health.ActiveTasks)
+			}
+		}
+		writeStdoutf("Errors: %d | Walked: %d | Cache Hits: %d\n",
+			progress.errors.Load(), walked, progress.cacheHits.Load())
+	}
+}
+
+// logLoadSummary emits the final "directory complete" line with the
+// per-stage counters and analysis timing stats gathered during the load.
+func logLoadSummary(start time.Time, experimentTag string, dirs []struct{ dir, label string }, progress *loadProgress) {
 	analyzed := progress.analyzed.Load()
 	elapsed := time.Since(start)
-	completeAttrs := []any{
+	attrs := []any{
 		"dirs", len(dirs),
 		"walked", progress.walked.Load(), "hashed", progress.hashed.Load(),
 		"inserted", progress.inserted.Load(),
@@ -889,24 +871,19 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 		"elapsed", elapsed.Round(time.Millisecond),
 	}
 	if analyzed > 0 {
-		avgMs := progress.analyzeDurationSum.Load() / analyzed / int64(time.Millisecond)
-		maxMs := progress.analyzeDurationMax.Load() / int64(time.Millisecond)
-		minMs := progress.analyzeDurationMin.Load() / int64(time.Millisecond)
 		throughput := float64(analyzed) / elapsed.Seconds()
-		completeAttrs = append(completeAttrs,
+		attrs = append(attrs,
 			"avg_score", int(progress.scoreSum.Load()/analyzed),
 			"throughput_per_sec", fmt.Sprintf("%.2f", throughput),
-			"analyze_avg_ms", avgMs,
-			"analyze_min_ms", minMs,
-			"analyze_max_ms", maxMs,
+			"analyze_avg_ms", progress.analyzeDurationSum.Load()/analyzed/int64(time.Millisecond),
+			"analyze_min_ms", progress.analyzeDurationMin.Load()/int64(time.Millisecond),
+			"analyze_max_ms", progress.analyzeDurationMax.Load()/int64(time.Millisecond),
 		)
 	}
 	if experimentTag != "" {
-		completeAttrs = append(completeAttrs, "experiment", experimentTag)
+		attrs = append(attrs, "experiment", experimentTag)
 	}
-	slog.Info("directory complete", completeAttrs...)
-
-	return int(progress.inserted.Load() + progress.skipped.Load())
+	slog.Info("directory complete", attrs...)
 }
 
 //nolint:revive // config is split across explicit parameters to keep call sites direct.
@@ -1037,56 +1014,118 @@ func markerInfo(path string) (kind string, mtime *time.Time) {
 	return "", nil
 }
 
-// labeledPath is a file path with its classification label.
+// labeledPath is a file path with its classification label and the file type
+// reported by cleave. The file type flows into the Sample row so DB queries
+// can filter by type without waiting for analysis.
 type labeledPath struct {
-	path  string
-	label string
+	path     string
+	label    string
+	fileType string
 }
 
-// walkAndShuffle walks all directories, collects file paths with labels,
-// shuffles them randomly, and sends them to the channel. Shuffling ensures
-// progress across all ecosystems rather than processing one directory at a time.
-func walkAndShuffle(ctx context.Context, dirs []struct{ dir, label string }, paths chan<- labeledPath, progress *loadProgress) {
-	var all []labeledPath
-	for _, d := range dirs {
-		slog.Info("walking directory", "dir", d.dir, "label", d.label)
-		if err := filepath.WalkDir(d.dir, func(path string, entry fs.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if !entry.Type().IsRegular() {
-				if entry.IsDir() && entry.Name() == ".git" {
-					return fs.SkipDir
-				}
-				return nil
-			}
-			if isMarkerFile(entry.Name()) {
-				return nil
-			}
-			all = append(all, labeledPath{path: path, label: d.label})
-			return nil
-		}); err != nil {
-			slog.Warn("walk directory failed", "dir", d.dir, "error", err)
+// pathLister enumerates recognized files under a directory and invokes emit
+// for each one as cleave produces it. emit returns false when the caller
+// wants to stop (typically because ctx.Done() fired on a blocked send), in
+// which case the lister returns early with a nil error. Tests override this
+// variable with a pure-Go walker that skips the real cleave binary.
+var pathLister = streamCleaveIterFiles
+
+// cleaveBinary is the path (or name, for $PATH lookup) of the cleave binary
+// used for file enumeration. Set by the load command's --cleave flag.
+var cleaveBinary = "cleave"
+
+// streamCleaveIterFiles invokes `cleave iter-files` against dir and streams
+// each decoded record to emit as cleave produces it. This lets the caller
+// forward entries into the hash pipeline without buffering a whole
+// directory's output first — the reason for the callback shape.
+//
+// Per-record decode errors stop the scan at the first bad record. A nonzero
+// cleave exit caused by context cancellation is surfaced as an error so
+// callers can unwind cleanly. A nonzero exit for any other reason degrades
+// gracefully: whatever records were already emitted stay emitted, and a
+// warn log captures the tail of cleave's stderr for diagnosis.
+//
+// Cleave's stderr is captured to a buffer and only shown on failure so the
+// startup banner doesn't clutter every successful run.
+func streamCleaveIterFiles(ctx context.Context, dir string, emit func(labeledPath) bool) error {
+	// Hopper's max file size is in bytes; cleave's --max-file-size is in
+	// megabytes and is a top-level flag that must precede the subcommand.
+	args := make([]string, 0, 4)
+	if mb := maxFileSize / (1024 * 1024); mb > 0 {
+		args = append(args, "--max-file-size", strconv.FormatInt(int64(mb), 10))
+	}
+	args = append(args, "iter-files", dir)
+
+	start := time.Now()
+	cmd := exec.CommandContext(ctx, cleaveBinary, args...)
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("cleave iter-files stdout pipe: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("cleave iter-files start: %w", err)
+	}
+	slog.Info("cleave iter-files started", "dir", dir, "pid", cmd.Process.Pid)
+
+	var emitted int
+	var stopped bool
+	dec := json.NewDecoder(stdout)
+	for dec.More() {
+		var rec struct {
+			Path     string `json:"path"`
+			FileType string `json:"type"`
+			Sz       int64  `json:"sz"`
 		}
+		if err := dec.Decode(&rec); err != nil {
+			slog.Warn("cleave iter-files decode", "dir", dir, "error", err)
+			break
+		}
+		if !emit(labeledPath{path: rec.Path, fileType: rec.FileType}) {
+			stopped = true
+			break
+		}
+		emitted++
+	}
+	// If the caller asked us to stop, drain stdout so cmd.Wait doesn't
+	// block on a full pipe; the CommandContext will kill cleave when the
+	// parent context fires, so any read error here is expected.
+	if stopped {
+		_, _ = io.Copy(io.Discard, stdout) //nolint:errcheck // drained for shutdown, error expected
 	}
 
-	// Shuffle for even progress across directories and ecosystems.
-	rng := rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())) //nolint:gosec // not crypto
-	rng.Shuffle(len(all), func(i, j int) { all[i], all[j] = all[j], all[i] })
-
-	slog.Info("walk complete", "files", len(all))
-	progress.walked.Store(int64(len(all)))
-
-	for _, lp := range all {
-		select {
-		case paths <- lp:
-		case <-ctx.Done():
-			return
+	if err := cmd.Wait(); err != nil {
+		// Context cancellation is an orderly shutdown, not a cleave crash.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("cleave iter-files: %w", ctxErr)
 		}
+		stderrTail := tailBytes(stderrBuf.Bytes(), 2048)
+		if emitted == 0 {
+			return fmt.Errorf("cleave iter-files: %w (stderr: %s)", err, stderrTail)
+		}
+		slog.Warn("cleave iter-files exited with error",
+			"dir", dir, "error", err, "emitted", emitted, "stderr", stderrTail)
 	}
+	slog.Info("cleave iter-files complete",
+		"dir", dir, "files", emitted, "elapsed", time.Since(start).Round(time.Millisecond))
+	return nil
 }
 
-func hashFile(ctx context.Context, path, label, source string, cache *hashCache, progress *loadProgress) (*hopper.Sample, error) {
+// tailBytes returns the last n bytes of b as a string, or all of b if
+// shorter. Used to truncate captured subprocess stderr for log lines.
+func tailBytes(b []byte, n int) string {
+	if len(b) <= n {
+		return string(b)
+	}
+	return string(b[len(b)-n:])
+}
+
+// hashFile opens path, enforces size limits, consults the hash cache, and
+// returns a Sample stamped with the cleave-classified file type. Pass "" for
+// fileType in contexts that don't yet know it (tests, ad-hoc callers). Pass
+// nil for progress when no cache-hit metric is being collected.
+func hashFile(ctx context.Context, path, label, fileType, source string, cache *hashCache, progress *loadProgress) (*hopper.Sample, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -1118,6 +1157,7 @@ func hashFile(ctx context.Context, path, label, source string, cache *hashCache,
 				SHA256:      cached,
 				Source:      source,
 				Filename:    filepath.Base(path),
+				FileType:    fileType,
 				Label:       label,
 				LabelSource: source,
 				SizeBytes:   info.Size(),
@@ -1142,6 +1182,7 @@ func hashFile(ctx context.Context, path, label, source string, cache *hashCache,
 		SHA256:      digest,
 		Source:      source,
 		Filename:    filepath.Base(path),
+		FileType:    fileType,
 		Label:       label,
 		LabelSource: source,
 		SizeBytes:   info.Size(),
@@ -1238,21 +1279,15 @@ func cmdBackfill(ctx context.Context) error {
 	return nil
 }
 
-type sampleListFunc func(context.Context, *hopper.DB, int, int) ([]*hopper.Sample, error)
-
-func reviewFlags(name string) (*flag.FlagSet, *string, *int, *int, *bool) {
-	f := flag.NewFlagSet(name, flag.ExitOnError)
+// cmdPurgeUnsupported deletes samples that were analyzed but cleave could
+// not classify — i.e. the file_type column came back empty. Dry-run by
+// default: pass --apply to actually delete. Uses the idx_samples_file_type
+// index so it's cheap even on multi-million-row tables.
+func cmdPurgeUnsupported(ctx context.Context) error {
+	f := flag.NewFlagSet("purge-unsupported", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
-	score := f.Int("threshold", 85, "score threshold")
-	f.IntVar(score, "score", 85, "score threshold (deprecated: use --threshold)")
-	limit := f.Int("limit", 100, "maximum rows to print")
-	flush := f.Bool("flush", false, "delete matching review markers and restore the underlying label")
-	return f, dsn, score, limit, flush
-}
-
-func runReviewCommand(ctx context.Context, args []string, name string, list sampleListFunc) error {
-	f, dsn, score, limit, flush := reviewFlags(name)
-	parseFlags(f, args)
+	apply := f.Bool("apply", false, "actually delete rows (default is dry-run)")
+	parseFlags(f, os.Args[2:])
 
 	db, err := openDB(ctx, *dsn)
 	if err != nil {
@@ -1260,15 +1295,66 @@ func runReviewCommand(ctx context.Context, args []string, name string, list samp
 	}
 	defer db.Close()
 
-	samples, err := list(ctx, db, *score, *limit)
+	if !*apply {
+		n, err := db.PurgeUnsupported(ctx, true)
+		if err != nil {
+			return err
+		}
+		writeStdoutf("would delete %d unsupported row(s) (cleave_result set, file_type empty)\n", n)
+		writeStdoutLine("re-run with --apply to actually delete")
+		return nil
+	}
+
+	slog.Info("purging unsupported rows")
+	n, err := db.PurgeUnsupported(ctx, false)
 	if err != nil {
 		return err
 	}
-	if *flush {
-		if err := flushReviewSamples(ctx, db, name, samples); err != nil {
-			return err
-		}
-		return nil
+	slog.Info("purge complete", "deleted", n)
+	return nil
+}
+
+type sampleListFunc func(context.Context, *hopper.DB, int, int) ([]*hopper.Sample, error)
+
+// reviewOpts bundles the flags shared by the review subcommands so their
+// setup can return a single value instead of a 5-tuple.
+type reviewOpts struct {
+	fs    *flag.FlagSet
+	dsn   *string
+	score *int
+	limit *int
+	flush *bool
+}
+
+func reviewFlags(name string) reviewOpts {
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
+	score := fs.Int("threshold", 85, "score threshold")
+	fs.IntVar(score, "score", 85, "score threshold (deprecated: use --threshold)")
+	return reviewOpts{
+		fs:    fs,
+		dsn:   fs.String("db", "", "database connection string"),
+		score: score,
+		limit: fs.Int("limit", 100, "maximum rows to print"),
+		flush: fs.Bool("flush", false, "delete matching review markers and restore the underlying label"),
+	}
+}
+
+func runReviewCommand(ctx context.Context, args []string, name string, list sampleListFunc) error {
+	o := reviewFlags(name)
+	parseFlags(o.fs, args)
+
+	db, err := openDB(ctx, *o.dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	samples, err := list(ctx, db, *o.score, *o.limit)
+	if err != nil {
+		return err
+	}
+	if *o.flush {
+		return flushReviewSamples(ctx, db, name, samples)
 	}
 	for _, s := range samples {
 		age := sampleAgeDays(s.Mtime)
@@ -1322,10 +1408,7 @@ func sampleAgeDays(ts *time.Time) string {
 	if ts == nil {
 		return ""
 	}
-	days := int(time.Since(*ts).Hours() / 24)
-	if days < 0 {
-		days = 0
-	}
+	days := max(int(time.Since(*ts).Hours()/24), 0)
 	return strconv.Itoa(days)
 }
 

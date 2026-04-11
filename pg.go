@@ -424,7 +424,10 @@ func (db *DB) seedCandidatesInPathsPG(ctx context.Context, prefixes []string, la
 		patterns[i] = p + "/%"
 	}
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM samples WHERE status = '' AND label = $1 AND skip = '' AND score `+op+` $2 AND path LIKE ANY($3) ORDER BY updated_at ASC LIMIT $4`,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE status = '' AND label = $1 AND skip = '' AND score `+op+` $2
+		   AND path LIKE ANY($3)
+		 ORDER BY updated_at ASC LIMIT $4`,
 		label, score, patterns, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: seed candidates in paths: %w", err)
@@ -594,11 +597,11 @@ func (db *DB) recomputeCanonicalSHA256PG(ctx context.Context) (int64, error) {
 // in SQL using JSON_TABLE (PG17+), avoiding the cost of streaming JSONB
 // blobs into Go.
 //
-// Only rows with file_type = '' are touched. file_type is the most recently
-// added column populated by writes, so an empty value is a reliable signal
-// that the row pre-dates the unified backfill path and may be missing other
-// derivable columns too. Rows backfilled previously are skipped cheaply by
-// an index lookup, so this is safe to run repeatedly.
+// Only rows whose file_type column is empty are touched. file_type is the
+// most recently added column populated by writes, so an empty value is a
+// reliable signal that the row pre-dates the unified backfill path and may
+// be missing other derivable columns too. Rows backfilled previously are
+// skipped cheaply by an index lookup, so this is safe to run repeatedly.
 func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 	var stats BackfillStats
 
@@ -666,6 +669,63 @@ func (db *DB) setSkipPG(ctx context.Context, sha256, skip string) error {
 		return fmt.Errorf("hopper: set skip: %w", err)
 	}
 	return nil
+}
+
+func (db *DB) deleteSamplePG(ctx context.Context, sha256 string) error {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("hopper: begin delete: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+
+	if _, err := tx.Exec(ctx, `DELETE FROM reports WHERE sha256 = $1`, sha256); err != nil {
+		return fmt.Errorf("hopper: delete sample reports: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM samples WHERE sha256 = $1`, sha256); err != nil {
+		return fmt.Errorf("hopper: delete sample: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("hopper: commit delete: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) purgeUnsupportedPG(ctx context.Context, dryRun bool) (int64, error) {
+	if dryRun {
+		var n int64
+		err := db.pool.QueryRow(ctx, `
+			SELECT count(*) FROM samples
+			WHERE cleave_result IS NOT NULL AND file_type = ''`).Scan(&n)
+		if err != nil {
+			return 0, fmt.Errorf("hopper: count unsupported: %w", err)
+		}
+		return n, nil
+	}
+
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: begin purge: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+
+	// Remove dependent reports first so foreign-key relationships (if any) stay clean.
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM reports WHERE sha256 IN (
+			SELECT sha256 FROM samples
+			WHERE cleave_result IS NOT NULL AND file_type = ''
+		)`); err != nil {
+		return 0, fmt.Errorf("hopper: purge unsupported reports: %w", err)
+	}
+	tag, err := tx.Exec(ctx, `
+		DELETE FROM samples
+		WHERE cleave_result IS NOT NULL AND file_type = ''`)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: purge unsupported: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("hopper: commit purge: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 func (db *DB) deleteAllPG(ctx context.Context) error {

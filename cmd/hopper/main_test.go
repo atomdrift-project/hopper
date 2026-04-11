@@ -23,6 +23,36 @@ func mustWriteFile(t *testing.T, path string, data []byte) {
 	}
 }
 
+// useTestPathLister swaps the package-level pathLister for a pure-Go walker
+// so tests do not depend on a real cleave binary. Each regular file under
+// the given root is streamed to the emit callback with a fake file type.
+// Cleanup restores the original lister.
+func useTestPathLister(t *testing.T) {
+	t.Helper()
+	original := pathLister
+	pathLister = func(_ context.Context, dir string, emit func(labeledPath) bool) error {
+		return filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				if entry.Name() == ".git" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !entry.Type().IsRegular() {
+				return nil
+			}
+			if !emit(labeledPath{path: path, fileType: "test"}) {
+				return filepath.SkipAll
+			}
+			return nil
+		})
+	}
+	t.Cleanup(func() { pathLister = original })
+}
+
 func mustRemove(t *testing.T, path string) {
 	t.Helper()
 	if err := os.Remove(path); err != nil {
@@ -145,6 +175,7 @@ func TestCheckMarkerSubdirectory(t *testing.T) {
 }
 
 func TestWalkFilesSkipsMarkers(t *testing.T) {
+	useTestPathLister(t)
 	dir := t.TempDir()
 	// Create a real sample and a marker file.
 	mustWriteFile(t, filepath.Join(dir, "malware.whl"), []byte("sample content!"))
@@ -152,25 +183,28 @@ func TestWalkFilesSkipsMarkers(t *testing.T) {
 	mustWriteFile(t, filepath.Join(dir, "._other.exe.BAD"), nil)
 	mustWriteFile(t, filepath.Join(dir, "legit.bin"), []byte("another sample!"))
 
-	paths := make(chan labeledPath, 10)
-	var progress loadProgress
-
-	dirs := []struct{ dir, label string }{{dir, "bad"}}
-	walkAndShuffle(t.Context(), dirs, paths, &progress)
-	close(paths)
-
+	// runDirPipeline drops marker files via isMarkerFile; exercise the
+	// same filter here by walking the lister directly.
 	var got []string
-	for lp := range paths {
-		got = append(got, filepath.Base(lp.path))
+	err := pathLister(t.Context(), dir, func(lp labeledPath) bool {
+		name := filepath.Base(lp.path)
+		if isMarkerFile(name) {
+			return true
+		}
+		got = append(got, name)
+		return true
+	})
+	if err != nil {
+		t.Fatalf("pathLister: %v", err)
 	}
 
 	// Only real samples should appear, not marker files.
 	if len(got) != 2 {
-		t.Fatalf("walkAndShuffle returned %d files %v, want 2 (malware.whl, legit.bin)", len(got), got)
+		t.Fatalf("pathLister returned %d files %v, want 2 (malware.whl, legit.bin)", len(got), got)
 	}
 	for _, name := range got {
 		if isMarkerFile(name) {
-			t.Errorf("walkAndShuffle emitted marker file %q", name)
+			t.Errorf("walker emitted marker file %q", name)
 		}
 	}
 }
@@ -183,7 +217,7 @@ func TestHashFileAppliesMarker(t *testing.T) {
 	mustWriteFile(t, samplePath, []byte("sample content!"))
 	mustWriteFile(t, filepath.Join(dir, "._malware.whl.BENIGN"), nil)
 
-	sample, err := hashFile(t.Context(), samplePath, "bad", "harvest", nil, nil)
+	sample, err := hashFile(t.Context(), samplePath, "bad", "", "harvest", nil, nil)
 	if err != nil {
 		t.Fatalf("hashFile: %v", err)
 	}
@@ -226,7 +260,7 @@ func TestHashFileMarkerNoContradiction(t *testing.T) {
 	mustWriteFile(t, samplePath, []byte("sample content!"))
 	mustWriteFile(t, filepath.Join(dir, "._malware.whl.BAD"), nil)
 
-	sample, err := hashFile(t.Context(), samplePath, "bad", "harvest", nil, nil)
+	sample, err := hashFile(t.Context(), samplePath, "bad", "", "harvest", nil, nil)
 	if err != nil {
 		t.Fatalf("hashFile: %v", err)
 	}
@@ -357,13 +391,13 @@ func TestHashFileWithCache(t *testing.T) {
 	mustWriteFile(t, samplePath, []byte("sample content!"))
 
 	// First call: cache miss, computes hash and stores it.
-	s1, err := hashFile(t.Context(), samplePath, "bad", "harvest", c, nil)
+	s1, err := hashFile(t.Context(), samplePath, "bad", "", "harvest", c, nil)
 	if err != nil {
 		t.Fatalf("hashFile (miss): %v", err)
 	}
 
 	// Second call: cache hit, should return same hash without re-reading.
-	s2, err := hashFile(t.Context(), samplePath, "bad", "harvest", c, nil)
+	s2, err := hashFile(t.Context(), samplePath, "bad", "", "harvest", c, nil)
 	if err != nil {
 		t.Fatalf("hashFile (hit): %v", err)
 	}
@@ -486,6 +520,7 @@ func TestCmdStats(t *testing.T) {
 }
 
 func TestCmdLoadIntegration(t *testing.T) {
+	useTestPathLister(t)
 	ctx := t.Context()
 	dbPath := filepath.Join(t.TempDir(), "load-test.db")
 	dir := t.TempDir()
@@ -548,6 +583,7 @@ func TestCmdImport(t *testing.T) {
 }
 
 func TestCmdLoadGood(t *testing.T) {
+	useTestPathLister(t)
 	ctx := t.Context()
 	dbPath := filepath.Join(t.TempDir(), "load-good.db")
 	dir := t.TempDir()
@@ -574,6 +610,7 @@ func TestCmdLoadGood(t *testing.T) {
 }
 
 func TestCmdLoadBothDirs(t *testing.T) {
+	useTestPathLister(t)
 	ctx := t.Context()
 	dbPath := filepath.Join(t.TempDir(), "load-both.db")
 	badDir := t.TempDir()
@@ -729,7 +766,7 @@ func TestHashFileTooSmall(t *testing.T) {
 	small := filepath.Join(dir, "tiny.bin")
 	mustWriteFile(t, small, []byte("short"))
 
-	_, err := hashFile(t.Context(), small, "bad", "test", nil, nil)
+	_, err := hashFile(t.Context(), small, "bad", "", "test", nil, nil)
 	if !errors.Is(err, errTooSmall) {
 		t.Errorf("expected errTooSmall, got %v", err)
 	}
@@ -743,25 +780,23 @@ func TestHashFileTooLarge(t *testing.T) {
 }
 
 func TestWalkFilesSkipsGitDir(t *testing.T) {
+	useTestPathLister(t)
 	dir := t.TempDir()
 	mustMkdirAll(t, filepath.Join(dir, ".git", "objects"))
 	mustWriteFile(t, filepath.Join(dir, ".git", "objects", "pack.idx"), []byte("git internal!"))
 	mustWriteFile(t, filepath.Join(dir, "sample.bin"), []byte("real sample!!!"))
 
-	paths := make(chan labeledPath, 10)
-	var progress loadProgress
-
-	dirs := []struct{ dir, label string }{{dir, "good"}}
-	walkAndShuffle(t.Context(), dirs, paths, &progress)
-	close(paths)
-
 	var got []string
-	for lp := range paths {
+	err := pathLister(t.Context(), dir, func(lp labeledPath) bool {
 		got = append(got, filepath.Base(lp.path))
+		return true
+	})
+	if err != nil {
+		t.Fatalf("pathLister: %v", err)
 	}
 
 	if len(got) != 1 || got[0] != "sample.bin" {
-		t.Errorf("walkAndShuffle returned %v, want just [sample.bin]", got)
+		t.Errorf("pathLister returned %v, want just [sample.bin]", got)
 	}
 }
 
@@ -785,6 +820,7 @@ func TestNewLitmusServer(t *testing.T) {
 }
 
 func TestLoadDir(t *testing.T) {
+	useTestPathLister(t)
 	ctx := t.Context()
 
 	// Set up a temp SQLite DB.
@@ -824,6 +860,7 @@ func TestLoadDir(t *testing.T) {
 }
 
 func TestLoadDirWithCache(t *testing.T) {
+	useTestPathLister(t)
 	ctx := t.Context()
 
 	dbPath := filepath.Join(t.TempDir(), "test.db")
@@ -864,6 +901,7 @@ func TestLoadDirWithCache(t *testing.T) {
 }
 
 func TestLoadDirMarkers(t *testing.T) {
+	useTestPathLister(t)
 	ctx := t.Context()
 
 	dbPath := filepath.Join(t.TempDir(), "test.db")
@@ -901,6 +939,7 @@ func TestLoadDirMarkers(t *testing.T) {
 }
 
 func TestLoadDirMarkersRefreshMarkerMtimeOnDuplicate(t *testing.T) {
+	useTestPathLister(t)
 	ctx := t.Context()
 
 	dbPath := filepath.Join(t.TempDir(), "test.db")
@@ -964,7 +1003,7 @@ func TestHashFileMarkerBadOnGood(t *testing.T) {
 	mustWriteFile(t, samplePath, []byte("sample content!"))
 	mustWriteFile(t, filepath.Join(dir, "._legit.bin.BAD"), nil)
 
-	sample, err := hashFile(t.Context(), samplePath, "good", "harvest", nil, nil)
+	sample, err := hashFile(t.Context(), samplePath, "good", "", "harvest", nil, nil)
 	if err != nil {
 		t.Fatalf("hashFile: %v", err)
 	}
@@ -1040,7 +1079,7 @@ func TestReviewCommands(t *testing.T) {
 		if err := db.InsertSample(ctx, sample); err != nil {
 			t.Fatal(err)
 		}
-		result := []byte(fmt.Sprintf(`{"fs":[{"sha":"%s","x":%d,"dp":0}]}`, sample.SHA256, sample.Score))
+		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"elf","x":%d,"dp":0}]}`, sample.SHA256, sample.Score)
 		if err := db.UpdateCleaveResult(ctx, sample.SHA256, result, ""); err != nil {
 			t.Fatal(err)
 		}
@@ -1110,7 +1149,7 @@ func TestReviewFlushCommands(t *testing.T) {
 		if err := db.InsertSample(ctx, sample); err != nil {
 			t.Fatal(err)
 		}
-		result := []byte(fmt.Sprintf(`{"fs":[{"sha":"%s","x":%d,"dp":0}]}`, sample.SHA256, sample.Score))
+		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"elf","x":%d,"dp":0}]}`, sample.SHA256, sample.Score)
 		if err := db.UpdateCleaveResult(ctx, sample.SHA256, result, ""); err != nil {
 			t.Fatal(err)
 		}

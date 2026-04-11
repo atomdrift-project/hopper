@@ -32,7 +32,9 @@ func mustInsert(t *testing.T, ctx context.Context, db *DB, s *Sample) {
 
 func mustAnalyze(t *testing.T, ctx context.Context, db *DB, sha string, score int) {
 	t.Helper()
-	result := []byte(fmt.Sprintf(`{"fs":[{"sha":"%s","x":%d,"dp":0}]}`, sha, score))
+	// Include a non-empty type so UpdateCleaveResult actually persists the row;
+	// an empty type triggers the belt-and-suspenders delete path.
+	result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"elf","x":%d,"dp":0}]}`, sha, score)
 	if err := db.UpdateCleaveResult(ctx, sha, result, ""); err != nil {
 		t.Fatalf("UpdateCleaveResult: %v", err)
 	}
@@ -120,7 +122,7 @@ func TestUpdateCleaveResult(t *testing.T) {
 	ctx := context.Background()
 
 	mustInsert(t, ctx, db, &Sample{SHA256: "c1", Source: "test", Label: "bad", LabelSource: "test"})
-	if err := db.UpdateCleaveResult(ctx, "c1", []byte(`{"fs":[{"ts":[{"i":"test","l":4}]}]}`), ""); err != nil {
+	if err := db.UpdateCleaveResult(ctx, "c1", []byte(`{"fs":[{"sha":"c1","type":"elf","dp":0,"ts":[{"i":"test","l":4}]}]}`), ""); err != nil {
 		t.Fatal(err)
 	}
 	got, err := db.SampleBySHA256(ctx, "c1")
@@ -140,7 +142,7 @@ func TestUpdateSample(t *testing.T) {
 	ctx := context.Background()
 
 	mustInsert(t, ctx, db, &Sample{SHA256: "u1", Source: "test", Label: "bad", LabelSource: "test", Status: "bad-review"})
-	if err := db.UpdateSample(ctx, "u1", "bad-reversed", []byte(`{"fs":[{"ts":[{"i":"test","l":5}]}]}`), ""); err != nil {
+	if err := db.UpdateSample(ctx, "u1", "bad-reversed", []byte(`{"fs":[{"sha":"u1","type":"elf","dp":0,"ts":[{"i":"test","l":5}]}]}`), ""); err != nil {
 		t.Fatal(err)
 	}
 	got, err := db.SampleBySHA256(ctx, "u1")
@@ -585,7 +587,7 @@ func TestUnanalyzed(t *testing.T) {
 
 	mustInsert(t, ctx, db, &Sample{SHA256: "a", Source: "test", Label: "bad", LabelSource: "test"})
 	mustInsert(t, ctx, db, &Sample{SHA256: "b", Source: "test", Label: "bad", LabelSource: "test"})
-	if err := db.UpdateCleaveResult(ctx, "b", []byte(`{}`), ""); err != nil {
+	if err := db.UpdateCleaveResult(ctx, "b", []byte(`{"fs":[{"sha":"b","type":"elf","dp":0}]}`), ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -951,7 +953,13 @@ func TestSamplesByEmbeddedSHA256(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
-	cleave := []byte(`{"files": [{"sha256": "embedded1", "formula": "H2O", "score": 10}, {"sha256": "embedded2", "formula": "O2", "score": 5}]}`)
+	// Fixture carries two parallel layouts:
+	//   - fs[]/sha/type is what parseCleaveFile reads (UpdateCleaveResult needs
+	//     a non-empty type or it deletes the row).
+	//   - files[]/sha256 is what SamplesByEmbeddedSHA256's JSON query reads.
+	cleave := []byte(`{"fs":[{"sha":"parent1","type":"archive","dp":0}],` +
+		`"files":[{"sha256":"embedded1","formula":"H2O","score":10},` +
+		`{"sha256":"embedded2","formula":"O2","score":5}]}`)
 	s := &Sample{SHA256: "parent1", Source: "test", CleaveResult: cleave}
 	if _, err := db.InsertSampleNew(ctx, s); err != nil {
 		t.Fatal(err)
@@ -1017,12 +1025,17 @@ func TestFeedSamples(t *testing.T) {
 	mustInsert(t, ctx, db, s1)
 	mustInsert(t, ctx, db, s2)
 
-	// Update with cleave result and analyzed_at
-	cleave := []byte("{}")
-	if err := db.UpdateCleaveResult(ctx, "s1", cleave, "s1"); err != nil {
+	// Update with cleave result and analyzed_at. Each row needs its own
+	// payload with the matching sha so parseCleaveFile pulls a non-empty
+	// file_type — otherwise UpdateCleaveResult treats the row as
+	// unclassified and deletes it.
+	resultFor := func(sha string) []byte {
+		return []byte(`{"fs":[{"sha":"` + sha + `","type":"elf","dp":0}]}`)
+	}
+	if err := db.UpdateCleaveResult(ctx, "s1", resultFor("s1"), "s1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.UpdateCleaveResult(ctx, "s2", cleave, "s2"); err != nil {
+	if err := db.UpdateCleaveResult(ctx, "s2", resultFor("s2"), "s2"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1075,11 +1088,10 @@ func TestFeedSamples(t *testing.T) {
 	s4 := &Sample{SHA256: "s4", Source: "test", Mtime: &t2}
 	mustInsert(t, ctx, db, s3)
 	mustInsert(t, ctx, db, s4)
-	cleave = []byte("{}")
-	if err := db.UpdateCleaveResult(ctx, "s3", cleave, "s3"); err != nil {
+	if err := db.UpdateCleaveResult(ctx, "s3", resultFor("s3"), "s3"); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.UpdateCleaveResult(ctx, "s4", cleave, "s4"); err != nil {
+	if err := db.UpdateCleaveResult(ctx, "s4", resultFor("s4"), "s4"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1162,7 +1174,7 @@ func TestUpdateCleaveResultSetsFormulaAndScore(t *testing.T) {
 	ctx := context.Background()
 
 	mustInsert(t, ctx, db, &Sample{SHA256: "fs1", Source: "test", Label: "bad", LabelSource: "test"})
-	result := []byte(`{"fs":[{"sha":"fs1","f":"O₃(C₂Er₂As)","x":42,"dp":0}]}`)
+	result := []byte(`{"fs":[{"sha":"fs1","type":"elf","f":"O₃(C₂Er₂As)","x":42,"dp":0}]}`)
 	if err := db.UpdateCleaveResult(ctx, "fs1", result, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -1179,6 +1191,129 @@ func TestUpdateCleaveResultSetsFormulaAndScore(t *testing.T) {
 	}
 	if got.Score != 42 {
 		t.Errorf("Score = %d", got.Score)
+	}
+}
+
+func TestDeleteSample(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{SHA256: "del1", Source: "test", Label: "bad", LabelSource: "test"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "del2", Source: "test", Label: "good", LabelSource: "test"})
+	if err := db.InsertReport(ctx, &Report{SHA256: "del1", Type: "re", Content: "r"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.DeleteSample(ctx, "del1"); err != nil {
+		t.Fatalf("DeleteSample: %v", err)
+	}
+
+	if _, err := db.SampleBySHA256(ctx, "del1"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("del1 should be gone, got err=%v", err)
+	}
+	if _, err := db.SampleBySHA256(ctx, "del2"); err != nil {
+		t.Errorf("del2 should still exist, got err=%v", err)
+	}
+	reports, err := db.ReportsBySHA256(ctx, "del1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reports) != 0 {
+		t.Errorf("reports for del1 should be gone, got %d", len(reports))
+	}
+
+	// Idempotent: deleting a non-existent sample is not an error.
+	if err := db.DeleteSample(ctx, "doesnotexist"); err != nil {
+		t.Errorf("DeleteSample(missing): %v", err)
+	}
+}
+
+func TestUpdateCleaveResultDeletesOnEmptyFileType(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{SHA256: "nc1", Source: "test", Label: "bad", LabelSource: "test"})
+	// Report with no fs[] entry → parseCleaveFile returns empty file_type →
+	// the row should be deleted, not updated.
+	if err := db.UpdateCleaveResult(ctx, "nc1", []byte(`{"fs":[]}`), ""); err != nil {
+		t.Fatalf("UpdateCleaveResult: %v", err)
+	}
+	if _, err := db.SampleBySHA256(ctx, "nc1"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("nc1 should be deleted, got err=%v", err)
+	}
+}
+
+func TestUpdateSampleDeletesOnEmptyFileType(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{SHA256: "us1", Source: "test", Label: "bad", LabelSource: "test", Status: "pending"})
+	if err := db.UpdateSample(ctx, "us1", "done", []byte(`{"fs":[]}`), ""); err != nil {
+		t.Fatalf("UpdateSample: %v", err)
+	}
+	if _, err := db.SampleBySHA256(ctx, "us1"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("us1 should be deleted, got err=%v", err)
+	}
+}
+
+func TestPurgeUnsupported(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Analyzed + recognized → stays.
+	mustInsert(t, ctx, db, &Sample{SHA256: "keep1", Source: "test", Label: "bad", LabelSource: "test"})
+	mustAnalyze(t, ctx, db, "keep1", 90)
+
+	// Unanalyzed → stays (P3 will catch it when analysis runs).
+	mustInsert(t, ctx, db, &Sample{SHA256: "keep2", Source: "test", Label: "bad", LabelSource: "test"})
+
+	// Analyzed but unrecognized: simulate a historical row by writing the
+	// bad blob via raw SQL so we bypass P3's live short-circuit.
+	mustInsert(t, ctx, db, &Sample{SHA256: "junk1", Source: "test", Label: "bad", LabelSource: "test"})
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET cleave_result = ?, file_type = '' WHERE sha256 = ?`,
+		`{"fs":[]}`, "junk1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertReport(ctx, &Report{SHA256: "junk1", Type: "re", Content: "stale"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Dry run: should count but not delete.
+	n, err := db.PurgeUnsupported(ctx, true)
+	if err != nil {
+		t.Fatalf("PurgeUnsupported dry-run: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("dry-run count = %d, want 1", n)
+	}
+	if _, err := db.SampleBySHA256(ctx, "junk1"); err != nil {
+		t.Errorf("junk1 should still exist after dry-run, got err=%v", err)
+	}
+
+	// Apply: deletes junk1 and its report, leaves keep1/keep2 alone.
+	n, err = db.PurgeUnsupported(ctx, false)
+	if err != nil {
+		t.Fatalf("PurgeUnsupported apply: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("apply count = %d, want 1", n)
+	}
+	if _, err := db.SampleBySHA256(ctx, "junk1"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("junk1 should be gone, got err=%v", err)
+	}
+	if _, err := db.SampleBySHA256(ctx, "keep1"); err != nil {
+		t.Errorf("keep1 should still exist, got err=%v", err)
+	}
+	if _, err := db.SampleBySHA256(ctx, "keep2"); err != nil {
+		t.Errorf("keep2 should still exist, got err=%v", err)
+	}
+	reports, err := db.ReportsBySHA256(ctx, "junk1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reports) != 0 {
+		t.Errorf("junk1 reports should be gone, got %d", len(reports))
 	}
 }
 

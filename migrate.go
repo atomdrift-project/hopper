@@ -572,7 +572,8 @@ func flushSamplesSQLite(ctx context.Context, dst *DB, samples []*Sample) (int64,
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
 				size_bytes, label, label_source, path, status, note, canonical_sha256,
-				parent, skip, formula, elements, score, cleave_result, litmus_result, litmus_score, analyzed_at, created_at, updated_at, mtime, marker_mtime)
+				parent, skip, formula, elements, score, cleave_result, litmus_result,
+				litmus_score, analyzed_at, created_at, updated_at, mtime, marker_mtime)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (sha256) DO NOTHING`,
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
