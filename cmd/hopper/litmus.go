@@ -618,6 +618,14 @@ func (s *litmusServer) Slots() int { return s.maxWorkers }
 // Name returns a short human-readable identifier for logs and metrics.
 func (s *litmusServer) Name() string { return "local:" + s.port }
 
+// Health polls the local litmus's /_/health and returns a parsed snapshot.
+// Used by the dashboard's per-node monitor; the existing pollHealth path
+// (which also pulls /_/requests for stuck-request detection) is unchanged
+// and continues to drive WatchHealth.
+func (s *litmusServer) Health(ctx context.Context) (*nodeHealth, error) {
+	return fetchHealth(ctx, s.client, s.url)
+}
+
 func (s *litmusServer) doAnalyze(ctx context.Context, sha256 string, body []byte) (*analyzeResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url+"/analyze-path", bytes.NewReader(body))
 	if err != nil {

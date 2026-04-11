@@ -636,9 +636,13 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 	// spawned over this queue.
 	var analyzeQueue chan loadJob
 	var analyzeWG sync.WaitGroup
+	var monitors []*nodeMonitor
 	if len(nodes) > 0 {
 		analyzeQueue = make(chan loadJob, 2_000_000)
 		startAnalysisWorkers(ctx, cancel, db, nodes, analyzeQueue, &analyzeWG, &progress, shared, maxAnalyzed)
+		// Per-node /_/health pollers feed the dashboard's pool block.
+		// Goroutines exit when ctx is cancelled at the end of the load.
+		monitors = startNodeMonitors(ctx, nodes)
 	}
 
 	// Progress dashboard: reads counters, exits when dashCtx is cancelled.
@@ -646,7 +650,7 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 	defer dashCancel()
 	var dashWG sync.WaitGroup
 	dashWG.Go(func() {
-		runDashboard(dashCtx, &progress, litmus, start, startAnalyzed, maxAnalyzed, len(dirs))
+		runDashboard(dashCtx, &progress, litmus, monitors, start, startAnalyzed, maxAnalyzed, len(dirs))
 	})
 
 	// Per-directory pipelines: each goroutine runs cleave→hash→batch→
@@ -800,11 +804,14 @@ func runDirPipeline(
 
 // runDashboard renders the periodic progress view (TTY bars or slog lines)
 // until ctx is cancelled. It reads progress counters directly; no
-// coordination with workers is required beyond those atomic loads.
+// coordination with workers is required beyond those atomic loads. The pool
+// status block is fed by background nodeMonitors so this function never
+// blocks on a slow remote.
 func runDashboard(
 	ctx context.Context,
 	progress *loadProgress,
 	litmus *litmusServer,
+	monitors []*nodeMonitor,
 	start time.Time,
 	startAnalyzed int64,
 	maxAnalyzed, ndirs int,
@@ -856,6 +863,7 @@ func runDashboard(
 				attrs = append(attrs, "analyze_pct", fmt.Sprintf("%.0f%%", float64(sessionAnalyzed)/float64(analyzeTarget)*100))
 			}
 			slog.Info("load progress", attrs...)
+			logPoolStatus(monitors)
 			continue
 		}
 
@@ -879,19 +887,152 @@ func runDashboard(
 			writeStdoutf("\033[31mRecent Error:\033[0m %s\n", last)
 			writeStdoutLine(strings.Repeat("─", 60))
 		}
+		renderPoolBlock(monitors)
+		// Local-only diagnostic: which file the slowest local worker is on
+		// right now. Remotes don't expose this (no /_/requests poll path).
 		if litmus != nil {
 			summary := litmus.workerSummary()
-			writeStdoutf("Litmus: %d busy, %d idle | oldest: %s (%s)\n",
-				summary.Busy, summary.Idle, summary.OldestFile,
-				(time.Duration(summary.OldestMS) * time.Millisecond).Round(time.Second))
-			if health := litmus.pollHealth(ctx); health != nil {
-				writeStdoutf("Health: %.2f load, %d MB RSS, %d active tasks\n",
-					health.Load, health.RSSMB, health.ActiveTasks)
+			if summary.Busy > 0 && summary.OldestFile != "" {
+				writeStdoutf("oldest local: %s (%s)\n",
+					summary.OldestFile,
+					(time.Duration(summary.OldestMS) * time.Millisecond).Round(time.Second))
 			}
 		}
 		writeStdoutf("Errors: %d | Walked: %d | Cache Hits: %d\n",
 			progress.errors.Load(), walked, progress.cacheHits.Load())
 	}
+}
+
+// renderPoolBlock writes a uniform per-node table for the TTY dashboard.
+// Stays at zero allocation in the steady-state by reading each monitor's
+// atomic snapshot pointer; never blocks on a slow node.
+func renderPoolBlock(monitors []*nodeMonitor) {
+	if len(monitors) == 0 {
+		return
+	}
+	totalSlots := 0
+	for _, m := range monitors {
+		totalSlots += m.Slots()
+	}
+
+	// Right-pad node names so the columns line up regardless of address length.
+	nameWidth := 4
+	for _, m := range monitors {
+		if w := len(m.Name()); w > nameWidth {
+			nameWidth = w
+		}
+	}
+
+	writeStdoutLine(strings.Repeat("─", 60))
+	writeStdoutf("\033[1mLitmus Pool:\033[0m %d nodes, %d slots\n", len(monitors), totalSlots)
+	for _, m := range monitors {
+		snap := m.Snapshot()
+		name := m.Name()
+		slots := m.Slots()
+		if snap == nil {
+			writeStdoutf("  %-*s  \033[2mpending…\033[0m\n", nameWidth, name)
+			continue
+		}
+		statusColor := poolStatusColor(snap)
+		statusLabel := poolStatusLabel(snap)
+		uptime := formatUptime(snap.Health.UptimeSecs)
+
+		if !snap.Reachable {
+			// Down: show last error inline; suppress stale numbers.
+			writeStdoutf("  %-*s  %s%-9s\033[0m  %s\n",
+				nameWidth, name, statusColor, statusLabel, truncate(snap.LastErr, 40))
+			continue
+		}
+		writeStdoutf("  %-*s  %s%-9s\033[0m  up %-9s  load %.2f  rss %4d MB  %2d/%-d\n",
+			nameWidth, name,
+			statusColor, statusLabel,
+			uptime,
+			snap.Health.Load,
+			snap.Health.RSSMB,
+			snap.Health.LiveTasks, slots,
+		)
+	}
+}
+
+// logPoolStatus emits one slog line per node for the non-TTY path. Each line
+// is independently greppable; combined with the existing "load progress"
+// line, the operator gets the same information as the TTY dashboard.
+func logPoolStatus(monitors []*nodeMonitor) {
+	for _, m := range monitors {
+		snap := m.Snapshot()
+		if snap == nil {
+			slog.Info("litmus node", "node", m.Name(), "status", "pending")
+			continue
+		}
+		if !snap.Reachable {
+			slog.Warn("litmus node",
+				"node", m.Name(),
+				"status", "down",
+				"error", snap.LastErr)
+			continue
+		}
+		slog.Info("litmus node",
+			"node", m.Name(),
+			"status", snap.Health.Status,
+			"uptime_secs", snap.Health.UptimeSecs,
+			"load", fmt.Sprintf("%.2f", snap.Health.Load),
+			"rss_mb", snap.Health.RSSMB,
+			"live", snap.Health.LiveTasks,
+			"slots", m.Slots(),
+		)
+	}
+}
+
+func poolStatusColor(snap *nodeStatusSnapshot) string {
+	if !snap.Reachable {
+		return "\033[31m" // red
+	}
+	switch snap.Health.Status {
+	case "ok":
+		return "\033[32m" // green
+	case "starting":
+		return "\033[33m" // yellow
+	case "degraded", "failed":
+		return "\033[33m" // yellow
+	default:
+		return "\033[37m" // gray for unknown
+	}
+}
+
+func poolStatusLabel(snap *nodeStatusSnapshot) string {
+	if !snap.Reachable {
+		return "down"
+	}
+	if snap.Health.Status == "" {
+		return "ok"
+	}
+	return snap.Health.Status
+}
+
+// formatUptime renders seconds as h:mm:ss (or m:ss for short uptimes). Used
+// only by the TTY dashboard; the slog path emits raw seconds.
+func formatUptime(secs int64) string {
+	if secs <= 0 {
+		return "—"
+	}
+	d := time.Duration(secs) * time.Second
+	h := int(d / time.Hour)
+	m := int((d % time.Hour) / time.Minute)
+	s := int((d % time.Minute) / time.Second)
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%d:%02d", m, s)
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	if n <= 1 {
+		return s[:n]
+	}
+	return s[:n-1] + "…"
 }
 
 // logLoadSummary emits the final "directory complete" line with the
