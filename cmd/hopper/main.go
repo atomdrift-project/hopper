@@ -412,7 +412,7 @@ func cmdLoad(ctx context.Context) error {
 	litmusBin := f.String("litmus", "litmus", "path to litmus binary (pass empty to disable)")
 	litmusWorkers := f.Int("litmus-workers", max(1, runtime.NumCPU()-1), "concurrent litmus analysis workers")
 	maxRSSGB := f.Int("max-memory-gb", 32, "litmus RSS limit in GB")
-	analysisTimeout := f.Int("analysis-timeout", 600, "per-file analysis timeout in seconds (passed to litmus)")
+	analysisTimeout := f.Int("analysis-timeout", 1200, "per-file analysis timeout in seconds (passed to litmus)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
