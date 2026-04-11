@@ -181,7 +181,7 @@ fi
 # for spinning disk.
 
 log "Applying PostgreSQL performance tunings"
-PG_TUNING_TMP=$(doas bastille cmd "$RUN" mktemp /tmp/pg-tuning-XXXXXX.sql)
+PG_TUNING_TMP="/tmp/pg-tuning-hopper.sql"
 doas bastille cmd "$RUN" tee "$PG_TUNING_TMP" >/dev/null <<'SQLEOF'
 -- Memory: 64GB server — shared_buffers=25% RAM, effective_cache_size=75% RAM.
 ALTER SYSTEM SET shared_buffers             = '16GB';
@@ -309,7 +309,7 @@ doas bastille cmd "$RUN" su -l postgres -c '
 log "Checking rc.d service for hopper"
 doas bastille cmd "$RUN" mkdir -p /usr/local/etc/rc.d
 
-RC_TMP=$(doas bastille cmd "$RUN" mktemp /tmp/hopper-rc-XXXXXX)
+RC_TMP="/tmp/hopper-rc.sh"
 doas bastille cmd "$RUN" tee "$RC_TMP" >/dev/null <<'RCEOF'
 #!/bin/sh
 
