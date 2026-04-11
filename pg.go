@@ -51,6 +51,14 @@ func (db *DB) migratePG(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_samples_ecosystem ON samples(ecosystem) WHERE ecosystem != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_mtime ON samples(mtime) WHERE mtime IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_file_type ON samples(file_type)`,
+		// idx_samples_unanalyzed indexes sha256 but unanalyzedPG orders by id;
+		// this index lets that query avoid a sort at 100M rows.
+		`CREATE INDEX IF NOT EXISTS idx_samples_unanalyzed_id ON samples(id) WHERE cleave_result IS NULL`,
+		// Covers falsePositivesPG / truePositivesPG / falseNegativesPG / benignReviewPG /
+		// badReviewPG — all filter (label, score, cleave_result IS NOT NULL, status='', skip='').
+		`CREATE INDEX IF NOT EXISTS idx_samples_review ON samples(label, score DESC) WHERE cleave_result IS NOT NULL AND status = '' AND skip = ''`,
+		// countAnalyzedPG: SELECT count(*) WHERE litmus_result IS NOT NULL — no index existed.
+		`CREATE INDEX IF NOT EXISTS idx_samples_litmus_done ON samples(id) WHERE litmus_result IS NOT NULL`,
 	} {
 		slog.Debug("executing migration ddl", "ddl", ddl)
 		if _, err := db.pool.Exec(ctx, ddl); err != nil {

@@ -29,6 +29,11 @@ else
     [ -z "$BUILD" ] || [ -z "$RUN" ] && die "usage: $0 <build-jail> <run-jail>"
 fi
 
+# PostgreSQL major version — bump here when upgrading.
+# Must match the version installed locally if you want pg_dump | pg_restore
+# to work without errors (e.g. transaction_timeout added in pg17).
+PGVER=17
+
 # Verify jails are accessible
 if [ -z "$DB_ONLY" ]; then
     doas bastille cmd "$BUILD" true || die "build jail '$BUILD' not accessible"
@@ -67,8 +72,17 @@ fi
 
 # --- Run jail setup ---
 
+# --- Storage tuning note (ZFS — do this on the host before first deploy) ---
+#
+# If the jail's data lives on ZFS, tune the dataset before initdb:
+#   zfs set recordsize=8k    <pool>/jails/<run-jail>   # match PG page size
+#   zfs set compression=lz4  <pool>/jails/<run-jail>   # transparent compression
+#   zfs set atime=off        <pool>/jails/<run-jail>   # eliminate atime writes
+#   zfs set logbias=throughput <pool>/jails/<run-jail> # sequential WAL writes
+#   zfs set primarycache=metadata <pool>/jails/<run-jail>  # let PG manage its own cache
+
 log "Installing PostgreSQL"
-doas bastille pkg "$RUN" install -y postgresql16-server
+doas bastille pkg "$RUN" install -y postgresql${PGVER}-server
 
 log "Ensuring hopper user exists"
 doas bastille cmd "$RUN" id -u hopper >/dev/null 2>&1 || \
@@ -113,18 +127,18 @@ log "Initializing PostgreSQL (if needed)"
 doas bastille sysrc "$RUN" postgresql_enable=YES
 
 # Initialize the database cluster if it doesn't exist yet.
-doas bastille cmd "$RUN" sh -c '
-    if [ ! -f /var/db/postgres/data16/PG_VERSION ]; then
+doas bastille cmd "$RUN" sh -c "
+    if [ ! -f /var/db/postgres/data${PGVER}/PG_VERSION ]; then
         /usr/local/etc/rc.d/postgresql initdb
     fi
-'
+"
 
 # Restrict network access: listen on all interfaces but only accept
 # connections from loopback and the 10.0.0.0/8 private range via pg_hba.
 # Overwriting pg_hba.conf is idempotent; postgres is reloaded below if
 # it's already running.
 log "Writing postgres access rules (loopback + 10.0.0.0/8)"
-doas bastille cmd "$RUN" tee /var/db/postgres/data16/pg_hba.conf >/dev/null <<'HBAEOF'
+doas bastille cmd "$RUN" tee /var/db/postgres/data${PGVER}/pg_hba.conf >/dev/null <<'HBAEOF'
 # Managed by rollout-bastille.sh — edits may be overwritten on redeploy.
 # TYPE  DATABASE  USER  ADDRESS         METHOD
 local   all       all                   peer
@@ -132,12 +146,12 @@ host    all       all   127.0.0.1/32    scram-sha-256
 host    all       all   ::1/128         scram-sha-256
 host    all       all   10.0.0.0/8      scram-sha-256
 HBAEOF
-doas bastille cmd "$RUN" chown postgres:postgres /var/db/postgres/data16/pg_hba.conf
-doas bastille cmd "$RUN" chmod 600 /var/db/postgres/data16/pg_hba.conf
+doas bastille cmd "$RUN" chown postgres:postgres /var/db/postgres/data${PGVER}/pg_hba.conf
+doas bastille cmd "$RUN" chmod 600 /var/db/postgres/data${PGVER}/pg_hba.conf
 
 # Ensure postgres listens on all interfaces so 10.x clients can reach it.
 doas bastille cmd "$RUN" sh -c "
-    conf=/var/db/postgres/data16/postgresql.conf
+    conf=/var/db/postgres/data${PGVER}/postgresql.conf
     if grep -qE \"^[#[:space:]]*listen_addresses\" \$conf; then
         sed -i '' -E \"s|^[#[:space:]]*listen_addresses.*|listen_addresses = '*'|\" \$conf
     else
@@ -154,6 +168,54 @@ else
     log "Starting PostgreSQL"
     doas bastille service "$RUN" postgresql start
 fi
+
+# --- PostgreSQL performance tuning ---
+#
+# ALTER SYSTEM writes to postgresql.auto.conf (always included, overrides
+# postgresql.conf). shared_buffers requires a restart; the others take effect
+# on reload. Adjust shared_buffers/effective_cache_size to your server RAM.
+#
+# Assumes SSD storage. Set random_page_cost=4 and effective_io_concurrency=2
+# for spinning disk.
+
+log "Applying PostgreSQL performance tunings"
+doas bastille cmd "$RUN" tee /tmp/pg-tuning.sql >/dev/null <<'SQLEOF'
+-- Memory: 64GB server — shared_buffers=25% RAM, effective_cache_size=75% RAM.
+ALTER SYSTEM SET shared_buffers             = '16GB';
+ALTER SYSTEM SET effective_cache_size       = '48GB';
+-- work_mem applies per sort/hash node; with ~20 connections doing complex
+-- queries this peaks around 10GB — well within budget on 64GB.
+ALTER SYSTEM SET work_mem                   = '512MB';
+-- Large maintenance_work_mem speeds up VACUUM and index builds on 100M rows.
+ALTER SYSTEM SET maintenance_work_mem       = '2GB';
+-- Checkpoints: spread I/O and give WAL room for bulk ingestion.
+ALTER SYSTEM SET checkpoint_completion_target = 0.9;
+ALTER SYSTEM SET max_wal_size               = '4GB';
+ALTER SYSTEM SET min_wal_size               = '1GB';
+ALTER SYSTEM SET wal_compression            = 'zstd';
+-- Planner: tuned for SSD.
+ALTER SYSTEM SET random_page_cost           = 1.2;
+ALTER SYSTEM SET effective_io_concurrency   = 200;
+-- Autovacuum: at 100M rows the default 20% threshold means 20M dead tuples
+-- before cleanup; drop to 1% so it stays on top of write-heavy workloads.
+ALTER SYSTEM SET autovacuum_vacuum_scale_factor  = 0.01;
+ALTER SYSTEM SET autovacuum_analyze_scale_factor = 0.005;
+ALTER SYSTEM SET autovacuum_max_workers          = 6;
+-- Huge pages: FreeBSD superpages are managed by the VM automatically;
+-- 'try' uses them when available without failing if not.
+ALTER SYSTEM SET huge_pages                 = 'try';
+-- Async commit: safe for this workload — worst case one WAL flush of data
+-- loss on a hard crash, acceptable for a file-analysis database.
+ALTER SYSTEM SET synchronous_commit         = 'off';
+SELECT pg_reload_conf();
+SQLEOF
+
+doas bastille cmd "$RUN" su -l postgres -c "psql -f /tmp/pg-tuning.sql"
+doas bastille cmd "$RUN" rm -f /tmp/pg-tuning.sql
+
+# Restart to apply settings that require it (shared_buffers, huge_pages).
+log "Restarting PostgreSQL to apply tuning"
+doas bastille service "$RUN" postgresql restart
 
 # Percent-encode a string for safe inclusion in a URL userinfo component.
 urlencode() {
@@ -215,6 +277,32 @@ if [ -n "$DB_ONLY" ]; then
     log "Database deployment complete"
     exit 0
 fi
+
+# --- Hourly PostgreSQL backups ---
+
+log "Setting up hourly PostgreSQL backups"
+doas bastille cmd "$RUN" mkdir -p /var/db/hopper-backups
+doas bastille cmd "$RUN" chown postgres:postgres /var/db/hopper-backups
+doas bastille cmd "$RUN" chmod 700 /var/db/hopper-backups
+
+doas bastille cmd "$RUN" tee /usr/local/sbin/hopper-backup.sh >/dev/null <<'BKEOF'
+#!/bin/sh
+# Dump hopper database and remove dumps older than 48 hours.
+BACKUP_DIR="/var/db/hopper-backups"
+STAMP=$(date -u +%Y-%m-%dT%H00Z)
+DEST="${BACKUP_DIR}/hopper-${STAMP}.dump"
+
+pg_dump -Fc hopper -f "${DEST}.tmp" && mv "${DEST}.tmp" "${DEST}"
+find "${BACKUP_DIR}" -name 'hopper-*.dump' -mtime +2 -delete
+BKEOF
+
+doas bastille cmd "$RUN" chmod 755 /usr/local/sbin/hopper-backup.sh
+
+# Add cron entry for postgres user (idempotent via grep guard).
+doas bastille cmd "$RUN" su -l postgres -c '
+    crontab -l 2>/dev/null | grep -q hopper-backup ||
+    ( crontab -l 2>/dev/null; echo "0 * * * * /usr/local/sbin/hopper-backup.sh" ) | crontab -
+'
 
 # --- Hopper rc.d service ---
 
