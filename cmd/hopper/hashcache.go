@@ -206,7 +206,7 @@ func (c *hashCache) close(ctx context.Context) {
 // fileStat returns the device and inode numbers from an os.FileInfo via Stat_t.
 func fileStat(info os.FileInfo) (dev, inode uint64) {
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		return st.Dev, st.Ino
+		return uint64(st.Dev), uint64(st.Ino)
 	}
 	return 0, 0
 }
