@@ -412,6 +412,7 @@ func cmdLoad(ctx context.Context) error {
 	litmusBin := f.String("litmus", "litmus", "path to litmus binary (pass empty to disable)")
 	litmusWorkers := f.Int("litmus-workers", 8, "concurrent litmus analysis workers (local node)")
 	litmusNodes := f.String("litmus-nodes", "", "comma-separated host[:port] of additional remote litmus servers (default port "+defaultRemoteLitmusPort+")")
+	noRulesUpdate := f.Bool("no-rules-update", false, "skip POST /_/update on each litmus node at startup")
 	maxRSSGB := f.Int("max-memory-gb", 32, "litmus RSS limit in GB")
 	analysisTimeout := f.Int("analysis-timeout", 1200, "per-file analysis timeout in seconds (passed to litmus)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
@@ -547,6 +548,19 @@ func cmdLoad(ctx context.Context) error {
 			"nodes", len(nodes),
 			"total_slots", totalSlots,
 			"detail", strings.Join(nodeNames, ","))
+
+		// Best-effort: ask every litmus node to refresh its models + traits
+		// data files, then compare versions across the pool. Both phases
+		// are non-fatal — a failed update or unreachable /_/info logs a
+		// warning and the load proceeds. The version-mismatch check ALWAYS
+		// runs (even with --no-rules-update) so the operator gets a loud
+		// signal if a node is running stale code or stale rules.
+		if !*noRulesUpdate {
+			updateAllNodes(ctx, nodes)
+		} else {
+			slog.Info("skipping rules/model update (--no-rules-update)")
+		}
+		warnVersionMismatch(fetchAllNodeInfo(ctx, nodes))
 	}
 
 	var shared loadProgress

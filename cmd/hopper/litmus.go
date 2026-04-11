@@ -626,6 +626,23 @@ func (s *litmusServer) Health(ctx context.Context) (*nodeHealth, error) {
 	return fetchHealth(ctx, s.client, s.url)
 }
 
+// Info fetches /_/info from the local litmus. Returns the same shape as
+// remote nodes so the version-mismatch comparison can treat all nodes
+// uniformly.
+func (s *litmusServer) Info(ctx context.Context) (*nodeInfo, error) {
+	return fetchInfo(ctx, s.client, s.url)
+}
+
+// Update asks the local litmus to pull fresh models + traits and reload.
+// Hopper already runs `git pull && make install` against ../litmus and
+// ../cleave on its own host (updateLitmus / updateCleave) — this updates
+// the model/traits *data files* used by the running binary. The two paths
+// are independent: binary version comes from the install, data versions
+// come from the repos this endpoint pulls.
+func (s *litmusServer) Update(ctx context.Context) (*updateResult, error) {
+	return postUpdate(ctx, s.client, s.url)
+}
+
 func (s *litmusServer) doAnalyze(ctx context.Context, sha256 string, body []byte) (*analyzeResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url+"/analyze-path", bytes.NewReader(body))
 	if err != nil {
