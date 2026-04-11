@@ -17,8 +17,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/codeGROOVE-dev/retry"
 )
 
 const restartRecoveryDelay = 15 * time.Second
@@ -597,9 +595,11 @@ type analyzeResult struct { //nolint:govet // result fields are grouped by meani
 
 var errRetryable = errors.New("service unavailable")
 
-// Analyze sends a file to the litmus server for analysis.
-// Returns the split response (ml + raw sections) and extracted canonical SHA.
-// Retries on 503 (litmus at capacity) with exponential backoff.
+// Analyze sends a file to the litmus server for analysis with a single HTTP
+// request. Retry/backoff is handled by the slot loop's analyzeWithRetry
+// wrapper (in pool.go) so local and remote nodes share one retry policy.
+//
+// Returns errRetryable on 503 so the wrapper can decide whether to retry.
 func (s *litmusServer) Analyze(ctx context.Context, sha256, path string) (*analyzeResult, error) {
 	body, err := json.Marshal(struct {
 		Path string `json:"path"`
@@ -607,34 +607,16 @@ func (s *litmusServer) Analyze(ctx context.Context, sha256, path string) (*analy
 	if err != nil {
 		return nil, err
 	}
-
-	r, err := retry.DoWithData(
-		func() (*analyzeResult, error) {
-			return s.doAnalyze(ctx, sha256, body)
-		},
-		retry.Attempts(12),
-		retry.Context(ctx),
-		retry.Delay(2*time.Second),
-		retry.MaxDelay(2*time.Minute),
-		retry.DelayType(retry.CombineDelay(retry.BackOffDelay, retry.RandomDelay)),
-		retry.MaxJitter(3*time.Second),
-		retry.RetryIf(func(err error) bool {
-			return errors.Is(err, errRetryable) || isRetryableNetError(err)
-		}),
-		retry.OnRetry(func(attempt uint, _ error) {
-			slog.Debug("litmus analyze retrying",
-				"path", path,
-				"url", s.url,
-				"pid", s.currentPID(),
-				"attempt", attempt+1)
-		}),
-		retry.LastErrorOnly(true),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("litmus: %s: %w", path, err)
-	}
-	return r, nil
+	return s.doAnalyze(ctx, sha256, body)
 }
+
+// Slots returns the number of concurrent analyses this node accepts; satisfies
+// the analyzer interface so the local litmus can sit in the pool alongside
+// remote nodes.
+func (s *litmusServer) Slots() int { return s.maxWorkers }
+
+// Name returns a short human-readable identifier for logs and metrics.
+func (s *litmusServer) Name() string { return "local:" + s.port }
 
 func (s *litmusServer) doAnalyze(ctx context.Context, sha256 string, body []byte) (*analyzeResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url+"/analyze-path", bytes.NewReader(body))

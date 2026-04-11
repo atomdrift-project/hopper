@@ -844,7 +844,7 @@ func TestLoadDir(t *testing.T) {
 
 	shared := &loadProgress{}
 	shared.analyzeDurationMin.Store(math.MaxInt64)
-	n := loadAll(ctx, func() {}, db, nil, nil, []struct{ dir, label string }{{dir, "bad"}}, "test", 2, false, 0, "", shared)
+	n := loadAll(ctx, func() {}, db, nil, nil, nil, []struct{ dir, label string }{{dir, "bad"}}, "test", 2, false, 0, "", shared)
 	// 2 valid files inserted (tiny skipped, .git skipped)
 	if n != 2 {
 		t.Errorf("loadAll returned %d, want 2", n)
@@ -886,7 +886,7 @@ func TestLoadDirWithCache(t *testing.T) {
 	// First load: cache miss, hashes file.
 	s1 := &loadProgress{}
 	s1.analyzeDurationMin.Store(math.MaxInt64)
-	n1 := loadAll(ctx, func() {}, db, nil, cache, []struct{ dir, label string }{{dir, "bad"}}, "test", 1, false, 0, "", s1)
+	n1 := loadAll(ctx, func() {}, db, nil, nil, cache, []struct{ dir, label string }{{dir, "bad"}}, "test", 1, false, 0, "", s1)
 	if n1 != 1 {
 		t.Errorf("first load = %d, want 1", n1)
 	}
@@ -894,7 +894,7 @@ func TestLoadDirWithCache(t *testing.T) {
 	// Second load: cache hit, same hash → duplicate skipped.
 	s2 := &loadProgress{}
 	s2.analyzeDurationMin.Store(math.MaxInt64)
-	n2 := loadAll(ctx, func() {}, db, nil, cache, []struct{ dir, label string }{{dir, "bad"}}, "test", 1, false, 0, "", s2)
+	n2 := loadAll(ctx, func() {}, db, nil, nil, cache, []struct{ dir, label string }{{dir, "bad"}}, "test", 1, false, 0, "", s2)
 	if n2 != 1 { // 1 total (0 inserted + 1 skipped)
 		t.Errorf("second load = %d, want 1", n2)
 	}
@@ -920,7 +920,7 @@ func TestLoadDirMarkers(t *testing.T) {
 
 	sm := &loadProgress{}
 	sm.analyzeDurationMin.Store(math.MaxInt64)
-	loadAll(ctx, func() {}, db, nil, nil, []struct{ dir, label string }{{dir, "bad"}}, "test", 1, false, 0, "", sm)
+	loadAll(ctx, func() {}, db, nil, nil, nil, []struct{ dir, label string }{{dir, "bad"}}, "test", 1, false, 0, "", sm)
 
 	// The sample should be flipped to "good" with skip="misclassified".
 	samples, err := db.SamplesByLabel(ctx, "good", 10)
@@ -966,7 +966,7 @@ func TestLoadDirMarkersRefreshMarkerMtimeOnDuplicate(t *testing.T) {
 
 	sm := &loadProgress{}
 	sm.analyzeDurationMin.Store(math.MaxInt64)
-	loadAll(ctx, func() {}, db, nil, nil, []struct{ dir, label string }{{dir, "bad"}}, "test", 1, false, 0, "", sm)
+	loadAll(ctx, func() {}, db, nil, nil, nil, []struct{ dir, label string }{{dir, "bad"}}, "test", 1, false, 0, "", sm)
 
 	samples, err := db.SamplesByLabel(ctx, "good", 10)
 	if err != nil {
@@ -981,7 +981,7 @@ func TestLoadDirMarkersRefreshMarkerMtimeOnDuplicate(t *testing.T) {
 	}
 	sm = &loadProgress{}
 	sm.analyzeDurationMin.Store(math.MaxInt64)
-	loadAll(ctx, func() {}, db, nil, nil, []struct{ dir, label string }{{dir, "bad"}}, "test", 1, false, 0, "", sm)
+	loadAll(ctx, func() {}, db, nil, nil, nil, []struct{ dir, label string }{{dir, "bad"}}, "test", 1, false, 0, "", sm)
 
 	samples, err = db.SamplesByLabel(ctx, "good", 10)
 	if err != nil {

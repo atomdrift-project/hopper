@@ -410,9 +410,10 @@ func cmdLoad(ctx context.Context) error {
 	workers := f.Int("workers", 8, "concurrent hash/insert workers")
 	cleaveBinFlag := f.String("cleave", "cleave", "path to cleave binary (used for file enumeration)")
 	litmusBin := f.String("litmus", "litmus", "path to litmus binary (pass empty to disable)")
-	litmusWorkers := f.Int("litmus-workers", max(1, runtime.NumCPU()-1), "concurrent litmus analysis workers")
+	litmusWorkers := f.Int("litmus-workers", 8, "concurrent litmus analysis workers (local node)")
+	litmusNodes := f.String("litmus-nodes", "", "comma-separated host[:port] of additional remote litmus servers (default port "+defaultRemoteLitmusPort+")")
 	maxRSSGB := f.Int("max-memory-gb", 32, "litmus RSS limit in GB")
-	analysisTimeout := f.Int("analysis-timeout", 3600, "per-file analysis timeout in seconds (passed to litmus)")
+	analysisTimeout := f.Int("analysis-timeout", 1200, "per-file analysis timeout in seconds (passed to litmus)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
@@ -523,13 +524,38 @@ func cmdLoad(ctx context.Context) error {
 		go litmus.WatchHealth(ctx)
 	}
 
+	// Build the analyzer pool: local litmus (if enabled) plus any remote
+	// litmus servers passed via --litmus-nodes. Remote nodes that fail to
+	// dial are logged and skipped, never fatal.
+	var nodes []analyzer
+	if litmus != nil {
+		nodes = append(nodes, litmus)
+	}
+	if remoteAddrs := parseLitmusNodes(*litmusNodes); len(remoteAddrs) > 0 {
+		for _, r := range dialAllRemoteLitmus(ctx, remoteAddrs) {
+			nodes = append(nodes, r)
+		}
+	}
+	if len(nodes) > 0 {
+		totalSlots := 0
+		nodeNames := make([]string, 0, len(nodes))
+		for _, n := range nodes {
+			totalSlots += n.Slots()
+			nodeNames = append(nodeNames, fmt.Sprintf("%s(%d)", n.Name(), n.Slots()))
+		}
+		slog.Info("analysis pool ready",
+			"nodes", len(nodes),
+			"total_slots", totalSlots,
+			"detail", strings.Join(nodeNames, ","))
+	}
+
 	var shared loadProgress
 	shared.analyzeDurationMin.Store(math.MaxInt64)
 
 	loadCtx, loadCancel := context.WithCancel(ctx)
 	defer loadCancel()
 
-	total := loadAll(loadCtx, loadCancel, db, litmus, cache, loadDirs, *source, *workers, *rescan, *maxAnalyzed, *experimentTag, &shared)
+	total := loadAll(loadCtx, loadCancel, db, litmus, nodes, cache, loadDirs, *source, *workers, *rescan, *maxAnalyzed, *experimentTag, &shared)
 	slog.Info("load complete", "samples", total)
 	return nil
 }
@@ -588,7 +614,7 @@ var (
 // may run concurrently (irrelevant for typical 3-dir loads).
 //
 //nolint:revive // signature matches the pipeline's top-level orchestration contract.
-func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litmus *litmusServer, cache *hashCache, dirs []struct{ dir, label string }, source string, nworkers int, rescan bool, maxAnalyzed int, experimentTag string, shared *loadProgress) int {
+func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litmus *litmusServer, nodes []analyzer, cache *hashCache, dirs []struct{ dir, label string }, source string, nworkers int, rescan bool, maxAnalyzed int, experimentTag string, shared *loadProgress) int {
 	slog.Info("loading", "dirs", len(dirs))
 	start := time.Now()
 	var progress loadProgress
@@ -606,12 +632,13 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 
 	// Analysis pool: a large buffered queue absorbs bursts from the
 	// per-directory inserters so slow litmus analysis doesn't back up
-	// into the DB insert path.
+	// into the DB insert path. One slot goroutine per node-slot is
+	// spawned over this queue.
 	var analyzeQueue chan loadJob
 	var analyzeWG sync.WaitGroup
-	if litmus != nil {
+	if len(nodes) > 0 {
 		analyzeQueue = make(chan loadJob, 2_000_000)
-		startAnalysisWorkers(ctx, cancel, db, litmus, analyzeQueue, &analyzeWG, &progress, shared, litmus.Workers(), maxAnalyzed)
+		startAnalysisWorkers(ctx, cancel, db, nodes, analyzeQueue, &analyzeWG, &progress, shared, maxAnalyzed)
 	}
 
 	// Progress dashboard: reads counters, exits when dashCtx is cancelled.
@@ -905,84 +932,100 @@ func startAnalysisWorkers(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	db *hopper.DB,
-	litmus *litmusServer,
+	nodes []analyzer,
 	queue chan loadJob,
 	wg *sync.WaitGroup,
 	progress *loadProgress,
 	shared *loadProgress,
-	nworkers int,
 	maxAnalyzed int,
 ) {
-	for workerID := range nworkers {
-		wg.Go(func() {
-			for job := range queue {
-				if ctx.Err() != nil {
-					slog.Debug("analysis worker exiting", "reason", "context cancelled")
-					return
-				}
+	// One goroutine per slot per node, all reading from the shared queue.
+	// Work-stealing emerges naturally: when a slot finishes (fast or slow),
+	// it grabs the next item, so heterogeneous nodes self-balance and the
+	// 2-120s analysis-time variance is absorbed without a scheduler.
+	workerID := 0
+	for _, node := range nodes {
+		// Only the local litmusServer wires into the dashboard's per-worker
+		// in-flight tracking. Remote nodes have no equivalent today.
+		local, _ := node.(*litmusServer)
+		for range node.Slots() {
+			id := workerID
+			workerID++
+			n := node
+			wg.Go(func() {
+				for job := range queue {
+					if ctx.Err() != nil {
+						slog.Debug("analysis worker exiting", "reason", "context cancelled", "node", n.Name())
+						return
+					}
 
-				litmus.TrackWorker(workerID, filepath.Base(job.path))
-				t0 := time.Now()
-				result, err := litmus.Analyze(ctx, job.sha, job.path)
-				litmus.TrackWorker(workerID, "")
-				dur := time.Since(t0).Nanoseconds()
+					if local != nil {
+						local.TrackWorker(id, filepath.Base(job.path))
+					}
+					t0 := time.Now()
+					result, err := analyzeWithRetry(ctx, n, job.sha, job.path)
+					if local != nil {
+						local.TrackWorker(id, "")
+					}
+					dur := time.Since(t0).Nanoseconds()
 
-				if err != nil {
-					progress.errors.Add(1)
-					progress.lastErr.Store(fmt.Sprintf("analyze: %s: %v", filepath.Base(job.path), err))
-					slog.Warn("analysis failed", "path", job.path, "error", err)
-					continue
-				}
+					if err != nil {
+						progress.errors.Add(1)
+						progress.lastErr.Store(fmt.Sprintf("analyze: %s: %v", filepath.Base(job.path), err))
+						slog.Warn("analysis failed", "node", n.Name(), "path", job.path, "error", err)
+						continue
+					}
 
-				// Track per-analysis duration.
-				progress.analyzeDurationSum.Add(dur)
-				shared.analyzeDurationSum.Add(dur)
-				for {
-					old := progress.analyzeDurationMax.Load()
-					if dur <= old || progress.analyzeDurationMax.CompareAndSwap(old, dur) {
-						break
+					// Track per-analysis duration.
+					progress.analyzeDurationSum.Add(dur)
+					shared.analyzeDurationSum.Add(dur)
+					for {
+						old := progress.analyzeDurationMax.Load()
+						if dur <= old || progress.analyzeDurationMax.CompareAndSwap(old, dur) {
+							break
+						}
+					}
+					for {
+						old := progress.analyzeDurationMin.Load()
+						if dur >= old || progress.analyzeDurationMin.CompareAndSwap(old, dur) {
+							break
+						}
+					}
+
+					// Store raw litmus report and classification envelope separately.
+					if err := db.UpdateCleaveResult(ctx, job.sha, result.Raw, result.Canonical); err != nil {
+						progress.errors.Add(1)
+						slog.Warn("storing cleave result failed", "path", job.path, "error", err)
+						continue
+					}
+					if err := db.UpdateLitmusResult(ctx, job.sha, result.ML); err != nil {
+						slog.Warn("storing litmus result failed", "path", job.path, "error", err)
+					}
+					progress.analyzed.Add(1)
+
+					// Check global analysis cap.
+					if maxAnalyzed > 0 && shared.analyzed.Add(1) >= int64(maxAnalyzed) {
+						slog.Info("max-analyzed reached", "limit", maxAnalyzed)
+						cancel()
+						return
+					}
+
+					// Explode archive members into individual sample rows.
+					parent, err := db.SampleBySHA256(ctx, job.sha)
+					if err != nil {
+						slog.Warn("fetch for explosion failed", "sha256", job.sha, "error", err)
+						continue
+					}
+					totalMembers, err := db.ExplodeArchiveMembers(ctx, parent)
+					if err != nil {
+						slog.Warn("archive explosion failed", "sha256", job.sha, "error", err)
+					} else if totalMembers > 0 {
+						slog.Debug("exploded archive members", "sha256", job.sha, "members", totalMembers)
+						progress.exploded.Add(totalMembers)
 					}
 				}
-				for {
-					old := progress.analyzeDurationMin.Load()
-					if dur >= old || progress.analyzeDurationMin.CompareAndSwap(old, dur) {
-						break
-					}
-				}
-
-				// Store raw litmus report and classification envelope separately.
-				if err := db.UpdateCleaveResult(ctx, job.sha, result.Raw, result.Canonical); err != nil {
-					progress.errors.Add(1)
-					slog.Warn("storing cleave result failed", "path", job.path, "error", err)
-					continue
-				}
-				if err := db.UpdateLitmusResult(ctx, job.sha, result.ML); err != nil {
-					slog.Warn("storing litmus result failed", "path", job.path, "error", err)
-				}
-				progress.analyzed.Add(1)
-
-				// Check global analysis cap.
-				if maxAnalyzed > 0 && shared.analyzed.Add(1) >= int64(maxAnalyzed) {
-					slog.Info("max-analyzed reached", "limit", maxAnalyzed)
-					cancel()
-					return
-				}
-
-				// Explode archive members into individual sample rows.
-				parent, err := db.SampleBySHA256(ctx, job.sha)
-				if err != nil {
-					slog.Warn("fetch for explosion failed", "sha256", job.sha, "error", err)
-					continue
-				}
-				totalMembers, err := db.ExplodeArchiveMembers(ctx, parent)
-				if err != nil {
-					slog.Warn("archive explosion failed", "sha256", job.sha, "error", err)
-				} else if totalMembers > 0 {
-					slog.Debug("exploded archive members", "sha256", job.sha, "members", totalMembers)
-					progress.exploded.Add(totalMembers)
-				}
-			}
-		})
+			})
+		}
 	}
 }
 

@@ -1,9 +1,13 @@
 #!/bin/sh
 # rollout-bastille.sh - Deploy hopper + PostgreSQL using separate build and run jails
 # Usage: ./rollout-bastille.sh <build-jail> <run-jail>
+#        DB_ONLY=1 ./rollout-bastille.sh "" <run-jail>
 #
 # Builds the hopper binary in the build jail, installs PostgreSQL and hopper
 # in the run jail, and configures both as rc.d services.
+#
+# When DB_ONLY=1 is set, only PostgreSQL is provisioned in the run jail — the
+# build jail is not touched and the hopper binary/service is left alone.
 
 set -e
 
@@ -19,39 +23,47 @@ log() {
     echo "==> $*"
 }
 
-[ -z "$BUILD" ] || [ -z "$RUN" ] && die "usage: $0 <build-jail> <run-jail>"
+if [ -n "$DB_ONLY" ]; then
+    [ -n "$RUN" ] || die "usage: DB_ONLY=1 $0 \"\" <run-jail>"
+else
+    [ -z "$BUILD" ] || [ -z "$RUN" ] && die "usage: $0 <build-jail> <run-jail>"
+fi
 
 # Verify jails are accessible
-doas bastille cmd "$BUILD" true || die "build jail '$BUILD' not accessible"
+if [ -z "$DB_ONLY" ]; then
+    doas bastille cmd "$BUILD" true || die "build jail '$BUILD' not accessible"
+fi
 doas bastille cmd "$RUN" true || die "run jail '$RUN' not accessible"
 
-# --- Build jail setup ---
+if [ -z "$DB_ONLY" ]; then
+    # --- Build jail setup ---
 
-log "Ensuring build user exists"
-doas bastille cmd "$BUILD" id -u hopper >/dev/null 2>&1 || \
-    doas bastille cmd "$BUILD" pw useradd hopper -m -s /bin/sh -c "Hopper Build"
+    log "Ensuring build user exists"
+    doas bastille cmd "$BUILD" id -u hopper >/dev/null 2>&1 || \
+        doas bastille cmd "$BUILD" pw useradd hopper -m -s /bin/sh -c "Hopper Build"
 
-log "Installing build dependencies"
-doas bastille pkg "$BUILD" install -y go gmake sqlite3
+    log "Installing build dependencies"
+    doas bastille pkg "$BUILD" install -y go gmake sqlite3
 
-log "Copying source tree to build jail"
-doas bastille cmd "$BUILD" rm -rf /home/hopper/hopper
-doas bastille cp "$BUILD" . /home/hopper/hopper
-doas bastille cmd "$BUILD" chown -R hopper:hopper /home/hopper/hopper
+    log "Copying source tree to build jail"
+    doas bastille cmd "$BUILD" rm -rf /home/hopper/hopper
+    doas bastille cp "$BUILD" . /home/hopper/hopper
+    doas bastille cmd "$BUILD" chown -R hopper:hopper /home/hopper/hopper
 
-log "Building hopper binary"
-doas bastille cmd "$BUILD" su -l hopper -c "cd ~/hopper && gmake build"
+    log "Building hopper binary"
+    doas bastille cmd "$BUILD" su -l hopper -c "cd ~/hopper && gmake build"
 
-log "Running tests"
-doas bastille cmd "$BUILD" su -l hopper -c "cd ~/hopper && gmake test"
+    log "Running tests"
+    doas bastille cmd "$BUILD" su -l hopper -c "cd ~/hopper && gmake test"
 
-# --- Transfer binary via jail filesystem ---
+    # --- Transfer binary via jail filesystem ---
 
-BASTILLE_DIR="/usr/local/bastille/jails"
+    BASTILLE_DIR="/usr/local/bastille/jails"
 
-log "Transferring binary to run jail"
-doas cp "$BASTILLE_DIR/$BUILD/root/home/hopper/hopper/hopper" \
-       "$BASTILLE_DIR/$RUN/root/tmp/hopper"
+    log "Transferring binary to run jail"
+    doas cp "$BASTILLE_DIR/$BUILD/root/home/hopper/hopper/hopper" \
+           "$BASTILLE_DIR/$RUN/root/tmp/hopper"
+fi
 
 # --- Run jail setup ---
 
@@ -62,10 +74,12 @@ log "Ensuring hopper user exists"
 doas bastille cmd "$RUN" id -u hopper >/dev/null 2>&1 || \
     doas bastille cmd "$RUN" pw useradd hopper -m -s /bin/sh -c "Hopper Service"
 
-log "Installing hopper binary"
-doas bastille cmd "$RUN" mkdir -p /usr/local/bin
-doas bastille cmd "$RUN" install -o root -g wheel -m 755 /tmp/hopper /usr/local/bin/hopper
-doas bastille cmd "$RUN" rm -f /tmp/hopper
+if [ -z "$DB_ONLY" ]; then
+    log "Installing hopper binary"
+    doas bastille cmd "$RUN" mkdir -p /usr/local/bin
+    doas bastille cmd "$RUN" install -o root -g wheel -m 755 /tmp/hopper /usr/local/bin/hopper
+    doas bastille cmd "$RUN" rm -f /tmp/hopper
+fi
 
 # --- PostgreSQL initialization ---
 
@@ -94,6 +108,12 @@ doas bastille cmd "$RUN" su -l postgres -c "createdb -O hopper hopper 2>/dev/nul
 log "Running hopper migrations"
 doas bastille cmd "$RUN" su -l hopper -c \
     "hopper init --db 'postgres://hopper@localhost/hopper?sslmode=disable'"
+
+if [ -n "$DB_ONLY" ]; then
+    log "DB_ONLY set — skipping hopper binary/service setup"
+    log "Database deployment complete"
+    exit 0
+fi
 
 # --- Hopper rc.d service ---
 

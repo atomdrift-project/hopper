@@ -6,7 +6,7 @@ help:
 	@echo "  make test                   Run tests"
 	@echo "  make lint                   Run linters"
 	@echo "  make clean                  Clean build artifacts"
-	@echo "  make rollout-bastille       Deploy to Bastille jails (BUILD=jail RUN=jail)"
+	@echo "  make rollout-bastille       Deploy to Bastille jails (BUILD=build RUN=hopper [DB_ONLY=1])"
 
 build:
 	CGO_ENABLED=1 go build -o hopper -ldflags="-s -w" ./cmd/hopper
@@ -14,9 +14,15 @@ build:
 test:
 	go test ./...
 
+BUILD ?= build
+RUN ?= hopper
+
 rollout-bastille:
-	@[ -n "$(BUILD)" ] && [ -n "$(RUN)" ] || { echo "Usage: make rollout-bastille BUILD=<build-jail> RUN=<run-jail>"; exit 1; }
-	./hacks/rollout-bastille.sh "$(BUILD)" "$(RUN)"
+	@if [ -n "$(DB_ONLY)" ]; then \
+		DB_ONLY=1 ./hacks/rollout-bastille.sh "" "$(RUN)"; \
+	else \
+		./hacks/rollout-bastille.sh "$(BUILD)" "$(RUN)"; \
+	fi
 
 clean:
 	rm -f hopper
