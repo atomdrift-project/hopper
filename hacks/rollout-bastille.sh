@@ -72,6 +72,14 @@ fi
 
 # --- Run jail setup ---
 
+# Enable DNS before anything else — pkg bootstrap will fail with a resolver
+# error if local_unbound isn't up first.
+log "Enabling local_unbound resolver"
+doas bastille sysrc "$RUN" local_unbound_enable=YES
+if ! doas bastille cmd "$RUN" service local_unbound status >/dev/null 2>&1; then
+    doas bastille service "$RUN" local_unbound start
+fi
+
 # --- Storage tuning note (ZFS — do this on the host before first deploy) ---
 #
 # If the jail's data lives on ZFS, tune the dataset before initdb:
@@ -115,12 +123,6 @@ done
 if [ "$need_restart" -eq 1 ]; then
     log "Restarting jail to apply SysV IPC namespace changes"
     doas bastille restart "$RUN"
-fi
-
-log "Enabling local_unbound resolver"
-doas bastille sysrc "$RUN" local_unbound_enable=YES
-if ! doas bastille cmd "$RUN" service local_unbound status >/dev/null 2>&1; then
-    doas bastille service "$RUN" local_unbound start
 fi
 
 log "Initializing PostgreSQL (if needed)"
