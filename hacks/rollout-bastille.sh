@@ -89,9 +89,11 @@ fi
 # kernel state via jls and only restart if something actually needs updating.
 need_restart=0
 for param in sysvmsg sysvsem sysvshm; do
-    current=$(doas jls -j "$RUN" "$param" 2>/dev/null || echo "disable")
+    # `bastille config get` reads the persisted value from jail.conf; it's
+    # more reliable than `jls` for params that aren't enumerated at runtime.
+    current=$(doas bastille config "$RUN" get "$param" 2>/dev/null | tr -d '[:space:]')
     if [ "$current" != "new" ]; then
-        log "Setting $param=new (was: $current)"
+        log "Setting $param=new (was: ${current:-unset})"
         doas bastille config "$RUN" set "$param" new
         need_restart=1
     fi
