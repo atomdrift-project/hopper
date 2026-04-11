@@ -133,6 +133,8 @@ type Sample struct {
 	ID              int64
 	SizeBytes       int64
 	Score           int // cleave raw score
+	MaxCrit         int // max trait criticality level (5=hostile, 4=suspicious, ...)
+	SuspiciousCount int // count of traits with level>=4 and confidence>=0.65
 }
 
 // Report is an analysis report produced by cyclotron.
@@ -148,15 +150,20 @@ type Report struct {
 
 // cleaveFileInfo holds per-file metadata extracted from a cleave result.
 type cleaveFileInfo struct {
-	Formula  string
-	Elements string
-	FileType string
-	Score    int
+	Formula         string
+	Elements        string
+	FileType        string
+	Score           int
+	MaxCrit         int
+	SuspiciousCount int
 }
 
-// parseCleaveFile extracts formula, elements, score, and file type from a
-// cleave result for the file matching the given SHA256 (preferring an exact
-// SHA match, then falling back to depth 0).
+// parseCleaveFile extracts formula, elements, score, file type, max trait
+// criticality, and suspicious-trait count from a cleave result for the
+// file matching the given SHA256 (preferring an exact SHA match, then
+// falling back to depth 0). SuspiciousCount counts traits with level >= 4
+// (suspicious or hostile) at confidence >= 0.65, matching the convention
+// used by ExplodeArchiveMembers.
 func parseCleaveFile(sha256 string, result []byte) cleaveFileInfo {
 	if len(result) == 0 {
 		return cleaveFileInfo{}
@@ -168,6 +175,10 @@ func parseCleaveFile(sha256 string, result []byte) cleaveFileInfo {
 			FileType string `json:"type"`
 			Score    int    `json:"x"`
 			Depth    int    `json:"dp"`
+			Traits   []struct {
+				Level int     `json:"l"`
+				Conf  float64 `json:"c"`
+			} `json:"ts"`
 		} `json:"fs"`
 	}
 	if json.Unmarshal(result, &report) != nil {
@@ -175,11 +186,27 @@ func parseCleaveFile(sha256 string, result []byte) cleaveFileInfo {
 	}
 	for _, f := range report.Files {
 		if f.SHA256 == sha256 || f.Depth == 0 {
+			maxCrit := 0
+			suspicious := 0
+			for _, t := range f.Traits {
+				if t.Level > maxCrit {
+					maxCrit = t.Level
+				}
+				conf := t.Conf
+				if conf == 0 {
+					conf = 1.0
+				}
+				if conf >= 0.65 && t.Level >= 4 {
+					suspicious++
+				}
+			}
 			return cleaveFileInfo{
-				Formula:  f.Formula,
-				Elements: stripSubscripts(f.Formula),
-				FileType: f.FileType,
-				Score:    f.Score,
+				Formula:         f.Formula,
+				Elements:        stripSubscripts(f.Formula),
+				FileType:        f.FileType,
+				Score:           f.Score,
+				MaxCrit:         maxCrit,
+				SuspiciousCount: suspicious,
 			}
 		}
 	}
@@ -407,8 +434,8 @@ func (db *DB) Migrate(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("hopper: post-migrate backfill: %w", err)
 	}
-	if stats.Updated > 0 {
-		slog.Info("post-migrate backfill", "scanned", stats.Scanned, "updated", stats.Updated)
+	if stats.Updated > 0 || stats.MarkersCleared > 0 {
+		slog.Info("post-migrate backfill", "scanned", stats.Scanned, "updated", stats.Updated, "markers_cleared", stats.MarkersCleared)
 	}
 	return nil
 }
@@ -709,8 +736,9 @@ func (db *DB) SamplesByEmbeddedSHA256(ctx context.Context, sha256 string, limit 
 
 // BackfillStats reports the outcome of a Backfill run.
 type BackfillStats struct {
-	Scanned int64 // rows examined
-	Updated int64 // rows where at least one derivable column changed
+	Scanned        int64 // rows examined
+	Updated        int64 // rows where at least one derivable column changed
+	MarkersCleared int64 // skip='misclassified' rows reset to skip='' under the new heuristic
 }
 
 // Backfill re-derives columns from cleave_result and litmus_result for every

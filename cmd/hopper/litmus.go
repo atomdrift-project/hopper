@@ -162,32 +162,44 @@ func (s *litmusServer) Start(ctx context.Context) error {
 // updateLitmus attempts to build and install the latest litmus from ../litmus.
 // On failure it logs the error and falls back to whatever version is already installed.
 func updateLitmus(ctx context.Context) {
-	dir := "../litmus"
+	updateSiblingTool(ctx, "litmus", "../litmus")
+}
+
+// updateCleave attempts to build and install the latest cleave from ../cleave.
+// On failure it logs the error and falls back to whatever version is already installed.
+func updateCleave(ctx context.Context) {
+	updateSiblingTool(ctx, "cleave", "../cleave")
+}
+
+// updateSiblingTool runs `git pull && make install` in dir, treating pull
+// failures as non-fatal so a dirty working tree still rebuilds. Both litmus
+// and cleave follow the same repo layout and Makefile convention.
+func updateSiblingTool(ctx context.Context, name, dir string) {
 	if _, err := os.Stat(dir); err != nil {
-		slog.Warn("litmus source not found, using installed version", "dir", dir)
+		slog.Warn("tool source not found, using installed version", "tool", name, "dir", dir)
 		return
 	}
 
-	slog.Info("updating litmus", "dir", dir)
+	slog.Info("updating tool", "tool", name, "dir", dir)
 
 	pull := exec.CommandContext(ctx, "git", "pull")
 	pull.Dir = dir
 	pulled := true
 	if out, err := pull.CombinedOutput(); err != nil {
 		pulled = false
-		slog.Warn("git pull failed for litmus, building from current working tree anyway",
-			"error", err, "output", string(out))
+		slog.Warn("git pull failed, building from current working tree anyway",
+			"tool", name, "error", err, "output", string(out))
 	}
 
 	install := exec.CommandContext(ctx, "make", "install")
 	install.Dir = dir
 	if out, err := install.CombinedOutput(); err != nil {
-		slog.Error("make install failed for litmus, using installed version",
-			"error", err, "output", string(out), "pulled", pulled)
+		slog.Error("make install failed, using installed version",
+			"tool", name, "error", err, "output", string(out), "pulled", pulled)
 		return
 	}
 
-	slog.Info("litmus updated successfully", "pulled", pulled)
+	slog.Info("tool updated successfully", "tool", name, "pulled", pulled)
 }
 
 func (s *litmusServer) startLocked(ctx context.Context, l net.Listener) error {

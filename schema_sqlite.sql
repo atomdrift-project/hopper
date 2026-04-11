@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS samples (
 	formula       TEXT NOT NULL DEFAULT '',
 	elements      TEXT NOT NULL DEFAULT '',
 	score         INTEGER NOT NULL DEFAULT 0,
+	max_crit      INTEGER NOT NULL DEFAULT 0,
+	suspicious_count INTEGER NOT NULL DEFAULT 0,
 	created_at    DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
 	updated_at    DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
 

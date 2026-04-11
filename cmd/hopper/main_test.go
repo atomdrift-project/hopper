@@ -773,9 +773,9 @@ func TestHashFileTooSmall(t *testing.T) {
 }
 
 func TestHashFileTooLarge(t *testing.T) {
-	// We can't create a 1GB file in tests, but we can verify the constant.
-	if maxFileSize != 1<<30 {
-		t.Errorf("maxFileSize = %d, want %d", maxFileSize, 1<<30)
+	// Verify the default cap matches defaultMaxFileSize.
+	if maxFileSize != defaultMaxFileSize {
+		t.Errorf("maxFileSize = %d, want %d", maxFileSize, defaultMaxFileSize)
 	}
 }
 
@@ -1040,46 +1040,62 @@ func TestReviewCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, sample := range []*hopper.Sample{
+	type fixture struct {
+		s      *hopper.Sample
+		traits string
+	}
+	for _, fx := range []fixture{
 		{
-			SHA256:      "fp",
-			Source:      "test",
-			Label:       "good",
-			LabelSource: "test",
-			Score:       90,
-			Path:        "/samples/good/fp",
+			s: &hopper.Sample{
+				SHA256:      "fp",
+				Source:      "test",
+				Label:       "good",
+				LabelSource: "test",
+				Score:       90,
+				Path:        "/samples/good/fp",
+			},
 		},
 		{
-			SHA256:      "fn",
-			Source:      "test",
-			Label:       "bad",
-			LabelSource: "test",
-			Score:       20,
-			Path:        "/samples/bad/fn",
+			s: &hopper.Sample{
+				SHA256:      "fn",
+				Source:      "test",
+				Label:       "bad",
+				LabelSource: "test",
+				Score:       20,
+				Path:        "/samples/bad/fn",
+			},
 		},
 		{
-			SHA256:      "br",
-			Source:      "test",
-			Label:       "good",
-			LabelSource: "marker",
-			Skip:        "misclassified",
-			Score:       90,
-			Path:        "/samples/bad/br",
+			s: &hopper.Sample{
+				SHA256:      "br",
+				Source:      "test",
+				Label:       "good",
+				LabelSource: "marker",
+				Skip:        "misclassified",
+				Score:       90,
+				Path:        "/samples/bad/br",
+			},
+			traits: `{"l":5,"c":1.0}`, // hostile -> qualifies for benign-review
 		},
 		{
-			SHA256:      "mr",
-			Source:      "test",
-			Label:       "bad",
-			LabelSource: "marker",
-			Skip:        "misclassified",
-			Score:       20,
-			Path:        "/samples/good/mr",
+			s: &hopper.Sample{
+				SHA256:      "mr",
+				Source:      "test",
+				Label:       "bad",
+				LabelSource: "marker",
+				Skip:        "misclassified",
+				Score:       20,
+				Path:        "/samples/good/mr",
+			},
+			// no traits -> max_crit=0, suspicious_count=0, qualifies for bad-review
 		},
 	} {
+		sample := fx.s
 		if err := db.InsertSample(ctx, sample); err != nil {
 			t.Fatal(err)
 		}
-		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"elf","x":%d,"dp":0}]}`, sample.SHA256, sample.Score)
+		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"elf","x":%d,"dp":0,"ts":[%s]}]}`,
+			sample.SHA256, sample.Score, fx.traits)
 		if err := db.UpdateCleaveResult(ctx, sample.SHA256, result, ""); err != nil {
 			t.Fatal(err)
 		}
@@ -1126,30 +1142,42 @@ func TestReviewFlushCommands(t *testing.T) {
 	mustWriteFile(t, reviewMarkerPath("benign-review", benignPath), nil)
 	mustWriteFile(t, reviewMarkerPath("bad-review", badPath), nil)
 
-	for _, sample := range []*hopper.Sample{
+	type flushFixture struct {
+		s      *hopper.Sample
+		traits string
+	}
+	for _, fx := range []flushFixture{
 		{
-			SHA256:      "br-flush",
-			Source:      "test",
-			Label:       "good",
-			LabelSource: "marker",
-			Skip:        "misclassified",
-			Score:       90,
-			Path:        benignPath,
+			s: &hopper.Sample{
+				SHA256:      "br-flush",
+				Source:      "test",
+				Label:       "good",
+				LabelSource: "marker",
+				Skip:        "misclassified",
+				Score:       90,
+				Path:        benignPath,
+			},
+			traits: `{"l":5,"c":1.0}`, // hostile -> benign-review
 		},
 		{
-			SHA256:      "mr-flush",
-			Source:      "test",
-			Label:       "bad",
-			LabelSource: "marker",
-			Skip:        "misclassified",
-			Score:       20,
-			Path:        badPath,
+			s: &hopper.Sample{
+				SHA256:      "mr-flush",
+				Source:      "test",
+				Label:       "bad",
+				LabelSource: "marker",
+				Skip:        "misclassified",
+				Score:       20,
+				Path:        badPath,
+			},
+			// no traits -> bad-review
 		},
 	} {
+		sample := fx.s
 		if err := db.InsertSample(ctx, sample); err != nil {
 			t.Fatal(err)
 		}
-		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"elf","x":%d,"dp":0}]}`, sample.SHA256, sample.Score)
+		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"elf","x":%d,"dp":0,"ts":[%s]}]}`,
+			sample.SHA256, sample.Score, fx.traits)
 		if err := db.UpdateCleaveResult(ctx, sample.SHA256, result, ""); err != nil {
 			t.Fatal(err)
 		}

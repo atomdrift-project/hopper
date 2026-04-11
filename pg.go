@@ -35,6 +35,8 @@ func (db *DB) migratePG(ctx context.Context) error {
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS formula TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS elements TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS score INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS max_crit INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS suspicious_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS litmus_result JSONB`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS litmus_score DOUBLE PRECISION NOT NULL DEFAULT 0`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent) WHERE parent != ''`,
@@ -60,7 +62,7 @@ func (db *DB) migratePG(ctx context.Context) error {
 
 const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, cleave_result, litmus_result, litmus_score,
-	path, status, note, canonical_sha256, parent, skip, formula, elements, score,
+	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, mtime, marker_mtime`
 
 func pgSampleDest(s *Sample) []any {
@@ -68,7 +70,7 @@ func pgSampleDest(s *Sample) []any {
 		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &s.CleaveResult, &s.LitmusResult, &s.LitmusScore,
 		&s.Path, &s.Status, &s.Note, &s.CanonicalSHA256,
-		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.Mtime, &s.MarkerMtime,
+		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.MaxCrit, &s.SuspiciousCount, &s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.Mtime, &s.MarkerMtime,
 	}
 }
 
@@ -100,11 +102,11 @@ func scanPGSamples(rows pgx.Rows) ([]*Sample, error) {
 func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 	tag, err := db.pool.Exec(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, mtime, marker_mtime)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $1, $12, $13, $14, $15, $16, $17, $18)
+			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count, mtime, marker_mtime)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $1, $12, $13, $14, $15, $16, $17, $18, $19, $20)
 		ON CONFLICT (sha256) DO NOTHING`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
-		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.Mtime, s.MarkerMtime)
+		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime)
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
@@ -119,20 +121,20 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 var insertBatchStagingCols = []string{
 	"sha256", "source", "feed", "ecosystem", "filename", "file_type",
 	"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
-	"parent", "skip", "formula", "elements", "score", "mtime", "marker_mtime",
+	"parent", "skip", "formula", "elements", "score", "max_crit", "suspicious_count", "mtime", "marker_mtime",
 }
 
 const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 	sha256 TEXT, source TEXT, feed TEXT, ecosystem TEXT, filename TEXT,
 	file_type TEXT, size_bytes BIGINT, label TEXT, label_source TEXT,
 	path TEXT, status TEXT, canonical_sha256 TEXT,
-	parent TEXT, skip TEXT, formula TEXT, elements TEXT, score INTEGER, mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ
+	parent TEXT, skip TEXT, formula TEXT, elements TEXT, score INTEGER, max_crit INTEGER, suspicious_count INTEGER, mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ
 ) ON COMMIT DROP`
 
 const insertBatchStagingInsert = `INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, mtime, marker_mtime)
+	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count, mtime, marker_mtime)
 SELECT sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, mtime, marker_mtime
+	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count, mtime, marker_mtime
 FROM _staging
 ON CONFLICT (sha256) DO NOTHING`
 
@@ -142,7 +144,7 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 		rows[i] = []any{
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256,
-			s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.Mtime, s.MarkerMtime,
+			s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
 		}
 	}
 
@@ -211,11 +213,11 @@ func (db *DB) sampleBySHA256PG(ctx context.Context, sha256 string) (*Sample, err
 func (db *DB) updateCleaveResultPG(ctx context.Context, sha256 string, result []byte, canonical string, fi cleaveFileInfo) error {
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET cleave_result = $2,
-			canonical_sha256 = $3, formula = $4, elements = $5, score = $6,
-			file_type = COALESCE(NULLIF($7, ''), file_type),
+			canonical_sha256 = $3, formula = $4, elements = $5, score = $6, max_crit = $7, suspicious_count = $8,
+			file_type = COALESCE(NULLIF($9, ''), file_type),
 			litmus_result = NULL, litmus_score = 0,
 			analyzed_at = now(), updated_at = now()
-		WHERE sha256 = $1`, sha256, sanitizeJSONB(result), canonical, fi.Formula, fi.Elements, fi.Score, fi.FileType)
+		WHERE sha256 = $1`, sha256, sanitizeJSONB(result), canonical, fi.Formula, fi.Elements, fi.Score, fi.MaxCrit, fi.SuspiciousCount, fi.FileType)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
 	}
@@ -335,26 +337,28 @@ func (db *DB) falseNegativesPG(ctx context.Context, scoreThreshold, limit int) (
 	return scanPGSamples(rows)
 }
 
-func (db *DB) benignReviewPG(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+func (db *DB) benignReviewPG(ctx context.Context, _, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
 		 WHERE label = 'good' AND label_source = 'marker' AND skip = 'misclassified'
-			AND cleave_result IS NOT NULL AND score >= $1 AND status = ''
-		 ORDER BY score DESC LIMIT $2`,
-		scoreThreshold, limit)
+			AND cleave_result IS NOT NULL AND status = ''
+			AND (max_crit >= 5 OR suspicious_count >= 2)
+		 ORDER BY max_crit DESC, suspicious_count DESC LIMIT $1`,
+		limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: benign review: %w", err)
 	}
 	return scanPGSamples(rows)
 }
 
-func (db *DB) badReviewPG(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+func (db *DB) badReviewPG(ctx context.Context, _, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
 		 WHERE label = 'bad' AND label_source = 'marker' AND skip = 'misclassified'
-			AND cleave_result IS NOT NULL AND score <= $1 AND status = ''
-		 ORDER BY score ASC LIMIT $2`,
-		scoreThreshold, limit)
+			AND cleave_result IS NOT NULL AND status = ''
+			AND max_crit < 5 AND suspicious_count <= 1
+		 ORDER BY suspicious_count ASC, max_crit ASC LIMIT $1`,
+		limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: bad review: %w", err)
 	}
@@ -379,11 +383,11 @@ func (db *DB) countAnalyzedPG(ctx context.Context) (int64, error) {
 func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result []byte, canonical string, fi cleaveFileInfo) error {
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET status = $2, cleave_result = $3,
-			canonical_sha256 = $4, formula = $5, elements = $6, score = $7,
-			file_type = COALESCE(NULLIF($8, ''), file_type),
+			canonical_sha256 = $4, formula = $5, elements = $6, score = $7, max_crit = $8, suspicious_count = $9,
+			file_type = COALESCE(NULLIF($10, ''), file_type),
 			litmus_result = NULL, litmus_score = 0,
 			analyzed_at = now(), updated_at = now()
-		WHERE sha256 = $1`, sha256, status, sanitizeJSONB(result), canonical, fi.Formula, fi.Elements, fi.Score, fi.FileType)
+		WHERE sha256 = $1`, sha256, status, sanitizeJSONB(result), canonical, fi.Formula, fi.Elements, fi.Score, fi.MaxCrit, fi.SuspiciousCount, fi.FileType)
 	if err != nil {
 		return fmt.Errorf("hopper: update sample: %w", err)
 	}
@@ -606,33 +610,44 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 	var stats BackfillStats
 
 	// Candidate rows: have analysis output and file_type was never set.
+	// Used for the Scanned stat only — passes 1 and 2 are index-gated on
+	// file_type='' so they're effectively no-ops once the cohort is empty,
+	// and pass 3 (marker reset) runs unconditionally.
 	if err := db.pool.QueryRow(ctx, `
 		SELECT count(*) FROM samples
 		WHERE file_type = ''
 			AND (cleave_result IS NOT NULL OR litmus_result IS NOT NULL)`).Scan(&stats.Scanned); err != nil {
 		return stats, fmt.Errorf("hopper: backfill count: %w", err)
 	}
-	if stats.Scanned == 0 {
-		return stats, nil
-	}
 
-	// Pass 1: formula / elements / score / file_type from cleave_result.
+	// Pass 1: formula / elements / score / file_type / max_crit from cleave_result.
 	// JSON_TABLE filters to the depth-0 entry; rows without one are skipped.
 	// elements = formula with Unicode subscripts ₀..₉ stripped.
+	// max_crit is the max trait level on the depth-0 entry, computed via a
+	// nested SELECT over the traits array.
 	cleaveTag, err := db.pool.Exec(ctx, `
 		UPDATE samples s SET
 			formula = COALESCE(j.f, ''),
 			elements = translate(COALESCE(j.f, ''), '₀₁₂₃₄₅₆₇₈₉', ''),
 			score = COALESCE(j.x, 0),
+			max_crit = COALESCE(j.mc, 0),
+			suspicious_count = COALESCE(j.sc, 0),
 			file_type = COALESCE(NULLIF(j.t, ''), s.file_type),
 			updated_at = now()
 		FROM (
-			SELECT s2.sha256, jt.f, jt.x, jt.t
+			SELECT s2.sha256, jt.f, jt.x, jt.t,
+				(SELECT COALESCE(MAX((tr->>'l')::int), 0)
+				 FROM jsonb_array_elements(COALESCE(jt.ts, '[]'::jsonb)) AS tr) AS mc,
+				(SELECT COUNT(*)
+				 FROM jsonb_array_elements(COALESCE(jt.ts, '[]'::jsonb)) AS tr
+				 WHERE (tr->>'l')::int >= 4
+				   AND COALESCE((tr->>'c')::double precision, 1.0) >= 0.65) AS sc
 			FROM samples s2,
 				JSON_TABLE(s2.cleave_result, '$.fs[*] ? (@.dp == 0)' COLUMNS (
 					f TEXT PATH '$.f',
 					x INTEGER PATH '$.x',
-					t TEXT PATH '$.type'
+					t TEXT PATH '$.type',
+					ts JSONB PATH '$.ts'
 				)) AS jt
 			WHERE s2.file_type = ''
 				AND s2.cleave_result IS NOT NULL
@@ -657,6 +672,35 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 		return stats, fmt.Errorf("hopper: backfill litmus_score: %w", err)
 	}
 	stats.Updated += litmusTag.RowsAffected()
+
+	// Pass 3: clear stale skip='misclassified' markers whose underlying
+	// trait counts no longer disagree with the marker. The old score-based
+	// rule was noisy on large tarballs and parked many rows here that the
+	// new max_crit/suspicious_count rule would never have flagged.
+	//
+	// good marker stays misclassified only while it still looks bad
+	// (max_crit >= 5 OR suspicious_count >= 2). Otherwise reset.
+	goodTag, err := db.pool.Exec(ctx, `
+		UPDATE samples SET skip = '', updated_at = now()
+		WHERE label = 'good' AND label_source = 'marker' AND skip = 'misclassified'
+			AND cleave_result IS NOT NULL
+			AND max_crit < 5 AND suspicious_count <= 1`)
+	if err != nil {
+		return stats, fmt.Errorf("hopper: backfill reset benign markers: %w", err)
+	}
+	stats.MarkersCleared += goodTag.RowsAffected()
+
+	// bad marker stays misclassified only while it still looks benign
+	// (max_crit < 5 AND suspicious_count <= 1). Otherwise reset.
+	badTag, err := db.pool.Exec(ctx, `
+		UPDATE samples SET skip = '', updated_at = now()
+		WHERE label = 'bad' AND label_source = 'marker' AND skip = 'misclassified'
+			AND cleave_result IS NOT NULL
+			AND (max_crit >= 5 OR suspicious_count >= 2)`)
+	if err != nil {
+		return stats, fmt.Errorf("hopper: backfill reset bad markers: %w", err)
+	}
+	stats.MarkersCleared += badTag.RowsAffected()
 
 	return stats, nil
 }

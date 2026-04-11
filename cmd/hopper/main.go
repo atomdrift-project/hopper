@@ -38,8 +38,8 @@ commands:
   import             transfer samples between hopper databases (sqlite↔postgres)
   false-positives    list known-good files that still score bad
   false-negatives    list known-bad files that still score benign
-  benign-review      list marker-benign files whose score still looks bad
-  bad-review         list marker-bad files whose score still looks benign
+  benign-review      list marker-benign files cleave still flags as suspicious
+  bad-review         list marker-bad files cleave still considers benign
   backfill           re-derive columns from cleave_result/litmus_result blobs
   purge-unsupported  delete analyzed rows cleave could not classify
   stats              show sample counts
@@ -412,19 +412,29 @@ func cmdLoad(ctx context.Context) error {
 	litmusBin := f.String("litmus", "litmus", "path to litmus binary (pass empty to disable)")
 	litmusWorkers := f.Int("litmus-workers", max(1, runtime.NumCPU()-1), "concurrent litmus analysis workers")
 	maxRSSGB := f.Int("max-memory-gb", 32, "litmus RSS limit in GB")
-	analysisTimeout := f.Int("analysis-timeout", 1200, "per-file analysis timeout in seconds (passed to litmus)")
+	analysisTimeout := f.Int("analysis-timeout", 3600, "per-file analysis timeout in seconds (passed to litmus)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
 	experimentTag := f.String("experiment-tag", "", "label for experiment comparison")
 	litmusVerbose := f.Bool("litmus-verbose", false, "enable debug logging in litmus server")
+	maxFileMB := f.Int64("max-file-size", defaultMaxFileSize/(1024*1024), "skip files larger than this many MiB")
 	parseFlags(f, os.Args[2:])
+
+	if *maxFileMB > 0 {
+		maxFileSize = *maxFileMB * 1024 * 1024
+	}
 
 	if *dataDir == "" {
 		return errors.New("pass --data <directory> (expects bad/, good/, unknown/ subdirectories)")
 	}
 
 	cleaveBinary = *cleaveBinFlag
+
+	// Rebuild cleave from ../cleave (same policy as litmus) before we start
+	// shelling out to `cleave iter-files`. Harmless if the source tree isn't
+	// present; logs and proceeds with whatever is on $PATH.
+	updateCleave(ctx)
 
 	// Discover label directories under --data.
 	// Convention: bad/ → label "bad", good/ → label "good", unknown/ → label "unknown".
@@ -556,10 +566,14 @@ type loadProgress struct { //nolint:govet // counters are grouped by pipeline st
 }
 
 const (
-	loadBatchSize = 500
-	minFileSize   = 13      // skip trivially small files (markers, empty, etc.)
-	maxFileSize   = 1 << 30 // 1 GiB
+	loadBatchSize      = 500
+	minFileSize        = 13                // skip trivially small files (markers, empty, etc.)
+	defaultMaxFileSize = 100 * 1024 * 1024 // 100 MiB
 )
+
+// maxFileSize is the per-file byte cap applied during enumeration, hashing,
+// and analysis. Overridable via the load command's --max-file-size flag.
+var maxFileSize int64 = defaultMaxFileSize
 
 var (
 	errTooSmall = errors.New("too small")
@@ -1052,7 +1066,7 @@ func streamCleaveIterFiles(ctx context.Context, dir string, emit func(labeledPat
 	// megabytes and is a top-level flag that must precede the subcommand.
 	args := make([]string, 0, 4)
 	if mb := maxFileSize / (1024 * 1024); mb > 0 {
-		args = append(args, "--max-file-size", strconv.FormatInt(int64(mb), 10))
+		args = append(args, "--max-file-size", strconv.FormatInt(mb, 10))
 	}
 	args = append(args, "iter-files", dir)
 
@@ -1270,12 +1284,19 @@ func cmdBackfill(ctx context.Context) error {
 	}
 	defer db.Close()
 
+	// Migrate runs the schema migrations (so newly added columns exist)
+	// and performs an initial Backfill pass. We then re-invoke Backfill so
+	// the CLI can surface fresh stats; the second pass is an idempotent
+	// no-op if Migrate already did the work.
+	if err := db.Migrate(ctx); err != nil {
+		return err
+	}
 	slog.Info("backfilling derivable columns from cleave_result and litmus_result")
 	stats, err := db.Backfill(ctx)
 	if err != nil {
 		return err
 	}
-	slog.Info("backfill complete", "scanned", stats.Scanned, "updated", stats.Updated)
+	slog.Info("backfill complete", "scanned", stats.Scanned, "updated", stats.Updated, "markers_cleared", stats.MarkersCleared)
 	return nil
 }
 

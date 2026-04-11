@@ -32,9 +32,16 @@ func mustInsert(t *testing.T, ctx context.Context, db *DB, s *Sample) {
 
 func mustAnalyze(t *testing.T, ctx context.Context, db *DB, sha string, score int) {
 	t.Helper()
+	mustAnalyzeWithTraits(t, ctx, db, sha, score, "")
+}
+
+// mustAnalyzeWithTraits is mustAnalyze plus an optional comma-separated list
+// of trait literals (e.g. `{"l":5,"c":1.0}`) inserted into the depth-0 entry.
+func mustAnalyzeWithTraits(t *testing.T, ctx context.Context, db *DB, sha string, score int, traits string) {
+	t.Helper()
 	// Include a non-empty type so UpdateCleaveResult actually persists the row;
 	// an empty type triggers the belt-and-suspenders delete path.
-	result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"elf","x":%d,"dp":0}]}`, sha, score)
+	result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"elf","x":%d,"dp":0,"ts":[%s]}]}`, sha, score, traits)
 	if err := db.UpdateCleaveResult(ctx, sha, result, ""); err != nil {
 		t.Fatalf("UpdateCleaveResult: %v", err)
 	}
@@ -444,33 +451,34 @@ func TestBenignReview(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
+	// br1: hostile trait (max_crit=5) -> qualifies for benign-review.
 	mustInsert(t, ctx, db, &Sample{
 		SHA256:      "br1",
 		Source:      "test",
 		Label:       "good",
 		LabelSource: "marker",
 		Skip:        "misclassified",
-		Score:       92,
 	})
-	mustAnalyze(t, ctx, db, "br1", 92)
+	mustAnalyzeWithTraits(t, ctx, db, "br1", 92, `{"l":5,"c":1.0}`)
+	// br2: only one suspicious trait, no hostile -> not in queue.
 	mustInsert(t, ctx, db, &Sample{
 		SHA256:      "br2",
 		Source:      "test",
 		Label:       "good",
 		LabelSource: "marker",
 		Skip:        "misclassified",
-		Score:       60,
 	})
-	mustAnalyze(t, ctx, db, "br2", 60)
+	mustAnalyzeWithTraits(t, ctx, db, "br2", 60, `{"l":4,"c":1.0}`)
+	// br3: not marker-sourced -> excluded regardless of traits.
 	mustInsert(t, ctx, db, &Sample{
 		SHA256:      "br3",
 		Source:      "test",
 		Label:       "good",
 		LabelSource: "test",
 		Skip:        "misclassified",
-		Score:       92,
 	})
-	mustAnalyze(t, ctx, db, "br3", 92)
+	mustAnalyzeWithTraits(t, ctx, db, "br3", 92, `{"l":5,"c":1.0}`)
+	// br4: claimed -> excluded.
 	mustInsert(t, ctx, db, &Sample{
 		SHA256:      "br4",
 		Source:      "test",
@@ -478,11 +486,10 @@ func TestBenignReview(t *testing.T) {
 		LabelSource: "marker",
 		Skip:        "misclassified",
 		Status:      "claimed",
-		Score:       92,
 	})
-	mustAnalyze(t, ctx, db, "br4", 92)
+	mustAnalyzeWithTraits(t, ctx, db, "br4", 92, `{"l":5,"c":1.0}`)
 
-	got, err := db.BenignReview(ctx, 85, 10)
+	got, err := db.BenignReview(ctx, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,33 +502,34 @@ func TestBadReview(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
+	// mr1: no traits -> looks benign, qualifies for bad-review.
 	mustInsert(t, ctx, db, &Sample{
 		SHA256:      "mr1",
 		Source:      "test",
 		Label:       "bad",
 		LabelSource: "marker",
 		Skip:        "misclassified",
-		Score:       20,
 	})
 	mustAnalyze(t, ctx, db, "mr1", 20)
+	// mr2: two suspicious traits -> doesn't look benign, excluded.
 	mustInsert(t, ctx, db, &Sample{
 		SHA256:      "mr2",
 		Source:      "test",
 		Label:       "bad",
 		LabelSource: "marker",
 		Skip:        "misclassified",
-		Score:       90,
 	})
-	mustAnalyze(t, ctx, db, "mr2", 90)
+	mustAnalyzeWithTraits(t, ctx, db, "mr2", 90, `{"l":4,"c":1.0},{"l":4,"c":1.0}`)
+	// mr3: not marker-sourced -> excluded.
 	mustInsert(t, ctx, db, &Sample{
 		SHA256:      "mr3",
 		Source:      "test",
 		Label:       "bad",
 		LabelSource: "test",
 		Skip:        "misclassified",
-		Score:       20,
 	})
 	mustAnalyze(t, ctx, db, "mr3", 20)
+	// mr4: claimed -> excluded.
 	mustInsert(t, ctx, db, &Sample{
 		SHA256:      "mr4",
 		Source:      "test",
@@ -529,11 +537,10 @@ func TestBadReview(t *testing.T) {
 		LabelSource: "marker",
 		Skip:        "misclassified",
 		Status:      "claimed",
-		Score:       20,
 	})
 	mustAnalyze(t, ctx, db, "mr4", 20)
 
-	got, err := db.BadReview(ctx, 25, 10)
+	got, err := db.BadReview(ctx, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
