@@ -112,7 +112,7 @@ doas bastille sysrc "$RUN" postgresql_enable=YES
 
 # Initialize the database cluster if it doesn't exist yet.
 doas bastille cmd "$RUN" sh -c '
-    if [ ! -d /var/db/postgres/data16/PG_VERSION ]; then
+    if [ ! -f /var/db/postgres/data16/PG_VERSION ]; then
         /usr/local/etc/rc.d/postgresql initdb
     fi
 '
