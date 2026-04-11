@@ -117,8 +117,38 @@ doas bastille cmd "$RUN" sh -c '
     fi
 '
 
-# Ensure PostgreSQL is running.
-if ! doas bastille cmd "$RUN" service postgresql status >/dev/null 2>&1; then
+# Restrict network access: listen on all interfaces but only accept
+# connections from loopback and the 10.0.0.0/8 private range via pg_hba.
+# Overwriting pg_hba.conf is idempotent; postgres is reloaded below if
+# it's already running.
+log "Writing postgres access rules (loopback + 10.0.0.0/8)"
+doas bastille cmd "$RUN" tee /var/db/postgres/data16/pg_hba.conf >/dev/null <<'HBAEOF'
+# Managed by rollout-bastille.sh — edits may be overwritten on redeploy.
+# TYPE  DATABASE  USER  ADDRESS         METHOD
+local   all       all                   peer
+host    all       all   127.0.0.1/32    scram-sha-256
+host    all       all   ::1/128         scram-sha-256
+host    all       all   10.0.0.0/8      scram-sha-256
+HBAEOF
+doas bastille cmd "$RUN" chown postgres:postgres /var/db/postgres/data16/pg_hba.conf
+doas bastille cmd "$RUN" chmod 600 /var/db/postgres/data16/pg_hba.conf
+
+# Ensure postgres listens on all interfaces so 10.x clients can reach it.
+doas bastille cmd "$RUN" sh -c "
+    conf=/var/db/postgres/data16/postgresql.conf
+    if grep -qE \"^[#[:space:]]*listen_addresses\" \$conf; then
+        sed -i '' -E \"s|^[#[:space:]]*listen_addresses.*|listen_addresses = '*'|\" \$conf
+    else
+        echo \"listen_addresses = '*'\" >> \$conf
+    fi
+"
+
+# Ensure PostgreSQL is running. listen_addresses changes require a full
+# restart (a reload won't pick them up), so restart if already running.
+if doas bastille cmd "$RUN" service postgresql status >/dev/null 2>&1; then
+    log "Restarting PostgreSQL to apply config changes"
+    doas bastille service "$RUN" postgresql restart
+else
     log "Starting PostgreSQL"
     doas bastille service "$RUN" postgresql start
 fi
@@ -168,10 +198,15 @@ else
     [ -n "$HOPPER_DB" ] || HOPPER_DB="postgres://hopper@localhost/hopper?sslmode=disable"
 fi
 
-# Run hopper schema migrations.
-log "Running hopper migrations"
-doas bastille cmd "$RUN" su -l hopper -c \
-    "hopper init --db '$HOPPER_DB'"
+# Run hopper schema migrations if the binary is available. In DB_ONLY mode
+# the binary isn't deployed here, so migrations have to be run out-of-band.
+if doas bastille cmd "$RUN" test -x /usr/local/bin/hopper; then
+    log "Running hopper migrations"
+    doas bastille cmd "$RUN" su -l hopper -c \
+        "hopper init --db '$HOPPER_DB'"
+else
+    log "hopper binary not installed in jail — skipping migrations"
+fi
 
 if [ -n "$DB_ONLY" ]; then
     log "DB_ONLY set — skipping hopper binary/service setup"
