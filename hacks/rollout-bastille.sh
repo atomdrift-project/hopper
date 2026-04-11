@@ -83,6 +83,30 @@ fi
 
 # --- PostgreSQL initialization ---
 
+# PostgreSQL's initdb uses SysV shared memory as a bootstrap interlock, which
+# requires a per-jail SysV IPC namespace. These are jail creation params, so
+# changes only take effect after a full stop/start — check the running jail's
+# kernel state via jls and only restart if something actually needs updating.
+need_restart=0
+for param in sysvmsg sysvsem sysvshm; do
+    current=$(doas jls -j "$RUN" "$param" 2>/dev/null || echo "disable")
+    if [ "$current" != "new" ]; then
+        log "Setting $param=new (was: $current)"
+        doas bastille config "$RUN" set "$param" new
+        need_restart=1
+    fi
+done
+if [ "$need_restart" -eq 1 ]; then
+    log "Restarting jail to apply SysV IPC namespace changes"
+    doas bastille restart "$RUN"
+fi
+
+log "Enabling local_unbound resolver"
+doas bastille sysrc "$RUN" local_unbound_enable=YES
+if ! doas bastille cmd "$RUN" service local_unbound status >/dev/null 2>&1; then
+    doas bastille service "$RUN" local_unbound start
+fi
+
 log "Initializing PostgreSQL (if needed)"
 doas bastille sysrc "$RUN" postgresql_enable=YES
 
@@ -99,15 +123,55 @@ if ! doas bastille cmd "$RUN" service postgresql status >/dev/null 2>&1; then
     doas bastille service "$RUN" postgresql start
 fi
 
-# Create the hopper database and user (ignore "already exists" errors).
-log "Creating hopper database"
-doas bastille cmd "$RUN" su -l postgres -c "createuser --no-password hopper 2>/dev/null || true"
-doas bastille cmd "$RUN" su -l postgres -c "createdb -O hopper hopper 2>/dev/null || true"
+# Percent-encode a string for safe inclusion in a URL userinfo component.
+urlencode() {
+    LC_ALL=C awk -v s="$1" 'BEGIN {
+        for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i
+        n = length(s)
+        for (i = 1; i <= n; i++) {
+            c = substr(s, i, 1)
+            if (c ~ /[A-Za-z0-9._~-]/) printf "%s", c
+            else printf "%%%02X", ord[c]
+        }
+    }'
+}
+
+# Create the hopper database and user. Prompt for a password only when the
+# role doesn't already exist — re-runs reuse whatever hopper_db is already
+# stored in rc.conf.
+role_exists=$(doas bastille cmd "$RUN" su -l postgres -c \
+    "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='hopper'\"" 2>/dev/null | tr -d '[:space:]')
+
+if [ -z "$role_exists" ]; then
+    log "Creating hopper postgres role"
+    printf "Enter password for new 'hopper' postgres user: " >&2
+    stty -echo 2>/dev/null || true
+    IFS= read -r HOPPER_PW
+    stty echo 2>/dev/null || true
+    printf "\n" >&2
+    [ -n "$HOPPER_PW" ] || die "password cannot be empty"
+
+    # Escape single quotes for SQL string literal.
+    HOPPER_PW_SQL=$(printf '%s' "$HOPPER_PW" | sed "s/'/''/g")
+    doas bastille cmd "$RUN" su -l postgres -c "psql -v ON_ERROR_STOP=1" <<SQL
+CREATE ROLE hopper LOGIN PASSWORD '$HOPPER_PW_SQL';
+SQL
+    doas bastille cmd "$RUN" su -l postgres -c "createdb -O hopper hopper 2>/dev/null || true"
+
+    HOPPER_PW_URL=$(urlencode "$HOPPER_PW")
+    HOPPER_DB="postgres://hopper:$HOPPER_PW_URL@localhost/hopper?sslmode=disable"
+    doas bastille sysrc "$RUN" hopper_db="$HOPPER_DB" >/dev/null
+    unset HOPPER_PW HOPPER_PW_SQL HOPPER_PW_URL
+else
+    log "Reusing existing hopper postgres role"
+    HOPPER_DB=$(doas bastille cmd "$RUN" sysrc -n hopper_db 2>/dev/null || true)
+    [ -n "$HOPPER_DB" ] || HOPPER_DB="postgres://hopper@localhost/hopper?sslmode=disable"
+fi
 
 # Run hopper schema migrations.
 log "Running hopper migrations"
 doas bastille cmd "$RUN" su -l hopper -c \
-    "hopper init --db 'postgres://hopper@localhost/hopper?sslmode=disable'"
+    "hopper init --db '$HOPPER_DB'"
 
 if [ -n "$DB_ONLY" ]; then
     log "DB_ONLY set — skipping hopper binary/service setup"
