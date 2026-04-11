@@ -181,7 +181,8 @@ fi
 # for spinning disk.
 
 log "Applying PostgreSQL performance tunings"
-doas bastille cmd "$RUN" tee /tmp/pg-tuning.sql >/dev/null <<'SQLEOF'
+PG_TUNING_TMP=$(doas bastille cmd "$RUN" mktemp /tmp/pg-tuning-XXXXXX.sql)
+doas bastille cmd "$RUN" tee "$PG_TUNING_TMP" >/dev/null <<'SQLEOF'
 -- Memory: 64GB server — shared_buffers=25% RAM, effective_cache_size=75% RAM.
 ALTER SYSTEM SET shared_buffers             = '16GB';
 ALTER SYSTEM SET effective_cache_size       = '48GB';
@@ -212,25 +213,13 @@ ALTER SYSTEM SET synchronous_commit         = 'off';
 SELECT pg_reload_conf();
 SQLEOF
 
-doas bastille cmd "$RUN" su -l postgres -c "psql -f /tmp/pg-tuning.sql"
-doas bastille cmd "$RUN" rm -f /tmp/pg-tuning.sql
+doas bastille cmd "$RUN" su -l postgres -c "psql -f $PG_TUNING_TMP"
+doas bastille cmd "$RUN" rm -f "$PG_TUNING_TMP"
 
 # Restart to apply settings that require it (shared_buffers, huge_pages).
 log "Restarting PostgreSQL to apply tuning"
 doas bastille service "$RUN" postgresql restart
 
-# Percent-encode a string for safe inclusion in a URL userinfo component.
-urlencode() {
-    LC_ALL=C awk -v s="$1" 'BEGIN {
-        for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i
-        n = length(s)
-        for (i = 1; i <= n; i++) {
-            c = substr(s, i, 1)
-            if (c ~ /[A-Za-z0-9._~-]/) printf "%s", c
-            else printf "%%%02X", ord[c]
-        }
-    }'
-}
 
 # Create the hopper database and user. Prompt for a password only when the
 # role doesn't already exist — re-runs reuse whatever hopper_db is already
@@ -247,17 +236,26 @@ if [ -z "$role_exists" ]; then
     printf "\n" >&2
     [ -n "$HOPPER_PW" ] || die "password cannot be empty"
 
-    # Escape single quotes for SQL string literal.
-    HOPPER_PW_SQL=$(printf '%s' "$HOPPER_PW" | sed "s/'/''/g")
-    doas bastille cmd "$RUN" su -l postgres -c "psql -v ON_ERROR_STOP=1" <<SQL
-CREATE ROLE hopper LOGIN PASSWORD '$HOPPER_PW_SQL';
-SQL
+    # Pass the password via psql -v so it never touches a shell-expanded context.
+    # :'pw' is psql literal interpolation — the shell only sees the variable name,
+    # not its value, so shell metacharacters in the password cannot be executed.
+    doas bastille cmd "$RUN" su -l postgres -c \
+        "psql -v ON_ERROR_STOP=1 -v pw='$HOPPER_PW' -c \"CREATE ROLE hopper LOGIN PASSWORD :'pw'\""
     doas bastille cmd "$RUN" su -l postgres -c "createdb -O hopper hopper 2>/dev/null || true"
 
-    HOPPER_PW_URL=$(urlencode "$HOPPER_PW")
-    HOPPER_DB="postgres://hopper:$HOPPER_PW_URL@localhost/hopper?sslmode=disable"
+    # Store the password in ~hopper/.pgpass (chmod 600) rather than in rc.conf.
+    # rc.conf is world-readable on FreeBSD; .pgpass is only readable by the hopper user.
+    # Format: hostname:port:database:username:password
+    doas bastille cmd "$RUN" sh -c "
+        printf 'localhost:5432:hopper:hopper:%s\n' '$HOPPER_PW' > /home/hopper/.pgpass
+        chown hopper:hopper /home/hopper/.pgpass
+        chmod 600 /home/hopper/.pgpass
+    "
+    unset HOPPER_PW
+
+    # DSN has no password — libpq/pgx resolves it from .pgpass at runtime.
+    HOPPER_DB="postgres://hopper@localhost/hopper?sslmode=disable"
     doas bastille sysrc "$RUN" hopper_db="$HOPPER_DB" >/dev/null
-    unset HOPPER_PW HOPPER_PW_SQL HOPPER_PW_URL
 else
     log "Reusing existing hopper postgres role"
     HOPPER_DB=$(doas bastille cmd "$RUN" sysrc -n hopper_db 2>/dev/null || true)
@@ -308,9 +306,11 @@ doas bastille cmd "$RUN" su -l postgres -c '
 
 # --- Hopper rc.d service ---
 
-log "Creating rc.d service for hopper"
+log "Checking rc.d service for hopper"
 doas bastille cmd "$RUN" mkdir -p /usr/local/etc/rc.d
-doas bastille cmd "$RUN" tee /usr/local/etc/rc.d/hopper >/dev/null <<'RCEOF'
+
+RC_TMP=$(doas bastille cmd "$RUN" mktemp /tmp/hopper-rc-XXXXXX)
+doas bastille cmd "$RUN" tee "$RC_TMP" >/dev/null <<'RCEOF'
 #!/bin/sh
 
 # PROVIDE: hopper
@@ -336,7 +336,16 @@ command_args="-c -f -P ${pidfile} -S -R 5 -o ${hopper_log} -u hopper /usr/bin/en
 run_rc_command "$1"
 RCEOF
 
-doas bastille cmd "$RUN" chmod 755 /usr/local/etc/rc.d/hopper
+RC_CHANGED=0
+if ! doas bastille cmd "$RUN" cmp -s "$RC_TMP" /usr/local/etc/rc.d/hopper; then
+    log "rc.d script changed — installing update"
+    doas bastille cmd "$RUN" install -o root -g wheel -m 755 "$RC_TMP" /usr/local/etc/rc.d/hopper
+    RC_CHANGED=1
+else
+    log "rc.d script unchanged"
+    doas bastille cmd "$RUN" chmod 755 /usr/local/etc/rc.d/hopper
+fi
+doas bastille cmd "$RUN" rm -f "$RC_TMP"
 doas bastille sysrc "$RUN" hopper_enable=YES
 
 # --- Restart/start services ---

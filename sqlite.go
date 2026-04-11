@@ -30,7 +30,7 @@ func openSQLite(ctx context.Context, dsn string) (*DB, error) {
 func pragmaHasColumn(ctx context.Context, db *sql.DB, column string) int {
 	var count int
 	if err := db.QueryRowContext(ctx,
-		fmt.Sprintf("SELECT count(*) FROM pragma_table_info('samples') WHERE name = '%s'", column),
+		"SELECT count(*) FROM pragma_table_info('samples') WHERE name = ?", column,
 	).Scan(&count); err != nil {
 		slog.Debug("pragma_table_info failed", "column", column, "error", err)
 		return 0
