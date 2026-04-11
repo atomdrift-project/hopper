@@ -172,19 +172,22 @@ func updateLitmus(ctx context.Context) {
 
 	pull := exec.CommandContext(ctx, "git", "pull")
 	pull.Dir = dir
+	pulled := true
 	if out, err := pull.CombinedOutput(); err != nil {
-		slog.Error("git pull failed for litmus, using installed version", "error", err, "output", string(out))
-		return
+		pulled = false
+		slog.Warn("git pull failed for litmus, building from current working tree anyway",
+			"error", err, "output", string(out))
 	}
 
 	install := exec.CommandContext(ctx, "make", "install")
 	install.Dir = dir
 	if out, err := install.CombinedOutput(); err != nil {
-		slog.Error("make install failed for litmus, using installed version", "error", err, "output", string(out))
+		slog.Error("make install failed for litmus, using installed version",
+			"error", err, "output", string(out), "pulled", pulled)
 		return
 	}
 
-	slog.Info("litmus updated successfully")
+	slog.Info("litmus updated successfully", "pulled", pulled)
 }
 
 func (s *litmusServer) startLocked(ctx context.Context, l net.Listener) error {
