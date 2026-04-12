@@ -210,6 +210,9 @@ ALTER SYSTEM SET huge_pages                 = 'try';
 -- Async commit: safe for this workload — worst case one WAL flush of data
 -- loss on a hard crash, acceptable for a file-analysis database.
 ALTER SYSTEM SET synchronous_commit         = 'off';
+-- Logical replication: required for CREATE PUBLICATION so that training
+-- machines can subscribe for a real-time local replica of the samples table.
+ALTER SYSTEM SET wal_level                  = 'logical';
 SELECT pg_reload_conf();
 SQLEOF
 
@@ -271,6 +274,24 @@ if doas bastille cmd "$RUN" test -x /usr/local/bin/hopper; then
 else
     log "hopper binary not installed in jail — skipping migrations"
 fi
+
+# --- Logical replication publication ---
+#
+# Creates a publication for the samples table so training machines can
+# subscribe for a real-time local replica (CREATE SUBSCRIPTION on the
+# subscriber). The publication is idempotent — CREATE IF NOT EXISTS isn't
+# supported for publications, so we check first.
+
+log "Ensuring logical replication publication exists"
+doas bastille cmd "$RUN" su -l postgres -c "
+    psql -d hopper -tAc \"SELECT 1 FROM pg_publication WHERE pubname='hopper_training'\" | grep -q 1 ||
+    psql -d hopper -c \"CREATE PUBLICATION hopper_training FOR TABLE samples\"
+"
+
+# Grant the hopper role replication privilege so subscribers can connect.
+doas bastille cmd "$RUN" su -l postgres -c "
+    psql -c \"ALTER ROLE hopper WITH REPLICATION\"
+"
 
 if [ -n "$DB_ONLY" ]; then
     log "DB_ONLY set — skipping hopper binary/service setup"
