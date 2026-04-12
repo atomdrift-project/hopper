@@ -419,7 +419,7 @@ func cmdLoad(ctx context.Context) error {
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
 	experimentTag := f.String("experiment-tag", "", "label for experiment comparison")
-	litmusVerbose := f.Bool("litmus-verbose", false, "enable debug logging in litmus server")
+	litmusVerbose := f.Bool("litmus-verbose", true, "enable debug logging in litmus server")
 	dashAddr := f.String("dashboard-addr", "0.0.0.0:8081", "web dashboard listen address (empty to disable)")
 	maxFileMB := f.Int64("max-file-size", defaultMaxFileSize/(1024*1024), "skip files larger than this many MiB")
 	parseFlags(f, os.Args[2:])
