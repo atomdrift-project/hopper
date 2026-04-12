@@ -186,6 +186,7 @@ type nodeHealth struct { //nolint:govet // small struct; readability over paddin
 	RSSMB         int     // resident set size in MiB
 	LiveTasks     int     // currently-running tasks
 	ActiveTasks   int     // active_tasks counter (may include orphaned)
+	OrphanedTasks int     // tasks that timed out but thread still running
 	MaxConcurrent int     // configured worker slot count
 	UptimeSecs    int64   // seconds since the litmus process started
 }
@@ -217,6 +218,7 @@ func fetchHealth(ctx context.Context, client *http.Client, baseURL string) (*nod
 		RSSMB         int     `json:"rss_mb"`
 		LiveTasks     int     `json:"live_tasks"`
 		ActiveTasks   int     `json:"active_tasks"`
+		OrphanedTasks int     `json:"orphaned_tasks"`
 		MaxConcurrent int     `json:"max_concurrent_tasks"`
 		UptimeSecs    int64   `json:"uptime_secs"`
 	}
@@ -242,6 +244,7 @@ func fetchHealth(ctx context.Context, client *http.Client, baseURL string) (*nod
 		RSSMB:         raw.RSSMB,
 		LiveTasks:     raw.LiveTasks,
 		ActiveTasks:   raw.ActiveTasks,
+		OrphanedTasks: raw.OrphanedTasks,
 		MaxConcurrent: raw.MaxConcurrent,
 		UptimeSecs:    raw.UptimeSecs,
 	}, nil
@@ -495,14 +498,16 @@ type nodeStatusSnapshot struct { //nolint:govet // small struct; readability ove
 	LastUpdate time.Time  // when this snapshot was written
 	LastErr    string     // empty when Health is fresh; populated when the most recent poll failed
 	Reachable  bool       // false ⇒ poll failed; render as "down"
+	Restarts   int        // cumulative restart count (local node only)
 }
 
 // nodeMonitor periodically polls one node's /_/health and exposes the latest
 // snapshot to the dashboard via Snapshot(). Each monitor owns one goroutine,
 // started by startNodeMonitors and stopped when its context is cancelled.
 type nodeMonitor struct {
-	node analyzer
-	snap atomic.Pointer[nodeStatusSnapshot]
+	node           analyzer
+	snap           atomic.Pointer[nodeStatusSnapshot]
+	restartCounter func() int // optional: returns cumulative restart count (local node only)
 }
 
 // Snapshot returns the most recent observation, or nil if no poll has run yet.
@@ -530,6 +535,9 @@ func startNodeMonitors(ctx context.Context, nodes []analyzer) []*nodeMonitor {
 	monitors := make([]*nodeMonitor, len(nodes))
 	for i, n := range nodes {
 		m := &nodeMonitor{node: n}
+		if ls, ok := n.(*litmusServer); ok {
+			m.restartCounter = ls.Restarts
+		}
 		monitors[i] = m
 		go m.run(ctx)
 	}
@@ -572,10 +580,15 @@ func (m *nodeMonitor) poll(ctx context.Context) {
 		})
 		return
 	}
+	restarts := 0
+	if m.restartCounter != nil {
+		restarts = m.restartCounter()
+	}
 	m.snap.Store(&nodeStatusSnapshot{
 		Health:     *h,
 		LastUpdate: time.Now(),
 		Reachable:  true,
+		Restarts:   restarts,
 	})
 }
 

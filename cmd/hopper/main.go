@@ -964,7 +964,15 @@ func renderPoolBlock(monitors []*nodeMonitor) {
 		if snap.Health.Reason != "" && snap.Health.Status != "ok" {
 			reason = "  \033[2m" + snap.Health.Reason + "\033[0m"
 		}
-		writeStdoutf("  %-*s  %s%-9s\033[0m  up %-9s  load %.2f  rss %4d MB  %2d/%-d%s\n",
+		// Surface orphan count and restart count when non-zero.
+		extra := ""
+		if snap.Health.OrphanedTasks > 0 {
+			extra += fmt.Sprintf("  \033[33morphaned:%d\033[0m", snap.Health.OrphanedTasks)
+		}
+		if snap.Restarts > 0 {
+			extra += fmt.Sprintf("  \033[33mrestarts:%d\033[0m", snap.Restarts)
+		}
+		writeStdoutf("  %-*s  %s%-9s\033[0m  up %-9s  load %.2f  rss %4d MB  %2d/%-d%s%s\n",
 			nameWidth, name,
 			statusColor, statusLabel,
 			uptime,
@@ -972,6 +980,7 @@ func renderPoolBlock(monitors []*nodeMonitor) {
 			snap.Health.RSSMB,
 			snap.Health.LiveTasks, slots,
 			reason,
+			extra,
 		)
 	}
 }
@@ -1004,6 +1013,12 @@ func logPoolStatus(monitors []*nodeMonitor) {
 		}
 		if snap.Health.Reason != "" {
 			attrs = append(attrs, "reason", snap.Health.Reason)
+		}
+		if snap.Health.OrphanedTasks > 0 {
+			attrs = append(attrs, "orphaned", snap.Health.OrphanedTasks)
+		}
+		if snap.Restarts > 0 {
+			attrs = append(attrs, "restarts", snap.Restarts)
 		}
 		slog.Info("litmus node", attrs...)
 	}

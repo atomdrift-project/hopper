@@ -37,6 +37,7 @@ type litmusServer struct { //nolint:govet // field order is chosen for readabili
 	verbose     bool
 	stopped     atomic.Bool
 	pid         atomic.Int64
+	restarts    atomic.Int64
 
 	// inFlight tracks what each hopper analysis worker is currently doing.
 	inFlight sync.Map // worker ID (int) → *workerState
@@ -297,7 +298,6 @@ func (s *litmusServer) Stop() {
 // Monitor watches the litmus process and restarts it on crash.
 // Blocks until ctx is cancelled or Stop is called.
 func (s *litmusServer) Monitor(ctx context.Context) error {
-	restarts := 0
 	for {
 		pid := s.currentPID()
 		err := s.waitExit(ctx)
@@ -305,7 +305,7 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 		if ctx.Err() != nil || s.stopped.Load() {
 			return ctx.Err()
 		}
-		restarts++
+		restarts := int(s.restarts.Add(1))
 		slog.Warn("litmus server crashed",
 			"pid", pid,
 			"url", s.url,
@@ -728,6 +728,9 @@ func extractCanonicalSHA(sha256 string, raw json.RawMessage) string {
 	}
 	return canonical
 }
+
+// Restarts returns the number of times litmus has been restarted.
+func (s *litmusServer) Restarts() int { return int(s.restarts.Load()) }
 
 // Workers returns the max concurrent analysis workers.
 func (s *litmusServer) Workers() int { return s.maxWorkers }
