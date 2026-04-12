@@ -420,6 +420,7 @@ func cmdLoad(ctx context.Context) error {
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
 	experimentTag := f.String("experiment-tag", "", "label for experiment comparison")
 	litmusVerbose := f.Bool("litmus-verbose", false, "enable debug logging in litmus server")
+	dashAddr := f.String("dashboard-addr", "0.0.0.0:8081", "web dashboard listen address (empty to disable)")
 	maxFileMB := f.Int64("max-file-size", defaultMaxFileSize/(1024*1024), "skip files larger than this many MiB")
 	parseFlags(f, os.Args[2:])
 
@@ -569,7 +570,7 @@ func cmdLoad(ctx context.Context) error {
 	loadCtx, loadCancel := context.WithCancel(ctx)
 	defer loadCancel()
 
-	total := loadAll(loadCtx, loadCancel, db, litmus, nodes, cache, loadDirs, *source, *workers, *rescan, *maxAnalyzed, *experimentTag, &shared)
+	total := loadAll(loadCtx, loadCancel, db, litmus, nodes, cache, loadDirs, *source, *workers, *rescan, *maxAnalyzed, *experimentTag, *dashAddr, &shared)
 	slog.Info("load complete", "samples", total)
 	return nil
 }
@@ -628,7 +629,7 @@ var (
 // may run concurrently (irrelevant for typical 3-dir loads).
 //
 //nolint:revive // signature matches the pipeline's top-level orchestration contract.
-func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litmus *litmusServer, nodes []analyzer, cache *hashCache, dirs []struct{ dir, label string }, source string, nworkers int, rescan bool, maxAnalyzed int, experimentTag string, shared *loadProgress) int {
+func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litmus *litmusServer, nodes []analyzer, cache *hashCache, dirs []struct{ dir, label string }, source string, nworkers int, rescan bool, maxAnalyzed int, experimentTag, dashAddr string, shared *loadProgress) int {
 	slog.Info("loading", "dirs", len(dirs))
 	start := time.Now()
 	var progress loadProgress
@@ -666,6 +667,23 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 	dashWG.Go(func() {
 		runDashboard(dashCtx, &progress, litmus, monitors, start, startAnalyzed, maxAnalyzed, len(dirs))
 	})
+
+	if dashAddr != "" {
+		wd := &webDashboard{
+			progress:      &progress,
+			litmus:        litmus,
+			monitors:      monitors,
+			start:         start,
+			startAnalyzed: startAnalyzed,
+			maxAnalyzed:   maxAnalyzed,
+			ndirs:         len(dirs),
+		}
+		if err := startWebDashboard(dashCtx, dashAddr, wd); err != nil {
+			slog.Warn("web dashboard disabled", "error", err)
+		} else {
+			slog.Info("web dashboard listening", "addr", dashAddr)
+		}
+	}
 
 	// Per-directory pipelines: each goroutine runs cleave→hash→batch→
 	// insert→queue end-to-end for its labeled directory. A semaphore
@@ -972,6 +990,13 @@ func renderPoolBlock(monitors []*nodeMonitor) {
 		if snap.Restarts > 0 {
 			extra += fmt.Sprintf("  \033[33mrestarts:%d\033[0m", snap.Restarts)
 		}
+		if snap.TraitsCommit != "" {
+			tc := snap.TraitsCommit
+			if len(tc) > 8 {
+				tc = tc[:8]
+			}
+			extra += fmt.Sprintf("  traits:%s", tc)
+		}
 		writeStdoutf("  %-*s  %s%-9s\033[0m  up %-9s  load %.2f  rss %4d MB  %2d/%-d%s%s\n",
 			nameWidth, name,
 			statusColor, statusLabel,
@@ -1034,7 +1059,7 @@ func poolStatusColor(snap *nodeStatusSnapshot) string {
 		// state under load, not an unhealthy condition, so colour it the
 		// same as ok.
 		return "\033[32m" // green
-	case "starting":
+	case "starting", "building":
 		return "\033[33m" // yellow
 	case "degraded", "failed":
 		return "\033[33m" // yellow

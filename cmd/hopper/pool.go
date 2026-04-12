@@ -494,11 +494,13 @@ func parseLitmusNodes(s string) []string {
 // inside nodeMonitor so the dashboard reads without locks. A new snapshot
 // is allocated and stored on every poll.
 type nodeStatusSnapshot struct { //nolint:govet // small struct; readability over padding minimization.
-	Health     nodeHealth // last successful health body (zero on first failure)
-	LastUpdate time.Time  // when this snapshot was written
-	LastErr    string     // empty when Health is fresh; populated when the most recent poll failed
-	Reachable  bool       // false ⇒ poll failed; render as "down"
-	Restarts   int        // cumulative restart count (local node only)
+	Health       nodeHealth // last successful health body (zero on first failure)
+	LastUpdate   time.Time  // when this snapshot was written
+	LastErr      string     // empty when Health is fresh; populated when the most recent poll failed
+	Reachable    bool       // false ⇒ poll failed; render as "down"
+	Restarts     int        // cumulative restart count (local node only)
+	TraitsCommit string     // short commit hash from /_/info (refreshed every ~60s)
+	Version      string     // litmus binary version from /_/info
 }
 
 // nodeMonitor periodically polls one node's /_/health and exposes the latest
@@ -508,6 +510,7 @@ type nodeMonitor struct {
 	node           analyzer
 	snap           atomic.Pointer[nodeStatusSnapshot]
 	restartCounter func() int // optional: returns cumulative restart count (local node only)
+	pollCount      int        // incremented each tick; drives periodic /_/info refresh
 }
 
 // Snapshot returns the most recent observation, or nil if no poll has run yet.
@@ -561,9 +564,30 @@ func (m *nodeMonitor) run(ctx context.Context) {
 	}
 }
 
+// infoPollEvery controls how many health polls pass between /_/info refreshes.
+// At 5s health intervals this means ~60s between info fetches.
+const infoPollEvery = 12
+
 // poll performs one health request and stores the result. Failures become a
 // "down" snapshot with the error string preserved for dashboard display.
+// Every infoPollEvery ticks it also fetches /_/info to refresh version and
+// traits commit.
 func (m *nodeMonitor) poll(ctx context.Context) {
+	m.pollCount++
+
+	// Carry forward previous info fields; refresh periodically.
+	var traitsCommit, version string
+	if old := m.snap.Load(); old != nil {
+		traitsCommit = old.TraitsCommit
+		version = old.Version
+	}
+	if m.pollCount%infoPollEvery == 1 { // first poll + every Nth
+		if info, err := m.node.Info(ctx); err == nil {
+			traitsCommit = info.TraitsCommit
+			version = info.Version
+		}
+	}
+
 	h, err := m.node.Health(ctx)
 	if err != nil {
 		// Preserve the previous successful Health body so the dashboard can
@@ -573,10 +597,12 @@ func (m *nodeMonitor) poll(ctx context.Context) {
 			prev = old.Health
 		}
 		m.snap.Store(&nodeStatusSnapshot{
-			Health:     prev,
-			LastUpdate: time.Now(),
-			LastErr:    err.Error(),
-			Reachable:  false,
+			Health:       prev,
+			LastUpdate:   time.Now(),
+			LastErr:      err.Error(),
+			Reachable:    false,
+			TraitsCommit: traitsCommit,
+			Version:      version,
 		})
 		return
 	}
@@ -585,10 +611,12 @@ func (m *nodeMonitor) poll(ctx context.Context) {
 		restarts = m.restartCounter()
 	}
 	m.snap.Store(&nodeStatusSnapshot{
-		Health:     *h,
-		LastUpdate: time.Now(),
-		Reachable:  true,
-		Restarts:   restarts,
+		Health:       *h,
+		LastUpdate:   time.Now(),
+		Reachable:    true,
+		Restarts:     restarts,
+		TraitsCommit: traitsCommit,
+		Version:      version,
 	})
 }
 

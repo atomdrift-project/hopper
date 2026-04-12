@@ -36,6 +36,7 @@ type litmusServer struct { //nolint:govet // field order is chosen for readabili
 	timeoutSecs int
 	verbose     bool
 	stopped     atomic.Bool
+	building    atomic.Bool
 	pid         atomic.Int64
 	restarts    atomic.Int64
 
@@ -132,7 +133,10 @@ func (s *litmusServer) currentPID() int {
 }
 
 // Start launches the litmus server and waits for it to become healthy.
-// It picks a random available port.
+// It picks a random available port. The litmus binary is rebuilt from
+// source in the background so startup is not blocked; Health reports
+// "building" and Analyze returns errRetryable until the rebuild finishes
+// and the server is ready.
 func (s *litmusServer) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -141,8 +145,40 @@ func (s *litmusServer) Start(ctx context.Context) error {
 		return errors.New("litmus server already started")
 	}
 
-	updateLitmus(ctx)
+	s.building.Store(true)
 
+	// Start the server with the currently installed binary, then rebuild
+	// in the background. The goroutine below will restart litmus with the
+	// fresh binary once the build completes.
+	if err := s.startOnce(ctx); err != nil {
+		return err
+	}
+
+	go func() {
+		defer s.building.Store(false)
+		updateLitmus(ctx)
+
+		// Restart so the newly built binary takes effect.
+		s.mu.Lock()
+		if s.cmd != nil && s.cmd.Process != nil {
+			slog.Info("restarting litmus with updated binary", "pid", s.cmd.Process.Pid)
+			killProcess("failed to kill litmus for rebuild", s.cmd.Process, "pid", s.cmd.Process.Pid)
+			waitCommand("litmus exited for rebuild", s.cmd, "pid", s.cmd.Process.Pid)
+			s.cmd = nil
+			s.pid.Store(0)
+		}
+		if err := s.startOnce(ctx); err != nil {
+			slog.Error("failed to restart litmus after rebuild", "error", err)
+		}
+		s.mu.Unlock()
+	}()
+
+	return nil
+}
+
+// startOnce tries up to 3 ports to launch the litmus process. Caller
+// must hold s.mu.
+func (s *litmusServer) startOnce(ctx context.Context) error {
 	var lastErr error
 	for range 3 {
 		port, l, err := freePort(ctx)
@@ -305,6 +341,18 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 		if ctx.Err() != nil || s.stopped.Load() {
 			return ctx.Err()
 		}
+		// If the build goroutine is restarting litmus with a new binary,
+		// don't count this as a crash — the kill was intentional.
+		if s.building.Load() {
+			slog.Info("litmus exited during rebuild, waiting for rebuild goroutine to restart it",
+				"pid", pid)
+			// Wait for the rebuild goroutine to finish restarting before
+			// we loop back and call waitExit on the new process.
+			for s.building.Load() && ctx.Err() == nil {
+				time.Sleep(500 * time.Millisecond)
+			}
+			continue
+		}
 		restarts := int(s.restarts.Add(1))
 		slog.Warn("litmus server crashed",
 			"pid", pid,
@@ -329,6 +377,14 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 		}
 
 		s.mu.Lock()
+		if s.cmd != nil {
+			// Another goroutine (e.g., the rebuild goroutine in Start)
+			// already restarted litmus while we were waiting for the lock.
+			s.mu.Unlock()
+			slog.Info("litmus already restarted by another goroutine, skipping",
+				"pid", s.currentPID())
+			continue
+		}
 		err = s.startLocked(ctx, nil)
 		s.mu.Unlock()
 		if err != nil {
@@ -555,7 +611,8 @@ func (s *litmusServer) pollHealth(ctx context.Context) *litmusHealth {
 	}
 
 	var h litmusHealth
-	if json.Unmarshal(body, &h) != nil {
+	if err := json.Unmarshal(body, &h); err != nil {
+		slog.Debug("failed to parse litmus health JSON", "error", err, "body_len", len(body))
 		return nil
 	}
 
@@ -628,10 +685,13 @@ func (s *litmusServer) Slots() int { return s.maxWorkers }
 func (s *litmusServer) Name() string { return "local:" + s.port }
 
 // Health polls the local litmus's /_/health and returns a parsed snapshot.
-// Used by the dashboard's per-node monitor; the existing pollHealth path
-// (which also pulls /_/requests for stuck-request detection) is unchanged
-// and continues to drive WatchHealth.
+// While the binary is being rebuilt it returns a synthetic "building" status
+// so the dashboard shows progress without hitting an endpoint that may be
+// mid-restart.
 func (s *litmusServer) Health(ctx context.Context) (*nodeHealth, error) {
+	if s.building.Load() {
+		return &nodeHealth{Status: "building", Reason: "rebuilding_binary"}, nil
+	}
 	return fetchHealth(ctx, s.client, s.url)
 }
 
