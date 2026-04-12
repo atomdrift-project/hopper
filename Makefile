@@ -54,14 +54,15 @@ sync-db:
 		echo "WARNING: hopper binary not found — schema must already exist"; \
 	fi
 	@# Drop existing subscription if present (idempotent re-setup)
-	@psql -U $(REMOTE_DB_USER) -d $(LOCAL_DB_NAME) -c \
+	@psql -h localhost -U $(REMOTE_DB_USER) -d $(LOCAL_DB_NAME) -c \
 		"SELECT 1 FROM pg_subscription WHERE subname='hopper_training_sub'" -tA 2>/dev/null | grep -q 1 && \
-		psql -U $(REMOTE_DB_USER) -d $(LOCAL_DB_NAME) -c \
+		psql -h localhost -U $(REMOTE_DB_USER) -d $(LOCAL_DB_NAME) -c \
 			"ALTER SUBSCRIPTION hopper_training_sub DISABLE; ALTER SUBSCRIPTION hopper_training_sub SET (slot_name = NONE); DROP SUBSCRIPTION hopper_training_sub;" 2>/dev/null || true
 	@echo "==> Creating subscription to $(REMOTE_DB_HOST)"
-	psql -U $(REMOTE_DB_USER) -d $(LOCAL_DB_NAME) -c "\
+	@PW=$$(awk -F: '/^$(REMOTE_DB_HOST):.*:$(REMOTE_DB_USER):/ {print $$5; exit}' ~/.pgpass) && \
+	psql -h localhost -U $(REMOTE_DB_USER) -d $(LOCAL_DB_NAME) -c "\
 		CREATE SUBSCRIPTION hopper_training_sub \
-		CONNECTION 'host=$(REMOTE_DB_HOST) dbname=$(REMOTE_DB_NAME) user=$(REMOTE_DB_USER)' \
+		CONNECTION 'host=$(REMOTE_DB_HOST) dbname=$(REMOTE_DB_NAME) user=$(REMOTE_DB_USER) password=$$PW' \
 		PUBLICATION hopper_training \
 		WITH (copy_data = true);"
 	@echo ""
