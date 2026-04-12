@@ -158,7 +158,10 @@ func (s *litmusServer) Start(ctx context.Context) error {
 		defer s.building.Store(false)
 		updateLitmus(ctx)
 
-		// Restart so the newly built binary takes effect.
+		// Restart so the newly built binary takes effect. Reuse the
+		// same port — it is free because we kill the old process first,
+		// and keeping it stable avoids races with the pool and health
+		// checkers that already know the URL.
 		s.mu.Lock()
 		if s.cmd != nil && s.cmd.Process != nil {
 			slog.Info("restarting litmus with updated binary", "pid", s.cmd.Process.Pid)
@@ -167,7 +170,7 @@ func (s *litmusServer) Start(ctx context.Context) error {
 			s.cmd = nil
 			s.pid.Store(0)
 		}
-		if err := s.startOnce(ctx); err != nil {
+		if err := s.startLocked(ctx, nil); err != nil {
 			slog.Error("failed to restart litmus after rebuild", "error", err)
 		}
 		s.mu.Unlock()
@@ -514,6 +517,13 @@ func (s *litmusServer) WatchHealth(ctx context.Context) {
 
 		if s.stopped.Load() {
 			return
+		}
+
+		// Don't poll or accumulate failures while the rebuild goroutine
+		// is restarting litmus — the process is expected to be down.
+		if s.building.Load() {
+			healthFailures = 0
+			continue
 		}
 
 		health := s.pollHealth(ctx)
