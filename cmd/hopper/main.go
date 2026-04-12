@@ -434,10 +434,19 @@ func cmdLoad(ctx context.Context) error {
 
 	cleaveBinary = *cleaveBinFlag
 
-	// Rebuild cleave from ../cleave (same policy as litmus) before we start
-	// shelling out to `cleave iter-files`. Harmless if the source tree isn't
-	// present; logs and proceeds with whatever is on $PATH.
-	updateCleave(ctx)
+	// Start the web dashboard first so it's reachable while everything
+	// else is still initializing. configure() is called inside loadAll
+	// once the session state is ready.
+	var wd *webDashboard
+	if *dashAddr != "" {
+		wd = &webDashboard{}
+		if err := startWebDashboard(ctx, *dashAddr, wd); err != nil {
+			slog.Warn("web dashboard disabled", "error", err)
+			wd = nil
+		} else {
+			slog.Info("web dashboard listening", "addr", *dashAddr)
+		}
+	}
 
 	// Discover label directories under --data.
 	// Convention: bad/ → label "bad", good/ → label "good", unknown/ → label "unknown".
@@ -455,6 +464,40 @@ func cmdLoad(ctx context.Context) error {
 	if len(loadDirs) == 0 {
 		return fmt.Errorf("no bad/, good/, or unknown/ subdirectories found in %s", *dataDir)
 	}
+
+	// Collect directories for litmus's --allowed-dirs.
+	var dirs []string
+	for _, d := range loadDirs {
+		if abs, err := filepath.Abs(d.dir); err == nil {
+			dirs = append(dirs, abs)
+		}
+	}
+
+	// Start litmus early — it takes several seconds to load its model and
+	// YARA rules, and none of that depends on cleave, the hash cache, or
+	// the database. Running it in parallel with those steps shaves ~5s off
+	// every startup.
+	var litmus *litmusServer
+	type litmusResult struct{ err error }
+	litmusCh := make(chan litmusResult, 1)
+	if *litmusBin != "" {
+		litmus = newLitmusServer(litmusConfig{
+			Bin:         *litmusBin,
+			Dirs:        dirs,
+			MaxRSSGB:    *maxRSSGB,
+			MaxWorkers:  *litmusWorkers,
+			TimeoutSecs: *analysisTimeout,
+			Verbose:     *litmusVerbose,
+		})
+		go func() {
+			litmusCh <- litmusResult{err: litmus.Start(ctx)}
+		}()
+	} else {
+		litmusCh <- litmusResult{} // nothing to wait for
+	}
+
+	// These run while litmus is starting up.
+	updateCleave(ctx)
 
 	// Open hash cache (default: ~/.hopper/hashcache.db).
 	var cache *hashCache
@@ -495,28 +538,11 @@ func cmdLoad(ctx context.Context) error {
 		return err
 	}
 
-	// Collect directories for litmus's --allowed-dirs.
-	var dirs []string
-	for _, d := range loadDirs {
-		if abs, err := filepath.Abs(d.dir); err == nil {
-			dirs = append(dirs, abs)
-		}
+	// Wait for litmus to finish starting before building the pool.
+	if res := <-litmusCh; res.err != nil {
+		return res.err
 	}
-
-	// Start litmus server if requested.
-	var litmus *litmusServer
-	if *litmusBin != "" {
-		litmus = newLitmusServer(litmusConfig{
-			Bin:         *litmusBin,
-			Dirs:        dirs,
-			MaxRSSGB:    *maxRSSGB,
-			MaxWorkers:  *litmusWorkers,
-			TimeoutSecs: *analysisTimeout,
-			Verbose:     *litmusVerbose,
-		})
-		if err := litmus.Start(ctx); err != nil {
-			return err
-		}
+	if litmus != nil {
 		defer litmus.Stop()
 		go func() {
 			if err := litmus.Monitor(ctx); err != nil {
@@ -562,20 +588,6 @@ func cmdLoad(ctx context.Context) error {
 			slog.Info("skipping rules/model update (--no-rules-update)")
 		}
 		warnVersionMismatch(fetchAllNodeInfo(ctx, nodes))
-	}
-
-	// Start the web dashboard immediately so it's reachable during setup
-	// (DB migrations, litmus startup, rules update). configure() is called
-	// inside loadAll once the session state is ready.
-	var wd *webDashboard
-	if *dashAddr != "" {
-		wd = &webDashboard{}
-		if err := startWebDashboard(ctx, *dashAddr, wd); err != nil {
-			slog.Warn("web dashboard disabled", "error", err)
-			wd = nil
-		} else {
-			slog.Info("web dashboard listening", "addr", *dashAddr)
-		}
 	}
 
 	var shared loadProgress
