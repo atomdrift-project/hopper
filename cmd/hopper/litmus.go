@@ -252,7 +252,12 @@ func (s *litmusServer) startLocked(ctx context.Context, l net.Listener) error {
 	}
 	bind := "127.0.0.1:" + s.port
 
-	args := []string{"serve", "--bind", bind}
+	// --verbose is a top-level flag (before the subcommand), not a serve flag.
+	args := []string{}
+	if s.verbose {
+		args = append(args, "--verbose")
+	}
+	args = append(args, "serve", "--bind", bind)
 	if len(s.dirs) > 0 {
 		args = append(args, "--allowed-dirs", strings.Join(s.dirs, ","))
 	}
@@ -266,9 +271,6 @@ func (s *litmusServer) startLocked(ctx context.Context, l net.Listener) error {
 		// Match litmus's max_concurrent_tasks to hopper's dispatch pool so
 		// the dashboard and litmus's own /_/health agree on slot count.
 		args = append(args, "--workers", strconv.Itoa(s.maxWorkers))
-	}
-	if s.verbose {
-		args = append(args, "--verbose")
 	}
 
 	cmd := exec.CommandContext(ctx, s.bin, args...) //nolint:gosec // bin path is from trusted CLI flag
