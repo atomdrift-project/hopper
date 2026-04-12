@@ -12,7 +12,10 @@ import (
 )
 
 // webDashboard serves a self-contained HTML page. Auto-refreshes every 5s.
+// Fields guarded by cfgMu are set once via configure() after the load session
+// begins; the handler renders a "starting" state until then.
 type webDashboard struct {
+	cfgMu         sync.RWMutex
 	progress      *loadProgress
 	litmus        *litmusServer
 	monitors      []*nodeMonitor
@@ -23,6 +26,21 @@ type webDashboard struct {
 
 	mu      sync.Mutex
 	samples []throughputSample // capped at maxThroughputSamples
+}
+
+// configure is called once the load session is ready. It sets the fields the
+// handler needs to render progress and is safe to call concurrently with the
+// HTTP server already running.
+func (wd *webDashboard) configure(progress *loadProgress, litmus *litmusServer, monitors []*nodeMonitor, start time.Time, startAnalyzed int64, maxAnalyzed, ndirs int) {
+	wd.cfgMu.Lock()
+	defer wd.cfgMu.Unlock()
+	wd.progress = progress
+	wd.litmus = litmus
+	wd.monitors = monitors
+	wd.start = start
+	wd.startAnalyzed = startAnalyzed
+	wd.maxAnalyzed = maxAnalyzed
+	wd.ndirs = ndirs
 }
 
 const maxThroughputSamples = 60
@@ -187,25 +205,49 @@ footer{display:flex;gap:1.5rem;padding-top:1.25rem;
 `
 
 func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
-	elapsed := time.Since(wd.start).Round(time.Second)
+	// Snapshot cfg fields under the read lock so configure() can be called
+	// safely from another goroutine while the server is already running.
+	wd.cfgMu.RLock()
+	progress := wd.progress
+	litmus := wd.litmus
+	monitors := wd.monitors
+	start := wd.start
+	startAnalyzed := wd.startAnalyzed
+	maxAnalyzed := wd.maxAnalyzed
+	wd.cfgMu.RUnlock()
 
-	analyzedAbs := wd.progress.analyzed.Load()
-	sessionAnalyzed := max(analyzedAbs-wd.startAnalyzed, 0)
-	walked := wd.progress.walked.Load()
-	hashedN := wd.progress.hashed.Load()
-	inserted := wd.progress.inserted.Load()
-	skipped := wd.progress.skipped.Load()
-	hashDone := hashedN + wd.progress.tooSmall.Load() + wd.progress.tooLarge.Load() + wd.progress.hashErrors.Load()
+	// Show a minimal "starting up" page until configure() has been called.
+	if progress == nil {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = fmt.Fprint(w,
+			`<!DOCTYPE html><html lang="en"><head>`+
+				`<meta charset="utf-8"><meta http-equiv="refresh" content="2">`+
+				`<title>Hopper</title><style>`+css+`</style></head><body>`+
+				`<div class="hdr"><span class="hdr-title">Hopper</span>`+
+				`<span class="hdr-eta">starting&hellip;</span></div>`+
+				`</body></html>`)
+		return
+	}
 
-	analyzeTarget := max(wd.progress.queued.Load()-wd.startAnalyzed, 0)
-	if wd.maxAnalyzed > 0 && int64(wd.maxAnalyzed) < analyzeTarget {
-		analyzeTarget = int64(wd.maxAnalyzed)
+	elapsed := time.Since(start).Round(time.Second)
+
+	analyzedAbs := progress.analyzed.Load()
+	sessionAnalyzed := max(analyzedAbs-startAnalyzed, 0)
+	walked := progress.walked.Load()
+	hashedN := progress.hashed.Load()
+	inserted := progress.inserted.Load()
+	skipped := progress.skipped.Load()
+	hashDone := hashedN + progress.tooSmall.Load() + progress.tooLarge.Load() + progress.hashErrors.Load()
+
+	analyzeTarget := max(progress.queued.Load()-startAnalyzed, 0)
+	if maxAnalyzed > 0 && int64(maxAnalyzed) < analyzeTarget {
+		analyzeTarget = int64(maxAnalyzed)
 	}
 
 	wd.recordSample(sessionAnalyzed)
 
 	var etaStr string
-	if elapsedSecs := time.Since(wd.start).Seconds(); sessionAnalyzed > 0 && analyzeTarget > sessionAnalyzed && elapsedSecs > 5 {
+	if elapsedSecs := time.Since(start).Seconds(); sessionAnalyzed > 0 && analyzeTarget > sessionAnalyzed && elapsedSecs > 5 {
 		rate := float64(sessionAnalyzed) / elapsedSecs
 		etaDur := time.Duration(float64(analyzeTarget-sessionAnalyzed)/rate) * time.Second
 		etaStr = formatETA(etaDur)
@@ -237,7 +279,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 	combined, perNode := wd.throughputSeries()
 	if len(combined) >= 2 {
 		var nodeNames []string
-		for _, m := range wd.monitors {
+		for _, m := range monitors {
 			nodeNames = append(nodeNames, m.Name())
 		}
 		b.WriteString(`<section><div class="label">Throughput</div>`)
@@ -246,19 +288,19 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	// Error
-	if last, ok := wd.progress.lastErr.Load().(string); ok && last != "" {
+	if last, ok := progress.lastErr.Load().(string); ok && last != "" {
 		fmt.Fprintf(&b, `<div class="err">%s</div>`, htmlEscape(last))
 	}
 
 	// Pool
-	if len(wd.monitors) > 0 {
+	if len(monitors) > 0 {
 		totalSlots := 0
-		for _, m := range wd.monitors {
+		for _, m := range monitors {
 			totalSlots += m.Slots()
 		}
 		b.WriteString(`<section><div class="label">Pool</div>`)
 		b.WriteString(`<div class="pool-meta">`)
-		fmt.Fprintf(&b, `<span class="pool-stat">%d nodes</span>`, len(wd.monitors))
+		fmt.Fprintf(&b, `<span class="pool-stat">%d nodes</span>`, len(monitors))
 		fmt.Fprintf(&b, `<span class="pool-stat">%d slots</span>`, totalSlots)
 		b.WriteString(`</div>`)
 
@@ -269,7 +311,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 			`</tr></thead><tbody>`)
 
 		const ncols = 10
-		for _, m := range wd.monitors {
+		for _, m := range monitors {
 			snap := m.Snapshot()
 			name := htmlEscape(m.Name())
 			if snap == nil {
@@ -343,8 +385,8 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	// Local worker oldest-file info (only shown when no remote pool)
-	if wd.litmus != nil && len(wd.monitors) == 0 {
-		if s := wd.litmus.workerSummary(); s.Busy > 0 && s.OldestFile != "" {
+	if litmus != nil && len(monitors) == 0 {
+		if s := litmus.workerSummary(); s.Busy > 0 && s.OldestFile != "" {
 			fmt.Fprintf(&b, `<div style="font-family:var(--mono);font-size:.78rem;color:var(--sub);margin-bottom:1.5rem">%s <span style="opacity:.5">%s</span></div>`,
 				htmlEscape(s.OldestFile),
 				(time.Duration(s.OldestMS)*time.Millisecond).Round(time.Second))
@@ -358,9 +400,9 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 			`<span>walked&nbsp;%s</span>`+
 			`<span>cache&nbsp;hits&nbsp;%s</span>`+
 			`</footer>`,
-		fmtN(wd.progress.errors.Load()),
+		fmtN(progress.errors.Load()),
 		fmtN(walked),
-		fmtN(wd.progress.cacheHits.Load()),
+		fmtN(progress.cacheHits.Load()),
 	)
 
 	b.WriteString(`</body></html>`)

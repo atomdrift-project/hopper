@@ -564,13 +564,27 @@ func cmdLoad(ctx context.Context) error {
 		warnVersionMismatch(fetchAllNodeInfo(ctx, nodes))
 	}
 
+	// Start the web dashboard immediately so it's reachable during setup
+	// (DB migrations, litmus startup, rules update). configure() is called
+	// inside loadAll once the session state is ready.
+	var wd *webDashboard
+	if *dashAddr != "" {
+		wd = &webDashboard{}
+		if err := startWebDashboard(ctx, *dashAddr, wd); err != nil {
+			slog.Warn("web dashboard disabled", "error", err)
+			wd = nil
+		} else {
+			slog.Info("web dashboard listening", "addr", *dashAddr)
+		}
+	}
+
 	var shared loadProgress
 	shared.analyzeDurationMin.Store(math.MaxInt64)
 
 	loadCtx, loadCancel := context.WithCancel(ctx)
 	defer loadCancel()
 
-	total := loadAll(loadCtx, loadCancel, db, litmus, nodes, cache, loadDirs, *source, *workers, *rescan, *maxAnalyzed, *experimentTag, *dashAddr, &shared)
+	total := loadAll(loadCtx, loadCancel, db, litmus, nodes, cache, loadDirs, *source, *workers, *rescan, *maxAnalyzed, *experimentTag, wd, &shared)
 	slog.Info("load complete", "samples", total)
 	return nil
 }
@@ -629,7 +643,7 @@ var (
 // may run concurrently (irrelevant for typical 3-dir loads).
 //
 //nolint:revive // signature matches the pipeline's top-level orchestration contract.
-func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litmus *litmusServer, nodes []analyzer, cache *hashCache, dirs []struct{ dir, label string }, source string, nworkers int, rescan bool, maxAnalyzed int, experimentTag, dashAddr string, shared *loadProgress) int {
+func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litmus *litmusServer, nodes []analyzer, cache *hashCache, dirs []struct{ dir, label string }, source string, nworkers int, rescan bool, maxAnalyzed int, experimentTag string, wd *webDashboard, shared *loadProgress) int {
 	slog.Info("loading", "dirs", len(dirs))
 	start := time.Now()
 	var progress loadProgress
@@ -668,21 +682,8 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 		runDashboard(dashCtx, &progress, litmus, monitors, start, startAnalyzed, maxAnalyzed, len(dirs))
 	})
 
-	if dashAddr != "" {
-		wd := &webDashboard{
-			progress:      &progress,
-			litmus:        litmus,
-			monitors:      monitors,
-			start:         start,
-			startAnalyzed: startAnalyzed,
-			maxAnalyzed:   maxAnalyzed,
-			ndirs:         len(dirs),
-		}
-		if err := startWebDashboard(dashCtx, dashAddr, wd); err != nil {
-			slog.Warn("web dashboard disabled", "error", err)
-		} else {
-			slog.Info("web dashboard listening", "addr", dashAddr)
-		}
+	if wd != nil {
+		wd.configure(&progress, litmus, monitors, start, startAnalyzed, maxAnalyzed, len(dirs))
 	}
 
 	// Per-directory pipelines: each goroutine runs cleave→hash→batch→
