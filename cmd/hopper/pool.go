@@ -190,6 +190,19 @@ type nodeHealth struct { //nolint:govet // small struct; readability over paddin
 	OrphanedTasks int     // tasks that timed out but thread still running
 	MaxConcurrent int     // configured worker slot count
 	UptimeSecs    int64   // seconds since the litmus process started
+	// StuckRequests lists in-flight requests exceeding 60s. Populated from
+	// /_/requests when the node is saturated or has orphans.
+	StuckRequests []stuckRequest
+}
+
+// stuckRequest is an in-flight litmus request exceeding 60s, surfaced in the
+// dashboard so operators can see which file and analysis phase is blocking.
+type stuckRequest struct {
+	Name      string
+	ElapsedMs int64
+	Phase     string
+	ThreadID  uint64
+	TimedOut  bool
 }
 
 // fetchHealth issues a single GET /_/health and parses the JSON response.
@@ -238,7 +251,7 @@ func fetchHealth(ctx context.Context, client *http.Client, baseURL string) (*nod
 			status = "degraded"
 		}
 	}
-	return &nodeHealth{
+	h := &nodeHealth{
 		Status:        status,
 		Reason:        raw.Reason,
 		Load:          raw.Load,
@@ -248,7 +261,59 @@ func fetchHealth(ctx context.Context, client *http.Client, baseURL string) (*nod
 		OrphanedTasks: raw.OrphanedTasks,
 		MaxConcurrent: raw.MaxConcurrent,
 		UptimeSecs:    raw.UptimeSecs,
-	}, nil
+	}
+
+	// When the node is saturated or has orphans, fetch /_/requests for
+	// stuck-request detail. Skip the extra call when healthy.
+	if raw.OrphanedTasks > 0 || status == "saturated" {
+		h.StuckRequests = fetchStuckRequests(ctx, client, baseURL)
+	}
+
+	return h, nil
+}
+
+// fetchStuckRequests calls /_/requests and returns entries exceeding 60s.
+func fetchStuckRequests(ctx context.Context, client *http.Client, baseURL string) []stuckRequest {
+	reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, baseURL+"/_/requests", http.NoBody)
+	if err != nil {
+		return nil
+	}
+	resp, err := client.Do(req) //nolint:gosec // base URL constructed from operator-supplied address
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close() //nolint:errcheck // best-effort close
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 65536))
+	if err != nil {
+		return nil
+	}
+	var parsed struct {
+		Requests []struct {
+			Name      string `json:"name"`
+			ElapsedMs int64  `json:"elapsed_ms"`
+			TimedOut  bool   `json:"timed_out"`
+			Phase     string `json:"phase"`
+			ThreadID  uint64 `json:"thread_id"`
+		} `json:"requests"`
+	}
+	if json.Unmarshal(body, &parsed) != nil {
+		return nil
+	}
+	var stuck []stuckRequest
+	for _, r := range parsed.Requests {
+		if r.ElapsedMs > 60_000 {
+			stuck = append(stuck, stuckRequest{
+				Name:      r.Name,
+				ElapsedMs: r.ElapsedMs,
+				Phase:     r.Phase,
+				ThreadID:  r.ThreadID,
+				TimedOut:  r.TimedOut,
+			})
+		}
+	}
+	return stuck
 }
 
 // remoteLitmus is a litmus server reachable over HTTP at a remote address.

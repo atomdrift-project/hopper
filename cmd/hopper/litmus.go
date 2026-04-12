@@ -597,6 +597,9 @@ type litmusHealth struct { //nolint:govet // JSON field grouping is clearer than
 	MaxConcurrent     int     `json:"max_concurrent_tasks"`
 	Load              float64 `json:"load"`
 	RSSMB             int     `json:"rss_mb"`
+	Status            string  `json:"status"`
+	Reason            string  `json:"reason"`
+	UptimeSecs        int     `json:"uptime_secs"`
 	OldestRequestMs   int64
 	OldestRequestName string
 }

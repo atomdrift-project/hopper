@@ -207,6 +207,7 @@ details.jobs-fold[open] summary::before{content:"▾ "}
 .job{display:block;font-size:.75rem;font-family:var(--mono);
   padding:.1rem 0;white-space:nowrap}
 .job-file{color:#8896b0}
+.job-phase{color:var(--amber);margin-left:.3em;font-size:.85em}
 .job-age{color:var(--sub);margin-left:.5em}
 
 /* footer */
@@ -407,6 +408,29 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 					htmlEscape(traits),
 					detail,
 				)
+			}
+
+			if stuck := snap.Health.StuckRequests; len(stuck) > 0 {
+				fmt.Fprintf(&b, `<tr class="jobs-row"><td></td><td colspan="%d">`, ncols-1)
+				fmt.Fprintf(&b, `<details class="jobs-fold" open><summary class="orphan-warn">%d stuck (>60s)</summary>`, len(stuck))
+				for _, sr := range stuck {
+					age := time.Duration(sr.ElapsedMs) * time.Millisecond
+					shortName := sr.Name
+					if idx := strings.LastIndex(sr.Name, "/"); idx >= 0 {
+						shortName = sr.Name[idx+1:]
+					}
+					phase := sr.Phase
+					if phase == "" {
+						phase = "?"
+					}
+					timedOut := ""
+					if sr.TimedOut {
+						timedOut = " timed-out"
+					}
+					fmt.Fprintf(&b, `<span class="job%s"><span class="job-file">%s</span> <span class="job-phase">[%s]</span><span class="job-age">%s</span></span>`,
+						timedOut, htmlEscape(shortName), htmlEscape(phase), shortDuration(age))
+				}
+				b.WriteString(`</details></td></tr>`)
 			}
 
 			if jobs := m.InFlightList(); len(jobs) > 0 {
