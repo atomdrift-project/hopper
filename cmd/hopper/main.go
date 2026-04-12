@@ -496,26 +496,9 @@ func cmdLoad(ctx context.Context) error {
 		litmusCh <- litmusResult{} // nothing to wait for
 	}
 
-	// These run while litmus is starting up.
-	updateCleave(ctx)
-
-	// Open hash cache (default: ~/.hopper/hashcache.db).
-	var cache *hashCache
-	if !*noCache {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			home = "."
-		}
-		cacheDir := filepath.Join(home, ".hopper")
-		mkdirAllBestEffort(cacheDir, 0o755)
-		cache, err = openHashCache(ctx, filepath.Join(cacheDir, "hashcache.db"))
-		if err != nil {
-			slog.Warn("hash cache unavailable, continuing without cache", "error", err)
-		} else {
-			defer cache.close(ctx)
-		}
-	}
-
+	// Run all independent startup work in parallel: cleave rebuild, hash
+	// cache load, DB connect+migrate, and remote litmus dial all happen
+	// concurrently alongside the local litmus startup above.
 	var dirNames []string
 	for _, d := range loadDirs {
 		dirNames = append(dirNames, d.label)
@@ -525,20 +508,86 @@ func cmdLoad(ctx context.Context) error {
 		"labels", dirNames,
 		"workers", *workers,
 		"rescan", *rescan,
-		"cache", cache != nil,
+		"cache", !*noCache,
 		"max_analyzed", *maxAnalyzed,
 		"experiment", *experimentTag)
-	db, err := openDB(ctx, *dsn)
-	if err != nil {
-		return err
+
+	go updateCleave(ctx)
+
+	type cacheResult struct {
+		cache *hashCache
+		err   error
 	}
-	defer db.Close()
-	slog.Info("running schema migrations")
-	if err := db.Migrate(ctx); err != nil {
-		return err
+	cacheCh := make(chan cacheResult, 1)
+	go func() {
+		if *noCache {
+			cacheCh <- cacheResult{}
+			return
+		}
+		home, err := os.UserHomeDir()
+		if err != nil {
+			home = "."
+		}
+		cacheDir := filepath.Join(home, ".hopper")
+		mkdirAllBestEffort(cacheDir, 0o755)
+		c, err := openHashCache(ctx, filepath.Join(cacheDir, "hashcache.db"))
+		cacheCh <- cacheResult{cache: c, err: err}
+	}()
+
+	type dbResult struct {
+		db  *hopper.DB
+		err error
+	}
+	dbCh := make(chan dbResult, 1)
+	go func() {
+		d, err := openDB(ctx, *dsn)
+		if err != nil {
+			dbCh <- dbResult{err: err}
+			return
+		}
+		slog.Info("running schema migrations")
+		if err := d.Migrate(ctx); err != nil {
+			d.Close()
+			dbCh <- dbResult{err: err}
+			return
+		}
+		dbCh <- dbResult{db: d}
+	}()
+
+	// Dial remote litmus nodes in parallel with everything else.
+	type remoteResult struct{ nodes []analyzer }
+	remoteCh := make(chan remoteResult, 1)
+	go func() {
+		if remoteAddrs := parseLitmusNodes(*litmusNodes); len(remoteAddrs) > 0 {
+			var nodes []analyzer
+			for _, r := range dialAllRemoteLitmus(ctx, remoteAddrs) {
+				nodes = append(nodes, r)
+			}
+			remoteCh <- remoteResult{nodes: nodes}
+		} else {
+			remoteCh <- remoteResult{}
+		}
+	}()
+
+	// Collect results. Order doesn't matter — each blocks until ready.
+	cr := <-cacheCh
+	var cache *hashCache
+	if cr.err != nil {
+		slog.Warn("hash cache unavailable, continuing without cache", "error", cr.err)
+	} else {
+		cache = cr.cache
+		if cache != nil {
+			defer cache.close(ctx)
+		}
 	}
 
-	// Wait for litmus to finish starting before building the pool.
+	dr := <-dbCh
+	if dr.err != nil {
+		return dr.err
+	}
+	db := dr.db
+	defer db.Close()
+
 	if res := <-litmusCh; res.err != nil {
 		return res.err
 	}
@@ -552,18 +601,14 @@ func cmdLoad(ctx context.Context) error {
 		go litmus.WatchHealth(ctx)
 	}
 
-	// Build the analyzer pool: local litmus (if enabled) plus any remote
-	// litmus servers passed via --litmus-nodes. Remote nodes that fail to
-	// dial are logged and skipped, never fatal.
+	remotes := <-remoteCh
+
+	// Build the analyzer pool from local + remote nodes.
 	var nodes []analyzer
 	if litmus != nil {
 		nodes = append(nodes, litmus)
 	}
-	if remoteAddrs := parseLitmusNodes(*litmusNodes); len(remoteAddrs) > 0 {
-		for _, r := range dialAllRemoteLitmus(ctx, remoteAddrs) {
-			nodes = append(nodes, r)
-		}
-	}
+	nodes = append(nodes, remotes.nodes...)
 	if len(nodes) > 0 {
 		totalSlots := 0
 		nodeNames := make([]string, 0, len(nodes))
