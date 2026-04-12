@@ -180,7 +180,8 @@ func postUpdate(ctx context.Context, client *http.Client, baseURL string) (*upda
 // Both local and remote nodes report the same shape; "down" is synthesized
 // by the monitor when a poll fails (the server itself never returns it).
 type nodeHealth struct { //nolint:govet // small struct; readability over padding minimization.
-	Status        string  // "ok" | "starting" | "degraded" | "failed" | "down"
+	Status        string  // "ok" | "starting" | "saturated" | "degraded" | "failed" | "down"
+	Reason        string  // litmus-supplied free-form code, e.g. "memory_pressure"
 	Load          float64 // 0..1, live_tasks / max_concurrent_tasks
 	RSSMB         int     // resident set size in MiB
 	LiveTasks     int     // currently-running tasks
@@ -211,6 +212,7 @@ func fetchHealth(ctx context.Context, client *http.Client, baseURL string) (*nod
 	}
 	var raw struct {
 		Status        string  `json:"status"`
+		Reason        string  `json:"reason"`
 		Load          float64 `json:"load"`
 		RSSMB         int     `json:"rss_mb"`
 		LiveTasks     int     `json:"live_tasks"`
@@ -221,8 +223,10 @@ func fetchHealth(ctx context.Context, client *http.Client, baseURL string) (*nod
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("parse /_/health: %w", err)
 	}
-	// Litmus returns "starting"/"degraded" with HTTP 503; treat both as
-	// reachable-but-unhealthy. Anything else with non-200 also degrades.
+	// Litmus returns "starting"/"degraded" with HTTP 503; "saturated" comes
+	// back with 200 since a fully-utilised pool is the target steady state,
+	// not a fault. Any other non-200 we don't recognise gets bucketed as
+	// degraded so it shows up on the dashboard.
 	status := raw.Status
 	if status == "" {
 		if resp.StatusCode == http.StatusOK {
@@ -233,6 +237,7 @@ func fetchHealth(ctx context.Context, client *http.Client, baseURL string) (*nod
 	}
 	return &nodeHealth{
 		Status:        status,
+		Reason:        raw.Reason,
 		Load:          raw.Load,
 		RSSMB:         raw.RSSMB,
 		LiveTasks:     raw.LiveTasks,

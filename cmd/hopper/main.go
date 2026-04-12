@@ -410,7 +410,7 @@ func cmdLoad(ctx context.Context) error {
 	workers := f.Int("workers", 8, "concurrent hash/insert workers")
 	cleaveBinFlag := f.String("cleave", "cleave", "path to cleave binary (used for file enumeration)")
 	litmusBin := f.String("litmus", "litmus", "path to litmus binary (pass empty to disable)")
-	litmusWorkers := f.Int("litmus-workers", 8, "concurrent litmus analysis workers (local node)")
+	litmusWorkers := f.Int("litmus-workers", 0, "concurrent litmus analysis workers for the local node (0 = auto: max(1, NumCPU/2))")
 	litmusNodes := f.String("litmus-nodes", "", "comma-separated host[:port] of additional remote litmus servers (default port "+defaultRemoteLitmusPort+")")
 	noRulesUpdate := f.Bool("no-rules-update", false, "skip POST /_/update on each litmus node at startup")
 	maxRSSGB := f.Int("max-memory-gb", 32, "litmus RSS limit in GB")
@@ -957,13 +957,21 @@ func renderPoolBlock(monitors []*nodeMonitor) {
 				nameWidth, name, statusColor, statusLabel, truncate(snap.LastErr, 40))
 			continue
 		}
-		writeStdoutf("  %-*s  %s%-9s\033[0m  up %-9s  load %.2f  rss %4d MB  %2d/%-d\n",
+		// Append the litmus-supplied reason whenever the node isn't a
+		// plain "ok" — that's how the operator finds out *why* something
+		// is saturated/degraded/failed without having to curl /_/health.
+		reason := ""
+		if snap.Health.Reason != "" && snap.Health.Status != "ok" {
+			reason = "  \033[2m" + snap.Health.Reason + "\033[0m"
+		}
+		writeStdoutf("  %-*s  %s%-9s\033[0m  up %-9s  load %.2f  rss %4d MB  %2d/%-d%s\n",
 			nameWidth, name,
 			statusColor, statusLabel,
 			uptime,
 			snap.Health.Load,
 			snap.Health.RSSMB,
 			snap.Health.LiveTasks, slots,
+			reason,
 		)
 	}
 }
@@ -985,7 +993,7 @@ func logPoolStatus(monitors []*nodeMonitor) {
 				"error", snap.LastErr)
 			continue
 		}
-		slog.Info("litmus node",
+		attrs := []any{
 			"node", m.Name(),
 			"status", snap.Health.Status,
 			"uptime_secs", snap.Health.UptimeSecs,
@@ -993,7 +1001,11 @@ func logPoolStatus(monitors []*nodeMonitor) {
 			"rss_mb", snap.Health.RSSMB,
 			"live", snap.Health.LiveTasks,
 			"slots", m.Slots(),
-		)
+		}
+		if snap.Health.Reason != "" {
+			attrs = append(attrs, "reason", snap.Health.Reason)
+		}
+		slog.Info("litmus node", attrs...)
 	}
 }
 
@@ -1002,7 +1014,10 @@ func poolStatusColor(snap *nodeStatusSnapshot) string {
 		return "\033[31m" // red
 	}
 	switch snap.Health.Status {
-	case "ok":
+	case "ok", "saturated":
+		// Saturated = all worker slots busy. That's the target steady
+		// state under load, not an unhealthy condition, so colour it the
+		// same as ok.
 		return "\033[32m" // green
 	case "starting":
 		return "\033[33m" // yellow

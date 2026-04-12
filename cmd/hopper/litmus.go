@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,7 +69,10 @@ func newLitmusServer(cfg litmusConfig) *litmusServer {
 		cfg.Bin = "litmus"
 	}
 	if cfg.MaxWorkers < 1 {
-		cfg.MaxWorkers = 8
+		// CPU-bound cleave + ONNX work overlaps poorly across many threads,
+		// so cores/2 typically delivers higher aggregate throughput than
+		// 1/core. Mirrors the litmus default.
+		cfg.MaxWorkers = max(1, runtime.NumCPU()/2)
 	}
 	return &litmusServer{
 		bin:         cfg.Bin,
@@ -217,6 +221,11 @@ func (s *litmusServer) startLocked(ctx context.Context, l net.Listener) error {
 	}
 	if s.timeoutSecs > 0 {
 		args = append(args, "--timeout-secs", strconv.Itoa(s.timeoutSecs))
+	}
+	if s.maxWorkers > 0 {
+		// Match litmus's max_concurrent_tasks to hopper's dispatch pool so
+		// the dashboard and litmus's own /_/health agree on slot count.
+		args = append(args, "--workers", strconv.Itoa(s.maxWorkers))
 	}
 	if s.verbose {
 		args = append(args, "--verbose")
