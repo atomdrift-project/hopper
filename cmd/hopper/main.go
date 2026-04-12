@@ -413,7 +413,7 @@ func cmdLoad(ctx context.Context) error {
 	litmusWorkers := f.Int("litmus-workers", 0, "concurrent litmus analysis workers for the local node (0 = auto: max(1, NumCPU/2))")
 	litmusNodes := f.String("litmus-nodes", "", "comma-separated host[:port] of additional remote litmus servers (default port "+defaultRemoteLitmusPort+")")
 	noRulesUpdate := f.Bool("no-rules-update", false, "skip POST /_/update on each litmus node at startup")
-	maxRSSGB := f.Int("max-memory-gb", 32, "litmus RSS limit in GB")
+	maxRSSGB := f.Int("max-memory-gb", 0, "litmus RSS limit in GB (0 = auto: min(50% RAM, 32 GiB))")
 	analysisTimeout := f.Int("analysis-timeout", 1200, "per-file analysis timeout in seconds (passed to litmus)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
