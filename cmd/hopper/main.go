@@ -654,10 +654,10 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 	var monitors []*nodeMonitor
 	if len(nodes) > 0 {
 		analyzeQueue = make(chan loadJob, 2_000_000)
-		startAnalysisWorkers(ctx, cancel, db, nodes, analyzeQueue, &analyzeWG, &progress, shared, maxAnalyzed)
 		// Per-node /_/health pollers feed the dashboard's pool block.
-		// Goroutines exit when ctx is cancelled at the end of the load.
+		// Created before workers so monitors can be wired for per-node counters.
 		monitors = startNodeMonitors(ctx, nodes)
+		startAnalysisWorkers(ctx, cancel, db, nodes, analyzeQueue, &analyzeWG, &progress, shared, maxAnalyzed, monitors)
 	}
 
 	// Progress dashboard: reads counters, exits when dashCtx is cancelled.
@@ -1148,7 +1148,14 @@ func startAnalysisWorkers(
 	progress *loadProgress,
 	shared *loadProgress,
 	maxAnalyzed int,
+	monitors []*nodeMonitor,
 ) {
+	// Build a name→monitor map so each worker can increment its node's counter.
+	monitorByName := make(map[string]*nodeMonitor, len(monitors))
+	for _, m := range monitors {
+		monitorByName[m.Name()] = m
+	}
+
 	// One goroutine per slot per node, all reading from the shared queue.
 	// Work-stealing emerges naturally: when a slot finishes (fast or slow),
 	// it grabs the next item, so heterogeneous nodes self-balance and the
@@ -1158,6 +1165,7 @@ func startAnalysisWorkers(
 		// Only the local litmusServer wires into the dashboard's per-worker
 		// in-flight tracking. Remote nodes have no equivalent today.
 		local, _ := node.(*litmusServer)
+		mon := monitorByName[node.Name()]
 		for range node.Slots() {
 			id := workerID
 			workerID++
@@ -1169,13 +1177,20 @@ func startAnalysisWorkers(
 						return
 					}
 
+					file := filepath.Base(job.path)
 					if local != nil {
-						local.TrackWorker(id, filepath.Base(job.path))
+						local.TrackWorker(id, file)
+					}
+					if mon != nil {
+						mon.TrackSlot(id, file)
 					}
 					t0 := time.Now()
 					result, err := analyzeWithRetry(ctx, n, job.sha, job.path)
 					if local != nil {
 						local.TrackWorker(id, "")
+					}
+					if mon != nil {
+						mon.TrackSlot(id, "")
 					}
 					dur := time.Since(t0).Nanoseconds()
 
@@ -1212,6 +1227,9 @@ func startAnalysisWorkers(
 						slog.Warn("storing litmus result failed", "path", job.path, "error", err)
 					}
 					progress.analyzed.Add(1)
+					if mon != nil {
+						mon.IncrAnalyzed()
+					}
 
 					// Check global analysis cap.
 					if maxAnalyzed > 0 && shared.analyzed.Add(1) >= int64(maxAnalyzed) {

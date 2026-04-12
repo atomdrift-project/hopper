@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -509,8 +510,52 @@ type nodeStatusSnapshot struct { //nolint:govet // small struct; readability ove
 type nodeMonitor struct {
 	node           analyzer
 	snap           atomic.Pointer[nodeStatusSnapshot]
-	restartCounter func() int // optional: returns cumulative restart count (local node only)
-	pollCount      int        // incremented each tick; drives periodic /_/info refresh
+	analyzed       atomic.Int64 // cumulative completions on this node, incremented by analysis workers
+	inFlight       sync.Map     // slot ID (int) → *workerState; written by analysis workers
+	restartCounter func() int   // optional: returns cumulative restart count (local node only)
+	pollCount      int          // incremented each tick; drives periodic /_/info refresh
+}
+
+// IncrAnalyzed increments the per-node completion counter. Called by analysis
+// workers after each successful analysis on this node.
+func (m *nodeMonitor) IncrAnalyzed() { m.analyzed.Add(1) }
+
+// Analyzed returns the cumulative completion count for this node.
+func (m *nodeMonitor) Analyzed() int64 { return m.analyzed.Load() }
+
+// TrackSlot records that slot id is working on file. Call with "" to clear.
+func (m *nodeMonitor) TrackSlot(id int, file string) {
+	if file == "" {
+		m.inFlight.Delete(id)
+	} else {
+		m.inFlight.Store(id, &workerState{File: file, StartedAt: time.Now()})
+	}
+}
+
+// inFlightJob is one currently-running analysis task on a node.
+type inFlightJob struct {
+	File    string
+	Elapsed time.Duration
+}
+
+// InFlightList returns all running jobs on this node, sorted oldest-first.
+func (m *nodeMonitor) InFlightList() []inFlightJob {
+	now := time.Now()
+	var jobs []inFlightJob
+	m.inFlight.Range(func(_, v any) bool {
+		ws, ok := v.(*workerState)
+		if ok {
+			jobs = append(jobs, inFlightJob{
+				File:    ws.File,
+				Elapsed: now.Sub(ws.StartedAt).Round(time.Second),
+			})
+		}
+		return true
+	})
+	sort.Slice(jobs, func(i, j int) bool {
+		return jobs[i].Elapsed > jobs[j].Elapsed
+	})
+	return jobs
 }
 
 // Snapshot returns the most recent observation, or nil if no poll has run yet.
