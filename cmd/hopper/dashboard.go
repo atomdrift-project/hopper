@@ -43,7 +43,7 @@ func (wd *webDashboard) configure(progress *loadProgress, litmus *litmusServer, 
 	wd.ndirs = ndirs
 }
 
-const maxThroughputSamples = 60
+const maxThroughputSamples = 2880 // 4 hours at 5-second refresh
 
 type throughputSample struct {
 	t      time.Time
@@ -191,12 +191,23 @@ td.hi{color:#c4cdde}
 .s-down .dot::before,.s-failed .dot::before{color:var(--red)}
 .s-pending .dot::before{color:var(--sub)}
 
+/* age warnings */
+.age-warn{color:var(--amber)}
+.age-alert{color:#fb923c}
+.orphan-warn{color:var(--amber)}
+
 /* in-flight jobs */
 tr.jobs-row td{padding:.1rem .75rem .55rem;border-bottom:1px solid var(--border)}
-.job{display:inline-flex;align-items:center;gap:.35em;
-  margin-right:1rem;font-size:.75rem;font-family:var(--mono)}
+details.jobs-fold{margin:0}
+details.jobs-fold summary{cursor:pointer;font-size:.7rem;color:var(--sub);
+  font-family:var(--mono);list-style:none;user-select:none}
+details.jobs-fold summary::-webkit-details-marker{display:none}
+details.jobs-fold summary::before{content:"▸ ";opacity:.5}
+details.jobs-fold[open] summary::before{content:"▾ "}
+.job{display:block;font-size:.75rem;font-family:var(--mono);
+  padding:.1rem 0;white-space:nowrap}
 .job-file{color:#8896b0}
-.job-age{color:var(--sub)}
+.job-age{color:var(--sub);margin-left:.5em}
 
 /* footer */
 footer{display:flex;gap:1.5rem;padding-top:1.25rem;
@@ -307,10 +318,11 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 		b.WriteString(`<table><thead><tr>` +
 			`<th>Node</th><th>Status</th><th>Uptime</th>` +
 			`<th>Load</th><th>RSS</th><th>Tasks</th>` +
-			`<th>Done</th><th>Version</th><th>Traits</th><th></th>` +
+			`<th>Orphans</th><th>Done</th><th>Errors</th><th>Last</th>` +
+			`<th>Version</th><th>Traits</th><th></th>` +
 			`</tr></thead><tbody>`)
 
-		const ncols = 10
+		const ncols = 13
 		for _, m := range monitors {
 			snap := m.Snapshot()
 			name := htmlEscape(m.Name())
@@ -334,11 +346,30 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 			if snap.Health.Reason != "" && snap.Health.Status != "ok" {
 				detail = htmlEscape(snap.Health.Reason)
 			}
-			if snap.Health.OrphanedTasks > 0 {
-				detail += fmt.Sprintf(" orphaned:%d", snap.Health.OrphanedTasks)
-			}
 			if snap.Restarts > 0 {
 				detail += fmt.Sprintf(" restarts:%d", snap.Restarts)
+			}
+
+			errCount := m.Errors()
+			lastAge := m.LastCompletedAge()
+			lastStr := "—"
+			lastClass := ""
+			if lastAge > 0 {
+				lastStr = shortDuration(lastAge) + " ago"
+				switch {
+				case lastAge >= 10*time.Minute:
+					lastClass = " age-alert"
+				case lastAge >= 5*time.Minute:
+					lastClass = " age-warn"
+				}
+			}
+
+			orphans := snap.Health.OrphanedTasks
+			orphanStr := "—"
+			orphanClass := ""
+			if orphans > 0 {
+				orphanStr = fmt.Sprintf("%d", orphans)
+				orphanClass = " orphan-warn"
 			}
 
 			if !snap.Reachable {
@@ -355,7 +386,10 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 						`<td class="hi">%.2f</td>`+
 						`<td>%d MB</td>`+
 						`<td>%d/%d</td>`+
+						`<td class="%s">%s</td>`+
 						`<td class="hi">%s</td>`+
+						`<td>%s</td>`+
+						`<td class="%s">%s</td>`+
 						`<td>%s</td>`+
 						`<td>%s</td>`+
 						`<td>%s</td>`+
@@ -365,7 +399,10 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 					snap.Health.Load,
 					snap.Health.RSSMB,
 					snap.Health.LiveTasks, m.Slots(),
+					orphanClass, orphanStr,
 					fmtN(m.Analyzed()),
+					fmtN(errCount),
+					lastClass, lastStr,
 					htmlEscape(snap.Version),
 					htmlEscape(traits),
 					detail,
@@ -373,12 +410,17 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 			}
 
 			if jobs := m.InFlightList(); len(jobs) > 0 {
+				oldest := jobs[0] // InFlightList returns oldest-first
 				fmt.Fprintf(&b, `<tr class="jobs-row"><td></td><td colspan="%d">`, ncols-1)
-				for _, j := range jobs {
+				fmt.Fprintf(&b, `<details class="jobs-fold"><summary>%d in-flight · <span class="job-file">%s</span> <span class="job-age">%s</span></summary>`,
+					len(jobs), htmlEscape(oldest.File), oldest.Elapsed)
+				// Expand to full list, oldest → newest.
+				for i := len(jobs) - 1; i >= 0; i-- {
+					j := jobs[i]
 					fmt.Fprintf(&b, `<span class="job"><span class="job-file">%s</span><span class="job-age">%s</span></span>`,
 						htmlEscape(j.File), j.Elapsed)
 				}
-				b.WriteString(`</td></tr>`)
+				b.WriteString(`</details></td></tr>`)
 			}
 		}
 		b.WriteString(`</tbody></table></section>`)
@@ -565,6 +607,22 @@ func shortCommit(s string) string {
 		return s[:8]
 	}
 	return s
+}
+
+// shortDuration formats a duration concisely: "3s", "2m15s", "1h30m".
+func shortDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	h := int(d / time.Hour)
+	m := int((d % time.Hour) / time.Minute)
+	s := int((d % time.Minute) / time.Second)
+	switch {
+	case h > 0:
+		return fmt.Sprintf("%dh%02dm", h, m)
+	case m > 0:
+		return fmt.Sprintf("%dm%02ds", m, s)
+	default:
+		return fmt.Sprintf("%ds", s)
+	}
 }
 
 func htmlEscape(s string) string {

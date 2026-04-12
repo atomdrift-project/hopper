@@ -511,6 +511,8 @@ type nodeMonitor struct {
 	node           analyzer
 	snap           atomic.Pointer[nodeStatusSnapshot]
 	analyzed       atomic.Int64 // cumulative completions on this node, incremented by analysis workers
+	analyzeErrors  atomic.Int64 // cumulative analysis errors on this node
+	lastCompleted  atomic.Int64 // unix nanos of last successful completion
 	inFlight       sync.Map     // slot ID (int) → *workerState; written by analysis workers
 	restartCounter func() int   // optional: returns cumulative restart count (local node only)
 	pollCount      int          // incremented each tick; drives periodic /_/info refresh
@@ -518,10 +520,29 @@ type nodeMonitor struct {
 
 // IncrAnalyzed increments the per-node completion counter. Called by analysis
 // workers after each successful analysis on this node.
-func (m *nodeMonitor) IncrAnalyzed() { m.analyzed.Add(1) }
+func (m *nodeMonitor) IncrAnalyzed() {
+	m.analyzed.Add(1)
+	m.lastCompleted.Store(time.Now().UnixNano())
+}
 
 // Analyzed returns the cumulative completion count for this node.
 func (m *nodeMonitor) Analyzed() int64 { return m.analyzed.Load() }
+
+// IncrErrors increments the per-node error counter.
+func (m *nodeMonitor) IncrErrors() { m.analyzeErrors.Add(1) }
+
+// Errors returns the cumulative error count for this node.
+func (m *nodeMonitor) Errors() int64 { return m.analyzeErrors.Load() }
+
+// LastCompletedAge returns how long ago the last successful analysis finished,
+// or zero if none have completed yet.
+func (m *nodeMonitor) LastCompletedAge() time.Duration {
+	ns := m.lastCompleted.Load()
+	if ns == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, ns)).Round(time.Second)
+}
 
 // TrackSlot records that slot id is working on file. Call with "" to clear.
 func (m *nodeMonitor) TrackSlot(id int, file string) {

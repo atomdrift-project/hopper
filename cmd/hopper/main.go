@@ -1254,6 +1254,9 @@ func startAnalysisWorkers(
 
 					if err != nil {
 						progress.errors.Add(1)
+						if mon != nil {
+							mon.IncrErrors()
+						}
 						progress.lastErr.Store(fmt.Sprintf("analyze: %s: %v", filepath.Base(job.path), err))
 						slog.Warn("analysis failed", "node", n.Name(), "path", job.path, "error", err)
 						continue
