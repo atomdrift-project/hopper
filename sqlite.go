@@ -1056,7 +1056,7 @@ func (db *DB) claimJobsSQLite(ctx context.Context, worker string, limit int, exp
 	cutoff := time.Now().Add(-expiry).UTC().Format(time.RFC3339Nano)
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id, sha256, path, size_bytes FROM samples
-		WHERE cleave_result IS NULL
+		WHERE cleave_result IS NULL AND skip = ''
 		  AND (claimed_by = '' OR claimed_at < ?)
 		ORDER BY mtime DESC, id LIMIT ?`, cutoff, limit)
 	if err != nil {

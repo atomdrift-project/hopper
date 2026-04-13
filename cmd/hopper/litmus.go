@@ -26,7 +26,7 @@ type litmusServer struct { //nolint:govet // field order is chosen for readabili
 	cmd         *exec.Cmd
 	bin         string // path to litmus binary
 	hopperURL   string // hopper API base URL for the worker to poll
-	dirs        []string
+	dataDir     string // data root for --data-dir
 	mu          sync.Mutex
 	maxRSSGB    int
 	maxWorkers  int
@@ -40,13 +40,13 @@ type litmusServer struct { //nolint:govet // field order is chosen for readabili
 
 // litmusConfig holds options for starting a litmus worker.
 type litmusConfig struct {
-	Bin         string   // path to litmus binary (default: "litmus")
-	HopperURL   string   // hopper API URL (e.g. http://127.0.0.1:8081)
-	Dirs        []string // directories for local path access
-	MaxRSSGB    int      // memory limit in GB (0 = let litmus decide)
-	MaxWorkers  int      // max concurrent analysis workers
-	TimeoutSecs int      // per-request analysis timeout (0 = litmus default: 600s)
-	Verbose     bool     // enable debug logging in litmus
+	Bin         string // path to litmus binary (default: "litmus")
+	HopperURL   string // hopper API URL (e.g. http://127.0.0.1:8081)
+	DataDir     string // data root for local file access
+	MaxRSSGB    int    // memory limit in GB (0 = let litmus decide)
+	MaxWorkers  int    // max concurrent analysis workers
+	TimeoutSecs int    // per-request analysis timeout (0 = litmus default: 600s)
+	Verbose     bool   // enable debug logging in litmus
 }
 
 func newLitmusServer(cfg litmusConfig) *litmusServer {
@@ -59,7 +59,7 @@ func newLitmusServer(cfg litmusConfig) *litmusServer {
 	return &litmusServer{
 		bin:         cfg.Bin,
 		hopperURL:   cfg.HopperURL,
-		dirs:        cfg.Dirs,
+		dataDir:     cfg.DataDir,
 		maxRSSGB:    cfg.MaxRSSGB,
 		maxWorkers:  cfg.MaxWorkers,
 		timeoutSecs: cfg.TimeoutSecs,
@@ -215,9 +215,12 @@ func (s *litmusServer) startLocked(ctx context.Context, _ net.Listener) error {
 		args = append(args, "--verbose")
 	}
 	args = append(args, "worker",
-		"--hopper-url", s.hopperURL,
+		"--url", s.hopperURL,
 		"--name", "local",
 	)
+	if s.dataDir != "" {
+		args = append(args, "--data-dir", s.dataDir)
+	}
 	if s.maxRSSGB > 0 {
 		args = append(args, "--max-rss-gb", strconv.Itoa(s.maxRSSGB))
 	}
@@ -293,6 +296,16 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 		s.pid.Store(0)
 		if ctx.Err() != nil || s.stopped.Load() {
 			return ctx.Err()
+		}
+		// No process to wait on — another goroutine (e.g. rebuild) may be
+		// starting one. Wait briefly instead of spinning.
+		if err != nil && err.Error() == "no process" {
+			select {
+			case <-time.After(2 * time.Second):
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 		// If the build goroutine is restarting litmus with a new binary,
 		// don't count this as a crash — the kill was intentional.

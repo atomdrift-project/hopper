@@ -26,6 +26,7 @@ type apiServer struct {
 	db          *hopper.DB
 	tracker     *workerTracker
 	progress    *loadProgress
+	dataRoot    string   // absolute path to the data directory; paths are served relative to this
 	allowedDirs []string // resolved absolute paths that /api/file may serve from
 }
 
@@ -139,6 +140,10 @@ func validWorkerName(name string) bool {
 // handleNext claims work items for a worker.
 // GET /api/next?worker=nuc&count=3&slots=4&version=0.8.2&traits=abc123.
 func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		http.Error(w, `{"error":"starting"}`, http.StatusServiceUnavailable)
+		return
+	}
 	worker := r.URL.Query().Get("worker")
 	if !validWorkerName(worker) {
 		http.Error(w, `{"error":"invalid worker name"}`, http.StatusBadRequest)
@@ -184,6 +189,15 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Strip the data root to return relative paths. Workers join these
+	// with their own data root to find files locally.
+	if s.dataRoot != "" {
+		prefix := s.dataRoot + string(filepath.Separator)
+		for i := range jobs {
+			jobs[i].Path = strings.TrimPrefix(jobs[i].Path, prefix)
+		}
+	}
+
 	slog.Debug("claimed jobs", "worker", worker, "count", len(jobs))
 
 	w.Header().Set("Content-Type", "application/json")
@@ -223,14 +237,28 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	if req.Error != "" {
-		// Analysis failed — release claim so another worker can try.
-		if err := s.db.UnclaimJobs(ctx, []string{req.SHA256}); err != nil {
-			slog.Error("unclaim failed", "sha256", req.SHA256, "error", err)
+		if isPermanentError(req.Error) {
+			// Unsupported file type, missing file, etc. — mark so it's
+			// never queued again, but preserve the record.
+			skip := "unsupported"
+			if strings.Contains(req.Error, "Path does not exist") {
+				skip = "missing"
+			}
+			if err := s.db.SetSkip(ctx, req.SHA256, skip); err != nil {
+				slog.Error("mark permanent failure failed", "sha256", req.SHA256, "error", err)
+			} else {
+				slog.Info("marked sample", "sha256", req.SHA256, "skip", skip)
+			}
+		} else {
+			// Transient error — release claim so another worker can try.
+			if err := s.db.UnclaimJobs(ctx, []string{req.SHA256}); err != nil {
+				slog.Error("unclaim failed", "sha256", req.SHA256, "error", err)
+			}
+			slog.Warn("worker reported analysis error",
+				"worker", req.Worker, "sha256", req.SHA256, "error", req.Error)
 		}
 		s.progress.errors.Add(1)
 		s.tracker.recordResult(req.Worker, true)
-		slog.Warn("worker reported analysis error",
-			"worker", req.Worker, "sha256", req.SHA256, "error", req.Error)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true}) //nolint:errcheck,errchkjson // best-effort response
 		return
@@ -271,6 +299,13 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true}) //nolint:errcheck,errchkjson // best-effort response
+}
+
+// isPermanentError returns true for analysis errors that will never succeed
+// on retry — the sample should be deleted rather than reclaimed.
+func isPermanentError(msg string) bool {
+	return strings.Contains(msg, "Unsupported file type") ||
+		strings.Contains(msg, "Path does not exist")
 }
 
 // validSHA256 checks that s is exactly 64 lowercase hex characters.

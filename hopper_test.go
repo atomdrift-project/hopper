@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -1357,5 +1358,121 @@ func TestSanitizeJSONB(t *testing.T) {
 				t.Errorf("sanitizeJSONB(%q)\n  got  %q\n  want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestMarkMissingSamples(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create a real file and a path that doesn't exist.
+	realFile := filepath.Join(t.TempDir(), "real.exe")
+	if err := os.WriteFile(realFile, []byte("MZ..."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gonePath := filepath.Join(t.TempDir(), "gone.exe")
+
+	// Insert samples: one with a real file, one with a missing file,
+	// one with a real file but not in the walked set (unsupported).
+	mustInsert(t, ctx, db, &Sample{SHA256: "aaa1", Path: realFile, Label: "bad"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "bbb2", Path: gonePath, Label: "bad"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "ccc3", Path: realFile, Label: "bad"})
+
+	// Only aaa1 was seen by iter-files.
+	walkedPaths := map[string]struct{}{realFile: {}}
+
+	// But ccc3 has the same path as aaa1 — both exist on disk.
+	// Only aaa1 is in walkedPaths, so ccc3 should be marked as unsupported.
+	// Wait — ccc3 has the same path, so it IS in walkedPaths. Let me use a different path.
+	unsupportedFile := filepath.Join(t.TempDir(), "readme.txt")
+	if err := os.WriteFile(unsupportedFile, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustInsert(t, ctx, db, &Sample{SHA256: "ddd4", Path: unsupportedFile, Label: "bad"})
+
+	marked, err := db.MarkMissingSamples(ctx, walkedPaths)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// bbb2 (missing) + ddd4 (unsupported) = 2 marked.
+	// aaa1 is in walkedPaths so untouched.
+	// ccc3 has same path as aaa1 which is in walkedPaths, so untouched.
+	if marked != 2 {
+		t.Errorf("marked = %d, want 2", marked)
+	}
+
+	// Verify skip values.
+	s, _ := db.SampleBySHA256(ctx, "aaa1")
+	if s.Skip != "" {
+		t.Errorf("aaa1 skip = %q, want empty", s.Skip)
+	}
+	s, _ = db.SampleBySHA256(ctx, "bbb2")
+	if s.Skip != "missing" {
+		t.Errorf("bbb2 skip = %q, want 'missing'", s.Skip)
+	}
+	s, _ = db.SampleBySHA256(ctx, "ddd4")
+	if s.Skip != "unsupported" {
+		t.Errorf("ddd4 skip = %q, want 'unsupported'", s.Skip)
+	}
+}
+
+func TestClaimJobsSkipsMarkedSamples(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Insert 3 unanalyzed samples: one normal, one skipped, one missing.
+	mustInsert(t, ctx, db, &Sample{SHA256: "claim1", Path: "/data/a.exe", Label: "bad"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "claim2", Path: "/data/b.exe", Label: "bad", Skip: "unsupported"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "claim3", Path: "/data/c.exe", Label: "bad", Skip: "missing"})
+
+	jobs, err := db.ClaimJobs(ctx, "testworker", 10, 30*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Only claim1 should be returned — the other two have non-empty skip.
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1", len(jobs))
+	}
+	if jobs[0].SHA256 != "claim1" {
+		t.Errorf("got sha256 = %q, want 'claim1'", jobs[0].SHA256)
+	}
+}
+
+func TestClaimJobsExpiry(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{SHA256: "exp1", Path: "/data/a.exe", Label: "bad"})
+
+	// Claim it.
+	jobs, err := db.ClaimJobs(ctx, "worker1", 1, 30*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("first claim: got %d jobs, want 1", len(jobs))
+	}
+
+	// Try to claim again — should get nothing (still claimed).
+	jobs, err = db.ClaimJobs(ctx, "worker2", 1, 30*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("second claim: got %d jobs, want 0", len(jobs))
+	}
+
+	// Claim with zero expiry — should reclaim the expired job.
+	jobs, err = db.ClaimJobs(ctx, "worker2", 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expired claim: got %d jobs, want 1", len(jobs))
+	}
+	if jobs[0].SHA256 != "exp1" {
+		t.Errorf("got sha256 = %q, want 'exp1'", jobs[0].SHA256)
 	}
 }

@@ -890,7 +890,7 @@ func (db *DB) claimJobsPG(ctx context.Context, worker string, limit int, expiry 
 	rows, err := db.pool.Query(ctx, `
 		WITH claimable AS (
 			SELECT id FROM samples
-			WHERE cleave_result IS NULL
+			WHERE cleave_result IS NULL AND skip = ''
 			  AND (claimed_by = '' OR claimed_at < now() - $2::interval)
 			ORDER BY mtime DESC NULLS LAST, id
 			LIMIT $3

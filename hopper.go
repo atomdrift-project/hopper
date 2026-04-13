@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"time"
 
@@ -534,6 +535,40 @@ func (db *DB) Unanalyzed(ctx context.Context, limit int) ([]*Sample, error) {
 		return db.unanalyzedPG(ctx, limit)
 	}
 	return db.unanalyzedSQLite(ctx, limit)
+}
+
+// MarkMissingSamples marks unanalyzed samples that can't be analyzed:
+//   - skip='missing' if the file doesn't exist on disk
+//   - skip='unsupported' if the file exists but wasn't in the iter-files output
+//
+// walkedPaths is the set of all paths emitted by cleave iter-files during
+// the current load. Returns the number of samples marked.
+func (db *DB) MarkMissingSamples(ctx context.Context, walkedPaths map[string]struct{}) (int64, error) {
+	samples, err := db.Unanalyzed(ctx, 1_000_000)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: mark missing: %w", err)
+	}
+	var marked int64
+	for _, s := range samples {
+		if s.Skip != "" {
+			continue
+		}
+		_, walked := walkedPaths[s.Path]
+		if walked {
+			continue // iter-files saw it — it's queued normally
+		}
+		_, statErr := os.Stat(s.Path)
+		skip := "unsupported" // file exists but iter-files filtered it out
+		if statErr != nil {
+			skip = "missing" // file is gone from disk
+		}
+		slog.Info("marking stale sample", "sha256", s.SHA256, "path", s.Path, "skip", skip)
+		if err := db.SetSkip(ctx, s.SHA256, skip); err != nil {
+			return marked, fmt.Errorf("hopper: mark missing: %w", err)
+		}
+		marked++
+	}
+	return marked, nil
 }
 
 // Pull-based work scheduling.

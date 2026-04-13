@@ -439,7 +439,12 @@ func cmdLoad(ctx context.Context) error {
 	// else is still initializing. configure() is called inside loadAll
 	// once the session state is ready.
 	// Create shared HTTP mux for dashboard + work API.
+	// API handlers are registered immediately so workers connecting during
+	// startup get a clean 503 instead of the dashboard's HTML.
 	httpMux := http.NewServeMux()
+	tracker := newWorkerTracker()
+	api := &apiServer{tracker: tracker} // db, progress, allowedDirs set after init
+	api.registerAPI(httpMux)
 
 	var wd *webDashboard
 	if *dashAddr != "" {
@@ -469,13 +474,6 @@ func cmdLoad(ctx context.Context) error {
 		return fmt.Errorf("no bad/, good/, or unknown/ subdirectories found in %s", *dataDir)
 	}
 
-	// Collect directories for litmus's --allowed-dirs.
-	var dirs []string
-	for _, d := range loadDirs {
-		if abs, err := filepath.Abs(d.dir); err == nil {
-			dirs = append(dirs, abs)
-		}
-	}
 
 	// Start litmus early — it takes several seconds to load its model and
 	// YARA rules, and none of that depends on cleave, the hash cache, or
@@ -485,14 +483,20 @@ func cmdLoad(ctx context.Context) error {
 	type litmusResult struct{ err error }
 	litmusCh := make(chan litmusResult, 1)
 	if *litmusBin != "" {
+		// Local worker always connects to loopback. Replace 0.0.0.0
+		// with 127.0.0.1 since 0.0.0.0 is a bind address, not a destination.
 		hopperURL := "http://127.0.0.1:8081"
 		if *dashAddr != "" {
-			hopperURL = "http://" + *dashAddr
+			addr := *dashAddr
+			if strings.HasPrefix(addr, "0.0.0.0:") {
+				addr = "127.0.0.1:" + strings.TrimPrefix(addr, "0.0.0.0:")
+			}
+			hopperURL = "http://" + addr
 		}
 		litmus = newLitmusServer(litmusConfig{
 			Bin:         *litmusBin,
 			HopperURL:   hopperURL,
-			Dirs:        dirs,
+			DataDir:     *dataDir,
 			MaxRSSGB:    *maxRSSGB,
 			MaxWorkers:  *litmusWorkers,
 			TimeoutSecs: *analysisTimeout,
@@ -600,18 +604,22 @@ func cmdLoad(ctx context.Context) error {
 	loadCtx, loadCancel := context.WithCancel(ctx)
 	defer loadCancel()
 
-	tracker := newWorkerTracker()
-
-	// Register the pull-based work API on the shared HTTP mux.
-	// Resolve allowed directories for /api/file path containment.
+	// Wire the API server now that the DB is ready.
 	var allowedDirs []string
 	for _, d := range loadDirs {
-		if abs, err := filepath.Abs(d.dir); err == nil {
+		if resolved, err := filepath.EvalSymlinks(d.dir); err == nil {
+			allowedDirs = append(allowedDirs, resolved)
+		} else if abs, err := filepath.Abs(d.dir); err == nil {
 			allowedDirs = append(allowedDirs, abs)
 		}
 	}
-	api := &apiServer{db: db, tracker: tracker, progress: nil, allowedDirs: allowedDirs} // progress set in loadAll
-	api.registerAPI(httpMux)
+	absDataDir, _ := filepath.EvalSymlinks(*dataDir)
+	if absDataDir == "" {
+		absDataDir, _ = filepath.Abs(*dataDir)
+	}
+	api.db = db
+	api.dataRoot = absDataDir
+	api.allowedDirs = allowedDirs
 
 	total := loadAll(loadCtx, loadCancel, db, litmus, tracker, api, cache, loadDirs, *source, *workers, *rescan, *maxAnalyzed, *experimentTag, wd)
 	slog.Info("load complete", "samples", total)
@@ -633,6 +641,7 @@ type loadProgress struct { //nolint:govet // counters are grouped by pipeline st
 	cacheHits  atomic.Int64
 	exploded   atomic.Int64 // archive members inserted
 	queued     atomic.Int64 // items sent for analysis
+	walkedPaths sync.Map    // path → struct{}: all paths seen by iter-files
 
 	lastErr atomic.Value // string
 
@@ -711,6 +720,18 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 	}
 	pipeWG.Wait()
 
+	// Mark samples whose files are gone or filtered out by iter-files.
+	walkedSet := make(map[string]struct{})
+	progress.walkedPaths.Range(func(k, _ any) bool {
+		walkedSet[k.(string)] = struct{}{}
+		return true
+	})
+	if marked, err := db.MarkMissingSamples(ctx, walkedSet); err != nil {
+		slog.Error("mark missing samples failed", "error", err)
+	} else if marked > 0 {
+		slog.Info("marked stale samples", "count", marked)
+	}
+
 	dashCancel()
 	dashWG.Wait()
 
@@ -769,6 +790,7 @@ func runDirPipeline(
 		}
 		lp.label = target.label
 		progress.walked.Add(1)
+		progress.walkedPaths.Store(lp.path, struct{}{})
 
 		sample, err := hashFile(ctx, lp.path, lp.label, lp.fileType, source, cache, progress)
 		if err != nil {
