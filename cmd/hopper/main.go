@@ -409,10 +409,10 @@ func cmdLoad(ctx context.Context) error {
 	dsn := f.String("db", "", "database connection string")
 	dataDir := f.String("data", "", "data directory containing bad/, good/, unknown/ subdirectories")
 	source := f.String("source", "harvest", "sample source tag")
-	workers := f.Int("workers", 8, "concurrent hash/insert workers")
+	hashWorkers := f.Int("hash-workers", 8, "concurrent hash/insert workers for file walking")
 	cleaveBinFlag := f.String("cleave", "cleave", "path to cleave binary (used for file enumeration)")
 	litmusBin := f.String("litmus", "litmus", "path to litmus binary (pass empty to disable)")
-	litmusWorkers := f.Int("litmus-workers", 0, "concurrent litmus analysis workers for the local node (0 = auto)")
+	litmusWorkers := f.Int("workers", 0, "concurrent analysis workers for the local litmus (0 = auto: max(2, cores/4))")
 	// Remote litmus workers self-register via the pull API; no --litmus-nodes flag needed.
 	maxRSSGB := f.Int("max-memory-gb", 0, "litmus RSS limit in GB (0 = auto)")
 	analysisTimeout := f.Int("analysis-timeout", 1200, "per-file analysis timeout in seconds (passed to litmus)")
@@ -519,7 +519,7 @@ func cmdLoad(ctx context.Context) error {
 	slog.Info("load starting",
 		"data", *dataDir,
 		"labels", dirNames,
-		"workers", *workers,
+		"workers", *hashWorkers,
 		"rescan", *rescan,
 		"cache", !*noCache,
 		"max_analyzed", *maxAnalyzed,
@@ -621,7 +621,7 @@ func cmdLoad(ctx context.Context) error {
 	api.dataRoot = absDataDir
 	api.allowedDirs = allowedDirs
 
-	total := loadAll(loadCtx, loadCancel, db, litmus, tracker, api, cache, loadDirs, *source, *workers, *rescan, *maxAnalyzed, *experimentTag, wd)
+	total := loadAll(loadCtx, loadCancel, db, litmus, tracker, api, cache, loadDirs, *source, *hashWorkers, *rescan, *maxAnalyzed, *experimentTag, wd)
 	slog.Info("file walk complete, serving API until interrupted", "samples", total)
 
 	// Block until interrupted — workers are still draining the analysis queue.

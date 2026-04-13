@@ -54,7 +54,7 @@ func newLitmusServer(cfg litmusConfig) *litmusServer {
 		cfg.Bin = "litmus"
 	}
 	if cfg.MaxWorkers < 1 {
-		cfg.MaxWorkers = max(1, runtime.NumCPU()*3/4)
+		cfg.MaxWorkers = max(2, runtime.NumCPU()/4)
 	}
 	return &litmusServer{
 		bin:         cfg.Bin,
