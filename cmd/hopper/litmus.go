@@ -166,7 +166,10 @@ func (s *litmusServer) Start(ctx context.Context) error {
 		if s.cmd != nil && s.cmd.Process != nil {
 			slog.Info("restarting litmus with updated binary", "pid", s.cmd.Process.Pid)
 			killProcess("failed to kill litmus for rebuild", s.cmd.Process, "pid", s.cmd.Process.Pid)
-			waitCommand("litmus exited for rebuild", s.cmd, "pid", s.cmd.Process.Pid)
+			// Do NOT call waitCommand here — the Monitor goroutine may
+			// have already reaped the process via waitExit, and
+			// cmd.Wait() is not safe for concurrent use. The kill is
+			// best-effort; if the process is already dead, that's fine.
 			s.cmd = nil
 			s.pid.Store(0)
 		}
