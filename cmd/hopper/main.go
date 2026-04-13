@@ -920,7 +920,7 @@ func runDirPipeline(
 func runDashboard(
 	ctx context.Context,
 	progress *loadProgress,
-	litmus *litmusServer,
+	_ *litmusServer,
 	mp *monitorPool,
 	start time.Time,
 	startAnalyzed int64,
@@ -933,7 +933,15 @@ func runDashboard(
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	var prevAnalyzed int64
+	// Ring buffer for 15-minute rolling rate (one sample per tick).
+	type sample struct {
+		t      time.Time
+		count  int64
+		byNode []int64
+	}
+	const maxSamples = 120 // 10s * 120 = 20 minutes of history
+	var samples []sample
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -945,21 +953,65 @@ func runDashboard(
 
 		analyzedAbs := progress.analyzed.Load()
 		sessionAnalyzed := max(analyzedAbs-startAnalyzed, 0)
-		recentRate := float64(analyzedAbs-prevAnalyzed) / interval.Seconds()
-		prevAnalyzed = analyzedAbs
-
 		walked := progress.walked.Load()
 		hashedN := progress.hashed.Load()
 		inserted := progress.inserted.Load()
 		skipped := progress.skipped.Load()
 		hashDone := hashedN + progress.tooSmall.Load() + progress.tooLarge.Load() + progress.hashErrors.Load()
 
-		// Session target: how many new samples we queued for analysis
-		// this run, capped at --max-analyzed if set.
 		analyzeTarget := max(progress.queued.Load()-startAnalyzed, 0)
 		if maxAnalyzed > 0 && int64(maxAnalyzed) < analyzeTarget {
 			analyzeTarget = int64(maxAnalyzed)
 		}
+
+		// Record sample (with per-node counts) and compute 15-minute rolling rates.
+		now := time.Now()
+		s := sample{t: now, count: sessionAnalyzed}
+		if len(monitors) > 0 {
+			s.byNode = make([]int64, len(monitors))
+			for i, m := range monitors {
+				s.byNode[i] = m.Analyzed()
+			}
+		}
+		samples = append(samples, s)
+		if len(samples) > maxSamples {
+			samples = samples[len(samples)-maxSamples:]
+		}
+
+		var rate15m float64
+		var nodeRates map[string]float64
+		if len(samples) >= 2 {
+			cutoff := now.Add(-15 * time.Minute)
+			oldest := samples[0]
+			for _, ss := range samples {
+				if !ss.t.Before(cutoff) {
+					oldest = ss
+					break
+				}
+			}
+			if dt := now.Sub(oldest.t).Seconds(); dt > 5 {
+				rate15m = float64(sessionAnalyzed-oldest.count) / dt
+				latest := samples[len(samples)-1]
+				// Per-node rates: compare matching indices up to the
+				// shorter of the two slices. This handles monitor
+				// count changes (nodes joining/leaving) gracefully.
+				minLen := len(latest.byNode)
+				if len(oldest.byNode) < minLen {
+					minLen = len(oldest.byNode)
+				}
+				if minLen > 0 {
+					nodeRates = make(map[string]float64, len(monitors))
+					for i, m := range monitors {
+						if i < minLen {
+							nodeRates[m.Name()] = float64(latest.byNode[i]-oldest.byNode[i]) / dt
+						}
+					}
+				}
+			}
+		}
+
+		totalTarget := startAnalyzed + analyzeTarget
+		totalDone := startAnalyzed + sessionAnalyzed
 
 		if !isTTY() {
 			attrs := []any{
@@ -974,120 +1026,112 @@ func runDashboard(
 			if analyzeTarget > 0 {
 				attrs = append(attrs, "analyze_pct", fmt.Sprintf("%.0f%%", float64(sessionAnalyzed)/float64(analyzeTarget)*100))
 			}
+			if rate15m > 0 {
+				attrs = append(attrs, "rate_15m", fmt.Sprintf("%.1f/s", rate15m))
+			}
 			slog.Info("load progress", attrs...)
 			logPoolStatus(monitors)
 			continue
 		}
 
+		// TTY dashboard
+		var etaStr string
+		if rate15m > 0.1 && analyzeTarget > sessionAnalyzed {
+			remaining := analyzeTarget - sessionAnalyzed
+			etaDur := time.Duration(float64(remaining)/rate15m) * time.Second
+			etaStr = formatETA(etaDur)
+		}
+
+		pct := 0.0
+		if totalTarget > 0 {
+			pct = float64(totalDone) / float64(totalTarget) * 100
+			if pct > 100 {
+				pct = 100
+			}
+		}
+
 		writeStdout("\033[H\033[2J")
-		writeStdoutf("\033[1mHopper Loading Dashboard\033[0m (%s)\n", time.Since(start).Round(time.Second))
-		writeStdoutLine(strings.Repeat("─", 60))
-		drawBar("Hashing  ", hashDone, walked, "", "\033[34m")
-		drawBar("Insertion", inserted+skipped, hashedN, "", "\033[32m")
 
-		var analyzeInfo string
-		if recentRate > 0 {
-			if remaining := analyzeTarget - sessionAnalyzed; remaining > 0 {
-				eta := (time.Duration(float64(remaining)/recentRate) * time.Second).Round(time.Second)
-				analyzeInfo = fmt.Sprintf("%.1f/s ETA %s", recentRate, eta)
+		// Header line: app name, elapsed, progress, rate, ETA
+		header := fmt.Sprintf("\033[1mhopper\033[0m  %s", time.Since(start).Round(time.Second))
+		right := fmt.Sprintf("%s / %s  %.0f%%", fmtN(totalDone), fmtN(totalTarget), pct)
+		if rate15m > 0.1 {
+			right += fmt.Sprintf("  %.1f/s", rate15m)
+		}
+		if etaStr != "" {
+			right += "  ETA " + etaStr
+		}
+		// Pad to ~80 columns.
+		pad := 78 - len(header) - len(right) + 8 // +8 for ANSI escape codes
+		if pad < 2 {
+			pad = 2
+		}
+		writeStdoutf("%s%s%s\n\n", header, strings.Repeat(" ", pad), right)
+
+		// Nodes
+		if len(monitors) > 0 {
+			sorted := sortedMonitors(monitors)
+
+			nameWidth := 4
+			for _, m := range sorted {
+				if w := len(shortNodeName(m.Name())); w > nameWidth {
+					nameWidth = w
+				}
+			}
+
+			// Column header
+			writeStdoutf("  \033[2m  %-*s  tasks    rate   load    rss / total\033[0m\n",
+				nameWidth, "node")
+
+			for _, m := range sorted {
+				snap := m.Snapshot()
+				name := shortNodeName(m.Name())
+				if snap == nil {
+					writeStdoutf("  \033[2m○\033[0m %-*s  \033[2mpending\033[0m\n", nameWidth, name)
+					continue
+				}
+
+				dot := "\033[32m●\033[0m"
+				if !snap.Reachable {
+					dot = "\033[31m●\033[0m"
+					writeStdoutf("  %s %-*s  \033[31mdown  %s\033[0m\n",
+						dot, nameWidth, name, snap.LastErr)
+					continue
+				}
+
+				switch snap.Health.Status {
+				case "degraded", "failed":
+					dot = "\033[33m○\033[0m"
+				case "starting", "building":
+					dot = "\033[33m●\033[0m"
+				}
+
+				mem := fmtMemGB(snap.Health.RSSMB, snap.TotalMemMB)
+				tasks := fmt.Sprintf("%d/%d", snap.Health.LiveTasks, m.Slots())
+				issues := nodeIssues(snap)
+
+				rateStr := "    —"
+				if r := nodeRates[m.Name()]; r > 0.05 {
+					rateStr = fmt.Sprintf("%4.1f/s", r)
+				}
+
+				line := fmt.Sprintf("  %s %-*s  %-7s  %s  %5.1f  %s",
+					dot, nameWidth, name, tasks, rateStr, snap.Health.LoadAvg, mem)
+				if issues != "" {
+					line += fmt.Sprintf("  \033[33m%s\033[0m", issues)
+				}
+				writeStdoutLine(line)
 			}
 		}
-		totalAnalyzeTarget := startAnalyzed + analyzeTarget
-		drawBarWithPrior("Analysis ", startAnalyzed, sessionAnalyzed, totalAnalyzeTarget, analyzeInfo, "\033[33m")
-		writeStdoutLine(strings.Repeat("─", 60))
 
+		// Footer
+		writeStdoutf("\n  %s errors · %s walked · %s cache hits\n",
+			fmtN(progress.errors.Load()), fmtN(walked), fmtN(progress.cacheHits.Load()))
+
+		// Last error at the bottom, untruncated
 		if last, ok := progress.lastErr.Load().(string); ok && last != "" {
-			writeStdoutf("\033[31mRecent Error:\033[0m %s\n", last)
-			writeStdoutLine(strings.Repeat("─", 60))
+			writeStdoutf("\n  \033[31m%s\033[0m\n", last)
 		}
-		renderPoolBlock(monitors)
-		// Local-only diagnostic: which file the slowest local worker is on
-		// right now. Remotes don't expose this (no /_/requests poll path).
-		if litmus != nil {
-			summary := litmus.workerSummary()
-			if summary.Busy > 0 && summary.OldestFile != "" {
-				writeStdoutf("oldest local: %s (%s)\n",
-					summary.OldestFile,
-					(time.Duration(summary.OldestMS) * time.Millisecond).Round(time.Second))
-			}
-		}
-		writeStdoutf("Errors: %d | Walked: %d | Cache Hits: %d\n",
-			progress.errors.Load(), walked, progress.cacheHits.Load())
-	}
-}
-
-// renderPoolBlock writes a uniform per-node table for the TTY dashboard.
-// Stays at zero allocation in the steady-state by reading each monitor's
-// atomic snapshot pointer; never blocks on a slow node.
-func renderPoolBlock(monitors []*nodeMonitor) {
-	if len(monitors) == 0 {
-		return
-	}
-	totalSlots := 0
-	for _, m := range monitors {
-		totalSlots += m.Slots()
-	}
-
-	// Right-pad node names so the columns line up regardless of address length.
-	nameWidth := 4
-	for _, m := range monitors {
-		if w := len(m.Name()); w > nameWidth {
-			nameWidth = w
-		}
-	}
-
-	writeStdoutLine(strings.Repeat("─", 60))
-	writeStdoutf("\033[1mLitmus Pool:\033[0m %d nodes, %d slots\n", len(monitors), totalSlots)
-	for _, m := range monitors {
-		snap := m.Snapshot()
-		name := m.Name()
-		slots := m.Slots()
-		if snap == nil {
-			writeStdoutf("  %-*s  \033[2mpending…\033[0m\n", nameWidth, name)
-			continue
-		}
-		statusColor := poolStatusColor(snap)
-		statusLabel := poolStatusLabel(snap)
-		uptime := formatUptime(snap.Health.UptimeSecs)
-
-		if !snap.Reachable {
-			// Down: show last error inline; suppress stale numbers.
-			writeStdoutf("  %-*s  %s%-9s\033[0m  %s\n",
-				nameWidth, name, statusColor, statusLabel, truncate(snap.LastErr, 40))
-			continue
-		}
-		// Append the litmus-supplied reason whenever the node isn't a
-		// plain "ok" — that's how the operator finds out *why* something
-		// is saturated/degraded/failed without having to curl /_/health.
-		reason := ""
-		if snap.Health.Reason != "" && snap.Health.Status != "ok" {
-			reason = "  \033[2m" + snap.Health.Reason + "\033[0m"
-		}
-		// Surface orphan count and restart count when non-zero.
-		extra := ""
-		if snap.Health.OrphanedTasks > 0 {
-			extra += fmt.Sprintf("  \033[33morphaned:%d\033[0m", snap.Health.OrphanedTasks)
-		}
-		if snap.Restarts > 0 {
-			extra += fmt.Sprintf("  \033[33mrestarts:%d\033[0m", snap.Restarts)
-		}
-		if snap.TraitsCommit != "" {
-			tc := snap.TraitsCommit
-			if len(tc) > 8 {
-				tc = tc[:8]
-			}
-			extra += fmt.Sprintf("  traits:%s", tc)
-		}
-		writeStdoutf("  %-*s  %s%-9s\033[0m  up %-9s  load %5.2f  rss %4d MB  %2d/%-d%s%s\n",
-			nameWidth, name,
-			statusColor, statusLabel,
-			uptime,
-			snap.Health.LoadAvg,
-			snap.Health.RSSMB,
-			snap.Health.LiveTasks, slots,
-			reason,
-			extra,
-		)
 	}
 }
 
@@ -1129,35 +1173,6 @@ func logPoolStatus(monitors []*nodeMonitor) {
 		}
 		slog.Info("litmus node", attrs...)
 	}
-}
-
-func poolStatusColor(snap *nodeStatusSnapshot) string {
-	if !snap.Reachable {
-		return "\033[31m" // red
-	}
-	switch snap.Health.Status {
-	case "ok", "saturated":
-		// Saturated = all worker slots busy. That's the target steady
-		// state under load, not an unhealthy condition, so colour it the
-		// same as ok.
-		return "\033[32m" // green
-	case "starting", "building":
-		return "\033[33m" // yellow
-	case "degraded", "failed":
-		return "\033[33m" // yellow
-	default:
-		return "\033[37m" // gray for unknown
-	}
-}
-
-func poolStatusLabel(snap *nodeStatusSnapshot) string {
-	if !snap.Reachable {
-		return "down"
-	}
-	if snap.Health.Status == "" {
-		return "ok"
-	}
-	return snap.Health.Status
 }
 
 // formatUptime renders seconds as h:mm:ss (or m:ss for short uptimes). Used
@@ -1893,39 +1908,3 @@ func isTTY() bool {
 	return (fileInfo.Mode() & os.ModeCharDevice) != 0
 }
 
-// drawBarWithPrior renders a progress bar with two segments: dim for prior
-// work (from previous runs) and bright for this session's progress.
-func drawBarWithPrior(label string, prior, session, total int64, info string, color string) {
-	const width = 20
-	var priorPct, sessionPct float64
-	if total > 0 {
-		priorPct = float64(prior) / float64(total)
-		sessionPct = float64(session) / float64(total)
-	}
-	if priorPct+sessionPct > 1.0 {
-		sessionPct = 1.0 - priorPct
-	}
-	priorFill := max(int(float64(width)*priorPct), 0)
-	sessionFill := max(int(float64(width)*sessionPct), 0)
-	empty := width - priorFill - sessionFill
-	if empty < 0 {
-		empty = 0
-	}
-	bar := strings.Repeat("▓", priorFill) + strings.Repeat("█", sessionFill) + strings.Repeat("░", empty)
-	combinedPct := (priorPct + sessionPct) * 100
-	writeStdoutf("%s%s\033[0m [%s] %3.0f%% (%d/%d) %s\n", color, label, bar, combinedPct, prior+session, total, info)
-}
-
-func drawBar(label string, current, total int64, info string, color string) {
-	const width = 20
-	var pct float64
-	if total > 0 {
-		pct = float64(current) / float64(total)
-	}
-	if pct > 1.0 {
-		pct = 1.0
-	}
-	filled := max(int(float64(width)*pct), 0)
-	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
-	writeStdoutf("%s%s\033[0m [%s] %3.0f%% (%d/%d) %s\n", color, label, bar, pct*100, current, total, info)
-}

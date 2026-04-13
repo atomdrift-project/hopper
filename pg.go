@@ -438,6 +438,7 @@ func (db *DB) seedCandidatesInPathsPG(ctx context.Context, prefixes []string, la
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
 		 WHERE status = '' AND label = $1 AND skip = '' AND score `+op+` $2
+		   AND cleave_result IS NOT NULL
 		   AND path LIKE ANY($3)
 		 ORDER BY updated_at ASC LIMIT $4`,
 		label, score, patterns, limit)

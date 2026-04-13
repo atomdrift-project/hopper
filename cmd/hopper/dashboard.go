@@ -6,6 +6,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -71,6 +72,44 @@ func (wd *webDashboard) recordSample(total int64) {
 	}
 }
 
+// ratesOver returns the average files/sec over the most recent window,
+// both combined and per-node. Per-node rates are keyed by monitor index
+// in the order monitors were recorded.
+func (wd *webDashboard) ratesOver(window time.Duration) (combined float64, perNode []float64) {
+	wd.mu.Lock()
+	n := len(wd.samples)
+	if n < 2 {
+		wd.mu.Unlock()
+		return 0, nil
+	}
+	latest := wd.samples[n-1]
+	cutoff := latest.t.Add(-window)
+	oldest := wd.samples[0]
+	for _, s := range wd.samples {
+		if !s.t.Before(cutoff) {
+			oldest = s
+			break
+		}
+	}
+	wd.mu.Unlock()
+	dt := latest.t.Sub(oldest.t).Seconds()
+	if dt < 5 {
+		return 0, nil
+	}
+	combined = float64(latest.total-oldest.total) / dt
+	minLen := len(latest.byNode)
+	if len(oldest.byNode) < minLen {
+		minLen = len(oldest.byNode)
+	}
+	if minLen > 0 {
+		perNode = make([]float64, minLen)
+		for i := range minLen {
+			perNode[i] = float64(latest.byNode[i]-oldest.byNode[i]) / dt
+		}
+	}
+	return combined, perNode
+}
+
 // throughputSeries derives per-interval files/sec from the sample history.
 // Intervals wider than 30s are zeroed to avoid spikes after page inactivity.
 func (wd *webDashboard) throughputSeries() (combined []float64, perNode [][]float64) {
@@ -129,6 +168,10 @@ func startWebDashboard(ctx context.Context, addr string, wd *webDashboard) error
 	return nil
 }
 
+// ---------------------------------------------------------------------------
+// Web dashboard
+// ---------------------------------------------------------------------------
+
 const css = `
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -138,98 +181,73 @@ const css = `
   --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
   --green:#34d399;--amber:#fbbf24;--red:#f87171;--blue:#818cf8;
 }
-body{font-family:var(--sans);background:var(--bg);color:#c4cdde;
-  font-size:13px;line-height:1.6;padding:2.5rem 3rem;max-width:1000px}
-a{color:inherit;text-decoration:none}
+body{font-family:var(--sans);background:var(--bg);color:var(--text);
+  font-size:13px;line-height:1.6;padding:2.5rem 3rem;max-width:900px}
 
 /* header */
-.hdr{display:flex;align-items:baseline;gap:.75rem;
-  padding-bottom:1.25rem;margin-bottom:2rem;border-bottom:1px solid var(--border)}
-.hdr-title{font-size:.75rem;font-weight:700;letter-spacing:.12em;
+.hdr{padding-bottom:1.5rem;margin-bottom:2rem;border-bottom:1px solid var(--border)}
+.hdr-top{display:flex;align-items:baseline;gap:1rem;margin-bottom:1.25rem}
+.hdr-title{font-size:.7rem;font-weight:700;letter-spacing:.12em;
   text-transform:uppercase;color:var(--sub)}
-.hdr-time{font-family:var(--mono);font-size:.85rem;color:#c4cdde}
-.hdr-eta{font-family:var(--mono);font-size:.85rem;color:var(--sub)}
+.hdr-time{font-family:var(--mono);font-size:.82rem;color:var(--sub)}
 
-/* section label */
+/* progress */
+.progress{margin-bottom:.75rem}
+.progress-stats{display:flex;justify-content:space-between;
+  align-items:baseline;margin-bottom:.5rem}
+.progress-main{font-family:var(--mono);font-size:1.1rem;font-weight:600}
+.progress-pct{color:var(--text)}
+.progress-detail{font-family:var(--mono);font-size:.82rem;color:var(--sub)}
+.progress-detail em{font-style:normal;color:var(--text)}
+.track{height:4px;background:var(--border);border-radius:2px;overflow:hidden;display:flex}
+.fill{height:100%;border-radius:2px;transition:width .5s ease;flex-shrink:0}
+
+/* section */
+section{margin-bottom:2rem}
 .label{font-size:.65rem;font-weight:700;letter-spacing:.12em;
   text-transform:uppercase;color:var(--sub);margin-bottom:.75rem}
 
-/* pipeline bars */
-section{margin-bottom:2.25rem}
-.stage{margin-bottom:.9rem}
-.stage-meta{display:flex;justify-content:space-between;
-  align-items:baseline;margin-bottom:.35rem}
-.stage-name{font-size:.72rem;font-weight:600;letter-spacing:.06em;
-  text-transform:uppercase;color:var(--sub)}
-.stage-stat{font-family:var(--mono);font-size:.78rem;color:var(--sub)}
-.stage-stat em{font-style:normal;color:#c4cdde}
-.track{height:3px;background:var(--border);border-radius:2px;overflow:hidden;display:flex}
-.fill{height:100%;border-radius:2px;transition:width .5s ease;flex-shrink:0}
+/* nodes */
+table{width:100%;border-collapse:collapse}
+thead th{font-size:.65rem;font-weight:600;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--sub);
+  padding:.25rem .6rem .5rem;text-align:left;border-bottom:1px solid var(--border)}
+tbody tr{border-bottom:1px solid var(--border)}
+tbody tr:last-child{border-bottom:none}
+tbody td{padding:.5rem .6rem;font-family:var(--mono);font-size:.8rem;color:var(--sub)}
+td.nn{font-family:var(--sans);color:var(--text);font-weight:500;
+  font-size:.82rem;white-space:nowrap}
+td.hi{color:var(--text)}
+td.warn{color:var(--amber)}
+
+/* status dot */
+.dot{font-size:.5rem;vertical-align:middle;margin-right:.35rem}
+.dot-ok{color:var(--green)}
+.dot-warn{color:var(--amber)}
+.dot-bad{color:var(--red)}
+.dot-off{color:var(--sub)}
+
+/* error */
+.err{background:#1a0d0d;border:1px solid #3d1515;border-radius:4px;
+  padding:.5rem .75rem;font-size:.78rem;color:#f87171;margin-top:1.5rem;
+  word-break:break-all;font-family:var(--mono)}
 
 /* graph */
 .graph-box{background:var(--surface);border:1px solid var(--border);
   border-radius:6px;padding:.75rem 1rem 0}
 .graph-legend{display:flex;gap:1rem;padding:.5rem 0;flex-wrap:wrap}
 .legend-item{display:flex;align-items:center;gap:.35rem;
-  font-size:.75rem;color:var(--sub);font-family:var(--mono)}
+  font-size:.72rem;color:var(--sub);font-family:var(--mono)}
 .legend-swatch{width:12px;height:2px;border-radius:1px}
 
-/* error */
-.err{background:#1a0d0d;border:1px solid #3d1515;border-radius:4px;
-  padding:.5rem .75rem;font-size:.82rem;color:#f87171;margin-bottom:1.5rem}
-
-/* pool */
-.pool-meta{display:flex;gap:1rem;align-items:baseline;margin-bottom:1rem}
-.pool-stat{font-family:var(--mono);font-size:.8rem;color:var(--sub)}
-table{width:100%;border-collapse:collapse}
-thead th{font-size:.65rem;font-weight:600;letter-spacing:.1em;
-  text-transform:uppercase;color:var(--sub);
-  padding:.25rem .75rem .6rem;text-align:left;border-bottom:1px solid var(--border)}
-tbody tr.node-row{border-bottom:1px solid var(--border)}
-tbody tr.node-row:last-of-type{border-bottom:none}
-tbody td{padding:.55rem .75rem;font-family:var(--mono);font-size:.8rem;color:var(--sub)}
-td.node-name{font-family:var(--sans);color:#c4cdde;font-weight:500;
-  font-size:.82rem;white-space:nowrap}
-td.hi{color:#c4cdde}
-
-/* status dot */
-.dot::before{content:"●";font-size:.5rem;vertical-align:middle;margin-right:.4rem}
-.s-ok .dot::before,.s-saturated .dot::before{color:var(--green)}
-.s-starting .dot::before,.s-degraded .dot::before{color:var(--amber)}
-.s-down .dot::before,.s-failed .dot::before{color:var(--red)}
-.s-pending .dot::before{color:var(--sub)}
-
-/* age warnings */
-.age-warn{color:var(--amber)}
-.age-alert{color:#fb923c}
-.orphan-warn{color:var(--amber)}
-
-/* in-flight jobs */
-tr.jobs-row td{padding:.1rem .75rem .55rem;border-bottom:1px solid var(--border)}
-details.jobs-fold{margin:0}
-details.jobs-fold summary{cursor:pointer;font-size:.7rem;color:var(--sub);
-  font-family:var(--mono);list-style:none;user-select:none}
-details.jobs-fold summary::-webkit-details-marker{display:none}
-details.jobs-fold summary::before{content:"▸ ";opacity:.5}
-details.jobs-fold[open] summary::before{content:"▾ "}
-.job{display:block;font-size:.75rem;font-family:var(--mono);
-  padding:.1rem 0;white-space:nowrap}
-.job-file{color:#8896b0}
-.job-phase{color:var(--amber);margin-left:.3em;font-size:.85em}
-.job-age{color:var(--sub);margin-left:.5em}
-
 /* footer */
-footer{display:flex;gap:1.5rem;padding-top:1.25rem;
-  border-top:1px solid var(--border);
+footer{padding-top:1rem;border-top:1px solid var(--border);
   font-family:var(--mono);font-size:.75rem;color:var(--sub)}
 `
 
 func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
-	// Snapshot cfg fields under the read lock so configure() can be called
-	// safely from another goroutine while the server is already running.
 	wd.cfgMu.RLock()
 	progress := wd.progress
-	litmus := wd.litmus
 	mp := wd.mp
 	start := wd.start
 	startAnalyzed := wd.startAnalyzed
@@ -241,75 +259,97 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 		monitors = mp.All()
 	}
 
-	// Show a minimal "starting up" page until configure() has been called.
 	if progress == nil {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = fmt.Fprint(w,
 			`<!DOCTYPE html><html lang="en"><head>`+
 				`<meta charset="utf-8"><meta http-equiv="refresh" content="2">`+
-				`<title>Hopper</title><style>`+css+`</style></head><body>`+
-				`<div class="hdr"><span class="hdr-title">Hopper</span>`+
-				`<span class="hdr-eta">starting&hellip;</span></div>`+
+				`<title>hopper</title><style>`+css+`</style></head><body>`+
+				`<div class="hdr"><div class="hdr-top"><span class="hdr-title">Hopper</span>`+
+				`<span class="hdr-time">starting&hellip;</span></div></div>`+
 				`</body></html>`)
 		return
 	}
 
 	elapsed := time.Since(start).Round(time.Second)
-
 	analyzedAbs := progress.analyzed.Load()
 	sessionAnalyzed := max(analyzedAbs-startAnalyzed, 0)
 	walked := progress.walked.Load()
-	hashedN := progress.hashed.Load()
-	inserted := progress.inserted.Load()
-	skipped := progress.skipped.Load()
-	hashDone := hashedN + progress.tooSmall.Load() + progress.tooLarge.Load() + progress.hashErrors.Load()
 
 	analyzeTarget := max(progress.queued.Load()-startAnalyzed, 0)
 	if maxAnalyzed > 0 && int64(maxAnalyzed) < analyzeTarget {
 		analyzeTarget = int64(maxAnalyzed)
 	}
+	totalTarget := startAnalyzed + analyzeTarget
+	totalDone := startAnalyzed + sessionAnalyzed
 
 	wd.recordSample(sessionAnalyzed)
+	rate, nodeRates := wd.ratesOver(15 * time.Minute)
+
+	// Build monitor-index → rate map for the node table.
+	nodeRateByName := make(map[string]float64, len(monitors))
+	for i, m := range monitors {
+		if i < len(nodeRates) {
+			nodeRateByName[m.Name()] = nodeRates[i]
+		}
+	}
 
 	var etaStr string
-	var analyzeRate float64
-	if elapsedSecs := time.Since(start).Seconds(); sessionAnalyzed > 0 && analyzeTarget > sessionAnalyzed && elapsedSecs > 5 {
-		analyzeRate = float64(sessionAnalyzed) / elapsedSecs
-		etaDur := time.Duration(float64(analyzeTarget-sessionAnalyzed)/analyzeRate) * time.Second
+	if rate > 0.1 && analyzeTarget > sessionAnalyzed {
+		remaining := analyzeTarget - sessionAnalyzed
+		etaDur := time.Duration(float64(remaining)/rate) * time.Second
 		etaStr = formatETA(etaDur)
 	}
 
-	var b strings.Builder
+	pct := 0.0
+	if totalTarget > 0 {
+		pct = math.Min(float64(totalDone)/float64(totalTarget)*100, 100)
+	}
 
+	var b strings.Builder
 	b.WriteString(`<!DOCTYPE html><html lang="en"><head>` +
 		`<meta charset="utf-8"><meta http-equiv="refresh" content="5">` +
-		`<title>Hopper</title><style>` + css + `</style></head><body>`)
+		`<title>hopper</title><style>` + css + `</style></head><body>`)
 
-	// Header
+	// Header + progress
 	b.WriteString(`<div class="hdr">`)
+	b.WriteString(`<div class="hdr-top">`)
 	b.WriteString(`<span class="hdr-title">Hopper</span>`)
 	fmt.Fprintf(&b, `<span class="hdr-time">%s</span>`, elapsed)
-	if etaStr != "" {
-		fmt.Fprintf(&b, `<span class="hdr-eta">ETA %s</span>`, etaStr)
-	}
 	b.WriteString(`</div>`)
 
-	// Pipeline
-	b.WriteString(`<section><div class="label">Pipeline</div>`)
-	writePipelineBar(&b, "Hashing", hashDone, walked, "#818cf8")
-	writePipelineBar(&b, "Insertion", inserted+skipped, hashedN, "#34d399")
-	// Analysis bar: show previously-analyzed samples as a dim segment, then
-	// this session's progress in the main color, against the total corpus.
-	totalAnalyzeTarget := startAnalyzed + analyzeTarget
-	var analyzeInfo string
-	if analyzeRate > 0 {
-		analyzeInfo = fmt.Sprintf("%.1f/s", analyzeRate)
-		if etaStr != "" {
-			analyzeInfo += " ETA " + etaStr
-		}
+	// Big progress
+	b.WriteString(`<div class="progress">`)
+	b.WriteString(`<div class="progress-stats">`)
+	fmt.Fprintf(&b, `<span class="progress-main"><span class="progress-pct">%.0f%%</span> analyzed</span>`, pct)
+
+	// Rate + ETA
+	b.WriteString(`<span class="progress-detail">`)
+	fmt.Fprintf(&b, `<em>%s</em> / %s`, fmtN(totalDone), fmtN(totalTarget))
+	if rate > 0.1 {
+		fmt.Fprintf(&b, ` &middot; <em>%.1f</em>/s`, rate)
 	}
-	writePipelineBarWithPrior(&b, "Analysis", startAnalyzed, sessionAnalyzed, totalAnalyzeTarget, analyzeInfo)
-	b.WriteString(`</section>`)
+	if etaStr != "" {
+		fmt.Fprintf(&b, ` &middot; ETA <em>%s</em>`, etaStr)
+	}
+	b.WriteString(`</span>`)
+	b.WriteString(`</div>`)
+
+	// Bar
+	priorPct := 0.0
+	sessionPct := 0.0
+	if totalTarget > 0 {
+		priorPct = math.Min(float64(startAnalyzed)/float64(totalTarget)*100, 100)
+		sessionPct = math.Min(float64(sessionAnalyzed)/float64(totalTarget)*100, 100-priorPct)
+	}
+	fmt.Fprintf(&b,
+		`<div class="track">`+
+			`<div class="fill" style="width:%.2f%%;background:#5a5230"></div>`+
+			`<div class="fill" style="width:%.2f%%;background:#fbbf24"></div>`+
+			`</div>`,
+		priorPct, sessionPct)
+	b.WriteString(`</div>`) // .progress
+	b.WriteString(`</div>`) // .hdr
 
 	// Throughput graph
 	combined, perNode := wd.throughputSeries()
@@ -323,231 +363,164 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 		b.WriteString(`</section>`)
 	}
 
-	// Error
-	if last, ok := progress.lastErr.Load().(string); ok && last != "" {
-		fmt.Fprintf(&b, `<div class="err">%s</div>`, htmlEscape(last))
-	}
-
-	// Pool
+	// Nodes
 	if len(monitors) > 0 {
-		totalSlots := 0
-		for _, m := range monitors {
-			totalSlots += m.Slots()
-		}
-		b.WriteString(`<section><div class="label">Pool</div>`)
-		b.WriteString(`<div class="pool-meta">`)
-		fmt.Fprintf(&b, `<span class="pool-stat">%d nodes</span>`, len(monitors))
-		fmt.Fprintf(&b, `<span class="pool-stat">%d slots</span>`, totalSlots)
-		b.WriteString(`</div>`)
-
+		b.WriteString(`<section><div class="label">Nodes</div>`)
 		b.WriteString(`<table><thead><tr>` +
-			`<th>Node</th><th>Status</th><th>Uptime</th>` +
-			`<th>Load</th><th>Memory</th><th>Tasks</th>` +
-			`<th>Orphans</th><th>Done</th><th>Errors</th><th>Last</th>` +
-			`<th>Version</th><th>Traits</th><th></th>` +
+			`<th>Node</th><th>Tasks</th><th>Rate</th><th>Load</th>` +
+			`<th>Memory</th><th></th>` +
 			`</tr></thead><tbody>`)
 
-		const ncols = 13
-		for _, m := range monitors {
+		sorted := sortedMonitors(monitors)
+		for _, m := range sorted {
 			snap := m.Snapshot()
-			name := htmlEscape(m.Name())
+			name := shortNodeName(m.Name())
 			if snap == nil {
-				fmt.Fprintf(&b, `<tr class="node-row s-pending"><td class="node-name"><span class="dot"></span>%s</td>`+
-					`<td>—</td><td colspan="%d"></td></tr>`, name, ncols-2)
+				fmt.Fprintf(&b, `<tr><td class="nn"><span class="dot dot-off">●</span>%s</td>`+
+					`<td colspan="5">pending</td></tr>`, htmlEscape(name))
 				continue
 			}
 
-			status := poolStatusLabel(snap)
-			statusClass := "s-" + status
-			traits := snap.TraitsCommit
-			if len(traits) > 8 {
-				traits = traits[:8]
-			}
-			if traits == "" {
-				traits = "—"
-			}
-
-			detail := ""
-			if snap.Health.Reason != "" && snap.Health.Status != "ok" {
-				detail = htmlEscape(snap.Health.Reason)
-			}
-			if snap.Restarts > 0 {
-				detail += fmt.Sprintf(" restarts:%d", snap.Restarts)
-			}
-
-			errCount := m.Errors()
-			lastAge := m.LastCompletedAge()
-			lastStr := "—"
-			lastClass := ""
-			if lastAge > 0 {
-				lastStr = shortDuration(lastAge) + " ago"
-				switch {
-				case lastAge >= 10*time.Minute:
-					lastClass = " age-alert"
-				case lastAge >= 5*time.Minute:
-					lastClass = " age-warn"
-				}
-			}
-
-			orphans := snap.Health.OrphanedTasks
-			orphanStr := "—"
-			orphanClass := ""
-			if orphans > 0 {
-				orphanStr = fmt.Sprintf("%d", orphans)
-				orphanClass = " orphan-warn"
-			}
-
+			dotClass := nodeDotClass(snap)
 			if !snap.Reachable {
 				fmt.Fprintf(&b,
-					`<tr class="node-row %s"><td class="node-name"><span class="dot"></span>%s</td>`+
-						`<td>%s</td><td colspan="%d"></td><td>%s</td></tr>`,
-					statusClass, name, status, ncols-3, htmlEscape(snap.LastErr))
-			} else {
-				memStr := fmt.Sprintf("%d MB", snap.Health.RSSMB)
-				if snap.TotalMemMB > 0 {
-					memStr = fmt.Sprintf("%d / %d MB", snap.Health.RSSMB, snap.TotalMemMB)
-				}
-
-				fmt.Fprintf(&b,
-					`<tr class="node-row %s">`+
-						`<td class="node-name"><span class="dot"></span>%s</td>`+
-						`<td>%s</td>`+
-						`<td>%s</td>`+
-						`<td class="hi">%.1f</td>`+
-						`<td>%s</td>`+
-						`<td>%d/%d</td>`+
-						`<td class="%s">%s</td>`+
-						`<td class="hi">%s</td>`+
-						`<td>%s</td>`+
-						`<td class="%s">%s</td>`+
-						`<td>%s</td>`+
-						`<td>%s</td>`+
-						`<td>%s</td>`+
-						`</tr>`,
-					statusClass, name, status,
-					formatUptime(snap.Health.UptimeSecs),
-					snap.Health.LoadAvg,
-					memStr,
-					snap.Health.LiveTasks, m.Slots(),
-					orphanClass, orphanStr,
-					fmtN(m.Analyzed()),
-					fmtN(errCount),
-					lastClass, lastStr,
-					htmlEscape(snap.Version),
-					htmlEscape(traits),
-					detail,
-				)
+					`<tr><td class="nn"><span class="dot %s">●</span>%s</td>`+
+						`<td>—</td><td>—</td><td>—</td><td>—</td><td class="warn">%s</td></tr>`,
+					dotClass, htmlEscape(name), htmlEscape(truncate(snap.LastErr, 60)))
+				continue
 			}
 
-			if stuck := snap.Health.StuckRequests; len(stuck) > 0 {
-				fmt.Fprintf(&b, `<tr class="jobs-row"><td></td><td colspan="%d">`, ncols-1)
-				fmt.Fprintf(&b, `<details class="jobs-fold" open><summary class="orphan-warn">%d stuck (>60s)</summary>`, len(stuck))
-				for _, sr := range stuck {
-					age := time.Duration(sr.ElapsedMs) * time.Millisecond
-					shortName := sr.Name
-					if idx := strings.LastIndex(sr.Name, "/"); idx >= 0 {
-						shortName = sr.Name[idx+1:]
-					}
-					phase := sr.Phase
-					if phase == "" {
-						phase = "?"
-					}
-					timedOut := ""
-					if sr.TimedOut {
-						timedOut = " timed-out"
-					}
-					fmt.Fprintf(&b, `<span class="job%s"><span class="job-file">%s</span> <span class="job-phase">[%s]</span><span class="job-age">%s</span></span>`,
-						timedOut, htmlEscape(shortName), htmlEscape(phase), shortDuration(age))
-				}
-				b.WriteString(`</details></td></tr>`)
+			memStr := fmtMemGB(snap.Health.RSSMB, snap.TotalMemMB)
+			issues := nodeIssues(snap)
+			nRate := nodeRateByName[m.Name()]
+			rateStr := "—"
+			if nRate > 0.05 {
+				rateStr = fmt.Sprintf("%.1f/s", nRate)
 			}
 
+			fmt.Fprintf(&b,
+				`<tr>`+
+					`<td class="nn"><span class="dot %s">●</span>%s</td>`+
+					`<td class="hi">%d/%d</td>`+
+					`<td class="hi">%s</td>`+
+					`<td class="hi">%.1f</td>`+
+					`<td>%s</td>`+
+					`<td class="warn">%s</td>`+
+					`</tr>`,
+				dotClass, htmlEscape(name),
+				snap.Health.LiveTasks, m.Slots(),
+				rateStr,
+				snap.Health.LoadAvg,
+				memStr,
+				htmlEscape(issues),
+			)
 		}
 		b.WriteString(`</tbody></table></section>`)
 	}
 
-	// Local worker oldest-file info (only shown when no remote pool)
-	if litmus != nil && len(monitors) == 0 {
-		if s := litmus.workerSummary(); s.Busy > 0 && s.OldestFile != "" {
-			fmt.Fprintf(&b, `<div style="font-family:var(--mono);font-size:.78rem;color:var(--sub);margin-bottom:1.5rem">%s <span style="opacity:.5">%s</span></div>`,
-				htmlEscape(s.OldestFile),
-				(time.Duration(s.OldestMS)*time.Millisecond).Round(time.Second))
-		}
-	}
-
 	// Footer
 	fmt.Fprintf(&b,
-		`<footer>`+
-			`<span>errors&nbsp;%s</span>`+
-			`<span>walked&nbsp;%s</span>`+
-			`<span>cache&nbsp;hits&nbsp;%s</span>`+
-			`</footer>`,
+		`<footer>%s errors &middot; %s walked &middot; %s cache hits</footer>`,
 		fmtN(progress.errors.Load()),
 		fmtN(walked),
 		fmtN(progress.cacheHits.Load()),
 	)
 
-	b.WriteString(`</body></html>`)
+	// Last error at the bottom, untruncated
+	if last, ok := progress.lastErr.Load().(string); ok && last != "" {
+		fmt.Fprintf(&b, `<div class="err">%s</div>`, htmlEscape(last))
+	}
 
+	b.WriteString(`</body></html>`)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = fmt.Fprint(w, b.String())
 }
 
-// writePipelineBarWithPrior renders a two-segment progress bar: a dim segment
-// for previously-analyzed samples and a bright segment for this session's work.
-func writePipelineBarWithPrior(b *strings.Builder, name string, prior, session, total int64, info string) {
-	priorPct := 0.0
-	sessionPct := 0.0
-	if total > 0 {
-		priorPct = math.Min(float64(prior)/float64(total)*100, 100)
-		sessionPct = math.Min(float64(session)/float64(total)*100, 100-priorPct)
-	}
-	combinedDone := prior + session
-	overallPct := 0.0
-	if total > 0 {
-		overallPct = math.Min(float64(combinedDone)/float64(total)*100, 100)
-	}
-	// Stats line: "session (+prior) / total  pct%"
-	stats := fmt.Sprintf("<em>%s</em>", fmtN(session))
-	if prior > 0 {
-		stats += fmt.Sprintf(` <span style="color:var(--sub)">(+%s prior)</span>`, fmtN(prior))
-	}
-	stats += fmt.Sprintf(" / %s &nbsp; <em>%.0f%%</em>", fmtN(total), overallPct)
-	if info != "" {
-		stats += fmt.Sprintf(` &nbsp; <span style="color:var(--sub)">%s</span>`, info)
-	}
+// ---------------------------------------------------------------------------
+// Helpers shared by both dashboards
+// ---------------------------------------------------------------------------
 
-	fmt.Fprintf(b,
-		`<div class="stage">`+
-			`<div class="stage-meta">`+
-			`<span class="stage-name">%s</span>`+
-			`<span class="stage-stat">%s</span>`+
-			`</div>`+
-			`<div class="track">`+
-			`<div class="fill" style="width:%.2f%%;background:#5a5230"></div>`+ // prior: dim amber
-			`<div class="fill" style="width:%.2f%%;background:#fbbf24"></div>`+ // session: bright amber
-			`</div>`+
-			`</div>`+"\n",
-		name, stats, priorPct, sessionPct)
+// shortNodeName trims the port suffix when it's the default litmus port.
+func shortNodeName(name string) string {
+	name = strings.TrimSuffix(name, ":"+defaultRemoteLitmusPort)
+	// Also trim ":NNNNN" from local:NNNNN for the local node.
+	if strings.HasPrefix(name, "local:") {
+		return "local"
+	}
+	return name
 }
 
-func writePipelineBar(b *strings.Builder, name string, done, total int64, color string) {
-	pct := 0.0
-	if total > 0 {
-		pct = math.Min(float64(done)/float64(total)*100, 100)
+// nodeDotClass returns a CSS class for the status dot color.
+func nodeDotClass(snap *nodeStatusSnapshot) string {
+	if !snap.Reachable {
+		return "dot-bad"
 	}
-	fmt.Fprintf(b,
-		`<div class="stage">`+
-			`<div class="stage-meta">`+
-			`<span class="stage-name">%s</span>`+
-			`<span class="stage-stat"><em>%s</em> / %s &nbsp; <em>%.0f%%</em></span>`+
-			`</div>`+
-			`<div class="track"><div class="fill" style="width:%.2f%%;background:%s"></div></div>`+
-			`</div>`+"\n",
-		name, fmtN(done), fmtN(total), pct, pct, color)
+	switch snap.Health.Status {
+	case "ok", "saturated":
+		return "dot-ok"
+	case "starting", "building":
+		return "dot-warn"
+	case "degraded", "failed":
+		return "dot-warn"
+	default:
+		return "dot-off"
+	}
 }
 
-// writeThroughputGraph renders an inline SVG sparkline with area fill.
+// nodeIssues returns a short string describing any problems with the node.
+func nodeIssues(snap *nodeStatusSnapshot) string {
+	var parts []string
+	if snap.Health.Reason != "" && snap.Health.Status != "ok" && snap.Health.Status != "saturated" {
+		parts = append(parts, snap.Health.Reason)
+	}
+	if snap.Health.OrphanedTasks > 0 {
+		parts = append(parts, fmt.Sprintf("%d orphans", snap.Health.OrphanedTasks))
+	}
+	if snap.Restarts > 0 {
+		parts = append(parts, fmt.Sprintf("%d restarts", snap.Restarts))
+	}
+	return strings.Join(parts, " · ")
+}
+
+// fmtMemGB formats RSS and optional total memory as "X.X / Y.Y GB".
+func fmtMemGB(rssMB, totalMB int) string {
+	rss := fmt.Sprintf("%.1f", float64(rssMB)/1024)
+	if totalMB > 0 {
+		return fmt.Sprintf("%s / %.0f GB", rss, float64(totalMB)/1024)
+	}
+	return rss + " GB"
+}
+
+// sortedMonitors returns monitors sorted: healthy first, then degraded, then down.
+func sortedMonitors(monitors []*nodeMonitor) []*nodeMonitor {
+	out := make([]*nodeMonitor, len(monitors))
+	copy(out, monitors)
+	sort.SliceStable(out, func(i, j int) bool {
+		return nodeOrder(out[i]) < nodeOrder(out[j])
+	})
+	return out
+}
+
+func nodeOrder(m *nodeMonitor) int {
+	snap := m.Snapshot()
+	if snap == nil {
+		return 3
+	}
+	if !snap.Reachable {
+		return 2
+	}
+	switch snap.Health.Status {
+	case "ok", "saturated":
+		return 0
+	default:
+		return 1
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Throughput graph (SVG sparkline)
+// ---------------------------------------------------------------------------
+
 func writeThroughputGraph(b *strings.Builder, combined []float64, perNode [][]float64, nodeNames []string) {
 	const W, H, px, py = 900, 72, 0, 4
 
@@ -586,18 +559,15 @@ func writeThroughputGraph(b *strings.Builder, combined []float64, perNode [][]fl
 		return sb.String()
 	}
 
-	// Build a closed polygon for the area fill under combined.
 	areaPoints := func(vals []float64) string {
 		if len(vals) == 0 {
 			return ""
 		}
 		var sb strings.Builder
-		// bottom-left corner
 		fmt.Fprintf(&sb, "%.1f,%.1f", xOf(0, len(vals)), float64(H-py))
 		for i, v := range vals {
 			fmt.Fprintf(&sb, " %.1f,%.1f", xOf(i, len(vals)), yOf(v))
 		}
-		// bottom-right corner
 		fmt.Fprintf(&sb, " %.1f,%.1f", xOf(len(vals)-1, len(vals)), float64(H-py))
 		return sb.String()
 	}
@@ -608,7 +578,6 @@ func writeThroughputGraph(b *strings.Builder, combined []float64, perNode [][]fl
 	fmt.Fprintf(b, `<svg width="%d" height="%d" viewBox="0 0 %d %d" style="display:block;width:100%%;overflow:visible">`,
 		W, H, W, H)
 
-	// Subtle horizontal grid at 50% and 100%
 	for _, frac := range []float64{0.5, 1.0} {
 		y := yOf(maxVal * frac)
 		fmt.Fprintf(b, `<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#1a1f2e" stroke-width="1"/>`,
@@ -617,12 +586,10 @@ func writeThroughputGraph(b *strings.Builder, combined []float64, perNode [][]fl
 			px, y, maxVal*frac)
 	}
 
-	// Area fill under combined (very subtle)
 	if pts := areaPoints(combined); pts != "" {
 		fmt.Fprintf(b, `<polygon points="%s" fill="#818cf8" fill-opacity="0.07"/>`, pts)
 	}
 
-	// Per-node lines (thinner, behind combined)
 	for i, series := range perNode {
 		if pts := line(series); pts != "" {
 			color := nodeColors[i%len(nodeColors)]
@@ -630,25 +597,26 @@ func writeThroughputGraph(b *strings.Builder, combined []float64, perNode [][]fl
 		}
 	}
 
-	// Combined line
 	if pts := line(combined); pts != "" {
 		fmt.Fprintf(b, `<polyline points="%s" fill="none" stroke="#818cf8" stroke-width="2" stroke-linejoin="round"/>`, pts)
 	}
 
 	b.WriteString(`</svg>`)
 
-	// Legend
 	b.WriteString(`<div class="graph-legend">`)
 	fmt.Fprintf(b, `<span class="legend-item"><span class="legend-swatch" style="background:#818cf8;height:2px"></span>combined</span>`)
 	for i, name := range nodeNames {
 		color := nodeColors[i%len(nodeColors)]
 		fmt.Fprintf(b, `<span class="legend-item"><span class="legend-swatch" style="background:%s"></span>%s</span>`,
-			color, htmlEscape(name))
+			color, htmlEscape(shortNodeName(name)))
 	}
 	b.WriteString(`</div></div>`)
 }
 
-// formatETA formats a duration as "2h15m", "45m30s", or "30s".
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
+
 func formatETA(d time.Duration) string {
 	d = d.Round(time.Second)
 	h := int(d / time.Hour)
@@ -664,7 +632,6 @@ func formatETA(d time.Duration) string {
 	}
 }
 
-// fmtN formats an integer with comma separators: 1234567 → "1,234,567".
 func fmtN(n int64) string {
 	s := fmt.Sprintf("%d", n)
 	if len(s) <= 3 {
@@ -680,14 +647,6 @@ func fmtN(n int64) string {
 	return string(out)
 }
 
-func shortCommit(s string) string {
-	if len(s) > 8 {
-		return s[:8]
-	}
-	return s
-}
-
-// shortDuration formats a duration concisely: "3s", "2m15s", "1h30m".
 func shortDuration(d time.Duration) string {
 	d = d.Round(time.Second)
 	h := int(d / time.Hour)
@@ -708,5 +667,12 @@ func htmlEscape(s string) string {
 	s = strings.ReplaceAll(s, "<", "&lt;")
 	s = strings.ReplaceAll(s, ">", "&gt;")
 	s = strings.ReplaceAll(s, "\"", "&quot;")
+	return s
+}
+
+func shortCommit(s string) string {
+	if len(s) > 8 {
+		return s[:8]
+	}
 	return s
 }

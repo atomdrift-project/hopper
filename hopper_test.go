@@ -284,6 +284,7 @@ func TestFalsePositivesInPaths(t *testing.T) {
 		Path:        "/data/good/app1",
 		Score:       90,
 	})
+	mustAnalyze(t, ctx, db, "fp1", 90)
 	mustInsert(t, ctx, db, &Sample{
 		SHA256:      "fp2",
 		Source:      "test",
@@ -348,6 +349,7 @@ func TestFalseNegativesInPaths(t *testing.T) {
 		Path:        "/data/bad/app1",
 		Score:       40,
 	})
+	mustAnalyze(t, ctx, db, "fn1", 40)
 	mustInsert(t, ctx, db, &Sample{
 		SHA256:      "fn2",
 		Source:      "test",

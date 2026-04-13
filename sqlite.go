@@ -578,7 +578,7 @@ func (db *DB) seedCandidatesInPathsSQLite(ctx context.Context, prefixes []string
 	}
 	args = append(args, limit)
 	//nolint:gosec // query structure is built from constants, values are parameterized
-	query := `SELECT ` + liteSampleCols + ` FROM samples WHERE status = '' AND label = ? AND skip = '' AND score ` + op + ` ? AND (` +
+	query := `SELECT ` + liteSampleCols + ` FROM samples WHERE status = '' AND label = ? AND skip = '' AND score ` + op + ` ? AND cleave_result IS NOT NULL AND (` +
 		strings.Join(clauses, " OR ") + `) ORDER BY updated_at ASC LIMIT ?`
 	rows, err := db.lite.QueryContext(ctx, query, args...)
 	if err != nil {
