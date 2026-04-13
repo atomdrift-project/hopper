@@ -13,12 +13,14 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -411,10 +413,9 @@ func cmdLoad(ctx context.Context) error {
 	cleaveBinFlag := f.String("cleave", "cleave", "path to cleave binary (used for file enumeration)")
 	litmusBin := f.String("litmus", "litmus", "path to litmus binary (pass empty to disable)")
 	litmusWorkers := f.Int("litmus-workers", 0, "concurrent litmus analysis workers for the local node (0 = auto)")
-	litmusNodes := f.String("litmus-nodes", "", "comma-separated host[:port] of additional remote litmus servers (default port "+defaultRemoteLitmusPort+")")
-	noRulesUpdate := f.Bool("no-rules-update", false, "skip POST /_/update on each litmus node at startup")
+	// Remote litmus workers self-register via the pull API; no --litmus-nodes flag needed.
 	maxRSSGB := f.Int("max-memory-gb", 0, "litmus RSS limit in GB (0 = auto)")
-	analysisTimeout := f.Int("analysis-timeout", 2400, "per-file analysis timeout in seconds (passed to litmus)")
+	analysisTimeout := f.Int("analysis-timeout", 1200, "per-file analysis timeout in seconds (passed to litmus)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
@@ -437,14 +438,17 @@ func cmdLoad(ctx context.Context) error {
 	// Start the web dashboard first so it's reachable while everything
 	// else is still initializing. configure() is called inside loadAll
 	// once the session state is ready.
+	// Create shared HTTP mux for dashboard + work API.
+	httpMux := http.NewServeMux()
+
 	var wd *webDashboard
 	if *dashAddr != "" {
 		wd = &webDashboard{}
-		if err := startWebDashboard(ctx, *dashAddr, wd); err != nil {
+		if err := startWebDashboard(ctx, *dashAddr, wd, httpMux); err != nil {
 			slog.Warn("web dashboard disabled", "error", err)
 			wd = nil
 		} else {
-			slog.Info("web dashboard listening", "addr", *dashAddr)
+			slog.Info("web dashboard + API listening", "addr", *dashAddr)
 		}
 	}
 
@@ -481,8 +485,13 @@ func cmdLoad(ctx context.Context) error {
 	type litmusResult struct{ err error }
 	litmusCh := make(chan litmusResult, 1)
 	if *litmusBin != "" {
+		hopperURL := "http://127.0.0.1:8081"
+		if *dashAddr != "" {
+			hopperURL = "http://" + *dashAddr
+		}
 		litmus = newLitmusServer(litmusConfig{
 			Bin:         *litmusBin,
+			HopperURL:   hopperURL,
 			Dirs:        dirs,
 			MaxRSSGB:    *maxRSSGB,
 			MaxWorkers:  *litmusWorkers,
@@ -554,24 +563,8 @@ func cmdLoad(ctx context.Context) error {
 		dbCh <- dbResult{db: d}
 	}()
 
-	// Dial remote litmus nodes in parallel with everything else.
-	type remoteResult struct {
-		nodes  []analyzer
-		failed []string
-	}
-	remoteCh := make(chan remoteResult, 1)
-	go func() {
-		if remoteAddrs := parseLitmusNodes(*litmusNodes); len(remoteAddrs) > 0 {
-			dialed, failed := dialAllRemoteLitmus(ctx, remoteAddrs)
-			var nodes []analyzer
-			for _, r := range dialed {
-				nodes = append(nodes, r)
-			}
-			remoteCh <- remoteResult{nodes: nodes, failed: failed}
-		} else {
-			remoteCh <- remoteResult{}
-		}
-	}()
+	// Remote litmus workers now self-register via the pull API.
+	// No dialing needed — they poll /api/next when ready.
 
 	// Collect results. Order doesn't matter — each blocks until ready.
 	cr := <-cacheCh
@@ -602,66 +595,27 @@ func cmdLoad(ctx context.Context) error {
 				slog.Error("litmus monitor failed", "error", err)
 			}
 		}()
-		go litmus.WatchHealth(ctx)
-
-		// Populate system memory for size-tiered queue assignment.
-		if info, err := litmus.Info(ctx); err == nil && info.TotalMemMB > 0 {
-			litmus.memoryMB.Store(int64(info.TotalMemMB))
-		}
 	}
-
-	remotes := <-remoteCh
-
-	// Build the analyzer pool from local + remote nodes.
-	var nodes []analyzer
-	if litmus != nil {
-		nodes = append(nodes, litmus)
-	}
-	nodes = append(nodes, remotes.nodes...)
-	if len(nodes) > 0 {
-		totalSlots := 0
-		nodeNames := make([]string, 0, len(nodes))
-		for _, n := range nodes {
-			totalSlots += n.Slots()
-			nodeNames = append(nodeNames, fmt.Sprintf("%s(%d)", n.Name(), n.Slots()))
-		}
-		slog.Info("analysis pool ready",
-			"nodes", len(nodes),
-			"total_slots", totalSlots,
-			"detail", strings.Join(nodeNames, ","))
-
-		// Best-effort: ask every litmus node to refresh its models + traits
-		// data files, then compare versions across the pool. Both phases
-		// are non-fatal and run in the background so the load starts
-		// immediately. The version-mismatch check ALWAYS runs (even with
-		// --no-rules-update) so the operator gets a loud signal if a node
-		// is running stale code or stale rules.
-		go func() {
-			if !*noRulesUpdate {
-				updateAllNodes(ctx, nodes)
-			} else {
-				slog.Info("skipping rules/model update (--no-rules-update)")
-			}
-			warnVersionMismatch(fetchAllNodeInfo(ctx, nodes))
-		}()
-	}
-
-	var shared loadProgress
-	shared.analyzeDurationMin.Store(math.MaxInt64)
 
 	loadCtx, loadCancel := context.WithCancel(ctx)
 	defer loadCancel()
 
-	total := loadAll(loadCtx, loadCancel, db, litmus, nodes, remotes.failed, !*noRulesUpdate, cache, loadDirs, *source, *workers, *rescan, *maxAnalyzed, *experimentTag, wd, &shared)
+	tracker := newWorkerTracker()
+
+	// Register the pull-based work API on the shared HTTP mux.
+	// Resolve allowed directories for /api/file path containment.
+	var allowedDirs []string
+	for _, d := range loadDirs {
+		if abs, err := filepath.Abs(d.dir); err == nil {
+			allowedDirs = append(allowedDirs, abs)
+		}
+	}
+	api := &apiServer{db: db, tracker: tracker, progress: nil, allowedDirs: allowedDirs} // progress set in loadAll
+	api.registerAPI(httpMux)
+
+	total := loadAll(loadCtx, loadCancel, db, litmus, tracker, api, cache, loadDirs, *source, *workers, *rescan, *maxAnalyzed, *experimentTag, wd)
 	slog.Info("load complete", "samples", total)
 	return nil
-}
-
-// loadJob is a file to be loaded and optionally analyzed.
-type loadJob struct {
-	path      string
-	sha       string // set after hashing
-	sizeBytes int64  // file size for memory-aware routing
 }
 
 // loadProgress tracks counters across concurrent load workers.
@@ -710,17 +664,17 @@ var (
 // the directory pipelines; then the analysis queue is closed and drained;
 // then the summary is logged. nworkers bounds how many directory pipelines
 // may run concurrently (irrelevant for typical 3-dir loads).
-//
-//nolint:revive // signature matches the pipeline's top-level orchestration contract.
-func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litmus *litmusServer, nodes []analyzer, failedAddrs []string, updateRules bool, cache *hashCache, dirs []struct{ dir, label string }, source string, nworkers int, rescan bool, maxAnalyzed int, experimentTag string, wd *webDashboard, shared *loadProgress) int {
+func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litmus *litmusServer, tracker *workerTracker, api *apiServer, cache *hashCache, dirs []struct{ dir, label string }, source string, nworkers int, rescan bool, maxAnalyzed int, experimentTag string, wd *webDashboard) int {
 	slog.Info("loading", "dirs", len(dirs))
 	start := time.Now()
 	var progress loadProgress
 	progress.analyzeDurationMin.Store(math.MaxInt64)
 
-	// Initialize already-analyzed count so the dashboard can subtract it
-	// off to show session-relative numbers (a user running with
-	// --max-analyzed=50 wants "N of 50 this session", not "39785 of 50").
+	// Wire the API server's progress pointer so /api/result can update counters.
+	if api != nil {
+		api.progress = &progress
+	}
+
 	var startAnalyzed int64
 	if n, err := db.CountAnalyzed(ctx); err == nil {
 		progress.analyzed.Store(n)
@@ -728,47 +682,20 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 		startAnalyzed = n
 	}
 
-	// Analysis pool: a large buffered queue absorbs bursts from the
-	// per-directory inserters so slow litmus analysis doesn't back up
-	// into the DB insert path. One slot goroutine per node-slot is
-	// spawned over this queue.
-	var sq *sizeTieredQueues
-	var analyzeWG sync.WaitGroup
-	mp := newMonitorPool(nil)
-	if len(nodes) > 0 {
-		sq = newSizeTieredQueues(nodes, 2_000_000, maxFileSize)
-		// Per-node /_/health pollers feed the dashboard's pool block.
-		// Created before workers so monitors can be wired for per-node counters.
-		monitors := startNodeMonitors(ctx, nodes)
-		mp.Add(monitors...)
-		startAnalysisWorkers(ctx, cancel, db, nodes, sq, &analyzeWG, &progress, shared, maxAnalyzed, monitors)
-	} else if len(failedAddrs) > 0 {
-		// No nodes connected at startup, but we have addrs to retry —
-		// create empty tiered queues so late-joining nodes have somewhere to read.
-		sq = newSizeTieredQueues(nil, 2_000_000, maxFileSize)
-	}
-
-	// Retry remote nodes that were unreachable at startup.
-	if len(failedAddrs) > 0 && sq != nil {
-		go retryFailedNodes(ctx, cancel, db, failedAddrs, updateRules, sq, &analyzeWG, &progress, shared, maxAnalyzed, mp)
-	}
-
-	// Progress dashboard: reads counters, exits when dashCtx is cancelled.
+	// Progress dashboard.
 	dashCtx, dashCancel := context.WithCancel(ctx)
 	defer dashCancel()
 	var dashWG sync.WaitGroup
 	dashWG.Go(func() {
-		runDashboard(dashCtx, &progress, litmus, mp, start, startAnalyzed, maxAnalyzed, len(dirs))
+		runDashboard(dashCtx, &progress, litmus, tracker, start, startAnalyzed, maxAnalyzed, len(dirs))
 	})
 
 	if wd != nil {
-		wd.configure(&progress, litmus, mp, start, startAnalyzed, maxAnalyzed, len(dirs))
+		wd.configure(&progress, litmus, tracker, start, startAnalyzed, maxAnalyzed, len(dirs))
 	}
 
-	// Per-directory pipelines: each goroutine runs cleave→hash→batch→
-	// insert→queue end-to-end for its labeled directory. A semaphore
-	// bounds concurrency to nworkers (usually larger than len(dirs), so
-	// all dirs run simultaneously).
+	// Per-directory pipelines: cleave→hash→batch→insert.
+	// Analysis happens via the pull API — workers claim from the DB.
 	sem := make(chan struct{}, max(1, nworkers))
 	var pipeWG sync.WaitGroup
 	for _, d := range dirs {
@@ -779,16 +706,10 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 			case <-ctx.Done():
 				return
 			}
-			runDirPipeline(ctx, db, d, source, cache, &progress, sq, rescan)
+			runDirPipeline(ctx, db, d, source, cache, &progress, rescan)
 		})
 	}
 	pipeWG.Wait()
-
-	// Ingest is done; drain analysis.
-	if sq != nil {
-		sq.Close()
-		analyzeWG.Wait()
-	}
 
 	dashCancel()
 	dashWG.Wait()
@@ -810,7 +731,6 @@ func runDirPipeline(
 	source string,
 	cache *hashCache,
 	progress *loadProgress,
-	sq *sizeTieredQueues,
 	rescan bool,
 ) {
 	batch := make([]*hopper.Sample, 0, loadBatchSize)
@@ -833,24 +753,7 @@ func runDirPipeline(
 		}
 		progress.inserted.Add(n)
 		progress.skipped.Add(int64(len(batch)) - n)
-
-		if sq != nil {
-			needs := make(map[string]struct{}, len(needsAnalysis))
-			for _, sha := range needsAnalysis {
-				needs[sha] = struct{}{}
-			}
-			for _, s := range batch {
-				if !rescan {
-					if _, ok := needs[s.SHA256]; !ok {
-						continue
-					}
-				}
-				if err := sq.Send(ctx, loadJob{path: pathBySha[s.SHA256], sha: s.SHA256, sizeBytes: s.SizeBytes}); err != nil {
-					return
-				}
-				progress.queued.Add(1)
-			}
-		}
+		progress.queued.Add(int64(len(needsAnalysis)))
 		batch = batch[:0]
 		clear(pathBySha)
 	}
@@ -921,7 +824,7 @@ func runDashboard(
 	ctx context.Context,
 	progress *loadProgress,
 	_ *litmusServer,
-	mp *monitorPool,
+	tracker *workerTracker,
 	start time.Time,
 	startAnalyzed int64,
 	maxAnalyzed, ndirs int,
@@ -949,7 +852,10 @@ func runDashboard(
 		case <-ticker.C:
 		}
 
-		monitors := mp.All()
+		var workers []namedWorkerStats
+		if tracker != nil {
+			workers = tracker.all()
+		}
 
 		analyzedAbs := progress.analyzed.Load()
 		sessionAnalyzed := max(analyzedAbs-startAnalyzed, 0)
@@ -964,13 +870,13 @@ func runDashboard(
 			analyzeTarget = int64(maxAnalyzed)
 		}
 
-		// Record sample (with per-node counts) and compute 15-minute rolling rates.
+		// Record sample (with per-worker counts) and compute 15-minute rolling rates.
 		now := time.Now()
 		s := sample{t: now, count: sessionAnalyzed}
-		if len(monitors) > 0 {
-			s.byNode = make([]int64, len(monitors))
-			for i, m := range monitors {
-				s.byNode[i] = m.Analyzed()
+		if len(workers) > 0 {
+			s.byNode = make([]int64, len(workers))
+			for i, w := range workers {
+				s.byNode[i] = w.Analyzed
 			}
 		}
 		samples = append(samples, s)
@@ -1000,10 +906,10 @@ func runDashboard(
 					minLen = len(oldest.byNode)
 				}
 				if minLen > 0 {
-					nodeRates = make(map[string]float64, len(monitors))
-					for i, m := range monitors {
+					nodeRates = make(map[string]float64, len(workers))
+					for i, w := range workers {
 						if i < minLen {
-							nodeRates[m.Name()] = float64(latest.byNode[i]-oldest.byNode[i]) / dt
+							nodeRates[w.Name] = float64(latest.byNode[i]-oldest.byNode[i]) / dt
 						}
 					}
 				}
@@ -1030,7 +936,7 @@ func runDashboard(
 				attrs = append(attrs, "rate_15m", fmt.Sprintf("%.1f/s", rate15m))
 			}
 			slog.Info("load progress", attrs...)
-			logPoolStatus(monitors)
+			logWorkerStatus(workers)
 			continue
 		}
 
@@ -1068,57 +974,35 @@ func runDashboard(
 		}
 		writeStdoutf("%s%s%s\n\n", header, strings.Repeat(" ", pad), right)
 
-		// Nodes
-		if len(monitors) > 0 {
-			sorted := sortedMonitors(monitors)
-
-			nameWidth := 4
-			for _, m := range sorted {
-				if w := len(shortNodeName(m.Name())); w > nameWidth {
-					nameWidth = w
+		// Workers
+		if len(workers) > 0 {
+			nameWidth := 6
+			for _, w := range workers {
+				if len(w.Name) > nameWidth {
+					nameWidth = len(w.Name)
 				}
 			}
+			writeStdoutf("\n  \033[2m  %-*s  slots    rate  analyzed  errors\033[0m\n",
+				nameWidth, "worker")
 
-			// Column header
-			writeStdoutf("  \033[2m  %-*s  tasks    rate   load    rss / total\033[0m\n",
-				nameWidth, "node")
-
-			for _, m := range sorted {
-				snap := m.Snapshot()
-				name := shortNodeName(m.Name())
-				if snap == nil {
-					writeStdoutf("  \033[2m○\033[0m %-*s  \033[2mpending\033[0m\n", nameWidth, name)
-					continue
-				}
-
+			sort.Slice(workers, func(i, j int) bool { return workers[i].Name < workers[j].Name })
+			for _, w := range workers {
+				online := time.Since(w.LastSeen) < 30*time.Second
 				dot := "\033[32m●\033[0m"
-				if !snap.Reachable {
+				if !online {
 					dot = "\033[31m●\033[0m"
-					writeStdoutf("  %s %-*s  \033[31mdown  %s\033[0m\n",
-						dot, nameWidth, name, snap.LastErr)
-					continue
 				}
-
-				switch snap.Health.Status {
-				case "degraded", "failed":
-					dot = "\033[33m○\033[0m"
-				case "starting", "building":
-					dot = "\033[33m●\033[0m"
-				}
-
-				mem := fmtMemGB(snap.Health.RSSMB, snap.TotalMemMB)
-				tasks := fmt.Sprintf("%d/%d", snap.Health.LiveTasks, m.Slots())
-				issues := nodeIssues(snap)
 
 				rateStr := "    —"
-				if r := nodeRates[m.Name()]; r > 0.05 {
+				if r := nodeRates[w.Name]; r > 0.05 {
 					rateStr = fmt.Sprintf("%4.1f/s", r)
 				}
 
-				line := fmt.Sprintf("  %s %-*s  %-7s  %s  %5.1f  %s",
-					dot, nameWidth, name, tasks, rateStr, snap.Health.LoadAvg, mem)
-				if issues != "" {
-					line += fmt.Sprintf("  \033[33m%s\033[0m", issues)
+				line := fmt.Sprintf("  %s %-*s  %5d  %s  %8s  %s",
+					dot, nameWidth, w.Name, w.Slots, rateStr,
+					fmtN(w.Analyzed), fmtN(w.Errors))
+				if !online {
+					line += fmt.Sprintf("  \033[33moffline %s\033[0m", shortDuration(time.Since(w.LastSeen)))
 				}
 				writeStdoutLine(line)
 			}
@@ -1135,43 +1019,20 @@ func runDashboard(
 	}
 }
 
-// logPoolStatus emits one slog line per node for the non-TTY path. Each line
-// is independently greppable; combined with the existing "load progress"
-// line, the operator gets the same information as the TTY dashboard.
-func logPoolStatus(monitors []*nodeMonitor) {
-	for _, m := range monitors {
-		snap := m.Snapshot()
-		if snap == nil {
-			slog.Info("litmus node", "node", m.Name(), "status", "pending")
-			continue
+// logWorkerStatus emits one slog line per worker for the non-TTY path.
+func logWorkerStatus(workers []namedWorkerStats) {
+	for _, w := range workers {
+		online := time.Since(w.LastSeen) < 30*time.Second
+		status := "online"
+		if !online {
+			status = "offline"
 		}
-		if !snap.Reachable {
-			slog.Warn("litmus node",
-				"node", m.Name(),
-				"status", "down",
-				"error", snap.LastErr)
-			continue
-		}
-		attrs := []any{
-			"node", m.Name(),
-			"status", snap.Health.Status,
-			"uptime_secs", snap.Health.UptimeSecs,
-			"load", fmt.Sprintf("%.2f", snap.Health.Load),
-			"load_avg", fmt.Sprintf("%.2f", snap.Health.LoadAvg),
-			"rss_mb", snap.Health.RSSMB,
-			"live", snap.Health.LiveTasks,
-			"slots", m.Slots(),
-		}
-		if snap.Health.Reason != "" {
-			attrs = append(attrs, "reason", snap.Health.Reason)
-		}
-		if snap.Health.OrphanedTasks > 0 {
-			attrs = append(attrs, "orphaned", snap.Health.OrphanedTasks)
-		}
-		if snap.Restarts > 0 {
-			attrs = append(attrs, "restarts", snap.Restarts)
-		}
-		slog.Info("litmus node", attrs...)
+		slog.Info("litmus worker",
+			"worker", w.Name,
+			"status", status,
+			"slots", w.Slots,
+			"analyzed", w.Analyzed,
+			"errors", w.Errors)
 	}
 }
 
@@ -1232,197 +1093,6 @@ func logLoadSummary(start time.Time, experimentTag string, dirs []struct{ dir, l
 		attrs = append(attrs, "experiment", experimentTag)
 	}
 	slog.Info("directory complete", attrs...)
-}
-
-//nolint:revive // config is split across explicit parameters to keep call sites direct.
-func startAnalysisWorkers(
-	ctx context.Context,
-	cancel context.CancelFunc,
-	db *hopper.DB,
-	nodes []analyzer,
-	sq *sizeTieredQueues,
-	wg *sync.WaitGroup,
-	progress *loadProgress,
-	shared *loadProgress,
-	maxAnalyzed int,
-	monitors []*nodeMonitor,
-) {
-	// Build a name→monitor map so each worker can increment its node's counter.
-	monitorByName := make(map[string]*nodeMonitor, len(monitors))
-	for _, m := range monitors {
-		monitorByName[m.Name()] = m
-	}
-
-	// One goroutine per slot per node. Each worker draws from tiered queues
-	// based on the node's memory tier: a tier-T worker reads from tiers 0..T,
-	// preferring its own tier so large nodes drain large files first but help
-	// with smaller files when idle. Small nodes never see oversized files.
-	workerID := 0
-	for _, node := range nodes {
-		// Only the local litmusServer wires into the dashboard's per-worker
-		// in-flight tracking. Remote nodes have no equivalent today.
-		local, _ := node.(*litmusServer)
-		mon := monitorByName[node.Name()]
-		maxTier := sq.TierForNode(node.Name())
-		for range node.Slots() {
-			id := workerID
-			workerID++
-			n := node
-			t := maxTier
-			wg.Go(func() {
-				for {
-					job, ok := sq.recvJob(ctx, t)
-					if !ok {
-						slog.Debug("analysis worker exiting", "reason", "queues drained or cancelled", "node", n.Name())
-						return
-					}
-					if ctx.Err() != nil {
-						slog.Debug("analysis worker exiting", "reason", "context cancelled", "node", n.Name())
-						return
-					}
-
-					file := filepath.Base(job.path)
-					if local != nil {
-						local.TrackWorker(id, file)
-					}
-					if mon != nil {
-						mon.TrackSlot(id, file)
-					}
-					t0 := time.Now()
-					result, err := analyzeWithRetry(ctx, n, mon, job.sha, job.path)
-					if local != nil {
-						local.TrackWorker(id, "")
-					}
-					if mon != nil {
-						mon.TrackSlot(id, "")
-					}
-					dur := time.Since(t0).Nanoseconds()
-
-					if err != nil {
-						progress.errors.Add(1)
-						if mon != nil {
-							mon.IncrErrors()
-						}
-						progress.lastErr.Store(fmt.Sprintf("analyze: %s: %v", filepath.Base(job.path), err))
-						slog.Warn("analysis failed", "node", n.Name(), "path", job.path, "error", err)
-						continue
-					}
-
-					// Track per-analysis duration.
-					progress.analyzeDurationSum.Add(dur)
-					shared.analyzeDurationSum.Add(dur)
-					for {
-						old := progress.analyzeDurationMax.Load()
-						if dur <= old || progress.analyzeDurationMax.CompareAndSwap(old, dur) {
-							break
-						}
-					}
-					for {
-						old := progress.analyzeDurationMin.Load()
-						if dur >= old || progress.analyzeDurationMin.CompareAndSwap(old, dur) {
-							break
-						}
-					}
-
-					// Store raw litmus report and classification envelope separately.
-					if err := db.UpdateCleaveResult(ctx, job.sha, result.Raw, result.Canonical); err != nil {
-						progress.errors.Add(1)
-						slog.Warn("storing cleave result failed", "path", job.path, "error", err)
-						continue
-					}
-					if err := db.UpdateLitmusResult(ctx, job.sha, result.ML); err != nil {
-						slog.Warn("storing litmus result failed", "path", job.path, "error", err)
-					}
-					progress.analyzed.Add(1)
-					if mon != nil {
-						mon.IncrAnalyzed()
-					}
-
-					// Check global analysis cap.
-					if maxAnalyzed > 0 && shared.analyzed.Add(1) >= int64(maxAnalyzed) {
-						slog.Info("max-analyzed reached", "limit", maxAnalyzed)
-						cancel()
-						return
-					}
-
-					// Explode archive members into individual sample rows.
-					parent, err := db.SampleBySHA256(ctx, job.sha)
-					if err != nil {
-						slog.Warn("fetch for explosion failed", "sha256", job.sha, "error", err)
-						continue
-					}
-					totalMembers, err := db.ExplodeArchiveMembers(ctx, parent)
-					if err != nil {
-						slog.Warn("archive explosion failed", "sha256", job.sha, "error", err)
-					} else if totalMembers > 0 {
-						slog.Debug("exploded archive members", "sha256", job.sha, "members", totalMembers)
-						progress.exploded.Add(totalMembers)
-					}
-				}
-			})
-		}
-	}
-}
-
-// retryFailedNodes periodically re-dials remote litmus addresses that were
-// unreachable at startup. When a node connects, it is added to the monitor
-// pool and new analysis workers are spawned on the shared queue.
-func retryFailedNodes(
-	ctx context.Context,
-	cancel context.CancelFunc,
-	db *hopper.DB,
-	addrs []string,
-	updateRules bool,
-	sq *sizeTieredQueues,
-	wg *sync.WaitGroup,
-	progress *loadProgress,
-	shared *loadProgress,
-	maxAnalyzed int,
-	mp *monitorPool,
-) {
-	const retryInterval = 30 * time.Second
-	ticker := time.NewTicker(retryInterval)
-	defer ticker.Stop()
-
-	pending := make(map[string]struct{}, len(addrs))
-	for _, a := range addrs {
-		pending[a] = struct{}{}
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-
-		if len(pending) == 0 {
-			return
-		}
-
-		for addr := range pending {
-			node, err := dialRemoteLitmus(ctx, addr)
-			if err != nil {
-				slog.Debug("retry dial failed", "addr", addr, "error", err)
-				continue
-			}
-			delete(pending, addr)
-
-			if updateRules {
-				updateAllNodes(ctx, []analyzer{node})
-			}
-
-			sq.AssignNode(node)
-			monitors := startNodeMonitors(ctx, []analyzer{node})
-			mp.Add(monitors...)
-			startAnalysisWorkers(ctx, cancel, db, []analyzer{node}, sq, wg, progress, shared, maxAnalyzed, monitors)
-			slog.Info("late-joined remote node",
-				"addr", addr,
-				"slots", node.Slots(),
-				"memory_mb", node.MemoryMB(),
-				"pending", len(pending))
-		}
-	}
 }
 
 // Marker file conventions (shared with cyclotron):

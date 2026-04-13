@@ -19,7 +19,7 @@ type webDashboard struct {
 	cfgMu         sync.RWMutex
 	progress      *loadProgress
 	litmus        *litmusServer
-	mp            *monitorPool
+	tracker       *workerTracker
 	start         time.Time
 	startAnalyzed int64
 	maxAnalyzed   int
@@ -32,12 +32,12 @@ type webDashboard struct {
 // configure is called once the load session is ready. It sets the fields the
 // handler needs to render progress and is safe to call concurrently with the
 // HTTP server already running.
-func (wd *webDashboard) configure(progress *loadProgress, litmus *litmusServer, mp *monitorPool, start time.Time, startAnalyzed int64, maxAnalyzed, ndirs int) {
+func (wd *webDashboard) configure(progress *loadProgress, litmus *litmusServer, tracker *workerTracker, start time.Time, startAnalyzed int64, maxAnalyzed, ndirs int) {
 	wd.cfgMu.Lock()
 	defer wd.cfgMu.Unlock()
 	wd.progress = progress
 	wd.litmus = litmus
-	wd.mp = mp
+	wd.tracker = tracker
 	wd.start = start
 	wd.startAnalyzed = startAnalyzed
 	wd.maxAnalyzed = maxAnalyzed
@@ -55,15 +55,14 @@ type throughputSample struct {
 func (wd *webDashboard) recordSample(total int64) {
 	wd.mu.Lock()
 	defer wd.mu.Unlock()
-	var monitors []*nodeMonitor
-	if wd.mp != nil {
-		monitors = wd.mp.All()
-	}
 	s := throughputSample{t: time.Now(), total: total}
-	if len(monitors) > 0 {
-		s.byNode = make([]int64, len(monitors))
-		for i, m := range monitors {
-			s.byNode[i] = m.Analyzed()
+	if wd.tracker != nil {
+		workers := wd.tracker.all()
+		if len(workers) > 0 {
+			s.byNode = make([]int64, len(workers))
+			for i, w := range workers {
+				s.byNode[i] = w.Analyzed
+			}
 		}
 	}
 	wd.samples = append(wd.samples, s)
@@ -123,12 +122,12 @@ func (wd *webDashboard) throughputSeries() (combined []float64, perNode [][]floa
 		return nil, nil
 	}
 	combined = make([]float64, n-1)
-	var monitors []*nodeMonitor
-	if wd.mp != nil {
-		monitors = wd.mp.All()
+	var nWorkers int
+	if wd.tracker != nil {
+		nWorkers = len(wd.tracker.all())
 	}
-	if len(monitors) > 0 {
-		perNode = make([][]float64, len(monitors))
+	if nWorkers > 0 {
+		perNode = make([][]float64, nWorkers)
 		for i := range perNode {
 			perNode[i] = make([]float64, n-1)
 		}
@@ -139,7 +138,7 @@ func (wd *webDashboard) throughputSeries() (combined []float64, perNode [][]floa
 			continue
 		}
 		combined[i-1] = float64(samples[i].total-samples[i-1].total) / dt
-		for j := range monitors {
+		for j := range nWorkers {
 			if j < len(samples[i].byNode) && j < len(samples[i-1].byNode) {
 				perNode[j][i-1] = float64(samples[i].byNode[j]-samples[i-1].byNode[j]) / dt
 			}
@@ -148,8 +147,7 @@ func (wd *webDashboard) throughputSeries() (combined []float64, perNode [][]floa
 	return combined, perNode
 }
 
-func startWebDashboard(ctx context.Context, addr string, wd *webDashboard) error {
-	mux := http.NewServeMux()
+func startWebDashboard(ctx context.Context, addr string, wd *webDashboard, mux *http.ServeMux) error {
 	mux.HandleFunc("/", wd.handler)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -248,15 +246,15 @@ footer{padding-top:1rem;border-top:1px solid var(--border);
 func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 	wd.cfgMu.RLock()
 	progress := wd.progress
-	mp := wd.mp
+	tracker := wd.tracker
 	start := wd.start
 	startAnalyzed := wd.startAnalyzed
 	maxAnalyzed := wd.maxAnalyzed
 	wd.cfgMu.RUnlock()
 
-	var monitors []*nodeMonitor
-	if mp != nil {
-		monitors = mp.All()
+	var workers []namedWorkerStats
+	if tracker != nil {
+		workers = tracker.all()
 	}
 
 	if progress == nil {
@@ -286,11 +284,11 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 	wd.recordSample(sessionAnalyzed)
 	rate, nodeRates := wd.ratesOver(15 * time.Minute)
 
-	// Build monitor-index → rate map for the node table.
-	nodeRateByName := make(map[string]float64, len(monitors))
-	for i, m := range monitors {
+	// Build worker-index → rate map for the node table.
+	nodeRateByName := make(map[string]float64, len(workers))
+	for i, w := range workers {
 		if i < len(nodeRates) {
-			nodeRateByName[m.Name()] = nodeRates[i]
+			nodeRateByName[w.Name] = nodeRates[i]
 		}
 	}
 
@@ -355,64 +353,56 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 	combined, perNode := wd.throughputSeries()
 	if len(combined) >= 2 {
 		var nodeNames []string
-		for _, m := range monitors {
-			nodeNames = append(nodeNames, m.Name())
+		for _, w := range workers {
+			nodeNames = append(nodeNames, w.Name)
 		}
 		b.WriteString(`<section><div class="label">Throughput</div>`)
 		writeThroughputGraph(&b, combined, perNode, nodeNames)
 		b.WriteString(`</section>`)
 	}
 
-	// Nodes
-	if len(monitors) > 0 {
-		b.WriteString(`<section><div class="label">Nodes</div>`)
+	// Workers
+	if len(workers) > 0 {
+		b.WriteString(`<section><div class="label">Workers</div>`)
 		b.WriteString(`<table><thead><tr>` +
-			`<th>Node</th><th>Tasks</th><th>Rate</th><th>Load</th>` +
-			`<th>Memory</th><th></th>` +
+			`<th>Worker</th><th>Slots</th><th>Rate</th>` +
+			`<th>Analyzed</th><th>Errors</th><th></th>` +
 			`</tr></thead><tbody>`)
 
-		sorted := sortedMonitors(monitors)
-		for _, m := range sorted {
-			snap := m.Snapshot()
-			name := shortNodeName(m.Name())
-			if snap == nil {
-				fmt.Fprintf(&b, `<tr><td class="nn"><span class="dot dot-off">●</span>%s</td>`+
-					`<td colspan="5">pending</td></tr>`, htmlEscape(name))
-				continue
+		sort.Slice(workers, func(i, j int) bool { return workers[i].Name < workers[j].Name })
+		for _, w := range workers {
+			online := time.Since(w.LastSeen) < 30*time.Second
+			dotClass := "dot-ok"
+			if !online {
+				dotClass = "dot-bad"
 			}
 
-			dotClass := nodeDotClass(snap)
-			if !snap.Reachable {
-				fmt.Fprintf(&b,
-					`<tr><td class="nn"><span class="dot %s">●</span>%s</td>`+
-						`<td>—</td><td>—</td><td>—</td><td>—</td><td class="warn">%s</td></tr>`,
-					dotClass, htmlEscape(name), htmlEscape(truncate(snap.LastErr, 60)))
-				continue
-			}
-
-			memStr := fmtMemGB(snap.Health.RSSMB, snap.TotalMemMB)
-			issues := nodeIssues(snap)
-			nRate := nodeRateByName[m.Name()]
+			nRate := nodeRateByName[w.Name]
 			rateStr := "—"
 			if nRate > 0.05 {
 				rateStr = fmt.Sprintf("%.1f/s", nRate)
 			}
 
+			status := ""
+			if !online {
+				status = fmt.Sprintf("offline %s", shortDuration(time.Since(w.LastSeen)))
+			}
+
 			fmt.Fprintf(&b,
 				`<tr>`+
 					`<td class="nn"><span class="dot %s">●</span>%s</td>`+
-					`<td class="hi">%d/%d</td>`+
+					`<td class="hi">%d</td>`+
 					`<td class="hi">%s</td>`+
-					`<td class="hi">%.1f</td>`+
+					`<td class="hi">%s</td>`+
 					`<td>%s</td>`+
 					`<td class="warn">%s</td>`+
 					`</tr>`,
-				dotClass, htmlEscape(name),
-				snap.Health.LiveTasks, m.Slots(),
+				dotClass, htmlEscape(w.Name),
+				w.Slots,
 				rateStr,
-				snap.Health.LoadAvg,
-				memStr,
-				htmlEscape(issues),
+				fmtN(w.Analyzed),
+				fmtN(w.Errors),
+				htmlEscape(status),
 			)
 		}
 		b.WriteString(`</tbody></table></section>`)
@@ -442,44 +432,12 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 
 // shortNodeName trims the port suffix when it's the default litmus port.
 func shortNodeName(name string) string {
-	name = strings.TrimSuffix(name, ":"+defaultRemoteLitmusPort)
+	name = strings.TrimSuffix(name, ":49999")
 	// Also trim ":NNNNN" from local:NNNNN for the local node.
 	if strings.HasPrefix(name, "local:") {
 		return "local"
 	}
 	return name
-}
-
-// nodeDotClass returns a CSS class for the status dot color.
-func nodeDotClass(snap *nodeStatusSnapshot) string {
-	if !snap.Reachable {
-		return "dot-bad"
-	}
-	switch snap.Health.Status {
-	case "ok", "saturated":
-		return "dot-ok"
-	case "starting", "building":
-		return "dot-warn"
-	case "degraded", "failed":
-		return "dot-warn"
-	default:
-		return "dot-off"
-	}
-}
-
-// nodeIssues returns a short string describing any problems with the node.
-func nodeIssues(snap *nodeStatusSnapshot) string {
-	var parts []string
-	if snap.Health.Reason != "" && snap.Health.Status != "ok" && snap.Health.Status != "saturated" {
-		parts = append(parts, snap.Health.Reason)
-	}
-	if snap.Health.OrphanedTasks > 0 {
-		parts = append(parts, fmt.Sprintf("%d orphans", snap.Health.OrphanedTasks))
-	}
-	if snap.Restarts > 0 {
-		parts = append(parts, fmt.Sprintf("%d restarts", snap.Restarts))
-	}
-	return strings.Join(parts, " · ")
 }
 
 // fmtMemGB formats RSS and optional total memory as "X.X / Y.Y GB".
@@ -489,32 +447,6 @@ func fmtMemGB(rssMB, totalMB int) string {
 		return fmt.Sprintf("%s / %.0f GB", rss, float64(totalMB)/1024)
 	}
 	return rss + " GB"
-}
-
-// sortedMonitors returns monitors sorted: healthy first, then degraded, then down.
-func sortedMonitors(monitors []*nodeMonitor) []*nodeMonitor {
-	out := make([]*nodeMonitor, len(monitors))
-	copy(out, monitors)
-	sort.SliceStable(out, func(i, j int) bool {
-		return nodeOrder(out[i]) < nodeOrder(out[j])
-	})
-	return out
-}
-
-func nodeOrder(m *nodeMonitor) int {
-	snap := m.Snapshot()
-	if snap == nil {
-		return 3
-	}
-	if !snap.Reachable {
-		return 2
-	}
-	switch snap.Health.Status {
-	case "ok", "saturated":
-		return 0
-	default:
-		return 1
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -667,6 +599,7 @@ func htmlEscape(s string) string {
 	s = strings.ReplaceAll(s, "<", "&lt;")
 	s = strings.ReplaceAll(s, ">", "&gt;")
 	s = strings.ReplaceAll(s, "\"", "&quot;")
+	s = strings.ReplaceAll(s, "'", "&#39;")
 	return s
 }
 

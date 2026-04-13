@@ -27,7 +27,9 @@ CREATE TABLE IF NOT EXISTS samples (
 	updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
 	analyzed_at   TIMESTAMPTZ,
 	mtime         TIMESTAMPTZ,
-	marker_mtime  TIMESTAMPTZ
+	marker_mtime  TIMESTAMPTZ,
+	claimed_by    TEXT NOT NULL DEFAULT '',
+	claimed_at    TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_samples_label ON samples(label);
@@ -48,3 +50,13 @@ CREATE TABLE IF NOT EXISTS reports (
 );
 
 CREATE INDEX IF NOT EXISTS idx_reports_sha256_type ON reports(sha256, report_type);
+
+CREATE TABLE IF NOT EXISTS workers (
+	name      TEXT PRIMARY KEY,
+	last_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+	slots     INTEGER NOT NULL DEFAULT 1,
+	version   TEXT NOT NULL DEFAULT '',
+	traits    TEXT NOT NULL DEFAULT '',
+	analyzed  BIGINT NOT NULL DEFAULT 0,
+	errors    BIGINT NOT NULL DEFAULT 0
+);

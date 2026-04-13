@@ -136,6 +136,33 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		}
 	}
 
+	// Pull-based work scheduling: claim tracking columns.
+	hasClaimedBy := pragmaHasColumn(ctx, db.lite, "claimed_by")
+	if hasClaimedBy == 0 {
+		for _, ddl := range []string{
+			`ALTER TABLE samples ADD COLUMN claimed_by TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE samples ADD COLUMN claimed_at DATETIME`,
+			`CREATE INDEX IF NOT EXISTS idx_samples_claimable ON samples(id) WHERE cleave_result IS NULL AND claimed_by = ''`,
+		} {
+			if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
+				return fmt.Errorf("hopper: migrate sqlite: %w", err)
+			}
+		}
+	}
+
+	// Worker heartbeat table for dashboard.
+	if _, err := db.lite.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS workers (
+		name      TEXT PRIMARY KEY,
+		last_seen DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+		slots     INTEGER NOT NULL DEFAULT 1,
+		version   TEXT NOT NULL DEFAULT '',
+		traits    TEXT NOT NULL DEFAULT '',
+		analyzed  INTEGER NOT NULL DEFAULT 0,
+		errors    INTEGER NOT NULL DEFAULT 0
+	)`); err != nil {
+		return fmt.Errorf("hopper: migrate sqlite: %w", err)
+	}
+
 	return nil
 }
 
@@ -245,7 +272,7 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 	if err != nil {
 		return 0, nil, fmt.Errorf("hopper: begin batch: %w", err)
 	}
-	defer tx.Rollback() //nolint:errcheck // commit or rollback
+	defer tx.Rollback() //nolint:errcheck // rollback is best-effort after commit // commit or rollback
 
 	cols := []string{
 		"sha256", "source", "feed", "ecosystem", "filename", "file_type",
@@ -877,7 +904,7 @@ func (db *DB) deleteSampleSQLite(ctx context.Context, sha256 string) error {
 	if err != nil {
 		return fmt.Errorf("hopper: begin delete: %w", err)
 	}
-	defer tx.Rollback() //nolint:errcheck // commit or rollback
+	defer tx.Rollback() //nolint:errcheck // rollback is best-effort after commit // commit or rollback
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM reports WHERE sha256 = ?`, sha256); err != nil {
 		return fmt.Errorf("hopper: delete sample reports: %w", err)
@@ -907,7 +934,7 @@ func (db *DB) purgeUnsupportedSQLite(ctx context.Context, dryRun bool) (int64, e
 	if err != nil {
 		return 0, fmt.Errorf("hopper: begin purge: %w", err)
 	}
-	defer tx.Rollback() //nolint:errcheck // commit or rollback
+	defer tx.Rollback() //nolint:errcheck // rollback is best-effort after commit // commit or rollback
 
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM reports WHERE sha256 IN (
@@ -1013,6 +1040,123 @@ func (db *DB) feedEcosystemsSQLite(ctx context.Context, source, label string) ([
 		return nil, fmt.Errorf("hopper: feed ecosystems: %w", err)
 	}
 	return scanLiteStrings(rows)
+}
+
+// Pull-based work scheduling (SQLite).
+
+func (db *DB) claimJobsSQLite(ctx context.Context, worker string, limit int, expiry time.Duration) ([]ClaimJob, error) {
+	// SQLite serializes writers via SetMaxOpenConns(1) on the pool, so
+	// concurrent claim requests are safe without row-level locking.
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: claim jobs begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback is best-effort after commit
+
+	cutoff := time.Now().Add(-expiry).UTC().Format(time.RFC3339Nano)
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, sha256, path, size_bytes FROM samples
+		WHERE cleave_result IS NULL
+		  AND (claimed_by = '' OR claimed_at < ?)
+		ORDER BY mtime DESC, id LIMIT ?`, cutoff, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: claim jobs query: %w", err)
+	}
+	type row struct {
+		id        int64
+		sha256    string
+		path      string
+		sizeBytes int64
+	}
+	var selected []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.sha256, &r.path, &r.sizeBytes); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("hopper: claim jobs scan: %w", err)
+		}
+		selected = append(selected, r)
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("hopper: claim jobs rows: %w", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	var jobs []ClaimJob
+	for _, r := range selected {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE samples SET claimed_by = ?, claimed_at = ? WHERE id = ?`,
+			worker, now, r.id); err != nil {
+			return nil, fmt.Errorf("hopper: claim jobs update: %w", err)
+		}
+		jobs = append(jobs, ClaimJob{SHA256: r.sha256, Path: r.path, SizeBytes: r.sizeBytes})
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("hopper: claim jobs commit: %w", err)
+	}
+	return jobs, nil
+}
+
+func (db *DB) unclaimJobsSQLite(ctx context.Context, shas []string) error {
+	if len(shas) == 0 {
+		return nil
+	}
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("hopper: unclaim begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback is best-effort after commit
+	for _, sha := range shas {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE samples SET claimed_by = '', claimed_at = NULL WHERE sha256 = ?`, sha); err != nil {
+			return fmt.Errorf("hopper: unclaim: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+func (db *DB) upsertWorkerSQLite(ctx context.Context, w Worker) error {
+	_, err := db.lite.ExecContext(ctx, `
+		INSERT INTO workers (name, last_seen, slots, version, traits, analyzed, errors)
+		VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, ?, ?, ?, ?)
+		ON CONFLICT (name) DO UPDATE SET
+			last_seen = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+			slots = excluded.slots,
+			version = excluded.version,
+			traits = excluded.traits,
+			analyzed = excluded.analyzed,
+			errors = excluded.errors`,
+		w.Name, w.Slots, w.Version, w.Traits, w.Analyzed, w.Errors)
+	if err != nil {
+		return fmt.Errorf("hopper: upsert worker: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) activeWorkersSQLite(ctx context.Context, since time.Duration) ([]Worker, error) {
+	cutoff := time.Now().Add(-since).UTC().Format(time.RFC3339Nano)
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT name, last_seen, slots, version, traits, analyzed, errors
+		 FROM workers WHERE last_seen > ? ORDER BY name`, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: active workers: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // deferred close is best-effort
+	var out []Worker
+	for rows.Next() {
+		var w Worker
+		var lastSeen string
+		if err := rows.Scan(&w.Name, &lastSeen, &w.Slots, &w.Version, &w.Traits, &w.Analyzed, &w.Errors); err != nil {
+			return nil, fmt.Errorf("hopper: active workers scan: %w", err)
+		}
+		if t, err := time.Parse(time.RFC3339Nano, lastSeen); err == nil {
+			w.LastSeen = t
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
 }
 
 func scanLiteStrings(rows *sql.Rows) ([]string, error) {

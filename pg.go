@@ -59,6 +59,20 @@ func (db *DB) migratePG(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_samples_review ON samples(label, score DESC) WHERE cleave_result IS NOT NULL AND status = '' AND skip = ''`,
 		// countAnalyzedPG: SELECT count(*) WHERE litmus_result IS NOT NULL — no index existed.
 		`CREATE INDEX IF NOT EXISTS idx_samples_litmus_done ON samples(id) WHERE litmus_result IS NOT NULL`,
+		// Pull-based work scheduling: claim tracking columns + index.
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS claimed_by TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_claimable ON samples(id) WHERE cleave_result IS NULL AND claimed_by = ''`,
+		// Worker heartbeat table for dashboard.
+		`CREATE TABLE IF NOT EXISTS workers (
+			name      TEXT PRIMARY KEY,
+			last_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+			slots     INTEGER NOT NULL DEFAULT 1,
+			version   TEXT NOT NULL DEFAULT '',
+			traits    TEXT NOT NULL DEFAULT '',
+			analyzed  BIGINT NOT NULL DEFAULT 0,
+			errors    BIGINT NOT NULL DEFAULT 0
+		)`,
 	} {
 		slog.Debug("executing migration ddl", "ddl", ddl)
 		if _, err := db.pool.Exec(ctx, ddl); err != nil {
@@ -868,4 +882,84 @@ func scanPGCounts(rows pgx.Rows) (map[string]int, error) {
 		counts[key] = n
 	}
 	return counts, rows.Err()
+}
+
+// Pull-based work scheduling (PostgreSQL).
+
+func (db *DB) claimJobsPG(ctx context.Context, worker string, limit int, expiry time.Duration) ([]ClaimJob, error) {
+	rows, err := db.pool.Query(ctx, `
+		WITH claimable AS (
+			SELECT id FROM samples
+			WHERE cleave_result IS NULL
+			  AND (claimed_by = '' OR claimed_at < now() - $2::interval)
+			ORDER BY mtime DESC NULLS LAST, id
+			LIMIT $3
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE samples SET claimed_by = $1, claimed_at = now()
+		FROM claimable WHERE samples.id = claimable.id
+		RETURNING samples.sha256, samples.path, samples.size_bytes`,
+		worker, expiry, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: claim jobs: %w", err)
+	}
+	defer rows.Close()
+	var jobs []ClaimJob
+	for rows.Next() {
+		var j ClaimJob
+		if err := rows.Scan(&j.SHA256, &j.Path, &j.SizeBytes); err != nil {
+			return nil, fmt.Errorf("hopper: claim jobs scan: %w", err)
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, rows.Err()
+}
+
+func (db *DB) unclaimJobsPG(ctx context.Context, shas []string) error {
+	if len(shas) == 0 {
+		return nil
+	}
+	_, err := db.pool.Exec(ctx,
+		`UPDATE samples SET claimed_by = '', claimed_at = NULL WHERE sha256 = ANY($1)`, shas)
+	if err != nil {
+		return fmt.Errorf("hopper: unclaim jobs: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) upsertWorkerPG(ctx context.Context, w Worker) error {
+	_, err := db.pool.Exec(ctx, `
+		INSERT INTO workers (name, last_seen, slots, version, traits, analyzed, errors)
+		VALUES ($1, now(), $2, $3, $4, $5, $6)
+		ON CONFLICT (name) DO UPDATE SET
+			last_seen = now(),
+			slots = EXCLUDED.slots,
+			version = EXCLUDED.version,
+			traits = EXCLUDED.traits,
+			analyzed = EXCLUDED.analyzed,
+			errors = EXCLUDED.errors`,
+		w.Name, w.Slots, w.Version, w.Traits, w.Analyzed, w.Errors)
+	if err != nil {
+		return fmt.Errorf("hopper: upsert worker: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) activeWorkersPG(ctx context.Context, since time.Duration) ([]Worker, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT name, last_seen, slots, version, traits, analyzed, errors
+		 FROM workers WHERE last_seen > now() - $1::interval ORDER BY name`, since)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: active workers: %w", err)
+	}
+	defer rows.Close()
+	var out []Worker
+	for rows.Next() {
+		var w Worker
+		if err := rows.Scan(&w.Name, &w.LastSeen, &w.Slots, &w.Version, &w.Traits, &w.Analyzed, &w.Errors); err != nil {
+			return nil, fmt.Errorf("hopper: active workers scan: %w", err)
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
 }

@@ -1,35 +1,31 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"sync/atomic"
 	"time"
 )
 
 const restartRecoveryDelay = 15 * time.Second
 
-// litmusServer manages a litmus API server subprocess.
+// litmusServer manages a local litmus worker subprocess. In pull mode,
+// litmus polls hopper's /api/next for work instead of hopper pushing
+// requests to it.
 type litmusServer struct { //nolint:govet // field order is chosen for readability over padding minimization.
-	client      *http.Client
 	cmd         *exec.Cmd
 	bin         string // path to litmus binary
-	url         string // base URL (e.g. http://127.0.0.1:PORT)
-	port        string
+	hopperURL   string // hopper API base URL for the worker to poll
 	dirs        []string
 	mu          sync.Mutex
 	maxRSSGB    int
@@ -40,31 +36,15 @@ type litmusServer struct { //nolint:govet // field order is chosen for readabili
 	building    atomic.Bool
 	pid         atomic.Int64
 	restarts    atomic.Int64
-
-	memoryMB atomic.Int64 // total system memory in MiB; populated from /_/info
-
-	// inFlight tracks what each hopper analysis worker is currently doing.
-	inFlight sync.Map // worker ID (int) → *workerState
 }
 
-type workerState struct { //nolint:govet // tiny runtime-only struct; readability wins here.
-	File      string
-	StartedAt time.Time
-}
-
-type workerSnapshot struct { //nolint:govet // compact summary struct; layout is not performance-critical.
-	Busy       int
-	Idle       int
-	OldestMS   int64
-	OldestFile string
-}
-
-// litmusConfig holds options for starting a litmus server.
+// litmusConfig holds options for starting a litmus worker.
 type litmusConfig struct {
 	Bin         string   // path to litmus binary (default: "litmus")
-	Dirs        []string // directories to allow for /analyze-path
+	HopperURL   string   // hopper API URL (e.g. http://127.0.0.1:8081)
+	Dirs        []string // directories for local path access
 	MaxRSSGB    int      // memory limit in GB (0 = let litmus decide)
-	MaxWorkers  int      // max concurrent analysis requests to send
+	MaxWorkers  int      // max concurrent analysis workers
 	TimeoutSecs int      // per-request analysis timeout (0 = litmus default: 600s)
 	Verbose     bool     // enable debug logging in litmus
 }
@@ -78,16 +58,12 @@ func newLitmusServer(cfg litmusConfig) *litmusServer {
 	}
 	return &litmusServer{
 		bin:         cfg.Bin,
+		hopperURL:   cfg.HopperURL,
 		dirs:        cfg.Dirs,
 		maxRSSGB:    cfg.MaxRSSGB,
 		maxWorkers:  cfg.MaxWorkers,
 		timeoutSecs: cfg.TimeoutSecs,
 		verbose:     cfg.Verbose,
-		client: &http.Client{
-			// Slightly longer than litmus's analysis timeout so litmus always
-			// has a chance to return 504 before the client gives up.
-			Timeout: time.Duration(cfg.TimeoutSecs+60) * time.Second,
-		},
 	}
 }
 
@@ -187,23 +163,7 @@ func (s *litmusServer) Start(ctx context.Context) error {
 // startOnce tries up to 3 ports to launch the litmus process. Caller
 // must hold s.mu.
 func (s *litmusServer) startOnce(ctx context.Context) error {
-	var lastErr error
-	for range 3 {
-		port, l, err := freePort(ctx)
-		if err != nil {
-			return fmt.Errorf("find free port: %w", err)
-		}
-		s.port = port
-		s.url = "http://127.0.0.1:" + port
-
-		if err := s.startLocked(ctx, l); err != nil {
-			lastErr = err
-			slog.Warn("failed to start litmus, retrying with new port", "port", port, "error", err)
-			continue
-		}
-		return nil
-	}
-	return fmt.Errorf("litmus failed to start after 3 attempts: %w", lastErr)
+	return s.startLocked(ctx, nil)
 }
 
 // updateLitmus attempts to build and install the latest litmus from ../litmus.
@@ -249,23 +209,15 @@ func updateSiblingTool(ctx context.Context, name, dir string) {
 	slog.Info("tool updated successfully", "tool", name, "pulled", pulled)
 }
 
-func (s *litmusServer) startLocked(ctx context.Context, l net.Listener) error {
-	if l != nil {
-		if err := l.Close(); err != nil {
-			slog.Warn("failed to close probe listener", "error", err)
-		}
-	}
-	bind := "127.0.0.1:" + s.port
-
-	// --verbose is a top-level flag (before the subcommand), not a serve flag.
+func (s *litmusServer) startLocked(ctx context.Context, _ net.Listener) error {
 	args := []string{}
 	if s.verbose {
 		args = append(args, "--verbose")
 	}
-	args = append(args, "serve", "--bind", bind)
-	if len(s.dirs) > 0 {
-		args = append(args, "--allowed-dirs", strings.Join(s.dirs, ","))
-	}
+	args = append(args, "worker",
+		"--hopper-url", s.hopperURL,
+		"--name", "local",
+	)
 	if s.maxRSSGB > 0 {
 		args = append(args, "--max-rss-gb", strconv.Itoa(s.maxRSSGB))
 	}
@@ -273,8 +225,6 @@ func (s *litmusServer) startLocked(ctx context.Context, l net.Listener) error {
 		args = append(args, "--timeout-secs", strconv.Itoa(s.timeoutSecs))
 	}
 	if s.maxWorkers > 0 {
-		// Match litmus's max_concurrent_tasks to hopper's dispatch pool so
-		// the dashboard and litmus's own /_/health agree on slot count.
 		args = append(args, "--workers", strconv.Itoa(s.maxWorkers))
 	}
 
@@ -301,28 +251,21 @@ func (s *litmusServer) startLocked(ctx context.Context, l net.Listener) error {
 	s.pid.Store(int64(cmd.Process.Pid))
 
 	//nolint:gosec // values are sanitized or derived locally; this is a false positive on structured slog fields.
-	slog.Info("starting litmus server",
-		"bind", bind,
+	slog.Info("starting litmus worker",
 		"pid", cmd.Process.Pid,
 		"log", sanitizeLogString(logFile.Name()),
 		"args", sanitizeLogString(strings.Join(args, " ")))
 
-	if err := s.waitHealthy(ctx); err != nil {
-		//nolint:gosec // values are sanitized or derived locally; this is a false positive on structured slog fields.
-		slog.Error("litmus server failed readiness check",
-			"pid", cmd.Process.Pid,
-			"bind", bind,
-			"error", err,
-			"log", sanitizeLogString(logFile.Name()))
-		killProcess("failed to kill unready litmus server", cmd.Process, "pid", cmd.Process.Pid)
-		waitCommand("litmus exited after readiness failure", cmd, "pid", cmd.Process.Pid)
+	// Brief startup check: if the process crashes immediately, report it.
+	time.Sleep(500 * time.Millisecond)
+	if cmd.ProcessState != nil {
 		closeLogFile(logFile.Name(), logFile)
 		s.cmd = nil
 		s.pid.Store(0)
-		return fmt.Errorf("litmus not healthy: %w", err)
+		return errors.New("litmus worker exited immediately")
 	}
 
-	slog.Info("litmus server ready", "url", s.url, "pid", cmd.Process.Pid)
+	slog.Info("litmus worker started", "pid", cmd.Process.Pid)
 	return nil
 }
 
@@ -332,7 +275,7 @@ func (s *litmusServer) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.cmd != nil && s.cmd.Process != nil {
-		slog.Info("stopping litmus server", "pid", s.cmd.Process.Pid, "url", s.url)
+		slog.Info("stopping litmus server", "pid", s.cmd.Process.Pid, "url", s.hopperURL)
 		killProcess("failed to kill litmus server during stop", s.cmd.Process, "pid", s.cmd.Process.Pid)
 		waitCommand("litmus exited during stop", s.cmd, "pid", s.cmd.Process.Pid)
 		s.cmd = nil
@@ -366,14 +309,14 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 		restarts := int(s.restarts.Add(1))
 		slog.Warn("litmus server crashed",
 			"pid", pid,
-			"url", s.url,
+			"url", s.hopperURL,
 			"error", err,
 			"restarts", restarts)
 
 		delay := time.Duration(1<<min(restarts-1, 4)) * time.Second
 		slog.Info("restarting litmus server",
 			"previous_pid", pid,
-			"url", s.url,
+			"url", s.hopperURL,
 			"delay", delay,
 			"attempt", restarts)
 		select {
@@ -400,7 +343,7 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 		if err != nil {
 			slog.Error("failed to restart litmus",
 				"previous_pid", pid,
-				"url", s.url,
+				"url", s.hopperURL,
 				"attempt", restarts,
 				"next_delay", time.Duration(1<<min(restarts, 4))*time.Second,
 				"error", err)
@@ -408,7 +351,7 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 		}
 		slog.Info("litmus restart waiting for recovery window",
 			"pid", s.currentPID(),
-			"url", s.url,
+			"url", s.hopperURL,
 			"delay", restartRecoveryDelay,
 			"attempt", restarts)
 		select {
@@ -419,403 +362,25 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 		slog.Info("litmus server restarted",
 			"restarts", restarts,
 			"pid", s.currentPID(),
-			"url", s.url)
+			"url", s.hopperURL)
 	}
 }
 
 func (s *litmusServer) waitExit(ctx context.Context) error {
-	if s.cmd == nil {
+	s.mu.Lock()
+	cmd := s.cmd
+	s.mu.Unlock()
+	if cmd == nil {
 		return errors.New("no process")
 	}
 	done := make(chan error, 1)
-	go func() { done <- s.cmd.Wait() }()
+	go func() { done <- cmd.Wait() }()
 	select {
 	case err := <-done:
 		return err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-}
-
-func (s *litmusServer) waitHealthy(ctx context.Context) error {
-	deadline := time.After(120 * time.Second) // litmus loads model + YARA, may take longer than cleave
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-deadline:
-			return errors.New("timeout waiting for litmus to start")
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			// Bail fast if the process already exited (e.g. port conflict).
-			if s.cmd != nil && s.cmd.Process != nil {
-				if err := s.cmd.Process.Signal(syscall.Signal(0)); err != nil {
-					return fmt.Errorf("litmus exited during startup: %w", err)
-				}
-			}
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.url+"/_/health", http.NoBody)
-			if err != nil {
-				continue
-			}
-			resp, err := s.client.Do(req) //nolint:gosec // URL is constructed from localhost + port
-			if err != nil {
-				continue
-			}
-			if err := resp.Body.Close(); err != nil {
-				slog.Debug("close litmus health body", "error", err)
-			}
-			if resp.StatusCode == http.StatusOK {
-				return nil
-			}
-		}
-	}
-}
-
-// TrackWorker registers a worker as analyzing a file. Call with "" to clear.
-func (s *litmusServer) TrackWorker(workerID int, file string) {
-	if file == "" {
-		s.inFlight.Delete(workerID)
-	} else {
-		s.inFlight.Store(workerID, &workerState{File: file, StartedAt: time.Now()})
-	}
-}
-
-// workerSummary returns counts and the oldest in-flight file for logging.
-func (s *litmusServer) workerSummary() workerSnapshot {
-	now := time.Now()
-	summary := workerSnapshot{Idle: s.maxWorkers}
-	s.inFlight.Range(func(_, v any) bool {
-		ws, ok := v.(*workerState)
-		if !ok {
-			return true
-		}
-		summary.Busy++
-		elapsed := now.Sub(ws.StartedAt).Milliseconds()
-		if elapsed > summary.OldestMS {
-			summary.OldestMS = elapsed
-			summary.OldestFile = ws.File
-		}
-		return true
-	})
-	summary.Idle -= summary.Busy
-	if summary.Idle < 0 {
-		summary.Idle = 0
-	}
-	return summary
-}
-
-// WatchHealth periodically polls litmus /_/health and /_/requests, logs the
-// state, and kills litmus if any request has been stuck longer than the
-// configured timeout. Runs alongside Monitor; call in a separate goroutine.
-func (s *litmusServer) WatchHealth(ctx context.Context) {
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-
-	stuckThreshold := time.Duration(s.timeoutSecs) * time.Second
-	if stuckThreshold == 0 {
-		stuckThreshold = 600 * time.Second
-	}
-	// Kill if any request exceeds the timeout + 1 minute grace period.
-	killThreshold := stuckThreshold + time.Minute
-
-	healthFailures := 0
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-
-		if s.stopped.Load() {
-			return
-		}
-
-		// Don't poll or accumulate failures while the rebuild goroutine
-		// is restarting litmus — the process is expected to be down.
-		if s.building.Load() {
-			healthFailures = 0
-			continue
-		}
-
-		health := s.pollHealth(ctx)
-		if health == nil {
-			healthFailures++
-			if healthFailures >= 3 {
-				pid := s.currentPID()
-				slog.Error("litmus health check failed repeatedly, killing to force restart",
-					"failures", healthFailures,
-					"pid", pid,
-					"url", s.url)
-				s.mu.Lock()
-				if s.cmd != nil && s.cmd.Process != nil {
-					killProcess("failed to kill unhealthy litmus server", s.cmd.Process, "pid", s.cmd.Process.Pid)
-				}
-				s.mu.Unlock()
-				healthFailures = 0
-			}
-			continue
-		}
-		healthFailures = 0
-
-		summary := s.workerSummary()
-
-		level := slog.LevelDebug
-		if !isStdoutTTY() && (health.ActiveTasks > 0 || summary.Busy > 0) {
-			level = slog.LevelInfo
-		}
-		slog.Default().Log(ctx, level, "litmus health",
-			"live_tasks", health.LiveTasks,
-			"orphaned_tasks", health.OrphanedTasks,
-			"active_tasks", health.ActiveTasks,
-			"max_concurrent", health.MaxConcurrent,
-			"load", fmt.Sprintf("%.2f", health.Load),
-			"load_avg", fmt.Sprintf("%.2f", health.LoadAvg),
-			"rss_mb", health.RSSMB,
-			"litmus_oldest_ms", health.OldestRequestMs,
-			"litmus_oldest_name", health.OldestRequestName,
-			"hopper_busy", summary.Busy,
-			"hopper_idle", summary.Idle,
-			"hopper_oldest_ms", summary.OldestMS,
-			"hopper_oldest_file", summary.OldestFile,
-		)
-
-		needKill := false
-		killReason := ""
-		if health.OrphanedTasks > 0 && health.OrphanedTasks >= health.LiveTasks {
-			needKill = true
-			killReason = "all slots orphaned — pool fully deadlocked"
-		} else if health.OldestRequestMs > killThreshold.Milliseconds() &&
-			health.LiveTasks > 0 &&
-			health.LiveTasks == health.ActiveTasks {
-			// Only kill for a stuck request when ALL live slots are stuck
-			// (i.e., every slot has exceeded the timeout). A single stuck
-			// request is handled by litmus's own per-request timeout; killing
-			// the whole process would destroy all other in-flight work.
-			needKill = true
-			killReason = fmt.Sprintf("all %d live slots exceeded kill threshold", health.LiveTasks)
-		}
-		if needKill {
-			pid := s.currentPID()
-			slog.Error("killing litmus to force restart",
-				"reason", killReason,
-				"oldest_request_ms", health.OldestRequestMs,
-				"oldest_request_name", health.OldestRequestName,
-				"orphaned_tasks", health.OrphanedTasks,
-				"live_tasks", health.LiveTasks,
-				"kill_threshold_ms", killThreshold.Milliseconds(),
-				"pid", pid,
-				"url", s.url,
-				"hopper_busy", summary.Busy,
-				"hopper_idle", summary.Idle,
-				"hopper_oldest_file", summary.OldestFile,
-			)
-			s.mu.Lock()
-			if s.cmd != nil && s.cmd.Process != nil {
-				killProcess("failed to kill stuck litmus server", s.cmd.Process, "pid", s.cmd.Process.Pid)
-			}
-			s.mu.Unlock()
-		}
-	}
-}
-
-type litmusHealth struct { //nolint:govet // JSON field grouping is clearer than padding order.
-	ActiveTasks       int     `json:"active_tasks"`
-	LiveTasks         int     `json:"live_tasks"`
-	OrphanedTasks     int     `json:"orphaned_tasks"`
-	MaxConcurrent     int     `json:"max_concurrent_tasks"`
-	Load              float64 `json:"load"`
-	LoadAvg           float64 `json:"load_avg"`
-	RSSMB             int     `json:"rss_mb"`
-	Status            string  `json:"status"`
-	Reason            string  `json:"reason"`
-	UptimeSecs        int     `json:"uptime_secs"`
-	OldestRequestMs   int64
-	OldestRequestName string
-}
-
-func (s *litmusServer) pollHealth(ctx context.Context) *litmusHealth {
-	// Poll health.
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.url+"/_/health", http.NoBody)
-	if err != nil {
-		return nil
-	}
-	resp, err := s.client.Do(req) //nolint:gosec // localhost only
-	if err != nil {
-		return nil
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if err != nil {
-		if closeErr := resp.Body.Close(); closeErr != nil {
-			slog.Debug("close litmus health response after read failure", "error", closeErr)
-		}
-		return nil
-	}
-	if err := resp.Body.Close(); err != nil {
-		slog.Debug("close litmus health response", "error", err)
-	}
-
-	var h litmusHealth
-	if err := json.Unmarshal(body, &h); err != nil {
-		slog.Debug("failed to parse litmus health JSON", "error", err, "body_len", len(body))
-		return nil
-	}
-
-	// Poll in-flight requests for oldest.
-	req, err = http.NewRequestWithContext(ctx, http.MethodGet, s.url+"/_/requests", http.NoBody)
-	if err != nil {
-		return &h
-	}
-	resp, err = s.client.Do(req) //nolint:gosec // localhost only
-	if err != nil {
-		return &h
-	}
-	body, err = io.ReadAll(io.LimitReader(resp.Body, 32768))
-	if err != nil {
-		if closeErr := resp.Body.Close(); closeErr != nil {
-			slog.Debug("close litmus requests response after read failure", "error", closeErr)
-		}
-		return &h
-	}
-	if err := resp.Body.Close(); err != nil {
-		slog.Debug("close litmus requests response", "error", err)
-	}
-
-	var reqList struct {
-		Requests []struct {
-			Name      string `json:"name"`
-			ElapsedMs int64  `json:"elapsed_ms"`
-		} `json:"requests"`
-	}
-	if json.Unmarshal(body, &reqList) == nil && len(reqList.Requests) > 0 {
-		// Requests are sorted by elapsed descending — first is oldest.
-		h.OldestRequestMs = reqList.Requests[0].ElapsedMs
-		h.OldestRequestName = reqList.Requests[0].Name
-	}
-
-	return &h
-}
-
-// analyzeResult holds the split litmus response for storage in hopper.
-type analyzeResult struct { //nolint:govet // result fields are grouped by meaning for call sites.
-	ML        json.RawMessage // ml section → litmus_result column
-	Raw       json.RawMessage // raw section → cleave_result column
-	Canonical string          // canonical SHA256 from raw.fs[]
-	TotalMs   int64           // server-reported total analysis time (from X-Total-Ms header)
-}
-
-var errRetryable = errors.New("service unavailable")
-
-// Analyze sends a file to the litmus server for analysis with a single HTTP
-// request. Retry/backoff is handled by the slot loop's analyzeWithRetry
-// wrapper (in pool.go) so local and remote nodes share one retry policy.
-//
-// Returns errRetryable on 503 so the wrapper can decide whether to retry.
-func (s *litmusServer) Analyze(ctx context.Context, sha256, path string) (*analyzeResult, error) {
-	body, err := json.Marshal(struct {
-		Path string `json:"path"`
-	}{Path: path})
-	if err != nil {
-		return nil, err
-	}
-	return s.doAnalyze(ctx, sha256, body)
-}
-
-// Slots returns the number of concurrent analyses this node accepts; satisfies
-// the analyzer interface so the local litmus can sit in the pool alongside
-// remote nodes.
-func (s *litmusServer) Slots() int { return s.maxWorkers }
-
-// MemoryMB returns total system memory discovered from the local litmus
-// process via /_/info. Returns 0 if litmus hasn't reported it yet.
-func (s *litmusServer) MemoryMB() int { return int(s.memoryMB.Load()) }
-
-// Name returns a short human-readable identifier for logs and metrics.
-func (s *litmusServer) Name() string { return "local:" + s.port }
-
-// Health polls the local litmus's /_/health and returns a parsed snapshot.
-// While the binary is being rebuilt it returns a synthetic "building" status
-// so the dashboard shows progress without hitting an endpoint that may be
-// mid-restart.
-func (s *litmusServer) Health(ctx context.Context) (*nodeHealth, error) {
-	if s.building.Load() {
-		return &nodeHealth{Status: "building", Reason: "rebuilding_binary"}, nil
-	}
-	return fetchHealth(ctx, s.client, s.url)
-}
-
-// Info fetches /_/info from the local litmus. Returns the same shape as
-// remote nodes so the version-mismatch comparison can treat all nodes
-// uniformly.
-func (s *litmusServer) Info(ctx context.Context) (*nodeInfo, error) {
-	return fetchInfo(ctx, s.client, s.url)
-}
-
-// Update asks the local litmus to pull fresh models + traits and reload.
-// Hopper already runs `git pull && make install` against ../litmus and
-// ../cleave on its own host (updateLitmus / updateCleave) — this updates
-// the model/traits *data files* used by the running binary. The two paths
-// are independent: binary version comes from the install, data versions
-// come from the repos this endpoint pulls.
-func (s *litmusServer) Update(ctx context.Context) (*updateResult, error) {
-	return postUpdate(ctx, s.client, s.url)
-}
-
-func (s *litmusServer) doAnalyze(ctx context.Context, sha256 string, body []byte) (*analyzeResult, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url+"/analyze-path", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := s.client.Do(req) //nolint:gosec // URL is constructed from localhost + port
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close() //nolint:errcheck // HTTP response
-
-	if resp.StatusCode == http.StatusServiceUnavailable {
-		return nil, errRetryable
-	}
-	if resp.StatusCode != http.StatusOK {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512)) //nolint:errcheck // best-effort error body
-		return nil, fmt.Errorf("litmus: %s: HTTP %d: %s", sha256, resp.StatusCode, bytes.TrimSpace(msg))
-	}
-
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("litmus: read response: %w", err)
-	}
-
-	// Split the {"ml": {...}, "raw": {...}} envelope.
-	var envelope struct {
-		ML  json.RawMessage `json:"ml"`
-		Raw json.RawMessage `json:"raw"`
-	}
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return nil, fmt.Errorf("litmus: parse envelope: %w", err)
-	}
-
-	canonical := extractCanonicalSHA(sha256, envelope.Raw)
-
-	var totalMs int64
-	if v := resp.Header.Get("X-Total-Ms"); v != "" {
-		parsed, parseErr := strconv.ParseInt(v, 10, 64)
-		if parseErr != nil {
-			//nolint:gosec // header value is sanitized before logging; this is a false positive on slog taint flow.
-			slog.Debug("invalid X-Total-Ms header", "value", sanitizeLogString(v), "error", parseErr)
-		} else {
-			totalMs = parsed
-		}
-	}
-
-	return &analyzeResult{
-		ML:        envelope.ML,
-		Raw:       envelope.Raw,
-		Canonical: canonical,
-		TotalMs:   totalMs,
-	}, nil
 }
 
 // extractCanonicalSHA computes the minimum SHA256 across files in the raw cleave report.
@@ -860,30 +425,3 @@ func freePort(ctx context.Context) (string, net.Listener, error) {
 	}
 	return strconv.Itoa(addr.Port), l, nil
 }
-
-func isRetryableNetError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return true
-	}
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		return true
-	}
-	// Common connection-level errors (refused, reset, broken pipe).
-	s := err.Error()
-	return strings.Contains(s, "connection refused") ||
-		strings.Contains(s, "connection reset") ||
-		strings.Contains(s, "broken pipe")
-}
-
-func isStdoutTTY() bool {
-	fileInfo, err := os.Stdout.Stat()
-	if err != nil {
-		return false
-	}
-	return (fileInfo.Mode() & os.ModeCharDevice) != 0
-}
-

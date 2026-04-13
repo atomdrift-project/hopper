@@ -536,6 +536,59 @@ func (db *DB) Unanalyzed(ctx context.Context, limit int) ([]*Sample, error) {
 	return db.unanalyzedSQLite(ctx, limit)
 }
 
+// Pull-based work scheduling.
+
+// ClaimJob is a work item returned to a litmus worker.
+type ClaimJob struct {
+	SHA256    string `json:"sha256"`
+	Path      string `json:"path"`
+	SizeBytes int64  `json:"size_bytes"`
+}
+
+// Worker is a litmus worker's latest heartbeat data.
+type Worker struct {
+	Name     string    `json:"name"`
+	LastSeen time.Time `json:"last_seen"`
+	Slots    int       `json:"slots"`
+	Version  string    `json:"version"`
+	Traits   string    `json:"traits"`
+	Analyzed int64     `json:"analyzed"`
+	Errors   int64     `json:"errors"`
+}
+
+// ClaimJobs atomically claims up to limit unanalyzed samples for the named
+// worker. Expired claims (older than expiry) are reclaimed.
+func (db *DB) ClaimJobs(ctx context.Context, worker string, limit int, expiry time.Duration) ([]ClaimJob, error) {
+	if db.pool != nil {
+		return db.claimJobsPG(ctx, worker, limit, expiry)
+	}
+	return db.claimJobsSQLite(ctx, worker, limit, expiry)
+}
+
+// UnclaimJobs releases claims for the given SHA256s so other workers can try.
+func (db *DB) UnclaimJobs(ctx context.Context, shas []string) error {
+	if db.pool != nil {
+		return db.unclaimJobsPG(ctx, shas)
+	}
+	return db.unclaimJobsSQLite(ctx, shas)
+}
+
+// UpsertWorker records a worker heartbeat for dashboard display.
+func (db *DB) UpsertWorker(ctx context.Context, w Worker) error {
+	if db.pool != nil {
+		return db.upsertWorkerPG(ctx, w)
+	}
+	return db.upsertWorkerSQLite(ctx, w)
+}
+
+// ActiveWorkers returns workers seen within the given duration.
+func (db *DB) ActiveWorkers(ctx context.Context, since time.Duration) ([]Worker, error) {
+	if db.pool != nil {
+		return db.activeWorkersPG(ctx, since)
+	}
+	return db.activeWorkersSQLite(ctx, since)
+}
+
 // SamplesByLabel returns up to limit samples with the given label, ordered by id.
 func (db *DB) SamplesByLabel(ctx context.Context, label string, limit int) ([]*Sample, error) {
 	if db.pool != nil {
