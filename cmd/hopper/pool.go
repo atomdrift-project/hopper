@@ -900,10 +900,11 @@ func warnVersionMismatch(snaps []nodeInfoSnapshot) {
 // dialAllRemoteLitmus dials each address concurrently. Failures are logged
 // and the node is omitted from the result — startup never fails because of
 // an unreachable remote node, on the principle that N working nodes are
-// better than aborting the run.
-func dialAllRemoteLitmus(ctx context.Context, addrs []string) []*remoteLitmus {
+// better than aborting the run. Failed addresses are returned so callers can
+// retry them later.
+func dialAllRemoteLitmus(ctx context.Context, addrs []string) (nodes []*remoteLitmus, failed []string) {
 	if len(addrs) == 0 {
-		return nil
+		return nil, nil
 	}
 	type result struct {
 		node *remoteLitmus
@@ -917,15 +918,50 @@ func dialAllRemoteLitmus(ctx context.Context, addrs []string) []*remoteLitmus {
 			results <- result{node: n, err: err, addr: addr}
 		}(addr)
 	}
-	var nodes []*remoteLitmus
 	for range addrs {
 		r := <-results
 		if r.err != nil {
 			slog.Warn("remote litmus unreachable at startup; skipping",
 				"addr", r.addr, "error", r.err)
+			failed = append(failed, r.addr)
 			continue
 		}
 		nodes = append(nodes, r.node)
 	}
-	return nodes
+	return nodes, failed
+}
+
+// monitorPool is a thread-safe, append-only collection of node monitors.
+// The dashboard reads the current snapshot on every tick via All(); the
+// late-join retry goroutine appends via Add(). Internally it swaps an
+// atomic pointer to an immutable slice so readers never block.
+type monitorPool struct {
+	p atomic.Pointer[[]*nodeMonitor]
+}
+
+func newMonitorPool(initial []*nodeMonitor) *monitorPool {
+	mp := &monitorPool{}
+	if initial == nil {
+		initial = []*nodeMonitor{}
+	}
+	mp.p.Store(&initial)
+	return mp
+}
+
+// All returns the current snapshot. The returned slice must not be mutated.
+func (mp *monitorPool) All() []*nodeMonitor {
+	return *mp.p.Load()
+}
+
+// Add appends new monitors and atomically publishes the updated list.
+func (mp *monitorPool) Add(monitors ...*nodeMonitor) {
+	for {
+		old := mp.p.Load()
+		next := make([]*nodeMonitor, len(*old)+len(monitors))
+		copy(next, *old)
+		copy(next[len(*old):], monitors)
+		if mp.p.CompareAndSwap(old, &next) {
+			return
+		}
+	}
 }

@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"sync/atomic"
 	"time"
 )
@@ -142,18 +143,20 @@ func (s *litmusServer) Start(ctx context.Context) error {
 		return errors.New("litmus server already started")
 	}
 
-	s.building.Store(true)
-
-	// Start the server with the currently installed binary, then rebuild
-	// in the background. The goroutine below will restart litmus with the
-	// fresh binary once the build completes.
+	// Start the server with the currently installed binary so it can
+	// serve traffic immediately. The rebuild runs in the background and
+	// only briefly sets building=true during the actual restart swap.
 	if err := s.startOnce(ctx); err != nil {
 		return err
 	}
 
 	go func() {
-		defer s.building.Store(false)
 		updateLitmus(ctx)
+
+		// Only mark building during the brief restart window so the
+		// existing process serves traffic throughout the build.
+		s.building.Store(true)
+		defer s.building.Store(false)
 
 		// Restart so the newly built binary takes effect. Reuse the
 		// same port — it is free because we kill the old process first,
@@ -444,6 +447,12 @@ func (s *litmusServer) waitHealthy(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+			// Bail fast if the process already exited (e.g. port conflict).
+			if s.cmd != nil && s.cmd.Process != nil {
+				if err := s.cmd.Process.Signal(syscall.Signal(0)); err != nil {
+					return fmt.Errorf("litmus exited during startup: %w", err)
+				}
+			}
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.url+"/_/health", http.NoBody)
 			if err != nil {
 				continue

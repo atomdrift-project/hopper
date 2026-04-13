@@ -555,15 +555,19 @@ func cmdLoad(ctx context.Context) error {
 	}()
 
 	// Dial remote litmus nodes in parallel with everything else.
-	type remoteResult struct{ nodes []analyzer }
+	type remoteResult struct {
+		nodes  []analyzer
+		failed []string
+	}
 	remoteCh := make(chan remoteResult, 1)
 	go func() {
 		if remoteAddrs := parseLitmusNodes(*litmusNodes); len(remoteAddrs) > 0 {
+			dialed, failed := dialAllRemoteLitmus(ctx, remoteAddrs)
 			var nodes []analyzer
-			for _, r := range dialAllRemoteLitmus(ctx, remoteAddrs) {
+			for _, r := range dialed {
 				nodes = append(nodes, r)
 			}
-			remoteCh <- remoteResult{nodes: nodes}
+			remoteCh <- remoteResult{nodes: nodes, failed: failed}
 		} else {
 			remoteCh <- remoteResult{}
 		}
@@ -623,16 +627,18 @@ func cmdLoad(ctx context.Context) error {
 
 		// Best-effort: ask every litmus node to refresh its models + traits
 		// data files, then compare versions across the pool. Both phases
-		// are non-fatal — a failed update or unreachable /_/info logs a
-		// warning and the load proceeds. The version-mismatch check ALWAYS
-		// runs (even with --no-rules-update) so the operator gets a loud
-		// signal if a node is running stale code or stale rules.
-		if !*noRulesUpdate {
-			updateAllNodes(ctx, nodes)
-		} else {
-			slog.Info("skipping rules/model update (--no-rules-update)")
-		}
-		warnVersionMismatch(fetchAllNodeInfo(ctx, nodes))
+		// are non-fatal and run in the background so the load starts
+		// immediately. The version-mismatch check ALWAYS runs (even with
+		// --no-rules-update) so the operator gets a loud signal if a node
+		// is running stale code or stale rules.
+		go func() {
+			if !*noRulesUpdate {
+				updateAllNodes(ctx, nodes)
+			} else {
+				slog.Info("skipping rules/model update (--no-rules-update)")
+			}
+			warnVersionMismatch(fetchAllNodeInfo(ctx, nodes))
+		}()
 	}
 
 	var shared loadProgress
@@ -641,7 +647,7 @@ func cmdLoad(ctx context.Context) error {
 	loadCtx, loadCancel := context.WithCancel(ctx)
 	defer loadCancel()
 
-	total := loadAll(loadCtx, loadCancel, db, litmus, nodes, cache, loadDirs, *source, *workers, *rescan, *maxAnalyzed, *experimentTag, wd, &shared)
+	total := loadAll(loadCtx, loadCancel, db, litmus, nodes, remotes.failed, !*noRulesUpdate, cache, loadDirs, *source, *workers, *rescan, *maxAnalyzed, *experimentTag, wd, &shared)
 	slog.Info("load complete", "samples", total)
 	return nil
 }
@@ -700,7 +706,7 @@ var (
 // may run concurrently (irrelevant for typical 3-dir loads).
 //
 //nolint:revive // signature matches the pipeline's top-level orchestration contract.
-func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litmus *litmusServer, nodes []analyzer, cache *hashCache, dirs []struct{ dir, label string }, source string, nworkers int, rescan bool, maxAnalyzed int, experimentTag string, wd *webDashboard, shared *loadProgress) int {
+func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litmus *litmusServer, nodes []analyzer, failedAddrs []string, updateRules bool, cache *hashCache, dirs []struct{ dir, label string }, source string, nworkers int, rescan bool, maxAnalyzed int, experimentTag string, wd *webDashboard, shared *loadProgress) int {
 	slog.Info("loading", "dirs", len(dirs))
 	start := time.Now()
 	var progress loadProgress
@@ -722,13 +728,23 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 	// spawned over this queue.
 	var analyzeQueue chan loadJob
 	var analyzeWG sync.WaitGroup
-	var monitors []*nodeMonitor
+	mp := newMonitorPool(nil)
 	if len(nodes) > 0 {
 		analyzeQueue = make(chan loadJob, 2_000_000)
 		// Per-node /_/health pollers feed the dashboard's pool block.
 		// Created before workers so monitors can be wired for per-node counters.
-		monitors = startNodeMonitors(ctx, nodes)
+		monitors := startNodeMonitors(ctx, nodes)
+		mp.Add(monitors...)
 		startAnalysisWorkers(ctx, cancel, db, nodes, analyzeQueue, &analyzeWG, &progress, shared, maxAnalyzed, monitors)
+	} else if len(failedAddrs) > 0 {
+		// No nodes connected at startup, but we have addrs to retry —
+		// create the queue so late-joining nodes have somewhere to read.
+		analyzeQueue = make(chan loadJob, 2_000_000)
+	}
+
+	// Retry remote nodes that were unreachable at startup.
+	if len(failedAddrs) > 0 && analyzeQueue != nil {
+		go retryFailedNodes(ctx, cancel, db, failedAddrs, updateRules, analyzeQueue, &analyzeWG, &progress, shared, maxAnalyzed, mp)
 	}
 
 	// Progress dashboard: reads counters, exits when dashCtx is cancelled.
@@ -736,11 +752,11 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 	defer dashCancel()
 	var dashWG sync.WaitGroup
 	dashWG.Go(func() {
-		runDashboard(dashCtx, &progress, litmus, monitors, start, startAnalyzed, maxAnalyzed, len(dirs))
+		runDashboard(dashCtx, &progress, litmus, mp, start, startAnalyzed, maxAnalyzed, len(dirs))
 	})
 
 	if wd != nil {
-		wd.configure(&progress, litmus, monitors, start, startAnalyzed, maxAnalyzed, len(dirs))
+		wd.configure(&progress, litmus, mp, start, startAnalyzed, maxAnalyzed, len(dirs))
 	}
 
 	// Per-directory pipelines: each goroutine runs cleave→hash→batch→
@@ -901,7 +917,7 @@ func runDashboard(
 	ctx context.Context,
 	progress *loadProgress,
 	litmus *litmusServer,
-	monitors []*nodeMonitor,
+	mp *monitorPool,
 	start time.Time,
 	startAnalyzed int64,
 	maxAnalyzed, ndirs int,
@@ -920,6 +936,8 @@ func runDashboard(
 			return
 		case <-ticker.C:
 		}
+
+		monitors := mp.All()
 
 		analyzedAbs := progress.analyzed.Load()
 		sessionAnalyzed := max(analyzedAbs-startAnalyzed, 0)
@@ -1315,6 +1333,65 @@ func startAnalysisWorkers(
 					}
 				}
 			})
+		}
+	}
+}
+
+// retryFailedNodes periodically re-dials remote litmus addresses that were
+// unreachable at startup. When a node connects, it is added to the monitor
+// pool and new analysis workers are spawned on the shared queue.
+func retryFailedNodes(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	db *hopper.DB,
+	addrs []string,
+	updateRules bool,
+	queue chan loadJob,
+	wg *sync.WaitGroup,
+	progress *loadProgress,
+	shared *loadProgress,
+	maxAnalyzed int,
+	mp *monitorPool,
+) {
+	const retryInterval = 30 * time.Second
+	ticker := time.NewTicker(retryInterval)
+	defer ticker.Stop()
+
+	pending := make(map[string]struct{}, len(addrs))
+	for _, a := range addrs {
+		pending[a] = struct{}{}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		if len(pending) == 0 {
+			return
+		}
+
+		for addr := range pending {
+			node, err := dialRemoteLitmus(ctx, addr)
+			if err != nil {
+				slog.Debug("retry dial failed", "addr", addr, "error", err)
+				continue
+			}
+			delete(pending, addr)
+
+			if updateRules {
+				updateAllNodes(ctx, []analyzer{node})
+			}
+
+			monitors := startNodeMonitors(ctx, []analyzer{node})
+			mp.Add(monitors...)
+			startAnalysisWorkers(ctx, cancel, db, []analyzer{node}, queue, wg, progress, shared, maxAnalyzed, monitors)
+			slog.Info("late-joined remote node",
+				"addr", addr,
+				"slots", node.Slots(),
+				"pending", len(pending))
 		}
 	}
 }

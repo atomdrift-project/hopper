@@ -18,7 +18,7 @@ type webDashboard struct {
 	cfgMu         sync.RWMutex
 	progress      *loadProgress
 	litmus        *litmusServer
-	monitors      []*nodeMonitor
+	mp            *monitorPool
 	start         time.Time
 	startAnalyzed int64
 	maxAnalyzed   int
@@ -31,12 +31,12 @@ type webDashboard struct {
 // configure is called once the load session is ready. It sets the fields the
 // handler needs to render progress and is safe to call concurrently with the
 // HTTP server already running.
-func (wd *webDashboard) configure(progress *loadProgress, litmus *litmusServer, monitors []*nodeMonitor, start time.Time, startAnalyzed int64, maxAnalyzed, ndirs int) {
+func (wd *webDashboard) configure(progress *loadProgress, litmus *litmusServer, mp *monitorPool, start time.Time, startAnalyzed int64, maxAnalyzed, ndirs int) {
 	wd.cfgMu.Lock()
 	defer wd.cfgMu.Unlock()
 	wd.progress = progress
 	wd.litmus = litmus
-	wd.monitors = monitors
+	wd.mp = mp
 	wd.start = start
 	wd.startAnalyzed = startAnalyzed
 	wd.maxAnalyzed = maxAnalyzed
@@ -54,10 +54,14 @@ type throughputSample struct {
 func (wd *webDashboard) recordSample(total int64) {
 	wd.mu.Lock()
 	defer wd.mu.Unlock()
+	var monitors []*nodeMonitor
+	if wd.mp != nil {
+		monitors = wd.mp.All()
+	}
 	s := throughputSample{t: time.Now(), total: total}
-	if len(wd.monitors) > 0 {
-		s.byNode = make([]int64, len(wd.monitors))
-		for i, m := range wd.monitors {
+	if len(monitors) > 0 {
+		s.byNode = make([]int64, len(monitors))
+		for i, m := range monitors {
 			s.byNode[i] = m.Analyzed()
 		}
 	}
@@ -80,8 +84,12 @@ func (wd *webDashboard) throughputSeries() (combined []float64, perNode [][]floa
 		return nil, nil
 	}
 	combined = make([]float64, n-1)
-	if len(wd.monitors) > 0 {
-		perNode = make([][]float64, len(wd.monitors))
+	var monitors []*nodeMonitor
+	if wd.mp != nil {
+		monitors = wd.mp.All()
+	}
+	if len(monitors) > 0 {
+		perNode = make([][]float64, len(monitors))
 		for i := range perNode {
 			perNode[i] = make([]float64, n-1)
 		}
@@ -92,7 +100,7 @@ func (wd *webDashboard) throughputSeries() (combined []float64, perNode [][]floa
 			continue
 		}
 		combined[i-1] = float64(samples[i].total-samples[i-1].total) / dt
-		for j := range wd.monitors {
+		for j := range monitors {
 			if j < len(samples[i].byNode) && j < len(samples[i-1].byNode) {
 				perNode[j][i-1] = float64(samples[i].byNode[j]-samples[i-1].byNode[j]) / dt
 			}
@@ -222,11 +230,16 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 	wd.cfgMu.RLock()
 	progress := wd.progress
 	litmus := wd.litmus
-	monitors := wd.monitors
+	mp := wd.mp
 	start := wd.start
 	startAnalyzed := wd.startAnalyzed
 	maxAnalyzed := wd.maxAnalyzed
 	wd.cfgMu.RUnlock()
+
+	var monitors []*nodeMonitor
+	if mp != nil {
+		monitors = mp.All()
+	}
 
 	// Show a minimal "starting up" page until configure() has been called.
 	if progress == nil {
