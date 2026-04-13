@@ -583,12 +583,18 @@ func (s *litmusServer) WatchHealth(ctx context.Context) {
 
 		needKill := false
 		killReason := ""
-		if health.OldestRequestMs > killThreshold.Milliseconds() {
-			needKill = true
-			killReason = "stuck request exceeded kill threshold"
-		} else if health.OrphanedTasks > 0 && health.OrphanedTasks >= health.LiveTasks {
+		if health.OrphanedTasks > 0 && health.OrphanedTasks >= health.LiveTasks {
 			needKill = true
 			killReason = "all slots orphaned — pool fully deadlocked"
+		} else if health.OldestRequestMs > killThreshold.Milliseconds() &&
+			health.LiveTasks > 0 &&
+			health.LiveTasks == health.ActiveTasks {
+			// Only kill for a stuck request when ALL live slots are stuck
+			// (i.e., every slot has exceeded the timeout). A single stuck
+			// request is handled by litmus's own per-request timeout; killing
+			// the whole process would destroy all other in-flight work.
+			needKill = true
+			killReason = fmt.Sprintf("all %d live slots exceeded kill threshold", health.LiveTasks)
 		}
 		if needKill {
 			pid := s.currentPID()

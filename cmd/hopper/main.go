@@ -1289,7 +1289,7 @@ func startAnalysisWorkers(
 						mon.TrackSlot(id, file)
 					}
 					t0 := time.Now()
-					result, err := analyzeWithRetry(ctx, n, job.sha, job.path)
+					result, err := analyzeWithRetry(ctx, n, mon, job.sha, job.path)
 					if local != nil {
 						local.TrackWorker(id, "")
 					}

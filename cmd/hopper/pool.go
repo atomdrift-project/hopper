@@ -527,18 +527,32 @@ func (r *remoteLitmus) Analyze(ctx context.Context, sha256, path string) (*analy
 // exponential backoff with jitter, retrying on errRetryable (503) and
 // transient network errors. Used by every slot in startAnalysisWorkers so
 // local and remote nodes share one retry policy.
-func analyzeWithRetry(ctx context.Context, node analyzer, sha256, path string) (*analyzeResult, error) {
+// errNodeUnreachable is returned when the node's health monitor reports it as
+// down, so the worker can fail fast instead of burning through retries.
+var errNodeUnreachable = errors.New("node unreachable")
+
+func analyzeWithRetry(ctx context.Context, node analyzer, mon *nodeMonitor, sha256, path string) (*analyzeResult, error) {
 	r, err := retry.DoWithData(
 		func() (*analyzeResult, error) {
+			// Fail fast if the health monitor already knows the node is down.
+			if mon != nil {
+				if snap := mon.Snapshot(); snap != nil && !snap.Reachable {
+					return nil, fmt.Errorf("%w: %s", errNodeUnreachable, snap.LastErr)
+				}
+			}
 			return node.Analyze(ctx, sha256, path)
 		},
-		retry.Attempts(12),
+		retry.Attempts(4),
 		retry.Context(ctx),
 		retry.Delay(2*time.Second),
-		retry.MaxDelay(2*time.Minute),
+		retry.MaxDelay(15*time.Second),
 		retry.DelayType(retry.CombineDelay(retry.BackOffDelay, retry.RandomDelay)),
 		retry.MaxJitter(3*time.Second),
 		retry.RetryIf(func(err error) bool {
+			// Don't retry if the health monitor says the node is down.
+			if errors.Is(err, errNodeUnreachable) {
+				return false
+			}
 			return errors.Is(err, errRetryable) || isRetryableNetError(err)
 		}),
 		retry.OnRetry(func(attempt uint, _ error) {
