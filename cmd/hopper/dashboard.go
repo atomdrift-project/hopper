@@ -259,9 +259,10 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 	wd.recordSample(sessionAnalyzed)
 
 	var etaStr string
+	var analyzeRate float64
 	if elapsedSecs := time.Since(start).Seconds(); sessionAnalyzed > 0 && analyzeTarget > sessionAnalyzed && elapsedSecs > 5 {
-		rate := float64(sessionAnalyzed) / elapsedSecs
-		etaDur := time.Duration(float64(analyzeTarget-sessionAnalyzed)/rate) * time.Second
+		analyzeRate = float64(sessionAnalyzed) / elapsedSecs
+		etaDur := time.Duration(float64(analyzeTarget-sessionAnalyzed)/analyzeRate) * time.Second
 		etaStr = formatETA(etaDur)
 	}
 
@@ -287,7 +288,14 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 	// Analysis bar: show previously-analyzed samples as a dim segment, then
 	// this session's progress in the main color, against the total corpus.
 	totalAnalyzeTarget := startAnalyzed + analyzeTarget
-	writePipelineBarWithPrior(&b, "Analysis", startAnalyzed, sessionAnalyzed, totalAnalyzeTarget)
+	var analyzeInfo string
+	if analyzeRate > 0 {
+		analyzeInfo = fmt.Sprintf("%.1f/s", analyzeRate)
+		if etaStr != "" {
+			analyzeInfo += " ETA " + etaStr
+		}
+	}
+	writePipelineBarWithPrior(&b, "Analysis", startAnalyzed, sessionAnalyzed, totalAnalyzeTarget, analyzeInfo)
 	b.WriteString(`</section>`)
 
 	// Throughput graph
@@ -482,7 +490,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 
 // writePipelineBarWithPrior renders a two-segment progress bar: a dim segment
 // for previously-analyzed samples and a bright segment for this session's work.
-func writePipelineBarWithPrior(b *strings.Builder, name string, prior, session, total int64) {
+func writePipelineBarWithPrior(b *strings.Builder, name string, prior, session, total int64, info string) {
 	priorPct := 0.0
 	sessionPct := 0.0
 	if total > 0 {
@@ -500,6 +508,9 @@ func writePipelineBarWithPrior(b *strings.Builder, name string, prior, session, 
 		stats += fmt.Sprintf(` <span style="color:var(--sub)">(+%s prior)</span>`, fmtN(prior))
 	}
 	stats += fmt.Sprintf(" / %s &nbsp; <em>%.0f%%</em>", fmtN(total), overallPct)
+	if info != "" {
+		stats += fmt.Sprintf(` &nbsp; <span style="color:var(--sub)">%s</span>`, info)
+	}
 
 	fmt.Fprintf(b,
 		`<div class="stage">`+

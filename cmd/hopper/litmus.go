@@ -71,7 +71,7 @@ func newLitmusServer(cfg litmusConfig) *litmusServer {
 		cfg.Bin = "litmus"
 	}
 	if cfg.MaxWorkers < 1 {
-		cfg.MaxWorkers = max(1, runtime.NumCPU())
+		cfg.MaxWorkers = max(1, runtime.NumCPU()-2)
 	}
 	return &litmusServer{
 		bin:         cfg.Bin,
@@ -506,8 +506,8 @@ func (s *litmusServer) WatchHealth(ctx context.Context) {
 	if stuckThreshold == 0 {
 		stuckThreshold = 600 * time.Second
 	}
-	// Kill if any request exceeds 2x the timeout — it's clearly stuck.
-	killThreshold := 2 * stuckThreshold
+	// Kill if any request exceeds the timeout + 1 minute grace period.
+	killThreshold := stuckThreshold + time.Minute
 
 	healthFailures := 0
 	for {
@@ -569,11 +569,23 @@ func (s *litmusServer) WatchHealth(ctx context.Context) {
 			"hopper_oldest_file", summary.OldestFile,
 		)
 
+		needKill := false
+		killReason := ""
 		if health.OldestRequestMs > killThreshold.Milliseconds() {
+			needKill = true
+			killReason = "stuck request exceeded kill threshold"
+		} else if health.OrphanedTasks > 0 && health.OrphanedTasks >= health.LiveTasks {
+			needKill = true
+			killReason = "all slots orphaned — pool fully deadlocked"
+		}
+		if needKill {
 			pid := s.currentPID()
-			slog.Error("litmus has stuck request, killing to force restart",
+			slog.Error("killing litmus to force restart",
+				"reason", killReason,
 				"oldest_request_ms", health.OldestRequestMs,
 				"oldest_request_name", health.OldestRequestName,
+				"orphaned_tasks", health.OrphanedTasks,
+				"live_tasks", health.LiveTasks,
 				"kill_threshold_ms", killThreshold.Milliseconds(),
 				"pid", pid,
 				"url", s.url,

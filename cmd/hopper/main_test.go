@@ -810,12 +810,12 @@ func TestNewLitmusServer(t *testing.T) {
 		t.Errorf("bin = %q", s.bin)
 	}
 
-	// Defaults: bin falls back to "litmus", workers to max(1, NumCPU/2).
+	// Defaults: bin falls back to "litmus", workers to max(1, NumCPU-2).
 	s2 := newLitmusServer(litmusConfig{})
 	if s2.bin != "litmus" {
 		t.Errorf("default bin = %q, want litmus", s2.bin)
 	}
-	wantWorkers := runtime.NumCPU() / 2
+	wantWorkers := runtime.NumCPU() - 2
 	if wantWorkers < 1 {
 		wantWorkers = 1
 	}
