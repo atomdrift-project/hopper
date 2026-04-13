@@ -38,19 +38,20 @@ type workerTracker struct {
 }
 
 type workerStats struct {
-	LastSeen time.Time
-	Slots    int
-	Analyzed int64
-	Errors   int64
-	Version  string
-	Traits   string
+	LastSeen     time.Time
+	Slots        int
+	ActiveClaims int // jobs claimed but not yet returned
+	Analyzed     int64
+	Errors       int64
+	Version      string
+	Traits       string
 }
 
 func newWorkerTracker() *workerTracker {
 	return &workerTracker{workers: make(map[string]*workerStats)}
 }
 
-func (wt *workerTracker) update(name string, slots int, version, traits string) {
+func (wt *workerTracker) update(name string, slots int, version, traits string, claimed int) {
 	wt.mu.Lock()
 	defer wt.mu.Unlock()
 	ws, ok := wt.workers[name]
@@ -65,6 +66,7 @@ func (wt *workerTracker) update(name string, slots int, version, traits string) 
 	ws.Slots = slots
 	ws.Version = version
 	ws.Traits = traits
+	ws.ActiveClaims += claimed
 }
 
 func (wt *workerTracker) recordResult(name string, isError bool) {
@@ -76,6 +78,9 @@ func (wt *workerTracker) recordResult(name string, isError bool) {
 		wt.workers[name] = ws
 	}
 	ws.LastSeen = time.Now()
+	if ws.ActiveClaims > 0 {
+		ws.ActiveClaims--
+	}
 	if isError {
 		ws.Errors++
 	} else {
@@ -160,7 +165,6 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		count = maxClaimCount
 	}
 
-	// Heartbeat: update worker tracker for dashboard.
 	slots := 1
 	if v := r.URL.Query().Get("slots"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -169,7 +173,6 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	}
 	version := r.URL.Query().Get("version")
 	traits := r.URL.Query().Get("traits")
-	s.tracker.update(worker, slots, version, traits)
 
 	jobs, err := s.db.ClaimJobs(r.Context(), worker, count, claimExpiry)
 	if err != nil {
@@ -177,6 +180,9 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
 		return
 	}
+
+	// Update tracker with claim count so the dashboard knows the worker is active.
+	s.tracker.update(worker, slots, version, traits, len(jobs))
 
 	// Persist worker heartbeat to DB for crash recovery.
 	wk := hopper.Worker{Name: worker, Slots: slots, Version: version, Traits: traits}
@@ -237,6 +243,12 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	if req.Error != "" {
+		// Look up the sample path for more useful error logs.
+		samplePath := ""
+		if sample, err := s.db.SampleBySHA256(ctx, req.SHA256); err == nil {
+			samplePath = sample.Path
+		}
+
 		if isPermanentError(req.Error) {
 			// Unsupported file type, missing file, etc. — mark so it's
 			// never queued again, but preserve the record.
@@ -247,7 +259,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 			if err := s.db.SetSkip(ctx, req.SHA256, skip); err != nil {
 				slog.Error("mark permanent failure failed", "sha256", req.SHA256, "error", err)
 			} else {
-				slog.Info("marked sample", "sha256", req.SHA256, "skip", skip)
+				slog.Info("marked sample", "sha256", req.SHA256, "path", samplePath, "skip", skip, "reason", req.Error)
 			}
 		} else {
 			// Transient error — release claim so another worker can try.
@@ -255,7 +267,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 				slog.Error("unclaim failed", "sha256", req.SHA256, "error", err)
 			}
 			slog.Warn("worker reported analysis error",
-				"worker", req.Worker, "sha256", req.SHA256, "error", req.Error)
+				"worker", req.Worker, "sha256", req.SHA256, "path", samplePath, "error", req.Error)
 		}
 		s.progress.errors.Add(1)
 		s.tracker.recordResult(req.Worker, true)

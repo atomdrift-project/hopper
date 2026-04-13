@@ -1055,8 +1055,8 @@ func (db *DB) claimJobsSQLite(ctx context.Context, worker string, limit int, exp
 
 	cutoff := time.Now().Add(-expiry).UTC().Format(time.RFC3339Nano)
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, sha256, path, size_bytes FROM samples
-		WHERE cleave_result IS NULL AND skip = ''
+		SELECT id, sha256, path, size_bytes, file_type FROM samples
+		WHERE cleave_result IS NULL AND skip = '' AND parent = ''
 		  AND (claimed_by = '' OR claimed_at < ?)
 		ORDER BY mtime DESC, id LIMIT ?`, cutoff, limit)
 	if err != nil {
@@ -1067,11 +1067,12 @@ func (db *DB) claimJobsSQLite(ctx context.Context, worker string, limit int, exp
 		sha256    string
 		path      string
 		sizeBytes int64
+		fileType  string
 	}
 	var selected []row
 	for rows.Next() {
 		var r row
-		if err := rows.Scan(&r.id, &r.sha256, &r.path, &r.sizeBytes); err != nil {
+		if err := rows.Scan(&r.id, &r.sha256, &r.path, &r.sizeBytes, &r.fileType); err != nil {
 			_ = rows.Close()
 			return nil, fmt.Errorf("hopper: claim jobs scan: %w", err)
 		}
@@ -1090,7 +1091,7 @@ func (db *DB) claimJobsSQLite(ctx context.Context, worker string, limit int, exp
 			worker, now, r.id); err != nil {
 			return nil, fmt.Errorf("hopper: claim jobs update: %w", err)
 		}
-		jobs = append(jobs, ClaimJob{SHA256: r.sha256, Path: r.path, SizeBytes: r.sizeBytes})
+		jobs = append(jobs, ClaimJob{SHA256: r.sha256, Path: r.path, SizeBytes: r.sizeBytes, FileType: r.fileType})
 	}
 
 	if err := tx.Commit(); err != nil {

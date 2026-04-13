@@ -365,15 +365,19 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 	if len(workers) > 0 {
 		b.WriteString(`<section><div class="label">Workers</div>`)
 		b.WriteString(`<table><thead><tr>` +
-			`<th>Worker</th><th>Slots</th><th>Rate</th>` +
+			`<th>Worker</th><th>Tasks</th><th>Rate</th>` +
 			`<th>Analyzed</th><th>Errors</th><th></th>` +
 			`</tr></thead><tbody>`)
 
 		sort.Slice(workers, func(i, j int) bool { return workers[i].Name < workers[j].Name })
 		for _, w := range workers {
-			online := time.Since(w.LastSeen) < 30*time.Second
+			idle := time.Since(w.LastSeen)
+			status, _ := workerStatus(w.ActiveClaims, idle)
 			dotClass := "dot-ok"
-			if !online {
+			if w.ActiveClaims == 0 && idle >= 10*time.Minute {
+				dotClass = "dot-warn"
+			}
+			if w.ActiveClaims == 0 && idle >= 30*time.Minute {
 				dotClass = "dot-bad"
 			}
 
@@ -383,22 +387,17 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 				rateStr = fmt.Sprintf("%.1f/s", nRate)
 			}
 
-			status := ""
-			if !online {
-				status = fmt.Sprintf("offline %s", shortDuration(time.Since(w.LastSeen)))
-			}
-
 			fmt.Fprintf(&b,
 				`<tr>`+
 					`<td class="nn"><span class="dot %s">●</span>%s</td>`+
-					`<td class="hi">%d</td>`+
+					`<td class="hi">%d/%d</td>`+
 					`<td class="hi">%s</td>`+
 					`<td class="hi">%s</td>`+
 					`<td>%s</td>`+
 					`<td class="warn">%s</td>`+
 					`</tr>`,
 				dotClass, htmlEscape(w.Name),
-				w.Slots,
+				w.ActiveClaims, w.Slots,
 				rateStr,
 				fmtN(w.Analyzed),
 				fmtN(w.Errors),

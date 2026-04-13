@@ -622,7 +622,11 @@ func cmdLoad(ctx context.Context) error {
 	api.allowedDirs = allowedDirs
 
 	total := loadAll(loadCtx, loadCancel, db, litmus, tracker, api, cache, loadDirs, *source, *workers, *rescan, *maxAnalyzed, *experimentTag, wd)
-	slog.Info("load complete", "samples", total)
+	slog.Info("file walk complete, serving API until interrupted", "samples", total)
+
+	// Block until interrupted — workers are still draining the analysis queue.
+	<-ctx.Done()
+	slog.Info("shutting down")
 	return nil
 }
 
@@ -691,12 +695,10 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 		startAnalyzed = n
 	}
 
-	// Progress dashboard.
-	dashCtx, dashCancel := context.WithCancel(ctx)
-	defer dashCancel()
+	// Progress dashboard — runs until ctx is cancelled (ctrl-C).
 	var dashWG sync.WaitGroup
 	dashWG.Go(func() {
-		runDashboard(dashCtx, &progress, litmus, tracker, start, startAnalyzed, maxAnalyzed, len(dirs))
+		runDashboard(ctx, &progress, litmus, tracker, start, startAnalyzed, maxAnalyzed, len(dirs))
 	})
 
 	if wd != nil {
@@ -732,10 +734,12 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 		slog.Info("marked stale samples", "count", marked)
 	}
 
-	dashCancel()
+	logLoadSummary(start, experimentTag, dirs, &progress)
+
+	// Keep the dashboard running — workers are still analyzing.
+	// The dashboard goroutine exits when ctx is cancelled (ctrl-C).
 	dashWG.Wait()
 
-	logLoadSummary(start, experimentTag, dirs, &progress)
 	return int(progress.inserted.Load() + progress.skipped.Load())
 }
 
@@ -1004,27 +1008,25 @@ func runDashboard(
 					nameWidth = len(w.Name)
 				}
 			}
-			writeStdoutf("\n  \033[2m  %-*s  slots    rate  analyzed  errors\033[0m\n",
+			writeStdoutf("\n  \033[2m  %-*s  tasks    rate  analyzed  errors\033[0m\n",
 				nameWidth, "worker")
 
 			sort.Slice(workers, func(i, j int) bool { return workers[i].Name < workers[j].Name })
 			for _, w := range workers {
-				online := time.Since(w.LastSeen) < 30*time.Second
-				dot := "\033[32m●\033[0m"
-				if !online {
-					dot = "\033[31m●\033[0m"
-				}
+				idle := time.Since(w.LastSeen)
+				status, dot := workerStatus(w.ActiveClaims, idle)
 
 				rateStr := "    —"
 				if r := nodeRates[w.Name]; r > 0.05 {
 					rateStr = fmt.Sprintf("%4.1f/s", r)
 				}
 
-				line := fmt.Sprintf("  %s %-*s  %5d  %s  %8s  %s",
-					dot, nameWidth, w.Name, w.Slots, rateStr,
+				line := fmt.Sprintf("  %s %-*s  %3d/%d  %s  %8s  %s",
+					dot, nameWidth, w.Name,
+					w.ActiveClaims, w.Slots, rateStr,
 					fmtN(w.Analyzed), fmtN(w.Errors))
-				if !online {
-					line += fmt.Sprintf("  \033[33moffline %s\033[0m", shortDuration(time.Since(w.LastSeen)))
+				if status != "" {
+					line += fmt.Sprintf("  \033[33m%s\033[0m", status)
 				}
 				writeStdoutLine(line)
 			}
@@ -1042,6 +1044,27 @@ func runDashboard(
 }
 
 // logWorkerStatus emits one slog line per worker for the non-TTY path.
+// workerStatus returns a display status and ANSI dot color for a worker.
+// Active claims > 0 means the worker is online (actively processing).
+// Otherwise, fall back to time-based: inactive after 10min, down after 30min.
+func workerStatus(activeClaims int, idle time.Duration) (status string, dot string) {
+	green := "\033[32m●\033[0m"
+	yellow := "\033[33m●\033[0m"
+	red := "\033[31m●\033[0m"
+
+	if activeClaims > 0 {
+		return "", green
+	}
+	switch {
+	case idle < 10*time.Minute:
+		return "", green // recently active, just idle
+	case idle < 30*time.Minute:
+		return fmt.Sprintf("inactive %s", shortDuration(idle)), yellow
+	default:
+		return fmt.Sprintf("down %s", shortDuration(idle)), red
+	}
+}
+
 func logWorkerStatus(workers []namedWorkerStats) {
 	for _, w := range workers {
 		online := time.Since(w.LastSeen) < 30*time.Second

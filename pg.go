@@ -890,7 +890,7 @@ func (db *DB) claimJobsPG(ctx context.Context, worker string, limit int, expiry 
 	rows, err := db.pool.Query(ctx, `
 		WITH claimable AS (
 			SELECT id FROM samples
-			WHERE cleave_result IS NULL AND skip = ''
+			WHERE cleave_result IS NULL AND skip = '' AND parent = ''
 			  AND (claimed_by = '' OR claimed_at < now() - $2::interval)
 			ORDER BY mtime DESC NULLS LAST, id
 			LIMIT $3
@@ -898,7 +898,7 @@ func (db *DB) claimJobsPG(ctx context.Context, worker string, limit int, expiry 
 		)
 		UPDATE samples SET claimed_by = $1, claimed_at = now()
 		FROM claimable WHERE samples.id = claimable.id
-		RETURNING samples.sha256, samples.path, samples.size_bytes`,
+		RETURNING samples.sha256, samples.path, samples.size_bytes, samples.file_type`,
 		worker, expiry, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: claim jobs: %w", err)
@@ -907,7 +907,7 @@ func (db *DB) claimJobsPG(ctx context.Context, worker string, limit int, expiry 
 	var jobs []ClaimJob
 	for rows.Next() {
 		var j ClaimJob
-		if err := rows.Scan(&j.SHA256, &j.Path, &j.SizeBytes); err != nil {
+		if err := rows.Scan(&j.SHA256, &j.Path, &j.SizeBytes, &j.FileType); err != nil {
 			return nil, fmt.Errorf("hopper: claim jobs scan: %w", err)
 		}
 		jobs = append(jobs, j)

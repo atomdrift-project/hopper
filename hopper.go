@@ -548,14 +548,31 @@ func (db *DB) MarkMissingSamples(ctx context.Context, walkedPaths map[string]str
 	if err != nil {
 		return 0, fmt.Errorf("hopper: mark missing: %w", err)
 	}
-	var marked int64
+
+	// Dry-run: count how many would be marked before writing anything.
+	// Skip archive children (parent != "") — they don't have standalone
+	// files on disk; they get analysis through their parent archive.
+	var eligible, wouldMark int64
 	for _, s := range samples {
-		if s.Skip != "" {
+		if s.Skip != "" || s.Parent != "" {
 			continue
 		}
-		_, walked := walkedPaths[s.Path]
-		if walked {
-			continue // iter-files saw it — it's queued normally
+		eligible++
+		if _, walked := walkedPaths[s.Path]; !walked {
+			wouldMark++
+		}
+	}
+	if eligible > 0 && wouldMark*2 > eligible {
+		return 0, fmt.Errorf("hopper: mark missing: refusing to mark %d of %d unanalyzed samples (>50%%); this likely indicates a misconfigured data directory", wouldMark, eligible)
+	}
+
+	var marked int64
+	for _, s := range samples {
+		if s.Skip != "" || s.Parent != "" {
+			continue
+		}
+		if _, walked := walkedPaths[s.Path]; walked {
+			continue
 		}
 		_, statErr := os.Stat(s.Path)
 		skip := "unsupported" // file exists but iter-files filtered it out
@@ -578,6 +595,7 @@ type ClaimJob struct {
 	SHA256    string `json:"sha256"`
 	Path      string `json:"path"`
 	SizeBytes int64  `json:"size_bytes"`
+	FileType  string `json:"file_type"`
 }
 
 // Worker is a litmus worker's latest heartbeat data.
