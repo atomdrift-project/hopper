@@ -342,7 +342,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 
 		b.WriteString(`<table><thead><tr>` +
 			`<th>Node</th><th>Status</th><th>Uptime</th>` +
-			`<th>Load</th><th>RSS</th><th>Tasks</th>` +
+			`<th>Load</th><th>Memory</th><th>Tasks</th>` +
 			`<th>Orphans</th><th>Done</th><th>Errors</th><th>Last</th>` +
 			`<th>Version</th><th>Traits</th><th></th>` +
 			`</tr></thead><tbody>`)
@@ -403,13 +403,18 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 						`<td>%s</td><td colspan="%d"></td><td>%s</td></tr>`,
 					statusClass, name, status, ncols-3, htmlEscape(snap.LastErr))
 			} else {
+				memStr := fmt.Sprintf("%d MB", snap.Health.RSSMB)
+				if snap.TotalMemMB > 0 {
+					memStr = fmt.Sprintf("%d / %d MB", snap.Health.RSSMB, snap.TotalMemMB)
+				}
+
 				fmt.Fprintf(&b,
 					`<tr class="node-row %s">`+
 						`<td class="node-name"><span class="dot"></span>%s</td>`+
 						`<td>%s</td>`+
 						`<td>%s</td>`+
-						`<td class="hi">%.2f</td>`+
-						`<td>%d MB</td>`+
+						`<td class="hi">%.1f</td>`+
+						`<td>%s</td>`+
 						`<td>%d/%d</td>`+
 						`<td class="%s">%s</td>`+
 						`<td class="hi">%s</td>`+
@@ -421,8 +426,8 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 						`</tr>`,
 					statusClass, name, status,
 					formatUptime(snap.Health.UptimeSecs),
-					snap.Health.Load,
-					snap.Health.RSSMB,
+					snap.Health.LoadAvg,
+					memStr,
 					snap.Health.LiveTasks, m.Slots(),
 					orphanClass, orphanStr,
 					fmtN(m.Analyzed()),
@@ -457,19 +462,6 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 				b.WriteString(`</details></td></tr>`)
 			}
 
-			if jobs := m.InFlightList(); len(jobs) > 0 {
-				oldest := jobs[0] // InFlightList returns oldest-first
-				fmt.Fprintf(&b, `<tr class="jobs-row"><td></td><td colspan="%d">`, ncols-1)
-				fmt.Fprintf(&b, `<details class="jobs-fold"><summary>%d in-flight · <span class="job-file">%s</span> <span class="job-age">%s</span></summary>`,
-					len(jobs), htmlEscape(oldest.File), oldest.Elapsed)
-				// Expand to full list, oldest → newest.
-				for i := len(jobs) - 1; i >= 0; i-- {
-					j := jobs[i]
-					fmt.Fprintf(&b, `<span class="job"><span class="job-file">%s</span><span class="job-age">%s</span></span>`,
-						htmlEscape(j.File), j.Elapsed)
-				}
-				b.WriteString(`</details></td></tr>`)
-			}
 		}
 		b.WriteString(`</tbody></table></section>`)
 	}

@@ -41,6 +41,8 @@ type litmusServer struct { //nolint:govet // field order is chosen for readabili
 	pid         atomic.Int64
 	restarts    atomic.Int64
 
+	memoryMB atomic.Int64 // total system memory in MiB; populated from /_/info
+
 	// inFlight tracks what each hopper analysis worker is currently doing.
 	inFlight sync.Map // worker ID (int) → *workerState
 }
@@ -72,7 +74,7 @@ func newLitmusServer(cfg litmusConfig) *litmusServer {
 		cfg.Bin = "litmus"
 	}
 	if cfg.MaxWorkers < 1 {
-		cfg.MaxWorkers = max(1, runtime.NumCPU()-2)
+		cfg.MaxWorkers = max(1, runtime.NumCPU()*3/4)
 	}
 	return &litmusServer{
 		bin:         cfg.Bin,
@@ -569,6 +571,7 @@ func (s *litmusServer) WatchHealth(ctx context.Context) {
 			"active_tasks", health.ActiveTasks,
 			"max_concurrent", health.MaxConcurrent,
 			"load", fmt.Sprintf("%.2f", health.Load),
+			"load_avg", fmt.Sprintf("%.2f", health.LoadAvg),
 			"rss_mb", health.RSSMB,
 			"litmus_oldest_ms", health.OldestRequestMs,
 			"litmus_oldest_name", health.OldestRequestName,
@@ -617,6 +620,7 @@ type litmusHealth struct { //nolint:govet // JSON field grouping is clearer than
 	OrphanedTasks     int     `json:"orphaned_tasks"`
 	MaxConcurrent     int     `json:"max_concurrent_tasks"`
 	Load              float64 `json:"load"`
+	LoadAvg           float64 `json:"load_avg"`
 	RSSMB             int     `json:"rss_mb"`
 	Status            string  `json:"status"`
 	Reason            string  `json:"reason"`
@@ -717,6 +721,10 @@ func (s *litmusServer) Analyze(ctx context.Context, sha256, path string) (*analy
 // remote nodes.
 func (s *litmusServer) Slots() int { return s.maxWorkers }
 
+// MemoryMB returns total system memory discovered from the local litmus
+// process via /_/info. Returns 0 if litmus hasn't reported it yet.
+func (s *litmusServer) MemoryMB() int { return int(s.memoryMB.Load()) }
+
 // Name returns a short human-readable identifier for logs and metrics.
 func (s *litmusServer) Name() string { return "local:" + s.port }
 
@@ -766,7 +774,7 @@ func (s *litmusServer) doAnalyze(ctx context.Context, sha256 string, body []byte
 	}
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512)) //nolint:errcheck // best-effort error body
-		return nil, fmt.Errorf("litmus: %d %s", resp.StatusCode, msg)
+		return nil, fmt.Errorf("litmus: %s: HTTP %d: %s", sha256, resp.StatusCode, bytes.TrimSpace(msg))
 	}
 
 	raw, err := io.ReadAll(resp.Body)
@@ -872,3 +880,4 @@ func isStdoutTTY() bool {
 	}
 	return (fileInfo.Mode() & os.ModeCharDevice) != 0
 }
+

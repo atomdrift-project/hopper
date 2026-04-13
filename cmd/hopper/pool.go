@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,6 +35,7 @@ const defaultRemoteLitmusPort = "49999"
 type analyzer interface {
 	Analyze(ctx context.Context, sha256, path string) (*analyzeResult, error)
 	Slots() int
+	MemoryMB() int // total system memory; 0 = unknown (treated as largest tier)
 	Name() string
 	Health(ctx context.Context) (*nodeHealth, error)
 	Info(ctx context.Context) (*nodeInfo, error)
@@ -48,6 +51,7 @@ type nodeInfo struct { //nolint:govet // small struct; readability over padding 
 	Slots        int    // configured concurrency limit
 	CPUs         int    // detected CPU count (informational)
 	MaxUploadMB  int    // max body size accepted by /analyze
+	TotalMemMB   int    // total system memory in MiB (0 = unknown)
 }
 
 // updateResult summarizes a /_/update call. Both flags are independent —
@@ -91,6 +95,7 @@ func fetchInfo(ctx context.Context, client *http.Client, baseURL string) (*nodeI
 		Slots        int     `json:"slots"`
 		CPUs         int     `json:"cpus"`
 		MaxUploadMB  int     `json:"max_upload_mb"`
+		TotalMemMB   int     `json:"total_mem_mb"`
 		ModelCommit  *string `json:"model_commit"`
 		TraitsCommit *string `json:"traits_commit"`
 	}
@@ -102,6 +107,7 @@ func fetchInfo(ctx context.Context, client *http.Client, baseURL string) (*nodeI
 		Slots:       raw.Slots,
 		CPUs:        raw.CPUs,
 		MaxUploadMB: raw.MaxUploadMB,
+		TotalMemMB:  raw.TotalMemMB,
 	}
 	if raw.ModelCommit != nil {
 		out.ModelCommit = *raw.ModelCommit
@@ -184,6 +190,7 @@ type nodeHealth struct { //nolint:govet // small struct; readability over paddin
 	Status        string  // "ok" | "starting" | "saturated" | "degraded" | "failed" | "down"
 	Reason        string  // litmus-supplied free-form code, e.g. "memory_pressure"
 	Load          float64 // 0..1, live_tasks / max_concurrent_tasks
+	LoadAvg       float64 // 1-minute system load average from the host
 	RSSMB         int     // resident set size in MiB
 	LiveTasks     int     // currently-running tasks
 	ActiveTasks   int     // active_tasks counter (may include orphaned)
@@ -229,6 +236,7 @@ func fetchHealth(ctx context.Context, client *http.Client, baseURL string) (*nod
 		Status        string  `json:"status"`
 		Reason        string  `json:"reason"`
 		Load          float64 `json:"load"`
+		LoadAvg       float64 `json:"load_avg"`
 		RSSMB         int     `json:"rss_mb"`
 		LiveTasks     int     `json:"live_tasks"`
 		ActiveTasks   int     `json:"active_tasks"`
@@ -255,6 +263,7 @@ func fetchHealth(ctx context.Context, client *http.Client, baseURL string) (*nod
 		Status:        status,
 		Reason:        raw.Reason,
 		Load:          raw.Load,
+		LoadAvg:       raw.LoadAvg,
 		RSSMB:         raw.RSSMB,
 		LiveTasks:     raw.LiveTasks,
 		ActiveTasks:   raw.ActiveTasks,
@@ -320,11 +329,12 @@ func fetchStuckRequests(ctx context.Context, client *http.Client, baseURL string
 // Capacity is discovered once at startup via /_/info; per-request retries
 // (transport blips and 503s) are handled by analyzeWithRetry, not here.
 type remoteLitmus struct { //nolint:govet // small struct; readability over padding minimization.
-	client *http.Client
-	addr   string // host:port (no scheme)
-	url    string // http://host:port
-	slots  int    // discovered from /_/info
-	cpus   int    // discovered from /_/info; informational
+	client   *http.Client
+	addr     string // host:port (no scheme)
+	url      string // http://host:port
+	slots    int    // discovered from /_/info
+	cpus     int    // discovered from /_/info; informational
+	memoryMB int    // total system memory in MiB; 0 = unknown
 }
 
 // dialRemoteLitmus connects to addr, fetches /_/info, and returns a node
@@ -368,6 +378,7 @@ func dialRemoteLitmus(ctx context.Context, addr string) (*remoteLitmus, error) {
 		Slots       int    `json:"slots"`
 		CPUs        int    `json:"cpus"`
 		MaxUploadMB int    `json:"max_upload_mb"`
+		TotalMemMB  int    `json:"total_mem_mb"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&info); err != nil {
 		return nil, fmt.Errorf("dial %s: parse /_/info: %w", addr, err)
@@ -388,19 +399,24 @@ func dialRemoteLitmus(ctx context.Context, addr string) (*remoteLitmus, error) {
 		"slots", info.Slots,
 		"cpus", info.CPUs,
 		"version", info.Version,
-		"max_upload_mb", info.MaxUploadMB)
+		"max_upload_mb", info.MaxUploadMB,
+		"total_mem_mb", info.TotalMemMB)
 
 	return &remoteLitmus{
-		client: client,
-		addr:   addr,
-		url:    base,
-		slots:  info.Slots,
-		cpus:   info.CPUs,
+		client:   client,
+		addr:     addr,
+		url:      base,
+		slots:    info.Slots,
+		cpus:     info.CPUs,
+		memoryMB: info.TotalMemMB,
 	}, nil
 }
 
 // Slots reports the discovered concurrency limit on this remote node.
 func (r *remoteLitmus) Slots() int { return r.slots }
+
+// MemoryMB returns the total system memory discovered at dial time.
+func (r *remoteLitmus) MemoryMB() int { return r.memoryMB }
 
 // Name returns the address used for logs and metrics.
 func (r *remoteLitmus) Name() string { return r.addr }
@@ -473,7 +489,7 @@ func (r *remoteLitmus) Analyze(ctx context.Context, sha256, path string) (*analy
 	}
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512)) //nolint:errcheck // best-effort error body
-		return nil, fmt.Errorf("litmus %s: %d %s", r.addr, resp.StatusCode, msg)
+		return nil, fmt.Errorf("litmus %s: %s: HTTP %d: %s", r.addr, sha256, resp.StatusCode, bytes.TrimSpace(msg))
 	}
 
 	raw, err := io.ReadAll(resp.Body)
@@ -565,6 +581,7 @@ type nodeStatusSnapshot struct { //nolint:govet // small struct; readability ove
 	LastErr      string     // empty when Health is fresh; populated when the most recent poll failed
 	Reachable    bool       // false ⇒ poll failed; render as "down"
 	Restarts     int        // cumulative restart count (local node only)
+	TotalMemMB   int        // total physical memory from /_/info (0 = unknown)
 	TraitsCommit string     // short commit hash from /_/info (refreshed every ~60s)
 	Version      string     // litmus binary version from /_/info
 }
@@ -708,14 +725,19 @@ func (m *nodeMonitor) poll(ctx context.Context) {
 
 	// Carry forward previous info fields; refresh periodically.
 	var traitsCommit, version string
+	var totalMemMB int
 	if old := m.snap.Load(); old != nil {
 		traitsCommit = old.TraitsCommit
 		version = old.Version
+		totalMemMB = old.TotalMemMB
 	}
 	if m.pollCount%infoPollEvery == 1 { // first poll + every Nth
 		if info, err := m.node.Info(ctx); err == nil {
 			traitsCommit = info.TraitsCommit
 			version = info.Version
+			if info.TotalMemMB > 0 {
+				totalMemMB = info.TotalMemMB
+			}
 		}
 	}
 
@@ -732,6 +754,7 @@ func (m *nodeMonitor) poll(ctx context.Context) {
 			LastUpdate:   time.Now(),
 			LastErr:      err.Error(),
 			Reachable:    false,
+			TotalMemMB:   totalMemMB,
 			TraitsCommit: traitsCommit,
 			Version:      version,
 		})
@@ -746,6 +769,7 @@ func (m *nodeMonitor) poll(ctx context.Context) {
 		LastUpdate:   time.Now(),
 		Reachable:    true,
 		Restarts:     restarts,
+		TotalMemMB:   totalMemMB,
 		TraitsCommit: traitsCommit,
 		Version:      version,
 	})
@@ -929,6 +953,237 @@ func dialAllRemoteLitmus(ctx context.Context, addrs []string) (nodes []*remoteLi
 		nodes = append(nodes, r.node)
 	}
 	return nodes, failed
+}
+
+// ---------------------------------------------------------------------------
+// Size-tiered analysis queues
+// ---------------------------------------------------------------------------
+//
+// Nodes are ranked by memory into quartile tiers. Files are routed to a tier
+// channel based on size thresholds proportional to node memory. A worker at
+// tier T draws from tiers 0..T, preferring its own tier so large nodes drain
+// large files first but help with small files when idle. Nodes with unknown
+// memory (0) are placed in the highest tier and receive all files.
+
+const numSizeTiers = 4
+
+// sizeTieredQueues routes loadJobs to per-tier channels based on file size,
+// so smaller-memory nodes only see smaller files.
+type sizeTieredQueues struct {
+	queues     [numSizeTiers]chan loadJob
+	thresholds [numSizeTiers]int64 // files <= thresholds[i] go to queues[i]
+	memBreaks  [numSizeTiers]int   // max node memory (MiB) for each tier
+	tierByNode map[string]int      // node name → tier index
+}
+
+// newSizeTieredQueues builds tiered queues from the known node set.
+// maxFileBytes is the global per-file size cap (e.g. 100 MiB).
+func newSizeTieredQueues(nodes []analyzer, queueCap int, maxFileBytes int64) *sizeTieredQueues {
+	sq := &sizeTieredQueues{
+		tierByNode: make(map[string]int, len(nodes)),
+	}
+	perTier := queueCap / numSizeTiers
+	if perTier < 1 {
+		perTier = 1
+	}
+	for i := range sq.queues {
+		sq.queues[i] = make(chan loadJob, perTier)
+	}
+
+	// Collect node memories; 0 means unknown → treated as max.
+	mems := make([]int, len(nodes))
+	maxMem := 0
+	for i, n := range nodes {
+		mems[i] = n.MemoryMB()
+		if mems[i] > maxMem {
+			maxMem = mems[i]
+		}
+	}
+
+	// If no memory info available at all, everything goes to the last tier
+	// and all workers read from it — equivalent to the old single-queue behavior.
+	if maxMem == 0 {
+		for i := range sq.thresholds {
+			sq.thresholds[i] = maxFileBytes
+		}
+		for _, n := range nodes {
+			sq.tierByNode[n.Name()] = numSizeTiers - 1
+		}
+		slog.Info("size-tiered queues: no memory info, all nodes at max tier")
+		return sq
+	}
+
+	// Sort unique memory values to compute tier boundaries.
+	sorted := make([]int, len(mems))
+	copy(sorted, mems)
+	sort.Ints(sorted)
+	// Replace 0 (unknown) with maxMem for threshold computation.
+	for i, m := range sorted {
+		if m == 0 {
+			sorted[i] = maxMem
+		}
+	}
+
+	// Tier boundaries: percentile 25/50/75/100 of the node memory distribution.
+	for t := 0; t < numSizeTiers; t++ {
+		idx := ((t + 1) * len(sorted) / numSizeTiers) - 1
+		if idx < 0 {
+			idx = 0
+		}
+		tierMem := sorted[idx]
+		sq.memBreaks[t] = tierMem
+		// File size threshold proportional to this tier's memory share.
+		sq.thresholds[t] = maxFileBytes * int64(tierMem) / int64(maxMem)
+		if sq.thresholds[t] < 1 {
+			sq.thresholds[t] = 1
+		}
+	}
+	// Last tier always accepts everything.
+	sq.thresholds[numSizeTiers-1] = maxFileBytes
+	sq.memBreaks[numSizeTiers-1] = maxMem
+
+	// Assign each node to a tier based on its memory.
+	for _, n := range nodes {
+		sq.tierByNode[n.Name()] = sq.tierForMem(n.MemoryMB())
+	}
+
+	slog.Info("size-tiered queues configured",
+		"thresholds_bytes", sq.thresholds,
+		"mem_breaks_mb", sq.memBreaks,
+		"tier_assignments", sq.tierByNode)
+	return sq
+}
+
+// Send routes a job to the appropriate tier channel based on file size.
+func (sq *sizeTieredQueues) Send(ctx context.Context, job loadJob) error {
+	tier := numSizeTiers - 1
+	for t := 0; t < numSizeTiers; t++ {
+		if job.sizeBytes <= sq.thresholds[t] {
+			tier = t
+			break
+		}
+	}
+	select {
+	case sq.queues[tier] <- job:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Close closes all tier channels, signaling workers to drain and exit.
+func (sq *sizeTieredQueues) Close() {
+	for i := range sq.queues {
+		close(sq.queues[i])
+	}
+}
+
+// TierForNode returns the tier assigned to the named node.
+func (sq *sizeTieredQueues) TierForNode(name string) int {
+	if t, ok := sq.tierByNode[name]; ok {
+		return t
+	}
+	return numSizeTiers - 1
+}
+
+// AssignNode registers a late-joining node into a tier based on its memory.
+func (sq *sizeTieredQueues) AssignNode(n analyzer) {
+	tier := sq.tierForMem(n.MemoryMB())
+	sq.tierByNode[n.Name()] = tier
+	slog.Info("late-joined node assigned tier", "node", n.Name(), "memory_mb", n.MemoryMB(), "tier", tier)
+}
+
+// tierForMem returns the tier a node with the given memory belongs to.
+// Unknown (0) maps to the highest tier.
+func (sq *sizeTieredQueues) tierForMem(memMB int) int {
+	if memMB <= 0 {
+		return numSizeTiers - 1
+	}
+	for t := 0; t < numSizeTiers; t++ {
+		if memMB <= sq.memBreaks[t] {
+			return t
+		}
+	}
+	return numSizeTiers - 1
+}
+
+// recvJob blocks until a job is available from any tier up to maxTier.
+// It prefers the worker's own tier (highest accessible) to keep large files
+// on large nodes, falling back to lower tiers when the own tier is empty.
+// Returns the job and true, or zero-value and false when all accessible
+// channels are closed and drained.
+func (sq *sizeTieredQueues) recvJob(ctx context.Context, maxTier int) (loadJob, bool) {
+	// Fast path: non-blocking try on our own tier.
+	select {
+	case job, ok := <-sq.queues[maxTier]:
+		if ok {
+			return job, true
+		}
+	default:
+	}
+
+	// Slow path: blocking select across tiers 0..maxTier + ctx.Done.
+	// Use reflect.Select for dynamic case count.
+	cases := make([]reflect.SelectCase, maxTier+2)
+	for t := 0; t <= maxTier; t++ {
+		cases[t] = reflect.SelectCase{
+			Dir:  reflect.SelectRecv,
+			Chan: reflect.ValueOf(sq.queues[t]),
+		}
+	}
+	cases[maxTier+1] = reflect.SelectCase{
+		Dir:  reflect.SelectRecv,
+		Chan: reflect.ValueOf(ctx.Done()),
+	}
+
+	chosen, value, ok := reflect.Select(cases)
+	if chosen == maxTier+1 {
+		// ctx.Done fired.
+		return loadJob{}, false
+	}
+	if !ok {
+		// Channel closed. Check if ALL accessible tiers are closed.
+		// Drain remaining open channels before giving up.
+		for {
+			openCases := make([]reflect.SelectCase, 0, maxTier+2)
+			tierMap := make([]int, 0, maxTier+2)
+			for t := 0; t <= maxTier; t++ {
+				// Skip the tier that just closed by trying a non-blocking recv.
+				select {
+				case job, open := <-sq.queues[t]:
+					if open {
+						// Got a job from this tier while probing — return it.
+						return job, true
+					}
+					// This tier is closed and drained, skip it.
+				default:
+					// Still open (or has buffered items), include it.
+					openCases = append(openCases, reflect.SelectCase{
+						Dir:  reflect.SelectRecv,
+						Chan: reflect.ValueOf(sq.queues[t]),
+					})
+					tierMap = append(tierMap, t)
+				}
+			}
+			if len(openCases) == 0 {
+				return loadJob{}, false
+			}
+			// Add ctx.Done.
+			openCases = append(openCases, reflect.SelectCase{
+				Dir:  reflect.SelectRecv,
+				Chan: reflect.ValueOf(ctx.Done()),
+			})
+			chosen, value, ok = reflect.Select(openCases)
+			if chosen == len(openCases)-1 {
+				return loadJob{}, false
+			}
+			if ok {
+				return value.Interface().(loadJob), true
+			}
+			// Another channel closed, loop to rebuild cases.
+		}
+	}
+	return value.Interface().(loadJob), true
 }
 
 // monitorPool is a thread-safe, append-only collection of node monitors.
