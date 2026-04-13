@@ -155,8 +155,8 @@ section{margin-bottom:2.25rem}
   text-transform:uppercase;color:var(--sub)}
 .stage-stat{font-family:var(--mono);font-size:.78rem;color:var(--sub)}
 .stage-stat em{font-style:normal;color:#c4cdde}
-.track{height:3px;background:var(--border);border-radius:2px;overflow:hidden}
-.fill{height:100%;border-radius:2px;transition:width .5s ease}
+.track{height:3px;background:var(--border);border-radius:2px;overflow:hidden;display:flex}
+.fill{height:100%;border-radius:2px;transition:width .5s ease;flex-shrink:0}
 
 /* graph */
 .graph-box{background:var(--surface);border:1px solid var(--border);
@@ -284,7 +284,10 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 	b.WriteString(`<section><div class="label">Pipeline</div>`)
 	writePipelineBar(&b, "Hashing", hashDone, walked, "#818cf8")
 	writePipelineBar(&b, "Insertion", inserted+skipped, hashedN, "#34d399")
-	writePipelineBar(&b, "Analysis", sessionAnalyzed, analyzeTarget, "#fbbf24")
+	// Analysis bar: show previously-analyzed samples as a dim segment, then
+	// this session's progress in the main color, against the total corpus.
+	totalAnalyzeTarget := startAnalyzed + analyzeTarget
+	writePipelineBarWithPrior(&b, "Analysis", startAnalyzed, sessionAnalyzed, totalAnalyzeTarget)
 	b.WriteString(`</section>`)
 
 	// Throughput graph
@@ -475,6 +478,41 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = fmt.Fprint(w, b.String())
+}
+
+// writePipelineBarWithPrior renders a two-segment progress bar: a dim segment
+// for previously-analyzed samples and a bright segment for this session's work.
+func writePipelineBarWithPrior(b *strings.Builder, name string, prior, session, total int64) {
+	priorPct := 0.0
+	sessionPct := 0.0
+	if total > 0 {
+		priorPct = math.Min(float64(prior)/float64(total)*100, 100)
+		sessionPct = math.Min(float64(session)/float64(total)*100, 100-priorPct)
+	}
+	combinedDone := prior + session
+	overallPct := 0.0
+	if total > 0 {
+		overallPct = math.Min(float64(combinedDone)/float64(total)*100, 100)
+	}
+	// Stats line: "session (+prior) / total  pct%"
+	stats := fmt.Sprintf("<em>%s</em>", fmtN(session))
+	if prior > 0 {
+		stats += fmt.Sprintf(` <span style="color:var(--sub)">(+%s prior)</span>`, fmtN(prior))
+	}
+	stats += fmt.Sprintf(" / %s &nbsp; <em>%.0f%%</em>", fmtN(total), overallPct)
+
+	fmt.Fprintf(b,
+		`<div class="stage">`+
+			`<div class="stage-meta">`+
+			`<span class="stage-name">%s</span>`+
+			`<span class="stage-stat">%s</span>`+
+			`</div>`+
+			`<div class="track">`+
+			`<div class="fill" style="width:%.2f%%;background:#5a5230"></div>`+ // prior: dim amber
+			`<div class="fill" style="width:%.2f%%;background:#fbbf24"></div>`+ // session: bright amber
+			`</div>`+
+			`</div>`+"\n",
+		name, stats, priorPct, sessionPct)
 }
 
 func writePipelineBar(b *strings.Builder, name string, done, total int64, color string) {

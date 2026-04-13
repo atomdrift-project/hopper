@@ -71,10 +71,7 @@ func newLitmusServer(cfg litmusConfig) *litmusServer {
 		cfg.Bin = "litmus"
 	}
 	if cfg.MaxWorkers < 1 {
-		// CPU-bound cleave + ONNX work overlaps poorly across many threads,
-		// so cores/2 typically delivers higher aggregate throughput than
-		// 1/core. Mirrors the litmus default.
-		cfg.MaxWorkers = max(1, runtime.NumCPU()/2)
+		cfg.MaxWorkers = max(1, runtime.NumCPU())
 	}
 	return &litmusServer{
 		bin:         cfg.Bin,

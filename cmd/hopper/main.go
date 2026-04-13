@@ -410,7 +410,7 @@ func cmdLoad(ctx context.Context) error {
 	workers := f.Int("workers", 8, "concurrent hash/insert workers")
 	cleaveBinFlag := f.String("cleave", "cleave", "path to cleave binary (used for file enumeration)")
 	litmusBin := f.String("litmus", "litmus", "path to litmus binary (pass empty to disable)")
-	litmusWorkers := f.Int("litmus-workers", 0, "concurrent litmus analysis workers for the local node (0 = auto: max(1, NumCPU/2))")
+	litmusWorkers := f.Int("litmus-workers", 0, "concurrent litmus analysis workers for the local node (0 = auto: NumCPU)")
 	litmusNodes := f.String("litmus-nodes", "", "comma-separated host[:port] of additional remote litmus servers (default port "+defaultRemoteLitmusPort+")")
 	noRulesUpdate := f.Bool("no-rules-update", false, "skip POST /_/update on each litmus node at startup")
 	maxRSSGB := f.Int("max-memory-gb", 0, "litmus RSS limit in GB (0 = auto: min(50% RAM, 32 GiB))")
@@ -970,7 +970,8 @@ func runDashboard(
 				analyzeInfo = fmt.Sprintf("%.1f/s ETA %s", recentRate, eta)
 			}
 		}
-		drawBar("Analysis ", sessionAnalyzed, analyzeTarget, analyzeInfo, "\033[33m")
+		totalAnalyzeTarget := startAnalyzed + analyzeTarget
+		drawBarWithPrior("Analysis ", startAnalyzed, sessionAnalyzed, totalAnalyzeTarget, analyzeInfo, "\033[33m")
 		writeStdoutLine(strings.Repeat("─", 60))
 
 		if last, ok := progress.lastErr.Load().(string); ok && last != "" {
@@ -1799,6 +1800,29 @@ func isTTY() bool {
 		return false
 	}
 	return (fileInfo.Mode() & os.ModeCharDevice) != 0
+}
+
+// drawBarWithPrior renders a progress bar with two segments: dim for prior
+// work (from previous runs) and bright for this session's progress.
+func drawBarWithPrior(label string, prior, session, total int64, info string, color string) {
+	const width = 20
+	var priorPct, sessionPct float64
+	if total > 0 {
+		priorPct = float64(prior) / float64(total)
+		sessionPct = float64(session) / float64(total)
+	}
+	if priorPct+sessionPct > 1.0 {
+		sessionPct = 1.0 - priorPct
+	}
+	priorFill := max(int(float64(width)*priorPct), 0)
+	sessionFill := max(int(float64(width)*sessionPct), 0)
+	empty := width - priorFill - sessionFill
+	if empty < 0 {
+		empty = 0
+	}
+	bar := strings.Repeat("▓", priorFill) + strings.Repeat("█", sessionFill) + strings.Repeat("░", empty)
+	combinedPct := (priorPct + sessionPct) * 100
+	writeStdoutf("%s%s\033[0m [%s] %3.0f%% (%d/%d) %s\n", color, label, bar, combinedPct, prior+session, total, info)
 }
 
 func drawBar(label string, current, total int64, info string, color string) {
