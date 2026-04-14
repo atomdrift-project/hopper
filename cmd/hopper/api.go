@@ -41,6 +41,7 @@ type workerStats struct {
 	LastSeen     time.Time
 	Slots        int
 	ActiveClaims int // jobs claimed but not yet returned
+	TotalClaimed int64
 	Analyzed     int64
 	Errors       int64
 	Version      string
@@ -67,6 +68,35 @@ func (wt *workerTracker) update(name string, slots int, version, traits string, 
 	ws.Version = version
 	ws.Traits = traits
 	ws.ActiveClaims += claimed
+	ws.TotalClaimed += int64(claimed)
+}
+
+// claimLimit returns how many more jobs the worker may claim right now.
+// Workers that have never returned a result are capped at warmupClaimLimit total.
+func (wt *workerTracker) claimLimit(name string) int {
+	wt.mu.RLock()
+	defer wt.mu.RUnlock()
+	ws, ok := wt.workers[name]
+	if !ok {
+		return warmupClaimLimit
+	}
+	if ws.Analyzed+ws.Errors > 0 {
+		return maxClaimCount // proven worker, no warmup cap
+	}
+	remaining := warmupClaimLimit - int(ws.TotalClaimed)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+func (wt *workerTracker) activeClaims(name string) int {
+	wt.mu.RLock()
+	defer wt.mu.RUnlock()
+	if ws, ok := wt.workers[name]; ok {
+		return ws.ActiveClaims
+	}
+	return 0
 }
 
 func (wt *workerTracker) recordResult(name string, isError bool) {
@@ -123,9 +153,11 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 const (
 	maxClaimCount      = 10
 	claimExpiry        = 30 * time.Minute
+	staleClaimAge      = 2 * time.Hour
 	maxWorkerNameLen   = 64
 	maxResultBodyBytes = 8 << 20 // 8 MiB — plenty for cleave+litmus JSON.
 	maxTrackedWorkers  = 200
+	warmupClaimLimit   = 10 // max claims before a worker has returned any results
 )
 
 // validWorkerName checks that the name is non-empty, <= maxWorkerNameLen,
@@ -174,6 +206,16 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	version := r.URL.Query().Get("version")
 	traits := r.URL.Query().Get("traits")
 
+	// Cap claims for workers that haven't returned any results yet.
+	if limit := s.tracker.claimLimit(worker); limit == 0 {
+		slog.Warn("worker at warmup claim limit, waiting for results", "worker", worker)
+		s.tracker.update(worker, slots, version, traits, 0)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	} else if count > limit {
+		count = limit
+	}
+
 	jobs, err := s.db.ClaimJobs(r.Context(), worker, count, claimExpiry)
 	if err != nil {
 		slog.Error("claim jobs failed", "worker", worker, "error", err)
@@ -191,6 +233,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(jobs) == 0 {
+		slog.Info("no work available", "worker", worker, "active_claims", s.tracker.activeClaims(worker))
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -204,7 +247,10 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	slog.Debug("claimed jobs", "worker", worker, "count", len(jobs))
+	active := s.tracker.activeClaims(worker)
+	for _, j := range jobs {
+		slog.Info("claimed", "worker", worker, "sha256", j.SHA256, "path", j.Path, "size", j.SizeBytes, "active_claims", active)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(map[string]any{"jobs": jobs}); err != nil {
@@ -232,10 +278,12 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 
 	var req resultRequest
 	if err := json.Unmarshal(body, &req); err != nil {
+		slog.Warn("result rejected: invalid json", "error", err, "body_len", len(body))
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 		return
 	}
 	if !validSHA256(req.SHA256) || !validWorkerName(req.Worker) {
+		slog.Warn("result rejected: invalid fields", "worker", req.Worker, "sha256", req.SHA256)
 		http.Error(w, `{"error":"invalid sha256 or worker"}`, http.StatusBadRequest)
 		return
 	}
@@ -307,7 +355,12 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	slog.Debug("result stored", "worker", req.Worker, "sha256", req.SHA256, "duration_ms", req.DurationMs)
+	resultPath := ""
+	if parent.Path != "" {
+		resultPath = parent.Path
+	}
+	slog.Info("result stored", "worker", req.Worker, "sha256", req.SHA256, "path", resultPath,
+		"duration_ms", req.DurationMs, "active_claims", s.tracker.activeClaims(req.Worker))
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true}) //nolint:errcheck,errchkjson // best-effort response

@@ -886,12 +886,14 @@ func runDashboard(
 
 		// Query oldest active claim per worker.
 		oldestClaims := make(map[string]hopper.WorkerClaim)
+		var newestAnalyzedAt time.Time
 		if db != nil {
-			if claims, err := db.OldestClaims(ctx); err == nil {
+			if claims, err := db.OldestClaims(ctx, staleClaimAge); err == nil {
 				for _, c := range claims {
 					oldestClaims[c.Worker] = c
 				}
 			}
+			newestAnalyzedAt, _ = db.NewestAnalyzedAt(ctx)
 		}
 
 		analyzedAbs := progress.analyzed.Load()
@@ -1031,7 +1033,7 @@ func runDashboard(
 					nameWidth = len(w.Name)
 				}
 			}
-			writeStdoutf("\n  \033[2m  %-*s  tasks    rate  analyzed  errors  oldest job\033[0m\n",
+			writeStdoutf("\n  \033[2m  %-*s  tasks  claimed    rate  analyzed  errors  oldest job\033[0m\n",
 				nameWidth, "worker")
 
 			sort.Slice(workers, func(i, j int) bool { return workers[i].Name < workers[j].Name })
@@ -1050,9 +1052,9 @@ func runDashboard(
 					oldestStr = fmt.Sprintf("  %s (%s)", filepath.Base(claim.Path), shortDuration(age))
 				}
 
-				line := fmt.Sprintf("  %s %-*s  %3d/%d  %s  %8s  %s",
+				line := fmt.Sprintf("  %s %-*s  %3d/%d  %6s  %s  %8s  %s",
 					dot, nameWidth, w.Name,
-					w.ActiveClaims, w.Slots, rateStr,
+					w.ActiveClaims, w.Slots, fmtN(w.TotalClaimed), rateStr,
 					fmtN(w.Analyzed), fmtN(w.Errors))
 				if oldestStr != "" {
 					line += oldestStr
@@ -1065,8 +1067,12 @@ func runDashboard(
 		}
 
 		// Footer
-		writeStdoutf("\n  %s errors · %s walked · %s cache hits\n",
-			fmtN(progress.errors.Load()), fmtN(walked), fmtN(progress.cacheHits.Load()))
+		lastCompleted := ""
+		if !newestAnalyzedAt.IsZero() {
+			lastCompleted = fmt.Sprintf(" · last completed %s ago", shortDuration(time.Since(newestAnalyzedAt)))
+		}
+		writeStdoutf("\n  %s errors · %s walked · %s cache hits%s\n",
+			fmtN(progress.errors.Load()), fmtN(walked), fmtN(progress.cacheHits.Load()), lastCompleted)
 
 		// Last error at the bottom, untruncated
 		if last, ok := progress.lastErr.Load().(string); ok && last != "" {
@@ -1108,6 +1114,7 @@ func logWorkerStatus(workers []namedWorkerStats, nodeRates map[string]float64, o
 			"worker", w.Name,
 			"status", status,
 			"slots", w.Slots,
+			"claimed", w.TotalClaimed,
 			"analyzed", w.Analyzed,
 			"errors", w.Errors,
 		}

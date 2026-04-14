@@ -915,13 +915,14 @@ func (db *DB) claimJobsPG(ctx context.Context, worker string, limit int, expiry 
 	return jobs, rows.Err()
 }
 
-func (db *DB) oldestClaimsPG(ctx context.Context) ([]WorkerClaim, error) {
+func (db *DB) oldestClaimsPG(ctx context.Context, maxAge time.Duration) ([]WorkerClaim, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT DISTINCT ON (claimed_by) claimed_by, path, claimed_at
 		FROM samples
 		WHERE claimed_by != '' AND claimed_at IS NOT NULL AND cleave_result IS NULL
+			AND claimed_at >= now() - $1::interval
 		ORDER BY claimed_by, claimed_at
-	`)
+	`, maxAge.String())
 	if err != nil {
 		return nil, fmt.Errorf("hopper: oldest claims: %w", err)
 	}
@@ -935,6 +936,17 @@ func (db *DB) oldestClaimsPG(ctx context.Context) ([]WorkerClaim, error) {
 		out = append(out, wc)
 	}
 	return out, rows.Err()
+}
+
+func (db *DB) newestAnalyzedAtPG(ctx context.Context) (time.Time, error) {
+	var t *time.Time
+	err := db.pool.QueryRow(ctx,
+		`SELECT MAX(analyzed_at) FROM samples WHERE analyzed_at IS NOT NULL`,
+	).Scan(&t)
+	if err != nil || t == nil {
+		return time.Time{}, err
+	}
+	return *t, nil
 }
 
 func (db *DB) unclaimJobsPG(ctx context.Context, shas []string) error {

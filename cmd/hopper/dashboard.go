@@ -265,12 +265,14 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 
 	// Query oldest active claim per worker from the DB.
 	oldestClaims := make(map[string]hopper.WorkerClaim)
+	var newestAnalyzedAt time.Time
 	if db != nil {
-		if claims, err := db.OldestClaims(r.Context()); err == nil {
+		if claims, err := db.OldestClaims(r.Context(), staleClaimAge); err == nil {
 			for _, c := range claims {
 				oldestClaims[c.Worker] = c
 			}
 		}
+		newestAnalyzedAt, _ = db.NewestAnalyzedAt(r.Context())
 	}
 
 	if progress == nil {
@@ -384,7 +386,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 	if len(workers) > 0 {
 		b.WriteString(`<section><div class="label">Workers</div>`)
 		b.WriteString(`<table><thead><tr>` +
-			`<th>Worker</th><th>Tasks</th><th>Rate</th>` +
+			`<th>Worker</th><th>Tasks</th><th>Claimed</th><th>Rate</th>` +
 			`<th>Analyzed</th><th>Errors</th><th>Oldest Job</th><th></th>` +
 			`</tr></thead><tbody>`)
 
@@ -418,12 +420,14 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 					`<td class="hi">%d/%d</td>`+
 					`<td class="hi">%s</td>`+
 					`<td class="hi">%s</td>`+
+					`<td class="hi">%s</td>`+
 					`<td>%s</td>`+
 					`<td>%s</td>`+
 					`<td class="warn">%s</td>`+
 					`</tr>`,
 				dotClass, htmlEscape(w.Name),
 				w.ActiveClaims, w.Slots,
+				fmtN(w.TotalClaimed),
 				rateStr,
 				fmtN(w.Analyzed),
 				fmtN(w.Errors),
@@ -435,11 +439,16 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Footer
+	lastCompleted := ""
+	if !newestAnalyzedAt.IsZero() {
+		lastCompleted = fmt.Sprintf(` &middot; last completed %s ago`, shortDuration(time.Since(newestAnalyzedAt)))
+	}
 	fmt.Fprintf(&b,
-		`<footer>%s errors &middot; %s walked &middot; %s cache hits</footer>`,
+		`<footer>%s errors &middot; %s walked &middot; %s cache hits%s</footer>`,
 		fmtN(progress.errors.Load()),
 		fmtN(walked),
 		fmtN(progress.cacheHits.Load()),
+		lastCompleted,
 	)
 
 	// Last error at the bottom, untruncated

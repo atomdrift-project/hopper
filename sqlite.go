@@ -1100,7 +1100,8 @@ func (db *DB) claimJobsSQLite(ctx context.Context, worker string, limit int, exp
 	return jobs, nil
 }
 
-func (db *DB) oldestClaimsSQLite(ctx context.Context) ([]WorkerClaim, error) {
+func (db *DB) oldestClaimsSQLite(ctx context.Context, maxAge time.Duration) ([]WorkerClaim, error) {
+	cutoff := time.Now().Add(-maxAge).UTC().Format(time.RFC3339Nano)
 	rows, err := db.lite.QueryContext(ctx, `
 		SELECT s.claimed_by, s.path, s.claimed_at
 		FROM samples s
@@ -1108,9 +1109,10 @@ func (db *DB) oldestClaimsSQLite(ctx context.Context) ([]WorkerClaim, error) {
 			SELECT claimed_by, MIN(claimed_at) AS min_at
 			FROM samples
 			WHERE claimed_by != '' AND claimed_at IS NOT NULL AND cleave_result IS NULL
+				AND claimed_at >= ?
 			GROUP BY claimed_by
 		) g ON s.claimed_by = g.claimed_by AND s.claimed_at = g.min_at
-	`)
+	`, cutoff)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: oldest claims: %w", err)
 	}
@@ -1128,6 +1130,18 @@ func (db *DB) oldestClaimsSQLite(ctx context.Context) ([]WorkerClaim, error) {
 		out = append(out, wc)
 	}
 	return out, rows.Err()
+}
+
+func (db *DB) newestAnalyzedAtSQLite(ctx context.Context) (time.Time, error) {
+	var ts sql.NullString
+	err := db.lite.QueryRowContext(ctx,
+		`SELECT MAX(analyzed_at) FROM samples WHERE analyzed_at IS NOT NULL`,
+	).Scan(&ts)
+	if err != nil || !ts.Valid {
+		return time.Time{}, err
+	}
+	t, err := time.Parse(time.RFC3339Nano, ts.String)
+	return t, err
 }
 
 func (db *DB) unclaimJobsSQLite(ctx context.Context, shas []string) error {

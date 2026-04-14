@@ -617,11 +617,20 @@ type WorkerClaim struct {
 }
 
 // OldestClaims returns the oldest active claim per worker.
-func (db *DB) OldestClaims(ctx context.Context) ([]WorkerClaim, error) {
+// Claims older than maxAge are considered stale and excluded.
+func (db *DB) OldestClaims(ctx context.Context, maxAge time.Duration) ([]WorkerClaim, error) {
 	if db.pool != nil {
-		return db.oldestClaimsPG(ctx)
+		return db.oldestClaimsPG(ctx, maxAge)
 	}
-	return db.oldestClaimsSQLite(ctx)
+	return db.oldestClaimsSQLite(ctx, maxAge)
+}
+
+// NewestAnalyzedAt returns the most recent analyzed_at timestamp, or zero if none.
+func (db *DB) NewestAnalyzedAt(ctx context.Context) (time.Time, error) {
+	if db.pool != nil {
+		return db.newestAnalyzedAtPG(ctx)
+	}
+	return db.newestAnalyzedAtSQLite(ctx)
 }
 
 // ClaimJobs atomically claims up to limit unanalyzed samples for the named
