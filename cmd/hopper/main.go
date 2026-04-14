@@ -122,6 +122,17 @@ func main() {
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+
+	// Force-exit on a second interrupt so cleanup can't hang forever.
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt)
+		<-sigCh // first is handled by NotifyContext
+		<-sigCh // second means "exit now"
+		slog.Warn("forced exit on second interrupt")
+		os.Exit(1)
+	}()
+
 	err = run(ctx)
 	stop()
 	if cleanup != nil {
@@ -200,15 +211,27 @@ func setupLogging() (func(), error) {
 	}
 
 	// Use a handler that writes to both stderr and the log file.
-	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
+	// Levels are dynamic so the dashboard can suppress noise at runtime.
+	stderrLevel := &slog.LevelVar{}
+	fileLevel := &slog.LevelVar{}
 	h := &multiHandler{
-		h1: slog.NewTextHandler(os.Stderr, opts),
-		h2: slog.NewJSONHandler(f, opts),
+		h1: slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: stderrLevel}),
+		h2: slog.NewJSONHandler(f, &slog.HandlerOptions{Level: fileLevel}),
 	}
 	slog.SetDefault(slog.New(h))
 
+	logLevels = &logLevelControl{stderr: stderrLevel, file: fileLevel}
+
 	return func() { closeFileBestEffort(logPath, f) }, nil
 }
+
+// logLevelControl allows runtime adjustment of log levels.
+type logLevelControl struct {
+	stderr, file *slog.LevelVar
+}
+
+// logLevels is set by setupLogging and used by the dashboard to quiet noisy messages.
+var logLevels *logLevelControl
 
 type multiHandler struct {
 	h1, h2 slog.Handler
@@ -859,6 +882,11 @@ func runDashboard(
 	interval := 10 * time.Second
 	if !isTTY() {
 		interval = 30 * time.Second
+	} else if logLevels != nil {
+		// TTY dashboard replaces log output; suppress everything below ERROR
+		// so the log file isn't filled with repetitive status warnings.
+		logLevels.stderr.Set(slog.LevelError)
+		logLevels.file.Set(slog.LevelError)
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
