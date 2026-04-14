@@ -412,7 +412,7 @@ func cmdLoad(ctx context.Context) error {
 	hashWorkers := f.Int("hash-workers", 8, "concurrent hash/insert workers for file walking")
 	cleaveBinFlag := f.String("cleave", "cleave", "path to cleave binary (used for file enumeration)")
 	litmusBin := f.String("litmus", "litmus", "path to litmus binary (pass empty to disable)")
-	litmusWorkers := f.Int("workers", 0, "concurrent analysis workers for the local litmus (0 = auto: max(2, cores/4))")
+	litmusWorkers := f.Int("workers", 0, "concurrent analysis workers for the local litmus (0 = auto: min(2, cores/2))")
 	// Remote litmus workers self-register via the pull API; no --litmus-nodes flag needed.
 	maxRSSGB := f.Int("max-memory-gb", 0, "litmus RSS limit in GB (0 = auto)")
 	analysisTimeout := f.Int("analysis-timeout", 1200, "per-file analysis timeout in seconds (passed to litmus)")
@@ -698,11 +698,11 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 	// Progress dashboard — runs until ctx is cancelled (ctrl-C).
 	var dashWG sync.WaitGroup
 	dashWG.Go(func() {
-		runDashboard(ctx, &progress, litmus, tracker, start, startAnalyzed, maxAnalyzed, len(dirs))
+		runDashboard(ctx, &progress, litmus, tracker, db, start, startAnalyzed, maxAnalyzed, len(dirs))
 	})
 
 	if wd != nil {
-		wd.configure(&progress, litmus, tracker, start, startAnalyzed, maxAnalyzed, len(dirs))
+		wd.configure(&progress, litmus, tracker, db, start, startAnalyzed, maxAnalyzed, len(dirs))
 	}
 
 	// Per-directory pipelines: cleave→hash→batch→insert.
@@ -851,6 +851,7 @@ func runDashboard(
 	progress *loadProgress,
 	_ *litmusServer,
 	tracker *workerTracker,
+	db *hopper.DB,
 	start time.Time,
 	startAnalyzed int64,
 	maxAnalyzed, ndirs int,
@@ -881,6 +882,16 @@ func runDashboard(
 		var workers []namedWorkerStats
 		if tracker != nil {
 			workers = tracker.all()
+		}
+
+		// Query oldest active claim per worker.
+		oldestClaims := make(map[string]hopper.WorkerClaim)
+		if db != nil {
+			if claims, err := db.OldestClaims(ctx); err == nil {
+				for _, c := range claims {
+					oldestClaims[c.Worker] = c
+				}
+			}
 		}
 
 		analyzedAbs := progress.analyzed.Load()
@@ -961,8 +972,16 @@ func runDashboard(
 			if rate15m > 0 {
 				attrs = append(attrs, "rate_15m", fmt.Sprintf("%.1f/s", rate15m))
 			}
+			if elapsed := time.Since(start).Seconds(); elapsed > 5 && sessionAnalyzed > 0 {
+				attrs = append(attrs, "rate_overall", fmt.Sprintf("%.1f/s", float64(sessionAnalyzed)/elapsed))
+			}
+			if rate15m > 0.1 && analyzeTarget > sessionAnalyzed {
+				remaining := analyzeTarget - sessionAnalyzed
+				etaDur := time.Duration(float64(remaining)/rate15m) * time.Second
+				attrs = append(attrs, "eta", formatETA(etaDur))
+			}
 			slog.Info("load progress", attrs...)
-			logWorkerStatus(workers)
+			logWorkerStatus(workers, nodeRates, oldestClaims)
 			continue
 		}
 
@@ -985,10 +1004,14 @@ func runDashboard(
 		writeStdout("\033[H\033[2J")
 
 		// Header line: app name, elapsed, progress, rate, ETA
-		header := fmt.Sprintf("\033[1mhopper\033[0m  %s", time.Since(start).Round(time.Second))
+		elapsed := time.Since(start)
+		header := fmt.Sprintf("\033[1mhopper\033[0m  %s", elapsed.Round(time.Second))
 		right := fmt.Sprintf("%s / %s  %.0f%%", fmtN(totalDone), fmtN(totalTarget), pct)
 		if rate15m > 0.1 {
 			right += fmt.Sprintf("  %.1f/s", rate15m)
+		}
+		if secs := elapsed.Seconds(); secs > 5 && sessionAnalyzed > 0 {
+			right += fmt.Sprintf("  (%.1f/s avg)", float64(sessionAnalyzed)/secs)
 		}
 		if etaStr != "" {
 			right += "  ETA " + etaStr
@@ -1008,7 +1031,7 @@ func runDashboard(
 					nameWidth = len(w.Name)
 				}
 			}
-			writeStdoutf("\n  \033[2m  %-*s  tasks    rate  analyzed  errors\033[0m\n",
+			writeStdoutf("\n  \033[2m  %-*s  tasks    rate  analyzed  errors  oldest job\033[0m\n",
 				nameWidth, "worker")
 
 			sort.Slice(workers, func(i, j int) bool { return workers[i].Name < workers[j].Name })
@@ -1021,10 +1044,19 @@ func runDashboard(
 					rateStr = fmt.Sprintf("%4.1f/s", r)
 				}
 
+				oldestStr := ""
+				if claim, ok := oldestClaims[w.Name]; ok {
+					age := time.Since(claim.ClaimedAt)
+					oldestStr = fmt.Sprintf("  %s (%s)", filepath.Base(claim.Path), shortDuration(age))
+				}
+
 				line := fmt.Sprintf("  %s %-*s  %3d/%d  %s  %8s  %s",
 					dot, nameWidth, w.Name,
 					w.ActiveClaims, w.Slots, rateStr,
 					fmtN(w.Analyzed), fmtN(w.Errors))
+				if oldestStr != "" {
+					line += oldestStr
+				}
 				if status != "" {
 					line += fmt.Sprintf("  \033[33m%s\033[0m", status)
 				}
@@ -1065,19 +1097,29 @@ func workerStatus(activeClaims int, idle time.Duration) (status string, dot stri
 	}
 }
 
-func logWorkerStatus(workers []namedWorkerStats) {
+func logWorkerStatus(workers []namedWorkerStats, nodeRates map[string]float64, oldestClaims map[string]hopper.WorkerClaim) {
 	for _, w := range workers {
 		online := time.Since(w.LastSeen) < 30*time.Second
 		status := "online"
 		if !online {
 			status = "offline"
 		}
-		slog.Info("litmus worker",
+		attrs := []any{
 			"worker", w.Name,
 			"status", status,
 			"slots", w.Slots,
 			"analyzed", w.Analyzed,
-			"errors", w.Errors)
+			"errors", w.Errors,
+		}
+		if r := nodeRates[w.Name]; r > 0.05 {
+			attrs = append(attrs, "rate", fmt.Sprintf("%.1f/s", r))
+		}
+		if claim, ok := oldestClaims[w.Name]; ok {
+			attrs = append(attrs,
+				"oldest_job", filepath.Base(claim.Path),
+				"oldest_age", shortDuration(time.Since(claim.ClaimedAt)))
+		}
+		slog.Info("litmus worker", attrs...)
 	}
 }
 

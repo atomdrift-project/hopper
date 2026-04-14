@@ -6,10 +6,13 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	hopper "codeberg.org/atomdrift/hopper"
 )
 
 // webDashboard serves a self-contained HTML page. Auto-refreshes every 5s.
@@ -20,6 +23,7 @@ type webDashboard struct {
 	progress      *loadProgress
 	litmus        *litmusServer
 	tracker       *workerTracker
+	db            *hopper.DB
 	start         time.Time
 	startAnalyzed int64
 	maxAnalyzed   int
@@ -32,12 +36,13 @@ type webDashboard struct {
 // configure is called once the load session is ready. It sets the fields the
 // handler needs to render progress and is safe to call concurrently with the
 // HTTP server already running.
-func (wd *webDashboard) configure(progress *loadProgress, litmus *litmusServer, tracker *workerTracker, start time.Time, startAnalyzed int64, maxAnalyzed, ndirs int) {
+func (wd *webDashboard) configure(progress *loadProgress, litmus *litmusServer, tracker *workerTracker, db *hopper.DB, start time.Time, startAnalyzed int64, maxAnalyzed, ndirs int) {
 	wd.cfgMu.Lock()
 	defer wd.cfgMu.Unlock()
 	wd.progress = progress
 	wd.litmus = litmus
 	wd.tracker = tracker
+	wd.db = db
 	wd.start = start
 	wd.startAnalyzed = startAnalyzed
 	wd.maxAnalyzed = maxAnalyzed
@@ -243,10 +248,11 @@ footer{padding-top:1rem;border-top:1px solid var(--border);
   font-family:var(--mono);font-size:.75rem;color:var(--sub)}
 `
 
-func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
+func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 	wd.cfgMu.RLock()
 	progress := wd.progress
 	tracker := wd.tracker
+	db := wd.db
 	start := wd.start
 	startAnalyzed := wd.startAnalyzed
 	maxAnalyzed := wd.maxAnalyzed
@@ -255,6 +261,16 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 	var workers []namedWorkerStats
 	if tracker != nil {
 		workers = tracker.all()
+	}
+
+	// Query oldest active claim per worker from the DB.
+	oldestClaims := make(map[string]hopper.WorkerClaim)
+	if db != nil {
+		if claims, err := db.OldestClaims(r.Context()); err == nil {
+			for _, c := range claims {
+				oldestClaims[c.Worker] = c
+			}
+		}
 	}
 
 	if progress == nil {
@@ -327,6 +343,9 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 	if rate > 0.1 {
 		fmt.Fprintf(&b, ` &middot; <em>%.1f</em>/s`, rate)
 	}
+	if secs := elapsed.Seconds(); secs > 5 && sessionAnalyzed > 0 {
+		fmt.Fprintf(&b, ` &middot; <em>%.1f</em>/s avg`, float64(sessionAnalyzed)/secs)
+	}
 	if etaStr != "" {
 		fmt.Fprintf(&b, ` &middot; ETA <em>%s</em>`, etaStr)
 	}
@@ -366,7 +385,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 		b.WriteString(`<section><div class="label">Workers</div>`)
 		b.WriteString(`<table><thead><tr>` +
 			`<th>Worker</th><th>Tasks</th><th>Rate</th>` +
-			`<th>Analyzed</th><th>Errors</th><th></th>` +
+			`<th>Analyzed</th><th>Errors</th><th>Oldest Job</th><th></th>` +
 			`</tr></thead><tbody>`)
 
 		sort.Slice(workers, func(i, j int) bool { return workers[i].Name < workers[j].Name })
@@ -387,12 +406,19 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 				rateStr = fmt.Sprintf("%.1f/s", nRate)
 			}
 
+			oldestStr := "—"
+			if claim, ok := oldestClaims[w.Name]; ok {
+				age := time.Since(claim.ClaimedAt)
+				oldestStr = fmt.Sprintf("%s (%s)", filepath.Base(claim.Path), shortDuration(age))
+			}
+
 			fmt.Fprintf(&b,
 				`<tr>`+
 					`<td class="nn"><span class="dot %s">●</span>%s</td>`+
 					`<td class="hi">%d/%d</td>`+
 					`<td class="hi">%s</td>`+
 					`<td class="hi">%s</td>`+
+					`<td>%s</td>`+
 					`<td>%s</td>`+
 					`<td class="warn">%s</td>`+
 					`</tr>`,
@@ -401,6 +427,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, _ *http.Request) {
 				rateStr,
 				fmtN(w.Analyzed),
 				fmtN(w.Errors),
+				htmlEscape(oldestStr),
 				htmlEscape(status),
 			)
 		}

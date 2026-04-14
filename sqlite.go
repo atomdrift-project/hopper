@@ -1100,6 +1100,36 @@ func (db *DB) claimJobsSQLite(ctx context.Context, worker string, limit int, exp
 	return jobs, nil
 }
 
+func (db *DB) oldestClaimsSQLite(ctx context.Context) ([]WorkerClaim, error) {
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT s.claimed_by, s.path, s.claimed_at
+		FROM samples s
+		INNER JOIN (
+			SELECT claimed_by, MIN(claimed_at) AS min_at
+			FROM samples
+			WHERE claimed_by != '' AND claimed_at IS NOT NULL AND cleave_result IS NULL
+			GROUP BY claimed_by
+		) g ON s.claimed_by = g.claimed_by AND s.claimed_at = g.min_at
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: oldest claims: %w", err)
+	}
+	defer rows.Close()
+	var out []WorkerClaim
+	for rows.Next() {
+		var wc WorkerClaim
+		var ts string
+		if err := rows.Scan(&wc.Worker, &wc.Path, &ts); err != nil {
+			return nil, fmt.Errorf("hopper: oldest claims scan: %w", err)
+		}
+		if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+			wc.ClaimedAt = t
+		}
+		out = append(out, wc)
+	}
+	return out, rows.Err()
+}
+
 func (db *DB) unclaimJobsSQLite(ctx context.Context, shas []string) error {
 	if len(shas) == 0 {
 		return nil

@@ -915,6 +915,28 @@ func (db *DB) claimJobsPG(ctx context.Context, worker string, limit int, expiry 
 	return jobs, rows.Err()
 }
 
+func (db *DB) oldestClaimsPG(ctx context.Context) ([]WorkerClaim, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT DISTINCT ON (claimed_by) claimed_by, path, claimed_at
+		FROM samples
+		WHERE claimed_by != '' AND claimed_at IS NOT NULL AND cleave_result IS NULL
+		ORDER BY claimed_by, claimed_at
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: oldest claims: %w", err)
+	}
+	defer rows.Close()
+	var out []WorkerClaim
+	for rows.Next() {
+		var wc WorkerClaim
+		if err := rows.Scan(&wc.Worker, &wc.Path, &wc.ClaimedAt); err != nil {
+			return nil, fmt.Errorf("hopper: oldest claims scan: %w", err)
+		}
+		out = append(out, wc)
+	}
+	return out, rows.Err()
+}
+
 func (db *DB) unclaimJobsPG(ctx context.Context, shas []string) error {
 	if len(shas) == 0 {
 		return nil

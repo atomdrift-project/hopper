@@ -609,6 +609,21 @@ type Worker struct {
 	Errors   int64     `json:"errors"`
 }
 
+// WorkerClaim describes the oldest active claim for a given worker.
+type WorkerClaim struct {
+	Worker    string
+	Path      string
+	ClaimedAt time.Time
+}
+
+// OldestClaims returns the oldest active claim per worker.
+func (db *DB) OldestClaims(ctx context.Context) ([]WorkerClaim, error) {
+	if db.pool != nil {
+		return db.oldestClaimsPG(ctx)
+	}
+	return db.oldestClaimsSQLite(ctx)
+}
+
 // ClaimJobs atomically claims up to limit unanalyzed samples for the named
 // worker. Expired claims (older than expiry) are reclaimed.
 func (db *DB) ClaimJobs(ctx context.Context, worker string, limit int, expiry time.Duration) ([]ClaimJob, error) {
