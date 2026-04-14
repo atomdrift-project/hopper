@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -155,7 +156,7 @@ const (
 	claimExpiry        = 30 * time.Minute
 	staleClaimAge      = 2 * time.Hour
 	maxWorkerNameLen   = 64
-	maxResultBodyBytes = 8 << 20 // 8 MiB — plenty for cleave+litmus JSON.
+	maxResultBodyBytes = 64 << 20 // 64 MiB — complex samples with many embedded binaries produce large cleave reports.
 	maxTrackedWorkers  = 200
 	warmupClaimLimit   = 10 // max claims before a worker has returned any results
 )
@@ -174,6 +175,21 @@ func validWorkerName(name string) bool {
 	return true
 }
 
+// qualifiedWorkerName returns "name:ip" to disambiguate workers that share
+// a hostname. Loopback addresses are left unqualified since the local
+// litmus worker is always unique.
+func qualifiedWorkerName(name string, remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return name
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || ip.IsLoopback() {
+		return name
+	}
+	return name + ":" + host
+}
+
 // handleNext claims work items for a worker.
 // GET /api/next?worker=nuc&count=3&slots=4&version=0.8.2&traits=abc123.
 func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
@@ -186,6 +202,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid worker name"}`, http.StatusBadRequest)
 		return
 	}
+	worker = qualifiedWorkerName(worker, r.RemoteAddr)
 
 	count := 1
 	if v := r.URL.Query().Get("count"); v != "" {
@@ -270,6 +287,10 @@ type resultRequest struct {
 
 // handleResult receives an analysis result from a worker.
 func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		http.Error(w, `{"error":"starting"}`, http.StatusServiceUnavailable)
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxResultBodyBytes))
 	if err != nil {
 		http.Error(w, `{"error":"read body"}`, http.StatusBadRequest)
@@ -287,6 +308,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid sha256 or worker"}`, http.StatusBadRequest)
 		return
 	}
+	req.Worker = qualifiedWorkerName(req.Worker, r.RemoteAddr)
 
 	ctx := r.Context()
 
@@ -370,7 +392,9 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 // on retry — the sample should be deleted rather than reclaimed.
 func isPermanentError(msg string) bool {
 	return strings.Contains(msg, "Unsupported file type") ||
-		strings.Contains(msg, "Path does not exist")
+		strings.Contains(msg, "Path does not exist") ||
+		strings.Contains(msg, "Failed to decrypt") ||
+		strings.Contains(msg, "Password required")
 }
 
 // validSHA256 checks that s is exactly 64 lowercase hex characters.
@@ -385,6 +409,10 @@ func validSHA256(s string) bool {
 // handleFile serves file content for remote workers.
 // GET /api/file/{sha256}.
 func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		http.Error(w, `{"error":"starting"}`, http.StatusServiceUnavailable)
+		return
+	}
 	sha := r.PathValue("sha256")
 	if !validSHA256(sha) {
 		http.Error(w, `{"error":"invalid sha256"}`, http.StatusBadRequest)

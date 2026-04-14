@@ -438,7 +438,7 @@ func cmdLoad(ctx context.Context) error {
 	litmusWorkers := f.Int("workers", 0, "concurrent analysis workers for the local litmus (0 = auto: min(2, cores/2))")
 	// Remote litmus workers self-register via the pull API; no --litmus-nodes flag needed.
 	maxRSSGB := f.Int("max-memory-gb", 0, "litmus RSS limit in GB (0 = auto)")
-	analysisTimeout := f.Int("analysis-timeout", 1200, "per-file analysis timeout in seconds (passed to litmus)")
+	analysisTimeout := f.Int("analysis-timeout", 3600, "per-file analysis timeout in seconds (passed to litmus)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
@@ -895,7 +895,7 @@ func runDashboard(
 	type sample struct {
 		t      time.Time
 		count  int64
-		byNode []int64
+		byNode map[string]int64 // keyed by worker name
 	}
 	const maxSamples = 120 // 10s * 120 = 20 minutes of history
 	var samples []sample
@@ -941,9 +941,9 @@ func runDashboard(
 		now := time.Now()
 		s := sample{t: now, count: sessionAnalyzed}
 		if len(workers) > 0 {
-			s.byNode = make([]int64, len(workers))
-			for i, w := range workers {
-				s.byNode[i] = w.Analyzed
+			s.byNode = make(map[string]int64, len(workers))
+			for _, w := range workers {
+				s.byNode[w.Name] = w.Analyzed
 			}
 		}
 		samples = append(samples, s)
@@ -963,20 +963,13 @@ func runDashboard(
 				}
 			}
 			if dt := now.Sub(oldest.t).Seconds(); dt > 5 {
-				rate15m = float64(sessionAnalyzed-oldest.count) / dt
+				rate15m = max(float64(sessionAnalyzed-oldest.count)/dt, 0)
 				latest := samples[len(samples)-1]
-				// Per-node rates: compare matching indices up to the
-				// shorter of the two slices. This handles monitor
-				// count changes (nodes joining/leaving) gracefully.
-				minLen := len(latest.byNode)
-				if len(oldest.byNode) < minLen {
-					minLen = len(oldest.byNode)
-				}
-				if minLen > 0 {
-					nodeRates = make(map[string]float64, len(workers))
-					for i, w := range workers {
-						if i < minLen {
-							nodeRates[w.Name] = float64(latest.byNode[i]-oldest.byNode[i]) / dt
+				if len(latest.byNode) > 0 {
+					nodeRates = make(map[string]float64, len(latest.byNode))
+					for name, latestCount := range latest.byNode {
+						if oldCount, ok := oldest.byNode[name]; ok {
+							nodeRates[name] = max(float64(latestCount-oldCount)/dt, 0)
 						}
 					}
 				}
@@ -1038,10 +1031,7 @@ func runDashboard(
 		header := fmt.Sprintf("\033[1mhopper\033[0m  %s", elapsed.Round(time.Second))
 		right := fmt.Sprintf("%s / %s  %.0f%%", fmtN(totalDone), fmtN(totalTarget), pct)
 		if rate15m > 0.1 {
-			right += fmt.Sprintf("  %.1f/s", rate15m)
-		}
-		if secs := elapsed.Seconds(); secs > 5 && sessionAnalyzed > 0 {
-			right += fmt.Sprintf("  (%.1f/s avg)", float64(sessionAnalyzed)/secs)
+			right += fmt.Sprintf("  %.1f/s (15m avg)", rate15m)
 		}
 		if etaStr != "" {
 			right += "  ETA " + etaStr

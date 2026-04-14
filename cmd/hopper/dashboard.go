@@ -54,7 +54,7 @@ const maxThroughputSamples = 2880 // 4 hours at 5-second refresh
 type throughputSample struct {
 	t      time.Time
 	total  int64
-	byNode []int64
+	byNode map[string]int64 // keyed by worker name
 }
 
 func (wd *webDashboard) recordSample(total int64) {
@@ -64,9 +64,9 @@ func (wd *webDashboard) recordSample(total int64) {
 	if wd.tracker != nil {
 		workers := wd.tracker.all()
 		if len(workers) > 0 {
-			s.byNode = make([]int64, len(workers))
-			for i, w := range workers {
-				s.byNode[i] = w.Analyzed
+			s.byNode = make(map[string]int64, len(workers))
+			for _, w := range workers {
+				s.byNode[w.Name] = w.Analyzed
 			}
 		}
 	}
@@ -77,9 +77,8 @@ func (wd *webDashboard) recordSample(total int64) {
 }
 
 // ratesOver returns the average files/sec over the most recent window,
-// both combined and per-node. Per-node rates are keyed by monitor index
-// in the order monitors were recorded.
-func (wd *webDashboard) ratesOver(window time.Duration) (combined float64, perNode []float64) {
+// both combined and per-node. Per-node rates are keyed by worker name.
+func (wd *webDashboard) ratesOver(window time.Duration) (combined float64, perNode map[string]float64) {
 	wd.mu.Lock()
 	n := len(wd.samples)
 	if n < 2 {
@@ -100,15 +99,17 @@ func (wd *webDashboard) ratesOver(window time.Duration) (combined float64, perNo
 	if dt < 5 {
 		return 0, nil
 	}
-	combined = float64(latest.total-oldest.total) / dt
-	minLen := len(latest.byNode)
-	if len(oldest.byNode) < minLen {
-		minLen = len(oldest.byNode)
-	}
-	if minLen > 0 {
-		perNode = make([]float64, minLen)
-		for i := range minLen {
-			perNode[i] = float64(latest.byNode[i]-oldest.byNode[i]) / dt
+	combined = max(float64(latest.total-oldest.total)/dt, 0)
+	if len(latest.byNode) > 0 {
+		perNode = make(map[string]float64, len(latest.byNode))
+		for name, latestCount := range latest.byNode {
+			if oldCount, ok := oldest.byNode[name]; ok {
+				perNode[name] = max(float64(latestCount-oldCount)/dt, 0)
+			} else {
+				// Worker joined after the oldest sample — rate over
+				// whatever history we have is still useful but we
+				// can't compute it precisely, so skip.
+			}
 		}
 	}
 	return combined, perNode
@@ -116,7 +117,8 @@ func (wd *webDashboard) ratesOver(window time.Duration) (combined float64, perNo
 
 // throughputSeries derives per-interval files/sec from the sample history.
 // Intervals wider than 30s are zeroed to avoid spikes after page inactivity.
-func (wd *webDashboard) throughputSeries() (combined []float64, perNode [][]float64) {
+// Returns combined rates and per-node rates keyed by worker name.
+func (wd *webDashboard) throughputSeries() (combined []float64, perNode map[string][]float64) {
 	wd.mu.Lock()
 	n := len(wd.samples)
 	samples := make([]throughputSample, n)
@@ -127,25 +129,32 @@ func (wd *webDashboard) throughputSeries() (combined []float64, perNode [][]floa
 		return nil, nil
 	}
 	combined = make([]float64, n-1)
-	var nWorkers int
-	if wd.tracker != nil {
-		nWorkers = len(wd.tracker.all())
-	}
-	if nWorkers > 0 {
-		perNode = make([][]float64, nWorkers)
-		for i := range perNode {
-			perNode[i] = make([]float64, n-1)
+
+	// Collect all worker names seen across samples.
+	nameSet := make(map[string]struct{})
+	for _, s := range samples {
+		for name := range s.byNode {
+			nameSet[name] = struct{}{}
 		}
 	}
+	if len(nameSet) > 0 {
+		perNode = make(map[string][]float64, len(nameSet))
+		for name := range nameSet {
+			perNode[name] = make([]float64, n-1)
+		}
+	}
+
 	for i := 1; i < n; i++ {
 		dt := samples[i].t.Sub(samples[i-1].t).Seconds()
 		if dt <= 0 || dt > 30 {
 			continue
 		}
-		combined[i-1] = float64(samples[i].total-samples[i-1].total) / dt
-		for j := range nWorkers {
-			if j < len(samples[i].byNode) && j < len(samples[i-1].byNode) {
-				perNode[j][i-1] = float64(samples[i].byNode[j]-samples[i-1].byNode[j]) / dt
+		combined[i-1] = max(float64(samples[i].total-samples[i-1].total)/dt, 0)
+		for name, series := range perNode {
+			cur, okCur := samples[i].byNode[name]
+			prev, okPrev := samples[i-1].byNode[name]
+			if okCur && okPrev {
+				series[i-1] = max(float64(cur-prev)/dt, 0)
 			}
 		}
 	}
@@ -221,6 +230,7 @@ tbody td{padding:.5rem .6rem;font-family:var(--mono);font-size:.8rem;color:var(-
 td.nn{font-family:var(--sans);color:var(--text);font-weight:500;
   font-size:.82rem;white-space:nowrap}
 td.hi{color:var(--text)}
+td.rate{color:var(--text);white-space:nowrap}
 td.warn{color:var(--amber)}
 
 /* status dot */
@@ -300,15 +310,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 	totalDone := startAnalyzed + sessionAnalyzed
 
 	wd.recordSample(sessionAnalyzed)
-	rate, nodeRates := wd.ratesOver(15 * time.Minute)
-
-	// Build worker-index → rate map for the node table.
-	nodeRateByName := make(map[string]float64, len(workers))
-	for i, w := range workers {
-		if i < len(nodeRates) {
-			nodeRateByName[w.Name] = nodeRates[i]
-		}
-	}
+	rate, nodeRateByName := wd.ratesOver(15 * time.Minute)
 
 	var etaStr string
 	if rate > 0.1 && analyzeTarget > sessionAnalyzed {
@@ -343,10 +345,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 	b.WriteString(`<span class="progress-detail">`)
 	fmt.Fprintf(&b, `<em>%s</em> / %s`, fmtN(totalDone), fmtN(totalTarget))
 	if rate > 0.1 {
-		fmt.Fprintf(&b, ` &middot; <em>%.1f</em>/s`, rate)
-	}
-	if secs := elapsed.Seconds(); secs > 5 && sessionAnalyzed > 0 {
-		fmt.Fprintf(&b, ` &middot; <em>%.1f</em>/s avg`, float64(sessionAnalyzed)/secs)
+		fmt.Fprintf(&b, ` &middot; <em>%.1f</em>/s (15m avg)`, rate)
 	}
 	if etaStr != "" {
 		fmt.Fprintf(&b, ` &middot; ETA <em>%s</em>`, etaStr)
@@ -371,14 +370,19 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 	b.WriteString(`</div>`) // .hdr
 
 	// Throughput graph
-	combined, perNode := wd.throughputSeries()
-	if len(combined) >= 2 {
-		var nodeNames []string
+	combinedSeries, perNodeSeries := wd.throughputSeries()
+	if len(combinedSeries) >= 2 {
+		// Build ordered name/series slices for the graph.
+		var graphNodeNames []string
+		var graphNodeSeries [][]float64
 		for _, w := range workers {
-			nodeNames = append(nodeNames, w.Name)
+			if series, ok := perNodeSeries[w.Name]; ok {
+				graphNodeNames = append(graphNodeNames, w.Name)
+				graphNodeSeries = append(graphNodeSeries, series)
+			}
 		}
 		b.WriteString(`<section><div class="label">Throughput</div>`)
-		writeThroughputGraph(&b, combined, perNode, nodeNames)
+		writeThroughputGraph(&b, combinedSeries, graphNodeSeries, graphNodeNames)
 		b.WriteString(`</section>`)
 	}
 
@@ -419,7 +423,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 					`<td class="nn"><span class="dot %s">●</span>%s</td>`+
 					`<td class="hi">%d/%d</td>`+
 					`<td class="hi">%s</td>`+
-					`<td class="hi">%s</td>`+
+					`<td class="rate">%s</td>`+
 					`<td class="hi">%s</td>`+
 					`<td>%s</td>`+
 					`<td>%s</td>`+
