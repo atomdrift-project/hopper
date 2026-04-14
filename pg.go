@@ -730,7 +730,7 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 
 func (db *DB) setSkipPG(ctx context.Context, sha256, skip string) error {
 	_, err := db.pool.Exec(ctx, `
-		UPDATE samples SET skip = $2, updated_at = now() WHERE sha256 = $1`,
+		UPDATE samples SET skip = $2, claimed_by = '', claimed_at = NULL, updated_at = now() WHERE sha256 = $1`,
 		sha256, skip)
 	if err != nil {
 		return fmt.Errorf("hopper: set skip: %w", err)

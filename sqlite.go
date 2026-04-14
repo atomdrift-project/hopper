@@ -891,7 +891,7 @@ func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 
 func (db *DB) setSkipSQLite(ctx context.Context, sha256, skip string) error {
 	_, err := db.lite.ExecContext(ctx, `
-		UPDATE samples SET skip = ?, updated_at = ? WHERE sha256 = ?`,
+		UPDATE samples SET skip = ?, claimed_by = '', claimed_at = NULL, updated_at = ? WHERE sha256 = ?`,
 		skip, now(), sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: set skip: %w", err)
