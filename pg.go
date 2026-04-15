@@ -356,6 +356,7 @@ func (db *DB) falsePositivesPG(ctx context.Context, scoreThreshold, limit int) (
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
 		 WHERE label = 'good' AND cleave_result IS NOT NULL AND score >= $1 AND status = '' AND skip = ''
+		   AND (max_crit >= 5 OR suspicious_count >= 2)
 		 ORDER BY score DESC LIMIT $2`,
 		scoreThreshold, limit)
 	if err != nil {
@@ -380,6 +381,7 @@ func (db *DB) falseNegativesPG(ctx context.Context, scoreThreshold, limit int) (
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
 		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND score <= $1 AND status = '' AND skip = ''
+		   AND max_crit < 5 AND suspicious_count < 2
 		 ORDER BY score ASC LIMIT $2`,
 		scoreThreshold, limit)
 	if err != nil {
@@ -481,11 +483,25 @@ func (db *DB) seedCandidatesInPathsPG(ctx context.Context, prefixes []string, la
 	for i, p := range prefixes {
 		patterns[i] = p + "/%"
 	}
+
+	// Apply detection-equivalent filter so the DB only returns samples that
+	// will pass the Go-side Detected() / !Detected() post-filter.
+	// FP seeds (good label) want detected:   max_crit >= 5 OR suspicious_count >= 2
+	// FN seeds (bad label)  want undetected:  max_crit < 5 AND suspicious_count < 2
+	var detectionFilter string
+	if label == "good" {
+		detectionFilter = "AND (max_crit >= 5 OR suspicious_count >= 2)"
+	} else {
+		detectionFilter = "AND max_crit < 5 AND suspicious_count < 2"
+	}
+
+	//nolint:gosec // detectionFilter is a compile-time constant per branch, not user input
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
 		 WHERE status = '' AND label = $1 AND skip = '' AND score `+op+` $2
 		   AND cleave_result IS NOT NULL
 		   AND path LIKE ANY($3)
+		   `+detectionFilter+`
 		 ORDER BY updated_at ASC LIMIT $4`,
 		label, score, patterns, limit)
 	if err != nil {
@@ -924,7 +940,7 @@ func (db *DB) claimJobsPG(ctx context.Context, worker string, limit int, expiry 
 			SELECT id FROM samples
 			WHERE cleave_result IS NULL AND skip = '' AND parent = ''
 			  AND (claimed_by = '' OR claimed_at < now() - $2::interval)
-			ORDER BY mtime DESC NULLS LAST, id
+			ORDER BY updated_at ASC NULLS FIRST, id
 			LIMIT $3
 			FOR UPDATE SKIP LOCKED
 		)
@@ -996,7 +1012,7 @@ func (db *DB) unclaimJobsPG(ctx context.Context, shas []string) error {
 		return nil
 	}
 	_, err := db.pool.Exec(ctx,
-		`UPDATE samples SET claimed_by = '', claimed_at = NULL WHERE sha256 = ANY($1)`, shas)
+		`UPDATE samples SET claimed_by = '', claimed_at = NULL, updated_at = now() WHERE sha256 = ANY($1)`, shas)
 	if err != nil {
 		return fmt.Errorf("hopper: unclaim jobs: %w", err)
 	}

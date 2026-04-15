@@ -489,6 +489,7 @@ func (db *DB) falsePositivesSQLite(ctx context.Context, scoreThreshold, limit in
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples
 		 WHERE label = 'good' AND cleave_result IS NOT NULL AND score >= ? AND status = '' AND skip = ''
+		   AND (max_crit >= 5 OR suspicious_count >= 2)
 		 ORDER BY score DESC LIMIT ?`,
 		scoreThreshold, limit)
 	if err != nil {
@@ -513,6 +514,7 @@ func (db *DB) falseNegativesSQLite(ctx context.Context, scoreThreshold, limit in
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples
 		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND score <= ? AND status = '' AND skip = ''
+		   AND max_crit < 5 AND suspicious_count < 2
 		 ORDER BY score ASC LIMIT ?`,
 		scoreThreshold, limit)
 	if err != nil {
@@ -622,12 +624,22 @@ func (db *DB) seedCandidatesInPathsSQLite(ctx context.Context, prefixes []string
 		args = append(args, p+"/*")
 	}
 	args = append(args, limit)
+	// Apply detection-equivalent filter so the DB only returns samples that
+	// will pass the Go-side Detected() / !Detected() post-filter.
+	var detectionFilter string
+	if label == "good" {
+		detectionFilter = " AND (max_crit >= 5 OR suspicious_count >= 2)"
+	} else {
+		detectionFilter = " AND max_crit < 5 AND suspicious_count < 2"
+	}
+
 	//nolint:gosec // query structure is built from constants, values are parameterized
 	query := `SELECT ` + liteSampleCols + ` FROM samples` +
 		` WHERE status = '' AND label = ? AND skip = ''` +
 		` AND score ` + op + ` ? AND cleave_result IS NOT NULL` +
-		` AND (` + strings.Join(clauses, " OR ") +
-		`) ORDER BY updated_at ASC LIMIT ?`
+		` AND (` + strings.Join(clauses, " OR ") + `)` +
+		detectionFilter +
+		` ORDER BY updated_at ASC LIMIT ?`
 	rows, err := db.lite.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: seed candidates in paths: %w", err)
@@ -1079,7 +1091,7 @@ func (db *DB) claimJobsSQLite(ctx context.Context, worker string, limit int, exp
 		SELECT id, sha256, path, size_bytes, file_type FROM samples
 		WHERE cleave_result IS NULL AND skip = '' AND parent = ''
 		  AND (claimed_by = '' OR claimed_at < ?)
-		ORDER BY mtime DESC, id LIMIT ?`, cutoff, limit)
+		ORDER BY updated_at ASC, id LIMIT ?`, cutoff, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: claim jobs query: %w", err)
 	}
@@ -1187,7 +1199,7 @@ func (db *DB) unclaimJobsSQLite(ctx context.Context, shas []string) error {
 	defer tx.Rollback() //nolint:errcheck // rollback is best-effort after commit
 	for _, sha := range shas {
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE samples SET claimed_by = '', claimed_at = NULL WHERE sha256 = ?`, sha); err != nil {
+			`UPDATE samples SET claimed_by = '', claimed_at = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE sha256 = ?`, sha); err != nil {
 			return fmt.Errorf("hopper: unclaim: %w", err)
 		}
 	}

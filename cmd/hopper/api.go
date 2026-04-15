@@ -354,7 +354,8 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(req.Error, "Unsupported file type") ||
 			strings.Contains(req.Error, "Path does not exist") ||
 			strings.Contains(req.Error, "Failed to decrypt") ||
-			strings.Contains(req.Error, "Password required") {
+			strings.Contains(req.Error, "Password required") ||
+			strings.Contains(req.Error, "invalid Zip archive") {
 			// Unsupported file type, missing file, etc. — mark so it's
 			// never queued again, but preserve the record.
 			skip := "unsupported"

@@ -285,7 +285,9 @@ func TestFalsePositivesInPaths(t *testing.T) {
 		Path:        "/data/good/app1",
 		Score:       90,
 	})
-	mustAnalyze(t, ctx, db, "fp1", 90)
+	// Include a hostile-level trait so fp1 passes the detection filter
+	// (max_crit >= 5 OR suspicious_count >= 2).
+	mustAnalyzeWithTraits(t, ctx, db, "fp1", 90, `{"l":5,"c":1.0}`)
 	mustInsert(t, ctx, db, &Sample{
 		SHA256:      "fp2",
 		Source:      "test",
