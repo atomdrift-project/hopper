@@ -1144,6 +1144,17 @@ func (db *DB) newestAnalyzedAtSQLite(ctx context.Context) (time.Time, error) {
 	return t, err
 }
 
+func (db *DB) unclaimAllSQLite(ctx context.Context) (int64, error) {
+	res, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET claimed_by = '', claimed_at = NULL
+		 WHERE claimed_by != '' AND cleave_result IS NULL`)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: unclaim all: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 func (db *DB) unclaimJobsSQLite(ctx context.Context, shas []string) error {
 	if len(shas) == 0 {
 		return nil

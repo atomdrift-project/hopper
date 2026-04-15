@@ -24,21 +24,30 @@ type cacheKey struct {
 	mtime int64 // UnixNano
 }
 
+// cacheEntry stores the SHA256 and whether the sample has been inserted into the
+// samples DB. The inserted flag lets the scan skip batch inserts for files that
+// haven't changed since the last successful run.
+type cacheEntry struct {
+	sha256   [32]byte
+	inserted bool
+}
+
 // hashCache is a SQLite-persisted, memory-resident cache mapping file identity → sha256.
 // On open it bulk-loads all rows into a map; lookups are O(1) with no I/O.
 // New entries are buffered and flushed to SQLite in batches.
 type hashCache struct {
 	db      *sql.DB
-	mem     map[cacheKey][32]byte // dev+inode+size+mtime → raw sha256
-	dirty   []dirtyEntry          // new entries pending write
+	mem     map[cacheKey]cacheEntry // dev+inode+size+mtime → sha256 + inserted flag
+	dirty   []dirtyEntry            // new entries pending write
 	mu      sync.Mutex
 	flushMu sync.Mutex
 	queued  atomic.Bool
 }
 
 type dirtyEntry struct {
-	key    cacheKey
-	sha256 [32]byte
+	key      cacheKey
+	sha256   [32]byte
+	inserted bool
 }
 
 const writeBatchSize = 1000
@@ -65,8 +74,11 @@ func openHashCache(ctx context.Context, path string) (*hashCache, error) {
 		}
 		return nil, fmt.Errorf("hashcache: create table: %w", err)
 	}
+	// Migration: add inserted column. Fails harmlessly if it already exists.
+	//nolint:errcheck,gosec // ALTER TABLE fails harmlessly if column already exists.
+	db.ExecContext(ctx, `ALTER TABLE hash_cache ADD COLUMN inserted INTEGER NOT NULL DEFAULT 0`)
 
-	c := &hashCache{db: db, mem: make(map[cacheKey][32]byte)}
+	c := &hashCache{db: db, mem: make(map[cacheKey]cacheEntry)}
 	if err := c.load(ctx); err != nil {
 		if closeErr := db.Close(); closeErr != nil {
 			slog.Warn("hashcache: close after load failure", "error", closeErr)
@@ -78,7 +90,7 @@ func openHashCache(ctx context.Context, path string) (*hashCache, error) {
 
 // load bulk-reads all cache rows into the map.
 func (c *hashCache) load(ctx context.Context) error {
-	rows, err := c.db.QueryContext(ctx, `SELECT dev, inode, size, mtime, sha256 FROM hash_cache`)
+	rows, err := c.db.QueryContext(ctx, `SELECT dev, inode, size, mtime, sha256, inserted FROM hash_cache`)
 	if err != nil {
 		return fmt.Errorf("hashcache: load: %w", err)
 	}
@@ -91,30 +103,32 @@ func (c *hashCache) load(ctx context.Context) error {
 	for rows.Next() {
 		var k cacheKey
 		var shaHex string
-		if err := rows.Scan(&k.dev, &k.inode, &k.size, &k.mtime, &shaHex); err != nil {
+		var ins int
+		if err := rows.Scan(&k.dev, &k.inode, &k.size, &k.mtime, &shaHex, &ins); err != nil {
 			return fmt.Errorf("hashcache: scan: %w", err)
 		}
 		var sha [32]byte
 		if _, err := hex.Decode(sha[:], []byte(shaHex)); err != nil {
 			return fmt.Errorf("hashcache: decode sha: %w", err)
 		}
-		c.mem[k] = sha
+		c.mem[k] = cacheEntry{sha256: sha, inserted: ins != 0}
 	}
 	slog.Info("hash cache loaded", "entries", len(c.mem))
 	return rows.Err()
 }
 
 // lookup checks the in-memory cache. Safe for concurrent use.
-// Returns the hex-encoded sha256 and true on hit.
-func (c *hashCache) lookup(dev, inode uint64, size int64, mtime time.Time) (string, bool) {
+// Returns the hex-encoded sha256, whether the entry has been inserted into
+// the samples DB, and whether the lookup was a hit.
+func (c *hashCache) lookup(dev, inode uint64, size int64, mtime time.Time) (sha256Hex string, inserted bool, ok bool) {
 	k := cacheKey{dev: dev, inode: inode, size: size, mtime: mtime.UnixNano()}
 	c.mu.Lock()
-	sha, ok := c.mem[k]
+	e, ok := c.mem[k]
 	c.mu.Unlock()
 	if !ok {
-		return "", false
+		return "", false, false
 	}
-	return hex.EncodeToString(sha[:]), true
+	return hex.EncodeToString(e.sha256[:]), e.inserted, true
 }
 
 // store adds an entry to the in-memory cache and dirty buffer.
@@ -128,11 +142,29 @@ func (c *hashCache) store(ctx context.Context, dev, inode uint64, size int64, mt
 	}
 
 	c.mu.Lock()
-	c.mem[k] = sha
+	c.mem[k] = cacheEntry{sha256: sha}
 	c.dirty = append(c.dirty, dirtyEntry{key: k, sha256: sha})
 	shouldFlush := len(c.dirty) >= writeBatchSize
 	c.mu.Unlock()
 
+	if shouldFlush {
+		c.requestFlush(ctx)
+	}
+}
+
+// markInserted marks cache entries as successfully inserted into the samples DB.
+// The flag is persisted on the next flush so future startups can skip re-inserting.
+func (c *hashCache) markInserted(ctx context.Context, keys []cacheKey) {
+	c.mu.Lock()
+	for _, k := range keys {
+		if e, ok := c.mem[k]; ok && !e.inserted {
+			e.inserted = true
+			c.mem[k] = e
+			c.dirty = append(c.dirty, dirtyEntry{key: k, sha256: e.sha256, inserted: true})
+		}
+	}
+	shouldFlush := len(c.dirty) >= writeBatchSize
+	c.mu.Unlock()
 	if shouldFlush {
 		c.requestFlush(ctx)
 	}
@@ -169,7 +201,7 @@ func (c *hashCache) flush(ctx context.Context) {
 		return
 	}
 	stmt, err := tx.PrepareContext(ctx,
-		`INSERT OR REPLACE INTO hash_cache (dev, inode, size, mtime, sha256) VALUES (?, ?, ?, ?, ?)`)
+		`INSERT OR REPLACE INTO hash_cache (dev, inode, size, mtime, sha256, inserted) VALUES (?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		if rollbackErr := tx.Rollback(); rollbackErr != nil {
 			slog.Warn("hashcache: rollback after prepare failure", "error", rollbackErr)
@@ -183,8 +215,12 @@ func (c *hashCache) flush(ctx context.Context) {
 		}
 	}()
 	for _, e := range batch {
+		ins := 0
+		if e.inserted {
+			ins = 1
+		}
 		if _, execErr := stmt.ExecContext(ctx,
-			e.key.dev, e.key.inode, e.key.size, e.key.mtime, hex.EncodeToString(e.sha256[:])); execErr != nil {
+			e.key.dev, e.key.inode, e.key.size, e.key.mtime, hex.EncodeToString(e.sha256[:]), ins); execErr != nil {
 			slog.Warn("hashcache: exec", "error", execErr)
 		}
 	}
@@ -206,7 +242,7 @@ func (c *hashCache) close(ctx context.Context) {
 // fileStat returns the device and inode numbers from an os.FileInfo via Stat_t.
 func fileStat(info os.FileInfo) (dev, inode uint64) {
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		return uint64(st.Dev), uint64(st.Ino)
+		return st.Dev, st.Ino
 	}
 	return 0, 0
 }

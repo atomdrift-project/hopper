@@ -12,8 +12,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/codeGROOVE-dev/fido"
+
 	hopper "codeberg.org/atomdrift/hopper"
 )
+
+const dashQueryTimeout = 3 * time.Second
 
 // webDashboard serves a self-contained HTML page. Auto-refreshes every 5s.
 // Fields guarded by cfgMu are set once via configure() after the load session
@@ -31,6 +35,9 @@ type webDashboard struct {
 
 	mu      sync.Mutex
 	samples []throughputSample // capped at maxThroughputSamples
+
+	claimsCache     *fido.Cache[string, []hopper.WorkerClaim]
+	newestATCache   *fido.Cache[string, time.Time]
 }
 
 // configure is called once the load session is ready. It sets the fields the
@@ -47,6 +54,8 @@ func (wd *webDashboard) configure(progress *loadProgress, litmus *litmusServer, 
 	wd.startAnalyzed = startAnalyzed
 	wd.maxAnalyzed = maxAnalyzed
 	wd.ndirs = ndirs
+	wd.claimsCache = fido.New[string, []hopper.WorkerClaim](fido.Size(1), fido.TTL(10*time.Second))
+	wd.newestATCache = fido.New[string, time.Time](fido.Size(1), fido.TTL(10*time.Second))
 }
 
 const maxThroughputSamples = 2880 // 4 hours at 5-second refresh
@@ -273,16 +282,24 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 		workers = tracker.all()
 	}
 
-	// Query oldest active claim per worker from the DB.
+	// Query oldest active claim per worker from the DB, with caching
+	// and a timeout so a slow database never blocks page renders.
 	oldestClaims := make(map[string]hopper.WorkerClaim)
 	var newestAnalyzedAt time.Time
 	if db != nil {
-		if claims, err := db.OldestClaims(r.Context(), staleClaimAge); err == nil {
-			for _, c := range claims {
-				oldestClaims[c.Worker] = c
-			}
+		claims, _ := wd.claimsCache.Fetch("claims", func() ([]hopper.WorkerClaim, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), dashQueryTimeout)
+			defer cancel()
+			return db.OldestClaims(ctx, staleClaimAge)
+		})
+		for _, c := range claims {
+			oldestClaims[c.Worker] = c
 		}
-		newestAnalyzedAt, _ = db.NewestAnalyzedAt(r.Context())
+		newestAnalyzedAt, _ = wd.newestATCache.Fetch("newest", func() (time.Time, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), dashQueryTimeout)
+			defer cancel()
+			return db.NewestAnalyzedAt(ctx)
+		})
 	}
 
 	if progress == nil {

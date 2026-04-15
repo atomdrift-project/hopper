@@ -54,8 +54,8 @@ func (db *DB) migratePG(ctx context.Context) error {
 		// idx_samples_unanalyzed indexes sha256 but unanalyzedPG orders by id;
 		// this index lets that query avoid a sort at 100M rows.
 		`CREATE INDEX IF NOT EXISTS idx_samples_unanalyzed_id ON samples(id) WHERE cleave_result IS NULL`,
-		// Covers falsePositivesPG / truePositivesPG / falseNegativesPG / benignReviewPG /
-		// badReviewPG — all filter (label, score, cleave_result IS NOT NULL, status='', skip='').
+		// Covers falsePositivesPG / truePositivesPG / falseNegativesPG — all filter
+		// (label, score, cleave_result IS NOT NULL, status='', skip='').
 		`CREATE INDEX IF NOT EXISTS idx_samples_review ON samples(label, score DESC) WHERE cleave_result IS NOT NULL AND status = '' AND skip = ''`,
 		// countAnalyzedPG: SELECT count(*) WHERE litmus_result IS NOT NULL — no index existed.
 		`CREATE INDEX IF NOT EXISTS idx_samples_litmus_done ON samples(id) WHERE litmus_result IS NOT NULL`,
@@ -63,6 +63,18 @@ func (db *DB) migratePG(ctx context.Context) error {
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS claimed_by TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_claimable ON samples(id) WHERE cleave_result IS NULL AND claimed_by = ''`,
+		// Covers the dashboard's OldestClaims query (DISTINCT ON claimed_by, ORDER BY claimed_at).
+		`CREATE INDEX IF NOT EXISTS idx_samples_claimed ON samples(claimed_by, claimed_at) WHERE claimed_by != '' AND cleave_result IS NULL`,
+		// newestAnalyzedAtPG: MAX(analyzed_at) — index-only max scan.
+		`CREATE INDEX IF NOT EXISTS idx_samples_analyzed_at ON samples(analyzed_at DESC) WHERE analyzed_at IS NOT NULL`,
+		// benignReviewPG / badReviewPG filter on skip='misclassified' which is excluded
+		// from idx_samples_review (WHERE skip=''). Separate partial index for misclassified review.
+		`CREATE INDEX IF NOT EXISTS idx_samples_misclassified_review ON samples(label, max_crit DESC, suspicious_count DESC) WHERE label_source = 'marker' AND skip = 'misclassified' AND cleave_result IS NOT NULL AND status = ''`,
+		// staleSamplesPG: WHERE updated_at < $1 ORDER BY updated_at — no status prefix.
+		`CREATE INDEX IF NOT EXISTS idx_samples_updated_at ON samples(updated_at)`,
+		// feedSourcesPG / feedEcosystemsPG: DISTINCT feed/ecosystem WHERE source = $1.
+		`CREATE INDEX IF NOT EXISTS idx_samples_source_feed ON samples(source, feed) WHERE feed != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_source_ecosystem ON samples(source, ecosystem) WHERE ecosystem != ''`,
 		// Worker heartbeat table for dashboard.
 		`CREATE TABLE IF NOT EXISTS workers (
 			name      TEXT PRIMARY KEY,
@@ -947,6 +959,16 @@ func (db *DB) newestAnalyzedAtPG(ctx context.Context) (time.Time, error) {
 		return time.Time{}, err
 	}
 	return *t, nil
+}
+
+func (db *DB) unclaimAllPG(ctx context.Context) (int64, error) {
+	tag, err := db.pool.Exec(ctx,
+		`UPDATE samples SET claimed_by = '', claimed_at = NULL
+		 WHERE claimed_by != '' AND cleave_result IS NULL`)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: unclaim all: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 func (db *DB) unclaimJobsPG(ctx context.Context, shas []string) error {

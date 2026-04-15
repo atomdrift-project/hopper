@@ -95,24 +95,12 @@ func killProcess(reason string, proc *os.Process, attrs ...any) {
 	}
 }
 
-func waitCommand(reason string, cmd *exec.Cmd, attrs ...any) {
-	if cmd == nil {
-		return
-	}
-	if err := cmd.Wait(); err != nil {
-		slog.Debug(reason, append(attrs, "error", err)...)
-	}
-}
-
 func (s *litmusServer) currentPID() int {
 	return int(s.pid.Load())
 }
 
-// Start launches the litmus server and waits for it to become healthy.
-// It picks a random available port. The litmus binary is rebuilt from
-// source in the background so startup is not blocked; Health reports
-// "building" and Analyze returns errRetryable until the rebuild finishes
-// and the server is ready.
+// Start launches the litmus worker subprocess. The litmus binary is rebuilt
+// from source in the background so startup is not blocked.
 func (s *litmusServer) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -124,12 +112,12 @@ func (s *litmusServer) Start(ctx context.Context) error {
 	// Start the server with the currently installed binary so it can
 	// serve traffic immediately. The rebuild runs in the background and
 	// only briefly sets building=true during the actual restart swap.
-	if err := s.startOnce(ctx); err != nil {
+	if err := s.startLocked(ctx); err != nil {
 		return err
 	}
 
 	go func() {
-		updateLitmus(ctx)
+		updateSiblingTool(ctx, "litmus", "../litmus")
 
 		// Only mark building during the brief restart window so the
 		// existing process serves traffic throughout the build.
@@ -144,38 +132,20 @@ func (s *litmusServer) Start(ctx context.Context) error {
 		if s.cmd != nil && s.cmd.Process != nil {
 			slog.Info("restarting litmus with updated binary", "pid", s.cmd.Process.Pid)
 			killProcess("failed to kill litmus for rebuild", s.cmd.Process, "pid", s.cmd.Process.Pid)
-			// Do NOT call waitCommand here — the Monitor goroutine may
+			// Do NOT call cmd.Wait here — the Monitor goroutine may
 			// have already reaped the process via waitExit, and
 			// cmd.Wait() is not safe for concurrent use. The kill is
 			// best-effort; if the process is already dead, that's fine.
 			s.cmd = nil
 			s.pid.Store(0)
 		}
-		if err := s.startLocked(ctx, nil); err != nil {
+		if err := s.startLocked(ctx); err != nil {
 			slog.Error("failed to restart litmus after rebuild", "error", err)
 		}
 		s.mu.Unlock()
 	}()
 
 	return nil
-}
-
-// startOnce tries up to 3 ports to launch the litmus process. Caller
-// must hold s.mu.
-func (s *litmusServer) startOnce(ctx context.Context) error {
-	return s.startLocked(ctx, nil)
-}
-
-// updateLitmus attempts to build and install the latest litmus from ../litmus.
-// On failure it logs the error and falls back to whatever version is already installed.
-func updateLitmus(ctx context.Context) {
-	updateSiblingTool(ctx, "litmus", "../litmus")
-}
-
-// updateCleave attempts to build and install the latest cleave from ../cleave.
-// On failure it logs the error and falls back to whatever version is already installed.
-func updateCleave(ctx context.Context) {
-	updateSiblingTool(ctx, "cleave", "../cleave")
 }
 
 // updateSiblingTool runs `git pull && make install` in dir, treating pull
@@ -209,7 +179,7 @@ func updateSiblingTool(ctx context.Context, name, dir string) {
 	slog.Info("tool updated successfully", "tool", name, "pulled", pulled)
 }
 
-func (s *litmusServer) startLocked(ctx context.Context, _ net.Listener) error {
+func (s *litmusServer) startLocked(ctx context.Context) error {
 	args := []string{}
 	if s.verbose {
 		args = append(args, "--verbose")
@@ -280,7 +250,9 @@ func (s *litmusServer) Stop() {
 	if s.cmd != nil && s.cmd.Process != nil {
 		slog.Info("stopping litmus server", "pid", s.cmd.Process.Pid, "url", s.hopperURL)
 		killProcess("failed to kill litmus server during stop", s.cmd.Process, "pid", s.cmd.Process.Pid)
-		waitCommand("litmus exited during stop", s.cmd, "pid", s.cmd.Process.Pid)
+		if err := s.cmd.Wait(); err != nil {
+			slog.Debug("litmus exited during stop", "pid", s.cmd.Process.Pid, "error", err)
+		}
 		s.cmd = nil
 		s.pid.Store(0)
 		slog.Info("litmus server stopped")
@@ -351,7 +323,7 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 				"pid", s.currentPID())
 			continue
 		}
-		err = s.startLocked(ctx, nil)
+		err = s.startLocked(ctx)
 		s.mu.Unlock()
 		if err != nil {
 			slog.Error("failed to restart litmus",

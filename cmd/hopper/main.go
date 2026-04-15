@@ -548,7 +548,7 @@ func cmdLoad(ctx context.Context) error {
 		"max_analyzed", *maxAnalyzed,
 		"experiment", *experimentTag)
 
-	go updateCleave(ctx)
+	go updateSiblingTool(ctx, "cleave", "../cleave")
 
 	type cacheResult struct {
 		cache *hashCache
@@ -611,6 +611,13 @@ func cmdLoad(ctx context.Context) error {
 	}
 	db := dr.db
 	defer db.Close()
+
+	// Clear stale claims from previous runs so those samples get re-queued.
+	if n, err := db.UnclaimAll(ctx); err != nil {
+		slog.Warn("failed to clear stale claims", "error", err)
+	} else if n > 0 {
+		slog.Info("cleared stale claims from previous run", "count", n)
+	}
 
 	if res := <-litmusCh; res.err != nil {
 		return res.err
@@ -782,6 +789,7 @@ func runDirPipeline(
 	rescan bool,
 ) {
 	batch := make([]*hopper.Sample, 0, loadBatchSize)
+	batchKeys := make([]cacheKey, 0, loadBatchSize)
 	pathBySha := make(map[string]string, loadBatchSize)
 
 	flush := func() {
@@ -796,13 +804,22 @@ func runDirPipeline(
 				slog.Error("batch insert failed", "error", err, "batch_size", len(batch), "dir", target.dir)
 			}
 			batch = batch[:0]
+			batchKeys = batchKeys[:0]
 			clear(pathBySha)
 			return
 		}
 		progress.inserted.Add(n)
 		progress.skipped.Add(int64(len(batch)) - n)
 		progress.queued.Add(int64(len(needsAnalysis)))
+
+		// Mark entries as inserted in the hash cache so future startups
+		// can skip the DB round-trip entirely.
+		if cache != nil && len(batchKeys) > 0 {
+			cache.markInserted(ctx, batchKeys)
+		}
+
 		batch = batch[:0]
+		batchKeys = batchKeys[:0]
 		clear(pathBySha)
 	}
 	defer flush()
@@ -819,7 +836,7 @@ func runDirPipeline(
 		progress.walked.Add(1)
 		progress.walkedPaths.Store(lp.path, struct{}{})
 
-		sample, err := hashFile(ctx, lp.path, lp.label, lp.fileType, source, cache, progress)
+		hr, err := hashFile(ctx, lp.path, lp.label, lp.fileType, source, cache, progress)
 		if err != nil {
 			switch {
 			case errors.Is(err, errTooSmall):
@@ -834,6 +851,17 @@ func runDirPipeline(
 			}
 			return true
 		}
+
+		progress.hashed.Add(1)
+
+		// Cache hit + already inserted into DB → skip the batch insert entirely.
+		// Marker changes are picked up on the next full scan (--rescan or cache miss).
+		if hr.inserted {
+			progress.skipped.Add(1)
+			return true
+		}
+
+		sample := hr.sample
 
 		// Apply misclassification marker if it contradicts the label.
 		if marker, markerMtime := markerInfo(lp.path); marker != "" {
@@ -851,8 +879,8 @@ func runDirPipeline(
 			}
 		}
 
-		progress.hashed.Add(1)
 		batch = append(batch, sample)
+		batchKeys = append(batchKeys, hr.cacheKey)
 		pathBySha[sample.SHA256] = lp.path
 		if len(batch) >= loadBatchSize {
 			flush()
@@ -1356,55 +1384,74 @@ func tailBytes(b []byte, n int) string {
 	return string(b[len(b)-n:])
 }
 
-// hashFile opens path, enforces size limits, consults the hash cache, and
-// returns a Sample stamped with the cleave-classified file type. Pass "" for
-// fileType in contexts that don't yet know it (tests, ad-hoc callers). Pass
-// nil for progress when no cache-hit metric is being collected.
-func hashFile(ctx context.Context, path, label, fileType, source string, cache *hashCache, progress *loadProgress) (*hopper.Sample, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close() //nolint:errcheck // read-only file
+// hashResult bundles a sample with cache metadata so the pipeline can skip
+// DB inserts for files that are both cache hits and already inserted.
+type hashResult struct {
+	sample   *hopper.Sample
+	cacheKey cacheKey
+	inserted bool // true if the hash cache says this SHA256 is already in the DB
+}
 
-	info, err := f.Stat()
+// hashFile stats path, enforces size limits, consults the hash cache, and
+// returns a Sample stamped with the cleave-classified file type. The file is
+// only opened for reading on a cache miss. Pass "" for fileType in contexts
+// that don't yet know it (tests, ad-hoc callers). Pass nil for progress when
+// no cache-hit metric is being collected.
+func hashFile(ctx context.Context, path, label, fileType, source string, cache *hashCache, progress *loadProgress) (hashResult, error) {
+	info, err := os.Stat(path)
 	if err != nil {
-		return nil, err
+		return hashResult{}, err
 	}
 
 	if info.Size() < minFileSize {
-		return nil, errTooSmall
+		return hashResult{}, errTooSmall
 	}
 	if info.Size() >= maxFileSize {
-		return nil, errTooLarge
+		return hashResult{}, errTooLarge
 	}
 
 	dev, inode := fileStat(info)
 
+	ck := cacheKey{dev: dev, inode: inode, size: info.Size(), mtime: info.ModTime().UnixNano()}
+
 	// Check hash cache before reading file contents.
 	if cache != nil {
-		if cached, ok := cache.lookup(dev, inode, info.Size(), info.ModTime()); ok {
+		if cached, ins, ok := cache.lookup(dev, inode, info.Size(), info.ModTime()); ok {
 			if progress != nil {
 				progress.cacheHits.Add(1)
 			}
+			if ins {
+				// Already in the DB — caller will skip the batch insert.
+				return hashResult{cacheKey: ck, inserted: true}, nil
+			}
 			modTime := info.ModTime()
-			return &hopper.Sample{
-				SHA256:      cached,
-				Source:      source,
-				Filename:    filepath.Base(path),
-				FileType:    fileType,
-				Label:       label,
-				LabelSource: source,
-				SizeBytes:   info.Size(),
-				Path:        path,
-				Mtime:       &modTime,
+			return hashResult{
+				cacheKey: ck,
+				sample: &hopper.Sample{
+					SHA256:      cached,
+					Source:      source,
+					Filename:    filepath.Base(path),
+					FileType:    fileType,
+					Label:       label,
+					LabelSource: source,
+					SizeBytes:   info.Size(),
+					Path:        path,
+					Mtime:       &modTime,
+				},
 			}, nil
 		}
 	}
 
+	// Cache miss — open and read the file to compute SHA256.
+	f, err := os.Open(path)
+	if err != nil {
+		return hashResult{}, err
+	}
+	defer f.Close() //nolint:errcheck // read-only file
+
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
-		return nil, err
+		return hashResult{}, err
 	}
 
 	digest := hex.EncodeToString(h.Sum(nil))
@@ -1425,7 +1472,7 @@ func hashFile(ctx context.Context, path, label, fileType, source string, cache *
 		Mtime:       ptrTime(info.ModTime()),
 	}
 	s.Feed, s.Ecosystem = extractFeedEcosystem(path, label)
-	return s, nil
+	return hashResult{cacheKey: ck, sample: s}, nil
 }
 
 func ptrTime(t time.Time) *time.Time { return &t }

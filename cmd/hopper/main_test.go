@@ -218,10 +218,11 @@ func TestHashFileAppliesMarker(t *testing.T) {
 	mustWriteFile(t, samplePath, []byte("sample content!"))
 	mustWriteFile(t, filepath.Join(dir, "._malware.whl.BENIGN"), nil)
 
-	sample, err := hashFile(t.Context(), samplePath, "bad", "", "harvest", nil, nil)
+	hr, err := hashFile(t.Context(), samplePath, "bad", "", "harvest", nil, nil)
 	if err != nil {
 		t.Fatalf("hashFile: %v", err)
 	}
+	sample := hr.sample
 
 	// hashFile doesn't apply markers — that's done in the hash worker.
 	// Verify the raw sample has the original label.
@@ -261,10 +262,11 @@ func TestHashFileMarkerNoContradiction(t *testing.T) {
 	mustWriteFile(t, samplePath, []byte("sample content!"))
 	mustWriteFile(t, filepath.Join(dir, "._malware.whl.BAD"), nil)
 
-	sample, err := hashFile(t.Context(), samplePath, "bad", "", "harvest", nil, nil)
+	hr, err := hashFile(t.Context(), samplePath, "bad", "", "harvest", nil, nil)
 	if err != nil {
 		t.Fatalf("hashFile: %v", err)
 	}
+	sample := hr.sample
 
 	label := "bad"
 	marker := checkMarker(samplePath)
@@ -296,13 +298,13 @@ func TestHashCacheHitMiss(t *testing.T) {
 	dev, ino := fileStat(info)
 
 	// Miss on empty cache.
-	if _, ok := c.lookup(dev, ino, info.Size(), info.ModTime()); ok {
+	if _, _, ok := c.lookup(dev, ino, info.Size(), info.ModTime()); ok {
 		t.Fatal("expected cache miss on empty cache")
 	}
 
 	// Store and hit.
 	c.store(t.Context(), dev, ino, info.Size(), info.ModTime(), "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234")
-	sha, ok := c.lookup(dev, ino, info.Size(), info.ModTime())
+	sha, _, ok := c.lookup(dev, ino, info.Size(), info.ModTime())
 	if !ok {
 		t.Fatal("expected cache hit after store")
 	}
@@ -311,12 +313,12 @@ func TestHashCacheHitMiss(t *testing.T) {
 	}
 
 	// Miss on different size.
-	if _, ok := c.lookup(dev, ino, info.Size()+1, info.ModTime()); ok {
+	if _, _, ok := c.lookup(dev, ino, info.Size()+1, info.ModTime()); ok {
 		t.Fatal("expected cache miss for different size")
 	}
 
 	// Miss on different mtime.
-	if _, ok := c.lookup(dev, ino, info.Size(), info.ModTime().Add(1)); ok {
+	if _, _, ok := c.lookup(dev, ino, info.Size(), info.ModTime().Add(1)); ok {
 		t.Fatal("expected cache miss for different mtime")
 	}
 }
@@ -339,7 +341,7 @@ func TestHashCachePersistence(t *testing.T) {
 	}
 	defer c2.close(t.Context())
 
-	sha, ok := c2.lookup(42, 999, 1024, fixedTime())
+	sha, _, ok := c2.lookup(42, 999, 1024, fixedTime())
 	if !ok {
 		t.Fatal("expected cache hit after reopen")
 	}
@@ -367,7 +369,7 @@ func TestHashCacheConcurrent(t *testing.T) {
 			ino := uint64(i)
 			sha := fmt.Sprintf("%064x", i)
 			c.store(t.Context(), 1, ino, 100, fixedTime(), sha)
-			got, ok := c.lookup(1, ino, 100, fixedTime())
+			got, _, ok := c.lookup(1, ino, 100, fixedTime())
 			if !ok {
 				t.Errorf("miss for inode %d after store", ino)
 				return
@@ -392,18 +394,18 @@ func TestHashFileWithCache(t *testing.T) {
 	mustWriteFile(t, samplePath, []byte("sample content!"))
 
 	// First call: cache miss, computes hash and stores it.
-	s1, err := hashFile(t.Context(), samplePath, "bad", "", "harvest", c, nil)
+	hr1, err := hashFile(t.Context(), samplePath, "bad", "", "harvest", c, nil)
 	if err != nil {
 		t.Fatalf("hashFile (miss): %v", err)
 	}
 
 	// Second call: cache hit, should return same hash without re-reading.
-	s2, err := hashFile(t.Context(), samplePath, "bad", "", "harvest", c, nil)
+	hr2, err := hashFile(t.Context(), samplePath, "bad", "", "harvest", c, nil)
 	if err != nil {
 		t.Fatalf("hashFile (hit): %v", err)
 	}
-	if s1.SHA256 != s2.SHA256 {
-		t.Fatalf("cache returned different hash: %q vs %q", s1.SHA256, s2.SHA256)
+	if hr1.sample.SHA256 != hr2.sample.SHA256 {
+		t.Fatalf("cache returned different hash: %q vs %q", hr1.sample.SHA256, hr2.sample.SHA256)
 	}
 }
 
@@ -1005,10 +1007,11 @@ func TestHashFileMarkerBadOnGood(t *testing.T) {
 	mustWriteFile(t, samplePath, []byte("sample content!"))
 	mustWriteFile(t, filepath.Join(dir, "._legit.bin.BAD"), nil)
 
-	sample, err := hashFile(t.Context(), samplePath, "good", "", "harvest", nil, nil)
+	hr, err := hashFile(t.Context(), samplePath, "good", "", "harvest", nil, nil)
 	if err != nil {
 		t.Fatalf("hashFile: %v", err)
 	}
+	sample := hr.sample
 
 	label := "good"
 	if marker := checkMarker(samplePath); marker != "" {

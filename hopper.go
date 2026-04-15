@@ -642,6 +642,15 @@ func (db *DB) ClaimJobs(ctx context.Context, worker string, limit int, expiry ti
 	return db.claimJobsSQLite(ctx, worker, limit, expiry)
 }
 
+// UnclaimAll releases all outstanding claims. Call on startup to clear
+// stale claims from previous runs so those samples get re-queued.
+func (db *DB) UnclaimAll(ctx context.Context) (int64, error) {
+	if db.pool != nil {
+		return db.unclaimAllPG(ctx)
+	}
+	return db.unclaimAllSQLite(ctx)
+}
+
 // UnclaimJobs releases claims for the given SHA256s so other workers can try.
 func (db *DB) UnclaimJobs(ctx context.Context, shas []string) error {
 	if db.pool != nil {
