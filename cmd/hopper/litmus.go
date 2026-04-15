@@ -22,7 +22,7 @@ const restartRecoveryDelay = 15 * time.Second
 // litmusServer manages a local litmus worker subprocess. In pull mode,
 // litmus polls hopper's /api/next for work instead of hopper pushing
 // requests to it.
-type litmusServer struct { //nolint:govet // field order is chosen for readability over padding minimization.
+type litmusServer struct {
 	cmd         *exec.Cmd
 	bin         string // path to litmus binary
 	hopperURL   string // hopper API base URL for the worker to poll

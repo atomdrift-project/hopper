@@ -1403,15 +1403,24 @@ func TestMarkMissingSamples(t *testing.T) {
 	}
 
 	// Verify skip values.
-	s, _ := db.SampleBySHA256(ctx, "aaa1")
+	s, err := db.SampleBySHA256(ctx, "aaa1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if s.Skip != "" {
 		t.Errorf("aaa1 skip = %q, want empty", s.Skip)
 	}
-	s, _ = db.SampleBySHA256(ctx, "bbb2")
+	s, err = db.SampleBySHA256(ctx, "bbb2")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if s.Skip != "missing" {
 		t.Errorf("bbb2 skip = %q, want 'missing'", s.Skip)
 	}
-	s, _ = db.SampleBySHA256(ctx, "ddd4")
+	s, err = db.SampleBySHA256(ctx, "ddd4")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if s.Skip != "unsupported" {
 		t.Errorf("ddd4 skip = %q, want 'unsupported'", s.Skip)
 	}

@@ -69,7 +69,10 @@ func (db *DB) migratePG(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_samples_analyzed_at ON samples(analyzed_at DESC) WHERE analyzed_at IS NOT NULL`,
 		// benignReviewPG / badReviewPG filter on skip='misclassified' which is excluded
 		// from idx_samples_review (WHERE skip=''). Separate partial index for misclassified review.
-		`CREATE INDEX IF NOT EXISTS idx_samples_misclassified_review ON samples(label, max_crit DESC, suspicious_count DESC) WHERE label_source = 'marker' AND skip = 'misclassified' AND cleave_result IS NOT NULL AND status = ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_misclassified_review ` +
+			`ON samples(label, max_crit DESC, suspicious_count DESC) ` +
+			`WHERE label_source = 'marker' AND skip = 'misclassified' ` +
+			`AND cleave_result IS NOT NULL AND status = ''`,
 		// staleSamplesPG: WHERE updated_at < $1 ORDER BY updated_at — no status prefix.
 		`CREATE INDEX IF NOT EXISTS idx_samples_updated_at ON samples(updated_at)`,
 		// feedSourcesPG / feedEcosystemsPG: DISTINCT feed/ecosystem WHERE source = $1.
@@ -104,7 +107,9 @@ func pgSampleDest(s *Sample) []any {
 		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &s.CleaveResult, &s.LitmusResult, &s.LitmusScore,
 		&s.Path, &s.Status, &s.Note, &s.CanonicalSHA256,
-		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.MaxCrit, &s.SuspiciousCount, &s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.Mtime, &s.MarkerMtime,
+		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score,
+		&s.MaxCrit, &s.SuspiciousCount,
+		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.Mtime, &s.MarkerMtime,
 	}
 }
 
@@ -136,11 +141,16 @@ func scanPGSamples(rows pgx.Rows) ([]*Sample, error) {
 func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 	tag, err := db.pool.Exec(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count, mtime, marker_mtime)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $1, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+			size_bytes, label, label_source, path, status,
+			canonical_sha256, parent, skip, formula, elements,
+			score, max_crit, suspicious_count, mtime, marker_mtime)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+			$11, $1, $12, $13, $14, $15, $16, $17, $18, $19, $20)
 		ON CONFLICT (sha256) DO NOTHING`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
-		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime)
+		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
+		s.Parent, s.Skip, s.Formula, s.Elements, s.Score,
+		s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime)
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
@@ -162,13 +172,20 @@ const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 	sha256 TEXT, source TEXT, feed TEXT, ecosystem TEXT, filename TEXT,
 	file_type TEXT, size_bytes BIGINT, label TEXT, label_source TEXT,
 	path TEXT, status TEXT, canonical_sha256 TEXT,
-	parent TEXT, skip TEXT, formula TEXT, elements TEXT, score INTEGER, max_crit INTEGER, suspicious_count INTEGER, mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ
+	parent TEXT, skip TEXT, formula TEXT, elements TEXT,
+	score INTEGER, max_crit INTEGER, suspicious_count INTEGER,
+	mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ
 ) ON COMMIT DROP`
 
-const insertBatchStagingInsert = `INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count, mtime, marker_mtime)
+const insertBatchStagingInsert = `INSERT INTO samples (
+	sha256, source, feed, ecosystem, filename, file_type,
+	size_bytes, label, label_source, path, status,
+	canonical_sha256, parent, skip, formula, elements,
+	score, max_crit, suspicious_count, mtime, marker_mtime)
 SELECT sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count, mtime, marker_mtime
+	size_bytes, label, label_source, path, status,
+	canonical_sha256, parent, skip, formula, elements,
+	score, max_crit, suspicious_count, mtime, marker_mtime
 FROM _staging
 ON CONFLICT (sha256) DO NOTHING`
 
@@ -421,7 +438,10 @@ func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result 
 			file_type = COALESCE(NULLIF($10, ''), file_type),
 			litmus_result = NULL, litmus_score = 0,
 			analyzed_at = now(), updated_at = now()
-		WHERE sha256 = $1`, sha256, status, sanitizeJSONB(result), canonical, fi.Formula, fi.Elements, fi.Score, fi.MaxCrit, fi.SuspiciousCount, fi.FileType)
+		WHERE sha256 = $1`,
+		sha256, status, sanitizeJSONB(result), canonical,
+		fi.Formula, fi.Elements, fi.Score, fi.MaxCrit,
+		fi.SuspiciousCount, fi.FileType)
 	if err != nil {
 		return fmt.Errorf("hopper: update sample: %w", err)
 	}

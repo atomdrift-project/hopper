@@ -171,15 +171,15 @@ func parseCleaveFile(sha256 string, result []byte) cleaveFileInfo {
 	}
 	var report struct {
 		Files []struct {
-			SHA256   string `json:"sha"`
 			Formula  string `json:"f"`
+			SHA256   string `json:"sha"`
 			FileType string `json:"type"`
-			Score    int    `json:"x"`
-			Depth    int    `json:"dp"`
 			Traits   []struct {
-				Level int     `json:"l"`
 				Conf  float64 `json:"c"`
+				Level int     `json:"l"`
 			} `json:"ts"`
+			Score int `json:"x"`
+			Depth int `json:"dp"`
 		} `json:"fs"`
 	}
 	if json.Unmarshal(result, &report) != nil {
@@ -563,7 +563,10 @@ func (db *DB) MarkMissingSamples(ctx context.Context, walkedPaths map[string]str
 		}
 	}
 	if eligible > 0 && wouldMark*2 > eligible {
-		return 0, fmt.Errorf("hopper: mark missing: refusing to mark %d of %d unanalyzed samples (>50%%); this likely indicates a misconfigured data directory", wouldMark, eligible)
+		return 0, fmt.Errorf(
+			"hopper: mark missing: refusing to mark %d of %d unanalyzed"+
+				" samples (>50%%); this likely indicates a misconfigured data directory",
+			wouldMark, eligible)
 	}
 
 	var marked int64
@@ -594,26 +597,26 @@ func (db *DB) MarkMissingSamples(ctx context.Context, walkedPaths map[string]str
 type ClaimJob struct {
 	SHA256    string `json:"sha256"`
 	Path      string `json:"path"`
-	SizeBytes int64  `json:"size_bytes"`
 	FileType  string `json:"file_type"`
+	SizeBytes int64  `json:"size_bytes"`
 }
 
 // Worker is a litmus worker's latest heartbeat data.
 type Worker struct {
-	Name     string    `json:"name"`
 	LastSeen time.Time `json:"last_seen"`
-	Slots    int       `json:"slots"`
+	Name     string    `json:"name"`
 	Version  string    `json:"version"`
 	Traits   string    `json:"traits"`
 	Analyzed int64     `json:"analyzed"`
 	Errors   int64     `json:"errors"`
+	Slots    int       `json:"slots"`
 }
 
 // WorkerClaim describes the oldest active claim for a given worker.
 type WorkerClaim struct {
+	ClaimedAt time.Time
 	Worker    string
 	Path      string
-	ClaimedAt time.Time
 }
 
 // OldestClaims returns the oldest active claim per worker.

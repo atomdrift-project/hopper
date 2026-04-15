@@ -437,7 +437,10 @@ func eachSampleSQLite(ctx context.Context, db *DB, afterID int64, fn func(*Sampl
 		if err := rows.Scan(&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &s.LitmusScore,
 			&s.Path, &status, &s.Note, &s.CanonicalSHA256,
-			&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.MaxCrit, &s.SuspiciousCount, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime, &markerMtime); err != nil {
+			&s.Parent, &s.Skip, &s.Formula, &s.Elements,
+			&s.Score, &s.MaxCrit, &s.SuspiciousCount,
+			&s.CreatedAt, &s.UpdatedAt,
+			&analyzedAt, &mtime, &markerMtime); err != nil {
 			return fmt.Errorf("scan sample: %w", err)
 		}
 		if cleaveResult.Valid {
@@ -533,10 +536,15 @@ const sampleStagingDDL = `CREATE TEMP TABLE _staging (
 
 const sampleStagingInsert = `INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, path, status, note, canonical_sha256,
-	parent, skip, formula, elements, score, max_crit, suspicious_count, cleave_result, litmus_result, litmus_score, analyzed_at, created_at, updated_at, mtime, marker_mtime)
+	parent, skip, formula, elements, score, max_crit,
+	suspicious_count, cleave_result, litmus_result, litmus_score,
+	analyzed_at, created_at, updated_at, mtime, marker_mtime)
 SELECT sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, path, status, note, canonical_sha256,
-	parent, skip, formula, elements, score, max_crit, suspicious_count, cleave_result, litmus_result, litmus_score, analyzed_at, created_at, updated_at, mtime, marker_mtime
+	size_bytes, label, label_source, path, status,
+	note, canonical_sha256, parent, skip, formula, elements,
+	score, max_crit, suspicious_count, cleave_result,
+	litmus_result, litmus_score,
+	analyzed_at, created_at, updated_at, mtime, marker_mtime
 FROM _staging
 ON CONFLICT (sha256) DO NOTHING`
 

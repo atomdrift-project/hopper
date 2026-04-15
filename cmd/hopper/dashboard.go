@@ -8,13 +8,14 @@ import (
 	"net/http"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/codeGROOVE-dev/fido"
 
-	hopper "codeberg.org/atomdrift/hopper"
+	"codeberg.org/atomdrift/hopper"
 )
 
 const dashQueryTimeout = 3 * time.Second
@@ -22,28 +23,29 @@ const dashQueryTimeout = 3 * time.Second
 // webDashboard serves a self-contained HTML page. Auto-refreshes every 5s.
 // Fields guarded by cfgMu are set once via configure() after the load session
 // begins; the handler renders a "starting" state until then.
-type webDashboard struct {
+type webDashboard struct { //nolint:govet // fields grouped logically.
 	cfgMu         sync.RWMutex
 	progress      *loadProgress
 	litmus        *litmusServer
 	tracker       *workerTracker
 	db            *hopper.DB
+	claimsCache   *fido.Cache[string, []hopper.WorkerClaim]
+	newestATCache *fido.Cache[string, time.Time]
+	samples       []throughputSample // capped at maxThroughputSamples
 	start         time.Time
 	startAnalyzed int64
+	mu            sync.Mutex
 	maxAnalyzed   int
 	ndirs         int
-
-	mu      sync.Mutex
-	samples []throughputSample // capped at maxThroughputSamples
-
-	claimsCache     *fido.Cache[string, []hopper.WorkerClaim]
-	newestATCache   *fido.Cache[string, time.Time]
 }
 
 // configure is called once the load session is ready. It sets the fields the
 // handler needs to render progress and is safe to call concurrently with the
 // HTTP server already running.
-func (wd *webDashboard) configure(progress *loadProgress, litmus *litmusServer, tracker *workerTracker, db *hopper.DB, start time.Time, startAnalyzed int64, maxAnalyzed, ndirs int) {
+func (wd *webDashboard) configure(
+	progress *loadProgress, litmus *litmusServer, tracker *workerTracker,
+	db *hopper.DB, start time.Time, startAnalyzed int64, maxAnalyzed, ndirs int,
+) {
 	wd.cfgMu.Lock()
 	defer wd.cfgMu.Unlock()
 	wd.progress = progress
@@ -61,9 +63,9 @@ func (wd *webDashboard) configure(progress *loadProgress, litmus *litmusServer, 
 const maxThroughputSamples = 2880 // 4 hours at 5-second refresh
 
 type throughputSample struct {
+	byNode map[string]int64 // keyed by worker name
 	t      time.Time
 	total  int64
-	byNode map[string]int64 // keyed by worker name
 }
 
 func (wd *webDashboard) recordSample(total int64) {
@@ -74,8 +76,8 @@ func (wd *webDashboard) recordSample(total int64) {
 		workers := wd.tracker.all()
 		if len(workers) > 0 {
 			s.byNode = make(map[string]int64, len(workers))
-			for _, w := range workers {
-				s.byNode[w.Name] = w.Analyzed
+			for i := range workers {
+				s.byNode[workers[i].Name] = workers[i].Analyzed
 			}
 		}
 	}
@@ -114,11 +116,7 @@ func (wd *webDashboard) ratesOver(window time.Duration) (combined float64, perNo
 		for name, latestCount := range latest.byNode {
 			if oldCount, ok := oldest.byNode[name]; ok {
 				perNode[name] = max(float64(latestCount-oldCount)/dt, 0)
-			} else {
-				// Worker joined after the oldest sample — rate over
-				// whatever history we have is still useful but we
-				// can't compute it precisely, so skip.
-			}
+			} // else: worker joined after the oldest sample; skip.
 		}
 	}
 	return combined, perNode
@@ -172,14 +170,14 @@ func (wd *webDashboard) throughputSeries() (combined []float64, perNode map[stri
 
 func startWebDashboard(ctx context.Context, addr string, wd *webDashboard, mux *http.ServeMux) error {
 	mux.HandleFunc("/", wd.handler)
-	ln, err := net.Listen("tcp", addr)
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("web dashboard listen %s: %w", addr, err)
 	}
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
-		_ = srv.Close()
+		_ = srv.Close() //nolint:errcheck // best-effort shutdown
 	}()
 	go func() {
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -190,8 +188,8 @@ func startWebDashboard(ctx context.Context, addr string, wd *webDashboard, mux *
 }
 
 // ---------------------------------------------------------------------------
-// Web dashboard
-// ---------------------------------------------------------------------------
+// Web dashboard.
+// ---------------------------------------------------------------------------.
 
 const css = `
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -267,7 +265,7 @@ footer{padding-top:1rem;border-top:1px solid var(--border);
   font-family:var(--mono);font-size:.75rem;color:var(--sub)}
 `
 
-func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
+func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //nolint:maintidx // dashboard render is inherently complex.
 	wd.cfgMu.RLock()
 	progress := wd.progress
 	tracker := wd.tracker
@@ -287,24 +285,26 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 	oldestClaims := make(map[string]hopper.WorkerClaim)
 	var newestAnalyzedAt time.Time
 	if db != nil {
+		//nolint:errcheck,contextcheck // Fetch returns cached/zero on error; closure creates its own context.
 		claims, _ := wd.claimsCache.Fetch("claims", func() ([]hopper.WorkerClaim, error) {
-			ctx, cancel := context.WithTimeout(context.Background(), dashQueryTimeout)
+			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
 			defer cancel()
-			return db.OldestClaims(ctx, staleClaimAge)
+			return db.OldestClaims(qctx, staleClaimAge)
 		})
 		for _, c := range claims {
 			oldestClaims[c.Worker] = c
 		}
+		//nolint:errcheck,contextcheck // Fetch returns zero time on error; closure creates its own context.
 		newestAnalyzedAt, _ = wd.newestATCache.Fetch("newest", func() (time.Time, error) {
-			ctx, cancel := context.WithTimeout(context.Background(), dashQueryTimeout)
+			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
 			defer cancel()
-			return db.NewestAnalyzedAt(ctx)
+			return db.NewestAnalyzedAt(qctx)
 		})
 	}
 
 	if progress == nil {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = fmt.Fprint(w,
+		_, _ = fmt.Fprint(w, //nolint:errcheck // best-effort HTTP response
 			`<!DOCTYPE html><html lang="en"><head>`+
 				`<meta charset="utf-8"><meta http-equiv="refresh" content="2">`+
 				`<title>hopper</title><style>`+css+`</style></head><body>`+
@@ -341,34 +341,34 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 		pct = math.Min(float64(totalDone)/float64(totalTarget)*100, 100)
 	}
 
-	var b strings.Builder
-	b.WriteString(`<!DOCTYPE html><html lang="en"><head>` +
+	var buf strings.Builder
+	buf.WriteString(`<!DOCTYPE html><html lang="en"><head>` +
 		`<meta charset="utf-8"><meta http-equiv="refresh" content="5">` +
 		`<title>hopper</title><style>` + css + `</style></head><body>`)
 
 	// Header + progress
-	b.WriteString(`<div class="hdr">`)
-	b.WriteString(`<div class="hdr-top">`)
-	b.WriteString(`<span class="hdr-title">Hopper</span>`)
-	fmt.Fprintf(&b, `<span class="hdr-time">%s</span>`, elapsed)
-	b.WriteString(`</div>`)
+	buf.WriteString(`<div class="hdr">`)
+	buf.WriteString(`<div class="hdr-top">`)
+	buf.WriteString(`<span class="hdr-title">Hopper</span>`)
+	fmt.Fprintf(&buf, `<span class="hdr-time">%s</span>`, elapsed)
+	buf.WriteString(`</div>`)
 
 	// Big progress
-	b.WriteString(`<div class="progress">`)
-	b.WriteString(`<div class="progress-stats">`)
-	fmt.Fprintf(&b, `<span class="progress-main"><span class="progress-pct">%.0f%%</span> analyzed</span>`, pct)
+	buf.WriteString(`<div class="progress">`)
+	buf.WriteString(`<div class="progress-stats">`)
+	fmt.Fprintf(&buf, `<span class="progress-main"><span class="progress-pct">%.0f%%</span> analyzed</span>`, pct)
 
 	// Rate + ETA
-	b.WriteString(`<span class="progress-detail">`)
-	fmt.Fprintf(&b, `<em>%s</em> / %s`, fmtN(totalDone), fmtN(totalTarget))
+	buf.WriteString(`<span class="progress-detail">`)
+	fmt.Fprintf(&buf, `<em>%s</em> / %s`, fmtN(totalDone), fmtN(totalTarget))
 	if rate > 0.1 {
-		fmt.Fprintf(&b, ` &middot; <em>%.1f</em>/s (15m avg)`, rate)
+		fmt.Fprintf(&buf, ` &middot; <em>%.1f</em>/s (15m avg)`, rate)
 	}
 	if etaStr != "" {
-		fmt.Fprintf(&b, ` &middot; ETA <em>%s</em>`, etaStr)
+		fmt.Fprintf(&buf, ` &middot; ETA <em>%s</em>`, etaStr)
 	}
-	b.WriteString(`</span>`)
-	b.WriteString(`</div>`)
+	buf.WriteString(`</span>`)
+	buf.WriteString(`</div>`)
 
 	// Bar
 	priorPct := 0.0
@@ -377,14 +377,14 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 		priorPct = math.Min(float64(startAnalyzed)/float64(totalTarget)*100, 100)
 		sessionPct = math.Min(float64(sessionAnalyzed)/float64(totalTarget)*100, 100-priorPct)
 	}
-	fmt.Fprintf(&b,
+	fmt.Fprintf(&buf,
 		`<div class="track">`+
 			`<div class="fill" style="width:%.2f%%;background:#5a5230"></div>`+
 			`<div class="fill" style="width:%.2f%%;background:#fbbf24"></div>`+
 			`</div>`,
 		priorPct, sessionPct)
-	b.WriteString(`</div>`) // .progress
-	b.WriteString(`</div>`) // .hdr
+	buf.WriteString(`</div>`) // .progress
+	buf.WriteString(`</div>`) // .hdr
 
 	// Throughput graph
 	combinedSeries, perNodeSeries := wd.throughputSeries()
@@ -392,27 +392,28 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 		// Build ordered name/series slices for the graph.
 		var graphNodeNames []string
 		var graphNodeSeries [][]float64
-		for _, w := range workers {
-			if series, ok := perNodeSeries[w.Name]; ok {
-				graphNodeNames = append(graphNodeNames, w.Name)
+		for i := range workers {
+			if series, ok := perNodeSeries[workers[i].Name]; ok {
+				graphNodeNames = append(graphNodeNames, workers[i].Name)
 				graphNodeSeries = append(graphNodeSeries, series)
 			}
 		}
-		b.WriteString(`<section><div class="label">Throughput</div>`)
-		writeThroughputGraph(&b, combinedSeries, graphNodeSeries, graphNodeNames)
-		b.WriteString(`</section>`)
+		buf.WriteString(`<section><div class="label">Throughput</div>`)
+		writeThroughputGraph(&buf, combinedSeries, graphNodeSeries, graphNodeNames)
+		buf.WriteString(`</section>`)
 	}
 
 	// Workers
 	if len(workers) > 0 {
-		b.WriteString(`<section><div class="label">Workers</div>`)
-		b.WriteString(`<table><thead><tr>` +
+		buf.WriteString(`<section><div class="label">Workers</div>`)
+		buf.WriteString(`<table><thead><tr>` +
 			`<th>Worker</th><th>Tasks</th><th>Claimed</th><th>Rate</th>` +
 			`<th>Analyzed</th><th>Errors</th><th>Oldest Job</th><th></th>` +
 			`</tr></thead><tbody>`)
 
 		sort.Slice(workers, func(i, j int) bool { return workers[i].Name < workers[j].Name })
-		for _, w := range workers {
+		for i := range workers {
+			w := &workers[i]
 			idle := time.Since(w.LastSeen)
 			status, _ := workerStatus(w.ActiveClaims, idle)
 			dotClass := "dot-ok"
@@ -435,7 +436,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 				oldestStr = fmt.Sprintf("%s (%s)", filepath.Base(claim.Path), shortDuration(age))
 			}
 
-			fmt.Fprintf(&b,
+			fmt.Fprintf(&buf,
 				`<tr>`+
 					`<td class="nn"><span class="dot %s">●</span>%s</td>`+
 					`<td class="hi">%d/%d</td>`+
@@ -456,7 +457,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 				htmlEscape(status),
 			)
 		}
-		b.WriteString(`</tbody></table></section>`)
+		buf.WriteString(`</tbody></table></section>`)
 	}
 
 	// Footer
@@ -464,7 +465,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 	if !newestAnalyzedAt.IsZero() {
 		lastCompleted = fmt.Sprintf(` &middot; last completed %s ago`, shortDuration(time.Since(newestAnalyzedAt)))
 	}
-	fmt.Fprintf(&b,
+	fmt.Fprintf(&buf,
 		`<footer>%s errors &middot; %s walked &middot; %s cache hits%s</footer>`,
 		fmtN(progress.errors.Load()),
 		fmtN(walked),
@@ -474,17 +475,17 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 
 	// Last error at the bottom, untruncated
 	if last, ok := progress.lastErr.Load().(string); ok && last != "" {
-		fmt.Fprintf(&b, `<div class="err">%s</div>`, htmlEscape(last))
+		fmt.Fprintf(&buf, `<div class="err">%s</div>`, htmlEscape(last))
 	}
 
-	b.WriteString(`</body></html>`)
+	buf.WriteString(`</body></html>`)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = fmt.Fprint(w, b.String())
+	_, _ = fmt.Fprint(w, buf.String()) //nolint:errcheck // best-effort HTTP response
 }
 
 // ---------------------------------------------------------------------------
-// Helpers shared by both dashboards
-// ---------------------------------------------------------------------------
+// Helpers shared by both dashboards.
+// ---------------------------------------------------------------------------.
 
 // shortNodeName trims the port suffix when it's the default litmus port.
 func shortNodeName(name string) string {
@@ -496,21 +497,12 @@ func shortNodeName(name string) string {
 	return name
 }
 
-// fmtMemGB formats RSS and optional total memory as "X.X / Y.Y GB".
-func fmtMemGB(rssMB, totalMB int) string {
-	rss := fmt.Sprintf("%.1f", float64(rssMB)/1024)
-	if totalMB > 0 {
-		return fmt.Sprintf("%s / %.0f GB", rss, float64(totalMB)/1024)
-	}
-	return rss + " GB"
-}
-
 // ---------------------------------------------------------------------------
-// Throughput graph (SVG sparkline)
-// ---------------------------------------------------------------------------
+// Throughput graph (SVG sparkline).
+// ---------------------------------------------------------------------------.
 
-func writeThroughputGraph(b *strings.Builder, combined []float64, perNode [][]float64, nodeNames []string) {
-	const W, H, px, py = 900, 72, 0, 4
+func writeThroughputGraph(buf *strings.Builder, combined []float64, perNode [][]float64, nodeNames []string) {
+	const w, h, px, py = 900, 72, 0, 4
 
 	maxVal := 0.1
 	for _, v := range combined {
@@ -530,10 +522,10 @@ func writeThroughputGraph(b *strings.Builder, combined []float64, perNode [][]fl
 		if n <= 1 {
 			return float64(px)
 		}
-		return float64(px) + float64(i)*float64(W-2*px)/float64(n-1)
+		return float64(px) + float64(i)*float64(w-2*px)/float64(n-1)
 	}
 	yOf := func(v float64) float64 {
-		return float64(H-py) - (v/maxVal)*float64(H-2*py)
+		return float64(h-py) - (v/maxVal)*float64(h-2*py)
 	}
 
 	line := func(vals []float64) string {
@@ -552,58 +544,60 @@ func writeThroughputGraph(b *strings.Builder, combined []float64, perNode [][]fl
 			return ""
 		}
 		var sb strings.Builder
-		fmt.Fprintf(&sb, "%.1f,%.1f", xOf(0, len(vals)), float64(H-py))
+		fmt.Fprintf(&sb, "%.1f,%.1f", xOf(0, len(vals)), float64(h-py))
 		for i, v := range vals {
 			fmt.Fprintf(&sb, " %.1f,%.1f", xOf(i, len(vals)), yOf(v))
 		}
-		fmt.Fprintf(&sb, " %.1f,%.1f", xOf(len(vals)-1, len(vals)), float64(H-py))
+		fmt.Fprintf(&sb, " %.1f,%.1f", xOf(len(vals)-1, len(vals)), float64(h-py))
 		return sb.String()
 	}
 
 	nodeColors := []string{"#34d399", "#fbbf24", "#f87171", "#22d3ee", "#a78bfa", "#fb923c"}
 
-	b.WriteString(`<div class="graph-box">`)
-	fmt.Fprintf(b, `<svg width="%d" height="%d" viewBox="0 0 %d %d" style="display:block;width:100%%;overflow:visible">`,
-		W, H, W, H)
+	buf.WriteString(`<div class="graph-box">`)
+	fmt.Fprintf(buf, `<svg width="%d" height="%d" viewBox="0 0 %d %d" style="display:block;width:100%%;overflow:visible">`,
+		w, h, w, h)
 
 	for _, frac := range []float64{0.5, 1.0} {
 		y := yOf(maxVal * frac)
-		fmt.Fprintf(b, `<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#1a1f2e" stroke-width="1"/>`,
-			px, y, W-px, y)
-		fmt.Fprintf(b, `<text x="%d" y="%.1f" fill="#2d3448" font-size="9" font-family="monospace" dy="-3">%.0f</text>`,
+		fmt.Fprintf(buf, `<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#1a1f2e" stroke-width="1"/>`,
+			px, y, w-px, y)
+		fmt.Fprintf(buf, `<text x="%d" y="%.1f" fill="#2d3448" font-size="9" font-family="monospace" dy="-3">%.0f</text>`,
 			px, y, maxVal*frac)
 	}
 
 	if pts := areaPoints(combined); pts != "" {
-		fmt.Fprintf(b, `<polygon points="%s" fill="#818cf8" fill-opacity="0.07"/>`, pts)
+		fmt.Fprintf(buf, `<polygon points="%s" fill="#818cf8" fill-opacity="0.07"/>`, pts)
 	}
 
 	for i, series := range perNode {
 		if pts := line(series); pts != "" {
 			color := nodeColors[i%len(nodeColors)]
-			fmt.Fprintf(b, `<polyline points="%s" fill="none" stroke="%s" stroke-width="1" stroke-linejoin="round" stroke-opacity="0.7"/>`, pts, color)
+			fmt.Fprintf(buf,
+				`<polyline points="%s" fill="none" stroke="%s" stroke-width="1" stroke-linejoin="round" stroke-opacity="0.7"/>`,
+				pts, color)
 		}
 	}
 
 	if pts := line(combined); pts != "" {
-		fmt.Fprintf(b, `<polyline points="%s" fill="none" stroke="#818cf8" stroke-width="2" stroke-linejoin="round"/>`, pts)
+		fmt.Fprintf(buf, `<polyline points="%s" fill="none" stroke="#818cf8" stroke-width="2" stroke-linejoin="round"/>`, pts)
 	}
 
-	b.WriteString(`</svg>`)
+	buf.WriteString(`</svg>`)
 
-	b.WriteString(`<div class="graph-legend">`)
-	fmt.Fprintf(b, `<span class="legend-item"><span class="legend-swatch" style="background:#818cf8;height:2px"></span>combined</span>`)
+	buf.WriteString(`<div class="graph-legend">`)
+	fmt.Fprint(buf, `<span class="legend-item"><span class="legend-swatch" style="background:#818cf8;height:2px"></span>combined</span>`)
 	for i, name := range nodeNames {
 		color := nodeColors[i%len(nodeColors)]
-		fmt.Fprintf(b, `<span class="legend-item"><span class="legend-swatch" style="background:%s"></span>%s</span>`,
+		fmt.Fprintf(buf, `<span class="legend-item"><span class="legend-swatch" style="background:%s"></span>%s</span>`,
 			color, htmlEscape(shortNodeName(name)))
 	}
-	b.WriteString(`</div></div>`)
+	buf.WriteString(`</div></div>`)
 }
 
 // ---------------------------------------------------------------------------
-// Formatting helpers
-// ---------------------------------------------------------------------------
+// Formatting helpers.
+// ---------------------------------------------------------------------------.
 
 func formatETA(d time.Duration) string {
 	d = d.Round(time.Second)
@@ -621,7 +615,7 @@ func formatETA(d time.Duration) string {
 }
 
 func fmtN(n int64) string {
-	s := fmt.Sprintf("%d", n)
+	s := strconv.FormatInt(n, 10)
 	if len(s) <= 3 {
 		return s
 	}
@@ -630,7 +624,7 @@ func fmtN(n int64) string {
 		if i > 0 && (len(s)-i)%3 == 0 {
 			out = append(out, ',')
 		}
-		out = append(out, byte(c))
+		out = append(out, byte(c)) //nolint:gosec // c is always an ASCII digit from FormatInt
 	}
 	return string(out)
 }
@@ -656,12 +650,5 @@ func htmlEscape(s string) string {
 	s = strings.ReplaceAll(s, ">", "&gt;")
 	s = strings.ReplaceAll(s, "\"", "&quot;")
 	s = strings.ReplaceAll(s, "'", "&#39;")
-	return s
-}
-
-func shortCommit(s string) string {
-	if len(s) > 8 {
-		return s[:8]
-	}
 	return s
 }

@@ -166,9 +166,12 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 	return nil
 }
 
-const liteSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, cleave_result, litmus_result, litmus_score,
-	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count, created_at, updated_at, analyzed_at, mtime, marker_mtime`
+const liteSampleCols = `id, sha256, source, feed, ecosystem,
+	filename, file_type, size_bytes, label, label_source,
+	cleave_result, litmus_result, litmus_score,
+	path, status, note, canonical_sha256, parent, skip,
+	formula, elements, score, max_crit, suspicious_count,
+	created_at, updated_at, analyzed_at, mtime, marker_mtime`
 
 func scanLiteSample(row *sql.Row) (*Sample, error) {
 	s := &Sample{}
@@ -217,7 +220,9 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 			&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &s.LitmusScore,
 			&s.Path, &status, &s.Note, &s.CanonicalSHA256,
-			&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score, &s.MaxCrit, &s.SuspiciousCount, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime, &markerMtime,
+			&s.Parent, &s.Skip, &s.Formula, &s.Elements,
+			&s.Score, &s.MaxCrit, &s.SuspiciousCount,
+			&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime, &markerMtime,
 		); err != nil {
 			return nil, err
 		}
@@ -247,11 +252,16 @@ func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error) {
 	res, err := db.lite.ExecContext(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
-			size_bytes, label, label_source, path, status, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count, mtime, marker_mtime)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			size_bytes, label, label_source, path, status,
+			canonical_sha256, parent, skip, formula, elements,
+			score, max_crit, suspicious_count, mtime, marker_mtime)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256) DO NOTHING`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
-		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime)
+		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
+		s.SHA256, s.Parent, s.Skip, s.Formula, s.Elements,
+		s.Score, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime)
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
@@ -301,7 +311,9 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 	for _, s := range samples {
 		res, err := stmt.ExecContext(ctx,
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
-			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime)
+			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
+			s.SHA256, s.Parent, s.Skip, s.Formula, s.Elements,
+			s.Score, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime)
 		if err != nil {
 			return 0, nil, fmt.Errorf("hopper: batch insert %s: %w", s.SHA256, err)
 		}
@@ -386,7 +398,10 @@ func (db *DB) updateCleaveResultSQLite(ctx context.Context, sha256 string, resul
 			file_type = CASE WHEN ? = '' THEN file_type ELSE ? END,
 			litmus_result = NULL, litmus_score = 0,
 			analyzed_at = ?, updated_at = ?
-		WHERE sha256 = ?`, string(result), canonical, fi.Formula, fi.Elements, fi.Score, fi.MaxCrit, fi.SuspiciousCount, fi.FileType, fi.FileType, n, n, sha256)
+		WHERE sha256 = ?`,
+		string(result), canonical, fi.Formula, fi.Elements,
+		fi.Score, fi.MaxCrit, fi.SuspiciousCount,
+		fi.FileType, fi.FileType, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
 	}
@@ -557,7 +572,10 @@ func (db *DB) updateSampleSQLite(ctx context.Context, sha256, status string, res
 			file_type = CASE WHEN ? = '' THEN file_type ELSE ? END,
 			litmus_result = NULL, litmus_score = 0,
 			analyzed_at = ?, updated_at = ?
-		WHERE sha256 = ?`, status, string(result), canonical, fi.Formula, fi.Elements, fi.Score, fi.MaxCrit, fi.SuspiciousCount, fi.FileType, fi.FileType, n, n, sha256)
+		WHERE sha256 = ?`,
+		status, string(result), canonical, fi.Formula,
+		fi.Elements, fi.Score, fi.MaxCrit, fi.SuspiciousCount,
+		fi.FileType, fi.FileType, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update sample: %w", err)
 	}
@@ -605,8 +623,11 @@ func (db *DB) seedCandidatesInPathsSQLite(ctx context.Context, prefixes []string
 	}
 	args = append(args, limit)
 	//nolint:gosec // query structure is built from constants, values are parameterized
-	query := `SELECT ` + liteSampleCols + ` FROM samples WHERE status = '' AND label = ? AND skip = '' AND score ` + op + ` ? AND cleave_result IS NOT NULL AND (` +
-		strings.Join(clauses, " OR ") + `) ORDER BY updated_at ASC LIMIT ?`
+	query := `SELECT ` + liteSampleCols + ` FROM samples` +
+		` WHERE status = '' AND label = ? AND skip = ''` +
+		` AND score ` + op + ` ? AND cleave_result IS NOT NULL` +
+		` AND (` + strings.Join(clauses, " OR ") +
+		`) ORDER BY updated_at ASC LIMIT ?`
 	rows, err := db.lite.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: seed candidates in paths: %w", err)
@@ -1063,22 +1084,22 @@ func (db *DB) claimJobsSQLite(ctx context.Context, worker string, limit int, exp
 		return nil, fmt.Errorf("hopper: claim jobs query: %w", err)
 	}
 	type row struct {
-		id        int64
 		sha256    string
 		path      string
-		sizeBytes int64
 		fileType  string
+		id        int64
+		sizeBytes int64
 	}
 	var selected []row
 	for rows.Next() {
 		var r row
 		if err := rows.Scan(&r.id, &r.sha256, &r.path, &r.sizeBytes, &r.fileType); err != nil {
-			_ = rows.Close()
+			_ = rows.Close() //nolint:errcheck,sqlclosecheck // close early before UPDATE; defer would hold the read lock.
 			return nil, fmt.Errorf("hopper: claim jobs scan: %w", err)
 		}
 		selected = append(selected, r)
 	}
-	_ = rows.Close()
+	_ = rows.Close() //nolint:errcheck // best-effort cleanup
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("hopper: claim jobs rows: %w", err)
 	}
@@ -1116,7 +1137,7 @@ func (db *DB) oldestClaimsSQLite(ctx context.Context, maxAge time.Duration) ([]W
 	if err != nil {
 		return nil, fmt.Errorf("hopper: oldest claims: %w", err)
 	}
-	defer rows.Close()
+	defer rows.Close() //nolint:errcheck // best-effort cleanup
 	var out []WorkerClaim
 	for rows.Next() {
 		var wc WorkerClaim
@@ -1151,7 +1172,7 @@ func (db *DB) unclaimAllSQLite(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("hopper: unclaim all: %w", err)
 	}
-	n, _ := res.RowsAffected()
+	n, _ := res.RowsAffected() //nolint:errcheck // best-effort
 	return n, nil
 }
 

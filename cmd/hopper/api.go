@@ -35,20 +35,20 @@ type apiServer struct {
 // workerTracker is an in-memory view of active workers, updated on every
 // API call. The dashboard reads from it instead of polling nodes.
 type workerTracker struct {
-	mu      sync.RWMutex
 	workers map[string]*workerStats
+	mu      sync.RWMutex
 }
 
-type workerStats struct {
+type workerStats struct { //nolint:govet // fields grouped logically, not by alignment.
 	LastSeen     time.Time
 	LastClaimed  time.Time // when the most recent batch of claims was made
-	Slots        int
-	ActiveClaims int // jobs claimed but not yet returned
 	TotalClaimed int64
 	Analyzed     int64
 	Errors       int64
 	Version      string
 	Traits       string
+	Slots        int
+	ActiveClaims int // jobs claimed but not yet returned
 }
 
 func newWorkerTracker() *workerTracker {
@@ -141,7 +141,7 @@ func (wt *workerTracker) recordResult(name string, isError bool) {
 }
 
 // namedWorkerStats is workerStats with the worker name attached.
-type namedWorkerStats struct {
+type namedWorkerStats struct { //nolint:govet // embedding first is idiomatic.
 	workerStats
 
 	Name string
@@ -247,7 +247,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 
 	// Cap claims for workers that haven't returned any results yet.
 	if limit := s.tracker.claimLimit(worker); limit == 0 {
-		slog.Warn("worker at warmup claim limit, waiting for results", "worker", worker)
+		slog.Warn("worker at warmup claim limit, waiting for results", "worker", worker) //nolint:gosec // worker is sanitized by validWorkerName
 		s.tracker.update(worker, slots, version, traits, 0)
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -260,7 +260,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 
 	jobs, err := s.db.ClaimJobs(ctx, worker, count, claimExpiry)
 	if err != nil {
-		slog.Error("claim jobs failed", "worker", worker, "error", err)
+		slog.Error("claim jobs failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
 		return
 	}
@@ -271,11 +271,13 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	// Persist worker heartbeat to DB for crash recovery.
 	wk := hopper.Worker{Name: worker, Slots: slots, Version: version, Traits: traits}
 	if err := s.db.UpsertWorker(ctx, wk); err != nil {
-		slog.Debug("upsert worker failed", "worker", worker, "error", err)
+		slog.Debug("upsert worker failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
 	}
 
 	if len(jobs) == 0 {
-		slog.Info("no work available", "worker", worker, "active_claims", s.tracker.activeClaims(worker))
+		//nolint:gosec // worker is sanitized by validWorkerName.
+		slog.Info("no work available", "worker", worker,
+			"active_claims", s.tracker.activeClaims(worker))
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -291,7 +293,9 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 
 	active := s.tracker.activeClaims(worker)
 	for _, j := range jobs {
-		slog.Info("claimed", "worker", worker, "sha256", j.SHA256, "path", j.Path, "size", j.SizeBytes, "active_claims", active)
+		//nolint:gosec // worker is sanitized by validWorkerName.
+		slog.Info("claimed", "worker", worker, "sha256", j.SHA256,
+			"path", j.Path, "size", j.SizeBytes, "active_claims", active)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -301,13 +305,13 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 }
 
 // resultRequest is the JSON body for POST /api/result.
-type resultRequest struct {
-	SHA256     string          `json:"sha256"`
-	Worker     string          `json:"worker"`
+type resultRequest struct { //nolint:govet // JSON field order matches API docs.
+	DurationMs int64           `json:"duration_ms"`
 	ML         json.RawMessage `json:"ml"`
 	Raw        json.RawMessage `json:"raw"`
+	SHA256     string          `json:"sha256"`
+	Worker     string          `json:"worker"`
 	Error      string          `json:"error"`
-	DurationMs int64           `json:"duration_ms"`
 }
 
 // handleResult receives an analysis result from a worker.
@@ -360,13 +364,16 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 			if err := s.db.SetSkip(ctx, req.SHA256, skip); err != nil {
 				slog.Error("mark permanent failure failed", "sha256", req.SHA256, "error", err)
 			} else {
-				slog.Info("marked sample", "sha256", req.SHA256, "path", samplePath, "skip", skip, "reason", req.Error)
+				//nolint:gosec // sha256 validated, path from DB.
+				slog.Info("marked sample", "sha256", req.SHA256,
+					"path", samplePath, "skip", skip, "reason", req.Error)
 			}
 		} else {
 			// Transient error — release claim so another worker can try.
 			if err := s.db.UnclaimJobs(ctx, []string{req.SHA256}); err != nil {
 				slog.Error("unclaim failed", "sha256", req.SHA256, "error", err)
 			}
+			//nolint:gosec // worker sanitized by validWorkerName, sha256 by validSHA256, path from DB
 			slog.Warn("worker reported analysis error",
 				"worker", req.Worker, "sha256", req.SHA256, "path", samplePath, "error", req.Error)
 		}
@@ -409,11 +416,12 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		if n, err := s.db.ExplodeArchiveMembers(ctx, parent); err != nil {
 			slog.Error("archive explosion failed", "sha256", req.SHA256, "error", err)
 		} else if n > 0 {
-			slog.Debug("exploded archive members", "sha256", req.SHA256, "members", n)
+			slog.Debug("exploded archive members", "sha256", req.SHA256, "members", n) //nolint:gosec // sha256 validated by validSHA256
 			s.progress.exploded.Add(n)
 		}
 	}
 
+	//nolint:gosec // worker sanitized by validWorkerName, sha256 by validSHA256, path from DB
 	slog.Info("result stored", "worker", req.Worker, "sha256", req.SHA256, "path", resultPath,
 		"duration_ms", req.DurationMs, "active_claims", s.tracker.activeClaims(req.Worker))
 
@@ -472,6 +480,7 @@ func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !allowed {
+		//nolint:gosec // sha256 validated by validSHA256, path from DB lookup
 		slog.Warn("file request blocked: path outside allowed directories",
 			"sha256", sha, "path", sample.Path, "resolved", resolved)
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)

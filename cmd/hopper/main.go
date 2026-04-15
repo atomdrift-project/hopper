@@ -427,7 +427,7 @@ func cmdReset(ctx context.Context) error {
 	return nil
 }
 
-func cmdLoad(ctx context.Context) error {
+func cmdLoad(ctx context.Context) error { //nolint:revive,maintidx // complex command setup function.
 	f := flag.NewFlagSet("load", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
 	dataDir := f.String("data", "", "data directory containing bad/, good/, unknown/ subdirectories")
@@ -497,7 +497,6 @@ func cmdLoad(ctx context.Context) error {
 		return fmt.Errorf("no bad/, good/, or unknown/ subdirectories found in %s", *dataDir)
 	}
 
-
 	// Start litmus early — it takes several seconds to load its model and
 	// YARA rules, and none of that depends on cleave, the hash cache, or
 	// the database. Running it in parallel with those steps shaves ~5s off
@@ -511,8 +510,8 @@ func cmdLoad(ctx context.Context) error {
 		hopperURL := "http://127.0.0.1:8081"
 		if *dashAddr != "" {
 			addr := *dashAddr
-			if strings.HasPrefix(addr, "0.0.0.0:") {
-				addr = "127.0.0.1:" + strings.TrimPrefix(addr, "0.0.0.0:")
+			if after, ok := strings.CutPrefix(addr, "0.0.0.0:"); ok {
+				addr = "127.0.0.1:" + after
 			}
 			hopperURL = "http://" + addr
 		}
@@ -643,9 +642,9 @@ func cmdLoad(ctx context.Context) error {
 			allowedDirs = append(allowedDirs, abs)
 		}
 	}
-	absDataDir, _ := filepath.EvalSymlinks(*dataDir)
+	absDataDir, _ := filepath.EvalSymlinks(*dataDir) //nolint:errcheck // best-effort resolve; falls back to Abs below
 	if absDataDir == "" {
-		absDataDir, _ = filepath.Abs(*dataDir)
+		absDataDir, _ = filepath.Abs(*dataDir) //nolint:errcheck // best-effort resolve; raw path is acceptable fallback
 	}
 	api.db = db
 	api.dataRoot = absDataDir
@@ -662,20 +661,20 @@ func cmdLoad(ctx context.Context) error {
 
 // loadProgress tracks counters across concurrent load workers.
 type loadProgress struct { //nolint:govet // counters are grouped by pipeline stage for maintenance.
-	walked     atomic.Int64
-	hashed     atomic.Int64
-	inserted   atomic.Int64
-	skipped    atomic.Int64
-	analyzed   atomic.Int64
-	markers    atomic.Int64 // files skipped due to misclassification markers
-	tooSmall   atomic.Int64 // files below minFileSize
-	tooLarge   atomic.Int64 // files above maxFileSize
-	errors     atomic.Int64
-	hashErrors atomic.Int64 // hash failures (subset of errors, for % calc)
-	cacheHits  atomic.Int64
-	exploded   atomic.Int64 // archive members inserted
-	queued     atomic.Int64 // items sent for analysis
-	walkedPaths sync.Map    // path → struct{}: all paths seen by iter-files
+	walked      atomic.Int64
+	hashed      atomic.Int64
+	inserted    atomic.Int64
+	skipped     atomic.Int64
+	analyzed    atomic.Int64
+	markers     atomic.Int64 // files skipped due to misclassification markers
+	tooSmall    atomic.Int64 // files below minFileSize
+	tooLarge    atomic.Int64 // files above maxFileSize
+	errors      atomic.Int64
+	hashErrors  atomic.Int64 // hash failures (subset of errors, for % calc)
+	cacheHits   atomic.Int64
+	exploded    atomic.Int64 // archive members inserted
+	queued      atomic.Int64 // items sent for analysis
+	walkedPaths sync.Map     // path → struct{}: all paths seen by iter-files
 
 	lastErr atomic.Value // string
 
@@ -707,7 +706,22 @@ var (
 // the directory pipelines; then the analysis queue is closed and drained;
 // then the summary is logged. nworkers bounds how many directory pipelines
 // may run concurrently (irrelevant for typical 3-dir loads).
-func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litmus *litmusServer, tracker *workerTracker, api *apiServer, cache *hashCache, dirs []struct{ dir, label string }, source string, nworkers int, rescan bool, maxAnalyzed int, experimentTag string, wd *webDashboard) int {
+func loadAll( //nolint:revive // many params reflect the many subsystems coordinated here.
+	ctx context.Context,
+	_ context.CancelFunc,
+	db *hopper.DB,
+	litmus *litmusServer,
+	tracker *workerTracker,
+	api *apiServer,
+	cache *hashCache,
+	dirs []struct{ dir, label string },
+	source string,
+	nworkers int,
+	_ bool,
+	maxAnalyzed int,
+	experimentTag string,
+	wd *webDashboard,
+) int {
 	slog.Info("loading", "dirs", len(dirs))
 	start := time.Now()
 	var progress loadProgress
@@ -747,7 +761,7 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 			case <-ctx.Done():
 				return
 			}
-			runDirPipeline(ctx, db, d, source, cache, &progress, rescan)
+			runDirPipeline(ctx, db, d, source, cache, &progress, false)
 		})
 	}
 	pipeWG.Wait()
@@ -755,7 +769,9 @@ func loadAll(ctx context.Context, cancel context.CancelFunc, db *hopper.DB, litm
 	// Mark samples whose files are gone or filtered out by iter-files.
 	walkedSet := make(map[string]struct{})
 	progress.walkedPaths.Range(func(k, _ any) bool {
-		walkedSet[k.(string)] = struct{}{}
+		if s, ok := k.(string); ok {
+			walkedSet[s] = struct{}{}
+		}
 		return true
 	})
 	if marked, err := db.MarkMissingSamples(ctx, walkedSet); err != nil {
@@ -786,7 +802,7 @@ func runDirPipeline(
 	source string,
 	cache *hashCache,
 	progress *loadProgress,
-	rescan bool,
+	_ bool,
 ) {
 	batch := make([]*hopper.Sample, 0, loadBatchSize)
 	batchKeys := make([]cacheKey, 0, loadBatchSize)
@@ -897,7 +913,7 @@ func runDirPipeline(
 // coordination with workers is required beyond those atomic loads. The pool
 // status block is fed by background nodeMonitors so this function never
 // blocks on a slow remote.
-func runDashboard(
+func runDashboard( //nolint:gocognit,revive,maintidx // complex dashboard loop with many coordinated params.
 	ctx context.Context,
 	progress *loadProgress,
 	_ *litmusServer,
@@ -922,8 +938,8 @@ func runDashboard(
 	// Ring buffer for 15-minute rolling rate (one sample per tick).
 	type sample struct {
 		t      time.Time
-		count  int64
 		byNode map[string]int64 // keyed by worker name
+		count  int64
 	}
 	const maxSamples = 120 // 10s * 120 = 20 minutes of history
 	var samples []sample
@@ -949,7 +965,7 @@ func runDashboard(
 					oldestClaims[c.Worker] = c
 				}
 			}
-			newestAnalyzedAt, _ = db.NewestAnalyzedAt(ctx)
+			newestAnalyzedAt, _ = db.NewestAnalyzedAt(ctx) //nolint:errcheck // best-effort; zero time is acceptable fallback
 		}
 
 		analyzedAbs := progress.analyzed.Load()
@@ -970,8 +986,8 @@ func runDashboard(
 		s := sample{t: now, count: sessionAnalyzed}
 		if len(workers) > 0 {
 			s.byNode = make(map[string]int64, len(workers))
-			for _, w := range workers {
-				s.byNode[w.Name] = w.Analyzed
+			for i := range workers {
+				s.byNode[workers[i].Name] = workers[i].Analyzed
 			}
 		}
 		samples = append(samples, s)
@@ -1065,43 +1081,40 @@ func runDashboard(
 			right += "  ETA " + etaStr
 		}
 		// Pad to ~80 columns.
-		pad := 78 - len(header) - len(right) + 8 // +8 for ANSI escape codes
-		if pad < 2 {
-			pad = 2
-		}
+		pad := max(78-len(header)-len(right)+8, 2) // +8 for ANSI escape codes
 		writeStdoutf("%s%s%s\n\n", header, strings.Repeat(" ", pad), right)
 
 		// Workers
 		if len(workers) > 0 {
 			nameWidth := 6
-			for _, w := range workers {
-				if len(w.Name) > nameWidth {
-					nameWidth = len(w.Name)
+			for i := range workers {
+				if len(workers[i].Name) > nameWidth {
+					nameWidth = len(workers[i].Name)
 				}
 			}
 			writeStdoutf("\n  \033[2m  %-*s  tasks  claimed    rate  analyzed  errors  oldest job\033[0m\n",
 				nameWidth, "worker")
 
 			sort.Slice(workers, func(i, j int) bool { return workers[i].Name < workers[j].Name })
-			for _, w := range workers {
-				idle := time.Since(w.LastSeen)
-				status, dot := workerStatus(w.ActiveClaims, idle)
+			for i := range workers {
+				idle := time.Since(workers[i].LastSeen)
+				status, dot := workerStatus(workers[i].ActiveClaims, idle)
 
 				rateStr := "    —"
-				if r := nodeRates[w.Name]; r > 0.05 {
+				if r := nodeRates[workers[i].Name]; r > 0.05 {
 					rateStr = fmt.Sprintf("%4.1f/s", r)
 				}
 
 				oldestStr := ""
-				if claim, ok := oldestClaims[w.Name]; ok {
+				if claim, ok := oldestClaims[workers[i].Name]; ok {
 					age := time.Since(claim.ClaimedAt)
 					oldestStr = fmt.Sprintf("  %s (%s)", filepath.Base(claim.Path), shortDuration(age))
 				}
 
 				line := fmt.Sprintf("  %s %-*s  %3d/%d  %6s  %s  %8s  %s",
-					dot, nameWidth, w.Name,
-					w.ActiveClaims, w.Slots, fmtN(w.TotalClaimed), rateStr,
-					fmtN(w.Analyzed), fmtN(w.Errors))
+					dot, nameWidth, workers[i].Name,
+					workers[i].ActiveClaims, workers[i].Slots, fmtN(workers[i].TotalClaimed), rateStr,
+					fmtN(workers[i].Analyzed), fmtN(workers[i].Errors))
 				if oldestStr != "" {
 					line += oldestStr
 				}
@@ -1150,56 +1163,30 @@ func workerStatus(activeClaims int, idle time.Duration) (status string, dot stri
 }
 
 func logWorkerStatus(workers []namedWorkerStats, nodeRates map[string]float64, oldestClaims map[string]hopper.WorkerClaim) {
-	for _, w := range workers {
-		online := time.Since(w.LastSeen) < 30*time.Second
+	for i := range workers {
+		online := time.Since(workers[i].LastSeen) < 30*time.Second
 		status := "online"
 		if !online {
 			status = "offline"
 		}
 		attrs := []any{
-			"worker", w.Name,
+			"worker", workers[i].Name,
 			"status", status,
-			"slots", w.Slots,
-			"claimed", w.TotalClaimed,
-			"analyzed", w.Analyzed,
-			"errors", w.Errors,
+			"slots", workers[i].Slots,
+			"claimed", workers[i].TotalClaimed,
+			"analyzed", workers[i].Analyzed,
+			"errors", workers[i].Errors,
 		}
-		if r := nodeRates[w.Name]; r > 0.05 {
+		if r := nodeRates[workers[i].Name]; r > 0.05 {
 			attrs = append(attrs, "rate", fmt.Sprintf("%.1f/s", r))
 		}
-		if claim, ok := oldestClaims[w.Name]; ok {
+		if claim, ok := oldestClaims[workers[i].Name]; ok {
 			attrs = append(attrs,
 				"oldest_job", filepath.Base(claim.Path),
 				"oldest_age", shortDuration(time.Since(claim.ClaimedAt)))
 		}
 		slog.Info("litmus worker", attrs...)
 	}
-}
-
-// formatUptime renders seconds as h:mm:ss (or m:ss for short uptimes). Used
-// only by the TTY dashboard; the slog path emits raw seconds.
-func formatUptime(secs int64) string {
-	if secs <= 0 {
-		return "—"
-	}
-	d := time.Duration(secs) * time.Second
-	h := int(d / time.Hour)
-	m := int((d % time.Hour) / time.Minute)
-	s := int((d % time.Minute) / time.Second)
-	if h > 0 {
-		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
-	}
-	return fmt.Sprintf("%d:%02d", m, s)
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	if n <= 1 {
-		return s[:n]
-	}
-	return s[:n-1] + "…"
 }
 
 // logLoadSummary emits the final "directory complete" line with the
@@ -1736,4 +1723,3 @@ func isTTY() bool {
 	}
 	return (fileInfo.Mode() & os.ModeCharDevice) != 0
 }
-
