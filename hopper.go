@@ -16,9 +16,11 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/mattn/go-sqlite3" // register sqlite3 driver
 )
@@ -159,15 +161,19 @@ type cleaveFileInfo struct {
 	SuspiciousCount int
 }
 
-// parseCleaveFile extracts formula, elements, score, file type, max trait
-// criticality, and suspicious-trait count from a cleave result for the
-// file matching the given SHA256 (preferring an exact SHA match, then
-// falling back to depth 0). SuspiciousCount counts traits with level >= 4
-// (suspicious or hostile) at confidence >= 0.65, matching the convention
-// used by ExplodeArchiveMembers.
-func parseCleaveFile(sha256 string, result []byte) cleaveFileInfo {
+// CleaveParseResult holds all metadata extracted from a single JSON parse
+// of a cleave result, combining file info and canonical SHA computation.
+type CleaveParseResult struct {
+	CanonicalSHA string
+	FileInfo     cleaveFileInfo
+}
+
+// ParseCleaveResult extracts file info and canonical SHA from a cleave result
+// in a single JSON parse, avoiding the redundant parsing that happens when
+// parseCleaveFile and canonicalSHA are called separately.
+func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 	if len(result) == 0 {
-		return cleaveFileInfo{}
+		return CleaveParseResult{CanonicalSHA: sha256}
 	}
 	var report struct {
 		Files []struct {
@@ -183,35 +189,54 @@ func parseCleaveFile(sha256 string, result []byte) cleaveFileInfo {
 		} `json:"fs"`
 	}
 	if json.Unmarshal(result, &report) != nil {
-		return cleaveFileInfo{}
+		return CleaveParseResult{CanonicalSHA: sha256}
 	}
+
+	// Canonical SHA: lexicographic minimum across sample and all embedded files.
+	canonical := sha256
 	for _, f := range report.Files {
-		if f.SHA256 == sha256 || f.Depth == 0 {
-			maxCrit := 0
-			suspicious := 0
-			for _, t := range f.Traits {
-				if t.Level > maxCrit {
-					maxCrit = t.Level
-				}
-				conf := t.Conf
-				if conf == 0 {
-					conf = 1.0
-				}
-				if conf >= 0.65 && t.Level >= 4 {
-					suspicious++
-				}
-			}
-			return cleaveFileInfo{
-				Formula:         f.Formula,
-				Elements:        stripSubscripts(f.Formula),
-				FileType:        f.FileType,
-				Score:           f.Score,
-				MaxCrit:         maxCrit,
-				SuspiciousCount: suspicious,
-			}
+		if len(f.SHA256) == 64 && f.SHA256 < canonical {
+			canonical = f.SHA256
 		}
 	}
-	return cleaveFileInfo{}
+
+	// File info for the matching entry.
+	var fi cleaveFileInfo
+	for _, f := range report.Files {
+		if f.SHA256 != sha256 && f.Depth != 0 {
+			continue
+		}
+		maxCrit := 0
+		suspicious := 0
+		for _, t := range f.Traits {
+			if t.Level > maxCrit {
+				maxCrit = t.Level
+			}
+			conf := t.Conf
+			if conf == 0 {
+				conf = 1.0
+			}
+			if conf >= 0.65 && t.Level >= 4 {
+				suspicious++
+			}
+		}
+		fi = cleaveFileInfo{
+			Formula:         f.Formula,
+			Elements:        stripSubscripts(f.Formula),
+			FileType:        f.FileType,
+			Score:           f.Score,
+			MaxCrit:         maxCrit,
+			SuspiciousCount: suspicious,
+		}
+		break
+	}
+
+	return CleaveParseResult{CanonicalSHA: canonical, FileInfo: fi}
+}
+
+// parseCleaveFile extracts file info only (for callers that don't need canonical SHA).
+func parseCleaveFile(sha256 string, result []byte) cleaveFileInfo {
+	return ParseCleaveResult(sha256, result).FileInfo
 }
 
 // parseLitmusProb extracts the litmus confidence score from a litmus result
@@ -489,26 +514,55 @@ func (db *DB) SampleBySHA256(ctx context.Context, sha256 string) (*Sample, error
 	return db.sampleBySHA256SQLite(ctx, sha256)
 }
 
+// SampleParentInfo fetches only the fields needed by ExplodeArchiveMembers,
+// avoiding the cost of reading the full row (especially the large cleave_result
+// JSONB column which the caller already has).
+func (db *DB) SampleParentInfo(ctx context.Context, sha256 string) (*Sample, error) {
+	const cols = `sha256, path, label, label_source, source, feed, ecosystem, canonical_sha256, litmus_result`
+	var s Sample
+	var litmus []byte
+	scan := func(row interface{ Scan(...any) error }) error {
+		return row.Scan(&s.SHA256, &s.Path, &s.Label, &s.LabelSource,
+			&s.Source, &s.Feed, &s.Ecosystem, &s.CanonicalSHA256, &litmus)
+	}
+	var err error
+	if db.pool != nil {
+		err = scan(db.pool.QueryRow(ctx, `SELECT `+cols+` FROM samples WHERE sha256 = $1`, sha256))
+	} else {
+		err = scan(db.lite.QueryRowContext(ctx, `SELECT `+cols+` FROM samples WHERE sha256 = ?`, sha256))
+	}
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("hopper: sample parent info %s: %w", sha256, err)
+	}
+	s.LitmusResult = litmus
+	return &s, nil
+}
+
 // UpdateCleaveResult stores analysis output for a sample.
-// Pass canonicalSHA256 as the minimum SHA256 across the sample and its embedded
-// files (for train/test splits). Pass "" to compute it from result automatically.
+// Pass a pre-parsed CleaveParseResult to avoid redundant JSON parsing,
+// or nil to parse the result automatically.
 //
 // If cleave could not classify the file (fi.FileType == ""), the row is
 // deleted instead of updated: an unclassified row carries no analytical
 // value and only pollutes later queries. This is the belt-and-suspenders
 // complement to the ingest-time filter in cleave iter-files.
-func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []byte, canonicalSHA256 string) error {
-	if canonicalSHA256 == "" {
-		canonicalSHA256 = canonicalSHA(sha256, result)
+func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []byte, parsed *CleaveParseResult) error {
+	var p CleaveParseResult
+	if parsed != nil {
+		p = *parsed
+	} else {
+		p = ParseCleaveResult(sha256, result)
 	}
-	fi := parseCleaveFile(sha256, result)
-	if fi.FileType == "" {
+	if p.FileInfo.FileType == "" {
 		return db.DeleteSample(ctx, sha256)
 	}
 	if db.pool != nil {
-		return db.updateCleaveResultPG(ctx, sha256, result, canonicalSHA256, fi)
+		return db.updateCleaveResultPG(ctx, sha256, result, p.CanonicalSHA, p.FileInfo)
 	}
-	return db.updateCleaveResultSQLite(ctx, sha256, result, canonicalSHA256, fi)
+	return db.updateCleaveResultSQLite(ctx, sha256, result, p.CanonicalSHA, p.FileInfo)
 }
 
 // UpdateLitmusResult stores the litmus classification envelope for a sample.
@@ -549,6 +603,15 @@ func (db *DB) MarkMissingSamples(ctx context.Context, walkedPaths map[string]str
 		return 0, fmt.Errorf("hopper: mark missing: %w", err)
 	}
 
+	// Resolve symlinks in DB paths so they match the resolved walkedPaths keys.
+	// Prior runs may have stored unresolved symlink paths (e.g. ~/data → /srv/data).
+	resolvedPath := func(p string) string {
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			return r
+		}
+		return p
+	}
+
 	// Dry-run: count how many would be marked before writing anything.
 	// Skip archive children (parent != "") — they don't have standalone
 	// files on disk; they get analysis through their parent archive.
@@ -558,7 +621,8 @@ func (db *DB) MarkMissingSamples(ctx context.Context, walkedPaths map[string]str
 			continue
 		}
 		eligible++
-		if _, walked := walkedPaths[s.Path]; !walked {
+		rp := resolvedPath(s.Path)
+		if _, walked := walkedPaths[rp]; !walked {
 			wouldMark++
 		}
 	}
@@ -574,7 +638,8 @@ func (db *DB) MarkMissingSamples(ctx context.Context, walkedPaths map[string]str
 		if s.Skip != "" || s.Parent != "" {
 			continue
 		}
-		if _, walked := walkedPaths[s.Path]; walked {
+		rp := resolvedPath(s.Path)
+		if _, walked := walkedPaths[rp]; walked {
 			continue
 		}
 		_, statErr := os.Stat(s.Path)
@@ -784,6 +849,21 @@ func (db *DB) CountAnalyzed(ctx context.Context) (int64, error) {
 		return db.countAnalyzedPG(ctx)
 	}
 	return db.countAnalyzedSQLite(ctx)
+}
+
+// CountPending returns the number of samples awaiting analysis
+// (matching the claim query criteria: no cleave result, not skipped, not a child).
+func (db *DB) CountPending(ctx context.Context) (int64, error) {
+	const q = `SELECT count(*) FROM samples ` +
+		`WHERE cleave_result IS NULL AND skip = '' AND parent = ''`
+	var n int64
+	var err error
+	if db.pool != nil {
+		err = db.pool.QueryRow(ctx, q).Scan(&n)
+	} else {
+		err = db.lite.QueryRowContext(ctx, q).Scan(&n)
+	}
+	return n, err
 }
 
 // UpdateSample updates status, cleave result, and updated_at in one operation.

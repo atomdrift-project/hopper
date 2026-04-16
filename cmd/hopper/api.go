@@ -82,34 +82,29 @@ func (wt *workerTracker) update(name string, slots int, version, traits string, 
 // Workers that have never returned a result are capped at warmupClaimLimit
 // total. If the worker's claims have all expired (older than claimExpiry),
 // the warmup counters are reset so a reconnecting worker can try again.
+// claimLimit returns how many more jobs the worker may claim right now.
+// Workers that have never returned a result are capped by their active
+// (unreturned) claim count — they can hold up to maxClaimCount jobs at once
+// but must return results to free capacity for more. Once a worker has
+// returned at least one result, the cap is lifted to maxClaimCount per request.
 func (wt *workerTracker) claimLimit(name string) int {
 	wt.mu.Lock()
 	defer wt.mu.Unlock()
 	ws, ok := wt.workers[name]
 	if !ok {
-		return warmupClaimLimit
+		return maxClaimCount
 	}
 	if ws.Analyzed+ws.Errors > 0 {
 		return maxClaimCount // proven worker, no warmup cap
 	}
-	remaining := warmupClaimLimit - int(ws.TotalClaimed)
+	// Unproven worker: limit by active (unreturned) claims, not total.
+	// This lets workers refill their prefetch buffer as results come back
+	// without hitting a cumulative ceiling.
+	remaining := maxClaimCount - ws.ActiveClaims
 	if remaining > 0 {
 		return remaining
 	}
-	// Worker hit the warmup cap without returning results. If enough time
-	// has passed for all old claims to expire, reset — this typically
-	// happens when a worker process restarts (e.g. litmus rebuild).
-	if ws.LastClaimed.IsZero() || time.Since(ws.LastClaimed) <= claimExpiry {
-		return 0
-	}
-	//nolint:gosec // name is validated by validWorkerName before reaching here.
-	slog.Info("resetting warmup for worker with expired claims",
-		"worker", name,
-		"stale_claims", ws.ActiveClaims,
-		"total_claimed", ws.TotalClaimed)
-	ws.TotalClaimed = 0
-	ws.ActiveClaims = 0
-	return warmupClaimLimit
+	return 0
 }
 
 func (wt *workerTracker) activeClaims(name string) int {
@@ -119,6 +114,15 @@ func (wt *workerTracker) activeClaims(name string) int {
 		return ws.ActiveClaims
 	}
 	return 0
+}
+
+func (wt *workerTracker) lastSeen(name string) time.Time {
+	wt.mu.RLock()
+	defer wt.mu.RUnlock()
+	if ws, ok := wt.workers[name]; ok {
+		return ws.LastSeen
+	}
+	return time.Time{}
 }
 
 func (wt *workerTracker) recordResult(name string, isError bool) {
@@ -170,17 +174,17 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/next", s.handleNext)
 	mux.HandleFunc("POST /api/result", s.handleResult)
 	mux.HandleFunc("GET /api/file/{sha256}", s.handleFile)
+	mux.Handle("GET /data/", s.safeFileServer())
 }
 
 const (
-	maxClaimCount      = 10
+	maxClaimCount      = 32
 	claimExpiry        = 30 * time.Minute
 	staleClaimAge      = 2 * time.Hour
 	maxWorkerNameLen   = 64
 	maxResultBodyBytes = 64 << 20 // 64 MiB — complex samples with many embedded binaries produce large cleave reports.
 	maxTrackedWorkers  = 200
-	warmupClaimLimit   = 10 // max claims before a worker has returned any results
-	apiQueryTimeout    = 10 * time.Second
+	apiQueryTimeout = 30 * time.Second
 )
 
 // validWorkerName checks that the name is non-empty, <= maxWorkerNameLen,
@@ -247,7 +251,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 
 	// Cap claims for workers that haven't returned any results yet.
 	if limit := s.tracker.claimLimit(worker); limit == 0 {
-		slog.Warn("worker at warmup claim limit, waiting for results", "worker", worker) //nolint:gosec // worker is sanitized by validWorkerName
+		slog.Warn("unproven worker at active claim limit, waiting for results", "worker", worker, "active", s.tracker.activeClaims(worker)) //nolint:gosec // worker is sanitized by validWorkerName
 		s.tracker.update(worker, slots, version, traits, 0)
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -283,11 +287,18 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Strip the data root to return relative paths. Workers join these
-	// with their own data root to find files locally.
+	// with their own data root to find files locally. Resolve each path
+	// first so legacy rows with unresolved symlinks still match.
 	if s.dataRoot != "" {
 		prefix := s.dataRoot + string(filepath.Separator)
 		for i := range jobs {
-			jobs[i].Path = strings.TrimPrefix(jobs[i].Path, prefix)
+			p := jobs[i].Path
+			if resolved, err := filepath.EvalSymlinks(p); err == nil {
+				p = resolved
+			} else if abs, err := filepath.Abs(p); err == nil {
+				p = abs
+			}
+			jobs[i].Path = strings.TrimPrefix(p, prefix)
 		}
 	}
 
@@ -355,12 +366,15 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 			strings.Contains(req.Error, "Path does not exist") ||
 			strings.Contains(req.Error, "Failed to decrypt") ||
 			strings.Contains(req.Error, "Password required") ||
-			strings.Contains(req.Error, "invalid Zip archive") {
+			strings.Contains(req.Error, "invalid Zip archive") ||
+			strings.Contains(req.Error, "analysis timed out") {
 			// Unsupported file type, missing file, etc. — mark so it's
 			// never queued again, but preserve the record.
 			skip := "unsupported"
 			if strings.Contains(req.Error, "Path does not exist") {
 				skip = "missing"
+			} else if strings.Contains(req.Error, "analysis timed out") {
+				skip = "timeout"
 			}
 			if err := s.db.SetSkip(ctx, req.SHA256, skip); err != nil {
 				slog.Error("mark permanent failure failed", "sha256", req.SHA256, "error", err)
@@ -385,9 +399,9 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Store cleave result.
-	canonical := extractCanonicalSHA(req.SHA256, req.Raw)
-	if err := s.db.UpdateCleaveResult(ctx, req.SHA256, req.Raw, canonical); err != nil {
+	// Parse cleave result once — used for both storage and explosion.
+	parsed := hopper.ParseCleaveResult(req.SHA256, req.Raw)
+	if err := s.db.UpdateCleaveResult(ctx, req.SHA256, req.Raw, &parsed); err != nil {
 		slog.Error("store cleave result failed", "sha256", req.SHA256, "error", err)
 		// Still record the result so ActiveClaims is decremented — otherwise
 		// the worker's claim count is permanently inflated for this slot.
@@ -407,13 +421,14 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 
 	// Explode archive members.
 	resultPath := ""
-	parent, err := s.db.SampleBySHA256(ctx, req.SHA256)
+	parent, err := s.db.SampleParentInfo(ctx, req.SHA256)
 	if err != nil {
 		if !errors.Is(err, hopper.ErrNotFound) {
 			slog.Error("fetch for explosion failed", "sha256", req.SHA256, "error", err)
 		}
 	} else {
 		resultPath = parent.Path
+		parent.CleaveResult = req.Raw // already have it — avoid re-reading from DB
 		if n, err := s.db.ExplodeArchiveMembers(ctx, parent); err != nil {
 			slog.Error("archive explosion failed", "sha256", req.SHA256, "error", err)
 		} else if n > 0 {
@@ -502,4 +517,63 @@ func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
+}
+
+// safeFileServer returns an HTTP handler that serves files from dataRoot
+// by relative path (e.g. GET /data/bad/sample.bin). This avoids the DB
+// lookup that /api/file/{sha256} requires — workers already know the
+// relative path from /api/next.
+//
+// Symlinks are resolved and the final path is checked against allowedDirs,
+// matching the security model of handleFile.
+func (s *apiServer) safeFileServer() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		relPath := strings.TrimPrefix(r.URL.Path, "/data/")
+		if relPath == "" || relPath[0] == '/' {
+			http.NotFound(w, r)
+			return
+		}
+		// Clean the path and reject anything that escapes the root.
+		cleaned := filepath.Clean(filepath.FromSlash(relPath))
+		if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+			http.NotFound(w, r)
+			return
+		}
+
+		absPath := filepath.Join(s.dataRoot, cleaned)
+		resolved, err := filepath.EvalSymlinks(absPath)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+
+		allowed := false
+		for _, dir := range s.allowedDirs {
+			if strings.HasPrefix(resolved, dir+string(filepath.Separator)) || resolved == dir {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			//nolint:gosec // relPath is cleaned via filepath.Clean above; logging for diagnostics
+			slog.Warn("data request blocked: path outside allowed directories",
+				"rel", relPath, "resolved", resolved)
+			http.NotFound(w, r)
+			return
+		}
+
+		f, err := os.Open(resolved) //nolint:gosec // path validated above
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		defer f.Close() //nolint:errcheck // best-effort close
+		stat, err := f.Stat()
+		if err != nil || stat.IsDir() {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
+	})
 }

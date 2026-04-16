@@ -12,7 +12,14 @@ import (
 )
 
 func openPG(ctx context.Context, dsn string) (*DB, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: parse dsn: %w", err)
+	}
+	cfg.MaxConns = 32
+	cfg.MinConns = 4
+	cfg.MaxConnIdleTime = 5 * time.Minute
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: connect: %w", err)
 	}
@@ -62,7 +69,10 @@ func (db *DB) migratePG(ctx context.Context) error {
 		// Pull-based work scheduling: claim tracking columns + index.
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS claimed_by TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_claimable ON samples(id) WHERE cleave_result IS NULL AND claimed_by = ''`,
+		`DROP INDEX IF EXISTS idx_samples_claimable`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_claimable ` +
+			`ON samples(updated_at ASC NULLS FIRST, id) ` +
+			`WHERE cleave_result IS NULL AND skip = '' AND parent = ''`,
 		// Covers the dashboard's OldestClaims query (DISTINCT ON claimed_by, ORDER BY claimed_at).
 		`CREATE INDEX IF NOT EXISTS idx_samples_claimed ON samples(claimed_by, claimed_at) WHERE claimed_by != '' AND cleave_result IS NULL`,
 		// newestAnalyzedAtPG: MAX(analyzed_at) — index-only max scan.
@@ -146,7 +156,8 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 			score, max_crit, suspicious_count, mtime, marker_mtime)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
 			$11, $1, $12, $13, $14, $15, $16, $17, $18, $19, $20)
-		ON CONFLICT (sha256) DO NOTHING`,
+		ON CONFLICT (sha256) DO UPDATE SET path = EXCLUDED.path, mtime = EXCLUDED.mtime
+		WHERE samples.path IS DISTINCT FROM EXCLUDED.path`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.Parent, s.Skip, s.Formula, s.Elements, s.Score,
@@ -182,12 +193,14 @@ const insertBatchStagingInsert = `INSERT INTO samples (
 	size_bytes, label, label_source, path, status,
 	canonical_sha256, parent, skip, formula, elements,
 	score, max_crit, suspicious_count, mtime, marker_mtime)
-SELECT sha256, source, feed, ecosystem, filename, file_type,
+SELECT DISTINCT ON (sha256)
+	sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, path, status,
 	canonical_sha256, parent, skip, formula, elements,
 	score, max_crit, suspicious_count, mtime, marker_mtime
 FROM _staging
-ON CONFLICT (sha256) DO NOTHING`
+ON CONFLICT (sha256) DO UPDATE SET path = EXCLUDED.path, mtime = EXCLUDED.mtime
+WHERE samples.path IS DISTINCT FROM EXCLUDED.path`
 
 func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inserted int64, needsAnalysis []string, err error) {
 	rows := make([][]any, len(samples))

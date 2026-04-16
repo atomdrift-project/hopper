@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"html"
 	"math"
 	"net"
 	"net/http"
@@ -174,7 +175,7 @@ func startWebDashboard(ctx context.Context, addr string, wd *webDashboard, mux *
 	if err != nil {
 		return fmt.Errorf("web dashboard listen %s: %w", addr, err)
 	}
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
 		<-ctx.Done()
 		_ = srv.Close() //nolint:errcheck // best-effort shutdown
@@ -265,14 +266,14 @@ footer{padding-top:1rem;border-top:1px solid var(--border);
   font-family:var(--mono);font-size:.75rem;color:var(--sub)}
 `
 
-func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //nolint:maintidx // dashboard render is inherently complex.
+func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 	wd.cfgMu.RLock()
 	progress := wd.progress
 	tracker := wd.tracker
 	db := wd.db
 	start := wd.start
 	startAnalyzed := wd.startAnalyzed
-	maxAnalyzed := wd.maxAnalyzed
+	_ = wd.maxAnalyzed // reserved for future use
 	wd.cfgMu.RUnlock()
 
 	var workers []namedWorkerStats
@@ -318,27 +319,30 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	analyzedAbs := progress.analyzed.Load()
 	sessionAnalyzed := max(analyzedAbs-startAnalyzed, 0)
 	walked := progress.walked.Load()
+	inserted := progress.inserted.Load()
+	skipped := progress.skipped.Load()
 
-	analyzeTarget := max(progress.queued.Load()-startAnalyzed, 0)
-	if maxAnalyzed > 0 && int64(maxAnalyzed) < analyzeTarget {
-		analyzeTarget = int64(maxAnalyzed)
+	totalInDB := progress.queued.Load()
+	insertDone := inserted + skipped + progress.tooSmall.Load() + progress.tooLarge.Load() + progress.hashErrors.Load()
+	inPipeline := max(walked-insertDone, 0)
+	totalExpected := totalInDB
+	if !progress.walkDone.Load() || inPipeline > 0 {
+		totalExpected += inPipeline
 	}
-	totalTarget := startAnalyzed + analyzeTarget
-	totalDone := startAnalyzed + sessionAnalyzed
+	pending := max(totalExpected-analyzedAbs, 0)
 
 	wd.recordSample(sessionAnalyzed)
 	rate, nodeRateByName := wd.ratesOver(15 * time.Minute)
 
 	var etaStr string
-	if rate > 0.1 && analyzeTarget > sessionAnalyzed {
-		remaining := analyzeTarget - sessionAnalyzed
-		etaDur := time.Duration(float64(remaining)/rate) * time.Second
+	if rate > 0.1 && pending > 0 {
+		etaDur := time.Duration(float64(pending)/rate) * time.Second
 		etaStr = formatETA(etaDur)
 	}
 
 	pct := 0.0
-	if totalTarget > 0 {
-		pct = math.Min(float64(totalDone)/float64(totalTarget)*100, 100)
+	if totalExpected > 0 {
+		pct = math.Min(float64(analyzedAbs)/float64(totalExpected)*100, 100)
 	}
 
 	var buf strings.Builder
@@ -353,14 +357,17 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	fmt.Fprintf(&buf, `<span class="hdr-time">%s</span>`, elapsed)
 	buf.WriteString(`</div>`)
 
-	// Big progress
+	// Big progress — total DB numbers for the full picture.
 	buf.WriteString(`<div class="progress">`)
 	buf.WriteString(`<div class="progress-stats">`)
 	fmt.Fprintf(&buf, `<span class="progress-main"><span class="progress-pct">%.0f%%</span> analyzed</span>`, pct)
 
 	// Rate + ETA
 	buf.WriteString(`<span class="progress-detail">`)
-	fmt.Fprintf(&buf, `<em>%s</em> / %s`, fmtN(totalDone), fmtN(totalTarget))
+	fmt.Fprintf(&buf, `<em>%s</em> / %s analyzed`, fmtN(analyzedAbs), fmtN(totalExpected))
+	if pending > 0 {
+		fmt.Fprintf(&buf, ` &middot; <em>%s</em> pending`, fmtN(pending))
+	}
 	if rate > 0.1 {
 		fmt.Fprintf(&buf, ` &middot; <em>%.1f</em>/s (15m avg)`, rate)
 	}
@@ -370,19 +377,12 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	buf.WriteString(`</span>`)
 	buf.WriteString(`</div>`)
 
-	// Bar
-	priorPct := 0.0
-	sessionPct := 0.0
-	if totalTarget > 0 {
-		priorPct = math.Min(float64(startAnalyzed)/float64(totalTarget)*100, 100)
-		sessionPct = math.Min(float64(sessionAnalyzed)/float64(totalTarget)*100, 100-priorPct)
-	}
+	// Bar — session progress only.
 	fmt.Fprintf(&buf,
 		`<div class="track">`+
-			`<div class="fill" style="width:%.2f%%;background:#5a5230"></div>`+
 			`<div class="fill" style="width:%.2f%%;background:#fbbf24"></div>`+
 			`</div>`,
-		priorPct, sessionPct)
+		pct)
 	buf.WriteString(`</div>`) // .progress
 	buf.WriteString(`</div>`) // .hdr
 
@@ -407,7 +407,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	if len(workers) > 0 {
 		buf.WriteString(`<section><div class="label">Workers</div>`)
 		buf.WriteString(`<table><thead><tr>` +
-			`<th>Worker</th><th>Tasks</th><th>Claimed</th><th>Rate</th>` +
+			`<th>Worker</th><th>Tasks</th><th>Seen</th><th>Rate</th>` +
 			`<th>Analyzed</th><th>Errors</th><th>Oldest Job</th><th></th>` +
 			`</tr></thead><tbody>`)
 
@@ -449,7 +449,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 					`</tr>`,
 				dotClass, htmlEscape(w.Name),
 				w.ActiveClaims, w.Slots,
-				fmtN(w.TotalClaimed),
+				shortDuration(idle),
 				rateStr,
 				fmtN(w.Analyzed),
 				fmtN(w.Errors),
@@ -460,27 +460,48 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		buf.WriteString(`</tbody></table></section>`)
 	}
 
-	// Footer
-	lastCompleted := ""
-	if !newestAnalyzedAt.IsZero() {
-		lastCompleted = fmt.Sprintf(` &middot; last completed %s ago`, shortDuration(time.Since(newestAnalyzedAt)))
-	}
-	fmt.Fprintf(&buf,
-		`<footer>%s errors &middot; %s walked &middot; %s cache hits%s</footer>`,
-		fmtN(progress.errors.Load()),
-		fmtN(walked),
-		fmtN(progress.cacheHits.Load()),
-		lastCompleted,
-	)
-
-	// Last error at the bottom, untruncated
-	if last, ok := progress.lastErr.Load().(string); ok && last != "" {
-		fmt.Fprintf(&buf, `<div class="err">%s</div>`, htmlEscape(last))
-	}
+	writeFooter(&buf, progress, walked, inserted, skipped, newestAnalyzedAt)
 
 	buf.WriteString(`</body></html>`)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = fmt.Fprint(w, buf.String()) //nolint:errcheck // best-effort HTTP response
+}
+
+// writeFooter renders the pipeline summary footer and last-error line.
+func writeFooter(buf *strings.Builder, progress *loadProgress, walked, inserted, skipped int64, newestAnalyzedAt time.Time) {
+	cacheHits := progress.cacheHits.Load()
+	tooSmall := progress.tooSmall.Load()
+	tooLarge := progress.tooLarge.Load()
+	errs := progress.errors.Load()
+	lastCompleted := ""
+	if !newestAnalyzedAt.IsZero() {
+		lastCompleted = fmt.Sprintf(` &middot; last completed %s ago`, shortDuration(time.Since(newestAnalyzedAt)))
+	}
+	var footerParts []string
+	walkStatus := "&hellip;"
+	if progress.walkDone.Load() {
+		walkStatus = "done"
+	}
+	dupes := max(skipped-cacheHits, 0)
+	footerParts = append(footerParts, fmt.Sprintf("%s walked (%s) &middot; %s known &middot; %s new &middot; %s inserted",
+		fmtN(walked), walkStatus, fmtN(cacheHits), fmtN(walked-cacheHits-tooSmall-tooLarge), fmtN(inserted)))
+	if dupes > 0 {
+		footerParts = append(footerParts, fmt.Sprintf("%s dupes", fmtN(dupes)))
+	}
+	if tooSmall+tooLarge > 0 {
+		footerParts = append(footerParts, fmt.Sprintf("%s filtered", fmtN(tooSmall+tooLarge)))
+	}
+	if errs > 0 {
+		footerParts = append(footerParts, fmt.Sprintf("%s errors", fmtN(errs)))
+	}
+	footer := strings.Join(footerParts, " &middot; ")
+	footer += lastCompleted
+	fmt.Fprintf(buf, `<footer>%s</footer>`, footer)
+
+	// Last error at the bottom, untruncated.
+	if last, ok := progress.lastErr.Load().(string); ok && last != "" {
+		fmt.Fprintf(buf, `<div class="err">%s</div>`, htmlEscape(last))
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -645,10 +666,5 @@ func shortDuration(d time.Duration) string {
 }
 
 func htmlEscape(s string) string {
-	s = strings.ReplaceAll(s, "&", "&amp;")
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	s = strings.ReplaceAll(s, "\"", "&quot;")
-	s = strings.ReplaceAll(s, "'", "&#39;")
-	return s
+	return html.EscapeString(s)
 }

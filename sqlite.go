@@ -257,7 +257,8 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 			score, max_crit, suspicious_count, mtime, marker_mtime)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?)
-		ON CONFLICT (sha256) DO NOTHING`,
+		ON CONFLICT (sha256) DO UPDATE SET path = excluded.path, mtime = excluded.mtime
+			WHERE samples.path != excluded.path`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.SHA256, s.Parent, s.Skip, s.Formula, s.Elements,
@@ -298,7 +299,8 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		`
 		INSERT INTO samples (%s)
 		VALUES (%s)
-		ON CONFLICT (sha256) DO NOTHING`,
+		ON CONFLICT (sha256) DO UPDATE SET path = excluded.path, mtime = excluded.mtime
+			WHERE samples.path != excluded.path`,
 		strings.Join(cols, ", "),
 		strings.Join(placeholders, ", "))
 

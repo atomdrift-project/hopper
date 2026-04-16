@@ -116,9 +116,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	cleanup, err := setupLogging()
+	logPath, cleanup, err := setupLogging()
 	if err != nil {
 		writeStderrf("failed to setup logging: %v\n", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "log: %s\n", logPath) //nolint:forbidigo // startup info before slog is configured
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -198,21 +200,22 @@ func xdgLogDir() string {
 	return ".hopper" // Fallback
 }
 
-func setupLogging() (func(), error) {
+func setupLogging() (logPath string, cleanup func(), err error) {
 	dir := xdgLogDir()
 	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
-	logPath := filepath.Join(dir, "hopper.log")
+	logPath = filepath.Join(dir, "hopper.log")
 	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
 	// Use a handler that writes to both stderr and the log file.
-	// Levels are dynamic so the dashboard can suppress noise at runtime.
+	// Console gets Warn+ only; Info/Debug go to the log file.
 	stderrLevel := &slog.LevelVar{}
+	stderrLevel.Set(slog.LevelWarn)
 	fileLevel := &slog.LevelVar{}
 	h := &multiHandler{
 		h1: slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: stderrLevel}),
@@ -220,18 +223,8 @@ func setupLogging() (func(), error) {
 	}
 	slog.SetDefault(slog.New(h))
 
-	logLevels = &logLevelControl{stderr: stderrLevel, file: fileLevel}
-
-	return func() { closeFileBestEffort(logPath, f) }, nil
+	return logPath, func() { closeFileBestEffort(logPath, f) }, nil
 }
-
-// logLevelControl allows runtime adjustment of log levels.
-type logLevelControl struct {
-	stderr, file *slog.LevelVar
-}
-
-// logLevels is set by setupLogging and used by the dashboard to quiet noisy messages.
-var logLevels *logLevelControl
 
 type multiHandler struct {
 	h1, h2 slog.Handler
@@ -242,8 +235,13 @@ func (m *multiHandler) Enabled(ctx context.Context, l slog.Level) bool {
 }
 
 func (m *multiHandler) Handle(ctx context.Context, r slog.Record) error { //nolint:gocritic // matches slog.Handler interface
-	err1 := m.h1.Handle(ctx, r)
-	err2 := m.h2.Handle(ctx, r)
+	var err1, err2 error
+	if m.h1.Enabled(ctx, r.Level) {
+		err1 = m.h1.Handle(ctx, r)
+	}
+	if m.h2.Enabled(ctx, r.Level) {
+		err2 = m.h2.Handle(ctx, r)
+	}
 	if err1 != nil {
 		return err1
 	}
@@ -456,6 +454,15 @@ func cmdLoad(ctx context.Context) error { //nolint:revive,maintidx // complex co
 		return errors.New("pass --data <directory> (expects bad/, good/, unknown/ subdirectories)")
 	}
 
+	// Resolve symlinks and make absolute early so that all paths derived
+	// from dataDir (loadDirs, DB rows, API prefix stripping) are consistent.
+	if resolved, err := filepath.EvalSymlinks(*dataDir); err == nil {
+		*dataDir = resolved
+	}
+	if abs, err := filepath.Abs(*dataDir); err == nil {
+		*dataDir = abs
+	}
+
 	cleaveBinary = *cleaveBinFlag
 
 	// Start the web dashboard first so it's reachable while everything
@@ -524,6 +531,8 @@ func cmdLoad(ctx context.Context) error { //nolint:revive,maintidx // complex co
 			TimeoutSecs: *analysisTimeout,
 			Verbose:     *litmusVerbose,
 		})
+		litmus.tracker = tracker
+		litmus.workerName = "local"
 		go func() {
 			litmusCh <- litmusResult{err: litmus.Start(ctx)}
 		}()
@@ -548,6 +557,13 @@ func cmdLoad(ctx context.Context) error { //nolint:revive,maintidx // complex co
 		"experiment", *experimentTag)
 
 	go updateSiblingTool(ctx, "cleave", "../cleave")
+
+	// Start file enumeration early — cleave iter-files doesn't need the
+	// hash cache or database, so overlap it with those slower init steps.
+	fileChs := make([]<-chan labeledPath, len(loadDirs))
+	for i, d := range loadDirs {
+		fileChs[i] = startEnumeration(ctx, d.dir)
+	}
 
 	type cacheResult struct {
 		cache *hashCache
@@ -642,20 +658,20 @@ func cmdLoad(ctx context.Context) error { //nolint:revive,maintidx // complex co
 			allowedDirs = append(allowedDirs, abs)
 		}
 	}
-	absDataDir, _ := filepath.EvalSymlinks(*dataDir) //nolint:errcheck // best-effort resolve; falls back to Abs below
-	if absDataDir == "" {
-		absDataDir, _ = filepath.Abs(*dataDir) //nolint:errcheck // best-effort resolve; raw path is acceptable fallback
-	}
+	// dataDir was already resolved (symlinks + absolute) at startup.
 	api.db = db
-	api.dataRoot = absDataDir
+	api.dataRoot = *dataDir
 	api.allowedDirs = allowedDirs
 
-	total := loadAll(loadCtx, loadCancel, db, litmus, tracker, api, cache, loadDirs, *source, *hashWorkers, *rescan, *maxAnalyzed, *experimentTag, wd)
+	total := loadAll(loadCtx, loadCancel, db, litmus, tracker, api, cache, loadDirs, fileChs, *source, *hashWorkers, *rescan, *maxAnalyzed, *experimentTag, wd)
 	slog.Info("file walk complete, serving API until interrupted", "samples", total)
 
 	// Block until interrupted — workers are still draining the analysis queue.
-	<-ctx.Done()
-	slog.Info("shutting down")
+	// Without litmus there's nothing left to wait for.
+	if litmus != nil {
+		<-ctx.Done()
+		slog.Info("shutting down")
+	}
 	return nil
 }
 
@@ -676,6 +692,8 @@ type loadProgress struct { //nolint:govet // counters are grouped by pipeline st
 	queued      atomic.Int64 // items sent for analysis
 	walkedPaths sync.Map     // path → struct{}: all paths seen by iter-files
 
+	walkDone atomic.Bool // true once all enumeration channels are drained
+
 	lastErr atomic.Value // string
 
 	// Per-analysis timing (nanoseconds).
@@ -686,7 +704,7 @@ type loadProgress struct { //nolint:govet // counters are grouped by pipeline st
 }
 
 const (
-	loadBatchSize      = 500
+	loadBatchSize      = 2000
 	minFileSize        = 13                // skip trivially small files (markers, empty, etc.)
 	defaultMaxFileSize = 100 * 1024 * 1024 // 100 MiB
 )
@@ -715,6 +733,7 @@ func loadAll( //nolint:revive // many params reflect the many subsystems coordin
 	api *apiServer,
 	cache *hashCache,
 	dirs []struct{ dir, label string },
+	fileChs []<-chan labeledPath,
 	source string,
 	nworkers int,
 	_ bool,
@@ -735,8 +754,15 @@ func loadAll( //nolint:revive // many params reflect the many subsystems coordin
 	var startAnalyzed int64
 	if n, err := db.CountAnalyzed(ctx); err == nil {
 		progress.analyzed.Store(n)
-		progress.queued.Store(n)
 		startAnalyzed = n
+	}
+	// Initialize queued to analyzed + pending so the denominator reflects all
+	// work from prior runs. Without this, pre-existing unanalyzed samples
+	// cause analyzed to exceed queued, producing ">100%" progress.
+	if pending, err := db.CountPending(ctx); err == nil {
+		progress.queued.Store(startAnalyzed + pending)
+	} else {
+		progress.queued.Store(startAnalyzed)
 	}
 
 	// Progress dashboard — runs until ctx is cancelled (ctrl-C).
@@ -749,52 +775,85 @@ func loadAll( //nolint:revive // many params reflect the many subsystems coordin
 		wd.configure(&progress, litmus, tracker, db, start, startAnalyzed, maxAnalyzed, len(dirs))
 	}
 
-	// Per-directory pipelines: cleave→hash→batch→insert.
-	// Analysis happens via the pull API — workers claim from the DB.
-	sem := make(chan struct{}, max(1, nworkers))
-	var pipeWG sync.WaitGroup
-	for _, d := range dirs {
-		pipeWG.Go(func() {
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				return
+	// runWalk executes one full enumeration→hash→insert pass across all dirs.
+	runWalk := func(chs []<-chan labeledPath) {
+		if chs == nil {
+			chs = make([]<-chan labeledPath, len(dirs))
+			for i, d := range dirs {
+				chs[i] = startEnumeration(ctx, d.dir)
 			}
-			runDirPipeline(ctx, db, d, source, cache, &progress, false)
-		})
-	}
-	pipeWG.Wait()
-
-	// Mark samples whose files are gone or filtered out by iter-files.
-	walkedSet := make(map[string]struct{})
-	progress.walkedPaths.Range(func(k, _ any) bool {
-		if s, ok := k.(string); ok {
-			walkedSet[s] = struct{}{}
 		}
-		return true
-	})
-	if marked, err := db.MarkMissingSamples(ctx, walkedSet); err != nil {
-		slog.Error("mark missing samples failed", "error", err)
-	} else if marked > 0 {
-		slog.Info("marked stale samples", "count", marked)
+
+		sem := make(chan struct{}, max(1, nworkers))
+		var pipeWG sync.WaitGroup
+		for i, d := range dirs {
+			ch := chs[i]
+			pipeWG.Go(func() {
+				select {
+				case sem <- struct{}{}:
+					defer func() { <-sem }()
+				case <-ctx.Done():
+					return
+				}
+				runDirPipeline(ctx, db, d, source, cache, &progress, ch)
+			})
+		}
+		pipeWG.Wait()
+		progress.walkDone.Store(true)
+
+		// Mark samples whose files are gone or filtered out by iter-files.
+		walkedSet := make(map[string]struct{})
+		progress.walkedPaths.Range(func(k, _ any) bool {
+			if s, ok := k.(string); ok {
+				walkedSet[s] = struct{}{}
+			}
+			return true
+		})
+		if marked, err := db.MarkMissingSamples(ctx, walkedSet); err != nil {
+			slog.Error("mark missing samples failed", "error", err)
+		} else if marked > 0 {
+			slog.Info("marked stale samples", "count", marked)
+		}
+
+		logLoadSummary(start, experimentTag, dirs, &progress)
 	}
 
-	logLoadSummary(start, experimentTag, dirs, &progress)
+	// Initial walk uses pre-started enumeration channels (if provided).
+	runWalk(fileChs)
 
-	// Keep the dashboard running — workers are still analyzing.
-	// The dashboard goroutine exits when ctx is cancelled (ctrl-C).
-	dashWG.Wait()
+	// Re-walk periodically to pick up new files while workers analyze.
+	if litmus != nil {
+		go func() {
+			ticker := time.NewTicker(10 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					progress.walkDone.Store(false)
+					slog.Info("starting periodic re-walk")
+					runWalk(nil)
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	// If there's a litmus server, keep the dashboard running — analysis
+	// is still in progress via the pull API. The dashboard goroutine exits
+	// when ctx is cancelled (ctrl-C). Without litmus there's nothing to
+	// wait for (remote workers also need the server to stay up).
+	if litmus != nil {
+		dashWG.Wait()
+	}
 
 	return int(progress.inserted.Load() + progress.skipped.Load())
 }
 
-// runDirPipeline is the entire load pipeline for one labeled directory:
-// enumerate via cleave, hash each file (respecting the cache and marker
-// conventions), batch into the samples table, and queue the rows that need
-// analysis. Everything runs sequentially in this one goroutine so batches
-// stay coherent without cross-goroutine plumbing; parallelism comes from
-// running one instance per directory.
+// runDirPipeline is the hash→batch→insert pipeline for one labeled directory,
+// fed by a pre-started enumeration channel. Everything runs sequentially in
+// this one goroutine so batches stay coherent without cross-goroutine plumbing;
+// parallelism comes from running one instance per directory.
 func runDirPipeline(
 	ctx context.Context,
 	db *hopper.DB,
@@ -802,7 +861,7 @@ func runDirPipeline(
 	source string,
 	cache *hashCache,
 	progress *loadProgress,
-	_ bool,
+	fileCh <-chan labeledPath,
 ) {
 	batch := make([]*hopper.Sample, 0, loadBatchSize)
 	batchKeys := make([]cacheKey, 0, loadBatchSize)
@@ -840,13 +899,12 @@ func runDirPipeline(
 	}
 	defer flush()
 
-	slog.Info("listing files", "dir", target.dir, "label", target.label)
-	err := pathLister(ctx, target.dir, func(lp labeledPath) bool {
+	for lp := range fileCh {
 		if ctx.Err() != nil {
-			return false
+			break
 		}
 		if isMarkerFile(filepath.Base(lp.path)) {
-			return true
+			continue
 		}
 		lp.label = target.label
 		progress.walked.Add(1)
@@ -865,7 +923,7 @@ func runDirPipeline(
 				progress.lastErr.Store(fmt.Sprintf("hash: %s: %v", filepath.Base(lp.path), err))
 				slog.Warn("hash failed", "path", lp.path, "error", err)
 			}
-			return true
+			continue
 		}
 
 		progress.hashed.Add(1)
@@ -874,7 +932,7 @@ func runDirPipeline(
 		// Marker changes are picked up on the next full scan (--rescan or cache miss).
 		if hr.inserted {
 			progress.skipped.Add(1)
-			return true
+			continue
 		}
 
 		sample := hr.sample
@@ -901,10 +959,6 @@ func runDirPipeline(
 		if len(batch) >= loadBatchSize {
 			flush()
 		}
-		return true
-	})
-	if err != nil {
-		slog.Warn("list files failed", "dir", target.dir, "error", err)
 	}
 }
 
@@ -926,20 +980,16 @@ func runDashboard( //nolint:gocognit,revive,maintidx // complex dashboard loop w
 	interval := 10 * time.Second
 	if !isTTY() {
 		interval = 30 * time.Second
-	} else if logLevels != nil {
-		// TTY dashboard replaces log output; suppress everything below ERROR
-		// so the log file isn't filled with repetitive status warnings.
-		logLevels.stderr.Set(slog.LevelError)
-		logLevels.file.Set(slog.LevelError)
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	// Ring buffer for 15-minute rolling rate (one sample per tick).
 	type sample struct {
-		t      time.Time
-		byNode map[string]int64 // keyed by worker name
-		count  int64
+		t        time.Time
+		byNode   map[string]int64 // keyed by worker name
+		count    int64            // session analyzed
+		inserted int64            // session inserted (new DB rows)
 	}
 	const maxSamples = 120 // 10s * 120 = 20 minutes of history
 	var samples []sample
@@ -976,14 +1026,24 @@ func runDashboard( //nolint:gocognit,revive,maintidx // complex dashboard loop w
 		skipped := progress.skipped.Load()
 		hashDone := hashedN + progress.tooSmall.Load() + progress.tooLarge.Load() + progress.hashErrors.Load()
 
-		analyzeTarget := max(progress.queued.Load()-startAnalyzed, 0)
-		if maxAnalyzed > 0 && int64(maxAnalyzed) < analyzeTarget {
-			analyzeTarget = int64(maxAnalyzed)
+		// totalInDB = all samples in the database (analyzed + pending).
+		totalInDB := progress.queued.Load()
+		// totalExpected adds files still in the walk→hash→insert pipeline
+		// that haven't reached the DB yet. This prevents premature 100%.
+		insertDone := inserted + skipped + progress.tooSmall.Load() + progress.tooLarge.Load() + progress.hashErrors.Load()
+		inPipeline := max(walked-insertDone, 0)
+		totalExpected := totalInDB
+		if !progress.walkDone.Load() || inPipeline > 0 {
+			totalExpected += inPipeline
+		}
+		pending := max(totalExpected-analyzedAbs, 0)
+		if maxAnalyzed > 0 && int64(maxAnalyzed) < pending {
+			pending = int64(maxAnalyzed)
 		}
 
 		// Record sample (with per-worker counts) and compute 15-minute rolling rates.
 		now := time.Now()
-		s := sample{t: now, count: sessionAnalyzed}
+		s := sample{t: now, count: sessionAnalyzed, inserted: inserted}
 		if len(workers) > 0 {
 			s.byNode = make(map[string]int64, len(workers))
 			for i := range workers {
@@ -996,6 +1056,7 @@ func runDashboard( //nolint:gocognit,revive,maintidx // complex dashboard loop w
 		}
 
 		var rate15m float64
+		var insertRate15m float64
 		var nodeRates map[string]float64
 		if len(samples) >= 2 {
 			cutoff := now.Add(-15 * time.Minute)
@@ -1008,6 +1069,7 @@ func runDashboard( //nolint:gocognit,revive,maintidx // complex dashboard loop w
 			}
 			if dt := now.Sub(oldest.t).Seconds(); dt > 5 {
 				rate15m = max(float64(sessionAnalyzed-oldest.count)/dt, 0)
+				insertRate15m = max(float64(inserted-oldest.inserted)/dt, 0)
 				latest := samples[len(samples)-1]
 				if len(latest.byNode) > 0 {
 					nodeRates = make(map[string]float64, len(latest.byNode))
@@ -1020,21 +1082,18 @@ func runDashboard( //nolint:gocognit,revive,maintidx // complex dashboard loop w
 			}
 		}
 
-		totalTarget := startAnalyzed + analyzeTarget
-		totalDone := startAnalyzed + sessionAnalyzed
-
 		if !isTTY() {
 			attrs := []any{
 				"dirs", ndirs,
 				"walked", walked, "hashed", hashedN,
 				"inserted", inserted, "skipped", skipped,
-				"analyzed", sessionAnalyzed, "errors", progress.errors.Load(),
+				"analyzed", analyzedAbs, "pending", pending, "errors", progress.errors.Load(),
 			}
 			if walked > 0 {
 				attrs = append(attrs, "hash_pct", fmt.Sprintf("%.0f%%", float64(hashDone)/float64(walked)*100))
 			}
-			if analyzeTarget > 0 {
-				attrs = append(attrs, "analyze_pct", fmt.Sprintf("%.0f%%", float64(sessionAnalyzed)/float64(analyzeTarget)*100))
+			if totalExpected > 0 {
+				attrs = append(attrs, "analyze_pct", fmt.Sprintf("%.0f%%", float64(analyzedAbs)/float64(totalExpected)*100))
 			}
 			if rate15m > 0 {
 				attrs = append(attrs, "rate_15m", fmt.Sprintf("%.1f/s", rate15m))
@@ -1042,9 +1101,8 @@ func runDashboard( //nolint:gocognit,revive,maintidx // complex dashboard loop w
 			if elapsed := time.Since(start).Seconds(); elapsed > 5 && sessionAnalyzed > 0 {
 				attrs = append(attrs, "rate_overall", fmt.Sprintf("%.1f/s", float64(sessionAnalyzed)/elapsed))
 			}
-			if rate15m > 0.1 && analyzeTarget > sessionAnalyzed {
-				remaining := analyzeTarget - sessionAnalyzed
-				etaDur := time.Duration(float64(remaining)/rate15m) * time.Second
+			if rate15m > 0.1 && pending > 0 {
+				etaDur := time.Duration(float64(pending)/rate15m) * time.Second
 				attrs = append(attrs, "eta", formatETA(etaDur))
 			}
 			slog.Info("load progress", attrs...)
@@ -1054,15 +1112,14 @@ func runDashboard( //nolint:gocognit,revive,maintidx // complex dashboard loop w
 
 		// TTY dashboard
 		var etaStr string
-		if rate15m > 0.1 && analyzeTarget > sessionAnalyzed {
-			remaining := analyzeTarget - sessionAnalyzed
-			etaDur := time.Duration(float64(remaining)/rate15m) * time.Second
+		if rate15m > 0.1 && pending > 0 {
+			etaDur := time.Duration(float64(pending)/rate15m) * time.Second
 			etaStr = formatETA(etaDur)
 		}
 
 		pct := 0.0
-		if totalTarget > 0 {
-			pct = float64(totalDone) / float64(totalTarget) * 100
+		if totalExpected > 0 {
+			pct = float64(analyzedAbs) / float64(totalExpected) * 100
 			if pct > 100 {
 				pct = 100
 			}
@@ -1070,19 +1127,36 @@ func runDashboard( //nolint:gocognit,revive,maintidx // complex dashboard loop w
 
 		writeStdout("\033[H\033[2J")
 
-		// Header line: app name, elapsed, progress, rate, ETA
 		elapsed := time.Since(start)
-		header := fmt.Sprintf("\033[1mhopper\033[0m  %s", elapsed.Round(time.Second))
-		right := fmt.Sprintf("%s / %s  %.0f%%", fmtN(totalDone), fmtN(totalTarget), pct)
+
+		// Line 1: analysis progress
+		analysisLine := fmt.Sprintf(
+			"\033[1mhopper\033[0m  %s    %s / %s analyzed  %.0f%%",
+			elapsed.Round(time.Second),
+			fmtN(analyzedAbs), fmtN(totalExpected), pct)
 		if rate15m > 0.1 {
-			right += fmt.Sprintf("  %.1f/s (15m avg)", rate15m)
+			analysisLine += fmt.Sprintf("  %.1f/s", rate15m)
 		}
 		if etaStr != "" {
-			right += "  ETA " + etaStr
+			analysisLine += "  ETA " + etaStr
 		}
-		// Pad to ~80 columns.
-		pad := max(78-len(header)-len(right)+8, 2) // +8 for ANSI escape codes
-		writeStdoutf("%s%s%s\n\n", header, strings.Repeat(" ", pad), right)
+		writeStdoutf("%s\n", analysisLine)
+
+		// Line 2: discovery progress (walked files → DB rows)
+		discoveryLine := fmt.Sprintf(
+			"  %s / %s in db",
+			fmtN(totalInDB), fmtN(walked))
+		if walked > 0 {
+			discoveryLine += fmt.Sprintf("  %.0f%%",
+				math.Min(float64(totalInDB)/float64(walked)*100, 100))
+		}
+		if insertRate15m > 0.1 {
+			discoveryLine += fmt.Sprintf("  %.1f/s new", insertRate15m)
+		}
+		if !progress.walkDone.Load() {
+			discoveryLine += "  walking\u2026"
+		}
+		writeStdoutf("%s\n", discoveryLine)
 
 		// Workers
 		if len(workers) > 0 {
@@ -1092,7 +1166,7 @@ func runDashboard( //nolint:gocognit,revive,maintidx // complex dashboard loop w
 					nameWidth = len(workers[i].Name)
 				}
 			}
-			writeStdoutf("\n  \033[2m  %-*s  tasks  claimed    rate  analyzed  errors  oldest job\033[0m\n",
+			writeStdoutf("\n  \033[2m  %-*s  tasks    seen    rate  analyzed  errors  oldest job\033[0m\n",
 				nameWidth, "worker")
 
 			sort.Slice(workers, func(i, j int) bool { return workers[i].Name < workers[j].Name })
@@ -1111,9 +1185,11 @@ func runDashboard( //nolint:gocognit,revive,maintidx // complex dashboard loop w
 					oldestStr = fmt.Sprintf("  %s (%s)", filepath.Base(claim.Path), shortDuration(age))
 				}
 
-				line := fmt.Sprintf("  %s %-*s  %3d/%d  %6s  %s  %8s  %s",
+				seenStr := fmt.Sprintf("%5s", shortDuration(idle))
+
+				line := fmt.Sprintf("  %s %-*s  %3d/%d  %s  %s  %8s  %s",
 					dot, nameWidth, workers[i].Name,
-					workers[i].ActiveClaims, workers[i].Slots, fmtN(workers[i].TotalClaimed), rateStr,
+					workers[i].ActiveClaims, workers[i].Slots, seenStr, rateStr,
 					fmtN(workers[i].Analyzed), fmtN(workers[i].Errors))
 				if oldestStr != "" {
 					line += oldestStr
@@ -1125,13 +1201,34 @@ func runDashboard( //nolint:gocognit,revive,maintidx // complex dashboard loop w
 			}
 		}
 
-		// Footer
+		// Footer: pipeline summary showing how walked files flow into analysis.
+		cacheHits := progress.cacheHits.Load()
+		tooSmall := progress.tooSmall.Load()
+		tooLarge := progress.tooLarge.Load()
+		errs := progress.errors.Load()
 		lastCompleted := ""
 		if !newestAnalyzedAt.IsZero() {
 			lastCompleted = fmt.Sprintf(" · last completed %s ago", shortDuration(time.Since(newestAnalyzedAt)))
 		}
-		writeStdoutf("\n  %s errors · %s walked · %s cache hits%s\n",
-			fmtN(progress.errors.Load()), fmtN(walked), fmtN(progress.cacheHits.Load()), lastCompleted)
+		walkStatus := "…"
+		if progress.walkDone.Load() {
+			walkStatus = "done"
+		}
+		// skipped includes both cache-hit skips and batch-insert dupes;
+		// subtract cache hits to show only the batch-insert dupes.
+		dupes := max(skipped-cacheHits, 0)
+		writeStdoutf("\n  %s walked (%s) · %s known · %s new · %s inserted",
+			fmtN(walked), walkStatus, fmtN(cacheHits), fmtN(walked-cacheHits-tooSmall-tooLarge), fmtN(inserted))
+		if dupes > 0 {
+			writeStdoutf(" · %s dupes", fmtN(dupes))
+		}
+		if tooSmall+tooLarge > 0 {
+			writeStdoutf(" · %s filtered", fmtN(tooSmall+tooLarge))
+		}
+		if errs > 0 {
+			writeStdoutf(" · %s errors", fmtN(errs))
+		}
+		writeStdoutf("%s\n", lastCompleted)
 
 		// Last error at the bottom, untruncated
 		if last, ok := progress.lastErr.Load().(string); ok && last != "" {
@@ -1279,6 +1376,29 @@ type labeledPath struct {
 // which case the lister returns early with a nil error. Tests override this
 // variable with a pure-Go walker that skips the real cleave binary.
 var pathLister = streamCleaveIterFiles
+
+// startEnumeration kicks off pathLister in a goroutine and streams results
+// into a channel so file enumeration can overlap with other startup work
+// (hash cache loading, DB migrations, etc.).
+func startEnumeration(ctx context.Context, dir string) <-chan labeledPath {
+	ch := make(chan labeledPath, 4096)
+	go func() {
+		defer close(ch)
+		slog.Info("listing files", "dir", dir)
+		err := pathLister(ctx, dir, func(lp labeledPath) bool {
+			select {
+			case ch <- lp:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		})
+		if err != nil {
+			slog.Warn("list files failed", "dir", dir, "error", err)
+		}
+	}()
+	return ch
+}
 
 // cleaveBinary is the path (or name, for $PATH lookup) of the cleave binary
 // used for file enumeration. Set by the load command's --cleave flag.

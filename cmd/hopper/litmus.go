@@ -22,11 +22,15 @@ const restartRecoveryDelay = 15 * time.Second
 // litmusServer manages a local litmus worker subprocess. In pull mode,
 // litmus polls hopper's /api/next for work instead of hopper pushing
 // requests to it.
+const livenessTimeout = 25 * time.Minute
+
 type litmusServer struct {
 	cmd         *exec.Cmd
 	bin         string // path to litmus binary
 	hopperURL   string // hopper API base URL for the worker to poll
 	dataDir     string // data root for --data-dir
+	tracker     *workerTracker // for liveness checks
+	workerName  string         // qualified name used to look up in tracker
 	mu          sync.Mutex
 	maxRSSGB    int
 	maxWorkers  int
@@ -259,9 +263,16 @@ func (s *litmusServer) Stop() {
 	}
 }
 
-// Monitor watches the litmus process and restarts it on crash.
+// Monitor watches the litmus process and restarts it on crash or wedge.
+// A liveness watchdog kills litmus if the local worker hasn't checked in
+// within livenessTimeout, which triggers a restart via the normal crash path.
 // Blocks until ctx is cancelled or Stop is called.
 func (s *litmusServer) Monitor(ctx context.Context) error {
+	// Liveness watchdog: kill litmus if the local worker stops checking in.
+	if s.tracker != nil && s.workerName != "" {
+		go s.livenessWatchdog(ctx)
+	}
+
 	for {
 		pid := s.currentPID()
 		err := s.waitExit(ctx)
@@ -298,7 +309,10 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 			"error", err,
 			"restarts", restarts)
 
-		delay := time.Duration(1<<min(restarts-1, 4)) * time.Second
+		delay := time.Duration(1<<min(restarts-1, 7)) * time.Second // cap at 128s (~2min)
+		if delay > 2*time.Minute {
+			delay = 2 * time.Minute
+		}
 		slog.Info("restarting litmus server",
 			"previous_pid", pid,
 			"url", s.hopperURL,
@@ -351,6 +365,46 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 	}
 }
 
+// livenessWatchdog periodically checks whether the local worker has polled
+// hopper recently. If it hasn't checked in within livenessTimeout, the litmus
+// process is killed — Monitor will detect the exit and restart it.
+func (s *litmusServer) livenessWatchdog(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return
+		}
+		if s.stopped.Load() || s.building.Load() {
+			continue
+		}
+		lastSeen := s.tracker.lastSeen(s.workerName)
+		if lastSeen.IsZero() {
+			continue // worker hasn't registered yet (still starting up)
+		}
+		idle := time.Since(lastSeen)
+		if idle <= livenessTimeout {
+			continue
+		}
+		pid := s.currentPID()
+		if pid == 0 {
+			continue
+		}
+		slog.Warn("local litmus worker appears wedged, killing process",
+			"worker", s.workerName,
+			"last_seen", lastSeen.Format(time.RFC3339),
+			"idle", idle.Round(time.Second),
+			"pid", pid)
+		s.mu.Lock()
+		if s.cmd != nil && s.cmd.Process != nil {
+			_ = s.cmd.Process.Kill() //nolint:errcheck // best-effort; Monitor will handle the exit
+		}
+		s.mu.Unlock()
+	}
+}
+
 func (s *litmusServer) waitExit(ctx context.Context) error {
 	s.mu.Lock()
 	cmd := s.cmd
@@ -362,6 +416,12 @@ func (s *litmusServer) waitExit(ctx context.Context) error {
 	go func() { done <- cmd.Wait() }()
 	select {
 	case err := <-done:
+		// Clear cmd so we don't double-Wait on the same process.
+		s.mu.Lock()
+		if s.cmd == cmd {
+			s.cmd = nil
+		}
+		s.mu.Unlock()
 		return err
 	case <-ctx.Done():
 		return ctx.Err()

@@ -50,7 +50,7 @@ type dirtyEntry struct {
 	inserted bool
 }
 
-const writeBatchSize = 1000
+const writeBatchSize = 5000
 
 // openHashCache opens (or creates) a hash cache at the given path and
 // preloads all entries into memory for O(1) lookups.
