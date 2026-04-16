@@ -1,11 +1,11 @@
 # hopper <img src="media/logo-small.png" align="right" alt="hopper logo">
 
-Distributed malware analysis engine for the [atomdrift](https://codeberg.org/atomdrift) pipeline. Hopper catalogs samples, hands work out to a small army of [litmus](https://codeberg.org/atomdrift/litmus) workers, and keeps the database honest so downstream tools ([cyclotron](https://github.com/atomdrift/cyclotron), [collimator](https://codeberg.org/atomdrift/collimator)) have something solid to chew on.
+Job broker and sample store for the [atomdrift](https://codeberg.org/atomdrift) malware analysis pipeline. Hopper catalogs samples, distributes analysis work to [litmus](https://codeberg.org/atomdrift/litmus) workers, and publishes labeled results to [collimator](https://codeberg.org/atomdrift/collimator) for ML training.
 
 ```
   samples ──► hopper ◄──► litmus workers (pull jobs, return verdicts)
                  │
-                 └──► cyclotron (RE) · collimator (ML training)
+                 └──► collimator (ML training)
 ```
 
 Workers poll `/api/next`, fetch bytes from `/api/file/{sha256}`, and POST results to `/api/result`. Hopper tracks liveness, retries stuck jobs, and serves a dashboard so you can watch the swarm. Point as many `litmus` workers as you like at the hopper URL — they'll pull until the queue drains.
