@@ -182,7 +182,7 @@ const (
 	claimExpiry        = 30 * time.Minute
 	staleClaimAge      = 2 * time.Hour
 	maxWorkerNameLen   = 64
-	maxResultBodyBytes = 64 << 20 // 64 MiB — complex samples with many embedded binaries produce large cleave reports.
+	maxResultBodyBytes = 128 << 20 // 128 MiB — complex samples with many embedded binaries produce large cleave reports.
 	maxTrackedWorkers  = 200
 	apiQueryTimeout = 30 * time.Second
 )
@@ -333,13 +333,25 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxResultBodyBytes))
 	if err != nil {
+		slog.Warn("result rejected: read body failed", "error", err, "remote", r.RemoteAddr)
 		http.Error(w, `{"error":"read body"}`, http.StatusBadRequest)
 		return
 	}
 
 	var req resultRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		slog.Warn("result rejected: invalid json", "error", err, "body_len", len(body))
+		snippet := string(body)
+		if len(snippet) > 256 {
+			snippet = snippet[:128] + "..." + snippet[len(snippet)-128:]
+		}
+		truncated := int64(len(body)) >= maxResultBodyBytes
+		slog.Warn("result rejected: invalid json",
+			"error", err,
+			"remote", r.RemoteAddr,
+			"body_len", len(body),
+			"truncated", truncated,
+			"snippet", snippet,
+		)
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 		return
 	}
