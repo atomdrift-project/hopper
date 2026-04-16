@@ -1,81 +1,39 @@
-# hopper
+# hopper <img src="media/logo-small.png" align="right" alt="hopper logo">
 
-Sample registry for the [atomdrift](https://codeberg.org/atomdrift) malware analysis pipeline. Catalogs binaries, runs static analysis via [cleave](https://codeberg.org/atomdrift/cleave), and stores results for [cyclotron](https://github.com/atomdrift/cyclotron) (LLM-powered RE) and [collimator](https://codeberg.org/atomdrift/collimator) (ML training).
+Distributed malware analysis engine for the [atomdrift](https://codeberg.org/atomdrift) pipeline. Hopper catalogs samples, hands work out to a small army of [litmus](https://codeberg.org/atomdrift/litmus) workers, and keeps the database honest so downstream tools ([cyclotron](https://github.com/atomdrift/cyclotron), [collimator](https://codeberg.org/atomdrift/collimator)) have something solid to chew on.
 
 ```
-samples on disk ──→ hopper load ──→ hopper DB ←── cyclotron (RE + traits)
-                        │                │
-                     cleave              └──→ collimator (ML training)
-                   (auto-managed)
+  samples ──► hopper ◄──► litmus workers (pull jobs, return verdicts)
+                 │
+                 └──► cyclotron (RE) · collimator (ML training)
 ```
+
+Workers poll `/api/next`, fetch bytes from `/api/file/{sha256}`, and POST results to `/api/result`. Hopper tracks liveness, retries stuck jobs, and serves a dashboard so you can watch the swarm. Point as many `litmus` workers as you like at the hopper URL — they'll pull until the queue drains.
 
 ## Quick start
 
 ```bash
-# SQLite for small runs:
-hopper init --db samples.db
-hopper load --db samples.db --bad ./malware --good ./benign
+hopper init --db samples.db                       # SQLite, for a laptop
+hopper load --db samples.db --data ./samples      # expects bad/ good/ unknown/
 
-# Local postgres for larger work:
-hopper serve                          # starts postgres on :5433
-hopper load --bad ./malware --good ./benign   # uses DATABASE_URL
+hopper serve                                      # embedded postgres on :5433
+hopper load --data ./samples                      # uses DATABASE_URL
 ```
 
-Hopper auto-starts a cleave server, manages its memory, restarts it on crash, and parallelizes analysis. Pass `--rescan` to re-analyze samples that already have results.
+## Production deployment
 
-## Production PostgreSQL
-
-`hopper serve` runs a local single-user instance under `~/.hopper/pgdata`. For production, create a database on an existing PostgreSQL 17+ server:
+PostgreSQL 17+ is required (for `JSON_TABLE`, which collimator uses to dedupe embedded hashes). On the DB host:
 
 ```bash
-sudo -u postgres createuser --no-superuser --no-createdb --no-createrole hopper
-sudo -u postgres createdb --owner=hopper hopper
-sudo -u postgres psql -c "ALTER USER hopper WITH PASSWORD 'changeme';"
+sudo -u postgres psql -c "CREATE ROLE hopper LOGIN PASSWORD 'changeme'; \
+  CREATE DATABASE hopper OWNER hopper; ALTER ROLE hopper WITH REPLICATION;"
+echo 'localhost:5432:hopper:hopper:changeme' >> ~/.pgpass && chmod 600 ~/.pgpass
+hopper init                                       # applies migrations
+hopper load --data /srv/samples --dashboard-addr 0.0.0.0:8081   # HTTP API + dashboard
 ```
 
-Set up `~/.pgpass` so credentials stay out of your environment and shell history:
+Run the `hopper load` process under rc.d, systemd, or s6 — it stays up serving the worker API and dashboard. `hacks/rollout-bastille.sh` is a working FreeBSD/bastille rollout with tuned postgres, hourly `pg_dump` backups, and a `hopper_training` logical-replication publication for collimator subscribers. Imports use `COPY`-based bulk loads and resume with `--after <id>`.
 
-```bash
-# ~/.pgpass — chmod 600
-localhost:5432:hopper:hopper:changeme
-```
+## Commands & building
 
-The default `DATABASE_URL` is `postgres://hopper@localhost:5432/hopper`, so for a local database no environment variable is needed:
-
-```bash
-hopper load --bad ./malware --good ./benign        # load samples
-hopper import-legacy --from /path/to/cyclotron.db  # legacy cyclotron DB
-hopper import --from ./local.db                    # transfer between hopper DBs
-```
-
-All commands apply schema migrations automatically before writing.
-
-Override with `DATABASE_URL` or `--db` to point at a remote host.
-
-All import commands run migrations automatically and log progress with row IDs. If interrupted, pass `--after <id>` to resume. Imports use `COPY`-based bulk inserts with staging tables, so throughput is bounded by disk I/O rather than round-trips.
-
-PostgreSQL 17+ is required for `JSON_TABLE` support, which enables SQL-side queries against embedded file hashes in cleave results (used by collimator for train/test split dedup).
-
-## As a Go library
-
-```go
-db, _ := hopper.Open(ctx, "postgres://localhost:5433/hopper")
-defer db.Close()
-
-db.InsertSample(ctx, &hopper.Sample{SHA256: sha, Label: "bad", StoragePath: path})
-db.UpdateCleaveResult(ctx, sha, cleaveJSON, "hostile", 5)
-
-samples, _ := db.SamplesByStatus(ctx, "bad-review", 100)
-```
-
-PostgreSQL or SQLite — detected automatically from the DSN.
-
-## Building
-
-Requires Go 1.25+ with CGO enabled (for SQLite). PostgreSQL 17+.
-
-```bash
-make build    # produces ./hopper
-make test
-make lint
-```
+`serve`, `init`, `load`, `import`, `reset`, `stats`, `backfill`, `purge-unsupported`, `false-positives`, `false-negatives`, `bad-review`, `benign-review`. Run `hopper` for the full list. Build with Go 1.25+ and CGO: `make build && make test && make lint`.
