@@ -436,7 +436,6 @@ func cmdLoad(ctx context.Context) error { //nolint:revive,maintidx // complex co
 	litmusWorkers := f.Int("workers", 0, "concurrent analysis workers for the local litmus (0 = auto: min(2, cores/2))")
 	// Remote litmus workers self-register via the pull API; no --litmus-nodes flag needed.
 	maxRSSGB := f.Int("max-memory-gb", 0, "litmus RSS limit in GB (0 = auto)")
-	analysisTimeout := f.Int("analysis-timeout", 3600, "per-file analysis timeout in seconds (passed to litmus)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
@@ -523,13 +522,12 @@ func cmdLoad(ctx context.Context) error { //nolint:revive,maintidx // complex co
 			hopperURL = "http://" + addr
 		}
 		litmus = newLitmusServer(litmusConfig{
-			Bin:         *litmusBin,
-			HopperURL:   hopperURL,
-			DataDir:     *dataDir,
-			MaxRSSGB:    *maxRSSGB,
-			MaxWorkers:  *litmusWorkers,
-			TimeoutSecs: *analysisTimeout,
-			Verbose:     *litmusVerbose,
+			Bin:        *litmusBin,
+			HopperURL:  hopperURL,
+			DataDir:    *dataDir,
+			MaxRSSGB:   *maxRSSGB,
+			MaxWorkers: *litmusWorkers,
+			Verbose:    *litmusVerbose,
 		})
 		litmus.tracker = tracker
 		litmus.workerName = "local"
@@ -1276,6 +1274,12 @@ func logWorkerStatus(workers []namedWorkerStats, nodeRates map[string]float64, o
 		}
 		if r := nodeRates[workers[i].Name]; r > 0.05 {
 			attrs = append(attrs, "rate", fmt.Sprintf("%.1f/s", r))
+		}
+		if workers[i].RSSMB > 0 {
+			attrs = append(attrs, "rss_mb", workers[i].RSSMB)
+		}
+		if workers[i].Load1 > 0 {
+			attrs = append(attrs, "load1", fmt.Sprintf("%.2f", workers[i].Load1))
 		}
 		if claim, ok := oldestClaims[workers[i].Name]; ok {
 			attrs = append(attrs,

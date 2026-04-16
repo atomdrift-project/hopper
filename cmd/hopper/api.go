@@ -48,14 +48,16 @@ type workerStats struct { //nolint:govet // fields grouped logically, not by ali
 	Version      string
 	Traits       string
 	Slots        int
-	ActiveClaims int // jobs claimed but not yet returned
+	ActiveClaims int     // jobs claimed but not yet returned
+	RSSMB        int     // last reported RSS in MiB (0 = unknown)
+	Load1        float64 // last reported 1-minute load average (0 = unknown)
 }
 
 func newWorkerTracker() *workerTracker {
 	return &workerTracker{workers: make(map[string]*workerStats)}
 }
 
-func (wt *workerTracker) update(name string, slots int, version, traits string, claimed int) {
+func (wt *workerTracker) update(name string, slots int, version, traits string, claimed int, rssMB int, load1 float64) {
 	wt.mu.Lock()
 	defer wt.mu.Unlock()
 	ws, ok := wt.workers[name]
@@ -73,6 +75,8 @@ func (wt *workerTracker) update(name string, slots int, version, traits string, 
 	ws.Traits = traits
 	ws.ActiveClaims += claimed
 	ws.TotalClaimed += int64(claimed)
+	ws.RSSMB = rssMB
+	ws.Load1 = load1
 	if claimed > 0 {
 		ws.LastClaimed = now
 	}
@@ -249,10 +253,23 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	version := r.URL.Query().Get("version")
 	traits := r.URL.Query().Get("traits")
 
+	var rssMB int
+	if v := r.URL.Query().Get("rss_mb"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			rssMB = n
+		}
+	}
+	var load1 float64
+	if v := r.URL.Query().Get("load1"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			load1 = f
+		}
+	}
+
 	// Cap claims for workers that haven't returned any results yet.
 	if limit := s.tracker.claimLimit(worker); limit == 0 {
 		slog.Warn("unproven worker at active claim limit, waiting for results", "worker", worker, "active", s.tracker.activeClaims(worker)) //nolint:gosec // worker is sanitized by validWorkerName
-		s.tracker.update(worker, slots, version, traits, 0)
+		s.tracker.update(worker, slots, version, traits, 0, rssMB, load1)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	} else if count > limit {
@@ -270,7 +287,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update tracker with claim count so the dashboard knows the worker is active.
-	s.tracker.update(worker, slots, version, traits, len(jobs))
+	s.tracker.update(worker, slots, version, traits, len(jobs), rssMB, load1)
 
 	// Persist worker heartbeat to DB for crash recovery.
 	wk := hopper.Worker{Name: worker, Slots: slots, Version: version, Traits: traits}

@@ -408,6 +408,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 		buf.WriteString(`<section><div class="label">Workers</div>`)
 		buf.WriteString(`<table><thead><tr>` +
 			`<th>Worker</th><th>Tasks</th><th>Seen</th><th>Rate</th>` +
+			`<th>RSS</th><th>Load</th>` +
 			`<th>Analyzed</th><th>Errors</th><th>Oldest Job</th><th></th>` +
 			`</tr></thead><tbody>`)
 
@@ -430,6 +431,20 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 				rateStr = fmt.Sprintf("%.1f/s", nRate)
 			}
 
+			rssStr := "—"
+			if w.RSSMB > 0 {
+				if w.RSSMB >= 1024 {
+					rssStr = fmt.Sprintf("%.1f GB", float64(w.RSSMB)/1024)
+				} else {
+					rssStr = fmt.Sprintf("%d MB", w.RSSMB)
+				}
+			}
+
+			loadStr := "—"
+			if w.Load1 > 0 {
+				loadStr = fmt.Sprintf("%.2f", w.Load1)
+			}
+
 			oldestStr := "—"
 			if claim, ok := oldestClaims[w.Name]; ok {
 				age := time.Since(claim.ClaimedAt)
@@ -442,6 +457,8 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 					`<td class="hi">%d/%d</td>`+
 					`<td class="hi">%s</td>`+
 					`<td class="rate">%s</td>`+
+					`<td>%s</td>`+
+					`<td>%s</td>`+
 					`<td class="hi">%s</td>`+
 					`<td>%s</td>`+
 					`<td>%s</td>`+
@@ -451,6 +468,8 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
 				w.ActiveClaims, w.Slots,
 				shortDuration(idle),
 				rateStr,
+				rssStr,
+				loadStr,
 				fmtN(w.Analyzed),
 				fmtN(w.Errors),
 				htmlEscape(oldestStr),

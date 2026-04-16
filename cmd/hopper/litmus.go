@@ -25,32 +25,30 @@ const restartRecoveryDelay = 15 * time.Second
 const livenessTimeout = 25 * time.Minute
 
 type litmusServer struct {
-	cmd         *exec.Cmd
-	bin         string // path to litmus binary
-	hopperURL   string // hopper API base URL for the worker to poll
-	dataDir     string // data root for --data-dir
-	tracker     *workerTracker // for liveness checks
-	workerName  string         // qualified name used to look up in tracker
-	mu          sync.Mutex
-	maxRSSGB    int
-	maxWorkers  int
-	timeoutSecs int
-	verbose     bool
-	stopped     atomic.Bool
-	building    atomic.Bool
-	pid         atomic.Int64
-	restarts    atomic.Int64
+	cmd        *exec.Cmd
+	bin        string         // path to litmus binary
+	hopperURL  string         // hopper API base URL for the worker to poll
+	dataDir    string         // data root for --data-dir
+	tracker    *workerTracker // for liveness checks
+	workerName string         // qualified name used to look up in tracker
+	mu         sync.Mutex
+	maxRSSGB   int
+	maxWorkers int
+	verbose    bool
+	stopped    atomic.Bool
+	building   atomic.Bool
+	pid        atomic.Int64
+	restarts   atomic.Int64
 }
 
 // litmusConfig holds options for starting a litmus worker.
 type litmusConfig struct {
-	Bin         string // path to litmus binary (default: "litmus")
-	HopperURL   string // hopper API URL (e.g. http://127.0.0.1:8081)
-	DataDir     string // data root for local file access
-	MaxRSSGB    int    // memory limit in GB (0 = let litmus decide)
-	MaxWorkers  int    // max concurrent analysis workers
-	TimeoutSecs int    // per-request analysis timeout (0 = litmus default: 600s)
-	Verbose     bool   // enable debug logging in litmus
+	Bin        string // path to litmus binary (default: "litmus")
+	HopperURL  string // hopper API URL (e.g. http://127.0.0.1:8081)
+	DataDir    string // data root for local file access
+	MaxRSSGB   int    // memory limit in GB (0 = let litmus decide)
+	MaxWorkers int    // max concurrent analysis workers
+	Verbose    bool   // enable debug logging in litmus
 }
 
 func newLitmusServer(cfg litmusConfig) *litmusServer {
@@ -61,13 +59,12 @@ func newLitmusServer(cfg litmusConfig) *litmusServer {
 		cfg.MaxWorkers = max(2, runtime.NumCPU()/2)
 	}
 	return &litmusServer{
-		bin:         cfg.Bin,
-		hopperURL:   cfg.HopperURL,
-		dataDir:     cfg.DataDir,
-		maxRSSGB:    cfg.MaxRSSGB,
-		maxWorkers:  cfg.MaxWorkers,
-		timeoutSecs: cfg.TimeoutSecs,
-		verbose:     cfg.Verbose,
+		bin:        cfg.Bin,
+		hopperURL:  cfg.HopperURL,
+		dataDir:    cfg.DataDir,
+		maxRSSGB:   cfg.MaxRSSGB,
+		maxWorkers: cfg.MaxWorkers,
+		verbose:    cfg.Verbose,
 	}
 }
 
@@ -197,9 +194,6 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 	}
 	if s.maxRSSGB > 0 {
 		args = append(args, "--max-rss-gb", strconv.Itoa(s.maxRSSGB))
-	}
-	if s.timeoutSecs > 0 {
-		args = append(args, "--timeout-secs", strconv.Itoa(s.timeoutSecs))
 	}
 	if s.maxWorkers > 0 {
 		args = append(args, "--workers", strconv.Itoa(s.maxWorkers))
