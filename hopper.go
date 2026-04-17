@@ -777,14 +777,15 @@ func (db *DB) SamplesByStatus(ctx context.Context, status string, limit int) ([]
 	return db.samplesByStatusSQLite(ctx, status, limit)
 }
 
-// FalsePositives returns analyzed good-labeled samples with score >= threshold
-// (cleave detects them as bad). These are candidates for false-positive resolution.
+// FalsePositives returns analyzed good-labeled samples that trigger detection
+// (max_crit >= 5 OR suspicious_count >= 2). These are candidates for
+// false-positive resolution.
 // Only returns samples with empty status (not yet claimed by a pipeline).
-func (db *DB) FalsePositives(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+func (db *DB) FalsePositives(ctx context.Context, limit int) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.falsePositivesPG(ctx, scoreThreshold, limit)
+		return db.falsePositivesPG(ctx, limit)
 	}
-	return db.falsePositivesSQLite(ctx, scoreThreshold, limit)
+	return db.falsePositivesSQLite(ctx, limit)
 }
 
 // TruePositives returns analyzed bad-labeled samples with score >= threshold.
@@ -797,14 +798,15 @@ func (db *DB) TruePositives(ctx context.Context, scoreThreshold, limit int) ([]*
 	return db.truePositivesSQLite(ctx, scoreThreshold, limit)
 }
 
-// FalseNegatives returns analyzed bad-labeled samples with score <= threshold
-// (cleave does not detect them). These are candidates for gap-and-fix.
+// FalseNegatives returns analyzed bad-labeled samples that do not trigger
+// detection (max_crit < 5 AND suspicious_count < 2). These are candidates
+// for gap-and-fix.
 // Only returns samples with empty status (not yet claimed by a pipeline).
-func (db *DB) FalseNegatives(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+func (db *DB) FalseNegatives(ctx context.Context, limit int) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.falseNegativesPG(ctx, scoreThreshold, limit)
+		return db.falseNegativesPG(ctx, limit)
 	}
-	return db.falseNegativesSQLite(ctx, scoreThreshold, limit)
+	return db.falseNegativesSQLite(ctx, limit)
 }
 
 // BenignReview returns known-bad files that were flipped to good by a BENIGN
@@ -886,22 +888,22 @@ func (db *DB) SamplesByStatusInPaths(ctx context.Context, status string, prefixe
 	return db.samplesByStatusInPathsSQLite(ctx, status, prefixes, limit)
 }
 
-// FalsePositivesInPaths returns unlabeled-queue good samples under the given
-// prefixes whose cleave score is at or above scoreFloor and that are not marked skip.
-func (db *DB) FalsePositivesInPaths(ctx context.Context, prefixes []string, scoreFloor, limit int) ([]*Sample, error) {
+// FalsePositivesInPaths returns good-labeled samples under the given prefixes
+// that trigger detection, with empty status and not marked skip.
+func (db *DB) FalsePositivesInPaths(ctx context.Context, prefixes []string, limit int) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.falsePositivesInPathsPG(ctx, prefixes, scoreFloor, limit)
+		return db.falsePositivesInPathsPG(ctx, prefixes, limit)
 	}
-	return db.falsePositivesInPathsSQLite(ctx, prefixes, scoreFloor, limit)
+	return db.falsePositivesInPathsSQLite(ctx, prefixes, limit)
 }
 
-// FalseNegativesInPaths returns unlabeled-queue bad samples under the given
-// prefixes whose cleave score is at or below scoreCeiling and that are not marked skip.
-func (db *DB) FalseNegativesInPaths(ctx context.Context, prefixes []string, scoreCeiling, limit int) ([]*Sample, error) {
+// FalseNegativesInPaths returns bad-labeled samples under the given prefixes
+// that do not trigger detection, with empty status and not marked skip.
+func (db *DB) FalseNegativesInPaths(ctx context.Context, prefixes []string, limit int) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.falseNegativesInPathsPG(ctx, prefixes, scoreCeiling, limit)
+		return db.falseNegativesInPathsPG(ctx, prefixes, limit)
 	}
-	return db.falseNegativesInPathsSQLite(ctx, prefixes, scoreCeiling, limit)
+	return db.falseNegativesInPathsSQLite(ctx, prefixes, limit)
 }
 
 // CountByStatusInPaths returns sample counts grouped by status, filtered to

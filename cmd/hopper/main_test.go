@@ -1059,6 +1059,7 @@ func TestReviewCommands(t *testing.T) {
 				Score:       90,
 				Path:        "/samples/good/fp",
 			},
+			traits: `{"l":5,"c":1.0}`, // hostile -> triggers detection for FP
 		},
 		{
 			s: &hopper.Sample{

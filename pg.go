@@ -365,13 +365,13 @@ func (db *DB) samplesByStatusPG(ctx context.Context, status string, limit int) (
 	return scanPGSamples(rows)
 }
 
-func (db *DB) falsePositivesPG(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+func (db *DB) falsePositivesPG(ctx context.Context, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
-		 WHERE label = 'good' AND cleave_result IS NOT NULL AND score >= $1 AND status = '' AND skip = ''
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
 		   AND (max_crit >= 5 OR suspicious_count >= 2)
-		 ORDER BY score DESC LIMIT $2`,
-		scoreThreshold, limit)
+		 ORDER BY updated_at ASC LIMIT $1`,
+		limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: false positives: %w", err)
 	}
@@ -390,13 +390,13 @@ func (db *DB) truePositivesPG(ctx context.Context, scoreThreshold, limit int) ([
 	return scanPGSamples(rows)
 }
 
-func (db *DB) falseNegativesPG(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+func (db *DB) falseNegativesPG(ctx context.Context, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
-		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND score <= $1 AND status = '' AND skip = ''
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
 		   AND max_crit < 5 AND suspicious_count < 2
-		 ORDER BY score ASC LIMIT $2`,
-		scoreThreshold, limit)
+		 ORDER BY updated_at ASC LIMIT $1`,
+		limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: false negatives: %w", err)
 	}
@@ -480,15 +480,15 @@ func (db *DB) samplesByStatusInPathsPG(ctx context.Context, status string, prefi
 	return scanPGSamples(rows)
 }
 
-func (db *DB) falsePositivesInPathsPG(ctx context.Context, prefixes []string, scoreFloor, limit int) ([]*Sample, error) {
-	return db.seedCandidatesInPathsPG(ctx, prefixes, "good", ">=", scoreFloor, limit)
+func (db *DB) falsePositivesInPathsPG(ctx context.Context, prefixes []string, limit int) ([]*Sample, error) {
+	return db.seedCandidatesInPathsPG(ctx, prefixes, "good", limit)
 }
 
-func (db *DB) falseNegativesInPathsPG(ctx context.Context, prefixes []string, scoreCeiling, limit int) ([]*Sample, error) {
-	return db.seedCandidatesInPathsPG(ctx, prefixes, "bad", "<=", scoreCeiling, limit)
+func (db *DB) falseNegativesInPathsPG(ctx context.Context, prefixes []string, limit int) ([]*Sample, error) {
+	return db.seedCandidatesInPathsPG(ctx, prefixes, "bad", limit)
 }
 
-func (db *DB) seedCandidatesInPathsPG(ctx context.Context, prefixes []string, label, op string, score, limit int) ([]*Sample, error) {
+func (db *DB) seedCandidatesInPathsPG(ctx context.Context, prefixes []string, label string, limit int) ([]*Sample, error) {
 	if len(prefixes) == 0 {
 		return nil, nil
 	}
@@ -508,15 +508,14 @@ func (db *DB) seedCandidatesInPathsPG(ctx context.Context, prefixes []string, la
 		detectionFilter = "AND max_crit < 5 AND suspicious_count < 2"
 	}
 
-	//nolint:gosec // detectionFilter is a compile-time constant per branch, not user input
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
-		 WHERE status = '' AND label = $1 AND skip = '' AND score `+op+` $2
+		 WHERE status = '' AND label = $1 AND skip = ''
 		   AND cleave_result IS NOT NULL
-		   AND path LIKE ANY($3)
+		   AND path LIKE ANY($2)
 		   `+detectionFilter+`
-		 ORDER BY updated_at ASC LIMIT $4`,
-		label, score, patterns, limit)
+		 ORDER BY updated_at ASC LIMIT $3`,
+		label, patterns, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: seed candidates in paths: %w", err)
 	}

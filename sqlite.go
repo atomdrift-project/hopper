@@ -487,13 +487,13 @@ func (db *DB) samplesByStatusSQLite(ctx context.Context, status string, limit in
 	return scanLiteSamples(rows)
 }
 
-func (db *DB) falsePositivesSQLite(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+func (db *DB) falsePositivesSQLite(ctx context.Context, limit int) ([]*Sample, error) {
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples
-		 WHERE label = 'good' AND cleave_result IS NOT NULL AND score >= ? AND status = '' AND skip = ''
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
 		   AND (max_crit >= 5 OR suspicious_count >= 2)
-		 ORDER BY score DESC LIMIT ?`,
-		scoreThreshold, limit)
+		 ORDER BY updated_at ASC LIMIT ?`,
+		limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: false positives: %w", err)
 	}
@@ -512,13 +512,13 @@ func (db *DB) truePositivesSQLite(ctx context.Context, scoreThreshold, limit int
 	return scanLiteSamples(rows)
 }
 
-func (db *DB) falseNegativesSQLite(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+func (db *DB) falseNegativesSQLite(ctx context.Context, limit int) ([]*Sample, error) {
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples
-		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND score <= ? AND status = '' AND skip = ''
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
 		   AND max_crit < 5 AND suspicious_count < 2
-		 ORDER BY score ASC LIMIT ?`,
-		scoreThreshold, limit)
+		 ORDER BY updated_at ASC LIMIT ?`,
+		limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: false negatives: %w", err)
 	}
@@ -607,20 +607,20 @@ func (db *DB) samplesByStatusInPathsSQLite(ctx context.Context, status string, p
 	return scanLiteSamples(rows)
 }
 
-func (db *DB) falsePositivesInPathsSQLite(ctx context.Context, prefixes []string, scoreFloor, limit int) ([]*Sample, error) {
-	return db.seedCandidatesInPathsSQLite(ctx, prefixes, "good", ">=", scoreFloor, limit)
+func (db *DB) falsePositivesInPathsSQLite(ctx context.Context, prefixes []string, limit int) ([]*Sample, error) {
+	return db.seedCandidatesInPathsSQLite(ctx, prefixes, "good", limit)
 }
 
-func (db *DB) falseNegativesInPathsSQLite(ctx context.Context, prefixes []string, scoreCeiling, limit int) ([]*Sample, error) {
-	return db.seedCandidatesInPathsSQLite(ctx, prefixes, "bad", "<=", scoreCeiling, limit)
+func (db *DB) falseNegativesInPathsSQLite(ctx context.Context, prefixes []string, limit int) ([]*Sample, error) {
+	return db.seedCandidatesInPathsSQLite(ctx, prefixes, "bad", limit)
 }
 
-func (db *DB) seedCandidatesInPathsSQLite(ctx context.Context, prefixes []string, label, op string, score, limit int) ([]*Sample, error) {
+func (db *DB) seedCandidatesInPathsSQLite(ctx context.Context, prefixes []string, label string, limit int) ([]*Sample, error) {
 	if len(prefixes) == 0 {
 		return nil, nil
 	}
 	var clauses []string
-	args := []any{label, score}
+	args := []any{label}
 	for _, p := range prefixes {
 		clauses = append(clauses, "path GLOB ?")
 		args = append(args, p+"/*")
@@ -638,7 +638,7 @@ func (db *DB) seedCandidatesInPathsSQLite(ctx context.Context, prefixes []string
 	//nolint:gosec // query structure is built from constants, values are parameterized
 	query := `SELECT ` + liteSampleCols + ` FROM samples` +
 		` WHERE status = '' AND label = ? AND skip = ''` +
-		` AND score ` + op + ` ? AND cleave_result IS NOT NULL` +
+		` AND cleave_result IS NOT NULL` +
 		` AND (` + strings.Join(clauses, " OR ") + `)` +
 		detectionFilter +
 		` ORDER BY updated_at ASC LIMIT ?`

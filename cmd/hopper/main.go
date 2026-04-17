@@ -1826,15 +1826,15 @@ func sampleAgeDays(ts *time.Time) string {
 
 func cmdFalsePositives(ctx context.Context) error {
 	return runReviewCommand(ctx, os.Args[2:], "false-positives",
-		func(ctx context.Context, db *hopper.DB, score, limit int) ([]*hopper.Sample, error) {
-			return db.FalsePositives(ctx, score, limit)
+		func(ctx context.Context, db *hopper.DB, _, limit int) ([]*hopper.Sample, error) {
+			return db.FalsePositives(ctx, limit)
 		})
 }
 
 func cmdFalseNegatives(ctx context.Context) error {
 	return runReviewCommand(ctx, os.Args[2:], "false-negatives",
-		func(ctx context.Context, db *hopper.DB, score, limit int) ([]*hopper.Sample, error) {
-			return db.FalseNegatives(ctx, score, limit)
+		func(ctx context.Context, db *hopper.DB, _, limit int) ([]*hopper.Sample, error) {
+			return db.FalseNegatives(ctx, limit)
 		})
 }
 

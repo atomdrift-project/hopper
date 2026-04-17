@@ -331,7 +331,7 @@ func TestFalsePositivesInPaths(t *testing.T) {
 		Score:       90,
 	})
 
-	got, err := db.FalsePositivesInPaths(ctx, []string{"/data/good"}, 85, 10)
+	got, err := db.FalsePositivesInPaths(ctx, []string{"/data/good"}, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +396,7 @@ func TestFalseNegativesInPaths(t *testing.T) {
 		Score:       40,
 	})
 
-	got, err := db.FalseNegativesInPaths(ctx, []string{"/data/bad"}, 75, 10)
+	got, err := db.FalseNegativesInPaths(ctx, []string{"/data/bad"}, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
