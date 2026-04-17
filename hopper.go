@@ -137,7 +137,7 @@ type Sample struct {
 	SizeBytes       int64
 	Score           int // cleave raw score
 	MaxCrit         int // max trait criticality level (5=hostile, 4=suspicious, ...)
-	SuspiciousCount int // count of traits with level>=4 and confidence>=0.65
+	SuspiciousCount int // count of traits with level>=4 (suspicious or hostile)
 }
 
 // Report is an analysis report produced by cyclotron.
@@ -212,11 +212,7 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 			if t.Level > maxCrit {
 				maxCrit = t.Level
 			}
-			conf := t.Conf
-			if conf == 0 {
-				conf = 1.0
-			}
-			if conf >= 0.65 && t.Level >= 4 {
+			if t.Level >= 4 {
 				suspicious++
 			}
 		}
@@ -339,14 +335,10 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 		maxLevel := 0
 		suspiciousCount := 0
 		for _, t := range entry.Traits {
-			conf := t.Conf
-			if conf == 0 {
-				conf = 1.0
-			}
 			if t.Level > maxLevel {
 				maxLevel = t.Level
 			}
-			if conf >= 0.65 && t.Level >= 4 { // suspicious+
+			if t.Level >= 4 { // suspicious+
 				suspiciousCount++
 			}
 		}

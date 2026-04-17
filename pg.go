@@ -724,8 +724,7 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 				 FROM jsonb_array_elements(COALESCE(jt.ts, '[]'::jsonb)) AS tr) AS mc,
 				(SELECT COUNT(*)
 				 FROM jsonb_array_elements(COALESCE(jt.ts, '[]'::jsonb)) AS tr
-				 WHERE (tr->>'l')::int >= 4
-				   AND COALESCE((tr->>'c')::double precision, 1.0) >= 0.65) AS sc
+				 WHERE (tr->>'l')::int >= 4) AS sc
 			FROM samples s2,
 				JSON_TABLE(s2.cleave_result, '$.fs[*] ? (@.dp == 0)' COLUMNS (
 					f TEXT PATH '$.f',

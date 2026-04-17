@@ -148,6 +148,17 @@ func (wt *workerTracker) recordResult(name string, isError bool) {
 	}
 }
 
+// resetClaims zeroes ActiveClaims for the named worker. Call this when a
+// worker process is restarted so stale claims from the old process don't
+// permanently block the new one from receiving work.
+func (wt *workerTracker) resetClaims(name string) {
+	wt.mu.Lock()
+	defer wt.mu.Unlock()
+	if ws, ok := wt.workers[name]; ok {
+		ws.ActiveClaims = 0
+	}
+}
+
 // namedWorkerStats is workerStats with the worker name attached.
 type namedWorkerStats struct { //nolint:govet // embedding first is idiomatic.
 	workerStats
@@ -318,6 +329,22 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 			jobs[i].Path = strings.TrimPrefix(p, prefix)
 		}
 	}
+
+	// Drop jobs with empty paths — workers can't fetch or locate
+	// these files and they just produce cascading errors.
+	filtered := jobs[:0]
+	for _, j := range jobs {
+		if j.Path == "" || j.Path == "." {
+			slog.Warn("skipping job with empty path",
+				"worker", worker, "sha256", j.SHA256)
+			if err := s.db.SetSkip(ctx, j.SHA256, "empty_path"); err != nil {
+				slog.Error("mark empty_path failed", "sha256", j.SHA256, "error", err)
+			}
+			continue
+		}
+		filtered = append(filtered, j)
+	}
+	jobs = filtered
 
 	active := s.tracker.activeClaims(worker)
 	for _, j := range jobs {
@@ -527,7 +554,8 @@ func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	if !allowed {
 		//nolint:gosec // sha256 validated by validSHA256, path from DB lookup
 		slog.Warn("file request blocked: path outside allowed directories",
-			"sha256", sha, "path", sample.Path, "resolved", resolved)
+			"sha256", sha, "path", sample.Path, "resolved", resolved,
+			"remote", r.RemoteAddr, "allowed_dirs", s.allowedDirs)
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		return
 	}

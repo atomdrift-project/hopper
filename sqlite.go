@@ -852,8 +852,7 @@ func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 				 FROM json_each(je.value, '$.ts') te) AS mc,
 				(SELECT COUNT(*)
 				 FROM json_each(je.value, '$.ts') te
-				 WHERE CAST(json_extract(te.value, '$.l') AS INTEGER) >= 4
-				   AND COALESCE(CAST(json_extract(te.value, '$.c') AS REAL), 1.0) >= 0.65) AS sc
+				 WHERE CAST(json_extract(te.value, '$.l') AS INTEGER) >= 4) AS sc
 			FROM samples s, json_each(s.cleave_result, '$.fs') je
 			WHERE s.file_type = ''
 				AND s.cleave_result IS NOT NULL

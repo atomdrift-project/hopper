@@ -775,6 +775,18 @@ func loadAll( //nolint:revive // many params reflect the many subsystems coordin
 
 	// runWalk executes one full enumeration→hash→insert pass across all dirs.
 	runWalk := func(chs []<-chan labeledPath) {
+		// Reset walk-phase counters so they reflect the current pass, not a
+		// cumulative total across re-walks. The walkedPaths map is kept to
+		// accumulate the full set for MarkMissingSamples.
+		progress.walked.Store(0)
+		progress.hashed.Store(0)
+		progress.inserted.Store(0)
+		progress.skipped.Store(0)
+		progress.cacheHits.Store(0)
+		progress.tooSmall.Store(0)
+		progress.tooLarge.Store(0)
+		progress.hashErrors.Store(0)
+
 		if chs == nil {
 			chs = make([]<-chan labeledPath, len(dirs))
 			for i, d := range dirs {

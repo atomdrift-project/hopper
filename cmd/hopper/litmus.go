@@ -129,6 +129,9 @@ func (s *litmusServer) Start(ctx context.Context) error {
 		// same port — it is free because we kill the old process first,
 		// and keeping it stable avoids races with the pool and health
 		// checkers that already know the URL.
+		if s.tracker != nil && s.workerName != "" {
+			s.tracker.resetClaims(s.workerName)
+		}
 		s.mu.Lock()
 		if s.cmd != nil && s.cmd.Process != nil {
 			slog.Info("restarting litmus with updated binary", "pid", s.cmd.Process.Pid)
@@ -320,6 +323,12 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 
 		if s.stopped.Load() {
 			return nil
+		}
+
+		// Clear stale claims from the dead process so the new instance
+		// isn't starved by the unproven-worker claim limit.
+		if s.tracker != nil && s.workerName != "" {
+			s.tracker.resetClaims(s.workerName)
 		}
 
 		s.mu.Lock()
