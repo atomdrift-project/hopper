@@ -804,6 +804,70 @@ func TestInsertSampleBatch(t *testing.T) {
 	}
 }
 
+func TestInsertSampleBatchMarksReplaced(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Insert an unanalyzed sample at a known path.
+	mustInsert(t, ctx, db, &Sample{SHA256: "old1", Source: "test", Label: "bad", LabelSource: "test", Path: "/data/pkg.whl", SizeBytes: 100})
+
+	// Re-insert the same path with a different SHA256 (file was replaced on disk).
+	batch := []*Sample{
+		{SHA256: "new1", Source: "test", Label: "bad", LabelSource: "test", Path: "/data/pkg.whl", SizeBytes: 200},
+	}
+	_, _, err := db.InsertSampleBatch(ctx, batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The old row should be marked as replaced.
+	old, err := db.SampleBySHA256(ctx, "old1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.Skip != "replaced" {
+		t.Errorf("old sample skip = %q, want 'replaced'", old.Skip)
+	}
+
+	// The new row should remain claimable (skip empty).
+	nw, err := db.SampleBySHA256(ctx, "new1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nw.Skip != "" {
+		t.Errorf("new sample skip = %q, want empty", nw.Skip)
+	}
+}
+
+func TestInsertSampleBatchDoesNotReplaceAnalyzed(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Insert a sample and give it analysis results.
+	mustInsert(t, ctx, db, &Sample{SHA256: "analyzed1", Source: "test", Label: "bad", LabelSource: "test", Path: "/data/pkg2.whl", SizeBytes: 100})
+	cleave := []byte(`{"fs":[{"sha":"analyzed1","f":"H2O","x":5,"type":"zip","dp":0,"ts":[]}]}`)
+	if err := db.UpdateCleaveResult(ctx, "analyzed1", cleave, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Re-insert the same path with a different SHA256.
+	batch := []*Sample{
+		{SHA256: "new2", Source: "test", Label: "bad", LabelSource: "test", Path: "/data/pkg2.whl", SizeBytes: 200},
+	}
+	if _, _, err := db.InsertSampleBatch(ctx, batch); err != nil {
+		t.Fatal(err)
+	}
+
+	// The analyzed row should NOT be marked as replaced.
+	old, err := db.SampleBySHA256(ctx, "analyzed1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.Skip != "" {
+		t.Errorf("analyzed sample skip = %q, want empty", old.Skip)
+	}
+}
+
 func TestStaleSamples(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()

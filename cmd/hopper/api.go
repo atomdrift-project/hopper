@@ -327,6 +327,53 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate files before handing them to workers. Check that each
+	// file still exists and that its size matches the DB record. Files
+	// that were replaced or removed since indexing are unclaimed and
+	// marked so they don't block the analysis queue.
+	var unclaimSHAs []string
+	validated := jobs[:0]
+	for _, j := range jobs {
+		if j.Path == "" || j.Path == "." {
+			slog.Warn("skipping job with empty path", //nolint:gosec // structured logging, worker validated
+				"worker", worker, "sha256", j.SHA256)
+			if err := s.db.SetSkip(ctx, j.SHA256, "empty_path"); err != nil {
+				slog.Error("mark empty_path failed", "sha256", j.SHA256, "error", err) //nolint:gosec // structured logging
+			}
+			unclaimSHAs = append(unclaimSHAs, j.SHA256)
+			continue
+		}
+		info, err := os.Stat(j.Path) //nolint:gosec // path from DB lookup, not user input
+		if err != nil {
+			//nolint:gosec // worker validated, sha256/path from DB
+			slog.Warn("claimed file missing on disk",
+				"worker", worker, "sha256", j.SHA256, "path", j.Path)
+			if err := s.db.SetSkip(ctx, j.SHA256, "missing"); err != nil {
+				slog.Error("mark missing failed", "sha256", j.SHA256, "error", err) //nolint:gosec // structured logging
+			}
+			unclaimSHAs = append(unclaimSHAs, j.SHA256)
+			continue
+		}
+		if j.SizeBytes > 0 && info.Size() != j.SizeBytes {
+			//nolint:gosec // sha256 validated, path from DB, sizes are int64
+			slog.Warn("claimed file size mismatch — file was likely replaced",
+				"worker", worker, "sha256", j.SHA256, "path", j.Path,
+				"db_size", j.SizeBytes, "disk_size", info.Size())
+			if err := s.db.SetSkip(ctx, j.SHA256, "corrupt"); err != nil {
+				slog.Error("mark corrupt failed", "sha256", j.SHA256, "error", err) //nolint:gosec // structured logging
+			}
+			unclaimSHAs = append(unclaimSHAs, j.SHA256)
+			continue
+		}
+		validated = append(validated, j)
+	}
+	jobs = validated
+	if len(unclaimSHAs) > 0 {
+		if err := s.db.UnclaimJobs(ctx, unclaimSHAs); err != nil {
+			slog.Error("unclaim invalid jobs failed", "error", err)
+		}
+	}
+
 	// Strip the data root to return relative paths. Workers join these
 	// with their own data root to find files locally. Resolve each path
 	// first so legacy rows with unresolved symlinks still match.
@@ -342,22 +389,6 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 			jobs[i].Path = strings.TrimPrefix(p, prefix)
 		}
 	}
-
-	// Drop jobs with empty paths — workers can't fetch or locate
-	// these files and they just produce cascading errors.
-	filtered := jobs[:0]
-	for _, j := range jobs {
-		if j.Path == "" || j.Path == "." {
-			slog.Warn("skipping job with empty path", //nolint:gosec // structured logging, worker validated
-				"worker", worker, "sha256", j.SHA256)
-			if err := s.db.SetSkip(ctx, j.SHA256, "empty_path"); err != nil {
-				slog.Error("mark empty_path failed", "sha256", j.SHA256, "error", err) //nolint:gosec // structured logging
-			}
-			continue
-		}
-		filtered = append(filtered, j)
-	}
-	jobs = filtered
 
 	active := s.tracker.activeClaims(worker)
 	for _, j := range jobs {

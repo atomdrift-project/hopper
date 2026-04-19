@@ -278,6 +278,20 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 		return 0, nil, fmt.Errorf("hopper: refresh marker mtime: %w", err)
 	}
 
+	// Mark stale rows whose path now belongs to a different SHA256.
+	// This happens when a file is replaced on disk — the walk inserts a
+	// new row for the new content but the old row lingers in the queue.
+	if _, err := tx.Exec(ctx, `
+		UPDATE samples s
+		SET skip = 'replaced'
+		FROM _staging st
+		WHERE s.path = st.path
+			AND s.sha256 != st.sha256
+			AND s.skip = ''
+			AND s.cleave_result IS NULL`); err != nil {
+		return 0, nil, fmt.Errorf("hopper: mark replaced: %w", err)
+	}
+
 	// Find SHAs that lack analysis results (including ones we just skipped).
 	query := `SELECT s.sha256 FROM samples s
 		JOIN _staging st ON s.sha256 = st.sha256

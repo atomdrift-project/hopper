@@ -421,6 +421,26 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		}
 	}
 
+	// Mark stale rows whose path now belongs to a different SHA256.
+	// This happens when a file is replaced on disk — the walk inserts a
+	// new row for the new content but the old row lingers in the queue
+	// and can never be analyzed because the original bytes are gone.
+	for _, s := range samples {
+		if s.Path == "" {
+			continue
+		}
+		res, err := tx.ExecContext(ctx,
+			`UPDATE samples SET skip = 'replaced'
+			WHERE path = ? AND sha256 != ? AND skip = '' AND cleave_result IS NULL`,
+			s.Path, s.SHA256)
+		if err != nil {
+			return 0, nil, fmt.Errorf("hopper: mark replaced %s: %w", s.SHA256, err)
+		}
+		if n, err := res.RowsAffected(); err == nil && n > 0 {
+			slog.Info("marked replaced sample", "path", s.Path, "new_sha256", s.SHA256, "replaced", n)
+		}
+	}
+
 	// Find SHAs that lack analysis results.
 	if _, err := tx.ExecContext(ctx, "CREATE TEMP TABLE IF NOT EXISTS _batch_shas (sha256 TEXT)"); err != nil {
 		return 0, nil, fmt.Errorf("hopper: create batch staging: %w", err)

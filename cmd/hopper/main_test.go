@@ -1102,7 +1102,7 @@ func TestReviewCommands(t *testing.T) {
 		}
 		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"elf","x":%d,"dp":0,"ts":[%s]}]}`,
 			sample.SHA256, sample.Score, fx.traits)
-		if err := db.UpdateCleaveResult(ctx, sample.SHA256, result, nil, "", 0); err != nil {
+		if err := db.UpdateCleaveResult(ctx, sample.SHA256, result, nil, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1184,7 +1184,7 @@ func TestReviewFlushCommands(t *testing.T) {
 		}
 		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"elf","x":%d,"dp":0,"ts":[%s]}]}`,
 			sample.SHA256, sample.Score, fx.traits)
-		if err := db.UpdateCleaveResult(ctx, sample.SHA256, result, nil, "", 0); err != nil {
+		if err := db.UpdateCleaveResult(ctx, sample.SHA256, result, nil, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
