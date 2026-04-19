@@ -820,14 +820,11 @@ func loadAll( //nolint:revive // many params reflect the many subsystems coordin
 		progress.walkDone.Store(true)
 
 		// Mark samples whose files are gone or filtered out by iter-files.
-		walkedSet := make(map[string]struct{})
-		progress.walkedPaths.Range(func(k, _ any) bool {
-			if s, ok := k.(string); ok {
-				walkedSet[s] = struct{}{}
-			}
-			return true
-		})
-		if marked, err := db.MarkMissingSamples(ctx, walkedSet); err != nil {
+		wasWalked := func(path string) bool {
+			_, ok := progress.walkedPaths.Load(path)
+			return ok
+		}
+		if marked, err := db.MarkMissingSamples(ctx, wasWalked); err != nil {
 			slog.Error("mark missing samples failed", "error", err)
 		} else if marked > 0 {
 			slog.Info("marked stale samples", "count", marked)
@@ -1547,7 +1544,7 @@ func hashFile(ctx context.Context, path, label, fileType, source string, cache *
 
 	// Check hash cache before reading file contents.
 	if cache != nil {
-		if cached, ins, ok := cache.lookup(dev, inode, info.Size(), info.ModTime()); ok {
+		if cached, ins, ok := cache.lookup(ctx, dev, inode, info.Size(), info.ModTime()); ok {
 			if progress != nil {
 				progress.cacheHits.Add(1)
 			}

@@ -88,9 +88,13 @@ func openHashCache(ctx context.Context, path string) (*hashCache, error) {
 	return c, nil
 }
 
-// load bulk-reads all cache rows into the map.
+// load reads non-inserted cache rows into memory for fast lookup. Already-
+// inserted entries (the vast majority at scale) stay in SQLite and are
+// queried on demand, keeping memory usage proportional to pending work
+// rather than total dataset size.
 func (c *hashCache) load(ctx context.Context) error {
-	rows, err := c.db.QueryContext(ctx, `SELECT dev, inode, size, mtime, sha256, inserted FROM hash_cache`)
+	rows, err := c.db.QueryContext(ctx,
+		`SELECT dev, inode, size, mtime, sha256 FROM hash_cache WHERE inserted = 0`)
 	if err != nil {
 		return fmt.Errorf("hashcache: load: %w", err)
 	}
@@ -103,32 +107,46 @@ func (c *hashCache) load(ctx context.Context) error {
 	for rows.Next() {
 		var k cacheKey
 		var shaHex string
-		var ins int
-		if err := rows.Scan(&k.dev, &k.inode, &k.size, &k.mtime, &shaHex, &ins); err != nil {
+		if err := rows.Scan(&k.dev, &k.inode, &k.size, &k.mtime, &shaHex); err != nil {
 			return fmt.Errorf("hashcache: scan: %w", err)
 		}
 		var sha [32]byte
 		if _, err := hex.Decode(sha[:], []byte(shaHex)); err != nil {
 			return fmt.Errorf("hashcache: decode sha: %w", err)
 		}
-		c.mem[k] = cacheEntry{sha256: sha, inserted: ins != 0}
+		c.mem[k] = cacheEntry{sha256: sha}
 	}
-	slog.Info("hash cache loaded", "entries", len(c.mem))
+
+	var total int
+	if err := c.db.QueryRowContext(ctx, `SELECT count(*) FROM hash_cache`).Scan(&total); err == nil {
+		slog.Info("hash cache loaded", "in_memory", len(c.mem), "on_disk", total)
+	} else {
+		slog.Info("hash cache loaded", "in_memory", len(c.mem))
+	}
 	return rows.Err()
 }
 
-// lookup checks the in-memory cache. Safe for concurrent use.
-// Returns the hex-encoded sha256, whether the entry has been inserted into
-// the samples DB, and whether the lookup was a hit.
-func (c *hashCache) lookup(dev, inode uint64, size int64, mtime time.Time) (sha256Hex string, inserted bool, ok bool) {
+// lookup checks the in-memory cache first (non-inserted entries), then
+// falls back to a SQLite query for already-inserted entries. Safe for
+// concurrent use.
+func (c *hashCache) lookup(ctx context.Context, dev, inode uint64, size int64, mtime time.Time) (sha256Hex string, inserted bool, ok bool) {
 	k := cacheKey{dev: dev, inode: inode, size: size, mtime: mtime.UnixNano()}
 	c.mu.Lock()
-	e, ok := c.mem[k]
+	e, memOK := c.mem[k]
 	c.mu.Unlock()
-	if !ok {
+	if memOK {
+		return hex.EncodeToString(e.sha256[:]), e.inserted, true
+	}
+
+	// Fall back to SQLite for inserted entries not loaded into memory.
+	var shaHex string
+	err := c.db.QueryRowContext(ctx,
+		`SELECT sha256 FROM hash_cache WHERE dev = ? AND inode = ? AND size = ? AND mtime = ?`,
+		dev, inode, size, k.mtime).Scan(&shaHex)
+	if err != nil {
 		return "", false, false
 	}
-	return hex.EncodeToString(e.sha256[:]), e.inserted, true
+	return shaHex, true, true
 }
 
 // store adds an entry to the in-memory cache and dirty buffer.
@@ -154,13 +172,14 @@ func (c *hashCache) store(ctx context.Context, dev, inode uint64, size int64, mt
 
 // markInserted marks cache entries as successfully inserted into the samples DB.
 // The flag is persisted on the next flush so future startups can skip re-inserting.
+// Entries are removed from the in-memory map since they'll be served from
+// SQLite on subsequent lookups, keeping memory proportional to pending work.
 func (c *hashCache) markInserted(ctx context.Context, keys []cacheKey) {
 	c.mu.Lock()
 	for _, k := range keys {
 		if e, ok := c.mem[k]; ok && !e.inserted {
-			e.inserted = true
-			c.mem[k] = e
 			c.dirty = append(c.dirty, dirtyEntry{key: k, sha256: e.sha256, inserted: true})
+			delete(c.mem, k)
 		}
 	}
 	shouldFlush := len(c.dirty) >= writeBatchSize

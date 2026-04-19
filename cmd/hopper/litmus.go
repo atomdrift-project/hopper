@@ -453,7 +453,7 @@ func extractCanonicalSHA(sha256 string, raw json.RawMessage) string {
 }
 
 // litmusTraitsVersion runs `litmus version --format=json` and returns the
-// first 3 characters of the traits commit hash. Returns "" on any error.
+// first 5 characters of the traits commit hash. Returns "" on any error.
 func litmusTraitsVersion(ctx context.Context, bin string) string {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -476,11 +476,11 @@ func litmusTraitsVersion(ctx context.Context, bin string) string {
 		return ""
 	}
 
-	if len(v.Traits) < 3 {
+	if len(v.Traits) < 5 {
 		slog.Warn("litmus traits version too short", "traits", v.Traits)
 		return v.Traits
 	}
-	return v.Traits[:3]
+	return v.Traits[:5]
 }
 
 // Restarts returns the number of times litmus has been restarted.

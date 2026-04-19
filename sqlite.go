@@ -178,6 +178,37 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		return fmt.Errorf("hopper: migrate sqlite: %w", err)
 	}
 
+	// Partial indexes matching PG for review and dashboard queries.
+	for _, ddl := range []string{
+		// falsePositives / truePositives / falseNegatives
+		`CREATE INDEX IF NOT EXISTS idx_samples_review ` +
+			`ON samples(label, score) ` +
+			`WHERE cleave_result IS NOT NULL AND status = '' AND skip = ''`,
+		// benignReview / badReview
+		`CREATE INDEX IF NOT EXISTS idx_samples_misclassified_review ` +
+			`ON samples(label, max_crit, suspicious_count) ` +
+			`WHERE label_source = 'marker' AND skip = 'misclassified' ` +
+			`AND cleave_result IS NOT NULL AND status = ''`,
+		// CountAnalyzed
+		`CREATE INDEX IF NOT EXISTS idx_samples_litmus_done ` +
+			`ON samples(id) WHERE litmus_result IS NOT NULL`,
+		// CountPending / claimable ordering
+		`DROP INDEX IF EXISTS idx_samples_claimable`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_claimable ` +
+			`ON samples(updated_at, id) ` +
+			`WHERE cleave_result IS NULL AND skip = '' AND parent = ''`,
+		// NewestAnalyzedAt
+		`CREATE INDEX IF NOT EXISTS idx_samples_analyzed_at ` +
+			`ON samples(analyzed_at) WHERE analyzed_at IS NOT NULL`,
+		// OldestClaims
+		`CREATE INDEX IF NOT EXISTS idx_samples_claimed ` +
+			`ON samples(claimed_by, claimed_at) WHERE claimed_by != '' AND cleave_result IS NULL`,
+	} {
+		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite index: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -812,25 +843,47 @@ func (db *DB) samplesByEmbeddedSHA256SQLite(ctx context.Context, sha256 string, 
 }
 
 func (db *DB) recomputeCanonicalSHA256SQLite(ctx context.Context) (int64, error) {
-	res, err := db.lite.ExecContext(ctx, `
-		UPDATE samples SET canonical_sha256 = (
-			SELECT MIN(v) FROM (
-				SELECT samples.sha256 AS v
-				UNION ALL
-				SELECT json_extract(value, '$.sha256') AS v
-				FROM json_each(samples.cleave_result, '$.files')
-				WHERE length(v) = 64
-			)
-		), updated_at = ?
-		WHERE cleave_result IS NOT NULL`, now())
-	if err != nil {
-		return 0, fmt.Errorf("hopper: recompute canonical sha256: %w", err)
+	const batchSize = 5000
+	var total int64
+	var lastID int64
+	for {
+		ts := now()
+		res, err := db.lite.ExecContext(ctx, `
+			UPDATE samples SET canonical_sha256 = (
+				SELECT MIN(v) FROM (
+					SELECT samples.sha256 AS v
+					UNION ALL
+					SELECT json_extract(value, '$.sha256') AS v
+					FROM json_each(samples.cleave_result, '$.files')
+					WHERE length(v) = 64
+				)
+			), updated_at = ?
+			WHERE rowid IN (
+				SELECT rowid FROM samples
+				WHERE cleave_result IS NOT NULL AND id > ?
+				ORDER BY id LIMIT ?
+			)`, ts, lastID, batchSize)
+		if err != nil {
+			return total, fmt.Errorf("hopper: recompute canonical sha256: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("hopper: rows affected recompute canonical sha256: %w", err)
+		}
+		total += n
+		// Advance cursor: find the max id in this batch.
+		if err := db.lite.QueryRowContext(ctx, `
+			SELECT COALESCE(MAX(id), 0) FROM samples
+			WHERE cleave_result IS NOT NULL AND id > ?
+			ORDER BY id LIMIT ?`, lastID, batchSize).Scan(&lastID); err != nil {
+			return total, fmt.Errorf("hopper: recompute cursor: %w", err)
+		}
+		if n < batchSize {
+			break
+		}
+		slog.Info("recompute canonical sha256 batch", "batch", n, "total", total)
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("hopper: rows affected recompute canonical sha256: %w", err)
-	}
-	return n, nil
+	return total, nil
 }
 
 // stripSubscriptsSQL is the SQLite expression equivalent of stripSubscripts:
@@ -861,42 +914,56 @@ func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 	// compile-time format string filled with a compile-time expression,
 	// so there's no tainted input despite the string concatenation.
 	// max_crit is computed via a correlated SELECT MAX over $.ts on the
-	// matched depth-0 entry.
+	// matched depth-0 entry. Batched to avoid one huge transaction.
 	elementsExpr := fmt.Sprintf(stripSubscriptsSQL, "COALESCE(j.f, '')")
-	//nolint:gosec // constant SQL fragments, no tainted input.
-	cleaveSQL := `
-		WITH cleave_extract AS (
-			SELECT s.sha256,
-				json_extract(je.value, '$.f') AS f,
-				json_extract(je.value, '$.x') AS x,
-				json_extract(je.value, '$.type') AS t,
-				(SELECT COALESCE(MAX(CAST(json_extract(te.value, '$.l') AS INTEGER)), 0)
-				 FROM json_each(je.value, '$.ts') te) AS mc,
-				(SELECT COUNT(*)
-				 FROM json_each(je.value, '$.ts') te
-				 WHERE CAST(json_extract(te.value, '$.l') AS INTEGER) >= 4) AS sc
-			FROM samples s, json_each(s.cleave_result, '$.fs') je
-			WHERE s.file_type = ''
-				AND s.cleave_result IS NOT NULL
-				AND json_extract(je.value, '$.dp') = 0
-		)
-		UPDATE samples SET
-			formula = COALESCE(j.f, ''),
-			elements = ` + elementsExpr + `,
-			score = COALESCE(j.x, 0),
-			max_crit = COALESCE(j.mc, 0),
-			suspicious_count = COALESCE(j.sc, 0),
-			file_type = CASE WHEN COALESCE(j.t, '') = '' THEN samples.file_type ELSE j.t END,
-			updated_at = ?
-		FROM cleave_extract j
-		WHERE samples.sha256 = j.sha256
-			AND samples.file_type = ''`
-	cleaveRes, err := db.lite.ExecContext(ctx, cleaveSQL, ts)
-	if err != nil {
-		return stats, fmt.Errorf("hopper: backfill cleave columns: %w", err)
-	}
-	if n, err := cleaveRes.RowsAffected(); err == nil {
+	const backfillBatch = 5000
+	for {
+		//nolint:gosec // constant SQL fragments, no tainted input.
+		cleaveSQL := `
+			WITH batch AS (
+				SELECT sha256 FROM samples
+				WHERE file_type = '' AND cleave_result IS NOT NULL
+				LIMIT ?
+			),
+			cleave_extract AS (
+				SELECT s.sha256,
+					json_extract(je.value, '$.f') AS f,
+					json_extract(je.value, '$.x') AS x,
+					json_extract(je.value, '$.type') AS t,
+					(SELECT COALESCE(MAX(CAST(json_extract(te.value, '$.l') AS INTEGER)), 0)
+					 FROM json_each(je.value, '$.ts') te) AS mc,
+					(SELECT COUNT(*)
+					 FROM json_each(je.value, '$.ts') te
+					 WHERE CAST(json_extract(te.value, '$.l') AS INTEGER) >= 4) AS sc
+				FROM samples s
+				JOIN batch b ON b.sha256 = s.sha256,
+					json_each(s.cleave_result, '$.fs') je
+				WHERE json_extract(je.value, '$.dp') = 0
+			)
+			UPDATE samples SET
+				formula = COALESCE(j.f, ''),
+				elements = ` + elementsExpr + `,
+				score = COALESCE(j.x, 0),
+				max_crit = COALESCE(j.mc, 0),
+				suspicious_count = COALESCE(j.sc, 0),
+				file_type = CASE WHEN COALESCE(j.t, '') = '' THEN samples.file_type ELSE j.t END,
+				updated_at = ?
+			FROM cleave_extract j
+			WHERE samples.sha256 = j.sha256
+				AND samples.file_type = ''`
+		cleaveRes, err := db.lite.ExecContext(ctx, cleaveSQL, backfillBatch, ts)
+		if err != nil {
+			return stats, fmt.Errorf("hopper: backfill cleave columns: %w", err)
+		}
+		n, err := cleaveRes.RowsAffected()
+		if err != nil {
+			return stats, fmt.Errorf("hopper: backfill rows affected: %w", err)
+		}
 		stats.Updated += n
+		if n < backfillBatch {
+			break
+		}
+		slog.Info("backfill cleave batch", "batch", n, "total", stats.Updated)
 	}
 
 	// Pass 2: litmus_score from litmus_result.prob, same scope.

@@ -298,13 +298,13 @@ func TestHashCacheHitMiss(t *testing.T) {
 	dev, ino := fileStat(info)
 
 	// Miss on empty cache.
-	if _, _, ok := c.lookup(dev, ino, info.Size(), info.ModTime()); ok {
+	if _, _, ok := c.lookup(t.Context(), dev, ino, info.Size(), info.ModTime()); ok {
 		t.Fatal("expected cache miss on empty cache")
 	}
 
 	// Store and hit.
 	c.store(t.Context(), dev, ino, info.Size(), info.ModTime(), "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234")
-	sha, _, ok := c.lookup(dev, ino, info.Size(), info.ModTime())
+	sha, _, ok := c.lookup(t.Context(), dev, ino, info.Size(), info.ModTime())
 	if !ok {
 		t.Fatal("expected cache hit after store")
 	}
@@ -313,12 +313,12 @@ func TestHashCacheHitMiss(t *testing.T) {
 	}
 
 	// Miss on different size.
-	if _, _, ok := c.lookup(dev, ino, info.Size()+1, info.ModTime()); ok {
+	if _, _, ok := c.lookup(t.Context(), dev, ino, info.Size()+1, info.ModTime()); ok {
 		t.Fatal("expected cache miss for different size")
 	}
 
 	// Miss on different mtime.
-	if _, _, ok := c.lookup(dev, ino, info.Size(), info.ModTime().Add(1)); ok {
+	if _, _, ok := c.lookup(t.Context(), dev, ino, info.Size(), info.ModTime().Add(1)); ok {
 		t.Fatal("expected cache miss for different mtime")
 	}
 }
@@ -341,7 +341,7 @@ func TestHashCachePersistence(t *testing.T) {
 	}
 	defer c2.close(t.Context())
 
-	sha, _, ok := c2.lookup(42, 999, 1024, fixedTime())
+	sha, _, ok := c2.lookup(t.Context(), 42, 999, 1024, fixedTime())
 	if !ok {
 		t.Fatal("expected cache hit after reopen")
 	}
@@ -369,7 +369,7 @@ func TestHashCacheConcurrent(t *testing.T) {
 			ino := uint64(i)
 			sha := fmt.Sprintf("%064x", i)
 			c.store(t.Context(), 1, ino, 100, fixedTime(), sha)
-			got, _, ok := c.lookup(1, ino, 100, fixedTime())
+			got, _, ok := c.lookup(t.Context(), 1, ino, 100, fixedTime())
 			if !ok {
 				t.Errorf("miss for inode %d after store", ino)
 				return

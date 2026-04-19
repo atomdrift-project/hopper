@@ -693,24 +693,52 @@ func (db *DB) samplesByEmbeddedSHA256PG(ctx context.Context, sha256 string, limi
 // canonical_sha256 in SQL without fetching blobs into Go. Returns the
 // number of rows updated.
 func (db *DB) recomputeCanonicalSHA256PG(ctx context.Context) (int64, error) {
-	tag, err := db.pool.Exec(ctx, `
-		UPDATE samples SET canonical_sha256 = computed.canonical, updated_at = now()
-		FROM (
-			SELECT s.sha256,
-				LEAST(s.sha256, MIN(jt.file_sha256)) AS canonical
-			FROM samples s,
-				JSON_TABLE(s.cleave_result, '$.files[*]' COLUMNS (
-					file_sha256 TEXT PATH '$.sha256'
-				)) AS jt
-			WHERE length(jt.file_sha256) = 64
-			GROUP BY s.sha256
-		) AS computed
-		WHERE samples.sha256 = computed.sha256
-			AND samples.canonical_sha256 IS DISTINCT FROM computed.canonical`)
-	if err != nil {
-		return 0, fmt.Errorf("hopper: recompute canonical sha256: %w", err)
+	const batchSize = 5000
+	var total int64
+	var lastID int64
+	for {
+		tag, err := db.pool.Exec(ctx, `
+			WITH batch AS (
+				SELECT id, sha256 FROM samples
+				WHERE cleave_result IS NOT NULL AND id > $2
+				ORDER BY id LIMIT $1
+			)
+			UPDATE samples SET canonical_sha256 = computed.canonical, updated_at = now()
+			FROM (
+				SELECT s.sha256,
+					LEAST(s.sha256, MIN(jt.file_sha256)) AS canonical
+				FROM samples s
+				JOIN batch b ON b.sha256 = s.sha256,
+					JSON_TABLE(s.cleave_result, '$.files[*]' COLUMNS (
+						file_sha256 TEXT PATH '$.sha256'
+					)) AS jt
+				WHERE length(jt.file_sha256) = 64
+				GROUP BY s.sha256
+			) AS computed
+			WHERE samples.sha256 = computed.sha256
+				AND samples.canonical_sha256 IS DISTINCT FROM computed.canonical`, batchSize, lastID)
+		if err != nil {
+			return total, fmt.Errorf("hopper: recompute canonical sha256: %w", err)
+		}
+		n := tag.RowsAffected()
+		total += n
+		// Advance cursor.
+		var maxID int64
+		if err := db.pool.QueryRow(ctx,
+			`SELECT COALESCE(MAX(id), 0) FROM samples WHERE cleave_result IS NOT NULL AND id > $1 ORDER BY id LIMIT $2`,
+			lastID, batchSize).Scan(&maxID); err != nil {
+			return total, fmt.Errorf("hopper: recompute cursor: %w", err)
+		}
+		if maxID == lastID {
+			break
+		}
+		lastID = maxID
+		if n < batchSize {
+			break
+		}
+		slog.Info("recompute canonical sha256 batch", "batch", n, "total", total)
 	}
-	return tag.RowsAffected(), nil
+	return total, nil
 }
 
 // backfillPG re-derives parseCleaveFile / parseLitmusProb columns entirely
@@ -740,39 +768,51 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 	// JSON_TABLE filters to the depth-0 entry; rows without one are skipped.
 	// elements = formula with Unicode subscripts ₀..₉ stripped.
 	// max_crit is the max trait level on the depth-0 entry, computed via a
-	// nested SELECT over the traits array.
-	cleaveTag, err := db.pool.Exec(ctx, `
-		UPDATE samples s SET
-			formula = COALESCE(j.f, ''),
-			elements = translate(COALESCE(j.f, ''), '₀₁₂₃₄₅₆₇₈₉', ''),
-			score = COALESCE(j.x, 0),
-			max_crit = COALESCE(j.mc, 0),
-			suspicious_count = COALESCE(j.sc, 0),
-			file_type = COALESCE(NULLIF(j.t, ''), s.file_type),
-			updated_at = now()
-		FROM (
-			SELECT s2.sha256, jt.f, jt.x, jt.t,
-				(SELECT COALESCE(MAX((tr->>'l')::int), 0)
-				 FROM jsonb_array_elements(COALESCE(jt.ts, '[]'::jsonb)) AS tr) AS mc,
-				(SELECT COUNT(*)
-				 FROM jsonb_array_elements(COALESCE(jt.ts, '[]'::jsonb)) AS tr
-				 WHERE (tr->>'l')::int >= 4) AS sc
-			FROM samples s2,
-				JSON_TABLE(s2.cleave_result, '$.fs[*] ? (@.dp == 0)' COLUMNS (
-					f TEXT PATH '$.f',
-					x INTEGER PATH '$.x',
-					t TEXT PATH '$.type',
-					ts JSONB PATH '$.ts'
-				)) AS jt
-			WHERE s2.file_type = ''
-				AND s2.cleave_result IS NOT NULL
-		) AS j
-		WHERE s.sha256 = j.sha256
-			AND s.file_type = ''`)
-	if err != nil {
-		return stats, fmt.Errorf("hopper: backfill cleave columns: %w", err)
+	// nested SELECT over the traits array. Batched to avoid one huge transaction.
+	const backfillBatch = 5000
+	for {
+		cleaveTag, err := db.pool.Exec(ctx, `
+			WITH batch AS (
+				SELECT sha256 FROM samples
+				WHERE file_type = '' AND cleave_result IS NOT NULL
+				LIMIT $1
+			)
+			UPDATE samples s SET
+				formula = COALESCE(j.f, ''),
+				elements = translate(COALESCE(j.f, ''), '₀₁₂₃₄₅₆₇₈₉', ''),
+				score = COALESCE(j.x, 0),
+				max_crit = COALESCE(j.mc, 0),
+				suspicious_count = COALESCE(j.sc, 0),
+				file_type = COALESCE(NULLIF(j.t, ''), s.file_type),
+				updated_at = now()
+			FROM (
+				SELECT s2.sha256, jt.f, jt.x, jt.t,
+					(SELECT COALESCE(MAX((tr->>'l')::int), 0)
+					 FROM jsonb_array_elements(COALESCE(jt.ts, '[]'::jsonb)) AS tr) AS mc,
+					(SELECT COUNT(*)
+					 FROM jsonb_array_elements(COALESCE(jt.ts, '[]'::jsonb)) AS tr
+					 WHERE (tr->>'l')::int >= 4) AS sc
+				FROM samples s2
+				JOIN batch b ON b.sha256 = s2.sha256,
+					JSON_TABLE(s2.cleave_result, '$.fs[*] ? (@.dp == 0)' COLUMNS (
+						f TEXT PATH '$.f',
+						x INTEGER PATH '$.x',
+						t TEXT PATH '$.type',
+						ts JSONB PATH '$.ts'
+					)) AS jt
+			) AS j
+			WHERE s.sha256 = j.sha256
+				AND s.file_type = ''`, backfillBatch)
+		if err != nil {
+			return stats, fmt.Errorf("hopper: backfill cleave columns: %w", err)
+		}
+		n := cleaveTag.RowsAffected()
+		stats.Updated += n
+		if n < backfillBatch {
+			break
+		}
+		slog.Info("backfill cleave batch", "batch", n, "total", stats.Updated)
 	}
-	stats.Updated += cleaveTag.RowsAffected()
 
 	// Pass 2: litmus_score from litmus_result.prob, scoped to the same
 	// "stale" set so we don't pay JSON parsing on already-backfilled rows.

@@ -465,18 +465,23 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Parse cleave result once — used for both storage and explosion.
+	parsed := hopper.ParseCleaveResult(req.SHA256, req.Raw)
+
 	// Determine the traits version used for this analysis: prefer the
-	// server's canonical version (from litmus version), fall back to the
-	// worker's self-reported traits hash truncated to 3 characters.
-	tv := s.traitsVersion
+	// version embedded in the cleave result (authoritative), fall back to
+	// the server's local litmus version, then the worker's self-reported
+	// traits hash.
+	tv := parsed.TraitsVersion
 	if tv == "" {
-		if wt := s.tracker.traits(req.Worker); len(wt) >= 3 {
-			tv = wt[:3]
+		tv = s.traitsVersion
+	}
+	if tv == "" {
+		if wt := s.tracker.traits(req.Worker); len(wt) >= 5 {
+			tv = wt[:5]
 		}
 	}
 
-	// Parse cleave result once — used for both storage and explosion.
-	parsed := hopper.ParseCleaveResult(req.SHA256, req.Raw)
 	if err := s.db.UpdateCleaveResult(ctx, req.SHA256, req.Raw, &parsed, tv); err != nil {
 		slog.Error("store cleave result failed", "sha256", req.SHA256, "error", err)
 		// Still record the result so ActiveClaims is decremented — otherwise

@@ -1382,6 +1382,10 @@ func TestMarkMissingSamples(t *testing.T) {
 
 	// Only aaa1 was seen by iter-files.
 	walkedPaths := map[string]struct{}{realFile: {}}
+	wasWalked := func(path string) bool {
+		_, ok := walkedPaths[path]
+		return ok
+	}
 
 	// But ccc3 has the same path as aaa1 — both exist on disk.
 	// Only aaa1 is in walkedPaths, so ccc3 should be marked as unsupported.
@@ -1392,7 +1396,7 @@ func TestMarkMissingSamples(t *testing.T) {
 	}
 	mustInsert(t, ctx, db, &Sample{SHA256: "ddd4", Path: unsupportedFile, Label: "bad"})
 
-	marked, err := db.MarkMissingSamples(ctx, walkedPaths)
+	marked, err := db.MarkMissingSamples(ctx, wasWalked)
 	if err != nil {
 		t.Fatal(err)
 	}

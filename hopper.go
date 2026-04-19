@@ -165,8 +165,9 @@ type cleaveFileInfo struct {
 // CleaveParseResult holds all metadata extracted from a single JSON parse
 // of a cleave result, combining file info and canonical SHA computation.
 type CleaveParseResult struct {
-	CanonicalSHA string
-	FileInfo     cleaveFileInfo
+	CanonicalSHA  string
+	FileInfo      cleaveFileInfo
+	TraitsVersion string // "tv" field from compact report (first 5 chars of traits commit)
 }
 
 // ParseCleaveResult extracts file info and canonical SHA from a cleave result
@@ -177,7 +178,8 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 		return CleaveParseResult{CanonicalSHA: sha256}
 	}
 	var report struct {
-		Files []struct {
+		TraitsVersion string `json:"tv"`
+		Files         []struct {
 			Formula  string `json:"f"`
 			SHA256   string `json:"sha"`
 			FileType string `json:"type"`
@@ -228,7 +230,7 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 		break
 	}
 
-	return CleaveParseResult{CanonicalSHA: canonical, FileInfo: fi}
+	return CleaveParseResult{CanonicalSHA: canonical, FileInfo: fi, TraitsVersion: report.TraitsVersion}
 }
 
 // parseCleaveFile extracts file info only (for callers that don't need canonical SHA).
@@ -588,10 +590,11 @@ func (db *DB) Unanalyzed(ctx context.Context, limit int) ([]*Sample, error) {
 //   - skip='missing' if the file doesn't exist on disk
 //   - skip='unsupported' if the file exists but wasn't in the iter-files output
 //
-// walkedPaths is the set of all paths emitted by cleave iter-files during
-// the current load. Returns the number of samples marked.
-func (db *DB) MarkMissingSamples(ctx context.Context, walkedPaths map[string]struct{}) (int64, error) {
-	samples, err := db.Unanalyzed(ctx, 1_000_000)
+// wasWalked reports whether a resolved path was emitted by cleave iter-files
+// during the current load. Returns the number of samples marked.
+func (db *DB) MarkMissingSamples(ctx context.Context, wasWalked func(string) bool) (int64, error) {
+	const batchSize = 50_000
+	samples, err := db.Unanalyzed(ctx, batchSize)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: mark missing: %w", err)
 	}
@@ -614,8 +617,7 @@ func (db *DB) MarkMissingSamples(ctx context.Context, walkedPaths map[string]str
 			continue
 		}
 		eligible++
-		rp := resolvedPath(s.Path)
-		if _, walked := walkedPaths[rp]; !walked {
+		if !wasWalked(resolvedPath(s.Path)) {
 			wouldMark++
 		}
 	}
@@ -631,8 +633,7 @@ func (db *DB) MarkMissingSamples(ctx context.Context, walkedPaths map[string]str
 		if s.Skip != "" || s.Parent != "" {
 			continue
 		}
-		rp := resolvedPath(s.Path)
-		if _, walked := walkedPaths[rp]; walked {
+		if wasWalked(resolvedPath(s.Path)) {
 			continue
 		}
 		_, statErr := os.Stat(s.Path)
