@@ -166,8 +166,8 @@ type cleaveFileInfo struct {
 // of a cleave result, combining file info and canonical SHA computation.
 type CleaveParseResult struct {
 	CanonicalSHA  string
-	FileInfo      cleaveFileInfo
 	TraitsVersion string // "tv" field from compact report (first 5 chars of traits commit)
+	FileInfo      cleaveFileInfo
 }
 
 // ParseCleaveResult extracts file info and canonical SHA from a cleave result
@@ -781,6 +781,15 @@ func (db *DB) SamplesByStatus(ctx context.Context, status string, limit int) ([]
 	return db.samplesByStatusSQLite(ctx, status, limit)
 }
 
+// SamplesByStatusLight is like SamplesByStatus but omits CleaveResult and
+// LitmusResult to reduce memory usage when only metadata is needed.
+func (db *DB) SamplesByStatusLight(ctx context.Context, status string, limit int) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.samplesByStatusLightPG(ctx, status, limit)
+	}
+	return db.samplesByStatusLightSQLite(ctx, status, limit)
+}
+
 // FalsePositives returns analyzed good-labeled samples that trigger detection
 // (max_crit >= 5 OR suspicious_count >= 2). These are candidates for
 // false-positive resolution.
@@ -811,6 +820,22 @@ func (db *DB) FalseNegatives(ctx context.Context, limit int) ([]*Sample, error) 
 		return db.falseNegativesPG(ctx, limit)
 	}
 	return db.falseNegativesSQLite(ctx, limit)
+}
+
+// FalsePositivesLight is like FalsePositives but omits CleaveResult/LitmusResult.
+func (db *DB) FalsePositivesLight(ctx context.Context, limit int) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.falsePositivesLightPG(ctx, limit)
+	}
+	return db.falsePositivesLightSQLite(ctx, limit)
+}
+
+// FalseNegativesLight is like FalseNegatives but omits CleaveResult/LitmusResult.
+func (db *DB) FalseNegativesLight(ctx context.Context, limit int) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.falseNegativesLightPG(ctx, limit)
+	}
+	return db.falseNegativesLightSQLite(ctx, limit)
 }
 
 // BenignReview returns known-bad files that were flipped to good by a BENIGN
@@ -896,18 +921,34 @@ func (db *DB) SamplesByStatusInPaths(ctx context.Context, status string, prefixe
 // that trigger detection, with empty status and not marked skip.
 func (db *DB) FalsePositivesInPaths(ctx context.Context, prefixes []string, limit int) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.falsePositivesInPathsPG(ctx, prefixes, limit)
+		return db.seedCandidatesInPathsPG(ctx, prefixes, "good", limit, false)
 	}
-	return db.falsePositivesInPathsSQLite(ctx, prefixes, limit)
+	return db.seedCandidatesInPathsSQLite(ctx, prefixes, "good", limit, false)
 }
 
 // FalseNegativesInPaths returns bad-labeled samples under the given prefixes
 // that do not trigger detection, with empty status and not marked skip.
 func (db *DB) FalseNegativesInPaths(ctx context.Context, prefixes []string, limit int) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.falseNegativesInPathsPG(ctx, prefixes, limit)
+		return db.seedCandidatesInPathsPG(ctx, prefixes, "bad", limit, false)
 	}
-	return db.falseNegativesInPathsSQLite(ctx, prefixes, limit)
+	return db.seedCandidatesInPathsSQLite(ctx, prefixes, "bad", limit, false)
+}
+
+// FalsePositivesLightInPaths is like FalsePositivesInPaths but omits CleaveResult/LitmusResult.
+func (db *DB) FalsePositivesLightInPaths(ctx context.Context, prefixes []string, limit int) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.seedCandidatesInPathsPG(ctx, prefixes, "good", limit, true)
+	}
+	return db.seedCandidatesInPathsSQLite(ctx, prefixes, "good", limit, true)
+}
+
+// FalseNegativesLightInPaths is like FalseNegativesInPaths but omits CleaveResult/LitmusResult.
+func (db *DB) FalseNegativesLightInPaths(ctx context.Context, prefixes []string, limit int) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.seedCandidatesInPathsPG(ctx, prefixes, "bad", limit, true)
+	}
+	return db.seedCandidatesInPathsSQLite(ctx, prefixes, "bad", limit, true)
 }
 
 // CountByStatusInPaths returns sample counts grouped by status, filtered to

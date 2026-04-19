@@ -220,6 +220,49 @@ const liteSampleCols = `id, sha256, source, feed, ecosystem,
 	created_at, updated_at, analyzed_at, mtime, marker_mtime,
 	traits_version`
 
+// liteSampleColsLight excludes cleave_result and litmus_result to avoid
+// loading large JSON blobs when only metadata is needed.
+const liteSampleColsLight = `id, sha256, source, feed, ecosystem,
+	filename, file_type, size_bytes, label, label_source,
+	litmus_score,
+	path, status, note, canonical_sha256, parent, skip,
+	formula, elements, score, max_crit, suspicious_count,
+	created_at, updated_at, analyzed_at, mtime, marker_mtime,
+	traits_version`
+
+func scanLiteSamplesLight(rows *sql.Rows) ([]*Sample, error) {
+	defer rows.Close() //nolint:errcheck // best-effort cleanup
+	var out []*Sample
+	for rows.Next() {
+		s := &Sample{}
+		var status sql.NullString
+		var analyzedAt, mtime, markerMtime sql.NullTime
+		if err := rows.Scan(
+			&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
+			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &s.LitmusScore,
+			&s.Path, &status, &s.Note, &s.CanonicalSHA256,
+			&s.Parent, &s.Skip, &s.Formula, &s.Elements,
+			&s.Score, &s.MaxCrit, &s.SuspiciousCount,
+			&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime, &markerMtime,
+			&s.TraitsVersion,
+		); err != nil {
+			return nil, err
+		}
+		s.Status = status.String
+		if analyzedAt.Valid {
+			s.AnalyzedAt = &analyzedAt.Time
+		}
+		if mtime.Valid {
+			s.Mtime = &mtime.Time
+		}
+		if markerMtime.Valid {
+			s.MarkerMtime = &markerMtime.Time
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 func scanLiteSample(row *sql.Row) (*Sample, error) {
 	s := &Sample{}
 	var cleaveResult, litmusResult, status sql.NullString
@@ -540,6 +583,16 @@ func (db *DB) samplesByStatusSQLite(ctx context.Context, status string, limit in
 	return scanLiteSamples(rows)
 }
 
+func (db *DB) samplesByStatusLightSQLite(ctx context.Context, status string, limit int) ([]*Sample, error) {
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleColsLight+` FROM samples WHERE status = ? ORDER BY updated_at ASC LIMIT ?`,
+		status, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: samples by status (light): %w", err)
+	}
+	return scanLiteSamplesLight(rows)
+}
+
 func (db *DB) falsePositivesSQLite(ctx context.Context, limit int) ([]*Sample, error) {
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples
@@ -576,6 +629,32 @@ func (db *DB) falseNegativesSQLite(ctx context.Context, limit int) ([]*Sample, e
 		return nil, fmt.Errorf("hopper: false negatives: %w", err)
 	}
 	return scanLiteSamples(rows)
+}
+
+func (db *DB) falsePositivesLightSQLite(ctx context.Context, limit int) ([]*Sample, error) {
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleColsLight+` FROM samples
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
+		   AND (max_crit >= 5 OR suspicious_count >= 2)
+		 ORDER BY updated_at ASC LIMIT ?`,
+		limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: false positives (light): %w", err)
+	}
+	return scanLiteSamplesLight(rows)
+}
+
+func (db *DB) falseNegativesLightSQLite(ctx context.Context, limit int) ([]*Sample, error) {
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleColsLight+` FROM samples
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
+		   AND max_crit < 5 AND suspicious_count < 2
+		 ORDER BY updated_at ASC LIMIT ?`,
+		limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: false negatives (light): %w", err)
+	}
+	return scanLiteSamplesLight(rows)
 }
 
 func (db *DB) benignReviewSQLite(ctx context.Context, _, limit int) ([]*Sample, error) {
@@ -660,15 +739,7 @@ func (db *DB) samplesByStatusInPathsSQLite(ctx context.Context, status string, p
 	return scanLiteSamples(rows)
 }
 
-func (db *DB) falsePositivesInPathsSQLite(ctx context.Context, prefixes []string, limit int) ([]*Sample, error) {
-	return db.seedCandidatesInPathsSQLite(ctx, prefixes, "good", limit)
-}
-
-func (db *DB) falseNegativesInPathsSQLite(ctx context.Context, prefixes []string, limit int) ([]*Sample, error) {
-	return db.seedCandidatesInPathsSQLite(ctx, prefixes, "bad", limit)
-}
-
-func (db *DB) seedCandidatesInPathsSQLite(ctx context.Context, prefixes []string, label string, limit int) ([]*Sample, error) {
+func (db *DB) seedCandidatesInPathsSQLite(ctx context.Context, prefixes []string, label string, limit int, light bool) ([]*Sample, error) {
 	if len(prefixes) == 0 {
 		return nil, nil
 	}
@@ -688,8 +759,13 @@ func (db *DB) seedCandidatesInPathsSQLite(ctx context.Context, prefixes []string
 		detectionFilter = " AND max_crit < 5 AND suspicious_count < 2"
 	}
 
+	cols := liteSampleCols
+	if light {
+		cols = liteSampleColsLight
+	}
+
 	//nolint:gosec // query structure is built from constants, values are parameterized
-	query := `SELECT ` + liteSampleCols + ` FROM samples` +
+	query := `SELECT ` + cols + ` FROM samples` +
 		` WHERE status = '' AND label = ? AND skip = ''` +
 		` AND cleave_result IS NOT NULL` +
 		` AND (` + strings.Join(clauses, " OR ") + `)` +
@@ -698,6 +774,9 @@ func (db *DB) seedCandidatesInPathsSQLite(ctx context.Context, prefixes []string
 	rows, err := db.lite.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: seed candidates in paths: %w", err)
+	}
+	if light {
+		return scanLiteSamplesLight(rows)
 	}
 	return scanLiteSamples(rows)
 }
@@ -1325,7 +1404,8 @@ func (db *DB) unclaimJobsSQLite(ctx context.Context, shas []string) error {
 	defer tx.Rollback() //nolint:errcheck // rollback is best-effort after commit
 	for _, sha := range shas {
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE samples SET claimed_by = '', claimed_at = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE sha256 = ?`, sha); err != nil {
+			`UPDATE samples SET claimed_by = '', claimed_at = NULL,
+			updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE sha256 = ?`, sha); err != nil {
 			return fmt.Errorf("hopper: unclaim: %w", err)
 		}
 	}

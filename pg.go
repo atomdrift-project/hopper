@@ -173,6 +173,19 @@ func scanPGSamples(rows pgx.Rows) ([]*Sample, error) {
 	return out, rows.Err()
 }
 
+func scanPGSamplesLight(rows pgx.Rows) ([]*Sample, error) {
+	defer rows.Close()
+	var out []*Sample
+	for rows.Next() {
+		s := &Sample{}
+		if err := rows.Scan(pgSampleDestLight(s)...); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 	tag, err := db.pool.Exec(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
@@ -398,6 +411,16 @@ func (db *DB) samplesByStatusPG(ctx context.Context, status string, limit int) (
 	return scanPGSamples(rows)
 }
 
+func (db *DB) samplesByStatusLightPG(ctx context.Context, status string, limit int) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleColsLight+` FROM samples WHERE status = $1 ORDER BY updated_at ASC LIMIT $2`,
+		status, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: samples by status (light): %w", err)
+	}
+	return scanPGSamplesLight(rows)
+}
+
 func (db *DB) falsePositivesPG(ctx context.Context, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
@@ -409,6 +432,19 @@ func (db *DB) falsePositivesPG(ctx context.Context, limit int) ([]*Sample, error
 		return nil, fmt.Errorf("hopper: false positives: %w", err)
 	}
 	return scanPGSamples(rows)
+}
+
+func (db *DB) falsePositivesLightPG(ctx context.Context, limit int) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleColsLight+` FROM samples
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
+		   AND (max_crit >= 5 OR suspicious_count >= 2)
+		 ORDER BY updated_at ASC LIMIT $1`,
+		limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: false positives (light): %w", err)
+	}
+	return scanPGSamplesLight(rows)
 }
 
 func (db *DB) truePositivesPG(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
@@ -434,6 +470,19 @@ func (db *DB) falseNegativesPG(ctx context.Context, limit int) ([]*Sample, error
 		return nil, fmt.Errorf("hopper: false negatives: %w", err)
 	}
 	return scanPGSamples(rows)
+}
+
+func (db *DB) falseNegativesLightPG(ctx context.Context, limit int) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleColsLight+` FROM samples
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
+		   AND max_crit < 5 AND suspicious_count < 2
+		 ORDER BY updated_at ASC LIMIT $1`,
+		limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: false negatives (light): %w", err)
+	}
+	return scanPGSamplesLight(rows)
 }
 
 func (db *DB) benignReviewPG(ctx context.Context, _, limit int) ([]*Sample, error) {
@@ -513,15 +562,7 @@ func (db *DB) samplesByStatusInPathsPG(ctx context.Context, status string, prefi
 	return scanPGSamples(rows)
 }
 
-func (db *DB) falsePositivesInPathsPG(ctx context.Context, prefixes []string, limit int) ([]*Sample, error) {
-	return db.seedCandidatesInPathsPG(ctx, prefixes, "good", limit)
-}
-
-func (db *DB) falseNegativesInPathsPG(ctx context.Context, prefixes []string, limit int) ([]*Sample, error) {
-	return db.seedCandidatesInPathsPG(ctx, prefixes, "bad", limit)
-}
-
-func (db *DB) seedCandidatesInPathsPG(ctx context.Context, prefixes []string, label string, limit int) ([]*Sample, error) {
+func (db *DB) seedCandidatesInPathsPG(ctx context.Context, prefixes []string, label string, limit int, light bool) ([]*Sample, error) {
 	if len(prefixes) == 0 {
 		return nil, nil
 	}
@@ -541,8 +582,13 @@ func (db *DB) seedCandidatesInPathsPG(ctx context.Context, prefixes []string, la
 		detectionFilter = "AND max_crit < 5 AND suspicious_count < 2"
 	}
 
+	cols := pgSampleCols
+	if light {
+		cols = pgSampleColsLight
+	}
+
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM samples
+		`SELECT `+cols+` FROM samples
 		 WHERE status = '' AND label = $1 AND skip = ''
 		   AND cleave_result IS NOT NULL
 		   AND path LIKE ANY($2)
@@ -551,6 +597,9 @@ func (db *DB) seedCandidatesInPathsPG(ctx context.Context, prefixes []string, la
 		label, patterns, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: seed candidates in paths: %w", err)
+	}
+	if light {
+		return scanPGSamplesLight(rows)
 	}
 	return scanPGSamples(rows)
 }

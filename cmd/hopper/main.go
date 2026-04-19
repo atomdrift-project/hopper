@@ -425,7 +425,7 @@ func cmdReset(ctx context.Context) error {
 	return nil
 }
 
-func cmdLoad(ctx context.Context) error { //nolint:revive,maintidx // complex command setup function.
+func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx // complex command setup function.
 	f := flag.NewFlagSet("load", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
 	dataDir := f.String("data", "", "data directory containing bad/, good/, unknown/ subdirectories")
@@ -669,7 +669,8 @@ func cmdLoad(ctx context.Context) error { //nolint:revive,maintidx // complex co
 		}
 	}
 
-	total := loadAll(loadCtx, loadCancel, db, litmus, tracker, api, cache, loadDirs, fileChs, *source, *hashWorkers, *rescan, *maxAnalyzed, *experimentTag, wd)
+	total := loadAll(loadCtx, loadCancel, db, litmus, tracker, api, cache,
+		loadDirs, fileChs, *source, *hashWorkers, *rescan, *maxAnalyzed, *experimentTag, wd)
 	slog.Info("file walk complete, serving API until interrupted", "samples", total)
 
 	// Block until interrupted — workers are still draining the analysis queue.
@@ -730,7 +731,7 @@ var (
 // the directory pipelines; then the analysis queue is closed and drained;
 // then the summary is logged. nworkers bounds how many directory pipelines
 // may run concurrently (irrelevant for typical 3-dir loads).
-func loadAll( //nolint:revive // many params reflect the many subsystems coordinated here.
+func loadAll( //nolint:nolintlint,revive // many params reflect the many subsystems coordinated here.
 	ctx context.Context,
 	_ context.CancelFunc,
 	db *hopper.DB,
@@ -982,7 +983,7 @@ func runDirPipeline(
 // coordination with workers is required beyond those atomic loads. The pool
 // status block is fed by background nodeMonitors so this function never
 // blocks on a slow remote.
-func runDashboard( //nolint:gocognit,revive,maintidx // complex dashboard loop with many coordinated params.
+func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashboard loop with many coordinated params.
 	ctx context.Context,
 	progress *loadProgress,
 	_ *litmusServer,

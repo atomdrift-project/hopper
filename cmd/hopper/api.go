@@ -209,7 +209,7 @@ const (
 	maxWorkerNameLen   = 64
 	maxResultBodyBytes = 128 << 20 // 128 MiB — complex samples with many embedded binaries produce large cleave reports.
 	maxTrackedWorkers  = 200
-	apiQueryTimeout = 30 * time.Second
+	apiQueryTimeout    = 30 * time.Second
 )
 
 // validWorkerName checks that the name is non-empty, <= maxWorkerNameLen,
@@ -289,7 +289,9 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 
 	// Cap claims for workers that haven't returned any results yet.
 	if limit := s.tracker.claimLimit(worker); limit == 0 {
-		slog.Warn("unproven worker at active claim limit, waiting for results", "worker", worker, "active", s.tracker.activeClaims(worker)) //nolint:gosec // worker is sanitized by validWorkerName
+		//nolint:gosec // worker is sanitized by validWorkerName
+		slog.Warn("unproven worker at active claim limit, waiting for results",
+			"worker", worker, "active", s.tracker.activeClaims(worker))
 		s.tracker.update(worker, slots, version, traits, 0, rssMB, load1)
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -345,10 +347,10 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	filtered := jobs[:0]
 	for _, j := range jobs {
 		if j.Path == "" || j.Path == "." {
-			slog.Warn("skipping job with empty path",
+			slog.Warn("skipping job with empty path", //nolint:gosec // structured logging, worker validated
 				"worker", worker, "sha256", j.SHA256)
 			if err := s.db.SetSkip(ctx, j.SHA256, "empty_path"); err != nil {
-				slog.Error("mark empty_path failed", "sha256", j.SHA256, "error", err)
+				slog.Error("mark empty_path failed", "sha256", j.SHA256, "error", err) //nolint:gosec // structured logging
 			}
 			continue
 		}
@@ -387,7 +389,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxResultBodyBytes))
 	if err != nil {
-		slog.Warn("result rejected: read body failed", "error", err, "remote", r.RemoteAddr)
+		slog.Warn("result rejected: read body failed", "error", err, "remote", r.RemoteAddr) //nolint:gosec // structured logging
 		http.Error(w, `{"error":"read body"}`, http.StatusBadRequest)
 		return
 	}
@@ -399,7 +401,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 			snippet = snippet[:128] + "..." + snippet[len(snippet)-128:]
 		}
 		truncated := int64(len(body)) >= maxResultBodyBytes
-		slog.Warn("result rejected: invalid json",
+		slog.Warn("result rejected: invalid json", //nolint:gosec // structured logging
 			"error", err,
 			"remote", r.RemoteAddr,
 			"body_len", len(body),

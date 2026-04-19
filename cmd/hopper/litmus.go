@@ -306,10 +306,7 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 			"error", err,
 			"restarts", restarts)
 
-		delay := time.Duration(1<<min(restarts-1, 7)) * time.Second // cap at 128s (~2min)
-		if delay > 2*time.Minute {
-			delay = 2 * time.Minute
-		}
+		delay := min(time.Duration(1<<min(restarts-1, 7))*time.Second, 2*time.Minute)
 		slog.Info("restarting litmus server",
 			"previous_pid", pid,
 			"url", s.hopperURL,

@@ -266,7 +266,7 @@ footer{padding-top:1rem;border-top:1px solid var(--border);
   font-family:var(--mono);font-size:.75rem;color:var(--sub)}
 `
 
-func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) {
+func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //nolint:maintidx // dashboard handler has many query parameters
 	wd.cfgMu.RLock()
 	progress := wd.progress
 	tracker := wd.tracker
