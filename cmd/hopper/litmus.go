@@ -15,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"codeberg.org/atomdrift/hopper"
 )
 
 const restartRecoveryDelay = 15 * time.Second
@@ -430,23 +432,7 @@ func (s *litmusServer) waitExit(ctx context.Context) error {
 
 // extractCanonicalSHA computes the minimum SHA256 across files in the raw cleave report.
 func extractCanonicalSHA(sha256 string, raw json.RawMessage) string {
-	var report struct {
-		Files []struct {
-			SHA256 string `json:"sha"`
-			Score  int    `json:"x"`
-			Depth  int    `json:"dp"`
-		} `json:"fs"`
-	}
-	if json.Unmarshal(raw, &report) != nil {
-		return sha256
-	}
-	canonical := sha256
-	for _, f := range report.Files {
-		if len(f.SHA256) == 64 && f.SHA256 < canonical {
-			canonical = f.SHA256
-		}
-	}
-	return canonical
+	return hopper.ParseCleaveResult(sha256, raw).CanonicalSHA
 }
 
 // litmusTraitsVersion runs `litmus version --format=json` and returns the

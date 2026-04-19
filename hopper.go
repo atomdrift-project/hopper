@@ -27,7 +27,7 @@ import (
 
 func closeSQLiteBestEffort(db *sql.DB) {
 	if err := db.Close(); err != nil {
-		return
+		slog.Debug("close sqlite failed", "error", err)
 	}
 }
 
@@ -1027,11 +1027,11 @@ func (db *DB) RecomputeCanonicalSHA256(ctx context.Context) (int64, error) {
 }
 
 // FeedQuery specifies filters for paginated feed queries.
-type FeedQuery struct { //nolint:govet // filter fields are grouped for readability.
-	Source     string   // "harvest" or "upload"
-	Label      string   // "bad", "good", "unknown", or "" (match any)
+type FeedQuery struct {
 	Feeds      []string // optional: filter by feed column values
 	Ecosystems []string // optional: filter by ecosystem column values
+	Source     string   // "harvest" or "upload"
+	Label      string   // "bad", "good", "unknown", or "" (match any)
 	OrderBy    string   // "mtime" (default) or "analyzed_at"
 	Limit      int      // page size (clamped to 1–100)
 	Offset     int      // pagination offset
