@@ -1067,14 +1067,16 @@ func scanPGCounts(rows pgx.Rows) (map[string]int, error) {
 
 // Pull-based work scheduling (PostgreSQL).
 
-func (db *DB) claimJobsPG(ctx context.Context, worker string, limit int, expiry time.Duration, currentTraits string) ([]ClaimJob, error) {
+func (db *DB) claimJobsPG(ctx context.Context, worker string, limit int, expiry time.Duration, currentTraits string, rescanAge time.Duration) ([]ClaimJob, error) {
 	// Tier 1: unanalyzed samples (highest priority).
+	// ORDER BY random() spreads work across different packages/sources so a
+	// batch of structurally similar archives can't monopolize all workers.
 	rows, err := db.pool.Query(ctx, `
 		WITH claimable AS (
 			SELECT id FROM samples
 			WHERE cleave_result IS NULL AND skip = '' AND parent = ''
 			  AND (claimed_by = '' OR claimed_at < now() - $2::interval)
-			ORDER BY updated_at ASC NULLS FIRST, id
+			ORDER BY random()
 			LIMIT $3
 			FOR UPDATE SKIP LOCKED
 		)
@@ -1095,14 +1097,15 @@ func (db *DB) claimJobsPG(ctx context.Context, worker string, limit int, expiry 
 
 	// Tier 2: stale-traits rescan — only when no unanalyzed samples remain.
 	// Reset cleave/litmus results so the normal result flow applies unchanged.
+	// ORDER BY random() for the same reason as tier 1.
 	rows, err = db.pool.Query(ctx, `
 		WITH reclaimable AS (
 			SELECT id FROM samples
 			WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
 			  AND traits_version != $4
-			  AND analyzed_at < now() - interval '7 days'
+			  AND analyzed_at < $5
 			  AND (claimed_by = '' OR claimed_at < now() - $2::interval)
-			ORDER BY analyzed_at ASC, id
+			ORDER BY random()
 			LIMIT $3
 			FOR UPDATE SKIP LOCKED
 		)
@@ -1111,7 +1114,7 @@ func (db *DB) claimJobsPG(ctx context.Context, worker string, limit int, expiry 
 			litmus_score = 0, traits_version = ''
 		FROM reclaimable WHERE samples.id = reclaimable.id
 		RETURNING samples.sha256, samples.path, samples.size_bytes, samples.file_type`,
-		worker, expiry, limit, currentTraits)
+		worker, expiry, limit, currentTraits, time.Now().Add(-rescanAge).UTC())
 	if err != nil {
 		return nil, fmt.Errorf("hopper: claim stale-traits jobs: %w", err)
 	}

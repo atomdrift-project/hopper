@@ -102,8 +102,9 @@ func (s *litmusServer) currentPID() int {
 	return int(s.pid.Load())
 }
 
-// Start launches the litmus worker subprocess. The litmus binary is rebuilt
-// from source in the background so startup is not blocked.
+// Start launches the litmus worker subprocess. The caller is responsible
+// for rebuilding the binary (via updateSiblingTool) before calling Start
+// so that the worker runs the latest version from the first request.
 func (s *litmusServer) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -112,46 +113,7 @@ func (s *litmusServer) Start(ctx context.Context) error {
 		return errors.New("litmus server already started")
 	}
 
-	// Start the server with the currently installed binary so it can
-	// serve traffic immediately. The rebuild runs in the background and
-	// only briefly sets building=true during the actual restart swap.
-	if err := s.startLocked(ctx); err != nil {
-		return err
-	}
-
-	go func() {
-		updateSiblingTool(ctx, "litmus", "../litmus")
-
-		// Only mark building during the brief restart window so the
-		// existing process serves traffic throughout the build.
-		s.building.Store(true)
-		defer s.building.Store(false)
-
-		// Restart so the newly built binary takes effect. Reuse the
-		// same port — it is free because we kill the old process first,
-		// and keeping it stable avoids races with the pool and health
-		// checkers that already know the URL.
-		if s.tracker != nil && s.workerName != "" {
-			s.tracker.resetClaims(s.workerName)
-		}
-		s.mu.Lock()
-		if s.cmd != nil && s.cmd.Process != nil {
-			slog.Info("restarting litmus with updated binary", "pid", s.cmd.Process.Pid)
-			killProcess("failed to kill litmus for rebuild", s.cmd.Process, "pid", s.cmd.Process.Pid)
-			// Do NOT call cmd.Wait here — the Monitor goroutine may
-			// have already reaped the process via waitExit, and
-			// cmd.Wait() is not safe for concurrent use. The kill is
-			// best-effort; if the process is already dead, that's fine.
-			s.cmd = nil
-			s.pid.Store(0)
-		}
-		if err := s.startLocked(ctx); err != nil {
-			slog.Error("failed to restart litmus after rebuild", "error", err)
-		}
-		s.mu.Unlock()
-	}()
-
-	return nil
+	return s.startLocked(ctx)
 }
 
 // updateSiblingTool runs `git pull && make install` in dir, treating pull
@@ -435,15 +397,44 @@ func extractCanonicalSHA(sha256 string, raw json.RawMessage) string {
 	return hopper.ParseCleaveResult(sha256, raw).CanonicalSHA
 }
 
-// litmusTraitsVersion runs `litmus version --format=json` and returns the
+const updateErrorDelay = 30 * time.Second
+
+// refreshLitmusRules runs `litmus update-rules` to pull the latest rule and
+// model bundles. The binary itself is already rebuilt by Start's background
+// goroutine via updateSiblingTool. If update-rules fails we pause briefly
+// so a concurrent rebuild has time to settle before we check the version.
+func refreshLitmusRules(ctx context.Context, bin string) {
+	ur := exec.CommandContext(ctx, bin, "update-rules")
+	if out, err := ur.CombinedOutput(); err != nil {
+		slog.Warn("litmus update-rules failed (non-fatal)", "bin", bin, "error", err, "output", string(out))
+		slog.Info("pausing after litmus update-rules error", "delay", updateErrorDelay)
+		select {
+		case <-time.After(updateErrorDelay):
+		case <-ctx.Done():
+		}
+	} else {
+		slog.Info("litmus update-rules succeeded", "bin", bin)
+	}
+}
+
+// litmusTraitsVersion runs `litmus -f json version` and returns the
 // first 5 characters of the traits commit hash. Returns "" on any error.
 func litmusTraitsVersion(ctx context.Context, bin string) string {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, bin, "version", "--format=json").Output()
+	cmd := exec.CommandContext(ctx, bin, "-f", "json", "version")
+	out, err := cmd.Output()
 	if err != nil {
-		slog.Warn("failed to get litmus traits version", "bin", bin, "error", err)
+		stderr := ""
+		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+			stderr = string(ee.Stderr)
+			if len(stderr) > 256 {
+				stderr = stderr[:256]
+			}
+		}
+		slog.Warn("failed to get litmus traits version (is litmus up to date?)",
+			"bin", bin, "error", err, "stderr", stderr)
 		return ""
 	}
 

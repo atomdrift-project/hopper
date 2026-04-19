@@ -1246,7 +1246,7 @@ func (db *DB) feedEcosystemsSQLite(ctx context.Context, source, label string) ([
 
 // Pull-based work scheduling (SQLite).
 
-func (db *DB) claimJobsSQLite(ctx context.Context, worker string, limit int, expiry time.Duration, currentTraits string) ([]ClaimJob, error) {
+func (db *DB) claimJobsSQLite(ctx context.Context, worker string, limit int, expiry time.Duration, currentTraits string, rescanAge time.Duration) ([]ClaimJob, error) {
 	// SQLite serializes writers via SetMaxOpenConns(1) on the pool, so
 	// concurrent claim requests are safe without row-level locking.
 	tx, err := db.lite.BeginTx(ctx, nil)
@@ -1258,11 +1258,13 @@ func (db *DB) claimJobsSQLite(ctx context.Context, worker string, limit int, exp
 	cutoff := time.Now().Add(-expiry).UTC().Format(time.RFC3339Nano)
 
 	// Tier 1: unanalyzed samples (highest priority).
+	// ORDER BY random() spreads work across different packages/sources so a
+	// batch of structurally similar archives can't monopolize all workers.
 	selected, err := queryLiteClaimRows(ctx, tx,
 		`SELECT id, sha256, path, size_bytes, file_type FROM samples
 		WHERE cleave_result IS NULL AND skip = '' AND parent = ''
 		  AND (claimed_by = '' OR claimed_at < ?)
-		ORDER BY updated_at ASC, id LIMIT ?`, cutoff, limit)
+		ORDER BY random() LIMIT ?`, cutoff, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: claim jobs: %w", err)
 	}
@@ -1270,14 +1272,14 @@ func (db *DB) claimJobsSQLite(ctx context.Context, worker string, limit int, exp
 	// Tier 2: stale-traits rescan — only when no unanalyzed samples remain.
 	stale := false
 	if len(selected) == 0 && currentTraits != "" {
-		staleAge := time.Now().Add(-7 * 24 * time.Hour).UTC().Format(time.RFC3339Nano)
+		staleAge := time.Now().Add(-rescanAge).UTC().Format(time.RFC3339Nano)
 		selected, err = queryLiteClaimRows(ctx, tx,
 			`SELECT id, sha256, path, size_bytes, file_type FROM samples
 			WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
 			  AND traits_version != ?
 			  AND analyzed_at < ?
 			  AND (claimed_by = '' OR claimed_at < ?)
-			ORDER BY analyzed_at ASC, id LIMIT ?`, currentTraits, staleAge, cutoff, limit)
+			ORDER BY random() LIMIT ?`, currentTraits, staleAge, cutoff, limit)
 		if err != nil {
 			return nil, fmt.Errorf("hopper: claim stale-traits jobs: %w", err)
 		}

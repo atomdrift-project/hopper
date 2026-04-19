@@ -437,6 +437,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx //
 	// Remote litmus workers self-register via the pull API; no --litmus-nodes flag needed.
 	maxRSSGB := f.Int("max-memory-gb", 0, "litmus RSS limit in GB (0 = auto)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
+	rescanAge := f.Duration("rescan-age", 7*24*time.Hour, "minimum age before a stale-traits sample is eligible for rescan")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
 	experimentTag := f.String("experiment-tag", "", "label for experiment comparison")
@@ -503,10 +504,34 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx //
 		return fmt.Errorf("no bad/, good/, or unknown/ subdirectories found in %s", *dataDir)
 	}
 
-	// Start litmus early — it takes several seconds to load its model and
-	// YARA rules, and none of that depends on cleave, the hash cache, or
-	// the database. Running it in parallel with those steps shaves ~5s off
-	// every startup.
+	// Rebuild tools first so we can bail early if litmus or cleave is broken.
+	// Both builds run in parallel; once done we update litmus rules and check
+	// the traits version — all before touching the database.
+	type buildResult struct{ err error }
+	litmusBuildCh := make(chan buildResult, 1)
+	cleaveBuildCh := make(chan buildResult, 1)
+	go func() {
+		updateSiblingTool(ctx, "litmus", "../litmus")
+		litmusBuildCh <- buildResult{}
+	}()
+	go func() {
+		updateSiblingTool(ctx, "cleave", "../cleave")
+		cleaveBuildCh <- buildResult{}
+	}()
+	<-litmusBuildCh
+	<-cleaveBuildCh
+
+	// With a freshly built binary, pull latest rules and check the version.
+	var traitsVersion string
+	if *litmusBin != "" {
+		refreshLitmusRules(ctx, *litmusBin)
+		traitsVersion = litmusTraitsVersion(ctx, *litmusBin)
+		if traitsVersion != "" {
+			slog.Info("traits version for rescan", "version", traitsVersion)
+		}
+	}
+
+	// Now start litmus and the rest of the startup work.
 	var litmus *litmusServer
 	type litmusResult struct{ err error }
 	litmusCh := make(chan litmusResult, 1)
@@ -538,9 +563,8 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx //
 		litmusCh <- litmusResult{} // nothing to wait for
 	}
 
-	// Run all independent startup work in parallel: cleave rebuild, hash
-	// cache load, DB connect+migrate, and remote litmus dial all happen
-	// concurrently alongside the local litmus startup above.
+	// Run independent startup work in parallel: hash cache load, DB
+	// connect+migrate, and file enumeration alongside litmus startup.
 	var dirNames []string
 	for _, d := range loadDirs {
 		dirNames = append(dirNames, d.label)
@@ -553,8 +577,6 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx //
 		"cache", !*noCache,
 		"max_analyzed", *maxAnalyzed,
 		"experiment", *experimentTag)
-
-	go updateSiblingTool(ctx, "cleave", "../cleave")
 
 	// Start file enumeration early — cleave iter-files doesn't need the
 	// hash cache or database, so overlap it with those slower init steps.
@@ -661,16 +683,11 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx //
 	api.dataRoot = *dataDir
 	api.allowedDirs = allowedDirs
 
-	// Determine current traits version for stale-traits rescanning.
-	if *litmusBin != "" {
-		if tv := litmusTraitsVersion(ctx, *litmusBin); tv != "" {
-			api.traitsVersion = tv
-			slog.Info("traits version for rescan", "version", tv)
-		}
-	}
+	api.traitsVersion = traitsVersion
+	api.rescanAge = *rescanAge
 
 	total := loadAll(loadCtx, loadCancel, db, litmus, tracker, api, cache,
-		loadDirs, fileChs, *source, *hashWorkers, *rescan, *maxAnalyzed, *experimentTag, wd)
+		loadDirs, fileChs, *source, *hashWorkers, *rescan, *maxAnalyzed, *experimentTag, wd, traitsVersion, *rescanAge)
 	slog.Info("file walk complete, serving API until interrupted", "samples", total)
 
 	// Block until interrupted — workers are still draining the analysis queue.
@@ -747,6 +764,8 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	maxAnalyzed int,
 	experimentTag string,
 	wd *webDashboard,
+	traitsVersion string,
+	rescanAge time.Duration,
 ) int {
 	slog.Info("loading", "dirs", len(dirs))
 	start := time.Now()
@@ -775,11 +794,11 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	// Progress dashboard — runs until ctx is cancelled (ctrl-C).
 	var dashWG sync.WaitGroup
 	dashWG.Go(func() {
-		runDashboard(ctx, &progress, litmus, tracker, db, start, startAnalyzed, maxAnalyzed, len(dirs))
+		runDashboard(ctx, &progress, litmus, tracker, db, start, startAnalyzed, maxAnalyzed, len(dirs), traitsVersion, rescanAge)
 	})
 
 	if wd != nil {
-		wd.configure(&progress, litmus, tracker, db, start, startAnalyzed, maxAnalyzed, len(dirs))
+		wd.configure(&progress, litmus, tracker, db, start, startAnalyzed, maxAnalyzed, len(dirs), traitsVersion, rescanAge)
 	}
 
 	// runWalk executes one full enumeration→hash→insert pass across all dirs.
@@ -992,6 +1011,8 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 	start time.Time,
 	startAnalyzed int64,
 	maxAnalyzed, ndirs int,
+	traitsVersion string,
+	rescanAge time.Duration,
 ) {
 	interval := 10 * time.Second
 	if !isTTY() {
@@ -1025,13 +1046,15 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 		// Query oldest active claim per worker.
 		oldestClaims := make(map[string]hopper.WorkerClaim)
 		var newestAnalyzedAt time.Time
+		var rescanPending int64
 		if db != nil {
 			if claims, err := db.OldestClaims(ctx, staleClaimAge); err == nil {
 				for _, c := range claims {
 					oldestClaims[c.Worker] = c
 				}
 			}
-			newestAnalyzedAt, _ = db.NewestAnalyzedAt(ctx) //nolint:errcheck // best-effort; zero time is acceptable fallback
+			newestAnalyzedAt, _ = db.NewestAnalyzedAt(ctx)   //nolint:errcheck // best-effort; zero time is acceptable fallback
+			rescanPending, _ = db.CountRescanPending(ctx, traitsVersion, rescanAge) //nolint:errcheck // best-effort; zero is acceptable fallback
 		}
 
 		analyzedAbs := progress.analyzed.Load()
@@ -1117,8 +1140,12 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 			if elapsed := time.Since(start).Seconds(); elapsed > 5 && sessionAnalyzed > 0 {
 				attrs = append(attrs, "rate_overall", fmt.Sprintf("%.1f/s", float64(sessionAnalyzed)/elapsed))
 			}
-			if rate15m > 0.1 && pending > 0 {
-				etaDur := time.Duration(float64(pending)/rate15m) * time.Second
+			totalRemaining := pending + rescanPending
+			if rescanPending > 0 {
+				attrs = append(attrs, "rescan_pending", rescanPending)
+			}
+			if rate15m > 0.1 && totalRemaining > 0 {
+				etaDur := time.Duration(float64(totalRemaining)/rate15m) * time.Second
 				attrs = append(attrs, "eta", formatETA(etaDur))
 			}
 			slog.Info("load progress", attrs...)
@@ -1127,9 +1154,11 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 		}
 
 		// TTY dashboard
+		totalRemaining := pending + rescanPending
+
 		var etaStr string
-		if rate15m > 0.1 && pending > 0 {
-			etaDur := time.Duration(float64(pending)/rate15m) * time.Second
+		if rate15m > 0.1 && totalRemaining > 0 {
+			etaDur := time.Duration(float64(totalRemaining)/rate15m) * time.Second
 			etaStr = formatETA(etaDur)
 		}
 
@@ -1158,21 +1187,29 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 		}
 		writeStdoutf("%s\n", analysisLine)
 
-		// Line 2: discovery progress (walked files → DB rows)
-		discoveryLine := fmt.Sprintf(
-			"  %s / %s in db",
-			fmtN(totalInDB), fmtN(walked))
-		if walked > 0 {
-			discoveryLine += fmt.Sprintf("  %.0f%%",
-				math.Min(float64(totalInDB)/float64(walked)*100, 100))
+		// Line 2: remaining work breakdown
+		if totalRemaining > 0 || !progress.walkDone.Load() {
+			remainLine := "  "
+			if pending > 0 {
+				remainLine += fmt.Sprintf("%s pending", fmtN(pending))
+			}
+			if rescanPending > 0 {
+				if pending > 0 {
+					remainLine += " + "
+				}
+				remainLine += fmt.Sprintf("%s rescan", fmtN(rescanPending))
+			}
+			if pending > 0 || rescanPending > 0 {
+				remainLine += fmt.Sprintf(" = %s remaining", fmtN(totalRemaining))
+			}
+			if insertRate15m > 0.1 {
+				remainLine += fmt.Sprintf("  %.1f/s new", insertRate15m)
+			}
+			if !progress.walkDone.Load() {
+				remainLine += "  walking\u2026"
+			}
+			writeStdoutf("%s\n", remainLine)
 		}
-		if insertRate15m > 0.1 {
-			discoveryLine += fmt.Sprintf("  %.1f/s new", insertRate15m)
-		}
-		if !progress.walkDone.Load() {
-			discoveryLine += "  walking\u2026"
-		}
-		writeStdoutf("%s\n", discoveryLine)
 
 		// Workers
 		if len(workers) > 0 {

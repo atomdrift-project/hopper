@@ -1441,7 +1441,7 @@ func TestClaimJobsSkipsMarkedSamples(t *testing.T) {
 	mustInsert(t, ctx, db, &Sample{SHA256: "claim2", Path: "/data/b.exe", Label: "bad", Skip: "unsupported"})
 	mustInsert(t, ctx, db, &Sample{SHA256: "claim3", Path: "/data/c.exe", Label: "bad", Skip: "missing"})
 
-	jobs, err := db.ClaimJobs(ctx, "testworker", 10, 30*time.Minute, "")
+	jobs, err := db.ClaimJobs(ctx, "testworker", 10, 30*time.Minute, "", 7*24*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1462,7 +1462,7 @@ func TestClaimJobsExpiry(t *testing.T) {
 	mustInsert(t, ctx, db, &Sample{SHA256: "exp1", Path: "/data/a.exe", Label: "bad"})
 
 	// Claim it.
-	jobs, err := db.ClaimJobs(ctx, "worker1", 1, 30*time.Minute, "")
+	jobs, err := db.ClaimJobs(ctx, "worker1", 1, 30*time.Minute, "", 7*24*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1471,7 +1471,7 @@ func TestClaimJobsExpiry(t *testing.T) {
 	}
 
 	// Try to claim again — should get nothing (still claimed).
-	jobs, err = db.ClaimJobs(ctx, "worker2", 1, 30*time.Minute, "")
+	jobs, err = db.ClaimJobs(ctx, "worker2", 1, 30*time.Minute, "", 7*24*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1480,7 +1480,7 @@ func TestClaimJobsExpiry(t *testing.T) {
 	}
 
 	// Claim with zero expiry — should reclaim the expired job.
-	jobs, err = db.ClaimJobs(ctx, "worker2", 1, 0, "")
+	jobs, err = db.ClaimJobs(ctx, "worker2", 1, 0, "", 7*24*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}

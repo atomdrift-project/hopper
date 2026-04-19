@@ -35,9 +35,12 @@ type webDashboard struct { //nolint:govet // fields grouped logically.
 	samples       []throughputSample // capped at maxThroughputSamples
 	start         time.Time
 	startAnalyzed int64
-	mu            sync.Mutex
-	maxAnalyzed   int
-	ndirs         int
+	mu             sync.Mutex
+	maxAnalyzed    int
+	ndirs          int
+	traitsVersion  string
+	rescanAge      time.Duration
+	rescanCache    *fido.Cache[string, int64]
 }
 
 // configure is called once the load session is ready. It sets the fields the
@@ -45,7 +48,7 @@ type webDashboard struct { //nolint:govet // fields grouped logically.
 // HTTP server already running.
 func (wd *webDashboard) configure(
 	progress *loadProgress, litmus *litmusServer, tracker *workerTracker,
-	db *hopper.DB, start time.Time, startAnalyzed int64, maxAnalyzed, ndirs int,
+	db *hopper.DB, start time.Time, startAnalyzed int64, maxAnalyzed, ndirs int, traitsVersion string, rescanAge time.Duration,
 ) {
 	wd.cfgMu.Lock()
 	defer wd.cfgMu.Unlock()
@@ -57,8 +60,11 @@ func (wd *webDashboard) configure(
 	wd.startAnalyzed = startAnalyzed
 	wd.maxAnalyzed = maxAnalyzed
 	wd.ndirs = ndirs
+	wd.traitsVersion = traitsVersion
+	wd.rescanAge = rescanAge
 	wd.claimsCache = fido.New[string, []hopper.WorkerClaim](fido.Size(1), fido.TTL(10*time.Second))
 	wd.newestATCache = fido.New[string, time.Time](fido.Size(1), fido.TTL(10*time.Second))
+	wd.rescanCache = fido.New[string, int64](fido.Size(1), fido.TTL(10*time.Second))
 }
 
 const maxThroughputSamples = 2880 // 4 hours at 5-second refresh
@@ -303,6 +309,18 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		})
 	}
 
+	var rescanPending int64
+	if db != nil && wd.traitsVersion != "" {
+		tv := wd.traitsVersion
+		ra := wd.rescanAge
+		//nolint:errcheck,contextcheck // Fetch returns zero on error; closure creates its own context.
+		rescanPending, _ = wd.rescanCache.Fetch("rescan", func() (int64, error) {
+			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
+			defer cancel()
+			return db.CountRescanPending(qctx, tv, ra)
+		})
+	}
+
 	if progress == nil {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = fmt.Fprint(w, //nolint:errcheck // best-effort HTTP response
@@ -334,9 +352,11 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	wd.recordSample(sessionAnalyzed)
 	rate, nodeRateByName := wd.ratesOver(15 * time.Minute)
 
+	totalRemaining := pending + rescanPending
+
 	var etaStr string
-	if rate > 0.1 && pending > 0 {
-		etaDur := time.Duration(float64(pending)/rate) * time.Second
+	if rate > 0.1 && totalRemaining > 0 {
+		etaDur := time.Duration(float64(totalRemaining)/rate) * time.Second
 		etaStr = formatETA(etaDur)
 	}
 
@@ -362,11 +382,17 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	buf.WriteString(`<div class="progress-stats">`)
 	fmt.Fprintf(&buf, `<span class="progress-main"><span class="progress-pct">%.0f%%</span> analyzed</span>`, pct)
 
-	// Rate + ETA
+	// Rate + ETA + remaining breakdown
 	buf.WriteString(`<span class="progress-detail">`)
 	fmt.Fprintf(&buf, `<em>%s</em> / %s analyzed`, fmtN(analyzedAbs), fmtN(totalExpected))
 	if pending > 0 {
 		fmt.Fprintf(&buf, ` &middot; <em>%s</em> pending`, fmtN(pending))
+	}
+	if rescanPending > 0 {
+		fmt.Fprintf(&buf, ` &middot; <em>%s</em> rescan`, fmtN(rescanPending))
+	}
+	if pending > 0 && rescanPending > 0 {
+		fmt.Fprintf(&buf, ` &middot; <em>%s</em> remaining`, fmtN(totalRemaining))
 	}
 	if rate > 0.1 {
 		fmt.Fprintf(&buf, ` &middot; <em>%.1f</em>/s (15m avg)`, rate)

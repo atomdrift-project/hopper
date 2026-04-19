@@ -30,7 +30,8 @@ type apiServer struct { //nolint:govet // fields grouped logically, not by align
 	progress      *loadProgress
 	dataRoot      string   // absolute path to the data directory; paths are served relative to this
 	allowedDirs   []string // resolved absolute paths that /api/file may serve from
-	traitsVersion string   // short prefix of current traits repo commit; empty = rescan disabled
+	traitsVersion string        // short prefix of current traits repo commit; empty = rescan disabled
+	rescanAge     time.Duration // minimum age before stale-traits samples are eligible for rescan
 }
 
 // workerTracker is an in-memory view of active workers, updated on every
@@ -302,7 +303,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
 
-	jobs, err := s.db.ClaimJobs(ctx, worker, count, claimExpiry, s.traitsVersion)
+	jobs, err := s.db.ClaimJobs(ctx, worker, count, claimExpiry, s.traitsVersion, s.rescanAge)
 	if err != nil {
 		slog.Error("claim jobs failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)

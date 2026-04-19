@@ -697,13 +697,13 @@ func (db *DB) NewestAnalyzedAt(ctx context.Context) (time.Time, error) {
 
 // ClaimJobs atomically claims up to limit unanalyzed samples for the named
 // worker. Expired claims (older than expiry) are reclaimed. When no unanalyzed
-// samples remain, samples analyzed with a different traits version more than
-// 7 days ago are reclaimed for re-analysis.
-func (db *DB) ClaimJobs(ctx context.Context, worker string, limit int, expiry time.Duration, currentTraits string) ([]ClaimJob, error) {
+// samples remain, samples analyzed with a different traits version older than
+// rescanAge are reclaimed for re-analysis.
+func (db *DB) ClaimJobs(ctx context.Context, worker string, limit int, expiry time.Duration, currentTraits string, rescanAge time.Duration) ([]ClaimJob, error) {
 	if db.pool != nil {
-		return db.claimJobsPG(ctx, worker, limit, expiry, currentTraits)
+		return db.claimJobsPG(ctx, worker, limit, expiry, currentTraits, rescanAge)
 	}
-	return db.claimJobsSQLite(ctx, worker, limit, expiry, currentTraits)
+	return db.claimJobsSQLite(ctx, worker, limit, expiry, currentTraits, rescanAge)
 }
 
 // UnclaimAll releases all outstanding claims. Call on startup to clear
@@ -885,6 +885,35 @@ func (db *DB) CountPending(ctx context.Context) (int64, error) {
 		err = db.pool.QueryRow(ctx, q).Scan(&n)
 	} else {
 		err = db.lite.QueryRowContext(ctx, q).Scan(&n)
+	}
+	return n, err
+}
+
+// CountRescanPending returns the number of previously analyzed samples
+// eligible for re-analysis due to stale traits (matching the tier-2 claim
+// criteria: stale traits version AND analyzed longer ago than rescanAge).
+// Returns 0 if currentTraits is empty (rescan disabled).
+func (db *DB) CountRescanPending(ctx context.Context, currentTraits string, rescanAge time.Duration) (int64, error) {
+	if currentTraits == "" {
+		return 0, nil
+	}
+	cutoff := time.Now().Add(-rescanAge).UTC()
+	var n int64
+	var err error
+	if db.pool != nil {
+		err = db.pool.QueryRow(ctx,
+			`SELECT count(*) FROM samples `+
+				`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' `+
+				`AND traits_version != $1 `+
+				`AND analyzed_at < $2`,
+			currentTraits, cutoff).Scan(&n)
+	} else {
+		err = db.lite.QueryRowContext(ctx,
+			`SELECT count(*) FROM samples `+
+				`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' `+
+				`AND traits_version != ? `+
+				`AND analyzed_at < ?`,
+			currentTraits, cutoff.Format(time.RFC3339Nano)).Scan(&n)
 	}
 	return n, err
 }
