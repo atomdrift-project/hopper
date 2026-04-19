@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS samples (
 	mtime         DATETIME,
 	marker_mtime  DATETIME,
 	claimed_by    TEXT NOT NULL DEFAULT '',
-	claimed_at    DATETIME
+	claimed_at    DATETIME,
+	traits_version TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_samples_label ON samples(label);

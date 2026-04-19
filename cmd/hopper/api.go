@@ -24,12 +24,13 @@ import (
 // jobs, submit results via /api/result, and fetch file content from
 // /api/file/{sha256}. All state lives in the database; the workerTracker
 // is an in-memory cache for the dashboard.
-type apiServer struct {
-	db          *hopper.DB
-	tracker     *workerTracker
-	progress    *loadProgress
-	dataRoot    string   // absolute path to the data directory; paths are served relative to this
-	allowedDirs []string // resolved absolute paths that /api/file may serve from
+type apiServer struct { //nolint:govet // fields grouped logically, not by alignment.
+	db            *hopper.DB
+	tracker       *workerTracker
+	progress      *loadProgress
+	dataRoot      string   // absolute path to the data directory; paths are served relative to this
+	allowedDirs   []string // resolved absolute paths that /api/file may serve from
+	traitsVersion string   // short prefix of current traits repo commit; empty = rescan disabled
 }
 
 // workerTracker is an in-memory view of active workers, updated on every
@@ -109,6 +110,15 @@ func (wt *workerTracker) claimLimit(name string) int {
 		return remaining
 	}
 	return 0
+}
+
+func (wt *workerTracker) traits(name string) string {
+	wt.mu.RLock()
+	defer wt.mu.RUnlock()
+	if ws, ok := wt.workers[name]; ok {
+		return ws.Traits
+	}
+	return ""
 }
 
 func (wt *workerTracker) activeClaims(name string) int {
@@ -290,7 +300,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
 
-	jobs, err := s.db.ClaimJobs(ctx, worker, count, claimExpiry)
+	jobs, err := s.db.ClaimJobs(ctx, worker, count, claimExpiry, s.traitsVersion)
 	if err != nil {
 		slog.Error("claim jobs failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
@@ -455,9 +465,19 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Determine the traits version used for this analysis: prefer the
+	// server's canonical version (from litmus version), fall back to the
+	// worker's self-reported traits hash truncated to 3 characters.
+	tv := s.traitsVersion
+	if tv == "" {
+		if wt := s.tracker.traits(req.Worker); len(wt) >= 3 {
+			tv = wt[:3]
+		}
+	}
+
 	// Parse cleave result once — used for both storage and explosion.
 	parsed := hopper.ParseCleaveResult(req.SHA256, req.Raw)
-	if err := s.db.UpdateCleaveResult(ctx, req.SHA256, req.Raw, &parsed); err != nil {
+	if err := s.db.UpdateCleaveResult(ctx, req.SHA256, req.Raw, &parsed, tv); err != nil {
 		slog.Error("store cleave result failed", "sha256", req.SHA256, "error", err)
 		// Still record the result so ActiveClaims is decremented — otherwise
 		// the worker's claim count is permanently inflated for this slot.

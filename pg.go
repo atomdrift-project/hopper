@@ -85,6 +85,11 @@ func (db *DB) migratePG(ctx context.Context) error {
 			`AND cleave_result IS NOT NULL AND status = ''`,
 		// staleSamplesPG: WHERE updated_at < $1 ORDER BY updated_at — no status prefix.
 		`CREATE INDEX IF NOT EXISTS idx_samples_updated_at ON samples(updated_at)`,
+		// Traits-version rescan: find analyzed samples with stale traits.
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS traits_version TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_stale_traits ` +
+			`ON samples(traits_version, analyzed_at) ` +
+			`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''`,
 		// feedSourcesPG / feedEcosystemsPG: DISTINCT feed/ecosystem WHERE source = $1.
 		`CREATE INDEX IF NOT EXISTS idx_samples_source_feed ON samples(source, feed) WHERE feed != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_source_ecosystem ON samples(source, ecosystem) WHERE ecosystem != ''`,
@@ -110,7 +115,14 @@ func (db *DB) migratePG(ctx context.Context) error {
 const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, cleave_result, litmus_result, litmus_score,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
-	created_at, updated_at, analyzed_at, mtime, marker_mtime`
+	created_at, updated_at, analyzed_at, mtime, marker_mtime, traits_version`
+
+// pgSampleColsLight excludes cleave_result and litmus_result to avoid loading
+// potentially large JSON blobs when only metadata is needed (e.g. claim queries).
+const pgSampleColsLight = `id, sha256, source, feed, ecosystem, filename, file_type,
+	size_bytes, label, label_source, litmus_score,
+	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
+	created_at, updated_at, analyzed_at, mtime, marker_mtime, traits_version`
 
 func pgSampleDest(s *Sample) []any {
 	return []any{
@@ -120,6 +132,19 @@ func pgSampleDest(s *Sample) []any {
 		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score,
 		&s.MaxCrit, &s.SuspiciousCount,
 		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.Mtime, &s.MarkerMtime,
+		&s.TraitsVersion,
+	}
+}
+
+func pgSampleDestLight(s *Sample) []any {
+	return []any{
+		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
+		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &s.LitmusScore,
+		&s.Path, &s.Status, &s.Note, &s.CanonicalSHA256,
+		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score,
+		&s.MaxCrit, &s.SuspiciousCount,
+		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.Mtime, &s.MarkerMtime,
+		&s.TraitsVersion,
 	}
 }
 
@@ -274,14 +299,22 @@ func (db *DB) sampleBySHA256PG(ctx context.Context, sha256 string) (*Sample, err
 	return s, nil
 }
 
-func (db *DB) updateCleaveResultPG(ctx context.Context, sha256 string, result []byte, canonical string, fi cleaveFileInfo) error {
+func (db *DB) updateCleaveResultPG(
+	ctx context.Context, sha256 string, result []byte, canonical string,
+	fi cleaveFileInfo, traitsVersion string,
+) error {
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET cleave_result = $2,
-			canonical_sha256 = $3, formula = $4, elements = $5, score = $6, max_crit = $7, suspicious_count = $8,
+			canonical_sha256 = $3, formula = $4, elements = $5,
+			score = $6, max_crit = $7, suspicious_count = $8,
 			file_type = COALESCE(NULLIF($9, ''), file_type),
 			litmus_result = NULL, litmus_score = 0,
+			traits_version = $10,
 			analyzed_at = now(), updated_at = now()
-		WHERE sha256 = $1`, sha256, sanitizeJSONB(result), canonical, fi.Formula, fi.Elements, fi.Score, fi.MaxCrit, fi.SuspiciousCount, fi.FileType)
+		WHERE sha256 = $1`,
+		sha256, sanitizeJSONB(result), canonical,
+		fi.Formula, fi.Elements, fi.Score, fi.MaxCrit,
+		fi.SuspiciousCount, fi.FileType, traitsVersion)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
 	}
@@ -945,7 +978,8 @@ func scanPGCounts(rows pgx.Rows) (map[string]int, error) {
 
 // Pull-based work scheduling (PostgreSQL).
 
-func (db *DB) claimJobsPG(ctx context.Context, worker string, limit int, expiry time.Duration) ([]ClaimJob, error) {
+func (db *DB) claimJobsPG(ctx context.Context, worker string, limit int, expiry time.Duration, currentTraits string) ([]ClaimJob, error) {
+	// Tier 1: unanalyzed samples (highest priority).
 	rows, err := db.pool.Query(ctx, `
 		WITH claimable AS (
 			SELECT id FROM samples
@@ -962,6 +996,40 @@ func (db *DB) claimJobsPG(ctx context.Context, worker string, limit int, expiry 
 	if err != nil {
 		return nil, fmt.Errorf("hopper: claim jobs: %w", err)
 	}
+	jobs, err := scanClaimRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(jobs) > 0 || currentTraits == "" {
+		return jobs, nil
+	}
+
+	// Tier 2: stale-traits rescan — only when no unanalyzed samples remain.
+	// Reset cleave/litmus results so the normal result flow applies unchanged.
+	rows, err = db.pool.Query(ctx, `
+		WITH reclaimable AS (
+			SELECT id FROM samples
+			WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
+			  AND traits_version != $4
+			  AND analyzed_at < now() - interval '7 days'
+			  AND (claimed_by = '' OR claimed_at < now() - $2::interval)
+			ORDER BY analyzed_at ASC, id
+			LIMIT $3
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE samples SET claimed_by = $1, claimed_at = now(),
+			cleave_result = NULL, litmus_result = NULL,
+			litmus_score = 0, traits_version = ''
+		FROM reclaimable WHERE samples.id = reclaimable.id
+		RETURNING samples.sha256, samples.path, samples.size_bytes, samples.file_type`,
+		worker, expiry, limit, currentTraits)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: claim stale-traits jobs: %w", err)
+	}
+	return scanClaimRows(rows)
+}
+
+func scanClaimRows(rows pgx.Rows) ([]ClaimJob, error) {
 	defer rows.Close()
 	var jobs []ClaimJob
 	for rows.Next() {

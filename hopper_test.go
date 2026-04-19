@@ -43,7 +43,7 @@ func mustAnalyzeWithTraits(t *testing.T, ctx context.Context, db *DB, sha string
 	// Include a non-empty type so UpdateCleaveResult actually persists the row;
 	// an empty type triggers the belt-and-suspenders delete path.
 	result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"elf","x":%d,"dp":0,"ts":[%s]}]}`, sha, score, traits)
-	if err := db.UpdateCleaveResult(ctx, sha, result, nil); err != nil {
+	if err := db.UpdateCleaveResult(ctx, sha, result, nil, ""); err != nil {
 		t.Fatalf("UpdateCleaveResult: %v", err)
 	}
 }
@@ -130,7 +130,7 @@ func TestUpdateCleaveResult(t *testing.T) {
 	ctx := context.Background()
 
 	mustInsert(t, ctx, db, &Sample{SHA256: "c1", Source: "test", Label: "bad", LabelSource: "test"})
-	if err := db.UpdateCleaveResult(ctx, "c1", []byte(`{"fs":[{"sha":"c1","type":"elf","dp":0,"ts":[{"i":"test","l":4}]}]}`), nil); err != nil {
+	if err := db.UpdateCleaveResult(ctx, "c1", []byte(`{"fs":[{"sha":"c1","type":"elf","dp":0,"ts":[{"i":"test","l":4}]}]}`), nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	got, err := db.SampleBySHA256(ctx, "c1")
@@ -599,7 +599,7 @@ func TestUnanalyzed(t *testing.T) {
 
 	mustInsert(t, ctx, db, &Sample{SHA256: "a", Source: "test", Label: "bad", LabelSource: "test"})
 	mustInsert(t, ctx, db, &Sample{SHA256: "b", Source: "test", Label: "bad", LabelSource: "test"})
-	if err := db.UpdateCleaveResult(ctx, "b", []byte(`{"fs":[{"sha":"b","type":"elf","dp":0}]}`), nil); err != nil {
+	if err := db.UpdateCleaveResult(ctx, "b", []byte(`{"fs":[{"sha":"b","type":"elf","dp":0}]}`), nil, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -976,7 +976,7 @@ func TestSamplesByEmbeddedSHA256(t *testing.T) {
 	if _, err := db.InsertSampleNew(ctx, s); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.UpdateCleaveResult(ctx, s.SHA256, cleave, nil); err != nil {
+	if err := db.UpdateCleaveResult(ctx, s.SHA256, cleave, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1044,10 +1044,10 @@ func TestFeedSamples(t *testing.T) {
 	resultFor := func(sha string) []byte {
 		return []byte(`{"fs":[{"sha":"` + sha + `","type":"elf","dp":0}]}`)
 	}
-	if err := db.UpdateCleaveResult(ctx, "s1", resultFor("s1"), nil); err != nil {
+	if err := db.UpdateCleaveResult(ctx, "s1", resultFor("s1"), nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.UpdateCleaveResult(ctx, "s2", resultFor("s2"), nil); err != nil {
+	if err := db.UpdateCleaveResult(ctx, "s2", resultFor("s2"), nil, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1100,10 +1100,10 @@ func TestFeedSamples(t *testing.T) {
 	s4 := &Sample{SHA256: "s4", Source: "test", Mtime: &t2}
 	mustInsert(t, ctx, db, s3)
 	mustInsert(t, ctx, db, s4)
-	if err := db.UpdateCleaveResult(ctx, "s3", resultFor("s3"), nil); err != nil {
+	if err := db.UpdateCleaveResult(ctx, "s3", resultFor("s3"), nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.UpdateCleaveResult(ctx, "s4", resultFor("s4"), nil); err != nil {
+	if err := db.UpdateCleaveResult(ctx, "s4", resultFor("s4"), nil, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1187,7 +1187,7 @@ func TestUpdateCleaveResultSetsFormulaAndScore(t *testing.T) {
 
 	mustInsert(t, ctx, db, &Sample{SHA256: "fs1", Source: "test", Label: "bad", LabelSource: "test"})
 	result := []byte(`{"fs":[{"sha":"fs1","type":"elf","f":"O₃(C₂Er₂As)","x":42,"dp":0}]}`)
-	if err := db.UpdateCleaveResult(ctx, "fs1", result, nil); err != nil {
+	if err := db.UpdateCleaveResult(ctx, "fs1", result, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1247,7 +1247,7 @@ func TestUpdateCleaveResultDeletesOnEmptyFileType(t *testing.T) {
 	mustInsert(t, ctx, db, &Sample{SHA256: "nc1", Source: "test", Label: "bad", LabelSource: "test"})
 	// Report with no fs[] entry → parseCleaveFile returns empty file_type →
 	// the row should be deleted, not updated.
-	if err := db.UpdateCleaveResult(ctx, "nc1", []byte(`{"fs":[]}`), nil); err != nil {
+	if err := db.UpdateCleaveResult(ctx, "nc1", []byte(`{"fs":[]}`), nil, ""); err != nil {
 		t.Fatalf("UpdateCleaveResult: %v", err)
 	}
 	if _, err := db.SampleBySHA256(ctx, "nc1"); !errors.Is(err, ErrNotFound) {
@@ -1437,7 +1437,7 @@ func TestClaimJobsSkipsMarkedSamples(t *testing.T) {
 	mustInsert(t, ctx, db, &Sample{SHA256: "claim2", Path: "/data/b.exe", Label: "bad", Skip: "unsupported"})
 	mustInsert(t, ctx, db, &Sample{SHA256: "claim3", Path: "/data/c.exe", Label: "bad", Skip: "missing"})
 
-	jobs, err := db.ClaimJobs(ctx, "testworker", 10, 30*time.Minute)
+	jobs, err := db.ClaimJobs(ctx, "testworker", 10, 30*time.Minute, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1458,7 +1458,7 @@ func TestClaimJobsExpiry(t *testing.T) {
 	mustInsert(t, ctx, db, &Sample{SHA256: "exp1", Path: "/data/a.exe", Label: "bad"})
 
 	// Claim it.
-	jobs, err := db.ClaimJobs(ctx, "worker1", 1, 30*time.Minute)
+	jobs, err := db.ClaimJobs(ctx, "worker1", 1, 30*time.Minute, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1467,7 +1467,7 @@ func TestClaimJobsExpiry(t *testing.T) {
 	}
 
 	// Try to claim again — should get nothing (still claimed).
-	jobs, err = db.ClaimJobs(ctx, "worker2", 1, 30*time.Minute)
+	jobs, err = db.ClaimJobs(ctx, "worker2", 1, 30*time.Minute, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1476,7 +1476,7 @@ func TestClaimJobsExpiry(t *testing.T) {
 	}
 
 	// Claim with zero expiry — should reclaim the expired job.
-	jobs, err = db.ClaimJobs(ctx, "worker2", 1, 0)
+	jobs, err = db.ClaimJobs(ctx, "worker2", 1, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS samples (
 	mtime         TIMESTAMPTZ,
 	marker_mtime  TIMESTAMPTZ,
 	claimed_by    TEXT NOT NULL DEFAULT '',
-	claimed_at    TIMESTAMPTZ
+	claimed_at    TIMESTAMPTZ,
+	traits_version TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_samples_label ON samples(label);

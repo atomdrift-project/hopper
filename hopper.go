@@ -127,6 +127,7 @@ type Sample struct {
 	Skip            string // non-empty = excluded from training, value = reason
 	Formula         string // cleave chemical formula (behavioral signature)
 	Elements        string // formula without counts (qualitative composition)
+	TraitsVersion   string // short prefix of traits repo commit used for analysis
 	AnalyzedAt      *time.Time
 	Mtime           *time.Time
 	MarkerMtime     *time.Time
@@ -541,7 +542,7 @@ func (db *DB) SampleParentInfo(ctx context.Context, sha256 string) (*Sample, err
 // deleted instead of updated: an unclassified row carries no analytical
 // value and only pollutes later queries. This is the belt-and-suspenders
 // complement to the ingest-time filter in cleave iter-files.
-func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []byte, parsed *CleaveParseResult) error {
+func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []byte, parsed *CleaveParseResult, traitsVersion string) error {
 	var p CleaveParseResult
 	if parsed != nil {
 		p = *parsed
@@ -552,9 +553,9 @@ func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []by
 		return db.DeleteSample(ctx, sha256)
 	}
 	if db.pool != nil {
-		return db.updateCleaveResultPG(ctx, sha256, result, p.CanonicalSHA, p.FileInfo)
+		return db.updateCleaveResultPG(ctx, sha256, result, p.CanonicalSHA, p.FileInfo, traitsVersion)
 	}
-	return db.updateCleaveResultSQLite(ctx, sha256, result, p.CanonicalSHA, p.FileInfo)
+	return db.updateCleaveResultSQLite(ctx, sha256, result, p.CanonicalSHA, p.FileInfo, traitsVersion)
 }
 
 // UpdateLitmusResult stores the litmus classification envelope for a sample.
@@ -694,12 +695,14 @@ func (db *DB) NewestAnalyzedAt(ctx context.Context) (time.Time, error) {
 }
 
 // ClaimJobs atomically claims up to limit unanalyzed samples for the named
-// worker. Expired claims (older than expiry) are reclaimed.
-func (db *DB) ClaimJobs(ctx context.Context, worker string, limit int, expiry time.Duration) ([]ClaimJob, error) {
+// worker. Expired claims (older than expiry) are reclaimed. When no unanalyzed
+// samples remain, samples analyzed with a different traits version more than
+// 7 days ago are reclaimed for re-analysis.
+func (db *DB) ClaimJobs(ctx context.Context, worker string, limit int, expiry time.Duration, currentTraits string) ([]ClaimJob, error) {
 	if db.pool != nil {
-		return db.claimJobsPG(ctx, worker, limit, expiry)
+		return db.claimJobsPG(ctx, worker, limit, expiry, currentTraits)
 	}
-	return db.claimJobsSQLite(ctx, worker, limit, expiry)
+	return db.claimJobsSQLite(ctx, worker, limit, expiry, currentTraits)
 }
 
 // UnclaimAll releases all outstanding claims. Call on startup to clear

@@ -168,7 +168,7 @@ func TestTransferSamples(t *testing.T) {
 	// Seed source with samples and reports.
 	mustInsert(t, ctx, src, &Sample{SHA256: "t1", Source: "test", Label: "bad", LabelSource: "test", Status: "bad-review", Path: "/data/t1"})
 	mustInsert(t, ctx, src, &Sample{SHA256: "t2", Source: "test", Label: "good", LabelSource: "test", Status: "good", Path: "/data/t2"})
-	if err := src.UpdateCleaveResult(ctx, "t1", []byte(`{"fs":[{"sha":"t1","type":"elf","dp":0,"ts":[{"i":"test","l":5}]}]}`), nil); err != nil {
+	if err := src.UpdateCleaveResult(ctx, "t1", []byte(`{"fs":[{"sha":"t1","type":"elf","dp":0,"ts":[{"i":"test","l":5}]}]}`), nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := src.InsertReport(ctx, &Report{SHA256: "t1", Type: "re", Content: "# Analysis", Provider: "claude"}); err != nil {

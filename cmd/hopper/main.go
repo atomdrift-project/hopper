@@ -661,6 +661,14 @@ func cmdLoad(ctx context.Context) error { //nolint:revive,maintidx // complex co
 	api.dataRoot = *dataDir
 	api.allowedDirs = allowedDirs
 
+	// Determine current traits version for stale-traits rescanning.
+	if *litmusBin != "" {
+		if tv := litmusTraitsVersion(ctx, *litmusBin); tv != "" {
+			api.traitsVersion = tv
+			slog.Info("traits version for rescan", "version", tv)
+		}
+	}
+
 	total := loadAll(loadCtx, loadCancel, db, litmus, tracker, api, cache, loadDirs, fileChs, *source, *hashWorkers, *rescan, *maxAnalyzed, *experimentTag, wd)
 	slog.Info("file walk complete, serving API until interrupted", "samples", total)
 

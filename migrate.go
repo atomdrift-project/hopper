@@ -440,7 +440,8 @@ func eachSampleSQLite(ctx context.Context, db *DB, afterID int64, fn func(*Sampl
 			&s.Parent, &s.Skip, &s.Formula, &s.Elements,
 			&s.Score, &s.MaxCrit, &s.SuspiciousCount,
 			&s.CreatedAt, &s.UpdatedAt,
-			&analyzedAt, &mtime, &markerMtime); err != nil {
+			&analyzedAt, &mtime, &markerMtime,
+			&s.TraitsVersion); err != nil {
 			return fmt.Errorf("scan sample: %w", err)
 		}
 		if cleaveResult.Valid {
@@ -523,6 +524,7 @@ var sampleStagingCols = []string{
 	"note", "canonical_sha256", "parent", "skip", "formula", "elements", "score", "max_crit", "suspicious_count",
 	"cleave_result", "litmus_result", "litmus_score",
 	"analyzed_at", "created_at", "updated_at", "mtime", "marker_mtime",
+	"traits_version",
 }
 
 const sampleStagingDDL = `CREATE TEMP TABLE _staging (
@@ -531,20 +533,21 @@ const sampleStagingDDL = `CREATE TEMP TABLE _staging (
 	path TEXT, status TEXT, note TEXT, canonical_sha256 TEXT,
 	parent TEXT, skip TEXT, formula TEXT, elements TEXT, score INTEGER, max_crit INTEGER, suspicious_count INTEGER,
 	cleave_result JSONB, litmus_result JSONB, litmus_score DOUBLE PRECISION,
-	analyzed_at TIMESTAMPTZ, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ
+	analyzed_at TIMESTAMPTZ, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ,
+	traits_version TEXT NOT NULL DEFAULT ''
 ) ON COMMIT DROP`
 
 const sampleStagingInsert = `INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, path, status, note, canonical_sha256,
 	parent, skip, formula, elements, score, max_crit,
 	suspicious_count, cleave_result, litmus_result, litmus_score,
-	analyzed_at, created_at, updated_at, mtime, marker_mtime)
+	analyzed_at, created_at, updated_at, mtime, marker_mtime, traits_version)
 SELECT sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, path, status,
 	note, canonical_sha256, parent, skip, formula, elements,
 	score, max_crit, suspicious_count, cleave_result,
 	litmus_result, litmus_score,
-	analyzed_at, created_at, updated_at, mtime, marker_mtime
+	analyzed_at, created_at, updated_at, mtime, marker_mtime, traits_version
 FROM _staging
 ON CONFLICT (sha256) DO NOTHING`
 
@@ -557,6 +560,7 @@ func flushSamplesPG(ctx context.Context, dst *DB, samples []*Sample) (int64, err
 			s.Note, s.CanonicalSHA256, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.MaxCrit, s.SuspiciousCount,
 			sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult), s.LitmusScore,
 			s.AnalyzedAt, s.CreatedAt, s.UpdatedAt, s.Mtime, s.MarkerMtime,
+			s.TraitsVersion,
 		}
 	}
 	return copyBatchPG(ctx, dst, sampleStagingDDL, sampleStagingInsert, sampleStagingCols, rows)
@@ -581,13 +585,13 @@ func flushSamplesSQLite(ctx context.Context, dst *DB, samples []*Sample) (int64,
 			INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
 				size_bytes, label, label_source, path, status, note, canonical_sha256,
 				parent, skip, formula, elements, score, max_crit, suspicious_count, cleave_result, litmus_result,
-				litmus_score, analyzed_at, created_at, updated_at, mtime, marker_mtime)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				litmus_score, analyzed_at, created_at, updated_at, mtime, marker_mtime, traits_version)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (sha256) DO NOTHING`,
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 			s.Note, s.CanonicalSHA256, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.MaxCrit, s.SuspiciousCount, cr, lr, s.LitmusScore,
-			s.AnalyzedAt, s.CreatedAt, s.UpdatedAt, s.Mtime, s.MarkerMtime)
+			s.AnalyzedAt, s.CreatedAt, s.UpdatedAt, s.Mtime, s.MarkerMtime, s.TraitsVersion)
 		if err != nil {
 			if rollbackErr := tx.Rollback(); rollbackErr != nil {
 				slog.Debug("rollback after insert failure failed", "error", rollbackErr)
