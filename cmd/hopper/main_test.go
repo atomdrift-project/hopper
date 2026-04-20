@@ -1108,13 +1108,13 @@ func TestReviewCommands(t *testing.T) {
 	}
 
 	tests := []struct {
-		args []string
 		want string
+		args []string
 	}{
-		{[]string{"hopper", "false-positives", "-db", dbPath, "-threshold", "85"}, "fp"},
-		{[]string{"hopper", "false-negatives", "-db", dbPath, "-threshold", "25"}, "fn"},
-		{[]string{"hopper", "benign-review", "-db", dbPath, "-threshold", "85"}, "br"},
-		{[]string{"hopper", "bad-review", "-db", dbPath, "-threshold", "25"}, "mr"},
+		{want: "fp", args: []string{"hopper", "false-positives", "-db", dbPath, "-threshold", "85"}},
+		{want: "fn", args: []string{"hopper", "false-negatives", "-db", dbPath, "-threshold", "25"}},
+		{want: "br", args: []string{"hopper", "benign-review", "-db", dbPath, "-threshold", "85"}},
+		{want: "mr", args: []string{"hopper", "bad-review", "-db", dbPath, "-threshold", "25"}},
 	}
 
 	for _, tt := range tests {
@@ -1233,4 +1233,64 @@ func TestReviewFlushCommands(t *testing.T) {
 	if mr.Label != "good" || mr.LabelSource != "flush" || mr.Skip != "" {
 		t.Fatalf("bad-review flush sample = %+v, want label=good label_source=flush skip=''", mr)
 	}
+}
+
+func TestStripDataRoot(t *testing.T) {
+	t.Run("direct prefix match", func(t *testing.T) {
+		got := stripDataRoot("/srv/data/unknown/harvest/new/crates/foo.crate", "/srv/data/")
+		want := "unknown/harvest/new/crates/foo.crate"
+		if got != want {
+			t.Errorf("stripDataRoot = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("symlinked prefix resolved via EvalSymlinks", func(t *testing.T) {
+		// Create: tmp/real/bad/sample.bin and tmp/link → tmp/real
+		// dataRoot prefix is "tmp/real/", DB path uses "tmp/link/bad/sample.bin".
+		tmp := t.TempDir()
+		realDir := filepath.Join(tmp, "real")
+		mustMkdirAll(t, filepath.Join(realDir, "bad"))
+		mustWriteFile(t, filepath.Join(realDir, "bad", "sample.bin"), []byte("x"))
+
+		linkDir := filepath.Join(tmp, "link")
+		if err := os.Symlink(realDir, linkDir); err != nil {
+			t.Skipf("symlinks not supported: %v", err)
+		}
+
+		prefix := realDir + string(filepath.Separator)
+		dbPath := filepath.Join(linkDir, "bad", "sample.bin")
+		got := stripDataRoot(dbPath, prefix)
+		want := filepath.Join("bad", "sample.bin")
+		if got != want {
+			t.Errorf("stripDataRoot(%q, %q) = %q, want %q", dbPath, prefix, got, want)
+		}
+	})
+
+	t.Run("intermediate symlink resolved via EvalSymlinks", func(t *testing.T) {
+		// Create: tmp/target/sub/file.txt and tmp/alias → tmp/target
+		// dataRoot is "tmp/target/sub/", DB path is "tmp/alias/sub/file.txt".
+		tmp := t.TempDir()
+		targetDir := filepath.Join(tmp, "target")
+		mustMkdirAll(t, filepath.Join(targetDir, "sub"))
+		mustWriteFile(t, filepath.Join(targetDir, "sub", "file.txt"), []byte("y"))
+
+		aliasDir := filepath.Join(tmp, "alias")
+		if err := os.Symlink(targetDir, aliasDir); err != nil {
+			t.Skipf("symlinks not supported: %v", err)
+		}
+
+		prefix := filepath.Join(targetDir, "sub") + string(filepath.Separator)
+		dbPath := filepath.Join(aliasDir, "sub", "file.txt")
+		got := stripDataRoot(dbPath, prefix)
+		if got != "file.txt" {
+			t.Errorf("stripDataRoot(%q, %q) = %q, want %q", dbPath, prefix, got, "file.txt")
+		}
+	})
+
+	t.Run("no match returns path as-is", func(t *testing.T) {
+		got := stripDataRoot("/completely/different/path.bin", "/srv/data/")
+		if got != "/completely/different/path.bin" {
+			t.Errorf("stripDataRoot = %q, want original path", got)
+		}
+	})
 }

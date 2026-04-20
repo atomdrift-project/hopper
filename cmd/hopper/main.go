@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"codeberg.org/atomdrift/hopper"
@@ -133,6 +134,17 @@ func main() {
 		<-sigCh // second means "exit now"
 		slog.Warn("forced exit on second interrupt")
 		os.Exit(1)
+	}()
+
+	// Dump all goroutine stacks on SIGUSR1 (Linux equivalent of BSD SIGINFO / Ctrl-T).
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGUSR1)
+		for range sigCh {
+			buf := make([]byte, 1<<20) // 1 MB
+			n := runtime.Stack(buf, true)
+			_, _ = os.Stderr.Write(buf[:n]) //nolint:errcheck // best-effort debug dump
+		}
 	}()
 
 	err = run(ctx)
@@ -507,16 +519,15 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx //
 	// Rebuild tools first so we can bail early if litmus or cleave is broken.
 	// Both builds run in parallel; once done we update litmus rules and check
 	// the traits version — all before touching the database.
-	type buildResult struct{ err error }
-	litmusBuildCh := make(chan buildResult, 1)
-	cleaveBuildCh := make(chan buildResult, 1)
+	litmusBuildCh := make(chan struct{}, 1)
+	cleaveBuildCh := make(chan struct{}, 1)
 	go func() {
 		updateSiblingTool(ctx, "litmus", "../litmus")
-		litmusBuildCh <- buildResult{}
+		litmusBuildCh <- struct{}{}
 	}()
 	go func() {
 		updateSiblingTool(ctx, "cleave", "../cleave")
-		cleaveBuildCh <- buildResult{}
+		cleaveBuildCh <- struct{}{}
 	}()
 	<-litmusBuildCh
 	<-cleaveBuildCh
@@ -629,6 +640,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx //
 	// No dialing needed — they poll /api/next when ready.
 
 	// Collect results. Order doesn't matter — each blocks until ready.
+	slog.Info("waiting for hash cache")
 	cr := <-cacheCh
 	var cache *hashCache
 	if cr.err != nil {
@@ -640,23 +652,28 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx //
 		}
 	}
 
+	slog.Info("waiting for database")
 	dr := <-dbCh
 	if dr.err != nil {
 		return dr.err
 	}
 	db := dr.db
 	defer db.Close()
+	slog.Info("database ready")
 
 	// Clear stale claims from previous runs so those samples get re-queued.
+	slog.Info("clearing stale claims")
 	if n, err := db.UnclaimAll(ctx); err != nil {
 		slog.Warn("failed to clear stale claims", "error", err)
 	} else if n > 0 {
 		slog.Info("cleared stale claims from previous run", "count", n)
 	}
 
+	slog.Info("waiting for litmus")
 	if res := <-litmusCh; res.err != nil {
 		return res.err
 	}
+	slog.Info("litmus ready")
 	if litmus != nil {
 		defer litmus.Stop()
 		go func() {
@@ -700,31 +717,36 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx //
 }
 
 // loadProgress tracks counters across concurrent load workers.
-type loadProgress struct { //nolint:govet // counters are grouped by pipeline stage for maintenance.
+type loadProgress struct { //nolint:govet // fields grouped by pipeline stage, not alignment
+	// Enumeration phase.
 	walked      atomic.Int64
-	hashed      atomic.Int64
-	inserted    atomic.Int64
-	skipped     atomic.Int64
-	analyzed    atomic.Int64
-	markers     atomic.Int64 // files skipped due to misclassification markers
-	tooSmall    atomic.Int64 // files below minFileSize
-	tooLarge    atomic.Int64 // files above maxFileSize
-	errors      atomic.Int64
-	hashErrors  atomic.Int64 // hash failures (subset of errors, for % calc)
-	cacheHits   atomic.Int64
-	exploded    atomic.Int64 // archive members inserted
-	queued      atomic.Int64 // items sent for analysis
-	walkedPaths sync.Map     // path → struct{}: all paths seen by iter-files
+	walkedPaths sync.Map // path → struct{}: all paths seen by iter-files
+	walkDone    atomic.Bool
 
-	walkDone atomic.Bool // true once all enumeration channels are drained
+	// Hashing phase.
+	hashed     atomic.Int64
+	cacheHits  atomic.Int64
+	tooSmall   atomic.Int64 // files below minFileSize
+	tooLarge   atomic.Int64 // files above maxFileSize
+	hashErrors atomic.Int64 // hash failures (subset of errors)
 
-	lastErr atomic.Value // string
+	// Insert phase.
+	inserted atomic.Int64
+	skipped  atomic.Int64
+	markers  atomic.Int64 // files skipped due to misclassification markers
+	queued   atomic.Int64 // items sent for analysis
+	exploded atomic.Int64 // archive members inserted
 
-	// Per-analysis timing (nanoseconds).
+	// Analysis phase.
+	analyzed           atomic.Int64
 	analyzeDurationSum atomic.Int64
 	analyzeDurationMax atomic.Int64
 	analyzeDurationMin atomic.Int64 // initialized to math.MaxInt64
 	scoreSum           atomic.Int64
+
+	// Errors.
+	errors  atomic.Int64
+	lastErr atomic.Value // string
 }
 
 const (
@@ -1053,7 +1075,7 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 					oldestClaims[c.Worker] = c
 				}
 			}
-			newestAnalyzedAt, _ = db.NewestAnalyzedAt(ctx)   //nolint:errcheck // best-effort; zero time is acceptable fallback
+			newestAnalyzedAt, _ = db.NewestAnalyzedAt(ctx)                          //nolint:errcheck // best-effort; zero time is acceptable fallback
 			rescanPending, _ = db.CountRescanPending(ctx, traitsVersion, rescanAge) //nolint:errcheck // best-effort; zero is acceptable fallback
 		}
 

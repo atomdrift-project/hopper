@@ -427,7 +427,8 @@ func litmusTraitsVersion(ctx context.Context, bin string) string {
 	out, err := cmd.Output()
 	if err != nil {
 		stderr := ""
-		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && len(ee.Stderr) > 0 {
 			stderr = string(ee.Stderr)
 			if len(stderr) > 256 {
 				stderr = stderr[:256]

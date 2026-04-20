@@ -1266,7 +1266,10 @@ func (db *DB) feedEcosystemsSQLite(ctx context.Context, source, label string) ([
 
 // Pull-based work scheduling (SQLite).
 
-func (db *DB) claimJobsSQLite(ctx context.Context, worker string, limit int, expiry time.Duration, currentTraits string, rescanAge time.Duration) ([]ClaimJob, error) {
+func (db *DB) claimJobsSQLite(
+	ctx context.Context, worker string, limit int,
+	expiry time.Duration, currentTraits string, rescanAge time.Duration,
+) ([]ClaimJob, error) {
 	// SQLite serializes writers via SetMaxOpenConns(1) on the pool, so
 	// concurrent claim requests are safe without row-level locking.
 	tx, err := db.lite.BeginTx(ctx, nil)

@@ -24,14 +24,14 @@ import (
 // jobs, submit results via /api/result, and fetch file content from
 // /api/file/{sha256}. All state lives in the database; the workerTracker
 // is an in-memory cache for the dashboard.
-type apiServer struct { //nolint:govet // fields grouped logically, not by alignment.
+type apiServer struct {
 	db            *hopper.DB
 	tracker       *workerTracker
 	progress      *loadProgress
-	dataRoot      string   // absolute path to the data directory; paths are served relative to this
+	dataRoot      string   // resolved absolute path to the data directory
+	traitsVersion string   // short prefix of current traits repo commit; empty = rescan disabled
 	allowedDirs   []string // resolved absolute paths that /api/file may serve from
-	traitsVersion string        // short prefix of current traits repo commit; empty = rescan disabled
-	rescanAge     time.Duration // minimum age before stale-traits samples are eligible for rescan
+	rescanAge     time.Duration
 }
 
 // workerTracker is an in-memory view of active workers, updated on every
@@ -41,14 +41,14 @@ type workerTracker struct {
 	mu      sync.RWMutex
 }
 
-type workerStats struct { //nolint:govet // fields grouped logically, not by alignment.
+type workerStats struct {
 	LastSeen     time.Time
 	LastClaimed  time.Time // when the most recent batch of claims was made
+	Version      string
+	Traits       string
 	TotalClaimed int64
 	Analyzed     int64
 	Errors       int64
-	Version      string
-	Traits       string
 	Slots        int
 	ActiveClaims int     // jobs claimed but not yet returned
 	RSSMB        int     // last reported RSS in MiB (0 = unknown)
@@ -171,7 +171,7 @@ func (wt *workerTracker) resetClaims(name string) {
 }
 
 // namedWorkerStats is workerStats with the worker name attached.
-type namedWorkerStats struct { //nolint:govet // embedding first is idiomatic.
+type namedWorkerStats struct { //nolint:govet // embedded field must come first per embeddedstructfieldcheck
 	workerStats
 
 	Name string
@@ -375,18 +375,12 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Strip the data root to return relative paths. Workers join these
-	// with their own data root to find files locally. Resolve each path
-	// first so legacy rows with unresolved symlinks still match.
+	// with their own data root to find files locally. EvalSymlinks inside
+	// stripDataRoot handles DB paths that use a symlinked prefix.
 	if s.dataRoot != "" {
 		prefix := s.dataRoot + string(filepath.Separator)
 		for i := range jobs {
-			p := jobs[i].Path
-			if resolved, err := filepath.EvalSymlinks(p); err == nil {
-				p = resolved
-			} else if abs, err := filepath.Abs(p); err == nil {
-				p = abs
-			}
-			jobs[i].Path = strings.TrimPrefix(p, prefix)
+			jobs[i].Path = stripDataRoot(jobs[i].Path, prefix)
 		}
 	}
 
@@ -404,13 +398,13 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 }
 
 // resultRequest is the JSON body for POST /api/result.
-type resultRequest struct { //nolint:govet // JSON field order matches API docs.
-	DurationMs int64           `json:"duration_ms"`
-	ML         json.RawMessage `json:"ml"`
-	Raw        json.RawMessage `json:"raw"`
+type resultRequest struct {
 	SHA256     string          `json:"sha256"`
 	Worker     string          `json:"worker"`
 	Error      string          `json:"error"`
+	ML         json.RawMessage `json:"ml"`
+	Raw        json.RawMessage `json:"raw"`
+	DurationMs int64           `json:"duration_ms"`
 }
 
 // handleResult receives an analysis result from a worker.
@@ -466,15 +460,36 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 			strings.Contains(req.Error, "Path does not exist") ||
 			strings.Contains(req.Error, "Failed to decrypt") ||
 			strings.Contains(req.Error, "Password required") ||
+			strings.Contains(req.Error, "Password for encrypted archive") ||
 			strings.Contains(req.Error, "invalid Zip archive") ||
-			strings.Contains(req.Error, "analysis timed out") {
+			strings.Contains(req.Error, "invalid gzip header") ||
+			strings.Contains(req.Error, "no local path") ||
+			strings.Contains(req.Error, "analysis timed out") ||
+			strings.Contains(req.Error, "bad magic") ||
+			strings.Contains(req.Error, "File CRC error") ||
+			strings.Contains(req.Error, "unexpected NUL byte") ||
+			strings.Contains(req.Error, "Failed to read tar entry") ||
+			strings.Contains(req.Error, "Failed to parse package.json") ||
+			strings.Contains(req.Error, "Invalid timestamp field") ||
+			strings.Contains(req.Error, "multi-disk") {
 			// Unsupported file type, missing file, etc. — mark so it's
 			// never queued again, but preserve the record.
 			skip := "unsupported"
-			if strings.Contains(req.Error, "Path does not exist") {
+			if strings.Contains(req.Error, "Path does not exist") ||
+				strings.Contains(req.Error, "no local path") {
 				skip = "missing"
 			} else if strings.Contains(req.Error, "analysis timed out") {
 				skip = "timeout"
+			} else if strings.Contains(req.Error, "Password") ||
+				strings.Contains(req.Error, "Failed to decrypt") {
+				skip = "encrypted"
+			} else if strings.Contains(req.Error, "CRC error") ||
+				strings.Contains(req.Error, "invalid gzip header") ||
+				strings.Contains(req.Error, "bad magic") ||
+				strings.Contains(req.Error, "NUL byte") ||
+				strings.Contains(req.Error, "checksum mismatch") ||
+				strings.Contains(req.Error, "Invalid timestamp") {
+				skip = "corrupt"
 			}
 			if err := s.db.SetSkip(ctx, req.SHA256, skip); err != nil {
 				slog.Error("mark permanent failure failed", "sha256", req.SHA256, "error", err)
@@ -633,6 +648,21 @@ func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
+}
+
+// stripDataRoot converts an absolute DB path to a path relative to prefix.
+// DB paths may use a symlinked prefix (e.g. /srv/home/t/data → /srv/data)
+// that differs from the resolved dataRoot. EvalSymlinks resolves the entire
+// chain including intermediate symlinks.
+func stripDataRoot(dbPath, prefix string) string {
+	if strings.HasPrefix(dbPath, prefix) {
+		return dbPath[len(prefix):]
+	}
+	if resolved, err := filepath.EvalSymlinks(dbPath); err == nil && strings.HasPrefix(resolved, prefix) {
+		return resolved[len(prefix):]
+	}
+	// Return as-is; the /api/file/{sha256} download fallback can still serve it.
+	return dbPath
 }
 
 // safeFileServer returns an HTTP handler that serves files from dataRoot

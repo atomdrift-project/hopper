@@ -24,29 +24,29 @@ const dashQueryTimeout = 3 * time.Second
 // webDashboard serves a self-contained HTML page. Auto-refreshes every 5s.
 // Fields guarded by cfgMu are set once via configure() after the load session
 // begins; the handler renders a "starting" state until then.
-type webDashboard struct { //nolint:govet // fields grouped logically.
-	cfgMu         sync.RWMutex
-	progress      *loadProgress
-	litmus        *litmusServer
-	tracker       *workerTracker
+type webDashboard struct {
+	start         time.Time
 	db            *hopper.DB
+	progress      *loadProgress
+	tracker       *workerTracker
+	rescanCache   *fido.Cache[string, int64]
 	claimsCache   *fido.Cache[string, []hopper.WorkerClaim]
 	newestATCache *fido.Cache[string, time.Time]
-	samples       []throughputSample // capped at maxThroughputSamples
-	start         time.Time
+	litmus        *litmusServer
+	traitsVersion string
+	samples       []throughputSample
+	maxAnalyzed   int
 	startAnalyzed int64
-	mu             sync.Mutex
-	maxAnalyzed    int
-	ndirs          int
-	traitsVersion  string
-	rescanAge      time.Duration
-	rescanCache    *fido.Cache[string, int64]
+	ndirs         int
+	rescanAge     time.Duration
+	cfgMu         sync.RWMutex
+	mu            sync.Mutex
 }
 
 // configure is called once the load session is ready. It sets the fields the
 // handler needs to render progress and is safe to call concurrently with the
 // HTTP server already running.
-func (wd *webDashboard) configure(
+func (wd *webDashboard) configure( //nolint:revive // argument-limit: dashboard needs all session state at once
 	progress *loadProgress, litmus *litmusServer, tracker *workerTracker,
 	db *hopper.DB, start time.Time, startAnalyzed int64, maxAnalyzed, ndirs int, traitsVersion string, rescanAge time.Duration,
 ) {
@@ -272,7 +272,7 @@ footer{padding-top:1rem;border-top:1px solid var(--border);
   font-family:var(--mono);font-size:.75rem;color:var(--sub)}
 `
 
-func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //nolint:maintidx // dashboard handler has many query parameters
+func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //nolint:maintidx,revive // dashboard handler has many query parameters
 	wd.cfgMu.RLock()
 	progress := wd.progress
 	tracker := wd.tracker

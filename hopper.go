@@ -451,6 +451,7 @@ func (db *DB) Migrate(ctx context.Context) error {
 			return err
 		}
 	}
+	slog.Info("starting post-migrate backfill")
 	stats, err := db.Backfill(ctx)
 	if err != nil {
 		return fmt.Errorf("hopper: post-migrate backfill: %w", err)
@@ -458,6 +459,7 @@ func (db *DB) Migrate(ctx context.Context) error {
 	if stats.Updated > 0 || stats.MarkersCleared > 0 {
 		slog.Info("post-migrate backfill", "scanned", stats.Scanned, "updated", stats.Updated, "markers_cleared", stats.MarkersCleared)
 	}
+	slog.Info("post-migrate backfill complete")
 	return nil
 }
 
@@ -699,7 +701,10 @@ func (db *DB) NewestAnalyzedAt(ctx context.Context) (time.Time, error) {
 // worker. Expired claims (older than expiry) are reclaimed. When no unanalyzed
 // samples remain, samples analyzed with a different traits version older than
 // rescanAge are reclaimed for re-analysis.
-func (db *DB) ClaimJobs(ctx context.Context, worker string, limit int, expiry time.Duration, currentTraits string, rescanAge time.Duration) ([]ClaimJob, error) {
+func (db *DB) ClaimJobs(
+	ctx context.Context, worker string, limit int,
+	expiry time.Duration, currentTraits string, rescanAge time.Duration,
+) ([]ClaimJob, error) {
 	if db.pool != nil {
 		return db.claimJobsPG(ctx, worker, limit, expiry, currentTraits, rescanAge)
 	}
@@ -1057,13 +1062,13 @@ func (db *DB) RecomputeCanonicalSHA256(ctx context.Context) (int64, error) {
 
 // FeedQuery specifies filters for paginated feed queries.
 type FeedQuery struct {
-	Feeds      []string // optional: filter by feed column values
-	Ecosystems []string // optional: filter by ecosystem column values
 	Source     string   // "harvest" or "upload"
 	Label      string   // "bad", "good", "unknown", or "" (match any)
 	OrderBy    string   // "mtime" (default) or "analyzed_at"
-	Limit      int      // page size (clamped to 1–100)
+	Feeds      []string // optional: filter by feed column values
+	Ecosystems []string // optional: filter by ecosystem column values
 	Offset     int      // pagination offset
+	Limit      int      // page size (clamped to 1–100)
 }
 
 // FeedSamples returns analyzed samples matching the query, newest first.

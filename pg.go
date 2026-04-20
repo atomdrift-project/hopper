@@ -31,10 +31,11 @@ func openPG(ctx context.Context, dsn string) (*DB, error) {
 }
 
 func (db *DB) migratePG(ctx context.Context) error {
-	slog.Debug("executing initial schema ddl")
+	slog.Info("executing initial schema ddl")
 	if _, err := db.pool.Exec(ctx, schemaPG); err != nil {
 		return fmt.Errorf("hopper: migrate: %w", err)
 	}
+	slog.Info("initial schema applied")
 	// Add columns introduced after initial schema.
 	for _, ddl := range []string{
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS parent TEXT NOT NULL DEFAULT ''`,
@@ -104,11 +105,12 @@ func (db *DB) migratePG(ctx context.Context) error {
 			errors    BIGINT NOT NULL DEFAULT 0
 		)`,
 	} {
-		slog.Debug("executing migration ddl", "ddl", ddl)
+		slog.Info("executing migration ddl", "ddl", ddl)
 		if _, err := db.pool.Exec(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate: %w", err)
 		}
 	}
+	slog.Info("all migrations applied")
 	return nil
 }
 
@@ -286,6 +288,7 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 		SET skip = 'replaced'
 		FROM _staging st
 		WHERE s.path = st.path
+			AND st.path != ''
 			AND s.sha256 != st.sha256
 			AND s.skip = ''
 			AND s.cleave_result IS NULL`); err != nil {
@@ -1081,7 +1084,10 @@ func scanPGCounts(rows pgx.Rows) (map[string]int, error) {
 
 // Pull-based work scheduling (PostgreSQL).
 
-func (db *DB) claimJobsPG(ctx context.Context, worker string, limit int, expiry time.Duration, currentTraits string, rescanAge time.Duration) ([]ClaimJob, error) {
+func (db *DB) claimJobsPG(
+	ctx context.Context, worker string, limit int,
+	expiry time.Duration, currentTraits string, rescanAge time.Duration,
+) ([]ClaimJob, error) {
 	// Tier 1: unanalyzed samples (highest priority).
 	// ORDER BY random() spreads work across different packages/sources so a
 	// batch of structurally similar archives can't monopolize all workers.
