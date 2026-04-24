@@ -209,6 +209,48 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		}
 	}
 
+	// sample_locations: one row per (sha256, path) observation. See the
+	// pg.go equivalent for rationale — both backends use the same schema.
+	for _, ddl := range []string{
+		`CREATE TABLE IF NOT EXISTS sample_locations (
+			id            INTEGER PRIMARY KEY AUTOINCREMENT,
+			sha256        TEXT NOT NULL REFERENCES samples(sha256) ON DELETE CASCADE,
+			path          TEXT NOT NULL CHECK (path <> ''),
+			parent_sha256 TEXT NOT NULL DEFAULT '',
+			filename      TEXT NOT NULL DEFAULT '',
+			source        TEXT NOT NULL DEFAULT '',
+			feed          TEXT NOT NULL DEFAULT '',
+			ecosystem     TEXT NOT NULL DEFAULT '',
+			mtime         DATETIME,
+			first_seen_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+			last_seen_at  DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+			UNIQUE (sha256, path)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_sl_sha256 ON sample_locations(sha256)`,
+		`CREATE INDEX IF NOT EXISTS idx_sl_source ON sample_locations(source, feed) WHERE feed <> ''`,
+		`CREATE INDEX IF NOT EXISTS idx_sl_parent ON sample_locations(parent_sha256) WHERE parent_sha256 <> ''`,
+		`CREATE INDEX IF NOT EXISTS idx_sl_last_seen ON sample_locations(last_seen_at)`,
+	} {
+		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite sample_locations: %w", err)
+		}
+	}
+	// One-shot backfill, gated on emptiness.
+	var locCount int
+	if err := db.lite.QueryRowContext(ctx, `SELECT count(*) FROM sample_locations`).Scan(&locCount); err != nil {
+		return fmt.Errorf("hopper: count sample_locations: %w", err)
+	}
+	if locCount == 0 {
+		if _, err := db.lite.ExecContext(ctx, `
+			INSERT INTO sample_locations
+				(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime, first_seen_at, last_seen_at)
+			SELECT sha256, path, parent, filename, source, feed, ecosystem, mtime, created_at, updated_at
+			  FROM samples WHERE path <> ''
+			ON CONFLICT (sha256, path) DO NOTHING`); err != nil {
+			return fmt.Errorf("hopper: backfill sample_locations: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -342,7 +384,12 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
 func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error) {
-	res, err := db.lite.ExecContext(ctx, `
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("hopper: begin insert: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
+	res, err := tx.ExecContext(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
 			size_bytes, label, label_source, path, status,
 			canonical_sha256, parent, skip, formula, elements,
@@ -366,9 +413,24 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 		return false, fmt.Errorf("hopper: rows affected: %w", err)
 	}
 	if n == 0 && s.MarkerMtime != nil {
-		if _, err := db.lite.ExecContext(ctx, `UPDATE samples SET marker_mtime = ? WHERE sha256 = ?`, s.MarkerMtime, s.SHA256); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE samples SET marker_mtime = ? WHERE sha256 = ?`, s.MarkerMtime, s.SHA256); err != nil {
 			return false, fmt.Errorf("hopper: refresh marker mtime: %w", err)
 		}
+	}
+	if s.Path != "" {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO sample_locations
+				(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (sha256, path) DO UPDATE SET
+				last_seen_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
+				mtime = COALESCE(excluded.mtime, sample_locations.mtime)`,
+			s.SHA256, s.Path, s.Parent, s.Filename, s.Source, s.Feed, s.Ecosystem, s.Mtime); err != nil {
+			return false, fmt.Errorf("hopper: upsert location: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("hopper: commit insert: %w", err)
 	}
 	return n > 0, nil
 }
@@ -408,6 +470,18 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 	}
 	defer stmt.Close() //nolint:errcheck // best-effort cleanup
 
+	locStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO sample_locations
+			(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (sha256, path) DO UPDATE SET
+			last_seen_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
+			mtime = COALESCE(excluded.mtime, sample_locations.mtime)`)
+	if err != nil {
+		return 0, nil, fmt.Errorf("hopper: prepare location upsert: %w", err)
+	}
+	defer locStmt.Close() //nolint:errcheck // best-effort cleanup
+
 	for _, s := range samples {
 		res, err := stmt.ExecContext(ctx,
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
@@ -423,6 +497,12 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		if s.MarkerMtime != nil {
 			if _, err := tx.ExecContext(ctx, `UPDATE samples SET marker_mtime = ? WHERE sha256 = ?`, s.MarkerMtime, s.SHA256); err != nil {
 				return 0, nil, fmt.Errorf("hopper: refresh marker mtime %s: %w", s.SHA256, err)
+			}
+		}
+		if s.Path != "" {
+			if _, err := locStmt.ExecContext(ctx,
+				s.SHA256, s.Path, s.Parent, s.Filename, s.Source, s.Feed, s.Ecosystem, s.Mtime); err != nil {
+				return 0, nil, fmt.Errorf("hopper: upsert location %s: %w", s.SHA256, err)
 			}
 		}
 	}
@@ -508,6 +588,52 @@ func (db *DB) sampleBySHA256SQLite(ctx context.Context, sha256 string) (*Sample,
 		return nil, fmt.Errorf("hopper: sample %s: %w", sha256, err)
 	}
 	return s, nil
+}
+
+const liteLocationCols = `id, sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime, first_seen_at, last_seen_at`
+
+func scanLiteLocation(row interface{ Scan(...any) error }) (*SampleLocation, error) {
+	var loc SampleLocation
+	if err := row.Scan(&loc.ID, &loc.SHA256, &loc.Path, &loc.ParentSHA256,
+		&loc.Filename, &loc.Source, &loc.Feed, &loc.Ecosystem,
+		&loc.Mtime, &loc.FirstSeenAt, &loc.LastSeenAt); err != nil {
+		return nil, err
+	}
+	return &loc, nil
+}
+
+func (db *DB) upsertLocationSQLite(ctx context.Context, loc *SampleLocation) error {
+	_, err := db.lite.ExecContext(ctx, `
+		INSERT INTO sample_locations
+			(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (sha256, path) DO UPDATE SET
+			last_seen_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
+			mtime = COALESCE(excluded.mtime, sample_locations.mtime)`,
+		loc.SHA256, loc.Path, loc.ParentSHA256, loc.Filename,
+		loc.Source, loc.Feed, loc.Ecosystem, loc.Mtime)
+	if err != nil {
+		return fmt.Errorf("hopper: upsert location %s: %w", loc.SHA256, err)
+	}
+	return nil
+}
+
+func (db *DB) locationsForSHASQLite(ctx context.Context, sha256 string) ([]*SampleLocation, error) {
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteLocationCols+` FROM sample_locations WHERE sha256 = ? ORDER BY last_seen_at DESC`, sha256)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: locations %s: %w", sha256, err)
+	}
+	defer rows.Close() //nolint:errcheck // read-only query
+	var out []*SampleLocation
+	for rows.Next() {
+		loc, err := scanLiteLocation(rows)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: scan location: %w", err)
+		}
+		out = append(out, loc)
+	}
+	return out, rows.Err()
 }
 
 func (db *DB) updateCleaveResultSQLite(

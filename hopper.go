@@ -141,6 +141,26 @@ type Sample struct {
 	SuspiciousCount int // count of traits with level>=4 (suspicious or hostile)
 }
 
+// SampleLocation is one observation of a sample at a particular path. A
+// single sha256 can have many locations — the same jQuery.min.js shows up
+// in thousands of npm packages, the same stub in many droppers — so path /
+// source / feed / parent are per-observation, not per-content. The row is
+// upsert-keyed on (sha256, path): re-observing the same pair bumps
+// last_seen_at and refreshes mtime.
+type SampleLocation struct {
+	FirstSeenAt  time.Time
+	LastSeenAt   time.Time
+	Mtime        *time.Time
+	SHA256       string
+	Path         string
+	ParentSHA256 string // sha of the archive this observation was extracted from; "" if top-level
+	Filename     string
+	Source       string // "harvest", "upload", ...
+	Feed         string
+	Ecosystem    string
+	ID           int64
+}
+
 // Report is an analysis report produced by cyclotron.
 type Report struct {
 	CreatedAt  time.Time
@@ -621,6 +641,28 @@ func (db *DB) InsertSampleBatch(ctx context.Context, samples []*Sample) (inserte
 		return db.insertSampleBatchPG(ctx, valid)
 	}
 	return db.insertSampleBatchSQLite(ctx, valid)
+}
+
+// UpsertLocation records an observation of a sample at a path. On a
+// duplicate (sha256, path) pair, last_seen_at is bumped to now() and
+// mtime is refreshed if the caller provided one.
+func (db *DB) UpsertLocation(ctx context.Context, loc *SampleLocation) error {
+	if loc == nil || loc.SHA256 == "" || loc.Path == "" {
+		return nil
+	}
+	if db.pool != nil {
+		return db.upsertLocationPG(ctx, loc)
+	}
+	return db.upsertLocationSQLite(ctx, loc)
+}
+
+// LocationsForSHA returns every known observation of the given sample,
+// most recently seen first. Empty slice (not error) when unknown.
+func (db *DB) LocationsForSHA(ctx context.Context, sha256 string) ([]*SampleLocation, error) {
+	if db.pool != nil {
+		return db.locationsForSHAPG(ctx, sha256)
+	}
+	return db.locationsForSHASQLite(ctx, sha256)
 }
 
 // SampleBySHA256 retrieves a sample by its hash.

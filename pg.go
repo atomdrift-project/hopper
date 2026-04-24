@@ -127,6 +127,52 @@ func (db *DB) migratePG(ctx context.Context) error {
 					CHECK (sha256 ~ '^[0-9a-f]{64}$');
 			END IF;
 		END$$`,
+
+		// sample_locations: one row per (sha256, path) observation. A sample
+		// can have many locations — the same jquery.min.js shows up in
+		// thousands of packages, the same stub in many droppers. Per-
+		// observation fields (path, source, feed, parent, mtime) that used
+		// to live on samples and get clobbered on re-ingest live here going
+		// forward.
+		`CREATE TABLE IF NOT EXISTS sample_locations (
+			id            BIGSERIAL PRIMARY KEY,
+			sha256        TEXT NOT NULL REFERENCES samples(sha256) ON DELETE CASCADE,
+			path          TEXT NOT NULL CHECK (path <> ''),
+			parent_sha256 TEXT NOT NULL DEFAULT ''
+				CHECK (parent_sha256 = '' OR parent_sha256 ~ '^[0-9a-f]{64}$'),
+			filename      TEXT NOT NULL DEFAULT '',
+			source        TEXT NOT NULL DEFAULT '',
+			feed          TEXT NOT NULL DEFAULT '',
+			ecosystem     TEXT NOT NULL DEFAULT '',
+			mtime         TIMESTAMPTZ,
+			first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+			UNIQUE (sha256, path)
+		)`,
+		// Indexes tuned for the expected read patterns.
+		// Primary lookup: "where is this sha seen?" → idx_sl_sha256.
+		// Feed/source rollups stay selective via the partial predicate.
+		// Parent lookups are rare (exploded-from query) and stay partial.
+		`CREATE INDEX IF NOT EXISTS idx_sl_sha256 ON sample_locations(sha256)`,
+		`CREATE INDEX IF NOT EXISTS idx_sl_source ON sample_locations(source, feed) WHERE feed <> ''`,
+		`CREATE INDEX IF NOT EXISTS idx_sl_parent ON sample_locations(parent_sha256) WHERE parent_sha256 <> ''`,
+		`CREATE INDEX IF NOT EXISTS idx_sl_last_seen ON sample_locations(last_seen_at)`,
+
+		// One-shot backfill from the existing denormalized columns. Guarded
+		// by a table-emptiness check so restarts are cheap no-ops; re-running
+		// the migration never re-scans the 3M-row samples table once done.
+		// ON CONFLICT DO NOTHING also guards against partial prior attempts.
+		`DO $$
+		BEGIN
+			IF NOT EXISTS (SELECT 1 FROM sample_locations LIMIT 1) THEN
+				INSERT INTO sample_locations
+					(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime, first_seen_at, last_seen_at)
+				SELECT sha256, path, parent, filename, source, feed, ecosystem, mtime, created_at, updated_at
+				  FROM samples
+				 WHERE path <> ''
+				ON CONFLICT (sha256, path) DO NOTHING;
+			END IF;
+		END$$`,
 	} {
 		slog.Info("executing migration ddl", "ddl", ddl)
 		if _, err := db.pool.Exec(ctx, ddl); err != nil {
@@ -212,7 +258,14 @@ func scanPGSamplesLight(rows pgx.Rows) ([]*Sample, error) {
 }
 
 func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
-	tag, err := db.pool.Exec(ctx, `
+	// One transaction so the sample row and its sample_locations
+	// observation are created (or rolled back) atomically.
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("hopper: begin insert: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+	tag, err := tx.Exec(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
 			size_bytes, label, label_source, path, status,
 			canonical_sha256, parent, skip, formula, elements,
@@ -232,9 +285,27 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
 	if tag.RowsAffected() == 0 && s.MarkerMtime != nil {
-		if _, err := db.pool.Exec(ctx, `UPDATE samples SET marker_mtime = $2 WHERE sha256 = $1`, s.SHA256, s.MarkerMtime); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE samples SET marker_mtime = $2 WHERE sha256 = $1`, s.SHA256, s.MarkerMtime); err != nil {
 			return false, fmt.Errorf("hopper: refresh marker mtime: %w", err)
 		}
+	}
+	// Record the observation. validSample already guarantees s.Path != ""
+	// at the dispatch layer, but keep the guard here so a direct-call bug
+	// doesn't violate the CHECK constraint and abort the whole transaction.
+	if s.Path != "" {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO sample_locations
+				(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT (sha256, path) DO UPDATE SET
+				last_seen_at = now(),
+				mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)`,
+			s.SHA256, s.Path, s.Parent, s.Filename, s.Source, s.Feed, s.Ecosystem, s.Mtime); err != nil {
+			return false, fmt.Errorf("hopper: upsert location: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("hopper: commit insert: %w", err)
 	}
 	return tag.RowsAffected() > 0, nil
 }
@@ -300,6 +371,23 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 	}
 	inserted = tag.RowsAffected()
 
+	// Fan the staging rows out into sample_locations in the same
+	// transaction. DISTINCT ON collapses duplicates within the batch
+	// (same sha+path twice → one row). ON CONFLICT upserts last_seen_at
+	// on re-observations without clobbering an existing mtime.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO sample_locations
+			(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime)
+		SELECT DISTINCT ON (sha256, path)
+			sha256, path, parent, filename, source, feed, ecosystem, mtime
+		  FROM _staging
+		 WHERE path <> ''
+		ON CONFLICT (sha256, path) DO UPDATE SET
+			last_seen_at = now(),
+			mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)`); err != nil {
+		return 0, nil, fmt.Errorf("hopper: upsert locations from staging: %w", err)
+	}
+
 	if _, err := tx.Exec(ctx, `
 		UPDATE samples s
 		SET marker_mtime = st.marker_mtime
@@ -356,6 +444,52 @@ func (db *DB) sampleBySHA256PG(ctx context.Context, sha256 string) (*Sample, err
 		return nil, fmt.Errorf("hopper: sample %s: %w", sha256, err)
 	}
 	return s, nil
+}
+
+const pgLocationCols = `id, sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime, first_seen_at, last_seen_at`
+
+func scanPGLocation(row interface{ Scan(...any) error }) (*SampleLocation, error) {
+	var loc SampleLocation
+	if err := row.Scan(&loc.ID, &loc.SHA256, &loc.Path, &loc.ParentSHA256,
+		&loc.Filename, &loc.Source, &loc.Feed, &loc.Ecosystem,
+		&loc.Mtime, &loc.FirstSeenAt, &loc.LastSeenAt); err != nil {
+		return nil, err
+	}
+	return &loc, nil
+}
+
+func (db *DB) upsertLocationPG(ctx context.Context, loc *SampleLocation) error {
+	_, err := db.pool.Exec(ctx, `
+		INSERT INTO sample_locations
+			(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (sha256, path) DO UPDATE SET
+			last_seen_at = now(),
+			mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)`,
+		loc.SHA256, loc.Path, loc.ParentSHA256, loc.Filename,
+		loc.Source, loc.Feed, loc.Ecosystem, loc.Mtime)
+	if err != nil {
+		return fmt.Errorf("hopper: upsert location %s: %w", loc.SHA256, err)
+	}
+	return nil
+}
+
+func (db *DB) locationsForSHAPG(ctx context.Context, sha256 string) ([]*SampleLocation, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgLocationCols+` FROM sample_locations WHERE sha256 = $1 ORDER BY last_seen_at DESC`, sha256)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: locations %s: %w", sha256, err)
+	}
+	defer rows.Close()
+	var out []*SampleLocation
+	for rows.Next() {
+		loc, err := scanPGLocation(rows)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: scan location: %w", err)
+		}
+		out = append(out, loc)
+	}
+	return out, rows.Err()
 }
 
 func (db *DB) updateCleaveResultPG(

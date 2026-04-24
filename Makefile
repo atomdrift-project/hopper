@@ -1,4 +1,4 @@
-.PHONY: build test clean rollout-bastille replica diagnose-replica help
+.PHONY: build test clean rollout-bastille replica diagnose-replica promote-replica help
 
 help:
 	@echo "Available targets:"
@@ -10,6 +10,8 @@ help:
 	@echo "  make replica                Configure local postgres as a logical replica of the"
 	@echo "                              upstream hopper DB (idempotent; reads ~/.pgpass)"
 	@echo "  make diagnose-replica       Dump replication status from both sides (read-only)"
+	@echo "  make promote-replica        Turn the local replica into a standalone primary"
+	@echo "                              (writes must already be stopped; idempotent)"
 
 build:
 	CGO_ENABLED=1 go build -o hopper -ldflags="-s -w" ./cmd/hopper
@@ -32,6 +34,9 @@ replica: build
 
 diagnose-replica:
 	@./hacks/diagnose-replica.sh
+
+promote-replica:
+	@./hacks/promote-replica.sh
 
 clean:
 	rm -f hopper

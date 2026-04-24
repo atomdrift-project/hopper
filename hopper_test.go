@@ -1099,6 +1099,94 @@ func TestExplodeArchiveMembersEmpty(t *testing.T) {
 	}
 }
 
+// TestLocationsDualWrite verifies that both the single-insert and batch-insert
+// paths populate sample_locations alongside samples, that re-observing the
+// same (sha, path) pair updates last_seen_at without adding a row, and that
+// a second observation of the same sha at a new path adds a second location.
+func TestLocationsDualWrite(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Single insert path.
+	mustInsert(t, ctx, db, &Sample{SHA256: "loc1", Path: "bad/a.exe", Source: "harvest", Feed: "feed-a"})
+	locs, err := db.LocationsForSHA(ctx, "loc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locs) != 1 || locs[0].Path != "bad/a.exe" || locs[0].Source != "harvest" || locs[0].Feed != "feed-a" {
+		t.Fatalf("single-insert location = %+v, want path=bad/a.exe source=harvest feed=feed-a", locs)
+	}
+	firstSeen := locs[0].FirstSeenAt
+	firstLastSeen := locs[0].LastSeenAt
+
+	// Re-inserting the same (sha, path) should upsert: no new row, last_seen_at bumped.
+	time.Sleep(5 * time.Millisecond)
+	mustInsert(t, ctx, db, &Sample{SHA256: "loc1", Path: "bad/a.exe", Source: "harvest", Feed: "feed-a"})
+	locs, err = db.LocationsForSHA(ctx, "loc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locs) != 1 {
+		t.Fatalf("after re-observe, locations = %d, want 1", len(locs))
+	}
+	if !locs[0].FirstSeenAt.Equal(firstSeen) {
+		t.Errorf("first_seen_at moved: got %v, want %v", locs[0].FirstSeenAt, firstSeen)
+	}
+	if !locs[0].LastSeenAt.After(firstLastSeen) {
+		t.Errorf("last_seen_at should advance on re-observe: was %v, now %v", firstLastSeen, locs[0].LastSeenAt)
+	}
+
+	// Observing the same sha at a new path adds a second row (this is the
+	// behavior the old schema's ON CONFLICT path-clobber destroyed).
+	mustInsert(t, ctx, db, &Sample{SHA256: "loc1", Path: "good/a.exe", Source: "harvest", Feed: "feed-b"})
+	locs, err = db.LocationsForSHA(ctx, "loc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locs) != 2 {
+		t.Fatalf("two-path observe = %d locations, want 2", len(locs))
+	}
+
+	// Batch insert path: three samples, each should produce one location row.
+	batch := []*Sample{
+		{SHA256: "bloc1", Path: "x/1", Source: "harvest"},
+		{SHA256: "bloc2", Path: "x/2", Source: "harvest"},
+		{SHA256: "bloc3", Path: "x/3", Source: "harvest"},
+	}
+	if _, _, err := db.InsertSampleBatch(ctx, batch); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range batch {
+		locs, err := db.LocationsForSHA(ctx, s.SHA256)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(locs) != 1 || locs[0].Path != s.Path {
+			t.Errorf("batch %s location = %+v, want path=%s", s.SHA256, locs, s.Path)
+		}
+	}
+
+	// Backfill path: ExplodeArchiveMembers writes through InsertSampleBatch,
+	// so members should land in sample_locations with virtual paths.
+	parentSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	memberSHA := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	parent := &Sample{
+		SHA256: parentSHA, Path: "bad/archive.zip", Source: "harvest", Label: "bad", LabelSource: "test",
+		CleaveResult: []byte(`{"fs":[{"sha":"` + memberSHA + `","type":"py","path":"pkg/x.py","dp":1,"ts":[{"l":5,"c":0.9}]}]}`),
+	}
+	mustInsert(t, ctx, db, parent)
+	if _, err := db.ExplodeArchiveMembers(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	memberLocs, err := db.LocationsForSHA(ctx, memberSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(memberLocs) != 1 || memberLocs[0].Path != "bad/archive.zip!pkg/x.py" || memberLocs[0].ParentSHA256 != parentSHA {
+		t.Errorf("member location = %+v, want virtual path + parent_sha256", memberLocs)
+	}
+}
+
 func TestCanonicalSHA(t *testing.T) {
 	tests := []struct {
 		name   string
