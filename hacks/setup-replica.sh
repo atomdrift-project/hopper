@@ -141,49 +141,61 @@ if command -v pgrep >/dev/null 2>&1 && pgrep -f 'hopper init' >/dev/null 2>&1; t
     die "another 'hopper init' is already running (pid $(pgrep -f 'hopper init' | tr '\n' ' ')) — kill it first: pkill -9 -f 'hopper init'"
 fi
 
-# If a subscription is already running, its apply + tablesync workers hold
-# locks on the replicated tables. hopper init's DDL (CREATE INDEX, ALTER
-# TABLE, etc.) would block indefinitely. Disable the subscription, wait for
-# its workers to exit, and forcibly terminate them if they don't. The
-# subscription block below re-ENABLEs it after the migration finishes.
+# If a subscription exists, its apply + tablesync workers hold locks on the
+# replicated tables. hopper init's DDL (CREATE INDEX, ALTER TABLE, etc.)
+# would block on those locks. Disable the subscription and forcibly
+# terminate every logical-replication worker before running DDL. Check by
+# existence, not subenabled — a wedged worker from a prior run can outlive
+# a DISABLE and still be holding locks even though the sub reads disabled.
+# The subscription block below re-ENABLEs it after the migration finishes.
 if admin -d "$LOCAL_DB" -tAc \
-        "SELECT 1 FROM pg_subscription WHERE subname = '$SUBSCRIPTION' AND subenabled" \
+        "SELECT 1 FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" \
         | grep -q 1; then
-    log "Disabling subscription '$SUBSCRIPTION' during schema migration"
+    log "Stopping subscription '$SUBSCRIPTION' during schema migration"
     admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -v sub="$SUBSCRIPTION" <<'SQL'
 ALTER SUBSCRIPTION :"sub" DISABLE;
 SQL
 
-    # Poll up to 10s for graceful shutdown.
-    busy=1
-    i=0
-    while [ "$i" -lt 10 ]; do
-        busy=$(admin -d "$LOCAL_DB" -tAc \
-            "SELECT count(*) FROM pg_stat_subscription WHERE subname = '$SUBSCRIPTION' AND pid IS NOT NULL" \
-            | tr -d '[:space:]')
-        [ "$busy" = "0" ] && break
-        sleep 1
-        i=$((i + 1))
-    done
+    # Terminate any lingering logical-replication workers. Filter on
+    # backend_type so we catch wedged workers that pg_stat_subscription
+    # no longer lists (the launcher is deliberately excluded).
+    killed=$(admin -d "$LOCAL_DB" -tAc "
+        SELECT count(*) FROM (
+            SELECT pg_terminate_backend(pid)
+              FROM pg_stat_activity
+             WHERE backend_type IN (
+                 'logical replication apply worker',
+                 'logical replication tablesync worker',
+                 'logical replication parallel apply worker')
+        ) t" | tr -d '[:space:]')
+    [ "${killed:-0}" -gt 0 ] && log "Terminated ${killed} logical-replication worker(s)"
 
-    if [ "$busy" != "0" ]; then
-        log "Graceful shutdown timed out — terminating $busy worker(s)"
-        admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -v sub="$SUBSCRIPTION" <<'SQL'
-SELECT pg_terminate_backend(pid)
-  FROM pg_stat_subscription
- WHERE subname = :'sub' AND pid IS NOT NULL;
-SQL
-        # Give them a second to clear from pg_stat_activity.
-        sleep 2
-    fi
+    # Give the postmaster a beat to reap them before we take locks.
+    sleep 1
 fi
 
-# Lock timeout keeps hopper init from hanging forever if something else is
-# still holding a table lock. 30s is much longer than any honest DDL should
-# take, but short enough to surface the problem instead of wedging the script.
+# Show any pre-existing backends on this DB so a stuck one is visible before
+# we queue behind it.
+busy=$(admin -d "$LOCAL_DB" -tAc "
+    SELECT count(*) FROM pg_stat_activity
+     WHERE datname = '$LOCAL_DB' AND pid <> pg_backend_pid()
+       AND backend_type = 'client backend'" | tr -d '[:space:]')
+if [ "${busy:-0}" -gt 0 ]; then
+    log "$busy existing client backend(s) on '$LOCAL_DB':"
+    admin -d "$LOCAL_DB" -tA -F '  ' <<'SQL' | sed 's/^/    /'
+SELECT pid, state, coalesce(wait_event, '-'),
+       coalesce((now() - xact_start)::text, '-') AS xact_age,
+       left(query, 80)
+  FROM pg_stat_activity
+ WHERE datname = current_database() AND pid <> pg_backend_pid()
+   AND backend_type = 'client backend';
+SQL
+fi
+
+# Set lock_timeout via DSN (pgx honors query-string GUCs reliably); keeps
+# hopper init from hanging forever if something else holds a table lock.
 log "Running '$HOPPER init' to ensure schema (lock_timeout=30s)"
-PGOPTIONS='-c lock_timeout=30s' \
-    "$HOPPER" init -db "postgres://$LOCAL_USER@localhost/$LOCAL_DB?sslmode=disable"
+"$HOPPER" init -db "postgres://$LOCAL_USER@localhost/$LOCAL_DB?sslmode=disable&lock_timeout=30s"
 
 # --- Subscription ----------------------------------------------------------
 # We keep the password out of argv by passing it through psql's -v mechanism
