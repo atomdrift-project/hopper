@@ -1,10 +1,4 @@
-.PHONY: build test clean rollout-bastille sync-db help
-
-# Remote PostgreSQL host — used by sync-db for logical replication.
-REMOTE_DB_HOST ?= hopper
-REMOTE_DB_USER ?= hopper
-REMOTE_DB_NAME ?= hopper
-LOCAL_DB_NAME ?= hopper
+.PHONY: build test clean rollout-bastille replica help
 
 help:
 	@echo "Available targets:"
@@ -13,8 +7,8 @@ help:
 	@echo "  make lint                   Run linters"
 	@echo "  make clean                  Clean build artifacts"
 	@echo "  make rollout-bastille       Deploy to Bastille jails (BUILD=build RUN=hopper [DB_ONLY=1])"
-	@echo "  make sync-db                Set up logical replication from remote hopper DB"
-	@echo "                              (one-time; after this, local DB auto-syncs in real time)"
+	@echo "  make replica                Configure local postgres as a logical replica of the"
+	@echo "                              upstream hopper DB (idempotent; reads ~/.pgpass)"
 
 build:
 	CGO_ENABLED=1 go build -o hopper -ldflags="-s -w" ./cmd/hopper
@@ -32,44 +26,8 @@ rollout-bastille:
 		./hacks/rollout-bastille.sh "$(BUILD)" "$(RUN)"; \
 	fi
 
-sync-db:
-	@echo "==> Setting up logical replication: $(REMOTE_DB_HOST) → localhost"
-	@echo "    Remote must have the hopper_training publication (run make rollout-bastille first)."
-	@echo ""
-	@# Ensure local postgres is running
-	@pg_isready -q 2>/dev/null || { echo "Local PostgreSQL is not running. Start it first:"; \
-		echo "  sudo systemctl start postgresql"; exit 1; }
-	@# Create local database + hopper role if needed
-	@psql -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$(REMOTE_DB_USER)'" 2>/dev/null | grep -q 1 || \
-		createuser -U postgres $(REMOTE_DB_USER) 2>/dev/null || true
-	@createdb -U postgres -O $(REMOTE_DB_USER) $(LOCAL_DB_NAME) 2>/dev/null || true
-	@# Create the samples table via hopper init if the binary is available
-	@if command -v hopper >/dev/null 2>&1; then \
-		echo "==> Running hopper init to create schema"; \
-		hopper init --db "postgres://$(REMOTE_DB_USER)@localhost/$(LOCAL_DB_NAME)?sslmode=disable"; \
-	elif [ -x ./hopper ]; then \
-		echo "==> Running ./hopper init to create schema"; \
-		./hopper init --db "postgres://$(REMOTE_DB_USER)@localhost/$(LOCAL_DB_NAME)?sslmode=disable"; \
-	else \
-		echo "WARNING: hopper binary not found — schema must already exist"; \
-	fi
-	@# Drop existing subscription if present (idempotent re-setup)
-	@psql -h localhost -U $(REMOTE_DB_USER) -d $(LOCAL_DB_NAME) -c \
-		"SELECT 1 FROM pg_subscription WHERE subname='hopper_training_sub'" -tA 2>/dev/null | grep -q 1 && \
-		psql -h localhost -U $(REMOTE_DB_USER) -d $(LOCAL_DB_NAME) -c \
-			"ALTER SUBSCRIPTION hopper_training_sub DISABLE; ALTER SUBSCRIPTION hopper_training_sub SET (slot_name = NONE); DROP SUBSCRIPTION hopper_training_sub;" 2>/dev/null || true
-	@echo "==> Creating subscription to $(REMOTE_DB_HOST)"
-	@PW=$$(awk -F: '/^$(REMOTE_DB_HOST):.*:$(REMOTE_DB_USER):/ {print $$5; exit}' ~/.pgpass) && \
-	psql -h localhost -U $(REMOTE_DB_USER) -d $(LOCAL_DB_NAME) -c "\
-		CREATE SUBSCRIPTION hopper_training_sub \
-		CONNECTION 'host=$(REMOTE_DB_HOST) dbname=$(REMOTE_DB_NAME) user=$(REMOTE_DB_USER) password=$$PW' \
-		PUBLICATION hopper_training \
-		WITH (copy_data = true);"
-	@echo ""
-	@echo "==> Logical replication active!"
-	@echo "    Initial table copy is running in the background."
-	@echo "    Monitor progress: psql -d $(LOCAL_DB_NAME) -c \"SELECT * FROM pg_stat_subscription\""
-	@echo "    Use for training: make train DB=postgres://$(REMOTE_DB_USER)@localhost/$(LOCAL_DB_NAME)"
+replica:
+	@./hacks/setup-replica.sh
 
 clean:
 	rm -f hopper
