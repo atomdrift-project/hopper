@@ -724,6 +724,11 @@ func (db *DB) countAnalyzedPG(ctx context.Context) (int64, error) {
 func (db *DB) relativizePathsPG(ctx context.Context, prefix string) (int64, error) {
 	var total int64
 	if prefix != "" {
+		// Both tables are rewritten together. sample_locations has a
+		// UNIQUE (sha256, path) constraint, so if the same (sha, stripped-
+		// path) already exists as a separate row, the UPDATE would fail;
+		// ON CONFLICT isn't available for UPDATE in Postgres, so we filter
+		// out any row whose rewrite would collide with an existing pair.
 		tag, err := db.pool.Exec(ctx, `
 			UPDATE samples SET path = substring(path from char_length($1) + 1), updated_at = now()
 			WHERE starts_with(path, $1)`, prefix)
@@ -731,6 +736,20 @@ func (db *DB) relativizePathsPG(ctx context.Context, prefix string) (int64, erro
 			return 0, fmt.Errorf("hopper: relativize paths by root: %w", err)
 		}
 		total += tag.RowsAffected()
+
+		if _, err := db.pool.Exec(ctx, `
+			UPDATE sample_locations AS sl
+			   SET path = substring(sl.path from char_length($1) + 1),
+			       last_seen_at = now()
+			 WHERE starts_with(sl.path, $1)
+			   AND NOT EXISTS (
+			       SELECT 1 FROM sample_locations x
+			        WHERE x.sha256 = sl.sha256
+			          AND x.path   = substring(sl.path from char_length($1) + 1)
+			          AND x.id    <> sl.id
+			   )`, prefix); err != nil {
+			return 0, fmt.Errorf("hopper: relativize location paths by root: %w", err)
+		}
 	}
 	tag, err := db.pool.Exec(ctx, `
 		UPDATE samples SET
@@ -739,6 +758,19 @@ func (db *DB) relativizePathsPG(ctx context.Context, prefix string) (int64, erro
 		WHERE position('/data/' in path) > 0`)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: relativize paths by data marker: %w", err)
+	}
+	if _, err := db.pool.Exec(ctx, `
+		UPDATE sample_locations AS sl SET
+			path = substring(sl.path from position('/data/' in sl.path) + char_length('/data/')),
+			last_seen_at = now()
+		WHERE position('/data/' in sl.path) > 0
+		  AND NOT EXISTS (
+		      SELECT 1 FROM sample_locations x
+		       WHERE x.sha256 = sl.sha256
+		         AND x.path   = substring(sl.path from position('/data/' in sl.path) + char_length('/data/'))
+		         AND x.id    <> sl.id
+		  )`); err != nil {
+		return 0, fmt.Errorf("hopper: relativize location paths by data marker: %w", err)
 	}
 	return total + tag.RowsAffected(), nil
 }

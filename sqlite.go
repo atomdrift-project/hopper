@@ -868,6 +868,22 @@ func (db *DB) relativizePathsSQLite(ctx context.Context, prefix string) (int64, 
 			return 0, fmt.Errorf("hopper: relativize paths by root rows affected: %w", err)
 		}
 		total += n
+
+		// Mirror to sample_locations. Guard against (sha, new-path)
+		// colliding with an existing row (UNIQUE constraint).
+		if _, err := db.lite.ExecContext(ctx, `
+			UPDATE sample_locations AS sl
+			   SET path = substr(sl.path, length(?) + 1),
+			       last_seen_at = ?
+			 WHERE instr(sl.path, ?) = 1
+			   AND NOT EXISTS (
+			       SELECT 1 FROM sample_locations x
+			        WHERE x.sha256 = sl.sha256
+			          AND x.path   = substr(sl.path, length(?) + 1)
+			          AND x.id    <> sl.id
+			   )`, prefix, ts, prefix, prefix); err != nil {
+			return 0, fmt.Errorf("hopper: relativize location paths by root: %w", err)
+		}
 	}
 
 	res, err := db.lite.ExecContext(ctx, `
@@ -883,6 +899,21 @@ func (db *DB) relativizePathsSQLite(ctx context.Context, prefix string) (int64, 
 	if err != nil {
 		return 0, fmt.Errorf("hopper: relativize paths by data marker rows affected: %w", err)
 	}
+
+	if _, err := db.lite.ExecContext(ctx, `
+		UPDATE sample_locations AS sl SET
+			path = substr(sl.path, instr(sl.path, '/data/') + length('/data/')),
+			last_seen_at = ?
+		WHERE instr(sl.path, '/data/') > 0
+		  AND NOT EXISTS (
+		      SELECT 1 FROM sample_locations x
+		       WHERE x.sha256 = sl.sha256
+		         AND x.path   = substr(sl.path, instr(sl.path, '/data/') + length('/data/'))
+		         AND x.id    <> sl.id
+		  )`, ts); err != nil {
+		return 0, fmt.Errorf("hopper: relativize location paths by data marker: %w", err)
+	}
+
 	return total + n, nil
 }
 
