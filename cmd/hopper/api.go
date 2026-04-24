@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -582,13 +581,22 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true}) //nolint:errcheck,errchkjson // best-effort response
 }
 
-// validSHA256 checks that s is exactly 64 hex characters.
+// validSHA256 checks that s is exactly 64 lowercase hex characters.
+// Rejecting mixed case at the edge prevents a misbehaving worker from
+// creating a case-variant duplicate of an existing sample — the samples
+// table treats sha256 as a plain TEXT column, so "abc…" and "ABC…" count
+// as distinct values under UNIQUE.
 func validSHA256(s string) bool {
 	if len(s) != 64 {
 		return false
 	}
-	_, err := hex.DecodeString(s)
-	return err == nil
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 // handleFile serves file content for remote workers.

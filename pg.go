@@ -104,6 +104,29 @@ func (db *DB) migratePG(ctx context.Context) error {
 			analyzed  BIGINT NOT NULL DEFAULT 0,
 			errors    BIGINT NOT NULL DEFAULT 0
 		)`,
+		// sha256/parent/canonical_sha256 are plain TEXT; the UNIQUE index on
+		// sha256 treats case as significant, so "abc…"/"ABC…" would be stored
+		// as distinct rows. Pin them to canonical lowercase-hex via CHECK so
+		// any writer bypassing the Go validators still can't drift.
+		`DO $$
+		BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'samples_sha256_hex') THEN
+				ALTER TABLE samples ADD CONSTRAINT samples_sha256_hex
+					CHECK (sha256 ~ '^[0-9a-f]{64}$');
+			END IF;
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'samples_parent_hex') THEN
+				ALTER TABLE samples ADD CONSTRAINT samples_parent_hex
+					CHECK (parent = '' OR parent ~ '^[0-9a-f]{64}$');
+			END IF;
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'samples_canonical_sha256_hex') THEN
+				ALTER TABLE samples ADD CONSTRAINT samples_canonical_sha256_hex
+					CHECK (canonical_sha256 = '' OR canonical_sha256 ~ '^[0-9a-f]{64}$');
+			END IF;
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'reports_sha256_hex') THEN
+				ALTER TABLE reports ADD CONSTRAINT reports_sha256_hex
+					CHECK (sha256 ~ '^[0-9a-f]{64}$');
+			END IF;
+		END$$`,
 	} {
 		slog.Info("executing migration ddl", "ddl", ddl)
 		if _, err := db.pool.Exec(ctx, ddl); err != nil {
@@ -196,8 +219,11 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 			score, max_crit, suspicious_count, mtime, marker_mtime)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
 			$11, $1, $12, $13, $14, $15, $16, $17, $18, $19, $20)
-		ON CONFLICT (sha256) DO UPDATE SET path = EXCLUDED.path, mtime = EXCLUDED.mtime
-		WHERE samples.path IS DISTINCT FROM EXCLUDED.path`,
+		ON CONFLICT (sha256) DO UPDATE SET
+			path  = CASE WHEN EXCLUDED.path  <> ''   THEN EXCLUDED.path  ELSE samples.path  END,
+			mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END
+		WHERE (EXCLUDED.path  <> ''   AND samples.path  IS DISTINCT FROM EXCLUDED.path)
+		   OR (EXCLUDED.mtime IS NOT NULL AND samples.mtime IS DISTINCT FROM EXCLUDED.mtime)`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.Parent, s.Skip, s.Formula, s.Elements, s.Score,
@@ -239,8 +265,11 @@ SELECT DISTINCT ON (sha256)
 	canonical_sha256, parent, skip, formula, elements,
 	score, max_crit, suspicious_count, mtime, marker_mtime
 FROM _staging
-ON CONFLICT (sha256) DO UPDATE SET path = EXCLUDED.path, mtime = EXCLUDED.mtime
-WHERE samples.path IS DISTINCT FROM EXCLUDED.path`
+ON CONFLICT (sha256) DO UPDATE SET
+	path  = CASE WHEN EXCLUDED.path  <> ''   THEN EXCLUDED.path  ELSE samples.path  END,
+	mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END
+WHERE (EXCLUDED.path  <> ''   AND samples.path  IS DISTINCT FROM EXCLUDED.path)
+   OR (EXCLUDED.mtime IS NOT NULL AND samples.mtime IS DISTINCT FROM EXCLUDED.mtime)`
 
 func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inserted int64, needsAnalysis []string, err error) {
 	rows := make([][]any, len(samples))
@@ -1021,6 +1050,36 @@ func (db *DB) deleteAllPG(ctx context.Context) error {
 		return fmt.Errorf("hopper: delete all: %w", err)
 	}
 	return nil
+}
+
+func (db *DB) countCleanupPG(ctx context.Context, stage CleanupStage) (int64, error) {
+	var n int64
+	err := db.pool.QueryRow(ctx,
+		"SELECT count(*) FROM samples WHERE "+stage.predicate).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: count cleanup %s: %w", stage.Name, err)
+	}
+	return n, nil
+}
+
+func (db *DB) applyCleanupPG(ctx context.Context, stage CleanupStage) (int64, error) {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: begin cleanup %s: %w", stage.Name, err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+	if _, err := tx.Exec(ctx,
+		"DELETE FROM reports WHERE sha256 IN (SELECT sha256 FROM samples WHERE "+stage.predicate+")"); err != nil {
+		return 0, fmt.Errorf("hopper: cleanup %s reports: %w", stage.Name, err)
+	}
+	tag, err := tx.Exec(ctx, "DELETE FROM samples WHERE "+stage.predicate)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: cleanup %s samples: %w", stage.Name, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("hopper: commit cleanup %s: %w", stage.Name, err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 func (db *DB) feedSamplesPG(ctx context.Context, q FeedQuery) ([]*Sample, error) {

@@ -26,6 +26,13 @@ func openTestDB(t *testing.T) *DB {
 
 func mustInsert(t *testing.T, ctx context.Context, db *DB, s *Sample) {
 	t.Helper()
+	// The insert layer rejects samples with empty paths. Many existing
+	// tests build minimal Sample literals without a Path; give them a
+	// synthetic one derived from the sha so they still exercise the DB
+	// without needing every test updated.
+	if s.Path == "" {
+		s.Path = "test/" + s.SHA256
+	}
 	if err := db.InsertSample(ctx, s); err != nil {
 		t.Fatalf("InsertSample: %v", err)
 	}
@@ -757,9 +764,9 @@ func TestInsertSampleBatch(t *testing.T) {
 	ctx := context.Background()
 
 	samples := []*Sample{
-		{SHA256: "b1", Source: "test", Label: "bad", LabelSource: "test", SizeBytes: 100},
-		{SHA256: "b2", Source: "test", Label: "good", LabelSource: "test", SizeBytes: 200},
-		{SHA256: "b3", Source: "test", Label: "bad", LabelSource: "test", SizeBytes: 300},
+		{SHA256: "b1", Source: "test", Label: "bad", LabelSource: "test", Path: "test/b1", SizeBytes: 100},
+		{SHA256: "b2", Source: "test", Label: "good", LabelSource: "test", Path: "test/b2", SizeBytes: 200},
+		{SHA256: "b3", Source: "test", Label: "bad", LabelSource: "test", Path: "test/b3", SizeBytes: 300},
 	}
 	_, needs, err := db.InsertSampleBatch(ctx, samples)
 	if err != nil {
@@ -1026,6 +1033,7 @@ func TestExplodeArchiveMembers(t *testing.T) {
 		Source:          "test",
 		Label:           "bad",
 		LabelSource:     "test",
+		Path:            "bad/archive.zip",
 		CleaveResult:    cleaveJSON,
 		CanonicalSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 	}
@@ -1048,7 +1056,8 @@ func TestExplodeArchiveMembers(t *testing.T) {
 		t.Errorf("duplicate explosion inserted = %d, want 0", n)
 	}
 
-	// The txt file with only level 1 findings should have skip="weak-findings".
+	// The txt file with only level 1 findings should have skip="weak-findings"
+	// and a virtual path combining parent.Path with its in-archive path.
 	txt, err := db.SampleBySHA256(ctx, "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
 	if err != nil {
 		t.Fatal(err)
@@ -1059,6 +1068,9 @@ func TestExplodeArchiveMembers(t *testing.T) {
 	if txt.Parent != parent.SHA256 {
 		t.Errorf("txt Parent = %q, want %q", txt.Parent, parent.SHA256)
 	}
+	if want := "bad/archive.zip!pkg/readme.txt"; txt.Path != want {
+		t.Errorf("txt Path = %q, want %q", txt.Path, want)
+	}
 
 	// The py file with hostile level findings should NOT be skipped.
 	py, err := db.SampleBySHA256(ctx, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
@@ -1067,6 +1079,9 @@ func TestExplodeArchiveMembers(t *testing.T) {
 	}
 	if py.Skip != "" {
 		t.Errorf("py Skip = %q, want empty", py.Skip)
+	}
+	if want := "bad/archive.zip!pkg/setup.py"; py.Path != want {
+		t.Errorf("py Path = %q, want %q", py.Path, want)
 	}
 }
 
@@ -1122,7 +1137,7 @@ func TestInsertSampleNew(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
-	isNew, err := db.InsertSampleNew(ctx, &Sample{SHA256: "new1", Source: "test", Label: "bad", LabelSource: "test"})
+	isNew, err := db.InsertSampleNew(ctx, &Sample{SHA256: "new1", Source: "test", Label: "bad", LabelSource: "test", Path: "test/new1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1130,7 +1145,7 @@ func TestInsertSampleNew(t *testing.T) {
 		t.Error("first insert should be new")
 	}
 
-	isNew, err = db.InsertSampleNew(ctx, &Sample{SHA256: "new1", Source: "test", Label: "bad", LabelSource: "test"})
+	isNew, err = db.InsertSampleNew(ctx, &Sample{SHA256: "new1", Source: "test", Label: "bad", LabelSource: "test", Path: "test/new1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1150,7 +1165,7 @@ func TestSamplesByEmbeddedSHA256(t *testing.T) {
 	cleave := []byte(`{"fs":[{"sha":"parent1","type":"archive","dp":0}],` +
 		`"files":[{"sha256":"embedded1","formula":"H2O","score":10},` +
 		`{"sha256":"embedded2","formula":"O2","score":5}]}`)
-	s := &Sample{SHA256: "parent1", Source: "test", CleaveResult: cleave}
+	s := &Sample{SHA256: "parent1", Source: "test", Path: "test/parent1", CleaveResult: cleave}
 	if _, err := db.InsertSampleNew(ctx, s); err != nil {
 		t.Fatal(err)
 	}
@@ -1178,7 +1193,7 @@ func TestRecomputeCanonicalSHA256(t *testing.T) {
 
 	// embedded2 is smaller than parent2
 	cleave := []byte(`{"files": [{"sha256": "` + embedded2 + `", "formula": "H2O", "score": 10}]}`)
-	s := &Sample{SHA256: parent2, Source: "test", CleaveResult: cleave, CanonicalSHA256: parent2}
+	s := &Sample{SHA256: parent2, Source: "test", Path: "test/" + parent2, CleaveResult: cleave, CanonicalSHA256: parent2}
 	if _, err := db.InsertSampleNew(ctx, s); err != nil {
 		t.Fatal(err)
 	}

@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -46,6 +47,7 @@ commands:
   bad-review         list marker-bad files cleave still considers benign
   backfill           re-derive columns from cleave_result/litmus_result blobs
   purge-unsupported  delete analyzed rows cleave could not classify
+  cleanup            delete wonky samples by skip category (interactive)
   stats              show sample counts
 `
 
@@ -291,6 +293,8 @@ func run(ctx context.Context) error {
 		return cmdBackfill(ctx)
 	case "purge-unsupported":
 		return cmdPurgeUnsupported(ctx)
+	case "cleanup":
+		return cmdCleanup(ctx)
 	case "stats":
 		return cmdStats(ctx)
 	default:
@@ -1926,6 +1930,84 @@ func cmdPurgeUnsupported(ctx context.Context) error {
 		return err
 	}
 	slog.Info("purge complete", "deleted", n)
+	return nil
+}
+
+// cmdCleanup walks each cleanup stage, reports how many rows match, and
+// (with --apply) prompts per stage before deleting. Without --apply the
+// command is read-only — always safe to run for a quick status report.
+func cmdCleanup(ctx context.Context) error {
+	f := flag.NewFlagSet("cleanup", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	apply := f.Bool("apply", false, "actually delete rows (default is count-only)")
+	yes := f.Bool("yes", false, "skip per-stage confirmation prompts")
+	only := f.String("stage", "", "only operate on the named stage")
+	parseFlags(f, os.Args[2:])
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	stages := hopper.CleanupStages
+	if *only != "" {
+		s, ok := hopper.CleanupStageByName(*only)
+		if !ok {
+			names := make([]string, len(hopper.CleanupStages))
+			for i := range hopper.CleanupStages {
+				names[i] = hopper.CleanupStages[i].Name
+			}
+			return fmt.Errorf("unknown stage %q; valid: %s", *only, strings.Join(names, ", "))
+		}
+		stages = []hopper.CleanupStage{s}
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+	var totalDeleted int64
+	for _, s := range stages {
+		n, err := db.CountCleanup(ctx, s)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			writeStdoutf("%-11s  0 rows\n", s.Name)
+			continue
+		}
+		writeStdoutf("%-11s  %d rows — %s\n", s.Name, n, s.Description)
+
+		if !*apply {
+			continue
+		}
+
+		if !*yes {
+			writeStdoutf("  delete %d rows? [y/N] ", n)
+			ans, _ := reader.ReadString('\n')
+			switch strings.TrimSpace(strings.ToLower(ans)) {
+			case "y", "yes":
+			default:
+				writeStdoutLine("  skipped")
+				continue
+			}
+		}
+
+		deleted, err := db.ApplyCleanup(ctx, s)
+		if err != nil {
+			return err
+		}
+		writeStdoutf("  deleted %d rows\n", deleted)
+		totalDeleted += deleted
+	}
+
+	if *apply {
+		writeStdoutf("\nTotal deleted: %d rows\n", totalDeleted)
+		return nil
+	}
+	writeStdoutLine("")
+	writeStdoutLine("Dry run. To delete:")
+	writeStdoutLine("  hopper cleanup --apply                    # prompt per stage")
+	writeStdoutLine("  hopper cleanup --apply --yes              # no prompts")
+	writeStdoutLine("  hopper cleanup --apply --stage=missing    # one stage only")
 	return nil
 }
 

@@ -1,4 +1,4 @@
-.PHONY: build test clean rollout-bastille replica help
+.PHONY: build test clean rollout-bastille replica diagnose-replica help
 
 help:
 	@echo "Available targets:"
@@ -9,6 +9,7 @@ help:
 	@echo "  make rollout-bastille       Deploy to Bastille jails (BUILD=build RUN=hopper [DB_ONLY=1])"
 	@echo "  make replica                Configure local postgres as a logical replica of the"
 	@echo "                              upstream hopper DB (idempotent; reads ~/.pgpass)"
+	@echo "  make diagnose-replica       Dump replication status from both sides (read-only)"
 
 build:
 	CGO_ENABLED=1 go build -o hopper -ldflags="-s -w" ./cmd/hopper
@@ -28,6 +29,9 @@ rollout-bastille:
 
 replica: build
 	@./hacks/setup-replica.sh
+
+diagnose-replica:
+	@./hacks/diagnose-replica.sh
 
 clean:
 	rm -f hopper

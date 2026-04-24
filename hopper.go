@@ -323,7 +323,13 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 			Size  int64 `json:"sz"`
 			Depth int   `json:"dp"`
 		}
-		if json.Unmarshal(raw, &entry) != nil || entry.Depth == 0 || len(entry.SHA256) != 64 {
+		if json.Unmarshal(raw, &entry) != nil || entry.Depth == 0 {
+			continue
+		}
+		// Cleave's hex output is conventionally lowercase, but normalize
+		// here so one upstream quirk can't bifurcate the dataset.
+		entry.SHA256 = strings.ToLower(entry.SHA256)
+		if !isLowerHexSHA256(entry.SHA256) {
 			continue
 		}
 
@@ -331,6 +337,12 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 		// and inserting them just pollutes the DB with rows the pipeline will
 		// never usefully act on.
 		if entry.FileType == "" {
+			continue
+		}
+
+		// Members without an in-archive path can't be given a meaningful
+		// location, so drop them rather than inserting rows with empty path.
+		if entry.Path == "" {
 			continue
 		}
 
@@ -358,6 +370,17 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 			continue
 		}
 
+		// Virtual path: "<parent-path>!<in-archive-path>". The '!' separator is
+		// the long-standing JAR/ZIP convention; it nests cleanly for archives
+		// within archives (e.g. "outer.zip!inner.zip!lib/foo.so"). If the parent
+		// has no path (older rows that predate relativization, or tests), fall
+		// back to the in-archive path alone so the row still has a meaningful
+		// location.
+		memberPath := entry.Path
+		if parent.Path != "" {
+			memberPath = parent.Path + "!" + entry.Path
+		}
+
 		members = append(members, &Sample{
 			SHA256:          entry.SHA256,
 			Source:          parent.Source,
@@ -368,6 +391,7 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 			SizeBytes:       entry.Size,
 			Label:           parent.Label,
 			LabelSource:     parent.LabelSource,
+			Path:            memberPath,
 			CleaveResult:    singleFile,
 			LitmusResult:    parent.LitmusResult,
 			CanonicalSHA256: parent.CanonicalSHA256,
@@ -413,6 +437,55 @@ func (db *DB) PurgeUnsupported(ctx context.Context, dryRun bool) (int64, error) 
 		return db.purgeUnsupportedPG(ctx, dryRun)
 	}
 	return db.purgeUnsupportedSQLite(ctx, dryRun)
+}
+
+// CleanupStage identifies a category of dead-end samples — records whose
+// skip marker means they can never be re-analyzed (missing on disk, lost
+// path, corrupt, encrypted) or have been superseded. Predicates are
+// compile-time constants; callers select a stage by name, so no caller
+// input is ever interpolated into SQL.
+type CleanupStage struct {
+	Name        string
+	Description string
+	predicate   string // SQL fragment applied to the samples table
+}
+
+// CleanupStages lists cleanup categories from largest/most-confidently-dead
+// to smallest/edge-case. Keep the order stable: the CLI walks it in this
+// order and users may rely on it when scripting with --stage.
+var CleanupStages = []CleanupStage{
+	{"empty_path", "samples whose original path was lost", "skip = 'empty_path'"},
+	{"missing", "files marked missing from disk", "skip = 'missing'"},
+	{"corrupt", "files too damaged to analyze", "skip = 'corrupt'"},
+	{"encrypted", "encrypted files that will never be analyzable", "skip = 'encrypted'"},
+	{"replaced", "samples superseded by a newer version", "skip = 'replaced'"},
+}
+
+// CleanupStageByName returns the stage with the given short name.
+func CleanupStageByName(name string) (CleanupStage, bool) {
+	for _, s := range CleanupStages {
+		if s.Name == name {
+			return s, true
+		}
+	}
+	return CleanupStage{}, false
+}
+
+// CountCleanup returns how many rows a cleanup stage would delete.
+func (db *DB) CountCleanup(ctx context.Context, stage CleanupStage) (int64, error) {
+	if db.pool != nil {
+		return db.countCleanupPG(ctx, stage)
+	}
+	return db.countCleanupSQLite(ctx, stage)
+}
+
+// ApplyCleanup deletes the rows matched by stage (plus their reports) in
+// a single transaction. Returns the number of sample rows removed.
+func (db *DB) ApplyCleanup(ctx context.Context, stage CleanupStage) (int64, error) {
+	if db.pool != nil {
+		return db.applyCleanupPG(ctx, stage)
+	}
+	return db.applyCleanupSQLite(ctx, stage)
 }
 
 // Open connects to the registry. DSNs starting with postgres:// or
@@ -477,9 +550,42 @@ func (db *DB) InsertSample(ctx context.Context, s *Sample) error {
 	return err
 }
 
+// isLowerHexSHA256 returns true if s is exactly 64 lowercase hex characters.
+// SHA256 is case-insensitive by value but case-sensitive as a TEXT column,
+// so enforcing a single canonical form prevents accidental UNIQUE-constraint
+// bypass via mixed-case duplicates.
+func isLowerHexSHA256(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// validSample enforces the minimum fields required for a sample row to
+// carry analytical value: a non-empty sha256 and a non-empty path (real or
+// virtual). Empty paths are the main historical source of junk rows. Strict
+// lowercase-hex enforcement on sha256 lives at the edges (API validator,
+// archive explode) and at the Postgres CHECK constraint — this guard stays
+// loose so tests can use short mock shas.
+func validSample(s *Sample) bool {
+	return s != nil && s.SHA256 != "" && s.Path != ""
+}
+
 // InsertSampleNew adds a sample and reports whether the row was actually inserted
-// (true) or was a duplicate that was silently skipped (false).
+// (true) or was a duplicate that was silently skipped (false). Samples with an
+// empty sha256 or path are rejected — callers should have derived both before
+// reaching the DB layer.
 func (db *DB) InsertSampleNew(ctx context.Context, s *Sample) (bool, error) {
+	if !validSample(s) {
+		slog.Warn("rejecting invalid sample", "sha256", s.SHA256, "path", s.Path)
+		return false, nil
+	}
 	if db.pool != nil {
 		return db.insertSampleNewPG(ctx, s)
 	}
@@ -490,16 +596,31 @@ func (db *DB) InsertSampleNew(ctx context.Context, s *Sample) (bool, error) {
 // Returns the number of new rows inserted (duplicates are silently skipped).
 // Much faster than calling InsertSampleNew in a loop, especially for SQLite
 // where each individual INSERT acquires the single-writer lock.
-// InsertSampleBatch inserts a batch of samples.
-// Returns the number of newly inserted samples and a list of SHAs that lack analysis results.
+// Samples failing validSample are dropped before reaching the DB; their
+// count is logged at warn level so the ingest source can be traced.
 func (db *DB) InsertSampleBatch(ctx context.Context, samples []*Sample) (inserted int64, needsAnalysis []string, err error) {
 	if len(samples) == 0 {
 		return 0, nil, nil
 	}
-	if db.pool != nil {
-		return db.insertSampleBatchPG(ctx, samples)
+	valid := samples[:0]
+	var skipped int
+	for _, s := range samples {
+		if !validSample(s) {
+			skipped++
+			continue
+		}
+		valid = append(valid, s)
 	}
-	return db.insertSampleBatchSQLite(ctx, samples)
+	if skipped > 0 {
+		slog.Warn("dropped invalid samples from batch", "skipped", skipped, "batch", len(samples))
+	}
+	if len(valid) == 0 {
+		return 0, nil, nil
+	}
+	if db.pool != nil {
+		return db.insertSampleBatchPG(ctx, valid)
+	}
+	return db.insertSampleBatchSQLite(ctx, valid)
 }
 
 // SampleBySHA256 retrieves a sample by its hash.

@@ -349,8 +349,11 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 			score, max_crit, suspicious_count, mtime, marker_mtime)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?)
-		ON CONFLICT (sha256) DO UPDATE SET path = excluded.path, mtime = excluded.mtime
-			WHERE samples.path != excluded.path`,
+		ON CONFLICT (sha256) DO UPDATE SET
+			path  = CASE WHEN excluded.path  != ''   THEN excluded.path  ELSE samples.path  END,
+			mtime = CASE WHEN excluded.mtime IS NOT NULL THEN excluded.mtime ELSE samples.mtime END
+			WHERE (excluded.path  != ''   AND samples.path  != excluded.path)
+			   OR (excluded.mtime IS NOT NULL AND samples.mtime IS NOT excluded.mtime)`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.SHA256, s.Parent, s.Skip, s.Formula, s.Elements,
@@ -391,8 +394,11 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		`
 		INSERT INTO samples (%s)
 		VALUES (%s)
-		ON CONFLICT (sha256) DO UPDATE SET path = excluded.path, mtime = excluded.mtime
-			WHERE samples.path != excluded.path`,
+		ON CONFLICT (sha256) DO UPDATE SET
+			path  = CASE WHEN excluded.path  != ''   THEN excluded.path  ELSE samples.path  END,
+			mtime = CASE WHEN excluded.mtime IS NOT NULL THEN excluded.mtime ELSE samples.mtime END
+			WHERE (excluded.path  != ''   AND samples.path  != excluded.path)
+			   OR (excluded.mtime IS NOT NULL AND samples.mtime IS NOT excluded.mtime)`,
 		strings.Join(cols, ", "),
 		strings.Join(placeholders, ", "))
 
@@ -1225,6 +1231,40 @@ func (db *DB) deleteAllSQLite(ctx context.Context) error {
 		return fmt.Errorf("hopper: delete samples: %w", err)
 	}
 	return nil
+}
+
+func (db *DB) countCleanupSQLite(ctx context.Context, stage CleanupStage) (int64, error) {
+	var n int64
+	err := db.lite.QueryRowContext(ctx,
+		"SELECT count(*) FROM samples WHERE "+stage.predicate).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: count cleanup %s: %w", stage.Name, err)
+	}
+	return n, nil
+}
+
+func (db *DB) applyCleanupSQLite(ctx context.Context, stage CleanupStage) (int64, error) {
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: begin cleanup %s: %w", stage.Name, err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
+	if _, err := tx.ExecContext(ctx,
+		"DELETE FROM reports WHERE sha256 IN (SELECT sha256 FROM samples WHERE "+stage.predicate+")"); err != nil {
+		return 0, fmt.Errorf("hopper: cleanup %s reports: %w", stage.Name, err)
+	}
+	res, err := tx.ExecContext(ctx, "DELETE FROM samples WHERE "+stage.predicate)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: cleanup %s samples: %w", stage.Name, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("hopper: cleanup %s rows affected: %w", stage.Name, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("hopper: commit cleanup %s: %w", stage.Name, err)
+	}
+	return n, nil
 }
 
 func (db *DB) feedSamplesSQLite(ctx context.Context, q FeedQuery) ([]*Sample, error) {
