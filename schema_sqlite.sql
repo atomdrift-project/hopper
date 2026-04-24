@@ -5,22 +5,33 @@ CREATE TABLE IF NOT EXISTS samples (
 	feed          TEXT NOT NULL DEFAULT '',
 	ecosystem     TEXT NOT NULL DEFAULT '',
 	filename      TEXT NOT NULL DEFAULT '',
-	file_type     TEXT NOT NULL DEFAULT '',
+	-- file_type, score, formula, litmus_score are GENERATED from the JSONB
+	-- source columns. Writing to them is an error; readers see the same
+	-- derived values they always did.
+	file_type     TEXT GENERATED ALWAYS AS
+	                   (COALESCE(json_extract(cleave_result, '$.fs[0].type'), ''))
+	                   STORED,
 	size_bytes    INTEGER NOT NULL DEFAULT 0,
 	label         TEXT NOT NULL DEFAULT 'unknown',
 	label_source  TEXT NOT NULL DEFAULT '',
 	cleave_result TEXT,
 	litmus_result TEXT,
-	litmus_score  REAL NOT NULL DEFAULT 0,
+	litmus_score  REAL GENERATED ALWAYS AS
+	                   (COALESCE(json_extract(litmus_result, '$.prob'), 0))
+	                   STORED,
 	path  TEXT NOT NULL DEFAULT '',
 	status        TEXT NOT NULL DEFAULT '',
 	note          TEXT NOT NULL DEFAULT '',
 	canonical_sha256 TEXT NOT NULL DEFAULT '',
 	parent        TEXT NOT NULL DEFAULT '',
 	skip          TEXT NOT NULL DEFAULT '',
-	formula       TEXT NOT NULL DEFAULT '',
+	formula       TEXT GENERATED ALWAYS AS
+	                   (COALESCE(json_extract(cleave_result, '$.fs[0].f'), ''))
+	                   STORED,
 	elements      TEXT NOT NULL DEFAULT '',
-	score         INTEGER NOT NULL DEFAULT 0,
+	score         INTEGER GENERATED ALWAYS AS
+	                   (COALESCE(json_extract(cleave_result, '$.fs[0].x'), 0))
+	                   STORED,
 	max_crit      INTEGER NOT NULL DEFAULT 0,
 	suspicious_count INTEGER NOT NULL DEFAULT 0,
 	created_at    DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),

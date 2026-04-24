@@ -518,35 +518,37 @@ func eachReportSQLite(ctx context.Context, db *DB, afterID int64, fn func(*Repor
 
 // Sample staging for PG COPY.
 
+// file_type, score, formula, litmus_score are GENERATED columns on the
+// destination samples table — they derive from cleave_result / litmus_result
+// automatically. Transfer writes only the source-of-truth columns.
 var sampleStagingCols = []string{
-	"sha256", "source", "feed", "ecosystem", "filename", "file_type",
+	"sha256", "source", "feed", "ecosystem", "filename",
 	"size_bytes", "label", "label_source", "path", "status",
-	"note", "canonical_sha256", "parent", "skip", "formula", "elements", "score", "max_crit", "suspicious_count",
-	"cleave_result", "litmus_result", "litmus_score",
+	"note", "canonical_sha256", "parent", "skip", "elements", "max_crit", "suspicious_count",
+	"cleave_result", "litmus_result",
 	"analyzed_at", "created_at", "updated_at", "mtime", "marker_mtime",
 	"traits_version",
 }
 
 const sampleStagingDDL = `CREATE TEMP TABLE _staging (
 	sha256 TEXT, source TEXT, feed TEXT, ecosystem TEXT, filename TEXT,
-	file_type TEXT, size_bytes BIGINT, label TEXT, label_source TEXT,
+	size_bytes BIGINT, label TEXT, label_source TEXT,
 	path TEXT, status TEXT, note TEXT, canonical_sha256 TEXT,
-	parent TEXT, skip TEXT, formula TEXT, elements TEXT, score INTEGER, max_crit INTEGER, suspicious_count INTEGER,
-	cleave_result JSONB, litmus_result JSONB, litmus_score DOUBLE PRECISION,
+	parent TEXT, skip TEXT, elements TEXT, max_crit INTEGER, suspicious_count INTEGER,
+	cleave_result JSONB, litmus_result JSONB,
 	analyzed_at TIMESTAMPTZ, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ,
 	traits_version TEXT NOT NULL DEFAULT ''
 ) ON COMMIT DROP`
 
-const sampleStagingInsert = `INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
+const sampleStagingInsert = `INSERT INTO samples (sha256, source, feed, ecosystem, filename,
 	size_bytes, label, label_source, path, status, note, canonical_sha256,
-	parent, skip, formula, elements, score, max_crit,
-	suspicious_count, cleave_result, litmus_result, litmus_score,
+	parent, skip, elements, max_crit, suspicious_count,
+	cleave_result, litmus_result,
 	analyzed_at, created_at, updated_at, mtime, marker_mtime, traits_version)
-SELECT sha256, source, feed, ecosystem, filename, file_type,
+SELECT sha256, source, feed, ecosystem, filename,
 	size_bytes, label, label_source, path, status,
-	note, canonical_sha256, parent, skip, formula, elements,
-	score, max_crit, suspicious_count, cleave_result,
-	litmus_result, litmus_score,
+	note, canonical_sha256, parent, skip, elements, max_crit, suspicious_count,
+	cleave_result, litmus_result,
 	analyzed_at, created_at, updated_at, mtime, marker_mtime, traits_version
 FROM _staging
 ON CONFLICT (sha256) DO NOTHING`
@@ -555,10 +557,10 @@ func flushSamplesPG(ctx context.Context, dst *DB, samples []*Sample) (int64, err
 	rows := make([][]any, len(samples))
 	for i, s := range samples {
 		rows[i] = []any{
-			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
+			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
-			s.Note, s.CanonicalSHA256, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.MaxCrit, s.SuspiciousCount,
-			sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult), s.LitmusScore,
+			s.Note, s.CanonicalSHA256, s.Parent, s.Skip, s.Elements, s.MaxCrit, s.SuspiciousCount,
+			sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult),
 			s.AnalyzedAt, s.CreatedAt, s.UpdatedAt, s.Mtime, s.MarkerMtime,
 			s.TraitsVersion,
 		}
@@ -582,15 +584,15 @@ func flushSamplesSQLite(ctx context.Context, dst *DB, samples []*Sample) (int64,
 			lr = sql.NullString{String: string(s.LitmusResult), Valid: true}
 		}
 		res, err := tx.ExecContext(ctx, `
-			INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
+			INSERT INTO samples (sha256, source, feed, ecosystem, filename,
 				size_bytes, label, label_source, path, status, note, canonical_sha256,
-				parent, skip, formula, elements, score, max_crit, suspicious_count, cleave_result, litmus_result,
-				litmus_score, analyzed_at, created_at, updated_at, mtime, marker_mtime, traits_version)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				parent, skip, elements, max_crit, suspicious_count, cleave_result, litmus_result,
+				analyzed_at, created_at, updated_at, mtime, marker_mtime, traits_version)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (sha256) DO NOTHING`,
-			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
+			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
-			s.Note, s.CanonicalSHA256, s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.MaxCrit, s.SuspiciousCount, cr, lr, s.LitmusScore,
+			s.Note, s.CanonicalSHA256, s.Parent, s.Skip, s.Elements, s.MaxCrit, s.SuspiciousCount, cr, lr,
 			s.AnalyzedAt, s.CreatedAt, s.UpdatedAt, s.Mtime, s.MarkerMtime, s.TraitsVersion)
 		if err != nil {
 			if rollbackErr := tx.Rollback(); rollbackErr != nil {

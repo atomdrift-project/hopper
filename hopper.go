@@ -258,21 +258,6 @@ func parseCleaveFile(sha256 string, result []byte) cleaveFileInfo {
 	return ParseCleaveResult(sha256, result).FileInfo
 }
 
-// parseLitmusProb extracts the litmus confidence score from a litmus result
-// envelope. Returns 0 if the envelope is missing or unparseable.
-func parseLitmusProb(result []byte) float64 {
-	if len(result) == 0 {
-		return 0
-	}
-	var envelope struct {
-		Prob float64 `json:"prob"`
-	}
-	if json.Unmarshal(result, &envelope) != nil {
-		return 0
-	}
-	return envelope.Prob
-}
-
 // stripSubscripts removes Unicode subscript digits (₀-₉) from a formula,
 // producing the qualitative element list.
 func stripSubscripts(formula string) string {
@@ -420,6 +405,7 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 			Path:            memberPath,
 			CleaveResult:    singleFile,
 			LitmusResult:    parent.LitmusResult,
+			LitmusScore:     parent.LitmusScore,
 			CanonicalSHA256: parent.CanonicalSHA256,
 			Parent:          parent.SHA256,
 			Skip:            skip,
@@ -733,12 +719,13 @@ func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []by
 
 // UpdateLitmusResult stores the litmus classification envelope for a sample.
 // The result should be the litmus response JSON without the embedded cleave field.
+// litmus_score is a GENERATED column on samples and updates automatically from
+// the new envelope — no separate score parameter needed.
 func (db *DB) UpdateLitmusResult(ctx context.Context, sha256 string, result []byte) error {
-	prob := parseLitmusProb(result)
 	if db.pool != nil {
-		return db.updateLitmusResultPG(ctx, sha256, result, prob)
+		return db.updateLitmusResultPG(ctx, sha256, result)
 	}
-	return db.updateLitmusResultSQLite(ctx, sha256, result, prob)
+	return db.updateLitmusResultSQLite(ctx, sha256, result)
 }
 
 // Reclassify changes a sample's label.

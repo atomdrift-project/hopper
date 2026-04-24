@@ -28,11 +28,15 @@ func openSQLite(ctx context.Context, dsn string) (*DB, error) {
 }
 
 func pragmaHasColumn(ctx context.Context, db *sql.DB, column string) int {
+	// pragma_table_xinfo (not table_info) includes GENERATED columns;
+	// table_info hides them, which would cause legacy ALTER TABLE ADD
+	// COLUMN migrations to fire duplicates against columns that already
+	// exist as generated in schema_sqlite.sql.
 	var count int
 	if err := db.QueryRowContext(ctx,
-		"SELECT count(*) FROM pragma_table_info('samples') WHERE name = ?", column,
+		"SELECT count(*) FROM pragma_table_xinfo('samples') WHERE name = ?", column,
 	).Scan(&count); err != nil {
-		slog.Debug("pragma_table_info failed", "column", column, "error", err)
+		slog.Debug("pragma_table_xinfo failed", "column", column, "error", err)
 		return 0
 	}
 	return count
@@ -401,27 +405,26 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 		return false, fmt.Errorf("hopper: begin insert: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // commit or rollback
-	// cleave_result and litmus_result are populated on INSERT when the caller
-	// already has them (notably ExplodeArchiveMembers, which derives both
-	// from the parent). ON CONFLICT leaves existing analysis alone so a
-	// walker row arriving later can't wipe results from an earlier Explode.
+	// file_type, score, formula, litmus_score are GENERATED STORED columns
+	// (SQLite 3.31+). They auto-derive from cleave_result / litmus_result
+	// so writing to them is neither necessary nor legal.
 	res, err := tx.ExecContext(ctx, `
-		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
+		INSERT INTO samples (sha256, source, feed, ecosystem, filename,
 			size_bytes, label, label_source, path, status,
-			canonical_sha256, parent, skip, formula, elements,
-			score, max_crit, suspicious_count, mtime, marker_mtime,
+			canonical_sha256, parent, skip, elements,
+			max_crit, suspicious_count, mtime, marker_mtime,
 			cleave_result, litmus_result)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256) DO UPDATE SET
 			path  = CASE WHEN excluded.path  != ''   THEN excluded.path  ELSE samples.path  END,
 			mtime = CASE WHEN excluded.mtime IS NOT NULL THEN excluded.mtime ELSE samples.mtime END
 			WHERE (excluded.path  != ''   AND samples.path  != excluded.path)
 			   OR (excluded.mtime IS NOT NULL AND samples.mtime IS NOT excluded.mtime)`,
-		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
+		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
-		s.SHA256, s.Parent, s.Skip, s.Formula, s.Elements,
-		s.Score, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
+		s.SHA256, s.Parent, s.Skip, s.Elements,
+		s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
 		jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult))
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
@@ -461,9 +464,9 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 	defer tx.Rollback() //nolint:errcheck // rollback is best-effort after commit // commit or rollback
 
 	cols := []string{
-		"sha256", "source", "feed", "ecosystem", "filename", "file_type",
+		"sha256", "source", "feed", "ecosystem", "filename",
 		"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
-		"parent", "skip", "formula", "elements", "score", "max_crit", "suspicious_count",
+		"parent", "skip", "elements", "max_crit", "suspicious_count",
 		"mtime", "marker_mtime", "cleave_result", "litmus_result",
 	}
 	placeholders := make([]string, len(cols))
@@ -503,10 +506,10 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 
 	for _, s := range samples {
 		res, err := stmt.ExecContext(ctx,
-			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
+			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
-			s.SHA256, s.Parent, s.Skip, s.Formula, s.Elements,
-			s.Score, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
+			s.SHA256, s.Parent, s.Skip, s.Elements,
+			s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
 			jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult))
 		if err != nil {
 			return 0, nil, fmt.Errorf("hopper: batch insert %s: %w", s.SHA256, err)
@@ -660,28 +663,30 @@ func (db *DB) updateCleaveResultSQLite(
 	ctx context.Context, sha256 string, result []byte, canonical string,
 	fi cleaveFileInfo, traitsVersion string,
 ) error {
+	// file_type, score, formula, litmus_score are GENERATED columns;
+	// setting litmus_result = NULL auto-resets litmus_score to 0.
 	n := now()
 	_, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET cleave_result = ?,
-			canonical_sha256 = ?, formula = ?, elements = ?, score = ?, max_crit = ?, suspicious_count = ?,
-			file_type = CASE WHEN ? = '' THEN file_type ELSE ? END,
-			litmus_result = NULL, litmus_score = 0,
+			canonical_sha256 = ?, elements = ?,
+			max_crit = ?, suspicious_count = ?,
+			litmus_result = NULL,
 			traits_version = ?,
 			analyzed_at = ?, updated_at = ?
 		WHERE sha256 = ?`,
-		string(result), canonical, fi.Formula, fi.Elements,
-		fi.Score, fi.MaxCrit, fi.SuspiciousCount,
-		fi.FileType, fi.FileType, traitsVersion, n, n, sha256)
+		string(result), canonical, fi.Elements,
+		fi.MaxCrit, fi.SuspiciousCount,
+		traitsVersion, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
 	}
 	return nil
 }
 
-func (db *DB) updateLitmusResultSQLite(ctx context.Context, sha256 string, result []byte, score float64) error {
+func (db *DB) updateLitmusResultSQLite(ctx context.Context, sha256 string, result []byte) error {
 	_, err := db.lite.ExecContext(ctx, `
-		UPDATE samples SET litmus_result = ?, litmus_score = ?, updated_at = ?
-		WHERE sha256 = ?`, string(result), score, now(), sha256)
+		UPDATE samples SET litmus_result = ?, updated_at = ?
+		WHERE sha256 = ?`, string(result), now(), sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update litmus result: %w", err)
 	}
@@ -932,17 +937,18 @@ func (db *DB) relativizePathsSQLite(ctx context.Context, prefix string) (int64, 
 }
 
 func (db *DB) updateSampleSQLite(ctx context.Context, sha256, status string, result []byte, canonical string, fi cleaveFileInfo) error {
+	// file_type, score, formula, litmus_score are GENERATED; litmus_score
+	// auto-resets to 0 when litmus_result goes NULL.
 	n := now()
 	_, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET status = ?, cleave_result = ?,
-			canonical_sha256 = ?, formula = ?, elements = ?, score = ?, max_crit = ?, suspicious_count = ?,
-			file_type = CASE WHEN ? = '' THEN file_type ELSE ? END,
-			litmus_result = NULL, litmus_score = 0,
+			canonical_sha256 = ?, elements = ?,
+			max_crit = ?, suspicious_count = ?,
+			litmus_result = NULL,
 			analyzed_at = ?, updated_at = ?
 		WHERE sha256 = ?`,
-		status, string(result), canonical, fi.Formula,
-		fi.Elements, fi.Score, fi.MaxCrit, fi.SuspiciousCount,
-		fi.FileType, fi.FileType, n, n, sha256)
+		status, string(result), canonical,
+		fi.Elements, fi.MaxCrit, fi.SuspiciousCount, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update sample: %w", err)
 	}
@@ -1204,27 +1210,24 @@ const stripSubscriptsSQL = `replace(replace(replace(replace(replace(` +
 	`%s, '₀',''),'₁',''),'₂',''),'₃',''),'₄',''),` +
 	`'₅',''),'₆',''),'₇',''),'₈',''),'₉','')`
 
-// backfillSQLite mirrors backfillPG: SQL-side re-derivation gated on an
-// empty file_type column so already-backfilled rows are skipped cheaply.
-// See backfillPG for the rationale.
+// backfillSQLite mirrors backfillPG: re-derive the remaining non-generated
+// analysis columns (elements, max_crit, suspicious_count) for legacy rows,
+// then clear stale misclassified markers. file_type / score / formula /
+// litmus_score are GENERATED STORED columns since the recent schema change,
+// so they can't drift and don't need a backfill pass.
 func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 	var stats BackfillStats
 	ts := now()
 
 	if err := db.lite.QueryRowContext(ctx, `
 		SELECT count(*) FROM samples
-		WHERE file_type = ''
-			AND (cleave_result IS NOT NULL OR litmus_result IS NOT NULL)`).Scan(&stats.Scanned); err != nil {
+		WHERE cleave_result IS NOT NULL AND elements = ''`).Scan(&stats.Scanned); err != nil {
 		return stats, fmt.Errorf("hopper: backfill count: %w", err)
 	}
 
-	// Pass 1: formula / elements / score / file_type / max_crit from cleave_result.
-	// json_each over $.fs, filter to the depth-0 entry. Rows without one
-	// are silently skipped (matches PG behavior). stripSubscriptsSQL is a
-	// compile-time format string filled with a compile-time expression,
-	// so there's no tainted input despite the string concatenation.
-	// max_crit is computed via a correlated SELECT MAX over $.ts on the
-	// matched depth-0 entry. Batched to avoid one huge transaction.
+	// Pass 1: elements / max_crit / suspicious_count from cleave_result,
+	// gated on elements = '' (the remaining non-generated signal that a
+	// row hasn't been backfilled yet).
 	elementsExpr := fmt.Sprintf(stripSubscriptsSQL, "COALESCE(j.f, '')")
 	const backfillBatch = 5000
 	for {
@@ -1232,14 +1235,12 @@ func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 		cleaveSQL := `
 			WITH batch AS (
 				SELECT sha256 FROM samples
-				WHERE file_type = '' AND cleave_result IS NOT NULL
+				WHERE cleave_result IS NOT NULL AND elements = ''
 				LIMIT ?
 			),
 			cleave_extract AS (
 				SELECT s.sha256,
 					json_extract(je.value, '$.f') AS f,
-					json_extract(je.value, '$.x') AS x,
-					json_extract(je.value, '$.type') AS t,
 					(SELECT COALESCE(MAX(CAST(json_extract(te.value, '$.l') AS INTEGER)), 0)
 					 FROM json_each(je.value, '$.ts') te) AS mc,
 					(SELECT COUNT(*)
@@ -1251,16 +1252,13 @@ func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 				WHERE json_extract(je.value, '$.dp') = 0
 			)
 			UPDATE samples SET
-				formula = COALESCE(j.f, ''),
 				elements = ` + elementsExpr + `,
-				score = COALESCE(j.x, 0),
 				max_crit = COALESCE(j.mc, 0),
 				suspicious_count = COALESCE(j.sc, 0),
-				file_type = CASE WHEN COALESCE(j.t, '') = '' THEN samples.file_type ELSE j.t END,
 				updated_at = ?
 			FROM cleave_extract j
 			WHERE samples.sha256 = j.sha256
-				AND samples.file_type = ''`
+				AND samples.elements = ''`
 		cleaveRes, err := db.lite.ExecContext(ctx, cleaveSQL, backfillBatch, ts)
 		if err != nil {
 			return stats, fmt.Errorf("hopper: backfill cleave columns: %w", err)
@@ -1276,22 +1274,7 @@ func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 		slog.Info("backfill cleave batch", "batch", n, "total", stats.Updated)
 	}
 
-	// Pass 2: litmus_score from litmus_result.prob, same scope.
-	litmusRes, err := db.lite.ExecContext(ctx, `
-		UPDATE samples SET
-			litmus_score = COALESCE(json_extract(litmus_result, '$.prob'), 0),
-			updated_at = ?
-		WHERE file_type = ''
-			AND litmus_result IS NOT NULL
-			AND litmus_score IS NOT COALESCE(json_extract(litmus_result, '$.prob'), 0)`, ts)
-	if err != nil {
-		return stats, fmt.Errorf("hopper: backfill litmus_score: %w", err)
-	}
-	if n, err := litmusRes.RowsAffected(); err == nil {
-		stats.Updated += n
-	}
-
-	// Pass 3: clear stale skip='misclassified' markers whose underlying
+	// Pass 2: clear stale skip='misclassified' markers whose underlying
 	// trait counts no longer disagree with the marker. The old score-based
 	// rule was noisy on large tarballs and parked many rows here that the
 	// new max_crit/suspicious_count rule would never have flagged.

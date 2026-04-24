@@ -186,6 +186,76 @@ func (db *DB) migratePG(ctx context.Context) error {
 				ON CONFLICT (sha256, path) DO NOTHING;
 			END IF;
 		END$$`,
+
+		// Derived columns: convert from plain columns (written by Go) to
+		// GENERATED … STORED (computed by PG from the JSONB source). This
+		// makes drift structurally impossible — a writer can't forget to
+		// set them because they're no longer settable. Existing rows get
+		// recomputed as part of the ADD COLUMN, which also fixes the ~20K
+		// archive members that had litmus_score=0 despite non-zero JSON prob.
+		//
+		// Guard: attgenerated='s' means "stored generated". If the column is
+		// already in that state (second-run of the migration), do nothing.
+		`DO $$
+		BEGIN
+			-- litmus_score: read prob from the JSONB envelope
+			IF NOT EXISTS (
+				SELECT 1 FROM pg_attribute
+				 WHERE attrelid = 'samples'::regclass AND attname = 'litmus_score'
+				   AND attgenerated = 's'
+			) THEN
+				ALTER TABLE samples DROP COLUMN IF EXISTS litmus_score;
+				ALTER TABLE samples ADD COLUMN litmus_score DOUBLE PRECISION
+					GENERATED ALWAYS AS
+						(COALESCE((litmus_result->>'prob')::double precision, 0))
+					STORED;
+			END IF;
+
+			-- file_type: cleave's classification for the top-level file
+			IF NOT EXISTS (
+				SELECT 1 FROM pg_attribute
+				 WHERE attrelid = 'samples'::regclass AND attname = 'file_type'
+				   AND attgenerated = 's'
+			) THEN
+				ALTER TABLE samples DROP COLUMN IF EXISTS file_type;
+				ALTER TABLE samples ADD COLUMN file_type TEXT NOT NULL
+					GENERATED ALWAYS AS
+						(COALESCE(cleave_result->'fs'->0->>'type', ''))
+					STORED;
+			END IF;
+
+			-- score: cleave's cumulative severity (fs[0].x)
+			IF NOT EXISTS (
+				SELECT 1 FROM pg_attribute
+				 WHERE attrelid = 'samples'::regclass AND attname = 'score'
+				   AND attgenerated = 's'
+			) THEN
+				ALTER TABLE samples DROP COLUMN IF EXISTS score;
+				ALTER TABLE samples ADD COLUMN score INTEGER NOT NULL
+					GENERATED ALWAYS AS
+						(COALESCE((cleave_result->'fs'->0->>'x')::int, 0))
+					STORED;
+			END IF;
+
+			-- formula: cleave's behavioral signature (fs[0].f)
+			IF NOT EXISTS (
+				SELECT 1 FROM pg_attribute
+				 WHERE attrelid = 'samples'::regclass AND attname = 'formula'
+				   AND attgenerated = 's'
+			) THEN
+				ALTER TABLE samples DROP COLUMN IF EXISTS formula;
+				ALTER TABLE samples ADD COLUMN formula TEXT NOT NULL
+					GENERATED ALWAYS AS
+						(COALESCE(cleave_result->'fs'->0->>'f', ''))
+					STORED;
+			END IF;
+		END$$`,
+
+		// Re-create the indexes that DROP COLUMN cascaded away. Each IF NOT
+		// EXISTS so this is a no-op on re-runs after the first conversion.
+		`CREATE INDEX IF NOT EXISTS idx_samples_file_type ON samples(file_type)`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_formula   ON samples(formula)   WHERE formula   != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_score     ON samples(score)     WHERE score     != 0`,
 	} {
 		slog.Info("executing migration ddl", "ddl", ddl)
 		if _, err := db.pool.Exec(ctx, ddl); err != nil {
@@ -278,27 +348,27 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 		return false, fmt.Errorf("hopper: begin insert: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
-	// cleave_result and litmus_result are populated at INSERT time when the
-	// caller already has them (archive-member explosion derives both from
-	// the parent's analysis). ON CONFLICT leaves existing analysis alone so
-	// a walker-comes-after-Explode case doesn't wipe real results.
+	// cleave_result and litmus_result are the only analysis fields the
+	// writer sets — file_type, score, formula, and litmus_score are
+	// GENERATED STORED columns derived from the JSONB, so writing to them
+	// is neither required nor legal. ON CONFLICT leaves existing analysis
+	// alone so a walker-comes-after-Explode case doesn't wipe real results.
 	tag, err := tx.Exec(ctx, `
-		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
+		INSERT INTO samples (sha256, source, feed, ecosystem, filename,
 			size_bytes, label, label_source, path, status,
-			canonical_sha256, parent, skip, formula, elements,
-			score, max_crit, suspicious_count, mtime, marker_mtime,
+			canonical_sha256, parent, skip, elements,
+			max_crit, suspicious_count, mtime, marker_mtime,
 			cleave_result, litmus_result)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-			$11, $1, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-			$21, $22)
+			$1, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 		ON CONFLICT (sha256) DO UPDATE SET
 			path  = CASE WHEN EXCLUDED.path  <> ''   THEN EXCLUDED.path  ELSE samples.path  END,
 			mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END
 		WHERE (EXCLUDED.path  <> ''   AND samples.path  IS DISTINCT FROM EXCLUDED.path)
 		   OR (EXCLUDED.mtime IS NOT NULL AND samples.mtime IS DISTINCT FROM EXCLUDED.mtime)`,
-		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
+		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
-		s.Parent, s.Skip, s.Formula, s.Elements, s.Score,
+		s.Parent, s.Skip, s.Elements,
 		s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
 		sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult))
 	if err != nil {
@@ -331,37 +401,38 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 }
 
 var insertBatchStagingCols = []string{
-	"sha256", "source", "feed", "ecosystem", "filename", "file_type",
+	"sha256", "source", "feed", "ecosystem", "filename",
 	"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
-	"parent", "skip", "formula", "elements", "score", "max_crit", "suspicious_count",
+	"parent", "skip", "elements", "max_crit", "suspicious_count",
 	"mtime", "marker_mtime", "cleave_result", "litmus_result",
 }
 
 const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 	sha256 TEXT, source TEXT, feed TEXT, ecosystem TEXT, filename TEXT,
-	file_type TEXT, size_bytes BIGINT, label TEXT, label_source TEXT,
+	size_bytes BIGINT, label TEXT, label_source TEXT,
 	path TEXT, status TEXT, canonical_sha256 TEXT,
-	parent TEXT, skip TEXT, formula TEXT, elements TEXT,
-	score INTEGER, max_crit INTEGER, suspicious_count INTEGER,
+	parent TEXT, skip TEXT, elements TEXT,
+	max_crit INTEGER, suspicious_count INTEGER,
 	mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ,
 	cleave_result JSONB, litmus_result JSONB
 ) ON COMMIT DROP`
 
-// cleave_result and litmus_result are populated on INSERT so archive-
-// member explosion — which derives both from the parent — doesn't silently
-// drop them. ON CONFLICT leaves existing analysis alone: a walker row
-// arriving after Explode must not wipe results we already stored.
+// file_type, score, formula, and litmus_score are GENERATED columns on
+// samples, auto-computed from cleave_result / litmus_result. We don't
+// reference them here — writing to a generated column is an error.
+// ON CONFLICT leaves existing analysis alone: a walker row arriving
+// after Explode must not wipe results we already stored.
 const insertBatchStagingInsert = `INSERT INTO samples (
-	sha256, source, feed, ecosystem, filename, file_type,
+	sha256, source, feed, ecosystem, filename,
 	size_bytes, label, label_source, path, status,
-	canonical_sha256, parent, skip, formula, elements,
-	score, max_crit, suspicious_count, mtime, marker_mtime,
+	canonical_sha256, parent, skip, elements,
+	max_crit, suspicious_count, mtime, marker_mtime,
 	cleave_result, litmus_result)
 SELECT DISTINCT ON (sha256)
-	sha256, source, feed, ecosystem, filename, file_type,
+	sha256, source, feed, ecosystem, filename,
 	size_bytes, label, label_source, path, status,
-	canonical_sha256, parent, skip, formula, elements,
-	score, max_crit, suspicious_count, mtime, marker_mtime,
+	canonical_sha256, parent, skip, elements,
+	max_crit, suspicious_count, mtime, marker_mtime,
 	cleave_result, litmus_result
 FROM _staging
 ON CONFLICT (sha256) DO UPDATE SET
@@ -374,9 +445,9 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 	rows := make([][]any, len(samples))
 	for i, s := range samples {
 		rows[i] = []any{
-			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
+			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256,
-			s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
+			s.Parent, s.Skip, s.Elements, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
 			sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult),
 		}
 	}
@@ -525,28 +596,30 @@ func (db *DB) updateCleaveResultPG(
 	ctx context.Context, sha256 string, result []byte, canonical string,
 	fi cleaveFileInfo, traitsVersion string,
 ) error {
+	// file_type, score, formula, litmus_score are GENERATED from
+	// cleave_result / litmus_result — they can't be SET directly. Setting
+	// litmus_result = NULL implicitly resets litmus_score to 0 (via the
+	// COALESCE in its generation expression).
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET cleave_result = $2,
-			canonical_sha256 = $3, formula = $4, elements = $5,
-			score = $6, max_crit = $7, suspicious_count = $8,
-			file_type = COALESCE(NULLIF($9, ''), file_type),
-			litmus_result = NULL, litmus_score = 0,
-			traits_version = $10,
+			canonical_sha256 = $3, elements = $4,
+			max_crit = $5, suspicious_count = $6,
+			litmus_result = NULL,
+			traits_version = $7,
 			analyzed_at = now(), updated_at = now()
 		WHERE sha256 = $1`,
 		sha256, sanitizeJSONB(result), canonical,
-		fi.Formula, fi.Elements, fi.Score, fi.MaxCrit,
-		fi.SuspiciousCount, fi.FileType, traitsVersion)
+		fi.Elements, fi.MaxCrit, fi.SuspiciousCount, traitsVersion)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
 	}
 	return nil
 }
 
-func (db *DB) updateLitmusResultPG(ctx context.Context, sha256 string, result []byte, score float64) error {
+func (db *DB) updateLitmusResultPG(ctx context.Context, sha256 string, result []byte) error {
 	_, err := db.pool.Exec(ctx, `
-		UPDATE samples SET litmus_result = $2, litmus_score = $3, updated_at = now()
-		WHERE sha256 = $1`, sha256, sanitizeJSONB(result), score)
+		UPDATE samples SET litmus_result = $2, updated_at = now()
+		WHERE sha256 = $1`, sha256, sanitizeJSONB(result))
 	if err != nil {
 		return fmt.Errorf("hopper: update litmus result: %w", err)
 	}
@@ -796,16 +869,17 @@ func (db *DB) relativizePathsPG(ctx context.Context, prefix string) (int64, erro
 }
 
 func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result []byte, canonical string, fi cleaveFileInfo) error {
+	// file_type, score, formula, litmus_score are GENERATED; setting
+	// litmus_result = NULL implicitly resets litmus_score to 0.
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET status = $2, cleave_result = $3,
-			canonical_sha256 = $4, formula = $5, elements = $6, score = $7, max_crit = $8, suspicious_count = $9,
-			file_type = COALESCE(NULLIF($10, ''), file_type),
-			litmus_result = NULL, litmus_score = 0,
+			canonical_sha256 = $4, elements = $5,
+			max_crit = $6, suspicious_count = $7,
+			litmus_result = NULL,
 			analyzed_at = now(), updated_at = now()
 		WHERE sha256 = $1`,
 		sha256, status, sanitizeJSONB(result), canonical,
-		fi.Formula, fi.Elements, fi.Score, fi.MaxCrit,
-		fi.SuspiciousCount, fi.FileType)
+		fi.Elements, fi.MaxCrit, fi.SuspiciousCount)
 	if err != nil {
 		return fmt.Errorf("hopper: update sample: %w", err)
 	}
@@ -1057,52 +1131,45 @@ func (db *DB) recomputeCanonicalSHA256PG(ctx context.Context) (int64, error) {
 	return total, nil
 }
 
-// backfillPG re-derives parseCleaveFile / parseLitmusProb columns entirely
-// in SQL using JSON_TABLE (PG17+), avoiding the cost of streaming JSONB
-// blobs into Go.
+// backfillPG fixes legacy rows whose non-generated derivable columns
+// (elements, max_crit, suspicious_count) are stale, then clears misclassified
+// skip markers that no longer disagree with the new trait-based heuristic.
 //
-// Only rows whose file_type column is empty are touched. file_type is the
-// most recently added column populated by writes, so an empty value is a
-// reliable signal that the row pre-dates the unified backfill path and may
-// be missing other derivable columns too. Rows backfilled previously are
-// skipped cheaply by an index lookup, so this is safe to run repeatedly.
+// Note: file_type / score / formula / litmus_score are GENERATED from the
+// JSONB source, so their values can't drift and don't need a backfill pass.
+// Before the generated-column migration this function also recomputed those
+// columns; that work is now a schema invariant.
 func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 	var stats BackfillStats
 
-	// Candidate rows: have analysis output and file_type was never set.
-	// Used for the Scanned stat only — passes 1 and 2 are index-gated on
-	// file_type='' so they're effectively no-ops once the cohort is empty,
-	// and pass 3 (marker reset) runs unconditionally.
+	// Candidate rows: have cleave_result but elements wasn't derived yet.
+	// elements is the only analysis-derived non-generated column, so empty
+	// elements on a row with cleave_result is the reliable "needs backfill"
+	// signal now that file_type is computed.
 	if err := db.pool.QueryRow(ctx, `
 		SELECT count(*) FROM samples
-		WHERE file_type = ''
-			AND (cleave_result IS NOT NULL OR litmus_result IS NOT NULL)`).Scan(&stats.Scanned); err != nil {
+		WHERE cleave_result IS NOT NULL AND elements = ''`).Scan(&stats.Scanned); err != nil {
 		return stats, fmt.Errorf("hopper: backfill count: %w", err)
 	}
 
-	// Pass 1: formula / elements / score / file_type / max_crit from cleave_result.
-	// JSON_TABLE filters to the depth-0 entry; rows without one are skipped.
-	// elements = formula with Unicode subscripts ₀..₉ stripped.
-	// max_crit is the max trait level on the depth-0 entry, computed via a
-	// nested SELECT over the traits array. Batched to avoid one huge transaction.
+	// Pass 1: elements / max_crit / suspicious_count from cleave_result,
+	// in batches. formula / score / file_type / litmus_score are generated
+	// columns — don't touch them. JSON_TABLE filters to the depth-0 entry.
 	const backfillBatch = 5000
 	for {
 		cleaveTag, err := db.pool.Exec(ctx, `
 			WITH batch AS (
 				SELECT sha256 FROM samples
-				WHERE file_type = '' AND cleave_result IS NOT NULL
+				WHERE cleave_result IS NOT NULL AND elements = ''
 				LIMIT $1
 			)
 			UPDATE samples s SET
-				formula = COALESCE(j.f, ''),
 				elements = translate(COALESCE(j.f, ''), '₀₁₂₃₄₅₆₇₈₉', ''),
-				score = COALESCE(j.x, 0),
 				max_crit = COALESCE(j.mc, 0),
 				suspicious_count = COALESCE(j.sc, 0),
-				file_type = COALESCE(NULLIF(j.t, ''), s.file_type),
 				updated_at = now()
 			FROM (
-				SELECT s2.sha256, jt.f, jt.x, jt.t,
+				SELECT s2.sha256, jt.f,
 					(SELECT COALESCE(MAX((tr->>'l')::int), 0)
 					 FROM jsonb_array_elements(COALESCE(jt.ts, '[]'::jsonb)) AS tr) AS mc,
 					(SELECT COUNT(*)
@@ -1112,13 +1179,11 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 				JOIN batch b ON b.sha256 = s2.sha256,
 					JSON_TABLE(s2.cleave_result, '$.fs[*] ? (@.dp == 0)' COLUMNS (
 						f TEXT PATH '$.f',
-						x INTEGER PATH '$.x',
-						t TEXT PATH '$.type',
 						ts JSONB PATH '$.ts'
 					)) AS jt
 			) AS j
 			WHERE s.sha256 = j.sha256
-				AND s.file_type = ''`, backfillBatch)
+				AND s.elements = ''`, backfillBatch)
 		if err != nil {
 			return stats, fmt.Errorf("hopper: backfill cleave columns: %w", err)
 		}
@@ -1130,21 +1195,7 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 		slog.Info("backfill cleave batch", "batch", n, "total", stats.Updated)
 	}
 
-	// Pass 2: litmus_score from litmus_result.prob, scoped to the same
-	// "stale" set so we don't pay JSON parsing on already-backfilled rows.
-	litmusTag, err := db.pool.Exec(ctx, `
-		UPDATE samples SET
-			litmus_score = COALESCE((litmus_result->>'prob')::double precision, 0),
-			updated_at = now()
-		WHERE file_type = ''
-			AND litmus_result IS NOT NULL
-			AND litmus_score IS DISTINCT FROM COALESCE((litmus_result->>'prob')::double precision, 0)`)
-	if err != nil {
-		return stats, fmt.Errorf("hopper: backfill litmus_score: %w", err)
-	}
-	stats.Updated += litmusTag.RowsAffected()
-
-	// Pass 3: clear stale skip='misclassified' markers whose underlying
+	// Pass 2: clear stale skip='misclassified' markers whose underlying
 	// trait counts no longer disagree with the marker. The old score-based
 	// rule was noisy on large tarballs and parked many rows here that the
 	// new max_crit/suspicious_count rule would never have flagged.

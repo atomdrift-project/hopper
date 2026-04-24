@@ -91,6 +91,47 @@ func TestInsertAndLookup(t *testing.T) {
 	}
 }
 
+// TestInsertPreservesCanonicalAndParent guards against placeholder/arg-list
+// drift in the single-insert path. Both canonical_sha256 (defaults to the
+// row's own sha via a $1-reuse in the SQL) and parent (from s.Parent) must
+// land in the correct columns — a swap here previously went unnoticed
+// because mock shas have no A-F chars that'd trigger the hex CHECK.
+func TestInsertPreservesCanonicalAndParent(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	const (
+		sha    = "child1"
+		parent = "parent1"
+	)
+	// Parent must exist first — no FK check, but exercises a non-empty
+	// sha2 argument to the insert.
+	mustInsert(t, ctx, db, &Sample{SHA256: parent, Source: "test", Label: "bad", LabelSource: "test"})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      sha,
+		Source:      "test",
+		Label:       "bad",
+		LabelSource: "test",
+		Path:        "bad/archive!child",
+		Parent:      parent,
+	})
+
+	got, err := db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// canonical_sha256 defaults to sha256 for top-level rows; for a row
+	// with Parent set, the insert still copies sha into the column (the
+	// sample's own content is its canonical identity — the archive
+	// relationship is separate, in parent).
+	if got.CanonicalSHA256 != sha {
+		t.Errorf("CanonicalSHA256 = %q, want %q (must not be swapped with Parent)", got.CanonicalSHA256, sha)
+	}
+	if got.Parent != parent {
+		t.Errorf("Parent = %q, want %q (must not be swapped with canonical)", got.Parent, parent)
+	}
+}
+
 func TestInsertDuplicate(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -1778,11 +1819,12 @@ func TestPurgeUnsupported(t *testing.T) {
 	// Unanalyzed → stays (P3 will catch it when analysis runs).
 	mustInsert(t, ctx, db, &Sample{SHA256: "keep2", Source: "test", Label: "bad", LabelSource: "test"})
 
-	// Analyzed but unrecognized: simulate a historical row by writing the
-	// bad blob via raw SQL so we bypass P3's live short-circuit.
+	// Analyzed but unrecognized: simulate a historical row by writing a
+	// cleave_result with an empty fs[] (no fs[0], so GENERATED file_type
+	// evaluates to '').
 	mustInsert(t, ctx, db, &Sample{SHA256: "junk1", Source: "test", Label: "bad", LabelSource: "test"})
 	if _, err := db.lite.ExecContext(ctx,
-		`UPDATE samples SET cleave_result = ?, file_type = '' WHERE sha256 = ?`,
+		`UPDATE samples SET cleave_result = ? WHERE sha256 = ?`,
 		`{"fs":[]}`, "junk1"); err != nil {
 		t.Fatal(err)
 	}
