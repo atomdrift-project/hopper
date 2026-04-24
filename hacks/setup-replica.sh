@@ -134,6 +134,32 @@ elif command -v hopper >/dev/null 2>&1; then
 else
     die "hopper binary not found — run 'make build' first"
 fi
+
+# If a subscription is already running, its apply + tablesync workers hold
+# locks on the replicated tables. hopper init's DDL (CREATE INDEX, ALTER
+# TABLE, etc.) would block on those locks indefinitely. Disable the
+# subscription while we migrate; the subscription block below re-ENABLEs it.
+if admin -d "$LOCAL_DB" -tAc \
+        "SELECT 1 FROM pg_subscription WHERE subname = '$SUBSCRIPTION' AND subenabled" \
+        | grep -q 1; then
+    log "Disabling subscription '$SUBSCRIPTION' during schema migration"
+    admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -v sub="$SUBSCRIPTION" <<'SQL'
+ALTER SUBSCRIPTION :"sub" DISABLE;
+SQL
+    # DISABLE returns immediately; the workers exit asynchronously. Wait for
+    # them to actually stop so we're not still racing their locks.
+    i=0
+    while [ "$i" -lt 15 ]; do
+        busy=$(admin -d "$LOCAL_DB" -tAc \
+            "SELECT 1 FROM pg_stat_subscription WHERE subname = '$SUBSCRIPTION' AND pid IS NOT NULL LIMIT 1" \
+            | tr -d '[:space:]')
+        [ "$busy" != "1" ] && break
+        sleep 1
+        i=$((i + 1))
+    done
+    [ "$busy" = "1" ] && log "WARN: subscription workers still running after 15s; continuing anyway"
+fi
+
 log "Running '$HOPPER init' to ensure schema"
 "$HOPPER" init -db "postgres://$LOCAL_USER@localhost/$LOCAL_DB?sslmode=disable"
 
