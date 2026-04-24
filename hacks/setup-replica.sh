@@ -135,10 +135,17 @@ else
     die "hopper binary not found — run 'make build' first"
 fi
 
+# Refuse to stack on top of a hung hopper init — each new run would just
+# queue behind the first one's lock waits and make things worse.
+if command -v pgrep >/dev/null 2>&1 && pgrep -f 'hopper init' >/dev/null 2>&1; then
+    die "another 'hopper init' is already running (pid $(pgrep -f 'hopper init' | tr '\n' ' ')) — kill it first: pkill -9 -f 'hopper init'"
+fi
+
 # If a subscription is already running, its apply + tablesync workers hold
 # locks on the replicated tables. hopper init's DDL (CREATE INDEX, ALTER
-# TABLE, etc.) would block on those locks indefinitely. Disable the
-# subscription while we migrate; the subscription block below re-ENABLEs it.
+# TABLE, etc.) would block indefinitely. Disable the subscription, wait for
+# its workers to exit, and forcibly terminate them if they don't. The
+# subscription block below re-ENABLEs it after the migration finishes.
 if admin -d "$LOCAL_DB" -tAc \
         "SELECT 1 FROM pg_subscription WHERE subname = '$SUBSCRIPTION' AND subenabled" \
         | grep -q 1; then
@@ -146,22 +153,37 @@ if admin -d "$LOCAL_DB" -tAc \
     admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -v sub="$SUBSCRIPTION" <<'SQL'
 ALTER SUBSCRIPTION :"sub" DISABLE;
 SQL
-    # DISABLE returns immediately; the workers exit asynchronously. Wait for
-    # them to actually stop so we're not still racing their locks.
+
+    # Poll up to 10s for graceful shutdown.
+    busy=1
     i=0
-    while [ "$i" -lt 15 ]; do
+    while [ "$i" -lt 10 ]; do
         busy=$(admin -d "$LOCAL_DB" -tAc \
-            "SELECT 1 FROM pg_stat_subscription WHERE subname = '$SUBSCRIPTION' AND pid IS NOT NULL LIMIT 1" \
+            "SELECT count(*) FROM pg_stat_subscription WHERE subname = '$SUBSCRIPTION' AND pid IS NOT NULL" \
             | tr -d '[:space:]')
-        [ "$busy" != "1" ] && break
+        [ "$busy" = "0" ] && break
         sleep 1
         i=$((i + 1))
     done
-    [ "$busy" = "1" ] && log "WARN: subscription workers still running after 15s; continuing anyway"
+
+    if [ "$busy" != "0" ]; then
+        log "Graceful shutdown timed out — terminating $busy worker(s)"
+        admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -v sub="$SUBSCRIPTION" <<'SQL'
+SELECT pg_terminate_backend(pid)
+  FROM pg_stat_subscription
+ WHERE subname = :'sub' AND pid IS NOT NULL;
+SQL
+        # Give them a second to clear from pg_stat_activity.
+        sleep 2
+    fi
 fi
 
-log "Running '$HOPPER init' to ensure schema"
-"$HOPPER" init -db "postgres://$LOCAL_USER@localhost/$LOCAL_DB?sslmode=disable"
+# Lock timeout keeps hopper init from hanging forever if something else is
+# still holding a table lock. 30s is much longer than any honest DDL should
+# take, but short enough to surface the problem instead of wedging the script.
+log "Running '$HOPPER init' to ensure schema (lock_timeout=30s)"
+PGOPTIONS='-c lock_timeout=30s' \
+    "$HOPPER" init -db "postgres://$LOCAL_USER@localhost/$LOCAL_DB?sslmode=disable"
 
 # --- Subscription ----------------------------------------------------------
 # We keep the password out of argv by passing it through psql's -v mechanism
