@@ -1,4 +1,8 @@
-# hopper <img src="media/logo-small.png" align="right" alt="hopper logo">
+<p align="center">
+  <img src="media/logo.svg" alt="hopper" width="240">
+</p>
+
+# hopper
 
 Job broker and sample store for the [atomdrift](https://codeberg.org/atomdrift) malware analysis pipeline. Hopper catalogs samples, distributes analysis work to [litmus](https://codeberg.org/atomdrift/litmus) workers, and publishes labeled results to [collimator](https://codeberg.org/atomdrift/collimator) for ML training.
 
