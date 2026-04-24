@@ -375,21 +375,23 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 			continue
 		}
 
-		// Cleave emits entry.Path in a layered format using "!!" as the
-		// archive-boundary delimiter — absolute or relative archive path
-		// followed by "!!" followed by the in-archive path, e.g.:
-		//   "/abs/foo.tgz!!pkg/index.js"              (one level deep)
-		//   "outer!!inner.tgz!pkg/index.js"            (two levels; last "!!" wins)
-		// Strip everything through the final "!!" to get just the member
-		// portion, then prefix our own parent.Path with a single "!" so
-		// the stored path is "<parent-relative-path>!<member>".
+		// Cleave emits entry.Path with "!!" as the archive-boundary
+		// delimiter. We adopt the same delimiter end-to-end so stored
+		// paths preserve cleave's format; the only transformation is
+		// replacing cleave's absolute archive prefix with our own
+		// relativized parent.Path. Shape:
+		//   cleave dp=1  "/abs/foo.tgz!!pkg/index.js"
+		//   stored       "bad/foo.tgz!!pkg/index.js"
+		// For dp>=2 cleave's prefix is already relative and may contain
+		// extra "!"/"!!" layers; we still substitute parent.Path on the
+		// left so the outer archive is identified unambiguously.
 		inArchive := entry.Path
 		if idx := strings.LastIndex(inArchive, "!!"); idx >= 0 {
 			inArchive = inArchive[idx+2:]
 		}
 		memberPath := inArchive
 		if parent.Path != "" {
-			memberPath = parent.Path + "!" + inArchive
+			memberPath = parent.Path + "!!" + inArchive
 		}
 
 		members = append(members, &Sample{

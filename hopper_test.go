@@ -112,7 +112,7 @@ func TestInsertPreservesCanonicalAndParent(t *testing.T) {
 		Source:      "test",
 		Label:       "bad",
 		LabelSource: "test",
-		Path:        "bad/archive!child",
+		Path:        "bad/archive!!child",
 		Parent:      parent,
 	})
 
@@ -1146,7 +1146,7 @@ func TestExplodeArchiveMembers(t *testing.T) {
 	if txt.Parent != parent.SHA256 {
 		t.Errorf("txt Parent = %q, want %q", txt.Parent, parent.SHA256)
 	}
-	if want := "bad/archive.zip!pkg/readme.txt"; txt.Path != want {
+	if want := "bad/archive.zip!!pkg/readme.txt"; txt.Path != want {
 		t.Errorf("txt Path = %q, want %q", txt.Path, want)
 	}
 
@@ -1158,7 +1158,7 @@ func TestExplodeArchiveMembers(t *testing.T) {
 	if py.Skip != "" {
 		t.Errorf("py Skip = %q, want empty", py.Skip)
 	}
-	if want := "bad/archive.zip!pkg/setup.py"; py.Path != want {
+	if want := "bad/archive.zip!!pkg/setup.py"; py.Path != want {
 		t.Errorf("py Path = %q, want %q", py.Path, want)
 	}
 
@@ -1224,7 +1224,7 @@ func TestExplodeArchiveMembersCleaveFormat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := "bad/archive.tgz!package/setup.py"; m.Path != want {
+	if want := "bad/archive.tgz!!package/setup.py"; m.Path != want {
 		t.Errorf("dp=1 member path = %q, want %q", m.Path, want)
 	}
 	if m.Filename != "package/setup.py" {
@@ -1232,13 +1232,105 @@ func TestExplodeArchiveMembersCleaveFormat(t *testing.T) {
 	}
 
 	// dp=2 nested member: after last "!!", the in-archive portion is
-	// "inner.tgz!deep/note.txt". Joined with parent: "bad/archive.tgz!inner.tgz!deep/note.txt".
+	// "inner.tgz!deep/note.txt". Joined with parent: "bad/archive.tgz!!inner.tgz!deep/note.txt".
 	n, err := db.SampleBySHA256(ctx, nSha)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := "bad/archive.tgz!inner.tgz!deep/note.txt"; n.Path != want {
+	if want := "bad/archive.tgz!!inner.tgz!deep/note.txt"; n.Path != want {
 		t.Errorf("dp=2 member path = %q, want %q", n.Path, want)
+	}
+}
+
+// TestExplodeDoesNotClobberWalkerPath is the regression guard for the
+// content-collision orphan class: when a sha has been inserted by the
+// walker (top-level, parent='') and the same sha then appears inside an
+// archive via ExplodeArchiveMembers, the archive-member upsert must NOT
+// overwrite samples.path with the virtual "<archive>!<member>" form —
+// that would leave the samples row pointing at a non-existent disk path,
+// marked tier-1 claimable, and workers would all report "missing on disk".
+// Observed in prod on shared code (vendored deps, copies of the same
+// library across versions). The sample_locations table still records the
+// archive observation separately; only the denormalized samples row is
+// protected from Explode clobber.
+func TestExplodeDoesNotClobberWalkerPath(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	const sharedSHA = "7777777777777777777777777777777777777777777777777777777777777777"
+
+	// Step 1: walker sees the file as a top-level sample.
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      sharedSHA,
+		Source:      "test",
+		Label:       "good",
+		LabelSource: "test",
+		Path:        "good/vendor/shared/lib.js",
+	})
+
+	// Step 2: an archive with the same content inside is analyzed and
+	// ExplodeArchiveMembers inserts a member with parent=<archive-sha>.
+	cleaveJSON := []byte(`{"fs":[
+		{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"zip","path":"bad/pkg.zip","dp":0},
+		{"sha":"` + sharedSHA + `","type":"js","path":"pkg/lib.js","dp":1,"sz":500,"ts":[{"l":5,"c":0.9}]}
+	]}`)
+	parent := &Sample{
+		SHA256:       "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Source:       "test",
+		Label:        "bad",
+		LabelSource:  "test",
+		Path:         "bad/pkg.zip",
+		CleaveResult: cleaveJSON,
+	}
+	mustInsert(t, ctx, db, parent)
+	if _, err := db.ExplodeArchiveMembers(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+
+	// The samples row for sharedSHA must still point at the walker's
+	// top-level path, with parent=''. If Explode's upsert had
+	// clobbered it, samples.path would be "bad/pkg.zip!!pkg/lib.js" and
+	// samples.parent would still be '' — the orphan state.
+	got, err := db.SampleBySHA256(ctx, sharedSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Path != "good/vendor/shared/lib.js" {
+		t.Errorf("Path = %q, want walker path %q (Explode clobbered?)",
+			got.Path, "good/vendor/shared/lib.js")
+	}
+	if got.Parent != "" {
+		t.Errorf("Parent = %q, want '' (top-level observation wins)", got.Parent)
+	}
+
+	// sample_locations should hold BOTH observations — walker's and
+	// Explode's — since they're different (sha, path) pairs.
+	locs, err := db.LocationsForSHA(ctx, sharedSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locs) != 2 {
+		t.Fatalf("locations = %d, want 2 (walker + archive)", len(locs))
+	}
+	var sawWalker, sawArchive bool
+	for _, l := range locs {
+		switch l.Path {
+		case "good/vendor/shared/lib.js":
+			sawWalker = true
+			if l.ParentSHA256 != "" {
+				t.Errorf("walker location has parent_sha256 = %q, want empty", l.ParentSHA256)
+			}
+		case "bad/pkg.zip!!pkg/lib.js":
+			sawArchive = true
+			if l.ParentSHA256 != parent.SHA256 {
+				t.Errorf("archive location parent_sha256 = %q, want %q", l.ParentSHA256, parent.SHA256)
+			}
+		default:
+			t.Errorf("unexpected location: %s", l.Path)
+		}
+	}
+	if !sawWalker || !sawArchive {
+		t.Errorf("want both walker and archive locations; walker=%v archive=%v", sawWalker, sawArchive)
 	}
 }
 
@@ -1441,7 +1533,7 @@ func TestLocationsDualWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(memberLocs) != 1 || memberLocs[0].Path != "bad/archive.zip!pkg/x.py" || memberLocs[0].ParentSHA256 != parentSHA {
+	if len(memberLocs) != 1 || memberLocs[0].Path != "bad/archive.zip!!pkg/x.py" || memberLocs[0].ParentSHA256 != parentSHA {
 		t.Errorf("member location = %+v, want virtual path + parent_sha256", memberLocs)
 	}
 }

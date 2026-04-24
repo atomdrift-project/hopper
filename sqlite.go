@@ -419,8 +419,13 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 		ON CONFLICT (sha256) DO UPDATE SET
 			path  = CASE WHEN excluded.path  != ''   THEN excluded.path  ELSE samples.path  END,
 			mtime = CASE WHEN excluded.mtime IS NOT NULL THEN excluded.mtime ELSE samples.mtime END
-			WHERE (excluded.path  != ''   AND samples.path  != excluded.path)
-			   OR (excluded.mtime IS NOT NULL AND samples.mtime IS NOT excluded.mtime)`,
+			-- Only walker writes (parent='') may update samples.path / mtime.
+			-- Explode writes (parent=<archive-sha>) must not clobber a top-
+			-- level row's path: content-collision between a top-level file
+			-- and an archive member would otherwise orphan the samples row.
+			WHERE excluded.parent = ''
+			  AND ((excluded.path  != ''   AND samples.path  != excluded.path)
+			    OR (excluded.mtime IS NOT NULL AND samples.mtime IS NOT excluded.mtime))`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.SHA256, s.Parent, s.Skip, s.Elements,
@@ -481,8 +486,11 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		ON CONFLICT (sha256) DO UPDATE SET
 			path  = CASE WHEN excluded.path  != ''   THEN excluded.path  ELSE samples.path  END,
 			mtime = CASE WHEN excluded.mtime IS NOT NULL THEN excluded.mtime ELSE samples.mtime END
-			WHERE (excluded.path  != ''   AND samples.path  != excluded.path)
-			   OR (excluded.mtime IS NOT NULL AND samples.mtime IS NOT excluded.mtime)`,
+			-- Explode writes (parent<>'') must not clobber a top-level
+			-- row's path on content-hash collision. See the PG version.
+			WHERE excluded.parent = ''
+			  AND ((excluded.path  != ''   AND samples.path  != excluded.path)
+			    OR (excluded.mtime IS NOT NULL AND samples.mtime IS NOT excluded.mtime))`,
 		strings.Join(cols, ", "),
 		strings.Join(placeholders, ", "))
 

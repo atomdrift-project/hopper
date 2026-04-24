@@ -364,8 +364,9 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 		ON CONFLICT (sha256) DO UPDATE SET
 			path  = CASE WHEN EXCLUDED.path  <> ''   THEN EXCLUDED.path  ELSE samples.path  END,
 			mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END
-		WHERE (EXCLUDED.path  <> ''   AND samples.path  IS DISTINCT FROM EXCLUDED.path)
-		   OR (EXCLUDED.mtime IS NOT NULL AND samples.mtime IS DISTINCT FROM EXCLUDED.mtime)`,
+		WHERE EXCLUDED.parent = ''
+		  AND ((EXCLUDED.path  <> ''   AND samples.path  IS DISTINCT FROM EXCLUDED.path)
+		    OR (EXCLUDED.mtime IS NOT NULL AND samples.mtime IS DISTINCT FROM EXCLUDED.mtime))`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.Parent, s.Skip, s.Elements,
@@ -438,8 +439,14 @@ FROM _staging
 ON CONFLICT (sha256) DO UPDATE SET
 	path  = CASE WHEN EXCLUDED.path  <> ''   THEN EXCLUDED.path  ELSE samples.path  END,
 	mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END
-WHERE (EXCLUDED.path  <> ''   AND samples.path  IS DISTINCT FROM EXCLUDED.path)
-   OR (EXCLUDED.mtime IS NOT NULL AND samples.mtime IS DISTINCT FROM EXCLUDED.mtime)`
+-- Only walker writes (parent='') are allowed to refresh samples.path /
+-- samples.mtime on conflict. Explode writes (parent=<archive-sha>) must
+-- never clobber the top-level row: a content hash collision between a
+-- top-level file and an archive member would otherwise leave samples
+-- pointing at a virtual archive-member path that doesn't exist on disk.
+WHERE EXCLUDED.parent = ''
+  AND ((EXCLUDED.path  <> ''   AND samples.path  IS DISTINCT FROM EXCLUDED.path)
+    OR (EXCLUDED.mtime IS NOT NULL AND samples.mtime IS DISTINCT FROM EXCLUDED.mtime))`
 
 func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inserted int64, needsAnalysis []string, err error) {
 	rows := make([][]any, len(samples))
