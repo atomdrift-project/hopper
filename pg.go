@@ -108,25 +108,38 @@ func (db *DB) migratePG(ctx context.Context) error {
 		// sha256 treats case as significant, so "abc…"/"ABC…" would be stored
 		// as distinct rows. Pin them to canonical lowercase-hex via CHECK so
 		// any writer bypassing the Go validators still can't drift.
+		//
+		// Two-step add: NOT VALID first (catalog-only, AccessExclusiveLock
+		// for milliseconds), then VALIDATE CONSTRAINT (ShareUpdateExclusive
+		// lock, doesn't block writes, scans in the background). On a
+		// multi-million-row table the one-shot form would lock the table
+		// for minutes; this form is near-invisible.
 		`DO $$
 		BEGIN
 			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'samples_sha256_hex') THEN
 				ALTER TABLE samples ADD CONSTRAINT samples_sha256_hex
-					CHECK (sha256 ~ '^[0-9a-f]{64}$');
+					CHECK (sha256 ~ '^[0-9a-f]{64}$') NOT VALID;
 			END IF;
 			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'samples_parent_hex') THEN
 				ALTER TABLE samples ADD CONSTRAINT samples_parent_hex
-					CHECK (parent = '' OR parent ~ '^[0-9a-f]{64}$');
+					CHECK (parent = '' OR parent ~ '^[0-9a-f]{64}$') NOT VALID;
 			END IF;
 			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'samples_canonical_sha256_hex') THEN
 				ALTER TABLE samples ADD CONSTRAINT samples_canonical_sha256_hex
-					CHECK (canonical_sha256 = '' OR canonical_sha256 ~ '^[0-9a-f]{64}$');
+					CHECK (canonical_sha256 = '' OR canonical_sha256 ~ '^[0-9a-f]{64}$') NOT VALID;
 			END IF;
 			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'reports_sha256_hex') THEN
 				ALTER TABLE reports ADD CONSTRAINT reports_sha256_hex
-					CHECK (sha256 ~ '^[0-9a-f]{64}$');
+					CHECK (sha256 ~ '^[0-9a-f]{64}$') NOT VALID;
 			END IF;
 		END$$`,
+		// Validation pass: cheap lock, background scan. Idempotent —
+		// VALIDATE CONSTRAINT on an already-valid constraint is a no-op that
+		// only reads pg_constraint. Safe to re-run on every startup.
+		`ALTER TABLE samples VALIDATE CONSTRAINT samples_sha256_hex`,
+		`ALTER TABLE samples VALIDATE CONSTRAINT samples_parent_hex`,
+		`ALTER TABLE samples VALIDATE CONSTRAINT samples_canonical_sha256_hex`,
+		`ALTER TABLE reports VALIDATE CONSTRAINT reports_sha256_hex`,
 
 		// sample_locations: one row per (sha256, path) observation. A sample
 		// can have many locations — the same jquery.min.js shows up in
