@@ -188,16 +188,20 @@ sleep 2
 
 log "Replication status:"
 
-# Worker-level state (pid NULL means the worker hasn't registered yet).
+# Main apply worker status. pg_stat_subscription has one row per worker —
+# the apply worker (relid IS NULL) plus one tablesync worker per table during
+# initial copy — so we filter to just the apply worker here. pid NULL means
+# it hasn't registered yet.
 admin -d "$LOCAL_DB" -v sub="$SUBSCRIPTION" -tA <<'SQL' | sed 's/^/    /'
-SELECT 'worker: ' ||
+SELECT 'apply worker: ' ||
     CASE WHEN pid IS NULL THEN 'not connected yet (check logs if this persists)'
          ELSE format('pid=%s received_lsn=%s latest_end_lsn=%s',
                      pid,
                      COALESCE(received_lsn::text,   '0/0'),
                      COALESCE(latest_end_lsn::text, '0/0'))
     END
-  FROM pg_stat_subscription WHERE subname = :'sub';
+  FROM pg_stat_subscription
+  WHERE subname = :'sub' AND relid IS NULL;
 SQL
 
 # Per-table: sync state + exact row count. quote_ident() makes the identifier
@@ -210,7 +214,7 @@ SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname) || '|' ||
            WHEN 'f' THEN 'finished table copy'
            WHEN 's' THEN 'synchronized'
            WHEN 'r' THEN 'ready (streaming)'
-           ELSE 'state=' || r.srsubstate
+           ELSE 'state=' || r.srsubstate::text
        END
   FROM pg_subscription_rel r
   JOIN pg_subscription s ON s.oid = r.srsubid
