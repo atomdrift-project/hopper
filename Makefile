@@ -26,7 +26,7 @@ rollout-bastille:
 		./hacks/rollout-bastille.sh "$(BUILD)" "$(RUN)"; \
 	fi
 
-replica:
+replica: build
 	@./hacks/setup-replica.sh
 
 clean:

@@ -155,6 +155,21 @@ ALTER SUBSCRIPTION :"sub" ENABLE;
 ALTER SUBSCRIPTION :"sub" REFRESH PUBLICATION;
 SQL
 else
+    # A prior run (or the retired sync-db target) may have left a replication
+    # slot on the remote without a matching local subscription. CREATE
+    # SUBSCRIPTION would fail to recreate it, so drop the orphan first.
+    # libpq reads the password from ~/.pgpass for this connection.
+    stale=$(psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" -tAc \
+        "SELECT 1 FROM pg_replication_slots WHERE slot_name = '$SUBSCRIPTION'" \
+        2>/dev/null | tr -d '[:space:]')
+    if [ "$stale" = "1" ]; then
+        log "Dropping orphan replication slot '$SUBSCRIPTION' on $REMOTE_HOST"
+        psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" \
+            -v ON_ERROR_STOP=1 -v slot="$SUBSCRIPTION" <<'SQL'
+SELECT pg_drop_replication_slot(:'slot');
+SQL
+    fi
+
     log "Creating subscription '$SUBSCRIPTION' → $REMOTE_HOST / $PUBLICATION"
     admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
         -v sub="$SUBSCRIPTION" \
@@ -167,8 +182,50 @@ CREATE SUBSCRIPTION :"sub"
 SQL
 fi
 
-log "Replica configured."
-log "Monitor initial copy:"
-log "  psql -h localhost -U $LOCAL_USER -d $LOCAL_DB -c 'SELECT subname, received_lsn, latest_end_lsn FROM pg_stat_subscription'"
-log "Per-table state:"
-log "  psql -h localhost -U $LOCAL_USER -d $LOCAL_DB -c 'SELECT s.subname, c.relname, r.srsubstate FROM pg_subscription_rel r JOIN pg_subscription s ON s.oid=r.srsubid JOIN pg_class c ON c.oid=r.srrelid'"
+# --- Sanity: confirm data is actually flowing ------------------------------
+# The apply worker is asynchronous, so give it a beat before reading status.
+sleep 2
+
+log "Replication status:"
+
+# Worker-level state (pid NULL means the worker hasn't registered yet).
+admin -d "$LOCAL_DB" -v sub="$SUBSCRIPTION" -tA <<'SQL' | sed 's/^/    /'
+SELECT 'worker: ' ||
+    CASE WHEN pid IS NULL THEN 'not connected yet (check logs if this persists)'
+         ELSE format('pid=%s received_lsn=%s latest_end_lsn=%s',
+                     pid,
+                     COALESCE(received_lsn::text,   '0/0'),
+                     COALESCE(latest_end_lsn::text, '0/0'))
+    END
+  FROM pg_stat_subscription WHERE subname = :'sub';
+SQL
+
+# Per-table: sync state + exact row count. quote_ident() makes the identifier
+# shell/SQL-safe for the follow-up count query.
+tables=$(admin -d "$LOCAL_DB" -v sub="$SUBSCRIPTION" -tA <<'SQL'
+SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname) || '|' ||
+       CASE r.srsubstate
+           WHEN 'i' THEN 'initializing'
+           WHEN 'd' THEN 'copying data'
+           WHEN 'f' THEN 'finished table copy'
+           WHEN 's' THEN 'synchronized'
+           WHEN 'r' THEN 'ready (streaming)'
+           ELSE 'state=' || r.srsubstate
+       END
+  FROM pg_subscription_rel r
+  JOIN pg_subscription s ON s.oid = r.srsubid
+  JOIN pg_class c ON c.oid = r.srrelid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE s.subname = :'sub'
+  ORDER BY c.relname;
+SQL
+)
+
+printf '%s\n' "$tables" | while IFS='|' read -r qualified state; do
+    [ -n "$qualified" ] || continue
+    rows=$(admin -d "$LOCAL_DB" -tAc "SELECT count(*) FROM $qualified" 2>/dev/null | tr -d '[:space:]')
+    printf '    table %s: %s (%s rows)\n' "$qualified" "$state" "${rows:-?}"
+done
+
+log "Done. Re-run anytime — this script is idempotent."
+log "Live monitor: watch -n2 \"psql -h localhost -U $LOCAL_USER -d $LOCAL_DB -c 'SELECT * FROM pg_stat_subscription'\""
