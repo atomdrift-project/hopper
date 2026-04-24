@@ -513,6 +513,7 @@ func cmdImport(ctx context.Context) error {
 func cmdReset(ctx context.Context) error {
 	f := flag.NewFlagSet("reset", flag.ExitOnError)
 	dsn := f.String("db", "", "database (postgres:// DSN or sqlite file path)")
+	keepCache := f.Bool("keep-cache", false, "keep the local hash cache (default: deleted so next load re-hashes every file)")
 	parseFlags(f, os.Args[2:])
 
 	db, err := openDB(ctx, *dsn)
@@ -521,10 +522,30 @@ func cmdReset(ctx context.Context) error {
 	}
 	defer db.Close()
 
-	slog.Info("deleting all samples and reports")
+	slog.Info("deleting all samples, sample_locations, and reports")
 	if err := db.DeleteAll(ctx); err != nil {
 		return err
 	}
+
+	// The hash cache maps (dev,inode,size,mtime) → (sha256, inserted).
+	// After a DB reset, every entry still says "inserted=true", so the
+	// walker would skip inserting any file it's hashed before. Drop the
+	// cache so the next load genuinely starts from zero.
+	if !*keepCache {
+		if home, err := os.UserHomeDir(); err == nil {
+			cachePath := filepath.Join(home, ".hopper", "hashcache.db")
+			if err := os.Remove(cachePath); err == nil {
+				slog.Info("cleared hash cache", "path", cachePath)
+			} else if !errors.Is(err, os.ErrNotExist) {
+				slog.Warn("could not remove hash cache", "path", cachePath, "error", err)
+			}
+			// Also clean the WAL/SHM companions the sqlite3 driver leaves.
+			for _, ext := range []string{"-wal", "-shm"} {
+				_ = os.Remove(cachePath + ext) //nolint:errcheck // best-effort cleanup
+			}
+		}
+	}
+
 	slog.Info("reset complete")
 	return nil
 }

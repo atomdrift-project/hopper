@@ -1373,13 +1373,19 @@ func (db *DB) purgeUnsupportedSQLite(ctx context.Context, dryRun bool) (int64, e
 }
 
 func (db *DB) deleteAllSQLite(ctx context.Context) error {
-	_, err := db.lite.ExecContext(ctx, `DELETE FROM reports`)
-	if err != nil {
-		return fmt.Errorf("hopper: delete reports: %w", err)
-	}
-	_, err = db.lite.ExecContext(ctx, `DELETE FROM samples`)
-	if err != nil {
-		return fmt.Errorf("hopper: delete samples: %w", err)
+	// Delete FK-dependent tables first; SQLite's ON DELETE CASCADE only
+	// fires with PRAGMA foreign_keys = ON, which we don't set globally,
+	// so we can't rely on it here.
+	for _, q := range []string{
+		`DELETE FROM sample_locations`,
+		`DELETE FROM reports`,
+		`DELETE FROM samples`,
+		// Reset AUTOINCREMENT counters so next insert starts at 1.
+		`DELETE FROM sqlite_sequence WHERE name IN ('samples','reports','sample_locations')`,
+	} {
+		if _, err := db.lite.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("hopper: delete all (%s): %w", q, err)
+		}
 	}
 	return nil
 }

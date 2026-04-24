@@ -1228,7 +1228,11 @@ func (db *DB) purgeUnsupportedPG(ctx context.Context, dryRun bool) (int64, error
 }
 
 func (db *DB) deleteAllPG(ctx context.Context) error {
-	_, err := db.pool.Exec(ctx, `TRUNCATE reports, samples`)
+	// CASCADE covers the FK from sample_locations / reports to samples;
+	// RESTART IDENTITY resets the id sequences so a post-reset ingest
+	// starts at 1 instead of continuing from pre-reset max.
+	_, err := db.pool.Exec(ctx,
+		`TRUNCATE samples, sample_locations, reports RESTART IDENTITY CASCADE`)
 	if err != nil {
 		return fmt.Errorf("hopper: delete all: %w", err)
 	}
