@@ -304,6 +304,60 @@ func xdgLogDir() string {
 	return ".hopper" // Fallback
 }
 
+// xdgCacheDir returns the OS-appropriate per-user cache directory for
+// hopper. Regenerable state only (hash cache) — anything we can't rebuild
+// from the DB belongs in state (xdgLogDir), not here.
+func xdgCacheDir() string {
+	switch runtime.GOOS {
+	case "darwin":
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, "Library", "Caches", "hopper")
+		}
+	case "windows":
+		if appdata := os.Getenv("LOCALAPPDATA"); appdata != "" {
+			return filepath.Join(appdata, "hopper", "Cache")
+		}
+	default:
+	}
+	if c := os.Getenv("XDG_CACHE_HOME"); c != "" {
+		return filepath.Join(c, "hopper")
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".cache", "hopper")
+	}
+	return ".hopper" // Fallback
+}
+
+// hashCachePath returns the current-convention location of the hash cache
+// and, as a side effect, migrates an old ~/.hopper/hashcache.db into it
+// the first time we run on a system that had the legacy layout. Keeping
+// the migration here (rather than a separate tool) means users upgrading
+// the binary transparently carry their hash cache forward.
+func hashCachePath() string {
+	dir := xdgCacheDir()
+	_ = os.MkdirAll(dir, 0o750) //nolint:errcheck // mkdirAllBestEffort idiom
+	newPath := filepath.Join(dir, "hashcache.db")
+
+	if _, err := os.Stat(newPath); err == nil {
+		return newPath
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		legacy := filepath.Join(home, ".hopper", "hashcache.db")
+		if _, err := os.Stat(legacy); err == nil {
+			// Move the cache + its WAL/SHM companions. Best effort: a
+			// rename failure (cross-device, permissions) just leaves the
+			// legacy file in place and we start fresh in the new spot.
+			if err := os.Rename(legacy, newPath); err == nil {
+				slog.Info("migrated hash cache", "from", legacy, "to", newPath)
+				for _, ext := range []string{"-wal", "-shm"} {
+					_ = os.Rename(legacy+ext, newPath+ext) //nolint:errcheck // best-effort cleanup
+				}
+			}
+		}
+	}
+	return newPath
+}
+
 func setupLogging() (logPath string, cleanup func(), err error) {
 	dir := xdgLogDir()
 	if err := os.MkdirAll(dir, 0o750); err != nil {
@@ -530,18 +584,22 @@ func cmdReset(ctx context.Context) error {
 	// The hash cache maps (dev,inode,size,mtime) → (sha256, inserted).
 	// After a DB reset, every entry still says "inserted=true", so the
 	// walker would skip inserting any file it's hashed before. Drop the
-	// cache so the next load genuinely starts from zero.
+	// cache — both the current XDG-compliant location and the legacy
+	// ~/.hopper/hashcache.db (in case the migration hasn't happened yet
+	// on this machine).
 	if !*keepCache {
+		paths := []string{filepath.Join(xdgCacheDir(), "hashcache.db")}
 		if home, err := os.UserHomeDir(); err == nil {
-			cachePath := filepath.Join(home, ".hopper", "hashcache.db")
-			if err := os.Remove(cachePath); err == nil {
-				slog.Info("cleared hash cache", "path", cachePath)
+			paths = append(paths, filepath.Join(home, ".hopper", "hashcache.db"))
+		}
+		for _, p := range paths {
+			if err := os.Remove(p); err == nil {
+				slog.Info("cleared hash cache", "path", p)
 			} else if !errors.Is(err, os.ErrNotExist) {
-				slog.Warn("could not remove hash cache", "path", cachePath, "error", err)
+				slog.Warn("could not remove hash cache", "path", p, "error", err)
 			}
-			// Also clean the WAL/SHM companions the sqlite3 driver leaves.
 			for _, ext := range []string{"-wal", "-shm"} {
-				_ = os.Remove(cachePath + ext) //nolint:errcheck // best-effort cleanup
+				_ = os.Remove(p + ext) //nolint:errcheck // best-effort cleanup
 			}
 		}
 	}
@@ -725,13 +783,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx //
 			cacheCh <- cacheResult{}
 			return
 		}
-		home, err := os.UserHomeDir()
-		if err != nil {
-			home = "."
-		}
-		cacheDir := filepath.Join(home, ".hopper")
-		mkdirAllBestEffort(cacheDir, 0o755)
-		c, err := openHashCache(ctx, filepath.Join(cacheDir, "hashcache.db"))
+		c, err := openHashCache(ctx, hashCachePath())
 		cacheCh <- cacheResult{cache: c, err: err}
 	}()
 
@@ -1454,10 +1506,21 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 	}
 }
 
-// logWorkerStatus emits one slog line per worker for the non-TTY path.
+// Worker presence windows — shared by the CLI status line, the web
+// dashboard, and the non-TTY log. Check-in cadence is tens of seconds,
+// so anything under workerActiveWindow is treated as "recently present"
+// even with zero active claims. The lower bound used to be 10min; the
+// non-TTY log once used 30s, which made workers flicker offline
+// between polls. Keep all three presentations in lockstep.
+const (
+	workerActiveWindow   = 20 * time.Minute
+	workerInactiveWindow = 60 * time.Minute
+)
+
 // workerStatus returns a display status and ANSI dot color for a worker.
-// Active claims > 0 means the worker is online (actively processing).
-// Otherwise, fall back to time-based: inactive after 10min, down after 30min.
+// Active claims > 0 means the worker is busy (green). Otherwise, fall
+// back to time-based: active within workerActiveWindow, inactive up to
+// workerInactiveWindow, down beyond that.
 func workerStatus(activeClaims int, idle time.Duration) (status string, dot string) {
 	green := "\033[32m●\033[0m"
 	yellow := "\033[33m●\033[0m"
@@ -1467,9 +1530,9 @@ func workerStatus(activeClaims int, idle time.Duration) (status string, dot stri
 		return "", green
 	}
 	switch {
-	case idle < 10*time.Minute:
+	case idle < workerActiveWindow:
 		return "", green // recently active, just idle
-	case idle < 30*time.Minute:
+	case idle < workerInactiveWindow:
 		return fmt.Sprintf("inactive %s", shortDuration(idle)), yellow
 	default:
 		return fmt.Sprintf("down %s", shortDuration(idle)), red
@@ -1478,7 +1541,7 @@ func workerStatus(activeClaims int, idle time.Duration) (status string, dot stri
 
 func logWorkerStatus(workers []namedWorkerStats, nodeRates map[string]float64, oldestClaims map[string]hopper.WorkerClaim) {
 	for i := range workers {
-		online := time.Since(workers[i].LastSeen) < 30*time.Second
+		online := time.Since(workers[i].LastSeen) < workerActiveWindow
 		status := "online"
 		if !online {
 			status = "offline"

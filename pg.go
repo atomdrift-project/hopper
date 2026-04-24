@@ -278,13 +278,19 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 		return false, fmt.Errorf("hopper: begin insert: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+	// cleave_result and litmus_result are populated at INSERT time when the
+	// caller already has them (archive-member explosion derives both from
+	// the parent's analysis). ON CONFLICT leaves existing analysis alone so
+	// a walker-comes-after-Explode case doesn't wipe real results.
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
 			size_bytes, label, label_source, path, status,
 			canonical_sha256, parent, skip, formula, elements,
-			score, max_crit, suspicious_count, mtime, marker_mtime)
+			score, max_crit, suspicious_count, mtime, marker_mtime,
+			cleave_result, litmus_result)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-			$11, $1, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+			$11, $1, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+			$21, $22)
 		ON CONFLICT (sha256) DO UPDATE SET
 			path  = CASE WHEN EXCLUDED.path  <> ''   THEN EXCLUDED.path  ELSE samples.path  END,
 			mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END
@@ -293,7 +299,8 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.Parent, s.Skip, s.Formula, s.Elements, s.Score,
-		s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime)
+		s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
+		sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult))
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
@@ -326,7 +333,8 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 var insertBatchStagingCols = []string{
 	"sha256", "source", "feed", "ecosystem", "filename", "file_type",
 	"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
-	"parent", "skip", "formula", "elements", "score", "max_crit", "suspicious_count", "mtime", "marker_mtime",
+	"parent", "skip", "formula", "elements", "score", "max_crit", "suspicious_count",
+	"mtime", "marker_mtime", "cleave_result", "litmus_result",
 }
 
 const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
@@ -335,19 +343,26 @@ const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 	path TEXT, status TEXT, canonical_sha256 TEXT,
 	parent TEXT, skip TEXT, formula TEXT, elements TEXT,
 	score INTEGER, max_crit INTEGER, suspicious_count INTEGER,
-	mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ
+	mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ,
+	cleave_result JSONB, litmus_result JSONB
 ) ON COMMIT DROP`
 
+// cleave_result and litmus_result are populated on INSERT so archive-
+// member explosion — which derives both from the parent — doesn't silently
+// drop them. ON CONFLICT leaves existing analysis alone: a walker row
+// arriving after Explode must not wipe results we already stored.
 const insertBatchStagingInsert = `INSERT INTO samples (
 	sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, path, status,
 	canonical_sha256, parent, skip, formula, elements,
-	score, max_crit, suspicious_count, mtime, marker_mtime)
+	score, max_crit, suspicious_count, mtime, marker_mtime,
+	cleave_result, litmus_result)
 SELECT DISTINCT ON (sha256)
 	sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, path, status,
 	canonical_sha256, parent, skip, formula, elements,
-	score, max_crit, suspicious_count, mtime, marker_mtime
+	score, max_crit, suspicious_count, mtime, marker_mtime,
+	cleave_result, litmus_result
 FROM _staging
 ON CONFLICT (sha256) DO UPDATE SET
 	path  = CASE WHEN EXCLUDED.path  <> ''   THEN EXCLUDED.path  ELSE samples.path  END,
@@ -362,6 +377,7 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256,
 			s.Parent, s.Skip, s.Formula, s.Elements, s.Score, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
+			sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult),
 		}
 	}
 

@@ -383,19 +383,36 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
+// jsonTextOrNil returns b as a string for storage in a SQLite TEXT column,
+// or nil (→ SQL NULL) when empty. SQLite's driver treats []byte as a blob;
+// go-sqlite3 stores "" as an empty blob too, which round-trips oddly for
+// JSON columns. Explicit NULL when we have no value keeps the column
+// consistent with "unanalyzed."
+func jsonTextOrNil(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return string(b)
+}
+
 func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error) {
 	tx, err := db.lite.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("hopper: begin insert: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // commit or rollback
+	// cleave_result and litmus_result are populated on INSERT when the caller
+	// already has them (notably ExplodeArchiveMembers, which derives both
+	// from the parent). ON CONFLICT leaves existing analysis alone so a
+	// walker row arriving later can't wipe results from an earlier Explode.
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename, file_type,
 			size_bytes, label, label_source, path, status,
 			canonical_sha256, parent, skip, formula, elements,
-			score, max_crit, suspicious_count, mtime, marker_mtime)
+			score, max_crit, suspicious_count, mtime, marker_mtime,
+			cleave_result, litmus_result)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?)
+			?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256) DO UPDATE SET
 			path  = CASE WHEN excluded.path  != ''   THEN excluded.path  ELSE samples.path  END,
 			mtime = CASE WHEN excluded.mtime IS NOT NULL THEN excluded.mtime ELSE samples.mtime END
@@ -404,7 +421,8 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.SHA256, s.Parent, s.Skip, s.Formula, s.Elements,
-		s.Score, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime)
+		s.Score, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
+		jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult))
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
@@ -445,7 +463,8 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 	cols := []string{
 		"sha256", "source", "feed", "ecosystem", "filename", "file_type",
 		"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
-		"parent", "skip", "formula", "elements", "score", "max_crit", "suspicious_count", "mtime", "marker_mtime",
+		"parent", "skip", "formula", "elements", "score", "max_crit", "suspicious_count",
+		"mtime", "marker_mtime", "cleave_result", "litmus_result",
 	}
 	placeholders := make([]string, len(cols))
 	for i := range cols {
@@ -487,7 +506,8 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename, s.FileType,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 			s.SHA256, s.Parent, s.Skip, s.Formula, s.Elements,
-			s.Score, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime)
+			s.Score, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
+			jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult))
 		if err != nil {
 			return 0, nil, fmt.Errorf("hopper: batch insert %s: %w", s.SHA256, err)
 		}

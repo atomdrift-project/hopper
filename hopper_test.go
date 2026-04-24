@@ -1,6 +1,7 @@
 package hopper
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -1062,6 +1063,7 @@ func TestExplodeArchiveMembers(t *testing.T) {
 		{"sha":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","type":"txt","path":"pkg/readme.txt","dp":1,"sz":50,"ts":[{"l":1,"c":1.0}]}
 	]}`)
 
+	parentLitmus := []byte(`{"score":0.97,"verdict":"bad"}`)
 	parent := &Sample{
 		SHA256:          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		Source:          "test",
@@ -1069,6 +1071,7 @@ func TestExplodeArchiveMembers(t *testing.T) {
 		LabelSource:     "test",
 		Path:            "bad/archive.zip",
 		CleaveResult:    cleaveJSON,
+		LitmusResult:    parentLitmus,
 		CanonicalSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 	}
 	mustInsert(t, ctx, db, parent)
@@ -1116,6 +1119,187 @@ func TestExplodeArchiveMembers(t *testing.T) {
 	}
 	if want := "bad/archive.zip!pkg/setup.py"; py.Path != want {
 		t.Errorf("py Path = %q, want %q", py.Path, want)
+	}
+
+	// Regression guard for the "archive orphan" class: Explode must persist
+	// cleave_result (single-file wrapper derived from the parent's fs[]
+	// entry) AND litmus_result (inherited from parent) on every member.
+	// Before the insert column-list fix, these fields were silently
+	// dropped because neither insertSampleBatch* listed them, leaving
+	// members with NULL cleave_result — invisible to ClaimJobs and hence
+	// undead in the queue forever.
+	for _, sha := range []string{
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+	} {
+		m, err := db.SampleBySHA256(ctx, sha)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(m.CleaveResult) == 0 {
+			t.Errorf("%s: cleave_result missing — explode inserted nothing into the column", sha[:12])
+		} else if !bytes.Contains(m.CleaveResult, []byte(sha)) {
+			t.Errorf("%s: cleave_result doesn't reference own sha: %s", sha[:12], m.CleaveResult)
+		}
+		if !bytes.Equal(m.LitmusResult, parentLitmus) {
+			t.Errorf("%s: litmus_result = %q, want inherited %q", sha[:12], m.LitmusResult, parentLitmus)
+		}
+	}
+}
+
+// TestExplodeArchiveMembersCleaveFormat verifies that we strip cleave's
+// "<archive-path>!!<member>" prefix before joining the member to our own
+// parent.Path. Historical bug: we were blindly prepending parent.Path +
+// "!" on top of cleave's already-qualified path, producing triple-nested
+// stored paths like "bad/foo.tgz!/abs/data/bad/foo.tgz!!member.py".
+func TestExplodeArchiveMembersCleaveFormat(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mSha := "2222222222222222222222222222222222222222222222222222222222222222"
+	nSha := "3333333333333333333333333333333333333333333333333333333333333333"
+	// Absolute-path format (what cleave emits for depth-1 members) and
+	// nested-archive format (depth-2; the last "!!" is still the boundary).
+	cleaveJSON := []byte(`{"fs":[
+		{"sha":"1111111111111111111111111111111111111111111111111111111111111111","type":"tar.gz","path":"/abs/data/bad/archive.tgz","dp":0},
+		{"sha":"` + mSha + `","type":"py","path":"/abs/data/bad/archive.tgz!!package/setup.py","dp":1,"sz":100,"ts":[{"l":5,"c":0.95}]},
+		{"sha":"` + nSha + `","type":"txt","path":"inner.tgz!!inner.tgz!deep/note.txt","dp":2,"sz":50,"ts":[{"l":5,"c":0.9}]}
+	]}`)
+	parent := &Sample{
+		SHA256:       "1111111111111111111111111111111111111111111111111111111111111111",
+		Source:       "test",
+		Label:        "bad",
+		LabelSource:  "test",
+		Path:         "bad/archive.tgz",
+		CleaveResult: cleaveJSON,
+	}
+	mustInsert(t, ctx, db, parent)
+	if _, err := db.ExplodeArchiveMembers(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+
+	// dp=1 member: last "!!" separates archive from member → "package/setup.py".
+	m, err := db.SampleBySHA256(ctx, mSha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "bad/archive.tgz!package/setup.py"; m.Path != want {
+		t.Errorf("dp=1 member path = %q, want %q", m.Path, want)
+	}
+	if m.Filename != "package/setup.py" {
+		t.Errorf("dp=1 member filename = %q, want %q", m.Filename, "package/setup.py")
+	}
+
+	// dp=2 nested member: after last "!!", the in-archive portion is
+	// "inner.tgz!deep/note.txt". Joined with parent: "bad/archive.tgz!inner.tgz!deep/note.txt".
+	n, err := db.SampleBySHA256(ctx, nSha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "bad/archive.tgz!inner.tgz!deep/note.txt"; n.Path != want {
+		t.Errorf("dp=2 member path = %q, want %q", n.Path, want)
+	}
+}
+
+// TestExplodeResultsSurviveReingest guards the "walker arrives after Explode"
+// case: if the walker re-hashes an archive member that's already on disk
+// as a standalone file, its InsertSample call must NOT null out the
+// cleave_result / litmus_result that Explode wrote earlier. The fix in
+// the ON CONFLICT clause leaves the analysis columns untouched on update.
+func TestExplodeResultsSurviveReingest(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	memberSHA := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	cleaveJSON := []byte(`{"fs":[
+		{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"elf","path":"pkg/bin","dp":0,"sz":1000,"ts":[{"l":5,"c":0.9}]},
+		{"sha":"` + memberSHA + `","type":"py","path":"pkg/setup.py","dp":1,"sz":500,"ts":[{"l":5,"c":0.95}]}
+	]}`)
+	parent := &Sample{
+		SHA256:          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Source:          "test",
+		Label:           "bad",
+		LabelSource:     "test",
+		Path:            "bad/archive.zip",
+		CleaveResult:    cleaveJSON,
+		LitmusResult:    []byte(`{"score":0.9}`),
+		CanonicalSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}
+	mustInsert(t, ctx, db, parent)
+	if _, err := db.ExplodeArchiveMembers(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+
+	// Member now has cleave_result + litmus_result from explosion.
+	before, err := db.SampleBySHA256(ctx, memberSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before.CleaveResult) == 0 || len(before.LitmusResult) == 0 {
+		t.Fatalf("precondition: Explode should have set both results, got cleave=%d bytes litmus=%d bytes", len(before.CleaveResult), len(before.LitmusResult))
+	}
+
+	// Simulate the walker re-ingesting this same content as a standalone
+	// file on disk — it has no analysis to contribute. The ON CONFLICT
+	// path must leave the existing results alone.
+	walkerInsert := &Sample{
+		SHA256:      memberSHA,
+		Source:      "test",
+		Label:       "unknown",
+		LabelSource: "test",
+		Path:        "bad/extracted/setup.py",
+	}
+	if _, err := db.InsertSampleNew(ctx, walkerInsert); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := db.SampleBySHA256(ctx, memberSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after.CleaveResult, before.CleaveResult) {
+		t.Errorf("cleave_result clobbered by re-ingest:\n  before = %s\n  after  = %s", before.CleaveResult, after.CleaveResult)
+	}
+	if !bytes.Equal(after.LitmusResult, before.LitmusResult) {
+		t.Errorf("litmus_result clobbered by re-ingest:\n  before = %s\n  after  = %s", before.LitmusResult, after.LitmusResult)
+	}
+}
+
+// TestInsertSampleBatchPersistsResults covers the batch-insert path with
+// cleave/litmus preset on the Sample struct. Before the column-list fix
+// the batch path silently dropped these fields.
+func TestInsertSampleBatchPersistsResults(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	cleave := []byte(`{"fs":[{"sha":"bloc1","type":"py"}]}`)
+	litmus := []byte(`{"score":0.5}`)
+	batch := []*Sample{
+		{SHA256: "bloc1", Source: "test", Path: "x/1", CleaveResult: cleave, LitmusResult: litmus},
+		{SHA256: "bloc2", Source: "test", Path: "x/2", CleaveResult: cleave}, // no litmus
+		{SHA256: "bloc3", Source: "test", Path: "x/3"},                        // neither
+	}
+	if _, _, err := db.InsertSampleBatch(ctx, batch); err != nil {
+		t.Fatal(err)
+	}
+
+	got1, _ := db.SampleBySHA256(ctx, "bloc1")
+	if !bytes.Equal(got1.CleaveResult, cleave) {
+		t.Errorf("bloc1 cleave_result = %q, want %q", got1.CleaveResult, cleave)
+	}
+	if !bytes.Equal(got1.LitmusResult, litmus) {
+		t.Errorf("bloc1 litmus_result = %q, want %q", got1.LitmusResult, litmus)
+	}
+	got2, _ := db.SampleBySHA256(ctx, "bloc2")
+	if !bytes.Equal(got2.CleaveResult, cleave) {
+		t.Errorf("bloc2 cleave_result = %q, want %q", got2.CleaveResult, cleave)
+	}
+	if len(got2.LitmusResult) != 0 {
+		t.Errorf("bloc2 litmus_result = %q, want empty (nothing was supplied)", got2.LitmusResult)
+	}
+	got3, _ := db.SampleBySHA256(ctx, "bloc3")
+	if len(got3.CleaveResult) != 0 {
+		t.Errorf("bloc3 cleave_result = %q, want empty", got3.CleaveResult)
 	}
 }
 

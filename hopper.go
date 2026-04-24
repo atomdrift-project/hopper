@@ -390,15 +390,21 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 			continue
 		}
 
-		// Virtual path: "<parent-path>!<in-archive-path>". The '!' separator is
-		// the long-standing JAR/ZIP convention; it nests cleanly for archives
-		// within archives (e.g. "outer.zip!inner.zip!lib/foo.so"). If the parent
-		// has no path (older rows that predate relativization, or tests), fall
-		// back to the in-archive path alone so the row still has a meaningful
-		// location.
-		memberPath := entry.Path
+		// Cleave emits entry.Path in a layered format using "!!" as the
+		// archive-boundary delimiter — absolute or relative archive path
+		// followed by "!!" followed by the in-archive path, e.g.:
+		//   "/abs/foo.tgz!!pkg/index.js"              (one level deep)
+		//   "outer!!inner.tgz!pkg/index.js"            (two levels; last "!!" wins)
+		// Strip everything through the final "!!" to get just the member
+		// portion, then prefix our own parent.Path with a single "!" so
+		// the stored path is "<parent-relative-path>!<member>".
+		inArchive := entry.Path
+		if idx := strings.LastIndex(inArchive, "!!"); idx >= 0 {
+			inArchive = inArchive[idx+2:]
+		}
+		memberPath := inArchive
 		if parent.Path != "" {
-			memberPath = parent.Path + "!" + entry.Path
+			memberPath = parent.Path + "!" + inArchive
 		}
 
 		members = append(members, &Sample{
@@ -406,7 +412,7 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 			Source:          parent.Source,
 			Feed:            parent.Feed,
 			Ecosystem:       parent.Ecosystem,
-			Filename:        entry.Path,
+			Filename:        inArchive,
 			FileType:        entry.FileType,
 			SizeBytes:       entry.Size,
 			Label:           parent.Label,

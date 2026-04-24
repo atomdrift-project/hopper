@@ -444,10 +444,10 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 			idle := time.Since(w.LastSeen)
 			status, _ := workerStatus(w.ActiveClaims, idle)
 			dotClass := "dot-ok"
-			if w.ActiveClaims == 0 && idle >= 10*time.Minute {
+			if w.ActiveClaims == 0 && idle >= workerActiveWindow {
 				dotClass = "dot-warn"
 			}
-			if w.ActiveClaims == 0 && idle >= 30*time.Minute {
+			if w.ActiveClaims == 0 && idle >= workerInactiveWindow {
 				dotClass = "dot-bad"
 			}
 
