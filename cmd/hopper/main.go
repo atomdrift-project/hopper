@@ -124,30 +124,12 @@ func localListenAddr(addr string) string {
 	return addr
 }
 
-const dataPathMarker = "/data/"
-
-func trimAfterDataDir(path string) (string, bool) {
-	slashPath := filepath.ToSlash(path)
-	idx := strings.Index(slashPath, dataPathMarker)
-	if idx < 0 {
-		return "", false
-	}
-	rel := slashPath[idx+len(dataPathMarker):]
-	if rel == "" || rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
-		return "", false
-	}
-	return rel, true
-}
-
 func relativeSamplePath(dataRoot, path string) string {
 	if dataRoot == "" || path == "" || !filepath.IsAbs(path) {
 		return path
 	}
 	if rel, err := filepath.Rel(dataRoot, path); err == nil && rel != "." &&
 		rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return rel
-	}
-	if rel, ok := trimAfterDataDir(path); ok {
 		return rel
 	}
 	return path
@@ -167,13 +149,10 @@ func normalizeForceRescanDirs(dataRoot string, dirs []string) ([]string, error) 
 		dir = filepath.Clean(dir)
 		if filepath.IsAbs(dir) {
 			rel, err := filepath.Rel(dataRoot, dir)
-			if err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-				dir = rel
-			} else if markerRel, ok := trimAfterDataDir(dir); ok {
-				dir = markerRel
-			} else {
-				return nil, fmt.Errorf("force-rescan path %q is outside data directory %s and has no /data/ component", dir, dataRoot)
+			if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return nil, fmt.Errorf("force-rescan path %q is outside data directory %s", dir, dataRoot)
 			}
+			dir = rel
 		}
 		dir = filepath.Clean(dir)
 		if dir == "." || dir == ".." || strings.HasPrefix(dir, ".."+string(filepath.Separator)) {

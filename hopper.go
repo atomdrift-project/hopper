@@ -1109,10 +1109,11 @@ func (db *DB) CountRescanPending(ctx context.Context, currentTraits string, resc
 	return n, err
 }
 
-// RelativizePaths rewrites absolute sample paths so only the path relative to
-// the data directory is stored. It first rewrites paths under dataRoot, then
-// handles older rows by trimming everything through the first "/data/" path
-// component.
+// RelativizePaths rewrites sample paths that start with dataRoot so only
+// the suffix (relative to dataRoot) is stored. Paths that don't live under
+// dataRoot are left untouched — callers pass the dataRoot currently being
+// loaded, and anything outside of it is an observation from a different
+// deployment that we shouldn't rewrite.
 func (db *DB) RelativizePaths(ctx context.Context, dataRoot string) (int64, error) {
 	prefix := ""
 	if dataRoot != "" {

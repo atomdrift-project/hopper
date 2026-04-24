@@ -1331,18 +1331,23 @@ func TestNormalizeForceRescanDirs(t *testing.T) {
 	if err := dirs.Set(abs); err != nil {
 		t.Fatal(err)
 	}
-	if err := dirs.Set("good/pkg,unknown/feed,/moved/archive/data/bad/moved"); err != nil {
+	if err := dirs.Set("good/pkg,unknown/feed"); err != nil {
 		t.Fatal(err)
 	}
 	got, err := normalizeForceRescanDirs(root, dirs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"bad/pkg", "good/pkg", "unknown/feed", "bad/moved"}
+	want := []string{"bad/pkg", "good/pkg", "unknown/feed"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("normalizeForceRescanDirs = %v, want %v", got, want)
 	}
 	if _, err := normalizeForceRescanDirs(root, []string{filepath.Dir(root)}); err == nil {
 		t.Fatal("normalizeForceRescanDirs outside root succeeded, want error")
+	}
+	// Absolute paths outside root no longer get silently "fixed" via a
+	// /data/ marker — they're a hard error.
+	if _, err := normalizeForceRescanDirs(root, []string{"/moved/archive/data/bad/moved"}); err == nil {
+		t.Fatal("normalizeForceRescanDirs with out-of-root absolute path succeeded, want error")
 	}
 }

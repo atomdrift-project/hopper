@@ -853,68 +853,62 @@ func (db *DB) countAnalyzedSQLite(ctx context.Context) (int64, error) {
 }
 
 func (db *DB) relativizePathsSQLite(ctx context.Context, prefix string) (int64, error) {
-	var total int64
+	if prefix == "" {
+		return 0, nil
+	}
 	ts := now()
-	if prefix != "" {
-		res, err := db.lite.ExecContext(ctx, `
-			UPDATE samples SET path = substr(path, length(?) + 1), updated_at = ?
-			WHERE instr(path, ?) = 1`,
-			prefix, ts, prefix)
-		if err != nil {
-			return 0, fmt.Errorf("hopper: relativize paths by root: %w", err)
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return 0, fmt.Errorf("hopper: relativize paths by root rows affected: %w", err)
-		}
-		total += n
-
-		// Mirror to sample_locations. Guard against (sha, new-path)
-		// colliding with an existing row (UNIQUE constraint).
-		if _, err := db.lite.ExecContext(ctx, `
-			UPDATE sample_locations AS sl
-			   SET path = substr(sl.path, length(?) + 1),
-			       last_seen_at = ?
-			 WHERE instr(sl.path, ?) = 1
-			   AND NOT EXISTS (
-			       SELECT 1 FROM sample_locations x
-			        WHERE x.sha256 = sl.sha256
-			          AND x.path   = substr(sl.path, length(?) + 1)
-			          AND x.id    <> sl.id
-			   )`, prefix, ts, prefix, prefix); err != nil {
-			return 0, fmt.Errorf("hopper: relativize location paths by root: %w", err)
-		}
-	}
-
 	res, err := db.lite.ExecContext(ctx, `
-		UPDATE samples SET
-			path = substr(path, instr(path, '/data/') + length('/data/')),
-			updated_at = ?
-		WHERE instr(path, '/data/') > 0`,
-		ts)
+		UPDATE samples SET path = substr(path, length(?) + 1), updated_at = ?
+		WHERE instr(path, ?) = 1`,
+		prefix, ts, prefix)
 	if err != nil {
-		return 0, fmt.Errorf("hopper: relativize paths by data marker: %w", err)
+		return 0, fmt.Errorf("hopper: relativize paths: %w", err)
 	}
-	n, err := res.RowsAffected()
+	total, err := res.RowsAffected()
 	if err != nil {
-		return 0, fmt.Errorf("hopper: relativize paths by data marker rows affected: %w", err)
+		return 0, fmt.Errorf("hopper: relativize paths rows affected: %w", err)
 	}
 
+	// Three-step rewrite so the UNIQUE (sha256, path) constraint is
+	// never violated; see relativizePathsPG for the rationale.
 	if _, err := db.lite.ExecContext(ctx, `
-		UPDATE sample_locations AS sl SET
-			path = substr(sl.path, instr(sl.path, '/data/') + length('/data/')),
-			last_seen_at = ?
-		WHERE instr(sl.path, '/data/') > 0
-		  AND NOT EXISTS (
-		      SELECT 1 FROM sample_locations x
-		       WHERE x.sha256 = sl.sha256
-		         AND x.path   = substr(sl.path, instr(sl.path, '/data/') + length('/data/'))
-		         AND x.id    <> sl.id
-		  )`, ts); err != nil {
-		return 0, fmt.Errorf("hopper: relativize location paths by data marker: %w", err)
+		DELETE FROM sample_locations
+		 WHERE id IN (
+		     SELECT sl.id FROM sample_locations sl
+		      WHERE instr(sl.path, ?) = 1
+		        AND EXISTS (
+		            SELECT 1 FROM sample_locations x
+		             WHERE x.sha256 = sl.sha256
+		               AND x.path   = substr(sl.path, length(?) + 1)
+		               AND x.id    <> sl.id
+		        )
+		 )`, prefix, prefix); err != nil {
+		return 0, fmt.Errorf("hopper: relativize locations dedup-vs-existing: %w", err)
 	}
-
-	return total + n, nil
+	if _, err := db.lite.ExecContext(ctx, `
+		DELETE FROM sample_locations
+		 WHERE id IN (
+		     SELECT id FROM (
+		         SELECT sl.id,
+		                row_number() OVER (
+		                    PARTITION BY sl.sha256, substr(sl.path, length(?) + 1)
+		                    ORDER BY sl.last_seen_at DESC, sl.id ASC
+		                ) AS rn
+		           FROM sample_locations sl
+		          WHERE instr(sl.path, ?) = 1
+		     ) t
+		     WHERE rn > 1
+		 )`, prefix, prefix); err != nil {
+		return 0, fmt.Errorf("hopper: relativize locations dedup-peers: %w", err)
+	}
+	if _, err := db.lite.ExecContext(ctx, `
+		UPDATE sample_locations SET
+			path = substr(path, length(?) + 1),
+			last_seen_at = ?
+		 WHERE instr(path, ?) = 1`, prefix, ts, prefix); err != nil {
+		return 0, fmt.Errorf("hopper: relativize locations update: %w", err)
+	}
+	return total, nil
 }
 
 func (db *DB) updateSampleSQLite(ctx context.Context, sha256, status string, result []byte, canonical string, fi cleaveFileInfo) error {

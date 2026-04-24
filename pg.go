@@ -722,57 +722,61 @@ func (db *DB) countAnalyzedPG(ctx context.Context) (int64, error) {
 }
 
 func (db *DB) relativizePathsPG(ctx context.Context, prefix string) (int64, error) {
-	var total int64
-	if prefix != "" {
-		// Both tables are rewritten together. sample_locations has a
-		// UNIQUE (sha256, path) constraint, so if the same (sha, stripped-
-		// path) already exists as a separate row, the UPDATE would fail;
-		// ON CONFLICT isn't available for UPDATE in Postgres, so we filter
-		// out any row whose rewrite would collide with an existing pair.
-		tag, err := db.pool.Exec(ctx, `
-			UPDATE samples SET path = substring(path from char_length($1) + 1), updated_at = now()
-			WHERE starts_with(path, $1)`, prefix)
-		if err != nil {
-			return 0, fmt.Errorf("hopper: relativize paths by root: %w", err)
-		}
-		total += tag.RowsAffected()
-
-		if _, err := db.pool.Exec(ctx, `
-			UPDATE sample_locations AS sl
-			   SET path = substring(sl.path from char_length($1) + 1),
-			       last_seen_at = now()
-			 WHERE starts_with(sl.path, $1)
-			   AND NOT EXISTS (
-			       SELECT 1 FROM sample_locations x
-			        WHERE x.sha256 = sl.sha256
-			          AND x.path   = substring(sl.path from char_length($1) + 1)
-			          AND x.id    <> sl.id
-			   )`, prefix); err != nil {
-			return 0, fmt.Errorf("hopper: relativize location paths by root: %w", err)
-		}
+	if prefix == "" {
+		return 0, nil
 	}
 	tag, err := db.pool.Exec(ctx, `
-		UPDATE samples SET
-			path = substring(path from position('/data/' in path) + char_length('/data/')),
-			updated_at = now()
-		WHERE position('/data/' in path) > 0`)
+		UPDATE samples SET path = substring(path from char_length($1) + 1), updated_at = now()
+		WHERE starts_with(path, $1)`, prefix)
 	if err != nil {
-		return 0, fmt.Errorf("hopper: relativize paths by data marker: %w", err)
+		return 0, fmt.Errorf("hopper: relativize paths: %w", err)
+	}
+
+	// Rewrite sample_locations in three steps so the UNIQUE (sha256, path)
+	// constraint is never violated:
+	//   1. delete absolute rows whose target already exists as a distinct
+	//      relative row (the relative peer wins),
+	//   2. dedup peers that would converge on the same (sha, new-path)
+	//      (keep most-recent),
+	//   3. UPDATE what remains; each survivor now has a unique target.
+	// The naïve single-UPDATE WHERE NOT EXISTS approach fails because two
+	// rows in the same UPDATE can each see no current conflict but still
+	// collide once one of them has rewritten.
+	if _, err := db.pool.Exec(ctx, `
+		DELETE FROM sample_locations sl
+		 WHERE starts_with(sl.path, $1)
+		   AND EXISTS (
+		       SELECT 1 FROM sample_locations x
+		        WHERE x.sha256 = sl.sha256
+		          AND x.path   = substring(sl.path from char_length($1) + 1)
+		          AND x.id    <> sl.id
+		   )`, prefix); err != nil {
+		return 0, fmt.Errorf("hopper: relativize locations dedup-vs-existing: %w", err)
 	}
 	if _, err := db.pool.Exec(ctx, `
-		UPDATE sample_locations AS sl SET
-			path = substring(sl.path from position('/data/' in sl.path) + char_length('/data/')),
-			last_seen_at = now()
-		WHERE position('/data/' in sl.path) > 0
-		  AND NOT EXISTS (
-		      SELECT 1 FROM sample_locations x
-		       WHERE x.sha256 = sl.sha256
-		         AND x.path   = substring(sl.path from position('/data/' in sl.path) + char_length('/data/'))
-		         AND x.id    <> sl.id
-		  )`); err != nil {
-		return 0, fmt.Errorf("hopper: relativize location paths by data marker: %w", err)
+		DELETE FROM sample_locations
+		 WHERE id IN (
+		     SELECT id FROM (
+		         SELECT sl.id,
+		                row_number() OVER (
+		                    PARTITION BY sl.sha256, substring(sl.path from char_length($1) + 1)
+		                    ORDER BY sl.last_seen_at DESC, sl.id ASC
+		                ) AS rn
+		           FROM sample_locations sl
+		          WHERE starts_with(sl.path, $1)
+		     ) t
+		     WHERE rn > 1
+		 )`, prefix); err != nil {
+		return 0, fmt.Errorf("hopper: relativize locations dedup-peers: %w", err)
 	}
-	return total + tag.RowsAffected(), nil
+	if _, err := db.pool.Exec(ctx, `
+		UPDATE sample_locations SET
+			path = substring(path from char_length($1) + 1),
+			last_seen_at = now()
+		 WHERE starts_with(path, $1)`, prefix); err != nil {
+		return 0, fmt.Errorf("hopper: relativize locations update: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result []byte, canonical string, fi cleaveFileInfo) error {

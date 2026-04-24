@@ -983,14 +983,16 @@ func TestRelativizePaths(t *testing.T) {
 	mustInsert(t, ctx, db, &Sample{SHA256: "rp1", Source: "test", Label: "bad", Path: root + "/bad/pkg/a.bin"})
 	mustInsert(t, ctx, db, &Sample{SHA256: "rp2", Source: "test", Label: "bad", Path: root + "-other/bad/pkg/a.bin"})
 	mustInsert(t, ctx, db, &Sample{SHA256: "rp3", Source: "test", Label: "bad", Path: "bad/pkg/already.bin"})
+	// A legacy-style absolute path that happens to live outside the current
+	// dataRoot — should be left alone (no implicit "/data/" marker fallback).
 	mustInsert(t, ctx, db, &Sample{SHA256: "rp4", Source: "test", Label: "bad", Path: "/moved/archive/data/good/pkg/b.bin"})
 
 	n, err := db.RelativizePaths(ctx, root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 2 {
-		t.Fatalf("RelativizePaths affected %d rows, want 2", n)
+	if n != 1 {
+		t.Fatalf("RelativizePaths affected %d rows, want 1", n)
 	}
 
 	rel, err := db.SampleBySHA256(ctx, "rp1")
@@ -1009,12 +1011,44 @@ func TestRelativizePaths(t *testing.T) {
 		t.Fatalf("rp2 path = %q, want unchanged outside path", outside.Path)
 	}
 
+	// rp4 has /data/ in the path but is NOT under dataRoot — stays
+	// untouched.
 	marker, err := db.SampleBySHA256(ctx, "rp4")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if marker.Path != "good/pkg/b.bin" {
-		t.Fatalf("rp4 path = %q, want marker-trimmed path", marker.Path)
+	if marker.Path != "/moved/archive/data/good/pkg/b.bin" {
+		t.Fatalf("rp4 path = %q, want unchanged (no /data/ marker fallback)", marker.Path)
+	}
+}
+
+// TestRelativizePathsLocationConflicts covers the case that trips up a
+// naïve UPDATE … WHERE NOT EXISTS: a sample has both the absolute and
+// relative form of the same location, left over from a prior deployment
+// or a backfill race. RelativizePaths must collapse them without tripping
+// the UNIQUE (sha256, path) constraint.
+func TestRelativizePathsLocationConflicts(t *testing.T) {
+	ctx := t.Context()
+	db := openTestDB(t)
+	root := filepath.ToSlash(filepath.Join(t.TempDir(), "data"))
+
+	// Fresh walker inserted an absolute path; prior backfill (or a
+	// previous relativize pass) already has the relative equivalent.
+	mustInsert(t, ctx, db, &Sample{SHA256: "conflict1", Source: "test", Label: "bad", Path: root + "/bad/foo.exe"})
+	if err := db.UpsertLocation(ctx, &SampleLocation{SHA256: "conflict1", Path: "bad/foo.exe"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.RelativizePaths(ctx, root); err != nil {
+		t.Fatalf("RelativizePaths: %v", err)
+	}
+
+	locs, err := db.LocationsForSHA(ctx, "conflict1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locs) != 1 || locs[0].Path != "bad/foo.exe" {
+		t.Fatalf("conflict1 locations = %+v, want single path=bad/foo.exe", locs)
 	}
 }
 
