@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -76,6 +77,114 @@ func parseFlags(f *flag.FlagSet, args []string) {
 	if err := f.Parse(args); err != nil {
 		panic(err)
 	}
+}
+
+type stringListFlag []string
+
+func (s *stringListFlag) String() string {
+	if s == nil {
+		return ""
+	}
+	return strings.Join(*s, ",")
+}
+
+func (s *stringListFlag) Set(v string) error {
+	for part := range strings.SplitSeq(v, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			*s = append(*s, part)
+		}
+	}
+	return nil
+}
+
+func localListenAddr(addr string) string {
+	if addr == "" {
+		return addr
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		if strings.HasPrefix(addr, ":") {
+			return "127.0.0.1" + addr
+		}
+		return addr
+	}
+	ip := net.ParseIP(host)
+	if host == "" || host == "localhost" || ip != nil && ip.IsLoopback() {
+		if host == "" {
+			return net.JoinHostPort("127.0.0.1", port)
+		}
+		return addr
+	}
+	if host == "0.0.0.0" || host == "::" || host == "[::]" || ip == nil || !ip.IsLoopback() {
+		return net.JoinHostPort("127.0.0.1", port)
+	}
+	return addr
+}
+
+const dataPathMarker = "/data/"
+
+func trimAfterDataDir(path string) (string, bool) {
+	slashPath := filepath.ToSlash(path)
+	idx := strings.Index(slashPath, dataPathMarker)
+	if idx < 0 {
+		return "", false
+	}
+	rel := slashPath[idx+len(dataPathMarker):]
+	if rel == "" || rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", false
+	}
+	return rel, true
+}
+
+func relativeSamplePath(dataRoot, path string) string {
+	if dataRoot == "" || path == "" || !filepath.IsAbs(path) {
+		return path
+	}
+	if rel, err := filepath.Rel(dataRoot, path); err == nil && rel != "." &&
+		rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return rel
+	}
+	if rel, ok := trimAfterDataDir(path); ok {
+		return rel
+	}
+	return path
+}
+
+func sampleDiskPath(dataRoot, path string) string {
+	if path == "" || filepath.IsAbs(path) || dataRoot == "" {
+		return path
+	}
+	return filepath.Join(dataRoot, path)
+}
+
+func normalizeForceRescanDirs(dataRoot string, dirs []string) ([]string, error) {
+	out := make([]string, 0, len(dirs))
+	seen := make(map[string]struct{}, len(dirs))
+	for _, dir := range dirs {
+		dir = filepath.Clean(dir)
+		if filepath.IsAbs(dir) {
+			rel, err := filepath.Rel(dataRoot, dir)
+			if err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				dir = rel
+			} else if markerRel, ok := trimAfterDataDir(dir); ok {
+				dir = markerRel
+			} else {
+				return nil, fmt.Errorf("force-rescan path %q is outside data directory %s and has no /data/ component", dir, dataRoot)
+			}
+		}
+		dir = filepath.Clean(dir)
+		if dir == "." || dir == ".." || strings.HasPrefix(dir, ".."+string(filepath.Separator)) {
+			return nil, fmt.Errorf("invalid force-rescan path %q", dir)
+		}
+		dir = filepath.ToSlash(dir)
+		if _, ok := seen[dir]; ok {
+			continue
+		}
+		seen[dir] = struct{}{}
+		out = append(out, dir)
+	}
+	return out, nil
 }
 
 func closeFileBestEffort(name string, f *os.File) {
@@ -455,11 +564,17 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx //
 	experimentTag := f.String("experiment-tag", "", "label for experiment comparison")
 	litmusVerbose := f.Bool("litmus-verbose", true, "enable debug logging in litmus server")
 	dashAddr := f.String("dashboard-addr", "0.0.0.0:8081", "web dashboard listen address (empty to disable)")
+	localOnly := f.Bool("local", false, "listen only on loopback for dashboard and worker API")
 	maxFileMB := f.Int64("max-file-size", defaultMaxFileSize/(1024*1024), "skip files larger than this many MiB")
+	var forceRescanDirs stringListFlag
+	f.Var(&forceRescanDirs, "force-rescan", "directory prefix to force re-analysis for; may be repeated or comma-separated")
 	parseFlags(f, os.Args[2:])
 
 	if *maxFileMB > 0 {
 		maxFileSize = *maxFileMB * 1024 * 1024
+	}
+	if *localOnly && *dashAddr != "" {
+		*dashAddr = localListenAddr(*dashAddr)
 	}
 
 	if *dataDir == "" {
@@ -485,7 +600,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx //
 	// startup get a clean 503 instead of the dashboard's HTML.
 	httpMux := http.NewServeMux()
 	tracker := newWorkerTracker()
-	api := &apiServer{tracker: tracker} // db, progress, allowedDirs set after init
+	api := &apiServer{tracker: tracker, hopperStart: time.Now().UTC()} // db, progress, allowedDirs set after init
 	api.registerAPI(httpMux)
 
 	var wd *webDashboard
@@ -660,6 +775,21 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx //
 	db := dr.db
 	defer db.Close()
 	slog.Info("database ready")
+
+	if n, err := db.RelativizePaths(ctx, *dataDir); err != nil {
+		return err
+	} else if n > 0 {
+		slog.Info("relativized stored sample paths", "samples", n)
+	}
+
+	forcePrefixes, err := normalizeForceRescanDirs(*dataDir, forceRescanDirs)
+	if err != nil {
+		return err
+	}
+	api.forceRescanPrefixes = forcePrefixes
+	if len(forcePrefixes) > 0 {
+		slog.Info("force rescan enabled", "paths", forcePrefixes, "since", api.hopperStart)
+	}
 
 	// Clear stale claims from previous runs so those samples get re-queued.
 	slog.Info("clearing stale claims")
@@ -866,7 +996,13 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 			_, ok := progress.walkedPaths.Load(path)
 			return ok
 		}
-		if marked, err := db.MarkMissingSamples(ctx, wasWalked); err != nil {
+		toWalkedPath := func(path string) string {
+			return filepath.ToSlash(relativeSamplePath(filepath.Dir(dirs[0].dir), path))
+		}
+		toDiskPath := func(path string) string {
+			return sampleDiskPath(filepath.Dir(dirs[0].dir), filepath.FromSlash(path))
+		}
+		if marked, err := db.MarkMissingSamplesResolved(ctx, wasWalked, toWalkedPath, toDiskPath); err != nil {
 			slog.Error("mark missing samples failed", "error", err)
 		} else if marked > 0 {
 			slog.Info("marked stale samples", "count", marked)
@@ -965,7 +1101,8 @@ func runDirPipeline(
 		}
 		lp.label = target.label
 		progress.walked.Add(1)
-		progress.walkedPaths.Store(lp.path, struct{}{})
+		storedPath := filepath.ToSlash(relativeSamplePath(filepath.Dir(target.dir), lp.path))
+		progress.walkedPaths.Store(storedPath, struct{}{})
 
 		hr, err := hashFile(ctx, lp.path, lp.label, lp.fileType, source, cache, progress)
 		if err != nil {
@@ -993,6 +1130,7 @@ func runDirPipeline(
 		}
 
 		sample := hr.sample
+		sample.Path = storedPath
 
 		// Apply misclassification marker if it contradicts the label.
 		if marker, markerMtime := markerInfo(lp.path); marker != "" {

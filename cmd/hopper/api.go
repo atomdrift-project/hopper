@@ -25,13 +25,15 @@ import (
 // /api/file/{sha256}. All state lives in the database; the workerTracker
 // is an in-memory cache for the dashboard.
 type apiServer struct {
-	db            *hopper.DB
-	tracker       *workerTracker
-	progress      *loadProgress
-	dataRoot      string   // resolved absolute path to the data directory
-	traitsVersion string   // short prefix of current traits repo commit; empty = rescan disabled
-	allowedDirs   []string // resolved absolute paths that /api/file may serve from
-	rescanAge     time.Duration
+	db                  *hopper.DB
+	tracker             *workerTracker
+	progress            *loadProgress
+	hopperStart         time.Time // process start; gates force-rescan claim tier
+	dataRoot            string    // resolved absolute path to the data directory
+	traitsVersion       string    // short prefix of current traits repo commit; empty = rescan disabled
+	allowedDirs         []string  // resolved absolute paths that /api/file may serve from
+	forceRescanPrefixes []string  // normalized relative paths to re-analyze when analysis predates hopperStart
+	rescanAge           time.Duration
 }
 
 // workerTracker is an in-memory view of active workers, updated on every
@@ -303,7 +305,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
 
-	jobs, err := s.db.ClaimJobs(ctx, worker, count, claimExpiry, s.traitsVersion, s.rescanAge)
+	jobs, err := s.db.ClaimJobs(ctx, worker, count, claimExpiry, s.traitsVersion, s.rescanAge, s.hopperStart, s.forceRescanPrefixes)
 	if err != nil {
 		slog.Error("claim jobs failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
@@ -343,11 +345,12 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 			unclaimSHAs = append(unclaimSHAs, j.SHA256)
 			continue
 		}
-		info, err := os.Stat(j.Path) //nolint:gosec // path from DB lookup, not user input
+		diskPath := sampleDiskPath(s.dataRoot, filepath.FromSlash(j.Path))
+		info, err := os.Stat(diskPath) //nolint:gosec // path from DB lookup, not user input
 		if err != nil {
 			//nolint:gosec // worker validated, sha256/path from DB
 			slog.Warn("claimed file missing on disk",
-				"worker", worker, "sha256", j.SHA256, "path", j.Path)
+				"worker", worker, "sha256", j.SHA256, "path", j.Path, "disk_path", diskPath)
 			if err := s.db.SetSkip(ctx, j.SHA256, "missing"); err != nil {
 				slog.Error("mark missing failed", "sha256", j.SHA256, "error", err) //nolint:gosec // structured logging
 			}
@@ -380,7 +383,11 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	if s.dataRoot != "" {
 		prefix := s.dataRoot + string(filepath.Separator)
 		for i := range jobs {
-			jobs[i].Path = stripDataRoot(jobs[i].Path, prefix)
+			if !filepath.IsAbs(jobs[i].Path) {
+				jobs[i].Path = filepath.ToSlash(jobs[i].Path)
+				continue
+			}
+			jobs[i].Path = filepath.ToSlash(stripDataRoot(jobs[i].Path, prefix))
 		}
 	}
 
@@ -613,7 +620,8 @@ func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	// Path containment: resolve symlinks and verify the file is under
 	// one of the allowed sample directories. Prevents serving arbitrary
 	// files if a sample row has a crafted or symlinked path.
-	resolved, err := filepath.EvalSymlinks(sample.Path)
+	diskPath := sampleDiskPath(s.dataRoot, filepath.FromSlash(sample.Path))
+	resolved, err := filepath.EvalSymlinks(diskPath)
 	if err != nil {
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		return

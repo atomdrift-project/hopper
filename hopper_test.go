@@ -897,6 +897,120 @@ func TestStaleSamples(t *testing.T) {
 	}
 }
 
+func TestClaimJobsForceRescan(t *testing.T) {
+	ctx := t.Context()
+	db := openTestDB(t)
+
+	mustInsert(t, ctx, db, &Sample{SHA256: "fr1", Source: "test", Label: "bad", Path: "bad/pkg/a.bin"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "fr2", Source: "test", Label: "bad", Path: "bad/other/b.bin"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "fr3", Source: "test", Label: "bad", Path: "bad/pkg/skipped.bin", Skip: "unsupported"})
+
+	// Seed prior analysis results so the rows look already-analyzed.
+	for _, sha := range []string{"fr1", "fr2", "fr3"} {
+		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"elf","x":50,"dp":0,"ts":[{"l":5,"c":1.0}]}]}`, sha)
+		if err := db.UpdateCleaveResult(ctx, sha, result, nil, "oldtv"); err != nil {
+			t.Fatalf("UpdateCleaveResult(%s): %v", sha, err)
+		}
+		if err := db.UpdateLitmusResult(ctx, sha, []byte(`{"prob":0.9}`)); err != nil {
+			t.Fatalf("UpdateLitmusResult(%s): %v", sha, err)
+		}
+	}
+
+	// Claim with force-rescan on bad/pkg and hopperStart in the future so all
+	// three rows' analyzed_at is "before" start. Only fr1 should be claimed:
+	// fr2 is outside the prefix, fr3 is marked skip.
+	hopperStart := time.Now().Add(time.Hour)
+	jobs, err := db.ClaimJobs(ctx, "w1", 10, 30*time.Minute, "", 7*24*time.Hour, hopperStart, []string{"bad/pkg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].SHA256 != "fr1" {
+		t.Fatalf("force-rescan claim: got %+v, want [fr1]", jobs)
+	}
+
+	// Prior analysis must still be visible on the claimed row — nothing is
+	// nulled at claim time; UpdateSample overwrites when new data arrives.
+	rescanned, err := db.SampleBySHA256(ctx, "fr1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rescanned.CleaveResult == nil || rescanned.LitmusResult == nil || rescanned.TraitsVersion != "oldtv" {
+		t.Fatalf("fr1 data was reset at claim time: %+v", rescanned)
+	}
+
+	// Outside-prefix and skipped rows are untouched.
+	for _, sha := range []string{"fr2", "fr3"} {
+		s, err := db.SampleBySHA256(ctx, sha)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.CleaveResult == nil || s.LitmusResult == nil || s.TraitsVersion != "oldtv" {
+			t.Fatalf("%s unexpectedly affected: %+v", sha, s)
+		}
+	}
+
+	// A second claim while fr1 is still held returns nothing.
+	jobs, err = db.ClaimJobs(ctx, "w2", 10, 30*time.Minute, "", 7*24*time.Hour, hopperStart, []string{"bad/pkg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("second claim should see fr1 in flight: got %+v", jobs)
+	}
+
+	// With no force-rescan prefixes and no traits version, no claims happen
+	// after tier-1 is empty — the force-rescan tier is opt-in per call.
+	jobs, err = db.ClaimJobs(ctx, "w3", 10, 0, "", 7*24*time.Hour, hopperStart, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("without force-rescan prefixes, no tier-2 claim: got %+v", jobs)
+	}
+}
+
+func TestRelativizePaths(t *testing.T) {
+	ctx := t.Context()
+	db := openTestDB(t)
+	root := filepath.ToSlash(filepath.Join(t.TempDir(), "data"))
+	mustInsert(t, ctx, db, &Sample{SHA256: "rp1", Source: "test", Label: "bad", Path: root + "/bad/pkg/a.bin"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "rp2", Source: "test", Label: "bad", Path: root + "-other/bad/pkg/a.bin"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "rp3", Source: "test", Label: "bad", Path: "bad/pkg/already.bin"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "rp4", Source: "test", Label: "bad", Path: "/moved/archive/data/good/pkg/b.bin"})
+
+	n, err := db.RelativizePaths(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("RelativizePaths affected %d rows, want 2", n)
+	}
+
+	rel, err := db.SampleBySHA256(ctx, "rp1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel.Path != "bad/pkg/a.bin" {
+		t.Fatalf("rp1 path = %q, want relative path", rel.Path)
+	}
+
+	outside, err := db.SampleBySHA256(ctx, "rp2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outside.Path != root+"-other/bad/pkg/a.bin" {
+		t.Fatalf("rp2 path = %q, want unchanged outside path", outside.Path)
+	}
+
+	marker, err := db.SampleBySHA256(ctx, "rp4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marker.Path != "good/pkg/b.bin" {
+		t.Fatalf("rp4 path = %q, want marker-trimmed path", marker.Path)
+	}
+}
+
 func TestExplodeArchiveMembers(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -1505,7 +1619,7 @@ func TestClaimJobsSkipsMarkedSamples(t *testing.T) {
 	mustInsert(t, ctx, db, &Sample{SHA256: "claim2", Path: "/data/b.exe", Label: "bad", Skip: "unsupported"})
 	mustInsert(t, ctx, db, &Sample{SHA256: "claim3", Path: "/data/c.exe", Label: "bad", Skip: "missing"})
 
-	jobs, err := db.ClaimJobs(ctx, "testworker", 10, 30*time.Minute, "", 7*24*time.Hour)
+	jobs, err := db.ClaimJobs(ctx, "testworker", 10, 30*time.Minute, "", 7*24*time.Hour, time.Now(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1526,7 +1640,7 @@ func TestClaimJobsExpiry(t *testing.T) {
 	mustInsert(t, ctx, db, &Sample{SHA256: "exp1", Path: "/data/a.exe", Label: "bad"})
 
 	// Claim it.
-	jobs, err := db.ClaimJobs(ctx, "worker1", 1, 30*time.Minute, "", 7*24*time.Hour)
+	jobs, err := db.ClaimJobs(ctx, "worker1", 1, 30*time.Minute, "", 7*24*time.Hour, time.Now(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1535,7 +1649,7 @@ func TestClaimJobsExpiry(t *testing.T) {
 	}
 
 	// Try to claim again — should get nothing (still claimed).
-	jobs, err = db.ClaimJobs(ctx, "worker2", 1, 30*time.Minute, "", 7*24*time.Hour)
+	jobs, err = db.ClaimJobs(ctx, "worker2", 1, 30*time.Minute, "", 7*24*time.Hour, time.Now(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1544,7 +1658,7 @@ func TestClaimJobsExpiry(t *testing.T) {
 	}
 
 	// Claim with zero expiry — should reclaim the expired job.
-	jobs, err = db.ClaimJobs(ctx, "worker2", 1, 0, "", 7*24*time.Hour)
+	jobs, err = db.ClaimJobs(ctx, "worker2", 1, 0, "", 7*24*time.Hour, time.Now(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

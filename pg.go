@@ -75,7 +75,7 @@ func (db *DB) migratePG(ctx context.Context) error {
 			`ON samples(updated_at ASC NULLS FIRST, id) ` +
 			`WHERE cleave_result IS NULL AND skip = '' AND parent = ''`,
 		// Covers the dashboard's OldestClaims query (DISTINCT ON claimed_by, ORDER BY claimed_at).
-		`CREATE INDEX IF NOT EXISTS idx_samples_claimed ON samples(claimed_by, claimed_at) WHERE claimed_by != '' AND cleave_result IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_claimed ON samples(claimed_by, claimed_at) WHERE claimed_by != ''`,
 		// newestAnalyzedAtPG: MAX(analyzed_at) — index-only max scan.
 		`CREATE INDEX IF NOT EXISTS idx_samples_analyzed_at ON samples(analyzed_at DESC) WHERE analyzed_at IS NOT NULL`,
 		// benignReviewPG / badReviewPG filter on skip='misclassified' which is excluded
@@ -543,6 +543,28 @@ func (db *DB) countAnalyzedPG(ctx context.Context) (int64, error) {
 	var n int64
 	err := db.pool.QueryRow(ctx, "SELECT count(*) FROM samples WHERE litmus_result IS NOT NULL").Scan(&n)
 	return n, err
+}
+
+func (db *DB) relativizePathsPG(ctx context.Context, prefix string) (int64, error) {
+	var total int64
+	if prefix != "" {
+		tag, err := db.pool.Exec(ctx, `
+			UPDATE samples SET path = substring(path from char_length($1) + 1), updated_at = now()
+			WHERE starts_with(path, $1)`, prefix)
+		if err != nil {
+			return 0, fmt.Errorf("hopper: relativize paths by root: %w", err)
+		}
+		total += tag.RowsAffected()
+	}
+	tag, err := db.pool.Exec(ctx, `
+		UPDATE samples SET
+			path = substring(path from position('/data/' in path) + char_length('/data/')),
+			updated_at = now()
+		WHERE position('/data/' in path) > 0`)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: relativize paths by data marker: %w", err)
+	}
+	return total + tag.RowsAffected(), nil
 }
 
 func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result []byte, canonical string, fi cleaveFileInfo) error {
@@ -1087,6 +1109,7 @@ func scanPGCounts(rows pgx.Rows) (map[string]int, error) {
 func (db *DB) claimJobsPG(
 	ctx context.Context, worker string, limit int,
 	expiry time.Duration, currentTraits string, rescanAge time.Duration,
+	hopperStart time.Time, forceRescanPrefixes []string,
 ) ([]ClaimJob, error) {
 	// Tier 1: unanalyzed samples (highest priority).
 	// ORDER BY random() spreads work across different packages/sources so a
@@ -1111,13 +1134,47 @@ func (db *DB) claimJobsPG(
 	if err != nil {
 		return nil, err
 	}
-	if len(jobs) > 0 || currentTraits == "" {
+	if len(jobs) > 0 {
 		return jobs, nil
 	}
 
-	// Tier 2: stale-traits rescan — only when no unanalyzed samples remain.
-	// Reset cleave/litmus results so the normal result flow applies unchanged.
-	// ORDER BY random() for the same reason as tier 1.
+	// Tier 2: force-rescan — re-analyze samples under the named path prefixes
+	// whose analysis predates this hopper run.
+	if len(forceRescanPrefixes) > 0 {
+		patterns := pathPatterns(forceRescanPrefixes)
+		rows, err = db.pool.Query(ctx, `
+			WITH reclaimable AS (
+				SELECT id FROM samples
+				WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
+				  AND analyzed_at < $4
+				  AND (path = ANY($5) OR path LIKE ANY($5))
+				  AND (claimed_by = '' OR claimed_at < now() - $2::interval)
+				ORDER BY random()
+				LIMIT $3
+				FOR UPDATE SKIP LOCKED
+			)
+			UPDATE samples SET claimed_by = $1, claimed_at = now()
+			FROM reclaimable WHERE samples.id = reclaimable.id
+			RETURNING samples.sha256, samples.path, samples.size_bytes, samples.file_type`,
+			worker, expiry, limit, hopperStart.UTC(), patterns)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: claim force-rescan jobs: %w", err)
+		}
+		jobs, err = scanClaimRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		if len(jobs) > 0 {
+			return jobs, nil
+		}
+	}
+
+	if currentTraits == "" {
+		return nil, nil
+	}
+
+	// Tier 3: stale-traits rescan — samples analyzed with an older traits
+	// version. ORDER BY random() for the same reason as tier 1.
 	rows, err = db.pool.Query(ctx, `
 		WITH reclaimable AS (
 			SELECT id FROM samples
@@ -1129,9 +1186,7 @@ func (db *DB) claimJobsPG(
 			LIMIT $3
 			FOR UPDATE SKIP LOCKED
 		)
-		UPDATE samples SET claimed_by = $1, claimed_at = now(),
-			cleave_result = NULL, litmus_result = NULL,
-			litmus_score = 0, traits_version = ''
+		UPDATE samples SET claimed_by = $1, claimed_at = now()
 		FROM reclaimable WHERE samples.id = reclaimable.id
 		RETURNING samples.sha256, samples.path, samples.size_bytes, samples.file_type`,
 		worker, expiry, limit, currentTraits, time.Now().Add(-rescanAge).UTC())
@@ -1139,6 +1194,16 @@ func (db *DB) claimJobsPG(
 		return nil, fmt.Errorf("hopper: claim stale-traits jobs: %w", err)
 	}
 	return scanClaimRows(rows)
+}
+
+// pathPatterns expands each path prefix into both its exact form and its
+// subtree form (prefix + "/%") so SQL can match either with a single array.
+func pathPatterns(prefixes []string) []string {
+	patterns := make([]string, 0, len(prefixes)*2)
+	for _, p := range prefixes {
+		patterns = append(patterns, p, p+"/%")
+	}
+	return patterns
 }
 
 func scanClaimRows(rows pgx.Rows) ([]ClaimJob, error) {
@@ -1158,7 +1223,7 @@ func (db *DB) oldestClaimsPG(ctx context.Context, maxAge time.Duration) ([]Worke
 	rows, err := db.pool.Query(ctx, `
 		SELECT DISTINCT ON (claimed_by) claimed_by, path, claimed_at
 		FROM samples
-		WHERE claimed_by != '' AND claimed_at IS NOT NULL AND cleave_result IS NULL
+		WHERE claimed_by != '' AND claimed_at IS NOT NULL
 			AND claimed_at >= now() - $1::interval
 		ORDER BY claimed_by, claimed_at
 	`, maxAge.String())
@@ -1191,7 +1256,7 @@ func (db *DB) newestAnalyzedAtPG(ctx context.Context) (time.Time, error) {
 func (db *DB) unclaimAllPG(ctx context.Context) (int64, error) {
 	tag, err := db.pool.Exec(ctx,
 		`UPDATE samples SET claimed_by = '', claimed_at = NULL
-		 WHERE claimed_by != '' AND cleave_result IS NULL`)
+		 WHERE claimed_by != ''`)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: unclaim all: %w", err)
 	}

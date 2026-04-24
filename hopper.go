@@ -595,19 +595,37 @@ func (db *DB) Unanalyzed(ctx context.Context, limit int) ([]*Sample, error) {
 // wasWalked reports whether a resolved path was emitted by cleave iter-files
 // during the current load. Returns the number of samples marked.
 func (db *DB) MarkMissingSamples(ctx context.Context, wasWalked func(string) bool) (int64, error) {
+	return db.MarkMissingSamplesResolved(ctx, wasWalked, nil, nil)
+}
+
+// MarkMissingSamplesResolved is MarkMissingSamples with caller-provided path
+// normalization. comparablePath maps DB paths into the same namespace used by
+// wasWalked; diskPath maps DB paths to local filesystem paths for os.Stat.
+func (db *DB) MarkMissingSamplesResolved(
+	ctx context.Context,
+	wasWalked func(string) bool,
+	comparablePath func(string) string,
+	diskPath func(string) string,
+) (int64, error) {
 	const batchSize = 50_000
 	samples, err := db.Unanalyzed(ctx, batchSize)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: mark missing: %w", err)
+	}
+	if comparablePath == nil {
+		comparablePath = func(p string) string { return p }
+	}
+	if diskPath == nil {
+		diskPath = func(p string) string { return p }
 	}
 
 	// Resolve symlinks in DB paths so they match the resolved walkedPaths keys.
 	// Prior runs may have stored unresolved symlink paths (e.g. ~/data → /srv/data).
 	resolvedPath := func(p string) string {
 		if r, err := filepath.EvalSymlinks(p); err == nil {
-			return r
+			return comparablePath(r)
 		}
-		return p
+		return comparablePath(p)
 	}
 
 	// Dry-run: count how many would be marked before writing anything.
@@ -638,7 +656,7 @@ func (db *DB) MarkMissingSamples(ctx context.Context, wasWalked func(string) boo
 		if wasWalked(resolvedPath(s.Path)) {
 			continue
 		}
-		_, statErr := os.Stat(s.Path)
+		_, statErr := os.Stat(diskPath(s.Path))
 		skip := "unsupported" // file exists but iter-files filtered it out
 		if statErr != nil {
 			skip = "missing" // file is gone from disk
@@ -699,16 +717,21 @@ func (db *DB) NewestAnalyzedAt(ctx context.Context) (time.Time, error) {
 
 // ClaimJobs atomically claims up to limit unanalyzed samples for the named
 // worker. Expired claims (older than expiry) are reclaimed. When no unanalyzed
-// samples remain, samples analyzed with a different traits version older than
-// rescanAge are reclaimed for re-analysis.
+// samples remain, workers fall through to two rescan tiers (in order):
+// force-rescan paths (samples under forceRescanPrefixes whose analysis
+// predates hopperStart) and traits-stale rescan (samples analyzed with a
+// different traits_version more than rescanAge ago). Neither rescan tier
+// clears stored analysis — UpdateSample overwrites in place when new results
+// arrive, so a crashed or expired rescan never leaves a row visibly empty.
 func (db *DB) ClaimJobs(
 	ctx context.Context, worker string, limit int,
 	expiry time.Duration, currentTraits string, rescanAge time.Duration,
+	hopperStart time.Time, forceRescanPrefixes []string,
 ) ([]ClaimJob, error) {
 	if db.pool != nil {
-		return db.claimJobsPG(ctx, worker, limit, expiry, currentTraits, rescanAge)
+		return db.claimJobsPG(ctx, worker, limit, expiry, currentTraits, rescanAge, hopperStart, forceRescanPrefixes)
 	}
-	return db.claimJobsSQLite(ctx, worker, limit, expiry, currentTraits, rescanAge)
+	return db.claimJobsSQLite(ctx, worker, limit, expiry, currentTraits, rescanAge, hopperStart, forceRescanPrefixes)
 }
 
 // UnclaimAll releases all outstanding claims. Call on startup to clear
@@ -921,6 +944,21 @@ func (db *DB) CountRescanPending(ctx context.Context, currentTraits string, resc
 			currentTraits, cutoff.Format(time.RFC3339Nano)).Scan(&n)
 	}
 	return n, err
+}
+
+// RelativizePaths rewrites absolute sample paths so only the path relative to
+// the data directory is stored. It first rewrites paths under dataRoot, then
+// handles older rows by trimming everything through the first "/data/" path
+// component.
+func (db *DB) RelativizePaths(ctx context.Context, dataRoot string) (int64, error) {
+	prefix := ""
+	if dataRoot != "" {
+		prefix = filepath.ToSlash(filepath.Clean(dataRoot)) + "/"
+	}
+	if db.pool != nil {
+		return db.relativizePathsPG(ctx, prefix)
+	}
+	return db.relativizePathsSQLite(ctx, prefix)
 }
 
 // UpdateSample updates status, cleave result, and updated_at in one operation.

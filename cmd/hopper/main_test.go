@@ -548,6 +548,18 @@ func TestCmdLoadIntegration(t *testing.T) {
 	if counts["bad"] != 2 {
 		t.Errorf("bad count = %d, want 2", counts["bad"])
 	}
+	samples, err := db.SamplesByLabel(ctx, "bad", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range samples {
+		if filepath.IsAbs(s.Path) {
+			t.Fatalf("stored path %q is absolute, want relative", s.Path)
+		}
+		if !strings.HasPrefix(filepath.ToSlash(s.Path), "bad/test/") {
+			t.Fatalf("stored path %q, want under bad/test/", s.Path)
+		}
+	}
 }
 
 func TestCmdImport(t *testing.T) {
@@ -1293,4 +1305,44 @@ func TestStripDataRoot(t *testing.T) {
 			t.Errorf("stripDataRoot = %q, want original path", got)
 		}
 	})
+}
+
+func TestLocalListenAddr(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"0.0.0.0:8081", "127.0.0.1:8081"},
+		{":8081", "127.0.0.1:8081"},
+		{"127.0.0.1:9090", "127.0.0.1:9090"},
+		{"192.0.2.10:8081", "127.0.0.1:8081"},
+	}
+	for _, tt := range tests {
+		if got := localListenAddr(tt.in); got != tt.want {
+			t.Errorf("localListenAddr(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestNormalizeForceRescanDirs(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, "bad", "pkg")
+	var dirs stringListFlag
+	if err := dirs.Set(abs); err != nil {
+		t.Fatal(err)
+	}
+	if err := dirs.Set("good/pkg,unknown/feed,/moved/archive/data/bad/moved"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := normalizeForceRescanDirs(root, dirs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"bad/pkg", "good/pkg", "unknown/feed", "bad/moved"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("normalizeForceRescanDirs = %v, want %v", got, want)
+	}
+	if _, err := normalizeForceRescanDirs(root, []string{filepath.Dir(root)}); err == nil {
+		t.Fatal("normalizeForceRescanDirs outside root succeeded, want error")
+	}
 }
