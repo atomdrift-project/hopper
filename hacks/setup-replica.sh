@@ -96,8 +96,12 @@ else
             || LOCAL_PW=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
     fi
     log "Creating role '$LOCAL_USER'"
-    admin -v ON_ERROR_STOP=1 -v role="$LOCAL_USER" -v pw="$LOCAL_PW" \
-        -c 'CREATE ROLE :"role" LOGIN PASSWORD :'"'pw'"
+    # Substitutions (`:"name"`, `:'pw'`) are only performed by psql when SQL
+    # arrives via stdin or -f; the -c path sends the string straight to the
+    # server, so we feed this through a heredoc.
+    admin -v ON_ERROR_STOP=1 -v role="$LOCAL_USER" -v pw="$LOCAL_PW" <<'SQL'
+CREATE ROLE :"role" LOGIN PASSWORD :'pw';
+SQL
 fi
 
 # Append .pgpass entry if one doesn't already cover localhost for this user/db.
@@ -117,8 +121,9 @@ if [ "$db_exists" = "1" ]; then
     log "Database '$LOCAL_DB' already exists"
 else
     log "Creating database '$LOCAL_DB' owned by '$LOCAL_USER'"
-    admin -v ON_ERROR_STOP=1 -v db="$LOCAL_DB" -v owner="$LOCAL_USER" \
-        -c 'CREATE DATABASE :"db" OWNER :"owner"'
+    admin -v ON_ERROR_STOP=1 -v db="$LOCAL_DB" -v owner="$LOCAL_USER" <<'SQL'
+CREATE DATABASE :"db" OWNER :"owner";
+SQL
 fi
 
 # --- Schema via hopper init (idempotent; uses migration tracking) ---------
