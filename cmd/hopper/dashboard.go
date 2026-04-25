@@ -23,7 +23,7 @@ const dashQueryTimeout = 3 * time.Second
 
 // webDashboard serves a self-contained HTML page. Auto-refreshes every 5s.
 // Fields guarded by cfgMu are set once via configure() after the load session
-// begins; the handler renders a "starting" state until then.
+// begins; the handler renders a startup-status page until then.
 type webDashboard struct {
 	start         time.Time
 	db            *hopper.DB
@@ -35,12 +35,110 @@ type webDashboard struct {
 	litmus        *litmusServer
 	traitsVersion string
 	samples       []throughputSample
+	stages        []*startupStage
 	maxAnalyzed   int
 	startAnalyzed int64
 	ndirs         int
 	rescanAge     time.Duration
 	cfgMu         sync.RWMutex
 	mu            sync.Mutex
+	stagesMu      sync.Mutex
+}
+
+// startupStage represents one named init step rendered on the bootstrap page.
+// finished.IsZero() means still running. err non-empty means failed.
+type startupStage struct {
+	started  time.Time
+	finished time.Time
+	name     string
+	label    string
+	err      string
+	current  int64
+	total    int64
+}
+
+// findStage returns the existing stage with the given name, or nil.
+// Caller must hold stagesMu.
+func (wd *webDashboard) findStage(name string) *startupStage {
+	for _, s := range wd.stages {
+		if s.name == name {
+			return s
+		}
+	}
+	return nil
+}
+
+// beginStage records a new init step. Idempotent — repeated calls with the
+// same name reset start time and clear any prior error / progress.
+// No-op on a nil receiver so callers don't need to nil-check when the
+// dashboard is disabled.
+func (wd *webDashboard) beginStage(name, label string) {
+	if wd == nil {
+		return
+	}
+	wd.stagesMu.Lock()
+	defer wd.stagesMu.Unlock()
+	if s := wd.findStage(name); s != nil {
+		s.started = time.Now()
+		s.finished = time.Time{}
+		s.label = label
+		s.err = ""
+		s.current = 0
+		s.total = 0
+		return
+	}
+	wd.stages = append(wd.stages, &startupStage{name: name, label: label, started: time.Now()})
+}
+
+// updateStage updates progress numbers for a running stage. No-op if unknown
+// or if the receiver is nil.
+func (wd *webDashboard) updateStage(name string, current, total int64) {
+	if wd == nil {
+		return
+	}
+	wd.stagesMu.Lock()
+	defer wd.stagesMu.Unlock()
+	if s := wd.findStage(name); s != nil {
+		s.current = current
+		s.total = total
+	}
+}
+
+// endStage marks a stage finished. No-op if unknown or receiver is nil.
+func (wd *webDashboard) endStage(name string) {
+	if wd == nil {
+		return
+	}
+	wd.stagesMu.Lock()
+	defer wd.stagesMu.Unlock()
+	if s := wd.findStage(name); s != nil && s.finished.IsZero() {
+		s.finished = time.Now()
+	}
+}
+
+// failStage marks a stage failed with the given error message. No-op on nil.
+func (wd *webDashboard) failStage(name, msg string) {
+	if wd == nil {
+		return
+	}
+	wd.stagesMu.Lock()
+	defer wd.stagesMu.Unlock()
+	if s := wd.findStage(name); s != nil {
+		s.err = msg
+		if s.finished.IsZero() {
+			s.finished = time.Now()
+		}
+	}
+}
+
+func (wd *webDashboard) snapshotStages() []startupStage {
+	wd.stagesMu.Lock()
+	defer wd.stagesMu.Unlock()
+	out := make([]startupStage, len(wd.stages))
+	for i, s := range wd.stages {
+		out[i] = *s
+	}
+	return out
 }
 
 // configure is called once the load session is ready. It sets the fields the
@@ -258,6 +356,7 @@ td.warn{color:var(--amber)}
 .err{background:#1a0d0d;border:1px solid #3d1515;border-radius:4px;
   padding:.5rem .75rem;font-size:.78rem;color:#f87171;margin-top:1.5rem;
   word-break:break-all;font-family:var(--mono)}
+.err-inline{color:var(--red);font-family:var(--mono)}
 
 /* graph */
 .graph-box{background:var(--surface);border:1px solid var(--border);
@@ -272,6 +371,71 @@ footer{padding-top:1rem;border-top:1px solid var(--border);
   font-family:var(--mono);font-size:.75rem;color:var(--sub)}
 `
 
+// renderStartup writes the bootstrap HTML page shown before the load session is
+// armed. Lists each init stage (running, done, or failed) with elapsed time and
+// progress where known.
+func (wd *webDashboard) renderStartup(w http.ResponseWriter) {
+	stages := wd.snapshotStages()
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	var buf strings.Builder
+	buf.WriteString(`<!DOCTYPE html><html lang="en"><head>` +
+		`<meta charset="utf-8"><meta http-equiv="refresh" content="2">` +
+		`<title>hopper</title><style>` + css + `</style></head><body>`)
+	buf.WriteString(`<div class="hdr"><div class="hdr-top">`)
+	buf.WriteString(`<span class="hdr-title">Hopper</span>`)
+	buf.WriteString(`<span class="hdr-time">starting&hellip;</span>`)
+	buf.WriteString(`</div></div>`)
+
+	if len(stages) == 0 {
+		buf.WriteString(`</body></html>`)
+		_, _ = w.Write([]byte(buf.String())) //nolint:errcheck // best-effort HTTP response
+		return
+	}
+
+	buf.WriteString(`<section><div class="label">Initializing</div><table><tbody>`)
+	now := time.Now()
+	for i := range stages {
+		s := &stages[i]
+		end := s.finished
+		if end.IsZero() {
+			end = now
+		}
+		dur := end.Sub(s.started).Round(100 * time.Millisecond)
+		dot := "dot-warn"
+		switch {
+		case s.err != "":
+			dot = "dot-bad"
+		case !s.finished.IsZero():
+			dot = "dot-ok"
+		default:
+			// running — leave dot-warn
+		}
+		//nolint:gosec // dot is a literal CSS class; label is HTML-escaped.
+		fmt.Fprintf(&buf, `<tr><td><span class="dot %s">&#9679;</span>%s</td>`, dot, html.EscapeString(s.label))
+		buf.WriteString(`<td class="rate">`)
+		switch {
+		case s.err != "":
+			//nolint:gosec // err is HTML-escaped before write.
+			fmt.Fprintf(&buf, `<span class="err-inline">%s</span>`, html.EscapeString(s.err))
+		case s.total > 0:
+			pct := math.Min(float64(s.current)/float64(s.total)*100, 100)
+			//nolint:gosec // fmtN emits only digits and commas; pct is a float.
+			fmt.Fprintf(&buf, `%s / %s (%.0f%%)`, fmtN(s.current), fmtN(s.total), pct)
+		case s.current > 0:
+			//nolint:gosec // fmtN emits only digits and commas.
+			fmt.Fprintf(&buf, `%s rows`, fmtN(s.current))
+		default:
+			// no progress signal — render the duration only
+		}
+		//nolint:gosec // dur formats as a Go duration literal (digits + units).
+		fmt.Fprintf(&buf, `</td><td>%s</td></tr>`, dur)
+	}
+	buf.WriteString(`</tbody></table></section>`)
+	buf.WriteString(`</body></html>`)
+	_, _ = w.Write([]byte(buf.String())) //nolint:errcheck // best-effort HTTP response
+}
+
 func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //nolint:maintidx,revive // dashboard handler has many query parameters
 	wd.cfgMu.RLock()
 	progress := wd.progress
@@ -281,6 +445,11 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	startAnalyzed := wd.startAnalyzed
 	_ = wd.maxAnalyzed // reserved for future use
 	wd.cfgMu.RUnlock()
+
+	if progress == nil {
+		wd.renderStartup(w)
+		return
+	}
 
 	var workers []namedWorkerStats
 	if tracker != nil {
@@ -319,18 +488,6 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 			defer cancel()
 			return db.CountRescanPending(qctx, tv, ra)
 		})
-	}
-
-	if progress == nil {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = fmt.Fprint(w, //nolint:errcheck // best-effort HTTP response
-			`<!DOCTYPE html><html lang="en"><head>`+
-				`<meta charset="utf-8"><meta http-equiv="refresh" content="2">`+
-				`<title>hopper</title><style>`+css+`</style></head><body>`+
-				`<div class="hdr"><div class="hdr-top"><span class="hdr-title">Hopper</span>`+
-				`<span class="hdr-time">starting&hellip;</span></div></div>`+
-				`</body></html>`)
-		return
 	}
 
 	elapsed := time.Since(start).Round(time.Second)

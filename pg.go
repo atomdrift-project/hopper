@@ -50,6 +50,9 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 		`CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent) WHERE parent != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_formula ON samples(formula) WHERE formula != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_elements ON samples(elements) WHERE elements != ''`,
+		// Drains itself as backfill completes: rows leave the index when elements
+		// is populated. Without it, each batch's gating SELECT seq-scans the heap.
+		`CREATE INDEX IF NOT EXISTS idx_samples_backfill_pending ON samples(sha256) WHERE cleave_result IS NOT NULL AND elements = ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_score ON samples(score) WHERE score != 0`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS mtime TIMESTAMPTZ`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS marker_mtime TIMESTAMPTZ`,
@@ -1170,7 +1173,7 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 	// self-reference via FROM trips the generated-column check even though
 	// file_type is not in the SET list. Inlining the JSON extraction on the
 	// target row sidesteps that.
-	const backfillBatch = 5000
+	const backfillBatch = 50000
 	for {
 		cleaveTag, err := db.pool.Exec(ctx, `
 			UPDATE samples SET
@@ -1201,6 +1204,7 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 		}
 		n := cleaveTag.RowsAffected()
 		stats.Updated += n
+		db.reportBackfill(stats.Updated, stats.Scanned)
 		if n < backfillBatch {
 			break
 		}

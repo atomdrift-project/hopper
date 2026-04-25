@@ -72,6 +72,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 			`ALTER TABLE samples ADD COLUMN score INTEGER NOT NULL DEFAULT 0`,
 			`CREATE INDEX IF NOT EXISTS idx_samples_formula ON samples(formula) WHERE formula != ''`,
 			`CREATE INDEX IF NOT EXISTS idx_samples_elements ON samples(elements) WHERE elements != ''`,
+			// Drains itself as backfill completes: rows leave the index when elements
+			// is populated. Without it, each batch's gating SELECT seq-scans the heap.
+			`CREATE INDEX IF NOT EXISTS idx_samples_backfill_pending ON samples(sha256) WHERE cleave_result IS NOT NULL AND elements = ''`,
 			`CREATE INDEX IF NOT EXISTS idx_samples_score ON samples(score) WHERE score != 0`,
 			`CREATE INDEX IF NOT EXISTS idx_samples_feed_source ON samples(source, label, analyzed_at DESC) WHERE cleave_result IS NOT NULL`,
 			`CREATE INDEX IF NOT EXISTS idx_samples_feed ON samples(feed) WHERE feed != ''`,
@@ -1237,7 +1240,7 @@ func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 	// gated on elements = '' (the remaining non-generated signal that a
 	// row hasn't been backfilled yet).
 	elementsExpr := fmt.Sprintf(stripSubscriptsSQL, "COALESCE(j.f, '')")
-	const backfillBatch = 5000
+	const backfillBatch = 50000
 	for {
 		//nolint:gosec // constant SQL fragments, no tainted input.
 		cleaveSQL := `
@@ -1276,6 +1279,7 @@ func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 			return stats, fmt.Errorf("hopper: backfill rows affected: %w", err)
 		}
 		stats.Updated += n
+		db.reportBackfill(stats.Updated, stats.Scanned)
 		if n < backfillBatch {
 			break
 		}

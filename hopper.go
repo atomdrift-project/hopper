@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -103,8 +104,30 @@ var ErrNotFound = errors.New("hopper: not found")
 // DB is a connection to the sample registry.
 // Backed by either PostgreSQL (pool) or SQLite (lite).
 type DB struct {
-	pool *pgxpool.Pool
-	lite *sql.DB
+	pool             *pgxpool.Pool
+	lite             *sql.DB
+	backfillProgress atomic.Pointer[BackfillProgressFn]
+}
+
+// BackfillProgressFn reports per-batch progress during Backfill. current is
+// rows updated so far; total is the upfront candidate count (0 if unknown).
+type BackfillProgressFn func(current, total int64)
+
+// SetBackfillProgress installs an optional callback invoked after each
+// backfill batch completes. Pass nil to clear. Safe to call concurrently
+// with Backfill, but typically set once before Migrate / Backfill runs.
+func (db *DB) SetBackfillProgress(fn BackfillProgressFn) {
+	if fn == nil {
+		db.backfillProgress.Store(nil)
+		return
+	}
+	db.backfillProgress.Store(&fn)
+}
+
+func (db *DB) reportBackfill(current, total int64) {
+	if p := db.backfillProgress.Load(); p != nil {
+		(*p)(current, total)
+	}
 }
 
 // Sample is a binary in the registry.

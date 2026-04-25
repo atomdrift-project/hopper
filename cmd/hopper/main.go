@@ -669,6 +669,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 			slog.Info("web dashboard + API listening", "addr", *dashAddr)
 		}
 	}
+	wd.beginStage("discover", "Discovering label directories")
 
 	// Discover label directories under --data.
 	// Convention: bad/ → label "bad", good/ → label "good", unknown/ → label "unknown".
@@ -684,20 +685,26 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		}
 	}
 	if len(loadDirs) == 0 {
+		wd.failStage("discover", fmt.Sprintf("no bad/, good/, or unknown/ in %s", *dataDir))
 		return fmt.Errorf("no bad/, good/, or unknown/ subdirectories found in %s", *dataDir)
 	}
+	wd.endStage("discover")
 
 	// Rebuild tools first so we can bail early if litmus or cleave is broken.
 	// Both builds run in parallel; once done we update litmus rules and check
 	// the traits version — all before touching the database.
+	wd.beginStage("build.litmus", "Building litmus")
+	wd.beginStage("build.cleave", "Building cleave")
 	litmusBuildCh := make(chan struct{}, 1)
 	cleaveBuildCh := make(chan struct{}, 1)
 	go func() {
 		updateSiblingTool(ctx, "litmus", "../litmus")
+		wd.endStage("build.litmus")
 		litmusBuildCh <- struct{}{}
 	}()
 	go func() {
 		updateSiblingTool(ctx, "cleave", "../cleave")
+		wd.endStage("build.cleave")
 		cleaveBuildCh <- struct{}{}
 	}()
 	<-litmusBuildCh
@@ -706,8 +713,10 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// With a freshly built binary, pull latest rules and check the version.
 	var traitsVersion string
 	if *litmusBin != "" {
+		wd.beginStage("litmus.rules", "Refreshing litmus rules")
 		refreshLitmusRules(ctx, *litmusBin)
 		traitsVersion = litmusTraitsVersion(ctx, *litmusBin)
+		wd.endStage("litmus.rules")
 		if traitsVersion != "" {
 			slog.Info("traits version for rescan", "version", traitsVersion)
 		}
@@ -738,8 +747,15 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		})
 		litmus.tracker = tracker
 		litmus.workerName = "local"
+		wd.beginStage("litmus.start", "Starting litmus worker")
 		go func() {
-			litmusCh <- litmusResult{err: litmus.Start(ctx)}
+			err := litmus.Start(ctx)
+			if err != nil {
+				wd.failStage("litmus.start", err.Error())
+			} else {
+				wd.endStage("litmus.start")
+			}
+			litmusCh <- litmusResult{err: err}
 		}()
 	} else {
 		litmusCh <- litmusResult{} // nothing to wait for
@@ -777,7 +793,13 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 			cacheCh <- cacheResult{}
 			return
 		}
+		wd.beginStage("cache.load", "Loading hash cache")
 		c, err := openHashCache(ctx, hashCachePath())
+		if err != nil {
+			wd.failStage("cache.load", err.Error())
+		} else {
+			wd.endStage("cache.load")
+		}
 		cacheCh <- cacheResult{cache: c, err: err}
 	}()
 
@@ -787,17 +809,28 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	}
 	dbCh := make(chan dbResult, 1)
 	go func() {
+		wd.beginStage("db.connect", "Connecting to database")
 		d, err := openDB(ctx, *dsn)
 		if err != nil {
+			wd.failStage("db.connect", err.Error())
 			dbCh <- dbResult{err: err}
 			return
 		}
+		wd.endStage("db.connect")
+		// Backfill can dominate startup on large tables. Feed its per-batch
+		// counter into the same stage so the row shows "1.2M / 2.5M (49%)".
+		wd.beginStage("db.migrate", "Migrating database")
+		d.SetBackfillProgress(func(current, total int64) {
+			wd.updateStage("db.migrate", current, total)
+		})
 		slog.Info("running schema migrations")
 		if err := d.Migrate(ctx); err != nil {
+			wd.failStage("db.migrate", err.Error())
 			d.Close()
 			dbCh <- dbResult{err: err}
 			return
 		}
+		wd.endStage("db.migrate")
 		dbCh <- dbResult{db: d}
 	}()
 
@@ -826,11 +859,14 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	defer db.Close()
 	slog.Info("database ready")
 
+	wd.beginStage("db.relativize", "Relativizing sample paths")
 	if n, err := db.RelativizePaths(ctx, *dataDir); err != nil {
+		wd.failStage("db.relativize", err.Error())
 		return err
 	} else if n > 0 {
 		slog.Info("relativized stored sample paths", "samples", n)
 	}
+	wd.endStage("db.relativize")
 
 	forcePrefixes, err := normalizeForceRescanDirs(*dataDir, forceRescanDirs)
 	if err != nil {
@@ -842,11 +878,16 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	}
 
 	// Clear stale claims from previous runs so those samples get re-queued.
+	wd.beginStage("db.unclaim", "Clearing stale worker claims")
 	slog.Info("clearing stale claims")
 	if n, err := db.UnclaimAll(ctx); err != nil {
+		wd.failStage("db.unclaim", err.Error())
 		slog.Warn("failed to clear stale claims", "error", err)
-	} else if n > 0 {
-		slog.Info("cleared stale claims from previous run", "count", n)
+	} else {
+		wd.endStage("db.unclaim")
+		if n > 0 {
+			slog.Info("cleared stale claims from previous run", "count", n)
+		}
 	}
 
 	slog.Info("waiting for litmus")
