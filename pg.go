@@ -1161,36 +1161,41 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 
 	// Pass 1: elements / max_crit / suspicious_count from cleave_result,
 	// in batches. formula / score / file_type / litmus_score are generated
-	// columns — don't touch them. JSON_TABLE filters to the depth-0 entry.
+	// columns — don't touch them.
+	//
+	// Implementation note: earlier versions used UPDATE samples s ... FROM
+	// (SELECT ... FROM samples s2 JOIN batch ...) with JSON_TABLE. PG rejects
+	// that shape with "column file_type can only be updated to DEFAULT"
+	// (SQLSTATE 428C9) when samples has STORED GENERATED columns — the
+	// self-reference via FROM trips the generated-column check even though
+	// file_type is not in the SET list. Inlining the JSON extraction on the
+	// target row sidesteps that.
 	const backfillBatch = 5000
 	for {
 		cleaveTag, err := db.pool.Exec(ctx, `
-			WITH batch AS (
+			UPDATE samples SET
+				elements = translate(
+					COALESCE(cleave_result->'fs'->0->>'f', ''),
+					'₀₁₂₃₄₅₆₇₈₉', ''),
+				max_crit = COALESCE((
+					SELECT MAX((tr->>'l')::int)
+					FROM jsonb_array_elements(
+						COALESCE(cleave_result->'fs'->0->'ts', '[]'::jsonb)
+					) AS tr
+				), 0),
+				suspicious_count = (
+					SELECT COUNT(*)::int
+					FROM jsonb_array_elements(
+						COALESCE(cleave_result->'fs'->0->'ts', '[]'::jsonb)
+					) AS tr
+					WHERE (tr->>'l')::int >= 4
+				),
+				updated_at = now()
+			WHERE sha256 IN (
 				SELECT sha256 FROM samples
 				WHERE cleave_result IS NOT NULL AND elements = ''
 				LIMIT $1
-			)
-			UPDATE samples s SET
-				elements = translate(COALESCE(j.f, ''), '₀₁₂₃₄₅₆₇₈₉', ''),
-				max_crit = COALESCE(j.mc, 0),
-				suspicious_count = COALESCE(j.sc, 0),
-				updated_at = now()
-			FROM (
-				SELECT s2.sha256, jt.f,
-					(SELECT COALESCE(MAX((tr->>'l')::int), 0)
-					 FROM jsonb_array_elements(COALESCE(jt.ts, '[]'::jsonb)) AS tr) AS mc,
-					(SELECT COUNT(*)
-					 FROM jsonb_array_elements(COALESCE(jt.ts, '[]'::jsonb)) AS tr
-					 WHERE (tr->>'l')::int >= 4) AS sc
-				FROM samples s2
-				JOIN batch b ON b.sha256 = s2.sha256,
-					JSON_TABLE(s2.cleave_result, '$.fs[*] ? (@.dp == 0)' COLUMNS (
-						f TEXT PATH '$.f',
-						ts JSONB PATH '$.ts'
-					)) AS jt
-			) AS j
-			WHERE s.sha256 = j.sha256
-				AND s.elements = ''`, backfillBatch)
+			)`, backfillBatch)
 		if err != nil {
 			return stats, fmt.Errorf("hopper: backfill cleave columns: %w", err)
 		}

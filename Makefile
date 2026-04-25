@@ -1,4 +1,10 @@
-.PHONY: build test clean rollout-bastille replica diagnose-replica promote-replica help
+.PHONY: build test clean deploy rollout-bastille replica diagnose-replica promote-replica help
+
+DATA_DIR  ?= /data/samples
+DB        ?= postgres://hopper@localhost/hopper?sslmode=disable
+SOURCE    ?= harvest
+DASH_ADDR ?= 0.0.0.0:8081
+WORKERS   ?= 0
 
 help:
 	@echo "Available targets:"
@@ -6,6 +12,8 @@ help:
 	@echo "  make test                   Run tests"
 	@echo "  make lint                   Run linters"
 	@echo "  make clean                  Clean build artifacts"
+	@echo "  make deploy                 Install as a hardened systemd service on this Linux host"
+	@echo "                              (DATA_DIR=$(DATA_DIR) DB=... SOURCE=$(SOURCE) DASH_ADDR=$(DASH_ADDR) WORKERS=$(WORKERS))"
 	@echo "  make rollout-bastille       Deploy to Bastille jails (BUILD=build RUN=hopper [DB_ONLY=1])"
 	@echo "  make replica                Configure local postgres as a logical replica of the"
 	@echo "                              upstream hopper DB (idempotent; reads ~/.pgpass)"
@@ -21,6 +29,11 @@ test:
 
 BUILD ?= build
 RUN ?= hopper
+
+deploy:
+	DATA_DIR='$(DATA_DIR)' DB='$(DB)' SOURCE='$(SOURCE)' \
+	DASH_ADDR='$(DASH_ADDR)' WORKERS='$(WORKERS)' \
+	./scripts/deploy.sh
 
 rollout-bastille:
 	@if [ -n "$(DB_ONLY)" ]; then \
