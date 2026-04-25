@@ -42,7 +42,7 @@ func pragmaHasColumn(ctx context.Context, db *sql.DB, column string) int {
 	return count
 }
 
-func (db *DB) migrateSQLite(ctx context.Context) error {
+func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maintidx // sequential migration steps; splitting reduces clarity
 	slog.Debug("executing initial schema ddl")
 	if _, err := db.lite.ExecContext(ctx, schemaSQLite); err != nil {
 		return fmt.Errorf("hopper: migrate sqlite: %w", err)
@@ -391,7 +391,7 @@ func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 // or nil (→ SQL NULL) when empty. SQLite's driver treats []byte as a blob;
 // go-sqlite3 stores "" as an empty blob too, which round-trips oddly for
 // JSON columns. Explicit NULL when we have no value keeps the column
-// consistent with "unanalyzed."
+// consistent with the "unanalyzed" sentinel state.
 func jsonTextOrNil(b []byte) any {
 	if len(b) == 0 {
 		return nil
@@ -1418,9 +1418,11 @@ func (db *DB) applyCleanupSQLite(ctx context.Context, stage CleanupStage) (int64
 	}
 	defer tx.Rollback() //nolint:errcheck // commit or rollback
 	if _, err := tx.ExecContext(ctx,
+		//nolint:gosec // stage.predicate is an internal constant from CleanupStages, not user input.
 		"DELETE FROM reports WHERE sha256 IN (SELECT sha256 FROM samples WHERE "+stage.predicate+")"); err != nil {
 		return 0, fmt.Errorf("hopper: cleanup %s reports: %w", stage.Name, err)
 	}
+	//nolint:gosec // stage.predicate is an internal constant from CleanupStages, not user input.
 	res, err := tx.ExecContext(ctx, "DELETE FROM samples WHERE "+stage.predicate)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: cleanup %s samples: %w", stage.Name, err)

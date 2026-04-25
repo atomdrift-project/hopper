@@ -30,7 +30,7 @@ func openPG(ctx context.Context, dsn string) (*DB, error) {
 	return &DB{pool: pool}, nil
 }
 
-func (db *DB) migratePG(ctx context.Context) error {
+func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long sequential migration list; splitting reduces clarity
 	slog.Info("executing initial schema ddl")
 	if _, err := db.pool.Exec(ctx, schemaPG); err != nil {
 		return fmt.Errorf("hopper: migrate: %w", err)

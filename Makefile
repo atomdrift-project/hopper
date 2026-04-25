@@ -1,7 +1,7 @@
 .PHONY: build test clean deploy rollout-bastille replica diagnose-replica promote-replica help
 
 DATA_DIR  ?= /data/samples
-DB        ?= postgres://hopper@localhost/hopper?sslmode=disable
+DB        ?= postgres://hopper@hopper/hopper?sslmode=disable
 SOURCE    ?= harvest
 DASH_ADDR ?= 0.0.0.0:8081
 WORKERS   ?= 0

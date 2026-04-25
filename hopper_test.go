@@ -1244,7 +1244,7 @@ func TestExplodeArchiveMembersCleaveFormat(t *testing.T) {
 
 // TestExplodeDoesNotClobberWalkerPath is the regression guard for the
 // content-collision orphan class: when a sha has been inserted by the
-// walker (top-level, parent='') and the same sha then appears inside an
+// walker (top-level, parent=”) and the same sha then appears inside an
 // archive via ExplodeArchiveMembers, the archive-member upsert must NOT
 // overwrite samples.path with the virtual "<archive>!<member>" form —
 // that would leave the samples row pointing at a non-existent disk path,
@@ -1410,27 +1410,36 @@ func TestInsertSampleBatchPersistsResults(t *testing.T) {
 	batch := []*Sample{
 		{SHA256: "bloc1", Source: "test", Path: "x/1", CleaveResult: cleave, LitmusResult: litmus},
 		{SHA256: "bloc2", Source: "test", Path: "x/2", CleaveResult: cleave}, // no litmus
-		{SHA256: "bloc3", Source: "test", Path: "x/3"},                        // neither
+		{SHA256: "bloc3", Source: "test", Path: "x/3"},                       // neither
 	}
 	if _, _, err := db.InsertSampleBatch(ctx, batch); err != nil {
 		t.Fatal(err)
 	}
 
-	got1, _ := db.SampleBySHA256(ctx, "bloc1")
+	got1, err := db.SampleBySHA256(ctx, "bloc1")
+	if err != nil {
+		t.Fatalf("SampleBySHA256(bloc1): %v", err)
+	}
 	if !bytes.Equal(got1.CleaveResult, cleave) {
 		t.Errorf("bloc1 cleave_result = %q, want %q", got1.CleaveResult, cleave)
 	}
 	if !bytes.Equal(got1.LitmusResult, litmus) {
 		t.Errorf("bloc1 litmus_result = %q, want %q", got1.LitmusResult, litmus)
 	}
-	got2, _ := db.SampleBySHA256(ctx, "bloc2")
+	got2, err := db.SampleBySHA256(ctx, "bloc2")
+	if err != nil {
+		t.Fatalf("SampleBySHA256(bloc2): %v", err)
+	}
 	if !bytes.Equal(got2.CleaveResult, cleave) {
 		t.Errorf("bloc2 cleave_result = %q, want %q", got2.CleaveResult, cleave)
 	}
 	if len(got2.LitmusResult) != 0 {
 		t.Errorf("bloc2 litmus_result = %q, want empty (nothing was supplied)", got2.LitmusResult)
 	}
-	got3, _ := db.SampleBySHA256(ctx, "bloc3")
+	got3, err := db.SampleBySHA256(ctx, "bloc3")
+	if err != nil {
+		t.Fatalf("SampleBySHA256(bloc3): %v", err)
+	}
 	if len(got3.CleaveResult) != 0 {
 		t.Errorf("bloc3 cleave_result = %q, want empty", got3.CleaveResult)
 	}

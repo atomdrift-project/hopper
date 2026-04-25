@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"codeberg.org/atomdrift/hopper"
@@ -89,12 +90,16 @@ func sanitizeLogString(s string) string {
 	}, s)
 }
 
-func killProcess(reason string, proc *os.Process, attrs ...any) {
-	if proc == nil {
+// killGroup sends sig to the process group led by pid. Litmus is started
+// with Setpgid so its rizin/yara children share the group; signaling the
+// group guarantees we don't leak descendants when tearing the worker down.
+// ESRCH (group already gone) is treated as success.
+func killGroup(reason string, pid int, sig syscall.Signal, attrs ...any) {
+	if pid <= 0 {
 		return
 	}
-	if err := proc.Kill(); err != nil {
-		slog.Warn(reason, append(attrs, "error", err)...)
+	if err := syscall.Kill(-pid, sig); err != nil && !errors.Is(err, syscall.ESRCH) {
+		slog.Warn(reason, append(attrs, "pid", pid, "signal", sig.String(), "error", err)...)
 	}
 }
 
@@ -167,6 +172,10 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 	}
 
 	cmd := exec.CommandContext(ctx, s.bin, args...) //nolint:gosec // bin path is from trusted CLI flag
+	// Run litmus as the leader of its own process group so we can signal the
+	// whole tree (rizin/yara children spawned by the worker) at once. Killing
+	// only the parent leaves orphaned descendants behind.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	logDir := xdgLogDir()
 	if err := os.MkdirAll(logDir, 0o750); err != nil {
@@ -214,13 +223,83 @@ func (s *litmusServer) Stop() {
 	defer s.mu.Unlock()
 	if s.cmd != nil && s.cmd.Process != nil {
 		slog.Info("stopping litmus server", "pid", s.cmd.Process.Pid, "url", s.hopperURL)
-		killProcess("failed to kill litmus server during stop", s.cmd.Process, "pid", s.cmd.Process.Pid)
+		killGroup("failed to kill litmus group during stop", s.cmd.Process.Pid, syscall.SIGKILL, "url", s.hopperURL)
 		if err := s.cmd.Wait(); err != nil {
 			slog.Debug("litmus exited during stop", "pid", s.cmd.Process.Pid, "error", err)
 		}
 		s.cmd = nil
 		s.pid.Store(0)
 		slog.Info("litmus server stopped")
+	}
+}
+
+// rotateSIGTERMGrace is how long we wait after SIGTERM for the worker to
+// exit on its own before escalating to SIGKILL during a controlled rotation.
+const rotateSIGTERMGrace = 30 * time.Second
+
+// RotateForRulesUpdate pulls fresh rule and model bundles via
+// `litmus update-rules` (which validates the new bundle and rolls back on
+// load failure), then graceful-restarts the worker so it serves from the
+// new rules.
+//
+// Coordinated with Monitor via s.building so the controlled kill is not
+// counted as a crash. The kill targets the entire process group, so any
+// rizin/yara children spawned by the worker are torn down too.
+func (s *litmusServer) RotateForRulesUpdate(ctx context.Context) {
+	if s.stopped.Load() || ctx.Err() != nil {
+		return
+	}
+	s.building.Store(true)
+	defer s.building.Store(false)
+
+	refreshLitmusRules(ctx, s.bin)
+	if ctx.Err() != nil || s.stopped.Load() {
+		return
+	}
+
+	pid := s.currentPID()
+	if pid > 0 {
+		slog.Info("rotator: stopping worker for rules rotation", "pid", pid)
+		killGroup("rotator: SIGTERM failed", pid, syscall.SIGTERM, "worker", s.workerName)
+		if !s.awaitExit(ctx, rotateSIGTERMGrace) {
+			slog.Warn("rotator: worker did not exit on SIGTERM, sending SIGKILL",
+				"pid", pid, "grace", rotateSIGTERMGrace)
+			killGroup("rotator: SIGKILL failed", pid, syscall.SIGKILL, "worker", s.workerName)
+			if !s.awaitExit(ctx, rotateSIGTERMGrace) {
+				slog.Error("rotator: worker still alive after SIGKILL grace; aborting rotation",
+					"pid", pid)
+				return
+			}
+		}
+	}
+
+	s.mu.Lock()
+	err := s.startLocked(ctx)
+	s.mu.Unlock()
+	if err != nil {
+		slog.Error("rotator: failed to restart worker after rules update", "error", err)
+		return
+	}
+	slog.Info("rotator: worker restarted with fresh rules", "pid", s.currentPID())
+}
+
+// awaitExit polls until the worker pid is cleared (meaning Monitor's waitExit
+// has reaped the process) or the grace period elapses. Returns true if the
+// worker has exited within the grace.
+func (s *litmusServer) awaitExit(ctx context.Context, grace time.Duration) bool {
+	deadline := time.Now().Add(grace)
+	for {
+		if s.currentPID() == 0 {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		select {
+		case <-time.After(200 * time.Millisecond):
+		case <-ctx.Done():
+			return false
+		}
 	}
 }
 
@@ -363,7 +442,8 @@ func (s *litmusServer) livenessWatchdog(ctx context.Context) {
 			"pid", pid)
 		s.mu.Lock()
 		if s.cmd != nil && s.cmd.Process != nil {
-			_ = s.cmd.Process.Kill() //nolint:errcheck // best-effort; Monitor will handle the exit
+			killGroup("failed to kill wedged litmus group", s.cmd.Process.Pid, syscall.SIGKILL,
+				"worker", s.workerName)
 		}
 		s.mu.Unlock()
 	}

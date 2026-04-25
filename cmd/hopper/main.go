@@ -177,12 +177,6 @@ func closeFileBestEffort(name string, f *os.File) {
 	}
 }
 
-func mkdirAllBestEffort(path string, perm os.FileMode) {
-	if err := os.MkdirAll(path, perm); err != nil {
-		slog.Warn("mkdir failed", "path", path, "error", err)
-	}
-}
-
 func killProcessBestEffort(reason string, proc *os.Process) {
 	if proc == nil {
 		return
@@ -608,7 +602,7 @@ func cmdReset(ctx context.Context) error {
 	return nil
 }
 
-func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx // complex command setup function.
+func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,gocognit // complex command setup function.
 	f := flag.NewFlagSet("load", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
 	dataDir := f.String("data", "", "data directory containing bad/, good/, unknown/ subdirectories")
@@ -865,6 +859,22 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx //
 		go func() {
 			if err := litmus.Monitor(ctx); err != nil {
 				slog.Error("litmus monitor failed", "error", err)
+			}
+		}()
+		// Periodically pull fresh litmus rules and restart the worker so it
+		// picks them up. `litmus update-rules` validates the new bundle and
+		// rolls back on load failure, so a broken upstream commit never
+		// reaches the worker.
+		go func() {
+			ticker := time.NewTicker(2 * time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					litmus.RotateForRulesUpdate(ctx)
+				case <-ctx.Done():
+					return
+				}
 			}
 		}()
 	}
@@ -2045,7 +2055,10 @@ func cmdCleanup(ctx context.Context) error {
 
 		if !*yes {
 			writeStdoutf("  delete %d rows? [y/N] ", n)
-			ans, _ := reader.ReadString('\n')
+			ans, err := reader.ReadString('\n')
+			if err != nil && !errors.Is(err, io.EOF) {
+				return fmt.Errorf("read confirmation: %w", err)
+			}
 			switch strings.TrimSpace(strings.ToLower(ans)) {
 			case "y", "yes":
 			default:

@@ -258,10 +258,13 @@ func (c *hashCache) close(ctx context.Context) {
 	}
 }
 
-// fileStat returns the device and inode numbers from an os.FileInfo via Stat_t.
+// fileStat returns the device and inode numbers from an os.FileInfo via
+// Stat_t. The device value is normalized to uint64 by statDev (defined in
+// platform-specific files) because Stat_t.Dev is uint64 on Linux but int32
+// on darwin.
 func fileStat(info os.FileInfo) (dev, inode uint64) {
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		return st.Dev, st.Ino
+		return statDev(st), st.Ino
 	}
 	return 0, 0
 }

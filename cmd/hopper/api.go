@@ -462,41 +462,9 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 			samplePath = sample.Path
 		}
 
-		if strings.Contains(req.Error, "Unsupported file type") ||
-			strings.Contains(req.Error, "Path does not exist") ||
-			strings.Contains(req.Error, "Failed to decrypt") ||
-			strings.Contains(req.Error, "Password required") ||
-			strings.Contains(req.Error, "Password for encrypted archive") ||
-			strings.Contains(req.Error, "invalid Zip archive") ||
-			strings.Contains(req.Error, "invalid gzip header") ||
-			strings.Contains(req.Error, "no local path") ||
-			strings.Contains(req.Error, "analysis timed out") ||
-			strings.Contains(req.Error, "bad magic") ||
-			strings.Contains(req.Error, "File CRC error") ||
-			strings.Contains(req.Error, "unexpected NUL byte") ||
-			strings.Contains(req.Error, "Failed to read tar entry") ||
-			strings.Contains(req.Error, "Failed to parse package.json") ||
-			strings.Contains(req.Error, "Invalid timestamp field") ||
-			strings.Contains(req.Error, "multi-disk") {
-			// Unsupported file type, missing file, etc. — mark so it's
-			// never queued again, but preserve the record.
-			skip := "unsupported"
-			if strings.Contains(req.Error, "Path does not exist") ||
-				strings.Contains(req.Error, "no local path") {
-				skip = "missing"
-			} else if strings.Contains(req.Error, "analysis timed out") {
-				skip = "timeout"
-			} else if strings.Contains(req.Error, "Password") ||
-				strings.Contains(req.Error, "Failed to decrypt") {
-				skip = "encrypted"
-			} else if strings.Contains(req.Error, "CRC error") ||
-				strings.Contains(req.Error, "invalid gzip header") ||
-				strings.Contains(req.Error, "bad magic") ||
-				strings.Contains(req.Error, "NUL byte") ||
-				strings.Contains(req.Error, "checksum mismatch") ||
-				strings.Contains(req.Error, "Invalid timestamp") {
-				skip = "corrupt"
-			}
+		if skip, permanent := classifyResultError(req.Error); permanent {
+			// Permanent failure (unsupported file type, missing file, etc.) —
+			// mark so it's never queued again, but preserve the record.
 			if err := s.db.SetSkip(ctx, req.SHA256, skip); err != nil {
 				slog.Error("mark permanent failure failed", "sha256", req.SHA256, "error", err)
 			} else {
@@ -590,13 +558,47 @@ func validSHA256(s string) bool {
 	if len(s) != 64 {
 		return false
 	}
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}
 	return true
+}
+
+// classifyResultError categorizes a worker-reported analysis error. If the
+// error matches a known permanent failure mode (unsupported format, missing
+// file, encrypted archive, etc.) it returns the skip-reason string and true.
+// Unknown errors are treated as transient and the caller re-queues the job.
+//
+// Order matters: more-specific cases come first so e.g. "Path does not
+// exist" classifies as "missing" rather than "unsupported".
+func classifyResultError(errMsg string) (string, bool) {
+	switch {
+	case strings.Contains(errMsg, "Path does not exist"),
+		strings.Contains(errMsg, "no local path"):
+		return "missing", true
+	case strings.Contains(errMsg, "analysis timed out"):
+		return "timeout", true
+	case strings.Contains(errMsg, "Password"),
+		strings.Contains(errMsg, "Failed to decrypt"):
+		return "encrypted", true
+	case strings.Contains(errMsg, "CRC error"),
+		strings.Contains(errMsg, "invalid gzip header"),
+		strings.Contains(errMsg, "bad magic"),
+		strings.Contains(errMsg, "NUL byte"),
+		strings.Contains(errMsg, "checksum mismatch"),
+		strings.Contains(errMsg, "Invalid timestamp"):
+		return "corrupt", true
+	case strings.Contains(errMsg, "Unsupported file type"),
+		strings.Contains(errMsg, "invalid Zip archive"),
+		strings.Contains(errMsg, "Failed to read tar entry"),
+		strings.Contains(errMsg, "Failed to parse package.json"),
+		strings.Contains(errMsg, "multi-disk"):
+		return "unsupported", true
+	}
+	return "", false
 }
 
 // handleFile serves file content for remote workers.

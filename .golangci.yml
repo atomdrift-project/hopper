@@ -183,7 +183,7 @@ linters:
         - name: nested-structs
           disabled: true
         - name: max-public-structs
-          arguments: [10]
+          arguments: [15]
         - name: flag-parameter # fixes are difficult
           disabled: true
         - name: bare-return
