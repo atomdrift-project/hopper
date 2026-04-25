@@ -1230,23 +1230,34 @@ func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 	var stats BackfillStats
 	ts := now()
 
+	// Candidate rows: have cleave_result, elements still empty, AND the JSON
+	// would actually produce a non-empty elements value. Without the EXISTS
+	// clause, rows whose cleave_result has no fs entry with dp=0 (or whose
+	// dp=0 entry has empty 'f') match the gate, get UPDATEd to elements='' as
+	// a no-op, and re-match next batch — inflating RowsAffected and risking
+	// an infinite loop on databases with >= backfillBatch such rows.
+	const candidateWhere = `cleave_result IS NOT NULL
+		AND elements = ''
+		AND EXISTS (
+			SELECT 1 FROM json_each(cleave_result, '$.fs') je
+			WHERE json_extract(je.value, '$.dp') = 0
+				AND COALESCE(json_extract(je.value, '$.f'), '') != ''
+		)`
 	if err := db.lite.QueryRowContext(ctx, `
-		SELECT count(*) FROM samples
-		WHERE cleave_result IS NOT NULL AND elements = ''`).Scan(&stats.Scanned); err != nil {
+		SELECT count(*) FROM samples WHERE `+candidateWhere).Scan(&stats.Scanned); err != nil {
 		return stats, fmt.Errorf("hopper: backfill count: %w", err)
 	}
+	// Surface the total to any progress observer before the first batch runs.
+	db.reportBackfill(0, stats.Scanned)
 
-	// Pass 1: elements / max_crit / suspicious_count from cleave_result,
-	// gated on elements = '' (the remaining non-generated signal that a
-	// row hasn't been backfilled yet).
+	// Pass 1: elements / max_crit / suspicious_count from cleave_result.
 	elementsExpr := fmt.Sprintf(stripSubscriptsSQL, "COALESCE(j.f, '')")
 	const backfillBatch = 50000
 	for {
 		//nolint:gosec // constant SQL fragments, no tainted input.
 		cleaveSQL := `
 			WITH batch AS (
-				SELECT sha256 FROM samples
-				WHERE cleave_result IS NOT NULL AND elements = ''
+				SELECT sha256 FROM samples WHERE ` + candidateWhere + `
 				LIMIT ?
 			),
 			cleave_extract AS (

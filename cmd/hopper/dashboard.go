@@ -418,13 +418,15 @@ func (wd *webDashboard) renderStartup(w http.ResponseWriter) {
 		case s.err != "":
 			//nolint:gosec // err is HTML-escaped before write.
 			fmt.Fprintf(&buf, `<span class="err-inline">%s</span>`, html.EscapeString(s.err))
-		case s.total > 0:
-			pct := math.Min(float64(s.current)/float64(s.total)*100, 100)
+		case s.total > 0 && s.current <= s.total:
+			pct := float64(s.current) / float64(s.total) * 100
 			//nolint:gosec // fmtN emits only digits and commas; pct is a float.
 			fmt.Fprintf(&buf, `%s / %s (%.0f%%)`, fmtN(s.current), fmtN(s.total), pct)
 		case s.current > 0:
+			// Either no upfront total, or current overshot it — show raw count
+			// rather than a misleading > 100% ratio.
 			//nolint:gosec // fmtN emits only digits and commas.
-			fmt.Fprintf(&buf, `%s rows`, fmtN(s.current))
+			fmt.Fprintf(&buf, `%s processed`, fmtN(s.current))
 		default:
 			// no progress signal — render the duration only
 		}

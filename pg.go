@@ -1152,15 +1152,23 @@ func (db *DB) recomputeCanonicalSHA256PG(ctx context.Context) (int64, error) {
 func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 	var stats BackfillStats
 
-	// Candidate rows: have cleave_result but elements wasn't derived yet.
-	// elements is the only analysis-derived non-generated column, so empty
-	// elements on a row with cleave_result is the reliable "needs backfill"
-	// signal now that file_type is computed.
+	// Candidate rows: have cleave_result but elements wasn't derived yet AND
+	// the JSON would actually produce a non-empty elements value. The third
+	// clause excludes "stuck" rows where cleave_result lacks an fs[0].f field —
+	// without it, those rows match the gate, get UPDATEd to elements='' (no-op),
+	// and re-match next batch, inflating RowsAffected and risking an infinite
+	// loop on databases with >= backfillBatch such rows.
+	const candidateWhere = `cleave_result IS NOT NULL
+		AND elements = ''
+		AND cleave_result->'fs'->0->>'f' > ''`
 	if err := db.pool.QueryRow(ctx, `
-		SELECT count(*) FROM samples
-		WHERE cleave_result IS NOT NULL AND elements = ''`).Scan(&stats.Scanned); err != nil {
+		SELECT count(*) FROM samples WHERE `+candidateWhere).Scan(&stats.Scanned); err != nil {
 		return stats, fmt.Errorf("hopper: backfill count: %w", err)
 	}
+	// Surface the total to any progress observer before the first batch runs,
+	// so the dashboard shows "0 / N" immediately instead of waiting ~10s for
+	// the first 50K-row UPDATE to complete.
+	db.reportBackfill(0, stats.Scanned)
 
 	// Pass 1: elements / max_crit / suspicious_count from cleave_result,
 	// in batches. formula / score / file_type / litmus_score are generated
@@ -1195,8 +1203,7 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 				),
 				updated_at = now()
 			WHERE sha256 IN (
-				SELECT sha256 FROM samples
-				WHERE cleave_result IS NOT NULL AND elements = ''
+				SELECT sha256 FROM samples WHERE `+candidateWhere+`
 				LIMIT $1
 			)`, backfillBatch)
 		if err != nil {
