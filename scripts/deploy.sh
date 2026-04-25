@@ -31,8 +31,16 @@ readonly BINARY=hopper
 readonly BIN_PATH=/usr/local/bin/${BINARY}
 readonly CONFIG_DIR=/etc/${SERVICE_NAME}
 readonly STATE_HOME=/var/lib/${SERVICE_NAME}
+readonly TOOLS_DIR=${STATE_HOME}/bin
 readonly CACHE_HOME=/var/cache/${SERVICE_NAME}
 readonly UNIT_FILE=/etc/systemd/system/${SERVICE_NAME}.service
+
+# Sibling repos that ship alongside hopper. `make deploy` builds both in
+# release mode and installs the resulting binaries into TOOLS_DIR.
+readonly LITMUS_SRC=../litmus
+readonly CLEAVE_SRC=../cleave
+readonly LITMUS_BIN=${TOOLS_DIR}/litmus
+readonly CLEAVE_BIN=${TOOLS_DIR}/cleave
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 log() { printf '==> %s\n' "$*"; }
@@ -49,15 +57,27 @@ command -v sudo      >/dev/null || die "sudo required"
 [[ -d ${DATA_DIR} ]]             || die "DATA_DIR does not exist: ${DATA_DIR}"
 sudo -v                          || die "sudo authentication failed"
 
-# litmus is invoked as a child; warn (don't fail) if missing — admins may
-# install it after the first deploy.
-command -v litmus >/dev/null || log "warning: 'litmus' not found on PATH — hopper load will skip analysis until it is installed"
+# litmus and cleave are checked out alongside hopper and built in release
+# mode during deploy. Their Makefiles drop the binary into ./out/<name>;
+# we install those artifacts into TOOLS_DIR so the service has a single,
+# hopper-owned location to exec from.
+[[ -d ${LITMUS_SRC}/.git ]] || die "litmus source not found at ${LITMUS_SRC}; check out codeberg.org/atomdrift/litmus there"
+[[ -d ${CLEAVE_SRC}/.git ]] || die "cleave source not found at ${CLEAVE_SRC}; check out codeberg.org/atomdrift/cleave there"
+command -v cargo >/dev/null || die "cargo not found on PATH; install the Rust toolchain to build litmus and cleave"
 
 # --- Build -------------------------------------------------------------------
 
 log "Building ${BINARY}"
 make build
 [[ -x ./${BINARY} ]] || die "build did not produce ./${BINARY}"
+
+log "Building litmus (release)"
+make -C "${LITMUS_SRC}" release >/dev/null
+[[ -x ${LITMUS_SRC}/out/litmus ]] || die "litmus build did not produce ${LITMUS_SRC}/out/litmus"
+
+log "Building cleave (release)"
+make -C "${CLEAVE_SRC}" release >/dev/null
+[[ -x ${CLEAVE_SRC}/out/cleave ]] || die "cleave build did not produce ${CLEAVE_SRC}/out/cleave"
 
 # --- Service user + directories ---------------------------------------------
 
@@ -69,7 +89,7 @@ if ! getent passwd "${SERVICE_USER}" >/dev/null; then
 fi
 
 sudo install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
-    "${STATE_HOME}" "${CACHE_HOME}" "${CONFIG_DIR}"
+    "${STATE_HOME}" "${CACHE_HOME}" "${CONFIG_DIR}" "${TOOLS_DIR}"
 
 # --- Binary ------------------------------------------------------------------
 
@@ -81,6 +101,21 @@ else
     sudo install -m 0755 -o root -g root "./${BINARY}" "${BIN_PATH}"
     binary_changed=1
 fi
+
+# Install litmus and cleave into the service user's TOOLS_DIR. A change in
+# either counts as a "binary change" so the service is restarted below.
+install_tool() {
+    local src=$1 dst=$2 name=$3
+    if sudo cmp -s "${src}" "${dst}" 2>/dev/null; then
+        log "${name} unchanged"
+        return
+    fi
+    log "Installing ${dst}"
+    sudo install -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${src}" "${dst}"
+    binary_changed=1
+}
+install_tool "${LITMUS_SRC}/out/litmus" "${LITMUS_BIN}" litmus
+install_tool "${CLEAVE_SRC}/out/cleave" "${CLEAVE_BIN}" cleave
 
 # --- .pgpass (optional, from the invoking user) -----------------------------
 
@@ -135,7 +170,7 @@ CacheDirectory=${SERVICE_NAME}
 CacheDirectoryMode=0750
 
 WorkingDirectory=%S/${SERVICE_NAME}
-ExecStart=${BIN_PATH} load --data ${DATA_DIR} --db ${DB} --source ${SOURCE} --dashboard-addr ${DASH_ADDR}${workers_arg}
+ExecStart=${BIN_PATH} load --data ${DATA_DIR} --db ${DB} --source ${SOURCE} --dashboard-addr ${DASH_ADDR} --litmus ${LITMUS_BIN} --cleave ${CLEAVE_BIN}${workers_arg}
 Restart=always
 RestartSec=10s
 TimeoutStopSec=60s
@@ -143,6 +178,7 @@ TimeoutStopSec=60s
 Environment=HOME=%S/${SERVICE_NAME}
 Environment=XDG_CACHE_HOME=%C/${SERVICE_NAME}
 Environment=PGPASSFILE=%E/${SERVICE_NAME}/.pgpass
+Environment=PATH=${TOOLS_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Resource caps — hopper + litmus children combined.
 MemoryHigh=28G
