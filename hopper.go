@@ -1329,7 +1329,10 @@ type BackfillStats struct {
 	MarkersCleared int64 // skip='misclassified' rows reset to skip='' under the new heuristic
 }
 
-const archiveMemberLitmusBackfillBatch = 5000
+const (
+	archiveMemberLitmusBackfillBatch = 5000
+	archiveMemberLitmusWorkers       = 24
+)
 
 // Backfill re-derives columns from cleave_result and litmus_result for every
 // sample with at least one of those blobs, updating rows where the stored

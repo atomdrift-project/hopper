@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/errgroup"
 )
 
 func openPG(ctx context.Context, dsn string) (*DB, error) {
@@ -1374,6 +1376,13 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 }
 
 func (db *DB) backfillArchiveMemberLitmusPG(ctx context.Context) (int64, error) {
+	type candidate struct {
+		sha256       string
+		childLitmus  []byte
+		parentCleave []byte
+		parentLitmus []byte
+	}
+
 	var total int64
 	for {
 		rows, err := db.pool.Query(ctx, `
@@ -1390,48 +1399,59 @@ func (db *DB) backfillArchiveMemberLitmusPG(ctx context.Context) (int64, error) 
 			return total, fmt.Errorf("hopper: backfill archive member litmus query: %w", err)
 		}
 
-		var seen, fixed int64
+		candidates := make([]candidate, 0, archiveMemberLitmusBackfillBatch)
 		for rows.Next() {
-			var sha256 string
-			var childLitmus, parentCleave, parentLitmus []byte
-			if err := rows.Scan(&sha256, &childLitmus, &parentCleave, &parentLitmus); err != nil {
+			var c candidate
+			if err := rows.Scan(&c.sha256, &c.childLitmus, &c.parentCleave, &c.parentLitmus); err != nil {
 				rows.Close()
 				return total, fmt.Errorf("hopper: backfill archive member litmus scan: %w", err)
 			}
-			seen++
-			id, ok := cleaveFileIndexForSHA(parentCleave, sha256)
-			if !ok {
-				continue
-			}
-			memberLitmus := litmusResultForMember(parentLitmus, id)
-			if len(memberLitmus) == 0 {
-				continue
-			}
-			tag, err := db.pool.Exec(ctx, `
-				UPDATE samples
-				SET litmus_result = $1, updated_at = now()
-				WHERE sha256 = $2 AND litmus_result = $3`,
-				sanitizeJSONB(memberLitmus), sha256, childLitmus)
-			if err != nil {
-				rows.Close()
-				return total, fmt.Errorf("hopper: backfill archive member litmus update %s: %w", sha256, err)
-			}
-			fixed += tag.RowsAffected()
+			candidates = append(candidates, c)
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
 			return total, fmt.Errorf("hopper: backfill archive member litmus rows: %w", err)
 		}
 		rows.Close()
-		if seen == 0 {
+		if len(candidates) == 0 {
 			return total, nil
 		}
 
-		total += fixed
-		if fixed > 0 {
-			slog.Info("backfill archive member litmus batch", "batch", fixed, "total", total)
+		var fixed atomic.Int64
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(archiveMemberLitmusWorkers)
+		for _, c := range candidates {
+			g.Go(func() error {
+				id, ok := cleaveFileIndexForSHA(c.parentCleave, c.sha256)
+				if !ok {
+					return nil
+				}
+				memberLitmus := litmusResultForMember(c.parentLitmus, id)
+				if len(memberLitmus) == 0 {
+					return nil
+				}
+				tag, err := db.pool.Exec(gctx, `
+					UPDATE samples
+					SET litmus_result = $1, updated_at = now()
+					WHERE sha256 = $2 AND litmus_result = $3`,
+					sanitizeJSONB(memberLitmus), c.sha256, c.childLitmus)
+				if err != nil {
+					return fmt.Errorf("hopper: backfill archive member litmus update %s: %w", c.sha256, err)
+				}
+				fixed.Add(tag.RowsAffected())
+				return nil
+			})
 		}
-		if seen < archiveMemberLitmusBackfillBatch || fixed == 0 {
+		if err := g.Wait(); err != nil {
+			return total, err
+		}
+
+		batchFixed := fixed.Load()
+		total += batchFixed
+		if batchFixed > 0 {
+			slog.Info("backfill archive member litmus batch", "batch", batchFixed, "total", total)
+		}
+		if len(candidates) < archiveMemberLitmusBackfillBatch || batchFixed == 0 {
 			return total, nil
 		}
 	}
