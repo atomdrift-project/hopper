@@ -193,8 +193,8 @@ Environment=PGPASSFILE=%E/${SERVICE_NAME}/.pgpass
 Environment=PATH=${TOOLS_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Resource caps — hopper + litmus children combined.
-MemoryHigh=28G
-MemoryMax=32G
+MemoryHigh=64G
+MemoryMax=72G
 TasksMax=8192
 # Child OOM (e.g. a rogue litmus worker) should be logged and retried, not
 # bring down the whole ingester.
