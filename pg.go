@@ -1383,22 +1383,37 @@ func (db *DB) backfillArchiveMemberLitmusPG(ctx context.Context) (int64, error) 
 		parentLitmus []byte
 	}
 
+	// One server-side cursor scans the table exactly once. Earlier batched-LIMIT
+	// approach re-scanned from the start each iteration — O(N^2) as qualifying
+	// rows became rarer late in the run. The pg_column_size pre-filter prunes
+	// non-matches via TOAST metadata before the expensive JSONB equality check.
+	tx, err := db.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return 0, fmt.Errorf("hopper: backfill archive member litmus begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `
+		DECLARE archive_member_litmus_cur NO SCROLL CURSOR FOR
+		SELECT c.sha256, c.litmus_result, p.cleave_result, p.litmus_result
+		FROM samples c
+		JOIN samples p ON p.sha256 = c.parent
+		WHERE c.parent <> ''
+			AND c.litmus_result IS NOT NULL
+			AND p.cleave_result IS NOT NULL
+			AND p.litmus_result IS NOT NULL
+			AND pg_column_size(c.litmus_result) = pg_column_size(p.litmus_result)
+			AND c.litmus_result = p.litmus_result`); err != nil {
+		return 0, fmt.Errorf("hopper: backfill archive member litmus declare: %w", err)
+	}
+
+	fetchSQL := fmt.Sprintf(`FETCH %d FROM archive_member_litmus_cur`, archiveMemberLitmusBackfillBatch)
 	var total int64
 	for {
-		rows, err := db.pool.Query(ctx, `
-			SELECT c.sha256, c.litmus_result, p.cleave_result, p.litmus_result
-			FROM samples c
-			JOIN samples p ON p.sha256 = c.parent
-			WHERE c.parent <> ''
-				AND c.litmus_result IS NOT NULL
-				AND c.litmus_result = p.litmus_result
-				AND p.cleave_result IS NOT NULL
-				AND p.litmus_result IS NOT NULL
-			LIMIT $1`, archiveMemberLitmusBackfillBatch)
+		rows, err := tx.Query(ctx, fetchSQL)
 		if err != nil {
-			return total, fmt.Errorf("hopper: backfill archive member litmus query: %w", err)
+			return total, fmt.Errorf("hopper: backfill archive member litmus fetch: %w", err)
 		}
-
 		candidates := make([]candidate, 0, archiveMemberLitmusBackfillBatch)
 		for rows.Next() {
 			var c candidate
@@ -1451,7 +1466,7 @@ func (db *DB) backfillArchiveMemberLitmusPG(ctx context.Context) (int64, error) 
 		if batchFixed > 0 {
 			slog.Info("backfill archive member litmus batch", "batch", batchFixed, "total", total)
 		}
-		if len(candidates) < archiveMemberLitmusBackfillBatch || batchFixed == 0 {
+		if len(candidates) < archiveMemberLitmusBackfillBatch {
 			return total, nil
 		}
 	}
