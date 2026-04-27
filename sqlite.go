@@ -475,7 +475,7 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		"sha256", "source", "feed", "ecosystem", "filename",
 		"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
 		"parent", "skip", "elements", "max_crit", "suspicious_count",
-		"mtime", "marker_mtime", "cleave_result", "litmus_result",
+		"mtime", "marker_mtime", "cleave_result", "litmus_result", "analyzed_at",
 	}
 	placeholders := make([]string, len(cols))
 	for i := range cols {
@@ -521,7 +521,7 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 			s.SHA256, s.Parent, s.Skip, s.Elements,
 			s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
-			jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult))
+			jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult), s.AnalyzedAt)
 		if err != nil {
 			return 0, nil, fmt.Errorf("hopper: batch insert %s: %w", s.SHA256, err)
 		}
@@ -1297,7 +1297,49 @@ func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 		slog.Info("backfill cleave batch", "batch", n, "total", stats.Updated)
 	}
 
-	// Pass 2: clear stale skip='misclassified' markers whose underlying
+	n, err := db.backfillArchiveMemberLitmusSQLite(ctx)
+	if err != nil {
+		return stats, err
+	}
+	stats.Updated += n
+	db.reportBackfill(stats.Updated, stats.Scanned)
+
+	// Pass 2: archive members written before analyzed_at was persisted by
+	// InsertSampleBatch should inherit the parent's analysis timestamp.
+	for {
+		childRes, err := db.lite.ExecContext(ctx, `
+			UPDATE samples SET
+				analyzed_at = (
+					SELECT p.analyzed_at FROM samples p
+					WHERE p.sha256 = samples.parent
+				),
+				updated_at = ?
+			WHERE sha256 IN (
+				SELECT c.sha256
+				FROM samples c
+				JOIN samples p ON p.sha256 = c.parent
+				WHERE c.parent <> ''
+					AND c.analyzed_at IS NULL
+					AND c.cleave_result IS NOT NULL
+					AND c.litmus_result IS NOT NULL
+					AND p.analyzed_at IS NOT NULL
+				LIMIT ?
+			)`, now(), backfillBatch)
+		if err != nil {
+			return stats, fmt.Errorf("hopper: backfill archive member analyzed_at: %w", err)
+		}
+		n, err := childRes.RowsAffected()
+		if err != nil {
+			return stats, fmt.Errorf("hopper: backfill archive member analyzed_at rows affected: %w", err)
+		}
+		stats.Updated += n
+		if n < backfillBatch {
+			break
+		}
+		slog.Info("backfill archive member analyzed_at batch", "batch", n, "total", stats.Updated)
+	}
+
+	// Pass 3: clear stale skip='misclassified' markers whose underlying
 	// trait counts no longer disagree with the marker. The old score-based
 	// rule was noisy on large tarballs and parked many rows here that the
 	// new max_crit/suspicious_count rule would never have flagged.
@@ -1326,6 +1368,80 @@ func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 	}
 
 	return stats, nil
+}
+
+func (db *DB) backfillArchiveMemberLitmusSQLite(ctx context.Context) (int64, error) {
+	var total int64
+	for {
+		rows, err := db.lite.QueryContext(ctx, `
+			SELECT c.sha256, c.litmus_result, p.cleave_result, p.litmus_result
+			FROM samples c
+			JOIN samples p ON p.sha256 = c.parent
+			WHERE c.parent <> ''
+				AND c.litmus_result IS NOT NULL
+				AND c.litmus_result = p.litmus_result
+				AND p.cleave_result IS NOT NULL
+				AND p.litmus_result IS NOT NULL
+			LIMIT ?`, archiveMemberLitmusBackfillBatch)
+		if err != nil {
+			return total, fmt.Errorf("hopper: backfill archive member litmus query: %w", err)
+		}
+
+		type candidate struct {
+			sha256       string
+			childLitmus  []byte
+			parentCleave []byte
+			parentLitmus []byte
+		}
+		var candidates []candidate
+		for rows.Next() {
+			var c candidate
+			if err := rows.Scan(&c.sha256, &c.childLitmus, &c.parentCleave, &c.parentLitmus); err != nil {
+				rows.Close()
+				return total, fmt.Errorf("hopper: backfill archive member litmus scan: %w", err)
+			}
+			candidates = append(candidates, c)
+		}
+		if err := rows.Err(); err != nil {
+			return total, fmt.Errorf("hopper: backfill archive member litmus rows: %w", err)
+		}
+		rows.Close()
+		if len(candidates) == 0 {
+			return total, nil
+		}
+
+		var fixed int64
+		for _, c := range candidates {
+			id, ok := cleaveFileIndexForSHA(c.parentCleave, c.sha256)
+			if !ok {
+				continue
+			}
+			memberLitmus := litmusResultForMember(c.parentLitmus, id)
+			if len(memberLitmus) == 0 {
+				continue
+			}
+			res, err := db.lite.ExecContext(ctx, `
+				UPDATE samples
+				SET litmus_result = ?, updated_at = ?
+				WHERE sha256 = ? AND litmus_result = ?`,
+				jsonTextOrNil(memberLitmus), now(), c.sha256, string(c.childLitmus))
+			if err != nil {
+				return total, fmt.Errorf("hopper: backfill archive member litmus update %s: %w", c.sha256, err)
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return total, fmt.Errorf("hopper: backfill archive member litmus rows affected: %w", err)
+			}
+			fixed += n
+		}
+		total += fixed
+		if fixed > 0 {
+			slog.Info("backfill archive member litmus batch", "batch", fixed, "total", total)
+		}
+		if len(candidates) < archiveMemberLitmusBackfillBatch || fixed == 0 {
+			return total, nil
+		}
+	}
 }
 
 func (db *DB) setSkipSQLite(ctx context.Context, sha256, skip string) error {

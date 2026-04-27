@@ -3,6 +3,7 @@ package hopper
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1104,7 +1105,8 @@ func TestExplodeArchiveMembers(t *testing.T) {
 		{"sha":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","type":"txt","path":"pkg/readme.txt","dp":1,"sz":50,"ts":[{"l":1,"c":1.0}]}
 	]}`)
 
-	parentLitmus := []byte(`{"score":0.97,"verdict":"bad"}`)
+	parentLitmus := []byte(`{"v":"4","prob":0.97,"class":1,"version":"vtest","thresholds":[0.5,0.9],"fs":[{"id":0,"prob":0.97,"class":1},{"id":1,"prob":0.91,"class":1},{"id":2,"prob":0.12,"class":0}]}`)
+	analyzedAt := time.Date(2026, 4, 27, 7, 30, 0, 0, time.UTC)
 	parent := &Sample{
 		SHA256:          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		Source:          "test",
@@ -1114,6 +1116,7 @@ func TestExplodeArchiveMembers(t *testing.T) {
 		CleaveResult:    cleaveJSON,
 		LitmusResult:    parentLitmus,
 		CanonicalSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		AnalyzedAt:      &analyzedAt,
 	}
 	mustInsert(t, ctx, db, parent)
 
@@ -1164,15 +1167,16 @@ func TestExplodeArchiveMembers(t *testing.T) {
 
 	// Regression guard for the "archive orphan" class: Explode must persist
 	// cleave_result (single-file wrapper derived from the parent's fs[]
-	// entry) AND litmus_result (inherited from parent) on every member.
+	// entry) AND member-specific litmus_result on every member.
 	// Before the insert column-list fix, these fields were silently
 	// dropped because neither insertSampleBatch* listed them, leaving
 	// members with NULL cleave_result — invisible to ClaimJobs and hence
 	// undead in the queue forever.
-	for _, sha := range []string{
-		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-	} {
+	wantLitmusScores := map[string]float64{
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": 0.91,
+		"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc": 0.12,
+	}
+	for sha, wantScore := range wantLitmusScores {
 		m, err := db.SampleBySHA256(ctx, sha)
 		if err != nil {
 			t.Fatal(err)
@@ -1182,9 +1186,181 @@ func TestExplodeArchiveMembers(t *testing.T) {
 		} else if !bytes.Contains(m.CleaveResult, []byte(sha)) {
 			t.Errorf("%s: cleave_result doesn't reference own sha: %s", sha[:12], m.CleaveResult)
 		}
-		if !bytes.Equal(m.LitmusResult, parentLitmus) {
-			t.Errorf("%s: litmus_result = %q, want inherited %q", sha[:12], m.LitmusResult, parentLitmus)
+		if bytes.Equal(m.LitmusResult, parentLitmus) {
+			t.Errorf("%s: litmus_result inherited parent envelope: %q", sha[:12], m.LitmusResult)
 		}
+		var litmus struct {
+			Prob float64 `json:"prob"`
+		}
+		if err := json.Unmarshal(m.LitmusResult, &litmus); err != nil {
+			t.Errorf("%s: parse member litmus_result: %v", sha[:12], err)
+		} else if litmus.Prob != wantScore {
+			t.Errorf("%s: member litmus prob = %v, want %v", sha[:12], litmus.Prob, wantScore)
+		}
+		if m.LitmusScore != wantScore {
+			t.Errorf("%s: litmus_score = %v, want %v", sha[:12], m.LitmusScore, wantScore)
+		}
+		if m.AnalyzedAt == nil || !m.AnalyzedAt.Equal(analyzedAt) {
+			t.Errorf("%s: analyzed_at = %v, want inherited %v", sha[:12], m.AnalyzedAt, analyzedAt)
+		}
+	}
+}
+
+func TestBackfillArchiveMemberAnalyzedAt(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	parentSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	childSHA := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	parentCleave := []byte(`{"fs":[{"sha":"` + parentSHA + `","type":"zip","dp":0}]}`)
+	parentLitmus := []byte(`{"prob":0.97}`)
+
+	mustInsert(t, ctx, db, &Sample{SHA256: parentSHA, Source: "test", Label: "bad", LabelSource: "test"})
+	if err := db.UpdateCleaveResult(ctx, parentSHA, parentCleave, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpdateLitmusResult(ctx, parentSHA, parentLitmus); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := db.SampleBySHA256(ctx, parentSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parent.AnalyzedAt == nil {
+		t.Fatal("parent analyzed_at missing")
+	}
+
+	childCleave := []byte(`{"fs":[{"sha":"` + childSHA + `","type":"py","dp":1}]}`)
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{{
+		SHA256:       childSHA,
+		Source:       "test",
+		Label:        "bad",
+		LabelSource:  "test",
+		Path:         "bad/archive.zip!!pkg/x.py",
+		Parent:       parentSHA,
+		CleaveResult: childCleave,
+		LitmusResult: parentLitmus,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	child, err := db.SampleBySHA256(ctx, childSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.AnalyzedAt != nil {
+		t.Fatalf("precondition: child analyzed_at = %v, want nil", child.AnalyzedAt)
+	}
+
+	if _, err := db.Backfill(ctx); err != nil {
+		t.Fatal(err)
+	}
+	child, err = db.SampleBySHA256(ctx, childSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.AnalyzedAt == nil || !child.AnalyzedAt.Equal(*parent.AnalyzedAt) {
+		t.Fatalf("child analyzed_at = %v, want parent analyzed_at %v", child.AnalyzedAt, parent.AnalyzedAt)
+	}
+}
+
+func TestBackfillArchiveMemberLitmusResult(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	parentSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	childSHA := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	parentCleave := []byte(`{"fs":[
+		{"sha":"` + parentSHA + `","type":"zip","path":"archive.zip","dp":0},
+		{"sha":"` + childSHA + `","type":"py","path":"pkg/x.py","dp":1}
+	]}`)
+	parentLitmus := []byte(`{"v":"4","prob":0.97,"class":1,"version":"vtest","fs":[{"id":0,"prob":0.97,"class":1},{"id":1,"prob":0.41,"class":0}]}`)
+	childCleave := []byte(`{"fs":[{"sha":"` + childSHA + `","type":"py","path":"pkg/x.py","dp":1}]}`)
+
+	mustInsert(t, ctx, db, &Sample{SHA256: parentSHA, Source: "test", Label: "bad", LabelSource: "test"})
+	if err := db.UpdateCleaveResult(ctx, parentSHA, parentCleave, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpdateLitmusResult(ctx, parentSHA, parentLitmus); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{{
+		SHA256:       childSHA,
+		Source:       "test",
+		Label:        "bad",
+		LabelSource:  "test",
+		Path:         "bad/archive.zip!!pkg/x.py",
+		Parent:       parentSHA,
+		CleaveResult: childCleave,
+		LitmusResult: parentLitmus,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Backfill(ctx); err != nil {
+		t.Fatal(err)
+	}
+	child, err := db.SampleBySHA256(ctx, childSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(child.LitmusResult, parentLitmus) {
+		t.Fatalf("child litmus_result still inherited parent envelope: %s", child.LitmusResult)
+	}
+	var litmus struct {
+		Prob float64 `json:"prob"`
+	}
+	if err := json.Unmarshal(child.LitmusResult, &litmus); err != nil {
+		t.Fatal(err)
+	}
+	if litmus.Prob != 0.41 || child.LitmusScore != 0.41 {
+		t.Fatalf("child litmus prob/score = %v/%v, want 0.41/0.41", litmus.Prob, child.LitmusScore)
+	}
+}
+
+func TestExplodeArchiveMembersViaSampleParentInfoAnalyzedAt(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	parentSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	childSHA := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	cleaveJSON := []byte(`{"fs":[
+		{"sha":"` + parentSHA + `","type":"zip","path":"archive.zip","dp":0,"ts":[{"l":5,"c":0.9}]},
+		{"sha":"` + childSHA + `","type":"py","path":"pkg/x.py","dp":1,"ts":[{"l":5,"c":0.9}]}
+	]}`)
+	litmusJSON := []byte(`{"v":"4","prob":0.97,"class":1,"fs":[{"id":0,"prob":0.97,"class":1},{"id":1,"prob":0.83,"class":1}]}`)
+
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      parentSHA,
+		Source:      "test",
+		Label:       "bad",
+		LabelSource: "test",
+		Path:        "bad/archive.zip",
+	})
+	if err := db.UpdateCleaveResult(ctx, parentSHA, cleaveJSON, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpdateLitmusResult(ctx, parentSHA, litmusJSON); err != nil {
+		t.Fatal(err)
+	}
+
+	parent, err := db.SampleParentInfo(ctx, parentSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parent.AnalyzedAt == nil {
+		t.Fatal("SampleParentInfo did not fetch analyzed_at")
+	}
+	parent.CleaveResult = cleaveJSON
+
+	if _, err := db.ExplodeArchiveMembers(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	child, err := db.SampleBySHA256(ctx, childSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.AnalyzedAt == nil || !child.AnalyzedAt.Equal(*parent.AnalyzedAt) {
+		t.Fatalf("child analyzed_at = %v, want parent analyzed_at %v", child.AnalyzedAt, parent.AnalyzedAt)
 	}
 }
 
@@ -1355,7 +1531,7 @@ func TestExplodeResultsSurviveReingest(t *testing.T) {
 		LabelSource:     "test",
 		Path:            "bad/archive.zip",
 		CleaveResult:    cleaveJSON,
-		LitmusResult:    []byte(`{"score":0.9}`),
+		LitmusResult:    []byte(`{"v":"4","prob":0.9,"class":1,"fs":[{"id":0,"prob":0.9,"class":1},{"id":1,"prob":0.82,"class":1}]}`),
 		CanonicalSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 	}
 	mustInsert(t, ctx, db, parent)

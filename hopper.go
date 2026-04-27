@@ -320,8 +320,8 @@ func canonicalSHA(sha256 string, cleaveResult []byte) string {
 
 // ExplodeArchiveMembers parses the cleave_result of the given sample and
 // inserts one row per embedded file (depth > 0). Each member inherits the
-// parent's label, label_source, source, feed, and canonical_sha256. Members
-// get a single-file cleave_result wrapping just their file entry.
+// parent's label, label_source, source, feed, and canonical_sha256. Members get
+// a single-file cleave_result and a litmus_result for just their file entry.
 //
 // For bad archives, members without hostile risk or >1 suspicious finding
 // are marked skip="weak-findings". Duplicate SHA256s are silently skipped.
@@ -339,7 +339,7 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 	}
 
 	var members []*Sample
-	for _, raw := range report.Files {
+	for id, raw := range report.Files {
 		var entry struct {
 			SHA256   string `json:"sha"`
 			FileType string `json:"type"`
@@ -429,11 +429,11 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 			LabelSource:     parent.LabelSource,
 			Path:            memberPath,
 			CleaveResult:    singleFile,
-			LitmusResult:    parent.LitmusResult,
-			LitmusScore:     parent.LitmusScore,
+			LitmusResult:    litmusResultForMember(parent.LitmusResult, id),
 			CanonicalSHA256: parent.CanonicalSHA256,
 			Parent:          parent.SHA256,
 			Skip:            skip,
+			AnalyzedAt:      parent.AnalyzedAt,
 		})
 	}
 
@@ -442,6 +442,68 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 	}
 	n, _, err := db.InsertSampleBatch(ctx, members)
 	return n, err
+}
+
+func litmusResultForMember(parent []byte, id int) []byte {
+	if len(parent) == 0 {
+		return nil
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(parent, &envelope); err != nil {
+		return nil
+	}
+	var files []map[string]json.RawMessage
+	if err := json.Unmarshal(envelope["fs"], &files); err != nil {
+		return nil
+	}
+
+	var member map[string]json.RawMessage
+	for _, f := range files {
+		var got int
+		if err := json.Unmarshal(f["id"], &got); err == nil && got == id {
+			member = f
+			break
+		}
+	}
+	if member == nil && id >= 0 && id < len(files) {
+		member = files[id]
+	}
+	if member == nil || len(member["prob"]) == 0 {
+		return nil
+	}
+
+	out := make(map[string]json.RawMessage, len(member)+4)
+	for _, key := range []string{"v", "version", "thresholds", "analyzed_at"} {
+		if v := envelope[key]; len(v) != 0 {
+			out[key] = v
+		}
+	}
+	for k, v := range member {
+		out[k] = v
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+func cleaveFileIndexForSHA(result []byte, sha256 string) (int, bool) {
+	var report struct {
+		Files []struct {
+			SHA256 string `json:"sha"`
+		} `json:"fs"`
+	}
+	if json.Unmarshal(result, &report) != nil {
+		return 0, false
+	}
+	sha256 = strings.ToLower(sha256)
+	for i, f := range report.Files {
+		if strings.ToLower(f.SHA256) == sha256 {
+			return i, true
+		}
+	}
+	return 0, false
 }
 
 // SetSkip sets the training-exclusion reason on a sample.
@@ -695,12 +757,13 @@ func (db *DB) SampleBySHA256(ctx context.Context, sha256 string) (*Sample, error
 // avoiding the cost of reading the full row (especially the large cleave_result
 // JSONB column which the caller already has).
 func (db *DB) SampleParentInfo(ctx context.Context, sha256 string) (*Sample, error) {
-	const cols = `sha256, path, label, label_source, source, feed, ecosystem, canonical_sha256, litmus_result`
+	const cols = `sha256, path, label, label_source, source, feed, ecosystem, canonical_sha256, litmus_result, analyzed_at`
 	var s Sample
 	var litmus []byte
+	var analyzedAt sql.NullTime
 	scan := func(row interface{ Scan(...any) error }) error {
 		return row.Scan(&s.SHA256, &s.Path, &s.Label, &s.LabelSource,
-			&s.Source, &s.Feed, &s.Ecosystem, &s.CanonicalSHA256, &litmus)
+			&s.Source, &s.Feed, &s.Ecosystem, &s.CanonicalSHA256, &litmus, &analyzedAt)
 	}
 	var err error
 	if db.pool != nil {
@@ -715,6 +778,9 @@ func (db *DB) SampleParentInfo(ctx context.Context, sha256 string) (*Sample, err
 		return nil, fmt.Errorf("hopper: sample parent info %s: %w", sha256, err)
 	}
 	s.LitmusResult = litmus
+	if analyzedAt.Valid {
+		s.AnalyzedAt = &analyzedAt.Time
+	}
 	return &s, nil
 }
 
@@ -808,6 +874,9 @@ func (db *DB) MarkMissingSamplesResolved(
 		}
 		return comparablePath(p)
 	}
+	seen := func(p string) bool {
+		return wasWalked(comparablePath(p)) || wasWalked(resolvedPath(p))
+	}
 
 	// Dry-run: count how many would be marked before writing anything.
 	// Skip archive children (parent != "") — they don't have standalone
@@ -818,11 +887,12 @@ func (db *DB) MarkMissingSamplesResolved(
 			continue
 		}
 		eligible++
-		if !wasWalked(resolvedPath(s.Path)) {
+		if !seen(s.Path) {
 			wouldMark++
 		}
 	}
-	if eligible > 0 && wouldMark*2 > eligible {
+	const minBulkMarkGuardSamples = 100
+	if eligible >= minBulkMarkGuardSamples && wouldMark*2 > eligible {
 		return 0, fmt.Errorf(
 			"hopper: mark missing: refusing to mark %d of %d unanalyzed"+
 				" samples (>50%%); this likely indicates a misconfigured data directory",
@@ -834,7 +904,7 @@ func (db *DB) MarkMissingSamplesResolved(
 		if s.Skip != "" || s.Parent != "" {
 			continue
 		}
-		if wasWalked(resolvedPath(s.Path)) {
+		if seen(s.Path) {
 			continue
 		}
 		_, statErr := os.Stat(diskPath(s.Path))
@@ -1256,13 +1326,15 @@ type BackfillStats struct {
 	MarkersCleared int64 // skip='misclassified' rows reset to skip='' under the new heuristic
 }
 
+const archiveMemberLitmusBackfillBatch = 50000
+
 // Backfill re-derives columns from cleave_result and litmus_result for every
 // sample with at least one of those blobs, updating rows where the stored
 // values disagree with what the parsers produce. Useful after parser changes
 // or for rows that pre-date a column being populated on write.
 //
-// Currently backfills: formula, elements, score, file_type (from cleave_result)
-// and litmus_score (from litmus_result).
+// Currently backfills: formula, elements, score, file_type (from cleave_result),
+// litmus_score (from litmus_result), and analyzed_at on archive members.
 func (db *DB) Backfill(ctx context.Context) (BackfillStats, error) {
 	if db.pool != nil {
 		return db.backfillPG(ctx)

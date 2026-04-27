@@ -408,7 +408,7 @@ var insertBatchStagingCols = []string{
 	"sha256", "source", "feed", "ecosystem", "filename",
 	"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
 	"parent", "skip", "elements", "max_crit", "suspicious_count",
-	"mtime", "marker_mtime", "cleave_result", "litmus_result",
+	"mtime", "marker_mtime", "cleave_result", "litmus_result", "analyzed_at",
 }
 
 const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
@@ -418,7 +418,7 @@ const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 	parent TEXT, skip TEXT, elements TEXT,
 	max_crit INTEGER, suspicious_count INTEGER,
 	mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ,
-	cleave_result JSONB, litmus_result JSONB
+	cleave_result JSONB, litmus_result JSONB, analyzed_at TIMESTAMPTZ
 ) ON COMMIT DROP`
 
 // file_type, score, formula, and litmus_score are GENERATED columns on
@@ -431,13 +431,13 @@ const insertBatchStagingInsert = `INSERT INTO samples (
 	size_bytes, label, label_source, path, status,
 	canonical_sha256, parent, skip, elements,
 	max_crit, suspicious_count, mtime, marker_mtime,
-	cleave_result, litmus_result)
+	cleave_result, litmus_result, analyzed_at)
 SELECT DISTINCT ON (sha256)
 	sha256, source, feed, ecosystem, filename,
 	size_bytes, label, label_source, path, status,
 	canonical_sha256, parent, skip, elements,
 	max_crit, suspicious_count, mtime, marker_mtime,
-	cleave_result, litmus_result
+	cleave_result, litmus_result, analyzed_at
 FROM _staging
 ON CONFLICT (sha256) DO UPDATE SET
 	path  = CASE WHEN EXCLUDED.path  <> ''   THEN EXCLUDED.path  ELSE samples.path  END,
@@ -458,7 +458,7 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256,
 			s.Parent, s.Skip, s.Elements, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
-			sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult),
+			sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult), s.AnalyzedAt,
 		}
 	}
 
@@ -1218,7 +1218,43 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 		slog.Info("backfill cleave batch", "batch", n, "total", stats.Updated)
 	}
 
-	// Pass 2: clear stale skip='misclassified' markers whose underlying
+	n, err := db.backfillArchiveMemberLitmusPG(ctx)
+	if err != nil {
+		return stats, err
+	}
+	stats.Updated += n
+	db.reportBackfill(stats.Updated, stats.Scanned)
+
+	// Pass 2: archive members written before analyzed_at was persisted by
+	// InsertSampleBatch should inherit the parent's analysis timestamp.
+	for {
+		childTag, err := db.pool.Exec(ctx, `
+			WITH batch AS (
+				SELECT c.sha256, p.analyzed_at
+				FROM samples c
+				JOIN samples p ON p.sha256 = c.parent
+				WHERE c.parent <> ''
+					AND c.analyzed_at IS NULL
+					AND c.cleave_result IS NOT NULL
+					AND c.litmus_result IS NOT NULL
+					AND p.analyzed_at IS NOT NULL
+				LIMIT $1
+			)
+			UPDATE samples s SET analyzed_at = batch.analyzed_at, updated_at = now()
+			FROM batch
+			WHERE s.sha256 = batch.sha256`, backfillBatch)
+		if err != nil {
+			return stats, fmt.Errorf("hopper: backfill archive member analyzed_at: %w", err)
+		}
+		n := childTag.RowsAffected()
+		stats.Updated += n
+		if n < backfillBatch {
+			break
+		}
+		slog.Info("backfill archive member analyzed_at batch", "batch", n, "total", stats.Updated)
+	}
+
+	// Pass 3: clear stale skip='misclassified' markers whose underlying
 	// trait counts no longer disagree with the marker. The old score-based
 	// rule was noisy on large tarballs and parked many rows here that the
 	// new max_crit/suspicious_count rule would never have flagged.
@@ -1248,6 +1284,76 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 	stats.MarkersCleared += badTag.RowsAffected()
 
 	return stats, nil
+}
+
+func (db *DB) backfillArchiveMemberLitmusPG(ctx context.Context) (int64, error) {
+	var total int64
+	for {
+		rows, err := db.pool.Query(ctx, `
+			SELECT c.sha256, c.litmus_result, p.cleave_result, p.litmus_result
+			FROM samples c
+			JOIN samples p ON p.sha256 = c.parent
+			WHERE c.parent <> ''
+				AND c.litmus_result IS NOT NULL
+				AND c.litmus_result = p.litmus_result
+				AND p.cleave_result IS NOT NULL
+				AND p.litmus_result IS NOT NULL
+			LIMIT $1`, archiveMemberLitmusBackfillBatch)
+		if err != nil {
+			return total, fmt.Errorf("hopper: backfill archive member litmus query: %w", err)
+		}
+
+		type candidate struct {
+			sha256       string
+			childLitmus  []byte
+			parentCleave []byte
+			parentLitmus []byte
+		}
+		var candidates []candidate
+		for rows.Next() {
+			var c candidate
+			if err := rows.Scan(&c.sha256, &c.childLitmus, &c.parentCleave, &c.parentLitmus); err != nil {
+				rows.Close()
+				return total, fmt.Errorf("hopper: backfill archive member litmus scan: %w", err)
+			}
+			candidates = append(candidates, c)
+		}
+		if err := rows.Err(); err != nil {
+			return total, fmt.Errorf("hopper: backfill archive member litmus rows: %w", err)
+		}
+		rows.Close()
+		if len(candidates) == 0 {
+			return total, nil
+		}
+
+		var fixed int64
+		for _, c := range candidates {
+			id, ok := cleaveFileIndexForSHA(c.parentCleave, c.sha256)
+			if !ok {
+				continue
+			}
+			memberLitmus := litmusResultForMember(c.parentLitmus, id)
+			if len(memberLitmus) == 0 {
+				continue
+			}
+			tag, err := db.pool.Exec(ctx, `
+				UPDATE samples
+				SET litmus_result = $1, updated_at = now()
+				WHERE sha256 = $2 AND litmus_result = $3`,
+				sanitizeJSONB(memberLitmus), c.sha256, c.childLitmus)
+			if err != nil {
+				return total, fmt.Errorf("hopper: backfill archive member litmus update %s: %w", c.sha256, err)
+			}
+			fixed += tag.RowsAffected()
+		}
+		total += fixed
+		if fixed > 0 {
+			slog.Info("backfill archive member litmus batch", "batch", fixed, "total", total)
+		}
+		if len(candidates) < archiveMemberLitmusBackfillBatch || fixed == 0 {
+			return total, nil
+		}
+	}
 }
 
 func (db *DB) setSkipPG(ctx context.Context, sha256, skip string) error {

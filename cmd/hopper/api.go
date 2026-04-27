@@ -542,6 +542,8 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		} else if n > 0 {
 			slog.Debug("exploded archive members", "sha256", req.SHA256, "members", n) //nolint:gosec // sha256 validated by validSHA256
 			s.progress.exploded.Add(n)
+			s.progress.queued.Add(n)
+			s.progress.analyzed.Add(n)
 		}
 	}
 
@@ -692,11 +694,23 @@ func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 // that differs from the resolved dataRoot. EvalSymlinks resolves the entire
 // chain including intermediate symlinks.
 func stripDataRoot(dbPath, prefix string) string {
-	if strings.HasPrefix(dbPath, prefix) {
-		return dbPath[len(prefix):]
+	strip := func(path, root string) (string, bool) {
+		rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return rel, true
+		}
+		return "", false
 	}
-	if resolved, err := filepath.EvalSymlinks(dbPath); err == nil && strings.HasPrefix(resolved, prefix) {
-		return resolved[len(prefix):]
+
+	if rel, ok := strip(dbPath, prefix); ok {
+		return rel
+	}
+	resolvedPath, pathErr := filepath.EvalSymlinks(dbPath)
+	resolvedPrefix, prefixErr := filepath.EvalSymlinks(prefix)
+	if pathErr == nil && prefixErr == nil {
+		if rel, ok := strip(resolvedPath, resolvedPrefix); ok {
+			return rel
+		}
 	}
 	// Return as-is; the /api/file/{sha256} download fallback can still serve it.
 	return dbPath
