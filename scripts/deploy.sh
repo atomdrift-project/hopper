@@ -35,8 +35,9 @@ readonly TOOLS_DIR=${STATE_HOME}/bin
 readonly CACHE_HOME=/var/cache/${SERVICE_NAME}
 readonly UNIT_FILE=/etc/systemd/system/${SERVICE_NAME}.service
 
-# Sibling repos that ship alongside hopper. `make deploy` builds both in
-# release mode and installs the resulting binaries into TOOLS_DIR.
+# Sibling repos that ship alongside hopper. `make deploy` updates both,
+# builds them in release mode, and installs the resulting binaries into
+# TOOLS_DIR.
 readonly LITMUS_SRC=../litmus
 readonly CLEAVE_SRC=../cleave
 readonly LITMUS_BIN=${TOOLS_DIR}/litmus
@@ -53,6 +54,7 @@ trap 'if (( ${#TMP_FILES[@]} > 0 )); then rm -f -- "${TMP_FILES[@]}"; fi' EXIT
 [[ $(uname -s) == Linux ]]      || die "deploy requires Linux with systemd"
 command -v systemctl >/dev/null || die "systemctl not found"
 command -v sudo      >/dev/null || die "sudo required"
+command -v git       >/dev/null || die "git not found"
 [[ -f Makefile ]]                || die "run from the repository root"
 [[ -d ${DATA_DIR} ]]             || die "DATA_DIR does not exist: ${DATA_DIR}"
 sudo -v                          || die "sudo authentication failed"
@@ -70,6 +72,16 @@ command -v cargo >/dev/null || die "cargo not found on PATH; install the Rust to
 log "Building ${BINARY}"
 make build
 [[ -x ./${BINARY} ]] || die "build did not produce ./${BINARY}"
+
+update_tool_source() {
+    local name=$1 dir=$2
+
+    log "Updating ${name} source"
+    git -C "${dir}" pull --ff-only
+}
+
+update_tool_source litmus "${LITMUS_SRC}"
+update_tool_source cleave "${CLEAVE_SRC}"
 
 log "Building litmus (release)"
 make -C "${LITMUS_SRC}" release >/dev/null
