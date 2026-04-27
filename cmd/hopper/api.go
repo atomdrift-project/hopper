@@ -35,6 +35,8 @@ type apiServer struct {
 	rescanAge           time.Duration
 }
 
+const maxClientErrorRunes = 120
+
 // workerTracker is an in-memory view of active workers, updated on every
 // API call. The dashboard reads from it instead of polling nodes.
 type workerTracker struct {
@@ -456,6 +458,8 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	if req.Error != "" {
+		clientErr := trimClientError(req.Error)
+
 		// Look up the sample path for more useful error logs.
 		samplePath := ""
 		if sample, err := s.db.SampleBySHA256(ctx, req.SHA256); err == nil {
@@ -470,7 +474,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 			} else {
 				//nolint:gosec // sha256 validated, path from DB.
 				slog.Info("marked sample", "sha256", req.SHA256,
-					"path", samplePath, "skip", skip, "reason", req.Error)
+					"path", samplePath, "skip", skip, "reason", clientErr)
 			}
 		} else {
 			// Transient error — release claim so another worker can try.
@@ -479,7 +483,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 			}
 			//nolint:gosec // worker sanitized by validWorkerName, sha256 by validSHA256, path from DB
 			slog.Warn("worker reported analysis error",
-				"worker", req.Worker, "sha256", req.SHA256, "path", samplePath, "error", req.Error)
+				"worker", req.Worker, "sha256", req.SHA256, "path", samplePath, "error", clientErr)
 		}
 		s.progress.errors.Add(1)
 		s.tracker.recordResult(req.Worker, true)
@@ -599,6 +603,21 @@ func classifyResultError(errMsg string) (string, bool) {
 		return "unsupported", true
 	}
 	return "", false
+}
+
+func trimClientError(msg string) string {
+	msg = strings.Join(strings.Fields(msg), " ")
+	if msg == "" {
+		return ""
+	}
+	count := 0
+	for i := range msg {
+		if count == maxClientErrorRunes {
+			return strings.TrimSpace(msg[:i])
+		}
+		count++
+	}
+	return msg
 }
 
 // handleFile serves file content for remote workers.
