@@ -26,6 +26,8 @@ import (
 	_ "github.com/mattn/go-sqlite3" // register sqlite3 driver
 )
 
+const skipBenignArchiveItem = "skip-benign-archive-item"
+
 func closeSQLiteBestEffort(db *sql.DB) {
 	if err := db.Close(); err != nil {
 		slog.Debug("close sqlite failed", "error", err)
@@ -325,7 +327,7 @@ func canonicalSHA(sha256 string, cleaveResult []byte) string {
 // a single-file cleave_result and a litmus_result for just their file entry.
 //
 // For bad archives, members without hostile risk or >1 suspicious finding
-// are marked skip="weak-findings". Duplicate SHA256s are silently skipped.
+// are marked skip="skip-benign-archive-item". Duplicate SHA256s are silently skipped.
 // Returns the number of new rows inserted.
 func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64, error) {
 	if len(parent.CleaveResult) == 0 {
@@ -389,7 +391,7 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 
 		skip := ""
 		if parent.Label == "bad" && maxLevel < 5 && suspiciousCount <= 1 {
-			skip = "weak-findings"
+			skip = skipBenignArchiveItem
 		}
 
 		singleFile, err := json.Marshal(struct {

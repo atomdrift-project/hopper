@@ -750,15 +750,15 @@ func TestSetSkip(t *testing.T) {
 	ctx := context.Background()
 
 	mustInsert(t, ctx, db, &Sample{SHA256: "sk1", Source: "test", Label: "bad", LabelSource: "test"})
-	if err := db.SetSkip(ctx, "sk1", "weak-findings"); err != nil {
+	if err := db.SetSkip(ctx, "sk1", skipBenignArchiveItem); err != nil {
 		t.Fatal(err)
 	}
 	got, err := db.SampleBySHA256(ctx, "sk1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Skip != "weak-findings" {
-		t.Errorf("Skip = %q, want %q", got.Skip, "weak-findings")
+	if got.Skip != skipBenignArchiveItem {
+		t.Errorf("Skip = %q, want %q", got.Skip, skipBenignArchiveItem)
 	}
 
 	// Clear skip.
@@ -1143,14 +1143,14 @@ func TestExplodeArchiveMembers(t *testing.T) {
 		t.Errorf("duplicate explosion inserted = %d, want 0", n)
 	}
 
-	// The txt file with only level 1 findings should have skip="weak-findings"
+	// The txt file with only level 1 findings should have skip="skip-benign-archive-item"
 	// and a virtual path combining parent.Path with its in-archive path.
 	txt, err := db.SampleBySHA256(ctx, "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if txt.Skip != "weak-findings" {
-		t.Errorf("txt Skip = %q, want %q", txt.Skip, "weak-findings")
+	if txt.Skip != skipBenignArchiveItem {
+		t.Errorf("txt Skip = %q, want %q", txt.Skip, skipBenignArchiveItem)
 	}
 	if txt.Parent != parent.SHA256 {
 		t.Errorf("txt Parent = %q, want %q", txt.Parent, parent.SHA256)

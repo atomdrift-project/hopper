@@ -111,6 +111,7 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 		// feedSourcesPG / feedEcosystemsPG: DISTINCT feed/ecosystem WHERE source = $1.
 		`CREATE INDEX IF NOT EXISTS idx_samples_source_feed ON samples(source, feed) WHERE feed != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_source_ecosystem ON samples(source, ecosystem) WHERE ecosystem != ''`,
+		`UPDATE samples SET skip = 'skip-benign-archive-item' WHERE skip = 'weak-findings'`,
 		// Worker heartbeat table for dashboard.
 		`CREATE TABLE IF NOT EXISTS workers (
 			name      TEXT PRIMARY KEY,

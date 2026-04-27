@@ -216,6 +216,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		// OldestClaims
 		`CREATE INDEX IF NOT EXISTS idx_samples_claimed ` +
 			`ON samples(claimed_by, claimed_at) WHERE claimed_by != ''`,
+		`UPDATE samples SET skip = 'skip-benign-archive-item' WHERE skip = 'weak-findings'`,
 	} {
 		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite index: %w", err)
