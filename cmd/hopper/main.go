@@ -204,7 +204,7 @@ func main() {
 	logPath, cleanup, err := setupLogging()
 	if err != nil {
 		writeStderrf("failed to setup logging: %v\n", err)
-	} else {
+	} else if logPath != "" {
 		fmt.Fprintf(os.Stderr, "log: %s\n", logPath) //nolint:forbidigo // startup info before slog is configured
 	}
 
@@ -353,6 +353,11 @@ func hashCachePath() string {
 }
 
 func setupLogging() (logPath string, cleanup func(), err error) {
+	if runningUnderSystemd() {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
+		return "", func() {}, nil
+	}
+
 	dir := xdgLogDir()
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return "", nil, err
@@ -376,6 +381,10 @@ func setupLogging() (logPath string, cleanup func(), err error) {
 	slog.SetDefault(slog.New(h))
 
 	return logPath, func() { closeFileBestEffort(logPath, f) }, nil
+}
+
+func runningUnderSystemd() bool {
+	return os.Getenv("INVOCATION_ID") != "" || os.Getenv("JOURNAL_STREAM") != ""
 }
 
 type multiHandler struct {

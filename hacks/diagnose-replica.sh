@@ -11,7 +11,7 @@ REMOTE_HOST="${REMOTE_HOST:-hopper}"
 REMOTE_USER="${REMOTE_USER:-hopper}"
 REMOTE_DB="${REMOTE_DB:-hopper}"
 LOCAL_DB="${LOCAL_DB:-hopper}"
-SUBSCRIPTION="${SUBSCRIPTION:-hopper_training_sub}"
+SUBSCRIPTION="${SUBSCRIPTION:-hopper_replica}"
 
 section() { printf '\n=== %s ===\n' "$*"; }
 

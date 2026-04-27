@@ -20,12 +20,26 @@ REMOTE_USER="${REMOTE_USER:-hopper}"
 REMOTE_DB="${REMOTE_DB:-hopper}"
 LOCAL_DB="${LOCAL_DB:-hopper}"
 LOCAL_USER="${LOCAL_USER:-hopper}"
-PUBLICATION="${PUBLICATION:-hopper_training}"
-SUBSCRIPTION="${SUBSCRIPTION:-hopper_training_sub}"
+PUBLICATION="${PUBLICATION:-hopper_replica}"
+SUBSCRIPTION="${SUBSCRIPTION:-hopper_replica}"
+LEGACY_PUBLICATION="${LEGACY_PUBLICATION:-hopper_training}"
+LEGACY_SUBSCRIPTION="${LEGACY_SUBSCRIPTION:-hopper_training_sub}"
 PGPASS="${PGPASSFILE:-$HOME/.pgpass}"
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
+validate_ident() {
+    case "$2" in
+        ""|[!A-Za-z_]*|*[!A-Za-z0-9_]*)
+            die "$1 must be a simple PostgreSQL identifier, got '$2'"
+            ;;
+    esac
+}
+
+validate_ident PUBLICATION "$PUBLICATION"
+validate_ident SUBSCRIPTION "$SUBSCRIPTION"
+validate_ident LEGACY_PUBLICATION "$LEGACY_PUBLICATION"
+validate_ident LEGACY_SUBSCRIPTION "$LEGACY_SUBSCRIPTION"
 
 # --- Sanity checks ---------------------------------------------------------
 command -v pg_isready >/dev/null 2>&1 || die "pg_isready not found; install postgres client tools"
@@ -149,12 +163,19 @@ fi
 # a DISABLE and still be holding locks even though the sub reads disabled.
 # The subscription block below re-ENABLEs it after the migration finishes.
 if admin -d "$LOCAL_DB" -tAc \
-        "SELECT 1 FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" \
+        "SELECT 1 FROM pg_subscription WHERE subname IN ('$SUBSCRIPTION', '$LEGACY_SUBSCRIPTION') LIMIT 1" \
         | grep -q 1; then
-    log "Stopping subscription '$SUBSCRIPTION' during schema migration"
-    admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -v sub="$SUBSCRIPTION" <<'SQL'
+    log "Stopping replica subscription(s) during schema migration"
+    for sub in "$SUBSCRIPTION" "$LEGACY_SUBSCRIPTION"; do
+        if admin -d "$LOCAL_DB" -tAc \
+                "SELECT 1 FROM pg_subscription WHERE subname = '$sub'" \
+                | grep -q 1; then
+            admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -v sub="$sub" <<'SQL'
 ALTER SUBSCRIPTION :"sub" DISABLE;
 SQL
+        fi
+        [ "$SUBSCRIPTION" != "$LEGACY_SUBSCRIPTION" ] || break
+    done
 
     # Terminate any lingering logical-replication workers. Filter on
     # backend_type so we catch wedged workers that pg_stat_subscription
@@ -197,10 +218,57 @@ fi
 log "Running '$HOPPER init' to ensure schema (lock_timeout=30s)"
 "$HOPPER" init -db "postgres://$LOCAL_USER@localhost/$LOCAL_DB?sslmode=disable&lock_timeout=30s"
 
+# --- Remote publication ----------------------------------------------------
+# Reconcile the publisher before creating or refreshing the local
+# subscription. A subscription can have a healthy apply worker even when its
+# publication has no tables, so make the publication/table membership explicit.
+log "Ensuring remote publication '$PUBLICATION' publishes public.samples"
+psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" \
+    -v ON_ERROR_STOP=1 <<SQL
+DO \$$
+DECLARE
+    target_pub text := '$PUBLICATION';
+    old_pub    text := '$LEGACY_PUBLICATION';
+BEGIN
+    IF target_pub <> old_pub
+       AND EXISTS (SELECT 1 FROM pg_publication WHERE pubname = old_pub)
+       AND NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = target_pub) THEN
+        EXECUTE format('ALTER PUBLICATION %I RENAME TO %I', old_pub, target_pub);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = target_pub) THEN
+        EXECUTE format('CREATE PUBLICATION %I FOR TABLE public.samples', target_pub);
+    ELSIF NOT EXISTS (
+        SELECT 1
+          FROM pg_publication_tables
+         WHERE pubname = target_pub
+           AND schemaname = 'public'
+           AND tablename = 'samples'
+    ) THEN
+        EXECUTE format('ALTER PUBLICATION %I ADD TABLE public.samples', target_pub);
+    END IF;
+END \$$;
+SQL
+
 # --- Subscription ----------------------------------------------------------
 # We keep the password out of argv by passing it through psql's -v mechanism
 # (:'name' expands to a properly-quoted SQL literal inside the client).
 CONN="host=$REMOTE_HOST dbname=$REMOTE_DB user=$REMOTE_USER password=$REMOTE_PW"
+
+if [ "$SUBSCRIPTION" != "$LEGACY_SUBSCRIPTION" ] &&
+   admin -d "$LOCAL_DB" -tAc \
+        "SELECT 1 FROM pg_subscription WHERE subname = '$LEGACY_SUBSCRIPTION'" \
+        | grep -q 1 &&
+   ! admin -d "$LOCAL_DB" -tAc \
+        "SELECT 1 FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" \
+        | grep -q 1; then
+    log "Renaming legacy subscription '$LEGACY_SUBSCRIPTION' to '$SUBSCRIPTION'"
+    admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
+        -v old_sub="$LEGACY_SUBSCRIPTION" \
+        -v sub="$SUBSCRIPTION" <<'SQL'
+ALTER SUBSCRIPTION :"old_sub" RENAME TO :"sub";
+SQL
+fi
 
 sub_exists=$(admin -d "$LOCAL_DB" -tAc \
     "SELECT 1 FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" | tr -d '[:space:]')
@@ -209,10 +277,12 @@ if [ "$sub_exists" = "1" ]; then
     log "Subscription '$SUBSCRIPTION' exists — refreshing connection + tables"
     admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
         -v sub="$SUBSCRIPTION" \
+        -v pub="$PUBLICATION" \
         -v conn="$CONN" <<'SQL'
 ALTER SUBSCRIPTION :"sub" CONNECTION :'conn';
+ALTER SUBSCRIPTION :"sub" SET PUBLICATION :"pub" WITH (refresh = false);
 ALTER SUBSCRIPTION :"sub" ENABLE;
-ALTER SUBSCRIPTION :"sub" REFRESH PUBLICATION;
+ALTER SUBSCRIPTION :"sub" REFRESH PUBLICATION WITH (copy_data = true);
 SQL
 else
     # A prior run (or the retired sync-db target) may have left a replication

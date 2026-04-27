@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -74,7 +75,19 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 		// Pull-based work scheduling: claim tracking columns + index.
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS claimed_by TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ`,
-		`DROP INDEX IF EXISTS idx_samples_claimable`,
+		`DO $$
+		DECLARE
+			idxdef text;
+		BEGIN
+			SELECT pg_get_indexdef(to_regclass('idx_samples_claimable'))
+			  INTO idxdef;
+
+			IF idxdef IS NOT NULL
+			   AND (idxdef NOT ILIKE '%ON public.samples USING btree (updated_at NULLS FIRST, id)%'
+			    OR idxdef NOT ILIKE '%WHERE ((cleave_result IS NULL) AND (skip = ''''::text) AND (parent = ''''::text))%') THEN
+				DROP INDEX idx_samples_claimable;
+			END IF;
+		END$$`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_claimable ` +
 			`ON samples(updated_at ASC NULLS FIRST, id) ` +
 			`WHERE cleave_result IS NULL AND skip = '' AND parent = ''`,
@@ -261,13 +274,79 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 		`CREATE INDEX IF NOT EXISTS idx_samples_formula   ON samples(formula)   WHERE formula   != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_score     ON samples(score)     WHERE score     != 0`,
 	} {
-		slog.Info("executing migration ddl", "ddl", ddl)
-		if _, err := db.pool.Exec(ctx, ddl); err != nil {
+		if err := db.execPGMigrationDDL(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate: %w", err)
 		}
 	}
 	slog.Info("all migrations applied")
 	return nil
+}
+
+func (db *DB) execPGMigrationDDL(ctx context.Context, ddl string) error {
+	ddl = strings.TrimSpace(ddl)
+	if idx, ok := concurrentIndexDDL(ddl); ok {
+		return db.createIndexConcurrently(ctx, ddl, idx)
+	}
+
+	start := time.Now()
+	slog.Info("executing migration ddl", "ddl", ddl)
+	if _, err := db.pool.Exec(ctx, ddl); err != nil {
+		return err
+	}
+	slog.Info("migration ddl complete", "elapsed", time.Since(start).String())
+	return nil
+}
+
+func concurrentIndexDDL(ddl string) (string, bool) {
+	const prefix = "CREATE INDEX IF NOT EXISTS "
+	if !strings.HasPrefix(ddl, prefix) {
+		return "", false
+	}
+	fields := strings.Fields(ddl)
+	if len(fields) < 6 {
+		return "", false
+	}
+	return fields[5], true
+}
+
+func (db *DB) createIndexConcurrently(ctx context.Context, ddl, indexName string) error {
+	invalid, err := db.invalidPGIndex(ctx, indexName)
+	if err != nil {
+		return err
+	}
+	if invalid {
+		drop := "DROP INDEX CONCURRENTLY IF EXISTS " + indexName
+		slog.Info("dropping invalid migration index", "index", indexName, "ddl", drop)
+		if _, err := db.pool.Exec(ctx, drop); err != nil {
+			return err
+		}
+	}
+
+	ddl = strings.Replace(ddl, "CREATE INDEX IF NOT EXISTS ", "CREATE INDEX CONCURRENTLY IF NOT EXISTS ", 1)
+	start := time.Now()
+	slog.Info("executing migration ddl", "ddl", ddl)
+	if _, err := db.pool.Exec(ctx, ddl); err != nil {
+		return err
+	}
+	slog.Info("migration ddl complete", "elapsed", time.Since(start).String())
+	return nil
+}
+
+func (db *DB) invalidPGIndex(ctx context.Context, indexName string) (bool, error) {
+	var invalid bool
+	if err := db.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			  FROM pg_class c
+			  JOIN pg_namespace n ON n.oid = c.relnamespace
+			  JOIN pg_index i ON i.indexrelid = c.oid
+			 WHERE n.nspname = current_schema()
+			   AND c.relname = $1
+			   AND NOT i.indisvalid
+		)`, indexName).Scan(&invalid); err != nil {
+		return false, err
+	}
+	return invalid, nil
 }
 
 const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
@@ -1310,36 +1389,20 @@ func (db *DB) backfillArchiveMemberLitmusPG(ctx context.Context) (int64, error) 
 			return total, fmt.Errorf("hopper: backfill archive member litmus query: %w", err)
 		}
 
-		type candidate struct {
-			sha256       string
-			childLitmus  []byte
-			parentCleave []byte
-			parentLitmus []byte
-		}
-		var candidates []candidate
+		var seen, fixed int64
 		for rows.Next() {
-			var c candidate
-			if err := rows.Scan(&c.sha256, &c.childLitmus, &c.parentCleave, &c.parentLitmus); err != nil {
+			var sha256 string
+			var childLitmus, parentCleave, parentLitmus []byte
+			if err := rows.Scan(&sha256, &childLitmus, &parentCleave, &parentLitmus); err != nil {
 				rows.Close()
 				return total, fmt.Errorf("hopper: backfill archive member litmus scan: %w", err)
 			}
-			candidates = append(candidates, c)
-		}
-		if err := rows.Err(); err != nil {
-			return total, fmt.Errorf("hopper: backfill archive member litmus rows: %w", err)
-		}
-		rows.Close()
-		if len(candidates) == 0 {
-			return total, nil
-		}
-
-		var fixed int64
-		for _, c := range candidates {
-			id, ok := cleaveFileIndexForSHA(c.parentCleave, c.sha256)
+			seen++
+			id, ok := cleaveFileIndexForSHA(parentCleave, sha256)
 			if !ok {
 				continue
 			}
-			memberLitmus := litmusResultForMember(c.parentLitmus, id)
+			memberLitmus := litmusResultForMember(parentLitmus, id)
 			if len(memberLitmus) == 0 {
 				continue
 			}
@@ -1347,17 +1410,27 @@ func (db *DB) backfillArchiveMemberLitmusPG(ctx context.Context) (int64, error) 
 				UPDATE samples
 				SET litmus_result = $1, updated_at = now()
 				WHERE sha256 = $2 AND litmus_result = $3`,
-				sanitizeJSONB(memberLitmus), c.sha256, c.childLitmus)
+				sanitizeJSONB(memberLitmus), sha256, childLitmus)
 			if err != nil {
-				return total, fmt.Errorf("hopper: backfill archive member litmus update %s: %w", c.sha256, err)
+				rows.Close()
+				return total, fmt.Errorf("hopper: backfill archive member litmus update %s: %w", sha256, err)
 			}
 			fixed += tag.RowsAffected()
 		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return total, fmt.Errorf("hopper: backfill archive member litmus rows: %w", err)
+		}
+		rows.Close()
+		if seen == 0 {
+			return total, nil
+		}
+
 		total += fixed
 		if fixed > 0 {
 			slog.Info("backfill archive member litmus batch", "batch", fixed, "total", total)
 		}
-		if len(candidates) < archiveMemberLitmusBackfillBatch || fixed == 0 {
+		if seen < archiveMemberLitmusBackfillBatch || fixed == 0 {
 			return total, nil
 		}
 	}
