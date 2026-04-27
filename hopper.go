@@ -152,6 +152,7 @@ type Sample struct {
 	Elements        string // formula without counts (qualitative composition)
 	TraitsVersion   string // short prefix of traits repo commit used for analysis
 	AnalyzedAt      *time.Time
+	LastErrorAt     *time.Time
 	Mtime           *time.Time
 	MarkerMtime     *time.Time
 	CleaveResult    []byte  // raw cleave JSON, nil if unanalyzed

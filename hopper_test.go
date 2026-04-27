@@ -789,6 +789,9 @@ func TestSetNote(t *testing.T) {
 	if got.Note != "analysis timed out" {
 		t.Errorf("Note = %q, want %q", got.Note, "analysis timed out")
 	}
+	if got.LastErrorAt == nil {
+		t.Fatal("LastErrorAt not set")
+	}
 
 	if err := db.SetNote(ctx, "n1", ""); err != nil {
 		t.Fatal(err)
@@ -799,6 +802,9 @@ func TestSetNote(t *testing.T) {
 	}
 	if got.Note != "" {
 		t.Errorf("Note = %q, want empty", got.Note)
+	}
+	if got.LastErrorAt != nil {
+		t.Errorf("LastErrorAt = %v, want nil", got.LastErrorAt)
 	}
 }
 
@@ -2270,6 +2276,34 @@ func TestClaimJobsSkipsMarkedSamples(t *testing.T) {
 	}
 	if jobs[0].SHA256 != "claim1" {
 		t.Errorf("got sha256 = %q, want 'claim1'", jobs[0].SHA256)
+	}
+}
+
+func TestClaimJobsRetriesOldErrorsAfterRestart(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{SHA256: "err1", Path: "/data/a.exe", Label: "bad"})
+	if err := db.SetNote(ctx, "err1", "worker failed"); err != nil {
+		t.Fatal(err)
+	}
+
+	currentRunStart := time.Now().Add(-time.Hour)
+	jobs, err := db.ClaimJobs(ctx, "worker1", 10, 30*time.Minute, "", 7*24*time.Hour, currentRunStart, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("current-run error claimed: got %+v, want none", jobs)
+	}
+
+	restartAfterError := time.Now().Add(time.Hour)
+	jobs, err = db.ClaimJobs(ctx, "worker2", 10, 30*time.Minute, "", 7*24*time.Hour, restartAfterError, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].SHA256 != "err1" {
+		t.Fatalf("old error after restart: got %+v, want err1", jobs)
 	}
 }
 

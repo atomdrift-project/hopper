@@ -118,6 +118,12 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		}
 	}
 
+	if pragmaHasColumn(ctx, db.lite, "last_error_at") == 0 {
+		if _, err := db.lite.ExecContext(ctx, `ALTER TABLE samples ADD COLUMN last_error_at DATETIME`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite: %w", err)
+		}
+	}
+
 	hasMarkerMtime := pragmaHasColumn(ctx, db.lite, "marker_mtime")
 	if hasMarkerMtime == 0 {
 		if _, err := db.lite.ExecContext(ctx, `ALTER TABLE samples ADD COLUMN marker_mtime DATETIME`); err != nil {
@@ -266,7 +272,7 @@ const liteSampleCols = `id, sha256, source, feed, ecosystem,
 	cleave_result, litmus_result, litmus_score,
 	path, status, note, canonical_sha256, parent, skip,
 	formula, elements, score, max_crit, suspicious_count,
-	created_at, updated_at, analyzed_at, mtime, marker_mtime,
+	created_at, updated_at, analyzed_at, last_error_at, mtime, marker_mtime,
 	traits_version`
 
 // liteSampleColsLight excludes cleave_result and litmus_result to avoid
@@ -276,7 +282,7 @@ const liteSampleColsLight = `id, sha256, source, feed, ecosystem,
 	litmus_score,
 	path, status, note, canonical_sha256, parent, skip,
 	formula, elements, score, max_crit, suspicious_count,
-	created_at, updated_at, analyzed_at, mtime, marker_mtime,
+	created_at, updated_at, analyzed_at, last_error_at, mtime, marker_mtime,
 	traits_version`
 
 func scanLiteSamplesLight(rows *sql.Rows) ([]*Sample, error) {
@@ -285,14 +291,14 @@ func scanLiteSamplesLight(rows *sql.Rows) ([]*Sample, error) {
 	for rows.Next() {
 		s := &Sample{}
 		var status sql.NullString
-		var analyzedAt, mtime, markerMtime sql.NullTime
+		var analyzedAt, lastErrorAt, mtime, markerMtime sql.NullTime
 		if err := rows.Scan(
 			&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &s.LitmusScore,
 			&s.Path, &status, &s.Note, &s.CanonicalSHA256,
 			&s.Parent, &s.Skip, &s.Formula, &s.Elements,
 			&s.Score, &s.MaxCrit, &s.SuspiciousCount,
-			&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime, &markerMtime,
+			&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &lastErrorAt, &mtime, &markerMtime,
 			&s.TraitsVersion,
 		); err != nil {
 			return nil, err
@@ -300,6 +306,9 @@ func scanLiteSamplesLight(rows *sql.Rows) ([]*Sample, error) {
 		s.Status = status.String
 		if analyzedAt.Valid {
 			s.AnalyzedAt = &analyzedAt.Time
+		}
+		if lastErrorAt.Valid {
+			s.LastErrorAt = &lastErrorAt.Time
 		}
 		if mtime.Valid {
 			s.Mtime = &mtime.Time
@@ -315,12 +324,12 @@ func scanLiteSamplesLight(rows *sql.Rows) ([]*Sample, error) {
 func scanLiteSample(row *sql.Row) (*Sample, error) {
 	s := &Sample{}
 	var cleaveResult, litmusResult, status sql.NullString
-	var analyzedAt, mtime, markerMtime sql.NullTime
+	var analyzedAt, lastErrorAt, mtime, markerMtime sql.NullTime
 	err := row.Scan(
 		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &s.LitmusScore,
 		&s.Path, &status, &s.Note, &s.CanonicalSHA256, &s.Parent, &s.Skip, &s.Formula,
-		&s.Elements, &s.Score, &s.MaxCrit, &s.SuspiciousCount, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime, &markerMtime,
+		&s.Elements, &s.Score, &s.MaxCrit, &s.SuspiciousCount, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &lastErrorAt, &mtime, &markerMtime,
 		&s.TraitsVersion,
 	)
 
@@ -340,6 +349,9 @@ func scanLiteSample(row *sql.Row) (*Sample, error) {
 	if analyzedAt.Valid {
 		s.AnalyzedAt = &analyzedAt.Time
 	}
+	if lastErrorAt.Valid {
+		s.LastErrorAt = &lastErrorAt.Time
+	}
 	if mtime.Valid {
 		s.Mtime = &mtime.Time
 	}
@@ -355,14 +367,14 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 	for rows.Next() {
 		s := &Sample{}
 		var cleaveResult, litmusResult, status sql.NullString
-		var analyzedAt, mtime, markerMtime sql.NullTime
+		var analyzedAt, lastErrorAt, mtime, markerMtime sql.NullTime
 		if err := rows.Scan(
 			&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &s.LitmusScore,
 			&s.Path, &status, &s.Note, &s.CanonicalSHA256,
 			&s.Parent, &s.Skip, &s.Formula, &s.Elements,
 			&s.Score, &s.MaxCrit, &s.SuspiciousCount,
-			&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &mtime, &markerMtime,
+			&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &lastErrorAt, &mtime, &markerMtime,
 			&s.TraitsVersion,
 		); err != nil {
 			return nil, err
@@ -377,6 +389,9 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 		if analyzedAt.Valid {
 			s.AnalyzedAt = &analyzedAt.Time
 		}
+		if lastErrorAt.Valid {
+			s.LastErrorAt = &lastErrorAt.Time
+		}
 		if mtime.Valid {
 			s.Mtime = &mtime.Time
 		}
@@ -389,6 +404,13 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+
+func nullableErrorTime(note string) any {
+	if note == "" {
+		return nil
+	}
+	return now()
+}
 
 // jsonTextOrNil returns b as a string for storage in a SQLite TEXT column,
 // or nil (→ SQL NULL) when empty. SQLite's driver treats []byte as a blob;
@@ -682,6 +704,7 @@ func (db *DB) updateCleaveResultSQLite(
 			canonical_sha256 = ?, elements = ?,
 			max_crit = ?, suspicious_count = ?,
 			litmus_result = NULL,
+			note = '', last_error_at = NULL,
 			traits_version = ?,
 			analyzed_at = ?, updated_at = ?
 		WHERE sha256 = ?`,
@@ -743,8 +766,8 @@ func (db *DB) countByLabelSQLite(ctx context.Context) (map[string]int, error) {
 
 func (db *DB) setNoteSQLite(ctx context.Context, sha256, note string) error {
 	_, err := db.lite.ExecContext(ctx, `
-		UPDATE samples SET note = ?, updated_at = ? WHERE sha256 = ?`,
-		note, now(), sha256)
+		UPDATE samples SET note = ?, last_error_at = ?, updated_at = ? WHERE sha256 = ?`,
+		note, nullableErrorTime(note), now(), sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: set note: %w", err)
 	}
@@ -753,7 +776,7 @@ func (db *DB) setNoteSQLite(ctx context.Context, sha256, note string) error {
 
 func (db *DB) setStatusSQLite(ctx context.Context, sha256, status string) error {
 	_, err := db.lite.ExecContext(ctx, `
-		UPDATE samples SET status = ?, note = '', updated_at = ? WHERE sha256 = ?`,
+		UPDATE samples SET status = ?, note = '', last_error_at = NULL, updated_at = ? WHERE sha256 = ?`,
 		status, now(), sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: set status: %w", err)
@@ -956,6 +979,7 @@ func (db *DB) updateSampleSQLite(ctx context.Context, sha256, status string, res
 			canonical_sha256 = ?, elements = ?,
 			max_crit = ?, suspicious_count = ?,
 			litmus_result = NULL,
+			note = '', last_error_at = NULL,
 			analyzed_at = ?, updated_at = ?
 		WHERE sha256 = ?`,
 		status, string(result), canonical,
@@ -1655,6 +1679,7 @@ func (db *DB) claimJobsSQLite(
 	defer tx.Rollback() //nolint:errcheck // rollback is best-effort after commit
 
 	cutoff := time.Now().Add(-expiry).UTC().Format(time.RFC3339Nano)
+	startCutoff := hopperStart.UTC().Format(time.RFC3339Nano)
 
 	// Tier 1: unanalyzed samples (highest priority).
 	// ORDER BY random() spreads work across different packages/sources so a
@@ -1662,8 +1687,9 @@ func (db *DB) claimJobsSQLite(
 	selected, err := queryLiteClaimRows(ctx, tx,
 		`SELECT id, sha256, path, size_bytes, file_type FROM samples
 		WHERE cleave_result IS NULL AND skip = '' AND parent = ''
+		  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
 		  AND (claimed_by = '' OR claimed_at < ?)
-		ORDER BY random() LIMIT ?`, cutoff, limit)
+		ORDER BY random() LIMIT ?`, startCutoff, cutoff, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: claim jobs: %w", err)
 	}
@@ -1672,18 +1698,18 @@ func (db *DB) claimJobsSQLite(
 	// analysis predates this hopper run. Prior analysis stays in place until
 	// UpdateSample overwrites it.
 	if len(selected) == 0 && len(forceRescanPrefixes) > 0 {
-		startCutoff := hopperStart.UTC().Format(time.RFC3339Nano)
 		clauses := make([]string, 0, len(forceRescanPrefixes))
 		args := []any{startCutoff}
 		for _, p := range forceRescanPrefixes {
 			clauses = append(clauses, "(path = ? OR path LIKE ?)")
 			args = append(args, p, p+"/%")
 		}
-		args = append(args, cutoff, limit)
+		args = append(args, startCutoff, cutoff, limit)
 		query := `SELECT id, sha256, path, size_bytes, file_type FROM samples
 			WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
 			  AND analyzed_at < ?
 			  AND (` + strings.Join(clauses, " OR ") + `)
+			  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
 			  AND (claimed_by = '' OR claimed_at < ?)
 			ORDER BY random() LIMIT ?`
 		selected, err = queryLiteClaimRows(ctx, tx, query, args...)
@@ -1700,8 +1726,9 @@ func (db *DB) claimJobsSQLite(
 			WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
 			  AND traits_version != ?
 			  AND analyzed_at < ?
+			  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
 			  AND (claimed_by = '' OR claimed_at < ?)
-			ORDER BY random() LIMIT ?`, currentTraits, staleAge, cutoff, limit)
+			ORDER BY random() LIMIT ?`, currentTraits, staleAge, startCutoff, cutoff, limit)
 		if err != nil {
 			return nil, fmt.Errorf("hopper: claim stale-traits jobs: %w", err)
 		}

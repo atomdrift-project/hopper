@@ -55,6 +55,7 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 		`CREATE INDEX IF NOT EXISTS idx_samples_backfill_pending ON samples(sha256) WHERE cleave_result IS NOT NULL AND elements = ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_score ON samples(score) WHERE score != 0`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS mtime TIMESTAMPTZ`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS last_error_at TIMESTAMPTZ`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS marker_mtime TIMESTAMPTZ`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source ON samples(source, label, analyzed_at DESC NULLS LAST) WHERE cleave_result IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_mtime ON samples(source, label, mtime DESC NULLS LAST) WHERE cleave_result IS NOT NULL`,
@@ -272,14 +273,14 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, cleave_result, litmus_result, litmus_score,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
-	created_at, updated_at, analyzed_at, mtime, marker_mtime, traits_version`
+	created_at, updated_at, analyzed_at, last_error_at, mtime, marker_mtime, traits_version`
 
 // pgSampleColsLight excludes cleave_result and litmus_result to avoid loading
 // potentially large JSON blobs when only metadata is needed (e.g. claim queries).
 const pgSampleColsLight = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, litmus_score,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
-	created_at, updated_at, analyzed_at, mtime, marker_mtime, traits_version`
+	created_at, updated_at, analyzed_at, last_error_at, mtime, marker_mtime, traits_version`
 
 func pgSampleDest(s *Sample) []any {
 	return []any{
@@ -288,7 +289,7 @@ func pgSampleDest(s *Sample) []any {
 		&s.Path, &s.Status, &s.Note, &s.CanonicalSHA256,
 		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score,
 		&s.MaxCrit, &s.SuspiciousCount,
-		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.Mtime, &s.MarkerMtime,
+		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.LastErrorAt, &s.Mtime, &s.MarkerMtime,
 		&s.TraitsVersion,
 	}
 }
@@ -300,7 +301,7 @@ func pgSampleDestLight(s *Sample) []any {
 		&s.Path, &s.Status, &s.Note, &s.CanonicalSHA256,
 		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score,
 		&s.MaxCrit, &s.SuspiciousCount,
-		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.Mtime, &s.MarkerMtime,
+		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.LastErrorAt, &s.Mtime, &s.MarkerMtime,
 		&s.TraitsVersion,
 	}
 }
@@ -615,6 +616,7 @@ func (db *DB) updateCleaveResultPG(
 			canonical_sha256 = $3, elements = $4,
 			max_crit = $5, suspicious_count = $6,
 			litmus_result = NULL,
+			note = '', last_error_at = NULL,
 			traits_version = $7,
 			analyzed_at = now(), updated_at = now()
 		WHERE sha256 = $1`,
@@ -675,7 +677,11 @@ func (db *DB) countByLabelPG(ctx context.Context) (map[string]int, error) {
 
 func (db *DB) setNotePG(ctx context.Context, sha256, note string) error {
 	_, err := db.pool.Exec(ctx, `
-		UPDATE samples SET note = $2, updated_at = now() WHERE sha256 = $1`,
+		UPDATE samples
+		SET note = $2,
+			last_error_at = CASE WHEN $2 = '' THEN NULL ELSE now() END,
+			updated_at = now()
+		WHERE sha256 = $1`,
 		sha256, note)
 	if err != nil {
 		return fmt.Errorf("hopper: set note: %w", err)
@@ -685,7 +691,7 @@ func (db *DB) setNotePG(ctx context.Context, sha256, note string) error {
 
 func (db *DB) setStatusPG(ctx context.Context, sha256, status string) error {
 	_, err := db.pool.Exec(ctx, `
-		UPDATE samples SET status = $2, note = '', updated_at = now() WHERE sha256 = $1`,
+		UPDATE samples SET status = $2, note = '', last_error_at = NULL, updated_at = now() WHERE sha256 = $1`,
 		sha256, status)
 	if err != nil {
 		return fmt.Errorf("hopper: set status: %w", err)
@@ -886,6 +892,7 @@ func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result 
 			canonical_sha256 = $4, elements = $5,
 			max_crit = $6, suspicious_count = $7,
 			litmus_result = NULL,
+			note = '', last_error_at = NULL,
 			analyzed_at = now(), updated_at = now()
 		WHERE sha256 = $1`,
 		sha256, status, sanitizeJSONB(result), canonical,
@@ -1560,6 +1567,7 @@ func (db *DB) claimJobsPG(
 		WITH claimable AS (
 			SELECT id FROM samples
 			WHERE cleave_result IS NULL AND skip = '' AND parent = ''
+			  AND (note = '' OR last_error_at IS NULL OR last_error_at < $4)
 			  AND (claimed_by = '' OR claimed_at < now() - $2::interval)
 			ORDER BY random()
 			LIMIT $3
@@ -1568,7 +1576,7 @@ func (db *DB) claimJobsPG(
 		UPDATE samples SET claimed_by = $1, claimed_at = now()
 		FROM claimable WHERE samples.id = claimable.id
 		RETURNING samples.sha256, samples.path, samples.size_bytes, samples.file_type`,
-		worker, expiry, limit)
+		worker, expiry, limit, hopperStart.UTC())
 	if err != nil {
 		return nil, fmt.Errorf("hopper: claim jobs: %w", err)
 	}
@@ -1590,6 +1598,7 @@ func (db *DB) claimJobsPG(
 				WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
 				  AND analyzed_at < $4
 				  AND (path = ANY($5) OR path LIKE ANY($5))
+				  AND (note = '' OR last_error_at IS NULL OR last_error_at < $4)
 				  AND (claimed_by = '' OR claimed_at < now() - $2::interval)
 				ORDER BY random()
 				LIMIT $3
@@ -1623,6 +1632,7 @@ func (db *DB) claimJobsPG(
 			WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
 			  AND traits_version != $4
 			  AND analyzed_at < $5
+			  AND (note = '' OR last_error_at IS NULL OR last_error_at < $6)
 			  AND (claimed_by = '' OR claimed_at < now() - $2::interval)
 			ORDER BY random()
 			LIMIT $3
@@ -1631,7 +1641,7 @@ func (db *DB) claimJobsPG(
 		UPDATE samples SET claimed_by = $1, claimed_at = now()
 		FROM reclaimable WHERE samples.id = reclaimable.id
 		RETURNING samples.sha256, samples.path, samples.size_bytes, samples.file_type`,
-		worker, expiry, limit, currentTraits, time.Now().Add(-rescanAge).UTC())
+		worker, expiry, limit, currentTraits, time.Now().Add(-rescanAge).UTC(), hopperStart.UTC())
 	if err != nil {
 		return nil, fmt.Errorf("hopper: claim stale-traits jobs: %w", err)
 	}

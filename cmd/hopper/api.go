@@ -477,6 +477,9 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 					"path", samplePath, "skip", skip, "reason", clientErr)
 			}
 		} else {
+			if err := s.db.SetNote(ctx, req.SHA256, clientErr); err != nil {
+				slog.Error("record analysis error failed", "sha256", req.SHA256, "error", err)
+			}
 			// Transient error — release claim so another worker can try.
 			if err := s.db.UnclaimJobs(ctx, []string{req.SHA256}); err != nil {
 				slog.Error("unclaim failed", "sha256", req.SHA256, "error", err)

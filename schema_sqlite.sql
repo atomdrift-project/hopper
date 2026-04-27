@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS samples (
 	updated_at    DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
 
 	analyzed_at   DATETIME,
+	last_error_at DATETIME,
 	mtime         DATETIME,
 	marker_mtime  DATETIME,
 	claimed_by    TEXT NOT NULL DEFAULT '',
