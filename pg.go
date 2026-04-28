@@ -1441,8 +1441,8 @@ func (db *DB) backfillArchiveMemberLitmusPG(ctx context.Context) (int64, error) 
 			SELECT sha256 FROM samples
 			WHERE parent = $1
 				AND litmus_result IS NOT NULL
-				AND pg_column_size(litmus_result) = pg_column_size($2)
-				AND litmus_result = $2`, parentSHA, parentLitmus)
+				AND pg_column_size(litmus_result) = pg_column_size($2::jsonb)
+				AND litmus_result = $2::jsonb`, parentSHA, parentLitmus)
 		if err != nil {
 			return total, fmt.Errorf("hopper: backfill archive member litmus children: %w", err)
 		}
