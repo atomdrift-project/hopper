@@ -39,6 +39,7 @@ commands:
   serve              start a local postgres server with hopper schema
   init               create/migrate a hopper database (sqlite or postgres)
   load               load sample files from directories
+  ingest-reports     ingest cyclotron Markdown reports from a directory
   reset              delete all samples and reports (preserves schema)
   import             transfer samples between hopper databases (sqlite↔postgres)
   false-positives    list known-good files that still score bad
@@ -252,6 +253,8 @@ func run(ctx context.Context) error {
 		return cmdImport(ctx)
 	case "load":
 		return cmdLoad(ctx)
+	case "ingest-reports":
+		return cmdIngestReports(ctx)
 	case "reset":
 		return cmdReset(ctx)
 	case "false-positives":
@@ -567,6 +570,124 @@ func cmdImport(ctx context.Context) error {
 	return nil
 }
 
+type reportIngestStats struct {
+	Scanned              int
+	Inserted             int
+	SkippedExisting      int
+	SkippedMissingSample int
+	SkippedInvalid       int
+}
+
+func cmdIngestReports(ctx context.Context) error {
+	f := flag.NewFlagSet("ingest-reports", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	dir := f.String("dir", "reports", "directory containing cyclotron reports named <sha256>.md")
+	reportType := f.String("type", "re", "report type to store")
+	provider := f.String("provider", "cyclotron", "report provider name")
+	parseFlags(f, os.Args[2:])
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		return err
+	}
+
+	stats, err := ingestReportsDir(ctx, db, *dir, *reportType, *provider)
+	if err != nil {
+		return err
+	}
+	slog.Info("report ingest complete",
+		"dir", *dir,
+		"type", *reportType,
+		"scanned", stats.Scanned,
+		"inserted", stats.Inserted,
+		"skipped_existing", stats.SkippedExisting,
+		"skipped_missing_sample", stats.SkippedMissingSample,
+		"skipped_invalid", stats.SkippedInvalid)
+	return nil
+}
+
+func ingestReportsDir(ctx context.Context, db *hopper.DB, dir, reportType, provider string) (reportIngestStats, error) {
+	var stats reportIngestStats
+	if dir == "" {
+		return stats, nil
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return stats, fmt.Errorf("stat reports dir: %w", err)
+	}
+	if !info.IsDir() {
+		return stats, fmt.Errorf("reports path is not a directory: %s", dir)
+	}
+
+	err = filepath.WalkDir(dir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if entry.IsDir() {
+			if path != dir && strings.HasPrefix(entry.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+
+		stats.Scanned++
+		name := entry.Name()
+		if filepath.Ext(name) != ".md" {
+			stats.SkippedInvalid++
+			return nil
+		}
+		sha := strings.TrimSuffix(name, ".md")
+		if !validSHA256(sha) {
+			stats.SkippedInvalid++
+			return nil
+		}
+
+		if _, err := db.SampleBySHA256(ctx, sha); err != nil {
+			if errors.Is(err, hopper.ErrNotFound) {
+				stats.SkippedMissingSample++
+				return nil
+			}
+			return err
+		}
+		content, err := os.ReadFile(path) //nolint:gosec // path comes from trusted local ingest dir walk
+		if err != nil {
+			return err
+		}
+		if report, err := db.LatestReport(ctx, sha, reportType); err == nil {
+			if report.Content == string(content) {
+				stats.SkippedExisting++
+				return nil
+			}
+		} else if !errors.Is(err, hopper.ErrNotFound) {
+			return err
+		}
+		if err := db.InsertReport(ctx, &hopper.Report{
+			SHA256:   sha,
+			Type:     reportType,
+			Content:  string(content),
+			Provider: provider,
+		}); err != nil {
+			return err
+		}
+		stats.Inserted++
+		return nil
+	})
+	if err != nil {
+		return stats, fmt.Errorf("walk reports dir: %w", err)
+	}
+	return stats, nil
+}
+
 func cmdReset(ctx context.Context) error {
 	f := flag.NewFlagSet("reset", flag.ExitOnError)
 	dsn := f.String("db", "", "database (postgres:// DSN or sqlite file path)")
@@ -631,6 +752,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	dashAddr := f.String("dashboard-addr", "0.0.0.0:8081", "web dashboard listen address (empty to disable)")
 	localOnly := f.Bool("local", false, "listen only on loopback for dashboard and worker API")
 	maxFileMB := f.Int64("max-file-size", defaultMaxFileSize/(1024*1024), "skip files larger than this many MiB")
+	reportsDir := f.String("reports-dir", "", "cyclotron reports directory to ingest (<sha>.md, optional)")
 	var forceRescanDirs stringListFlag
 	f.Var(&forceRescanDirs, "force-rescan", "directory prefix to force re-analysis for; may be repeated or comma-separated")
 	parseFlags(f, os.Args[2:])
@@ -951,6 +1073,22 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 
 	total := loadAll(loadCtx, loadCancel, db, litmus, tracker, api, cache,
 		loadDirs, fileChs, *source, *hashWorkers, *rescan, *maxAnalyzed, *experimentTag, wd, traitsVersion, *rescanAge)
+	if *reportsDir != "" {
+		wd.beginStage("reports.ingest", "Ingesting reports")
+		stats, err := ingestReportsDir(ctx, db, *reportsDir, "re", "cyclotron")
+		if err != nil {
+			wd.failStage("reports.ingest", err.Error())
+			return err
+		}
+		wd.endStage("reports.ingest")
+		slog.Info("report ingest complete",
+			"dir", *reportsDir,
+			"scanned", stats.Scanned,
+			"inserted", stats.Inserted,
+			"skipped_existing", stats.SkippedExisting,
+			"skipped_missing_sample", stats.SkippedMissingSample,
+			"skipped_invalid", stats.SkippedInvalid)
+	}
 	slog.Info("file walk complete, serving API until interrupted", "samples", total)
 
 	// Block until interrupted — workers are still draining the analysis queue.

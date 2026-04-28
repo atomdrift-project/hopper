@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -527,13 +529,19 @@ func TestCmdLoadIntegration(t *testing.T) {
 	ctx := t.Context()
 	dbPath := filepath.Join(t.TempDir(), "load-test.db")
 	dir := t.TempDir()
-	mustWriteFile(t, filepath.Join(dir, "sample1.bin"), []byte("malicious content!"))
+	sample1 := []byte("malicious content!")
+	sample1Sum := sha256.Sum256(sample1)
+	sample1SHA := hex.EncodeToString(sample1Sum[:])
+	mustWriteFile(t, filepath.Join(dir, "sample1.bin"), sample1)
 	mustWriteFile(t, filepath.Join(dir, "sample2.bin"), []byte("another evil file!"))
+	reportsDir := filepath.Join(t.TempDir(), "reports")
+	mustMkdir(t, reportsDir)
+	mustWriteFile(t, filepath.Join(reportsDir, sample1SHA+".md"), []byte("# Loaded report\n"))
 
 	data := t.TempDir()
 	mustMkdir(t, filepath.Join(data, "bad"))
 	mustRename(t, dir, filepath.Join(data, "bad", "test"))
-	withArgs([]string{"hopper", "load", "-db", dbPath, "-data", data, "-workers", "2", "-litmus", ""}, func() {
+	withArgs([]string{"hopper", "load", "-db", dbPath, "-data", data, "-workers", "2", "-litmus", "", "-reports-dir", reportsDir}, func() {
 		if err := cmdLoad(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -560,10 +568,18 @@ func TestCmdLoadIntegration(t *testing.T) {
 			t.Fatalf("stored path %q, want under bad/test/", s.Path)
 		}
 	}
+	report, err := db.LatestReport(ctx, sample1SHA, "re")
+	if err != nil {
+		t.Fatalf("latest report: %v", err)
+	}
+	if report.Content != "# Loaded report\n" {
+		t.Fatalf("report content = %q", report.Content)
+	}
 }
 
 func TestCmdImport(t *testing.T) {
 	ctx := t.Context()
+	sha := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 	// Set up source DB with a sample.
 	srcPath := filepath.Join(t.TempDir(), "src.db")
@@ -571,10 +587,10 @@ func TestCmdImport(t *testing.T) {
 	if err := src.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := src.InsertSample(ctx, &hopper.Sample{SHA256: "imp1", Source: "test", Label: "bad", LabelSource: "test"}); err != nil {
+	if err := src.InsertSample(ctx, &hopper.Sample{SHA256: sha, Source: "test", Label: "bad", LabelSource: "test", Path: "bad/imported"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := src.InsertReport(ctx, &hopper.Report{SHA256: "imp1", Type: "re", Content: "report"}); err != nil {
+	if err := src.InsertReport(ctx, &hopper.Report{SHA256: sha, Type: "re", Content: "report"}); err != nil {
 		t.Fatal(err)
 	}
 	src.Close()
@@ -588,12 +604,75 @@ func TestCmdImport(t *testing.T) {
 
 	dst := mustOpenDB(t, ctx, dstPath)
 	defer dst.Close()
-	got, err := dst.SampleBySHA256(ctx, "imp1")
+	got, err := dst.SampleBySHA256(ctx, sha)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.Label != "bad" {
 		t.Errorf("label = %q, want bad", got.Label)
+	}
+}
+
+func TestIngestReportsDir(t *testing.T) {
+	ctx := t.Context()
+	dbPath := filepath.Join(t.TempDir(), "reports.db")
+	db := mustOpenDB(t, ctx, dbPath)
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	shaWithReport := "008a1e2cfd6bf252151738bcff2b1796d0866bf8dda2e0d51d5d581e19b45cce"
+	shaExisting := "1111111111111111111111111111111111111111111111111111111111111111"
+	shaMissingSample := "2222222222222222222222222222222222222222222222222222222222222222"
+
+	if err := db.InsertSample(ctx, &hopper.Sample{SHA256: shaWithReport, Source: "test", Label: "bad", LabelSource: "test", Path: "bad/sample"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertSample(ctx, &hopper.Sample{SHA256: shaExisting, Source: "test", Label: "bad", LabelSource: "test", Path: "bad/existing"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertReport(ctx, &hopper.Report{SHA256: shaExisting, Type: "re", Content: "# Existing"}); err != nil {
+		t.Fatal(err)
+	}
+
+	reportsDir := filepath.Join(t.TempDir(), "reports")
+	mustMkdir(t, reportsDir)
+	mustWriteFile(t, filepath.Join(reportsDir, shaWithReport+".md"), []byte("# RE report\n"))
+	mustWriteFile(t, filepath.Join(reportsDir, shaExisting+".md"), []byte("# Should not duplicate\n"))
+	mustWriteFile(t, filepath.Join(reportsDir, shaMissingSample+".md"), []byte("# No sample\n"))
+	mustWriteFile(t, filepath.Join(reportsDir, "not-a-sha.md"), []byte("# Invalid\n"))
+	mustWriteFile(t, filepath.Join(reportsDir, shaWithReport+".txt"), []byte("# Wrong extension\n"))
+
+	stats, err := ingestReportsDir(ctx, db, reportsDir, "re", "cyclotron")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Inserted != 2 || stats.SkippedExisting != 0 || stats.SkippedMissingSample != 1 || stats.SkippedInvalid != 2 {
+		t.Fatalf("stats = %+v, want inserted=2 existing=0 missing=1 invalid=2", stats)
+	}
+
+	report, err := db.LatestReport(ctx, shaWithReport, "re")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Content != "# RE report\n" || report.Provider != "cyclotron" {
+		t.Fatalf("report = %#v", report)
+	}
+	existing, err := db.LatestReport(ctx, shaExisting, "re")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if existing.Content != "# Should not duplicate\n" {
+		t.Fatalf("existing latest report = %#v", existing)
+	}
+
+	stats, err = ingestReportsDir(ctx, db, reportsDir, "re", "cyclotron")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Inserted != 0 || stats.SkippedExisting != 2 {
+		t.Fatalf("second stats = %+v, want inserted=0 existing=2", stats)
 	}
 }
 
