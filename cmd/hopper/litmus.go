@@ -42,6 +42,7 @@ type litmusServer struct {
 	building   atomic.Bool
 	pid        atomic.Int64
 	restarts   atomic.Int64
+	logPath    atomic.Pointer[string] // current worker's stdout/stderr log file
 }
 
 // litmusConfig holds options for starting a litmus worker.
@@ -79,6 +80,54 @@ func closeLogFile(name string, f *os.File) {
 		//nolint:gosec // value is sanitized before logging; this is a false positive on slog taint flow.
 		slog.Warn("failed to close litmus log file", "log", sanitizeLogString(name), "error", err)
 	}
+}
+
+// tailLogFile returns the last few lines of path, capped at maxBytes bytes
+// and maxLines lines. Returns "" on any error so callers can include it
+// unconditionally in a slog record.
+func tailLogFile(path string) string {
+	if path == "" {
+		return ""
+	}
+	const (
+		maxBytes = 4096
+		maxLines = 30
+	)
+	f, err := os.Open(path) //nolint:gosec // path is the temp file we created at startup
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	size := fi.Size()
+	offset := int64(0)
+	if size > maxBytes {
+		offset = size - maxBytes
+	}
+	buf := make([]byte, size-offset)
+	n, _ := f.ReadAt(buf, offset)
+	if n == 0 {
+		return ""
+	}
+	out := string(buf[:n])
+	// If we seeked into the middle of a line, drop the partial first line.
+	if offset > 0 {
+		if i := strings.IndexByte(out, '\n'); i >= 0 {
+			out = out[i+1:]
+		}
+	}
+	out = strings.TrimRight(out, "\n")
+	if out == "" {
+		return ""
+	}
+	lines := strings.Split(out, "\n")
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	return sanitizeLogString(strings.Join(lines, "\n"))
 }
 
 func sanitizeLogString(s string) string {
@@ -186,6 +235,8 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create litmus log file: %w", err)
 	}
+	logName := logFile.Name()
+	s.logPath.Store(&logName)
 
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -343,11 +394,17 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 			continue
 		}
 		restarts := int(s.restarts.Add(1))
+		logPath := ""
+		if p := s.logPath.Load(); p != nil {
+			logPath = *p
+		}
 		slog.Warn("litmus server crashed",
 			"pid", pid,
 			"url", s.hopperURL,
 			"error", err,
-			"restarts", restarts)
+			"restarts", restarts,
+			"log", sanitizeLogString(logPath),
+			"tail", tailLogFile(logPath))
 
 		delay := min(time.Duration(1<<min(restarts-1, 7))*time.Second, 2*time.Minute)
 		slog.Info("restarting litmus server",
