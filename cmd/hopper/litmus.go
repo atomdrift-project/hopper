@@ -554,6 +554,40 @@ func refreshLitmusRules(ctx context.Context, bin string) {
 	}
 }
 
+// preflightLitmusValidate runs `litmus validate` synchronously so we discover
+// a broken model / rules bundle once, here, rather than watching the worker
+// crash-loop with exit status 1 (the worker subcommand runs the same check at
+// startup). On failure the worker is not started; remote workers can still
+// connect. Output is captured and logged so journalctl is self-contained.
+func preflightLitmusValidate(ctx context.Context, bin string) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "validate") //nolint:gosec // bin path is from trusted CLI flag
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		slog.Error("litmus validate failed; worker startup would crash-loop on the same check",
+			"bin", bin,
+			"error", err,
+			"output", lastLines(out, 30))
+		return err
+	}
+	slog.Info("litmus validate passed", "bin", bin, "output", sanitizeLogString(strings.TrimSpace(string(out))))
+	return nil
+}
+
+// lastLines returns the trailing maxLines of b, sanitized for slog.
+func lastLines(b []byte, maxLines int) string {
+	s := strings.TrimRight(string(b), "\n")
+	if s == "" {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	return sanitizeLogString(strings.Join(lines, "\n"))
+}
+
 // litmusTraitsVersion runs `litmus -f json version` and returns the
 // first 5 characters of the traits commit hash. Returns "" on any error.
 func litmusTraitsVersion(ctx context.Context, bin string) string {

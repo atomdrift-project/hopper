@@ -851,6 +851,20 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		if traitsVersion != "" {
 			slog.Info("traits version for rescan", "version", traitsVersion)
 		}
+
+		// Pre-flight: run `litmus validate` against the freshly refreshed
+		// bundle. The worker subcommand re-runs this on every spawn, so a
+		// failure here turns into a restart loop with opaque "exit status 1"
+		// messages. Surface it once, clearly, and skip starting the worker
+		// — remote workers stay reachable, no crash spam.
+		wd.beginStage("litmus.validate", "Validating litmus bundle")
+		if err := preflightLitmusValidate(ctx, *litmusBin); err != nil {
+			wd.failStage("litmus.validate", "validate failed: "+err.Error())
+			slog.Warn("skipping local litmus worker startup until validate passes", "bin", *litmusBin)
+			*litmusBin = ""
+		} else {
+			wd.endStage("litmus.validate")
+		}
 	}
 
 	// Now start litmus and the rest of the startup work.
