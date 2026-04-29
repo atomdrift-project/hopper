@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -591,13 +592,15 @@ func commandDiagnostics(cmd *exec.Cmd) []any {
 	if lp, err := exec.LookPath(cmd.Path); err == nil {
 		resolved = lp
 	}
-	envKeys := []string{
+	unsetKeys := []string{
 		"CLEAVE_TRAITS_DIR",
 		"LITMUS_MODELS_DIR",
-		"HOME",
 		"XDG_CONFIG_HOME",
-		"XDG_CACHE_HOME",
 		"XDG_DATA_HOME",
+	}
+	setKeys := []string{
+		"HOME",
+		"XDG_CACHE_HOME",
 		"PATH",
 	}
 	attrs := []any{
@@ -605,14 +608,15 @@ func commandDiagnostics(cmd *exec.Cmd) []any {
 		"argv", cmd.Args,
 		"command", shellCommand(cmd.Args),
 		"resolved_bin", resolved,
-		"reproduce", reproduceCommand(cmd, wd, envKeys),
+		"traits_dir", resolvedTraitsDir(cmd),
+		"models_dir", resolvedModelsDir(cmd),
+		"reproduce", reproduceCommand(cmd, wd, unsetKeys, setKeys),
+		"reproduce_as_hopper", "sudo -u hopper " + reproduceCommand(cmd, wd, unsetKeys, setKeys),
 	}
-	for _, key := range envKeys {
-		val, ok := cmdEnvValue(cmd, key)
-		if !ok {
-			val = "<unset>"
+	for _, key := range append(setKeys, unsetKeys...) {
+		if val, ok := cmdEnvValue(cmd, key); ok && val != "" {
+			attrs = append(attrs, key, val)
 		}
-		attrs = append(attrs, key, val)
 	}
 	return attrs
 }
@@ -627,17 +631,60 @@ func cmdEnvValue(cmd *exec.Cmd, key string) (string, bool) {
 	return "", false
 }
 
-func reproduceCommand(cmd *exec.Cmd, wd string, envKeys []string) string {
+func resolvedTraitsDir(cmd *exec.Cmd) string {
+	if val, ok := cmdEnvValue(cmd, "CLEAVE_TRAITS_DIR"); ok && val != "" {
+		return val
+	}
+	if looksLikeTraitsDir(filepath.Join("traits")) {
+		return filepath.Join("traits")
+	}
+	home := cmdHome(cmd)
+	if home == "" {
+		return filepath.Join("cleave", "traits")
+	}
+	return filepath.Join(home, ".local", "share", "cleave", "traits")
+}
+
+func resolvedModelsDir(cmd *exec.Cmd) string {
+	if val, ok := cmdEnvValue(cmd, "LITMUS_MODELS_DIR"); ok && val != "" {
+		return val
+	}
+	home := cmdHome(cmd)
+	if home == "" {
+		return filepath.Join("litmus", "models")
+	}
+	return filepath.Join(home, ".local", "share", "litmus", "models")
+}
+
+func cmdHome(cmd *exec.Cmd) string {
+	if val, ok := cmdEnvValue(cmd, "HOME"); ok && val != "" {
+		return val
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return home
+	}
+	return ""
+}
+
+func looksLikeTraitsDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+func reproduceCommand(cmd *exec.Cmd, wd string, unsetKeys, setKeys []string) string {
 	var parts []string
 	if wd != "" {
 		parts = append(parts, "cd", shellQuote(wd), "&&")
 	}
 	parts = append(parts, "env")
-	for _, key := range envKeys {
+	for _, key := range unsetKeys {
+		if _, ok := cmdEnvValue(cmd, key); !ok {
+			parts = append(parts, "-u", key)
+		}
+	}
+	for _, key := range setKeys {
 		if val, ok := cmdEnvValue(cmd, key); ok {
 			parts = append(parts, key+"="+shellQuote(val))
-		} else {
-			parts = append(parts, "-u", key)
 		}
 	}
 	parts = append(parts, shellCommand(cmd.Args))

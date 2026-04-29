@@ -22,6 +22,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -74,6 +75,36 @@ func writeStdoutLine(s string) {
 	if _, err := fmt.Println(s); err != nil {
 		slog.Debug("stdout write failed", "error", err)
 	}
+}
+
+func runtimeIdentityAttrs() []any {
+	attrs := []any{
+		"pid", os.Getpid(),
+		"go", runtime.Version(),
+	}
+	if exe, err := os.Executable(); err == nil {
+		attrs = append(attrs, "executable", exe)
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if info.Main.Version != "" && info.Main.Version != "(devel)" {
+			attrs = append(attrs, "module_version", info.Main.Version)
+		}
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				if len(setting.Value) > 12 {
+					attrs = append(attrs, "vcs_revision", setting.Value[:12])
+				} else {
+					attrs = append(attrs, "vcs_revision", setting.Value)
+				}
+			case "vcs.time":
+				attrs = append(attrs, "vcs_time", setting.Value)
+			case "vcs.modified":
+				attrs = append(attrs, "vcs_modified", setting.Value)
+			}
+		}
+	}
+	return attrs
 }
 
 func parseFlags(f *flag.FlagSet, args []string) {
@@ -914,14 +945,17 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	for _, d := range loadDirs {
 		dirNames = append(dirNames, d.label)
 	}
-	slog.Info("load starting",
+	attrs := []any{
 		"data", *dataDir,
 		"labels", dirNames,
 		"workers", *hashWorkers,
 		"rescan", *rescan,
 		"cache", !*noCache,
 		"max_analyzed", *maxAnalyzed,
-		"experiment", *experimentTag)
+		"experiment", *experimentTag,
+	}
+	attrs = append(attrs, runtimeIdentityAttrs()...)
+	slog.Info("load starting", attrs...)
 
 	// Start file enumeration early — cleave iter-files doesn't need the
 	// hash cache or database, so overlap it with those slower init steps.

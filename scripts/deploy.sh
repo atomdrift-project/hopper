@@ -183,7 +183,7 @@ CacheDirectoryMode=0750
 
 WorkingDirectory=%S/${SERVICE_NAME}
 ExecStart=${BIN_PATH} load --data ${DATA_DIR} --db ${DB} --source ${SOURCE} --dashboard-addr ${DASH_ADDR} --litmus ${LITMUS_BIN} --cleave ${CLEAVE_BIN}${workers_arg}
-Restart=always
+Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=60s
 
