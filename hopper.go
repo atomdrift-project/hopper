@@ -612,10 +612,7 @@ func (db *DB) Close() {
 // Pool returns the underlying PostgreSQL connection pool, or nil for SQLite.
 func (db *DB) Pool() *pgxpool.Pool { return db.pool }
 
-// Migrate creates the schema if it does not exist, then backfills any
-// rows missing derivable columns. The backfill is gated on the file_type
-// column being empty so it's a single indexed count on already-migrated
-// databases.
+// Migrate creates the schema if it does not exist.
 func (db *DB) Migrate(ctx context.Context) error {
 	if db.pool != nil {
 		if err := db.migratePG(ctx); err != nil {
@@ -626,15 +623,6 @@ func (db *DB) Migrate(ctx context.Context) error {
 			return err
 		}
 	}
-	slog.Info("starting post-migrate backfill")
-	stats, err := db.Backfill(ctx)
-	if err != nil {
-		return fmt.Errorf("hopper: post-migrate backfill: %w", err)
-	}
-	if stats.Updated > 0 || stats.MarkersCleared > 0 {
-		slog.Info("post-migrate backfill", "scanned", stats.Scanned, "updated", stats.Updated, "markers_cleared", stats.MarkersCleared)
-	}
-	slog.Info("post-migrate backfill complete")
 	return nil
 }
 
@@ -1347,23 +1335,44 @@ type BackfillStats struct {
 	MarkersCleared int64 // skip='misclassified' rows reset to skip='' under the new heuristic
 }
 
+// BackfillPending reports how much work each Backfill pass currently has.
+type BackfillPending struct {
+	CleaveColumns         int64 // elements / max_crit / suspicious_count from cleave_result
+	ArchiveMemberLitmus   int64 // archive members that still carry the parent's litmus_result blob
+	ArchiveMemberAnalyzed int64 // archive members missing analyzed_at while their parent has it
+	StaleGoodMarkers      int64 // good marker misclassification skips that can be cleared
+	StaleBadMarkers       int64 // bad marker misclassification skips that can be cleared
+}
+
+func (p BackfillPending) TotalRows() int64 {
+	return p.CleaveColumns + p.ArchiveMemberLitmus + p.ArchiveMemberAnalyzed + p.StaleGoodMarkers + p.StaleBadMarkers
+}
+
 const (
 	archiveMemberLitmusBackfillBatch = 5000
 	archiveMemberLitmusWorkers       = 24
 )
 
-// Backfill re-derives columns from cleave_result and litmus_result for every
-// sample with at least one of those blobs, updating rows where the stored
-// values disagree with what the parsers produce. Useful after parser changes
-// or for rows that pre-date a column being populated on write.
+// Backfill re-derives mutable columns from cleave_result and litmus_result,
+// updating rows where the stored values disagree with what the parsers produce.
+// Useful after parser changes or for rows that pre-date a column being
+// populated on write.
 //
-// Currently backfills: formula, elements, score, file_type (from cleave_result),
-// litmus_score (from litmus_result), and analyzed_at on archive members.
+// Currently backfills: elements, max_crit, suspicious_count, archive member
+// litmus_result, archive member analyzed_at, and stale misclassified markers.
 func (db *DB) Backfill(ctx context.Context) (BackfillStats, error) {
 	if db.pool != nil {
 		return db.backfillPG(ctx)
 	}
 	return db.backfillSQLite(ctx)
+}
+
+// BackfillPending counts rows matched by each explicit Backfill pass.
+func (db *DB) BackfillPending(ctx context.Context) (BackfillPending, error) {
+	if db.pool != nil {
+		return db.backfillPendingPG(ctx)
+	}
+	return db.backfillPendingSQLite(ctx)
 }
 
 // RecomputeCanonicalSHA256 recalculates canonical_sha256 for all analyzed

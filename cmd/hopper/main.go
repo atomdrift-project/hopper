@@ -821,6 +821,8 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	}
 	wd.endStage("discover")
 
+	prepStart := time.Now()
+
 	// Rebuild tools first so we can bail early if litmus or cleave is broken.
 	// Both builds run in parallel; once done we update litmus rules and check
 	// the traits version — all before touching the database.
@@ -953,29 +955,30 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		err error
 	}
 	dbCh := make(chan dbResult, 1)
+	dbStart := time.Now()
 	go func() {
+		slog.Info("database startup task started")
 		wd.beginStage("db.connect", "Connecting to database")
 		d, err := openDB(ctx, *dsn)
 		if err != nil {
 			wd.failStage("db.connect", err.Error())
+			slog.Error("database connection failed", "elapsed", time.Since(dbStart), "error", err)
 			dbCh <- dbResult{err: err}
 			return
 		}
 		wd.endStage("db.connect")
-		// Backfill can dominate startup on large tables. Feed its per-batch
-		// counter into the same stage so the row shows "1.2M / 2.5M (49%)".
+		slog.Info("database connection established", "elapsed", time.Since(dbStart))
 		wd.beginStage("db.migrate", "Migrating database")
-		d.SetBackfillProgress(func(current, total int64) {
-			wd.updateStage("db.migrate", current, total)
-		})
 		slog.Info("running schema migrations")
 		if err := d.Migrate(ctx); err != nil {
 			wd.failStage("db.migrate", err.Error())
 			d.Close()
+			slog.Error("schema migrations failed", "elapsed", time.Since(dbStart), "error", err)
 			dbCh <- dbResult{err: err}
 			return
 		}
 		wd.endStage("db.migrate")
+		slog.Info("database startup task complete", "elapsed", time.Since(dbStart))
 		dbCh <- dbResult{db: d}
 	}()
 
@@ -995,21 +998,31 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		}
 	}
 
-	slog.Info("waiting for database")
-	dr := <-dbCh
+	var dr dbResult
+	select {
+	case dr = <-dbCh:
+	default:
+		waitStart := time.Now()
+		slog.Info("waiting for database startup task", "already_elapsed", time.Since(dbStart))
+		dr = <-dbCh
+		slog.Info("database startup wait complete", "waited", time.Since(waitStart), "total_elapsed", time.Since(dbStart))
+	}
 	if dr.err != nil {
 		return dr.err
 	}
 	db := dr.db
 	defer db.Close()
-	slog.Info("database ready")
+	slog.Info("database ready", "elapsed", time.Since(dbStart), "next", "relativize sample paths")
 
 	wd.beginStage("db.relativize", "Relativizing sample paths")
+	relativizeStart := time.Now()
+	slog.Info("relativizing stored sample paths")
 	if n, err := db.RelativizePaths(ctx, *dataDir); err != nil {
 		wd.failStage("db.relativize", err.Error())
+		slog.Error("failed to relativize stored sample paths", "elapsed", time.Since(relativizeStart), "error", err)
 		return err
-	} else if n > 0 {
-		slog.Info("relativized stored sample paths", "samples", n)
+	} else {
+		slog.Info("relativized stored sample paths", "samples", n, "elapsed", time.Since(relativizeStart))
 	}
 	wd.endStage("db.relativize")
 
@@ -1024,15 +1037,14 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 
 	// Clear stale claims from previous runs so those samples get re-queued.
 	wd.beginStage("db.unclaim", "Clearing stale worker claims")
+	unclaimStart := time.Now()
 	slog.Info("clearing stale claims")
 	if n, err := db.UnclaimAll(ctx); err != nil {
 		wd.failStage("db.unclaim", err.Error())
-		slog.Warn("failed to clear stale claims", "error", err)
+		slog.Warn("failed to clear stale claims", "elapsed", time.Since(unclaimStart), "error", err)
 	} else {
 		wd.endStage("db.unclaim")
-		if n > 0 {
-			slog.Info("cleared stale claims from previous run", "count", n)
-		}
+		slog.Info("cleared stale claims from previous run", "count", n, "elapsed", time.Since(unclaimStart))
 	}
 
 	slog.Info("waiting for litmus")
@@ -1084,6 +1096,14 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 
 	api.traitsVersion = traitsVersion
 	api.rescanAge = *rescanAge
+
+	slog.Info("load prep complete",
+		"elapsed", time.Since(prepStart),
+		"dirs", len(loadDirs),
+		"allowed_dirs", len(allowedDirs),
+		"local_litmus", litmus != nil,
+		"cache", cache != nil,
+		"next", "load samples")
 
 	total := loadAll(loadCtx, loadCancel, db, litmus, tracker, api, cache,
 		loadDirs, fileChs, *source, *hashWorkers, *rescan, *maxAnalyzed, *experimentTag, wd, traitsVersion, *rescanAge)
@@ -2157,20 +2177,39 @@ func cmdBackfill(ctx context.Context) error {
 	}
 	defer db.Close()
 
-	// Migrate runs the schema migrations (so newly added columns exist)
-	// and performs an initial Backfill pass. We then re-invoke Backfill so
-	// the CLI can surface fresh stats; the second pass is an idempotent
-	// no-op if Migrate already did the work.
+	// Migrate runs only schema migrations. Backfill is intentionally explicit
+	// so normal startup/load paths do not spend minutes rewriting old rows.
 	if err := db.Migrate(ctx); err != nil {
 		return err
 	}
-	slog.Info("backfilling derivable columns from cleave_result and litmus_result")
+
+	pending, err := db.BackfillPending(ctx)
+	if err != nil {
+		return err
+	}
+	logBackfillPending(pending)
+	if pending.TotalRows() == 0 {
+		slog.Info("backfill skipped; no matching rows")
+		return nil
+	}
+
+	slog.Info("backfilling explicit legacy data repairs")
 	stats, err := db.Backfill(ctx)
 	if err != nil {
 		return err
 	}
 	slog.Info("backfill complete", "scanned", stats.Scanned, "updated", stats.Updated, "markers_cleared", stats.MarkersCleared)
 	return nil
+}
+
+func logBackfillPending(p hopper.BackfillPending) {
+	slog.Info("backfill pending rows",
+		"total", p.TotalRows(),
+		"cleave_columns", p.CleaveColumns,
+		"archive_member_litmus_candidates", p.ArchiveMemberLitmus,
+		"archive_member_analyzed_at", p.ArchiveMemberAnalyzed,
+		"stale_good_markers", p.StaleGoodMarkers,
+		"stale_bad_markers", p.StaleBadMarkers)
 }
 
 // cmdPurgeUnsupported deletes samples that were analyzed but cleave could

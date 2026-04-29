@@ -1269,6 +1269,54 @@ func (db *DB) recomputeCanonicalSHA256PG(ctx context.Context) (int64, error) {
 	return total, nil
 }
 
+const pgCleaveBackfillWhere = `cleave_result IS NOT NULL
+	AND elements = ''
+	AND cleave_result->'fs'->0->>'f' > ''`
+
+func (db *DB) backfillPendingPG(ctx context.Context) (BackfillPending, error) {
+	var pending BackfillPending
+	if err := db.pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM samples WHERE `+pgCleaveBackfillWhere+`),
+			(SELECT count(*)
+			 FROM samples c
+			 JOIN samples p ON p.sha256 = c.parent
+			 WHERE c.parent <> ''
+				AND c.litmus_result IS NOT NULL
+				AND pg_column_size(c.litmus_result) = pg_column_size(p.litmus_result)
+				AND c.litmus_result = p.litmus_result
+				AND p.cleave_result IS NOT NULL
+				AND p.litmus_result IS NOT NULL),
+			(SELECT count(*)
+			 FROM samples c
+			 JOIN samples p ON p.sha256 = c.parent
+			 WHERE c.parent <> ''
+				AND c.analyzed_at IS NULL
+				AND c.cleave_result IS NOT NULL
+				AND c.litmus_result IS NOT NULL
+				AND p.analyzed_at IS NOT NULL),
+			(SELECT count(*)
+			 FROM samples
+			 WHERE label = 'good' AND label_source = 'marker' AND skip = 'misclassified'
+				AND cleave_result IS NOT NULL
+				AND max_crit < 5 AND suspicious_count <= 1),
+			(SELECT count(*)
+			 FROM samples
+			 WHERE label = 'bad' AND label_source = 'marker' AND skip = 'misclassified'
+				AND cleave_result IS NOT NULL
+				AND (max_crit >= 5 OR suspicious_count >= 2))`,
+	).Scan(
+		&pending.CleaveColumns,
+		&pending.ArchiveMemberLitmus,
+		&pending.ArchiveMemberAnalyzed,
+		&pending.StaleGoodMarkers,
+		&pending.StaleBadMarkers,
+	); err != nil {
+		return pending, fmt.Errorf("hopper: backfill pending count: %w", err)
+	}
+	return pending, nil
+}
+
 // backfillPG fixes legacy rows whose non-generated derivable columns
 // (elements, max_crit, suspicious_count) are stale, then clears misclassified
 // skip markers that no longer disagree with the new trait-based heuristic.
@@ -1286,11 +1334,8 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 	// without it, those rows match the gate, get UPDATEd to elements='' (no-op),
 	// and re-match next batch, inflating RowsAffected and risking an infinite
 	// loop on databases with >= backfillBatch such rows.
-	const candidateWhere = `cleave_result IS NOT NULL
-		AND elements = ''
-		AND cleave_result->'fs'->0->>'f' > ''`
 	if err := db.pool.QueryRow(ctx, `
-		SELECT count(*) FROM samples WHERE `+candidateWhere).Scan(&stats.Scanned); err != nil {
+		SELECT count(*) FROM samples WHERE `+pgCleaveBackfillWhere).Scan(&stats.Scanned); err != nil {
 		return stats, fmt.Errorf("hopper: backfill count: %w", err)
 	}
 	// Surface the total to any progress observer before the first batch runs,
@@ -1331,7 +1376,7 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 				),
 				updated_at = now()
 			WHERE sha256 IN (
-				SELECT sha256 FROM samples WHERE `+candidateWhere+`
+				SELECT sha256 FROM samples WHERE `+pgCleaveBackfillWhere+`
 				LIMIT $1
 			)`, backfillBatch)
 		if err != nil {

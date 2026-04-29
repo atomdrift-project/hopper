@@ -1286,6 +1286,57 @@ const stripSubscriptsSQL = `replace(replace(replace(replace(replace(` +
 	`%s, '₀',''),'₁',''),'₂',''),'₃',''),'₄',''),` +
 	`'₅',''),'₆',''),'₇',''),'₈',''),'₉','')`
 
+const sqliteCleaveBackfillWhere = `cleave_result IS NOT NULL
+	AND elements = ''
+	AND EXISTS (
+		SELECT 1 FROM json_each(cleave_result, '$.fs') je
+		WHERE json_extract(je.value, '$.dp') = 0
+			AND COALESCE(json_extract(je.value, '$.f'), '') != ''
+	)`
+
+func (db *DB) backfillPendingSQLite(ctx context.Context) (BackfillPending, error) {
+	var pending BackfillPending
+	if err := db.lite.QueryRowContext(ctx, `
+		SELECT
+			(SELECT count(*) FROM samples WHERE `+sqliteCleaveBackfillWhere+`),
+			(SELECT count(*)
+			 FROM samples c
+			 JOIN samples p ON p.sha256 = c.parent
+			 WHERE c.parent <> ''
+				AND c.litmus_result IS NOT NULL
+				AND c.litmus_result = p.litmus_result
+				AND p.cleave_result IS NOT NULL
+				AND p.litmus_result IS NOT NULL),
+			(SELECT count(*)
+			 FROM samples c
+			 JOIN samples p ON p.sha256 = c.parent
+			 WHERE c.parent <> ''
+				AND c.analyzed_at IS NULL
+				AND c.cleave_result IS NOT NULL
+				AND c.litmus_result IS NOT NULL
+				AND p.analyzed_at IS NOT NULL),
+			(SELECT count(*)
+			 FROM samples
+			 WHERE label = 'good' AND label_source = 'marker' AND skip = 'misclassified'
+				AND cleave_result IS NOT NULL
+				AND max_crit < 5 AND suspicious_count <= 1),
+			(SELECT count(*)
+			 FROM samples
+			 WHERE label = 'bad' AND label_source = 'marker' AND skip = 'misclassified'
+				AND cleave_result IS NOT NULL
+				AND (max_crit >= 5 OR suspicious_count >= 2))`,
+	).Scan(
+		&pending.CleaveColumns,
+		&pending.ArchiveMemberLitmus,
+		&pending.ArchiveMemberAnalyzed,
+		&pending.StaleGoodMarkers,
+		&pending.StaleBadMarkers,
+	); err != nil {
+		return pending, fmt.Errorf("hopper: backfill pending count: %w", err)
+	}
+	return pending, nil
+}
+
 // backfillSQLite mirrors backfillPG: re-derive the remaining non-generated
 // analysis columns (elements, max_crit, suspicious_count) for legacy rows,
 // then clear stale misclassified markers. file_type / score / formula /
@@ -1301,15 +1352,8 @@ func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 	// dp=0 entry has empty 'f') match the gate, get UPDATEd to elements='' as
 	// a no-op, and re-match next batch — inflating RowsAffected and risking
 	// an infinite loop on databases with >= backfillBatch such rows.
-	const candidateWhere = `cleave_result IS NOT NULL
-		AND elements = ''
-		AND EXISTS (
-			SELECT 1 FROM json_each(cleave_result, '$.fs') je
-			WHERE json_extract(je.value, '$.dp') = 0
-				AND COALESCE(json_extract(je.value, '$.f'), '') != ''
-		)`
 	if err := db.lite.QueryRowContext(ctx, `
-		SELECT count(*) FROM samples WHERE `+candidateWhere).Scan(&stats.Scanned); err != nil {
+		SELECT count(*) FROM samples WHERE `+sqliteCleaveBackfillWhere).Scan(&stats.Scanned); err != nil {
 		return stats, fmt.Errorf("hopper: backfill count: %w", err)
 	}
 	// Surface the total to any progress observer before the first batch runs.
@@ -1322,7 +1366,7 @@ func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 		//nolint:gosec // constant SQL fragments, no tainted input.
 		cleaveSQL := `
 			WITH batch AS (
-				SELECT sha256 FROM samples WHERE ` + candidateWhere + `
+				SELECT sha256 FROM samples WHERE ` + sqliteCleaveBackfillWhere + `
 				LIMIT ?
 			),
 			cleave_extract AS (

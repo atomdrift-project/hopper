@@ -57,6 +57,43 @@ func mustAnalyzeWithTraits(t *testing.T, ctx context.Context, db *DB, sha string
 	}
 }
 
+func TestMigrateDoesNotRunBackfill(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	sha := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	cleave := `{"fs":[{"sha":"` + sha + `","type":"elf","f":"H₂O","x":7,"dp":0,"ts":[{"l":5},{"l":3}]}]}`
+	if _, err := db.lite.ExecContext(ctx, `
+		INSERT INTO samples (sha256, source, label, label_source, path, cleave_result)
+		VALUES (?, 'test', 'bad', 'test', ?, ?)`,
+		sha, "test/"+sha, cleave); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var elements string
+	var maxCrit, suspiciousCount int
+	if err := db.lite.QueryRowContext(ctx, `
+		SELECT elements, max_crit, suspicious_count FROM samples WHERE sha256 = ?`, sha,
+	).Scan(&elements, &maxCrit, &suspiciousCount); err != nil {
+		t.Fatal(err)
+	}
+	if elements != "" || maxCrit != 0 || suspiciousCount != 0 {
+		t.Fatalf("Migrate backfilled legacy row: elements=%q max_crit=%d suspicious_count=%d", elements, maxCrit, suspiciousCount)
+	}
+
+	pending, err := db.BackfillPending(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.CleaveColumns != 1 {
+		t.Fatalf("pending cleave columns = %d, want 1", pending.CleaveColumns)
+	}
+}
+
 func TestInsertAndLookup(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
