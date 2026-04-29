@@ -178,6 +178,30 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		}
 	}
 
+	// cyclotron_attempted_at: stamped when cyclotron seeds a sample, used to
+	// gate FP/FN seed queries with a per-sample retry cooldown.
+	if pragmaHasColumn(ctx, db.lite, "cyclotron_attempted_at") == 0 {
+		if _, err := db.lite.ExecContext(ctx, `ALTER TABLE samples ADD COLUMN cyclotron_attempted_at DATETIME`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite: %w", err)
+		}
+	}
+
+	// Covers FP/FN seed queries ordered by impact. SQLite needs the explicit
+	// `litmus_score IS NULL` prefix to match the `NULLS LAST` semantics our
+	// queries use (see liteSeedOrder).
+	for _, ddl := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_samples_seed_pool ` +
+			`ON samples(label, litmus_score IS NULL, litmus_score DESC, score DESC, analyzed_at ASC) ` +
+			`WHERE cleave_result IS NOT NULL AND status = '' AND skip = ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_pipeline_stage ` +
+			`ON samples(status, litmus_score IS NULL, litmus_score DESC, score DESC, updated_at ASC) ` +
+			`WHERE status != ''`,
+	} {
+		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite: %w", err)
+		}
+	}
+
 	// Worker heartbeat table for dashboard.
 	if _, err := db.lite.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS workers (
 		name      TEXT PRIMARY KEY,
@@ -785,22 +809,33 @@ func (db *DB) setStatusSQLite(ctx context.Context, sha256, status string) error 
 	return nil
 }
 
-func (db *DB) samplesByStatusSQLite(ctx context.Context, status string, limit int) ([]*Sample, error) {
+// SQLite sorts NULLs as smallest, so DESC NULLS LAST needs an explicit guard:
+// `litmus_score IS NULL` puts NULLs at the end of a DESC sort.
+const (
+	liteStageOrder = `ORDER BY litmus_score IS NULL, litmus_score DESC, score DESC, updated_at ASC`
+	liteSeedOrder  = `ORDER BY litmus_score IS NULL, litmus_score DESC, score DESC, analyzed_at ASC`
+)
+
+func liteSeedFreshnessCutoff() string {
+	return seedFreshnessCutoff().Format(time.RFC3339Nano)
+}
+
+func (db *DB) samplesInPipelineStageSQLite(ctx context.Context, status string, limit int) ([]*Sample, error) {
 	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleCols+` FROM samples WHERE status = ? ORDER BY updated_at ASC LIMIT ?`,
+		`SELECT `+liteSampleCols+` FROM samples WHERE status = ? `+liteStageOrder+` LIMIT ?`,
 		status, limit)
 	if err != nil {
-		return nil, fmt.Errorf("hopper: samples by status: %w", err)
+		return nil, fmt.Errorf("hopper: samples in pipeline stage: %w", err)
 	}
 	return scanLiteSamples(rows)
 }
 
-func (db *DB) samplesByStatusLightSQLite(ctx context.Context, status string, limit int) ([]*Sample, error) {
+func (db *DB) samplesInPipelineStageLightSQLite(ctx context.Context, status string, limit int) ([]*Sample, error) {
 	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleColsLight+` FROM samples WHERE status = ? ORDER BY updated_at ASC LIMIT ?`,
+		`SELECT `+liteSampleColsLight+` FROM samples WHERE status = ? `+liteStageOrder+` LIMIT ?`,
 		status, limit)
 	if err != nil {
-		return nil, fmt.Errorf("hopper: samples by status (light): %w", err)
+		return nil, fmt.Errorf("hopper: samples in pipeline stage (light): %w", err)
 	}
 	return scanLiteSamplesLight(rows)
 }
@@ -810,8 +845,9 @@ func (db *DB) falsePositivesSQLite(ctx context.Context, limit int) ([]*Sample, e
 		`SELECT `+liteSampleCols+` FROM samples
 		 WHERE label = 'good' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
 		   AND (max_crit >= 5 OR suspicious_count >= 2)
-		 ORDER BY updated_at ASC LIMIT ?`,
-		limit)
+		   AND (cyclotron_attempted_at IS NULL OR cyclotron_attempted_at < ?)
+		 `+liteSeedOrder+` LIMIT ?`,
+		liteSeedFreshnessCutoff(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: false positives: %w", err)
 	}
@@ -835,8 +871,9 @@ func (db *DB) falseNegativesSQLite(ctx context.Context, limit int) ([]*Sample, e
 		`SELECT `+liteSampleCols+` FROM samples
 		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
 		   AND max_crit < 5 AND suspicious_count < 2
-		 ORDER BY updated_at ASC LIMIT ?`,
-		limit)
+		   AND (cyclotron_attempted_at IS NULL OR cyclotron_attempted_at < ?)
+		 `+liteSeedOrder+` LIMIT ?`,
+		liteSeedFreshnessCutoff(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: false negatives: %w", err)
 	}
@@ -848,8 +885,9 @@ func (db *DB) falsePositivesLightSQLite(ctx context.Context, limit int) ([]*Samp
 		`SELECT `+liteSampleColsLight+` FROM samples
 		 WHERE label = 'good' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
 		   AND (max_crit >= 5 OR suspicious_count >= 2)
-		 ORDER BY updated_at ASC LIMIT ?`,
-		limit)
+		   AND (cyclotron_attempted_at IS NULL OR cyclotron_attempted_at < ?)
+		 `+liteSeedOrder+` LIMIT ?`,
+		liteSeedFreshnessCutoff(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: false positives (light): %w", err)
 	}
@@ -861,8 +899,9 @@ func (db *DB) falseNegativesLightSQLite(ctx context.Context, limit int) ([]*Samp
 		`SELECT `+liteSampleColsLight+` FROM samples
 		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
 		   AND max_crit < 5 AND suspicious_count < 2
-		 ORDER BY updated_at ASC LIMIT ?`,
-		limit)
+		   AND (cyclotron_attempted_at IS NULL OR cyclotron_attempted_at < ?)
+		 `+liteSeedOrder+` LIMIT ?`,
+		liteSeedFreshnessCutoff(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: false negatives (light): %w", err)
 	}
@@ -1022,7 +1061,7 @@ func (db *DB) seedCandidatesInPathsSQLite(ctx context.Context, prefixes []string
 		clauses = append(clauses, "path GLOB ?")
 		args = append(args, p+"/*")
 	}
-	args = append(args, limit)
+	args = append(args, liteSeedFreshnessCutoff(), limit)
 	// Apply detection-equivalent filter so the DB only returns samples that
 	// will pass the Go-side Detected() / !Detected() post-filter.
 	var detectionFilter string
@@ -1042,8 +1081,9 @@ func (db *DB) seedCandidatesInPathsSQLite(ctx context.Context, prefixes []string
 		` WHERE status = '' AND label = ? AND skip = ''` +
 		` AND cleave_result IS NOT NULL` +
 		` AND (` + strings.Join(clauses, " OR ") + `)` +
+		` AND (cyclotron_attempted_at IS NULL OR cyclotron_attempted_at < ?)` +
 		detectionFilter +
-		` ORDER BY updated_at ASC LIMIT ?`
+		` ` + liteSeedOrder + ` LIMIT ?`
 	rows, err := db.lite.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: seed candidates in paths: %w", err)

@@ -102,6 +102,7 @@ func mustOpenDB(t *testing.T, ctx context.Context, path string) *hopper.DB {
 	return db
 }
 
+
 func TestIsMarkerFile(t *testing.T) {
 	tests := []struct {
 		name string

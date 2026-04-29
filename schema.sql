@@ -31,7 +31,11 @@ CREATE TABLE IF NOT EXISTS samples (
 	marker_mtime  TIMESTAMPTZ,
 	claimed_by    TEXT NOT NULL DEFAULT '',
 	claimed_at    TIMESTAMPTZ,
-	traits_version TEXT NOT NULL DEFAULT ''
+	traits_version TEXT NOT NULL DEFAULT '',
+	-- Set by cyclotron when it first commits to working on a sample (initial
+	-- status seed). Used to gate seed queries with a per-sample cooldown so
+	-- cyclotron never re-attacks the same unfixable sample in a tight loop.
+	cyclotron_attempted_at TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_samples_label ON samples(label);

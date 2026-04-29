@@ -232,7 +232,7 @@ func TestReclassify(t *testing.T) {
 	}
 }
 
-func TestSamplesByStatus(t *testing.T) {
+func TestSamplesInPipelineStage(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
@@ -240,7 +240,7 @@ func TestSamplesByStatus(t *testing.T) {
 	mustInsert(t, ctx, db, &Sample{SHA256: "b", Source: "test", Label: "bad", LabelSource: "test", Status: "bad-review"})
 	mustInsert(t, ctx, db, &Sample{SHA256: "c", Source: "test", Label: "bad", LabelSource: "test", Status: "bad"})
 
-	got, err := db.SamplesByStatus(ctx, "bad-review", 10)
+	got, err := db.SamplesInPipelineStage(ctx, "bad-review", 10)
 	if err != nil {
 		t.Fatal(err)
 	}

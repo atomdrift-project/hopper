@@ -822,6 +822,22 @@ func (db *DB) UpdateLitmusResult(ctx context.Context, sha256 string, result []by
 	return db.updateLitmusResultSQLite(ctx, sha256, result)
 }
 
+// MarkCyclotronAttempt stamps cyclotron_attempted_at = now() so the sample
+// drops out of the FP/FN seed pool for seedReanalysisCooldown. Cyclotron calls
+// this when it first commits to working on a sample (initial status seed) so a
+// sample that resists remediation can't tight-loop through the seed queue.
+func (db *DB) MarkCyclotronAttempt(ctx context.Context, sha256 string) error {
+	if db.pool != nil {
+		_, err := db.pool.Exec(ctx,
+			`UPDATE samples SET cyclotron_attempted_at = now() WHERE sha256 = $1`, sha256)
+		return err
+	}
+	_, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET cyclotron_attempted_at = ? WHERE sha256 = ?`,
+		time.Now().UTC().Format(time.RFC3339Nano), sha256)
+	return err
+}
+
 // Reclassify changes a sample's label.
 func (db *DB) Reclassify(ctx context.Context, sha256, label, source string) error {
 	if db.pool != nil {
@@ -1055,21 +1071,23 @@ func (db *DB) SetStatus(ctx context.Context, sha256, status string) error {
 	return db.setStatusSQLite(ctx, sha256, status)
 }
 
-// SamplesByStatus returns up to limit samples with the given status, oldest first.
-func (db *DB) SamplesByStatus(ctx context.Context, status string, limit int) ([]*Sample, error) {
+// SamplesInPipelineStage returns up to limit samples currently parked in the
+// given cyclotron pipeline status (e.g. "bad-review", "good-analyzed"), ordered
+// by impact: highest litmus_score first, then cleave score, then oldest update.
+func (db *DB) SamplesInPipelineStage(ctx context.Context, status string, limit int) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.samplesByStatusPG(ctx, status, limit)
+		return db.samplesInPipelineStagePG(ctx, status, limit)
 	}
-	return db.samplesByStatusSQLite(ctx, status, limit)
+	return db.samplesInPipelineStageSQLite(ctx, status, limit)
 }
 
-// SamplesByStatusLight is like SamplesByStatus but omits CleaveResult and
-// LitmusResult to reduce memory usage when only metadata is needed.
-func (db *DB) SamplesByStatusLight(ctx context.Context, status string, limit int) ([]*Sample, error) {
+// SamplesInPipelineStageLight is like SamplesInPipelineStage but omits
+// CleaveResult and LitmusResult to reduce memory usage when only metadata is needed.
+func (db *DB) SamplesInPipelineStageLight(ctx context.Context, status string, limit int) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.samplesByStatusLightPG(ctx, status, limit)
+		return db.samplesInPipelineStageLightPG(ctx, status, limit)
 	}
-	return db.samplesByStatusLightSQLite(ctx, status, limit)
+	return db.samplesInPipelineStageLightSQLite(ctx, status, limit)
 }
 
 // FalsePositives returns analyzed good-labeled samples that trigger detection

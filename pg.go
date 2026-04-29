@@ -107,6 +107,18 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 		`CREATE INDEX IF NOT EXISTS idx_samples_updated_at ON samples(updated_at)`,
 		// Traits-version rescan: find analyzed samples with stale traits.
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS traits_version TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS cyclotron_attempted_at TIMESTAMPTZ`,
+		// Covers FP/FN seed queries (falsePositivesPG, falseNegativesPG, light
+		// variants, seedCandidatesInPathsPG) ordered by impact. The detection
+		// filter (max_crit / suspicious_count) and cyclotron_attempted_at
+		// cooldown apply as residual predicates after the indexed scan.
+		`CREATE INDEX IF NOT EXISTS idx_samples_seed_pool ` +
+			`ON samples(label, litmus_score DESC NULLS LAST, score DESC, analyzed_at ASC NULLS FIRST) ` +
+			`WHERE cleave_result IS NOT NULL AND status = '' AND skip = ''`,
+		// Covers SamplesInPipelineStage drain (impact-ordered mid-pipeline pull).
+		`CREATE INDEX IF NOT EXISTS idx_samples_pipeline_stage ` +
+			`ON samples(status, litmus_score DESC NULLS LAST, score DESC, updated_at ASC) ` +
+			`WHERE status != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_stale_traits ` +
 			`ON samples(traits_version, analyzed_at) ` +
 			`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''`,
@@ -781,22 +793,44 @@ func (db *DB) setStatusPG(ctx context.Context, sha256, status string) error {
 	return nil
 }
 
-func (db *DB) samplesByStatusPG(ctx context.Context, status string, limit int) ([]*Sample, error) {
+// pipelineStageOrder ranks parked / candidate samples by impact: highest
+// litmus_score first, falling back to cleave score for older rows where
+// litmus has not yet run, with oldest update as a final tiebreaker.
+const pipelineStageOrder = `ORDER BY litmus_score DESC NULLS LAST, score DESC, updated_at ASC`
+
+// seedCandidateOrder is pipelineStageOrder with analyzed_at as the tiebreaker —
+// fresh seeds always carry analyzed_at (cleave_result IS NOT NULL) so it's a
+// more meaningful ordering than updated_at, which gets bumped by status writes.
+const seedCandidateOrder = `ORDER BY litmus_score DESC NULLS LAST, score DESC, analyzed_at ASC NULLS FIRST`
+
+// seedReanalysisCooldown skips seed candidates cyclotron has already attempted
+// within this window. Prevents tight loops on samples that resist remediation:
+// after the pipeline runs and the sample (somehow) ends up back in the seed
+// pool, we sit out the cooldown before another attempt. Fresh-cleaved samples
+// have cyclotron_attempted_at = NULL and are exempt — picked up immediately.
+// In-pipeline samples (SamplesInPipelineStage) are exempt regardless.
+const seedReanalysisCooldown = 8 * time.Hour
+
+func seedFreshnessCutoff() time.Time {
+	return time.Now().UTC().Add(-seedReanalysisCooldown)
+}
+
+func (db *DB) samplesInPipelineStagePG(ctx context.Context, status string, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM samples WHERE status = $1 ORDER BY updated_at ASC LIMIT $2`,
+		`SELECT `+pgSampleCols+` FROM samples WHERE status = $1 `+pipelineStageOrder+` LIMIT $2`,
 		status, limit)
 	if err != nil {
-		return nil, fmt.Errorf("hopper: samples by status: %w", err)
+		return nil, fmt.Errorf("hopper: samples in pipeline stage: %w", err)
 	}
 	return scanPGSamples(rows)
 }
 
-func (db *DB) samplesByStatusLightPG(ctx context.Context, status string, limit int) ([]*Sample, error) {
+func (db *DB) samplesInPipelineStageLightPG(ctx context.Context, status string, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleColsLight+` FROM samples WHERE status = $1 ORDER BY updated_at ASC LIMIT $2`,
+		`SELECT `+pgSampleColsLight+` FROM samples WHERE status = $1 `+pipelineStageOrder+` LIMIT $2`,
 		status, limit)
 	if err != nil {
-		return nil, fmt.Errorf("hopper: samples by status (light): %w", err)
+		return nil, fmt.Errorf("hopper: samples in pipeline stage (light): %w", err)
 	}
 	return scanPGSamplesLight(rows)
 }
@@ -806,8 +840,9 @@ func (db *DB) falsePositivesPG(ctx context.Context, limit int) ([]*Sample, error
 		`SELECT `+pgSampleCols+` FROM samples
 		 WHERE label = 'good' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
 		   AND (max_crit >= 5 OR suspicious_count >= 2)
-		 ORDER BY updated_at ASC LIMIT $1`,
-		limit)
+		   AND (cyclotron_attempted_at IS NULL OR cyclotron_attempted_at < $1)
+		 `+seedCandidateOrder+` LIMIT $2`,
+		seedFreshnessCutoff(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: false positives: %w", err)
 	}
@@ -819,8 +854,9 @@ func (db *DB) falsePositivesLightPG(ctx context.Context, limit int) ([]*Sample, 
 		`SELECT `+pgSampleColsLight+` FROM samples
 		 WHERE label = 'good' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
 		   AND (max_crit >= 5 OR suspicious_count >= 2)
-		 ORDER BY updated_at ASC LIMIT $1`,
-		limit)
+		   AND (cyclotron_attempted_at IS NULL OR cyclotron_attempted_at < $1)
+		 `+seedCandidateOrder+` LIMIT $2`,
+		seedFreshnessCutoff(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: false positives (light): %w", err)
 	}
@@ -844,8 +880,9 @@ func (db *DB) falseNegativesPG(ctx context.Context, limit int) ([]*Sample, error
 		`SELECT `+pgSampleCols+` FROM samples
 		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
 		   AND max_crit < 5 AND suspicious_count < 2
-		 ORDER BY updated_at ASC LIMIT $1`,
-		limit)
+		   AND (cyclotron_attempted_at IS NULL OR cyclotron_attempted_at < $1)
+		 `+seedCandidateOrder+` LIMIT $2`,
+		seedFreshnessCutoff(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: false negatives: %w", err)
 	}
@@ -857,8 +894,9 @@ func (db *DB) falseNegativesLightPG(ctx context.Context, limit int) ([]*Sample, 
 		`SELECT `+pgSampleColsLight+` FROM samples
 		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
 		   AND max_crit < 5 AND suspicious_count < 2
-		 ORDER BY updated_at ASC LIMIT $1`,
-		limit)
+		   AND (cyclotron_attempted_at IS NULL OR cyclotron_attempted_at < $1)
+		 `+seedCandidateOrder+` LIMIT $2`,
+		seedFreshnessCutoff(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: false negatives (light): %w", err)
 	}
@@ -1032,9 +1070,10 @@ func (db *DB) seedCandidatesInPathsPG(ctx context.Context, prefixes []string, la
 		 WHERE status = '' AND label = $1 AND skip = ''
 		   AND cleave_result IS NOT NULL
 		   AND path LIKE ANY($2)
+		   AND (cyclotron_attempted_at IS NULL OR cyclotron_attempted_at < $3)
 		   `+detectionFilter+`
-		 ORDER BY updated_at ASC LIMIT $3`,
-		label, patterns, limit)
+		 `+seedCandidateOrder+` LIMIT $4`,
+		label, patterns, seedFreshnessCutoff(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: seed candidates in paths: %w", err)
 	}
