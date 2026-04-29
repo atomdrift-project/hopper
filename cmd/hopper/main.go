@@ -113,6 +113,16 @@ func parseFlags(f *flag.FlagSet, args []string) {
 	}
 }
 
+func flagWasSet(f *flag.FlagSet, name string) bool {
+	seen := false
+	f.Visit(func(fl *flag.Flag) {
+		if fl.Name == name {
+			seen = true
+		}
+	})
+	return seen
+}
+
 type stringListFlag []string
 
 func (s *stringListFlag) String() string {
@@ -787,6 +797,8 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	var forceRescanDirs stringListFlag
 	f.Var(&forceRescanDirs, "force-rescan", "directory prefix to force re-analysis for; may be repeated or comma-separated")
 	parseFlags(f, os.Args[2:])
+	explicitLitmusBin := flagWasSet(f, "litmus")
+	explicitCleaveBin := flagWasSet(f, "cleave")
 
 	if *maxFileMB > 0 {
 		maxFileSize = *maxFileMB * 1024 * 1024
@@ -854,21 +866,29 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 
 	prepStart := time.Now()
 
-	// Rebuild tools first so we can bail early if litmus or cleave is broken.
-	// Both builds run in parallel; once done we update litmus rules and check
-	// the traits version — all before touching the database.
-	wd.beginStage("build.litmus", "Building litmus")
-	wd.beginStage("build.cleave", "Building cleave")
+	// Rebuild sibling tools only when Hopper is using the default tool names.
+	// If the caller supplied --litmus or --cleave, that path is authoritative
+	// and should not be shadowed by `make install` into another location.
 	litmusBuildCh := make(chan struct{}, 1)
 	cleaveBuildCh := make(chan struct{}, 1)
 	go func() {
-		updateSiblingTool(ctx, "litmus", "../litmus")
-		wd.endStage("build.litmus")
+		if explicitLitmusBin {
+			slog.Info("skipping litmus rebuild for explicit binary", "bin", *litmusBin)
+		} else {
+			wd.beginStage("build.litmus", "Building litmus")
+			updateSiblingTool(ctx, "litmus", "../litmus")
+			wd.endStage("build.litmus")
+		}
 		litmusBuildCh <- struct{}{}
 	}()
 	go func() {
-		updateSiblingTool(ctx, "cleave", "../cleave")
-		wd.endStage("build.cleave")
+		if explicitCleaveBin {
+			slog.Info("skipping cleave rebuild for explicit binary", "bin", *cleaveBinFlag)
+		} else {
+			wd.beginStage("build.cleave", "Building cleave")
+			updateSiblingTool(ctx, "cleave", "../cleave")
+			wd.endStage("build.cleave")
+		}
 		cleaveBuildCh <- struct{}{}
 	}()
 	<-litmusBuildCh

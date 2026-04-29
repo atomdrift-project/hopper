@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"math"
@@ -911,6 +912,26 @@ func TestNewLitmusServer(t *testing.T) {
 	wantWorkers := max(2, runtime.NumCPU()/2)
 	if s2.Workers() != wantWorkers {
 		t.Errorf("default Workers = %d, want %d", s2.Workers(), wantWorkers)
+	}
+}
+
+func TestFlagWasSet(t *testing.T) {
+	f := flag.NewFlagSet("test", flag.ContinueOnError)
+	litmus := f.String("litmus", "litmus", "")
+	cleave := f.String("cleave", "cleave", "")
+	parseFlags(f, []string{"--litmus", "/opt/litmus"})
+
+	if !flagWasSet(f, "litmus") {
+		t.Fatal("flagWasSet(litmus) = false, want true")
+	}
+	if flagWasSet(f, "cleave") {
+		t.Fatal("flagWasSet(cleave) = true, want false")
+	}
+	if *litmus != "/opt/litmus" {
+		t.Fatalf("litmus = %q, want /opt/litmus", *litmus)
+	}
+	if *cleave != "cleave" {
+		t.Fatalf("cleave = %q, want cleave", *cleave)
 	}
 }
 
