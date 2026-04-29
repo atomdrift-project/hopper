@@ -323,9 +323,21 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(jobs) == 0 {
+		var rescanPending int64
+		if s.traitsVersion != "" {
+			if n, err := s.db.CountRescanPending(ctx, s.traitsVersion, s.rescanAge); err == nil {
+				rescanPending = n
+			} else {
+				slog.Debug("count rescan pending failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
+			}
+		}
 		//nolint:gosec // worker is sanitized by validWorkerName.
 		slog.Info("no work available", "worker", worker,
-			"active_claims", s.tracker.activeClaims(worker))
+			"active_claims", s.tracker.activeClaims(worker),
+			"traits_version", s.traitsVersion,
+			"rescan_age", s.rescanAge,
+			"rescan_pending", rescanPending,
+			"force_rescan_prefixes", len(s.forceRescanPrefixes))
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}

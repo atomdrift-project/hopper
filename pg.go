@@ -1844,8 +1844,8 @@ func (db *DB) claimJobsPG(
 		return nil, nil
 	}
 
-	// Tier 3: stale-traits rescan — samples analyzed with an older traits
-	// version. ORDER BY random() for the same reason as tier 1.
+	// Tier 3: stale-traits rescan — prioritize rows whose current analysis
+	// disagrees with their label, then boundary-confidence rows, then age.
 	rows, err = db.pool.Query(ctx, `
 		WITH reclaimable AS (
 			SELECT id FROM samples
@@ -1854,7 +1854,14 @@ func (db *DB) claimJobsPG(
 			  AND analyzed_at < $5
 			  AND (note = '' OR last_error_at IS NULL OR last_error_at < $6)
 			  AND (claimed_by = '' OR claimed_at < now() - $2::interval)
-			ORDER BY random()
+			ORDER BY
+			  CASE
+			    WHEN label = 'good' AND (max_crit >= 5 OR suspicious_count >= 2) THEN 0
+			    WHEN label = 'bad' AND max_crit < 5 AND suspicious_count < 2 THEN 0
+			    ELSE 1
+			  END,
+			  ABS(litmus_score - 0.5),
+			  analyzed_at ASC NULLS LAST
 			LIMIT $3
 			FOR UPDATE SKIP LOCKED
 		)

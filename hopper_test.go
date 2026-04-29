@@ -1062,6 +1062,56 @@ func TestClaimJobsForceRescan(t *testing.T) {
 	}
 }
 
+func TestClaimJobsStaleTraitsOrdering(t *testing.T) {
+	ctx := t.Context()
+	db := openTestDB(t)
+
+	type sample struct {
+		sha    string
+		label  string
+		score  int
+		traits string
+		litmus string
+	}
+	samples := []sample{
+		// Disagrees with label and closest to the litmus boundary: first.
+		{sha: "1111111111111111111111111111111111111111111111111111111111111111", label: "bad", score: 0, traits: "", litmus: `{"prob":0.49}`},
+		// Disagrees with label but farther from the boundary: second.
+		{sha: "2222222222222222222222222222222222222222222222222222222222222222", label: "good", score: 50, traits: `{"l":5,"c":1.0}`, litmus: `{"prob":0.10}`},
+		// Does not disagree, but is near the boundary: third.
+		{sha: "3333333333333333333333333333333333333333333333333333333333333333", label: "good", score: 0, traits: "", litmus: `{"prob":0.51}`},
+		// Does not disagree and is farther from the boundary: last.
+		{sha: "4444444444444444444444444444444444444444444444444444444444444444", label: "bad", score: 50, traits: `{"l":5,"c":1.0}`, litmus: `{"prob":0.90}`},
+	}
+	for _, s := range samples {
+		mustInsert(t, ctx, db, &Sample{SHA256: s.sha, Source: "test", Label: s.label, LabelSource: "test"})
+		mustAnalyzeWithTraits(t, ctx, db, s.sha, s.score, s.traits)
+		if err := db.UpdateLitmusResult(ctx, s.sha, []byte(s.litmus)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-96 * time.Hour).UTC().Format(time.RFC3339Nano)
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET analyzed_at = ?, traits_version = 'old-traits'`,
+		old); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs, err := db.ClaimJobs(ctx, "w1", 4, 30*time.Minute, "new-traits", 72*time.Hour, time.Now(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{samples[0].sha, samples[1].sha, samples[2].sha, samples[3].sha}
+	if len(jobs) != len(want) {
+		t.Fatalf("claimed %d jobs, want %d: %+v", len(jobs), len(want), jobs)
+	}
+	for i := range want {
+		if jobs[i].SHA256 != want[i] {
+			t.Fatalf("job %d sha = %s, want %s; jobs=%+v", i, jobs[i].SHA256, want[i], jobs)
+		}
+	}
+}
+
 func TestRelativizePaths(t *testing.T) {
 	ctx := t.Context()
 	db := openTestDB(t)

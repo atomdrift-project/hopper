@@ -1803,7 +1803,8 @@ func (db *DB) claimJobsSQLite(
 		}
 	}
 
-	// Tier 3: stale-traits rescan.
+	// Tier 3: stale-traits rescan. Prioritize rows whose current analysis
+	// disagrees with their label, then boundary-confidence rows, then age.
 	if len(selected) == 0 && currentTraits != "" {
 		staleAge := time.Now().Add(-rescanAge).UTC().Format(time.RFC3339Nano)
 		selected, err = queryLiteClaimRows(ctx, tx,
@@ -1813,7 +1814,15 @@ func (db *DB) claimJobsSQLite(
 			  AND analyzed_at < ?
 			  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
 			  AND (claimed_by = '' OR claimed_at < ?)
-			ORDER BY random() LIMIT ?`, currentTraits, staleAge, startCutoff, cutoff, limit)
+			ORDER BY
+			  CASE
+			    WHEN label = 'good' AND (max_crit >= 5 OR suspicious_count >= 2) THEN 0
+			    WHEN label = 'bad' AND max_crit < 5 AND suspicious_count < 2 THEN 0
+			    ELSE 1
+			  END,
+			  ABS(litmus_score - 0.5),
+			  analyzed_at ASC
+			LIMIT ?`, currentTraits, staleAge, startCutoff, cutoff, limit)
 		if err != nil {
 			return nil, fmt.Errorf("hopper: claim stale-traits jobs: %w", err)
 		}
