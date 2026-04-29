@@ -956,28 +956,41 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	}
 	dbCh := make(chan dbResult, 1)
 	dbStart := time.Now()
+	var dbPhase atomic.Value
+	dbPhase.Store("queued")
+	dbPhaseString := func() string {
+		if phase, ok := dbPhase.Load().(string); ok {
+			return phase
+		}
+		return "unknown"
+	}
 	go func() {
-		slog.Info("database startup task started")
+		dbPhase.Store("connecting")
+		slog.Info("database startup task started", "phase", dbPhaseString())
 		wd.beginStage("db.connect", "Connecting to database")
 		d, err := openDB(ctx, *dsn)
 		if err != nil {
 			wd.failStage("db.connect", err.Error())
+			dbPhase.Store("connect failed")
 			slog.Error("database connection failed", "elapsed", time.Since(dbStart), "error", err)
 			dbCh <- dbResult{err: err}
 			return
 		}
 		wd.endStage("db.connect")
 		slog.Info("database connection established", "elapsed", time.Since(dbStart))
+		dbPhase.Store("migrating schema")
 		wd.beginStage("db.migrate", "Migrating database")
 		slog.Info("running schema migrations")
 		if err := d.Migrate(ctx); err != nil {
 			wd.failStage("db.migrate", err.Error())
 			d.Close()
+			dbPhase.Store("migration failed")
 			slog.Error("schema migrations failed", "elapsed", time.Since(dbStart), "error", err)
 			dbCh <- dbResult{err: err}
 			return
 		}
 		wd.endStage("db.migrate")
+		dbPhase.Store("complete")
 		slog.Info("database startup task complete", "elapsed", time.Since(dbStart))
 		dbCh <- dbResult{db: d}
 	}()
@@ -1003,9 +1016,9 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	case dr = <-dbCh:
 	default:
 		waitStart := time.Now()
-		slog.Info("waiting for database startup task", "already_elapsed", time.Since(dbStart))
+		slog.Info("waiting for database connect/migrate task", "phase", dbPhaseString(), "already_elapsed", time.Since(dbStart))
 		dr = <-dbCh
-		slog.Info("database startup wait complete", "waited", time.Since(waitStart), "total_elapsed", time.Since(dbStart))
+		slog.Info("database startup wait complete", "phase", dbPhaseString(), "waited", time.Since(waitStart), "total_elapsed", time.Since(dbStart))
 	}
 	if dr.err != nil {
 		return dr.err
