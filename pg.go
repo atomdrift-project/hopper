@@ -2,6 +2,8 @@ package hopper
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -39,6 +41,9 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 		return fmt.Errorf("hopper: migrate: %w", err)
 	}
 	slog.Info("initial schema applied")
+	if err := db.ensurePGMigrationLedger(ctx); err != nil {
+		return fmt.Errorf("hopper: migrate: %w", err)
+	}
 	// Add columns introduced after initial schema.
 	for _, ddl := range []string{
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS parent TEXT NOT NULL DEFAULT ''`,
@@ -299,17 +304,106 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 
 func (db *DB) execPGMigrationDDL(ctx context.Context, ddl string) error {
 	ddl = strings.TrimSpace(ddl)
+	id := migrationID(ddl)
+	applied, err := db.pgMigrationApplied(ctx, id)
+	if err != nil {
+		return err
+	}
+	if applied {
+		slog.Debug("migration ddl skipped", "reason", "applied", "id", id, "ddl", ddl)
+		return nil
+	}
+
+	satisfied, err := db.pgMigrationAlreadySatisfied(ctx, ddl)
+	if err != nil {
+		return err
+	}
+	if satisfied {
+		if err := db.recordPGMigration(ctx, id, ddl); err != nil {
+			return err
+		}
+		slog.Info("migration ddl already satisfied", "id", id, "ddl", ddl)
+		return nil
+	}
+
 	if idx, ok := concurrentIndexDDL(ddl); ok {
-		return db.createIndexConcurrently(ctx, ddl, idx)
+		if err := db.createIndexConcurrently(ctx, ddl, idx); err != nil {
+			return err
+		}
+		return db.recordPGMigration(ctx, id, ddl)
 	}
 
 	start := time.Now()
-	slog.Info("executing migration ddl", "ddl", ddl)
+	slog.Info("executing migration ddl", "id", id, "ddl", ddl)
 	if _, err := db.pool.Exec(ctx, ddl); err != nil {
 		return err
 	}
-	slog.Info("migration ddl complete", "elapsed", time.Since(start).String())
+	elapsed := time.Since(start)
+	if err := db.recordPGMigration(ctx, id, ddl); err != nil {
+		return err
+	}
+	slog.Info("migration ddl complete", "id", id, "elapsed", elapsed.String())
 	return nil
+}
+
+func (db *DB) ensurePGMigrationLedger(ctx context.Context) error {
+	_, err := db.pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS hopper_migrations (
+			id         TEXT PRIMARY KEY,
+			ddl        TEXT NOT NULL,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`)
+	return err
+}
+
+func migrationID(ddl string) string {
+	sum := sha256.Sum256([]byte(normalizeMigrationDDL(ddl)))
+	return hex.EncodeToString(sum[:8])
+}
+
+func normalizeMigrationDDL(ddl string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(ddl)), " ")
+}
+
+func (db *DB) pgMigrationApplied(ctx context.Context, id string) (bool, error) {
+	var applied bool
+	if err := db.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM hopper_migrations WHERE id = $1)`, id).Scan(&applied); err != nil {
+		return false, err
+	}
+	return applied, nil
+}
+
+func (db *DB) recordPGMigration(ctx context.Context, id, ddl string) error {
+	_, err := db.pool.Exec(ctx, `
+		INSERT INTO hopper_migrations (id, ddl)
+		VALUES ($1, $2)
+		ON CONFLICT (id) DO UPDATE
+		SET ddl = EXCLUDED.ddl,
+		    applied_at = now()`,
+		id, ddl)
+	return err
+}
+
+func (db *DB) pgMigrationAlreadySatisfied(ctx context.Context, ddl string) (bool, error) {
+	switch normalizeMigrationDDL(ddl) {
+	case `ALTER TABLE samples ADD COLUMN IF NOT EXISTS traits_version TEXT NOT NULL DEFAULT ''`:
+		return db.pgColumnExists(ctx, "samples", "traits_version")
+	default:
+		return false, nil
+	}
+}
+
+func (db *DB) pgColumnExists(ctx context.Context, table, column string) (bool, error) {
+	var exists bool
+	err := db.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_attribute
+			WHERE attrelid = to_regclass($1)
+			  AND attname = $2
+			  AND NOT attisdropped
+		)`, table, column).Scan(&exists)
+	return exists, err
 }
 
 func concurrentIndexDDL(ddl string) (string, bool) {

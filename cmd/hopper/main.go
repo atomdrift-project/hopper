@@ -885,18 +885,17 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 			slog.Info("traits version for rescan", "version", traitsVersion)
 		}
 
-		// Pre-flight: run `litmus validate` against the freshly refreshed
-		// bundle. The worker subcommand re-runs this on every spawn, so a
-		// failure here turns into a restart loop with opaque "exit status 1"
-		// messages. Surface it once, clearly, and skip starting the worker
-		// — remote workers stay reachable, no crash spam.
-		wd.beginStage("litmus.validate", "Validating litmus bundle")
-		if err := preflightLitmusValidate(ctx, *litmusBin); err != nil {
-			wd.failStage("litmus.validate", "validate failed: "+err.Error())
-			slog.Warn("skipping local litmus worker startup until validate passes", "bin", *litmusBin)
+		// Pre-flight: validate cleave traits. Litmus' model-benign validation
+		// is useful diagnostics, but host-local benign corpora vary by distro
+		// and should not prevent Hopper from starting a worker.
+		wd.beginStage("cleave.validate", "Validating cleave traits")
+		if err := preflightCleaveValidate(ctx, *cleaveBinFlag); err != nil {
+			wd.failStage("cleave.validate", "validate failed: "+err.Error())
+			slog.Warn("skipping local litmus worker startup until cleave validate passes",
+				"litmus_bin", *litmusBin, "cleave_bin", *cleaveBinFlag)
 			*litmusBin = ""
 		} else {
-			wd.endStage("litmus.validate")
+			wd.endStage("cleave.validate")
 		}
 	}
 

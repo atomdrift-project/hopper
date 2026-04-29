@@ -557,12 +557,10 @@ func refreshLitmusRules(ctx context.Context, bin string) {
 	}
 }
 
-// preflightLitmusValidate runs `litmus validate` synchronously so we discover
-// a broken model / rules bundle once, here, rather than watching the worker
-// crash-loop with exit status 1 (the worker subcommand runs the same check at
-// startup). On failure the worker is not started; remote workers can still
-// connect. Output is captured and logged so journalctl is self-contained.
-func preflightLitmusValidate(ctx context.Context, bin string) error {
+// preflightCleaveValidate runs `cleave validate` synchronously so we discover
+// broken traits once, here. Litmus' own model-benign validation is intentionally
+// not a Hopper startup gate: host-local benign corpora can vary by distro.
+func preflightCleaveValidate(ctx context.Context, bin string) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, "validate") //nolint:gosec // bin path is from trusted CLI flag
@@ -573,11 +571,11 @@ func preflightLitmusValidate(ctx context.Context, bin string) error {
 			"output", lastLines(out, 30),
 		}
 		attrs = append(attrs, commandDiagnostics(cmd)...)
-		slog.Error("litmus validate failed; worker startup would crash-loop on the same check",
+		slog.Error("cleave validate failed; local litmus worker startup skipped",
 			attrs...)
 		return err
 	}
-	slog.Info("litmus validate passed", "bin", bin, "output", sanitizeLogString(strings.TrimSpace(string(out))))
+	slog.Info("cleave validate passed", "bin", bin, "output", sanitizeLogString(strings.TrimSpace(string(out))))
 	return nil
 }
 
