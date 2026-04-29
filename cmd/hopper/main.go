@@ -1136,13 +1136,23 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 			"skipped_missing_sample", stats.SkippedMissingSample,
 			"skipped_invalid", stats.SkippedInvalid)
 	}
-	slog.Info("file walk complete, serving API until interrupted", "samples", total)
+	servingAPI := *dashAddr != ""
+	slog.Info("file walk complete",
+		"samples", total,
+		"serving_api", servingAPI,
+		"local_litmus", litmus != nil)
 
-	// Block until interrupted — workers are still draining the analysis queue.
-	// Without litmus there's nothing left to wait for.
-	if litmus != nil {
+	// Block while there is something useful to keep alive: the dashboard/API
+	// for remote workers, or the local litmus worker process.
+	if servingAPI || litmus != nil {
+		slog.Info("load service running until interrupted",
+			"serving_api", servingAPI,
+			"local_litmus", litmus != nil)
 		<-ctx.Done()
-		slog.Info("shutting down")
+		slog.Info("load service shutting down", "reason", ctx.Err())
+	} else {
+		slog.Info("load service exiting after file walk",
+			"reason", "no dashboard/API listener and no local litmus worker")
 	}
 	return nil
 }

@@ -102,7 +102,6 @@ func mustOpenDB(t *testing.T, ctx context.Context, path string) *hopper.DB {
 	return db
 }
 
-
 func TestIsMarkerFile(t *testing.T) {
 	tests := []struct {
 		name string
@@ -542,7 +541,7 @@ func TestCmdLoadIntegration(t *testing.T) {
 	data := t.TempDir()
 	mustMkdir(t, filepath.Join(data, "bad"))
 	mustRename(t, dir, filepath.Join(data, "bad", "test"))
-	withArgs([]string{"hopper", "load", "-db", dbPath, "-data", data, "-workers", "2", "-litmus", "", "-reports-dir", reportsDir}, func() {
+	withArgs([]string{"hopper", "load", "-db", dbPath, "-data", data, "-workers", "2", "-litmus", "", "-dashboard-addr", "", "-reports-dir", reportsDir}, func() {
 		if err := cmdLoad(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -687,7 +686,7 @@ func TestCmdLoadGood(t *testing.T) {
 	data := t.TempDir()
 	mustMkdir(t, filepath.Join(data, "good"))
 	mustRename(t, dir, filepath.Join(data, "good", "test"))
-	withArgs([]string{"hopper", "load", "-db", dbPath, "-data", data, "-workers", "1", "-litmus", "", "-no-cache"}, func() {
+	withArgs([]string{"hopper", "load", "-db", dbPath, "-data", data, "-workers", "1", "-litmus", "", "-dashboard-addr", "", "-no-cache"}, func() {
 		if err := cmdLoad(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -719,7 +718,7 @@ func TestCmdLoadBothDirs(t *testing.T) {
 	mustRename(t, filepath.Join(badDir, "evil.bin"), filepath.Join(data, "bad", "evil.bin"))
 	mustRename(t, filepath.Join(goodDir, "safe.bin"), filepath.Join(data, "good", "safe.bin"))
 
-	withArgs([]string{"hopper", "load", "-db", dbPath, "-data", data, "-workers", "1", "-litmus", ""}, func() {
+	withArgs([]string{"hopper", "load", "-db", dbPath, "-data", data, "-workers", "1", "-litmus", "", "-dashboard-addr", ""}, func() {
 		if err := cmdLoad(ctx); err != nil {
 			t.Fatal(err)
 		}

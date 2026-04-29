@@ -543,7 +543,9 @@ const updateErrorDelay = 30 * time.Second
 func refreshLitmusRules(ctx context.Context, bin string) {
 	ur := exec.CommandContext(ctx, bin, "update-rules")
 	if out, err := ur.CombinedOutput(); err != nil {
-		slog.Warn("litmus update-rules failed (non-fatal)", "bin", bin, "error", err, "output", string(out))
+		attrs := []any{"error", err, "output", string(out)}
+		attrs = append(attrs, commandDiagnostics(ur)...)
+		slog.Warn("litmus update-rules failed (non-fatal)", attrs...)
 		slog.Info("pausing after litmus update-rules error", "delay", updateErrorDelay)
 		select {
 		case <-time.After(updateErrorDelay):
@@ -565,14 +567,104 @@ func preflightLitmusValidate(ctx context.Context, bin string) error {
 	cmd := exec.CommandContext(ctx, bin, "validate") //nolint:gosec // bin path is from trusted CLI flag
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		slog.Error("litmus validate failed; worker startup would crash-loop on the same check",
-			"bin", bin,
+		attrs := []any{
 			"error", err,
-			"output", lastLines(out, 30))
+			"output", lastLines(out, 30),
+		}
+		attrs = append(attrs, commandDiagnostics(cmd)...)
+		slog.Error("litmus validate failed; worker startup would crash-loop on the same check",
+			attrs...)
 		return err
 	}
 	slog.Info("litmus validate passed", "bin", bin, "output", sanitizeLogString(strings.TrimSpace(string(out))))
 	return nil
+}
+
+func commandDiagnostics(cmd *exec.Cmd) []any {
+	wd := cmd.Dir
+	if wd == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			wd = cwd
+		}
+	}
+	resolved := cmd.Path
+	if lp, err := exec.LookPath(cmd.Path); err == nil {
+		resolved = lp
+	}
+	envKeys := []string{
+		"CLEAVE_TRAITS_DIR",
+		"LITMUS_MODELS_DIR",
+		"HOME",
+		"XDG_CONFIG_HOME",
+		"XDG_CACHE_HOME",
+		"XDG_DATA_HOME",
+		"PATH",
+	}
+	attrs := []any{
+		"cwd", wd,
+		"argv", cmd.Args,
+		"command", shellCommand(cmd.Args),
+		"resolved_bin", resolved,
+		"reproduce", reproduceCommand(cmd, wd, envKeys),
+	}
+	for _, key := range envKeys {
+		val, ok := cmdEnvValue(cmd, key)
+		if !ok {
+			val = "<unset>"
+		}
+		attrs = append(attrs, key, val)
+	}
+	return attrs
+}
+
+func cmdEnvValue(cmd *exec.Cmd, key string) (string, bool) {
+	prefix := key + "="
+	for _, entry := range cmd.Environ() {
+		if strings.HasPrefix(entry, prefix) {
+			return strings.TrimPrefix(entry, prefix), true
+		}
+	}
+	return "", false
+}
+
+func reproduceCommand(cmd *exec.Cmd, wd string, envKeys []string) string {
+	var parts []string
+	if wd != "" {
+		parts = append(parts, "cd", shellQuote(wd), "&&")
+	}
+	parts = append(parts, "env")
+	for _, key := range envKeys {
+		if val, ok := cmdEnvValue(cmd, key); ok {
+			parts = append(parts, key+"="+shellQuote(val))
+		} else {
+			parts = append(parts, "-u", key)
+		}
+	}
+	parts = append(parts, shellCommand(cmd.Args))
+	return strings.Join(parts, " ")
+}
+
+func shellCommand(argv []string) string {
+	quoted := make([]string, 0, len(argv))
+	for _, arg := range argv {
+		quoted = append(quoted, shellQuote(arg))
+	}
+	return strings.Join(quoted, " ")
+}
+
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if strings.IndexFunc(s, func(r rune) bool {
+		return !(r >= 'A' && r <= 'Z' ||
+			r >= 'a' && r <= 'z' ||
+			r >= '0' && r <= '9' ||
+			strings.ContainsRune("._/:-", r))
+	}) == -1 {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
 // lastLines returns the trailing maxLines of b, sanitized for slog.
