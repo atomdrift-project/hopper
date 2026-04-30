@@ -843,7 +843,7 @@ func (db *DB) samplesInPipelineStageLightSQLite(ctx context.Context, status stri
 func (db *DB) falsePositivesSQLite(ctx context.Context, limit int) ([]*Sample, error) {
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples
-		 WHERE label = 'good' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND status = '' AND skip = '' AND parent = ''
 		   AND (max_crit >= 5 OR suspicious_count >= 2)
 		   AND (cyclotron_attempted_at IS NULL OR cyclotron_attempted_at < ?)
 		 `+liteSeedOrder+` LIMIT ?`,
@@ -869,7 +869,7 @@ func (db *DB) truePositivesSQLite(ctx context.Context, scoreThreshold, limit int
 func (db *DB) falseNegativesSQLite(ctx context.Context, limit int) ([]*Sample, error) {
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples
-		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND status = '' AND skip = '' AND parent = ''
 		   AND max_crit < 5 AND suspicious_count < 2
 		   AND (cyclotron_attempted_at IS NULL OR cyclotron_attempted_at < ?)
 		 `+liteSeedOrder+` LIMIT ?`,
@@ -883,7 +883,7 @@ func (db *DB) falseNegativesSQLite(ctx context.Context, limit int) ([]*Sample, e
 func (db *DB) falsePositivesLightSQLite(ctx context.Context, limit int) ([]*Sample, error) {
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleColsLight+` FROM samples
-		 WHERE label = 'good' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND status = '' AND skip = '' AND parent = ''
 		   AND (max_crit >= 5 OR suspicious_count >= 2)
 		   AND (cyclotron_attempted_at IS NULL OR cyclotron_attempted_at < ?)
 		 `+liteSeedOrder+` LIMIT ?`,
@@ -897,7 +897,7 @@ func (db *DB) falsePositivesLightSQLite(ctx context.Context, limit int) ([]*Samp
 func (db *DB) falseNegativesLightSQLite(ctx context.Context, limit int) ([]*Sample, error) {
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleColsLight+` FROM samples
-		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND status = '' AND skip = '' AND parent = ''
 		   AND max_crit < 5 AND suspicious_count < 2
 		   AND (cyclotron_attempted_at IS NULL OR cyclotron_attempted_at < ?)
 		 `+liteSeedOrder+` LIMIT ?`,

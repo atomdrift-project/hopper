@@ -427,6 +427,47 @@ func TestFalsePositivesInPaths(t *testing.T) {
 	}
 }
 
+func TestFalsePositivesExcludeArchiveChildren(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "fp-parent",
+		Source:      "test",
+		Label:       "good",
+		LabelSource: "test",
+		Path:        "/data/good/pkg.vsix",
+		Score:       90,
+	})
+	mustAnalyzeWithTraits(t, ctx, db, "fp-parent", 90, `{"l":5,"c":1.0}`)
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "fp-child",
+		Source:      "test",
+		Label:       "good",
+		LabelSource: "test",
+		Path:        "/data/good/pkg.vsix!!extension/dist/server.js",
+		Parent:      "fp-parent",
+		Score:       95,
+	})
+	mustAnalyzeWithTraits(t, ctx, db, "fp-child", 95, `{"l":5,"c":1.0}`)
+
+	got, err := db.FalsePositives(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SHA256 != "fp-parent" {
+		t.Fatalf("FalsePositives got %+v, want only fp-parent", got)
+	}
+
+	light, err := db.FalsePositivesLight(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(light) != 1 || light[0].SHA256 != "fp-parent" {
+		t.Fatalf("FalsePositivesLight got %+v, want only fp-parent", light)
+	}
+}
+
 func TestFalseNegativesInPaths(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -489,6 +530,47 @@ func TestFalseNegativesInPaths(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].SHA256 != "fn1" {
 		t.Fatalf("got %+v, want only fn1", got)
+	}
+}
+
+func TestFalseNegativesExcludeArchiveChildren(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "fn-parent",
+		Source:      "test",
+		Label:       "bad",
+		LabelSource: "test",
+		Path:        "/data/bad/pkg.vsix",
+		Score:       0,
+	})
+	mustAnalyze(t, ctx, db, "fn-parent", 0)
+	mustInsert(t, ctx, db, &Sample{
+		SHA256:      "fn-child",
+		Source:      "test",
+		Label:       "bad",
+		LabelSource: "test",
+		Path:        "/data/bad/pkg.vsix!!extension/dist/server.js",
+		Parent:      "fn-parent",
+		Score:       0,
+	})
+	mustAnalyze(t, ctx, db, "fn-child", 0)
+
+	got, err := db.FalseNegatives(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SHA256 != "fn-parent" {
+		t.Fatalf("FalseNegatives got %+v, want only fn-parent", got)
+	}
+
+	light, err := db.FalseNegativesLight(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(light) != 1 || light[0].SHA256 != "fn-parent" {
+		t.Fatalf("FalseNegativesLight got %+v, want only fn-parent", light)
 	}
 }
 

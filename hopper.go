@@ -1078,7 +1078,7 @@ func (db *DB) SamplesInPipelineStageLight(ctx context.Context, status string, li
 	return db.samplesInPipelineStageLightSQLite(ctx, status, limit)
 }
 
-// FalsePositives returns analyzed good-labeled samples that trigger detection
+// FalsePositives returns analyzed top-level good-labeled samples that trigger detection
 // (max_crit >= 5 OR suspicious_count >= 2). These are candidates for
 // false-positive resolution.
 // Only returns samples with empty status (not yet claimed by a pipeline).
@@ -1099,7 +1099,7 @@ func (db *DB) TruePositives(ctx context.Context, scoreThreshold, limit int) ([]*
 	return db.truePositivesSQLite(ctx, scoreThreshold, limit)
 }
 
-// FalseNegatives returns analyzed bad-labeled samples that do not trigger
+// FalseNegatives returns analyzed top-level bad-labeled samples that do not trigger
 // detection (max_crit < 5 AND suspicious_count < 2). These are candidates
 // for gap-and-fix.
 // Only returns samples with empty status (not yet claimed by a pipeline).

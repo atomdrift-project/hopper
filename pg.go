@@ -932,7 +932,7 @@ func (db *DB) samplesInPipelineStageLightPG(ctx context.Context, status string, 
 func (db *DB) falsePositivesPG(ctx context.Context, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
-		 WHERE label = 'good' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND status = '' AND skip = '' AND parent = ''
 		   AND (max_crit >= 5 OR suspicious_count >= 2)
 		   AND (cyclotron_attempted_at IS NULL OR cyclotron_attempted_at < $1)
 		 `+seedCandidateOrder+` LIMIT $2`,
@@ -946,7 +946,7 @@ func (db *DB) falsePositivesPG(ctx context.Context, limit int) ([]*Sample, error
 func (db *DB) falsePositivesLightPG(ctx context.Context, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE label = 'good' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND status = '' AND skip = '' AND parent = ''
 		   AND (max_crit >= 5 OR suspicious_count >= 2)
 		   AND (cyclotron_attempted_at IS NULL OR cyclotron_attempted_at < $1)
 		 `+seedCandidateOrder+` LIMIT $2`,
@@ -972,7 +972,7 @@ func (db *DB) truePositivesPG(ctx context.Context, scoreThreshold, limit int) ([
 func (db *DB) falseNegativesPG(ctx context.Context, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
-		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND status = '' AND skip = '' AND parent = ''
 		   AND max_crit < 5 AND suspicious_count < 2
 		   AND (cyclotron_attempted_at IS NULL OR cyclotron_attempted_at < $1)
 		 `+seedCandidateOrder+` LIMIT $2`,
@@ -986,7 +986,7 @@ func (db *DB) falseNegativesPG(ctx context.Context, limit int) ([]*Sample, error
 func (db *DB) falseNegativesLightPG(ctx context.Context, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND status = '' AND skip = ''
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND status = '' AND skip = '' AND parent = ''
 		   AND max_crit < 5 AND suspicious_count < 2
 		   AND (cyclotron_attempted_at IS NULL OR cyclotron_attempted_at < $1)
 		 `+seedCandidateOrder+` LIMIT $2`,
