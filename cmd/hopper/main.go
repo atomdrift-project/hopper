@@ -1486,9 +1486,9 @@ func runDirPipeline(
 
 		progress.hashed.Add(1)
 
-		// Cache hit + already inserted into DB → skip the batch insert entirely.
-		// Marker changes are picked up on the next full scan (--rescan or cache miss).
-		if hr.inserted {
+		// Cache hit + already inserted into DB → skip the batch insert entirely
+		// when there is no path-derived metadata to refresh.
+		if hr.inserted && (hr.sample == nil || (hr.sample.Feed == "" && hr.sample.Ecosystem == "")) {
 			progress.skipped.Add(1)
 			continue
 		}
@@ -2121,24 +2121,23 @@ func hashFile(ctx context.Context, path, label, fileType, source string, cache *
 			if progress != nil {
 				progress.cacheHits.Add(1)
 			}
-			if ins {
-				// Already in the DB — caller will skip the batch insert.
-				return hashResult{cacheKey: ck, inserted: true}, nil
-			}
 			modTime := info.ModTime()
+			s := &hopper.Sample{
+				SHA256:      cached,
+				Source:      source,
+				Filename:    filepath.Base(path),
+				FileType:    fileType,
+				Label:       label,
+				LabelSource: source,
+				SizeBytes:   info.Size(),
+				Path:        path,
+				Mtime:       &modTime,
+			}
+			s.Feed, s.Ecosystem = extractFeedEcosystem(path, label)
 			return hashResult{
 				cacheKey: ck,
-				sample: &hopper.Sample{
-					SHA256:      cached,
-					Source:      source,
-					Filename:    filepath.Base(path),
-					FileType:    fileType,
-					Label:       label,
-					LabelSource: source,
-					SizeBytes:   info.Size(),
-					Path:        path,
-					Mtime:       &modTime,
-				},
+				sample:   s,
+				inserted: ins,
 			}, nil
 		}
 	}
@@ -2178,27 +2177,37 @@ func hashFile(ctx context.Context, path, label, fileType, source string, cache *
 
 func ptrTime(t time.Time) *time.Time { return &t }
 
-// extractFeedEcosystem parses feed and ecosystem from a file path when
-// a "harvest" directory component is present.
+// extractFeedEcosystem parses the datasource/feed and ecosystem from Harvest
+// output paths.
 //
-// Known-bad:  .../harvest/<feed>/<ecosystem>/file → feed + ecosystem
+// Known-bad:  .../bad/harvest/<feed>/<ecosystem>/file → feed + ecosystem
 //
-//	.../harvest/<feed>/file             → feed only
+//	.../bad/harvest/<feed>/file             → feed only
 //
-// Known-good: .../harvest/<ecosystem>/file        → ecosystem only.
+// Known-good/unknown: .../<label>/harvest/<ecosystem>/file → ecosystem only.
 func extractFeedEcosystem(path, label string) (feed, ecosystem string) {
 	parts := strings.Split(filepath.ToSlash(path), "/")
-	idx := -1
+	labelIdx := -1
 	for i, p := range parts {
-		if p == "harvest" {
-			idx = i
-			break
+		if p == label {
+			labelIdx = i
 		}
 	}
-	if idx < 0 {
+	idx := labelIdx
+	if idx >= 0 && idx+1 < len(parts) && parts[idx+1] == "harvest" {
+		idx++
+	} else {
+		for i, p := range parts {
+			if p == "harvest" {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx < 0 || idx+1 >= len(parts) {
 		return "", ""
 	}
-	// Directory components between "harvest" and the filename.
+	// Directory components between the layout marker and the filename.
 	after := parts[idx+1:]
 	if len(after) < 2 {
 		return "", "" // need at least one directory + filename

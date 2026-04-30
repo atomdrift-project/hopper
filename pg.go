@@ -554,11 +554,15 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
 			$1, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 		ON CONFLICT (sha256) DO UPDATE SET
+			feed  = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE samples.feed END,
+			ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE samples.ecosystem END,
 			path  = CASE WHEN EXCLUDED.path  <> ''   THEN EXCLUDED.path  ELSE samples.path  END,
 			mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END
 		WHERE EXCLUDED.parent = ''
 		  AND ((EXCLUDED.path  <> ''   AND samples.path  IS DISTINCT FROM EXCLUDED.path)
-		    OR (EXCLUDED.mtime IS NOT NULL AND samples.mtime IS DISTINCT FROM EXCLUDED.mtime))`,
+		    OR (EXCLUDED.mtime IS NOT NULL AND samples.mtime IS DISTINCT FROM EXCLUDED.mtime)
+		    OR (EXCLUDED.feed <> '' AND samples.feed IS DISTINCT FROM EXCLUDED.feed)
+		    OR (EXCLUDED.ecosystem <> '' AND samples.ecosystem IS DISTINCT FROM EXCLUDED.ecosystem))`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.Parent, s.Skip, s.Elements,
@@ -582,6 +586,9 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 			ON CONFLICT (sha256, path) DO UPDATE SET
 				last_seen_at = now(),
+				source = CASE WHEN EXCLUDED.source <> '' THEN EXCLUDED.source ELSE sample_locations.source END,
+				feed = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE sample_locations.feed END,
+				ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE sample_locations.ecosystem END,
 				mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)`,
 			s.SHA256, s.Path, s.Parent, s.Filename, s.Source, s.Feed, s.Ecosystem, s.Mtime); err != nil {
 			return false, fmt.Errorf("hopper: upsert location: %w", err)
@@ -629,6 +636,8 @@ SELECT DISTINCT ON (sha256)
 	cleave_result, litmus_result, analyzed_at
 FROM _staging
 ON CONFLICT (sha256) DO UPDATE SET
+	feed  = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE samples.feed END,
+	ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE samples.ecosystem END,
 	path  = CASE WHEN EXCLUDED.path  <> ''   THEN EXCLUDED.path  ELSE samples.path  END,
 	mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END
 -- Only walker writes (parent='') are allowed to refresh samples.path /
@@ -638,7 +647,9 @@ ON CONFLICT (sha256) DO UPDATE SET
 -- pointing at a virtual archive-member path that doesn't exist on disk.
 WHERE EXCLUDED.parent = ''
   AND ((EXCLUDED.path  <> ''   AND samples.path  IS DISTINCT FROM EXCLUDED.path)
-    OR (EXCLUDED.mtime IS NOT NULL AND samples.mtime IS DISTINCT FROM EXCLUDED.mtime))`
+    OR (EXCLUDED.mtime IS NOT NULL AND samples.mtime IS DISTINCT FROM EXCLUDED.mtime)
+    OR (EXCLUDED.feed <> '' AND samples.feed IS DISTINCT FROM EXCLUDED.feed)
+    OR (EXCLUDED.ecosystem <> '' AND samples.ecosystem IS DISTINCT FROM EXCLUDED.ecosystem))`
 
 func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inserted int64, needsAnalysis []string, err error) {
 	rows := make([][]any, len(samples))
@@ -683,6 +694,9 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 		 WHERE path <> ''
 		ON CONFLICT (sha256, path) DO UPDATE SET
 			last_seen_at = now(),
+			source = CASE WHEN EXCLUDED.source <> '' THEN EXCLUDED.source ELSE sample_locations.source END,
+			feed = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE sample_locations.feed END,
+			ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE sample_locations.ecosystem END,
 			mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)`); err != nil {
 		return 0, nil, fmt.Errorf("hopper: upsert locations from staging: %w", err)
 	}

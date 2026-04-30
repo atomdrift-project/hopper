@@ -1347,6 +1347,112 @@ func TestReviewFlushCommands(t *testing.T) {
 	}
 }
 
+func TestCmdLoadHarvestMetadata(t *testing.T) {
+	useTestPathLister(t)
+	ctx := t.Context()
+	dbPath := filepath.Join(t.TempDir(), "metadata.db")
+	data := t.TempDir()
+
+	badBytes := []byte("malicious package content")
+	badSum := sha256.Sum256(badBytes)
+	badSHA := hex.EncodeToString(badSum[:])
+	badPath := filepath.Join(data, "bad", "harvest", "opensourcemalware", "pypi", "evil.whl")
+	mustMkdirAll(t, filepath.Dir(badPath))
+	mustWriteFile(t, badPath, badBytes)
+	db := mustOpenDB(t, ctx, dbPath)
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertSample(ctx, &hopper.Sample{
+		SHA256:      badSHA,
+		Source:      "harvest",
+		Filename:    "evil.whl",
+		Label:       "bad",
+		LabelSource: "harvest",
+		Path:        "bad/old/evil.whl",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	goodBytes := []byte("benign package content")
+	goodSum := sha256.Sum256(goodBytes)
+	goodSHA := hex.EncodeToString(goodSum[:])
+	goodPath := filepath.Join(data, "good", "harvest", "npm", "safe.tgz")
+	mustMkdirAll(t, filepath.Dir(goodPath))
+	mustWriteFile(t, goodPath, goodBytes)
+
+	withArgs([]string{"hopper", "load", "-db", dbPath, "-data", data, "-workers", "2", "-litmus", "", "-dashboard-addr", ""}, func() {
+		if err := cmdLoad(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	db = mustOpenDB(t, ctx, dbPath)
+	defer db.Close()
+	bad, err := db.SampleBySHA256(ctx, badSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bad.Feed != "opensourcemalware" || bad.Ecosystem != "pypi" {
+		t.Fatalf("bad metadata feed/ecosystem = %q/%q, want opensourcemalware/pypi", bad.Feed, bad.Ecosystem)
+	}
+	good, err := db.SampleBySHA256(ctx, goodSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if good.Feed != "" || good.Ecosystem != "npm" {
+		t.Fatalf("good metadata feed/ecosystem = %q/%q, want ''/npm", good.Feed, good.Ecosystem)
+	}
+}
+
+func TestExtractFeedEcosystem(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		label    string
+		wantFeed string
+		wantEco  string
+	}{
+		{
+			name:     "bad all layout",
+			path:     "/srv/data/bad/harvest/opensourcemalware/pypi/pkg.whl",
+			label:    "bad",
+			wantFeed: "opensourcemalware",
+			wantEco:  "pypi",
+		},
+		{
+			name:     "good all layout",
+			path:     "/srv/data/good/harvest/npm/pkg.tgz",
+			label:    "good",
+			wantFeed: "",
+			wantEco:  "npm",
+		},
+		{
+			name:     "unknown all layout",
+			path:     "/srv/data/unknown/harvest/crates/pkg.crate",
+			label:    "unknown",
+			wantFeed: "",
+			wantEco:  "crates",
+		},
+		{
+			name:     "legacy bad harvest marker",
+			path:     "/srv/harvest/osv/maven/pkg.jar",
+			label:    "bad",
+			wantFeed: "osv",
+			wantEco:  "maven",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotFeed, gotEco := extractFeedEcosystem(tt.path, tt.label)
+			if gotFeed != tt.wantFeed || gotEco != tt.wantEco {
+				t.Fatalf("extractFeedEcosystem() = %q/%q, want %q/%q", gotFeed, gotEco, tt.wantFeed, tt.wantEco)
+			}
+		})
+	}
+}
+
 func TestStripDataRoot(t *testing.T) {
 	t.Run("direct prefix match", func(t *testing.T) {
 		got := stripDataRoot("/srv/data/unknown/harvest/new/crates/foo.crate", "/srv/data/")

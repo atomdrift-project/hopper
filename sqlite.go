@@ -467,6 +467,8 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256) DO UPDATE SET
+			feed  = CASE WHEN excluded.feed  != '' THEN excluded.feed  ELSE samples.feed  END,
+			ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE samples.ecosystem END,
 			path  = CASE WHEN excluded.path  != ''   THEN excluded.path  ELSE samples.path  END,
 			mtime = CASE WHEN excluded.mtime IS NOT NULL THEN excluded.mtime ELSE samples.mtime END
 			-- Only walker writes (parent='') may update samples.path / mtime.
@@ -475,7 +477,9 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 			-- and an archive member would otherwise orphan the samples row.
 			WHERE excluded.parent = ''
 			  AND ((excluded.path  != ''   AND samples.path  != excluded.path)
-			    OR (excluded.mtime IS NOT NULL AND samples.mtime IS NOT excluded.mtime))`,
+			    OR (excluded.mtime IS NOT NULL AND samples.mtime IS NOT excluded.mtime)
+			    OR (excluded.feed != '' AND samples.feed != excluded.feed)
+			    OR (excluded.ecosystem != '' AND samples.ecosystem != excluded.ecosystem))`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.SHA256, s.Parent, s.Skip, s.Elements,
@@ -498,8 +502,11 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 			INSERT INTO sample_locations
 				(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT (sha256, path) DO UPDATE SET
+		ON CONFLICT (sha256, path) DO UPDATE SET
 				last_seen_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
+				source = CASE WHEN excluded.source != '' THEN excluded.source ELSE sample_locations.source END,
+				feed = CASE WHEN excluded.feed != '' THEN excluded.feed ELSE sample_locations.feed END,
+				ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE sample_locations.ecosystem END,
 				mtime = COALESCE(excluded.mtime, sample_locations.mtime)`,
 			s.SHA256, s.Path, s.Parent, s.Filename, s.Source, s.Feed, s.Ecosystem, s.Mtime); err != nil {
 			return false, fmt.Errorf("hopper: upsert location: %w", err)
@@ -534,13 +541,17 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		INSERT INTO samples (%s)
 		VALUES (%s)
 		ON CONFLICT (sha256) DO UPDATE SET
+			feed  = CASE WHEN excluded.feed  != '' THEN excluded.feed  ELSE samples.feed  END,
+			ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE samples.ecosystem END,
 			path  = CASE WHEN excluded.path  != ''   THEN excluded.path  ELSE samples.path  END,
 			mtime = CASE WHEN excluded.mtime IS NOT NULL THEN excluded.mtime ELSE samples.mtime END
 			-- Explode writes (parent<>'') must not clobber a top-level
 			-- row's path on content-hash collision. See the PG version.
 			WHERE excluded.parent = ''
 			  AND ((excluded.path  != ''   AND samples.path  != excluded.path)
-			    OR (excluded.mtime IS NOT NULL AND samples.mtime IS NOT excluded.mtime))`,
+			    OR (excluded.mtime IS NOT NULL AND samples.mtime IS NOT excluded.mtime)
+			    OR (excluded.feed != '' AND samples.feed != excluded.feed)
+			    OR (excluded.ecosystem != '' AND samples.ecosystem != excluded.ecosystem))`,
 		strings.Join(cols, ", "),
 		strings.Join(placeholders, ", "))
 
@@ -556,6 +567,9 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256, path) DO UPDATE SET
 			last_seen_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
+			source = CASE WHEN excluded.source != '' THEN excluded.source ELSE sample_locations.source END,
+			feed = CASE WHEN excluded.feed != '' THEN excluded.feed ELSE sample_locations.feed END,
+			ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE sample_locations.ecosystem END,
 			mtime = COALESCE(excluded.mtime, sample_locations.mtime)`)
 	if err != nil {
 		return 0, nil, fmt.Errorf("hopper: prepare location upsert: %w", err)
