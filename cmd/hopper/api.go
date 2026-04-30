@@ -17,6 +17,7 @@ import (
 	"unicode"
 
 	"codeberg.org/atomdrift/hopper"
+	"github.com/codeGROOVE-dev/retry"
 )
 
 // apiServer handles the pull-based work API. Workers poll /api/next for
@@ -214,6 +215,9 @@ const (
 	maxResultBodyBytes = 128 << 20 // 128 MiB — complex samples with many embedded binaries produce large cleave reports.
 	maxTrackedWorkers  = 200
 	apiQueryTimeout    = 30 * time.Second
+	resultStoreTimeout = 10 * time.Minute
+	dbRetryInitial     = 100 * time.Millisecond
+	dbRetryMax         = 5 * time.Second
 )
 
 // validWorkerName checks that the name is non-empty, <= maxWorkerNameLen,
@@ -464,24 +468,29 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Worker = qualifiedWorkerName(req.Worker, r.RemoteAddr)
 
-	// No artificial timeout here — result processing involves multiple
-	// sequential DB writes (cleave, litmus, explosion) that can legitimately
-	// take longer than a single query timeout.
-	ctx := r.Context()
+	// Once the result body is accepted, persist it independently of the
+	// client connection. Workers may time out or disconnect while Hopper is
+	// still doing DB work, and that must not discard completed analysis.
+	ctx, cancelStore := resultStoreContext(r.Context())
+	defer cancelStore()
 
 	if req.Error != "" {
 		clientErr := trimClientError(req.Error)
 
 		// Look up the sample path for more useful error logs.
 		samplePath := ""
-		if sample, err := s.db.SampleBySHA256(ctx, req.SHA256); err == nil {
+		if sample, err := retryDBAccess(ctx, "sample lookup for worker error", req.SHA256, func(ctx context.Context) (*hopper.Sample, error) {
+			return s.db.SampleBySHA256(ctx, req.SHA256)
+		}); err == nil {
 			samplePath = sample.Path
 		}
 
 		if skip, permanent := classifyResultError(req.Error); permanent {
 			// Permanent failure (unsupported file type, missing file, etc.) —
 			// mark so it's never queued again, but preserve the record.
-			if err := s.db.SetSkip(ctx, req.SHA256, skip); err != nil {
+			if err := retryDBAccessNoValue(ctx, "mark permanent failure", req.SHA256, func(ctx context.Context) error {
+				return s.db.SetSkip(ctx, req.SHA256, skip)
+			}); err != nil {
 				slog.Error("mark permanent failure failed", "sha256", req.SHA256, "error", err)
 			} else {
 				//nolint:gosec // sha256 validated, path from DB.
@@ -489,11 +498,15 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 					"path", samplePath, "skip", skip, "reason", clientErr)
 			}
 		} else {
-			if err := s.db.SetNote(ctx, req.SHA256, clientErr); err != nil {
+			if err := retryDBAccessNoValue(ctx, "record analysis error", req.SHA256, func(ctx context.Context) error {
+				return s.db.SetNote(ctx, req.SHA256, clientErr)
+			}); err != nil {
 				slog.Error("record analysis error failed", "sha256", req.SHA256, "error", err)
 			}
 			// Transient error — release claim so another worker can try.
-			if err := s.db.UnclaimJobs(ctx, []string{req.SHA256}); err != nil {
+			if err := retryDBAccessNoValue(ctx, "unclaim transient failure", req.SHA256, func(ctx context.Context) error {
+				return s.db.UnclaimJobs(ctx, []string{req.SHA256})
+			}); err != nil {
 				slog.Error("unclaim failed", "sha256", req.SHA256, "error", err)
 			}
 			//nolint:gosec // worker sanitized by validWorkerName, sha256 by validSHA256, path from DB
@@ -524,18 +537,22 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := s.db.UpdateCleaveResult(ctx, req.SHA256, req.Raw, &parsed, tv); err != nil {
-		slog.Error("store cleave result failed", "sha256", req.SHA256, "error", err)
+	if err := retryDBAccessNoValue(ctx, "store cleave result", req.SHA256, func(ctx context.Context) error {
+		return s.db.UpdateCleaveResult(ctx, req.SHA256, req.Raw, &parsed, tv)
+	}); err != nil {
+		logResultStoreError("store cleave result failed after accepting worker result", r.Context(), ctx, req.SHA256, err)
 		// Still record the result so ActiveClaims is decremented — otherwise
 		// the worker's claim count is permanently inflated for this slot.
 		s.tracker.recordResult(req.Worker, true)
 		s.progress.errors.Add(1)
-		http.Error(w, `{"error":"store cleave result"}`, http.StatusInternalServerError)
+		http.Error(w, resultStoreHTTPError(err), http.StatusInternalServerError)
 		return
 	}
 
 	// Store litmus result.
-	if err := s.db.UpdateLitmusResult(ctx, req.SHA256, req.ML); err != nil {
+	if err := retryDBAccessNoValue(ctx, "store litmus result", req.SHA256, func(ctx context.Context) error {
+		return s.db.UpdateLitmusResult(ctx, req.SHA256, req.ML)
+	}); err != nil {
 		slog.Error("store litmus result failed", "sha256", req.SHA256, "error", err)
 	}
 
@@ -544,7 +561,9 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 
 	// Explode archive members.
 	resultPath := ""
-	parent, err := s.db.SampleParentInfo(ctx, req.SHA256)
+	parent, err := retryDBAccess(ctx, "fetch sample for archive explosion", req.SHA256, func(ctx context.Context) (*hopper.Sample, error) {
+		return s.db.SampleParentInfo(ctx, req.SHA256)
+	})
 	if err != nil {
 		if !errors.Is(err, hopper.ErrNotFound) {
 			slog.Error("fetch for explosion failed", "sha256", req.SHA256, "error", err)
@@ -552,7 +571,9 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	} else {
 		resultPath = parent.Path
 		parent.CleaveResult = req.Raw // already have it — avoid re-reading from DB
-		if n, err := s.db.ExplodeArchiveMembers(ctx, parent); err != nil {
+		if n, err := retryDBAccess(ctx, "explode archive members", req.SHA256, func(ctx context.Context) (int64, error) {
+			return s.db.ExplodeArchiveMembers(ctx, parent)
+		}); err != nil {
 			slog.Error("archive explosion failed", "sha256", req.SHA256, "error", err)
 		} else if n > 0 {
 			slog.Debug("exploded archive members", "sha256", req.SHA256, "members", n) //nolint:gosec // sha256 validated by validSHA256
@@ -568,6 +589,64 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true}) //nolint:errcheck,errchkjson // best-effort response
+}
+
+func resultStoreContext(reqCtx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(reqCtx), resultStoreTimeout)
+}
+
+func retryDBAccessNoValue(ctx context.Context, op, sha256 string, fn func(context.Context) error) error {
+	_, err := retryDBAccess(ctx, op, sha256, func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, fn(ctx)
+	})
+	return err
+}
+
+func retryDBAccess[T any](ctx context.Context, op, sha256 string, fn func(context.Context) (T, error)) (T, error) {
+	return retry.DoWithData(
+		func() (T, error) {
+			v, err := fn(ctx)
+			if err == nil {
+				return v, nil
+			}
+			if ctx.Err() != nil ||
+				errors.Is(err, context.Canceled) ||
+				errors.Is(err, context.DeadlineExceeded) ||
+				errors.Is(err, hopper.ErrNotFound) {
+				return v, retry.Unrecoverable(err)
+			}
+			return v, err
+		},
+		retry.Context(ctx),
+		retry.UntilSucceeded(),
+		retry.Delay(dbRetryInitial),
+		retry.MaxDelay(dbRetryMax),
+		retry.DelayType(retry.FullJitterBackoffDelay),
+		retry.LastErrorOnly(true),
+		retry.WrapContextErrorWithLastError(true),
+		retry.OnRetry(func(attempt uint, err error) {
+			slog.Warn("database operation failed; retrying",
+				"op", op, "sha256", sha256, "attempt", attempt+1, "error", err)
+		}),
+	)
+}
+
+func logResultStoreError(msg string, reqCtx, storeCtx context.Context, sha256 string, err error) {
+	attrs := []any{"sha256", sha256, "error", err}
+	if reqErr := reqCtx.Err(); reqErr != nil {
+		attrs = append(attrs, "request_context", reqErr)
+	}
+	if storeErr := storeCtx.Err(); storeErr != nil {
+		attrs = append(attrs, "store_context", storeErr)
+	}
+	slog.Error(msg, attrs...)
+}
+
+func resultStoreHTTPError(err error) string {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return `{"error":"store cleave result failed: database write context was canceled or timed out"}`
+	}
+	return `{"error":"store cleave result failed"}`
 }
 
 // validSHA256 checks that s is exactly 64 lowercase hex characters.
