@@ -227,6 +227,14 @@ LockPersonality=true
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged
+# Re-allow chown family: upx (invoked transitively via litmus/cleave to unpack
+# samples) calls chown when finalizing its output file, and @privileged
+# subtracts @chown. Without this the syscall is killed with SIGSYS and upx
+# core-dumps instead of returning a clean error.
+SystemCallFilter=@chown
+# Convert any remaining filter violations to EPERM rather than SIGSYS so a
+# stray syscall in a child process degrades to an error instead of a crash.
+SystemCallErrorNumber=EPERM
 CapabilityBoundingSet=
 AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
