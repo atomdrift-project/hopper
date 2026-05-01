@@ -480,7 +480,13 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 			feed  = CASE WHEN excluded.feed  != '' THEN excluded.feed  ELSE samples.feed  END,
 			ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE samples.ecosystem END,
 			path  = CASE WHEN excluded.path  != ''   THEN excluded.path  ELSE samples.path  END,
-			mtime = CASE WHEN excluded.mtime IS NOT NULL THEN excluded.mtime ELSE samples.mtime END
+			mtime = CASE WHEN excluded.mtime IS NOT NULL THEN excluded.mtime ELSE samples.mtime END,
+			-- Walker re-observation clears 'missing'/'unsupported' skips so
+			-- a previously-hidden file (permission error) or previously-
+			-- unsupported type (cleave gained support) rejoins the queue.
+			-- Other skip reasons (corrupt/encrypted/replaced/misclassified)
+			-- are sticky.
+			skip  = CASE WHEN samples.skip IN ('missing','unsupported') THEN '' ELSE samples.skip END
 			-- Only walker writes (parent='') may update samples.path / mtime.
 			-- Explode writes (parent=<archive-sha>) must not clobber a top-
 			-- level row's path: content-collision between a top-level file
@@ -489,7 +495,8 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 			  AND ((excluded.path  != ''   AND samples.path  != excluded.path)
 			    OR (excluded.mtime IS NOT NULL AND samples.mtime IS NOT excluded.mtime)
 			    OR (excluded.feed != '' AND samples.feed != excluded.feed)
-			    OR (excluded.ecosystem != '' AND samples.ecosystem != excluded.ecosystem))`,
+			    OR (excluded.ecosystem != '' AND samples.ecosystem != excluded.ecosystem)
+			    OR samples.skip IN ('missing','unsupported'))`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.SHA256, s.Parent, s.Skip, s.Elements,
@@ -554,14 +561,18 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 			feed  = CASE WHEN excluded.feed  != '' THEN excluded.feed  ELSE samples.feed  END,
 			ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE samples.ecosystem END,
 			path  = CASE WHEN excluded.path  != ''   THEN excluded.path  ELSE samples.path  END,
-			mtime = CASE WHEN excluded.mtime IS NOT NULL THEN excluded.mtime ELSE samples.mtime END
+			mtime = CASE WHEN excluded.mtime IS NOT NULL THEN excluded.mtime ELSE samples.mtime END,
+			-- Walker re-observation clears 'missing'/'unsupported' skips.
+			-- See insertSampleNewSQLite for the rationale.
+			skip  = CASE WHEN samples.skip IN ('missing','unsupported') THEN '' ELSE samples.skip END
 			-- Explode writes (parent<>'') must not clobber a top-level
 			-- row's path on content-hash collision. See the PG version.
 			WHERE excluded.parent = ''
 			  AND ((excluded.path  != ''   AND samples.path  != excluded.path)
 			    OR (excluded.mtime IS NOT NULL AND samples.mtime IS NOT excluded.mtime)
 			    OR (excluded.feed != '' AND samples.feed != excluded.feed)
-			    OR (excluded.ecosystem != '' AND samples.ecosystem != excluded.ecosystem))`,
+			    OR (excluded.ecosystem != '' AND samples.ecosystem != excluded.ecosystem)
+			    OR samples.skip IN ('missing','unsupported'))`,
 		strings.Join(cols, ", "),
 		strings.Join(placeholders, ", "))
 

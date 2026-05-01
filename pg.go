@@ -559,12 +559,18 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 			feed  = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE samples.feed END,
 			ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE samples.ecosystem END,
 			path  = CASE WHEN EXCLUDED.path  <> ''   THEN EXCLUDED.path  ELSE samples.path  END,
-			mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END
+			mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END,
+			-- Walker has re-observed a row that we previously gave up on
+			-- (permission error hid it, or cleave didn't support the type
+			-- yet). Clear the skip so it gets re-claimed for analysis. Other
+			-- skip reasons (corrupt/encrypted/replaced/misclassified) stick.
+			skip  = CASE WHEN samples.skip IN ('missing','unsupported') THEN '' ELSE samples.skip END
 		WHERE EXCLUDED.parent = ''
 		  AND ((EXCLUDED.path  <> ''   AND samples.path  IS DISTINCT FROM EXCLUDED.path)
 		    OR (EXCLUDED.mtime IS NOT NULL AND samples.mtime IS DISTINCT FROM EXCLUDED.mtime)
 		    OR (EXCLUDED.feed <> '' AND samples.feed IS DISTINCT FROM EXCLUDED.feed)
-		    OR (EXCLUDED.ecosystem <> '' AND samples.ecosystem IS DISTINCT FROM EXCLUDED.ecosystem))`,
+		    OR (EXCLUDED.ecosystem <> '' AND samples.ecosystem IS DISTINCT FROM EXCLUDED.ecosystem)
+		    OR samples.skip IN ('missing','unsupported'))`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.Parent, s.Skip, s.Elements,
@@ -641,7 +647,11 @@ ON CONFLICT (sha256) DO UPDATE SET
 	feed  = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE samples.feed END,
 	ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE samples.ecosystem END,
 	path  = CASE WHEN EXCLUDED.path  <> ''   THEN EXCLUDED.path  ELSE samples.path  END,
-	mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END
+	mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END,
+	-- Re-observation by the walker clears 'missing'/'unsupported' skips
+	-- so a previously-hidden or previously-unsupported file rejoins the
+	-- analysis queue. See insertSampleNewPG for the full rationale.
+	skip  = CASE WHEN samples.skip IN ('missing','unsupported') THEN '' ELSE samples.skip END
 -- Only walker writes (parent='') are allowed to refresh samples.path /
 -- samples.mtime on conflict. Explode writes (parent=<archive-sha>) must
 -- never clobber the top-level row: a content hash collision between a
@@ -651,7 +661,8 @@ WHERE EXCLUDED.parent = ''
   AND ((EXCLUDED.path  <> ''   AND samples.path  IS DISTINCT FROM EXCLUDED.path)
     OR (EXCLUDED.mtime IS NOT NULL AND samples.mtime IS DISTINCT FROM EXCLUDED.mtime)
     OR (EXCLUDED.feed <> '' AND samples.feed IS DISTINCT FROM EXCLUDED.feed)
-    OR (EXCLUDED.ecosystem <> '' AND samples.ecosystem IS DISTINCT FROM EXCLUDED.ecosystem))`
+    OR (EXCLUDED.ecosystem <> '' AND samples.ecosystem IS DISTINCT FROM EXCLUDED.ecosystem)
+    OR samples.skip IN ('missing','unsupported'))`
 
 func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inserted int64, needsAnalysis []string, err error) {
 	rows := make([][]any, len(samples))
