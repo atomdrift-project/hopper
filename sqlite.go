@@ -110,6 +110,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 			`ALTER TABLE samples ADD COLUMN mtime DATETIME`,
 			`CREATE INDEX IF NOT EXISTS idx_samples_mtime ON samples(mtime) WHERE mtime IS NOT NULL`,
 			`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_mtime ON samples(source, label, mtime DESC) WHERE cleave_result IS NOT NULL`,
+			`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_created ON samples(source, label, created_at DESC) WHERE cleave_result IS NOT NULL`,
+			`CREATE INDEX IF NOT EXISTS idx_samples_feed_top_created_done ON samples(source, label, created_at DESC) WHERE cleave_result IS NOT NULL AND parent = '' AND litmus_result IS NOT NULL`,
 		} {
 			slog.Debug("executing migration ddl", "ddl", ddl)
 			if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
@@ -133,6 +135,14 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 
 	if _, err := db.lite.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_samples_file_type ON samples(file_type)`); err != nil {
 		return fmt.Errorf("hopper: migrate sqlite: %w", err)
+	}
+	for _, ddl := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_created ON samples(source, label, created_at DESC) WHERE cleave_result IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_feed_top_created_done ON samples(source, label, created_at DESC) WHERE cleave_result IS NOT NULL AND parent = '' AND litmus_result IS NOT NULL`,
+	} {
+		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite: %w", err)
+		}
 	}
 
 	hasMaxCrit := pragmaHasColumn(ctx, db.lite, "max_crit")
@@ -1739,6 +1749,27 @@ func (q *FeedQuery) whereSQLite() (where string, args []any) {
 			args = append(args, q.Ecosystems[i])
 		}
 		clauses = append(clauses, "ecosystem IN ("+strings.Join(placeholders, ", ")+")")
+	}
+
+	if len(q.LitmusClasses) > 0 {
+		placeholders := make([]string, len(q.LitmusClasses))
+		for i := range q.LitmusClasses {
+			placeholders[i] = "?"
+			args = append(args, q.LitmusClasses[i])
+		}
+		clauses = append(clauses, "json_extract(litmus_result, '$.class') IN ("+strings.Join(placeholders, ", ")+")")
+	}
+	if q.RequireLitmus {
+		clauses = append(clauses, "litmus_result IS NOT NULL")
+	}
+
+	if q.TopLevelOnly {
+		clauses = append(clauses, "parent = ''")
+	}
+
+	if q.Formula != "" {
+		clauses = append(clauses, "formula = ?")
+		args = append(args, q.Formula)
 	}
 
 	return "WHERE " + strings.Join(clauses, " AND "), args

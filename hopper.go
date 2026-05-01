@@ -1387,13 +1387,17 @@ func (db *DB) RecomputeCanonicalSHA256(ctx context.Context) (int64, error) {
 
 // FeedQuery specifies filters for paginated feed queries.
 type FeedQuery struct {
-	Source     string   // "harvest" or "upload"
-	Label      string   // "bad", "good", "unknown", or "" (match any)
-	OrderBy    string   // "mtime" (default) or "analyzed_at"
-	Feeds      []string // optional: filter by feed column values
-	Ecosystems []string // optional: filter by ecosystem column values
-	Offset     int      // pagination offset
-	Limit      int      // page size (clamped to 1–100)
+	Source        string   // "harvest" or "upload"
+	Label         string   // "bad", "good", "unknown", or "" (match any)
+	OrderBy       string   // "mtime" (default), "created_at", or "analyzed_at"
+	Formula       string   // optional: filter by exact cleave chemical formula
+	Feeds         []string // optional: filter by feed column values
+	Ecosystems    []string // optional: filter by ecosystem column values
+	LitmusClasses []int    // optional: filter by litmus_result class values
+	RequireLitmus bool     // require any litmus_result without filtering by class
+	TopLevelOnly  bool     // only samples with no archive parent
+	Offset        int      // pagination offset
+	Limit         int      // page size (clamped to 1–100)
 }
 
 // FeedSamples returns analyzed samples matching the query, newest first.
@@ -1443,6 +1447,8 @@ func (q *FeedQuery) clamp() {
 
 func (q *FeedQuery) sortBy() string {
 	switch q.OrderBy {
+	case "created_at":
+		return "created_at"
 	case "analyzed_at":
 		return "analyzed_at"
 	default:

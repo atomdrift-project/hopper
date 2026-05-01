@@ -67,6 +67,8 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS marker_mtime TIMESTAMPTZ`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source ON samples(source, label, analyzed_at DESC NULLS LAST) WHERE cleave_result IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_mtime ON samples(source, label, mtime DESC NULLS LAST) WHERE cleave_result IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_created ON samples(source, label, created_at DESC) WHERE cleave_result IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_feed_top_created_done ON samples(source, label, created_at DESC) WHERE cleave_result IS NOT NULL AND parent = '' AND litmus_result IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed ON samples(feed) WHERE feed != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_ecosystem ON samples(ecosystem) WHERE ecosystem != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_mtime ON samples(mtime) WHERE mtime IS NOT NULL`,
@@ -1806,11 +1808,15 @@ func (db *DB) feedSamplesPG(ctx context.Context, q FeedQuery) ([]*Sample, error)
 		WHERE source = $1
 			AND ($2 = '' OR label = $2)
 			AND cleave_result IS NOT NULL
-			AND (cardinality($3::text[]) = 0 OR feed = ANY($3))
-			AND (cardinality($4::text[]) = 0 OR ecosystem = ANY($4))
+			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
+			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
+			AND (coalesce(cardinality($5::int[]), 0) = 0 OR (litmus_result->>'class')::int = ANY($5))
+			AND (NOT $6 OR parent = '')
+			AND ($7 = '' OR formula = $7)
+			AND (NOT $8 OR litmus_result IS NOT NULL)
 		ORDER BY `+q.sortBy()+` DESC NULLS LAST
-		LIMIT $5 OFFSET $6`,
-		q.Source, q.Label, q.Feeds, q.Ecosystems, q.Limit, q.Offset)
+		LIMIT $9 OFFSET $10`,
+		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly, q.Formula, q.RequireLitmus, q.Limit, q.Offset)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed samples: %w", err)
 	}
@@ -1824,9 +1830,13 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q FeedQuery) (int, error) 
 		WHERE source = $1
 			AND ($2 = '' OR label = $2)
 			AND cleave_result IS NOT NULL
-			AND (cardinality($3::text[]) = 0 OR feed = ANY($3))
-			AND (cardinality($4::text[]) = 0 OR ecosystem = ANY($4))`,
-		q.Source, q.Label, q.Feeds, q.Ecosystems).Scan(&n)
+			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
+			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
+			AND (coalesce(cardinality($5::int[]), 0) = 0 OR (litmus_result->>'class')::int = ANY($5))
+			AND (NOT $6 OR parent = '')
+			AND ($7 = '' OR formula = $7)
+			AND (NOT $8 OR litmus_result IS NOT NULL)`,
+		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly, q.Formula, q.RequireLitmus).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: feed samples count: %w", err)
 	}

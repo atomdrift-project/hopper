@@ -2121,6 +2121,13 @@ func TestFeedSamples(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	// Explicit created_at sort
+	q.OrderBy = "created_at"
+	_, err = db.FeedSamples(ctx, q)
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestPool(t *testing.T) {
