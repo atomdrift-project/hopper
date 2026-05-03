@@ -22,6 +22,7 @@ import (
 )
 
 const restartRecoveryDelay = 15 * time.Second
+const litmusTmpSentinel = ".hopper-litmus-managed"
 
 // litmusServer manages a local litmus worker subprocess. In pull mode,
 // litmus polls hopper's /api/next for work instead of hopper pushing
@@ -43,6 +44,7 @@ type litmusServer struct {
 	building   atomic.Bool
 	pid        atomic.Int64
 	restarts   atomic.Int64
+	tmpDir     string
 	logPath    atomic.Pointer[string] // current worker's stdout/stderr log file
 }
 
@@ -157,6 +159,114 @@ func (s *litmusServer) currentPID() int {
 	return int(s.pid.Load())
 }
 
+func (s *litmusServer) ensureTmpDirLocked() (string, error) {
+	if s.tmpDir == "" {
+		dir, err := os.MkdirTemp("", "hopper-litmus-*")
+		if err != nil {
+			return "", fmt.Errorf("create litmus tmp dir: %w", err)
+		}
+		s.tmpDir = dir
+		if err := ensureLitmusTmpSentinel(filepath.Join(dir, litmusTmpSentinel)); err != nil {
+			return "", fmt.Errorf("stamp litmus tmp dir: %w", err)
+		}
+		sweepStaleLitmusTmpDirs(dir)
+	} else if err := ensureLitmusTmpSentinel(filepath.Join(s.tmpDir, litmusTmpSentinel)); err != nil {
+		return "", fmt.Errorf("stamp litmus tmp dir: %w", err)
+	}
+
+	sweepLitmusTmpChildren(s.tmpDir, 0)
+	return s.tmpDir, nil
+}
+
+func ensureLitmusTmpSentinel(path string) error {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeNamedPipe != 0 {
+			return nil
+		}
+		_ = os.Remove(path) //nolint:errcheck // replace legacy/foreign regular marker
+	}
+	if err := syscall.Mkfifo(path, 0o600); err != nil && !errors.Is(err, syscall.EEXIST) {
+		return fmt.Errorf("mkfifo %s: %w", path, err)
+	}
+	return nil
+}
+
+func safeRemoveLitmusTmpDir(path, root string) {
+	cleanPath := filepath.Clean(path)
+	cleanRoot := filepath.Clean(root)
+	if cleanPath == "" || cleanPath == cleanRoot || filepath.Dir(cleanPath) != cleanRoot {
+		slog.Warn("refusing to remove litmus tmp dir outside tmp root", "path", cleanPath, "root", cleanRoot)
+		return
+	}
+	if info, err := os.Lstat(cleanPath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("stat litmus tmp dir failed", "path", cleanPath, "error", err)
+		}
+		return
+	} else if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		slog.Warn("refusing to remove non-directory litmus tmp path", "path", cleanPath)
+		return
+	}
+	if _, err := os.Stat(filepath.Join(cleanPath, litmusTmpSentinel)); err != nil {
+		slog.Warn("refusing to remove litmus tmp dir without sentinel", "path", cleanPath, "error", err)
+		return
+	}
+	if err := os.RemoveAll(cleanPath); err != nil {
+		slog.Warn("remove litmus tmp dir failed", "path", cleanPath, "error", err)
+	}
+}
+
+func sweepStaleLitmusTmpDirs(current string) {
+	root := os.TempDir()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		slog.Warn("read tmp root for litmus sweep failed", "root", root, "error", err)
+		return
+	}
+	cleanCurrent := filepath.Clean(current)
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "hopper-litmus-") {
+			continue
+		}
+		full := filepath.Join(root, name)
+		if filepath.Clean(full) == cleanCurrent {
+			continue
+		}
+		safeRemoveLitmusTmpDir(full, root)
+	}
+}
+
+func sweepLitmusTmpChildren(root string, maxAge time.Duration) {
+	cleanRoot := filepath.Clean(root)
+	if _, err := os.Stat(filepath.Join(cleanRoot, litmusTmpSentinel)); err != nil {
+		slog.Warn("refusing to sweep litmus tmp children without sentinel", "root", cleanRoot, "error", err)
+		return
+	}
+	entries, err := os.ReadDir(cleanRoot)
+	if err != nil {
+		slog.Warn("read litmus tmp dir failed", "root", cleanRoot, "error", err)
+		return
+	}
+	cutoff := time.Now().Add(-maxAge)
+	for _, entry := range entries {
+		if entry.Name() == litmusTmpSentinel {
+			continue
+		}
+		full := filepath.Join(cleanRoot, entry.Name())
+		info, err := os.Lstat(full)
+		if err != nil {
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 || info.ModTime().After(cutoff) {
+			continue
+		}
+		if err := os.RemoveAll(full); err != nil {
+			slog.Warn("remove stale litmus tmp child failed", "path", full, "error", err)
+		}
+	}
+}
+
 // Start launches the litmus worker subprocess. The caller is responsible
 // for rebuilding the binary (via updateSiblingTool) before calling Start
 // so that the worker runs the latest version from the first request.
@@ -221,11 +331,17 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 		args = append(args, "--workers", strconv.Itoa(s.maxWorkers))
 	}
 
+	tmpDir, err := s.ensureTmpDirLocked()
+	if err != nil {
+		return err
+	}
+
 	cmd := exec.CommandContext(ctx, s.bin, args...) //nolint:gosec // bin path is from trusted CLI flag
 	// Run litmus as the leader of its own process group so we can signal the
 	// whole tree (rizin/yara children spawned by the worker) at once. Killing
 	// only the parent leaves orphaned descendants behind.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = append(os.Environ(), "TMPDIR="+tmpDir)
 
 	logDir := xdgLogDir()
 	if err := os.MkdirAll(logDir, 0o750); err != nil {
@@ -282,6 +398,10 @@ func (s *litmusServer) Stop() {
 		s.cmd = nil
 		s.pid.Store(0)
 		slog.Info("litmus server stopped")
+	}
+	if s.tmpDir != "" {
+		safeRemoveLitmusTmpDir(s.tmpDir, os.TempDir())
+		s.tmpDir = ""
 	}
 }
 
