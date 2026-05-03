@@ -30,7 +30,6 @@ type webDashboard struct {
 	progress      *loadProgress
 	tracker       *workerTracker
 	rescanCache   *fido.Cache[string, int64]
-	claimsCache   *fido.Cache[string, []hopper.WorkerClaim]
 	newestATCache *fido.Cache[string, time.Time]
 	litmus        *litmusServer
 	traitsVersion string
@@ -160,7 +159,6 @@ func (wd *webDashboard) configure( //nolint:revive // argument-limit: dashboard 
 	wd.ndirs = ndirs
 	wd.traitsVersion = traitsVersion
 	wd.rescanAge = rescanAge
-	wd.claimsCache = fido.New[string, []hopper.WorkerClaim](fido.Size(1), fido.TTL(10*time.Second))
 	wd.newestATCache = fido.New[string, time.Time](fido.Size(1), fido.TTL(10*time.Second))
 	wd.rescanCache = fido.New[string, int64](fido.Size(1), fido.TTL(10*time.Second))
 }
@@ -438,7 +436,7 @@ func (wd *webDashboard) renderStartup(w http.ResponseWriter) {
 	_, _ = w.Write([]byte(buf.String())) //nolint:errcheck // best-effort HTTP response
 }
 
-func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //nolint:maintidx,revive // dashboard handler has many query parameters
+func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //nolint:maintidx // dashboard handler has many query parameters
 	wd.cfgMu.RLock()
 	progress := wd.progress
 	tracker := wd.tracker
@@ -458,20 +456,13 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		workers = tracker.all()
 	}
 
-	// Query oldest active claim per worker from the DB, with caching
-	// and a timeout so a slow database never blocks page renders.
-	oldestClaims := make(map[string]hopper.WorkerClaim)
+	// Oldest active claim per worker — read from the in-memory tracker.
+	oldestClaims := map[string]hopper.WorkerClaim{}
+	if tracker != nil {
+		oldestClaims = tracker.oldestPerWorker(staleClaimAge)
+	}
 	var newestAnalyzedAt time.Time
 	if db != nil {
-		//nolint:errcheck,contextcheck // Fetch returns cached/zero on error; closure creates its own context.
-		claims, _ := wd.claimsCache.Fetch("claims", func() ([]hopper.WorkerClaim, error) {
-			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
-			defer cancel()
-			return db.OldestClaims(qctx, staleClaimAge)
-		})
-		for _, c := range claims {
-			oldestClaims[c.Worker] = c
-		}
 		//nolint:errcheck,contextcheck // Fetch returns zero time on error; closure creates its own context.
 		newestAnalyzedAt, _ = wd.newestATCache.Fetch("newest", func() (time.Time, error) {
 			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)

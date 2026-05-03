@@ -1091,29 +1091,26 @@ func TestClaimJobsForceRescan(t *testing.T) {
 		}
 	}
 
-	// Claim with force-rescan on bad/pkg and hopperStart in the future so all
-	// three rows' analyzed_at is "before" start. Only fr1 should be claimed:
-	// fr2 is outside the prefix, fr3 is marked skip.
+	// hopperStart in the future so all three rows' analyzed_at is "before"
+	// start. Only fr1 should be returned: fr2 is outside the prefix, fr3 is
+	// marked skip.
 	hopperStart := time.Now().Add(time.Hour)
-	jobs, err := db.ClaimJobs(ctx, "w1", 10, 30*time.Minute, "", 7*24*time.Hour, hopperStart, []string{"bad/pkg"})
+	jobs, err := db.ForceRescanCandidates(ctx, hopperStart, []string{"bad/pkg"}, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(jobs) != 1 || jobs[0].SHA256 != "fr1" {
-		t.Fatalf("force-rescan claim: got %+v, want [fr1]", jobs)
+		t.Fatalf("force-rescan candidates: got %+v, want [fr1]", jobs)
 	}
 
-	// Prior analysis must still be visible on the claimed row — nothing is
-	// nulled at claim time; UpdateSample overwrites when new data arrives.
+	// Candidate fetches must not mutate samples. Prior analysis stays put.
 	rescanned, err := db.SampleBySHA256(ctx, "fr1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if rescanned.CleaveResult == nil || rescanned.LitmusResult == nil || rescanned.TraitsVersion != "oldtv" {
-		t.Fatalf("fr1 data was reset at claim time: %+v", rescanned)
+		t.Fatalf("fr1 data was reset at fetch time: %+v", rescanned)
 	}
-
-	// Outside-prefix and skipped rows are untouched.
 	for _, sha := range []string{"fr2", "fr3"} {
 		s, err := db.SampleBySHA256(ctx, sha)
 		if err != nil {
@@ -1124,23 +1121,13 @@ func TestClaimJobsForceRescan(t *testing.T) {
 		}
 	}
 
-	// A second claim while fr1 is still held returns nothing.
-	jobs, err = db.ClaimJobs(ctx, "w2", 10, 30*time.Minute, "", 7*24*time.Hour, hopperStart, []string{"bad/pkg"})
+	// Empty prefixes: caller is opting out of Tier 2.
+	jobs, err = db.ForceRescanCandidates(ctx, hopperStart, nil, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(jobs) != 0 {
-		t.Fatalf("second claim should see fr1 in flight: got %+v", jobs)
-	}
-
-	// With no force-rescan prefixes and no traits version, no claims happen
-	// after tier-1 is empty — the force-rescan tier is opt-in per call.
-	jobs, err = db.ClaimJobs(ctx, "w3", 10, 0, "", 7*24*time.Hour, hopperStart, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(jobs) != 0 {
-		t.Fatalf("without force-rescan prefixes, no tier-2 claim: got %+v", jobs)
+		t.Fatalf("empty prefixes should return no candidates: got %+v", jobs)
 	}
 }
 
@@ -1179,13 +1166,13 @@ func TestClaimJobsStaleTraitsOrdering(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	jobs, err := db.ClaimJobs(ctx, "w1", 4, 30*time.Minute, "new-traits", 72*time.Hour, time.Now(), nil)
+	jobs, err := db.StaleTraitsCandidates(ctx, "new-traits", 72*time.Hour, time.Now(), 4)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []string{samples[0].sha, samples[1].sha, samples[2].sha, samples[3].sha}
 	if len(jobs) != len(want) {
-		t.Fatalf("claimed %d jobs, want %d: %+v", len(jobs), len(want), jobs)
+		t.Fatalf("got %d jobs, want %d: %+v", len(jobs), len(want), jobs)
 	}
 	for i := range want {
 		if jobs[i].SHA256 != want[i] {
@@ -2432,21 +2419,19 @@ func TestMarkMissingSamples(t *testing.T) {
 	}
 }
 
-func TestClaimJobsSkipsMarkedSamples(t *testing.T) {
+func TestUnanalyzedCandidatesSkipsMarkedSamples(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
-	// Insert 3 unanalyzed samples: one normal, one skipped, one missing.
+	// Insert 3 unanalyzed samples: one normal, two with skip set.
 	mustInsert(t, ctx, db, &Sample{SHA256: "claim1", Path: "/data/a.exe", Label: "bad"})
 	mustInsert(t, ctx, db, &Sample{SHA256: "claim2", Path: "/data/b.exe", Label: "bad", Skip: "unsupported"})
 	mustInsert(t, ctx, db, &Sample{SHA256: "claim3", Path: "/data/c.exe", Label: "bad", Skip: "missing"})
 
-	jobs, err := db.ClaimJobs(ctx, "testworker", 10, 30*time.Minute, "", 7*24*time.Hour, time.Now(), nil)
+	jobs, err := db.UnanalyzedCandidates(ctx, time.Now(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// Only claim1 should be returned — the other two have non-empty skip.
 	if len(jobs) != 1 {
 		t.Fatalf("got %d jobs, want 1", len(jobs))
 	}
@@ -2455,7 +2440,10 @@ func TestClaimJobsSkipsMarkedSamples(t *testing.T) {
 	}
 }
 
-func TestClaimJobsRetriesOldErrorsAfterRestart(t *testing.T) {
+// TestUnanalyzedCandidatesRetriesOldErrorsAfterRestart verifies that the
+// hopperStart cutoff lets a freshly restarted process pick up samples whose
+// last_error_at predates this run.
+func TestUnanalyzedCandidatesRetriesOldErrorsAfterRestart(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
@@ -2465,57 +2453,20 @@ func TestClaimJobsRetriesOldErrorsAfterRestart(t *testing.T) {
 	}
 
 	currentRunStart := time.Now().Add(-time.Hour)
-	jobs, err := db.ClaimJobs(ctx, "worker1", 10, 30*time.Minute, "", 7*24*time.Hour, currentRunStart, nil)
+	jobs, err := db.UnanalyzedCandidates(ctx, currentRunStart, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(jobs) != 0 {
-		t.Fatalf("current-run error claimed: got %+v, want none", jobs)
+		t.Fatalf("current-run error returned as candidate: got %+v, want none", jobs)
 	}
 
 	restartAfterError := time.Now().Add(time.Hour)
-	jobs, err = db.ClaimJobs(ctx, "worker2", 10, 30*time.Minute, "", 7*24*time.Hour, restartAfterError, nil)
+	jobs, err = db.UnanalyzedCandidates(ctx, restartAfterError, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(jobs) != 1 || jobs[0].SHA256 != "err1" {
 		t.Fatalf("old error after restart: got %+v, want err1", jobs)
-	}
-}
-
-func TestClaimJobsExpiry(t *testing.T) {
-	db := openTestDB(t)
-	ctx := context.Background()
-
-	mustInsert(t, ctx, db, &Sample{SHA256: "exp1", Path: "/data/a.exe", Label: "bad"})
-
-	// Claim it.
-	jobs, err := db.ClaimJobs(ctx, "worker1", 1, 30*time.Minute, "", 7*24*time.Hour, time.Now(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(jobs) != 1 {
-		t.Fatalf("first claim: got %d jobs, want 1", len(jobs))
-	}
-
-	// Try to claim again — should get nothing (still claimed).
-	jobs, err = db.ClaimJobs(ctx, "worker2", 1, 30*time.Minute, "", 7*24*time.Hour, time.Now(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(jobs) != 0 {
-		t.Fatalf("second claim: got %d jobs, want 0", len(jobs))
-	}
-
-	// Claim with zero expiry — should reclaim the expired job.
-	jobs, err = db.ClaimJobs(ctx, "worker2", 1, 0, "", 7*24*time.Hour, time.Now(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(jobs) != 1 {
-		t.Fatalf("expired claim: got %d jobs, want 1", len(jobs))
-	}
-	if jobs[0].SHA256 != "exp1" {
-		t.Errorf("got sha256 = %q, want 'exp1'", jobs[0].SHA256)
 	}
 }

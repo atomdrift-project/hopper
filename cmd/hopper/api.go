@@ -22,8 +22,8 @@ import (
 
 // apiServer handles the pull-based work API. Workers poll /api/next for
 // jobs, submit results via /api/result, and fetch file content from
-// /api/file/{sha256}. All state lives in the database; the workerTracker
-// is an in-memory cache for the dashboard.
+// /api/file/{sha256}. Sample data lives in the database; per-job claim
+// state lives in workerTracker (see below).
 type apiServer struct {
 	db                  *hopper.DB
 	tracker             *workerTracker
@@ -38,11 +38,33 @@ type apiServer struct {
 
 const maxClientErrorRunes = 120
 
-// workerTracker is an in-memory view of active workers, updated on every
-// API call. The dashboard reads from it instead of polling nodes.
+// workerTracker holds in-memory worker stats AND active job claims.
+//
+// Claims used to live in samples.claimed_by/claimed_at in Postgres. That made
+// every poll an UPDATE on the multi-million-row samples table, which (a) blew
+// out the visibility map so "index only" scans degraded into million-fetch
+// heap probes, and (b) prevented HOT updates because claimed_by/claimed_at
+// were both indexed — so each claim wrote a new tuple plus a new entry in
+// every other index. The result was 71 GB of relation for 5.3 GB of data and
+// a Tier-3 query that took 5+ seconds.
+//
+// Claims are now in-memory only. Durability does not matter: the worst case
+// of losing claim state (Hopper restart, crash, in-memory eviction) is that
+// two workers analyze the same file. Cleave/litmus analysis is deterministic-
+// ish and UpdateCleaveResult is idempotent, so a duplicate is wasted CPU, not
+// corruption. Hopper restart actually improves recovery here — old DB-stored
+// claims used to block re-claim for up to 30 minutes.
 type workerTracker struct {
 	workers map[string]*workerStats
+	claims  map[string]claim // sha256 -> claim
 	mu      sync.RWMutex
+}
+
+// claim records that a sha256 is currently out with a worker.
+type claim struct {
+	at     time.Time
+	worker string
+	path   string // for dashboard/log display; avoids a per-worker DB lookup
 }
 
 type workerStats struct {
@@ -60,10 +82,108 @@ type workerStats struct {
 }
 
 func newWorkerTracker() *workerTracker {
-	return &workerTracker{workers: make(map[string]*workerStats)}
+	return &workerTracker{
+		workers: make(map[string]*workerStats),
+		claims:  make(map[string]claim),
+	}
 }
 
-func (wt *workerTracker) update(name string, slots int, version, traits string, claimed int, rssMB int, load1 float64) {
+// tryClaimBatch picks up to want candidates that aren't currently held by
+// another worker (or whose hold is older than expiry), records them under
+// the given worker name, and returns the claimed jobs. Order of cands
+// determines priority — the caller pre-sorts.
+func (wt *workerTracker) tryClaimBatch(cands []hopper.ClaimJob, worker string, expiry time.Duration, want int) []hopper.ClaimJob {
+	if want <= 0 || len(cands) == 0 {
+		return nil
+	}
+	wt.mu.Lock()
+	defer wt.mu.Unlock()
+	now := time.Now()
+	out := make([]hopper.ClaimJob, 0, want)
+	for _, c := range cands {
+		if existing, ok := wt.claims[c.SHA256]; ok && now.Sub(existing.at) < expiry {
+			continue
+		}
+		wt.claims[c.SHA256] = claim{worker: worker, path: c.Path, at: now}
+		out = append(out, c)
+		if len(out) == want {
+			break
+		}
+	}
+	if len(out) > 0 {
+		ws, ok := wt.workers[worker]
+		if !ok && len(wt.workers) < maxTrackedWorkers {
+			ws = &workerStats{}
+			wt.workers[worker] = ws
+		}
+		if ws != nil {
+			ws.ActiveClaims += len(out)
+			ws.TotalClaimed += int64(len(out))
+			ws.LastClaimed = now
+			ws.LastSeen = now
+		}
+	}
+	return out
+}
+
+// release drops a single claim and decrements the holding worker's
+// ActiveClaims counter. Safe if the sha256 isn't present.
+func (wt *workerTracker) release(sha string) {
+	wt.mu.Lock()
+	defer wt.mu.Unlock()
+	c, ok := wt.claims[sha]
+	if !ok {
+		return
+	}
+	delete(wt.claims, sha)
+	if ws := wt.workers[c.worker]; ws != nil && ws.ActiveClaims > 0 {
+		ws.ActiveClaims--
+	}
+}
+
+// releaseMany drops a batch of claims.
+func (wt *workerTracker) releaseMany(shas []string) {
+	if len(shas) == 0 {
+		return
+	}
+	wt.mu.Lock()
+	defer wt.mu.Unlock()
+	for _, s := range shas {
+		c, ok := wt.claims[s]
+		if !ok {
+			continue
+		}
+		delete(wt.claims, s)
+		if ws := wt.workers[c.worker]; ws != nil && ws.ActiveClaims > 0 {
+			ws.ActiveClaims--
+		}
+	}
+}
+
+// oldestPerWorker returns the oldest active claim per worker name, dropping
+// claims older than maxAge from the map as it walks. The dashboard calls
+// this on every render — there is no separate sweep goroutine.
+func (wt *workerTracker) oldestPerWorker(maxAge time.Duration) map[string]hopper.WorkerClaim {
+	wt.mu.Lock()
+	defer wt.mu.Unlock()
+	now := time.Now()
+	cutoff := now.Add(-maxAge)
+	out := map[string]hopper.WorkerClaim{}
+	for sha, c := range wt.claims {
+		if c.at.Before(cutoff) {
+			delete(wt.claims, sha)
+			continue
+		}
+		if cur, ok := out[c.worker]; !ok || c.at.Before(cur.ClaimedAt) {
+			out[c.worker] = hopper.WorkerClaim{Worker: c.worker, Path: c.path, ClaimedAt: c.at}
+		}
+	}
+	return out
+}
+
+// update records a worker heartbeat. ActiveClaims/TotalClaimed/LastClaimed
+// are owned by tryClaimBatch and release; do not bump them here.
+func (wt *workerTracker) update(name string, slots int, version, traits string, rssMB int, load1 float64) {
 	wt.mu.Lock()
 	defer wt.mu.Unlock()
 	ws, ok := wt.workers[name]
@@ -74,18 +194,12 @@ func (wt *workerTracker) update(name string, slots int, version, traits string, 
 		ws = &workerStats{}
 		wt.workers[name] = ws
 	}
-	now := time.Now()
-	ws.LastSeen = now
+	ws.LastSeen = time.Now()
 	ws.Slots = slots
 	ws.Version = version
 	ws.Traits = traits
-	ws.ActiveClaims += claimed
-	ws.TotalClaimed += int64(claimed)
 	ws.RSSMB = rssMB
 	ws.Load1 = load1
-	if claimed > 0 {
-		ws.LastClaimed = now
-	}
 }
 
 // claimLimit returns how many more jobs the worker may claim right now.
@@ -144,6 +258,9 @@ func (wt *workerTracker) lastSeen(name string) time.Time {
 	return time.Time{}
 }
 
+// recordResult bumps the analyzed/errors counter for a worker. The matching
+// claim is dropped separately by release(); call that first so ActiveClaims
+// is decremented before the counter bump.
 func (wt *workerTracker) recordResult(name string, isError bool) {
 	wt.mu.Lock()
 	defer wt.mu.Unlock()
@@ -153,9 +270,6 @@ func (wt *workerTracker) recordResult(name string, isError bool) {
 		wt.workers[name] = ws
 	}
 	ws.LastSeen = time.Now()
-	if ws.ActiveClaims > 0 {
-		ws.ActiveClaims--
-	}
 	if isError {
 		ws.Errors++
 	} else {
@@ -163,12 +277,17 @@ func (wt *workerTracker) recordResult(name string, isError bool) {
 	}
 }
 
-// resetClaims zeroes ActiveClaims for the named worker. Call this when a
+// resetClaims drops every claim held by the named worker. Call this when a
 // worker process is restarted so stale claims from the old process don't
 // permanently block the new one from receiving work.
 func (wt *workerTracker) resetClaims(name string) {
 	wt.mu.Lock()
 	defer wt.mu.Unlock()
+	for sha, c := range wt.claims {
+		if c.worker == name {
+			delete(wt.claims, sha)
+		}
+	}
 	if ws, ok := wt.workers[name]; ok {
 		ws.ActiveClaims = 0
 	}
@@ -218,6 +337,12 @@ const (
 	resultStoreTimeout = 10 * time.Minute
 	dbRetryInitial     = 100 * time.Millisecond
 	dbRetryMax         = 5 * time.Second
+
+	// Candidate fetch over-fetches the worker's requested count so concurrent
+	// pollers walking the same head-of-queue rows don't all collapse onto the
+	// same prefix. tryClaimBatch handles the deduplication in memory.
+	candidateOverfetch = 8
+	minCandidates      = 32
 )
 
 // validWorkerName checks that the name is non-empty, <= maxWorkerNameLen,
@@ -300,30 +425,30 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		//nolint:gosec // worker is sanitized by validWorkerName
 		slog.Warn("unproven worker at active claim limit, waiting for results",
 			"worker", worker, "active", s.tracker.activeClaims(worker))
-		s.tracker.update(worker, slots, version, traits, 0, rssMB, load1)
+		s.tracker.update(worker, slots, version, traits, rssMB, load1)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	} else if count > limit {
 		count = limit
 	}
 
+	// Heartbeat first so the dashboard sees the worker even on no-work polls.
+	s.tracker.update(worker, slots, version, traits, rssMB, load1)
+
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
-
-	jobs, err := s.db.ClaimJobs(ctx, worker, count, claimExpiry, s.traitsVersion, s.rescanAge, s.hopperStart, s.forceRescanPrefixes)
-	if err != nil {
-		slog.Error("claim jobs failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
-		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
-		return
-	}
-
-	// Update tracker with claim count so the dashboard knows the worker is active.
-	s.tracker.update(worker, slots, version, traits, len(jobs), rssMB, load1)
 
 	// Persist worker heartbeat to DB for crash recovery.
 	wk := hopper.Worker{Name: worker, Slots: slots, Version: version, Traits: traits}
 	if err := s.db.UpsertWorker(ctx, wk); err != nil {
 		slog.Debug("upsert worker failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
+	}
+
+	jobs, err := s.claimJobs(ctx, worker, count)
+	if err != nil {
+		slog.Error("claim jobs failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
+		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		return
 	}
 
 	if len(jobs) == 0 {
@@ -346,10 +471,9 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate files before handing them to workers. Check that each
-	// file still exists and that its size matches the DB record. Files
-	// that were replaced or removed since indexing are unclaimed and
-	// marked so they don't block the analysis queue.
+	// Validate files before handing them to workers. Files that were
+	// replaced or removed since indexing are released back from the in-
+	// memory claim set and marked skip so they don't block the queue.
 	var unclaimSHAs []string
 	validated := jobs[:0]
 	for _, j := range jobs {
@@ -388,11 +512,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		validated = append(validated, j)
 	}
 	jobs = validated
-	if len(unclaimSHAs) > 0 {
-		if err := s.db.UnclaimJobs(ctx, unclaimSHAs); err != nil {
-			slog.Error("unclaim invalid jobs failed", "error", err)
-		}
-	}
+	s.tracker.releaseMany(unclaimSHAs)
 
 	// Strip the data root to return relative paths. Workers join these
 	// with their own data root to find files locally. EvalSymlinks inside
@@ -503,17 +623,14 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 			}); err != nil {
 				slog.Error("record analysis error failed", "sha256", req.SHA256, "error", err)
 			}
-			// Transient error — release claim so another worker can try.
-			if err := retryDBAccessNoValue(ctx, "unclaim transient failure", req.SHA256, func(ctx context.Context) error {
-				return s.db.UnclaimJobs(ctx, []string{req.SHA256})
-			}); err != nil {
-				slog.Error("unclaim failed", "sha256", req.SHA256, "error", err)
-			}
 			//nolint:gosec // worker sanitized by validWorkerName, sha256 by validSHA256, path from DB
 			slog.Warn("worker reported analysis error",
 				"worker", req.Worker, "sha256", req.SHA256, "path", samplePath, "error", clientErr)
 		}
 		s.progress.errors.Add(1)
+		// Drop the in-memory claim so another worker can try it. Order matters:
+		// release decrements ActiveClaims, then recordResult bumps Errors.
+		s.tracker.release(req.SHA256)
 		s.tracker.recordResult(req.Worker, true)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true}) //nolint:errcheck,errchkjson // best-effort response
@@ -541,8 +658,9 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		return s.db.UpdateCleaveResult(ctx, req.SHA256, req.Raw, &parsed, tv)
 	}); err != nil {
 		logResultStoreError("store cleave result failed after accepting worker result", r.Context(), ctx, req.SHA256, err)
-		// Still record the result so ActiveClaims is decremented — otherwise
-		// the worker's claim count is permanently inflated for this slot.
+		// Drop the claim and bump errors so the worker's slot frees up — without
+		// this, the worker's ActiveClaims is permanently inflated for this job.
+		s.tracker.release(req.SHA256)
 		s.tracker.recordResult(req.Worker, true)
 		s.progress.errors.Add(1)
 		http.Error(w, resultStoreHTTPError(err), http.StatusInternalServerError)
@@ -557,6 +675,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.progress.analyzed.Add(1)
+	s.tracker.release(req.SHA256)
 	s.tracker.recordResult(req.Worker, false)
 
 	// Explode archive members.
@@ -589,6 +708,47 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true}) //nolint:errcheck,errchkjson // best-effort response
+}
+
+// claimJobs walks the three priority tiers (unanalyzed → force-rescan →
+// stale-traits) in order, fetching candidate batches from the DB and
+// claiming the first count that aren't held by another worker. Over-fetches
+// so that contention with other concurrent pollers doesn't starve a
+// requester at the head of the queue.
+func (s *apiServer) claimJobs(ctx context.Context, worker string, count int) ([]hopper.ClaimJob, error) {
+	want := count
+	overfetch := max(count*candidateOverfetch, minCandidates)
+
+	cands, err := s.db.UnanalyzedCandidates(ctx, s.hopperStart, overfetch)
+	if err != nil {
+		return nil, err
+	}
+	out := s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)
+	if len(out) >= count {
+		return out, nil
+	}
+
+	if len(s.forceRescanPrefixes) > 0 {
+		want = count - len(out)
+		cands, err = s.db.ForceRescanCandidates(ctx, s.hopperStart, s.forceRescanPrefixes, want*candidateOverfetch)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
+		if len(out) >= count {
+			return out, nil
+		}
+	}
+
+	if s.traitsVersion != "" {
+		want = count - len(out)
+		cands, err = s.db.StaleTraitsCandidates(ctx, s.traitsVersion, s.rescanAge, s.hopperStart, want*candidateOverfetch)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
+	}
+	return out, nil
 }
 
 func resultStoreContext(reqCtx context.Context) (context.Context, context.CancelFunc) {

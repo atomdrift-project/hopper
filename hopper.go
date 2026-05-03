@@ -949,20 +949,12 @@ type Worker struct {
 	Slots    int       `json:"slots"`
 }
 
-// WorkerClaim describes the oldest active claim for a given worker.
+// WorkerClaim describes one in-flight job claim, used by the dashboard to
+// show what each worker is currently working on.
 type WorkerClaim struct {
 	ClaimedAt time.Time
 	Worker    string
 	Path      string
-}
-
-// OldestClaims returns the oldest active claim per worker.
-// Claims older than maxAge are considered stale and excluded.
-func (db *DB) OldestClaims(ctx context.Context, maxAge time.Duration) ([]WorkerClaim, error) {
-	if db.pool != nil {
-		return db.oldestClaimsPG(ctx, maxAge)
-	}
-	return db.oldestClaimsSQLite(ctx, maxAge)
 }
 
 // NewestAnalyzedAt returns the most recent analyzed_at timestamp, or zero if none.
@@ -973,40 +965,36 @@ func (db *DB) NewestAnalyzedAt(ctx context.Context) (time.Time, error) {
 	return db.newestAnalyzedAtSQLite(ctx)
 }
 
-// ClaimJobs atomically claims up to limit unanalyzed samples for the named
-// worker. Expired claims (older than expiry) are reclaimed. When no unanalyzed
-// samples remain, workers fall through to two rescan tiers (in order):
-// force-rescan paths (samples under forceRescanPrefixes whose analysis
-// predates hopperStart) and traits-stale rescan (samples analyzed with a
-// different traits_version more than rescanAge ago). Neither rescan tier
-// clears stored analysis — UpdateSample overwrites in place when new results
-// arrive, so a crashed or expired rescan never leaves a row visibly empty.
-func (db *DB) ClaimJobs(
-	ctx context.Context, worker string, limit int,
-	expiry time.Duration, currentTraits string, rescanAge time.Duration,
-	hopperStart time.Time, forceRescanPrefixes []string,
+// UnanalyzedCandidates returns up to limit Tier 1 jobs (samples that have
+// never been analyzed) in priority order. Claim ownership lives in memory
+// in the API server — this is a pure SELECT.
+func (db *DB) UnanalyzedCandidates(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
+	if db.pool != nil {
+		return db.unanalyzedCandidatesPG(ctx, hopperStart, limit)
+	}
+	return db.unanalyzedCandidatesSQLite(ctx, hopperStart, limit)
+}
+
+// ForceRescanCandidates returns up to limit Tier 2 jobs: previously analyzed
+// samples under the named path prefixes whose analysis predates hopperStart.
+func (db *DB) ForceRescanCandidates(ctx context.Context, hopperStart time.Time, prefixes []string, limit int) ([]ClaimJob, error) {
+	if db.pool != nil {
+		return db.forceRescanCandidatesPG(ctx, hopperStart, prefixes, limit)
+	}
+	return db.forceRescanCandidatesSQLite(ctx, hopperStart, prefixes, limit)
+}
+
+// StaleTraitsCandidates returns up to limit Tier 3 jobs: samples analyzed
+// with a different traits_version more than rescanAge ago, ordered by
+// label-disagreement priority.
+func (db *DB) StaleTraitsCandidates(
+	ctx context.Context, currentTraits string, rescanAge time.Duration,
+	hopperStart time.Time, limit int,
 ) ([]ClaimJob, error) {
 	if db.pool != nil {
-		return db.claimJobsPG(ctx, worker, limit, expiry, currentTraits, rescanAge, hopperStart, forceRescanPrefixes)
+		return db.staleTraitsCandidatesPG(ctx, currentTraits, rescanAge, hopperStart, limit)
 	}
-	return db.claimJobsSQLite(ctx, worker, limit, expiry, currentTraits, rescanAge, hopperStart, forceRescanPrefixes)
-}
-
-// UnclaimAll releases all outstanding claims. Call on startup to clear
-// stale claims from previous runs so those samples get re-queued.
-func (db *DB) UnclaimAll(ctx context.Context) (int64, error) {
-	if db.pool != nil {
-		return db.unclaimAllPG(ctx)
-	}
-	return db.unclaimAllSQLite(ctx)
-}
-
-// UnclaimJobs releases claims for the given SHA256s so other workers can try.
-func (db *DB) UnclaimJobs(ctx context.Context, shas []string) error {
-	if db.pool != nil {
-		return db.unclaimJobsPG(ctx, shas)
-	}
-	return db.unclaimJobsSQLite(ctx, shas)
+	return db.staleTraitsCandidatesSQLite(ctx, currentTraits, rescanAge, hopperStart, limit)
 }
 
 // UpsertWorker records a worker heartbeat for dashboard display.

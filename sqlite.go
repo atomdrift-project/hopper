@@ -247,9 +247,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		// NewestAnalyzedAt
 		`CREATE INDEX IF NOT EXISTS idx_samples_analyzed_at ` +
 			`ON samples(analyzed_at) WHERE analyzed_at IS NOT NULL`,
-		// OldestClaims
-		`CREATE INDEX IF NOT EXISTS idx_samples_claimed ` +
-			`ON samples(claimed_by, claimed_at) WHERE claimed_by != ''`,
+		// Claim state moved to memory; no longer reading these columns.
+		`DROP INDEX IF EXISTS idx_samples_claimed`,
 		`UPDATE samples SET skip = 'skip-benign-archive-item' WHERE skip = 'weak-findings'`,
 	} {
 		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
@@ -1590,7 +1589,7 @@ func (db *DB) backfillArchiveMemberLitmusSQLite(ctx context.Context) (int64, err
 
 func (db *DB) setSkipSQLite(ctx context.Context, sha256, skip string) error {
 	_, err := db.lite.ExecContext(ctx, `
-		UPDATE samples SET skip = ?, claimed_by = '', claimed_at = NULL, updated_at = ? WHERE sha256 = ?`,
+		UPDATE samples SET skip = ?, updated_at = ? WHERE sha256 = ?`,
 		skip, now(), sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: set skip: %w", err)
@@ -1806,154 +1805,80 @@ func (db *DB) feedEcosystemsSQLite(ctx context.Context, source, label string) ([
 
 // Pull-based work scheduling (SQLite).
 
-func (db *DB) claimJobsSQLite(
-	ctx context.Context, worker string, limit int,
-	expiry time.Duration, currentTraits string, rescanAge time.Duration,
-	hopperStart time.Time, forceRescanPrefixes []string,
-) ([]ClaimJob, error) {
-	// SQLite serializes writers via SetMaxOpenConns(1) on the pool, so
-	// concurrent claim requests are safe without row-level locking.
-	tx, err := db.lite.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("hopper: claim jobs begin: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck // rollback is best-effort after commit
+// Pull-based work scheduling (SQLite). See pg.go for design rationale —
+// claim ownership lives in workerTracker, not the database.
 
-	cutoff := time.Now().Add(-expiry).UTC().Format(time.RFC3339Nano)
+func (db *DB) unanalyzedCandidatesSQLite(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
 	startCutoff := hopperStart.UTC().Format(time.RFC3339Nano)
-
-	// Tier 1: unanalyzed samples (highest priority).
-	// ORDER BY random() spreads work across different packages/sources so a
-	// batch of structurally similar archives can't monopolize all workers.
-	selected, err := queryLiteClaimRows(ctx, tx,
-		`SELECT id, sha256, path, size_bytes, file_type FROM samples
+	return queryLiteCandidates(ctx, db.lite,
+		`SELECT sha256, path, size_bytes, file_type FROM samples
 		WHERE cleave_result IS NULL AND skip = '' AND parent = ''
 		  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
-		  AND (claimed_by = '' OR claimed_at < ?)
-		ORDER BY random() LIMIT ?`, startCutoff, cutoff, limit)
-	if err != nil {
-		return nil, fmt.Errorf("hopper: claim jobs: %w", err)
-	}
-
-	// Tier 2: force-rescan — samples under the named path prefixes whose
-	// analysis predates this hopper run. Prior analysis stays in place until
-	// UpdateSample overwrites it.
-	if len(selected) == 0 && len(forceRescanPrefixes) > 0 {
-		clauses := make([]string, 0, len(forceRescanPrefixes))
-		args := []any{startCutoff}
-		for _, p := range forceRescanPrefixes {
-			clauses = append(clauses, "(path = ? OR path LIKE ?)")
-			args = append(args, p, p+"/%")
-		}
-		args = append(args, startCutoff, cutoff, limit)
-		query := `SELECT id, sha256, path, size_bytes, file_type FROM samples
-			WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
-			  AND analyzed_at < ?
-			  AND (` + strings.Join(clauses, " OR ") + `)
-			  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
-			  AND (claimed_by = '' OR claimed_at < ?)
-			ORDER BY random() LIMIT ?`
-		selected, err = queryLiteClaimRows(ctx, tx, query, args...)
-		if err != nil {
-			return nil, fmt.Errorf("hopper: claim force-rescan jobs: %w", err)
-		}
-	}
-
-	// Tier 3: stale-traits rescan. Prioritize rows whose current analysis
-	// disagrees with their label, then boundary-confidence rows, then age.
-	if len(selected) == 0 && currentTraits != "" {
-		staleAge := time.Now().Add(-rescanAge).UTC().Format(time.RFC3339Nano)
-		selected, err = queryLiteClaimRows(ctx, tx,
-			`SELECT id, sha256, path, size_bytes, file_type FROM samples
-			WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
-			  AND traits_version != ?
-			  AND analyzed_at < ?
-			  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
-			  AND (claimed_by = '' OR claimed_at < ?)
-			ORDER BY
-			  CASE
-			    WHEN label = 'good' AND (max_crit >= 5 OR suspicious_count >= 2) THEN 0
-			    WHEN label = 'bad' AND max_crit < 5 AND suspicious_count < 2 THEN 0
-			    ELSE 1
-			  END,
-			  ABS(litmus_score - 0.5),
-			  analyzed_at ASC
-			LIMIT ?`, currentTraits, staleAge, startCutoff, cutoff, limit)
-		if err != nil {
-			return nil, fmt.Errorf("hopper: claim stale-traits jobs: %w", err)
-		}
-	}
-
-	ts := time.Now().UTC().Format(time.RFC3339Nano)
-	var jobs []ClaimJob
-	for _, r := range selected {
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE samples SET claimed_by = ?, claimed_at = ? WHERE id = ?`,
-			worker, ts, r.id); err != nil {
-			return nil, fmt.Errorf("hopper: claim jobs update: %w", err)
-		}
-		jobs = append(jobs, ClaimJob{SHA256: r.sha256, Path: r.path, SizeBytes: r.sizeBytes, FileType: r.fileType})
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("hopper: claim jobs commit: %w", err)
-	}
-	return jobs, nil
+		ORDER BY updated_at ASC, id
+		LIMIT ?`, startCutoff, limit)
 }
 
-type liteClaimRow struct {
-	sha256    string
-	path      string
-	fileType  string
-	id        int64
-	sizeBytes int64
+func (db *DB) forceRescanCandidatesSQLite(ctx context.Context, hopperStart time.Time, prefixes []string, limit int) ([]ClaimJob, error) {
+	if len(prefixes) == 0 {
+		return nil, nil
+	}
+	startCutoff := hopperStart.UTC().Format(time.RFC3339Nano)
+	clauses := make([]string, 0, len(prefixes))
+	args := []any{startCutoff}
+	for _, p := range prefixes {
+		clauses = append(clauses, "(path = ? OR path LIKE ?)")
+		args = append(args, p, p+"/%")
+	}
+	args = append(args, startCutoff, limit)
+	query := `SELECT sha256, path, size_bytes, file_type FROM samples
+		WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
+		  AND analyzed_at < ?
+		  AND (` + strings.Join(clauses, " OR ") + `)
+		  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
+		ORDER BY updated_at ASC, id
+		LIMIT ?`
+	return queryLiteCandidates(ctx, db.lite, query, args...)
 }
 
-func queryLiteClaimRows(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]liteClaimRow, error) {
-	rows, err := tx.QueryContext(ctx, query, args...)
+func (db *DB) staleTraitsCandidatesSQLite(
+	ctx context.Context, currentTraits string, rescanAge time.Duration,
+	hopperStart time.Time, limit int,
+) ([]ClaimJob, error) {
+	if currentTraits == "" {
+		return nil, nil
+	}
+	staleAge := time.Now().Add(-rescanAge).UTC().Format(time.RFC3339Nano)
+	startCutoff := hopperStart.UTC().Format(time.RFC3339Nano)
+	return queryLiteCandidates(ctx, db.lite,
+		`SELECT sha256, path, size_bytes, file_type FROM samples
+		WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
+		  AND traits_version != ?
+		  AND analyzed_at < ?
+		  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
+		ORDER BY
+		  CASE
+		    WHEN label = 'good' AND (max_crit >= 5 OR suspicious_count >= 2) THEN 0
+		    WHEN label = 'bad' AND max_crit < 5 AND suspicious_count < 2 THEN 0
+		    ELSE 1
+		  END,
+		  ABS(litmus_score - 0.5),
+		  analyzed_at ASC
+		LIMIT ?`, currentTraits, staleAge, startCutoff, limit)
+}
+
+func queryLiteCandidates(ctx context.Context, db *sql.DB, query string, args ...any) ([]ClaimJob, error) {
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("hopper: candidates: %w", err)
 	}
 	defer rows.Close() //nolint:errcheck // best-effort cleanup
-	var out []liteClaimRow
+	var out []ClaimJob
 	for rows.Next() {
-		var r liteClaimRow
-		if err := rows.Scan(&r.id, &r.sha256, &r.path, &r.sizeBytes, &r.fileType); err != nil {
-			return nil, err
+		var j ClaimJob
+		if err := rows.Scan(&j.SHA256, &j.Path, &j.SizeBytes, &j.FileType); err != nil {
+			return nil, fmt.Errorf("hopper: candidate scan: %w", err)
 		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
-func (db *DB) oldestClaimsSQLite(ctx context.Context, maxAge time.Duration) ([]WorkerClaim, error) {
-	cutoff := time.Now().Add(-maxAge).UTC().Format(time.RFC3339Nano)
-	rows, err := db.lite.QueryContext(ctx, `
-		SELECT s.claimed_by, s.path, s.claimed_at
-		FROM samples s
-		INNER JOIN (
-			SELECT claimed_by, MIN(claimed_at) AS min_at
-			FROM samples
-			WHERE claimed_by != '' AND claimed_at IS NOT NULL
-				AND claimed_at >= ?
-			GROUP BY claimed_by
-		) g ON s.claimed_by = g.claimed_by AND s.claimed_at = g.min_at
-	`, cutoff)
-	if err != nil {
-		return nil, fmt.Errorf("hopper: oldest claims: %w", err)
-	}
-	defer rows.Close() //nolint:errcheck // best-effort cleanup
-	var out []WorkerClaim
-	for rows.Next() {
-		var wc WorkerClaim
-		var ts string
-		if err := rows.Scan(&wc.Worker, &wc.Path, &ts); err != nil {
-			return nil, fmt.Errorf("hopper: oldest claims scan: %w", err)
-		}
-		if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
-			wc.ClaimedAt = t
-		}
-		out = append(out, wc)
+		out = append(out, j)
 	}
 	return out, rows.Err()
 }
@@ -1968,36 +1893,6 @@ func (db *DB) newestAnalyzedAtSQLite(ctx context.Context) (time.Time, error) {
 	}
 	t, err := time.Parse(time.RFC3339Nano, ts.String)
 	return t, err
-}
-
-func (db *DB) unclaimAllSQLite(ctx context.Context) (int64, error) {
-	res, err := db.lite.ExecContext(ctx,
-		`UPDATE samples SET claimed_by = '', claimed_at = NULL
-		 WHERE claimed_by != ''`)
-	if err != nil {
-		return 0, fmt.Errorf("hopper: unclaim all: %w", err)
-	}
-	n, _ := res.RowsAffected() //nolint:errcheck // best-effort
-	return n, nil
-}
-
-func (db *DB) unclaimJobsSQLite(ctx context.Context, shas []string) error {
-	if len(shas) == 0 {
-		return nil
-	}
-	tx, err := db.lite.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("hopper: unclaim begin: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck // rollback is best-effort after commit
-	for _, sha := range shas {
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE samples SET claimed_by = '', claimed_at = NULL,
-			updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE sha256 = ?`, sha); err != nil {
-			return fmt.Errorf("hopper: unclaim: %w", err)
-		}
-	}
-	return tx.Commit()
 }
 
 func (db *DB) upsertWorkerSQLite(ctx context.Context, w Worker) error {

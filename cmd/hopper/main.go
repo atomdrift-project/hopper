@@ -1101,17 +1101,8 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		slog.Info("force rescan enabled", "paths", forcePrefixes, "since", api.hopperStart)
 	}
 
-	// Clear stale claims from previous runs so those samples get re-queued.
-	wd.beginStage("db.unclaim", "Clearing stale worker claims")
-	unclaimStart := time.Now()
-	slog.Info("clearing stale claims")
-	if n, err := db.UnclaimAll(ctx); err != nil {
-		wd.failStage("db.unclaim", err.Error())
-		slog.Warn("failed to clear stale claims", "elapsed", time.Since(unclaimStart), "error", err)
-	} else {
-		wd.endStage("db.unclaim")
-		slog.Info("cleared stale claims from previous run", "count", n, "elapsed", time.Since(unclaimStart))
-	}
+	// Claims live in workerTracker (in-memory only), so a fresh process
+	// starts with an empty claim set — nothing to clear here.
 
 	slog.Info("waiting for litmus")
 	if res := <-litmusCh; res.err != nil {
@@ -1567,16 +1558,11 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 			workers = tracker.all()
 		}
 
-		// Query oldest active claim per worker.
-		oldestClaims := make(map[string]hopper.WorkerClaim)
+		// Oldest active claim per worker, read from the in-memory tracker.
+		oldestClaims := tracker.oldestPerWorker(staleClaimAge)
 		var newestAnalyzedAt time.Time
 		var rescanPending int64
 		if db != nil {
-			if claims, err := db.OldestClaims(ctx, staleClaimAge); err == nil {
-				for _, c := range claims {
-					oldestClaims[c.Worker] = c
-				}
-			}
 			newestAnalyzedAt, _ = db.NewestAnalyzedAt(ctx)                          //nolint:errcheck // best-effort; zero time is acceptable fallback
 			rescanPending, _ = db.CountRescanPending(ctx, traitsVersion, rescanAge) //nolint:errcheck // best-effort; zero is acceptable fallback
 		}

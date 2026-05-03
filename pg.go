@@ -295,6 +295,13 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 		`CREATE INDEX IF NOT EXISTS idx_samples_file_type ON samples(file_type)`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_formula   ON samples(formula)   WHERE formula   != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_score     ON samples(score)     WHERE score     != 0`,
+
+		// Claim state moved to memory (see workerTracker in cmd/hopper/api.go).
+		// idx_samples_claimed exists only to serve OldestClaims, which is gone;
+		// the claimed_by / claimed_at columns are no longer written. Drop the
+		// index now to recover its bloat; the columns can be dropped in a
+		// follow-up once we're sure no rollback is needed.
+		`DROP INDEX IF EXISTS idx_samples_claimed`,
 	} {
 		if err := db.execPGMigrationDDL(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate: %w", err)
@@ -1706,7 +1713,7 @@ func (db *DB) backfillArchiveMemberLitmusPG(ctx context.Context) (int64, error) 
 
 func (db *DB) setSkipPG(ctx context.Context, sha256, skip string) error {
 	_, err := db.pool.Exec(ctx, `
-		UPDATE samples SET skip = $2, claimed_by = '', claimed_at = NULL, updated_at = now() WHERE sha256 = $1`,
+		UPDATE samples SET skip = $2, updated_at = now() WHERE sha256 = $1`,
 		sha256, skip)
 	if err != nil {
 		return fmt.Errorf("hopper: set skip: %w", err)
@@ -1903,103 +1910,77 @@ func scanPGCounts(rows pgx.Rows) (map[string]int, error) {
 }
 
 // Pull-based work scheduling (PostgreSQL).
+//
+// These return up to limit candidate jobs in priority order. Claim ownership
+// is tracked entirely in memory by workerTracker — see cmd/hopper/api.go for
+// rationale. The handler over-fetches and uses tryClaimBatch to skip jobs
+// already held by other workers.
 
-func (db *DB) claimJobsPG(
-	ctx context.Context, worker string, limit int,
-	expiry time.Duration, currentTraits string, rescanAge time.Duration,
-	hopperStart time.Time, forceRescanPrefixes []string,
-) ([]ClaimJob, error) {
-	// Tier 1: unanalyzed samples (highest priority).
-	// ORDER BY random() spreads work across different packages/sources so a
-	// batch of structurally similar archives can't monopolize all workers.
+// unanalyzedCandidatesPG returns Tier 1 work (samples that have never been
+// analyzed). Index-ordered scan via idx_samples_claimable, no sort.
+func (db *DB) unanalyzedCandidatesPG(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
 	rows, err := db.pool.Query(ctx, `
-		WITH claimable AS (
-			SELECT id FROM samples
-			WHERE cleave_result IS NULL AND skip = '' AND parent = ''
-			  AND (note = '' OR last_error_at IS NULL OR last_error_at < $4)
-			  AND (claimed_by = '' OR claimed_at < now() - $2::interval)
-			ORDER BY random()
-			LIMIT $3
-			FOR UPDATE SKIP LOCKED
-		)
-		UPDATE samples SET claimed_by = $1, claimed_at = now()
-		FROM claimable WHERE samples.id = claimable.id
-		RETURNING samples.sha256, samples.path, samples.size_bytes, samples.file_type`,
-		worker, expiry, limit, hopperStart.UTC())
+		SELECT sha256, path, size_bytes, file_type FROM samples
+		WHERE cleave_result IS NULL AND skip = '' AND parent = ''
+		  AND (note = '' OR last_error_at IS NULL OR last_error_at < $1)
+		ORDER BY updated_at ASC NULLS FIRST, id
+		LIMIT $2`,
+		hopperStart.UTC(), limit)
 	if err != nil {
-		return nil, fmt.Errorf("hopper: claim jobs: %w", err)
+		return nil, fmt.Errorf("hopper: unanalyzed candidates: %w", err)
 	}
-	jobs, err := scanClaimRows(rows)
+	return scanClaimRows(rows)
+}
+
+// forceRescanCandidatesPG returns Tier 2 work: previously analyzed samples
+// under the named path prefixes whose analysis predates hopperStart.
+func (db *DB) forceRescanCandidatesPG(ctx context.Context, hopperStart time.Time, prefixes []string, limit int) ([]ClaimJob, error) {
+	if len(prefixes) == 0 {
+		return nil, nil
+	}
+	rows, err := db.pool.Query(ctx, `
+		SELECT sha256, path, size_bytes, file_type FROM samples
+		WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
+		  AND analyzed_at < $1
+		  AND (path = ANY($2) OR path LIKE ANY($2))
+		  AND (note = '' OR last_error_at IS NULL OR last_error_at < $1)
+		ORDER BY updated_at ASC, id
+		LIMIT $3`,
+		hopperStart.UTC(), pathPatterns(prefixes), limit)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("hopper: force-rescan candidates: %w", err)
 	}
-	if len(jobs) > 0 {
-		return jobs, nil
-	}
+	return scanClaimRows(rows)
+}
 
-	// Tier 2: force-rescan — re-analyze samples under the named path prefixes
-	// whose analysis predates this hopper run.
-	if len(forceRescanPrefixes) > 0 {
-		patterns := pathPatterns(forceRescanPrefixes)
-		rows, err = db.pool.Query(ctx, `
-			WITH reclaimable AS (
-				SELECT id FROM samples
-				WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
-				  AND analyzed_at < $4
-				  AND (path = ANY($5) OR path LIKE ANY($5))
-				  AND (note = '' OR last_error_at IS NULL OR last_error_at < $4)
-				  AND (claimed_by = '' OR claimed_at < now() - $2::interval)
-				ORDER BY random()
-				LIMIT $3
-				FOR UPDATE SKIP LOCKED
-			)
-			UPDATE samples SET claimed_by = $1, claimed_at = now()
-			FROM reclaimable WHERE samples.id = reclaimable.id
-			RETURNING samples.sha256, samples.path, samples.size_bytes, samples.file_type`,
-			worker, expiry, limit, hopperStart.UTC(), patterns)
-		if err != nil {
-			return nil, fmt.Errorf("hopper: claim force-rescan jobs: %w", err)
-		}
-		jobs, err = scanClaimRows(rows)
-		if err != nil {
-			return nil, err
-		}
-		if len(jobs) > 0 {
-			return jobs, nil
-		}
-	}
-
+// staleTraitsCandidatesPG returns Tier 3 work: samples analyzed with a
+// different traits_version more than rescanAge ago. Prioritizes label
+// disagreements and boundary-confidence rows.
+func (db *DB) staleTraitsCandidatesPG(
+	ctx context.Context, currentTraits string, rescanAge time.Duration,
+	hopperStart time.Time, limit int,
+) ([]ClaimJob, error) {
 	if currentTraits == "" {
 		return nil, nil
 	}
-
-	// Tier 3: stale-traits rescan — prioritize rows whose current analysis
-	// disagrees with their label, then boundary-confidence rows, then age.
-	rows, err = db.pool.Query(ctx, `
-		WITH reclaimable AS (
-			SELECT id FROM samples
-			WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
-			  AND traits_version != $4
-			  AND analyzed_at < $5
-			  AND (note = '' OR last_error_at IS NULL OR last_error_at < $6)
-			  AND (claimed_by = '' OR claimed_at < now() - $2::interval)
-			ORDER BY
-			  CASE
-			    WHEN label = 'good' AND (max_crit >= 5 OR suspicious_count >= 2) THEN 0
-			    WHEN label = 'bad' AND max_crit < 5 AND suspicious_count < 2 THEN 0
-			    ELSE 1
-			  END,
-			  ABS(litmus_score - 0.5),
-			  analyzed_at ASC NULLS LAST
-			LIMIT $3
-			FOR UPDATE SKIP LOCKED
-		)
-		UPDATE samples SET claimed_by = $1, claimed_at = now()
-		FROM reclaimable WHERE samples.id = reclaimable.id
-		RETURNING samples.sha256, samples.path, samples.size_bytes, samples.file_type`,
-		worker, expiry, limit, currentTraits, time.Now().Add(-rescanAge).UTC(), hopperStart.UTC())
+	rows, err := db.pool.Query(ctx, `
+		SELECT sha256, path, size_bytes, file_type FROM samples
+		WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
+		  AND traits_version != $1
+		  AND analyzed_at < $2
+		  AND (note = '' OR last_error_at IS NULL OR last_error_at < $3)
+		ORDER BY
+		  CASE
+		    WHEN label = 'good' AND (max_crit >= 5 OR suspicious_count >= 2) THEN 0
+		    WHEN label = 'bad' AND max_crit < 5 AND suspicious_count < 2 THEN 0
+		    ELSE 1
+		  END,
+		  ABS(litmus_score - 0.5),
+		  analyzed_at ASC NULLS LAST
+		LIMIT $4`,
+		currentTraits, time.Now().Add(-rescanAge).UTC(), hopperStart.UTC(), limit)
 	if err != nil {
-		return nil, fmt.Errorf("hopper: claim stale-traits jobs: %w", err)
+		return nil, fmt.Errorf("hopper: stale-traits candidates: %w", err)
 	}
 	return scanClaimRows(rows)
 }
@@ -2020,34 +2001,11 @@ func scanClaimRows(rows pgx.Rows) ([]ClaimJob, error) {
 	for rows.Next() {
 		var j ClaimJob
 		if err := rows.Scan(&j.SHA256, &j.Path, &j.SizeBytes, &j.FileType); err != nil {
-			return nil, fmt.Errorf("hopper: claim jobs scan: %w", err)
+			return nil, fmt.Errorf("hopper: candidate scan: %w", err)
 		}
 		jobs = append(jobs, j)
 	}
 	return jobs, rows.Err()
-}
-
-func (db *DB) oldestClaimsPG(ctx context.Context, maxAge time.Duration) ([]WorkerClaim, error) {
-	rows, err := db.pool.Query(ctx, `
-		SELECT DISTINCT ON (claimed_by) claimed_by, path, claimed_at
-		FROM samples
-		WHERE claimed_by != '' AND claimed_at IS NOT NULL
-			AND claimed_at >= now() - $1::interval
-		ORDER BY claimed_by, claimed_at
-	`, maxAge.String())
-	if err != nil {
-		return nil, fmt.Errorf("hopper: oldest claims: %w", err)
-	}
-	defer rows.Close()
-	var out []WorkerClaim
-	for rows.Next() {
-		var wc WorkerClaim
-		if err := rows.Scan(&wc.Worker, &wc.Path, &wc.ClaimedAt); err != nil {
-			return nil, fmt.Errorf("hopper: oldest claims scan: %w", err)
-		}
-		out = append(out, wc)
-	}
-	return out, rows.Err()
 }
 
 func (db *DB) newestAnalyzedAtPG(ctx context.Context) (time.Time, error) {
@@ -2059,28 +2017,6 @@ func (db *DB) newestAnalyzedAtPG(ctx context.Context) (time.Time, error) {
 		return time.Time{}, err
 	}
 	return *t, nil
-}
-
-func (db *DB) unclaimAllPG(ctx context.Context) (int64, error) {
-	tag, err := db.pool.Exec(ctx,
-		`UPDATE samples SET claimed_by = '', claimed_at = NULL
-		 WHERE claimed_by != ''`)
-	if err != nil {
-		return 0, fmt.Errorf("hopper: unclaim all: %w", err)
-	}
-	return tag.RowsAffected(), nil
-}
-
-func (db *DB) unclaimJobsPG(ctx context.Context, shas []string) error {
-	if len(shas) == 0 {
-		return nil
-	}
-	_, err := db.pool.Exec(ctx,
-		`UPDATE samples SET claimed_by = '', claimed_at = NULL, updated_at = now() WHERE sha256 = ANY($1)`, shas)
-	if err != nil {
-		return fmt.Errorf("hopper: unclaim jobs: %w", err)
-	}
-	return nil
 }
 
 func (db *DB) upsertWorkerPG(ctx context.Context, w Worker) error {

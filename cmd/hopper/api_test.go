@@ -8,10 +8,67 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"codeberg.org/atomdrift/hopper"
 )
+
+func TestWorkerTrackerClaimAndRelease(t *testing.T) {
+	wt := newWorkerTracker()
+	cands := []hopper.ClaimJob{
+		{SHA256: "a", Path: "p/a"},
+		{SHA256: "b", Path: "p/b"},
+		{SHA256: "c", Path: "p/c"},
+	}
+
+	got := wt.tryClaimBatch(cands, "w1", time.Minute, 10)
+	if len(got) != 3 {
+		t.Fatalf("first claim: got %d, want 3", len(got))
+	}
+
+	// Re-claim while w1's hold is fresh: w2 should get nothing.
+	got = wt.tryClaimBatch(cands, "w2", time.Minute, 10)
+	if len(got) != 0 {
+		t.Fatalf("w2 saw held claims as available: %+v", got)
+	}
+
+	// w1 finishes "a"; w2 can now take it.
+	wt.release("a")
+	got = wt.tryClaimBatch(cands, "w2", time.Minute, 10)
+	if len(got) != 1 || got[0].SHA256 != "a" {
+		t.Fatalf("after release: got %+v, want [{a ...}]", got)
+	}
+}
+
+func TestWorkerTrackerClaimExpiry(t *testing.T) {
+	wt := newWorkerTracker()
+	cands := []hopper.ClaimJob{{SHA256: "exp1", Path: "p/x"}}
+
+	if got := wt.tryClaimBatch(cands, "w1", time.Minute, 1); len(got) != 1 {
+		t.Fatalf("first claim: got %d, want 1", len(got))
+	}
+
+	// Zero expiry treats every claim as already-expired and re-issues it.
+	got := wt.tryClaimBatch(cands, "w2", 0, 1)
+	if len(got) != 1 || got[0].SHA256 != "exp1" {
+		t.Fatalf("zero-expiry steal: got %+v, want [{exp1 ...}]", got)
+	}
+}
+
+func TestWorkerTrackerOldestPerWorkerPrunesStale(t *testing.T) {
+	wt := newWorkerTracker()
+	wt.claims["fresh"] = claim{worker: "w1", path: "fresh.bin", at: time.Now()}
+	wt.claims["stale"] = claim{worker: "w1", path: "stale.bin", at: time.Now().Add(-time.Hour)}
+
+	out := wt.oldestPerWorker(time.Minute)
+	if len(out) != 1 || out["w1"].Path != "fresh.bin" {
+		t.Fatalf("oldestPerWorker = %+v, want only fresh.bin for w1", out)
+	}
+	if _, stillThere := wt.claims["stale"]; stillThere {
+		t.Fatal("stale claim was not pruned during oldestPerWorker walk")
+	}
+}
 
 func TestTrimClientError(t *testing.T) {
 	in := "cleave failed:\n\n   Failed to load traits\tfrom /usr/local/share/litmus/traits due to many validation errors while parsing the installed bundle"
