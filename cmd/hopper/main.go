@@ -783,7 +783,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	litmusBin := f.String("litmus", "litmus", "path to litmus binary (pass empty to disable)")
 	litmusWorkers := f.Int("workers", 0, "concurrent analysis workers for the local litmus (0 = auto: min(2, cores/2))")
 	// Remote litmus workers self-register via the pull API; no --litmus-nodes flag needed.
-	maxRSSGB := f.Int("max-memory-gb", 0, "litmus RSS limit in GB (0 = auto)")
+	maxRSSGB := f.Int("max-memory-gb", -1, "litmus RSS limit in GB (-1 = disable in-process throttling, 0 = auto)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
 	rescanAge := f.Duration("rescan-age", 72*time.Hour, "minimum age before a stale-traits sample is eligible for rescan")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
@@ -1079,6 +1079,11 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	db := dr.db
 	defer db.Close()
 	slog.Info("database ready", "elapsed", time.Since(dbStart), "next", "relativize sample paths")
+
+	// Periodic pgxpool stats so saturation is visible. Without this, a
+	// connection-starved pool looks like "the dashboard is slow" with no
+	// further signal.
+	go logPoolStatsLoop(ctx, db)
 
 	wd.beginStage("db.relativize", "Relativizing sample paths")
 	relativizeStart := time.Now()
@@ -2531,4 +2536,33 @@ func isTTY() bool {
 		return false
 	}
 	return (fileInfo.Mode() & os.ModeCharDevice) != 0
+}
+
+// logPoolStatsLoop emits a snapshot of the pgxpool every 30s. Anything other
+// than baseline numbers (acquired_conns near max, non-zero acquire_wait) is a
+// pool-saturation signal.
+func logPoolStatsLoop(ctx context.Context, db *hopper.DB) {
+	pool := db.Pool()
+	if pool == nil {
+		return
+	}
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		s := pool.Stat()
+		slog.Info("pg pool stats",
+			"acquired", s.AcquiredConns(),
+			"idle", s.IdleConns(),
+			"total", s.TotalConns(),
+			"max", s.MaxConns(),
+			"acquire_count", s.AcquireCount(),
+			"acquire_wait", s.AcquireDuration().Round(time.Millisecond),
+			"empty_acquire", s.EmptyAcquireCount(),
+			"canceled_acquire", s.CanceledAcquireCount())
+	}
 }

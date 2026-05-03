@@ -21,8 +21,12 @@ func openPG(ctx context.Context, dsn string) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("hopper: parse dsn: %w", err)
 	}
-	cfg.MaxConns = 32
-	cfg.MinConns = 4
+	// Sized for concurrent /api/next + /api/result + dashboard + ad-hoc psql
+	// inspection. With long result-store transactions (UpdateCleaveResult
+	// can cascade into ExplodeArchiveMembers) holding a connection for
+	// seconds, 32 was tight enough to starve the dashboard's queries.
+	cfg.MaxConns = 64
+	cfg.MinConns = 8
 	cfg.MaxConnIdleTime = 5 * time.Minute
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
@@ -302,6 +306,19 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 		// index now to recover its bloat; the columns can be dropped in a
 		// follow-up once we're sure no rollback is needed.
 		`DROP INDEX IF EXISTS idx_samples_claimed`,
+
+		// Aggressive autovacuum on the hot table. Defaults wait for 20% dead
+		// tuples / 10% changed rows before kicking in, which on a 5M-row table
+		// means autovacuum lags by a million rows — and a stale visibility map
+		// turns "index-only" scans into million-fetch heap probes. With these
+		// settings autovacuum reacts at ~100K-row deltas and is given enough
+		// cost budget to actually finish a cycle.
+		`ALTER TABLE samples SET (
+			autovacuum_vacuum_scale_factor = 0.02,
+			autovacuum_analyze_scale_factor = 0.02,
+			autovacuum_vacuum_insert_scale_factor = 0.02,
+			autovacuum_vacuum_cost_limit = 2000
+		)`,
 	} {
 		if err := db.execPGMigrationDDL(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate: %w", err)

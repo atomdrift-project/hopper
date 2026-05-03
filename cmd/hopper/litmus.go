@@ -51,7 +51,7 @@ type litmusConfig struct {
 	Bin        string // path to litmus binary (default: "litmus")
 	HopperURL  string // hopper API URL (e.g. http://127.0.0.1:8081)
 	DataDir    string // data root for local file access
-	MaxRSSGB   int    // memory limit in GB (0 = let litmus decide)
+	MaxRSSGB   int    // memory limit in GB (0 = let litmus decide, -1 = disable in-process throttling)
 	MaxWorkers int    // max concurrent analysis workers
 	Verbose    bool   // enable debug logging in litmus
 }
@@ -214,7 +214,7 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 	if s.dataDir != "" {
 		args = append(args, "--data-dir", s.dataDir)
 	}
-	if s.maxRSSGB > 0 {
+	if s.maxRSSGB != 0 {
 		args = append(args, "--max-rss-gb", strconv.Itoa(s.maxRSSGB))
 	}
 	if s.maxWorkers > 0 {

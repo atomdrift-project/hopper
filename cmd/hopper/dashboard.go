@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"html"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -280,7 +281,16 @@ func startWebDashboard(ctx context.Context, addr string, wd *webDashboard, mux *
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
 		<-ctx.Done()
-		_ = srv.Close() //nolint:errcheck // best-effort shutdown
+		// Graceful shutdown — let in-flight /data/* downloads finish so workers
+		// don't see "error decoding response body" mid-stream. Detach from the
+		// cancelled parent (it's the trigger, not a deadline). Close as a
+		// fallback if a slow client keeps the server alive past the deadline.
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("web dashboard graceful shutdown timed out; forcing close", "error", err)
+			_ = srv.Close() //nolint:errcheck // last-resort close after Shutdown timeout
+		}
 	}()
 	go func() {
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -436,7 +446,7 @@ func (wd *webDashboard) renderStartup(w http.ResponseWriter) {
 	_, _ = w.Write([]byte(buf.String())) //nolint:errcheck // best-effort HTTP response
 }
 
-func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //nolint:maintidx // dashboard handler has many query parameters
+func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //nolint:maintidx,gocognit,revive // dashboard handler has many query parameters and is long but flat
 	wd.cfgMu.RLock()
 	progress := wd.progress
 	tracker := wd.tracker
@@ -463,11 +473,15 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	}
 	var newestAnalyzedAt time.Time
 	if db != nil {
-		//nolint:errcheck,contextcheck // Fetch returns zero time on error; closure creates its own context.
+		//nolint:contextcheck,errcheck // closure creates its own context; closure logs errors before returning
 		newestAnalyzedAt, _ = wd.newestATCache.Fetch("newest", func() (time.Time, error) {
 			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
 			defer cancel()
-			return db.NewestAnalyzedAt(qctx)
+			t, err := db.NewestAnalyzedAt(qctx)
+			if err != nil {
+				slog.Warn("dashboard: NewestAnalyzedAt failed", "error", err)
+			}
+			return t, err
 		})
 	}
 
@@ -475,11 +489,15 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	if db != nil && wd.traitsVersion != "" {
 		tv := wd.traitsVersion
 		ra := wd.rescanAge
-		//nolint:errcheck,contextcheck // Fetch returns zero on error; closure creates its own context.
+		//nolint:contextcheck,errcheck // closure creates its own context; closure logs errors before returning
 		rescanPending, _ = wd.rescanCache.Fetch("rescan", func() (int64, error) {
 			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
 			defer cancel()
-			return db.CountRescanPending(qctx, tv, ra)
+			n, err := db.CountRescanPending(qctx, tv, ra)
+			if err != nil {
+				slog.Warn("dashboard: CountRescanPending failed", "error", err)
+			}
+			return n, err
 		})
 	}
 
