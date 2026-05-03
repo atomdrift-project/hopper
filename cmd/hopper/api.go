@@ -28,12 +28,22 @@ type apiServer struct {
 	db                  *hopper.DB
 	tracker             *workerTracker
 	progress            *loadProgress
-	hopperStart         time.Time // process start; gates force-rescan claim tier
-	dataRoot            string    // resolved absolute path to the data directory
-	traitsVersion       string    // short prefix of current traits repo commit; empty = rescan disabled
-	allowedDirs         []string  // resolved absolute paths that /api/file may serve from
-	forceRescanPrefixes []string  // normalized relative paths to re-analyze when analysis predates hopperStart
+	explosions          chan explosionJob // archive-expansion work, drained by background goroutines
+	hopperStart         time.Time         // process start; gates force-rescan claim tier
+	dataRoot            string            // resolved absolute path to the data directory
+	traitsVersion       string            // short prefix of current traits repo commit; empty = rescan disabled
+	allowedDirs         []string          // resolved absolute paths that /api/file may serve from
+	forceRescanPrefixes []string          // normalized relative paths to re-analyze when analysis predates hopperStart
+	explosionWG         sync.WaitGroup    // tracks live explosion workers for graceful drain
 	rescanAge           time.Duration
+}
+
+// explosionJob defers archive-member expansion off the /api/result hot path.
+// Workers don't care about the result of explosion — it only seeds new rows
+// in samples for future analysis.
+type explosionJob struct {
+	sha256 string
+	raw    json.RawMessage
 }
 
 const maxClientErrorRunes = 120
@@ -70,6 +80,7 @@ type claim struct {
 type workerStats struct {
 	LastSeen     time.Time
 	LastClaimed  time.Time // when the most recent batch of claims was made
+	LastUpserted time.Time // when we last persisted a heartbeat row to the workers table
 	Version      string
 	Traits       string
 	TotalClaimed int64
@@ -127,18 +138,21 @@ func (wt *workerTracker) tryClaimBatch(cands []hopper.ClaimJob, worker string, e
 }
 
 // release drops a single claim and decrements the holding worker's
-// ActiveClaims counter. Safe if the sha256 isn't present.
-func (wt *workerTracker) release(sha string) {
+// ActiveClaims counter. Returns the path that was associated with the
+// claim so the caller can log it without a separate DB lookup. Returns
+// "" if the sha256 wasn't held.
+func (wt *workerTracker) release(sha string) string {
 	wt.mu.Lock()
 	defer wt.mu.Unlock()
 	c, ok := wt.claims[sha]
 	if !ok {
-		return
+		return ""
 	}
 	delete(wt.claims, sha)
 	if ws := wt.workers[c.worker]; ws != nil && ws.ActiveClaims > 0 {
 		ws.ActiveClaims--
 	}
+	return c.path
 }
 
 // releaseMany drops a batch of claims.
@@ -200,6 +214,26 @@ func (wt *workerTracker) update(name string, slots int, version, traits string, 
 	ws.Traits = traits
 	ws.RSSMB = rssMB
 	ws.Load1 = load1
+}
+
+// shouldUpsertWorker reports whether the workers-table heartbeat row for the
+// named worker should be re-persisted, and stamps the time if so. The DB row
+// is purely for crash inspection — the dashboard reads from this tracker —
+// so it can lag the in-memory view by a few tens of seconds without harm.
+// Without this throttle every /api/next does a WAL-flushed write.
+func (wt *workerTracker) shouldUpsertWorker(name string, interval time.Duration) bool {
+	wt.mu.Lock()
+	defer wt.mu.Unlock()
+	ws := wt.workers[name]
+	if ws == nil {
+		return true // first sighting; let the caller persist
+	}
+	now := time.Now()
+	if now.Sub(ws.LastUpserted) < interval {
+		return false
+	}
+	ws.LastUpserted = now
+	return true
 }
 
 // claimLimit returns how many more jobs the worker may claim right now.
@@ -331,7 +365,7 @@ const (
 	claimExpiry        = 30 * time.Minute
 	staleClaimAge      = 2 * time.Hour
 	maxWorkerNameLen   = 64
-	maxResultBodyBytes = 128 << 20 // 128 MiB — complex samples with many embedded binaries produce large cleave reports.
+	maxResultBodyBytes = 256 << 20 // 256 MiB — some archive cleave reports legitimately exceed 128 MiB.
 	maxTrackedWorkers  = 200
 	apiQueryTimeout    = 30 * time.Second
 	resultStoreTimeout = 10 * time.Minute
@@ -343,6 +377,18 @@ const (
 	// same prefix. tryClaimBatch handles the deduplication in memory.
 	candidateOverfetch = 8
 	minCandidates      = 32
+
+	// workerUpsertInterval throttles DB heartbeat writes per worker so a
+	// busy worker polling several times per second doesn't generate a
+	// matching write storm to the workers table.
+	workerUpsertInterval = 30 * time.Second
+
+	// explosionQueueSize bounds how many cleave results may be waiting for
+	// background archive expansion. Set well above expected steady-state so
+	// transient bursts don't push back on /api/result.
+	explosionQueueSize    = 4096
+	explosionWorkers      = 4
+	explosionDrainTimeout = 30 * time.Second
 )
 
 // validWorkerName checks that the name is non-empty, <= maxWorkerNameLen,
@@ -438,10 +484,14 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
 
-	// Persist worker heartbeat to DB for crash recovery.
-	wk := hopper.Worker{Name: worker, Slots: slots, Version: version, Traits: traits}
-	if err := s.db.UpsertWorker(ctx, wk); err != nil {
-		slog.Debug("upsert worker failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
+	// Persist worker heartbeat to DB for crash recovery, throttled. The
+	// dashboard reads live worker state from the in-memory tracker; the DB
+	// row is only for post-crash inspection.
+	if s.tracker.shouldUpsertWorker(worker, workerUpsertInterval) {
+		wk := hopper.Worker{Name: worker, Slots: slots, Version: version, Traits: traits}
+		if err := s.db.UpsertWorker(ctx, wk); err != nil {
+			slog.Debug("upsert worker failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
+		}
 	}
 
 	jobs, err := s.claimJobs(ctx, worker, count)
@@ -557,26 +607,16 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"starting"}`, http.StatusServiceUnavailable)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxResultBodyBytes))
-	if err != nil {
-		slog.Warn("result rejected: read body failed", "error", err, "remote", r.RemoteAddr) //nolint:gosec // structured logging
-		http.Error(w, `{"error":"read body"}`, http.StatusBadRequest)
-		return
-	}
-
+	// Stream-decode rather than io.ReadAll: avoids a duplicate 128 MiB buffer
+	// per concurrent uploader. The Raw/ML json.RawMessage fields still land
+	// in memory once each, but we lose the second whole-body copy.
+	limited := io.LimitReader(r.Body, maxResultBodyBytes)
+	dec := json.NewDecoder(limited)
 	var req resultRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		snippet := string(body)
-		if len(snippet) > 256 {
-			snippet = snippet[:128] + "..." + snippet[len(snippet)-128:]
-		}
-		truncated := int64(len(body)) >= maxResultBodyBytes
+	if err := dec.Decode(&req); err != nil {
 		slog.Warn("result rejected: invalid json", //nolint:gosec // structured logging
 			"error", err,
 			"remote", r.RemoteAddr,
-			"body_len", len(body),
-			"truncated", truncated,
-			"snippet", snippet,
 		)
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 		return
@@ -591,7 +631,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	// Once the result body is accepted, persist it independently of the
 	// client connection. Workers may time out or disconnect while Hopper is
 	// still doing DB work, and that must not discard completed analysis.
-	ctx, cancelStore := resultStoreContext(r.Context())
+	ctx, cancelStore := context.WithTimeout(context.WithoutCancel(r.Context()), resultStoreTimeout)
 	defer cancelStore()
 
 	if req.Error != "" {
@@ -663,7 +703,11 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		s.tracker.release(req.SHA256)
 		s.tracker.recordResult(req.Worker, true)
 		s.progress.errors.Add(1)
-		http.Error(w, resultStoreHTTPError(err), http.StatusInternalServerError)
+		errMsg := `{"error":"store cleave result failed"}`
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			errMsg = `{"error":"store cleave result failed: database write context was canceled or timed out"}`
+		}
+		http.Error(w, errMsg, http.StatusInternalServerError)
 		return
 	}
 
@@ -675,39 +719,111 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.progress.analyzed.Add(1)
-	s.tracker.release(req.SHA256)
+	path := s.tracker.release(req.SHA256)
 	s.tracker.recordResult(req.Worker, false)
 
-	// Explode archive members.
-	resultPath := ""
-	parent, err := retryDBAccess(ctx, "fetch sample for archive explosion", req.SHA256, func(ctx context.Context) (*hopper.Sample, error) {
-		return s.db.SampleParentInfo(ctx, req.SHA256)
-	})
-	if err != nil {
-		if !errors.Is(err, hopper.ErrNotFound) {
-			slog.Error("fetch for explosion failed", "sha256", req.SHA256, "error", err)
-		}
-	} else {
-		resultPath = parent.Path
-		parent.CleaveResult = req.Raw // already have it — avoid re-reading from DB
-		if n, err := retryDBAccess(ctx, "explode archive members", req.SHA256, func(ctx context.Context) (int64, error) {
-			return s.db.ExplodeArchiveMembers(ctx, parent)
-		}); err != nil {
-			slog.Error("archive explosion failed", "sha256", req.SHA256, "error", err)
-		} else if n > 0 {
-			slog.Debug("exploded archive members", "sha256", req.SHA256, "members", n) //nolint:gosec // sha256 validated by validSHA256
-			s.progress.exploded.Add(n)
-			s.progress.queued.Add(n)
-			s.progress.analyzed.Add(n)
-		}
-	}
+	// Hand archive expansion to the background pool. The worker doesn't
+	// care about the result, and a 200-entry JAR shouldn't keep its HTTP
+	// connection (or our pool conn) busy.
+	s.enqueueExplosion(ctx, explosionJob{sha256: req.SHA256, raw: req.Raw})
 
-	//nolint:gosec // worker sanitized by validWorkerName, sha256 by validSHA256, path from DB
-	slog.Info("result stored", "worker", req.Worker, "sha256", req.SHA256, "path", resultPath,
+	//nolint:gosec // worker sanitized by validWorkerName, sha256 by validSHA256, path from in-memory claim
+	slog.Info("result stored", "worker", req.Worker, "sha256", req.SHA256, "path", path,
 		"duration_ms", req.DurationMs, "active_claims", s.tracker.activeClaims(req.Worker))
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true}) //nolint:errcheck,errchkjson // best-effort response
+}
+
+// startExplosions launches the background pool that expands archive cleave
+// results into child sample rows. Call once after the apiServer's db is set.
+// Workers exit only when the queue is closed via drainExplosions; that lets
+// graceful shutdown actually finish in-flight DB writes instead of failing
+// them with context.Canceled the moment main shuts down.
+func (s *apiServer) startExplosions(ctx context.Context) {
+	// Decouple from cancellation so workers survive a ctx-Done shutdown
+	// long enough for drainExplosions to flush the channel. db.Close runs
+	// after drainExplosions in main, so the pool stays alive.
+	explosionCtx := context.WithoutCancel(ctx)
+	s.explosions = make(chan explosionJob, explosionQueueSize)
+	for range explosionWorkers {
+		s.explosionWG.Go(func() {
+			for job := range s.explosions {
+				// Per-job panic recovery so a malformed cleave result can't
+				// crash the worker (which would shrink the pool until restart).
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							slog.Error("explosion worker recovered from panic",
+								"sha256", job.sha256, "panic", r)
+						}
+					}()
+					s.processExplosion(explosionCtx, job)
+				}()
+			}
+		})
+	}
+}
+
+// drainExplosions closes the queue and waits for in-flight expansions to
+// finish, capped at explosionDrainTimeout so a wedged DB doesn't hang
+// shutdown. Call exactly once.
+func (s *apiServer) drainExplosions() {
+	if s.explosions == nil {
+		return
+	}
+	close(s.explosions)
+	done := make(chan struct{})
+	go func() { s.explosionWG.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(explosionDrainTimeout):
+		slog.Warn("explosion drain timed out; some archive members may not be enqueued",
+			"timeout", explosionDrainTimeout)
+	}
+}
+
+func (s *apiServer) processExplosion(ctx context.Context, job explosionJob) {
+	parent, err := retryDBAccess(ctx, "fetch sample for archive explosion", job.sha256, func(ctx context.Context) (*hopper.Sample, error) {
+		return s.db.SampleParentInfo(ctx, job.sha256)
+	})
+	if err != nil {
+		if !errors.Is(err, hopper.ErrNotFound) {
+			slog.Error("fetch for explosion failed", "sha256", job.sha256, "error", err)
+		}
+		return
+	}
+	parent.CleaveResult = job.raw // we already have it; avoid re-reading from DB
+	n, err := retryDBAccess(ctx, "explode archive members", job.sha256, func(ctx context.Context) (int64, error) {
+		return s.db.ExplodeArchiveMembers(ctx, parent)
+	})
+	if err != nil {
+		slog.Error("archive explosion failed", "sha256", job.sha256, "error", err)
+		return
+	}
+	if n > 0 {
+		slog.Debug("exploded archive members", "sha256", job.sha256, "members", n)
+		s.progress.exploded.Add(n)
+		s.progress.queued.Add(n)
+		s.progress.analyzed.Add(n)
+	}
+}
+
+// enqueueExplosion hands the job off to the background pool, falling back to
+// inline processing if the queue is full so we never lose a result. A full
+// queue means the explosion workers can't keep up — log it so the operator
+// notices.
+func (s *apiServer) enqueueExplosion(ctx context.Context, job explosionJob) {
+	if s.explosions == nil {
+		s.processExplosion(ctx, job)
+		return
+	}
+	select {
+	case s.explosions <- job:
+	default:
+		slog.Warn("explosion queue full; processing inline", "sha256", job.sha256, "queue_size", explosionQueueSize)
+		s.processExplosion(ctx, job)
+	}
 }
 
 // claimJobs walks the three priority tiers (unanalyzed → force-rescan →
@@ -749,10 +865,6 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int) ([]
 		out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
 	}
 	return out, nil
-}
-
-func resultStoreContext(reqCtx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(reqCtx), resultStoreTimeout)
 }
 
 func retryDBAccessNoValue(ctx context.Context, op, sha256 string, fn func(context.Context) error) error {
@@ -800,13 +912,6 @@ func logResultStoreError(msg string, reqCtx, storeCtx context.Context, sha256 st
 		attrs = append(attrs, "store_context", storeErr)
 	}
 	slog.Error(msg, attrs...)
-}
-
-func resultStoreHTTPError(err error) string {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return `{"error":"store cleave result failed: database write context was canceled or timed out"}`
-	}
-	return `{"error":"store cleave result failed"}`
 }
 
 // validSHA256 checks that s is exactly 64 lowercase hex characters.

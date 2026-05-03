@@ -1312,7 +1312,7 @@ func (db *DB) insertReportPG(ctx context.Context, r *Report) error {
 func (db *DB) reportsBySHA256PG(ctx context.Context, sha256 string) ([]*Report, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT id, sha256, report_type, content, provider, duration_ms, created_at
-		FROM reports WHERE sha256 = $1 ORDER BY created_at DESC`, sha256)
+		FROM reports WHERE sha256 = $1 ORDER BY created_at DESC, id DESC`, sha256)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: reports for %s: %w", sha256, err)
 	}
@@ -1330,10 +1330,13 @@ func (db *DB) reportsBySHA256PG(ctx context.Context, sha256 string) ([]*Report, 
 
 func (db *DB) latestReportPG(ctx context.Context, sha256, reportType string) (*Report, error) {
 	r := &Report{}
+	// id DESC tiebreaks when two rows share a created_at — strftime('%f') and
+	// now() are millisecond-resolution, and rapid InsertReport calls collide
+	// on the same value. Without id DESC, "latest" is non-deterministic.
 	err := db.pool.QueryRow(ctx, `
 		SELECT id, sha256, report_type, content, provider, duration_ms, created_at
 		FROM reports WHERE sha256 = $1 AND report_type = $2
-		ORDER BY created_at DESC LIMIT 1`, sha256, reportType).Scan(
+		ORDER BY created_at DESC, id DESC LIMIT 1`, sha256, reportType).Scan(
 		&r.ID, &r.SHA256, &r.Type, &r.Content, &r.Provider, &r.DurationMS, &r.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound

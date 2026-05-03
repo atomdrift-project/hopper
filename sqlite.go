@@ -1221,7 +1221,7 @@ func (db *DB) insertReportSQLite(ctx context.Context, r *Report) error {
 func (db *DB) reportsBySHA256SQLite(ctx context.Context, sha256 string) ([]*Report, error) {
 	rows, err := db.lite.QueryContext(ctx, `
 		SELECT id, sha256, report_type, content, provider, duration_ms, created_at
-		FROM reports WHERE sha256 = ? ORDER BY created_at DESC`, sha256)
+		FROM reports WHERE sha256 = ? ORDER BY created_at DESC, id DESC`, sha256)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: reports for %s: %w", sha256, err)
 	}
@@ -1239,10 +1239,13 @@ func (db *DB) reportsBySHA256SQLite(ctx context.Context, sha256 string) ([]*Repo
 
 func (db *DB) latestReportSQLite(ctx context.Context, sha256, reportType string) (*Report, error) {
 	r := &Report{}
+	// id DESC tiebreaks when two rows share a created_at — strftime('%f') is
+	// millisecond-resolution, and rapid InsertReport calls collide on the
+	// same value. Without id DESC, "latest" is non-deterministic.
 	err := db.lite.QueryRowContext(ctx, `
 		SELECT id, sha256, report_type, content, provider, duration_ms, created_at
 		FROM reports WHERE sha256 = ? AND report_type = ?
-		ORDER BY created_at DESC LIMIT 1`, sha256, reportType).Scan(
+		ORDER BY created_at DESC, id DESC LIMIT 1`, sha256, reportType).Scan(
 		&r.ID, &r.SHA256, &r.Type, &r.Content, &r.Provider, &r.DurationMS, &r.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound

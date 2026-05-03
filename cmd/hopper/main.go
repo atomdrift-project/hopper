@@ -1159,6 +1159,12 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	api.traitsVersion = traitsVersion
 	api.rescanAge = *rescanAge
 
+	// Background pool that handles archive expansion off the /api/result hot
+	// path. Drains gracefully on return so a worker's ExplodeArchiveMembers
+	// call isn't lost mid-flight if the process is shutting down.
+	api.startExplosions(ctx)
+	defer api.drainExplosions()
+
 	slog.Info("load prep complete",
 		"elapsed", time.Since(prepStart),
 		"dirs", len(loadDirs),
