@@ -188,6 +188,53 @@ type SampleLocation struct {
 	ID           int64
 }
 
+// WorkflowSnapshot is the compact operational view used by Hopper dashboards.
+type WorkflowSnapshot struct {
+	Health        WorkflowHealth
+	Backlogs      []WorkflowBacklog
+	LatestAdded   []WorkflowSample
+	LatestReady   []WorkflowSample
+	OldestPending []WorkflowSample
+}
+
+// WorkflowHealth summarizes freshness and queue state across the ingest →
+// analysis → Prism-ready pipeline.
+type WorkflowHealth struct {
+	LatestAdded    time.Time
+	LatestUpdated  time.Time
+	LatestAnalyzed time.Time
+	LatestReady    time.Time
+	PendingCleave  int64
+	PendingLitmus  int64
+}
+
+// WorkflowBacklog groups pending work by source/feed/ecosystem.
+type WorkflowBacklog struct {
+	Source        string
+	Feed          string
+	Ecosystem     string
+	OldestPending time.Time
+	NewestPending time.Time
+	PendingCleave int64
+	PendingLitmus int64
+}
+
+// WorkflowSample is a light sample row for dashboard recency tables.
+type WorkflowSample struct {
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	AnalyzedAt  *time.Time
+	SHA256      string
+	Source      string
+	Feed        string
+	Ecosystem   string
+	Filename    string
+	Path        string
+	HasCleave   bool
+	HasLitmus   bool
+	Criticality int
+}
+
 // Report is an analysis report produced by cyclotron.
 type Report struct {
 	CreatedAt  time.Time
@@ -1190,6 +1237,18 @@ func (db *DB) CountRescanPending(ctx context.Context, currentTraits string, resc
 			currentTraits, cutoff.Format(time.RFC3339Nano)).Scan(&n)
 	}
 	return n, err
+}
+
+// WorkflowSnapshot returns a compact dashboard-oriented view of freshness,
+// queue shape, and recent samples.
+func (db *DB) WorkflowSnapshot(ctx context.Context, limit int) (WorkflowSnapshot, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	if db.pool != nil {
+		return db.workflowSnapshotPG(ctx, limit)
+	}
+	return db.workflowSnapshotSQLite(ctx, limit)
 }
 
 // RelativizePaths rewrites sample paths that start with dataRoot so only

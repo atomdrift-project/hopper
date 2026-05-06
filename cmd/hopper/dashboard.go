@@ -31,6 +31,7 @@ type webDashboard struct {
 	progress      *loadProgress
 	tracker       *workerTracker
 	rescanCache   *fido.Cache[string, int64]
+	workflowCache *fido.Cache[string, hopper.WorkflowSnapshot]
 	newestATCache *fido.Cache[string, time.Time]
 	litmus        *litmusServer
 	traitsVersion string
@@ -148,6 +149,7 @@ func (wd *webDashboard) configure( //nolint:revive // argument-limit: dashboard 
 	wd.rescanAge = rescanAge
 	wd.newestATCache = fido.New[string, time.Time](fido.Size(1), fido.TTL(10*time.Second))
 	wd.rescanCache = fido.New[string, int64](fido.Size(1), fido.TTL(10*time.Second))
+	wd.workflowCache = fido.New[string, hopper.WorkflowSnapshot](fido.Size(1), fido.TTL(10*time.Second))
 }
 
 const maxThroughputSamples = 2880 // 4 hours at 5-second refresh
@@ -326,6 +328,16 @@ body{font-family:var(--sans);background:var(--bg);color:var(--text);
 .queue-meta{font-family:var(--mono);font-size:.76rem;color:var(--sub);margin-top:.35rem}
 .queue-meta em{font-style:normal;color:var(--text)}
 .queue-note{color:var(--amber)}
+.health-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.75rem}
+.metric-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:.75rem .85rem}
+.metric-label{font-size:.62rem;font-weight:700;letter-spacing:.11em;text-transform:uppercase;color:var(--sub);margin-bottom:.3rem}
+.metric-value{font-family:var(--mono);font-size:.95rem;color:var(--text);font-weight:600}
+.metric-sub{font-family:var(--mono);font-size:.72rem;color:var(--sub);margin-top:.25rem}
+.pill{display:inline-block;border:1px solid var(--border);border-radius:4px;padding:.05rem .35rem;font-size:.7rem;font-family:var(--mono)}
+.pill.hostile{color:#fca5a5;border-color:#3d1515;background:#1a0d0d}
+.pill.suspicious{color:#fde68a;border-color:#3b2a0a;background:#171202}
+.pill.benign{color:#86efac;border-color:#12331f;background:#06150c}
+.pill.pending{color:var(--sub)}
 
 /* section */
 section{margin-bottom:2rem}
@@ -373,7 +385,7 @@ td.warn{color:var(--amber)}
 /* footer */
 footer{padding-top:1rem;border-top:1px solid var(--border);
   font-family:var(--mono);font-size:.75rem;color:var(--sub)}
-@media (max-width:900px){body{padding:1.25rem;max-width:none}.queue-grid{grid-template-columns:1fr}}
+@media (max-width:900px){body{padding:1.25rem;max-width:none}.queue-grid,.health-grid{grid-template-columns:1fr}}
 `
 
 // renderStartup writes the bootstrap HTML page shown before the load session is
@@ -498,6 +510,24 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		})
 	}
 
+	var workflow hopper.WorkflowSnapshot
+	var hasWorkflow bool
+	if db != nil && wd.workflowCache != nil {
+		//nolint:contextcheck,errcheck // closure creates its own context; closure logs errors before returning
+		if snap, err := wd.workflowCache.Fetch("workflow", func() (hopper.WorkflowSnapshot, error) {
+			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
+			defer cancel()
+			snap, err := db.WorkflowSnapshot(qctx, 5)
+			if err != nil {
+				slog.Warn("dashboard: WorkflowSnapshot failed", "error", err)
+			}
+			return snap, err
+		}); err == nil {
+			workflow = snap
+			hasWorkflow = true
+		}
+	}
+
 	elapsed := time.Since(start).Round(time.Second)
 	analyzedAbs := progress.analyzed.Load()
 	sessionAnalyzed := max(analyzedAbs-startAnalyzed, 0)
@@ -614,6 +644,14 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	buf.WriteString(`</div>`)
 	buf.WriteString(`</div>`) // .hdr
 
+	if hasWorkflow {
+		writeWorkflowHealth(&buf, workflow)
+		writeWorkflowBacklogs(&buf, workflow.Backlogs)
+		writeWorkflowSamples(&buf, "Recent Samples", "Newest rows seen by Hopper", workflow.LatestAdded, "created")
+		writeWorkflowSamples(&buf, "Prism Ready", "Newest top-level rows with cleave and litmus results", workflow.LatestReady, "created")
+		writeWorkflowSamples(&buf, "Oldest Pending Cleave", "Claimable top-level rows still missing cleave results", workflow.OldestPending, "updated")
+	}
+
 	// Throughput graph
 	combinedSeries, perNodeSeries := wd.throughputSeries()
 	if len(combinedSeries) >= 2 {
@@ -719,6 +757,152 @@ func writeQueueCard(buf *strings.Builder, label, value, meta string) {
 	fmt.Fprintf(buf,
 		`<div class="queue-card"><div class="queue-label">%s</div><div class="queue-value">%s</div><div class="queue-meta">%s</div></div>`,
 		htmlEscape(label), htmlEscape(value), meta)
+}
+
+func writeWorkflowHealth(buf *strings.Builder, snap hopper.WorkflowSnapshot) {
+	h := snap.Health
+	buf.WriteString(`<section><div class="label">Workflow Health</div><div class="health-grid">`)
+	writeMetricCard(buf, "Latest added", ageValue(h.LatestAdded), timeTitle(h.LatestAdded))
+	writeMetricCard(buf, "Latest analyzed", ageValue(h.LatestAnalyzed), timeTitle(h.LatestAnalyzed))
+	writeMetricCard(buf, "Prism ready", ageValue(h.LatestReady), readyLag(h.LatestAdded, h.LatestReady))
+	writeMetricCard(buf, "Workflow queues",
+		fmt.Sprintf("%s / %s", fmtN(h.PendingCleave), fmtN(h.PendingLitmus)),
+		"cleave pending / litmus pending")
+	buf.WriteString(`</div></section>`)
+}
+
+func writeMetricCard(buf *strings.Builder, label, value, sub string) {
+	fmt.Fprintf(buf,
+		`<div class="metric-card"><div class="metric-label">%s</div><div class="metric-value">%s</div><div class="metric-sub">%s</div></div>`,
+		htmlEscape(label), htmlEscape(value), htmlEscape(sub))
+}
+
+func writeWorkflowBacklogs(buf *strings.Builder, rows []hopper.WorkflowBacklog) {
+	if len(rows) == 0 {
+		return
+	}
+	buf.WriteString(`<section><div class="label">Top Backlogs</div>`)
+	buf.WriteString(`<table><thead><tr><th>Source</th><th>Feed</th><th>Ecosystem</th><th>Cleave</th><th>Litmus</th><th>Oldest</th><th>Newest</th></tr></thead><tbody>`)
+	for _, r := range rows {
+		fmt.Fprintf(buf,
+			`<tr><td>%s</td><td>%s</td><td class="hi">%s</td><td class="hi">%s</td><td>%s</td><td>%s</td><td>%s</td></tr>`,
+			htmlEscape(dashIfEmpty(r.Source)),
+			htmlEscape(dashIfEmpty(r.Feed)),
+			htmlEscape(dashIfEmpty(r.Ecosystem)),
+			fmtN(r.PendingCleave),
+			fmtN(r.PendingLitmus),
+			htmlEscape(ageValue(r.OldestPending)),
+			htmlEscape(ageValue(r.NewestPending)))
+	}
+	buf.WriteString(`</tbody></table></section>`)
+}
+
+func writeWorkflowSamples(buf *strings.Builder, label, note string, samples []hopper.WorkflowSample, timeKind string) {
+	if len(samples) == 0 {
+		return
+	}
+	fmt.Fprintf(buf, `<section><div class="label">%s</div><div class="metric-sub">%s</div>`,
+		htmlEscape(label), htmlEscape(note))
+	buf.WriteString(`<table><thead><tr><th>When</th><th>State</th><th>Sample</th><th>Source</th><th>Ecosystem</th><th>SHA</th></tr></thead><tbody>`)
+	for _, s := range samples {
+		t := s.CreatedAt
+		if timeKind == "updated" {
+			t = s.UpdatedAt
+		}
+		name := firstNonEmpty(s.Filename, filepath.Base(s.Path), s.SHA256)
+		fmt.Fprintf(buf,
+			`<tr><td title="%s">%s</td><td>%s</td><td class="hi">%s</td><td>%s</td><td>%s</td><td>%s</td></tr>`,
+			htmlEscape(t.Format(time.RFC3339)),
+			htmlEscape(ageValue(t)),
+			workflowStateHTML(s),
+			htmlEscape(name),
+			htmlEscape(dashIfEmpty(sourceFeed(s.Source, s.Feed))),
+			htmlEscape(dashIfEmpty(s.Ecosystem)),
+			htmlEscape(shortSHA(s.SHA256)))
+	}
+	buf.WriteString(`</tbody></table></section>`)
+}
+
+func workflowStateHTML(s hopper.WorkflowSample) string {
+	if !s.HasCleave {
+		return `<span class="pill pending">no cleave</span>`
+	}
+	if !s.HasLitmus {
+		return `<span class="pill pending">no litmus</span>`
+	}
+	label, class := criticalityLabel(s.Criticality)
+	return fmt.Sprintf(`<span class="pill %s">%s</span>`, class, htmlEscape(label))
+}
+
+func criticalityLabel(class int) (label, cssClass string) {
+	switch class {
+	case 2:
+		return "hostile", "hostile"
+	case 1:
+		return "suspicious", "suspicious"
+	case 0:
+		return "benign", "benign"
+	default:
+		return "class " + strconv.Itoa(class), "pending"
+	}
+}
+
+func ageValue(t time.Time) string {
+	if t.IsZero() {
+		return "—"
+	}
+	d := time.Since(t)
+	if d < 0 {
+		d = 0
+	}
+	return shortDuration(d) + " ago"
+}
+
+func timeTitle(t time.Time) string {
+	if t.IsZero() {
+		return "no data"
+	}
+	return t.Format("2006-01-02 15:04:05 MST")
+}
+
+func readyLag(added, ready time.Time) string {
+	if added.IsZero() || ready.IsZero() {
+		return "no data"
+	}
+	if !added.After(ready) {
+		return "caught up"
+	}
+	return "ready lag " + shortDuration(added.Sub(ready))
+}
+
+func sourceFeed(source, feed string) string {
+	if feed == "" {
+		return source
+	}
+	return source + "/" + feed
+}
+
+func dashIfEmpty(s string) string {
+	if s == "" {
+		return "—"
+	}
+	return s
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" && v != "." {
+			return v
+		}
+	}
+	return ""
+}
+
+func shortSHA(sha string) string {
+	if len(sha) <= 12 {
+		return sha
+	}
+	return sha[:12]
 }
 
 func writeRecentErrors(buf *strings.Builder, progress *loadProgress) {

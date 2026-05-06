@@ -3,6 +3,7 @@ package hopper
 import (
 	"context"
 	cryptosha256 "crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -558,6 +559,123 @@ func scanPGSamplesLight(rows pgx.Rows) ([]*Sample, error) {
 		out = append(out, s)
 	}
 	return out, rows.Err()
+}
+
+func (db *DB) workflowSnapshotPG(ctx context.Context, limit int) (WorkflowSnapshot, error) {
+	var snap WorkflowSnapshot
+	health, err := db.workflowHealthPG(ctx)
+	if err != nil {
+		return snap, err
+	}
+	snap.Health = health
+	if snap.Backlogs, err = db.workflowBacklogsPG(ctx, limit); err != nil {
+		return snap, err
+	}
+	if snap.LatestAdded, err = db.workflowSamplesPG(ctx,
+		`WHERE parent = '' ORDER BY created_at DESC LIMIT $1`, limit); err != nil {
+		return snap, err
+	}
+	if snap.LatestReady, err = db.workflowSamplesPG(ctx,
+		`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL ORDER BY created_at DESC LIMIT $1`, limit); err != nil {
+		return snap, err
+	}
+	if snap.OldestPending, err = db.workflowSamplesPG(ctx,
+		`WHERE parent = '' AND cleave_result IS NULL AND skip = '' ORDER BY updated_at ASC NULLS FIRST, id LIMIT $1`, limit); err != nil {
+		return snap, err
+	}
+	return snap, nil
+}
+
+func (db *DB) workflowHealthPG(ctx context.Context) (WorkflowHealth, error) {
+	var h WorkflowHealth
+	var latestAdded, latestUpdated, latestAnalyzed, latestReady sql.NullTime
+	err := db.pool.QueryRow(ctx, `
+		SELECT
+			(SELECT max(created_at) FROM samples WHERE parent = ''),
+			(SELECT max(updated_at) FROM samples WHERE parent = ''),
+			(SELECT max(analyzed_at) FROM samples WHERE parent = '' AND analyzed_at IS NOT NULL),
+			(SELECT max(created_at) FROM samples WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL),
+			(SELECT count(*) FROM samples WHERE parent = '' AND skip = '' AND cleave_result IS NULL),
+			(SELECT count(*) FROM samples WHERE parent = '' AND skip = '' AND cleave_result IS NOT NULL AND litmus_result IS NULL)`,
+	).Scan(&latestAdded, &latestUpdated, &latestAnalyzed, &latestReady, &h.PendingCleave, &h.PendingLitmus)
+	if err != nil {
+		return h, fmt.Errorf("hopper: workflow health: %w", err)
+	}
+	h.LatestAdded = nullTime(latestAdded)
+	h.LatestUpdated = nullTime(latestUpdated)
+	h.LatestAnalyzed = nullTime(latestAnalyzed)
+	h.LatestReady = nullTime(latestReady)
+	return h, nil
+}
+
+func (db *DB) workflowBacklogsPG(ctx context.Context, limit int) ([]WorkflowBacklog, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT source, feed, ecosystem,
+			min(updated_at), max(updated_at),
+			count(*) FILTER (WHERE cleave_result IS NULL),
+			count(*) FILTER (WHERE cleave_result IS NOT NULL AND litmus_result IS NULL)
+		FROM samples
+		WHERE parent = '' AND skip = ''
+		  AND (cleave_result IS NULL OR (cleave_result IS NOT NULL AND litmus_result IS NULL))
+		GROUP BY source, feed, ecosystem
+		ORDER BY (count(*) FILTER (WHERE cleave_result IS NULL)
+			+ count(*) FILTER (WHERE cleave_result IS NOT NULL AND litmus_result IS NULL)) DESC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: workflow backlogs: %w", err)
+	}
+	defer rows.Close()
+	out := make([]WorkflowBacklog, 0, limit)
+	for rows.Next() {
+		var b WorkflowBacklog
+		var oldest, newest sql.NullTime
+		if err := rows.Scan(&b.Source, &b.Feed, &b.Ecosystem, &oldest, &newest, &b.PendingCleave, &b.PendingLitmus); err != nil {
+			return nil, fmt.Errorf("hopper: scan workflow backlog: %w", err)
+		}
+		b.OldestPending = nullTime(oldest)
+		b.NewestPending = nullTime(newest)
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) workflowSamplesPG(ctx context.Context, where string, limit int) ([]WorkflowSample, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT sha256, source, feed, ecosystem, filename, path,
+			created_at, updated_at, analyzed_at,
+			cleave_result IS NOT NULL,
+			litmus_result IS NOT NULL,
+			COALESCE((litmus_result->>'class')::int, 0)
+		FROM samples `+where, limit) //nolint:gosec // where is a fixed fragment selected by workflowSnapshotPG.
+	if err != nil {
+		return nil, fmt.Errorf("hopper: workflow samples: %w", err)
+	}
+	defer rows.Close()
+	return scanWorkflowSamplesPG(rows, limit)
+}
+
+func scanWorkflowSamplesPG(rows pgx.Rows, limit int) ([]WorkflowSample, error) {
+	out := make([]WorkflowSample, 0, limit)
+	for rows.Next() {
+		var s WorkflowSample
+		var analyzed sql.NullTime
+		if err := rows.Scan(&s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename, &s.Path,
+			&s.CreatedAt, &s.UpdatedAt, &analyzed, &s.HasCleave, &s.HasLitmus, &s.Criticality); err != nil {
+			return nil, fmt.Errorf("hopper: scan workflow sample: %w", err)
+		}
+		if analyzed.Valid {
+			s.AnalyzedAt = &analyzed.Time
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+func nullTime(t sql.NullTime) time.Time {
+	if t.Valid {
+		return t.Time
+	}
+	return time.Time{}
 }
 
 func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
