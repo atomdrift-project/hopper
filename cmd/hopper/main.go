@@ -1242,8 +1242,48 @@ type loadProgress struct { //nolint:govet // fields grouped by pipeline stage, n
 	scoreSum           atomic.Int64
 
 	// Errors.
-	errors  atomic.Int64
-	lastErr atomic.Value // string
+	errors atomic.Int64
+	errMu  sync.Mutex
+	errs   []progressError
+}
+
+type progressError struct {
+	At      time.Time
+	Stage   string
+	Message string
+}
+
+const maxProgressErrors = 5
+
+func (p *loadProgress) recordError(n int64, stage, format string, args ...any) {
+	if p == nil {
+		return
+	}
+	if n > 0 {
+		p.errors.Add(n)
+	}
+	msg := fmt.Sprintf(format, args...)
+	p.errMu.Lock()
+	defer p.errMu.Unlock()
+	p.errs = append(p.errs, progressError{
+		At:      time.Now(),
+		Stage:   stage,
+		Message: msg,
+	})
+	if len(p.errs) > maxProgressErrors {
+		p.errs = p.errs[len(p.errs)-maxProgressErrors:]
+	}
+}
+
+func (p *loadProgress) recentErrors() []progressError {
+	if p == nil {
+		return nil
+	}
+	p.errMu.Lock()
+	defer p.errMu.Unlock()
+	out := make([]progressError, len(p.errs))
+	copy(out, p.errs)
+	return out
 }
 
 const (
@@ -1434,8 +1474,7 @@ func runDirPipeline(
 		n, needsAnalysis, err := db.InsertSampleBatch(ctx, batch)
 		if err != nil {
 			if ctx.Err() == nil {
-				progress.errors.Add(int64(len(batch)))
-				progress.lastErr.Store(fmt.Sprintf("insert: %v", err))
+				progress.recordError(int64(len(batch)), "insert", "insert: %v", err)
 				slog.Error("batch insert failed", "error", err, "batch_size", len(batch), "dir", target.dir)
 			}
 			batch = batch[:0]
@@ -1479,9 +1518,8 @@ func runDirPipeline(
 			case errors.Is(err, errTooLarge):
 				progress.tooLarge.Add(1)
 			default:
-				progress.errors.Add(1)
 				progress.hashErrors.Add(1)
-				progress.lastErr.Store(fmt.Sprintf("hash: %s: %v", filepath.Base(lp.path), err))
+				progress.recordError(1, "hash", "hash: %s: %v", filepath.Base(lp.path), err)
 				slog.Warn("hash failed", "path", lp.path, "error", err)
 			}
 			continue
@@ -1662,13 +1700,20 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 			if elapsed := time.Since(start).Seconds(); elapsed > 5 && sessionAnalyzed > 0 {
 				attrs = append(attrs, "rate_overall", fmt.Sprintf("%.1f/s", float64(sessionAnalyzed)/elapsed))
 			}
-			totalRemaining := pending + rescanPending
 			if rescanPending > 0 {
 				attrs = append(attrs, "rescan_pending", rescanPending)
 			}
-			if rate15m > 0.1 && totalRemaining > 0 {
-				etaDur := time.Duration(float64(totalRemaining)/rate15m) * time.Second
-				attrs = append(attrs, "eta", formatETA(etaDur))
+			if rate15m > 0.1 && pending > 0 {
+				etaDur := time.Duration(float64(pending)/rate15m) * time.Second
+				attrs = append(attrs, "pending_eta", formatETA(etaDur))
+			}
+			if rate15m > 0.1 && rescanPending > 0 {
+				rescanRemaining := rescanPending
+				if pending > 0 {
+					rescanRemaining += pending
+				}
+				etaDur := time.Duration(float64(rescanRemaining)/rate15m) * time.Second
+				attrs = append(attrs, "rescan_eta", formatETA(etaDur))
 			}
 			slog.Info("load progress", attrs...)
 			logWorkerStatus(workers, nodeRates, oldestClaims)
@@ -1676,12 +1721,17 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 		}
 
 		// TTY dashboard
-		totalRemaining := pending + rescanPending
-
-		var etaStr string
-		if rate15m > 0.1 && totalRemaining > 0 {
-			etaDur := time.Duration(float64(totalRemaining)/rate15m) * time.Second
-			etaStr = formatETA(etaDur)
+		var pendingETA string
+		if rate15m > 0.1 && pending > 0 {
+			pendingETA = formatETA(time.Duration(float64(pending)/rate15m) * time.Second)
+		}
+		var rescanETA string
+		if rate15m > 0.1 && rescanPending > 0 {
+			rescanRemaining := rescanPending
+			if pending > 0 {
+				rescanRemaining += pending
+			}
+			rescanETA = formatETA(time.Duration(float64(rescanRemaining)/rate15m) * time.Second)
 		}
 
 		pct := 0.0
@@ -1704,25 +1754,29 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 		if rate15m > 0.1 {
 			analysisLine += fmt.Sprintf("  %.1f/s", rate15m)
 		}
-		if etaStr != "" {
-			analysisLine += "  ETA " + etaStr
+		if pendingETA != "" {
+			analysisLine += "  pending ETA " + pendingETA
 		}
 		writeStdoutf("%s\n", analysisLine)
 
 		// Line 2: remaining work breakdown
-		if totalRemaining > 0 || !progress.walkDone.Load() {
+		if pending > 0 || rescanPending > 0 || !progress.walkDone.Load() {
 			remainLine := "  "
 			if pending > 0 {
-				remainLine += fmt.Sprintf("%s pending", fmtN(pending))
+				remainLine += fmt.Sprintf("initial: %s pending", fmtN(pending))
 			}
 			if rescanPending > 0 {
 				if pending > 0 {
-					remainLine += " + "
+					remainLine += "  ·  "
 				}
 				remainLine += fmt.Sprintf("%s rescan", fmtN(rescanPending))
-			}
-			if pending > 0 || rescanPending > 0 {
-				remainLine += fmt.Sprintf(" = %s remaining", fmtN(totalRemaining))
+				if rescanETA != "" {
+					if pending > 0 {
+						remainLine += fmt.Sprintf(" (finish after initial %s)", rescanETA)
+					} else {
+						remainLine += fmt.Sprintf(" (ETA %s)", rescanETA)
+					}
+				}
 			}
 			if insertRate15m > 0.1 {
 				remainLine += fmt.Sprintf("  %.1f/s new", insertRate15m)
@@ -1805,9 +1859,13 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 		}
 		writeStdoutf("%s\n", lastCompleted)
 
-		// Last error at the bottom, untruncated
-		if last, ok := progress.lastErr.Load().(string); ok && last != "" {
-			writeStdoutf("\n  \033[31m%s\033[0m\n", last)
+		if recent := progress.recentErrors(); len(recent) > 0 {
+			writeStdout("\n  \033[2mrecent errors\033[0m\n")
+			for i := len(recent) - 1; i >= 0; i-- {
+				e := recent[i]
+				writeStdoutf("  \033[31m%s %-7s\033[0m %s\n",
+					e.At.Format("15:04:05"), e.Stage, e.Message)
+			}
 		}
 	}
 }

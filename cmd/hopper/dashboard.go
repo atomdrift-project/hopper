@@ -300,7 +300,7 @@ const css = `
   --green:#34d399;--amber:#fbbf24;--red:#f87171;--blue:#818cf8;
 }
 body{font-family:var(--sans);background:var(--bg);color:var(--text);
-  font-size:13px;line-height:1.6;padding:2.5rem 3rem;max-width:900px}
+  font-size:13px;line-height:1.6;padding:2.5rem 3rem;max-width:1180px}
 
 /* header */
 .hdr{padding-bottom:1.5rem;margin-bottom:2rem;border-bottom:1px solid var(--border)}
@@ -319,6 +319,13 @@ body{font-family:var(--sans);background:var(--bg);color:var(--text);
 .progress-detail em{font-style:normal;color:var(--text)}
 .track{height:4px;background:var(--border);border-radius:2px;overflow:hidden;display:flex}
 .fill{height:100%;border-radius:2px;transition:width .5s ease;flex-shrink:0}
+.queue-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem;margin-top:1rem}
+.queue-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:.8rem .9rem}
+.queue-label{font-size:.62rem;font-weight:700;letter-spacing:.11em;text-transform:uppercase;color:var(--sub);margin-bottom:.35rem}
+.queue-value{font-family:var(--mono);font-size:1.05rem;color:var(--text);font-weight:600;line-height:1.25}
+.queue-meta{font-family:var(--mono);font-size:.76rem;color:var(--sub);margin-top:.35rem}
+.queue-meta em{font-style:normal;color:var(--text)}
+.queue-note{color:var(--amber)}
 
 /* section */
 section{margin-bottom:2rem}
@@ -351,6 +358,9 @@ td.warn{color:var(--amber)}
   padding:.5rem .75rem;font-size:.78rem;color:#f87171;margin-top:1.5rem;
   word-break:break-all;font-family:var(--mono)}
 .err-inline{color:var(--red);font-family:var(--mono)}
+.err-stage{color:var(--red)}
+.err-time{white-space:nowrap;color:var(--sub)}
+.err-msg{word-break:break-word;color:#fca5a5}
 
 /* graph */
 .graph-box{background:var(--surface);border:1px solid var(--border);
@@ -363,6 +373,7 @@ td.warn{color:var(--amber)}
 /* footer */
 footer{padding-top:1rem;border-top:1px solid var(--border);
   font-family:var(--mono);font-size:.75rem;color:var(--sub)}
+@media (max-width:900px){body{padding:1.25rem;max-width:none}.queue-grid{grid-template-columns:1fr}}
 `
 
 // renderStartup writes the bootstrap HTML page shown before the load session is
@@ -506,12 +517,17 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	wd.recordSample(sessionAnalyzed)
 	rate, nodeRateByName := wd.ratesOver(15 * time.Minute)
 
-	totalRemaining := pending + rescanPending
-
-	var etaStr string
-	if rate > 0.1 && totalRemaining > 0 {
-		etaDur := time.Duration(float64(totalRemaining)/rate) * time.Second
-		etaStr = formatETA(etaDur)
+	var initialETA string
+	if rate > 0.1 && pending > 0 {
+		initialETA = formatETA(time.Duration(float64(pending)/rate) * time.Second)
+	}
+	var rescanETA string
+	if rate > 0.1 && rescanPending > 0 {
+		rescanRemaining := rescanPending
+		if pending > 0 {
+			rescanRemaining += pending
+		}
+		rescanETA = formatETA(time.Duration(float64(rescanRemaining)/rate) * time.Second)
 	}
 
 	pct := 0.0
@@ -531,28 +547,22 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	fmt.Fprintf(&buf, `<span class="hdr-time">%s</span>`, elapsed)
 	buf.WriteString(`</div>`)
 
-	// Big progress — total DB numbers for the full picture.
+	// Initial-analysis progress — kept separate from rescan work, which is a
+	// lower-priority queue in claimJobs.
 	buf.WriteString(`<div class="progress">`)
 	buf.WriteString(`<div class="progress-stats">`)
-	fmt.Fprintf(&buf, `<span class="progress-main"><span class="progress-pct">%.0f%%</span> analyzed</span>`, pct)
+	fmt.Fprintf(&buf, `<span class="progress-main"><span class="progress-pct">%.0f%%</span> initial analysis</span>`, pct)
 
-	// Rate + ETA + remaining breakdown
 	buf.WriteString(`<span class="progress-detail">`)
 	fmt.Fprintf(&buf, `<em>%s</em> / %s analyzed`, fmtN(analyzedAbs), fmtN(totalExpected))
 	if pending > 0 {
-		fmt.Fprintf(&buf, ` &middot; <em>%s</em> pending`, fmtN(pending))
-	}
-	if rescanPending > 0 {
-		fmt.Fprintf(&buf, ` &middot; <em>%s</em> rescan`, fmtN(rescanPending))
-	}
-	if pending > 0 && rescanPending > 0 {
-		fmt.Fprintf(&buf, ` &middot; <em>%s</em> remaining`, fmtN(totalRemaining))
+		fmt.Fprintf(&buf, ` &middot; <em>%s</em> pending initial`, fmtN(pending))
 	}
 	if rate > 0.1 {
 		fmt.Fprintf(&buf, ` &middot; <em>%.1f</em>/s (15m avg)`, rate)
 	}
-	if etaStr != "" {
-		fmt.Fprintf(&buf, ` &middot; ETA <em>%s</em>`, etaStr)
+	if initialETA != "" {
+		fmt.Fprintf(&buf, ` &middot; initial ETA <em>%s</em>`, initialETA)
 	}
 	buf.WriteString(`</span>`)
 	buf.WriteString(`</div>`)
@@ -564,6 +574,44 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 			`</div>`,
 		pct)
 	buf.WriteString(`</div>`) // .progress
+
+	buf.WriteString(`<div class="queue-grid">`)
+	writeQueueCard(&buf, "Initial queue", fmt.Sprintf("%s pending", fmtN(pending)), func() string {
+		var parts []string
+		parts = append(parts, fmt.Sprintf("<em>%s</em> total", fmtN(totalExpected)))
+		if rate > 0.1 {
+			parts = append(parts, fmt.Sprintf("<em>%.1f</em>/s", rate))
+		}
+		if initialETA != "" {
+			parts = append(parts, "ETA <em>"+initialETA+"</em>")
+		}
+		return strings.Join(parts, " &middot; ")
+	}())
+	rescanMeta := "stale traits disabled"
+	if wd.traitsVersion != "" {
+		var parts []string
+		if pending > 0 && rescanPending > 0 {
+			parts = append(parts, `<span class="queue-note">waits behind initial</span>`)
+		}
+		if rescanETA != "" {
+			label := "ETA"
+			if pending > 0 {
+				label = "finish after initial"
+			}
+			parts = append(parts, label+" <em>"+rescanETA+"</em>")
+		}
+		if len(parts) == 0 {
+			parts = append(parts, "ready when initial queue is empty")
+		}
+		rescanMeta = strings.Join(parts, " &middot; ")
+	}
+	writeQueueCard(&buf, "Rescan queue", fmt.Sprintf("%s pending", fmtN(rescanPending)), rescanMeta)
+	ingestMeta := fmt.Sprintf("<em>%s</em> known &middot; <em>%s</em> inserted", fmtN(progress.cacheHits.Load()), fmtN(inserted))
+	if !progress.walkDone.Load() || inPipeline > 0 {
+		ingestMeta += ` &middot; <span class="queue-note">walking</span>`
+	}
+	writeQueueCard(&buf, "Walk / ingest", fmt.Sprintf("%s walked", fmtN(walked)), ingestMeta)
+	buf.WriteString(`</div>`)
 	buf.WriteString(`</div>`) // .hdr
 
 	// Throughput graph
@@ -659,6 +707,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		buf.WriteString(`</tbody></table></section>`)
 	}
 
+	writeRecentErrors(&buf, progress)
 	writeFooter(&buf, progress, walked, inserted, skipped, newestAnalyzedAt)
 
 	buf.WriteString(`</body></html>`)
@@ -666,7 +715,31 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	_, _ = fmt.Fprint(w, buf.String()) //nolint:errcheck // best-effort HTTP response
 }
 
-// writeFooter renders the pipeline summary footer and last-error line.
+func writeQueueCard(buf *strings.Builder, label, value, meta string) {
+	fmt.Fprintf(buf,
+		`<div class="queue-card"><div class="queue-label">%s</div><div class="queue-value">%s</div><div class="queue-meta">%s</div></div>`,
+		htmlEscape(label), htmlEscape(value), meta)
+}
+
+func writeRecentErrors(buf *strings.Builder, progress *loadProgress) {
+	errs := progress.recentErrors()
+	if len(errs) == 0 {
+		return
+	}
+	buf.WriteString(`<section><div class="label">Recent Errors</div>`)
+	buf.WriteString(`<table><thead><tr><th>Time</th><th>Stage</th><th>Error</th></tr></thead><tbody>`)
+	for i := len(errs) - 1; i >= 0; i-- {
+		e := errs[i]
+		fmt.Fprintf(buf,
+			`<tr><td class="err-time">%s</td><td class="err-stage">%s</td><td class="err-msg">%s</td></tr>`,
+			htmlEscape(e.At.Format("15:04:05")),
+			htmlEscape(e.Stage),
+			htmlEscape(e.Message))
+	}
+	buf.WriteString(`</tbody></table></section>`)
+}
+
+// writeFooter renders the pipeline summary footer.
 func writeFooter(buf *strings.Builder, progress *loadProgress, walked, inserted, skipped int64, newestAnalyzedAt time.Time) {
 	cacheHits := progress.cacheHits.Load()
 	tooSmall := progress.tooSmall.Load()
@@ -696,11 +769,6 @@ func writeFooter(buf *strings.Builder, progress *loadProgress, walked, inserted,
 	footer := strings.Join(footerParts, " &middot; ")
 	footer += lastCompleted
 	fmt.Fprintf(buf, `<footer>%s</footer>`, footer)
-
-	// Last error at the bottom, untruncated.
-	if last, ok := progress.lastErr.Load().(string); ok && last != "" {
-		fmt.Fprintf(buf, `<div class="err">%s</div>`, htmlEscape(last))
-	}
 }
 
 // ---------------------------------------------------------------------------

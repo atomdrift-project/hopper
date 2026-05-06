@@ -669,7 +669,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("worker reported analysis error",
 				"worker", req.Worker, "sha256", req.SHA256, "path", samplePath, "error", clientErr)
 		}
-		s.progress.errors.Add(1)
+		s.progress.recordError(1, "worker", "worker: %s: %s", req.SHA256, clientErr)
 		// Drop the in-memory claim so another worker can try it. Order matters:
 		// release decrements ActiveClaims, then recordResult bumps Errors.
 		s.tracker.release(req.SHA256)
@@ -704,7 +704,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		// this, the worker's ActiveClaims is permanently inflated for this job.
 		s.tracker.release(req.SHA256)
 		s.tracker.recordResult(req.Worker, true)
-		s.progress.errors.Add(1)
+		s.progress.recordError(1, "store", "store cleave result: %s: %v", req.SHA256, err)
 		errMsg := `{"error":"store cleave result failed"}`
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			errMsg = `{"error":"store cleave result failed: database write context was canceled or timed out"}`
@@ -717,6 +717,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	if err := retryDBAccessNoValue(ctx, "store litmus result", req.SHA256, func(ctx context.Context) error {
 		return s.db.UpdateLitmusResult(ctx, req.SHA256, req.ML)
 	}); err != nil {
+		s.progress.recordError(1, "store", "store litmus result: %s: %v", req.SHA256, err)
 		slog.Error("store litmus result failed", "sha256", req.SHA256, "error", err)
 	}
 
