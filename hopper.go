@@ -1245,10 +1245,80 @@ func (db *DB) WorkflowSnapshot(ctx context.Context, limit int) (WorkflowSnapshot
 	if limit <= 0 {
 		limit = 5
 	}
-	if db.pool != nil {
-		return db.workflowSnapshotPG(ctx, limit)
+	health, err := db.WorkflowHealth(ctx)
+	if err != nil {
+		return WorkflowSnapshot{}, err
 	}
-	return db.workflowSnapshotSQLite(ctx, limit)
+	backlogs, err := db.WorkflowBacklogs(ctx, limit)
+	if err != nil {
+		return WorkflowSnapshot{}, err
+	}
+	latestAdded, err := db.WorkflowLatestAdded(ctx, limit)
+	if err != nil {
+		return WorkflowSnapshot{}, err
+	}
+	latestReady, err := db.WorkflowLatestReady(ctx, limit)
+	if err != nil {
+		return WorkflowSnapshot{}, err
+	}
+	oldestPending, err := db.WorkflowOldestPending(ctx, limit)
+	if err != nil {
+		return WorkflowSnapshot{}, err
+	}
+	return WorkflowSnapshot{
+		Health:        health,
+		Backlogs:      backlogs,
+		LatestAdded:   latestAdded,
+		LatestReady:   latestReady,
+		OldestPending: oldestPending,
+	}, nil
+}
+
+func (db *DB) WorkflowHealth(ctx context.Context) (WorkflowHealth, error) {
+	if db.pool != nil {
+		return db.workflowHealthPG(ctx)
+	}
+	return db.workflowHealthSQLite(ctx)
+}
+
+func (db *DB) WorkflowBacklogs(ctx context.Context, limit int) ([]WorkflowBacklog, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	if db.pool != nil {
+		return db.workflowBacklogsPG(ctx, limit)
+	}
+	return db.workflowBacklogsSQLite(ctx, limit)
+}
+
+func (db *DB) WorkflowLatestAdded(ctx context.Context, limit int) ([]WorkflowSample, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	if db.pool != nil {
+		return db.workflowLatestAddedPG(ctx, limit)
+	}
+	return db.workflowLatestAddedSQLite(ctx, limit)
+}
+
+func (db *DB) WorkflowLatestReady(ctx context.Context, limit int) ([]WorkflowSample, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	if db.pool != nil {
+		return db.workflowLatestReadyPG(ctx, limit)
+	}
+	return db.workflowLatestReadySQLite(ctx, limit)
+}
+
+func (db *DB) WorkflowOldestPending(ctx context.Context, limit int) ([]WorkflowSample, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	if db.pool != nil {
+		return db.workflowOldestPendingPG(ctx, limit)
+	}
+	return db.workflowOldestPendingSQLite(ctx, limit)
 }
 
 // RelativizePaths rewrites sample paths that start with dataRoot so only

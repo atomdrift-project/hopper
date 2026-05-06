@@ -31,7 +31,9 @@ type webDashboard struct {
 	progress      *loadProgress
 	tracker       *workerTracker
 	rescanCache   *fido.Cache[string, int64]
-	workflowCache *fido.Cache[string, hopper.WorkflowSnapshot]
+	healthCache   *fido.Cache[string, hopper.WorkflowHealth]
+	backlogCache  *fido.Cache[string, []hopper.WorkflowBacklog]
+	samplesCache  *fido.Cache[string, []hopper.WorkflowSample]
 	newestATCache *fido.Cache[string, time.Time]
 	litmus        *litmusServer
 	traitsVersion string
@@ -149,7 +151,9 @@ func (wd *webDashboard) configure( //nolint:revive // argument-limit: dashboard 
 	wd.rescanAge = rescanAge
 	wd.newestATCache = fido.New[string, time.Time](fido.Size(1), fido.TTL(10*time.Second))
 	wd.rescanCache = fido.New[string, int64](fido.Size(1), fido.TTL(10*time.Second))
-	wd.workflowCache = fido.New[string, hopper.WorkflowSnapshot](fido.Size(1), fido.TTL(10*time.Second))
+	wd.healthCache = fido.New[string, hopper.WorkflowHealth](fido.Size(1), fido.TTL(10*time.Second))
+	wd.backlogCache = fido.New[string, []hopper.WorkflowBacklog](fido.Size(1), fido.TTL(10*time.Second))
+	wd.samplesCache = fido.New[string, []hopper.WorkflowSample](fido.Size(3), fido.TTL(10*time.Second))
 }
 
 const maxThroughputSamples = 2880 // 4 hours at 5-second refresh
@@ -511,22 +515,9 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		})
 	}
 
-	var workflow hopper.WorkflowSnapshot
-	var hasWorkflow bool
-	if db != nil && wd.workflowCache != nil {
-		//nolint:contextcheck,errcheck // closure creates its own context; closure logs errors before returning
-		if snap, err := wd.workflowCache.Fetch("workflow", func() (hopper.WorkflowSnapshot, error) {
-			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
-			defer cancel()
-			snap, err := db.WorkflowSnapshot(qctx, 5)
-			if err != nil {
-				slog.Warn("dashboard: WorkflowSnapshot failed", "error", err)
-			}
-			return snap, err
-		}); err == nil {
-			workflow = snap
-			hasWorkflow = true
-		}
+	var workflow dashboardWorkflow
+	if db != nil {
+		workflow = wd.fetchWorkflow(r.Context(), db)
 	}
 
 	elapsed := time.Since(start).Round(time.Second)
@@ -645,13 +636,13 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	buf.WriteString(`</div>`)
 	buf.WriteString(`</div>`) // .hdr
 
-	if hasWorkflow {
-		writeWorkflowHealth(&buf, workflow)
-		writeWorkflowBacklogs(&buf, workflow.Backlogs)
-		writeWorkflowSamples(&buf, "Recent Samples", "Newest rows seen by Hopper", workflow.LatestAdded, "created")
-		writeWorkflowSamples(&buf, "Prism Ready", "Newest top-level rows with cleave and litmus results", workflow.LatestReady, "created")
-		writeWorkflowSamples(&buf, "Oldest Pending Cleave", "Claimable top-level rows still missing cleave results", workflow.OldestPending, "updated")
+	if workflow.hasHealth {
+		writeWorkflowHealth(&buf, workflow.health)
 	}
+	writeWorkflowBacklogs(&buf, workflow.backlogs)
+	writeWorkflowSamples(&buf, "Recent Samples", "Newest rows seen by Hopper", workflow.latestAdded, "created")
+	writeWorkflowSamples(&buf, "Prism Ready", "Newest top-level rows with cleave and litmus results", workflow.latestReady, "created")
+	writeWorkflowSamples(&buf, "Oldest Pending Cleave", "Claimable top-level rows still missing cleave results", workflow.oldestPending, "updated")
 
 	// Throughput graph
 	combinedSeries, perNodeSeries := wd.throughputSeries()
@@ -754,14 +745,111 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	_, _ = fmt.Fprint(w, buf.String()) //nolint:errcheck // best-effort HTTP response
 }
 
+type dashboardWorkflow struct {
+	health        hopper.WorkflowHealth
+	backlogs      []hopper.WorkflowBacklog
+	latestAdded   []hopper.WorkflowSample
+	latestReady   []hopper.WorkflowSample
+	oldestPending []hopper.WorkflowSample
+	hasHealth     bool
+}
+
+func (wd *webDashboard) fetchWorkflow(ctx context.Context, db *hopper.DB) dashboardWorkflow {
+	var out dashboardWorkflow
+	var outMu sync.Mutex
+	var wg sync.WaitGroup
+
+	run := func(label string, fn func(context.Context) error) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			qctx, cancel := context.WithTimeout(ctx, dashQueryTimeout)
+			defer cancel()
+			if err := fn(qctx); err != nil {
+				slog.Warn("dashboard: workflow query failed", "query", label, "error", err)
+			}
+		}()
+	}
+
+	if wd.healthCache != nil {
+		run("health", func(qctx context.Context) error {
+			h, err := wd.healthCache.Fetch("health", func() (hopper.WorkflowHealth, error) {
+				return db.WorkflowHealth(qctx)
+			})
+			if err != nil {
+				return err
+			}
+			outMu.Lock()
+			out.health = h
+			out.hasHealth = true
+			outMu.Unlock()
+			return nil
+		})
+	}
+	if wd.backlogCache != nil {
+		run("backlogs", func(qctx context.Context) error {
+			rows, err := wd.backlogCache.Fetch("backlogs", func() ([]hopper.WorkflowBacklog, error) {
+				return db.WorkflowBacklogs(qctx, 5)
+			})
+			if err != nil {
+				return err
+			}
+			outMu.Lock()
+			out.backlogs = rows
+			outMu.Unlock()
+			return nil
+		})
+	}
+	if wd.samplesCache != nil {
+		run("latest_added", func(qctx context.Context) error {
+			rows, err := wd.samplesCache.Fetch("latest_added", func() ([]hopper.WorkflowSample, error) {
+				return db.WorkflowLatestAdded(qctx, 5)
+			})
+			if err != nil {
+				return err
+			}
+			outMu.Lock()
+			out.latestAdded = rows
+			outMu.Unlock()
+			return nil
+		})
+		run("latest_ready", func(qctx context.Context) error {
+			rows, err := wd.samplesCache.Fetch("latest_ready", func() ([]hopper.WorkflowSample, error) {
+				return db.WorkflowLatestReady(qctx, 5)
+			})
+			if err != nil {
+				return err
+			}
+			outMu.Lock()
+			out.latestReady = rows
+			outMu.Unlock()
+			return nil
+		})
+		run("oldest_pending", func(qctx context.Context) error {
+			rows, err := wd.samplesCache.Fetch("oldest_pending", func() ([]hopper.WorkflowSample, error) {
+				return db.WorkflowOldestPending(qctx, 5)
+			})
+			if err != nil {
+				return err
+			}
+			outMu.Lock()
+			out.oldestPending = rows
+			outMu.Unlock()
+			return nil
+		})
+	}
+
+	wg.Wait()
+	return out
+}
+
 func writeQueueCard(buf *strings.Builder, label, value, meta string) {
 	fmt.Fprintf(buf,
 		`<div class="queue-card"><div class="queue-label">%s</div><div class="queue-value">%s</div><div class="queue-meta">%s</div></div>`,
 		htmlEscape(label), htmlEscape(value), meta)
 }
 
-func writeWorkflowHealth(buf *strings.Builder, snap hopper.WorkflowSnapshot) {
-	h := snap.Health
+func writeWorkflowHealth(buf *strings.Builder, h hopper.WorkflowHealth) {
 	buf.WriteString(`<section><div class="label">Workflow Health</div><div class="health-grid">`)
 	writeMetricCard(buf, "Latest added", ageValue(h.LatestAdded), timeTitle(h.LatestAdded))
 	writeMetricCard(buf, "Latest analyzed", ageValue(h.LatestAnalyzed), timeTitle(h.LatestAnalyzed))

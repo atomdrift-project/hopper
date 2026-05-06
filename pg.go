@@ -119,6 +119,23 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 			`AND cleave_result IS NOT NULL AND status = ''`,
 		// staleSamplesPG: WHERE updated_at < $1 ORDER BY updated_at — no status prefix.
 		`CREATE INDEX IF NOT EXISTS idx_samples_updated_at ON samples(updated_at)`,
+		// Workflow dashboard freshness: global top-level recency cannot use the
+		// feed-prefixed indexes because there is no source/label predicate.
+		`CREATE INDEX IF NOT EXISTS idx_samples_top_created ` +
+			`ON samples(created_at DESC, id) ` +
+			`WHERE parent = ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_top_ready_created ` +
+			`ON samples(created_at DESC, id) ` +
+			`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL`,
+		// Workflow dashboard backlog grouping. Keep these separate so each side
+		// of the queue can be counted without a heap-wide OR scan.
+		`CREATE INDEX IF NOT EXISTS idx_samples_pending_cleave_group ` +
+			`ON samples(source, feed, ecosystem, updated_at) ` +
+			`WHERE parent = '' AND skip = '' AND cleave_result IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_pending_litmus_group ` +
+			`ON samples(source, feed, ecosystem, updated_at) ` +
+			`WHERE parent = '' AND skip = '' AND cleave_result IS NOT NULL AND litmus_result IS NULL`,
+		`ANALYZE samples`,
 		// Traits-version rescan: find analyzed samples with stale traits.
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS traits_version TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS cyclotron_attempted_at TIMESTAMPTZ`,
@@ -561,40 +578,15 @@ func scanPGSamplesLight(rows pgx.Rows) ([]*Sample, error) {
 	return out, rows.Err()
 }
 
-func (db *DB) workflowSnapshotPG(ctx context.Context, limit int) (WorkflowSnapshot, error) {
-	var snap WorkflowSnapshot
-	health, err := db.workflowHealthPG(ctx)
-	if err != nil {
-		return snap, err
-	}
-	snap.Health = health
-	if snap.Backlogs, err = db.workflowBacklogsPG(ctx, limit); err != nil {
-		return snap, err
-	}
-	if snap.LatestAdded, err = db.workflowSamplesPG(ctx,
-		`WHERE parent = '' ORDER BY created_at DESC LIMIT $1`, limit); err != nil {
-		return snap, err
-	}
-	if snap.LatestReady, err = db.workflowSamplesPG(ctx,
-		`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL ORDER BY created_at DESC LIMIT $1`, limit); err != nil {
-		return snap, err
-	}
-	if snap.OldestPending, err = db.workflowSamplesPG(ctx,
-		`WHERE parent = '' AND cleave_result IS NULL AND skip = '' ORDER BY updated_at ASC NULLS FIRST, id LIMIT $1`, limit); err != nil {
-		return snap, err
-	}
-	return snap, nil
-}
-
 func (db *DB) workflowHealthPG(ctx context.Context) (WorkflowHealth, error) {
 	var h WorkflowHealth
 	var latestAdded, latestUpdated, latestAnalyzed, latestReady sql.NullTime
 	err := db.pool.QueryRow(ctx, `
 		SELECT
-			(SELECT max(created_at) FROM samples WHERE parent = ''),
+			(SELECT created_at FROM samples WHERE parent = '' ORDER BY created_at DESC LIMIT 1),
 			(SELECT max(updated_at) FROM samples WHERE parent = ''),
 			(SELECT max(analyzed_at) FROM samples WHERE parent = '' AND analyzed_at IS NOT NULL),
-			(SELECT max(created_at) FROM samples WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL),
+			(SELECT created_at FROM samples WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL ORDER BY created_at DESC LIMIT 1),
 			(SELECT count(*) FROM samples WHERE parent = '' AND skip = '' AND cleave_result IS NULL),
 			(SELECT count(*) FROM samples WHERE parent = '' AND skip = '' AND cleave_result IS NOT NULL AND litmus_result IS NULL)`,
 	).Scan(&latestAdded, &latestUpdated, &latestAnalyzed, &latestReady, &h.PendingCleave, &h.PendingLitmus)
@@ -612,14 +604,23 @@ func (db *DB) workflowBacklogsPG(ctx context.Context, limit int) ([]WorkflowBack
 	rows, err := db.pool.Query(ctx, `
 		SELECT source, feed, ecosystem,
 			min(updated_at), max(updated_at),
-			count(*) FILTER (WHERE cleave_result IS NULL),
-			count(*) FILTER (WHERE cleave_result IS NOT NULL AND litmus_result IS NULL)
-		FROM samples
-		WHERE parent = '' AND skip = ''
-		  AND (cleave_result IS NULL OR (cleave_result IS NOT NULL AND litmus_result IS NULL))
+			sum(pending_cleave), sum(pending_litmus)
+		FROM (
+			SELECT source, feed, ecosystem, updated_at,
+				1::integer AS pending_cleave,
+				0::integer AS pending_litmus
+			FROM samples
+			WHERE parent = '' AND skip = '' AND cleave_result IS NULL
+			UNION ALL
+			SELECT source, feed, ecosystem, updated_at,
+				0::integer AS pending_cleave,
+				1::integer AS pending_litmus
+			FROM samples
+			WHERE parent = '' AND skip = ''
+			  AND cleave_result IS NOT NULL AND litmus_result IS NULL
+		) pending
 		GROUP BY source, feed, ecosystem
-		ORDER BY (count(*) FILTER (WHERE cleave_result IS NULL)
-			+ count(*) FILTER (WHERE cleave_result IS NOT NULL AND litmus_result IS NULL)) DESC
+		ORDER BY (sum(pending_cleave) + sum(pending_litmus)) DESC
 		LIMIT $1`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: workflow backlogs: %w", err)
@@ -637,6 +638,20 @@ func (db *DB) workflowBacklogsPG(ctx context.Context, limit int) ([]WorkflowBack
 		out = append(out, b)
 	}
 	return out, rows.Err()
+}
+
+func (db *DB) workflowLatestAddedPG(ctx context.Context, limit int) ([]WorkflowSample, error) {
+	return db.workflowSamplesPG(ctx, `WHERE parent = '' ORDER BY created_at DESC LIMIT $1`, limit)
+}
+
+func (db *DB) workflowLatestReadyPG(ctx context.Context, limit int) ([]WorkflowSample, error) {
+	return db.workflowSamplesPG(ctx,
+		`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL ORDER BY created_at DESC LIMIT $1`, limit)
+}
+
+func (db *DB) workflowOldestPendingPG(ctx context.Context, limit int) ([]WorkflowSample, error) {
+	return db.workflowSamplesPG(ctx,
+		`WHERE parent = '' AND cleave_result IS NULL AND skip = '' ORDER BY updated_at ASC NULLS FIRST, id LIMIT $1`, limit)
 }
 
 func (db *DB) workflowSamplesPG(ctx context.Context, where string, limit int) ([]WorkflowSample, error) {
