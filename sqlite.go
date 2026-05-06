@@ -42,7 +42,7 @@ func pragmaHasColumn(ctx context.Context, db *sql.DB, column string) int {
 	return count
 }
 
-func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maintidx // sequential migration steps; splitting reduces clarity
+func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maintidx,revive // sequential migration steps; splitting reduces clarity
 	slog.Debug("executing initial schema ddl")
 	if _, err := db.lite.ExecContext(ctx, schemaSQLite); err != nil {
 		return fmt.Errorf("hopper: migrate sqlite: %w", err)
@@ -111,7 +111,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 			`CREATE INDEX IF NOT EXISTS idx_samples_mtime ON samples(mtime) WHERE mtime IS NOT NULL`,
 			`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_mtime ON samples(source, label, mtime DESC) WHERE cleave_result IS NOT NULL`,
 			`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_created ON samples(source, label, created_at DESC) WHERE cleave_result IS NOT NULL`,
-			`CREATE INDEX IF NOT EXISTS idx_samples_feed_top_created_done ON samples(source, label, created_at DESC) WHERE cleave_result IS NOT NULL AND parent = '' AND litmus_result IS NOT NULL`,
+			`CREATE INDEX IF NOT EXISTS idx_samples_feed_top_created_done ` +
+				`ON samples(source, label, created_at DESC) ` +
+				`WHERE cleave_result IS NOT NULL AND parent = '' AND litmus_result IS NOT NULL`,
 		} {
 			slog.Debug("executing migration ddl", "ddl", ddl)
 			if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
@@ -137,8 +139,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		return fmt.Errorf("hopper: migrate sqlite: %w", err)
 	}
 	for _, ddl := range []string{
-		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_created ON samples(source, label, created_at DESC) WHERE cleave_result IS NOT NULL`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_feed_top_created_done ON samples(source, label, created_at DESC) WHERE cleave_result IS NOT NULL AND parent = '' AND litmus_result IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_created ` +
+			`ON samples(source, label, created_at DESC) WHERE cleave_result IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_feed_top_created_done ` +
+			`ON samples(source, label, created_at DESC) ` +
+			`WHERE cleave_result IS NOT NULL AND parent = '' AND litmus_result IS NOT NULL`,
 	} {
 		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite: %w", err)
@@ -1517,8 +1522,13 @@ func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 }
 
 func (db *DB) backfillArchiveMemberLitmusSQLite(ctx context.Context) (int64, error) {
-	var total int64
-	for {
+	type candidate struct {
+		sha256       string
+		childLitmus  []byte
+		parentCleave []byte
+		parentLitmus []byte
+	}
+	loadBatch := func() ([]candidate, error) {
 		rows, err := db.lite.QueryContext(ctx, `
 			SELECT c.sha256, c.litmus_result, p.cleave_result, p.litmus_result
 			FROM samples c
@@ -1530,28 +1540,29 @@ func (db *DB) backfillArchiveMemberLitmusSQLite(ctx context.Context) (int64, err
 				AND p.litmus_result IS NOT NULL
 			LIMIT ?`, archiveMemberLitmusBackfillBatch)
 		if err != nil {
-			return total, fmt.Errorf("hopper: backfill archive member litmus query: %w", err)
+			return nil, fmt.Errorf("hopper: backfill archive member litmus query: %w", err)
 		}
-
-		type candidate struct {
-			sha256       string
-			childLitmus  []byte
-			parentCleave []byte
-			parentLitmus []byte
-		}
+		defer rows.Close() //nolint:errcheck // best-effort cleanup
 		var candidates []candidate
 		for rows.Next() {
 			var c candidate
 			if err := rows.Scan(&c.sha256, &c.childLitmus, &c.parentCleave, &c.parentLitmus); err != nil {
-				rows.Close()
-				return total, fmt.Errorf("hopper: backfill archive member litmus scan: %w", err)
+				return nil, fmt.Errorf("hopper: backfill archive member litmus scan: %w", err)
 			}
 			candidates = append(candidates, c)
 		}
 		if err := rows.Err(); err != nil {
-			return total, fmt.Errorf("hopper: backfill archive member litmus rows: %w", err)
+			return nil, fmt.Errorf("hopper: backfill archive member litmus rows: %w", err)
 		}
-		rows.Close()
+		return candidates, nil
+	}
+
+	var total int64
+	for {
+		candidates, err := loadBatch()
+		if err != nil {
+			return total, err
+		}
 		if len(candidates) == 0 {
 			return total, nil
 		}

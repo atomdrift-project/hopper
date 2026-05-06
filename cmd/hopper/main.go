@@ -101,6 +101,7 @@ func runtimeIdentityAttrs() []any {
 				attrs = append(attrs, "vcs_time", setting.Value)
 			case "vcs.modified":
 				attrs = append(attrs, "vcs_modified", setting.Value)
+			default:
 			}
 		}
 	}
@@ -700,7 +701,7 @@ func ingestReportsDir(ctx context.Context, db *hopper.DB, dir, reportType, provi
 			}
 			return err
 		}
-		content, err := os.ReadFile(path) //nolint:gosec // path comes from trusted local ingest dir walk
+		content, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
@@ -1088,13 +1089,13 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	wd.beginStage("db.relativize", "Relativizing sample paths")
 	relativizeStart := time.Now()
 	slog.Info("relativizing stored sample paths")
-	if n, err := db.RelativizePaths(ctx, *dataDir); err != nil {
+	n, err := db.RelativizePaths(ctx, *dataDir)
+	if err != nil {
 		wd.failStage("db.relativize", err.Error())
 		slog.Error("failed to relativize stored sample paths", "elapsed", time.Since(relativizeStart), "error", err)
 		return err
-	} else {
-		slog.Info("relativized stored sample paths", "samples", n, "elapsed", time.Since(relativizeStart))
 	}
+	slog.Info("relativized stored sample paths", "samples", n, "elapsed", time.Since(relativizeStart))
 	wd.endStage("db.relativize")
 
 	forcePrefixes, err := normalizeForceRescanDirs(*dataDir, forceRescanDirs)

@@ -90,20 +90,6 @@ func (wd *webDashboard) beginStage(name, label string) {
 	wd.stages = append(wd.stages, &startupStage{name: name, label: label, started: time.Now()})
 }
 
-// updateStage updates progress numbers for a running stage. No-op if unknown
-// or if the receiver is nil.
-func (wd *webDashboard) updateStage(name string, current, total int64) {
-	if wd == nil {
-		return
-	}
-	wd.stagesMu.Lock()
-	defer wd.stagesMu.Unlock()
-	if s := wd.findStage(name); s != nil {
-		s.current = current
-		s.total = total
-	}
-}
-
 // endStage marks a stage finished. No-op if unknown or receiver is nil.
 func (wd *webDashboard) endStage(name string) {
 	if wd == nil {

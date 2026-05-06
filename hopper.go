@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -481,9 +482,7 @@ func litmusResultForMember(parent []byte, id int) []byte {
 			out[key] = v
 		}
 	}
-	for k, v := range member {
-		out[k] = v
-	}
+	maps.Copy(out, member)
 	b, err := json.Marshal(out)
 	if err != nil {
 		return nil
@@ -500,9 +499,8 @@ func cleaveFileIndexForSHA(result []byte, sha256 string) (int, bool) {
 	if json.Unmarshal(result, &report) != nil {
 		return 0, false
 	}
-	sha256 = strings.ToLower(sha256)
 	for i, f := range report.Files {
-		if strings.ToLower(f.SHA256) == sha256 {
+		if strings.EqualFold(f.SHA256, sha256) {
 			return i, true
 		}
 	}
@@ -1332,6 +1330,7 @@ type BackfillPending struct {
 	StaleBadMarkers       int64 // bad marker misclassification skips that can be cleared
 }
 
+// TotalRows is the sum of all pending backfill rows across passes.
 func (p BackfillPending) TotalRows() int64 {
 	return p.CleaveColumns + p.ArchiveMemberLitmus + p.ArchiveMemberAnalyzed + p.StaleGoodMarkers + p.StaleBadMarkers
 }

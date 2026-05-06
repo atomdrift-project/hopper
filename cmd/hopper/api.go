@@ -422,6 +422,8 @@ func qualifiedWorkerName(name, addr string) string {
 
 // handleNext claims work items for a worker.
 // GET /api/next?worker=nuc&count=3&slots=4&version=0.8.2&traits=abc123.
+//
+//nolint:gocognit,maintidx // single sequence of input validation + claim flow; splitting hides control flow
 func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
 		http.Error(w, `{"error":"starting"}`, http.StatusServiceUnavailable)
@@ -697,7 +699,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	if err := retryDBAccessNoValue(ctx, "store cleave result", req.SHA256, func(ctx context.Context) error {
 		return s.db.UpdateCleaveResult(ctx, req.SHA256, req.Raw, &parsed, tv)
 	}); err != nil {
-		logResultStoreError("store cleave result failed after accepting worker result", r.Context(), ctx, req.SHA256, err)
+		logResultStoreError(r.Context(), ctx, "store cleave result failed after accepting worker result", req.SHA256, err)
 		// Drop the claim and bump errors so the worker's slot frees up — without
 		// this, the worker's ActiveClaims is permanently inflated for this job.
 		s.tracker.release(req.SHA256)
@@ -903,7 +905,7 @@ func retryDBAccess[T any](ctx context.Context, op, sha256 string, fn func(contex
 	)
 }
 
-func logResultStoreError(msg string, reqCtx, storeCtx context.Context, sha256 string, err error) {
+func logResultStoreError(reqCtx, storeCtx context.Context, msg, sha256 string, err error) {
 	attrs := []any{"sha256", sha256, "error", err}
 	if reqErr := reqCtx.Err(); reqErr != nil {
 		attrs = append(attrs, "request_context", reqErr)

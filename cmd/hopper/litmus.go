@@ -21,31 +21,32 @@ import (
 	"codeberg.org/atomdrift/hopper"
 )
 
-const restartRecoveryDelay = 15 * time.Second
-const litmusTmpSentinel = ".hopper-litmus-managed"
-
 // litmusServer manages a local litmus worker subprocess. In pull mode,
 // litmus polls hopper's /api/next for work instead of hopper pushing
 // requests to it.
-const livenessTimeout = 25 * time.Minute
+const (
+	restartRecoveryDelay = 15 * time.Second
+	litmusTmpSentinel    = ".hopper-litmus-managed"
+	livenessTimeout      = 25 * time.Minute
+)
 
 type litmusServer struct {
 	cmd        *exec.Cmd
-	bin        string         // path to litmus binary
-	hopperURL  string         // hopper API base URL for the worker to poll
-	dataDir    string         // data root for --data-dir
-	tracker    *workerTracker // for liveness checks
-	workerName string         // qualified name used to look up in tracker
+	tracker    *workerTracker         // for liveness checks
+	logPath    atomic.Pointer[string] // current worker's stdout/stderr log file
+	bin        string                 // path to litmus binary
+	hopperURL  string                 // hopper API base URL for the worker to poll
+	dataDir    string                 // data root for --data-dir
+	workerName string                 // qualified name used to look up in tracker
+	tmpDir     string
+	pid        atomic.Int64
+	restarts   atomic.Int64
 	mu         sync.Mutex
 	maxRSSGB   int
 	maxWorkers int
-	verbose    bool
 	stopped    atomic.Bool
 	building   atomic.Bool
-	pid        atomic.Int64
-	restarts   atomic.Int64
-	tmpDir     string
-	logPath    atomic.Pointer[string] // current worker's stdout/stderr log file
+	verbose    bool
 }
 
 // litmusConfig holds options for starting a litmus worker.
@@ -96,11 +97,11 @@ func tailLogFile(path string) string {
 		maxBytes = 4096
 		maxLines = 30
 	)
-	f, err := os.Open(path) //nolint:gosec // path is the temp file we created at startup
+	f, err := os.Open(path)
 	if err != nil {
 		return ""
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close() //nolint:errcheck // best-effort read
 	fi, err := f.Stat()
 	if err != nil {
 		return ""
@@ -111,7 +112,10 @@ func tailLogFile(path string) string {
 		offset = size - maxBytes
 	}
 	buf := make([]byte, size-offset)
-	n, _ := f.ReadAt(buf, offset)
+	n, _ := f.ReadAt(buf, offset) //nolint:errcheck // partial read is fine; n==0 below filters empty
+	if n == 0 {
+		return ""
+	}
 	if n == 0 {
 		return ""
 	}
@@ -683,7 +687,7 @@ func refreshLitmusRules(ctx context.Context, bin string) {
 func preflightCleaveValidate(ctx context.Context, bin string) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, "validate") //nolint:gosec // bin path is from trusted CLI flag
+	cmd := exec.CommandContext(ctx, bin, "validate")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		attrs := []any{
@@ -742,8 +746,8 @@ func commandDiagnostics(cmd *exec.Cmd) []any {
 func cmdEnvValue(cmd *exec.Cmd, key string) (string, bool) {
 	prefix := key + "="
 	for _, entry := range cmd.Environ() {
-		if strings.HasPrefix(entry, prefix) {
-			return strings.TrimPrefix(entry, prefix), true
+		if val, ok := strings.CutPrefix(entry, prefix); ok {
+			return val, true
 		}
 	}
 	return "", false
@@ -753,8 +757,8 @@ func resolvedTraitsDir(cmd *exec.Cmd) string {
 	if val, ok := cmdEnvValue(cmd, "CLEAVE_TRAITS_DIR"); ok && val != "" {
 		return val
 	}
-	if looksLikeTraitsDir(filepath.Join("traits")) {
-		return filepath.Join("traits")
+	if looksLikeTraitsDir("traits") {
+		return "traits"
 	}
 	home := cmdHome(cmd)
 	if home == "" {
@@ -822,10 +826,10 @@ func shellQuote(s string) string {
 		return "''"
 	}
 	if strings.IndexFunc(s, func(r rune) bool {
-		return !(r >= 'A' && r <= 'Z' ||
-			r >= 'a' && r <= 'z' ||
-			r >= '0' && r <= '9' ||
-			strings.ContainsRune("._/:-", r))
+		return (r < 'A' || r > 'Z') &&
+			(r < 'a' || r > 'z') &&
+			(r < '0' || r > '9') &&
+			!strings.ContainsRune("._/:-", r)
 	}) == -1 {
 		return s
 	}

@@ -2,7 +2,7 @@ package hopper
 
 import (
 	"context"
-	"crypto/sha256"
+	cryptosha256 "crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -72,7 +72,9 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source ON samples(source, label, analyzed_at DESC NULLS LAST) WHERE cleave_result IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_mtime ON samples(source, label, mtime DESC NULLS LAST) WHERE cleave_result IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_created ON samples(source, label, created_at DESC) WHERE cleave_result IS NOT NULL`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_feed_top_created_done ON samples(source, label, created_at DESC) WHERE cleave_result IS NOT NULL AND parent = '' AND litmus_result IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_feed_top_created_done ` +
+			`ON samples(source, label, created_at DESC) ` +
+			`WHERE cleave_result IS NOT NULL AND parent = '' AND litmus_result IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed ON samples(feed) WHERE feed != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_ecosystem ON samples(ecosystem) WHERE ecosystem != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_mtime ON samples(mtime) WHERE mtime IS NOT NULL`,
@@ -383,7 +385,7 @@ func (db *DB) ensurePGMigrationLedger(ctx context.Context) error {
 }
 
 func migrationID(ddl string) string {
-	sum := sha256.Sum256([]byte(normalizeMigrationDDL(ddl)))
+	sum := cryptosha256.Sum256([]byte(normalizeMigrationDDL(ddl)))
 	return hex.EncodeToString(sum[:8])
 }
 
@@ -1625,7 +1627,7 @@ func (db *DB) backfillArchiveMemberLitmusPG(ctx context.Context) (int64, error) 
 	if err != nil {
 		return 0, fmt.Errorf("hopper: backfill archive member litmus begin: %w", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
 
 	if _, err := tx.Exec(ctx, `
 		DECLARE archive_parent_cur NO SCROLL CURSOR FOR
