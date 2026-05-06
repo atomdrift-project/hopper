@@ -356,6 +356,7 @@ td.nn{font-family:var(--sans);color:var(--text);font-weight:500;
   font-size:.82rem;white-space:nowrap}
 td.hi{color:var(--text)}
 td.rate{color:var(--text);white-space:nowrap}
+th.col-rss,td.col-rss{width:7.2ch;min-width:7.2ch;white-space:nowrap}
 td.warn{color:var(--amber)}
 
 /* status dot */
@@ -674,7 +675,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		buf.WriteString(`<section><div class="label">Workers</div>`)
 		buf.WriteString(`<table><thead><tr>` +
 			`<th>Worker</th><th>Tasks</th><th>Seen</th><th>Rate</th>` +
-			`<th>RSS</th><th>Load</th>` +
+			`<th class="col-rss">RSS</th><th>Load</th>` +
 			`<th>Analyzed</th><th>Errors</th><th>Oldest Job</th><th></th>` +
 			`</tr></thead><tbody>`)
 
@@ -723,7 +724,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 					`<td class="hi">%d/%d</td>`+
 					`<td class="hi">%s</td>`+
 					`<td class="rate">%s</td>`+
-					`<td>%s</td>`+
+					`<td class="col-rss">%s</td>`+
 					`<td>%s</td>`+
 					`<td class="hi">%s</td>`+
 					`<td>%s</td>`+
