@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -229,6 +230,43 @@ func TestUpdateCleaveResult(t *testing.T) {
 	}
 	if got.AnalyzedAt == nil {
 		t.Error("AnalyzedAt should be set")
+	}
+	if got.FirstAnalyzedAt == nil {
+		t.Error("FirstAnalyzedAt should be set")
+	}
+}
+
+func TestUpdateCleaveResultPreservesFirstAnalyzedAt(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{SHA256: "fa1", Source: "test", Label: "bad", LabelSource: "test"})
+	result := []byte(`{"fs":[{"sha":"fa1","type":"elf","dp":0,"x":1}]}`)
+	if err := db.UpdateCleaveResult(ctx, "fa1", result, nil, "old"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := db.SampleBySHA256(ctx, "fa1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.FirstAnalyzedAt == nil || first.AnalyzedAt == nil {
+		t.Fatalf("first analysis timestamps missing: %+v", first)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	result = []byte(`{"fs":[{"sha":"fa1","type":"elf","dp":0,"x":2}]}`)
+	if err := db.UpdateCleaveResult(ctx, "fa1", result, nil, "new"); err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.SampleBySHA256(ctx, "fa1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.FirstAnalyzedAt == nil || !second.FirstAnalyzedAt.Equal(*first.FirstAnalyzedAt) {
+		t.Fatalf("first_analyzed_at = %v, want preserved %v", second.FirstAnalyzedAt, first.FirstAnalyzedAt)
+	}
+	if second.AnalyzedAt == nil || !second.AnalyzedAt.After(*first.AnalyzedAt) {
+		t.Fatalf("analyzed_at = %v, want after %v", second.AnalyzedAt, first.AnalyzedAt)
 	}
 }
 
@@ -1438,11 +1476,15 @@ func TestBackfillArchiveMemberLitmusResult(t *testing.T) {
 	parentLitmus := []byte(`{"v":"4","prob":0.97,"class":1,"version":"vtest","fs":[{"id":0,"prob":0.97,"class":1},{"id":1,"prob":0.41,"class":0}]}`)
 	childCleave := []byte(`{"fs":[{"sha":"` + childSHA + `","type":"py","path":"pkg/x.py","dp":1}]}`)
 
-	mustInsert(t, ctx, db, &Sample{SHA256: parentSHA, Source: "test", Label: "bad", LabelSource: "test"})
-	if err := db.UpdateCleaveResult(ctx, parentSHA, parentCleave, nil, ""); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.UpdateLitmusResult(ctx, parentSHA, parentLitmus); err != nil {
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{{
+		SHA256:       parentSHA,
+		Source:       "test",
+		Label:        "bad",
+		LabelSource:  "test",
+		Path:         "bad/archive.zip",
+		CleaveResult: parentCleave,
+		LitmusResult: parentLitmus,
+	}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{{
@@ -1512,6 +1554,9 @@ func TestExplodeArchiveMembersViaSampleParentInfoAnalyzedAt(t *testing.T) {
 	if parent.AnalyzedAt == nil {
 		t.Fatal("SampleParentInfo did not fetch analyzed_at")
 	}
+	if parent.FirstAnalyzedAt == nil {
+		t.Fatal("SampleParentInfo did not fetch first_analyzed_at")
+	}
 	parent.CleaveResult = cleaveJSON
 
 	if _, err := db.ExplodeArchiveMembers(ctx, parent); err != nil {
@@ -1523,6 +1568,9 @@ func TestExplodeArchiveMembersViaSampleParentInfoAnalyzedAt(t *testing.T) {
 	}
 	if child.AnalyzedAt == nil || !child.AnalyzedAt.Equal(*parent.AnalyzedAt) {
 		t.Fatalf("child analyzed_at = %v, want parent analyzed_at %v", child.AnalyzedAt, parent.AnalyzedAt)
+	}
+	if child.FirstAnalyzedAt == nil || !child.FirstAnalyzedAt.Equal(*parent.FirstAnalyzedAt) {
+		t.Fatalf("child first_analyzed_at = %v, want parent first_analyzed_at %v", child.FirstAnalyzedAt, parent.FirstAnalyzedAt)
 	}
 }
 
@@ -2124,6 +2172,54 @@ func TestPool(t *testing.T) {
 	}
 }
 
+func TestWorkflowLatestReadyUsesFirstAnalyzedAt(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	oldFirst := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	newFirst := time.Date(2026, 5, 2, 10, 0, 0, 0, time.UTC)
+	oldCreated := time.Date(2026, 5, 3, 10, 0, 0, 0, time.UTC)
+	newCreated := time.Date(2026, 5, 1, 9, 0, 0, 0, time.UTC)
+
+	for _, sha := range []string{"ready-old", "ready-new"} {
+		mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test", Label: "bad", LabelSource: "test"})
+		if err := db.UpdateCleaveResult(ctx, sha, []byte(`{"fs":[{"sha":"`+sha+`","type":"elf","dp":0}]}`), nil, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.UpdateLitmusResult(ctx, sha, []byte(`{"prob":0.9,"class":1}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET created_at = ?, first_analyzed_at = ?, analyzed_at = ? WHERE sha256 = ?`,
+		oldCreated.Format(time.RFC3339Nano), oldFirst.Format(time.RFC3339Nano), oldFirst.Format(time.RFC3339Nano), "ready-old"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET created_at = ?, first_analyzed_at = ?, analyzed_at = ? WHERE sha256 = ?`,
+		newCreated.Format(time.RFC3339Nano), newFirst.Format(time.RFC3339Nano), newFirst.Format(time.RFC3339Nano), "ready-new"); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := db.WorkflowLatestReady(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].SHA256 != "ready-new" || rows[1].SHA256 != "ready-old" {
+		t.Fatalf("latest ready order = %+v, want ready-new then ready-old", rows)
+	}
+	if rows[0].FirstAnalyzedAt == nil || !rows[0].FirstAnalyzedAt.Equal(newFirst) {
+		t.Fatalf("first analyzed = %v, want %v", rows[0].FirstAnalyzedAt, newFirst)
+	}
+	h, err := db.WorkflowHealth(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !h.LatestReady.Equal(newFirst) {
+		t.Fatalf("health latest ready = %v, want %v", h.LatestReady, newFirst)
+	}
+}
+
 func TestStripSubscripts(t *testing.T) {
 	tests := []struct {
 		in, want string
@@ -2189,6 +2285,51 @@ func TestUpdateCleaveResultSetsFormulaAndScore(t *testing.T) {
 	}
 	if got.Score != 42 {
 		t.Errorf("Score = %d", got.Score)
+	}
+}
+
+func TestUpdateCleaveResultCompactsArchiveStorage(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	parentSHA := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	childSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	result := []byte(`{"tv":"abcde","fs":[` +
+		`{"sha":"` + parentSHA + `","type":"zip","path":"archive.zip","dp":0,"x":7},` +
+		`{"sha":"` + childSHA + `","type":"py","path":"pkg/x.py","dp":1,"x":3}` +
+		`]}`)
+	mustInsert(t, ctx, db, &Sample{SHA256: parentSHA, Source: "test", Label: "bad", LabelSource: "test"})
+	if err := db.UpdateCleaveResult(ctx, parentSHA, result, nil, "abcde"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := db.SampleBySHA256(ctx, parentSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CanonicalSHA256 != childSHA {
+		t.Fatalf("canonical = %s, want embedded child %s", got.CanonicalSHA256, childSHA)
+	}
+	var stored struct {
+		TraitsVersion string `json:"tv"`
+		Files         []struct {
+			SHA256 string `json:"sha"`
+			Depth  int    `json:"dp"`
+		} `json:"fs"`
+		Truncated    bool `json:"truncated"`
+		OmittedFiles int  `json:"omitted_files"`
+	}
+	if err := json.Unmarshal(got.CleaveResult, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if len(stored.Files) != 1 || stored.Files[0].SHA256 != parentSHA || stored.Files[0].Depth != 0 {
+		t.Fatalf("stored fs = %+v, want only parent", stored.Files)
+	}
+	if !stored.Truncated || stored.OmittedFiles != 1 || stored.TraitsVersion != "abcde" {
+		t.Fatalf("stored compact metadata = %+v", stored)
+	}
+	if bytes.Contains(got.CleaveResult, []byte(childSHA)) {
+		t.Fatalf("stored cleave_result still contains child sha: %s", got.CleaveResult)
 	}
 }
 
@@ -2468,5 +2609,35 @@ func TestUnanalyzedCandidatesRetriesOldErrorsAfterRestart(t *testing.T) {
 	}
 	if len(jobs) != 1 || jobs[0].SHA256 != "err1" {
 		t.Fatalf("old error after restart: got %+v, want err1", jobs)
+	}
+}
+
+func TestUnanalyzedCandidatesUsesRandomPivot(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	lowest := strings.Repeat("0", 64)
+	mustInsert(t, ctx, db, &Sample{SHA256: lowest, Path: "/data/lowest.exe", Label: "bad"})
+	for i := 1; i < 256; i++ {
+		sha := fmt.Sprintf("%02x%s", i, strings.Repeat("0", 62))
+		mustInsert(t, ctx, db, &Sample{SHA256: sha, Path: "/data/" + sha, Label: "bad"})
+	}
+
+	sawNonLowestFirst := false
+	for range 20 {
+		jobs, err := db.UnanalyzedCandidates(ctx, time.Now(), 5)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(jobs) != 5 {
+			t.Fatalf("got %d jobs, want 5", len(jobs))
+		}
+		if jobs[0].SHA256 != lowest {
+			sawNonLowestFirst = true
+			break
+		}
+	}
+	if !sawNonLowestFirst {
+		t.Fatal("random candidate pivot kept returning the lowest SHA first")
 	}
 }

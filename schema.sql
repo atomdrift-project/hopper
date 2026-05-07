@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS samples (
 	created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
 	updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
 	analyzed_at   TIMESTAMPTZ,
+	first_analyzed_at TIMESTAMPTZ,
 	last_error_at TIMESTAMPTZ,
 	mtime         TIMESTAMPTZ,
 	marker_mtime  TIMESTAMPTZ,

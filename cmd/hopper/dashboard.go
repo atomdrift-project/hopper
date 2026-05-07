@@ -641,7 +641,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	}
 	writeWorkflowBacklogs(&buf, workflow.backlogs)
 	writeWorkflowSamples(&buf, "Recent Samples", "Newest rows seen by Hopper", workflow.latestAdded, "created")
-	writeWorkflowSamples(&buf, "Prism Ready", "Newest top-level rows with cleave and litmus results", workflow.latestReady, "created")
+	writeWorkflowSamples(&buf, "Prism Ready", "Top-level rows by first analysis completion", workflow.latestReady, "first_analyzed")
 	writeWorkflowSamples(&buf, "Oldest Pending Cleave", "Claimable top-level rows still missing cleave results", workflow.oldestPending, "updated")
 
 	// Throughput graph
@@ -897,6 +897,8 @@ func writeWorkflowSamples(buf *strings.Builder, label, note string, samples []ho
 		t := s.CreatedAt
 		if timeKind == "updated" {
 			t = s.UpdatedAt
+		} else if timeKind == "first_analyzed" && s.FirstAnalyzedAt != nil {
+			t = *s.FirstAnalyzedAt
 		}
 		name := firstNonEmpty(s.Filename, filepath.Base(s.Path), s.SHA256)
 		fmt.Fprintf(buf,

@@ -112,8 +112,11 @@ func (wt *workerTracker) tryClaimBatch(cands []hopper.ClaimJob, worker string, e
 	now := time.Now()
 	out := make([]hopper.ClaimJob, 0, want)
 	for _, c := range cands {
-		if existing, ok := wt.claims[c.SHA256]; ok && now.Sub(existing.at) < expiry {
-			continue
+		if existing, ok := wt.claims[c.SHA256]; ok {
+			if now.Sub(existing.at) < expiry {
+				continue
+			}
+			wt.decrementActiveLocked(existing.worker)
 		}
 		wt.claims[c.SHA256] = claim{worker: worker, path: c.Path, at: now}
 		out = append(out, c)
@@ -137,6 +140,12 @@ func (wt *workerTracker) tryClaimBatch(cands []hopper.ClaimJob, worker string, e
 	return out
 }
 
+func (wt *workerTracker) decrementActiveLocked(worker string) {
+	if ws := wt.workers[worker]; ws != nil && ws.ActiveClaims > 0 {
+		ws.ActiveClaims--
+	}
+}
+
 // release drops a single claim and decrements the holding worker's
 // ActiveClaims counter. Returns the path that was associated with the
 // claim so the caller can log it without a separate DB lookup. Returns
@@ -149,9 +158,7 @@ func (wt *workerTracker) release(sha string) string {
 		return ""
 	}
 	delete(wt.claims, sha)
-	if ws := wt.workers[c.worker]; ws != nil && ws.ActiveClaims > 0 {
-		ws.ActiveClaims--
-	}
+	wt.decrementActiveLocked(c.worker)
 	return c.path
 }
 
@@ -168,9 +175,7 @@ func (wt *workerTracker) releaseMany(shas []string) {
 			continue
 		}
 		delete(wt.claims, s)
-		if ws := wt.workers[c.worker]; ws != nil && ws.ActiveClaims > 0 {
-			ws.ActiveClaims--
-		}
+		wt.decrementActiveLocked(c.worker)
 	}
 }
 
@@ -186,6 +191,7 @@ func (wt *workerTracker) oldestPerWorker(maxAge time.Duration) map[string]hopper
 	for sha, c := range wt.claims {
 		if c.at.Before(cutoff) {
 			delete(wt.claims, sha)
+			wt.decrementActiveLocked(c.worker)
 			continue
 		}
 		if cur, ok := out[c.worker]; !ok || c.at.Before(cur.ClaimedAt) {
@@ -193,6 +199,19 @@ func (wt *workerTracker) oldestPerWorker(maxAge time.Duration) map[string]hopper
 		}
 	}
 	return out
+}
+
+func (wt *workerTracker) pruneExpiredClaimsLocked(worker string, expiry time.Duration, now time.Time) {
+	if expiry <= 0 {
+		return
+	}
+	cutoff := now.Add(-expiry)
+	for sha, c := range wt.claims {
+		if c.worker == worker && c.at.Before(cutoff) {
+			delete(wt.claims, sha)
+			wt.decrementActiveLocked(c.worker)
+		}
+	}
 }
 
 // update records a worker heartbeat. ActiveClaims/TotalClaimed/LastClaimed
@@ -252,6 +271,7 @@ func (wt *workerTracker) claimLimit(name string) int {
 	if !ok {
 		return maxClaimCount
 	}
+	wt.pruneExpiredClaimsLocked(name, claimExpiry, time.Now())
 	if ws.Analyzed+ws.Errors > 0 {
 		return maxClaimCount // proven worker, no warmup cap
 	}

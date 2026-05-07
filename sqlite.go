@@ -127,6 +127,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 			return fmt.Errorf("hopper: migrate sqlite: %w", err)
 		}
 	}
+	if pragmaHasColumn(ctx, db.lite, "first_analyzed_at") == 0 {
+		if _, err := db.lite.ExecContext(ctx, `ALTER TABLE samples ADD COLUMN first_analyzed_at DATETIME`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite: %w", err)
+		}
+	}
 
 	hasMarkerMtime := pragmaHasColumn(ctx, db.lite, "marker_mtime")
 	if hasMarkerMtime == 0 {
@@ -249,6 +254,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		`CREATE INDEX IF NOT EXISTS idx_samples_claimable ` +
 			`ON samples(updated_at, id) ` +
 			`WHERE cleave_result IS NULL AND skip = '' AND parent = ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_claimable_sha ` +
+			`ON samples(sha256) ` +
+			`WHERE cleave_result IS NULL AND skip = '' AND parent = ''`,
 		// NewestAnalyzedAt
 		`CREATE INDEX IF NOT EXISTS idx_samples_analyzed_at ` +
 			`ON samples(analyzed_at) WHERE analyzed_at IS NOT NULL`,
@@ -258,6 +266,12 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		`CREATE INDEX IF NOT EXISTS idx_samples_top_ready_created ` +
 			`ON samples(created_at DESC, id) ` +
 			`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_top_ready_first_analyzed ` +
+			`ON samples(first_analyzed_at DESC, id) ` +
+			`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND first_analyzed_at IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_top_ready_first_analyzed_coalesce ` +
+			`ON samples(COALESCE(first_analyzed_at, analyzed_at) DESC, id) ` +
+			`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_pending_cleave_group ` +
 			`ON samples(source, feed, ecosystem, updated_at) ` +
 			`WHERE parent = '' AND skip = '' AND cleave_result IS NULL`,
@@ -323,7 +337,7 @@ const liteSampleCols = `id, sha256, source, feed, ecosystem,
 	cleave_result, litmus_result, litmus_score,
 	path, status, note, canonical_sha256, parent, skip,
 	formula, elements, score, max_crit, suspicious_count,
-	created_at, updated_at, analyzed_at, last_error_at, mtime, marker_mtime,
+	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime,
 	traits_version`
 
 // liteSampleColsLight excludes cleave_result and litmus_result to avoid
@@ -333,7 +347,7 @@ const liteSampleColsLight = `id, sha256, source, feed, ecosystem,
 	litmus_score,
 	path, status, note, canonical_sha256, parent, skip,
 	formula, elements, score, max_crit, suspicious_count,
-	created_at, updated_at, analyzed_at, last_error_at, mtime, marker_mtime,
+	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime,
 	traits_version`
 
 func scanLiteSamplesLight(rows *sql.Rows) ([]*Sample, error) {
@@ -342,14 +356,14 @@ func scanLiteSamplesLight(rows *sql.Rows) ([]*Sample, error) {
 	for rows.Next() {
 		s := &Sample{}
 		var status sql.NullString
-		var analyzedAt, lastErrorAt, mtime, markerMtime sql.NullTime
+		var analyzedAt, firstAnalyzedAt, lastErrorAt, mtime, markerMtime sql.NullTime
 		if err := rows.Scan(
 			&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &s.LitmusScore,
 			&s.Path, &status, &s.Note, &s.CanonicalSHA256,
 			&s.Parent, &s.Skip, &s.Formula, &s.Elements,
 			&s.Score, &s.MaxCrit, &s.SuspiciousCount,
-			&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &lastErrorAt, &mtime, &markerMtime,
+			&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &firstAnalyzedAt, &lastErrorAt, &mtime, &markerMtime,
 			&s.TraitsVersion,
 		); err != nil {
 			return nil, err
@@ -357,6 +371,9 @@ func scanLiteSamplesLight(rows *sql.Rows) ([]*Sample, error) {
 		s.Status = status.String
 		if analyzedAt.Valid {
 			s.AnalyzedAt = &analyzedAt.Time
+		}
+		if firstAnalyzedAt.Valid {
+			s.FirstAnalyzedAt = &firstAnalyzedAt.Time
 		}
 		if lastErrorAt.Valid {
 			s.LastErrorAt = &lastErrorAt.Time
@@ -374,23 +391,23 @@ func scanLiteSamplesLight(rows *sql.Rows) ([]*Sample, error) {
 
 func (db *DB) workflowHealthSQLite(ctx context.Context) (WorkflowHealth, error) {
 	var h WorkflowHealth
-	var latestAdded, latestUpdated, latestAnalyzed, latestReady sql.NullTime
+	var latestAdded, latestUpdated, latestAnalyzed, latestReady sqliteNullTime
 	err := db.lite.QueryRowContext(ctx, `
 		SELECT
 			(SELECT created_at FROM samples WHERE parent = '' ORDER BY created_at DESC LIMIT 1),
 			(SELECT max(updated_at) FROM samples WHERE parent = ''),
 			(SELECT max(analyzed_at) FROM samples WHERE parent = '' AND analyzed_at IS NOT NULL),
-			(SELECT created_at FROM samples WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL ORDER BY created_at DESC LIMIT 1),
+			(SELECT COALESCE(first_analyzed_at, analyzed_at) FROM samples WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL ORDER BY COALESCE(first_analyzed_at, analyzed_at) DESC LIMIT 1),
 			(SELECT count(*) FROM samples WHERE parent = '' AND skip = '' AND cleave_result IS NULL),
 			(SELECT count(*) FROM samples WHERE parent = '' AND skip = '' AND cleave_result IS NOT NULL AND litmus_result IS NULL)`,
 	).Scan(&latestAdded, &latestUpdated, &latestAnalyzed, &latestReady, &h.PendingCleave, &h.PendingLitmus)
 	if err != nil {
 		return h, fmt.Errorf("hopper: workflow health: %w", err)
 	}
-	h.LatestAdded = nullTime(latestAdded)
-	h.LatestUpdated = nullTime(latestUpdated)
-	h.LatestAnalyzed = nullTime(latestAnalyzed)
-	h.LatestReady = nullTime(latestReady)
+	h.LatestAdded = nullTime(latestAdded.NullTime)
+	h.LatestUpdated = nullTime(latestUpdated.NullTime)
+	h.LatestAnalyzed = nullTime(latestAnalyzed.NullTime)
+	h.LatestReady = nullTime(latestReady.NullTime)
 	return h, nil
 }
 
@@ -440,7 +457,7 @@ func (db *DB) workflowLatestAddedSQLite(ctx context.Context, limit int) ([]Workf
 
 func (db *DB) workflowLatestReadySQLite(ctx context.Context, limit int) ([]WorkflowSample, error) {
 	return db.workflowSamplesSQLite(ctx,
-		`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL ORDER BY created_at DESC LIMIT ?`, limit)
+		`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL ORDER BY COALESCE(first_analyzed_at, analyzed_at) DESC, id LIMIT ?`, limit)
 }
 
 func (db *DB) workflowOldestPendingSQLite(ctx context.Context, limit int) ([]WorkflowSample, error) {
@@ -451,7 +468,7 @@ func (db *DB) workflowOldestPendingSQLite(ctx context.Context, limit int) ([]Wor
 func (db *DB) workflowSamplesSQLite(ctx context.Context, where string, limit int) ([]WorkflowSample, error) {
 	rows, err := db.lite.QueryContext(ctx, `
 		SELECT sha256, source, feed, ecosystem, filename, path,
-			created_at, updated_at, analyzed_at,
+			created_at, updated_at, analyzed_at, COALESCE(first_analyzed_at, analyzed_at),
 			cleave_result IS NOT NULL,
 			litmus_result IS NOT NULL,
 			COALESCE(CAST(json_extract(litmus_result, '$.class') AS INTEGER), 0)
@@ -463,13 +480,16 @@ func (db *DB) workflowSamplesSQLite(ctx context.Context, where string, limit int
 	out := make([]WorkflowSample, 0, limit)
 	for rows.Next() {
 		var s WorkflowSample
-		var analyzed sql.NullTime
+		var analyzed, firstAnalyzed sqliteNullTime
 		if err := rows.Scan(&s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename, &s.Path,
-			&s.CreatedAt, &s.UpdatedAt, &analyzed, &s.HasCleave, &s.HasLitmus, &s.Criticality); err != nil {
+			&s.CreatedAt, &s.UpdatedAt, &analyzed, &firstAnalyzed, &s.HasCleave, &s.HasLitmus, &s.Criticality); err != nil {
 			return nil, fmt.Errorf("hopper: scan workflow sample: %w", err)
 		}
 		if analyzed.Valid {
 			s.AnalyzedAt = &analyzed.Time
+		}
+		if firstAnalyzed.Valid {
+			s.FirstAnalyzedAt = &firstAnalyzed.Time
 		}
 		out = append(out, s)
 	}
@@ -479,12 +499,12 @@ func (db *DB) workflowSamplesSQLite(ctx context.Context, where string, limit int
 func scanLiteSample(row *sql.Row) (*Sample, error) {
 	s := &Sample{}
 	var cleaveResult, litmusResult, status sql.NullString
-	var analyzedAt, lastErrorAt, mtime, markerMtime sql.NullTime
+	var analyzedAt, firstAnalyzedAt, lastErrorAt, mtime, markerMtime sql.NullTime
 	err := row.Scan(
 		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &s.LitmusScore,
 		&s.Path, &status, &s.Note, &s.CanonicalSHA256, &s.Parent, &s.Skip, &s.Formula,
-		&s.Elements, &s.Score, &s.MaxCrit, &s.SuspiciousCount, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &lastErrorAt, &mtime, &markerMtime,
+		&s.Elements, &s.Score, &s.MaxCrit, &s.SuspiciousCount, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &firstAnalyzedAt, &lastErrorAt, &mtime, &markerMtime,
 		&s.TraitsVersion,
 	)
 
@@ -504,6 +524,9 @@ func scanLiteSample(row *sql.Row) (*Sample, error) {
 	if analyzedAt.Valid {
 		s.AnalyzedAt = &analyzedAt.Time
 	}
+	if firstAnalyzedAt.Valid {
+		s.FirstAnalyzedAt = &firstAnalyzedAt.Time
+	}
 	if lastErrorAt.Valid {
 		s.LastErrorAt = &lastErrorAt.Time
 	}
@@ -522,14 +545,14 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 	for rows.Next() {
 		s := &Sample{}
 		var cleaveResult, litmusResult, status sql.NullString
-		var analyzedAt, lastErrorAt, mtime, markerMtime sql.NullTime
+		var analyzedAt, firstAnalyzedAt, lastErrorAt, mtime, markerMtime sql.NullTime
 		if err := rows.Scan(
 			&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &s.LitmusScore,
 			&s.Path, &status, &s.Note, &s.CanonicalSHA256,
 			&s.Parent, &s.Skip, &s.Formula, &s.Elements,
 			&s.Score, &s.MaxCrit, &s.SuspiciousCount,
-			&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &lastErrorAt, &mtime, &markerMtime,
+			&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &firstAnalyzedAt, &lastErrorAt, &mtime, &markerMtime,
 			&s.TraitsVersion,
 		); err != nil {
 			return nil, err
@@ -543,6 +566,9 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 		s.Status = status.String
 		if analyzedAt.Valid {
 			s.AnalyzedAt = &analyzedAt.Time
+		}
+		if firstAnalyzedAt.Valid {
+			s.FirstAnalyzedAt = &firstAnalyzedAt.Time
 		}
 		if lastErrorAt.Valid {
 			s.LastErrorAt = &lastErrorAt.Time
@@ -559,6 +585,52 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+
+type sqliteNullTime struct {
+	sql.NullTime
+}
+
+func (t *sqliteNullTime) Scan(value any) error {
+	switch v := value.(type) {
+	case nil:
+		t.Valid = false
+		t.Time = time.Time{}
+		return nil
+	case time.Time:
+		t.Time = v
+		t.Valid = true
+		return nil
+	case string:
+		return t.scanString(v)
+	case []byte:
+		return t.scanString(string(v))
+	default:
+		return fmt.Errorf("unsupported sqlite time value %T", value)
+	}
+}
+
+func (t *sqliteNullTime) scanString(s string) error {
+	if s == "" {
+		t.Valid = false
+		t.Time = time.Time{}
+		return nil
+	}
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		"2006-01-02T15:04:05.999999999",
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+	} {
+		parsed, err := time.Parse(layout, s)
+		if err == nil {
+			t.Time = parsed
+			t.Valid = true
+			return nil
+		}
+	}
+	return fmt.Errorf("parse sqlite time %q", s)
+}
 
 func nullableErrorTime(note string) any {
 	if note == "" {
@@ -666,7 +738,7 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		"sha256", "source", "feed", "ecosystem", "filename",
 		"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
 		"parent", "skip", "elements", "max_crit", "suspicious_count",
-		"mtime", "marker_mtime", "cleave_result", "litmus_result", "analyzed_at",
+		"mtime", "marker_mtime", "cleave_result", "litmus_result", "analyzed_at", "first_analyzed_at",
 	}
 	placeholders := make([]string, len(cols))
 	for i := range cols {
@@ -718,12 +790,16 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 	defer locStmt.Close() //nolint:errcheck // best-effort cleanup
 
 	for _, s := range samples {
+		firstAnalyzedAt := s.FirstAnalyzedAt
+		if firstAnalyzedAt == nil {
+			firstAnalyzedAt = s.AnalyzedAt
+		}
 		res, err := stmt.ExecContext(ctx,
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 			s.SHA256, s.Parent, s.Skip, s.Elements,
 			s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
-			jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult), s.AnalyzedAt)
+			jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult), s.AnalyzedAt, firstAnalyzedAt)
 		if err != nil {
 			return 0, nil, fmt.Errorf("hopper: batch insert %s: %w", s.SHA256, err)
 		}
@@ -886,11 +962,12 @@ func (db *DB) updateCleaveResultSQLite(
 			litmus_result = NULL,
 			note = '', last_error_at = NULL,
 			traits_version = ?,
+			first_analyzed_at = COALESCE(first_analyzed_at, ?),
 			analyzed_at = ?, updated_at = ?
 		WHERE sha256 = ?`,
 		string(result), canonical, fi.Elements,
 		fi.MaxCrit, fi.SuspiciousCount,
-		traitsVersion, n, n, sha256)
+		traitsVersion, n, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
 	}
@@ -1175,10 +1252,11 @@ func (db *DB) updateSampleSQLite(ctx context.Context, sha256, status string, res
 			max_crit = ?, suspicious_count = ?,
 			litmus_result = NULL,
 			note = '', last_error_at = NULL,
+			first_analyzed_at = COALESCE(first_analyzed_at, ?),
 			analyzed_at = ?, updated_at = ?
 		WHERE sha256 = ?`,
 		status, string(result), canonical,
-		fi.Elements, fi.MaxCrit, fi.SuspiciousCount, n, n, sha256)
+		fi.Elements, fi.MaxCrit, fi.SuspiciousCount, n, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update sample: %w", err)
 	}
@@ -1940,12 +2018,34 @@ func (db *DB) feedEcosystemsSQLite(ctx context.Context, source, label string) ([
 
 func (db *DB) unanalyzedCandidatesSQLite(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
 	startCutoff := hopperStart.UTC().Format(time.RFC3339Nano)
+	pivot := randomSHA256Pivot()
 	return queryLiteCandidates(ctx, db.lite,
-		`SELECT sha256, path, size_bytes, file_type FROM samples
-		WHERE cleave_result IS NULL AND skip = '' AND parent = ''
-		  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
-		ORDER BY updated_at ASC, id
-		LIMIT ?`, startCutoff, limit)
+		`WITH picked AS (
+			SELECT sha256, path, size_bytes, file_type, 0 AS pass
+			FROM samples
+			WHERE sha256 >= ?
+			  AND cleave_result IS NULL AND skip = '' AND parent = ''
+			  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
+			ORDER BY sha256
+			LIMIT ?
+		),
+		wrapped AS (
+			SELECT sha256, path, size_bytes, file_type, 1 AS pass
+			FROM samples
+			WHERE sha256 < ?
+			  AND cleave_result IS NULL AND skip = '' AND parent = ''
+			  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
+			ORDER BY sha256
+			LIMIT ?
+		)
+		SELECT sha256, path, size_bytes, file_type
+		FROM (
+			SELECT * FROM picked
+			UNION ALL
+			SELECT * FROM wrapped
+		)
+		ORDER BY pass, sha256
+		LIMIT ?`, pivot, startCutoff, limit, pivot, startCutoff, limit, limit)
 }
 
 func (db *DB) forceRescanCandidatesSQLite(ctx context.Context, hopperStart time.Time, prefixes []string, limit int) ([]ClaimJob, error) {

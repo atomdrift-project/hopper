@@ -54,12 +54,44 @@ func TestWorkerTrackerClaimExpiry(t *testing.T) {
 	if len(got) != 1 || got[0].SHA256 != "exp1" {
 		t.Fatalf("zero-expiry steal: got %+v, want [{exp1 ...}]", got)
 	}
+	if wt.activeClaims("w1") != 0 || wt.activeClaims("w2") != 1 {
+		t.Fatalf("active claims after steal: w1=%d w2=%d, want 0/1", wt.activeClaims("w1"), wt.activeClaims("w2"))
+	}
+}
+
+func TestWorkerTrackerClaimLimitPrunesExpiredClaims(t *testing.T) {
+	wt := newWorkerTracker()
+	cands := make([]hopper.ClaimJob, maxClaimCount)
+	for i := range cands {
+		cands[i] = hopper.ClaimJob{SHA256: string(rune('a' + i)), Path: "p/x"}
+	}
+	if got := wt.tryClaimBatch(cands, "w1", time.Minute, maxClaimCount); len(got) != maxClaimCount {
+		t.Fatalf("first claim: got %d, want %d", len(got), maxClaimCount)
+	}
+	if got := wt.claimLimit("w1"); got != 0 {
+		t.Fatalf("fresh claimLimit = %d, want 0", got)
+	}
+
+	wt.mu.Lock()
+	for sha, c := range wt.claims {
+		c.at = time.Now().Add(-claimExpiry - time.Minute)
+		wt.claims[sha] = c
+	}
+	wt.mu.Unlock()
+
+	if got := wt.claimLimit("w1"); got != maxClaimCount {
+		t.Fatalf("expired claimLimit = %d, want %d", got, maxClaimCount)
+	}
+	if got := wt.activeClaims("w1"); got != 0 {
+		t.Fatalf("active claims after prune = %d, want 0", got)
+	}
 }
 
 func TestWorkerTrackerOldestPerWorkerPrunesStale(t *testing.T) {
 	wt := newWorkerTracker()
 	wt.claims["fresh"] = claim{worker: "w1", path: "fresh.bin", at: time.Now()}
 	wt.claims["stale"] = claim{worker: "w1", path: "stale.bin", at: time.Now().Add(-time.Hour)}
+	wt.workers["w1"] = &workerStats{ActiveClaims: 2}
 
 	out := wt.oldestPerWorker(time.Minute)
 	if len(out) != 1 || out["w1"].Path != "fresh.bin" {
@@ -67,6 +99,9 @@ func TestWorkerTrackerOldestPerWorkerPrunesStale(t *testing.T) {
 	}
 	if _, stillThere := wt.claims["stale"]; stillThere {
 		t.Fatal("stale claim was not pruned during oldestPerWorker walk")
+	}
+	if got := wt.activeClaims("w1"); got != 1 {
+		t.Fatalf("active claims after stale prune = %d, want 1", got)
 	}
 }
 

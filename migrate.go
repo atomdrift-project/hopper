@@ -124,12 +124,12 @@ func migrateLegacySQLite(ctx context.Context, dst *DB, rows *sql.Rows, total int
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO samples (sha256, source, filename, label, label_source,
 				path, status, cleave_result,
-				canonical_sha256, analyzed_at, updated_at)
-			VALUES (?, 'legacy', ?, ?, 'legacy', ?, ?, ?, ?, ?, ?)
+				canonical_sha256, analyzed_at, first_analyzed_at, updated_at)
+			VALUES (?, 'legacy', ?, ?, 'legacy', ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (sha256) DO NOTHING`,
 			sha256, filepath.Base(path), label, path, status,
 			cleaveResult,
-			canonical, analyzedAt, updatedTS)
+			canonical, analyzedAt, analyzedAt, updatedTS)
 		if err != nil {
 			slog.Warn("skipping legacy sample", "sha256", sha256, "error", err)
 			continue
@@ -167,22 +167,22 @@ const legacyBatchSize = 1000
 var legacyStagingCols = []string{
 	"sha256", "source", "filename", "label", "label_source",
 	"path", "status", "cleave_result",
-	"canonical_sha256", "analyzed_at", "updated_at",
+	"canonical_sha256", "analyzed_at", "first_analyzed_at", "updated_at",
 }
 
 const legacyStagingDDL = `CREATE TEMP TABLE _staging (
 	sha256 TEXT, source TEXT, filename TEXT, label TEXT, label_source TEXT,
 	path TEXT, status TEXT,
 	cleave_result JSONB, canonical_sha256 TEXT,
-	analyzed_at TIMESTAMPTZ, updated_at TIMESTAMPTZ
+	analyzed_at TIMESTAMPTZ, first_analyzed_at TIMESTAMPTZ, updated_at TIMESTAMPTZ
 ) ON COMMIT DROP`
 
 const legacyStagingInsert = `INSERT INTO samples (sha256, source, filename, label, label_source,
 	path, status, cleave_result,
-	canonical_sha256, analyzed_at, updated_at)
+	canonical_sha256, analyzed_at, first_analyzed_at, updated_at)
 SELECT sha256, source, filename, label, label_source,
 	path, status, cleave_result,
-	canonical_sha256, analyzed_at, updated_at
+	canonical_sha256, analyzed_at, first_analyzed_at, updated_at
 FROM _staging
 ON CONFLICT (sha256) DO NOTHING`
 
@@ -256,7 +256,7 @@ func migrateLegacyPG(ctx context.Context, dst *DB, rows *sql.Rows, total int64) 
 		batch = append(batch, []any{
 			sha256, "legacy", filepath.Base(path), label, "legacy",
 			path, status, cleaveResult,
-			canonical, analyzedAt, updatedTS,
+			canonical, analyzedAt, analyzedAt, updatedTS,
 		})
 
 		if len(batch) >= legacyBatchSize {
@@ -433,14 +433,14 @@ func eachSampleSQLite(ctx context.Context, db *DB, afterID int64, fn func(*Sampl
 	for rows.Next() {
 		s := &Sample{}
 		var cleaveResult, litmusResult, status sql.NullString
-		var analyzedAt, lastErrorAt, mtime, markerMtime sql.NullTime
+		var analyzedAt, firstAnalyzedAt, lastErrorAt, mtime, markerMtime sql.NullTime
 		if err := rows.Scan(&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &s.LitmusScore,
 			&s.Path, &status, &s.Note, &s.CanonicalSHA256,
 			&s.Parent, &s.Skip, &s.Formula, &s.Elements,
 			&s.Score, &s.MaxCrit, &s.SuspiciousCount,
 			&s.CreatedAt, &s.UpdatedAt,
-			&analyzedAt, &lastErrorAt, &mtime, &markerMtime,
+			&analyzedAt, &firstAnalyzedAt, &lastErrorAt, &mtime, &markerMtime,
 			&s.TraitsVersion); err != nil {
 			return fmt.Errorf("scan sample: %w", err)
 		}
@@ -453,6 +453,9 @@ func eachSampleSQLite(ctx context.Context, db *DB, afterID int64, fn func(*Sampl
 		s.Status = status.String
 		if analyzedAt.Valid {
 			s.AnalyzedAt = &analyzedAt.Time
+		}
+		if firstAnalyzedAt.Valid {
+			s.FirstAnalyzedAt = &firstAnalyzedAt.Time
 		}
 		if lastErrorAt.Valid {
 			s.LastErrorAt = &lastErrorAt.Time
@@ -529,7 +532,7 @@ var sampleStagingCols = []string{
 	"size_bytes", "label", "label_source", "path", "status",
 	"note", "canonical_sha256", "parent", "skip", "elements", "max_crit", "suspicious_count",
 	"cleave_result", "litmus_result",
-	"analyzed_at", "last_error_at", "created_at", "updated_at", "mtime", "marker_mtime",
+	"analyzed_at", "first_analyzed_at", "last_error_at", "created_at", "updated_at", "mtime", "marker_mtime",
 	"traits_version",
 }
 
@@ -539,7 +542,7 @@ const sampleStagingDDL = `CREATE TEMP TABLE _staging (
 	path TEXT, status TEXT, note TEXT, canonical_sha256 TEXT,
 	parent TEXT, skip TEXT, elements TEXT, max_crit INTEGER, suspicious_count INTEGER,
 	cleave_result JSONB, litmus_result JSONB,
-	analyzed_at TIMESTAMPTZ, last_error_at TIMESTAMPTZ, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ,
+	analyzed_at TIMESTAMPTZ, first_analyzed_at TIMESTAMPTZ, last_error_at TIMESTAMPTZ, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ,
 	traits_version TEXT NOT NULL DEFAULT ''
 ) ON COMMIT DROP`
 
@@ -547,24 +550,28 @@ const sampleStagingInsert = `INSERT INTO samples (sha256, source, feed, ecosyste
 	size_bytes, label, label_source, path, status, note, canonical_sha256,
 	parent, skip, elements, max_crit, suspicious_count,
 	cleave_result, litmus_result,
-	analyzed_at, last_error_at, created_at, updated_at, mtime, marker_mtime, traits_version)
+	analyzed_at, first_analyzed_at, last_error_at, created_at, updated_at, mtime, marker_mtime, traits_version)
 SELECT sha256, source, feed, ecosystem, filename,
 	size_bytes, label, label_source, path, status,
 	note, canonical_sha256, parent, skip, elements, max_crit, suspicious_count,
 	cleave_result, litmus_result,
-	analyzed_at, last_error_at, created_at, updated_at, mtime, marker_mtime, traits_version
+	analyzed_at, first_analyzed_at, last_error_at, created_at, updated_at, mtime, marker_mtime, traits_version
 FROM _staging
 ON CONFLICT (sha256) DO NOTHING`
 
 func flushSamplesPG(ctx context.Context, dst *DB, samples []*Sample) (int64, error) {
 	rows := make([][]any, len(samples))
 	for i, s := range samples {
+		firstAnalyzedAt := s.FirstAnalyzedAt
+		if firstAnalyzedAt == nil {
+			firstAnalyzedAt = s.AnalyzedAt
+		}
 		rows[i] = []any{
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 			s.Note, s.CanonicalSHA256, s.Parent, s.Skip, s.Elements, s.MaxCrit, s.SuspiciousCount,
 			sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult),
-			s.AnalyzedAt, s.LastErrorAt, s.CreatedAt, s.UpdatedAt, s.Mtime, s.MarkerMtime,
+			s.AnalyzedAt, firstAnalyzedAt, s.LastErrorAt, s.CreatedAt, s.UpdatedAt, s.Mtime, s.MarkerMtime,
 			s.TraitsVersion,
 		}
 	}
@@ -579,6 +586,10 @@ func flushSamplesSQLite(ctx context.Context, dst *DB, samples []*Sample) (int64,
 
 	var inserted int64
 	for _, s := range samples {
+		firstAnalyzedAt := s.FirstAnalyzedAt
+		if firstAnalyzedAt == nil {
+			firstAnalyzedAt = s.AnalyzedAt
+		}
 		var cr, lr sql.NullString
 		if s.CleaveResult != nil {
 			cr = sql.NullString{String: string(s.CleaveResult), Valid: true}
@@ -590,13 +601,13 @@ func flushSamplesSQLite(ctx context.Context, dst *DB, samples []*Sample) (int64,
 			INSERT INTO samples (sha256, source, feed, ecosystem, filename,
 				size_bytes, label, label_source, path, status, note, canonical_sha256,
 				parent, skip, elements, max_crit, suspicious_count, cleave_result, litmus_result,
-				analyzed_at, last_error_at, created_at, updated_at, mtime, marker_mtime, traits_version)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				analyzed_at, first_analyzed_at, last_error_at, created_at, updated_at, mtime, marker_mtime, traits_version)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (sha256) DO NOTHING`,
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 			s.Note, s.CanonicalSHA256, s.Parent, s.Skip, s.Elements, s.MaxCrit, s.SuspiciousCount, cr, lr,
-			s.AnalyzedAt, s.LastErrorAt, s.CreatedAt, s.UpdatedAt, s.Mtime, s.MarkerMtime, s.TraitsVersion)
+			s.AnalyzedAt, firstAnalyzedAt, s.LastErrorAt, s.CreatedAt, s.UpdatedAt, s.Mtime, s.MarkerMtime, s.TraitsVersion)
 		if err != nil {
 			if rollbackErr := tx.Rollback(); rollbackErr != nil {
 				slog.Debug("rollback after insert failure failed", "error", rollbackErr)

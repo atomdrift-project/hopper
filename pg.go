@@ -69,6 +69,7 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 		`CREATE INDEX IF NOT EXISTS idx_samples_score ON samples(score) WHERE score != 0`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS mtime TIMESTAMPTZ`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS last_error_at TIMESTAMPTZ`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS first_analyzed_at TIMESTAMPTZ`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS marker_mtime TIMESTAMPTZ`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source ON samples(source, label, analyzed_at DESC NULLS LAST) WHERE cleave_result IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_mtime ON samples(source, label, mtime DESC NULLS LAST) WHERE cleave_result IS NOT NULL`,
@@ -107,6 +108,9 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 		`CREATE INDEX IF NOT EXISTS idx_samples_claimable ` +
 			`ON samples(updated_at ASC NULLS FIRST, id) ` +
 			`WHERE cleave_result IS NULL AND skip = '' AND parent = ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_claimable_sha ` +
+			`ON samples(sha256) ` +
+			`WHERE cleave_result IS NULL AND skip = '' AND parent = ''`,
 		// Covers the dashboard's OldestClaims query (DISTINCT ON claimed_by, ORDER BY claimed_at).
 		`CREATE INDEX IF NOT EXISTS idx_samples_claimed ON samples(claimed_by, claimed_at) WHERE claimed_by != ''`,
 		// newestAnalyzedAtPG: MAX(analyzed_at) — index-only max scan.
@@ -127,6 +131,12 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 		`CREATE INDEX IF NOT EXISTS idx_samples_top_ready_created ` +
 			`ON samples(created_at DESC, id) ` +
 			`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_top_ready_first_analyzed ` +
+			`ON samples(first_analyzed_at DESC, id) ` +
+			`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND first_analyzed_at IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_top_ready_first_analyzed_coalesce ` +
+			`ON samples((COALESCE(first_analyzed_at, analyzed_at)) DESC, id) ` +
+			`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL`,
 		// Workflow dashboard backlog grouping. Keep these separate so each side
 		// of the queue can be counted without a heap-wide OR scan.
 		`CREATE INDEX IF NOT EXISTS idx_samples_pending_cleave_group ` +
@@ -507,14 +517,14 @@ func (db *DB) invalidPGIndex(ctx context.Context, indexName string) (bool, error
 const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, cleave_result, litmus_result, litmus_score,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
-	created_at, updated_at, analyzed_at, last_error_at, mtime, marker_mtime, traits_version`
+	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime, traits_version`
 
 // pgSampleColsLight excludes cleave_result and litmus_result to avoid loading
 // potentially large JSON blobs when only metadata is needed (e.g. claim queries).
 const pgSampleColsLight = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, litmus_score,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
-	created_at, updated_at, analyzed_at, last_error_at, mtime, marker_mtime, traits_version`
+	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime, traits_version`
 
 func pgSampleDest(s *Sample) []any {
 	return []any{
@@ -523,7 +533,7 @@ func pgSampleDest(s *Sample) []any {
 		&s.Path, &s.Status, &s.Note, &s.CanonicalSHA256,
 		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score,
 		&s.MaxCrit, &s.SuspiciousCount,
-		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.LastErrorAt, &s.Mtime, &s.MarkerMtime,
+		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.FirstAnalyzedAt, &s.LastErrorAt, &s.Mtime, &s.MarkerMtime,
 		&s.TraitsVersion,
 	}
 }
@@ -535,7 +545,7 @@ func pgSampleDestLight(s *Sample) []any {
 		&s.Path, &s.Status, &s.Note, &s.CanonicalSHA256,
 		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score,
 		&s.MaxCrit, &s.SuspiciousCount,
-		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.LastErrorAt, &s.Mtime, &s.MarkerMtime,
+		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.FirstAnalyzedAt, &s.LastErrorAt, &s.Mtime, &s.MarkerMtime,
 		&s.TraitsVersion,
 	}
 }
@@ -586,7 +596,7 @@ func (db *DB) workflowHealthPG(ctx context.Context) (WorkflowHealth, error) {
 			(SELECT created_at FROM samples WHERE parent = '' ORDER BY created_at DESC LIMIT 1),
 			(SELECT max(updated_at) FROM samples WHERE parent = ''),
 			(SELECT max(analyzed_at) FROM samples WHERE parent = '' AND analyzed_at IS NOT NULL),
-			(SELECT created_at FROM samples WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL ORDER BY created_at DESC LIMIT 1),
+			(SELECT COALESCE(first_analyzed_at, analyzed_at) FROM samples WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL ORDER BY COALESCE(first_analyzed_at, analyzed_at) DESC LIMIT 1),
 			(SELECT count(*) FROM samples WHERE parent = '' AND skip = '' AND cleave_result IS NULL),
 			(SELECT count(*) FROM samples WHERE parent = '' AND skip = '' AND cleave_result IS NOT NULL AND litmus_result IS NULL)`,
 	).Scan(&latestAdded, &latestUpdated, &latestAnalyzed, &latestReady, &h.PendingCleave, &h.PendingLitmus)
@@ -646,7 +656,7 @@ func (db *DB) workflowLatestAddedPG(ctx context.Context, limit int) ([]WorkflowS
 
 func (db *DB) workflowLatestReadyPG(ctx context.Context, limit int) ([]WorkflowSample, error) {
 	return db.workflowSamplesPG(ctx,
-		`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL ORDER BY created_at DESC LIMIT $1`, limit)
+		`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL ORDER BY COALESCE(first_analyzed_at, analyzed_at) DESC, id LIMIT $1`, limit)
 }
 
 func (db *DB) workflowOldestPendingPG(ctx context.Context, limit int) ([]WorkflowSample, error) {
@@ -657,7 +667,7 @@ func (db *DB) workflowOldestPendingPG(ctx context.Context, limit int) ([]Workflo
 func (db *DB) workflowSamplesPG(ctx context.Context, where string, limit int) ([]WorkflowSample, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT sha256, source, feed, ecosystem, filename, path,
-			created_at, updated_at, analyzed_at,
+			created_at, updated_at, analyzed_at, COALESCE(first_analyzed_at, analyzed_at),
 			cleave_result IS NOT NULL,
 			litmus_result IS NOT NULL,
 			COALESCE((litmus_result->>'class')::int, 0)
@@ -673,13 +683,16 @@ func scanWorkflowSamplesPG(rows pgx.Rows, limit int) ([]WorkflowSample, error) {
 	out := make([]WorkflowSample, 0, limit)
 	for rows.Next() {
 		var s WorkflowSample
-		var analyzed sql.NullTime
+		var analyzed, firstAnalyzed sql.NullTime
 		if err := rows.Scan(&s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename, &s.Path,
-			&s.CreatedAt, &s.UpdatedAt, &analyzed, &s.HasCleave, &s.HasLitmus, &s.Criticality); err != nil {
+			&s.CreatedAt, &s.UpdatedAt, &analyzed, &firstAnalyzed, &s.HasCleave, &s.HasLitmus, &s.Criticality); err != nil {
 			return nil, fmt.Errorf("hopper: scan workflow sample: %w", err)
 		}
 		if analyzed.Valid {
 			s.AnalyzedAt = &analyzed.Time
+		}
+		if firstAnalyzed.Valid {
+			s.FirstAnalyzedAt = &firstAnalyzed.Time
 		}
 		out = append(out, s)
 	}
@@ -771,7 +784,7 @@ var insertBatchStagingCols = []string{
 	"sha256", "source", "feed", "ecosystem", "filename",
 	"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
 	"parent", "skip", "elements", "max_crit", "suspicious_count",
-	"mtime", "marker_mtime", "cleave_result", "litmus_result", "analyzed_at",
+	"mtime", "marker_mtime", "cleave_result", "litmus_result", "analyzed_at", "first_analyzed_at",
 }
 
 const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
@@ -781,7 +794,7 @@ const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 	parent TEXT, skip TEXT, elements TEXT,
 	max_crit INTEGER, suspicious_count INTEGER,
 	mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ,
-	cleave_result JSONB, litmus_result JSONB, analyzed_at TIMESTAMPTZ
+	cleave_result JSONB, litmus_result JSONB, analyzed_at TIMESTAMPTZ, first_analyzed_at TIMESTAMPTZ
 ) ON COMMIT DROP`
 
 // file_type, score, formula, and litmus_score are GENERATED columns on
@@ -794,13 +807,13 @@ const insertBatchStagingInsert = `INSERT INTO samples (
 	size_bytes, label, label_source, path, status,
 	canonical_sha256, parent, skip, elements,
 	max_crit, suspicious_count, mtime, marker_mtime,
-	cleave_result, litmus_result, analyzed_at)
+	cleave_result, litmus_result, analyzed_at, first_analyzed_at)
 SELECT DISTINCT ON (sha256)
 	sha256, source, feed, ecosystem, filename,
 	size_bytes, label, label_source, path, status,
 	canonical_sha256, parent, skip, elements,
 	max_crit, suspicious_count, mtime, marker_mtime,
-	cleave_result, litmus_result, analyzed_at
+	cleave_result, litmus_result, analyzed_at, first_analyzed_at
 FROM _staging
 ON CONFLICT (sha256) DO UPDATE SET
 	feed  = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE samples.feed END,
@@ -826,11 +839,15 @@ WHERE EXCLUDED.parent = ''
 func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inserted int64, needsAnalysis []string, err error) {
 	rows := make([][]any, len(samples))
 	for i, s := range samples {
+		firstAnalyzedAt := s.FirstAnalyzedAt
+		if firstAnalyzedAt == nil {
+			firstAnalyzedAt = s.AnalyzedAt
+		}
 		rows[i] = []any{
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256,
 			s.Parent, s.Skip, s.Elements, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
-			sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult), s.AnalyzedAt,
+			sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult), s.AnalyzedAt, firstAnalyzedAt,
 		}
 	}
 
@@ -992,6 +1009,7 @@ func (db *DB) updateCleaveResultPG(
 			litmus_result = NULL,
 			note = '', last_error_at = NULL,
 			traits_version = $7,
+			first_analyzed_at = COALESCE(first_analyzed_at, now()),
 			analyzed_at = now(), updated_at = now()
 		WHERE sha256 = $1`,
 		sha256, sanitizeJSONB(result), canonical,
@@ -1293,6 +1311,7 @@ func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result 
 			max_crit = $6, suspicious_count = $7,
 			litmus_result = NULL,
 			note = '', last_error_at = NULL,
+			first_analyzed_at = COALESCE(first_analyzed_at, now()),
 			analyzed_at = now(), updated_at = now()
 		WHERE sha256 = $1`,
 		sha256, status, sanitizeJSONB(result), canonical,
@@ -2072,15 +2091,38 @@ func scanPGCounts(rows pgx.Rows) (map[string]int, error) {
 // already held by other workers.
 
 // unanalyzedCandidatesPG returns Tier 1 work (samples that have never been
-// analyzed). Index-ordered scan via idx_samples_claimable, no sort.
+// analyzed). A random SHA pivot avoids time/path clustering and spreads
+// concurrent pollers across the queue without ORDER BY random().
 func (db *DB) unanalyzedCandidatesPG(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
+	pivot := randomSHA256Pivot()
 	rows, err := db.pool.Query(ctx, `
-		SELECT sha256, path, size_bytes, file_type FROM samples
-		WHERE cleave_result IS NULL AND skip = '' AND parent = ''
-		  AND (note = '' OR last_error_at IS NULL OR last_error_at < $1)
-		ORDER BY updated_at ASC NULLS FIRST, id
-		LIMIT $2`,
-		hopperStart.UTC(), limit)
+		WITH picked AS (
+			SELECT sha256, path, size_bytes, file_type, 0 AS pass
+			FROM samples
+			WHERE sha256 >= $2
+			  AND cleave_result IS NULL AND skip = '' AND parent = ''
+			  AND (note = '' OR last_error_at IS NULL OR last_error_at < $1)
+			ORDER BY sha256
+			LIMIT $3
+		),
+		wrapped AS (
+			SELECT sha256, path, size_bytes, file_type, 1 AS pass
+			FROM samples
+			WHERE sha256 < $2
+			  AND cleave_result IS NULL AND skip = '' AND parent = ''
+			  AND (note = '' OR last_error_at IS NULL OR last_error_at < $1)
+			ORDER BY sha256
+			LIMIT $3
+		)
+		SELECT sha256, path, size_bytes, file_type
+		FROM (
+			SELECT * FROM picked
+			UNION ALL
+			SELECT * FROM wrapped
+		) q
+		ORDER BY pass, sha256
+		LIMIT $3`,
+		hopperStart.UTC(), pivot, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: unanalyzed candidates: %w", err)
 	}

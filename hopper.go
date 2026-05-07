@@ -9,8 +9,11 @@ package hopper
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
+	cryptosha256 "crypto/sha256"
 	"database/sql"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -91,6 +94,60 @@ func sanitizeJSONB(b []byte) []byte {
 	return out
 }
 
+func randomSHA256Pivot() string {
+	var b [32]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		sum := cryptosha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
+		return hex.EncodeToString(sum[:])
+	}
+	return hex.EncodeToString(b[:])
+}
+
+func compactCleaveResultForStorage(sha256 string, result []byte) []byte {
+	if len(result) == 0 {
+		return result
+	}
+	var envelope map[string]json.RawMessage
+	if json.Unmarshal(result, &envelope) != nil {
+		return result
+	}
+	var files []json.RawMessage
+	if json.Unmarshal(envelope["fs"], &files) != nil || len(files) <= 1 {
+		return result
+	}
+
+	top := 0
+	for i, raw := range files {
+		var f struct {
+			SHA256 string `json:"sha"`
+			Depth  int    `json:"dp"`
+		}
+		if json.Unmarshal(raw, &f) != nil {
+			continue
+		}
+		if f.SHA256 == sha256 {
+			top = i
+			break
+		}
+		if f.Depth == 0 {
+			top = i
+		}
+	}
+
+	compactFS, err := json.Marshal([]json.RawMessage{files[top]})
+	if err != nil {
+		return result
+	}
+	envelope["fs"] = compactFS
+	envelope["truncated"] = json.RawMessage(`true`)
+	envelope["omitted_files"] = json.RawMessage(fmt.Sprintf("%d", len(files)-1))
+	compact, err := json.Marshal(envelope)
+	if err != nil {
+		return result
+	}
+	return compact
+}
+
 func isHex(c byte) bool {
 	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
@@ -155,6 +212,7 @@ type Sample struct {
 	Elements        string // formula without counts (qualitative composition)
 	TraitsVersion   string // short prefix of traits repo commit used for analysis
 	AnalyzedAt      *time.Time
+	FirstAnalyzedAt *time.Time
 	LastErrorAt     *time.Time
 	Mtime           *time.Time
 	MarkerMtime     *time.Time
@@ -221,18 +279,19 @@ type WorkflowBacklog struct {
 
 // WorkflowSample is a light sample row for dashboard recency tables.
 type WorkflowSample struct {
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-	AnalyzedAt  *time.Time
-	SHA256      string
-	Source      string
-	Feed        string
-	Ecosystem   string
-	Filename    string
-	Path        string
-	HasCleave   bool
-	HasLitmus   bool
-	Criticality int
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	AnalyzedAt      *time.Time
+	FirstAnalyzedAt *time.Time
+	SHA256          string
+	Source          string
+	Feed            string
+	Ecosystem       string
+	Filename        string
+	Path            string
+	HasCleave       bool
+	HasLitmus       bool
+	Criticality     int
 }
 
 // Report is an analysis report produced by cyclotron.
@@ -485,6 +544,7 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 			Parent:          parent.SHA256,
 			Skip:            skip,
 			AnalyzedAt:      parent.AnalyzedAt,
+			FirstAnalyzedAt: firstNonNilTime(parent.FirstAnalyzedAt, parent.AnalyzedAt),
 		})
 	}
 
@@ -493,6 +553,15 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 	}
 	n, _, err := db.InsertSampleBatch(ctx, members)
 	return n, err
+}
+
+func firstNonNilTime(times ...*time.Time) *time.Time {
+	for _, t := range times {
+		if t != nil {
+			return t
+		}
+	}
+	return nil
 }
 
 func litmusResultForMember(parent []byte, id int) []byte {
@@ -793,13 +862,13 @@ func (db *DB) SampleBySHA256(ctx context.Context, sha256 string) (*Sample, error
 // avoiding the cost of reading the full row (especially the large cleave_result
 // JSONB column which the caller already has).
 func (db *DB) SampleParentInfo(ctx context.Context, sha256 string) (*Sample, error) {
-	const cols = `sha256, path, label, label_source, source, feed, ecosystem, canonical_sha256, litmus_result, analyzed_at`
+	const cols = `sha256, path, label, label_source, source, feed, ecosystem, canonical_sha256, litmus_result, analyzed_at, first_analyzed_at`
 	var s Sample
 	var litmus []byte
-	var analyzedAt sql.NullTime
+	var analyzedAt, firstAnalyzedAt sql.NullTime
 	scan := func(row interface{ Scan(...any) error }) error {
 		return row.Scan(&s.SHA256, &s.Path, &s.Label, &s.LabelSource,
-			&s.Source, &s.Feed, &s.Ecosystem, &s.CanonicalSHA256, &litmus, &analyzedAt)
+			&s.Source, &s.Feed, &s.Ecosystem, &s.CanonicalSHA256, &litmus, &analyzedAt, &firstAnalyzedAt)
 	}
 	var err error
 	if db.pool != nil {
@@ -816,6 +885,9 @@ func (db *DB) SampleParentInfo(ctx context.Context, sha256 string) (*Sample, err
 	s.LitmusResult = litmus
 	if analyzedAt.Valid {
 		s.AnalyzedAt = &analyzedAt.Time
+	}
+	if firstAnalyzedAt.Valid {
+		s.FirstAnalyzedAt = &firstAnalyzedAt.Time
 	}
 	return &s, nil
 }
@@ -838,6 +910,7 @@ func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []by
 	if p.FileInfo.FileType == "" {
 		return db.DeleteSample(ctx, sha256)
 	}
+	result = compactCleaveResultForStorage(sha256, result)
 	if db.pool != nil {
 		return db.updateCleaveResultPG(ctx, sha256, result, p.CanonicalSHA, p.FileInfo, traitsVersion)
 	}
@@ -1011,8 +1084,8 @@ func (db *DB) NewestAnalyzedAt(ctx context.Context) (time.Time, error) {
 }
 
 // UnanalyzedCandidates returns up to limit Tier 1 jobs (samples that have
-// never been analyzed) in priority order. Claim ownership lives in memory
-// in the API server — this is a pure SELECT.
+// never been analyzed). Claim ownership lives in memory in the API server —
+// this is a pure SELECT.
 func (db *DB) UnanalyzedCandidates(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
 	if db.pool != nil {
 		return db.unanalyzedCandidatesPG(ctx, hopperStart, limit)
@@ -1350,6 +1423,7 @@ func (db *DB) UpdateSample(ctx context.Context, sha256, status string, result []
 	if fi.FileType == "" {
 		return db.DeleteSample(ctx, sha256)
 	}
+	result = compactCleaveResultForStorage(sha256, result)
 	if db.pool != nil {
 		return db.updateSamplePG(ctx, sha256, status, result, canonicalSHA256, fi)
 	}
