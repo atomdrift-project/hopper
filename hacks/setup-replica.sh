@@ -23,7 +23,6 @@ LOCAL_USER="${LOCAL_USER:-hopper}"
 PUBLICATION="${PUBLICATION:-hopper_replica}"
 SUBSCRIPTION="${SUBSCRIPTION:-hopper_replica}"
 LEGACY_PUBLICATION="${LEGACY_PUBLICATION:-hopper_training}"
-LEGACY_SUBSCRIPTION="${LEGACY_SUBSCRIPTION:-hopper_training_sub}"
 PGPASS="${PGPASSFILE:-$HOME/.pgpass}"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -39,7 +38,6 @@ validate_ident() {
 validate_ident PUBLICATION "$PUBLICATION"
 validate_ident SUBSCRIPTION "$SUBSCRIPTION"
 validate_ident LEGACY_PUBLICATION "$LEGACY_PUBLICATION"
-validate_ident LEGACY_SUBSCRIPTION "$LEGACY_SUBSCRIPTION"
 
 # --- Sanity checks ---------------------------------------------------------
 command -v pg_isready >/dev/null 2>&1 || die "pg_isready not found; install postgres client tools"
@@ -163,19 +161,12 @@ fi
 # a DISABLE and still be holding locks even though the sub reads disabled.
 # The subscription block below re-ENABLEs it after the migration finishes.
 if admin -d "$LOCAL_DB" -tAc \
-        "SELECT 1 FROM pg_subscription WHERE subname IN ('$SUBSCRIPTION', '$LEGACY_SUBSCRIPTION') LIMIT 1" \
+        "SELECT 1 FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" \
         | grep -q 1; then
-    log "Stopping replica subscription(s) during schema migration"
-    for sub in "$SUBSCRIPTION" "$LEGACY_SUBSCRIPTION"; do
-        if admin -d "$LOCAL_DB" -tAc \
-                "SELECT 1 FROM pg_subscription WHERE subname = '$sub'" \
-                | grep -q 1; then
-            admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -v sub="$sub" <<'SQL'
+    log "Stopping replica subscription during schema migration"
+    admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -v sub="$SUBSCRIPTION" <<'SQL'
 ALTER SUBSCRIPTION :"sub" DISABLE;
 SQL
-        fi
-        [ "$SUBSCRIPTION" != "$LEGACY_SUBSCRIPTION" ] || break
-    done
 
     # Terminate any lingering logical-replication workers. Filter on
     # backend_type so we catch wedged workers that pg_stat_subscription
@@ -254,21 +245,6 @@ SQL
 # We keep the password out of argv by passing it through psql's -v mechanism
 # (:'name' expands to a properly-quoted SQL literal inside the client).
 CONN="host=$REMOTE_HOST dbname=$REMOTE_DB user=$REMOTE_USER password=$REMOTE_PW"
-
-if [ "$SUBSCRIPTION" != "$LEGACY_SUBSCRIPTION" ] &&
-   admin -d "$LOCAL_DB" -tAc \
-        "SELECT 1 FROM pg_subscription WHERE subname = '$LEGACY_SUBSCRIPTION'" \
-        | grep -q 1 &&
-   ! admin -d "$LOCAL_DB" -tAc \
-        "SELECT 1 FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" \
-        | grep -q 1; then
-    log "Renaming legacy subscription '$LEGACY_SUBSCRIPTION' to '$SUBSCRIPTION'"
-    admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
-        -v old_sub="$LEGACY_SUBSCRIPTION" \
-        -v sub="$SUBSCRIPTION" <<'SQL'
-ALTER SUBSCRIPTION :"old_sub" RENAME TO :"sub";
-SQL
-fi
 
 sub_exists=$(admin -d "$LOCAL_DB" -tAc \
     "SELECT 1 FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" | tr -d '[:space:]')
