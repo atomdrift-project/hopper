@@ -82,6 +82,9 @@ doas bastille pkg "$RUN" install -y \
 log "Selecting PostgreSQL ${PGVER} data directory"
 doas bastille sysrc "$RUN" postgresql_enable=YES >/dev/null
 doas bastille sysrc "$RUN" postgresql_data="/var/db/postgres/data${PGVER}" >/dev/null
+doas bastille cmd "$RUN" mkdir -p /var/db/postgres
+doas bastille cmd "$RUN" chown postgres:postgres /var/db/postgres
+doas bastille cmd "$RUN" chmod 750 /var/db/postgres
 
 wrong_pg=$(doas bastille cmd "$RUN" sh -c \
     "ps axww | grep '[p]ostgres .* -D ' | grep -v '/var/db/postgres/data${PGVER}' || true")
