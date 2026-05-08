@@ -1,4 +1,4 @@
-.PHONY: build test clean deploy rollout-bastille replica diagnose-replica promote-replica help
+.PHONY: build test clean deploy rollout-bastille rollout-replica-bastille replica diagnose-replica promote-replica help
 
 DATA_DIR  ?= /data/samples
 DB        ?= postgres://hopper@hopper-db/hopper?sslmode=disable
@@ -15,6 +15,8 @@ help:
 	@echo "  make deploy                 Install as a hardened systemd service on this Linux host"
 	@echo "                              (DATA_DIR=$(DATA_DIR) DB=... SOURCE=$(SOURCE) DASH_ADDR=$(DASH_ADDR) WORKERS=$(WORKERS))"
 	@echo "  make rollout-bastille       Deploy to Bastille jails (BUILD=build RUN=hopper [DB_ONLY=1])"
+	@echo "  make rollout-replica-bastille Deploy a Bastille jail as a logical replica"
+	@echo "                              (RUN=hopper-replica REMOTE_HOST=hopper-db SUBSCRIPTION=...)"
 	@echo "  make replica                Configure local postgres as a logical replica of the"
 	@echo "                              upstream hopper DB (idempotent; reads ~/.pgpass)"
 	@echo "  make diagnose-replica       Dump replication status from both sides (read-only)"
@@ -41,6 +43,9 @@ rollout-bastille:
 	else \
 		./scripts/master/freebsd-bastille.sh "$(BUILD)" "$(RUN)"; \
 	fi
+
+rollout-replica-bastille:
+	@./scripts/replica/freebsd-bastille.sh "$(RUN)"
 
 replica: build
 	@./scripts/replica/setup.sh
