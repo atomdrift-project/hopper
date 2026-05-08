@@ -786,7 +786,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// Remote litmus workers self-register via the pull API; no --litmus-nodes flag needed.
 	maxRSSGB := f.Int("max-memory-gb", -1, "litmus RSS limit in GB (-1 = disable in-process throttling, 0 = auto)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
-	rescanAge := f.Duration("rescan-age", 72*time.Hour, "minimum age before a stale-traits sample is eligible for rescan")
+	rescanAge := f.Duration("rescan-age", 120*time.Hour, "minimum age before a stale-traits sample is eligible for rescan")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
 	experimentTag := f.String("experiment-tag", "", "label for experiment comparison")

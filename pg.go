@@ -260,6 +260,28 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 			END IF;
 		END$$`,
 
+		// Logical replication and pg_restore can leave BIGSERIAL sequences
+		// behind the restored/copied row ids. Advance only forward so a
+		// promoted replica or restored master does not reuse primary keys.
+		`SELECT setval('samples_id_seq',
+			GREATEST(
+				(SELECT COALESCE(max(id), 0) FROM samples),
+				(SELECT last_value FROM samples_id_seq)
+			),
+			true)`,
+		`SELECT setval('sample_locations_id_seq',
+			GREATEST(
+				(SELECT COALESCE(max(id), 0) FROM sample_locations),
+				(SELECT last_value FROM sample_locations_id_seq)
+			),
+			true)`,
+		`SELECT setval('reports_id_seq',
+			GREATEST(
+				(SELECT COALESCE(max(id), 0) FROM reports),
+				(SELECT last_value FROM reports_id_seq)
+			),
+			true)`,
+
 		// Derived columns: convert from plain columns (written by Go) to
 		// GENERATED … STORED (computed by PG from the JSONB source). This
 		// makes drift structurally impossible — a writer can't forget to

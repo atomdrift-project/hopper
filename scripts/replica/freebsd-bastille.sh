@@ -95,6 +95,10 @@ fi
 
 log "Initializing PostgreSQL ${PGVER} (if needed)"
 doas bastille cmd "$RUN" sh -c "
+    if [ -d /var/db/postgres/data${PGVER} ] && [ ! -f /var/db/postgres/data${PGVER}/PG_VERSION ]; then
+        echo 'removing incomplete /var/db/postgres/data${PGVER} from interrupted initdb'
+        rm -rf /var/db/postgres/data${PGVER}
+    fi
     if [ ! -f /var/db/postgres/data${PGVER}/PG_VERSION ]; then
         /usr/local/etc/rc.d/postgresql initdb
     fi
