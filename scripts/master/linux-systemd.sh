@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# deploy.sh - Install hopper as a hardened systemd service on the local host.
+# linux-systemd.sh - Install hopper as a hardened systemd service on the local host.
 #
 # hopper runs `hopper load` which forks litmus + rizin children to analyse
 # samples under DATA_DIR and push results into postgres. Memory/Tasks caps
@@ -12,7 +12,7 @@
 #   DATA_DIR  sample directory (read-only to hopper)
 #                                    (default: /data/samples)
 #   DB        postgres DSN (password resolved from the installed .pgpass)
-#                                    (default: postgres://hopper@hopper/hopper?sslmode=disable)
+#                                    (default: postgres://hopper@hopper-db/hopper?sslmode=disable)
 #   SOURCE    --source tag           (default: harvest)
 #   DASH_ADDR --dashboard-addr       (default: 0.0.0.0:8081)
 #   WORKERS   --workers              (default: 0 = auto)
@@ -20,7 +20,7 @@
 set -euo pipefail
 
 DATA_DIR="${DATA_DIR:-/data/samples}"
-DB="${DB:-postgres://hopper@hopper/hopper?sslmode=disable}"
+DB="${DB:-postgres://hopper@hopper-db/hopper?sslmode=disable}"
 SOURCE="${SOURCE:-harvest}"
 DASH_ADDR="${DASH_ADDR:-0.0.0.0:8081}"
 WORKERS="${WORKERS:-0}"

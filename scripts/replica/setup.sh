@@ -11,7 +11,7 @@
 #   * The hopper binary is built (./hopper) or installed on $PATH.
 #
 # Overridable via env: REMOTE_HOST, REMOTE_USER, REMOTE_DB, LOCAL_DB,
-# LOCAL_USER, PUBLICATION, SUBSCRIPTION, PGPASSFILE.
+# LOCAL_USER, PUBLICATION, SUBSCRIPTION, COPY_DATA, PGPASSFILE.
 
 set -eu
 
@@ -22,6 +22,7 @@ LOCAL_DB="${LOCAL_DB:-hopper}"
 LOCAL_USER="${LOCAL_USER:-hopper}"
 PUBLICATION="${PUBLICATION:-hopper_replica}"
 SUBSCRIPTION="${SUBSCRIPTION:-hopper_replica}"
+COPY_DATA="${COPY_DATA:-true}"
 LEGACY_PUBLICATION="${LEGACY_PUBLICATION:-hopper_training}"
 PGPASS="${PGPASSFILE:-$HOME/.pgpass}"
 
@@ -38,6 +39,10 @@ validate_ident() {
 validate_ident PUBLICATION "$PUBLICATION"
 validate_ident SUBSCRIPTION "$SUBSCRIPTION"
 validate_ident LEGACY_PUBLICATION "$LEGACY_PUBLICATION"
+case "$COPY_DATA" in
+    true|false) ;;
+    *) die "COPY_DATA must be true or false, got '$COPY_DATA'" ;;
+esac
 
 # --- Sanity checks ---------------------------------------------------------
 command -v pg_isready >/dev/null 2>&1 || die "pg_isready not found; install postgres client tools"
@@ -250,15 +255,22 @@ sub_exists=$(admin -d "$LOCAL_DB" -tAc \
     "SELECT 1 FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" | tr -d '[:space:]')
 
 if [ "$sub_exists" = "1" ]; then
+    current_slot=$(admin -d "$LOCAL_DB" -tAc \
+        "SELECT COALESCE(subslotname, '') FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" \
+        | tr -d '[:space:]')
+    if [ "$current_slot" != "$SUBSCRIPTION" ]; then
+        die "subscription '$SUBSCRIPTION' uses replication slot '$current_slot', expected '$SUBSCRIPTION'; rebuild the local replica instead of refreshing across a slot rename"
+    fi
+
     log "Subscription '$SUBSCRIPTION' exists — refreshing connection + tables"
     admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
         -v sub="$SUBSCRIPTION" \
         -v pub="$PUBLICATION" \
-        -v conn="$CONN" <<'SQL'
+        -v conn="$CONN" <<SQL
 ALTER SUBSCRIPTION :"sub" CONNECTION :'conn';
 ALTER SUBSCRIPTION :"sub" SET PUBLICATION :"pub" WITH (refresh = false);
 ALTER SUBSCRIPTION :"sub" ENABLE;
-ALTER SUBSCRIPTION :"sub" REFRESH PUBLICATION WITH (copy_data = true);
+ALTER SUBSCRIPTION :"sub" REFRESH PUBLICATION WITH (copy_data = $COPY_DATA);
 SQL
 else
     # A prior run (or the retired sync-db target) may have left a replication
@@ -276,15 +288,15 @@ SELECT pg_drop_replication_slot(:'slot');
 SQL
     fi
 
-    log "Creating subscription '$SUBSCRIPTION' → $REMOTE_HOST / $PUBLICATION"
+    log "Creating subscription '$SUBSCRIPTION' → $REMOTE_HOST / $PUBLICATION (copy_data=$COPY_DATA)"
     admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
         -v sub="$SUBSCRIPTION" \
         -v pub="$PUBLICATION" \
-        -v conn="$CONN" <<'SQL'
+        -v conn="$CONN" <<SQL
 CREATE SUBSCRIPTION :"sub"
     CONNECTION :'conn'
     PUBLICATION :"pub"
-    WITH (copy_data = true);
+    WITH (copy_data = $COPY_DATA);
 SQL
 fi
 

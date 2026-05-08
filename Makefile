@@ -1,7 +1,7 @@
 .PHONY: build test clean deploy rollout-bastille replica diagnose-replica promote-replica help
 
 DATA_DIR  ?= /data/samples
-DB        ?= postgres://hopper@hopper/hopper?sslmode=disable
+DB        ?= postgres://hopper@hopper-db/hopper?sslmode=disable
 SOURCE    ?= harvest
 DASH_ADDR ?= 0.0.0.0:8081
 WORKERS   ?= 0
@@ -33,23 +33,23 @@ RUN ?= hopper
 deploy:
 	DATA_DIR='$(DATA_DIR)' DB='$(DB)' SOURCE='$(SOURCE)' \
 	DASH_ADDR='$(DASH_ADDR)' WORKERS='$(WORKERS)' \
-	./scripts/deploy.sh
+	./scripts/master/linux-systemd.sh
 
 rollout-bastille:
 	@if [ -n "$(DB_ONLY)" ]; then \
-		DB_ONLY=1 ./hacks/rollout-bastille.sh "" "$(RUN)"; \
+		DB_ONLY=1 ./scripts/master/freebsd-bastille.sh "" "$(RUN)"; \
 	else \
-		./hacks/rollout-bastille.sh "$(BUILD)" "$(RUN)"; \
+		./scripts/master/freebsd-bastille.sh "$(BUILD)" "$(RUN)"; \
 	fi
 
 replica: build
-	@./hacks/setup-replica.sh
+	@./scripts/replica/setup.sh
 
 diagnose-replica:
-	@./hacks/diagnose-replica.sh
+	@./scripts/replica/diagnose.sh
 
 promote-replica:
-	@./hacks/promote-replica.sh
+	@./scripts/replica/promote.sh
 
 clean:
 	rm -f hopper

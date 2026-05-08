@@ -1,7 +1,7 @@
 #!/bin/sh
-# rollout-bastille.sh - Deploy hopper + PostgreSQL using separate build and run jails
-# Usage: ./rollout-bastille.sh <build-jail> <run-jail>
-#        DB_ONLY=1 ./rollout-bastille.sh "" <run-jail>
+# freebsd-bastille.sh - Deploy hopper + PostgreSQL using separate build and run jails
+# Usage: ./scripts/master/freebsd-bastille.sh <build-jail> <run-jail>
+#        DB_ONLY=1 ./scripts/master/freebsd-bastille.sh "" <run-jail>
 #
 # Builds the hopper binary in the build jail, installs PostgreSQL and hopper
 # in the run jail, and configures both as rc.d services.
@@ -29,10 +29,11 @@ else
     [ -z "$BUILD" ] || [ -z "$RUN" ] && die "usage: $0 <build-jail> <run-jail>"
 fi
 
-# PostgreSQL major version — bump here when upgrading.
+# PostgreSQL major version.
 # Must match the version installed locally if you want pg_dump | pg_restore
-# to work without errors (e.g. transaction_timeout added in pg17).
-PGVER=17
+# to work without errors across major versions. Override with PGVER=17 if
+# the target jail only has PostgreSQL 17 packages.
+PGVER="${PGVER:-18}"
 
 # Verify jails are accessible
 if [ -z "$DB_ONLY" ]; then
@@ -141,7 +142,7 @@ doas bastille cmd "$RUN" sh -c "
 # it's already running.
 log "Writing postgres access rules (loopback + 10.0.0.0/8)"
 doas bastille cmd "$RUN" tee /var/db/postgres/data${PGVER}/pg_hba.conf >/dev/null <<'HBAEOF'
-# Managed by rollout-bastille.sh — edits may be overwritten on redeploy.
+# Managed by scripts/master/freebsd-bastille.sh — edits may be overwritten on redeploy.
 # TYPE  DATABASE  USER  ADDRESS         METHOD
 local   all       all                   peer
 host    all       all   127.0.0.1/32    scram-sha-256

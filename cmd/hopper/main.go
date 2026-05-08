@@ -476,7 +476,7 @@ func openDB(ctx context.Context, dsn string) (*hopper.DB, error) {
 		dsn = os.Getenv("DATABASE_URL")
 	}
 	if dsn == "" {
-		dsn = "postgres://hopper@hopper:5432/hopper"
+		dsn = "postgres://hopper@hopper-db:5432/hopper"
 	}
 	slog.Info("connecting to database", "dsn", redactDSN(dsn)) //nolint:gosec // dsn is redacted before logging
 	return hopper.Open(ctx, dsn)

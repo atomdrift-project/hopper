@@ -26,7 +26,7 @@ hopper load --data ./samples                      # uses DATABASE_URL
 
 ## Production deployment
 
-PostgreSQL 17+ is required (for `JSON_TABLE`, which collimator uses to dedupe embedded hashes). On the DB host:
+PostgreSQL 18 is recommended; PostgreSQL 17+ is required for `JSON_TABLE`, which collimator uses to dedupe embedded hashes. On the DB host:
 
 ```bash
 sudo -u postgres psql -c "CREATE ROLE hopper LOGIN PASSWORD 'changeme'; \
@@ -36,7 +36,7 @@ hopper init                                       # applies migrations
 hopper load --data /srv/samples --dashboard-addr 0.0.0.0:8081   # HTTP API + dashboard
 ```
 
-Run the `hopper load` process under rc.d, systemd, or s6 — it stays up serving the worker API and dashboard. `hacks/rollout-bastille.sh` is a working FreeBSD/bastille rollout with tuned postgres, hourly `pg_dump` backups, and a `hopper_replica` logical-replication publication for replica subscribers. Imports use `COPY`-based bulk loads and resume with `--after <id>`.
+Run the `hopper load` process under rc.d, systemd, or s6 — it stays up serving the worker API and dashboard. `scripts/master/freebsd-bastille.sh` is a working FreeBSD/bastille rollout with tuned postgres, hourly `pg_dump` backups, and a `hopper_replica` logical-replication publication for replica subscribers. Imports use `COPY`-based bulk loads and resume with `--after <id>`.
 
 ## Commands & building
 
