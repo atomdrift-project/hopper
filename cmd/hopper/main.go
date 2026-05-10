@@ -2265,7 +2265,12 @@ func hashFile(ctx context.Context, path, label, fileType, source string, cache *
 // (legacy paths that predate the relayout migration).
 func fillSampleProvenance(s *hopper.Sample, prov pathProvenance, filename string) {
 	s.Feed = prov.feed
-	s.Ecosystem = prov.ecosystem
+	// Normalize the path-extracted ecosystem through the runtime map.
+	// Legacy paths put registry names ("npm"), file-type classifiers
+	// ("elf"), or junk dataset names ("vxunderground-inthewild") in the
+	// ecosystem slot — we want the canonical runtime name in the DB so
+	// queries and dropdowns stay clean.
+	s.Ecosystem = pkgparse.NormalizeEcosystem(prov.ecosystem)
 	s.Domain = prov.domain
 	s.Package = prov.pkg
 	s.Version = prov.version

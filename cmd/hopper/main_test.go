@@ -1394,15 +1394,15 @@ func TestCmdLoadHarvestMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bad.Feed != "opensourcemalware" || bad.Ecosystem != "pypi" {
-		t.Fatalf("bad metadata feed/ecosystem = %q/%q, want opensourcemalware/pypi", bad.Feed, bad.Ecosystem)
+	if bad.Feed != "opensourcemalware" || bad.Ecosystem != "python" {
+		t.Fatalf("bad metadata feed/ecosystem = %q/%q, want opensourcemalware/python", bad.Feed, bad.Ecosystem)
 	}
 	good, err := db.SampleBySHA256(ctx, goodSHA)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if good.Feed != "" || good.Ecosystem != "npm" {
-		t.Fatalf("good metadata feed/ecosystem = %q/%q, want ''/npm", good.Feed, good.Ecosystem)
+	if good.Feed != "" || good.Ecosystem != "javascript" {
+		t.Fatalf("good metadata feed/ecosystem = %q/%q, want ''/javascript", good.Feed, good.Ecosystem)
 	}
 }
 
