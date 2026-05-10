@@ -56,9 +56,11 @@ CREATE INDEX IF NOT EXISTS idx_samples_unanalyzed ON samples(sha256) WHERE cleav
 CREATE INDEX IF NOT EXISTS idx_samples_status ON samples(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_samples_path ON samples(path);
 CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent) WHERE parent != '';
-CREATE INDEX IF NOT EXISTS idx_samples_domain ON samples(domain) WHERE domain != '';
-CREATE INDEX IF NOT EXISTS idx_samples_package_version ON samples(package, version) WHERE package != '';
-CREATE INDEX IF NOT EXISTS idx_samples_ecosystem_name ON samples(ecosystem, name) WHERE name != '';
+-- Indexes on url/domain/package/version live in the runtime migration
+-- list (pg.go) so they fire AFTER the ALTER TABLE ADD COLUMN. Putting
+-- them here would fail on existing databases that haven't yet acquired
+-- the new columns: CREATE TABLE IF NOT EXISTS is a no-op, but CREATE
+-- INDEX still tries to read the column.
 
 CREATE TABLE IF NOT EXISTS reports (
 	id          BIGSERIAL PRIMARY KEY,
