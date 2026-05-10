@@ -441,7 +441,8 @@ func eachSampleSQLite(ctx context.Context, db *DB, afterID int64, fn func(*Sampl
 			&s.Score, &s.MaxCrit, &s.SuspiciousCount,
 			&s.CreatedAt, &s.UpdatedAt,
 			&analyzedAt, &firstAnalyzedAt, &lastErrorAt, &mtime, &markerMtime,
-			&s.TraitsVersion); err != nil {
+			&s.TraitsVersion,
+			&s.URL, &s.Domain, &s.Package, &s.Version); err != nil {
 			return fmt.Errorf("scan sample: %w", err)
 		}
 		if cleaveResult.Valid {

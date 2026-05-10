@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"codeberg.org/atomdrift/hopper"
+	"codeberg.org/atomdrift/hopper/pkgparse"
 )
 
 const usageText = `usage: hopper <command>
@@ -778,7 +779,8 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	f := flag.NewFlagSet("load", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
 	dataDir := f.String("data", "", "data directory containing bad/, good/, unknown/ subdirectories")
-	source := f.String("source", "harvest", "sample source tag")
+	source := f.String("source", "forager", "sample source tag")
+	pruneMissingPaths := f.Bool("prune-missing-paths", false, "after walking, delete sample_locations rows whose path no longer exists on disk")
 	hashWorkers := f.Int("hash-workers", 8, "concurrent hash/insert workers for file walking")
 	cleaveBinFlag := f.String("cleave", "cleave", "path to cleave binary (used for file enumeration)")
 	litmusBin := f.String("litmus", "litmus", "path to litmus binary (pass empty to disable)")
@@ -1197,6 +1199,15 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		"samples", total,
 		"serving_api", servingAPI,
 		"local_litmus", litmus != nil)
+
+	if *pruneMissingPaths {
+		removed, err := db.PruneMissingLocations(ctx, *dataDir)
+		if err != nil {
+			slog.Error("prune missing locations failed", "error", err)
+		} else {
+			slog.Info("pruned missing locations", "removed", removed, "data_dir", *dataDir)
+		}
+	}
 
 	// Block while there is something useful to keep alive: the dashboard/API
 	// for remote workers, or the local litmus worker process.
@@ -2189,7 +2200,8 @@ func hashFile(ctx context.Context, path, label, fileType, source string, cache *
 				Path:        path,
 				Mtime:       &modTime,
 			}
-			s.Feed, s.Ecosystem = extractFeedEcosystem(path, label)
+			prov := extractPathProvenance(path, label)
+			fillSampleProvenance(s, prov, filepath.Base(path))
 			return hashResult{
 				cacheKey: ck,
 				sample:   s,
@@ -2227,60 +2239,158 @@ func hashFile(ctx context.Context, path, label, fileType, source string, cache *
 		Path:        path,
 		Mtime:       ptrTime(info.ModTime()),
 	}
-	s.Feed, s.Ecosystem = extractFeedEcosystem(path, label)
+	prov := extractPathProvenance(path, label)
+	fillSampleProvenance(s, prov, filepath.Base(path))
 	return hashResult{cacheKey: ck, sample: s}, nil
+}
+
+// fillSampleProvenance populates the provenance fields on s using the
+// path-extracted values, falling back to filename parsing for any
+// fields the path didn't carry. The forager layout has name in the
+// path but not version, so we always parse the filename for version
+// and use parsed name as a fallback when the path component was empty
+// (legacy paths that predate the relayout migration).
+func fillSampleProvenance(s *hopper.Sample, prov pathProvenance, filename string) {
+	s.Feed = prov.feed
+	s.Ecosystem = prov.ecosystem
+	s.Domain = prov.domain
+	s.Package = prov.pkg
+	s.Version = prov.version
+	parsedName, parsedVersion := pkgparse.ParseFilename(filename)
+	if s.Package == "" {
+		s.Package = parsedName
+	}
+	if s.Version == "" {
+		s.Version = parsedVersion
+	}
 }
 
 func ptrTime(t time.Time) *time.Time { return &t }
 
-// extractFeedEcosystem parses the datasource/feed and ecosystem from Harvest
-// output paths.
+// pathProvenance captures the metadata recoverable from a forager-output
+// path. Whatever the path doesn't carry stays empty.
+type pathProvenance struct {
+	feed      string
+	ecosystem string
+	domain    string
+	pkg       string
+	version   string
+}
+
+// extractPathProvenance parses provenance fields from a forager output path.
 //
-// Known-bad:  .../bad/harvest/<feed>/<ecosystem>/file → feed + ecosystem
+// New layout (forager 2026-05+, marker = "foraged"):
 //
-//	.../bad/harvest/<feed>/file             → feed only
+//	.../<label>/foraged/<runtime>/<domain>/<feed>/<name>/<file>
 //
-// Known-good/unknown: .../<label>/harvest/<ecosystem>/file → ecosystem only.
-func extractFeedEcosystem(path, label string) (feed, ecosystem string) {
+// Legacy harvest layout (still walked during the relayout transition):
+//
+//	.../bad/harvest/<feed>/<ecosystem>/<file>     → feed + ecosystem
+//	.../bad/harvest/<feed>/<file>                 → feed only
+//	.../<label>/harvest/<ecosystem>/<file>        → ecosystem only (good/unknown)
+//
+// "_unknown" placeholders that the relayout migration may have introduced
+// for missing name are normalized to empty strings so they don't pollute
+// downstream queries. Version is read from the filename (forager doesn't
+// give version its own path component) and left empty when not parseable.
+func extractPathProvenance(path, label string) pathProvenance {
 	parts := strings.Split(filepath.ToSlash(path), "/")
+	marker, idx := findLayoutMarker(parts, label)
+	if idx < 0 || idx+1 >= len(parts) {
+		return pathProvenance{}
+	}
+	after := parts[idx+1:]
+	if len(after) < 2 {
+		return pathProvenance{}
+	}
+	dirs := after[:len(after)-1]
+
+	if marker == "foraged" {
+		return parseForagedDirs(dirs)
+	}
+	return parseHarvestDirs(dirs, label)
+}
+
+// findLayoutMarker scans path components for the layout-marker segment.
+// Prefers a marker immediately following the label segment so paths that
+// happen to contain the marker name as a package name don't confuse us.
+// Returns the marker name and its index in parts, or ("", -1) if absent.
+func findLayoutMarker(parts []string, label string) (marker string, idx int) {
 	labelIdx := -1
 	for i, p := range parts {
 		if p == label {
 			labelIdx = i
 		}
 	}
-	idx := labelIdx
-	if idx >= 0 && idx+1 < len(parts) && parts[idx+1] == "harvest" {
-		idx++
-	} else {
-		for i, p := range parts {
-			if p == "harvest" {
-				idx = i
-				break
-			}
+	if labelIdx >= 0 && labelIdx+1 < len(parts) {
+		switch parts[labelIdx+1] {
+		case "foraged", "harvest":
+			return parts[labelIdx+1], labelIdx + 1
 		}
 	}
-	if idx < 0 || idx+1 >= len(parts) {
-		return "", ""
+	for i, p := range parts {
+		if p == "foraged" || p == "harvest" {
+			return p, i
+		}
 	}
-	// Directory components between the layout marker and the filename.
-	after := parts[idx+1:]
-	if len(after) < 2 {
-		return "", "" // need at least one directory + filename
-	}
-	dirs := after[:len(after)-1]
+	return "", -1
+}
 
+// parseForagedDirs maps the directory components between the "foraged"
+// marker and the filename onto the new-layout provenance fields.
+//
+// Expected dirs slice (length 4): [runtime, domain, feed, name].
+// Shorter slices fall through gracefully — fields stay empty.
+// Version is not a path component; it lives in the filename.
+//
+// The "_" placeholder for feed indicates "same as domain" — used for
+// goodfeed paths where the discovery channel is the registry itself.
+// Expand it back here so the DB row carries the actual feed value.
+func parseForagedDirs(dirs []string) pathProvenance {
+	p := pathProvenance{}
+	if len(dirs) >= 1 {
+		p.ecosystem = dirs[0]
+	}
+	if len(dirs) >= 2 {
+		p.domain = unknownToEmpty(dirs[1])
+	}
+	if len(dirs) >= 3 {
+		feed := unknownToEmpty(dirs[2])
+		if feed == "_" {
+			feed = p.domain
+		}
+		p.feed = feed
+	}
+	if len(dirs) >= 4 {
+		p.pkg = unknownToEmpty(dirs[3])
+	}
+	return p
+}
+
+// parseHarvestDirs preserves the legacy harvest-layout extraction: bad
+// paths carry feed+ecosystem under harvest/, good/unknown carry only the
+// ecosystem.
+func parseHarvestDirs(dirs []string, label string) pathProvenance {
 	switch label {
 	case "bad":
-		switch len(dirs) {
-		case 1:
-			return dirs[0], ""
-		default:
-			return dirs[0], dirs[1]
+		if len(dirs) == 1 {
+			return pathProvenance{feed: dirs[0]}
 		}
-	default: // "good", "unknown"
-		return "", dirs[0]
+		return pathProvenance{feed: dirs[0], ecosystem: dirs[1]}
+	default:
+		return pathProvenance{ecosystem: dirs[0]}
 	}
+}
+
+// unknownToEmpty maps the "_unknown" placeholder back to "" so callers
+// don't have to special-case it. The placeholder is a marker forager's
+// relayout migration uses for missing values; treating it as empty
+// downstream keeps queries clean.
+func unknownToEmpty(s string) string {
+	if s == "_unknown" {
+		return ""
+	}
+	return s
 }
 
 func cmdStats(ctx context.Context) error {

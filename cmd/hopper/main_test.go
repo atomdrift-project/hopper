@@ -1406,48 +1406,87 @@ func TestCmdLoadHarvestMetadata(t *testing.T) {
 	}
 }
 
-func TestExtractFeedEcosystem(t *testing.T) {
+func TestExtractPathProvenance(t *testing.T) {
 	tests := []struct {
-		name     string
-		path     string
-		label    string
-		wantFeed string
-		wantEco  string
+		name  string
+		path  string
+		label string
+		want  pathProvenance
 	}{
+		// Legacy harvest layout — preserved for the relayout transition.
 		{
-			name:     "bad all layout",
-			path:     "/srv/data/bad/harvest/opensourcemalware/pypi/pkg.whl",
-			label:    "bad",
-			wantFeed: "opensourcemalware",
-			wantEco:  "pypi",
+			name:  "legacy bad harvest with feed+ecosystem",
+			path:  "/srv/data/bad/harvest/opensourcemalware/pypi/pkg.whl",
+			label: "bad",
+			want:  pathProvenance{feed: "opensourcemalware", ecosystem: "pypi"},
 		},
 		{
-			name:     "good all layout",
-			path:     "/srv/data/good/harvest/npm/pkg.tgz",
-			label:    "good",
-			wantFeed: "",
-			wantEco:  "npm",
+			name:  "legacy good harvest with ecosystem only",
+			path:  "/srv/data/good/harvest/npm/pkg.tgz",
+			label: "good",
+			want:  pathProvenance{ecosystem: "npm"},
 		},
 		{
-			name:     "unknown all layout",
-			path:     "/srv/data/unknown/harvest/crates/pkg.crate",
-			label:    "unknown",
-			wantFeed: "",
-			wantEco:  "crates",
+			name:  "legacy unknown harvest with ecosystem only",
+			path:  "/srv/data/unknown/harvest/crates/pkg.crate",
+			label: "unknown",
+			want:  pathProvenance{ecosystem: "crates"},
 		},
 		{
-			name:     "legacy bad harvest marker",
-			path:     "/srv/harvest/osv/maven/pkg.jar",
-			label:    "bad",
-			wantFeed: "osv",
-			wantEco:  "maven",
+			name:  "legacy bare harvest marker",
+			path:  "/srv/harvest/osv/maven/pkg.jar",
+			label: "bad",
+			want:  pathProvenance{feed: "osv", ecosystem: "maven"},
+		},
+		// New foraged layout: runtime/domain/feed/name/file (no version dir).
+		{
+			name:  "foraged bad: full provenance",
+			path:  "/srv/data/bad/foraged/javascript/npmjs.org/aikido.dev/lodash/lodash-4.17.21.tgz",
+			label: "bad",
+			want: pathProvenance{
+				ecosystem: "javascript",
+				domain:    "npmjs.org",
+				feed:      "aikido.dev",
+				pkg:      "lodash",
+			},
+		},
+		{
+			name:  "foraged good: registry-as-feed",
+			path:  "/srv/data/good/foraged/python/pythonhosted.org/pypi.org/requests/requests-2.31.0.tar.gz",
+			label: "good",
+			want: pathProvenance{
+				ecosystem: "python",
+				domain:    "pythonhosted.org",
+				feed:      "pypi.org",
+				pkg:      "requests",
+			},
+		},
+		{
+			name:  "foraged with _unknown placeholders normalizes to empty",
+			path:  "/srv/data/bad/foraged/windows/_unknown/abuse.ch/_unknown/evil.exe",
+			label: "bad",
+			want: pathProvenance{
+				ecosystem: "windows",
+				feed:      "abuse.ch",
+			},
+		},
+		{
+			name:  "foraged with _ feed collapse expands to domain",
+			path:  "/srv/data/good/foraged/javascript/npmjs.org/_/lodash/lodash-1.0.0.tgz",
+			label: "good",
+			want: pathProvenance{
+				ecosystem: "javascript",
+				domain:    "npmjs.org",
+				feed:      "npmjs.org",
+				pkg:      "lodash",
+			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotFeed, gotEco := extractFeedEcosystem(tt.path, tt.label)
-			if gotFeed != tt.wantFeed || gotEco != tt.wantEco {
-				t.Fatalf("extractFeedEcosystem() = %q/%q, want %q/%q", gotFeed, gotEco, tt.wantFeed, tt.wantEco)
+			got := extractPathProvenance(tt.path, tt.label)
+			if got != tt.want {
+				t.Fatalf("extractPathProvenance() = %+v, want %+v", got, tt.want)
 			}
 		})
 	}

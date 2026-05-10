@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -28,15 +30,19 @@ func openSQLite(ctx context.Context, dsn string) (*DB, error) {
 }
 
 func pragmaHasColumn(ctx context.Context, db *sql.DB, column string) int {
-	// pragma_table_xinfo (not table_info) includes GENERATED columns;
-	// table_info hides them, which would cause legacy ALTER TABLE ADD
-	// COLUMN migrations to fire duplicates against columns that already
-	// exist as generated in schema_sqlite.sql.
+	return pragmaHasColumnIn(ctx, db, "samples", column)
+}
+
+// pragmaHasColumnIn reports whether the named column exists on the given
+// table. Uses pragma_table_xinfo (not table_info) so GENERATED columns are
+// counted — without this, legacy ALTER TABLE ADD COLUMN migrations would
+// fire duplicates against columns that already exist as generated.
+func pragmaHasColumnIn(ctx context.Context, db *sql.DB, table, column string) int {
 	var count int
 	if err := db.QueryRowContext(ctx,
-		"SELECT count(*) FROM pragma_table_xinfo('samples') WHERE name = ?", column,
+		"SELECT count(*) FROM pragma_table_xinfo(?) WHERE name = ?", table, column,
 	).Scan(&count); err != nil {
-		slog.Debug("pragma_table_xinfo failed", "column", column, "error", err)
+		slog.Debug("pragma_table_xinfo failed", "table", table, "column", column, "error", err)
 		return 0
 	}
 	return count
@@ -206,6 +212,29 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		}
 	}
 
+	// Forager direct-insert provenance: url, domain (eTLD+1, populated by
+	// Go via publicsuffix), name, version. See pg.go for rationale.
+	for _, col := range []struct{ name, ddl string }{
+		{"url", `ALTER TABLE samples ADD COLUMN url TEXT NOT NULL DEFAULT ''`},
+		{"domain", `ALTER TABLE samples ADD COLUMN domain TEXT NOT NULL DEFAULT ''`},
+		{"name", `ALTER TABLE samples ADD COLUMN name TEXT NOT NULL DEFAULT ''`},
+		{"version", `ALTER TABLE samples ADD COLUMN version TEXT NOT NULL DEFAULT ''`},
+	} {
+		if pragmaHasColumn(ctx, db.lite, col.name) == 0 {
+			if _, err := db.lite.ExecContext(ctx, col.ddl); err != nil {
+				return fmt.Errorf("hopper: migrate sqlite samples.%s: %w", col.name, err)
+			}
+		}
+	}
+	for _, ddl := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_samples_domain ON samples(domain) WHERE domain != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_name_version ON samples(name, version) WHERE name != ''`,
+	} {
+		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite samples index: %w", err)
+		}
+	}
+
 	// Covers FP/FN seed queries ordered by impact. SQLite needs the explicit
 	// `litmus_score IS NULL` prefix to match the `NULLS LAST` semantics our
 	// queries use (see liteSeedOrder).
@@ -338,7 +367,8 @@ const liteSampleCols = `id, sha256, source, feed, ecosystem,
 	path, status, note, canonical_sha256, parent, skip,
 	formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime,
-	traits_version`
+	traits_version,
+	url, domain, package, version`
 
 // liteSampleColsLight excludes cleave_result and litmus_result to avoid
 // loading large JSON blobs when only metadata is needed.
@@ -348,7 +378,8 @@ const liteSampleColsLight = `id, sha256, source, feed, ecosystem,
 	path, status, note, canonical_sha256, parent, skip,
 	formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime,
-	traits_version`
+	traits_version,
+	url, domain, package, version`
 
 func scanLiteSamplesLight(rows *sql.Rows) ([]*Sample, error) {
 	defer rows.Close() //nolint:errcheck // best-effort cleanup
@@ -365,6 +396,7 @@ func scanLiteSamplesLight(rows *sql.Rows) ([]*Sample, error) {
 			&s.Score, &s.MaxCrit, &s.SuspiciousCount,
 			&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &firstAnalyzedAt, &lastErrorAt, &mtime, &markerMtime,
 			&s.TraitsVersion,
+			&s.URL, &s.Domain, &s.Package, &s.Version,
 		); err != nil {
 			return nil, err
 		}
@@ -472,7 +504,7 @@ func (db *DB) workflowSamplesSQLite(ctx context.Context, where string, limit int
 			cleave_result IS NOT NULL,
 			litmus_result IS NOT NULL,
 			COALESCE(CAST(json_extract(litmus_result, '$.class') AS INTEGER), 0)
-		FROM samples `+where, limit) //nolint:gosec // where is a fixed fragment selected by workflowSnapshotSQLite.
+		FROM samples `+where, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: workflow samples: %w", err)
 	}
@@ -504,8 +536,10 @@ func scanLiteSample(row *sql.Row) (*Sample, error) {
 		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &s.LitmusScore,
 		&s.Path, &status, &s.Note, &s.CanonicalSHA256, &s.Parent, &s.Skip, &s.Formula,
-		&s.Elements, &s.Score, &s.MaxCrit, &s.SuspiciousCount, &s.CreatedAt, &s.UpdatedAt, &analyzedAt, &firstAnalyzedAt, &lastErrorAt, &mtime, &markerMtime,
+		&s.Elements, &s.Score, &s.MaxCrit, &s.SuspiciousCount,
+		&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &firstAnalyzedAt, &lastErrorAt, &mtime, &markerMtime,
 		&s.TraitsVersion,
+		&s.URL, &s.Domain, &s.Package, &s.Version,
 	)
 
 	if errors.Is(err, sql.ErrNoRows) {
@@ -554,6 +588,7 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 			&s.Score, &s.MaxCrit, &s.SuspiciousCount,
 			&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &firstAnalyzedAt, &lastErrorAt, &mtime, &markerMtime,
 			&s.TraitsVersion,
+			&s.URL, &s.Domain, &s.Package, &s.Version,
 		); err != nil {
 			return nil, err
 		}
@@ -665,14 +700,20 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 			size_bytes, label, label_source, path, status,
 			canonical_sha256, parent, skip, elements,
 			max_crit, suspicious_count, mtime, marker_mtime,
-			cleave_result, litmus_result)
+			cleave_result, litmus_result,
+			url, domain, package, version)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?)
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256) DO UPDATE SET
 			feed  = CASE WHEN excluded.feed  != '' THEN excluded.feed  ELSE samples.feed  END,
 			ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE samples.ecosystem END,
 			path  = CASE WHEN excluded.path  != ''   THEN excluded.path  ELSE samples.path  END,
 			mtime = CASE WHEN excluded.mtime IS NOT NULL THEN excluded.mtime ELSE samples.mtime END,
+			-- Provenance fields stick to first non-empty observation.
+			url     = CASE WHEN samples.url     = '' THEN excluded.url     ELSE samples.url     END,
+			domain  = CASE WHEN samples.domain  = '' THEN excluded.domain  ELSE samples.domain  END,
+			package    = CASE WHEN samples.package    = '' THEN excluded.package    ELSE samples.package    END,
+			version = CASE WHEN samples.version = '' THEN excluded.version ELSE samples.version END,
 			-- Walker re-observation clears 'missing'/'unsupported' skips so
 			-- a previously-hidden file (permission error) or previously-
 			-- unsupported type (cleave gained support) rejoins the queue.
@@ -688,12 +729,15 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 			    OR (excluded.mtime IS NOT NULL AND samples.mtime IS NOT excluded.mtime)
 			    OR (excluded.feed != '' AND samples.feed != excluded.feed)
 			    OR (excluded.ecosystem != '' AND samples.ecosystem != excluded.ecosystem)
+			    OR (samples.url = '' AND excluded.url != '')
+			    OR (samples.package = '' AND excluded.package != '')
 			    OR samples.skip IN ('missing','unsupported'))`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.SHA256, s.Parent, s.Skip, s.Elements,
 		s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
-		jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult))
+		jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult),
+		s.URL, s.Domain, s.Package, s.Version)
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
@@ -739,6 +783,7 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
 		"parent", "skip", "elements", "max_crit", "suspicious_count",
 		"mtime", "marker_mtime", "cleave_result", "litmus_result", "analyzed_at", "first_analyzed_at",
+		"url", "domain", "name", "version",
 	}
 	placeholders := make([]string, len(cols))
 	for i := range cols {
@@ -754,6 +799,10 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 			ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE samples.ecosystem END,
 			path  = CASE WHEN excluded.path  != ''   THEN excluded.path  ELSE samples.path  END,
 			mtime = CASE WHEN excluded.mtime IS NOT NULL THEN excluded.mtime ELSE samples.mtime END,
+			url     = CASE WHEN samples.url     = '' THEN excluded.url     ELSE samples.url     END,
+			domain  = CASE WHEN samples.domain  = '' THEN excluded.domain  ELSE samples.domain  END,
+			package    = CASE WHEN samples.package    = '' THEN excluded.package    ELSE samples.package    END,
+			version = CASE WHEN samples.version = '' THEN excluded.version ELSE samples.version END,
 			-- Walker re-observation clears 'missing'/'unsupported' skips.
 			-- See insertSampleNewSQLite for the rationale.
 			skip  = CASE WHEN samples.skip IN ('missing','unsupported') THEN '' ELSE samples.skip END
@@ -764,6 +813,8 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 			    OR (excluded.mtime IS NOT NULL AND samples.mtime IS NOT excluded.mtime)
 			    OR (excluded.feed != '' AND samples.feed != excluded.feed)
 			    OR (excluded.ecosystem != '' AND samples.ecosystem != excluded.ecosystem)
+			    OR (samples.url = '' AND excluded.url != '')
+			    OR (samples.package = '' AND excluded.package != '')
 			    OR samples.skip IN ('missing','unsupported'))`,
 		strings.Join(cols, ", "),
 		strings.Join(placeholders, ", "))
@@ -799,7 +850,8 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 			s.SHA256, s.Parent, s.Skip, s.Elements,
 			s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
-			jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult), s.AnalyzedAt, firstAnalyzedAt)
+			jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult), s.AnalyzedAt, firstAnalyzedAt,
+			s.URL, s.Domain, s.Package, s.Version)
 		if err != nil {
 			return 0, nil, fmt.Errorf("hopper: batch insert %s: %w", s.SHA256, err)
 		}
@@ -946,6 +998,51 @@ func (db *DB) locationsForSHASQLite(ctx context.Context, sha256 string) ([]*Samp
 		out = append(out, loc)
 	}
 	return out, rows.Err()
+}
+
+// pruneVictim names a sample_locations row that should be deleted.
+type pruneVictim struct {
+	path string
+	id   int64
+}
+
+// pruneMissingLocationsSQLite walks every sample_locations row whose
+// path lives under absRoot, stats the file, and deletes the row if
+// stat returns ENOENT. Returns the count of rows deleted.
+func (db *DB) pruneMissingLocationsSQLite(ctx context.Context, absRoot string) (int, error) {
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT id, path FROM sample_locations WHERE path LIKE ?`, absRoot+"/%")
+	if err != nil {
+		return 0, fmt.Errorf("hopper: scan locations for prune: %w", err)
+	}
+	var victims []pruneVictim
+	for rows.Next() {
+		var v pruneVictim
+		if err := rows.Scan(&v.id, &v.path); err != nil {
+			rows.Close() //nolint:errcheck,sqlclosecheck,gosec // best-effort cleanup before error return
+			return 0, fmt.Errorf("hopper: scan location row: %w", err)
+		}
+		path := v.path
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(absRoot, path)
+		}
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			victims = append(victims, v)
+		} else if err != nil {
+			slog.Warn("hopper: stat failed during prune; preserving row", "path", path, "error", err)
+		}
+	}
+	rows.Close() //nolint:errcheck,gosec // best-effort cleanup
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	for _, v := range victims {
+		if _, err := db.lite.ExecContext(ctx, `DELETE FROM sample_locations WHERE id = ?`, v.id); err != nil {
+			return 0, fmt.Errorf("hopper: delete location %d: %w", v.id, err)
+		}
+	}
+	return len(victims), nil
 }
 
 func (db *DB) updateCleaveResultSQLite(

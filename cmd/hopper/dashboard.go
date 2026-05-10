@@ -760,15 +760,13 @@ func (wd *webDashboard) fetchWorkflow(ctx context.Context, db *hopper.DB) dashbo
 	var wg sync.WaitGroup
 
 	run := func(label string, fn func(context.Context) error) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			qctx, cancel := context.WithTimeout(ctx, dashQueryTimeout)
 			defer cancel()
 			if err := fn(qctx); err != nil {
 				slog.Warn("dashboard: workflow query failed", "query", label, "error", err)
 			}
-		}()
+		})
 	}
 
 	if wd.healthCache != nil {
@@ -942,10 +940,7 @@ func ageValue(t time.Time) string {
 	if t.IsZero() {
 		return "—"
 	}
-	d := time.Since(t)
-	if d < 0 {
-		d = 0
-	}
+	d := max(time.Since(t), 0)
 	return shortDuration(d) + " ago"
 }
 

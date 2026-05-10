@@ -4,6 +4,17 @@ CREATE TABLE IF NOT EXISTS samples (
 	source        TEXT NOT NULL DEFAULT '',
 	feed          TEXT NOT NULL DEFAULT '',
 	ecosystem     TEXT NOT NULL DEFAULT '',
+	url           TEXT NOT NULL DEFAULT '',
+	-- domain is the registered domain (eTLD+1) of the url, e.g.
+	-- "registry.npmjs.org" → "npmjs.org". Computed by the writer via
+	-- golang.org/x/net/publicsuffix so it handles multi-level public
+	-- suffixes ("example.co.uk" → "example.co.uk") correctly.
+	domain        TEXT NOT NULL DEFAULT '',
+	-- package is the software package this file belongs to (e.g. "zfs"
+	-- for zfs-2.4.1-r0.apk). Parsed from the download filename using
+	-- the format-specific patterns in pkgparse.ParseFilename.
+	package       TEXT NOT NULL DEFAULT '',
+	version       TEXT NOT NULL DEFAULT '',
 	filename      TEXT NOT NULL DEFAULT '',
 	file_type     TEXT NOT NULL DEFAULT '',
 	size_bytes    BIGINT NOT NULL DEFAULT 0,
@@ -45,6 +56,9 @@ CREATE INDEX IF NOT EXISTS idx_samples_unanalyzed ON samples(sha256) WHERE cleav
 CREATE INDEX IF NOT EXISTS idx_samples_status ON samples(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_samples_path ON samples(path);
 CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent) WHERE parent != '';
+CREATE INDEX IF NOT EXISTS idx_samples_domain ON samples(domain) WHERE domain != '';
+CREATE INDEX IF NOT EXISTS idx_samples_package_version ON samples(package, version) WHERE package != '';
+CREATE INDEX IF NOT EXISTS idx_samples_ecosystem_name ON samples(ecosystem, name) WHERE name != '';
 
 CREATE TABLE IF NOT EXISTS reports (
 	id          BIGSERIAL PRIMARY KEY,

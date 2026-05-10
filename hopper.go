@@ -21,6 +21,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -97,7 +98,7 @@ func sanitizeJSONB(b []byte) []byte {
 func randomSHA256Pivot() string {
 	var b [32]byte
 	if _, err := cryptorand.Read(b[:]); err != nil {
-		sum := cryptosha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
+		sum := cryptosha256.Sum256([]byte(strconv.FormatInt(time.Now().UnixNano(), 10)))
 		return hex.EncodeToString(sum[:])
 	}
 	return hex.EncodeToString(b[:])
@@ -140,7 +141,7 @@ func compactCleaveResultForStorage(sha256 string, result []byte) []byte {
 	}
 	envelope["fs"] = compactFS
 	envelope["truncated"] = json.RawMessage(`true`)
-	envelope["omitted_files"] = json.RawMessage(fmt.Sprintf("%d", len(files)-1))
+	envelope["omitted_files"] = json.RawMessage(strconv.Itoa(len(files) - 1))
 	compact, err := json.Marshal(envelope)
 	if err != nil {
 		return result
@@ -198,6 +199,10 @@ type Sample struct {
 	Source          string
 	Feed            string
 	Ecosystem       string
+	URL             string // canonical URL the bytes were fetched from
+	Domain          string // registered domain (eTLD+1), populated via golang.org/x/net/publicsuffix
+	Package         string // software package this file belongs to, e.g. "lodash" or "@vue/cli"
+	Version         string // package version, e.g. "4.17.21"
 	Filename        string
 	FileType        string
 	Label           string // "bad", "good", "unknown"
@@ -240,7 +245,7 @@ type SampleLocation struct {
 	Path         string
 	ParentSHA256 string // sha of the archive this observation was extracted from; "" if top-level
 	Filename     string
-	Source       string // "harvest", "upload", ...
+	Source       string // "forager", "upload", ... ("harvest" persists on legacy rows)
 	Feed         string
 	Ecosystem    string
 	ID           int64
@@ -268,11 +273,11 @@ type WorkflowHealth struct {
 
 // WorkflowBacklog groups pending work by source/feed/ecosystem.
 type WorkflowBacklog struct {
+	OldestPending time.Time
+	NewestPending time.Time
 	Source        string
 	Feed          string
 	Ecosystem     string
-	OldestPending time.Time
-	NewestPending time.Time
 	PendingCleave int64
 	PendingLitmus int64
 }
@@ -847,6 +852,30 @@ func (db *DB) LocationsForSHA(ctx context.Context, sha256 string) ([]*SampleLoca
 		return db.locationsForSHAPG(ctx, sha256)
 	}
 	return db.locationsForSHASQLite(ctx, sha256)
+}
+
+// PruneMissingLocations removes sample_locations rows whose path no longer
+// exists on disk. Walks every location row and stats each path; removes
+// rows where stat returns ENOENT. Other stat errors (permission, etc) are
+// logged but the row is preserved.
+//
+// Use after migrating files to a new layout, or any operation that moves
+// files outside the normal hopper-load lifecycle. Safe to interrupt — runs
+// in batches so a kill at the wrong moment leaves a partial prune at worst.
+//
+// Returns the number of rows removed.
+func (db *DB) PruneMissingLocations(ctx context.Context, dataRoot string) (int, error) {
+	if dataRoot == "" {
+		return 0, errors.New("hopper: PruneMissingLocations requires a non-empty dataRoot")
+	}
+	absRoot, err := filepath.Abs(dataRoot)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: resolve dataRoot: %w", err)
+	}
+	if db.pool != nil {
+		return db.pruneMissingLocationsPG(ctx, absRoot)
+	}
+	return db.pruneMissingLocationsSQLite(ctx, absRoot)
 }
 
 // SampleBySHA256 retrieves a sample by its hash.
@@ -1577,7 +1606,7 @@ func (db *DB) RecomputeCanonicalSHA256(ctx context.Context) (int64, error) {
 
 // FeedQuery specifies filters for paginated feed queries.
 type FeedQuery struct {
-	Source        string   // "harvest" or "upload"
+	Source        string   // "forager" or "upload" ("harvest" matches legacy rows)
 	Label         string   // "bad", "good", "unknown", or "" (match any)
 	OrderBy       string   // "mtime" (default), "created_at", or "analyzed_at"
 	Formula       string   // optional: filter by exact cleave chemical formula

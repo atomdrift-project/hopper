@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -166,6 +168,19 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 		// feedSourcesPG / feedEcosystemsPG: DISTINCT feed/ecosystem WHERE source = $1.
 		`CREATE INDEX IF NOT EXISTS idx_samples_source_feed ON samples(source, feed) WHERE feed != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_source_ecosystem ON samples(source, ecosystem) WHERE ecosystem != ''`,
+		// Forager direct-insert provenance. url is the canonical URL the
+		// bytes were fetched from; domain is the registered domain (eTLD+1)
+		// of that url, populated by the Go writer via publicsuffix.
+		// name+version describe the package, enabling supply-chain queries
+		// ("same name+version, different SHA-256" = silent payload swap).
+		// Per-content (samples-level), not per-observation: the URL bytes
+		// "are from" doesn't legitimately vary across re-fetches.
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS url TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS domain TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS package TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS version TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_domain ON samples(domain) WHERE domain != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_package_version ON samples(package, version) WHERE package != ''`,
 		`UPDATE samples SET skip = 'skip-benign-archive-item' WHERE skip = 'weak-findings'`,
 		// Worker heartbeat table for dashboard.
 		`CREATE TABLE IF NOT EXISTS workers (
@@ -539,14 +554,16 @@ func (db *DB) invalidPGIndex(ctx context.Context, indexName string) (bool, error
 const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, cleave_result, litmus_result, litmus_score,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
-	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime, traits_version`
+	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime, traits_version,
+	url, domain, package, version`
 
 // pgSampleColsLight excludes cleave_result and litmus_result to avoid loading
 // potentially large JSON blobs when only metadata is needed (e.g. claim queries).
 const pgSampleColsLight = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, litmus_score,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
-	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime, traits_version`
+	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime, traits_version,
+	url, domain, package, version`
 
 func pgSampleDest(s *Sample) []any {
 	return []any{
@@ -557,6 +574,7 @@ func pgSampleDest(s *Sample) []any {
 		&s.MaxCrit, &s.SuspiciousCount,
 		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.FirstAnalyzedAt, &s.LastErrorAt, &s.Mtime, &s.MarkerMtime,
 		&s.TraitsVersion,
+		&s.URL, &s.Domain, &s.Package, &s.Version,
 	}
 }
 
@@ -569,6 +587,7 @@ func pgSampleDestLight(s *Sample) []any {
 		&s.MaxCrit, &s.SuspiciousCount,
 		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.FirstAnalyzedAt, &s.LastErrorAt, &s.Mtime, &s.MarkerMtime,
 		&s.TraitsVersion,
+		&s.URL, &s.Domain, &s.Package, &s.Version,
 	}
 }
 
@@ -693,7 +712,7 @@ func (db *DB) workflowSamplesPG(ctx context.Context, where string, limit int) ([
 			cleave_result IS NOT NULL,
 			litmus_result IS NOT NULL,
 			COALESCE((litmus_result->>'class')::int, 0)
-		FROM samples `+where, limit) //nolint:gosec // where is a fixed fragment selected by workflowSnapshotPG.
+		FROM samples `+where, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: workflow samples: %w", err)
 	}
@@ -746,14 +765,24 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 			size_bytes, label, label_source, path, status,
 			canonical_sha256, parent, skip, elements,
 			max_crit, suspicious_count, mtime, marker_mtime,
-			cleave_result, litmus_result)
+			cleave_result, litmus_result,
+			url, domain, package, version)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-			$1, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+			$1, $11, $12, $13, $14, $15, $16, $17, $18, $19,
+			$20, $21, $22, $23)
 		ON CONFLICT (sha256) DO UPDATE SET
 			feed  = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE samples.feed END,
 			ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE samples.ecosystem END,
 			path  = CASE WHEN EXCLUDED.path  <> ''   THEN EXCLUDED.path  ELSE samples.path  END,
 			mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END,
+			-- Provenance fields stick to first non-empty observation: if the
+			-- existing row has a value, keep it. The first-observation URL is
+			-- the canonical one; subsequent re-fetches via mirrors don't
+			-- overwrite history.
+			url     = CASE WHEN samples.url     = '' THEN EXCLUDED.url     ELSE samples.url     END,
+			domain  = CASE WHEN samples.domain  = '' THEN EXCLUDED.domain  ELSE samples.domain  END,
+			package    = CASE WHEN samples.package    = '' THEN EXCLUDED.package    ELSE samples.package    END,
+			version = CASE WHEN samples.version = '' THEN EXCLUDED.version ELSE samples.version END,
 			-- Walker has re-observed a row that we previously gave up on
 			-- (permission error hid it, or cleave didn't support the type
 			-- yet). Clear the skip so it gets re-claimed for analysis. Other
@@ -764,12 +793,15 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 		    OR (EXCLUDED.mtime IS NOT NULL AND samples.mtime IS DISTINCT FROM EXCLUDED.mtime)
 		    OR (EXCLUDED.feed <> '' AND samples.feed IS DISTINCT FROM EXCLUDED.feed)
 		    OR (EXCLUDED.ecosystem <> '' AND samples.ecosystem IS DISTINCT FROM EXCLUDED.ecosystem)
+		    OR (samples.url = '' AND EXCLUDED.url <> '')
+		    OR (samples.package = '' AND EXCLUDED.package <> '')
 		    OR samples.skip IN ('missing','unsupported'))`,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.Parent, s.Skip, s.Elements,
 		s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
-		sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult))
+		sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult),
+		s.URL, s.Domain, s.Package, s.Version)
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
@@ -807,6 +839,7 @@ var insertBatchStagingCols = []string{
 	"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
 	"parent", "skip", "elements", "max_crit", "suspicious_count",
 	"mtime", "marker_mtime", "cleave_result", "litmus_result", "analyzed_at", "first_analyzed_at",
+	"url", "domain", "name", "version",
 }
 
 const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
@@ -816,7 +849,8 @@ const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 	parent TEXT, skip TEXT, elements TEXT,
 	max_crit INTEGER, suspicious_count INTEGER,
 	mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ,
-	cleave_result JSONB, litmus_result JSONB, analyzed_at TIMESTAMPTZ, first_analyzed_at TIMESTAMPTZ
+	cleave_result JSONB, litmus_result JSONB, analyzed_at TIMESTAMPTZ, first_analyzed_at TIMESTAMPTZ,
+	url TEXT, domain TEXT, name TEXT, version TEXT
 ) ON COMMIT DROP`
 
 // file_type, score, formula, and litmus_score are GENERATED columns on
@@ -829,19 +863,25 @@ const insertBatchStagingInsert = `INSERT INTO samples (
 	size_bytes, label, label_source, path, status,
 	canonical_sha256, parent, skip, elements,
 	max_crit, suspicious_count, mtime, marker_mtime,
-	cleave_result, litmus_result, analyzed_at, first_analyzed_at)
+	cleave_result, litmus_result, analyzed_at, first_analyzed_at,
+	url, domain, package, version)
 SELECT DISTINCT ON (sha256)
 	sha256, source, feed, ecosystem, filename,
 	size_bytes, label, label_source, path, status,
 	canonical_sha256, parent, skip, elements,
 	max_crit, suspicious_count, mtime, marker_mtime,
-	cleave_result, litmus_result, analyzed_at, first_analyzed_at
+	cleave_result, litmus_result, analyzed_at, first_analyzed_at,
+	url, domain, package, version
 FROM _staging
 ON CONFLICT (sha256) DO UPDATE SET
 	feed  = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE samples.feed END,
 	ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE samples.ecosystem END,
 	path  = CASE WHEN EXCLUDED.path  <> ''   THEN EXCLUDED.path  ELSE samples.path  END,
 	mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END,
+	url     = CASE WHEN samples.url     = '' THEN EXCLUDED.url     ELSE samples.url     END,
+	domain  = CASE WHEN samples.domain  = '' THEN EXCLUDED.domain  ELSE samples.domain  END,
+	package    = CASE WHEN samples.package    = '' THEN EXCLUDED.package    ELSE samples.package    END,
+	version = CASE WHEN samples.version = '' THEN EXCLUDED.version ELSE samples.version END,
 	-- Re-observation by the walker clears 'missing'/'unsupported' skips
 	-- so a previously-hidden or previously-unsupported file rejoins the
 	-- analysis queue. See insertSampleNewPG for the full rationale.
@@ -856,6 +896,8 @@ WHERE EXCLUDED.parent = ''
     OR (EXCLUDED.mtime IS NOT NULL AND samples.mtime IS DISTINCT FROM EXCLUDED.mtime)
     OR (EXCLUDED.feed <> '' AND samples.feed IS DISTINCT FROM EXCLUDED.feed)
     OR (EXCLUDED.ecosystem <> '' AND samples.ecosystem IS DISTINCT FROM EXCLUDED.ecosystem)
+    OR (samples.url = '' AND EXCLUDED.url <> '')
+    OR (samples.package = '' AND EXCLUDED.package <> '')
     OR samples.skip IN ('missing','unsupported'))`
 
 func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inserted int64, needsAnalysis []string, err error) {
@@ -870,6 +912,7 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256,
 			s.Parent, s.Skip, s.Elements, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
 			sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult), s.AnalyzedAt, firstAnalyzedAt,
+			s.URL, s.Domain, s.Package, s.Version,
 		}
 	}
 
@@ -1014,6 +1057,44 @@ func (db *DB) locationsForSHAPG(ctx context.Context, sha256 string) ([]*SampleLo
 		out = append(out, loc)
 	}
 	return out, rows.Err()
+}
+
+// pruneMissingLocationsPG mirrors pruneMissingLocationsSQLite for the
+// PostgreSQL backend.
+func (db *DB) pruneMissingLocationsPG(ctx context.Context, absRoot string) (int, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT id, path FROM sample_locations WHERE path LIKE $1`, absRoot+"/%")
+	if err != nil {
+		return 0, fmt.Errorf("hopper: scan locations for prune: %w", err)
+	}
+	var victims []pruneVictim
+	for rows.Next() {
+		var v pruneVictim
+		if err := rows.Scan(&v.id, &v.path); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("hopper: scan location row: %w", err)
+		}
+		path := v.path
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(absRoot, path)
+		}
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			victims = append(victims, v)
+		} else if err != nil {
+			slog.Warn("hopper: stat failed during prune; preserving row", "path", path, "error", err)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	for _, v := range victims {
+		if _, err := db.pool.Exec(ctx, `DELETE FROM sample_locations WHERE id = $1`, v.id); err != nil {
+			return 0, fmt.Errorf("hopper: delete location %d: %w", v.id, err)
+		}
+	}
+	return len(victims), nil
 }
 
 func (db *DB) updateCleaveResultPG(

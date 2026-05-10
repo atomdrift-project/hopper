@@ -4,6 +4,14 @@ CREATE TABLE IF NOT EXISTS samples (
 	source        TEXT NOT NULL DEFAULT '',
 	feed          TEXT NOT NULL DEFAULT '',
 	ecosystem     TEXT NOT NULL DEFAULT '',
+	url           TEXT NOT NULL DEFAULT '',
+	-- domain is the registered domain (eTLD+1), populated by the Go writer
+	-- via golang.org/x/net/publicsuffix.
+	domain        TEXT NOT NULL DEFAULT '',
+	-- package is the software package this file belongs to (parsed from
+	-- the download filename via pkgparse.ParseFilename).
+	package       TEXT NOT NULL DEFAULT '',
+	version       TEXT NOT NULL DEFAULT '',
 	filename      TEXT NOT NULL DEFAULT '',
 	-- file_type, score, formula, litmus_score are GENERATED from the JSONB
 	-- source columns. Writing to them is an error; readers see the same
