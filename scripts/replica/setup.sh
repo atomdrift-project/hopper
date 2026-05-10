@@ -21,7 +21,14 @@ REMOTE_DB="${REMOTE_DB:-hopper}"
 LOCAL_DB="${LOCAL_DB:-hopper}"
 LOCAL_USER="${LOCAL_USER:-hopper}"
 PUBLICATION="${PUBLICATION:-hopper_replica}"
-SUBSCRIPTION="${SUBSCRIPTION:-hopper_replica}"
+# Subscription name is per-replica because Postgres derives the
+# replication slot name on the publisher from it: two replicas with the
+# same subscription name would fight over a single slot. The local
+# hostname is unique per host and stable across restarts; sanitize it to
+# the [a-z0-9_] subset Postgres allows for identifiers.
+default_sub_suffix=$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_' | sed 's/_*$//')
+[ -z "$default_sub_suffix" ] && default_sub_suffix="local"
+SUBSCRIPTION="${SUBSCRIPTION:-hopper_replica_${default_sub_suffix}}"
 COPY_DATA="${COPY_DATA:-true}"
 LEGACY_PUBLICATION="${LEGACY_PUBLICATION:-hopper_training}"
 PGPASS="${PGPASSFILE:-$HOME/.pgpass}"
