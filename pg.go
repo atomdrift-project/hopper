@@ -839,7 +839,7 @@ var insertBatchStagingCols = []string{
 	"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
 	"parent", "skip", "elements", "max_crit", "suspicious_count",
 	"mtime", "marker_mtime", "cleave_result", "litmus_result", "analyzed_at", "first_analyzed_at",
-	"url", "domain", "name", "version",
+	"url", "domain", "package", "version",
 }
 
 const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
@@ -850,7 +850,7 @@ const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 	max_crit INTEGER, suspicious_count INTEGER,
 	mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ,
 	cleave_result JSONB, litmus_result JSONB, analyzed_at TIMESTAMPTZ, first_analyzed_at TIMESTAMPTZ,
-	url TEXT, domain TEXT, name TEXT, version TEXT
+	url TEXT, domain TEXT, package TEXT, version TEXT
 ) ON COMMIT DROP`
 
 // file_type, score, formula, and litmus_score are GENERATED columns on

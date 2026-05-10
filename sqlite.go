@@ -217,7 +217,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 	for _, col := range []struct{ name, ddl string }{
 		{"url", `ALTER TABLE samples ADD COLUMN url TEXT NOT NULL DEFAULT ''`},
 		{"domain", `ALTER TABLE samples ADD COLUMN domain TEXT NOT NULL DEFAULT ''`},
-		{"name", `ALTER TABLE samples ADD COLUMN name TEXT NOT NULL DEFAULT ''`},
+		{"package", `ALTER TABLE samples ADD COLUMN package TEXT NOT NULL DEFAULT ''`},
 		{"version", `ALTER TABLE samples ADD COLUMN version TEXT NOT NULL DEFAULT ''`},
 	} {
 		if pragmaHasColumn(ctx, db.lite, col.name) == 0 {
@@ -228,7 +228,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 	}
 	for _, ddl := range []string{
 		`CREATE INDEX IF NOT EXISTS idx_samples_domain ON samples(domain) WHERE domain != ''`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_name_version ON samples(name, version) WHERE name != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_package_version ON samples(package, version) WHERE package != ''`,
 	} {
 		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite samples index: %w", err)
@@ -783,7 +783,7 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
 		"parent", "skip", "elements", "max_crit", "suspicious_count",
 		"mtime", "marker_mtime", "cleave_result", "litmus_result", "analyzed_at", "first_analyzed_at",
-		"url", "domain", "name", "version",
+		"url", "domain", "package", "version",
 	}
 	placeholders := make([]string, len(cols))
 	for i := range cols {
