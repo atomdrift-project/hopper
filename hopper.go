@@ -1639,6 +1639,7 @@ type FeedQuery struct {
 	Formula       string   // optional: filter by exact cleave chemical formula
 	Feeds         []string // optional: filter by feed column values
 	Ecosystems    []string // optional: filter by ecosystem column values
+	Domains       []string // optional: filter by domain column values
 	LitmusClasses []int    // optional: filter by litmus_result class values
 	RequireLitmus bool     // require any litmus_result without filtering by class
 	TopLevelOnly  bool     // only samples with no archive parent
@@ -1671,12 +1672,24 @@ func (db *DB) FeedSources(ctx context.Context, source, label string) ([]string, 
 	return db.feedSourcesSQLite(ctx, source, label)
 }
 
-// FeedEcosystems returns distinct ecosystem values for samples matching source and label.
+// FeedEcosystems returns distinct ecosystem values for samples matching
+// source and label. Pass source="" to span all sources (legacy "harvest"
+// rows + new "forager" rows + manual uploads).
 func (db *DB) FeedEcosystems(ctx context.Context, source, label string) ([]string, error) {
 	if db.pool != nil {
 		return db.feedEcosystemsPG(ctx, source, label)
 	}
 	return db.feedEcosystemsSQLite(ctx, source, label)
+}
+
+// FeedDomains returns distinct domain values (eTLD+1 of where bytes were
+// fetched from) for samples matching source and label. Pass source=""
+// to span all sources.
+func (db *DB) FeedDomains(ctx context.Context, source, label string) ([]string, error) {
+	if db.pool != nil {
+		return db.feedDomainsPG(ctx, source, label)
+	}
+	return db.feedDomainsSQLite(ctx, source, label)
 }
 
 func (q *FeedQuery) clamp() {

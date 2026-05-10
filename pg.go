@@ -2106,7 +2106,7 @@ func (db *DB) applyCleanupPG(ctx context.Context, stage CleanupStage) (int64, er
 func (db *DB) feedSamplesPG(ctx context.Context, q FeedQuery) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT `+pgSampleCols+` FROM samples
-		WHERE source = $1
+		WHERE ($1 = '' OR source = $1)
 			AND ($2 = '' OR label = $2)
 			AND cleave_result IS NOT NULL
 			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
@@ -2115,9 +2115,10 @@ func (db *DB) feedSamplesPG(ctx context.Context, q FeedQuery) ([]*Sample, error)
 			AND (NOT $6 OR parent = '')
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
+			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))
 		ORDER BY `+q.sortBy()+` DESC NULLS LAST
-		LIMIT $9 OFFSET $10`,
-		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly, q.Formula, q.RequireLitmus, q.Limit, q.Offset)
+		LIMIT $10 OFFSET $11`,
+		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly, q.Formula, q.RequireLitmus, q.Domains, q.Limit, q.Offset)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed samples: %w", err)
 	}
@@ -2128,7 +2129,7 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q FeedQuery) (int, error) 
 	var n int
 	err := db.pool.QueryRow(ctx, `
 		SELECT count(*) FROM samples
-		WHERE source = $1
+		WHERE ($1 = '' OR source = $1)
 			AND ($2 = '' OR label = $2)
 			AND cleave_result IS NOT NULL
 			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
@@ -2136,8 +2137,9 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q FeedQuery) (int, error) 
 			AND (coalesce(cardinality($5::int[]), 0) = 0 OR (litmus_result->>'class')::int = ANY($5))
 			AND (NOT $6 OR parent = '')
 			AND ($7 = '' OR formula = $7)
-			AND (NOT $8 OR litmus_result IS NOT NULL)`,
-		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly, q.Formula, q.RequireLitmus).Scan(&n)
+			AND (NOT $8 OR litmus_result IS NOT NULL)
+			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))`,
+		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly, q.Formula, q.RequireLitmus, q.Domains).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: feed samples count: %w", err)
 	}
@@ -2147,7 +2149,7 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q FeedQuery) (int, error) 
 func (db *DB) feedSourcesPG(ctx context.Context, source, label string) ([]string, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT DISTINCT feed FROM samples
-		WHERE source = $1 AND ($2 = '' OR label = $2) AND feed != ''
+		WHERE ($1 = '' OR source = $1) AND ($2 = '' OR label = $2) AND feed != ''
 		ORDER BY feed`, source, label)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed sources: %w", err)
@@ -2158,10 +2160,21 @@ func (db *DB) feedSourcesPG(ctx context.Context, source, label string) ([]string
 func (db *DB) feedEcosystemsPG(ctx context.Context, source, label string) ([]string, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT DISTINCT ecosystem FROM samples
-		WHERE source = $1 AND ($2 = '' OR label = $2) AND ecosystem != ''
+		WHERE ($1 = '' OR source = $1) AND ($2 = '' OR label = $2) AND ecosystem != ''
 		ORDER BY ecosystem`, source, label)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed ecosystems: %w", err)
+	}
+	return scanPGStrings(rows)
+}
+
+func (db *DB) feedDomainsPG(ctx context.Context, source, label string) ([]string, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT DISTINCT domain FROM samples
+		WHERE ($1 = '' OR source = $1) AND ($2 = '' OR label = $2) AND domain != ''
+		ORDER BY domain`, source, label)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: feed domains: %w", err)
 	}
 	return scanPGStrings(rows)
 }

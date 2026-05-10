@@ -2074,6 +2074,15 @@ func (q *FeedQuery) whereSQLite() (where string, args []any) {
 		clauses = append(clauses, "ecosystem IN ("+strings.Join(placeholders, ", ")+")")
 	}
 
+	if len(q.Domains) > 0 {
+		placeholders := make([]string, len(q.Domains))
+		for i := range q.Domains {
+			placeholders[i] = "?"
+			args = append(args, q.Domains[i])
+		}
+		clauses = append(clauses, "domain IN ("+strings.Join(placeholders, ", ")+")")
+	}
+
 	if len(q.LitmusClasses) > 0 {
 		placeholders := make([]string, len(q.LitmusClasses))
 		for i := range q.LitmusClasses {
@@ -2099,8 +2108,8 @@ func (q *FeedQuery) whereSQLite() (where string, args []any) {
 }
 
 func (db *DB) feedSourcesSQLite(ctx context.Context, source, label string) ([]string, error) {
-	query := `SELECT DISTINCT feed FROM samples WHERE source = ? AND (? = '' OR label = ?) AND feed != '' ORDER BY feed`
-	rows, err := db.lite.QueryContext(ctx, query, source, label, label)
+	query := `SELECT DISTINCT feed FROM samples WHERE (? = '' OR source = ?) AND (? = '' OR label = ?) AND feed != '' ORDER BY feed`
+	rows, err := db.lite.QueryContext(ctx, query, source, source, label, label)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed sources: %w", err)
 	}
@@ -2108,10 +2117,19 @@ func (db *DB) feedSourcesSQLite(ctx context.Context, source, label string) ([]st
 }
 
 func (db *DB) feedEcosystemsSQLite(ctx context.Context, source, label string) ([]string, error) {
-	query := `SELECT DISTINCT ecosystem FROM samples WHERE source = ? AND (? = '' OR label = ?) AND ecosystem != '' ORDER BY ecosystem`
-	rows, err := db.lite.QueryContext(ctx, query, source, label, label)
+	query := `SELECT DISTINCT ecosystem FROM samples WHERE (? = '' OR source = ?) AND (? = '' OR label = ?) AND ecosystem != '' ORDER BY ecosystem`
+	rows, err := db.lite.QueryContext(ctx, query, source, source, label, label)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed ecosystems: %w", err)
+	}
+	return scanLiteStrings(rows)
+}
+
+func (db *DB) feedDomainsSQLite(ctx context.Context, source, label string) ([]string, error) {
+	query := `SELECT DISTINCT domain FROM samples WHERE (? = '' OR source = ?) AND (? = '' OR label = ?) AND domain != '' ORDER BY domain`
+	rows, err := db.lite.QueryContext(ctx, query, source, source, label, label)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: feed domains: %w", err)
 	}
 	return scanLiteStrings(rows)
 }
