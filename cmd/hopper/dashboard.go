@@ -30,6 +30,7 @@ type webDashboard struct {
 	db            *hopper.DB
 	progress      *loadProgress
 	tracker       *workerTracker
+	api           *apiServer // for live traits-version reads (refreshed every 2h)
 	rescanCache   *fido.Cache[string, int64]
 	healthCache   *fido.Cache[string, hopper.WorkflowHealth]
 	backlogCache  *fido.Cache[string, []hopper.WorkflowBacklog]
@@ -134,7 +135,7 @@ func (wd *webDashboard) snapshotStages() []startupStage {
 // handler needs to render progress and is safe to call concurrently with the
 // HTTP server already running.
 func (wd *webDashboard) configure( //nolint:revive // argument-limit: dashboard needs all session state at once
-	progress *loadProgress, litmus *litmusServer, tracker *workerTracker,
+	progress *loadProgress, litmus *litmusServer, tracker *workerTracker, api *apiServer,
 	db *hopper.DB, start time.Time, startAnalyzed int64, maxAnalyzed, ndirs int, traitsVersion string, rescanAge time.Duration,
 ) {
 	wd.cfgMu.Lock()
@@ -142,6 +143,7 @@ func (wd *webDashboard) configure( //nolint:revive // argument-limit: dashboard 
 	wd.progress = progress
 	wd.litmus = litmus
 	wd.tracker = tracker
+	wd.api = api
 	wd.db = db
 	wd.start = start
 	wd.startAnalyzed = startAnalyzed
@@ -663,9 +665,21 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 
 	// Workers
 	if len(workers) > 0 {
+		// latestTraits is the canonical traits version we measure each
+		// worker against. Read live from apiServer so the periodic
+		// rules-rotation refresh is reflected immediately on the next
+		// dashboard render.
+		latestTraits := wd.traitsVersion
+		if wd.api != nil {
+			if v := wd.api.TraitsVersion(); v != "" {
+				latestTraits = v
+			}
+		}
+
 		buf.WriteString(`<section><div class="label">Workers</div>`)
 		buf.WriteString(`<table><thead><tr>` +
-			`<th>Worker</th><th>Tasks</th><th>Seen</th><th>Rate</th>` +
+			`<th>Worker</th><th>Litmus</th><th>Traits</th>` +
+			`<th>Tasks</th><th>Seen</th><th>Rate</th>` +
 			`<th class="col-rss">RSS</th><th>Load</th>` +
 			`<th>Analyzed</th><th>Errors</th><th>Oldest Job</th><th></th>` +
 			`</tr></thead><tbody>`)
@@ -681,6 +695,20 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 			}
 			if w.ActiveClaims == 0 && idle >= workerInactiveWindow {
 				dotClass = "dot-bad"
+			}
+			// Stale-traits also drops the worker to dot-warn (unless
+			// it's already a worse status). Mismatch is only meaningful
+			// if we have a known-good "latest" to compare against.
+			traitsStale := latestTraits != "" && w.Traits != "" && w.Traits != latestTraits
+			if traitsStale && dotClass == "dot-ok" {
+				dotClass = "dot-warn"
+			}
+
+			litmusCell := dashEm(w.Version)
+			traitsCell := dashEm(w.Traits)
+			if traitsStale {
+				traitsCell = fmt.Sprintf(`<span class="warn">%s &rarr; %s</span>`,
+					htmlEscape(w.Traits), htmlEscape(latestTraits))
 			}
 
 			nRate := nodeRateByName[w.Name]
@@ -712,6 +740,8 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 			fmt.Fprintf(&buf,
 				`<tr>`+
 					`<td class="nn"><span class="dot %s">●</span>%s</td>`+
+					`<td>%s</td>`+
+					`<td>%s</td>`+
 					`<td class="hi">%d/%d</td>`+
 					`<td class="hi">%s</td>`+
 					`<td class="rate">%s</td>`+
@@ -723,6 +753,8 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 					`<td class="warn">%s</td>`+
 					`</tr>`,
 				dotClass, htmlEscape(w.Name),
+				litmusCell,
+				traitsCell,
 				w.ActiveClaims, w.Slots,
 				shortDuration(idle),
 				rateStr,
@@ -1204,4 +1236,14 @@ func shortDuration(d time.Duration) string {
 
 func htmlEscape(s string) string {
 	return html.EscapeString(s)
+}
+
+// dashEm renders s as an html-escaped table cell, falling back to a long
+// dash for empty values. Keeps the dashboard from showing blank cells
+// for unreported fields like worker version / traits.
+func dashEm(s string) string {
+	if s == "" {
+		return "—"
+	}
+	return htmlEscape(s)
 }

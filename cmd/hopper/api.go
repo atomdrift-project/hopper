@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -25,17 +26,39 @@ import (
 // /api/file/{sha256}. Sample data lives in the database; per-job claim
 // state lives in workerTracker (see below).
 type apiServer struct {
-	db                  *hopper.DB
-	tracker             *workerTracker
-	progress            *loadProgress
-	explosions          chan explosionJob // archive-expansion work, drained by background goroutines
-	hopperStart         time.Time         // process start; gates force-rescan claim tier
-	dataRoot            string            // resolved absolute path to the data directory
-	traitsVersion       string            // short prefix of current traits repo commit; empty = rescan disabled
-	allowedDirs         []string          // resolved absolute paths that /api/file may serve from
-	forceRescanPrefixes []string          // normalized relative paths to re-analyze when analysis predates hopperStart
-	explosionWG         sync.WaitGroup    // tracks live explosion workers for graceful drain
+	db         *hopper.DB
+	tracker    *workerTracker
+	progress   *loadProgress
+	explosions chan explosionJob // archive-expansion work, drained by background goroutines
+	// traitsVersion holds the short prefix of the current traits repo
+	// commit. Stored in an atomic.Pointer so the periodic rules-update
+	// goroutine can refresh it concurrently with read traffic from
+	// /api/next, /api/result, and the dashboard. Empty = rescan disabled.
+	traitsVersion       atomic.Pointer[string]
+	hopperStart         time.Time // process start; gates force-rescan claim tier
+	dataRoot            string    // resolved absolute path to the data directory
+	allowedDirs         []string  // resolved absolute paths that /api/file may serve from
+	forceRescanPrefixes []string  // normalized relative paths to re-analyze when analysis predates hopperStart
+	explosionWG         sync.WaitGroup
 	rescanAge           time.Duration
+}
+
+// TraitsVersion returns the current canonical traits version. Safe for
+// concurrent callers; empty if not yet set or if the local litmus
+// hasn't reported a version.
+func (s *apiServer) TraitsVersion() string {
+	if v := s.traitsVersion.Load(); v != nil {
+		return *v
+	}
+	return ""
+}
+
+// SetTraitsVersion updates the canonical traits version. Called once at
+// startup with the initial value, and again after every periodic
+// rules-update rotation so dashboard staleness checks reflect what the
+// local litmus is actually running.
+func (s *apiServer) SetTraitsVersion(v string) {
+	s.traitsVersion.Store(&v)
 }
 
 // explosionJob defers archive-member expansion off the /api/result hot path.
@@ -525,8 +548,8 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 
 	if len(jobs) == 0 {
 		var rescanPending int64
-		if s.traitsVersion != "" {
-			if n, err := s.db.CountRescanPending(ctx, s.traitsVersion, s.rescanAge); err == nil {
+		if s.TraitsVersion() != "" {
+			if n, err := s.db.CountRescanPending(ctx, s.TraitsVersion(), s.rescanAge); err == nil {
 				rescanPending = n
 			} else {
 				slog.Debug("count rescan pending failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
@@ -535,7 +558,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		//nolint:gosec // worker is sanitized by validWorkerName.
 		slog.Info("no work available", "worker", worker,
 			"active_claims", s.tracker.activeClaims(worker),
-			"traits_version", s.traitsVersion,
+			"traits_version", s.TraitsVersion(),
 			"rescan_age", s.rescanAge,
 			"rescan_pending", rescanPending,
 			"force_rescan_prefixes", len(s.forceRescanPrefixes))
@@ -708,7 +731,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	// traits hash.
 	tv := parsed.TraitsVersion
 	if tv == "" {
-		tv = s.traitsVersion
+		tv = s.TraitsVersion()
 	}
 	if tv == "" {
 		if wt := s.tracker.traits(req.Worker); len(wt) >= 5 {
@@ -879,9 +902,9 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int) ([]
 		}
 	}
 
-	if s.traitsVersion != "" {
+	if s.TraitsVersion() != "" {
 		want = count - len(out)
-		cands, err = s.db.StaleTraitsCandidates(ctx, s.traitsVersion, s.rescanAge, s.hopperStart, want*candidateOverfetch)
+		cands, err = s.db.StaleTraitsCandidates(ctx, s.TraitsVersion(), s.rescanAge, s.hopperStart, want*candidateOverfetch)
 		if err != nil {
 			return out, err
 		}

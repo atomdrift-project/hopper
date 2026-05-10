@@ -1125,17 +1125,21 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 				slog.Error("litmus monitor failed", "error", err)
 			}
 		}()
-		// Periodically pull fresh litmus rules and restart the worker so it
-		// picks them up. `litmus update-rules` validates the new bundle and
-		// rolls back on load failure, so a broken upstream commit never
-		// reaches the worker.
+		// The litmus worker self-updates rules every hour via its own
+		// spawn_resource_renewal_task (in worker.rs). We just poll the
+		// resulting traits version on the same cadence so the dashboard's
+		// "is this worker stale?" check measures against the live local
+		// litmus, not the snapshot taken at startup. No external restart
+		// needed — the worker reloads its capability mapper in-place.
 		go func() {
-			ticker := time.NewTicker(2 * time.Hour)
+			ticker := time.NewTicker(1 * time.Hour)
 			defer ticker.Stop()
 			for {
 				select {
 				case <-ticker.C:
-					litmus.RotateForRulesUpdate(ctx)
+					if v := litmusTraitsVersion(ctx, *litmusBin); v != "" {
+						api.SetTraitsVersion(v)
+					}
 				case <-ctx.Done():
 					return
 				}
@@ -1160,7 +1164,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	api.dataRoot = *dataDir
 	api.allowedDirs = allowedDirs
 
-	api.traitsVersion = traitsVersion
+	api.SetTraitsVersion(traitsVersion)
 	api.rescanAge = *rescanAge
 
 	// Background pool that handles archive expansion off the /api/result hot
@@ -1381,7 +1385,7 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	})
 
 	if wd != nil {
-		wd.configure(&progress, litmus, tracker, db, start, startAnalyzed, maxAnalyzed, len(dirs), traitsVersion, rescanAge)
+		wd.configure(&progress, litmus, tracker, api, db, start, startAnalyzed, maxAnalyzed, len(dirs), traitsVersion, rescanAge)
 	}
 
 	// runWalk executes one full enumeration→hash→insert pass across all dirs.
