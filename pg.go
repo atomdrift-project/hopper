@@ -1061,19 +1061,21 @@ func (db *DB) locationsForSHAPG(ctx context.Context, sha256 string) ([]*SampleLo
 
 // pruneMissingLocationsPG mirrors pruneMissingLocationsSQLite for the
 // PostgreSQL backend.
-func (db *DB) pruneMissingLocationsPG(ctx context.Context, absRoot string) (int, error) {
+func (db *DB) pruneMissingLocationsPG(ctx context.Context, absRoot string, maxFraction float64) (int, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT id, path FROM sample_locations WHERE path LIKE $1`, absRoot+"/%")
 	if err != nil {
 		return 0, fmt.Errorf("hopper: scan locations for prune: %w", err)
 	}
 	var victims []pruneVictim
+	total := 0
 	for rows.Next() {
 		var v pruneVictim
 		if err := rows.Scan(&v.id, &v.path); err != nil {
 			rows.Close()
 			return 0, fmt.Errorf("hopper: scan location row: %w", err)
 		}
+		total++
 		path := v.path
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(absRoot, path)
@@ -1087,6 +1089,10 @@ func (db *DB) pruneMissingLocationsPG(ctx context.Context, absRoot string) (int,
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return 0, err
+	}
+
+	if total > 0 && float64(len(victims))/float64(total) > maxFraction {
+		return 0, &PruneSafetyExceeded{Total: total, Victims: len(victims), MaxFraction: maxFraction}
 	}
 
 	for _, v := range victims {

@@ -1008,20 +1008,24 @@ type pruneVictim struct {
 
 // pruneMissingLocationsSQLite walks every sample_locations row whose
 // path lives under absRoot, stats the file, and deletes the row if
-// stat returns ENOENT. Returns the count of rows deleted.
-func (db *DB) pruneMissingLocationsSQLite(ctx context.Context, absRoot string) (int, error) {
+// stat returns ENOENT. Refuses to delete more than maxFraction of the
+// rows it scanned, returning *PruneSafetyExceeded instead.
+// Returns the count of rows deleted.
+func (db *DB) pruneMissingLocationsSQLite(ctx context.Context, absRoot string, maxFraction float64) (int, error) {
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT id, path FROM sample_locations WHERE path LIKE ?`, absRoot+"/%")
 	if err != nil {
 		return 0, fmt.Errorf("hopper: scan locations for prune: %w", err)
 	}
 	var victims []pruneVictim
+	total := 0
 	for rows.Next() {
 		var v pruneVictim
 		if err := rows.Scan(&v.id, &v.path); err != nil {
 			rows.Close() //nolint:errcheck,sqlclosecheck,gosec // best-effort cleanup before error return
 			return 0, fmt.Errorf("hopper: scan location row: %w", err)
 		}
+		total++
 		path := v.path
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(absRoot, path)
@@ -1035,6 +1039,10 @@ func (db *DB) pruneMissingLocationsSQLite(ctx context.Context, absRoot string) (
 	rows.Close() //nolint:errcheck,gosec // best-effort cleanup
 	if err := rows.Err(); err != nil {
 		return 0, err
+	}
+
+	if total > 0 && float64(len(victims))/float64(total) > maxFraction {
+		return 0, &PruneSafetyExceeded{Total: total, Victims: len(victims), MaxFraction: maxFraction}
 	}
 
 	for _, v := range victims {

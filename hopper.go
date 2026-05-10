@@ -854,28 +854,55 @@ func (db *DB) LocationsForSHA(ctx context.Context, sha256 string) ([]*SampleLoca
 	return db.locationsForSHASQLite(ctx, sha256)
 }
 
+// PruneSafetyExceeded is returned by PruneMissingLocations when the
+// number of rows that would be deleted exceeds the maxFraction safety
+// cap. The error carries the counts so the caller can decide whether
+// to retry with force=true after a sanity check.
+type PruneSafetyExceeded struct {
+	Total       int     // total sample_locations rows under the data root
+	Victims     int     // rows whose path no longer exists
+	MaxFraction float64 // configured safety cap, e.g. 0.40
+}
+
+func (e *PruneSafetyExceeded) Error() string {
+	pct := 0.0
+	if e.Total > 0 {
+		pct = 100 * float64(e.Victims) / float64(e.Total)
+	}
+	return fmt.Sprintf(
+		"hopper: prune would remove %d of %d rows (%.1f%%) which exceeds %.0f%% safety cap",
+		e.Victims, e.Total, pct, e.MaxFraction*100)
+}
+
 // PruneMissingLocations removes sample_locations rows whose path no longer
 // exists on disk. Walks every location row and stats each path; removes
 // rows where stat returns ENOENT. Other stat errors (permission, etc) are
 // logged but the row is preserved.
+//
+// Refuses to proceed if the planned prune exceeds maxFraction of the rows
+// under dataRoot, returning *PruneSafetyExceeded without modifying the
+// database. Pass maxFraction=1.0 (or higher) to disable the safety check.
 //
 // Use after migrating files to a new layout, or any operation that moves
 // files outside the normal hopper-load lifecycle. Safe to interrupt — runs
 // in batches so a kill at the wrong moment leaves a partial prune at worst.
 //
 // Returns the number of rows removed.
-func (db *DB) PruneMissingLocations(ctx context.Context, dataRoot string) (int, error) {
+func (db *DB) PruneMissingLocations(ctx context.Context, dataRoot string, maxFraction float64) (int, error) {
 	if dataRoot == "" {
 		return 0, errors.New("hopper: PruneMissingLocations requires a non-empty dataRoot")
+	}
+	if maxFraction <= 0 {
+		return 0, errors.New("hopper: PruneMissingLocations requires maxFraction > 0")
 	}
 	absRoot, err := filepath.Abs(dataRoot)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: resolve dataRoot: %w", err)
 	}
 	if db.pool != nil {
-		return db.pruneMissingLocationsPG(ctx, absRoot)
+		return db.pruneMissingLocationsPG(ctx, absRoot, maxFraction)
 	}
-	return db.pruneMissingLocationsSQLite(ctx, absRoot)
+	return db.pruneMissingLocationsSQLite(ctx, absRoot, maxFraction)
 }
 
 // SampleBySHA256 retrieves a sample by its hash.

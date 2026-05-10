@@ -781,6 +781,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	dataDir := f.String("data", "", "data directory containing bad/, good/, unknown/ subdirectories")
 	source := f.String("source", "forager", "sample source tag")
 	pruneMissingPaths := f.Bool("prune-missing-paths", false, "after walking, delete sample_locations rows whose path no longer exists on disk")
+	force := f.Bool("force", false, "override safety guards (currently: bypass the 40%-of-rows safety cap on --prune-missing-paths)")
 	hashWorkers := f.Int("hash-workers", 8, "concurrent hash/insert workers for file walking")
 	cleaveBinFlag := f.String("cleave", "cleave", "path to cleave binary (used for file enumeration)")
 	litmusBin := f.String("litmus", "litmus", "path to litmus binary (pass empty to disable)")
@@ -1201,11 +1202,23 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		"local_litmus", litmus != nil)
 
 	if *pruneMissingPaths {
-		removed, err := db.PruneMissingLocations(ctx, *dataDir)
-		if err != nil {
-			slog.Error("prune missing locations failed", "error", err)
-		} else {
+		// Default cap: refuse to prune more than 40% of the location
+		// rows under the data root. Catches the unmount-race case
+		// (data dir gone → all paths "missing" → mass deletion) and
+		// other obvious misconfiguration. --force disables the cap.
+		maxFraction := 0.40
+		if *force {
+			maxFraction = 1.0
+		}
+		removed, err := db.PruneMissingLocations(ctx, *dataDir, maxFraction)
+		switch {
+		case err == nil:
 			slog.Info("pruned missing locations", "removed", removed, "data_dir", *dataDir)
+		case errors.As(err, new(*hopper.PruneSafetyExceeded)):
+			slog.Error("prune safety cap tripped — refusing to delete; pass --force to override after sanity check",
+				"error", err, "data_dir", *dataDir)
+		default:
+			slog.Error("prune missing locations failed", "error", err)
 		}
 	}
 
