@@ -1013,6 +1013,15 @@ func (db *DB) sampleBySHA256PG(ctx context.Context, sha256 string) (*Sample, err
 	return s, nil
 }
 
+func (db *DB) samplesByParentPG(ctx context.Context, parentSHA string) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples WHERE parent = $1 ORDER BY path`, parentSHA)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: samples by parent %s: %w", parentSHA, err)
+	}
+	return scanPGSamples(rows)
+}
+
 const pgLocationCols = `id, sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime, first_seen_at, last_seen_at`
 
 func scanPGLocation(row interface{ Scan(...any) error }) (*SampleLocation, error) {

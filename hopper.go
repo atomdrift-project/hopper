@@ -914,6 +914,20 @@ func (db *DB) SampleBySHA256(ctx context.Context, sha256 string) (*Sample, error
 	return db.sampleBySHA256SQLite(ctx, sha256)
 }
 
+// SamplesByParent returns all samples whose parent column equals parentSHA,
+// ordered by path. Used to reassemble archive contents after dedup, where
+// a parent's cleave_result contains only its own metadata and children
+// live as separate rows.
+func (db *DB) SamplesByParent(ctx context.Context, parentSHA string) ([]*Sample, error) {
+	if parentSHA == "" {
+		return nil, nil
+	}
+	if db.pool != nil {
+		return db.samplesByParentPG(ctx, parentSHA)
+	}
+	return db.samplesByParentSQLite(ctx, parentSHA)
+}
+
 // SampleParentInfo fetches only the fields needed by ExplodeArchiveMembers,
 // avoiding the cost of reading the full row (especially the large cleave_result
 // JSONB column which the caller already has).
