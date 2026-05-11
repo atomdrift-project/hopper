@@ -279,10 +279,6 @@ func (wt *workerTracker) shouldUpsertWorker(name string, interval time.Duration)
 }
 
 // claimLimit returns how many more jobs the worker may claim right now.
-// Workers that have never returned a result are capped at warmupClaimLimit
-// total. If the worker's claims have all expired (older than claimExpiry),
-// the warmup counters are reset so a reconnecting worker can try again.
-// claimLimit returns how many more jobs the worker may claim right now.
 // Workers that have never returned a result are capped by their active
 // (unreturned) claim count — they can hold up to maxClaimCount jobs at once
 // but must return results to free capacity for more. Once a worker has
@@ -712,7 +708,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("worker reported analysis error",
 				"worker", req.Worker, "sha256", req.SHA256, "path", samplePath, "error", clientErr)
 		}
-		s.progress.recordError(1, "worker", "worker: %s: %s", req.SHA256, clientErr)
+		s.progress.recordErrorf(1, "worker", "worker: %s: %s", req.SHA256, clientErr)
 		// Drop the in-memory claim so another worker can try it. Order matters:
 		// release decrements ActiveClaims, then recordResult bumps Errors.
 		s.tracker.release(req.SHA256)
@@ -747,7 +743,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		// this, the worker's ActiveClaims is permanently inflated for this job.
 		s.tracker.release(req.SHA256)
 		s.tracker.recordResult(req.Worker, true)
-		s.progress.recordError(1, "store", "store cleave result: %s: %v", req.SHA256, err)
+		s.progress.recordErrorf(1, "store", "store cleave result: %s: %v", req.SHA256, err)
 		errMsg := `{"error":"store cleave result failed"}`
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			errMsg = `{"error":"store cleave result failed: database write context was canceled or timed out"}`
@@ -760,7 +756,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	if err := retryDBAccessNoValue(ctx, "store litmus result", req.SHA256, func(ctx context.Context) error {
 		return s.db.UpdateLitmusResult(ctx, req.SHA256, req.ML)
 	}); err != nil {
-		s.progress.recordError(1, "store", "store litmus result: %s: %v", req.SHA256, err)
+		s.progress.recordErrorf(1, "store", "store litmus result: %s: %v", req.SHA256, err)
 		slog.Error("store litmus result failed", "sha256", req.SHA256, "error", err)
 	}
 
@@ -1053,6 +1049,14 @@ func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Archive member: extracted children aren't stored on disk under their
+	// own SHA — they live inside the parent. Resolve to the parent path,
+	// stream-extract the inner file, and serve those bytes.
+	if sample.Parent != "" {
+		s.serveArchiveMember(ctx, w, r, sample, sha)
+		return
+	}
+
 	// Path containment: resolve symlinks and verify the file is under
 	// one of the allowed sample directories. Prevents serving arbitrary
 	// files if a sample row has a crafted or symlinked path.
@@ -1092,6 +1096,81 @@ func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
+}
+
+// archiveMemberMaxBytes caps the result of an archive-member extraction.
+// Generous enough for source files and manifests; blocks accidental
+// extraction of multi-GB blobs into memory.
+const archiveMemberMaxBytes = 8 * 1024 * 1024
+
+// serveArchiveMember resolves child to its parent on disk, reads the parent,
+// extracts the requested inner path, and writes the bytes back. Reuses the
+// same path-containment check as the top-level serve.
+func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWriter, r *http.Request, child *hopper.Sample, sha string) {
+	parent, err := s.db.SampleBySHA256(ctx, child.Parent)
+	if err != nil {
+		if errors.Is(err, hopper.ErrNotFound) {
+			http.Error(w, `{"error":"parent not found"}`, http.StatusNotFound)
+			return
+		}
+		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		return
+	}
+	innerPath := hopper.PathInsideArchive(child.Path)
+	if innerPath == "" {
+		http.Error(w, `{"error":"child has no archive-relative path"}`, http.StatusInternalServerError)
+		return
+	}
+
+	diskPath := sampleDiskPath(s.dataRoot, filepath.FromSlash(parent.Path))
+	resolved, err := filepath.EvalSymlinks(diskPath)
+	if err != nil {
+		http.Error(w, `{"error":"parent file missing"}`, http.StatusNotFound)
+		return
+	}
+	allowed := false
+	for _, dir := range s.allowedDirs {
+		if strings.HasPrefix(resolved, dir+string(filepath.Separator)) || resolved == dir {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		//nolint:gosec // sha256 validated by validSHA256, path from DB lookup
+		slog.Warn("archive-member request blocked: parent path outside allowed directories",
+			"sha256", sha, "parent_sha", parent.SHA256, "parent_path", parent.Path,
+			"resolved", resolved, "remote", r.RemoteAddr, "allowed_dirs", s.allowedDirs)
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+
+	archive, err := os.ReadFile(resolved) //nolint:gosec // path validated above
+	if err != nil {
+		http.Error(w, `{"error":"parent unreadable"}`, http.StatusInternalServerError)
+		return
+	}
+	body, err := hopper.ExtractFromArchive(archive, parent.FileType, innerPath, archiveMemberMaxBytes)
+	if err != nil {
+		switch {
+		case strings.Contains(err.Error(), "not found in archive"):
+			http.Error(w, `{"error":"not found in archive"}`, http.StatusNotFound)
+		case strings.Contains(err.Error(), "too large"):
+			http.Error(w, `{"error":"file too large"}`, http.StatusRequestEntityTooLarge)
+		case strings.Contains(err.Error(), "unsupported archive"):
+			http.Error(w, `{"error":"unsupported archive type"}`, http.StatusUnsupportedMediaType)
+		default:
+			//nolint:gosec // sha256 validated by validSHA256
+			slog.Warn("archive-member extraction failed",
+				"sha256", sha, "parent_sha", parent.SHA256, "error", err)
+			http.Error(w, `{"error":"extraction failed"}`, http.StatusInternalServerError)
+		}
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	if _, err := w.Write(body); err != nil { //nolint:gosec // body served as application/octet-stream; sha256 validated
+		slog.Debug("archive-member write failed", "sha256", sha, "error", err)
+	}
 }
 
 // stripDataRoot converts an absolute DB path to a path relative to prefix.

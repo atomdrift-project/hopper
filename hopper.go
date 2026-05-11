@@ -7,7 +7,10 @@
 package hopper
 
 import (
+	"archive/tar"
+	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"context"
 	cryptorand "crypto/rand"
 	cryptosha256 "crypto/sha256"
@@ -17,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"os"
@@ -32,12 +36,6 @@ import (
 )
 
 const skipBenignArchiveItem = "skip-benign-archive-item"
-
-func closeSQLiteBestEffort(db *sql.DB) {
-	if err := db.Close(); err != nil {
-		slog.Debug("close sqlite failed", "error", err)
-	}
-}
 
 // sanitizeJSONB fixes JSON that is valid in lenient parsers but rejected by
 // PostgreSQL's strict JSONB parser:
@@ -532,6 +530,10 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 			memberPath = parent.Path + "!!" + inArchive
 		}
 
+		firstAnalyzedAt := parent.FirstAnalyzedAt
+		if firstAnalyzedAt == nil {
+			firstAnalyzedAt = parent.AnalyzedAt
+		}
 		members = append(members, &Sample{
 			SHA256:          entry.SHA256,
 			Source:          parent.Source,
@@ -549,7 +551,7 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 			Parent:          parent.SHA256,
 			Skip:            skip,
 			AnalyzedAt:      parent.AnalyzedAt,
-			FirstAnalyzedAt: firstNonNilTime(parent.FirstAnalyzedAt, parent.AnalyzedAt),
+			FirstAnalyzedAt: firstAnalyzedAt,
 		})
 	}
 
@@ -558,15 +560,6 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 	}
 	n, _, err := db.InsertSampleBatch(ctx, members)
 	return n, err
-}
-
-func firstNonNilTime(times ...*time.Time) *time.Time {
-	for _, t := range times {
-		if t != nil {
-			return t
-		}
-	}
-	return nil
 }
 
 func litmusResultForMember(parent []byte, id int) []byte {
@@ -724,7 +717,9 @@ func (db *DB) Close() {
 		db.pool.Close()
 	}
 	if db.lite != nil {
-		closeSQLiteBestEffort(db.lite)
+		if err := db.lite.Close(); err != nil {
+			slog.Debug("close sqlite failed", "error", err)
+		}
 	}
 }
 
@@ -845,6 +840,116 @@ func (db *DB) UpsertLocation(ctx context.Context, loc *SampleLocation) error {
 	return db.upsertLocationSQLite(ctx, loc)
 }
 
+// PathInsideArchive returns the segment of an archive-member sample's
+// stored path that follows the last "!!" separator (cleave's archive-
+// member delimiter). Empty for paths without a delimiter.
+func PathInsideArchive(samplePath string) string {
+	idx := strings.LastIndex(samplePath, "!!")
+	if idx < 0 {
+		return ""
+	}
+	return samplePath[idx+2:]
+}
+
+// ExtractFromArchive pulls a single file out of an archive by its path
+// inside the container. Supported types: tar, tar.gz/tgz, zip and zip-
+// equivalent containers (jar, war, ear, apk, aab, ipa, whl, egg, gem,
+// nupkg). Result is capped at maxBytes; larger files return an
+// "unsupported archive: <type>" error for unrecognised types so callers
+// can render a graceful fallback rather than failing.
+func ExtractFromArchive(archive []byte, fileType, innerPath string, maxBytes int64) ([]byte, error) {
+	t := strings.ToLower(strings.TrimSpace(fileType))
+	switch t {
+	case "tar.gz", "tgz", "gz":
+		return extractFromTarGz(archive, innerPath, maxBytes)
+	case "tar":
+		return extractFromTar(bytes.NewReader(archive), innerPath, maxBytes)
+	case "zip", "jar", "war", "ear", "apk", "aab", "ipa", "whl", "egg", "gem", "nupkg":
+		return extractFromZip(archive, innerPath, maxBytes)
+	}
+	return nil, fmt.Errorf("unsupported archive: %s", fileType)
+}
+
+func extractFromTarGz(archive []byte, innerPath string, maxBytes int64) ([]byte, error) {
+	gz, err := gzip.NewReader(bytes.NewReader(archive))
+	if err != nil {
+		return nil, fmt.Errorf("gunzip: %w", err)
+	}
+	defer func() { _ = gz.Close() }() //nolint:errcheck // best-effort close after extraction
+	return extractFromTar(gz, innerPath, maxBytes)
+}
+
+func extractFromTar(r io.Reader, innerPath string, maxBytes int64) ([]byte, error) {
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("path not found in archive: %s", innerPath)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("tar entry: %w", err)
+		}
+		if !archivePathMatches(hdr.Name, innerPath) {
+			continue
+		}
+		if hdr.Size > maxBytes {
+			return nil, fmt.Errorf("file too large (>%d bytes)", maxBytes)
+		}
+		body, err := io.ReadAll(io.LimitReader(tr, maxBytes+1))
+		if err != nil {
+			return nil, fmt.Errorf("read entry: %w", err)
+		}
+		if int64(len(body)) > maxBytes {
+			return nil, fmt.Errorf("file too large (>%d bytes)", maxBytes)
+		}
+		return body, nil
+	}
+}
+
+func extractFromZip(archive []byte, innerPath string, maxBytes int64) ([]byte, error) {
+	zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+	if err != nil {
+		return nil, fmt.Errorf("zip open: %w", err)
+	}
+	for _, f := range zr.File {
+		if !archivePathMatches(f.Name, innerPath) {
+			continue
+		}
+		if maxBytes >= 0 && f.UncompressedSize64 > uint64(maxBytes) {
+			return nil, fmt.Errorf("file too large (>%d bytes)", maxBytes)
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return nil, fmt.Errorf("zip entry open: %w", err)
+		}
+		body, err := io.ReadAll(io.LimitReader(rc, maxBytes+1))
+		_ = rc.Close() //nolint:errcheck // read-only stream, close error ignored
+		if err != nil {
+			return nil, fmt.Errorf("read entry: %w", err)
+		}
+		if int64(len(body)) > maxBytes {
+			return nil, fmt.Errorf("file too large (>%d bytes)", maxBytes)
+		}
+		return body, nil
+	}
+	return nil, fmt.Errorf("path not found in archive: %s", innerPath)
+}
+
+// archivePathMatches accepts an exact match or a match after stripping the
+// conventional one-level "package/" or "./" prefix that npm/pypi archives
+// wrap their content in. Cleave records the post-strip path so the inner-
+// path string we get rarely matches the in-archive header verbatim.
+func archivePathMatches(headerName, want string) bool {
+	headerName = strings.TrimPrefix(headerName, "./")
+	if headerName == want {
+		return true
+	}
+	if _, rest, ok := strings.Cut(headerName, "/"); ok && rest == want {
+		return true
+	}
+	return false
+}
+
 // LocationsForSHA returns every known observation of the given sample,
 // most recently seen first. Empty slice (not error) when unknown.
 func (db *DB) LocationsForSHA(ctx context.Context, sha256 string) ([]*SampleLocation, error) {
@@ -858,7 +963,7 @@ func (db *DB) LocationsForSHA(ctx context.Context, sha256 string) ([]*SampleLoca
 // number of rows that would be deleted exceeds the maxFraction safety
 // cap. The error carries the counts so the caller can decide whether
 // to retry with force=true after a sanity check.
-type PruneSafetyExceeded struct {
+type PruneSafetyExceeded struct { //nolint:errname // follows context.DeadlineExceeded convention
 	Total       int     // total sample_locations rows under the data root
 	Victims     int     // rows whose path no longer exists
 	MaxFraction float64 // configured safety cap, e.g. 0.40
@@ -1417,6 +1522,7 @@ func (db *DB) WorkflowSnapshot(ctx context.Context, limit int) (WorkflowSnapshot
 	}, nil
 }
 
+// WorkflowHealth returns queue freshness counters for the dashboard.
 func (db *DB) WorkflowHealth(ctx context.Context) (WorkflowHealth, error) {
 	if db.pool != nil {
 		return db.workflowHealthPG(ctx)
@@ -1424,6 +1530,7 @@ func (db *DB) WorkflowHealth(ctx context.Context) (WorkflowHealth, error) {
 	return db.workflowHealthSQLite(ctx)
 }
 
+// WorkflowBacklogs returns pending-work grouped by source/feed/ecosystem.
 func (db *DB) WorkflowBacklogs(ctx context.Context, limit int) ([]WorkflowBacklog, error) {
 	if limit <= 0 {
 		limit = 5
@@ -1434,6 +1541,7 @@ func (db *DB) WorkflowBacklogs(ctx context.Context, limit int) ([]WorkflowBacklo
 	return db.workflowBacklogsSQLite(ctx, limit)
 }
 
+// WorkflowLatestAdded returns the most recently inserted samples.
 func (db *DB) WorkflowLatestAdded(ctx context.Context, limit int) ([]WorkflowSample, error) {
 	if limit <= 0 {
 		limit = 5
@@ -1444,6 +1552,7 @@ func (db *DB) WorkflowLatestAdded(ctx context.Context, limit int) ([]WorkflowSam
 	return db.workflowLatestAddedSQLite(ctx, limit)
 }
 
+// WorkflowLatestReady returns the most recently analyzed samples.
 func (db *DB) WorkflowLatestReady(ctx context.Context, limit int) ([]WorkflowSample, error) {
 	if limit <= 0 {
 		limit = 5
@@ -1454,6 +1563,7 @@ func (db *DB) WorkflowLatestReady(ctx context.Context, limit int) ([]WorkflowSam
 	return db.workflowLatestReadySQLite(ctx, limit)
 }
 
+// WorkflowOldestPending returns the longest-waiting unanalyzed samples.
 func (db *DB) WorkflowOldestPending(ctx context.Context, limit int) ([]WorkflowSample, error) {
 	if limit <= 0 {
 		limit = 5
@@ -1486,18 +1596,18 @@ func (db *DB) RelativizePaths(ctx context.Context, dataRoot string) (int64, erro
 // deleted instead of updated — matches UpdateCleaveResult's belt-and-suspenders
 // rule so the two analysis-save paths stay consistent.
 func (db *DB) UpdateSample(ctx context.Context, sha256, status string, result []byte, canonicalSHA256 string) error {
-	if canonicalSHA256 == "" {
-		canonicalSHA256 = canonicalSHA(sha256, result)
-	}
-	fi := parseCleaveFile(sha256, result)
-	if fi.FileType == "" {
+	p := ParseCleaveResult(sha256, result)
+	if p.FileInfo.FileType == "" {
 		return db.DeleteSample(ctx, sha256)
+	}
+	if canonicalSHA256 == "" {
+		canonicalSHA256 = p.CanonicalSHA
 	}
 	result = compactCleaveResultForStorage(sha256, result)
 	if db.pool != nil {
-		return db.updateSamplePG(ctx, sha256, status, result, canonicalSHA256, fi)
+		return db.updateSamplePG(ctx, sha256, status, result, canonicalSHA256, p.FileInfo)
 	}
-	return db.updateSampleSQLite(ctx, sha256, status, result, canonicalSHA256, fi)
+	return db.updateSampleSQLite(ctx, sha256, status, result, canonicalSHA256, p.FileInfo)
 }
 
 // SamplesByStatusInPaths returns samples matching status whose path
@@ -1753,4 +1863,95 @@ func (db *DB) LatestReport(ctx context.Context, sha256, reportType string) (*Rep
 		return db.latestReportPG(ctx, sha256, reportType)
 	}
 	return db.latestReportSQLite(ctx, sha256, reportType)
+}
+
+// ReportIngestStats summarizes one IngestReportsDir run.
+type ReportIngestStats struct {
+	Scanned              int
+	Inserted             int
+	SkippedExisting      int
+	SkippedMissingSample int
+	SkippedInvalid       int
+}
+
+// IngestReportsDir walks dir for files named "<sha256>.md" and inserts each
+// as a report of the given type and provider. Reports whose content matches
+// the latest stored report for that sample are skipped. Reports for samples
+// hopper has never seen are counted under SkippedMissingSample and ignored.
+//
+// This is the single ingest path used by both the `hopper ingest-reports`
+// CLI and cyclotron's startup self-heal — keep them in sync by editing here.
+func (db *DB) IngestReportsDir(ctx context.Context, dir, reportType, provider string) (ReportIngestStats, error) {
+	var stats ReportIngestStats
+	if dir == "" {
+		return stats, nil
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return stats, fmt.Errorf("stat reports dir: %w", err)
+	}
+	if !info.IsDir() {
+		return stats, fmt.Errorf("reports path is not a directory: %s", dir)
+	}
+	walkErr := filepath.WalkDir(dir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if entry.IsDir() {
+			if path != dir && strings.HasPrefix(entry.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		stats.Scanned++
+		name := entry.Name()
+		if filepath.Ext(name) != ".md" {
+			stats.SkippedInvalid++
+			return nil
+		}
+		sha := strings.TrimSuffix(name, ".md")
+		if !isLowerHexSHA256(sha) {
+			stats.SkippedInvalid++
+			return nil
+		}
+		if _, err := db.SampleBySHA256(ctx, sha); err != nil {
+			if errors.Is(err, ErrNotFound) {
+				stats.SkippedMissingSample++
+				return nil
+			}
+			return err
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if existing, err := db.LatestReport(ctx, sha, reportType); err == nil {
+			if existing.Content == string(content) {
+				stats.SkippedExisting++
+				return nil
+			}
+		} else if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		if err := db.InsertReport(ctx, &Report{
+			SHA256:   sha,
+			Type:     reportType,
+			Content:  string(content),
+			Provider: provider,
+		}); err != nil {
+			return err
+		}
+		stats.Inserted++
+		return nil
+	})
+	if walkErr != nil {
+		return stats, fmt.Errorf("walk reports dir: %w", walkErr)
+	}
+	return stats, nil
 }

@@ -645,7 +645,7 @@ func TestIngestReportsDir(t *testing.T) {
 	mustWriteFile(t, filepath.Join(reportsDir, "not-a-sha.md"), []byte("# Invalid\n"))
 	mustWriteFile(t, filepath.Join(reportsDir, shaWithReport+".txt"), []byte("# Wrong extension\n"))
 
-	stats, err := ingestReportsDir(ctx, db, reportsDir, "re", "cyclotron")
+	stats, err := db.IngestReportsDir(ctx, reportsDir, "re", "cyclotron")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -668,7 +668,7 @@ func TestIngestReportsDir(t *testing.T) {
 		t.Fatalf("existing latest report = %#v", existing)
 	}
 
-	stats, err = ingestReportsDir(ctx, db, reportsDir, "re", "cyclotron")
+	stats, err = db.IngestReportsDir(ctx, reportsDir, "re", "cyclotron")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1447,7 +1447,7 @@ func TestExtractPathProvenance(t *testing.T) {
 				ecosystem: "javascript",
 				domain:    "npmjs.org",
 				feed:      "aikido.dev",
-				pkg:      "lodash",
+				pkg:       "lodash",
 			},
 		},
 		{
@@ -1458,7 +1458,7 @@ func TestExtractPathProvenance(t *testing.T) {
 				ecosystem: "python",
 				domain:    "pythonhosted.org",
 				feed:      "pypi.org",
-				pkg:      "requests",
+				pkg:       "requests",
 			},
 		},
 		{
@@ -1478,7 +1478,7 @@ func TestExtractPathProvenance(t *testing.T) {
 				ecosystem: "javascript",
 				domain:    "npmjs.org",
 				feed:      "npmjs.org",
-				pkg:      "lodash",
+				pkg:       "lodash",
 			},
 		},
 	}

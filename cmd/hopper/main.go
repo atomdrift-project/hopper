@@ -613,14 +613,6 @@ func cmdImport(ctx context.Context) error {
 	return nil
 }
 
-type reportIngestStats struct {
-	Scanned              int
-	Inserted             int
-	SkippedExisting      int
-	SkippedMissingSample int
-	SkippedInvalid       int
-}
-
 func cmdIngestReports(ctx context.Context) error {
 	f := flag.NewFlagSet("ingest-reports", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
@@ -638,7 +630,7 @@ func cmdIngestReports(ctx context.Context) error {
 		return err
 	}
 
-	stats, err := ingestReportsDir(ctx, db, *dir, *reportType, *provider)
+	stats, err := db.IngestReportsDir(ctx, *dir, *reportType, *provider)
 	if err != nil {
 		return err
 	}
@@ -651,84 +643,6 @@ func cmdIngestReports(ctx context.Context) error {
 		"skipped_missing_sample", stats.SkippedMissingSample,
 		"skipped_invalid", stats.SkippedInvalid)
 	return nil
-}
-
-func ingestReportsDir(ctx context.Context, db *hopper.DB, dir, reportType, provider string) (reportIngestStats, error) {
-	var stats reportIngestStats
-	if dir == "" {
-		return stats, nil
-	}
-	info, err := os.Stat(dir)
-	if err != nil {
-		return stats, fmt.Errorf("stat reports dir: %w", err)
-	}
-	if !info.IsDir() {
-		return stats, fmt.Errorf("reports path is not a directory: %s", dir)
-	}
-
-	err = filepath.WalkDir(dir, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if entry.IsDir() {
-			if path != dir && strings.HasPrefix(entry.Name(), ".") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !entry.Type().IsRegular() {
-			return nil
-		}
-
-		stats.Scanned++
-		name := entry.Name()
-		if filepath.Ext(name) != ".md" {
-			stats.SkippedInvalid++
-			return nil
-		}
-		sha := strings.TrimSuffix(name, ".md")
-		if !validSHA256(sha) {
-			stats.SkippedInvalid++
-			return nil
-		}
-
-		if _, err := db.SampleBySHA256(ctx, sha); err != nil {
-			if errors.Is(err, hopper.ErrNotFound) {
-				stats.SkippedMissingSample++
-				return nil
-			}
-			return err
-		}
-		content, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		if report, err := db.LatestReport(ctx, sha, reportType); err == nil {
-			if report.Content == string(content) {
-				stats.SkippedExisting++
-				return nil
-			}
-		} else if !errors.Is(err, hopper.ErrNotFound) {
-			return err
-		}
-		if err := db.InsertReport(ctx, &hopper.Report{
-			SHA256:   sha,
-			Type:     reportType,
-			Content:  string(content),
-			Provider: provider,
-		}); err != nil {
-			return err
-		}
-		stats.Inserted++
-		return nil
-	})
-	if err != nil {
-		return stats, fmt.Errorf("walk reports dir: %w", err)
-	}
-	return stats, nil
 }
 
 func cmdReset(ctx context.Context) error {
@@ -1125,14 +1039,16 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 				slog.Error("litmus monitor failed", "error", err)
 			}
 		}()
-		// The litmus worker self-updates rules every hour via its own
-		// spawn_resource_renewal_task (in worker.rs). We just poll the
+		// The litmus worker self-updates rules every 10 minutes via its
+		// own spawn_resource_renewal_task (in worker.rs). We poll the
 		// resulting traits version on the same cadence so the dashboard's
 		// "is this worker stale?" check measures against the live local
 		// litmus, not the snapshot taken at startup. No external restart
 		// needed — the worker reloads its capability mapper in-place.
+		// 10-minute cadence trades a bit of git-pull traffic for faster
+		// rule rollout to the fleet.
 		go func() {
-			ticker := time.NewTicker(1 * time.Hour)
+			ticker := time.NewTicker(10 * time.Minute)
 			defer ticker.Stop()
 			for {
 				select {
@@ -1185,7 +1101,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		loadDirs, fileChs, *source, *hashWorkers, *rescan, *maxAnalyzed, *experimentTag, wd, traitsVersion, *rescanAge)
 	if *reportsDir != "" {
 		wd.beginStage("reports.ingest", "Ingesting reports")
-		stats, err := ingestReportsDir(ctx, db, *reportsDir, "re", "cyclotron")
+		stats, err := db.IngestReportsDir(ctx, *reportsDir, "re", "cyclotron")
 		if err != nil {
 			wd.failStage("reports.ingest", err.Error())
 			return err
@@ -1283,7 +1199,7 @@ type progressError struct {
 
 const maxProgressErrors = 5
 
-func (p *loadProgress) recordError(n int64, stage, format string, args ...any) {
+func (p *loadProgress) recordErrorf(n int64, stage, format string, args ...any) {
 	if p == nil {
 		return
 	}
@@ -1502,7 +1418,7 @@ func runDirPipeline(
 		n, needsAnalysis, err := db.InsertSampleBatch(ctx, batch)
 		if err != nil {
 			if ctx.Err() == nil {
-				progress.recordError(int64(len(batch)), "insert", "insert: %v", err)
+				progress.recordErrorf(int64(len(batch)), "insert", "insert: %v", err)
 				slog.Error("batch insert failed", "error", err, "batch_size", len(batch), "dir", target.dir)
 			}
 			batch = batch[:0]
@@ -1547,7 +1463,7 @@ func runDirPipeline(
 				progress.tooLarge.Add(1)
 			default:
 				progress.hashErrors.Add(1)
-				progress.recordError(1, "hash", "hash: %s: %v", filepath.Base(lp.path), err)
+				progress.recordErrorf(1, "hash", "hash: %s: %v", filepath.Base(lp.path), err)
 				slog.Warn("hash failed", "path", lp.path, "error", err)
 			}
 			continue
@@ -2245,6 +2161,7 @@ func hashFile(ctx context.Context, path, label, fileType, source string, cache *
 		cache.store(ctx, dev, inode, info.Size(), info.ModTime(), digest)
 	}
 
+	mtime := info.ModTime()
 	s := &hopper.Sample{
 		SHA256:      digest,
 		Source:      source,
@@ -2254,7 +2171,7 @@ func hashFile(ctx context.Context, path, label, fileType, source string, cache *
 		LabelSource: source,
 		SizeBytes:   info.Size(),
 		Path:        path,
-		Mtime:       ptrTime(info.ModTime()),
+		Mtime:       &mtime,
 	}
 	prov := extractPathProvenance(path, label)
 	fillSampleProvenance(s, prov, filepath.Base(path))
@@ -2286,8 +2203,6 @@ func fillSampleProvenance(s *hopper.Sample, prov pathProvenance, filename string
 		s.Version = parsedVersion
 	}
 }
-
-func ptrTime(t time.Time) *time.Time { return &t }
 
 // pathProvenance captures the metadata recoverable from a forager-output
 // path. Whatever the path doesn't carry stays empty.
