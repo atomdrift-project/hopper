@@ -105,6 +105,69 @@ func TestWorkerTrackerOldestPerWorkerPrunesStale(t *testing.T) {
 	}
 }
 
+func TestWorkerToolParsingDistinguishesLegacyFromEmptyReport(t *testing.T) {
+	if tools, caps := parseWorkerTools(nil); tools != "" || caps != nil {
+		t.Fatalf("absent tools = %q/%v, want legacy nil capabilities", tools, caps)
+	}
+	tools, caps := parseWorkerTools([]string{""})
+	if tools != "" || caps == nil {
+		t.Fatalf("empty tools report = %q/%v, want present empty capability set", tools, caps)
+	}
+	if workerCanAnalyzeFileType("elf", caps) {
+		t.Fatal("empty capability set should not accept elf")
+	}
+}
+
+func TestWorkerCanAnalyzeFileTypeRequiresReportedTools(t *testing.T) {
+	tools := workerToolSet{"rizin": true, "upx": true, "innoextract": true, "7z": true}
+	for _, ft := range []string{"elf", "pe", "macho", "java_class", "python_bytecode", "msi", "cab", "sevenz"} {
+		if !workerCanAnalyzeFileType(ft, &tools) {
+			t.Fatalf("fully equipped worker rejected %s", ft)
+		}
+	}
+
+	noUPX := workerToolSet{"rizin": true, "innoextract": true, "7z": true}
+	if workerCanAnalyzeFileType("elf", &noUPX) || workerCanAnalyzeFileType("pe", &noUPX) {
+		t.Fatal("missing upx should block elf and pe")
+	}
+
+	noInno := workerToolSet{"rizin": true, "upx": true, "7z": true}
+	if workerCanAnalyzeFileType("msi", &noInno) || workerCanAnalyzeFileType("pe", &noInno) {
+		t.Fatal("missing innoextract should block msi and pe")
+	}
+
+	noRizin := workerToolSet{"upx": true, "innoextract": true, "7z": true}
+	if workerCanAnalyzeFileType("elf", &noRizin) || workerCanAnalyzeFileType("macho", &noRizin) {
+		t.Fatal("missing rizin should block binary formats")
+	}
+	if !workerCanAnalyzeFileType("python", &noRizin) {
+		t.Fatal("missing rizin should not block non-binary script formats")
+	}
+
+	no7z := workerToolSet{"rizin": true, "upx": true, "innoextract": true}
+	if workerCanAnalyzeFileType("cab", &no7z) || workerCanAnalyzeFileType("seven_z", &no7z) {
+		t.Fatal("missing 7z should block 7z/cab formats")
+	}
+}
+
+func TestFilterCandidatesByWorkerToolsKeepsCompatibleJobsUnclaimed(t *testing.T) {
+	tools := workerToolSet{"7z": true}
+	cands := []hopper.ClaimJob{
+		{SHA256: "elf", FileType: "elf"},
+		{SHA256: "py", FileType: "python"},
+		{SHA256: "cab", FileType: "cab"},
+	}
+	got := filterCandidatesByWorkerTools(cands, &tools)
+	if len(got) != 2 || got[0].SHA256 != "py" || got[1].SHA256 != "cab" {
+		t.Fatalf("filtered candidates = %+v, want python and cab only", got)
+	}
+
+	legacy := filterCandidatesByWorkerTools(cands, nil)
+	if len(legacy) != 3 {
+		t.Fatalf("legacy absent tool report filtered candidates: %+v", legacy)
+	}
+}
+
 func TestTrimClientError(t *testing.T) {
 	in := "cleave failed:\n\n   Failed to load traits\tfrom /usr/local/share/litmus/traits due to many validation errors while parsing the installed bundle"
 	got := trimClientError(in)

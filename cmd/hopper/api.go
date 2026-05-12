@@ -113,6 +113,7 @@ type workerStats struct {
 	ActiveClaims int     // jobs claimed but not yet returned
 	RSSMB        int     // last reported RSS in MiB (0 = unknown)
 	Load1        float64 // last reported 1-minute load average (0 = unknown)
+	Tools        string  // comma-separated canonical external tools reported by litmus
 }
 
 func newWorkerTracker() *workerTracker {
@@ -239,7 +240,7 @@ func (wt *workerTracker) pruneExpiredClaimsLocked(worker string, expiry time.Dur
 
 // update records a worker heartbeat. ActiveClaims/TotalClaimed/LastClaimed
 // are owned by tryClaimBatch and release; do not bump them here.
-func (wt *workerTracker) update(name string, slots int, version, traits string, rssMB int, load1 float64) {
+func (wt *workerTracker) update(name string, slots int, version, traits string, rssMB int, load1 float64, tools string) {
 	wt.mu.Lock()
 	defer wt.mu.Unlock()
 	ws, ok := wt.workers[name]
@@ -256,6 +257,7 @@ func (wt *workerTracker) update(name string, slots int, version, traits string, 
 	ws.Traits = traits
 	ws.RSSMB = rssMB
 	ws.Load1 = load1
+	ws.Tools = tools
 }
 
 // shouldUpsertWorker reports whether the workers-table heartbeat row for the
@@ -459,6 +461,102 @@ func qualifiedWorkerName(name, addr string) string {
 	return name + ":" + host
 }
 
+type workerToolSet map[string]bool
+
+func parseWorkerTools(values []string) (string, *workerToolSet) {
+	if values == nil {
+		return "", nil
+	}
+	tools := workerToolSet{}
+	for _, value := range values {
+		for _, raw := range strings.Split(value, ",") {
+			name := strings.ToLower(strings.TrimSpace(raw))
+			if name == "" {
+				continue
+			}
+			switch name {
+			case "7za", "7zz", "7zr", "p7zip":
+				name = "7z"
+			}
+			tools[name] = true
+		}
+	}
+	canonical := make([]string, 0, len(tools))
+	for _, name := range []string{"rizin", "upx", "innoextract", "7z"} {
+		if tools[name] {
+			canonical = append(canonical, name)
+		}
+	}
+	return strings.Join(canonical, ","), &tools
+}
+
+func workerCanAnalyzeFileType(fileType string, tools *workerToolSet) bool {
+	if tools == nil {
+		return true
+	}
+	ft := normalizeFileType(fileType)
+	if ft == "" {
+		return true
+	}
+	if requiresTool(ft, "rizin") && !(*tools)["rizin"] {
+		return false
+	}
+	if requiresTool(ft, "upx") && !(*tools)["upx"] {
+		return false
+	}
+	if requiresTool(ft, "innoextract") && !(*tools)["innoextract"] {
+		return false
+	}
+	if requiresTool(ft, "7z") && !(*tools)["7z"] {
+		return false
+	}
+	return true
+}
+
+func normalizeFileType(fileType string) string {
+	ft := strings.ToLower(strings.TrimSpace(fileType))
+	ft = strings.ReplaceAll(ft, "-", "_")
+	ft = strings.ReplaceAll(ft, " ", "_")
+	return ft
+}
+
+func requiresTool(fileType, tool string) bool {
+	switch tool {
+	case "rizin":
+		return isBinaryFileType(fileType)
+	case "upx":
+		return fileType == "elf" || fileType == "pe"
+	case "innoextract":
+		return fileType == "msi" || fileType == "pe"
+	case "7z":
+		return fileType == "7z" || fileType == "sevenz" || fileType == "seven_z" || fileType == "cab"
+	default:
+		return false
+	}
+}
+
+func isBinaryFileType(fileType string) bool {
+	switch fileType {
+	case "elf", "pe", "macho", "mach_o", "java_class", "javaclass", "python_bytecode", "pyc":
+		return true
+	default:
+		return false
+	}
+}
+
+func filterCandidatesByWorkerTools(cands []hopper.ClaimJob, tools *workerToolSet) []hopper.ClaimJob {
+	if tools == nil || len(cands) == 0 {
+		return cands
+	}
+	out := cands[:0]
+	for _, c := range cands {
+		if workerCanAnalyzeFileType(c.FileType, tools) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // handleNext claims work items for a worker.
 // GET /api/next?worker=nuc&count=3&slots=4&version=0.8.2&traits=abc123.
 //
@@ -493,6 +591,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	}
 	version := r.URL.Query().Get("version")
 	traits := r.URL.Query().Get("traits")
+	tools, toolCaps := parseWorkerTools(r.URL.Query()["tools"])
 
 	var rssMB int
 	if v := r.URL.Query().Get("rss_mb"); v != "" {
@@ -512,7 +611,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		//nolint:gosec // worker is sanitized by validWorkerName
 		slog.Warn("unproven worker at active claim limit, waiting for results",
 			"worker", worker, "active", s.tracker.activeClaims(worker))
-		s.tracker.update(worker, slots, version, traits, rssMB, load1)
+		s.tracker.update(worker, slots, version, traits, rssMB, load1, tools)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	} else if count > limit {
@@ -520,7 +619,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Heartbeat first so the dashboard sees the worker even on no-work polls.
-	s.tracker.update(worker, slots, version, traits, rssMB, load1)
+	s.tracker.update(worker, slots, version, traits, rssMB, load1, tools)
 
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
@@ -535,7 +634,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	jobs, err := s.claimJobs(ctx, worker, count)
+	jobs, err := s.claimJobs(ctx, worker, count, toolCaps)
 	if err != nil {
 		slog.Error("claim jobs failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
@@ -873,7 +972,7 @@ func (s *apiServer) enqueueExplosion(ctx context.Context, job explosionJob) {
 // claiming the first count that aren't held by another worker. Over-fetches
 // so that contention with other concurrent pollers doesn't starve a
 // requester at the head of the queue.
-func (s *apiServer) claimJobs(ctx context.Context, worker string, count int) ([]hopper.ClaimJob, error) {
+func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, tools *workerToolSet) ([]hopper.ClaimJob, error) {
 	want := count
 	overfetch := max(count*candidateOverfetch, minCandidates)
 
@@ -881,6 +980,7 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int) ([]
 	if err != nil {
 		return nil, err
 	}
+	cands = filterCandidatesByWorkerTools(cands, tools)
 	out := s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)
 	if len(out) >= count {
 		return out, nil
@@ -892,6 +992,7 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int) ([]
 		if err != nil {
 			return out, err
 		}
+		cands = filterCandidatesByWorkerTools(cands, tools)
 		out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
 		if len(out) >= count {
 			return out, nil
@@ -904,6 +1005,7 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int) ([]
 		if err != nil {
 			return out, err
 		}
+		cands = filterCandidatesByWorkerTools(cands, tools)
 		out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
 	}
 	return out, nil

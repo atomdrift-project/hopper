@@ -678,7 +678,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 
 		buf.WriteString(`<section><div class="label">Workers</div>`)
 		buf.WriteString(`<table><thead><tr>` +
-			`<th>Worker</th><th>Litmus</th><th>Traits</th>` +
+			`<th>Worker</th><th>Litmus</th><th>Traits</th><th>Tools</th>` +
 			`<th>Tasks</th><th>Seen</th><th>Rate</th>` +
 			`<th class="col-rss">RSS</th><th>Load</th>` +
 			`<th>Analyzed</th><th>Errors</th><th>Oldest Job</th><th></th>` +
@@ -742,6 +742,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 					`<td class="nn"><span class="dot %s">●</span>%s</td>`+
 					`<td>%s</td>`+
 					`<td>%s</td>`+
+					`<td>%s</td>`+
 					`<td class="hi">%d/%d</td>`+
 					`<td class="hi">%s</td>`+
 					`<td class="rate">%s</td>`+
@@ -755,6 +756,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 				dotClass, htmlEscape(w.Name),
 				litmusCell,
 				traitsCell,
+				dashEm(w.Tools),
 				w.ActiveClaims, w.Slots,
 				shortDuration(idle),
 				rateStr,
