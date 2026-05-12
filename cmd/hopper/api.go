@@ -491,23 +491,27 @@ func parseWorkerTools(values []string) (string, *workerToolSet) {
 }
 
 func workerCanAnalyzeFileType(fileType string, tools *workerToolSet) bool {
+	return workerCanAnalyzeFile(fileType, "", tools)
+}
+
+func workerCanAnalyzeFile(fileType, path string, tools *workerToolSet) bool {
 	if tools == nil {
 		return true
 	}
 	ft := normalizeFileType(fileType)
-	if ft == "" {
+	if ft == "" && path == "" {
 		return true
 	}
-	if requiresTool(ft, "rizin") && !(*tools)["rizin"] {
+	if requiresTool(ft, path, "rizin") && !(*tools)["rizin"] {
 		return false
 	}
-	if requiresTool(ft, "upx") && !(*tools)["upx"] {
+	if requiresTool(ft, path, "upx") && !(*tools)["upx"] {
 		return false
 	}
-	if requiresTool(ft, "innoextract") && !(*tools)["innoextract"] {
+	if requiresTool(ft, path, "innoextract") && !(*tools)["innoextract"] {
 		return false
 	}
-	if requiresTool(ft, "7z") && !(*tools)["7z"] {
+	if requiresTool(ft, path, "7z") && !(*tools)["7z"] {
 		return false
 	}
 	return true
@@ -520,28 +524,41 @@ func normalizeFileType(fileType string) string {
 	return ft
 }
 
-func requiresTool(fileType, tool string) bool {
+func requiresTool(fileType, path, tool string) bool {
 	switch tool {
 	case "rizin":
-		return isBinaryFileType(fileType)
+		return isNativeBinaryFileType(fileType)
 	case "upx":
 		return fileType == "elf" || fileType == "pe"
 	case "innoextract":
-		return fileType == "msi" || fileType == "pe"
+		return fileType == "msi" || hasFileExtension(path, ".msi", ".msp") || fileType == "pe"
 	case "7z":
-		return fileType == "7z" || fileType == "sevenz" || fileType == "seven_z" || fileType == "cab"
+		return fileType == "pe"
 	default:
 		return false
 	}
 }
 
-func isBinaryFileType(fileType string) bool {
+func isNativeBinaryFileType(fileType string) bool {
 	switch fileType {
-	case "elf", "pe", "macho", "mach_o", "java_class", "javaclass", "python_bytecode", "pyc":
+	case "elf", "pe", "macho", "mach_o":
 		return true
 	default:
 		return false
 	}
+}
+
+func hasFileExtension(path string, exts ...string) bool {
+	if path == "" {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(path))
+	for _, want := range exts {
+		if ext == want {
+			return true
+		}
+	}
+	return false
 }
 
 func filterCandidatesByWorkerTools(cands []hopper.ClaimJob, tools *workerToolSet) []hopper.ClaimJob {
@@ -550,7 +567,7 @@ func filterCandidatesByWorkerTools(cands []hopper.ClaimJob, tools *workerToolSet
 	}
 	out := cands[:0]
 	for _, c := range cands {
-		if workerCanAnalyzeFileType(c.FileType, tools) {
+		if workerCanAnalyzeFile(c.FileType, c.Path, tools) {
 			out = append(out, c)
 		}
 	}

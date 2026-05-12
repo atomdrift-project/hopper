@@ -135,18 +135,27 @@ func TestWorkerCanAnalyzeFileTypeRequiresReportedTools(t *testing.T) {
 	if workerCanAnalyzeFileType("msi", &noInno) || workerCanAnalyzeFileType("pe", &noInno) {
 		t.Fatal("missing innoextract should block msi and pe")
 	}
+	if workerCanAnalyzeFile("ole_doc", "installers/setup.msi", &noInno) {
+		t.Fatal("missing innoextract should block MSI paths even when file type is OLE")
+	}
 
 	noRizin := workerToolSet{"upx": true, "innoextract": true, "7z": true}
 	if workerCanAnalyzeFileType("elf", &noRizin) || workerCanAnalyzeFileType("macho", &noRizin) {
-		t.Fatal("missing rizin should block binary formats")
+		t.Fatal("missing rizin should block native binary formats")
+	}
+	if !workerCanAnalyzeFileType("java_class", &noRizin) || !workerCanAnalyzeFileType("python_bytecode", &noRizin) {
+		t.Fatal("missing rizin should not block bytecode formats")
 	}
 	if !workerCanAnalyzeFileType("python", &noRizin) {
 		t.Fatal("missing rizin should not block non-binary script formats")
 	}
 
 	no7z := workerToolSet{"rizin": true, "upx": true, "innoextract": true}
-	if workerCanAnalyzeFileType("cab", &no7z) || workerCanAnalyzeFileType("seven_z", &no7z) {
-		t.Fatal("missing 7z should block 7z/cab formats")
+	if !workerCanAnalyzeFileType("cab", &no7z) || !workerCanAnalyzeFileType("seven_z", &no7z) {
+		t.Fatal("missing 7z should not block library-backed 7z/cab archive formats")
+	}
+	if workerCanAnalyzeFileType("pe", &no7z) {
+		t.Fatal("missing 7z should block PE SFX formats")
 	}
 }
 
