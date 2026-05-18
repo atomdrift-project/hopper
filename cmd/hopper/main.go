@@ -1415,7 +1415,7 @@ func runDirPipeline(
 		if len(batch) == 0 {
 			return
 		}
-		n, needsAnalysis, err := db.InsertSampleBatch(ctx, batch)
+		n, _, err := db.InsertSampleBatch(ctx, batch)
 		if err != nil {
 			if ctx.Err() == nil {
 				progress.recordErrorf(int64(len(batch)), "insert", "insert: %v", err)
@@ -1428,7 +1428,9 @@ func runDirPipeline(
 		}
 		progress.inserted.Add(n)
 		progress.skipped.Add(int64(len(batch)) - n)
-		progress.queued.Add(int64(len(needsAnalysis)))
+		// Only newly inserted rows; needsAnalysis also includes pre-existing
+		// unanalyzed samples, which would double-count on each periodic re-walk.
+		progress.queued.Add(n)
 
 		// Mark entries as inserted in the hash cache so future startups
 		// can skip the DB round-trip entirely.
