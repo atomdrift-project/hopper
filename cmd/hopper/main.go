@@ -996,24 +996,12 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	}
 	db := dr.db
 	defer db.Close()
-	slog.Info("database ready", "elapsed", time.Since(dbStart), "next", "relativize sample paths")
+	slog.Info("database ready", "elapsed", time.Since(dbStart))
 
 	// Periodic pgxpool stats so saturation is visible. Without this, a
 	// connection-starved pool looks like "the dashboard is slow" with no
 	// further signal.
 	go logPoolStatsLoop(ctx, db)
-
-	wd.beginStage("db.relativize", "Relativizing sample paths")
-	relativizeStart := time.Now()
-	slog.Info("relativizing stored sample paths")
-	n, err := db.RelativizePaths(ctx, *dataDir)
-	if err != nil {
-		wd.failStage("db.relativize", err.Error())
-		slog.Error("failed to relativize stored sample paths", "elapsed", time.Since(relativizeStart), "error", err)
-		return err
-	}
-	slog.Info("relativized stored sample paths", "samples", n, "elapsed", time.Since(relativizeStart))
-	wd.endStage("db.relativize")
 
 	forcePrefixes, err := normalizeForceRescanDirs(*dataDir, forceRescanDirs)
 	if err != nil {
