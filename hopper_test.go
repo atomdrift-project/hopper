@@ -2263,6 +2263,20 @@ func TestParseCleaveFile(t *testing.T) {
 	}
 }
 
+func TestParseCleaveResultV5KeepsMetadataAndIgnoresFacts(t *testing.T) {
+	result := []byte(`{"v":"5","tv":"abcde","fs":[{"sha":"aaa","type":"pe","f":"O₃","x":16,"dp":0,"ts":[{"l":4},{"l":5}],"ff":{"id":"pe","m":{"binary":{"overall_entropy":7.2}},"v":{"pe.machine":"x86_64"}}}]}`)
+	parsed := ParseCleaveResult("aaa", result)
+	if parsed.TraitsVersion != "abcde" {
+		t.Fatalf("TraitsVersion = %q", parsed.TraitsVersion)
+	}
+	if parsed.FileInfo.FileType != "pe" || parsed.FileInfo.Formula != "O₃" || parsed.FileInfo.Score != 16 {
+		t.Fatalf("FileInfo = %+v", parsed.FileInfo)
+	}
+	if parsed.FileInfo.MaxCrit != 5 || parsed.FileInfo.SuspiciousCount != 2 {
+		t.Fatalf("crit summary = max %d suspicious %d", parsed.FileInfo.MaxCrit, parsed.FileInfo.SuspiciousCount)
+	}
+}
+
 func TestUpdateCleaveResultSetsFormulaAndScore(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()

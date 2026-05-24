@@ -326,9 +326,9 @@ type CleaveParseResult struct {
 	FileInfo      cleaveFileInfo
 }
 
-// ParseCleaveResult extracts file info and canonical SHA from a cleave result
-// in a single JSON parse, avoiding the redundant parsing that happens when
-// parseCleaveFile and canonicalSHA are called separately.
+// ParseCleaveResult extracts file info and canonical SHA from a cleave compact
+// result in a single JSON parse. It intentionally reads only stable fs[]
+// metadata, so v4 top-level facts and v5 ff facts both pass through.
 func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 	if len(result) == 0 {
 		return CleaveParseResult{CanonicalSHA: sha256}
