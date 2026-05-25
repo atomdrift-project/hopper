@@ -993,12 +993,28 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, too
 	want := count
 	overfetch := max(count*candidateOverfetch, minCandidates)
 
-	cands, err := s.db.UnanalyzedCandidates(ctx, s.hopperStart, overfetch)
+	// Tier 0: operator-initiated rescans (RequestRescan). Drained before
+	// the unanalyzed backlog so a user-requested re-queue jumps the line
+	// instead of waiting for its SHA prefix to come up in the Tier 1
+	// random-pivot rotation.
+	cands, err := s.db.ForcedRescanCandidates(ctx, overfetch)
 	if err != nil {
 		return nil, err
 	}
 	cands = filterCandidatesByWorkerTools(cands, tools)
 	out := s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)
+	if len(out) >= count {
+		return out, nil
+	}
+
+	// Tier 1: the main unanalyzed-samples queue.
+	want = count - len(out)
+	cands, err = s.db.UnanalyzedCandidates(ctx, s.hopperStart, want*candidateOverfetch)
+	if err != nil {
+		return out, err
+	}
+	cands = filterCandidatesByWorkerTools(cands, tools)
+	out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
 	if len(out) >= count {
 		return out, nil
 	}

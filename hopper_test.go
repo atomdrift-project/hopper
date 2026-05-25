@@ -2655,3 +2655,136 @@ func TestUnanalyzedCandidatesUsesRandomPivot(t *testing.T) {
 		t.Fatal("random candidate pivot kept returning the lowest SHA first")
 	}
 }
+
+// TestRequestRescanQueuesTier0 covers the happy path: an analyzed sample
+// becomes eligible for rescan after the cooldown elapses, RequestRescan
+// clears its analysis fields + stamps forced_rescan_at, and the next
+// ForcedRescanCandidates call returns it.
+func TestRequestRescanQueuesTier0(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	const sha = "aaaaaa00000000000000000000000000000000000000000000000000000000aa"
+	mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test", Label: "good", LabelSource: "test"})
+	mustAnalyze(t, ctx, db, sha, 1)
+
+	// Backdate analyzed_at so the cooldown predicate accepts the request.
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET analyzed_at = ? WHERE sha256 = ?`,
+		time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), sha); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+
+	if err := db.RequestRescan(ctx, sha, 15*time.Minute); err != nil {
+		t.Fatalf("RequestRescan: %v", err)
+	}
+
+	jobs, err := db.ForcedRescanCandidates(ctx, 10)
+	if err != nil {
+		t.Fatalf("ForcedRescanCandidates: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].SHA256 != sha {
+		t.Fatalf("ForcedRescanCandidates = %+v, want one job for %s", jobs, sha)
+	}
+}
+
+// TestRequestRescanHonorsCooldown covers the defense-in-depth path: a
+// sample analyzed within the cooldown window is rejected with
+// ErrRescanNotEligible even if the caller asks.
+func TestRequestRescanHonorsCooldown(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	const sha = "bbbbbb00000000000000000000000000000000000000000000000000000000bb"
+	mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test", Label: "good", LabelSource: "test"})
+	mustAnalyze(t, ctx, db, sha, 1)
+
+	if err := db.RequestRescan(ctx, sha, 15*time.Minute); !errors.Is(err, ErrRescanNotEligible) {
+		t.Fatalf("RequestRescan within cooldown: err = %v, want ErrRescanNotEligible", err)
+	}
+}
+
+// TestRequestRescanRejectsArchiveChild covers the parent-non-empty gate:
+// an archive member is never eligible for rescan (the parent archive
+// owns its analysis).
+func TestRequestRescanRejectsArchiveChild(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	const parent = "cccccc00000000000000000000000000000000000000000000000000000000cc"
+	const child = "dddddd00000000000000000000000000000000000000000000000000000000dd"
+	mustInsert(t, ctx, db, &Sample{SHA256: parent, Source: "test", Label: "bad", LabelSource: "test"})
+	mustInsert(t, ctx, db, &Sample{SHA256: child, Source: "test", Label: "bad", LabelSource: "test", Parent: parent})
+
+	if err := db.RequestRescan(ctx, child, 15*time.Minute); !errors.Is(err, ErrRescanNotEligible) {
+		t.Fatalf("RequestRescan on archive child: err = %v, want ErrRescanNotEligible", err)
+	}
+}
+
+// TestUpdateCleaveResultClearsForcedRescan covers the queue-drain path:
+// when a worker submits fresh analysis for a forced-rescan sample, the
+// forced_rescan_at marker clears so the row drops out of Tier 0.
+func TestUpdateCleaveResultClearsForcedRescan(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	const sha = "eeeeee00000000000000000000000000000000000000000000000000000000ee"
+	mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test", Label: "good", LabelSource: "test"})
+	mustAnalyze(t, ctx, db, sha, 1)
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET analyzed_at = ? WHERE sha256 = ?`,
+		time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), sha); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	if err := db.RequestRescan(ctx, sha, 15*time.Minute); err != nil {
+		t.Fatalf("RequestRescan: %v", err)
+	}
+
+	mustAnalyze(t, ctx, db, sha, 2) // simulates a worker finishing the rescan
+
+	jobs, err := db.ForcedRescanCandidates(ctx, 10)
+	if err != nil {
+		t.Fatalf("ForcedRescanCandidates: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("ForcedRescanCandidates after re-analysis = %+v, want empty", jobs)
+	}
+}
+
+// TestForcedRescanCandidatesOrder verifies FIFO ordering by forced_rescan_at.
+func TestForcedRescanCandidatesOrder(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	shas := []string{
+		"aabbcc0000000000000000000000000000000000000000000000000000000010",
+		"aabbcc0000000000000000000000000000000000000000000000000000000020",
+		"aabbcc0000000000000000000000000000000000000000000000000000000030",
+	}
+	for i, sha := range shas {
+		mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test", Label: "good", LabelSource: "test"})
+		mustAnalyze(t, ctx, db, sha, 1)
+		// Stamp forced_rescan_at explicitly so the test isn't dependent on
+		// RequestRescan's now()-based ordering (which is rate-limited by the
+		// SQLite clock resolution).
+		ts := time.Now().Add(time.Duration(i) * time.Second).Format(time.RFC3339Nano)
+		if _, err := db.lite.ExecContext(ctx,
+			`UPDATE samples SET cleave_result = NULL, forced_rescan_at = ? WHERE sha256 = ?`,
+			ts, sha); err != nil {
+			t.Fatalf("stamp: %v", err)
+		}
+	}
+
+	jobs, err := db.ForcedRescanCandidates(ctx, 10)
+	if err != nil {
+		t.Fatalf("ForcedRescanCandidates: %v", err)
+	}
+	if len(jobs) != len(shas) {
+		t.Fatalf("got %d jobs, want %d", len(jobs), len(shas))
+	}
+	for i, j := range jobs {
+		if j.SHA256 != shas[i] {
+			t.Fatalf("jobs[%d] = %s, want %s (FIFO order)", i, j.SHA256, shas[i])
+		}
+	}
+}

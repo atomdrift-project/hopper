@@ -212,6 +212,22 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		}
 	}
 
+	// forced_rescan_at: operator-initiated re-queue marker (Tier 0). See the
+	// matching PG migration for rationale. Workers drain Tier 0 before Tier 1
+	// so user-requested rescans jump the queue.
+	if pragmaHasColumn(ctx, db.lite, "forced_rescan_at") == 0 {
+		for _, ddl := range []string{
+			`ALTER TABLE samples ADD COLUMN forced_rescan_at DATETIME`,
+			`CREATE INDEX IF NOT EXISTS idx_samples_forced_rescan ` +
+				`ON samples(forced_rescan_at) ` +
+				`WHERE forced_rescan_at IS NOT NULL AND cleave_result IS NULL`,
+		} {
+			if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
+				return fmt.Errorf("hopper: migrate sqlite: %w", err)
+			}
+		}
+	}
+
 	// Forager direct-insert provenance: url, domain (eTLD+1, populated by
 	// Go via publicsuffix), name, version. See pg.go for rationale.
 	for _, col := range []struct{ name, ddl string }{
@@ -1069,6 +1085,8 @@ func (db *DB) updateCleaveResultSQLite(
 	// file_type, score, formula, litmus_score are GENERATED columns;
 	// setting litmus_result = NULL auto-resets litmus_score to 0.
 	n := now()
+	// forced_rescan_at clears here so the row drops out of the Tier 0
+	// queue once fresh analysis lands.
 	_, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET cleave_result = ?,
 			canonical_sha256 = ?, elements = ?,
@@ -1076,6 +1094,7 @@ func (db *DB) updateCleaveResultSQLite(
 			litmus_result = NULL,
 			note = '', last_error_at = NULL,
 			traits_version = ?,
+			forced_rescan_at = NULL,
 			first_analyzed_at = COALESCE(first_analyzed_at, ?),
 			analyzed_at = ?, updated_at = ?
 		WHERE sha256 = ?`,
@@ -1084,6 +1103,39 @@ func (db *DB) updateCleaveResultSQLite(
 		traitsVersion, n, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
+	}
+	return nil
+}
+
+// requestRescanSQLite mirrors requestRescanPG. SQLite is used for tests
+// and small-scale deployments; the production schema runs on Postgres.
+// cooldownCutoff is formatted to RFC3339Nano so the predicate compares
+// text-against-text — analyzed_at is stored as a TEXT column by the
+// migration, so a raw time.Time would format differently and never match.
+func (db *DB) requestRescanSQLite(ctx context.Context, sha256 string, cooldownCutoff time.Time) error {
+	n := now()
+	cutoff := cooldownCutoff.UTC().Format(time.RFC3339Nano)
+	res, err := db.lite.ExecContext(ctx, `
+		UPDATE samples
+		SET cleave_result = NULL,
+		    litmus_result = NULL,
+		    analyzed_at = NULL,
+		    last_error_at = NULL,
+		    traits_version = '',
+		    forced_rescan_at = ?,
+		    updated_at = ?
+		WHERE sha256 = ? AND parent = '' AND skip = ''
+		  AND (analyzed_at IS NULL OR analyzed_at < ?)`,
+		n, n, sha256, cutoff)
+	if err != nil {
+		return fmt.Errorf("hopper: request rescan: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("hopper: request rescan: rows affected: %w", err)
+	}
+	if rows == 0 {
+		return ErrRescanNotEligible
 	}
 	return nil
 }
@@ -2178,6 +2230,17 @@ func (db *DB) unanalyzedCandidatesSQLite(ctx context.Context, hopperStart time.T
 		)
 		ORDER BY pass, sha256
 		LIMIT ?`, pivot, startCutoff, limit, pivot, startCutoff, limit, limit)
+}
+
+// forcedRescanCandidatesSQLite mirrors forcedRescanCandidatesPG: Tier 0
+// operator-requested rescans, oldest first.
+func (db *DB) forcedRescanCandidatesSQLite(ctx context.Context, limit int) ([]ClaimJob, error) {
+	return queryLiteCandidates(ctx, db.lite, `
+		SELECT sha256, path, size_bytes, file_type FROM samples
+		WHERE forced_rescan_at IS NOT NULL AND cleave_result IS NULL
+		  AND skip = '' AND parent = ''
+		ORDER BY forced_rescan_at ASC
+		LIMIT ?`, limit)
 }
 
 func (db *DB) forceRescanCandidatesSQLite(ctx context.Context, hopperStart time.Time, prefixes []string, limit int) ([]ClaimJob, error) {

@@ -374,6 +374,17 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 		// follow-up once we're sure no rollback is needed.
 		`DROP INDEX IF EXISTS idx_samples_claimed`,
 
+		// Operator-initiated re-queue (Tier 0). Set by RequestRescan; cleared
+		// by updateCleaveResult when a worker submits fresh analysis. Workers
+		// drain Tier 0 before the Tier 1 (unanalyzed) backlog so a user-
+		// requested rescan jumps the queue regardless of the random SHA-pivot
+		// rotation Tier 1 uses. Partial index keeps the scan tiny (the set is
+		// transient — entries clear themselves as workers finish them).
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS forced_rescan_at TIMESTAMPTZ`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_forced_rescan ` +
+			`ON samples(forced_rescan_at) ` +
+			`WHERE forced_rescan_at IS NOT NULL AND cleave_result IS NULL`,
+
 		// Aggressive autovacuum on the hot table. Defaults wait for 20% dead
 		// tuples / 10% changed rows before kicking in, which on a 5M-row table
 		// means autovacuum lags by a million rows — and a stale visibility map
@@ -1120,6 +1131,9 @@ func (db *DB) updateCleaveResultPG(
 	// cleave_result / litmus_result — they can't be SET directly. Setting
 	// litmus_result = NULL implicitly resets litmus_score to 0 (via the
 	// COALESCE in its generation expression).
+	// forced_rescan_at clears here so the row drops out of the Tier 0
+	// queue once a worker has actually produced fresh analysis; without
+	// this the partial index would carry stale entries.
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET cleave_result = $2,
 			canonical_sha256 = $3, elements = $4,
@@ -1127,6 +1141,7 @@ func (db *DB) updateCleaveResultPG(
 			litmus_result = NULL,
 			note = '', last_error_at = NULL,
 			traits_version = $7,
+			forced_rescan_at = NULL,
 			first_analyzed_at = COALESCE(first_analyzed_at, now()),
 			analyzed_at = now(), updated_at = now()
 		WHERE sha256 = $1`,
@@ -1134,6 +1149,32 @@ func (db *DB) updateCleaveResultPG(
 		fi.Elements, fi.MaxCrit, fi.SuspiciousCount, traitsVersion)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
+	}
+	return nil
+}
+
+// requestRescanPG clears analysis fields and stamps forced_rescan_at so
+// workers pick this row before the Tier 1 backlog. Atomic: the cooldown
+// predicate is in the same WHERE as the state change, so a race never
+// produces a duplicate enqueue.
+func (db *DB) requestRescanPG(ctx context.Context, sha256 string, cooldownCutoff time.Time) error {
+	tag, err := db.pool.Exec(ctx, `
+		UPDATE samples
+		SET cleave_result = NULL,
+		    litmus_result = NULL,
+		    analyzed_at = NULL,
+		    last_error_at = NULL,
+		    traits_version = '',
+		    forced_rescan_at = now(),
+		    updated_at = now()
+		WHERE sha256 = $1 AND parent = '' AND skip = ''
+		  AND (analyzed_at IS NULL OR analyzed_at < $2)`,
+		sha256, cooldownCutoff)
+	if err != nil {
+		return fmt.Errorf("hopper: request rescan: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrRescanNotEligible
 	}
 	return nil
 }
@@ -2256,6 +2297,24 @@ func (db *DB) unanalyzedCandidatesPG(ctx context.Context, hopperStart time.Time,
 		hopperStart.UTC(), pivot, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: unanalyzed candidates: %w", err)
+	}
+	return scanClaimRows(rows)
+}
+
+// forcedRescanCandidatesPG returns Tier 0 work: samples explicitly re-
+// queued by RequestRescan. The idx_samples_forced_rescan partial index
+// keeps this scan O(active forced-rescan count) regardless of table size.
+// Rows leave the index as workers complete them (updateCleaveResultPG
+// clears forced_rescan_at) so the index stays tiny.
+func (db *DB) forcedRescanCandidatesPG(ctx context.Context, limit int) ([]ClaimJob, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT sha256, path, size_bytes, file_type FROM samples
+		WHERE forced_rescan_at IS NOT NULL AND cleave_result IS NULL
+		  AND skip = '' AND parent = ''
+		ORDER BY forced_rescan_at ASC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: forced rescan candidates: %w", err)
 	}
 	return scanClaimRows(rows)
 }

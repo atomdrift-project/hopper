@@ -1067,6 +1067,37 @@ func (db *DB) SampleParentInfo(ctx context.Context, sha256 string) (*Sample, err
 	return &s, nil
 }
 
+// ErrRescanNotEligible is returned by RequestRescan when the SHA matches
+// no top-level non-skipped sample OR when the sample was analyzed within
+// the cooldown window. Callers should treat it as a soft user-facing
+// error (HTTP 429 / 404), not a system failure.
+var ErrRescanNotEligible = errors.New("hopper: sample not eligible for rescan")
+
+// RequestRescan re-queues a previously-analyzed sample for Tier 0 work.
+// Clears the cached cleave/litmus envelope (so the worker re-analyzes)
+// and stamps forced_rescan_at so workers see this row before draining
+// the Tier 1 (unanalyzed) backlog.
+//
+// cooldown is the minimum age of the existing analysis before another
+// rescan is accepted; a row analyzed more recently returns
+// ErrRescanNotEligible. Cooldown is enforced in the same UPDATE as the
+// state transition so a race between two operators can never double-
+// queue the same SHA.
+//
+// Returns ErrRescanNotEligible when the sample is missing, is an archive
+// child (parent is non-empty), is skipped (skip is non-empty), or fails
+// the cooldown check. Returns nil on a successful re-queue.
+func (db *DB) RequestRescan(ctx context.Context, sha256 string, cooldown time.Duration) error {
+	if !isLowerHexSHA256(sha256) {
+		return ErrRescanNotEligible
+	}
+	cutoff := time.Now().Add(-cooldown)
+	if db.pool != nil {
+		return db.requestRescanPG(ctx, sha256, cutoff)
+	}
+	return db.requestRescanSQLite(ctx, sha256, cutoff)
+}
+
 // UpdateCleaveResult stores analysis output for a sample.
 // Pass a pre-parsed CleaveParseResult to avoid redundant JSON parsing,
 // or nil to parse the result automatically.
@@ -1266,6 +1297,18 @@ func (db *DB) UnanalyzedCandidates(ctx context.Context, hopperStart time.Time, l
 		return db.unanalyzedCandidatesPG(ctx, hopperStart, limit)
 	}
 	return db.unanalyzedCandidatesSQLite(ctx, hopperStart, limit)
+}
+
+// ForcedRescanCandidates returns up to limit Tier 0 jobs: samples that an
+// operator explicitly re-queued via RequestRescan. Workers drain this
+// before Tier 1 (unanalyzed) so a user-requested rescan jumps the queue
+// regardless of how big the backlog is. Ordered by forced_rescan_at
+// ascending (oldest request first) for FIFO fairness across operators.
+func (db *DB) ForcedRescanCandidates(ctx context.Context, limit int) ([]ClaimJob, error) {
+	if db.pool != nil {
+		return db.forcedRescanCandidatesPG(ctx, limit)
+	}
+	return db.forcedRescanCandidatesSQLite(ctx, limit)
 }
 
 // ForceRescanCandidates returns up to limit Tier 2 jobs: previously analyzed
