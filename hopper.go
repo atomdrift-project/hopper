@@ -1317,6 +1317,31 @@ func (db *DB) ForcedRescanCandidates(ctx context.Context, limit int) ([]ClaimJob
 	return db.forcedRescanCandidatesSQLite(ctx, limit)
 }
 
+// SampleAnalyzed reports whether a sample with the given SHA-256 exists
+// in the DB and, if so, whether its cleave_result is populated. Used by
+// prism's SSE wait endpoint for sub-100ms upload→render notification: a
+// tight poll loop that fetches the full sample row would pull megabytes
+// of cleave_result on every tick.
+func (db *DB) SampleAnalyzed(ctx context.Context, sha256 string) (exists, analyzed bool, err error) {
+	if db.pool != nil {
+		return db.sampleAnalyzedPG(ctx, sha256)
+	}
+	return db.sampleAnalyzedSQLite(ctx, sha256)
+}
+
+// UploadCandidates returns up to limit interactive-upload jobs: samples
+// posted by a user through prism's /upload (Source="upload") that haven't
+// been analyzed yet. Drained ahead of every other tier so the user sees
+// their result as fast as possible. Ordered by id ASC (insertion order)
+// for FIFO fairness — uploads are rare enough that the existing
+// idx_samples_claimable partial index covers this scan cheaply.
+func (db *DB) UploadCandidates(ctx context.Context, limit int) ([]ClaimJob, error) {
+	if db.pool != nil {
+		return db.uploadCandidatesPG(ctx, limit)
+	}
+	return db.uploadCandidatesSQLite(ctx, limit)
+}
+
 // ForceRescanCandidates returns up to limit Tier 2 jobs: previously analyzed
 // samples under the named path prefixes whose analysis predates hopperStart.
 func (db *DB) ForceRescanCandidates(ctx context.Context, hopperStart time.Time, prefixes []string, limit int) ([]ClaimJob, error) {

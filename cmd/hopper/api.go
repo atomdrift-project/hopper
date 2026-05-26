@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -397,6 +399,7 @@ func (wt *workerTracker) all() []namedWorkerStats {
 func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/next", s.handleNext)
 	mux.HandleFunc("POST /api/result", s.handleResult)
+	mux.HandleFunc("POST /api/upload", s.handleUpload)
 	mux.HandleFunc("GET /api/file/{sha256}", s.handleFile)
 	mux.Handle("GET /data/", s.safeFileServer())
 }
@@ -430,7 +433,20 @@ const (
 	explosionQueueSize    = 4096
 	explosionWorkers      = 4
 	explosionDrainTimeout = 30 * time.Second
+
+	// maxUploadBytes caps an interactive /api/upload body. Matches prism's
+	// web upload limit so anything that gets past prism fits here too.
+	maxUploadBytes = 100 << 20
+	// uploadFilenameMax bounds the on-disk filename component to keep paths
+	// reasonable across filesystems; longer names are truncated, never
+	// rejected, so users still get an analysis.
+	uploadFilenameMax = 200
 )
+
+// uploadDir is the directory under dataRoot where interactive uploads
+// land: <root>/unknown/uploads. Workers pick them up via the upload tier
+// in claimJobs.
+const uploadDir = "unknown/uploads"
 
 // validWorkerName checks that the name is non-empty, <= maxWorkerNameLen,
 // and contains only printable ASCII without control chars or whitespace tricks.
@@ -984,25 +1000,40 @@ func (s *apiServer) enqueueExplosion(ctx context.Context, job explosionJob) {
 	}
 }
 
-// claimJobs walks the three priority tiers (unanalyzed → force-rescan →
-// stale-traits) in order, fetching candidate batches from the DB and
-// claiming the first count that aren't held by another worker. Over-fetches
-// so that contention with other concurrent pollers doesn't starve a
-// requester at the head of the queue.
+// claimJobs walks the priority tiers (interactive uploads → forced
+// rescans → unanalyzed backlog → path-prefix rescans → stale traits) in
+// order, fetching candidate batches from the DB and claiming the first
+// count that aren't held by another worker. Over-fetches so that
+// contention with other concurrent pollers doesn't starve a requester at
+// the head of the queue.
 func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, tools *workerToolSet) ([]hopper.ClaimJob, error) {
 	want := count
 	overfetch := max(count*candidateOverfetch, minCandidates)
 
-	// Tier 0: operator-initiated rescans (RequestRescan). Drained before
-	// the unanalyzed backlog so a user-requested re-queue jumps the line
-	// instead of waiting for its SHA prefix to come up in the Tier 1
-	// random-pivot rotation.
-	cands, err := s.db.ForcedRescanCandidates(ctx, overfetch)
+	// Tier U: interactive uploads (Source="upload"). Drained ahead of
+	// every other tier so a user staring at the /file/<sha> page gets
+	// their result as fast as a worker can produce it.
+	cands, err := s.db.UploadCandidates(ctx, overfetch)
 	if err != nil {
 		return nil, err
 	}
 	cands = filterCandidatesByWorkerTools(cands, tools)
 	out := s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)
+	if len(out) >= count {
+		return out, nil
+	}
+
+	// Tier 0: operator-initiated rescans (RequestRescan). Drained before
+	// the unanalyzed backlog so a user-requested re-queue jumps the line
+	// instead of waiting for its SHA prefix to come up in the Tier 1
+	// random-pivot rotation.
+	want = count - len(out)
+	cands, err = s.db.ForcedRescanCandidates(ctx, overfetch)
+	if err != nil {
+		return out, err
+	}
+	cands = filterCandidatesByWorkerTools(cands, tools)
+	out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
 	if len(out) >= count {
 		return out, nil
 	}
@@ -1107,6 +1138,186 @@ func validSHA256(s string) bool {
 		}
 	}
 	return true
+}
+
+// uploadResponse is the JSON body returned by POST /api/upload.
+type uploadResponse struct {
+	SHA256          string `json:"sha256"`
+	AlreadyAnalyzed bool   `json:"already_analyzed"`
+	Size            int64  `json:"size"`
+}
+
+// sanitizeUploadFilename returns a safe on-disk filename component. Strips
+// any path separators (defence in depth — clients shouldn't send them) and
+// any control character, collapses whitespace, and truncates to
+// uploadFilenameMax bytes. Returns "" if nothing usable remains; the
+// caller substitutes a sha-derived placeholder.
+func sanitizeUploadFilename(raw string) string {
+	raw = filepath.Base(raw)
+	if raw == "." || raw == "/" || raw == `\` {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	for _, r := range raw {
+		switch {
+		case r == '/' || r == '\\' || r == 0:
+			continue
+		case r < 0x20 || r == 0x7f:
+			continue
+		case unicode.IsSpace(r):
+			b.WriteByte(' ')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	out := strings.TrimSpace(b.String())
+	if len(out) > uploadFilenameMax {
+		// Preserve extension if possible so file-type detection still works.
+		ext := filepath.Ext(out)
+		if len(ext) > 0 && len(ext) < 16 {
+			out = out[:uploadFilenameMax-len(ext)] + ext
+		} else {
+			out = out[:uploadFilenameMax]
+		}
+	}
+	return out
+}
+
+// handleUpload accepts an interactive file upload from prism, persists it
+// under <dataRoot>/unknown/uploads/<aa>/<bb>/<filename>, and inserts a
+// sample row tagged Source="upload" so the upload tier in claimJobs hands
+// it to the next free worker. The request body IS the file (no
+// multipart): keeps the streaming write zero-copy and lets prism just
+// io.Copy its incoming body straight through.
+//
+// Query parameters:
+//   - filename: optional, hint for on-disk name and DB.Filename. Sanitized
+//     to a safe basename; falls back to "<sha[:16]>.bin" if missing or empty
+//     after sanitization.
+//
+// Response: 200 OK with JSON {"sha256", "size", "already_analyzed"}.
+// Idempotent — re-uploading the same content returns the existing sample,
+// with already_analyzed=true if cleave_result is populated.
+func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		http.Error(w, `{"error":"starting"}`, http.StatusServiceUnavailable)
+		return
+	}
+	if s.dataRoot == "" {
+		http.Error(w, `{"error":"no data root configured"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	rawName := r.URL.Query().Get("filename")
+	filename := sanitizeUploadFilename(rawName)
+
+	// Stream to a temp file under the uploads root while hashing. Temp
+	// lives on the same filesystem as the final location so the post-hash
+	// rename is atomic and cross-device-safe.
+	tmpDir := filepath.Join(s.dataRoot, uploadDir, ".tmp")
+	if err := os.MkdirAll(tmpDir, 0o750); err != nil {
+		slog.Error("upload: mkdir tmp", "error", err)
+		http.Error(w, `{"error":"server error"}`, http.StatusInternalServerError)
+		return
+	}
+	tmpFile, err := os.CreateTemp(tmpDir, "up-*")
+	if err != nil {
+		slog.Error("upload: create temp", "error", err)
+		http.Error(w, `{"error":"server error"}`, http.StatusInternalServerError)
+		return
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath) //nolint:errcheck // best-effort; succeeds on error path, no-op after rename
+
+	body := http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	hasher := sha256.New()
+	written, copyErr := io.Copy(io.MultiWriter(tmpFile, hasher), body)
+	closeErr := tmpFile.Close()
+	if copyErr != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(copyErr, &maxErr) {
+			http.Error(w, `{"error":"file too large"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
+		slog.Warn("upload: stream copy failed", "error", copyErr, "bytes", written)
+		http.Error(w, `{"error":"upload failed"}`, http.StatusBadRequest)
+		return
+	}
+	if closeErr != nil {
+		slog.Error("upload: temp close", "error", closeErr)
+		http.Error(w, `{"error":"server error"}`, http.StatusInternalServerError)
+		return
+	}
+	if written == 0 {
+		http.Error(w, `{"error":"empty body"}`, http.StatusBadRequest)
+		return
+	}
+
+	sha := hex.EncodeToString(hasher.Sum(nil))
+	if filename == "" {
+		filename = sha[:16] + ".bin"
+	}
+
+	// Final location: unknown/uploads/<aa>/<bb>/<filename>
+	relDir := filepath.Join(uploadDir, sha[:2], sha[2:4])
+	relPath := filepath.Join(relDir, filename)
+	absDir := filepath.Join(s.dataRoot, relDir)
+	absPath := filepath.Join(s.dataRoot, relPath)
+	if err := os.MkdirAll(absDir, 0o750); err != nil {
+		slog.Error("upload: mkdir shard", "error", err, "dir", absDir)
+		http.Error(w, `{"error":"server error"}`, http.StatusInternalServerError)
+		return
+	}
+	// Idempotent: if the file already exists for this sha, the rename
+	// replaces it. Same content, same sha — bytes are identical.
+	if err := os.Rename(tmpPath, absPath); err != nil {
+		slog.Error("upload: rename", "error", err, "from", tmpPath, "to", absPath)
+		http.Error(w, `{"error":"server error"}`, http.StatusInternalServerError)
+		return
+	}
+	_ = os.Chmod(absPath, 0o600) //nolint:errcheck // best-effort; rename preserves the temp file's 0600
+
+	// Check whether this sha is already known (re-upload). If so, return
+	// its analysis status so the caller can redirect straight to the
+	// result page.
+	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
+	defer cancel()
+	alreadyAnalyzed := false
+	if existing, err := s.db.SampleBySHA256(ctx, sha); err == nil {
+		alreadyAnalyzed = len(existing.CleaveResult) > 0
+	} else if !errors.Is(err, hopper.ErrNotFound) {
+		slog.Warn("upload: existing sample lookup", "sha256", sha, "error", err)
+	}
+
+	// Insert (no-op if duplicate sha). Path uses forward slashes — hopper
+	// stores POSIX-style paths even on Windows, matching every other
+	// ingest source.
+	relPathPOSIX := filepath.ToSlash(relPath)
+	if err := s.db.InsertSample(ctx, &hopper.Sample{
+		SHA256:      sha,
+		Source:      "upload",
+		Filename:    filename,
+		Path:        relPathPOSIX,
+		Label:       "unknown",
+		LabelSource: "upload",
+		SizeBytes:   written,
+	}); err != nil {
+		slog.Error("upload: insert sample", "sha256", sha, "error", err)
+		http.Error(w, `{"error":"server error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	slog.Info("upload accepted",
+		"sha256", sha, "size", written, "filename", filename,
+		"already_analyzed", alreadyAnalyzed, "remote", r.RemoteAddr)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(uploadResponse{ //nolint:errcheck,errchkjson // best-effort response
+		SHA256:          sha,
+		Size:            written,
+		AlreadyAnalyzed: alreadyAnalyzed,
+	})
 }
 
 // classifyResultError categorizes a worker-reported analysis error. If the

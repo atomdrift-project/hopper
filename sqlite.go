@@ -2248,6 +2248,33 @@ func (db *DB) forcedRescanCandidatesSQLite(ctx context.Context, limit int) ([]Cl
 		LIMIT ?`, limit)
 }
 
+// sampleAnalyzedSQLite mirrors sampleAnalyzedPG: cheap status query that
+// avoids pulling the cleave_result blob during tight poll loops.
+func (db *DB) sampleAnalyzedSQLite(ctx context.Context, sha256 string) (exists, analyzed bool, err error) {
+	var analyzedInt int
+	err = db.lite.QueryRowContext(ctx,
+		`SELECT cleave_result IS NOT NULL FROM samples WHERE sha256 = ?`, sha256,
+	).Scan(&analyzedInt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, false, nil
+		}
+		return false, false, fmt.Errorf("hopper: sample analyzed lookup: %w", err)
+	}
+	return true, analyzedInt != 0, nil
+}
+
+// uploadCandidatesSQLite mirrors uploadCandidatesPG: interactive uploads
+// not yet analyzed, oldest first.
+func (db *DB) uploadCandidatesSQLite(ctx context.Context, limit int) ([]ClaimJob, error) {
+	return queryLiteCandidates(ctx, db.lite, `
+		SELECT sha256, path, size_bytes, file_type FROM samples
+		WHERE source = 'upload' AND cleave_result IS NULL
+		  AND skip = '' AND parent = ''
+		ORDER BY id ASC
+		LIMIT ?`, limit)
+}
+
 func (db *DB) forceRescanCandidatesSQLite(ctx context.Context, hopperStart time.Time, prefixes []string, limit int) ([]ClaimJob, error) {
 	if len(prefixes) == 0 {
 		return nil, nil

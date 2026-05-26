@@ -2343,6 +2343,37 @@ func (db *DB) forcedRescanCandidatesPG(ctx context.Context, limit int) ([]ClaimJ
 	return scanClaimRows(rows)
 }
 
+// sampleAnalyzedPG is the PG implementation of SampleAnalyzed. Reads two
+// booleans via the primary-key index; never pulls cleave_result bytes.
+func (db *DB) sampleAnalyzedPG(ctx context.Context, sha256 string) (exists, analyzed bool, err error) {
+	err = db.pool.QueryRow(ctx,
+		`SELECT cleave_result IS NOT NULL FROM samples WHERE sha256 = $1`, sha256,
+	).Scan(&analyzed)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, false, nil
+		}
+		return false, false, fmt.Errorf("hopper: sample analyzed lookup: %w", err)
+	}
+	return true, analyzed, nil
+}
+
+// uploadCandidatesPG returns interactive uploads waiting for analysis,
+// ordered by insertion (id ASC). Drained ahead of every other tier in
+// claimJobs so prism users see results as soon as a worker is free.
+func (db *DB) uploadCandidatesPG(ctx context.Context, limit int) ([]ClaimJob, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT sha256, path, size_bytes, file_type FROM samples
+		WHERE source = 'upload' AND cleave_result IS NULL
+		  AND skip = '' AND parent = ''
+		ORDER BY id ASC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: upload candidates: %w", err)
+	}
+	return scanClaimRows(rows)
+}
+
 // forceRescanCandidatesPG returns Tier 2 work: previously analyzed samples
 // under the named path prefixes whose analysis predates hopperStart.
 func (db *DB) forceRescanCandidatesPG(ctx context.Context, hopperStart time.Time, prefixes []string, limit int) ([]ClaimJob, error) {
