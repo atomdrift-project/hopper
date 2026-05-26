@@ -382,6 +382,16 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		}
 	}
 
+	// Internal key/value store. Used for the upload-token bootstrap (prism
+	// reads it to discover the bearer token for /api/upload).
+	if _, err := db.lite.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS hopper_kv (
+		key        TEXT PRIMARY KEY,
+		value      TEXT NOT NULL,
+		updated_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+	)`); err != nil {
+		return fmt.Errorf("hopper: migrate sqlite hopper_kv: %w", err)
+	}
+
 	return nil
 }
 

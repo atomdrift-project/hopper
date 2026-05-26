@@ -410,6 +410,14 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 			autovacuum_vacuum_insert_scale_factor = 0.02,
 			autovacuum_vacuum_cost_limit = 2000
 		)`,
+
+		// Internal key/value store. Used for the upload-token bootstrap
+		// (prism reads it to discover the bearer token for /api/upload).
+		`CREATE TABLE IF NOT EXISTS hopper_kv (
+			key        TEXT PRIMARY KEY,
+			value      TEXT NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
 	} {
 		if err := db.execPGMigrationDDL(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate: %w", err)

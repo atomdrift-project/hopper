@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -18,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"codeberg.org/atomdrift/hopper"
 	"github.com/codeGROOVE-dev/retry"
@@ -36,13 +39,39 @@ type apiServer struct {
 	// commit. Stored in an atomic.Pointer so the periodic rules-update
 	// goroutine can refresh it concurrently with read traffic from
 	// /api/next, /api/result, and the dashboard. Empty = rescan disabled.
-	traitsVersion       atomic.Pointer[string]
-	hopperStart         time.Time // process start; gates force-rescan claim tier
-	dataRoot            string    // resolved absolute path to the data directory
-	allowedDirs         []string  // resolved absolute paths that /api/file may serve from
-	forceRescanPrefixes []string  // normalized relative paths to re-analyze when analysis predates hopperStart
+	traitsVersion atomic.Pointer[string]
+	hopperStart   time.Time // process start; gates force-rescan claim tier
+	dataRoot      string    // resolved absolute path to the data directory
+	// uploadTokenHash holds sha256(HOPPER_UPLOAD_TOKEN). Storing only the
+	// hash means a process-memory disclosure (core dump, /proc/<pid>/mem,
+	// swap) does not leak the secret in usable form. Compare with
+	// subtle.ConstantTimeCompare against sha256(incoming). uploadTokenSet
+	// distinguishes "no token configured" from the 2^-256 case of a hash
+	// that happens to be all-zero.
+	uploadTokenHash     [sha256.Size]byte
+	uploadTokenSet      bool
+	allowedDirs         []string // resolved absolute paths that /api/file may serve from
+	forceRescanPrefixes []string // normalized relative paths to re-analyze when analysis predates hopperStart
 	explosionWG         sync.WaitGroup
 	rescanAge           time.Duration
+}
+
+// errUploadDisabled is the sentinel for "no HOPPER_UPLOAD_TOKEN configured".
+// The auth handler dispatches on this with errors.Is to return 503 (disabled)
+// rather than 401 (auth failed).
+var errUploadDisabled = errors.New("upload endpoint disabled (set HOPPER_UPLOAD_TOKEN)")
+
+// setUploadToken stores sha256(token) for later constant-time comparison.
+// The plaintext is scoped to this call; once it returns, the only in-memory
+// copy is the SHA-256 digest. Returns an error if the token is too short to
+// meet the minimum-entropy threshold.
+func (s *apiServer) setUploadToken(token string) error {
+	if len(token) < uploadTokenMinLen {
+		return fmt.Errorf("token must be at least %d bytes (got %d)", uploadTokenMinLen, len(token))
+	}
+	s.uploadTokenHash = sha256.Sum256([]byte(token))
+	s.uploadTokenSet = true
+	return nil
 }
 
 // TraitsVersion returns the current canonical traits version. Safe for
@@ -441,12 +470,26 @@ const (
 	// reasonable across filesystems; longer names are truncated, never
 	// rejected, so users still get an analysis.
 	uploadFilenameMax = 200
+	// uploadBodyTimeout caps how long the body of a single /api/upload may
+	// take to arrive. Defends against slow-loris streams that hold a temp
+	// file open while dripping bytes under maxUploadBytes.
+	uploadBodyTimeout = 5 * time.Minute
+	// uploadTokenMinLen is the smallest acceptable HOPPER_UPLOAD_TOKEN.
+	// 32 chars yields >=128 bits with hex encoding, >=192 bits with base64.
+	// A random `openssl rand -hex 32` produces 64 chars and meets this with
+	// room to spare. Rejecting short tokens at config time keeps a typo
+	// from silently degrading auth strength below the threat model.
+	uploadTokenMinLen = 32
+	// uploadTmpMaxAge is how long an orphaned .tmp/up-* file may live
+	// before startup sweep deletes it. Long enough that an in-flight
+	// upload across a process restart still survives if the operator
+	// bounces hopper mid-request.
+	uploadTmpMaxAge = 1 * time.Hour
+	// uploadDir is the directory under dataRoot where interactive uploads
+	// land: <root>/unknown/uploads. Workers pick them up via the upload
+	// tier in claimJobs.
+	uploadDir = "unknown/uploads"
 )
-
-// uploadDir is the directory under dataRoot where interactive uploads
-// land: <root>/unknown/uploads. Workers pick them up via the upload tier
-// in claimJobs.
-const uploadDir = "unknown/uploads"
 
 // validWorkerName checks that the name is non-empty, <= maxWorkerNameLen,
 // and contains only printable ASCII without control chars or whitespace tricks.
@@ -1147,41 +1190,182 @@ type uploadResponse struct {
 	Size            int64  `json:"size"`
 }
 
-// sanitizeUploadFilename returns a safe on-disk filename component. Strips
-// any path separators (defence in depth — clients shouldn't send them) and
-// any control character, collapses whitespace, and truncates to
-// uploadFilenameMax bytes. Returns "" if nothing usable remains; the
-// caller substitutes a sha-derived placeholder.
+// reservedWindowsNames are device names that Windows treats specially in any
+// directory, with or without an extension. We never want to write a file
+// whose stem matches one of these — even on Linux deployments, the corpus
+// occasionally gets rsync'd onto Windows analyst boxes.
+var reservedWindowsNames = map[string]struct{}{
+	"con": {}, "prn": {}, "aux": {}, "nul": {},
+	"com1": {}, "com2": {}, "com3": {}, "com4": {}, "com5": {},
+	"com6": {}, "com7": {}, "com8": {}, "com9": {},
+	"lpt1": {}, "lpt2": {}, "lpt3": {}, "lpt4": {}, "lpt5": {},
+	"lpt6": {}, "lpt7": {}, "lpt8": {}, "lpt9": {},
+}
+
+// sanitizeUploadFilename returns a safe on-disk filename component, or ""
+// if nothing usable survives. Hardening, in order:
+//
+//   - filepath.Base strips any directory prefix (defence in depth; clients
+//     shouldn't send one).
+//   - Path separators, NULs, and control chars are dropped.
+//   - Whitespace runs collapse to single spaces, then outer space is trimmed.
+//   - Pure-dot strings (".", "..", "...") are rejected — they're either
+//     traversal attempts or filesystem-special names.
+//   - Trailing dots and spaces are trimmed (Windows strips them silently,
+//     so "evil.exe." would resolve to "evil.exe" on a Windows analyst box).
+//   - Reserved Windows device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9) are
+//     replaced with the sha-derived placeholder by returning "" — the
+//     caller substitutes.
+//   - Truncated to uploadFilenameMax bytes on a UTF-8-safe boundary so the
+//     on-disk name is always well-formed UTF-8.
 func sanitizeUploadFilename(raw string) string {
 	raw = filepath.Base(raw)
-	if raw == "." || raw == "/" || raw == `\` {
+	if raw == "." || raw == ".." || raw == "/" || raw == `\` {
 		return ""
 	}
 	var b strings.Builder
 	b.Grow(len(raw))
+	prevSpace := false
 	for _, r := range raw {
 		switch {
+		case r == utf8.RuneError:
+			continue
 		case r == '/' || r == '\\' || r == 0:
 			continue
+		case unicode.IsSpace(r):
+			// Whitespace check comes before the generic control-char filter
+			// so tab/CR/LF collapse to a single space rather than vanishing,
+			// which would silently glue separate words together.
+			if !prevSpace {
+				b.WriteByte(' ')
+				prevSpace = true
+			}
 		case r < 0x20 || r == 0x7f:
 			continue
-		case unicode.IsSpace(r):
-			b.WriteByte(' ')
 		default:
 			b.WriteRune(r)
+			prevSpace = false
 		}
 	}
-	out := strings.TrimSpace(b.String())
+	// Strip trailing dots and spaces — Windows ignores them, which lets a
+	// crafted "evil.exe." appear as "evil.exe" once the corpus is moved.
+	out := strings.TrimRight(strings.TrimSpace(b.String()), ". ")
+	if out == "" {
+		return ""
+	}
+	// Any all-dots survivor is suspicious; reject.
+	if strings.Trim(out, ".") == "" {
+		return ""
+	}
+	// Reserved Windows device name (case-insensitive, with or without extension).
+	stem := strings.ToLower(out)
+	if i := strings.IndexByte(stem, '.'); i >= 0 {
+		stem = stem[:i]
+	}
+	if _, bad := reservedWindowsNames[stem]; bad {
+		return ""
+	}
 	if len(out) > uploadFilenameMax {
 		// Preserve extension if possible so file-type detection still works.
 		ext := filepath.Ext(out)
-		if len(ext) > 0 && len(ext) < 16 {
-			out = out[:uploadFilenameMax-len(ext)] + ext
+		var cut int
+		if ext != "" && len(ext) < 16 {
+			cut = uploadFilenameMax - len(ext)
 		} else {
-			out = out[:uploadFilenameMax]
+			cut = uploadFilenameMax
+			ext = ""
 		}
+		// Round cut DOWN to a UTF-8 rune boundary so we never split a
+		// multi-byte rune. utf8.RuneStart is true at boundary bytes.
+		for cut > 0 && !utf8.RuneStart(out[cut]) {
+			cut--
+		}
+		out = out[:cut] + ext
 	}
 	return out
+}
+
+// writeJSONError emits a JSON error body with the correct Content-Type and
+// no-store cache directives. The stdlib http.Error otherwise overrides
+// Content-Type to text/plain, and leaves caching to intermediary defaults.
+func writeJSONError(w http.ResponseWriter, code int, body string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(code)
+	_, _ = io.WriteString(w, body) //nolint:errcheck // best-effort response
+}
+
+// checkUploadAuth validates the bearer token on /api/upload. Both sides
+// are hashed to a fixed 32-byte digest before comparison so:
+//
+//   - subtle.ConstantTimeCompare runs over constant-length inputs — it
+//     would otherwise short-circuit on length mismatch and leak the server
+//     token's length via response timing.
+//   - The plaintext token never sits in long-lived process memory; only
+//     its SHA-256 does. A core dump or /proc/<pid>/mem read by a
+//     post-compromise adversary still finds the hash, not the secret.
+//
+// Returns errUploadDisabled when no token is configured (the handler
+// translates that to 503); any other error becomes 401. The HTTP response
+// body is the same in either case — the distinction is for logging.
+func (s *apiServer) checkUploadAuth(r *http.Request) error {
+	if !s.uploadTokenSet {
+		return errUploadDisabled
+	}
+	auth := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if !strings.HasPrefix(auth, prefix) {
+		return errors.New("missing or malformed Authorization header")
+	}
+	got := sha256.Sum256([]byte(auth[len(prefix):]))
+	if subtle.ConstantTimeCompare(got[:], s.uploadTokenHash[:]) != 1 {
+		return errors.New("invalid token")
+	}
+	return nil
+}
+
+// checkBrowserCSRF rejects requests that browser security signals identify
+// as cross-origin form posts. The upload endpoint should never be hit by a
+// browser-served HTML form: prism uploads with an explicit fetch(),
+// command-line clients send Authorization headers. Anything that looks
+// like a cross-site form submit is treated as hostile. Returns nil when
+// the request passes.
+func checkBrowserCSRF(r *http.Request) error {
+	// Sec-Fetch-Site is set by every modern browser. "same-origin" and
+	// "same-site" are normal user-driven requests from prism; "none" is a
+	// user-typed URL (no upload there). "cross-site" is forbidden.
+	if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+		return errors.New("cross-site request blocked")
+	}
+	// Block obvious form-submission content types. Raw uploads are
+	// application/octet-stream or unset; browsers can only set those via
+	// fetch(), which triggers a preflight (and the server doesn't answer
+	// preflights, so it's already blocked). Browser-issued <form> submits
+	// land here with one of the three CORS "simple" types below.
+	ct := r.Header.Get("Content-Type")
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	switch strings.TrimSpace(strings.ToLower(ct)) {
+	case "application/x-www-form-urlencoded", "multipart/form-data", "text/plain":
+		return errors.New("disallowed Content-Type for upload")
+	}
+	return nil
+}
+
+// resolveDataPath joins the relative path under dataRoot and asserts the
+// cleaned result is still strictly inside dataRoot. Belt-and-braces against
+// any future regression in sanitizeUploadFilename — if a "../"-shaped name
+// ever survives, this catch fires before we touch the filesystem.
+// filepath.Join already calls Clean, and dataRoot is cleaned+absolute at
+// startup, so no re-cleaning is needed here.
+func (s *apiServer) resolveDataPath(rel string) (string, error) {
+	abs := filepath.Join(s.dataRoot, rel)
+	if abs != s.dataRoot && !strings.HasPrefix(abs, s.dataRoot+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q escapes data root %q", rel, s.dataRoot)
+	}
+	return abs, nil
 }
 
 // handleUpload accepts an interactive file upload from prism, persists it
@@ -1191,6 +1375,9 @@ func sanitizeUploadFilename(raw string) string {
 // multipart): keeps the streaming write zero-copy and lets prism just
 // io.Copy its incoming body straight through.
 //
+// Auth: requires "Authorization: Bearer <HOPPER_UPLOAD_TOKEN>". When the
+// env var is unset the route is disabled (returns 503) — fail-closed.
+//
 // Query parameters:
 //   - filename: optional, hint for on-disk name and DB.Filename. Sanitized
 //     to a safe basename; falls back to "<sha[:16]>.bin" if missing or empty
@@ -1199,15 +1386,57 @@ func sanitizeUploadFilename(raw string) string {
 // Response: 200 OK with JSON {"sha256", "size", "already_analyzed"}.
 // Idempotent — re-uploading the same content returns the existing sample,
 // with already_analyzed=true if cleave_result is populated.
+//
+//nolint:gosec // paths confined to dataRoot via resolveDataPath
 func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
-		http.Error(w, `{"error":"starting"}`, http.StatusServiceUnavailable)
+		writeJSONError(w, http.StatusServiceUnavailable, `{"error":"starting"}`)
 		return
 	}
 	if s.dataRoot == "" {
-		http.Error(w, `{"error":"no data root configured"}`, http.StatusServiceUnavailable)
+		writeJSONError(w, http.StatusServiceUnavailable, `{"error":"no data root configured"}`)
 		return
 	}
+
+	// Auth first — every later step touches disk or DB.
+	if err := s.checkUploadAuth(r); err != nil {
+		slog.Warn("upload rejected: auth", "reason", err, "remote", r.RemoteAddr)
+		if errors.Is(err, errUploadDisabled) {
+			writeJSONError(w, http.StatusServiceUnavailable, `{"error":"upload disabled"}`)
+			return
+		}
+		w.Header().Set("WWW-Authenticate", `Bearer realm="hopper"`)
+		writeJSONError(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
+		return
+	}
+
+	// CSRF/browser-form guard. Cheap, rejects the most common cross-origin
+	// shapes before we read any body bytes.
+	if err := checkBrowserCSRF(r); err != nil {
+		slog.Warn("upload rejected: csrf guard", "reason", err,
+			"sec_fetch_site", r.Header.Get("Sec-Fetch-Site"),
+			"origin", r.Header.Get("Origin"), "remote", r.RemoteAddr)
+		writeJSONError(w, http.StatusForbidden, `{"error":"forbidden"}`)
+		return
+	}
+
+	// Content-Length pre-check. Lets us reject oversized uploads before
+	// allocating a temp file. ContentLength is -1 when unknown (chunked).
+	if r.ContentLength > maxUploadBytes {
+		writeJSONError(w, http.StatusRequestEntityTooLarge, `{"error":"file too large"}`)
+		return
+	}
+	if r.ContentLength == 0 {
+		writeJSONError(w, http.StatusBadRequest, `{"error":"empty body"}`)
+		return
+	}
+
+	// Slowloris defense: bound how long the body may take. Uses the
+	// per-request response controller so workers downloading large samples
+	// over /data/* aren't affected by a global server-level ReadTimeout.
+	// SetReadDeadline returns http.ErrNotSupported when the underlying
+	// ResponseWriter doesn't implement it (e.g. httptest); harmless.
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(uploadBodyTimeout)) //nolint:errcheck // optional
 
 	rawName := r.URL.Query().Get("filename")
 	filename := sanitizeUploadFilename(rawName)
@@ -1215,16 +1444,21 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// Stream to a temp file under the uploads root while hashing. Temp
 	// lives on the same filesystem as the final location so the post-hash
 	// rename is atomic and cross-device-safe.
-	tmpDir := filepath.Join(s.dataRoot, uploadDir, ".tmp")
+	tmpDir, err := s.resolveDataPath(filepath.Join(uploadDir, ".tmp"))
+	if err != nil {
+		slog.Error("upload: resolve tmp dir", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		return
+	}
 	if err := os.MkdirAll(tmpDir, 0o750); err != nil {
 		slog.Error("upload: mkdir tmp", "error", err)
-		http.Error(w, `{"error":"server error"}`, http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
 	}
 	tmpFile, err := os.CreateTemp(tmpDir, "up-*")
 	if err != nil {
 		slog.Error("upload: create temp", "error", err)
-		http.Error(w, `{"error":"server error"}`, http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
 	}
 	tmpPath := tmpFile.Name()
@@ -1237,20 +1471,29 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if copyErr != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(copyErr, &maxErr) {
-			http.Error(w, `{"error":"file too large"}`, http.StatusRequestEntityTooLarge)
+			writeJSONError(w, http.StatusRequestEntityTooLarge, `{"error":"file too large"}`)
 			return
 		}
-		slog.Warn("upload: stream copy failed", "error", copyErr, "bytes", written)
-		http.Error(w, `{"error":"upload failed"}`, http.StatusBadRequest)
+		// Read-deadline expiration surfaces as a net.Error with Timeout()=true.
+		var netErr net.Error
+		if errors.As(copyErr, &netErr) && netErr.Timeout() {
+			//nolint:gosec // structured logging
+			slog.Warn("upload: body read timeout", "bytes", written, "remote", r.RemoteAddr)
+			writeJSONError(w, http.StatusRequestTimeout, `{"error":"upload timeout"}`)
+			return
+		}
+		//nolint:gosec // structured logging
+		slog.Warn("upload: stream copy failed", "error", copyErr, "bytes", written, "remote", r.RemoteAddr)
+		writeJSONError(w, http.StatusBadRequest, `{"error":"upload failed"}`)
 		return
 	}
 	if closeErr != nil {
 		slog.Error("upload: temp close", "error", closeErr)
-		http.Error(w, `{"error":"server error"}`, http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
 	}
 	if written == 0 {
-		http.Error(w, `{"error":"empty body"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, `{"error":"empty body"}`)
 		return
 	}
 
@@ -1259,65 +1502,123 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		filename = sha[:16] + ".bin"
 	}
 
-	// Final location: unknown/uploads/<aa>/<bb>/<filename>
+	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
+	defer cancel()
+
+	// Look up any existing row for this sha BEFORE writing the final path.
+	// If we already have this sample, reuse its on-disk filename rather
+	// than spawning a second copy under a new shard path — otherwise an
+	// attacker re-uploading the same bytes with a rotating filename query
+	// param fills the disk despite the sha-level dedupe.
+	existing, err := s.db.SampleBySHA256(ctx, sha)
+	if err != nil && !errors.Is(err, hopper.ErrNotFound) {
+		slog.Warn("upload: existing sample lookup", "sha256", sha, "error", err)
+	}
+	alreadyAnalyzed := existing != nil && len(existing.CleaveResult) > 0
+
+	// Final location: unknown/uploads/<aa>/<bb>/<filename>. When the sha is
+	// already known, reuse the stored filename so we land at the same path
+	// instead of creating a duplicate.
+	if existing != nil && existing.Filename != "" {
+		if reuse := sanitizeUploadFilename(existing.Filename); reuse != "" {
+			filename = reuse
+		}
+	}
 	relDir := filepath.Join(uploadDir, sha[:2], sha[2:4])
 	relPath := filepath.Join(relDir, filename)
-	absDir := filepath.Join(s.dataRoot, relDir)
-	absPath := filepath.Join(s.dataRoot, relPath)
-	if err := os.MkdirAll(absDir, 0o750); err != nil {
-		slog.Error("upload: mkdir shard", "error", err, "dir", absDir)
-		http.Error(w, `{"error":"server error"}`, http.StatusInternalServerError)
+	absDir, err := s.resolveDataPath(relDir)
+	if err != nil {
+		slog.Error("upload: shard path escapes data root", "rel", relDir, "error", err)
+		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid filename"}`)
 		return
 	}
-	// Idempotent: if the file already exists for this sha, the rename
+	absPath, err := s.resolveDataPath(relPath)
+	if err != nil {
+		slog.Error("upload: target path escapes data root", "rel", relPath, "error", err)
+		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid filename"}`)
+		return
+	}
+	if err := os.MkdirAll(absDir, 0o750); err != nil {
+		slog.Error("upload: mkdir shard", "error", err, "dir", absDir)
+		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		return
+	}
+	// Idempotent: if the file already exists for this sha, Rename atomically
 	// replaces it. Same content, same sha — bytes are identical.
 	if err := os.Rename(tmpPath, absPath); err != nil {
 		slog.Error("upload: rename", "error", err, "from", tmpPath, "to", absPath)
-		http.Error(w, `{"error":"server error"}`, http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
-	}
-	_ = os.Chmod(absPath, 0o600) //nolint:errcheck // best-effort; rename preserves the temp file's 0600
-
-	// Check whether this sha is already known (re-upload). If so, return
-	// its analysis status so the caller can redirect straight to the
-	// result page.
-	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
-	defer cancel()
-	alreadyAnalyzed := false
-	if existing, err := s.db.SampleBySHA256(ctx, sha); err == nil {
-		alreadyAnalyzed = len(existing.CleaveResult) > 0
-	} else if !errors.Is(err, hopper.ErrNotFound) {
-		slog.Warn("upload: existing sample lookup", "sha256", sha, "error", err)
 	}
 
 	// Insert (no-op if duplicate sha). Path uses forward slashes — hopper
 	// stores POSIX-style paths even on Windows, matching every other
 	// ingest source.
-	relPathPOSIX := filepath.ToSlash(relPath)
 	if err := s.db.InsertSample(ctx, &hopper.Sample{
 		SHA256:      sha,
 		Source:      "upload",
 		Filename:    filename,
-		Path:        relPathPOSIX,
+		Path:        filepath.ToSlash(relPath),
 		Label:       "unknown",
 		LabelSource: "upload",
 		SizeBytes:   written,
 	}); err != nil {
 		slog.Error("upload: insert sample", "sha256", sha, "error", err)
-		http.Error(w, `{"error":"server error"}`, http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
 	}
 
+	//nolint:gosec // structured logging; filename sanitized, remote is r.RemoteAddr
 	slog.Info("upload accepted",
 		"sha256", sha, "size", written, "filename", filename,
 		"already_analyzed", alreadyAnalyzed, "remote", r.RemoteAddr)
 
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(uploadResponse{ //nolint:errcheck,errchkjson // best-effort response
 		SHA256:          sha,
 		Size:            written,
 		AlreadyAnalyzed: alreadyAnalyzed,
 	})
+}
+
+// sweepUploadTmp removes orphaned upload temp files older than uploadTmpMaxAge.
+// Crashes mid-upload leave files in <dataRoot>/unknown/uploads/.tmp/up-* that
+// nothing else cleans up; without this they accumulate forever.
+func (s *apiServer) sweepUploadTmp() {
+	if s.dataRoot == "" {
+		return
+	}
+	tmpDir := filepath.Join(s.dataRoot, uploadDir, ".tmp")
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			slog.Debug("upload tmp sweep: readdir failed", "dir", tmpDir, "error", err)
+		}
+		return
+	}
+	cutoff := time.Now().Add(-uploadTmpMaxAge)
+	var removed int
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), "up-") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(cutoff) {
+			continue
+		}
+		path := filepath.Join(tmpDir, e.Name())
+		if err := os.Remove(path); err == nil {
+			removed++
+		}
+	}
+	if removed > 0 {
+		slog.Info("upload tmp sweep", "removed", removed, "dir", tmpDir)
+	}
 }
 
 // classifyResultError categorizes a worker-reported analysis error. If the

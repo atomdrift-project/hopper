@@ -1019,6 +1019,46 @@ func (db *DB) SampleBySHA256(ctx context.Context, sha256 string) (*Sample, error
 	return db.sampleBySHA256SQLite(ctx, sha256)
 }
 
+// KVGet reads a value from the internal hopper_kv table. Returns
+// ErrNotFound when the key is absent.
+func (db *DB) KVGet(ctx context.Context, key string) (string, error) {
+	var value string
+	var err error
+	if db.pool != nil {
+		err = db.pool.QueryRow(ctx, `SELECT value FROM hopper_kv WHERE key = $1`, key).Scan(&value)
+	} else {
+		err = db.lite.QueryRowContext(ctx, `SELECT value FROM hopper_kv WHERE key = ?`, key).Scan(&value)
+	}
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("hopper: kv get %q: %w", key, err)
+	}
+	return value, nil
+}
+
+// KVSetIfAbsent inserts (key, value) into hopper_kv only when the key is
+// not yet present. Concurrent callers that lose the race observe no
+// error; the next KVGet returns whichever value won. Used by bootstrap
+// flows that need a self-generated secret to converge across replicas.
+func (db *DB) KVSetIfAbsent(ctx context.Context, key, value string) error {
+	var err error
+	if db.pool != nil {
+		_, err = db.pool.Exec(ctx,
+			`INSERT INTO hopper_kv (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING`,
+			key, value)
+	} else {
+		_, err = db.lite.ExecContext(ctx,
+			`INSERT INTO hopper_kv (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING`,
+			key, value)
+	}
+	if err != nil {
+		return fmt.Errorf("hopper: kv set %q: %w", key, err)
+	}
+	return nil
+}
+
 // SamplesByParent returns all samples whose parent column equals parentSHA,
 // ordered by path. Used to reassemble archive contents after dedup, where
 // a parent's cleave_result contains only its own metadata and children

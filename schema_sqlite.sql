@@ -83,3 +83,12 @@ CREATE TABLE IF NOT EXISTS workers (
 	analyzed  INTEGER NOT NULL DEFAULT 0,
 	errors    INTEGER NOT NULL DEFAULT 0
 );
+
+-- hopper_kv stores internal key/value state that needs to survive process
+-- restart but doesn't belong in a domain table. Used today for the
+-- upload-token bootstrap (shared with prism via this row).
+CREATE TABLE IF NOT EXISTS hopper_kv (
+	key        TEXT PRIMARY KEY,
+	value      TEXT NOT NULL,
+	updated_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);

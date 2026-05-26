@@ -2906,3 +2906,38 @@ func TestRequestRescanIdempotent(t *testing.T) {
 			firstForcedAt, secondForcedAt)
 	}
 }
+
+func TestKVGetNotFound(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.KVGet(context.Background(), "nope"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("KVGet missing key: err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestKVSetIfAbsentAndGet(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	if err := db.KVSetIfAbsent(ctx, "k1", "first"); err != nil {
+		t.Fatalf("KVSetIfAbsent first: %v", err)
+	}
+	if got, err := db.KVGet(ctx, "k1"); err != nil || got != "first" {
+		t.Fatalf("KVGet after first set: got=%q err=%v", got, err)
+	}
+
+	// Second SetIfAbsent on the same key must NOT overwrite.
+	if err := db.KVSetIfAbsent(ctx, "k1", "second"); err != nil {
+		t.Fatalf("KVSetIfAbsent second: %v", err)
+	}
+	if got, err := db.KVGet(ctx, "k1"); err != nil || got != "first" {
+		t.Errorf("KVSetIfAbsent overwrote: got=%q err=%v, want first", got, err)
+	}
+
+	// Independent keys coexist.
+	if err := db.KVSetIfAbsent(ctx, "k2", "other"); err != nil {
+		t.Fatalf("KVSetIfAbsent k2: %v", err)
+	}
+	if got, err := db.KVGet(ctx, "k2"); err != nil || got != "other" {
+		t.Errorf("KVGet k2: got=%q err=%v, want other", got, err)
+	}
+}

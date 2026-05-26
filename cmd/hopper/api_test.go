@@ -3,9 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -249,3 +254,381 @@ func TestHandleResultStoresAfterRequestContextCanceled(t *testing.T) {
 		t.Fatal("cleave result was not stored")
 	}
 }
+
+func TestSanitizeUploadFilename(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in, want string
+	}{
+		// Happy paths.
+		{"sample.exe", "sample.exe"},
+		{"My Document.zip", "My Document.zip"},
+		{".gitignore", ".gitignore"},
+		{"unicode-名前.tar.gz", "unicode-名前.tar.gz"}, //nolint:gosmopolitan // multilingual filename coverage is the point
+
+		// Path traversal — sanitization MUST refuse these and the caller
+		// substitutes a placeholder.
+		{"..", ""},
+		{".", ""},
+		{"...", ""},
+		{"../../etc/passwd", "passwd"},
+		{"..\\..\\windows\\system32", "....windowssystem32"},
+		{"/etc/passwd", "passwd"},
+		{"\\", ""},
+		{"/", ""},
+
+		// NUL and non-whitespace control chars stripped; whitespace-like
+		// control chars (CR/LF/tab) collapse to a single space so we don't
+		// silently glue words.
+		{"foo\x00bar", "foobar"},
+		{"foo\rbar\nbaz", "foo bar baz"},
+		{"\x01\x02\x03", ""},
+
+		// Trailing dots/spaces (Windows ignores them; "evil.exe." → "evil.exe").
+		{"evil.exe.", "evil.exe"},
+		{"evil.exe   ", "evil.exe"},
+		{"evil.exe. . .", "evil.exe"},
+
+		// Reserved Windows names with and without extensions.
+		{"CON", ""},
+		{"con.txt", ""},
+		{"LPT1.bin", ""},
+		{"NUL", ""},
+		{"console.txt", "console.txt"}, // not reserved — stem differs
+
+		// Whitespace collapse.
+		{"a   b\t\tc", "a b c"},
+
+		// Empty-after-sanitize → empty result.
+		{"   ", ""},
+	}
+	for _, tc := range cases {
+		got := sanitizeUploadFilename(tc.in)
+		if got != tc.want {
+			t.Errorf("sanitizeUploadFilename(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestSanitizeUploadFilenameTruncationIsUTF8Safe(t *testing.T) {
+	t.Parallel()
+	// 100 four-byte runes (400 bytes) followed by an extension — exceeds
+	// uploadFilenameMax. Result must be well-formed UTF-8 and end in .bin.
+	long := strings.Repeat("𝔸", 100) + ".bin"
+	got := sanitizeUploadFilename(long)
+	if got == "" {
+		t.Fatalf("unexpectedly empty result for %d-byte input", len(long))
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated filename is not valid UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, ".bin") {
+		t.Fatalf("truncated filename lost extension: %q", got)
+	}
+	if len(got) > uploadFilenameMax {
+		t.Fatalf("len(got)=%d exceeds uploadFilenameMax=%d", len(got), uploadFilenameMax)
+	}
+}
+
+func TestCheckBrowserCSRF(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		fetchSite   string
+		contentType string
+		wantOK      bool
+	}{
+		{"raw upload no headers", "", "", true},
+		{"raw upload octet-stream", "same-origin", "application/octet-stream", true},
+		{"cross-site blocked", "cross-site", "application/octet-stream", false},
+		{"form-urlencoded blocked", "same-origin", "application/x-www-form-urlencoded", false},
+		{"multipart blocked", "same-origin", "multipart/form-data; boundary=xyz", false},
+		{"text/plain blocked (CORS simple)", "same-origin", "text/plain", false},
+		{"json allowed", "same-origin", "application/json", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := httptest.NewRequest(http.MethodPost, "/api/upload", http.NoBody)
+			if tc.fetchSite != "" {
+				r.Header.Set("Sec-Fetch-Site", tc.fetchSite)
+			}
+			if tc.contentType != "" {
+				r.Header.Set("Content-Type", tc.contentType)
+			}
+			gotOK := checkBrowserCSRF(r) == nil
+			if gotOK != tc.wantOK {
+				t.Errorf("checkBrowserCSRF ok = %v, want %v", gotOK, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestHandleUploadAuth(t *testing.T) {
+	t.Parallel()
+	api := &apiServer{
+		tracker:  newWorkerTracker(),
+		dataRoot: t.TempDir(),
+	}
+	if err := api.setUploadToken("test-token-with-32-chars-or-more!!"); err != nil {
+		t.Fatalf("setUploadToken rejected the test token: %v", err)
+	}
+	// Stub db to non-nil so we get past the "starting" guard. Auth runs
+	// before any DB access, so a nil pool is fine here.
+	api.db = &hopper.DB{}
+
+	check := func(name, auth string, wantCode int) {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			r := httptest.NewRequest(http.MethodPost, "/api/upload", strings.NewReader("x"))
+			if auth != "" {
+				r.Header.Set("Authorization", auth)
+			}
+			r.Header.Set("Content-Type", "application/octet-stream")
+			r.ContentLength = 1
+			w := httptest.NewRecorder()
+			api.handleUpload(w, r)
+			if w.Code != wantCode {
+				t.Errorf("code=%d body=%s want=%d", w.Code, w.Body.String(), wantCode)
+			}
+		})
+	}
+
+	// Every rejected request returns the same Unauthorized status and the
+	// same body shape so an attacker cannot distinguish "wrong scheme"
+	// from "wrong-length token" from "right-length but wrong bytes". The
+	// reason-string is only logged, not echoed.
+	check("missing header", "", http.StatusUnauthorized)
+	check("wrong scheme", "Basic foo", http.StatusUnauthorized)
+	check("wrong token correct length", "Bearer not-the-right-token-value-okay-but-32-plus", http.StatusUnauthorized)
+	check("wrong token short", "Bearer short", http.StatusUnauthorized)
+	check("empty bearer value", "Bearer ", http.StatusUnauthorized)
+
+	t.Run("disabled when no token", func(t *testing.T) {
+		t.Parallel()
+		api2 := &apiServer{
+			tracker:  newWorkerTracker(),
+			dataRoot: t.TempDir(),
+			db:       &hopper.DB{},
+		}
+		r := httptest.NewRequest(http.MethodPost, "/api/upload", strings.NewReader("x"))
+		r.Header.Set("Authorization", "Bearer anything")
+		r.ContentLength = 1
+		w := httptest.NewRecorder()
+		api2.handleUpload(w, r)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Errorf("code=%d body=%s want=%d", w.Code, w.Body.String(), http.StatusServiceUnavailable)
+		}
+	})
+}
+
+func TestSetUploadTokenRejectsShortTokens(t *testing.T) {
+	t.Parallel()
+	api := &apiServer{}
+	if err := api.setUploadToken(""); err == nil {
+		t.Error("empty token accepted")
+	}
+	if err := api.setUploadToken(strings.Repeat("a", uploadTokenMinLen-1)); err == nil {
+		t.Error("token one byte too short accepted")
+	}
+	if err := api.setUploadToken(strings.Repeat("a", uploadTokenMinLen)); err != nil {
+		t.Errorf("minimum-length token rejected: %v", err)
+	}
+	if !api.uploadTokenSet {
+		t.Error("uploadTokenSet false after successful setUploadToken")
+	}
+}
+
+func TestCheckUploadAuthConstantShape(t *testing.T) {
+	t.Parallel()
+	api := &apiServer{}
+	if err := api.setUploadToken("the-correct-token-with-32-or-more!"); err != nil {
+		t.Fatalf("setUploadToken rejected the fixture: %v", err)
+	}
+
+	mkReq := func(authHeader string) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/api/upload", http.NoBody)
+		if authHeader != "" {
+			r.Header.Set("Authorization", authHeader)
+		}
+		return r
+	}
+
+	// Negative cases of varying lengths — all must return a non-nil error.
+	bads := []string{
+		"",
+		"Basic xyz",
+		"Bearer ",
+		"Bearer a",
+		"Bearer " + strings.Repeat("x", 1),
+		"Bearer " + strings.Repeat("x", 32),
+		"Bearer " + strings.Repeat("x", 1024),
+		"Bearer the-correct-token-with-32-or-more!!", // one byte off
+	}
+	for _, h := range bads {
+		if err := api.checkUploadAuth(mkReq(h)); err == nil {
+			t.Errorf("bad auth header accepted: %q", h)
+		}
+	}
+
+	// Positive: the literal correct token passes.
+	if err := api.checkUploadAuth(mkReq("Bearer the-correct-token-with-32-or-more!")); err != nil {
+		t.Errorf("correct token rejected: %v", err)
+	}
+
+	// Plaintext is not retained: the stored 32-byte field must not be the
+	// raw bytes of the token (taking the first 32 chars of the plaintext).
+	// Defence-in-depth: catches a regression where someone "optimizes"
+	// setUploadToken to keep the plaintext.
+	plain := "the-correct-token-with-32-or-more!"
+	if string(api.uploadTokenHash[:]) == plain[:sha256.Size] {
+		t.Error("uploadTokenHash appears to contain the plaintext token")
+	}
+}
+
+func TestResolveDataPath(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	api := &apiServer{dataRoot: root}
+
+	if abs, err := api.resolveDataPath("unknown/uploads/ab/cd/foo.bin"); err != nil {
+		t.Errorf("normal path errored: %v (got %q)", err, abs)
+	}
+	for _, bad := range []string{
+		"..",
+		"../etc/passwd",
+		"../../../../../../../etc/passwd",
+	} {
+		if _, err := api.resolveDataPath(bad); err == nil {
+			t.Errorf("resolveDataPath(%q) should have failed", bad)
+		}
+	}
+}
+
+func TestSweepUploadTmp(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	tmp := filepath.Join(root, uploadDir, ".tmp")
+	if err := os.MkdirAll(tmp, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	// Old orphan: should be removed.
+	old := filepath.Join(tmp, "up-old")
+	if err := os.WriteFile(old, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-2 * uploadTmpMaxAge)
+	if err := os.Chtimes(old, past, past); err != nil {
+		t.Fatal(err)
+	}
+	// Recent: should be kept.
+	fresh := filepath.Join(tmp, "up-fresh")
+	if err := os.WriteFile(fresh, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Non-upload file: should be untouched even if old.
+	other := filepath.Join(tmp, "junk")
+	if err := os.WriteFile(other, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(other, past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	api := &apiServer{dataRoot: root}
+	api.sweepUploadTmp()
+
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Errorf("old orphan was not removed: err=%v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("fresh tmp file was removed: err=%v", err)
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Errorf("non-upload file was removed: err=%v", err)
+	}
+}
+
+func TestBootstrapUploadTokenFromEnv(t *testing.T) {
+	t.Setenv("HOPPER_UPLOAD_TOKEN", "env-supplied-token-32-bytes-long!")
+	ctx := t.Context()
+	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "bs.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	api := &apiServer{tracker: newWorkerTracker()}
+
+	bootstrapUploadToken(ctx, api, db)
+
+	if !api.uploadTokenSet {
+		t.Fatal("uploadTokenSet false after env bootstrap")
+	}
+	// Env path must NOT touch the DB.
+	if _, err := db.KVGet(ctx, uploadTokenKVKey); !errors.Is(err, hopper.ErrNotFound) {
+		t.Errorf("env path wrote to DB: err=%v", err)
+	}
+}
+
+func TestBootstrapUploadTokenGeneratesAndPersists(t *testing.T) {
+	t.Setenv("HOPPER_UPLOAD_TOKEN", "")
+	ctx := t.Context()
+	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "bs.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	api := &apiServer{tracker: newWorkerTracker()}
+
+	bootstrapUploadToken(ctx, api, db)
+
+	if !api.uploadTokenSet {
+		t.Fatal("uploadTokenSet false after generate bootstrap")
+	}
+	stored, err := db.KVGet(ctx, uploadTokenKVKey)
+	if err != nil {
+		t.Fatalf("KVGet after generate: %v", err)
+	}
+	if len(stored) < uploadTokenMinLen {
+		t.Errorf("persisted token too short: len=%d want>=%d", len(stored), uploadTokenMinLen)
+	}
+	// Hash in api must match the stored value — proves prism (reading the
+	// same row) will speak the same token.
+	if sum := sha256.Sum256([]byte(stored)); sum != api.uploadTokenHash {
+		t.Error("api hash does not match stored token's sha256")
+	}
+}
+
+func TestBootstrapUploadTokenReusesPersistedValue(t *testing.T) {
+	t.Setenv("HOPPER_UPLOAD_TOKEN", "")
+	ctx := t.Context()
+	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "bs.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed the DB as if a previous run had persisted a token.
+	const seeded = "previously-persisted-token-32-or-more!"
+	if err := db.KVSetIfAbsent(ctx, uploadTokenKVKey, seeded); err != nil {
+		t.Fatal(err)
+	}
+
+	api := &apiServer{tracker: newWorkerTracker()}
+	bootstrapUploadToken(ctx, api, db)
+
+	if !api.uploadTokenSet {
+		t.Fatal("uploadTokenSet false after db bootstrap")
+	}
+	if sum := sha256.Sum256([]byte(seeded)); sum != api.uploadTokenHash {
+		t.Error("api hash does not match seeded token's sha256")
+	}
+	// And the persisted value is unchanged — second startup didn't rotate.
+	if got, err := db.KVGet(ctx, uploadTokenKVKey); err != nil || got != seeded {
+		t.Errorf("persisted token mutated: got=%q err=%v, want %q", got, err, seeded)
+	}
+}
+
+// Silences "imported and not used" complaints if a previous test gets
+// trimmed; harmless when other tests reference io/os/filepath.
+var _ = io.EOF

@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -142,6 +143,90 @@ func (s *stringListFlag) Set(v string) error {
 		}
 	}
 	return nil
+}
+
+// uploadTokenKVKey names the hopper_kv row that holds the upload bearer
+// token. Prism reads this same key to discover the token without operator
+// coordination.
+const uploadTokenKVKey = "upload_token"
+
+// bootstrapUploadToken resolves the /api/upload bearer token in this
+// priority order:
+//  1. HOPPER_UPLOAD_TOKEN env var (operator override; never written to DB).
+//  2. The persisted hopper_kv row (set by a previous run or peer instance).
+//  3. A freshly-generated 32-byte random token, persisted via INSERT…
+//     ON CONFLICT DO NOTHING so concurrent first-starters converge on
+//     whichever value won the race.
+//
+// On any failure the route stays disabled (setUploadToken never called),
+// and /api/upload returns 503. The plaintext token is scoped to this
+// function; only the SHA-256 digest survives in apiServer.
+func bootstrapUploadToken(ctx context.Context, api *apiServer, db *hopper.DB) {
+	if env := strings.TrimSpace(os.Getenv("HOPPER_UPLOAD_TOKEN")); env != "" {
+		if err := api.setUploadToken(env); err != nil {
+			slog.Error("HOPPER_UPLOAD_TOKEN rejected; /api/upload disabled", "error", err)
+			return
+		}
+		//nolint:gosec // logging integer length only; token bytes never logged
+		slog.Info("upload endpoint enabled", "source", "env", "token_len", len(env))
+		return
+	}
+
+	stored, err := db.KVGet(ctx, uploadTokenKVKey)
+	switch {
+	case err == nil:
+		if err := api.setUploadToken(stored); err != nil {
+			slog.Error("stored upload token rejected; /api/upload disabled", "error", err)
+			return
+		}
+		slog.Info("upload endpoint enabled", "source", "db", "token_len", len(stored))
+	case errors.Is(err, hopper.ErrNotFound):
+		var buf [32]byte
+		if _, err := rand.Read(buf[:]); err != nil {
+			slog.Error("upload token generation failed; /api/upload disabled", "error", err)
+			return
+		}
+		token := hex.EncodeToString(buf[:])
+		if err := db.KVSetIfAbsent(ctx, uploadTokenKVKey, token); err != nil {
+			slog.Error("upload token persistence failed; /api/upload disabled", "error", err)
+			return
+		}
+		// A peer instance may have raced us and won. Read whichever value
+		// actually landed.
+		token, err = db.KVGet(ctx, uploadTokenKVKey)
+		if err != nil {
+			slog.Error("upload token re-read failed; /api/upload disabled", "error", err)
+			return
+		}
+		if err := api.setUploadToken(token); err != nil {
+			slog.Error("generated upload token rejected; /api/upload disabled", "error", err)
+			return
+		}
+		slog.Info("upload endpoint enabled", "source", "generated", "token_len", len(token))
+	default:
+		slog.Error("upload token DB lookup failed; /api/upload disabled", "error", err)
+	}
+}
+
+// isLoopbackAddr reports whether addr (host:port or ":port") binds only to
+// the loopback interface. Empty addr / unresolvable host count as non-
+// loopback so the caller emits the safer warning.
+func isLoopbackAddr(addr string) bool {
+	if addr == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func localListenAddr(addr string) string {
@@ -748,7 +833,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// startup get a clean 503 instead of the dashboard's HTML.
 	httpMux := http.NewServeMux()
 	tracker := newWorkerTracker()
-	api := &apiServer{tracker: tracker, hopperStart: time.Now().UTC()} // db, progress, allowedDirs set after init
+	api := &apiServer{tracker: tracker, hopperStart: time.Now().UTC()} // db, progress, allowedDirs, uploadTokenHash set after init
 	api.registerAPI(httpMux)
 
 	var wd *webDashboard
@@ -1076,6 +1161,21 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// call isn't lost mid-flight if the process is shutting down.
 	api.startExplosions(ctx)
 	defer api.drainExplosions()
+
+	// Reap orphaned upload temp files left by a previous crash. No-op when
+	// the directory doesn't exist yet.
+	api.sweepUploadTmp()
+
+	// Resolve the upload token: env override > persisted DB value >
+	// generated-and-persisted. The plaintext is scoped to this block; only
+	// the SHA-256 lives in api once setUploadToken returns. Prism reads
+	// the persisted value from hopper_kv to discover the same token.
+	bootstrapUploadToken(ctx, api, db)
+	if api.uploadTokenSet && *dashAddr != "" && !isLoopbackAddr(*dashAddr) {
+		slog.Warn("dashboard bound to non-loopback; /api/file and /data remain unauthenticated",
+			"addr", *dashAddr,
+			"recommendation", "run with --local or behind an authenticated reverse proxy")
+	}
 
 	slog.Info("load prep complete",
 		"elapsed", time.Since(prepStart),
