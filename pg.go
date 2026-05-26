@@ -380,10 +380,23 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 		// requested rescan jumps the queue regardless of the random SHA-pivot
 		// rotation Tier 1 uses. Partial index keeps the scan tiny (the set is
 		// transient — entries clear themselves as workers finish them).
+		//
+		// The predicate intentionally does NOT include `cleave_result IS NULL`:
+		// an earlier version did, which forced RequestRescan to null the
+		// cached envelope to make a row eligible. That created a window
+		// (request → worker finishes) in which readers (litmus, dashboard,
+		// API) saw the row as unanalyzed. Keeping cleave_result intact lets
+		// the stale-but-real envelope stay visible until updateCleaveResult
+		// atomically replaces it.
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS forced_rescan_at TIMESTAMPTZ`,
+		// Drop any prior version of the index whose predicate also gated on
+		// `cleave_result IS NULL`. The replacement below is then created with
+		// the right predicate. Both operations are tiny (the indexed set is
+		// only rows currently awaiting a forced rescan).
+		`DROP INDEX IF EXISTS idx_samples_forced_rescan`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_forced_rescan ` +
 			`ON samples(forced_rescan_at) ` +
-			`WHERE forced_rescan_at IS NOT NULL AND cleave_result IS NULL`,
+			`WHERE forced_rescan_at IS NOT NULL`,
 
 		// Aggressive autovacuum on the hot table. Defaults wait for 20% dead
 		// tuples / 10% changed rows before kicking in, which on a 5M-row table
@@ -1153,22 +1166,27 @@ func (db *DB) updateCleaveResultPG(
 	return nil
 }
 
-// requestRescanPG clears analysis fields and stamps forced_rescan_at so
-// workers pick this row before the Tier 1 backlog. Atomic: the cooldown
-// predicate is in the same WHERE as the state change, so a race never
-// produces a duplicate enqueue.
+// requestRescanPG stamps forced_rescan_at so workers pick this row before
+// the Tier 1 backlog. Analysis fields (cleave_result, litmus_result,
+// analyzed_at, traits_version, note, last_error_at) are deliberately left
+// alone so readers continue to see the prior envelope until a worker
+// stores fresh results — updateCleaveResultPG replaces them atomically
+// and clears forced_rescan_at in the same UPDATE.
+//
+// `COALESCE(forced_rescan_at, now())` makes repeat requests for the same
+// SHA idempotent: a row already queued keeps its original FIFO position.
+// The WHERE accepts a re-request when either the cooldown has elapsed OR
+// the row is already pending — so a caller is never told ErrRescanNotEligible
+// for a SHA that's actually about to be rescanned.
 func (db *DB) requestRescanPG(ctx context.Context, sha256 string, cooldownCutoff time.Time) error {
 	tag, err := db.pool.Exec(ctx, `
 		UPDATE samples
-		SET cleave_result = NULL,
-		    litmus_result = NULL,
-		    analyzed_at = NULL,
-		    last_error_at = NULL,
-		    traits_version = '',
-		    forced_rescan_at = now(),
+		SET forced_rescan_at = COALESCE(forced_rescan_at, now()),
 		    updated_at = now()
 		WHERE sha256 = $1 AND parent = '' AND skip = ''
-		  AND (analyzed_at IS NULL OR analyzed_at < $2)`,
+		  AND (forced_rescan_at IS NOT NULL
+		       OR analyzed_at IS NULL
+		       OR analyzed_at < $2)`,
 		sha256, cooldownCutoff)
 	if err != nil {
 		return fmt.Errorf("hopper: request rescan: %w", err)
@@ -2306,10 +2324,16 @@ func (db *DB) unanalyzedCandidatesPG(ctx context.Context, hopperStart time.Time,
 // keeps this scan O(active forced-rescan count) regardless of table size.
 // Rows leave the index as workers complete them (updateCleaveResultPG
 // clears forced_rescan_at) so the index stays tiny.
+//
+// The query does NOT filter on `cleave_result IS NULL`: requestRescanPG
+// leaves the prior envelope in place so readers see it during the rescan
+// window. Tier 1 (`cleave_result IS NULL`) therefore can't overlap with
+// this tier, and overlap with Tier 2/3 is harmless because Tier 0 drains
+// first and tryClaimBatch dedupes in-memory.
 func (db *DB) forcedRescanCandidatesPG(ctx context.Context, limit int) ([]ClaimJob, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT sha256, path, size_bytes, file_type FROM samples
-		WHERE forced_rescan_at IS NOT NULL AND cleave_result IS NULL
+		WHERE forced_rescan_at IS NOT NULL
 		  AND skip = '' AND parent = ''
 		ORDER BY forced_rescan_at ASC
 		LIMIT $1`, limit)

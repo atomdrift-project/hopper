@@ -1073,20 +1073,26 @@ func (db *DB) SampleParentInfo(ctx context.Context, sha256 string) (*Sample, err
 // error (HTTP 429 / 404), not a system failure.
 var ErrRescanNotEligible = errors.New("hopper: sample not eligible for rescan")
 
-// RequestRescan re-queues a previously-analyzed sample for Tier 0 work.
-// Clears the cached cleave/litmus envelope (so the worker re-analyzes)
-// and stamps forced_rescan_at so workers see this row before draining
-// the Tier 1 (unanalyzed) backlog.
+// RequestRescan re-queues a previously-analyzed sample for Tier 0 work
+// by stamping forced_rescan_at so workers pick this row before draining
+// the Tier 1 (unanalyzed) backlog. The cached cleave/litmus envelope is
+// deliberately preserved — readers continue to see the prior analysis
+// until UpdateCleaveResult replaces it atomically. Workers re-analyze
+// from the file itself, not the cached envelope, so leaving it in place
+// has no effect on correctness.
 //
 // cooldown is the minimum age of the existing analysis before another
 // rescan is accepted; a row analyzed more recently returns
-// ErrRescanNotEligible. Cooldown is enforced in the same UPDATE as the
-// state transition so a race between two operators can never double-
-// queue the same SHA.
+// ErrRescanNotEligible UNLESS the row is already pending a forced
+// rescan, in which case the call is a no-op success (the original FIFO
+// position is preserved). Cooldown is enforced in the same UPDATE as
+// the state transition so a race between two operators can never
+// double-queue the same SHA.
 //
 // Returns ErrRescanNotEligible when the sample is missing, is an archive
 // child (parent is non-empty), is skipped (skip is non-empty), or fails
-// the cooldown check. Returns nil on a successful re-queue.
+// the cooldown check while no rescan is pending. Returns nil on a
+// successful re-queue.
 func (db *DB) RequestRescan(ctx context.Context, sha256 string, cooldown time.Duration) error {
 	if !isLowerHexSHA256(sha256) {
 		return ErrRescanNotEligible

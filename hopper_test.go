@@ -3,6 +3,7 @@ package hopper
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2786,5 +2787,122 @@ func TestForcedRescanCandidatesOrder(t *testing.T) {
 		if j.SHA256 != shas[i] {
 			t.Fatalf("jobs[%d] = %s, want %s (FIFO order)", i, j.SHA256, shas[i])
 		}
+	}
+}
+
+// TestRequestRescanPreservesEnvelope verifies the no-null-window guarantee:
+// while a forced rescan is pending, readers still see the prior cleave/litmus
+// envelope, the analyzed_at timestamp, and the traits version. The row only
+// transitions to its new state when a worker stores fresh analysis.
+func TestRequestRescanPreservesEnvelope(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	const sha = "ffffff00000000000000000000000000000000000000000000000000000000ff"
+	mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test", Label: "good", LabelSource: "test"})
+	mustAnalyzeWithTraits(t, ctx, db, sha, 1, `{"l":2}`)
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET analyzed_at = ?, traits_version = 'abc12' WHERE sha256 = ?`,
+		time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), sha); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+
+	// Snapshot before the rescan request.
+	var beforeCleave, beforeTraits string
+	var beforeAnalyzedAt sql.NullString
+	if err := db.lite.QueryRowContext(ctx,
+		`SELECT cleave_result, traits_version, analyzed_at FROM samples WHERE sha256 = ?`,
+		sha).Scan(&beforeCleave, &beforeTraits, &beforeAnalyzedAt); err != nil {
+		t.Fatalf("snapshot before: %v", err)
+	}
+	if beforeCleave == "" || beforeTraits != "abc12" || !beforeAnalyzedAt.Valid {
+		t.Fatalf("setup invariants violated: cleave=%q traits=%q analyzed_at_valid=%v",
+			beforeCleave, beforeTraits, beforeAnalyzedAt.Valid)
+	}
+
+	if err := db.RequestRescan(ctx, sha, 15*time.Minute); err != nil {
+		t.Fatalf("RequestRescan: %v", err)
+	}
+
+	// After the rescan request the row must remain in Tier 0 *and* still
+	// expose its cached envelope to readers.
+	jobs, err := db.ForcedRescanCandidates(ctx, 10)
+	if err != nil {
+		t.Fatalf("ForcedRescanCandidates: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].SHA256 != sha {
+		t.Fatalf("ForcedRescanCandidates = %+v, want one job for %s", jobs, sha)
+	}
+
+	var afterCleave, afterTraits string
+	var afterAnalyzedAt sql.NullString
+	var forcedAt sql.NullString
+	if err := db.lite.QueryRowContext(ctx,
+		`SELECT cleave_result, traits_version, analyzed_at, forced_rescan_at FROM samples WHERE sha256 = ?`,
+		sha).Scan(&afterCleave, &afterTraits, &afterAnalyzedAt, &forcedAt); err != nil {
+		t.Fatalf("snapshot after: %v", err)
+	}
+	if afterCleave != beforeCleave {
+		t.Fatalf("cleave_result changed: before=%q after=%q", beforeCleave, afterCleave)
+	}
+	if afterTraits != beforeTraits {
+		t.Fatalf("traits_version changed: before=%q after=%q", beforeTraits, afterTraits)
+	}
+	if afterAnalyzedAt.String != beforeAnalyzedAt.String {
+		t.Fatalf("analyzed_at changed: before=%q after=%q", beforeAnalyzedAt.String, afterAnalyzedAt.String)
+	}
+	if !forcedAt.Valid {
+		t.Fatalf("forced_rescan_at not set after RequestRescan")
+	}
+}
+
+// TestRequestRescanIdempotent verifies that asking to rescan a row that
+// is already queued is a no-op success: the original forced_rescan_at
+// timestamp is preserved (so FIFO position holds) and no error is
+// returned even if the cooldown would otherwise reject the call.
+func TestRequestRescanIdempotent(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	const sha = "abcdef00000000000000000000000000000000000000000000000000000000ab"
+	mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test", Label: "good", LabelSource: "test"})
+	mustAnalyze(t, ctx, db, sha, 1)
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET analyzed_at = ? WHERE sha256 = ?`,
+		time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), sha); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+
+	if err := db.RequestRescan(ctx, sha, 15*time.Minute); err != nil {
+		t.Fatalf("RequestRescan first call: %v", err)
+	}
+	var firstForcedAt string
+	if err := db.lite.QueryRowContext(ctx,
+		`SELECT forced_rescan_at FROM samples WHERE sha256 = ?`,
+		sha).Scan(&firstForcedAt); err != nil {
+		t.Fatalf("read first forced_rescan_at: %v", err)
+	}
+
+	// Bring analyzed_at back into the cooldown window to prove the second
+	// call short-circuits via the forced_rescan_at branch rather than the
+	// cooldown branch.
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET analyzed_at = ? WHERE sha256 = ?`,
+		time.Now().UTC().Format(time.RFC3339Nano), sha); err != nil {
+		t.Fatalf("re-stamp analyzed_at: %v", err)
+	}
+
+	if err := db.RequestRescan(ctx, sha, 15*time.Minute); err != nil {
+		t.Fatalf("RequestRescan second call (already queued): %v", err)
+	}
+	var secondForcedAt string
+	if err := db.lite.QueryRowContext(ctx,
+		`SELECT forced_rescan_at FROM samples WHERE sha256 = ?`,
+		sha).Scan(&secondForcedAt); err != nil {
+		t.Fatalf("read second forced_rescan_at: %v", err)
+	}
+	if secondForcedAt != firstForcedAt {
+		t.Fatalf("forced_rescan_at moved: first=%q second=%q (FIFO position should not change on idempotent re-request)",
+			firstForcedAt, secondForcedAt)
 	}
 }

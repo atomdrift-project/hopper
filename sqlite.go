@@ -216,15 +216,23 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 	// matching PG migration for rationale. Workers drain Tier 0 before Tier 1
 	// so user-requested rescans jump the queue.
 	if pragmaHasColumn(ctx, db.lite, "forced_rescan_at") == 0 {
-		for _, ddl := range []string{
-			`ALTER TABLE samples ADD COLUMN forced_rescan_at DATETIME`,
-			`CREATE INDEX IF NOT EXISTS idx_samples_forced_rescan ` +
-				`ON samples(forced_rescan_at) ` +
-				`WHERE forced_rescan_at IS NOT NULL AND cleave_result IS NULL`,
-		} {
-			if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
-				return fmt.Errorf("hopper: migrate sqlite: %w", err)
-			}
+		if _, err := db.lite.ExecContext(ctx,
+			`ALTER TABLE samples ADD COLUMN forced_rescan_at DATETIME`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite: %w", err)
+		}
+	}
+	// Re-create the partial index without `cleave_result IS NULL` in the
+	// predicate. The prior version forced RequestRescan to null the cached
+	// envelope to make rows eligible — see pg.go for the full rationale.
+	// DROP+CREATE is idempotent: fresh installs see no prior index to drop.
+	for _, ddl := range []string{
+		`DROP INDEX IF EXISTS idx_samples_forced_rescan`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_forced_rescan ` +
+			`ON samples(forced_rescan_at) ` +
+			`WHERE forced_rescan_at IS NOT NULL`,
+	} {
+		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite: %w", err)
 		}
 	}
 
@@ -1117,15 +1125,12 @@ func (db *DB) requestRescanSQLite(ctx context.Context, sha256 string, cooldownCu
 	cutoff := cooldownCutoff.UTC().Format(time.RFC3339Nano)
 	res, err := db.lite.ExecContext(ctx, `
 		UPDATE samples
-		SET cleave_result = NULL,
-		    litmus_result = NULL,
-		    analyzed_at = NULL,
-		    last_error_at = NULL,
-		    traits_version = '',
-		    forced_rescan_at = ?,
+		SET forced_rescan_at = COALESCE(forced_rescan_at, ?),
 		    updated_at = ?
 		WHERE sha256 = ? AND parent = '' AND skip = ''
-		  AND (analyzed_at IS NULL OR analyzed_at < ?)`,
+		  AND (forced_rescan_at IS NOT NULL
+		       OR analyzed_at IS NULL
+		       OR analyzed_at < ?)`,
 		n, n, sha256, cutoff)
 	if err != nil {
 		return fmt.Errorf("hopper: request rescan: %w", err)
@@ -2237,7 +2242,7 @@ func (db *DB) unanalyzedCandidatesSQLite(ctx context.Context, hopperStart time.T
 func (db *DB) forcedRescanCandidatesSQLite(ctx context.Context, limit int) ([]ClaimJob, error) {
 	return queryLiteCandidates(ctx, db.lite, `
 		SELECT sha256, path, size_bytes, file_type FROM samples
-		WHERE forced_rescan_at IS NOT NULL AND cleave_result IS NULL
+		WHERE forced_rescan_at IS NOT NULL
 		  AND skip = '' AND parent = ''
 		ORDER BY forced_rescan_at ASC
 		LIMIT ?`, limit)
