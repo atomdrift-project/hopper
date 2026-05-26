@@ -172,41 +172,61 @@ func bootstrapUploadToken(ctx context.Context, api *apiServer, db *hopper.DB) {
 		return
 	}
 
-	stored, err := db.KVGet(ctx, uploadTokenKVKey)
+	// Bound the DB-touching paths so a wedged database surfaces as a
+	// fail-closed disabled endpoint instead of an indefinite startup hang.
+	// retryDBAccess retries inside this budget with full-jitter backoff.
+	ctx, cancel := context.WithTimeout(ctx, kvBootstrapTimeout)
+	defer cancel()
+
+	readToken := func(op string) (string, error) {
+		return retryDBAccess(ctx, op, uploadTokenKVKey, func(ctx context.Context) (string, error) {
+			return db.KVGet(ctx, uploadTokenKVKey)
+		})
+	}
+
+	token, err := readToken("kv get upload token")
+	source := "db"
 	switch {
 	case err == nil:
-		if err := api.setUploadToken(stored); err != nil {
-			slog.Error("stored upload token rejected; /api/upload disabled", "error", err)
-			return
-		}
-		slog.Info("upload endpoint enabled", "source", "db", "token_len", len(stored))
+		// Use the stored value as-is.
 	case errors.Is(err, hopper.ErrNotFound):
 		var buf [32]byte
 		if _, err := rand.Read(buf[:]); err != nil {
 			slog.Error("upload token generation failed; /api/upload disabled", "error", err)
 			return
 		}
-		token := hex.EncodeToString(buf[:])
-		if err := db.KVSetIfAbsent(ctx, uploadTokenKVKey, token); err != nil {
+		candidate := hex.EncodeToString(buf[:])
+		if err := retryDBAccessNoValue(ctx, "kv set upload token", uploadTokenKVKey, func(ctx context.Context) error {
+			return db.KVSetIfAbsent(ctx, uploadTokenKVKey, candidate)
+		}); err != nil {
 			slog.Error("upload token persistence failed; /api/upload disabled", "error", err)
 			return
 		}
 		// A peer instance may have raced us and won. Read whichever value
 		// actually landed.
-		token, err = db.KVGet(ctx, uploadTokenKVKey)
+		token, err = readToken("kv reread upload token")
 		if err != nil {
 			slog.Error("upload token re-read failed; /api/upload disabled", "error", err)
 			return
 		}
-		if err := api.setUploadToken(token); err != nil {
-			slog.Error("generated upload token rejected; /api/upload disabled", "error", err)
-			return
-		}
-		slog.Info("upload endpoint enabled", "source", "generated", "token_len", len(token))
+		source = "generated"
 	default:
 		slog.Error("upload token DB lookup failed; /api/upload disabled", "error", err)
+		return
 	}
+
+	if err := api.setUploadToken(token); err != nil {
+		slog.Error("upload token rejected; /api/upload disabled", "source", source, "error", err)
+		return
+	}
+	slog.Info("upload endpoint enabled", "source", source, "token_len", len(token))
 }
+
+// kvBootstrapTimeout caps every KV call made during /api/upload token
+// bootstrap. retryDBAccess backs off with full jitter inside this deadline;
+// the operator sees a fail-closed disabled endpoint rather than an
+// indefinite startup hang if the DB never recovers.
+const kvBootstrapTimeout = 2 * time.Minute
 
 // isLoopbackAddr reports whether addr (host:port or ":port") binds only to
 // the loopback interface. Empty addr / unresolvable host count as non-

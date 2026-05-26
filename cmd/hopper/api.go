@@ -485,6 +485,11 @@ const (
 	// upload across a process restart still survives if the operator
 	// bounces hopper mid-request.
 	uploadTmpMaxAge = 1 * time.Hour
+	// uploadStoreTimeout caps the detached-context DB store that runs
+	// after a successful body write. Long enough for retryDBAccess to
+	// chew through transient blips with full-jitter backoff; short enough
+	// to surface a real outage to logs without leaving the file orphaned.
+	uploadStoreTimeout = 2 * time.Minute
 	// uploadDir is the directory under dataRoot where interactive uploads
 	// land: <root>/unknown/uploads. Workers pick them up via the upload
 	// tier in claimJobs.
@@ -1387,7 +1392,7 @@ func (s *apiServer) resolveDataPath(rel string) (string, error) {
 // Idempotent — re-uploading the same content returns the existing sample,
 // with already_analyzed=true if cleave_result is populated.
 //
-//nolint:gosec // paths confined to dataRoot via resolveDataPath
+//nolint:gosec,maintidx // paths confined to dataRoot via resolveDataPath; linear hardening flow
 func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
 		writeJSONError(w, http.StatusServiceUnavailable, `{"error":"starting"}`)
@@ -1510,7 +1515,9 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// than spawning a second copy under a new shard path — otherwise an
 	// attacker re-uploading the same bytes with a rotating filename query
 	// param fills the disk despite the sha-level dedupe.
-	existing, err := s.db.SampleBySHA256(ctx, sha)
+	existing, err := retryDBAccess(ctx, "upload sample lookup", sha, func(ctx context.Context) (*hopper.Sample, error) {
+		return s.db.SampleBySHA256(ctx, sha)
+	})
 	if err != nil && !errors.Is(err, hopper.ErrNotFound) {
 		slog.Warn("upload: existing sample lookup", "sha256", sha, "error", err)
 	}
@@ -1553,15 +1560,21 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	// Insert (no-op if duplicate sha). Path uses forward slashes — hopper
 	// stores POSIX-style paths even on Windows, matching every other
-	// ingest source.
-	if err := s.db.InsertSample(ctx, &hopper.Sample{
-		SHA256:      sha,
-		Source:      "upload",
-		Filename:    filename,
-		Path:        filepath.ToSlash(relPath),
-		Label:       "unknown",
-		LabelSource: "upload",
-		SizeBytes:   written,
+	// ingest source. The store context is detached from r.Context() so a
+	// client disconnect during DB retries doesn't orphan the on-disk file
+	// behind a missing row; matches handleResult's persistence model.
+	storeCtx, cancelStore := context.WithTimeout(context.WithoutCancel(r.Context()), uploadStoreTimeout)
+	defer cancelStore()
+	if err := retryDBAccessNoValue(storeCtx, "upload sample insert", sha, func(ctx context.Context) error {
+		return s.db.InsertSample(ctx, &hopper.Sample{
+			SHA256:      sha,
+			Source:      "upload",
+			Filename:    filename,
+			Path:        filepath.ToSlash(relPath),
+			Label:       "unknown",
+			LabelSource: "upload",
+			SizeBytes:   written,
+		})
 	}); err != nil {
 		slog.Error("upload: insert sample", "sha256", sha, "error", err)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
