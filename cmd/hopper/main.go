@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"codeberg.org/atomdrift/hopper"
+	"codeberg.org/atomdrift/obs"
 	"codeberg.org/atomdrift/hopper/pkgparse"
 )
 
@@ -359,6 +360,15 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 
+	// Init OTel. DisableSlog so we keep the stderr+file fan-out built by
+	// setupLogging and just add the OTLP sink as one more handler.
+	obsShutdown, err := obs.Init(ctx, obs.Config{ServiceName: "hopper", DisableSlog: true})
+	if err != nil {
+		writeStderrf("obs init: %v\n", err)
+		os.Exit(1)
+	}
+	slog.SetDefault(slog.New(obs.TeeSlog(slog.Default().Handler(), "hopper")))
+
 	// Force-exit on a second interrupt so cleanup can't hang forever.
 	go func() {
 		sigCh := make(chan os.Signal, 1)
@@ -382,6 +392,13 @@ func main() {
 
 	err = run(ctx)
 	stop()
+	// Flush exporters before file/log cleanup so the last spans/metrics
+	// have a chance to ship.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if shutdownErr := obsShutdown(shutdownCtx); shutdownErr != nil {
+		slog.Warn("obs shutdown", "error", shutdownErr)
+	}
+	shutdownCancel()
 	if cleanup != nil {
 		cleanup()
 	}
@@ -855,6 +872,10 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	tracker := newWorkerTracker()
 	api := &apiServer{tracker: tracker, hopperStart: time.Now().UTC()} // db, progress, allowedDirs, uploadTokenHash set after init
 	api.registerAPI(httpMux)
+	httpMux.HandleFunc("GET /_/health", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	})
+	httpMux.Handle("GET /_/metrik", obs.MetricsHandler())
 
 	var wd *webDashboard
 	if *dashAddr != "" {
@@ -1102,6 +1123,10 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	db := dr.db
 	defer db.Close()
 	slog.Info("database ready", "elapsed", time.Since(dbStart))
+
+	if err := obs.PoolStats("hopper", db.Pool()); err != nil {
+		slog.Warn("pool stats registration", "error", err)
+	}
 
 	// Periodic pgxpool stats so saturation is visible. Without this, a
 	// connection-starved pool looks like "the dashboard is slow" with no

@@ -192,6 +192,12 @@ Environment=XDG_CACHE_HOME=%C/${SERVICE_NAME}
 Environment=PGPASSFILE=%E/${SERVICE_NAME}/.pgpass
 Environment=PATH=${TOOLS_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+# OpenTelemetry. The base endpoint; the SDK appends /v1/<signal> per the
+# OTel spec, so metrics land at /api/v1/otlp/v1/metrics on the Prometheus
+# OTLP receiver. Override OTEL_EXPORTER_OTLP_<SIGNAL>_ENDPOINT to send
+# a single signal somewhere else (e.g. traces → Tempo).
+Environment=OTEL_EXPORTER_OTLP_ENDPOINT=http://otel:9090/api/v1/otlp
+
 # Resource caps — hopper + litmus children combined.
 MemoryHigh=64G
 MemoryMax=72G

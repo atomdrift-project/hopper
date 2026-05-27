@@ -18,6 +18,7 @@ import (
 	"github.com/codeGROOVE-dev/fido"
 
 	"codeberg.org/atomdrift/hopper"
+	"codeberg.org/atomdrift/obs"
 )
 
 const dashQueryTimeout = 3 * time.Second
@@ -272,7 +273,7 @@ func startWebDashboard(ctx context.Context, addr string, wd *webDashboard, mux *
 	if err != nil {
 		return fmt.Errorf("web dashboard listen %s: %w", addr, err)
 	}
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	srv := &http.Server{Handler: obs.Middleware(mux), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
 		<-ctx.Done()
 		// Graceful shutdown — let in-flight /data/* downloads finish so workers
