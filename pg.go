@@ -117,6 +117,12 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 		`CREATE INDEX IF NOT EXISTS idx_samples_claimed ON samples(claimed_by, claimed_at) WHERE claimed_by != ''`,
 		// newestAnalyzedAtPG: MAX(analyzed_at) — index-only max scan.
 		`CREATE INDEX IF NOT EXISTS idx_samples_analyzed_at ON samples(analyzed_at DESC) WHERE analyzed_at IS NOT NULL`,
+		// Grafana ingest-rate panels: count/bucket samples by created_at without
+		// the parent/cleave predicates the other created_at indexes carry.
+		`CREATE INDEX IF NOT EXISTS idx_samples_created_at ON samples(created_at DESC)`,
+		// Grafana analysis-latency panels bucket reports by created_at over wide
+		// ranges; idx_reports_sha256_type doesn't help time-range scans.
+		`CREATE INDEX IF NOT EXISTS idx_reports_created_at ON reports(created_at DESC)`,
 		// benignReviewPG / badReviewPG filter on skip='misclassified' which is excluded
 		// from idx_samples_review (WHERE skip=''). Separate partial index for misclassified review.
 		`CREATE INDEX IF NOT EXISTS idx_samples_misclassified_review ` +
