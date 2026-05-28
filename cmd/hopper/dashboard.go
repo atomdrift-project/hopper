@@ -369,6 +369,7 @@ td.warn{color:var(--amber)}
 /* status dot */
 .dot{font-size:.5rem;vertical-align:middle;margin-right:.35rem}
 .dot-ok{color:var(--green)}
+.dot-fresh{color:#f5f7fa}
 .dot-warn{color:var(--amber)}
 .dot-bad{color:var(--red)}
 .dot-off{color:var(--sub)}
@@ -690,18 +691,20 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 			w := &workers[i]
 			idle := time.Since(w.LastSeen)
 			status, _ := workerStatus(w.ActiveClaims, idle)
-			dotClass := "dot-ok"
-			if w.ActiveClaims == 0 && idle >= workerActiveWindow {
-				dotClass = "dot-warn"
-			}
-			if w.ActiveClaims == 0 && idle >= workerInactiveWindow {
+			// Color purely by recency: white within workerActiveWindow,
+			// yellow up to workerInactiveWindow, red beyond.
+			dotClass := "dot-fresh"
+			switch {
+			case idle >= workerInactiveWindow:
 				dotClass = "dot-bad"
+			case idle >= workerActiveWindow:
+				dotClass = "dot-warn"
 			}
 			// Stale-traits also drops the worker to dot-warn (unless
 			// it's already a worse status). Mismatch is only meaningful
 			// if we have a known-good "latest" to compare against.
 			traitsStale := latestTraits != "" && w.Traits != "" && w.Traits != latestTraits
-			if traitsStale && dotClass == "dot-ok" {
+			if traitsStale && dotClass == "dot-fresh" {
 				dotClass = "dot-warn"
 			}
 

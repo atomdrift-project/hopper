@@ -406,12 +406,12 @@ type namedWorkerStats struct { //nolint:govet // embedded field must come first 
 	Name string
 }
 
-// all returns a snapshot of workers seen within the last hour.
+// all returns a snapshot of workers seen within workerRetentionWindow.
 // Stale entries are pruned on each call.
 func (wt *workerTracker) all() []namedWorkerStats {
 	wt.mu.Lock()
 	defer wt.mu.Unlock()
-	cutoff := time.Now().Add(-1 * time.Hour)
+	cutoff := time.Now().Add(-workerRetentionWindow)
 	for name, ws := range wt.workers {
 		if ws.LastSeen.Before(cutoff) {
 			delete(wt.workers, name)

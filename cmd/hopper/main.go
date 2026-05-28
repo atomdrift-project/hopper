@@ -1958,6 +1958,9 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 const (
 	workerActiveWindow   = 20 * time.Minute
 	workerInactiveWindow = 60 * time.Minute
+	// workerRetentionWindow is how long a worker remains on the dashboard
+	// after its last contact.
+	workerRetentionWindow = 72 * time.Hour
 )
 
 // workerStatus returns a display status and ANSI dot color for a worker.
