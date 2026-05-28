@@ -2198,7 +2198,7 @@ func (db *DB) feedSamplesPG(ctx context.Context, q FeedQuery) ([]*Sample, error)
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
 			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))
-		ORDER BY `+q.sortBy()+` DESC NULLS LAST
+		ORDER BY `+q.sortBy()+`
 		LIMIT $10 OFFSET $11`,
 		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly, q.Formula, q.RequireLitmus, q.Domains, q.Limit, q.Offset)
 	if err != nil {

@@ -1942,14 +1942,24 @@ func (q *FeedQuery) clamp() {
 	}
 }
 
+// sortBy returns the full ORDER BY direction clause for the configured
+// column, including the right NULLS placement so the planner can use the
+// matching partial index as an ordered scan rather than falling back to a
+// top-N heapsort. The column-specific NULLS clauses match the indexes
+// created in pg.go (idx_samples_feed_source / _mtime carry NULLS LAST;
+// the created_at indexes do not — and don't need to since the column is
+// NOT NULL).
 func (q *FeedQuery) sortBy() string {
 	switch q.OrderBy {
 	case "created_at":
-		return "created_at"
+		// created_at is NOT NULL, so a NULLS clause is redundant and
+		// would prevent the planner from using DESC indexes (which
+		// default to NULLS FIRST for DESC). Omit it.
+		return "created_at DESC"
 	case "analyzed_at":
-		return "analyzed_at"
+		return "analyzed_at DESC NULLS LAST"
 	default:
-		return "mtime"
+		return "mtime DESC NULLS LAST"
 	}
 }
 

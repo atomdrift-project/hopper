@@ -2103,7 +2103,7 @@ func (db *DB) applyCleanupSQLite(ctx context.Context, stage CleanupStage) (int64
 func (db *DB) feedSamplesSQLite(ctx context.Context, q FeedQuery) ([]*Sample, error) {
 	where, args := q.whereSQLite()
 	query := `SELECT ` + liteSampleCols + ` FROM samples ` + where + //nolint:gosec // built from fixed query fragments and validated sort key.
-		` ORDER BY ` + q.sortBy() + ` DESC LIMIT ? OFFSET ?`
+		` ORDER BY ` + q.sortBy() + ` LIMIT ? OFFSET ?`
 	args = append(args, q.Limit, q.Offset)
 
 	rows, err := db.lite.QueryContext(ctx, query, args...)
