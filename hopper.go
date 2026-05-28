@@ -591,7 +591,7 @@ func litmusResultForMember(parent []byte, id int) []byte {
 	}
 
 	out := make(map[string]json.RawMessage, len(member)+4)
-	for _, key := range []string{"v", "version", "thresholds", "analyzed_at"} {
+	for _, key := range []string{"v", "version", "thresholds", "threshold", "level", "analyzed_at"} {
 		if v := envelope[key]; len(v) != 0 {
 			out[key] = v
 		}

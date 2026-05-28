@@ -1407,6 +1407,64 @@ func TestExplodeArchiveMembers(t *testing.T) {
 	}
 }
 
+// TestLitmusResultForMemberAcceptsV4AndV5 exercises the per-member envelope
+// extraction directly. The function must inherit envelope-level metadata
+// (version/threshold/level for v=5, version/thresholds for v=4) onto the
+// per-member result so downstream consumers can interpret it standalone.
+func TestLitmusResultForMemberAcceptsV4AndV5(t *testing.T) {
+	cases := []struct {
+		name        string
+		parent      []byte
+		wantPresent []string // envelope-level keys that must appear on the member
+		wantAbsent  []string // envelope-level keys that must NOT appear on the member
+	}{
+		{
+			name:        "v4 envelope",
+			parent:      []byte(`{"v":"4","prob":0.97,"class":1,"version":"vtest","thresholds":[0.5,0.9],"fs":[{"id":0,"prob":0.91,"class":1}]}`),
+			wantPresent: []string{"v", "version", "thresholds"},
+			wantAbsent:  []string{"threshold", "level"},
+		},
+		{
+			name:        "v5 envelope",
+			parent:      []byte(`{"v":"5","prob":0.97,"class":1,"version":"vtest","threshold":0.9,"level":3,"fs":[{"id":0,"prob":0.91,"class":1,"threshold":0.9}]}`),
+			wantPresent: []string{"v", "version", "threshold", "level"},
+			wantAbsent:  []string{"thresholds"},
+		},
+		{
+			name:        "v5 envelope with null level (manual thresholds)",
+			parent:      []byte(`{"v":"5","prob":0.97,"class":1,"version":"vtest","threshold":0.9,"level":null,"fs":[{"id":0,"prob":0.91,"class":1,"threshold":0.9}]}`),
+			wantPresent: []string{"v", "version", "threshold", "level"},
+			wantAbsent:  []string{"thresholds"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := litmusResultForMember(tc.parent, 0)
+			if got == nil {
+				t.Fatal("got nil; want member envelope")
+			}
+			var out map[string]json.RawMessage
+			if err := json.Unmarshal(got, &out); err != nil {
+				t.Fatalf("unmarshal member: %v", err)
+			}
+			// Member's own prob must survive.
+			if _, ok := out["prob"]; !ok {
+				t.Error("member missing prob")
+			}
+			for _, k := range tc.wantPresent {
+				if _, ok := out[k]; !ok {
+					t.Errorf("missing envelope-level key %q on member; got: %s", k, got)
+				}
+			}
+			for _, k := range tc.wantAbsent {
+				if _, ok := out[k]; ok {
+					t.Errorf("unexpected envelope-level key %q on member; got: %s", k, got)
+				}
+			}
+		})
+	}
+}
+
 func TestBackfillArchiveMemberAnalyzedAt(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
