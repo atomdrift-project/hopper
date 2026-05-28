@@ -1882,7 +1882,7 @@ type FeedQuery struct {
 	RequireLitmus bool     // require any litmus_result without filtering by class
 	TopLevelOnly  bool     // only samples with no archive parent
 	Offset        int      // pagination offset
-	Limit         int      // page size (clamped to 1–100)
+	Limit         int      // page size (clamped to 1–1000)
 }
 
 // FeedSamples returns analyzed samples matching the query, newest first.
@@ -1934,8 +1934,8 @@ func (q *FeedQuery) clamp() {
 	if q.Limit < 1 {
 		q.Limit = 1
 	}
-	if q.Limit > 100 {
-		q.Limit = 100
+	if q.Limit > 1000 {
+		q.Limit = 1000
 	}
 	if q.Offset < 0 {
 		q.Offset = 0
