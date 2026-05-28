@@ -975,6 +975,49 @@ func TestLoadDir(t *testing.T) {
 	}
 }
 
+// TestLoadDirSkipsForagerSidecars verifies the load walk ingests the vendor
+// binary but never the forager metadata sidecars beside it — both the current
+// hidden ".<sha>.sidecar.json" form and the legacy bare "<sha>.json" form.
+func TestLoadDirSkipsForagerSidecars(t *testing.T) {
+	useTestPathLister(t)
+	ctx := t.Context()
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := hopper.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	binSHA := strings.Repeat("a", 64)
+	otherSHA := strings.Repeat("b", 64)
+	dir := t.TempDir()
+	host := filepath.Join(dir, "owasp-amass.github.io")
+	mustMkdirAll(t, host)
+	mustWriteFile(t, filepath.Join(host, binSHA+"-amass_Linux_amd64.zip"), []byte("real amass release binary bytes"))
+	mustWriteFile(t, filepath.Join(host, "."+binSHA+".sidecar.json"), []byte(`{"fetch_url":"https://example/x"}`))
+	mustWriteFile(t, filepath.Join(host, otherSHA+".json"), []byte(`{"fetch_url":"https://example/y"}`))
+
+	n := loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{dir, "good"}}, nil, "forager", 1, false, 0, "", nil, "", 0)
+	if n != 1 {
+		t.Errorf("loadAll returned %d, want 1 (only the binary, sidecars skipped)", n)
+	}
+
+	samples, err := db.SamplesByLabel(ctx, "good", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 1 {
+		t.Fatalf("expected 1 good sample, got %d", len(samples))
+	}
+	if strings.HasSuffix(samples[0].Filename, ".json") {
+		t.Errorf("a sidecar .json was ingested as a sample: %q", samples[0].Filename)
+	}
+}
+
 func TestLoadDirWithCache(t *testing.T) {
 	useTestPathLister(t)
 	ctx := t.Context()

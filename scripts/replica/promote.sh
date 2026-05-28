@@ -189,7 +189,7 @@ What's left (manual):
      write to it:
        doas bastille service <old-primary-jail> postgresql stop
 
-  3. Resume hopper workers (harvest, analyzers). They should now connect
+  3. Resume hopper workers (forager, analyzers). They should now connect
      to THIS host via the updated 'hopper' hostname.
 
   4. Smoke-test: run a tiny ingest and confirm it shows up in BOTH tables:

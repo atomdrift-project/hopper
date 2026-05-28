@@ -13,7 +13,7 @@
 #                                    (default: /data/samples)
 #   DB        postgres DSN (password resolved from the installed .pgpass)
 #                                    (default: postgres://hopper@hopper-db/hopper?sslmode=disable)
-#   SOURCE    --source tag           (default: harvest)
+#   SOURCE    --source tag           (default: forager)
 #   DASH_ADDR --dashboard-addr       (default: 0.0.0.0:8081)
 #   WORKERS   --workers              (default: 0 = auto)
 
@@ -21,7 +21,7 @@ set -euo pipefail
 
 DATA_DIR="${DATA_DIR:-/data/samples}"
 DB="${DB:-postgres://hopper@hopper-db/hopper?sslmode=disable}"
-SOURCE="${SOURCE:-harvest}"
+SOURCE="${SOURCE:-forager}"
 DASH_ADDR="${DASH_ADDR:-0.0.0.0:8081}"
 WORKERS="${WORKERS:-0}"
 

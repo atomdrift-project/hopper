@@ -1584,6 +1584,9 @@ func runDirPipeline(
 		if isMarkerFile(filepath.Base(lp.path)) {
 			continue
 		}
+		if isForagerSidecar(filepath.Base(lp.path)) {
+			continue
+		}
 		lp.label = target.label
 		progress.walked.Add(1)
 		storedPath := filepath.ToSlash(relativeSamplePath(filepath.Dir(target.dir), lp.path))
@@ -2065,6 +2068,36 @@ const (
 func isMarkerFile(name string) bool {
 	return strings.HasPrefix(name, markerPrefix) &&
 		(strings.HasSuffix(name, markerBenign) || strings.HasSuffix(name, markerBad))
+}
+
+// isForagerSidecar reports whether name is a forager vendor-fetch metadata
+// sidecar rather than sample content. The current naming is a hidden dotfile
+// (".<sha256>.sidecar.json"); the legacy form is a bare "<sha256>.json". Both
+// describe a sibling binary and must never be ingested as samples — forager
+// direct-inserts the real row, and on a disaster-recovery walk the binary
+// carries its own provenance.
+func isForagerSidecar(name string) bool {
+	if strings.HasSuffix(name, ".sidecar.json") {
+		return true
+	}
+	if stem, ok := strings.CutSuffix(name, ".json"); ok {
+		return isHexSHA256Name(stem)
+	}
+	return false
+}
+
+// isHexSHA256Name reports whether s is exactly 64 lowercase hex digits, the
+// shape of a forager sha256-named file.
+func isHexSHA256Name(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // checkMarker looks for a sibling marker file that contradicts the given label.
