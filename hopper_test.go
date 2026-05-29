@@ -1018,6 +1018,180 @@ func TestInsertSampleBatch(t *testing.T) {
 	}
 }
 
+func TestClassifyLabelTransition(t *testing.T) {
+	tests := []struct {
+		name                           string
+		stored, storedSrc, storedSkip  string
+		in, inSrc                      string
+		wantCategory, wantFrom, wantTo string
+	}{
+		{"promote unknown to good", "unknown", "forager", "", "good", "forager", "promoted", "unknown", "good"},
+		{"promote unknown to bad", "unknown", "forager", "", "bad", "forager", "promoted", "unknown", "bad"},
+		{"conflict good then bad", "good", "forager", "", "bad", "forager", "conflict", "good", "bad"},
+		{"conflict bad then good", "bad", "forager", "", "good", "forager", "conflict", "bad", "bad"},
+		{"unknown does not demote good", "good", "forager", "", "unknown", "forager", "", "", ""},
+		{"equal labels no change", "bad", "forager", "", "bad", "forager", "", "", ""},
+		{"incoming marker is logged in go", "unknown", "forager", "", "good", "marker", "", "", ""},
+		{"rehabilitate cleared marker", "bad", "marker", "misclassified", "bad", "forager", "rehabilitated", "bad", "bad"},
+		{"rehabilitate flipped marker", "good", "marker", "misclassified", "bad", "forager", "rehabilitated", "good", "bad"},
+		{"stale marker already clean no change", "bad", "marker", "", "bad", "forager", "", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cat, from, to := classifyLabelTransition(tt.stored, tt.storedSrc, tt.storedSkip, tt.in, tt.inSrc)
+			if cat != tt.wantCategory || from != tt.wantFrom || to != tt.wantTo {
+				t.Errorf("classifyLabelTransition = (%q,%q,%q), want (%q,%q,%q)",
+					cat, from, to, tt.wantCategory, tt.wantFrom, tt.wantTo)
+			}
+		})
+	}
+}
+
+// TestLabelPrecedenceOnReobservation exercises the ON CONFLICT pool-precedence
+// resolution end-to-end through InsertSampleBatch (the same path the load
+// pipeline uses), one rule per subtest.
+func TestLabelPrecedenceOnReobservation(t *testing.T) {
+	reobserve := func(t *testing.T, ctx context.Context, db *DB, s *Sample) {
+		t.Helper()
+		if _, _, err := db.InsertSampleBatch(ctx, []*Sample{s}); err != nil {
+			t.Fatalf("InsertSampleBatch: %v", err)
+		}
+	}
+	want := func(t *testing.T, ctx context.Context, db *DB, sha, label, source, skip string) {
+		t.Helper()
+		got, err := db.SampleBySHA256(ctx, sha)
+		if err != nil {
+			t.Fatalf("SampleBySHA256(%s): %v", sha, err)
+		}
+		if got.Label != label || got.LabelSource != source || got.Skip != skip {
+			t.Errorf("%s: got (label=%q source=%q skip=%q), want (label=%q source=%q skip=%q)",
+				sha, got.Label, got.LabelSource, got.Skip, label, source, skip)
+		}
+	}
+
+	t.Run("promote unknown to good", func(t *testing.T) {
+		db := openTestDB(t)
+		ctx := context.Background()
+		reobserve(t, ctx, db, &Sample{SHA256: "p1", Source: "test", Label: "unknown", LabelSource: "forager", Path: "unknown/p1", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "p1", Source: "test", Label: "good", LabelSource: "forager", Path: "good/p1", SizeBytes: 1})
+		want(t, ctx, db, "p1", "good", "forager", "")
+	})
+
+	t.Run("promote unknown to bad", func(t *testing.T) {
+		db := openTestDB(t)
+		ctx := context.Background()
+		reobserve(t, ctx, db, &Sample{SHA256: "p2", Source: "test", Label: "unknown", LabelSource: "forager", Path: "unknown/p2", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "p2", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/p2", SizeBytes: 1})
+		want(t, ctx, db, "p2", "bad", "forager", "")
+	})
+
+	t.Run("conflict good then bad", func(t *testing.T) {
+		db := openTestDB(t)
+		ctx := context.Background()
+		reobserve(t, ctx, db, &Sample{SHA256: "c1", Source: "test", Label: "good", LabelSource: "forager", Path: "good/c1", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "c1", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/c1", SizeBytes: 1})
+		want(t, ctx, db, "c1", "bad", "conflict", "conflict")
+	})
+
+	t.Run("conflict bad then good resolves to bad", func(t *testing.T) {
+		db := openTestDB(t)
+		ctx := context.Background()
+		reobserve(t, ctx, db, &Sample{SHA256: "c2", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/c2", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "c2", Source: "test", Label: "good", LabelSource: "forager", Path: "good/c2", SizeBytes: 1})
+		want(t, ctx, db, "c2", "bad", "conflict", "conflict")
+	})
+
+	t.Run("unknown does not demote", func(t *testing.T) {
+		db := openTestDB(t)
+		ctx := context.Background()
+		reobserve(t, ctx, db, &Sample{SHA256: "d1", Source: "test", Label: "good", LabelSource: "forager", Path: "good/d1", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "d1", Source: "test", Label: "unknown", LabelSource: "forager", Path: "unknown/d1", SizeBytes: 1})
+		want(t, ctx, db, "d1", "good", "forager", "")
+	})
+
+	t.Run("incoming marker is authoritative", func(t *testing.T) {
+		db := openTestDB(t)
+		ctx := context.Background()
+		reobserve(t, ctx, db, &Sample{SHA256: "m1", Source: "test", Label: "unknown", LabelSource: "forager", Path: "unknown/m1", SizeBytes: 1})
+		// A good/ file carrying a .BAD marker: Go flips it before insert.
+		reobserve(t, ctx, db, &Sample{SHA256: "m1", Source: "test", Label: "bad", LabelSource: "marker", Skip: "misclassified", Path: "good/m1", SizeBytes: 1})
+		want(t, ctx, db, "m1", "bad", "marker", "misclassified")
+	})
+
+	t.Run("rehabilitate after marker removed", func(t *testing.T) {
+		db := openTestDB(t)
+		ctx := context.Background()
+		// Stored quarantine from a good/ file with a .BAD marker.
+		reobserve(t, ctx, db, &Sample{SHA256: "r1", Source: "test", Label: "bad", LabelSource: "marker", Skip: "misclassified", Path: "good/r1", SizeBytes: 1})
+		// Moved into bad/ with the marker dropped: plain pool observation.
+		reobserve(t, ctx, db, &Sample{SHA256: "r1", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/r1", SizeBytes: 1})
+		want(t, ctx, db, "r1", "bad", "forager", "")
+	})
+
+	t.Run("missing auto-heals on re-observation", func(t *testing.T) {
+		db := openTestDB(t)
+		ctx := context.Background()
+		reobserve(t, ctx, db, &Sample{SHA256: "g1", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/g1", SizeBytes: 1})
+		if err := db.SetSkip(ctx, "g1", "missing"); err != nil {
+			t.Fatal(err)
+		}
+		reobserve(t, ctx, db, &Sample{SHA256: "g1", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/g1", SizeBytes: 1})
+		want(t, ctx, db, "g1", "bad", "forager", "")
+	})
+
+	t.Run("missing returning as conflict is quarantined", func(t *testing.T) {
+		db := openTestDB(t)
+		ctx := context.Background()
+		reobserve(t, ctx, db, &Sample{SHA256: "g2", Source: "test", Label: "good", LabelSource: "forager", Path: "good/g2", SizeBytes: 1})
+		if err := db.SetSkip(ctx, "g2", "missing"); err != nil {
+			t.Fatal(err)
+		}
+		reobserve(t, ctx, db, &Sample{SHA256: "g2", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/g2", SizeBytes: 1})
+		want(t, ctx, db, "g2", "bad", "conflict", "conflict")
+	})
+
+	t.Run("hard skip preserved on promotion", func(t *testing.T) {
+		db := openTestDB(t)
+		ctx := context.Background()
+		reobserve(t, ctx, db, &Sample{SHA256: "h1", Source: "test", Label: "unknown", LabelSource: "forager", Skip: "corrupt", Path: "unknown/h1", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "h1", Source: "test", Label: "good", LabelSource: "forager", Path: "good/h1", SizeBytes: 1})
+		want(t, ctx, db, "h1", "good", "forager", "corrupt")
+	})
+
+	t.Run("archive member never changes top-level label", func(t *testing.T) {
+		db := openTestDB(t)
+		ctx := context.Background()
+		reobserve(t, ctx, db, &Sample{SHA256: "a1", Source: "test", Label: "good", LabelSource: "forager", Path: "good/a1", SizeBytes: 1})
+		// Same content hash seen inside a bad archive (parent set).
+		reobserve(t, ctx, db, &Sample{SHA256: "a1", Source: "test", Label: "bad", LabelSource: "forager", Parent: "archivesha", Path: "bad/arc.zip!!a1", SizeBytes: 1})
+		want(t, ctx, db, "a1", "good", "forager", "")
+	})
+}
+
+func TestConflictReview(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Create a good+bad conflict and an ordinary bad sample.
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{{SHA256: "k1", Source: "test", Label: "good", LabelSource: "forager", Path: "good/k1", SizeBytes: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{{SHA256: "k1", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/k1", SizeBytes: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{{SHA256: "k2", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/k2", SizeBytes: 1}}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := db.ConflictReview(ctx, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SHA256 != "k1" {
+		t.Fatalf("ConflictReview returned %d rows (%v), want just k1", len(got), got)
+	}
+}
+
 func TestInsertSampleBatchMarksReplaced(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()

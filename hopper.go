@@ -37,6 +37,89 @@ import (
 
 const skipBenignArchiveItem = "skip-benign-archive-item"
 
+// Pool labels, ordered by precedence: bad > good > unknown.
+const (
+	labelUnknown = "unknown"
+	labelGood    = "good"
+	labelBad     = "bad"
+)
+
+// Label-related skip reasons and label sources managed by the pool-precedence
+// resolution. Other skip reasons (corrupt/encrypted/missing/unsupported/
+// replaced/empty_path/skip-benign-archive-item) are "hard" and never cleared
+// by relabeling.
+const (
+	skipMisclassified   = "misclassified" // marker contradicts the pool directory
+	skipConflict        = "conflict"      // same SHA256 asserted in both good/ and bad/
+	labelSourceMarker   = "marker"        // label flipped by a .BENIGN/.BAD marker
+	labelSourceConflict = "conflict"      // label forced to bad by a good+bad conflict
+)
+
+// logLabelTransition emits a structured log line for a top-level label change
+// that the upsert is about to apply, categorized by classifyLabelTransition.
+// No-op when the label is unchanged.
+func logLabelTransition(sha, path, stored, storedSrc, storedSkip, in, inSrc string) {
+	category, from, to := classifyLabelTransition(stored, storedSrc, storedSkip, in, inSrc)
+	switch category {
+	case "conflict":
+		slog.Warn("label conflict good+bad", "sha256", sha, "path", path,
+			"stored", from, "incoming", in, "resolved", to)
+	case "rehabilitated":
+		slog.Info("marker cleared, label rehabilitated", "sha256", sha, "path", path,
+			"from", from, "to", to)
+	case "promoted":
+		slog.Info("label promoted", "sha256", sha, "path", path, "from", from, "to", to)
+	default:
+		// Empty category → nothing log-worthy changed.
+	}
+}
+
+// labelRank orders pool labels for precedence resolution: bad outranks good
+// outranks unknown. Used to decide whether a re-observation promotes a sample.
+func labelRank(label string) int {
+	switch label {
+	case labelBad:
+		return 2
+	case labelGood:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// classifyLabelTransition mirrors the ON CONFLICT label-resolution rules (see
+// insertSampleBatchSQLite / insertBatchStagingInsert) for a top-level
+// (parent=”) re-observation. It is logging-only: the authoritative write
+// happens in the upsert SQL, which compares against the live row and is
+// therefore race-safe under concurrent per-directory pipelines. It returns the
+// transition category ("" when nothing log-worthy changes) and the from/to
+// labels. stored* is the existing row; in*/inSrc is the incoming (already
+// marker-processed) pool observation.
+func classifyLabelTransition(stored, storedSrc, storedSkip, in, inSrc string) (category, from, to string) {
+	switch {
+	case inSrc == labelSourceMarker:
+		// Rule 1: a contradicting marker is present; Go already logged it.
+		return "", "", ""
+	case storedSrc == labelSourceMarker:
+		// Rule 2: stored row is a marker quarantine but no marker is present
+		// now (removed or the file moved pools) → the directory governs again.
+		if stored == in && storedSkip != skipMisclassified {
+			return "", "", ""
+		}
+		return "rehabilitated", stored, in
+	case (stored == labelGood && in == labelBad) || (stored == labelBad && in == labelGood):
+		// Rule 3: the same SHA256 is asserted good in one pool and bad in
+		// another → resolve to bad and quarantine for review.
+		return "conflict", stored, labelBad
+	case labelRank(in) > labelRank(stored):
+		// Rule 4: a higher-rank pool placement promotes the label.
+		return "promoted", stored, in
+	default:
+		// Rule 5: no change (incoming does not outrank the stored label).
+		return "", "", ""
+	}
+}
+
 // sanitizeJSONB fixes JSON that is valid in lenient parsers but rejected by
 // PostgreSQL's strict JSONB parser:
 //   - \u0000 (null bytes): PG uses C-style null-terminated strings internally
@@ -1539,6 +1622,17 @@ func (db *DB) BadReview(ctx context.Context, scoreThreshold, limit int) ([]*Samp
 		return db.badReviewPG(ctx, scoreThreshold, limit)
 	}
 	return db.badReviewSQLite(ctx, scoreThreshold, limit)
+}
+
+// ConflictReview returns samples flagged with a good+bad pool conflict
+// (label='bad', skip='conflict'): the same content was asserted both benign
+// and malicious in different pool directories. These are resolved to bad
+// operationally but excluded from training until a human picks a side.
+func (db *DB) ConflictReview(ctx context.Context, scoreThreshold, limit int) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.conflictReviewPG(ctx, scoreThreshold, limit)
+	}
+	return db.conflictReviewSQLite(ctx, scoreThreshold, limit)
 }
 
 // CountByStatus returns sample counts grouped by status.

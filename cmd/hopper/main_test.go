@@ -1018,6 +1018,58 @@ func TestLoadDirSkipsForagerSidecars(t *testing.T) {
 	}
 }
 
+// TestLoadDirReadsVendorSidecar verifies the walk reads a vendor binary's
+// sibling sidecar to fill url/feed on the row (the path supplies only
+// domain/ecosystem), so vendor provenance is recovered even without forager
+// direct-insert.
+func TestLoadDirReadsVendorSidecar(t *testing.T) {
+	useTestPathLister(t)
+	ctx := t.Context()
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := hopper.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	host := filepath.Join(dir, "good", "foraged", "vendor", "owasp-amass.github.io")
+	mustMkdirAll(t, host)
+	content := []byte("real amass release binary content bytes")
+	sum := sha256.Sum256(content)
+	sha := hex.EncodeToString(sum[:])
+	mustWriteFile(t, filepath.Join(host, sha+"-amass_Linux_amd64.zip"), content)
+	url := "https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_Linux_amd64.zip"
+	mustWriteFile(t, filepath.Join(host, "."+sha+".sidecar.json"),
+		[]byte(fmt.Sprintf(`{"fetch_url":%q,"source":"amass","hostname":"owasp-amass.github.io"}`, url)))
+
+	loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{dir, "good"}}, nil, "forager", 1, false, 0, "", nil, "", 0)
+
+	got, err := db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatalf("SampleBySHA256: %v", err)
+	}
+	if got == nil {
+		t.Fatal("vendor binary not inserted")
+	}
+	if got.URL != url {
+		t.Errorf("URL = %q, want %q (from sidecar)", got.URL, url)
+	}
+	if got.Feed != "amass" {
+		t.Errorf("Feed = %q, want amass (from sidecar)", got.Feed)
+	}
+	if got.Domain != "owasp-amass.github.io" {
+		t.Errorf("Domain = %q, want owasp-amass.github.io", got.Domain)
+	}
+	if got.Source != "forager" {
+		t.Errorf("Source = %q, want forager", got.Source)
+	}
+}
+
 func TestLoadDirWithCache(t *testing.T) {
 	useTestPathLister(t)
 	ctx := t.Context()
@@ -1151,6 +1203,58 @@ func TestLoadDirMarkersRefreshMarkerMtimeOnDuplicate(t *testing.T) {
 	}
 	if !samples[0].MarkerMtime.Equal(second) {
 		t.Fatalf("marker_mtime = %v, want %v", samples[0].MarkerMtime.UTC(), second)
+	}
+}
+
+// TestLoadRehabilitatesAfterMarkerRemoved exercises the full load path twice:
+// a good/ file with a .BAD marker is flipped to bad and quarantined
+// (skip=misclassified), then the same content is re-observed in bad/ with no
+// marker, which must rehabilitate it into a clean bad training sample.
+func TestLoadRehabilitatesAfterMarkerRemoved(t *testing.T) {
+	useTestPathLister(t)
+	ctx := t.Context()
+	dbPath := filepath.Join(t.TempDir(), "rehab.db")
+	db, err := hopper.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	content := []byte("identical payload observed across two pools!")
+
+	// Phase 1: good/ file carrying a .BAD marker → flips to bad, quarantined.
+	goodDir := t.TempDir()
+	mustWriteFile(t, filepath.Join(goodDir, "x.bin"), content)
+	mustWriteFile(t, filepath.Join(goodDir, "._x.bin.BAD"), nil)
+	loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{goodDir, "good"}}, nil, "test", 1, false, 0, "", nil, "", 0)
+
+	flipped, err := db.SamplesByLabel(ctx, "bad", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(flipped) != 1 {
+		t.Fatalf("after marker flip: got %d bad samples, want 1", len(flipped))
+	}
+	if flipped[0].Skip != "misclassified" || flipped[0].LabelSource != "marker" {
+		t.Fatalf("after marker flip: skip=%q source=%q, want misclassified/marker", flipped[0].Skip, flipped[0].LabelSource)
+	}
+	sha := flipped[0].SHA256
+
+	// Phase 2: same content now in bad/ with no marker → rehabilitate.
+	badDir := t.TempDir()
+	mustWriteFile(t, filepath.Join(badDir, "x.bin"), content)
+	loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{badDir, "bad"}}, nil, "test", 1, false, 0, "", nil, "", 0)
+
+	got, err := db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Label != "bad" || got.Skip != "" || got.LabelSource != "test" {
+		t.Errorf("after rehabilitation: label=%q skip=%q source=%q, want bad/\"\"/test",
+			got.Label, got.Skip, got.LabelSource)
 	}
 }
 

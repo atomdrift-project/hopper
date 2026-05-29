@@ -33,8 +33,8 @@ import (
 	"time"
 
 	"codeberg.org/atomdrift/hopper"
-	"codeberg.org/atomdrift/obs"
 	"codeberg.org/atomdrift/hopper/pkgparse"
+	"codeberg.org/atomdrift/obs"
 )
 
 const usageText = `usage: hopper <command>
@@ -50,6 +50,7 @@ commands:
   false-negatives    list known-bad files that still score benign
   benign-review      list marker-benign files cleave still flags as suspicious
   bad-review         list marker-bad files cleave still considers benign
+  conflict-review    list samples asserted both good and bad across pools
   backfill           re-derive columns from cleave_result/litmus_result blobs
   purge-unsupported  delete analyzed rows cleave could not classify
   cleanup            delete wonky samples by skip category (interactive)
@@ -430,6 +431,8 @@ func run(ctx context.Context) error {
 		return cmdBenignReview(ctx)
 	case "bad-review":
 		return cmdBadReview(ctx)
+	case "conflict-review":
+		return cmdConflictReview(ctx)
 	case "backfill":
 		return cmdBackfill(ctx)
 	case "purge-unsupported":
@@ -2373,6 +2376,73 @@ func fillSampleProvenance(s *hopper.Sample, prov pathProvenance, filename string
 	if s.Version == "" {
 		s.Version = parsedVersion
 	}
+	enrichFromVendorSidecar(s)
+}
+
+// enrichFromVendorSidecar fills url/feed/domain on a vendor-fetched sample from
+// the provenance sidecar forager writes next to each binary
+// (".<sha>.sidecar.json", or the legacy "<sha>.json"). The walk skips the
+// sidecar as its own sample (isForagerSidecar); reading it here is how its
+// metadata — most importantly the fetch URL — still reaches the binary's row
+// when forager isn't direct-inserting (and after a from-scratch DR walk).
+//
+// Called while s.Path is still the absolute on-disk path (hashFile sets it
+// before runDirPipeline rewrites it to the stored relative path), so the
+// sidecar sibling resolves correctly.
+func enrichFromVendorSidecar(s *hopper.Sample) {
+	if s.SHA256 == "" || s.Path == "" {
+		return
+	}
+	if !strings.Contains(filepath.ToSlash(s.Path), "/foraged/vendor/") {
+		return
+	}
+	sc, ok := readVendorSidecar(filepath.Dir(s.Path), s.SHA256)
+	if !ok {
+		return
+	}
+	if s.URL == "" {
+		s.URL = sc.FetchURL
+	}
+	if s.Feed == "" {
+		s.Feed = sc.Source
+	}
+	if s.Domain == "" {
+		s.Domain = vendorSidecarDomain(sc.Hostname)
+	}
+}
+
+// vendorSidecar is the subset of forager's sidecar JSON that hopper consumes.
+type vendorSidecar struct {
+	FetchURL string `json:"fetch_url"`
+	Source   string `json:"source"`
+	Hostname string `json:"hostname"`
+}
+
+// readVendorSidecar reads and parses the forager sidecar for sha in dir,
+// trying the current hidden name then the legacy bare name. Returns ok=false
+// when neither exists or the JSON can't be parsed.
+func readVendorSidecar(dir, sha string) (vendorSidecar, bool) {
+	for _, name := range []string{"." + sha + ".sidecar.json", sha + ".json"} {
+		b, err := os.ReadFile(filepath.Join(dir, name)) //nolint:gosec // dir/sha come from the walked sample path
+		if err != nil {
+			continue
+		}
+		var v vendorSidecar
+		if json.Unmarshal(b, &v) == nil {
+			return v, true
+		}
+	}
+	return vendorSidecar{}, false
+}
+
+// vendorSidecarDomain keeps only the leading host of a vendor hostname
+// ("github.com/abiosoft/colima" → "github.com"), matching the value the
+// dashboard groups by.
+func vendorSidecarDomain(hostname string) string {
+	if i := strings.IndexByte(hostname, '/'); i >= 0 {
+		return hostname[:i]
+	}
+	return hostname
 }
 
 // pathProvenance captures the metadata recoverable from a forager-output
@@ -2810,6 +2880,13 @@ func cmdBadReview(ctx context.Context) error {
 	return runReviewCommand(ctx, os.Args[2:], "bad-review",
 		func(ctx context.Context, db *hopper.DB, score, limit int) ([]*hopper.Sample, error) {
 			return db.BadReview(ctx, score, limit)
+		})
+}
+
+func cmdConflictReview(ctx context.Context) error {
+	return runReviewCommand(ctx, os.Args[2:], "conflict-review",
+		func(ctx context.Context, db *hopper.DB, score, limit int) ([]*hopper.Sample, error) {
+			return db.ConflictReview(ctx, score, limit)
 		})
 }
 

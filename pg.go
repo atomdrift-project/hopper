@@ -129,6 +129,10 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long seq
 			`ON samples(label, max_crit DESC, suspicious_count DESC) ` +
 			`WHERE label_source = 'marker' AND skip = 'misclassified' ` +
 			`AND cleave_result IS NOT NULL AND status = ''`,
+		// conflictReviewPG: good+bad conflicts flagged skip='conflict'.
+		`CREATE INDEX IF NOT EXISTS idx_samples_conflict_review ` +
+			`ON samples(updated_at DESC) ` +
+			`WHERE skip = 'conflict' AND status = ''`,
 		// staleSamplesPG: WHERE updated_at < $1 ORDER BY updated_at — no status prefix.
 		`CREATE INDEX IF NOT EXISTS idx_samples_updated_at ON samples(updated_at)`,
 		// Workflow dashboard freshness: global top-level recency cannot use the
@@ -808,32 +812,7 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
 			$1, $11, $12, $13, $14, $15, $16, $17, $18, $19,
 			$20, $21, $22, $23)
-		ON CONFLICT (sha256) DO UPDATE SET
-			feed  = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE samples.feed END,
-			ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE samples.ecosystem END,
-			path  = CASE WHEN EXCLUDED.path  <> ''   THEN EXCLUDED.path  ELSE samples.path  END,
-			mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END,
-			-- Provenance fields stick to first non-empty observation: if the
-			-- existing row has a value, keep it. The first-observation URL is
-			-- the canonical one; subsequent re-fetches via mirrors don't
-			-- overwrite history.
-			url     = CASE WHEN samples.url     = '' THEN EXCLUDED.url     ELSE samples.url     END,
-			domain  = CASE WHEN samples.domain  = '' THEN EXCLUDED.domain  ELSE samples.domain  END,
-			package    = CASE WHEN samples.package    = '' THEN EXCLUDED.package    ELSE samples.package    END,
-			version = CASE WHEN samples.version = '' THEN EXCLUDED.version ELSE samples.version END,
-			-- Walker has re-observed a row that we previously gave up on
-			-- (permission error hid it, or cleave didn't support the type
-			-- yet). Clear the skip so it gets re-claimed for analysis. Other
-			-- skip reasons (corrupt/encrypted/replaced/misclassified) stick.
-			skip  = CASE WHEN samples.skip IN ('missing','unsupported') THEN '' ELSE samples.skip END
-		WHERE EXCLUDED.parent = ''
-		  AND ((EXCLUDED.path  <> ''   AND samples.path  IS DISTINCT FROM EXCLUDED.path)
-		    OR (EXCLUDED.mtime IS NOT NULL AND samples.mtime IS DISTINCT FROM EXCLUDED.mtime)
-		    OR (EXCLUDED.feed <> '' AND samples.feed IS DISTINCT FROM EXCLUDED.feed)
-		    OR (EXCLUDED.ecosystem <> '' AND samples.ecosystem IS DISTINCT FROM EXCLUDED.ecosystem)
-		    OR (samples.url = '' AND EXCLUDED.url <> '')
-		    OR (samples.package = '' AND EXCLUDED.package <> '')
-		    OR samples.skip IN ('missing','unsupported'))`,
+		`+sampleConflictUpdatePG,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.Parent, s.Skip, s.Elements,
@@ -896,6 +875,81 @@ const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 // reference them here — writing to a generated column is an error.
 // ON CONFLICT leaves existing analysis alone: a walker row arriving
 // after Explode must not wipe results we already stored.
+// sampleConflictUpdatePG is the shared ON CONFLICT clause for top-level
+// re-observations, used by both the single-row (insertSampleNewPG) and batch
+// (insertBatchStagingInsert) upserts so their resolution logic can't drift.
+//
+// Pool-precedence label resolution (rank: bad>good>unknown), evaluated in
+// order — see classifyLabelTransition for the mirror used by logging:
+//  1. incoming marker present        → take the marker's label, re-quarantine
+//  2. stored marker, none incoming   → marker gone, the directory governs again
+//  3. good+bad across pools          → resolve to bad, quarantine as 'conflict'
+//  4. incoming outranks stored       → promote
+//  5. otherwise                      → keep the stored label
+//
+// Only walker writes (parent=”) may touch the row; explode writes
+// (parent=<archive-sha>) are excluded by the WHERE so an archive member never
+// changes a top-level label or clobbers its path on a content-hash collision.
+const sampleConflictUpdatePG = `ON CONFLICT (sha256) DO UPDATE SET
+	label = CASE
+		WHEN EXCLUDED.label_source = 'marker' THEN EXCLUDED.label
+		WHEN samples.label_source = 'marker' THEN EXCLUDED.label
+		WHEN (samples.label = 'good' AND EXCLUDED.label = 'bad')
+		  OR (samples.label = 'bad' AND EXCLUDED.label = 'good') THEN 'bad'
+		WHEN (CASE EXCLUDED.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
+		   > (CASE samples.label  WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END) THEN EXCLUDED.label
+		ELSE samples.label
+	END,
+	label_source = CASE
+		WHEN EXCLUDED.label_source = 'marker' THEN 'marker'
+		WHEN samples.label_source = 'marker' THEN EXCLUDED.label_source
+		WHEN (samples.label = 'good' AND EXCLUDED.label = 'bad')
+		  OR (samples.label = 'bad' AND EXCLUDED.label = 'good') THEN 'conflict'
+		WHEN (CASE EXCLUDED.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
+		   > (CASE samples.label  WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END) THEN EXCLUDED.label_source
+		ELSE samples.label_source
+	END,
+	feed  = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE samples.feed END,
+	ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE samples.ecosystem END,
+	path  = CASE WHEN EXCLUDED.path  <> ''   THEN EXCLUDED.path  ELSE samples.path  END,
+	mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END,
+	url     = CASE WHEN samples.url     = '' THEN EXCLUDED.url     ELSE samples.url     END,
+	domain  = CASE WHEN samples.domain  = '' THEN EXCLUDED.domain  ELSE samples.domain  END,
+	package    = CASE WHEN samples.package    = '' THEN EXCLUDED.package    ELSE samples.package    END,
+	version = CASE WHEN samples.version = '' THEN EXCLUDED.version ELSE samples.version END,
+	-- Label-related skips ('misclassified'/'conflict') track the resolution;
+	-- the walker also clears 'missing'/'unsupported' so a re-observed file
+	-- rejoins the analysis queue. Hard skips (corrupt/encrypted/replaced/
+	-- empty_path/skip-benign-archive-item) stick. See insertSampleNewPG.
+	skip  = CASE
+		WHEN EXCLUDED.label_source = 'marker' THEN 'misclassified'
+		WHEN samples.label_source = 'marker' AND samples.skip = 'misclassified' THEN ''
+		WHEN ((samples.label = 'good' AND EXCLUDED.label = 'bad')
+		   OR (samples.label = 'bad' AND EXCLUDED.label = 'good'))
+		  AND samples.skip IN ('', 'misclassified', 'conflict', 'missing', 'unsupported') THEN 'conflict'
+		WHEN (CASE EXCLUDED.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
+		   > (CASE samples.label  WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
+		  AND samples.skip IN ('misclassified', 'conflict') THEN ''
+		WHEN samples.skip IN ('missing','unsupported') THEN ''
+		ELSE samples.skip
+	END
+WHERE EXCLUDED.parent = ''
+  AND ((EXCLUDED.path  <> ''   AND samples.path  IS DISTINCT FROM EXCLUDED.path)
+    OR (EXCLUDED.mtime IS NOT NULL AND samples.mtime IS DISTINCT FROM EXCLUDED.mtime)
+    OR (EXCLUDED.feed <> '' AND samples.feed IS DISTINCT FROM EXCLUDED.feed)
+    OR (EXCLUDED.ecosystem <> '' AND samples.ecosystem IS DISTINCT FROM EXCLUDED.ecosystem)
+    OR (samples.url = '' AND EXCLUDED.url <> '')
+    OR (samples.package = '' AND EXCLUDED.package <> '')
+    OR samples.skip IN ('missing','unsupported')
+    -- Pool-precedence transitions must fire even when path/mtime are unchanged.
+    OR ((CASE EXCLUDED.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
+      > (CASE samples.label  WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END))
+    OR ((samples.label = 'good' AND EXCLUDED.label = 'bad')
+      OR (samples.label = 'bad' AND EXCLUDED.label = 'good'))
+    OR (EXCLUDED.label_source = 'marker'
+        AND (samples.label <> EXCLUDED.label OR samples.label_source <> 'marker' OR samples.skip <> 'misclassified'))
+    OR (samples.label_source = 'marker' AND EXCLUDED.label_source <> 'marker'))`
+
 const insertBatchStagingInsert = `INSERT INTO samples (
 	sha256, source, feed, ecosystem, filename,
 	size_bytes, label, label_source, path, status,
@@ -911,32 +965,41 @@ SELECT DISTINCT ON (sha256)
 	cleave_result, litmus_result, analyzed_at, first_analyzed_at,
 	url, domain, package, version
 FROM _staging
-ON CONFLICT (sha256) DO UPDATE SET
-	feed  = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE samples.feed END,
-	ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE samples.ecosystem END,
-	path  = CASE WHEN EXCLUDED.path  <> ''   THEN EXCLUDED.path  ELSE samples.path  END,
-	mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END,
-	url     = CASE WHEN samples.url     = '' THEN EXCLUDED.url     ELSE samples.url     END,
-	domain  = CASE WHEN samples.domain  = '' THEN EXCLUDED.domain  ELSE samples.domain  END,
-	package    = CASE WHEN samples.package    = '' THEN EXCLUDED.package    ELSE samples.package    END,
-	version = CASE WHEN samples.version = '' THEN EXCLUDED.version ELSE samples.version END,
-	-- Re-observation by the walker clears 'missing'/'unsupported' skips
-	-- so a previously-hidden or previously-unsupported file rejoins the
-	-- analysis queue. See insertSampleNewPG for the full rationale.
-	skip  = CASE WHEN samples.skip IN ('missing','unsupported') THEN '' ELSE samples.skip END
--- Only walker writes (parent='') are allowed to refresh samples.path /
--- samples.mtime on conflict. Explode writes (parent=<archive-sha>) must
--- never clobber the top-level row: a content hash collision between a
--- top-level file and an archive member would otherwise leave samples
--- pointing at a virtual archive-member path that doesn't exist on disk.
-WHERE EXCLUDED.parent = ''
-  AND ((EXCLUDED.path  <> ''   AND samples.path  IS DISTINCT FROM EXCLUDED.path)
-    OR (EXCLUDED.mtime IS NOT NULL AND samples.mtime IS DISTINCT FROM EXCLUDED.mtime)
-    OR (EXCLUDED.feed <> '' AND samples.feed IS DISTINCT FROM EXCLUDED.feed)
-    OR (EXCLUDED.ecosystem <> '' AND samples.ecosystem IS DISTINCT FROM EXCLUDED.ecosystem)
-    OR (samples.url = '' AND EXCLUDED.url <> '')
-    OR (samples.package = '' AND EXCLUDED.package <> '')
-    OR samples.skip IN ('missing','unsupported'))`
+` + sampleConflictUpdatePG
+
+// logLabelTransitionsPG logs each top-level re-observation in _staging whose
+// label resolution will change under sampleConflictUpdatePG. The filter mirrors
+// classifyLabelTransition's true-cases so every returned row is log-worthy.
+// Best-effort: the upsert is authoritative, so a query error is logged and
+// ignored rather than failing the batch.
+func logLabelTransitionsPG(ctx context.Context, tx pgx.Tx) {
+	rows, err := tx.Query(ctx, `
+		SELECT DISTINCT ON (st.sha256)
+			st.sha256, st.path, s.label, s.label_source, s.skip, st.label, st.label_source
+		FROM _staging st
+		JOIN samples s ON s.sha256 = st.sha256
+		WHERE st.parent = '' AND s.parent = ''
+		  AND st.label_source <> 'marker'
+		  AND ((s.label_source = 'marker' AND (s.label <> st.label OR s.skip = 'misclassified'))
+		    OR (s.label_source <> 'marker'
+		        AND ((s.label = 'good' AND st.label = 'bad')
+		          OR (s.label = 'bad' AND st.label = 'good')
+		          OR (CASE st.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
+		           > (CASE s.label  WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END))))`)
+	if err != nil {
+		slog.Warn("label transition log query failed", "error", err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sha, path, sLabel, sSrc, sSkip, inLabel, inSrc string
+		if err := rows.Scan(&sha, &path, &sLabel, &sSrc, &sSkip, &inLabel, &inSrc); err != nil {
+			slog.Warn("label transition scan failed", "error", err)
+			return
+		}
+		logLabelTransition(sha, path, sLabel, sSrc, sSkip, inLabel, inSrc)
+	}
+}
 
 func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inserted int64, needsAnalysis []string, err error) {
 	rows := make([][]any, len(samples))
@@ -966,6 +1029,8 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"_staging"}, insertBatchStagingCols, pgx.CopyFromRows(rows)); err != nil {
 		return 0, nil, fmt.Errorf("hopper: copy to staging: %w", err)
 	}
+
+	logLabelTransitionsPG(ctx, tx)
 
 	tag, err := tx.Exec(ctx, insertBatchStagingInsert)
 	if err != nil {
@@ -1416,6 +1481,18 @@ func (db *DB) badReviewPG(ctx context.Context, _, limit int) ([]*Sample, error) 
 		limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: bad review: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
+func (db *DB) conflictReviewPG(ctx context.Context, _, limit int) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE label = 'bad' AND skip = 'conflict' AND status = ''
+		 ORDER BY updated_at DESC LIMIT $1`,
+		limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: conflict review: %w", err)
 	}
 	return scanPGSamples(rows)
 }

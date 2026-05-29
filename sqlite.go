@@ -299,6 +299,10 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 			`ON samples(label, max_crit, suspicious_count) ` +
 			`WHERE label_source = 'marker' AND skip = 'misclassified' ` +
 			`AND cleave_result IS NOT NULL AND status = ''`,
+		// conflictReview
+		`CREATE INDEX IF NOT EXISTS idx_samples_conflict_review ` +
+			`ON samples(updated_at) ` +
+			`WHERE skip = 'conflict' AND status = ''`,
 		// CountAnalyzed
 		`CREATE INDEX IF NOT EXISTS idx_samples_litmus_done ` +
 			`ON samples(id) WHERE litmus_result IS NOT NULL`,
@@ -720,6 +724,69 @@ func jsonTextOrNil(b []byte) any {
 	return string(b)
 }
 
+// sampleConflictUpdateSQLite is the shared ON CONFLICT clause for top-level
+// re-observations, used by both the single-row (insertSampleNewSQLite) and
+// batch (insertSampleBatchSQLite) upserts so their resolution can't drift. It
+// is the SQLite twin of sampleConflictUpdatePG; see that constant for the
+// rule-by-rule explanation of the pool-precedence label resolution.
+const sampleConflictUpdateSQLite = `ON CONFLICT (sha256) DO UPDATE SET
+	label = CASE
+		WHEN excluded.label_source = 'marker' THEN excluded.label
+		WHEN samples.label_source = 'marker' THEN excluded.label
+		WHEN (samples.label = 'good' AND excluded.label = 'bad')
+		  OR (samples.label = 'bad' AND excluded.label = 'good') THEN 'bad'
+		WHEN (CASE excluded.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
+		   > (CASE samples.label  WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END) THEN excluded.label
+		ELSE samples.label
+	END,
+	label_source = CASE
+		WHEN excluded.label_source = 'marker' THEN 'marker'
+		WHEN samples.label_source = 'marker' THEN excluded.label_source
+		WHEN (samples.label = 'good' AND excluded.label = 'bad')
+		  OR (samples.label = 'bad' AND excluded.label = 'good') THEN 'conflict'
+		WHEN (CASE excluded.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
+		   > (CASE samples.label  WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END) THEN excluded.label_source
+		ELSE samples.label_source
+	END,
+	feed  = CASE WHEN excluded.feed  != '' THEN excluded.feed  ELSE samples.feed  END,
+	ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE samples.ecosystem END,
+	path  = CASE WHEN excluded.path  != ''   THEN excluded.path  ELSE samples.path  END,
+	mtime = CASE WHEN excluded.mtime IS NOT NULL THEN excluded.mtime ELSE samples.mtime END,
+	url     = CASE WHEN samples.url     = '' THEN excluded.url     ELSE samples.url     END,
+	domain  = CASE WHEN samples.domain  = '' THEN excluded.domain  ELSE samples.domain  END,
+	package    = CASE WHEN samples.package    = '' THEN excluded.package    ELSE samples.package    END,
+	version = CASE WHEN samples.version = '' THEN excluded.version ELSE samples.version END,
+	-- Label-related skips ('misclassified'/'conflict') track the resolution;
+	-- the walker also clears 'missing'/'unsupported'. Hard skips stick.
+	skip  = CASE
+		WHEN excluded.label_source = 'marker' THEN 'misclassified'
+		WHEN samples.label_source = 'marker' AND samples.skip = 'misclassified' THEN ''
+		WHEN ((samples.label = 'good' AND excluded.label = 'bad')
+		   OR (samples.label = 'bad' AND excluded.label = 'good'))
+		  AND samples.skip IN ('', 'misclassified', 'conflict', 'missing', 'unsupported') THEN 'conflict'
+		WHEN (CASE excluded.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
+		   > (CASE samples.label  WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
+		  AND samples.skip IN ('misclassified', 'conflict') THEN ''
+		WHEN samples.skip IN ('missing','unsupported') THEN ''
+		ELSE samples.skip
+	END
+WHERE excluded.parent = ''
+  AND ((excluded.path  != ''   AND samples.path  != excluded.path)
+    OR (excluded.mtime IS NOT NULL AND samples.mtime IS NOT excluded.mtime)
+    OR (excluded.feed != '' AND samples.feed != excluded.feed)
+    OR (excluded.ecosystem != '' AND samples.ecosystem != excluded.ecosystem)
+    OR (samples.url = '' AND excluded.url != '')
+    OR (samples.package = '' AND excluded.package != '')
+    OR samples.skip IN ('missing','unsupported')
+    -- Pool-precedence transitions must fire even when path/mtime are unchanged.
+    OR ((CASE excluded.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
+      > (CASE samples.label  WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END))
+    OR ((samples.label = 'good' AND excluded.label = 'bad')
+      OR (samples.label = 'bad' AND excluded.label = 'good'))
+    OR (excluded.label_source = 'marker'
+        AND (samples.label != excluded.label OR samples.label_source != 'marker' OR samples.skip != 'misclassified'))
+    OR (samples.label_source = 'marker' AND excluded.label_source != 'marker'))`
+
 func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error) {
 	tx, err := db.lite.BeginTx(ctx, nil)
 	if err != nil {
@@ -738,34 +805,7 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 			url, domain, package, version)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT (sha256) DO UPDATE SET
-			feed  = CASE WHEN excluded.feed  != '' THEN excluded.feed  ELSE samples.feed  END,
-			ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE samples.ecosystem END,
-			path  = CASE WHEN excluded.path  != ''   THEN excluded.path  ELSE samples.path  END,
-			mtime = CASE WHEN excluded.mtime IS NOT NULL THEN excluded.mtime ELSE samples.mtime END,
-			-- Provenance fields stick to first non-empty observation.
-			url     = CASE WHEN samples.url     = '' THEN excluded.url     ELSE samples.url     END,
-			domain  = CASE WHEN samples.domain  = '' THEN excluded.domain  ELSE samples.domain  END,
-			package    = CASE WHEN samples.package    = '' THEN excluded.package    ELSE samples.package    END,
-			version = CASE WHEN samples.version = '' THEN excluded.version ELSE samples.version END,
-			-- Walker re-observation clears 'missing'/'unsupported' skips so
-			-- a previously-hidden file (permission error) or previously-
-			-- unsupported type (cleave gained support) rejoins the queue.
-			-- Other skip reasons (corrupt/encrypted/replaced/misclassified)
-			-- are sticky.
-			skip  = CASE WHEN samples.skip IN ('missing','unsupported') THEN '' ELSE samples.skip END
-			-- Only walker writes (parent='') may update samples.path / mtime.
-			-- Explode writes (parent=<archive-sha>) must not clobber a top-
-			-- level row's path: content-collision between a top-level file
-			-- and an archive member would otherwise orphan the samples row.
-			WHERE excluded.parent = ''
-			  AND ((excluded.path  != ''   AND samples.path  != excluded.path)
-			    OR (excluded.mtime IS NOT NULL AND samples.mtime IS NOT excluded.mtime)
-			    OR (excluded.feed != '' AND samples.feed != excluded.feed)
-			    OR (excluded.ecosystem != '' AND samples.ecosystem != excluded.ecosystem)
-			    OR (samples.url = '' AND excluded.url != '')
-			    OR (samples.package = '' AND excluded.package != '')
-			    OR samples.skip IN ('missing','unsupported'))`,
+		`+sampleConflictUpdateSQLite,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.SHA256, s.Parent, s.Skip, s.Elements,
@@ -805,6 +845,60 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 	return n > 0, nil
 }
 
+// logLabelTransitionsSQLite logs each top-level re-observation in the batch
+// whose label resolution will change under sampleConflictUpdateSQLite. It reads
+// the pre-upsert state inside the same transaction so the comparison is
+// accurate. Best-effort: a query error is logged and ignored rather than
+// failing the batch, since the upsert is authoritative.
+func logLabelTransitionsSQLite(ctx context.Context, tx *sql.Tx, samples []*Sample) {
+	incoming := make(map[string]*Sample, len(samples))
+	shas := make([]string, 0, len(samples))
+	for _, s := range samples {
+		if s.Parent != "" || s.SHA256 == "" {
+			continue
+		}
+		if _, ok := incoming[s.SHA256]; ok {
+			continue
+		}
+		incoming[s.SHA256] = s
+		shas = append(shas, s.SHA256)
+	}
+	const chunk = 500 // stay under SQLite's default bind-variable limit
+	for start := 0; start < len(shas); start += chunk {
+		if err := logLabelTransitionChunkSQLite(ctx, tx, shas[start:min(start+chunk, len(shas))], incoming); err != nil {
+			slog.Warn("label transition log failed", "error", err)
+			return
+		}
+	}
+}
+
+func logLabelTransitionChunkSQLite(ctx context.Context, tx *sql.Tx, shas []string, incoming map[string]*Sample) error {
+	placeholders := make([]string, len(shas))
+	args := make([]any, len(shas))
+	for i, sha := range shas {
+		placeholders[i] = "?"
+		args[i] = sha
+	}
+	//nolint:gosec // placeholders are '?' bind markers; sha values are parameterized via args.
+	q := `SELECT sha256, label, label_source, skip FROM samples WHERE parent = '' AND sha256 IN (` +
+		strings.Join(placeholders, ",") + `)`
+	rows, err := tx.QueryContext(ctx, q, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close() //nolint:errcheck // best-effort cleanup
+	for rows.Next() {
+		var sha, sLabel, sSrc, sSkip string
+		if err := rows.Scan(&sha, &sLabel, &sSrc, &sSkip); err != nil {
+			return err
+		}
+		if s, ok := incoming[sha]; ok {
+			logLabelTransition(sha, s.Path, sLabel, sSrc, sSkip, s.Label, s.LabelSource)
+		}
+	}
+	return rows.Err()
+}
+
 func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (inserted int64, needsAnalysis []string, err error) {
 	tx, err := db.lite.BeginTx(ctx, nil)
 	if err != nil {
@@ -828,28 +922,7 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		`
 		INSERT INTO samples (%s)
 		VALUES (%s)
-		ON CONFLICT (sha256) DO UPDATE SET
-			feed  = CASE WHEN excluded.feed  != '' THEN excluded.feed  ELSE samples.feed  END,
-			ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE samples.ecosystem END,
-			path  = CASE WHEN excluded.path  != ''   THEN excluded.path  ELSE samples.path  END,
-			mtime = CASE WHEN excluded.mtime IS NOT NULL THEN excluded.mtime ELSE samples.mtime END,
-			url     = CASE WHEN samples.url     = '' THEN excluded.url     ELSE samples.url     END,
-			domain  = CASE WHEN samples.domain  = '' THEN excluded.domain  ELSE samples.domain  END,
-			package    = CASE WHEN samples.package    = '' THEN excluded.package    ELSE samples.package    END,
-			version = CASE WHEN samples.version = '' THEN excluded.version ELSE samples.version END,
-			-- Walker re-observation clears 'missing'/'unsupported' skips.
-			-- See insertSampleNewSQLite for the rationale.
-			skip  = CASE WHEN samples.skip IN ('missing','unsupported') THEN '' ELSE samples.skip END
-			-- Explode writes (parent<>'') must not clobber a top-level
-			-- row's path on content-hash collision. See the PG version.
-			WHERE excluded.parent = ''
-			  AND ((excluded.path  != ''   AND samples.path  != excluded.path)
-			    OR (excluded.mtime IS NOT NULL AND samples.mtime IS NOT excluded.mtime)
-			    OR (excluded.feed != '' AND samples.feed != excluded.feed)
-			    OR (excluded.ecosystem != '' AND samples.ecosystem != excluded.ecosystem)
-			    OR (samples.url = '' AND excluded.url != '')
-			    OR (samples.package = '' AND excluded.package != '')
-			    OR samples.skip IN ('missing','unsupported'))`,
+		`+sampleConflictUpdateSQLite,
 		strings.Join(cols, ", "),
 		strings.Join(placeholders, ", "))
 
@@ -873,6 +946,8 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		return 0, nil, fmt.Errorf("hopper: prepare location upsert: %w", err)
 	}
 	defer locStmt.Close() //nolint:errcheck // best-effort cleanup
+
+	logLabelTransitionsSQLite(ctx, tx, samples)
 
 	for _, s := range samples {
 		firstAnalyzedAt := s.FirstAnalyzedAt
@@ -1345,6 +1420,18 @@ func (db *DB) badReviewSQLite(ctx context.Context, _, limit int) ([]*Sample, err
 		limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: bad review: %w", err)
+	}
+	return scanLiteSamples(rows)
+}
+
+func (db *DB) conflictReviewSQLite(ctx context.Context, _, limit int) ([]*Sample, error) {
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleCols+` FROM samples
+		 WHERE label = 'bad' AND skip = 'conflict' AND status = ''
+		 ORDER BY updated_at DESC LIMIT ?`,
+		limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: conflict review: %w", err)
 	}
 	return scanLiteSamples(rows)
 }
