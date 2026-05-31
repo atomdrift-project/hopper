@@ -151,10 +151,20 @@ SQL
 fi
 
 # --- Schema via hopper init (idempotent; uses migration tracking) ---------
-if [ -x ./hopper ]; then
+# init applies the schema migrations the subscriber needs to match the
+# publisher (the schema-parity gate below depends on this being current). A
+# STALE binary silently skips migrations added after it was built, leaving the
+# replica missing columns the publisher sends — the exact failure that wedges
+# the subscription. The Makefile passes HOPPER as the just-built binary so
+# `make replica` always inits with current migrations; honor it first, and
+# warn loudly if we fall back to a possibly-stale `hopper` on PATH.
+if [ -n "${HOPPER:-}" ]; then
+    [ -x "$HOPPER" ] || die "HOPPER='$HOPPER' is not an executable — run 'make build'"
+elif [ -x ./hopper ]; then
     HOPPER=./hopper
 elif command -v hopper >/dev/null 2>&1; then
     HOPPER=hopper
+    log "warning: using 'hopper' from PATH ($(command -v hopper)) — if it predates a schema migration, init will silently skip it. Prefer 'make replica' (rebuilds first)."
 else
     die "hopper binary not found — run 'make build' first"
 fi
@@ -252,6 +262,47 @@ BEGIN
     END IF;
 END \$$;
 SQL
+
+# --- Schema parity gate ----------------------------------------------------
+# A logical subscriber must have every column the publisher replicates. If it
+# doesn't, the tablesync/apply worker dies on startup with "missing replicated
+# column" and the launcher restarts it forever — a crash loop that pins the
+# publisher's replication slot and retains WAL on the master without bound
+# (it never advances restart_lsn because the initial copy never commits).
+# 'hopper init' above is meant to bring the local schema current, but a stale
+# hopper binary — one built before a newer column's migration was added —
+# silently skips that migration and leaves the gap. Detect it here, before we
+# create/refresh the subscription, instead of discovering it later as a wedged
+# replica that's quietly eating the master's disk.
+#
+# Published column set: pg_publication_tables.attnames lists exactly the
+# columns the publisher sends (all of them when the publication has no column
+# list, as ours doesn't). We require the local table to be a superset.
+log "Verifying local public.samples covers every column the publisher replicates"
+published_cols=$(psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" -tAc \
+    "SELECT unnest(attnames) FROM pg_publication_tables
+      WHERE pubname = '$PUBLICATION' AND schemaname = 'public' AND tablename = 'samples'" \
+    2>/dev/null | sort -u)
+[ -n "$published_cols" ] || die "publisher reports no published columns for public.samples under '$PUBLICATION' — publication missing or unreachable"
+local_cols=$(admin -d "$LOCAL_DB" -tAc \
+    "SELECT column_name FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'samples'" | sort -u)
+[ -n "$local_cols" ] || die "local public.samples has no columns (table missing?) — run 'hopper init' first"
+# Set subtraction "published minus local": grep -F reads each line of $local_cols
+# as a fixed, whole-line (-x) pattern, and -v prints the published columns that
+# match none of them. Done as a single set op rather than a shell for-loop —
+# word-splitting $published_cols is IFS-dependent and brittle. (|| true: grep
+# exits 1 when nothing is missing, which is the good case and must not trip
+# 'set -e'.)
+missing=$(printf '%s\n' "$published_cols" | grep -vxF "$local_cols" || true)
+if [ -n "$missing" ]; then
+    die "local public.samples is missing column(s) the publisher replicates: $(printf '%s' "$missing" | tr '\n' ' ')
+       The local schema is behind the publisher — the hopper binary that ran
+       'init' is likely stale (built before these columns' migrations existed).
+       Rebuild it and re-run:  make build && make replica
+       Skipping CREATE/REFRESH SUBSCRIPTION: subscribing now would crash-loop
+       the apply worker and retain WAL on the publisher without bound."
+fi
 
 # --- Subscription ----------------------------------------------------------
 # We keep the password out of argv by passing it through psql's -v mechanism

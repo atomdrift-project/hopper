@@ -541,7 +541,19 @@ func (db *DB) workflowSamplesSQLite(ctx context.Context, where string, limit int
 			created_at, updated_at, analyzed_at, COALESCE(first_analyzed_at, analyzed_at),
 			cleave_result IS NOT NULL,
 			litmus_result IS NOT NULL,
-			COALESCE(CAST(json_extract(litmus_result, '$.class') AS INTEGER), 0)
+			-- Criticality: legacy records carried 'class' directly
+			-- (0=benign, 1=suspicious, 2=hostile); v2 dropped class and uses
+			-- 'l' as the verdict-carrier (non-null → hostile, null → benign).
+			-- Try class first, fall back to l-derived.
+			COALESCE(
+				CAST(json_extract(litmus_result, '$.class') AS INTEGER),
+				CASE
+					WHEN litmus_result IS NULL THEN 0
+					WHEN json_extract(litmus_result, '$.l') IS NULL THEN 0
+					WHEN CAST(json_extract(litmus_result, '$.l') AS INTEGER) < 0 THEN 0
+					ELSE 2
+				END
+			)
 		FROM samples `+where, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: workflow samples: %w", err)
@@ -2252,7 +2264,16 @@ func (q *FeedQuery) whereSQLite() (where string, args []any) {
 			placeholders[i] = "?"
 			args = append(args, q.LitmusClasses[i])
 		}
-		clauses = append(clauses, "json_extract(litmus_result, '$.class') IN ("+strings.Join(placeholders, ", ")+")")
+		// Match either schema: legacy `class` field, or v2 `l`-derived
+		// (l >= 0 → hostile/2, l == -1 or absent → benign/0). Suspicious/1
+		// doesn't exist in v2 records, so a class=1 filter only matches
+		// legacy rows.
+		clauses = append(clauses,
+			"COALESCE(CAST(json_extract(litmus_result, '$.class') AS INTEGER), "+
+				"CASE WHEN litmus_result IS NULL THEN 0 "+
+				"WHEN json_extract(litmus_result, '$.l') IS NULL THEN 0 "+
+				"WHEN CAST(json_extract(litmus_result, '$.l') AS INTEGER) < 0 THEN 0 ELSE 2 END) "+
+				"IN ("+strings.Join(placeholders, ", ")+")")
 	}
 	if q.RequireLitmus {
 		clauses = append(clauses, "litmus_result IS NOT NULL")

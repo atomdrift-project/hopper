@@ -1,4 +1,4 @@
-.PHONY: build test clean deploy rollout-bastille rollout-replica-bastille replica diagnose-replica promote-replica help
+.PHONY: build test clean deploy rollout-bastille rollout-replica-bastille replica rebuild-replica diagnose-replica promote-replica help
 
 DATA_DIR  ?= /data/samples
 DB        ?= postgres://hopper@hopper-db/hopper?sslmode=disable
@@ -19,6 +19,8 @@ help:
 	@echo "                              (RUN=hopper-replica REMOTE_HOST=hopper-db SUBSCRIPTION=...)"
 	@echo "  make replica                Configure local postgres as a logical replica of the"
 	@echo "                              upstream hopper DB (idempotent; reads ~/.pgpass)"
+	@echo "  make rebuild-replica        Tear down a wedged replica (invalidated slot) and"
+	@echo "                              rebuild from scratch — TRUNCATEs + full re-copy (FORCE=true)"
 	@echo "  make diagnose-replica       Dump replication status from both sides (read-only)"
 	@echo "  make promote-replica        Turn the local replica into a standalone primary"
 	@echo "                              (writes must already be stopped; idempotent)"
@@ -48,7 +50,10 @@ rollout-replica-bastille:
 	@./scripts/replica/freebsd-bastille.sh "$(RUN)"
 
 replica: build
-	@./scripts/replica/setup.sh
+	@HOPPER='$(CURDIR)/hopper' ./scripts/replica/setup.sh
+
+rebuild-replica: build
+	@HOPPER='$(CURDIR)/hopper' ./scripts/replica/rebuild.sh
 
 diagnose-replica:
 	@./scripts/replica/diagnose.sh

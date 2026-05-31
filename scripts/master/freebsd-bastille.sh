@@ -214,6 +214,26 @@ ALTER SYSTEM SET synchronous_commit         = 'off';
 -- Logical replication: required for CREATE PUBLICATION so that replica
 -- machines can subscribe for a real-time local replica of the samples table.
 ALTER SYSTEM SET wal_level                  = 'logical';
+-- Bound per-slot WAL retention so a stuck/slow subscriber can't fill the
+-- master's disk. An inactive or far-behind replication slot otherwise retains
+-- WAL without limit (the default, -1); a replica that wedges during its
+-- initial copy — e.g. blocked behind a long transaction, or crash-looping on
+-- a schema mismatch — will then grow the master's pg_wal until the volume
+-- fills and the WHOLE primary goes down. With this set, Postgres instead
+-- invalidates the offending slot once it exceeds the cap, protecting the
+-- master at the cost of forcing that one replica to rebuild.
+--
+-- TRADE-OFF — tune to this host's disk: the value must exceed the WAL
+-- generated on the master during a full initial copy of `samples` under peak
+-- write load, or legitimate in-progress rebuilds get their slot invalidated
+-- mid-copy and can never finish (the exact 'wal_removed' failure that forces a
+-- rebuild). A full ~233 GB copy at ~5 MB/s takes ~13 h, during which the slot
+-- retains WAL at the master's write rate (~5 MB/s) — projected peak ~400 GB.
+-- 600 GB leaves headroom above that; raise it if rebuilds get invalidated,
+-- lower it if pg_wal threatens the disk. Size against free space on the pg_wal
+-- volume. (Reload to apply: ALTER SYSTEM only writes postgresql.auto.conf —
+-- run SELECT pg_reload_conf(); afterward; no restart needed.)
+ALTER SYSTEM SET max_slot_wal_keep_size      = '600GB';
 SELECT pg_reload_conf();
 SQLEOF
 

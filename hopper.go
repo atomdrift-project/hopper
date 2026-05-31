@@ -674,7 +674,11 @@ func litmusResultForMember(parent []byte, id int) []byte {
 	}
 
 	out := make(map[string]json.RawMessage, len(member)+4)
-	for _, key := range []string{"v", "version", "thresholds", "threshold", "level", "analyzed_at"} {
+	// Pass through envelope-level metadata that applies to every member.
+	// `l` is the per-100M severity level (litmus v2 schema). For older
+	// litmus outputs we also carry `level`/`threshold`/`thresholds` so
+	// already-stored results stay readable; these are no-ops on v2 envelopes.
+	for _, key := range []string{"v", "version", "thresholds", "threshold", "level", "l", "analyzed_at"} {
 		if v := envelope[key]; len(v) != 0 {
 			out[key] = v
 		}

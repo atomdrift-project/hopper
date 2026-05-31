@@ -753,7 +753,20 @@ func (db *DB) workflowSamplesPG(ctx context.Context, where string, limit int) ([
 			created_at, updated_at, analyzed_at, COALESCE(first_analyzed_at, analyzed_at),
 			cleave_result IS NOT NULL,
 			litmus_result IS NOT NULL,
-			COALESCE((litmus_result->>'class')::int, 0)
+			-- Criticality: legacy records (v4/v5) carried class directly
+			-- (0=benign, 1=suspicious, 2=hostile); v2 drops class and uses
+			-- the l field as the verdict-carrier (non-null hostile, null
+			-- benign). Try class first, fall back to l-derived so both
+			-- schemas coexist in the DB during the migration window.
+			COALESCE(
+				(litmus_result->>'class')::int,
+				CASE
+					WHEN litmus_result IS NULL THEN 0
+					WHEN litmus_result->>'l' IS NULL THEN 0
+					WHEN (litmus_result->>'l')::int < 0 THEN 0
+					ELSE 2
+				END
+			)
 		FROM samples `+where, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: workflow samples: %w", err)
@@ -2270,7 +2283,18 @@ func (db *DB) feedSamplesPG(ctx context.Context, q FeedQuery) ([]*Sample, error)
 			AND cleave_result IS NOT NULL
 			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
 			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
-			AND (coalesce(cardinality($5::int[]), 0) = 0 OR (litmus_result->>'class')::int = ANY($5))
+			AND (coalesce(cardinality($5::int[]), 0) = 0 OR
+				-- Match either schema: legacy class field, or v2 l-derived
+				-- (l non-null → hostile/2, l null → benign/0; suspicious/1
+				-- doesn't exist in v2, so the v2 branch can only match 0 or 2).
+				COALESCE(
+					(litmus_result->>'class')::int,
+					CASE
+						WHEN litmus_result IS NULL THEN 0
+						WHEN litmus_result->>'l' IS NULL THEN 0
+						ELSE 2
+					END
+				) = ANY($5))
 			AND (NOT $6 OR parent = '')
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
@@ -2293,7 +2317,18 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q FeedQuery) (int, error) 
 			AND cleave_result IS NOT NULL
 			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
 			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
-			AND (coalesce(cardinality($5::int[]), 0) = 0 OR (litmus_result->>'class')::int = ANY($5))
+			AND (coalesce(cardinality($5::int[]), 0) = 0 OR
+				-- Match either schema: legacy class field, or v2 l-derived
+				-- (l non-null → hostile/2, l null → benign/0; suspicious/1
+				-- doesn't exist in v2, so the v2 branch can only match 0 or 2).
+				COALESCE(
+					(litmus_result->>'class')::int,
+					CASE
+						WHEN litmus_result IS NULL THEN 0
+						WHEN litmus_result->>'l' IS NULL THEN 0
+						ELSE 2
+					END
+				) = ANY($5))
 			AND (NOT $6 OR parent = '')
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
