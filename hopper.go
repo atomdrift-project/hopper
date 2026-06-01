@@ -37,6 +37,15 @@ import (
 
 const skipBenignArchiveItem = "skip-benign-archive-item"
 
+// CriticalLevel is hopper's consumer-side cutoff between hostile and suspicious
+// when deriving criticality from a v6 litmus envelope's `ml.l`. `l <= CriticalLevel`
+// is hostile (fires at or below our critical line); `l > CriticalLevel` is
+// suspicious (fired only at noisier operating points); `-1` is benign; `null`
+// (manual-mode hostile) is hostile. Mirrors DefaultSeverityLevel in collimator,
+// litmus, autocollie, prism, and promoter — see
+// collimator/src/collimator/thresholds/__init__.py for the cross-repo group.
+const CriticalLevel = 4
+
 // Pool labels, ordered by precedence: bad > good > unknown.
 const (
 	labelUnknown = "unknown"

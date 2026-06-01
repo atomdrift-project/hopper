@@ -536,25 +536,28 @@ func (db *DB) workflowOldestPendingSQLite(ctx context.Context, limit int) ([]Wor
 }
 
 func (db *DB) workflowSamplesSQLite(ctx context.Context, where string, limit int) ([]WorkflowSample, error) {
-	rows, err := db.lite.QueryContext(ctx, `
+	rows, err := db.lite.QueryContext(ctx, fmt.Sprintf(`
 		SELECT sha256, source, feed, ecosystem, filename, path,
 			created_at, updated_at, analyzed_at, COALESCE(first_analyzed_at, analyzed_at),
 			cleave_result IS NOT NULL,
 			litmus_result IS NOT NULL,
-			-- Criticality: legacy records carried 'class' directly
-			-- (0=benign, 1=suspicious, 2=hostile); v2 dropped class and uses
-			-- 'l' as the verdict-carrier (non-null → hostile, null → benign).
-			-- Try class first, fall back to l-derived.
+			-- Criticality (0=benign, 1=suspicious, 2=hostile): legacy records
+			-- carried 'class' directly; v2 dropped it for 'l' (the strictest
+			-- grid level at which the file fires, or -1 for never-fires).
+			-- Try class first; otherwise derive from l using CriticalLevel %d
+			-- as the hostile/suspicious cutoff (l == null means manual-mode
+			-- hostile and is treated as hostile fail-safe).
 			COALESCE(
 				CAST(json_extract(litmus_result, '$.class') AS INTEGER),
 				CASE
 					WHEN litmus_result IS NULL THEN 0
-					WHEN json_extract(litmus_result, '$.l') IS NULL THEN 0
+					WHEN json_extract(litmus_result, '$.l') IS NULL THEN 2
 					WHEN CAST(json_extract(litmus_result, '$.l') AS INTEGER) < 0 THEN 0
-					ELSE 2
+					WHEN CAST(json_extract(litmus_result, '$.l') AS INTEGER) <= %d THEN 2
+					ELSE 1
 				END
 			)
-		FROM samples `+where, limit)
+		FROM samples `+where, CriticalLevel, CriticalLevel), limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: workflow samples: %w", err)
 	}

@@ -748,26 +748,28 @@ func (db *DB) workflowOldestPendingPG(ctx context.Context, limit int) ([]Workflo
 }
 
 func (db *DB) workflowSamplesPG(ctx context.Context, where string, limit int) ([]WorkflowSample, error) {
-	rows, err := db.pool.Query(ctx, `
+	rows, err := db.pool.Query(ctx, fmt.Sprintf(`
 		SELECT sha256, source, feed, ecosystem, filename, path,
 			created_at, updated_at, analyzed_at, COALESCE(first_analyzed_at, analyzed_at),
 			cleave_result IS NOT NULL,
 			litmus_result IS NOT NULL,
-			-- Criticality: legacy records (v4/v5) carried class directly
-			-- (0=benign, 1=suspicious, 2=hostile); v2 drops class and uses
-			-- the l field as the verdict-carrier (non-null hostile, null
-			-- benign). Try class first, fall back to l-derived so both
-			-- schemas coexist in the DB during the migration window.
+			-- Criticality (0=benign, 1=suspicious, 2=hostile): legacy records
+			-- (v4/v5) carried class directly; v2 drops it for l (the strictest
+			-- grid level at which the file fires, or -1 for never-fires). Try
+			-- class first; otherwise derive from l using CriticalLevel %d as
+			-- the hostile/suspicious cutoff (l == null is manual-mode hostile,
+			-- treated as hostile fail-safe).
 			COALESCE(
 				(litmus_result->>'class')::int,
 				CASE
 					WHEN litmus_result IS NULL THEN 0
-					WHEN litmus_result->>'l' IS NULL THEN 0
+					WHEN litmus_result->>'l' IS NULL THEN 2
 					WHEN (litmus_result->>'l')::int < 0 THEN 0
-					ELSE 2
+					WHEN (litmus_result->>'l')::int <= %d THEN 2
+					ELSE 1
 				END
 			)
-		FROM samples `+where, limit)
+		FROM samples `+where, CriticalLevel, CriticalLevel), limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: workflow samples: %w", err)
 	}
