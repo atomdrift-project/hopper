@@ -28,6 +28,10 @@ const (
 	restartRecoveryDelay = 15 * time.Second
 	litmusTmpSentinel    = ".hopper-litmus-managed"
 	livenessTimeout      = 25 * time.Minute
+	// wedgeDumpDelay is how long the liveness watchdog waits after sending
+	// SIGUSR1 (which makes litmus dump every thread's backtrace to its log)
+	// before SIGKILLing a wedged worker, so the dump has time to flush.
+	wedgeDumpDelay = 10 * time.Second
 )
 
 type litmusServer struct {
@@ -40,6 +44,7 @@ type litmusServer struct {
 	workerName string                 // qualified name used to look up in tracker
 	tmpDir     string
 	pid        atomic.Int64
+	spawnedAt  atomic.Int64 // UnixNano when the current process started; 0 if none
 	restarts   atomic.Int64
 	mu         sync.Mutex
 	maxRSSGB   int
@@ -161,6 +166,18 @@ func killGroup(reason string, pid int, sig syscall.Signal, attrs ...any) {
 
 func (s *litmusServer) currentPID() int {
 	return int(s.pid.Load())
+}
+
+// spawnTime reports when the current litmus process started, or the zero
+// time if none is running. The watchdog treats a fresh start as activity so
+// a just-restarted process is never judged by the previous process's
+// heartbeat.
+func (s *litmusServer) spawnTime() time.Time {
+	ns := s.spawnedAt.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
 }
 
 func (s *litmusServer) ensureTmpDirLocked() (string, error) {
@@ -367,6 +384,9 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 		return fmt.Errorf("start litmus: %w", err)
 	}
 	s.cmd = cmd
+	// Stamp the spawn time before publishing the pid so the watchdog never
+	// pairs a fresh pid with a previous process's spawn time.
+	s.spawnedAt.Store(time.Now().UnixNano())
 	s.pid.Store(int64(cmd.Process.Pid))
 
 	//nolint:gosec // values are sanitized or derived locally; this is a false positive on structured slog fields.
@@ -381,6 +401,7 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 		closeLogFile(logFile.Name(), logFile)
 		s.cmd = nil
 		s.pid.Store(0)
+		s.spawnedAt.Store(0)
 		return errors.New("litmus worker exited immediately")
 	}
 
@@ -535,26 +556,49 @@ func (s *litmusServer) livenessWatchdog(ctx context.Context) {
 		if s.stopped.Load() || s.building.Load() {
 			continue
 		}
-		lastSeen := s.tracker.lastSeen(s.workerName)
-		if lastSeen.IsZero() {
-			continue // worker hasn't registered yet (still starting up)
+		pid := s.currentPID()
+		if pid == 0 {
+			continue // no process running (between restarts)
 		}
-		idle := time.Since(lastSeen)
+		// Count a fresh (re)start as activity: a just-spawned process must
+		// be given the full liveness window to load its model and start
+		// polling, rather than being judged by the previous process's
+		// heartbeat — which never advances until the new process checks in
+		// and would otherwise kill it on sight, wedging the restart loop.
+		ref := s.tracker.lastSeen(s.workerName)
+		if started := s.spawnTime(); started.After(ref) {
+			ref = started
+		}
+		if ref.IsZero() {
+			continue // nothing has started yet
+		}
+		idle := time.Since(ref)
 		if idle <= livenessTimeout {
 			continue
 		}
-		pid := s.currentPID()
-		if pid == 0 {
-			continue
-		}
-		slog.Warn("local litmus worker appears wedged, killing process",
+		// Ask litmus to dump every thread's backtrace (SIGUSR1, handled in
+		// litmus/src/main.rs) into its log so the wedge is diagnosable, give
+		// it a moment to flush, then SIGKILL the whole group. Signal the
+		// process directly, not the group: only litmus handles SIGUSR1, and
+		// the default disposition would terminate its rizin/yara children.
+		slog.Warn("local litmus worker appears wedged, dumping backtrace then killing",
 			"worker", s.workerName,
-			"last_seen", lastSeen.Format(time.RFC3339),
+			"last_seen", s.tracker.lastSeen(s.workerName).Format(time.RFC3339),
 			"idle", idle.Round(time.Second),
 			"pid", pid)
+		if err := syscall.Kill(pid, syscall.SIGUSR1); err != nil && !errors.Is(err, syscall.ESRCH) {
+			slog.Warn("failed to signal wedged litmus for backtrace", "pid", pid, "error", err)
+		}
+		select {
+		case <-time.After(wedgeDumpDelay):
+		case <-ctx.Done():
+			return
+		}
 		s.mu.Lock()
-		if s.cmd != nil && s.cmd.Process != nil {
-			killGroup("failed to kill wedged litmus group", s.cmd.Process.Pid, syscall.SIGKILL,
+		// Guard against the process having been replaced during the dump
+		// window (e.g. a concurrent rebuild) so we never kill a newer pid.
+		if s.cmd != nil && s.cmd.Process != nil && s.cmd.Process.Pid == pid {
+			killGroup("failed to kill wedged litmus group", pid, syscall.SIGKILL,
 				"worker", s.workerName)
 		}
 		s.mu.Unlock()
