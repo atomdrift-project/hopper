@@ -197,6 +197,8 @@ Environment=PATH=${TOOLS_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
 # OTLP receiver. Override OTEL_EXPORTER_OTLP_<SIGNAL>_ENDPOINT to send
 # a single signal somewhere else (e.g. traces → Tempo).
 Environment=OTEL_EXPORTER_OTLP_ENDPOINT=http://otel:9090/api/v1/otlp
+# Logs are handled by Loki; send them to its OTLP endpoint (used verbatim).
+Environment=OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://otel:3100/otlp/v1/logs
 
 # Resource caps — hopper + litmus children combined.
 MemoryHigh=64G

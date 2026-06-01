@@ -392,7 +392,7 @@ load_rc_config $name
 pidfile="/var/run/${name}.pid"
 hopper_log="/var/log/${name}.log"
 command="/usr/sbin/daemon"
-command_args="-c -f -P ${pidfile} -S -R 5 -o ${hopper_log} -u hopper /usr/bin/env DATABASE_URL=${hopper_db} OTEL_EXPORTER_OTLP_ENDPOINT=http://otel:9090/api/v1/otlp /usr/local/bin/hopper serve --port 5433"
+command_args="-c -f -P ${pidfile} -S -R 5 -o ${hopper_log} -u hopper /usr/bin/env DATABASE_URL=${hopper_db} OTEL_EXPORTER_OTLP_ENDPOINT=http://otel:9090/api/v1/otlp OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://otel:3100/otlp/v1/logs /usr/local/bin/hopper serve --port 5433"
 
 run_rc_command "$1"
 RCEOF
