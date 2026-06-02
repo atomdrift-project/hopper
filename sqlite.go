@@ -396,6 +396,28 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		return fmt.Errorf("hopper: migrate sqlite hopper_kv: %w", err)
 	}
 
+	// label_events: append-only audit of every label/skip transition applied
+	// by pool reconciliation. Lets a data scientist reconstruct a sample's
+	// ground-truth at a point in time and audit demote/conflict/missing
+	// decisions; never read on the hot path.
+	for _, ddl := range []string{
+		`CREATE TABLE IF NOT EXISTS label_events (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			sha256      TEXT NOT NULL,
+			from_label  TEXT NOT NULL DEFAULT '',
+			to_label    TEXT NOT NULL DEFAULT '',
+			from_skip   TEXT NOT NULL DEFAULT '',
+			to_skip     TEXT NOT NULL DEFAULT '',
+			reason      TEXT NOT NULL,
+			observed_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_label_events_sha ON label_events(sha256, observed_at)`,
+	} {
+		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite label_events: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -2091,6 +2113,240 @@ func (db *DB) setSkipSQLite(ctx context.Context, sha256, skip string) error {
 		return fmt.Errorf("hopper: set skip: %w", err)
 	}
 	return nil
+}
+
+func (db *DB) touchLocationsSQLite(ctx context.Context, keys []SampleLocationKey) error {
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("hopper: begin touch: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
+	stmt, err := tx.PrepareContext(ctx,
+		`UPDATE sample_locations SET last_seen_at = strftime('%Y-%m-%dT%H:%M:%f', 'now')
+		 WHERE sha256 = ? AND path = ?`)
+	if err != nil {
+		return fmt.Errorf("hopper: prepare touch: %w", err)
+	}
+	defer stmt.Close() //nolint:errcheck // best-effort cleanup
+	for _, k := range keys {
+		if _, err := stmt.ExecContext(ctx, k.SHA256, k.Path); err != nil {
+			return fmt.Errorf("hopper: touch location %s: %w", k.SHA256, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("hopper: commit touch: %w", err)
+	}
+	return nil
+}
+
+// liteWalkCutoff formats walkStart for comparison against sample_locations
+// last_seen_at, which is written by strftime('%Y-%m-%dT%H:%M:%f','now'). A one
+// second slack avoids excluding a file touched at the very start of the walk.
+func liteWalkCutoff(walkStart time.Time) string {
+	return walkStart.Add(-time.Second).UTC().Format("2006-01-02T15:04:05.000")
+}
+
+func (db *DB) relabelFromPoolsSQLite(ctx context.Context, walkStart time.Time) (int64, error) {
+	cutoff := liteWalkCutoff(walkStart)
+	ts := now()
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: begin relabel: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
+
+	// Materialize the rows whose label/skip should change: top-level, non-marker
+	// samples joined to the pools their standalone copies were seen in this walk.
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS _relabel (
+		sha256 TEXT PRIMARY KEY, old_label TEXT, old_skip TEXT,
+		new_label TEXT, new_skip TEXT, new_source TEXT)`); err != nil {
+		return 0, fmt.Errorf("hopper: relabel temp: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM _relabel`); err != nil {
+		return 0, fmt.Errorf("hopper: relabel clear: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO _relabel
+		WITH pools AS (
+			SELECT sha256,
+				MAX(path LIKE 'bad/%')  AS in_bad,
+				MAX(path LIKE 'good/%') AS in_good,
+				MAX(source)             AS src
+			FROM sample_locations
+			WHERE parent_sha256 = '' AND last_seen_at >= ?
+			GROUP BY sha256
+		)
+		SELECT s.sha256, s.label, s.skip,
+			CASE WHEN p.in_bad = 1 THEN 'bad'
+			     WHEN p.in_good = 1 THEN 'good'
+			     ELSE s.label END,
+			CASE WHEN p.in_bad = 1 AND p.in_good = 1 THEN 'conflict'
+			     WHEN s.skip IN ('conflict', 'missing', 'unsupported') THEN ''
+			     ELSE s.skip END,
+			CASE WHEN p.in_bad = 1 AND p.in_good = 1 THEN 'conflict'
+			     ELSE p.src END
+		FROM samples s JOIN pools p ON p.sha256 = s.sha256
+		WHERE s.parent = '' AND s.label_source <> 'marker'`, cutoff); err != nil {
+		return 0, fmt.Errorf("hopper: relabel stage: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM _relabel WHERE new_label = old_label AND new_skip = old_skip`); err != nil {
+		return 0, fmt.Errorf("hopper: relabel prune: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
+		SELECT sha256, old_label, new_label, old_skip, new_skip,
+			CASE WHEN new_skip = 'conflict' THEN 'conflict' ELSE 'relabel' END, ?
+		FROM _relabel`, ts); err != nil {
+		return 0, fmt.Errorf("hopper: relabel audit: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE samples SET
+			label = (SELECT new_label FROM _relabel r WHERE r.sha256 = samples.sha256),
+			skip = (SELECT new_skip FROM _relabel r WHERE r.sha256 = samples.sha256),
+			label_source = (SELECT new_source FROM _relabel r WHERE r.sha256 = samples.sha256),
+			updated_at = ?
+		WHERE sha256 IN (SELECT sha256 FROM _relabel)`, ts)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: relabel apply: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("hopper: commit relabel: %w", err)
+	}
+	return n, nil
+}
+
+func (db *DB) staleStandaloneSamplesSQLite(ctx context.Context, walkStart time.Time) ([]SampleLocationKey, int64, error) {
+	cutoff := liteWalkCutoff(walkStart)
+	var eligible int64
+	if err := db.lite.QueryRowContext(ctx,
+		`SELECT count(*) FROM samples WHERE parent = '' AND skip IN ('', 'conflict')`).Scan(&eligible); err != nil {
+		return nil, 0, fmt.Errorf("hopper: stale count: %w", err)
+	}
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT s.sha256, s.path FROM samples s
+		WHERE s.parent = '' AND s.skip IN ('', 'conflict')
+		  AND NOT EXISTS (
+			SELECT 1 FROM sample_locations sl
+			 WHERE sl.sha256 = s.sha256 AND sl.parent_sha256 = '' AND sl.last_seen_at >= ?)`, cutoff)
+	if err != nil {
+		return nil, 0, fmt.Errorf("hopper: stale scan: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // best-effort cleanup
+	var out []SampleLocationKey
+	for rows.Next() {
+		var k SampleLocationKey
+		if err := rows.Scan(&k.SHA256, &k.Path); err != nil {
+			return nil, 0, fmt.Errorf("hopper: stale scan row: %w", err)
+		}
+		out = append(out, k)
+	}
+	return out, eligible, rows.Err()
+}
+
+func (db *DB) setSkipWithEventSQLite(ctx context.Context, sha256, skip, reason string) (bool, error) {
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("hopper: begin set skip event: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
+	var label, curSkip string
+	switch err := tx.QueryRowContext(ctx,
+		`SELECT label, skip FROM samples WHERE sha256 = ?`, sha256).Scan(&label, &curSkip); {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("hopper: set skip event read: %w", err)
+	}
+	if curSkip == skip {
+		return false, nil
+	}
+	ts := now()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, sha256, label, label, curSkip, skip, reason, ts); err != nil {
+		return false, fmt.Errorf("hopper: set skip event audit: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE samples SET skip = ?, updated_at = ? WHERE sha256 = ?`, skip, ts, sha256); err != nil {
+		return false, fmt.Errorf("hopper: set skip event apply: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("hopper: commit set skip event: %w", err)
+	}
+	return true, nil
+}
+
+func (db *DB) cascadeMembersSQLite(ctx context.Context, walkStart time.Time) (int64, int64, error) {
+	cutoff := liteWalkCutoff(walkStart)
+	ts := now()
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, fmt.Errorf("hopper: begin cascade: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
+
+	// Reachability closure: a sha is alive if a standalone copy was seen this
+	// walk, or it is a member of an alive archive (transitively). A member with
+	// an edge to any alive archive therefore survives — the supply-chain veto.
+	if _, err := tx.ExecContext(ctx,
+		`CREATE TEMP TABLE IF NOT EXISTS _alive (sha256 TEXT PRIMARY KEY)`); err != nil {
+		return 0, 0, fmt.Errorf("hopper: cascade temp: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM _alive`); err != nil {
+		return 0, 0, fmt.Errorf("hopper: cascade clear: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		WITH RECURSIVE alive(sha256) AS (
+			SELECT DISTINCT sha256 FROM sample_locations
+			 WHERE parent_sha256 = '' AND last_seen_at >= ?
+			UNION
+			SELECT sl.sha256 FROM sample_locations sl
+			  JOIN alive a ON sl.parent_sha256 = a.sha256
+		)
+		INSERT INTO _alive SELECT sha256 FROM alive`, cutoff); err != nil {
+		return 0, 0, fmt.Errorf("hopper: cascade closure: %w", err)
+	}
+
+	// Cascade missing to orphaned members (skip='' only — hard and benign-item
+	// skips stick, markers are manual).
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
+		SELECT sha256, label, label, skip, 'missing', 'cascade-missing', ?
+		FROM samples
+		WHERE parent <> '' AND skip = '' AND sha256 NOT IN (SELECT sha256 FROM _alive)`, ts); err != nil {
+		return 0, 0, fmt.Errorf("hopper: cascade audit: %w", err)
+	}
+	cascRes, err := tx.ExecContext(ctx, `
+		UPDATE samples SET skip = 'missing', updated_at = ?
+		WHERE parent <> '' AND skip = '' AND sha256 NOT IN (SELECT sha256 FROM _alive)`, ts)
+	if err != nil {
+		return 0, 0, fmt.Errorf("hopper: cascade apply: %w", err)
+	}
+	cascaded, _ := cascRes.RowsAffected()
+
+	// Revive members whose archive reappeared.
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
+		SELECT sha256, label, label, skip, '', 'revive', ?
+		FROM samples
+		WHERE parent <> '' AND skip = 'missing' AND sha256 IN (SELECT sha256 FROM _alive)`, ts); err != nil {
+		return 0, 0, fmt.Errorf("hopper: revive audit: %w", err)
+	}
+	revRes, err := tx.ExecContext(ctx, `
+		UPDATE samples SET skip = '', updated_at = ?
+		WHERE parent <> '' AND skip = 'missing' AND sha256 IN (SELECT sha256 FROM _alive)`, ts)
+	if err != nil {
+		return 0, 0, fmt.Errorf("hopper: revive apply: %w", err)
+	}
+	revived, _ := revRes.RowsAffected()
+
+	if err := tx.Commit(); err != nil {
+		return 0, 0, fmt.Errorf("hopper: commit cascade: %w", err)
+	}
+	return cascaded, revived, nil
 }
 
 func (db *DB) deleteSampleSQLite(ctx context.Context, sha256 string) error {

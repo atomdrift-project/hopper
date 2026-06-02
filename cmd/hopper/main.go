@@ -1296,9 +1296,8 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 // loadProgress tracks counters across concurrent load workers.
 type loadProgress struct { //nolint:govet // fields grouped by pipeline stage, not alignment
 	// Enumeration phase.
-	walked      atomic.Int64
-	walkedPaths sync.Map // path → struct{}: all paths seen by iter-files
-	walkDone    atomic.Bool
+	walked   atomic.Int64
+	walkDone atomic.Bool
 
 	// Hashing phase.
 	hashed     atomic.Int64
@@ -1442,9 +1441,12 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 
 	// runWalk executes one full enumeration→hash→insert pass across all dirs.
 	runWalk := func(chs []<-chan labeledPath) {
+		// Captured before any DB write this pass; reconciliation treats a
+		// location's last_seen_at >= walkStart as "present in this walk".
+		walkStart := time.Now()
 		// Reset walk-phase counters so they reflect the current pass, not a
-		// cumulative total across re-walks. The walkedPaths map is kept to
-		// accumulate the full set for MarkMissingSamples.
+		// cumulative total across re-walks. Presence is now tracked by
+		// sample_locations.last_seen_at, not an in-memory path set.
 		progress.walked.Store(0)
 		progress.hashed.Store(0)
 		progress.inserted.Store(0)
@@ -1478,21 +1480,23 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 		pipeWG.Wait()
 		progress.walkDone.Store(true)
 
-		// Mark samples whose files are gone or filtered out by iter-files.
-		wasWalked := func(path string) bool {
-			_, ok := progress.walkedPaths.Load(path)
-			return ok
-		}
-		toWalkedPath := func(path string) string {
-			return filepath.ToSlash(relativeSamplePath(filepath.Dir(dirs[0].dir), path))
-		}
-		toDiskPath := func(path string) string {
-			return sampleDiskPath(filepath.Dir(dirs[0].dir), filepath.FromSlash(path))
-		}
-		if marked, err := db.MarkMissingSamplesResolved(ctx, wasWalked, toWalkedPath, toDiskPath); err != nil {
-			slog.Error("mark missing samples failed", "error", err)
-		} else if marked > 0 {
-			slog.Info("marked stale samples", "count", marked)
+		// Reconcile the derived label/skip cache against the pools, but only
+		// after a complete walk — a cancelled (partial) walk would make present
+		// files look missing.
+		if ctx.Err() == nil {
+			toDiskPath := func(path string) string {
+				return sampleDiskPath(filepath.Dir(dirs[0].dir), filepath.FromSlash(path))
+			}
+			if st, err := db.ReconcilePools(ctx, walkStart, toDiskPath); err != nil {
+				slog.Error("reconcile pools failed", "error", err)
+			} else if st.Relabeled+st.MarkedMissing+st.MarkedUnsupported+st.CascadedMissing+st.Revived > 0 {
+				slog.Info("reconciled pools",
+					"relabeled", st.Relabeled,
+					"missing", st.MarkedMissing,
+					"unsupported", st.MarkedUnsupported,
+					"cascaded_missing", st.CascadedMissing,
+					"revived", st.Revived)
+			}
 		}
 
 		logLoadSummary(start, experimentTag, dirs, &progress)
@@ -1547,6 +1551,25 @@ func runDirPipeline(
 	batchKeys := make([]cacheKey, 0, loadBatchSize)
 	pathBySha := make(map[string]string, loadBatchSize)
 
+	// Cache-hit files skip the batch insert entirely, so their location rows
+	// would never have last_seen_at refreshed — which pool reconciliation
+	// relies on to tell "still on disk" from "moved away". Touch them in
+	// batches so liveness stays a cheap indexed last_seen_at >= walkStart query
+	// instead of an app-side full scan.
+	touchBatch := make([]hopper.SampleLocationKey, 0, loadBatchSize)
+	touchFlush := func() {
+		if len(touchBatch) == 0 {
+			return
+		}
+		if err := db.TouchLocations(ctx, touchBatch); err != nil {
+			if ctx.Err() == nil {
+				slog.Warn("touch locations failed", "error", err, "batch_size", len(touchBatch))
+			}
+		}
+		touchBatch = touchBatch[:0]
+	}
+	defer touchFlush()
+
 	flush := func() {
 		if len(batch) == 0 {
 			return
@@ -1593,7 +1616,6 @@ func runDirPipeline(
 		lp.label = target.label
 		progress.walked.Add(1)
 		storedPath := filepath.ToSlash(relativeSamplePath(filepath.Dir(target.dir), lp.path))
-		progress.walkedPaths.Store(storedPath, struct{}{})
 
 		hr, err := hashFile(ctx, lp.path, lp.label, lp.fileType, source, cache, progress)
 		if err != nil {
@@ -1613,9 +1635,16 @@ func runDirPipeline(
 		progress.hashed.Add(1)
 
 		// Cache hit + already inserted into DB → skip the batch insert entirely
-		// when there is no path-derived metadata to refresh.
+		// when there is no path-derived metadata to refresh. Still refresh the
+		// location's last_seen_at so reconciliation knows the file is present.
 		if hr.inserted && (hr.sample == nil || (hr.sample.Feed == "" && hr.sample.Ecosystem == "")) {
 			progress.skipped.Add(1)
+			if hr.sample != nil {
+				touchBatch = append(touchBatch, hopper.SampleLocationKey{SHA256: hr.sample.SHA256, Path: storedPath})
+				if len(touchBatch) >= loadBatchSize {
+					touchFlush()
+				}
+			}
 			continue
 		}
 

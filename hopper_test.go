@@ -2840,72 +2840,188 @@ func TestScrubNULs(t *testing.T) {
 	}
 }
 
-func TestMarkMissingSamples(t *testing.T) {
+// ageLocation backdates a sample's standalone location so reconciliation treats
+// it as not-seen-this-walk, simulating a file that has moved away.
+func ageLocation(t *testing.T, ctx context.Context, db *DB, sha string) {
+	t.Helper()
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE sample_locations SET last_seen_at = '2000-01-01T00:00:00.000' WHERE sha256 = ?`, sha); err != nil {
+		t.Fatalf("ageLocation: %v", err)
+	}
+}
+
+func skipOf(t *testing.T, ctx context.Context, db *DB, sha string) string {
+	t.Helper()
+	s, err := db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatalf("SampleBySHA256(%s): %v", sha, err)
+	}
+	return s.Skip
+}
+
+func labelOf(t *testing.T, ctx context.Context, db *DB, sha string) string {
+	t.Helper()
+	s, err := db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatalf("SampleBySHA256(%s): %v", sha, err)
+	}
+	return s.Label
+}
+
+// TestReconcilePoolsRelabel covers the pool-placement label transitions:
+// demotion (bad→good), promotion (good→bad), and the both-pools conflict.
+func TestReconcilePoolsRelabel(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	walkStart := time.Now()
+
+	// dem: stored bad, but its only live copy is now in good/ → demote to good.
+	mustInsert(t, ctx, db, &Sample{SHA256: "dem", Path: "good/dem.bin", Label: "bad", LabelSource: "local"})
+	// pro: stored good, but now in bad/ → promote to bad.
+	mustInsert(t, ctx, db, &Sample{SHA256: "pro", Path: "bad/pro.bin", Label: "good", LabelSource: "local"})
+	// conf: present in both good/ and bad/ at once → bad + skip='conflict'.
+	mustInsert(t, ctx, db, &Sample{SHA256: "conf", Path: "good/conf.bin", Label: "good", LabelSource: "local"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "conf", Path: "bad/conf.bin", Label: "good", LabelSource: "local"})
+
+	if _, err := db.ReconcilePools(ctx, walkStart, func(p string) string { return p }); err != nil {
+		t.Fatalf("ReconcilePools: %v", err)
+	}
+
+	if got := labelOf(t, ctx, db, "dem"); got != "good" {
+		t.Errorf("dem label = %q, want good (demoted)", got)
+	}
+	if got := labelOf(t, ctx, db, "pro"); got != "bad" {
+		t.Errorf("pro label = %q, want bad (promoted)", got)
+	}
+	if got := labelOf(t, ctx, db, "conf"); got != "bad" {
+		t.Errorf("conf label = %q, want bad (conflict)", got)
+	}
+	if got := skipOf(t, ctx, db, "conf"); got != "conflict" {
+		t.Errorf("conf skip = %q, want conflict", got)
+	}
+
+	// A marker label must never be overridden by pool placement.
+	walkStart2 := time.Now()
+	mustInsert(t, ctx, db, &Sample{SHA256: "mark", Path: "bad/mark.bin", Label: "good", LabelSource: "marker", Skip: "misclassified"})
+	if _, err := db.ReconcilePools(ctx, walkStart2, func(p string) string { return p }); err != nil {
+		t.Fatalf("ReconcilePools: %v", err)
+	}
+	if got := labelOf(t, ctx, db, "mark"); got != "good" {
+		t.Errorf("marker sample relabeled to %q, want good (untouched)", got)
+	}
+
+	// The transitions were audited.
+	var events int
+	if err := db.lite.QueryRowContext(ctx,
+		`SELECT count(*) FROM label_events WHERE sha256 IN ('dem','pro','conf')`).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 3 {
+		t.Errorf("label_events = %d, want 3", events)
+	}
+}
+
+// TestReconcilePoolsMissing covers marking standalone files missing
+// (including already-analyzed ones) vs unsupported, plus the >50% guard.
+func TestReconcilePoolsMissing(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
-	// Create a real file and a path that doesn't exist.
-	realFile := filepath.Join(t.TempDir(), "real.exe")
-	if err := os.WriteFile(realFile, []byte("MZ..."), 0o644); err != nil {
+	realFile := filepath.Join(t.TempDir(), "present.bin")
+	if err := os.WriteFile(realFile, []byte("MZ...."), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gonePath := filepath.Join(t.TempDir(), "gone.exe")
-
-	// Insert samples: one with a real file, one with a missing file,
-	// one with a real file but not in the walked set (unsupported).
-	mustInsert(t, ctx, db, &Sample{SHA256: "aaa1", Path: realFile, Label: "bad"})
-	mustInsert(t, ctx, db, &Sample{SHA256: "bbb2", Path: gonePath, Label: "bad"})
-	mustInsert(t, ctx, db, &Sample{SHA256: "ccc3", Path: realFile, Label: "bad"})
-
-	// Only aaa1 was seen by iter-files.
-	walkedPaths := map[string]struct{}{realFile: {}}
-	wasWalked := func(path string) bool {
-		_, ok := walkedPaths[path]
-		return ok
+	disk := func(p string) string {
+		if p == "bad/present.bin" {
+			return realFile
+		}
+		return filepath.Join(t.TempDir(), "nope", p) // never exists
 	}
 
-	// But ccc3 has the same path as aaa1 — both exist on disk.
-	// Only aaa1 is in walkedPaths, so ccc3 should be marked as unsupported.
-	// Wait — ccc3 has the same path, so it IS in walkedPaths. Let me use a different path.
-	unsupportedFile := filepath.Join(t.TempDir(), "readme.txt")
-	if err := os.WriteFile(unsupportedFile, []byte("hello"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	mustInsert(t, ctx, db, &Sample{SHA256: "ddd4", Path: unsupportedFile, Label: "bad"})
+	walkStart := time.Now()
+	// seen: stays present this walk (fresh location).
+	mustInsert(t, ctx, db, &Sample{SHA256: "seen", Path: "bad/seen.bin", Label: "bad"})
+	// gone: analyzed, then moved away → must be marked missing despite analysis.
+	mustInsert(t, ctx, db, &Sample{SHA256: "gone", Path: "bad/gone.bin", Label: "bad"})
+	mustAnalyze(t, ctx, db, "gone", 5)
+	ageLocation(t, ctx, db, "gone")
+	// unsup: still on disk but not enumerated this walk → unsupported.
+	mustInsert(t, ctx, db, &Sample{SHA256: "unsup", Path: "bad/present.bin", Label: "bad"})
+	ageLocation(t, ctx, db, "unsup")
 
-	marked, err := db.MarkMissingSamples(ctx, wasWalked)
+	st, err := db.ReconcilePools(ctx, walkStart, disk)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("ReconcilePools: %v", err)
+	}
+	if st.MarkedMissing != 1 || st.MarkedUnsupported != 1 {
+		t.Errorf("stats missing=%d unsupported=%d, want 1/1", st.MarkedMissing, st.MarkedUnsupported)
+	}
+	if got := skipOf(t, ctx, db, "seen"); got != "" {
+		t.Errorf("seen skip = %q, want empty", got)
+	}
+	if got := skipOf(t, ctx, db, "gone"); got != "missing" {
+		t.Errorf("gone skip = %q, want missing (analyzed file moved away)", got)
+	}
+	if got := skipOf(t, ctx, db, "unsup"); got != "unsupported" {
+		t.Errorf("unsup skip = %q, want unsupported", got)
+	}
+}
+
+// TestReconcilePoolsCascade covers missing cascading to archive members, the
+// shared-archive veto, and revival when an archive reappears.
+func TestReconcilePoolsCascade(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	walkStart := time.Now()
+
+	// Live good archive G and a missing bad archive P.
+	mustInsert(t, ctx, db, &Sample{SHA256: "G", Path: "good/pkg.tgz", Label: "good"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "P", Path: "bad/arch.tgz", Label: "bad"})
+
+	// C1 lives only inside P. C2 lives inside P AND inside live G (shared file).
+	mustInsert(t, ctx, db, &Sample{SHA256: "C1", Parent: "P", Path: "bad/arch.tgz!!evil.js", Label: "bad"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "C2", Parent: "P", Path: "bad/arch.tgz!!shared.js", Label: "bad"})
+	// Second containment edge for C2: also a member of live archive G.
+	mustInsert(t, ctx, db, &Sample{SHA256: "C2", Parent: "G", Path: "good/pkg.tgz!!shared.js", Label: "good"})
+
+	// P moved away; G stays.
+	ageLocation(t, ctx, db, "P")
+	disk := func(p string) string { return filepath.Join(t.TempDir(), "nope", p) }
+
+	st, err := db.ReconcilePools(ctx, walkStart, disk)
+	if err != nil {
+		t.Fatalf("ReconcilePools: %v", err)
+	}
+	if got := skipOf(t, ctx, db, "P"); got != "missing" {
+		t.Errorf("P skip = %q, want missing", got)
+	}
+	if got := skipOf(t, ctx, db, "C1"); got != "missing" {
+		t.Errorf("C1 skip = %q, want missing (orphaned member)", got)
+	}
+	if got := skipOf(t, ctx, db, "C2"); got != "" {
+		t.Errorf("C2 skip = %q, want empty (shared with live archive — veto)", got)
+	}
+	if st.CascadedMissing != 1 {
+		t.Errorf("CascadedMissing = %d, want 1", st.CascadedMissing)
 	}
 
-	// bbb2 (missing) + ddd4 (unsupported) = 2 marked.
-	// aaa1 is in walkedPaths so untouched.
-	// ccc3 has same path as aaa1 which is in walkedPaths, so untouched.
-	if marked != 2 {
-		t.Errorf("marked = %d, want 2", marked)
-	}
-
-	// Verify skip values.
-	s, err := db.SampleBySHA256(ctx, "aaa1")
-	if err != nil {
+	// P reappears: a fresh walk re-touches both archives' locations → C1 revives.
+	walkStart2 := time.Now()
+	if err := db.TouchLocations(ctx, []SampleLocationKey{
+		{SHA256: "G", Path: "good/pkg.tgz"},
+		{SHA256: "P", Path: "bad/arch.tgz"},
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if s.Skip != "" {
-		t.Errorf("aaa1 skip = %q, want empty", s.Skip)
-	}
-	s, err = db.SampleBySHA256(ctx, "bbb2")
+	st2, err := db.ReconcilePools(ctx, walkStart2, func(p string) string { return p })
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("ReconcilePools revive: %v", err)
 	}
-	if s.Skip != "missing" {
-		t.Errorf("bbb2 skip = %q, want 'missing'", s.Skip)
+	if got := skipOf(t, ctx, db, "C1"); got != "" {
+		t.Errorf("C1 skip = %q after revival, want empty", got)
 	}
-	s, err = db.SampleBySHA256(ctx, "ddd4")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s.Skip != "unsupported" {
-		t.Errorf("ddd4 skip = %q, want 'unsupported'", s.Skip)
+	if st2.Revived != 1 {
+		t.Errorf("Revived = %d, want 1", st2.Revived)
 	}
 }
 

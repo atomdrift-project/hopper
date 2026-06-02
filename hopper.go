@@ -771,6 +771,26 @@ func (db *DB) SetSkip(ctx context.Context, sha256, skip string) error {
 	return db.setSkipSQLite(ctx, sha256, skip)
 }
 
+// SampleLocationKey identifies one (sha256, path) row in sample_locations.
+type SampleLocationKey struct {
+	SHA256 string
+	Path   string
+}
+
+// TouchLocations refreshes last_seen_at on the given location rows so pool
+// reconciliation counts them as present in the current walk. Rows that no
+// longer exist are silently ignored. Used for cache-hit files that bypass the
+// normal insert path (which would otherwise refresh last_seen_at itself).
+func (db *DB) TouchLocations(ctx context.Context, keys []SampleLocationKey) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	if db.pool != nil {
+		return db.touchLocationsPG(ctx, keys)
+	}
+	return db.touchLocationsSQLite(ctx, keys)
+}
+
 // DeleteSample removes a single sample by SHA256. Returns nil even if no
 // row matched (idempotent, like a DELETE with a WHERE clause).
 func (db *DB) DeleteSample(ctx context.Context, sha256 string) error {
@@ -1353,90 +1373,128 @@ func (db *DB) Unanalyzed(ctx context.Context, limit int) ([]*Sample, error) {
 	return db.unanalyzedSQLite(ctx, limit)
 }
 
-// MarkMissingSamples marks unanalyzed samples that can't be analyzed:
-//   - skip='missing' if the file doesn't exist on disk
-//   - skip='unsupported' if the file exists but wasn't in the iter-files output
-//
-// wasWalked reports whether a resolved path was emitted by cleave iter-files
-// during the current load. Returns the number of samples marked.
-func (db *DB) MarkMissingSamples(ctx context.Context, wasWalked func(string) bool) (int64, error) {
-	return db.MarkMissingSamplesResolved(ctx, wasWalked, nil, nil)
+// ReconcileStats summarizes one reconciliation pass.
+type ReconcileStats struct {
+	Relabeled         int64 // top-level samples whose pool label/skip changed
+	MarkedMissing     int64 // standalone files gone from disk
+	MarkedUnsupported int64 // standalone files present but not enumerated
+	CascadedMissing   int64 // archive members orphaned by a missing parent
+	Revived           int64 // members whose containing archive reappeared
 }
 
-// MarkMissingSamplesResolved is MarkMissingSamples with caller-provided path
-// normalization. comparablePath maps DB paths into the same namespace used by
-// wasWalked; diskPath maps DB paths to local filesystem paths for os.Stat.
-func (db *DB) MarkMissingSamplesResolved(
-	ctx context.Context,
-	wasWalked func(string) bool,
-	comparablePath func(string) string,
-	diskPath func(string) string,
-) (int64, error) {
-	const batchSize = 50_000
-	samples, err := db.Unanalyzed(ctx, batchSize)
-	if err != nil {
-		return 0, fmt.Errorf("hopper: mark missing: %w", err)
-	}
-	if comparablePath == nil {
-		comparablePath = func(p string) string { return p }
-	}
+// ReconcilePools makes samples.label/skip authoritative against the current
+// state of the good/ and bad/ pool directories. It runs at the end of a full
+// walk and is the single authoritative writer of the derived label/skip cache,
+// using sample_locations as the source of truth for presence and containment.
+//
+// It does four things, in order:
+//  1. Relabels top-level samples from the pools they currently live in: a file
+//     moved bad→good is demoted to good, good→bad is promoted to bad, and a file
+//     asserted in both pools at once resolves to bad with skip='conflict'.
+//  2. Marks standalone files not seen this walk as skip='missing' (gone) or
+//     'unsupported' (present on disk but not enumerated).
+//  3. Cascades skip='missing' to archive members orphaned by a missing parent —
+//     unless the member is still reachable through another live archive (the
+//     supply-chain case: a benign file shared with a present package survives).
+//  4. Revives members whose containing archive reappeared.
+//
+// "Live this walk" means a location's last_seen_at >= walkStart, so callers MUST
+// refresh last_seen_at for every observed file (InsertSampleBatch and
+// TouchLocations do). diskPath maps a stored path to a local filesystem path so
+// a stale standalone file can be classified missing vs unsupported. Every
+// transition is recorded in label_events in the same transaction as the change.
+// A >50% missing rate aborts before any write, on the assumption the data
+// directory is misconfigured rather than legitimately emptied.
+func (db *DB) ReconcilePools(ctx context.Context, walkStart time.Time, diskPath func(string) string) (ReconcileStats, error) {
 	if diskPath == nil {
 		diskPath = func(p string) string { return p }
 	}
+	var stats ReconcileStats
 
-	// Resolve symlinks in DB paths so they match the resolved walkedPaths keys.
-	// Prior runs may have stored unresolved symlink paths (e.g. ~/data → /srv/data).
-	resolvedPath := func(p string) string {
-		if r, err := filepath.EvalSymlinks(p); err == nil {
-			return comparablePath(r)
-		}
-		return comparablePath(p)
+	relabeled, err := db.relabelFromPools(ctx, walkStart)
+	if err != nil {
+		return stats, fmt.Errorf("hopper: reconcile relabel: %w", err)
 	}
-	seen := func(p string) bool {
-		return wasWalked(comparablePath(p)) || wasWalked(resolvedPath(p))
-	}
+	stats.Relabeled = relabeled
 
-	// Dry-run: count how many would be marked before writing anything.
-	// Skip archive children (parent != "") — they don't have standalone
-	// files on disk; they get analysis through their parent archive.
-	var eligible, wouldMark int64
-	for _, s := range samples {
-		if s.Skip != "" || s.Parent != "" {
-			continue
-		}
-		eligible++
-		if !seen(s.Path) {
-			wouldMark++
-		}
+	stale, eligible, err := db.staleStandaloneSamples(ctx, walkStart)
+	if err != nil {
+		return stats, fmt.Errorf("hopper: reconcile stale scan: %w", err)
 	}
 	const minBulkMarkGuardSamples = 100
-	if eligible >= minBulkMarkGuardSamples && wouldMark*2 > eligible {
-		return 0, fmt.Errorf(
-			"hopper: mark missing: refusing to mark %d of %d unanalyzed"+
-				" samples (>50%%); this likely indicates a misconfigured data directory",
-			wouldMark, eligible)
+	if eligible >= minBulkMarkGuardSamples && int64(len(stale))*2 > eligible {
+		return stats, fmt.Errorf(
+			"hopper: reconcile: refusing to mark %d of %d standalone samples missing"+
+				" (>50%%); this likely indicates a misconfigured data directory",
+			len(stale), eligible)
 	}
 
-	var marked int64
-	for _, s := range samples {
-		if s.Skip != "" || s.Parent != "" {
-			continue
+	for _, s := range stale {
+		skip := "unsupported" // present on disk but not enumerated by iter-files
+		if _, statErr := os.Stat(diskPath(s.Path)); statErr != nil {
+			skip = "missing" // gone from disk
 		}
-		if seen(s.Path) {
-			continue
+		changed, err := db.setSkipWithEvent(ctx, s.SHA256, skip, skip)
+		if err != nil {
+			return stats, fmt.Errorf("hopper: reconcile mark %s: %w", skip, err)
 		}
-		_, statErr := os.Stat(diskPath(s.Path))
-		skip := "unsupported" // file exists but iter-files filtered it out
-		if statErr != nil {
-			skip = "missing" // file is gone from disk
+		if !changed {
+			continue
 		}
 		slog.Info("marking stale sample", "sha256", s.SHA256, "path", s.Path, "skip", skip)
-		if err := db.SetSkip(ctx, s.SHA256, skip); err != nil {
-			return marked, fmt.Errorf("hopper: mark missing: %w", err)
+		if skip == "missing" {
+			stats.MarkedMissing++
+		} else {
+			stats.MarkedUnsupported++
 		}
-		marked++
 	}
-	return marked, nil
+
+	cascaded, revived, err := db.cascadeMembers(ctx, walkStart)
+	if err != nil {
+		return stats, fmt.Errorf("hopper: reconcile cascade: %w", err)
+	}
+	stats.CascadedMissing = cascaded
+	stats.Revived = revived
+	return stats, nil
+}
+
+// relabelFromPools rewrites label/skip on top-level, non-marker samples from the
+// pools their standalone copies currently live in this walk. See ReconcilePools.
+func (db *DB) relabelFromPools(ctx context.Context, walkStart time.Time) (int64, error) {
+	if db.pool != nil {
+		return db.relabelFromPoolsPG(ctx, walkStart)
+	}
+	return db.relabelFromPoolsSQLite(ctx, walkStart)
+}
+
+// staleStandaloneSamples returns top-level samples (skip empty or 'conflict')
+// whose standalone locations were not seen this walk, plus the count of all such
+// eligible samples for the >50% guard.
+func (db *DB) staleStandaloneSamples(ctx context.Context, walkStart time.Time) ([]SampleLocationKey, int64, error) {
+	if db.pool != nil {
+		return db.staleStandaloneSamplesPG(ctx, walkStart)
+	}
+	return db.staleStandaloneSamplesSQLite(ctx, walkStart)
+}
+
+// setSkipWithEvent sets skip on one sample and records the transition in
+// label_events in the same transaction. Returns false (no event) when the skip
+// is already the target value.
+func (db *DB) setSkipWithEvent(ctx context.Context, sha256, skip, reason string) (bool, error) {
+	if db.pool != nil {
+		return db.setSkipWithEventPG(ctx, sha256, skip, reason)
+	}
+	return db.setSkipWithEventSQLite(ctx, sha256, skip, reason)
+}
+
+// cascadeMembers marks archive members missing when every archive containing
+// them is gone, and revives members whose archive reappeared. Returns the
+// (cascaded, revived) counts. See ReconcilePools.
+func (db *DB) cascadeMembers(ctx context.Context, walkStart time.Time) (int64, int64, error) {
+	if db.pool != nil {
+		return db.cascadeMembersPG(ctx, walkStart)
+	}
+	return db.cascadeMembersSQLite(ctx, walkStart)
 }
 
 // Pull-based work scheduling.
