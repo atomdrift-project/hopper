@@ -467,7 +467,10 @@ func (db *DB) workflowHealthSQLite(ctx context.Context) (WorkflowHealth, error) 
 			(SELECT created_at FROM samples WHERE parent = '' ORDER BY created_at DESC LIMIT 1),
 			(SELECT max(updated_at) FROM samples WHERE parent = ''),
 			(SELECT max(analyzed_at) FROM samples WHERE parent = '' AND analyzed_at IS NOT NULL),
-			(SELECT COALESCE(first_analyzed_at, analyzed_at) FROM samples WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL ORDER BY COALESCE(first_analyzed_at, analyzed_at) DESC LIMIT 1),
+			(SELECT COALESCE(first_analyzed_at, analyzed_at) FROM samples
+				WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL
+					AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL
+				ORDER BY COALESCE(first_analyzed_at, analyzed_at) DESC LIMIT 1),
 			(SELECT count(*) FROM samples WHERE parent = '' AND skip = '' AND cleave_result IS NULL),
 			(SELECT count(*) FROM samples WHERE parent = '' AND skip = '' AND cleave_result IS NOT NULL AND litmus_result IS NULL)`,
 	).Scan(&latestAdded, &latestUpdated, &latestAnalyzed, &latestReady, &h.PendingCleave, &h.PendingLitmus)
@@ -527,7 +530,9 @@ func (db *DB) workflowLatestAddedSQLite(ctx context.Context, limit int) ([]Workf
 
 func (db *DB) workflowLatestReadySQLite(ctx context.Context, limit int) ([]WorkflowSample, error) {
 	return db.workflowSamplesSQLite(ctx,
-		`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL ORDER BY COALESCE(first_analyzed_at, analyzed_at) DESC, id LIMIT ?`, limit)
+		`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL `+
+			`AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL `+
+			`ORDER BY COALESCE(first_analyzed_at, analyzed_at) DESC, id LIMIT ?`, limit)
 }
 
 func (db *DB) workflowOldestPendingSQLite(ctx context.Context, limit int) ([]WorkflowSample, error) {
@@ -2265,17 +2270,23 @@ func (q *FeedQuery) whereSQLite() (where string, args []any) {
 		placeholders := make([]string, len(q.LitmusClasses))
 		for i := range q.LitmusClasses {
 			placeholders[i] = "?"
+		}
+		// Match either schema: legacy `class` field, or v6 `l`-derived. Mirror
+		// prism's envelopeClass / the scan query above: class first; else derive
+		// from l using the cutoff `?` (null is manual-mode hostile/2; -1 benign/0;
+		// 0..=cutoff hostile/2; above cutoff suspicious/1). The cutoff `?` precedes
+		// the IN(...) placeholders in the SQL, so its arg is appended first.
+		args = append(args, q.criticalLevel())
+		for i := range q.LitmusClasses {
 			args = append(args, q.LitmusClasses[i])
 		}
-		// Match either schema: legacy `class` field, or v2 `l`-derived
-		// (l >= 0 → hostile/2, l == -1 or absent → benign/0). Suspicious/1
-		// doesn't exist in v2 records, so a class=1 filter only matches
-		// legacy rows.
 		clauses = append(clauses,
 			"COALESCE(CAST(json_extract(litmus_result, '$.class') AS INTEGER), "+
 				"CASE WHEN litmus_result IS NULL THEN 0 "+
-				"WHEN json_extract(litmus_result, '$.l') IS NULL THEN 0 "+
-				"WHEN CAST(json_extract(litmus_result, '$.l') AS INTEGER) < 0 THEN 0 ELSE 2 END) "+
+				"WHEN json_extract(litmus_result, '$.l') IS NULL THEN 2 "+
+				"WHEN CAST(json_extract(litmus_result, '$.l') AS INTEGER) < 0 THEN 0 "+
+				"WHEN CAST(json_extract(litmus_result, '$.l') AS INTEGER) <= ? THEN 2 "+
+				"ELSE 1 END) "+
 				"IN ("+strings.Join(placeholders, ", ")+")")
 	}
 	if q.RequireLitmus {
@@ -2350,9 +2361,9 @@ func (db *DB) unanalyzedCandidatesSQLite(ctx context.Context, hopperStart time.T
 		)
 		SELECT sha256, path, size_bytes, file_type
 		FROM (
-			SELECT * FROM picked
+			SELECT sha256, path, size_bytes, file_type, pass FROM picked
 			UNION ALL
-			SELECT * FROM wrapped
+			SELECT sha256, path, size_bytes, file_type, pass FROM wrapped
 		)
 		ORDER BY pass, sha256
 		LIMIT ?`, pivot, startCutoff, limit, pivot, startCutoff, limit, limit)

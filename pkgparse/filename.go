@@ -36,13 +36,13 @@ var filenamePatterns = []*regexp.Regexp{
 	regexp.MustCompile(`^(?P<name>[^_]+)_(?P<version>[^_]+)_[^_]+\.deb$`),
 
 	// rpm: <name>-<version>-<release>.<arch>.rpm. Combine version+release.
-	regexp.MustCompile(`^(?P<name>.+)-(?P<version>\d[\w.+~]*-[\w.+~]+)\.[\w_]+\.rpm$`),
+	regexp.MustCompile(`^(?P<name>.+)-(?P<version>\d[\w.+~]*-[\w.+~]+)\.\w+\.rpm$`),
 
 	// archlinux .pkg.tar.zst: <name>-<version>-<release>-<arch>.pkg.tar.zst
-	regexp.MustCompile(`^(?P<name>.+)-(?P<version>\d[\w.+~]*-\d+)-[\w_]+\.pkg\.tar\.[\w]+$`),
+	regexp.MustCompile(`^(?P<name>.+)-(?P<version>\d[\w.+~]*-\d+)-\w+\.pkg\.tar\.\w+$`),
 
 	// conda: <name>-<version>-<build>.conda.
-	regexp.MustCompile(`^(?P<name>.+)-(?P<version>\d[\w.+~]*-[\w._+~]+)\.conda$`),
+	regexp.MustCompile(`^(?P<name>.+)-(?P<version>\d[\w.+~]*-[\w.+~]+)\.conda$`),
 
 	// docker / OCI image tarballs with underscore separators.
 	// Multiple underscore segments (registry_namespace_image_version);
@@ -65,7 +65,8 @@ var filenamePatterns = []*regexp.Regexp{
 	// the shortest plausible name so the version captures all trailing
 	// build metadata (semver build suffixes like "1.0.6+spec-1.1.0").
 	// Version may carry an optional "v" prefix.
-	regexp.MustCompile(`^(?P<name>.+?)-(?P<version>v?\d[\w.+~-]*)\.(?:tgz|tar\.gz|tar\.bz2|tar\.xz|tar\.zst|tar|whl|crate|jar|gem|nupkg|zip|vsix|crx|xpi|AppImage)$`),
+	regexp.MustCompile(`^(?P<name>.+?)-(?P<version>v?\d[\w.+~-]*)\.` +
+		`(?:tgz|tar\.gz|tar\.bz2|tar\.xz|tar\.zst|tar|whl|crate|jar|gem|nupkg|zip|vsix|crx|xpi|AppImage)$`),
 
 	// nuget with dot-separated name + version (Microsoft.X.Y.Z.W.nupkg).
 	// Non-greedy name so version grabs the trailing dotted-int sequence.

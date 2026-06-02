@@ -699,6 +699,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 				dotClass = "dot-bad"
 			case idle >= workerActiveWindow:
 				dotClass = "dot-warn"
+			default:
 			}
 			// Stale-traits also drops the worker to dot-warn (unless
 			// it's already a worse status). Mismatch is only meaningful
@@ -897,6 +898,7 @@ func writeWorkflowHealth(buf *strings.Builder, h hopper.WorkflowHealth) {
 }
 
 func writeMetricCard(buf *strings.Builder, label, value, sub string) {
+	//nolint:gosec // G705 false positive: every interpolated value is htmlEscape'd (html.EscapeString) before formatting.
 	fmt.Fprintf(buf,
 		`<div class="metric-card"><div class="metric-label">%s</div><div class="metric-value">%s</div><div class="metric-sub">%s</div></div>`,
 		htmlEscape(label), htmlEscape(value), htmlEscape(sub))
@@ -907,8 +909,11 @@ func writeWorkflowBacklogs(buf *strings.Builder, rows []hopper.WorkflowBacklog) 
 		return
 	}
 	buf.WriteString(`<section><div class="label">Top Backlogs</div>`)
-	buf.WriteString(`<table><thead><tr><th>Source</th><th>Feed</th><th>Ecosystem</th><th>Cleave</th><th>Litmus</th><th>Oldest</th><th>Newest</th></tr></thead><tbody>`)
-	for _, r := range rows {
+	buf.WriteString(`<table><thead><tr><th>Source</th><th>Feed</th><th>Ecosystem</th>` +
+		`<th>Cleave</th><th>Litmus</th><th>Oldest</th><th>Newest</th></tr></thead><tbody>`)
+	for i := range rows {
+		r := &rows[i]
+		//nolint:gosec // G705 false positive: string values are htmlEscape'd and fmtN emits only digits/commas.
 		fmt.Fprintf(buf,
 			`<tr><td>%s</td><td>%s</td><td class="hi">%s</td><td class="hi">%s</td><td>%s</td><td>%s</td><td>%s</td></tr>`,
 			htmlEscape(dashIfEmpty(r.Source)),
@@ -929,7 +934,8 @@ func writeWorkflowSamples(buf *strings.Builder, label, note string, samples []ho
 	fmt.Fprintf(buf, `<section><div class="label">%s</div><div class="metric-sub">%s</div>`,
 		htmlEscape(label), htmlEscape(note))
 	buf.WriteString(`<table><thead><tr><th>When</th><th>State</th><th>Sample</th><th>Source</th><th>Ecosystem</th><th>SHA</th></tr></thead><tbody>`)
-	for _, s := range samples {
+	for i := range samples {
+		s := &samples[i]
 		t := s.CreatedAt
 		if timeKind == "updated" {
 			t = s.UpdatedAt
@@ -937,11 +943,12 @@ func writeWorkflowSamples(buf *strings.Builder, label, note string, samples []ho
 			t = *s.FirstAnalyzedAt
 		}
 		name := firstNonEmpty(s.Filename, filepath.Base(s.Path), s.SHA256)
+		//nolint:gosec // G705 false positive: every interpolated value is htmlEscape'd or constant HTML from workflowStateHTML.
 		fmt.Fprintf(buf,
 			`<tr><td title="%s">%s</td><td>%s</td><td class="hi">%s</td><td>%s</td><td>%s</td><td>%s</td></tr>`,
 			htmlEscape(t.Format(time.RFC3339)),
 			htmlEscape(ageValue(t)),
-			workflowStateHTML(s),
+			workflowStateHTML(*s),
 			htmlEscape(name),
 			htmlEscape(dashIfEmpty(sourceFeed(s.Source, s.Feed))),
 			htmlEscape(dashIfEmpty(s.Ecosystem)),

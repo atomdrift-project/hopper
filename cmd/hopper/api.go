@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,6 +25,7 @@ import (
 
 	"codeberg.org/atomdrift/hopper"
 	"github.com/codeGROOVE-dev/retry"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // apiServer handles the pull-based work API. Workers poll /api/next for
@@ -39,21 +41,21 @@ type apiServer struct {
 	// commit. Stored in an atomic.Pointer so the periodic rules-update
 	// goroutine can refresh it concurrently with read traffic from
 	// /api/next, /api/result, and the dashboard. Empty = rescan disabled.
-	traitsVersion atomic.Pointer[string]
-	hopperStart   time.Time // process start; gates force-rescan claim tier
-	dataRoot      string    // resolved absolute path to the data directory
+	traitsVersion       atomic.Pointer[string]
+	hopperStart         time.Time // process start; gates force-rescan claim tier
+	dataRoot            string    // resolved absolute path to the data directory
+	allowedDirs         []string  // resolved absolute paths that /api/file may serve from
+	forceRescanPrefixes []string  // normalized relative paths to re-analyze when analysis predates hopperStart
+	rescanAge           time.Duration
 	// uploadTokenHash holds sha256(HOPPER_UPLOAD_TOKEN). Storing only the
 	// hash means a process-memory disclosure (core dump, /proc/<pid>/mem,
 	// swap) does not leak the secret in usable form. Compare with
 	// subtle.ConstantTimeCompare against sha256(incoming). uploadTokenSet
 	// distinguishes "no token configured" from the 2^-256 case of a hash
 	// that happens to be all-zero.
-	uploadTokenHash     [sha256.Size]byte
-	uploadTokenSet      bool
-	allowedDirs         []string // resolved absolute paths that /api/file may serve from
-	forceRescanPrefixes []string // normalized relative paths to re-analyze when analysis predates hopperStart
-	explosionWG         sync.WaitGroup
-	rescanAge           time.Duration
+	uploadTokenHash [sha256.Size]byte
+	explosionWG     sync.WaitGroup
+	uploadTokenSet  bool
 }
 
 // errUploadDisabled is the sentinel for "no HOPPER_UPLOAD_TOKEN configured".
@@ -137,14 +139,14 @@ type workerStats struct {
 	LastUpserted time.Time // when we last persisted a heartbeat row to the workers table
 	Version      string
 	Traits       string
+	Tools        string // comma-separated canonical external tools reported by litmus
 	TotalClaimed int64
 	Analyzed     int64
 	Errors       int64
-	Slots        int
-	ActiveClaims int     // jobs claimed but not yet returned
-	RSSMB        int     // last reported RSS in MiB (0 = unknown)
 	Load1        float64 // last reported 1-minute load average (0 = unknown)
-	Tools        string  // comma-separated canonical external tools reported by litmus
+	Slots        int
+	ActiveClaims int // jobs claimed but not yet returned
+	RSSMB        int // last reported RSS in MiB (0 = unknown)
 }
 
 func newWorkerTracker() *workerTracker {
@@ -400,7 +402,9 @@ func (wt *workerTracker) resetClaims(name string) {
 }
 
 // namedWorkerStats is workerStats with the worker name attached.
-type namedWorkerStats struct { //nolint:govet // embedded field must come first per embeddedstructfieldcheck
+//
+//nolint:govet // fieldalignment conflicts with embeddedstructfieldcheck, which requires the embedded field first.
+type namedWorkerStats struct {
 	workerStats
 
 	Name string
@@ -533,7 +537,7 @@ func parseWorkerTools(values []string) (string, *workerToolSet) {
 	}
 	tools := workerToolSet{}
 	for _, value := range values {
-		for _, raw := range strings.Split(value, ",") {
+		for raw := range strings.SplitSeq(value, ",") {
 			name := strings.ToLower(strings.TrimSpace(raw))
 			if name == "" {
 				continue
@@ -541,6 +545,7 @@ func parseWorkerTools(values []string) (string, *workerToolSet) {
 			switch name {
 			case "7za", "7zz", "7zr", "p7zip":
 				name = "7z"
+			default:
 			}
 			tools[name] = true
 		}
@@ -617,12 +622,7 @@ func hasFileExtension(path string, exts ...string) bool {
 		return false
 	}
 	ext := strings.ToLower(filepath.Ext(path))
-	for _, want := range exts {
-		if ext == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(exts, ext)
 }
 
 func filterCandidatesByWorkerTools(cands []hopper.ClaimJob, tools *workerToolSet) []hopper.ClaimJob {
@@ -1123,14 +1123,39 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, too
 	return out, nil
 }
 
-func retryDBAccessNoValue(ctx context.Context, op, sha256 string, fn func(context.Context) error) error {
-	_, err := retryDBAccess(ctx, op, sha256, func(ctx context.Context) (struct{}, error) {
+// permanentPGError reports whether err is a deterministic PostgreSQL error
+// that cannot succeed on retry, so retryDBAccess should surface it immediately
+// instead of looping. It matches the SQLSTATE class (first two characters):
+//
+//	22 — data exception (e.g. 22021 invalid byte sequence: a NUL byte in text)
+//	23 — integrity constraint violation
+//	42 — syntax error or access rule violation (a programming bug)
+//
+// Transient classes (08 connection, 40 serialization/deadlock, 53 insufficient
+// resources, 57 operator intervention, …) are deliberately excluded so they
+// keep retrying. Without this, a single malformed archive member triggered a
+// retry storm of thousands of attempts against SQLSTATE 22021.
+func permanentPGError(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || len(pgErr.Code) < 2 {
+		return false
+	}
+	switch pgErr.Code[:2] {
+	case "22", "23", "42":
+		return true
+	default:
+		return false
+	}
+}
+
+func retryDBAccessNoValue(ctx context.Context, op, shaHex string, fn func(context.Context) error) error {
+	_, err := retryDBAccess(ctx, op, shaHex, func(ctx context.Context) (struct{}, error) {
 		return struct{}{}, fn(ctx)
 	})
 	return err
 }
 
-func retryDBAccess[T any](ctx context.Context, op, sha256 string, fn func(context.Context) (T, error)) (T, error) {
+func retryDBAccess[T any](ctx context.Context, op, shaHex string, fn func(context.Context) (T, error)) (T, error) {
 	return retry.DoWithData(
 		func() (T, error) {
 			v, err := fn(ctx)
@@ -1140,7 +1165,8 @@ func retryDBAccess[T any](ctx context.Context, op, sha256 string, fn func(contex
 			if ctx.Err() != nil ||
 				errors.Is(err, context.Canceled) ||
 				errors.Is(err, context.DeadlineExceeded) ||
-				errors.Is(err, hopper.ErrNotFound) {
+				errors.Is(err, hopper.ErrNotFound) ||
+				permanentPGError(err) {
 				return v, retry.Unrecoverable(err)
 			}
 			return v, err
@@ -1154,13 +1180,13 @@ func retryDBAccess[T any](ctx context.Context, op, sha256 string, fn func(contex
 		retry.WrapContextErrorWithLastError(true),
 		retry.OnRetry(func(attempt uint, err error) {
 			slog.Warn("database operation failed; retrying",
-				"op", op, "sha256", sha256, "attempt", attempt+1, "error", err)
+				"op", op, "sha256", shaHex, "attempt", attempt+1, "error", err)
 		}),
 	)
 }
 
-func logResultStoreError(reqCtx, storeCtx context.Context, msg, sha256 string, err error) {
-	attrs := []any{"sha256", sha256, "error", err}
+func logResultStoreError(reqCtx, storeCtx context.Context, msg, shaHex string, err error) {
+	attrs := []any{"sha256", shaHex, "error", err}
 	if reqErr := reqCtx.Err(); reqErr != nil {
 		attrs = append(attrs, "request_context", reqErr)
 	}

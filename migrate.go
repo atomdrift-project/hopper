@@ -543,7 +543,8 @@ const sampleStagingDDL = `CREATE TEMP TABLE _staging (
 	path TEXT, status TEXT, note TEXT, canonical_sha256 TEXT,
 	parent TEXT, skip TEXT, elements TEXT, max_crit INTEGER, suspicious_count INTEGER,
 	cleave_result JSONB, litmus_result JSONB,
-	analyzed_at TIMESTAMPTZ, first_analyzed_at TIMESTAMPTZ, last_error_at TIMESTAMPTZ, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ,
+	analyzed_at TIMESTAMPTZ, first_analyzed_at TIMESTAMPTZ, last_error_at TIMESTAMPTZ,
+	created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ,
 	traits_version TEXT NOT NULL DEFAULT ''
 ) ON COMMIT DROP`
 

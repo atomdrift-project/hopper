@@ -679,7 +679,10 @@ func (db *DB) workflowHealthPG(ctx context.Context) (WorkflowHealth, error) {
 			(SELECT created_at FROM samples WHERE parent = '' ORDER BY created_at DESC LIMIT 1),
 			(SELECT max(updated_at) FROM samples WHERE parent = ''),
 			(SELECT max(analyzed_at) FROM samples WHERE parent = '' AND analyzed_at IS NOT NULL),
-			(SELECT COALESCE(first_analyzed_at, analyzed_at) FROM samples WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL ORDER BY COALESCE(first_analyzed_at, analyzed_at) DESC LIMIT 1),
+			(SELECT COALESCE(first_analyzed_at, analyzed_at) FROM samples
+				WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL
+					AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL
+				ORDER BY COALESCE(first_analyzed_at, analyzed_at) DESC LIMIT 1),
 			(SELECT count(*) FROM samples WHERE parent = '' AND skip = '' AND cleave_result IS NULL),
 			(SELECT count(*) FROM samples WHERE parent = '' AND skip = '' AND cleave_result IS NOT NULL AND litmus_result IS NULL)`,
 	).Scan(&latestAdded, &latestUpdated, &latestAnalyzed, &latestReady, &h.PendingCleave, &h.PendingLitmus)
@@ -739,7 +742,9 @@ func (db *DB) workflowLatestAddedPG(ctx context.Context, limit int) ([]WorkflowS
 
 func (db *DB) workflowLatestReadyPG(ctx context.Context, limit int) ([]WorkflowSample, error) {
 	return db.workflowSamplesPG(ctx,
-		`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL ORDER BY COALESCE(first_analyzed_at, analyzed_at) DESC, id LIMIT $1`, limit)
+		`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL `+
+			`AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL `+
+			`ORDER BY COALESCE(first_analyzed_at, analyzed_at) DESC, id LIMIT $1`, limit)
 }
 
 func (db *DB) workflowOldestPendingPG(ctx context.Context, limit int) ([]WorkflowSample, error) {
@@ -805,6 +810,7 @@ func nullTime(t sql.NullTime) time.Time {
 }
 
 func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
+	s.scrubNULs() // PG TEXT can't hold 0x00 (SQLSTATE 22021); see scrubNULs.
 	// One transaction so the sample row and its sample_locations
 	// observation are created (or rolled back) atomically.
 	tx, err := db.pool.Begin(ctx)
@@ -1019,6 +1025,7 @@ func logLabelTransitionsPG(ctx context.Context, tx pgx.Tx) {
 func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inserted int64, needsAnalysis []string, err error) {
 	rows := make([][]any, len(samples))
 	for i, s := range samples {
+		s.scrubNULs() // PG TEXT can't hold 0x00 (SQLSTATE 22021); see scrubNULs.
 		firstAnalyzedAt := s.FirstAnalyzedAt
 		if firstAnalyzedAt == nil {
 			firstAnalyzedAt = s.AnalyzedAt
@@ -2286,15 +2293,19 @@ func (db *DB) feedSamplesPG(ctx context.Context, q FeedQuery) ([]*Sample, error)
 			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
 			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
 			AND (coalesce(cardinality($5::int[]), 0) = 0 OR
-				-- Match either schema: legacy class field, or v2 l-derived
-				-- (l non-null → hostile/2, l null → benign/0; suspicious/1
-				-- doesn't exist in v2, so the v2 branch can only match 0 or 2).
+				-- Match either schema: legacy class field, or v6 l-derived.
+				-- Mirror prism's envelopeClass / workflowSamplesPG: class first;
+				-- else derive from l using $12 as the hostile/suspicious cutoff
+				-- (null is manual-mode hostile/2; -1 benign/0; 0..=cutoff
+				-- hostile/2; above cutoff suspicious/1).
 				COALESCE(
 					(litmus_result->>'class')::int,
 					CASE
 						WHEN litmus_result IS NULL THEN 0
-						WHEN litmus_result->>'l' IS NULL THEN 0
-						ELSE 2
+						WHEN litmus_result->>'l' IS NULL THEN 2
+						WHEN (litmus_result->>'l')::int < 0 THEN 0
+						WHEN (litmus_result->>'l')::int <= $12 THEN 2
+						ELSE 1
 					END
 				) = ANY($5))
 			AND (NOT $6 OR parent = '')
@@ -2303,7 +2314,8 @@ func (db *DB) feedSamplesPG(ctx context.Context, q FeedQuery) ([]*Sample, error)
 			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))
 		ORDER BY `+q.sortBy()+`
 		LIMIT $10 OFFSET $11`,
-		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly, q.Formula, q.RequireLitmus, q.Domains, q.Limit, q.Offset)
+		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
+		q.Formula, q.RequireLitmus, q.Domains, q.Limit, q.Offset, q.criticalLevel())
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed samples: %w", err)
 	}
@@ -2320,22 +2332,26 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q FeedQuery) (int, error) 
 			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
 			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
 			AND (coalesce(cardinality($5::int[]), 0) = 0 OR
-				-- Match either schema: legacy class field, or v2 l-derived
-				-- (l non-null → hostile/2, l null → benign/0; suspicious/1
-				-- doesn't exist in v2, so the v2 branch can only match 0 or 2).
+				-- Match either schema: legacy class field, or v6 l-derived.
+				-- Mirror prism's envelopeClass / workflowSamplesPG: class first;
+				-- else derive from l using $10 as the hostile/suspicious cutoff
+				-- (null is manual-mode hostile/2; -1 benign/0; 0..=cutoff
+				-- hostile/2; above cutoff suspicious/1).
 				COALESCE(
 					(litmus_result->>'class')::int,
 					CASE
 						WHEN litmus_result IS NULL THEN 0
-						WHEN litmus_result->>'l' IS NULL THEN 0
-						ELSE 2
+						WHEN litmus_result->>'l' IS NULL THEN 2
+						WHEN (litmus_result->>'l')::int < 0 THEN 0
+						WHEN (litmus_result->>'l')::int <= $10 THEN 2
+						ELSE 1
 					END
 				) = ANY($5))
 			AND (NOT $6 OR parent = '')
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
 			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))`,
-		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly, q.Formula, q.RequireLitmus, q.Domains).Scan(&n)
+		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly, q.Formula, q.RequireLitmus, q.Domains, q.criticalLevel()).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: feed samples count: %w", err)
 	}
@@ -2434,9 +2450,9 @@ func (db *DB) unanalyzedCandidatesPG(ctx context.Context, hopperStart time.Time,
 		)
 		SELECT sha256, path, size_bytes, file_type
 		FROM (
-			SELECT * FROM picked
+			SELECT sha256, path, size_bytes, file_type, pass FROM picked
 			UNION ALL
-			SELECT * FROM wrapped
+			SELECT sha256, path, size_bytes, file_type, pass FROM wrapped
 		) q
 		ORDER BY pass, sha256
 		LIMIT $3`,

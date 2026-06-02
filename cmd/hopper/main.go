@@ -876,7 +876,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	api := &apiServer{tracker: tracker, hopperStart: time.Now().UTC()} // db, progress, allowedDirs, uploadTokenHash set after init
 	api.registerAPI(httpMux)
 	httpMux.HandleFunc("GET /_/health", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok")) //nolint:errcheck // best-effort HTTP response
 	})
 	httpMux.Handle("GET /_/metrik", obs.MetricsHandler())
 
@@ -2095,7 +2095,7 @@ func isHexSHA256Name(s string) bool {
 	if len(s) != 64 {
 		return false
 	}
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		if c := s[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
@@ -2423,7 +2423,7 @@ type vendorSidecar struct {
 // when neither exists or the JSON can't be parsed.
 func readVendorSidecar(dir, sha string) (vendorSidecar, bool) {
 	for _, name := range []string{"." + sha + ".sidecar.json", sha + ".json"} {
-		b, err := os.ReadFile(filepath.Join(dir, name)) //nolint:gosec // dir/sha come from the walked sample path
+		b, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
 			continue
 		}
@@ -2439,8 +2439,8 @@ func readVendorSidecar(dir, sha string) (vendorSidecar, bool) {
 // ("github.com/abiosoft/colima" → "github.com"), matching the value the
 // dashboard groups by.
 func vendorSidecarDomain(hostname string) string {
-	if i := strings.IndexByte(hostname, '/'); i >= 0 {
-		return hostname[:i]
+	if host, _, found := strings.Cut(hostname, "/"); found {
+		return host
 	}
 	return hostname
 }

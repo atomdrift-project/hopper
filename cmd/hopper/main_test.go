@@ -1045,7 +1045,7 @@ func TestLoadDirReadsVendorSidecar(t *testing.T) {
 	mustWriteFile(t, filepath.Join(host, sha+"-amass_Linux_amd64.zip"), content)
 	url := "https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_Linux_amd64.zip"
 	mustWriteFile(t, filepath.Join(host, "."+sha+".sidecar.json"),
-		[]byte(fmt.Sprintf(`{"fetch_url":%q,"source":"amass","hostname":"owasp-amass.github.io"}`, url)))
+		fmt.Appendf(nil, `{"fetch_url":%q,"source":"amass","hostname":"owasp-amass.github.io"}`, url))
 
 	loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{dir, "good"}}, nil, "forager", 1, false, 0, "", nil, "", 0)
 

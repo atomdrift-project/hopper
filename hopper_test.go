@@ -2398,6 +2398,80 @@ func TestFeedSamples(t *testing.T) {
 	}
 }
 
+// TestFeedSamplesLitmusClassesV6 locks in the v6 `l` → 0/1/2 class derivation
+// used by the LitmusClasses filter, mirroring prism's envelopeClass: -1 benign,
+// null manual-mode hostile, 0..=CriticalLevel hostile, above suspicious. It
+// guards the regression where the hostile filter dropped v6 rows.
+func TestFeedSamplesLitmusClassesV6(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// class is the expected 0/1/2 bucket under the default CriticalLevel (4).
+	rows := []struct {
+		sha    string
+		litmus string
+		class  int
+	}{
+		{"v6null", `{"v":"6","l":null}`, 2}, // manual-mode hostile, fail-safe
+		{"v6lo", `{"v":"6","l":0}`, 2},      // fires at the strictest level
+		{"v6crit", `{"v":"6","l":4}`, 2},    // boundary: at the critical line
+		{"v6susp", `{"v":"6","l":10}`, 1},   // fires only above the line
+		{"v6benign", `{"v":"6","l":-1}`, 0}, // never fires
+		{"legacy2", `{"v":"4","class":2}`, 2},
+		{"legacy1", `{"v":"4","class":1}`, 1},
+	}
+	for _, r := range rows {
+		mustInsert(t, ctx, db, &Sample{SHA256: r.sha, Source: "v6test", Label: "bad"})
+		if err := db.UpdateCleaveResult(ctx, r.sha, []byte(`{"fs":[{"sha":"`+r.sha+`","type":"elf","dp":0}]}`), nil, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.UpdateLitmusResult(ctx, r.sha, []byte(r.litmus)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for class := range 3 {
+		q := FeedQuery{Source: "v6test", Limit: 100, CriticalLevel: 4, LitmusClasses: []int{class}}
+		samples, err := db.FeedSamples(ctx, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make(map[string]bool, len(samples))
+		for _, s := range samples {
+			got[s.SHA256] = true
+		}
+		count, err := db.FeedSamplesCount(ctx, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if count != len(samples) {
+			t.Errorf("class=%d: count %d != len(samples) %d", class, count, len(samples))
+		}
+		for _, r := range rows {
+			if want := r.class == class; got[r.sha] != want {
+				t.Errorf("class=%d filter: %s (l-class %d) present=%v, want %v", class, r.sha, r.class, got[r.sha], want)
+			}
+		}
+	}
+
+	// A caller-pinned cutoff moves the line: with CriticalLevel=3, l=4 (hostile
+	// at the default cutoff) becomes suspicious. This is the consistency knob.
+	q := FeedQuery{Source: "v6test", Limit: 100, CriticalLevel: 3, LitmusClasses: []int{1}}
+	samples, err := db.FeedSamples(ctx, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, s := range samples {
+		if s.SHA256 == "v6crit" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("CriticalLevel=3: expected v6crit (l=4) to be classed suspicious")
+	}
+}
+
 func TestPool(t *testing.T) {
 	db := openTestDB(t)
 	if db.Pool() != nil {
@@ -2735,6 +2809,34 @@ func TestSanitizeJSONB(t *testing.T) {
 				t.Errorf("sanitizeJSONB(%q)\n  got  %q\n  want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestScrubNULs(t *testing.T) {
+	s := &Sample{
+		SHA256:   "abc",
+		Path:     "pkg/bin\x00.exe",
+		Filename: "evil\x00.sh",
+		Package:  "left\x00pad",
+		Version:  "1.0\x000",
+		Elements: "C\x00H4",
+		Label:    "bad", // no NUL, must be untouched
+	}
+	s.scrubNULs()
+
+	for field, got := range map[string]string{
+		"Path": s.Path, "Filename": s.Filename, "Package": s.Package,
+		"Version": s.Version, "Elements": s.Elements,
+	} {
+		if strings.IndexByte(got, 0) >= 0 {
+			t.Errorf("scrubNULs left a NUL in %s: %q", field, got)
+		}
+	}
+	if s.Path != "pkg/bin.exe" {
+		t.Errorf("Path = %q, want %q", s.Path, "pkg/bin.exe")
+	}
+	if s.Label != "bad" {
+		t.Errorf("Label = %q, want unchanged %q", s.Label, "bad")
 	}
 }
 

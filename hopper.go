@@ -4,6 +4,8 @@
 // reports for the atomdrift malware detection pipeline.
 //
 // Use a postgres:// DSN for PostgreSQL, or a file path for SQLite.
+//
+//nolint:revive // max-public-structs: these are the package's core domain types (DB, Sample, Report, ClaimJob, WorkflowSample, etc.); they form a single cohesive public API and splitting them apart would harm discoverability, not clarity.
 package hopper
 
 import (
@@ -44,6 +46,10 @@ const skipBenignArchiveItem = "skip-benign-archive-item"
 // (manual-mode hostile) is hostile. Mirrors DefaultSeverityLevel in collimator,
 // litmus, autocollie, prism, and promoter — see
 // collimator/src/collimator/thresholds/__init__.py for the cross-repo group.
+//
+// It is the default for feed queries that don't pin their own cutoff via
+// [FeedQuery.CriticalLevel]; callers should pin it so a future divergence in
+// any one repo can't silently desync the class derivation.
 const CriticalLevel = 4
 
 // Pool labels, ordered by precedence: bad > good > unknown.
@@ -319,6 +325,45 @@ type Sample struct {
 	Score           int // cleave raw score
 	MaxCrit         int // max trait criticality level (5=hostile, 4=suspicious, ...)
 	SuspiciousCount int // count of traits with level>=4 (suspicious or hostile)
+}
+
+// scrubNULs removes embedded NUL bytes (0x00) from a sample's TEXT fields.
+// PostgreSQL stores text as C strings and rejects an embedded 0x00 with
+// SQLSTATE 22021 ("invalid byte sequence for encoding UTF8"); a malformed
+// archive member whose path or filename carries one would otherwise fail every
+// INSERT/COPY for that sample — and, because the failure is deterministic, the
+// worker would retry it forever. A NUL is never legitimate filesystem
+// metadata, so dropping it is safe. The JSONB result columns are handled
+// separately by [sanitizeJSONB]; SHA256 is validated as hex upstream.
+func (s *Sample) scrubNULs() {
+	fields := []struct {
+		p    *string
+		name string
+	}{
+		{&s.Source, "source"},
+		{&s.Feed, "feed"},
+		{&s.Ecosystem, "ecosystem"},
+		{&s.Filename, "filename"},
+		{&s.Label, "label"},
+		{&s.LabelSource, "label_source"},
+		{&s.Path, "path"},
+		{&s.Status, "status"},
+		{&s.Parent, "parent"},
+		{&s.Skip, "skip"},
+		{&s.Elements, "elements"},
+		{&s.URL, "url"},
+		{&s.Domain, "domain"},
+		{&s.Package, "package"},
+		{&s.Version, "version"},
+	}
+	for _, f := range fields {
+		if strings.IndexByte(*f.p, 0) < 0 {
+			continue
+		}
+		*f.p = strings.ReplaceAll(*f.p, "\x00", "")
+		slog.Warn("scrubbed NUL byte from sample text field",
+			"sha256", s.SHA256, "field", f.name)
+	}
 }
 
 // SampleLocation is one observation of a sample at a particular path. A
@@ -1990,6 +2035,12 @@ type FeedQuery struct {
 	TopLevelOnly  bool     // only samples with no archive parent
 	Offset        int      // pagination offset
 	Limit         int      // page size (clamped to 1–1000)
+	// CriticalLevel pins the hostile/suspicious cutoff used when deriving
+	// criticality from a v6 envelope's `ml.l` (see LitmusClasses). Callers
+	// set it to their own consumer-side definition so the class derivation
+	// stays consistent across repos; a zero (unset) value falls back to the
+	// package default [CriticalLevel].
+	CriticalLevel int
 }
 
 // FeedSamples returns analyzed samples matching the query, newest first.
@@ -2047,6 +2098,17 @@ func (q *FeedQuery) clamp() {
 	if q.Offset < 0 {
 		q.Offset = 0
 	}
+}
+
+// criticalLevel resolves the hostile/suspicious cutoff for deriving criticality
+// from a v6 litmus envelope's `ml.l`. A caller-pinned [FeedQuery.CriticalLevel]
+// wins so the derivation matches its definition of hostile; an unset (zero)
+// value falls back to the package default [CriticalLevel].
+func (q *FeedQuery) criticalLevel() int {
+	if q.CriticalLevel > 0 {
+		return q.CriticalLevel
+	}
+	return CriticalLevel
 }
 
 // sortBy returns the full ORDER BY direction clause for the configured
