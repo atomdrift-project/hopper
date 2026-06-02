@@ -21,9 +21,20 @@ import (
 	"codeberg.org/atomdrift/obs"
 )
 
-const dashQueryTimeout = 3 * time.Second
+// dashQueryTimeout bounds each dashboard stat query. The counts/aggregations
+// are index-only scans over millions of rows (rescan backlog, pending groups),
+// which can take several seconds under concurrent walk load; 3s was too tight
+// and left tiles perpetually stale. Results are cached (see dashCacheTTL), so a
+// query this slow runs at most about once per cache window, not per refresh.
+const dashQueryTimeout = 10 * time.Second
 
-// webDashboard serves a self-contained HTML page. Auto-refreshes every 5s.
+// dashCacheTTL is how long a computed dashboard stat is served before a refresh
+// recomputes it. Kept below the page auto-refresh interval so tiles stay live
+// without rerunning the heavy queries on every request.
+const dashCacheTTL = 45 * time.Second
+
+// webDashboard serves a self-contained HTML page. Auto-refreshes every 60s;
+// expensive stats are cached (dashCacheTTL) so most refreshes hit memory.
 // Fields guarded by cfgMu are set once via configure() after the load session
 // begins; the handler renders a startup-status page until then.
 type webDashboard struct {
@@ -152,14 +163,14 @@ func (wd *webDashboard) configure( //nolint:revive // argument-limit: dashboard 
 	wd.ndirs = ndirs
 	wd.traitsVersion = traitsVersion
 	wd.rescanAge = rescanAge
-	wd.newestATCache = fido.New[string, time.Time](fido.Size(1), fido.TTL(10*time.Second))
-	wd.rescanCache = fido.New[string, int64](fido.Size(1), fido.TTL(10*time.Second))
-	wd.healthCache = fido.New[string, hopper.WorkflowHealth](fido.Size(1), fido.TTL(10*time.Second))
-	wd.backlogCache = fido.New[string, []hopper.WorkflowBacklog](fido.Size(1), fido.TTL(10*time.Second))
-	wd.samplesCache = fido.New[string, []hopper.WorkflowSample](fido.Size(3), fido.TTL(10*time.Second))
+	wd.newestATCache = fido.New[string, time.Time](fido.Size(1), fido.TTL(dashCacheTTL))
+	wd.rescanCache = fido.New[string, int64](fido.Size(1), fido.TTL(dashCacheTTL))
+	wd.healthCache = fido.New[string, hopper.WorkflowHealth](fido.Size(1), fido.TTL(dashCacheTTL))
+	wd.backlogCache = fido.New[string, []hopper.WorkflowBacklog](fido.Size(1), fido.TTL(dashCacheTTL))
+	wd.samplesCache = fido.New[string, []hopper.WorkflowSample](fido.Size(3), fido.TTL(dashCacheTTL))
 }
 
-const maxThroughputSamples = 2880 // 4 hours at 5-second refresh
+const maxThroughputSamples = 2880 // ~48h at the 60s page refresh (one sample recorded per request)
 
 type throughputSample struct {
 	byNode map[string]int64 // keyed by worker name
@@ -563,7 +574,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 
 	var buf strings.Builder
 	buf.WriteString(`<!DOCTYPE html><html lang="en"><head>` +
-		`<meta charset="utf-8"><meta http-equiv="refresh" content="5">` +
+		`<meta charset="utf-8"><meta http-equiv="refresh" content="60">` +
 		`<title>hopper</title><style>` + css + `</style></head><body>`)
 
 	// Header + progress

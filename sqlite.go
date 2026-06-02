@@ -418,6 +418,23 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		}
 	}
 
+	// walk_staging holds (sha256, path) for every standalone file seen in the
+	// current walk; reconciliation anti-joins it against samples. See the pg.go
+	// equivalent. SQLite has no UNLOGGED tables, but this DB is the local cache
+	// (not the durable store), so a plain table is fine.
+	for _, ddl := range []string{
+		`CREATE TABLE IF NOT EXISTS walk_staging (
+			sha256 TEXT NOT NULL,
+			path   TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_reconcile_toplevel ON samples(sha256)
+			WHERE parent = '' AND (skip = '' OR skip = 'conflict')`,
+	} {
+		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite walk_staging: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -2115,39 +2132,36 @@ func (db *DB) setSkipSQLite(ctx context.Context, sha256, skip string) error {
 	return nil
 }
 
-func (db *DB) touchLocationsSQLite(ctx context.Context, keys []SampleLocationKey) error {
-	tx, err := db.lite.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("hopper: begin touch: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck // commit or rollback
-	stmt, err := tx.PrepareContext(ctx,
-		`UPDATE sample_locations SET last_seen_at = strftime('%Y-%m-%dT%H:%M:%f', 'now')
-		 WHERE sha256 = ? AND path = ?`)
-	if err != nil {
-		return fmt.Errorf("hopper: prepare touch: %w", err)
-	}
-	defer stmt.Close() //nolint:errcheck // best-effort cleanup
-	for _, k := range keys {
-		if _, err := stmt.ExecContext(ctx, k.SHA256, k.Path); err != nil {
-			return fmt.Errorf("hopper: touch location %s: %w", k.SHA256, err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("hopper: commit touch: %w", err)
+func (db *DB) startWalkStagingSQLite(ctx context.Context) error {
+	if _, err := db.lite.ExecContext(ctx, `DELETE FROM walk_staging`); err != nil {
+		return fmt.Errorf("hopper: clear walk staging: %w", err)
 	}
 	return nil
 }
 
-// liteWalkCutoff formats walkStart for comparison against sample_locations
-// last_seen_at, which is written by strftime('%Y-%m-%dT%H:%M:%f','now'). A one
-// second slack avoids excluding a file touched at the very start of the walk.
-func liteWalkCutoff(walkStart time.Time) string {
-	return walkStart.Add(-time.Second).UTC().Format("2006-01-02T15:04:05.000")
+func (db *DB) stageLocationsSQLite(ctx context.Context, keys []SampleLocationKey) error {
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("hopper: begin stage: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO walk_staging (sha256, path) VALUES (?, ?)`)
+	if err != nil {
+		return fmt.Errorf("hopper: prepare stage: %w", err)
+	}
+	defer stmt.Close() //nolint:errcheck // best-effort cleanup
+	for _, k := range keys {
+		if _, err := stmt.ExecContext(ctx, k.SHA256, k.Path); err != nil {
+			return fmt.Errorf("hopper: stage location %s: %w", k.SHA256, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("hopper: commit stage: %w", err)
+	}
+	return nil
 }
 
-func (db *DB) relabelFromPoolsSQLite(ctx context.Context, walkStart time.Time) (int64, error) {
-	cutoff := liteWalkCutoff(walkStart)
+func (db *DB) relabelFromPoolsSQLite(ctx context.Context) (int64, error) {
 	ts := now()
 	tx, err := db.lite.BeginTx(ctx, nil)
 	if err != nil {
@@ -2170,10 +2184,8 @@ func (db *DB) relabelFromPoolsSQLite(ctx context.Context, walkStart time.Time) (
 		WITH pools AS (
 			SELECT sha256,
 				MAX(path LIKE 'bad/%')  AS in_bad,
-				MAX(path LIKE 'good/%') AS in_good,
-				MAX(source)             AS src
-			FROM sample_locations
-			WHERE parent_sha256 = '' AND last_seen_at >= ?
+				MAX(path LIKE 'good/%') AS in_good
+			FROM walk_staging
 			GROUP BY sha256
 		)
 		SELECT s.sha256, s.label, s.skip,
@@ -2184,9 +2196,10 @@ func (db *DB) relabelFromPoolsSQLite(ctx context.Context, walkStart time.Time) (
 			     WHEN s.skip IN ('conflict', 'missing', 'unsupported') THEN ''
 			     ELSE s.skip END,
 			CASE WHEN p.in_bad = 1 AND p.in_good = 1 THEN 'conflict'
-			     ELSE p.src END
+			     WHEN s.label_source = 'conflict' THEN ''
+			     ELSE s.label_source END
 		FROM samples s JOIN pools p ON p.sha256 = s.sha256
-		WHERE s.parent = '' AND s.label_source <> 'marker'`, cutoff); err != nil {
+		WHERE s.parent = '' AND s.label_source <> 'marker'`); err != nil {
 		return 0, fmt.Errorf("hopper: relabel stage: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
@@ -2221,8 +2234,7 @@ func (db *DB) relabelFromPoolsSQLite(ctx context.Context, walkStart time.Time) (
 	return n, nil
 }
 
-func (db *DB) staleStandaloneSamplesSQLite(ctx context.Context, walkStart time.Time) ([]SampleLocationKey, int64, error) {
-	cutoff := liteWalkCutoff(walkStart)
+func (db *DB) staleStandaloneSamplesSQLite(ctx context.Context) ([]SampleLocationKey, int64, error) {
 	var eligible int64
 	if err := db.lite.QueryRowContext(ctx,
 		`SELECT count(*) FROM samples WHERE parent = '' AND skip IN ('', 'conflict')`).Scan(&eligible); err != nil {
@@ -2231,9 +2243,7 @@ func (db *DB) staleStandaloneSamplesSQLite(ctx context.Context, walkStart time.T
 	rows, err := db.lite.QueryContext(ctx, `
 		SELECT s.sha256, s.path FROM samples s
 		WHERE s.parent = '' AND s.skip IN ('', 'conflict')
-		  AND NOT EXISTS (
-			SELECT 1 FROM sample_locations sl
-			 WHERE sl.sha256 = s.sha256 AND sl.parent_sha256 = '' AND sl.last_seen_at >= ?)`, cutoff)
+		  AND s.sha256 NOT IN (SELECT sha256 FROM walk_staging)`)
 	if err != nil {
 		return nil, 0, fmt.Errorf("hopper: stale scan: %w", err)
 	}
@@ -2283,8 +2293,7 @@ func (db *DB) setSkipWithEventSQLite(ctx context.Context, sha256, skip, reason s
 	return true, nil
 }
 
-func (db *DB) cascadeMembersSQLite(ctx context.Context, walkStart time.Time) (cascaded, revived int64, err error) {
-	cutoff := liteWalkCutoff(walkStart)
+func (db *DB) cascadeMembersSQLite(ctx context.Context) (cascaded, revived int64, err error) {
 	ts := now()
 	tx, err := db.lite.BeginTx(ctx, nil)
 	if err != nil {
@@ -2293,8 +2302,9 @@ func (db *DB) cascadeMembersSQLite(ctx context.Context, walkStart time.Time) (ca
 	defer tx.Rollback() //nolint:errcheck // commit or rollback
 
 	// Reachability closure: a sha is alive if a standalone copy was seen this
-	// walk, or it is a member of an alive archive (transitively). A member with
-	// an edge to any alive archive therefore survives — the supply-chain veto.
+	// walk (in walk_staging), or it is a member of an alive archive (transitively).
+	// A member with an edge to any alive archive therefore survives — the
+	// supply-chain veto.
 	if _, err := tx.ExecContext(ctx,
 		`CREATE TEMP TABLE IF NOT EXISTS _alive (sha256 TEXT PRIMARY KEY)`); err != nil {
 		return 0, 0, fmt.Errorf("hopper: cascade temp: %w", err)
@@ -2304,13 +2314,12 @@ func (db *DB) cascadeMembersSQLite(ctx context.Context, walkStart time.Time) (ca
 	}
 	if _, err := tx.ExecContext(ctx, `
 		WITH RECURSIVE alive(sha256) AS (
-			SELECT DISTINCT sha256 FROM sample_locations
-			 WHERE parent_sha256 = '' AND last_seen_at >= ?
+			SELECT DISTINCT sha256 FROM walk_staging
 			UNION
 			SELECT sl.sha256 FROM sample_locations sl
 			  JOIN alive a ON sl.parent_sha256 = a.sha256
 		)
-		INSERT INTO _alive SELECT sha256 FROM alive`, cutoff); err != nil {
+		INSERT INTO _alive SELECT sha256 FROM alive`); err != nil {
 		return 0, 0, fmt.Errorf("hopper: cascade closure: %w", err)
 	}
 

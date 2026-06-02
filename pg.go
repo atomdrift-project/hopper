@@ -444,6 +444,21 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive,maintidx //
 			observed_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_label_events_sha ON label_events(sha256, observed_at)`,
+
+		// walk_staging holds (sha256, path) for every standalone file seen in the
+		// current walk. Reconciliation anti-joins it against samples to find moved
+		// /missing files instead of touching last_seen_at on every cache hit
+		// (millions of UPDATEs per walk). UNLOGGED: it is truncated and rebuilt
+		// each walk, so crash-durability is pointless and skipping WAL is a big win.
+		`CREATE UNLOGGED TABLE IF NOT EXISTS walk_staging (
+			sha256 TEXT NOT NULL,
+			path   TEXT NOT NULL
+		)`,
+
+		// Supports the reconcile anti-join / eligible count over the active
+		// top-level working set without scanning the full samples heap.
+		`CREATE INDEX IF NOT EXISTS idx_samples_reconcile_toplevel ON samples(sha256)
+			WHERE parent = '' AND (skip = '' OR skip = 'conflict')`,
 	} {
 		if err := db.execPGMigrationDDL(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate: %w", err)
@@ -2201,7 +2216,14 @@ func (db *DB) setSkipPG(ctx context.Context, sha256, skip string) error {
 	return nil
 }
 
-func (db *DB) touchLocationsPG(ctx context.Context, keys []SampleLocationKey) error {
+func (db *DB) startWalkStagingPG(ctx context.Context) error {
+	if _, err := db.pool.Exec(ctx, `TRUNCATE walk_staging`); err != nil {
+		return fmt.Errorf("hopper: clear walk staging: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) stageLocationsPG(ctx context.Context, keys []SampleLocationKey) error {
 	shas := make([]string, len(keys))
 	paths := make([]string, len(keys))
 	for i, k := range keys {
@@ -2209,17 +2231,16 @@ func (db *DB) touchLocationsPG(ctx context.Context, keys []SampleLocationKey) er
 		paths[i] = k.Path
 	}
 	_, err := db.pool.Exec(ctx, `
-		UPDATE sample_locations sl SET last_seen_at = now()
-		FROM unnest($1::text[], $2::text[]) AS v(sha256, path)
-		WHERE sl.sha256 = v.sha256 AND sl.path = v.path`,
+		INSERT INTO walk_staging (sha256, path)
+		SELECT sha256, path FROM unnest($1::text[], $2::text[]) AS v(sha256, path)`,
 		shas, paths)
 	if err != nil {
-		return fmt.Errorf("hopper: touch locations: %w", err)
+		return fmt.Errorf("hopper: stage locations: %w", err)
 	}
 	return nil
 }
 
-func (db *DB) relabelFromPoolsPG(ctx context.Context, walkStart time.Time) (int64, error) {
+func (db *DB) relabelFromPoolsPG(ctx context.Context) (int64, error) {
 	// One statement: a writable CTE updates the changed rows and the final
 	// INSERT audits them. PG executes every data-modifying CTE exactly once, so
 	// the UPDATE runs even though the INSERT reads pre-update values from
@@ -2228,10 +2249,8 @@ func (db *DB) relabelFromPoolsPG(ctx context.Context, walkStart time.Time) (int6
 		WITH pools AS (
 			SELECT sha256,
 				bool_or(path LIKE 'bad/%')  AS in_bad,
-				bool_or(path LIKE 'good/%') AS in_good,
-				max(source)                 AS src
-			FROM sample_locations
-			WHERE parent_sha256 = '' AND last_seen_at >= $1
+				bool_or(path LIKE 'good/%') AS in_good
+			FROM walk_staging
 			GROUP BY sha256
 		),
 		target AS (
@@ -2240,7 +2259,9 @@ func (db *DB) relabelFromPoolsPG(ctx context.Context, walkStart time.Time) (int6
 				CASE WHEN p.in_bad AND p.in_good THEN 'conflict'
 				     WHEN s.skip IN ('conflict', 'missing', 'unsupported') THEN ''
 				     ELSE s.skip END AS new_skip,
-				CASE WHEN p.in_bad AND p.in_good THEN 'conflict' ELSE p.src END AS new_source
+				CASE WHEN p.in_bad AND p.in_good THEN 'conflict'
+				     WHEN s.label_source = 'conflict' THEN ''
+				     ELSE s.label_source END AS new_source
 			FROM samples s JOIN pools p ON p.sha256 = s.sha256
 			WHERE s.parent = '' AND s.label_source <> 'marker'
 		),
@@ -2257,14 +2278,14 @@ func (db *DB) relabelFromPoolsPG(ctx context.Context, walkStart time.Time) (int6
 		INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
 		SELECT sha256, old_label, new_label, old_skip, new_skip,
 			CASE WHEN new_skip = 'conflict' THEN 'conflict' ELSE 'relabel' END, now()
-		FROM changed`, walkStart.Add(-time.Second))
+		FROM changed`)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: relabel: %w", err)
 	}
 	return tag.RowsAffected(), nil
 }
 
-func (db *DB) staleStandaloneSamplesPG(ctx context.Context, walkStart time.Time) ([]SampleLocationKey, int64, error) {
+func (db *DB) staleStandaloneSamplesPG(ctx context.Context) ([]SampleLocationKey, int64, error) {
 	var eligible int64
 	if err := db.pool.QueryRow(ctx,
 		`SELECT count(*) FROM samples WHERE parent = '' AND skip IN ('', 'conflict')`).Scan(&eligible); err != nil {
@@ -2273,10 +2294,7 @@ func (db *DB) staleStandaloneSamplesPG(ctx context.Context, walkStart time.Time)
 	rows, err := db.pool.Query(ctx, `
 		SELECT s.sha256, s.path FROM samples s
 		WHERE s.parent = '' AND s.skip IN ('', 'conflict')
-		  AND NOT EXISTS (
-			SELECT 1 FROM sample_locations sl
-			 WHERE sl.sha256 = s.sha256 AND sl.parent_sha256 = '' AND sl.last_seen_at >= $1)`,
-		walkStart.Add(-time.Second))
+		  AND NOT EXISTS (SELECT 1 FROM walk_staging w WHERE w.sha256 = s.sha256)`)
 	if err != nil {
 		return nil, 0, fmt.Errorf("hopper: stale scan: %w", err)
 	}
@@ -2310,11 +2328,9 @@ func (db *DB) setSkipWithEventPG(ctx context.Context, sha256, skip, reason strin
 	return tag.RowsAffected() > 0, nil
 }
 
-func (db *DB) cascadeMembersPG(ctx context.Context, walkStart time.Time) (cascaded, revived int64, err error) {
-	cutoff := walkStart.Add(-time.Second)
+func (db *DB) cascadeMembersPG(ctx context.Context) (cascaded, revived int64, err error) {
 	const aliveCTE = `WITH RECURSIVE alive(sha256) AS (
-		SELECT DISTINCT sha256 FROM sample_locations
-		 WHERE parent_sha256 = '' AND last_seen_at >= $1
+		SELECT DISTINCT sha256 FROM walk_staging
 		UNION
 		SELECT sl.sha256 FROM sample_locations sl
 		  JOIN alive a ON sl.parent_sha256 = a.sha256
@@ -2336,7 +2352,7 @@ func (db *DB) cascadeMembersPG(ctx context.Context, walkStart time.Time) (cascad
 			RETURNING s.sha256, s.label
 		)
 		INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
-		SELECT sha256, label, label, '', 'missing', 'cascade-missing', now() FROM casc`, cutoff)
+		SELECT sha256, label, label, '', 'missing', 'cascade-missing', now() FROM casc`)
 	if err != nil {
 		return 0, 0, fmt.Errorf("hopper: cascade apply: %w", err)
 	}
@@ -2349,7 +2365,7 @@ func (db *DB) cascadeMembersPG(ctx context.Context, walkStart time.Time) (cascad
 			RETURNING s.sha256, s.label
 		)
 		INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
-		SELECT sha256, label, label, 'missing', '', 'revive', now() FROM rev`, cutoff)
+		SELECT sha256, label, label, 'missing', '', 'revive', now() FROM rev`)
 	if err != nil {
 		return 0, 0, fmt.Errorf("hopper: revive apply: %w", err)
 	}

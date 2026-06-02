@@ -1441,12 +1441,13 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 
 	// runWalk executes one full enumeration→hash→insert pass across all dirs.
 	runWalk := func(chs []<-chan labeledPath) {
-		// Captured before any DB write this pass; reconciliation treats a
-		// location's last_seen_at >= walkStart as "present in this walk".
-		walkStart := time.Now()
+		// Empty the staging table so this pass records a fresh present-set;
+		// reconciliation anti-joins it against samples to find moved/missing files.
+		if err := db.StartWalkStaging(ctx); err != nil {
+			slog.Error("start walk staging failed", "error", err)
+		}
 		// Reset walk-phase counters so they reflect the current pass, not a
-		// cumulative total across re-walks. Presence is now tracked by
-		// sample_locations.last_seen_at, not an in-memory path set.
+		// cumulative total across re-walks.
 		progress.walked.Store(0)
 		progress.hashed.Store(0)
 		progress.inserted.Store(0)
@@ -1487,7 +1488,7 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 			toDiskPath := func(path string) string {
 				return sampleDiskPath(filepath.Dir(dirs[0].dir), filepath.FromSlash(path))
 			}
-			if st, err := db.ReconcilePools(ctx, walkStart, toDiskPath); err != nil {
+			if st, err := db.ReconcilePools(ctx, toDiskPath); err != nil {
 				slog.Error("reconcile pools failed", "error", err)
 			} else if st.Relabeled+st.MarkedMissing+st.MarkedUnsupported+st.CascadedMissing+st.Revived > 0 {
 				slog.Info("reconciled pools",
@@ -1534,29 +1535,30 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	return int(progress.inserted.Load() + progress.skipped.Load())
 }
 
-// locationToucher batches last_seen_at refreshes for cache-hit files that skip
-// the insert path. Without these touches a cache hit would leave its location
-// looking stale, so pool reconciliation would wrongly treat the file as moved.
-type locationToucher struct {
+// walkStager batches every standalone file seen this walk into walk_staging,
+// which ReconcilePools anti-joins against samples to find moved/missing files.
+// Appending to an unlogged staging table is far cheaper than the per-file
+// last_seen_at UPDATE it replaces (millions of indexed writes per walk).
+type walkStager struct {
 	db    *hopper.DB
 	batch []hopper.SampleLocationKey
 }
 
-func (t *locationToucher) add(ctx context.Context, sha, path string) {
-	t.batch = append(t.batch, hopper.SampleLocationKey{SHA256: sha, Path: path})
-	if len(t.batch) >= loadBatchSize {
-		t.flush(ctx)
+func (s *walkStager) add(ctx context.Context, sha, path string) {
+	s.batch = append(s.batch, hopper.SampleLocationKey{SHA256: sha, Path: path})
+	if len(s.batch) >= loadBatchSize {
+		s.flush(ctx)
 	}
 }
 
-func (t *locationToucher) flush(ctx context.Context) {
-	if len(t.batch) == 0 {
+func (s *walkStager) flush(ctx context.Context) {
+	if len(s.batch) == 0 {
 		return
 	}
-	if err := t.db.TouchLocations(ctx, t.batch); err != nil && ctx.Err() == nil {
-		slog.Warn("touch locations failed", "error", err, "batch_size", len(t.batch))
+	if err := s.db.StageLocations(ctx, s.batch); err != nil && ctx.Err() == nil {
+		slog.Warn("stage locations failed", "error", err, "batch_size", len(s.batch))
 	}
-	t.batch = t.batch[:0]
+	s.batch = s.batch[:0]
 }
 
 // runDirPipeline is the hash→batch→insert pipeline for one labeled directory,
@@ -1576,10 +1578,10 @@ func runDirPipeline(
 	batchKeys := make([]cacheKey, 0, loadBatchSize)
 	pathBySha := make(map[string]string, loadBatchSize)
 
-	// Cache-hit files skip the batch insert, so their locations are touched
-	// separately to keep last_seen_at fresh for reconciliation.
-	toucher := &locationToucher{db: db}
-	defer toucher.flush(ctx)
+	// Every standalone file seen this walk is staged for reconciliation,
+	// regardless of whether it also goes through the batch insert below.
+	stager := &walkStager{db: db}
+	defer stager.flush(ctx)
 
 	flush := func() {
 		if len(batch) == 0 {
@@ -1645,14 +1647,16 @@ func runDirPipeline(
 
 		progress.hashed.Add(1)
 
+		// Stage every file seen this walk (present at its current pool path) so
+		// reconciliation can anti-join walk_staging against samples.
+		if hr.sample != nil {
+			stager.add(ctx, hr.sample.SHA256, storedPath)
+		}
+
 		// Cache hit + already inserted into DB → skip the batch insert entirely
-		// when there is no path-derived metadata to refresh. Still refresh the
-		// location's last_seen_at so reconciliation knows the file is present.
+		// when there is no path-derived metadata to refresh.
 		if hr.inserted && (hr.sample == nil || (hr.sample.Feed == "" && hr.sample.Ecosystem == "")) {
 			progress.skipped.Add(1)
-			if hr.sample != nil {
-				toucher.add(ctx, hr.sample.SHA256, storedPath)
-			}
 			continue
 		}
 
@@ -1671,7 +1675,9 @@ func runDirPipeline(
 				sample.LabelSource = "marker"
 				sample.Skip = "misclassified"
 				sample.MarkerMtime = markerMtime
-				slog.Info("misclassified file", "path", lp.path, "original_label", lp.label, "marker", marker)
+				// Debug, not Info: a full re-walk re-emits this for every marker
+				// file every cycle, which floods the log on large pools.
+				slog.Debug("misclassified file", "path", lp.path, "original_label", lp.label, "marker", marker)
 			}
 		}
 
@@ -1718,6 +1724,13 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 	const maxSamples = 120 // 10s * 120 = 20 minutes of history
 	var samples []sample
 
+	// rescanPending is an index-only count over millions of rows; recompute it at
+	// most once a minute (not every tick) and reuse the last value between, so the
+	// progress logger neither hammers the DB nor stalls on a slow count.
+	const rescanRecompute = time.Minute
+	var rescanPending int64
+	var lastRescanAt time.Time
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -1733,10 +1746,14 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 		// Oldest active claim per worker, read from the in-memory tracker.
 		oldestClaims := tracker.oldestPerWorker(staleClaimAge)
 		var newestAnalyzedAt time.Time
-		var rescanPending int64
 		if db != nil {
-			newestAnalyzedAt, _ = db.NewestAnalyzedAt(ctx)                          //nolint:errcheck // best-effort; zero time is acceptable fallback
-			rescanPending, _ = db.CountRescanPending(ctx, traitsVersion, rescanAge) //nolint:errcheck // best-effort; zero is acceptable fallback
+			newestAnalyzedAt, _ = db.NewestAnalyzedAt(ctx) //nolint:errcheck // best-effort; zero time is acceptable fallback
+			if lastRescanAt.IsZero() || time.Since(lastRescanAt) >= rescanRecompute {
+				qctx, cancel := context.WithTimeout(ctx, dashQueryTimeout)
+				rescanPending, _ = db.CountRescanPending(qctx, traitsVersion, rescanAge) //nolint:errcheck // best-effort; zero is acceptable fallback
+				cancel()
+				lastRescanAt = time.Now()
+			}
 		}
 
 		analyzedAbs := progress.analyzed.Load()

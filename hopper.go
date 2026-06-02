@@ -771,24 +771,34 @@ func (db *DB) SetSkip(ctx context.Context, sha256, skip string) error {
 	return db.setSkipSQLite(ctx, sha256, skip)
 }
 
-// SampleLocationKey identifies one (sha256, path) row in sample_locations.
+// SampleLocationKey identifies one (sha256, path) standalone file.
 type SampleLocationKey struct {
 	SHA256 string
 	Path   string
 }
 
-// TouchLocations refreshes last_seen_at on the given location rows so pool
-// reconciliation counts them as present in the current walk. Rows that no
-// longer exist are silently ignored. Used for cache-hit files that bypass the
-// normal insert path (which would otherwise refresh last_seen_at itself).
-func (db *DB) TouchLocations(ctx context.Context, keys []SampleLocationKey) error {
+// StartWalkStaging empties walk_staging at the start of a full walk. The walk
+// then streams every standalone file it sees into the table via StageLocations,
+// and ReconcilePools anti-joins it against samples to find moved/missing files.
+func (db *DB) StartWalkStaging(ctx context.Context) error {
+	if db.pool != nil {
+		return db.startWalkStagingPG(ctx)
+	}
+	return db.startWalkStagingSQLite(ctx)
+}
+
+// StageLocations records (sha256, path) standalone files seen in the current
+// walk into walk_staging. Cheap append-only inserts (PG: UNLOGGED, no WAL),
+// replacing the per-file last_seen_at UPDATE that previously cost millions of
+// indexed writes per walk.
+func (db *DB) StageLocations(ctx context.Context, keys []SampleLocationKey) error {
 	if len(keys) == 0 {
 		return nil
 	}
 	if db.pool != nil {
-		return db.touchLocationsPG(ctx, keys)
+		return db.stageLocationsPG(ctx, keys)
 	}
-	return db.touchLocationsSQLite(ctx, keys)
+	return db.stageLocationsSQLite(ctx, keys)
 }
 
 // DeleteSample removes a single sample by SHA256. Returns nil even if no
@@ -1400,36 +1410,36 @@ type ReconcileStats struct {
 //     supply-chain case: a benign file shared with a present package survives).
 //  4. Revives members whose containing archive reappeared.
 //
-// "Live this walk" means a location's last_seen_at >= walkStart, so callers MUST
-// refresh last_seen_at for every observed file (InsertSampleBatch and
-// TouchLocations do). diskPath maps a stored path to a local filesystem path so
-// a stale standalone file can be classified missing vs unsupported. Every
-// transition is recorded in label_events in the same transaction as the change.
-// A >50% missing rate aborts before any write, on the assumption the data
-// directory is misconfigured rather than legitimately emptied.
-func (db *DB) ReconcilePools(ctx context.Context, walkStart time.Time, diskPath func(string) string) (ReconcileStats, error) {
+// Presence is read from walk_staging, which the caller fills (StartWalkStaging
+// then StageLocations) with every standalone file seen this walk. diskPath maps
+// a stored path to a local filesystem path so a stale standalone file can be
+// classified missing vs unsupported. Every transition is recorded in
+// label_events in the same transaction as the change. A >50% missing rate aborts
+// before any write, on the assumption the data directory is misconfigured rather
+// than legitimately emptied.
+func (db *DB) ReconcilePools(ctx context.Context, diskPath func(string) string) (ReconcileStats, error) {
 	var stats ReconcileStats
 	var err error
 
 	// 1. Relabel top-level, non-marker samples from the pools their standalone
 	//    copies live in this walk (demote bad→good, promote good→bad, both→conflict).
 	if db.pool != nil {
-		stats.Relabeled, err = db.relabelFromPoolsPG(ctx, walkStart)
+		stats.Relabeled, err = db.relabelFromPoolsPG(ctx)
 	} else {
-		stats.Relabeled, err = db.relabelFromPoolsSQLite(ctx, walkStart)
+		stats.Relabeled, err = db.relabelFromPoolsSQLite(ctx)
 	}
 	if err != nil {
 		return stats, fmt.Errorf("hopper: reconcile relabel: %w", err)
 	}
 
-	// 2. Find top-level samples (skip empty or 'conflict') whose standalone copies
-	//    were not seen this walk, with the >50% guard checked before any write.
+	// 2. Find top-level samples (skip empty or 'conflict') not seen this walk,
+	//    with the >50% guard checked before any write.
 	var stale []SampleLocationKey
 	var eligible int64
 	if db.pool != nil {
-		stale, eligible, err = db.staleStandaloneSamplesPG(ctx, walkStart)
+		stale, eligible, err = db.staleStandaloneSamplesPG(ctx)
 	} else {
-		stale, eligible, err = db.staleStandaloneSamplesSQLite(ctx, walkStart)
+		stale, eligible, err = db.staleStandaloneSamplesSQLite(ctx)
 	}
 	if err != nil {
 		return stats, fmt.Errorf("hopper: reconcile stale scan: %w", err)
@@ -1471,9 +1481,9 @@ func (db *DB) ReconcilePools(ctx context.Context, walkStart time.Time, diskPath 
 	// 4. Cascade missing to members orphaned by a missing parent (shared-archive
 	//    veto applies), and revive members whose archive reappeared.
 	if db.pool != nil {
-		stats.CascadedMissing, stats.Revived, err = db.cascadeMembersPG(ctx, walkStart)
+		stats.CascadedMissing, stats.Revived, err = db.cascadeMembersPG(ctx)
 	} else {
-		stats.CascadedMissing, stats.Revived, err = db.cascadeMembersSQLite(ctx, walkStart)
+		stats.CascadedMissing, stats.Revived, err = db.cascadeMembersSQLite(ctx)
 	}
 	if err != nil {
 		return stats, fmt.Errorf("hopper: reconcile cascade: %w", err)
