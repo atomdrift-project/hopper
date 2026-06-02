@@ -1384,8 +1384,10 @@ type ReconcileStats struct {
 
 // ReconcilePools makes samples.label/skip authoritative against the current
 // state of the good/ and bad/ pool directories. It runs at the end of a full
-// walk and is the single authoritative writer of the derived label/skip cache,
-// using sample_locations as the source of truth for presence and containment.
+// walk and reconciles the derived label/skip cache to the truth — correcting
+// the monotonic, one-observation-at-a-time approximation the insert-time upsert
+// can only build mid-walk — using sample_locations as the source of truth for
+// presence and containment.
 //
 // It does four things, in order:
 //  1. Relabels top-level samples from the pools they currently live in: a file
@@ -1406,18 +1408,29 @@ type ReconcileStats struct {
 // A >50% missing rate aborts before any write, on the assumption the data
 // directory is misconfigured rather than legitimately emptied.
 func (db *DB) ReconcilePools(ctx context.Context, walkStart time.Time, diskPath func(string) string) (ReconcileStats, error) {
-	if diskPath == nil {
-		diskPath = func(p string) string { return p }
-	}
 	var stats ReconcileStats
+	var err error
 
-	relabeled, err := db.relabelFromPools(ctx, walkStart)
+	// 1. Relabel top-level, non-marker samples from the pools their standalone
+	//    copies live in this walk (demote bad→good, promote good→bad, both→conflict).
+	if db.pool != nil {
+		stats.Relabeled, err = db.relabelFromPoolsPG(ctx, walkStart)
+	} else {
+		stats.Relabeled, err = db.relabelFromPoolsSQLite(ctx, walkStart)
+	}
 	if err != nil {
 		return stats, fmt.Errorf("hopper: reconcile relabel: %w", err)
 	}
-	stats.Relabeled = relabeled
 
-	stale, eligible, err := db.staleStandaloneSamples(ctx, walkStart)
+	// 2. Find top-level samples (skip empty or 'conflict') whose standalone copies
+	//    were not seen this walk, with the >50% guard checked before any write.
+	var stale []SampleLocationKey
+	var eligible int64
+	if db.pool != nil {
+		stale, eligible, err = db.staleStandaloneSamplesPG(ctx, walkStart)
+	} else {
+		stale, eligible, err = db.staleStandaloneSamplesSQLite(ctx, walkStart)
+	}
 	if err != nil {
 		return stats, fmt.Errorf("hopper: reconcile stale scan: %w", err)
 	}
@@ -1429,12 +1442,18 @@ func (db *DB) ReconcilePools(ctx context.Context, walkStart time.Time, diskPath 
 			len(stale), eligible)
 	}
 
+	// 3. Classify each stale standalone file: gone → missing, present → unsupported.
 	for _, s := range stale {
 		skip := "unsupported" // present on disk but not enumerated by iter-files
 		if _, statErr := os.Stat(diskPath(s.Path)); statErr != nil {
 			skip = "missing" // gone from disk
 		}
-		changed, err := db.setSkipWithEvent(ctx, s.SHA256, skip, skip)
+		var changed bool
+		if db.pool != nil {
+			changed, err = db.setSkipWithEventPG(ctx, s.SHA256, skip, skip)
+		} else {
+			changed, err = db.setSkipWithEventSQLite(ctx, s.SHA256, skip, skip)
+		}
 		if err != nil {
 			return stats, fmt.Errorf("hopper: reconcile mark %s: %w", skip, err)
 		}
@@ -1449,52 +1468,17 @@ func (db *DB) ReconcilePools(ctx context.Context, walkStart time.Time, diskPath 
 		}
 	}
 
-	cascaded, revived, err := db.cascadeMembers(ctx, walkStart)
+	// 4. Cascade missing to members orphaned by a missing parent (shared-archive
+	//    veto applies), and revive members whose archive reappeared.
+	if db.pool != nil {
+		stats.CascadedMissing, stats.Revived, err = db.cascadeMembersPG(ctx, walkStart)
+	} else {
+		stats.CascadedMissing, stats.Revived, err = db.cascadeMembersSQLite(ctx, walkStart)
+	}
 	if err != nil {
 		return stats, fmt.Errorf("hopper: reconcile cascade: %w", err)
 	}
-	stats.CascadedMissing = cascaded
-	stats.Revived = revived
 	return stats, nil
-}
-
-// relabelFromPools rewrites label/skip on top-level, non-marker samples from the
-// pools their standalone copies currently live in this walk. See ReconcilePools.
-func (db *DB) relabelFromPools(ctx context.Context, walkStart time.Time) (int64, error) {
-	if db.pool != nil {
-		return db.relabelFromPoolsPG(ctx, walkStart)
-	}
-	return db.relabelFromPoolsSQLite(ctx, walkStart)
-}
-
-// staleStandaloneSamples returns top-level samples (skip empty or 'conflict')
-// whose standalone locations were not seen this walk, plus the count of all such
-// eligible samples for the >50% guard.
-func (db *DB) staleStandaloneSamples(ctx context.Context, walkStart time.Time) ([]SampleLocationKey, int64, error) {
-	if db.pool != nil {
-		return db.staleStandaloneSamplesPG(ctx, walkStart)
-	}
-	return db.staleStandaloneSamplesSQLite(ctx, walkStart)
-}
-
-// setSkipWithEvent sets skip on one sample and records the transition in
-// label_events in the same transaction. Returns false (no event) when the skip
-// is already the target value.
-func (db *DB) setSkipWithEvent(ctx context.Context, sha256, skip, reason string) (bool, error) {
-	if db.pool != nil {
-		return db.setSkipWithEventPG(ctx, sha256, skip, reason)
-	}
-	return db.setSkipWithEventSQLite(ctx, sha256, skip, reason)
-}
-
-// cascadeMembers marks archive members missing when every archive containing
-// them is gone, and revives members whose archive reappeared. Returns the
-// (cascaded, revived) counts. See ReconcilePools.
-func (db *DB) cascadeMembers(ctx context.Context, walkStart time.Time) (int64, int64, error) {
-	if db.pool != nil {
-		return db.cascadeMembersPG(ctx, walkStart)
-	}
-	return db.cascadeMembersSQLite(ctx, walkStart)
 }
 
 // Pull-based work scheduling.

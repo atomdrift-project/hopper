@@ -42,7 +42,7 @@ func openPG(ctx context.Context, dsn string) (*DB, error) {
 	return &DB{pool: pool}, nil
 }
 
-func (db *DB) migratePG(ctx context.Context) error { //nolint:revive // long sequential migration list; splitting reduces clarity
+func (db *DB) migratePG(ctx context.Context) error { //nolint:revive,maintidx // long sequential migration list; splitting reduces clarity
 	slog.Info("executing initial schema ddl")
 	if _, err := db.pool.Exec(ctx, schemaPG); err != nil {
 		return fmt.Errorf("hopper: migrate: %w", err)
@@ -2245,7 +2245,8 @@ func (db *DB) relabelFromPoolsPG(ctx context.Context, walkStart time.Time) (int6
 			WHERE s.parent = '' AND s.label_source <> 'marker'
 		),
 		changed AS (
-			SELECT * FROM target WHERE new_label <> old_label OR new_skip <> old_skip
+			SELECT sha256, old_label, old_skip, new_label, new_skip, new_source
+			FROM target WHERE new_label <> old_label OR new_skip <> old_skip
 		),
 		upd AS (
 			UPDATE samples s SET label = c.new_label, skip = c.new_skip,
@@ -2309,7 +2310,7 @@ func (db *DB) setSkipWithEventPG(ctx context.Context, sha256, skip, reason strin
 	return tag.RowsAffected() > 0, nil
 }
 
-func (db *DB) cascadeMembersPG(ctx context.Context, walkStart time.Time) (int64, int64, error) {
+func (db *DB) cascadeMembersPG(ctx context.Context, walkStart time.Time) (cascaded, revived int64, err error) {
 	cutoff := walkStart.Add(-time.Second)
 	const aliveCTE = `WITH RECURSIVE alive(sha256) AS (
 		SELECT DISTINCT sha256 FROM sample_locations

@@ -1534,6 +1534,31 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	return int(progress.inserted.Load() + progress.skipped.Load())
 }
 
+// locationToucher batches last_seen_at refreshes for cache-hit files that skip
+// the insert path. Without these touches a cache hit would leave its location
+// looking stale, so pool reconciliation would wrongly treat the file as moved.
+type locationToucher struct {
+	db    *hopper.DB
+	batch []hopper.SampleLocationKey
+}
+
+func (t *locationToucher) add(ctx context.Context, sha, path string) {
+	t.batch = append(t.batch, hopper.SampleLocationKey{SHA256: sha, Path: path})
+	if len(t.batch) >= loadBatchSize {
+		t.flush(ctx)
+	}
+}
+
+func (t *locationToucher) flush(ctx context.Context) {
+	if len(t.batch) == 0 {
+		return
+	}
+	if err := t.db.TouchLocations(ctx, t.batch); err != nil && ctx.Err() == nil {
+		slog.Warn("touch locations failed", "error", err, "batch_size", len(t.batch))
+	}
+	t.batch = t.batch[:0]
+}
+
 // runDirPipeline is the hash→batch→insert pipeline for one labeled directory,
 // fed by a pre-started enumeration channel. Everything runs sequentially in
 // this one goroutine so batches stay coherent without cross-goroutine plumbing;
@@ -1551,24 +1576,10 @@ func runDirPipeline(
 	batchKeys := make([]cacheKey, 0, loadBatchSize)
 	pathBySha := make(map[string]string, loadBatchSize)
 
-	// Cache-hit files skip the batch insert entirely, so their location rows
-	// would never have last_seen_at refreshed — which pool reconciliation
-	// relies on to tell "still on disk" from "moved away". Touch them in
-	// batches so liveness stays a cheap indexed last_seen_at >= walkStart query
-	// instead of an app-side full scan.
-	touchBatch := make([]hopper.SampleLocationKey, 0, loadBatchSize)
-	touchFlush := func() {
-		if len(touchBatch) == 0 {
-			return
-		}
-		if err := db.TouchLocations(ctx, touchBatch); err != nil {
-			if ctx.Err() == nil {
-				slog.Warn("touch locations failed", "error", err, "batch_size", len(touchBatch))
-			}
-		}
-		touchBatch = touchBatch[:0]
-	}
-	defer touchFlush()
+	// Cache-hit files skip the batch insert, so their locations are touched
+	// separately to keep last_seen_at fresh for reconciliation.
+	toucher := &locationToucher{db: db}
+	defer toucher.flush(ctx)
 
 	flush := func() {
 		if len(batch) == 0 {
@@ -1640,10 +1651,7 @@ func runDirPipeline(
 		if hr.inserted && (hr.sample == nil || (hr.sample.Feed == "" && hr.sample.Ecosystem == "")) {
 			progress.skipped.Add(1)
 			if hr.sample != nil {
-				touchBatch = append(touchBatch, hopper.SampleLocationKey{SHA256: hr.sample.SHA256, Path: storedPath})
-				if len(touchBatch) >= loadBatchSize {
-					touchFlush()
-				}
+				toucher.add(ctx, hr.sample.SHA256, storedPath)
 			}
 			continue
 		}

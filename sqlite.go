@@ -2211,7 +2211,10 @@ func (db *DB) relabelFromPoolsSQLite(ctx context.Context, walkStart time.Time) (
 	if err != nil {
 		return 0, fmt.Errorf("hopper: relabel apply: %w", err)
 	}
-	n, _ := res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("hopper: relabel rows: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("hopper: commit relabel: %w", err)
 	}
@@ -2253,11 +2256,12 @@ func (db *DB) setSkipWithEventSQLite(ctx context.Context, sha256, skip, reason s
 	}
 	defer tx.Rollback() //nolint:errcheck // commit or rollback
 	var label, curSkip string
-	switch err := tx.QueryRowContext(ctx,
-		`SELECT label, skip FROM samples WHERE sha256 = ?`, sha256).Scan(&label, &curSkip); {
-	case errors.Is(err, sql.ErrNoRows):
+	err = tx.QueryRowContext(ctx,
+		`SELECT label, skip FROM samples WHERE sha256 = ?`, sha256).Scan(&label, &curSkip)
+	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
-	case err != nil:
+	}
+	if err != nil {
 		return false, fmt.Errorf("hopper: set skip event read: %w", err)
 	}
 	if curSkip == skip {
@@ -2279,7 +2283,7 @@ func (db *DB) setSkipWithEventSQLite(ctx context.Context, sha256, skip, reason s
 	return true, nil
 }
 
-func (db *DB) cascadeMembersSQLite(ctx context.Context, walkStart time.Time) (int64, int64, error) {
+func (db *DB) cascadeMembersSQLite(ctx context.Context, walkStart time.Time) (cascaded, revived int64, err error) {
 	cutoff := liteWalkCutoff(walkStart)
 	ts := now()
 	tx, err := db.lite.BeginTx(ctx, nil)
@@ -2325,7 +2329,9 @@ func (db *DB) cascadeMembersSQLite(ctx context.Context, walkStart time.Time) (in
 	if err != nil {
 		return 0, 0, fmt.Errorf("hopper: cascade apply: %w", err)
 	}
-	cascaded, _ := cascRes.RowsAffected()
+	if cascaded, err = cascRes.RowsAffected(); err != nil {
+		return 0, 0, fmt.Errorf("hopper: cascade rows: %w", err)
+	}
 
 	// Revive members whose archive reappeared.
 	if _, err := tx.ExecContext(ctx, `
@@ -2341,9 +2347,11 @@ func (db *DB) cascadeMembersSQLite(ctx context.Context, walkStart time.Time) (in
 	if err != nil {
 		return 0, 0, fmt.Errorf("hopper: revive apply: %w", err)
 	}
-	revived, _ := revRes.RowsAffected()
+	if revived, err = revRes.RowsAffected(); err != nil {
+		return 0, 0, fmt.Errorf("hopper: revive rows: %w", err)
+	}
 
-	if err := tx.Commit(); err != nil {
+	if err = tx.Commit(); err != nil {
 		return 0, 0, fmt.Errorf("hopper: commit cascade: %w", err)
 	}
 	return cascaded, revived, nil
