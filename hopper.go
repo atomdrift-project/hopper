@@ -1244,6 +1244,22 @@ func (db *DB) SamplesByParent(ctx context.Context, parentSHA string) ([]*Sample,
 	return db.samplesByParentSQLite(ctx, parentSHA)
 }
 
+// BadMembersByParent returns only the bad-labeled members of an archive. Callers
+// that just need to find a dangerous member (e.g. promoter's bad-archive gate)
+// should prefer this over SamplesByParent: it filters in SQL, bounding memory to
+// the bad-member count rather than materializing every member — and its
+// cleave/litmus blobs — of an archive that may have an attacker-chosen number of
+// entries.
+func (db *DB) BadMembersByParent(ctx context.Context, parentSHA string) ([]*Sample, error) {
+	if parentSHA == "" {
+		return nil, nil
+	}
+	if db.pool != nil {
+		return db.badMembersByParentPG(ctx, parentSHA)
+	}
+	return db.badMembersByParentSQLite(ctx, parentSHA)
+}
+
 // SampleParentInfo fetches only the fields needed by ExplodeArchiveMembers,
 // avoiding the cost of reading the full row (especially the large cleave_result
 // JSONB column which the caller already has).

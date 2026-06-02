@@ -1178,6 +1178,15 @@ func (db *DB) samplesByParentPG(ctx context.Context, parentSHA string) ([]*Sampl
 	return scanPGSamples(rows)
 }
 
+func (db *DB) badMembersByParentPG(ctx context.Context, parentSHA string) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples WHERE parent = $1 AND label = 'bad' ORDER BY path`, parentSHA)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: bad members by parent %s: %w", parentSHA, err)
+	}
+	return scanPGSamples(rows)
+}
+
 const pgLocationCols = `id, sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime, first_seen_at, last_seen_at`
 
 func scanPGLocation(row interface{ Scan(...any) error }) (*SampleLocation, error) {
