@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -146,8 +147,26 @@ type workerStats struct {
 	Errors       int64
 	Load1        float64 // last reported 1-minute load average (0 = unknown)
 	Slots        int
-	ActiveClaims int // jobs claimed but not yet returned
+	ActiveClaims int // jobs claimed but not yet returned (hopper's own accounting)
 	RSSMB        int // last reported RSS in MiB (0 = unknown)
+	// Worker-reported view from /api/heartbeat. These are display-only and never
+	// persisted — the worker recomputes them every beat. Queue is the staged
+	// backlog (prefetched but not yet dispatched); ReportedActive is running
+	// analyses. The remaining fields are the worker's own local-queue telemetry.
+	Queue          int
+	ReportedActive int
+	// OldestQueueSince is when the oldest still-queued item entered the queue
+	// (zero if the queue is empty); the dashboard shows the elapsed age.
+	OldestQueueSince time.Time
+	// LastCompletion is when the worker last finished a job (zero if none yet).
+	LastCompletion time.Time
+	// FilesPerSec is the worker's trailing 15-minute throughput.
+	FilesPerSec float64
+	// ErrorsRecent is the worker's error count over the trailing 15 minutes.
+	ErrorsRecent int
+	// LastError and LastErrorAt are the worker's most recent analysis error.
+	LastError   string
+	LastErrorAt time.Time
 }
 
 func newWorkerTracker() *workerTracker {
@@ -294,6 +313,63 @@ func (wt *workerTracker) update(name string, slots int, version, traits string, 
 	ws.Tools = tools
 }
 
+// heartbeat records a dedicated /api/heartbeat check-in. It refreshes the same
+// liveness signals as update plus the worker's self-reported local-queue
+// telemetry, which the work-claim path can't supply. ActiveClaims/TotalClaimed/
+// LastClaimed stay owned by tryClaimBatch and release; do not bump them here.
+func (wt *workerTracker) heartbeat(name string, hb workerHeartbeat) {
+	wt.mu.Lock()
+	defer wt.mu.Unlock()
+	ws, ok := wt.workers[name]
+	if !ok {
+		if len(wt.workers) >= maxTrackedWorkers {
+			return // silently drop to prevent memory exhaustion
+		}
+		ws = &workerStats{}
+		wt.workers[name] = ws
+	}
+	ws.LastSeen = time.Now()
+	ws.Slots = hb.slots
+	ws.Version = hb.version
+	ws.Traits = hb.traits
+	ws.RSSMB = hb.rssMB
+	ws.Load1 = hb.load1
+	ws.Tools = hb.tools
+	ws.Queue = hb.queue
+	ws.ReportedActive = hb.active
+	ws.OldestQueueSince = hb.oldestQueueSince
+	ws.LastCompletion = hb.lastCompletion
+	ws.FilesPerSec = hb.filesPerSec
+	ws.ErrorsRecent = hb.errorsRecent
+	ws.LastError = hb.lastError
+	ws.LastErrorAt = hb.lastErrorAt
+}
+
+// workerHeartbeat is the parsed payload of one /api/heartbeat request. Timestamps
+// are already converted from the worker's relative ages to absolute hopper-clock
+// times at receipt, so the dashboard can render them with time.Since.
+type workerHeartbeat struct {
+	lastSeenSignals
+	queue            int
+	active           int
+	oldestQueueSince time.Time
+	lastCompletion   time.Time
+	filesPerSec      float64
+	errorsRecent     int
+	lastError        string
+	lastErrorAt      time.Time
+}
+
+// lastSeenSignals are the liveness fields shared by /api/next and /api/heartbeat.
+type lastSeenSignals struct {
+	slots   int
+	version string
+	traits  string
+	tools   string
+	rssMB   int
+	load1   float64
+}
+
 // shouldUpsertWorker reports whether the workers-table heartbeat row for the
 // named worker should be re-persisted, and stamps the time if so. The DB row
 // is purely for crash inspection — the dashboard reads from this tracker —
@@ -432,6 +508,7 @@ func (wt *workerTracker) all() []namedWorkerStats {
 // registerAPI mounts the work API routes on the given mux.
 func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/next", s.handleNext)
+	mux.HandleFunc("GET /api/heartbeat", s.handleHeartbeat)
 	mux.HandleFunc("POST /api/result", s.handleResult)
 	mux.HandleFunc("POST /api/upload", s.handleUpload)
 	mux.HandleFunc("GET /api/file/{sha256}", s.handleFile)
@@ -637,6 +714,93 @@ func filterCandidatesByWorkerTools(cands []hopper.ClaimJob, tools *workerToolSet
 		}
 	}
 	return out
+}
+
+// handleHeartbeat records a worker check-in without claiming work. The claim
+// path (/api/next) only contacts hopper when a worker has buffer room, so a
+// saturated worker can vanish from the dashboard for minutes; this endpoint
+// gives every worker a fixed-cadence liveness signal carrying RSS, load, queue
+// depth, and local-queue telemetry. Heartbeats are display-only and are never
+// persisted to the DB — the worker recomputes everything each beat, so a DB
+// write would be pure load with no recovery value.
+// GET /api/heartbeat?worker=nuc&slots=4&active=3&queue=2&fps=1.5&version=0.8.2&...
+func (s *apiServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	worker := r.URL.Query().Get("worker")
+	if !validWorkerName(worker) {
+		http.Error(w, `{"error":"invalid worker name"}`, http.StatusBadRequest)
+		return
+	}
+	worker = qualifiedWorkerName(worker, r.RemoteAddr)
+
+	q := r.URL.Query()
+	now := time.Now()
+	hb := workerHeartbeat{
+		lastSeenSignals: lastSeenSignals{
+			slots:   queryIntDefault(q, "slots", 1),
+			version: q.Get("version"),
+			traits:  q.Get("traits"),
+			load1:   queryFloat(q, "load1"),
+		},
+		queue:        queryIntDefault(q, "queue", 0),
+		active:       queryIntDefault(q, "active", 0),
+		filesPerSec:  queryFloat(q, "fps"),
+		errorsRecent: queryIntDefault(q, "errs", 0),
+		lastError:    q.Get("err"),
+	}
+	hb.tools, _ = parseWorkerTools(q["tools"])
+	if n := queryIntDefault(q, "rss_mb", -1); n >= 0 {
+		hb.rssMB = n
+	}
+	// Ages arrive relative to the worker's clock; anchor them to hopper's clock
+	// at receipt so the dashboard renders a live "x ago" without clock-sync.
+	if s, ok := queryAgeBefore(q, "oldest_s", now); ok {
+		hb.oldestQueueSince = s
+	}
+	if s, ok := queryAgeBefore(q, "done_age_s", now); ok {
+		hb.lastCompletion = s
+	}
+	if s, ok := queryAgeBefore(q, "err_age_s", now); ok {
+		hb.lastErrorAt = s
+	}
+
+	s.tracker.heartbeat(worker, hb)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// queryIntDefault returns the named query value parsed as a non-negative int,
+// or def when absent, unparseable, or negative.
+func queryIntDefault(q url.Values, name string, def int) int {
+	if v := q.Get(name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return def
+}
+
+// queryFloat parses the named query value as a non-negative float, or 0.
+func queryFloat(q url.Values, name string) float64 {
+	if v := q.Get(name); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			return f
+		}
+	}
+	return 0
+}
+
+// queryAgeBefore reads the named query value as an age in seconds and returns
+// the absolute time that many seconds before now. ok is false when the param is
+// absent or invalid, leaving the caller's timestamp zero.
+func queryAgeBefore(q url.Values, name string, now time.Time) (time.Time, bool) {
+	v := q.Get(name)
+	if v == "" {
+		return time.Time{}, false
+	}
+	secs, err := strconv.Atoi(v)
+	if err != nil || secs < 0 {
+		return time.Time{}, false
+	}
+	return now.Add(-time.Duration(secs) * time.Second), true
 }
 
 // handleNext claims work items for a worker.

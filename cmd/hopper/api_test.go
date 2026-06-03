@@ -111,6 +111,69 @@ func TestWorkerTrackerOldestPerWorkerPrunesStale(t *testing.T) {
 	}
 }
 
+func TestHandleHeartbeatRecordsTelemetryAndConvertsAges(t *testing.T) {
+	api := &apiServer{tracker: newWorkerTracker()} // db nil: heartbeat must not touch it
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/heartbeat?worker=nuc&slots=4&active=2&queue=3&rss_mb=512&load1=1.50"+
+			"&fps=2.500&errs=1&oldest_s=30&done_age_s=10&err_age_s=5&err=boom&version=9.9&traits=abcde",
+		http.NoBody)
+	req.RemoteAddr = "127.0.0.1:1234" // loopback keeps the bare worker name
+	rec := httptest.NewRecorder()
+
+	before := time.Now()
+	api.handleHeartbeat(rec, req)
+	after := time.Now()
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+
+	ws := api.tracker.workers["nuc"]
+	if ws == nil {
+		t.Fatal("worker not recorded in tracker")
+	}
+	if ws.Slots != 4 || ws.ReportedActive != 2 || ws.Queue != 3 {
+		t.Errorf("slots/active/queue = %d/%d/%d, want 4/2/3", ws.Slots, ws.ReportedActive, ws.Queue)
+	}
+	if ws.RSSMB != 512 || ws.Load1 != 1.5 || ws.FilesPerSec != 2.5 {
+		t.Errorf("rss/load/fps = %d/%.2f/%.3f, want 512/1.50/2.500", ws.RSSMB, ws.Load1, ws.FilesPerSec)
+	}
+	if ws.ErrorsRecent != 1 || ws.LastError != "boom" {
+		t.Errorf("errors = %d/%q, want 1/\"boom\"", ws.ErrorsRecent, ws.LastError)
+	}
+	if ws.Version != "9.9" || ws.Traits != "abcde" {
+		t.Errorf("version/traits = %q/%q, want \"9.9\"/\"abcde\"", ws.Version, ws.Traits)
+	}
+
+	// Ages are converted to absolute times anchored at receipt; each must land
+	// within the handler's execution window offset by the reported age.
+	assertAge := func(label string, got time.Time, ageSec int) {
+		t.Helper()
+		lo := before.Add(-time.Duration(ageSec) * time.Second)
+		hi := after.Add(-time.Duration(ageSec) * time.Second)
+		if got.Before(lo) || got.After(hi) {
+			t.Errorf("%s = %v, want within [%v, %v]", label, got, lo, hi)
+		}
+	}
+	assertAge("OldestQueueSince", ws.OldestQueueSince, 30)
+	assertAge("LastCompletion", ws.LastCompletion, 10)
+	assertAge("LastErrorAt", ws.LastErrorAt, 5)
+}
+
+func TestHandleHeartbeatRejectsInvalidWorker(t *testing.T) {
+	api := &apiServer{tracker: newWorkerTracker()}
+	req := httptest.NewRequest(http.MethodGet, "/api/heartbeat?worker=bad%20name", http.NoBody)
+	rec := httptest.NewRecorder()
+	api.handleHeartbeat(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+	if len(api.tracker.workers) != 0 {
+		t.Fatalf("invalid worker was recorded: %v", api.tracker.workers)
+	}
+}
+
 func TestWorkerToolParsingDistinguishesLegacyFromEmptyReport(t *testing.T) {
 	if tools, caps := parseWorkerTools(nil); tools != "" || caps != nil {
 		t.Fatalf("absent tools = %q/%v, want legacy nil capabilities", tools, caps)

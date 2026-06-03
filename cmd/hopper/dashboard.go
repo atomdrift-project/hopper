@@ -694,6 +694,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 			`<th>Worker</th><th>Litmus</th><th>Traits</th><th>Tools</th>` +
 			`<th>Tasks</th><th>Seen</th><th>Rate</th>` +
 			`<th class="col-rss">RSS</th><th>Load</th>` +
+			`<th>Queue</th><th>Last Done</th><th>F/s</th><th>Err 15m</th>` +
 			`<th>Analyzed</th><th>Errors</th><th>Oldest Job</th><th></th>` +
 			`</tr></thead><tbody>`)
 
@@ -753,6 +754,38 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 				oldestStr = fmt.Sprintf("%s (%s)", filepath.Base(claim.Path), shortDuration(age))
 			}
 
+			// Worker-reported local-queue telemetry (from /api/heartbeat).
+			queueStr := "—"
+			if w.Queue > 0 {
+				if !w.OldestQueueSince.IsZero() {
+					queueStr = fmt.Sprintf("%d · %s", w.Queue, shortDuration(time.Since(w.OldestQueueSince)))
+				} else {
+					queueStr = fmt.Sprintf("%d", w.Queue)
+				}
+			}
+
+			lastDoneStr := "—"
+			if !w.LastCompletion.IsZero() {
+				lastDoneStr = shortDuration(time.Since(w.LastCompletion))
+			}
+
+			fpsStr := "—"
+			if w.FilesPerSec > 0.005 {
+				fpsStr = fmt.Sprintf("%.2f/s", w.FilesPerSec)
+			}
+
+			// Errors in the trailing 15 min, with the most recent message (and
+			// how long ago) surfaced as a hover title.
+			err15Cell := `<td>—</td>`
+			if w.ErrorsRecent > 0 {
+				title := w.LastError
+				if !w.LastErrorAt.IsZero() {
+					title = strings.TrimSpace(title + " · " + shortDuration(time.Since(w.LastErrorAt)) + " ago")
+				}
+				err15Cell = fmt.Sprintf(`<td class="warn" title="%s">%d</td>`,
+					htmlEscape(title), w.ErrorsRecent)
+			}
+
 			fmt.Fprintf(&buf,
 				`<tr>`+
 					`<td class="nn"><span class="dot %s">●</span>%s</td>`+
@@ -764,6 +797,10 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 					`<td class="rate">%s</td>`+
 					`<td class="col-rss">%s</td>`+
 					`<td>%s</td>`+
+					`<td>%s</td>`+
+					`<td>%s</td>`+
+					`<td class="rate">%s</td>`+
+					`%s`+
 					`<td class="hi">%s</td>`+
 					`<td>%s</td>`+
 					`<td>%s</td>`+
@@ -778,6 +815,10 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 				rateStr,
 				rssStr,
 				loadStr,
+				htmlEscape(queueStr),
+				htmlEscape(lastDoneStr),
+				fpsStr,
+				err15Cell,
 				fmtN(w.Analyzed),
 				fmtN(w.Errors),
 				htmlEscape(oldestStr),
