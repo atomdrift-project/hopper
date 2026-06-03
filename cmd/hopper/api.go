@@ -26,6 +26,7 @@ import (
 	"codeberg.org/atomdrift/hopper"
 	"github.com/codeGROOVE-dev/retry"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/klauspost/compress/zstd"
 )
 
 // apiServer handles the pull-based work API. Workers poll /api/next for
@@ -463,7 +464,7 @@ const (
 	// explosionQueueSize bounds how many cleave results may be waiting for
 	// background archive expansion. Set well above expected steady-state so
 	// transient bursts don't push back on /api/result.
-	explosionQueueSize    = 4096
+	explosionQueueSize    = 16384
 	explosionWorkers      = 4
 	explosionDrainTimeout = 30 * time.Second
 
@@ -822,6 +823,31 @@ type resultRequest struct {
 	DurationMs int64           `json:"duration_ms"`
 }
 
+// resultBody returns a reader over the request body, transparently
+// decompressing when the worker advertised a Content-Encoding we support.
+// Both the compressed input and the decompressed output are bounded by
+// maxResultBodyBytes: a hostile or buggy client must not be able to drive
+// the server OOM with a small zstd stream that expands without limit. The
+// returned cleanup must be called once decoding is done.
+func resultBody(r *http.Request) (io.Reader, func(), error) {
+	body := io.LimitReader(r.Body, maxResultBodyBytes)
+	switch strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding"))) {
+	case "", "identity":
+		return body, func() {}, nil
+	case "zstd":
+		// One decoder per request: result POSTs are infrequent and large, so
+		// the decoder setup is dwarfed by the decode itself. Single-threaded
+		// and low-memory keeps the per-request footprint small under bursts.
+		zr, err := zstd.NewReader(body, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true))
+		if err != nil {
+			return nil, nil, err
+		}
+		return io.LimitReader(zr, maxResultBodyBytes), zr.Close, nil
+	default:
+		return nil, nil, errors.New("unsupported content-encoding")
+	}
+}
+
 // handleResult receives an analysis result from a worker.
 func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
@@ -831,8 +857,17 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	// Stream-decode rather than io.ReadAll: avoids a duplicate 128 MiB buffer
 	// per concurrent uploader. The Raw/ML json.RawMessage fields still land
 	// in memory once each, but we lose the second whole-body copy.
-	limited := io.LimitReader(r.Body, maxResultBodyBytes)
-	dec := json.NewDecoder(limited)
+	body, closeBody, err := resultBody(r)
+	if err != nil {
+		slog.Warn("result rejected: bad content-encoding", //nolint:gosec // structured logging
+			"error", err,
+			"remote", r.RemoteAddr,
+		)
+		http.Error(w, `{"error":"unsupported content-encoding"}`, http.StatusUnsupportedMediaType)
+		return
+	}
+	defer closeBody()
+	dec := json.NewDecoder(body)
 	var req resultRequest
 	if err := dec.Decode(&req); err != nil {
 		slog.Warn("result rejected: invalid json", //nolint:gosec // structured logging

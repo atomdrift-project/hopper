@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"codeberg.org/atomdrift/hopper"
+	"github.com/klauspost/compress/zstd"
 )
 
 func TestWorkerTrackerClaimAndRelease(t *testing.T) {
@@ -252,6 +253,60 @@ func TestHandleResultStoresAfterRequestContextCanceled(t *testing.T) {
 	}
 	if len(sample.CleaveResult) == 0 {
 		t.Fatal("cleave result was not stored")
+	}
+}
+
+func TestResultBody(t *testing.T) {
+	t.Parallel()
+
+	want := []byte(`{"sha256":"abc","worker":"w","raw":{"fs":[]}}`)
+
+	enc, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	compressed := enc.EncodeAll(want, nil)
+	if err := enc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	cases := []struct {
+		name     string
+		encoding string
+		body     []byte
+		wantErr  bool
+	}{
+		{"identity_implicit", "", want, false},
+		{"identity_explicit", "identity", want, false},
+		{"zstd", "zstd", compressed, false},
+		{"unsupported", "gzip", want, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := httptest.NewRequest(http.MethodPost, "/api/result", bytes.NewReader(tc.body))
+			if tc.encoding != "" {
+				r.Header.Set("Content-Encoding", tc.encoding)
+			}
+			reader, cleanup, err := resultBody(r)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("resultBody: expected error for unsupported encoding, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resultBody: %v", err)
+			}
+			defer cleanup()
+			got, err := io.ReadAll(reader)
+			if err != nil {
+				t.Fatalf("ReadAll: %v", err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("decoded body = %q, want %q", got, want)
+			}
+		})
 	}
 }
 

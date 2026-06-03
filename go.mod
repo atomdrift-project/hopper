@@ -7,6 +7,7 @@ require (
 	github.com/codeGROOVE-dev/fido v1.11.0
 	github.com/codeGROOVE-dev/retry v1.3.1
 	github.com/jackc/pgx/v5 v5.9.2
+	github.com/klauspost/compress v1.18.0
 	github.com/mattn/go-sqlite3 v1.14.44
 	golang.org/x/sync v0.20.0
 )
