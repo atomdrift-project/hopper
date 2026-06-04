@@ -2138,12 +2138,14 @@ func (db *DB) FeedSources(ctx context.Context, source, label string) ([]string, 
 
 // FeedEcosystems returns distinct ecosystem values for samples matching
 // source and label. Pass source="" to span all sources (legacy "harvest"
-// rows + new "forager" rows + manual uploads).
-func (db *DB) FeedEcosystems(ctx context.Context, source, label string) ([]string, error) {
+// rows + new "forager" rows + manual uploads). A non-zero since restricts
+// the result to ecosystems with at least one sample created at or after
+// that time; a zero since spans all history.
+func (db *DB) FeedEcosystems(ctx context.Context, source, label string, since time.Time) ([]string, error) {
 	if db.pool != nil {
-		return db.feedEcosystemsPG(ctx, source, label)
+		return db.feedEcosystemsPG(ctx, source, label, since)
 	}
-	return db.feedEcosystemsSQLite(ctx, source, label)
+	return db.feedEcosystemsSQLite(ctx, source, label, since)
 }
 
 // FeedDomains returns distinct domain values (eTLD+1 of where bytes were

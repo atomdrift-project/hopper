@@ -2568,11 +2568,17 @@ func (db *DB) feedSourcesPG(ctx context.Context, source, label string) ([]string
 	return scanPGStrings(rows)
 }
 
-func (db *DB) feedEcosystemsPG(ctx context.Context, source, label string) ([]string, error) {
+func (db *DB) feedEcosystemsPG(ctx context.Context, source, label string, since time.Time) ([]string, error) {
+	var sincePtr *time.Time
+	if !since.IsZero() {
+		u := since.UTC()
+		sincePtr = &u
+	}
 	rows, err := db.pool.Query(ctx, `
 		SELECT DISTINCT ecosystem FROM samples
 		WHERE ($1 = '' OR source = $1) AND ($2 = '' OR label = $2) AND ecosystem != ''
-		ORDER BY ecosystem`, source, label)
+		  AND ($3::timestamptz IS NULL OR created_at >= $3)
+		ORDER BY ecosystem`, source, label, sincePtr)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed ecosystems: %w", err)
 	}

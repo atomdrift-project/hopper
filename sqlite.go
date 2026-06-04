@@ -2596,9 +2596,16 @@ func (db *DB) feedSourcesSQLite(ctx context.Context, source, label string) ([]st
 	return scanLiteStrings(rows)
 }
 
-func (db *DB) feedEcosystemsSQLite(ctx context.Context, source, label string) ([]string, error) {
-	query := `SELECT DISTINCT ecosystem FROM samples WHERE (? = '' OR source = ?) AND (? = '' OR label = ?) AND ecosystem != '' ORDER BY ecosystem`
-	rows, err := db.lite.QueryContext(ctx, query, source, source, label, label)
+func (db *DB) feedEcosystemsSQLite(ctx context.Context, source, label string, since time.Time) ([]string, error) {
+	// created_at is stored as RFC3339Nano UTC text (see now()), so a
+	// same-format cutoff compares lexicographically. Empty cutoff disables
+	// the time filter, mirroring the source/label empty-string sentinels.
+	cutoff := ""
+	if !since.IsZero() {
+		cutoff = since.UTC().Format(time.RFC3339Nano)
+	}
+	query := `SELECT DISTINCT ecosystem FROM samples WHERE (? = '' OR source = ?) AND (? = '' OR label = ?) AND ecosystem != '' AND (? = '' OR created_at >= ?) ORDER BY ecosystem`
+	rows, err := db.lite.QueryContext(ctx, query, source, source, label, label, cutoff, cutoff)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed ecosystems: %w", err)
 	}

@@ -2337,12 +2337,29 @@ func TestFeedSamples(t *testing.T) {
 		t.Errorf("expected 2 sources, got %v", sources)
 	}
 
-	ecos, err := db.FeedEcosystems(ctx, "test", "bad")
+	ecos, err := db.FeedEcosystems(ctx, "test", "bad", time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(ecos) != 2 {
 		t.Errorf("expected 2 ecosystems, got %v", ecos)
+	}
+
+	// A since within the window keeps both freshly-inserted ecosystems; a
+	// since in the future excludes them, exercising both filter branches.
+	recent, err := db.FeedEcosystems(ctx, "test", "bad", time.Now().Add(-72*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recent) != 2 {
+		t.Errorf("expected 2 recent ecosystems, got %v", recent)
+	}
+	future, err := db.FeedEcosystems(ctx, "test", "bad", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(future) != 0 {
+		t.Errorf("expected 0 ecosystems past the cutoff, got %v", future)
 	}
 
 	count, err := db.FeedSamplesCount(ctx, q)
