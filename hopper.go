@@ -27,6 +27,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -2146,6 +2147,43 @@ func (db *DB) FeedEcosystems(ctx context.Context, source, label string, since ti
 		return db.feedEcosystemsPG(ctx, source, label, since)
 	}
 	return db.feedEcosystemsSQLite(ctx, source, label, since)
+}
+
+// DistinctEcosystems returns every distinct non-empty ecosystem value
+// currently stored across the samples and sample_locations tables. The
+// ecosystem-normalization repair uses it to find legacy values that need
+// remapping; it is not filtered by source or recency on purpose.
+func (db *DB) DistinctEcosystems(ctx context.Context) ([]string, error) {
+	if db.pool != nil {
+		return db.distinctEcosystemsPG(ctx)
+	}
+	return db.distinctEcosystemsSQLite(ctx)
+}
+
+// UpdateEcosystems remaps stored ecosystem values per mapping (old → new),
+// across both the samples and sample_locations tables, returning the total
+// rows changed. A new value of "" clears the column — how labels that are no
+// longer recognized runtimes (feed names, junk classifiers) are dropped.
+//
+// The whole remap runs as one statement per table rather than one per
+// distinct value. That matters at scale: sample_locations has no index on
+// ecosystem, so a per-value loop would seq-scan the (multi-million-row)
+// table once for every value being rewritten. Callers should omit no-op
+// entries (value mapping to itself); an empty mapping is a no-op.
+func (db *DB) UpdateEcosystems(ctx context.Context, mapping map[string]string) (int64, error) {
+	if len(mapping) == 0 {
+		return 0, nil
+	}
+	if db.pool != nil {
+		return db.updateEcosystemsPG(ctx, mapping)
+	}
+	return db.updateEcosystemsSQLite(ctx, mapping)
+}
+
+// sortedKeys returns m's keys in sorted order, so the generated SQL and its
+// bound parameters are deterministic (stable logs, reproducible tests).
+func sortedKeys(m map[string]string) []string {
+	return slices.Sorted(maps.Keys(m))
 }
 
 // FeedDomains returns distinct domain values (eTLD+1 of where bytes were

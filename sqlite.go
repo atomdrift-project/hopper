@@ -2604,12 +2604,62 @@ func (db *DB) feedEcosystemsSQLite(ctx context.Context, source, label string, si
 	if !since.IsZero() {
 		cutoff = since.UTC().Format(time.RFC3339Nano)
 	}
-	query := `SELECT DISTINCT ecosystem FROM samples WHERE (? = '' OR source = ?) AND (? = '' OR label = ?) AND ecosystem != '' AND (? = '' OR created_at >= ?) ORDER BY ecosystem`
+	query := `SELECT DISTINCT ecosystem FROM samples
+		WHERE (? = '' OR source = ?) AND (? = '' OR label = ?) AND ecosystem != ''
+		AND (? = '' OR created_at >= ?)
+		ORDER BY ecosystem`
 	rows, err := db.lite.QueryContext(ctx, query, source, source, label, label, cutoff, cutoff)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed ecosystems: %w", err)
 	}
 	return scanLiteStrings(rows)
+}
+
+func (db *DB) distinctEcosystemsSQLite(ctx context.Context) ([]string, error) {
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT ecosystem FROM samples WHERE ecosystem != ''
+		UNION
+		SELECT ecosystem FROM sample_locations WHERE ecosystem != ''
+		ORDER BY ecosystem`)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: distinct ecosystems: %w", err)
+	}
+	return scanLiteStrings(rows)
+}
+
+func (db *DB) updateEcosystemsSQLite(ctx context.Context, mapping map[string]string) (int64, error) {
+	// One CASE statement per table (single pass), filtered to the remapped
+	// values. Bind order matches placeholder order: the CASE's (when,then)
+	// pairs first, then the IN-list keys.
+	keys := sortedKeys(mapping)
+	var caseExpr strings.Builder
+	caseExpr.WriteString("CASE ecosystem")
+	args := make([]any, 0, len(keys)*3)
+	for _, k := range keys {
+		caseExpr.WriteString(" WHEN ? THEN ?")
+		args = append(args, k, mapping[k])
+	}
+	caseExpr.WriteString(" END")
+	in := make([]string, len(keys))
+	for i, k := range keys {
+		in[i] = "?"
+		args = append(args, k)
+	}
+	filter := strings.Join(in, ",")
+
+	var total int64
+	for _, table := range []string{"samples", "sample_locations"} {
+		// #nosec G201 -- table is a fixed local literal; all values are bound params.
+		q := fmt.Sprintf("UPDATE %s SET ecosystem = %s WHERE ecosystem IN (%s)", table, caseExpr.String(), filter)
+		res, err := db.lite.ExecContext(ctx, q, args...)
+		if err != nil {
+			return total, fmt.Errorf("hopper: update %s ecosystem: %w", table, err)
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			total += n
+		}
+	}
+	return total, nil
 }
 
 func (db *DB) feedDomainsSQLite(ctx context.Context, source, label string) ([]string, error) {

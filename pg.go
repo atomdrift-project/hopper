@@ -2585,6 +2585,47 @@ func (db *DB) feedEcosystemsPG(ctx context.Context, source, label string, since 
 	return scanPGStrings(rows)
 }
 
+func (db *DB) distinctEcosystemsPG(ctx context.Context) ([]string, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT ecosystem FROM samples WHERE ecosystem <> ''
+		UNION
+		SELECT ecosystem FROM sample_locations WHERE ecosystem <> ''
+		ORDER BY ecosystem`)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: distinct ecosystems: %w", err)
+	}
+	return scanPGStrings(rows)
+}
+
+func (db *DB) updateEcosystemsPG(ctx context.Context, mapping map[string]string) (int64, error) {
+	// One CASE statement per table, filtered to the remapped values via an
+	// array param so the partial idx_samples_ecosystem can drive the scan on
+	// samples; sample_locations is seq-scanned exactly once.
+	keys := sortedKeys(mapping)
+	var caseExpr strings.Builder
+	args := make([]any, 0, len(keys)*2+1)
+	caseExpr.WriteString("CASE ecosystem")
+	for _, k := range keys {
+		fmt.Fprintf(&caseExpr, " WHEN $%d THEN $%d", len(args)+1, len(args)+2)
+		args = append(args, k, mapping[k])
+	}
+	caseExpr.WriteString(" END")
+	args = append(args, keys)
+	filter := fmt.Sprintf("$%d::text[]", len(args))
+
+	var total int64
+	for _, table := range []string{"samples", "sample_locations"} {
+		// #nosec G201 -- table is a fixed local literal; all values are bound params.
+		q := fmt.Sprintf("UPDATE %s SET ecosystem = %s WHERE ecosystem = ANY(%s)", table, caseExpr.String(), filter)
+		tag, err := db.pool.Exec(ctx, q, args...)
+		if err != nil {
+			return total, fmt.Errorf("hopper: update %s ecosystem: %w", table, err)
+		}
+		total += tag.RowsAffected()
+	}
+	return total, nil
+}
+
 func (db *DB) feedDomainsPG(ctx context.Context, source, label string) ([]string, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT DISTINCT domain FROM samples

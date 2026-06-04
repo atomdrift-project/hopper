@@ -53,6 +53,7 @@ commands:
   conflict-review    list samples asserted both good and bad across pools
   backfill           re-derive columns from cleave_result/litmus_result blobs
   purge-unsupported  delete analyzed rows cleave could not classify
+  normalize-ecosystems  re-canonicalize stored ecosystem labels (dry-run)
   cleanup            delete wonky samples by skip category (interactive)
   stats              show sample counts
 `
@@ -437,6 +438,8 @@ func run(ctx context.Context) error {
 		return cmdBackfill(ctx)
 	case "purge-unsupported":
 		return cmdPurgeUnsupported(ctx)
+	case "normalize-ecosystems":
+		return cmdNormalizeEcosystems(ctx)
 	case "cleanup":
 		return cmdCleanup(ctx)
 	case "stats":
@@ -2727,6 +2730,59 @@ func cmdPurgeUnsupported(ctx context.Context) error {
 		return err
 	}
 	slog.Info("purge complete", "deleted", n)
+	return nil
+}
+
+// cmdNormalizeEcosystems re-applies pkgparse.NormalizeEcosystem to every
+// distinct ecosystem value already stored, rewriting legacy/junk labels to
+// their canonical runtime or clearing them when no runtime is known. It
+// repairs rows written before the normalizer existed (feed names like
+// "objectivesee", file-type tags like "c_linux") that the sticky upsert
+// would otherwise preserve forever. Dry-run by default; pass --apply to write.
+func cmdNormalizeEcosystems(ctx context.Context) error {
+	f := flag.NewFlagSet("normalize-ecosystems", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	apply := f.Bool("apply", false, "actually rewrite rows (default is dry-run)")
+	parseFlags(f, os.Args[2:])
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	values, err := db.DistinctEcosystems(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Build the old→new remap, skipping values that already normalize to
+	// themselves. The whole set is applied in one pass per table below.
+	mapping := make(map[string]string, len(values))
+	var cleared int
+	for _, v := range values {
+		n := pkgparse.NormalizeEcosystem(v)
+		if n == v {
+			continue
+		}
+		mapping[v] = n
+		if n == "" {
+			cleared++
+			writeStdoutf("would clear %q (no known runtime)\n", v)
+		} else {
+			writeStdoutf("would rewrite %q -> %q\n", v, n)
+		}
+	}
+
+	if !*apply {
+		writeStdoutf("%d distinct value(s) would change (%d cleared); re-run with --apply to write\n", len(mapping), cleared)
+		return nil
+	}
+	rows, err := db.UpdateEcosystems(ctx, mapping)
+	if err != nil {
+		return err
+	}
+	slog.Info("ecosystem normalization complete", "distinct_changed", len(mapping), "cleared", cleared, "rows_updated", rows)
 	return nil
 }
 

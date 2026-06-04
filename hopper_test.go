@@ -3495,3 +3495,50 @@ func TestKVSetIfAbsentAndGet(t *testing.T) {
 		t.Errorf("KVGet k2: got=%q err=%v, want other", got, err)
 	}
 }
+
+func TestUpdateEcosystem(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{SHA256: "e1", Source: "test", Ecosystem: "objectivesee", Label: "bad"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "e2", Source: "test", Ecosystem: "objectivesee", Label: "bad"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "e3", Source: "test", Ecosystem: "macos", Label: "bad"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "e4", Source: "test", Ecosystem: "c_linux", Label: "bad"})
+
+	assertEcosystems := func(want string) {
+		t.Helper()
+		got, err := db.DistinctEcosystems(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Join(got, ",") != want {
+			t.Fatalf("DistinctEcosystems = %v, want %q", got, want)
+		}
+	}
+
+	assertEcosystems("c_linux,macos,objectivesee")
+
+	// One call remaps several values at once: a junk value collapses onto an
+	// existing canonical one (objectivesee→macos) while another is cleared
+	// (c_linux→""). Each sample also has a sample_locations row. Rows changed:
+	// e1,e2 (objectivesee) + e4 (c_linux) = 3 samples + 3 locations = 6.
+	n, err := db.UpdateEcosystems(ctx, map[string]string{"objectivesee": "macos", "c_linux": ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 6 {
+		t.Errorf("UpdateEcosystems rows = %d, want 6 (3 samples + 3 locations)", n)
+	}
+	assertEcosystems("macos")
+
+	// Clearing to empty drops the value from the distinct set entirely.
+	if _, err := db.UpdateEcosystems(ctx, map[string]string{"macos": ""}); err != nil {
+		t.Fatal(err)
+	}
+	assertEcosystems("")
+
+	// An empty mapping is a no-op rather than a malformed statement.
+	if n, err := db.UpdateEcosystems(ctx, nil); err != nil || n != 0 {
+		t.Fatalf("UpdateEcosystems(nil) = %d, %v; want 0, nil", n, err)
+	}
+}
