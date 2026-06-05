@@ -2096,6 +2096,7 @@ type FeedQuery struct {
 	Label         string   // "bad", "good", "unknown", or "" (match any)
 	OrderBy       string   // "mtime" (default), "created_at", or "analyzed_at"
 	Formula       string   // optional: filter by exact cleave chemical formula
+	Search        string   // optional free-text: case-insensitive filename substring OR sha256 hex prefix
 	Feeds         []string // optional: filter by feed column values
 	Ecosystems    []string // optional: filter by ecosystem column values
 	Domains       []string // optional: filter by domain column values
@@ -2217,6 +2218,24 @@ func (q *FeedQuery) criticalLevel() int {
 		return q.CriticalLevel
 	}
 	return CriticalLevel
+}
+
+// likeEscaper neutralizes the LIKE wildcards (% and _) and the escape
+// character itself so a free-text term matches literally. Pair with
+// `ESCAPE '\'` in the SQL.
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+// searchTerm normalizes [FeedQuery.Search] for the feed LIKE predicate:
+// lowercased so a sha256 hex prefix matches the lowercase-stored column
+// (filename matching is case-insensitive regardless), with LIKE
+// metacharacters escaped so the term is a literal substring rather than a
+// wildcard pattern. Empty Search yields "", which the SQL guards read as
+// "match everything".
+func (q *FeedQuery) searchTerm() string {
+	if q.Search == "" {
+		return ""
+	}
+	return likeEscaper.Replace(strings.ToLower(q.Search))
 }
 
 // sortBy returns the full ORDER BY direction clause for the configured

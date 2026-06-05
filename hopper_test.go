@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -2412,6 +2413,75 @@ func TestFeedSamples(t *testing.T) {
 	_, err = db.FeedSamples(ctx, q)
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestFeedSamplesSearch exercises the free-text Search predicate: a
+// case-insensitive filename substring or a sha256 hex prefix, applied in SQL
+// so it spans the whole index rather than an in-memory page. LIKE
+// metacharacters in the term must match literally, not as wildcards.
+func TestFeedSamplesSearch(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	resultFor := func(sha string) []byte {
+		return []byte(`{"fs":[{"sha":"` + sha + `","type":"elf","dp":0}]}`)
+	}
+	insert := func(sha, filename string) {
+		mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test", Filename: filename})
+		if err := db.UpdateCleaveResult(ctx, sha, resultFor(sha), nil, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert("abc123def", "requests.tar.gz")
+	insert("beef0001", "left-pad.js")
+	insert("cafe0002", "100%_real.bin")
+
+	shas := func(q FeedQuery) []string {
+		q.Source = "test"
+		q.Limit = 10
+		samples, err := db.FeedSamples(ctx, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		count, err := db.FeedSamplesCount(ctx, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if count != len(samples) {
+			t.Errorf("count %d disagrees with %d rows for %q", count, len(samples), q.Search)
+		}
+		out := make([]string, len(samples))
+		for i, s := range samples {
+			out[i] = s.SHA256
+		}
+		slices.Sort(out)
+		return out
+	}
+
+	tests := []struct {
+		name   string
+		search string
+		want   []string
+	}{
+		{"empty matches all", "", []string{"abc123def", "beef0001", "cafe0002"}},
+		{"filename substring", "requests", []string{"abc123def"}},
+		{"filename case-insensitive", "REQUESTS", []string{"abc123def"}},
+		{"sha prefix", "beef", []string{"beef0001"}},
+		{"no match", "nonexistent", nil},
+		{"percent is literal not wildcard", "100%", []string{"cafe0002"}},
+		// A bare "%" is a literal percent sign, so it matches only the
+		// filename that contains one — not every row, as it would if the
+		// term leaked through as a LIKE wildcard.
+		{"bare percent is literal", "%", []string{"cafe0002"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shas(FeedQuery{Search: tt.search})
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("Search(%q) = %v, want %v", tt.search, got, tt.want)
+			}
+		})
 	}
 }
 

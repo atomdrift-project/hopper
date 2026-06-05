@@ -2511,10 +2511,13 @@ func (db *DB) feedSamplesPG(ctx context.Context, q FeedQuery) ([]*Sample, error)
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
 			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))
+			AND ($13 = '' OR filename ILIKE '%' || $13 || '%' ESCAPE '\'
+				OR sha256 LIKE $13 || '%' ESCAPE '\')
 		ORDER BY `+q.sortBy()+`
 		LIMIT $10 OFFSET $11`,
 		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
-		q.Formula, q.RequireLitmus, q.Domains, q.Limit, q.Offset, q.criticalLevel())
+		q.Formula, q.RequireLitmus, q.Domains, q.Limit, q.Offset, q.criticalLevel(),
+		q.searchTerm())
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed samples: %w", err)
 	}
@@ -2549,8 +2552,11 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q FeedQuery) (int, error) 
 			AND (NOT $6 OR parent = '')
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
-			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))`,
-		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly, q.Formula, q.RequireLitmus, q.Domains, q.criticalLevel()).Scan(&n)
+			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))
+			AND ($11 = '' OR filename ILIKE '%' || $11 || '%' ESCAPE '\'
+				OR sha256 LIKE $11 || '%' ESCAPE '\')`,
+		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
+		q.Formula, q.RequireLitmus, q.Domains, q.criticalLevel(), q.searchTerm()).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: feed samples count: %w", err)
 	}

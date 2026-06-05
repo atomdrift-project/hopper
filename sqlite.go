@@ -2584,6 +2584,14 @@ func (q *FeedQuery) whereSQLite() (where string, args []any) {
 		args = append(args, q.Formula)
 	}
 
+	// SQLite LIKE is case-insensitive for ASCII, matching the filename intent;
+	// sha256 is stored lowercase and the term is lowercased in searchTerm.
+	if term := q.searchTerm(); term != "" {
+		clauses = append(clauses,
+			`(filename LIKE '%' || ? || '%' ESCAPE '\' OR sha256 LIKE ? || '%' ESCAPE '\')`)
+		args = append(args, term, term)
+	}
+
 	return "WHERE " + strings.Join(clauses, " AND "), args
 }
 
