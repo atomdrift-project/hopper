@@ -136,37 +136,27 @@ type claim struct {
 }
 
 type workerStats struct {
-	LastSeen     time.Time
-	LastClaimed  time.Time // when the most recent batch of claims was made
-	LastUpserted time.Time // when we last persisted a heartbeat row to the workers table
-	Version      string
-	Traits       string
-	Tools        string // comma-separated canonical external tools reported by litmus
-	TotalClaimed int64
-	Analyzed     int64
-	Errors       int64
-	Load1        float64 // last reported 1-minute load average (0 = unknown)
-	Slots        int
-	ActiveClaims int // jobs claimed but not yet returned (hopper's own accounting)
-	RSSMB        int // last reported RSS in MiB (0 = unknown)
-	// Worker-reported view from /api/heartbeat. These are display-only and never
-	// persisted — the worker recomputes them every beat. Queue is the staged
-	// backlog (prefetched but not yet dispatched); ReportedActive is running
-	// analyses. The remaining fields are the worker's own local-queue telemetry.
-	Queue          int
-	ReportedActive int
-	// OldestQueueSince is when the oldest still-queued item entered the queue
-	// (zero if the queue is empty); the dashboard shows the elapsed age.
 	OldestQueueSince time.Time
-	// LastCompletion is when the worker last finished a job (zero if none yet).
-	LastCompletion time.Time
-	// FilesPerSec is the worker's trailing 15-minute throughput.
-	FilesPerSec float64
-	// ErrorsRecent is the worker's error count over the trailing 15 minutes.
-	ErrorsRecent int
-	// LastError and LastErrorAt are the worker's most recent analysis error.
-	LastError   string
-	LastErrorAt time.Time
+	LastClaimed      time.Time
+	LastUpserted     time.Time
+	LastErrorAt      time.Time
+	LastCompletion   time.Time
+	LastSeen         time.Time
+	Tools            string
+	Traits           string
+	Version          string
+	LastError        string
+	Slots            int
+	ActiveClaims     int
+	RSSMB            int
+	Queue            int
+	ReportedActive   int
+	TotalClaimed     int64
+	Analyzed         int64
+	FilesPerSec      float64
+	ErrorsRecent     int
+	Load1            float64
+	Errors           int64
 }
 
 func newWorkerTracker() *workerTracker {
@@ -317,17 +307,24 @@ func (wt *workerTracker) update(name string, slots int, version, traits string, 
 // liveness signals as update plus the worker's self-reported local-queue
 // telemetry, which the work-claim path can't supply. ActiveClaims/TotalClaimed/
 // LastClaimed stay owned by tryClaimBatch and release; do not bump them here.
-func (wt *workerTracker) heartbeat(name string, hb workerHeartbeat) {
+//
+// It returns true when hb carries a client-side error string that differs from
+// the previous beat's, so the caller can surface it to the log exactly once.
+// lastError is sticky across beats, so logging every non-empty value would
+// repeat the same line at the heartbeat cadence; keying on a change logs each
+// distinct error once while the trailing ErrorsRecent count conveys the volume.
+func (wt *workerTracker) heartbeat(name string, hb workerHeartbeat) (newError bool) {
 	wt.mu.Lock()
 	defer wt.mu.Unlock()
 	ws, ok := wt.workers[name]
 	if !ok {
 		if len(wt.workers) >= maxTrackedWorkers {
-			return // silently drop to prevent memory exhaustion
+			return false // silently drop to prevent memory exhaustion
 		}
 		ws = &workerStats{}
 		wt.workers[name] = ws
 	}
+	newError = hb.lastError != "" && hb.lastError != ws.LastError
 	ws.LastSeen = time.Now()
 	ws.Slots = hb.slots
 	ws.Version = hb.version
@@ -343,29 +340,30 @@ func (wt *workerTracker) heartbeat(name string, hb workerHeartbeat) {
 	ws.ErrorsRecent = hb.errorsRecent
 	ws.LastError = hb.lastError
 	ws.LastErrorAt = hb.lastErrorAt
+	return newError
 }
 
 // workerHeartbeat is the parsed payload of one /api/heartbeat request. Timestamps
 // are already converted from the worker's relative ages to absolute hopper-clock
 // times at receipt, so the dashboard can render them with time.Since.
 type workerHeartbeat struct {
-	lastSeenSignals
-	queue            int
-	active           int
 	oldestQueueSince time.Time
 	lastCompletion   time.Time
-	filesPerSec      float64
-	errorsRecent     int
-	lastError        string
 	lastErrorAt      time.Time
+	lastError        string
+	lastSeenSignals
+	queue        int
+	active       int
+	filesPerSec  float64
+	errorsRecent int
 }
 
 // lastSeenSignals are the liveness fields shared by /api/next and /api/heartbeat.
 type lastSeenSignals struct {
-	slots   int
 	version string
 	traits  string
 	tools   string
+	slots   int
 	rssMB   int
 	load1   float64
 }
@@ -480,7 +478,7 @@ func (wt *workerTracker) resetClaims(name string) {
 
 // namedWorkerStats is workerStats with the worker name attached.
 //
-//nolint:govet // fieldalignment conflicts with embeddedstructfieldcheck, which requires the embedded field first.
+
 type namedWorkerStats struct {
 	workerStats
 
@@ -763,7 +761,17 @@ func (s *apiServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		hb.lastErrorAt = s
 	}
 
-	s.tracker.heartbeat(worker, hb)
+	if s.tracker.heartbeat(worker, hb) {
+		// Worker-side analysis errors are otherwise invisible here: heartbeats
+		// are display-only, so without this the only signal is a number ticking
+		// up on the dashboard. Surface the actual error so it lands in the
+		// journal/Loki alongside hopper's own logs.
+		slog.Warn("worker reported error", //nolint:gosec // structured logging
+			"worker", worker,
+			"error", hb.lastError,
+			"errors_recent", hb.errorsRecent,
+		)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

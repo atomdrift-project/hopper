@@ -760,7 +760,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 				if !w.OldestQueueSince.IsZero() {
 					queueStr = fmt.Sprintf("%d · %s", w.Queue, shortDuration(time.Since(w.OldestQueueSince)))
 				} else {
-					queueStr = fmt.Sprintf("%d", w.Queue)
+					queueStr = strconv.Itoa(w.Queue)
 				}
 			}
 
