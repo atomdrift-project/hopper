@@ -2585,10 +2585,11 @@ func (q *FeedQuery) whereSQLite() (where string, args []any) {
 	}
 
 	// SQLite LIKE is case-insensitive for ASCII, matching the filename intent;
-	// sha256 is stored lowercase and the term is lowercased in searchTerm.
+	// sha256 is matched by equality (the term is lowercased in searchTerm to
+	// meet the lowercase-stored column).
 	if term := q.searchTerm(); term != "" {
 		clauses = append(clauses,
-			`(filename LIKE '%' || ? || '%' ESCAPE '\' OR sha256 LIKE ? || '%' ESCAPE '\')`)
+			`(filename LIKE '%' || ? || '%' ESCAPE '\' OR sha256 = ?)`)
 		args = append(args, term, term)
 	}
 

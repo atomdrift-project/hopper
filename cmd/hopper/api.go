@@ -554,6 +554,11 @@ const (
 	// take to arrive. Defends against slow-loris streams that hold a temp
 	// file open while dripping bytes under maxUploadBytes.
 	uploadBodyTimeout = 5 * time.Minute
+	// resultBodyTimeout caps how long the body of a single /api/result may
+	// take to arrive — the same slow-loris defense as uploadBodyTimeout, but
+	// roomier because a result body may reach maxResultBodyBytes (256 MiB).
+	// Workers run on the local network, so even a slow-link budget is ample.
+	resultBodyTimeout = 10 * time.Minute
 	// uploadTokenMinLen is the smallest acceptable HOPPER_UPLOAD_TOKEN.
 	// 32 chars yields >=128 bits with hex encoding, >=192 bits with base64.
 	// A random `openssl rand -hex 32` produces 64 chars and meets this with
@@ -1026,6 +1031,11 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"starting"}`, http.StatusServiceUnavailable)
 		return
 	}
+	// Slow-loris defense: bound how long the (up to 256 MiB) body may take to
+	// arrive, mirroring handleUpload. Uses the per-request response controller
+	// so it doesn't impose a global ReadTimeout on long-lived /data downloads.
+	// SetReadDeadline returns http.ErrNotSupported under httptest; harmless.
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(resultBodyTimeout)) //nolint:errcheck // optional
 	// Stream-decode rather than io.ReadAll: avoids a duplicate 128 MiB buffer
 	// per concurrent uploader. The Raw/ML json.RawMessage fields still land
 	// in memory once each, but we lose the second whole-body copy.

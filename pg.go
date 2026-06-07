@@ -459,6 +459,20 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive,maintidx //
 		// top-level working set without scanning the full samples heap.
 		`CREATE INDEX IF NOT EXISTS idx_samples_reconcile_toplevel ON samples(sha256)
 			WHERE parent = '' AND (skip = '' OR skip = 'conflict')`,
+		// Web-UI filename search (FeedQuery.Search) runs `filename ILIKE
+		// '%term%'`. A btree can't serve a leading-wildcard substring match, so
+		// without a trigram index it seq-scans the heap. pg_trgm's GIN operator
+		// class indexes ILIKE substrings; the partial predicate mirrors the
+		// feed query (top-level, analyzed) so the index stays small — archive
+		// members, the bulk of the table, are excluded. The sha256 side of the
+		// search is an equality on the existing UNIQUE(sha256) index, so it
+		// needs no new index. pg_trgm ships with Cloud SQL / standard Postgres;
+		// CREATE EXTENSION needs a role that can install it (run once, then
+		// ledgered). The index itself is created CONCURRENTLY by the migrator.
+		`CREATE EXTENSION IF NOT EXISTS pg_trgm`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_filename_trgm ` +
+			`ON samples USING gin (filename gin_trgm_ops) ` +
+			`WHERE cleave_result IS NOT NULL AND parent = ''`,
 	} {
 		if err := db.execPGMigrationDDL(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate: %w", err)
@@ -2512,7 +2526,7 @@ func (db *DB) feedSamplesPG(ctx context.Context, q FeedQuery) ([]*Sample, error)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
 			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))
 			AND ($13 = '' OR filename ILIKE '%' || $13 || '%' ESCAPE '\'
-				OR sha256 LIKE $13 || '%' ESCAPE '\')
+				OR sha256 = $13)
 		ORDER BY `+q.sortBy()+`
 		LIMIT $10 OFFSET $11`,
 		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
@@ -2554,7 +2568,7 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q FeedQuery) (int, error) 
 			AND (NOT $8 OR litmus_result IS NOT NULL)
 			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))
 			AND ($11 = '' OR filename ILIKE '%' || $11 || '%' ESCAPE '\'
-				OR sha256 LIKE $11 || '%' ESCAPE '\')`,
+				OR sha256 = $11)`,
 		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
 		q.Formula, q.RequireLitmus, q.Domains, q.criticalLevel(), q.searchTerm()).Scan(&n)
 	if err != nil {

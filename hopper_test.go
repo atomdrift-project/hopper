@@ -2417,9 +2417,9 @@ func TestFeedSamples(t *testing.T) {
 }
 
 // TestFeedSamplesSearch exercises the free-text Search predicate: a
-// case-insensitive filename substring or a sha256 hex prefix, applied in SQL
-// so it spans the whole index rather than an in-memory page. LIKE
-// metacharacters in the term must match literally, not as wildcards.
+// case-insensitive filename substring or an exact sha256, applied in SQL so it
+// spans the whole index rather than an in-memory page. LIKE metacharacters in
+// the term must match literally, not as wildcards.
 func TestFeedSamplesSearch(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -2467,7 +2467,8 @@ func TestFeedSamplesSearch(t *testing.T) {
 		{"empty matches all", "", []string{"abc123def", "beef0001", "cafe0002"}},
 		{"filename substring", "requests", []string{"abc123def"}},
 		{"filename case-insensitive", "REQUESTS", []string{"abc123def"}},
-		{"sha prefix", "beef", []string{"beef0001"}},
+		{"sha exact match", "beef0001", []string{"beef0001"}},
+		{"sha partial no longer matches", "beef000", nil},
 		{"no match", "nonexistent", nil},
 		{"percent is literal not wildcard", "100%", []string{"cafe0002"}},
 		// A bare "%" is a literal percent sign, so it matches only the

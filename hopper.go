@@ -40,6 +40,12 @@ import (
 
 const skipBenignArchiveItem = "skip-benign-archive-item"
 
+// maxArchiveMembers bounds how many members a single archive explosion will
+// insert (see ExplodeArchiveMembers). Real archives — even large containers or
+// monorepo tarballs — stay well under this; the cap exists so one oversized or
+// crafted cleave result can't fan a single /api/result into millions of rows.
+const maxArchiveMembers = 100_000
+
 // CriticalLevel is hopper's consumer-side cutoff between hostile and suspicious
 // when deriving criticality from a v6 litmus envelope's `ml.l`. `l <= CriticalLevel`
 // is hostile (fires at or below our critical line); `l > CriticalLevel` is
@@ -589,8 +595,22 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 		return 0, fmt.Errorf("hopper: parse cleave result for explosion: %w", err)
 	}
 
-	var members []*Sample
-	for id, raw := range report.Files {
+	// Bound the fan-out. A cleave result is worker-supplied and capped only by
+	// the API body size (256 MiB), so a crafted or pathological `fs` array of
+	// millions of tiny entries would otherwise materialize millions of *Sample,
+	// a parallel [][]any in the batch insert, and millions of DB rows from a
+	// single request — an OOM / DB-pollution lever. The cap is far above any
+	// real archive's analyzed member count; truncation is logged so a genuine
+	// archive that ever approaches it is visible rather than silently clipped.
+	files := report.Files
+	if len(files) > maxArchiveMembers {
+		slog.Warn("archive explosion truncated: member count exceeds cap",
+			"parent", parent.SHA256, "reported", len(files), "cap", maxArchiveMembers)
+		files = files[:maxArchiveMembers]
+	}
+
+	members := make([]*Sample, 0, len(files))
+	for id, raw := range files {
 		var entry struct {
 			SHA256   string `json:"sha"`
 			FileType string `json:"type"`
@@ -2096,7 +2116,7 @@ type FeedQuery struct {
 	Label         string   // "bad", "good", "unknown", or "" (match any)
 	OrderBy       string   // "mtime" (default), "created_at", or "analyzed_at"
 	Formula       string   // optional: filter by exact cleave chemical formula
-	Search        string   // optional free-text: case-insensitive filename substring OR sha256 hex prefix
+	Search        string   // optional free-text: case-insensitive filename substring OR exact sha256
 	Feeds         []string // optional: filter by feed column values
 	Ecosystems    []string // optional: filter by ecosystem column values
 	Domains       []string // optional: filter by domain column values
@@ -2225,12 +2245,14 @@ func (q *FeedQuery) criticalLevel() int {
 // `ESCAPE '\'` in the SQL.
 var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
-// searchTerm normalizes [FeedQuery.Search] for the feed LIKE predicate:
-// lowercased so a sha256 hex prefix matches the lowercase-stored column
-// (filename matching is case-insensitive regardless), with LIKE
-// metacharacters escaped so the term is a literal substring rather than a
-// wildcard pattern. Empty Search yields "", which the SQL guards read as
-// "match everything".
+// searchTerm normalizes [FeedQuery.Search] for the feed predicate: lowercased
+// so an exact sha256 matches the lowercase-stored column (filename matching is
+// case-insensitive regardless), with LIKE metacharacters escaped so the term
+// is a literal substring in the filename ILIKE rather than a wildcard pattern.
+// The same escaped value backs the `sha256 = $n` equality: a valid sha256 is
+// 64 hex chars, which contain no LIKE metacharacters, so escaping never alters
+// a value that could match. Empty Search yields "", which the SQL guards read
+// as "match everything".
 func (q *FeedQuery) searchTerm() string {
 	if q.Search == "" {
 		return ""
