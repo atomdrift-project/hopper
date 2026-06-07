@@ -43,12 +43,17 @@ func openPG(ctx context.Context, dsn string) (*DB, error) {
 }
 
 func (db *DB) migratePG(ctx context.Context) error { //nolint:revive,maintidx // long sequential migration list; splitting reduces clarity
-	slog.Info("executing initial schema ddl")
-	if _, err := db.pool.Exec(ctx, schemaPG); err != nil {
+	if err := db.ensurePGMigrationLedger(ctx); err != nil {
 		return fmt.Errorf("hopper: migrate: %w", err)
 	}
-	slog.Info("initial schema applied")
-	if err := db.ensurePGMigrationLedger(ctx); err != nil {
+	// Base schema is ledger-gated like every other migration. Although every
+	// statement in it is idempotent (CREATE … IF NOT EXISTS), a no-op CREATE
+	// INDEX still takes a ShareLock on samples to perform its check — and that
+	// lock request queues behind any open transaction (e.g. a long pool
+	// reconcile) and head-of-line-blocks every writer behind it. Skipping the
+	// blob outright once it is recorded keeps an unchanged-schema restart
+	// completely lock-free.
+	if err := db.execPGMigrationDDL(ctx, schemaPG); err != nil {
 		return fmt.Errorf("hopper: migrate: %w", err)
 	}
 	// Add columns introduced after initial schema.
