@@ -464,23 +464,30 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive,maintidx //
 		// top-level working set without scanning the full samples heap.
 		`CREATE INDEX IF NOT EXISTS idx_samples_reconcile_toplevel ON samples(sha256)
 			WHERE parent = '' AND (skip = '' OR skip = 'conflict')`,
-		// Web-UI filename search (FeedQuery.Search) runs `filename ILIKE
-		// '%term%'`. A btree can't serve a leading-wildcard substring match, so
-		// without a trigram index it seq-scans the heap. pg_trgm's GIN operator
-		// class indexes ILIKE substrings; the partial predicate mirrors the
-		// feed query (top-level, analyzed) so the index stays small — archive
-		// members, the bulk of the table, are excluded. The sha256 side of the
-		// search is an equality on the existing UNIQUE(sha256) index, so it
-		// needs no new index. pg_trgm ships with Cloud SQL / standard Postgres;
-		// CREATE EXTENSION needs a role that can install it (run once, then
-		// ledgered). The index itself is created CONCURRENTLY by the migrator.
+	} {
+		if err := db.execPGMigrationDDL(ctx, ddl); err != nil {
+			return fmt.Errorf("hopper: migrate: %w", err)
+		}
+	}
+
+	// Optional, best-effort migrations: a failure here logs a warning and lets
+	// hopper start anyway. These back only the web-UI filename search
+	// (FeedQuery.Search's `filename ILIKE '%term%'`): pg_trgm's GIN operator
+	// class indexes the leading-wildcard substring match a btree can't serve,
+	// and the partial predicate mirrors the feed query (top-level, analyzed) so
+	// the index stays small. Without them, search falls back to an ILIKE
+	// seq-scan — slower, but a missing contrib extension must never crash-loop
+	// the whole ingester. On failure the DDL is left unrecorded in the ledger,
+	// so a later boot retries once the extension is installed.
+	for _, ddl := range []string{
 		`CREATE EXTENSION IF NOT EXISTS pg_trgm`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_filename_trgm ` +
 			`ON samples USING gin (filename gin_trgm_ops) ` +
 			`WHERE cleave_result IS NOT NULL AND parent = ''`,
 	} {
 		if err := db.execPGMigrationDDL(ctx, ddl); err != nil {
-			return fmt.Errorf("hopper: migrate: %w", err)
+			slog.Warn("optional migration skipped; continuing without it", "ddl", ddl, "error", err)
+			break // the index needs the extension; don't attempt it if the extension failed
 		}
 	}
 	slog.Info("all migrations applied")
