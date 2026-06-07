@@ -2357,23 +2357,49 @@ func (db *DB) setSkipWithEventPG(ctx context.Context, sha256, skip, reason strin
 }
 
 func (db *DB) cascadeMembersPG(ctx context.Context) (cascaded, revived int64, err error) {
-	const aliveCTE = `WITH RECURSIVE alive(sha256) AS (
-		SELECT DISTINCT sha256 FROM walk_staging
-		UNION
-		SELECT sl.sha256 FROM sample_locations sl
-		  JOIN alive a ON sl.parent_sha256 = a.sha256
-	)`
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
 		return 0, 0, fmt.Errorf("hopper: begin cascade: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
 
+	// `alive` is the recursive reachability set: every standalone file in the
+	// current walk, plus every member transitively reachable from one through
+	// the sample_locations edge set (~80M rows). It is identical for the
+	// cascade and revive passes and is by far the costliest part of
+	// reconciliation. Computing it inline with each UPDATE (two fused writable
+	// CTEs) recomputed it twice AND held a RowExclusiveLock on samples for the
+	// entire multi-hour recursion — head-of-line-blocking every ingest writer.
+	//
+	// Build it ONCE into an indexed temp table instead. This phase only reads
+	// walk_staging/sample_locations (no samples write lock), and a generous
+	// session-local work_mem keeps the DISTINCT and recursive dedup in memory
+	// rather than spilling gigabytes to temp files. The two UPDATEs then become
+	// fast anti-/semi-joins against the temp PK, so the samples write lock is
+	// held only for their brief duration.
+	if _, err := tx.Exec(ctx, `SET LOCAL work_mem = '4GB'`); err != nil {
+		return 0, 0, fmt.Errorf("hopper: cascade work_mem: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `CREATE TEMP TABLE alive (sha256 TEXT PRIMARY KEY) ON COMMIT DROP`); err != nil {
+		return 0, 0, fmt.Errorf("hopper: cascade temp: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO alive (sha256)
+		WITH RECURSIVE reach(sha256) AS (
+			SELECT DISTINCT sha256 FROM walk_staging
+			UNION
+			SELECT sl.sha256 FROM sample_locations sl
+			  JOIN reach r ON sl.parent_sha256 = r.sha256
+		)
+		SELECT sha256 FROM reach`); err != nil {
+		return 0, 0, fmt.Errorf("hopper: cascade build alive: %w", err)
+	}
+
 	// Cascade missing to members orphaned by a missing parent. The WHERE skip=''
 	// guarantees from_skip='', so the audit needs no pre-read. A member with an
 	// edge to any alive archive is in `alive` and survives (supply-chain veto).
-	cascTag, err := tx.Exec(ctx, aliveCTE+`,
-		casc AS (
+	cascTag, err := tx.Exec(ctx, `
+		WITH casc AS (
 			UPDATE samples s SET skip = 'missing', updated_at = now()
 			WHERE s.parent <> '' AND s.skip = ''
 			  AND NOT EXISTS (SELECT 1 FROM alive a WHERE a.sha256 = s.sha256)
@@ -2385,8 +2411,8 @@ func (db *DB) cascadeMembersPG(ctx context.Context) (cascaded, revived int64, er
 		return 0, 0, fmt.Errorf("hopper: cascade apply: %w", err)
 	}
 
-	revTag, err := tx.Exec(ctx, aliveCTE+`,
-		rev AS (
+	revTag, err := tx.Exec(ctx, `
+		WITH rev AS (
 			UPDATE samples s SET skip = '', updated_at = now()
 			WHERE s.parent <> '' AND s.skip = 'missing'
 			  AND EXISTS (SELECT 1 FROM alive a WHERE a.sha256 = s.sha256)
