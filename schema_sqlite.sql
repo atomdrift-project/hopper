@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS samples (
 	-- source columns. Writing to them is an error; readers see the same
 	-- derived values they always did.
 	file_type     TEXT GENERATED ALWAYS AS
-	                   (COALESCE(json_extract(cleave_result, '$.fs[0].type'), ''))
+	                   (COALESCE(json_extract(cleave_result, '$.files[0].type'), json_extract(cleave_result, '$.fs[0].type'), ''))
 	                   STORED,
 	size_bytes    INTEGER NOT NULL DEFAULT 0,
 	label         TEXT NOT NULL DEFAULT 'unknown',
@@ -34,11 +34,11 @@ CREATE TABLE IF NOT EXISTS samples (
 	parent        TEXT NOT NULL DEFAULT '',
 	skip          TEXT NOT NULL DEFAULT '',
 	formula       TEXT GENERATED ALWAYS AS
-	                   (COALESCE(json_extract(cleave_result, '$.fs[0].f'), ''))
+	                   (COALESCE(json_extract(cleave_result, '$.files[0].mol'), json_extract(cleave_result, '$.fs[0].f'), ''))
 	                   STORED,
 	elements      TEXT NOT NULL DEFAULT '',
 	score         INTEGER GENERATED ALWAYS AS
-	                   (COALESCE(json_extract(cleave_result, '$.fs[0].x'), 0))
+	                   (COALESCE(json_extract(cleave_result, '$.files[0].risk'), json_extract(cleave_result, '$.fs[0].x'), 0))
 	                   STORED,
 	max_crit      INTEGER NOT NULL DEFAULT 0,
 	suspicious_count INTEGER NOT NULL DEFAULT 0,

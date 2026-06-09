@@ -599,18 +599,18 @@ func (db *DB) workflowSamplesSQLite(ctx context.Context, where string, limit int
 			cleave_result IS NOT NULL,
 			litmus_result IS NOT NULL,
 			-- Criticality (0=benign, 1=suspicious, 2=hostile): legacy records
-			-- carried 'class' directly; v2 dropped it for 'l' (the strictest
+			-- carried 'class' directly; v6/v7 use 'lvl'/'l' (the strictest
 			-- grid level at which the file fires, or -1 for never-fires).
-			-- Try class first; otherwise derive from l using CriticalLevel %d
-			-- as the hostile/suspicious cutoff (l == null means manual-mode
+			-- Try class first; otherwise derive from the level using CriticalLevel %d
+			-- as the hostile/suspicious cutoff (null means manual-mode
 			-- hostile and is treated as hostile fail-safe).
 			COALESCE(
 				CAST(json_extract(litmus_result, '$.class') AS INTEGER),
 				CASE
 					WHEN litmus_result IS NULL THEN 0
-					WHEN json_extract(litmus_result, '$.l') IS NULL THEN 2
-					WHEN CAST(json_extract(litmus_result, '$.l') AS INTEGER) < 0 THEN 0
-					WHEN CAST(json_extract(litmus_result, '$.l') AS INTEGER) <= %d THEN 2
+					WHEN COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) IS NULL THEN 2
+					WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) < 0 THEN 0
+					WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) <= %d THEN 2
 					ELSE 1
 				END
 			)
@@ -1808,8 +1808,8 @@ func (db *DB) samplesByEmbeddedSHA256SQLite(ctx context.Context, sha256 string, 
 	rows, err := db.lite.QueryContext(ctx, `
 		SELECT `+liteSampleCols+` FROM samples WHERE id IN (
 			SELECT DISTINCT s.id
-			FROM samples s, json_each(s.cleave_result, '$.files')
-			WHERE json_extract(value, '$.sha256') = ?
+			FROM samples s, json_each(COALESCE(json_extract(s.cleave_result, '$.files'), json_extract(s.cleave_result, '$.fs'))) je
+			WHERE COALESCE(json_extract(je.value, '$.sha256'), json_extract(je.value, '$.sha')) = ?
 		)
 		ORDER BY id
 		LIMIT ?`, sha256, limit)
@@ -1831,7 +1831,11 @@ func (db *DB) recomputeCanonicalSHA256SQLite(ctx context.Context) (int64, error)
 					SELECT samples.sha256 AS v
 					UNION ALL
 					SELECT json_extract(value, '$.sha256') AS v
-					FROM json_each(samples.cleave_result, '$.files')
+					FROM json_each(COALESCE(json_extract(samples.cleave_result, '$.files'), json_extract(samples.cleave_result, '$.fs')))
+					WHERE length(v) = 64
+					UNION ALL
+					SELECT json_extract(value, '$.sha') AS v
+					FROM json_each(COALESCE(json_extract(samples.cleave_result, '$.files'), json_extract(samples.cleave_result, '$.fs')))
 					WHERE length(v) = 64
 				)
 			), updated_at = ?
@@ -1874,9 +1878,9 @@ const stripSubscriptsSQL = `replace(replace(replace(replace(replace(` +
 const sqliteCleaveBackfillWhere = `cleave_result IS NOT NULL
 	AND elements = ''
 	AND EXISTS (
-		SELECT 1 FROM json_each(cleave_result, '$.fs') je
+		SELECT 1 FROM json_each(COALESCE(json_extract(cleave_result, '$.files'), json_extract(cleave_result, '$.fs'))) je
 		WHERE json_extract(je.value, '$.dp') = 0
-			AND COALESCE(json_extract(je.value, '$.f'), '') != ''
+			AND COALESCE(json_extract(je.value, '$.mol'), json_extract(je.value, '$.f'), '') != ''
 	)`
 
 func (db *DB) backfillPendingSQLite(ctx context.Context) (BackfillPending, error) {
@@ -1933,8 +1937,8 @@ func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 
 	// Candidate rows: have cleave_result, elements still empty, AND the JSON
 	// would actually produce a non-empty elements value. Without the EXISTS
-	// clause, rows whose cleave_result has no fs entry with dp=0 (or whose
-	// dp=0 entry has empty 'f') match the gate, get UPDATEd to elements='' as
+	// clause, rows whose cleave_result has no files entry with dp=0 (or whose
+	// dp=0 entry has empty 'mol') match the gate, get UPDATEd to elements='' as
 	// a no-op, and re-match next batch — inflating RowsAffected and risking
 	// an infinite loop on databases with >= backfillBatch such rows.
 	if err := db.lite.QueryRowContext(ctx, `
@@ -1956,15 +1960,15 @@ func (db *DB) backfillSQLite(ctx context.Context) (BackfillStats, error) {
 			),
 			cleave_extract AS (
 				SELECT s.sha256,
-					json_extract(je.value, '$.f') AS f,
-					(SELECT COALESCE(MAX(CAST(json_extract(te.value, '$.l') AS INTEGER)), 0)
-					 FROM json_each(je.value, '$.ts') te) AS mc,
+					COALESCE(json_extract(je.value, '$.mol'), json_extract(je.value, '$.f')) AS f,
+					(SELECT COALESCE(MAX(CAST(COALESCE(json_extract(te.value, '$.crit'), json_extract(te.value, '$.l')) AS INTEGER)), 0)
+					 FROM json_each(COALESCE(json_extract(je.value, '$.find'), json_extract(je.value, '$.ts'), '[]')) te) AS mc,
 					(SELECT COUNT(*)
-					 FROM json_each(je.value, '$.ts') te
-					 WHERE CAST(json_extract(te.value, '$.l') AS INTEGER) >= 4) AS sc
+					 FROM json_each(COALESCE(json_extract(je.value, '$.find'), json_extract(je.value, '$.ts'), '[]')) te
+					 WHERE CAST(COALESCE(json_extract(te.value, '$.crit'), json_extract(te.value, '$.l')) AS INTEGER) >= 4) AS sc
 				FROM samples s
 				JOIN batch b ON b.sha256 = s.sha256,
-					json_each(s.cleave_result, '$.fs') je
+					json_each(COALESCE(json_extract(s.cleave_result, '$.files'), json_extract(s.cleave_result, '$.fs'))) je
 				WHERE json_extract(je.value, '$.dp') = 0
 			)
 			UPDATE samples SET
@@ -2614,9 +2618,9 @@ func (q *FeedQuery) whereSQLite() (where string, args []any) {
 		clauses = append(clauses,
 			"COALESCE(CAST(json_extract(litmus_result, '$.class') AS INTEGER), "+
 				"CASE WHEN litmus_result IS NULL THEN 0 "+
-				"WHEN json_extract(litmus_result, '$.l') IS NULL THEN 2 "+
-				"WHEN CAST(json_extract(litmus_result, '$.l') AS INTEGER) < 0 THEN 0 "+
-				"WHEN CAST(json_extract(litmus_result, '$.l') AS INTEGER) <= ? THEN 2 "+
+				"WHEN COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) IS NULL THEN 2 "+
+				"WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) < 0 THEN 0 "+
+				"WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) <= ? THEN 2 "+
 				"ELSE 1 END) "+
 				"IN ("+strings.Join(placeholders, ", ")+")")
 	}

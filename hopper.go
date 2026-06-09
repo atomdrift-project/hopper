@@ -215,8 +215,8 @@ func compactCleaveResultForStorage(sha256 string, result []byte) []byte {
 	if json.Unmarshal(result, &envelope) != nil {
 		return result
 	}
-	var files []json.RawMessage
-	if json.Unmarshal(envelope["fs"], &files) != nil || len(files) <= 1 {
+	files := cleaveCompactFiles(envelope)
+	if len(files) <= 1 {
 		return result
 	}
 
@@ -242,7 +242,8 @@ func compactCleaveResultForStorage(sha256 string, result []byte) []byte {
 	if err != nil {
 		return result
 	}
-	envelope["fs"] = compactFS
+	delete(envelope, "fs")
+	envelope["files"] = compactFS
 	envelope["truncated"] = json.RawMessage(`true`)
 	envelope["omitted_files"] = json.RawMessage(strconv.Itoa(len(files) - 1))
 	compact, err := json.Marshal(envelope)
@@ -250,6 +251,34 @@ func compactCleaveResultForStorage(sha256 string, result []byte) []byte {
 		return result
 	}
 	return compact
+}
+
+func cleaveCompactFiles(envelope map[string]json.RawMessage) []json.RawMessage {
+	if files := cleaveCompactFilesFromRaw(envelope["files"]); len(files) > 0 {
+		return files
+	}
+	return cleaveCompactFilesFromRaw(envelope["fs"])
+}
+
+func cleaveCompactFilesFromRaw(raw json.RawMessage) []json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+	var files []json.RawMessage
+	if json.Unmarshal(raw, &files) != nil {
+		return nil
+	}
+	for _, entry := range files {
+		var f struct {
+			SHA256   string `json:"sha"`
+			FileType string `json:"type"`
+			Depth    *int   `json:"dp"`
+		}
+		if json.Unmarshal(entry, &f) == nil && (f.SHA256 != "" || f.FileType != "" || f.Depth != nil) {
+			return files
+		}
+	}
+	return nil
 }
 
 func isHex(c byte) bool {
@@ -470,29 +499,42 @@ type CleaveParseResult struct {
 	FileInfo      cleaveFileInfo
 }
 
+type cleaveTraitEntry struct {
+	Conf     float64 `json:"conf"`
+	OldConf  float64 `json:"c"`
+	Level    int     `json:"crit"`
+	OldLevel int     `json:"l"`
+}
+
+type cleaveCompactFileEntry struct {
+	Formula    string             `json:"mol"`
+	OldFormula string             `json:"f"`
+	SHA256     string             `json:"sha"`
+	FileType   string             `json:"type"`
+	Traits     []cleaveTraitEntry `json:"find"`
+	OldTraits  []cleaveTraitEntry `json:"ts"`
+	Score      int                `json:"risk"`
+	OldScore   int                `json:"x"`
+	Depth      int                `json:"dp"`
+}
+
 // ParseCleaveResult extracts file info and canonical SHA from a cleave compact
-// result in a single JSON parse. It intentionally reads only stable fs[]
-// metadata, so v4 top-level facts and v5 ff facts both pass through.
+// result in a single JSON parse. It intentionally reads only stable files[]
+// metadata, accepting old fs[] keys for cached rows.
 func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 	if len(result) == 0 {
 		return CleaveParseResult{CanonicalSHA: sha256}
 	}
 	var report struct {
-		TraitsVersion string `json:"tv"`
-		Files         []struct {
-			Formula  string `json:"f"`
-			SHA256   string `json:"sha"`
-			FileType string `json:"type"`
-			Traits   []struct {
-				Conf  float64 `json:"c"`
-				Level int     `json:"l"`
-			} `json:"ts"`
-			Score int `json:"x"`
-			Depth int `json:"dp"`
-		} `json:"fs"`
+		TraitsVersion string                   `json:"tv"`
+		Files         []cleaveCompactFileEntry `json:"files"`
+		OldFiles      []cleaveCompactFileEntry `json:"fs"`
 	}
 	if json.Unmarshal(result, &report) != nil {
 		return CleaveParseResult{CanonicalSHA: sha256}
+	}
+	if len(report.Files) == 0 || !parsedCleaveFilesLookCompact(report.Files) {
+		report.Files = report.OldFiles
 	}
 
 	// Canonical SHA: lexicographic minimum across sample and all embedded files.
@@ -509,21 +551,37 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 		if f.SHA256 != sha256 && f.Depth != 0 {
 			continue
 		}
+		formula := f.Formula
+		if formula == "" {
+			formula = f.OldFormula
+		}
+		score := f.Score
+		if score == 0 {
+			score = f.OldScore
+		}
+		traits := f.Traits
+		if len(traits) == 0 {
+			traits = f.OldTraits
+		}
 		maxCrit := 0
 		suspicious := 0
-		for _, t := range f.Traits {
-			if t.Level > maxCrit {
-				maxCrit = t.Level
+		for _, t := range traits {
+			level := t.Level
+			if level == 0 {
+				level = t.OldLevel
 			}
-			if t.Level >= 4 {
+			if level > maxCrit {
+				maxCrit = level
+			}
+			if level >= 4 {
 				suspicious++
 			}
 		}
 		fi = cleaveFileInfo{
-			Formula:         f.Formula,
-			Elements:        stripSubscripts(f.Formula),
+			Formula:         formula,
+			Elements:        stripSubscripts(formula),
 			FileType:        f.FileType,
-			Score:           f.Score,
+			Score:           score,
 			MaxCrit:         maxCrit,
 			SuspiciousCount: suspicious,
 		}
@@ -531,6 +589,15 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 	}
 
 	return CleaveParseResult{CanonicalSHA: canonical, FileInfo: fi, TraitsVersion: report.TraitsVersion}
+}
+
+func parsedCleaveFilesLookCompact(files []cleaveCompactFileEntry) bool {
+	for _, f := range files {
+		if f.SHA256 != "" || f.FileType != "" || f.Depth != 0 || f.Formula != "" || f.OldFormula != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // parseCleaveFile extracts file info only (for callers that don't need canonical SHA).
@@ -562,10 +629,16 @@ func canonicalSHA(sha256 string, cleaveResult []byte) string {
 	var report struct {
 		Files []struct {
 			SHA256 string `json:"sha"`
+		} `json:"files"`
+		OldFiles []struct {
+			SHA256 string `json:"sha"`
 		} `json:"fs"`
 	}
 	if json.Unmarshal(cleaveResult, &report) != nil {
 		return canonical
+	}
+	if len(report.Files) == 0 {
+		report.Files = report.OldFiles
 	}
 	for _, f := range report.Files {
 		if len(f.SHA256) == 64 && f.SHA256 < canonical {
@@ -589,10 +662,14 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 	}
 
 	var report struct {
-		Files []json.RawMessage `json:"fs"`
+		Files    []json.RawMessage `json:"files"`
+		OldFiles []json.RawMessage `json:"fs"`
 	}
 	if err := json.Unmarshal(parent.CleaveResult, &report); err != nil {
 		return 0, fmt.Errorf("hopper: parse cleave result for explosion: %w", err)
+	}
+	if len(report.Files) == 0 {
+		report.Files = report.OldFiles
 	}
 
 	// Bound the fan-out. A cleave result is worker-supplied and capped only by
@@ -616,14 +693,34 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 			FileType string `json:"type"`
 			Path     string `json:"path"`
 			Traits   []struct {
+				Level    int     `json:"crit"`
+				OldLevel int     `json:"l"`
+				Conf     float64 `json:"conf"`
+				OldConf  float64 `json:"c"`
+			} `json:"find"`
+			OldTraits []struct {
 				Level int     `json:"l"`
 				Conf  float64 `json:"c"`
 			} `json:"ts"`
-			Size  int64 `json:"sz"`
-			Depth int   `json:"dp"`
+			Size    int64 `json:"size"`
+			OldSize int64 `json:"sz"`
+			Depth   int   `json:"dp"`
 		}
 		if json.Unmarshal(raw, &entry) != nil || entry.Depth == 0 {
 			continue
+		}
+		if len(entry.Traits) == 0 {
+			for _, t := range entry.OldTraits {
+				entry.Traits = append(entry.Traits, struct {
+					Level    int     `json:"crit"`
+					OldLevel int     `json:"l"`
+					Conf     float64 `json:"conf"`
+					OldConf  float64 `json:"c"`
+				}{Level: t.Level, Conf: t.Conf})
+			}
+		}
+		if entry.Size == 0 {
+			entry.Size = entry.OldSize
 		}
 		// Cleave's hex output is conventionally lowercase, but normalize
 		// here so one upstream quirk can't bifurcate the dataset.
@@ -649,10 +746,14 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 		maxLevel := 0
 		suspiciousCount := 0
 		for _, t := range entry.Traits {
-			if t.Level > maxLevel {
-				maxLevel = t.Level
+			level := t.Level
+			if level == 0 {
+				level = t.OldLevel
 			}
-			if t.Level >= 4 { // suspicious+
+			if level > maxLevel {
+				maxLevel = level
+			}
+			if level >= 4 { // suspicious+
 				suspiciousCount++
 			}
 		}
@@ -663,7 +764,7 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 		}
 
 		singleFile, err := json.Marshal(struct {
-			Files []json.RawMessage `json:"fs"`
+			Files []json.RawMessage `json:"files"`
 		}{Files: []json.RawMessage{raw}})
 		if err != nil {
 			continue
@@ -729,7 +830,11 @@ func litmusResultForMember(parent []byte, id int) []byte {
 		return nil
 	}
 	var files []map[string]json.RawMessage
-	if err := json.Unmarshal(envelope["fs"], &files); err != nil {
+	rawFiles := envelope["files"]
+	if len(rawFiles) == 0 {
+		rawFiles = envelope["fs"]
+	}
+	if err := json.Unmarshal(rawFiles, &files); err != nil {
 		return nil
 	}
 
@@ -750,10 +855,10 @@ func litmusResultForMember(parent []byte, id int) []byte {
 
 	out := make(map[string]json.RawMessage, len(member)+4)
 	// Pass through envelope-level metadata that applies to every member.
-	// `l` is the per-100M severity level (litmus v2 schema). For older
+	// `lvl` is the per-100M severity level. For older
 	// litmus outputs we also carry `level`/`threshold`/`thresholds` so
 	// already-stored results stay readable; these are no-ops on v2 envelopes.
-	for _, key := range []string{"v", "version", "thresholds", "threshold", "level", "l", "analyzed_at"} {
+	for _, key := range []string{"v", "version", "thresholds", "threshold", "level", "lvl", "l", "conf", "analyzed_at"} {
 		if v := envelope[key]; len(v) != 0 {
 			out[key] = v
 		}
@@ -770,10 +875,16 @@ func cleaveFileIndexForSHA(result []byte, sha256 string) (int, bool) {
 	var report struct {
 		Files []struct {
 			SHA256 string `json:"sha"`
+		} `json:"files"`
+		OldFiles []struct {
+			SHA256 string `json:"sha"`
 		} `json:"fs"`
 	}
 	if json.Unmarshal(result, &report) != nil {
 		return 0, false
+	}
+	if len(report.Files) == 0 {
+		report.Files = report.OldFiles
 	}
 	for i, f := range report.Files {
 		if strings.EqualFold(f.SHA256, sha256) {

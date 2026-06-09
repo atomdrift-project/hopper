@@ -357,11 +357,11 @@ func pgRuntimeMigrations() []string { //nolint:revive // long sequential migrati
 				ALTER TABLE samples DROP COLUMN IF EXISTS file_type;
 				ALTER TABLE samples ADD COLUMN file_type TEXT NOT NULL
 					GENERATED ALWAYS AS
-						(COALESCE(cleave_result->'fs'->0->>'type', ''))
+						(COALESCE(cleave_result->'files'->0->>'type', cleave_result->'fs'->0->>'type', ''))
 					STORED;
 			END IF;
 
-			-- score: cleave's cumulative severity (fs[0].x)
+			-- score: cleave's cumulative severity (files[0].risk)
 			IF NOT EXISTS (
 				SELECT 1 FROM pg_attribute
 				 WHERE attrelid = 'samples'::regclass AND attname = 'score'
@@ -370,11 +370,11 @@ func pgRuntimeMigrations() []string { //nolint:revive // long sequential migrati
 				ALTER TABLE samples DROP COLUMN IF EXISTS score;
 				ALTER TABLE samples ADD COLUMN score INTEGER NOT NULL
 					GENERATED ALWAYS AS
-						(COALESCE((cleave_result->'fs'->0->>'x')::int, 0))
+						(COALESCE((cleave_result->'files'->0->>'risk')::int, (cleave_result->'fs'->0->>'x')::int, 0))
 					STORED;
 			END IF;
 
-			-- formula: cleave's behavioral signature (fs[0].f)
+			-- formula: cleave's behavioral signature (files[0].mol)
 			IF NOT EXISTS (
 				SELECT 1 FROM pg_attribute
 				 WHERE attrelid = 'samples'::regclass AND attname = 'formula'
@@ -383,7 +383,7 @@ func pgRuntimeMigrations() []string { //nolint:revive // long sequential migrati
 				ALTER TABLE samples DROP COLUMN IF EXISTS formula;
 				ALTER TABLE samples ADD COLUMN formula TEXT NOT NULL
 					GENERATED ALWAYS AS
-						(COALESCE(cleave_result->'fs'->0->>'f', ''))
+						(COALESCE(cleave_result->'files'->0->>'mol', cleave_result->'fs'->0->>'f', ''))
 					STORED;
 			END IF;
 		END$$`,
@@ -881,18 +881,18 @@ func (db *DB) workflowSamplesPG(ctx context.Context, where string, limit int) ([
 			cleave_result IS NOT NULL,
 			litmus_result IS NOT NULL,
 			-- Criticality (0=benign, 1=suspicious, 2=hostile): legacy records
-			-- (v4/v5) carried class directly; v2 drops it for l (the strictest
+			-- (v4/v5) carried class directly; v6/v7 use lvl/l (the strictest
 			-- grid level at which the file fires, or -1 for never-fires). Try
-			-- class first; otherwise derive from l using CriticalLevel %d as
-			-- the hostile/suspicious cutoff (l == null is manual-mode hostile,
+			-- class first; otherwise derive from the level using CriticalLevel %d as
+			-- the hostile/suspicious cutoff (null is manual-mode hostile,
 			-- treated as hostile fail-safe).
 			COALESCE(
 				(litmus_result->>'class')::int,
 				CASE
 					WHEN litmus_result IS NULL THEN 0
-					WHEN litmus_result->>'l' IS NULL THEN 2
-					WHEN (litmus_result->>'l')::int < 0 THEN 0
-					WHEN (litmus_result->>'l')::int <= %d THEN 2
+					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l') IS NULL THEN 2
+					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int < 0 THEN 0
+					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= %d THEN 2
 					ELSE 1
 				END
 			)
@@ -1928,10 +1928,11 @@ func (db *DB) samplesByEmbeddedSHA256PG(ctx context.Context, sha256 string, limi
 	rows, err := db.pool.Query(ctx, `
 		SELECT DISTINCT `+pgSampleCols+`
 		FROM samples,
-			JSON_TABLE(cleave_result, '$.files[*]' COLUMNS (
-				file_sha256 TEXT PATH '$.sha256'
+			JSON_TABLE(COALESCE(cleave_result->'files', cleave_result->'fs', '[]'::jsonb), '$[*]' COLUMNS (
+				file_sha256 TEXT PATH '$.sha256',
+				file_sha TEXT PATH '$.sha'
 			)) AS jt
-		WHERE jt.file_sha256 = $1
+		WHERE COALESCE(jt.file_sha256, jt.file_sha) = $1
 		ORDER BY id
 		LIMIT $2`, sha256, limit)
 	if err != nil {
@@ -1957,13 +1958,14 @@ func (db *DB) recomputeCanonicalSHA256PG(ctx context.Context) (int64, error) {
 			UPDATE samples SET canonical_sha256 = computed.canonical, updated_at = now()
 			FROM (
 				SELECT s.sha256,
-					LEAST(s.sha256, MIN(jt.file_sha256)) AS canonical
+					LEAST(s.sha256, MIN(COALESCE(jt.file_sha256, jt.file_sha))) AS canonical
 				FROM samples s
 				JOIN batch b ON b.sha256 = s.sha256,
-					JSON_TABLE(s.cleave_result, '$.files[*]' COLUMNS (
-						file_sha256 TEXT PATH '$.sha256'
+					JSON_TABLE(COALESCE(s.cleave_result->'files', s.cleave_result->'fs', '[]'::jsonb), '$[*]' COLUMNS (
+						file_sha256 TEXT PATH '$.sha256',
+						file_sha TEXT PATH '$.sha'
 					)) AS jt
-				WHERE length(jt.file_sha256) = 64
+				WHERE length(COALESCE(jt.file_sha256, jt.file_sha)) = 64
 				GROUP BY s.sha256
 			) AS computed
 			WHERE samples.sha256 = computed.sha256
@@ -1994,7 +1996,7 @@ func (db *DB) recomputeCanonicalSHA256PG(ctx context.Context) (int64, error) {
 
 const pgCleaveBackfillWhere = `cleave_result IS NOT NULL
 	AND elements = ''
-	AND cleave_result->'fs'->0->>'f' > ''`
+	AND COALESCE(cleave_result->'files'->0->>'mol', cleave_result->'fs'->0->>'f', '') > ''`
 
 func (db *DB) backfillPendingPG(ctx context.Context) (BackfillPending, error) {
 	var pending BackfillPending
@@ -2053,7 +2055,7 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 
 	// Candidate rows: have cleave_result but elements wasn't derived yet AND
 	// the JSON would actually produce a non-empty elements value. The third
-	// clause excludes "stuck" rows where cleave_result lacks an fs[0].f field —
+	// clause excludes "stuck" rows where cleave_result lacks a files[0].mol field —
 	// without it, those rows match the gate, get UPDATEd to elements='' (no-op),
 	// and re-match next batch, inflating RowsAffected and risking an infinite
 	// loop on databases with >= backfillBatch such rows.
@@ -2082,20 +2084,22 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 		cleaveTag, err := db.pool.Exec(ctx, `
 			UPDATE samples SET
 				elements = translate(
-					COALESCE(cleave_result->'fs'->0->>'f', ''),
+					COALESCE(cleave_result->'files'->0->>'mol', cleave_result->'fs'->0->>'f', ''),
 					'₀₁₂₃₄₅₆₇₈₉', ''),
 				max_crit = COALESCE((
-					SELECT MAX((tr->>'l')::int)
+					SELECT MAX((COALESCE(tr->>'crit', tr->>'l'))::int)
 					FROM jsonb_array_elements(
-						COALESCE(cleave_result->'fs'->0->'ts', '[]'::jsonb)
+						COALESCE(cleave_result->'files'->0->'find', cleave_result->'fs'->0->'ts', '[]'::jsonb)
 					) AS tr
+					WHERE COALESCE(tr->>'crit', tr->>'l') IS NOT NULL
 				), 0),
 				suspicious_count = (
 					SELECT COUNT(*)::int
 					FROM jsonb_array_elements(
-						COALESCE(cleave_result->'fs'->0->'ts', '[]'::jsonb)
+						COALESCE(cleave_result->'files'->0->'find', cleave_result->'fs'->0->'ts', '[]'::jsonb)
 					) AS tr
-					WHERE (tr->>'l')::int >= 4
+					WHERE COALESCE(tr->>'crit', tr->>'l') IS NOT NULL
+						AND (COALESCE(tr->>'crit', tr->>'l'))::int >= 4
 				),
 				updated_at = now()
 			WHERE sha256 IN (
@@ -2639,18 +2643,18 @@ func (db *DB) feedSamplesPG(ctx context.Context, q FeedQuery) ([]*Sample, error)
 			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
 			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
 			AND (coalesce(cardinality($5::int[]), 0) = 0 OR
-				-- Match either schema: legacy class field, or v6 l-derived.
+				-- Match either schema: legacy class field, or v6/v7 level-derived.
 				-- Mirror prism's envelopeClass / workflowSamplesPG: class first;
-				-- else derive from l using $12 as the hostile/suspicious cutoff
+				-- else derive from lvl/l using $12 as the hostile/suspicious cutoff
 				-- (null is manual-mode hostile/2; -1 benign/0; 0..=cutoff
 				-- hostile/2; above cutoff suspicious/1).
 				COALESCE(
 					(litmus_result->>'class')::int,
 					CASE
 						WHEN litmus_result IS NULL THEN 0
-						WHEN litmus_result->>'l' IS NULL THEN 2
-						WHEN (litmus_result->>'l')::int < 0 THEN 0
-						WHEN (litmus_result->>'l')::int <= $12 THEN 2
+						WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l') IS NULL THEN 2
+						WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int < 0 THEN 0
+						WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= $12 THEN 2
 						ELSE 1
 					END
 				) = ANY($5))
@@ -2681,18 +2685,18 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q FeedQuery) (int, error) 
 			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
 			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
 			AND (coalesce(cardinality($5::int[]), 0) = 0 OR
-				-- Match either schema: legacy class field, or v6 l-derived.
+				-- Match either schema: legacy class field, or v6/v7 level-derived.
 				-- Mirror prism's envelopeClass / workflowSamplesPG: class first;
-				-- else derive from l using $10 as the hostile/suspicious cutoff
+				-- else derive from lvl/l using $10 as the hostile/suspicious cutoff
 				-- (null is manual-mode hostile/2; -1 benign/0; 0..=cutoff
 				-- hostile/2; above cutoff suspicious/1).
 				COALESCE(
 					(litmus_result->>'class')::int,
 					CASE
 						WHEN litmus_result IS NULL THEN 0
-						WHEN litmus_result->>'l' IS NULL THEN 2
-						WHEN (litmus_result->>'l')::int < 0 THEN 0
-						WHEN (litmus_result->>'l')::int <= $10 THEN 2
+						WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l') IS NULL THEN 2
+						WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int < 0 THEN 0
+						WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= $10 THEN 2
 						ELSE 1
 					END
 				) = ANY($5))

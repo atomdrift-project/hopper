@@ -1699,6 +1699,12 @@ func TestLitmusResultForMemberAcceptsV4AndV5(t *testing.T) {
 			wantPresent: []string{"v", "version", "threshold", "level"},
 			wantAbsent:  []string{"thresholds"},
 		},
+		{
+			name:        "v7 envelope",
+			parent:      []byte(`{"v":"7","prob":0.97,"lvl":3,"conf":97,"version":"vtest","files":[{"id":0,"prob":0.91,"lvl":3,"conf":97}]}`),
+			wantPresent: []string{"v", "version", "lvl", "conf"},
+			wantAbsent:  []string{"thresholds", "threshold", "level", "l"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2338,6 +2344,27 @@ func TestSamplesByEmbeddedSHA256(t *testing.T) {
 	} else if samples[0].SHA256 != "parent1" {
 		t.Errorf("expected parent1, got %s", samples[0].SHA256)
 	}
+
+	cleaveV7 := []byte(`{"v":"7","files":[{"sha":"parent7","type":"archive","dp":0},{"sha":"embedded7","type":"elf","dp":1,"mol":"O2","risk":5}]}`)
+	s = &Sample{SHA256: "parent7", Source: "test", Path: "test/parent7", CleaveResult: cleaveV7}
+	if _, err := db.InsertSampleNew(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET cleave_result = ? WHERE sha256 = ?`,
+		string(cleaveV7), s.SHA256); err != nil {
+		t.Fatal(err)
+	}
+
+	samples, err = db.SamplesByEmbeddedSHA256(ctx, "embedded7", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 1 {
+		t.Errorf("expected 1 v7 sample, got %d", len(samples))
+	} else if samples[0].SHA256 != "parent7" {
+		t.Errorf("expected parent7, got %s", samples[0].SHA256)
+	}
 }
 
 func TestRecomputeCanonicalSHA256(t *testing.T) {
@@ -2574,11 +2601,12 @@ func TestFeedSamplesSearch(t *testing.T) {
 	}
 }
 
-// TestFeedSamplesLitmusClassesV6 locks in the v6 `l` → 0/1/2 class derivation
-// used by the LitmusClasses filter, mirroring prism's envelopeClass: -1 benign,
-// null manual-mode hostile, 0..=CriticalLevel hostile, above suspicious. It
-// guards the regression where the hostile filter dropped v6 rows.
-func TestFeedSamplesLitmusClassesV6(t *testing.T) {
+// TestFeedSamplesLitmusClassesV6V7 locks in the compact level → 0/1/2 class
+// derivation used by the LitmusClasses filter, mirroring prism's envelopeClass:
+// -1 benign, null manual-mode hostile, 0..=CriticalLevel hostile, above
+// suspicious. It guards the regression where the hostile filter dropped compact
+// litmus rows.
+func TestFeedSamplesLitmusClassesV6V7(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
@@ -2593,6 +2621,11 @@ func TestFeedSamplesLitmusClassesV6(t *testing.T) {
 		{"v6crit", `{"v":"6","l":4}`, 2},    // boundary: at the critical line
 		{"v6susp", `{"v":"6","l":10}`, 1},   // fires only above the line
 		{"v6benign", `{"v":"6","l":-1}`, 0}, // never fires
+		{"v7null", `{"v":"7","lvl":null}`, 2},
+		{"v7lo", `{"v":"7","lvl":0}`, 2},
+		{"v7crit", `{"v":"7","lvl":4}`, 2},
+		{"v7susp", `{"v":"7","lvl":10}`, 1},
+		{"v7benign", `{"v":"7","lvl":-1}`, 0},
 		{"legacy2", `{"v":"4","class":2}`, 2},
 		{"legacy1", `{"v":"4","class":1}`, 1},
 	}
@@ -2625,13 +2658,14 @@ func TestFeedSamplesLitmusClassesV6(t *testing.T) {
 		}
 		for _, r := range rows {
 			if want := r.class == class; got[r.sha] != want {
-				t.Errorf("class=%d filter: %s (l-class %d) present=%v, want %v", class, r.sha, r.class, got[r.sha], want)
+				t.Errorf("class=%d filter: %s (level-class %d) present=%v, want %v", class, r.sha, r.class, got[r.sha], want)
 			}
 		}
 	}
 
-	// A caller-pinned cutoff moves the line: with CriticalLevel=3, l=4 (hostile
-	// at the default cutoff) becomes suspicious. This is the consistency knob.
+	// A caller-pinned cutoff moves the line: with CriticalLevel=3, level 4
+	// (hostile at the default cutoff) becomes suspicious. This is the
+	// consistency knob.
 	q := FeedQuery{Source: "v6test", Limit: 100, CriticalLevel: 3, LitmusClasses: []int{1}}
 	samples, err := db.FeedSamples(ctx, q)
 	if err != nil {
@@ -2644,7 +2678,7 @@ func TestFeedSamplesLitmusClassesV6(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("CriticalLevel=3: expected v6crit (l=4) to be classed suspicious")
+		t.Errorf("CriticalLevel=3: expected v6crit (level=4) to be classed suspicious")
 	}
 }
 
@@ -2760,6 +2794,20 @@ func TestParseCleaveResultV5KeepsMetadataAndIgnoresFacts(t *testing.T) {
 	}
 }
 
+func TestParseCleaveResultV7KeepsMetadata(t *testing.T) {
+	result := []byte(`{"v":"7","tv":"abcde","files":[{"sha":"aaa","type":"pe","mol":"O₃","risk":16,"dp":0,"find":[{"crit":4},{"crit":5}],"fact":{"id":"pe","met":{"binary":{"overall_entropy":7.2}},"val":{"pe.machine":"x86_64"}}}]}`)
+	parsed := ParseCleaveResult("aaa", result)
+	if parsed.TraitsVersion != "abcde" {
+		t.Fatalf("TraitsVersion = %q", parsed.TraitsVersion)
+	}
+	if parsed.FileInfo.FileType != "pe" || parsed.FileInfo.Formula != "O₃" || parsed.FileInfo.Score != 16 {
+		t.Fatalf("FileInfo = %+v", parsed.FileInfo)
+	}
+	if parsed.FileInfo.MaxCrit != 5 || parsed.FileInfo.SuspiciousCount != 2 {
+		t.Fatalf("crit summary = max %d suspicious %d", parsed.FileInfo.MaxCrit, parsed.FileInfo.SuspiciousCount)
+	}
+}
+
 func TestUpdateCleaveResultSetsFormulaAndScore(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -2812,7 +2860,7 @@ func TestUpdateCleaveResultCompactsArchiveStorage(t *testing.T) {
 		Files         []struct {
 			SHA256 string `json:"sha"`
 			Depth  int    `json:"dp"`
-		} `json:"fs"`
+		} `json:"files"`
 		Truncated    bool `json:"truncated"`
 		OmittedFiles int  `json:"omitted_files"`
 	}
@@ -2820,7 +2868,7 @@ func TestUpdateCleaveResultCompactsArchiveStorage(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(stored.Files) != 1 || stored.Files[0].SHA256 != parentSHA || stored.Files[0].Depth != 0 {
-		t.Fatalf("stored fs = %+v, want only parent", stored.Files)
+		t.Fatalf("stored files = %+v, want only parent", stored.Files)
 	}
 	if !stored.Truncated || stored.OmittedFiles != 1 || stored.TraitsVersion != "abcde" {
 		t.Fatalf("stored compact metadata = %+v", stored)
