@@ -138,8 +138,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 			return fmt.Errorf("hopper: migrate sqlite: %w", err)
 		}
 	}
-	// Poison-sample protection: claim-attempt counter, skip timestamp, and a
-	// partial index so the reaper's "attempts >= N" scan stays cheap.
+	// Poison-sample protection: claim-attempt counter and skip timestamp. No
+	// dedicated index — the reaper's periodic "attempts >= N" sweep rides the
+	// existing idx_samples_unanalyzed over the small pending set.
 	if pragmaHasColumn(ctx, db.lite, "attempts") == 0 {
 		if _, err := db.lite.ExecContext(ctx, `ALTER TABLE samples ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite: %w", err)
@@ -149,10 +150,6 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		if _, err := db.lite.ExecContext(ctx, `ALTER TABLE samples ADD COLUMN skipped_at DATETIME`); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite: %w", err)
 		}
-	}
-	if _, err := db.lite.ExecContext(ctx,
-		`CREATE INDEX IF NOT EXISTS idx_samples_stuck ON samples(attempts) WHERE cleave_result IS NULL AND skip = ''`); err != nil {
-		return fmt.Errorf("hopper: migrate sqlite: %w", err)
 	}
 
 	hasMarkerMtime := pragmaHasColumn(ctx, db.lite, "marker_mtime")

@@ -167,11 +167,12 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive,maintidx //
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS traits_version TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS cyclotron_attempted_at TIMESTAMPTZ`,
 		// Poison-sample protection: count claims that never produced a result
-		// and record skip timing. The partial index keeps the reaper's
-		// "attempts >= N" scan O(pending count).
+		// and record skip timing. No dedicated index — the reaper's
+		// "attempts >= N" sweep runs every few minutes and rides the existing
+		// idx_samples_unanalyzed (the pending set is small), and an index on
+		// attempts would take a write on the hot claim path for every bump.
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS skipped_at TIMESTAMPTZ`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_stuck ON samples(attempts) WHERE cleave_result IS NULL AND skip = ''`,
 		// Covers FP/FN seed queries (falsePositivesPG, falseNegativesPG, light
 		// variants, seedCandidatesInPathsPG) ordered by impact. The detection
 		// filter (max_crit / suspicious_count) and cyclotron_attempted_at
