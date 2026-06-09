@@ -363,6 +363,8 @@ td.warn{color:var(--amber)}
 .graph-title{font-size:.72rem;color:var(--sub);font-family:var(--mono);
   padding-bottom:.4rem;display:flex;justify-content:space-between;gap:.5rem}
 .graph-title em{color:var(--text);font-style:normal}
+.graph-note{font-size:.72rem;color:var(--sub);font-family:var(--mono);
+  padding:.5rem 0}
 .graph-legend{display:flex;gap:1rem;padding:.5rem 0;flex-wrap:wrap}
 .legend-item{display:flex;align-items:center;gap:.35rem;
   font-size:.72rem;color:var(--sub);font-family:var(--mono)}
@@ -644,9 +646,10 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	// over the trailing window, all from the database's own counts (sampled
 	// into the local metrics cache). They share one time axis but each scales
 	// to its own maximum, since the three magnitudes differ by orders.
+	var queuePoints []queuePoint
 	if wd.metrics != nil {
 		//nolint:contextcheck,errcheck // closure creates its own context; closure logs errors before returning
-		points, _ := wd.seriesCache.Fetch("series", func() ([]queuePoint, error) {
+		queuePoints, _ = wd.seriesCache.Fetch("series", func() ([]queuePoint, error) {
 			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
 			defer cancel()
 			pts, err := wd.metrics.series(qctx, time.Now().Add(-queueGraphWindow))
@@ -655,8 +658,8 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 			}
 			return pts, err
 		})
-		writeQueueGraphs(&buf, points)
 	}
+	writeQueueGraphs(&buf, queuePoints, wd.metrics != nil)
 
 	// Workers
 	if len(workers) > 0 {
@@ -1137,8 +1140,18 @@ const queueGraphWindow = 72 * time.Hour
 // time axis, but each is scaled to its own maximum: pending (~10^5), rescan
 // (~10^6) and per-interval completions (~10^3) differ by orders of magnitude,
 // so a single shared y-axis would flatten two of the three into the baseline.
-func writeQueueGraphs(buf *strings.Builder, points []queuePoint) {
+func writeQueueGraphs(buf *strings.Builder, points []queuePoint, cacheReady bool) {
 	if len(points) < 2 {
+		// Make the empty state visible rather than silently omitting the
+		// section: distinguish a disabled cache (won't fix itself) from the
+		// normal post-restart warm-up (fills within a couple of samples).
+		buf.WriteString(`<section><div class="label">Queues &amp; throughput</div><div class="graph-note">`)
+		if cacheReady {
+			buf.WriteString(`collecting&hellip; first points appear within a few minutes`)
+		} else {
+			buf.WriteString(`metrics cache unavailable — set HOPPER_METRICS_DB to a writable path`)
+		}
+		buf.WriteString(`</div></section>`)
 		return
 	}
 	pending := make([]float64, len(points))

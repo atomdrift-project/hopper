@@ -34,17 +34,17 @@ type queuePoint struct {
 }
 
 // metricsDBPath returns the path to the local metrics cache. HOPPER_METRICS_DB
-// overrides it; otherwise it lives under the user cache dir, falling back to
-// the temp dir when that is unavailable.
+// overrides it; otherwise it lives alongside the hash cache in xdgCacheDir().
+// We deliberately reuse that resolver rather than os.UserCacheDir: a systemd
+// service often runs without $HOME/$XDG_CACHE_HOME, where os.UserCacheDir errs
+// and a temp-dir fallback may be unwritable or wiped (PrivateTmp) on restart.
+// xdgCacheDir has a working fallback chain (it's where the hash cache lives),
+// so the metrics cache lands wherever the hash cache already succeeds.
 func metricsDBPath() string {
 	if p := os.Getenv("HOPPER_METRICS_DB"); p != "" {
 		return p
 	}
-	base, err := os.UserCacheDir()
-	if err != nil {
-		base = os.TempDir()
-	}
-	return filepath.Join(base, "hopper", "queue-metrics.db")
+	return filepath.Join(xdgCacheDir(), "queue-metrics.db")
 }
 
 // openMetricsStore opens (creating if needed) the local metrics cache at path
