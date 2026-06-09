@@ -963,6 +963,24 @@ func (db *DB) Migrate(ctx context.Context) error {
 	return nil
 }
 
+// MigrateServing applies the migrations a server needs before it can accept
+// work and returns a function that performs the remaining, deferrable
+// migrations — the index builds. The caller should run that function in the
+// background after it begins serving: a missing index only makes queries
+// slower, never wrong, and building one on a large table can take many minutes
+// — long enough to strand workers if it blocks startup. On SQLite everything is
+// applied up front (local databases are small and have no serving-gap concern)
+// and the returned function is a no-op.
+func (db *DB) MigrateServing(ctx context.Context) (func(context.Context) error, error) {
+	if db.pool != nil {
+		return db.migrateServingPG(ctx)
+	}
+	if err := db.migrateSQLite(ctx); err != nil {
+		return nil, err
+	}
+	return func(context.Context) error { return nil }, nil
+}
+
 // DeleteAll removes all rows from reports and samples, preserving the schema.
 func (db *DB) DeleteAll(ctx context.Context) error {
 	if db.pool != nil {

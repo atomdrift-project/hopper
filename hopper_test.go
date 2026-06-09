@@ -933,6 +933,35 @@ func TestSetSkip(t *testing.T) {
 	}
 }
 
+func TestPGMigrationPartition(t *testing.T) {
+	// The serving path runs core DDL synchronously and defers index builds.
+	// Correctness rests on two invariants: nothing classified as "core" is a
+	// CREATE INDEX (those are the slow builds we move off the startup path),
+	// and the list actually contains both kinds.
+	var coreN, indexN int
+	for _, ddl := range pgRuntimeMigrations() {
+		if isDeferrableIndexDDL(ddl) {
+			indexN++
+			continue
+		}
+		coreN++
+		if strings.HasPrefix(strings.TrimSpace(ddl), "CREATE INDEX") {
+			t.Errorf("CREATE INDEX leaked into the synchronous core phase: %q", ddl)
+		}
+	}
+	if coreN == 0 || indexN == 0 {
+		t.Fatalf("expected both core and index DDL, got core=%d index=%d", coreN, indexN)
+	}
+
+	// pg_trgm: the extension is core (cheap), the GIN index is deferred.
+	if isDeferrableIndexDDL(trgmExtensionDDL) {
+		t.Error("trgm extension should run as core DDL, not be deferred")
+	}
+	if !isDeferrableIndexDDL(trgmIndexDDL) {
+		t.Error("trgm GIN index should be deferred with the other indexes")
+	}
+}
+
 func TestReapStuckSamples(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()

@@ -1054,8 +1054,9 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	}()
 
 	type dbResult struct {
-		db  *hopper.DB
-		err error
+		db           *hopper.DB
+		buildIndexes func(context.Context) error
+		err          error
 	}
 	dbCh := make(chan dbResult, 1)
 	dbStart := time.Now()
@@ -1084,7 +1085,13 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		dbPhase.Store("migrating schema")
 		wd.beginStage("db.migrate", "Migrating database")
 		slog.Info("running schema migrations")
-		if err := d.Migrate(ctx); err != nil {
+		// Apply only the migrations needed before serving (schema, columns,
+		// extensions). Index builds are returned and run in the background once
+		// the API is up — building a new index on the multi-million-row samples
+		// table can take many minutes, and blocking startup on it strands every
+		// worker with 503s for the duration.
+		buildIndexes, err := d.MigrateServing(ctx)
+		if err != nil {
 			wd.failStage("db.migrate", err.Error())
 			d.Close()
 			dbPhase.Store("migration failed")
@@ -1095,7 +1102,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		wd.endStage("db.migrate")
 		dbPhase.Store("complete")
 		slog.Info("database startup task complete", "elapsed", time.Since(dbStart))
-		dbCh <- dbResult{db: d}
+		dbCh <- dbResult{db: d, buildIndexes: buildIndexes}
 	}()
 
 	// Remote litmus workers now self-register via the pull API.
@@ -1206,6 +1213,19 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 
 	api.SetTraitsVersion(traitsVersion)
 	api.rescanAge = *rescanAge
+
+	// Build deferred indexes in the background now that the API is serving.
+	// On an established database these are ledger-skipped no-ops; a genuinely
+	// new index warms up without blocking workers, who keep running on the
+	// existing query plans until it becomes valid. Uses the root ctx (not
+	// loadCtx) so a long build isn't cut short by load completion.
+	if dr.buildIndexes != nil {
+		go func() {
+			if err := dr.buildIndexes(ctx); err != nil {
+				slog.Warn("background index migration failed; queries may be slower until next restart", "error", err)
+			}
+		}()
+	}
 
 	// Background pool that handles archive expansion off the /api/result hot
 	// path. Drains gracefully on return so a worker's ExplodeArchiveMembers

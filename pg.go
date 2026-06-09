@@ -42,22 +42,27 @@ func openPG(ctx context.Context, dsn string) (*DB, error) {
 	return &DB{pool: pool}, nil
 }
 
-func (db *DB) migratePG(ctx context.Context) error { //nolint:revive,maintidx // long sequential migration list; splitting reduces clarity
-	if err := db.ensurePGMigrationLedger(ctx); err != nil {
-		return fmt.Errorf("hopper: migrate: %w", err)
+// migratePG applies every migration synchronously — core DDL (tables, columns,
+// extensions) followed by all index builds. Used by one-shot commands (init,
+// import) where nothing is serving yet and a fully-indexed database is wanted
+// before bulk work begins. The serving path (load/serve) calls migrateServingPG
+// instead, which defers index builds to a background goroutine.
+func (db *DB) migratePG(ctx context.Context) error {
+	build, err := db.migrateServingPG(ctx)
+	if err != nil {
+		return err
 	}
-	// Base schema is ledger-gated like every other migration. Although every
-	// statement in it is idempotent (CREATE … IF NOT EXISTS), a no-op CREATE
-	// INDEX still takes a ShareLock on samples to perform its check — and that
-	// lock request queues behind any open transaction (e.g. a long pool
-	// reconcile) and head-of-line-blocks every writer behind it. Skipping the
-	// blob outright once it is recorded keeps an unchanged-schema restart
-	// completely lock-free.
-	if err := db.execPGMigrationDDL(ctx, schemaPG); err != nil {
-		return fmt.Errorf("hopper: migrate: %w", err)
-	}
-	// Add columns introduced after initial schema.
-	for _, ddl := range []string{
+	return build(ctx)
+}
+
+// pgRuntimeMigrations is the ordered post-schema DDL list. Extracted into its
+// own function so the synchronous (migratePG) and serving (migrateServingPG)
+// paths share one source of truth; the serving path partitions it with
+// isDeferrableIndexDDL. Index DDL may appear anywhere in the list — every
+// CREATE INDEX depends only on columns added earlier, never on another index,
+// so building all columns before any index preserves correctness.
+func pgRuntimeMigrations() []string { //nolint:revive // long sequential migration list; splitting reduces clarity
+	return []string{
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS parent TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS skip TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS formula TEXT NOT NULL DEFAULT ''`,
@@ -471,34 +476,87 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive,maintidx //
 		// top-level working set without scanning the full samples heap.
 		`CREATE INDEX IF NOT EXISTS idx_samples_reconcile_toplevel ON samples(sha256)
 			WHERE parent = '' AND (skip = '' OR skip = 'conflict')`,
-	} {
+	}
+}
+
+// trgmExtensionDDL and trgmIndexDDL back the web-UI filename search
+// (FeedQuery.Search's `filename ILIKE '%term%'`): pg_trgm's GIN operator class
+// indexes the leading-wildcard substring match a btree can't serve, and the
+// partial predicate mirrors the feed query (top-level, analyzed) so the index
+// stays small. The extension is applied as core DDL; the GIN index is deferred
+// with the other indexes. Both are best-effort — a missing contrib package
+// must never crash-loop the ingester; search just falls back to a seq-scan, and
+// an unrecorded DDL is retried on a later boot once the extension is installed.
+const trgmExtensionDDL = `CREATE EXTENSION IF NOT EXISTS pg_trgm`
+
+const trgmIndexDDL = `CREATE INDEX IF NOT EXISTS idx_samples_filename_trgm ` +
+	`ON samples USING gin (filename gin_trgm_ops) ` +
+	`WHERE cleave_result IS NOT NULL AND parent = ''`
+
+// isDeferrableIndexDDL reports whether ddl is a CREATE INDEX that can be built
+// in the background after the server starts. A missing index only makes
+// queries slower; building one on a large table holds an ACCESS-blocking lock
+// or a long concurrent scan, which would strand workers if it ran on the
+// startup critical path.
+func isDeferrableIndexDDL(ddl string) bool {
+	return strings.HasPrefix(strings.TrimSpace(ddl), "CREATE INDEX")
+}
+
+// migrateServingPG applies the migrations a server needs before it can safely
+// accept work — the base schema, columns, and the pg_trgm extension — and
+// returns a function that builds the deferrable indexes. The caller runs that
+// function in the background once it is serving, so a new index build never
+// blocks workers. On an established database every index already exists, so the
+// returned function is a fast sequence of ledger-skipped no-ops.
+func (db *DB) migrateServingPG(ctx context.Context) (func(context.Context) error, error) {
+	if err := db.ensurePGMigrationLedger(ctx); err != nil {
+		return nil, fmt.Errorf("hopper: migrate: %w", err)
+	}
+	// Base schema is ledger-gated like every other migration. Although every
+	// statement in it is idempotent (CREATE … IF NOT EXISTS), a no-op CREATE
+	// INDEX still takes a ShareLock on samples to perform its check — and that
+	// lock request queues behind any open transaction (e.g. a long pool
+	// reconcile) and head-of-line-blocks every writer behind it. Skipping the
+	// blob outright once it is recorded keeps an unchanged-schema restart
+	// completely lock-free.
+	if err := db.execPGMigrationDDL(ctx, schemaPG); err != nil {
+		return nil, fmt.Errorf("hopper: migrate: %w", err)
+	}
+
+	// Core DDL (columns, tables, cleanup) runs now; index builds are collected
+	// for the background phase.
+	var deferred []string
+	for _, ddl := range pgRuntimeMigrations() {
+		if isDeferrableIndexDDL(ddl) {
+			deferred = append(deferred, ddl)
+			continue
+		}
 		if err := db.execPGMigrationDDL(ctx, ddl); err != nil {
-			return fmt.Errorf("hopper: migrate: %w", err)
+			return nil, fmt.Errorf("hopper: migrate: %w", err)
 		}
 	}
 
-	// Optional, best-effort migrations: a failure here logs a warning and lets
-	// hopper start anyway. These back only the web-UI filename search
-	// (FeedQuery.Search's `filename ILIKE '%term%'`): pg_trgm's GIN operator
-	// class indexes the leading-wildcard substring match a btree can't serve,
-	// and the partial predicate mirrors the feed query (top-level, analyzed) so
-	// the index stays small. Without them, search falls back to an ILIKE
-	// seq-scan — slower, but a missing contrib extension must never crash-loop
-	// the whole ingester. On failure the DDL is left unrecorded in the ledger,
-	// so a later boot retries once the extension is installed.
-	for _, ddl := range []string{
-		`CREATE EXTENSION IF NOT EXISTS pg_trgm`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_filename_trgm ` +
-			`ON samples USING gin (filename gin_trgm_ops) ` +
-			`WHERE cleave_result IS NOT NULL AND parent = ''`,
-	} {
-		if err := db.execPGMigrationDDL(ctx, ddl); err != nil {
-			slog.Warn("optional migration skipped; continuing without it", "ddl", ddl, "error", err)
-			break // the index needs the extension; don't attempt it if the extension failed
-		}
+	trgmReady := true
+	if err := db.execPGMigrationDDL(ctx, trgmExtensionDDL); err != nil {
+		slog.Warn("optional migration skipped; continuing without it", "ddl", trgmExtensionDDL, "error", err)
+		trgmReady = false
 	}
-	slog.Info("all migrations applied")
-	return nil
+	slog.Info("core migrations applied", "deferred_indexes", len(deferred))
+
+	return func(ctx context.Context) error {
+		for _, ddl := range deferred {
+			if err := db.execPGMigrationDDL(ctx, ddl); err != nil {
+				return fmt.Errorf("hopper: migrate index: %w", err)
+			}
+		}
+		if trgmReady {
+			if err := db.execPGMigrationDDL(ctx, trgmIndexDDL); err != nil {
+				slog.Warn("optional migration skipped; continuing without it", "ddl", trgmIndexDDL, "error", err)
+			}
+		}
+		slog.Info("index migrations applied", "count", len(deferred))
+		return nil
+	}, nil
 }
 
 func (db *DB) execPGMigrationDDL(ctx context.Context, ddl string) error {
