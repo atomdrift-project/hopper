@@ -1005,23 +1005,27 @@ type resultRequest struct {
 // Both the compressed input and the decompressed output are bounded by
 // maxResultBodyBytes: a hostile or buggy client must not be able to drive
 // the server OOM with a small zstd stream that expands without limit. The
+// limits allow one extra byte so overLimit can distinguish "body exceeded
+// the cap" (the truncated JSON then fails to decode) from a genuinely
+// malformed body — callers should report the former as 413, not 400. The
 // returned cleanup must be called once decoding is done.
-func resultBody(r *http.Request) (io.Reader, func(), error) {
-	body := io.LimitReader(r.Body, maxResultBodyBytes)
+func resultBody(r *http.Request) (body io.Reader, overLimit func() bool, cleanup func(), err error) {
+	raw := &io.LimitedReader{R: r.Body, N: maxResultBodyBytes + 1}
 	switch strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding"))) {
 	case "", "identity":
-		return body, func() {}, nil
+		return raw, func() bool { return raw.N <= 0 }, func() {}, nil
 	case "zstd":
 		// One decoder per request: result POSTs are infrequent and large, so
 		// the decoder setup is dwarfed by the decode itself. Single-threaded
 		// and low-memory keeps the per-request footprint small under bursts.
-		zr, err := zstd.NewReader(body, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true))
+		zr, err := zstd.NewReader(raw, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true))
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		return io.LimitReader(zr, maxResultBodyBytes), zr.Close, nil
+		out := &io.LimitedReader{R: zr, N: maxResultBodyBytes + 1}
+		return out, func() bool { return out.N <= 0 || raw.N <= 0 }, zr.Close, nil
 	default:
-		return nil, nil, errors.New("unsupported content-encoding")
+		return nil, nil, nil, errors.New("unsupported content-encoding")
 	}
 }
 
@@ -1039,7 +1043,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	// Stream-decode rather than io.ReadAll: avoids a duplicate 128 MiB buffer
 	// per concurrent uploader. The Raw/ML json.RawMessage fields still land
 	// in memory once each, but we lose the second whole-body copy.
-	body, closeBody, err := resultBody(r)
+	body, overLimit, closeBody, err := resultBody(r)
 	if err != nil {
 		slog.Warn("result rejected: bad content-encoding", //nolint:gosec // structured logging
 			"error", err,
@@ -1052,6 +1056,17 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(body)
 	var req resultRequest
 	if err := dec.Decode(&req); err != nil {
+		// An over-limit body is truncated mid-document and fails the decode;
+		// report it as 413 so the worker sees the real cause instead of a
+		// generic "invalid json" 400.
+		if overLimit() {
+			slog.Warn("result rejected: body exceeds size limit",
+				"limit_bytes", int64(maxResultBodyBytes),
+				"remote", r.RemoteAddr,
+			)
+			http.Error(w, `{"error":"result body exceeds size limit"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
 		slog.Warn("result rejected: invalid json", //nolint:gosec // structured logging
 			"error", err,
 			"remote", r.RemoteAddr,

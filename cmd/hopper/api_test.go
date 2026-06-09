@@ -351,7 +351,7 @@ func TestResultBody(t *testing.T) {
 			if tc.encoding != "" {
 				r.Header.Set("Content-Encoding", tc.encoding)
 			}
-			reader, cleanup, err := resultBody(r)
+			reader, overLimit, cleanup, err := resultBody(r)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatal("resultBody: expected error for unsupported encoding, got nil")
@@ -368,6 +368,9 @@ func TestResultBody(t *testing.T) {
 			}
 			if !bytes.Equal(got, want) {
 				t.Fatalf("decoded body = %q, want %q", got, want)
+			}
+			if overLimit() {
+				t.Fatal("overLimit() = true for a body well under the limit")
 			}
 		})
 	}
