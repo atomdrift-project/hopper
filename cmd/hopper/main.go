@@ -1480,7 +1480,7 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	// Queue maintenance: reap poison samples and (when the cache is open)
 	// sample queue depths for the graphs, on one ticker tied to ctx.
 	dashWG.Go(func() {
-		runQueueMaintenance(ctx, db, metrics, traitsVersion, rescanAge)
+		runQueueMaintenance(ctx, db, &progress, metrics, traitsVersion, rescanAge)
 	})
 
 	// runWalk executes one full enumeration→hash→insert pass across all dirs.
@@ -1734,18 +1734,16 @@ func runDirPipeline(
 	}
 }
 
-// runDashboard renders the periodic progress view (TTY bars or slog lines)
-// until ctx is cancelled. It reads progress counters directly; no
-// coordination with workers is required beyond those atomic loads. The pool
-// status block is fed by background nodeMonitors so this function never
-// blocks on a slow remote.
 // runQueueMaintenance runs the periodic background jobs that keep the pending
 // queue healthy and the dashboard graphs fed. On each tick it reaps poison
 // samples (claimed too many times without a result) and, when the metrics
 // cache is available, snapshots the live queue depths. It runs the first pass
 // immediately so the graphs and reaper don't wait a full interval, then ticks
 // until ctx is cancelled.
-func runQueueMaintenance(ctx context.Context, db *hopper.DB, metrics *metricsStore, traitsVersion string, rescanAge time.Duration) {
+func runQueueMaintenance(
+	ctx context.Context, db *hopper.DB, progress *loadProgress,
+	metrics *metricsStore, traitsVersion string, rescanAge time.Duration,
+) {
 	const interval = 5 * time.Minute
 	const retention = 8 * 24 * time.Hour // a little beyond the 72h graph window
 	ticker := time.NewTicker(interval)
@@ -1758,7 +1756,7 @@ func runQueueMaintenance(ctx context.Context, db *hopper.DB, metrics *metricsSto
 			slog.Info("reaped stuck samples", "count", n, "max_attempts", hopper.MaxClaimAttempts)
 		}
 		if metrics != nil {
-			sampleQueueMetrics(ctx, db, metrics, traitsVersion, rescanAge, retention)
+			sampleQueueMetrics(ctx, db, progress, metrics, traitsVersion, rescanAge, retention)
 		}
 
 		select {
@@ -1769,10 +1767,17 @@ func runQueueMaintenance(ctx context.Context, db *hopper.DB, metrics *metricsSto
 	}
 }
 
-// sampleQueueMetrics records one snapshot of the live queue depths and the
+// sampleQueueMetrics records one snapshot of the queue depths plus the
 // cumulative completion count into the metrics cache, then prunes points older
-// than retention. Best-effort: a failed count must not stall maintenance.
-func sampleQueueMetrics(ctx context.Context, db *hopper.DB, metrics *metricsStore, traitsVersion string, rescanAge, retention time.Duration) {
+// than retention. The completion count is read from the in-memory analyzed
+// counter (seeded from the DB at startup, bumped on each stored result) rather
+// than a fresh count(*): counting tens of millions of analyzed rows every few
+// minutes blew the query timeout and stopped every sample from being recorded.
+// Best-effort throughout — a slow count just skips one sample.
+func sampleQueueMetrics(
+	ctx context.Context, db *hopper.DB, progress *loadProgress, metrics *metricsStore,
+	traitsVersion string, rescanAge, retention time.Duration,
+) {
 	qctx, cancel := context.WithTimeout(ctx, dashQueryTimeout)
 	defer cancel()
 
@@ -1789,20 +1794,27 @@ func sampleQueueMetrics(ctx context.Context, db *hopper.DB, metrics *metricsStor
 			slog.Debug("queue metrics: count rescan failed", "error", err)
 		}
 	}
-	completed, err := db.CountAnalyzed(qctx)
-	if err != nil {
-		slog.Debug("queue metrics: count analyzed failed", "error", err)
-	}
+	completed := progress.analyzed.Load()
 
-	if err := metrics.record(qctx, queuePoint{T: time.Now(), Pending: pending, Rescan: rescan, Completed: completed}); err != nil {
+	// Record/prune on a fresh context: a slow (or timed-out) PG count above
+	// must not carry an exhausted deadline into the local SQLite write, or the
+	// snapshot is lost even though the values are in hand.
+	wctx, wcancel := context.WithTimeout(ctx, dashQueryTimeout)
+	defer wcancel()
+	if err := metrics.record(wctx, queuePoint{T: time.Now(), Pending: pending, Rescan: rescan, Completed: completed}); err != nil {
 		slog.Warn("queue metrics: record failed", "error", err)
 		return
 	}
-	if err := metrics.prune(qctx, time.Now().Add(-retention)); err != nil {
+	if err := metrics.prune(wctx, time.Now().Add(-retention)); err != nil {
 		slog.Debug("queue metrics: prune failed", "error", err)
 	}
 }
 
+// runDashboard renders the periodic progress view (TTY bars or slog lines)
+// until ctx is cancelled. It reads progress counters directly; no
+// coordination with workers is required beyond those atomic loads. The pool
+// status block is fed by background nodeMonitors so this function never
+// blocks on a slow remote.
 func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashboard loop with many coordinated params.
 	ctx context.Context,
 	progress *loadProgress,
