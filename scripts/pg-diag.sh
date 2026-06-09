@@ -33,7 +33,7 @@ DB="${DB:-hopper}"
 DB_HOST="${DB_HOST:-}"
 OUTDIR="${OUTDIR:-/tmp}"
 POOL="${POOL:-}"
-RECONCILE_RE="${RECONCILE_RE:-RECURSIVE alive}"
+RECONCILE_RE="${RECONCILE_RE:-RECURSIVE}"
 SKIP_OS="${SKIP_OS:-0}"
 
 ts=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo unknown)
@@ -73,7 +73,8 @@ fi
 PREAMBLE="SET statement_timeout='15s'; SET lock_timeout='2s'; SET idle_in_transaction_session_timeout='15s';"
 
 # sql RUNS a heredoc (read on stdin) under the preamble, appending to the report.
-sql() { admin -d "$DB" -P pager=off -v ON_ERROR_STOP=0 -c "$PREAMBLE" -f - ; }
+# -q suppresses the command-status tags ("SET") the preamble would otherwise emit.
+sql() { admin -d "$DB" -q -P pager=off -v ON_ERROR_STOP=0 -c "$PREAMBLE" -f - ; }
 
 section() { printf '\n========== %s ==========\n' "$*" >>"$REPORT"; }
 note()    { printf '%s\n' "$*" >>"$REPORT"; }
@@ -165,7 +166,10 @@ SQL
 # (no ANALYZE -> the plan is estimated, the query is NOT executed). Only works
 # for statements without bind parameters; worker UPDATEs ($1,$2) are skipped.
 section "live reconcile query + estimated plan"
-recon_sql=$(admin -d "$DB" -tA -c "$PREAMBLE" -c \
+# Capture with -tAq and NO preamble: a single pg_stat_activity read takes no
+# heavy locks, and omitting the SET preamble keeps stray "SET" command tags out
+# of the captured text (otherwise EXPLAIN <text> becomes EXPLAIN SET...).
+recon_sql=$(admin -d "$DB" -tAqc \
   "SELECT query FROM pg_stat_activity
    WHERE datname='$DB' AND query ~ '$RECONCILE_RE' AND pid<>pg_backend_pid()
    ORDER BY xact_start LIMIT 1" 2>/dev/null)
@@ -179,7 +183,7 @@ if [ -n "$recon_sql" ]; then
             note "--- EXPLAIN (VERBOSE, SETTINGS) ---"
             tmp=$(mktemp 2>/dev/null || echo /tmp/pg-diag-explain.$$)
             printf '%s\nEXPLAIN (VERBOSE, SETTINGS) %s;\n' "$PREAMBLE" "$recon_sql" >"$tmp"
-            admin -d "$DB" -P pager=off -v ON_ERROR_STOP=0 -f "$tmp" >>"$REPORT" 2>&1
+            admin -d "$DB" -q -P pager=off -v ON_ERROR_STOP=0 -f "$tmp" >>"$REPORT" 2>&1
             rm -f "$tmp" ;;
     esac
 else
