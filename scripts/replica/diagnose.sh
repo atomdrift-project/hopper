@@ -7,7 +7,7 @@
 
 set -u
 
-REMOTE_HOST="${REMOTE_HOST:-hopper}"
+REMOTE_HOST="${REMOTE_HOST:-hopper-db}"
 REMOTE_USER="${REMOTE_USER:-hopper}"
 REMOTE_DB="${REMOTE_DB:-hopper}"
 LOCAL_DB="${LOCAL_DB:-hopper}"
