@@ -56,7 +56,6 @@ type webDashboard struct {
 	samples       []throughputSample
 	stages        []*startupStage
 	maxAnalyzed   int
-	startAnalyzed int64
 	ndirs         int
 	rescanAge     time.Duration
 	cfgMu         sync.RWMutex
@@ -151,7 +150,7 @@ func (wd *webDashboard) snapshotStages() []startupStage {
 // HTTP server already running.
 func (wd *webDashboard) configure( //nolint:revive // argument-limit: dashboard needs all session state at once
 	progress *loadProgress, litmus *litmusServer, tracker *workerTracker, api *apiServer,
-	db *hopper.DB, start time.Time, startAnalyzed int64, maxAnalyzed, ndirs int, traitsVersion string, rescanAge time.Duration,
+	db *hopper.DB, start time.Time, maxAnalyzed, ndirs int, traitsVersion string, rescanAge time.Duration,
 	metrics *metricsStore,
 ) {
 	wd.cfgMu.Lock()
@@ -163,7 +162,6 @@ func (wd *webDashboard) configure( //nolint:revive // argument-limit: dashboard 
 	wd.api = api
 	wd.db = db
 	wd.start = start
-	wd.startAnalyzed = startAnalyzed
 	wd.maxAnalyzed = maxAnalyzed
 	wd.ndirs = ndirs
 	wd.traitsVersion = traitsVersion
@@ -449,7 +447,6 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	tracker := wd.tracker
 	db := wd.db
 	start := wd.start
-	startAnalyzed := wd.startAnalyzed
 	_ = wd.maxAnalyzed // reserved for future use
 	wd.cfgMu.RUnlock()
 
@@ -505,7 +502,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 
 	elapsed := time.Since(start).Round(time.Second)
 	analyzedAbs := progress.analyzed.Load()
-	sessionAnalyzed := max(analyzedAbs-startAnalyzed, 0)
+	sessionAnalyzed := max(analyzedAbs-progress.startAnalyzed.Load(), 0)
 	walked := progress.walked.Load()
 	inserted := progress.inserted.Load()
 	skipped := progress.skipped.Load()

@@ -1338,6 +1338,7 @@ type loadProgress struct { //nolint:govet // fields grouped by pipeline stage, n
 
 	// Analysis phase.
 	analyzed           atomic.Int64
+	startAnalyzed      atomic.Int64 // analyzed total carried over from prior runs; session delta = analyzed - startAnalyzed
 	analyzeDurationSum atomic.Int64
 	analyzeDurationMax atomic.Int64
 	analyzeDurationMin atomic.Int64 // initialized to math.MaxInt64
@@ -1438,24 +1439,10 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 		api.progress = &progress
 	}
 
-	var startAnalyzed int64
-	if n, err := db.CountAnalyzed(ctx); err == nil {
-		progress.analyzed.Store(n)
-		startAnalyzed = n
-	}
-	// Initialize queued to analyzed + pending so the denominator reflects all
-	// work from prior runs. Without this, pre-existing unanalyzed samples
-	// cause analyzed to exceed queued, producing ">100%" progress.
-	if pending, err := db.CountPending(ctx); err == nil {
-		progress.queued.Store(startAnalyzed + pending)
-	} else {
-		progress.queued.Store(startAnalyzed)
-	}
-
 	// Progress dashboard — runs until ctx is cancelled (ctrl-C).
 	var dashWG sync.WaitGroup
 	dashWG.Go(func() {
-		runDashboard(ctx, &progress, litmus, tracker, db, start, startAnalyzed, maxAnalyzed, len(dirs), traitsVersion, rescanAge)
+		runDashboard(ctx, &progress, litmus, tracker, db, start, maxAnalyzed, len(dirs), traitsVersion, rescanAge)
 	})
 
 	// Local time-series cache for the dashboard queue graphs. Historical queue
@@ -1474,8 +1461,18 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 				}
 			}()
 		}
-		wd.configure(&progress, litmus, tracker, api, db, start, startAnalyzed, maxAnalyzed, len(dirs), traitsVersion, rescanAge, metrics)
+		wd.configure(&progress, litmus, tracker, api, db, start, maxAnalyzed, len(dirs), traitsVersion, rescanAge, metrics)
 	}
+
+	// Seed the progress denominators carried over from prior runs off the
+	// startup critical path. CountAnalyzed/CountPending are full count(*) scans
+	// over the samples table whose supporting partial indexes
+	// (idx_samples_litmus_done, idx_samples_unanalyzed_id) may still be building
+	// in the background after a deploy — a fresh index build can leave them
+	// taking minutes. The dashboard is already configured above, so it switches
+	// to the live view immediately and these baselines fill in once the counts
+	// return; until then the session delta is simply measured from zero.
+	go seedProgressBaseline(ctx, db, &progress)
 
 	// Queue maintenance: reap poison samples and (when the cache is open)
 	// sample queue depths for the graphs, on one ticker tied to ctx.
@@ -1810,6 +1807,34 @@ func sampleQueueMetrics(
 	}
 }
 
+// seedProgressBaseline records the analyzed/queued totals carried over from
+// prior runs so the dashboard's session percentage has the right denominator.
+// It runs off the startup critical path because the underlying count(*) scans
+// can take minutes while their partial indexes are still building in the
+// background. The counters are added (not stored) so results that arrive
+// before this returns aren't clobbered: the session delta stays correct
+// throughout — measured from zero until the baseline lands, then from it.
+// Best-effort: a failed count leaves the baseline at its zero value.
+func seedProgressBaseline(ctx context.Context, db *hopper.DB, progress *loadProgress) {
+	n, err := db.CountAnalyzed(ctx)
+	if err != nil {
+		slog.Debug("seed baseline: count analyzed failed", "error", err)
+		return
+	}
+	progress.startAnalyzed.Store(n)
+	progress.analyzed.Add(n)
+
+	// Without the pending count the denominator reflects all prior work, so
+	// pre-existing unanalyzed samples can't push analyzed past queued (>100%).
+	pending, err := db.CountPending(ctx)
+	if err != nil {
+		slog.Debug("seed baseline: count pending failed", "error", err)
+		progress.queued.Add(n)
+		return
+	}
+	progress.queued.Add(n + pending)
+}
+
 // runDashboard renders the periodic progress view (TTY bars or slog lines)
 // until ctx is cancelled. It reads progress counters directly; no
 // coordination with workers is required beyond those atomic loads. The pool
@@ -1822,7 +1847,6 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 	tracker *workerTracker,
 	db *hopper.DB,
 	start time.Time,
-	startAnalyzed int64,
 	maxAnalyzed, ndirs int,
 	traitsVersion string,
 	rescanAge time.Duration,
@@ -1877,7 +1901,7 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 		}
 
 		analyzedAbs := progress.analyzed.Load()
-		sessionAnalyzed := max(analyzedAbs-startAnalyzed, 0)
+		sessionAnalyzed := max(analyzedAbs-progress.startAnalyzed.Load(), 0)
 		walked := progress.walked.Load()
 		hashedN := progress.hashed.Load()
 		inserted := progress.inserted.Load()
