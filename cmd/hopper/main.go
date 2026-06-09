@@ -1438,9 +1438,30 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 		runDashboard(ctx, &progress, litmus, tracker, db, start, startAnalyzed, maxAnalyzed, len(dirs), traitsVersion, rescanAge)
 	})
 
+	// Local time-series cache for the dashboard queue graphs. Historical queue
+	// depth can't be reconstructed from the sample table, so the sampler
+	// snapshots live counts here. It's a pure cache (lives in the OS cache
+	// dir); failing to open it only costs graph history.
+	var metrics *metricsStore
 	if wd != nil {
-		wd.configure(&progress, litmus, tracker, api, db, start, startAnalyzed, maxAnalyzed, len(dirs), traitsVersion, rescanAge)
+		if ms, err := openMetricsStore(ctx, metricsDBPath()); err != nil {
+			slog.Warn("queue metrics cache disabled", "error", err)
+		} else {
+			metrics = ms
+			defer func() {
+				if err := metrics.close(); err != nil {
+					slog.Debug("close metrics cache failed", "error", err)
+				}
+			}()
+		}
+		wd.configure(&progress, litmus, tracker, api, db, start, startAnalyzed, maxAnalyzed, len(dirs), traitsVersion, rescanAge, metrics)
 	}
+
+	// Queue maintenance: reap poison samples and (when the cache is open)
+	// sample queue depths for the graphs, on one ticker tied to ctx.
+	dashWG.Go(func() {
+		runQueueMaintenance(ctx, db, metrics, traitsVersion, rescanAge)
+	})
 
 	// runWalk executes one full enumeration→hash→insert pass across all dirs.
 	runWalk := func(chs []<-chan labeledPath) {
@@ -1698,6 +1719,70 @@ func runDirPipeline(
 // coordination with workers is required beyond those atomic loads. The pool
 // status block is fed by background nodeMonitors so this function never
 // blocks on a slow remote.
+// runQueueMaintenance runs the periodic background jobs that keep the pending
+// queue healthy and the dashboard graphs fed. On each tick it reaps poison
+// samples (claimed too many times without a result) and, when the metrics
+// cache is available, snapshots the live queue depths. It runs the first pass
+// immediately so the graphs and reaper don't wait a full interval, then ticks
+// until ctx is cancelled.
+func runQueueMaintenance(ctx context.Context, db *hopper.DB, metrics *metricsStore, traitsVersion string, rescanAge time.Duration) {
+	const interval = 5 * time.Minute
+	const retention = 8 * 24 * time.Hour // a little beyond the 72h graph window
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		if n, err := db.ReapStuck(ctx); err != nil {
+			slog.Warn("reap stuck samples failed", "error", err)
+		} else if n > 0 {
+			slog.Info("reaped stuck samples", "count", n, "max_attempts", hopper.MaxClaimAttempts)
+		}
+		if metrics != nil {
+			sampleQueueMetrics(ctx, db, metrics, traitsVersion, rescanAge, retention)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// sampleQueueMetrics records one snapshot of the live queue depths and the
+// cumulative completion count into the metrics cache, then prunes points older
+// than retention. Best-effort: a failed count must not stall maintenance.
+func sampleQueueMetrics(ctx context.Context, db *hopper.DB, metrics *metricsStore, traitsVersion string, rescanAge, retention time.Duration) {
+	qctx, cancel := context.WithTimeout(ctx, dashQueryTimeout)
+	defer cancel()
+
+	pending, err := db.CountPending(qctx)
+	if err != nil {
+		slog.Warn("queue metrics: count pending failed", "error", err)
+		return
+	}
+	var rescan int64
+	if traitsVersion != "" {
+		if n, err := db.CountRescanPending(qctx, traitsVersion, rescanAge); err == nil {
+			rescan = n
+		} else {
+			slog.Debug("queue metrics: count rescan failed", "error", err)
+		}
+	}
+	completed, err := db.CountAnalyzed(qctx)
+	if err != nil {
+		slog.Debug("queue metrics: count analyzed failed", "error", err)
+	}
+
+	if err := metrics.record(qctx, queuePoint{T: time.Now(), Pending: pending, Rescan: rescan, Completed: completed}); err != nil {
+		slog.Warn("queue metrics: record failed", "error", err)
+		return
+	}
+	if err := metrics.prune(qctx, time.Now().Add(-retention)); err != nil {
+		slog.Debug("queue metrics: prune failed", "error", err)
+	}
+}
+
 func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashboard loop with many coordinated params.
 	ctx context.Context,
 	progress *loadProgress,

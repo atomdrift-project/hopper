@@ -792,6 +792,37 @@ func (db *DB) SetSkip(ctx context.Context, sha256, skip string) error {
 	return db.setSkipSQLite(ctx, sha256, skip)
 }
 
+// MaxClaimAttempts is the number of times a pending sample may be handed to a
+// worker without producing a result before ReapStuck skips it as poison. The
+// Tier-1 claim queries also stop offering a sample once it reaches this count,
+// so a wedging sample can't keep burning worker capacity while it waits to be
+// reaped.
+const MaxClaimAttempts = 8
+
+// Unexported alias so the claim queries in pg.go / sqlite.go can reference the
+// threshold without the package qualifier.
+const maxClaimAttempts = MaxClaimAttempts
+
+// IncrementAttempts bumps the claim-attempt counter for the given samples. It
+// does not touch updated_at — a claim is not progress. Called from /api/next
+// with the batch a worker just claimed.
+func (db *DB) IncrementAttempts(ctx context.Context, shas []string) error {
+	if db.pool != nil {
+		return db.incrementAttemptsPG(ctx, shas)
+	}
+	return db.incrementAttemptsSQLite(ctx, shas)
+}
+
+// ReapStuck marks pending samples claimed MaxClaimAttempts or more times
+// without a result as skip='stuck', removing them from the pending pool.
+// Returns the number reaped.
+func (db *DB) ReapStuck(ctx context.Context) (int64, error) {
+	if db.pool != nil {
+		return db.reapStuckPG(ctx, maxClaimAttempts)
+	}
+	return db.reapStuckSQLite(ctx, maxClaimAttempts)
+}
+
 // SampleLocationKey identifies one (sha256, path) standalone file.
 type SampleLocationKey struct {
 	SHA256 string

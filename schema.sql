@@ -47,7 +47,15 @@ CREATE TABLE IF NOT EXISTS samples (
 	-- Set by cyclotron when it first commits to working on a sample (initial
 	-- status seed). Used to gate seed queries with a per-sample cooldown so
 	-- cyclotron never re-attacks the same unfixable sample in a tight loop.
-	cyclotron_attempted_at TIMESTAMPTZ
+	cyclotron_attempted_at TIMESTAMPTZ,
+	-- attempts counts how many times this sample has been handed to a worker
+	-- without producing a result. Poison samples that repeatedly wedge or
+	-- crash a worker never report an error, so this is the only signal that
+	-- catches them; the reaper skips a row once it crosses MaxClaimAttempts.
+	attempts      INTEGER NOT NULL DEFAULT 0,
+	-- skipped_at records when skip was last set, for audit and so the queue
+	-- can be reasoned about over time.
+	skipped_at    TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_samples_label ON samples(label);

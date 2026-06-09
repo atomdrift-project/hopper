@@ -166,6 +166,12 @@ func (db *DB) migratePG(ctx context.Context) error { //nolint:revive,maintidx //
 		// Traits-version rescan: find analyzed samples with stale traits.
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS traits_version TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS cyclotron_attempted_at TIMESTAMPTZ`,
+		// Poison-sample protection: count claims that never produced a result
+		// and record skip timing. The partial index keeps the reaper's
+		// "attempts >= N" scan O(pending count).
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS skipped_at TIMESTAMPTZ`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_stuck ON samples(attempts) WHERE cleave_result IS NULL AND skip = ''`,
 		// Covers FP/FN seed queries (falsePositivesPG, falseNegativesPG, light
 		// variants, seedCandidatesInPathsPG) ordered by impact. The detection
 		// filter (max_crit / suspicious_count) and cyclotron_attempted_at
@@ -2243,12 +2249,42 @@ func (db *DB) backfillArchiveMemberLitmusPG(ctx context.Context) (int64, error) 
 
 func (db *DB) setSkipPG(ctx context.Context, sha256, skip string) error {
 	_, err := db.pool.Exec(ctx, `
-		UPDATE samples SET skip = $2, updated_at = now() WHERE sha256 = $1`,
+		UPDATE samples SET skip = $2, skipped_at = now(), updated_at = now() WHERE sha256 = $1`,
 		sha256, skip)
 	if err != nil {
 		return fmt.Errorf("hopper: set skip: %w", err)
 	}
 	return nil
+}
+
+// incrementAttemptsPG bumps the claim-attempt counter for the given samples.
+// It deliberately does not touch updated_at: a claim is not progress, and
+// bumping updated_at would corrupt the oldest-pending view. Called from the
+// /api/next hot path with the batch a worker just claimed.
+func (db *DB) incrementAttemptsPG(ctx context.Context, shas []string) error {
+	if len(shas) == 0 {
+		return nil
+	}
+	_, err := db.pool.Exec(ctx,
+		`UPDATE samples SET attempts = attempts + 1 WHERE sha256 = ANY($1)`, shas)
+	if err != nil {
+		return fmt.Errorf("hopper: increment attempts: %w", err)
+	}
+	return nil
+}
+
+// reapStuckPG marks pending samples that have been claimed maxAttempts or more
+// times without ever producing a result. These are poison samples — they wedge
+// or crash a worker before it can POST a result or an error, so no other gate
+// (note / last_error_at) ever sees them. Returns the number reaped.
+func (db *DB) reapStuckPG(ctx context.Context, maxAttempts int) (int64, error) {
+	tag, err := db.pool.Exec(ctx, `
+		UPDATE samples SET skip = 'stuck', skipped_at = now(), updated_at = now()
+		WHERE cleave_result IS NULL AND skip = '' AND attempts >= $1`, maxAttempts)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: reap stuck: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 func (db *DB) startWalkStagingPG(ctx context.Context) error {
@@ -2740,6 +2776,7 @@ func (db *DB) unanalyzedCandidatesPG(ctx context.Context, hopperStart time.Time,
 			WHERE sha256 >= $2
 			  AND cleave_result IS NULL AND skip = '' AND parent = ''
 			  AND (note = '' OR last_error_at IS NULL OR last_error_at < $1)
+			  AND attempts < $4
 			ORDER BY sha256
 			LIMIT $3
 		),
@@ -2749,6 +2786,7 @@ func (db *DB) unanalyzedCandidatesPG(ctx context.Context, hopperStart time.Time,
 			WHERE sha256 < $2
 			  AND cleave_result IS NULL AND skip = '' AND parent = ''
 			  AND (note = '' OR last_error_at IS NULL OR last_error_at < $1)
+			  AND attempts < $4
 			ORDER BY sha256
 			LIMIT $3
 		)
@@ -2760,7 +2798,7 @@ func (db *DB) unanalyzedCandidatesPG(ctx context.Context, hopperStart time.Time,
 		) q
 		ORDER BY pass, sha256
 		LIMIT $3`,
-		hopperStart.UTC(), pivot, limit)
+		hopperStart.UTC(), pivot, limit, maxClaimAttempts)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: unanalyzed candidates: %w", err)
 	}

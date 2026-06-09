@@ -963,6 +963,22 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	jobs = validated
 	s.tracker.releaseMany(unclaimSHAs)
 
+	// Count this hand-out against each sample. Poison samples that wedge a
+	// worker never report a result, so the attempt counter is the only signal
+	// that catches them; the reaper skips a sample once it crosses
+	// hopper.MaxClaimAttempts. Best-effort: a failed bump must not deny work.
+	if len(jobs) > 0 {
+		claimedSHAs := make([]string, len(jobs))
+		for i := range jobs {
+			claimedSHAs[i] = jobs[i].SHA256
+		}
+		if err := s.db.IncrementAttempts(ctx, claimedSHAs); err != nil {
+			//nolint:gosec // worker sanitized by validWorkerName
+			slog.Warn("increment claim attempts failed",
+				"worker", worker, "count", len(claimedSHAs), "error", err)
+		}
+	}
+
 	// Strip the data root to return relative paths. Workers join these
 	// with their own data root to find files locally. EvalSymlinks inside
 	// stripDataRoot handles DB paths that use a symlinked prefix.

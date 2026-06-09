@@ -933,6 +933,65 @@ func TestSetSkip(t *testing.T) {
 	}
 }
 
+func TestReapStuckSamples(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// poison: handed out MaxClaimAttempts times, never analyzed → reaped.
+	mustInsert(t, ctx, db, &Sample{SHA256: "poison", Source: "test", Label: "unknown", LabelSource: "test"})
+	// fresh: handed out once, well under the threshold → left alone.
+	mustInsert(t, ctx, db, &Sample{SHA256: "fresh", Source: "test", Label: "unknown", LabelSource: "test"})
+	// done: analyzed, so it must never be reaped no matter how many attempts.
+	mustInsert(t, ctx, db, &Sample{SHA256: "done", Source: "test", Label: "unknown", LabelSource: "test"})
+	mustAnalyze(t, ctx, db, "done", 1)
+
+	for range MaxClaimAttempts {
+		if err := db.IncrementAttempts(ctx, []string{"poison", "done"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.IncrementAttempts(ctx, []string{"fresh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	pendingBefore, err := db.CountPending(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := db.ReapStuck(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("ReapStuck reaped %d, want 1 (only the poison sample)", n)
+	}
+
+	if got := skipOf(t, ctx, db, "poison"); got != "stuck" {
+		t.Errorf("poison skip = %q, want %q", got, "stuck")
+	}
+	if got := skipOf(t, ctx, db, "fresh"); got != "" {
+		t.Errorf("fresh skip = %q, want empty (under attempt threshold)", got)
+	}
+	if got := skipOf(t, ctx, db, "done"); got != "" {
+		t.Errorf("done skip = %q, want empty (analyzed rows are never poison)", got)
+	}
+
+	// Reaping a stuck sample removes it from the pending pool.
+	pendingAfter, err := db.CountPending(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pendingAfter != pendingBefore-1 {
+		t.Errorf("pending = %d after reap, want %d", pendingAfter, pendingBefore-1)
+	}
+
+	// Idempotent: a second pass finds nothing new.
+	if n, err := db.ReapStuck(ctx); err != nil || n != 0 {
+		t.Fatalf("second ReapStuck = (%d, %v), want (0, nil)", n, err)
+	}
+}
+
 func TestSetNote(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()

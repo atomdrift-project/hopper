@@ -138,6 +138,22 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 			return fmt.Errorf("hopper: migrate sqlite: %w", err)
 		}
 	}
+	// Poison-sample protection: claim-attempt counter, skip timestamp, and a
+	// partial index so the reaper's "attempts >= N" scan stays cheap.
+	if pragmaHasColumn(ctx, db.lite, "attempts") == 0 {
+		if _, err := db.lite.ExecContext(ctx, `ALTER TABLE samples ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite: %w", err)
+		}
+	}
+	if pragmaHasColumn(ctx, db.lite, "skipped_at") == 0 {
+		if _, err := db.lite.ExecContext(ctx, `ALTER TABLE samples ADD COLUMN skipped_at DATETIME`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite: %w", err)
+		}
+	}
+	if _, err := db.lite.ExecContext(ctx,
+		`CREATE INDEX IF NOT EXISTS idx_samples_stuck ON samples(attempts) WHERE cleave_result IS NULL AND skip = ''`); err != nil {
+		return fmt.Errorf("hopper: migrate sqlite: %w", err)
+	}
 
 	hasMarkerMtime := pragmaHasColumn(ctx, db.lite, "marker_mtime")
 	if hasMarkerMtime == 0 {
@@ -2132,13 +2148,49 @@ func (db *DB) backfillArchiveMemberLitmusSQLite(ctx context.Context) (int64, err
 }
 
 func (db *DB) setSkipSQLite(ctx context.Context, sha256, skip string) error {
+	ts := now()
 	_, err := db.lite.ExecContext(ctx, `
-		UPDATE samples SET skip = ?, updated_at = ? WHERE sha256 = ?`,
-		skip, now(), sha256)
+		UPDATE samples SET skip = ?, skipped_at = ?, updated_at = ? WHERE sha256 = ?`,
+		skip, ts, ts, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: set skip: %w", err)
 	}
 	return nil
+}
+
+// incrementAttemptsSQLite mirrors incrementAttemptsPG. updated_at is left
+// untouched so a claim does not register as progress.
+func (db *DB) incrementAttemptsSQLite(ctx context.Context, shas []string) error {
+	if len(shas) == 0 {
+		return nil
+	}
+	args := make([]any, len(shas))
+	for i, s := range shas {
+		args[i] = s
+	}
+	//nolint:gosec // placeholders are '?' bind markers; sha values are parameterized via args.
+	q := `UPDATE samples SET attempts = attempts + 1 WHERE sha256 IN (` +
+		strings.Repeat("?,", len(shas)-1) + `?)`
+	if _, err := db.lite.ExecContext(ctx, q, args...); err != nil {
+		return fmt.Errorf("hopper: increment attempts: %w", err)
+	}
+	return nil
+}
+
+// reapStuckSQLite mirrors reapStuckPG.
+func (db *DB) reapStuckSQLite(ctx context.Context, maxAttempts int) (int64, error) {
+	ts := now()
+	res, err := db.lite.ExecContext(ctx, `
+		UPDATE samples SET skip = 'stuck', skipped_at = ?, updated_at = ?
+		WHERE cleave_result IS NULL AND skip = '' AND attempts >= ?`, ts, ts, maxAttempts)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: reap stuck: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("hopper: reap stuck rows: %w", err)
+	}
+	return n, nil
 }
 
 func (db *DB) startWalkStagingSQLite(ctx context.Context) error {
@@ -2695,6 +2747,7 @@ func (db *DB) unanalyzedCandidatesSQLite(ctx context.Context, hopperStart time.T
 			WHERE sha256 >= ?
 			  AND cleave_result IS NULL AND skip = '' AND parent = ''
 			  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
+			  AND attempts < ?
 			ORDER BY sha256
 			LIMIT ?
 		),
@@ -2704,6 +2757,7 @@ func (db *DB) unanalyzedCandidatesSQLite(ctx context.Context, hopperStart time.T
 			WHERE sha256 < ?
 			  AND cleave_result IS NULL AND skip = '' AND parent = ''
 			  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
+			  AND attempts < ?
 			ORDER BY sha256
 			LIMIT ?
 		)
@@ -2714,7 +2768,7 @@ func (db *DB) unanalyzedCandidatesSQLite(ctx context.Context, hopperStart time.T
 			SELECT sha256, path, size_bytes, file_type, pass FROM wrapped
 		)
 		ORDER BY pass, sha256
-		LIMIT ?`, pivot, startCutoff, limit, pivot, startCutoff, limit, limit)
+		LIMIT ?`, pivot, startCutoff, maxClaimAttempts, limit, pivot, startCutoff, maxClaimAttempts, limit, limit)
 }
 
 // forcedRescanCandidatesSQLite mirrors forcedRescanCandidatesPG: Tier 0

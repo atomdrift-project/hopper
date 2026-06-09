@@ -44,10 +44,13 @@ type webDashboard struct {
 	tracker       *workerTracker
 	api           *apiServer // for live traits-version reads (refreshed every 2h)
 	rescanCache   *fido.Cache[string, int64]
+	pendingCache  *fido.Cache[string, int64]
 	healthCache   *fido.Cache[string, hopper.WorkflowHealth]
 	backlogCache  *fido.Cache[string, []hopper.WorkflowBacklog]
 	samplesCache  *fido.Cache[string, []hopper.WorkflowSample]
+	seriesCache   *fido.Cache[string, []queuePoint]
 	newestATCache *fido.Cache[string, time.Time]
+	metrics       *metricsStore
 	litmus        *litmusServer
 	traitsVersion string
 	samples       []throughputSample
@@ -149,9 +152,11 @@ func (wd *webDashboard) snapshotStages() []startupStage {
 func (wd *webDashboard) configure( //nolint:revive // argument-limit: dashboard needs all session state at once
 	progress *loadProgress, litmus *litmusServer, tracker *workerTracker, api *apiServer,
 	db *hopper.DB, start time.Time, startAnalyzed int64, maxAnalyzed, ndirs int, traitsVersion string, rescanAge time.Duration,
+	metrics *metricsStore,
 ) {
 	wd.cfgMu.Lock()
 	defer wd.cfgMu.Unlock()
+	wd.metrics = metrics
 	wd.progress = progress
 	wd.litmus = litmus
 	wd.tracker = tracker
@@ -165,6 +170,8 @@ func (wd *webDashboard) configure( //nolint:revive // argument-limit: dashboard 
 	wd.rescanAge = rescanAge
 	wd.newestATCache = fido.New[string, time.Time](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.rescanCache = fido.New[string, int64](fido.Size(1), fido.TTL(dashCacheTTL))
+	wd.pendingCache = fido.New[string, int64](fido.Size(1), fido.TTL(dashCacheTTL))
+	wd.seriesCache = fido.New[string, []queuePoint](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.healthCache = fido.New[string, hopper.WorkflowHealth](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.backlogCache = fido.New[string, []hopper.WorkflowBacklog](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.samplesCache = fido.New[string, []hopper.WorkflowSample](fido.Size(3), fido.TTL(dashCacheTTL))
@@ -227,52 +234,6 @@ func (wd *webDashboard) ratesOver(window time.Duration) (combined float64, perNo
 			if oldCount, ok := oldest.byNode[name]; ok {
 				perNode[name] = max(float64(latestCount-oldCount)/dt, 0)
 			} // else: worker joined after the oldest sample; skip.
-		}
-	}
-	return combined, perNode
-}
-
-// throughputSeries derives per-interval files/sec from the sample history.
-// Intervals wider than 30s are zeroed to avoid spikes after page inactivity.
-// Returns combined rates and per-node rates keyed by worker name.
-func (wd *webDashboard) throughputSeries() (combined []float64, perNode map[string][]float64) {
-	wd.mu.Lock()
-	n := len(wd.samples)
-	samples := make([]throughputSample, n)
-	copy(samples, wd.samples)
-	wd.mu.Unlock()
-
-	if n < 2 {
-		return nil, nil
-	}
-	combined = make([]float64, n-1)
-
-	// Collect all worker names seen across samples.
-	nameSet := make(map[string]struct{})
-	for _, s := range samples {
-		for name := range s.byNode {
-			nameSet[name] = struct{}{}
-		}
-	}
-	if len(nameSet) > 0 {
-		perNode = make(map[string][]float64, len(nameSet))
-		for name := range nameSet {
-			perNode[name] = make([]float64, n-1)
-		}
-	}
-
-	for i := 1; i < n; i++ {
-		dt := samples[i].t.Sub(samples[i-1].t).Seconds()
-		if dt <= 0 || dt > 30 {
-			continue
-		}
-		combined[i-1] = max(float64(samples[i].total-samples[i-1].total)/dt, 0)
-		for name, series := range perNode {
-			cur, okCur := samples[i].byNode[name]
-			prev, okPrev := samples[i-1].byNode[name]
-			if okCur && okPrev {
-				series[i-1] = max(float64(cur-prev)/dt, 0)
-			}
 		}
 	}
 	return combined, perNode
@@ -397,6 +358,11 @@ td.warn{color:var(--amber)}
 /* graph */
 .graph-box{background:var(--surface);border:1px solid var(--border);
   border-radius:6px;padding:.75rem 1rem 0}
+.graph-row{display:flex;gap:1rem;flex-wrap:wrap}
+.graph-row .graph-mini{flex:1 1 0;min-width:240px;padding-bottom:.5rem}
+.graph-title{font-size:.72rem;color:var(--sub);font-family:var(--mono);
+  padding-bottom:.4rem;display:flex;justify-content:space-between;gap:.5rem}
+.graph-title em{color:var(--text);font-style:normal}
 .graph-legend{display:flex;gap:1rem;padding:.5rem 0;flex-wrap:wrap}
 .legend-item{display:flex;align-items:center;gap:.35rem;
   font-size:.72rem;color:var(--sub);font-family:var(--mono)}
@@ -542,14 +508,29 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	inserted := progress.inserted.Load()
 	skipped := progress.skipped.Load()
 
-	totalInDB := progress.queued.Load()
 	insertDone := inserted + skipped + progress.tooSmall.Load() + progress.tooLarge.Load() + progress.hashErrors.Load()
 	inPipeline := max(walked-insertDone, 0)
-	totalExpected := totalInDB
-	if !progress.walkDone.Load() || inPipeline > 0 {
-		totalExpected += inPipeline
+
+	// Pending is the live database count (cleave_result IS NULL, not skipped,
+	// not a child), cached so it costs one indexed count per dashCacheTTL.
+	// Deriving it from in-memory progress counters drifts permanently: samples
+	// that leave the pool via skip / permanent failure are never subtracted, so
+	// the old estimate only ever grew (and read ~30k high). The analyzed/total
+	// denominator follows from the live count.
+	var pending int64
+	if db != nil {
+		//nolint:contextcheck,errcheck // closure creates its own context; closure logs errors before returning
+		pending, _ = wd.pendingCache.Fetch("pending", func() (int64, error) {
+			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
+			defer cancel()
+			n, err := db.CountPending(qctx)
+			if err != nil {
+				slog.Warn("dashboard: CountPending failed", "error", err)
+			}
+			return n, err
+		})
 	}
-	pending := max(totalExpected-analyzedAbs, 0)
+	totalExpected := analyzedAbs + pending
 
 	wd.recordSample(sessionAnalyzed)
 	rate, nodeRateByName := wd.ratesOver(15 * time.Minute)
@@ -659,21 +640,22 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	writeWorkflowSamples(&buf, "Prism Ready", "Top-level rows by first analysis completion", workflow.latestReady, "first_analyzed")
 	writeWorkflowSamples(&buf, "Oldest Pending Cleave", "Claimable top-level rows still missing cleave results", workflow.oldestPending, "updated")
 
-	// Throughput graph
-	combinedSeries, perNodeSeries := wd.throughputSeries()
-	if len(combinedSeries) >= 2 {
-		// Build ordered name/series slices for the graph.
-		var graphNodeNames []string
-		var graphNodeSeries [][]float64
-		for i := range workers {
-			if series, ok := perNodeSeries[workers[i].Name]; ok {
-				graphNodeNames = append(graphNodeNames, workers[i].Name)
-				graphNodeSeries = append(graphNodeSeries, series)
+	// Queue graphs: pending depth, rescan depth, and completion throughput
+	// over the trailing window, all from the database's own counts (sampled
+	// into the local metrics cache). They share one time axis but each scales
+	// to its own maximum, since the three magnitudes differ by orders.
+	if wd.metrics != nil {
+		//nolint:contextcheck,errcheck // closure creates its own context; closure logs errors before returning
+		points, _ := wd.seriesCache.Fetch("series", func() ([]queuePoint, error) {
+			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
+			defer cancel()
+			pts, err := wd.metrics.series(qctx, time.Now().Add(-queueGraphWindow))
+			if err != nil {
+				slog.Warn("dashboard: queue metric series failed", "error", err)
 			}
-		}
-		buf.WriteString(`<section><div class="label">Throughput</div>`)
-		writeThroughputGraph(&buf, combinedSeries, graphNodeSeries, graphNodeNames)
-		buf.WriteString(`</section>`)
+			return pts, err
+		})
+		writeQueueGraphs(&buf, points)
 	}
 
 	// Workers
@@ -1142,37 +1124,61 @@ func writeFooter(buf *strings.Builder, progress *loadProgress, walked, inserted,
 // Helpers shared by both dashboards.
 // ---------------------------------------------------------------------------.
 
-// shortNodeName trims the port suffix when it's the default litmus port.
-func shortNodeName(name string) string {
-	name = strings.TrimSuffix(name, ":49999")
-	// Also trim ":NNNNN" from local:NNNNN for the local node.
-	if strings.HasPrefix(name, "local:") {
-		return "local"
-	}
-	return name
-}
-
 // ---------------------------------------------------------------------------
-// Throughput graph (SVG sparkline).
+// Queue graphs (SVG sparklines, sourced from the local metrics cache).
 // ---------------------------------------------------------------------------.
 
-func writeThroughputGraph(buf *strings.Builder, combined []float64, perNode [][]float64, nodeNames []string) {
-	const w, h, px, py = 900, 72, 0, 4
+// queueGraphWindow is the trailing span the queue graphs cover.
+const queueGraphWindow = 72 * time.Hour
 
-	maxVal := 0.1
-	for _, v := range combined {
+// writeQueueGraphs renders pending depth, rescan depth, and completion
+// throughput side by side over the trailing window. All three come from the
+// database's own counts (snapshotted into the metrics cache) and share one
+// time axis, but each is scaled to its own maximum: pending (~10^5), rescan
+// (~10^6) and per-interval completions (~10^3) differ by orders of magnitude,
+// so a single shared y-axis would flatten two of the three into the baseline.
+func writeQueueGraphs(buf *strings.Builder, points []queuePoint) {
+	if len(points) < 2 {
+		return
+	}
+	pending := make([]float64, len(points))
+	rescan := make([]float64, len(points))
+	for i, p := range points {
+		pending[i] = float64(p.Pending)
+		rescan[i] = float64(p.Rescan)
+	}
+	// Completion throughput = the count the database recorded as analyzed
+	// within each sampling interval (the difference of the cumulative analyzed
+	// count). Clamp negatives so a restart gap or counter reset reads as zero
+	// rather than a downward spike.
+	completed := make([]float64, len(points)-1)
+	for i := 1; i < len(points); i++ {
+		completed[i-1] = max(float64(points[i].Completed-points[i-1].Completed), 0)
+	}
+
+	span := points[len(points)-1].T.Sub(points[0].T)
+	step := span / time.Duration(len(points)-1)
+	last := points[len(points)-1]
+
+	buf.WriteString(`<section><div class="label">Queues &amp; throughput &middot; last `)
+	buf.WriteString(htmlEscape(shortDuration(span)))
+	buf.WriteString(`</div><div class="graph-row">`)
+	writeMiniGraph(buf, "Pending", fmtN(last.Pending), pending, "#818cf8")
+	writeMiniGraph(buf, "Rescan", fmtN(last.Rescan), rescan, "#fbbf24")
+	writeMiniGraph(buf, "Completed / "+shortDuration(step), fmtN(int64(completed[len(completed)-1])), completed, "#34d399")
+	buf.WriteString(`</div></section>`)
+}
+
+// writeMiniGraph renders one labelled area+line sparkline scaled to its own
+// max. cur is the preformatted current value shown beside the title.
+func writeMiniGraph(buf *strings.Builder, title, cur string, vals []float64, color string) {
+	const w, h, px, py = 300, 80, 0, 6
+	maxVal := 1.0
+	for _, v := range vals {
 		if v > maxVal {
 			maxVal = v
 		}
 	}
-	for _, series := range perNode {
-		for _, v := range series {
-			if v > maxVal {
-				maxVal = v
-			}
-		}
-	}
-
 	xOf := func(i, n int) float64 {
 		if n <= 1 {
 			return float64(px)
@@ -1182,72 +1188,27 @@ func writeThroughputGraph(buf *strings.Builder, combined []float64, perNode [][]
 	yOf := func(v float64) float64 {
 		return float64(h-py) - (v/maxVal)*float64(h-2*py)
 	}
-
-	line := func(vals []float64) string {
-		var sb strings.Builder
-		for i, v := range vals {
-			if i > 0 {
-				sb.WriteByte(' ')
-			}
-			fmt.Fprintf(&sb, "%.1f,%.1f", xOf(i, len(vals)), yOf(v))
+	var lineSB, areaSB strings.Builder
+	fmt.Fprintf(&areaSB, "%.1f,%.1f", xOf(0, len(vals)), float64(h-py))
+	for i, v := range vals {
+		if i > 0 {
+			lineSB.WriteByte(' ')
 		}
-		return sb.String()
+		fmt.Fprintf(&lineSB, "%.1f,%.1f", xOf(i, len(vals)), yOf(v))
+		fmt.Fprintf(&areaSB, " %.1f,%.1f", xOf(i, len(vals)), yOf(v))
 	}
+	fmt.Fprintf(&areaSB, " %.1f,%.1f", xOf(len(vals)-1, len(vals)), float64(h-py))
 
-	areaPoints := func(vals []float64) string {
-		if len(vals) == 0 {
-			return ""
-		}
-		var sb strings.Builder
-		fmt.Fprintf(&sb, "%.1f,%.1f", xOf(0, len(vals)), float64(h-py))
-		for i, v := range vals {
-			fmt.Fprintf(&sb, " %.1f,%.1f", xOf(i, len(vals)), yOf(v))
-		}
-		fmt.Fprintf(&sb, " %.1f,%.1f", xOf(len(vals)-1, len(vals)), float64(h-py))
-		return sb.String()
-	}
-
-	nodeColors := []string{"#34d399", "#fbbf24", "#f87171", "#22d3ee", "#a78bfa", "#fb923c"}
-
-	buf.WriteString(`<div class="graph-box">`)
-	fmt.Fprintf(buf, `<svg width="%d" height="%d" viewBox="0 0 %d %d" style="display:block;width:100%%;overflow:visible">`,
-		w, h, w, h)
-
-	for _, frac := range []float64{0.5, 1.0} {
-		y := yOf(maxVal * frac)
-		fmt.Fprintf(buf, `<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#1a1f2e" stroke-width="1"/>`,
-			px, y, w-px, y)
-		fmt.Fprintf(buf, `<text x="%d" y="%.1f" fill="#2d3448" font-size="9" font-family="monospace" dy="-3">%.0f</text>`,
-			px, y, maxVal*frac)
-	}
-
-	if pts := areaPoints(combined); pts != "" {
-		fmt.Fprintf(buf, `<polygon points="%s" fill="#818cf8" fill-opacity="0.07"/>`, pts)
-	}
-
-	for i, series := range perNode {
-		if pts := line(series); pts != "" {
-			color := nodeColors[i%len(nodeColors)]
-			fmt.Fprintf(buf,
-				`<polyline points="%s" fill="none" stroke="%s" stroke-width="1" stroke-linejoin="round" stroke-opacity="0.7"/>`,
-				pts, color)
-		}
-	}
-
-	if pts := line(combined); pts != "" {
-		fmt.Fprintf(buf, `<polyline points="%s" fill="none" stroke="#818cf8" stroke-width="2" stroke-linejoin="round"/>`, pts)
-	}
-
-	buf.WriteString(`</svg>`)
-
-	buf.WriteString(`<div class="graph-legend">`)
-	fmt.Fprint(buf, `<span class="legend-item"><span class="legend-swatch" style="background:#818cf8;height:2px"></span>combined</span>`)
-	for i, name := range nodeNames {
-		color := nodeColors[i%len(nodeColors)]
-		fmt.Fprintf(buf, `<span class="legend-item"><span class="legend-swatch" style="background:%s"></span>%s</span>`,
-			color, htmlEscape(shortNodeName(name)))
-	}
-	buf.WriteString(`</div></div>`)
+	buf.WriteString(`<div class="graph-box graph-mini">`)
+	fmt.Fprintf(buf, `<div class="graph-title">%s <em>%s</em></div>`, htmlEscape(title), htmlEscape(cur))
+	fmt.Fprintf(buf, `<svg viewBox="0 0 %d %d" preserveAspectRatio="none" style="display:block;width:100%%;height:80px;overflow:visible">`, w, h)
+	y := yOf(maxVal)
+	fmt.Fprintf(buf, `<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#1a1f2e" stroke-width="1"/>`, px, y, w-px, y)
+	fmt.Fprintf(buf, `<text x="%d" y="%.1f" fill="#2d3448" font-size="9" font-family="monospace" dy="10">%s</text>`,
+		px, y, htmlEscape(fmtN(int64(maxVal))))
+	fmt.Fprintf(buf, `<polygon points="%s" fill="%s" fill-opacity="0.10"/>`, areaSB.String(), color)
+	fmt.Fprintf(buf, `<polyline points="%s" fill="none" stroke="%s" stroke-width="2" stroke-linejoin="round"/>`, lineSB.String(), color)
+	buf.WriteString(`</svg></div>`)
 }
 
 // ---------------------------------------------------------------------------
