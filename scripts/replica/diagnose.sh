@@ -3,7 +3,8 @@
 # replication pair so a stuck sync is obvious at a glance. Read-only.
 #
 # Overridable via env: REMOTE_HOST, REMOTE_USER, REMOTE_DB, LOCAL_DB,
-# SUBSCRIPTION. Remote queries read ~/.pgpass for credentials.
+# SUBSCRIPTION (auto-detected from pg_subscription when unset).
+# Remote queries read ~/.pgpass for credentials.
 
 set -u
 
@@ -11,7 +12,7 @@ REMOTE_HOST="${REMOTE_HOST:-hopper-db}"
 REMOTE_USER="${REMOTE_USER:-hopper}"
 REMOTE_DB="${REMOTE_DB:-hopper}"
 LOCAL_DB="${LOCAL_DB:-hopper}"
-SUBSCRIPTION="${SUBSCRIPTION:-hopper_replica}"
+SUBSCRIPTION="${SUBSCRIPTION:-}"
 
 section() { printf '\n=== %s ===\n' "$*"; }
 
@@ -30,6 +31,25 @@ else
     echo "error: no admin access to local postgres" >&2
     exit 1
 fi
+
+# Auto-detect the subscription name rather than guessing: a wrong name makes
+# every filtered section come back empty, which reads as "not set up at all".
+if [ -z "$SUBSCRIPTION" ]; then
+    subs=$(admin -d "$LOCAL_DB" -tA <<'SQL'
+SELECT subname FROM pg_subscription
+ WHERE subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+ ORDER BY subname;
+SQL
+)
+    SUBSCRIPTION=$(printf '%s\n' "$subs" | head -n 1)
+    if [ -z "$SUBSCRIPTION" ]; then
+        echo "error: no subscription found in database '$LOCAL_DB'; is the replica set up?" >&2
+        exit 1
+    fi
+    n=$(printf '%s\n' "$subs" | grep -c .)
+    [ "$n" -gt 1 ] && echo "note: $n subscriptions found; using '$SUBSCRIPTION' (override with SUBSCRIPTION=...)"
+fi
+echo "subscription: $SUBSCRIPTION"
 
 # ---------------------------------------------------------------------------
 # LOCAL SIDE
@@ -120,13 +140,15 @@ done
 
 remote() { psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" "$@"; }
 
-section "remote: replication slot for this subscription"
+section "remote: replication slots (subscription + tablesync)"
+# Tablesync workers use their own transient slots named pg_<suboid>_sync_<...>.
 remote -v sub="$SUBSCRIPTION" <<'SQL'
 SELECT slot_name, active, active_pid,
        restart_lsn, confirmed_flush_lsn,
        pg_size_pretty(pg_current_wal_lsn() - restart_lsn) AS retained_wal
   FROM pg_replication_slots
- WHERE slot_name = :'sub';
+ WHERE slot_name = :'sub' OR slot_name LIKE 'pg\_%\_sync\_%'
+ ORDER BY slot_name;
 SQL
 
 section "remote: pg_stat_replication (this subscriber's peer)"
