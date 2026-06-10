@@ -76,8 +76,12 @@ if [ "$need_restart" -eq 1 ]; then
 fi
 
 log "Installing replica dependencies"
+# postgresql${PGVER}-contrib provides pg_trgm; without it hopper init logs
+# "extension pg_trgm is not available" and silently skips the trigram index
+# the publisher has, leaving the replica's schema subtly behind.
 doas bastille pkg "$RUN" install -y \
-    git go gmake sqlite3 postgresql${PGVER}-server postgresql${PGVER}-client
+    git go gmake sqlite3 \
+    postgresql${PGVER}-server postgresql${PGVER}-client postgresql${PGVER}-contrib
 
 log "Selecting PostgreSQL ${PGVER} data directory"
 doas bastille sysrc "$RUN" postgresql_enable=YES >/dev/null

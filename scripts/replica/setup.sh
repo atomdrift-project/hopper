@@ -93,6 +93,32 @@ REMOTE_PW=$(awk -F: -v h="$REMOTE_HOST" -v u="$REMOTE_USER" -v d="$REMOTE_DB" '
 ' "$PGPASS")
 [ -n "$REMOTE_PW" ] || die "no matching $REMOTE_HOST:*:$REMOTE_DB:$REMOTE_USER entry in $PGPASS"
 
+# --- Publisher reachability preflight --------------------------------------
+# Fail fast if the publisher is unreachable, instead of doing all the local
+# schema work (role/db/hopper init) and only discovering the dead upstream at
+# the publication step. DNS misses are common in fresh jails: a jail's
+# /etc/hosts does not inherit the host's 'hopper-db' entry.
+log "Checking publisher $REMOTE_HOST is reachable"
+if probe=$(pg_isready -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" 2>&1); then
+    : # rc 0: accepting connections
+else
+    rc=$?
+    # pg_isready rc: 1 = reachable but rejecting (fine — auth/HBA is checked
+    # later); 2 = no response; 3 = bad params. Only hard-fail when unreachable.
+    if [ "$rc" -ge 2 ]; then
+        case "$probe" in
+            *"could not translate host name"*|*"not resolve"*|*"nodename nor servname"*|*"No address associated"*)
+                die "publisher '$REMOTE_HOST' does not resolve from here ($probe).
+       A Bastille jail does not inherit the host's /etc/hosts — add the mapping
+       inside the jail, or re-run with REMOTE_HOST set to the publisher's IP:
+         doas bastille cmd <jail> sh -c 'echo \"<ip>  $REMOTE_HOST\" >> /etc/hosts'" ;;
+            *)
+                die "publisher '$REMOTE_HOST' is not accepting connections ($probe).
+       Confirm postgres is running there and pg_hba.conf admits this host." ;;
+        esac
+    fi
+fi
+
 # --- Logical replication must be enabled on the local cluster -------------
 wal_level=$(admin -tAc 'SHOW wal_level' | tr -d '[:space:]')
 if [ "$wal_level" != "logical" ]; then
@@ -408,4 +434,7 @@ printf '%s\n' "$tables" | while IFS='|' read -r qualified state; do
 done
 
 log "Done. Re-run anytime — this script is idempotent."
-log "Live monitor: watch -n2 \"psql -h localhost -U $LOCAL_USER -d $LOCAL_DB -c 'SELECT * FROM pg_stat_subscription'\""
+# psql's built-in \watch works on FreeBSD and Linux alike; GNU watch(1) does
+# not exist on FreeBSD (watch(8) there is an unrelated tty-snooping tool).
+log "Live monitor: psql -h localhost -U $LOCAL_USER -d $LOCAL_DB -c 'SELECT * FROM pg_stat_subscription \watch 2'"
+log "Full status:  make diagnose-replica REMOTE_HOST=$REMOTE_HOST SUBSCRIPTION=$SUBSCRIPTION"
