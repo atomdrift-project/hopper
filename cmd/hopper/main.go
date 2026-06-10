@@ -2833,6 +2833,7 @@ func logBackfillPending(p hopper.BackfillPending) {
 	slog.Info("backfill pending rows",
 		"total", p.TotalRows(),
 		"cleave_columns", p.CleaveColumns,
+		"file_type_empties", p.FileTypeEmpties,
 		"archive_member_litmus_candidates", p.ArchiveMemberLitmus,
 		"archive_member_analyzed_at", p.ArchiveMemberAnalyzed,
 		"stale_good_markers", p.StaleGoodMarkers,

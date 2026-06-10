@@ -324,18 +324,31 @@ func pgRuntimeMigrations() []string { //nolint:revive // long sequential migrati
 			),
 			true)`,
 
-		// Derived columns: convert from plain columns (written by Go) to
-		// GENERATED … STORED (computed by PG from the JSONB source). This
-		// makes drift structurally impossible — a writer can't forget to
-		// set them because they're no longer settable. Existing rows get
-		// recomputed as part of the ADD COLUMN, which also fixes the ~20K
-		// archive members that had litmus_score=0 despite non-zero JSON prob.
+		// Derived analysis columns.
 		//
-		// Guard: attgenerated='s' means "stored generated". If the column is
-		// already in that state (second-run of the migration), do nothing.
+		// litmus_score stays a GENERATED STORED column: its source key (prob)
+		// did not move in v7, so its expression never drifted and it can be
+		// recomputed cheaply by the one-time ADD COLUMN below.
+		//
+		// file_type / score / formula were ALSO generated, but their
+		// expression was pinned to the pre-v7 'fs' envelope key. v7 renamed
+		// that key to 'files', so every record stored in the new format
+		// generated '' / 0. The expression can't be corrected in place
+		// without an ACCESS EXCLUSIVE rewrite of samples (~350GB) — generated
+		// STORED columns recompute every row on ALTER. So instead we convert
+		// them to plain columns (ALTER COLUMN … DROP EXPRESSION is
+		// metadata-only: no rewrite, existing values retained) and derive
+		// them with a BEFORE INSERT/UPDATE trigger that reads both the v7
+		// 'files' key and the legacy 'fs' key (see samples_derive_cleave_cols
+		// below). Derivation stays DB-side and drift-proof — mirroring the
+		// SQLite backend's generated columns — without the rewrite. Existing
+		// 'files'-format rows (file_type = '') are healed by the bounded
+		// empties backfill in backfillPG.
+		//
+		// Guard: attgenerated='s' means "stored generated". Each branch is a
+		// no-op once the column is already in its target state.
 		`DO $$
 		BEGIN
-			-- litmus_score: read prob from the JSONB envelope
 			IF NOT EXISTS (
 				SELECT 1 FROM pg_attribute
 				 WHERE attrelid = 'samples'::regclass AND attname = 'litmus_score'
@@ -348,51 +361,72 @@ func pgRuntimeMigrations() []string { //nolint:revive // long sequential migrati
 					STORED;
 			END IF;
 
-			-- file_type: cleave's classification for the top-level file
-			IF NOT EXISTS (
+			IF EXISTS (
 				SELECT 1 FROM pg_attribute
 				 WHERE attrelid = 'samples'::regclass AND attname = 'file_type'
 				   AND attgenerated = 's'
 			) THEN
-				ALTER TABLE samples DROP COLUMN IF EXISTS file_type;
-				ALTER TABLE samples ADD COLUMN file_type TEXT NOT NULL
-					GENERATED ALWAYS AS
-						(COALESCE(cleave_result->'files'->0->>'type', cleave_result->'fs'->0->>'type', ''))
-					STORED;
+				ALTER TABLE samples ALTER COLUMN file_type DROP EXPRESSION;
+				ALTER TABLE samples ALTER COLUMN file_type SET DEFAULT '';
 			END IF;
 
-			-- score: cleave's cumulative severity (files[0].risk)
-			IF NOT EXISTS (
+			IF EXISTS (
 				SELECT 1 FROM pg_attribute
 				 WHERE attrelid = 'samples'::regclass AND attname = 'score'
 				   AND attgenerated = 's'
 			) THEN
-				ALTER TABLE samples DROP COLUMN IF EXISTS score;
-				ALTER TABLE samples ADD COLUMN score INTEGER NOT NULL
-					GENERATED ALWAYS AS
-						(COALESCE((cleave_result->'files'->0->>'risk')::int, (cleave_result->'fs'->0->>'x')::int, 0))
-					STORED;
+				ALTER TABLE samples ALTER COLUMN score DROP EXPRESSION;
+				ALTER TABLE samples ALTER COLUMN score SET DEFAULT 0;
 			END IF;
 
-			-- formula: cleave's behavioral signature (files[0].mol)
-			IF NOT EXISTS (
+			IF EXISTS (
 				SELECT 1 FROM pg_attribute
 				 WHERE attrelid = 'samples'::regclass AND attname = 'formula'
 				   AND attgenerated = 's'
 			) THEN
-				ALTER TABLE samples DROP COLUMN IF EXISTS formula;
-				ALTER TABLE samples ADD COLUMN formula TEXT NOT NULL
-					GENERATED ALWAYS AS
-						(COALESCE(cleave_result->'files'->0->>'mol', cleave_result->'fs'->0->>'f', ''))
-					STORED;
+				ALTER TABLE samples ALTER COLUMN formula DROP EXPRESSION;
+				ALTER TABLE samples ALTER COLUMN formula SET DEFAULT '';
 			END IF;
 		END$$`,
 
-		// Re-create the indexes that DROP COLUMN cascaded away. Each IF NOT
-		// EXISTS so this is a no-op on re-runs after the first conversion.
+		// Trigger that derives file_type / score / formula from the cleave
+		// result on every write, reading the v7 'files' key first and falling
+		// back to the legacy 'fs' key for cached rows. BEFORE INSERT covers
+		// the bulk COPY path used for archive members; UPDATE OF cleave_result
+		// covers analysis stores without firing on unrelated column updates.
+		`CREATE OR REPLACE FUNCTION samples_derive_cleave_cols() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			NEW.file_type := COALESCE(NEW.cleave_result->'files'->0->>'type',
+									   NEW.cleave_result->'fs'->0->>'type', '');
+			NEW.score := COALESCE((NEW.cleave_result->'files'->0->>'risk')::int,
+								   (NEW.cleave_result->'fs'->0->>'x')::int, 0);
+			NEW.formula := COALESCE(NEW.cleave_result->'files'->0->>'mol',
+									NEW.cleave_result->'fs'->0->>'f', '');
+			RETURN NEW;
+		END;
+		$$`,
+		`CREATE OR REPLACE TRIGGER samples_derive_cleave_cols_trg
+			BEFORE INSERT OR UPDATE OF cleave_result ON samples
+			FOR EACH ROW EXECUTE FUNCTION samples_derive_cleave_cols()`,
+
+		// Indexes on the derived columns (no-op after first creation). These
+		// are not cascaded away by DROP EXPRESSION (the columns persist), but
+		// the IF NOT EXISTS keeps them correct on a fresh database too.
 		`CREATE INDEX IF NOT EXISTS idx_samples_file_type ON samples(file_type)`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_formula   ON samples(formula)   WHERE formula   != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_score     ON samples(score)     WHERE score     != 0`,
+
+		// Drives the one-time Pass 1b heal in backfillPG: rows stored under the
+		// v7 'files' key while file_type/score/formula were generated from the
+		// legacy 'fs' key, so file_type is '' even though the JSON carries a
+		// type. Self-draining — a row leaves the index the moment the backfill
+		// (or the derive trigger) sets a non-empty file_type. The predicate
+		// must stay in sync with pgFileTypeBackfillWhere. Built CONCURRENTLY by
+		// the migration runner, so it never blocks writes.
+		`CREATE INDEX IF NOT EXISTS idx_samples_filetype_pending ON samples(sha256) ` +
+			`WHERE cleave_result IS NOT NULL AND file_type = '' ` +
+			`AND COALESCE(cleave_result->'files'->0->>'type', cleave_result->'fs'->0->>'type', '') <> ''`,
 
 		// Claim state moved to memory (see workerTracker in cmd/hopper/api.go).
 		// idx_samples_claimed exists only to serve OldestClaims, which is gone;
@@ -941,10 +975,10 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
 	// cleave_result and litmus_result are the only analysis fields the
-	// writer sets — file_type, score, formula, and litmus_score are
-	// GENERATED STORED columns derived from the JSONB, so writing to them
-	// is neither required nor legal. ON CONFLICT leaves existing analysis
-	// alone so a walker-comes-after-Explode case doesn't wipe real results.
+	// writer sets — file_type, score, formula are derived DB-side by the
+	// samples_derive_cleave_cols trigger and litmus_score is GENERATED, so
+	// the writer never sets them. ON CONFLICT leaves existing analysis alone
+	// so a walker-comes-after-Explode case doesn't wipe real results.
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename,
 			size_bytes, label, label_source, path, status,
@@ -1013,9 +1047,10 @@ const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 	url TEXT, domain TEXT, package TEXT, version TEXT
 ) ON COMMIT DROP`
 
-// file_type, score, formula, and litmus_score are GENERATED columns on
-// samples, auto-computed from cleave_result / litmus_result. We don't
-// reference them here — writing to a generated column is an error.
+// file_type, score, formula are derived DB-side by the
+// samples_derive_cleave_cols trigger and litmus_score is GENERATED, all from
+// cleave_result / litmus_result. We don't reference them here — the trigger
+// and generation expression own them.
 // ON CONFLICT leaves existing analysis alone: a walker row arriving
 // after Explode must not wipe results we already stored.
 // sampleConflictUpdatePG is the shared ON CONFLICT clause for top-level
@@ -1372,10 +1407,10 @@ func (db *DB) updateCleaveResultPG(
 	ctx context.Context, sha256 string, result []byte, canonical string,
 	fi cleaveFileInfo, traitsVersion string,
 ) error {
-	// file_type, score, formula, litmus_score are GENERATED from
-	// cleave_result / litmus_result — they can't be SET directly. Setting
-	// litmus_result = NULL implicitly resets litmus_score to 0 (via the
-	// COALESCE in its generation expression).
+	// file_type, score, formula are re-derived from the new cleave_result by
+	// the samples_derive_cleave_cols trigger (UPDATE OF cleave_result fires
+	// it); litmus_score is GENERATED, so setting litmus_result = NULL resets
+	// it to 0 via the COALESCE in its generation expression. None are SET here.
 	// forced_rescan_at clears here so the row drops out of the Tier 0
 	// queue once a worker has actually produced fresh analysis; without
 	// this the partial index would carry stale entries.
@@ -1724,8 +1759,9 @@ func (db *DB) relativizePathsPG(ctx context.Context, prefix string) (int64, erro
 }
 
 func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result []byte, canonical string, fi cleaveFileInfo) error {
-	// file_type, score, formula, litmus_score are GENERATED; setting
-	// litmus_result = NULL implicitly resets litmus_score to 0.
+	// file_type, score, formula are re-derived by the
+	// samples_derive_cleave_cols trigger (UPDATE OF cleave_result fires it);
+	// litmus_score is GENERATED, so setting litmus_result = NULL resets it to 0.
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET status = $2, cleave_result = $3,
 			canonical_sha256 = $4, elements = $5,
@@ -1998,11 +2034,20 @@ const pgCleaveBackfillWhere = `cleave_result IS NOT NULL
 	AND elements = ''
 	AND COALESCE(cleave_result->'files'->0->>'mol', cleave_result->'fs'->0->>'f', '') > ''`
 
+// pgFileTypeBackfillWhere selects rows whose file_type/score/formula were left
+// empty by the pre-v7 fs-only generated expression: file_type is blank yet the
+// JSON carries a type to derive. Must stay in sync with
+// idx_samples_filetype_pending so the gate stays index-backed and self-draining.
+const pgFileTypeBackfillWhere = `cleave_result IS NOT NULL
+	AND file_type = ''
+	AND COALESCE(cleave_result->'files'->0->>'type', cleave_result->'fs'->0->>'type', '') <> ''`
+
 func (db *DB) backfillPendingPG(ctx context.Context) (BackfillPending, error) {
 	var pending BackfillPending
 	if err := db.pool.QueryRow(ctx, `
 		SELECT
 			(SELECT count(*) FROM samples WHERE `+pgCleaveBackfillWhere+`),
+			(SELECT count(*) FROM samples WHERE `+pgFileTypeBackfillWhere+`),
 			(SELECT count(*)
 			 FROM samples c
 			 JOIN samples p ON p.sha256 = c.parent
@@ -2032,6 +2077,7 @@ func (db *DB) backfillPendingPG(ctx context.Context) (BackfillPending, error) {
 				AND (max_crit >= 5 OR suspicious_count >= 2))`,
 	).Scan(
 		&pending.CleaveColumns,
+		&pending.FileTypeEmpties,
 		&pending.ArchiveMemberLitmus,
 		&pending.ArchiveMemberAnalyzed,
 		&pending.StaleGoodMarkers,
@@ -2042,14 +2088,16 @@ func (db *DB) backfillPendingPG(ctx context.Context) (BackfillPending, error) {
 	return pending, nil
 }
 
-// backfillPG fixes legacy rows whose non-generated derivable columns
-// (elements, max_crit, suspicious_count) are stale, then clears misclassified
-// skip markers that no longer disagree with the new trait-based heuristic.
+// backfillPG fixes legacy rows whose derivable columns (elements, max_crit,
+// suspicious_count in Pass 1; file_type, score, formula in Pass 1b) are stale,
+// then clears misclassified skip markers that no longer disagree with the new
+// trait-based heuristic.
 //
-// Note: file_type / score / formula / litmus_score are GENERATED from the
-// JSONB source, so their values can't drift and don't need a backfill pass.
-// Before the generated-column migration this function also recomputed those
-// columns; that work is now a schema invariant.
+// file_type / score / formula are derived DB-side by the
+// samples_derive_cleave_cols trigger going forward, but rows written while
+// those columns were generated from the pre-v7 'fs' key need a one-time heal
+// (Pass 1b). litmus_score remains GENERATED from litmus_result->>'prob', whose
+// key did not move in v7, so it can't drift and needs no backfill.
 func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 	var stats BackfillStats
 
@@ -2069,16 +2117,14 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 	db.reportBackfill(0, stats.Scanned)
 
 	// Pass 1: elements / max_crit / suspicious_count from cleave_result,
-	// in batches. formula / score / file_type / litmus_score are generated
-	// columns — don't touch them.
+	// in batches. file_type / score / formula are handled by Pass 1b below;
+	// litmus_score is generated and never drifts.
 	//
-	// Implementation note: earlier versions used UPDATE samples s ... FROM
-	// (SELECT ... FROM samples s2 JOIN batch ...) with JSON_TABLE. PG rejects
-	// that shape with "column file_type can only be updated to DEFAULT"
-	// (SQLSTATE 428C9) when samples has STORED GENERATED columns — the
-	// self-reference via FROM trips the generated-column check even though
-	// file_type is not in the SET list. Inlining the JSON extraction on the
-	// target row sidesteps that.
+	// Implementation note: this inlines the JSON extraction on the target row
+	// rather than using UPDATE samples s ... FROM (SELECT ... JOIN batch). PG
+	// rejects that self-referential shape with "column … can only be updated
+	// to DEFAULT" (SQLSTATE 428C9) while samples still has any STORED GENERATED
+	// column (litmus_score), even when no generated column is in the SET list.
 	const backfillBatch = 50000
 	for {
 		cleaveTag, err := db.pool.Exec(ctx, `
@@ -2116,6 +2162,37 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 			break
 		}
 		slog.Info("backfill cleave batch", "batch", n, "total", stats.Updated)
+	}
+
+	// Pass 1b: heal file_type / score / formula for rows stored under the v7
+	// 'files' key while those columns were still generated from the legacy
+	// 'fs' key (every such row has file_type=''). The derive trigger fixes
+	// writes from here on; this drains the rows written before it, using the
+	// same dual-key expressions the trigger uses. The pgFileTypeBackfillWhere
+	// gate is served by idx_samples_filetype_pending and self-drains: a row
+	// leaves it the moment file_type becomes non-empty. Does not bump
+	// updated_at — healing a derived column is not a real change and must not
+	// reshuffle queues ordered by updated_at.
+	for {
+		ftTag, err := db.pool.Exec(ctx, `
+			UPDATE samples SET
+				file_type = COALESCE(cleave_result->'files'->0->>'type', cleave_result->'fs'->0->>'type', ''),
+				score = COALESCE((cleave_result->'files'->0->>'risk')::int, (cleave_result->'fs'->0->>'x')::int, 0),
+				formula = COALESCE(cleave_result->'files'->0->>'mol', cleave_result->'fs'->0->>'f', '')
+			WHERE sha256 IN (
+				SELECT sha256 FROM samples WHERE `+pgFileTypeBackfillWhere+`
+				LIMIT $1
+			)`, backfillBatch)
+		if err != nil {
+			return stats, fmt.Errorf("hopper: backfill file_type: %w", err)
+		}
+		n := ftTag.RowsAffected()
+		stats.Updated += n
+		db.reportBackfill(stats.Updated, stats.Scanned)
+		if n < backfillBatch {
+			break
+		}
+		slog.Info("backfill file_type batch", "batch", n, "total", stats.Updated)
 	}
 
 	n, err := db.backfillArchiveMemberLitmusPG(ctx)

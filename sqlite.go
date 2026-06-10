@@ -1915,6 +1915,9 @@ func (db *DB) backfillPendingSQLite(ctx context.Context) (BackfillPending, error
 				AND cleave_result IS NOT NULL
 				AND (max_crit >= 5 OR suspicious_count >= 2))`,
 	).Scan(
+		// No FileTypeEmpties count: SQLite derives file_type/score/formula with
+		// dual-key GENERATED columns (schema_sqlite.sql), so they never went
+		// stale the way the Postgres expression did. It stays 0.
 		&pending.CleaveColumns,
 		&pending.ArchiveMemberLitmus,
 		&pending.ArchiveMemberAnalyzed,

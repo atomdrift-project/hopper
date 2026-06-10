@@ -2222,6 +2222,7 @@ type BackfillStats struct {
 // BackfillPending reports how much work each Backfill pass currently has.
 type BackfillPending struct {
 	CleaveColumns         int64 // elements / max_crit / suspicious_count from cleave_result
+	FileTypeEmpties       int64 // file_type/score/formula left '' by the pre-v7 'fs'-only expression
 	ArchiveMemberLitmus   int64 // archive members that still carry the parent's litmus_result blob
 	ArchiveMemberAnalyzed int64 // archive members missing analyzed_at while their parent has it
 	StaleGoodMarkers      int64 // good marker misclassification skips that can be cleared
@@ -2230,7 +2231,7 @@ type BackfillPending struct {
 
 // TotalRows is the sum of all pending backfill rows across passes.
 func (p BackfillPending) TotalRows() int64 {
-	return p.CleaveColumns + p.ArchiveMemberLitmus + p.ArchiveMemberAnalyzed + p.StaleGoodMarkers + p.StaleBadMarkers
+	return p.CleaveColumns + p.FileTypeEmpties + p.ArchiveMemberLitmus + p.ArchiveMemberAnalyzed + p.StaleGoodMarkers + p.StaleBadMarkers
 }
 
 const (
