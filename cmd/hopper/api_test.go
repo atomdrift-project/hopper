@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -91,6 +92,83 @@ func TestWorkerTrackerClaimLimitPrunesExpiredClaims(t *testing.T) {
 	if got := wt.activeClaims("w1"); got != 0 {
 		t.Fatalf("active claims after prune = %d, want 0", got)
 	}
+}
+
+func TestSizeClassBucketsByBounds(t *testing.T) {
+	for _, tc := range []struct {
+		bytes int64
+		want  int
+	}{
+		{0, 0},
+		{1<<20 - 1, 0},
+		{1 << 20, 1},  // exactly 1 MiB → medium
+		{32 << 20, 2}, // exactly 32 MiB → large
+		{1 << 40, 2},
+	} {
+		if got := sizeClass(tc.bytes); got != tc.want {
+			t.Errorf("sizeClass(%d) = %d, want %d", tc.bytes, got, tc.want)
+		}
+	}
+}
+
+func TestInterleaveBySizeClassSpreadsClassesEvenly(t *testing.T) {
+	job := func(sha string, size int64) hopper.ClaimJob {
+		return hopper.ClaimJob{SHA256: sha, Path: sha + ".bin", SizeBytes: size}
+	}
+	const big = 100 << 20
+
+	// 4 smalls + 1 large: the large lands mid-stream (position 1/2 falls
+	// between the smalls at 1/8, 3/8 and 5/8, 7/8), not at either end.
+	got := interleaveBySizeClass([]hopper.ClaimJob{
+		job("s1", 10), job("s2", 20), job("s3", 30), job("s4", 40), job("big", big),
+	})
+	want := []string{"s1", "s2", "big", "s3", "s4"}
+	for i, w := range want {
+		if got[i].SHA256 != w {
+			t.Fatalf("position %d = %q, want %q (full: %v)", i, got[i].SHA256, w, shas(got))
+		}
+	}
+
+	// An all-big run followed by all smalls must come back alternating-ish:
+	// no batch prefix should be a solid block of one class.
+	var cands []hopper.ClaimJob
+	for i := range 4 {
+		cands = append(cands, job("b"+strconv.Itoa(i), big))
+	}
+	for i := range 4 {
+		cands = append(cands, job("t"+strconv.Itoa(i), 100))
+	}
+	mixed := interleaveBySizeClass(cands)
+	for i := 0; i+1 < len(mixed); i += 2 {
+		a, b := sizeClass(mixed[i].SizeBytes), sizeClass(mixed[i+1].SizeBytes)
+		if a == b {
+			t.Fatalf("positions %d,%d are both class %d (full: %v)", i, i+1, a, shas(mixed))
+		}
+	}
+
+	// Stability: jobs within a class keep their input (tier) order.
+	for i := 1; i < len(mixed); i++ {
+		for j := range i {
+			if sizeClass(mixed[j].SizeBytes) == sizeClass(mixed[i].SizeBytes) &&
+				mixed[j].SHA256 > mixed[i].SHA256 {
+				t.Fatalf("class-internal order not preserved: %q before %q", mixed[j].SHA256, mixed[i].SHA256)
+			}
+		}
+	}
+
+	// Short lists pass through untouched.
+	two := []hopper.ClaimJob{job("x", big), job("y", 1)}
+	if got := interleaveBySizeClass(two); got[0].SHA256 != "x" || got[1].SHA256 != "y" {
+		t.Fatalf("short list reordered: %v", shas(got))
+	}
+}
+
+func shas(jobs []hopper.ClaimJob) []string {
+	out := make([]string, len(jobs))
+	for i := range jobs {
+		out[i] = jobs[i].SHA256
+	}
+	return out
 }
 
 func TestWorkerTrackerOldestPerWorkerPrunesStale(t *testing.T) {

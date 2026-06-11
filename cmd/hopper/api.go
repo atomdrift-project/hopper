@@ -719,6 +719,69 @@ func filterCandidatesByWorkerTools(cands []hopper.ClaimJob, tools *workerToolSet
 	return out
 }
 
+// sizeClass buckets a job by on-disk size for handout interleaving:
+// 0 = small (<1 MiB), 1 = medium (<32 MiB), 2 = large. Matches the litmus
+// worker-benchmark classes so measurements line up across both repos.
+func sizeClass(sizeBytes int64) int {
+	switch {
+	case sizeBytes < 1<<20:
+		return 0
+	case sizeBytes < 32<<20:
+		return 1
+	default:
+		return 2
+	}
+}
+
+// interleaveBySizeClass spreads each size class evenly across the candidate
+// list: the k-th of n jobs in a class lands at fractional position (2k+1)/2n
+// of the stream, so every claimed batch carries a representative mix of small
+// and large work. Without this a worker whose batch happens to be all large
+// archives pins every slot for minutes while small samples starve behind them
+// — on the litmus worker benchmark, mixing the handout cut median small-sample
+// turnaround ~10x when paired with the worker's smallest-first dispatch.
+// Positions compare as integer rationals scaled to a 2^32 grid (exact for any
+// realistic batch size); the sort is stable, so jobs within a class keep
+// their tier ordering.
+func interleaveBySizeClass(cands []hopper.ClaimJob) []hopper.ClaimJob {
+	if len(cands) < 3 {
+		return cands
+	}
+	var counts [3]uint64
+	for i := range cands {
+		counts[sizeClass(cands[i].SizeBytes)]++
+	}
+	type keyedJob struct {
+		key uint64
+		job hopper.ClaimJob
+	}
+	keyed := make([]keyedJob, len(cands))
+	var seen [3]uint64
+	for i := range cands {
+		class := sizeClass(cands[i].SizeBytes)
+		keyed[i] = keyedJob{
+			key: ((2*seen[class] + 1) << 32) / (2 * counts[class]),
+			job: cands[i],
+		}
+		seen[class]++
+	}
+	slices.SortStableFunc(keyed, func(a, b keyedJob) int {
+		switch {
+		case a.key < b.key:
+			return -1
+		case a.key > b.key:
+			return 1
+		default:
+			return 0
+		}
+	})
+	out := make([]hopper.ClaimJob, len(cands))
+	for i := range keyed {
+		out[i] = keyed[i].job
+	}
+	return out
+}
+
 // handleHeartbeat records a worker check-in without claiming work. The claim
 // path (/api/next) only contacts hopper when a worker has buffer room, so a
 // saturated worker can vanish from the dashboard for minutes; this endpoint
@@ -1334,13 +1397,16 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, too
 		return out, nil
 	}
 
-	// Tier 1: the main unanalyzed-samples queue.
+	// Tier 1: the main unanalyzed-samples queue. Candidates arrive in random
+	// SHA order (pivot scan), so interleaving size classes loses nothing and
+	// guarantees every batch mixes small and large work — the other tiers keep
+	// their deliberate orderings (upload FIFO, operator FIFO, staleness).
 	want = count - len(out)
 	cands, err = s.db.UnanalyzedCandidates(ctx, s.hopperStart, want*candidateOverfetch)
 	if err != nil {
 		return out, err
 	}
-	cands = filterCandidatesByWorkerTools(cands, tools)
+	cands = interleaveBySizeClass(filterCandidatesByWorkerTools(cands, tools))
 	out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
 	if len(out) >= count {
 		return out, nil
