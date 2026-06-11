@@ -123,6 +123,20 @@ install_cron() {
     log "  logfile: $logfile"
 }
 
+# Install the healer to a stable, postgres-readable path. The repo often lives
+# in a user home the postgres user can't traverse, but the schedule runs the
+# healer AS postgres (systemd User=postgres / postgres crontab) — so referencing
+# the in-repo path fails with EACCES. Copy it somewhere world-readable.
+INSTALL_PATH="${HEAL_INSTALL_PATH:-/usr/local/bin/hopper-replica-heal.sh}"
+if [ "$HEAL" != "$INSTALL_PATH" ]; then
+    if as_root install -D -m 0755 "$HEAL" "$INSTALL_PATH" 2>/dev/null; then
+        log "installed healer -> $INSTALL_PATH"
+        HEAL="$INSTALL_PATH"
+    else
+        warn "could not copy healer to $INSTALL_PATH; using in-place $HEAL (postgres must be able to read it)"
+    fi
+fi
+
 # --- pick scheduler --------------------------------------------------------
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     if install_systemd; then exit 0; fi
