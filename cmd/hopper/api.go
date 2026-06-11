@@ -346,16 +346,17 @@ func (wt *workerTracker) heartbeat(name string, hb workerHeartbeat) (newError bo
 // workerHeartbeat is the parsed payload of one /api/heartbeat request. Timestamps
 // are already converted from the worker's relative ages to absolute hopper-clock
 // times at receipt, so the dashboard can render them with time.Since.
-type workerHeartbeat struct {
+type workerHeartbeat struct { //nolint:govet // embedded-first ordering over fieldalignment's pointer-packing
+	lastSeenSignals
+
 	oldestQueueSince time.Time
 	lastCompletion   time.Time
 	lastErrorAt      time.Time
 	lastError        string
-	lastSeenSignals
-	queue        int
-	active       int
-	filesPerSec  float64
-	errorsRecent int
+	queue            int
+	active           int
+	filesPerSec      float64
+	errorsRecent     int
 }
 
 // lastSeenSignals are the liveness fields shared by /api/next and /api/heartbeat.
@@ -479,7 +480,11 @@ func (wt *workerTracker) resetClaims(name string) {
 // namedWorkerStats is workerStats with the worker name attached.
 //
 
-type namedWorkerStats struct {
+// namedWorkerStats pairs a worker's name with its stats for the dashboard
+// snapshot. Embedded field first per Go style; the optimal-alignment ordering
+// (Name ahead of the embedded block) is declined deliberately — this is a
+// short-lived snapshot value, not a hot allocation.
+type namedWorkerStats struct { //nolint:govet // embedded-first ordering over fieldalignment's pointer-packing
 	workerStats
 
 	Name string
@@ -524,6 +529,19 @@ const (
 	resultStoreTimeout = 10 * time.Minute
 	dbRetryInitial     = 100 * time.Millisecond
 	dbRetryMax         = 5 * time.Second
+	// dbRetryAttempts caps how many times a single DB operation is retried on a
+	// transient error. The governing context still bounds total wall time, but an
+	// attempt cap stops a table-wide stall (e.g. a lock_timeout storm, SQLSTATE
+	// 55P03) from being amplified: without it, every blocked worker re-queued for
+	// the same lock for the full 10-minute store budget, and the pile of waiters
+	// was itself the contention.
+	//
+	// At dbRetryInitial=100ms doubling to dbRetryMax=5s under full jitter, 28
+	// attempts spans ~2 minutes of worst-case backoff — long enough to ride out a
+	// DB failover or a brief contention window without losing completed analysis,
+	// matching the "retry with backoff up to ~2 minutes" reliability standard,
+	// yet bounded so a real outage degrades gracefully instead of storming.
+	dbRetryAttempts = 28
 
 	// Candidate fetch over-fetches the worker's requested count so concurrent
 	// pollers walking the same head-of-queue rows don't all collapse onto the
@@ -1088,23 +1106,33 @@ type resultRequest struct {
 // the cap" (the truncated JSON then fails to decode) from a genuinely
 // malformed body — callers should report the former as 413, not 400. The
 // returned cleanup must be called once decoding is done.
-func resultBody(r *http.Request) (body io.Reader, overLimit func() bool, cleanup func(), err error) {
+// resultReader is the decoded result-body stream plus the two closures the
+// caller needs alongside it: overLimit reports whether the size cap was hit
+// (so a truncated decode can be surfaced as 413 rather than 400), and cleanup
+// releases any decoder resources.
+type resultReader struct {
+	body      io.Reader
+	overLimit func() bool
+	cleanup   func()
+}
+
+func resultBody(r *http.Request) (resultReader, error) {
 	raw := &io.LimitedReader{R: r.Body, N: maxResultBodyBytes + 1}
 	switch strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding"))) {
 	case "", "identity":
-		return raw, func() bool { return raw.N <= 0 }, func() {}, nil
+		return resultReader{body: raw, overLimit: func() bool { return raw.N <= 0 }, cleanup: func() {}}, nil
 	case "zstd":
 		// One decoder per request: result POSTs are infrequent and large, so
 		// the decoder setup is dwarfed by the decode itself. Single-threaded
 		// and low-memory keeps the per-request footprint small under bursts.
 		zr, err := zstd.NewReader(raw, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true))
 		if err != nil {
-			return nil, nil, nil, err
+			return resultReader{}, err
 		}
 		out := &io.LimitedReader{R: zr, N: maxResultBodyBytes + 1}
-		return out, func() bool { return out.N <= 0 || raw.N <= 0 }, zr.Close, nil
+		return resultReader{body: out, overLimit: func() bool { return out.N <= 0 || raw.N <= 0 }, cleanup: zr.Close}, nil
 	default:
-		return nil, nil, nil, errors.New("unsupported content-encoding")
+		return resultReader{}, errors.New("unsupported content-encoding")
 	}
 }
 
@@ -1122,7 +1150,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	// Stream-decode rather than io.ReadAll: avoids a duplicate 128 MiB buffer
 	// per concurrent uploader. The Raw/ML json.RawMessage fields still land
 	// in memory once each, but we lose the second whole-body copy.
-	body, overLimit, closeBody, err := resultBody(r)
+	rb, err := resultBody(r)
 	if err != nil {
 		slog.Warn("result rejected: bad content-encoding", //nolint:gosec // structured logging
 			"error", err,
@@ -1131,15 +1159,15 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"unsupported content-encoding"}`, http.StatusUnsupportedMediaType)
 		return
 	}
-	defer closeBody()
-	dec := json.NewDecoder(body)
+	defer rb.cleanup()
+	dec := json.NewDecoder(rb.body)
 	var req resultRequest
 	if err := dec.Decode(&req); err != nil {
 		// An over-limit body is truncated mid-document and fails the decode;
 		// report it as 413 so the worker sees the real cause instead of a
 		// generic "invalid json" 400.
-		if overLimit() {
-			slog.Warn("result rejected: body exceeds size limit",
+		if rb.overLimit() {
+			slog.Warn("result rejected: body exceeds size limit", //nolint:gosec // structured logging
 				"limit_bytes", int64(maxResultBodyBytes),
 				"remote", r.RemoteAddr,
 			)
@@ -1486,7 +1514,7 @@ func retryDBAccess[T any](ctx context.Context, op, shaHex string, fn func(contex
 			return v, err
 		},
 		retry.Context(ctx),
-		retry.UntilSucceeded(),
+		retry.Attempts(dbRetryAttempts),
 		retry.Delay(dbRetryInitial),
 		retry.MaxDelay(dbRetryMax),
 		retry.DelayType(retry.FullJitterBackoffDelay),

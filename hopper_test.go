@@ -2428,7 +2428,7 @@ func TestFeedSamples(t *testing.T) {
 	}
 
 	q := FeedQuery{Source: "test", Limit: 10}
-	samples, err := db.FeedSamples(ctx, q)
+	samples, err := db.FeedSamples(ctx, &q)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2437,7 +2437,7 @@ func TestFeedSamples(t *testing.T) {
 	}
 
 	q.Feeds = []string{"feed1"}
-	samples, err = db.FeedSamples(ctx, q)
+	samples, err = db.FeedSamples(ctx, &q)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2478,7 +2478,7 @@ func TestFeedSamples(t *testing.T) {
 		t.Errorf("expected 0 ecosystems past the cutoff, got %v", future)
 	}
 
-	count, err := db.FeedSamplesCount(ctx, q)
+	count, err := db.FeedSamplesCount(ctx, &q)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2501,7 +2501,7 @@ func TestFeedSamples(t *testing.T) {
 	}
 
 	q = FeedQuery{Source: "test", Limit: 10}
-	samples, err = db.FeedSamples(ctx, q)
+	samples, err = db.FeedSamples(ctx, &q)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2518,14 +2518,14 @@ func TestFeedSamples(t *testing.T) {
 
 	// Explicit analyzed_at sort
 	q.OrderBy = "analyzed_at"
-	_, err = db.FeedSamples(ctx, q)
+	_, err = db.FeedSamples(ctx, &q)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Explicit created_at sort
 	q.OrderBy = "created_at"
-	_, err = db.FeedSamples(ctx, q)
+	_, err = db.FeedSamples(ctx, &q)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2555,11 +2555,11 @@ func TestFeedSamplesSearch(t *testing.T) {
 	shas := func(q FeedQuery) []string {
 		q.Source = "test"
 		q.Limit = 10
-		samples, err := db.FeedSamples(ctx, q)
+		samples, err := db.FeedSamples(ctx, &q)
 		if err != nil {
 			t.Fatal(err)
 		}
-		count, err := db.FeedSamplesCount(ctx, q)
+		count, err := db.FeedSamplesCount(ctx, &q)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2641,7 +2641,7 @@ func TestFeedSamplesLitmusClassesV6V7(t *testing.T) {
 
 	for class := range 3 {
 		q := FeedQuery{Source: "v6test", Limit: 100, CriticalLevel: 4, LitmusClasses: []int{class}}
-		samples, err := db.FeedSamples(ctx, q)
+		samples, err := db.FeedSamples(ctx, &q)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2649,7 +2649,7 @@ func TestFeedSamplesLitmusClassesV6V7(t *testing.T) {
 		for _, s := range samples {
 			got[s.SHA256] = true
 		}
-		count, err := db.FeedSamplesCount(ctx, q)
+		count, err := db.FeedSamplesCount(ctx, &q)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2667,7 +2667,7 @@ func TestFeedSamplesLitmusClassesV6V7(t *testing.T) {
 	// (hostile at the default cutoff) becomes suspicious. This is the
 	// consistency knob.
 	q := FeedQuery{Source: "v6test", Limit: 100, CriticalLevel: 3, LitmusClasses: []int{1}}
-	samples, err := db.FeedSamples(ctx, q)
+	samples, err := db.FeedSamples(ctx, &q)
 	if err != nil {
 		t.Fatal(err)
 	}

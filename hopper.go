@@ -271,8 +271,8 @@ func cleaveCompactFilesFromRaw(raw json.RawMessage) []json.RawMessage {
 	for _, entry := range files {
 		var f struct {
 			SHA256   string `json:"sha"`
-			FileType string `json:"type"`
 			Depth    *int   `json:"dp"`
+			FileType string `json:"type"`
 		}
 		if json.Unmarshal(entry, &f) == nil && (f.SHA256 != "" || f.FileType != "" || f.Depth != nil) {
 			return files
@@ -539,7 +539,8 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 
 	// Canonical SHA: lexicographic minimum across sample and all embedded files.
 	canonical := sha256
-	for _, f := range report.Files {
+	for i := range report.Files {
+		f := &report.Files[i]
 		if len(f.SHA256) == 64 && f.SHA256 < canonical {
 			canonical = f.SHA256
 		}
@@ -547,7 +548,8 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 
 	// File info for the matching entry.
 	var fi cleaveFileInfo
-	for _, f := range report.Files {
+	for i := range report.Files {
+		f := &report.Files[i]
 		if f.SHA256 != sha256 && f.Depth != 0 {
 			continue
 		}
@@ -592,7 +594,8 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 }
 
 func parsedCleaveFilesLookCompact(files []cleaveCompactFileEntry) bool {
-	for _, f := range files {
+	for i := range files {
+		f := &files[i]
 		if f.SHA256 != "" || f.FileType != "" || f.Depth != 0 || f.Formula != "" || f.OldFormula != "" {
 			return true
 		}
@@ -1084,7 +1087,11 @@ func (db *DB) Migrate(ctx context.Context) error {
 // and the returned function is a no-op.
 func (db *DB) MigrateServing(ctx context.Context) (func(context.Context) error, error) {
 	if db.pool != nil {
-		return db.migrateServingPG(ctx)
+		// allowRewrite is false: the serving path must never run a
+		// table-rewriting migration on a populated samples table, since the
+		// ACCESS EXCLUSIVE lock would freeze every reader and writer for the
+		// length of the rewrite. Such a migration is deferred to `hopper migrate`.
+		return db.migrateServingPG(ctx, false)
 	}
 	if err := db.migrateSQLite(ctx); err != nil {
 		return nil, err
@@ -2295,7 +2302,7 @@ type FeedQuery struct {
 }
 
 // FeedSamples returns analyzed samples matching the query, newest first.
-func (db *DB) FeedSamples(ctx context.Context, q FeedQuery) ([]*Sample, error) {
+func (db *DB) FeedSamples(ctx context.Context, q *FeedQuery) ([]*Sample, error) {
 	q.clamp()
 	if db.pool != nil {
 		return db.feedSamplesPG(ctx, q)
@@ -2304,7 +2311,7 @@ func (db *DB) FeedSamples(ctx context.Context, q FeedQuery) ([]*Sample, error) {
 }
 
 // FeedSamplesCount returns the total number of samples matching the query.
-func (db *DB) FeedSamplesCount(ctx context.Context, q FeedQuery) (int, error) {
+func (db *DB) FeedSamplesCount(ctx context.Context, q *FeedQuery) (int, error) {
 	if db.pool != nil {
 		return db.feedSamplesCountPG(ctx, q)
 	}

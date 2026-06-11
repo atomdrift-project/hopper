@@ -659,6 +659,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	writeQueueGraphs(&buf, queuePoints, wd.metrics != nil)
 
 	// Workers
+	//nolint:nestif // flat per-worker cell formatting, consistent with this handler's documented long-but-flat style
 	if len(workers) > 0 {
 		// latestTraits is the canonical traits version we measure each
 		// worker against. Read live from apiServer so the periodic
@@ -764,6 +765,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 				if !w.LastErrorAt.IsZero() {
 					title = strings.TrimSpace(title + " · " + shortDuration(time.Since(w.LastErrorAt)) + " ago")
 				}
+				//nolint:gocritic // %q applies Go quoting; an HTML attribute needs htmlEscape with literal quotes
 				err15Cell = fmt.Sprintf(`<td class="warn" title="%s">%d</td>`,
 					htmlEscape(title), w.ErrorsRecent)
 			}

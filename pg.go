@@ -46,9 +46,11 @@ func openPG(ctx context.Context, dsn string) (*DB, error) {
 // extensions) followed by all index builds. Used by one-shot commands (init,
 // import) where nothing is serving yet and a fully-indexed database is wanted
 // before bulk work begins. The serving path (load/serve) calls migrateServingPG
-// instead, which defers index builds to a background goroutine.
+// instead, which defers index builds to a background goroutine. allowRewrite is
+// true here: a one-shot command is the only context permitted to run a
+// table-rewriting migration on a populated samples table.
 func (db *DB) migratePG(ctx context.Context) error {
-	build, err := db.migrateServingPG(ctx)
+	build, err := db.migrateServingPG(ctx, true)
 	if err != nil {
 		return err
 	}
@@ -61,7 +63,7 @@ func (db *DB) migratePG(ctx context.Context) error {
 // isDeferrableIndexDDL. Index DDL may appear anywhere in the list — every
 // CREATE INDEX depends only on columns added earlier, never on another index,
 // so building all columns before any index preserves correctness.
-func pgRuntimeMigrations() []string { //nolint:revive // long sequential migration list; splitting reduces clarity
+func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequential migration list; splitting reduces clarity
 	return []string{
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS parent TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS skip TEXT NOT NULL DEFAULT ''`,
@@ -565,7 +567,7 @@ func isDeferrableIndexDDL(ddl string) bool {
 // function in the background once it is serving, so a new index build never
 // blocks workers. On an established database every index already exists, so the
 // returned function is a fast sequence of ledger-skipped no-ops.
-func (db *DB) migrateServingPG(ctx context.Context) (func(context.Context) error, error) {
+func (db *DB) migrateServingPG(ctx context.Context, allowRewrite bool) (func(context.Context) error, error) {
 	if err := db.ensurePGMigrationLedger(ctx); err != nil {
 		return nil, fmt.Errorf("hopper: migrate: %w", err)
 	}
@@ -576,7 +578,7 @@ func (db *DB) migrateServingPG(ctx context.Context) (func(context.Context) error
 	// reconcile) and head-of-line-blocks every writer behind it. Skipping the
 	// blob outright once it is recorded keeps an unchanged-schema restart
 	// completely lock-free.
-	if err := db.execPGMigrationDDL(ctx, schemaPG); err != nil {
+	if err := db.execPGMigrationDDL(ctx, schemaPG, allowRewrite); err != nil {
 		return nil, fmt.Errorf("hopper: migrate: %w", err)
 	}
 
@@ -588,13 +590,13 @@ func (db *DB) migrateServingPG(ctx context.Context) (func(context.Context) error
 			deferred = append(deferred, ddl)
 			continue
 		}
-		if err := db.execPGMigrationDDL(ctx, ddl); err != nil {
+		if err := db.execPGMigrationDDL(ctx, ddl, allowRewrite); err != nil {
 			return nil, fmt.Errorf("hopper: migrate: %w", err)
 		}
 	}
 
 	trgmReady := true
-	if err := db.execPGMigrationDDL(ctx, trgmExtensionDDL); err != nil {
+	if err := db.execPGMigrationDDL(ctx, trgmExtensionDDL, allowRewrite); err != nil {
 		slog.Warn("optional migration skipped; continuing without it", "ddl", trgmExtensionDDL, "error", err)
 		trgmReady = false
 	}
@@ -602,12 +604,12 @@ func (db *DB) migrateServingPG(ctx context.Context) (func(context.Context) error
 
 	return func(ctx context.Context) error {
 		for _, ddl := range deferred {
-			if err := db.execPGMigrationDDL(ctx, ddl); err != nil {
+			if err := db.execPGMigrationDDL(ctx, ddl, allowRewrite); err != nil {
 				return fmt.Errorf("hopper: migrate index: %w", err)
 			}
 		}
 		if trgmReady {
-			if err := db.execPGMigrationDDL(ctx, trgmIndexDDL); err != nil {
+			if err := db.execPGMigrationDDL(ctx, trgmIndexDDL, allowRewrite); err != nil {
 				slog.Warn("optional migration skipped; continuing without it", "ddl", trgmIndexDDL, "error", err)
 			}
 		}
@@ -616,7 +618,7 @@ func (db *DB) migrateServingPG(ctx context.Context) (func(context.Context) error
 	}, nil
 }
 
-func (db *DB) execPGMigrationDDL(ctx context.Context, ddl string) error {
+func (db *DB) execPGMigrationDDL(ctx context.Context, ddl string, allowRewrite bool) error {
 	ddl = strings.TrimSpace(ddl)
 	id := migrationID(ddl)
 	applied, err := db.pgMigrationApplied(ctx, id)
@@ -638,6 +640,22 @@ func (db *DB) execPGMigrationDDL(ctx context.Context, ddl string) error {
 		}
 		slog.Info("migration ddl already satisfied", "id", id, "ddl", ddl)
 		return nil
+	}
+
+	// This statement is genuinely about to execute (not applied, not already
+	// satisfied). Refuse the serving path the chance to rewrite a populated
+	// samples table: the ACCESS EXCLUSIVE lock would strand every worker for the
+	// length of the rewrite. The operator must run it via `hopper migrate` in a
+	// maintenance window. An empty table rewrites instantly, so it is allowed.
+	if !allowRewrite && isTableRewriteDDL(ddl) {
+		nonEmpty, err := db.pgSamplesNonEmpty(ctx)
+		if err != nil {
+			return err
+		}
+		if nonEmpty {
+			return fmt.Errorf("hopper: refusing table-rewriting migration %s on a populated samples table while serving; "+
+				"run `hopper migrate` in a maintenance window first", id)
+		}
 	}
 
 	if idx, ok := concurrentIndexDDL(ddl); ok {
@@ -699,12 +717,92 @@ func (db *DB) recordPGMigration(ctx context.Context, id, ddl string) error {
 }
 
 func (db *DB) pgMigrationAlreadySatisfied(ctx context.Context, ddl string) (bool, error) {
+	// The cleave-derived-column conversion is a DO block whose body can take an
+	// ACCESS EXCLUSIVE lock and rewrite the whole (~350GB) samples table when it
+	// (re)creates litmus_score as a STORED generated column. The migration ledger
+	// keys on a hash of the DDL text, so an unrelated edit to this block's
+	// comments changes its hash, the "already applied" lookup misses, and the
+	// rewrite re-fires against a live database. Gate it on the catalog instead:
+	// when samples is already in the converted end-state every branch of the
+	// block is a guaranteed no-op, so record it satisfied without executing it.
+	if isCleaveDeriveColumnsDDL(ddl) {
+		return db.pgCleaveDeriveColumnsConverted(ctx)
+	}
 	switch normalizeMigrationDDL(ddl) {
 	case `ALTER TABLE samples ADD COLUMN IF NOT EXISTS traits_version TEXT NOT NULL DEFAULT ''`:
 		return db.pgColumnExists(ctx, "samples", "traits_version")
 	default:
 		return false, nil
 	}
+}
+
+// isTableRewriteDDL reports whether ddl can rewrite the whole samples table
+// under an ACCESS EXCLUSIVE lock. Today the only such statement is the
+// cleave-derive conversion block, whose litmus_score branch recreates a STORED
+// generated column — a full rewrite on a ~350GB table. The serving path refuses
+// it on a populated table (see execPGMigrationDDL) so a rewrite can never freeze
+// live traffic, regardless of which binary version ran the migration.
+func isTableRewriteDDL(ddl string) bool {
+	return isCleaveDeriveColumnsDDL(ddl)
+}
+
+// pgSamplesNonEmpty reports whether the samples table holds at least one row.
+// EXISTS stops at the first row, so this stays cheap on a huge table. samples is
+// always present here: the base schema (which creates it) runs before any
+// rewrite-class migration.
+func (db *DB) pgSamplesNonEmpty(ctx context.Context) (bool, error) {
+	var nonEmpty bool
+	if err := db.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM samples)`).Scan(&nonEmpty); err != nil {
+		return false, err
+	}
+	return nonEmpty, nil
+}
+
+// isCleaveDeriveColumnsDDL identifies the one-time DO block that converts the
+// cleave-derived columns to their trigger-fed shape. Matched on stable column
+// references rather than exact text so a comment edit can never slip an
+// unguarded table rewrite past pgMigrationAlreadySatisfied.
+func isCleaveDeriveColumnsDDL(ddl string) bool {
+	return strings.Contains(ddl, "ADD COLUMN litmus_score") &&
+		strings.Contains(ddl, "DROP EXPRESSION")
+}
+
+// pgCleaveDeriveColumnsConverted reports whether samples is already in the
+// end-state the cleave-derive DO block produces: litmus_score is the STORED
+// generated column and file_type/score/formula are plain columns fed by the
+// samples_derive_cleave_cols trigger. In that state every branch of the block is
+// a no-op, so skipping it is equivalent to running it — and crucially avoids the
+// full-table rewrite the litmus_score branch performs when it has to (re)create
+// that column. Returns false (run the block) on a database that predates the
+// columns, where the conversion is genuinely still needed.
+func (db *DB) pgCleaveDeriveColumnsConverted(ctx context.Context) (bool, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT attname, attgenerated::text FROM pg_attribute
+		WHERE attrelid = to_regclass('samples')
+		  AND attname IN ('litmus_score', 'file_type', 'score', 'formula')
+		  AND NOT attisdropped`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	gen := make(map[string]string, 4)
+	for rows.Next() {
+		var name, generated string
+		if err := rows.Scan(&name, &generated); err != nil {
+			return false, err
+		}
+		gen[name] = generated
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	// All four columns must already exist, with litmus_score STORED-generated
+	// ('s') and the rest plain (anything but 's'); only then is the block inert.
+	return len(gen) == 4 &&
+		gen["litmus_score"] == "s" &&
+		gen["file_type"] != "s" &&
+		gen["score"] != "s" &&
+		gen["formula"] != "s", nil
 }
 
 func (db *DB) pgColumnExists(ctx context.Context, table, column string) (bool, error) {
@@ -2560,35 +2658,118 @@ func (db *DB) setSkipWithEventPG(ctx context.Context, sha256, skip, reason strin
 	return tag.RowsAffected() > 0, nil
 }
 
+// cascadeBatch bounds how many samples rows a single reconcile UPDATE locks at
+// once. Large enough to drain a sizable backlog in a few round-trips, small
+// enough that the row locks it holds clear quickly for foreground workers.
+const cascadeBatch = 10000
+
 func (db *DB) cascadeMembersPG(ctx context.Context) (cascaded, revived int64, err error) {
-	tx, err := db.pool.Begin(ctx)
+	// Reachability set: every standalone file in the current walk, plus every
+	// member transitively reachable from one through the sample_locations edge
+	// set (~80M rows). Materialized ONCE into a session-local temp table so the
+	// two reconcile passes below become fast anti-/semi-joins against its primary
+	// key. The whole pass runs on a single dedicated connection: the temp table
+	// is private to that session — safe against a concurrent reconcile — yet
+	// survives across the independent per-batch transactions.
+	//
+	// The earlier form ran both reconciling UPDATEs unbounded inside ONE
+	// transaction, locking every matching samples row at once and holding those
+	// locks until commit — head-of-line-blocking every worker's result store
+	// until lock_timeout fired (SQLSTATE 55P03). Each UPDATE now drains in
+	// bounded batches, each its own transaction selecting victims FOR UPDATE SKIP
+	// LOCKED under a short lock_timeout, so the sweep always yields to — and
+	// never blocks — a worker holding a row lock.
+	conn, err := db.pool.Acquire(ctx)
 	if err != nil {
-		return 0, 0, fmt.Errorf("hopper: begin cascade: %w", err)
+		return 0, 0, fmt.Errorf("hopper: acquire reconcile conn: %w", err)
+	}
+	// Drop the temp table before the connection returns to the pool so a later
+	// reuse starts clean. WithoutCancel so cleanup still runs when ctx is already
+	// cancelled; buildReconcileAliveSet also drops first, so any residue
+	// self-heals on the next pass regardless.
+	defer func() {
+		if _, derr := conn.Exec(context.WithoutCancel(ctx), `DROP TABLE IF EXISTS reconcile_alive`); derr != nil {
+			slog.Warn("reconcile temp table cleanup failed; will self-heal on next pass", "error", derr)
+		}
+		conn.Release()
+	}()
+
+	if err := buildReconcileAliveSet(ctx, conn); err != nil {
+		return 0, 0, err
+	}
+
+	// Cascade missing to members orphaned by a missing parent. The WHERE skip=''
+	// guarantees from_skip='', so the audit needs no pre-read; a member with an
+	// edge to any alive archive is in reconcile_alive and survives (supply-chain
+	// veto). Self-draining: each row moves skip ''→'missing' and leaves the
+	// candidate set, so the loop terminates when a batch changes nothing.
+	cascaded, err = drainReconcile(ctx, conn, `
+		WITH casc AS (
+			UPDATE samples s SET skip = 'missing', updated_at = now()
+			WHERE s.sha256 IN (
+				SELECT s2.sha256 FROM samples s2
+				WHERE s2.parent <> '' AND s2.skip = ''
+				  AND NOT EXISTS (SELECT 1 FROM reconcile_alive a WHERE a.sha256 = s2.sha256)
+				LIMIT $1
+				FOR UPDATE SKIP LOCKED
+			)
+			RETURNING s.sha256, s.label
+		)
+		INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
+		SELECT sha256, label, label, '', 'missing', 'cascade-missing', now() FROM casc`)
+	if err != nil {
+		return cascaded, 0, err
+	}
+
+	revived, err = drainReconcile(ctx, conn, `
+		WITH rev AS (
+			UPDATE samples s SET skip = '', updated_at = now()
+			WHERE s.sha256 IN (
+				SELECT s2.sha256 FROM samples s2
+				WHERE s2.parent <> '' AND s2.skip = 'missing'
+				  AND EXISTS (SELECT 1 FROM reconcile_alive a WHERE a.sha256 = s2.sha256)
+				LIMIT $1
+				FOR UPDATE SKIP LOCKED
+			)
+			RETURNING s.sha256, s.label
+		)
+		INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
+		SELECT sha256, label, label, 'missing', '', 'revive', now() FROM rev`)
+	if err != nil {
+		return cascaded, revived, err
+	}
+	return cascaded, revived, nil
+}
+
+// buildReconcileAliveSet materializes the reconcile reachability set into the
+// session-local temp table reconcile_alive on conn. Kept separate from the
+// per-batch UPDATEs so the expensive recursive walk commits once and each batch
+// can run in its own short transaction. This phase reads only
+// walk_staging/sample_locations, so it takes no lock on samples; a session-local
+// work_mem keeps the DISTINCT and recursive dedup in memory rather than spilling
+// gigabytes to temp files. The temp table omits ON COMMIT DROP so it outlives
+// the build transaction and stays visible to the drain batches on this same
+// connection.
+func buildReconcileAliveSet(ctx context.Context, conn *pgxpool.Conn) error {
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("hopper: begin alive build: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
 
-	// `alive` is the recursive reachability set: every standalone file in the
-	// current walk, plus every member transitively reachable from one through
-	// the sample_locations edge set (~80M rows). It is identical for the
-	// cascade and revive passes and is by far the costliest part of
-	// reconciliation. Computing it inline with each UPDATE (two fused writable
-	// CTEs) recomputed it twice AND held a RowExclusiveLock on samples for the
-	// entire multi-hour recursion — head-of-line-blocking every ingest writer.
-	//
-	// Build it ONCE into an indexed temp table instead. This phase only reads
-	// walk_staging/sample_locations (no samples write lock), and a generous
-	// session-local work_mem keeps the DISTINCT and recursive dedup in memory
-	// rather than spilling gigabytes to temp files. The two UPDATEs then become
-	// fast anti-/semi-joins against the temp PK, so the samples write lock is
-	// held only for their brief duration.
 	if _, err := tx.Exec(ctx, `SET LOCAL work_mem = '4GB'`); err != nil {
-		return 0, 0, fmt.Errorf("hopper: cascade work_mem: %w", err)
+		return fmt.Errorf("hopper: alive work_mem: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `CREATE TEMP TABLE alive (sha256 TEXT PRIMARY KEY) ON COMMIT DROP`); err != nil {
-		return 0, 0, fmt.Errorf("hopper: cascade temp: %w", err)
+	// DROP first so residue left on this pooled connection by a cancelled cleanup
+	// never poisons this pass with stale reachability.
+	if _, err := tx.Exec(ctx, `DROP TABLE IF EXISTS reconcile_alive`); err != nil {
+		return fmt.Errorf("hopper: drop stale alive: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `CREATE TEMP TABLE reconcile_alive (sha256 TEXT PRIMARY KEY)`); err != nil {
+		return fmt.Errorf("hopper: create alive: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO alive (sha256)
+		INSERT INTO reconcile_alive (sha256)
 		WITH RECURSIVE reach(sha256) AS (
 			SELECT DISTINCT sha256 FROM walk_staging
 			UNION
@@ -2596,41 +2777,49 @@ func (db *DB) cascadeMembersPG(ctx context.Context) (cascaded, revived int64, er
 			  JOIN reach r ON sl.parent_sha256 = r.sha256
 		)
 		SELECT sha256 FROM reach`); err != nil {
-		return 0, 0, fmt.Errorf("hopper: cascade build alive: %w", err)
-	}
-
-	// Cascade missing to members orphaned by a missing parent. The WHERE skip=''
-	// guarantees from_skip='', so the audit needs no pre-read. A member with an
-	// edge to any alive archive is in `alive` and survives (supply-chain veto).
-	cascTag, err := tx.Exec(ctx, `
-		WITH casc AS (
-			UPDATE samples s SET skip = 'missing', updated_at = now()
-			WHERE s.parent <> '' AND s.skip = ''
-			  AND NOT EXISTS (SELECT 1 FROM alive a WHERE a.sha256 = s.sha256)
-			RETURNING s.sha256, s.label
-		)
-		INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
-		SELECT sha256, label, label, '', 'missing', 'cascade-missing', now() FROM casc`)
-	if err != nil {
-		return 0, 0, fmt.Errorf("hopper: cascade apply: %w", err)
-	}
-
-	revTag, err := tx.Exec(ctx, `
-		WITH rev AS (
-			UPDATE samples s SET skip = '', updated_at = now()
-			WHERE s.parent <> '' AND s.skip = 'missing'
-			  AND EXISTS (SELECT 1 FROM alive a WHERE a.sha256 = s.sha256)
-			RETURNING s.sha256, s.label
-		)
-		INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
-		SELECT sha256, label, label, 'missing', '', 'revive', now() FROM rev`)
-	if err != nil {
-		return 0, 0, fmt.Errorf("hopper: revive apply: %w", err)
+		return fmt.Errorf("hopper: build alive: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return 0, 0, fmt.Errorf("hopper: commit cascade: %w", err)
+		return fmt.Errorf("hopper: commit alive build: %w", err)
 	}
-	return cascTag.RowsAffected(), revTag.RowsAffected(), nil
+	return nil
+}
+
+// drainReconcile runs one batched reconcile statement on conn repeatedly until a
+// batch changes no rows. stmt must take $1 (the batch limit) and report the
+// number of rows changed via its command tag. Each batch is its own transaction
+// with a short lock_timeout, and the statement selects its victims FOR UPDATE
+// SKIP LOCKED, so the sweep never waits on a worker-held row lock — momentarily
+// locked rows are simply left for the next reconcile pass. Runs on conn so the
+// statements see the session-local reconcile_alive temp table.
+func drainReconcile(ctx context.Context, conn *pgxpool.Conn, stmt string) (int64, error) {
+	var total int64
+	for {
+		var affected int64
+		err := func() error {
+			tx, err := conn.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+			if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '3s'`); err != nil {
+				return err
+			}
+			tag, err := tx.Exec(ctx, stmt, cascadeBatch)
+			if err != nil {
+				return err
+			}
+			affected = tag.RowsAffected()
+			return tx.Commit(ctx)
+		}()
+		if err != nil {
+			return total, fmt.Errorf("hopper: reconcile batch: %w", err)
+		}
+		total += affected
+		if affected == 0 {
+			return total, nil
+		}
+	}
 }
 
 func (db *DB) deleteSamplePG(ctx context.Context, sha256 string) error {
@@ -2732,7 +2921,7 @@ func (db *DB) applyCleanupPG(ctx context.Context, stage CleanupStage) (int64, er
 	return tag.RowsAffected(), nil
 }
 
-func (db *DB) feedSamplesPG(ctx context.Context, q FeedQuery) ([]*Sample, error) {
+func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT `+pgSampleCols+` FROM samples
 		WHERE ($1 = '' OR source = $1)
@@ -2773,7 +2962,7 @@ func (db *DB) feedSamplesPG(ctx context.Context, q FeedQuery) ([]*Sample, error)
 	return scanPGSamples(rows)
 }
 
-func (db *DB) feedSamplesCountPG(ctx context.Context, q FeedQuery) (int, error) {
+func (db *DB) feedSamplesCountPG(ctx context.Context, q *FeedQuery) (int, error) {
 	var n int
 	err := db.pool.QueryRow(ctx, `
 		SELECT count(*) FROM samples

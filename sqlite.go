@@ -2545,7 +2545,7 @@ func (db *DB) applyCleanupSQLite(ctx context.Context, stage CleanupStage) (int64
 	return n, nil
 }
 
-func (db *DB) feedSamplesSQLite(ctx context.Context, q FeedQuery) ([]*Sample, error) {
+func (db *DB) feedSamplesSQLite(ctx context.Context, q *FeedQuery) ([]*Sample, error) {
 	where, args := q.whereSQLite()
 	query := `SELECT ` + liteSampleCols + ` FROM samples ` + where + //nolint:gosec // built from fixed query fragments and validated sort key.
 		` ORDER BY ` + q.sortBy() + ` LIMIT ? OFFSET ?`
@@ -2558,7 +2558,7 @@ func (db *DB) feedSamplesSQLite(ctx context.Context, q FeedQuery) ([]*Sample, er
 	return scanLiteSamples(rows)
 }
 
-func (db *DB) feedSamplesCountSQLite(ctx context.Context, q FeedQuery) (int, error) {
+func (db *DB) feedSamplesCountSQLite(ctx context.Context, q *FeedQuery) (int, error) {
 	where, args := q.whereSQLite()
 	var n int
 	err := db.lite.QueryRowContext(ctx, `SELECT count(*) FROM samples `+where, args...).Scan(&n)

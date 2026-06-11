@@ -429,7 +429,7 @@ func TestResultBody(t *testing.T) {
 			if tc.encoding != "" {
 				r.Header.Set("Content-Encoding", tc.encoding)
 			}
-			reader, overLimit, cleanup, err := resultBody(r)
+			rb, err := resultBody(r)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatal("resultBody: expected error for unsupported encoding, got nil")
@@ -439,15 +439,15 @@ func TestResultBody(t *testing.T) {
 			if err != nil {
 				t.Fatalf("resultBody: %v", err)
 			}
-			defer cleanup()
-			got, err := io.ReadAll(reader)
+			defer rb.cleanup()
+			got, err := io.ReadAll(rb.body)
 			if err != nil {
 				t.Fatalf("ReadAll: %v", err)
 			}
 			if !bytes.Equal(got, want) {
 				t.Fatalf("decoded body = %q, want %q", got, want)
 			}
-			if overLimit() {
+			if rb.overLimit() {
 				t.Fatal("overLimit() = true for a body well under the limit")
 			}
 		})
