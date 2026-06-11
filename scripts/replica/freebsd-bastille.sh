@@ -31,8 +31,11 @@ COPY_DATA="${COPY_DATA:-true}"
 PGPASS="${PGPASSFILE:-$HOME/.pgpass}"
 PGPASS_MODE="${PGPASS_MODE:-preserve}"
 
-safe_run=$(printf '%s' "$RUN" | tr -c 'A-Za-z0-9_' '_')
-SUBSCRIPTION="${SUBSCRIPTION:-hopper_${safe_run}}"
+# Subscription/slot name: do NOT derive it from the jail name — that produced
+# cryptic, inconsistent names like 'hopper_replic'. Leave it empty so the
+# in-jail setup.sh derives the canonical hopper_replica_<hostname>, identical to
+# how every other replica is named. Override by exporting SUBSCRIPTION.
+SUBSCRIPTION="${SUBSCRIPTION:-}"
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
@@ -46,7 +49,7 @@ validate_ident() {
 }
 
 validate_ident PUBLICATION "$PUBLICATION"
-validate_ident SUBSCRIPTION "$SUBSCRIPTION"
+[ -n "$SUBSCRIPTION" ] && validate_ident SUBSCRIPTION "$SUBSCRIPTION"
 case "$COPY_DATA" in true|false) ;; *) die "COPY_DATA must be true or false" ;; esac
 case "$PGPASS_MODE" in preserve|replace) ;; *) die "PGPASS_MODE must be preserve or replace" ;; esac
 [ -f "$PGPASS" ] || die "$PGPASS not found; add the $REMOTE_HOST credentials first"
@@ -173,19 +176,29 @@ doas bastille cmd "$RUN" rm -rf /var/db/postgres/hopper
 doas bastille cp "$RUN" . /var/db/postgres/hopper
 doas bastille cmd "$RUN" chown -R postgres:postgres /var/db/postgres/hopper
 
+# Ensure cron runs in the jail: setup.sh -> install-heal.sh installs the
+# schema-drift self-healer as a postgres crontab (no systemd in a jail), which
+# only fires if cron is actually running.
+doas bastille sysrc "$RUN" cron_enable=YES >/dev/null
+doas bastille cmd "$RUN" service cron status >/dev/null 2>&1 \
+    || doas bastille service "$RUN" cron start || true
+
 log "Running replica setup inside jail"
+# Pass SUBSCRIPTION only when explicitly set; otherwise let the in-jail setup.sh
+# derive the canonical hopper_replica_<hostname>.
+sub_env=""
+[ -n "$SUBSCRIPTION" ] && sub_env="SUBSCRIPTION='$SUBSCRIPTION' "
 doas bastille cmd "$RUN" su -l postgres -c "
     cd /var/db/postgres/hopper &&
     REMOTE_HOST='$REMOTE_HOST' \
     REMOTE_USER='$REMOTE_USER' \
     REMOTE_DB='$REMOTE_DB' \
     PUBLICATION='$PUBLICATION' \
-    SUBSCRIPTION='$SUBSCRIPTION' \
-    COPY_DATA='$COPY_DATA' \
+    ${sub_env}COPY_DATA='$COPY_DATA' \
     PGPASSFILE=/var/db/postgres/.pgpass \
     gmake replica
 "
 
 log "Replica deployment complete"
 log "Monitor with:"
-log "  doas bastille cmd $RUN su -l postgres -c 'cd /var/db/postgres/hopper && REMOTE_HOST=$REMOTE_HOST SUBSCRIPTION=$SUBSCRIPTION gmake diagnose-replica'"
+log "  doas bastille cmd $RUN su -l postgres -c 'cd /var/db/postgres/hopper && REMOTE_HOST=$REMOTE_HOST gmake diagnose-replica'"

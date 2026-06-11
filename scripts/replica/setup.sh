@@ -195,6 +195,34 @@ else
     die "hopper binary not found — run 'make build' first"
 fi
 
+# --- Self-heal coordination ------------------------------------------------
+# install-heal.sh (called at the end) schedules replica-heal.sh to run as
+# postgres and auto-fix additive schema drift. While THIS script disables the
+# subscription to run DDL, raise a maintenance flag the healer honors so they
+# don't race. pg_sh runs a command as the postgres OS user (same escalation as
+# admin()) so files land where the healer — also postgres — reads them.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -z "$ESCALATE" ]; then
+    pg_sh() { sh -c "$1"; }
+else
+    # shellcheck disable=SC2086
+    pg_sh() { $ESCALATE sh -c "$1"; }
+fi
+HEAL_DIR=$(pg_sh 'printf %s "${HEAL_STATE_DIR:-$HOME/.hopper-replica-heal}"' 2>/dev/null || true)
+maint_on()  { [ -n "${HEAL_DIR:-}" ] && pg_sh "mkdir -p '$HEAL_DIR' && : > '$HEAL_DIR/maintenance'" 2>/dev/null || true; }
+maint_off() { [ -n "${HEAL_DIR:-}" ] && pg_sh "rm -f '$HEAL_DIR/maintenance'" 2>/dev/null || true; }
+trap 'maint_off' EXIT
+maint_on
+
+# Apply-worker resilience: the 1-minute default wal_receiver_timeout tears down
+# (and restarts from the slot's restart_lsn) any stream whose publisher-side
+# decode is slow — e.g. while catching up a large backlog. That turns a slow
+# catch-up into a restart loop. Give the receiver real slack.
+admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+ALTER SYSTEM SET wal_receiver_timeout = '10min';
+SELECT pg_reload_conf();
+SQL
+
 # Refuse to stack on top of a hung hopper init — each new run would just
 # queue behind the first one's lock waits and make things worse.
 if command -v pgrep >/dev/null 2>&1 && pgrep -f 'hopper init' >/dev/null 2>&1; then
@@ -353,6 +381,13 @@ if [ "$sub_exists" = "1" ]; then
         -v conn="$CONN" <<SQL
 ALTER SUBSCRIPTION :"sub" CONNECTION :'conn';
 ALTER SUBSCRIPTION :"sub" SET PUBLICATION :"pub" WITH (refresh = false);
+-- Contain schema drift: on any apply error (e.g. a missing replicated column
+-- after the publisher gains one) the subscription disables itself instead of
+-- crash-looping and pinning the publisher's WAL. replica-heal.sh re-enables it.
+-- streaming=on ships large in-progress transactions incrementally instead of
+-- buffering+spilling them whole on the publisher — important for this workload's
+-- big full-table backfill migrations.
+ALTER SUBSCRIPTION :"sub" SET (disable_on_error = true, streaming = on);
 ALTER SUBSCRIPTION :"sub" ENABLE;
 ALTER SUBSCRIPTION :"sub" REFRESH PUBLICATION WITH (copy_data = $COPY_DATA);
 SQL
@@ -380,7 +415,7 @@ SQL
 CREATE SUBSCRIPTION :"sub"
     CONNECTION :'conn'
     PUBLICATION :"pub"
-    WITH (copy_data = $COPY_DATA);
+    WITH (copy_data = $COPY_DATA, disable_on_error = true, streaming = on);
 SQL
 fi
 
@@ -432,6 +467,30 @@ printf '%s\n' "$tables" | while IFS='|' read -r qualified state; do
     rows=$(admin -d "$LOCAL_DB" -tAc "SELECT count(*) FROM $qualified" 2>/dev/null | tr -d '[:space:]')
     printf '    table %s: %s (%s rows)\n' "$qualified" "$state" "${rows:-?}"
 done
+
+# --- Schema-drift self-healer ----------------------------------------------
+# Give the postgres user (which the healer runs as) the upstream entry in its
+# own ~/.pgpass — the healer reads the publisher's catalog as postgres. Append
+# only if absent; password goes via stdin, never argv.
+PG_PGPASS=$(pg_sh 'printf %s "$HOME/.pgpass"' 2>/dev/null || true)
+pat="^$REMOTE_HOST:[*]:$REMOTE_DB:$REMOTE_USER:"
+have=$(pg_sh "grep -c '$pat' \"\$HOME/.pgpass\" 2>/dev/null" 2>/dev/null || true)
+case "${have:-0}" in
+    ''|0)
+        printf '%s:*:%s:%s:%s\n' "$REMOTE_HOST" "$REMOTE_DB" "$REMOTE_USER" "$REMOTE_PW" \
+          | pg_sh 'umask 077; f="$HOME/.pgpass"; touch "$f"; cat >> "$f"; chmod 600 "$f"' \
+          && log "Added upstream entry to postgres ~/.pgpass (for replica-heal.sh)" \
+          || log "warning: could not write postgres ~/.pgpass — add the upstream entry manually for the healer" ;;
+esac
+
+# Schedule the healer (systemd timer on Linux, postgres cron in a FreeBSD jail).
+# Best-effort: a failure here doesn't fail replica setup.
+log "Installing schema-drift self-heal schedule"
+REMOTE_HOST="$REMOTE_HOST" REMOTE_USER="$REMOTE_USER" REMOTE_DB="$REMOTE_DB" \
+LOCAL_DB="$LOCAL_DB" PUBLICATION="$PUBLICATION" SUBSCRIPTION="$SUBSCRIPTION" \
+PGPASSFILE="${PG_PGPASS:-$PGPASS}" \
+    "$SCRIPT_DIR/install-heal.sh" \
+    || log "warning: self-heal schedule not installed — run scripts/replica/install-heal.sh manually"
 
 log "Done. Re-run anytime — this script is idempotent."
 # psql's built-in \watch works on FreeBSD and Linux alike; GNU watch(1) does

@@ -73,10 +73,21 @@ else
 fi
 if [ -z "$ESCALATE" ]; then
     admin() { psql -U postgres "$@"; }
+    pg_sh() { sh -c "$1"; }
 else
     # shellcheck disable=SC2086
     admin() { $ESCALATE psql "$@"; }
+    # shellcheck disable=SC2086
+    pg_sh() { $ESCALATE sh -c "$1"; }
 fi
+
+# Suppress the schema-drift self-healer for the rebuild — it must not try to
+# re-enable the subscription while we deliberately drop, truncate, and re-copy.
+# (setup.sh, invoked at step 3, manages the same flag on its own exit.)
+HEAL_DIR=$(pg_sh 'printf %s "${HEAL_STATE_DIR:-$HOME/.hopper-replica-heal}"' 2>/dev/null || true)
+maint_off() { [ -n "${HEAL_DIR:-}" ] && pg_sh "rm -f '$HEAL_DIR/maintenance'" 2>/dev/null || true; }
+[ -n "${HEAL_DIR:-}" ] && pg_sh "mkdir -p '$HEAL_DIR' && : > '$HEAL_DIR/maintenance'" 2>/dev/null || true
+trap maint_off EXIT
 
 # --- 1. Drop the wedged subscription locally -------------------------------
 # slot_name = NONE dissociates from the (likely invalidated) remote slot so
