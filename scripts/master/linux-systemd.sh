@@ -9,7 +9,7 @@
 # restarted when the binary or unit file actually changed on disk.
 #
 # Variables (env):
-#   DATA_DIR  sample directory (read-only to hopper)
+#   DATA_DIR  sample directory (read-only to hopper except unknown/uploads)
 #                                    (default: /data/samples)
 #   DB        postgres DSN (password resolved from the installed .pgpass)
 #                                    (default: postgres://hopper@hopper-db/hopper?sslmode=disable)
@@ -20,6 +20,7 @@
 set -euo pipefail
 
 DATA_DIR="${DATA_DIR:-/data/samples}"
+UPLOAD_DIR="${DATA_DIR}/unknown/uploads"
 DB="${DB:-postgres://hopper@hopper-db/hopper?sslmode=disable}"
 SOURCE="${SOURCE:-forager}"
 DASH_ADDR="${DASH_ADDR:-0.0.0.0:8081}"
@@ -102,6 +103,8 @@ fi
 
 sudo install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
     "${STATE_HOME}" "${CACHE_HOME}" "${CONFIG_DIR}" "${TOOLS_DIR}"
+sudo install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${UPLOAD_DIR}"
+sudo install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${UPLOAD_DIR}/.tmp"
 
 # --- Binary ------------------------------------------------------------------
 
@@ -208,10 +211,11 @@ TasksMax=8192
 # bring down the whole ingester.
 OOMPolicy=continue
 
-# Filesystem isolation. DATA_DIR is read-only; hopper never mutates samples.
+# Filesystem isolation. DATA_DIR is read-only except interactive uploads.
 ProtectSystem=strict
 ProtectHome=true
 ReadOnlyPaths=${DATA_DIR}
+ReadWritePaths=${UPLOAD_DIR}
 PrivateTmp=true
 PrivateDevices=true
 PrivateMounts=true

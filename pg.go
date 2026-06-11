@@ -389,13 +389,26 @@ func pgRuntimeMigrations() []string { //nolint:revive // long sequential migrati
 			END IF;
 		END$$`,
 
-		// Trigger that derives file_type / score / formula from the cleave
-		// result on every write, reading the v7 'files' key first and falling
-		// back to the legacy 'fs' key for cached rows. BEFORE INSERT covers
-		// the bulk COPY path used for archive members; UPDATE OF cleave_result
-		// covers analysis stores without firing on unrelated column updates.
+		// Trigger that derives every cleave-sourced column (file_type, score,
+		// formula, elements, max_crit, suspicious_count) from the cleave result
+		// on every write, reading the v7 'files' key first and falling back to
+		// the legacy 'fs' key for cached rows. BEFORE INSERT covers the bulk
+		// archive-member insert path (which otherwise never set elements/
+		// max_crit/suspicious_count, leaving every member permanently in the
+		// backfill-pending set); UPDATE OF cleave_result covers analysis stores
+		// without firing on unrelated column updates. Deriving here is cheaper
+		// than backfilling: NEW.cleave_result is already in memory, so there is
+		// no TOAST re-read. The expressions mirror backfillPG's Pass 1/1b so a
+		// row written by the trigger never re-enters either backfill gate.
+		//
+		// Changing only this function body (not the trigger definition below)
+		// keeps redeploys lock-free: CREATE OR REPLACE FUNCTION locks pg_proc,
+		// not samples, so it can't be blocked by a long reader.
 		`CREATE OR REPLACE FUNCTION samples_derive_cleave_cols() RETURNS trigger
 		LANGUAGE plpgsql AS $$
+		DECLARE
+			finds jsonb := COALESCE(NEW.cleave_result->'files'->0->'find',
+									NEW.cleave_result->'fs'->0->'ts', '[]'::jsonb);
 		BEGIN
 			NEW.file_type := COALESCE(NEW.cleave_result->'files'->0->>'type',
 									   NEW.cleave_result->'fs'->0->>'type', '');
@@ -403,6 +416,16 @@ func pgRuntimeMigrations() []string { //nolint:revive // long sequential migrati
 								   (NEW.cleave_result->'fs'->0->>'x')::int, 0);
 			NEW.formula := COALESCE(NEW.cleave_result->'files'->0->>'mol',
 									NEW.cleave_result->'fs'->0->>'f', '');
+			NEW.elements := translate(NEW.formula, '₀₁₂₃₄₅₆₇₈₉', '');
+			NEW.max_crit := COALESCE((
+				SELECT MAX((COALESCE(t->>'crit', t->>'l'))::int)
+				FROM jsonb_array_elements(finds) AS t
+				WHERE COALESCE(t->>'crit', t->>'l') IS NOT NULL), 0);
+			NEW.suspicious_count := (
+				SELECT COUNT(*)::int
+				FROM jsonb_array_elements(finds) AS t
+				WHERE COALESCE(t->>'crit', t->>'l') IS NOT NULL
+					AND (COALESCE(t->>'crit', t->>'l'))::int >= 4);
 			RETURN NEW;
 		END;
 		$$`,
@@ -2101,31 +2124,60 @@ func (db *DB) backfillPendingPG(ctx context.Context) (BackfillPending, error) {
 func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 	var stats BackfillStats
 
-	// Candidate rows: have cleave_result but elements wasn't derived yet AND
-	// the JSON would actually produce a non-empty elements value. The third
-	// clause excludes "stuck" rows where cleave_result lacks a files[0].mol field —
-	// without it, those rows match the gate, get UPDATEd to elements='' (no-op),
-	// and re-match next batch, inflating RowsAffected and risking an infinite
-	// loop on databases with >= backfillBatch such rows.
-	if err := db.pool.QueryRow(ctx, `
-		SELECT count(*) FROM samples WHERE `+pgCleaveBackfillWhere).Scan(&stats.Scanned); err != nil {
-		return stats, fmt.Errorf("hopper: backfill count: %w", err)
-	}
-	// Surface the total to any progress observer before the first batch runs,
-	// so the dashboard shows "0 / N" immediately instead of waiting ~10s for
-	// the first 50K-row UPDATE to complete.
-	db.reportBackfill(0, stats.Scanned)
+	const backfillBatch = 50000
 
-	// Pass 1: elements / max_crit / suspicious_count from cleave_result,
-	// in batches. file_type / score / formula are handled by Pass 1b below;
-	// litmus_score is generated and never drifts.
+	// Pass 1b runs first because it is small and index-backed: heal file_type /
+	// score / formula for rows stored under the v7 'files' key while those
+	// columns were still generated from the legacy 'fs' key (every such row has
+	// file_type=''). The pgFileTypeBackfillWhere gate is served by
+	// idx_samples_filetype_pending and self-drains — a row leaves it the moment
+	// file_type becomes non-empty — so this finishes fast and is never held
+	// behind the much larger elements pass below. The derive trigger fixes
+	// writes from here on; this drains the pre-trigger rows using the same
+	// dual-key expressions. Does not bump updated_at — healing a derived column
+	// is not a real change and must not reshuffle queues ordered by updated_at.
+	for {
+		ftTag, err := db.pool.Exec(ctx, `
+			UPDATE samples SET
+				file_type = COALESCE(cleave_result->'files'->0->>'type', cleave_result->'fs'->0->>'type', ''),
+				score = COALESCE((cleave_result->'files'->0->>'risk')::int, (cleave_result->'fs'->0->>'x')::int, 0),
+				formula = COALESCE(cleave_result->'files'->0->>'mol', cleave_result->'fs'->0->>'f', '')
+			WHERE sha256 IN (
+				SELECT sha256 FROM samples WHERE `+pgFileTypeBackfillWhere+`
+				LIMIT $1
+			)`, backfillBatch)
+		if err != nil {
+			return stats, fmt.Errorf("hopper: backfill file_type: %w", err)
+		}
+		n := ftTag.RowsAffected()
+		stats.Updated += n
+		db.reportBackfill(stats.Updated, stats.Scanned)
+		if n < backfillBatch {
+			break
+		}
+		slog.Info("backfill file_type batch", "batch", n, "total", stats.Updated)
+	}
+
+	// Pass 1: elements / max_crit / suspicious_count for rows whose cleave
+	// columns predate the derive trigger. Candidate rows have cleave_result but
+	// elements wasn't derived yet AND the JSON would actually produce a
+	// non-empty elements value. The third clause (in pgCleaveBackfillWhere)
+	// excludes "stuck" rows where cleave_result lacks a files[0].mol field —
+	// without it those rows match the gate, get UPDATEd to elements='' (no-op),
+	// and re-match next batch, risking an infinite loop. New writes get these
+	// columns from the derive trigger, so this backlog only shrinks: it is a
+	// one-time drain of rows written before the trigger existed.
 	//
 	// Implementation note: this inlines the JSON extraction on the target row
 	// rather than using UPDATE samples s ... FROM (SELECT ... JOIN batch). PG
 	// rejects that self-referential shape with "column … can only be updated
 	// to DEFAULT" (SQLSTATE 428C9) while samples still has any STORED GENERATED
 	// column (litmus_score), even when no generated column is in the SET list.
-	const backfillBatch = 50000
+	if err := db.pool.QueryRow(ctx, `
+		SELECT count(*) FROM samples WHERE `+pgCleaveBackfillWhere).Scan(&stats.Scanned); err != nil {
+		return stats, fmt.Errorf("hopper: backfill count: %w", err)
+	}
+	db.reportBackfill(stats.Updated, stats.Scanned)
 	for {
 		cleaveTag, err := db.pool.Exec(ctx, `
 			UPDATE samples SET
@@ -2162,37 +2214,6 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 			break
 		}
 		slog.Info("backfill cleave batch", "batch", n, "total", stats.Updated)
-	}
-
-	// Pass 1b: heal file_type / score / formula for rows stored under the v7
-	// 'files' key while those columns were still generated from the legacy
-	// 'fs' key (every such row has file_type=''). The derive trigger fixes
-	// writes from here on; this drains the rows written before it, using the
-	// same dual-key expressions the trigger uses. The pgFileTypeBackfillWhere
-	// gate is served by idx_samples_filetype_pending and self-drains: a row
-	// leaves it the moment file_type becomes non-empty. Does not bump
-	// updated_at — healing a derived column is not a real change and must not
-	// reshuffle queues ordered by updated_at.
-	for {
-		ftTag, err := db.pool.Exec(ctx, `
-			UPDATE samples SET
-				file_type = COALESCE(cleave_result->'files'->0->>'type', cleave_result->'fs'->0->>'type', ''),
-				score = COALESCE((cleave_result->'files'->0->>'risk')::int, (cleave_result->'fs'->0->>'x')::int, 0),
-				formula = COALESCE(cleave_result->'files'->0->>'mol', cleave_result->'fs'->0->>'f', '')
-			WHERE sha256 IN (
-				SELECT sha256 FROM samples WHERE `+pgFileTypeBackfillWhere+`
-				LIMIT $1
-			)`, backfillBatch)
-		if err != nil {
-			return stats, fmt.Errorf("hopper: backfill file_type: %w", err)
-		}
-		n := ftTag.RowsAffected()
-		stats.Updated += n
-		db.reportBackfill(stats.Updated, stats.Scanned)
-		if n < backfillBatch {
-			break
-		}
-		slog.Info("backfill file_type batch", "batch", n, "total", stats.Updated)
 	}
 
 	n, err := db.backfillArchiveMemberLitmusPG(ctx)
