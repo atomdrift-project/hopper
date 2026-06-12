@@ -328,39 +328,41 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 
 		// Derived analysis columns.
 		//
-		// litmus_score stays a GENERATED STORED column: its source key (prob)
-		// did not move in v7, so its expression never drifted and it can be
-		// recomputed cheaply by the one-time ADD COLUMN below.
+		// EVERY derived column here — litmus_score, file_type, score, formula —
+		// is a PLAIN column kept current by a BEFORE INSERT/UPDATE trigger, never
+		// a STORED GENERATED column. This is deliberate and load-bearing: adding
+		// (or re-adding) a STORED generated column rewrites every row of samples
+		// (~350GB) under an ACCESS EXCLUSIVE lock, freezing every reader and
+		// writer — workers, the dashboard, even a plain SELECT — until it
+		// finishes. See isTableRewriteDDL for the rule and the cheap alternatives.
 		//
-		// file_type / score / formula were ALSO generated, but their
-		// expression was pinned to the pre-v7 'fs' envelope key. v7 renamed
-		// that key to 'files', so every record stored in the new format
-		// generated '' / 0. The expression can't be corrected in place
-		// without an ACCESS EXCLUSIVE rewrite of samples (~350GB) — generated
-		// STORED columns recompute every row on ALTER. So instead we convert
-		// them to plain columns (ALTER COLUMN … DROP EXPRESSION is
-		// metadata-only: no rewrite, existing values retained) and derive
-		// them with a BEFORE INSERT/UPDATE trigger that reads both the v7
-		// 'files' key and the legacy 'fs' key (see samples_derive_cleave_cols
-		// below). Derivation stays DB-side and drift-proof — mirroring the
-		// SQLite backend's generated columns — without the rewrite. Existing
-		// 'files'-format rows (file_type = '') are healed by the bounded
-		// empties backfill in backfillPG.
+		// litmus_score: its source key (prob) never moved, so wherever the column
+		// is already populated its values are correct. If a prior build left it as
+		// a STORED generated column, convert it back in place — ALTER COLUMN …
+		// DROP EXPRESSION is metadata-only (no rewrite, existing values retained).
+		// The samples_derive_litmus_score trigger below maintains it from here on,
+		// and backfillPG fills any rows still sitting at the DEFAULT 0. The base
+		// schema already added the plain column, so there is nothing to ADD.
+		//
+		// file_type / score / formula were ALSO generated, but their expression
+		// was pinned to the pre-v7 'fs' envelope key. v7 renamed that key to
+		// 'files', so every record stored in the new format generated '' / 0. Same
+		// fix: DROP EXPRESSION to a plain column, then derive via the
+		// samples_derive_cleave_cols trigger (which reads both the v7 'files' key
+		// and the legacy 'fs' key). Existing 'files'-format rows (file_type = '')
+		// are healed by the bounded empties backfill in backfillPG.
 		//
 		// Guard: attgenerated='s' means "stored generated". Each branch is a
-		// no-op once the column is already in its target state.
+		// no-op once the column is already plain (its target state).
 		`DO $$
 		BEGIN
-			IF NOT EXISTS (
+			IF EXISTS (
 				SELECT 1 FROM pg_attribute
 				 WHERE attrelid = 'samples'::regclass AND attname = 'litmus_score'
 				   AND attgenerated = 's'
 			) THEN
-				ALTER TABLE samples DROP COLUMN IF EXISTS litmus_score;
-				ALTER TABLE samples ADD COLUMN litmus_score DOUBLE PRECISION
-					GENERATED ALWAYS AS
-						(COALESCE((litmus_result->>'prob')::double precision, 0))
-					STORED;
+				ALTER TABLE samples ALTER COLUMN litmus_score DROP EXPRESSION;
+				ALTER TABLE samples ALTER COLUMN litmus_score SET DEFAULT 0;
 			END IF;
 
 			IF EXISTS (
@@ -434,6 +436,27 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE OR REPLACE TRIGGER samples_derive_cleave_cols_trg
 			BEFORE INSERT OR UPDATE OF cleave_result ON samples
 			FOR EACH ROW EXECUTE FUNCTION samples_derive_cleave_cols()`,
+
+		// Derives litmus_score from litmus_result->>'prob' on every write, so the
+		// column can be a plain column rather than a STORED generated one — which
+		// would force a full-table ACCESS EXCLUSIVE rewrite to (re)create (see the
+		// DO block above and isTableRewriteDDL). Narrow firing (UPDATE OF
+		// litmus_result) keeps result stores cheap and covers the
+		// litmus_result := NULL reset in updateCleaveResultPG: COALESCE(NULL,0)=0,
+		// matching the old generated column's reset semantics. BEFORE INSERT covers
+		// the archive-member insert path. As with samples_derive_cleave_cols,
+		// CREATE OR REPLACE FUNCTION locks pg_proc, not samples, so redeploys that
+		// change only the body stay lock-free.
+		`CREATE OR REPLACE FUNCTION samples_derive_litmus_score() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			NEW.litmus_score := COALESCE((NEW.litmus_result->>'prob')::double precision, 0);
+			RETURN NEW;
+		END;
+		$$`,
+		`CREATE OR REPLACE TRIGGER samples_derive_litmus_score_trg
+			BEFORE INSERT OR UPDATE OF litmus_result ON samples
+			FOR EACH ROW EXECUTE FUNCTION samples_derive_litmus_score()`,
 
 		// Indexes on the derived columns (no-op after first creation). These
 		// are not cascaded away by DROP EXPRESSION (the columns persist), but
@@ -643,18 +666,34 @@ func (db *DB) execPGMigrationDDL(ctx context.Context, ddl string, allowRewrite b
 	}
 
 	// This statement is genuinely about to execute (not applied, not already
-	// satisfied). Refuse the serving path the chance to rewrite a populated
-	// samples table: the ACCESS EXCLUSIVE lock would strand every worker for the
-	// length of the rewrite. The operator must run it via `hopper migrate` in a
-	// maintenance window. An empty table rewrites instantly, so it is allowed.
-	if !allowRewrite && isTableRewriteDDL(ddl) {
+	// satisfied). A table-rewriting migration takes ACCESS EXCLUSIVE on samples
+	// for the length of the rewrite, locking out every reader and writer (see
+	// isTableRewriteDDL). An empty table rewrites instantly, so that is always
+	// allowed; on a populated table we refuse unless the operator has explicitly
+	// arranged a maintenance window:
+	//   - serving path (load/serve, allowRewrite=false): never rewrites — defer
+	//     to an explicit `hopper init`.
+	//   - init/import (allowRewrite=true): refuse unless HOPPER_FORCE_REWRITE=1,
+	//     so a stray `hopper init`/`import` pointed at a live database (the
+	//     incident that froze the primary for 44 minutes) errors up front instead
+	//     of locking everyone out. The operator stops the workers, sets the flag,
+	//     and runs it in a window.
+	if isTableRewriteDDL(ddl) {
 		nonEmpty, err := db.pgSamplesNonEmpty(ctx)
 		if err != nil {
 			return err
 		}
-		if nonEmpty {
+		// A populated table is the only dangerous case; an empty one rewrites
+		// instantly. The serving path never rewrites a populated table; the
+		// init/import/migrate path may, but only with an explicit opt-in.
+		if nonEmpty && !allowRewrite {
 			return fmt.Errorf("hopper: refusing table-rewriting migration %s on a populated samples table while serving; "+
-				"run `hopper migrate` in a maintenance window first", id)
+				"run `hopper init` in a maintenance window first", id)
+		}
+		if nonEmpty && allowRewrite && os.Getenv("HOPPER_FORCE_REWRITE") != "1" {
+			return fmt.Errorf("hopper: refusing table-rewriting migration %s on a populated samples table: "+
+				"it would hold ACCESS EXCLUSIVE and lock out every reader and writer (workers, dashboard, even plain SELECTs) "+
+				"for the length of the rewrite. Stop the workers/server and re-run with HOPPER_FORCE_REWRITE=1 in a maintenance window", id)
 		}
 	}
 
@@ -717,12 +756,11 @@ func (db *DB) recordPGMigration(ctx context.Context, id, ddl string) error {
 }
 
 func (db *DB) pgMigrationAlreadySatisfied(ctx context.Context, ddl string) (bool, error) {
-	// The cleave-derived-column conversion is a DO block whose body can take an
-	// ACCESS EXCLUSIVE lock and rewrite the whole (~350GB) samples table when it
-	// (re)creates litmus_score as a STORED generated column. The migration ledger
-	// keys on a hash of the DDL text, so an unrelated edit to this block's
-	// comments changes its hash, the "already applied" lookup misses, and the
-	// rewrite re-fires against a live database. Gate it on the catalog instead:
+	// The cleave-derived-column conversion is a DO block of metadata-only ALTERs
+	// (DROP EXPRESSION / SET DEFAULT). The migration ledger keys on a hash of the
+	// DDL text, so an unrelated edit to this block's comments changes its hash and
+	// the "already applied" lookup misses — re-running the block needlessly takes a
+	// brief ACCESS EXCLUSIVE lock on a live table. Gate it on the catalog instead:
 	// when samples is already in the converted end-state every branch of the
 	// block is a guaranteed no-op, so record it satisfied without executing it.
 	if isCleaveDeriveColumnsDDL(ddl) {
@@ -736,14 +774,56 @@ func (db *DB) pgMigrationAlreadySatisfied(ctx context.Context, ddl string) (bool
 	}
 }
 
-// isTableRewriteDDL reports whether ddl can rewrite the whole samples table
-// under an ACCESS EXCLUSIVE lock. Today the only such statement is the
-// cleave-derive conversion block, whose litmus_score branch recreates a STORED
-// generated column — a full rewrite on a ~350GB table. The serving path refuses
-// it on a populated table (see execPGMigrationDDL) so a rewrite can never freeze
-// live traffic, regardless of which binary version ran the migration.
+// isTableRewriteDDL reports whether a migration statement would rewrite the
+// whole samples table under an ACCESS EXCLUSIVE lock — the single most
+// dangerous thing a migration can do to this database.
+//
+// ⚠️  LOCKOUT HAZARD — READ THIS BEFORE ADDING A MIGRATION  ⚠️
+//
+// A statement that rewrites samples holds ACCESS EXCLUSIVE for the ENTIRE
+// rewrite — minutes to hours on a ~350GB table. For that whole window every
+// reader and writer blocks: workers storing results, the dashboard, and even a
+// plain SELECT (a bare read normally never waits on row locks, but it cannot get
+// its ACCESS SHARE lock while a rewrite holds ACCESS EXCLUSIVE). They then fail
+// with lock_timeout (SQLSTATE 55P03). One such statement — a STORED generated
+// column re-created by `hopper init` against the live primary — froze all
+// ingestion for 44 minutes. Do not add another.
+//
+// Operations that FORCE a full rewrite of samples (never do these here):
+//   - ADD COLUMN ... GENERATED ALWAYS AS (...) STORED  — computes every row
+//   - ALTER COLUMN ... TYPE / SET DATA TYPE            — re-encodes every row
+//   - ADD COLUMN ... DEFAULT <volatile expr>           — evaluated per row
+//
+// Cheap, rewrite-FREE alternatives — always prefer these:
+//   - A PLAIN column kept current by a BEFORE INSERT/UPDATE trigger (see
+//     samples_derive_cleave_cols and samples_derive_litmus_score), plus a
+//     batched online backfill in backfillPG for historical rows (row locks
+//     only — never blocks readers, yields to writers). This is how EVERY
+//     derived column here is maintained; never a STORED generated column.
+//   - ADD COLUMN with a constant default (PG11+ records it in the catalog: a
+//     fast metadata change, not a rewrite).
+//   - ALTER COLUMN ... DROP EXPRESSION (metadata-only; retains existing values).
+//
+// Anything this returns true for is refused on a populated samples table while
+// other client backends are connected — on the serving path always, and on the
+// init/import/migrate path unless HOPPER_FORCE_REWRITE=1 (run it in a real
+// maintenance window with workers stopped). See execPGMigrationDDL. Keep this
+// conservative but correct: a false negative re-opens the lockout.
 func isTableRewriteDDL(ddl string) bool {
-	return isCleaveDeriveColumnsDDL(ddl)
+	u := strings.ToUpper(ddl)
+	if !strings.Contains(u, "SAMPLES") {
+		return false
+	}
+	// (Re)creating a STORED generated column recomputes and rewrites every row.
+	if strings.Contains(u, "GENERATED ALWAYS AS") && strings.Contains(u, "STORED") {
+		return true
+	}
+	// A column type change re-encodes every row.
+	if strings.Contains(u, "ALTER COLUMN") &&
+		(strings.Contains(u, " TYPE ") || strings.Contains(u, "SET DATA TYPE")) {
+		return true
+	}
+	return false
 }
 
 // pgSamplesNonEmpty reports whether the samples table holds at least one row.
@@ -759,22 +839,24 @@ func (db *DB) pgSamplesNonEmpty(ctx context.Context) (bool, error) {
 }
 
 // isCleaveDeriveColumnsDDL identifies the one-time DO block that converts the
-// cleave-derived columns to their trigger-fed shape. Matched on stable column
-// references rather than exact text so a comment edit can never slip an
-// unguarded table rewrite past pgMigrationAlreadySatisfied.
+// cleave-derived columns (litmus_score, file_type, score, formula) to their
+// plain, trigger-fed shape. Matched on stable column references rather than
+// exact text so a comment edit can never slip the block past
+// pgMigrationAlreadySatisfied. The block touches litmus_score and is the only
+// migration that issues DROP EXPRESSION, so those two markers identify it
+// uniquely.
 func isCleaveDeriveColumnsDDL(ddl string) bool {
-	return strings.Contains(ddl, "ADD COLUMN litmus_score") &&
+	return strings.Contains(ddl, "litmus_score") &&
 		strings.Contains(ddl, "DROP EXPRESSION")
 }
 
 // pgCleaveDeriveColumnsConverted reports whether samples is already in the
-// end-state the cleave-derive DO block produces: litmus_score is the STORED
-// generated column and file_type/score/formula are plain columns fed by the
-// samples_derive_cleave_cols trigger. In that state every branch of the block is
-// a no-op, so skipping it is equivalent to running it — and crucially avoids the
-// full-table rewrite the litmus_score branch performs when it has to (re)create
-// that column. Returns false (run the block) on a database that predates the
-// columns, where the conversion is genuinely still needed.
+// end-state the cleave-derive DO block produces: litmus_score, file_type, score
+// and formula are ALL plain columns (fed by the samples_derive_litmus_score and
+// samples_derive_cleave_cols triggers), none STORED-generated. In that state
+// every branch of the block is a no-op, so skipping it is equivalent to running
+// it. Returns false (run the block) on a database where any column is still
+// generated, where the conversion is genuinely still needed.
 func (db *DB) pgCleaveDeriveColumnsConverted(ctx context.Context) (bool, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT attname, attgenerated::text FROM pg_attribute
@@ -796,10 +878,10 @@ func (db *DB) pgCleaveDeriveColumnsConverted(ctx context.Context) (bool, error) 
 	if err := rows.Err(); err != nil {
 		return false, err
 	}
-	// All four columns must already exist, with litmus_score STORED-generated
-	// ('s') and the rest plain (anything but 's'); only then is the block inert.
+	// All four columns must already exist and be plain (attgenerated anything
+	// but 's'); only then is the block inert.
 	return len(gen) == 4 &&
-		gen["litmus_score"] == "s" &&
+		gen["litmus_score"] != "s" &&
 		gen["file_type"] != "s" &&
 		gen["score"] != "s" &&
 		gen["formula"] != "s", nil
@@ -1097,8 +1179,9 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
 	// cleave_result and litmus_result are the only analysis fields the
 	// writer sets — file_type, score, formula are derived DB-side by the
-	// samples_derive_cleave_cols trigger and litmus_score is GENERATED, so
-	// the writer never sets them. ON CONFLICT leaves existing analysis alone
+	// samples_derive_cleave_cols trigger and litmus_score by the
+	// samples_derive_litmus_score trigger, so the writer never sets them. ON
+	// CONFLICT leaves existing analysis alone
 	// so a walker-comes-after-Explode case doesn't wipe real results.
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename,
@@ -1169,9 +1252,9 @@ const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 ) ON COMMIT DROP`
 
 // file_type, score, formula are derived DB-side by the
-// samples_derive_cleave_cols trigger and litmus_score is GENERATED, all from
-// cleave_result / litmus_result. We don't reference them here — the trigger
-// and generation expression own them.
+// samples_derive_cleave_cols trigger and litmus_score by the
+// samples_derive_litmus_score trigger, all from cleave_result / litmus_result.
+// We don't reference them here — the triggers own them.
 // ON CONFLICT leaves existing analysis alone: a walker row arriving
 // after Explode must not wipe results we already stored.
 // sampleConflictUpdatePG is the shared ON CONFLICT clause for top-level
@@ -1530,8 +1613,9 @@ func (db *DB) updateCleaveResultPG(
 ) error {
 	// file_type, score, formula are re-derived from the new cleave_result by
 	// the samples_derive_cleave_cols trigger (UPDATE OF cleave_result fires
-	// it); litmus_score is GENERATED, so setting litmus_result = NULL resets
-	// it to 0 via the COALESCE in its generation expression. None are SET here.
+	// it); litmus_score by the samples_derive_litmus_score trigger (UPDATE OF
+	// litmus_result fires it), so setting litmus_result = NULL resets it to 0
+	// via the trigger's COALESCE. None are SET here.
 	// forced_rescan_at clears here so the row drops out of the Tier 0
 	// queue once a worker has actually produced fresh analysis; without
 	// this the partial index would carry stale entries.
@@ -1882,7 +1966,8 @@ func (db *DB) relativizePathsPG(ctx context.Context, prefix string) (int64, erro
 func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result []byte, canonical string, fi cleaveFileInfo) error {
 	// file_type, score, formula are re-derived by the
 	// samples_derive_cleave_cols trigger (UPDATE OF cleave_result fires it);
-	// litmus_score is GENERATED, so setting litmus_result = NULL resets it to 0.
+	// litmus_score by the samples_derive_litmus_score trigger (UPDATE OF
+	// litmus_result fires it), so setting litmus_result = NULL resets it to 0.
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET status = $2, cleave_result = $3,
 			canonical_sha256 = $4, elements = $5,
@@ -2217,8 +2302,9 @@ func (db *DB) backfillPendingPG(ctx context.Context) (BackfillPending, error) {
 // file_type / score / formula are derived DB-side by the
 // samples_derive_cleave_cols trigger going forward, but rows written while
 // those columns were generated from the pre-v7 'fs' key need a one-time heal
-// (Pass 1b). litmus_score remains GENERATED from litmus_result->>'prob', whose
-// key did not move in v7, so it can't drift and needs no backfill.
+// (Pass 1b). litmus_score is derived by the samples_derive_litmus_score trigger
+// from litmus_result->>'prob'; rows analyzed before that trigger existed are
+// healed by Pass 1c.
 func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 	var stats BackfillStats
 
@@ -2256,6 +2342,38 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 		slog.Info("backfill file_type batch", "batch", n, "total", stats.Updated)
 	}
 
+	// Pass 1c: litmus_score for rows analyzed before it became a trigger-fed
+	// column — or while it was a STORED generated column that was later converted
+	// in place by DROP EXPRESSION (which retains values but leaves never-populated
+	// rows at the DEFAULT 0). Gate: a row whose litmus_result carries a non-zero
+	// 'prob' while litmus_score is still 0. The third clause keeps the gate
+	// self-draining and loop-safe — a row whose prob is genuinely 0/absent never
+	// matches, so it can't be UPDATEd to 0 and re-match forever. The
+	// samples_derive_litmus_score trigger fixes writes from here on; this drains
+	// the pre-trigger backlog. Like Pass 1b it does not bump updated_at — healing a
+	// derived column is not a real change and must not reshuffle updated_at queues.
+	for {
+		lsTag, err := db.pool.Exec(ctx, `
+			UPDATE samples SET
+				litmus_score = COALESCE((litmus_result->>'prob')::double precision, 0)
+			WHERE sha256 IN (
+				SELECT sha256 FROM samples
+				WHERE litmus_result IS NOT NULL AND litmus_score = 0
+				  AND COALESCE((litmus_result->>'prob')::double precision, 0) <> 0
+				LIMIT $1
+			)`, backfillBatch)
+		if err != nil {
+			return stats, fmt.Errorf("hopper: backfill litmus_score: %w", err)
+		}
+		n := lsTag.RowsAffected()
+		stats.Updated += n
+		db.reportBackfill(stats.Updated, stats.Scanned)
+		if n < backfillBatch {
+			break
+		}
+		slog.Info("backfill litmus_score batch", "batch", n, "total", stats.Updated)
+	}
+
 	// Pass 1: elements / max_crit / suspicious_count for rows whose cleave
 	// columns predate the derive trigger. Candidate rows have cleave_result but
 	// elements wasn't derived yet AND the JSON would actually produce a
@@ -2267,10 +2385,12 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 	// one-time drain of rows written before the trigger existed.
 	//
 	// Implementation note: this inlines the JSON extraction on the target row
-	// rather than using UPDATE samples s ... FROM (SELECT ... JOIN batch). PG
-	// rejects that self-referential shape with "column … can only be updated
-	// to DEFAULT" (SQLSTATE 428C9) while samples still has any STORED GENERATED
-	// column (litmus_score), even when no generated column is in the SET list.
+	// rather than using UPDATE samples s ... FROM (SELECT ... JOIN batch). PG used
+	// to reject that self-referential shape with "column … can only be updated to
+	// DEFAULT" (SQLSTATE 428C9) while samples carried a STORED GENERATED column
+	// (litmus_score); that column is now plain (trigger-fed), so the restriction no
+	// longer applies — but the inline form is retained: it is correct and avoids a
+	// needless self-join.
 	if err := db.pool.QueryRow(ctx, `
 		SELECT count(*) FROM samples WHERE `+pgCleaveBackfillWhere).Scan(&stats.Scanned); err != nil {
 		return stats, fmt.Errorf("hopper: backfill count: %w", err)

@@ -119,6 +119,21 @@ else
     fi
 fi
 
+# --- Guard: never run replica setup against the primary --------------------
+# A replica is a SUBSCRIBER; the publisher (primary) is the only cluster that
+# hosts the publication. If this local cluster already has it, we are ON the
+# primary — and proceeding would run 'hopper init' (schema migrations) against
+# the live database every replica streams from. Refuse before any change. A
+# fresh replica has no such database/publication yet, so this is a no-op there.
+guard_db=$(admin -tAc "SELECT 1 FROM pg_database WHERE datname = '$LOCAL_DB'" | tr -d '[:space:]')
+if [ "$guard_db" = "1" ]; then
+    guard_pub=$(admin -d "$LOCAL_DB" -tAc \
+        "SELECT 1 FROM pg_publication WHERE pubname = '$PUBLICATION'" | tr -d '[:space:]')
+    [ "$guard_pub" = "1" ] && die "local database '$LOCAL_DB' hosts publication '$PUBLICATION' — this cluster is the PRIMARY/publisher, not a replica.
+       Refusing replica setup against the primary (it would migrate the live publisher's schema).
+       Run this on an actual replica, or correct REMOTE_HOST/LOCAL_DB."
+fi
+
 # --- Logical replication must be enabled on the local cluster -------------
 wal_level=$(admin -tAc 'SHOW wal_level' | tr -d '[:space:]')
 if [ "$wal_level" != "logical" ]; then

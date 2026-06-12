@@ -1,11 +1,16 @@
 #!/bin/sh
-# replica-heal.sh — keep a logical replica alive across *additive* schema drift.
+# replica-heal.sh — keep a logical replica alive across schema drift that breaks
+# apply but is safe to fix deterministically from the publisher's catalog.
 #
-# Logical replication does not replicate DDL. When the publisher gains a column
-# (ALTER TABLE ... ADD COLUMN) the subscriber's apply worker dies with
-# "missing replicated column" and — with disable_on_error=true — the
-# subscription disables itself. This script restores LIVENESS by adding any
-# published column the local table lacks, then re-enables the subscription.
+# Logical replication does not replicate DDL, so the subscriber's apply worker
+# dies (and, with disable_on_error=true, disables the subscription) when the
+# local schema cannot accept what the publisher sends. Two such cases are safe
+# and unambiguous to reconcile against the publisher's live catalog:
+#   1. a newly ADDed published column the local table lacks; or
+#   2. a column the publisher publishes PLAIN while it is still STORED-generated
+#      locally — you cannot write a replicated value into a generated column.
+# This script restores LIVENESS by reconciling exactly those two cases, then
+# re-enables the subscription.
 #
 # Design / scope (read before extending):
 #   * LIVENESS, not parity. The job is "every published column exists locally
@@ -13,9 +18,12 @@
 #     (indexes, constraints, NOT NULL backfills) remains 'hopper init's job at
 #     deploy time; this heal is the gap-filler between deploys. A column this
 #     script adds gets reconciled to canonical by the next 'make replica'.
-#   * ADDITIVE ONLY. It only ever ADDs missing columns. Drops, renames, and
-#     type changes are real migrations: it never guesses at them — it alerts
-#     and leaves the subscription disabled for a human + the next deploy.
+#   * BOUNDED, LOSSLESS HEALS ONLY — the two cases above, and nothing else.
+#     ADD COLUMN (nullable / non-volatile default) and ALTER COLUMN ... DROP
+#     EXPRESSION are both metadata-only fast operations that retain existing
+#     data and never rewrite the table. Real migrations — drops, renames, true
+#     type changes — are never guessed: it alerts and leaves the subscription
+#     disabled for a human + the next deploy.
 #   * VERSION-INDEPENDENT. It reads the publisher's live catalog as the source
 #     of truth (not a migration list), so it consumes any future column add —
 #     even ones newer than anything deployed here. No hopper binary required.
@@ -192,11 +200,29 @@ SQL
 )
 local_tables=$(printf '%s\n' "$local_cols" | cut -d'|' -f1 | sort -u)
 
+# Columns that are STORED-generated locally. A published column is always plain
+# on the publisher (a publication does not publish generated columns), so a
+# column the publisher publishes but that is generated here makes apply fail —
+# Postgres cannot write a replicated value into a generated column. The fix is
+# ALTER COLUMN ... DROP EXPRESSION: metadata-only, retains values, no rewrite.
+local_generated=$(admin -d "$LOCAL_DB" -tAF '|' <<'SQL'
+SELECT format('%I.%I', n.nspname, c.relname), a.attname
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  JOIN pg_attribute a ON a.attrelid = c.oid
+ WHERE c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped
+   AND a.attgenerated = 's'
+   AND n.nspname NOT IN ('pg_catalog', 'information_schema');
+SQL
+)
+
 # Compute missing columns (and missing whole tables, which we will NOT create).
-missing_ddl=""        # newline-separated ALTER statements to run
+missing_ddl=""        # newline-separated ADD COLUMN statements to run
 missing_names=""      # space-separated table.col for logging
 missing_table=""      # space-separated tables published but absent locally
 notnull_unenforced="" # space-separated table.col added nullable despite NOT NULL
+generated_ddl=""      # newline-separated DROP EXPRESSION statements to run
+generated_names=""    # space-separated table.col converted generated->plain
 oldIFS=$IFS
 IFS='
 '
@@ -209,10 +235,17 @@ for line in $published; do
         continue
     fi
     if ! printf '%s\n' "$local_cols" | grep -qxF "$qt|$col"; then
+        # Published column absent locally → ADD it (publisher-supplied DDL).
         missing_ddl="${missing_ddl}${ddl};
 "
         missing_names="$missing_names $qt.$col"
         [ "$flag" = "notnull_unenforced" ] && notnull_unenforced="$notnull_unenforced $qt.$col"
+    elif printf '%s\n' "$local_generated" | grep -qxF "$qt|$col"; then
+        # Present locally but STORED-generated while the publisher publishes it
+        # plain → DROP EXPRESSION so apply can write the replicated value.
+        generated_ddl="${generated_ddl}ALTER TABLE ${qt} ALTER COLUMN \"${col}\" DROP EXPRESSION;
+"
+        generated_names="$generated_names $qt.$col"
     fi
 done
 IFS=$oldIFS
@@ -225,8 +258,11 @@ if [ -n "$missing_table" ]; then
     exit 1
 fi
 
-if [ -z "$missing_ddl" ]; then
-    # No additive drift.
+heal_ddl="${missing_ddl}${generated_ddl}"
+heal_names="${missing_names}${generated_names}"
+
+if [ -z "$heal_ddl" ]; then
+    # No healable drift (no missing column, no generated-vs-published mismatch).
     if [ "$enabled" = "t" ]; then
         clear_alert
         log "ok: '$SUBSCRIPTION' enabled, schema in parity with publisher"
@@ -241,42 +277,46 @@ if [ -z "$missing_ddl" ]; then
     exit 1
 fi
 
-# Additive drift confirmed → heal.
-log "additive schema drift on '$SUBSCRIPTION': adding missing column(s):$missing_names"
+# Healable drift confirmed → heal.
+[ -n "$missing_names" ]   && log "additive drift on '$SUBSCRIPTION': adding missing column(s):$missing_names"
+[ -n "$generated_names" ] && log "generated/plain drift on '$SUBSCRIPTION': converting to plain (DROP EXPRESSION):$generated_names"
 
-# Disable during DDL so the apply worker's locks don't fight ADD COLUMN. (If it
-# was disabled by disable_on_error, this is a no-op.)
+# Disable during DDL so the apply worker's locks don't fight it. (If it was
+# disabled by disable_on_error, this is a no-op.)
 if [ "$enabled" = "t" ]; then
     log "disabling subscription for DDL"
     admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -c "ALTER SUBSCRIPTION $SUBSCRIPTION DISABLE;"
 fi
 
-# Apply the additive DDL with a bounded lock wait. ADD COLUMN (nullable, or with
-# a non-volatile default) is a metadata-only fast operation in PG11+.
-printf 'SET lock_timeout = %s;\n%s' "$HEAL_LOCK_TIMEOUT" "$missing_ddl" \
+# Apply the heal DDL with a bounded lock wait. ADD COLUMN (nullable / non-volatile
+# default) and ALTER COLUMN ... DROP EXPRESSION are both metadata-only fast ops.
+printf 'SET lock_timeout = %s;\n%s' "$HEAL_LOCK_TIMEOUT" "$heal_ddl" \
     | admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
-    || { alert warn "failed to apply additive DDL on '$LOCAL_DB' (lock contention or bad type?); subscription left DISABLED. DDL was:$missing_names"; exit 1; }
+    || { alert warn "failed to apply heal DDL on '$LOCAL_DB' (lock contention or bad type?); subscription left DISABLED. DDL targeted:$heal_names"; exit 1; }
 
-# Re-verify parity before re-enabling — never re-arm a crash loop.
-local_cols2=$(admin -d "$LOCAL_DB" -tAF '|' <<'SQL'
-SELECT format('%I.%I', n.nspname, c.relname), a.attname
+# Re-verify before re-enabling — never re-arm a crash loop. Every published
+# column must now exist locally AND be plain (attgenerated empty), so apply can
+# write its replicated value.
+local_state2=$(admin -d "$LOCAL_DB" -tAF '|' <<'SQL'
+SELECT format('%I.%I', n.nspname, c.relname), a.attname, a.attgenerated
   FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
   JOIN pg_attribute a ON a.attrelid = c.oid
  WHERE c.relkind='r' AND a.attnum>0 AND NOT a.attisdropped
    AND n.nspname NOT IN ('pg_catalog','information_schema');
 SQL
 )
-still_missing=""
+unhealed=""
 IFS='
 '
 for line in $published; do
     qt=${line%%|*}; rest=${line#*|}; col=${rest%%|*}
-    printf '%s\n' "$local_cols2" | grep -qxF "$qt|$col" || still_missing="$still_missing $qt.$col"
+    # A present-and-plain column prints as "qt|col|" (empty attgenerated field).
+    printf '%s\n' "$local_state2" | grep -qxF "$qt|$col|" || unhealed="$unhealed $qt.$col"
 done
 IFS=$oldIFS
 
-if [ -n "$still_missing" ]; then
-    alert warn "after heal, still missing:$still_missing — subscription '$SUBSCRIPTION' left DISABLED (could not reproduce these columns). Run 'make replica'."
+if [ -n "$unhealed" ]; then
+    alert warn "after heal, these published columns are still missing or generated locally:$unhealed — subscription '$SUBSCRIPTION' left DISABLED. Run 'make replica'."
     exit 1
 fi
 
@@ -288,5 +328,5 @@ if [ -n "$notnull_unenforced" ]; then
 else
     clear_alert
 fi
-alert info "healed additive drift on '$SUBSCRIPTION' — added:$missing_names; subscription re-enabled"
+alert info "healed drift on '$SUBSCRIPTION' — columns:$heal_names; subscription re-enabled"
 log "done"

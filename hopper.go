@@ -1090,7 +1090,7 @@ func (db *DB) MigrateServing(ctx context.Context) (func(context.Context) error, 
 		// allowRewrite is false: the serving path must never run a
 		// table-rewriting migration on a populated samples table, since the
 		// ACCESS EXCLUSIVE lock would freeze every reader and writer for the
-		// length of the rewrite. Such a migration is deferred to `hopper migrate`.
+		// length of the rewrite. Such a migration is deferred to `hopper init`.
 		return db.migrateServingPG(ctx, false)
 	}
 	if err := db.migrateSQLite(ctx); err != nil {

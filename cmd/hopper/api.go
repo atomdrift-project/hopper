@@ -770,8 +770,8 @@ func interleaveBySizeClass(cands []hopper.ClaimJob) []hopper.ClaimJob {
 		counts[sizeClass(cands[i].SizeBytes)]++
 	}
 	type keyedJob struct {
-		key uint64
 		job hopper.ClaimJob
+		key uint64
 	}
 	keyed := make([]keyedJob, len(cands))
 	var seen [3]uint64
