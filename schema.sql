@@ -23,6 +23,14 @@ CREATE TABLE IF NOT EXISTS samples (
 	cleave_result JSONB,
 	litmus_result JSONB,
 	litmus_score  DOUBLE PRECISION NOT NULL DEFAULT 0,
+	-- provenance is the collector's per-artifact sidecar (forager's Sidecar:
+	-- artifact bytes, fetch act, feed event, and authoritative registry
+	-- snapshot). Mirrors the on-disk <artifact>.forage.json so the catalog is
+	-- queryable without reading files. fetched_at is the artifact fetch time
+	-- (UTC), distinct from created_at (row-insert time, which diverges when the
+	-- hopper-load walk backfills a row long after capture).
+	provenance    JSONB,
+	fetched_at    TIMESTAMPTZ,
 	path  TEXT NOT NULL DEFAULT '',
 	status        TEXT NOT NULL DEFAULT '',
 	note          TEXT NOT NULL DEFAULT '',

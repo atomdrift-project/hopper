@@ -353,9 +353,11 @@ type Sample struct {
 	LastErrorAt     *time.Time
 	Mtime           *time.Time
 	MarkerMtime     *time.Time
-	CleaveResult    []byte  // raw cleave JSON, nil if unanalyzed
-	LitmusResult    []byte  // litmus classification envelope JSON, nil if unclassified
-	LitmusScore     float64 // litmus confidence score (0.0-1.0)
+	FetchedAt       *time.Time // when the collector fetched the artifact (UTC); distinct from CreatedAt
+	CleaveResult    []byte     // raw cleave JSON, nil if unanalyzed
+	LitmusResult    []byte     // litmus classification envelope JSON, nil if unclassified
+	Provenance      []byte     // collector provenance sidecar JSON, nil if none
+	LitmusScore     float64    // litmus confidence score (0.0-1.0)
 	ID              int64
 	SizeBytes       int64
 	Score           int // cleave raw score
@@ -1335,7 +1337,8 @@ func (e *PruneSafetyExceeded) Error() string {
 	}
 	return fmt.Sprintf(
 		"hopper: prune would remove %d of %d rows (%.1f%%) which exceeds %.0f%% safety cap",
-		e.Victims, e.Total, pct, e.MaxFraction*100)
+		e.Victims, e.Total, pct, e.MaxFraction*100,
+	)
 }
 
 // PruneMissingLocations removes sample_locations rows whose path no longer
@@ -1653,7 +1656,8 @@ func (db *DB) ReconcilePools(ctx context.Context, diskPath func(string) string) 
 		return stats, fmt.Errorf(
 			"hopper: reconcile: refusing to mark %d of %d standalone samples missing"+
 				" (>50%%); this likely indicates a misconfigured data directory",
-			len(stale), eligible)
+			len(stale), eligible,
+		)
 	}
 
 	// 3. Classify each stale standalone file: gone → missing, present → unsupported.

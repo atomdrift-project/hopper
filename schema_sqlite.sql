@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS samples (
 	litmus_score  REAL GENERATED ALWAYS AS
 	                   (COALESCE(json_extract(litmus_result, '$.prob'), 0))
 	                   STORED,
+	-- See schema.sql: collector provenance sidecar JSON + artifact fetch time.
+	provenance    TEXT,
+	fetched_at    TIMESTAMPTZ,
 	path  TEXT NOT NULL DEFAULT '',
 	status        TEXT NOT NULL DEFAULT '',
 	note          TEXT NOT NULL DEFAULT '',

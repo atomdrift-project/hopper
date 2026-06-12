@@ -256,6 +256,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		{"domain", `ALTER TABLE samples ADD COLUMN domain TEXT NOT NULL DEFAULT ''`},
 		{"package", `ALTER TABLE samples ADD COLUMN package TEXT NOT NULL DEFAULT ''`},
 		{"version", `ALTER TABLE samples ADD COLUMN version TEXT NOT NULL DEFAULT ''`},
+		{"provenance", `ALTER TABLE samples ADD COLUMN provenance TEXT`},
+		{"fetched_at", `ALTER TABLE samples ADD COLUMN fetched_at DATETIME`},
 	} {
 		if pragmaHasColumn(ctx, db.lite, col.name) == 0 {
 			if _, err := db.lite.ExecContext(ctx, col.ddl); err != nil {
@@ -828,6 +830,10 @@ const sampleConflictUpdateSQLite = `ON CONFLICT (sha256) DO UPDATE SET
 	domain  = CASE WHEN samples.domain  = '' THEN excluded.domain  ELSE samples.domain  END,
 	package    = CASE WHEN samples.package    = '' THEN excluded.package    ELSE samples.package    END,
 	version = CASE WHEN samples.version = '' THEN excluded.version ELSE samples.version END,
+	-- Capture-time provenance is written once by the collector's direct-insert;
+	-- a later walk carries none, so keep whatever is already there.
+	provenance = CASE WHEN samples.provenance IS NOT NULL THEN samples.provenance ELSE excluded.provenance END,
+	fetched_at = CASE WHEN samples.fetched_at IS NOT NULL THEN samples.fetched_at ELSE excluded.fetched_at END,
 	-- Label-related skips ('misclassified'/'conflict') track the resolution;
 	-- the walker also clears 'missing'/'unsupported'. Hard skips stick.
 	skip  = CASE
@@ -874,16 +880,16 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 			canonical_sha256, parent, skip, elements,
 			max_crit, suspicious_count, mtime, marker_mtime,
 			cleave_result, litmus_result,
-			url, domain, package, version)
+			url, domain, package, version, provenance, fetched_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`+sampleConflictUpdateSQLite,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.SHA256, s.Parent, s.Skip, s.Elements,
 		s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
 		jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult),
-		s.URL, s.Domain, s.Package, s.Version)
+		s.URL, s.Domain, s.Package, s.Version, jsonTextOrNil(s.Provenance), s.FetchedAt)
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}

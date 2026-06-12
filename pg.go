@@ -210,6 +210,10 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS version TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_domain ON samples(domain) WHERE domain != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_package_version ON samples(package, version) WHERE package != ''`,
+		// Collector provenance sidecar (forager) + artifact fetch time. JSONB so
+		// the registry/feed records inside are directly queryable.
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS provenance JSONB`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS fetched_at TIMESTAMPTZ`,
 		`UPDATE samples SET skip = 'skip-benign-archive-item' WHERE skip = 'weak-findings'`,
 		// Worker heartbeat table for dashboard.
 		`CREATE TABLE IF NOT EXISTS workers (
@@ -1189,17 +1193,17 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 			canonical_sha256, parent, skip, elements,
 			max_crit, suspicious_count, mtime, marker_mtime,
 			cleave_result, litmus_result,
-			url, domain, package, version)
+			url, domain, package, version, provenance, fetched_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
 			$1, $11, $12, $13, $14, $15, $16, $17, $18, $19,
-			$20, $21, $22, $23)
+			$20, $21, $22, $23, $24, $25)
 		`+sampleConflictUpdatePG,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.Parent, s.Skip, s.Elements,
 		s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
 		sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult),
-		s.URL, s.Domain, s.Package, s.Version)
+		s.URL, s.Domain, s.Package, s.Version, sanitizeJSONB(s.Provenance), s.FetchedAt)
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
@@ -1299,6 +1303,10 @@ const sampleConflictUpdatePG = `ON CONFLICT (sha256) DO UPDATE SET
 	domain  = CASE WHEN samples.domain  = '' THEN EXCLUDED.domain  ELSE samples.domain  END,
 	package    = CASE WHEN samples.package    = '' THEN EXCLUDED.package    ELSE samples.package    END,
 	version = CASE WHEN samples.version = '' THEN EXCLUDED.version ELSE samples.version END,
+	-- Capture-time provenance is written once by the collector's direct-insert;
+	-- a later walk carries none, so keep whatever is already there.
+	provenance = CASE WHEN samples.provenance IS NOT NULL THEN samples.provenance ELSE EXCLUDED.provenance END,
+	fetched_at = CASE WHEN samples.fetched_at IS NOT NULL THEN samples.fetched_at ELSE EXCLUDED.fetched_at END,
 	-- Label-related skips ('misclassified'/'conflict') track the resolution;
 	-- the walker also clears 'missing'/'unsupported' so a re-observed file
 	-- rejoins the analysis queue. Hard skips (corrupt/encrypted/replaced/
