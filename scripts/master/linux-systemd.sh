@@ -16,6 +16,8 @@
 #   SOURCE    --source tag           (default: forager)
 #   DASH_ADDR --dashboard-addr       (default: 0.0.0.0:8081)
 #   WORKERS   --workers              (default: 0 = auto)
+#   PULL_DISABLE  set to 1 to skip the git pull of ../scan and ../cleave and
+#                 build the current checkouts as-is (e.g. when the remote is down)
 
 set -euo pipefail
 
@@ -25,6 +27,7 @@ DB="${DB:-postgres://hopper@hopper-db/hopper?sslmode=disable}"
 SOURCE="${SOURCE:-forager}"
 DASH_ADDR="${DASH_ADDR:-0.0.0.0:8081}"
 WORKERS="${WORKERS:-0}"
+PULL_DISABLE="${PULL_DISABLE:-0}"
 
 readonly SERVICE_USER=hopper
 readonly SERVICE_NAME=hopper
@@ -39,9 +42,11 @@ readonly UNIT_FILE=/etc/systemd/system/${SERVICE_NAME}.service
 # Sibling repos that ship alongside hopper. `make deploy` updates both,
 # builds them in release mode, and installs the resulting binaries into
 # TOOLS_DIR.
-readonly LITMUS_SRC=../litmus
+readonly SCAN_SRC=../scan
 readonly CLEAVE_SRC=../cleave
-readonly LITMUS_BIN=${TOOLS_DIR}/litmus
+# Atomdrift Scan installs as 'ascan' to avoid colliding with the unrelated
+# 'litmus' WebDAV tool. ('litmus' remains the internal codename in hopper/db.)
+readonly SCAN_BIN=${TOOLS_DIR}/ascan
 readonly CLEAVE_BIN=${TOOLS_DIR}/cleave
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -54,17 +59,29 @@ trap 'if (( ${#TMP_FILES[@]} > 0 )); then rm -f -- "${TMP_FILES[@]}"; fi' EXIT
 
 [[ $(uname -s) == Linux ]]      || die "deploy requires Linux with systemd"
 command -v systemctl >/dev/null || die "systemctl not found"
-command -v sudo      >/dev/null || die "sudo required"
 command -v git       >/dev/null || die "git not found"
 [[ -f Makefile ]]                || die "run from the repository root"
 [[ -d ${DATA_DIR} ]]             || die "DATA_DIR does not exist: ${DATA_DIR}"
-sudo -v                          || die "sudo authentication failed"
+
+# Privilege escalation: prefer doas (BSD default, and passwordless on some Linux
+# hosts), fall back to sudo, no-op when already root. Mirrors the ladder the
+# replica scripts use so deploy behaves the same everywhere.
+if [[ $EUID -eq 0 ]]; then
+    priv() { "$@"; }
+elif command -v doas >/dev/null 2>&1; then
+    priv() { doas "$@"; }
+elif command -v sudo >/dev/null 2>&1; then
+    priv() { sudo "$@"; }
+else
+    die "need root: install doas or sudo, or run as root"
+fi
+priv true || die "privilege escalation failed (doas/sudo)"
 
 # litmus and cleave are checked out alongside hopper and built in release
 # mode during deploy. Their Makefiles drop the binary into ./out/<name>;
 # we install those artifacts into TOOLS_DIR so the service has a single,
 # hopper-owned location to exec from.
-[[ -d ${LITMUS_SRC}/.git ]] || die "litmus source not found at ${LITMUS_SRC}; check out codeberg.org/atomdrift/litmus there"
+[[ -d ${SCAN_SRC}/.git ]] || die "Atomdrift Scan source not found at ${SCAN_SRC}; check out codeberg.org/atomdrift/scan there"
 [[ -d ${CLEAVE_SRC}/.git ]] || die "cleave source not found at ${CLEAVE_SRC}; check out codeberg.org/atomdrift/cleave there"
 command -v cargo >/dev/null || die "cargo not found on PATH; install the Rust toolchain to build litmus and cleave"
 
@@ -77,16 +94,20 @@ make build
 update_tool_source() {
     local name=$1 dir=$2
 
+    if [[ ${PULL_DISABLE} != 0 ]]; then
+        log "Skipping ${name} source pull (PULL_DISABLE=${PULL_DISABLE}); building current checkout"
+        return
+    fi
     log "Updating ${name} source"
     git -C "${dir}" pull --ff-only
 }
 
-update_tool_source litmus "${LITMUS_SRC}"
+update_tool_source scan "${SCAN_SRC}"
 update_tool_source cleave "${CLEAVE_SRC}"
 
-log "Building litmus (release)"
-make -C "${LITMUS_SRC}" release >/dev/null
-[[ -x ${LITMUS_SRC}/out/litmus ]] || die "litmus build did not produce ${LITMUS_SRC}/out/litmus"
+log "Building Atomdrift Scan (release)"
+make -C "${SCAN_SRC}" release >/dev/null
+[[ -x ${SCAN_SRC}/out/ascan ]] || die "scan build did not produce ${SCAN_SRC}/out/ascan"
 
 log "Building cleave (release)"
 make -C "${CLEAVE_SRC}" release >/dev/null
@@ -96,24 +117,24 @@ make -C "${CLEAVE_SRC}" release >/dev/null
 
 if ! getent passwd "${SERVICE_USER}" >/dev/null; then
     log "Creating service user '${SERVICE_USER}'"
-    sudo useradd --system --home-dir "${STATE_HOME}" --no-create-home \
+    priv useradd --system --home-dir "${STATE_HOME}" --no-create-home \
                  --shell /usr/sbin/nologin \
                  --comment "Hopper service" "${SERVICE_USER}"
 fi
 
-sudo install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
+priv install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
     "${STATE_HOME}" "${CACHE_HOME}" "${CONFIG_DIR}" "${TOOLS_DIR}"
-sudo install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${UPLOAD_DIR}"
-sudo install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${UPLOAD_DIR}/.tmp"
+priv install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${UPLOAD_DIR}"
+priv install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${UPLOAD_DIR}/.tmp"
 
 # --- Binary ------------------------------------------------------------------
 
 binary_changed=0
-if sudo cmp -s "./${BINARY}" "${BIN_PATH}" 2>/dev/null; then
+if priv cmp -s "./${BINARY}" "${BIN_PATH}" 2>/dev/null; then
     log "Binary unchanged"
 else
     log "Installing ${BIN_PATH}"
-    sudo install -m 0755 -o root -g root "./${BINARY}" "${BIN_PATH}"
+    priv install -m 0755 -o root -g root "./${BINARY}" "${BIN_PATH}"
     binary_changed=1
 fi
 
@@ -121,15 +142,15 @@ fi
 # either counts as a "binary change" so the service is restarted below.
 install_tool() {
     local src=$1 dst=$2 name=$3
-    if sudo cmp -s "${src}" "${dst}" 2>/dev/null; then
+    if priv cmp -s "${src}" "${dst}" 2>/dev/null; then
         log "${name} unchanged"
         return
     fi
     log "Installing ${dst}"
-    sudo install -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${src}" "${dst}"
+    priv install -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${src}" "${dst}"
     binary_changed=1
 }
-install_tool "${LITMUS_SRC}/out/litmus" "${LITMUS_BIN}" litmus
+install_tool "${SCAN_SRC}/out/ascan" "${SCAN_BIN}" ascan
 install_tool "${CLEAVE_SRC}/out/cleave" "${CLEAVE_BIN}" cleave
 
 # --- .pgpass (optional, from the invoking user) -----------------------------
@@ -144,11 +165,11 @@ done
 
 pgpass_dst="${CONFIG_DIR}/.pgpass"
 if [[ -n $pgpass_src ]]; then
-    if sudo cmp -s "$pgpass_src" "$pgpass_dst" 2>/dev/null; then
+    if priv cmp -s "$pgpass_src" "$pgpass_dst" 2>/dev/null; then
         log ".pgpass unchanged"
     else
         log "Installing .pgpass from ${pgpass_src}"
-        sudo install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
+        priv install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
             "$pgpass_src" "$pgpass_dst"
     fi
 elif [[ ! -e $pgpass_dst ]]; then
@@ -167,7 +188,7 @@ workers_arg=""
 
 cat >"$tmp_unit" <<EOF
 [Unit]
-Description=Hopper sample ingester (spawns litmus workers)
+Description=Hopper sample ingester (spawns Atomdrift Scan workers)
 Documentation=https://codeberg.org/atomdrift/hopper
 After=network-online.target postgresql.service
 Wants=network-online.target
@@ -185,7 +206,7 @@ CacheDirectory=${SERVICE_NAME}
 CacheDirectoryMode=0750
 
 WorkingDirectory=%S/${SERVICE_NAME}
-ExecStart=${BIN_PATH} load --data ${DATA_DIR} --db ${DB} --source ${SOURCE} --dashboard-addr ${DASH_ADDR} --litmus ${LITMUS_BIN} --cleave ${CLEAVE_BIN} --prune-missing-paths${workers_arg}
+ExecStart=${BIN_PATH} load --data ${DATA_DIR} --db ${DB} --source ${SOURCE} --dashboard-addr ${DASH_ADDR} --litmus ${SCAN_BIN} --cleave ${CLEAVE_BIN} --prune-missing-paths${workers_arg}
 Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=60s
@@ -260,29 +281,29 @@ WantedBy=multi-user.target
 EOF
 
 unit_changed=0
-if sudo cmp -s "$tmp_unit" "$UNIT_FILE" 2>/dev/null; then
+if priv cmp -s "$tmp_unit" "$UNIT_FILE" 2>/dev/null; then
     log "Unit unchanged"
 else
     log "Writing ${UNIT_FILE}"
-    sudo install -m 0644 -o root -g root "$tmp_unit" "$UNIT_FILE"
+    priv install -m 0644 -o root -g root "$tmp_unit" "$UNIT_FILE"
     unit_changed=1
 fi
 
 # --- Activate ----------------------------------------------------------------
 
-(( unit_changed )) && sudo systemctl daemon-reload
+(( unit_changed )) && priv systemctl daemon-reload
 
-sudo systemctl enable --now "${SERVICE_NAME}.service" >/dev/null
+priv systemctl enable --now "${SERVICE_NAME}.service" >/dev/null
 
 if (( binary_changed || unit_changed )); then
     log "Restarting ${SERVICE_NAME}"
-    if ! sudo systemctl restart "${SERVICE_NAME}.service"; then
-        sudo systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
+    if ! priv systemctl restart "${SERVICE_NAME}.service"; then
+        priv systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
         die "service failed to start; see: journalctl -u ${SERVICE_NAME} -n 50"
     fi
 else
     log "No changes; leaving service running"
 fi
 
-sudo systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
+priv systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
 log "Deployment complete"

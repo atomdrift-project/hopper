@@ -1055,6 +1055,43 @@ func TestSetNote(t *testing.T) {
 	}
 }
 
+func TestInsertSampleBatchPersistsProvenance(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	at := time.Date(2026, 6, 12, 16, 33, 17, 0, time.UTC)
+	prov := []byte(`{"schema_version":"1.0","registry":{"source_id":"npm"}}`)
+	s := &Sample{
+		SHA256: "pv1", Source: "forager", Label: "bad", LabelSource: "forager",
+		Path: "bad/pv1", SizeBytes: 10, Provenance: prov, FetchedAt: &at,
+	}
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{s}); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotProv []byte
+	var gotFetched sql.NullString
+	if err := db.lite.QueryRowContext(ctx,
+		`SELECT provenance, fetched_at FROM samples WHERE sha256 = ?`, "pv1").
+		Scan(&gotProv, &gotFetched); err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(gotProv) {
+		t.Fatalf("provenance not persisted/valid: %q", gotProv)
+	}
+	var meta struct {
+		Registry struct {
+			SourceID string `json:"source_id"`
+		} `json:"registry"`
+	}
+	if err := json.Unmarshal(gotProv, &meta); err != nil || meta.Registry.SourceID != "npm" {
+		t.Errorf("provenance round-trip = %q", gotProv)
+	}
+	if !gotFetched.Valid || !strings.Contains(gotFetched.String, "2026-06-12") {
+		t.Errorf("fetched_at = %q, want it to carry 2026-06-12", gotFetched.String)
+	}
+}
+
 func TestInsertSampleBatch(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()

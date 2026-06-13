@@ -989,7 +989,7 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
 		"parent", "skip", "elements", "max_crit", "suspicious_count",
 		"mtime", "marker_mtime", "cleave_result", "litmus_result", "analyzed_at", "first_analyzed_at",
-		"url", "domain", "package", "version",
+		"url", "domain", "package", "version", "provenance", "fetched_at",
 	}
 	placeholders := make([]string, len(cols))
 	for i := range cols {
@@ -1038,7 +1038,7 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 			s.SHA256, s.Parent, s.Skip, s.Elements,
 			s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
 			jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult), s.AnalyzedAt, firstAnalyzedAt,
-			s.URL, s.Domain, s.Package, s.Version)
+			s.URL, s.Domain, s.Package, s.Version, jsonTextOrNil(s.Provenance), s.FetchedAt)
 		if err != nil {
 			return 0, nil, fmt.Errorf("hopper: batch insert %s: %w", s.SHA256, err)
 		}

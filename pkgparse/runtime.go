@@ -2,16 +2,23 @@ package pkgparse
 
 import "strings"
 
-// runtimeMap is the canonical mapping from legacy registry / classifier
-// names (the values that appear in samples.ecosystem from before the
-// rename, plus the dir-name classifiers used by the legacy harvest
-// walker) onto the runtime/host that will RUN the software.
+// runtimeMap is the single source of truth for the registry/classifier →
+// ecosystem taxonomy. Keys are the names that appear in samples.ecosystem
+// (registry names, the dir-name classifiers used by the legacy harvest
+// walker, and already-canonical values); values are the ecosystem the
+// software belongs to.
+//
+// OS distributions keep their own identity (arch, fedora, alpine, debian,
+// freebsd, …) rather than folding into a generic "linux"/"bsd" — distro is
+// the dimension consumers filter on. forager's EcosystemForLanguage
+// delegates here, so the on-disk layout, forager's direct-insert, and
+// hopper's reconcile walker all produce identical ecosystems.
 //
 // Examples:
 //
 //	"npm"      → "javascript"
 //	"pypi"     → "python"
-//	"wolfi"    → "linux"
+//	"aur"      → "arch"
 //	"openvsx"  → "vscode"
 //	"datasets" → "" (junk classifier; falls through to NormalizeEcosystem
 //	                 which returns "" so callers can leave the field empty)
@@ -47,23 +54,28 @@ var runtimeMap = map[string]string{
 	// Agent skills.
 	"skills_sh": "agent",
 	"clawhub":   "openclaw",
-	// OS targets.
-	"homebrew":     "macos",
-	"freebsd":      "bsd",
-	"netbsd":       "bsd",
-	"openbsd":      "bsd",
-	"alpine":       "linux",
-	"wolfi":        "linux",
-	"debian":       "linux",
-	"fedora":       "linux",
-	"rpmfusion":    "linux",
-	"arch":         "linux",
-	"archlinux":    "linux",
-	"aur":          "linux",
-	"scoop":        "windows",
-	"winget":       "windows",
-	"chocolatey":   "windows",
-	"portableapps": "windows",
+	// OS targets. Distros keep their own identity; *_source variants fold
+	// into their base distro.
+	"homebrew":       "macos",
+	"macupdate":      "macos",
+	"freebsd":        "freebsd",
+	"freebsd_source": "freebsd",
+	"netbsd":         "netbsd",
+	"netbsd_source":  "netbsd",
+	"openbsd":        "openbsd",
+	"openbsd_source": "openbsd",
+	"alpine":         "alpine",
+	"wolfi":          "wolfi",
+	"debian":         "debian",
+	"fedora":         "fedora",
+	"rpmfusion":      "fedora",
+	"arch":           "arch",
+	"archlinux":      "arch",
+	"aur":            "arch",
+	"scoop":          "windows",
+	"winget":         "windows",
+	"chocolatey":     "windows",
+	"portableapps":   "windows",
 	// Containers.
 	"docker": "container",
 	"oci":    "container",
@@ -107,6 +119,9 @@ var runtimeMap = map[string]string{
 	"agent":      "agent",
 	"openclaw":   "openclaw",
 	"container":  "container",
+	// The distro ecosystems (arch, fedora, alpine, …) self-map via their
+	// entries in the OS-targets block above, so re-normalizing a stored
+	// distro value is already idempotent.
 }
 
 // NormalizeEcosystem maps a registry/classifier name to its canonical

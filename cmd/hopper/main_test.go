@@ -57,6 +57,55 @@ func useTestPathLister(t *testing.T) {
 	t.Cleanup(func() { pathLister = original })
 }
 
+func TestAttachSidecarProvenance(t *testing.T) {
+	dir := t.TempDir()
+	artifact := filepath.Join(dir, "pkg-1.0.0.tgz")
+	if err := os.WriteFile(artifact, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := `{"schema_version":"1.0","fetch":{"at":"2026-06-12T16:33:17Z"},"registry":{"source_id":"npm"}}`
+	if err := os.WriteFile(artifact+sidecarSuffix, []byte(sidecar), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var s hopper.Sample
+	attachSidecarProvenance(&s, artifact)
+	if len(s.Provenance) == 0 {
+		t.Fatal("provenance not loaded from sidecar")
+	}
+	if s.FetchedAt == nil || s.FetchedAt.UTC().Format(time.RFC3339) != "2026-06-12T16:33:17Z" {
+		t.Errorf("fetched_at = %v, want 2026-06-12T16:33:17Z", s.FetchedAt)
+	}
+
+	// No sidecar: both stay unset.
+	var s2 hopper.Sample
+	attachSidecarProvenance(&s2, filepath.Join(dir, "nope.tgz"))
+	if s2.Provenance != nil || s2.FetchedAt != nil {
+		t.Error("missing sidecar should leave provenance/fetched_at unset")
+	}
+}
+
+func TestStartEnumerationSkipsSidecars(t *testing.T) {
+	useTestPathLister(t)
+	dir := t.TempDir()
+	sample := filepath.Join(dir, "pkg-1.0.0.tar.gz")
+	sidecar := sample + sidecarSuffix
+	for _, p := range []string{sample, sidecar} {
+		if err := os.WriteFile(p, []byte("data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var got []string
+	for lp := range startEnumeration(context.Background(), dir) {
+		got = append(got, filepath.Base(lp.path))
+	}
+
+	if len(got) != 1 || got[0] != "pkg-1.0.0.tar.gz" {
+		t.Fatalf("enumeration = %v, want only the sample (sidecar must be skipped)", got)
+	}
+}
+
 func mustRemove(t *testing.T, path string) {
 	t.Helper()
 	if err := os.Remove(path); err != nil {
@@ -904,10 +953,11 @@ func TestNewLitmusServer(t *testing.T) {
 		t.Errorf("bin = %q", s.bin)
 	}
 
-	// Defaults: bin falls back to "litmus", workers to max(2, NumCPU/2).
+	// Defaults: bin falls back to "ascan" (the installed Atomdrift Scan binary),
+	// workers to max(2, NumCPU/2).
 	s2 := newLitmusServer(litmusConfig{})
-	if s2.bin != "litmus" {
-		t.Errorf("default bin = %q, want litmus", s2.bin)
+	if s2.bin != "ascan" {
+		t.Errorf("default bin = %q, want ascan", s2.bin)
 	}
 	wantWorkers := max(2, runtime.NumCPU()/2)
 	if s2.Workers() != wantWorkers {

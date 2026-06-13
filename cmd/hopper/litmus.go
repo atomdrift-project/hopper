@@ -36,12 +36,13 @@ const (
 
 type litmusServer struct {
 	cmd        *exec.Cmd
-	tracker    *workerTracker         // for liveness checks
-	logPath    atomic.Pointer[string] // current worker's stdout/stderr log file
-	bin        string                 // path to litmus binary
-	hopperURL  string                 // hopper API base URL for the worker to poll
-	dataDir    string                 // data root for --data-dir
-	workerName string                 // qualified name used to look up in tracker
+	tracker    *workerTracker                    // for liveness checks
+	logPath    atomic.Pointer[string]            // current worker's stdout/stderr log file
+	health     atomic.Pointer[localWorkerHealth] // published for the dashboard banner
+	bin        string                            // path to litmus binary
+	hopperURL  string                            // hopper API base URL for the worker to poll
+	dataDir    string                            // data root for --data-dir
+	workerName string                            // qualified name used to look up in tracker
 	tmpDir     string
 	pid        atomic.Int64
 	spawnedAt  atomic.Int64 // UnixNano when the current process started; 0 if none
@@ -54,9 +55,44 @@ type litmusServer struct {
 	verbose    bool
 }
 
+// localWorkerHealth is the current state of the in-process scan (ascan) worker,
+// published for the web dashboard's status banner. since marks when the present
+// ok-state began, so a persistent failure shows a stable "down since <time>".
+// detail holds the last few log/output lines for the failure so the banner is
+// enough to debug from without SSHing to read the worker log.
+type localWorkerHealth struct {
+	since  time.Time
+	reason string
+	detail string
+	ok     bool
+}
+
+// setHealth publishes the worker's health. reason is a one-line summary; detail
+// is the recent log/output tail (may be empty). since is preserved while the
+// ok-state is unchanged, so an ongoing failure keeps its original onset stamp.
+func (s *litmusServer) setHealth(ok bool, reason, detail string) {
+	since := time.Now()
+	if prev := s.health.Load(); prev != nil && prev.ok == ok {
+		since = prev.since
+	}
+	s.health.Store(&localWorkerHealth{ok: ok, reason: reason, detail: detail, since: since})
+}
+
+// healthSnapshot returns the published worker health, or nil if never set.
+func (s *litmusServer) healthSnapshot() *localWorkerHealth { return s.health.Load() }
+
+// workerLogTail returns the last n lines of the current worker's log file, for
+// the dashboard banner's failure detail. Empty if there is no log yet.
+func (s *litmusServer) workerLogTail(n int) string {
+	if p := s.logPath.Load(); p != nil {
+		return lastNLines(tailLogFile(*p), n)
+	}
+	return ""
+}
+
 // litmusConfig holds options for starting a litmus worker.
 type litmusConfig struct {
-	Bin        string // path to litmus binary (default: "litmus")
+	Bin        string // path to the Atomdrift Scan binary (codename: litmus); default "ascan"
 	HopperURL  string // hopper API URL (e.g. http://127.0.0.1:8081)
 	DataDir    string // data root for local file access
 	MaxRSSGB   int    // memory limit in GB (0 = let litmus decide, -1 = disable in-process throttling)
@@ -66,7 +102,7 @@ type litmusConfig struct {
 
 func newLitmusServer(cfg litmusConfig) *litmusServer {
 	if cfg.Bin == "" {
-		cfg.Bin = "litmus"
+		cfg.Bin = "ascan"
 	}
 	if cfg.MaxWorkers < 1 {
 		cfg.MaxWorkers = max(2, runtime.NumCPU()/2)
@@ -406,6 +442,7 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 	}
 
 	slog.Info("litmus worker started", "pid", cmd.Process.Pid)
+	s.setHealth(true, "running", "")
 	return nil
 }
 
@@ -481,6 +518,7 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 			"restarts", restarts,
 			"log", sanitizeLogString(logPath),
 			"tail", tailLogFile(logPath))
+		s.setHealth(false, fmt.Sprintf("crashed (restart %d): %v", restarts, err), s.workerLogTail(3))
 
 		delay := min(time.Duration(1<<min(restarts-1, 7))*time.Second, 2*time.Minute)
 		slog.Info("restarting litmus server",
@@ -522,6 +560,7 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 				"attempt", restarts,
 				"next_delay", time.Duration(1<<min(restarts, 4))*time.Second,
 				"error", err)
+			s.setHealth(false, fmt.Sprintf("restart failed (attempt %d): %v", restarts, err), s.workerLogTail(3))
 			continue
 		}
 		slog.Info("litmus restart waiting for recovery window",
@@ -658,7 +697,7 @@ func refreshLitmusRules(ctx context.Context, bin string) {
 // preflightCleaveValidate runs `cleave validate` synchronously so we discover
 // broken traits once, here. Litmus' own model-benign validation is intentionally
 // not a Hopper startup gate: host-local benign corpora can vary by distro.
-func preflightCleaveValidate(ctx context.Context, bin string) error {
+func preflightCleaveValidate(ctx context.Context, bin string) (detail string, err error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, "validate")
@@ -669,12 +708,100 @@ func preflightCleaveValidate(ctx context.Context, bin string) error {
 			"output", lastLines(out, 30),
 		}
 		attrs = append(attrs, commandDiagnostics(cmd)...)
-		slog.Error("cleave validate failed; local litmus worker startup skipped",
+		slog.Error("cleave validate failed; local scan worker startup deferred",
 			attrs...)
-		return err
+		return lastLines(out, 3), fmt.Errorf("%w: %s", err, lastReasonLine(out))
 	}
 	slog.Info("cleave validate passed", "bin", bin, "output", sanitizeLogString(strings.TrimSpace(string(out))))
-	return nil
+	return "", nil
+}
+
+// lastReasonLine extracts the most informative single line from a tool's output
+// — the trailing non-empty line, e.g. cleave's "Error: Traits not found ..." —
+// for use as a one-line status reason. Sanitized for logs and HTML.
+func lastReasonLine(out []byte) string {
+	s := strings.TrimSpace(string(out))
+	if i := strings.LastIndexByte(s, '\n'); i >= 0 {
+		s = strings.TrimSpace(s[i+1:])
+	}
+	return sanitizeLogString(s)
+}
+
+// lastNLines returns the trailing n lines of s, sanitized — used for the
+// dashboard banner's failure detail.
+func lastNLines(s string, n int) string {
+	s = strings.TrimRight(s, "\n")
+	if s == "" {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return sanitizeLogString(strings.Join(lines, "\n"))
+}
+
+// superviseLocalWorker keeps the in-process scan (ascan) worker running for the
+// life of ctx and never gives up. It loops: validate cleave traits (retrying —
+// a fresh fetch may still be landing, or may have failed, in which case it
+// re-pulls rules), then start the worker and hand off to Monitor, which restarts
+// it on every crash. Every failure is logged and published to the dashboard
+// banner via setHealth; the worker is never permanently disabled and never
+// blocks ingestion — remote workers keep analyzing regardless.
+func superviseLocalWorker(ctx context.Context, litmus *litmusServer, litmusBin, cleaveBin string) {
+	for attempt := 1; ctx.Err() == nil; attempt++ {
+		if detail, err := preflightCleaveValidate(ctx, cleaveBin); err != nil {
+			delay := workerRetryDelay(attempt)
+			litmus.setHealth(false, "cleave validate failed: "+err.Error(), detail)
+			slog.Error("local scan worker not started: cleave validate failed; retrying",
+				"error", err, "cleave_bin", cleaveBin, "attempt", attempt, "retry_in", delay)
+			// Re-pull rules in case the traits fetch genuinely failed, not just a
+			// startup race where they were still landing.
+			refreshLitmusRules(ctx, litmusBin)
+			if !sleepCtx(ctx, delay) {
+				return
+			}
+			continue
+		}
+		if err := litmus.Start(ctx); err != nil {
+			delay := workerRetryDelay(attempt)
+			litmus.setHealth(false, "failed to start: "+err.Error(), litmus.workerLogTail(3))
+			slog.Error("local scan worker failed to start; retrying",
+				"error", err, "attempt", attempt, "retry_in", delay)
+			if !sleepCtx(ctx, delay) {
+				return
+			}
+			continue
+		}
+		// Started. Monitor publishes crash health itself and restarts the worker
+		// on every crash; it returns only when ctx is cancelled or Stop is called.
+		if err := litmus.Monitor(ctx); err != nil && ctx.Err() == nil {
+			litmus.setHealth(false, "monitor exited: "+err.Error(), "")
+			slog.Error("local scan worker monitor exited unexpectedly; re-validating",
+				"error", err)
+			continue
+		}
+		return
+	}
+}
+
+// workerRetryDelay is the exponential backoff (capped at 1 minute) between local
+// scan worker startup attempts.
+func workerRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	return min(time.Duration(1<<min(attempt-1, 6))*time.Second, time.Minute)
+}
+
+// sleepCtx sleeps for d or until ctx is cancelled; returns false if ctx ended.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-time.After(d):
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func commandDiagnostics(cmd *exec.Cmd) []any {
@@ -690,7 +817,7 @@ func commandDiagnostics(cmd *exec.Cmd) []any {
 	}
 	unsetKeys := []string{
 		"CLEAVE_TRAITS_DIR",
-		"LITMUS_MODELS_DIR",
+		"SCAN_MODELS_DIR",
 		"XDG_CONFIG_HOME",
 		"XDG_DATA_HOME",
 	}
@@ -742,14 +869,14 @@ func resolvedTraitsDir(cmd *exec.Cmd) string {
 }
 
 func resolvedModelsDir(cmd *exec.Cmd) string {
-	if val, ok := cmdEnvValue(cmd, "LITMUS_MODELS_DIR"); ok && val != "" {
+	if val, ok := cmdEnvValue(cmd, "SCAN_MODELS_DIR"); ok && val != "" {
 		return val
 	}
 	home := cmdHome(cmd)
 	if home == "" {
-		return filepath.Join("litmus", "models")
+		return filepath.Join("atomdrift", "scan", "models")
 	}
-	return filepath.Join(home, ".local", "share", "litmus", "models")
+	return filepath.Join(home, ".local", "share", "atomdrift", "scan", "models")
 }
 
 func cmdHome(cmd *exec.Cmd) string {

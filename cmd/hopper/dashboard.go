@@ -349,6 +349,12 @@ td.warn{color:var(--amber)}
   padding:.5rem .75rem;font-size:.78rem;color:#f87171;margin-top:1.5rem;
   word-break:break-all;font-family:var(--mono)}
 .err-inline{color:var(--red);font-family:var(--mono)}
+.banner-down{background:var(--red);color:#fff;font-weight:700;font-size:1rem;
+  padding:.85rem 1.25rem;margin-bottom:1.5rem;border-radius:4px;letter-spacing:.02em}
+.banner-since{font-weight:400;opacity:.85;font-family:var(--mono);font-size:.82rem;margin-left:.5rem}
+.banner-detail{margin:.6rem 0 0;padding:.5rem .7rem;background:rgba(0,0,0,.25);border-radius:3px;
+  font-family:var(--mono);font-size:.78rem;font-weight:400;line-height:1.4;
+  white-space:pre-wrap;word-break:break-all;overflow-x:auto;max-height:8rem}
 .err-stage{color:var(--red)}
 .err-time{white-space:nowrap;color:var(--sub)}
 .err-msg{word-break:break-word;color:#fca5a5}
@@ -556,6 +562,24 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	buf.WriteString(`<!DOCTYPE html><html lang="en"><head>` +
 		`<meta charset="utf-8"><meta http-equiv="refresh" content="60">` +
 		`<title>hopper</title><style>` + css + `</style></head><body>`)
+
+	// Big red banner when the local scan (ascan) worker is down — crashing or
+	// not starting. Reason, onset timestamp, and the last few log/output lines
+	// come straight from the worker's published health (see superviseLocalWorker
+	// / litmusServer.setHealth) so the banner is enough to debug the failure.
+	if wd.litmus != nil {
+		if h := wd.litmus.healthSnapshot(); h != nil && !h.ok {
+			buf.WriteString(`<div class="banner-down">`)
+			fmt.Fprintf(&buf,
+				`&#9888; LOCAL SCAN WORKER DOWN &mdash; %s<span class="banner-since">since %s</span>`,
+				html.EscapeString(h.reason),
+				html.EscapeString(h.since.Format("2006-01-02 15:04:05 MST")))
+			if h.detail != "" {
+				fmt.Fprintf(&buf, `<pre class="banner-detail">%s</pre>`, html.EscapeString(h.detail))
+			}
+			buf.WriteString(`</div>`)
+		}
+	}
 
 	// Header + progress
 	buf.WriteString(`<div class="hdr">`)

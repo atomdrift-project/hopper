@@ -826,7 +826,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	force := f.Bool("force", false, "override safety guards (currently: bypass the 40%-of-rows safety cap on --prune-missing-paths)")
 	hashWorkers := f.Int("hash-workers", 8, "concurrent hash/insert workers for file walking")
 	cleaveBinFlag := f.String("cleave", "cleave", "path to cleave binary (used for file enumeration)")
-	litmusBin := f.String("litmus", "litmus", "path to litmus binary (pass empty to disable)")
+	litmusBin := f.String("litmus", "ascan", "path to the Atomdrift Scan binary (ascan; codename litmus; pass empty to disable)")
 	litmusWorkers := f.Int("workers", 0, "concurrent analysis workers for the local litmus (0 = auto: min(2, cores/2))")
 	// Remote litmus workers self-register via the pull API; no --litmus-nodes flag needed.
 	maxRSSGB := f.Int("max-memory-gb", -1, "litmus RSS limit in GB (-1 = disable in-process throttling, 0 = auto)")
@@ -925,9 +925,9 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		if explicitLitmusBin {
 			slog.Info("skipping litmus rebuild for explicit binary", "bin", *litmusBin)
 		} else {
-			wd.beginStage("build.litmus", "Building litmus")
-			updateSiblingTool(ctx, "litmus", "../litmus")
-			wd.endStage("build.litmus")
+			wd.beginStage("build.scan", "Building Atomdrift Scan")
+			updateSiblingTool(ctx, "scan", "../scan")
+			wd.endStage("build.scan")
 		}
 		litmusBuildCh <- struct{}{}
 	}()
@@ -954,28 +954,21 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		if traitsVersion != "" {
 			slog.Info("traits version for rescan", "version", traitsVersion)
 		}
-
-		// Pre-flight: validate cleave traits. Litmus' model-benign validation
-		// is useful diagnostics, but host-local benign corpora vary by distro
-		// and should not prevent Hopper from starting a worker.
-		wd.beginStage("cleave.validate", "Validating cleave traits")
-		if err := preflightCleaveValidate(ctx, *cleaveBinFlag); err != nil {
-			wd.failStage("cleave.validate", "validate failed: "+err.Error())
-			slog.Warn("skipping local litmus worker startup until cleave validate passes",
-				"litmus_bin", *litmusBin, "cleave_bin", *cleaveBinFlag)
-			*litmusBin = ""
-		} else {
-			wd.endStage("cleave.validate")
-		}
+		// Cleave-traits validation is no longer a one-shot gate here: it runs
+		// inside superviseLocalWorker, which retries it (and re-pulls rules)
+		// forever so a transient failure — e.g. traits still landing after a
+		// fresh fetch — never disables the local worker.
 	}
 
-	// Now start litmus and the rest of the startup work.
+	// Start the local scan (ascan) worker under a supervisor that never gives
+	// up: it waits for cleave traits to validate, starts the worker, and lets
+	// Monitor restart it on every crash — all in the background, so a flaky local
+	// worker never blocks ingestion (remote workers keep running). Failures
+	// surface on the dashboard banner via the server's published health.
 	var litmus *litmusServer
-	type litmusResult struct{ err error }
-	litmusCh := make(chan litmusResult, 1)
 	if *litmusBin != "" {
-		// Local worker always connects to loopback. Replace 0.0.0.0
-		// with 127.0.0.1 since 0.0.0.0 is a bind address, not a destination.
+		// Local worker always connects to loopback. Replace 0.0.0.0 with
+		// 127.0.0.1 since 0.0.0.0 is a bind address, not a destination.
 		hopperURL := "http://127.0.0.1:8081"
 		if *dashAddr != "" {
 			addr := *dashAddr
@@ -994,18 +987,9 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		})
 		litmus.tracker = tracker
 		litmus.workerName = "local"
-		wd.beginStage("litmus.start", "Starting litmus worker")
-		go func() {
-			err := litmus.Start(ctx)
-			if err != nil {
-				wd.failStage("litmus.start", err.Error())
-			} else {
-				wd.endStage("litmus.start")
-			}
-			litmusCh <- litmusResult{err: err}
-		}()
-	} else {
-		litmusCh <- litmusResult{} // nothing to wait for
+		litmus.setHealth(false, "starting", "")
+		defer litmus.Stop()
+		go superviseLocalWorker(ctx, litmus, *litmusBin, *cleaveBinFlag)
 	}
 
 	// Run independent startup work in parallel: hash cache load, DB
@@ -1158,19 +1142,8 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// Claims live in workerTracker (in-memory only), so a fresh process
 	// starts with an empty claim set — nothing to clear here.
 
-	slog.Info("waiting for litmus")
-	if res := <-litmusCh; res.err != nil {
-		return res.err
-	}
-	slog.Info("litmus ready")
 	if litmus != nil {
-		defer litmus.Stop()
-		go func() {
-			if err := litmus.Monitor(ctx); err != nil {
-				slog.Error("litmus monitor failed", "error", err)
-			}
-		}()
-		// The litmus worker self-updates rules every 10 minutes via its
+		// The scan worker self-updates rules every 10 minutes via its
 		// own spawn_resource_renewal_task (in worker.rs). We poll the
 		// resulting traits version on the same cadence so the dashboard's
 		// "is this worker stale?" check measures against the live local
@@ -2346,12 +2319,25 @@ var pathLister = streamCleaveIterFiles
 // startEnumeration kicks off pathLister in a goroutine and streams results
 // into a channel so file enumeration can overlap with other startup work
 // (hash cache loading, DB migrations, etc.).
+// sidecarSuffix names forager's per-artifact provenance sidecars (mirrors
+// forager.SidecarSuffix; hopper sits below forager in the module graph and
+// cannot import it). The sidecars live next to samples but are metadata, not
+// samples, so enumeration skips them rather than ingesting one as a sample.
+const sidecarSuffix = ".forage.json"
+
+func isSidecarPath(path string) bool {
+	return strings.HasSuffix(path, sidecarSuffix)
+}
+
 func startEnumeration(ctx context.Context, dir string) <-chan labeledPath {
 	ch := make(chan labeledPath, 4096)
 	go func() {
 		defer close(ch)
 		slog.Info("listing files", "dir", dir)
 		err := pathLister(ctx, dir, func(lp labeledPath) bool {
+			if isSidecarPath(lp.path) {
+				return true // provenance sidecar, not a sample; keep enumerating
+			}
 			select {
 			case ch <- lp:
 				return true
@@ -2507,6 +2493,7 @@ func hashFile(ctx context.Context, path, label, fileType, source string, cache *
 			}
 			prov := extractPathProvenance(path, label)
 			fillSampleProvenance(s, prov, filepath.Base(path))
+			attachSidecarProvenance(s, path)
 			return hashResult{
 				cacheKey: ck,
 				sample:   s,
@@ -2547,7 +2534,30 @@ func hashFile(ctx context.Context, path, label, fileType, source string, cache *
 	}
 	prov := extractPathProvenance(path, label)
 	fillSampleProvenance(s, prov, filepath.Base(path))
+	attachSidecarProvenance(s, path)
 	return hashResult{cacheKey: ck, sample: s}, nil
+}
+
+// attachSidecarProvenance loads the forager provenance sidecar next to an
+// artifact (if present) into the sample's provenance column and fetched_at.
+// This backfills provenance for samples that reach hopper via the reconcile
+// walk rather than forager's direct-insert. A missing or malformed sidecar is
+// the common case and silently leaves both unset; the insert conflict clause
+// preserves any provenance a prior direct-insert already wrote.
+func attachSidecarProvenance(s *hopper.Sample, artifactPath string) {
+	data, err := os.ReadFile(artifactPath + sidecarSuffix)
+	if err != nil || !json.Valid(data) {
+		return
+	}
+	s.Provenance = data
+	var meta struct {
+		Fetch struct {
+			At time.Time `json:"at"`
+		} `json:"fetch"`
+	}
+	if err := json.Unmarshal(data, &meta); err == nil && !meta.Fetch.At.IsZero() {
+		s.FetchedAt = &meta.Fetch.At
+	}
 }
 
 // fillSampleProvenance populates the provenance fields on s using the

@@ -290,6 +290,11 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_sl_sha256 ON sample_locations(sha256)`,
 		`CREATE INDEX IF NOT EXISTS idx_sl_source ON sample_locations(source, feed) WHERE feed <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_sl_parent ON sample_locations(parent_sha256) WHERE parent_sha256 <> ''`,
+		// Covering index for the reconcile reachability walk (cascadeMembersPG):
+		// finding a parent's child sha256 is then index-only — no heap fetch —
+		// which is what lets the BFS expand the alive set by index lookups instead
+		// of seq-scanning + sorting all of sample_locations.
+		`CREATE INDEX IF NOT EXISTS idx_sl_parent_child ON sample_locations(parent_sha256) INCLUDE (sha256) WHERE parent_sha256 <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_sl_last_seen ON sample_locations(last_seen_at)`,
 
 		// One-shot backfill from the existing denormalized columns. Guarded
@@ -917,6 +922,29 @@ func concurrentIndexDDL(ddl string) (string, bool) {
 }
 
 func (db *DB) createIndexConcurrently(ctx context.Context, ddl, indexName string) error {
+	// CREATE/DROP INDEX CONCURRENTLY briefly needs ShareUpdateExclusive and waits
+	// for concurrent transactions to drain. The server-wide lock_timeout (kept low
+	// to protect the hot write path) would otherwise cancel the build with
+	// SQLSTATE 55P03 — exactly what failed idx_sl_parent_child against a busy
+	// 105M-row table. Run the build on a dedicated connection with lock_timeout
+	// disabled, resetting it before the connection returns to the pool so no other
+	// caller inherits an unbounded lock wait. CONCURRENTLY can't run in a
+	// transaction, so each statement auto-commits on this connection.
+	conn, err := db.pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if _, derr := conn.Exec(context.WithoutCancel(ctx), `SET lock_timeout = DEFAULT`); derr != nil {
+			slog.Warn("failed to reset lock_timeout after index build; dropping connection", "error", derr)
+			conn.Conn().Close(context.WithoutCancel(ctx)) //nolint:errcheck,gosec // discarding the tainted conn
+		}
+		conn.Release()
+	}()
+	if _, err := conn.Exec(ctx, `SET lock_timeout = 0`); err != nil {
+		return fmt.Errorf("hopper: disable lock_timeout for index build: %w", err)
+	}
+
 	invalid, err := db.invalidPGIndex(ctx, indexName)
 	if err != nil {
 		return err
@@ -924,7 +952,7 @@ func (db *DB) createIndexConcurrently(ctx context.Context, ddl, indexName string
 	if invalid {
 		drop := "DROP INDEX CONCURRENTLY IF EXISTS " + indexName
 		slog.Info("dropping invalid migration index", "index", indexName, "ddl", drop)
-		if _, err := db.pool.Exec(ctx, drop); err != nil {
+		if _, err := conn.Exec(ctx, drop); err != nil {
 			return err
 		}
 	}
@@ -932,7 +960,7 @@ func (db *DB) createIndexConcurrently(ctx context.Context, ddl, indexName string
 	ddl = strings.Replace(ddl, "CREATE INDEX IF NOT EXISTS ", "CREATE INDEX CONCURRENTLY IF NOT EXISTS ", 1)
 	start := time.Now()
 	slog.Info("executing migration ddl", "ddl", ddl)
-	if _, err := db.pool.Exec(ctx, ddl); err != nil {
+	if _, err := conn.Exec(ctx, ddl); err != nil {
 		return err
 	}
 	slog.Info("migration ddl complete", "elapsed", time.Since(start).String())
@@ -1241,7 +1269,7 @@ var insertBatchStagingCols = []string{
 	"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
 	"parent", "skip", "elements", "max_crit", "suspicious_count",
 	"mtime", "marker_mtime", "cleave_result", "litmus_result", "analyzed_at", "first_analyzed_at",
-	"url", "domain", "package", "version",
+	"url", "domain", "package", "version", "provenance", "fetched_at",
 }
 
 const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
@@ -1252,7 +1280,7 @@ const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 	max_crit INTEGER, suspicious_count INTEGER,
 	mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ,
 	cleave_result JSONB, litmus_result JSONB, analyzed_at TIMESTAMPTZ, first_analyzed_at TIMESTAMPTZ,
-	url TEXT, domain TEXT, package TEXT, version TEXT
+	url TEXT, domain TEXT, package TEXT, version TEXT, provenance JSONB, fetched_at TIMESTAMPTZ
 ) ON COMMIT DROP`
 
 // file_type, score, formula are derived DB-side by the
@@ -1346,14 +1374,14 @@ const insertBatchStagingInsert = `INSERT INTO samples (
 	canonical_sha256, parent, skip, elements,
 	max_crit, suspicious_count, mtime, marker_mtime,
 	cleave_result, litmus_result, analyzed_at, first_analyzed_at,
-	url, domain, package, version)
+	url, domain, package, version, provenance, fetched_at)
 SELECT DISTINCT ON (sha256)
 	sha256, source, feed, ecosystem, filename,
 	size_bytes, label, label_source, path, status,
 	canonical_sha256, parent, skip, elements,
 	max_crit, suspicious_count, mtime, marker_mtime,
 	cleave_result, litmus_result, analyzed_at, first_analyzed_at,
-	url, domain, package, version
+	url, domain, package, version, provenance, fetched_at
 FROM _staging
 ` + sampleConflictUpdatePG
 
@@ -1404,7 +1432,7 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256,
 			s.Parent, s.Skip, s.Elements, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
 			sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult), s.AnalyzedAt, firstAnalyzedAt,
-			s.URL, s.Domain, s.Package, s.Version,
+			s.URL, s.Domain, s.Package, s.Version, sanitizeJSONB(s.Provenance), s.FetchedAt,
 		}
 	}
 
@@ -2811,12 +2839,12 @@ func (db *DB) cascadeMembersPG(ctx context.Context) (cascaded, revived int64, er
 	if err != nil {
 		return 0, 0, fmt.Errorf("hopper: acquire reconcile conn: %w", err)
 	}
-	// Drop the temp table before the connection returns to the pool so a later
+	// Drop the temp tables before the connection returns to the pool so a later
 	// reuse starts clean. WithoutCancel so cleanup still runs when ctx is already
 	// cancelled; buildReconcileAliveSet also drops first, so any residue
 	// self-heals on the next pass regardless.
 	defer func() {
-		if _, derr := conn.Exec(context.WithoutCancel(ctx), `DROP TABLE IF EXISTS reconcile_alive`); derr != nil {
+		if _, derr := conn.Exec(context.WithoutCancel(ctx), `DROP TABLE IF EXISTS reconcile_alive, reconcile_frontier`); derr != nil {
 			slog.Warn("reconcile temp table cleanup failed; will self-heal on next pass", "error", derr)
 		}
 		conn.Release()
@@ -2869,48 +2897,101 @@ func (db *DB) cascadeMembersPG(ctx context.Context) (cascaded, revived int64, er
 	return cascaded, revived, nil
 }
 
-// buildReconcileAliveSet materializes the reconcile reachability set into the
-// session-local temp table reconcile_alive on conn. Kept separate from the
-// per-batch UPDATEs so the expensive recursive walk commits once and each batch
-// can run in its own short transaction. This phase reads only
-// walk_staging/sample_locations, so it takes no lock on samples; a session-local
-// work_mem keeps the DISTINCT and recursive dedup in memory rather than spilling
-// gigabytes to temp files. The temp table omits ON COMMIT DROP so it outlives
-// the build transaction and stays visible to the drain batches on this same
-// connection.
-func buildReconcileAliveSet(ctx context.Context, conn *pgxpool.Conn) error {
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("hopper: begin alive build: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+// aliveExpandBatch bounds how many frontier sha256 a single BFS expansion step
+// processes. Each step is one statement (its own implicit transaction), so this
+// keeps every transaction short: the reconcile must never hold a long-open
+// transaction, which would pin the logical-replication slot's restart_lsn and
+// stall WAL release on the primary.
+const aliveExpandBatch = 50000
 
-	if _, err := tx.Exec(ctx, `SET LOCAL work_mem = '4GB'`); err != nil {
-		return fmt.Errorf("hopper: alive work_mem: %w", err)
+// buildReconcileAliveSet materializes the reconcile reachability set into the
+// session-local temp table reconcile_alive on conn: every walked standalone file
+// (walk_staging) plus every member transitively reachable from one through the
+// sample_locations parent->child edge set.
+//
+// It is an iterative breadth-first expansion, NOT one recursive-CTE INSERT. The
+// recursive form planned as a merge join that seq-scanned and sorted the whole
+// ~105M-row sample_locations table (spilling past work_mem='4GB') on every pass
+// — hours on a host whose data blocks aren't cached — and, being one statement,
+// held a single long transaction that pinned the replication slot. The BFS
+// instead expands a bounded frontier per step using idx_sl_parent_child (an
+// index-only child lookup), dedups via the alive PK with ON CONFLICT, and
+// commits every step, so it never sorts the whole table and never holds a
+// long-open transaction. It reads only walk_staging/sample_locations, so it
+// takes no lock on samples. The temp tables omit ON COMMIT DROP so they outlive
+// each step's transaction and stay visible to the drain batches on this conn.
+func buildReconcileAliveSet(ctx context.Context, conn *pgxpool.Conn) error {
+	// (Re)create the alive set and the frontier scratch. DROP first so residue
+	// left on this pooled connection by a cancelled cleanup never poisons this
+	// pass. Each Exec on conn is its own implicit transaction.
+	for _, stmt := range []string{
+		`DROP TABLE IF EXISTS reconcile_alive, reconcile_frontier`,
+		`CREATE TEMP TABLE reconcile_alive (sha256 TEXT PRIMARY KEY)`,
+		`CREATE TEMP TABLE reconcile_frontier (sha256 TEXT PRIMARY KEY)`,
+	} {
+		if _, err := conn.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("hopper: alive setup: %w", err)
+		}
 	}
-	// DROP first so residue left on this pooled connection by a cancelled cleanup
-	// never poisons this pass with stale reachability.
-	if _, err := tx.Exec(ctx, `DROP TABLE IF EXISTS reconcile_alive`); err != nil {
-		return fmt.Errorf("hopper: drop stale alive: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `CREATE TEMP TABLE reconcile_alive (sha256 TEXT PRIMARY KEY)`); err != nil {
-		return fmt.Errorf("hopper: create alive: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `
+
+	// Seed: every walked standalone file is alive. ON CONFLICT dedups
+	// walk_staging's repeated sha256 via the PK — no DISTINCT needed. The seed
+	// set is also the initial frontier.
+	if _, err := conn.Exec(ctx, `
 		INSERT INTO reconcile_alive (sha256)
-		WITH RECURSIVE reach(sha256) AS (
-			SELECT DISTINCT sha256 FROM walk_staging
-			UNION
-			SELECT sl.sha256 FROM sample_locations sl
-			  JOIN reach r ON sl.parent_sha256 = r.sha256
-		)
-		SELECT sha256 FROM reach`); err != nil {
-		return fmt.Errorf("hopper: build alive: %w", err)
+		SELECT sha256 FROM walk_staging
+		ON CONFLICT DO NOTHING`); err != nil {
+		return fmt.Errorf("hopper: seed alive: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("hopper: commit alive build: %w", err)
+	if _, err := conn.Exec(ctx, `
+		INSERT INTO reconcile_frontier (sha256)
+		SELECT sha256 FROM reconcile_alive`); err != nil {
+		return fmt.Errorf("hopper: seed frontier: %w", err)
 	}
-	return nil
+
+	// Expand level by level: pop a bounded batch off the frontier, add its
+	// not-yet-alive children to the alive set, and enqueue those new children as
+	// the next frontier — all in one self-committing statement (the added/enqueue
+	// data-modifying CTEs run to completion regardless of the top-level SELECT).
+	// Terminates when the frontier drains (a round pops nothing). Every sha256
+	// enters the frontier at most once — only when first inserted into alive — so
+	// cycles can't loop and the walk is finite.
+	for {
+		var popped int64
+		if err := conn.QueryRow(ctx, `
+			WITH batch AS (
+				DELETE FROM reconcile_frontier
+				WHERE sha256 IN (SELECT sha256 FROM reconcile_frontier LIMIT $1)
+				RETURNING sha256
+			),
+			added AS (
+				INSERT INTO reconcile_alive (sha256)
+				SELECT sl.sha256
+				FROM batch b
+				-- The redundant-looking parent_sha256 <> '' is load-bearing: it
+				-- lets the planner use the partial idx_sl_parent_child /
+				-- idx_sl_parent (both WHERE parent_sha256 <> '') for an index
+				-- nested loop. Without it the planner can't prove the join keys
+				-- are non-empty and falls back to a 105M-row seq scan + sort. The
+				-- frontier holds only real 64-hex sha256, so it changes no rows.
+				JOIN sample_locations sl
+				  ON sl.parent_sha256 = b.sha256 AND sl.parent_sha256 <> ''
+				ON CONFLICT (sha256) DO NOTHING
+				RETURNING sha256
+			),
+			enqueue AS (
+				INSERT INTO reconcile_frontier (sha256)
+				SELECT sha256 FROM added
+				ON CONFLICT DO NOTHING
+				RETURNING sha256
+			)
+			SELECT count(*) FROM batch`, aliveExpandBatch).Scan(&popped); err != nil {
+			return fmt.Errorf("hopper: expand alive: %w", err)
+		}
+		if popped == 0 {
+			return nil
+		}
+	}
 }
 
 // drainReconcile runs one batched reconcile statement on conn repeatedly until a
