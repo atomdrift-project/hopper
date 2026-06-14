@@ -1532,31 +1532,19 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 		// pathological pass is abandoned instead of stranding the walk loop (and
 		// with it all ingestion), as an unbounded reconcile once did.
 		if stageOK && ctx.Err() == nil {
-			rctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
-			toDiskPath := func(path string) string {
-				return sampleDiskPath(filepath.Dir(dirs[0].dir), filepath.FromSlash(path))
-			}
-			if st, err := db.ReconcilePools(rctx, toDiskPath); err != nil {
-				slog.Error("reconcile pools failed", "error", err)
-			} else if st.Relabeled+st.MarkedMissing+st.MarkedUnsupported+st.CascadedMissing+st.Revived > 0 {
-				slog.Info("reconciled pools",
-					"relabeled", st.Relabeled,
-					"missing", st.MarkedMissing,
-					"unsupported", st.MarkedUnsupported,
-					"cascaded_missing", st.CascadedMissing,
-					"revived", st.Revived)
-			}
-			cancel()
+			reconcilePools(ctx, db, dirs)
 		}
 
 		logLoadSummary(start, experimentTag, dirs, &progress)
 	}
 
-	// Initial pass: a full ingest using the pre-started enumeration channels so
-	// new rows flow immediately. It deliberately skips reconcile — that runs on
-	// its own slower cadence below and must never gate startup ingestion.
+	// Initial pass: a full walk (pre-started enumeration channels) that also
+	// reconciles pools. Reconcile is bounded by reconcileTimeout, so it can no
+	// longer strand startup the way an unbounded pass once did — yet it still
+	// runs on every restart, which matters on a host that recycles more often
+	// than reconcileWalkInterval (otherwise reconcile would rarely run at all).
 	initialStart := time.Now()
-	runWalk(fileChs, time.Time{}, false)
+	runWalk(fileChs, time.Time{}, true)
 
 	// Periodic passes pick up files forager's direct-insert missed while workers
 	// analyze. Ingest walks are incremental (only files modified since the
@@ -1599,6 +1587,32 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	}
 
 	return int(progress.inserted.Load() + progress.skipped.Load())
+}
+
+// reconcilePools anti-joins the just-staged present-set against samples to flag
+// moved/missing/relabeled files. It is bounded by reconcileTimeout: an
+// unbounded pass once ran for over an hour and stranded all ingestion, so a
+// pathological pass is now abandoned and retried next cycle. Only called after a
+// complete, staged walk.
+func reconcilePools(ctx context.Context, db *hopper.DB, dirs []struct{ dir, label string }) {
+	ctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
+	defer cancel()
+	toDiskPath := func(path string) string {
+		return sampleDiskPath(filepath.Dir(dirs[0].dir), filepath.FromSlash(path))
+	}
+	st, err := db.ReconcilePools(ctx, toDiskPath)
+	if err != nil {
+		slog.Error("reconcile pools failed", "error", err)
+		return
+	}
+	if st.Relabeled+st.MarkedMissing+st.MarkedUnsupported+st.CascadedMissing+st.Revived > 0 {
+		slog.Info("reconciled pools",
+			"relabeled", st.Relabeled,
+			"missing", st.MarkedMissing,
+			"unsupported", st.MarkedUnsupported,
+			"cascaded_missing", st.CascadedMissing,
+			"revived", st.Revived)
+	}
 }
 
 // walkStager batches every standalone file seen this walk into walk_staging,
