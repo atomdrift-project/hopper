@@ -227,6 +227,11 @@ Environment=OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://otel:3100/otlp/v1/logs
 # Resource caps — hopper + litmus children combined.
 MemoryHigh=64G
 MemoryMax=72G
+# Bound cgroup swap. Without this, MemoryMax is toothless: pages spill into
+# swap (zram, i.e. compressed RAM) without limit, cannibalizing host memory
+# until the box thrashes. Cap it so a runaway litmus worker is OOM-killed and
+# retried (see OOMPolicy below) instead of swap-thrashing the whole host.
+MemorySwapMax=8G
 TasksMax=8192
 # Child OOM (e.g. a rogue litmus worker) should be logged and retried, not
 # bring down the whole ingester.
