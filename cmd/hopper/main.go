@@ -1014,7 +1014,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// hash cache or database, so overlap it with those slower init steps.
 	fileChs := make([]<-chan labeledPath, len(loadDirs))
 	for i, d := range loadDirs {
-		fileChs[i] = startEnumeration(ctx, d.dir)
+		fileChs[i] = startEnumeration(ctx, d.dir, time.Time{}) // full enumeration on startup
 	}
 
 	type cacheResult struct {
@@ -1368,6 +1368,22 @@ const (
 	defaultMaxFileSize = 100 * 1024 * 1024 // 100 MiB
 )
 
+const (
+	// ingestWalkInterval is how often the backstop walk re-scans the data dir
+	// for new files forager's direct-insert missed. After the first full pass
+	// each walk is incremental (only files modified since the previous walk
+	// began), so it stays cheap.
+	ingestWalkInterval = 30 * time.Minute
+	// reconcileWalkInterval is the slower cadence for a full walk that also
+	// reconciles pools (detects moved/missing/relabeled files). It is kept
+	// separate from ingest so the expensive reconcile never gates ingestion.
+	reconcileWalkInterval = 6 * time.Hour
+	// reconcileTimeout bounds a single ReconcilePools pass. A reconcile that
+	// once ran unbounded for over an hour stranded all ingestion; capping it
+	// means a pathological pass is abandoned and retried next cycle instead.
+	reconcileTimeout = 20 * time.Minute
+)
+
 // maxFileSize is the per-file byte cap applied during enumeration, hashing,
 // and analysis. Overridable via the load command's --max-file-size flag.
 var maxFileSize int64 = defaultMaxFileSize
@@ -1453,13 +1469,28 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 		runQueueMaintenance(ctx, db, &progress, metrics, traitsVersion, rescanAge)
 	})
 
-	// runWalk executes one full enumeration→hash→insert pass across all dirs.
-	runWalk := func(chs []<-chan labeledPath) {
-		// Empty the staging table so this pass records a fresh present-set;
-		// reconciliation anti-joins it against samples to find moved/missing files.
-		if err := db.StartWalkStaging(ctx); err != nil {
-			slog.Error("start walk staging failed", "error", err)
+	// runWalk executes one enumeration→hash→insert pass across all dirs. When
+	// cutoff is non-zero the enumeration is incremental — only files modified at
+	// or after cutoff are considered. When reconcile is true the pass also
+	// records a present-set in walk_staging and runs ReconcilePools; otherwise
+	// it is a pure ingest pass that never touches the staging table.
+	runWalk := func(chs []<-chan labeledPath, cutoff time.Time, reconcile bool) {
+		// Only a reconcile pass touches walk_staging: it records a fresh
+		// present-set that ReconcilePools anti-joins against samples to find
+		// moved/missing files. Ingest passes skip staging entirely, so they
+		// never contend on the table and an incremental (partial) present-set
+		// can never make live files look missing. If the table can't be cleared
+		// we skip reconcile rather than stage onto a stale set (the original
+		// cause of unbounded walk_staging growth).
+		stageOK := false
+		if reconcile {
+			if err := db.StartWalkStaging(ctx); err != nil {
+				slog.Error("walk staging clear failed; skipping reconcile this pass", "error", err)
+			} else {
+				stageOK = true
+			}
 		}
+
 		// Reset walk-phase counters so they reflect the current pass, not a
 		// cumulative total across re-walks.
 		progress.walked.Store(0)
@@ -1474,7 +1505,7 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 		if chs == nil {
 			chs = make([]<-chan labeledPath, len(dirs))
 			for i, d := range dirs {
-				chs[i] = startEnumeration(ctx, d.dir)
+				chs[i] = startEnumeration(ctx, d.dir, cutoff)
 			}
 		}
 
@@ -1489,20 +1520,23 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 				case <-ctx.Done():
 					return
 				}
-				runDirPipeline(ctx, db, d, source, cache, &progress, ch)
+				runDirPipeline(ctx, db, d, source, cache, &progress, ch, stageOK)
 			})
 		}
 		pipeWG.Wait()
 		progress.walkDone.Store(true)
 
 		// Reconcile the derived label/skip cache against the pools, but only
-		// after a complete walk — a cancelled (partial) walk would make present
-		// files look missing.
-		if ctx.Err() == nil {
+		// after a complete staged walk — a cancelled (partial) walk would make
+		// present files look missing. Bounded by reconcileTimeout so a
+		// pathological pass is abandoned instead of stranding the walk loop (and
+		// with it all ingestion), as an unbounded reconcile once did.
+		if stageOK && ctx.Err() == nil {
+			rctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
 			toDiskPath := func(path string) string {
 				return sampleDiskPath(filepath.Dir(dirs[0].dir), filepath.FromSlash(path))
 			}
-			if st, err := db.ReconcilePools(ctx, toDiskPath); err != nil {
+			if st, err := db.ReconcilePools(rctx, toDiskPath); err != nil {
 				slog.Error("reconcile pools failed", "error", err)
 			} else if st.Relabeled+st.MarkedMissing+st.MarkedUnsupported+st.CascadedMissing+st.Revived > 0 {
 				slog.Info("reconciled pools",
@@ -1512,25 +1546,43 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 					"cascaded_missing", st.CascadedMissing,
 					"revived", st.Revived)
 			}
+			cancel()
 		}
 
 		logLoadSummary(start, experimentTag, dirs, &progress)
 	}
 
-	// Initial walk uses pre-started enumeration channels (if provided).
-	runWalk(fileChs)
+	// Initial pass: a full ingest using the pre-started enumeration channels so
+	// new rows flow immediately. It deliberately skips reconcile — that runs on
+	// its own slower cadence below and must never gate startup ingestion.
+	initialStart := time.Now()
+	runWalk(fileChs, time.Time{}, false)
 
-	// Re-walk periodically to pick up new files while workers analyze.
+	// Periodic passes pick up files forager's direct-insert missed while workers
+	// analyze. Ingest walks are incremental (only files modified since the
+	// previous walk began) and skip reconcile, so they stay cheap; a slower full
+	// pass also reconciles pools. Both fire from one goroutine via select, so a
+	// reconcile and an ingest pass never overlap or contend on walk_staging.
 	if litmus != nil {
 		go func() {
-			ticker := time.NewTicker(10 * time.Minute)
-			defer ticker.Stop()
+			lastStart := initialStart
+			ingest := time.NewTicker(ingestWalkInterval)
+			recon := time.NewTicker(reconcileWalkInterval)
+			defer ingest.Stop()
+			defer recon.Stop()
 			for {
 				select {
-				case <-ticker.C:
+				case <-ingest.C:
+					cutoff := lastStart
+					lastStart = time.Now()
 					progress.walkDone.Store(false)
-					slog.Info("starting periodic re-walk")
-					runWalk(nil)
+					slog.Info("starting incremental ingest walk", "since", cutoff)
+					runWalk(nil, cutoff, false)
+				case <-recon.C:
+					lastStart = time.Now()
+					progress.walkDone.Store(false)
+					slog.Info("starting full reconcile walk")
+					runWalk(nil, time.Time{}, true)
 				case <-ctx.Done():
 					return
 				}
@@ -1587,15 +1639,21 @@ func runDirPipeline(
 	cache *hashCache,
 	progress *loadProgress,
 	fileCh <-chan labeledPath,
+	stage bool,
 ) {
 	batch := make([]*hopper.Sample, 0, loadBatchSize)
 	batchKeys := make([]cacheKey, 0, loadBatchSize)
 	pathBySha := make(map[string]string, loadBatchSize)
 
-	// Every standalone file seen this walk is staged for reconciliation,
-	// regardless of whether it also goes through the batch insert below.
-	stager := &walkStager{db: db}
-	defer stager.flush(ctx)
+	// On a reconcile pass every standalone file seen is staged for
+	// reconciliation, regardless of whether it also goes through the batch
+	// insert below. On an ingest pass stage is false and stager stays nil — an
+	// incremental walk must not record a partial present-set.
+	var stager *walkStager
+	if stage {
+		stager = &walkStager{db: db}
+		defer stager.flush(ctx)
+	}
 
 	flush := func() {
 		if len(batch) == 0 {
@@ -1662,8 +1720,9 @@ func runDirPipeline(
 		progress.hashed.Add(1)
 
 		// Stage every file seen this walk (present at its current pool path) so
-		// reconciliation can anti-join walk_staging against samples.
-		if hr.sample != nil {
+		// reconciliation can anti-join walk_staging against samples. Only on a
+		// reconcile pass; ingest passes leave stager nil.
+		if stager != nil && hr.sample != nil {
 			stager.add(ctx, hr.sample.SHA256, storedPath)
 		}
 
@@ -2329,12 +2388,14 @@ func isSidecarPath(path string) bool {
 	return strings.HasSuffix(path, sidecarSuffix)
 }
 
-func startEnumeration(ctx context.Context, dir string) <-chan labeledPath {
+// startEnumeration streams files under dir. A non-zero newerThan makes the
+// enumeration incremental: only files modified at or after it are emitted.
+func startEnumeration(ctx context.Context, dir string, newerThan time.Time) <-chan labeledPath {
 	ch := make(chan labeledPath, 4096)
 	go func() {
 		defer close(ch)
-		slog.Info("listing files", "dir", dir)
-		err := pathLister(ctx, dir, func(lp labeledPath) bool {
+		slog.Info("listing files", "dir", dir, "newer_than", newerThan)
+		err := pathLister(ctx, dir, newerThan, func(lp labeledPath) bool {
 			if isSidecarPath(lp.path) {
 				return true // provenance sidecar, not a sample; keep enumerating
 			}
@@ -2369,14 +2430,21 @@ var cleaveBinary = "cleave"
 //
 // Cleave's stderr is captured to a buffer and only shown on failure so the
 // startup banner doesn't clutter every successful run.
-func streamCleaveIterFiles(ctx context.Context, dir string, emit func(labeledPath) bool) error {
+func streamCleaveIterFiles(ctx context.Context, dir string, newerThan time.Time, emit func(labeledPath) bool) error {
 	// Hopper's max file size is in bytes; cleave's --max-file-size is in
 	// megabytes and is a top-level flag that must precede the subcommand.
-	args := make([]string, 0, 4)
+	args := make([]string, 0, 6)
 	if mb := maxFileSize / (1024 * 1024); mb > 0 {
 		args = append(args, "--max-file-size", strconv.FormatInt(mb, 10))
 	}
 	args = append(args, "iter-files", dir)
+	// Incremental walk: let cleave skip files older than the cutoff by their
+	// mtime, before it reads each file's magic bytes (the costly step on a cold
+	// cache). --newer-than takes Unix seconds; requires a cleave that supports
+	// the flag (deploy cleave before hopper starts passing it).
+	if !newerThan.IsZero() {
+		args = append(args, "--newer-than", strconv.FormatInt(newerThan.Unix(), 10))
+	}
 
 	start := time.Now()
 	cmd := exec.CommandContext(ctx, cleaveBinary, args...)

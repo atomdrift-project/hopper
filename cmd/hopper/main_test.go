@@ -34,7 +34,7 @@ func mustWriteFile(t *testing.T, path string, data []byte) {
 func useTestPathLister(t *testing.T) {
 	t.Helper()
 	original := pathLister
-	pathLister = func(_ context.Context, dir string, emit func(labeledPath) bool) error {
+	pathLister = func(_ context.Context, dir string, newerThan time.Time, emit func(labeledPath) bool) error {
 		return filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -47,6 +47,13 @@ func useTestPathLister(t *testing.T) {
 			}
 			if !entry.Type().IsRegular() {
 				return nil
+			}
+			// Mirror cleave's incremental filter: skip files older than the
+			// cutoff before emitting them.
+			if !newerThan.IsZero() {
+				if info, statErr := entry.Info(); statErr == nil && info.ModTime().Before(newerThan) {
+					return nil
+				}
 			}
 			if !emit(labeledPath{path: path, fileType: "test"}) {
 				return filepath.SkipAll
@@ -97,7 +104,7 @@ func TestStartEnumerationSkipsSidecars(t *testing.T) {
 	}
 
 	var got []string
-	for lp := range startEnumeration(context.Background(), dir) {
+	for lp := range startEnumeration(context.Background(), dir, time.Time{}) {
 		got = append(got, filepath.Base(lp.path))
 	}
 
@@ -239,7 +246,7 @@ func TestWalkFilesSkipsMarkers(t *testing.T) {
 	// runDirPipeline drops marker files via isMarkerFile; exercise the
 	// same filter here by walking the lister directly.
 	var got []string
-	err := pathLister(t.Context(), dir, func(lp labeledPath) bool {
+	err := pathLister(t.Context(), dir, time.Time{}, func(lp labeledPath) bool {
 		name := filepath.Base(lp.path)
 		if isMarkerFile(name) {
 			return true
@@ -931,7 +938,7 @@ func TestWalkFilesSkipsGitDir(t *testing.T) {
 	mustWriteFile(t, filepath.Join(dir, "sample.bin"), []byte("real sample!!!"))
 
 	var got []string
-	err := pathLister(t.Context(), dir, func(lp labeledPath) bool {
+	err := pathLister(t.Context(), dir, time.Time{}, func(lp labeledPath) bool {
 		got = append(got, filepath.Base(lp.path))
 		return true
 	})
