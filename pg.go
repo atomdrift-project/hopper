@@ -3248,17 +3248,17 @@ func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error
 			AND cleave_result IS NOT NULL
 			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
 			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
-			AND (coalesce(cardinality($5::int[]), 0) = 0 OR `+q.feedClassExpr("$12")+` = ANY($5))
+			AND (coalesce(cardinality($5::int[]), 0) = 0 OR `+q.feedClassExpr()+` = ANY($5))
 			AND (NOT $6 OR parent = '')
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
 			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))
-			AND ($13 = '' OR filename ILIKE '%' || $13 || '%' ESCAPE '\'
-				OR sha256 = $13)
+			AND ($12 = '' OR filename ILIKE '%' || $12 || '%' ESCAPE '\'
+				OR sha256 = $12)
 		ORDER BY `+q.sortBy()+`
 		LIMIT $10 OFFSET $11`,
 		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
-		q.Formula, q.requireLitmus(), q.Domains, q.Limit, q.Offset, q.criticalLevel(),
+		q.Formula, q.requireLitmus(), q.Domains, q.Limit, q.Offset,
 		q.searchTerm())
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed samples: %w", err)
@@ -3275,15 +3275,15 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q *FeedQuery) (int, error)
 			AND cleave_result IS NOT NULL
 			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
 			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
-			AND (coalesce(cardinality($5::int[]), 0) = 0 OR `+q.feedClassExpr("$10")+` = ANY($5))
+			AND (coalesce(cardinality($5::int[]), 0) = 0 OR `+q.feedClassExpr()+` = ANY($5))
 			AND (NOT $6 OR parent = '')
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
 			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))
-			AND ($11 = '' OR filename ILIKE '%' || $11 || '%' ESCAPE '\'
-				OR sha256 = $11)`,
+			AND ($10 = '' OR filename ILIKE '%' || $10 || '%' ESCAPE '\'
+				OR sha256 = $10)`,
 		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
-		q.Formula, q.requireLitmus(), q.Domains, q.criticalLevel(), q.searchTerm()).Scan(&n)
+		q.Formula, q.requireLitmus(), q.Domains, q.searchTerm()).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: feed samples count: %w", err)
 	}

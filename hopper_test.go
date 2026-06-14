@@ -2743,20 +2743,21 @@ func TestFeedQueryRequireLitmus(t *testing.T) {
 
 func TestFeedQueryClassExpr(t *testing.T) {
 	// Default cutoff reads the indexed litmus_class column.
-	if got := (&FeedQuery{}).feedClassExpr("$12"); got != "litmus_class" {
+	if got := (&FeedQuery{}).feedClassExpr(); got != "litmus_class" {
 		t.Errorf("default cutoff: feedClassExpr() = %q, want %q", got, "litmus_class")
 	}
-	if got := (&FeedQuery{CriticalLevel: CriticalLevel}).feedClassExpr("$12"); got != "litmus_class" {
+	if got := (&FeedQuery{CriticalLevel: CriticalLevel}).feedClassExpr(); got != "litmus_class" {
 		t.Errorf("explicit default cutoff: feedClassExpr() = %q, want %q", got, "litmus_class")
 	}
 	// A non-default cutoff must re-derive from litmus_result (the column is
-	// pinned to CriticalLevel) and bind the supplied cutoff placeholder.
-	got := (&FeedQuery{CriticalLevel: 3}).feedClassExpr("$12")
+	// pinned to CriticalLevel) and inline the cutoff as a literal — never leave a
+	// dangling bound parameter (the $12 / 42P18 regression).
+	got := (&FeedQuery{CriticalLevel: 3}).feedClassExpr()
 	if got == "litmus_class" {
 		t.Fatal("non-default cutoff must not use the litmus_class column")
 	}
-	if !strings.Contains(got, "litmus_result->>'class'") || !strings.Contains(got, "<= $12") {
-		t.Errorf("non-default cutoff expr missing derivation or cutoff param: %q", got)
+	if !strings.Contains(got, "litmus_result->>'class'") || !strings.Contains(got, "<= 3") {
+		t.Errorf("non-default cutoff expr missing derivation or inlined cutoff: %q", got)
 	}
 }
 

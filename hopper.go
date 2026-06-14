@@ -2438,20 +2438,24 @@ func (q *FeedQuery) requireLitmus() bool {
 // — turning a rare class in a large ecosystem from a per-row JSONB scan into an
 // ordered seek. A non-default [FeedQuery.CriticalLevel] re-derives the class from
 // litmus_result inline (litmus_class is pinned to CriticalLevel, so it cannot
-// answer a different cutoff), with cutoffParam naming the bound cutoff placeholder
-// ("$12" for the sample query, "$10" for the count). The inline form is identical
-// to the trigger's and to workflowSamplesPG's; keep all three in sync.
-func (q *FeedQuery) feedClassExpr(cutoffParam string) string {
+// answer a different cutoff). The cutoff is an int from trusted config, inlined
+// as a literal — the same approach as workflowSamplesPG — rather than a bound
+// parameter: a conditionally-referenced parameter would dangle untyped when the
+// column path is taken instead, which Postgres rejects (SQLSTATE 42P18). The
+// inline form is identical to the trigger's and to workflowSamplesPG's; keep all
+// three in sync.
+func (q *FeedQuery) feedClassExpr() string {
 	if q.criticalLevel() == CriticalLevel {
 		return "litmus_class"
 	}
+	cutoff := strconv.Itoa(q.criticalLevel())
 	return `COALESCE(
 				(litmus_result->>'class')::int,
 				CASE
 					WHEN litmus_result IS NULL THEN 0
 					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l') IS NULL THEN 2
 					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int < 0 THEN 0
-					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= ` + cutoffParam + ` THEN 2
+					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= ` + cutoff + ` THEN 2
 					ELSE 1
 				END)`
 }
