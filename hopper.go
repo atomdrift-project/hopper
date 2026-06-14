@@ -2412,6 +2412,50 @@ func (q *FeedQuery) criticalLevel() int {
 	return CriticalLevel
 }
 
+// requireLitmus reports whether the feed query can be restricted to rows with a
+// non-null litmus_result. It is true when the caller asked for it explicitly
+// (RequireLitmus) and, additionally, whenever the criticality filter selects
+// only non-benign classes: the class derivation maps a null litmus_result to
+// class 0 (benign), so a LitmusClasses set that excludes 0 can never match a
+// null-litmus row. Adding the predicate is therefore result-preserving, and it
+// lets both the sample and count queries use idx_samples_eco_top_created (whose
+// partial predicate includes litmus_result IS NOT NULL) instead of falling back
+// to a heap recheck.
+func (q *FeedQuery) requireLitmus() bool {
+	if q.RequireLitmus {
+		return true
+	}
+	if len(q.LitmusClasses) == 0 {
+		return false
+	}
+	return !slices.Contains(q.LitmusClasses, 0)
+}
+
+// feedClassExpr returns the SQL expression that yields a sample's criticality
+// class (0=benign, 1=suspicious, 2=hostile) for the feed's class filter. When
+// the query's cutoff is the default CriticalLevel it returns the trigger-
+// maintained litmus_class column, which idx_samples_eco_class_created can index
+// — turning a rare class in a large ecosystem from a per-row JSONB scan into an
+// ordered seek. A non-default [FeedQuery.CriticalLevel] re-derives the class from
+// litmus_result inline (litmus_class is pinned to CriticalLevel, so it cannot
+// answer a different cutoff), with cutoffParam naming the bound cutoff placeholder
+// ("$12" for the sample query, "$10" for the count). The inline form is identical
+// to the trigger's and to workflowSamplesPG's; keep all three in sync.
+func (q *FeedQuery) feedClassExpr(cutoffParam string) string {
+	if q.criticalLevel() == CriticalLevel {
+		return "litmus_class"
+	}
+	return `COALESCE(
+				(litmus_result->>'class')::int,
+				CASE
+					WHEN litmus_result IS NULL THEN 0
+					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l') IS NULL THEN 2
+					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int < 0 THEN 0
+					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= ` + cutoffParam + ` THEN 2
+					ELSE 1
+				END)`
+}
+
 // likeEscaper neutralizes the LIKE wildcards (% and _) and the escape
 // character itself so a free-text term matches literally. Pair with
 // `ESCAPE '\'` in the SQL.

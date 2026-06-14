@@ -155,6 +155,40 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_top_ready_created ` +
 			`ON samples(created_at DESC, id) ` +
 			`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL`,
+		// prism's feed filtered by ecosystem (FeedQuery.Ecosystems) orders by
+		// created_at DESC. The date-only indexes above force the planner to walk
+		// the global recency order discarding every other ecosystem's rows — a
+		// rare ecosystem made it scan ~3.2M rows to collect 500 (21s). Prefixing
+		// ecosystem lets it seek the one ecosystem and walk created_at DESC in
+		// order, stopping at LIMIT with no sort.
+		//
+		// The predicate is idx_samples_top_ready_created's, prefixed by ecosystem:
+		// every prism feed query carries parent='' (TopLevelOnly) and
+		// cleave_result IS NOT NULL unconditionally, and litmus_result IS NOT NULL
+		// either explicitly (RequireLitmus) or via FeedQuery.requireLitmus (the
+		// criticality-band path adds it — a hostile/suspicious class can never be a
+		// null-litmus row, so it is result-preserving). Matching all three constant
+		// predicates lets feedSamplesCountPG count by index-only scan (the table is
+		// ~97% all-visible) instead of heap-rechecking every row — the difference
+		// between a sub-second count and a multi-second one on a large ecosystem.
+		// ecosystem<>'' keeps the empty-ecosystem block out (a specific-ecosystem
+		// qual implies it). Built CONCURRENTLY by createIndexConcurrently.
+		`CREATE INDEX IF NOT EXISTS idx_samples_eco_top_created ` +
+			`ON samples(ecosystem, created_at DESC) ` +
+			`WHERE parent = '' AND cleave_result IS NOT NULL ` +
+			`AND litmus_result IS NOT NULL AND ecosystem <> ''`,
+		// Adds litmus_class between ecosystem and created_at so a feed filtered by
+		// BOTH ecosystem and criticality (feedSamplesPG with LitmusClasses set,
+		// cutoff = CriticalLevel) is an ordered seek to (ecosystem, class) walked
+		// created_at DESC — no per-row JSONB read, no sort — and the matching count
+		// is an index-only scan. The class-less ecosystem feed keeps using
+		// idx_samples_eco_top_created above (created_at is contiguous there; here it
+		// is only contiguous within a class). Same partial predicate, so a row
+		// healed by the litmus_class backfill enters both consistently.
+		`CREATE INDEX IF NOT EXISTS idx_samples_eco_class_created ` +
+			`ON samples(ecosystem, litmus_class, created_at DESC) ` +
+			`WHERE parent = '' AND cleave_result IS NOT NULL ` +
+			`AND litmus_result IS NOT NULL AND ecosystem <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_top_ready_first_analyzed ` +
 			`ON samples(first_analyzed_at DESC, id) ` +
 			`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND first_analyzed_at IS NOT NULL`,
@@ -446,23 +480,48 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			BEFORE INSERT OR UPDATE OF cleave_result ON samples
 			FOR EACH ROW EXECUTE FUNCTION samples_derive_cleave_cols()`,
 
-		// Derives litmus_score from litmus_result->>'prob' on every write, so the
-		// column can be a plain column rather than a STORED generated one — which
-		// would force a full-table ACCESS EXCLUSIVE rewrite to (re)create (see the
-		// DO block above and isTableRewriteDDL). Narrow firing (UPDATE OF
+		// litmus_class is the materialized criticality (0=benign, 1=suspicious,
+		// 2=hostile) used to make prism's feed-by-criticality sub-second: it can be
+		// an index column (idx_samples_eco_class_created) whereas the equivalent
+		// JSONB derivation cannot, so a rare class in a large ecosystem becomes an
+		// ordered seek instead of a per-row TOAST read of litmus_result. Nullable
+		// with no default so ADD COLUMN is metadata-only (no rewrite) and the
+		// backfill gate (litmus_class IS NULL) shrinks monotonically — unlike a
+		// NOT NULL DEFAULT 0, which would leave every benign row in the gate to be
+		// re-scanned each batch. The derive trigger fills it on every write; the
+		// Pass 1d backfill heals pre-trigger rows. feedClassExpr reads it only when
+		// the query cutoff equals CriticalLevel (what it is derived against).
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS litmus_class SMALLINT`,
+
+		// Derives litmus_score (from litmus_result->>'prob') and litmus_class (the
+		// criticality, pinned to CriticalLevel as the hostile/suspicious cutoff) on
+		// every write, so both stay plain columns rather than STORED generated ones
+		// — which would force a full-table ACCESS EXCLUSIVE rewrite to (re)create
+		// (see the DO block above and isTableRewriteDDL). Narrow firing (UPDATE OF
 		// litmus_result) keeps result stores cheap and covers the
-		// litmus_result := NULL reset in updateCleaveResultPG: COALESCE(NULL,0)=0,
-		// matching the old generated column's reset semantics. BEFORE INSERT covers
-		// the archive-member insert path. As with samples_derive_cleave_cols,
-		// CREATE OR REPLACE FUNCTION locks pg_proc, not samples, so redeploys that
-		// change only the body stay lock-free.
-		`CREATE OR REPLACE FUNCTION samples_derive_litmus_score() RETURNS trigger
+		// litmus_result := NULL reset in updateCleaveResultPG: litmus_score falls to
+		// 0 and litmus_class to 0 (benign), matching the old reset semantics.
+		// BEFORE INSERT covers the archive-member insert path. As with
+		// samples_derive_cleave_cols, CREATE OR REPLACE FUNCTION locks pg_proc, not
+		// samples, so redeploys that change only the body stay lock-free — including
+		// a changed CriticalLevel, which just re-runs this and re-heals via Pass 1d.
+		// The litmus_class formula mirrors feedClassExpr / workflowSamplesPG exactly.
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION samples_derive_litmus_score() RETURNS trigger
 		LANGUAGE plpgsql AS $$
 		BEGIN
 			NEW.litmus_score := COALESCE((NEW.litmus_result->>'prob')::double precision, 0);
+			NEW.litmus_class := COALESCE(
+				(NEW.litmus_result->>'class')::smallint,
+				CASE
+					WHEN NEW.litmus_result IS NULL THEN 0
+					WHEN COALESCE(NEW.litmus_result->>'lvl', NEW.litmus_result->>'l') IS NULL THEN 2
+					WHEN COALESCE(NEW.litmus_result->>'lvl', NEW.litmus_result->>'l')::int < 0 THEN 0
+					WHEN COALESCE(NEW.litmus_result->>'lvl', NEW.litmus_result->>'l')::int <= %d THEN 2
+					ELSE 1
+				END);
 			RETURN NEW;
 		END;
-		$$`,
+		$$`, CriticalLevel),
 		`CREATE OR REPLACE TRIGGER samples_derive_litmus_score_trg
 			BEFORE INSERT OR UPDATE OF litmus_result ON samples
 			FOR EACH ROW EXECUTE FUNCTION samples_derive_litmus_score()`,
@@ -2410,6 +2469,16 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 		slog.Info("backfill litmus_score batch", "batch", n, "total", stats.Updated)
 	}
 
+	// Pass 1d: litmus_class for litmus-bearing rows analyzed before it became a
+	// trigger-fed column. Extracted (like the archive-member pass below) to keep
+	// backfillPG within length limits.
+	lc, err := db.backfillLitmusClassPG(ctx, backfillBatch)
+	if err != nil {
+		return stats, err
+	}
+	stats.Updated += lc
+	db.reportBackfill(stats.Updated, stats.Scanned)
+
 	// Pass 1: elements / max_crit / suspicious_count for rows whose cleave
 	// columns predate the derive trigger. Candidate rows have cleave_result but
 	// elements wasn't derived yet AND the JSON would actually produce a
@@ -2536,6 +2605,45 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 	stats.MarkersCleared += badTag.RowsAffected()
 
 	return stats, nil
+}
+
+// backfillLitmusClassPG heals litmus_class for litmus-bearing rows analyzed
+// before it became a trigger-fed column (the column is nullable, so those rows
+// are NULL until healed). The samples_derive_litmus_score trigger fills it on
+// every write from here on; this drains the pre-trigger backlog in batches of
+// limit. The IS NULL gate shrinks monotonically — every UPDATE sets a non-null
+// class, so a healed row never re-enters — so unlike the litmus_score pass it
+// never re-scans the (large) already-correct set. CriticalLevel is the pinned
+// cutoff, matching the trigger and feedClassExpr's default-cutoff path; the WHERE
+// guarantees litmus_result IS NOT NULL, so the trigger's null branch is omitted.
+// No updated_at bump: healing a derived column must not reshuffle update queues.
+func (db *DB) backfillLitmusClassPG(ctx context.Context, limit int) (int64, error) {
+	var total int64
+	for {
+		tag, err := db.pool.Exec(ctx, fmt.Sprintf(`
+			UPDATE samples SET litmus_class = COALESCE(
+				(litmus_result->>'class')::smallint,
+				CASE
+					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l') IS NULL THEN 2
+					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int < 0 THEN 0
+					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= %d THEN 2
+					ELSE 1
+				END)
+			WHERE sha256 IN (
+				SELECT sha256 FROM samples
+				WHERE litmus_result IS NOT NULL AND litmus_class IS NULL
+				LIMIT $1
+			)`, CriticalLevel), limit)
+		if err != nil {
+			return total, fmt.Errorf("hopper: backfill litmus_class: %w", err)
+		}
+		n := tag.RowsAffected()
+		total += n
+		if n < int64(limit) {
+			return total, nil
+		}
+		slog.Info("backfill litmus_class batch", "batch", n, "total", total)
+	}
 }
 
 func (db *DB) backfillArchiveMemberLitmusPG(ctx context.Context) (int64, error) {
@@ -3131,6 +3239,8 @@ func (db *DB) applyCleanupPG(ctx context.Context, stage CleanupStage) (int64, er
 }
 
 func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error) {
+	// The class filter reads the indexed litmus_class column at the default
+	// cutoff and re-derives from litmus_result otherwise; see feedClassExpr.
 	rows, err := db.pool.Query(ctx, `
 		SELECT `+pgSampleCols+` FROM samples
 		WHERE ($1 = '' OR source = $1)
@@ -3138,22 +3248,7 @@ func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error
 			AND cleave_result IS NOT NULL
 			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
 			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
-			AND (coalesce(cardinality($5::int[]), 0) = 0 OR
-				-- Match either schema: legacy class field, or v6/v7 level-derived.
-				-- Mirror prism's envelopeClass / workflowSamplesPG: class first;
-				-- else derive from lvl/l using $12 as the hostile/suspicious cutoff
-				-- (null is manual-mode hostile/2; -1 benign/0; 0..=cutoff
-				-- hostile/2; above cutoff suspicious/1).
-				COALESCE(
-					(litmus_result->>'class')::int,
-					CASE
-						WHEN litmus_result IS NULL THEN 0
-						WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l') IS NULL THEN 2
-						WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int < 0 THEN 0
-						WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= $12 THEN 2
-						ELSE 1
-					END
-				) = ANY($5))
+			AND (coalesce(cardinality($5::int[]), 0) = 0 OR `+q.feedClassExpr("$12")+` = ANY($5))
 			AND (NOT $6 OR parent = '')
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
@@ -3163,7 +3258,7 @@ func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error
 		ORDER BY `+q.sortBy()+`
 		LIMIT $10 OFFSET $11`,
 		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
-		q.Formula, q.RequireLitmus, q.Domains, q.Limit, q.Offset, q.criticalLevel(),
+		q.Formula, q.requireLitmus(), q.Domains, q.Limit, q.Offset, q.criticalLevel(),
 		q.searchTerm())
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed samples: %w", err)
@@ -3180,22 +3275,7 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q *FeedQuery) (int, error)
 			AND cleave_result IS NOT NULL
 			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
 			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
-			AND (coalesce(cardinality($5::int[]), 0) = 0 OR
-				-- Match either schema: legacy class field, or v6/v7 level-derived.
-				-- Mirror prism's envelopeClass / workflowSamplesPG: class first;
-				-- else derive from lvl/l using $10 as the hostile/suspicious cutoff
-				-- (null is manual-mode hostile/2; -1 benign/0; 0..=cutoff
-				-- hostile/2; above cutoff suspicious/1).
-				COALESCE(
-					(litmus_result->>'class')::int,
-					CASE
-						WHEN litmus_result IS NULL THEN 0
-						WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l') IS NULL THEN 2
-						WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int < 0 THEN 0
-						WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= $10 THEN 2
-						ELSE 1
-					END
-				) = ANY($5))
+			AND (coalesce(cardinality($5::int[]), 0) = 0 OR `+q.feedClassExpr("$10")+` = ANY($5))
 			AND (NOT $6 OR parent = '')
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
@@ -3203,7 +3283,7 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q *FeedQuery) (int, error)
 			AND ($11 = '' OR filename ILIKE '%' || $11 || '%' ESCAPE '\'
 				OR sha256 = $11)`,
 		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
-		q.Formula, q.RequireLitmus, q.Domains, q.criticalLevel(), q.searchTerm()).Scan(&n)
+		q.Formula, q.requireLitmus(), q.Domains, q.criticalLevel(), q.searchTerm()).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: feed samples count: %w", err)
 	}

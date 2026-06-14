@@ -2719,6 +2719,47 @@ func TestFeedSamplesLitmusClassesV6V7(t *testing.T) {
 	}
 }
 
+func TestFeedQueryRequireLitmus(t *testing.T) {
+	tests := []struct {
+		name string
+		q    FeedQuery
+		want bool
+	}{
+		{"explicit", FeedQuery{RequireLitmus: true}, true},
+		{"no filter", FeedQuery{}, false},
+		{"hostile band", FeedQuery{LitmusClasses: []int{2}}, true},
+		{"suspicious+hostile", FeedQuery{LitmusClasses: []int{1, 2}}, true},
+		{"includes benign", FeedQuery{LitmusClasses: []int{0, 2}}, false},
+		{"benign only", FeedQuery{LitmusClasses: []int{0}}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.q.requireLitmus(); got != tt.want {
+				t.Errorf("requireLitmus() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFeedQueryClassExpr(t *testing.T) {
+	// Default cutoff reads the indexed litmus_class column.
+	if got := (&FeedQuery{}).feedClassExpr("$12"); got != "litmus_class" {
+		t.Errorf("default cutoff: feedClassExpr() = %q, want %q", got, "litmus_class")
+	}
+	if got := (&FeedQuery{CriticalLevel: CriticalLevel}).feedClassExpr("$12"); got != "litmus_class" {
+		t.Errorf("explicit default cutoff: feedClassExpr() = %q, want %q", got, "litmus_class")
+	}
+	// A non-default cutoff must re-derive from litmus_result (the column is
+	// pinned to CriticalLevel) and bind the supplied cutoff placeholder.
+	got := (&FeedQuery{CriticalLevel: 3}).feedClassExpr("$12")
+	if got == "litmus_class" {
+		t.Fatal("non-default cutoff must not use the litmus_class column")
+	}
+	if !strings.Contains(got, "litmus_result->>'class'") || !strings.Contains(got, "<= $12") {
+		t.Errorf("non-default cutoff expr missing derivation or cutoff param: %q", got)
+	}
+}
+
 func TestPool(t *testing.T) {
 	db := openTestDB(t)
 	if db.Pool() != nil {
