@@ -742,7 +742,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 			`<th>Worker</th><th>Litmus</th><th>Traits</th><th>Tools</th>` +
 			`<th>Tasks</th><th>Seen</th><th>Rate</th>` +
 			`<th class="col-rss">RSS</th><th>Load</th>` +
-			`<th>Queue</th><th>Last Done</th><th>F/s</th><th>Err 15m</th>` +
+			`<th>Queue</th><th>Intake</th><th>Last Done</th><th>F/s</th><th>Err 15m</th>` +
 			`<th>Analyzed</th><th>Errors</th><th>Oldest Job</th><th></th>` +
 			`</tr></thead><tbody>`)
 
@@ -817,6 +817,18 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 				lastDoneStr = shortDuration(time.Since(w.LastCompletion))
 			}
 
+			// Claim-side intake: free buffer room, then last poll want→got, then
+			// memory reserved/ceiling. room 0 = saturated (not polling on purpose);
+			// want>got with room = hopper had nothing; reserved≈ceiling = memory
+			// throttle. "—" when the worker doesn't report the telemetry.
+			intakeStr := "—"
+			if !w.LastPollAt.IsZero() {
+				intakeStr = fmt.Sprintf("%d · %d→%d", w.BufferRoom, w.LastWant, w.LastClaim)
+				if w.MemCeilingMB > 0 {
+					intakeStr += fmt.Sprintf(" · %dg/%dg", w.MemReservedMB/1024, w.MemCeilingMB/1024)
+				}
+			}
+
 			fpsStr := "—"
 			if w.FilesPerSec > 0.005 {
 				fpsStr = fmt.Sprintf("%.2f/s", w.FilesPerSec)
@@ -848,6 +860,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 					`<td>%s</td>`+
 					`<td>%s</td>`+
 					`<td>%s</td>`+
+					`<td>%s</td>`+
 					`<td class="rate">%s</td>`+
 					`%s`+
 					`<td class="hi">%s</td>`+
@@ -865,6 +878,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 				rssStr,
 				loadStr,
 				htmlEscape(queueStr),
+				htmlEscape(intakeStr),
 				htmlEscape(lastDoneStr),
 				fpsStr,
 				err15Cell,

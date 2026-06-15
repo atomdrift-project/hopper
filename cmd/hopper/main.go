@@ -2264,6 +2264,24 @@ func logWorkerStatus(workers []namedWorkerStats, nodeRates map[string]float64, o
 				"oldest_job", filepath.Base(claim.Path),
 				"oldest_age", shortDuration(time.Since(claim.ClaimedAt)))
 		}
+		// Why the worker is/isn't pulling more: free buffer room (0 = saturated,
+		// so it stops polling on purpose), and what its last poll asked for vs got
+		// (want>got with room means hopper had nothing for it).
+		attrs = append(attrs,
+			"buffer_room", workers[i].BufferRoom,
+			"want", workers[i].LastWant,
+			"got", workers[i].LastClaim)
+		if workers[i].MemCeilingMB > 0 {
+			attrs = append(attrs, "mem_mb",
+				fmt.Sprintf("%d/%d", workers[i].MemReservedMB, workers[i].MemCeilingMB))
+		}
+		// Room to spare but a stale last poll = the poll loop is wedged, not just
+		// saturated (a full buffer stops polling normally).
+		if workers[i].BufferRoom > 0 && !workers[i].LastPollAt.IsZero() {
+			if age := time.Since(workers[i].LastPollAt); age > workerActiveWindow {
+				attrs = append(attrs, "poll_age", shortDuration(age))
+			}
+		}
 		slog.Info("litmus worker", attrs...)
 	}
 }

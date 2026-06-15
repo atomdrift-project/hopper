@@ -142,6 +142,7 @@ type workerStats struct {
 	LastErrorAt      time.Time
 	LastCompletion   time.Time
 	LastSeen         time.Time
+	LastPollAt       time.Time
 	Tools            string
 	Traits           string
 	Version          string
@@ -151,6 +152,11 @@ type workerStats struct {
 	RSSMB            int
 	Queue            int
 	ReportedActive   int
+	MemReservedMB    int
+	MemCeilingMB     int
+	LastWant         int
+	LastClaim        int
+	BufferRoom       int
 	TotalClaimed     int64
 	Analyzed         int64
 	FilesPerSec      float64
@@ -313,7 +319,7 @@ func (wt *workerTracker) update(name string, slots int, version, traits string, 
 // lastError is sticky across beats, so logging every non-empty value would
 // repeat the same line at the heartbeat cadence; keying on a change logs each
 // distinct error once while the trailing ErrorsRecent count conveys the volume.
-func (wt *workerTracker) heartbeat(name string, hb workerHeartbeat) (newError bool) {
+func (wt *workerTracker) heartbeat(name string, hb *workerHeartbeat) (newError bool) {
 	wt.mu.Lock()
 	defer wt.mu.Unlock()
 	ws, ok := wt.workers[name]
@@ -334,6 +340,12 @@ func (wt *workerTracker) heartbeat(name string, hb workerHeartbeat) (newError bo
 	ws.Tools = hb.tools
 	ws.Queue = hb.queue
 	ws.ReportedActive = hb.active
+	ws.MemReservedMB = hb.memReservedMB
+	ws.MemCeilingMB = hb.memCeilingMB
+	ws.LastWant = hb.lastWant
+	ws.LastClaim = hb.lastClaim
+	ws.BufferRoom = hb.bufferRoom
+	ws.LastPollAt = hb.lastPollAt
 	ws.OldestQueueSince = hb.oldestQueueSince
 	ws.LastCompletion = hb.lastCompletion
 	ws.FilesPerSec = hb.filesPerSec
@@ -352,9 +364,15 @@ type workerHeartbeat struct { //nolint:govet // embedded-first ordering over fie
 	oldestQueueSince time.Time
 	lastCompletion   time.Time
 	lastErrorAt      time.Time
+	lastPollAt       time.Time
 	lastError        string
 	queue            int
 	active           int
+	memReservedMB    int
+	memCeilingMB     int
+	lastWant         int
+	lastClaim        int
+	bufferRoom       int
 	filesPerSec      float64
 	errorsRecent     int
 }
@@ -825,11 +843,16 @@ func (s *apiServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 			traits:  q.Get("traits"),
 			load1:   queryFloat(q, "load1"),
 		},
-		queue:        queryIntDefault(q, "queue", 0),
-		active:       queryIntDefault(q, "active", 0),
-		filesPerSec:  queryFloat(q, "fps"),
-		errorsRecent: queryIntDefault(q, "errs", 0),
-		lastError:    q.Get("err"),
+		queue:         queryIntDefault(q, "queue", 0),
+		active:        queryIntDefault(q, "active", 0),
+		memReservedMB: queryIntDefault(q, "mem_reserved_mb", 0),
+		memCeilingMB:  queryIntDefault(q, "mem_ceiling_mb", 0),
+		lastWant:      queryIntDefault(q, "want", 0),
+		lastClaim:     queryIntDefault(q, "last_claim", 0),
+		bufferRoom:    queryIntDefault(q, "buffer_room", 0),
+		filesPerSec:   queryFloat(q, "fps"),
+		errorsRecent:  queryIntDefault(q, "errs", 0),
+		lastError:     q.Get("err"),
 	}
 	hb.tools, _ = parseWorkerTools(q["tools"])
 	if n := queryIntDefault(q, "rss_mb", -1); n >= 0 {
@@ -843,11 +866,14 @@ func (s *apiServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if s, ok := queryAgeBefore(q, "done_age_s", now); ok {
 		hb.lastCompletion = s
 	}
+	if s, ok := queryAgeBefore(q, "poll_age_s", now); ok {
+		hb.lastPollAt = s
+	}
 	if s, ok := queryAgeBefore(q, "err_age_s", now); ok {
 		hb.lastErrorAt = s
 	}
 
-	if s.tracker.heartbeat(worker, hb) {
+	if s.tracker.heartbeat(worker, &hb) {
 		// Worker-side analysis errors are otherwise invisible here: heartbeats
 		// are display-only, so without this the only signal is a number ticking
 		// up on the dashboard. Surface the actual error so it lands in the
