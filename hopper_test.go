@@ -60,6 +60,77 @@ func mustAnalyzeWithTraits(t *testing.T, ctx context.Context, db *DB, sha string
 	}
 }
 
+func TestMembersByParentAndSamplesBySHAs(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	const archive = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	// Three members of one archive, distinct scores (generated from fs[0].x).
+	// Paths are this archive's member locations; member() builds a row that
+	// InsertSampleBatch fans out into both samples and sample_locations.
+	member := func(sha string, score int) *Sample {
+		return &Sample{
+			SHA256:       sha,
+			Source:       "test",
+			Label:        "bad",
+			LabelSource:  "test",
+			Parent:       archive,
+			Path:         archive + "!!pkg/" + sha[:4] + ".js",
+			CleaveResult: fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"js","x":%d,"dp":1}]}`, sha, score),
+		}
+	}
+	m1 := "1111111111111111111111111111111111111111111111111111111111111111"
+	m2 := "2222222222222222222222222222222222222222222222222222222222222222"
+	m3 := "3333333333333333333333333333333333333333333333333333333333333333"
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{member(m1, 30), member(m2, 90), member(m3, 60)}); err != nil {
+		t.Fatalf("InsertSampleBatch: %v", err)
+	}
+
+	// Capped list: highest score first, total reflects every member.
+	members, total, err := db.MembersByParent(ctx, archive, 2)
+	if err != nil {
+		t.Fatalf("MembersByParent: %v", err)
+	}
+	if total != 3 {
+		t.Errorf("total = %d, want 3", total)
+	}
+	if len(members) != 2 {
+		t.Fatalf("len(members) = %d, want 2 (capped)", len(members))
+	}
+	if members[0].SHA256 != m2 || members[1].SHA256 != m3 {
+		t.Errorf("order = [%s, %s], want highest-score-first [m2(90), m3(60)]", members[0].SHA256[:4], members[1].SHA256[:4])
+	}
+	if members[0].Score != 90 || members[0].FileType != "js" {
+		t.Errorf("member[0] = score %d type %q, want score 90 type js", members[0].Score, members[0].FileType)
+	}
+	if members[0].Path != archive+"!!pkg/2222.js" {
+		t.Errorf("member[0].Path = %q, want the per-archive location", members[0].Path)
+	}
+
+	// Light listing must not load the heavy blob; the heavy fetch must.
+	heavy, err := db.SamplesBySHAs(ctx, []string{m1, m2})
+	if err != nil {
+		t.Fatalf("SamplesBySHAs: %v", err)
+	}
+	if len(heavy) != 2 {
+		t.Fatalf("len(heavy) = %d, want 2", len(heavy))
+	}
+	for _, s := range heavy {
+		if len(s.CleaveResult) == 0 {
+			t.Errorf("SamplesBySHAs(%s) returned empty CleaveResult", s.SHA256[:4])
+		}
+	}
+
+	// An archive with no members yields nothing, not an error.
+	none, total, err := db.MembersByParent(ctx, m1, 10)
+	if err != nil {
+		t.Fatalf("MembersByParent(no members): %v", err)
+	}
+	if total != 0 || len(none) != 0 {
+		t.Errorf("no-member parent: total=%d members=%d, want 0/0", total, len(none))
+	}
+}
+
 func TestMigrateDoesNotRunBackfill(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()

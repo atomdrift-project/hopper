@@ -1201,45 +1201,6 @@ func (db *DB) samplesBySHAsSQLite(ctx context.Context, shas []string) ([]*Sample
 	return scanLiteSamples(rows)
 }
 
-func (db *DB) samplesByParentSQLite(ctx context.Context, parentSHA string) ([]*Sample, error) {
-	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleCols+` FROM samples WHERE parent = ? ORDER BY path`, parentSHA)
-	if err != nil {
-		return nil, fmt.Errorf("hopper: samples by parent %s: %w", parentSHA, err)
-	}
-	return scanLiteSamples(rows)
-}
-
-func (db *DB) topMembersByParentSQLite(ctx context.Context, parentSHA string, limit int) ([]*Sample, int, error) {
-	var total int
-	if err := db.lite.QueryRowContext(ctx,
-		`SELECT count(*) FROM samples WHERE parent = ?`, parentSHA).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("hopper: count members by parent %s: %w", parentSHA, err)
-	}
-	if total == 0 {
-		return nil, 0, nil
-	}
-	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleCols+` FROM samples WHERE parent = ? ORDER BY score DESC, path LIMIT ?`,
-		parentSHA, limit)
-	if err != nil {
-		return nil, 0, fmt.Errorf("hopper: top members by parent %s: %w", parentSHA, err)
-	}
-	members, err := scanLiteSamples(rows)
-	if err != nil {
-		return nil, 0, err
-	}
-	return members, total, nil
-}
-
-func (db *DB) badMembersByParentSQLite(ctx context.Context, parentSHA string) ([]*Sample, error) {
-	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleCols+` FROM samples WHERE parent = ? AND label = 'bad' ORDER BY path`, parentSHA)
-	if err != nil {
-		return nil, fmt.Errorf("hopper: bad members by parent %s: %w", parentSHA, err)
-	}
-	return scanLiteSamples(rows)
-}
 
 const liteLocationCols = `id, sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime, first_seen_at, last_seen_at`
 

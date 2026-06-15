@@ -1654,45 +1654,6 @@ func (db *DB) samplesBySHAsPG(ctx context.Context, shas []string) ([]*Sample, er
 	return scanPGSamples(rows)
 }
 
-func (db *DB) samplesByParentPG(ctx context.Context, parentSHA string) ([]*Sample, error) {
-	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM samples WHERE parent = $1 ORDER BY path`, parentSHA)
-	if err != nil {
-		return nil, fmt.Errorf("hopper: samples by parent %s: %w", parentSHA, err)
-	}
-	return scanPGSamples(rows)
-}
-
-func (db *DB) topMembersByParentPG(ctx context.Context, parentSHA string, limit int) ([]*Sample, int, error) {
-	var total int
-	if err := db.pool.QueryRow(ctx,
-		`SELECT count(*) FROM samples WHERE parent = $1`, parentSHA).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("hopper: count members by parent %s: %w", parentSHA, err)
-	}
-	if total == 0 {
-		return nil, 0, nil
-	}
-	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM samples WHERE parent = $1 ORDER BY score DESC, path LIMIT $2`,
-		parentSHA, limit)
-	if err != nil {
-		return nil, 0, fmt.Errorf("hopper: top members by parent %s: %w", parentSHA, err)
-	}
-	members, err := scanPGSamples(rows)
-	if err != nil {
-		return nil, 0, err
-	}
-	return members, total, nil
-}
-
-func (db *DB) badMembersByParentPG(ctx context.Context, parentSHA string) ([]*Sample, error) {
-	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM samples WHERE parent = $1 AND label = 'bad' ORDER BY path`, parentSHA)
-	if err != nil {
-		return nil, fmt.Errorf("hopper: bad members by parent %s: %w", parentSHA, err)
-	}
-	return scanPGSamples(rows)
-}
 
 const pgLocationCols = `id, sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime, first_seen_at, last_seen_at`
 

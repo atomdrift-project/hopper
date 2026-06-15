@@ -1468,53 +1468,6 @@ func (db *DB) SamplesBySHAs(ctx context.Context, shas []string) ([]*Sample, erro
 	return db.samplesBySHAsSQLite(ctx, shas)
 }
 
-// SamplesByParent returns all samples whose parent column equals parentSHA,
-// ordered by path. Used to reassemble archive contents after dedup, where
-// a parent's cleave_result contains only its own metadata and children
-// live as separate rows.
-func (db *DB) SamplesByParent(ctx context.Context, parentSHA string) ([]*Sample, error) {
-	if parentSHA == "" {
-		return nil, nil
-	}
-	if db.pool != nil {
-		return db.samplesByParentPG(ctx, parentSHA)
-	}
-	return db.samplesByParentSQLite(ctx, parentSHA)
-}
-
-// TopMembersByParent returns at most limit members of the archive whose parent
-// column equals parentSHA, highest score first, together with the total member
-// count. Bounding the fetch in SQL keeps memory proportional to limit rather
-// than to an archive's (possibly attacker-chosen) member count — and avoids
-// materializing every member's cleave/litmus blobs. The total lets callers
-// report how many members were left unmerged. Ordering by score DESC keeps the
-// most suspicious members when the cap bites: the same ranking the UI uses to
-// decide which files to surface, so the cap drops only what would not be shown.
-func (db *DB) TopMembersByParent(ctx context.Context, parentSHA string, limit int) (members []*Sample, total int, err error) {
-	if parentSHA == "" || limit <= 0 {
-		return nil, 0, nil
-	}
-	if db.pool != nil {
-		return db.topMembersByParentPG(ctx, parentSHA, limit)
-	}
-	return db.topMembersByParentSQLite(ctx, parentSHA, limit)
-}
-
-// BadMembersByParent returns only the bad-labeled members of an archive. Callers
-// that just need to find a dangerous member (e.g. promoter's bad-archive gate)
-// should prefer this over SamplesByParent: it filters in SQL, bounding memory to
-// the bad-member count rather than materializing every member — and its
-// cleave/litmus blobs — of an archive that may have an attacker-chosen number of
-// entries.
-func (db *DB) BadMembersByParent(ctx context.Context, parentSHA string) ([]*Sample, error) {
-	if parentSHA == "" {
-		return nil, nil
-	}
-	if db.pool != nil {
-		return db.badMembersByParentPG(ctx, parentSHA)
-	}
-	return db.badMembersByParentSQLite(ctx, parentSHA)
-}
 
 // SampleParentInfo fetches only the fields needed by ExplodeArchiveMembers,
 // avoiding the cost of reading the full row (especially the large cleave_result
