@@ -33,6 +33,17 @@ const dashQueryTimeout = 10 * time.Second
 // without rerunning the heavy queries on every request.
 const dashCacheTTL = 45 * time.Second
 
+// analysisRateWindow is the look-back used to measure live top-level analysis
+// and rescan throughput for the queue ETAs. Wide enough to smooth the bursty
+// way rescans are serviced — they run only on capacity left over after
+// first-time analysis, so a short window swings between zero and a spike.
+const analysisRateWindow = 60 * time.Minute
+
+// minRescanRate is the rescans/sec below which the backlog is treated as not
+// draining: first-time analysis is consuming the whole fleet, so any ETA would
+// be a meaningless multi-year figure. ~72/hr.
+const minRescanRate = 0.02
+
 // webDashboard serves a self-contained HTML page. Auto-refreshes every 60s;
 // expensive stats are cached (dashCacheTTL) so most refreshes hit memory.
 // Fields guarded by cfgMu are set once via configure() after the load session
@@ -44,6 +55,7 @@ type webDashboard struct {
 	tracker       *workerTracker
 	api           *apiServer // for live traits-version reads (refreshed every 2h)
 	rescanCache   *fido.Cache[string, int64]
+	ratesCache    *fido.Cache[string, hopper.AnalysisRates]
 	pendingCache  *fido.Cache[string, int64]
 	healthCache   *fido.Cache[string, hopper.WorkflowHealth]
 	backlogCache  *fido.Cache[string, []hopper.WorkflowBacklog]
@@ -168,6 +180,7 @@ func (wd *webDashboard) configure( //nolint:revive // argument-limit: dashboard 
 	wd.rescanAge = rescanAge
 	wd.newestATCache = fido.New[string, time.Time](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.rescanCache = fido.New[string, int64](fido.Size(1), fido.TTL(dashCacheTTL))
+	wd.ratesCache = fido.New[string, hopper.AnalysisRates](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.pendingCache = fido.New[string, int64](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.seriesCache = fido.New[string, []queuePoint](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.healthCache = fido.New[string, hopper.WorkflowHealth](fido.Size(1), fido.TTL(dashCacheTTL))
@@ -298,7 +311,7 @@ body{font-family:var(--sans);background:var(--bg);color:var(--text);
 .progress-detail em{font-style:normal;color:var(--text)}
 .track{height:4px;background:var(--border);border-radius:2px;overflow:hidden;display:flex}
 .fill{height:100%;border-radius:2px;transition:width .5s ease;flex-shrink:0}
-.queue-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem;margin-top:1rem}
+.queue-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.75rem;margin-top:1rem}
 .queue-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:.8rem .9rem}
 .queue-label{font-size:.62rem;font-weight:700;letter-spacing:.11em;text-transform:uppercase;color:var(--sub);margin-bottom:.35rem}
 .queue-value{font-family:var(--mono);font-size:1.05rem;color:var(--text);font-weight:600;line-height:1.25}
@@ -501,6 +514,27 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		})
 	}
 
+	// Top-level analysis and rescan rates, measured at the DB so they count
+	// items the queue backlog is denominated in (parent = ''), not the ~80x
+	// larger files/sec the fleet reports once exploded archive members are
+	// included. Dividing a top-level backlog by a files/sec rate is what made
+	// the old ETAs wildly optimistic.
+	var topLevelRate, rescanRate float64
+	if db != nil {
+		//nolint:contextcheck,errcheck // closure creates its own context; closure logs errors before returning
+		rates, _ := wd.ratesCache.Fetch("rates", func() (hopper.AnalysisRates, error) {
+			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
+			defer cancel()
+			v, err := db.AnalysisRatesSince(qctx, analysisRateWindow)
+			if err != nil {
+				slog.Warn("dashboard: AnalysisRatesSince failed", "error", err)
+			}
+			return v, err
+		})
+		topLevelRate = float64(rates.TopLevel) / analysisRateWindow.Seconds()
+		rescanRate = float64(rates.Rescans) / analysisRateWindow.Seconds()
+	}
+
 	var workflow dashboardWorkflow
 	if db != nil {
 		workflow = wd.fetchWorkflow(r.Context(), db)
@@ -541,16 +575,17 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	rate, nodeRateByName := wd.ratesOver(15 * time.Minute)
 
 	var initialETA string
-	if rate > 0.1 && pending > 0 {
-		initialETA = formatETA(time.Duration(float64(pending)/rate) * time.Second)
+	if topLevelRate > 0.001 && pending > 0 {
+		initialETA = formatETA(time.Duration(float64(pending)/topLevelRate) * time.Second)
 	}
+	// Rescan ETA divides the backlog by the *measured* rescan rate, not the
+	// overall analysis rate: rescans are the lowest claim tier and only run on
+	// capacity left after first-time analysis, so the total rate overstates
+	// progress by orders of magnitude. A near-zero rate means ingestion is
+	// consuming the whole fleet and the backlog isn't draining.
 	var rescanETA string
-	if rate > 0.1 && rescanPending > 0 {
-		rescanRemaining := rescanPending
-		if pending > 0 {
-			rescanRemaining += pending
-		}
-		rescanETA = formatETA(time.Duration(float64(rescanRemaining)/rate) * time.Second)
+	if rescanRate > minRescanRate && rescanPending > 0 {
+		rescanETA = formatETA(time.Duration(float64(rescanPending)/rescanRate) * time.Second)
 	}
 
 	pct := 0.0
@@ -599,9 +634,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	if pending > 0 {
 		fmt.Fprintf(&buf, ` &middot; <em>%s</em> pending initial`, fmtN(pending))
 	}
-	if rate > 0.1 {
-		fmt.Fprintf(&buf, ` &middot; <em>%.1f</em>/s (15m avg)`, rate)
-	}
+	// Rates live in the Throughput tile; the progress line stays about progress.
 	if initialETA != "" {
 		fmt.Fprintf(&buf, ` &middot; initial ETA <em>%s</em>`, initialETA)
 	}
@@ -620,8 +653,8 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	writeQueueCard(&buf, "Initial queue", fmt.Sprintf("%s pending", fmtN(pending)), func() string {
 		var parts []string
 		parts = append(parts, fmt.Sprintf("<em>%s</em> total", fmtN(totalExpected)))
-		if rate > 0.1 {
-			parts = append(parts, fmt.Sprintf("<em>%.1f</em>/s", rate))
+		if topLevelRate > 0.001 {
+			parts = append(parts, fmt.Sprintf("<em>%.2f</em>/s", topLevelRate))
 		}
 		if initialETA != "" {
 			parts = append(parts, "ETA <em>"+initialETA+"</em>")
@@ -630,23 +663,29 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	}())
 	rescanMeta := "stale traits disabled"
 	if wd.traitsVersion != "" {
-		var parts []string
-		if pending > 0 && rescanPending > 0 {
-			parts = append(parts, `<span class="queue-note">waits behind initial</span>`)
+		switch {
+		case rescanPending == 0:
+			rescanMeta = "caught up"
+		case rescanETA != "":
+			rescanMeta = "ETA <em>" + rescanETA + "</em>"
+		default:
+			// rescanRate at or below the floor: the fleet is saturated with
+			// first-time analysis, so the rescan backlog is not draining.
+			rescanMeta = `<span class="queue-note">stalled &mdash; initial analysis at capacity</span>`
 		}
-		if rescanETA != "" {
-			label := "ETA"
-			if pending > 0 {
-				label = "finish after initial"
-			}
-			parts = append(parts, label+" <em>"+rescanETA+"</em>")
-		}
-		if len(parts) == 0 {
-			parts = append(parts, "ready when initial queue is empty")
-		}
-		rescanMeta = strings.Join(parts, " &middot; ")
 	}
 	writeQueueCard(&buf, "Rescan queue", fmt.Sprintf("%s pending", fmtN(rescanPending)), rescanMeta)
+
+	// Throughput tile: the rescan rate gets its own labeled home rather than
+	// hiding on the rescan card's ETA line. The headline is top-level items/s
+	// (what the queues drain in); the meta carries the much larger raw files/s
+	// (archive members included) and, when enabled, the rescan slice of it.
+	throughputMeta := fmt.Sprintf("<em>%.0f</em> files/s", rate)
+	if wd.traitsVersion != "" {
+		throughputMeta += fmt.Sprintf(" &middot; <em>%.2f</em> rescan/s", rescanRate)
+	}
+	writeQueueCard(&buf, "Throughput", fmt.Sprintf("%.2f items/s", topLevelRate), throughputMeta)
+
 	ingestMeta := fmt.Sprintf("<em>%s</em> known &middot; <em>%s</em> inserted", fmtN(progress.cacheHits.Load()), fmtN(inserted))
 	if !progress.walkDone.Load() || inPipeline > 0 {
 		ingestMeta += ` &middot; <span class="queue-note">walking</span>`
@@ -1253,10 +1292,13 @@ func writeMiniGraph(buf *strings.Builder, title, cur string, vals []float64, col
 
 func formatETA(d time.Duration) string {
 	d = d.Round(time.Second)
+	days := int(d / (24 * time.Hour))
 	h := int(d / time.Hour)
 	m := int((d % time.Hour) / time.Minute)
 	s := int((d % time.Minute) / time.Second)
 	switch {
+	case days > 0:
+		return fmt.Sprintf("%dd%02dh", days, h%24)
 	case h > 0:
 		return fmt.Sprintf("%dh%02dm", h, m)
 	case m > 0:

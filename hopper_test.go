@@ -326,6 +326,52 @@ func TestSamplesInPipelineStage(t *testing.T) {
 	}
 }
 
+func TestAnalysisRatesSince(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+	ins := func(sha, parent string, first, analyzed *time.Time) {
+		t.Helper()
+		var firstS, analyzedS any
+		if first != nil {
+			firstS = first.UTC().Format(time.RFC3339Nano)
+		}
+		if analyzed != nil {
+			analyzedS = analyzed.UTC().Format(time.RFC3339Nano)
+		}
+		if _, err := db.lite.ExecContext(ctx, `
+			INSERT INTO samples (sha256, source, label, label_source, path, parent, analyzed_at, first_analyzed_at)
+			VALUES (?, 'test', 'bad', 'test', ?, ?, ?, ?)`,
+			sha, "test/"+sha, parent, analyzedS, firstS); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hex := func(c byte) string { return strings.Repeat(string(c), 64) }
+
+	recent := now.Add(-5 * time.Minute) // inside the 60m window
+	older := now.Add(-240 * time.Hour)  // a much earlier first analysis
+	stale := now.Add(-90 * time.Minute) // outside the 60m window
+
+	ins(hex('a'), "", &recent, &recent)      // top-level first-time analysis: top-level, not rescan
+	ins(hex('b'), "", &older, &recent)       // top-level rescan inside the window: counts in both
+	ins(hex('c'), "", &older, &stale)        // top-level rescan, but before the window: excluded
+	ins(hex('d'), "", nil, &recent)          // top-level analyzed, first never stamped: top-level, not rescan
+	ins(hex('e'), "", nil, nil)              // never analyzed: excluded
+	ins(hex('0'), hex('f'), &older, &recent) // archive CHILD rescan: excluded by the parent filter
+
+	r, err := db.AnalysisRatesSince(ctx, 60*time.Minute)
+	if err != nil {
+		t.Fatalf("AnalysisRatesSince: %v", err)
+	}
+	if r.TopLevel != 3 { // a, b, d
+		t.Errorf("TopLevel = %d, want 3", r.TopLevel)
+	}
+	if r.Rescans != 1 { // b only — child excluded by parent, d has no first, a is first-time
+		t.Errorf("Rescans = %d, want 1", r.Rescans)
+	}
+}
+
 func TestCountByLabel(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()

@@ -2013,6 +2013,43 @@ func (db *DB) CountRescanPending(ctx context.Context, currentTraits string, resc
 	return n, err
 }
 
+// AnalysisRates summarizes top-level (parent = ”) analysis throughput over a
+// window. Children of exploded archives are excluded on purpose: they are
+// created already-analyzed in bulk when their parent is processed, so counting
+// them inflates throughput by ~80x and makes any ETA against the top-level
+// backlog (pending / rescan counts, which are all parent = ”) meaningless.
+type AnalysisRates struct {
+	TopLevel int64 // top-level samples (re)analyzed in the window
+	Rescans  int64 // subset that were re-analyzed (first analysis predates this one)
+}
+
+// AnalysisRatesSince counts top-level analyses in the window, split into rescans
+// (first_analyzed_at < analyzed_at) and the rest. A first-time analysis stamps
+// first_analyzed_at and analyzed_at together, so the strict inequality isolates
+// genuine rescans. Divided by the window these give the live top-level and
+// rescan rates the dashboard uses for honest queue ETAs: rescans are the lowest
+// claim tier, so their rate is a fraction of the overall analysis rate, and the
+// overall analysis rate is itself far below the raw files/sec the fleet reports
+// once archive members are excluded.
+func (db *DB) AnalysisRatesSince(ctx context.Context, window time.Duration) (AnalysisRates, error) {
+	since := time.Now().Add(-window).UTC()
+	const rescanExpr = `count(CASE WHEN first_analyzed_at IS NOT NULL AND first_analyzed_at < analyzed_at THEN 1 END)`
+	var r AnalysisRates
+	var err error
+	if db.pool != nil {
+		err = db.pool.QueryRow(ctx,
+			`SELECT count(*), `+rescanExpr+
+				` FROM samples WHERE analyzed_at >= $1 AND parent = ''`,
+			since).Scan(&r.TopLevel, &r.Rescans)
+	} else {
+		err = db.lite.QueryRowContext(ctx,
+			`SELECT count(*), `+rescanExpr+
+				` FROM samples WHERE analyzed_at >= ? AND parent = ''`,
+			since.Format(time.RFC3339Nano)).Scan(&r.TopLevel, &r.Rescans)
+	}
+	return r, err
+}
+
 // WorkflowSnapshot returns a compact dashboard-oriented view of freshness,
 // queue shape, and recent samples.
 func (db *DB) WorkflowSnapshot(ctx context.Context, limit int) (WorkflowSnapshot, error) {
