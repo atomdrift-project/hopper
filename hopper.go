@@ -356,6 +356,7 @@ type Sample struct {
 	FetchedAt       *time.Time // when the collector fetched the artifact (UTC); distinct from CreatedAt
 	CleaveResult    []byte     // raw cleave JSON, nil if unanalyzed
 	LitmusResult    []byte     // litmus classification envelope JSON, nil if unclassified
+	LLMResult       []byte     // LLM interpretation JSON (envelope `llm`), nil when no interpretation pass ran
 	Provenance      []byte     // collector provenance sidecar JSON, nil if none
 	LitmusScore     float64    // litmus confidence score (0.0-1.0)
 	ID              int64
@@ -1435,6 +1436,24 @@ func (db *DB) SamplesByParent(ctx context.Context, parentSHA string) ([]*Sample,
 	return db.samplesByParentSQLite(ctx, parentSHA)
 }
 
+// TopMembersByParent returns at most limit members of the archive whose parent
+// column equals parentSHA, highest score first, together with the total member
+// count. Bounding the fetch in SQL keeps memory proportional to limit rather
+// than to an archive's (possibly attacker-chosen) member count — and avoids
+// materializing every member's cleave/litmus blobs. The total lets callers
+// report how many members were left unmerged. Ordering by score DESC keeps the
+// most suspicious members when the cap bites: the same ranking the UI uses to
+// decide which files to surface, so the cap drops only what would not be shown.
+func (db *DB) TopMembersByParent(ctx context.Context, parentSHA string, limit int) (members []*Sample, total int, err error) {
+	if parentSHA == "" || limit <= 0 {
+		return nil, 0, nil
+	}
+	if db.pool != nil {
+		return db.topMembersByParentPG(ctx, parentSHA, limit)
+	}
+	return db.topMembersByParentSQLite(ctx, parentSHA, limit)
+}
+
 // BadMembersByParent returns only the bad-labeled members of an archive. Callers
 // that just need to find a dangerous member (e.g. promoter's bad-archive gate)
 // should prefer this over SamplesByParent: it filters in SQL, bounding memory to
@@ -1556,6 +1575,17 @@ func (db *DB) UpdateLitmusResult(ctx context.Context, sha256 string, result []by
 		return db.updateLitmusResultPG(ctx, sha256, result)
 	}
 	return db.updateLitmusResultSQLite(ctx, sha256, result)
+}
+
+// UpdateLLMResult stores the optional LLM interpretation (envelope `llm`) for a
+// sample. The interpretation pass is gated, so most results carry none; an empty
+// result clears the column to NULL so a rescan that drops the pass doesn't leave
+// a stale interpretation behind.
+func (db *DB) UpdateLLMResult(ctx context.Context, sha256 string, result []byte) error {
+	if db.pool != nil {
+		return db.updateLLMResultPG(ctx, sha256, result)
+	}
+	return db.updateLLMResultSQLite(ctx, sha256, result)
 }
 
 // MarkCyclotronAttempt stamps cyclotron_attempted_at = now() so the sample

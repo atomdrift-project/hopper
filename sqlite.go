@@ -101,6 +101,14 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		}
 	}
 
+	// Add llm_result column.
+	hasLLMResult := pragmaHasColumn(ctx, db.lite, "llm_result")
+	if hasLLMResult == 0 {
+		if _, err := db.lite.ExecContext(ctx, `ALTER TABLE samples ADD COLUMN llm_result TEXT`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite: %w", err)
+		}
+	}
+
 	// Add litmus_score column.
 	hasLitmusScore := pragmaHasColumn(ctx, db.lite, "litmus_score")
 	if hasLitmusScore == 0 {
@@ -455,7 +463,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 
 const liteSampleCols = `id, sha256, source, feed, ecosystem,
 	filename, file_type, size_bytes, label, label_source,
-	cleave_result, litmus_result, litmus_score,
+	cleave_result, litmus_result, llm_result, litmus_score,
 	path, status, note, canonical_sha256, parent, skip,
 	formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime,
@@ -642,11 +650,11 @@ func (db *DB) workflowSamplesSQLite(ctx context.Context, where string, limit int
 
 func scanLiteSample(row *sql.Row) (*Sample, error) {
 	s := &Sample{}
-	var cleaveResult, litmusResult, status sql.NullString
+	var cleaveResult, litmusResult, llmResult, status sql.NullString
 	var analyzedAt, firstAnalyzedAt, lastErrorAt, mtime, markerMtime sql.NullTime
 	err := row.Scan(
 		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
-		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &s.LitmusScore,
+		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &llmResult, &s.LitmusScore,
 		&s.Path, &status, &s.Note, &s.CanonicalSHA256, &s.Parent, &s.Skip, &s.Formula,
 		&s.Elements, &s.Score, &s.MaxCrit, &s.SuspiciousCount,
 		&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &firstAnalyzedAt, &lastErrorAt, &mtime, &markerMtime,
@@ -665,6 +673,9 @@ func scanLiteSample(row *sql.Row) (*Sample, error) {
 	}
 	if litmusResult.Valid {
 		s.LitmusResult = []byte(litmusResult.String)
+	}
+	if llmResult.Valid {
+		s.LLMResult = []byte(llmResult.String)
 	}
 	s.Status = status.String
 	if analyzedAt.Valid {
@@ -690,11 +701,11 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 	var out []*Sample
 	for rows.Next() {
 		s := &Sample{}
-		var cleaveResult, litmusResult, status sql.NullString
+		var cleaveResult, litmusResult, llmResult, status sql.NullString
 		var analyzedAt, firstAnalyzedAt, lastErrorAt, mtime, markerMtime sql.NullTime
 		if err := rows.Scan(
 			&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
-			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &s.LitmusScore,
+			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &llmResult, &s.LitmusScore,
 			&s.Path, &status, &s.Note, &s.CanonicalSHA256,
 			&s.Parent, &s.Skip, &s.Formula, &s.Elements,
 			&s.Score, &s.MaxCrit, &s.SuspiciousCount,
@@ -709,6 +720,9 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 		}
 		if litmusResult.Valid {
 			s.LitmusResult = []byte(litmusResult.String)
+		}
+		if llmResult.Valid {
+			s.LLMResult = []byte(llmResult.String)
 		}
 		s.Status = status.String
 		if analyzedAt.Valid {
@@ -1150,6 +1164,28 @@ func (db *DB) samplesByParentSQLite(ctx context.Context, parentSHA string) ([]*S
 	return scanLiteSamples(rows)
 }
 
+func (db *DB) topMembersByParentSQLite(ctx context.Context, parentSHA string, limit int) ([]*Sample, int, error) {
+	var total int
+	if err := db.lite.QueryRowContext(ctx,
+		`SELECT count(*) FROM samples WHERE parent = ?`, parentSHA).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("hopper: count members by parent %s: %w", parentSHA, err)
+	}
+	if total == 0 {
+		return nil, 0, nil
+	}
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleCols+` FROM samples WHERE parent = ? ORDER BY score DESC, path LIMIT ?`,
+		parentSHA, limit)
+	if err != nil {
+		return nil, 0, fmt.Errorf("hopper: top members by parent %s: %w", parentSHA, err)
+	}
+	members, err := scanLiteSamples(rows)
+	if err != nil {
+		return nil, 0, err
+	}
+	return members, total, nil
+}
+
 func (db *DB) badMembersByParentSQLite(ctx context.Context, parentSHA string) ([]*Sample, error) {
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples WHERE parent = ? AND label = 'bad' ORDER BY path`, parentSHA)
@@ -1323,6 +1359,22 @@ func (db *DB) updateLitmusResultSQLite(ctx context.Context, sha256 string, resul
 		WHERE sha256 = ?`, string(result), now(), sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update litmus result: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) updateLLMResultSQLite(ctx context.Context, sha256 string, result []byte) error {
+	// Store NULL rather than an empty string when no interpretation ran, so the
+	// column is absent exactly when the pass was.
+	var val any
+	if len(result) > 0 {
+		val = string(result)
+	}
+	_, err := db.lite.ExecContext(ctx, `
+		UPDATE samples SET llm_result = ?, updated_at = ?
+		WHERE sha256 = ?`, val, now(), sha256)
+	if err != nil {
+		return fmt.Errorf("hopper: update llm result: %w", err)
 	}
 	return nil
 }

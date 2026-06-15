@@ -73,6 +73,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS max_crit INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS suspicious_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS litmus_result JSONB`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS llm_result JSONB`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS litmus_score DOUBLE PRECISION NOT NULL DEFAULT 0`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent) WHERE parent != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_formula ON samples(formula) WHERE formula != ''`,
@@ -1063,7 +1064,7 @@ func (db *DB) invalidPGIndex(ctx context.Context, indexName string) (bool, error
 }
 
 const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, cleave_result, litmus_result, litmus_score,
+	size_bytes, label, label_source, cleave_result, litmus_result, llm_result, litmus_score,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime, traits_version,
 	url, domain, package, version`
@@ -1079,7 +1080,7 @@ const pgSampleColsLight = `id, sha256, source, feed, ecosystem, filename, file_t
 func pgSampleDest(s *Sample) []any {
 	return []any{
 		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
-		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &s.CleaveResult, &s.LitmusResult, &s.LitmusScore,
+		&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &s.CleaveResult, &s.LitmusResult, &s.LLMResult, &s.LitmusScore,
 		&s.Path, &s.Status, &s.Note, &s.CanonicalSHA256,
 		&s.Parent, &s.Skip, &s.Formula, &s.Elements, &s.Score,
 		&s.MaxCrit, &s.SuspiciousCount,
@@ -1622,6 +1623,28 @@ func (db *DB) samplesByParentPG(ctx context.Context, parentSHA string) ([]*Sampl
 	return scanPGSamples(rows)
 }
 
+func (db *DB) topMembersByParentPG(ctx context.Context, parentSHA string, limit int) ([]*Sample, int, error) {
+	var total int
+	if err := db.pool.QueryRow(ctx,
+		`SELECT count(*) FROM samples WHERE parent = $1`, parentSHA).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("hopper: count members by parent %s: %w", parentSHA, err)
+	}
+	if total == 0 {
+		return nil, 0, nil
+	}
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples WHERE parent = $1 ORDER BY score DESC, path LIMIT $2`,
+		parentSHA, limit)
+	if err != nil {
+		return nil, 0, fmt.Errorf("hopper: top members by parent %s: %w", parentSHA, err)
+	}
+	members, err := scanPGSamples(rows)
+	if err != nil {
+		return nil, 0, err
+	}
+	return members, total, nil
+}
+
 func (db *DB) badMembersByParentPG(ctx context.Context, parentSHA string) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples WHERE parent = $1 AND label = 'bad' ORDER BY path`, parentSHA)
@@ -1789,6 +1812,22 @@ func (db *DB) updateLitmusResultPG(ctx context.Context, sha256 string, result []
 		WHERE sha256 = $1`, sha256, sanitizeJSONB(result))
 	if err != nil {
 		return fmt.Errorf("hopper: update litmus result: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) updateLLMResultPG(ctx context.Context, sha256 string, result []byte) error {
+	// An absent interpretation must store SQL NULL, not an empty string that
+	// fails JSONB parsing — normalize empty to nil so pgx sends NULL.
+	var val []byte
+	if len(result) > 0 {
+		val = sanitizeJSONB(result)
+	}
+	_, err := db.pool.Exec(ctx, `
+		UPDATE samples SET llm_result = $2, updated_at = now()
+		WHERE sha256 = $1`, sha256, val)
+	if err != nil {
+		return fmt.Errorf("hopper: update llm result: %w", err)
 	}
 	return nil
 }

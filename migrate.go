@@ -432,10 +432,10 @@ func eachSampleSQLite(ctx context.Context, db *DB, afterID int64, fn func(*Sampl
 	defer rows.Close() //nolint:errcheck // best-effort cleanup
 	for rows.Next() {
 		s := &Sample{}
-		var cleaveResult, litmusResult, status sql.NullString
+		var cleaveResult, litmusResult, llmResult, status sql.NullString
 		var analyzedAt, firstAnalyzedAt, lastErrorAt, mtime, markerMtime sql.NullTime
 		if err := rows.Scan(&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
-			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &s.LitmusScore,
+			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &llmResult, &s.LitmusScore,
 			&s.Path, &status, &s.Note, &s.CanonicalSHA256,
 			&s.Parent, &s.Skip, &s.Formula, &s.Elements,
 			&s.Score, &s.MaxCrit, &s.SuspiciousCount,
@@ -450,6 +450,9 @@ func eachSampleSQLite(ctx context.Context, db *DB, afterID int64, fn func(*Sampl
 		}
 		if litmusResult.Valid {
 			s.LitmusResult = []byte(litmusResult.String)
+		}
+		if llmResult.Valid {
+			s.LLMResult = []byte(llmResult.String)
 		}
 		s.Status = status.String
 		if analyzedAt.Valid {
@@ -532,7 +535,7 @@ var sampleStagingCols = []string{
 	"sha256", "source", "feed", "ecosystem", "filename",
 	"size_bytes", "label", "label_source", "path", "status",
 	"note", "canonical_sha256", "parent", "skip", "elements", "max_crit", "suspicious_count",
-	"cleave_result", "litmus_result",
+	"cleave_result", "litmus_result", "llm_result",
 	"analyzed_at", "first_analyzed_at", "last_error_at", "created_at", "updated_at", "mtime", "marker_mtime",
 	"traits_version",
 }
@@ -542,7 +545,7 @@ const sampleStagingDDL = `CREATE TEMP TABLE _staging (
 	size_bytes BIGINT, label TEXT, label_source TEXT,
 	path TEXT, status TEXT, note TEXT, canonical_sha256 TEXT,
 	parent TEXT, skip TEXT, elements TEXT, max_crit INTEGER, suspicious_count INTEGER,
-	cleave_result JSONB, litmus_result JSONB,
+	cleave_result JSONB, litmus_result JSONB, llm_result JSONB,
 	analyzed_at TIMESTAMPTZ, first_analyzed_at TIMESTAMPTZ, last_error_at TIMESTAMPTZ,
 	created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ,
 	traits_version TEXT NOT NULL DEFAULT ''
@@ -551,12 +554,12 @@ const sampleStagingDDL = `CREATE TEMP TABLE _staging (
 const sampleStagingInsert = `INSERT INTO samples (sha256, source, feed, ecosystem, filename,
 	size_bytes, label, label_source, path, status, note, canonical_sha256,
 	parent, skip, elements, max_crit, suspicious_count,
-	cleave_result, litmus_result,
+	cleave_result, litmus_result, llm_result,
 	analyzed_at, first_analyzed_at, last_error_at, created_at, updated_at, mtime, marker_mtime, traits_version)
 SELECT sha256, source, feed, ecosystem, filename,
 	size_bytes, label, label_source, path, status,
 	note, canonical_sha256, parent, skip, elements, max_crit, suspicious_count,
-	cleave_result, litmus_result,
+	cleave_result, litmus_result, llm_result,
 	analyzed_at, first_analyzed_at, last_error_at, created_at, updated_at, mtime, marker_mtime, traits_version
 FROM _staging
 ON CONFLICT (sha256) DO NOTHING`
@@ -572,7 +575,7 @@ func flushSamplesPG(ctx context.Context, dst *DB, samples []*Sample) (int64, err
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 			s.Note, s.CanonicalSHA256, s.Parent, s.Skip, s.Elements, s.MaxCrit, s.SuspiciousCount,
-			sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult),
+			sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult), sanitizeJSONB(s.LLMResult),
 			s.AnalyzedAt, firstAnalyzedAt, s.LastErrorAt, s.CreatedAt, s.UpdatedAt, s.Mtime, s.MarkerMtime,
 			s.TraitsVersion,
 		}
@@ -592,23 +595,26 @@ func flushSamplesSQLite(ctx context.Context, dst *DB, samples []*Sample) (int64,
 		if firstAnalyzedAt == nil {
 			firstAnalyzedAt = s.AnalyzedAt
 		}
-		var cr, lr sql.NullString
+		var cr, lr, llmr sql.NullString
 		if s.CleaveResult != nil {
 			cr = sql.NullString{String: string(s.CleaveResult), Valid: true}
 		}
 		if s.LitmusResult != nil {
 			lr = sql.NullString{String: string(s.LitmusResult), Valid: true}
 		}
+		if s.LLMResult != nil {
+			llmr = sql.NullString{String: string(s.LLMResult), Valid: true}
+		}
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO samples (sha256, source, feed, ecosystem, filename,
 				size_bytes, label, label_source, path, status, note, canonical_sha256,
-				parent, skip, elements, max_crit, suspicious_count, cleave_result, litmus_result,
+				parent, skip, elements, max_crit, suspicious_count, cleave_result, litmus_result, llm_result,
 				analyzed_at, first_analyzed_at, last_error_at, created_at, updated_at, mtime, marker_mtime, traits_version)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (sha256) DO NOTHING`,
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
-			s.Note, s.CanonicalSHA256, s.Parent, s.Skip, s.Elements, s.MaxCrit, s.SuspiciousCount, cr, lr,
+			s.Note, s.CanonicalSHA256, s.Parent, s.Skip, s.Elements, s.MaxCrit, s.SuspiciousCount, cr, lr, llmr,
 			s.AnalyzedAt, firstAnalyzedAt, s.LastErrorAt, s.CreatedAt, s.UpdatedAt, s.Mtime, s.MarkerMtime, s.TraitsVersion)
 		if err != nil {
 			if rollbackErr := tx.Rollback(); rollbackErr != nil {

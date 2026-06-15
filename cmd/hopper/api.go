@@ -523,7 +523,7 @@ const (
 	claimExpiry        = 30 * time.Minute
 	staleClaimAge      = 2 * time.Hour
 	maxWorkerNameLen   = 64
-	maxResultBodyBytes = 256 << 20 // 256 MiB — some archive cleave reports legitimately exceed 128 MiB.
+	maxResultBodyBytes = 512 << 20 // 512 MiB — some archive cleave reports legitimately exceed 256 MiB.
 	maxTrackedWorkers  = 200
 	apiQueryTimeout    = 30 * time.Second
 	resultStoreTimeout = 10 * time.Minute
@@ -574,7 +574,7 @@ const (
 	uploadBodyTimeout = 5 * time.Minute
 	// resultBodyTimeout caps how long the body of a single /api/result may
 	// take to arrive — the same slow-loris defense as uploadBodyTimeout, but
-	// roomier because a result body may reach maxResultBodyBytes (256 MiB).
+	// roomier because a result body may reach maxResultBodyBytes (512 MiB).
 	// Workers run on the local network, so even a slow-link budget is ample.
 	resultBodyTimeout = 10 * time.Minute
 	// uploadTokenMinLen is the smallest acceptable HOPPER_UPLOAD_TOKEN.
@@ -1093,6 +1093,7 @@ type resultRequest struct {
 	Worker     string          `json:"worker"`
 	Error      string          `json:"error"`
 	ML         json.RawMessage `json:"ml"`
+	LLM        json.RawMessage `json:"llm"`
 	Raw        json.RawMessage `json:"raw"`
 	DurationMs int64           `json:"duration_ms"`
 }
@@ -1277,6 +1278,15 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		s.progress.recordErrorf(1, "store", "store litmus result: %s: %v", req.SHA256, err)
 		slog.Error("store litmus result failed", "sha256", req.SHA256, "error", err)
+	}
+
+	// Store the optional LLM interpretation (envelope `llm`); kept in its own
+	// column so consumers read it without disturbing the litmus envelope shape.
+	if err := retryDBAccessNoValue(ctx, "store llm result", req.SHA256, func(ctx context.Context) error {
+		return s.db.UpdateLLMResult(ctx, req.SHA256, req.LLM)
+	}); err != nil {
+		s.progress.recordErrorf(1, "store", "store llm result: %s: %v", req.SHA256, err)
+		slog.Error("store llm result failed", "sha256", req.SHA256, "error", err)
 	}
 
 	s.progress.analyzed.Add(1)
