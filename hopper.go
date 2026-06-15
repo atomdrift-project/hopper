@@ -1454,7 +1454,9 @@ func (db *DB) reconcileLocationParentEdges(ctx context.Context) error {
 	}
 	cursor := int64(0)
 	if v, err := db.KVGet(ctx, locationParentBackfillCurKey); err == nil {
-		cursor, _ = strconv.ParseInt(v, 10, 64)
+		if n, perr := strconv.ParseInt(v, 10, 64); perr == nil {
+			cursor = n
+		}
 	}
 	if db.pool != nil {
 		return db.reconcileLocationParentEdgesPG(ctx, cursor)
@@ -1492,6 +1494,24 @@ func (db *DB) MembersByParent(ctx context.Context, parentSHA string, limit int) 
 		return db.membersByParentPG(ctx, parentSHA, limit)
 	}
 	return db.membersByParentSQLite(ctx, parentSHA, limit)
+}
+
+// BadMembersByParent returns the full sample rows of an archive's bad-labeled
+// members, resolved through the sample_locations edge so it also catches bad
+// content shared across archives (which the content-addressed samples.parent
+// column would miss). Callers that just need to find a dangerous member (e.g.
+// promoter's bad-archive gate) should prefer this over MembersByParent: it
+// filters to label='bad' in SQL, bounding memory to the bad-member count rather
+// than materializing every member — and its cleave/litmus blobs — of an archive
+// that may have an attacker-chosen number of entries.
+func (db *DB) BadMembersByParent(ctx context.Context, parentSHA string) ([]*Sample, error) {
+	if parentSHA == "" {
+		return nil, nil
+	}
+	if db.pool != nil {
+		return db.badMembersByParentPG(ctx, parentSHA)
+	}
+	return db.badMembersByParentSQLite(ctx, parentSHA)
 }
 
 // SamplesBySHAs fetches full sample rows (including cleave/litmus blobs) for the

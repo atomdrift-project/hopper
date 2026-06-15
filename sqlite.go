@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -1180,7 +1181,7 @@ func (db *DB) membersByParentSQLite(ctx context.Context, parentSHA string, limit
 	if err != nil {
 		return nil, 0, fmt.Errorf("hopper: members by parent %s: %w", parentSHA, err)
 	}
-	defer rows.Close()
+	defer rows.Close() //nolint:errcheck // best-effort cleanup
 	var out []ArchiveMember
 	for rows.Next() {
 		var m ArchiveMember
@@ -1199,10 +1200,23 @@ func (db *DB) samplesBySHAsSQLite(ctx context.Context, shas []string) ([]*Sample
 		placeholders[i] = "?"
 		args[i] = s
 	}
-	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleCols+` FROM samples WHERE sha256 IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	//nolint:gosec // placeholders are '?' bind markers; sha values are parameterized via args.
+	q := `SELECT ` + liteSampleCols + ` FROM samples WHERE sha256 IN (` + strings.Join(placeholders, ",") + `)`
+	rows, err := db.lite.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: samples by shas: %w", err)
+	}
+	return scanLiteSamples(rows)
+}
+
+func (db *DB) badMembersByParentSQLite(ctx context.Context, parentSHA string) ([]*Sample, error) {
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleCols+` FROM samples
+		  WHERE label = 'bad'
+		    AND sha256 IN (SELECT sha256 FROM sample_locations WHERE parent_sha256 = ?)
+		  ORDER BY path`, parentSHA)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: bad members by parent %s: %w", parentSHA, err)
 	}
 	return scanLiteSamples(rows)
 }
@@ -1234,7 +1248,7 @@ func (db *DB) reconcileLocationParentEdgesSQLite(ctx context.Context, cursor int
 		if _, err := db.lite.ExecContext(ctx,
 			`INSERT INTO hopper_kv (key, value) VALUES (?, ?)
 			 ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
-			locationParentBackfillCurKey, fmt.Sprintf("%d", cursor)); err != nil {
+			locationParentBackfillCurKey, strconv.FormatInt(cursor, 10)); err != nil {
 			return fmt.Errorf("hopper: backfill locations: save cursor: %w", err)
 		}
 	}

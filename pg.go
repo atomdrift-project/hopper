@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -1659,6 +1660,18 @@ func (db *DB) samplesBySHAsPG(ctx context.Context, shas []string) ([]*Sample, er
 	return scanPGSamples(rows)
 }
 
+func (db *DB) badMembersByParentPG(ctx context.Context, parentSHA string) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples
+		  WHERE label = 'bad'
+		    AND sha256 IN (SELECT sha256 FROM sample_locations WHERE parent_sha256 = $1)
+		  ORDER BY path`, parentSHA)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: bad members by parent %s: %w", parentSHA, err)
+	}
+	return scanPGSamples(rows)
+}
+
 func (db *DB) reconcileLocationParentEdgesPG(ctx context.Context, cursor int64) error {
 	var maxID int64
 	if err := db.pool.QueryRow(ctx,
@@ -1686,7 +1699,7 @@ func (db *DB) reconcileLocationParentEdgesPG(ctx context.Context, cursor int64) 
 		if _, err := db.pool.Exec(ctx,
 			`INSERT INTO hopper_kv (key, value) VALUES ($1, $2)
 			 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-			locationParentBackfillCurKey, fmt.Sprintf("%d", cursor)); err != nil {
+			locationParentBackfillCurKey, strconv.FormatInt(cursor, 10)); err != nil {
 			return fmt.Errorf("hopper: backfill locations: save cursor: %w", err)
 		}
 	}
