@@ -4,7 +4,10 @@ DATA_DIR  ?= /data/samples
 DB        ?= postgres://hopper@hopper-db/hopper?sslmode=disable
 SOURCE    ?= harvest
 DASH_ADDR ?= 0.0.0.0:8081
-WORKERS   ?= 0
+# Local litmus worker slots. Pinned to 56 (not auto=cores/2=64 on the 128-core
+# server box) to leave RAM headroom for the co-located API server + DB feeder,
+# which were being starved into swap at 64. Override with WORKERS=N if needed.
+WORKERS   ?= 56
 
 help:
 	@echo "Available targets:"
