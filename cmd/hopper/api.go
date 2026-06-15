@@ -1823,7 +1823,7 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
 	}
-	if err := os.MkdirAll(tmpDir, 0o750); err != nil {
+	if err := mkdirSharedAll(tmpDir); err != nil {
 		slog.Error("upload: mkdir tmp", "error", err)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
@@ -1913,7 +1913,7 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid filename"}`)
 		return
 	}
-	if err := os.MkdirAll(absDir, 0o750); err != nil {
+	if err := mkdirSharedAll(absDir); err != nil {
 		slog.Error("upload: mkdir shard", "error", err, "dir", absDir)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
@@ -1924,6 +1924,11 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		slog.Error("upload: rename", "error", err, "from", tmpPath, "to", absPath)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
+	}
+	// Uploaded samples are immutable; force the read-only, group-readable sample
+	// mode (os.CreateTemp left the temp file at 0600, owner-only).
+	if err := os.Chmod(absPath, sampleFileMode); err != nil {
+		slog.Warn("upload: chmod sample read-only", "error", err, "path", absPath)
 	}
 
 	// Insert (no-op if duplicate sha). Path uses forward slashes — hopper

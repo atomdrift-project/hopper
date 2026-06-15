@@ -228,6 +228,25 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_stale_traits ` +
 			`ON samples(traits_version, analyzed_at) ` +
 			`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''`,
+		// staleTraitsCandidatesPG orders by a priority expression (label-
+		// disagreement bucket, then |litmus_score-0.5|, then analyzed_at). The
+		// index above is keyed (traits_version, analyzed_at), which can't serve
+		// that ordering: with traits_version filtered by inequality (!= current),
+		// Postgres scanned every eligible row and top-N sorted the lot — ~3.8M
+		// rows / 18s per poll once the backlog aged in, starving every worker
+		// that fell through to the rescan tier. This expression index stores rows
+		// in the ORDER BY order, so the planner walks it and stops at LIMIT,
+		// applying traits_version != current and the age/cooldown as residual
+		// filters (both pass for ~all rows, so it terminates after ~LIMIT). The
+		// column expressions must stay byte-identical to the ORDER BY in
+		// staleTraitsCandidatesPG or the planner won't match them.
+		`CREATE INDEX IF NOT EXISTS idx_samples_stale_traits_pri ` +
+			`ON samples(` +
+			`(CASE WHEN label = 'good' AND (max_crit >= 5 OR suspicious_count >= 2) THEN 0 ` +
+			`WHEN label = 'bad' AND max_crit < 5 AND suspicious_count < 2 THEN 0 ELSE 1 END), ` +
+			`(ABS(litmus_score - 0.5)), ` +
+			`analyzed_at) ` +
+			`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''`,
 		// feedSourcesPG / feedEcosystemsPG: DISTINCT feed/ecosystem WHERE source = $1.
 		`CREATE INDEX IF NOT EXISTS idx_samples_source_feed ON samples(source, feed) WHERE feed != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_source_ecosystem ON samples(source, ecosystem) WHERE ecosystem != ''`,

@@ -669,9 +669,11 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		case rescanETA != "":
 			rescanMeta = "ETA <em>" + rescanETA + "</em>"
 		default:
-			// rescanRate at or below the floor: the fleet is saturated with
-			// first-time analysis, so the rescan backlog is not draining.
-			rescanMeta = `<span class="queue-note">stalled &mdash; initial analysis at capacity</span>`
+			// Below the floor for a meaningful ETA. Report the measured rate
+			// (rescans/hr) rather than asserting a cause — a low rate can be
+			// first-time analysis hogging the fleet OR workers starved waiting on
+			// a slow candidate query, and the dashboard can't tell which.
+			rescanMeta = fmt.Sprintf(`<span class="queue-note">barely draining &middot; %.0f/hr</span>`, rescanRate*3600)
 		}
 	}
 	writeQueueCard(&buf, "Rescan queue", fmt.Sprintf("%s pending", fmtN(rescanPending)), rescanMeta)
