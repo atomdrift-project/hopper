@@ -131,6 +131,61 @@ func TestMembersByParentAndSamplesBySHAs(t *testing.T) {
 	}
 }
 
+func TestReconcileLocationParentEdgesBackfill(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	archive := strings.Repeat("a", 64)
+	child := strings.Repeat("b", 64)
+	// Simulate a legacy member: a child row with samples.parent set but no
+	// sample_locations edge (the pre-fan-out state). Raw insert bypasses
+	// InsertSampleBatch's edge fan-out so we reproduce exactly that gap.
+	cleave := fmt.Sprintf(`{"fs":[{"sha":%q,"type":"js","x":42,"dp":1}]}`, child)
+	if _, err := db.lite.ExecContext(ctx, `
+		INSERT INTO samples (sha256, source, label, label_source, path, parent, cleave_result)
+		VALUES (?, 'test', 'bad', 'test', ?, ?, ?)`,
+		child, archive+"!!pkg/evil.js", archive, cleave); err != nil {
+		t.Fatal(err)
+	}
+	if _, total, err := db.MembersByParent(ctx, archive, 10); err != nil || total != 0 {
+		t.Fatalf("pre-backfill: expected no edge yet, got total=%d err=%v", total, err)
+	}
+	// Migrate (in openTestDB) already marked the backfill done on the empty DB;
+	// clear the marker so the reconcile runs against our injected legacy row.
+	if _, err := db.lite.ExecContext(ctx, `DELETE FROM hopper_kv WHERE key LIKE 'backfill:locations:parent%'`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.reconcileLocationParentEdges(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	members, total, err := db.MembersByParent(ctx, archive, 10)
+	if err != nil {
+		t.Fatalf("MembersByParent: %v", err)
+	}
+	if total != 1 || len(members) != 1 || members[0].SHA256 != child {
+		t.Fatalf("post-backfill: expected the child listed, got total=%d members=%d", total, len(members))
+	}
+	if members[0].Score != 42 || members[0].FileType != "js" {
+		t.Errorf("member score/type = %d/%q, want 42/js", members[0].Score, members[0].FileType)
+	}
+
+	// Idempotent + gated: a second run is a no-op (done marker set) and leaves a
+	// single edge, never a duplicate.
+	if err := db.reconcileLocationParentEdges(ctx); err != nil {
+		t.Fatalf("reconcile (2nd): %v", err)
+	}
+	var edges int
+	if err := db.lite.QueryRowContext(ctx,
+		`SELECT count(*) FROM sample_locations WHERE parent_sha256 = ?`, archive).Scan(&edges); err != nil {
+		t.Fatal(err)
+	}
+	if edges != 1 {
+		t.Errorf("expected 1 edge after idempotent re-run, got %d", edges)
+	}
+}
+
 func TestMigrateDoesNotRunBackfill(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()

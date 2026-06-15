@@ -1422,6 +1422,46 @@ func (db *DB) KVSetIfAbsent(ctx context.Context, key, value string) error {
 	return nil
 }
 
+// Keys and chunk size for reconcileLocationParentEdges. The done marker makes
+// every boot after completion a single key read; the cursor lets a boot that
+// was interrupted mid-backfill resume from where it stopped rather than
+// re-scanning from the start.
+const (
+	locationParentBackfillDoneKey = "backfill:locations:parent:v1"
+	locationParentBackfillCurKey  = "backfill:locations:parent:cursor"
+	locationParentBackfillBatch   = 5000
+)
+
+// reconcileLocationParentEdges backfills sample_locations parent edges for
+// archive members whose edge predates the InsertSampleBatch fan-out — the
+// original one-shot table backfill ran only when sample_locations was first
+// created, so members exploded in any later window where the fan-out had not
+// yet shipped have a samples.parent but no edge, and would list no members
+// under the locations-based read path.
+//
+// It is a one-time, resumable reconcile meant to run from migration. Work
+// proceeds in small id-range chunks, each a single short autocommit statement,
+// so even on a multi-million-row samples table it only ever takes brief
+// row-level locks and never holds one long enough to block writers. ON CONFLICT
+// DO NOTHING makes every chunk idempotent. A cursor records progress so an
+// interrupted boot resumes; a done marker short-circuits every later call.
+func (db *DB) reconcileLocationParentEdges(ctx context.Context) error {
+	switch done, err := db.KVGet(ctx, locationParentBackfillDoneKey); {
+	case err != nil && !errors.Is(err, ErrNotFound):
+		return fmt.Errorf("hopper: backfill locations: read marker: %w", err)
+	case done == "done":
+		return nil
+	}
+	cursor := int64(0)
+	if v, err := db.KVGet(ctx, locationParentBackfillCurKey); err == nil {
+		cursor, _ = strconv.ParseInt(v, 10, 64)
+	}
+	if db.pool != nil {
+		return db.reconcileLocationParentEdgesPG(ctx, cursor)
+	}
+	return db.reconcileLocationParentEdgesSQLite(ctx, cursor)
+}
+
 // ArchiveMember is a lightweight listing of one member of an archive: enough to
 // rank and display it without loading its (potentially large) cleave/litmus
 // blobs. Path is the member's location within this specific archive (from
@@ -1467,7 +1507,6 @@ func (db *DB) SamplesBySHAs(ctx context.Context, shas []string) ([]*Sample, erro
 	}
 	return db.samplesBySHAsSQLite(ctx, shas)
 }
-
 
 // SampleParentInfo fetches only the fields needed by ExplodeArchiveMembers,
 // avoiding the cost of reading the full row (especially the large cleave_result

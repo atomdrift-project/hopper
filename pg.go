@@ -725,6 +725,11 @@ func (db *DB) migrateServingPG(ctx context.Context, allowRewrite bool) (func(con
 			}
 		}
 		slog.Info("index migrations applied", "count", len(deferred))
+		// One-time, chunked, resumable; a non-fatal failure just resumes next
+		// boot, so a transient hiccup never blocks startup.
+		if err := db.reconcileLocationParentEdges(ctx); err != nil {
+			slog.Warn("sample_locations parent-edge backfill incomplete; will resume on next boot", "error", err)
+		}
 		return nil
 	}, nil
 }
@@ -1654,6 +1659,46 @@ func (db *DB) samplesBySHAsPG(ctx context.Context, shas []string) ([]*Sample, er
 	return scanPGSamples(rows)
 }
 
+func (db *DB) reconcileLocationParentEdgesPG(ctx context.Context, cursor int64) error {
+	var maxID int64
+	if err := db.pool.QueryRow(ctx,
+		`SELECT COALESCE(max(id), 0) FROM samples WHERE parent <> ''`).Scan(&maxID); err != nil {
+		return fmt.Errorf("hopper: backfill locations: bounds: %w", err)
+	}
+	for cursor < maxID {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		hi := cursor + locationParentBackfillBatch
+		// One short autocommit statement per id window: a PK range scan bounded
+		// to the batch, inserting only the edges still missing. Row-level locks
+		// only, released immediately — no long-held lock on samples.
+		if _, err := db.pool.Exec(ctx, `
+			INSERT INTO sample_locations
+				(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime, first_seen_at, last_seen_at)
+			SELECT sha256, path, parent, filename, source, feed, ecosystem, mtime, created_at, updated_at
+			  FROM samples
+			 WHERE id > $1 AND id <= $2 AND parent <> '' AND path <> ''
+			ON CONFLICT (sha256, path) DO NOTHING`, cursor, hi); err != nil {
+			return fmt.Errorf("hopper: backfill locations: chunk (%d,%d]: %w", cursor, hi, err)
+		}
+		cursor = hi
+		if _, err := db.pool.Exec(ctx,
+			`INSERT INTO hopper_kv (key, value) VALUES ($1, $2)
+			 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+			locationParentBackfillCurKey, fmt.Sprintf("%d", cursor)); err != nil {
+			return fmt.Errorf("hopper: backfill locations: save cursor: %w", err)
+		}
+	}
+	if _, err := db.pool.Exec(ctx,
+		`INSERT INTO hopper_kv (key, value) VALUES ($1, 'done')
+		 ON CONFLICT (key) DO UPDATE SET value = 'done'`,
+		locationParentBackfillDoneKey); err != nil {
+		return fmt.Errorf("hopper: backfill locations: done marker: %w", err)
+	}
+	slog.Info("sample_locations parent-edge backfill complete", "max_id", maxID)
+	return nil
+}
 
 const pgLocationCols = `id, sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime, first_seen_at, last_seen_at`
 
