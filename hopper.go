@@ -1422,6 +1422,52 @@ func (db *DB) KVSetIfAbsent(ctx context.Context, key, value string) error {
 	return nil
 }
 
+// ArchiveMember is a lightweight listing of one member of an archive: enough to
+// rank and display it without loading its (potentially large) cleave/litmus
+// blobs. Path is the member's location within this specific archive (from
+// sample_locations), so a content-deduplicated member shows the correct path
+// per containing archive. Heavy per-member data is fetched on demand by SHA via
+// SamplesBySHAs.
+type ArchiveMember struct {
+	SHA256   string
+	Path     string
+	FileType string
+	Score    int
+	MaxCrit  int
+}
+
+// MembersByParent lists an archive's members from sample_locations — the
+// authoritative archive↔member edge table, which (unlike the content-addressed
+// samples.parent column) records every edge even when a member's content is
+// shared across archives. It returns the top members by score (capped at limit)
+// plus the total member count, joining only the light score columns so the big
+// cleave/litmus blobs are never loaded here; callers fetch those on demand for
+// just the members they render (see SamplesBySHAs). The parent_sha256 lookup is
+// served index-only by idx_sl_parent_child.
+func (db *DB) MembersByParent(ctx context.Context, parentSHA string, limit int) (members []ArchiveMember, total int, err error) {
+	if parentSHA == "" || limit <= 0 {
+		return nil, 0, nil
+	}
+	if db.pool != nil {
+		return db.membersByParentPG(ctx, parentSHA, limit)
+	}
+	return db.membersByParentSQLite(ctx, parentSHA, limit)
+}
+
+// SamplesBySHAs fetches full sample rows (including cleave/litmus blobs) for the
+// given SHAs in a single round-trip. Pairs with MembersByParent: list members
+// cheaply, then load heavy data only for the handful actually rendered. Order is
+// unspecified; callers index the result by SHA.
+func (db *DB) SamplesBySHAs(ctx context.Context, shas []string) ([]*Sample, error) {
+	if len(shas) == 0 {
+		return nil, nil
+	}
+	if db.pool != nil {
+		return db.samplesBySHAsPG(ctx, shas)
+	}
+	return db.samplesBySHAsSQLite(ctx, shas)
+}
+
 // SamplesByParent returns all samples whose parent column equals parentSHA,
 // ordered by path. Used to reassemble archive contents after dedup, where
 // a parent's cleave_result contains only its own metadata and children

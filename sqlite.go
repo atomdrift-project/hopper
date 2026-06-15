@@ -1155,6 +1155,52 @@ func (db *DB) sampleBySHA256SQLite(ctx context.Context, sha256 string) (*Sample,
 	return s, nil
 }
 
+func (db *DB) membersByParentSQLite(ctx context.Context, parentSHA string, limit int) ([]ArchiveMember, int, error) {
+	var total int
+	if err := db.lite.QueryRowContext(ctx,
+		`SELECT count(*) FROM sample_locations WHERE parent_sha256 = ?`, parentSHA).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("hopper: count members by parent %s: %w", parentSHA, err)
+	}
+	if total == 0 {
+		return nil, 0, nil
+	}
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT s.sha256, sl.path, s.file_type, s.score, s.max_crit
+		  FROM sample_locations sl
+		  JOIN samples s ON s.sha256 = sl.sha256
+		 WHERE sl.parent_sha256 = ?
+		 ORDER BY s.score DESC, s.max_crit DESC, sl.path
+		 LIMIT ?`, parentSHA, limit)
+	if err != nil {
+		return nil, 0, fmt.Errorf("hopper: members by parent %s: %w", parentSHA, err)
+	}
+	defer rows.Close()
+	var out []ArchiveMember
+	for rows.Next() {
+		var m ArchiveMember
+		if err := rows.Scan(&m.SHA256, &m.Path, &m.FileType, &m.Score, &m.MaxCrit); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, m)
+	}
+	return out, total, rows.Err()
+}
+
+func (db *DB) samplesBySHAsSQLite(ctx context.Context, shas []string) ([]*Sample, error) {
+	placeholders := make([]string, len(shas))
+	args := make([]any, len(shas))
+	for i, s := range shas {
+		placeholders[i] = "?"
+		args[i] = s
+	}
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleCols+` FROM samples WHERE sha256 IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: samples by shas: %w", err)
+	}
+	return scanLiteSamples(rows)
+}
+
 func (db *DB) samplesByParentSQLite(ctx context.Context, parentSHA string) ([]*Sample, error) {
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples WHERE parent = ? ORDER BY path`, parentSHA)
