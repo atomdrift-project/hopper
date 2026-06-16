@@ -514,11 +514,13 @@ type cleaveCompactFileEntry struct {
 	OldFormula string             `json:"f"`
 	SHA256     string             `json:"sha"`
 	FileType   string             `json:"type"`
-	Traits     []cleaveTraitEntry `json:"find"`
-	OldTraits  []cleaveTraitEntry `json:"ts"`
+	Traits     []cleaveTraitEntry `json:"traits"` // v8
+	V7Traits   []cleaveTraitEntry `json:"find"`   // v7
+	OldTraits  []cleaveTraitEntry `json:"ts"`     // v4
 	Score      int                `json:"risk"`
 	OldScore   int                `json:"x"`
-	Depth      int                `json:"dp"`
+	Depth      int                `json:"depth"` // v8
+	OldDepth   int                `json:"dp"`    // v7
 }
 
 // ParseCleaveResult extracts file info and canonical SHA from a cleave compact
@@ -529,7 +531,8 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 		return CleaveParseResult{CanonicalSHA: sha256}
 	}
 	var report struct {
-		TraitsVersion string                   `json:"tv"`
+		TraitsVersion    string                   `json:"rev"` // v8
+		OldTraitsVersion string                   `json:"tv"`  // v7
 		Files         []cleaveCompactFileEntry `json:"files"`
 		OldFiles      []cleaveCompactFileEntry `json:"fs"`
 	}
@@ -553,7 +556,11 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 	var fi cleaveFileInfo
 	for i := range report.Files {
 		f := &report.Files[i]
-		if f.SHA256 != sha256 && f.Depth != 0 {
+		depth := f.Depth
+		if depth == 0 {
+			depth = f.OldDepth
+		}
+		if f.SHA256 != sha256 && depth != 0 {
 			continue
 		}
 		formula := f.Formula
@@ -565,6 +572,9 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 			score = f.OldScore
 		}
 		traits := f.Traits
+		if len(traits) == 0 {
+			traits = f.V7Traits
+		}
 		if len(traits) == 0 {
 			traits = f.OldTraits
 		}
@@ -593,13 +603,17 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 		break
 	}
 
-	return CleaveParseResult{CanonicalSHA: canonical, FileInfo: fi, TraitsVersion: report.TraitsVersion}
+	tv := report.TraitsVersion
+	if tv == "" {
+		tv = report.OldTraitsVersion
+	}
+	return CleaveParseResult{CanonicalSHA: canonical, FileInfo: fi, TraitsVersion: tv}
 }
 
 func parsedCleaveFilesLookCompact(files []cleaveCompactFileEntry) bool {
 	for i := range files {
 		f := &files[i]
-		if f.SHA256 != "" || f.FileType != "" || f.Depth != 0 || f.Formula != "" || f.OldFormula != "" {
+		if f.SHA256 != "" || f.FileType != "" || f.Depth != 0 || f.OldDepth != 0 || f.Formula != "" || f.OldFormula != "" {
 			return true
 		}
 	}
@@ -703,17 +717,33 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 				OldLevel int     `json:"l"`
 				Conf     float64 `json:"conf"`
 				OldConf  float64 `json:"c"`
-			} `json:"find"`
+			} `json:"traits"` // v8
+			V7Traits []struct {
+				Level    int     `json:"crit"`
+				OldLevel int     `json:"l"`
+				Conf     float64 `json:"conf"`
+				OldConf  float64 `json:"c"`
+			} `json:"find"` // v7
 			OldTraits []struct {
 				Level int     `json:"l"`
 				Conf  float64 `json:"c"`
-			} `json:"ts"`
-			Size    int64 `json:"size"`
-			OldSize int64 `json:"sz"`
-			Depth   int   `json:"dp"`
+			} `json:"ts"` // v4
+			Size     int64 `json:"size"`
+			OldSize  int64 `json:"sz"`
+			Depth    int   `json:"depth"` // v8
+			OldDepth int   `json:"dp"`    // v7
 		}
-		if json.Unmarshal(raw, &entry) != nil || entry.Depth == 0 {
+		if json.Unmarshal(raw, &entry) != nil {
 			continue
+		}
+		if entry.Depth == 0 {
+			entry.Depth = entry.OldDepth
+		}
+		if entry.Depth == 0 {
+			continue
+		}
+		if len(entry.Traits) == 0 {
+			entry.Traits = entry.V7Traits
 		}
 		if len(entry.Traits) == 0 {
 			for _, t := range entry.OldTraits {

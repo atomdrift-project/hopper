@@ -45,12 +45,34 @@ as_root() {
     else return 1; fi
 }
 
+# The schedule runs the healer AS postgres, which usually cannot read an
+# operator's ~/.pgpass (mode 600 inside a 0700 home dir). Same hazard we handle
+# for the healer script itself (copied to a postgres-readable path below) and
+# that freebsd-bastille.sh handles by seeding the jail's postgres .pgpass: copy
+# the credentials into postgres's own home and repoint PGPASSFILE there, so the
+# value baked into the unit/crontab is one postgres can actually read.
+ensure_pg_readable_pgpass() {
+    src="${PGPASSFILE:-$HOME/.pgpass}"
+    [ -f "$src" ] || return 0                       # nothing to relocate
+    pg_home=$(getent passwd postgres 2>/dev/null | cut -d: -f6)
+    [ -n "$pg_home" ] || { warn "no postgres home found; leaving PGPASSFILE=$src"; return 0; }
+    dest="$pg_home/.pgpass"
+    [ "$src" = "$dest" ] && { PGPASSFILE="$dest"; return 0; }   # already correct
+    if as_root install -o postgres -g postgres -m 600 "$src" "$dest" 2>/dev/null; then
+        log "seeded postgres-readable pgpass -> $dest (from $src)"
+        PGPASSFILE="$dest"
+    else
+        warn "could not seed $dest from $src; healer (User=postgres) may be unable to read $src"
+    fi
+}
+
 # --- systemd path ----------------------------------------------------------
 install_systemd() {
     unit_dir=/etc/systemd/system
     svc="$unit_dir/hopper-replica-heal.service"
     tmr="$unit_dir/hopper-replica-heal.timer"
 
+    ensure_pg_readable_pgpass
     envlines=$(heal_env | sed 's/^/Environment=/')
 
     svc_body=$(cat <<EOF
@@ -91,6 +113,7 @@ EOF
 # --- cron path (postgres crontab) ------------------------------------------
 install_cron() {
     # The healer must run as postgres (local peer auth + postgres-owned .pgpass).
+    ensure_pg_readable_pgpass
     envstr=$(heal_env | tr '\n' ' ')
     logfile="${HEAL_LOG:-/var/db/postgres/.hopper-replica-heal/heal.log}"
     [ -d /var/db/postgres ] || logfile="${HEAL_LOG:-$HOME/.hopper-replica-heal/heal.log}"
