@@ -238,14 +238,56 @@ func compactCleaveResultForStorage(sha256 string, result []byte) []byte {
 		}
 	}
 
-	compactFS, err := json.Marshal([]json.RawMessage{files[top]})
+	// Keep the top file in full; replace every other member with a lightweight
+	// stub that preserves its identity in the existing files[] schema — id, sha,
+	// path, type, depth, size — so a reader can resolve cross-file `from`
+	// references and fetch each child's full analysis by sha, without inventing a
+	// side structure. The heavy ctx/facts/traits are dropped; that is the storage
+	// win. Bounded by maxArchiveMembers (the same cap explosion enforces) so a
+	// pathological member count can't bloat the parent row.
+	stubKeys := []string{"id", "sha", "path", "type", "depth", "dp", "size", "sz", "risk", "mol"}
+	compactFiles := make([]json.RawMessage, 0, len(files))
+	compactFiles = append(compactFiles, files[top])
+	kept := 0
+	for i, raw := range files {
+		if i == top {
+			continue
+		}
+		if kept >= maxArchiveMembers {
+			break
+		}
+		var full map[string]json.RawMessage
+		if json.Unmarshal(raw, &full) != nil {
+			continue
+		}
+		stub := make(map[string]json.RawMessage, len(stubKeys))
+		for _, k := range stubKeys {
+			if v, ok := full[k]; ok {
+				stub[k] = v
+			}
+		}
+		b, err := json.Marshal(stub)
+		if err != nil {
+			continue
+		}
+		compactFiles = append(compactFiles, b)
+		kept++
+	}
+	compactFS, err := json.Marshal(compactFiles)
 	if err != nil {
 		return result
 	}
+
 	delete(envelope, "fs")
 	envelope["files"] = compactFS
 	envelope["truncated"] = json.RawMessage(`true`)
-	envelope["omitted_files"] = json.RawMessage(strconv.Itoa(len(files) - 1))
+	// Only members beyond the storage cap are truly omitted; the rest are present
+	// as stubs awaiting on-demand hydration by the reader.
+	if omitted := (len(files) - 1) - kept; omitted > 0 {
+		envelope["omitted_files"] = json.RawMessage(strconv.Itoa(omitted))
+	} else {
+		delete(envelope, "omitted_files")
+	}
 	compact, err := json.Marshal(envelope)
 	if err != nil {
 		return result
@@ -533,8 +575,8 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 	var report struct {
 		TraitsVersion    string                   `json:"rev"` // v8
 		OldTraitsVersion string                   `json:"tv"`  // v7
-		Files         []cleaveCompactFileEntry `json:"files"`
-		OldFiles      []cleaveCompactFileEntry `json:"fs"`
+		Files            []cleaveCompactFileEntry `json:"files"`
+		OldFiles         []cleaveCompactFileEntry `json:"fs"`
 	}
 	if json.Unmarshal(result, &report) != nil {
 		return CleaveParseResult{CanonicalSHA: sha256}
@@ -706,57 +748,51 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 		files = files[:maxArchiveMembers]
 	}
 
+	// memberTrait reads a member's per-trait criticality across envelope
+	// generations: v8 uses crit/conf, pre-v8 used l/c.
+	type memberTrait struct {
+		Crit    int     `json:"crit"`
+		OldCrit int     `json:"l"`
+		Conf    float64 `json:"conf"`
+		OldConf float64 `json:"c"`
+	}
 	members := make([]*Sample, 0, len(files))
 	for id, raw := range files {
+		// The members-array key was renamed across envelope generations
+		// (v8 "traits", v7 "find", v4 "ts"), as were depth ("depth"/"dp") and
+		// size ("size"/"sz"). Decode every generation so old envelopes still
+		// explode; the cascade below prefers the newest present.
 		var entry struct {
-			SHA256   string `json:"sha"`
-			FileType string `json:"type"`
-			Path     string `json:"path"`
-			Traits   []struct {
-				Level    int     `json:"crit"`
-				OldLevel int     `json:"l"`
-				Conf     float64 `json:"conf"`
-				OldConf  float64 `json:"c"`
-			} `json:"traits"` // v8
-			V7Traits []struct {
-				Level    int     `json:"crit"`
-				OldLevel int     `json:"l"`
-				Conf     float64 `json:"conf"`
-				OldConf  float64 `json:"c"`
-			} `json:"find"` // v7
-			OldTraits []struct {
-				Level int     `json:"l"`
-				Conf  float64 `json:"c"`
-			} `json:"ts"` // v4
-			Size     int64 `json:"size"`
-			OldSize  int64 `json:"sz"`
-			Depth    int   `json:"depth"` // v8
-			OldDepth int   `json:"dp"`    // v7
+			SHA256   string        `json:"sha"`
+			FileType string        `json:"type"`
+			Path     string        `json:"path"`
+			V8Traits []memberTrait `json:"traits"`
+			V7Traits []memberTrait `json:"find"`
+			V4Traits []memberTrait `json:"ts"`
+			Size     int64         `json:"size"`  // v8 + v7
+			V4Size   int64         `json:"sz"`    // v4
+			Depth    int           `json:"depth"` // v8
+			V4Depth  int           `json:"dp"`    // v4–v7
 		}
 		if json.Unmarshal(raw, &entry) != nil {
 			continue
 		}
-		if entry.Depth == 0 {
-			entry.Depth = entry.OldDepth
+		depth := entry.Depth
+		if depth == 0 {
+			depth = entry.V4Depth
 		}
-		if entry.Depth == 0 {
-			continue
+		if depth == 0 {
+			continue // depth 0 is the container itself, not a member
 		}
-		if len(entry.Traits) == 0 {
-			entry.Traits = entry.V7Traits
+		traits := entry.V8Traits
+		if len(traits) == 0 {
+			traits = entry.V7Traits
 		}
-		if len(entry.Traits) == 0 {
-			for _, t := range entry.OldTraits {
-				entry.Traits = append(entry.Traits, struct {
-					Level    int     `json:"crit"`
-					OldLevel int     `json:"l"`
-					Conf     float64 `json:"conf"`
-					OldConf  float64 `json:"c"`
-				}{Level: t.Level, Conf: t.Conf})
-			}
+		if len(traits) == 0 {
+			traits = entry.V4Traits
 		}
 		if entry.Size == 0 {
-			entry.Size = entry.OldSize
+			entry.Size = entry.V4Size
 		}
 		// Cleave's hex output is conventionally lowercase, but normalize
 		// here so one upstream quirk can't bifurcate the dataset.
@@ -781,10 +817,10 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 		// Count suspicious+ findings with sufficient confidence for skip logic.
 		maxLevel := 0
 		suspiciousCount := 0
-		for _, t := range entry.Traits {
-			level := t.Level
+		for _, t := range traits {
+			level := t.Crit
 			if level == 0 {
-				level = t.OldLevel
+				level = t.OldCrit
 			}
 			if level > maxLevel {
 				maxLevel = level

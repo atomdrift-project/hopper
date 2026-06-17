@@ -2165,6 +2165,57 @@ func TestExplodeArchiveMembersCleaveFormat(t *testing.T) {
 	}
 }
 
+// TestExplodeArchiveMembersV8Format is the regression guard for the v8 JSON
+// migration: members are addressed with "depth"/"traits"/"size" rather than
+// pre-v8 "dp"/"ts"/"sz". Reading the old names left every member at depth 0,
+// so explosion skipped them all and an archive's children never reached
+// sample_locations — collapsing the per-file Content view.
+func TestExplodeArchiveMembersV8Format(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	parentSHA := "1111111111111111111111111111111111111111111111111111111111111111"
+	mSha := "2222222222222222222222222222222222222222222222222222222222222222"
+	cleaveJSON := []byte(`{"v":8,"files":[
+		{"sha":"` + parentSHA + `","type":"tar.gz","path":"/abs/data/bad/archive.tgz"},
+		{"sha":"` + mSha + `","type":"py","path":"/abs/data/bad/archive.tgz!!package/setup.py","depth":1,"size":100,"traits":[{"crit":5,"conf":0.95}]}
+	]}`)
+	parent := &Sample{
+		SHA256:       parentSHA,
+		Source:       "test",
+		Label:        "bad",
+		LabelSource:  "test",
+		Path:         "bad/archive.tgz",
+		CleaveResult: cleaveJSON,
+	}
+	mustInsert(t, ctx, db, parent)
+	n, err := db.ExplodeArchiveMembers(ctx, parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("exploded %d members, want 1 (the depth-1 member)", n)
+	}
+	m, err := db.SampleBySHA256(ctx, mSha)
+	if err != nil {
+		t.Fatalf("v8 member not exploded into samples: %v", err)
+	}
+	if want := "bad/archive.tgz!!package/setup.py"; m.Path != want {
+		t.Errorf("member path = %q, want %q", m.Path, want)
+	}
+	if m.SizeBytes != 100 {
+		t.Errorf("member size = %d, want 100 (v8 \"size\")", m.SizeBytes)
+	}
+	// The parent→member edge must exist so MembersByParent can find it.
+	members, total, err := db.MembersByParent(ctx, parentSHA, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(members) != 1 || members[0].SHA256 != mSha {
+		t.Errorf("MembersByParent = %+v (total %d), want the v8 member", members, total)
+	}
+}
+
 // TestExplodeDoesNotClobberWalkerPath is the regression guard for the
 // content-collision orphan class: when a sha has been inserted by the
 // walker (top-level, parent=”) and the same sha then appears inside an
@@ -3107,25 +3158,38 @@ func TestUpdateCleaveResultCompactsArchiveStorage(t *testing.T) {
 		t.Fatalf("canonical = %s, want embedded child %s", got.CanonicalSHA256, childSHA)
 	}
 	var stored struct {
-		TraitsVersion string `json:"tv"`
-		Files         []struct {
-			SHA256 string `json:"sha"`
-			Depth  int    `json:"dp"`
-		} `json:"files"`
-		Truncated    bool `json:"truncated"`
-		OmittedFiles int  `json:"omitted_files"`
+		TraitsVersion string                       `json:"tv"`
+		Files         []map[string]json.RawMessage `json:"files"`
+		Truncated     bool                         `json:"truncated"`
+		OmittedFiles  int                          `json:"omitted_files"`
 	}
 	if err := json.Unmarshal(got.CleaveResult, &stored); err != nil {
 		t.Fatal(err)
 	}
-	if len(stored.Files) != 1 || stored.Files[0].SHA256 != parentSHA || stored.Files[0].Depth != 0 {
-		t.Fatalf("stored files = %+v, want only parent", stored.Files)
+	// The child is kept as a lightweight stub in the existing files[] schema —
+	// not dropped, not moved to a side structure — so its id/sha/path survive
+	// for `from`-reference resolution and on-demand hydration.
+	if len(stored.Files) != 2 {
+		t.Fatalf("stored files = %d, want 2 (parent + child stub): %s", len(stored.Files), got.CleaveResult)
 	}
-	if !stored.Truncated || stored.OmittedFiles != 1 || stored.TraitsVersion != "abcde" {
-		t.Fatalf("stored compact metadata = %+v", stored)
+	if !stored.Truncated || stored.OmittedFiles != 0 || stored.TraitsVersion != "abcde" {
+		t.Fatalf("stored compact metadata: truncated=%v omitted=%d tv=%q", stored.Truncated, stored.OmittedFiles, stored.TraitsVersion)
 	}
-	if bytes.Contains(got.CleaveResult, []byte(childSHA)) {
-		t.Fatalf("stored cleave_result still contains child sha: %s", got.CleaveResult)
+	parentSHAJSON, _ := json.Marshal(parentSHA)
+	if !bytes.Equal(stored.Files[0]["sha"], parentSHAJSON) {
+		t.Fatalf("files[0] sha = %s, want parent", stored.Files[0]["sha"])
+	}
+	childStub := stored.Files[1]
+	childSHAJSON, _ := json.Marshal(childSHA)
+	if !bytes.Equal(childStub["sha"], childSHAJSON) {
+		t.Fatalf("child stub sha = %s, want %s", childStub["sha"], childSHA)
+	}
+	if _, ok := childStub["path"]; !ok {
+		t.Errorf("child stub should retain path: %+v", childStub)
+	}
+	// The heavy, per-trait field (x) must be stripped from the stub.
+	if _, ok := childStub["x"]; ok {
+		t.Errorf("child stub should not retain heavy fields, got %+v", childStub)
 	}
 }
 
