@@ -142,14 +142,26 @@ func classifyLabelTransition(stored, storedSrc, storedSkip, in, inSrc string) (c
 	}
 }
 
-// sanitizeJSONB fixes JSON that is valid in lenient parsers but rejected by
-// PostgreSQL's strict JSONB parser:
-//   - \u0000 (null bytes): PG uses C-style null-terminated strings internally
-//   - \xNN (hex escapes): not valid JSON, must be \u00NN
+// nulSentinel stands in for a JSON NUL (\u0000) in stored data. PostgreSQL's
+// JSONB cannot represent the null character, so rather than drop it (lossy) we
+// substitute this Private-Use code point on write and restore it on read (see
+// restoreNULs), so a NUL survives the storage round-trip. U+E000 never appears
+// in well-formed analysis output; a literal U+E000 in the input is the one
+// reserved character and is read back as NUL. Encoding is idempotent: the
+// sentinel contains no \u0000 / \xNN, so re-running sanitizeJSONB over
+// already-encoded data is a no-op, keeping the read-modify-write backfill paths
+// safe.
+const nulSentinel = "\uE000"
+
+// sanitizeJSONB makes JSON storable in PostgreSQL's strict JSONB:
+//   - \u0000 / \x00 (NUL): encoded to nulSentinel; PG JSONB can't hold a null
+//     character. restoreNULs reverses this on read.
+//   - \xNN (other hex escapes): rewritten to \u00NN; \xNN is not valid JSON.
+//     One-way: it fixes malformed cleave output, there is nothing to restore.
 //
-// Both are common in malware analysis output where cleave reports binary
-// strings as-is. Only single-backslash sequences are replaced; \\u0000 and
-// \\xNN (escaped backslash + literal text) are left intact.
+// Both are common in malware analysis output where cleave reports binary strings
+// as-is. Only single-backslash sequences are touched; \\u0000 and \\xNN (escaped
+// backslash + literal text) are left intact.
 func sanitizeJSONB(b []byte) []byte {
 	if len(b) == 0 {
 		return b
@@ -178,8 +190,9 @@ func sanitizeJSONB(b []byte) []byte {
 			i++
 
 		case next == 'x' && needsHex && i+3 < len(b) && isHex(b[i+2]) && isHex(b[i+3]):
-			// \xNN → \u00NN, but drop \x00 entirely (it becomes \u0000)
+			// \xNN → \u00NN; \x00 is a NUL, encoded to the sentinel.
 			if b[i+2] == '0' && b[i+3] == '0' {
+				out = append(out, nulSentinel...)
 				i += 3
 			} else {
 				out = append(out, `\u00`...)
@@ -188,7 +201,8 @@ func sanitizeJSONB(b []byte) []byte {
 			}
 
 		case next == 'u' && needsNull && i+5 < len(b) && b[i+2] == '0' && b[i+3] == '0' && b[i+4] == '0' && b[i+5] == '0':
-			// \u0000 → drop entirely
+			// \u0000 (NUL): PG JSONB can't store it; encode to the sentinel.
+			out = append(out, nulSentinel...)
 			i += 5
 
 		default:
@@ -196,6 +210,17 @@ func sanitizeJSONB(b []byte) []byte {
 		}
 	}
 	return out
+}
+
+// restoreNULs reverses the nulSentinel substitution sanitizeJSONB applies on
+// write: each sentinel code point becomes a JSON NUL escape again. It is the
+// read half of the column-boundary codec and a no-op on data carrying no
+// sentinel (including everything written before the codec existed).
+func restoreNULs(b []byte) []byte {
+	if !bytes.Contains(b, []byte(nulSentinel)) {
+		return b
+	}
+	return bytes.ReplaceAll(b, []byte(nulSentinel), []byte(`\u0000`))
 }
 
 func randomSHA256Pivot() string {
@@ -207,120 +232,70 @@ func randomSHA256Pivot() string {
 	return hex.EncodeToString(b[:])
 }
 
-func compactCleaveResultForStorage(sha256 string, result []byte) []byte {
+// compactCleaveResultForStorage shrinks an archive's stored cleave result for
+// the parent row. It runs the result's `raw` section through [Split], which keeps
+// the container in full and replaces every embedded member with a lightweight
+// reference; the members' full analysis is stored separately by
+// [DB.ExplodeArchiveMembers] and rejoined on read by [Reassemble]. A non-archive
+// result is returned verbatim.
+//
+// On top of Split's structural decomposition this applies the storage policy:
+// normalize the member list under the v8 "files" key, bound it by
+// maxArchiveMembers (the excess reported as "omitted_files" rather than stored,
+// so a pathological member count can't bloat the row), and mark the row
+// "truncated" so the read path knows to rehydrate.
+func compactCleaveResultForStorage(result []byte) []byte {
 	if len(result) == 0 {
 		return result
 	}
-	var envelope map[string]json.RawMessage
-	if json.Unmarshal(result, &envelope) != nil {
+	parent, leaves, err := Split(mustMarshal(map[string]json.RawMessage{"raw": json.RawMessage(result)}))
+	if err != nil || len(leaves) == 0 {
+		return result // unparseable or not an archive: store verbatim
+	}
+	top, err := decodeObject(parent)
+	if err != nil {
 		return result
 	}
-	files := cleaveCompactFiles(envelope)
-	if len(files) <= 1 {
-		return result
-	}
-
-	top := 0
-	for i, raw := range files {
-		var f struct {
-			SHA256 string `json:"sha"`
-			Depth  int    `json:"dp"`
-		}
-		if json.Unmarshal(raw, &f) != nil {
-			continue
-		}
-		if f.SHA256 == sha256 {
-			top = i
-			break
-		}
-		if f.Depth == 0 {
-			top = i
-		}
-	}
-
-	// Keep the top file in full; replace every other member with a lightweight
-	// stub that preserves its identity in the existing files[] schema — id, sha,
-	// path, type, depth, size — so a reader can resolve cross-file `from`
-	// references and fetch each child's full analysis by sha, without inventing a
-	// side structure. The heavy ctx/facts/traits are dropped; that is the storage
-	// win. Bounded by maxArchiveMembers (the same cap explosion enforces) so a
-	// pathological member count can't bloat the parent row.
-	stubKeys := []string{"id", "sha", "path", "type", "depth", "dp", "size", "sz", "risk", "mol"}
-	compactFiles := make([]json.RawMessage, 0, len(files))
-	compactFiles = append(compactFiles, files[top])
-	kept := 0
-	for i, raw := range files {
-		if i == top {
-			continue
-		}
-		if kept >= maxArchiveMembers {
-			break
-		}
-		var full map[string]json.RawMessage
-		if json.Unmarshal(raw, &full) != nil {
-			continue
-		}
-		stub := make(map[string]json.RawMessage, len(stubKeys))
-		for _, k := range stubKeys {
-			if v, ok := full[k]; ok {
-				stub[k] = v
-			}
-		}
-		b, err := json.Marshal(stub)
-		if err != nil {
-			continue
-		}
-		compactFiles = append(compactFiles, b)
-		kept++
-	}
-	compactFS, err := json.Marshal(compactFiles)
+	rawObj, err := decodeObject(top["raw"])
 	if err != nil {
 		return result
 	}
 
-	delete(envelope, "fs")
-	envelope["files"] = compactFS
-	envelope["truncated"] = json.RawMessage(`true`)
-	// Only members beyond the storage cap are truly omitted; the rest are present
-	// as stubs awaiting on-demand hydration by the reader.
-	if omitted := (len(files) - 1) - kept; omitted > 0 {
-		envelope["omitted_files"] = json.RawMessage(strconv.Itoa(omitted))
+	// Normalize the member list under the v8 "files" key (Split preserves
+	// whichever alias the input used).
+	files := rawObj["files"]
+	if len(files) == 0 {
+		files = rawObj["fs"]
+	}
+	delete(rawObj, "fs")
+
+	var entries []json.RawMessage
+	if json.Unmarshal(files, &entries) != nil {
+		return result
+	}
+	kept := entries[:0]
+	members, omitted := 0, 0
+	for _, e := range entries {
+		obj, derr := decodeObject(e)
+		isMember := derr == nil && entryDepth(obj) > 0
+		if isMember && members >= maxArchiveMembers {
+			omitted++
+			continue
+		}
+		if isMember {
+			members++
+		}
+		kept = append(kept, e)
+	}
+
+	rawObj["files"] = mustMarshal(kept)
+	rawObj["truncated"] = json.RawMessage(`true`)
+	if omitted > 0 {
+		rawObj["omitted_files"] = mustMarshal(omitted)
 	} else {
-		delete(envelope, "omitted_files")
+		delete(rawObj, "omitted_files")
 	}
-	compact, err := json.Marshal(envelope)
-	if err != nil {
-		return result
-	}
-	return compact
-}
-
-func cleaveCompactFiles(envelope map[string]json.RawMessage) []json.RawMessage {
-	if files := cleaveCompactFilesFromRaw(envelope["files"]); len(files) > 0 {
-		return files
-	}
-	return cleaveCompactFilesFromRaw(envelope["fs"])
-}
-
-func cleaveCompactFilesFromRaw(raw json.RawMessage) []json.RawMessage {
-	if len(raw) == 0 {
-		return nil
-	}
-	var files []json.RawMessage
-	if json.Unmarshal(raw, &files) != nil {
-		return nil
-	}
-	for _, entry := range files {
-		var f struct {
-			SHA256   string `json:"sha"`
-			Depth    *int   `json:"dp"`
-			FileType string `json:"type"`
-		}
-		if json.Unmarshal(entry, &f) == nil && (f.SHA256 != "" || f.FileType != "" || f.Depth != nil) {
-			return files
-		}
-	}
-	return nil
+	return mustMarshal(rawObj)
 }
 
 func isHex(c byte) bool {
@@ -406,6 +381,19 @@ type Sample struct {
 	Score           int // cleave raw score
 	MaxCrit         int // max trait criticality level (5=hostile, 4=suspicious, ...)
 	SuspiciousCount int // count of traits with level>=4 (suspicious or hostile)
+}
+
+// restoreJSONB reverses the write-time nulSentinel substitution on a sample's
+// JSON columns, so a Sample read from the DB carries the same NUL bytes the
+// analyzer emitted — the read half of the column-boundary codec whose write half
+// is [sanitizeJSONB]. The TEXT columns [Sample.scrubNULs] strips are not
+// restored: those NULs are irrecoverably dropped (PG TEXT cannot hold them) and
+// are metadata noise, not analysis content.
+func (s *Sample) restoreJSONB() {
+	s.CleaveResult = restoreNULs(s.CleaveResult)
+	s.LitmusResult = restoreNULs(s.LitmusResult)
+	s.LLMResult = restoreNULs(s.LLMResult)
+	s.Provenance = restoreNULs(s.Provenance)
 }
 
 // scrubNULs removes embedded NUL bytes (0x00) from a sample's TEXT fields.
@@ -1683,7 +1671,7 @@ func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []by
 	if p.FileInfo.FileType == "" {
 		return db.DeleteSample(ctx, sha256)
 	}
-	result = compactCleaveResultForStorage(sha256, result)
+	result = compactCleaveResultForStorage(result)
 	if db.pool != nil {
 		return db.updateCleaveResultPG(ctx, sha256, result, p.CanonicalSHA, p.FileInfo, traitsVersion)
 	}
@@ -2320,7 +2308,7 @@ func (db *DB) UpdateSample(ctx context.Context, sha256, status string, result []
 	if canonicalSHA256 == "" {
 		canonicalSHA256 = p.CanonicalSHA
 	}
-	result = compactCleaveResultForStorage(sha256, result)
+	result = compactCleaveResultForStorage(result)
 	if db.pool != nil {
 		return db.updateSamplePG(ctx, sha256, status, result, canonicalSHA256, p.FileInfo)
 	}

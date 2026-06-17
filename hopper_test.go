@@ -3331,20 +3331,20 @@ func TestSanitizeJSONB(t *testing.T) {
 	}{
 		{"empty", "", ""},
 		{"no escapes", `{"a":"b"}`, `{"a":"b"}`},
-		// Single-backslash \u0000 should be stripped.
-		{"null escape", `{"v":"\u0000"}`, `{"v":""}`},
+		// Single-backslash \u0000 is encoded to the sentinel (restored on read).
+		{"null escape", `{"v":"\u0000"}`, `{"v":"` + nulSentinel + `"}`},
 		// Double-backslash \\u0000 is a literal backslash + "u0000" — must be preserved.
 		{"escaped backslash u0000", `{"v":"\\u0000"}`, `{"v":"\\u0000"}`},
 		// \x86 (single backslash) → \u0086
 		{"hex escape", `{"v":"\x86"}`, `{"v":"\u0086"}`},
 		// \\x86 is a literal backslash + "x86" — must be preserved.
 		{"escaped backslash x86", `{"v":"\\x86"}`, `{"v":"\\x86"}`},
-		// Mixed: real null inside a range pattern.
-		{"null in range", `{"v":"/[^\u0000-\u001f]/"}`, `{"v":"/[^-\u001f]/"}`},
+		// Mixed: real null inside a range pattern, encoded to the sentinel.
+		{"null in range", `{"v":"/[^\u0000-\u001f]/"}`, `{"v":"/[^` + nulSentinel + `-\u001f]/"}`},
 		// \\u0000 inside a JS regex pattern should be left alone.
 		{"escaped null in range", `{"v":"/[^\\u0000-\\u001f]/"}`, `{"v":"/[^\\u0000-\\u001f]/"}`},
-		// \x00 → \u0000 → stripped
-		{"hex null", `{"v":"\x00"}`, `{"v":""}`},
+		// \x00 is a NUL, encoded to the sentinel.
+		{"hex null", `{"v":"\x00"}`, `{"v":"` + nulSentinel + `"}`},
 	}
 
 	for _, tt := range tests {
@@ -3354,6 +3354,58 @@ func TestSanitizeJSONB(t *testing.T) {
 				t.Errorf("sanitizeJSONB(%q)\n  got  %q\n  want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestNULCodecRoundTrip proves restoreNULs inverts sanitizeJSONB's NUL encoding
+// for input free of pre-existing sentinels: a NUL written to the DB reads back
+// unchanged (\x00 normalizes to \u0000 on the way in).
+func TestNULCodecRoundTrip(t *testing.T) {
+	cases := []string{
+		`{"v":"\u0000"}`,
+		`{"d":"a\u0000b\u0000c"}`,
+		`{"x":"\x00"}`,
+		`{"plain":"no nulls here"}`,
+		`{"nested":{"s":"x\u0000y"}}`,
+	}
+	for _, in := range cases {
+		enc := sanitizeJSONB([]byte(in))
+		if bytes.Contains(enc, []byte(`\u0000`)) {
+			t.Errorf("encoded form still holds a raw NUL escape: %s", enc)
+		}
+		got := string(restoreNULs(enc))
+		want := strings.ReplaceAll(in, `\x00`, `\u0000`)
+		if got != want {
+			t.Errorf("round-trip\n in   %q\n enc  %q\n got  %q\n want %q", in, enc, got, want)
+		}
+	}
+}
+
+// TestSanitizeJSONBIdempotent confirms encoding already-encoded data is a no-op,
+// so read-modify-write backfill paths never double-encode a sentinel.
+func TestSanitizeJSONBIdempotent(t *testing.T) {
+	for _, in := range []string{`{"v":"\u0000"}`, `{"v":"\x00\x86"}`, `{"v":"plain"}`} {
+		once := sanitizeJSONB([]byte(in))
+		twice := sanitizeJSONB(once)
+		if !bytes.Equal(once, twice) {
+			t.Errorf("not idempotent for %q:\n once  %q\n twice %q", in, once, twice)
+		}
+	}
+}
+
+// TestRestoreJSONBSampleColumns checks a Sample's JSON columns come back with
+// NULs restored at the read boundary.
+func TestRestoreJSONBSampleColumns(t *testing.T) {
+	s := &Sample{
+		CleaveResult: sanitizeJSONB([]byte(`{"d":"a\u0000b"}`)),
+		LitmusResult: sanitizeJSONB([]byte(`{"m":"\u0000"}`)),
+	}
+	s.restoreJSONB()
+	if string(s.CleaveResult) != `{"d":"a\u0000b"}` {
+		t.Errorf("CleaveResult = %s", s.CleaveResult)
+	}
+	if string(s.LitmusResult) != `{"m":"\u0000"}` {
+		t.Errorf("LitmusResult = %s", s.LitmusResult)
 	}
 }
 

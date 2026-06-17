@@ -1118,6 +1118,7 @@ func scanPGSample(row pgx.Row) (*Sample, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.restoreJSONB()
 	return s, nil
 }
 
@@ -1129,6 +1130,7 @@ func scanPGSamples(rows pgx.Rows) ([]*Sample, error) {
 		if err := rows.Scan(pgSampleDest(s)...); err != nil {
 			return nil, err
 		}
+		s.restoreJSONB()
 		out = append(out, s)
 	}
 	return out, rows.Err()

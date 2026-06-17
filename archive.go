@@ -58,10 +58,53 @@ func Reassemble(parent *Sample, members []*Sample) ([]byte, error) {
 	for _, m := range members {
 		leaves[m.SHA256] = Envelope(m)
 	}
-	return Join(Envelope(parent), func(sha string) ([]byte, bool) {
+	joined, err := Join(Envelope(parent), func(sha string) ([]byte, bool) {
 		env, ok := leaves[sha]
 		return env, ok
 	})
+	if err != nil {
+		return nil, err
+	}
+	return clearCompactionMarkers(joined, leaves)
+}
+
+// clearCompactionMarkers drops the storage-time "truncated" flag — the envelope
+// is reassembled now — and rewrites "omitted_files" to the members that remained
+// references because no leaf was supplied. This keeps a reader from treating a
+// reassembled envelope as still-compacted (and re-reassembling it forever) while
+// staying honest about a partial hydration.
+func clearCompactionMarkers(envelope []byte, have map[string][]byte) ([]byte, error) {
+	top, err := decodeObject(envelope)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: finalize markers: %w", err)
+	}
+	raw, err := section(top, "raw")
+	if err != nil {
+		return nil, fmt.Errorf("hopper: finalize markers raw: %w", err)
+	}
+	if raw.obj == nil {
+		return envelope, nil
+	}
+	omitted := 0
+	for _, f := range raw.files {
+		entry, derr := decodeObject(f)
+		if derr != nil {
+			continue
+		}
+		if entryDepth(entry) > 0 {
+			if _, ok := have[entrySHA(entry)]; !ok {
+				omitted++
+			}
+		}
+	}
+	delete(raw.obj, "truncated")
+	if omitted > 0 {
+		raw.obj["omitted_files"] = mustMarshal(omitted)
+	} else {
+		delete(raw.obj, "omitted_files")
+	}
+	top["raw"] = mustMarshal(raw.obj)
+	return mustMarshal(top), nil
 }
 
 // Leaf is one archive member's analysis, factored out of its parent and keyed by
@@ -123,7 +166,7 @@ func Split(envelope []byte) (parent []byte, leaves []Leaf, err error) {
 		if entryDepth(entry) == 0 {
 			continue // the container stays in the parent, in full
 		}
-		sha := entryString(entry, "sha")
+		sha := entrySHA(entry)
 		if sha == "" {
 			continue // unidentifiable member: leave it inline rather than orphan it
 		}
@@ -167,13 +210,13 @@ func Join(parent []byte, lookup func(sha string) (envelope []byte, ok bool)) ([]
 		if entryDepth(ref) == 0 {
 			continue // container, already whole
 		}
-		leafEnv, ok := lookup(entryString(ref, "sha"))
+		leafEnv, ok := lookup(entrySHA(ref))
 		if !ok {
 			continue // leaf unavailable: keep the reference as a stub
 		}
 		restored, rerr := restoreMember(ref, leafEnv)
 		if rerr != nil {
-			return nil, fmt.Errorf("hopper: join member %s: %w", entryString(ref, "sha"), rerr)
+			return nil, fmt.Errorf("hopper: join member %s: %w", entrySHA(ref), rerr)
 		}
 		raw.files[i] = restored
 	}
@@ -336,9 +379,10 @@ func entryID(entry map[string]json.RawMessage) int {
 	return id
 }
 
-func entryString(entry map[string]json.RawMessage, key string) string {
+// entrySHA returns a file entry's content SHA-256, or "" when absent.
+func entrySHA(entry map[string]json.RawMessage) string {
 	var s string
-	if v, ok := entry[key]; ok {
+	if v, ok := entry["sha"]; ok {
 		_ = json.Unmarshal(v, &s) //nolint:errcheck // non-string → empty, handled by callers
 	}
 	return s

@@ -700,6 +700,7 @@ func scanLiteSample(row *sql.Row) (*Sample, error) {
 	if markerMtime.Valid {
 		s.MarkerMtime = &markerMtime.Time
 	}
+	s.restoreJSONB()
 	return s, nil
 }
 
@@ -747,6 +748,7 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 		if markerMtime.Valid {
 			s.MarkerMtime = &markerMtime.Time
 		}
+		s.restoreJSONB()
 		out = append(out, s)
 	}
 	return out, rows.Err()

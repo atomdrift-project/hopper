@@ -273,7 +273,89 @@ func TestReassembleNonArchive(t *testing.T) {
 	assertJSONEqual(t, Envelope(s), got)
 }
 
+// TestStorageRoundTrip exercises the real write→read path end to end: compact
+// the parent cleave result the way UpdateCleaveResult does, build member rows the
+// way ExplodeArchiveMembers does, then Reassemble. The result must equal the
+// original envelope — proving compaction (Split) and the explosion format
+// compose with Reassemble (Join) to the identity the design promises.
+func TestStorageRoundTrip(t *testing.T) {
+	envelope, err := os.ReadFile("testdata/archive_whl.json")
+	if err != nil {
+		t.Skipf("golden fixture unavailable: %v", err)
+	}
+	top := mustDecode(t, envelope)
+	raw, err := section(top, "raw")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write path: the parent stores the compacted cleave; each member becomes its
+	// own row carrying its single-file cleave and per-member litmus verdict.
+	parent := &Sample{
+		CleaveResult: compactCleaveResultForStorage(top["raw"]),
+		LitmusResult: top["ml"],
+		LLMResult:    top["llm"],
+	}
+	var members []*Sample
+	for _, e := range raw.files {
+		entry, derr := decodeObject(e)
+		if derr != nil || entryDepth(entry) == 0 {
+			continue
+		}
+		members = append(members, &Sample{
+			SHA256:       entrySHA(entry),
+			CleaveResult: mustMarshal(map[string]json.RawMessage{"files": mustMarshal([]json.RawMessage{e})}),
+			LitmusResult: litmusResultForMember(top["ml"], entryID(entry)),
+		})
+	}
+
+	rejoined, err := Reassemble(parent, members)
+	if err != nil {
+		t.Fatalf("Reassemble: %v", err)
+	}
+	assertJSONEqual(t, envelope, rejoined)
+}
+
+// TestReassembleClearsMarkers confirms Reassemble drops the storage-time
+// "truncated" flag once it has reassembled (so a reader never re-reassembles a
+// finished envelope) and reports any members left as references in
+// "omitted_files".
+func TestReassembleClearsMarkers(t *testing.T) {
+	parent := &Sample{CleaveResult: []byte(`{"truncated":true,"omitted_files":2,"files":[` +
+		`{"id":0,"sha":"top","type":"zip","dp":0},` +
+		`{"id":1,"sha":"bbb","path":"a!!x.py","type":"python","dp":1},` +
+		`{"id":2,"sha":"ccc","path":"a!!y.py","type":"python","dp":1}` +
+		`]}`)}
+	member := &Sample{SHA256: "bbb", CleaveResult: []byte(`{"files":[{"sha":"bbb","type":"python","traits":[{"id":"t","crit":3}]}]}`)}
+
+	got, err := Reassemble(parent, []*Sample{member})
+	if err != nil {
+		t.Fatalf("Reassemble: %v", err)
+	}
+	raw, err := section(mustDecode(t, got), "raw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw.obj["truncated"]; ok {
+		t.Error("truncated marker survived reassembly")
+	}
+	// One member (ccc) had no leaf, so it stays a reference and is counted.
+	var omitted int
+	if err := json.Unmarshal(raw.obj["omitted_files"], &omitted); err != nil || omitted != 1 {
+		t.Errorf("omitted_files = %s (err %v), want 1", raw.obj["omitted_files"], err)
+	}
+}
+
 // --- helpers ---
+
+func mustDecode(t *testing.T, b []byte) map[string]json.RawMessage {
+	t.Helper()
+	obj, err := decodeObject(b)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return obj
+}
 
 // sectionRaw returns the raw bytes of a top-level envelope key, or nil when
 // absent — mirroring how a result's sections land in separate Sample columns.
