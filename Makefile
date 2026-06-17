@@ -1,4 +1,4 @@
-.PHONY: build test clean deploy rollout-bastille rollout-replica-bastille replica rebuild-replica diagnose-replica promote-replica help
+.PHONY: build test clean deploy rollout-bastille rollout-replica-bastille replica rebuild-replica diagnose-replica promote-replica install-precommit help
 
 DATA_DIR  ?= /data/samples
 DB        ?= postgres://hopper@hopper-db/hopper?sslmode=disable
@@ -15,6 +15,7 @@ help:
 	@echo "  make test                   Run tests"
 	@echo "  make lint                   Run linters"
 	@echo "  make clean                  Clean build artifacts"
+	@echo "  make install-precommit      Install the git pre-commit hook (test + lint + go.mod)"
 	@echo "  make deploy                 Install as a hardened systemd service on this Linux host"
 	@echo "                              (DATA_DIR=$(DATA_DIR) DB=... SOURCE=$(SOURCE) DASH_ADDR=$(DASH_ADDR) WORKERS=$(WORKERS))"
 	@echo "  make rollout-bastille       Deploy to Bastille jails (BUILD=build RUN=hopper [DB_ONLY=1])"
@@ -30,6 +31,11 @@ help:
 
 build:
 	CGO_ENABLED=1 go build -o hopper -ldflags="-s -w" ./cmd/hopper
+
+install-precommit:
+	cp scripts/pre-commit $(shell git rev-parse --git-path hooks)/pre-commit
+	chmod +x $(shell git rev-parse --git-path hooks)/pre-commit
+	@echo "Pre-commit hook installed."
 
 test:
 	go test ./...

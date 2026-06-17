@@ -3175,12 +3175,18 @@ func TestUpdateCleaveResultCompactsArchiveStorage(t *testing.T) {
 	if !stored.Truncated || stored.OmittedFiles != 0 || stored.TraitsVersion != "abcde" {
 		t.Fatalf("stored compact metadata: truncated=%v omitted=%d tv=%q", stored.Truncated, stored.OmittedFiles, stored.TraitsVersion)
 	}
-	parentSHAJSON, _ := json.Marshal(parentSHA)
+	parentSHAJSON, err := json.Marshal(parentSHA)
+	if err != nil {
+		t.Fatalf("marshal parent sha: %v", err)
+	}
 	if !bytes.Equal(stored.Files[0]["sha"], parentSHAJSON) {
 		t.Fatalf("files[0] sha = %s, want parent", stored.Files[0]["sha"])
 	}
 	childStub := stored.Files[1]
-	childSHAJSON, _ := json.Marshal(childSHA)
+	childSHAJSON, err := json.Marshal(childSHA)
+	if err != nil {
+		t.Fatalf("marshal child sha: %v", err)
+	}
 	if !bytes.Equal(childStub["sha"], childSHAJSON) {
 		t.Fatalf("child stub sha = %s, want %s", childStub["sha"], childSHA)
 	}

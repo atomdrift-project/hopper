@@ -1,0 +1,39 @@
+#!/bin/sh
+# Pre-commit hook: refuse to commit unless the tree is in a known-good state.
+# Install with `make install-precommit`.
+#
+#   1. go.mod has no local `replace` overrides (filesystem paths)
+#   2. `make test` passes
+#   3. `make lint` passes
+
+set -e
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+# 1. Reject local replace overrides in go.mod. A replace directive whose target
+# is a filesystem path (starts with ./, ../, or /) must never reach a commit.
+if git ls-files --error-unmatch go.mod >/dev/null 2>&1; then
+	overrides=$(awk '
+		/^replace[[:space:]]*\(/ { block=1; next }
+		block && /^\)/           { block=0; next }
+		/^replace[[:space:]]/    { print; next }
+		block                    { print }
+	' go.mod | grep -E '=>[[:space:]]*(\.{1,2})?/' || true)
+	if [ -n "$overrides" ]; then
+		echo "pre-commit: go.mod contains local replace overrides:" >&2
+		echo "$overrides" >&2
+		echo "Remove them before committing." >&2
+		exit 1
+	fi
+fi
+
+# 2. Tests must pass.
+echo "pre-commit: running make test..."
+make test
+
+# 3. Lint must pass.
+echo "pre-commit: running make lint..."
+make lint
+
+echo "pre-commit: all checks passed."
