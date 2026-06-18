@@ -894,6 +894,11 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 			wd = nil
 		} else {
 			slog.Info("web dashboard + API listening", "addr", *dashAddr)
+			// Publish the dashboard's numerics at /_/metrik. Registered now;
+			// the callback no-ops until the load session is configured.
+			if err := wd.enableMetrics(); err != nil {
+				slog.Warn("dashboard metrics disabled", "error", err)
+			}
 		}
 	}
 	wd.beginStage("discover", "Discovering label directories")

@@ -1,0 +1,121 @@
+# Prometheus alerting rules for hopper.
+#
+# Hopper publishes its dashboard numerics at GET /_/metrik on the dashboard
+# address (default :8081, flag -dashboard-addr). Point a Prometheus scrape at
+# it; once a minute is plenty — the collector reuses the dashboard's 45s query
+# caches, so a scrape adds no database load the page would not already cause.
+#
+#   scrape_configs:
+#     - job_name: hopper
+#       scrape_interval: 60s
+#       static_configs:
+#         - targets: ['hopper:8081']
+#       metrics_path: /_/metrik
+#
+# Load this file from prometheus.yml (rule_files: [prometheus-hopper-alerts.yml]).
+# The `job="hopper"` matchers below assume the job_name above; adjust if yours
+# differs.
+#
+# Exported metric catalogue (OTel maps dots to underscores, appends unit
+# suffixes, and adds _total to counters):
+#
+#   Queues / backlog (gauges):
+#     hopper_queue_pending              samples awaiting first analysis
+#     hopper_queue_rescan               samples eligible for re-analysis
+#     hopper_queue_cleave_pending       samples awaiting the cleave stage
+#     hopper_queue_litmus_pending       samples awaiting the litmus stage
+#   Throughput:
+#     hopper_analyzed_total             cumulative samples analyzed (DB + session)
+#     hopper_analysis_rate_per_second   {tier="toplevel"|"rescan"} analyses/sec
+#     hopper_files_rate_per_second      fleet files/sec over the trailing 15m
+#   Freshness / lag (gauges, seconds):
+#     hopper_workflow_added_age_seconds      since the newest added sample
+#     hopper_workflow_analyzed_age_seconds   since the newest analyzed sample
+#     hopper_workflow_ready_lag_seconds      newest-added to newest-prism-ready
+#   Walk / ingest (per-process counters):
+#     hopper_walk_files_total, hopper_walk_inserted_total,
+#     hopper_walk_cache_hits_total, hopper_walk_filtered_total, hopper_errors_total
+#   Per worker ({worker="<name:ip>"}):
+#     hopper_worker_last_seen_age_seconds, hopper_worker_active_claims,
+#     hopper_worker_slots, hopper_worker_queue, hopper_worker_rss_bytes,
+#     hopper_worker_load1, hopper_worker_files_rate_per_second,
+#     hopper_worker_analyzed_total, hopper_worker_errors_total,
+#     hopper_worker_errors_recent
+#   Local scan (litmus) worker:
+#     hopper_local_worker_up            1 healthy, 0 down
+#     hopper_local_worker_restarts_total  cumulative supervisor restarts
+
+groups:
+  - name: hopper-liveness
+    rules:
+      # The process is up but the in-process scan (litmus) worker is down —
+      # crashing, wedged, or failing to start. This is the published health the
+      # dashboard's red banner uses, so a firing alert is enough to start
+      # debugging. 10m rides out the supervisor's restart/backoff so a single
+      # crash-and-recover does not page.
+      - alert: HopperLocalWorkerDown
+        expr: hopper_local_worker_up == 0
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Hopper local scan worker is down"
+          description: "hopper_local_worker_up has been 0 for 10m; the in-process litmus worker is not analyzing."
+
+      # Hopper itself is unreachable (process down, dashboard port closed, host
+      # gone). Distinct from the gauge above, which needs hopper up to report.
+      - alert: HopperDown
+        expr: up{job="hopper"} == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Hopper is not scrapeable"
+          description: "Prometheus cannot scrape hopper ({{ $labels.instance }}) — process or dashboard endpoint down."
+
+      # The supervisor is restarting the local worker repeatedly: it starts, dies,
+      # restarts. up may read 1 between restarts, so watch the restart counter.
+      - alert: HopperLocalWorkerFlapping
+        expr: increase(hopper_local_worker_restarts_total[15m]) > 3
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hopper local scan worker is flapping"
+          description: "{{ $value | printf \"%.0f\" }} local-worker restarts in the last 15m."
+
+      # A remote worker stopped checking in but has not yet aged out of the
+      # tracker. Per-worker, so the label names the node. 10m is well past the
+      # poll/heartbeat cadence.
+      - alert: HopperWorkerStale
+        expr: hopper_worker_last_seen_age_seconds > 600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hopper worker {{ $labels.worker }} is stale"
+          description: "{{ $labels.worker }} last checked in {{ $value | printf \"%.0f\" }}s ago."
+
+  - name: hopper-pipeline
+    rules:
+      # Nothing has been analyzed in an hour while work is queued: the pipeline
+      # has stalled even though there is backlog to drain.
+      - alert: HopperAnalysisStalled
+        expr: hopper_workflow_analyzed_age_seconds > 3600 and hopper_queue_pending > 0
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "Hopper analysis has stalled"
+          description: "No sample analyzed in {{ $value | printf \"%.0f\" }}s while the pending queue is non-empty."
+
+      # Ingestion has stopped feeding the pipeline: no new sample added in an
+      # hour. Trends a dead forager/walk upstream.
+      - alert: HopperIngestionStalled
+        expr: hopper_workflow_added_age_seconds > 3600
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hopper ingestion has stalled"
+          description: "No sample added in {{ $value | printf \"%.0f\" }}s; upstream ingestion may be down."

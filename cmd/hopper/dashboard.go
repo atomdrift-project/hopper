@@ -995,6 +995,87 @@ func (wd *webDashboard) fetchWorkflow(ctx context.Context, db *hopper.DB) dashbo
 	return out
 }
 
+// The cached stats below back the Prometheus collector (see obsmetrics.go).
+// They deliberately reuse the same fido caches and keys the page handler fills,
+// so a scrape and a page render within dashCacheTTL of each other run the
+// underlying query once; when nothing is watching the page, a scrape recomputes
+// at most one query per metric per cache window. They are kept separate from the
+// handler's inline fetches so the handler's HTML rendering path is unchanged.
+// ctx bounds the query; on error the cache's last (or zero) value is returned
+// and the failure logged.
+
+// pendingCount returns the live count of samples awaiting first analysis.
+func (wd *webDashboard) pendingCount(ctx context.Context) int64 {
+	if wd.db == nil || wd.pendingCache == nil {
+		return 0
+	}
+	n, _ := wd.pendingCache.Fetch("pending", func() (int64, error) { //nolint:errcheck // cached value used on error
+		qctx, cancel := context.WithTimeout(ctx, dashQueryTimeout)
+		defer cancel()
+		n, err := wd.db.CountPending(qctx)
+		if err != nil {
+			slog.Warn("metrics: CountPending failed", "error", err)
+		}
+		return n, err
+	})
+	return n
+}
+
+// rescanPending returns the count of samples eligible for re-analysis under the
+// live traits version. Zero until the traits version is known.
+func (wd *webDashboard) rescanPending(ctx context.Context) int64 {
+	if wd.db == nil || wd.rescanCache == nil || wd.traitsVersion == "" {
+		return 0
+	}
+	tv, ra := wd.traitsVersion, wd.rescanAge
+	n, _ := wd.rescanCache.Fetch("rescan", func() (int64, error) { //nolint:errcheck // cached value used on error
+		qctx, cancel := context.WithTimeout(ctx, dashQueryTimeout)
+		defer cancel()
+		n, err := wd.db.CountRescanPending(qctx, tv, ra)
+		if err != nil {
+			slog.Warn("metrics: CountRescanPending failed", "error", err)
+		}
+		return n, err
+	})
+	return n
+}
+
+// analysisRates returns the top-level and rescan analysis counts over
+// analysisRateWindow (divide by the window for per-second rates).
+func (wd *webDashboard) analysisRates(ctx context.Context) hopper.AnalysisRates {
+	if wd.db == nil || wd.ratesCache == nil {
+		return hopper.AnalysisRates{}
+	}
+	rates, _ := wd.ratesCache.Fetch("rates", func() (hopper.AnalysisRates, error) { //nolint:errcheck // cached value used on error
+		qctx, cancel := context.WithTimeout(ctx, dashQueryTimeout)
+		defer cancel()
+		v, err := wd.db.AnalysisRatesSince(qctx, analysisRateWindow)
+		if err != nil {
+			slog.Warn("metrics: AnalysisRatesSince failed", "error", err)
+		}
+		return v, err
+	})
+	return rates
+}
+
+// workflowHealth returns the workflow freshness/backlog snapshot. The bool is
+// false when no value is available; it shares the "health" cache key with
+// fetchWorkflow.
+func (wd *webDashboard) workflowHealth(ctx context.Context) (hopper.WorkflowHealth, bool) {
+	if wd.db == nil || wd.healthCache == nil {
+		return hopper.WorkflowHealth{}, false
+	}
+	h, err := wd.healthCache.Fetch("health", func() (hopper.WorkflowHealth, error) {
+		qctx, cancel := context.WithTimeout(ctx, dashQueryTimeout)
+		defer cancel()
+		return wd.db.WorkflowHealth(qctx)
+	})
+	if err != nil {
+		return hopper.WorkflowHealth{}, false
+	}
+	return h, true
+}
+
 func writeQueueCard(buf *strings.Builder, label, value, meta string) {
 	fmt.Fprintf(buf,
 		`<div class="queue-card"><div class="queue-label">%s</div><div class="queue-value">%s</div><div class="queue-meta">%s</div></div>`,
