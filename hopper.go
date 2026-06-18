@@ -706,9 +706,16 @@ func canonicalSHA(sha256 string, cleaveResult []byte) string {
 // For bad archives, members without hostile risk or >1 suspicious finding
 // are marked skip="skip-benign-archive-item". Duplicate SHA256s are silently skipped.
 // Returns the number of new rows inserted.
-func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64, error) {
+// memberSamplesFromEnvelope builds the per-member sample rows embedded in an
+// archive's full cleave envelope (parent.CleaveResult). Each member inherits the
+// parent's label/source/feed/ecosystem/canonical and receives a single-file
+// cleave result, its litmus slice, and a per-archive path. It is pure (no DB
+// access) so the same members can be persisted inside the parent's store
+// transaction by StoreResult, or via ExplodeArchiveMembers. parent.AnalyzedAt
+// stamps each member's analyzed_at, which gates the freshness refresh on store.
+func memberSamplesFromEnvelope(parent *Sample) []*Sample {
 	if len(parent.CleaveResult) == 0 {
-		return 0, nil
+		return nil
 	}
 
 	var report struct {
@@ -716,7 +723,8 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 		OldFiles []json.RawMessage `json:"fs"`
 	}
 	if err := json.Unmarshal(parent.CleaveResult, &report); err != nil {
-		return 0, fmt.Errorf("hopper: parse cleave result for explosion: %w", err)
+		slog.Warn("parse cleave result for member extraction", "parent", parent.SHA256, "error", err)
+		return nil
 	}
 	if len(report.Files) == 0 {
 		report.Files = report.OldFiles
@@ -874,11 +882,66 @@ func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64,
 		})
 	}
 
+	return members
+}
+
+// ExplodeArchiveMembers persists an archive's members out-of-band. StoreResult
+// now does this atomically with the parent write, so this remains only for
+// callers that re-derive members from an already-stored parent (and tests). It
+// inserts new members and refreshes any whose stored analysis this archive's
+// supersedes. Returns the number of new rows inserted.
+func (db *DB) ExplodeArchiveMembers(ctx context.Context, parent *Sample) (int64, error) {
+	members := memberSamplesFromEnvelope(parent)
 	if len(members) == 0 {
 		return 0, nil
 	}
 	n, _, err := db.InsertSampleBatch(ctx, members)
-	return n, err
+	if err != nil {
+		return n, err
+	}
+	if _, rerr := db.RefreshStaleMemberAnalysis(ctx, members); rerr != nil {
+		slog.Warn("refresh stale member analysis failed", "parent", parent.SHA256, "error", rerr)
+	}
+	return n, nil
+}
+
+// RefreshStaleMemberAnalysis updates existing sample rows whose stored analysis
+// predates the supplied members', so a newer archive's richer per-member
+// analysis supersedes a stale standalone (or earlier-archive) result that
+// InsertSampleBatch's ON CONFLICT leaves frozen. Only cleave_result,
+// litmus_result, and analyzed_at move, and only strictly forward in time;
+// label/path/skip are never touched (that stays the walker clause's job).
+// Members carrying no analysis or no analysis date are skipped, so a refresh can
+// never blank an existing result. Returns the number of rows refreshed.
+func (db *DB) RefreshStaleMemberAnalysis(ctx context.Context, members []*Sample) (int64, error) {
+	rows := make([]staleRefresh, 0, len(members))
+	for _, m := range members {
+		if m == nil || m.SHA256 == "" || len(m.CleaveResult) == 0 || m.AnalyzedAt == nil {
+			continue
+		}
+		rows = append(rows, staleRefresh{
+			SHA256:       m.SHA256,
+			CleaveResult: m.CleaveResult,
+			LitmusResult: m.LitmusResult,
+			AnalyzedAt:   *m.AnalyzedAt,
+		})
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	if db.pool != nil {
+		return db.refreshStaleMemberAnalysisPG(ctx, rows)
+	}
+	return db.refreshStaleMemberAnalysisSQLite(ctx, rows)
+}
+
+// staleRefresh is one row's freshness-gated analysis refresh: the content to
+// write and the analysis time that must beat the stored row's to win.
+type staleRefresh struct {
+	AnalyzedAt   time.Time
+	SHA256       string
+	CleaveResult []byte
+	LitmusResult []byte
 }
 
 func litmusResultForMember(parent []byte, id int) []byte {
@@ -1651,6 +1714,44 @@ func (db *DB) RequestRescan(ctx context.Context, sha256 string, cooldown time.Du
 		return db.requestRescanPG(ctx, sha256, cutoff)
 	}
 	return db.requestRescanSQLite(ctx, sha256, cutoff)
+}
+
+// StoreStats reports what StoreResult persisted, for logging and telemetry.
+type StoreStats struct {
+	Members       int   // members extracted from the archive envelope (0 = not an archive)
+	MembersStored int64 // member rows inserted or freshness-refreshed in this transaction
+}
+
+// StoreResult atomically persists a worker's full analysis for a sample and,
+// when the sample is an archive, all of its members — parent and members commit
+// together or not at all. This replaces the previous "truncate the parent now,
+// recreate members later via a best-effort async pool" design, whose member
+// creation could be silently lost, leaving a truncated parent with no members
+// (no content, permanent data loss). Here the parent is never truncated unless
+// its members land in the same transaction.
+//
+// The caller is responsible for running this under a context detached from the
+// client request (e.g. context.WithoutCancel) so a worker disconnect or request
+// timeout cannot abort a partially-applied store; the transaction itself is
+// all-or-nothing regardless.
+//
+// If cleave could not classify the file (FileType == ""), the row is deleted —
+// the belt-and-suspenders complement to cleave's ingest-time filter.
+func (db *DB) StoreResult(ctx context.Context, sha256 string, cleaveRaw, litmusML, llm []byte, parsed *CleaveParseResult, traitsVersion string) (StoreStats, error) {
+	var p CleaveParseResult
+	if parsed != nil {
+		p = *parsed
+	} else {
+		p = ParseCleaveResult(sha256, cleaveRaw)
+	}
+	if p.FileInfo.FileType == "" {
+		return StoreStats{}, db.DeleteSample(ctx, sha256)
+	}
+	now := time.Now().UTC()
+	if db.pool != nil {
+		return db.storeResultPG(ctx, sha256, cleaveRaw, litmusML, llm, p, traitsVersion, now)
+	}
+	return db.storeResultSQLite(ctx, sha256, cleaveRaw, litmusML, llm, p, traitsVersion, now)
 }
 
 // UpdateCleaveResult stores analysis output for a sample.

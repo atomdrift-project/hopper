@@ -1351,6 +1351,46 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 	return tag.RowsAffected() > 0, nil
 }
 
+// refreshStaleMemberAnalysisPG rewrites analysis columns for rows whose stored
+// analysis is older than the incoming one, in a single set-based UPDATE. Only
+// cleave_result/litmus_result/analyzed_at move; the samples_derive_cleave_cols
+// trigger re-derives file_type/max_crit/etc since it fires on UPDATE OF
+// cleave_result. litmus_result keeps its stored value when the incoming member
+// carries none, so a refresh never blanks a classification.
+func (db *DB) refreshStaleMemberAnalysisPG(ctx context.Context, rows []staleRefresh) (int64, error) {
+	shas := make([]string, len(rows))
+	cleaves := make([]string, len(rows))
+	litmus := make([]*string, len(rows))
+	ats := make([]time.Time, len(rows))
+	for i, r := range rows {
+		shas[i] = r.SHA256
+		cleaves[i] = string(sanitizeJSONB(r.CleaveResult))
+		if len(r.LitmusResult) > 0 {
+			s := string(sanitizeJSONB(r.LitmusResult))
+			litmus[i] = &s
+		}
+		ats[i] = r.AnalyzedAt
+	}
+	tag, err := db.pool.Exec(ctx, `
+		UPDATE samples s SET
+			cleave_result = d.cleave::jsonb,
+			litmus_result = COALESCE(d.litmus::jsonb, s.litmus_result),
+			analyzed_at   = d.at
+		FROM (
+			SELECT unnest($1::text[])        AS sha256,
+			       unnest($2::text[])        AS cleave,
+			       unnest($3::text[])        AS litmus,
+			       unnest($4::timestamptz[]) AS at
+		) d
+		WHERE s.sha256 = d.sha256
+		  AND (s.analyzed_at IS NULL OR d.at > s.analyzed_at)`,
+		shas, cleaves, litmus, ats)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: refresh stale member analysis: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 var insertBatchStagingCols = []string{
 	"sha256", "source", "feed", "ecosystem", "filename",
 	"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
@@ -1506,7 +1546,10 @@ func logLabelTransitionsPG(ctx context.Context, tx pgx.Tx) {
 	}
 }
 
-func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inserted int64, needsAnalysis []string, err error) {
+// sampleStagingRows builds the COPY tuples for the _staging temp table in
+// insertBatchStagingCols order. Shared by insertSampleBatchPG and storeResultPG
+// so the column order can't drift between the two writers.
+func sampleStagingRows(samples []*Sample) [][]any {
 	rows := make([][]any, len(samples))
 	for i, s := range samples {
 		s.scrubNULs() // PG TEXT can't hold 0x00 (SQLSTATE 22021); see scrubNULs.
@@ -1522,6 +1565,29 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 			s.URL, s.Domain, s.Package, s.Version, sanitizeJSONB(s.Provenance), s.FetchedAt,
 		}
 	}
+	return rows
+}
+
+// locationsFromStagingPG fans _staging rows out into sample_locations. DISTINCT
+// ON collapses duplicates within the batch; ON CONFLICT bumps last_seen_at on
+// re-observation without clobbering an existing mtime. Shared by the batch
+// insert and the atomic store.
+const locationsFromStagingPG = `
+	INSERT INTO sample_locations
+		(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime)
+	SELECT DISTINCT ON (sha256, path)
+		sha256, path, parent, filename, source, feed, ecosystem, mtime
+	  FROM _staging
+	 WHERE path <> ''
+	ON CONFLICT (sha256, path) DO UPDATE SET
+		last_seen_at = now(),
+		source = CASE WHEN EXCLUDED.source <> '' THEN EXCLUDED.source ELSE sample_locations.source END,
+		feed = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE sample_locations.feed END,
+		ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE sample_locations.ecosystem END,
+		mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)`
+
+func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inserted int64, needsAnalysis []string, err error) {
+	rows := sampleStagingRows(samples)
 
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
@@ -1544,23 +1610,8 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 	}
 	inserted = tag.RowsAffected()
 
-	// Fan the staging rows out into sample_locations in the same
-	// transaction. DISTINCT ON collapses duplicates within the batch
-	// (same sha+path twice → one row). ON CONFLICT upserts last_seen_at
-	// on re-observations without clobbering an existing mtime.
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO sample_locations
-			(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime)
-		SELECT DISTINCT ON (sha256, path)
-			sha256, path, parent, filename, source, feed, ecosystem, mtime
-		  FROM _staging
-		 WHERE path <> ''
-		ON CONFLICT (sha256, path) DO UPDATE SET
-			last_seen_at = now(),
-			source = CASE WHEN EXCLUDED.source <> '' THEN EXCLUDED.source ELSE sample_locations.source END,
-			feed = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE sample_locations.feed END,
-			ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE sample_locations.ecosystem END,
-			mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)`); err != nil {
+	// Fan the staging rows out into sample_locations in the same transaction.
+	if _, err := tx.Exec(ctx, locationsFromStagingPG); err != nil {
 		return 0, nil, fmt.Errorf("hopper: upsert locations from staging: %w", err)
 	}
 
@@ -1611,6 +1662,132 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 	}
 
 	return inserted, needsAnalysis, nil
+}
+
+// memberConflictUpdatePG refreshes ONLY analysis columns of an existing member
+// row, and only when this archive's analysis is strictly newer. It never touches
+// label/path/skip/parent (a member must not rewrite a standalone row's identity)
+// and never blanks litmus. New members fall through to a plain INSERT. The
+// samples_derive_cleave_cols trigger re-derives file_type/max_crit/etc on the
+// cleave_result write.
+const memberConflictUpdatePG = `ON CONFLICT (sha256) DO UPDATE SET
+	cleave_result = EXCLUDED.cleave_result,
+	litmus_result = COALESCE(EXCLUDED.litmus_result, samples.litmus_result),
+	analyzed_at = EXCLUDED.analyzed_at,
+	first_analyzed_at = COALESCE(samples.first_analyzed_at, EXCLUDED.first_analyzed_at),
+	updated_at = now()
+WHERE EXCLUDED.analyzed_at > samples.analyzed_at OR samples.analyzed_at IS NULL`
+
+// insertMembersFromStagingPG is insertBatchStagingInsert with the member
+// conflict clause: insert new members, freshness-refresh stale ones, identity
+// untouched.
+const insertMembersFromStagingPG = `INSERT INTO samples (
+	sha256, source, feed, ecosystem, filename,
+	size_bytes, label, label_source, path, status,
+	canonical_sha256, parent, skip, elements,
+	max_crit, suspicious_count, mtime, marker_mtime,
+	cleave_result, litmus_result, analyzed_at, first_analyzed_at,
+	url, domain, package, version, provenance, fetched_at)
+SELECT DISTINCT ON (sha256)
+	sha256, source, feed, ecosystem, filename,
+	size_bytes, label, label_source, path, status,
+	canonical_sha256, parent, skip, elements,
+	max_crit, suspicious_count, mtime, marker_mtime,
+	cleave_result, litmus_result, analyzed_at, first_analyzed_at,
+	url, domain, package, version, provenance, fetched_at
+FROM _staging
+` + memberConflictUpdatePG
+
+// storeResultPG atomically writes a sample's analysis and, for an archive, all
+// its members in one transaction: the parent is never truncated unless its
+// members land in the same commit. See StoreResult for the contract.
+func (db *DB) storeResultPG(
+	ctx context.Context, sha256 string, cleaveRaw, litmusML, llm []byte,
+	p CleaveParseResult, traitsVersion string, now time.Time,
+) (StoreStats, error) {
+	truncated := compactCleaveResultForStorage(cleaveRaw)
+
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return StoreStats{}, fmt.Errorf("hopper: begin store: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+
+	// Read (and lock) the identity fields members inherit from the parent, so a
+	// concurrent write can't shift the parent out from under the members.
+	var parent Sample
+	var firstAnalyzed sql.NullTime
+	if err := tx.QueryRow(ctx,
+		`SELECT label, label_source, source, feed, ecosystem, path, first_analyzed_at
+		   FROM samples WHERE sha256 = $1 FOR UPDATE`, sha256).
+		Scan(&parent.Label, &parent.LabelSource, &parent.Source, &parent.Feed,
+			&parent.Ecosystem, &parent.Path, &firstAnalyzed); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return StoreStats{}, fmt.Errorf("hopper: store result for absent sample %s: %w", sha256, ErrNotFound)
+		}
+		return StoreStats{}, fmt.Errorf("hopper: read parent for store %s: %w", sha256, err)
+	}
+
+	var litmusVal, llmVal []byte
+	if len(litmusML) > 0 {
+		litmusVal = sanitizeJSONB(litmusML)
+	}
+	if len(llm) > 0 {
+		llmVal = sanitizeJSONB(llm)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE samples SET cleave_result = $2,
+			canonical_sha256 = $3, elements = $4,
+			max_crit = $5, suspicious_count = $6,
+			litmus_result = $7, llm_result = $8,
+			note = '', last_error_at = NULL,
+			traits_version = $9, forced_rescan_at = NULL,
+			first_analyzed_at = COALESCE(first_analyzed_at, $10),
+			analyzed_at = $10, updated_at = $10
+		WHERE sha256 = $1`,
+		sha256, sanitizeJSONB(truncated), p.CanonicalSHA,
+		p.FileInfo.Elements, p.FileInfo.MaxCrit, p.FileInfo.SuspiciousCount,
+		litmusVal, llmVal, traitsVersion, now); err != nil {
+		return StoreStats{}, fmt.Errorf("hopper: update parent: %w", err)
+	}
+
+	// Build members from the FULL envelope, inheriting the parent's identity and
+	// stamped with this analysis time so the freshness gate orders refreshes.
+	parent.SHA256 = sha256
+	parent.CleaveResult = cleaveRaw
+	parent.LitmusResult = litmusML
+	parent.CanonicalSHA256 = p.CanonicalSHA
+	parent.AnalyzedAt = &now
+	if firstAnalyzed.Valid {
+		parent.FirstAnalyzedAt = &firstAnalyzed.Time
+	} else {
+		parent.FirstAnalyzedAt = &now
+	}
+	members := memberSamplesFromEnvelope(&parent)
+
+	var stats StoreStats
+	stats.Members = len(members)
+	if len(members) > 0 {
+		if _, err := tx.Exec(ctx, insertBatchStagingDDL); err != nil {
+			return StoreStats{}, fmt.Errorf("hopper: create member staging: %w", err)
+		}
+		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"_staging"}, insertBatchStagingCols, pgx.CopyFromRows(sampleStagingRows(members))); err != nil {
+			return StoreStats{}, fmt.Errorf("hopper: copy members to staging: %w", err)
+		}
+		tag, err := tx.Exec(ctx, insertMembersFromStagingPG)
+		if err != nil {
+			return StoreStats{}, fmt.Errorf("hopper: upsert members: %w", err)
+		}
+		stats.MembersStored = tag.RowsAffected()
+		if _, err := tx.Exec(ctx, locationsFromStagingPG); err != nil {
+			return StoreStats{}, fmt.Errorf("hopper: upsert member locations: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return StoreStats{}, fmt.Errorf("hopper: commit store: %w", err)
+	}
+	return stats, nil
 }
 
 func (db *DB) sampleBySHA256PG(ctx context.Context, sha256 string) (*Sample, error) {

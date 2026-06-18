@@ -35,10 +35,9 @@ import (
 // /api/file/{sha256}. Sample data lives in the database; per-job claim
 // state lives in workerTracker (see below).
 type apiServer struct {
-	db         *hopper.DB
-	tracker    *workerTracker
-	progress   *loadProgress
-	explosions chan explosionJob // archive-expansion work, drained by background goroutines
+	db       *hopper.DB
+	tracker  *workerTracker
+	progress *loadProgress
 	// traitsVersion holds the short prefix of the current traits repo
 	// commit. Stored in an atomic.Pointer so the periodic rules-update
 	// goroutine can refresh it concurrently with read traffic from
@@ -56,7 +55,6 @@ type apiServer struct {
 	// distinguishes "no token configured" from the 2^-256 case of a hash
 	// that happens to be all-zero.
 	uploadTokenHash [sha256.Size]byte
-	explosionWG     sync.WaitGroup
 	uploadTokenSet  bool
 }
 
@@ -94,14 +92,6 @@ func (s *apiServer) TraitsVersion() string {
 // local litmus is actually running.
 func (s *apiServer) SetTraitsVersion(v string) {
 	s.traitsVersion.Store(&v)
-}
-
-// explosionJob defers archive-member expansion off the /api/result hot path.
-// Workers don't care about the result of explosion — it only seeds new rows
-// in samples for future analysis.
-type explosionJob struct {
-	sha256 string
-	raw    json.RawMessage
 }
 
 const maxClientErrorRunes = 120
@@ -571,13 +561,6 @@ const (
 	// busy worker polling several times per second doesn't generate a
 	// matching write storm to the workers table.
 	workerUpsertInterval = 30 * time.Second
-
-	// explosionQueueSize bounds how many cleave results may be waiting for
-	// background archive expansion. Set well above expected steady-state so
-	// transient bursts don't push back on /api/result.
-	explosionQueueSize    = 16384
-	explosionWorkers      = 4
-	explosionDrainTimeout = 30 * time.Second
 
 	// maxUploadBytes caps an interactive /api/upload body. Matches prism's
 	// web upload limit so anything that gets past prism fits here too.
@@ -1281,48 +1264,42 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := retryDBAccessNoValue(ctx, "store cleave result", req.SHA256, func(ctx context.Context) error {
-		return s.db.UpdateCleaveResult(ctx, req.SHA256, req.Raw, &parsed, tv)
-	}); err != nil {
-		logResultStoreError(r.Context(), ctx, "store cleave result failed after accepting worker result", req.SHA256, err)
+	// Store the parent's cleave/litmus/llm analysis and, for an archive, all its
+	// members in one atomic transaction (StoreResult). This runs under ctx, which
+	// is detached from the client request (context.WithoutCancel above) with its
+	// own timeout, so a worker disconnect can't abort a partially-applied store.
+	// Replaces the former "truncate now, recreate members later via a best-effort
+	// async pool" path, whose silent member loss produced truncated parents with
+	// no members (no content, permanent data loss).
+	stats, err := retryDBAccess(ctx, "store result", req.SHA256, func(ctx context.Context) (hopper.StoreStats, error) {
+		return s.db.StoreResult(ctx, req.SHA256, req.Raw, req.ML, req.LLM, &parsed, tv)
+	})
+	if err != nil {
+		logResultStoreError(r.Context(), ctx, "store result failed after accepting worker result", req.SHA256, err)
 		// Drop the claim and bump errors so the worker's slot frees up — without
 		// this, the worker's ActiveClaims is permanently inflated for this job.
 		s.tracker.release(req.SHA256)
 		s.tracker.recordResult(req.Worker, true)
-		s.progress.recordErrorf(1, "store", "store cleave result: %s: %v", req.SHA256, err)
-		errMsg := `{"error":"store cleave result failed"}`
+		s.progress.recordErrorf(1, "store", "store result: %s: %v", req.SHA256, err)
+		errMsg := `{"error":"store result failed"}`
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			errMsg = `{"error":"store cleave result failed: database write context was canceled or timed out"}`
+			errMsg = `{"error":"store result failed: database write context was canceled or timed out"}`
 		}
 		http.Error(w, errMsg, http.StatusInternalServerError)
 		return
 	}
 
-	// Store litmus result.
-	if err := retryDBAccessNoValue(ctx, "store litmus result", req.SHA256, func(ctx context.Context) error {
-		return s.db.UpdateLitmusResult(ctx, req.SHA256, req.ML)
-	}); err != nil {
-		s.progress.recordErrorf(1, "store", "store litmus result: %s: %v", req.SHA256, err)
-		slog.Error("store litmus result failed", "sha256", req.SHA256, "error", err)
-	}
-
-	// Store the optional LLM interpretation (envelope `llm`); kept in its own
-	// column so consumers read it without disturbing the litmus envelope shape.
-	if err := retryDBAccessNoValue(ctx, "store llm result", req.SHA256, func(ctx context.Context) error {
-		return s.db.UpdateLLMResult(ctx, req.SHA256, req.LLM)
-	}); err != nil {
-		s.progress.recordErrorf(1, "store", "store llm result: %s: %v", req.SHA256, err)
-		slog.Error("store llm result failed", "sha256", req.SHA256, "error", err)
-	}
-
 	s.progress.analyzed.Add(1)
+	if stats.Members > 0 {
+		s.progress.exploded.Add(stats.MembersStored)
+		s.progress.queued.Add(stats.MembersStored)
+		s.progress.analyzed.Add(stats.MembersStored)
+		//nolint:gosec // sha256 validated by validSHA256; counts are ints
+		slog.Info("stored archive members atomically",
+			"sha256", req.SHA256, "members", stats.Members, "stored", stats.MembersStored)
+	}
 	path := s.tracker.release(req.SHA256)
 	s.tracker.recordResult(req.Worker, false)
-
-	// Hand archive expansion to the background pool. The worker doesn't
-	// care about the result, and a 200-entry JAR shouldn't keep its HTTP
-	// connection (or our pool conn) busy.
-	s.enqueueExplosion(ctx, explosionJob{sha256: req.SHA256, raw: req.Raw})
 
 	//nolint:gosec // worker sanitized by validWorkerName, sha256 by validSHA256, path from in-memory claim
 	slog.Info("result stored", "worker", req.Worker, "sha256", req.SHA256, "path", path,
@@ -1330,97 +1307,6 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true}) //nolint:errcheck,errchkjson // best-effort response
-}
-
-// startExplosions launches the background pool that expands archive cleave
-// results into child sample rows. Call once after the apiServer's db is set.
-// Workers exit only when the queue is closed via drainExplosions; that lets
-// graceful shutdown actually finish in-flight DB writes instead of failing
-// them with context.Canceled the moment main shuts down.
-func (s *apiServer) startExplosions(ctx context.Context) {
-	// Decouple from cancellation so workers survive a ctx-Done shutdown
-	// long enough for drainExplosions to flush the channel. db.Close runs
-	// after drainExplosions in main, so the pool stays alive.
-	explosionCtx := context.WithoutCancel(ctx)
-	s.explosions = make(chan explosionJob, explosionQueueSize)
-	for range explosionWorkers {
-		s.explosionWG.Go(func() {
-			for job := range s.explosions {
-				// Per-job panic recovery so a malformed cleave result can't
-				// crash the worker (which would shrink the pool until restart).
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							slog.Error("explosion worker recovered from panic",
-								"sha256", job.sha256, "panic", r)
-						}
-					}()
-					s.processExplosion(explosionCtx, job)
-				}()
-			}
-		})
-	}
-}
-
-// drainExplosions closes the queue and waits for in-flight expansions to
-// finish, capped at explosionDrainTimeout so a wedged DB doesn't hang
-// shutdown. Call exactly once.
-func (s *apiServer) drainExplosions() {
-	if s.explosions == nil {
-		return
-	}
-	close(s.explosions)
-	done := make(chan struct{})
-	go func() { s.explosionWG.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(explosionDrainTimeout):
-		slog.Warn("explosion drain timed out; some archive members may not be enqueued",
-			"timeout", explosionDrainTimeout)
-	}
-}
-
-func (s *apiServer) processExplosion(ctx context.Context, job explosionJob) {
-	parent, err := retryDBAccess(ctx, "fetch sample for archive explosion", job.sha256, func(ctx context.Context) (*hopper.Sample, error) {
-		return s.db.SampleParentInfo(ctx, job.sha256)
-	})
-	if err != nil {
-		if !errors.Is(err, hopper.ErrNotFound) {
-			slog.Error("fetch for explosion failed", "sha256", job.sha256, "error", err)
-		}
-		return
-	}
-	parent.CleaveResult = job.raw // we already have it; avoid re-reading from DB
-	n, err := retryDBAccess(ctx, "explode archive members", job.sha256, func(ctx context.Context) (int64, error) {
-		return s.db.ExplodeArchiveMembers(ctx, parent)
-	})
-	if err != nil {
-		slog.Error("archive explosion failed", "sha256", job.sha256, "error", err)
-		return
-	}
-	if n > 0 {
-		slog.Debug("exploded archive members", "sha256", job.sha256, "members", n)
-		s.progress.exploded.Add(n)
-		s.progress.queued.Add(n)
-		s.progress.analyzed.Add(n)
-	}
-}
-
-// enqueueExplosion hands the job off to the background pool, falling back to
-// inline processing if the queue is full so we never lose a result. A full
-// queue means the explosion workers can't keep up — log it so the operator
-// notices.
-func (s *apiServer) enqueueExplosion(ctx context.Context, job explosionJob) {
-	if s.explosions == nil {
-		s.processExplosion(ctx, job)
-		return
-	}
-	select {
-	case s.explosions <- job:
-	default:
-		slog.Warn("explosion queue full; processing inline", "sha256", job.sha256, "queue_size", explosionQueueSize)
-		s.processExplosion(ctx, job)
-	}
 }
 
 // claimJobs walks the priority tiers (interactive uploads → forced

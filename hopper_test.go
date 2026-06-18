@@ -131,6 +131,139 @@ func TestMembersByParentAndSamplesBySHAs(t *testing.T) {
 	}
 }
 
+// TestExplodeRefreshesStaleMember locks the freshness-gated refresh: a file
+// first analyzed standalone (or by an older archive) keeps a stale result that
+// ON CONFLICT would freeze, but a newer archive that re-analyzes the same
+// content supersedes it — while an older archive can never overwrite a newer
+// result.
+func TestExplodeRefreshesStaleMember(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	member := strings.Repeat("d", 64)
+	staleAt := time.Now().Add(-48 * time.Hour).UTC()
+
+	// Pre-existing stale standalone analysis: no findings, old date.
+	seed := &Sample{
+		SHA256: member, Source: "forage", Label: "unknown", LabelSource: "forage",
+		Path: "forage/secure.js", FileType: "javascript", AnalyzedAt: &staleAt,
+		CleaveResult: fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"javascript","dp":1}]}`, member),
+	}
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{seed}); err != nil {
+		t.Fatalf("seed stale member: %v", err)
+	}
+
+	explode := func(archive string, at time.Time, traitID string) {
+		t.Helper()
+		parent := &Sample{
+			SHA256: archive, Source: "test", Label: "bad", LabelSource: "test",
+			Path: "bad/arch.zip", FileType: "zip", AnalyzedAt: &at,
+			CleaveResult: fmt.Appendf(nil,
+				`{"files":[{"id":0,"sha":%q,"type":"zip","depth":0,"path":"arch.zip"},`+
+					`{"id":1,"sha":%q,"type":"javascript","depth":1,"path":"arch.zip!!secure.js",`+
+					`"traits":[{"id":%q,"crit":5,"conf":0.95}]}]}`, archive, member, traitID),
+		}
+		if _, err := db.ExplodeArchiveMembers(ctx, parent); err != nil {
+			t.Fatalf("ExplodeArchiveMembers: %v", err)
+		}
+	}
+
+	// A newer archive's rich analysis supersedes the stale standalone row.
+	fresh := time.Now().UTC()
+	explode(strings.Repeat("a", 64), fresh, "obf/eval-fresh")
+	got, err := db.SampleBySHA256(ctx, member)
+	if err != nil {
+		t.Fatalf("SampleBySHA256: %v", err)
+	}
+	if !strings.Contains(string(got.CleaveResult), "obf/eval-fresh") {
+		t.Errorf("member not refreshed by newer archive: %s", got.CleaveResult)
+	}
+	if got.AnalyzedAt == nil || !got.AnalyzedAt.After(staleAt) {
+		t.Errorf("analyzed_at not advanced: %v", got.AnalyzedAt)
+	}
+
+	// An older archive must not overwrite the now-newer result.
+	explode(strings.Repeat("b", 64), staleAt.Add(-time.Hour), "obf/eval-older")
+	got, err = db.SampleBySHA256(ctx, member)
+	if err != nil {
+		t.Fatalf("SampleBySHA256: %v", err)
+	}
+	if strings.Contains(string(got.CleaveResult), "obf/eval-older") {
+		t.Errorf("older archive wrongly overwrote newer analysis: %s", got.CleaveResult)
+	}
+	if !strings.Contains(string(got.CleaveResult), "obf/eval-fresh") {
+		t.Errorf("newer analysis lost: %s", got.CleaveResult)
+	}
+}
+
+// TestStoreResultAtomicMembers locks the core reliability contract: StoreResult
+// writes the parent's truncated analysis AND every member row in one
+// transaction, so a stored parent always has its members (no "truncated parent,
+// zero members" data-loss state). It also covers the non-archive case and the
+// freshness gate for a member that already exists with older analysis.
+func TestStoreResultAtomicMembers(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	archive := strings.Repeat("a", 64)
+	m1 := strings.Repeat("b", 64)
+	m2 := strings.Repeat("c", 64)
+
+	// The archive must already exist as a claimed, unanalyzed row (the worker
+	// claimed it before POSTing its result).
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: archive, Source: "test", Label: "bad", LabelSource: "test",
+		Path: "bad/app.zip",
+	})
+
+	// A worker's full envelope: container + two members, each with per-line ctx.
+	full := fmt.Appendf(nil, `{"v":8,"files":[
+		{"id":0,"sha":%q,"type":"zip","depth":0,"path":"app.zip","traits":[{"id":"c2/beacon","crit":4,"conf":0.9,"from":[{"file":1},{"file":2}]}]},
+		{"id":1,"sha":%q,"type":"javascript","depth":1,"path":"app.zip!!a.js","traits":[{"id":"exec/eval","crit":5,"conf":0.9}],"ctx":[{"ln":1,"addr":0,"b":"abc"}]},
+		{"id":2,"sha":%q,"type":"javascript","depth":1,"path":"app.zip!!b.js","traits":[{"id":"net/http","crit":3,"conf":0.8}],"ctx":[{"ln":1,"addr":0,"b":"xyz"}]}
+	]}`, archive, m1, m2)
+
+	stats, err := db.StoreResult(ctx, archive, full, []byte(`{"prob":0.9}`), nil, nil, "tv1")
+	if err != nil {
+		t.Fatalf("StoreResult: %v", err)
+	}
+	if stats.Members != 2 || stats.MembersStored != 2 {
+		t.Fatalf("stats = %+v, want 2 members, 2 stored", stats)
+	}
+
+	// Parent is stored and compacted; members exist as their own rows with full
+	// single-file analysis — atomically, in the same commit.
+	parent, err := db.SampleBySHA256(ctx, archive)
+	if err != nil || len(parent.CleaveResult) == 0 {
+		t.Fatalf("parent not stored: %v", err)
+	}
+	for _, m := range []string{m1, m2} {
+		row, err := db.SampleBySHA256(ctx, m)
+		if err != nil {
+			t.Fatalf("member %s missing — atomicity violated: %v", m[:4], err)
+		}
+		if row.Parent != archive {
+			t.Errorf("member %s parent = %q, want %q", m[:4], row.Parent, archive)
+		}
+		if len(row.CleaveResult) == 0 {
+			t.Errorf("member %s has no analysis", m[:4])
+		}
+	}
+
+	// Non-archive: a single-file result stores the parent and yields no members.
+	solo := strings.Repeat("d", 64)
+	mustInsert(t, ctx, db, &Sample{SHA256: solo, Source: "test", Label: "unknown", LabelSource: "test", Path: "x/solo.js"})
+	soloStats, err := db.StoreResult(ctx, solo,
+		fmt.Appendf(nil, `{"v":8,"files":[{"id":0,"sha":%q,"type":"javascript","depth":0,"path":"solo.js"}]}`, solo),
+		nil, nil, nil, "tv1")
+	if err != nil {
+		t.Fatalf("StoreResult(non-archive): %v", err)
+	}
+	if soloStats.Members != 0 {
+		t.Errorf("non-archive members = %d, want 0", soloStats.Members)
+	}
+}
+
 func TestReconcileLocationParentEdgesBackfill(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)

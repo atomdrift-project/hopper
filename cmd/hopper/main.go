@@ -1200,11 +1200,9 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		}()
 	}
 
-	// Background pool that handles archive expansion off the /api/result hot
-	// path. Drains gracefully on return so a worker's ExplodeArchiveMembers
-	// call isn't lost mid-flight if the process is shutting down.
-	api.startExplosions(ctx)
-	defer api.drainExplosions()
+	// Archive members are now persisted atomically with the parent in
+	// StoreResult (the /api/result handler), so there's no background expansion
+	// pool to start or drain.
 
 	// Reap orphaned upload temp files left by a previous crash. No-op when
 	// the directory doesn't exist yet.

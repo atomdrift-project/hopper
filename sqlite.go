@@ -1155,6 +1155,46 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 	return inserted, needsAnalysis, nil
 }
 
+// refreshStaleMemberAnalysisSQLite is the SQLite twin of
+// refreshStaleMemberAnalysisPG: per-row UPDATEs in one transaction, gated so
+// only strictly-newer analysis overwrites and litmus is never blanked. Times
+// bind as *time.Time exactly as the batch insert stores them, so the analyzed_at
+// comparison matches the stored serialization.
+func (db *DB) refreshStaleMemberAnalysisSQLite(ctx context.Context, rows []staleRefresh) (int64, error) {
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: begin refresh: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // best-effort after commit
+	stmt, err := tx.PrepareContext(ctx, `
+		UPDATE samples SET
+			cleave_result = ?,
+			litmus_result = COALESCE(?, litmus_result),
+			analyzed_at   = ?
+		WHERE sha256 = ?
+		  AND (analyzed_at IS NULL OR ? > analyzed_at)`)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: prepare refresh: %w", err)
+	}
+	defer stmt.Close() //nolint:errcheck // best-effort cleanup
+	var refreshed int64
+	for _, r := range rows {
+		res, err := stmt.ExecContext(ctx,
+			jsonTextOrNil(r.CleaveResult), jsonTextOrNil(r.LitmusResult),
+			r.AnalyzedAt, r.SHA256, r.AnalyzedAt)
+		if err != nil {
+			return 0, fmt.Errorf("hopper: refresh %s: %w", r.SHA256, err)
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			refreshed += n
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("hopper: commit refresh: %w", err)
+	}
+	return refreshed, nil
+}
+
 func (db *DB) sampleBySHA256SQLite(ctx context.Context, sha256 string) (*Sample, error) {
 	s, err := scanLiteSample(db.lite.QueryRowContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples WHERE sha256 = ?`, sha256))
@@ -1390,6 +1430,134 @@ func (db *DB) updateCleaveResultSQLite(
 		return fmt.Errorf("hopper: update cleave result: %w", err)
 	}
 	return nil
+}
+
+// storeResultSQLite is the SQLite twin of storeResultPG: parent analysis and all
+// archive members written in one transaction. Per-row member upserts (SQLite has
+// no COPY); the member conflict clause touches only analysis columns and only
+// when strictly newer, mirroring memberConflictUpdatePG.
+func (db *DB) storeResultSQLite(
+	ctx context.Context, sha256 string, cleaveRaw, litmusML, llm []byte,
+	p CleaveParseResult, traitsVersion string, now time.Time,
+) (StoreStats, error) {
+	truncated := compactCleaveResultForStorage(cleaveRaw)
+	nowStr := now.UTC().Format(time.RFC3339Nano)
+
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return StoreStats{}, fmt.Errorf("hopper: begin store: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
+
+	var parent Sample
+	var firstAnalyzed sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		`SELECT label, label_source, source, feed, ecosystem, path, first_analyzed_at
+		   FROM samples WHERE sha256 = ?`, sha256).
+		Scan(&parent.Label, &parent.LabelSource, &parent.Source, &parent.Feed,
+			&parent.Ecosystem, &parent.Path, &firstAnalyzed); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return StoreStats{}, fmt.Errorf("hopper: store result for absent sample %s: %w", sha256, ErrNotFound)
+		}
+		return StoreStats{}, fmt.Errorf("hopper: read parent for store %s: %w", sha256, err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE samples SET cleave_result = ?,
+			canonical_sha256 = ?, elements = ?,
+			max_crit = ?, suspicious_count = ?,
+			litmus_result = ?, llm_result = ?,
+			note = '', last_error_at = NULL,
+			traits_version = ?, forced_rescan_at = NULL,
+			first_analyzed_at = COALESCE(first_analyzed_at, ?),
+			analyzed_at = ?, updated_at = ?
+		WHERE sha256 = ?`,
+		string(truncated), p.CanonicalSHA, p.FileInfo.Elements,
+		p.FileInfo.MaxCrit, p.FileInfo.SuspiciousCount,
+		jsonTextOrNil(litmusML), jsonTextOrNil(llm),
+		traitsVersion, nowStr, nowStr, nowStr, sha256); err != nil {
+		return StoreStats{}, fmt.Errorf("hopper: update parent: %w", err)
+	}
+
+	parent.SHA256 = sha256
+	parent.CleaveResult = cleaveRaw
+	parent.LitmusResult = litmusML
+	parent.CanonicalSHA256 = p.CanonicalSHA
+	parent.AnalyzedAt = &now
+	if firstAnalyzed.Valid {
+		if t, perr := time.Parse(time.RFC3339Nano, firstAnalyzed.String); perr == nil {
+			parent.FirstAnalyzedAt = &t
+		}
+	}
+	if parent.FirstAnalyzedAt == nil {
+		parent.FirstAnalyzedAt = &now
+	}
+	members := memberSamplesFromEnvelope(&parent)
+
+	var stats StoreStats
+	stats.Members = len(members)
+	if len(members) > 0 {
+		memStmt, err := tx.PrepareContext(ctx, `
+			INSERT INTO samples (sha256, source, feed, ecosystem, filename,
+				size_bytes, label, label_source, path, status, canonical_sha256,
+				parent, skip, elements, max_crit, suspicious_count, mtime, marker_mtime,
+				cleave_result, litmus_result, analyzed_at, first_analyzed_at,
+				url, domain, package, version, provenance, fetched_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (sha256) DO UPDATE SET
+				cleave_result = excluded.cleave_result,
+				litmus_result = COALESCE(excluded.litmus_result, samples.litmus_result),
+				analyzed_at = excluded.analyzed_at,
+				first_analyzed_at = COALESCE(samples.first_analyzed_at, excluded.first_analyzed_at),
+				updated_at = ?
+			WHERE excluded.analyzed_at > samples.analyzed_at OR samples.analyzed_at IS NULL`)
+		if err != nil {
+			return StoreStats{}, fmt.Errorf("hopper: prepare member upsert: %w", err)
+		}
+		defer memStmt.Close() //nolint:errcheck // best-effort cleanup
+		locStmt, err := tx.PrepareContext(ctx, `
+			INSERT INTO sample_locations
+				(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (sha256, path) DO UPDATE SET
+				last_seen_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
+				mtime = COALESCE(excluded.mtime, sample_locations.mtime)`)
+		if err != nil {
+			return StoreStats{}, fmt.Errorf("hopper: prepare member location: %w", err)
+		}
+		defer locStmt.Close() //nolint:errcheck // best-effort cleanup
+
+		for _, m := range members {
+			firstAt := m.FirstAnalyzedAt
+			if firstAt == nil {
+				firstAt = m.AnalyzedAt
+			}
+			res, err := memStmt.ExecContext(ctx,
+				m.SHA256, m.Source, m.Feed, m.Ecosystem, m.Filename,
+				m.SizeBytes, m.Label, m.LabelSource, m.Path, m.Status, m.SHA256,
+				m.Parent, m.Skip, m.Elements, m.MaxCrit, m.SuspiciousCount, m.Mtime, m.MarkerMtime,
+				jsonTextOrNil(m.CleaveResult), jsonTextOrNil(m.LitmusResult), m.AnalyzedAt, firstAt,
+				m.URL, m.Domain, m.Package, m.Version, jsonTextOrNil(m.Provenance), m.FetchedAt,
+				nowStr)
+			if err != nil {
+				return StoreStats{}, fmt.Errorf("hopper: upsert member %s: %w", m.SHA256, err)
+			}
+			if affected, err := res.RowsAffected(); err == nil {
+				stats.MembersStored += affected
+			}
+			if m.Path != "" {
+				if _, err := locStmt.ExecContext(ctx,
+					m.SHA256, m.Path, m.Parent, m.Filename, m.Source, m.Feed, m.Ecosystem, m.Mtime); err != nil {
+					return StoreStats{}, fmt.Errorf("hopper: upsert member location %s: %w", m.SHA256, err)
+				}
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return StoreStats{}, fmt.Errorf("hopper: commit store: %w", err)
+	}
+	return stats, nil
 }
 
 // requestRescanSQLite mirrors requestRescanPG. SQLite is used for tests
