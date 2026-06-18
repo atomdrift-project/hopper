@@ -398,7 +398,10 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 	// whole tree (rizin/yara children spawned by the worker) at once. Killing
 	// only the parent leaves orphaned descendants behind.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = append(os.Environ(), "TMPDIR="+tmpDir)
+	// Soft trait validation for the worker's own startup gate (see
+	// preflightCleaveValidate): reject a bundle only for load/detection flaws,
+	// not authoring hygiene. Ignored by litmus builds predating soft support.
+	cmd.Env = append(os.Environ(), "TMPDIR="+tmpDir, "CLEAVE_VALIDATE_SOFT=1")
 
 	logDir := xdgLogDir()
 	if err := os.MkdirAll(logDir, 0o750); err != nil {
@@ -701,6 +704,12 @@ func preflightCleaveValidate(ctx context.Context, bin string) (detail string, er
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, "validate")
+	// Soft validation: reject a trait bundle only for flaws that break loading
+	// or lose detections, never for authoring hygiene (taxonomy, size, dedup,
+	// style, precision). Sent as an env toggle rather than a `--soft` flag so a
+	// cleave predating soft support ignores it and validates as before, instead
+	// of hard-failing the gate on an unknown flag.
+	cmd.Env = append(os.Environ(), "CLEAVE_VALIDATE_SOFT=1")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		attrs := []any{
