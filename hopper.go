@@ -1686,7 +1686,7 @@ func (db *DB) SampleParentInfo(ctx context.Context, sha256 string) (*Sample, err
 var ErrRescanNotEligible = errors.New("hopper: sample not eligible for rescan")
 
 // RequestRescan re-queues a previously-analyzed sample for Tier 0 work
-// by stamping forced_rescan_at so workers pick this row before draining
+// by setting rescan_priority = 2 so workers pick this row before draining
 // the Tier 1 (unanalyzed) backlog. The cached cleave/litmus envelope is
 // deliberately preserved — readers continue to see the prior analysis
 // until UpdateCleaveResult replaces it atomically. Workers re-analyze
@@ -1989,16 +1989,56 @@ func (db *DB) UnanalyzedCandidates(ctx context.Context, hopperStart time.Time, l
 	return db.unanalyzedCandidatesSQLite(ctx, hopperStart, limit)
 }
 
-// ForcedRescanCandidates returns up to limit Tier 0 jobs: samples that an
-// operator explicitly re-queued via RequestRescan. Workers drain this
-// before Tier 1 (unanalyzed) so a user-requested rescan jumps the queue
-// regardless of how big the backlog is. Ordered by forced_rescan_at
+// ForcedRescanCandidates returns up to limit Tier 0 jobs: samples an operator
+// explicitly re-queued via RequestRescan (rescan_priority = 2). Workers drain
+// this before Tier 1 (unanalyzed) so a user-requested rescan jumps the queue
+// regardless of how big the backlog is. Ordered by rescan_requested_at
 // ascending (oldest request first) for FIFO fairness across operators.
 func (db *DB) ForcedRescanCandidates(ctx context.Context, limit int) ([]ClaimJob, error) {
 	if db.pool != nil {
 		return db.forcedRescanCandidatesPG(ctx, limit)
 	}
 	return db.forcedRescanCandidatesSQLite(ctx, limit)
+}
+
+// RepairCandidates returns up to limit jobs flagged for re-analysis via the
+// rescan column. Drained by Tier 1b — AFTER the unanalyzed backlog — so bulk
+// background repair (e.g. archives left memberless by the old async explosion)
+// never starves freshly-ingested archives. Worst (highest score) first. The
+// flag is set by QueueMissingMembersForRepair / QueueRescan and cleared by
+// StoreResult once fresh analysis lands.
+func (db *DB) RepairCandidates(ctx context.Context, limit int) ([]ClaimJob, error) {
+	if db.pool != nil {
+		return db.repairCandidatesPG(ctx, limit)
+	}
+	return db.repairCandidatesSQLite(ctx, limit)
+}
+
+// QueueRescan flags the given SHAs for re-analysis in the repair tier
+// (rescan_priority 1). Only top-level, non-skipped samples are touched, and a
+// sample already queued at a higher priority is left alone. Returns the number
+// flagged. This is the CLI/operator entry point for rescanning files behind new
+// work.
+func (db *DB) QueueRescan(ctx context.Context, shas []string) (int64, error) {
+	if len(shas) == 0 {
+		return 0, nil
+	}
+	if db.pool != nil {
+		return db.queueRescanPG(ctx, shas)
+	}
+	return db.queueRescanSQLite(ctx, shas)
+}
+
+// QueueMissingMembersForRepair flags every top-level archive whose stored
+// cleave_result was truncated (members factored out) but which has no member
+// rows — the data-loss state the former async explosion could leave behind. The
+// detecting NOT EXISTS scan runs once here, not per claim poll; thereafter Tier
+// 1b drains the cheap rescan flag. Returns the number flagged.
+func (db *DB) QueueMissingMembersForRepair(ctx context.Context) (int64, error) {
+	if db.pool != nil {
+		return db.queueMissingMembersForRepairPG(ctx)
+	}
+	return db.queueMissingMembersForRepairSQLite(ctx)
 }
 
 // SampleAnalyzed reports whether a sample with the given SHA-256 exists

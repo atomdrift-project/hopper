@@ -234,24 +234,33 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		}
 	}
 
-	// forced_rescan_at: operator-initiated re-queue marker (Tier 0). See the
-	// matching PG migration for rationale. Workers drain Tier 0 before Tier 1
-	// so user-requested rescans jump the queue.
-	if pragmaHasColumn(ctx, db.lite, "forced_rescan_at") == 0 {
+	// Rescan queue: rescan_priority (2 = interactive/ahead of new, 1 = bulk
+	// repair/behind new, 0 = not queued) + rescan_requested_at (when queued, for
+	// FIFO ordering). Supersedes the timestamp-only forced_rescan_at, which is
+	// dropped without preserving its handful of pending rows. See the matching PG
+	// migration for the full rationale.
+	if pragmaHasColumn(ctx, db.lite, "rescan_priority") == 0 {
 		if _, err := db.lite.ExecContext(ctx,
-			`ALTER TABLE samples ADD COLUMN forced_rescan_at DATETIME`); err != nil {
+			`ALTER TABLE samples ADD COLUMN rescan_priority INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite: %w", err)
 		}
 	}
-	// Re-create the partial index without `cleave_result IS NULL` in the
-	// predicate. The prior version forced RequestRescan to null the cached
-	// envelope to make rows eligible — see pg.go for the full rationale.
-	// DROP+CREATE is idempotent: fresh installs see no prior index to drop.
+	if pragmaHasColumn(ctx, db.lite, "rescan_requested_at") == 0 {
+		if _, err := db.lite.ExecContext(ctx,
+			`ALTER TABLE samples ADD COLUMN rescan_requested_at DATETIME`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite: %w", err)
+		}
+	}
+	if pragmaHasColumn(ctx, db.lite, "forced_rescan_at") == 1 {
+		if _, err := db.lite.ExecContext(ctx,
+			`ALTER TABLE samples DROP COLUMN forced_rescan_at`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite: %w", err)
+		}
+	}
 	for _, ddl := range []string{
 		`DROP INDEX IF EXISTS idx_samples_forced_rescan`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_forced_rescan ` +
-			`ON samples(forced_rescan_at) ` +
-			`WHERE forced_rescan_at IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_rescan_queue ` +
+			`ON samples(rescan_priority, rescan_requested_at) WHERE rescan_priority > 0`,
 	} {
 		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite: %w", err)
@@ -1410,8 +1419,8 @@ func (db *DB) updateCleaveResultSQLite(
 	// file_type, score, formula, litmus_score are GENERATED columns;
 	// setting litmus_result = NULL auto-resets litmus_score to 0.
 	n := now()
-	// forced_rescan_at clears here so the row drops out of the Tier 0
-	// queue once fresh analysis lands.
+	// The rescan queue fields clear here so the row drops out once fresh
+	// analysis lands.
 	_, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET cleave_result = ?,
 			canonical_sha256 = ?, elements = ?,
@@ -1419,7 +1428,7 @@ func (db *DB) updateCleaveResultSQLite(
 			litmus_result = NULL,
 			note = '', last_error_at = NULL,
 			traits_version = ?,
-			forced_rescan_at = NULL,
+			rescan_priority = 0, rescan_requested_at = NULL,
 			first_analyzed_at = COALESCE(first_analyzed_at, ?),
 			analyzed_at = ?, updated_at = ?
 		WHERE sha256 = ?`,
@@ -1468,7 +1477,7 @@ func (db *DB) storeResultSQLite(
 			max_crit = ?, suspicious_count = ?,
 			litmus_result = ?, llm_result = ?,
 			note = '', last_error_at = NULL,
-			traits_version = ?, forced_rescan_at = NULL,
+			traits_version = ?, rescan_priority = 0, rescan_requested_at = NULL,
 			first_analyzed_at = COALESCE(first_analyzed_at, ?),
 			analyzed_at = ?, updated_at = ?
 		WHERE sha256 = ?`,
@@ -1570,10 +1579,11 @@ func (db *DB) requestRescanSQLite(ctx context.Context, sha256 string, cooldownCu
 	cutoff := cooldownCutoff.UTC().Format(time.RFC3339Nano)
 	res, err := db.lite.ExecContext(ctx, `
 		UPDATE samples
-		SET forced_rescan_at = COALESCE(forced_rescan_at, ?),
+		SET rescan_priority = 2,
+		    rescan_requested_at = COALESCE(rescan_requested_at, ?),
 		    updated_at = ?
 		WHERE sha256 = ? AND parent = '' AND skip = ''
-		  AND (forced_rescan_at IS NOT NULL
+		  AND (rescan_priority > 0
 		       OR analyzed_at IS NULL
 		       OR analyzed_at < ?)`,
 		n, n, sha256, cutoff)
@@ -3075,10 +3085,57 @@ func (db *DB) unanalyzedCandidatesSQLite(ctx context.Context, hopperStart time.T
 func (db *DB) forcedRescanCandidatesSQLite(ctx context.Context, limit int) ([]ClaimJob, error) {
 	return queryLiteCandidates(ctx, db.lite, `
 		SELECT sha256, path, size_bytes, file_type FROM samples
-		WHERE forced_rescan_at IS NOT NULL
+		WHERE rescan_priority = 2
 		  AND skip = '' AND parent = ''
-		ORDER BY forced_rescan_at ASC
+		ORDER BY rescan_requested_at ASC
 		LIMIT ?`, limit)
+}
+
+// repairCandidatesSQLite mirrors repairCandidatesPG.
+func (db *DB) repairCandidatesSQLite(ctx context.Context, limit int) ([]ClaimJob, error) {
+	return queryLiteCandidates(ctx, db.lite, `
+		SELECT sha256, path, size_bytes, file_type FROM samples
+		WHERE rescan_priority = 1 AND skip = '' AND parent = ''
+		ORDER BY rescan_requested_at ASC, score DESC
+		LIMIT ?`, limit)
+}
+
+// queueRescanSQLite mirrors queueRescanPG. SQLite has no array binding, so the
+// SHA list is expanded into placeholders.
+func (db *DB) queueRescanSQLite(ctx context.Context, shas []string) (int64, error) {
+	placeholders := make([]string, len(shas))
+	args := make([]any, len(shas))
+	for i, s := range shas {
+		placeholders[i] = "?"
+		args[i] = s
+	}
+	//nolint:gosec // placeholders are literal "?" tokens, never user input
+	res, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET rescan_priority = 1,
+		     rescan_requested_at = COALESCE(rescan_requested_at, strftime('%Y-%m-%dT%H:%M:%f','now')),
+		     updated_at = strftime('%Y-%m-%dT%H:%M:%f','now')
+		 WHERE sha256 IN (`+strings.Join(placeholders, ",")+`) AND parent = '' AND skip = '' AND rescan_priority = 0`,
+		args...)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: queue rescan: %w", err)
+	}
+	return res.RowsAffected()
+}
+
+// queueMissingMembersForRepairSQLite mirrors queueMissingMembersForRepairPG.
+func (db *DB) queueMissingMembersForRepairSQLite(ctx context.Context) (int64, error) {
+	res, err := db.lite.ExecContext(ctx, `
+		UPDATE samples SET rescan_priority = 1,
+		    rescan_requested_at = strftime('%Y-%m-%dT%H:%M:%f','now'),
+		    updated_at = strftime('%Y-%m-%dT%H:%M:%f','now')
+		WHERE parent = '' AND skip = '' AND rescan_priority = 0
+		  AND cleave_result IS NOT NULL
+		  AND json_extract(cleave_result, '$.truncated') IS NOT NULL
+		  AND NOT EXISTS (SELECT 1 FROM samples m WHERE m.parent = samples.sha256)`)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: queue missing-member archives: %w", err)
+	}
+	return res.RowsAffected()
 }
 
 // sampleAnalyzedSQLite mirrors sampleAnalyzedPG: cheap status query that

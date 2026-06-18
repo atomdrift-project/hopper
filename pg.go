@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
 )
@@ -586,15 +587,26 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// API) saw the row as unanalyzed. Keeping cleave_result intact lets
 		// the stale-but-real envelope stay visible until updateCleaveResult
 		// atomically replaces it.
-		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS forced_rescan_at TIMESTAMPTZ`,
-		// Drop any prior version of the index whose predicate also gated on
-		// `cleave_result IS NULL`. The replacement below is then created with
-		// the right predicate. Both operations are tiny (the indexed set is
-		// only rows currently awaiting a forced rescan).
+		// Rescan queue. A pending re-analysis is one row: rescan_priority says
+		// which tier drains it (2 = interactive, ahead of the unanalyzed backlog,
+		// for a user waiting on prism's rescan button; 1 = bulk/background repair,
+		// behind new ingestion, e.g. archives left memberless by the old async
+		// explosion; 0 = not queued). rescan_requested_at is when it was queued —
+		// FIFO ordering within a tier and operator visibility. Both ADD COLUMNs are
+		// metadata-only (constant/NULL default → a brief catalog lock, never a
+		// table rewrite). This supersedes the timestamp-only forced_rescan_at,
+		// whose "forced = ahead of new" meaning is now priority 2; its handful of
+		// pending rows aren't worth preserving, so the column is simply dropped
+		// (also a metadata-only operation — the new queue starts empty).
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS rescan_priority SMALLINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS rescan_requested_at TIMESTAMPTZ`,
 		`DROP INDEX IF EXISTS idx_samples_forced_rescan`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_forced_rescan ` +
-			`ON samples(forced_rescan_at) ` +
-			`WHERE forced_rescan_at IS NOT NULL`,
+		`ALTER TABLE samples DROP COLUMN IF EXISTS forced_rescan_at`,
+		// Tiny partial index over queued rows only; covers both tier filters
+		// (rescan_priority = 1|2) and FIFO ordering by request time. Built
+		// CONCURRENTLY by the migration framework, so no lock.
+		`CREATE INDEX IF NOT EXISTS idx_samples_rescan_queue ` +
+			`ON samples(rescan_priority, rescan_requested_at) WHERE rescan_priority > 0`,
 
 		// Aggressive autovacuum on the hot table. Defaults wait for 20% dead
 		// tuples / 10% changed rows before kicking in, which on a 5M-row table
@@ -800,7 +812,7 @@ func (db *DB) execPGMigrationDDL(ctx context.Context, ddl string, allowRewrite b
 
 	start := time.Now()
 	slog.Info("executing migration ddl", "id", id, "ddl", ddl)
-	if _, err := db.pool.Exec(ctx, ddl); err != nil {
+	if err := db.execMigrationWithLockRetry(ctx, ddl); err != nil {
 		return err
 	}
 	elapsed := time.Since(start)
@@ -809,6 +821,70 @@ func (db *DB) execPGMigrationDDL(ctx context.Context, ddl string, allowRewrite b
 	}
 	slog.Info("migration ddl complete", "id", id, "elapsed", elapsed.String())
 	return nil
+}
+
+const (
+	// migrationLockTimeout bounds how long one migration attempt waits for its
+	// table lock. Kept short so a waiting ACCESS EXCLUSIVE never queues readers
+	// for long; the metadata change itself is instant once the lock is held.
+	migrationLockTimeout = 3 * time.Second
+	// migrationLockAttempts is the initial try plus retries. The rescan-column
+	// migration is metadata-only but still needs a brief ACCESS EXCLUSIVE, which
+	// can lose the race to a long-running reader on a perpetually-busy table;
+	// retrying lets a single contended boot succeed instead of failing startup.
+	migrationLockAttempts = 4 // 1 try + 3 retries
+	// migrationLockBackoff lets the blocking reader drain between attempts.
+	migrationLockBackoff = 2 * time.Second
+)
+
+// execMigrationWithLockRetry runs one migration statement under a short
+// per-statement lock_timeout, retrying on lock_not_available (SQLSTATE 55P03).
+// DDL here is metadata-only (ADD/DROP COLUMN, CREATE/REPLACE FUNCTION/TRIGGER) —
+// instant once its brief lock is held — but acquiring that lock on a
+// continuously-read table can time out behind a long reader. A short timeout
+// keeps a waiting exclusive from stalling readers for long, and the back-off
+// lets the blocker finish before the next try, so a busy first deploy no longer
+// fails startup. Concurrent index builds take a different path (createIndex
+// Concurrently) and never reach here.
+func (db *DB) execMigrationWithLockRetry(ctx context.Context, ddl string) error {
+	var lastErr error
+	for attempt := 1; attempt <= migrationLockAttempts; attempt++ {
+		err := func() error {
+			tx, err := db.pool.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback(ctx) //nolint:errcheck // rolled back unless Commit succeeds
+			// set_config(..., true) is SET LOCAL — scoped to this transaction, so
+			// it never leaks the short timeout onto the pooled connection.
+			if _, err := tx.Exec(ctx, `SELECT set_config('lock_timeout', $1, true)`,
+				strconv.FormatInt(migrationLockTimeout.Milliseconds(), 10)); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, ddl); err != nil {
+				return err
+			}
+			return tx.Commit(ctx)
+		}()
+		if err == nil {
+			return nil
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "55P03" { // lock_not_available
+			return err
+		}
+		lastErr = err
+		slog.Warn("migration ddl lost the lock race; retrying",
+			"attempt", attempt, "max", migrationLockAttempts, "error", err)
+		if attempt < migrationLockAttempts {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(migrationLockBackoff):
+			}
+		}
+	}
+	return fmt.Errorf("hopper: migration ddl could not acquire its lock after %d attempts: %w", migrationLockAttempts, lastErr)
 }
 
 func (db *DB) ensurePGMigrationLedger(ctx context.Context) error {
@@ -1741,7 +1817,7 @@ func (db *DB) storeResultPG(
 			max_crit = $5, suspicious_count = $6,
 			litmus_result = $7, llm_result = $8,
 			note = '', last_error_at = NULL,
-			traits_version = $9, forced_rescan_at = NULL,
+			traits_version = $9, rescan_priority = 0, rescan_requested_at = NULL,
 			first_analyzed_at = COALESCE(first_analyzed_at, $10),
 			analyzed_at = $10, updated_at = $10
 		WHERE sha256 = $1`,
@@ -1991,9 +2067,9 @@ func (db *DB) updateCleaveResultPG(
 	// it); litmus_score by the samples_derive_litmus_score trigger (UPDATE OF
 	// litmus_result fires it), so setting litmus_result = NULL resets it to 0
 	// via the trigger's COALESCE. None are SET here.
-	// forced_rescan_at clears here so the row drops out of the Tier 0
-	// queue once a worker has actually produced fresh analysis; without
-	// this the partial index would carry stale entries.
+	// The rescan queue (rescan_priority/rescan_requested_at) clears here so the
+	// row drops out once a worker has produced fresh analysis; without this the
+	// partial index would carry stale entries.
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET cleave_result = $2,
 			canonical_sha256 = $3, elements = $4,
@@ -2001,7 +2077,7 @@ func (db *DB) updateCleaveResultPG(
 			litmus_result = NULL,
 			note = '', last_error_at = NULL,
 			traits_version = $7,
-			forced_rescan_at = NULL,
+			rescan_priority = 0, rescan_requested_at = NULL,
 			first_analyzed_at = COALESCE(first_analyzed_at, now()),
 			analyzed_at = now(), updated_at = now()
 		WHERE sha256 = $1`,
@@ -2013,25 +2089,25 @@ func (db *DB) updateCleaveResultPG(
 	return nil
 }
 
-// requestRescanPG stamps forced_rescan_at so workers pick this row before
-// the Tier 1 backlog. Analysis fields (cleave_result, litmus_result,
-// analyzed_at, traits_version, note, last_error_at) are deliberately left
-// alone so readers continue to see the prior envelope until a worker
-// stores fresh results — updateCleaveResultPG replaces them atomically
-// and clears forced_rescan_at in the same UPDATE.
+// requestRescanPG queues an interactive rescan (rescan_priority = 2), drained
+// ahead of the unanalyzed backlog. Analysis fields (cleave_result,
+// litmus_result, analyzed_at, traits_version, note, last_error_at) are
+// deliberately left alone so readers see the prior envelope until a worker
+// stores fresh results — StoreResult replaces them and clears the queue fields.
 //
-// `COALESCE(forced_rescan_at, now())` makes repeat requests for the same
-// SHA idempotent: a row already queued keeps its original FIFO position.
-// The WHERE accepts a re-request when either the cooldown has elapsed OR
-// the row is already pending — so a caller is never told ErrRescanNotEligible
-// for a SHA that's actually about to be rescanned.
+// `COALESCE(rescan_requested_at, now())` makes repeat requests idempotent: a
+// row already queued keeps its original FIFO position (and a repair-queued row
+// is promoted to interactive without losing its place). The WHERE accepts a
+// re-request when the cooldown has elapsed OR the row is already queued — so a
+// caller is never told ErrRescanNotEligible for a SHA already about to rescan.
 func (db *DB) requestRescanPG(ctx context.Context, sha256 string, cooldownCutoff time.Time) error {
 	tag, err := db.pool.Exec(ctx, `
 		UPDATE samples
-		SET forced_rescan_at = COALESCE(forced_rescan_at, now()),
+		SET rescan_priority = 2,
+		    rescan_requested_at = COALESCE(rescan_requested_at, now()),
 		    updated_at = now()
 		WHERE sha256 = $1 AND parent = '' AND skip = ''
-		  AND (forced_rescan_at IS NOT NULL
+		  AND (rescan_priority > 0
 		       OR analyzed_at IS NULL
 		       OR analyzed_at < $2)`,
 		sha256, cooldownCutoff)
@@ -3741,10 +3817,10 @@ func (db *DB) unanalyzedCandidatesPG(ctx context.Context, hopperStart time.Time,
 }
 
 // forcedRescanCandidatesPG returns Tier 0 work: samples explicitly re-
-// queued by RequestRescan. The idx_samples_forced_rescan partial index
-// keeps this scan O(active forced-rescan count) regardless of table size.
-// Rows leave the index as workers complete them (updateCleaveResultPG
-// clears forced_rescan_at) so the index stays tiny.
+// queued by RequestRescan (rescan_priority = 2). The idx_samples_rescan_queue
+// partial index keeps this scan O(active queued count) regardless of table
+// size. Rows leave the index as workers complete them (StoreResult clears the
+// queue fields) so the index stays tiny.
 //
 // The query does NOT filter on `cleave_result IS NULL`: requestRescanPG
 // leaves the prior envelope in place so readers see it during the rescan
@@ -3754,14 +3830,59 @@ func (db *DB) unanalyzedCandidatesPG(ctx context.Context, hopperStart time.Time,
 func (db *DB) forcedRescanCandidatesPG(ctx context.Context, limit int) ([]ClaimJob, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT sha256, path, size_bytes, file_type FROM samples
-		WHERE forced_rescan_at IS NOT NULL
+		WHERE rescan_priority = 2
 		  AND skip = '' AND parent = ''
-		ORDER BY forced_rescan_at ASC
+		ORDER BY rescan_requested_at ASC
 		LIMIT $1`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: forced rescan candidates: %w", err)
 	}
 	return scanClaimRows(rows)
+}
+
+// repairCandidatesPG returns repair-tier jobs (rescan_priority = 1), FIFO by
+// request time with worst score as tiebreak, via the idx_samples_rescan_queue
+// partial index — cheap regardless of backlog size.
+func (db *DB) repairCandidatesPG(ctx context.Context, limit int) ([]ClaimJob, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT sha256, path, size_bytes, file_type FROM samples
+		WHERE rescan_priority = 1 AND skip = '' AND parent = ''
+		ORDER BY rescan_requested_at ASC, score DESC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: repair candidates: %w", err)
+	}
+	return scanClaimRows(rows)
+}
+
+// queueRescanPG flags specific top-level samples for repair-tier re-analysis,
+// leaving any already queued at a higher priority untouched.
+func (db *DB) queueRescanPG(ctx context.Context, shas []string) (int64, error) {
+	tag, err := db.pool.Exec(ctx,
+		`UPDATE samples SET rescan_priority = 1,
+		     rescan_requested_at = COALESCE(rescan_requested_at, now()), updated_at = now()
+		 WHERE sha256 = ANY($1) AND parent = '' AND skip = '' AND rescan_priority = 0`, shas)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: queue rescan: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// queueMissingMembersForRepairPG flags every truncated top-level archive that
+// has no member rows. The "truncated" marker is only ever set (never false —
+// clearCompactionMarkers deletes it on reassembly), so its presence is the
+// signal. One-time NOT EXISTS scan; the repair tier then drains the flag cheaply.
+func (db *DB) queueMissingMembersForRepairPG(ctx context.Context) (int64, error) {
+	tag, err := db.pool.Exec(ctx, `
+		UPDATE samples p SET rescan_priority = 1, rescan_requested_at = now(), updated_at = now()
+		WHERE p.parent = '' AND p.skip = '' AND p.rescan_priority = 0
+		  AND p.cleave_result IS NOT NULL
+		  AND (p.cleave_result->>'truncated') IS NOT NULL
+		  AND NOT EXISTS (SELECT 1 FROM samples m WHERE m.parent = p.sha256)`)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: queue missing-member archives: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // sampleAnalyzedPG is the PG implementation of SampleAnalyzed. Reads two

@@ -1362,6 +1362,22 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, too
 		return out, nil
 	}
 
+	// Tier 1b: repair jobs flagged via the rescan column (e.g. archives left
+	// memberless by the former async explosion — re-analysis regenerates members
+	// atomically via StoreResult). Drained after the unanalyzed backlog so bulk
+	// repair never starves fresh ingestion, but ahead of path-prefix and
+	// stale-traits rescans.
+	want = count - len(out)
+	cands, err = s.db.RepairCandidates(ctx, want*candidateOverfetch)
+	if err != nil {
+		return out, err
+	}
+	cands = filterCandidatesByWorkerTools(cands, tools)
+	out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
+	if len(out) >= count {
+		return out, nil
+	}
+
 	if len(s.forceRescanPrefixes) > 0 {
 		want = count - len(out)
 		cands, err = s.db.ForceRescanCandidates(ctx, s.hopperStart, s.forceRescanPrefixes, want*candidateOverfetch)

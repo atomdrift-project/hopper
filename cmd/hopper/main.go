@@ -55,6 +55,7 @@ commands:
   purge-unsupported  delete analyzed rows cleave could not classify
   normalize-ecosystems  re-canonicalize stored ecosystem labels (dry-run)
   cleanup            delete wonky samples by skip category (interactive)
+  rescan             queue files for repair-tier re-analysis (--missing-members or SHA-256 args)
   stats              show sample counts
 `
 
@@ -442,6 +443,8 @@ func run(ctx context.Context) error {
 		return cmdNormalizeEcosystems(ctx)
 	case "cleanup":
 		return cmdCleanup(ctx)
+	case "rescan":
+		return cmdRescan(ctx)
 	case "stats":
 		return cmdStats(ctx)
 	default:
@@ -2934,6 +2937,56 @@ func cmdBackfill(ctx context.Context) error {
 		return err
 	}
 	slog.Info("backfill complete", "scanned", stats.Scanned, "updated", stats.Updated, "markers_cleared", stats.MarkersCleared)
+	return nil
+}
+
+// cmdRescan queues files for re-analysis in the repair tier (rescan_priority=1),
+// drained behind new ingestion so it never starves fresh work. With
+// --missing-members it flags every truncated archive that has no member rows —
+// the historical data-loss backlog from the old async explosion; otherwise it
+// flags the SHA-256s given as arguments. For an interactive, ahead-of-new rescan
+// of a single file, use prism's per-file rescan button (RequestRescan).
+func cmdRescan(ctx context.Context) error {
+	f := flag.NewFlagSet("rescan", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	missingMembers := f.Bool("missing-members", false, "flag every truncated archive that has no member rows")
+	parseFlags(f, os.Args[2:])
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		return err
+	}
+
+	if *missingMembers {
+		n, err := db.QueueMissingMembersForRepair(ctx)
+		if err != nil {
+			return err
+		}
+		slog.Info("queued memberless archives for repair", "count", n)
+		return nil
+	}
+
+	shas := f.Args()
+	if len(shas) == 0 {
+		return errors.New("rescan: pass --missing-members, or one or more SHA-256 arguments")
+	}
+	norm := make([]string, len(shas))
+	for i, s := range shas {
+		s = strings.ToLower(s)
+		if !validSHA256(s) {
+			return fmt.Errorf("rescan: %q is not a SHA-256", shas[i])
+		}
+		norm[i] = s
+	}
+	n, err := db.QueueRescan(ctx, norm)
+	if err != nil {
+		return err
+	}
+	slog.Info("queued samples for repair-tier rescan", "requested", len(norm), "queued", n)
 	return nil
 }
 

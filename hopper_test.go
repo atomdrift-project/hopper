@@ -264,6 +264,77 @@ func TestStoreResultAtomicMembers(t *testing.T) {
 	}
 }
 
+// TestRepairQueue locks the repair tier end to end: QueueMissingMembersForRepair
+// flags only truncated top-level archives that lack member rows (priority 1),
+// RepairCandidates returns exactly those, and an interactive RequestRescan
+// outranks a repair flag (priority 2) so it drains from the forced tier instead.
+func TestRepairQueue(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	broken := strings.Repeat("a", 64)   // truncated, no members → repair candidate
+	repaired := strings.Repeat("b", 64) // truncated, has a member → not
+	member := strings.Repeat("c", 64)
+	plain := strings.Repeat("d", 64)   // not truncated → not
+	skipped := strings.Repeat("e", 64) // truncated but skipped → not
+
+	insert := func(sha, skip string, truncated bool) {
+		t.Helper()
+		body := fmt.Sprintf(`{"files":[{"sha":%q,"type":"zip"}]}`, sha)
+		if truncated {
+			body = fmt.Sprintf(`{"files":[{"sha":%q,"type":"zip"}],"truncated":true}`, sha)
+		}
+		mustInsert(t, ctx, db, &Sample{
+			SHA256: sha, Source: "test", Label: "bad", LabelSource: "test",
+			Path: "bad/" + sha + ".zip", Skip: skip, CleaveResult: []byte(body),
+		})
+	}
+	insert(broken, "", true)
+	insert(repaired, "", true)
+	insert(plain, "", false)
+	insert(skipped, "skip-benign-archive-item", true)
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: member, Source: "test", Label: "bad", LabelSource: "test",
+		Path: "bad/" + repaired + ".zip!!m.js", Parent: repaired,
+		CleaveResult: []byte(`{"files":[{"sha":"` + member + `","type":"javascript"}]}`),
+	})
+
+	n, err := db.QueueMissingMembersForRepair(ctx)
+	if err != nil {
+		t.Fatalf("QueueMissingMembersForRepair: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("flagged %d archives, want only the memberless one", n)
+	}
+	cands, err := db.RepairCandidates(ctx, 50)
+	if err != nil {
+		t.Fatalf("RepairCandidates: %v", err)
+	}
+	if len(cands) != 1 || cands[0].SHA256 != broken {
+		t.Fatalf("repair candidates = %+v, want only %s", cands, broken[:4])
+	}
+
+	// An interactive rescan of the same archive promotes it to priority 2, so it
+	// leaves the repair tier for the forced (ahead-of-new) tier.
+	if err := db.RequestRescan(ctx, broken, 0); err != nil {
+		t.Fatalf("RequestRescan: %v", err)
+	}
+	afterPromote, err := db.RepairCandidates(ctx, 50)
+	if err != nil {
+		t.Fatalf("RepairCandidates: %v", err)
+	}
+	if len(afterPromote) != 0 {
+		t.Errorf("after interactive rescan, repair tier should be empty, got %+v", afterPromote)
+	}
+	forced, err := db.ForcedRescanCandidates(ctx, 50)
+	if err != nil {
+		t.Fatalf("ForcedRescanCandidates: %v", err)
+	}
+	if len(forced) != 1 || forced[0].SHA256 != broken {
+		t.Errorf("forced tier = %+v, want %s after interactive rescan", forced, broken[:4])
+	}
+}
+
 func TestReconcileLocationParentEdgesBackfill(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
@@ -4032,12 +4103,12 @@ func TestForcedRescanCandidatesOrder(t *testing.T) {
 	for i, sha := range shas {
 		mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test", Label: "good", LabelSource: "test"})
 		mustAnalyze(t, ctx, db, sha, 1)
-		// Stamp forced_rescan_at explicitly so the test isn't dependent on
+		// Stamp the queue fields explicitly so the test isn't dependent on
 		// RequestRescan's now()-based ordering (which is rate-limited by the
 		// SQLite clock resolution).
 		ts := time.Now().Add(time.Duration(i) * time.Second).Format(time.RFC3339Nano)
 		if _, err := db.lite.ExecContext(ctx,
-			`UPDATE samples SET cleave_result = NULL, forced_rescan_at = ? WHERE sha256 = ?`,
+			`UPDATE samples SET cleave_result = NULL, rescan_priority = 2, rescan_requested_at = ? WHERE sha256 = ?`,
 			ts, sha); err != nil {
 			t.Fatalf("stamp: %v", err)
 		}
@@ -4105,7 +4176,7 @@ func TestRequestRescanPreservesEnvelope(t *testing.T) {
 	var afterAnalyzedAt sql.NullString
 	var forcedAt sql.NullString
 	if err := db.lite.QueryRowContext(ctx,
-		`SELECT cleave_result, traits_version, analyzed_at, forced_rescan_at FROM samples WHERE sha256 = ?`,
+		`SELECT cleave_result, traits_version, analyzed_at, rescan_requested_at FROM samples WHERE sha256 = ?`,
 		sha).Scan(&afterCleave, &afterTraits, &afterAnalyzedAt, &forcedAt); err != nil {
 		t.Fatalf("snapshot after: %v", err)
 	}
@@ -4145,7 +4216,7 @@ func TestRequestRescanIdempotent(t *testing.T) {
 	}
 	var firstForcedAt string
 	if err := db.lite.QueryRowContext(ctx,
-		`SELECT forced_rescan_at FROM samples WHERE sha256 = ?`,
+		`SELECT rescan_requested_at FROM samples WHERE sha256 = ?`,
 		sha).Scan(&firstForcedAt); err != nil {
 		t.Fatalf("read first forced_rescan_at: %v", err)
 	}
@@ -4164,7 +4235,7 @@ func TestRequestRescanIdempotent(t *testing.T) {
 	}
 	var secondForcedAt string
 	if err := db.lite.QueryRowContext(ctx,
-		`SELECT forced_rescan_at FROM samples WHERE sha256 = ?`,
+		`SELECT rescan_requested_at FROM samples WHERE sha256 = ?`,
 		sha).Scan(&secondForcedAt); err != nil {
 		t.Fatalf("read second forced_rescan_at: %v", err)
 	}
