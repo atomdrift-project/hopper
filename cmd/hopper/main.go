@@ -56,6 +56,7 @@ commands:
   normalize-ecosystems  re-canonicalize stored ecosystem labels (dry-run)
   cleanup            delete wonky samples by skip category (interactive)
   rescan             queue files for repair-tier re-analysis (--missing-members or SHA-256 args)
+  triage             fetch mislabeled samples to /var/tmp/hopper-triage
   stats              show sample counts
 `
 
@@ -445,6 +446,8 @@ func run(ctx context.Context) error {
 		return cmdCleanup(ctx)
 	case "rescan":
 		return cmdRescan(ctx)
+	case "triage":
+		return cmdTriage(ctx)
 	case "stats":
 		return cmdStats(ctx)
 	default:
@@ -3271,6 +3274,105 @@ func sampleAgeDays(ts *time.Time) string {
 	}
 	days := max(int(time.Since(*ts).Hours()/24), 0)
 	return strconv.Itoa(days)
+}
+
+func cmdTriage(ctx context.Context) error {
+	f := flag.NewFlagSet("triage", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	count := f.Int("count", 100, "maximum rows per dataset")
+	url := f.String("url", "http://127.0.0.1:8081", "hopper API base URL")
+	out := f.String("out", "/var/tmp/hopper-triage", "output root directory")
+	ecosystem := f.String("ecosystem", "", "filter by ecosystem (e.g. wolfi, archlinux)")
+	fileType := f.String("file-type", "", "filter by file type (e.g. apk, pkg.tar.zst)")
+	parseFlags(f, os.Args[2:])
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	filter := hopper.TriageFilter{Ecosystem: *ecosystem, FileType: *fileType}
+
+	type dataset struct {
+		name    string
+		fetch   func(context.Context, int) ([]*hopper.Sample, error)
+	}
+	datasets := []dataset{
+		{"bad", func(ctx context.Context, n int) ([]*hopper.Sample, error) { return db.TriageBad(ctx, n, filter) }},
+		{"good", func(ctx context.Context, n int) ([]*hopper.Sample, error) { return db.TriageGood(ctx, n, filter) }},
+		{"new", func(ctx context.Context, n int) ([]*hopper.Sample, error) { return db.TriageNew(ctx, n, filter) }},
+	}
+
+	if err := os.RemoveAll(*out); err != nil {
+		return fmt.Errorf("clear output dir: %w", err)
+	}
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	var totalOK, totalFail int
+
+	for _, ds := range datasets {
+		samples, err := ds.fetch(ctx, *count)
+		if err != nil {
+			return fmt.Errorf("%s: %w", ds.name, err)
+		}
+		writeStdoutf("%s: fetching %d samples...\n", ds.name, len(samples))
+
+		for _, s := range samples {
+			bucket := s.Ecosystem
+			if bucket == "" {
+				bucket = s.Feed
+			}
+			if bucket == "" {
+				bucket = s.Source
+			}
+			if bucket == "" {
+				bucket = "unknown"
+			}
+			name := s.Filename
+			if name == "" {
+				name = s.SHA256
+			}
+
+			destDir := filepath.Join(*out, ds.name, bucket)
+			if err := os.MkdirAll(destDir, 0o755); err != nil {
+				return fmt.Errorf("mkdir %s: %w", destDir, err)
+			}
+			dest := filepath.Join(destDir, name)
+
+			apiURL := strings.TrimRight(*url, "/") + "/api/file/" + s.SHA256
+			resp, err := client.Get(apiURL) //nolint:noctx // timeout set on client
+			if err != nil {
+				writeStdoutf("  err %-64s  %s\n", s.SHA256, err)
+				totalFail++
+				continue
+			}
+			if resp.StatusCode != http.StatusOK {
+				resp.Body.Close()
+				writeStdoutf("  %d  %-64s  %s/%s/%s\n", resp.StatusCode, s.SHA256, ds.name, bucket, name)
+				totalFail++
+				continue
+			}
+			f, err := os.Create(dest)
+			if err != nil {
+				resp.Body.Close()
+				return fmt.Errorf("create %s: %w", dest, err)
+			}
+			_, copyErr := io.Copy(f, resp.Body)
+			resp.Body.Close()
+			closeErr := f.Close()
+			if copyErr != nil || closeErr != nil {
+				writeStdoutf("  err %-64s  write failed\n", s.SHA256)
+				totalFail++
+				continue
+			}
+			writeStdoutf("  ok  %-64s  %s/%s/%s\n", s.SHA256, ds.name, bucket, name)
+			totalOK++
+		}
+	}
+
+	writeStdoutf("\nSummary: %d ok, %d failed\n", totalOK, totalFail)
+	return nil
 }
 
 func cmdFalsePositives(ctx context.Context) error {

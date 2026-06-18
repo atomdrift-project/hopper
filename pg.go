@@ -2345,6 +2345,65 @@ func (db *DB) badReviewPG(ctx context.Context, _, limit int) ([]*Sample, error) 
 	return scanPGSamples(rows)
 }
 
+func triageFilterClausePG(f TriageFilter, startIdx int) (string, []any) {
+	var clause string
+	var args []any
+	if f.Ecosystem != "" {
+		args = append(args, f.Ecosystem)
+		clause += fmt.Sprintf(" AND ecosystem = $%d", startIdx+len(args)-1)
+	}
+	if f.FileType != "" {
+		args = append(args, f.FileType)
+		clause += fmt.Sprintf(" AND file_type = $%d", startIdx+len(args)-1)
+	}
+	return clause, args
+}
+
+func (db *DB) triageBadPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	extra, fargs := triageFilterClausePG(f, 1)
+	args := append(fargs, limit)
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = ''
+		   AND max_crit < 5 AND suspicious_count < 2`+extra+`
+		 ORDER BY analyzed_at DESC NULLS LAST LIMIT $`+fmt.Sprintf("%d", len(args)),
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage bad: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
+func (db *DB) triageGoodPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	extra, fargs := triageFilterClausePG(f, 1)
+	args := append(fargs, limit)
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = ''
+		   AND (max_crit >= 5 OR suspicious_count >= 2)`+extra+`
+		 ORDER BY analyzed_at DESC NULLS LAST LIMIT $`+fmt.Sprintf("%d", len(args)),
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage good: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
+func (db *DB) triageNewPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	extra, fargs := triageFilterClausePG(f, 1)
+	args := append(fargs, limit)
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = ''
+		   AND (max_crit >= 5 OR suspicious_count >= 2)`+extra+`
+		 ORDER BY analyzed_at DESC NULLS LAST LIMIT $`+fmt.Sprintf("%d", len(args)),
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage new: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
 func (db *DB) conflictReviewPG(ctx context.Context, _, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples

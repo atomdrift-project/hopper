@@ -2225,6 +2225,42 @@ func (db *DB) BadReview(ctx context.Context, scoreThreshold, limit int) ([]*Samp
 	return db.badReviewSQLite(ctx, scoreThreshold, limit)
 }
 
+// TriageFilter optionally narrows triage queries to a specific ecosystem and/or file type.
+type TriageFilter struct {
+	Ecosystem string // e.g. "wolfi", "archlinux" — empty means no filter
+	FileType  string // e.g. "apk", "pkg.tar.zst" — empty means no filter
+}
+
+// TriageBad returns analyzed top-level bad-labeled samples that cleave did not
+// flag (max_crit < 5 AND suspicious_count < 2), ordered by most recently
+// analyzed first. No skip/status filters — intended for manual triage.
+func (db *DB) TriageBad(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.triageBadPG(ctx, limit, f)
+	}
+	return db.triageBadSQLite(ctx, limit, f)
+}
+
+// TriageGood returns analyzed top-level good-labeled samples that cleave
+// flagged (max_crit >= 5 OR suspicious_count >= 2), ordered by most recently
+// analyzed first. No skip/status filters — intended for manual triage.
+func (db *DB) TriageGood(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.triageGoodPG(ctx, limit, f)
+	}
+	return db.triageGoodSQLite(ctx, limit, f)
+}
+
+// TriageNew returns analyzed top-level unknown-labeled samples that cleave
+// flagged (max_crit >= 5 OR suspicious_count >= 2), ordered by most recently
+// analyzed first. No skip/status filters — intended for manual triage.
+func (db *DB) TriageNew(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.triageNewPG(ctx, limit, f)
+	}
+	return db.triageNewSQLite(ctx, limit, f)
+}
+
 // ConflictReview returns samples flagged with a good+bad pool conflict
 // (label='bad', skip='conflict'): the same content was asserted both benign
 // and malicious in different pool directories. These are resolved to bad
