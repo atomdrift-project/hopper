@@ -47,6 +47,19 @@
 #   Local scan (litmus) worker:
 #     hopper_local_worker_up            1 healthy, 0 down
 #     hopper_local_worker_restarts_total  cumulative supervisor restarts
+#
+# Shared obs instrumentation (every atomdrift service exposes these — see the
+# obs package). Labeled by job/instance, pool="<name>" for db_pool_*:
+#   Database pool:
+#     db_pool_open, db_pool_idle, db_pool_acquired, db_pool_max,
+#     db_pool_constructing, db_pool_wait_count_total, db_pool_wait_duration_seconds_total,
+#     db_pool_canceled_acquire_total, db_pool_new_conns_total
+#   Process / runtime (Prometheus client collectors):
+#     process_cpu_seconds_total, process_resident_memory_bytes, process_open_fds,
+#     process_max_fds, go_goroutines, go_threads, go_memstats_heap_inuse_bytes,
+#     go_gc_duration_seconds
+#   HTTP server/client (otelhttp): http_server_request_duration_seconds_*,
+#     http_client_request_duration_seconds_* (labeled by http_route, status)
 
 groups:
   - name: hopper-liveness
@@ -136,3 +149,25 @@ groups:
         annotations:
           summary: "Hopper inserts failing on lock contention"
           description: "{{ $value | printf \"%.2f\" }} samples/sec failing to insert on lock_timeout over 10m; check database lock waits."
+
+      # The connection pool is running at its ceiling: queries are queuing for a
+      # connection, the upstream condition for the lock/insert failures above.
+      - alert: HopperDBPoolSaturated
+        expr: db_pool_acquired{job="hopper"} / clamp_min(db_pool_max{job="hopper"}, 1) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hopper DB pool {{ $labels.pool }} is saturated"
+          description: "pool {{ $labels.pool }} is {{ $value | humanizePercentage }} checked out for 10m; connections are queuing."
+
+      # Callers are giving up (context timeout/cancel) while waiting for a pool
+      # connection — a stronger contention signal than saturation alone.
+      - alert: HopperDBPoolAcquireCanceled
+        expr: sum by (pool) (rate(db_pool_canceled_acquire_total{job="hopper"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hopper DB pool {{ $labels.pool }} acquires being canceled"
+          description: "{{ $value | printf \"%.2f\" }} acquire cancellations/sec on pool {{ $labels.pool }} over 10m; connections are not available in time."
