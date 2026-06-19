@@ -15,7 +15,7 @@
 #                                    (default: postgres://hopper@hopper-db/hopper?sslmode=disable)
 #   SOURCE    --source tag           (default: forager)
 #   DASH_ADDR --dashboard-addr       (default: 0.0.0.0:8081)
-#   WORKERS   --workers              (default: 0 = auto)
+#   WORKERS   --workers              (default: 48; set 0 for hopper's auto-pick)
 #   PULL_DISABLE  set to 1 to skip the git pull of ../scan and ../cleave and
 #                 build the current checkouts as-is (e.g. when the remote is down)
 
@@ -26,7 +26,7 @@ UPLOAD_DIR="${DATA_DIR}/unknown/uploads"
 DB="${DB:-postgres://hopper@hopper-db/hopper?sslmode=disable}"
 SOURCE="${SOURCE:-forager}"
 DASH_ADDR="${DASH_ADDR:-0.0.0.0:8081}"
-WORKERS="${WORKERS:-0}"
+WORKERS="${WORKERS:-48}"
 PULL_DISABLE="${PULL_DISABLE:-0}"
 
 readonly SERVICE_USER=hopper
@@ -225,8 +225,8 @@ Environment=OTEL_EXPORTER_OTLP_ENDPOINT=http://otel:9090/api/v1/otlp
 Environment=OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://otel:3100/otlp/v1/logs
 
 # Resource caps — hopper + litmus children combined.
-MemoryHigh=64G
-MemoryMax=72G
+MemoryHigh=80G
+MemoryMax=96G
 # Bound cgroup swap. Without this, MemoryMax is toothless: pages spill into
 # swap (zram, i.e. compressed RAM) without limit, cannibalizing host memory
 # until the box thrashes. Cap it so a runaway litmus worker is OOM-killed and
