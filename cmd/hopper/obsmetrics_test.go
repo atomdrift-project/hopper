@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
@@ -52,6 +55,7 @@ func TestRegisterMetrics(t *testing.T) {
 	var progress loadProgress
 	progress.analyzed.Store(99)
 	progress.walked.Store(4242)
+	progress.insertFails[causeLockTimeout].Store(7)
 	wd.progress = &progress
 
 	if err := wd.registerMetrics(provider.Meter(meterName)); err != nil {
@@ -75,6 +79,7 @@ func TestRegisterMetrics(t *testing.T) {
 		`worker="edge:10.0.0.5"`,
 		"hopper_analyzed_total",
 		"hopper_walk_files_total",
+		`hopper_insert_failures_total{cause="lock_timeout"`,
 	}
 	for _, w := range want {
 		if !strings.Contains(body, w) {
@@ -89,6 +94,39 @@ func TestRegisterMetrics(t *testing.T) {
 		if strings.HasPrefix(ln, "hopper_local_worker_up{") && !strings.HasSuffix(ln, " 0") {
 			t.Errorf("local_worker_up not 0 while down: %s", ln)
 		}
+	}
+}
+
+// TestClassifyInsertFailure pins the SQLSTATE-to-cause mapping the insert
+// failure metric depends on. Lock contention (55P03 / SQLite "database is
+// locked") is the case the 2026-06-14 silent ingestion outage hinged on, so it
+// gets explicit coverage alongside the other transient and permanent classes.
+func TestClassifyInsertFailure(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want insertFailCause
+	}{
+		{"nil", nil, causeOther},
+		{"lock_timeout", &pgconn.PgError{Code: "55P03"}, causeLockTimeout},
+		{"statement_timeout", &pgconn.PgError{Code: "57014"}, causeStatementTimeout},
+		{"serialization", &pgconn.PgError{Code: "40001"}, causeSerialization},
+		{"deadlock", &pgconn.PgError{Code: "40P01"}, causeDeadlock},
+		{"constraint", &pgconn.PgError{Code: "23505"}, causeConstraint},
+		{"data", &pgconn.PgError{Code: "22021"}, causeData},
+		{"connection", &pgconn.PgError{Code: "08006"}, causeConnection},
+		{"context_deadline", fmt.Errorf("insert: %w", context.DeadlineExceeded), causeContext},
+		{"context_canceled", context.Canceled, causeContext},
+		{"sqlite_locked", errors.New("database is locked"), causeLockTimeout},
+		{"unknown", errors.New("disk full"), causeOther},
+		{"wrapped_pg", fmt.Errorf("batch insert: %w", &pgconn.PgError{Code: "55P03"}), causeLockTimeout},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyInsertFailure(tt.err); got != tt.want {
+				t.Errorf("classifyInsertFailure(%v) = %s, want %s", tt.err, got, tt.want)
+			}
+		})
 	}
 }
 

@@ -31,6 +31,7 @@ type instruments struct {
 	analysisRate, filesRate                       metric.Float64Observable
 	addedAge, analyzedAge, readyLag               metric.Float64Observable
 	walked, inserted, cacheHits, filtered, errors metric.Int64Observable
+	insertFails                                   metric.Int64Observable
 	wLastSeen, wLoad, wFilesRate                  metric.Float64Observable
 	wActive, wSlots, wQueue, wRSS                 metric.Int64Observable
 	wAnalyzed, wErrors, wErrorsRecent             metric.Int64Observable
@@ -122,6 +123,9 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 		cacheHits: counter("hopper.walk.cache_hits", "Walked files already known (hash cache hits) this process lifetime.", "{file}"),
 		filtered:  counter("hopper.walk.filtered", "Walked files skipped for being too small or too large this process lifetime.", "{file}"),
 		errors:    counter("hopper.errors", "Ingestion errors recorded this process lifetime.", "{error}"),
+		// Insert failures broken out by cause, keyed by a bounded "cause"
+		// attribute, so lock contention reads apart from malformed input.
+		insertFails: counter("hopper.insert.failures", "Sample inserts that failed this process lifetime, by cause.", "{sample}"),
 
 		// Per-worker, keyed by a bounded "worker" attribute.
 		wLastSeen:     fgauge("hopper.worker.last_seen_age", "Seconds since the worker last polled or sent a heartbeat.", "s"),
@@ -196,6 +200,10 @@ func (wd *webDashboard) observe(ctx context.Context, o metric.Observer, in *inst
 		o.ObserveInt64(in.cacheHits, progress.cacheHits.Load())
 		o.ObserveInt64(in.filtered, progress.tooSmall.Load()+progress.tooLarge.Load())
 		o.ObserveInt64(in.errors, progress.errors.Load())
+		for c := range numInsertFailCauses {
+			o.ObserveInt64(in.insertFails, progress.insertFails[c].Load(),
+				metric.WithAttributes(attribute.String("cause", c.String())))
+		}
 	}
 
 	combined, _ := wd.ratesOver(15 * time.Minute)

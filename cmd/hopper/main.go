@@ -1328,8 +1328,12 @@ type loadProgress struct { //nolint:govet // fields grouped by pipeline stage, n
 
 	// Errors.
 	errors atomic.Int64
-	errMu  sync.Mutex
-	errs   []progressError
+	// insertFails counts failed inserts by cause (indexed by insertFailCause).
+	// A subset of errors, broken out so lock-contention stalls are visible
+	// apart from malformed input. See recordInsertFailure.
+	insertFails [numInsertFailCauses]atomic.Int64
+	errMu       sync.Mutex
+	errs        []progressError
 }
 
 type progressError struct {
@@ -1358,6 +1362,21 @@ func (p *loadProgress) recordErrorf(n int64, stage, format string, args ...any) 
 	if len(p.errs) > maxProgressErrors {
 		p.errs = p.errs[len(p.errs)-maxProgressErrors:]
 	}
+}
+
+// recordInsertFailure attributes n lost samples to the cause of err and rolls
+// the failure into the error log. A batch insert fails all of its rows at once,
+// so n is the row count of the failed statement: the per-cause counter reflects
+// samples that did not land, not just the number of failed statements.
+func (p *loadProgress) recordInsertFailure(n int64, err error) {
+	if p == nil {
+		return
+	}
+	cause := classifyInsertFailure(err)
+	if n > 0 {
+		p.insertFails[cause].Add(n)
+	}
+	p.recordErrorf(n, "insert", "insert (%s): %v", cause, err)
 }
 
 func (p *loadProgress) recentErrors() []progressError {
@@ -1685,7 +1704,7 @@ func runDirPipeline(
 		n, _, err := db.InsertSampleBatch(ctx, batch)
 		if err != nil {
 			if ctx.Err() == nil {
-				progress.recordErrorf(int64(len(batch)), "insert", "insert: %v", err)
+				progress.recordInsertFailure(int64(len(batch)), err)
 				slog.Error("batch insert failed", "error", err, "batch_size", len(batch), "dir", target.dir)
 			}
 			batch = batch[:0]
@@ -3280,7 +3299,7 @@ func cmdTriage(ctx context.Context) error {
 	f := flag.NewFlagSet("triage", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
 	count := f.Int("count", 100, "maximum rows per dataset")
-	url := f.String("url", "http://127.0.0.1:8081", "hopper API base URL")
+	baseURL := f.String("url", "http://127.0.0.1:8081", "hopper API base URL")
 	out := f.String("out", "/var/tmp/hopper-triage", "output root directory")
 	ecosystem := f.String("ecosystem", "", "filter by ecosystem (e.g. wolfi, archlinux)")
 	fileType := f.String("file-type", "", "filter by file type (e.g. apk, pkg.tar.zst)")
@@ -3295,13 +3314,13 @@ func cmdTriage(ctx context.Context) error {
 	filter := hopper.TriageFilter{Ecosystem: *ecosystem, FileType: *fileType}
 
 	type dataset struct {
-		name    string
-		fetch   func(context.Context, int) ([]*hopper.Sample, error)
+		fetch func(context.Context, int) ([]*hopper.Sample, error)
+		name  string
 	}
 	datasets := []dataset{
-		{"bad", func(ctx context.Context, n int) ([]*hopper.Sample, error) { return db.TriageBad(ctx, n, filter) }},
-		{"good", func(ctx context.Context, n int) ([]*hopper.Sample, error) { return db.TriageGood(ctx, n, filter) }},
-		{"new", func(ctx context.Context, n int) ([]*hopper.Sample, error) { return db.TriageNew(ctx, n, filter) }},
+		{name: "bad", fetch: func(ctx context.Context, n int) ([]*hopper.Sample, error) { return db.TriageBad(ctx, n, filter) }},
+		{name: "good", fetch: func(ctx context.Context, n int) ([]*hopper.Sample, error) { return db.TriageGood(ctx, n, filter) }},
+		{name: "new", fetch: func(ctx context.Context, n int) ([]*hopper.Sample, error) { return db.TriageNew(ctx, n, filter) }},
 	}
 
 	if err := os.RemoveAll(*out); err != nil {
@@ -3335,12 +3354,12 @@ func cmdTriage(ctx context.Context) error {
 			}
 
 			destDir := filepath.Join(*out, ds.name, bucket)
-			if err := os.MkdirAll(destDir, 0o755); err != nil {
+			if err := os.MkdirAll(destDir, 0o750); err != nil {
 				return fmt.Errorf("mkdir %s: %w", destDir, err)
 			}
 			dest := filepath.Join(destDir, name)
 
-			apiURL := strings.TrimRight(*url, "/") + "/api/file/" + s.SHA256
+			apiURL := strings.TrimRight(*baseURL, "/") + "/api/file/" + s.SHA256
 			resp, err := client.Get(apiURL) //nolint:noctx // timeout set on client
 			if err != nil {
 				writeStdoutf("  err %-64s  %s\n", s.SHA256, err)
@@ -3348,18 +3367,18 @@ func cmdTriage(ctx context.Context) error {
 				continue
 			}
 			if resp.StatusCode != http.StatusOK {
-				resp.Body.Close()
+				resp.Body.Close() //nolint:errcheck,gosec // best-effort close before skipping non-200
 				writeStdoutf("  %d  %-64s  %s/%s/%s\n", resp.StatusCode, s.SHA256, ds.name, bucket, name)
 				totalFail++
 				continue
 			}
 			f, err := os.Create(dest)
 			if err != nil {
-				resp.Body.Close()
+				resp.Body.Close() //nolint:errcheck,gosec // best-effort close before bailing on create error
 				return fmt.Errorf("create %s: %w", dest, err)
 			}
 			_, copyErr := io.Copy(f, resp.Body)
-			resp.Body.Close()
+			resp.Body.Close() //nolint:errcheck,gosec // body fully read; close error is irrelevant
 			closeErr := f.Close()
 			if copyErr != nil || closeErr != nil {
 				writeStdoutf("  err %-64s  write failed\n", s.SHA256)

@@ -35,6 +35,9 @@
 #   Walk / ingest (per-process counters):
 #     hopper_walk_files_total, hopper_walk_inserted_total,
 #     hopper_walk_cache_hits_total, hopper_walk_filtered_total, hopper_errors_total
+#   Insert failures by cause (per-process counter, subset of hopper_errors_total):
+#     hopper_insert_failures_total{cause="lock_timeout"|"statement_timeout"|
+#       "serialization"|"deadlock"|"constraint"|"data"|"connection"|"context"|"other"}
 #   Per worker ({worker="<name:ip>"}):
 #     hopper_worker_last_seen_age_seconds, hopper_worker_active_claims,
 #     hopper_worker_slots, hopper_worker_queue, hopper_worker_rss_bytes,
@@ -119,3 +122,17 @@ groups:
         annotations:
           summary: "Hopper ingestion has stalled"
           description: "No sample added in {{ $value | printf \"%.0f\" }}s; upstream ingestion may be down."
+
+      # Inserts are failing on database lock contention. This is the silent mode
+      # that took out ingestion on 2026-06-14: the walk backstop fails a whole
+      # batch at once and drops it, so a sustained rate means samples are being
+      # lost, not retried. added_age may still look fresh if the forager path is
+      # also landing rows, so watch the failure rate directly.
+      - alert: HopperInsertLockContention
+        expr: sum(rate(hopper_insert_failures_total{cause="lock_timeout"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hopper inserts failing on lock contention"
+          description: "{{ $value | printf \"%.2f\" }} samples/sec failing to insert on lock_timeout over 10m; check database lock waits."

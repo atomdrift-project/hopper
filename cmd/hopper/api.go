@@ -1428,6 +1428,91 @@ func permanentPGError(err error) bool {
 	}
 }
 
+// insertFailCause classifies why a sample insert failed so the failure metric
+// can tell a database under lock contention (the silent ingestion outage of
+// 2026-06-14) apart from malformed input or a dropped connection. The set is
+// small and fixed so the "cause" metric label stays low-cardinality.
+type insertFailCause int
+
+const (
+	causeOther            insertFailCause = iota // unclassified
+	causeLockTimeout                             // 55P03 lock_not_available (lock_timeout fired) or SQLite busy/locked
+	causeStatementTimeout                        // 57014 query_canceled (statement_timeout fired)
+	causeSerialization                           // 40001 serialization_failure
+	causeDeadlock                                // 40P01 deadlock_detected
+	causeConstraint                              // class 23 integrity constraint violation
+	causeData                                    // class 22 data exception (e.g. bad encoding)
+	causeConnection                              // class 08 connection exception
+	causeContext                                 // context deadline exceeded or cancellation
+	numInsertFailCauses
+)
+
+// String is the value used for the metric's "cause" label.
+func (c insertFailCause) String() string {
+	switch c {
+	case causeLockTimeout:
+		return "lock_timeout"
+	case causeStatementTimeout:
+		return "statement_timeout"
+	case causeSerialization:
+		return "serialization"
+	case causeDeadlock:
+		return "deadlock"
+	case causeConstraint:
+		return "constraint"
+	case causeData:
+		return "data"
+	case causeConnection:
+		return "connection"
+	case causeContext:
+		return "context"
+	default:
+		return "other"
+	}
+}
+
+// classifyInsertFailure maps an insert error to a cause. It checks context
+// errors first (they wrap the driver error during a timeout), then the
+// PostgreSQL SQLSTATE, then the SQLite contention strings so one classifier
+// covers both backends.
+func classifyInsertFailure(err error) insertFailCause {
+	switch {
+	case err == nil:
+		return causeOther
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return causeContext
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "55P03":
+			return causeLockTimeout
+		case "57014":
+			return causeStatementTimeout
+		case "40001":
+			return causeSerialization
+		case "40P01":
+			return causeDeadlock
+		}
+		if len(pgErr.Code) >= 2 {
+			switch pgErr.Code[:2] {
+			case "23":
+				return causeConstraint
+			case "22":
+				return causeData
+			case "08":
+				return causeConnection
+			}
+		}
+		return causeOther
+	}
+	// SQLite (dev/test) surfaces lock contention as a message, not a code.
+	if msg := err.Error(); strings.Contains(msg, "database is locked") || strings.Contains(msg, "table is locked") {
+		return causeLockTimeout
+	}
+	return causeOther
+}
+
 func retryDBAccessNoValue(ctx context.Context, op, shaHex string, fn func(context.Context) error) error {
 	_, err := retryDBAccess(ctx, op, shaHex, func(ctx context.Context) (struct{}, error) {
 		return struct{}{}, fn(ctx)
@@ -1887,6 +1972,7 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 			SizeBytes:   written,
 		})
 	}); err != nil {
+		s.progress.recordInsertFailure(1, err)
 		slog.Error("upload: insert sample", "sha256", sha, "error", err)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return

@@ -1810,9 +1810,7 @@ func (db *DB) badReviewSQLite(ctx context.Context, _, limit int) ([]*Sample, err
 	return scanLiteSamples(rows)
 }
 
-func triageFilterClauseSQLite(f TriageFilter) (string, []any) {
-	var clause string
-	var args []any
+func triageFilterClauseSQLite(f TriageFilter) (clause string, args []any) {
 	if f.Ecosystem != "" {
 		clause += " AND ecosystem = ?"
 		args = append(args, f.Ecosystem)
@@ -1825,8 +1823,9 @@ func triageFilterClauseSQLite(f TriageFilter) (string, []any) {
 }
 
 func (db *DB) triageBadSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClauseSQLite(f)
-	args := append(fargs, limit)
+	extra, args := triageFilterClauseSQLite(f)
+	args = append(args, limit)
+	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples
 		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = ''
@@ -1840,8 +1839,9 @@ func (db *DB) triageBadSQLite(ctx context.Context, limit int, f TriageFilter) ([
 }
 
 func (db *DB) triageGoodSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClauseSQLite(f)
-	args := append(fargs, limit)
+	extra, args := triageFilterClauseSQLite(f)
+	args = append(args, limit)
+	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples
 		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = ''
@@ -1855,8 +1855,9 @@ func (db *DB) triageGoodSQLite(ctx context.Context, limit int, f TriageFilter) (
 }
 
 func (db *DB) triageNewSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClauseSQLite(f)
-	args := append(fargs, limit)
+	extra, args := triageFilterClauseSQLite(f)
+	args = append(args, limit)
+	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples
 		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = ''

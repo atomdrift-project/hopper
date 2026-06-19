@@ -1756,7 +1756,10 @@ WHERE EXCLUDED.analyzed_at > samples.analyzed_at OR samples.analyzed_at IS NULL`
 
 // insertMembersFromStagingPG is insertBatchStagingInsert with the member
 // conflict clause: insert new members, freshness-refresh stale ones, identity
-// untouched.
+// untouched. The trailing ORDER BY sha256 makes concurrent stores acquire their
+// member row locks in the same order, so two archives sharing members can't form
+// a lock cycle (deadlock); it also makes the residual contention orderly. The
+// leading column matches DISTINCT ON (sha256), which Postgres requires.
 const insertMembersFromStagingPG = `INSERT INTO samples (
 	sha256, source, feed, ecosystem, filename,
 	size_bytes, label, label_source, path, status,
@@ -1772,59 +1775,39 @@ SELECT DISTINCT ON (sha256)
 	cleave_result, litmus_result, analyzed_at, first_analyzed_at,
 	url, domain, package, version, provenance, fetched_at
 FROM _staging
+ORDER BY sha256
 ` + memberConflictUpdatePG
 
 // storeResultPG atomically writes a sample's analysis and, for an archive, all
 // its members in one transaction: the parent is never truncated unless its
 // members land in the same commit. See StoreResult for the contract.
+//
+// All envelope parsing and row construction happen before Begin, so the
+// transaction is a back-to-back burst of SQL with no application compute
+// between statements. A transaction left open across that work would pin the
+// parent's row lock for as long as the work runs — under load, minutes — and
+// stall every concurrent store of the same row behind lock_timeout (55P03).
 func (db *DB) storeResultPG(
 	ctx context.Context, sha256 string, cleaveRaw, litmusML, llm []byte,
 	p CleaveParseResult, traitsVersion string, now time.Time,
 ) (StoreStats, error) {
-	truncated := compactCleaveResultForStorage(cleaveRaw)
-
-	tx, err := db.pool.Begin(ctx)
-	if err != nil {
-		return StoreStats{}, fmt.Errorf("hopper: begin store: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
-
-	// Read (and lock) the identity fields members inherit from the parent, so a
-	// concurrent write can't shift the parent out from under the members.
+	// Read the identity fields members inherit from the parent. A plain read,
+	// not SELECT … FOR UPDATE: the store is an idempotent, analyzed_at-gated
+	// merge that needs no identity lock, and the worst a relabel racing this
+	// read can do is leave members one cycle stale until pool reconcile heals
+	// them. Reading here, before Begin, lets us build the members outside the
+	// transaction.
 	var parent Sample
 	var firstAnalyzed sql.NullTime
-	if err := tx.QueryRow(ctx,
+	if err := db.pool.QueryRow(ctx,
 		`SELECT label, label_source, source, feed, ecosystem, path, first_analyzed_at
-		   FROM samples WHERE sha256 = $1 FOR UPDATE`, sha256).
+		   FROM samples WHERE sha256 = $1`, sha256).
 		Scan(&parent.Label, &parent.LabelSource, &parent.Source, &parent.Feed,
 			&parent.Ecosystem, &parent.Path, &firstAnalyzed); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return StoreStats{}, fmt.Errorf("hopper: store result for absent sample %s: %w", sha256, ErrNotFound)
 		}
 		return StoreStats{}, fmt.Errorf("hopper: read parent for store %s: %w", sha256, err)
-	}
-
-	var litmusVal, llmVal []byte
-	if len(litmusML) > 0 {
-		litmusVal = sanitizeJSONB(litmusML)
-	}
-	if len(llm) > 0 {
-		llmVal = sanitizeJSONB(llm)
-	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE samples SET cleave_result = $2,
-			canonical_sha256 = $3, elements = $4,
-			max_crit = $5, suspicious_count = $6,
-			litmus_result = $7, llm_result = $8,
-			note = '', last_error_at = NULL,
-			traits_version = $9, rescan_priority = 0, rescan_requested_at = NULL,
-			first_analyzed_at = COALESCE(first_analyzed_at, $10),
-			analyzed_at = $10, updated_at = $10
-		WHERE sha256 = $1`,
-		sha256, sanitizeJSONB(truncated), p.CanonicalSHA,
-		p.FileInfo.Elements, p.FileInfo.MaxCrit, p.FileInfo.SuspiciousCount,
-		litmusVal, llmVal, traitsVersion, now); err != nil {
-		return StoreStats{}, fmt.Errorf("hopper: update parent: %w", err)
 	}
 
 	// Build members from the FULL envelope, inheriting the parent's identity and
@@ -1840,6 +1823,43 @@ func (db *DB) storeResultPG(
 		parent.FirstAnalyzedAt = &now
 	}
 	members := memberSamplesFromEnvelope(&parent)
+	stagingRows := sampleStagingRows(members)
+
+	truncated := compactCleaveResultForStorage(cleaveRaw)
+	var litmusVal, llmVal []byte
+	if len(litmusML) > 0 {
+		litmusVal = sanitizeJSONB(litmusML)
+	}
+	if len(llm) > 0 {
+		llmVal = sanitizeJSONB(llm)
+	}
+
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return StoreStats{}, fmt.Errorf("hopper: begin store: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+
+	res, err := tx.Exec(ctx, `
+		UPDATE samples SET cleave_result = $2,
+			canonical_sha256 = $3, elements = $4,
+			max_crit = $5, suspicious_count = $6,
+			litmus_result = $7, llm_result = $8,
+			note = '', last_error_at = NULL,
+			traits_version = $9, rescan_priority = 0, rescan_requested_at = NULL,
+			first_analyzed_at = COALESCE(first_analyzed_at, $10),
+			analyzed_at = $10, updated_at = $10
+		WHERE sha256 = $1`,
+		sha256, sanitizeJSONB(truncated), p.CanonicalSHA,
+		p.FileInfo.Elements, p.FileInfo.MaxCrit, p.FileInfo.SuspiciousCount,
+		litmusVal, llmVal, traitsVersion, now)
+	if err != nil {
+		return StoreStats{}, fmt.Errorf("hopper: update parent for store %s: %w", sha256, err)
+	}
+	if res.RowsAffected() == 0 {
+		// The row was deleted between the identity read and this update.
+		return StoreStats{}, fmt.Errorf("hopper: store result for absent sample %s: %w", sha256, ErrNotFound)
+	}
 
 	var stats StoreStats
 	stats.Members = len(members)
@@ -1847,7 +1867,7 @@ func (db *DB) storeResultPG(
 		if _, err := tx.Exec(ctx, insertBatchStagingDDL); err != nil {
 			return StoreStats{}, fmt.Errorf("hopper: create member staging: %w", err)
 		}
-		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"_staging"}, insertBatchStagingCols, pgx.CopyFromRows(sampleStagingRows(members))); err != nil {
+		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"_staging"}, insertBatchStagingCols, pgx.CopyFromRows(stagingRows)); err != nil {
 			return StoreStats{}, fmt.Errorf("hopper: copy members to staging: %w", err)
 		}
 		tag, err := tx.Exec(ctx, insertMembersFromStagingPG)
@@ -2345,9 +2365,7 @@ func (db *DB) badReviewPG(ctx context.Context, _, limit int) ([]*Sample, error) 
 	return scanPGSamples(rows)
 }
 
-func triageFilterClausePG(f TriageFilter, startIdx int) (string, []any) {
-	var clause string
-	var args []any
+func triageFilterClausePG(f TriageFilter, startIdx int) (clause string, args []any) {
 	if f.Ecosystem != "" {
 		args = append(args, f.Ecosystem)
 		clause += fmt.Sprintf(" AND ecosystem = $%d", startIdx+len(args)-1)
@@ -2360,13 +2378,13 @@ func triageFilterClausePG(f TriageFilter, startIdx int) (string, []any) {
 }
 
 func (db *DB) triageBadPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClausePG(f, 1)
-	args := append(fargs, limit)
+	extra, args := triageFilterClausePG(f, 1)
+	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
 		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = ''
 		   AND max_crit < 5 AND suspicious_count < 2`+extra+`
-		 ORDER BY analyzed_at DESC NULLS LAST LIMIT $`+fmt.Sprintf("%d", len(args)),
+		 ORDER BY analyzed_at DESC NULLS LAST LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage bad: %w", err)
@@ -2375,13 +2393,13 @@ func (db *DB) triageBadPG(ctx context.Context, limit int, f TriageFilter) ([]*Sa
 }
 
 func (db *DB) triageGoodPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClausePG(f, 1)
-	args := append(fargs, limit)
+	extra, args := triageFilterClausePG(f, 1)
+	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
 		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = ''
 		   AND (max_crit >= 5 OR suspicious_count >= 2)`+extra+`
-		 ORDER BY analyzed_at DESC NULLS LAST LIMIT $`+fmt.Sprintf("%d", len(args)),
+		 ORDER BY analyzed_at DESC NULLS LAST LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage good: %w", err)
@@ -2390,13 +2408,13 @@ func (db *DB) triageGoodPG(ctx context.Context, limit int, f TriageFilter) ([]*S
 }
 
 func (db *DB) triageNewPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClausePG(f, 1)
-	args := append(fargs, limit)
+	extra, args := triageFilterClausePG(f, 1)
+	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
 		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = ''
 		   AND (max_crit >= 5 OR suspicious_count >= 2)`+extra+`
-		 ORDER BY analyzed_at DESC NULLS LAST LIMIT $`+fmt.Sprintf("%d", len(args)),
+		 ORDER BY analyzed_at DESC NULLS LAST LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage new: %w", err)
