@@ -3,7 +3,7 @@ module codeberg.org/atomdrift/hopper
 go 1.25.4
 
 require (
-	codeberg.org/atomdrift/obs v0.0.0-20260618102920-63996188a61d
+	codeberg.org/atomdrift/obs v0.0.0-20260619160844-cb5f9d8bdccd
 	github.com/codeGROOVE-dev/fido v1.11.0
 	github.com/codeGROOVE-dev/retry v1.3.1
 	github.com/jackc/pgx/v5 v5.10.0

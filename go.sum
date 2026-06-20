@@ -2,6 +2,8 @@ codeberg.org/atomdrift/obs v0.0.0-20260527115627-22bed5c55594 h1:AXMuGXL69gliKDS
 codeberg.org/atomdrift/obs v0.0.0-20260527115627-22bed5c55594/go.mod h1:N3CvSuq9LM9bAt7dwB6s6sQxnEJZdliK5+2eRCcwHCA=
 codeberg.org/atomdrift/obs v0.0.0-20260618102920-63996188a61d h1:owzK27rYw/Yltk5kDxXgHeK6SkF/cBuBQv9oNyt7xa8=
 codeberg.org/atomdrift/obs v0.0.0-20260618102920-63996188a61d/go.mod h1:N3CvSuq9LM9bAt7dwB6s6sQxnEJZdliK5+2eRCcwHCA=
+codeberg.org/atomdrift/obs v0.0.0-20260619160844-cb5f9d8bdccd h1:w2Y50eZ8MIsPzPxBEa4lGoH7sBWv1lg8Ggy8HjphMak=
+codeberg.org/atomdrift/obs v0.0.0-20260619160844-cb5f9d8bdccd/go.mod h1:N3CvSuq9LM9bAt7dwB6s6sQxnEJZdliK5+2eRCcwHCA=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
 github.com/cenkalti/backoff/v5 v5.0.3 h1:ZN+IMa753KfX5hd8vVaMixjnqRZ3y8CuJKRKj1xcsSM=
