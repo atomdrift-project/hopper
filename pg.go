@@ -1778,18 +1778,67 @@ FROM _staging
 ORDER BY sha256
 ` + memberConflictUpdatePG
 
-// storeResultPG atomically writes a sample's analysis and, for an archive, all
-// its members in one transaction: the parent is never truncated unless its
-// members land in the same commit. See StoreResult for the contract.
+// memberStoreBatch caps how many member rows a single store transaction writes.
+// A large archive holds thousands of member sha256s; upserting them all in one
+// transaction pins every one of those row locks until commit — under the
+// metadata-only DB cache that commit is IO-bound and can run for minutes,
+// stalling any concurrent store that shares a member behind lock_timeout
+// (55P03) and forcing a full retry. Splitting the members into batches bounds
+// the lock-hold window to one batch's worth of rows, sized to amortise the
+// per-batch staging + COPY round trips while keeping that window short.
+const memberStoreBatch = 1000
+
+// storeMemberRowsPG upserts one batch of archive-member rows in its own
+// transaction: stage, COPY, analysis-only upsert, then fan the same rows out
+// into sample_locations. Both writes are internally ordered by sha256 (the
+// upsert's ORDER BY, the locations' DISTINCT ON), so every batch acquires its
+// shared member locks in the same order and concurrent archives cannot form a
+// deadlock cycle. Returns the number of member rows inserted or freshness-
+// refreshed. The caller drives the batching; see storeResultPG.
+func (db *DB) storeMemberRowsPG(ctx context.Context, rows [][]any) (int64, error) {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: begin member batch: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+
+	if _, err := tx.Exec(ctx, insertBatchStagingDDL); err != nil {
+		return 0, fmt.Errorf("hopper: create member staging: %w", err)
+	}
+	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"_staging"}, insertBatchStagingCols, pgx.CopyFromRows(rows)); err != nil {
+		return 0, fmt.Errorf("hopper: copy members to staging: %w", err)
+	}
+	tag, err := tx.Exec(ctx, insertMembersFromStagingPG)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: upsert members: %w", err)
+	}
+	if _, err := tx.Exec(ctx, locationsFromStagingPG); err != nil {
+		return 0, fmt.Errorf("hopper: upsert member locations: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("hopper: commit member batch: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// storeResultPG writes a sample's analysis and, for an archive, all its members.
+// Members are written first — in bounded batches, each its own transaction — and
+// the parent's truncating UPDATE runs last, only after every member is durably
+// stored. This keeps StoreResult's contract (the parent's heavy member payload
+// is never dropped unless the member rows exist) and extends it across a crash:
+// an interrupted store leaves the members present but the parent un-truncated
+// and un-analyzed, so a later rescan simply redoes it. See StoreResult.
 //
-// All envelope parsing and row construction happen before Begin, so the
-// transaction is a back-to-back burst of SQL with no application compute
-// between statements. A transaction left open across that work would pin the
-// parent's row lock for as long as the work runs — under load, minutes — and
-// stall every concurrent store of the same row behind lock_timeout (55P03).
+// All envelope parsing and row construction happen before any Begin, so each
+// transaction is a back-to-back burst of SQL with no application compute between
+// statements. Holding the whole archive in one transaction pinned the parent and
+// every member row lock for as long as the (IO-bound) commit ran — under load,
+// minutes — stalling every concurrent store of a shared row behind lock_timeout
+// (55P03); the batched members and the lone parent UPDATE each hold their locks
+// for a fraction of that.
 func (db *DB) storeResultPG(
 	ctx context.Context, sha256 string, cleaveRaw, litmusML, llm []byte,
-	p CleaveParseResult, traitsVersion string, now time.Time,
+	parsed CleaveParseResult, traitsVersion string, now time.Time,
 ) (StoreStats, error) {
 	// Read the identity fields members inherit from the parent. A plain read,
 	// not SELECT … FOR UPDATE: the store is an idempotent, analyzed_at-gated
@@ -1815,7 +1864,7 @@ func (db *DB) storeResultPG(
 	parent.SHA256 = sha256
 	parent.CleaveResult = cleaveRaw
 	parent.LitmusResult = litmusML
-	parent.CanonicalSHA256 = p.CanonicalSHA
+	parent.CanonicalSHA256 = parsed.CanonicalSHA
 	parent.AnalyzedAt = &now
 	if firstAnalyzed.Valid {
 		parent.FirstAnalyzedAt = &firstAnalyzed.Time
@@ -1834,6 +1883,22 @@ func (db *DB) storeResultPG(
 		llmVal = sanitizeJSONB(llm)
 	}
 
+	// Members first: write every member in bounded batches, each committed on
+	// its own, before the parent's truncating UPDATE below. The member upsert is
+	// idempotent (analyzed_at-gated), so a retry of the whole store after a
+	// lock_timeout on one batch re-runs the committed batches as no-ops.
+	var stats StoreStats
+	stats.Members = len(members)
+	for start := 0; start < len(stagingRows); start += memberStoreBatch {
+		n, err := db.storeMemberRowsPG(ctx, stagingRows[start:min(start+memberStoreBatch, len(stagingRows))])
+		if err != nil {
+			return StoreStats{}, err
+		}
+		stats.MembersStored += n
+	}
+
+	// Parent last, in its own short transaction. Truncating it only after the
+	// members are durably stored is what upholds the contract across a crash.
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
 		return StoreStats{}, fmt.Errorf("hopper: begin store: %w", err)
@@ -1850,34 +1915,17 @@ func (db *DB) storeResultPG(
 			first_analyzed_at = COALESCE(first_analyzed_at, $10),
 			analyzed_at = $10, updated_at = $10
 		WHERE sha256 = $1`,
-		sha256, sanitizeJSONB(truncated), p.CanonicalSHA,
-		p.FileInfo.Elements, p.FileInfo.MaxCrit, p.FileInfo.SuspiciousCount,
+		sha256, sanitizeJSONB(truncated), parsed.CanonicalSHA,
+		parsed.FileInfo.Elements, parsed.FileInfo.MaxCrit, parsed.FileInfo.SuspiciousCount,
 		litmusVal, llmVal, traitsVersion, now)
 	if err != nil {
 		return StoreStats{}, fmt.Errorf("hopper: update parent for store %s: %w", sha256, err)
 	}
 	if res.RowsAffected() == 0 {
-		// The row was deleted between the identity read and this update.
+		// The row was deleted between the identity read and this update. Any
+		// member rows already written are reaped by pool reconcile's
+		// missing-parent cascade.
 		return StoreStats{}, fmt.Errorf("hopper: store result for absent sample %s: %w", sha256, ErrNotFound)
-	}
-
-	var stats StoreStats
-	stats.Members = len(members)
-	if len(members) > 0 {
-		if _, err := tx.Exec(ctx, insertBatchStagingDDL); err != nil {
-			return StoreStats{}, fmt.Errorf("hopper: create member staging: %w", err)
-		}
-		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"_staging"}, insertBatchStagingCols, pgx.CopyFromRows(stagingRows)); err != nil {
-			return StoreStats{}, fmt.Errorf("hopper: copy members to staging: %w", err)
-		}
-		tag, err := tx.Exec(ctx, insertMembersFromStagingPG)
-		if err != nil {
-			return StoreStats{}, fmt.Errorf("hopper: upsert members: %w", err)
-		}
-		stats.MembersStored = tag.RowsAffected()
-		if _, err := tx.Exec(ctx, locationsFromStagingPG); err != nil {
-			return StoreStats{}, fmt.Errorf("hopper: upsert member locations: %w", err)
-		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
