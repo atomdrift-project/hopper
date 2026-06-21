@@ -5,6 +5,10 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -128,5 +132,90 @@ func TestExtractFromArchiveTooLarge(t *testing.T) {
 
 	if _, err := ExtractFromArchive(buf.Bytes(), "zip", "big.txt", 100); err == nil {
 		t.Error("expected too-large error when entry exceeds maxBytes")
+	}
+}
+
+// TestStreamArchiveMemberStoredFile streams a stored (uncompressed) zip member
+// straight from an *os.File — the sendfile fast path — and verifies the bytes,
+// the Content-Length signalled via setLen, and that the whole archive is never
+// materialised by the caller.
+func TestStreamArchiveMemberStoredFile(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	// zip.Store leaves the member as raw bytes, exercising the DataOffset path.
+	w, err := zw.CreateHeader(&zip.FileHeader{Name: "pkg/data.bin", Method: zip.Store})
+	if err != nil {
+		t.Fatalf("zip create: %v", err)
+	}
+	want := bytes.Repeat([]byte("payload-"), 4096) // 32 KiB, larger than a copy buffer
+	if _, err := w.Write(want); err != nil {
+		t.Fatalf("zip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zip close: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "a.zip")
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open archive: %v", err)
+	}
+	defer f.Close() //nolint:errcheck // test cleanup
+	stat, err := f.Stat()
+	if err != nil {
+		t.Fatalf("stat archive: %v", err)
+	}
+
+	var out bytes.Buffer
+	lenCalls, gotLen := 0, int64(-1)
+	err = StreamArchiveMember(f, stat.Size(), "zip", "data.bin", 1<<20, func(n int64) {
+		lenCalls++
+		gotLen = n
+	}, &out)
+	if err != nil {
+		t.Fatalf("stream data.bin: %v", err)
+	}
+	if lenCalls != 1 {
+		t.Errorf("setLen called %d times, want 1", lenCalls)
+	}
+	if gotLen != int64(len(want)) {
+		t.Errorf("setLen size = %d, want %d", gotLen, len(want))
+	}
+	if !bytes.Equal(out.Bytes(), want) {
+		t.Errorf("streamed %d bytes, want %d", out.Len(), len(want))
+	}
+}
+
+// TestStreamArchiveMemberErrors checks the typed sentinels and that setLen is
+// never called on a pre-write error (so an HTTP caller can still pick a status).
+func TestStreamArchiveMemberErrors(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.Create("only.txt")
+	if err != nil {
+		t.Fatalf("zip create: %v", err)
+	}
+	if _, err := w.Write(bytes.Repeat([]byte("A"), 512)); err != nil {
+		t.Fatalf("zip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zip close: %v", err)
+	}
+	src := bytes.NewReader(buf.Bytes())
+	size := int64(buf.Len())
+
+	mustNotSetLen := func(int64) { t.Error("setLen called on a pre-write error") }
+
+	if err := StreamArchiveMember(src, size, "zip", "missing.txt", 1<<20, mustNotSetLen, io.Discard); !errors.Is(err, ErrArchiveMemberNotFound) {
+		t.Errorf("missing member: got %v, want ErrArchiveMemberNotFound", err)
+	}
+	if err := StreamArchiveMember(src, size, "zip", "only.txt", 100, mustNotSetLen, io.Discard); !errors.Is(err, ErrArchiveMemberTooLarge) {
+		t.Errorf("oversize member: got %v, want ErrArchiveMemberTooLarge", err)
+	}
+	if err := StreamArchiveMember(src, size, "rar", "only.txt", 1<<20, mustNotSetLen, io.Discard); err == nil {
+		t.Error("unsupported type: expected error")
 	}
 }

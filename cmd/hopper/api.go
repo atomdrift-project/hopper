@@ -2201,32 +2201,44 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 		return
 	}
 
-	archive, err := os.ReadFile(resolved) //nolint:gosec // path validated above
+	f, err := os.Open(resolved) //nolint:gosec // path validated above
 	if err != nil {
 		http.Error(w, `{"error":"parent unreadable"}`, http.StatusInternalServerError)
 		return
 	}
-	body, err := hopper.ExtractFromArchive(archive, parent.FileType, innerPath, archiveMemberMaxBytes)
+	defer f.Close() //nolint:errcheck // best-effort close
+	stat, err := f.Stat()
+	if err != nil || stat.IsDir() {
+		http.Error(w, `{"error":"parent unreadable"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Stream the single member straight from disk to the socket: zip uses the
+	// file as random-access (only the central directory plus the member's
+	// working set are resident), stored entries copy via sendfile(2). The whole
+	// parent archive — which can be multiple GB — is never read into memory.
+	// setLen sets Content-Length just before the first byte; on a pre-write
+	// error nothing has been written so the status code below is still honoured.
+	w.Header().Set("Content-Type", "application/octet-stream")
+	err = hopper.StreamArchiveMember(f, stat.Size(), parent.FileType, innerPath, archiveMemberMaxBytes,
+		func(n int64) { w.Header().Set("Content-Length", strconv.FormatInt(n, 10)) }, w)
 	if err != nil {
 		switch {
-		case strings.Contains(err.Error(), "not found in archive"):
+		case errors.Is(err, hopper.ErrArchiveMemberNotFound):
 			http.Error(w, `{"error":"not found in archive"}`, http.StatusNotFound)
-		case strings.Contains(err.Error(), "too large"):
+		case errors.Is(err, hopper.ErrArchiveMemberTooLarge):
 			http.Error(w, `{"error":"file too large"}`, http.StatusRequestEntityTooLarge)
 		case strings.Contains(err.Error(), "unsupported archive"):
 			http.Error(w, `{"error":"unsupported archive type"}`, http.StatusUnsupportedMediaType)
 		default:
 			//nolint:gosec // sha256 validated by validSHA256
-			slog.Warn("archive-member extraction failed",
+			slog.Warn("archive-member streaming failed",
 				"sha256", sha, "parent_sha", parent.SHA256, "error", err)
+			// Headers may already be sent if the failure was mid-stream; in that
+			// case http.Error's WriteHeader is a no-op and only logs.
 			http.Error(w, `{"error":"extraction failed"}`, http.StatusInternalServerError)
 		}
 		return
-	}
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-	if _, err := w.Write(body); err != nil { //nolint:gosec // body served as application/octet-stream; sha256 validated
-		slog.Debug("archive-member write failed", "sha256", sha, "error", err)
 	}
 }
 

@@ -25,6 +25,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1330,88 +1331,132 @@ func PathInsideArchive(samplePath string) string {
 	return samplePath[idx+2:]
 }
 
-// ExtractFromArchive pulls a single file out of an archive by its path
-// inside the container. Supported types: tar, tar.gz/tgz, zip and zip-
-// equivalent containers (jar, war, ear, apk, aab, ipa, whl, egg, gem,
-// nupkg). Result is capped at maxBytes; larger files return an
-// "unsupported archive: <type>" error for unrecognised types so callers
-// can render a graceful fallback rather than failing.
-func ExtractFromArchive(archive []byte, fileType, innerPath string, maxBytes int64) ([]byte, error) {
+// Errors returned by StreamArchiveMember (and the ExtractFromArchive wrapper)
+// so HTTP callers can map them to status codes before any bytes are written.
+var (
+	// ErrArchiveMemberNotFound is returned when innerPath is absent.
+	ErrArchiveMemberNotFound = errors.New("path not found in archive")
+	// ErrArchiveMemberTooLarge is returned when the member exceeds maxBytes.
+	ErrArchiveMemberTooLarge = errors.New("file too large")
+)
+
+// StreamArchiveMember writes the single member innerPath out of an archive to
+// w without ever holding the whole archive in memory. src provides random
+// access over the archive (size is its length in bytes); zip uses it directly
+// and tar reads it sequentially. Supported types: tar, tar.gz/tgz, zip and
+// zip-equivalent containers (jar, war, ear, apk, aab, ipa, whl, egg, gem,
+// nupkg); other types return an "unsupported archive: <type>" error.
+//
+// When src is an *os.File and a zip member is stored uncompressed, the member
+// is copied as a raw file region so io.Copy to a TCP socket uses sendfile(2) —
+// no decompression and nothing buffered. Compressed members stream through a
+// bounded decompressor (≈32 KiB working set).
+//
+// setLen is called exactly once with the member's exact size immediately before
+// the first byte is written, letting an HTTP caller set Content-Length. On any
+// pre-write error (member missing, too large, unsupported type) it is never
+// called, so the caller can still choose a status code.
+func StreamArchiveMember(src io.ReaderAt, size int64, fileType, innerPath string, maxBytes int64, setLen func(int64), w io.Writer) error {
 	t := strings.ToLower(strings.TrimSpace(fileType))
 	switch t {
 	case "tar.gz", "tgz", "gz":
-		return extractFromTarGz(archive, innerPath, maxBytes)
+		gz, err := gzip.NewReader(io.NewSectionReader(src, 0, size))
+		if err != nil {
+			return fmt.Errorf("gunzip: %w", err)
+		}
+		defer func() { _ = gz.Close() }() //nolint:errcheck // best-effort close after streaming
+		return streamTarMember(gz, innerPath, maxBytes, setLen, w)
 	case "tar":
-		return extractFromTar(bytes.NewReader(archive), innerPath, maxBytes)
+		return streamTarMember(io.NewSectionReader(src, 0, size), innerPath, maxBytes, setLen, w)
 	case "zip", "jar", "war", "ear", "apk", "aab", "ipa", "whl", "egg", "gem", "nupkg":
-		return extractFromZip(archive, innerPath, maxBytes)
+		return streamZipMember(src, size, innerPath, maxBytes, setLen, w)
 	}
-	return nil, fmt.Errorf("unsupported archive: %s", fileType)
+	return fmt.Errorf("unsupported archive: %s", fileType)
 }
 
-func extractFromTarGz(archive []byte, innerPath string, maxBytes int64) ([]byte, error) {
-	gz, err := gzip.NewReader(bytes.NewReader(archive))
-	if err != nil {
-		return nil, fmt.Errorf("gunzip: %w", err)
-	}
-	defer func() { _ = gz.Close() }() //nolint:errcheck // best-effort close after extraction
-	return extractFromTar(gz, innerPath, maxBytes)
-}
-
-func extractFromTar(r io.Reader, innerPath string, maxBytes int64) ([]byte, error) {
+func streamTarMember(r io.Reader, innerPath string, maxBytes int64, setLen func(int64), w io.Writer) error {
 	tr := tar.NewReader(r)
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
-			return nil, fmt.Errorf("path not found in archive: %s", innerPath)
+			return fmt.Errorf("%w: %s", ErrArchiveMemberNotFound, innerPath)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("tar entry: %w", err)
+			return fmt.Errorf("tar entry: %w", err)
 		}
 		if !archivePathMatches(hdr.Name, innerPath) {
 			continue
 		}
 		if hdr.Size > maxBytes {
-			return nil, fmt.Errorf("file too large (>%d bytes)", maxBytes)
+			return fmt.Errorf("%w (>%d bytes)", ErrArchiveMemberTooLarge, maxBytes)
 		}
-		body, err := io.ReadAll(io.LimitReader(tr, maxBytes+1))
-		if err != nil {
-			return nil, fmt.Errorf("read entry: %w", err)
+		setLen(hdr.Size)
+		if _, err := io.Copy(w, io.LimitReader(tr, hdr.Size)); err != nil {
+			return fmt.Errorf("stream entry: %w", err)
 		}
-		if int64(len(body)) > maxBytes {
-			return nil, fmt.Errorf("file too large (>%d bytes)", maxBytes)
-		}
-		return body, nil
+		return nil
 	}
 }
 
-func extractFromZip(archive []byte, innerPath string, maxBytes int64) ([]byte, error) {
-	zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+func streamZipMember(src io.ReaderAt, size int64, innerPath string, maxBytes int64, setLen func(int64), w io.Writer) error {
+	zr, err := zip.NewReader(src, size)
 	if err != nil {
-		return nil, fmt.Errorf("zip open: %w", err)
+		return fmt.Errorf("zip open: %w", err)
 	}
 	for _, f := range zr.File {
 		if !archivePathMatches(f.Name, innerPath) {
 			continue
 		}
 		if maxBytes >= 0 && f.UncompressedSize64 > uint64(maxBytes) {
-			return nil, fmt.Errorf("file too large (>%d bytes)", maxBytes)
+			return fmt.Errorf("%w (>%d bytes)", ErrArchiveMemberTooLarge, maxBytes)
+		}
+		if f.UncompressedSize64 > math.MaxInt64 {
+			return fmt.Errorf("%w (>%d bytes)", ErrArchiveMemberTooLarge, maxBytes)
+		}
+		n := int64(f.UncompressedSize64)
+		// Stored entries are raw bytes in the archive: copy the file region
+		// directly so io.Copy to a TCP socket uses sendfile(2). io.LimitReader
+		// over an *os.File is recognised by the kernel-copy fast path; a
+		// bytes.Reader (tests) falls through to the generic copy below.
+		if file, ok := src.(*os.File); ok && f.Method == zip.Store {
+			if off, derr := f.DataOffset(); derr == nil {
+				if _, serr := file.Seek(off, io.SeekStart); serr == nil {
+					setLen(n)
+					if _, cerr := io.Copy(w, io.LimitReader(file, n)); cerr != nil {
+						return fmt.Errorf("stream entry: %w", cerr)
+					}
+					return nil
+				}
+			}
 		}
 		rc, err := f.Open()
 		if err != nil {
-			return nil, fmt.Errorf("zip entry open: %w", err)
+			return fmt.Errorf("zip entry open: %w", err)
 		}
-		body, err := io.ReadAll(io.LimitReader(rc, maxBytes+1))
+		setLen(n)
+		_, cerr := io.Copy(w, io.LimitReader(rc, n))
 		_ = rc.Close() //nolint:errcheck // read-only stream, close error ignored
-		if err != nil {
-			return nil, fmt.Errorf("read entry: %w", err)
+		if cerr != nil {
+			return fmt.Errorf("stream entry: %w", cerr)
 		}
-		if int64(len(body)) > maxBytes {
-			return nil, fmt.Errorf("file too large (>%d bytes)", maxBytes)
-		}
-		return body, nil
+		return nil
 	}
-	return nil, fmt.Errorf("path not found in archive: %s", innerPath)
+	return fmt.Errorf("%w: %s", ErrArchiveMemberNotFound, innerPath)
+}
+
+// ExtractFromArchive is a buffering convenience wrapper over
+// StreamArchiveMember for callers that want the member as a byte slice (it
+// holds only the single member in memory, never the whole archive). The hot
+// download path uses StreamArchiveMember directly.
+func ExtractFromArchive(archive []byte, fileType, innerPath string, maxBytes int64) ([]byte, error) {
+	var buf bytes.Buffer
+	err := StreamArchiveMember(bytes.NewReader(archive), int64(len(archive)), fileType, innerPath, maxBytes, func(n int64) {
+		buf.Grow(int(n))
+	}, &buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // archivePathMatches accepts an exact match or a match after stripping the
