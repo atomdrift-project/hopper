@@ -2228,6 +2228,8 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 			http.Error(w, `{"error":"not found in archive"}`, http.StatusNotFound)
 		case errors.Is(err, hopper.ErrArchiveMemberTooLarge):
 			http.Error(w, `{"error":"file too large"}`, http.StatusRequestEntityTooLarge)
+		case errors.Is(err, hopper.ErrArchiveEncrypted):
+			http.Error(w, `{"error":"encrypted archive: could not decrypt with known passwords"}`, http.StatusUnprocessableEntity)
 		case strings.Contains(err.Error(), "unsupported archive"):
 			http.Error(w, `{"error":"unsupported archive type"}`, http.StatusUnsupportedMediaType)
 		default:

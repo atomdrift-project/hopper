@@ -12,7 +12,6 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"bytes"
-	"compress/gzip"
 	"context"
 	cryptorand "crypto/rand"
 	cryptosha256 "crypto/sha256"
@@ -1338,41 +1337,11 @@ var (
 	ErrArchiveMemberNotFound = errors.New("path not found in archive")
 	// ErrArchiveMemberTooLarge is returned when the member exceeds maxBytes.
 	ErrArchiveMemberTooLarge = errors.New("file too large")
+	// ErrArchiveEncrypted is returned when an archive could not be opened or
+	// decoded with any known password (almost always an encrypted sample whose
+	// password is not in the list, or a corrupt archive).
+	ErrArchiveEncrypted = errors.New("could not decrypt archive")
 )
-
-// StreamArchiveMember writes the single member innerPath out of an archive to
-// w without ever holding the whole archive in memory. src provides random
-// access over the archive (size is its length in bytes); zip uses it directly
-// and tar reads it sequentially. Supported types: tar, tar.gz/tgz, zip and
-// zip-equivalent containers (jar, war, ear, apk, aab, ipa, whl, egg, gem,
-// nupkg); other types return an "unsupported archive: <type>" error.
-//
-// When src is an *os.File and a zip member is stored uncompressed, the member
-// is copied as a raw file region so io.Copy to a TCP socket uses sendfile(2) —
-// no decompression and nothing buffered. Compressed members stream through a
-// bounded decompressor (≈32 KiB working set).
-//
-// setLen is called exactly once with the member's exact size immediately before
-// the first byte is written, letting an HTTP caller set Content-Length. On any
-// pre-write error (member missing, too large, unsupported type) it is never
-// called, so the caller can still choose a status code.
-func StreamArchiveMember(src io.ReaderAt, size int64, fileType, innerPath string, maxBytes int64, setLen func(int64), w io.Writer) error {
-	t := strings.ToLower(strings.TrimSpace(fileType))
-	switch t {
-	case "tar.gz", "tgz", "gz":
-		gz, err := gzip.NewReader(io.NewSectionReader(src, 0, size))
-		if err != nil {
-			return fmt.Errorf("gunzip: %w", err)
-		}
-		defer func() { _ = gz.Close() }() //nolint:errcheck // best-effort close after streaming
-		return streamTarMember(gz, innerPath, maxBytes, setLen, w)
-	case "tar":
-		return streamTarMember(io.NewSectionReader(src, 0, size), innerPath, maxBytes, setLen, w)
-	case "zip", "jar", "war", "ear", "apk", "aab", "ipa", "whl", "egg", "gem", "nupkg":
-		return streamZipMember(src, size, innerPath, maxBytes, setLen, w)
-	}
-	return fmt.Errorf("unsupported archive: %s", fileType)
-}
 
 func streamTarMember(r io.Reader, innerPath string, maxBytes int64, setLen func(int64), w io.Writer) error {
 	tr := tar.NewReader(r)

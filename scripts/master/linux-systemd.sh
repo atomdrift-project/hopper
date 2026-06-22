@@ -216,6 +216,15 @@ Environment=XDG_CACHE_HOME=%C/${SERVICE_NAME}
 Environment=PGPASSFILE=%E/${SERVICE_NAME}/.pgpass
 Environment=PATH=${TOOLS_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+# Bound the Go heap so the runtime applies GC backpressure *before* the cgroup
+# MemoryHigh below forces pages into swap. The hopper process RSS is almost
+# entirely Go heap; without this the runtime grows to ~2x the live working set
+# (GOGC=100) with the cgroup as the only ceiling, which reclaims into swap
+# rather than collecting. Soft limit: a transient spike GCs harder instead of
+# OOMing. Sits above the observed steady-state working set and below
+# MemoryHigh/MemorySwapMax. NB: only bounds hopper itself, not the litmus child.
+Environment=GOMEMLIMIT=16GiB
+
 # OpenTelemetry. The base endpoint; the SDK appends /v1/<signal> per the
 # OTel spec, so metrics land at /api/v1/otlp/v1/metrics on the Prometheus
 # OTLP receiver. Override OTEL_EXPORTER_OTLP_<SIGNAL>_ENDPOINT to send
