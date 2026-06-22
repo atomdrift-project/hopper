@@ -47,7 +47,12 @@ readonly HEAL_PERMS_SRC=scripts/master/heal-perms.sh
 readonly HEAL_PERMS_BIN=/usr/local/bin/hopper-heal-perms.sh
 readonly HEAL_PERMS_SVC=/etc/systemd/system/hopper-heal-perms.service
 readonly HEAL_PERMS_TIMER=/etc/systemd/system/hopper-heal-perms.timer
-HEAL_PERMS_INTERVAL_MIN="${HEAL_PERMS_INTERVAL_MIN:-15}"
+# Hourly by default: a full /data/samples walk is minutes-long on a large tree
+# and runs every tick regardless of drift, so a tight cadence keeps the tree
+# under near-constant traversal I/O for little benefit — forager and hopper
+# already self-heal the subtrees they write, leaving this as a backstop for
+# manual/relayout/root drift. Override for a tighter or looser window.
+HEAL_PERMS_INTERVAL_MIN="${HEAL_PERMS_INTERVAL_MIN:-60}"
 case "$HEAL_PERMS_INTERVAL_MIN" in *[!0-9]*|'') die "HEAL_PERMS_INTERVAL_MIN must be an integer" ;; esac
 
 # Sibling repos that ship alongside hopper. `make deploy` updates both,
@@ -449,15 +454,13 @@ fi
 # Clear any prior failed run so the timer reschedules cleanly.
 priv systemctl reset-failed hopper-heal-perms.service 2>/dev/null || true
 priv systemctl enable --now hopper-heal-perms.timer >/dev/null
-# Kick one run now (Type=oneshot, so this blocks until it finishes) so each
-# deploy heals immediately and surfaces any script error in the journal rather
-# than waiting for the first timer tick. A heal failure warns but never fails
-# the deploy.
-if priv systemctl start hopper-heal-perms.service; then
-    log "perms-heal ran: journalctl -u hopper-heal-perms.service -n 20"
-else
-    log "WARN perms-heal initial run failed; see: journalctl -u hopper-heal-perms.service -n 20"
-fi
+# Kick one run now, but do NOT block the deploy on it: the first heal walks the
+# entire sample tree and can take many minutes (Type=oneshot would otherwise
+# make `make deploy` hang until it finishes). --no-block enqueues the start and
+# returns; the result lands in the journal. Steady-state runs are cheap (only
+# drift), so the timer cadence stays light.
+priv systemctl start --no-block hopper-heal-perms.service || true
+log "perms-heal run scheduled; watch: journalctl -u hopper-heal-perms.service -f"
 log "perms-heal timer active (every ${HEAL_PERMS_INTERVAL_MIN}min): systemctl list-timers hopper-heal-perms.timer"
 
 priv systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
