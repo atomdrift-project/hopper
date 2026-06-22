@@ -223,7 +223,11 @@ Environment=PATH=${TOOLS_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
 # rather than collecting. Soft limit: a transient spike GCs harder instead of
 # OOMing. Sits above the observed steady-state working set and below
 # MemoryHigh/MemorySwapMax. NB: only bounds hopper itself, not the litmus child.
-Environment=GOMEMLIMIT=16GiB
+# 2026-06-21: raised 16->32GiB. 16 sat *below* a (bug-inflated) ~47GB live heap,
+# which put GC into a death spiral (continuous GC it can't satisfy → CPU pegged
+# → API unresponsive). 32 is an interim backstop pending the result-ingestion
+# memory fix; revisit downward once the working set is actually bounded.
+Environment=GOMEMLIMIT=32GiB
 
 # OpenTelemetry. The base endpoint; the SDK appends /v1/<signal> per the
 # OTel spec, so metrics land at /api/v1/otlp/v1/metrics on the Prometheus

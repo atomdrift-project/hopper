@@ -30,7 +30,9 @@ func openPG(ctx context.Context, dsn string) (*DB, error) {
 	// inspection. With long result-store transactions (UpdateCleaveResult
 	// can cascade into ExplodeArchiveMembers) holding a connection for
 	// seconds, 32 was tight enough to starve the dashboard's queries.
-	cfg.MaxConns = 64
+	// Observed steady state is ~8 in use (pool metrics), so 32 leaves ample
+	// headroom without reserving 64×work_mem on the memory-tight PG host.
+	cfg.MaxConns = 32
 	cfg.MinConns = 8
 	cfg.MaxConnIdleTime = 5 * time.Minute
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)

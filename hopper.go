@@ -1341,6 +1341,11 @@ var (
 	// decoded with any known password (almost always an encrypted sample whose
 	// password is not in the list, or a corrupt archive).
 	ErrArchiveEncrypted = errors.New("could not decrypt archive")
+	// ErrUnsupportedArchive is returned when the container, a nested container,
+	// or its compression is a type StreamArchiveMember does not handle. Wraps
+	// every "unsupported …" path so the HTTP layer maps them all to 415 rather
+	// than letting the nested/compression variants leak into a 500.
+	ErrUnsupportedArchive = errors.New("unsupported archive")
 )
 
 func streamTarMember(r io.Reader, innerPath string, maxBytes int64, setLen func(int64), w io.Writer) error {

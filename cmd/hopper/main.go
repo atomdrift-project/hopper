@@ -17,6 +17,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	_ "net/http/pprof" //nolint:gosec // G108: pprof bound to a dedicated loopback listener (pprofAddr), never the public mux
 	"net/url"
 	"os"
 	"os/exec"
@@ -843,6 +844,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	experimentTag := f.String("experiment-tag", "", "label for experiment comparison")
 	litmusVerbose := f.Bool("litmus-verbose", true, "enable debug logging in litmus server")
 	dashAddr := f.String("dashboard-addr", "0.0.0.0:8081", "web dashboard listen address (empty to disable)")
+	pprofAddr := f.String("pprof-addr", "127.0.0.1:6060", "net/http/pprof listen address; loopback-only by default (empty to disable)")
 	localOnly := f.Bool("local", false, "listen only on loopback for dashboard and worker API")
 	maxFileMB := f.Int64("max-file-size", defaultMaxFileSize/(1024*1024), "skip files larger than this many MiB")
 	reportsDir := f.String("reports-dir", "", "cyclotron reports directory to ingest (<sha>.md, optional)")
@@ -880,9 +882,31 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// Create shared HTTP mux for dashboard + work API.
 	// API handlers are registered immediately so workers connecting during
 	// startup get a clean 503 instead of the dashboard's HTML.
+	// pprof on a dedicated loopback listener — never the public dashboard mux.
+	// net/http/pprof registers on http.DefaultServeMux, which nothing else
+	// serves, so the profiles are reachable only from the host (or an SSH
+	// tunnel). Critical for diagnosing heap/goroutine growth without a redeploy.
+	if *pprofAddr != "" {
+		pprofSrv := &http.Server{Addr: *pprofAddr, Handler: http.DefaultServeMux, ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			if err := pprofSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Warn("pprof listener stopped", "addr", *pprofAddr, "error", err)
+			}
+		}()
+		go func() { <-ctx.Done(); _ = pprofSrv.Close() }() //nolint:errcheck // best-effort shutdown
+		slog.Info("pprof listening", "addr", *pprofAddr)
+	}
+
 	httpMux := http.NewServeMux()
 	tracker := newWorkerTracker()
-	api := &apiServer{tracker: tracker, hopperStart: time.Now().UTC()} // db, progress, allowedDirs, uploadTokenHash set after init
+	// Cap concurrent archive-member extractions to the CPU count (decompression
+	// is CPU-bound), clamped so a many-core host can't pile up unbounded disk
+	// spooling from a request burst.
+	api := &apiServer{
+		tracker:     tracker,
+		hopperStart: time.Now().UTC(),
+		extractSem:  make(chan struct{}, min(16, max(2, runtime.NumCPU()))),
+	} // db, progress, allowedDirs, uploadTokenHash set after init
 	api.registerAPI(httpMux)
 	httpMux.HandleFunc("GET /_/health", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok")) //nolint:errcheck // best-effort HTTP response
@@ -1194,6 +1218,23 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	api.db = db
 	api.dataRoot = *dataDir
 	api.allowedDirs = allowedDirs
+
+	// Nested-archive extraction spools intermediate containers to disk before
+	// descending. The default temp location is often a tmpfs (RAM) under
+	// PrivateTmp, which would put a multi-GB inner archive back in memory; keep
+	// it on the data volume instead. Use the upload temp dir: it sits under the
+	// service's one writable path (systemd ReadWritePaths=<uploadDir>), unlike
+	// the samples root which another service owns and hopper cannot write. On
+	// failure, leave the default in place — the WARN is the canary that the
+	// spool fell back to tmpfs.
+	if *dataDir != "" {
+		spool := filepath.Join(*dataDir, uploadDir, ".tmp")
+		if err := mkdirSharedAll(spool); err != nil {
+			slog.Warn("nested-archive spool dir unavailable; using default temp (may be tmpfs)", "dir", spool, "error", err)
+		} else {
+			hopper.NestedSpoolDir = spool
+		}
+	}
 
 	api.SetTraitsVersion(traitsVersion)
 	api.rescanAge = *rescanAge

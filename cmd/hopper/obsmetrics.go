@@ -36,6 +36,7 @@ type instruments struct {
 	wActive, wSlots, wQueue, wRSS                 metric.Int64Observable
 	wAnalyzed, wErrors, wErrorsRecent             metric.Int64Observable
 	localUp, localRestarts                        metric.Int64Observable
+	extractInUse, extractMax                      metric.Int64Observable
 }
 
 // enableMetrics registers the OpenTelemetry instruments that publish every
@@ -143,6 +144,12 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 		// "local worker down" alert; restarts trends supervisor churn.
 		localUp:       gauge("hopper.local_worker.up", "1 when the in-process scan worker is healthy, 0 when down.", ""),
 		localRestarts: counter("hopper.local_worker.restarts", "Cumulative supervisor restarts of the local scan worker.", "{restart}"),
+
+		// Archive-member extraction concurrency. in_use approaching max means
+		// /api/file member requests are queuing (or being shed with 503); the
+		// ratio is the saturation signal for the extraction cap.
+		extractInUse: gauge("hopper.extract.slots_in_use", "Archive-member extraction slots currently held.", "{slot}"),
+		extractMax:   gauge("hopper.extract.slots_max", "Maximum concurrent archive-member extraction slots.", "{slot}"),
 	}
 	if firstErr != nil {
 		return firstErr
@@ -166,6 +173,7 @@ func (wd *webDashboard) observe(ctx context.Context, o metric.Observer, in *inst
 	tracker := wd.tracker
 	litmus := wd.litmus
 	db := wd.db
+	api := wd.api
 	wd.cfgMu.RUnlock()
 
 	now := time.Now()
@@ -234,6 +242,13 @@ func (wd *webDashboard) observe(ctx context.Context, o metric.Observer, in *inst
 		}
 		o.ObserveInt64(in.localUp, up)
 		o.ObserveInt64(in.localRestarts, litmus.restarts.Load())
+	}
+
+	// len/cap of the buffered semaphore: a non-blocking read of in-flight
+	// extractions and the configured ceiling. nil when the cap is disabled.
+	if api != nil && api.extractSem != nil {
+		o.ObserveInt64(in.extractInUse, int64(len(api.extractSem)))
+		o.ObserveInt64(in.extractMax, int64(cap(api.extractSem)))
 	}
 }
 

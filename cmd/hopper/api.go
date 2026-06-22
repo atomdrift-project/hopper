@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -38,6 +39,11 @@ type apiServer struct {
 	db       *hopper.DB
 	tracker  *workerTracker
 	progress *loadProgress
+	// extractSem bounds in-flight archive-member extractions. Each can run a
+	// decompressor and spool a multi-GB intermediate container to disk, so an
+	// unbounded burst of /api/file requests for members would otherwise pile up
+	// CPU and scratch space. nil disables the limit (e.g. in tests).
+	extractSem chan struct{}
 	// traitsVersion holds the short prefix of the current traits repo
 	// commit. Stored in an atomic.Pointer so the periodic rules-update
 	// goroutine can refresh it concurrently with read traffic from
@@ -56,6 +62,27 @@ type apiServer struct {
 	// that happens to be all-zero.
 	uploadTokenHash [sha256.Size]byte
 	uploadTokenSet  bool
+}
+
+// acquireExtract blocks until an archive-extraction slot is free or ctx is
+// done. A nil extractSem means unlimited (tests construct apiServer directly).
+func (s *apiServer) acquireExtract(ctx context.Context) error {
+	if s.extractSem == nil {
+		return nil
+	}
+	select {
+	case s.extractSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// releaseExtract returns a slot taken by acquireExtract.
+func (s *apiServer) releaseExtract() {
+	if s.extractSem != nil {
+		<-s.extractSem
+	}
 }
 
 // errUploadDisabled is the sentinel for "no HOPPER_UPLOAD_TOKEN configured".
@@ -2084,7 +2111,7 @@ func trimClientError(msg string) string {
 // GET /api/file/{sha256}.
 func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
-		http.Error(w, `{"error":"starting"}`, http.StatusServiceUnavailable)
+		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
 		return
 	}
 	sha := r.PathValue("sha256")
@@ -2092,6 +2119,7 @@ func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid sha256"}`, http.StatusBadRequest)
 		return
 	}
+	setDownloadDeadline(w) // bound stalled-client writes for both member and top-level serves
 
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
@@ -2120,7 +2148,7 @@ func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	diskPath := sampleDiskPath(s.dataRoot, filepath.FromSlash(sample.Path))
 	resolved, err := filepath.EvalSymlinks(diskPath)
 	if err != nil {
-		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		writeMissingSampleFile(w, err, `{"error":"sample file gone"}`)
 		return
 	}
 	allowed := false
@@ -2142,12 +2170,16 @@ func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	// Serve the file directly (no directory listings — the path is a file).
 	f, err := os.Open(resolved) //nolint:gosec // path validated above
 	if err != nil {
-		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		writeMissingSampleFile(w, err, `{"error":"sample file gone"}`)
 		return
 	}
 	defer f.Close() //nolint:errcheck // best-effort close
 	stat, err := f.Stat()
-	if err != nil || stat.IsDir() {
+	if err != nil {
+		writeMissingSampleFile(w, err, `{"error":"sample file gone"}`)
+		return
+	}
+	if stat.IsDir() {
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		return
 	}
@@ -2155,10 +2187,71 @@ func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
 }
 
-// archiveMemberMaxBytes caps the result of an archive-member extraction.
-// Generous enough for source files and manifests; blocks accidental
-// extraction of multi-GB blobs into memory.
-const archiveMemberMaxBytes = 8 * 1024 * 1024
+// isClientGone reports whether err (or the request context) indicates the
+// caller disconnected rather than the server failing: a cancelled/expired
+// context, or a write to a socket the peer already closed (EPIPE/ECONNRESET,
+// or a closed connection). These must not count as server errors.
+func isClientGone(ctx context.Context, err error) bool {
+	return ctx.Err() != nil ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, net.ErrClosed)
+}
+
+// Retry-After hints (delta-seconds, RFC 9110 §10.2.3) carried on the download
+// 503s so a client backs off a concrete amount rather than guessing. Small: on
+// a healthy host these conditions clear in a beat.
+const (
+	retryAfterStarting  = 5 // process still warming up
+	retryAfterBusy      = 2 // extraction slots free fast
+	retryAfterTransient = 3 // fd exhaustion / transient I/O
+)
+
+// writeRetryable writes a 503 with a Retry-After header, so the retryable signal
+// carries an explicit backoff, not just the status class.
+func writeRetryable(w http.ResponseWriter, retryAfterSec int, body string) {
+	w.Header().Set("Retry-After", strconv.Itoa(retryAfterSec))
+	http.Error(w, body, http.StatusServiceUnavailable)
+}
+
+// writeMissingSampleFile maps a failure to resolve or open a sample file whose
+// DB row exists to a status the client can act on. The record asserts the file
+// should be on disk, so ENOENT means it was deleted — permanent, and 410 Gone
+// ("existed, now gone") is more precise than 404. Anything else — fd exhaustion
+// (EMFILE) under load, a transient mount/I-O blip — is retryable → 503, so a
+// caller does not permanently abandon a file that is merely briefly unreachable.
+func writeMissingSampleFile(w http.ResponseWriter, err error, goneJSON string) {
+	if errors.Is(err, os.ErrNotExist) {
+		http.Error(w, goneJSON, http.StatusGone)
+		return
+	}
+	writeRetryable(w, retryAfterTransient, `{"error":"temporarily unavailable"}`)
+}
+
+// downloadWriteTimeout bounds a single file-serving response. Generous enough
+// for a multi-GB archive over the LAN, short enough that a stalled reader (one
+// that stops draining, so the TCP send buffer fills and io.Copy blocks forever)
+// is reclaimed rather than leaking its handler goroutine, buffers, and any
+// extraction slot it holds.
+const downloadWriteTimeout = 10 * time.Minute
+
+// setDownloadDeadline applies downloadWriteTimeout to the response connection.
+// Mirrors the per-request SetReadDeadline the upload/result handlers use; best
+// effort, so httptest and non-deadline writers simply no-op.
+func setDownloadDeadline(w http.ResponseWriter) {
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(downloadWriteTimeout)) //nolint:errcheck // optional hardening
+}
+
+// archiveMemberMaxBytes caps a single file extracted from inside an archive.
+// Members stream (sendfile for stored zip entries, a bounded decompressor for
+// compressed ones), so memory per request is independent of this value — it is
+// a policy ceiling, not a memory guard. The size check is pre-write against the
+// member's declared size and the copy is LimitReader-bounded, so a large (or
+// lying) member can't blow up RAM. Whole-file serving (/data and top-level
+// /api/file) is uncapped; this only limits extract-from-archive requests.
+const archiveMemberMaxBytes = 250 << 20 // 250 MiB
 
 // serveArchiveMember resolves child to its parent on disk, reads the parent,
 // extracts the requested inner path, and writes the bytes back. Reuses the
@@ -2175,14 +2268,23 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 	}
 	innerPath := hopper.PathInsideArchive(child.Path)
 	if innerPath == "" {
-		http.Error(w, `{"error":"child has no archive-relative path"}`, http.StatusInternalServerError)
+		// The child's stored path lacks the "!!" archive delimiter, so there is
+		// no member to extract. This happens when the parent archive itself has
+		// no on-disk path (e.g. a path-less direct insert): memberSamplesFromEnvelope
+		// then mints members without the delimiter, and they are unservable. It
+		// is a permanent condition, so return 422 (not a retryable 5xx) and log
+		// it — previously this was a silent 500 that workers retried forever.
+		//nolint:gosec // sha256 validated by validSHA256
+		slog.Warn("archive-member unservable: child path has no archive delimiter",
+			"sha256", sha, "parent_sha", child.Parent, "child_path", child.Path)
+		http.Error(w, `{"error":"child has no archive-relative path"}`, http.StatusUnprocessableEntity)
 		return
 	}
 
 	diskPath := sampleDiskPath(s.dataRoot, filepath.FromSlash(parent.Path))
 	resolved, err := filepath.EvalSymlinks(diskPath)
 	if err != nil {
-		http.Error(w, `{"error":"parent file missing"}`, http.StatusNotFound)
+		writeMissingSampleFile(w, err, `{"error":"parent file gone"}`)
 		return
 	}
 	allowed := false
@@ -2203,15 +2305,29 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 
 	f, err := os.Open(resolved) //nolint:gosec // path validated above
 	if err != nil {
-		http.Error(w, `{"error":"parent unreadable"}`, http.StatusInternalServerError)
+		writeMissingSampleFile(w, err, `{"error":"parent file gone"}`)
 		return
 	}
 	defer f.Close() //nolint:errcheck // best-effort close
 	stat, err := f.Stat()
-	if err != nil || stat.IsDir() {
-		http.Error(w, `{"error":"parent unreadable"}`, http.StatusInternalServerError)
+	if err != nil {
+		writeMissingSampleFile(w, err, `{"error":"parent file gone"}`)
 		return
 	}
+	if stat.IsDir() {
+		http.Error(w, `{"error":"parent not a file"}`, http.StatusUnprocessableEntity)
+		return
+	}
+
+	// Bound concurrent extractions: a burst of member requests could otherwise
+	// run many decompressors and spool many intermediate archives to disk at
+	// once. Acquired here (not earlier) so the cheap parent lookup and path
+	// checks above don't hold a slot while blocking.
+	if err := s.acquireExtract(ctx); err != nil {
+		writeRetryable(w, retryAfterBusy, `{"error":"busy: extraction slots exhausted"}`)
+		return
+	}
+	defer s.releaseExtract()
 
 	// Stream the single member straight from disk to the socket: zip uses the
 	// file as random-access (only the central directory plus the member's
@@ -2227,18 +2343,48 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 		case errors.Is(err, hopper.ErrArchiveMemberNotFound):
 			http.Error(w, `{"error":"not found in archive"}`, http.StatusNotFound)
 		case errors.Is(err, hopper.ErrArchiveMemberTooLarge):
+			//nolint:gosec // sha256 validated by validSHA256
+			slog.Info("archive-member over size cap",
+				"sha256", sha, "parent_sha", parent.SHA256, "parent_type", parent.FileType,
+				"inner_path", innerPath, "cap_bytes", archiveMemberMaxBytes)
 			http.Error(w, `{"error":"file too large"}`, http.StatusRequestEntityTooLarge)
 		case errors.Is(err, hopper.ErrArchiveEncrypted):
 			http.Error(w, `{"error":"encrypted archive: could not decrypt with known passwords"}`, http.StatusUnprocessableEntity)
-		case strings.Contains(err.Error(), "unsupported archive"):
-			http.Error(w, `{"error":"unsupported archive type"}`, http.StatusUnsupportedMediaType)
-		default:
+		case errors.Is(err, hopper.ErrUnsupportedArchive):
+			// Log the container type so the coverage gap is visible: which
+			// parent/nested archive formats workers want but hopper can't serve.
 			//nolint:gosec // sha256 validated by validSHA256
-			slog.Warn("archive-member streaming failed",
+			slog.Info("archive-member unsupported container",
+				"sha256", sha, "parent_sha", parent.SHA256, "parent_type", parent.FileType,
+				"inner_path", innerPath, "error", err)
+			http.Error(w, `{"error":"unsupported archive type"}`, http.StatusUnsupportedMediaType)
+		case isClientGone(ctx, err):
+			// The client closed the connection mid-stream (broken pipe / reset)
+			// or its request context expired. Not a server fault, and bytes may
+			// already be on the wire, so there is no status to set — just log it
+			// quietly so it stays out of the 5xx error budget.
+			//nolint:gosec // sha256 validated by validSHA256
+			slog.Debug("archive-member request abandoned by client",
+				"sha256", sha, "parent_sha", parent.SHA256, "error", err)
+		case hopper.IsCorruptArchive(err):
+			//nolint:gosec // sha256 validated by validSHA256
+			slog.Info("archive-member extraction: corrupt archive",
+				"sha256", sha, "parent_sha", parent.SHA256, "error", err)
+			http.Error(w, `{"error":"corrupt archive"}`, http.StatusUnprocessableEntity)
+		default:
+			// The parent is open and readable (checked above), so a remaining
+			// extraction failure is a property of the archive data — a corrupt
+			// codec stream IsCorruptArchive doesn't have a typed sentinel for
+			// (zstd/xz/lzma/7z/crx/rpm/deb), a truncated member, etc. Permanent,
+			// so 422 (not a retryable 5xx): the client must not loop on a
+			// fundamentally unextractable member. Logged at Warn because a spike
+			// here can also mean a genuine new gap worth investigating.
+			//nolint:gosec // sha256 validated by validSHA256
+			slog.Warn("archive-member extraction failed (treated as permanent)",
 				"sha256", sha, "parent_sha", parent.SHA256, "error", err)
 			// Headers may already be sent if the failure was mid-stream; in that
 			// case http.Error's WriteHeader is a no-op and only logs.
-			http.Error(w, `{"error":"extraction failed"}`, http.StatusInternalServerError)
+			http.Error(w, `{"error":"extraction failed"}`, http.StatusUnprocessableEntity)
 		}
 		return
 	}
@@ -2280,6 +2426,7 @@ func stripDataRoot(dbPath, prefix string) string {
 // matching the security model of handleFile.
 func (s *apiServer) safeFileServer() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setDownloadDeadline(w) // bound stalled-client writes on /data/ downloads
 		relPath := strings.TrimPrefix(r.URL.Path, "/data/")
 		if relPath == "" || relPath[0] == '/' {
 			http.NotFound(w, r)
@@ -2316,12 +2463,23 @@ func (s *apiServer) safeFileServer() http.Handler {
 
 		f, err := os.Open(resolved) //nolint:gosec // path validated above
 		if err != nil {
-			http.NotFound(w, r)
+			// /data makes no DB existence claim, so a vanished file is just 404.
+			// A non-ENOENT failure (fd exhaustion under load, transient I/O) is
+			// retryable (503) — don't tell a caller a present file is gone.
+			if errors.Is(err, os.ErrNotExist) {
+				http.NotFound(w, r)
+			} else {
+				writeRetryable(w, retryAfterTransient, "temporarily unavailable")
+			}
 			return
 		}
 		defer f.Close() //nolint:errcheck // best-effort close
 		stat, err := f.Stat()
-		if err != nil || stat.IsDir() {
+		if err != nil {
+			writeRetryable(w, retryAfterTransient, "temporarily unavailable")
+			return
+		}
+		if stat.IsDir() {
 			http.NotFound(w, r)
 			return
 		}

@@ -1,7 +1,10 @@
 package hopper
 
 import (
+	"archive/tar"
+	"archive/zip"
 	"compress/bzip2"
+	"compress/flate"
 	"compress/gzip"
 	"encoding/binary"
 	"errors"
@@ -17,11 +20,40 @@ import (
 	"github.com/ulikunitz/xz/lzma"
 )
 
+// IsCorruptArchive reports whether err means the archive bytes themselves are
+// malformed — a bad header, checksum mismatch, or truncated/garbage compressed
+// stream — as opposed to a server-side I/O fault or a client disconnect. The
+// data is the caller's problem, so the HTTP layer maps these to 422 rather than
+// 500. Covers the standard-library container/codec errors (tar, zip, gzip,
+// flate, bzip2); exotic codec corruption (zstd/xz/7z) falls through to 500.
+func IsCorruptArchive(err error) bool {
+	if errors.Is(err, tar.ErrHeader) ||
+		errors.Is(err, zip.ErrFormat) || errors.Is(err, zip.ErrChecksum) || errors.Is(err, zip.ErrAlgorithm) ||
+		errors.Is(err, gzip.ErrHeader) || errors.Is(err, gzip.ErrChecksum) {
+		return true
+	}
+	var (
+		flateCorrupt  flate.CorruptInputError
+		flateInternal flate.InternalError
+		bz2Err        bzip2.StructuralError
+	)
+	return errors.As(err, &flateCorrupt) || errors.As(err, &flateInternal) || errors.As(err, &bz2Err)
+}
+
 // maxNestedArchiveBytes bounds an *intermediate* nested archive that must be
 // extracted to reach a deeper member (e.g. the pkg-*.tar.zst inside a .conda).
 // The final leaf is still capped by the caller's maxBytes; this only limits how
 // large an inner container we'll spool to a temp file before descending.
 const maxNestedArchiveBytes = 2 << 30 // 2 GiB
+
+// NestedSpoolDir is the directory streamNestedMember spools intermediate
+// archives into. An empty value falls back to os.TempDir() (i.e. $TMPDIR or
+// /tmp), which under systemd's PrivateTmp is frequently a tmpfs (RAM-backed) —
+// spooling a multi-GB inner container there would defeat the point of
+// streaming. main sets this to an on-disk path under the data root before the
+// server starts serving; it is only read afterwards, so no synchronisation is
+// needed.
+var NestedSpoolDir string
 
 // StreamArchiveMember writes the single member innerPath out of an archive to w
 // without ever holding the whole archive in memory. src provides random access
@@ -80,7 +112,7 @@ func streamArchiveLeaf(src io.ReaderAt, size int64, fileType, member string, max
 	case "deb", "ipk":
 		return streamDebMember(src, size, member, maxBytes, setLen, w)
 	}
-	return fmt.Errorf("unsupported archive: %s", fileType)
+	return fmt.Errorf("%w: %s", ErrUnsupportedArchive, fileType)
 }
 
 // streamNestedMember spools the intermediate archive named by head to a temp
@@ -90,10 +122,10 @@ func streamArchiveLeaf(src io.ReaderAt, size int64, fileType, member string, max
 func streamNestedMember(src io.ReaderAt, size int64, fileType, head, tail string, maxBytes int64, setLen func(int64), w io.Writer) error {
 	nestedType := archiveTypeFromName(head)
 	if nestedType == "" {
-		return fmt.Errorf("unsupported nested archive: %s", head)
+		return fmt.Errorf("%w: nested %s", ErrUnsupportedArchive, head)
 	}
 
-	tmp, err := os.CreateTemp("", "hopper-nested-*")
+	tmp, err := os.CreateTemp(NestedSpoolDir, "hopper-nested-*")
 	if err != nil {
 		return fmt.Errorf("nested temp: %w", err)
 	}
@@ -225,7 +257,7 @@ func newDecompressor(comp string, r io.Reader) (io.Reader, func(), error) {
 	case "bz2":
 		return bzip2.NewReader(r), func() {}, nil
 	}
-	return nil, nil, fmt.Errorf("unsupported compression: %s", comp)
+	return nil, nil, fmt.Errorf("%w: compression %s", ErrUnsupportedArchive, comp)
 }
 
 // streamCrxMember strips the Chrome extension (crx) wrapper — a small header in
