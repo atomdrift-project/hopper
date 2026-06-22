@@ -39,6 +39,17 @@ readonly TOOLS_DIR=${STATE_HOME}/bin
 readonly CACHE_HOME=/var/cache/${SERVICE_NAME}
 readonly UNIT_FILE=/etc/systemd/system/${SERVICE_NAME}.service
 
+# Permission-heal timer: a root oneshot that re-asserts the shared-tree contract
+# (samples group + setgid dirs + read-only files) on DATA_DIR, catching drift
+# from writers that bypass forager's/hopper's own self-heal. The interval is
+# env-overridable; the heal is a no-op when the tree is already clean.
+readonly HEAL_PERMS_SRC=scripts/master/heal-perms.sh
+readonly HEAL_PERMS_BIN=/usr/local/bin/hopper-heal-perms.sh
+readonly HEAL_PERMS_SVC=/etc/systemd/system/hopper-heal-perms.service
+readonly HEAL_PERMS_TIMER=/etc/systemd/system/hopper-heal-perms.timer
+HEAL_PERMS_INTERVAL_MIN="${HEAL_PERMS_INTERVAL_MIN:-15}"
+case "$HEAL_PERMS_INTERVAL_MIN" in *[!0-9]*|'') die "HEAL_PERMS_INTERVAL_MIN must be an integer" ;; esac
+
 # Sibling repos that ship alongside hopper. `make deploy` updates both,
 # builds them in release mode, and installs the resulting binaries into
 # TOOLS_DIR.
@@ -76,6 +87,36 @@ else
     die "need root: install doas or sudo, or run as root"
 fi
 priv true || die "privilege escalation failed (doas/sudo)"
+
+# Verify the escalation path can actually run the privileged commands this
+# deploy and the perms-heal timer need — not merely `true`. A command-scoped
+# doas/sudo policy (vs the common `permit nopass <user>`) can let `priv true`
+# succeed yet deny chmod/chgrp, which would otherwise blow up deep in the
+# deploy or leave a perms-heal timer that fails every cycle. Probe each with a
+# side-effect-free --version. Only when escalation is non-interactive, so a
+# password-scoped policy is not turned into a prompt storm.
+priv_noninteractive() {
+    [[ $EUID -eq 0 ]] && return 0
+    command -v doas >/dev/null 2>&1 && doas -n true >/dev/null 2>&1 && return 0
+    command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1 && return 0
+    return 1
+}
+if priv_noninteractive; then
+    declare -a priv_missing=()
+    for c in install systemctl chgrp chmod find; do
+        priv "$c" --version >/dev/null 2>&1 || priv_missing+=("$c")
+    done
+    if (( ${#priv_missing[@]} > 0 )); then
+        die "doas/sudo is configured but not permitted to run: ${priv_missing[*]}
+  the deploy installs units (install, systemctl) and the perms-heal timer runs
+  chgrp/chmod as root. Grant these to $(id -un) — e.g. /etc/doas.conf:
+      permit nopass $(id -un)
+  (or a cmd-scoped rule covering the above) — or run 'make deploy' as root."
+    fi
+    log "doas/sudo capability check passed (install, systemctl, chgrp, chmod, find)"
+else
+    log "escalation requires a password; skipping non-interactive doas capability probe"
+fi
 
 # litmus and cleave are checked out alongside hopper and built in release
 # mode during deploy. Their Makefiles drop the binary into ./out/<name>;
@@ -322,6 +363,102 @@ if (( binary_changed || unit_changed )); then
 else
     log "No changes; leaving service running"
 fi
+
+# --- Permission-heal timer ---------------------------------------------------
+# /data/samples is shared (samples group) by forager, hopper, and the promoter.
+# This root oneshot + timer re-asserts the contract — samples group, setgid
+# 2775 dirs, read-only 0444 files — for drift from writers that bypass the
+# services' own self-heal (a manual mv, the relayout, a root import). It runs
+# as root so it can chgrp/chmod paths owned by any of those services; the
+# long-running hopper service stays unprivileged and is never granted
+# chmod/chgrp rights. The heal is a no-op when the tree is already clean.
+
+[[ -f ${HEAL_PERMS_SRC} ]] || die "perms-heal script not found at ${HEAL_PERMS_SRC} (run from repo root)"
+if priv cmp -s "${HEAL_PERMS_SRC}" "${HEAL_PERMS_BIN}" 2>/dev/null; then
+    log "perms-heal script unchanged"
+else
+    log "Installing ${HEAL_PERMS_BIN}"
+    priv install -m 0755 -o root -g root "${HEAL_PERMS_SRC}" "${HEAL_PERMS_BIN}"
+fi
+
+tmp_heal_svc=$(mktemp -t hopper-heal-perms.service.XXXXXX); TMP_FILES+=("$tmp_heal_svc")
+tmp_heal_tmr=$(mktemp -t hopper-heal-perms.timer.XXXXXX); TMP_FILES+=("$tmp_heal_tmr")
+
+cat >"$tmp_heal_svc" <<EOF
+[Unit]
+Description=Heal shared sample-tree permissions (group/setgid/read-only)
+Documentation=https://codeberg.org/atomdrift/hopper
+
+[Service]
+Type=oneshot
+ExecStart=${HEAL_PERMS_BIN}
+Environment=DATA_DIR=${DATA_DIR}
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Least privilege for a root oneshot: walk DATA_DIR and chgrp/chmod within it,
+# nothing else. ProtectSystem=strict makes the rest of the filesystem
+# read-only; ReadWritePaths re-opens just the sample tree. Default root caps
+# are retained (CAP_CHOWN/CAP_FOWNER) so it can fix paths owned by forager etc.
+ProtectSystem=strict
+ReadWritePaths=${DATA_DIR}
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+NoNewPrivileges=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+StandardOutput=journal
+StandardError=journal
+EOF
+
+cat >"$tmp_heal_tmr" <<EOF
+[Unit]
+Description=Run hopper-heal-perms every ${HEAL_PERMS_INTERVAL_MIN}min
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=${HEAL_PERMS_INTERVAL_MIN}min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+heal_changed=0
+if priv cmp -s "$tmp_heal_svc" "$HEAL_PERMS_SVC" 2>/dev/null; then
+    log "perms-heal unit unchanged"
+else
+    log "Writing ${HEAL_PERMS_SVC}"
+    priv install -m 0644 -o root -g root "$tmp_heal_svc" "$HEAL_PERMS_SVC"
+    heal_changed=1
+fi
+if priv cmp -s "$tmp_heal_tmr" "$HEAL_PERMS_TIMER" 2>/dev/null; then
+    log "perms-heal timer unchanged"
+else
+    log "Writing ${HEAL_PERMS_TIMER}"
+    priv install -m 0644 -o root -g root "$tmp_heal_tmr" "$HEAL_PERMS_TIMER"
+    heal_changed=1
+fi
+(( heal_changed )) && priv systemctl daemon-reload
+# Clear any prior failed run so the timer reschedules cleanly.
+priv systemctl reset-failed hopper-heal-perms.service 2>/dev/null || true
+priv systemctl enable --now hopper-heal-perms.timer >/dev/null
+# Kick one run now (Type=oneshot, so this blocks until it finishes) so each
+# deploy heals immediately and surfaces any script error in the journal rather
+# than waiting for the first timer tick. A heal failure warns but never fails
+# the deploy.
+if priv systemctl start hopper-heal-perms.service; then
+    log "perms-heal ran: journalctl -u hopper-heal-perms.service -n 20"
+else
+    log "WARN perms-heal initial run failed; see: journalctl -u hopper-heal-perms.service -n 20"
+fi
+log "perms-heal timer active (every ${HEAL_PERMS_INTERVAL_MIN}min): systemctl list-timers hopper-heal-perms.timer"
 
 priv systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
 log "Deployment complete"
