@@ -39,6 +39,14 @@ set -eu
 DATA_DIR="${DATA_DIR:-/data/samples}"
 GROUP="${SAMPLES_GROUP:-samples}"
 
+# Subtree to leave untouched. hopper's upload staging area is private, not part
+# of the shared cooperative tree: the deploy owns it hopper:hopper at 0750 (and
+# .tmp at 0700), and files there are mid-ingest. Applying the shared contract
+# would regroup it to samples, loosen the private 0700 .tmp to 2775, and could
+# flip an in-flight temp file to 0444 under an active upload. Pruning it keeps
+# the heal off hopper's write path entirely. Empty disables the exclusion.
+EXCLUDE="${HEAL_EXCLUDE:-$DATA_DIR/unknown/uploads}"
+
 [ -d "$DATA_DIR" ] || { echo "heal-perms: DATA_DIR does not exist: $DATA_DIR" >&2; exit 1; }
 getent group "$GROUP" >/dev/null 2>&1 || { echo "heal-perms: group does not exist: $GROUP" >&2; exit 1; }
 
@@ -53,18 +61,22 @@ log() { echo "heal-perms: $*"; }
 # dropped (2>/dev/null) so a file deleted mid-walk is a silent no-op; `|| true`
 # keeps a per-entry chmod failure (e.g. EPERM) from aborting the later passes.
 
+# Each walk prunes $EXCLUDE first: `-path EXCLUDE -prune -o <test> -print0` reads
+# as "(path is EXCLUDE and prune) or (<test> and print)", so the excluded subtree
+# is never descended or acted on. An empty EXCLUDE matches no path, disabling it.
+
 # 1. Group ownership: any entry not already in the samples group. -h regroups a
 #    stray symlink as the link itself rather than following it to its target.
-grp_out=$(find "$DATA_DIR" ! -group "$GROUP" -print0 \
+grp_out=$(find "$DATA_DIR" -path "$EXCLUDE" -prune -o ! -group "$GROUP" -print0 \
     | xargs -0 -r -n 4096 chgrp -ch "$GROUP" -- 2>/dev/null) || true
 
 # 2. Directories not already exactly 2775 (setgid + group-writable).
-dir_out=$(find "$DATA_DIR" -type d ! -perm 2775 -print0 \
+dir_out=$(find "$DATA_DIR" -path "$EXCLUDE" -prune -o -type d ! -perm 2775 -print0 \
     | xargs -0 -r -n 2048 chmod -c 2775 -- 2>/dev/null) || true
 
 # 3. Regular files not already exactly 0444 (read-only). Immutability is
 #    deliberate; see the contract above.
-file_out=$(find "$DATA_DIR" -type f ! -perm 0444 -print0 \
+file_out=$(find "$DATA_DIR" -path "$EXCLUDE" -prune -o -type f ! -perm 0444 -print0 \
     | xargs -0 -r -n 4096 chmod -c 0444 -- 2>/dev/null) || true
 
 # Per-path heal log to the journal (nothing on a clean tree).

@@ -398,6 +398,8 @@ Documentation=https://codeberg.org/atomdrift/hopper
 Type=oneshot
 ExecStart=${HEAL_PERMS_BIN}
 Environment=DATA_DIR=${DATA_DIR}
+# Leave hopper's private upload staging area out of the shared-tree heal.
+Environment=HEAL_EXCLUDE=${UPLOAD_DIR}
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Least privilege for a root oneshot: walk DATA_DIR and chgrp/chmod within it,

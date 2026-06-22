@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -553,6 +554,7 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/heartbeat", s.handleHeartbeat)
 	mux.HandleFunc("POST /api/result", s.handleResult)
 	mux.HandleFunc("POST /api/upload", s.handleUpload)
+	mux.HandleFunc("POST /api/known", s.handleKnown)
 	mux.HandleFunc("GET /api/file/{sha256}", s.handleFile)
 	mux.Handle("GET /data/", s.safeFileServer())
 }
@@ -593,9 +595,16 @@ const (
 	// matching write storm to the workers table.
 	workerUpsertInterval = 30 * time.Second
 
-	// maxUploadBytes caps an interactive /api/upload body. Matches prism's
+	// maxUploadBytes caps the artifact bytes in an /api/upload. Matches prism's
 	// web upload limit so anything that gets past prism fits here too.
 	maxUploadBytes = 100 << 20
+	// uploadProvenanceMaxBytes caps the provenance part of a multipart upload.
+	// A sidecar carries at most two metadata records, each with Raw bounded by
+	// hopper.MaxRawBytes (256 KiB), plus small scalar fields.
+	uploadProvenanceMaxBytes = 1 << 20
+	// maxUploadEnvelopeBytes caps a full multipart upload body: the artifact
+	// (maxUploadBytes) plus the provenance part and multipart framing overhead.
+	maxUploadEnvelopeBytes = maxUploadBytes + uploadProvenanceMaxBytes + (64 << 10)
 	// uploadFilenameMax bounds the on-disk filename component to keep paths
 	// reasonable across filesystems; longer names are truncated, never
 	// rejected, so users still get an analysis.
@@ -1766,16 +1775,19 @@ func checkBrowserCSRF(r *http.Request) error {
 		return errors.New("cross-site request blocked")
 	}
 	// Block obvious form-submission content types. Raw uploads are
-	// application/octet-stream or unset; browsers can only set those via
-	// fetch(), which triggers a preflight (and the server doesn't answer
-	// preflights, so it's already blocked). Browser-issued <form> submits
-	// land here with one of the three CORS "simple" types below.
+	// application/octet-stream or unset; provenance-carrying uploads are
+	// multipart/form-data sent by non-browser clients (forager, prism's
+	// backend) that already hold a Bearer token — which a browser cannot set
+	// on a cross-site request without a preflight the server never answers, so
+	// such a request fails auth above and never reaches here. multipart is
+	// therefore deliberately NOT blocked. The classic CSRF-able simple types
+	// below have no legitimate use on this endpoint.
 	ct := r.Header.Get("Content-Type")
 	if i := strings.IndexByte(ct, ';'); i >= 0 {
 		ct = ct[:i]
 	}
 	switch strings.TrimSpace(strings.ToLower(ct)) {
-	case "application/x-www-form-urlencoded", "multipart/form-data", "text/plain":
+	case "application/x-www-form-urlencoded", "text/plain":
 		return errors.New("disallowed Content-Type for upload")
 	}
 	return nil
@@ -1814,7 +1826,68 @@ func (s *apiServer) resolveDataPath(rel string) (string, error) {
 // Idempotent — re-uploading the same content returns the existing sample,
 // with already_analyzed=true if cleave_result is populated.
 //
-//nolint:gosec,maintidx // paths confined to dataRoot via resolveDataPath; linear hardening flow
+// maxKnownBatch caps the digests one /api/known request may probe. Bounds the
+// query and the response, and keeps the batch well under SQLite's bound-param
+// limit. A bulk producer chunks larger work into successive requests.
+const maxKnownBatch = 1024
+
+type knownRequest struct {
+	SHA256 []string `json:"sha256"`
+}
+
+type knownResponse struct {
+	Known []string `json:"known"`
+}
+
+// handleKnown answers "which of these digests do you already have?" with a
+// single index-only lookup, so a producer can skip transferring bytes hopper
+// holds. It is unauthenticated — sample existence is already visible in the web
+// UI — and reads nothing but the sha256 key, making it the cheapest probe the
+// store offers. The response lists only the known digests; unknown ones are
+// simply absent.
+func (s *apiServer) handleKnown(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
+		return
+	}
+	// Bound the body: maxKnownBatch 64-hex strings plus JSON framing, generously.
+	var req knownRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxKnownBatch*72+1024)).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid json"}`)
+		return
+	}
+	if len(req.SHA256) > maxKnownBatch {
+		writeJSONError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(`{"error":"too many digests (max %d)"}`, maxKnownBatch))
+		return
+	}
+	// Keep only well-formed lowercase-hex digests; a malformed entry can never
+	// match and would only waste a bind slot.
+	valid := req.SHA256[:0]
+	for _, sha := range req.SHA256 {
+		if validSHA256(sha) {
+			valid = append(valid, sha)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
+	defer cancel()
+	known, err := s.db.KnownSHA256(ctx, valid)
+	if err != nil {
+		slog.Error("known: query failed", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		return
+	}
+	if known == nil {
+		known = []string{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(knownResponse{Known: known}) //nolint:errcheck,errchkjson // best-effort response
+}
+
+//nolint:gosec // G706: structured logging of request-derived fields (remote, error); not a format string
 func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
 		writeJSONError(w, http.StatusServiceUnavailable, `{"error":"starting"}`)
@@ -1849,7 +1922,7 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	// Content-Length pre-check. Lets us reject oversized uploads before
 	// allocating a temp file. ContentLength is -1 when unknown (chunked).
-	if r.ContentLength > maxUploadBytes {
+	if r.ContentLength > maxUploadEnvelopeBytes {
 		writeJSONError(w, http.StatusRequestEntityTooLarge, `{"error":"file too large"}`)
 		return
 	}
@@ -1865,9 +1938,105 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// ResponseWriter doesn't implement it (e.g. httptest); harmless.
 	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(uploadBodyTimeout)) //nolint:errcheck // optional
 
-	rawName := r.URL.Query().Get("filename")
-	filename := sanitizeUploadFilename(rawName)
+	// Dispatch on body shape. A multipart body carries the required, validated
+	// provenance envelope (forager nodes, prism's browser form); a raw body is
+	// the legacy thin-row path, retained until every uploader sends provenance.
+	// A malformed Content-Type parses to an empty type and falls through to raw.
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err == nil && mediaType == "multipart/form-data" {
+		s.handleUploadMultipart(w, r)
+		return
+	}
 
+	slog.Warn("upload: legacy raw body without provenance (deprecated)", "remote", r.RemoteAddr)
+	body := http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	s.storeUpload(w, r, body, r.URL.Query().Get("filename"), nil)
+}
+
+// handleUploadMultipart handles a provenance-carrying upload: a multipart body
+// with a "provenance" part (the JSON sidecar, required and validated) followed
+// by a "file" part (the artifact bytes). The provenance MUST precede the file
+// so it is parsed before the large stream begins. Both forager (remote, lightly
+// trusted nodes) and prism (human submissions) use this path.
+func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadEnvelopeBytes)
+	mr, err := r.MultipartReader()
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, `{"error":"malformed multipart body"}`)
+		return
+	}
+
+	var prov *hopper.Sidecar
+	const maxParts = 8
+	parts := 0
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				writeJSONError(w, http.StatusRequestEntityTooLarge, `{"error":"file too large"}`)
+				return
+			}
+			writeJSONError(w, http.StatusBadRequest, `{"error":"malformed multipart body"}`)
+			return
+		}
+		parts++
+		if parts > maxParts {
+			_ = part.Close() //nolint:errcheck // best-effort
+			writeJSONError(w, http.StatusBadRequest, `{"error":"too many parts"}`)
+			return
+		}
+
+		switch part.FormName() {
+		case "provenance":
+			buf, rerr := io.ReadAll(io.LimitReader(part, uploadProvenanceMaxBytes))
+			_ = part.Close() //nolint:errcheck // best-effort
+			if rerr != nil {
+				writeJSONError(w, http.StatusBadRequest, `{"error":"provenance read failed"}`)
+				return
+			}
+			var sc hopper.Sidecar
+			if err := json.Unmarshal(buf, &sc); err != nil {
+				writeJSONError(w, http.StatusBadRequest, `{"error":"invalid provenance json"}`)
+				return
+			}
+			// Finalize first so an over-cap Raw is trimmed rather than rejected,
+			// then validate the required core. The producer's claimed sha is
+			// checked against the bytes we actually hash in storeUpload, so
+			// provenance and content cannot disagree.
+			sc.Finalize()
+			if err := sc.Validate(); err != nil {
+				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf(`{"error":%q}`, "invalid provenance: "+err.Error()))
+				return
+			}
+			prov = &sc
+		case "file":
+			if prov == nil {
+				writeJSONError(w, http.StatusBadRequest, `{"error":"provenance part must precede file part"}`)
+				return
+			}
+			// storeUpload consumes the part stream and writes the response.
+			s.storeUpload(w, r, part, prov.Artifact.Filename, prov)
+			return
+		default:
+			_ = part.Close() //nolint:errcheck // ignore unexpected parts
+		}
+	}
+	writeJSONError(w, http.StatusBadRequest, `{"error":"missing file part"}`)
+}
+
+// storeUpload streams src to a sha-sharded path under the uploads root while
+// hashing, verifies the bytes against the provenance claim (when present),
+// dedupes by sha, and upserts the sample row. prov is nil for the legacy raw
+// path. When present, its scalar claims fill the descriptive columns, but the
+// trust-bearing label is never taken from it — an upload arrives over a lightly
+// trusted boundary, so analysis, not the producer, decides a sample's label.
+//
+//nolint:gosec // G703/G706: shard paths are confined to dataRoot via resolveDataPath; logging is structured
+func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.Reader, claimedName string, prov *hopper.Sidecar) {
 	// Stream to a temp file under the uploads root while hashing. Temp
 	// lives on the same filesystem as the final location so the post-hash
 	// rename is atomic and cross-device-safe.
@@ -1891,9 +2060,8 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath) //nolint:errcheck // best-effort; succeeds on error path, no-op after rename
 
-	body := http.MaxBytesReader(w, r.Body, maxUploadBytes)
 	hasher := sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(tmpFile, hasher), body)
+	written, copyErr := io.Copy(io.MultiWriter(tmpFile, hasher), src)
 	closeErr := tmpFile.Close()
 	if copyErr != nil {
 		var maxErr *http.MaxBytesError
@@ -1925,6 +2093,17 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sha := hex.EncodeToString(hasher.Sum(nil))
+
+	// The producer's claimed sha must match the bytes we actually received, so a
+	// tampered or mispaired provenance/file pair can't be stored as if matched.
+	if prov != nil && prov.Artifact.SHA256 != sha {
+		//nolint:gosec // structured logging
+		slog.Warn("upload: provenance sha mismatch", "claimed", prov.Artifact.SHA256, "actual", sha, "remote", r.RemoteAddr)
+		writeJSONError(w, http.StatusBadRequest, `{"error":"content does not match provenance sha256"}`)
+		return
+	}
+
+	filename := sanitizeUploadFilename(claimedName)
 	if filename == "" {
 		filename = sha[:16] + ".bin"
 	}
@@ -1935,8 +2114,8 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// Look up any existing row for this sha BEFORE writing the final path.
 	// If we already have this sample, reuse its on-disk filename rather
 	// than spawning a second copy under a new shard path — otherwise an
-	// attacker re-uploading the same bytes with a rotating filename query
-	// param fills the disk despite the sha-level dedupe.
+	// uploader re-sending the same bytes with a rotating filename fills the
+	// disk despite the sha-level dedupe.
 	existing, err := retryDBAccess(ctx, "upload sample lookup", sha, func(ctx context.Context) (*hopper.Sample, error) {
 		return s.db.SampleBySHA256(ctx, sha)
 	})
@@ -1945,9 +2124,11 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	alreadyAnalyzed := existing != nil && len(existing.CleaveResult) > 0
 
-	// Final location: unknown/uploads/<aa>/<bb>/<filename>. When the sha is
-	// already known, reuse the stored filename so we land at the same path
-	// instead of creating a duplicate.
+	// Final location: unknown/uploads/<aa>/<bb>/<filename>. hopper always picks
+	// this sha-shard — an upload never controls its on-disk path — so the bucket
+	// taxonomy a producer claims lives in the row's columns, not the layout.
+	// When the sha is already known, reuse the stored filename so we land at the
+	// same path instead of creating a duplicate.
 	if existing != nil && existing.Filename != "" {
 		if reuse := sanitizeUploadFilename(existing.Filename); reuse != "" {
 			filename = reuse
@@ -1985,23 +2166,15 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("upload: chmod sample read-only", "error", err, "path", absPath)
 	}
 
-	// Insert (no-op if duplicate sha). Path uses forward slashes — hopper
-	// stores POSIX-style paths even on Windows, matching every other
-	// ingest source. The store context is detached from r.Context() so a
-	// client disconnect during DB retries doesn't orphan the on-disk file
-	// behind a missing row; matches handleResult's persistence model.
+	// Insert (sticky upsert; no-op on the bytes for a duplicate sha). The store
+	// context is detached from r.Context() so a client disconnect during DB
+	// retries doesn't orphan the on-disk file behind a missing row; matches
+	// handleResult's persistence model.
+	sample := uploadSample(sha, filename, filepath.ToSlash(relPath), written, prov)
 	storeCtx, cancelStore := context.WithTimeout(context.WithoutCancel(r.Context()), uploadStoreTimeout)
 	defer cancelStore()
 	if err := retryDBAccessNoValue(storeCtx, "upload sample insert", sha, func(ctx context.Context) error {
-		return s.db.InsertSample(ctx, &hopper.Sample{
-			SHA256:      sha,
-			Source:      "upload",
-			Filename:    filename,
-			Path:        filepath.ToSlash(relPath),
-			Label:       "unknown",
-			LabelSource: "upload",
-			SizeBytes:   written,
-		})
+		return s.db.InsertSample(ctx, sample)
 	}); err != nil {
 		s.progress.recordInsertFailure(1, err)
 		slog.Error("upload: insert sample", "sha256", sha, "error", err)
@@ -2012,7 +2185,7 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	//nolint:gosec // structured logging; filename sanitized, remote is r.RemoteAddr
 	slog.Info("upload accepted",
 		"sha256", sha, "size", written, "filename", filename,
-		"already_analyzed", alreadyAnalyzed, "remote", r.RemoteAddr)
+		"has_provenance", prov != nil, "already_analyzed", alreadyAnalyzed, "remote", r.RemoteAddr)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -2022,6 +2195,40 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		Size:            written,
 		AlreadyAnalyzed: alreadyAnalyzed,
 	})
+}
+
+// uploadSample builds the row for a stored upload. Source is always "upload"
+// (the trust-boundary marker, distinct from a co-located forager's trusted
+// "forager" direct-insert) and Label is always "unknown" — neither is taken
+// from the producer. When provenance is present, its scalar claims fill the
+// descriptive columns and the finalized sidecar is preserved verbatim in the
+// provenance JSONB.
+func uploadSample(sha, filename, relPath string, size int64, prov *hopper.Sidecar) *hopper.Sample {
+	sample := &hopper.Sample{
+		SHA256:      sha,
+		Source:      "upload",
+		Filename:    filename,
+		Path:        relPath,
+		Label:       "unknown",
+		LabelSource: "upload",
+		SizeBytes:   size,
+	}
+	if prov == nil {
+		return sample
+	}
+	if provJSON, err := json.Marshal(prov); err == nil {
+		sample.Provenance = provJSON
+	}
+	if !prov.Fetch.At.IsZero() {
+		at := prov.Fetch.At
+		sample.FetchedAt = &at
+	}
+	sample.URL = prov.Fetch.URL
+	sample.Ecosystem = prov.Package.Ecosystem
+	sample.Package = prov.Package.Name
+	sample.Version = prov.Package.Version
+	sample.Feed = prov.Package.Feed
+	return sample
 }
 
 // sweepUploadTmp removes orphaned upload temp files older than uploadTmpMaxAge.

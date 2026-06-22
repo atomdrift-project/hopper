@@ -1518,6 +1518,64 @@ func (db *DB) SampleBySHA256(ctx context.Context, sha256 string) (*Sample, error
 	return db.sampleBySHA256SQLite(ctx, sha256)
 }
 
+// KnownSHA256 returns the subset of the given digests that already have a
+// sample row. It is a deliberately minimal existence probe — a single
+// index-only scan of the unique sha256 key, hydrating no row data — so a bulk
+// producer (a remote forager) can skip transferring bytes hopper already holds.
+// Order is unspecified; treat the result as a set. Callers must bound the input
+// size; the API edge caps it.
+func (db *DB) KnownSHA256(ctx context.Context, shas []string) ([]string, error) {
+	if len(shas) == 0 {
+		return nil, nil
+	}
+	known := make([]string, 0, len(shas))
+
+	if db.pool != nil {
+		rows, err := db.pool.Query(ctx, `SELECT sha256 FROM samples WHERE sha256 = ANY($1)`, shas)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: known sha256: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var s string
+			if err := rows.Scan(&s); err != nil {
+				return nil, fmt.Errorf("hopper: known sha256 scan: %w", err)
+			}
+			known = append(known, s)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("hopper: known sha256 rows: %w", err)
+		}
+		return known, nil
+	}
+
+	// SQLite: an explicit placeholder list. The API edge bounds len(shas) well
+	// under SQLite's bound-parameter limit, so no chunking is needed.
+	placeholders := make([]string, len(shas))
+	args := make([]any, len(shas))
+	for i, s := range shas {
+		placeholders[i] = "?"
+		args[i] = s
+	}
+	//nolint:gosec // G202: the concatenated text is a fixed "?,?,…" placeholder list; the digests are bound parameters
+	rows, err := db.lite.QueryContext(ctx, `SELECT sha256 FROM samples WHERE sha256 IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: known sha256: %w", err)
+	}
+	defer func() { _ = rows.Close() }() //nolint:errcheck // best-effort close
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, fmt.Errorf("hopper: known sha256 scan: %w", err)
+		}
+		known = append(known, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("hopper: known sha256 rows: %w", err)
+	}
+	return known, nil
+}
+
 // KVGet reads a value from the internal hopper_kv table. Returns
 // ErrNotFound when the key is absent.
 func (db *DB) KVGet(ctx context.Context, key string) (string, error) {

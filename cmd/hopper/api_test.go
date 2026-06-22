@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -541,7 +543,12 @@ func TestCheckBrowserCSRF(t *testing.T) {
 		{"raw upload octet-stream", "same-origin", "application/octet-stream", true},
 		{"cross-site blocked", "cross-site", "application/octet-stream", false},
 		{"form-urlencoded blocked", "same-origin", "application/x-www-form-urlencoded", false},
-		{"multipart blocked", "same-origin", "multipart/form-data; boundary=xyz", false},
+		// multipart carries the provenance envelope from Bearer-authed clients
+		// (forager, prism backend); auth runs before this guard, so a browser
+		// form cannot reach the store. Same-origin multipart is allowed; a
+		// cross-site one is still blocked by the Sec-Fetch-Site check above.
+		{"multipart allowed (provenance upload)", "same-origin", "multipart/form-data; boundary=xyz", true},
+		{"multipart cross-site blocked", "cross-site", "multipart/form-data; boundary=xyz", false},
 		{"text/plain blocked (CORS simple)", "same-origin", "text/plain", false},
 		{"json allowed", "same-origin", "application/json", true},
 	}
@@ -831,3 +838,233 @@ func TestBootstrapUploadTokenReusesPersistedValue(t *testing.T) {
 // Silences "imported and not used" complaints if a previous test gets
 // trimmed; harmless when other tests reference io/os/filepath.
 var _ = io.EOF
+
+// uploadAPI builds an apiServer wired to a real sqlite DB and a fresh data
+// root, with the upload token configured, for exercising the full store path.
+func uploadAPI(t *testing.T) *apiServer {
+	t.Helper()
+	db, err := hopper.Open(context.Background(), filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	if err := db.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	api := &apiServer{tracker: newWorkerTracker(), dataRoot: t.TempDir(), db: db}
+	if err := api.setUploadToken("test-token-with-32-chars-or-more!!"); err != nil {
+		t.Fatalf("setUploadToken: %v", err)
+	}
+	return api
+}
+
+// multipartUpload encodes a provenance+file body. provFirst=false puts the file
+// part before the provenance part to exercise the ordering guard.
+func multipartUpload(t *testing.T, prov []byte, file []byte, provFirst bool) (body *bytes.Buffer, contentType string) {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	write := func(name string, data []byte) {
+		p, err := mw.CreateFormField(name)
+		if err != nil {
+			t.Fatalf("create part %s: %v", name, err)
+		}
+		if _, err := p.Write(data); err != nil {
+			t.Fatalf("write part %s: %v", name, err)
+		}
+	}
+	if provFirst {
+		write("provenance", prov)
+		write("file", file)
+	} else {
+		write("file", file)
+		write("provenance", prov)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	return &buf, mw.FormDataContentType()
+}
+
+func validProvenance(t *testing.T, file []byte, claimedSHA string) []byte {
+	t.Helper()
+	sc := hopper.Sidecar{
+		SchemaVersion: hopper.SidecarSchemaVersion,
+		Artifact:      hopper.Artifact{Filename: "evil-1.0.0.tgz", SHA256: claimedSHA, SizeBytes: int64(len(file))},
+		Package:       hopper.PackageRef{Ecosystem: "npm", Name: "evil", Version: "1.0.0", Feed: "npm"},
+		Fetch: hopper.Fetch{
+			Collector: "forager+test", Category: "new", At: time.Now().UTC(),
+			URL: "https://registry.npmjs.org/evil/-/evil-1.0.0.tgz",
+		},
+	}
+	b, err := json.Marshal(&sc)
+	if err != nil {
+		t.Fatalf("marshal provenance: %v", err)
+	}
+	return b
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return b
+}
+
+func postUpload(t *testing.T, api *apiServer, body *bytes.Buffer, contentType string) *httptest.ResponseRecorder {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodPost, "/api/upload", body)
+	r.Header.Set("Authorization", "Bearer test-token-with-32-chars-or-more!!")
+	r.Header.Set("Content-Type", contentType)
+	w := httptest.NewRecorder()
+	api.handleUpload(w, r)
+	return w
+}
+
+func TestHandleUploadMultipartEnrichesRow(t *testing.T) {
+	t.Parallel()
+	api := uploadAPI(t)
+	file := []byte("malicious package bytes")
+	sum := sha256.Sum256(file)
+	sha := hex.EncodeToString(sum[:])
+
+	body, ct := multipartUpload(t, validProvenance(t, file, sha), file, true)
+	w := postUpload(t, api, body, ct)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s want 200", w.Code, w.Body.String())
+	}
+
+	got, err := api.db.SampleBySHA256(context.Background(), sha)
+	if err != nil {
+		t.Fatalf("SampleBySHA256: %v", err)
+	}
+	// Trust boundary: the producer's claims fill descriptive columns, but
+	// Source marks the upload boundary and Label is never taken from the claim.
+	if got.Source != "upload" {
+		t.Errorf("Source = %q, want upload", got.Source)
+	}
+	if got.Label != "unknown" {
+		t.Errorf("Label = %q, want unknown (claim must not set label)", got.Label)
+	}
+	if got.Ecosystem != "npm" || got.Package != "evil" || got.Version != "1.0.0" || got.Feed != "npm" {
+		t.Errorf("descriptive columns not populated from provenance: %+v", got)
+	}
+	if got.URL != "https://registry.npmjs.org/evil/-/evil-1.0.0.tgz" {
+		t.Errorf("URL = %q, want the provenance fetch URL", got.URL)
+	}
+	if !strings.HasPrefix(got.Path, "unknown/uploads/") {
+		t.Errorf("Path = %q, want hopper-controlled shard under unknown/uploads/", got.Path)
+	}
+}
+
+func TestHandleKnown(t *testing.T) {
+	t.Parallel()
+	api := uploadAPI(t)
+	ctx := context.Background()
+
+	have := []string{strings.Repeat("a", 64), strings.Repeat("b", 64)}
+	for i, sha := range have {
+		if err := api.db.InsertSample(ctx, &hopper.Sample{
+			SHA256: sha, Source: "test", Path: "test/" + strconv.Itoa(i), Label: "unknown",
+		}); err != nil {
+			t.Fatalf("insert %s: %v", sha, err)
+		}
+	}
+	missing := strings.Repeat("c", 64)
+
+	reqBody := mustJSON(t, knownRequest{SHA256: append(append([]string{}, have...), missing, "NOT-HEX")})
+	r := httptest.NewRequest(http.MethodPost, "/api/known", bytes.NewReader(reqBody))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	api.handleKnown(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s want 200", w.Code, w.Body.String())
+	}
+
+	var resp knownResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	gotKnown := map[string]bool{}
+	for _, s := range resp.Known {
+		gotKnown[s] = true
+	}
+	if !gotKnown[have[0]] || !gotKnown[have[1]] {
+		t.Errorf("known = %v, want both inserted digests", resp.Known)
+	}
+	if gotKnown[missing] {
+		t.Errorf("known includes the absent digest %s", missing)
+	}
+	if len(resp.Known) != 2 {
+		t.Errorf("known has %d entries, want 2 (malformed entry must be dropped)", len(resp.Known))
+	}
+}
+
+func TestHandleKnownBatchCap(t *testing.T) {
+	t.Parallel()
+	api := uploadAPI(t)
+	shas := make([]string, maxKnownBatch+1)
+	for i := range shas {
+		shas[i] = strings.Repeat("a", 64)
+	}
+	reqBody := mustJSON(t, knownRequest{SHA256: shas})
+	r := httptest.NewRequest(http.MethodPost, "/api/known", bytes.NewReader(reqBody))
+	w := httptest.NewRecorder()
+	api.handleKnown(w, r)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("code=%d want 413 for oversized batch", w.Code)
+	}
+}
+
+func TestHandleUploadMultipartRejections(t *testing.T) {
+	t.Parallel()
+	file := []byte("some bytes")
+	sum := sha256.Sum256(file)
+	sha := hex.EncodeToString(sum[:])
+
+	t.Run("sha mismatch", func(t *testing.T) {
+		t.Parallel()
+		api := uploadAPI(t)
+		wrong := strings.Repeat("0", 64)
+		body, ct := multipartUpload(t, validProvenance(t, file, wrong), file, true)
+		if w := postUpload(t, api, body, ct); w.Code != http.StatusBadRequest {
+			t.Errorf("code=%d body=%s want 400", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("file before provenance", func(t *testing.T) {
+		t.Parallel()
+		api := uploadAPI(t)
+		body, ct := multipartUpload(t, validProvenance(t, file, sha), file, false)
+		if w := postUpload(t, api, body, ct); w.Code != http.StatusBadRequest {
+			t.Errorf("code=%d body=%s want 400", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("invalid provenance json", func(t *testing.T) {
+		t.Parallel()
+		api := uploadAPI(t)
+		body, ct := multipartUpload(t, []byte("{not json"), file, true)
+		if w := postUpload(t, api, body, ct); w.Code != http.StatusBadRequest {
+			t.Errorf("code=%d body=%s want 400", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("missing required field", func(t *testing.T) {
+		t.Parallel()
+		api := uploadAPI(t)
+		// Valid JSON, valid sha, but no collector — Validate must reject.
+		sc := hopper.Sidecar{
+			SchemaVersion: hopper.SidecarSchemaVersion,
+			Artifact:      hopper.Artifact{Filename: "x.tgz", SHA256: sha},
+			Fetch:         hopper.Fetch{Category: "new", At: time.Now().UTC()},
+		}
+		prov := mustJSON(t, &sc)
+		body, ct := multipartUpload(t, prov, file, true)
+		if w := postUpload(t, api, body, ct); w.Code != http.StatusBadRequest {
+			t.Errorf("code=%d body=%s want 400", w.Code, w.Body.String())
+		}
+	})
+}
