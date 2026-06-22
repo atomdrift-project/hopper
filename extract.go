@@ -226,6 +226,70 @@ func streamCompressedTar(src io.ReaderAt, size int64, comp, member string, maxBy
 	return streamTarMember(dr, member, maxBytes, setLen, w)
 }
 
+// tarCompression maps a compressed-tar fileType to the codec newDecompressor
+// understands, reporting false for anything that is not a compressed tar (plain
+// tar, zip, 7z, rpm, deb, …). It is the single source of truth for "is this a
+// container whose members all sit behind one non-seekable decompression pass",
+// which is exactly the set worth caching once instead of per member.
+func tarCompression(fileType string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(fileType)) {
+	case "tar.gz", "tgz", "gz", "crate":
+		return "gz", true
+	case "tar.xz", "txz", "xz":
+		return "xz", true
+	case "tar.zst", "tzst", "zst":
+		return "zst", true
+	case "tar.bz2", "tbz2", "tbz", "bz2":
+		return "bz2", true
+	}
+	return "", false
+}
+
+// IsCompressedTar reports whether fileType names a tar wrapped in a whole-stream
+// codec (tar.gz/tar.xz/tar.zst/tar.bz2 and their aliases). Such archives are not
+// seekable, so extracting member K re-runs the decompressor from byte 0 — the
+// motivation for caching the decompressed tar. Plain "tar", zip, 7z, rpm and deb
+// return false: they are already random-access or decode by a different path.
+func IsCompressedTar(fileType string) bool {
+	_, ok := tarCompression(fileType)
+	return ok
+}
+
+// DecompressTar streams the decompressed tar bytes of a compressed-tar archive
+// (see IsCompressedTar) to dst, returning the number of bytes written. This is
+// the one-time cost the member-extraction cache pays per parent: afterwards the
+// resulting tar is seekable on disk, so many members are served without ever
+// re-running the (CPU-bound, non-seekable) decompressor. The output is capped at
+// maxBytes — a parent whose decompressed tar would exceed it returns
+// ErrArchiveMemberTooLarge so the caller can fall back to direct streaming
+// rather than blow the cache's disk budget on one archive. A negative maxBytes
+// disables the cap. Memory stays bounded to the decompressor's working set
+// because dst is written incrementally.
+func DecompressTar(src io.ReaderAt, size int64, fileType string, maxBytes int64, dst io.Writer) (int64, error) {
+	comp, ok := tarCompression(fileType)
+	if !ok {
+		return 0, fmt.Errorf("%w: %s (not a compressed tar)", ErrUnsupportedArchive, fileType)
+	}
+	dr, closeFn, err := newDecompressor(comp, io.NewSectionReader(src, 0, size))
+	if err != nil {
+		return 0, err
+	}
+	defer closeFn()
+	if maxBytes < 0 {
+		return io.Copy(dst, dr)
+	}
+	// Copy one byte past the cap so an exactly-cap archive passes and a larger one
+	// is caught without reading it all into memory.
+	n, err := io.Copy(dst, io.LimitReader(dr, maxBytes+1))
+	if err != nil {
+		return n, err
+	}
+	if n > maxBytes {
+		return n, fmt.Errorf("%w (decompressed >%d bytes)", ErrArchiveMemberTooLarge, maxBytes)
+	}
+	return n, nil
+}
+
 // newDecompressor wraps r in a streaming decompressor for comp. The returned
 // closeFn releases the decompressor's resources and must always be called.
 func newDecompressor(comp string, r io.Reader) (io.Reader, func(), error) {

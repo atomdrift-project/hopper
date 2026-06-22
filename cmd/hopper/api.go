@@ -44,6 +44,10 @@ type apiServer struct {
 	// unbounded burst of /api/file requests for members would otherwise pile up
 	// CPU and scratch space. nil disables the limit (e.g. in tests).
 	extractSem chan struct{}
+	// extractCache holds decompressed compressed-tar parents so the members of
+	// one archive are decompressed once, not once per request. nil disables it,
+	// in which case every member streams through a fresh decompressor.
+	extractCache *extractCache
 	// traitsVersion holds the short prefix of the current traits repo
 	// commit. Stored in an atomic.Pointer so the periodic rules-update
 	// goroutine can refresh it concurrently with read traffic from
@@ -2319,10 +2323,39 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 		return
 	}
 
-	// Bound concurrent extractions: a burst of member requests could otherwise
-	// run many decompressors and spool many intermediate archives to disk at
-	// once. Acquired here (not earlier) so the cheap parent lookup and path
-	// checks above don't hold a slot while blocking.
+	w.Header().Set("Content-Type", "application/octet-stream")
+
+	// Compressed tars (tar.xz/tar.zst/tar.gz/tar.bz2) are not seekable, so
+	// extracting member K re-runs the whole decompressor from byte 0 — O(N×M) for
+	// N members of an M-byte archive. Serve them through the cache: the first
+	// member decompresses the parent once (holding an extraction slot for just
+	// that work), and every later member streams off the resulting seekable tar
+	// with no slot contention. A disabled or over-budget cache falls through to
+	// direct streaming below.
+	if hopper.IsCompressedTar(parent.FileType) {
+		ct, cerr := s.extractCache.readerAt(ctx, parent.SHA256, f, stat.Size(), parent.FileType)
+		switch {
+		case cerr == nil:
+			defer ct.done()
+			streamMember(ctx, w, ct.r, ct.size, "tar", innerPath, sha, parent)
+			return
+		case errors.Is(cerr, errCacheDisabled), errors.Is(cerr, errCacheTooLarge):
+			// Fall through to direct streaming.
+		case errors.Is(cerr, context.Canceled), errors.Is(cerr, context.DeadlineExceeded):
+			writeRetryable(w, retryAfterBusy, `{"error":"busy: extraction slots exhausted"}`)
+			return
+		default:
+			// The one-time decompression failed: a corrupt or unsupported codec
+			// stream. Map it like any other extraction failure.
+			writeExtractError(ctx, w, cerr, innerPath, sha, parent)
+			return
+		}
+	}
+
+	// Direct path: plain tar, zip, 7z, rpm, deb, or a compressed tar too large to
+	// cache. Bound concurrency with an extraction slot — acquired here (not
+	// earlier) so the cheap parent lookup and path checks above don't hold one
+	// while blocking.
 	if err := s.acquireExtract(ctx); err != nil {
 		writeRetryable(w, retryAfterBusy, `{"error":"busy: extraction slots exhausted"}`)
 		return
@@ -2330,63 +2363,73 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 	defer s.releaseExtract()
 
 	// Stream the single member straight from disk to the socket: zip uses the
-	// file as random-access (only the central directory plus the member's
-	// working set are resident), stored entries copy via sendfile(2). The whole
-	// parent archive — which can be multiple GB — is never read into memory.
-	// setLen sets Content-Length just before the first byte; on a pre-write
-	// error nothing has been written so the status code below is still honoured.
-	w.Header().Set("Content-Type", "application/octet-stream")
-	err = hopper.StreamArchiveMember(f, stat.Size(), parent.FileType, innerPath, archiveMemberMaxBytes,
+	// file as random-access (only the central directory plus the member's working
+	// set are resident), stored entries copy via sendfile(2). The whole parent
+	// archive — which can be multiple GB — is never read into memory.
+	streamMember(ctx, w, f, stat.Size(), parent.FileType, innerPath, sha, parent)
+}
+
+// streamMember writes the member at innerPath out of the archive (src, size,
+// fileType) to w, translating any extraction failure to a status code. setLen
+// fires once with the leaf size just before the first byte, so a pre-write error
+// leaves the response status free for writeExtractError to set.
+func streamMember(ctx context.Context, w http.ResponseWriter, src io.ReaderAt, size int64, fileType, innerPath, sha string, parent *hopper.Sample) {
+	err := hopper.StreamArchiveMember(src, size, fileType, innerPath, archiveMemberMaxBytes,
 		func(n int64) { w.Header().Set("Content-Length", strconv.FormatInt(n, 10)) }, w)
 	if err != nil {
-		switch {
-		case errors.Is(err, hopper.ErrArchiveMemberNotFound):
-			http.Error(w, `{"error":"not found in archive"}`, http.StatusNotFound)
-		case errors.Is(err, hopper.ErrArchiveMemberTooLarge):
-			//nolint:gosec // sha256 validated by validSHA256
-			slog.Info("archive-member over size cap",
-				"sha256", sha, "parent_sha", parent.SHA256, "parent_type", parent.FileType,
-				"inner_path", innerPath, "cap_bytes", archiveMemberMaxBytes)
-			http.Error(w, `{"error":"file too large"}`, http.StatusRequestEntityTooLarge)
-		case errors.Is(err, hopper.ErrArchiveEncrypted):
-			http.Error(w, `{"error":"encrypted archive: could not decrypt with known passwords"}`, http.StatusUnprocessableEntity)
-		case errors.Is(err, hopper.ErrUnsupportedArchive):
-			// Log the container type so the coverage gap is visible: which
-			// parent/nested archive formats workers want but hopper can't serve.
-			//nolint:gosec // sha256 validated by validSHA256
-			slog.Info("archive-member unsupported container",
-				"sha256", sha, "parent_sha", parent.SHA256, "parent_type", parent.FileType,
-				"inner_path", innerPath, "error", err)
-			http.Error(w, `{"error":"unsupported archive type"}`, http.StatusUnsupportedMediaType)
-		case isClientGone(ctx, err):
-			// The client closed the connection mid-stream (broken pipe / reset)
-			// or its request context expired. Not a server fault, and bytes may
-			// already be on the wire, so there is no status to set — just log it
-			// quietly so it stays out of the 5xx error budget.
-			//nolint:gosec // sha256 validated by validSHA256
-			slog.Debug("archive-member request abandoned by client",
-				"sha256", sha, "parent_sha", parent.SHA256, "error", err)
-		case hopper.IsCorruptArchive(err):
-			//nolint:gosec // sha256 validated by validSHA256
-			slog.Info("archive-member extraction: corrupt archive",
-				"sha256", sha, "parent_sha", parent.SHA256, "error", err)
-			http.Error(w, `{"error":"corrupt archive"}`, http.StatusUnprocessableEntity)
-		default:
-			// The parent is open and readable (checked above), so a remaining
-			// extraction failure is a property of the archive data — a corrupt
-			// codec stream IsCorruptArchive doesn't have a typed sentinel for
-			// (zstd/xz/lzma/7z/crx/rpm/deb), a truncated member, etc. Permanent,
-			// so 422 (not a retryable 5xx): the client must not loop on a
-			// fundamentally unextractable member. Logged at Warn because a spike
-			// here can also mean a genuine new gap worth investigating.
-			//nolint:gosec // sha256 validated by validSHA256
-			slog.Warn("archive-member extraction failed (treated as permanent)",
-				"sha256", sha, "parent_sha", parent.SHA256, "error", err)
-			// Headers may already be sent if the failure was mid-stream; in that
-			// case http.Error's WriteHeader is a no-op and only logs.
-			http.Error(w, `{"error":"extraction failed"}`, http.StatusUnprocessableEntity)
-		}
-		return
+		writeExtractError(ctx, w, err, innerPath, sha, parent)
+	}
+}
+
+// writeExtractError maps an archive-extraction failure to an HTTP status and
+// logs it. Shared by the cached and direct member-serving paths.
+func writeExtractError(ctx context.Context, w http.ResponseWriter, err error, innerPath, sha string, parent *hopper.Sample) {
+	switch {
+	case errors.Is(err, hopper.ErrArchiveMemberNotFound):
+		http.Error(w, `{"error":"not found in archive"}`, http.StatusNotFound)
+	case errors.Is(err, hopper.ErrArchiveMemberTooLarge):
+		//nolint:gosec // sha256 validated by validSHA256
+		slog.Info("archive-member over size cap",
+			"sha256", sha, "parent_sha", parent.SHA256, "parent_type", parent.FileType,
+			"inner_path", innerPath, "cap_bytes", archiveMemberMaxBytes)
+		http.Error(w, `{"error":"file too large"}`, http.StatusRequestEntityTooLarge)
+	case errors.Is(err, hopper.ErrArchiveEncrypted):
+		http.Error(w, `{"error":"encrypted archive: could not decrypt with known passwords"}`, http.StatusUnprocessableEntity)
+	case errors.Is(err, hopper.ErrUnsupportedArchive):
+		// Log the container type so the coverage gap is visible: which
+		// parent/nested archive formats workers want but hopper can't serve.
+		//nolint:gosec // sha256 validated by validSHA256
+		slog.Info("archive-member unsupported container",
+			"sha256", sha, "parent_sha", parent.SHA256, "parent_type", parent.FileType,
+			"inner_path", innerPath, "error", err)
+		http.Error(w, `{"error":"unsupported archive type"}`, http.StatusUnsupportedMediaType)
+	case isClientGone(ctx, err):
+		// The client closed the connection mid-stream (broken pipe / reset) or its
+		// request context expired. Not a server fault, and bytes may already be on
+		// the wire, so there is no status to set — just log it quietly so it stays
+		// out of the 5xx error budget.
+		//nolint:gosec // sha256 validated by validSHA256
+		slog.Debug("archive-member request abandoned by client",
+			"sha256", sha, "parent_sha", parent.SHA256, "error", err)
+	case hopper.IsCorruptArchive(err):
+		//nolint:gosec // sha256 validated by validSHA256
+		slog.Info("archive-member extraction: corrupt archive",
+			"sha256", sha, "parent_sha", parent.SHA256, "error", err)
+		http.Error(w, `{"error":"corrupt archive"}`, http.StatusUnprocessableEntity)
+	default:
+		// The parent is open and readable (checked above), so a remaining
+		// extraction failure is a property of the archive data — a corrupt codec
+		// stream IsCorruptArchive doesn't have a typed sentinel for
+		// (zstd/xz/lzma/7z/crx/rpm/deb), a truncated member, etc. Permanent, so
+		// 422 (not a retryable 5xx): the client must not loop on a fundamentally
+		// unextractable member. Logged at Warn because a spike here can also mean a
+		// genuine new gap worth investigating.
+		//nolint:gosec // sha256 validated by validSHA256
+		slog.Warn("archive-member extraction failed (treated as permanent)",
+			"sha256", sha, "parent_sha", parent.SHA256, "error", err)
+		// Headers may already be sent if the failure was mid-stream; in that case
+		// http.Error's WriteHeader is a no-op and only logs.
+		http.Error(w, `{"error":"extraction failed"}`, http.StatusUnprocessableEntity)
 	}
 }
 

@@ -10,7 +10,98 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/ulikunitz/xz"
 )
+
+func TestIsCompressedTar(t *testing.T) {
+	compressed := []string{"tar.gz", "tgz", "tar.xz", "txz", "tar.zst", "tar.bz2", "TAR.XZ", " tar.gz "}
+	for _, ft := range compressed {
+		if !IsCompressedTar(ft) {
+			t.Errorf("IsCompressedTar(%q) = false, want true", ft)
+		}
+	}
+	for _, ft := range []string{"tar", "zip", "7z", "rpm", "deb", "jar", ""} {
+		if IsCompressedTar(ft) {
+			t.Errorf("IsCompressedTar(%q) = true, want false", ft)
+		}
+	}
+}
+
+// xzTar builds a tar of contents wrapped in xz — the non-seekable shape the
+// extract cache exists to decompress once.
+func xzTar(t *testing.T, contents map[string]string) []byte {
+	t.Helper()
+	var raw bytes.Buffer
+	tw := tar.NewWriter(&raw)
+	for name, body := range contents {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Size: int64(len(body)), Mode: 0o644}); err != nil {
+			t.Fatalf("tar header %q: %v", name, err)
+		}
+		if _, err := tw.Write([]byte(body)); err != nil {
+			t.Fatalf("tar write %q: %v", name, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar close: %v", err)
+	}
+	var out bytes.Buffer
+	xw, err := xz.NewWriter(&out)
+	if err != nil {
+		t.Fatalf("xz writer: %v", err)
+	}
+	if _, err := xw.Write(raw.Bytes()); err != nil {
+		t.Fatalf("xz write: %v", err)
+	}
+	if err := xw.Close(); err != nil {
+		t.Fatalf("xz close: %v", err)
+	}
+	return out.Bytes()
+}
+
+func TestDecompressTar(t *testing.T) {
+	contents := map[string]string{
+		"a/first.txt":  "hello\n",
+		"a/second.txt": "world\n",
+	}
+	archive := xzTar(t, contents)
+	src := bytes.NewReader(archive)
+
+	var out bytes.Buffer
+	n, err := DecompressTar(src, int64(len(archive)), "tar.xz", -1, &out)
+	if err != nil {
+		t.Fatalf("DecompressTar: %v", err)
+	}
+	if n != int64(out.Len()) {
+		t.Fatalf("returned n=%d but wrote %d bytes", n, out.Len())
+	}
+	// The decompressed bytes are a plain tar: every member must extract from it.
+	for name, body := range contents {
+		got, err := ExtractFromArchive(out.Bytes(), "tar", name, 1<<20)
+		if err != nil {
+			t.Fatalf("extract %q from decompressed tar: %v", name, err)
+		}
+		if string(got) != body {
+			t.Errorf("%q = %q, want %q", name, got, body)
+		}
+	}
+}
+
+func TestDecompressTarRejectsNonCompressedTar(t *testing.T) {
+	if _, err := DecompressTar(bytes.NewReader([]byte("PK\x03\x04")), 4, "zip", -1, io.Discard); !errors.Is(err, ErrUnsupportedArchive) {
+		t.Errorf("DecompressTar(zip) = %v, want ErrUnsupportedArchive", err)
+	}
+}
+
+func TestDecompressTarEnforcesCap(t *testing.T) {
+	archive := xzTar(t, map[string]string{"big.txt": "0123456789ABCDEF"})
+	// The decompressed tar is at least 512 (header) + 16 (body) bytes; a tiny cap
+	// must trip ErrArchiveMemberTooLarge so the caller falls back to streaming.
+	_, err := DecompressTar(bytes.NewReader(archive), int64(len(archive)), "tar.xz", 8, io.Discard)
+	if !errors.Is(err, ErrArchiveMemberTooLarge) {
+		t.Errorf("DecompressTar with small cap = %v, want ErrArchiveMemberTooLarge", err)
+	}
+}
 
 func TestPathInsideArchive(t *testing.T) {
 	cases := map[string]string{

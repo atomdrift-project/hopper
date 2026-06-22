@@ -279,6 +279,33 @@ func localListenAddr(addr string) string {
 	return addr
 }
 
+// Extract-cache disk budget defaults. The total is a soft ceiling on cached
+// decompressed tars across all parents; perEntry caps a single one so one giant
+// image can't consume the whole budget (it falls back to direct streaming).
+// Operators override both with HOPPER_EXTRACT_CACHE_BYTES /
+// HOPPER_EXTRACT_CACHE_MAX_ENTRY_BYTES; setting the total to 0 disables caching.
+const (
+	defaultExtractCacheBytes      = 16 << 30 // 16 GiB total
+	defaultExtractCacheEntryBytes = 4 << 30  // 4 GiB per archive
+)
+
+// envBytes reads a non-negative byte count from env, falling back to def when
+// unset, empty, or unparseable. A negative value also falls back to def, so the
+// only way to disable a budget is an explicit 0.
+func envBytes(name string, def int64) int64 {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		//nolint:gosec // name/v are operator-supplied env config, not request data
+		slog.Warn("ignoring invalid byte-count env var; using default", "var", name, "value", v, "default", def)
+		return def
+	}
+	return n
+}
+
 func relativeSamplePath(dataRoot, path string) string {
 	if dataRoot == "" || path == "" || !filepath.IsAbs(path) {
 		return path
@@ -1233,6 +1260,26 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 			slog.Warn("nested-archive spool dir unavailable; using default temp (may be tmpfs)", "dir", spool, "error", err)
 		} else {
 			hopper.NestedSpoolDir = spool
+		}
+	}
+
+	// Decompressed-parent cache: compressed-tar archives (tar.xz/zst/gz/bz2) are
+	// not seekable, so without it every member fetch re-runs the whole
+	// decompressor — the O(N×M) cost that exhausts extraction slots and times
+	// clients out under a many-member workload. Cache the decompressed tar on the
+	// data volume, keyed by parent SHA, so members decompress once. The build
+	// holds an extraction slot; cache hits do not. Budget is operator-tunable;
+	// zero disables it.
+	if *dataDir != "" {
+		total := envBytes("HOPPER_EXTRACT_CACHE_BYTES", defaultExtractCacheBytes)
+		perEntry := envBytes("HOPPER_EXTRACT_CACHE_MAX_ENTRY_BYTES", defaultExtractCacheEntryBytes)
+		cacheDir := filepath.Join(*dataDir, uploadDir, ".extract-cache")
+		if ec, err := newExtractCache(cacheDir, total, perEntry, api.acquireExtract, api.releaseExtract); err != nil {
+			slog.Warn("extract cache disabled; archive members will decompress per request", "dir", cacheDir, "error", err)
+		} else if ec != nil {
+			api.extractCache = ec
+			defer ec.close()
+			slog.Info("extract cache enabled", "dir", cacheDir, "budget_bytes", total, "max_entry_bytes", perEntry)
 		}
 	}
 
