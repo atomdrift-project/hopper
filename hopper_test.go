@@ -4326,3 +4326,81 @@ func TestUpdateEcosystem(t *testing.T) {
 		t.Fatalf("UpdateEcosystems(nil) = %d, %v; want 0, nil", n, err)
 	}
 }
+
+// TestTriagePerFileType verifies that the per-dataset limit applies per
+// file_type, not globally: with a limit of 2 and two file types present, each
+// type contributes up to 2 rows (4 total), where a flat global LIMIT would
+// return only 2.
+func TestTriagePerFileType(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	var n int
+	// analyze inserts a top-level sample with the given label, then records a
+	// cleave result whose single trait sets file_type and max_crit. level<5
+	// with one trait => max_crit<5 && suspicious_count<2 (a "bad" miss); level>=5
+	// => flagged (a "good"/"new" hit).
+	analyze := func(label, fileType string, level int) {
+		n++
+		sha := fmt.Sprintf("%064x", n)
+		mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test", Label: label, LabelSource: "test"})
+		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":%q,"x":0,"dp":0,"ts":[{"l":%d}]}]}`, sha, fileType, level)
+		if err := db.UpdateCleaveResult(ctx, sha, result, nil, ""); err != nil {
+			t.Fatalf("UpdateCleaveResult: %v", err)
+		}
+	}
+
+	counts := func(samples []*Sample) map[string]int {
+		m := map[string]int{}
+		for _, s := range samples {
+			m[s.FileType]++
+		}
+		return m
+	}
+
+	// bad misses: 3 apk + 2 deb; good/new hits mirror the structure so all three
+	// datasets exercise the same per-type cap.
+	for i := 0; i < 3; i++ {
+		analyze("bad", "apk", 1)
+		analyze("good", "apk", 5)
+		analyze("unknown", "apk", 5)
+	}
+	for i := 0; i < 2; i++ {
+		analyze("bad", "deb", 1)
+		analyze("good", "deb", 5)
+		analyze("unknown", "deb", 5)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		fetch func(context.Context, int, TriageFilter) ([]*Sample, error)
+	}{
+		{"bad", db.TriageBad},
+		{"good", db.TriageGood},
+		{"new", db.TriageNew},
+	} {
+		got, err := tc.fetch(ctx, 2, TriageFilter{})
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		c := counts(got)
+		if c["apk"] != 2 {
+			t.Errorf("%s: apk = %d, want 2 (capped per file type)", tc.name, c["apk"])
+		}
+		if c["deb"] != 2 {
+			t.Errorf("%s: deb = %d, want 2", tc.name, c["deb"])
+		}
+		if len(got) != 4 {
+			t.Errorf("%s: total = %d, want 4", tc.name, len(got))
+		}
+	}
+
+	// The file-type filter still narrows to a single type, capped by the limit.
+	got, err := db.TriageBad(ctx, 2, TriageFilter{FileType: "apk"})
+	if err != nil {
+		t.Fatalf("TriageBad(apk): %v", err)
+	}
+	if c := counts(got); c["apk"] != 2 || len(got) != 2 {
+		t.Errorf("TriageBad(apk) = %v (len %d), want only 2 apk", c, len(got))
+	}
+}

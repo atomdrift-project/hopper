@@ -1831,10 +1831,14 @@ func (db *DB) triageBadSQLite(ctx context.Context, limit int, f TriageFilter) ([
 	args = append(args, limit)
 	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleCols+` FROM samples
-		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = ''
-		   AND max_crit < 5 AND suspicious_count < 2`+extra+`
-		 ORDER BY analyzed_at DESC LIMIT ?`,
+		`SELECT `+liteSampleCols+` FROM (
+		     SELECT `+liteSampleCols+`,
+		            row_number() OVER (PARTITION BY file_type ORDER BY analyzed_at DESC) AS triage_rn
+		       FROM samples
+		      WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = ''
+		        AND max_crit < 5 AND suspicious_count < 2`+extra+`
+		 ) t WHERE triage_rn <= ?
+		 ORDER BY file_type, analyzed_at DESC`,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage bad: %w", err)
@@ -1847,10 +1851,14 @@ func (db *DB) triageGoodSQLite(ctx context.Context, limit int, f TriageFilter) (
 	args = append(args, limit)
 	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleCols+` FROM samples
-		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = ''
-		   AND (max_crit >= 5 OR suspicious_count >= 2)`+extra+`
-		 ORDER BY analyzed_at DESC LIMIT ?`,
+		`SELECT `+liteSampleCols+` FROM (
+		     SELECT `+liteSampleCols+`,
+		            row_number() OVER (PARTITION BY file_type ORDER BY analyzed_at DESC) AS triage_rn
+		       FROM samples
+		      WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = ''
+		        AND (max_crit >= 5 OR suspicious_count >= 2)`+extra+`
+		 ) t WHERE triage_rn <= ?
+		 ORDER BY file_type, analyzed_at DESC`,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage good: %w", err)
@@ -1863,10 +1871,14 @@ func (db *DB) triageNewSQLite(ctx context.Context, limit int, f TriageFilter) ([
 	args = append(args, limit)
 	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleCols+` FROM samples
-		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = ''
-		   AND (max_crit >= 5 OR suspicious_count >= 2)`+extra+`
-		 ORDER BY analyzed_at DESC LIMIT ?`,
+		`SELECT `+liteSampleCols+` FROM (
+		     SELECT `+liteSampleCols+`,
+		            row_number() OVER (PARTITION BY file_type ORDER BY analyzed_at DESC) AS triage_rn
+		       FROM samples
+		      WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = ''
+		        AND (max_crit >= 5 OR suspicious_count >= 2)`+extra+`
+		 ) t WHERE triage_rn <= ?
+		 ORDER BY file_type, analyzed_at DESC`,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage new: %w", err)

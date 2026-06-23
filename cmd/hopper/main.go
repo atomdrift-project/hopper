@@ -3386,7 +3386,7 @@ func sampleAgeDays(ts *time.Time) string {
 func cmdTriage(ctx context.Context) error {
 	f := flag.NewFlagSet("triage", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
-	count := f.Int("count", 100, "maximum rows per dataset")
+	count := f.Int("count", 40, "maximum rows per file type (per dataset)")
 	baseURL := f.String("url", "http://127.0.0.1:8081", "hopper API base URL")
 	out := f.String("out", "/var/tmp/hopper-triage", "output root directory")
 	ecosystem := f.String("ecosystem", "", "filter by ecosystem (e.g. wolfi, archlinux)")
