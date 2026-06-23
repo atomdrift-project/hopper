@@ -70,7 +70,11 @@ type PackageRef struct {
 	Ecosystem string `json:"ecosystem,omitempty"`
 	Name      string `json:"name,omitempty"`
 	Version   string `json:"version,omitempty"`
-	Feed      string `json:"feed,omitempty"` // discovery channel, e.g. "npm", "aikido"
+	// PURL is the full versioned canonical Package URL (e.g.
+	// "pkg:npm/lodash@4.17.21"), empty for ecosystems without a defined PURL
+	// type. Its version-less form is projected into the samples.purl_base column.
+	PURL string `json:"purl,omitempty"`
+	Feed string `json:"feed,omitempty"` // discovery channel, e.g. "npm", "aikido"
 }
 
 // Artifact describes the saved bytes and the producer's own measurement of
