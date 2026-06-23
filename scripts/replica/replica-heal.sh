@@ -290,7 +290,7 @@ fi
 
 # Apply the heal DDL with a bounded lock wait. ADD COLUMN (nullable / non-volatile
 # default) and ALTER COLUMN ... DROP EXPRESSION are both metadata-only fast ops.
-printf 'SET lock_timeout = %s;\n%s' "$HEAL_LOCK_TIMEOUT" "$heal_ddl" \
+printf "SET lock_timeout = '%s';\n%s" "$HEAL_LOCK_TIMEOUT" "$heal_ddl" \
     | admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
     || { alert warn "failed to apply heal DDL on '$LOCAL_DB' (lock contention or bad type?); subscription left DISABLED. DDL targeted:$heal_names"; exit 1; }
 
