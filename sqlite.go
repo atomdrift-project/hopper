@@ -274,6 +274,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		{"domain", `ALTER TABLE samples ADD COLUMN domain TEXT NOT NULL DEFAULT ''`},
 		{"package", `ALTER TABLE samples ADD COLUMN package TEXT NOT NULL DEFAULT ''`},
 		{"version", `ALTER TABLE samples ADD COLUMN version TEXT NOT NULL DEFAULT ''`},
+		{"purl_base", `ALTER TABLE samples ADD COLUMN purl_base TEXT NOT NULL DEFAULT ''`},
 		{"provenance", `ALTER TABLE samples ADD COLUMN provenance TEXT`},
 		{"fetched_at", `ALTER TABLE samples ADD COLUMN fetched_at DATETIME`},
 	} {
@@ -286,6 +287,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 	for _, ddl := range []string{
 		`CREATE INDEX IF NOT EXISTS idx_samples_domain ON samples(domain) WHERE domain != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_package_version ON samples(package, version) WHERE package != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_purl_base ON samples(purl_base) WHERE purl_base != ''`,
 	} {
 		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite samples index: %w", err)
@@ -484,7 +486,7 @@ const liteSampleCols = `id, sha256, source, feed, ecosystem,
 	formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime,
 	traits_version,
-	url, domain, package, version`
+	url, domain, package, version, purl_base`
 
 // liteSampleColsLight excludes cleave_result and litmus_result to avoid
 // loading large JSON blobs when only metadata is needed.
@@ -495,7 +497,7 @@ const liteSampleColsLight = `id, sha256, source, feed, ecosystem,
 	formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime,
 	traits_version,
-	url, domain, package, version`
+	url, domain, package, version, purl_base`
 
 func scanLiteSamplesLight(rows *sql.Rows) ([]*Sample, error) {
 	defer rows.Close() //nolint:errcheck // best-effort cleanup
@@ -512,7 +514,7 @@ func scanLiteSamplesLight(rows *sql.Rows) ([]*Sample, error) {
 			&s.Score, &s.MaxCrit, &s.SuspiciousCount,
 			&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &firstAnalyzedAt, &lastErrorAt, &mtime, &markerMtime,
 			&s.TraitsVersion,
-			&s.URL, &s.Domain, &s.Package, &s.Version,
+			&s.URL, &s.Domain, &s.Package, &s.Version, &s.PURLBase,
 		); err != nil {
 			return nil, err
 		}
@@ -675,7 +677,7 @@ func scanLiteSample(row *sql.Row) (*Sample, error) {
 		&s.Elements, &s.Score, &s.MaxCrit, &s.SuspiciousCount,
 		&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &firstAnalyzedAt, &lastErrorAt, &mtime, &markerMtime,
 		&s.TraitsVersion,
-		&s.URL, &s.Domain, &s.Package, &s.Version,
+		&s.URL, &s.Domain, &s.Package, &s.Version, &s.PURLBase,
 	)
 
 	if errors.Is(err, sql.ErrNoRows) {
@@ -728,7 +730,7 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 			&s.Score, &s.MaxCrit, &s.SuspiciousCount,
 			&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &firstAnalyzedAt, &lastErrorAt, &mtime, &markerMtime,
 			&s.TraitsVersion,
-			&s.URL, &s.Domain, &s.Package, &s.Version,
+			&s.URL, &s.Domain, &s.Package, &s.Version, &s.PURLBase,
 		); err != nil {
 			return nil, err
 		}
@@ -862,6 +864,7 @@ const sampleConflictUpdateSQLite = `ON CONFLICT (sha256) DO UPDATE SET
 	domain  = CASE WHEN samples.domain  = '' THEN excluded.domain  ELSE samples.domain  END,
 	package    = CASE WHEN samples.package    = '' THEN excluded.package    ELSE samples.package    END,
 	version = CASE WHEN samples.version = '' THEN excluded.version ELSE samples.version END,
+	purl_base = CASE WHEN samples.purl_base = '' THEN excluded.purl_base ELSE samples.purl_base END,
 	-- Capture-time provenance is written once by the collector's direct-insert;
 	-- a later walk carries none, so keep whatever is already there.
 	provenance = CASE WHEN samples.provenance IS NOT NULL THEN samples.provenance ELSE excluded.provenance END,
@@ -887,6 +890,7 @@ WHERE excluded.parent = ''
     OR (excluded.ecosystem != '' AND samples.ecosystem != excluded.ecosystem)
     OR (samples.url = '' AND excluded.url != '')
     OR (samples.package = '' AND excluded.package != '')
+    OR (samples.purl_base = '' AND excluded.purl_base != '')
     OR samples.skip IN ('missing','unsupported')
     -- Pool-precedence transitions must fire even when path/mtime are unchanged.
     OR ((CASE excluded.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
@@ -912,16 +916,16 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 			canonical_sha256, parent, skip, elements,
 			max_crit, suspicious_count, mtime, marker_mtime,
 			cleave_result, litmus_result,
-			url, domain, package, version, provenance, fetched_at)
+			url, domain, package, version, provenance, fetched_at, purl_base)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`+sampleConflictUpdateSQLite,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.SHA256, s.Parent, s.Skip, s.Elements,
 		s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
 		jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult),
-		s.URL, s.Domain, s.Package, s.Version, jsonTextOrNil(s.Provenance), s.FetchedAt)
+		s.URL, s.Domain, s.Package, s.Version, jsonTextOrNil(s.Provenance), s.FetchedAt, s.PURLBase)
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}

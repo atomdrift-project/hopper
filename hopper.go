@@ -352,6 +352,7 @@ type Sample struct {
 	Domain          string // registered domain (eTLD+1), populated via golang.org/x/net/publicsuffix
 	Package         string // software package this file belongs to, e.g. "lodash" or "@vue/cli"
 	Version         string // package version, e.g. "4.17.21"
+	PURLBase        string // version-less canonical PURL, e.g. "pkg:npm/lodash"; "" if not a known package ecosystem
 	Filename        string
 	FileType        string
 	Label           string // "bad", "good", "unknown"

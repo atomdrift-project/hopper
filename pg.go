@@ -266,8 +266,13 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS domain TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS package TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS version TEXT NOT NULL DEFAULT ''`,
+		// purl_base: version-less canonical PURL, the package identity across
+		// versions. Indexed (partial, skipping non-package files) so GROUP BY /
+		// lookups by package are fast.
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS purl_base TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_domain ON samples(domain) WHERE domain != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_package_version ON samples(package, version) WHERE package != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_purl_base ON samples(purl_base) WHERE purl_base != ''`,
 		// Collector provenance sidecar (forager) + artifact fetch time. JSONB so
 		// the registry/feed records inside are directly queryable.
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS provenance JSONB`,
@@ -1151,7 +1156,7 @@ const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, cleave_result, litmus_result, llm_result, litmus_score,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime, traits_version,
-	url, domain, package, version`
+	url, domain, package, version, purl_base`
 
 // pgSampleColsLight excludes cleave_result and litmus_result to avoid loading
 // potentially large JSON blobs when only metadata is needed (e.g. claim queries).
@@ -1159,7 +1164,7 @@ const pgSampleColsLight = `id, sha256, source, feed, ecosystem, filename, file_t
 	size_bytes, label, label_source, litmus_score,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime, traits_version,
-	url, domain, package, version`
+	url, domain, package, version, purl_base`
 
 func pgSampleDest(s *Sample) []any {
 	return []any{
@@ -1170,7 +1175,7 @@ func pgSampleDest(s *Sample) []any {
 		&s.MaxCrit, &s.SuspiciousCount,
 		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.FirstAnalyzedAt, &s.LastErrorAt, &s.Mtime, &s.MarkerMtime,
 		&s.TraitsVersion,
-		&s.URL, &s.Domain, &s.Package, &s.Version,
+		&s.URL, &s.Domain, &s.Package, &s.Version, &s.PURLBase,
 	}
 }
 
@@ -1183,7 +1188,7 @@ func pgSampleDestLight(s *Sample) []any {
 		&s.MaxCrit, &s.SuspiciousCount,
 		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.FirstAnalyzedAt, &s.LastErrorAt, &s.Mtime, &s.MarkerMtime,
 		&s.TraitsVersion,
-		&s.URL, &s.Domain, &s.Package, &s.Version,
+		&s.URL, &s.Domain, &s.Package, &s.Version, &s.PURLBase,
 	}
 }
 
@@ -1386,17 +1391,17 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 			canonical_sha256, parent, skip, elements,
 			max_crit, suspicious_count, mtime, marker_mtime,
 			cleave_result, litmus_result,
-			url, domain, package, version, provenance, fetched_at)
+			url, domain, package, version, provenance, fetched_at, purl_base)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
 			$1, $11, $12, $13, $14, $15, $16, $17, $18, $19,
-			$20, $21, $22, $23, $24, $25)
+			$20, $21, $22, $23, $24, $25, $26)
 		`+sampleConflictUpdatePG,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.Parent, s.Skip, s.Elements,
 		s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
 		sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult),
-		s.URL, s.Domain, s.Package, s.Version, sanitizeJSONB(s.Provenance), s.FetchedAt)
+		s.URL, s.Domain, s.Package, s.Version, sanitizeJSONB(s.Provenance), s.FetchedAt, s.PURLBase)
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
@@ -1536,6 +1541,7 @@ const sampleConflictUpdatePG = `ON CONFLICT (sha256) DO UPDATE SET
 	domain  = CASE WHEN samples.domain  = '' THEN EXCLUDED.domain  ELSE samples.domain  END,
 	package    = CASE WHEN samples.package    = '' THEN EXCLUDED.package    ELSE samples.package    END,
 	version = CASE WHEN samples.version = '' THEN EXCLUDED.version ELSE samples.version END,
+	purl_base = CASE WHEN samples.purl_base = '' THEN EXCLUDED.purl_base ELSE samples.purl_base END,
 	-- Capture-time provenance is written once by the collector's direct-insert;
 	-- a later walk carries none, so keep whatever is already there.
 	provenance = CASE WHEN samples.provenance IS NOT NULL THEN samples.provenance ELSE EXCLUDED.provenance END,
@@ -1563,6 +1569,7 @@ WHERE EXCLUDED.parent = ''
     OR (EXCLUDED.ecosystem <> '' AND samples.ecosystem IS DISTINCT FROM EXCLUDED.ecosystem)
     OR (samples.url = '' AND EXCLUDED.url <> '')
     OR (samples.package = '' AND EXCLUDED.package <> '')
+    OR (samples.purl_base = '' AND EXCLUDED.purl_base <> '')
     OR samples.skip IN ('missing','unsupported')
     -- Pool-precedence transitions must fire even when path/mtime are unchanged.
     OR ((CASE EXCLUDED.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)

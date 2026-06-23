@@ -15,6 +15,12 @@ CREATE TABLE IF NOT EXISTS samples (
 	-- the format-specific patterns in pkgparse.ParseFilename.
 	package       TEXT NOT NULL DEFAULT '',
 	version       TEXT NOT NULL DEFAULT '',
+	-- purl_base is the version-less canonical Package URL (e.g. "pkg:npm/lodash"),
+	-- computed by the collector at ingestion. It is the package's stable identity
+	-- across versions: GROUP BY purl_base collapses every version of a package.
+	-- Empty for files that aren't a known package ecosystem. The full versioned
+	-- PURL is purl_base || '@' || version.
+	purl_base     TEXT NOT NULL DEFAULT '',
 	filename      TEXT NOT NULL DEFAULT '',
 	file_type     TEXT NOT NULL DEFAULT '',
 	size_bytes    BIGINT NOT NULL DEFAULT 0,

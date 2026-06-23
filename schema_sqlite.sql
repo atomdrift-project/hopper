@@ -12,6 +12,9 @@ CREATE TABLE IF NOT EXISTS samples (
 	-- the download filename via pkgparse.ParseFilename).
 	package       TEXT NOT NULL DEFAULT '',
 	version       TEXT NOT NULL DEFAULT '',
+	-- purl_base is the version-less canonical PURL (e.g. "pkg:npm/lodash"); the
+	-- package identity across versions. See schema.sql for rationale.
+	purl_base     TEXT NOT NULL DEFAULT '',
 	filename      TEXT NOT NULL DEFAULT '',
 	-- file_type, score, formula, litmus_score are GENERATED from the JSONB
 	-- source columns. Writing to them is an error; readers see the same
