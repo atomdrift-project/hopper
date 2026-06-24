@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -856,7 +857,13 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	dsn := f.String("db", "", "database connection string")
 	dataDir := f.String("data", "", "data directory containing bad/, good/, unknown/ subdirectories")
 	source := f.String("source", "forager", "sample source tag")
-	pruneMissingPaths := f.Bool("prune-missing-paths", false, "after walking, delete sample_locations rows whose path no longer exists on disk")
+	// Default on: prune only deletes location rows (rebuilt by the next walk)
+	// and marks samples skip='missing' (auto-revived on re-observation) — it
+	// never deletes a sample, analysis, or report, and it stats the filesystem
+	// directly, so a mistaken run self-heals and a partial walk can't cause it.
+	// The 40% safety cap guards the unmount/wrong-root case. Pass
+	// --prune-missing-paths=false to disable.
+	pruneMissingPaths := f.Bool("prune-missing-paths", true, "drop location rows for files gone from disk, mark sample missing (=false to disable)")
 	force := f.Bool("force", false, "override safety guards (currently: bypass the 40%-of-rows safety cap on --prune-missing-paths)")
 	hashWorkers := f.Int("hash-workers", 8, "concurrent hash/insert workers for file walking")
 	cleaveBinFlag := f.String("cleave", "cleave", "path to cleave binary (used for file enumeration)")
@@ -2536,6 +2543,33 @@ func isSidecarPath(path string) bool {
 	return strings.HasSuffix(path, sidecarSuffix)
 }
 
+// stagingDirName is the subdirectory cooperating writers (forager, hopper
+// uploads) use to assemble an artifact before atomically renaming the finished
+// file into the sample tree. cleave's iter-files walks into it (it only skips
+// .git), so enumeration must filter it here: a scratch file caught mid-write,
+// or in the window before its rename/cleanup, would otherwise be ingested as a
+// sample and leave a DB row pointing at a path that vanishes when the rename
+// runs. Keep in sync with forager's stagingSubdir.
+const stagingDirName = ".tmp"
+
+// legacyUnpkgScratchSuffix matches the pre-staging scratch name forager wrote
+// directly into the sample dir for unpkg-reconstructed tarballs. A forager that
+// predates the staging-dir change still produces these, so skip them by name
+// too until every forager is redeployed.
+const legacyUnpkgScratchSuffix = "-unpkg-tmp.tgz"
+
+// isStagingPath reports whether path is a transient artifact that enumeration
+// must not ingest: anything inside a stagingDirName component, or a legacy
+// unpkg scratch tarball sitting beside real samples.
+func isStagingPath(path string) bool {
+	if strings.HasSuffix(path, legacyUnpkgScratchSuffix) {
+		return true
+	}
+	// Match stagingDirName as a whole path component, not a substring, so a
+	// legitimately-named file like "foo.tmp.tgz" is not skipped.
+	return slices.Contains(strings.Split(path, string(filepath.Separator)), stagingDirName)
+}
+
 // startEnumeration streams files under dir. A non-zero newerThan makes the
 // enumeration incremental: only files modified at or after it are emitted.
 func startEnumeration(ctx context.Context, dir string, newerThan time.Time) <-chan labeledPath {
@@ -2546,6 +2580,9 @@ func startEnumeration(ctx context.Context, dir string, newerThan time.Time) <-ch
 		err := pathLister(ctx, dir, newerThan, func(lp labeledPath) bool {
 			if isSidecarPath(lp.path) {
 				return true // provenance sidecar, not a sample; keep enumerating
+			}
+			if isStagingPath(lp.path) {
+				return true // transient staging artifact; not a sample
 			}
 			select {
 			case ch <- lp:

@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -2094,8 +2093,10 @@ func (db *DB) locationsForSHAPG(ctx context.Context, sha256 string) ([]*SampleLo
 // pruneMissingLocationsPG mirrors pruneMissingLocationsSQLite for the
 // PostgreSQL backend.
 func (db *DB) pruneMissingLocationsPG(ctx context.Context, absRoot string, maxFraction float64) (int, error) {
-	rows, err := db.pool.Query(ctx,
-		`SELECT id, path FROM sample_locations WHERE path LIKE $1`, absRoot+"/%")
+	rows, err := db.pool.Query(ctx, `
+		SELECT id, sha256, path FROM sample_locations
+		WHERE (parent_sha256 IS NULL OR parent_sha256 = '')
+		  AND (path NOT LIKE '/%' OR path LIKE $1)`, absRoot+"/%")
 	if err != nil {
 		return 0, fmt.Errorf("hopper: scan locations for prune: %w", err)
 	}
@@ -2103,19 +2104,20 @@ func (db *DB) pruneMissingLocationsPG(ctx context.Context, absRoot string, maxFr
 	total := 0
 	for rows.Next() {
 		var v pruneVictim
-		if err := rows.Scan(&v.id, &v.path); err != nil {
+		if err := rows.Scan(&v.id, &v.sha256, &v.path); err != nil {
 			rows.Close()
 			return 0, fmt.Errorf("hopper: scan location row: %w", err)
 		}
 		total++
-		path := v.path
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(absRoot, path)
+		resolved, ok := prunePathResolve(absRoot, v.path)
+		if !ok {
+			slog.Warn("hopper: location path escapes data root; preserving row", "path", v.path)
+			continue
 		}
-		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Stat(resolved); errors.Is(err, os.ErrNotExist) {
 			victims = append(victims, v)
 		} else if err != nil {
-			slog.Warn("hopper: stat failed during prune; preserving row", "path", path, "error", err)
+			slog.Warn("hopper: stat failed during prune; preserving row", "path", resolved, "error", err)
 		}
 	}
 	rows.Close()
@@ -2126,13 +2128,105 @@ func (db *DB) pruneMissingLocationsPG(ctx context.Context, absRoot string, maxFr
 	if total > 0 && float64(len(victims))/float64(total) > maxFraction {
 		return 0, &PruneSafetyExceeded{Total: total, Victims: len(victims), MaxFraction: maxFraction}
 	}
+	if len(victims) == 0 {
+		return 0, nil
+	}
 
-	for _, v := range victims {
-		if _, err := db.pool.Exec(ctx, `DELETE FROM sample_locations WHERE id = $1`, v.id); err != nil {
-			return 0, fmt.Errorf("hopper: delete location %d: %w", v.id, err)
+	ids := make([]int64, len(victims))
+	for i, v := range victims {
+		ids[i] = v.id
+	}
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: begin prune: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+	if _, err := tx.Exec(ctx, `DELETE FROM sample_locations WHERE id = ANY($1)`, ids); err != nil {
+		return 0, fmt.Errorf("hopper: delete %d locations: %w", len(ids), err)
+	}
+	shas := distinctVictimSHAs(victims)
+	if len(shas) > 0 {
+		// A re-observed file flips skip back to '' via the samples upsert
+		// conflict clause; only skip='' is promoted so manual/label skips stick.
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
+			SELECT sha256, label, label, skip, 'missing', 'prune-missing', now()
+			FROM samples
+			WHERE parent = '' AND skip = '' AND sha256 = ANY($1)
+			  AND NOT EXISTS (SELECT 1 FROM sample_locations sl WHERE sl.sha256 = samples.sha256)`, shas); err != nil {
+			return 0, fmt.Errorf("hopper: prune missing audit: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE samples SET skip = 'missing', updated_at = now()
+			WHERE parent = '' AND skip = '' AND sha256 = ANY($1)
+			  AND NOT EXISTS (SELECT 1 FROM sample_locations sl WHERE sl.sha256 = samples.sha256)`, shas); err != nil {
+			return 0, fmt.Errorf("hopper: prune mark missing: %w", err)
 		}
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("hopper: commit prune: %w", err)
+	}
 	return len(victims), nil
+}
+
+func (db *DB) promoteLabelByPURLPG(ctx context.Context, purlBase, version, incLabel, incSource, feed string) (PURLPromotion, error) {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return PURLPromotion{}, fmt.Errorf("hopper: begin promote: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+
+	rows, err := tx.Query(ctx,
+		`SELECT sha256, label, label_source, skip FROM samples WHERE purl_base = $1 AND version = $2 AND parent = ''`,
+		purlBase, version)
+	if err != nil {
+		return PURLPromotion{}, fmt.Errorf("hopper: scan purl candidates: %w", err)
+	}
+	var cands []purlCandidate
+	present := false
+	for rows.Next() {
+		var c purlCandidate
+		if err := rows.Scan(&c.sha, &c.label, &c.source, &c.skip); err != nil {
+			rows.Close()
+			return PURLPromotion{}, fmt.Errorf("hopper: scan purl candidate: %w", err)
+		}
+		if c.skip != "missing" {
+			present = true
+		}
+		cands = append(cands, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return PURLPromotion{}, err
+	}
+
+	promoted := 0
+	for _, c := range cands {
+		r := resolveIncomingLabel(c.label, c.source, c.skip, incLabel, incSource)
+		if !r.changed {
+			continue
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
+			VALUES ($1, $2, $3, $4, $5, 'purl-promote', now())`,
+			c.sha, c.label, r.label, c.skip, r.skip); err != nil {
+			return PURLPromotion{}, fmt.Errorf("hopper: promote audit: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE samples
+			SET label = $1, label_source = $2, skip = $3,
+				feed = CASE WHEN $4 <> '' THEN $4 ELSE feed END,
+				updated_at = now()
+			WHERE sha256 = $5`,
+			r.label, r.labelSource, r.skip, feed, c.sha); err != nil {
+			return PURLPromotion{}, fmt.Errorf("hopper: promote update: %w", err)
+		}
+		promoted++
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return PURLPromotion{}, fmt.Errorf("hopper: commit promote: %w", err)
+	}
+	return PURLPromotion{Present: present, Promoted: promoted}, nil
 }
 
 func (db *DB) updateCleaveResultPG(

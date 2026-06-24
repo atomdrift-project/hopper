@@ -4404,3 +4404,269 @@ func TestTriagePerFileType(t *testing.T) {
 		t.Errorf("TriageBad(apk) = %v (len %d), want only 2 apk", c, len(got))
 	}
 }
+
+// sha64 builds a syntactically valid lowercase-hex sha256 from a single hex
+// digit, so prune tests can use distinct, readable sample identities.
+func sha64(d byte) string { return strings.Repeat(string(d), 64) }
+
+func TestPruneMissingLocations(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	root := t.TempDir()
+
+	writeUnder := func(rel string) {
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	locCount := func(sha string) int {
+		var n int
+		if err := db.lite.QueryRowContext(ctx, `SELECT count(*) FROM sample_locations WHERE sha256=?`, sha).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	skipOf := func(sha string) string {
+		s, err := db.SampleBySHA256(ctx, sha)
+		if err != nil {
+			t.Fatalf("SampleBySHA256(%s): %v", sha, err)
+		}
+		return s.Skip
+	}
+
+	var (
+		present = sha64('1') // top-level, file on disk → kept
+		gone    = sha64('2') // top-level, no file → pruned + marked missing
+		twoLoc  = sha64('3') // two locations, one missing → stays active
+		archive = sha64('4') // parent archive
+		member  = sha64('5') // archive member, no standalone file → never pruned
+	)
+
+	writeUnder("bad/present.js")
+	mustInsert(t, ctx, db, &Sample{SHA256: present, Source: "test", Label: "bad", LabelSource: "test", Path: "bad/present.js"})
+
+	mustInsert(t, ctx, db, &Sample{SHA256: gone, Source: "test", Label: "bad", LabelSource: "test", Path: "bad/gone.js"})
+
+	writeUnder("bad/twoloc-a.js")
+	mustInsert(t, ctx, db, &Sample{SHA256: twoLoc, Source: "test", Label: "bad", LabelSource: "test", Path: "bad/twoloc-a.js"})
+	mustInsert(t, ctx, db, &Sample{SHA256: twoLoc, Source: "test", Label: "bad", LabelSource: "test", Path: "bad/twoloc-b.js"}) // missing on disk
+
+	// Archive member: parent set, pseudo-path with the !! delimiter, no real
+	// file. Must be invisible to prune or every member would be marked missing.
+	mustInsert(t, ctx, db, &Sample{SHA256: member, Source: "test", Label: "bad", LabelSource: "test", Parent: archive, Path: archive + "!!pkg/x.js"})
+
+	// maxFraction 1.0: 2 of 4 top-level locations are missing (>0.40 default cap).
+	removed, err := db.PruneMissingLocations(ctx, root, 1.0)
+	if err != nil {
+		t.Fatalf("PruneMissingLocations: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("removed = %d, want 2 (gone + twoloc-b)", removed)
+	}
+
+	if got := locCount(present); got != 1 || skipOf(present) != "" {
+		t.Errorf("present: loc=%d skip=%q, want loc=1 skip=''", got, skipOf(present))
+	}
+	if got := locCount(gone); got != 0 {
+		t.Errorf("gone: loc=%d, want 0", got)
+	}
+	if got := skipOf(gone); got != "missing" {
+		t.Errorf("gone: skip=%q, want 'missing'", got)
+	}
+	if got := locCount(twoLoc); got != 1 || skipOf(twoLoc) != "" {
+		t.Errorf("twoLoc: loc=%d skip=%q, want loc=1 skip='' (survives on its present location)", got, skipOf(twoLoc))
+	}
+	if got := locCount(member); got != 1 {
+		t.Errorf("member: loc=%d, want 1 (archive members are never stat-pruned)", got)
+	}
+
+	// A label_event records the missing transition for audit.
+	var events int
+	if err := db.lite.QueryRowContext(ctx,
+		`SELECT count(*) FROM label_events WHERE sha256=? AND reason='prune-missing' AND to_skip='missing'`, gone).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 1 {
+		t.Errorf("label_events for gone = %d, want 1", events)
+	}
+
+	// Revive: the bytes reappear at a new path; the next walk-style insert
+	// clears skip='missing' back to '' and records a fresh location.
+	writeUnder("bad/gone-again.js")
+	mustInsert(t, ctx, db, &Sample{SHA256: gone, Source: "test", Label: "bad", LabelSource: "test", Path: "bad/gone-again.js"})
+	if got := skipOf(gone); got != "" {
+		t.Errorf("after revive: gone skip=%q, want '' (re-observed file clears missing)", got)
+	}
+	if got := locCount(gone); got != 1 {
+		t.Errorf("after revive: gone loc=%d, want 1", got)
+	}
+}
+
+func TestPruneMissingLocationsSafetyCap(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	root := t.TempDir()
+
+	a, b := sha64('a'), sha64('b')
+	mustInsert(t, ctx, db, &Sample{SHA256: a, Source: "test", Label: "bad", LabelSource: "test", Path: "bad/a.js"})
+	mustInsert(t, ctx, db, &Sample{SHA256: b, Source: "test", Label: "bad", LabelSource: "test", Path: "bad/b.js"})
+
+	// Both files are missing → 100% would be pruned, exceeding the 40% cap.
+	_, err := db.PruneMissingLocations(ctx, root, 0.40)
+	var se *PruneSafetyExceeded
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *PruneSafetyExceeded", err)
+	}
+	if se.Victims != 2 || se.Total != 2 {
+		t.Errorf("cap report victims=%d total=%d, want 2/2", se.Victims, se.Total)
+	}
+	// Nothing deleted, nothing marked.
+	for _, sha := range []string{a, b} {
+		var n int
+		if err := db.lite.QueryRowContext(ctx, `SELECT count(*) FROM sample_locations WHERE sha256=?`, sha).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 {
+			t.Errorf("%s loc=%d, want 1 (cap aborts before any delete)", sha[:6], n)
+		}
+		s, err := db.SampleBySHA256(ctx, sha)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.Skip != "" {
+			t.Errorf("%s skip=%q, want '' (cap aborts before any mark)", sha[:6], s.Skip)
+		}
+	}
+}
+
+func TestResolveIncomingLabel(t *testing.T) {
+	tests := []struct {
+		name                            string
+		curLabel, curSource, curSkip    string
+		incLabel, incSource             string
+		wantLabel, wantSource, wantSkip string
+		wantChanged                     bool
+	}{
+		{"unknown promotes to bad", "unknown", "forager", "", "bad", "forager", "bad", "forager", "", true},
+		{"good vs bad is a conflict", "good", "test", "", "bad", "forager", "bad", "conflict", "conflict", true},
+		{"bad vs good stays bad but conflicts", "bad", "test", "", "good", "forager", "bad", "conflict", "conflict", true},
+		{"equal label no change", "bad", "test", "", "bad", "forager", "bad", "test", "", false},
+		{"lower rank no change", "bad", "test", "", "unknown", "forager", "bad", "test", "", false},
+		{"missing skip preserved on promote", "unknown", "forager", "missing", "bad", "forager", "bad", "forager", "missing", true},
+		{"unsupported skip preserved on promote", "unknown", "forager", "unsupported", "bad", "forager", "bad", "forager", "unsupported", true},
+		{"incoming marker wins", "unknown", "forager", "", "bad", "marker", "bad", "marker", "misclassified", true},
+		{"existing marker overridden by feed", "good", "marker", "", "bad", "forager", "bad", "forager", "conflict", true},
+		{"existing marker rehabilitated to same label", "bad", "marker", "misclassified", "bad", "forager", "bad", "forager", "", true},
+		{"promote clears misclassified skip", "unknown", "test", "misclassified", "bad", "forager", "bad", "forager", "", true},
+		{"promote clears conflict skip", "unknown", "conflict", "conflict", "bad", "forager", "bad", "forager", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveIncomingLabel(tt.curLabel, tt.curSource, tt.curSkip, tt.incLabel, tt.incSource)
+			if got.label != tt.wantLabel || got.labelSource != tt.wantSource || got.skip != tt.wantSkip || got.changed != tt.wantChanged {
+				t.Errorf("resolveIncomingLabel(%q,%q,%q ← %q,%q) = {%q,%q,%q,%v}, want {%q,%q,%q,%v}",
+					tt.curLabel, tt.curSource, tt.curSkip, tt.incLabel, tt.incSource,
+					got.label, got.labelSource, got.skip, got.changed,
+					tt.wantLabel, tt.wantSource, tt.wantSkip, tt.wantChanged)
+			}
+		})
+	}
+}
+
+func TestPromoteLabelByPURL(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	const purlBase, version = "pkg:npm/evil-pkg", "1.0.0"
+	mk := func(sha, label, source, skip, ver string) {
+		mustInsert(t, ctx, db, &Sample{
+			SHA256: sha, Source: "test", Label: label, LabelSource: source, Skip: skip,
+			PURLBase: purlBase, Version: ver, Path: "unknown/" + sha[:8] + ".tgz",
+		})
+	}
+	var (
+		unk    = sha64('1') // unknown → promoted to bad
+		good   = sha64('2') // good → conflict
+		alrdy  = sha64('3') // already bad → unchanged
+		gone   = sha64('4') // unknown but file missing → label promoted, skip kept
+		otherV = sha64('5') // different version → untouched
+		member = sha64('6') // archive member (parent set) → untouched
+	)
+	mk(unk, "unknown", "forager", "", version)
+	mk(good, "good", "test", "", version)
+	mk(alrdy, "bad", "test", "", version)
+	mk(gone, "unknown", "forager", "missing", version)
+	mk(otherV, "unknown", "forager", "", "2.0.0")
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: member, Source: "test", Label: "unknown", LabelSource: "forager",
+		Parent: sha64('a'), PURLBase: purlBase, Version: version, Path: sha64('a') + "!!pkg/x.js",
+	})
+
+	res, err := db.PromoteLabelByPURL(ctx, purlBase, version, "bad", "forager", "kmsec.uk")
+	if err != nil {
+		t.Fatalf("PromoteLabelByPURL: %v", err)
+	}
+	if !res.Present {
+		t.Error("Present = false, want true (unk has bytes)")
+	}
+	if res.Promoted != 3 {
+		t.Errorf("Promoted = %d, want 3 (unk, good, gone)", res.Promoted)
+	}
+
+	check := func(sha, wantLabel, wantSource, wantSkip string) {
+		s, err := db.SampleBySHA256(ctx, sha)
+		if err != nil {
+			t.Fatalf("SampleBySHA256(%s): %v", sha, err)
+		}
+		if s.Label != wantLabel || s.LabelSource != wantSource || s.Skip != wantSkip {
+			t.Errorf("%s = {%q,%q,%q}, want {%q,%q,%q}", sha[:6], s.Label, s.LabelSource, s.Skip, wantLabel, wantSource, wantSkip)
+		}
+	}
+	check(unk, "bad", "forager", "")
+	check(good, "bad", "conflict", "conflict")
+	check(alrdy, "bad", "test", "") // unchanged
+	check(gone, "bad", "forager", "missing")
+	check(otherV, "unknown", "forager", "") // different version, untouched
+	check(member, "unknown", "forager", "") // archive member, untouched
+
+	// The feed name is recorded on the rows we actually changed.
+	for _, sha := range []string{unk, good, gone} {
+		s, err := db.SampleBySHA256(ctx, sha)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.Feed != "kmsec.uk" {
+			t.Errorf("%s feed = %q, want kmsec.uk", sha[:6], s.Feed)
+		}
+	}
+
+	var events int
+	if err := db.lite.QueryRowContext(ctx,
+		`SELECT count(*) FROM label_events WHERE reason='purl-promote'`).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 3 {
+		t.Errorf("purl-promote label_events = %d, want 3", events)
+	}
+
+	// Present=false when the only copy is missing.
+	const p2, v2 = "pkg:npm/ghost-pkg", "9.9.9"
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: sha64('7'), Source: "test", Label: "unknown", LabelSource: "forager",
+		Skip: "missing", PURLBase: p2, Version: v2, Path: "unknown/ghost.tgz",
+	})
+	res2, err := db.PromoteLabelByPURL(ctx, p2, v2, "bad", "forager", "aikido.dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res2.Present {
+		t.Error("Present = true, want false (only copy is missing → re-download wanted)")
+	}
+	if res2.Promoted != 1 {
+		t.Errorf("Promoted = %d, want 1", res2.Promoted)
+	}
+}

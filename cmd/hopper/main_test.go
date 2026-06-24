@@ -113,6 +113,50 @@ func TestStartEnumerationSkipsSidecars(t *testing.T) {
 	}
 }
 
+func TestStartEnumerationSkipsStaging(t *testing.T) {
+	useTestPathLister(t)
+	dir := t.TempDir()
+	sample := filepath.Join(dir, "pkg-1.0.0.tgz")
+	staged := filepath.Join(dir, stagingDirName, "pkg-unpkg.tgz")     // in a .tmp staging dir
+	legacy := filepath.Join(dir, "evil-pkg"+legacyUnpkgScratchSuffix) // pre-staging scratch name
+	mustMkdirAll(t, filepath.Dir(staged))
+	for _, p := range []string{sample, staged, legacy} {
+		if err := os.WriteFile(p, []byte("data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var got []string
+	for lp := range startEnumeration(context.Background(), dir, time.Time{}) {
+		got = append(got, filepath.Base(lp.path))
+	}
+
+	if len(got) != 1 || got[0] != "pkg-1.0.0.tgz" {
+		t.Fatalf("enumeration = %v, want only the sample (staging artifacts must be skipped)", got)
+	}
+}
+
+func TestIsStagingPath(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"bad/foraged/javascript/pkg/.tmp/pkg-unpkg.tgz", true},
+		{"good/.tmp/x.tgz", true},
+		{".tmp/x.tgz", true},
+		{"bad/foraged/javascript/npmjs.org/kmsec.uk/chalk-pro/chalk-pro-unpkg-tmp.tgz", true},
+		{"bad/foraged/pkg-1.0.0.tgz", false},
+		{"good/foo.tmp.tgz", false}, // ".tmp" as a substring, not a path component
+		{"unknown/uploads/sample.bin", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := isStagingPath(filepath.FromSlash(tt.path)); got != tt.want {
+			t.Errorf("isStagingPath(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}
+
 func mustRemove(t *testing.T, path string) {
 	t.Helper()
 	if err := os.Remove(path); err != nil {

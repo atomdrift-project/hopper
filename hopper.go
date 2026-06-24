@@ -1510,6 +1510,134 @@ func (db *DB) PruneMissingLocations(ctx context.Context, dataRoot string, maxFra
 	return db.pruneMissingLocationsSQLite(ctx, absRoot, maxFraction)
 }
 
+// prunePathResolve resolves a stored sample_locations path to an on-disk path
+// for prune. Locations store paths relative to the data root (the current
+// layout), but an absolute path is still accepted and taken as-is. The result
+// must stay within absRoot: a relative path that climbs out with ".." or a
+// stray absolute path outside the tree returns ok=false so prune never stats —
+// and therefore never deletes — a row for a file it cannot safely account for.
+func prunePathResolve(absRoot, path string) (resolved string, ok bool) {
+	if filepath.IsAbs(path) {
+		resolved = filepath.Clean(path)
+	} else {
+		resolved = filepath.Join(absRoot, path)
+	}
+	if resolved != absRoot && !strings.HasPrefix(resolved, absRoot+string(filepath.Separator)) {
+		return "", false
+	}
+	return resolved, true
+}
+
+// PURLPromotion reports the outcome of PromoteLabelByPURL.
+type PURLPromotion struct {
+	// Present is true when hopper already holds a non-missing sample for the
+	// queried (purlBase, version); the collector can skip re-downloading.
+	Present bool
+	// Promoted counts samples whose label or skip the feed observation changed.
+	Promoted int
+}
+
+// labelResolution is the post-precedence state of a sample after an incoming
+// (label, source) observation, mirroring the sample-upsert conflict clause.
+type labelResolution struct {
+	label, labelSource, skip string
+	changed                  bool
+}
+
+// resolveIncomingLabel applies an incoming (incLabel, incSource) observation to
+// a sample currently at (curLabel, curSource, curSkip) and returns the resolved
+// state. It mirrors sampleConflictUpdate{SQLite,PG} (the INSERT...ON CONFLICT
+// label/label_source/skip CASE ladders) exactly, so a label asserted without a
+// re-download resolves identically to one carried by a walk:
+//   - a marker observation wins; an existing marker is overridden by a
+//     non-marker observation (as the upsert does);
+//   - opposite poles (good vs bad) resolve to bad/conflict;
+//   - otherwise a strictly higher-ranked label wins; ties keep the current one.
+//
+// It deviates in exactly one, deliberate way: it never resurrects a sample whose
+// skip is 'missing' or 'unsupported'. The upsert clears those because re-seeing
+// a file proves the bytes are back; a feed sighting carries no bytes, so the
+// label is promoted but skip is preserved — the row is restored (and skip
+// cleared) only by an actual re-download.
+func resolveIncomingLabel(curLabel, curSource, curSkip, incLabel, incSource string) labelResolution {
+	opposite := (curLabel == labelGood && incLabel == labelBad) || (curLabel == labelBad && incLabel == labelGood)
+	higher := labelRank(incLabel) > labelRank(curLabel)
+
+	out := labelResolution{label: curLabel, labelSource: curSource, skip: curSkip}
+
+	switch {
+	case incSource == labelSourceMarker:
+		out.label, out.labelSource = incLabel, labelSourceMarker
+	case curSource == labelSourceMarker:
+		out.label, out.labelSource = incLabel, incSource
+	case opposite:
+		out.label, out.labelSource = labelBad, labelSourceConflict
+	case higher:
+		out.label, out.labelSource = incLabel, incSource
+	}
+
+	// Bytes are not proven present here, so a missing/unsupported sample keeps
+	// its skip even as its label is promoted (see doc comment).
+	if curSkip != "missing" && curSkip != "unsupported" {
+		switch {
+		case incSource == labelSourceMarker:
+			out.skip = skipMisclassified
+		case curSource == labelSourceMarker && curSkip == skipMisclassified:
+			out.skip = ""
+		case opposite && (curSkip == "" || curSkip == skipMisclassified || curSkip == skipConflict):
+			out.skip = skipConflict
+		case higher && (curSkip == skipMisclassified || curSkip == skipConflict):
+			out.skip = ""
+		}
+	}
+
+	out.changed = out.label != curLabel || out.labelSource != curSource || out.skip != curSkip
+	return out
+}
+
+// PromoteLabelByPURL records that a feed reported the package identity purlBase
+// at version with (label, labelSource), promoting every top-level sample hopper
+// already holds for that exact package@version per resolveIncomingLabel and
+// writing a label_event for each change. It also reports whether a non-missing
+// copy already exists, so a collector can skip re-downloading bytes hopper
+// already has while still upgrading an 'unknown' row to 'bad'.
+//
+// The scan is a single indexed probe (idx_samples_purl_base) touching only the
+// handful of rows for one package@version. A blank purlBase, version, or label
+// is a no-op.
+func (db *DB) PromoteLabelByPURL(ctx context.Context, purlBase, version, label, labelSource, feed string) (PURLPromotion, error) {
+	if purlBase == "" || version == "" || label == "" {
+		return PURLPromotion{}, nil
+	}
+	if db.pool != nil {
+		return db.promoteLabelByPURLPG(ctx, purlBase, version, label, labelSource, feed)
+	}
+	return db.promoteLabelByPURLSQLite(ctx, purlBase, version, label, labelSource, feed)
+}
+
+// purlCandidate is one sample matched by (purl_base, version) during promotion.
+type purlCandidate struct {
+	sha, label, source, skip string
+}
+
+// distinctVictimSHAs returns the unique sha256s among pruned locations, so the
+// caller can mark any sample left with no surviving location as missing.
+func distinctVictimSHAs(victims []pruneVictim) []string {
+	seen := make(map[string]struct{}, len(victims))
+	shas := make([]string, 0, len(victims))
+	for _, v := range victims {
+		if v.sha256 == "" {
+			continue
+		}
+		if _, ok := seen[v.sha256]; ok {
+			continue
+		}
+		seen[v.sha256] = struct{}{}
+		shas = append(shas, v.sha256)
+	}
+	return shas
+}
+
 // SampleBySHA256 retrieves a sample by its hash.
 // Returns ErrNotFound if no such sample exists.
 func (db *DB) SampleBySHA256(ctx context.Context, sha256 string) (*Sample, error) {

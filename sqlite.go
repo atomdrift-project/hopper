@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -1365,18 +1364,25 @@ func (db *DB) locationsForSHASQLite(ctx context.Context, sha256 string) ([]*Samp
 
 // pruneVictim names a sample_locations row that should be deleted.
 type pruneVictim struct {
-	path string
-	id   int64
+	path   string
+	sha256 string
+	id     int64
 }
 
-// pruneMissingLocationsSQLite walks every sample_locations row whose
-// path lives under absRoot, stats the file, and deletes the row if
-// stat returns ENOENT. Refuses to delete more than maxFraction of the
-// rows it scanned, returning *PruneSafetyExceeded instead.
-// Returns the count of rows deleted.
+// pruneMissingLocationsSQLite stats every top-level sample_locations path under
+// absRoot and deletes the row when the file is gone (ENOENT). Archive members
+// (parent_sha256 set) are skipped: they have no standalone file, so statting
+// them would mark every member missing. Paths are stored relative to the data
+// root; an absolute path is still accepted (prunePathResolve keeps both within
+// absRoot). A sample left with no surviving location is marked skip='missing'
+// in the same transaction, which a later walk auto-reverts to ” if the bytes
+// reappear. Refuses to delete more than maxFraction of the rows it scanned,
+// returning *PruneSafetyExceeded. Returns the count of rows deleted.
 func (db *DB) pruneMissingLocationsSQLite(ctx context.Context, absRoot string, maxFraction float64) (int, error) {
-	rows, err := db.lite.QueryContext(ctx,
-		`SELECT id, path FROM sample_locations WHERE path LIKE ?`, absRoot+"/%")
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT id, sha256, path FROM sample_locations
+		WHERE (parent_sha256 IS NULL OR parent_sha256 = '')
+		  AND (path NOT LIKE '/%' OR path LIKE ?)`, absRoot+"/%")
 	if err != nil {
 		return 0, fmt.Errorf("hopper: scan locations for prune: %w", err)
 	}
@@ -1384,19 +1390,20 @@ func (db *DB) pruneMissingLocationsSQLite(ctx context.Context, absRoot string, m
 	total := 0
 	for rows.Next() {
 		var v pruneVictim
-		if err := rows.Scan(&v.id, &v.path); err != nil {
+		if err := rows.Scan(&v.id, &v.sha256, &v.path); err != nil {
 			rows.Close() //nolint:errcheck,sqlclosecheck,gosec // best-effort cleanup before error return
 			return 0, fmt.Errorf("hopper: scan location row: %w", err)
 		}
 		total++
-		path := v.path
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(absRoot, path)
+		resolved, ok := prunePathResolve(absRoot, v.path)
+		if !ok {
+			slog.Warn("hopper: location path escapes data root; preserving row", "path", v.path)
+			continue
 		}
-		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Stat(resolved); errors.Is(err, os.ErrNotExist) {
 			victims = append(victims, v)
 		} else if err != nil {
-			slog.Warn("hopper: stat failed during prune; preserving row", "path", path, "error", err)
+			slog.Warn("hopper: stat failed during prune; preserving row", "path", resolved, "error", err)
 		}
 	}
 	rows.Close() //nolint:errcheck,gosec // best-effort cleanup
@@ -1407,13 +1414,125 @@ func (db *DB) pruneMissingLocationsSQLite(ctx context.Context, absRoot string, m
 	if total > 0 && float64(len(victims))/float64(total) > maxFraction {
 		return 0, &PruneSafetyExceeded{Total: total, Victims: len(victims), MaxFraction: maxFraction}
 	}
+	if len(victims) == 0 {
+		return 0, nil
+	}
 
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: begin prune: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
 	for _, v := range victims {
-		if _, err := db.lite.ExecContext(ctx, `DELETE FROM sample_locations WHERE id = ?`, v.id); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sample_locations WHERE id = ?`, v.id); err != nil {
 			return 0, fmt.Errorf("hopper: delete location %d: %w", v.id, err)
 		}
 	}
+	if err := markPrunedSamplesMissingSQLite(ctx, tx, distinctVictimSHAs(victims)); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("hopper: commit prune: %w", err)
+	}
 	return len(victims), nil
+}
+
+// markPrunedSamplesMissingSQLite flags any top-level sample among shas that has
+// no surviving location as skip='missing', recording a label_event for each.
+// Hard/label skips are left untouched (only skip=” is promoted), so a manual
+// marker or a conflict resolution is never clobbered. Mirrors the archive-member
+// cascade-missing in reconcile; a re-observed file flips skip back to ” via the
+// samples upsert conflict clause.
+func markPrunedSamplesMissingSQLite(ctx context.Context, tx *sql.Tx, shas []string) error {
+	ts := now()
+	const chunk = 400 // stay under SQLite's default bind-variable limit
+	for start := 0; start < len(shas); start += chunk {
+		batch := shas[start:min(start+chunk, len(shas))]
+		ph := strings.Repeat(",?", len(batch))[1:]
+		args := make([]any, 0, len(batch)+1)
+		args = append(args, ts)
+		for _, sha := range batch {
+			args = append(args, sha)
+		}
+		//nolint:gosec // ph is a run of '?' bind markers; sha values are parameterized.
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
+			SELECT sha256, label, label, skip, 'missing', 'prune-missing', ?
+			FROM samples
+			WHERE parent = '' AND skip = '' AND sha256 IN (`+ph+`)
+			  AND NOT EXISTS (SELECT 1 FROM sample_locations sl WHERE sl.sha256 = samples.sha256)`, args...); err != nil {
+			return fmt.Errorf("hopper: prune missing audit: %w", err)
+		}
+		//nolint:gosec // ph is a run of '?' bind markers; sha values are parameterized.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE samples SET skip = 'missing', updated_at = ?
+			WHERE parent = '' AND skip = '' AND sha256 IN (`+ph+`)
+			  AND NOT EXISTS (SELECT 1 FROM sample_locations sl WHERE sl.sha256 = samples.sha256)`, args...); err != nil {
+			return fmt.Errorf("hopper: prune mark missing: %w", err)
+		}
+	}
+	return nil
+}
+
+func (db *DB) promoteLabelByPURLSQLite(ctx context.Context, purlBase, version, incLabel, incSource, feed string) (PURLPromotion, error) {
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return PURLPromotion{}, fmt.Errorf("hopper: begin promote: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
+
+	rows, err := tx.QueryContext(ctx,
+		`SELECT sha256, label, label_source, skip FROM samples WHERE purl_base = ? AND version = ? AND parent = ''`,
+		purlBase, version)
+	if err != nil {
+		return PURLPromotion{}, fmt.Errorf("hopper: scan purl candidates: %w", err)
+	}
+	var cands []purlCandidate
+	present := false
+	for rows.Next() {
+		var c purlCandidate
+		if err := rows.Scan(&c.sha, &c.label, &c.source, &c.skip); err != nil {
+			rows.Close() //nolint:errcheck,sqlclosecheck,gosec // best-effort cleanup before error return
+			return PURLPromotion{}, fmt.Errorf("hopper: scan purl candidate: %w", err)
+		}
+		if c.skip != "missing" {
+			present = true
+		}
+		cands = append(cands, c)
+	}
+	rows.Close() //nolint:errcheck,gosec // best-effort cleanup
+	if err := rows.Err(); err != nil {
+		return PURLPromotion{}, err
+	}
+
+	ts := now()
+	promoted := 0
+	for _, c := range cands {
+		r := resolveIncomingLabel(c.label, c.source, c.skip, incLabel, incSource)
+		if !r.changed {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
+			VALUES (?, ?, ?, ?, ?, 'purl-promote', ?)`,
+			c.sha, c.label, r.label, c.skip, r.skip, ts); err != nil {
+			return PURLPromotion{}, fmt.Errorf("hopper: promote audit: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE samples
+			SET label = ?, label_source = ?, skip = ?,
+				feed = CASE WHEN ? != '' THEN ? ELSE feed END,
+				updated_at = ?
+			WHERE sha256 = ?`,
+			r.label, r.labelSource, r.skip, feed, feed, ts, c.sha); err != nil {
+			return PURLPromotion{}, fmt.Errorf("hopper: promote update: %w", err)
+		}
+		promoted++
+	}
+	if err := tx.Commit(); err != nil {
+		return PURLPromotion{}, fmt.Errorf("hopper: commit promote: %w", err)
+	}
+	return PURLPromotion{Present: present, Promoted: promoted}, nil
 }
 
 func (db *DB) updateCleaveResultSQLite(
