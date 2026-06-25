@@ -2087,6 +2087,59 @@ func TestExplodeArchiveMembers(t *testing.T) {
 // extraction directly. The function must inherit envelope-level metadata
 // (version/threshold/level for v=5, version/thresholds for v=4) onto the
 // per-member result so downstream consumers can interpret it standalone.
+// TestMemberEnvelopeBatchedBuildMatchesSingle verifies that building an
+// archive's members in batches (as storeResultPG now does, to bound memory)
+// yields exactly the same members — identity, cleave slice, and per-member
+// litmus slice — as building them all at once. It also guards the parse-once
+// litmus index: every member must resolve a distinct, non-empty litmus result.
+func TestMemberEnvelopeBatchedBuildMatchesSingle(t *testing.T) {
+	mk := func(i int) string { return fmt.Sprintf("%064x", i+1) } // distinct lowercase-hex sha256
+
+	var files, litFiles []string
+	for i := range 5 {
+		files = append(files, fmt.Sprintf(
+			`{"sha":%q,"type":"elf","path":"pkg/f%d.so","depth":1,"size":%d,"traits":[{"crit":5,"conf":0.9}]}`,
+			mk(i), i, 100+i))
+		litFiles = append(litFiles, fmt.Sprintf(`{"id":%d,"prob":0.9%d,"class":1}`, i, i))
+	}
+	parent := &Sample{
+		SHA256: mk(99), Source: "s", Feed: "fd", Ecosystem: "e",
+		Label: "bad", LabelSource: "ls", Path: "bad/pkg.tar",
+		CleaveResult: []byte(`{"files":[` + strings.Join(files, ",") + `]}`),
+		LitmusResult: []byte(`{"v":"7","version":"vt","lvl":3,"files":[` + strings.Join(litFiles, ",") + `]}`),
+	}
+
+	single := memberSamplesFromEnvelope(parent)
+	if len(single) != 5 {
+		t.Fatalf("single build: got %d members, want 5", len(single))
+	}
+
+	env := newMemberEnvelope(parent)
+	batched := append(env.buildRange(0, 2), env.buildRange(2, env.len())...)
+	if len(batched) != len(single) {
+		t.Fatalf("batched build: got %d members, want %d", len(batched), len(single))
+	}
+	for i := range single {
+		a, b := single[i], batched[i]
+		if a.SHA256 != b.SHA256 || a.Path != b.Path || a.Skip != b.Skip ||
+			a.FileType != b.FileType || a.SizeBytes != b.SizeBytes {
+			t.Errorf("member %d identity mismatch:\n single=%+v\n batched=%+v", i, a, b)
+		}
+		if !bytes.Equal(a.CleaveResult, b.CleaveResult) {
+			t.Errorf("member %d cleave mismatch:\n single=%s\n batched=%s", i, a.CleaveResult, b.CleaveResult)
+		}
+		if !bytes.Equal(a.LitmusResult, b.LitmusResult) {
+			t.Errorf("member %d litmus mismatch:\n single=%s\n batched=%s", i, a.LitmusResult, b.LitmusResult)
+		}
+	}
+	if len(single[0].LitmusResult) == 0 {
+		t.Error("expected a per-member litmus result, got empty")
+	}
+	if bytes.Equal(single[0].LitmusResult, single[1].LitmusResult) {
+		t.Error("expected distinct per-member litmus results from the parse-once index")
+	}
+}
+
 func TestLitmusResultForMemberAcceptsV4AndV5(t *testing.T) {
 	cases := []struct {
 		name        string

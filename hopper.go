@@ -739,8 +739,8 @@ type memberTrait struct {
 // than the former O(N²) re-parse for every member.
 type memberEnvelope struct {
 	parent *Sample
-	files  []json.RawMessage
 	litmus *litmusMemberIndex
+	files  []json.RawMessage
 }
 
 // newMemberEnvelope parses parent.CleaveResult into its member entries, applying
