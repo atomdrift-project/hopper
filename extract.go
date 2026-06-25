@@ -534,6 +534,11 @@ func sniffCompression(src io.ReaderAt, off int64) (string, error) {
 
 const cpioNewcMagic = "070701"
 
+// cpioMaxNameSize bounds the member-name length read from a (newc) cpio header.
+// The field is attacker-controlled; 64 KiB is far above any real path yet keeps
+// a crafted value from forcing a multi-gigabyte allocation.
+const cpioMaxNameSize = 64 << 10
+
 // streamCpioMember scans a newc-format cpio stream for member and streams it
 // out. rpm payloads use this format with "./"-prefixed names, normalised by
 // archivePathMatches.
@@ -556,6 +561,12 @@ func streamCpioMember(r io.Reader, member string, maxBytes int64, setLen func(in
 		namesize, err := cpioField(hdr[:], 11)
 		if err != nil {
 			return err
+		}
+		// namesize comes straight from an untrusted header field; a crafted
+		// value would otherwise allocate up to 4 GiB for a single member name.
+		// Real paths are far smaller than the cap.
+		if namesize < 0 || namesize > cpioMaxNameSize {
+			return fmt.Errorf("cpio: implausible name size %d", namesize)
 		}
 		name := make([]byte, namesize)
 		if _, err := io.ReadFull(r, name); err != nil {

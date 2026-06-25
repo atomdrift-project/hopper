@@ -39,6 +39,19 @@ readonly TOOLS_DIR=${STATE_HOME}/bin
 readonly CACHE_HOME=/var/cache/${SERVICE_NAME}
 readonly UNIT_FILE=/etc/systemd/system/${SERVICE_NAME}.service
 
+# Shared memory budget for the whole sample pipeline (hopper + forager +
+# promoter). All three live under this slice so their *combined* footprint is
+# bounded; without it they share system.slice, which has no ceiling, and an
+# unbounded sibling (promoter has peaked at ~95 GiB) drives the host into a
+# *global* OOM that kills an arbitrary victim — repeatedly, hopper itself.
+# forager/promoter ship from their own repos, so their slice membership and caps
+# are layered on as drop-ins here (this is the host's master deploy script); a
+# drop-in survives a redeploy of the foreign unit, a live edit would not.
+readonly SLICE_NAME=atomdrift
+readonly SLICE_FILE=/etc/systemd/system/${SLICE_NAME}.slice
+readonly FORAGER_DROPIN=/etc/systemd/system/forager.service.d/10-${SLICE_NAME}-slice.conf
+readonly PROMOTER_DROPIN=/etc/systemd/system/promoter.service.d/10-${SLICE_NAME}-slice.conf
+
 # Permission-heal timer: a root oneshot that re-asserts the shared-tree contract
 # (samples group + setgid dirs + read-only files) on DATA_DIR, catching drift
 # from writers that bypass forager's/hopper's own self-heal. The interval is
@@ -244,6 +257,12 @@ Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
 
+# Share the pipeline-wide memory budget (see ${SLICE_NAME}.slice). hopper is the
+# primary service: it keeps the most generous per-service caps and the most
+# protective OOMScoreAdjust, so under slice pressure the kernel sheds promoter
+# (the runaway) first and leaves the ingester running.
+Slice=${SLICE_NAME}.slice
+
 ConfigurationDirectory=${SERVICE_NAME}
 ConfigurationDirectoryMode=0750
 StateDirectory=${SERVICE_NAME}
@@ -295,6 +314,10 @@ TasksMax=8192
 # Child OOM (e.g. a rogue litmus worker) should be logged and retried, not
 # bring down the whole ingester.
 OOMPolicy=continue
+# Protect the primary service. If the shared slice hits its ceiling the kernel
+# kills the highest-scoring task in the slice; a strongly negative bias here
+# makes hopper the last to be chosen (promoter, +600, goes first).
+OOMScoreAdjust=-800
 
 # Filesystem isolation. DATA_DIR is read-only except interactive uploads.
 ProtectSystem=strict
@@ -367,6 +390,102 @@ if (( binary_changed || unit_changed )); then
     fi
 else
     log "No changes; leaving service running"
+fi
+
+# --- Shared memory budget (slice + sibling drop-ins) -------------------------
+# Cap the whole pipeline so it can never trigger a host-wide OOM. The host has
+# ~125 GiB; the slice ceiling is 120 GiB, leaving ~8 GiB for the kernel,
+# journald, dbus, ssh and page cache. When the slice fills, the *cgroup* OOM
+# killer fires inside it and picks the member with the highest OOMScoreAdjust
+# (promoter) — a contained, recoverable kill, never the global killer that has
+# repeatedly taken hopper (and dbus) down.
+#
+# Per-service MemoryMax values intentionally sum above the slice ceiling
+# (96+24+16); the slice is the real backstop and lets any one service burst into
+# spare headroom when its siblings are idle (forager/promoter are periodic).
+
+tmp_slice=$(mktemp -t "${SLICE_NAME}.slice.XXXXXX"); TMP_FILES+=("$tmp_slice")
+cat >"$tmp_slice" <<EOF
+[Unit]
+Description=Atomdrift sample pipeline memory budget (hopper + forager + promoter)
+Documentation=https://codeberg.org/atomdrift/hopper
+Before=slices.target
+
+[Slice]
+# Whole-pipeline ceiling. Bounds the sum of every service nested below it, so a
+# runaway in one cannot exhaust host RAM and provoke the global OOM killer.
+MemoryHigh=112G
+MemoryMax=120G
+# Swap is zram here — compressed RAM. Uncapped, swap-out cannibalizes the very
+# headroom MemoryMax reserves, so bound what the slice can push into it.
+MemorySwapMax=8G
+EOF
+
+slice_changed=0
+if priv cmp -s "$tmp_slice" "$SLICE_FILE" 2>/dev/null; then
+    log "slice unit unchanged"
+else
+    log "Writing ${SLICE_FILE}"
+    priv install -m 0644 -o root -g root "$tmp_slice" "$SLICE_FILE"
+    slice_changed=1
+fi
+
+# Sibling drop-ins. Each adds slice membership + an OOM-victim bias; promoter
+# (unbounded in its own unit, peaks ~95 GiB) additionally gets hard caps here.
+# Only written when the sibling unit is installed, and a restart is needed for
+# a Slice= change to take effect.
+install_dropin() {
+    local svc=$1 dropin=$2 content=$3
+    systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 \
+        || { log "${svc}.service not installed; skipping slice drop-in"; return; }
+    local tmp; tmp=$(mktemp -t "${svc}.dropin.XXXXXX"); TMP_FILES+=("$tmp")
+    printf '%s\n' "$content" >"$tmp"
+    if priv cmp -s "$tmp" "$dropin" 2>/dev/null; then
+        log "${svc} slice drop-in unchanged"
+        return
+    fi
+    log "Writing ${dropin}"
+    priv install -d -m 0755 -o root -g root "$(dirname "$dropin")"
+    priv install -m 0644 -o root -g root "$tmp" "$dropin"
+    DROPIN_CHANGED_SVCS+=("$svc")
+}
+
+declare -a DROPIN_CHANGED_SVCS=()
+
+install_dropin forager "$FORAGER_DROPIN" "[Service]
+# Join the pipeline budget; mild OOM bias (above hopper, below promoter). Keeps
+# its own MemoryMax from the forager repo's unit.
+Slice=${SLICE_NAME}.slice
+OOMScoreAdjust=200"
+
+install_dropin promoter "$PROMOTER_DROPIN" "[Service]
+# promoter ships with no memory caps and has peaked at ~95 GiB (a batch-scanner
+# runaway) — the direct cause of the host-wide OOM. Bound it: steady state is
+# ~16 GiB, so a runaway now trips a contained restart (Restart=always) instead
+# of taking down the box. Most expendable member: sacrificed first under slice
+# pressure.
+Slice=${SLICE_NAME}.slice
+MemoryHigh=16G
+MemoryMax=24G
+MemorySwapMax=2G
+OOMScoreAdjust=600"
+
+# A new/edited slice or any moved-into-slice membership needs a daemon-reload,
+# and a service only enters its new slice on restart.
+if (( slice_changed )) || (( ${#DROPIN_CHANGED_SVCS[@]} > 0 )); then
+    priv systemctl daemon-reload
+fi
+for svc in "${DROPIN_CHANGED_SVCS[@]}"; do
+    log "Restarting ${svc} to apply slice membership"
+    priv systemctl restart "${svc}.service" \
+        || log "WARNING: ${svc}.service failed to restart; check: journalctl -u ${svc} -n 50"
+done
+# hopper's own Slice= lives in its unit; if only the slice file changed (not the
+# hopper unit), hopper is still in the old slice until restarted.
+if (( slice_changed )) && ! (( unit_changed )); then
+    log "Restarting ${SERVICE_NAME} to apply slice membership"
+    priv systemctl restart "${SERVICE_NAME}.service" \
+        || die "service failed to start; see: journalctl -u ${SERVICE_NAME} -n 50"
 fi
 
 # --- Permission-heal timer ---------------------------------------------------

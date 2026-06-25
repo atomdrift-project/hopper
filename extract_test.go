@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ulikunitz/xz"
@@ -223,6 +224,26 @@ func TestExtractFromArchiveTooLarge(t *testing.T) {
 
 	if _, err := ExtractFromArchive(buf.Bytes(), "zip", "big.txt", 100); err == nil {
 		t.Error("expected too-large error when entry exceeds maxBytes")
+	}
+}
+
+// TestStreamCpioMemberRejectsHugeName guards the bound on the attacker-
+// controlled newc name-size field: without it, a crafted header forces a
+// multi-gigabyte make([]byte). The check must reject before allocating.
+func TestStreamCpioMemberRejectsHugeName(t *testing.T) {
+	hdr := make([]byte, 110)
+	for i := range hdr {
+		hdr[i] = '0'
+	}
+	copy(hdr[0:6], cpioNewcMagic)
+	copy(hdr[94:102], "ffffffff") // namesize field (k=11): ~4 GiB
+
+	err := streamCpioMember(bytes.NewReader(hdr), "anything", -1, func(int64) {}, io.Discard)
+	if err == nil {
+		t.Fatal("expected error for implausible cpio name size, got nil")
+	}
+	if !strings.Contains(err.Error(), "name size") {
+		t.Fatalf("expected name-size rejection, got: %v", err)
 	}
 }
 

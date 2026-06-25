@@ -940,6 +940,11 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		tracker:     tracker,
 		hopperStart: time.Now().UTC(),
 		extractSem:  make(chan struct{}, min(16, max(2, runtime.NumCPU()))),
+		// Result ingestion is memory-bound (each store expands an envelope to
+		// several times its size), not CPU-bound, so cap it tighter than
+		// extraction: enough for steady throughput, low enough that a burst of
+		// large archive results can't blow up the heap.
+		resultSem: make(chan struct{}, min(8, max(2, runtime.NumCPU()))),
 	} // db, progress, allowedDirs, uploadTokenHash set after init
 	api.registerAPI(httpMux)
 	httpMux.HandleFunc("GET /_/health", func(w http.ResponseWriter, _ *http.Request) {

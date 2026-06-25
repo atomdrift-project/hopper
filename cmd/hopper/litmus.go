@@ -446,6 +446,10 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 
 	slog.Info("litmus worker started", "pid", cmd.Process.Pid)
 	s.setHealth(true, "running", "")
+	// The child inherited its own dup of the log fd at Start, so the parent's
+	// copy is dead weight; close it. Without this the Monitor restart loop leaks
+	// one fd per spawn for the life of the process.
+	closeLogFile(logFile.Name(), logFile)
 	return nil
 }
 

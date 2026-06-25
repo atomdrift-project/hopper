@@ -45,6 +45,13 @@ type apiServer struct {
 	// unbounded burst of /api/file requests for members would otherwise pile up
 	// CPU and scratch space. nil disables the limit (e.g. in tests).
 	extractSem chan struct{}
+	// resultSem bounds in-flight /api/result ingestions. Each decodes a result
+	// body up to maxResultBodyBytes and, for an archive, expands the whole
+	// envelope into per-member rows — several times the body size, held live
+	// across a DB store that can stall on lock contention. Without a cap, a
+	// burst of large archive results (or a DB slowdown) lets these expansions
+	// accumulate into a heap blow-up. nil disables the limit (e.g. in tests).
+	resultSem chan struct{}
 	// extractCache holds decompressed compressed-tar parents so the members of
 	// one archive are decompressed once, not once per request. nil disables it,
 	// in which case every member streams through a fresh decompressor.
@@ -87,6 +94,29 @@ func (s *apiServer) acquireExtract(ctx context.Context) error {
 func (s *apiServer) releaseExtract() {
 	if s.extractSem != nil {
 		<-s.extractSem
+	}
+}
+
+// acquireResult blocks until a result-ingestion slot is free or ctx is done.
+// Gating before the body is decoded means a saturated server leaves request
+// bodies unread in the kernel socket buffer instead of materializing them on
+// the heap. A nil resultSem means unlimited (tests construct apiServer directly).
+func (s *apiServer) acquireResult(ctx context.Context) error {
+	if s.resultSem == nil {
+		return nil
+	}
+	select {
+	case s.resultSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// releaseResult returns a slot taken by acquireResult.
+func (s *apiServer) releaseResult() {
+	if s.resultSem != nil {
+		<-s.resultSem
 	}
 }
 
@@ -1192,6 +1222,15 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"starting"}`, http.StatusServiceUnavailable)
 		return
 	}
+	// Bound concurrent ingestions before reading the body: each result expands
+	// to several times its (up-to-maxResultBodyBytes) size and is held across a
+	// DB store that can stall, so an unbounded fan-in is a heap blow-up. When
+	// saturated, shed load with a Retry-After rather than buffering more bodies.
+	if err := s.acquireResult(r.Context()); err != nil {
+		writeRetryable(w, retryAfterBusy, `{"error":"busy: result ingestion saturated"}`)
+		return
+	}
+	defer s.releaseResult()
 	// Slow-loris defense: bound how long the (up to 256 MiB) body may take to
 	// arrive, mirroring handleUpload. Uses the per-request response controller
 	// so it doesn't impose a global ReadTimeout on long-lived /data downloads.

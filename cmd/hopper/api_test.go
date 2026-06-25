@@ -399,6 +399,53 @@ func TestHandleResultStoresAfterRequestContextCanceled(t *testing.T) {
 	}
 }
 
+// TestHandleResultShedsLoadWhenSaturated verifies that with no ingestion slot
+// free the handler sheds load with 503 + Retry-After instead of reading and
+// buffering the body. A pre-filled cap-1 resultSem plus a cancelled request
+// context makes acquireResult take the ctx.Done path deterministically.
+func TestHandleResultShedsLoadWhenSaturated(t *testing.T) {
+	ctx := context.Background()
+	db := mustOpenDB(t, ctx, t.TempDir()+"/hopper.db")
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	sha := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if err := db.InsertSample(ctx, &hopper.Sample{
+		SHA256: sha, Source: "test", Path: "bad/x.bin", Label: "bad", LabelSource: "test",
+	}); err != nil {
+		t.Fatalf("InsertSample: %v", err)
+	}
+
+	api := &apiServer{
+		db: db, tracker: newWorkerTracker(), progress: &loadProgress{},
+		resultSem: make(chan struct{}, 1),
+	}
+	api.resultSem <- struct{}{} // occupy the only slot
+
+	body, err := json.Marshal(resultRequest{SHA256: sha, Worker: "w", Raw: json.RawMessage(`{"fs":[]}`)})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	reqCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	req := httptest.NewRequest(http.MethodPost, "/api/result", bytes.NewReader(body)).WithContext(reqCtx)
+	rec := httptest.NewRecorder()
+
+	api.handleResult(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body = %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("expected Retry-After header on shed response")
+	}
+	if s, err := db.SampleBySHA256(ctx, sha); err == nil && len(s.CleaveResult) != 0 {
+		t.Error("result was stored despite load shedding")
+	}
+}
+
 func TestResultBody(t *testing.T) {
 	t.Parallel()
 
