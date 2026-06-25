@@ -3403,6 +3403,40 @@ func (db *DB) incrementAttemptsPG(ctx context.Context, shas []string) error {
 	return nil
 }
 
+func (db *DB) provenanceBySHA256PG(ctx context.Context, sha256 string) ([]byte, error) {
+	var prov []byte
+	err := db.pool.QueryRow(ctx,
+		`SELECT provenance FROM samples WHERE sha256 = $1`, sha256).Scan(&prov)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("hopper: provenance %s: %w", sha256, err)
+	}
+	return prov, nil
+}
+
+func (db *DB) shasWithProvenancePG(ctx context.Context, shas []string) (map[string]bool, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT sha256 FROM samples WHERE sha256 = ANY($1) AND provenance IS NOT NULL`, shas)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: shas with provenance: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]bool, len(shas))
+	for rows.Next() {
+		var sha string
+		if err := rows.Scan(&sha); err != nil {
+			return nil, fmt.Errorf("hopper: shas with provenance scan: %w", err)
+		}
+		out[sha] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("hopper: shas with provenance rows: %w", err)
+	}
+	return out, nil
+}
+
 // reapStuckPG marks pending samples that have been claimed maxAttempts or more
 // times without ever producing a result. These are poison samples — they wedge
 // or crash a worker before it can POST a result or an error, so no other gate

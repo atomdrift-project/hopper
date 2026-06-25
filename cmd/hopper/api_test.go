@@ -657,20 +657,15 @@ func TestHandleUploadAuth(t *testing.T) {
 	check("wrong token short", "Bearer short", http.StatusUnauthorized)
 	check("empty bearer value", "Bearer ", http.StatusUnauthorized)
 
-	t.Run("disabled when no token", func(t *testing.T) {
+	t.Run("open when no token configured", func(t *testing.T) {
 		t.Parallel()
-		api2 := &apiServer{
-			tracker:  newWorkerTracker(),
-			dataRoot: t.TempDir(),
-			db:       &hopper.DB{},
-		}
-		r := httptest.NewRequest(http.MethodPost, "/api/upload", strings.NewReader("x"))
-		r.Header.Set("Authorization", "Bearer anything")
-		r.ContentLength = 1
-		w := httptest.NewRecorder()
-		api2.handleUpload(w, r)
-		if w.Code != http.StatusServiceUnavailable {
-			t.Errorf("code=%d body=%s want=%d", w.Code, w.Body.String(), http.StatusServiceUnavailable)
+		// With no token set the endpoint is open: auth passes regardless of (or
+		// without) an Authorization header, so an internal client can push content
+		// without shared-secret plumbing. The browser CSRF guard, checked later in
+		// the handler, is the remaining gate.
+		api2 := &apiServer{tracker: newWorkerTracker(), dataRoot: t.TempDir()}
+		if err := api2.checkUploadAuth(httptest.NewRequest(http.MethodPost, "/api/upload", http.NoBody)); err != nil {
+			t.Errorf("checkUploadAuth with no token configured = %v, want nil (open)", err)
 		}
 	})
 }

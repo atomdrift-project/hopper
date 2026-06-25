@@ -120,11 +120,6 @@ func (s *apiServer) releaseResult() {
 	}
 }
 
-// errUploadDisabled is the sentinel for "no HOPPER_UPLOAD_TOKEN configured".
-// The auth handler dispatches on this with errors.Is to return 503 (disabled)
-// rather than 401 (auth failed).
-var errUploadDisabled = errors.New("upload endpoint disabled (set HOPPER_UPLOAD_TOKEN)")
-
 // setUploadToken stores sha256(token) for later constant-time comparison.
 // The plaintext is scoped to this call; once it returns, the only in-memory
 // copy is the SHA-256 digest. Returns an error if the token is too short to
@@ -586,6 +581,7 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/upload", s.handleUpload)
 	mux.HandleFunc("POST /api/known", s.handleKnown)
 	mux.HandleFunc("GET /api/file/{sha256}", s.handleFile)
+	mux.HandleFunc("GET /api/provenance/{sha256}", s.handleProvenance)
 	mux.Handle("GET /data/", s.safeFileServer())
 }
 
@@ -1136,6 +1132,20 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 			//nolint:gosec // worker sanitized by validWorkerName
 			slog.Warn("increment claim attempts failed",
 				"worker", worker, "count", len(claimedSHAs), "error", err)
+		}
+
+		// Stamp which claimed samples carry a provenance sidecar, so the worker
+		// fetches the registry record (/api/provenance/{sha256}) only for those.
+		// Best-effort: on a probe failure HasProvenance stays false and the
+		// worker simply skips the fetch — it never blocks handing out work.
+		if withProv, err := s.db.ShasWithProvenance(ctx, claimedSHAs); err != nil {
+			//nolint:gosec // worker sanitized by validWorkerName
+			slog.Warn("provenance presence probe failed",
+				"worker", worker, "count", len(claimedSHAs), "error", err)
+		} else {
+			for i := range jobs {
+				jobs[i].HasProvenance = withProv[jobs[i].SHA256]
+			}
 		}
 	}
 
@@ -1781,12 +1791,13 @@ func writeJSONError(w http.ResponseWriter, code int, body string) {
 //     its SHA-256 does. A core dump or /proc/<pid>/mem read by a
 //     post-compromise adversary still finds the hash, not the secret.
 //
-// Returns errUploadDisabled when no token is configured (the handler
-// translates that to 503); any other error becomes 401. The HTTP response
-// body is the same in either case — the distinction is for logging.
+// When no token is configured the endpoint is open: a bearer token is enforced
+// only when one is set, so an internal deployment can push content without
+// shared-secret plumbing while the browser CSRF guard still blocks form posts.
+// A configured-but-wrong token returns a 401 the caller maps from any error.
 func (s *apiServer) checkUploadAuth(r *http.Request) error {
 	if !s.uploadTokenSet {
-		return errUploadDisabled
+		return nil
 	}
 	auth := r.Header.Get("Authorization")
 	const prefix = "Bearer "
@@ -1937,13 +1948,10 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Auth first — every later step touches disk or DB.
+	// Auth first — every later step touches disk or DB. Only enforced when a
+	// token is configured; otherwise the endpoint is open (CSRF guard still runs).
 	if err := s.checkUploadAuth(r); err != nil {
 		slog.Warn("upload rejected: auth", "reason", err, "remote", r.RemoteAddr)
-		if errors.Is(err, errUploadDisabled) {
-			writeJSONError(w, http.StatusServiceUnavailable, `{"error":"upload disabled"}`)
-			return
-		}
 		w.Header().Set("WWW-Authenticate", `Bearer realm="hopper"`)
 		writeJSONError(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
 		return
@@ -2357,6 +2365,49 @@ func trimClientError(msg string) string {
 	return msg
 }
 
+// handleProvenance serves the provenance sidecar a sample was ingested with, so
+// a worker can apply its registry record (and a forensic reader can inspect the
+// raw upstream documents) without re-fetching. GET /api/provenance/{sha256}.
+// 204 when the sample exists but carries no sidecar; 404 when it is unknown. The
+// sidecar is fixed for a content-addressed sha256, so the response is cacheable.
+func (s *apiServer) handleProvenance(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
+		return
+	}
+	sha := r.PathValue("sha256")
+	if !validSHA256(sha) {
+		http.Error(w, `{"error":"invalid sha256"}`, http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
+	defer cancel()
+
+	prov, err := s.db.ProvenanceBySHA256(ctx, sha)
+	if err != nil {
+		if errors.Is(err, hopper.ErrNotFound) {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		} else {
+			http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		}
+		return
+	}
+	if len(prov) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// The sidecar is fixed for a content-addressed sha256, so it never changes:
+	// mark it immutable with a one-year max-age (HTTP's effective "forever").
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	if _, err := w.Write(prov); err != nil { //nolint:gosec // prov is stored JSON served with nosniff; sha256 validated by validSHA256
+		slog.Warn("write provenance failed", "sha256", sha, "error", err) //nolint:gosec // sha256 validated by validSHA256
+	}
+}
+
 // handleFile serves file content for remote workers.
 // GET /api/file/{sha256}.
 func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
@@ -2434,6 +2485,8 @@ func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
+	// Content-addressed by sha256: the bytes never change, so cache forever.
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
 }
 
@@ -2570,6 +2623,8 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
+	// Content-addressed by sha256: the extracted member's bytes never change.
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 
 	// Compressed tars (tar.xz/tar.zst/tar.gz/tar.bz2) are not seekable, so
 	// extracting member K re-runs the whole decompressor from byte 0 — O(N×M) for
@@ -2773,6 +2828,8 @@ func (s *apiServer) safeFileServer() http.Handler {
 			return
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
+		// Content-addressed by sha256 (the path embeds the hash), so cache forever.
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
 	})
 }

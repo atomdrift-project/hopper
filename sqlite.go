@@ -2669,6 +2669,48 @@ func (db *DB) incrementAttemptsSQLite(ctx context.Context, shas []string) error 
 	return nil
 }
 
+func (db *DB) provenanceBySHA256SQLite(ctx context.Context, sha256 string) ([]byte, error) {
+	var prov []byte
+	err := db.lite.QueryRowContext(ctx,
+		`SELECT provenance FROM samples WHERE sha256 = ?`, sha256).Scan(&prov)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("hopper: provenance %s: %w", sha256, err)
+	}
+	// SQLite stores JSONB as NUL-escaped text (jsonTextOrNil); undo it so the
+	// bytes match what was written, exactly as the full sample read does.
+	return restoreNULs(prov), nil
+}
+
+func (db *DB) shasWithProvenanceSQLite(ctx context.Context, shas []string) (map[string]bool, error) {
+	args := make([]any, len(shas))
+	for i, s := range shas {
+		args[i] = s
+	}
+	//nolint:gosec // placeholders are '?' bind markers; sha values are parameterized via args.
+	q := `SELECT sha256 FROM samples WHERE provenance IS NOT NULL AND sha256 IN (` +
+		strings.Repeat("?,", len(shas)-1) + `?)`
+	rows, err := db.lite.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: shas with provenance: %w", err)
+	}
+	defer func() { _ = rows.Close() }() //nolint:errcheck // best-effort
+	out := make(map[string]bool, len(shas))
+	for rows.Next() {
+		var sha string
+		if err := rows.Scan(&sha); err != nil {
+			return nil, fmt.Errorf("hopper: shas with provenance scan: %w", err)
+		}
+		out[sha] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("hopper: shas with provenance rows: %w", err)
+	}
+	return out, nil
+}
+
 // reapStuckSQLite mirrors reapStuckPG.
 func (db *DB) reapStuckSQLite(ctx context.Context, maxAttempts int) (int64, error) {
 	ts := now()

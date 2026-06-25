@@ -1128,6 +1128,23 @@ func (db *DB) IncrementAttempts(ctx context.Context, shas []string) error {
 	return db.incrementAttemptsSQLite(ctx, shas)
 }
 
+// ShasWithProvenance returns the subset of shas whose sample row carries a
+// provenance sidecar (a non-null provenance column), as a set for O(1) lookup.
+// Used by the claim path to stamp ClaimJob.HasProvenance so a worker fetches a
+// sample's registry record only when one exists. A sample with provenance but no
+// registry slot is a tolerated false positive — the worker simply finds no
+// record — so this stays one cheap presence check rather than a JSONB path probe
+// whose syntax differs across backends.
+func (db *DB) ShasWithProvenance(ctx context.Context, shas []string) (map[string]bool, error) {
+	if len(shas) == 0 {
+		return map[string]bool{}, nil
+	}
+	if db.pool != nil {
+		return db.shasWithProvenancePG(ctx, shas)
+	}
+	return db.shasWithProvenanceSQLite(ctx, shas)
+}
+
 // ReapStuck marks pending samples claimed MaxClaimAttempts or more times
 // without a result as skip='stuck', removing them from the pending pool.
 // Returns the number reaped.
@@ -1727,6 +1744,18 @@ func (db *DB) SampleBySHA256(ctx context.Context, sha256 string) (*Sample, error
 	return db.sampleBySHA256SQLite(ctx, sha256)
 }
 
+// ProvenanceBySHA256 returns just the provenance sidecar bytes for a sample,
+// without loading the heavy cleave_result/litmus_result columns SampleBySHA256
+// pulls (the sidecar is excluded from the sample column set for exactly that
+// reason). Returns ErrNotFound when the sample is unknown, and (nil, nil) when
+// it exists but carries no sidecar.
+func (db *DB) ProvenanceBySHA256(ctx context.Context, sha256 string) ([]byte, error) {
+	if db.pool != nil {
+		return db.provenanceBySHA256PG(ctx, sha256)
+	}
+	return db.provenanceBySHA256SQLite(ctx, sha256)
+}
+
 // KnownSHA256 returns the subset of the given digests that already have a
 // sample row. It is a deliberately minimal existence probe — a single
 // index-only scan of the unique sha256 key, hydrating no row data — so a bulk
@@ -2236,6 +2265,12 @@ type ClaimJob struct {
 	Path      string `json:"path"`
 	FileType  string `json:"file_type"`
 	SizeBytes int64  `json:"size_bytes"`
+	// HasProvenance reports whether hopper holds a provenance sidecar for this
+	// sample, so the worker fetches /api/provenance/{sha256} for its registry
+	// record only when there is one — avoiding a wasted round-trip on the
+	// majority of samples that carry none. Stamped per claim batch, not selected
+	// by each tier query. Omitted from the wire when false.
+	HasProvenance bool `json:"has_provenance,omitempty"`
 }
 
 // Worker is a litmus worker's latest heartbeat data.

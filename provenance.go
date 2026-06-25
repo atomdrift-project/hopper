@@ -116,6 +116,16 @@ type MetadataRecord struct {
 	At        time.Time       `json:"at"`
 	Status    string          `json:"status"`
 	Raw       json.RawMessage `json:"raw,omitempty"`
+	// Record is the normalized, ecosystem-agnostic account of the package — a
+	// `fletch::Registry` document — when the producer has already parsed the raw
+	// source(s) into the common shape a consumer reasons over. It is the read
+	// path: scan applies it directly as a scan's root registry, so a
+	// hopper-sourced analysis sees the same registry facts a live fetch would,
+	// without re-parsing or re-fetching. Raw beneath it then holds the verbatim
+	// source document(s) the record was derived from — for the fletch registry
+	// collector, the full array of every provider document it fetched — the
+	// re-parsing backup. Empty for a feed record or a producer that ships only Raw.
+	Record json.RawMessage `json:"record,omitempty"`
 }
 
 // Finalize enforces the invariants every conforming sidecar must hold — schema
