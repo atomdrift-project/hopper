@@ -4328,7 +4328,7 @@ func TestUpdateEcosystem(t *testing.T) {
 }
 
 // TestTriageMostRecent verifies that the per-dataset limit applies globally —
-// the most recently analyzed rows across all file types, not capped per type.
+// the most recently added rows across all file types, not capped per type.
 func TestTriageMostRecent(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
@@ -4338,7 +4338,7 @@ func TestTriageMostRecent(t *testing.T) {
 	// cleave result whose single trait sets file_type and max_crit. level<5
 	// with one trait => max_crit<5 && suspicious_count<2 (a "bad" miss); level>=5
 	// => flagged (a "good"/"new" hit). Samples are inserted oldest-first, so
-	// later inserts are the most recently analyzed.
+	// later inserts are the most recently added (higher created_at and id).
 	analyze := func(label, fileType string, level int) {
 		n++
 		sha := fmt.Sprintf("%064x", n)
@@ -4358,7 +4358,7 @@ func TestTriageMostRecent(t *testing.T) {
 	}
 
 	// bad misses: 3 apk then 2 deb; good/new hits mirror the structure. The deb
-	// rows are analyzed last, so a global most-recent limit favors them.
+	// rows are added last, so a global most-recent limit favors them.
 	for range 3 {
 		analyze("bad", "apk", 1)
 		analyze("good", "apk", 5)
@@ -4399,6 +4399,95 @@ func TestTriageMostRecent(t *testing.T) {
 	}
 	if c := counts(got); c["apk"] != 2 || len(got) != 2 {
 		t.Errorf("TriageBad(apk) = %v (len %d), want only 2 apk", c, len(got))
+	}
+}
+
+// TestTriageThresholds pins the detection boundaries: good/new surface any
+// sample with at least one suspicious-or-hostile finding (suspicious_count >= 1),
+// while bad surfaces samples that fall short of a confident detection — those
+// lacking either a hostile finding or a second suspicious-or-hostile finding
+// (max_crit < 5 OR suspicious_count < 2).
+func TestTriageThresholds(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	var n int
+	// analyze inserts a top-level sample with the given label and a cleave result
+	// carrying one trait per level in levels (l>=5 hostile, l==4 suspicious). It
+	// returns the sha so callers can assert membership.
+	analyze := func(label string, levels ...int) string {
+		n++
+		sha := fmt.Sprintf("%064x", n)
+		mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test", Label: label, LabelSource: "test"})
+		ts := make([]string, len(levels))
+		for i, l := range levels {
+			ts[i] = fmt.Sprintf(`{"l":%d}`, l)
+		}
+		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"apk","x":0,"dp":0,"ts":[%s]}]}`,
+			sha, strings.Join(ts, ","))
+		if err := db.UpdateCleaveResult(ctx, sha, result, nil, ""); err != nil {
+			t.Fatalf("UpdateCleaveResult: %v", err)
+		}
+		return sha
+	}
+
+	has := func(samples []*Sample, sha string) bool {
+		for _, s := range samples {
+			if s.SHA256 == sha {
+				return true
+			}
+		}
+		return false
+	}
+
+	// good/new: a lone suspicious finding (l=4) now qualifies; a lone hostile
+	// finding (l=5) qualifies too; an all-benign sample does not.
+	goodSusp := analyze("good", 4)
+	goodHostile := analyze("good", 5)
+	goodBenign := analyze("good", 1, 3)
+	newSusp := analyze("unknown", 4)
+	newBenign := analyze("unknown", 2)
+
+	// bad: a confident detection (hostile + a second suspicious finding) is NOT a
+	// miss; everything short of that bar is. A lone hostile finding lacks the
+	// second finding, and a pair of suspicious findings lacks the hostile one —
+	// both are misses worth surfacing.
+	badConfident := analyze("bad", 5, 4)
+	badLoneHostile := analyze("bad", 5)
+	badTwoSusp := analyze("bad", 4, 4)
+	badBenign := analyze("bad", 1)
+
+	good, err := db.TriageGood(ctx, 100, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageGood: %v", err)
+	}
+	if !has(good, goodSusp) || !has(good, goodHostile) {
+		t.Errorf("TriageGood missing suspicious/hostile sample")
+	}
+	if has(good, goodBenign) {
+		t.Errorf("TriageGood included an all-benign sample")
+	}
+
+	gotNew, err := db.TriageNew(ctx, 100, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageNew: %v", err)
+	}
+	if !has(gotNew, newSusp) {
+		t.Errorf("TriageNew missing suspicious sample")
+	}
+	if has(gotNew, newBenign) {
+		t.Errorf("TriageNew included an all-benign sample")
+	}
+
+	bad, err := db.TriageBad(ctx, 100, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageBad: %v", err)
+	}
+	if has(bad, badConfident) {
+		t.Errorf("TriageBad included a confidently-detected sample")
+	}
+	if !has(bad, badLoneHostile) || !has(bad, badTwoSusp) || !has(bad, badBenign) {
+		t.Errorf("TriageBad missing a detection-miss sample")
 	}
 }
 

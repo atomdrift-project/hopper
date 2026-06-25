@@ -2534,8 +2534,8 @@ func (db *DB) triageBadPG(ctx context.Context, limit int, f TriageFilter) ([]*Sa
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
 		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = ''
-		   AND max_crit < 5 AND suspicious_count < 2`+extra+`
-		 ORDER BY analyzed_at DESC NULLS LAST LIMIT $`+strconv.Itoa(len(args)),
+		   AND (max_crit < 5 OR suspicious_count < 2)`+extra+`
+		 ORDER BY created_at DESC, id DESC LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage bad: %w", err)
@@ -2549,8 +2549,8 @@ func (db *DB) triageGoodPG(ctx context.Context, limit int, f TriageFilter) ([]*S
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
 		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = ''
-		   AND (max_crit >= 5 OR suspicious_count >= 2)`+extra+`
-		 ORDER BY analyzed_at DESC NULLS LAST LIMIT $`+strconv.Itoa(len(args)),
+		   AND suspicious_count >= 1`+extra+`
+		 ORDER BY created_at DESC, id DESC LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage good: %w", err)
@@ -2564,8 +2564,8 @@ func (db *DB) triageNewPG(ctx context.Context, limit int, f TriageFilter) ([]*Sa
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
 		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = ''
-		   AND (max_crit >= 5 OR suspicious_count >= 2)`+extra+`
-		 ORDER BY analyzed_at DESC NULLS LAST LIMIT $`+strconv.Itoa(len(args)),
+		   AND suspicious_count >= 1`+extra+`
+		 ORDER BY created_at DESC, id DESC LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage new: %w", err)

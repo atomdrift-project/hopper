@@ -2438,8 +2438,10 @@ type TriageFilter struct {
 }
 
 // TriageBad returns analyzed top-level bad-labeled samples that cleave did not
-// flag (max_crit < 5 AND suspicious_count < 2), taking up to limit of the most
-// recently analyzed. No skip/status filters — intended for manual triage.
+// confidently flag — lacking either a hostile finding or a second
+// suspicious-or-hostile finding (max_crit < 5 OR suspicious_count < 2) — taking
+// up to limit of the most recently added (created_at). No skip/status filters —
+// intended for manual triage.
 func (db *DB) TriageBad(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
 		return db.triageBadPG(ctx, limit, f)
@@ -2447,9 +2449,10 @@ func (db *DB) TriageBad(ctx context.Context, limit int, f TriageFilter) ([]*Samp
 	return db.triageBadSQLite(ctx, limit, f)
 }
 
-// TriageGood returns analyzed top-level good-labeled samples that cleave
-// flagged (max_crit >= 5 OR suspicious_count >= 2), taking up to limit of the
-// most recently analyzed. No skip/status filters — intended for manual triage.
+// TriageGood returns analyzed top-level good-labeled samples that cleave flagged
+// with at least one suspicious-or-hostile finding (suspicious_count >= 1),
+// taking up to limit of the most recently added (created_at). No skip/status
+// filters — intended for manual triage.
 func (db *DB) TriageGood(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
 		return db.triageGoodPG(ctx, limit, f)
@@ -2458,8 +2461,9 @@ func (db *DB) TriageGood(ctx context.Context, limit int, f TriageFilter) ([]*Sam
 }
 
 // TriageNew returns analyzed top-level unknown-labeled samples that cleave
-// flagged (max_crit >= 5 OR suspicious_count >= 2), taking up to limit of the
-// most recently analyzed. No skip/status filters — intended for manual triage.
+// flagged with at least one suspicious-or-hostile finding (suspicious_count >=
+// 1), taking up to limit of the most recently added (created_at). No skip/status
+// filters — intended for manual triage.
 func (db *DB) TriageNew(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
 		return db.triageNewPG(ctx, limit, f)
