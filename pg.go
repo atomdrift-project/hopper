@@ -2532,14 +2532,10 @@ func (db *DB) triageBadPG(ctx context.Context, limit int, f TriageFilter) ([]*Sa
 	extra, args := triageFilterClausePG(f, 1)
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM (
-		     SELECT `+pgSampleCols+`,
-		            row_number() OVER (PARTITION BY file_type ORDER BY analyzed_at DESC NULLS LAST) AS triage_rn
-		       FROM samples
-		      WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = ''
-		        AND max_crit < 5 AND suspicious_count < 2`+extra+`
-		 ) t WHERE triage_rn <= $`+strconv.Itoa(len(args))+`
-		 ORDER BY file_type, analyzed_at DESC NULLS LAST`,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = ''
+		   AND max_crit < 5 AND suspicious_count < 2`+extra+`
+		 ORDER BY analyzed_at DESC NULLS LAST LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage bad: %w", err)
@@ -2551,14 +2547,10 @@ func (db *DB) triageGoodPG(ctx context.Context, limit int, f TriageFilter) ([]*S
 	extra, args := triageFilterClausePG(f, 1)
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM (
-		     SELECT `+pgSampleCols+`,
-		            row_number() OVER (PARTITION BY file_type ORDER BY analyzed_at DESC NULLS LAST) AS triage_rn
-		       FROM samples
-		      WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = ''
-		        AND (max_crit >= 5 OR suspicious_count >= 2)`+extra+`
-		 ) t WHERE triage_rn <= $`+strconv.Itoa(len(args))+`
-		 ORDER BY file_type, analyzed_at DESC NULLS LAST`,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = ''
+		   AND (max_crit >= 5 OR suspicious_count >= 2)`+extra+`
+		 ORDER BY analyzed_at DESC NULLS LAST LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage good: %w", err)
@@ -2570,14 +2562,10 @@ func (db *DB) triageNewPG(ctx context.Context, limit int, f TriageFilter) ([]*Sa
 	extra, args := triageFilterClausePG(f, 1)
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM (
-		     SELECT `+pgSampleCols+`,
-		            row_number() OVER (PARTITION BY file_type ORDER BY analyzed_at DESC NULLS LAST) AS triage_rn
-		       FROM samples
-		      WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = ''
-		        AND (max_crit >= 5 OR suspicious_count >= 2)`+extra+`
-		 ) t WHERE triage_rn <= $`+strconv.Itoa(len(args))+`
-		 ORDER BY file_type, analyzed_at DESC NULLS LAST`,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = ''
+		   AND (max_crit >= 5 OR suspicious_count >= 2)`+extra+`
+		 ORDER BY analyzed_at DESC NULLS LAST LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage new: %w", err)

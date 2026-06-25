@@ -4327,11 +4327,9 @@ func TestUpdateEcosystem(t *testing.T) {
 	}
 }
 
-// TestTriagePerFileType verifies that the per-dataset limit applies per
-// file_type, not globally: with a limit of 2 and two file types present, each
-// type contributes up to 2 rows (4 total), where a flat global LIMIT would
-// return only 2.
-func TestTriagePerFileType(t *testing.T) {
+// TestTriageMostRecent verifies that the per-dataset limit applies globally —
+// the most recently analyzed rows across all file types, not capped per type.
+func TestTriageMostRecent(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
 
@@ -4339,7 +4337,8 @@ func TestTriagePerFileType(t *testing.T) {
 	// analyze inserts a top-level sample with the given label, then records a
 	// cleave result whose single trait sets file_type and max_crit. level<5
 	// with one trait => max_crit<5 && suspicious_count<2 (a "bad" miss); level>=5
-	// => flagged (a "good"/"new" hit).
+	// => flagged (a "good"/"new" hit). Samples are inserted oldest-first, so
+	// later inserts are the most recently analyzed.
 	analyze := func(label, fileType string, level int) {
 		n++
 		sha := fmt.Sprintf("%064x", n)
@@ -4358,14 +4357,14 @@ func TestTriagePerFileType(t *testing.T) {
 		return m
 	}
 
-	// bad misses: 3 apk + 2 deb; good/new hits mirror the structure so all three
-	// datasets exercise the same per-type cap.
-	for i := 0; i < 3; i++ {
+	// bad misses: 3 apk then 2 deb; good/new hits mirror the structure. The deb
+	// rows are analyzed last, so a global most-recent limit favors them.
+	for range 3 {
 		analyze("bad", "apk", 1)
 		analyze("good", "apk", 5)
 		analyze("unknown", "apk", 5)
 	}
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		analyze("bad", "deb", 1)
 		analyze("good", "deb", 5)
 		analyze("unknown", "deb", 5)
@@ -4383,15 +4382,13 @@ func TestTriagePerFileType(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
-		c := counts(got)
-		if c["apk"] != 2 {
-			t.Errorf("%s: apk = %d, want 2 (capped per file type)", tc.name, c["apk"])
+		// Limit 2 returns exactly 2 rows total (global cap), and they are the
+		// most recent — both deb, not split across file types.
+		if len(got) != 2 {
+			t.Errorf("%s: total = %d, want 2 (global cap)", tc.name, len(got))
 		}
-		if c["deb"] != 2 {
-			t.Errorf("%s: deb = %d, want 2", tc.name, c["deb"])
-		}
-		if len(got) != 4 {
-			t.Errorf("%s: total = %d, want 4", tc.name, len(got))
+		if c := counts(got); c["deb"] != 2 {
+			t.Errorf("%s: deb = %d, want 2 (most recent), counts %v", tc.name, c["deb"], c)
 		}
 	}
 
