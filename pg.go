@@ -1879,7 +1879,7 @@ func (db *DB) storeResultPG(
 	} else {
 		parent.FirstAnalyzedAt = &now
 	}
-	members := memberSamplesFromEnvelope(&parent)
+	env := newMemberEnvelope(&parent)
 
 	truncated := compactCleaveResultForStorage(cleaveRaw)
 	var litmusVal, llmVal []byte
@@ -1890,29 +1890,26 @@ func (db *DB) storeResultPG(
 		llmVal = sanitizeJSONB(llm)
 	}
 
-	// Members first: write every member in bounded batches, each committed on
-	// its own, before the parent's truncating UPDATE below. The member upsert is
-	// idempotent (analyzed_at-gated), so a retry of the whole store after a
-	// lock_timeout on one batch re-runs the committed batches as no-ops.
+	// Members first: build, write, and release them one bounded batch at a time,
+	// each committed on its own, before the parent's truncating UPDATE below. The
+	// member upsert is idempotent (analyzed_at-gated), so a retry of the whole
+	// store after a lock_timeout on one batch re-runs the committed batches as
+	// no-ops. Building per batch (rather than all members up front) keeps a large
+	// archive from materializing every member's re-marshaled cleave/litmus slice
+	// at once — several times the envelope size — held across the whole store;
+	// each batch falls out of scope and is reclaimed before the next.
 	var stats StoreStats
-	stats.Members = len(members)
-	for start := 0; start < len(members); start += memberStoreBatch {
-		batch := members[start:min(start+memberStoreBatch, len(members))]
-		// Build the staging tuples for just this batch, not all members at once:
-		// a large archive's members otherwise materialize a second full copy of
-		// every member's JSON alongside the members themselves.
+	for start := 0; start < env.len(); start += memberStoreBatch {
+		batch := env.buildRange(start, min(start+memberStoreBatch, env.len()))
+		stats.Members += len(batch)
+		if len(batch) == 0 {
+			continue
+		}
 		n, err := db.storeMemberRowsPG(ctx, sampleStagingRows(batch))
 		if err != nil {
 			return StoreStats{}, err
 		}
 		stats.MembersStored += n
-		// The batch is durably staged; drop its heavy per-member JSON so a large
-		// archive's members don't all sit in memory until the parent UPDATE below
-		// (which can block on lock contention) completes.
-		for _, m := range batch {
-			m.CleaveResult = nil
-			m.LitmusResult = nil
-		}
 	}
 
 	// Parent last, in its own short transaction. Truncating it only after the

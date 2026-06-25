@@ -715,6 +715,38 @@ func canonicalSHA(sha256 string, cleaveResult []byte) string {
 // transaction by StoreResult, or via ExplodeArchiveMembers. parent.AnalyzedAt
 // stamps each member's analyzed_at, which gates the freshness refresh on store.
 func memberSamplesFromEnvelope(parent *Sample) []*Sample {
+	e := newMemberEnvelope(parent)
+	if e == nil {
+		return nil
+	}
+	return e.buildRange(0, e.len())
+}
+
+// memberTrait reads a member's per-trait criticality across envelope
+// generations: v8 uses crit/conf, pre-v8 used l/c.
+type memberTrait struct {
+	Crit    int     `json:"crit"`
+	OldCrit int     `json:"l"`
+	Conf    float64 `json:"conf"`
+	OldConf float64 `json:"c"`
+}
+
+// memberEnvelope holds an archive's parsed cleave envelope so its members can be
+// built in bounded batches rather than all at once: a large archive otherwise
+// materializes every member's re-marshaled cleave slice simultaneously, several
+// times the envelope size, held across the whole store. The parent litmus
+// envelope is parsed once (into litmus), so per-member extraction is O(1) rather
+// than the former O(N²) re-parse for every member.
+type memberEnvelope struct {
+	parent *Sample
+	files  []json.RawMessage
+	litmus *litmusMemberIndex
+}
+
+// newMemberEnvelope parses parent.CleaveResult into its member entries, applying
+// the generation fallback (files/fs) and the fan-out cap. A nil result means the
+// parent carries no usable envelope, hence no members.
+func newMemberEnvelope(parent *Sample) *memberEnvelope {
 	if len(parent.CleaveResult) == 0 {
 		return nil
 	}
@@ -727,8 +759,9 @@ func memberSamplesFromEnvelope(parent *Sample) []*Sample {
 		slog.Warn("parse cleave result for member extraction", "parent", parent.SHA256, "error", err)
 		return nil
 	}
-	if len(report.Files) == 0 {
-		report.Files = report.OldFiles
+	files := report.Files
+	if len(files) == 0 {
+		files = report.OldFiles
 	}
 
 	// Bound the fan-out. A cleave result is worker-supplied and capped only by
@@ -738,23 +771,35 @@ func memberSamplesFromEnvelope(parent *Sample) []*Sample {
 	// single request — an OOM / DB-pollution lever. The cap is far above any
 	// real archive's analyzed member count; truncation is logged so a genuine
 	// archive that ever approaches it is visible rather than silently clipped.
-	files := report.Files
 	if len(files) > maxArchiveMembers {
 		slog.Warn("archive explosion truncated: member count exceeds cap",
 			"parent", parent.SHA256, "reported", len(files), "cap", maxArchiveMembers)
 		files = files[:maxArchiveMembers]
 	}
-
-	// memberTrait reads a member's per-trait criticality across envelope
-	// generations: v8 uses crit/conf, pre-v8 used l/c.
-	type memberTrait struct {
-		Crit    int     `json:"crit"`
-		OldCrit int     `json:"l"`
-		Conf    float64 `json:"conf"`
-		OldConf float64 `json:"c"`
+	return &memberEnvelope{
+		parent: parent,
+		files:  files,
+		litmus: newLitmusMemberIndex(parent.LitmusResult),
 	}
-	members := make([]*Sample, 0, len(files))
-	for id, raw := range files {
+}
+
+// len reports the number of member entries before per-entry skips.
+func (e *memberEnvelope) len() int {
+	if e == nil {
+		return 0
+	}
+	return len(e.files)
+}
+
+// buildRange builds the member samples for entries [start,end). The heavy
+// per-member cleave and litmus slices are allocated here, so a caller storing in
+// batches can build, persist, and release one batch at a time instead of holding
+// every member at once. Entries cleave couldn't classify (no depth, bad sha, no
+// type or path) are skipped, so the result may be shorter than end-start.
+func (e *memberEnvelope) buildRange(start, end int) []*Sample {
+	members := make([]*Sample, 0, end-start)
+	for id := start; id < end; id++ {
+		raw := e.files[id]
 		// The members-array key was renamed across envelope generations
 		// (v8 "traits", v7 "find", v4 "ts"), as were depth ("depth"/"dp") and
 		// size ("size"/"sz"). Decode every generation so old envelopes still
@@ -828,7 +873,7 @@ func memberSamplesFromEnvelope(parent *Sample) []*Sample {
 		}
 
 		skip := ""
-		if parent.Label == "bad" && maxLevel < 5 && suspiciousCount <= 1 {
+		if e.parent.Label == "bad" && maxLevel < 5 && suspiciousCount <= 1 {
 			skip = skipBenignArchiveItem
 		}
 
@@ -854,31 +899,31 @@ func memberSamplesFromEnvelope(parent *Sample) []*Sample {
 			inArchive = inArchive[idx+2:]
 		}
 		memberPath := inArchive
-		if parent.Path != "" {
-			memberPath = parent.Path + "!!" + inArchive
+		if e.parent.Path != "" {
+			memberPath = e.parent.Path + "!!" + inArchive
 		}
 
-		firstAnalyzedAt := parent.FirstAnalyzedAt
+		firstAnalyzedAt := e.parent.FirstAnalyzedAt
 		if firstAnalyzedAt == nil {
-			firstAnalyzedAt = parent.AnalyzedAt
+			firstAnalyzedAt = e.parent.AnalyzedAt
 		}
 		members = append(members, &Sample{
 			SHA256:          entry.SHA256,
-			Source:          parent.Source,
-			Feed:            parent.Feed,
-			Ecosystem:       parent.Ecosystem,
+			Source:          e.parent.Source,
+			Feed:            e.parent.Feed,
+			Ecosystem:       e.parent.Ecosystem,
 			Filename:        inArchive,
 			FileType:        entry.FileType,
 			SizeBytes:       entry.Size,
-			Label:           parent.Label,
-			LabelSource:     parent.LabelSource,
+			Label:           e.parent.Label,
+			LabelSource:     e.parent.LabelSource,
 			Path:            memberPath,
 			CleaveResult:    singleFile,
-			LitmusResult:    litmusResultForMember(parent.LitmusResult, id),
-			CanonicalSHA256: parent.CanonicalSHA256,
-			Parent:          parent.SHA256,
+			LitmusResult:    e.litmus.forMember(id),
+			CanonicalSHA256: e.parent.CanonicalSHA256,
+			Parent:          e.parent.SHA256,
 			Skip:            skip,
-			AnalyzedAt:      parent.AnalyzedAt,
+			AnalyzedAt:      e.parent.AnalyzedAt,
 			FirstAnalyzedAt: firstAnalyzedAt,
 		})
 	}
@@ -945,7 +990,20 @@ type staleRefresh struct {
 	LitmusResult []byte
 }
 
-func litmusResultForMember(parent []byte, id int) []byte {
+// litmusMemberIndex holds a parent litmus envelope parsed once so each member's
+// slice can be extracted in O(1). Re-parsing the whole envelope per member (the
+// former behavior) is O(N²) over an archive's members — a transient-allocation
+// firehose for large archives. A nil *litmusMemberIndex is valid and yields nil
+// for every member.
+type litmusMemberIndex struct {
+	meta    map[string]json.RawMessage // envelope-level metadata applied to every member
+	byID    map[int]map[string]json.RawMessage
+	byIndex []map[string]json.RawMessage
+}
+
+// newLitmusMemberIndex parses a parent litmus envelope into its per-member
+// entries. An empty or unparseable envelope yields nil (a valid, all-nil index).
+func newLitmusMemberIndex(parent []byte) *litmusMemberIndex {
 	if len(parent) == 0 {
 		return nil
 	}
@@ -953,25 +1011,40 @@ func litmusResultForMember(parent []byte, id int) []byte {
 	if err := json.Unmarshal(parent, &envelope); err != nil {
 		return nil
 	}
-	var files []map[string]json.RawMessage
 	rawFiles := envelope["files"]
 	if len(rawFiles) == 0 {
 		rawFiles = envelope["fs"]
 	}
+	var files []map[string]json.RawMessage
 	if err := json.Unmarshal(rawFiles, &files); err != nil {
 		return nil
 	}
-
-	var member map[string]json.RawMessage
+	idx := &litmusMemberIndex{meta: envelope, byIndex: files}
 	for _, f := range files {
 		var got int
-		if err := json.Unmarshal(f["id"], &got); err == nil && got == id {
-			member = f
-			break
+		if err := json.Unmarshal(f["id"], &got); err != nil {
+			continue
+		}
+		if idx.byID == nil {
+			idx.byID = make(map[int]map[string]json.RawMessage, len(files))
+		}
+		if _, exists := idx.byID[got]; !exists {
+			idx.byID[got] = f // first entry wins, matching the former linear scan
 		}
 	}
-	if member == nil && id >= 0 && id < len(files) {
-		member = files[id]
+	return idx
+}
+
+// forMember returns the litmus slice for the member at id, preferring an entry
+// whose "id" field matches and falling back to the positional entry. Returns nil
+// when there is no such member or it carries no findings.
+func (idx *litmusMemberIndex) forMember(id int) []byte {
+	if idx == nil {
+		return nil
+	}
+	member := idx.byID[id]
+	if member == nil && id >= 0 && id < len(idx.byIndex) {
+		member = idx.byIndex[id]
 	}
 	if member == nil || len(member["prob"]) == 0 {
 		return nil
@@ -983,7 +1056,7 @@ func litmusResultForMember(parent []byte, id int) []byte {
 	// litmus outputs we also carry `level`/`threshold`/`thresholds` so
 	// already-stored results stay readable; these are no-ops on v2 envelopes.
 	for _, key := range []string{"v", "version", "thresholds", "threshold", "level", "lvl", "l", "conf", "analyzed_at"} {
-		if v := envelope[key]; len(v) != 0 {
+		if v := idx.meta[key]; len(v) != 0 {
 			out[key] = v
 		}
 	}
@@ -993,6 +1066,13 @@ func litmusResultForMember(parent []byte, id int) []byte {
 		return nil
 	}
 	return b
+}
+
+// litmusResultForMember extracts a single member's litmus slice. It is a
+// single-shot wrapper over litmusMemberIndex; callers exploding many members
+// should build the index once (memberEnvelope does) to amortize the parse.
+func litmusResultForMember(parent []byte, id int) []byte {
+	return newLitmusMemberIndex(parent).forMember(id)
 }
 
 func cleaveFileIndexForSHA(result []byte, sha256 string) (int, bool) {
