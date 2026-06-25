@@ -2275,7 +2275,23 @@ func uploadSample(sha, filename, relPath string, size int64, prov *hopper.Sideca
 	sample.Package = prov.Package.Name
 	sample.Version = prov.Package.Version
 	sample.Feed = prov.Package.Feed
+	// Project the version-less PURL into the queryable column, mirroring
+	// forager's direct-insert path — so an uploaded dependency is findable by
+	// purl_base, not just by the PURL buried in the provenance JSONB.
+	sample.PURLBase = versionlessPURL(prov.Package.PURL)
 	return sample
+}
+
+// versionlessPURL strips the trailing "@version" from a Package URL, yielding
+// the identity form stored in samples.purl_base (e.g. "pkg:npm/lodash@4.17.21"
+// → "pkg:npm/lodash"). The version separator is the last '@'; a scoped npm
+// name's '@' sits earlier (or is percent-encoded), so it is never mistaken for
+// it. Empty in, empty out.
+func versionlessPURL(fullPURL string) string {
+	if i := strings.LastIndexByte(fullPURL, '@'); i > 0 {
+		return fullPURL[:i]
+	}
+	return fullPURL
 }
 
 // sweepUploadTmp removes orphaned upload temp files older than uploadTmpMaxAge.
