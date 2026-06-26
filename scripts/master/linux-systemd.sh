@@ -281,6 +281,13 @@ Environment=XDG_CACHE_HOME=%C/${SERVICE_NAME}
 Environment=PGPASSFILE=%E/${SERVICE_NAME}/.pgpass
 Environment=PATH=${TOOLS_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+# Open upload endpoint: /api/upload accepts content pushes from scan --upload and
+# forager with no bearer token (the browser CSRF guard still blocks form posts).
+# This deployment is internal, so frictionless ingest beats shared-secret
+# plumbing. To require a token instead, drop this line and set
+# Environment=HOPPER_UPLOAD_TOKEN=<token>.
+Environment=HOPPER_UPLOAD_OPEN=1
+
 # Bound the Go heap so the runtime applies GC backpressure *before* the cgroup
 # MemoryHigh below forces pages into swap. The hopper process RSS is almost
 # entirely Go heap; without this the runtime grows to ~2x the live working set

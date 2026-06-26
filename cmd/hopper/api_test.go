@@ -818,6 +818,35 @@ func TestBootstrapUploadTokenFromEnv(t *testing.T) {
 	}
 }
 
+func TestBootstrapUploadTokenOpenMode(t *testing.T) {
+	t.Setenv("HOPPER_UPLOAD_OPEN", "1")
+	// A token in the env must not override open mode — open is checked first.
+	t.Setenv("HOPPER_UPLOAD_TOKEN", "would-be-token-32-bytes-or-more!!")
+	ctx := t.Context()
+	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "bs.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	api := &apiServer{tracker: newWorkerTracker()}
+
+	bootstrapUploadToken(ctx, api, db)
+
+	// Open: the endpoint is not enforced, so a tokenless push is accepted.
+	if api.uploadTokenSet {
+		t.Fatal("uploadTokenSet true under HOPPER_UPLOAD_OPEN; /api/upload should be open")
+	}
+	// But a token is still provisioned in the KV, so prism (which reads it) keeps
+	// working and dropping open mode later re-enforces this same token.
+	stored, err := db.KVGet(ctx, uploadTokenKVKey)
+	if err != nil {
+		t.Fatalf("open mode did not provision a KV token: %v", err)
+	}
+	if stored == "" {
+		t.Error("provisioned upload token is empty")
+	}
+}
+
 func TestBootstrapUploadTokenGeneratesAndPersists(t *testing.T) {
 	t.Setenv("HOPPER_UPLOAD_TOKEN", "")
 	ctx := t.Context()

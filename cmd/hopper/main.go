@@ -157,8 +157,24 @@ func (s *stringListFlag) Set(v string) error {
 // coordination.
 const uploadTokenKVKey = "upload_token"
 
+// uploadOpenRequested reports whether HOPPER_UPLOAD_OPEN asks for an
+// unauthenticated /api/upload — a "1"/"true"/"yes"/"on" value (case-insensitive).
+func uploadOpenRequested() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("HOPPER_UPLOAD_OPEN"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 // bootstrapUploadToken resolves the /api/upload bearer token in this
 // priority order:
+//  0. HOPPER_UPLOAD_OPEN truthy → open: /api/upload is left unauthenticated
+//     (the CSRF guard still blocks browser forms). A token is still provisioned
+//     in the KV (steps 2–3) so prism and other token-sending clients keep
+//     working, but it is not enforced — a tokenless scan/forager push is
+//     accepted. The frictionless choice for an internal deployment.
 //  1. HOPPER_UPLOAD_TOKEN env var (operator override; never written to DB).
 //  2. The persisted hopper_kv row (set by a previous run or peer instance).
 //  3. A freshly-generated 32-byte random token, persisted via INSERT…
@@ -169,7 +185,14 @@ const uploadTokenKVKey = "upload_token"
 // and /api/upload returns 503. The plaintext token is scoped to this
 // function; only the SHA-256 digest survives in apiServer.
 func bootstrapUploadToken(ctx context.Context, api *apiServer, db *hopper.DB) {
-	if env := strings.TrimSpace(os.Getenv("HOPPER_UPLOAD_TOKEN")); env != "" {
+	open := uploadOpenRequested()
+	if open {
+		// Loud: this disables auth on a content-ingest path. A token is still
+		// provisioned below (so prism and other token-sending clients keep
+		// working), but setUploadToken is never called, so checkUploadAuth leaves
+		// the endpoint open — a tokenless scan/forager push is accepted too.
+		slog.Warn("upload endpoint OPEN: /api/upload requires no token (HOPPER_UPLOAD_OPEN set)")
+	} else if env := strings.TrimSpace(os.Getenv("HOPPER_UPLOAD_TOKEN")); env != "" {
 		if err := api.setUploadToken(env); err != nil {
 			slog.Error("HOPPER_UPLOAD_TOKEN rejected; /api/upload disabled", "error", err)
 			return
@@ -219,6 +242,14 @@ func bootstrapUploadToken(ctx context.Context, api *apiServer, db *hopper.DB) {
 		source = "generated"
 	default:
 		slog.Error("upload token DB lookup failed; /api/upload disabled", "error", err)
+		return
+	}
+
+	if open {
+		// Token is now in the KV for clients that send one, but the endpoint
+		// stays open (setUploadToken not called). Dropping HOPPER_UPLOAD_OPEN on
+		// the next start re-enforces this same provisioned token.
+		slog.Info("upload token provisioned but not enforced (open mode)", "source", source, "token_len", len(token))
 		return
 	}
 
