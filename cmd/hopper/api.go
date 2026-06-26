@@ -2072,7 +2072,43 @@ func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request
 			_ = part.Close() //nolint:errcheck // ignore unexpected parts
 		}
 	}
+	// No file part. A provenance-only body is a backfill: attach the sidecar to a
+	// sample hopper already holds the bytes for (matched by artifact.sha256),
+	// without moving any bytes. A body with neither file nor provenance is a
+	// malformed upload.
+	if prov != nil {
+		s.storeProvenanceOnly(w, r, prov)
+		return
+	}
 	writeJSONError(w, http.StatusBadRequest, `{"error":"missing file part"}`)
+}
+
+// storeProvenanceOnly attaches a provenance sidecar to an existing sample that
+// has none — the backfill path for a sample hopper already holds the bytes for
+// (e.g. a dependency ingested as raw bytes with no provenance). No bytes move;
+// the sample is matched by the sidecar's artifact.sha256. Idempotent: a sample
+// that already carries provenance, or one hopper doesn't have, is left
+// untouched. The sidecar was Finalized and Validated by the caller.
+func (s *apiServer) storeProvenanceOnly(w http.ResponseWriter, r *http.Request, prov *hopper.Sidecar) {
+	sha := prov.Artifact.SHA256 // Validate() guarantees 64 lowercase hex
+	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
+	defer cancel()
+
+	// Reuse the upload projection (provenance JSONB + scalar identity columns,
+	// including purl_base); BackfillProvenance only reads those, never the
+	// path/label/source fields, so the existing row's bytes and verdict are safe.
+	sample := uploadSample(sha, prov.Artifact.Filename, "", prov.Artifact.SizeBytes, prov)
+	backfilled, err := s.db.BackfillProvenance(ctx, sample)
+	if err != nil {
+		slog.Error("upload: backfill provenance", "sha256", sha, "error", err)
+		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		return
+	}
+	//nolint:gosec // sha256 validated by Sidecar.Validate
+	slog.Info("provenance backfill", "sha256", sha, "applied", backfilled)
+	w.Header().Set("Content-Type", "application/json")
+	//nolint:errcheck,errchkjson // best-effort response
+	_ = json.NewEncoder(w).Encode(map[string]any{"sha256": sha, "provenance_backfilled": backfilled})
 }
 
 // storeUpload streams src to a sha-sharded path under the uploads root while

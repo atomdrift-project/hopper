@@ -3416,6 +3416,25 @@ func (db *DB) provenanceBySHA256PG(ctx context.Context, sha256 string) ([]byte, 
 	return prov, nil
 }
 
+func (db *DB) backfillProvenancePG(ctx context.Context, s *Sample) (bool, error) {
+	tag, err := db.pool.Exec(ctx, `
+		UPDATE samples SET
+			provenance = $2,
+			ecosystem  = COALESCE(NULLIF(ecosystem, ''), $3),
+			package    = COALESCE(NULLIF(package, ''), $4),
+			version    = COALESCE(NULLIF(version, ''), $5),
+			purl_base  = COALESCE(NULLIF(purl_base, ''), $6),
+			url        = COALESCE(NULLIF(url, ''), $7),
+			fetched_at = COALESCE(fetched_at, $8)
+		WHERE sha256 = $1 AND provenance IS NULL`,
+		s.SHA256, sanitizeJSONB(s.Provenance),
+		s.Ecosystem, s.Package, s.Version, s.PURLBase, s.URL, s.FetchedAt)
+	if err != nil {
+		return false, fmt.Errorf("hopper: backfill provenance %s: %w", s.SHA256, err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 func (db *DB) shasWithProvenancePG(ctx context.Context, shas []string) (map[string]bool, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT sha256 FROM samples WHERE sha256 = ANY($1) AND provenance IS NOT NULL`, shas)

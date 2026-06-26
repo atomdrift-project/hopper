@@ -1756,6 +1756,19 @@ func (db *DB) ProvenanceBySHA256(ctx context.Context, sha256 string) ([]byte, er
 	return db.provenanceBySHA256SQLite(ctx, sha256)
 }
 
+// BackfillProvenance attaches a provenance sidecar (and its projected scalar
+// identity columns) to an existing sample that has none, without touching the
+// sample's bytes, path, label, or analysis. Reports whether a row was updated —
+// false when the sample is absent or already carries provenance, because
+// provenance is written once and never overwritten (the WHERE guards on
+// provenance IS NULL). Identity columns are filled only where currently empty.
+func (db *DB) BackfillProvenance(ctx context.Context, s *Sample) (bool, error) {
+	if db.pool != nil {
+		return db.backfillProvenancePG(ctx, s)
+	}
+	return db.backfillProvenanceSQLite(ctx, s)
+}
+
 // KnownSHA256 returns the subset of the given digests that already have a
 // sample row. It is a deliberately minimal existence probe — a single
 // index-only scan of the unique sha256 key, hydrating no row data — so a bulk

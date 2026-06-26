@@ -7,6 +7,62 @@ import (
 	"testing"
 )
 
+// TestBackfillProvenance covers the provenance-only upload path: a sample with
+// bytes but no sidecar gets one (and its purl_base projected), while a sample
+// that already has provenance — or one that doesn't exist — is left untouched.
+func TestBackfillProvenance(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	noProv := strings.Repeat("d", 64)
+	hasProv := strings.Repeat("e", 64)
+	absent := strings.Repeat("f", 64)
+
+	mustInsert(t, ctx, db, &Sample{SHA256: noProv}) // bytes present, no provenance
+	mustInsert(t, ctx, db, &Sample{SHA256: hasProv, Provenance: []byte(`{"schema_version":"1.0"}`)})
+
+	prov := []byte(`{"schema_version":"1.0","package":{"purl":"pkg:npm/is-number@7.0.0"}}`)
+	sidecar := &Sample{
+		SHA256: noProv, Provenance: prov,
+		Ecosystem: "npm", Package: "is-number", Version: "7.0.0", PURLBase: "pkg:npm/is-number",
+	}
+
+	// Unprovenanced sample → backfill applies, provenance + purl_base land.
+	applied, err := db.BackfillProvenance(ctx, sidecar)
+	if err != nil {
+		t.Fatalf("BackfillProvenance: %v", err)
+	}
+	if !applied {
+		t.Fatal("expected backfill to apply to an unprovenanced sample")
+	}
+	got, err := db.ProvenanceBySHA256(ctx, noProv)
+	if err != nil || len(got) == 0 {
+		t.Fatalf("provenance not stored: err=%v len=%d", err, len(got))
+	}
+	s2, err := db.SampleBySHA256(ctx, noProv)
+	if err != nil {
+		t.Fatalf("SampleBySHA256: %v", err)
+	}
+	if s2.PURLBase != "pkg:npm/is-number" {
+		t.Errorf("purl_base = %q, want pkg:npm/is-number", s2.PURLBase)
+	}
+
+	// Second time → no-op: provenance is written once, never overwritten.
+	if applied, err := db.BackfillProvenance(ctx, sidecar); err != nil || applied {
+		t.Errorf("re-backfill = (%v, %v), want (false, nil)", applied, err)
+	}
+
+	// A sample that already has provenance is never touched.
+	if applied, err := db.BackfillProvenance(ctx, &Sample{SHA256: hasProv, Provenance: prov}); err != nil || applied {
+		t.Errorf("backfill over existing provenance = (%v, %v), want (false, nil)", applied, err)
+	}
+
+	// An absent sample is a no-op, not an error.
+	if applied, err := db.BackfillProvenance(ctx, &Sample{SHA256: absent, Provenance: prov}); err != nil || applied {
+		t.Errorf("backfill of absent sample = (%v, %v), want (false, nil)", applied, err)
+	}
+}
+
 // TestProvenanceBySHA256 covers the three outcomes the provenance endpoint maps
 // to 200 / 204 / 404: a sample with a sidecar, a sample without one, and an
 // unknown sample.

@@ -2684,6 +2684,28 @@ func (db *DB) provenanceBySHA256SQLite(ctx context.Context, sha256 string) ([]by
 	return restoreNULs(prov), nil
 }
 
+func (db *DB) backfillProvenanceSQLite(ctx context.Context, s *Sample) (bool, error) {
+	res, err := db.lite.ExecContext(ctx, `
+		UPDATE samples SET
+			provenance = ?,
+			ecosystem  = COALESCE(NULLIF(ecosystem, ''), ?),
+			package    = COALESCE(NULLIF(package, ''), ?),
+			version    = COALESCE(NULLIF(version, ''), ?),
+			purl_base  = COALESCE(NULLIF(purl_base, ''), ?),
+			url        = COALESCE(NULLIF(url, ''), ?),
+			fetched_at = COALESCE(fetched_at, ?)
+		WHERE sha256 = ? AND provenance IS NULL`,
+		jsonTextOrNil(s.Provenance), s.Ecosystem, s.Package, s.Version, s.PURLBase, s.URL, s.FetchedAt, s.SHA256)
+	if err != nil {
+		return false, fmt.Errorf("hopper: backfill provenance %s: %w", s.SHA256, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("hopper: backfill provenance rows %s: %w", s.SHA256, err)
+	}
+	return n > 0, nil
+}
+
 func (db *DB) shasWithProvenanceSQLite(ctx context.Context, shas []string) (map[string]bool, error) {
 	args := make([]any, len(shas))
 	for i, s := range shas {
