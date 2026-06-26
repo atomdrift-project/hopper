@@ -16,9 +16,16 @@
 #                                grants — a file's own write bit is never
 #                                required to relayout the tree.
 #
+# Exception — hopper's upload tree (unknown/uploads): same group + 2775 dirs, but
+# its sample files are 0440 (group-private, no world read) since they are
+# hopper's own ingest and nothing outside the group reads them off disk. Its
+# .tmp staging dir is skipped entirely: those files are mid-write with transient
+# modes and hopper re-asserts their final mode on rename.
+#
 # forager (pkg/outputperms) and hopper (cmd/hopper/perms.go) already self-heal
 # the subtrees they write. This is the safety net for drift introduced by
-# writers that bypass that path: a manual `mv`, the relayout, a root-run import.
+# writers that bypass that path: a manual `mv`, the relayout, a root-run import,
+# or upload shards a setgid-blocked hopper left group-private.
 #
 # Each pass only touches entries that are *actually* wrong — the find filters
 # select on the bit that is off — so a clean tree costs three cheap walks and
@@ -39,13 +46,16 @@ set -eu
 DATA_DIR="${DATA_DIR:-/data/samples}"
 GROUP="${SAMPLES_GROUP:-samples}"
 
-# Subtree to leave untouched. hopper's upload staging area is private, not part
-# of the shared cooperative tree: the deploy owns it hopper:hopper at 0750 (and
-# .tmp at 0700), and files there are mid-ingest. Applying the shared contract
-# would regroup it to samples, loosen the private 0700 .tmp to 2775, and could
-# flip an in-flight temp file to 0444 under an active upload. Pruning it keeps
-# the heal off hopper's write path entirely. Empty disables the exclusion.
-EXCLUDE="${HEAL_EXCLUDE:-$DATA_DIR/unknown/uploads}"
+# hopper's upload tree is healed like the rest (group + 2775 dirs), but its
+# sample files are 0440 not 0444 (see header), so the file pass splits on it.
+UPLOAD_DIR="$DATA_DIR/unknown/uploads"
+
+# Subtree to leave untouched: only hopper's in-flight upload staging dir. Its
+# temp files are mid-write with transient modes, and hopper sets their final
+# mode on rename, so the heal must never touch them. Empty disables the
+# exclusion. (Was the whole upload tree; narrowed to .tmp once uploads joined
+# the shared contract.)
+EXCLUDE="${HEAL_EXCLUDE:-$UPLOAD_DIR/.tmp}"
 
 [ -d "$DATA_DIR" ] || { echo "heal-perms: DATA_DIR does not exist: $DATA_DIR" >&2; exit 1; }
 getent group "$GROUP" >/dev/null 2>&1 || { echo "heal-perms: group does not exist: $GROUP" >&2; exit 1; }
@@ -65,24 +75,34 @@ log() { echo "heal-perms: $*"; }
 # as "(path is EXCLUDE and prune) or (<test> and print)", so the excluded subtree
 # is never descended or acted on. An empty EXCLUDE matches no path, disabling it.
 
-# 1. Group ownership: any entry not already in the samples group. -h regroups a
-#    stray symlink as the link itself rather than following it to its target.
+# 1. Group ownership: any entry not already in the samples group (whole tree,
+#    upload shards included). -h regroups a stray symlink as the link itself
+#    rather than following it to its target.
 grp_out=$(find "$DATA_DIR" -path "$EXCLUDE" -prune -o ! -group "$GROUP" -print0 \
     | xargs -0 -r -n 4096 chgrp -ch "$GROUP" -- 2>/dev/null) || true
 
-# 2. Directories not already exactly 2775 (setgid + group-writable).
+# 2. Directories not already exactly 2775 (setgid + group-writable), whole tree.
 dir_out=$(find "$DATA_DIR" -path "$EXCLUDE" -prune -o -type d ! -perm 2775 -print0 \
     | xargs -0 -r -n 2048 chmod -c 2775 -- 2>/dev/null) || true
 
-# 3. Regular files not already exactly 0444 (read-only). Immutability is
+# 3. Regular files outside the upload tree → 0444 (read-only, world-readable).
+#    The whole upload tree is pruned here and handled by pass 4. Immutability is
 #    deliberate; see the contract above.
-file_out=$(find "$DATA_DIR" -path "$EXCLUDE" -prune -o -type f ! -perm 0444 -print0 \
+file_out=$(find "$DATA_DIR" -path "$UPLOAD_DIR" -prune -o -type f ! -perm 0444 -print0 \
     | xargs -0 -r -n 4096 chmod -c 0444 -- 2>/dev/null) || true
 
+# 4. Upload sample files → 0440 (group-private; see header). Only when the tree
+#    exists, pruning the in-flight .tmp staging dir.
+upload_out=""
+if [ -d "$UPLOAD_DIR" ]; then
+    upload_out=$(find "$UPLOAD_DIR" -path "$EXCLUDE" -prune -o -type f ! -perm 0440 -print0 \
+        | xargs -0 -r -n 4096 chmod -c 0440 -- 2>/dev/null) || true
+fi
+
 # Per-path heal log to the journal (nothing on a clean tree).
-for o in "$grp_out" "$dir_out" "$file_out"; do
+for o in "$grp_out" "$dir_out" "$file_out" "$upload_out"; do
     if [ -n "$o" ]; then printf '%s\n' "$o"; fi
 done
 
 count() { [ -z "$1" ] && { printf 0; return; }; printf '%s\n' "$1" | wc -l | tr -d '[:space:]'; }
-log "healed under $DATA_DIR (group=$GROUP): regrouped=$(count "$grp_out") dirs=$(count "$dir_out") files=$(count "$file_out")"
+log "healed under $DATA_DIR (group=$GROUP): regrouped=$(count "$grp_out") dirs=$(count "$dir_out") files=$(count "$file_out") upload_files=$(count "$upload_out")"

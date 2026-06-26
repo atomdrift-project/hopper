@@ -23,6 +23,10 @@ set -euo pipefail
 
 DATA_DIR="${DATA_DIR:-/data/samples}"
 UPLOAD_DIR="${DATA_DIR}/unknown/uploads"
+# Shared group for the sample tree. forager, hopper, and promoter all run in it
+# so any of them can read/traverse the others' output; setgid dirs make new
+# children inherit it. hopper's upload tree joins this contract.
+SAMPLES_GROUP="${SAMPLES_GROUP:-samples}"
 DB="${DB:-postgres://hopper@hopper-db/hopper?sslmode=disable}"
 SOURCE="${SOURCE:-forager}"
 DASH_ADDR="${DASH_ADDR:-0.0.0.0:8081}"
@@ -181,10 +185,35 @@ if ! getent passwd "${SERVICE_USER}" >/dev/null; then
                  --comment "Hopper service" "${SERVICE_USER}"
 fi
 
+# hopper must belong to the shared group: it reads the shared sample tree, and
+# the setgid bit only sticks on a chmod when the process is in the dir's group
+# (otherwise the kernel silently strips it, breaking group inheritance). The
+# unit also sets SupplementaryGroups so the running process has it regardless,
+# but keep the account's membership in sync too.
+getent group "${SAMPLES_GROUP}" >/dev/null \
+    || die "shared group '${SAMPLES_GROUP}' does not exist; create it (groupadd --system ${SAMPLES_GROUP}) or set SAMPLES_GROUP"
+if ! id -nG "${SERVICE_USER}" | tr ' ' '\n' | grep -qx "${SAMPLES_GROUP}"; then
+    log "Adding ${SERVICE_USER} to '${SAMPLES_GROUP}' group"
+    priv usermod -aG "${SAMPLES_GROUP}" "${SERVICE_USER}"
+fi
+
 priv install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
     "${STATE_HOME}" "${CACHE_HOME}" "${CONFIG_DIR}" "${TOOLS_DIR}"
-priv install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${UPLOAD_DIR}"
-priv install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${UPLOAD_DIR}/.tmp"
+
+# Upload tree: part of the shared samples-group contract. Group ${SAMPLES_GROUP},
+# setgid 2775 dirs so hopper's runtime sha-shard mkdirs (and .tmp staging)
+# inherit the group, and read-only files. hopper writes here at runtime; the
+# perms-heal timer deliberately skips this subtree (HEAL_EXCLUDE=${UPLOAD_DIR}),
+# so this deploy is the only thing that (re)asserts the contract on it.
+priv install -d -m 2775 -o "${SERVICE_USER}" -g "${SAMPLES_GROUP}" "${UPLOAD_DIR}"
+priv install -d -m 2775 -o "${SERVICE_USER}" -g "${SAMPLES_GROUP}" "${UPLOAD_DIR}/.tmp"
+# Heal a pre-existing tree from before this contract (e.g. hopper:hopper / 0750,
+# or shards left group-private by the old setgid-blocked code path): regroup to
+# ${SAMPLES_GROUP}, setgid+group-write every dir, mark every file read-only 0440.
+log "Asserting shared-group contract on ${UPLOAD_DIR}"
+priv chgrp -R "${SAMPLES_GROUP}" "${UPLOAD_DIR}"
+priv find "${UPLOAD_DIR}" -type d -exec chmod 2775 {} +
+priv find "${UPLOAD_DIR}" -type f -exec chmod 0440 {} +
 
 # --- Binary ------------------------------------------------------------------
 
@@ -256,6 +285,10 @@ Wants=network-online.target
 Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
+# Run in the shared sample group so hopper can read the tree the siblings write
+# and so the setgid bit sticks on the upload dirs it creates (the kernel strips
+# setgid on chmod when the process is not in the target dir's group).
+SupplementaryGroups=${SAMPLES_GROUP}
 
 # Share the pipeline-wide memory budget (see ${SLICE_NAME}.slice). hopper is the
 # primary service: it keeps the most generous per-service caps and the most
@@ -347,7 +380,13 @@ UMask=0077
 # Process hardening. MemoryDenyWriteExecute is intentionally omitted because
 # litmus/rizin children rely on executable mappings for binary analysis.
 NoNewPrivileges=true
-RestrictSUIDSGID=true
+# RestrictSUIDSGID is intentionally NOT set. hopper creates setgid (2775) shard
+# directories under the upload tree so each sha-shard inherits the shared
+# '${SAMPLES_GROUP}' group; RestrictSUIDSGID's seccomp filter denies the setgid
+# bit in mkdir/chmod and returns EPERM, which is what broke upload sharding
+# ("upload: mkdir shard: operation not permitted"). The tree is hopper-owned and
+# group-shared with no setuid binaries, and NoNewPrivileges=true neutralizes any
+# setuid/setgid bit at exec time, so dropping this restriction adds no real risk.
 RestrictRealtime=true
 RestrictNamespaces=true
 LockPersonality=true
@@ -498,8 +537,9 @@ fi
 # --- Permission-heal timer ---------------------------------------------------
 # /data/samples is shared (samples group) by forager, hopper, and the promoter.
 # This root oneshot + timer re-asserts the contract — samples group, setgid
-# 2775 dirs, read-only 0444 files — for drift from writers that bypass the
-# services' own self-heal (a manual mv, the relayout, a root import). It runs
+# 2775 dirs, read-only files (0444 shared, 0440 in the upload tree) — for drift
+# from writers that bypass the services' own self-heal (a manual mv, the
+# relayout, a root import, group-private upload shards). It runs
 # as root so it can chgrp/chmod paths owned by any of those services; the
 # long-running hopper service stays unprivileged and is never granted
 # chmod/chgrp rights. The heal is a no-op when the tree is already clean.
@@ -524,8 +564,11 @@ Documentation=https://codeberg.org/atomdrift/hopper
 Type=oneshot
 ExecStart=${HEAL_PERMS_BIN}
 Environment=DATA_DIR=${DATA_DIR}
-# Leave hopper's private upload staging area out of the shared-tree heal.
-Environment=HEAL_EXCLUDE=${UPLOAD_DIR}
+# The upload tree is now part of the shared contract and IS healed (group +
+# 2775 dirs; files to 0440). Only the in-flight .tmp staging dir is excluded —
+# the script defaults HEAL_EXCLUDE to \${DATA_DIR}/unknown/uploads/.tmp, so no
+# override is needed here.
+Environment=HEAL_EXCLUDE=${UPLOAD_DIR}/.tmp
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Least privilege for a root oneshot: walk DATA_DIR and chgrp/chmod within it,

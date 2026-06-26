@@ -12,11 +12,12 @@ import (
 // be group-writable, and setgid makes new children inherit the samples group.
 const sharedDirMode = os.ModeSetgid | 0o775
 
-// sampleFileMode is the read-only mode for sample files on disk: group- and
-// world-readable, never writable, matching forager's convention. (os.CreateTemp
-// defaults to 0600, which would otherwise leave an uploaded sample readable only
-// by hopper.)
-const sampleFileMode os.FileMode = 0o444
+// sampleFileMode is the read-only mode for uploaded sample files on disk:
+// owner- and group-readable, never writable, never world-readable. The shared
+// 'samples' group (forager, hopper, promoter) can read them via the setgid
+// upload dirs; nothing outside the group needs to. (os.CreateTemp defaults to
+// 0600, which would otherwise leave an uploaded sample readable only by hopper.)
+const sampleFileMode os.FileMode = 0o440
 
 // mkdirSharedAll creates path and its parents, forcing sharedDirMode on every
 // component it creates — a plain mkdir is subject to umask (which strips
