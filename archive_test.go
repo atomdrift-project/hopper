@@ -446,3 +446,51 @@ func rawFiles(t *testing.T, envelope []byte) []json.RawMessage {
 	}
 	return raw.files
 }
+
+// TestSplitParentOnlyMatchesSplit locks the storage-compaction invariant:
+// splitParentOnly must produce a parent byte-identical to Split's, and report
+// the same member count, while skipping the leaf assembly that dominated the
+// heap. If these ever diverge, compacted cleave_result bytes would change.
+func TestSplitParentOnlyMatchesSplit(t *testing.T) {
+	cases := map[string][]byte{
+		"flat": []byte(`{
+			"ml": {"v": "8", "files": [
+				{"id": 0, "type": "zip"},
+				{"id": 1, "type": "python"},
+				{"id": 2, "type": "python"}
+			]},
+			"raw": {"v": 8, "rev": "abc123", "files": [
+				{"id": 0, "sha": "aaa", "path": "pkg.zip", "type": "zip", "size": 900, "risk": 3},
+				{"id": 1, "sha": "bbb", "path": "pkg.zip!!a/util.py", "type": "python", "dp": 1, "size": 400, "risk": 3,
+				 "traits": [{"id": "x/eval", "crit": 3}], "ctx": [{"ln": 1, "b": "abc"}]},
+				{"id": 2, "sha": "ccc", "path": "pkg.zip!!a/empty.py", "type": "python", "dp": 1, "size": 0, "risk": 0}
+			]}
+		}`),
+		"non-archive": []byte(`{"raw": {"v": 8, "files": [
+			{"id": 0, "sha": "aaa", "path": "lone.py", "type": "python"}
+		]}}`),
+	}
+	if golden, err := os.ReadFile("testdata/archive_whl.json"); err == nil {
+		cases["golden"] = golden
+	}
+
+	for name, envelope := range cases {
+		t.Run(name, func(t *testing.T) {
+			wantParent, leaves, err := Split(envelope)
+			if err != nil {
+				t.Fatalf("Split: %v", err)
+			}
+			gotParent, members, err := splitParentOnly(envelope)
+			if err != nil {
+				t.Fatalf("splitParentOnly: %v", err)
+			}
+			if members != len(leaves) {
+				t.Errorf("members = %d, want %d (len leaves)", members, len(leaves))
+			}
+			if !bytes.Equal(wantParent, gotParent) {
+				t.Errorf("parent diverged\n--- Split ---\n%s\n--- splitParentOnly ---\n%s",
+					indentJSON(wantParent), indentJSON(gotParent))
+			}
+		})
+	}
+}

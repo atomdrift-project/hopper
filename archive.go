@@ -184,6 +184,47 @@ func Split(envelope []byte) (parent []byte, leaves []Leaf, err error) {
 	return mustMarshal(top), leaves, nil
 }
 
+// splitParentOnly builds the same parent Split would (container whole, every
+// member entry reduced to its placement reference) but never assembles the
+// leaves. It is what storage compaction needs: the parent is the only output,
+// so building — and json.Marshaling — a standalone envelope per member is pure
+// waste, and on a large archive that wasted marshaling dominates the heap. The
+// returned parent is byte-identical to Split's, since the leaf assembly (and the
+// ml section it reads) never touches top. members is the number of references
+// produced (== len(Split's leaves)); 0 means "not an archive, store verbatim".
+func splitParentOnly(envelope []byte) (parent []byte, members int, err error) {
+	top, err := decodeObject(envelope)
+	if err != nil {
+		return nil, 0, fmt.Errorf("hopper: split envelope: %w", err)
+	}
+	raw, err := section(top, "raw")
+	if err != nil {
+		return nil, 0, fmt.Errorf("hopper: split raw: %w", err)
+	}
+	if len(raw.files) <= 1 {
+		return envelope, 0, nil // not an archive; nothing to factor out
+	}
+
+	for i, rawEntry := range raw.files {
+		entry, derr := decodeObject(rawEntry)
+		if derr != nil {
+			return nil, 0, fmt.Errorf("hopper: split raw.files[%d]: %w", i, derr)
+		}
+		if entryDepth(entry) == 0 {
+			continue // the container stays in the parent, in full
+		}
+		if entrySHA(entry) == "" {
+			continue // unidentifiable member: leave it inline rather than orphan it
+		}
+		raw.files[i] = mustMarshal(pick(entry, refKeys))
+		members++
+	}
+
+	raw.obj[raw.key] = mustMarshal(raw.files)
+	top["raw"] = mustMarshal(raw.obj)
+	return mustMarshal(top), members, nil
+}
+
 // Join reverses Split: it restores every member entry in the parent's raw.files
 // from its leaf, re-stamping the placement the reference preserved. lookup
 // returns a member's leaf envelope by content SHA-256; a member whose leaf is

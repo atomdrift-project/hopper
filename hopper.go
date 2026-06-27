@@ -269,8 +269,8 @@ func compactCleaveResultForStorage(result []byte) []byte {
 	if len(result) == 0 {
 		return result
 	}
-	parent, leaves, err := Split(mustMarshal(map[string]json.RawMessage{"raw": json.RawMessage(result)}))
-	if err != nil || len(leaves) == 0 {
+	parent, members, err := splitParentOnly(mustMarshal(map[string]json.RawMessage{"raw": json.RawMessage(result)}))
+	if err != nil || members == 0 {
 		return result // unparseable or not an archive: store verbatim
 	}
 	top, err := decodeObject(parent)
