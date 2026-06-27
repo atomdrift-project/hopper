@@ -580,6 +580,7 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/result", s.handleResult)
 	mux.HandleFunc("POST /api/upload", s.handleUpload)
 	mux.HandleFunc("POST /api/known", s.handleKnown)
+	mux.HandleFunc("POST /api/triage", s.handleTriage)
 	mux.HandleFunc("GET /api/file/{sha256}", s.handleFile)
 	mux.HandleFunc("GET /api/provenance/{sha256}", s.handleProvenance)
 	mux.Handle("GET /data/", s.safeFileServer())

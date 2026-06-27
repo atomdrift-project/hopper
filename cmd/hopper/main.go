@@ -59,6 +59,7 @@ commands:
   cleanup            delete wonky samples by skip category (interactive)
   rescan             queue files for repair-tier re-analysis (--missing-members or SHA-256 args)
   triage             fetch mislabeled samples to /var/tmp/hopper-triage
+  post-triage        apply triage verdicts: re-scan, move + flip mislabeled samples
   stats              show sample counts
 `
 
@@ -508,6 +509,8 @@ func run(ctx context.Context) error {
 		return cmdRescan(ctx)
 	case "triage":
 		return cmdTriage(ctx)
+	case "post-triage":
+		return cmdPostTriage(ctx)
 	case "stats":
 		return cmdStats(ctx)
 	default:

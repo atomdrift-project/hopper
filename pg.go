@@ -2389,6 +2389,32 @@ func (db *DB) updateLLMResultPG(ctx context.Context, sha256 string, result []byt
 	return nil
 }
 
+func (db *DB) relocateSamplePG(ctx context.Context, sha256, oldRel, newRel, label, source string) error {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("hopper: relocate begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+	if _, err := tx.Exec(ctx, `
+		UPDATE samples
+		   SET label = $2, label_source = $3, path = $4,
+		       skip = '', skipped_at = now(), updated_at = now()
+		 WHERE sha256 = $1`, sha256, label, source, newRel); err != nil {
+		return fmt.Errorf("hopper: relocate sample: %w", err)
+	}
+	// Update only the top-level pool observation (parent_sha256 = ''); archive
+	// members keep their container-relative path.
+	if _, err := tx.Exec(ctx, `
+		UPDATE sample_locations SET path = $3
+		 WHERE sha256 = $1 AND path = $2 AND parent_sha256 = ''`, sha256, oldRel, newRel); err != nil {
+		return fmt.Errorf("hopper: relocate location: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("hopper: relocate commit: %w", err)
+	}
+	return nil
+}
+
 func (db *DB) reclassifyPG(ctx context.Context, sha256, label, source string) error {
 	_, err := db.pool.Exec(ctx, `
 		UPDATE samples SET label = $2, label_source = $3, updated_at = now() WHERE sha256 = $1`,

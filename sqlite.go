@@ -1844,6 +1844,31 @@ func (db *DB) reclassifySQLite(ctx context.Context, sha256, label, source string
 	return nil
 }
 
+func (db *DB) relocateSampleSQLite(ctx context.Context, sha256, oldRel, newRel, label, source string) error {
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("hopper: relocate begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
+	ts := now()
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE samples
+		   SET label = ?, label_source = ?, path = ?,
+		       skip = '', skipped_at = ?, updated_at = ?
+		 WHERE sha256 = ?`, label, source, newRel, ts, ts, sha256); err != nil {
+		return fmt.Errorf("hopper: relocate sample: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE sample_locations SET path = ?
+		 WHERE sha256 = ? AND path = ? AND parent_sha256 = ''`, newRel, sha256, oldRel); err != nil {
+		return fmt.Errorf("hopper: relocate location: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("hopper: relocate commit: %w", err)
+	}
+	return nil
+}
+
 func (db *DB) unanalyzedSQLite(ctx context.Context, limit int) ([]*Sample, error) {
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples WHERE cleave_result IS NULL ORDER BY id LIMIT ?`, limit)

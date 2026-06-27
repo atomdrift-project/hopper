@@ -2204,6 +2204,21 @@ func (db *DB) Reclassify(ctx context.Context, sha256, label, source string) erro
 	return db.reclassifySQLite(ctx, sha256, label, source)
 }
 
+// RelocateSample records a triage verdict atomically: it flips the sample's
+// label to `label` (label_source `source`), clears any skip, repoints
+// samples.path to newRel, and updates the matching top-level
+// sample_locations row from oldRel to newRel. Paths are relative to the data
+// root. The caller performs the on-disk os.Rename; this only brings the DB
+// into agreement so the next load walk has nothing to reconcile and
+// /api/file resolves the moved file immediately rather than 404ing until the
+// walk catches up.
+func (db *DB) RelocateSample(ctx context.Context, sha256, oldRel, newRel, label, source string) error {
+	if db.pool != nil {
+		return db.relocateSamplePG(ctx, sha256, oldRel, newRel, label, source)
+	}
+	return db.relocateSampleSQLite(ctx, sha256, oldRel, newRel, label, source)
+}
+
 // Unanalyzed returns up to limit samples lacking a cleave result.
 func (db *DB) Unanalyzed(ctx context.Context, limit int) ([]*Sample, error) {
 	if db.pool != nil {
