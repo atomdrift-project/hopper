@@ -264,16 +264,27 @@ func removeMarkers(samplePath string) {
 
 func cmdPostTriage(ctx context.Context) error {
 	f := flag.NewFlagSet("post-triage", flag.ExitOnError)
-	baseURL := f.String("url", "http://127.0.0.1:8081", "hopper master API base URL")
-	misplacedGood := f.String("misplaced-good", defaultMisplacedGood,
-		"directory of files re-classified benign (was bad)")
-	misplacedBad := f.String("misplaced-bad", defaultMisplacedBad,
-		"directory of files re-classified hostile (was good)")
-	noUpload := f.Bool("no-upload", false, "skip pushing fresh analysis (default: scan --hopper each positional dir first)")
+	baseURL := f.String("url", "http://hopper-api:8081/", "hopper master API base URL")
+	var misplacedGood, misplacedBad stringListFlag
+	f.Var(&misplacedGood, "misplaced-good",
+		"dir of files re-classified benign (was bad); repeatable or comma-separated")
+	f.Var(&misplacedBad, "misplaced-bad",
+		"dir of files re-classified hostile (was good); repeatable or comma-separated")
+	noUpload := f.Bool("no-upload", false, "skip pushing fresh analysis (default: scan fs --hopper each misplaced dir first)")
 	scanBin := f.String("scan", "scan", "path to the scan (ascan) binary used for --upload")
 	token := f.String("token", os.Getenv("HOPPER_UPLOAD_TOKEN"), "upload bearer token (default: $HOPPER_UPLOAD_TOKEN)")
 	dryRun := f.Bool("dry-run", false, "ask the master to report the planned moves without touching anything")
 	parseFlags(f, os.Args[2:])
+
+	// Default to the skill-produced dirs ONLY when the operator named neither
+	// side AND gave no positional dirs. The moment they point at a specific
+	// dir — misplaced (flip these) or positional (rescan-only these) — we act
+	// on exactly what they listed: naming a good dir must not silently sweep a
+	// bad dir, and a plain `post-triage <dir>` rescan must not flip anything.
+	if len(misplacedGood) == 0 && len(misplacedBad) == 0 && len(f.Args()) == 0 {
+		misplacedGood = stringListFlag{defaultMisplacedGood}
+		misplacedBad = stringListFlag{defaultMisplacedBad}
+	}
 
 	// 1. Push corrected analysis up the existing /api/result path first, so the
 	//    fresh verdicts are stored before the labels flip. Remote-native: scan
@@ -284,8 +295,15 @@ func cmdPostTriage(ctx context.Context) error {
 	//    stale data this whole step exists to refresh. /xtriage-* relocated them
 	//    out of the triage dir, so scanning only the positional dirs would skip
 	//    them. Positional args add any extra directories to re-scan.
-	scanDirs := dedupExistingDirs(append([]string{*misplacedGood, *misplacedBad}, f.Args()...))
-	if !*noUpload {
+	scanDirs := dedupExistingDirs(append(append(append([]string{}, misplacedGood...), misplacedBad...), f.Args()...))
+	switch {
+	case *noUpload:
+		// operator opted out
+	case *dryRun:
+		// A dry run must not mutate the master; the scan upload renews stored
+		// results, so skip it and only preview the moves below.
+		slog.Info("dry-run: skipping scan upload", "dirs", scanDirs)
+	default:
 		if len(scanDirs) == 0 {
 			slog.Warn("nothing to re-scan: no misplaced dirs and no positional dirs exist")
 		}
@@ -296,18 +314,31 @@ func cmdPostTriage(ctx context.Context) error {
 		}
 	}
 
-	// 2. Collect verdicts from the two misplaced directories.
-	verdicts, err := collectVerdicts(*misplacedGood, "good")
-	if err != nil {
-		return err
+	// 2. Collect verdicts from the selected misplaced directories.
+	var verdicts []triageVerdict
+	for _, dir := range misplacedGood {
+		v, err := collectVerdicts(dir, "good")
+		if err != nil {
+			return err
+		}
+		verdicts = append(verdicts, v...)
 	}
-	bad, err := collectVerdicts(*misplacedBad, "bad")
-	if err != nil {
-		return err
+	goodCount := len(verdicts)
+	for _, dir := range misplacedBad {
+		v, err := collectVerdicts(dir, "bad")
+		if err != nil {
+			return err
+		}
+		verdicts = append(verdicts, v...)
 	}
-	verdicts = append(verdicts, bad...)
+	bad := verdicts[goodCount:]
 	if len(verdicts) == 0 {
-		writeStdoutf("no misplaced files found in %s or %s\n", *misplacedGood, *misplacedBad)
+		if len(misplacedGood) == 0 && len(misplacedBad) == 0 {
+			writeStdoutf("rescan-only: uploaded fresh analysis, no labels to flip\n")
+		} else {
+			writeStdoutf("no misplaced files found in %v or %v\n",
+				[]string(misplacedGood), []string(misplacedBad))
+		}
 		return nil
 	}
 	writeStdoutf("collected %d verdict(s): %d good, %d bad\n",
