@@ -60,6 +60,7 @@ commands:
   rescan             queue files for repair-tier re-analysis (--missing-members or SHA-256 args)
   triage             fetch mislabeled samples to /var/tmp/hopper-triage
   post-triage        apply triage verdicts: re-scan, move + flip mislabeled samples
+  cascade-backfill   propagate good/bad archive labels to their members (dry-run)
   stats              show sample counts
 `
 
@@ -517,6 +518,8 @@ func run(ctx context.Context) error {
 		return cmdTriage(ctx)
 	case "post-triage":
 		return cmdPostTriage(ctx)
+	case "cascade-backfill":
+		return cmdCascadeBackfill(ctx)
 	case "stats":
 		return cmdStats(ctx)
 	default:
@@ -3285,6 +3288,51 @@ func cmdNormalizeEcosystems(ctx context.Context) error {
 		return err
 	}
 	slog.Info("ecosystem normalization complete", "distinct_changed", len(mapping), "cleared", cleared, "rows_updated", rows)
+	return nil
+}
+
+// cmdCascadeBackfill propagates existing good/bad archive labels onto their
+// members for archives labeled before CascadeLabel existed: bad archives demote
+// their suspicious (score >= 30) unknown members, good archives promote their
+// unknown members. Dry-run by default — it reports the member counts that would
+// change; re-run with --apply to write. Idempotent and safe to re-run.
+func cmdCascadeBackfill(ctx context.Context) error {
+	f := flag.NewFlagSet("cascade-backfill", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	apply := f.Bool("apply", false, "actually relabel members (default is dry-run)")
+	parseFlags(f, os.Args[2:])
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	pending, err := db.CascadeBackfillPending(ctx)
+	if err != nil {
+		return err
+	}
+	if !pending {
+		slog.Info("cascade backfill: nothing to do")
+		writeStdoutf("no good/bad archive has unknown members; nothing to cascade\n")
+		return nil
+	}
+
+	slog.Info("cascade backfill starting", "apply", *apply)
+	st, err := db.CascadeBackfill(ctx, !*apply)
+	if err != nil {
+		return err
+	}
+	if !*apply {
+		writeStdoutf("would demote %d member(s) across %d bad archive(s) and promote %d across %d good archive(s); re-run with --apply to write\n",
+			st.MembersDemoted, st.BadArchives, st.MembersPromoted, st.GoodArchives)
+		writeStdoutf("note: dry-run sums each archive independently; a member shared by a bad and a good\n")
+		writeStdoutf("      archive is counted in both, but --apply resolves it bad (bad-first)\n")
+		return nil
+	}
+	slog.Info("cascade backfill complete",
+		"bad_archives", st.BadArchives, "members_demoted", st.MembersDemoted,
+		"good_archives", st.GoodArchives, "members_promoted", st.MembersPromoted)
 	return nil
 }
 

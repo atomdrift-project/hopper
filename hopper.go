@@ -66,6 +66,27 @@ const (
 	labelBad     = "bad"
 )
 
+// CascadeDemoteScore is the minimum cleave risk score (samples.score) an
+// unlabeled archive member must carry to be demoted alongside a bad parent.
+// A bad archive's malice lives in a few members, not every file; shared benign
+// content (READMEs, licenses, popular vendored deps) scores below this and is
+// left untouched so one bad archive cannot poison content it shares with
+// thousands of clean ones. Promotion has no such floor: a clean archive vouches
+// for all of its members.
+const CascadeDemoteScore = 30
+
+// cascadeBackfillLogEvery is how often (in archives processed) CascadeBackfill
+// emits a progress log line during each pass.
+const cascadeBackfillLogEvery = 1000
+
+// cascadeSource is the label_source stamped on members demoted by [DB.CascadeLabel]
+// because their archive parent was marked bad. It encodes the parent so a later
+// promotion of that same parent can find and revert exactly the members it
+// demoted. A member demoted via two bad parents records only the most recent;
+// reverting the older parent then leaves it good even though the other parent
+// still considers it bad. That cross-parent imprecision is accepted.
+func cascadeSource(parentSHA256 string) string { return "cascade:" + parentSHA256 }
+
 // Label-related skip reasons and label sources managed by the pool-precedence
 // resolution. Other skip reasons (corrupt/encrypted/missing/unsupported/
 // replaced/empty_path/skip-benign-archive-item) are "hard" and never cleared
@@ -2202,6 +2223,74 @@ func (db *DB) Reclassify(ctx context.Context, sha256, label, source string) erro
 		return db.reclassifyPG(ctx, sha256, label, source)
 	}
 	return db.reclassifySQLite(ctx, sha256, label, source)
+}
+
+// CascadeLabel relabels an archive (sha256) to label/source and propagates the
+// verdict to its members, returning the number of members changed. Membership
+// is resolved through sample_locations (the same source of truth as
+// [DB.BadMembersByParent]); labels live on the content hash, so a member shared
+// by other archives shares this label globally — hence the asymmetry below.
+//
+// Promote (label == "good"): every member still unlabeled (unknown) follows the
+// parent to good, and any member this same parent previously cascade-demoted is
+// reverted to good. Members independently labeled bad are left untouched so a
+// clean archive cannot whitewash content that is malicious elsewhere.
+//
+// Demote (label == "bad"): only unlabeled members carrying real suspicion
+// (score >= [CascadeDemoteScore]) follow the parent to bad, tagged with
+// [cascadeSource] so the demotion is reversible. Members already labeled good or
+// bad are left untouched.
+//
+// Any other label updates only the parent. Each member transition is recorded
+// in label_events within the same transaction as the change.
+func (db *DB) CascadeLabel(ctx context.Context, sha256, label, source string) (int, error) {
+	if db.pool != nil {
+		return db.cascadeLabelPG(ctx, sha256, label, source)
+	}
+	return db.cascadeLabelSQLite(ctx, sha256, label, source)
+}
+
+// CascadeBackfillStats reports the outcome of [DB.CascadeBackfill].
+type CascadeBackfillStats struct {
+	BadArchives     int // bad archives with members that were processed
+	GoodArchives    int // good archives with members that were processed
+	MembersDemoted  int // members the bad pass demoted (or would, in dry-run)
+	MembersPromoted int // members the good pass promoted or reverted to good
+}
+
+// record folds one processed archive's member count into the stats, keyed by
+// the archive's label.
+func (s *CascadeBackfillStats) record(label string, members int) {
+	switch label {
+	case labelBad:
+		s.BadArchives++
+		s.MembersDemoted += members
+	case labelGood:
+		s.GoodArchives++
+		s.MembersPromoted += members
+	}
+}
+
+// CascadeBackfillPending reports whether any good/bad top-level archive still
+// holds an 'unknown' member — i.e. whether [DB.CascadeBackfill] has work to do.
+// It is an index-assisted probe so the common "nothing to do" case is cheap.
+func (db *DB) CascadeBackfillPending(ctx context.Context) (bool, error) {
+	if db.pool != nil {
+		return db.cascadeBackfillPendingPG(ctx)
+	}
+	return db.cascadeBackfillPendingSQLite(ctx)
+}
+
+// CascadeBackfill re-applies the member cascade to every already-labeled archive
+// so children labeled before [DB.CascadeLabel] existed are brought into
+// agreement: bad archives are processed before good ones (precedence
+// bad > good > unknown), each in its own transaction. dryRun counts the members
+// that would change without writing. It is idempotent and safe to re-run.
+func (db *DB) CascadeBackfill(ctx context.Context, dryRun bool) (CascadeBackfillStats, error) {
+	if db.pool != nil {
+		return db.cascadeBackfillPG(ctx, dryRun)
+	}
+	return db.cascadeBackfillSQLite(ctx, dryRun)
 }
 
 // RelocateSample records a triage verdict atomically: it flips the sample's

@@ -4911,3 +4911,211 @@ func TestPromoteLabelByPURL(t *testing.T) {
 		t.Errorf("Promoted = %d, want 1", res2.Promoted)
 	}
 }
+
+func mustRelabel(t *testing.T, ctx context.Context, db *DB, sha, label, source string) {
+	t.Helper()
+	if err := db.Reclassify(ctx, sha, label, source); err != nil {
+		t.Fatalf("Reclassify(%s): %v", sha[:4], err)
+	}
+}
+
+func TestCascadeLabel(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	// label/source assertion helper.
+	want := func(sha, label, source string) {
+		t.Helper()
+		s, err := db.SampleBySHA256(ctx, sha)
+		if err != nil {
+			t.Fatalf("SampleBySHA256(%s): %v", sha[:4], err)
+		}
+		if s.Label != label || s.LabelSource != source {
+			t.Errorf("%s = {%q,%q}, want {%q,%q}", sha[:4], s.Label, s.LabelSource, label, source)
+		}
+	}
+	countEvents := func(reason string) int {
+		t.Helper()
+		var n int
+		if err := db.lite.QueryRowContext(ctx,
+			`SELECT count(*) FROM label_events WHERE reason=?`, reason).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	// member inserts a sample carried by archive `parent` with the given score,
+	// fanned out into sample_locations by InsertSampleBatch.
+	member := func(sha, parent string, score int) *Sample {
+		return &Sample{
+			SHA256: sha, Source: "test", Label: "unknown", LabelSource: "forager", Parent: parent,
+			Path:         parent + "!!pkg/" + sha[:4] + ".js",
+			CleaveResult: fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"js","x":%d,"dp":1}]}`, sha, score),
+		}
+	}
+
+	// --- Demote: archive marked bad. ---
+	archA := sha64('a')
+	mustInsert(t, ctx, db, &Sample{SHA256: archA, Source: "test", Label: "unknown", LabelSource: "forager", Path: "unknown/a.tgz"})
+	var (
+		aHigh = sha64('b') // unknown, score 90 → demoted
+		aMid  = sha64('c') // unknown, score 30 (== floor) → demoted
+		aLow  = sha64('d') // unknown, score 10 (< floor) → untouched
+		aGood = sha64('e') // good → untouched (no whitewash backward either)
+		aBad  = sha64('f') // independently bad → untouched
+	)
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{
+		member(aHigh, archA, 90), member(aMid, archA, 30), member(aLow, archA, 10),
+		member(aGood, archA, 90), member(aBad, archA, 90),
+	}); err != nil {
+		t.Fatalf("InsertSampleBatch: %v", err)
+	}
+	mustRelabel(t, ctx, db, aGood, "good", "test")
+	mustRelabel(t, ctx, db, aBad, "bad", "test")
+
+	n, err := db.CascadeLabel(ctx, archA, "bad", "promoter:interactive")
+	if err != nil {
+		t.Fatalf("CascadeLabel demote: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("demote cascaded %d members, want 2 (aHigh, aMid)", n)
+	}
+	want(archA, "bad", "promoter:interactive")
+	want(aHigh, "bad", cascadeSource(archA))
+	want(aMid, "bad", cascadeSource(archA))
+	want(aLow, "unknown", "forager") // below score floor
+	want(aGood, "good", "test")      // independent label preserved
+	want(aBad, "bad", "test")        // independent label preserved
+	if got := countEvents("cascade-demote"); got != 2 {
+		t.Errorf("cascade-demote events = %d, want 2", got)
+	}
+
+	// --- Promote: archive marked good, including revert of a prior cascade-demote. ---
+	archB := sha64('g')
+	mustInsert(t, ctx, db, &Sample{SHA256: archB, Source: "test", Label: "unknown", LabelSource: "forager", Path: "unknown/g.tgz"})
+	var (
+		bUnk      = sha64('h') // unknown → promoted to good
+		bBadIndep = sha64('i') // independently bad → untouched (no whitewash)
+		bCascade  = sha64('j') // bad via this parent's cascade → reverted to good
+	)
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{
+		member(bUnk, archB, 5), member(bBadIndep, archB, 90), member(bCascade, archB, 90),
+	}); err != nil {
+		t.Fatalf("InsertSampleBatch: %v", err)
+	}
+	mustRelabel(t, ctx, db, bBadIndep, "bad", "test")
+	mustRelabel(t, ctx, db, bCascade, "bad", cascadeSource(archB))
+
+	n, err = db.CascadeLabel(ctx, archB, "good", "promoter:interactive")
+	if err != nil {
+		t.Fatalf("CascadeLabel promote: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("promote cascaded %d members, want 2 (bUnk promote, bCascade revert)", n)
+	}
+	want(archB, "good", "promoter:interactive")
+	want(bUnk, "good", "promoter:interactive")     // unlabeled member follows
+	want(bBadIndep, "bad", "test")                 // independent bad not whitewashed
+	want(bCascade, "good", "promoter:interactive") // this parent's demote reverted
+	if got := countEvents("cascade-promote"); got != 1 {
+		t.Errorf("cascade-promote events = %d, want 1", got)
+	}
+	if got := countEvents("cascade-revert"); got != 1 {
+		t.Errorf("cascade-revert events = %d, want 1", got)
+	}
+}
+
+func TestCascadeBackfill(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	want := func(sha, label, source string) {
+		t.Helper()
+		s, err := db.SampleBySHA256(ctx, sha)
+		if err != nil {
+			t.Fatalf("SampleBySHA256(%s): %v", sha[:4], err)
+		}
+		if s.Label != label || s.LabelSource != source {
+			t.Errorf("%s = {%q,%q}, want {%q,%q}", sha[:4], s.Label, s.LabelSource, label, source)
+		}
+	}
+	member := func(sha, parent string, score int) *Sample {
+		return &Sample{
+			SHA256: sha, Source: "test", Label: "unknown", LabelSource: "forager", Parent: parent,
+			Path:         parent + "!!pkg/" + sha[:4] + ".js",
+			CleaveResult: fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"js","x":%d,"dp":1}]}`, sha, score),
+		}
+	}
+
+	// An archive labeled bad before CascadeLabel existed: members still unknown.
+	archBad := sha64('a')
+	mustInsert(t, ctx, db, &Sample{SHA256: archBad, Source: "test", Label: "bad", LabelSource: "promoter:interactive", Path: "q/a.tgz"})
+	var (
+		bHigh  = sha64('b') // unknown, score 90 → demoted
+		bLow   = sha64('c') // unknown, score 10 → left (below floor)
+		shared = sha64('d') // unknown, score 90, also under archGood → bad wins (bad-first)
+	)
+	// An archive labeled good before CascadeLabel existed.
+	archGood := sha64('e')
+	mustInsert(t, ctx, db, &Sample{SHA256: archGood, Source: "test", Label: "good", LabelSource: "promoter:interactive", Path: "q/e.tgz"})
+	gUnk := sha64('f') // unknown → promoted
+
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{
+		member(bHigh, archBad, 90), member(bLow, archBad, 10), member(shared, archBad, 90),
+		member(gUnk, archGood, 5),
+	}); err != nil {
+		t.Fatalf("InsertSampleBatch: %v", err)
+	}
+	// Give `shared` a second location under the good archive, so it is a member
+	// of both. Bad-first must resolve it to bad.
+	if _, err := db.lite.ExecContext(ctx,
+		`INSERT INTO sample_locations (sha256, path, parent_sha256, first_seen_at, last_seen_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		shared, archGood+"!!pkg/dd.js", archGood, now(), now()); err != nil {
+		t.Fatalf("insert shared location: %v", err)
+	}
+
+	// Pending probe should see work before the backfill.
+	if pending, err := db.CascadeBackfillPending(ctx); err != nil || !pending {
+		t.Fatalf("CascadeBackfillPending before = %v, %v; want true, nil", pending, err)
+	}
+
+	// Dry-run changes nothing and sums each archive independently, so `shared`
+	// is counted in both the demote (archBad) and promote (archGood) totals.
+	dry, err := db.CascadeBackfill(ctx, true)
+	if err != nil {
+		t.Fatalf("CascadeBackfill dry-run: %v", err)
+	}
+	if dry.BadArchives != 1 || dry.MembersDemoted != 2 {
+		t.Errorf("dry-run bad = {%d archives, %d demoted}, want {1, 2}", dry.BadArchives, dry.MembersDemoted)
+	}
+	if dry.GoodArchives != 1 || dry.MembersPromoted != 2 {
+		t.Errorf("dry-run good = {%d archives, %d promoted}, want {1, 2 (incl. shared)}", dry.GoodArchives, dry.MembersPromoted)
+	}
+	want(bHigh, "unknown", "forager") // dry-run wrote nothing
+	want(gUnk, "unknown", "forager")
+
+	// Apply: bad-first means `shared` is demoted, then the good pass skips it.
+	got, err := db.CascadeBackfill(ctx, false)
+	if err != nil {
+		t.Fatalf("CascadeBackfill apply: %v", err)
+	}
+	if got.MembersDemoted != 2 || got.MembersPromoted != 1 {
+		t.Errorf("apply = {%d demoted, %d promoted}, want {2, 1} (shared resolved bad-first)", got.MembersDemoted, got.MembersPromoted)
+	}
+	want(bHigh, "bad", cascadeSource(archBad))
+	want(shared, "bad", cascadeSource(archBad)) // bad-first wins over the good archive
+	want(bLow, "unknown", "forager")            // below the demote floor
+	want(gUnk, "good", "promoter:interactive")  // promoted from the good archive
+
+	// Nothing left to do, and re-running is a no-op.
+	if pending, err := db.CascadeBackfillPending(ctx); err != nil || pending {
+		t.Fatalf("CascadeBackfillPending after = %v, %v; want false, nil", pending, err)
+	}
+	again, err := db.CascadeBackfill(ctx, false)
+	if err != nil {
+		t.Fatalf("CascadeBackfill re-run: %v", err)
+	}
+	if again.MembersDemoted != 0 || again.MembersPromoted != 0 {
+		t.Errorf("re-run = {%d demoted, %d promoted}, want {0, 0} (idempotent)", again.MembersDemoted, again.MembersPromoted)
+	}
+}

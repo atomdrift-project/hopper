@@ -1844,6 +1844,217 @@ func (db *DB) reclassifySQLite(ctx context.Context, sha256, label, source string
 	return nil
 }
 
+func (db *DB) cascadeLabelSQLite(ctx context.Context, sha256, label, source string) (int, error) {
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: begin cascade: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE samples SET label = ?, label_source = ?, updated_at = ? WHERE sha256 = ?`,
+		label, source, now(), sha256); err != nil {
+		return 0, fmt.Errorf("hopper: cascade parent: %w", err)
+	}
+	children, err := cascadeMembersForParentSQLite(ctx, tx, sha256, label, source, false)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("hopper: commit cascade: %w", err)
+	}
+	return children, nil
+}
+
+// cascadeMembersForParentSQLite is the SQLite counterpart of
+// cascadeMembersForParentPG: it applies the member cascade for an archive
+// already labeled `label`, without touching the parent row. dryRun counts
+// without writing.
+func cascadeMembersForParentSQLite(ctx context.Context, tx *sql.Tx, parent, label, source string, dryRun bool) (int, error) {
+	// Member-selection queries mirror cascadeMembersForParentPG. The trailing ?
+	// binds the parent SHA256; earlier ? bind the extra args passed alongside.
+	const promoteMembers = `SELECT sha256, label FROM samples
+		WHERE label = 'unknown'
+		  AND sha256 IN (SELECT sha256 FROM sample_locations WHERE parent_sha256 = ?)`
+	const revertMembers = `SELECT sha256, label FROM samples
+		WHERE label = 'bad' AND label_source = ?
+		  AND sha256 IN (SELECT sha256 FROM sample_locations WHERE parent_sha256 = ?)`
+	const demoteMembers = `SELECT sha256, label FROM samples
+		WHERE label = 'unknown' AND score >= ?
+		  AND sha256 IN (SELECT sha256 FROM sample_locations WHERE parent_sha256 = ?)`
+
+	children := 0
+	switch label {
+	case labelGood:
+		n, err := cascadeMembersSQLite(ctx, tx, promoteMembers, []any{parent}, labelGood, source, "cascade-promote", dryRun)
+		if err != nil {
+			return 0, err
+		}
+		children += n
+		n, err = cascadeMembersSQLite(ctx, tx, revertMembers, []any{cascadeSource(parent), parent}, labelGood, source, "cascade-revert", dryRun)
+		if err != nil {
+			return 0, err
+		}
+		children += n
+	case labelBad:
+		n, err := cascadeMembersSQLite(ctx, tx, demoteMembers, []any{CascadeDemoteScore, parent},
+			labelBad, cascadeSource(parent), "cascade-demote", dryRun)
+		if err != nil {
+			return 0, err
+		}
+		children += n
+	default:
+		// Other labels (e.g. unknown) have no member cascade.
+	}
+	return children, nil
+}
+
+// cascadeMembersSQLite is the SQLite counterpart of cascadeMembersPG: query
+// selects sha256, label and binds args; matched members are relabeled to
+// toLabel/toSource with each transition recorded in label_events under reason.
+// dryRun returns the eligible count without writing.
+func cascadeMembersSQLite(ctx context.Context, tx *sql.Tx, query string, args []any, toLabel, toSource, reason string, dryRun bool) (int, error) {
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: cascade scan members: %w", err)
+	}
+	type change struct{ sha, from string }
+	var changes []change
+	for rows.Next() {
+		var c change
+		if err := rows.Scan(&c.sha, &c.from); err != nil {
+			rows.Close() //nolint:errcheck,sqlclosecheck,gosec // best-effort cleanup before error return
+			return 0, fmt.Errorf("hopper: cascade scan member: %w", err)
+		}
+		changes = append(changes, c)
+	}
+	rows.Close() //nolint:errcheck,gosec // best-effort cleanup
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if dryRun {
+		return len(changes), nil
+	}
+	ts := now()
+	applied := 0
+	for _, c := range changes {
+		// Compare-and-set on the scanned label (see cascadeMembersPG).
+		res, err := tx.ExecContext(ctx, `
+			UPDATE samples SET label = ?, label_source = ?, updated_at = ? WHERE sha256 = ? AND label = ?`,
+			toLabel, toSource, ts, c.sha, c.from)
+		if err != nil {
+			return 0, fmt.Errorf("hopper: cascade member: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("hopper: cascade member rows: %w", err)
+		}
+		if n == 0 {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
+			VALUES (?, ?, ?, '', '', ?, ?)`,
+			c.sha, c.from, toLabel, reason, ts); err != nil {
+			return 0, fmt.Errorf("hopper: cascade audit: %w", err)
+		}
+		applied++
+	}
+	return applied, nil
+}
+
+// cascadeBackfillPendingSQLite is the SQLite counterpart of
+// cascadeBackfillPendingPG.
+func (db *DB) cascadeBackfillPendingSQLite(ctx context.Context) (bool, error) {
+	var pending bool
+	err := db.lite.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM samples p
+			JOIN sample_locations l ON l.parent_sha256 = p.sha256
+			JOIN samples m ON m.sha256 = l.sha256
+			WHERE p.parent = '' AND m.label = 'unknown'
+			  AND (p.label = 'good' OR (p.label = 'bad' AND m.score >= ?))
+		)`, CascadeDemoteScore).Scan(&pending)
+	if err != nil {
+		return false, fmt.Errorf("hopper: cascade backfill pending: %w", err)
+	}
+	return pending, nil
+}
+
+// cascadeBackfillSQLite is the SQLite counterpart of cascadeBackfillPG.
+func (db *DB) cascadeBackfillSQLite(ctx context.Context, dryRun bool) (CascadeBackfillStats, error) {
+	// See cascadeBackfillPG for why selection is eligibility-aware.
+	const badArchives = `
+		SELECT sha256, label_source FROM samples s
+		WHERE parent = '' AND label = 'bad'
+		  AND EXISTS (
+			SELECT 1 FROM sample_locations l JOIN samples m ON m.sha256 = l.sha256
+			WHERE l.parent_sha256 = s.sha256 AND m.label = 'unknown' AND m.score >= ?)
+		ORDER BY id`
+	const goodArchives = `
+		SELECT sha256, label_source FROM samples s
+		WHERE parent = '' AND label = 'good'
+		  AND EXISTS (
+			SELECT 1 FROM sample_locations l JOIN samples m ON m.sha256 = l.sha256
+			WHERE l.parent_sha256 = s.sha256
+			  AND (m.label = 'unknown' OR (m.label = 'bad' AND m.label_source = 'cascade:' || s.sha256)))
+		ORDER BY id`
+
+	var st CascadeBackfillStats
+	for _, label := range []string{labelBad, labelGood} {
+		query, args := goodArchives, []any(nil)
+		if label == labelBad {
+			query, args = badArchives, []any{CascadeDemoteScore}
+		}
+		rows, err := db.lite.QueryContext(ctx, query, args...)
+		if err != nil {
+			return st, fmt.Errorf("hopper: backfill scan archives: %w", err)
+		}
+		type archive struct{ sha, source string }
+		var archives []archive
+		for rows.Next() {
+			var a archive
+			if err := rows.Scan(&a.sha, &a.source); err != nil {
+				rows.Close() //nolint:errcheck,sqlclosecheck,gosec // best-effort cleanup before error return
+				return st, fmt.Errorf("hopper: backfill scan archive: %w", err)
+			}
+			archives = append(archives, a)
+		}
+		rows.Close() //nolint:errcheck,gosec // best-effort cleanup
+		if err := rows.Err(); err != nil {
+			return st, err
+		}
+
+		slog.Info("cascade backfill pass starting", "label", label, "archives", len(archives), "dry_run", dryRun)
+		passMembers := 0
+		for i, a := range archives {
+			tx, err := db.lite.BeginTx(ctx, nil)
+			if err != nil {
+				return st, fmt.Errorf("hopper: backfill begin: %w", err)
+			}
+			n, err := cascadeMembersForParentSQLite(ctx, tx, a.sha, label, a.source, dryRun)
+			if err != nil {
+				tx.Rollback() //nolint:errcheck,gosec // returning the prior error
+				return st, err
+			}
+			if dryRun {
+				tx.Rollback() //nolint:errcheck,gosec // dry-run: discard
+			} else if err := tx.Commit(); err != nil {
+				return st, fmt.Errorf("hopper: backfill commit: %w", err)
+			}
+			st.record(label, n)
+			passMembers += n
+			if (i+1)%cascadeBackfillLogEvery == 0 {
+				slog.Info("cascade backfill progress", "label", label,
+					"archives_done", i+1, "archives_total", len(archives), "members_changed", passMembers)
+			}
+		}
+		slog.Info("cascade backfill pass complete", "label", label, "archives", len(archives), "members_changed", passMembers)
+	}
+	return st, nil
+}
+
 func (db *DB) relocateSampleSQLite(ctx context.Context, sha256, oldRel, newRel, label, source string) error {
 	tx, err := db.lite.BeginTx(ctx, nil)
 	if err != nil {

@@ -2425,6 +2425,234 @@ func (db *DB) reclassifyPG(ctx context.Context, sha256, label, source string) er
 	return nil
 }
 
+func (db *DB) cascadeLabelPG(ctx context.Context, sha256, label, source string) (int, error) {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: begin cascade: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE samples SET label = $2, label_source = $3, updated_at = now() WHERE sha256 = $1`,
+		sha256, label, source); err != nil {
+		return 0, fmt.Errorf("hopper: cascade parent: %w", err)
+	}
+	children, err := cascadeMembersForParentPG(ctx, tx, sha256, label, source, false)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("hopper: commit cascade: %w", err)
+	}
+	return children, nil
+}
+
+// cascadeMembersForParentPG applies the member cascade for an archive already
+// labeled `label` (with label_source `source`), without touching the parent row.
+// It is the shared unit behind both live relabeling (cascadeLabelPG) and the
+// historical backfill (cascadeBackfillPG); dryRun counts the eligible members
+// without writing. It returns the number of members changed (or that would be).
+func cascadeMembersForParentPG(ctx context.Context, tx pgx.Tx, parent, label, source string, dryRun bool) (int, error) {
+	// Each query selects the members (via sample_locations, the membership
+	// source of truth) eligible for a transition. $1 is the parent; later
+	// placeholders bind extra args.
+	const promoteMembers = `SELECT sha256, label FROM samples
+		WHERE label = 'unknown'
+		  AND sha256 IN (SELECT sha256 FROM sample_locations WHERE parent_sha256 = $1)`
+	const revertMembers = `SELECT sha256, label FROM samples
+		WHERE label = 'bad' AND label_source = $2
+		  AND sha256 IN (SELECT sha256 FROM sample_locations WHERE parent_sha256 = $1)`
+	const demoteMembers = `SELECT sha256, label FROM samples
+		WHERE label = 'unknown' AND score >= $2
+		  AND sha256 IN (SELECT sha256 FROM sample_locations WHERE parent_sha256 = $1)`
+
+	children := 0
+	switch label {
+	case labelGood:
+		// Unlabeled members follow the parent to good.
+		n, err := cascadeMembersPG(ctx, tx, promoteMembers, []any{parent}, labelGood, source, "cascade-promote", dryRun)
+		if err != nil {
+			return 0, err
+		}
+		children += n
+		// Members this same parent previously demoted are reverted to good.
+		n, err = cascadeMembersPG(ctx, tx, revertMembers, []any{parent, cascadeSource(parent)}, labelGood, source, "cascade-revert", dryRun)
+		if err != nil {
+			return 0, err
+		}
+		children += n
+	case labelBad:
+		// Only unlabeled members carrying real suspicion follow the parent to bad.
+		n, err := cascadeMembersPG(ctx, tx, demoteMembers, []any{parent, CascadeDemoteScore},
+			labelBad, cascadeSource(parent), "cascade-demote", dryRun)
+		if err != nil {
+			return 0, err
+		}
+		children += n
+	default:
+		// Other labels (e.g. unknown) have no member cascade.
+	}
+	return children, nil
+}
+
+// cascadeMembersPG runs query (which selects sha256, label and binds args) and
+// relabels every returned member to toLabel/toSource, recording each transition
+// in label_events under reason. dryRun returns the eligible count without
+// writing. It returns the number of members changed (or that would be).
+func cascadeMembersPG(ctx context.Context, tx pgx.Tx, query string, args []any, toLabel, toSource, reason string, dryRun bool) (int, error) {
+	rows, err := tx.Query(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: cascade scan members: %w", err)
+	}
+	type change struct{ sha, from string }
+	var changes []change
+	for rows.Next() {
+		var c change
+		if err := rows.Scan(&c.sha, &c.from); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("hopper: cascade scan member: %w", err)
+		}
+		changes = append(changes, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if dryRun {
+		return len(changes), nil
+	}
+	applied := 0
+	for _, c := range changes {
+		// Compare-and-set on the scanned label: if concurrent live traffic
+		// relabeled the row since the scan, RowsAffected is 0 and we leave it
+		// (and skip the audit) rather than clobber the newer verdict.
+		tag, err := tx.Exec(ctx, `
+			UPDATE samples SET label = $2, label_source = $3, updated_at = now()
+			WHERE sha256 = $1 AND label = $4`,
+			c.sha, toLabel, toSource, c.from)
+		if err != nil {
+			return 0, fmt.Errorf("hopper: cascade member: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			continue
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
+			VALUES ($1, $2, $3, '', '', $4, now())`,
+			c.sha, c.from, toLabel, reason); err != nil {
+			return 0, fmt.Errorf("hopper: cascade audit: %w", err)
+		}
+		applied++
+	}
+	return applied, nil
+}
+
+// cascadeBackfillPendingPG reports whether any good/bad top-level archive still
+// holds an 'unknown' member — i.e. whether cascadeBackfillPG has work to do.
+// It drives from the (small) labeled-archive set so the common "nothing to do"
+// answer stays an index-assisted probe rather than a full member scan.
+func (db *DB) cascadeBackfillPendingPG(ctx context.Context) (bool, error) {
+	var pending bool
+	err := db.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM samples p
+			JOIN sample_locations l ON l.parent_sha256 = p.sha256
+			JOIN samples m ON m.sha256 = l.sha256
+			WHERE p.parent = '' AND m.label = 'unknown'
+			  AND (p.label = 'good' OR (p.label = 'bad' AND m.score >= $1))
+		)`, CascadeDemoteScore).Scan(&pending)
+	if err != nil {
+		return false, fmt.Errorf("hopper: cascade backfill pending: %w", err)
+	}
+	return pending, nil
+}
+
+// cascadeBackfillPG re-applies the member cascade to every already-labeled
+// archive so children labeled before CascadeLabel existed are brought into
+// agreement. Bad archives are processed before good ones: a member shared by a
+// bad and a good archive must end up bad (precedence bad > good > unknown), and
+// since demote claims only unknown members while promote never overrides bad,
+// bad-first yields that outcome — good-first would whitewash it. Each archive
+// commits in its own transaction so the pass never holds a table-wide lock and
+// is resumable; it is idempotent. dryRun counts without writing. The parent rows
+// are left untouched (they are already labeled); only members change.
+func (db *DB) cascadeBackfillPG(ctx context.Context, dryRun bool) (CascadeBackfillStats, error) {
+	// Select only archives that actually have an eligible member, so the
+	// per-archive loop skips the (vast majority of) labeled archives whose
+	// members were already settled at extraction time. The EXISTS predicate
+	// mirrors cascadeMembersForParent's selection for each direction; the
+	// 'cascade:' literal mirrors cascadeSource.
+	const badArchives = `
+		SELECT sha256, label_source FROM samples s
+		WHERE parent = '' AND label = 'bad'
+		  AND EXISTS (
+			SELECT 1 FROM sample_locations l JOIN samples m ON m.sha256 = l.sha256
+			WHERE l.parent_sha256 = s.sha256 AND m.label = 'unknown' AND m.score >= $1)
+		ORDER BY id`
+	const goodArchives = `
+		SELECT sha256, label_source FROM samples s
+		WHERE parent = '' AND label = 'good'
+		  AND EXISTS (
+			SELECT 1 FROM sample_locations l JOIN samples m ON m.sha256 = l.sha256
+			WHERE l.parent_sha256 = s.sha256
+			  AND (m.label = 'unknown' OR (m.label = 'bad' AND m.label_source = 'cascade:' || s.sha256)))
+		ORDER BY id`
+
+	var st CascadeBackfillStats
+	for _, label := range []string{labelBad, labelGood} {
+		query, args := goodArchives, []any(nil)
+		if label == labelBad {
+			query, args = badArchives, []any{CascadeDemoteScore}
+		}
+		rows, err := db.pool.Query(ctx, query, args...)
+		if err != nil {
+			return st, fmt.Errorf("hopper: backfill scan archives: %w", err)
+		}
+		type archive struct{ sha, source string }
+		var archives []archive
+		for rows.Next() {
+			var a archive
+			if err := rows.Scan(&a.sha, &a.source); err != nil {
+				rows.Close()
+				return st, fmt.Errorf("hopper: backfill scan archive: %w", err)
+			}
+			archives = append(archives, a)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return st, err
+		}
+
+		slog.Info("cascade backfill pass starting", "label", label, "archives", len(archives), "dry_run", dryRun)
+		passMembers := 0
+		for i, a := range archives {
+			tx, err := db.pool.Begin(ctx)
+			if err != nil {
+				return st, fmt.Errorf("hopper: backfill begin: %w", err)
+			}
+			n, err := cascadeMembersForParentPG(ctx, tx, a.sha, label, a.source, dryRun)
+			if err != nil {
+				tx.Rollback(ctx) //nolint:errcheck,gosec // returning the prior error
+				return st, err
+			}
+			if dryRun {
+				tx.Rollback(ctx) //nolint:errcheck,gosec // dry-run: discard
+			} else if err := tx.Commit(ctx); err != nil {
+				return st, fmt.Errorf("hopper: backfill commit: %w", err)
+			}
+			st.record(label, n)
+			passMembers += n
+			if (i+1)%cascadeBackfillLogEvery == 0 {
+				slog.Info("cascade backfill progress", "label", label,
+					"archives_done", i+1, "archives_total", len(archives), "members_changed", passMembers)
+			}
+		}
+		slog.Info("cascade backfill pass complete", "label", label, "archives", len(archives), "members_changed", passMembers)
+	}
+	return st, nil
+}
+
 func (db *DB) unanalyzedPG(ctx context.Context, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples WHERE cleave_result IS NULL ORDER BY id LIMIT $1`, limit)
