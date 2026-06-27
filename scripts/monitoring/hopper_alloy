@@ -1,0 +1,55 @@
+#!/bin/sh
+#
+# PROVIDE: hopper_alloy
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+#
+# Grafana Alloy shipping hopper's Postgres replication metrics to Grafana Cloud.
+# Install as /usr/local/etc/rc.d/hopper_alloy, then:  sysrc hopper_alloy_enable=YES
+#
+# rc.conf knobs (defaults below):
+#   hopper_alloy_user     service account             (alloy)
+#   hopper_alloy_config   Alloy config file           (/usr/local/etc/hopper-alloy/config.alloy)
+#   hopper_alloy_env      KEY=VALUE secrets file       (/usr/local/etc/hopper-alloy/alloy.env)
+#   hopper_alloy_storage  Alloy WAL/storage dir        (/var/db/hopper-alloy)
+
+. /etc/rc.subr
+
+name="hopper_alloy"
+desc="Grafana Alloy — hopper Postgres replication metrics"
+rcvar="hopper_alloy_enable"
+
+load_rc_config $name
+
+: ${hopper_alloy_enable:="NO"}
+: ${hopper_alloy_user:="alloy"}
+: ${hopper_alloy_config:="/usr/local/etc/hopper-alloy/config.alloy"}
+: ${hopper_alloy_env:="/usr/local/etc/hopper-alloy/alloy.env"}
+: ${hopper_alloy_storage:="/var/db/hopper-alloy"}
+
+pidfile="/var/run/${name}.pid"
+alloy_bin="/usr/local/bin/alloy"
+
+# Load the secrets file (EXPORTER_DSN, GC_*) into the environment so daemon(8)
+# passes them through to alloy. `set -a` exports everything the file sets; the
+# plain KEY=value lines in alloy.env therefore reach the child process.
+if [ -r "${hopper_alloy_env}" ]; then
+	set -a
+	. "${hopper_alloy_env}"
+	set +a
+fi
+
+# Supervise under daemon(8): -r restart on exit, -S log stdout/stderr to syslog
+# under tag ${name}, -p pidfile for rc status, -u drop to the service account.
+command="/usr/sbin/daemon"
+command_args="-r -S -T ${name} -p ${pidfile} -u ${hopper_alloy_user} \
+	${alloy_bin} run ${hopper_alloy_config} --storage.path=${hopper_alloy_storage}"
+
+start_precmd="hopper_alloy_precmd"
+hopper_alloy_precmd()
+{
+	install -d -o "${hopper_alloy_user}" -g "${hopper_alloy_user}" -m 0750 \
+		"${hopper_alloy_storage}"
+}
+
+run_rc_command "$1"

@@ -1,0 +1,37 @@
+# Custom queries for Alloy's embedded postgres_exporter
+# (prometheus.exporter.postgres custom_queries_config_path).
+#
+# Publisher-side view: one row per LOGICAL replication slot. This is the
+# canonical lag source — pg_replication_slots always has a row per slot, unlike
+# pg_stat_replication whose walsender rows exist only while a peer is actively
+# connected. A sick replica is therefore visible here even when its own host is
+# unreachable (that is what makes a single publisher-side exporter sufficient).
+#
+# Emits: hopper_replication_slot_{active,wal_status_code,retained_wal_bytes,
+#        confirmed_lag_bytes}{slot_name=..., kind="streaming"|"tablesync"}
+
+hopper_replication_slot:
+  query: |
+    SELECT
+      s.slot_name,
+      CASE WHEN s.slot_name LIKE 'pg\_%\_sync\_%'
+           THEN 'tablesync' ELSE 'streaming' END                    AS kind,
+      (s.active)::int                                               AS active,
+      CASE s.wal_status
+        WHEN 'reserved'   THEN 0
+        WHEN 'extended'   THEN 1
+        WHEN 'unreserved' THEN 2
+        WHEN 'lost'       THEN 3
+        ELSE -1 END                                                 AS wal_status_code,
+      (pg_current_wal_lsn() - s.restart_lsn)                        AS retained_wal_bytes,
+      GREATEST(pg_current_wal_lsn() - s.confirmed_flush_lsn, 0)     AS confirmed_lag_bytes
+    FROM pg_replication_slots s
+    WHERE s.slot_type = 'logical'
+  master: true          # only scrape this on the primary/publisher
+  metrics:
+    - slot_name:          { usage: "LABEL", description: "Replication slot name" }
+    - kind:               { usage: "LABEL", description: "streaming or tablesync (initial copy)" }
+    - active:             { usage: "GAUGE", description: "1 if a walsender is currently consuming the slot" }
+    - wal_status_code:    { usage: "GAUGE", description: "0=reserved 1=extended 2=unreserved 3=lost(invalidated)" }
+    - retained_wal_bytes: { usage: "GAUGE", description: "WAL bytes pinned by this slot = replica lag" }
+    - confirmed_lag_bytes:{ usage: "GAUGE", description: "Bytes between current WAL and slot confirmed_flush_lsn" }

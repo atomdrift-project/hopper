@@ -1,0 +1,48 @@
+// Grafana Alloy — Postgres replication metrics for hopper.
+//
+// Runs on uruk-hai (FreeBSD, 10.9.8.5) — a non-replica box, reaching the
+// publisher (hopper-db, a native illumos zone) over the tailnet. Alloy connects
+// as a network client, so it needn't be co-located, and FreeBSD/amd64 is an
+// official Alloy build target (unlike illumos). One connection to the publisher
+// is enough: pg_replication_slots there shows every replica's lag and status.
+// Its ONLY job is to ship that replication state to Grafana Cloud — app/runtime
+// metrics already arrive via each Go service's native OTel exporter, so Alloy
+// deliberately does NOT scrape those.
+//
+// Env (loaded from alloy.env by the rc.d script, see RUNBOOK.md):
+//   EXPORTER_DSN   postgresql://hopper_exporter:PW@hopper-db:5432/hopper?sslmode=disable
+//   GC_PROM_URL    https://prometheus-prod-XX-...grafana.net/api/prom/push
+//   GC_PROM_USER   Grafana Cloud Prometheus instance id (numeric)
+//   GC_PROM_TOKEN  Grafana Cloud access policy token (metrics:write)
+
+prometheus.exporter.postgres "publisher" {
+  data_source_names          = [sys.env("EXPORTER_DSN")]
+  custom_queries_config_path = "/usr/local/etc/hopper-alloy/queries.yaml"
+
+  // Defaults give pg_up + the built-in replication / replication_slot
+  // collectors; the custom query above adds wal_status + tablesync labelling.
+  enabled_collectors = ["replication", "replication_slot"]
+}
+
+prometheus.scrape "publisher" {
+  targets         = prometheus.exporter.postgres.publisher.targets
+  forward_to      = [prometheus.remote_write.grafanacloud.receiver]
+  job_name        = "postgres-publisher"
+  scrape_interval = "30s"
+}
+
+prometheus.remote_write "grafanacloud" {
+  endpoint {
+    url = sys.env("GC_PROM_URL")
+    basic_auth {
+      username = sys.env("GC_PROM_USER")
+      password = sys.env("GC_PROM_TOKEN")
+    }
+  }
+  // cluster label ties these series to the hopper topology; instance/job come
+  // from the scrape target so per-slot series stay distinct.
+  external_labels = {
+    cluster = "hopper",
+    role    = "publisher",
+  }
+}

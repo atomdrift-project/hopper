@@ -1,0 +1,102 @@
+# Replication alerting rules for hopper's logical-replication topology.
+#
+# EVALUATED IN GRAFANA CLOUD (Mimir), not on a replica — so a dead replica
+# still pages. This is the whole reason the metrics are pushed out: on
+# 2026-06-27 galadriel's postgres was down 2.5h; host-local alerting would have
+# died with it. Load with mimirtool:
+#
+#   mimirtool rules load scripts/monitoring/replication-alerts.yml \
+#     --address="$GC_PROM_URL_BASE" --id="$GC_TENANT" --key="$GC_TOKEN"
+#
+# Metrics come from Alloy's embedded postgres_exporter on the PUBLISHER
+# (job="postgres-publisher"), custom query "hopper_replication_slot"
+# (scripts/monitoring/queries.yaml). The slot view shows a sick replica even
+# when its own host is unreachable, so publisher-side scraping alone covers
+# every incident this topology has actually had.
+#
+# Backstop context: publisher max_slot_wal_keep_size = 1500GB; WAL burn
+# ~35-40 GB/h. A slot that crosses the backstop is invalidated ("lost") and its
+# replica needs a full rebuild, so the lag pages fire with hours of runway left.
+
+groups:
+  - name: hopper-replication
+    rules:
+      # The exporter itself stopped reporting — replication is now unmonitored.
+      # (Also fires if the publisher's postgres is down, since the local DSN
+      # scrape fails.)
+      - alert: PostgresPublisherExporterDown
+        expr: up{job="postgres-publisher"} == 0
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "Postgres replication exporter is down"
+          description: "Alloy/postgres_exporter on the publisher has been unscrapeable for 5m — replication lag is no longer being observed."
+
+      # A slot crossed max_slot_wal_keep_size and self-invalidated. Unrecoverable
+      # without a full rebuild (the 2026-06-21 incident). Any kind, page now.
+      - alert: ReplicaSlotInvalidated
+        expr: hopper_replication_slot_wal_status_code == 3
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: "Replication slot {{ $labels.slot_name }} is LOST"
+          description: "wal_status=lost on {{ $labels.slot_name }} ({{ $labels.kind }}) — exceeded max_slot_wal_keep_size and was invalidated. The replica needs a full rebuild (make rebuild-replica)."
+
+      # A streaming replica's apply worker is no longer consuming its slot:
+      # host/PG down (2026-06-27), subscription disabled by schema drift
+      # (2026-06-14/21), or a severed link. Tablesync slots are excluded — they
+      # are legitimately inactive during the initial COPY.
+      - alert: ReplicaSlotInactive
+        expr: hopper_replication_slot_active{kind="streaming"} == 0
+        for: 10m
+        labels: { severity: page }
+        annotations:
+          summary: "Streaming replica slot {{ $labels.slot_name }} has no consumer"
+          description: "No walsender has consumed {{ $labels.slot_name }} for 10m — the replica is disconnected (host/PG down or subscription disabled)."
+
+      # Streaming replica falling behind. Warn early, well under the backstop.
+      - alert: ReplicaSlotLagWarning
+        expr: hopper_replication_slot_retained_wal_bytes{kind="streaming"} > 300e9
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Replica slot {{ $labels.slot_name }} retaining >300GB WAL"
+          description: "{{ $value | humanize1024 }}B pinned by {{ $labels.slot_name }} — the streaming replica is lagging (backstop 1500GB)."
+
+      # Any slot within ~300GB of the 1500GB backstop (~8h runway). Page: if it
+      # crosses, the slot is invalidated and the replica must be rebuilt.
+      - alert: ReplicaSlotLagCritical
+        expr: hopper_replication_slot_retained_wal_bytes > 1200e9
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "Replication slot {{ $labels.slot_name }} near the backstop"
+          description: "{{ $value | humanize1024 }}B pinned by {{ $labels.slot_name }} ({{ $labels.kind }}) — within ~300GB of max_slot_wal_keep_size. It will self-invalidate if it crosses."
+
+      # An initial tablesync (e.g. .62's sample_locations copy) freezes its
+      # slot's restart_lsn for the whole COPY, so retention only grows. Expected,
+      # but warn so a slow copy doesn't silently march into the backstop.
+      - alert: TablesyncSlotLagWarning
+        expr: hopper_replication_slot_retained_wal_bytes{kind="tablesync"} > 400e9
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "Tablesync slot {{ $labels.slot_name }} retaining >400GB WAL"
+          description: "An initial tablesync is pinning {{ $value | humanize1024 }}B and rising. Normal during a large copy; watch it against the 1500GB backstop."
+
+# ---------------------------------------------------------------------------
+# OPTIONAL subscriber-side rules — require ALSO scraping the replicas
+# (job="postgres-replica"), which needs the exporter to reach each replica's
+# postgres. .62 is reachable; galadriel currently listens socket-only, so it
+# would need listen_addresses/pg_hba opened to the tailnet or a local exporter.
+# These give earlier, cleaner signal than the publisher-side lag climb:
+#
+#   - alert: SubscriptionDisabled
+#     expr: pg_subscription_enabled == 0          # custom query on the replica
+#     for: 2m
+#     labels: { severity: page }
+#   - alert: SubscriptionApplyErrors
+#     expr: increase(pg_stat_subscription_stats_apply_error_count[15m]) > 0
+#     for: 0m
+#     labels: { severity: warning }
+# ---------------------------------------------------------------------------
