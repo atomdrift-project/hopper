@@ -357,6 +357,13 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// which is what lets the BFS expand the alive set by index lookups instead
 		// of seq-scanning + sorting all of sample_locations.
 		`CREATE INDEX IF NOT EXISTS idx_sl_parent_child ON sample_locations(parent_sha256) INCLUDE (sha256) WHERE parent_sha256 <> ''`,
+		// Reverse edge for the page's "found in" backlinks (ParentArchivesForChild):
+		// resolve a child sha to its parent archives index-only. Partial, so it
+		// covers only the minority of rows that actually carry a parent — a widely
+		// shared file (the same jquery.min.js in thousands of packages) resolves its
+		// parents without thousands of heap fetches.
+		`CREATE INDEX IF NOT EXISTS idx_sl_sha256_parents ON sample_locations(sha256) ` +
+			`INCLUDE (parent_sha256, last_seen_at, path) WHERE parent_sha256 <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_sl_last_seen ON sample_locations(last_seen_at)`,
 
 		// One-shot backfill from the existing denormalized columns. Guarded
@@ -1996,6 +2003,64 @@ func (db *DB) samplesBySHAsPG(ctx context.Context, shas []string) ([]*Sample, er
 		return nil, fmt.Errorf("hopper: samples by shas: %w", err)
 	}
 	return scanPGSamples(rows)
+}
+
+// membersWithSamplesByParentPG hydrates the archive's top-N edge members plus
+// the linked SHAs (and, only when the parent has no edges, the envelope
+// fallback) in one query. The topn CTE selects only sha256 and sorts on the
+// light score columns, so the heavy cleave/litmus blobs detoast for just the
+// rows the outer SELECT returns. ANY($n) over an empty array matches nothing.
+func (db *DB) membersWithSamplesByParentPG(ctx context.Context, parentSHA string, limit int, linkedSHAs, fallbackSHAs []string) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx, `
+		WITH topn AS (
+			SELECT s.sha256
+			  FROM sample_locations sl
+			  JOIN samples s ON s.sha256 = sl.sha256
+			 WHERE sl.parent_sha256 = $1
+			 ORDER BY s.score DESC, s.max_crit DESC, sl.path
+			 LIMIT $2
+		)
+		SELECT `+pgSampleCols+`
+		  FROM samples s
+		 WHERE s.sha256 IN (SELECT sha256 FROM topn)
+		    OR s.sha256 = ANY($3::text[])
+		    OR (NOT EXISTS (SELECT 1 FROM topn) AND s.sha256 = ANY($4::text[]))`,
+		parentSHA, limit, linkedSHAs, fallbackSHAs)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: members with samples by parent %s: %w", parentSHA, err)
+	}
+	return scanPGSamples(rows)
+}
+
+// parentArchivesForChildPG resolves a child sha to its parent archives in one
+// light-projection join. DISTINCT ON keeps each parent's most-recent location;
+// the outer ORDER BY then ranks parents by recency and caps the set.
+func (db *DB) parentArchivesForChildPG(ctx context.Context, childSHA string, limit int) ([]ParentRef, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT sha256, filename, sample_path, loc_path, litmus_result, analyzed_at FROM (
+			SELECT DISTINCT ON (s.sha256)
+			       s.sha256, s.filename, s.path AS sample_path, sl.path AS loc_path,
+			       s.litmus_result, s.analyzed_at, sl.last_seen_at
+			  FROM sample_locations sl
+			  JOIN samples s ON s.sha256 = sl.parent_sha256
+			 WHERE sl.sha256 = $1 AND sl.parent_sha256 <> ''
+			 ORDER BY s.sha256, sl.last_seen_at DESC
+		) d
+		ORDER BY d.last_seen_at DESC
+		LIMIT $2`, childSHA, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: parent archives for child %s: %w", childSHA, err)
+	}
+	defer rows.Close()
+	var out []ParentRef
+	for rows.Next() {
+		var p ParentRef
+		if err := rows.Scan(&p.SHA256, &p.Filename, &p.SamplePath, &p.Path, &p.LitmusResult, &p.AnalyzedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 func (db *DB) badMembersByParentPG(ctx context.Context, parentSHA string) ([]*Sample, error) {

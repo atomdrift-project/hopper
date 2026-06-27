@@ -131,6 +131,108 @@ func TestMembersByParentAndSamplesBySHAs(t *testing.T) {
 	}
 }
 
+func TestMembersWithSamplesAndParentArchives(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	const arc1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const arc2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	member := func(sha, parent string, score int) *Sample {
+		return &Sample{
+			SHA256:       sha,
+			Source:       "test",
+			Label:        "bad",
+			LabelSource:  "test",
+			Parent:       parent,
+			Path:         parent + "!!pkg/" + sha[:4] + ".js",
+			CleaveResult: fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"js","x":%d,"dp":1}]}`, sha, score),
+		}
+	}
+	m1 := "1111111111111111111111111111111111111111111111111111111111111111"
+	m2 := "2222222222222222222222222222222222222222222222222222222222222222"
+	m3 := "3333333333333333333333333333333333333333333333333333333333333333"
+	// arc1 as a real sample row (so the parent-archive join resolves) plus three
+	// members; m1 is also a member of arc2 so the backlink dedup is exercised.
+	arc1Sample := &Sample{SHA256: arc1, Source: "test", Label: "bad", LabelSource: "test", Filename: "evil.zip", Path: "/feeds/evil.zip"}
+	arc2Sample := &Sample{SHA256: arc2, Source: "test", Label: "bad", LabelSource: "test", Filename: "evil2.zip", Path: "/feeds/evil2.zip"}
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{
+		arc1Sample, arc2Sample, member(m1, arc1, 30), member(m2, arc1, 90), member(m3, arc1, 60), member(m1, arc2, 30),
+	}); err != nil {
+		t.Fatalf("InsertSampleBatch: %v", err)
+	}
+
+	// Top-N by score, hydrated with heavy blobs, plus a linked member that scores
+	// below the cap but must still be included.
+	got, err := db.MembersWithSamplesByParent(ctx, arc1, 2, []string{m1}, nil)
+	if err != nil {
+		t.Fatalf("MembersWithSamplesByParent: %v", err)
+	}
+	shas := map[string]bool{}
+	for _, s := range got {
+		shas[s.SHA256] = true
+		if len(s.CleaveResult) == 0 {
+			t.Errorf("member %s returned empty CleaveResult; heavy blob must be hydrated", s.SHA256[:4])
+		}
+	}
+	if !shas[m2] || !shas[m3] {
+		t.Errorf("top-2 by score missing: got %v, want m2(90)+m3(60)", keys(shas))
+	}
+	if !shas[m1] {
+		t.Errorf("linked member m1 dropped despite below-cap score; got %v", keys(shas))
+	}
+
+	// No edges for this parent: the fallback SHAs hydrate instead (un-backfilled
+	// archive path), still one query.
+	fb, err := db.MembersWithSamplesByParent(ctx, m1, 2, nil, []string{m2})
+	if err != nil {
+		t.Fatalf("MembersWithSamplesByParent(fallback): %v", err)
+	}
+	if len(fb) != 1 || fb[0].SHA256 != m2 {
+		t.Errorf("fallback = %v, want [m2]", keys2(fb))
+	}
+
+	// Backlinks: m1 belongs to arc1 and arc2; arc1 resolves to its sample row,
+	// each parent appears once.
+	refs, err := db.ParentArchivesForChild(ctx, m1, 10)
+	if err != nil {
+		t.Fatalf("ParentArchivesForChild: %v", err)
+	}
+	seen := map[string]hopperParentRefView{}
+	for _, r := range refs {
+		if _, dup := seen[r.SHA256]; dup {
+			t.Errorf("parent %s returned more than once; dedup failed", r.SHA256[:4])
+		}
+		seen[r.SHA256] = hopperParentRefView{filename: r.Filename, childPath: r.Path}
+	}
+	if len(seen) != 2 {
+		t.Fatalf("parents = %d, want 2 (arc1+arc2)", len(seen))
+	}
+	if seen[arc1].filename != "evil.zip" {
+		t.Errorf("arc1 filename = %q, want evil.zip", seen[arc1].filename)
+	}
+	if seen[arc1].childPath != arc1+"!!pkg/1111.js" {
+		t.Errorf("arc1 child path = %q, want m1's location within arc1", seen[arc1].childPath)
+	}
+}
+
+type hopperParentRefView struct{ filename, childPath string }
+
+func keys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k[:4])
+	}
+	return out
+}
+
+func keys2(ss []*Sample) []string {
+	out := make([]string, 0, len(ss))
+	for _, s := range ss {
+		out = append(out, s.SHA256[:4])
+	}
+	return out
+}
+
 // TestExplodeRefreshesStaleMember locks the freshness-gated refresh: a file
 // first analyzed standalone (or by an older archive) keeps a stale result that
 // ON CONFLICT would freeze, but a newer archive that re-analyzes the same

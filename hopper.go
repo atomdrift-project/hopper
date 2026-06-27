@@ -1959,6 +1959,57 @@ func (db *DB) BadMembersByParent(ctx context.Context, parentSHA string) ([]*Samp
 	return db.badMembersByParentSQLite(ctx, parentSHA)
 }
 
+// MembersWithSamplesByParent hydrates an archive's members in a single
+// round-trip — collapsing the former MembersByParent→SamplesBySHAs pair on the
+// page-load path. It returns full sample rows for the union of:
+//   - the top-`limit` members ranked by score (resolved through the
+//     sample_locations edge), and
+//   - linkedSHAs: members a container-level finding draws from, always included
+//     regardless of their standalone score.
+//
+// fallbackSHAs hydrate instead only when the parent has no sample_locations
+// edges at all (an un-backfilled archive) — folded into the same query via a
+// NOT EXISTS guard so an archive page is always exactly two queries (parent +
+// this), never three. Order is unspecified; callers index the result by SHA.
+func (db *DB) MembersWithSamplesByParent(ctx context.Context, parentSHA string, limit int, linkedSHAs, fallbackSHAs []string) ([]*Sample, error) {
+	if parentSHA == "" || limit <= 0 {
+		return nil, nil
+	}
+	if db.pool != nil {
+		return db.membersWithSamplesByParentPG(ctx, parentSHA, limit, linkedSHAs, fallbackSHAs)
+	}
+	return db.membersWithSamplesByParentSQLite(ctx, parentSHA, limit, linkedSHAs, fallbackSHAs)
+}
+
+// ParentRef identifies one archive a child sha was extracted from, carrying just
+// the fields a "found in" backlink renders. LitmusResult is the parent's raw
+// verdict blob (for the classification badge); the heavy cleave_result is never
+// loaded.
+type ParentRef struct {
+	SHA256       string
+	Filename     string // parent archive's filename
+	SamplePath   string // parent archive's own path (basename fallback for Filename)
+	Path         string // path of the child within this parent (from sample_locations)
+	AnalyzedAt   *time.Time
+	LitmusResult []byte // parent's raw verdict blob; cleave_result is never loaded
+}
+
+// ParentArchivesForChild returns, in a single round-trip, the archives a child
+// sha appears in: each parent's identity plus the child's path within it, most
+// recently seen first and deduplicated by parent. It replaces the per-parent
+// SampleBySHA256 fan-out (an N+1 that detoasted every parent's cleave_result for
+// a backlink that needs none) with one light-projection join, served by
+// idx_sl_sha256_parents. Capped at `limit` parents.
+func (db *DB) ParentArchivesForChild(ctx context.Context, childSHA string, limit int) ([]ParentRef, error) {
+	if childSHA == "" || limit <= 0 {
+		return nil, nil
+	}
+	if db.pool != nil {
+		return db.parentArchivesForChildPG(ctx, childSHA, limit)
+	}
+	return db.parentArchivesForChildSQLite(ctx, childSHA, limit)
+}
+
 // SamplesBySHAs fetches full sample rows (including cleave/litmus blobs) for the
 // given SHAs in a single round-trip. Pairs with MembersByParent: list members
 // cheaply, then load heavy data only for the handful actually rendered. Order is
