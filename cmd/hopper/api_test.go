@@ -1139,3 +1139,94 @@ func TestHandleUploadMultipartRejections(t *testing.T) {
 		}
 	})
 }
+
+// TestClassifyResultError pins which worker-reported errors are permanent
+// (marked skip, never re-queued) versus transient (re-queued). The deterministic
+// analysis-guard trips must be permanent; the load-shedding errors must not be,
+// since they succeed once the worker pool drains.
+func TestClassifyResultError(t *testing.T) {
+	tests := []struct {
+		name     string
+		errMsg   string
+		wantSkip string
+		wantPerm bool
+	}{
+		{"file count guard", "cleave analysis of x.zip: Exceeded maximum file count (100000)", "oversized", true},
+		{"extraction size guard", "cleave analysis of x.zip: Exceeded maximum total extraction size", "oversized", true},
+		{"archive depth guard", "cleave analysis of x.zip: Maximum archive depth (8) exceeded", "oversized", true},
+		{"decode depth guard", "cleave analysis of x.gz: Maximum decode depth 8 exceeded", "oversized", true},
+		{"file count limit", "file count limit exceeded", "oversized", true},
+		{"zip bomb", "Archive has suspicious compression ratio (potential zip bomb)", "oversized", true},
+		{"corrupt gzip", "cleave analysis of x.tar.gz: Failed to read tar entry: invalid gzip header", "corrupt", true},
+		{"missing", "Path does not exist", "missing", true},
+		// Load-shedding must stay retryable: the same input succeeds once capacity frees up.
+		{"too many active tasks", "Rejecting request: too many active analysis tasks", "", false},
+		{"server overloaded", "Server overloaded (too many active analyses)", "", false},
+		{"unknown transient", "connection reset by peer", "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			skip, perm := classifyResultError(tc.errMsg)
+			if perm != tc.wantPerm || skip != tc.wantSkip {
+				t.Errorf("classifyResultError(%q) = (%q, %v), want (%q, %v)",
+					tc.errMsg, skip, perm, tc.wantSkip, tc.wantPerm)
+			}
+		})
+	}
+}
+
+// TestAcquireSlot pins the shed-fast contract: a free slot is taken instantly, a
+// saturated pool sheds with errSaturated within the bound (not blocking until
+// the client times out), and a cancelled context returns its own error so the
+// caller can tell "client gave up" from "server saturated".
+func TestAcquireSlot(t *testing.T) {
+	t.Run("free slot acquires immediately", func(t *testing.T) {
+		sem := make(chan struct{}, 1)
+		if err := acquireSlotWithin(context.Background(), sem, time.Second); err != nil {
+			t.Fatalf("acquire on free pool: %v", err)
+		}
+	})
+
+	t.Run("nil pool is unlimited", func(t *testing.T) {
+		if err := acquireSlotWithin(context.Background(), nil, time.Second); err != nil {
+			t.Fatalf("acquire on nil pool: %v", err)
+		}
+	})
+
+	t.Run("saturated pool sheds within the bound", func(t *testing.T) {
+		sem := make(chan struct{}, 1)
+		sem <- struct{}{} // pool full
+		start := time.Now()
+		err := acquireSlotWithin(context.Background(), sem, 20*time.Millisecond)
+		elapsed := time.Since(start)
+		if !errors.Is(err, errSaturated) {
+			t.Fatalf("saturated acquire = %v, want errSaturated", err)
+		}
+		if elapsed > 500*time.Millisecond {
+			t.Fatalf("shed took %v, expected to bail near the 20ms bound", elapsed)
+		}
+	})
+
+	t.Run("freed slot is taken before the bound", func(t *testing.T) {
+		sem := make(chan struct{}, 1)
+		sem <- struct{}{}
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			<-sem // free it
+		}()
+		if err := acquireSlotWithin(context.Background(), sem, time.Second); err != nil {
+			t.Fatalf("acquire after slot freed: %v", err)
+		}
+	})
+
+	t.Run("cancelled context returns ctx error, not errSaturated", func(t *testing.T) {
+		sem := make(chan struct{}, 1)
+		sem <- struct{}{} // pool full
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := acquireSlotWithin(ctx, sem, time.Second)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled acquire = %v, want context.Canceled", err)
+		}
+	})
+}

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -37,6 +38,35 @@ type instruments struct {
 	wAnalyzed, wErrors, wErrorsRecent             metric.Int64Observable
 	localUp, localRestarts                        metric.Int64Observable
 	extractInUse, extractMax                      metric.Int64Observable
+}
+
+// loadShedCount counts load-shedding events: requests turned away with a
+// Retry-After because a slot pool (result ingestion or archive extraction) was
+// saturated. This is the aggregate post-mortem signal for "we dropped work
+// under pressure" — per-event logging would flood under sustained backpressure,
+// but a counter labeled by pool aggregates cleanly and graphs over time.
+var (
+	loadShedOnce  sync.Once
+	loadShedCount metric.Int64Counter
+)
+
+// recordLoadShed increments the load-shed counter for the named slot pool
+// ("result" or "extract"). The counter is created lazily on first use — the
+// meter provider is installed by obs.Init before any request is served — and a
+// creation failure leaves it nil, degrading to a silent no-op. ctx carries the
+// request's trace span so the metric links back to the shed request.
+func recordLoadShed(ctx context.Context, pool string) {
+	loadShedOnce.Do(func() {
+		if c, err := otel.Meter(meterName).Int64Counter(
+			"hopper.load_shed.total",
+			metric.WithDescription("Requests shed with Retry-After because a slot pool was saturated."),
+		); err == nil {
+			loadShedCount = c
+		}
+	})
+	if loadShedCount != nil {
+		loadShedCount.Add(ctx, 1, metric.WithAttributes(attribute.String("pool", pool)))
+	}
 }
 
 // enableMetrics registers the OpenTelemetry instruments that publish every

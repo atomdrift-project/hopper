@@ -468,7 +468,13 @@ func main() {
 		cleanup()
 	}
 	if err != nil {
-		slog.Error(err.Error())
+		// The command name (os.Args[1], validated by run's dispatch) pins which
+		// subcommand failed; the wrapped err carries the operation-level context.
+		cmd := ""
+		if len(os.Args) > 1 {
+			cmd = os.Args[1]
+		}
+		slog.Error("command failed", "command", cmd, "error", err) //nolint:gosec // cmd is os.Args[1]; slog escapes structured values
 		os.Exit(1)
 	}
 }
@@ -1138,6 +1144,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		wd.beginStage("cache.load", "Loading hash cache")
 		c, err := openHashCache(ctx, hashCachePath())
 		if err != nil {
+			slog.Warn("hash cache load failed; continuing without it", "error", err, "path", hashCachePath())
 			wd.failStage("cache.load", err.Error())
 		} else {
 			wd.endStage("cache.load")
@@ -1378,6 +1385,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		wd.beginStage("reports.ingest", "Ingesting reports")
 		stats, err := db.IngestReportsDir(ctx, *reportsDir, "re", "cyclotron")
 		if err != nil {
+			slog.Error("report ingest failed", "error", err, "dir", *reportsDir)
 			wd.failStage("reports.ingest", err.Error())
 			return err
 		}
@@ -3491,7 +3499,17 @@ func cmdTriage(ctx context.Context) error {
 		return fmt.Errorf("clear output dir: %w", err)
 	}
 
-	client := &http.Client{Timeout: 60 * time.Second}
+	// Reuse connections across the serial run for throughput, and bound each
+	// attempt with its own context deadline rather than a single client Timeout:
+	// a blanket timeout would also abort a legitimately large download, while a
+	// per-attempt deadline lets a slow sample finish yet still caps a true hang.
+	client := &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        16,
+			MaxIdleConnsPerHost: 16,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
 	var totalOK, totalFail int
 
 	for _, ds := range datasets {
@@ -3524,28 +3542,9 @@ func cmdTriage(ctx context.Context) error {
 			dest := filepath.Join(destDir, name)
 
 			apiURL := strings.TrimRight(*baseURL, "/") + "/api/file/" + s.SHA256
-			resp, err := client.Get(apiURL) //nolint:noctx // timeout set on client
-			if err != nil {
-				writeStdoutf("  err %-64s  %s\n", s.SHA256, err)
-				totalFail++
-				continue
-			}
-			if resp.StatusCode != http.StatusOK {
-				resp.Body.Close() //nolint:errcheck,gosec // best-effort close before skipping non-200
-				writeStdoutf("  %d  %-64s  %s/%s/%s\n", resp.StatusCode, s.SHA256, ds.name, bucket, name)
-				totalFail++
-				continue
-			}
-			f, err := os.Create(dest)
-			if err != nil {
-				resp.Body.Close() //nolint:errcheck,gosec // best-effort close before bailing on create error
-				return fmt.Errorf("create %s: %w", dest, err)
-			}
-			_, copyErr := io.Copy(f, resp.Body)
-			resp.Body.Close() //nolint:errcheck,gosec // body fully read; close error is irrelevant
-			closeErr := f.Close()
-			if copyErr != nil || closeErr != nil {
-				writeStdoutf("  err %-64s  write failed\n", s.SHA256)
+			detail, ok := fetchSample(ctx, client, apiURL, dest)
+			if !ok {
+				writeStdoutf("  err %-64s  %s\n", s.SHA256, detail)
 				totalFail++
 				continue
 			}
@@ -3556,6 +3555,126 @@ func cmdTriage(ctx context.Context) error {
 
 	writeStdoutf("\nSummary: %d ok, %d failed\n", totalOK, totalFail)
 	return nil
+}
+
+const (
+	// triageMaxAttempts bounds retries per sample: enough to ride out a brief
+	// server saturation window (each shed is a fast 503 + Retry-After) without
+	// turning a permanently-broken sample into a long stall.
+	triageMaxAttempts = 4
+	// triageAttemptTimeout caps a single GET — generous, since a large sample on
+	// a slow link is legitimate; it is the per-attempt context deadline that
+	// replaces a blanket client timeout.
+	triageAttemptTimeout = 5 * time.Minute
+	triageBackoffBase    = 500 * time.Millisecond
+	triageBackoffMax     = 10 * time.Second
+	triageErrBodyMax     = 512 // bytes of a non-200 body to surface in the log line
+)
+
+// fetchSample downloads one sample to dest, serial but resilient: it retries
+// transient network errors and a 503/429 (honoring the server's Retry-After)
+// with bounded backoff, surfaces the server's structured error body on a
+// permanent failure, and reuses the client's connection pool for throughput.
+// Returns "ok" / true on success, else a human-readable reason / false.
+func fetchSample(ctx context.Context, client *http.Client, fileURL, dest string) (string, bool) {
+	backoff := triageBackoffBase
+	var last string
+	for attempt := range triageMaxAttempts {
+		if attempt > 0 {
+			if !sleepCtx(ctx, backoff) {
+				return "canceled", false
+			}
+			backoff = min(backoff*2, triageBackoffMax)
+		}
+
+		reqCtx, cancel := context.WithTimeout(ctx, triageAttemptTimeout)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, fileURL, http.NoBody)
+		if err != nil {
+			cancel()
+			return "bad request: " + err.Error(), false
+		}
+		resp, err := client.Do(req) //nolint:gosec // fileURL derives from the operator-supplied --url; this is a CLI client, not a server
+		if err != nil {
+			cancel()
+			if ctx.Err() != nil {
+				return "canceled", false
+			}
+			last = "request failed: " + classifyNetErr(err)
+			continue // transient: retry with backoff
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			werr := streamToFile(resp.Body, dest)
+			resp.Body.Close() //nolint:errcheck,gosec // body fully read or errored; close is best-effort
+			cancel()
+			if werr != nil {
+				return "write failed: " + werr.Error(), false // local issue; a retry won't help
+			}
+			return "ok", true
+		}
+
+		// Non-200: read a short body so hopper's structured error is visible.
+		body := errBodySnippet(resp.Body)
+		retryAfter, hasRA := retryAfterSeconds(resp.Header.Get("Retry-After"))
+		code := resp.StatusCode
+		resp.Body.Close() //nolint:errcheck,gosec // best-effort close
+		cancel()
+
+		detail := fmt.Sprintf("%d %s", code, body)
+		if code == http.StatusServiceUnavailable || code == http.StatusTooManyRequests {
+			last = detail
+			if hasRA {
+				backoff = retryAfter
+			}
+			continue // server shed load: back off and retry
+		}
+		return detail, false // other 4xx/5xx: permanent, do not retry
+	}
+	return last + " (gave up after retries)", false
+}
+
+// streamToFile writes r to dest, reporting the first of the copy or close error.
+func streamToFile(r io.Reader, dest string) error {
+	f, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(f, r)
+	closeErr := f.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
+// classifyNetErr renders a transport error as a short, human diagnosis so the
+// triage line distinguishes a timeout from a connection reset from anything else.
+func classifyNetErr(err error) string {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return "timeout awaiting response"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return err.Error()
+}
+
+// errBodySnippet reads up to triageErrBodyMax bytes of a non-200 body and folds
+// it to a single trimmed line for the log.
+func errBodySnippet(r io.Reader) string {
+	b, _ := io.ReadAll(io.LimitReader(r, triageErrBodyMax)) //nolint:errcheck // best-effort diagnostic
+	return strings.TrimSpace(strings.ReplaceAll(string(b), "\n", " "))
+}
+
+// retryAfterSeconds parses the integer-seconds form of a Retry-After header.
+// The HTTP-date form is unsupported and reported absent, so the caller falls
+// back to its own backoff.
+func retryAfterSeconds(h string) (time.Duration, bool) {
+	if n, err := strconv.Atoi(strings.TrimSpace(h)); err == nil && n >= 0 {
+		return time.Duration(n) * time.Second, true
+	}
+	return 0, false
 }
 
 func cmdFalsePositives(ctx context.Context) error {

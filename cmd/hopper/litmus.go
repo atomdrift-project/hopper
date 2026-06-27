@@ -313,6 +313,7 @@ func sweepLitmusTmpChildren(root string, maxAge time.Duration) {
 		full := filepath.Join(cleanRoot, entry.Name())
 		info, err := os.Lstat(full)
 		if err != nil {
+			slog.Warn("stat litmus tmp child failed", "path", full, "error", err)
 			continue
 		}
 		if info.Mode()&os.ModeSymlink != 0 || info.ModTime().After(cutoff) {

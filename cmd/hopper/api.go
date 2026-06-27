@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -76,18 +77,61 @@ type apiServer struct {
 	uploadTokenSet  bool
 }
 
-// acquireExtract blocks until an archive-extraction slot is free or ctx is
-// done. A nil extractSem means unlimited (tests construct apiServer directly).
-func (s *apiServer) acquireExtract(ctx context.Context) error {
-	if s.extractSem == nil {
+// errSaturated is returned by the slot-acquire helpers when no slot frees
+// within slotAcquireWait. Handlers map it to a 503 + Retry-After so a saturated
+// server sheds load fast: the client backs off and retries rather than holding
+// a connection open with no response headers until its own timeout fires (the
+// failure mode that reads as "context deadline exceeded while awaiting
+// headers"). Distinct from ctx cancellation, which means the client gave up.
+var errSaturated = errors.New("slot pool saturated")
+
+// slotAcquireWait bounds how long a request queues for a slot before being
+// shed. Long enough to absorb sub-second contention — a slot usually frees the
+// moment a neighbouring extraction finishes — yet short enough to shed well
+// before any client timeout, turning an opaque hang into an actionable 503.
+const slotAcquireWait = 3 * time.Second
+
+// slotWaitLogThreshold is the slot-acquisition wait above which a successful
+// acquire is still logged: the request was served, but the queue was deep
+// enough to be worth surfacing as a contention signal before it tips into
+// shedding. Below it, acquisition is effectively free and not worth a line.
+const slotWaitLogThreshold = 500 * time.Millisecond
+
+// acquireSlot takes a token from sem, returning nil on success, errSaturated if
+// none frees within slotAcquireWait, or ctx.Err() if ctx ends first. A nil sem
+// means unlimited (tests construct apiServer directly).
+func acquireSlot(ctx context.Context, sem chan struct{}) error {
+	return acquireSlotWithin(ctx, sem, slotAcquireWait)
+}
+
+// acquireSlotWithin is acquireSlot with an explicit shed deadline, so a test can
+// exercise the saturation path without waiting the production slotAcquireWait.
+func acquireSlotWithin(ctx context.Context, sem chan struct{}, wait time.Duration) error {
+	if sem == nil {
 		return nil
 	}
-	select {
-	case s.extractSem <- struct{}{}:
+	select { // fast path: a slot is free right now
+	case sem <- struct{}{}:
 		return nil
+	default:
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case sem <- struct{}{}:
+		return nil
+	case <-timer.C:
+		return errSaturated
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// acquireExtract takes an archive-extraction slot, shedding with errSaturated if
+// none frees within slotAcquireWait. Its signature matches the extractCache
+// gate, so the cache's heavy builds shed on the same bound.
+func (s *apiServer) acquireExtract(ctx context.Context) error {
+	return acquireSlot(ctx, s.extractSem)
 }
 
 // releaseExtract returns a slot taken by acquireExtract.
@@ -97,20 +141,12 @@ func (s *apiServer) releaseExtract() {
 	}
 }
 
-// acquireResult blocks until a result-ingestion slot is free or ctx is done.
-// Gating before the body is decoded means a saturated server leaves request
-// bodies unread in the kernel socket buffer instead of materializing them on
-// the heap. A nil resultSem means unlimited (tests construct apiServer directly).
+// acquireResult takes a result-ingestion slot, shedding with errSaturated if
+// none frees within slotAcquireWait. Gating before the body is decoded means a
+// saturated server leaves request bodies unread in the kernel socket buffer
+// instead of materializing them on the heap.
 func (s *apiServer) acquireResult(ctx context.Context) error {
-	if s.resultSem == nil {
-		return nil
-	}
-	select {
-	case s.resultSem <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return acquireSlot(ctx, s.resultSem)
 }
 
 // releaseResult returns a slot taken by acquireResult.
@@ -879,6 +915,8 @@ func interleaveBySizeClass(cands []hopper.ClaimJob) []hopper.ClaimJob {
 func (s *apiServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	worker := r.URL.Query().Get("worker")
 	if !validWorkerName(worker) {
+		slog.WarnContext(r.Context(), "heartbeat rejected: invalid worker name",
+			"worker", worker, "remote", r.RemoteAddr)
 		http.Error(w, `{"error":"invalid worker name"}`, http.StatusBadRequest)
 		return
 	}
@@ -984,6 +1022,8 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	}
 	worker := r.URL.Query().Get("worker")
 	if !validWorkerName(worker) {
+		slog.WarnContext(r.Context(), "next rejected: invalid worker name",
+			"worker", worker, "remote", r.RemoteAddr)
 		http.Error(w, `{"error":"invalid worker name"}`, http.StatusBadRequest)
 		return
 	}
@@ -1237,9 +1277,19 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	// to several times its (up-to-maxResultBodyBytes) size and is held across a
 	// DB store that can stall, so an unbounded fan-in is a heap blow-up. When
 	// saturated, shed load with a Retry-After rather than buffering more bodies.
+	waitStart := time.Now()
 	if err := s.acquireResult(r.Context()); err != nil {
+		if errors.Is(err, errSaturated) {
+			recordLoadShed(r.Context(), "result")
+			slog.WarnContext(r.Context(), "result shed: ingestion slots saturated",
+				"remote", r.RemoteAddr, "wait", slotAcquireWait.String())
+		}
 		writeRetryable(w, retryAfterBusy, `{"error":"busy: result ingestion saturated"}`)
 		return
+	}
+	if waited := time.Since(waitStart); waited > slotWaitLogThreshold {
+		slog.WarnContext(r.Context(), "result ingestion slot wait was slow",
+			"remote", r.RemoteAddr, "waited_ms", waited.Milliseconds())
 	}
 	defer s.releaseResult()
 	// Slow-loris defense: bound how long the (up to 256 MiB) body may take to
@@ -1782,6 +1832,59 @@ func writeJSONError(w http.ResponseWriter, code int, body string) {
 	_, _ = io.WriteString(w, body) //nolint:errcheck // best-effort response
 }
 
+// recoverMiddleware turns a handler panic into a logged 500 rather than an
+// abrupt connection drop. Without it a panic unwinds to net/http's
+// per-connection recover, which writes a raw stack to the server's default
+// logger (not slog) and closes the socket mid-response — surfacing to the
+// client as a truncated read / "connection reset" with no structured
+// server-side record of what failed. Logging the method, path, remote, panic
+// value, and stack here makes any handler panic root-causable, and is the
+// outermost wrapper so it also catches panics raised inside the tracing
+// middleware. ErrAbortHandler is the sanctioned "abandon this response" signal,
+// so it is re-raised for net/http to swallow rather than logged as a fault.
+func recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		//nolint:contextcheck // r.Context() carries the request's trace span; there is no inbound ctx param to thread
+		defer func() {
+			v := recover()
+			if v == nil {
+				return
+			}
+			if v == http.ErrAbortHandler { //nolint:errorlint // recovered value is any; net/http compares this sentinel with ==
+				panic(v)
+			}
+			slog.ErrorContext(r.Context(), "panic in HTTP handler",
+				"method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr,
+				"panic", fmt.Sprintf("%v", v), "stack", string(debug.Stack()))
+			// Best-effort 500: lands only if no response bytes were written yet;
+			// after a partial write the connection still drops, but now with a log.
+			w.WriteHeader(http.StatusInternalServerError)
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// snippet returns a single-line, log-safe excerpt of up to limit bytes of b, with
+// control characters folded to spaces and a trailing ellipsis when truncated.
+// Used to surface a malformed payload in a log line without dumping the whole
+// body or smearing it across multiple lines.
+func snippet(b []byte, limit int) string {
+	truncated := len(b) > limit
+	if truncated {
+		b = b[:limit]
+	}
+	s := strings.Map(func(r rune) rune {
+		if r == utf8.RuneError || unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, strings.ToValidUTF8(string(b), ""))
+	if truncated {
+		s += "…"
+	}
+	return s
+}
+
 // checkUploadAuth validates the bearer token on /api/upload. Both sides
 // are hashed to a fixed 32-byte digest before comparison so:
 //
@@ -1904,10 +2007,13 @@ func (s *apiServer) handleKnown(w http.ResponseWriter, r *http.Request) {
 	// Bound the body: maxKnownBatch 64-hex strings plus JSON framing, generously.
 	var req knownRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxKnownBatch*72+1024)).Decode(&req); err != nil {
+		slog.WarnContext(r.Context(), "known rejected: invalid json", "remote", r.RemoteAddr, "error", err)
 		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid json"}`)
 		return
 	}
 	if len(req.SHA256) > maxKnownBatch {
+		slog.WarnContext(r.Context(), "known rejected: too many digests",
+			"remote", r.RemoteAddr, "count", len(req.SHA256), "max", maxKnownBatch)
 		writeJSONError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(`{"error":"too many digests (max %d)"}`, maxKnownBatch))
 		return
 	}
@@ -1996,7 +2102,7 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Warn("upload: legacy raw body without provenance (deprecated)", "remote", r.RemoteAddr)
+	slog.WarnContext(r.Context(), "upload: legacy raw body without provenance (deprecated)", "remote", r.RemoteAddr)
 	body := http.MaxBytesReader(w, r.Body, maxUploadBytes)
 	s.storeUpload(w, r, body, r.URL.Query().Get("filename"), nil)
 }
@@ -2010,6 +2116,8 @@ func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadEnvelopeBytes)
 	mr, err := r.MultipartReader()
 	if err != nil {
+		slog.WarnContext(r.Context(), "upload rejected: cannot read multipart body",
+			"remote", r.RemoteAddr, "error", err, "content_type", r.Header.Get("Content-Type"))
 		writeJSONError(w, http.StatusBadRequest, `{"error":"malformed multipart body"}`)
 		return
 	}
@@ -2025,15 +2133,21 @@ func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request
 		if err != nil {
 			var maxErr *http.MaxBytesError
 			if errors.As(err, &maxErr) {
+				slog.WarnContext(r.Context(), "upload rejected: envelope exceeds size limit",
+					"remote", r.RemoteAddr, "limit", maxUploadEnvelopeBytes, "part", parts)
 				writeJSONError(w, http.StatusRequestEntityTooLarge, `{"error":"file too large"}`)
 				return
 			}
+			slog.WarnContext(r.Context(), "upload rejected: malformed multipart stream",
+				"remote", r.RemoteAddr, "error", err, "part", parts)
 			writeJSONError(w, http.StatusBadRequest, `{"error":"malformed multipart body"}`)
 			return
 		}
 		parts++
 		if parts > maxParts {
 			_ = part.Close() //nolint:errcheck // best-effort
+			slog.WarnContext(r.Context(), "upload rejected: too many parts",
+				"remote", r.RemoteAddr, "max", maxParts)
 			writeJSONError(w, http.StatusBadRequest, `{"error":"too many parts"}`)
 			return
 		}
@@ -2043,11 +2157,21 @@ func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request
 			buf, rerr := io.ReadAll(io.LimitReader(part, uploadProvenanceMaxBytes))
 			_ = part.Close() //nolint:errcheck // best-effort
 			if rerr != nil {
+				slog.WarnContext(r.Context(), "upload rejected: provenance read failed",
+					"remote", r.RemoteAddr, "error", rerr)
 				writeJSONError(w, http.StatusBadRequest, `{"error":"provenance read failed"}`)
 				return
 			}
 			var sc hopper.Sidecar
 			if err := json.Unmarshal(buf, &sc); err != nil {
+				// The body is unparseable, so there are no fields to key on;
+				// log the parse error and a bounded snippet of the raw bytes so
+				// the producer's malformed payload can be reconstructed.
+				slog.WarnContext(r.Context(), "upload rejected: invalid provenance json",
+					"remote", r.RemoteAddr,
+					"error", err,
+					"bytes", len(buf),
+					"snippet", snippet(buf, 512))
 				writeJSONError(w, http.StatusBadRequest, `{"error":"invalid provenance json"}`)
 				return
 			}
@@ -2057,12 +2181,20 @@ func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request
 			// provenance and content cannot disagree.
 			sc.Finalize()
 			if err := sc.Validate(); err != nil {
+				slog.WarnContext(r.Context(), "upload rejected: provenance failed validation",
+					"remote", r.RemoteAddr,
+					"error", err,
+					"sha256", sc.Artifact.SHA256,
+					"collector", sc.Fetch.Collector,
+					"purl", sc.Package.PURL)
 				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf(`{"error":%q}`, "invalid provenance: "+err.Error()))
 				return
 			}
 			prov = &sc
 		case "file":
 			if prov == nil {
+				slog.WarnContext(r.Context(), "upload rejected: file part precedes provenance",
+					"remote", r.RemoteAddr)
 				writeJSONError(w, http.StatusBadRequest, `{"error":"provenance part must precede file part"}`)
 				return
 			}
@@ -2081,6 +2213,8 @@ func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request
 		s.storeProvenanceOnly(w, r, prov)
 		return
 	}
+	slog.WarnContext(r.Context(), "upload rejected: no file or provenance part",
+		"remote", r.RemoteAddr, "parts", parts)
 	writeJSONError(w, http.StatusBadRequest, `{"error":"missing file part"}`)
 }
 
@@ -2101,12 +2235,11 @@ func (s *apiServer) storeProvenanceOnly(w http.ResponseWriter, r *http.Request, 
 	sample := uploadSample(sha, prov.Artifact.Filename, "", prov.Artifact.SizeBytes, prov)
 	backfilled, err := s.db.BackfillProvenance(ctx, sample)
 	if err != nil {
-		slog.Error("upload: backfill provenance", "sha256", sha, "error", err)
+		slog.ErrorContext(r.Context(), "upload: backfill provenance", "sha256", sha, "error", err)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
 	}
-	//nolint:gosec // sha256 validated by Sidecar.Validate
-	slog.Info("provenance backfill", "sha256", sha, "applied", backfilled)
+	slog.InfoContext(r.Context(), "provenance backfill", "sha256", sha, "applied", backfilled)
 	w.Header().Set("Content-Type", "application/json")
 	//nolint:errcheck,errchkjson // best-effort response
 	_ = json.NewEncoder(w).Encode(map[string]any{"sha256": sha, "provenance_backfilled": backfilled})
@@ -2126,18 +2259,18 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 	// rename is atomic and cross-device-safe.
 	tmpDir, err := s.resolveDataPath(filepath.Join(uploadDir, ".tmp"))
 	if err != nil {
-		slog.Error("upload: resolve tmp dir", "error", err)
+		slog.ErrorContext(r.Context(), "upload: resolve tmp dir", "error", err)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
 	}
 	if err := mkdirSharedAll(tmpDir); err != nil {
-		slog.Error("upload: mkdir tmp", "error", err)
+		slog.ErrorContext(r.Context(), "upload: mkdir tmp", "error", err)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
 	}
 	tmpFile, err := os.CreateTemp(tmpDir, "up-*")
 	if err != nil {
-		slog.Error("upload: create temp", "error", err)
+		slog.ErrorContext(r.Context(), "upload: create temp", "error", err)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
 	}
@@ -2157,21 +2290,22 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 		var netErr net.Error
 		if errors.As(copyErr, &netErr) && netErr.Timeout() {
 			//nolint:gosec // structured logging
-			slog.Warn("upload: body read timeout", "bytes", written, "remote", r.RemoteAddr)
+			slog.WarnContext(r.Context(), "upload: body read timeout", "bytes", written, "remote", r.RemoteAddr)
 			writeJSONError(w, http.StatusRequestTimeout, `{"error":"upload timeout"}`)
 			return
 		}
 		//nolint:gosec // structured logging
-		slog.Warn("upload: stream copy failed", "error", copyErr, "bytes", written, "remote", r.RemoteAddr)
+		slog.WarnContext(r.Context(), "upload: stream copy failed", "error", copyErr, "bytes", written, "remote", r.RemoteAddr)
 		writeJSONError(w, http.StatusBadRequest, `{"error":"upload failed"}`)
 		return
 	}
 	if closeErr != nil {
-		slog.Error("upload: temp close", "error", closeErr)
+		slog.ErrorContext(r.Context(), "upload: temp close", "error", closeErr)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
 	}
 	if written == 0 {
+		slog.WarnContext(r.Context(), "upload rejected: empty body", "remote", r.RemoteAddr) //nolint:gosec // structured logging
 		writeJSONError(w, http.StatusBadRequest, `{"error":"empty body"}`)
 		return
 	}
@@ -2182,7 +2316,7 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 	// tampered or mispaired provenance/file pair can't be stored as if matched.
 	if prov != nil && prov.Artifact.SHA256 != sha {
 		//nolint:gosec // structured logging
-		slog.Warn("upload: provenance sha mismatch", "claimed", prov.Artifact.SHA256, "actual", sha, "remote", r.RemoteAddr)
+		slog.WarnContext(r.Context(), "upload: provenance sha mismatch", "claimed", prov.Artifact.SHA256, "actual", sha, "remote", r.RemoteAddr)
 		writeJSONError(w, http.StatusBadRequest, `{"error":"content does not match provenance sha256"}`)
 		return
 	}
@@ -2204,7 +2338,7 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 		return s.db.SampleBySHA256(ctx, sha)
 	})
 	if err != nil && !errors.Is(err, hopper.ErrNotFound) {
-		slog.Warn("upload: existing sample lookup", "sha256", sha, "error", err)
+		slog.WarnContext(r.Context(), "upload: existing sample lookup", "sha256", sha, "error", err)
 	}
 	alreadyAnalyzed := existing != nil && len(existing.CleaveResult) > 0
 
@@ -2222,18 +2356,18 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 	relPath := filepath.Join(relDir, filename)
 	absDir, err := s.resolveDataPath(relDir)
 	if err != nil {
-		slog.Error("upload: shard path escapes data root", "rel", relDir, "error", err)
+		slog.ErrorContext(r.Context(), "upload: shard path escapes data root", "rel", relDir, "error", err)
 		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid filename"}`)
 		return
 	}
 	absPath, err := s.resolveDataPath(relPath)
 	if err != nil {
-		slog.Error("upload: target path escapes data root", "rel", relPath, "error", err)
+		slog.ErrorContext(r.Context(), "upload: target path escapes data root", "rel", relPath, "error", err)
 		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid filename"}`)
 		return
 	}
 	if err := mkdirSharedAll(absDir); err != nil {
-		slog.Error("upload: mkdir shard", "error", err, "dir", absDir)
+		slog.ErrorContext(r.Context(), "upload: mkdir shard", "error", err, "dir", absDir)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
 	}
@@ -2399,6 +2533,19 @@ func classifyResultError(errMsg string) (string, bool) {
 		strings.Contains(errMsg, "Failed to parse package.json"),
 		strings.Contains(errMsg, "multi-disk"):
 		return "unsupported", true
+	case strings.Contains(errMsg, "Exceeded maximum"),
+		strings.Contains(errMsg, "file count limit exceeded"),
+		strings.Contains(errMsg, "Maximum archive depth"),
+		strings.Contains(errMsg, "Maximum decode depth"),
+		strings.Contains(errMsg, "potential zip bomb"):
+		// Deterministic analysis-guard trips (file count, archive/decode depth,
+		// total extraction size, decompression bomb). The same input always
+		// blows the same guard, so re-queuing only burns worker capacity until
+		// the poison reaper gives up — mark it permanently skipped now. These
+		// mirror the 4xx client errors cleave's own server returns. Note the
+		// transient guards ("too many active analysis tasks", "Server
+		// overloaded") are deliberately excluded — those must stay retryable.
+		return "oversized", true
 	}
 	return "", false
 }
@@ -2442,6 +2589,8 @@ func (s *apiServer) handleProvenance(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, hopper.ErrNotFound) {
 			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		} else {
+			slog.ErrorContext(r.Context(), "provenance: lookup failed",
+				"sha256", sha, "error", err, "remote", r.RemoteAddr)
 			http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
 		}
 		return
@@ -2483,6 +2632,8 @@ func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, hopper.ErrNotFound) {
 			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		} else {
+			slog.ErrorContext(r.Context(), "file: sample lookup failed",
+				"sha256", sha, "error", err, "remote", r.RemoteAddr)
 			http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
 		}
 		return
@@ -2619,6 +2770,8 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 			http.Error(w, `{"error":"parent not found"}`, http.StatusNotFound)
 			return
 		}
+		slog.ErrorContext(ctx, "archive-member: parent lookup failed",
+			"sha256", sha, "parent_sha", child.Parent, "error", err, "remote", r.RemoteAddr)
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
 		return
 	}
@@ -2695,7 +2848,16 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 			return
 		case errors.Is(cerr, errCacheDisabled), errors.Is(cerr, errCacheTooLarge):
 			// Fall through to direct streaming.
+		case errors.Is(cerr, errSaturated):
+			// The cache's heavy-build gate is the extraction-slot pool; shed fast.
+			recordLoadShed(ctx, "extract")
+			slog.WarnContext(ctx, "extract shed: slots saturated (cache build)",
+				"sha256", sha, "parent_sha", parent.SHA256, "remote", r.RemoteAddr)
+			writeRetryable(w, retryAfterBusy, `{"error":"busy: extraction slots exhausted"}`)
+			return
 		case errors.Is(cerr, context.Canceled), errors.Is(cerr, context.DeadlineExceeded):
+			// Client gave up or the request deadline fired mid-build; nothing
+			// useful to send, but answer retryable in case the socket is alive.
 			writeRetryable(w, retryAfterBusy, `{"error":"busy: extraction slots exhausted"}`)
 			return
 		default:
@@ -2710,9 +2872,19 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 	// cache. Bound concurrency with an extraction slot — acquired here (not
 	// earlier) so the cheap parent lookup and path checks above don't hold one
 	// while blocking.
+	waitStart := time.Now()
 	if err := s.acquireExtract(ctx); err != nil {
+		if errors.Is(err, errSaturated) {
+			recordLoadShed(ctx, "extract")
+			slog.WarnContext(ctx, "extract shed: slots saturated",
+				"sha256", sha, "parent_sha", parent.SHA256, "remote", r.RemoteAddr)
+		}
 		writeRetryable(w, retryAfterBusy, `{"error":"busy: extraction slots exhausted"}`)
 		return
+	}
+	if waited := time.Since(waitStart); waited > slotWaitLogThreshold {
+		slog.WarnContext(ctx, "extraction slot wait was slow",
+			"sha256", sha, "parent_sha", parent.SHA256, "waited_ms", waited.Milliseconds())
 	}
 	defer s.releaseExtract()
 

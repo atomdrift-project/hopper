@@ -256,7 +256,7 @@ func startWebDashboard(ctx context.Context, addr string, wd *webDashboard, mux *
 	if err != nil {
 		return fmt.Errorf("web dashboard listen %s: %w", addr, err)
 	}
-	srv := &http.Server{Handler: obs.Middleware(mux), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	srv := &http.Server{Handler: recoverMiddleware(obs.Middleware(mux)), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
 		<-ctx.Done()
 		// Graceful shutdown — let in-flight /data/* downloads finish so workers
@@ -272,7 +272,7 @@ func startWebDashboard(ctx context.Context, addr string, wd *webDashboard, mux *
 	}()
 	go func() {
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			fmt.Printf("web dashboard error: %v\n", err) //nolint:forbidigo // startup diag
+			slog.Error("web dashboard server stopped", "error", err, "addr", srv.Addr)
 		}
 	}()
 	return nil
@@ -1071,6 +1071,7 @@ func (wd *webDashboard) workflowHealth(ctx context.Context) (hopper.WorkflowHeal
 		return wd.db.WorkflowHealth(qctx)
 	})
 	if err != nil {
+		slog.Warn("dashboard: workflow health query failed", "error", err)
 		return hopper.WorkflowHealth{}, false
 	}
 	return h, true
