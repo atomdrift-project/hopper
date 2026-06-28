@@ -2754,6 +2754,25 @@ func (db *DB) TriageNew(ctx context.Context, limit int, f TriageFilter) ([]*Samp
 	return db.triageNewSQLite(ctx, limit, f)
 }
 
+// PromotionCandidates returns up to limit top-level, unknown-labeled samples
+// whose stored path is under pathPrefix and whose on-disk mtime is older than
+// olderThan, excluding training-skipped rows. Results are ordered by sha256 and
+// restricted to sha256 > afterSHA, so a caller pages the indexed sha256 keyspace
+// with keyset pagination (an index range-scan, not an ORDER BY random() full
+// sort) and can anchor a sweep at a random sha for pseudo-random, unbiased
+// coverage. Pass afterSHA="" to start at the keyspace floor.
+//
+// It is the remote replacement for promoter's local filesystem walk: pathPrefix
+// is the source tree (e.g. "unknown/foraged/", with the trailing slash so a
+// sibling like "unknown/foraged-review/" is excluded). Stored paths are
+// slash-relative to the data root.
+func (db *DB) PromotionCandidates(ctx context.Context, pathPrefix string, olderThan time.Time, afterSHA string, limit int) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.promotionCandidatesPG(ctx, pathPrefix, olderThan, afterSHA, limit)
+	}
+	return db.promotionCandidatesSQLite(ctx, pathPrefix, olderThan, afterSHA, limit)
+}
+
 // ConflictReview returns samples flagged with a good+bad pool conflict
 // (label='bad', skip='conflict'): the same content was asserted both benign
 // and malicious in different pool directories. These are resolved to bad

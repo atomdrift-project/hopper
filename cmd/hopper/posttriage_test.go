@@ -138,6 +138,94 @@ func TestHandleTriageUnknownSHA(t *testing.T) {
 	}
 }
 
+// TestHandleTriageRulings covers promoter's remote flow: each ruling preserves
+// the source subpath into its pool tree, good/bad relabel while review does not,
+// and re-running is idempotent.
+func TestHandleTriageRulings(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db := mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	api := &apiServer{db: db, dataRoot: root, tracker: newWorkerTracker()}
+
+	// seed writes an unknown candidate under unknown/foraged/<sub> and returns it.
+	seed := func(sha, sub string) string {
+		t.Helper()
+		rel := filepath.Join("unknown", "foraged", sub)
+		abs := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(abs), 0o750); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(abs, []byte("data"), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if err := db.InsertSample(ctx, &hopper.Sample{
+			SHA256: sha, Source: "test", Path: rel, Label: "unknown", LabelSource: "forager",
+		}); err != nil {
+			t.Fatalf("InsertSample: %v", err)
+		}
+		return rel
+	}
+
+	cases := []struct {
+		ruling   string
+		sha      string
+		wantPath string
+		wantLbl  string
+		wantSrc  string
+	}{
+		{"good", repeat("1"), filepath.Join("good", "foraged-promote", "npm", "a.tgz"), "good", "promoter"},
+		{"bad", repeat("2"), filepath.Join("bad", "foraged-quarantine", "npm", "b.tgz"), "bad", "promoter"},
+		{"review", repeat("3"), filepath.Join("unknown", "foraged-review", "npm", "c.tgz"), "unknown", "forager"},
+	}
+	for _, tc := range cases {
+		sub := filepath.Join("npm", map[string]string{"good": "a.tgz", "bad": "b.tgz", "review": "c.tgz"}[tc.ruling])
+		oldRel := seed(tc.sha, sub)
+		resp := callTriage(t, api, triageRequest{Verdicts: []triageVerdict{{SHA256: tc.sha, Ruling: tc.ruling}}})
+		if resp.Moved != 1 || resp.Failed != 0 {
+			t.Fatalf("%s: moved=%d failed=%d results=%+v", tc.ruling, resp.Moved, resp.Failed, resp.Results)
+		}
+		if got := resp.Results[0].NewPath; got != tc.wantPath {
+			t.Fatalf("%s: new path = %q, want %q", tc.ruling, got, tc.wantPath)
+		}
+		if _, err := os.Stat(filepath.Join(root, tc.wantPath)); err != nil {
+			t.Fatalf("%s: moved file missing: %v", tc.ruling, err)
+		}
+		if _, err := os.Stat(filepath.Join(root, oldRel)); !os.IsNotExist(err) {
+			t.Fatalf("%s: source should be gone, err=%v", tc.ruling, err)
+		}
+		samp, err := db.SampleBySHA256(ctx, tc.sha)
+		if err != nil {
+			t.Fatalf("%s: SampleBySHA256: %v", tc.ruling, err)
+		}
+		if samp.Label != tc.wantLbl || samp.LabelSource != tc.wantSrc || samp.Path != tc.wantPath {
+			t.Fatalf("%s: row label=%q source=%q path=%q", tc.ruling, samp.Label, samp.LabelSource, samp.Path)
+		}
+		// Idempotent re-run.
+		again := callTriage(t, api, triageRequest{Verdicts: []triageVerdict{{SHA256: tc.sha, Ruling: tc.ruling}}})
+		if again.Noop != 1 || again.Moved != 0 {
+			t.Fatalf("%s: re-run noop=%d moved=%d", tc.ruling, again.Noop, again.Moved)
+		}
+	}
+
+	// A request with neither verdict nor ruling is an error.
+	bad := callTriage(t, api, triageRequest{Verdicts: []triageVerdict{{SHA256: repeat("4")}}})
+	if bad.Failed != 1 {
+		t.Fatalf("empty item: failed=%d results=%+v", bad.Failed, bad.Results)
+	}
+}
+
+func repeat(b string) string {
+	out := ""
+	for len(out) < 64 {
+		out += b
+	}
+	return out[:64]
+}
+
 func callTriage(t *testing.T, api *apiServer, req triageRequest) triageResponse {
 	t.Helper()
 	body, err := json.Marshal(req)

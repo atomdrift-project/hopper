@@ -2098,6 +2098,25 @@ func (db *DB) samplesByLabelSQLite(ctx context.Context, label string, limit int)
 	return scanLiteSamples(rows)
 }
 
+func (db *DB) promotionCandidatesSQLite(ctx context.Context, pathPrefix string, olderThan time.Time, afterSHA string, limit int) ([]*Sample, error) {
+	// Timestamps are stored as RFC3339Nano text and compare lexicographically
+	// (matching staleSamplesSQLite); mtime is written in the same format. GLOB is
+	// case-sensitive and uses the path index for a prefix match.
+	threshold := olderThan.UTC().Format(time.RFC3339Nano)
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleCols+` FROM samples
+		 WHERE label = 'unknown' AND parent = '' AND skip = ''
+		   AND path GLOB ? || '*'
+		   AND mtime IS NOT NULL AND mtime < ?
+		   AND sha256 > ?
+		 ORDER BY sha256 LIMIT ?`,
+		pathPrefix, threshold, afterSHA, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: promotion candidates: %w", err)
+	}
+	return scanLiteSamples(rows)
+}
+
 func (db *DB) countByLabelSQLite(ctx context.Context) (map[string]int, error) {
 	rows, err := db.lite.QueryContext(ctx, `SELECT label, count(*) FROM samples GROUP BY label`)
 	if err != nil {

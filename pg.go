@@ -2671,6 +2671,21 @@ func (db *DB) samplesByLabelPG(ctx context.Context, label string, limit int) ([]
 	return scanPGSamples(rows)
 }
 
+func (db *DB) promotionCandidatesPG(ctx context.Context, pathPrefix string, olderThan time.Time, afterSHA string, limit int) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE label = 'unknown' AND parent = '' AND skip = ''
+		   AND starts_with(path, $1)
+		   AND mtime IS NOT NULL AND mtime < $2
+		   AND sha256 > $3
+		 ORDER BY sha256 LIMIT $4`,
+		pathPrefix, olderThan.UTC(), afterSHA, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: promotion candidates: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
 func (db *DB) countByLabelPG(ctx context.Context) (map[string]int, error) {
 	rows, err := db.pool.Query(ctx, `SELECT label, count(*) FROM samples GROUP BY label`)
 	if err != nil {

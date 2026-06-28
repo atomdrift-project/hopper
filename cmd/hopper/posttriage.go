@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"codeberg.org/atomdrift/hopper"
@@ -48,11 +49,59 @@ const (
 	maxTriageVerdicts = 10_000
 )
 
-// triageVerdict is one corrected classification: the sample identified by
-// SHA256 is actually Verdict ("good" or "bad").
+// triageVerdict is one corrected classification for the sample identified by
+// SHA256. Exactly one of Verdict or Ruling is set:
+//
+//   - Verdict ("good"|"bad") is the operator post-triage flow: the file moves
+//     into a <verdict>/mislabeled-<old-label>/ bucket (basename only) and is
+//     relabeled.
+//   - Ruling ("good"|"bad"|"review") is promoter's remote flow: the file moves
+//     into the ruling's pool tree with its source subpath preserved, and is
+//     relabeled (good/bad) or left labeled (review). See rulingPlan.
 type triageVerdict struct {
 	SHA256  string `json:"sha256"`
-	Verdict string `json:"verdict"`
+	Verdict string `json:"verdict,omitempty"`
+	Ruling  string `json:"ruling,omitempty"`
+}
+
+// Promotion pool layout. hopper owns where a ruled sample lands; promoter sends
+// only the abstract ruling. The source tree is forager's unknown/foraged; the
+// subpath beneath it is preserved into the destination tree, so
+// unknown/foraged/npm/foo.tgz promotes to good/foraged-promote/npm/foo.tgz.
+const (
+	promoteSrcRoot    = "unknown/foraged/"
+	promoteGoodTree   = "good/foraged-promote"
+	promoteBadTree    = "bad/foraged-quarantine"
+	promoteReviewTree = "unknown/foraged-review"
+)
+
+// placement is a triage item's resolved destination: the new relative path and
+// the label + label_source to record.
+type placement struct {
+	newRel string
+	label  string
+	source string
+}
+
+// rulingPlan resolves a promoter ruling to its placement: the destination path
+// (subpath preserved beneath the ruling's tree) plus the label change to apply.
+// For "review" the sample keeps its existing label and label_source (the review
+// queue does not relabel — it only relocates out of the discovery prefix). ok is
+// false for an unrecognized ruling.
+func rulingPlan(samp *hopper.Sample, oldRel, ruling string) (placement, bool) {
+	sub := strings.TrimPrefix(oldRel, promoteSrcRoot)
+	if sub == oldRel { // not under the source root: preserve only the basename
+		sub = filepath.Base(oldRel)
+	}
+	switch ruling {
+	case "good":
+		return placement{filepath.Join(promoteGoodTree, sub), "good", "promoter"}, true
+	case "bad":
+		return placement{filepath.Join(promoteBadTree, sub), "bad", "promoter"}, true
+	case "review":
+		return placement{filepath.Join(promoteReviewTree, sub), samp.Label, samp.LabelSource}, true
+	}
+	return placement{}, false
 }
 
 // triageRequest is the JSON body for POST /api/triage.
@@ -133,9 +182,11 @@ func (s *apiServer) handleTriage(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp) //nolint:errcheck,errchkjson // best-effort response
 }
 
-// relocateTriaged moves one sample into its corrected pool bucket and flips
-// its DB label. It is idempotent: a sample already carrying the verdict label
-// returns "noop" so re-running a batch is safe.
+// relocateTriaged moves one sample into its corrected location and updates its
+// DB label+path atomically. It is idempotent: a sample already at its
+// destination returns "noop" so re-running a batch is safe. It serves both the
+// operator verdict flow (mislabeled bucket) and promoter's ruling flow (pool
+// tree with preserved subpath); triagePlan resolves which.
 func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun bool) triageResult {
 	res := triageResult{SHA256: v.SHA256}
 	sha := strings.ToLower(strings.TrimSpace(v.SHA256))
@@ -144,10 +195,8 @@ func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun
 		return res
 	}
 	res.SHA256 = sha
-	switch v.Verdict {
-	case "good", "bad":
-	default:
-		res.Status, res.Error = "error", "verdict must be \"good\" or \"bad\""
+	if (v.Verdict == "") == (v.Ruling == "") {
+		res.Status, res.Error = "error", `exactly one of "verdict" or "ruling" must be set`
 		return res
 	}
 
@@ -164,45 +213,38 @@ func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun
 		res.Status, res.Error = "not_found", "sample has no on-disk path"
 		return res
 	}
-	// Already corrected — nothing to move.
-	if samp.Label == v.Verdict {
-		res.Status, res.OldPath = "noop", samp.Path
-		return res
-	}
 
 	oldRel := relativeSamplePath(s.dataRoot, samp.Path)
 	oldAbs := sampleDiskPath(s.dataRoot, oldRel)
 	res.OldPath = oldRel
 
-	// Bucket records the wrong label the file is being rescued from, so a
-	// good→bad correction lands in bad/mislabeled-good and bad→good in
-	// good/mislabeled-bad. Fall back to "unknown" for the odd legacy row.
-	wrong := samp.Label
-	if wrong == "" {
-		wrong = "unknown"
+	// Idempotency: a sample already at its destination is a no-op, so retries
+	// and re-runs are safe. good/bad are recognized by their terminal label;
+	// review keeps the unknown label, so it is recognized by already living
+	// under the review tree. Keying on label/tree (not recomputed path equality)
+	// stays correct after the move, when the subpath no longer starts at the
+	// source root.
+	switch {
+	case v.Verdict != "" && samp.Label == v.Verdict,
+		v.Ruling == "good" && samp.Label == "good",
+		v.Ruling == "bad" && samp.Label == "bad",
+		v.Ruling == "review" && strings.HasPrefix(oldRel, promoteReviewTree+"/"):
+		res.Status = "noop"
+		return res
 	}
-	newRel := filepath.Join(v.Verdict, "mislabeled-"+wrong, filepath.Base(oldRel))
-	newAbs, err := s.resolveDataPath(newRel)
+
+	plan, err := s.triagePlan(samp, oldRel, v)
 	if err != nil {
 		res.Status, res.Error = "error", err.Error()
 		return res
 	}
-	// Disambiguate a basename collision in the shared bucket by prefixing the
-	// sha; keeps the bucket flat and human-browsable while staying unique.
-	if collides, err := pathExists(newAbs); err != nil {
+	res.NewPath = plan.newRel
+
+	newAbs, err := s.resolveDataPath(plan.newRel)
+	if err != nil {
 		res.Status, res.Error = "error", err.Error()
 		return res
-	} else if collides {
-		base := filepath.Base(oldRel)
-		ext := filepath.Ext(base)
-		stem := strings.TrimSuffix(base, ext)
-		newRel = filepath.Join(v.Verdict, "mislabeled-"+wrong, stem+"."+sha[:12]+ext)
-		if newAbs, err = s.resolveDataPath(newRel); err != nil {
-			res.Status, res.Error = "error", err.Error()
-			return res
-		}
 	}
-	res.NewPath = newRel
 
 	if dryRun {
 		res.Status = "plan"
@@ -213,15 +255,15 @@ func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun
 		res.Status, res.Error = "error", "mkdir: "+err.Error()
 		return res
 	}
-	if err := os.Rename(oldAbs, newAbs); err != nil {
-		res.Status, res.Error = "error", "rename: "+err.Error()
+	if err := moveSample(oldAbs, newAbs); err != nil {
+		res.Status, res.Error = "error", "move: "+err.Error()
 		return res
 	}
-	// The DB verdict is now authoritative; drop any stale litmus markers left
-	// beside the old location so a future walk can't resurrect the wrong label.
+	// The DB is now authoritative; drop any stale litmus markers left beside the
+	// old location so a future walk can't resurrect the wrong label.
 	removeMarkers(oldAbs)
 
-	if err := s.db.RelocateSample(ctx, sha, oldRel, newRel, v.Verdict, "triage"); err != nil {
+	if err := s.db.RelocateSample(ctx, sha, oldRel, plan.newRel, plan.label, plan.source); err != nil {
 		// The bytes already moved; report the error but leave them in place —
 		// the next load walk will reconcile the DB from the new pool location.
 		res.Status, res.Error = "error", "db relocate: "+err.Error()
@@ -231,10 +273,100 @@ func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun
 	return res
 }
 
+// triagePlan resolves a triage item to its destination path, target label, and
+// label_source. A Ruling uses promoter's pool-tree placement (subpath
+// preserved); a Verdict uses the operator mislabeled-bucket placement.
+func (s *apiServer) triagePlan(samp *hopper.Sample, oldRel string, v triageVerdict) (placement, error) {
+	if v.Ruling != "" {
+		plan, ok := rulingPlan(samp, oldRel, v.Ruling)
+		if !ok {
+			return placement{}, errors.New(`ruling must be "good", "bad", or "review"`)
+		}
+		return plan, nil
+	}
+
+	switch v.Verdict {
+	case "good", "bad":
+	default:
+		return placement{}, errors.New(`verdict must be "good" or "bad"`)
+	}
+	// Bucket records the wrong label the file is being rescued from, so a
+	// good→bad correction lands in bad/mislabeled-good and bad→good in
+	// good/mislabeled-bad. Fall back to "unknown" for the odd legacy row.
+	wrong := samp.Label
+	if wrong == "" {
+		wrong = "unknown"
+	}
+	newRel := filepath.Join(v.Verdict, "mislabeled-"+wrong, filepath.Base(oldRel))
+	newAbs, err := s.resolveDataPath(newRel)
+	if err != nil {
+		return placement{}, err
+	}
+	// Disambiguate a basename collision in the flat bucket by prefixing the sha;
+	// keeps the bucket human-browsable while staying unique.
+	if collides, err := pathExists(newAbs); err != nil {
+		return placement{}, err
+	} else if collides {
+		base := filepath.Base(oldRel)
+		ext := filepath.Ext(base)
+		stem := strings.TrimSuffix(base, ext)
+		newRel = filepath.Join(v.Verdict, "mislabeled-"+wrong, stem+"."+samp.SHA256[:12]+ext)
+	}
+	return placement{newRel, v.Verdict, "triage"}, nil
+}
+
+// moveSample relocates a sample file between pool trees. It tries an atomic
+// rename and falls back to copy-then-remove across filesystem boundaries: the
+// good/, bad/, and unknown/ pools live on separate filesystems, so a cross-pool
+// move yields EXDEV. The destination's parent directory must already exist.
+//
+//nolint:gosec // G703: oldAbs/newAbs are sample paths the caller resolved within dataRoot
+func moveSample(oldAbs, newAbs string) error {
+	if err := os.Rename(oldAbs, newAbs); err == nil {
+		return nil
+	} else if !errors.Is(err, syscall.EXDEV) {
+		return fmt.Errorf("rename: %w", err)
+	}
+	if err := copySample(oldAbs, newAbs); err != nil {
+		return err
+	}
+	if err := os.Remove(oldAbs); err != nil {
+		return fmt.Errorf("remove source after copy: %w", err)
+	}
+	return nil
+}
+
+// copySample streams src to dst, truncating any existing destination and
+// preserving src's permission bits.
+func copySample(src, dst string) error {
+	in, err := os.Open(src) //nolint:gosec // src is a sample path resolved within dataRoot
+	if err != nil {
+		return fmt.Errorf("open source: %w", err)
+	}
+	defer in.Close() //nolint:errcheck // read-only handle
+	info, err := in.Stat()
+	if err != nil {
+		return fmt.Errorf("stat source: %w", err)
+	}
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode()) //nolint:gosec // dst resolved within dataRoot
+	if err != nil {
+		return fmt.Errorf("create destination: %w", err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()    //nolint:errcheck // already failing
+		_ = os.Remove(dst) //nolint:errcheck,gosec // best-effort cleanup; G703: dst resolved within dataRoot
+		return fmt.Errorf("copy: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("close destination: %w", err)
+	}
+	return nil
+}
+
 // pathExists reports whether path exists, distinguishing a real stat error
 // (e.g. permission denied) from a clean "not there".
 func pathExists(path string) (bool, error) {
-	_, err := os.Stat(path)
+	_, err := os.Stat(path) //nolint:gosec // G703: path is a sample destination resolved within dataRoot
 	if err == nil {
 		return true, nil
 	}
@@ -252,18 +384,17 @@ func removeMarkers(samplePath string) {
 	base := filepath.Base(samplePath)
 	for _, suffix := range []string{markerBenign, markerBad} {
 		p := filepath.Join(dir, markerPrefix+base+suffix)
+		//nolint:gosec // G703: p is a marker beside a sample path within dataRoot
 		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
-			slog.Warn("remove stale marker failed", "path", p, "error", err)
+			slog.Warn("remove stale marker failed", "path", p, "error", err) //nolint:gosec // G706: p is server-derived
 		}
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Client: `hopper post-triage`
-// ---------------------------------------------------------------------------
-
+// Client: `hopper post-triage`.
 func cmdPostTriage(ctx context.Context) error {
 	f := flag.NewFlagSet("post-triage", flag.ExitOnError)
+	//nolint:revive // unsecure-url-scheme: the master API is a plain-http internal cluster endpoint
 	baseURL := f.String("url", "http://hopper-api:8081/", "hopper master API base URL")
 	var misplacedGood, misplacedBad stringListFlag
 	f.Var(&misplacedGood, "misplaced-good",
@@ -438,7 +569,7 @@ func collectVerdicts(dir, verdict string) ([]triageVerdict, error) {
 }
 
 func hashFileSHA256(path string) (string, error) {
-	f, err := os.Open(path) //nolint:gosec // path comes from a local triage dir the operator chose
+	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
@@ -467,7 +598,7 @@ func postTriage(ctx context.Context, baseURL, token string, req triageRequest) (
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 	}
 	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Do(httpReq)
+	resp, err := client.Do(httpReq) //nolint:gosec // G704: baseURL is the operator-provided trusted master endpoint
 	if err != nil {
 		return nil, err
 	}

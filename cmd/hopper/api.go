@@ -1829,7 +1829,10 @@ func writeJSONError(w http.ResponseWriter, code int, body string) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(code)
-	_, _ = io.WriteString(w, body) //nolint:errcheck // best-effort response
+	// gosec G705: not an XSS vector — Content-Type is application/json with
+	// X-Content-Type-Options: nosniff (set above), so the body is never
+	// interpreted as HTML; the only interpolated values are JSON-escaped.
+	_, _ = io.WriteString(w, body) //nolint:errcheck,gosec // best-effort response; see above
 }
 
 // recoverMiddleware turns a handler panic into a logged 500 rather than an
