@@ -365,6 +365,23 @@ doas bastille cmd "$RUN" su -l postgres -c '
     ( crontab -l 2>/dev/null; echo "0 * * * * /usr/local/sbin/hopper-backup.sh" ) | crontab -
 '
 
+# --- Grafana Cloud OTLP token ---
+#
+# obs reads the base64 OTLP credential from $HOME/.tok/graf (HOME=/home/hopper,
+# set in the rc.d command below) and pushes telemetry to Grafana Cloud. Stage
+# the deploying host's token into the jail: 0700 dir, 0600 file, owned by hopper.
+# Idempotent — re-running re-copies the same bytes and re-asserts ownership.
+GRAF_SRC="${GRAF_TOKEN:-$HOME/.tok/graf}"
+if [ -r "$GRAF_SRC" ]; then
+    log "Installing Grafana Cloud token into run jail"
+    doas bastille cmd "$RUN" install -d -o hopper -g hopper -m 0700 /home/hopper/.tok
+    doas bastille cp "$RUN" "$GRAF_SRC" /home/hopper/.tok/graf
+    doas bastille cmd "$RUN" chown hopper:hopper /home/hopper/.tok/graf
+    doas bastille cmd "$RUN" chmod 600 /home/hopper/.tok/graf
+else
+    log "No $GRAF_SRC on deploy host — OTLP push to Grafana Cloud disabled until provided"
+fi
+
 # --- Hopper rc.d service ---
 
 log "Checking rc.d service for hopper"
@@ -392,7 +409,10 @@ load_rc_config $name
 pidfile="/var/run/${name}.pid"
 hopper_log="/var/log/${name}.log"
 command="/usr/sbin/daemon"
-command_args="-c -f -P ${pidfile} -S -R 5 -o ${hopper_log} -u hopper /usr/bin/env DATABASE_URL=${hopper_db} OTEL_EXPORTER_OTLP_ENDPOINT=http://otel:9090/api/v1/otlp OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://otel:3100/otlp/v1/logs /usr/local/bin/hopper serve --port 5433"
+# HOME=/home/hopper so obs finds the Grafana Cloud token at $HOME/.tok/graf and
+# pushes telemetry there (daemon -u does not set HOME on its own). No OTLP
+# endpoint is set: obs falls back to the Grafana Cloud gateway via that token.
+command_args="-c -f -P ${pidfile} -S -R 5 -o ${hopper_log} -u hopper /usr/bin/env HOME=/home/hopper DATABASE_URL=${hopper_db} /usr/local/bin/hopper serve --port 5433"
 
 run_rc_command "$1"
 RCEOF

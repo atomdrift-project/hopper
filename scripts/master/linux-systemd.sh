@@ -264,6 +264,34 @@ elif [[ ! -e $pgpass_dst ]]; then
     log "No ~/.pgpass found; hopper will fail to authenticate until one is provided at ${pgpass_dst}"
 fi
 
+# --- Grafana Cloud OTLP token (optional, from the invoking user) ------------
+
+# obs reads the base64 OTLP credential from $HOME/.tok/graf and, when present,
+# pushes metrics/traces/logs to Grafana Cloud. HOME is the StateDirectory
+# (%S/${SERVICE_NAME}), so stage the token there for the service user. Mirrors
+# the .pgpass drop above: sourced from the deploying user, change-detected, 0600.
+graf_src=""
+for candidate in "${GRAF_TOKEN:-}" "${HOME}/.tok/graf"; do
+    if [[ -n $candidate && -f $candidate ]]; then
+        graf_src=$candidate
+        break
+    fi
+done
+
+graf_dst="${STATE_HOME}/.tok/graf"
+if [[ -n $graf_src ]]; then
+    priv install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_HOME}/.tok"
+    if priv cmp -s "$graf_src" "$graf_dst" 2>/dev/null; then
+        log "Grafana token unchanged"
+    else
+        log "Installing Grafana Cloud token from ${graf_src}"
+        priv install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
+            "$graf_src" "$graf_dst"
+    fi
+elif [[ ! -e $graf_dst ]]; then
+    log "No ~/.tok/graf found; OTLP push to Grafana Cloud disabled until one is provided at ${graf_dst}"
+fi
+
 # --- Unit --------------------------------------------------------------------
 
 tmp_unit=$(mktemp -t "${SERVICE_NAME}.service.XXXXXX")
@@ -334,13 +362,10 @@ Environment=HOPPER_UPLOAD_OPEN=1
 # memory fix; revisit downward once the working set is actually bounded.
 Environment=GOMEMLIMIT=32GiB
 
-# OpenTelemetry. The base endpoint; the SDK appends /v1/<signal> per the
-# OTel spec, so metrics land at /api/v1/otlp/v1/metrics on the Prometheus
-# OTLP receiver. Override OTEL_EXPORTER_OTLP_<SIGNAL>_ENDPOINT to send
-# a single signal somewhere else (e.g. traces → Tempo).
-Environment=OTEL_EXPORTER_OTLP_ENDPOINT=http://otel:9090/api/v1/otlp
-# Logs are handled by Loki; send them to its OTLP endpoint (used verbatim).
-Environment=OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://otel:3100/otlp/v1/logs
+# OpenTelemetry → Grafana Cloud. No endpoint is set here on purpose: obs falls
+# back to the Grafana Cloud OTLP gateway using the credential staged at
+# $HOME/.tok/graf (see the token drop above). To target a self-hosted fleet
+# instead, set OTEL_EXPORTER_OTLP_ENDPOINT (and _LOGS_ENDPOINT) in the env.
 
 # Resource caps — hopper + litmus children combined.
 MemoryHigh=80G
