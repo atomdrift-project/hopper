@@ -7,10 +7,12 @@ import (
 	"testing"
 )
 
-// TestBackfillProvenance covers the provenance-only upload path: a sample with
-// bytes but no sidecar gets one (and its purl_base projected), while a sample
-// that already has provenance — or one that doesn't exist — is left untouched.
-func TestBackfillProvenance(t *testing.T) {
+// TestSetProvenance covers the provenance-only upload path: a sample with bytes
+// gets (or refreshes) its sidecar and projected purl_base, an already-provenanced
+// sample is overwritten (the merge that preserves the discovery wrapper happens
+// in the handler, above this unconditional write), and an absent sample is a
+// no-op rather than an error.
+func TestSetProvenance(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
 
@@ -27,13 +29,13 @@ func TestBackfillProvenance(t *testing.T) {
 		Ecosystem: "npm", Package: "is-number", Version: "7.0.0", PURLBase: "pkg:npm/is-number",
 	}
 
-	// Unprovenanced sample → backfill applies, provenance + purl_base land.
-	applied, err := db.BackfillProvenance(ctx, sidecar)
+	// Unprovenanced sample → write applies, provenance + purl_base land.
+	applied, err := db.SetProvenance(ctx, sidecar)
 	if err != nil {
-		t.Fatalf("BackfillProvenance: %v", err)
+		t.Fatalf("SetProvenance: %v", err)
 	}
 	if !applied {
-		t.Fatal("expected backfill to apply to an unprovenanced sample")
+		t.Fatal("expected the write to apply to an unprovenanced sample")
 	}
 	got, err := db.ProvenanceBySHA256(ctx, noProv)
 	if err != nil || len(got) == 0 {
@@ -47,19 +49,51 @@ func TestBackfillProvenance(t *testing.T) {
 		t.Errorf("purl_base = %q, want pkg:npm/is-number", s2.PURLBase)
 	}
 
-	// Second time → no-op: provenance is written once, never overwritten.
-	if applied, err := db.BackfillProvenance(ctx, sidecar); err != nil || applied {
-		t.Errorf("re-backfill = (%v, %v), want (false, nil)", applied, err)
+	// A sample that already has provenance is overwritten with the new sidecar.
+	refreshed := []byte(`{"schema_version":"1.0","registry":{"record":{"ecosystem":"npm","name":"left-pad"}}}`)
+	if applied, err := db.SetProvenance(ctx, &Sample{SHA256: hasProv, Provenance: refreshed}); err != nil || !applied {
+		t.Errorf("set over existing provenance = (%v, %v), want (true, nil)", applied, err)
 	}
-
-	// A sample that already has provenance is never touched.
-	if applied, err := db.BackfillProvenance(ctx, &Sample{SHA256: hasProv, Provenance: prov}); err != nil || applied {
-		t.Errorf("backfill over existing provenance = (%v, %v), want (false, nil)", applied, err)
+	if got, err := db.ProvenanceBySHA256(ctx, hasProv); err != nil || !strings.Contains(string(got), "left-pad") {
+		t.Errorf("provenance not overwritten: err=%v got=%q", err, got)
 	}
 
 	// An absent sample is a no-op, not an error.
-	if applied, err := db.BackfillProvenance(ctx, &Sample{SHA256: absent, Provenance: prov}); err != nil || applied {
-		t.Errorf("backfill of absent sample = (%v, %v), want (false, nil)", applied, err)
+	if applied, err := db.SetProvenance(ctx, &Sample{SHA256: absent, Provenance: prov}); err != nil || applied {
+		t.Errorf("set on absent sample = (%v, %v), want (false, nil)", applied, err)
+	}
+}
+
+// TestSidecarMergeRefresh covers the merge policy the provenance-only handler
+// applies before the unconditional write: the registry snapshot refreshes from
+// the incoming sidecar while the original discovery wrapper (Feed) is preserved,
+// and a discovery channel the prior sidecar lacked is adopted from the newer one.
+func TestSidecarMergeRefresh(t *testing.T) {
+	feed := &MetadataRecord{SourceID: "npm-firehose", Format: "npm.event", Status: MetadataComplete}
+	oldReg := &MetadataRecord{SourceID: "npm-old", Format: "npm.packument", Status: MetadataComplete}
+	newReg := &MetadataRecord{SourceID: "npm-new", Format: "npm.packument", Status: MetadataComplete}
+
+	// Prior sidecar discovered via a feed; a re-fetch refreshes only the registry.
+	prior := Sidecar{Feed: feed, Registry: oldReg, Package: PackageRef{Feed: "npm"}}
+	prior.MergeRefresh(&Sidecar{Registry: newReg}) // incoming carries no Feed
+	if prior.Feed != feed {
+		t.Error("discovery wrapper (Feed) must be preserved across a registry refresh")
+	}
+	if prior.Package.Feed != "npm" {
+		t.Errorf("package.feed = %q, want preserved npm", prior.Package.Feed)
+	}
+	if prior.Registry != newReg {
+		t.Error("registry snapshot must be refreshed from the newer sidecar")
+	}
+
+	// A prior sidecar without a feed adopts one observed later.
+	noFeed := Sidecar{Registry: oldReg}
+	noFeed.MergeRefresh(&Sidecar{Feed: feed, Package: PackageRef{Feed: "aikido"}})
+	if noFeed.Feed != feed || noFeed.Package.Feed != "aikido" {
+		t.Error("a feed observed later should be adopted when none existed")
+	}
+	if noFeed.Registry != oldReg {
+		t.Error("a newer sidecar without a registry must not erase the existing one")
 	}
 }
 

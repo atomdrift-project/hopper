@@ -179,6 +179,26 @@ func (sc *Sidecar) Validate() error {
 	return nil
 }
 
+// MergeRefresh updates this sidecar in place to absorb a newer capture of the
+// same artifact's provenance. The registry snapshot ("what the package is now")
+// is refreshed from newer, while the discovery wrapper ("how it was first found"
+// — Feed) and everything else this sidecar already records are preserved: a
+// re-fetch of a known dependency updates its registry facts without rewriting its
+// discovery history. A discovery channel this sidecar lacks is adopted from newer
+// (a feed observed only later is not dropped); a newer capture that carries no
+// registry leaves the existing snapshot intact. Callers Finalize afterward.
+func (sc *Sidecar) MergeRefresh(newer *Sidecar) {
+	if newer.Registry != nil {
+		sc.Registry = newer.Registry
+	}
+	if sc.Feed == nil && newer.Feed != nil {
+		sc.Feed = newer.Feed
+	}
+	if sc.Package.Feed == "" && newer.Package.Feed != "" {
+		sc.Package.Feed = newer.Package.Feed
+	}
+}
+
 // isSHA256Hex reports whether s is exactly 64 lowercase hexadecimal digits.
 func isSHA256Hex(s string) bool {
 	if len(s) != 64 {

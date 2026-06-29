@@ -2221,31 +2221,51 @@ func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request
 	writeJSONError(w, http.StatusBadRequest, `{"error":"missing file part"}`)
 }
 
-// storeProvenanceOnly attaches a provenance sidecar to an existing sample that
-// has none — the backfill path for a sample hopper already holds the bytes for
-// (e.g. a dependency ingested as raw bytes with no provenance). No bytes move;
-// the sample is matched by the sidecar's artifact.sha256. Idempotent: a sample
-// that already carries provenance, or one hopper doesn't have, is left
-// untouched. The sidecar was Finalized and Validated by the caller.
+// storeProvenanceOnly attaches or refreshes a provenance sidecar on an existing
+// sample hopper already holds the bytes for (e.g. a dependency re-fetched by a
+// scan). No bytes move; the sample is matched by the sidecar's artifact.sha256.
+// When the row already carries provenance, the incoming sidecar is merged in
+// (see [hopper.Sidecar.MergeRefresh]): the registry snapshot is refreshed while
+// the original discovery wrapper — the Feed that recorded how the dependency was
+// first found — is preserved. A sample hopper doesn't have is left untouched. The
+// incoming sidecar was Finalized and Validated by the caller.
 func (s *apiServer) storeProvenanceOnly(w http.ResponseWriter, r *http.Request, prov *hopper.Sidecar) {
 	sha := prov.Artifact.SHA256 // Validate() guarantees 64 lowercase hex
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
 
+	// Merge onto any prior sidecar so a refresh keeps the original discovery
+	// channel and only swaps the registry snapshot. A read-then-write here can
+	// race a concurrent refresh; both preserve the same prior Feed, so the worst
+	// case is a lost registry update recovered on the next scan — acceptable for
+	// best-effort provenance.
+	toStore := prov
+	if existingRaw, err := s.db.ProvenanceBySHA256(ctx, sha); err == nil && len(existingRaw) > 0 {
+		var existing hopper.Sidecar
+		if err := json.Unmarshal(existingRaw, &existing); err == nil {
+			existing.MergeRefresh(prov)
+			existing.Finalize()
+			toStore = &existing
+		} else {
+			slog.WarnContext(r.Context(), "provenance refresh: unparseable prior sidecar; overwriting",
+				"sha256", sha, "error", err)
+		}
+	}
+
 	// Reuse the upload projection (provenance JSONB + scalar identity columns,
-	// including purl_base); BackfillProvenance only reads those, never the
+	// including purl_base); SetProvenance only reads those, never the
 	// path/label/source fields, so the existing row's bytes and verdict are safe.
-	sample := uploadSample(sha, prov.Artifact.Filename, "", prov.Artifact.SizeBytes, prov)
-	backfilled, err := s.db.BackfillProvenance(ctx, sample)
+	sample := uploadSample(sha, toStore.Artifact.Filename, "", toStore.Artifact.SizeBytes, toStore)
+	applied, err := s.db.SetProvenance(ctx, sample)
 	if err != nil {
-		slog.ErrorContext(r.Context(), "upload: backfill provenance", "sha256", sha, "error", err)
+		slog.ErrorContext(r.Context(), "upload: set provenance", "sha256", sha, "error", err)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
 	}
-	slog.InfoContext(r.Context(), "provenance backfill", "sha256", sha, "applied", backfilled)
+	slog.InfoContext(r.Context(), "provenance set", "sha256", sha, "applied", applied)
 	w.Header().Set("Content-Type", "application/json")
 	//nolint:errcheck,errchkjson // best-effort response
-	_ = json.NewEncoder(w).Encode(map[string]any{"sha256": sha, "provenance_backfilled": backfilled})
+	_ = json.NewEncoder(w).Encode(map[string]any{"sha256": sha, "provenance_backfilled": applied})
 }
 
 // storeUpload streams src to a sha-sharded path under the uploads root while

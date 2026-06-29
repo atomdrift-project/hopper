@@ -1777,17 +1777,18 @@ func (db *DB) ProvenanceBySHA256(ctx context.Context, sha256 string) ([]byte, er
 	return db.provenanceBySHA256SQLite(ctx, sha256)
 }
 
-// BackfillProvenance attaches a provenance sidecar (and its projected scalar
-// identity columns) to an existing sample that has none, without touching the
-// sample's bytes, path, label, or analysis. Reports whether a row was updated —
-// false when the sample is absent or already carries provenance, because
-// provenance is written once and never overwritten (the WHERE guards on
-// provenance IS NULL). Identity columns are filled only where currently empty.
-func (db *DB) BackfillProvenance(ctx context.Context, s *Sample) (bool, error) {
+// SetProvenance writes the provenance sidecar for an existing sample, replacing
+// whatever provenance the row carried, without touching the sample's bytes, path,
+// label, or analysis. Reports whether a row matched — false when the sample is
+// absent. Any merge policy (e.g. preserving a prior discovery wrapper while
+// refreshing the registry snapshot, via [Sidecar.MergeRefresh]) is the caller's
+// responsibility; this is the unconditional write. Scalar identity columns are
+// filled only where currently empty, so a refresh never blanks a populated one.
+func (db *DB) SetProvenance(ctx context.Context, s *Sample) (bool, error) {
 	if db.pool != nil {
-		return db.backfillProvenancePG(ctx, s)
+		return db.setProvenancePG(ctx, s)
 	}
-	return db.backfillProvenanceSQLite(ctx, s)
+	return db.setProvenanceSQLite(ctx, s)
 }
 
 // KnownSHA256 returns the subset of the given digests that already have a

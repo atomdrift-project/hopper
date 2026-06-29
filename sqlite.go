@@ -3024,7 +3024,7 @@ func (db *DB) provenanceBySHA256SQLite(ctx context.Context, sha256 string) ([]by
 	return restoreNULs(prov), nil
 }
 
-func (db *DB) backfillProvenanceSQLite(ctx context.Context, s *Sample) (bool, error) {
+func (db *DB) setProvenanceSQLite(ctx context.Context, s *Sample) (bool, error) {
 	res, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET
 			provenance = ?,
@@ -3034,14 +3034,14 @@ func (db *DB) backfillProvenanceSQLite(ctx context.Context, s *Sample) (bool, er
 			purl_base  = COALESCE(NULLIF(purl_base, ''), ?),
 			url        = COALESCE(NULLIF(url, ''), ?),
 			fetched_at = COALESCE(fetched_at, ?)
-		WHERE sha256 = ? AND provenance IS NULL`,
+		WHERE sha256 = ?`,
 		jsonTextOrNil(s.Provenance), s.Ecosystem, s.Package, s.Version, s.PURLBase, s.URL, s.FetchedAt, s.SHA256)
 	if err != nil {
-		return false, fmt.Errorf("hopper: backfill provenance %s: %w", s.SHA256, err)
+		return false, fmt.Errorf("hopper: set provenance %s: %w", s.SHA256, err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("hopper: backfill provenance rows %s: %w", s.SHA256, err)
+		return false, fmt.Errorf("hopper: set provenance rows %s: %w", s.SHA256, err)
 	}
 	return n > 0, nil
 }
