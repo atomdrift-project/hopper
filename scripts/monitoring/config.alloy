@@ -9,40 +9,67 @@
 // metrics already arrive via each Go service's native OTel exporter, so Alloy
 // deliberately does NOT scrape those.
 //
+// Transport: scrape the embedded postgres_exporter, then push via OTLP to the
+// Grafana Cloud gateway — the same ingestion path the Go services use (the
+// stack token in ~/.tok/graf is an OTLP-write token for region prod-us-east-3).
+//
 // Env (loaded from alloy.env by the rc.d script, see RUNBOOK.md):
 //   EXPORTER_DSN   postgresql://hopper_exporter:PW@hopper-db:5432/hopper?sslmode=disable
-//   GC_PROM_URL    https://prometheus-prod-XX-...grafana.net/api/prom/push
-//   GC_PROM_USER   Grafana Cloud Prometheus instance id (numeric)
-//   GC_PROM_TOKEN  Grafana Cloud access policy token (metrics:write)
+//   GC_OTLP_URL    https://otlp-gateway-prod-us-east-3.grafana.net/otlp
+//   GC_OTLP_USER   Grafana Cloud instance id (1669252)
+//   GC_OTLP_TOKEN  glc_... access-policy token
 
 prometheus.exporter.postgres "publisher" {
   data_source_names          = [sys.env("EXPORTER_DSN")]
   custom_queries_config_path = "/usr/local/etc/hopper-alloy/queries.yaml"
 
   // Defaults give pg_up + the built-in replication / replication_slot
-  // collectors; the custom query above adds wal_status + tablesync labelling.
+  // collectors; the custom query adds wal_status + tablesync labelling.
   enabled_collectors = ["replication", "replication_slot"]
 }
 
 prometheus.scrape "publisher" {
   targets         = prometheus.exporter.postgres.publisher.targets
-  forward_to      = [prometheus.remote_write.grafanacloud.receiver]
+  forward_to      = [prometheus.relabel.labels.receiver]
   job_name        = "postgres-publisher"
   scrape_interval = "30s"
 }
 
-prometheus.remote_write "grafanacloud" {
-  endpoint {
-    url = sys.env("GC_PROM_URL")
-    basic_auth {
-      username = sys.env("GC_PROM_USER")
-      password = sys.env("GC_PROM_TOKEN")
-    }
+// Stamp topology labels on every series before conversion (resource attributes
+// would land in target_info instead of on the series).
+prometheus.relabel "labels" {
+  forward_to = [otelcol.receiver.prometheus.default.receiver]
+  rule {
+    target_label = "cluster"
+    replacement  = "hopper"
   }
-  // cluster label ties these series to the hopper topology; instance/job come
-  // from the scrape target so per-slot series stay distinct.
-  external_labels = {
-    cluster = "hopper",
-    role    = "publisher",
+  rule {
+    target_label = "role"
+    replacement  = "publisher"
   }
+}
+
+// Prometheus -> OTLP -> Grafana Cloud gateway.
+otelcol.receiver.prometheus "default" {
+  output {
+    metrics = [otelcol.processor.batch.default.input]
+  }
+}
+
+otelcol.processor.batch "default" {
+  output {
+    metrics = [otelcol.exporter.otlphttp.grafanacloud.input]
+  }
+}
+
+otelcol.exporter.otlphttp "grafanacloud" {
+  client {
+    endpoint = sys.env("GC_OTLP_URL")
+    auth     = otelcol.auth.basic.grafanacloud.handler
+  }
+}
+
+otelcol.auth.basic "grafanacloud" {
+  username = sys.env("GC_OTLP_USER")
+  password = sys.env("GC_OTLP_TOKEN")
 }
