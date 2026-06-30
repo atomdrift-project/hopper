@@ -384,11 +384,16 @@ OOMPolicy=continue
 # makes hopper the last to be chosen (promoter, +600, goes first).
 OOMScoreAdjust=-800
 
-# Filesystem isolation. DATA_DIR is read-only except interactive uploads.
+# Filesystem isolation. hopper is the pool's relocation authority: besides
+# interactive uploads it moves samples between the good/bad/unknown trees
+# (post-triage and promoter rulings via /api/triage), so the whole sample tree
+# must be writable, not just the upload dir. The pools are separate ZFS mounts
+# (good, bad, unknown) under the DATA_DIR parent; list each mountpoint so the
+# ProtectSystem=strict read-only remount can't leave a submount read-only and
+# fault a relocation with EROFS ("mkdir: read-only file system").
 ProtectSystem=strict
 ProtectHome=true
-ReadOnlyPaths=${DATA_DIR}
-ReadWritePaths=${UPLOAD_DIR}
+ReadWritePaths=${DATA_DIR} ${DATA_DIR}/good ${DATA_DIR}/bad ${DATA_DIR}/unknown
 PrivateTmp=true
 PrivateDevices=true
 PrivateMounts=true
