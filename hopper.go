@@ -3141,6 +3141,31 @@ func (db *DB) BackfillPending(ctx context.Context) (BackfillPending, error) {
 	return db.backfillPendingSQLite(ctx)
 }
 
+// RehealCleaveCrit repairs max_crit/suspicious_count for rows the Postgres
+// samples_derive_cleave_cols trigger zeroed before it learned the v8 'traits'
+// trait key (see rehealCleaveCritPG). It is Postgres-only: the SQLite path
+// derives these columns in Go via ParseCleaveResult, which has been v8-aware
+// since the format landed, so SQLite rows were never affected. Returns the
+// number of rows repaired.
+func (db *DB) RehealCleaveCrit(ctx context.Context) (int64, error) {
+	if db.pool != nil {
+		return db.rehealCleaveCritPG(ctx)
+	}
+	return 0, nil
+}
+
+// BackfillPURL fills samples.purl_base for top-level rows that have a package
+// coordinate but no stored PURL identity, rebuilding it from the ecosystem +
+// package columns via the shared pkgparse builder (see backfillPURLPG). It never
+// overwrites an existing purl_base. Postgres-only; the SQLite path is unused for
+// this repair. Returns the number of rows filled.
+func (db *DB) BackfillPURL(ctx context.Context) (int64, error) {
+	if db.pool != nil {
+		return db.backfillPURLPG(ctx)
+	}
+	return 0, nil
+}
+
 // RecomputeCanonicalSHA256 recalculates canonical_sha256 for all analyzed
 // samples using SQL-side JSON_TABLE, avoiding the need to fetch cleave_result
 // blobs into Go. Returns the number of rows updated.

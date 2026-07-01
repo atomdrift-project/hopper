@@ -54,6 +54,8 @@ commands:
   bad-review         list marker-bad files cleave still considers benign
   conflict-review    list samples asserted both good and bad across pools
   backfill           re-derive columns from cleave_result/litmus_result blobs
+  reheal-crit        repair max_crit/suspicious_count zeroed by the pre-v8 cleave trigger (postgres)
+  backfill-purl      derive missing samples.purl_base from ecosystem+package (never overwrites; postgres)
   purge-unsupported  delete analyzed rows cleave could not classify
   normalize-ecosystems  re-canonicalize stored ecosystem labels (dry-run)
   cleanup            delete wonky samples by skip category (interactive)
@@ -506,6 +508,10 @@ func run(ctx context.Context) error {
 		return cmdConflictReview(ctx)
 	case "backfill":
 		return cmdBackfill(ctx)
+	case "reheal-crit":
+		return cmdRehealCrit(ctx)
+	case "backfill-purl":
+		return cmdBackfillPURL(ctx)
 	case "purge-unsupported":
 		return cmdPurgeUnsupported(ctx)
 	case "normalize-ecosystems":
@@ -3139,6 +3145,68 @@ func cmdBackfill(ctx context.Context) error {
 		return err
 	}
 	slog.Info("backfill complete", "scanned", stats.Scanned, "updated", stats.Updated, "markers_cleared", stats.MarkersCleared)
+	return nil
+}
+
+// cmdRehealCrit repairs the max_crit/suspicious_count columns that the
+// samples_derive_cleave_cols trigger zeroed for every cleave v8 row (the per-file
+// trait array was renamed 'find'->'traits' in v8; the trigger only knew 'find',
+// so it derived max_crit=0 for all post-v8 samples and silently dropped them from
+// the bloom's bad tiers and every criticality gate). Migrate first so the fixed
+// trigger is in place before healing, then drain the broken backlog. Idempotent:
+// only rows whose corrected criticality is non-zero are rewritten.
+func cmdRehealCrit(ctx context.Context) error {
+	f := flag.NewFlagSet("reheal-crit", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	parseFlags(f, os.Args[2:])
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	if err := db.Migrate(ctx); err != nil {
+		return err
+	}
+
+	slog.Info("rehealing max_crit/suspicious_count for cleave v8 rows")
+	n, err := db.RehealCleaveCrit(ctx)
+	if err != nil {
+		return err
+	}
+	slog.Info("reheal-crit complete", "rows_repaired", n)
+	return nil
+}
+
+// cmdBackfillPURL derives samples.purl_base for older rows that have a package
+// coordinate but no stored PURL identity — the backlog from before forager
+// derived it on write, plus rows whose runtime ecosystem the old registry-only
+// mapping could not translate (javascript/rust/java/…), which is what kept the
+// bad-PURL bloom near-empty. It rebuilds from the ecosystem + package columns via
+// the shared pkgparse builder and never overwrites an existing purl_base, so it is
+// safe to re-run.
+func cmdBackfillPURL(ctx context.Context) error {
+	f := flag.NewFlagSet("backfill-purl", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	parseFlags(f, os.Args[2:])
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	if err := db.Migrate(ctx); err != nil {
+		return err
+	}
+
+	slog.Info("backfilling purl_base from ecosystem+package")
+	n, err := db.BackfillPURL(ctx)
+	if err != nil {
+		return err
+	}
+	slog.Info("backfill-purl complete", "rows_filled", n)
 	return nil
 }
 

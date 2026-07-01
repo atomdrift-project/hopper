@@ -18,6 +18,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
+
+	"codeberg.org/atomdrift/hopper/pkgparse"
 )
 
 func openPG(ctx context.Context, dsn string) (*DB, error) {
@@ -59,6 +61,16 @@ func (db *DB) migratePG(ctx context.Context) error {
 	}
 	return build(ctx)
 }
+
+// cleaveTraitArrayKeys lists every key the cleave compact report has used for a
+// file's trait array, newest first: 'traits' (v8+), 'find' (v7), 'ts' (v4). Every
+// place that derives max_crit/suspicious_count — the samples_derive_cleave_cols
+// trigger, backfillPG Pass 1, rehealCleaveCritPG — must COALESCE across all of
+// them, or rows in the missing format silently derive crit 0. When cleave renames
+// the array again, prepend the new key here and to those three COALESCEs;
+// TestCleaveTriggerKnowsAllTraitKeys fails until the trigger learns it. (The Go
+// mirror lives in cleaveCompactFileEntry's struct tags in hopper.go.)
+var cleaveTraitArrayKeys = []string{"traits", "find", "ts"}
 
 // pgRuntimeMigrations is the ordered post-schema DDL list. Extracted into its
 // own function so the synchronous (migratePG) and serving (migrateServingPG)
@@ -474,7 +486,12 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// Trigger that derives every cleave-sourced column (file_type, score,
 		// formula, elements, max_crit, suspicious_count) from the cleave result
 		// on every write, reading the v7 'files' key first and falling back to
-		// the legacy 'fs' key for cached rows. BEFORE INSERT covers the bulk
+		// the legacy 'fs' key for cached rows. The per-file trait array was named
+		// 'find' through v7 and renamed 'traits' in v8; max_crit/suspicious_count
+		// read 'traits' first, then 'find', then the v4 'ts' key, so a missed
+		// rename can't silently zero the criticality of every new sample (it did:
+		// v8 landed ~2026-06-15 and every v8 row derived max_crit=0 until this
+		// COALESCE learned 'traits'). BEFORE INSERT covers the bulk
 		// archive-member insert path (which otherwise never set elements/
 		// max_crit/suspicious_count, leaving every member permanently in the
 		// backfill-pending set); UPDATE OF cleave_result covers analysis stores
@@ -489,7 +506,8 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE OR REPLACE FUNCTION samples_derive_cleave_cols() RETURNS trigger
 		LANGUAGE plpgsql AS $$
 		DECLARE
-			finds jsonb := COALESCE(NEW.cleave_result->'files'->0->'find',
+			finds jsonb := COALESCE(NEW.cleave_result->'files'->0->'traits',
+									NEW.cleave_result->'files'->0->'find',
 									NEW.cleave_result->'fs'->0->'ts', '[]'::jsonb);
 		BEGIN
 			NEW.file_type := COALESCE(NEW.cleave_result->'files'->0->>'type',
@@ -3451,14 +3469,14 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 				max_crit = COALESCE((
 					SELECT MAX((COALESCE(tr->>'crit', tr->>'l'))::int)
 					FROM jsonb_array_elements(
-						COALESCE(cleave_result->'files'->0->'find', cleave_result->'fs'->0->'ts', '[]'::jsonb)
+						COALESCE(cleave_result->'files'->0->'traits', cleave_result->'files'->0->'find', cleave_result->'fs'->0->'ts', '[]'::jsonb)
 					) AS tr
 					WHERE COALESCE(tr->>'crit', tr->>'l') IS NOT NULL
 				), 0),
 				suspicious_count = (
 					SELECT COUNT(*)::int
 					FROM jsonb_array_elements(
-						COALESCE(cleave_result->'files'->0->'find', cleave_result->'fs'->0->'ts', '[]'::jsonb)
+						COALESCE(cleave_result->'files'->0->'traits', cleave_result->'files'->0->'find', cleave_result->'fs'->0->'ts', '[]'::jsonb)
 					) AS tr
 					WHERE COALESCE(tr->>'crit', tr->>'l') IS NOT NULL
 						AND (COALESCE(tr->>'crit', tr->>'l'))::int >= 4
@@ -3546,6 +3564,146 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 	stats.MarkersCleared += badTag.RowsAffected()
 
 	return stats, nil
+}
+
+// rehealCleaveCritPG repairs max_crit/suspicious_count for rows the
+// samples_derive_cleave_cols trigger zeroed while it only knew the v7 'find'
+// trait key: v8 renamed that array to 'traits' (landed ~2026-06-15), so every
+// v8 sample derived max_crit=0 / suspicious_count=0 regardless of its actual
+// findings, dropping all post-v8 malware out of the bloom's bad tiers
+// (label='bad' AND max_crit>=4) and out of every prism/promoter criticality
+// gate. The standard Backfill Pass 1 cannot reach these rows: its gate is
+// elements=” (idx_samples_backfill_pending), and the broken trigger still
+// derived elements/formula/file_type/score correctly (those keys did not
+// rename) — only the two crit columns are wrong. So this is a separate,
+// explicit, one-time heal.
+//
+// It pages by ascending id (PK index, so sparse ids cost nothing) and recomputes
+// both columns from the now-correct 'traits'→'find'→'ts' fallback, restricted to
+// rows that carry the v8 'traits' key and still read max_crit=0. The final
+// predicate (nv.mc>0 OR nv.sc>0) writes only rows whose corrected value actually
+// differs, so genuinely-benign v8 rows are never rewritten and the pass is
+// idempotent. No updated_at bump: like backfillLitmusClassPG, healing a derived
+// column must not reshuffle update queues. Returns the number of rows repaired.
+func (db *DB) rehealCleaveCritPG(ctx context.Context) (int64, error) {
+	const batchRows = 50000
+	var updated, cursor int64
+	for {
+		var hi *int64
+		if err := db.pool.QueryRow(ctx,
+			`SELECT max(id) FROM (SELECT id FROM samples WHERE id > $1 ORDER BY id LIMIT $2) q`,
+			cursor, batchRows).Scan(&hi); err != nil {
+			return updated, fmt.Errorf("hopper: reheal crit cursor: %w", err)
+		}
+		if hi == nil {
+			break // no rows past the cursor; done
+		}
+		tag, err := db.pool.Exec(ctx, `
+			UPDATE samples s SET max_crit = nv.mc, suspicious_count = nv.sc
+			FROM (
+				SELECT id,
+					COALESCE((
+						SELECT MAX((COALESCE(tr->>'crit', tr->>'l'))::int)
+						FROM jsonb_array_elements(
+							COALESCE(cleave_result->'files'->0->'traits', cleave_result->'files'->0->'find', cleave_result->'fs'->0->'ts', '[]'::jsonb)
+						) AS tr
+						WHERE COALESCE(tr->>'crit', tr->>'l') IS NOT NULL
+					), 0) AS mc,
+					(
+						SELECT COUNT(*)::int
+						FROM jsonb_array_elements(
+							COALESCE(cleave_result->'files'->0->'traits', cleave_result->'files'->0->'find', cleave_result->'fs'->0->'ts', '[]'::jsonb)
+						) AS tr
+						WHERE COALESCE(tr->>'crit', tr->>'l') IS NOT NULL
+							AND (COALESCE(tr->>'crit', tr->>'l'))::int >= 4
+					) AS sc
+				FROM samples
+				WHERE id > $1 AND id <= $2
+					AND cleave_result IS NOT NULL
+					AND max_crit = 0
+					AND cleave_result->'files'->0 ? 'traits'
+			) nv
+			WHERE s.id = nv.id AND (nv.mc > 0 OR nv.sc > 0)`, cursor, *hi)
+		if err != nil {
+			return updated, fmt.Errorf("hopper: reheal crit batch (%d, %d]: %w", cursor, *hi, err)
+		}
+		updated += tag.RowsAffected()
+		cursor = *hi
+		slog.Info("reheal crit batch", "through_id", cursor, "repaired_total", updated)
+	}
+	return updated, nil
+}
+
+// backfillPURLPG fills samples.purl_base for top-level rows that carry a package
+// coordinate but no stored PURL identity. Two backlogs land here: rows ingested
+// before forager derived purl_base on write, and rows whose ecosystem the old
+// derivation could not map — it ran the lossy runtime ecosystem string through a
+// registry-only table, so javascript/rust/java/ruby/dotnet silently produced no
+// PURL, which (with the cleave v8 max_crit miss) is why the bad-PURL bloom froze
+// at a handful of entries.
+//
+// It rebuilds the version-less identity from the stored ecosystem + package
+// columns via the shared pkgparse builder, which maps each runtime ecosystem to
+// its dominant registry and refuses the ambiguous ones — so a row we cannot map
+// confidently is left empty rather than given a wrong PURL. It never overwrites a
+// non-empty purl_base (re-running is a no-op and existing identities are
+// untouched), and pages by ascending id advancing the cursor past every scanned
+// row, so each heap row is visited once and unmappable rows are not retried. No
+// updated_at bump: purl_base is a derived identity, not a state change.
+func (db *DB) backfillPURLPG(ctx context.Context) (int64, error) {
+	const batchRows = 20000
+	var updated, cursor int64
+	for {
+		rows, err := db.pool.Query(ctx, `
+			SELECT id, ecosystem, package FROM samples
+			WHERE id > $1 AND purl_base = '' AND package <> '' AND parent = ''
+			ORDER BY id LIMIT $2`, cursor, batchRows)
+		if err != nil {
+			return updated, fmt.Errorf("hopper: backfill purl select: %w", err)
+		}
+		var ids []int64
+		var purls []string
+		var seen int
+		var maxID int64
+		for rows.Next() {
+			var id int64
+			var eco, pkg string
+			if err := rows.Scan(&id, &eco, &pkg); err != nil {
+				rows.Close()
+				return updated, fmt.Errorf("hopper: backfill purl scan: %w", err)
+			}
+			seen++
+			maxID = id
+			if p, ok := pkgparse.PURLIdentity(eco, pkg); ok {
+				ids = append(ids, id)
+				purls = append(purls, p)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return updated, fmt.Errorf("hopper: backfill purl iterate: %w", err)
+		}
+		rows.Close()
+		if seen == 0 {
+			break
+		}
+		if len(ids) > 0 {
+			tag, err := db.pool.Exec(ctx, `
+				UPDATE samples s SET purl_base = v.purl
+				FROM unnest($1::bigint[], $2::text[]) AS v(id, purl)
+				WHERE s.id = v.id AND s.purl_base = ''`, ids, purls)
+			if err != nil {
+				return updated, fmt.Errorf("hopper: backfill purl update: %w", err)
+			}
+			updated += tag.RowsAffected()
+		}
+		cursor = maxID
+		slog.Info("backfill purl batch", "through_id", cursor, "filled_total", updated)
+		if seen < batchRows {
+			break
+		}
+	}
+	return updated, nil
 }
 
 // backfillLitmusClassPG heals litmus_class for litmus-bearing rows analyzed
