@@ -3655,7 +3655,7 @@ func (db *DB) backfillPURLPG(ctx context.Context) (int64, error) {
 	var updated, cursor int64
 	for {
 		rows, err := db.pool.Query(ctx, `
-			SELECT id, ecosystem, package FROM samples
+			SELECT id, ecosystem, domain, package FROM samples
 			WHERE id > $1 AND purl_base = '' AND package <> '' AND parent = ''
 			ORDER BY id LIMIT $2`, cursor, batchRows)
 		if err != nil {
@@ -3667,14 +3667,14 @@ func (db *DB) backfillPURLPG(ctx context.Context) (int64, error) {
 		var maxID int64
 		for rows.Next() {
 			var id int64
-			var eco, pkg string
-			if err := rows.Scan(&id, &eco, &pkg); err != nil {
+			var eco, dom, pkg string
+			if err := rows.Scan(&id, &eco, &dom, &pkg); err != nil {
 				rows.Close()
 				return updated, fmt.Errorf("hopper: backfill purl scan: %w", err)
 			}
 			seen++
 			maxID = id
-			if p, ok := pkgparse.PURLIdentity(eco, pkg); ok {
+			if p, ok := pkgparse.SourcePURLIdentity(eco, dom, pkg); ok {
 				ids = append(ids, id)
 				purls = append(purls, p)
 			}
