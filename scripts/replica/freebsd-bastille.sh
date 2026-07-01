@@ -151,6 +151,13 @@ ECS_MB=$(( _mem_mb * 3 / 5 ))
 log "PG memory sizing: shared_buffers=${SB_MB}MB effective_cache_size=${ECS_MB}MB (host RAM ${_mem_mb}MB)"
 PG_TUNING_TMP="/tmp/hopper-replica-pg.sql"
 doas bastille cmd "$RUN" tee "$PG_TUNING_TMP" >/dev/null <<SQLEOF
+-- Listen on all the jail's addresses so BOTH localhost (hopper init / the
+-- healer / psql -h localhost) and the external IP (readers like prism) work.
+-- pg_hba above still gates auth (local peer + 127.0.0.1/::1 + 10.0.0.0/8 hopper),
+-- so '*' only controls which interfaces are bound, not who may connect. Without
+-- this, a box left on listen_addresses=<jail-ip> refuses hopper init's localhost
+-- DSN with "connection refused".
+ALTER SYSTEM SET listen_addresses = '*';
 ALTER SYSTEM SET wal_level = 'logical';
 ALTER SYSTEM SET max_replication_slots = '10';
 ALTER SYSTEM SET max_wal_senders = '10';
