@@ -1030,6 +1030,139 @@ func TestHandleUploadMultipartEnrichesRow(t *testing.T) {
 	}
 }
 
+// provenanceOnlyUpload builds a multipart body with just a "provenance" part and
+// no "file" part — the refresh shape scan sends for a dependency hopper already
+// holds the bytes for.
+func provenanceOnlyUpload(t *testing.T, prov []byte) (body *bytes.Buffer, contentType string) {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	p, err := mw.CreateFormField("provenance")
+	if err != nil {
+		t.Fatalf("create provenance part: %v", err)
+	}
+	if _, err := p.Write(prov); err != nil {
+		t.Fatalf("write provenance: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	return &buf, mw.FormDataContentType()
+}
+
+// postDepResult posts a dependency verdict to /api/result keyed by content sha,
+// with a real cleave report (fileType keeps StoreResult from deleting the row on
+// an empty FileType). Returns the stored cleave_result for difference checks.
+func postDepResult(t *testing.T, api *apiServer, sha, fileType string, lvl int) []byte {
+	t.Helper()
+	raw := json.RawMessage(`{"fs":[{"sha":"` + sha + `","type":"` + fileType + `","dp":0}]}`)
+	ml := json.RawMessage(`{"lvl":` + strconv.Itoa(lvl) + `}`)
+	body, err := json.Marshal(resultRequest{SHA256: sha, Worker: "worker1", Raw: raw, ML: ml})
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	r := httptest.NewRequest(http.MethodPost, "/api/result", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	api.handleResult(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("post result: code=%d body=%s", w.Code, w.Body.String())
+	}
+	got, err := api.db.SampleBySHA256(context.Background(), sha)
+	if err != nil {
+		t.Fatalf("SampleBySHA256 after result: %v", err)
+	}
+	return got.CleaveResult
+}
+
+// TestDependencyMirrorAndRefresh drives hopper's real handlers through exactly
+// what scan does when it mirrors a fetched dependency and later re-scans it:
+//   - first discovery (forager-style sidecar with a Feed record + initial
+//     Registry, uploaded with bytes) stores content + provenance + findings;
+//   - a re-scan (provenance-only refresh carrying a new Registry and no Feed, then
+//     an updated verdict) refreshes the registry snapshot and the findings while
+//     preserving the original discovery feed — and never re-moves the bytes.
+func TestDependencyMirrorAndRefresh(t *testing.T) {
+	api := uploadAPI(t)
+	api.progress = &loadProgress{} // handleResult records progress
+	ctx := context.Background()
+
+	file := []byte("dependency tarball bytes")
+	sum := sha256.Sum256(file)
+	sha := hex.EncodeToString(sum[:])
+
+	feed := &hopper.MetadataRecord{
+		SourceID: "npm-firehose", Format: "npm.event",
+		URL: "https://npm/feed", Status: hopper.MetadataComplete,
+	}
+	base := hopper.Sidecar{
+		SchemaVersion: hopper.SidecarSchemaVersion,
+		Artifact:      hopper.Artifact{Filename: "foo-1.0.0.tgz", SHA256: sha, SizeBytes: int64(len(file))},
+		Package:       hopper.PackageRef{Ecosystem: "npm", Name: "foo", Version: "1.0.0", PURL: "pkg:npm/foo@1.0.0", Feed: "npm"},
+		Fetch:         hopper.Fetch{Collector: "forager+test", Category: "new", At: time.Now().UTC(), URL: "https://registry.npmjs.org/foo/-/foo-1.0.0.tgz"},
+		Feed:          feed,
+		Registry: &hopper.MetadataRecord{
+			SourceID: "npm-old", Format: "npm.packument", URL: "https://registry.npmjs.org/foo",
+			Status: hopper.MetadataComplete, Record: json.RawMessage(`{"downloads_recent":100}`),
+		},
+	}
+
+	// --- First discovery: bytes + provenance. ---
+	body, ct := multipartUpload(t, mustJSON(t, &base), file, true)
+	if w := postUpload(t, api, body, ct); w.Code != http.StatusOK {
+		t.Fatalf("initial upload: code=%d body=%s", w.Code, w.Body.String())
+	}
+	if got, err := api.db.ProvenanceBySHA256(ctx, sha); err != nil || len(got) == 0 {
+		t.Fatalf("provenance not stored on discovery: err=%v len=%d", err, len(got))
+	}
+	if s0, err := api.db.SampleBySHA256(ctx, sha); err != nil || s0.PURLBase != "pkg:npm/foo" {
+		t.Fatalf("purl_base not projected: err=%v purl_base=%q", err, s0.PURLBase)
+	}
+
+	// First verdict.
+	firstResult := postDepResult(t, api, sha, "elf", -1)
+	if len(firstResult) == 0 {
+		t.Fatal("findings not stored on first pass")
+	}
+
+	// --- Re-scan: provenance-only refresh with a new registry and no feed. ---
+	refresh := base
+	refresh.Feed = nil // scan sends no discovery feed
+	refresh.Fetch.Collector = "scan+host"
+	refresh.Registry = &hopper.MetadataRecord{
+		SourceID: "npm-new", Format: "npm.packument", URL: "https://registry.npmjs.org/foo",
+		Status: hopper.MetadataComplete, Record: json.RawMessage(`{"downloads_recent":999,"deprecated":true}`),
+	}
+	body2, ct2 := provenanceOnlyUpload(t, mustJSON(t, &refresh))
+	if w := postUpload(t, api, body2, ct2); w.Code != http.StatusOK {
+		t.Fatalf("provenance refresh: code=%d body=%s", w.Code, w.Body.String())
+	}
+
+	// The discovery feed survives; the registry snapshot is refreshed.
+	raw, err := api.db.ProvenanceBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatalf("ProvenanceBySHA256 after refresh: %v", err)
+	}
+	var stored hopper.Sidecar
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		t.Fatalf("unmarshal stored provenance: %v", err)
+	}
+	if stored.Feed == nil || stored.Feed.SourceID != "npm-firehose" {
+		t.Errorf("discovery feed not preserved across refresh: %+v", stored.Feed)
+	}
+	if stored.Registry == nil || stored.Registry.SourceID != "npm-new" {
+		t.Errorf("registry snapshot not refreshed: %+v", stored.Registry)
+	}
+	if !bytes.Contains(stored.Registry.Record, []byte("deprecated")) {
+		t.Errorf("refreshed registry record missing new data: %s", stored.Registry.Record)
+	}
+
+	// --- Updated verdict on re-scan: a different report replaces the findings. ---
+	secondResult := postDepResult(t, api, sha, "pe", 100)
+	if bytes.Equal(firstResult, secondResult) {
+		t.Error("re-scan did not update the stored findings")
+	}
+}
+
 func TestHandleKnown(t *testing.T) {
 	t.Parallel()
 	api := uploadAPI(t)
