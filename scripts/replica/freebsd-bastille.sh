@@ -138,8 +138,19 @@ else
 fi
 
 log "Configuring PostgreSQL for logical replication"
+# Size the memory GUCs from host RAM (a jail shares the host's memory). Keep
+# shared_buffers modest — on ZFS the ARC also caches file data, so a large
+# shared_buffers just double-buffers; effective_cache_size (a planner hint =
+# ARC + shared_buffers) is what makes index scans win. The stock 4GB default
+# badly under-reads a big box and biases the planner toward seq scans.
+_mem_mb=$(( $(sysctl -n hw.physmem) / 1048576 ))
+SB_MB=$(( _mem_mb / 8 ))
+[ "$SB_MB" -gt 16384 ] && SB_MB=16384
+[ "$SB_MB" -lt 128 ] && SB_MB=128
+ECS_MB=$(( _mem_mb * 3 / 5 ))
+log "PG memory sizing: shared_buffers=${SB_MB}MB effective_cache_size=${ECS_MB}MB (host RAM ${_mem_mb}MB)"
 PG_TUNING_TMP="/tmp/hopper-replica-pg.sql"
-doas bastille cmd "$RUN" tee "$PG_TUNING_TMP" >/dev/null <<'SQLEOF'
+doas bastille cmd "$RUN" tee "$PG_TUNING_TMP" >/dev/null <<SQLEOF
 ALTER SYSTEM SET wal_level = 'logical';
 ALTER SYSTEM SET max_replication_slots = '10';
 ALTER SYSTEM SET max_wal_senders = '10';
@@ -147,10 +158,24 @@ ALTER SYSTEM SET max_wal_size = '16GB';
 ALTER SYSTEM SET min_wal_size = '2GB';
 ALTER SYSTEM SET wal_compression = 'zstd';
 ALTER SYSTEM SET checkpoint_completion_target = '0.9';
+ALTER SYSTEM SET checkpoint_timeout = '30min';
 ALTER SYSTEM SET autovacuum_vacuum_scale_factor = '0.01';
 ALTER SYSTEM SET autovacuum_analyze_scale_factor = '0.005';
 ALTER SYSTEM SET random_page_cost = '1.2';
 ALTER SYSTEM SET effective_io_concurrency = '200';
+-- Read-serving + apply tuning for a disposable read replica.
+ALTER SYSTEM SET shared_buffers = '${SB_MB}MB';
+ALTER SYSTEM SET effective_cache_size = '${ECS_MB}MB';
+ALTER SYSTEM SET work_mem = '64MB';
+ALTER SYSTEM SET maintenance_work_mem = '1GB';
+ALTER SYSTEM SET max_parallel_workers_per_gather = '4';
+ALTER SYSTEM SET default_statistics_target = '200';
+-- ZFS is copy-on-write, so torn pages cannot happen: full_page_writes off is
+-- safe here and cuts WAL a lot (faster apply, less I/O competing with reads).
+ALTER SYSTEM SET full_page_writes = 'off';
+-- Disposable replica: do not fsync-wait on commit (faster apply / catch-up).
+-- promote.sh restores synchronous_commit=on when this becomes a primary.
+ALTER SYSTEM SET synchronous_commit = 'off';
 SELECT pg_reload_conf();
 SQLEOF
 doas bastille cmd "$RUN" su -l postgres -c "psql -v ON_ERROR_STOP=1 -f $PG_TUNING_TMP"
@@ -200,6 +225,16 @@ if [ "${ZFS_TUNE:-true}" = "true" ]; then
         PGDATA="$jail_root/var/db/postgres/data${PGVER}" \
             "$SCRIPT_DIR/zfs-tune.sh" apply \
             || log "warning: ZFS tuning failed (continuing)"
+        # NVMe: the ZFS async-read queue default (3) is tuned for spinning
+        # disks; a deeper queue lets concurrent readers + prefetch + apply
+        # reads use the device. Live + persisted (host-wide, idempotent).
+        _ar=$(sysctl -n vfs.zfs.vdev.async_read_max_active 2>/dev/null || echo 0)
+        if [ "${_ar:-0}" -lt 8 ]; then
+            doas sysctl vfs.zfs.vdev.async_read_max_active=8 >/dev/null 2>&1 || true
+        fi
+        if ! grep -q '^vfs.zfs.vdev.async_read_max_active=' /etc/sysctl.conf 2>/dev/null; then
+            printf 'vfs.zfs.vdev.async_read_max_active=8\n' | doas tee -a /etc/sysctl.conf >/dev/null 2>&1 || true
+        fi
     else
         log "warning: could not resolve jail path via jls; apply ZFS tuning on the host by hand:"
         log "         scripts/replica/zfs-tune.sh apply <pool>/<jail pgdata dataset>"

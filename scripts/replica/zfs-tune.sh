@@ -48,6 +48,8 @@ else
 fi
 # shellcheck disable=SC2086 # $ZE is a fixed, script-controlled prefix
 zfs_cmd() { if [ -z "$ZE" ]; then zfs "$@"; else $ZE zfs "$@"; fi; }
+# shellcheck disable=SC2086
+zpool_cmd() { if [ -z "$ZE" ]; then zpool "$@"; else $ZE zpool "$@"; fi; }
 
 command -v zfs >/dev/null 2>&1 || {
     log "no 'zfs' command here — skipping (run on the ZFS host if this is a jail)"
@@ -101,5 +103,14 @@ for ds in $DATASETS; do
     zfs_cmd set "sync=$SYNC" "$ds"       || log "warning: failed to set sync on $ds"
     zfs_cmd set "logbias=$LOGBIAS" "$ds" || log "warning: failed to set logbias on $ds"
 done
+# NVMe-friendly pool default (role-agnostic — safe for a primary too, so no
+# revert): autotrim keeps sustained write performance up on SSD/NVMe.
+if [ "$MODE" = "apply" ]; then
+    _pool=${DATASETS%% *}; _pool=${_pool%%/*}
+    if [ -n "$_pool" ] && [ "$(zpool_cmd get -H -o value autotrim "$_pool" 2>/dev/null)" != "on" ]; then
+        log "enabling autotrim on pool '$_pool' (NVMe/SSD sustained write perf)"
+        zpool_cmd set autotrim=on "$_pool" || log "warning: could not enable autotrim on $_pool"
+    fi
+fi
 # shellcheck disable=SC2086 # intentional word-split of the dataset list
 zfs_cmd get -o name,property,value sync,logbias $DATASETS 2>/dev/null || true

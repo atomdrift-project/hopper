@@ -175,11 +175,18 @@ SQL
     log "sample_locations rows after backfill: $loc_count"
 fi
 
-# --- 6. Revert disposable-replica ZFS tuning ------------------------------
-# A read replica runs sync=disabled (durability traded for throughput); a
-# primary must be durable. Flip it back. Best-effort and a no-op inside a jail
-# (see the manual note below) or on non-ZFS boxes.
-log "Reverting disposable-replica ZFS tuning (this box is becoming a durable primary)"
+# --- 6. Revert disposable-replica tuning ----------------------------------
+# A read replica trades durability for throughput; a primary must be durable.
+# Flip the pieces back. (full_page_writes stays off — it's safe on ZFS even for
+# a primary, since copy-on-write rules out torn pages.)
+log "Restoring synchronous_commit=on (this box is becoming a durable primary)"
+admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+ALTER SYSTEM SET synchronous_commit = on;
+SELECT pg_reload_conf();
+SQL
+# ZFS: sync=disabled -> standard. Best-effort and a no-op inside a jail (see the
+# manual note below) or on non-ZFS boxes.
+log "Reverting disposable-replica ZFS tuning"
 PGDATA=$(admin -tAc 'SHOW data_directory' 2>/dev/null | tr -d '[:space:]') \
     "$SCRIPT_DIR/zfs-tune.sh" revert \
     || log "warning: could not revert ZFS tuning — do it by hand: zfs set sync=standard <pgdata dataset>"

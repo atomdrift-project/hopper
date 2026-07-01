@@ -122,15 +122,23 @@ scripts/replica/zfs-tune.sh apply  zroot/bastille/jails/<jail>/pgdata
 # promote.sh prints the matching revert (sync=standard) for the host to run.
 ```
 
-**PostgreSQL restart-only knobs — still manual.** These need a restart (and
-`shared_buffers`/`fsync` would be wrong to force on every replica), so apply by
-hand on a disposable replica before a big rebuild and restart postgres:
+**PostgreSQL read/apply tuning — now deploy defaults.** `freebsd-bastille.sh`
+sets these in its tuning block (they take effect on the restart it already
+does), sized from host RAM: `shared_buffers` (~RAM/8, capped 16 GB),
+`effective_cache_size` (~60% RAM — the stock 4 GB default badly biases the
+planner toward seq scans), `work_mem=64MB`, `max_parallel_workers_per_gather=4`,
+`checkpoint_timeout=30min`, `default_statistics_target=200`,
+`full_page_writes=off` (ZFS CoW → no torn pages, safe), and
+`synchronous_commit=off` (`promote.sh` restores it to `on`). `autotrim=on` and a
+deeper `vfs.zfs.vdev.async_read_max_active` are applied host-side too.
+
+**Still manual (most aggressive):** `fsync=off` trades a crash into a full
+rebuild — only worth it during a big rebuild, and `sync=disabled` at the ZFS
+layer already covers most of the win, so it's left off by default:
 
 ```sh
-ALTER SYSTEM SET fsync = off;              -- rebuild-on-crash; ZFS sync=disabled also covers this
-ALTER SYSTEM SET full_page_writes = off;   -- SAFE to keep off permanently on ZFS (CoW, no torn pages)
-ALTER SYSTEM SET shared_buffers = '8GB';   -- vs a tiny default
-sysctl vfs.zfs.arc.max=<~half RAM>         -- (FreeBSD) leave room for shared_buffers + index builds
+ALTER SYSTEM SET fsync = off;       -- then restart; revert to on for anything you must keep
+sysctl vfs.zfs.arc.max=<~half RAM>  -- (FreeBSD) cap ARC to leave room for index builds during a rebuild
 ```
 
 Wire compression is **not** available (PostgreSQL 18's libpq has no
