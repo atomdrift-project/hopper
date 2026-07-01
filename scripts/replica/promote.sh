@@ -28,6 +28,7 @@ OFFLINE_PROMOTE="${OFFLINE_PROMOTE:-0}"
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 # Admin probe — same ladder as setup-replica.sh so this works cleanly on
 # CachyOS (doas), FreeBSD (doas or sudo), Debian (sudo), or a box where
@@ -174,12 +175,27 @@ SQL
     log "sample_locations rows after backfill: $loc_count"
 fi
 
-# --- 6. Manual steps left ------------------------------------------------
+# --- 6. Revert disposable-replica ZFS tuning ------------------------------
+# A read replica runs sync=disabled (durability traded for throughput); a
+# primary must be durable. Flip it back. Best-effort and a no-op inside a jail
+# (see the manual note below) or on non-ZFS boxes.
+log "Reverting disposable-replica ZFS tuning (this box is becoming a durable primary)"
+PGDATA=$(admin -tAc 'SHOW data_directory' 2>/dev/null | tr -d '[:space:]') \
+    "$SCRIPT_DIR/zfs-tune.sh" revert \
+    || log "warning: could not revert ZFS tuning — do it by hand: zfs set sync=standard <pgdata dataset>"
+
+# --- 7. Manual steps left ------------------------------------------------
 cat <<EOF
 
 ==> Database side of promotion complete.
 
 What's left (manual):
+
+  0. If this replica is a Bastille jail, revert the pool's durability tuning
+     ON THE HOST (a jail can't set host ZFS props):
+       zfs set sync=standard logbias=latency <pool>/<pgdata dataset>
+     (and, if you had set them for a disposable replica, restore fsync=on /
+     full_page_writes accordingly, then restart postgres).
 
   1. /etc/hosts on every machine that writes 'hopper':
      point 'hopper' at THIS host's IP (was: $REMOTE_HOST's IP).

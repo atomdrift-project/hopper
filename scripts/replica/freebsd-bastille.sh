@@ -30,6 +30,10 @@ PUBLICATION="${PUBLICATION:-hopper_replica}"
 COPY_DATA="${COPY_DATA:-true}"
 PGPASS="${PGPASSFILE:-$HOME/.pgpass}"
 PGPASS_MODE="${PGPASS_MODE:-preserve}"
+# REBUILD=true drives a destructive full re-copy inside the jail (for a wedged
+# replica whose slot was invalidated — setup.sh alone can't resume a lost slot).
+# Default is the idempotent setup path.
+REBUILD="${REBUILD:-false}"
 
 # Subscription/slot name: do NOT derive it from the jail name — that produced
 # cryptic, inconsistent names like 'hopper_replic'. Leave it empty so the
@@ -39,6 +43,7 @@ SUBSCRIPTION="${SUBSCRIPTION:-}"
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 validate_ident() {
     case "$2" in
@@ -51,6 +56,7 @@ validate_ident() {
 validate_ident PUBLICATION "$PUBLICATION"
 [ -n "$SUBSCRIPTION" ] && validate_ident SUBSCRIPTION "$SUBSCRIPTION"
 case "$COPY_DATA" in true|false) ;; *) die "COPY_DATA must be true or false" ;; esac
+case "$REBUILD" in true|false) ;; *) die "REBUILD must be true or false" ;; esac
 case "$PGPASS_MODE" in preserve|replace) ;; *) die "PGPASS_MODE must be preserve or replace" ;; esac
 [ -f "$PGPASS" ] || die "$PGPASS not found; add the $REMOTE_HOST credentials first"
 
@@ -183,20 +189,54 @@ doas bastille sysrc "$RUN" cron_enable=YES >/dev/null
 doas bastille cmd "$RUN" service cron status >/dev/null 2>&1 \
     || doas bastille service "$RUN" cron start || true
 
-log "Running replica setup inside jail"
-# Pass SUBSCRIPTION only when explicitly set; otherwise let the in-jail setup.sh
+# Disposable read-replica ZFS tuning — done HERE, on the host, because the jail
+# can't set its own dataset's props (the pool lives on the host). setup.sh's
+# in-jail ZFS step is a no-op, so we pass ZFS_TUNE=false below and apply it here
+# instead. promote.sh reverts it. ZFS_TUNE=false (env) skips both.
+if [ "${ZFS_TUNE:-true}" = "true" ]; then
+    jail_root=$(doas jls -j "$RUN" path 2>/dev/null || true)
+    if [ -n "$jail_root" ]; then
+        log "Applying disposable read-replica ZFS tuning on host for jail '$RUN'"
+        PGDATA="$jail_root/var/db/postgres/data${PGVER}" \
+            "$SCRIPT_DIR/zfs-tune.sh" apply \
+            || log "warning: ZFS tuning failed (continuing)"
+    else
+        log "warning: could not resolve jail path via jls; apply ZFS tuning on the host by hand:"
+        log "         scripts/replica/zfs-tune.sh apply <pool>/<jail pgdata dataset>"
+    fi
+fi
+
+# REBUILD=true → destructive full re-copy (rebuild.sh); else idempotent setup.
+jail_target="replica"
+force_env=""
+if [ "$REBUILD" = "true" ]; then
+    jail_target="rebuild-replica"
+    force_env="FORCE='true' "
+    log "Running replica REBUILD inside jail (destructive full re-copy)"
+else
+    log "Running replica setup inside jail"
+fi
+# Pass SUBSCRIPTION only when explicitly set; otherwise let the in-jail scripts
 # derive the canonical hopper_replica_<hostname>.
 sub_env=""
 [ -n "$SUBSCRIPTION" ] && sub_env="SUBSCRIPTION='$SUBSCRIPTION' "
+# Forward fast-sync knobs (bulkload.sh) when the operator set them, e.g.
+# BULK_MAINT_MEM=8GB on a big-RAM jail. ZFS_TUNE=false: the host handled ZFS.
+bulk_env=""
+for _v in FAST_SYNC BULK_MAINT_MEM BULK_MAX_PARALLEL_MAINT BULK_MAX_WAL BULK_POLL_SECS; do
+    eval "_val=\${$_v:-}"
+    [ -n "$_val" ] && bulk_env="$bulk_env $_v='$_val'"
+done
 doas bastille cmd "$RUN" su -l postgres -c "
     cd /var/db/postgres/hopper &&
     REMOTE_HOST='$REMOTE_HOST' \
     REMOTE_USER='$REMOTE_USER' \
     REMOTE_DB='$REMOTE_DB' \
     PUBLICATION='$PUBLICATION' \
-    ${sub_env}COPY_DATA='$COPY_DATA' \
+    ${sub_env}${force_env}COPY_DATA='$COPY_DATA' \
+    ZFS_TUNE='false'${bulk_env} \
     PGPASSFILE=/var/db/postgres/.pgpass \
-    gmake replica
+    gmake $jail_target
 "
 
 log "Replica deployment complete"

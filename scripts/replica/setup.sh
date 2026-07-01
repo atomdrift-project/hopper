@@ -229,6 +229,23 @@ maint_off() { [ -n "${HEAL_DIR:-}" ] && pg_sh "rm -f '$HEAL_DIR/maintenance'" 2>
 trap 'maint_off' EXIT
 maint_on
 
+# Fast-sync helpers: defer secondary-index maintenance during the initial COPY
+# and rebuild in bulk afterwards (the single biggest lever for large, heavily
+# indexed tables). Sourced here so admin()/pg_sh()/log()/HEAL_DIR are defined.
+. "$SCRIPT_DIR/bulkload.sh"
+
+# Disposable read-replica ZFS tuning (sync=disabled, logbias=throughput). A
+# replica is read-only and rebuildable, so trade crash durability for write
+# throughput — a big win for the bulk copy and steady apply. Default on; set
+# ZFS_TUNE=false to skip. promote.sh reverts this when a replica becomes a
+# durable primary. Best-effort: a no-op inside a Bastille jail (tune the pool
+# from the host) and on non-ZFS boxes.
+if [ "${ZFS_TUNE:-true}" = "true" ]; then
+    PGDATA=$(admin -tAc 'SHOW data_directory' 2>/dev/null | tr -d '[:space:]') \
+        "$SCRIPT_DIR/zfs-tune.sh" apply \
+        || log "warning: ZFS tuning step failed (continuing)"
+fi
+
 # Apply-worker resilience: the 1-minute default wal_receiver_timeout tears down
 # (and restarts from the slot's restart_lsn) any stream whose publisher-side
 # decode is slow — e.g. while catching up a large backlog. That turns a slow
@@ -381,6 +398,39 @@ CONN="host=$REMOTE_HOST dbname=$REMOTE_DB user=$REMOTE_USER password=$REMOTE_PW"
 sub_exists=$(admin -d "$LOCAL_DB" -tAc \
     "SELECT 1 FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" | tr -d '[:space:]')
 
+# --- fast-sync: defer secondary-index maintenance during the copy ----------
+# Drop each to-be-copied table's non-PK indexes before tablesync so the COPY
+# runs index-light; they're rebuilt in bulk after (see bulkload.sh). The set
+# that will actually be (re)copied = publication tables not already 'ready'
+# locally: a fresh/rebuilt subscription has none ready (all copy); a refresh
+# copies only newly-added tables. Best-effort — a hiccup here must not abort
+# setup, it just means a slower (indexed) copy.
+BULK_DEFERRED=''
+if [ "$FAST_SYNC" = "true" ] && [ "$COPY_DATA" = "true" ]; then
+    pub_tables=$(psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" -tAc \
+        "SELECT tablename FROM pg_publication_tables
+          WHERE pubname = '$PUBLICATION' AND schemaname = 'public'" 2>/dev/null)
+    to_copy=''
+    for t in $pub_tables; do
+        ready=''
+        if [ "$sub_exists" = "1" ]; then
+            ready=$(admin -d "$LOCAL_DB" -tAc \
+                "SELECT 1 FROM pg_subscription_rel r
+                   JOIN pg_subscription s ON s.oid = r.srsubid
+                   JOIN pg_class c ON c.oid = r.srrelid
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                  WHERE s.subname = '$SUBSCRIPTION' AND n.nspname = 'public'
+                    AND c.relname = '$t' AND r.srsubstate = 'r'" | tr -d '[:space:]')
+        fi
+        [ "$ready" = "1" ] || to_copy="$to_copy $t"
+    done
+    if [ -n "$to_copy" ]; then
+        # shellcheck disable=SC2086 # intentional word-split of the table list
+        bulkload_defer $to_copy \
+            || log "warning: fast-sync defer incomplete; copy proceeds with remaining indexes"
+    fi
+fi
+
 if [ "$sub_exists" = "1" ]; then
     current_slot=$(admin -d "$LOCAL_DB" -tAc \
         "SELECT COALESCE(subslotname, '') FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" \
@@ -506,6 +556,19 @@ LOCAL_DB="$LOCAL_DB" PUBLICATION="$PUBLICATION" SUBSCRIPTION="$SUBSCRIPTION" \
 PGPASSFILE="${PG_PGPASS:-$PGPASS}" \
     "$SCRIPT_DIR/install-heal.sh" \
     || log "warning: self-heal schedule not installed — run scripts/replica/install-heal.sh manually"
+
+# --- fast-sync: finish the deferred-index copy -----------------------------
+# Block until tablesync completes, rebuilding each table's indexes as it
+# finishes (so a smaller table's indexes build while a bigger one still
+# copies), then restore the bulk GUCs. No-op when nothing was deferred, which
+# preserves this script's fast async return on steady-state reconciles. The
+# healer stays paused throughout (the maintenance flag is held until EXIT).
+if [ -n "${BULK_DEFERRED:-}" ]; then
+    log "Watch from another shell: make diagnose-replica SUBSCRIPTION=$SUBSCRIPTION"
+    # shellcheck disable=SC2086 # intentional word-split of the table list
+    bulkload_finish $BULK_DEFERRED \
+        || log "warning: fast-sync did not finish cleanly — check messages above and $( { [ -n "${HEAL_DIR:-}" ] && printf '%s/bulkload' "$HEAL_DIR"; } || printf 'the bulkload state dir')"
+fi
 
 log "Done. Re-run anytime — this script is idempotent."
 # psql's built-in \watch works on FreeBSD and Linux alike; GNU watch(1) does
