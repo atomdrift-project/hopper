@@ -15,7 +15,10 @@
 #                                    (default: postgres://hopper@hopper-db/hopper?sslmode=disable)
 #   SOURCE    --source tag           (default: forager)
 #   DASH_ADDR --dashboard-addr       (default: 0.0.0.0:8081)
-#   WORKERS   --workers              (default: 48; set 0 for hopper's auto-pick)
+#   WORKERS   --workers              (default: 40; set 0 for hopper's auto-pick)
+#   MAX_MEMORY_GB  --max-memory-gb    litmus RSS cap in GB, forwarded as
+#                 --max-rss-gb (default: 48; 0 = litmus self-throttle,
+#                 -1 = disable in-process throttling)
 #   PULL_DISABLE  set to 1 to skip the git pull of ../scan and ../cleave and
 #                 build the current checkouts as-is (e.g. when the remote is down)
 
@@ -30,7 +33,8 @@ SAMPLES_GROUP="${SAMPLES_GROUP:-samples}"
 DB="${DB:-postgres://hopper@hopper-db/hopper?sslmode=disable}"
 SOURCE="${SOURCE:-forager}"
 DASH_ADDR="${DASH_ADDR:-0.0.0.0:8081}"
-WORKERS="${WORKERS:-48}"
+WORKERS="${WORKERS:-40}"
+MAX_MEMORY_GB="${MAX_MEMORY_GB:-48}"
 PULL_DISABLE="${PULL_DISABLE:-0}"
 
 readonly SERVICE_USER=hopper
@@ -302,6 +306,12 @@ TMP_FILES+=("$tmp_unit")
 workers_arg=""
 (( WORKERS > 0 )) && workers_arg=" --workers ${WORKERS}"
 
+# --max-memory-gb caps the litmus worker's RSS (forwarded as --max-rss-gb).
+# Emitted for any non-zero value so the -1 "disable throttling" sentinel still
+# passes through; 0 leaves it to litmus's own self-throttling.
+max_mem_arg=""
+(( MAX_MEMORY_GB != 0 )) && max_mem_arg=" --max-memory-gb ${MAX_MEMORY_GB}"
+
 cat >"$tmp_unit" <<EOF
 [Unit]
 Description=Hopper sample ingester (spawns Atomdrift Scan workers)
@@ -332,7 +342,7 @@ CacheDirectory=${SERVICE_NAME}
 CacheDirectoryMode=0750
 
 WorkingDirectory=%S/${SERVICE_NAME}
-ExecStart=${BIN_PATH} load --data ${DATA_DIR} --db ${DB} --source ${SOURCE} --dashboard-addr ${DASH_ADDR} --litmus ${SCAN_BIN} --cleave ${CLEAVE_BIN} --prune-missing-paths${workers_arg}
+ExecStart=${BIN_PATH} load --data ${DATA_DIR} --db ${DB} --source ${SOURCE} --dashboard-addr ${DASH_ADDR} --litmus ${SCAN_BIN} --cleave ${CLEAVE_BIN} --prune-missing-paths${workers_arg}${max_mem_arg}
 Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=60s
