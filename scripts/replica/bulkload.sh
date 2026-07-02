@@ -82,7 +82,7 @@ _bulk_valid_table() {
 _bulk_dump_reindex() {
     _bt="$1"; _bf="$2"
     admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
-\copy (SELECT stmt FROM (SELECT pg_get_indexdef(i.indexrelid)||';' AS stmt, 1 AS ord, pg_relation_size(i.indexrelid) AS sz FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname='public' AND t.relname='$_bt' AND NOT i.indisprimary UNION ALL SELECT 'ALTER TABLE public.'||quote_ident(t.relname)||' ADD CONSTRAINT '||quote_ident(c.relname)||' UNIQUE USING INDEX '||quote_ident(c.relname)||';', 2, 0 FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_constraint k ON k.conindid=i.indexrelid AND k.contype='u' WHERE n.nspname='public' AND t.relname='$_bt') q ORDER BY ord, sz DESC) TO '$_bf'
+\copy (SELECT stmt FROM (SELECT regexp_replace(pg_get_indexdef(i.indexrelid), '^CREATE (UNIQUE )?INDEX ', 'CREATE \1INDEX IF NOT EXISTS ')||';' AS stmt, 1 AS ord, pg_relation_size(i.indexrelid) AS sz FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname='public' AND t.relname='$_bt' AND NOT i.indisprimary UNION ALL SELECT 'DO \$do\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='||quote_literal('public.'||t.relname)||'::regclass AND conname='||quote_literal(c.relname)||') THEN ALTER TABLE public.'||quote_ident(t.relname)||' ADD CONSTRAINT '||quote_ident(c.relname)||' UNIQUE USING INDEX '||quote_ident(c.relname)||'; END IF; END \$do\$;', 2, 0 FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_constraint k ON k.conindid=i.indexrelid AND k.contype='u' WHERE n.nspname='public' AND t.relname='$_bt') q ORDER BY ord, sz DESC) TO '$_bf'
 SQL
 }
 
@@ -104,11 +104,20 @@ BEGIN
           LEFT JOIN pg_constraint k ON k.conindid = i.indexrelid AND k.contype IN ('u','x')
          WHERE n.nspname = 'public' AND t.relname = '$_bt' AND NOT i.indisprimary
     LOOP
-        IF r.con IS NOT NULL THEN
-            EXECUTE format('ALTER TABLE public.%I DROP CONSTRAINT %I', '$_bt', r.con);
-        ELSE
-            EXECUTE format('DROP INDEX IF EXISTS public.%I', r.idx);
-        END IF;
+        -- Drop each index in its own subtransaction so one failure doesn't
+        -- roll back the whole batch. Notably a UNIQUE constraint that a foreign
+        -- key depends on (e.g. samples_sha256_key, referenced by
+        -- sample_locations) can't be dropped — catch it, keep that one index,
+        -- and still drop all the others (the bulk of the copy-cost win).
+        BEGIN
+            IF r.con IS NOT NULL THEN
+                EXECUTE format('ALTER TABLE public.%I DROP CONSTRAINT %I', '$_bt', r.con);
+            ELSE
+                EXECUTE format('DROP INDEX IF EXISTS public.%I', r.idx);
+            END IF;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'bulkload: keeping %.% (could not drop: %)', '$_bt', coalesce(r.con, r.idx), SQLERRM;
+        END;
     END LOOP;
 END
 \$bulk\$;
