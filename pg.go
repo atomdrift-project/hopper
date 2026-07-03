@@ -2040,31 +2040,21 @@ func (db *DB) samplesBySHAsPG(ctx context.Context, shas []string) ([]*Sample, er
 	return scanPGSamples(rows)
 }
 
-// membersWithSamplesByParentPG hydrates the archive's top-N edge members plus
-// the linked SHAs (and, only when the parent has no edges, the envelope
-// fallback) in one query. The topn CTE selects only sha256 and sorts on the
-// light score columns, so the heavy cleave/litmus blobs detoast for just the
-// rows the outer SELECT returns. ANY($n) over an empty array matches nothing.
-func (db *DB) membersWithSamplesByParentPG(ctx context.Context, parentSHA string, limit int, linkedSHAs, fallbackSHAs []string) ([]*Sample, error) {
+// topMemberSHAsByParentPG returns up to limit member SHAs of parentSHA ranked
+// by score. It reads only sha256 off idx_sl_parent_child's edge and the PK
+// join to samples, so nothing heavy detoasts here.
+func (db *DB) topMemberSHAsByParentPG(ctx context.Context, parentSHA string, limit int) ([]string, error) {
 	rows, err := db.pool.Query(ctx, `
-		WITH topn AS (
-			SELECT s.sha256
-			  FROM sample_locations sl
-			  JOIN samples s ON s.sha256 = sl.sha256
-			 WHERE sl.parent_sha256 = $1
-			 ORDER BY s.score DESC, s.max_crit DESC, sl.path
-			 LIMIT $2
-		)
-		SELECT `+pgSampleCols+`
-		  FROM samples s
-		 WHERE s.sha256 IN (SELECT sha256 FROM topn)
-		    OR s.sha256 = ANY($3::text[])
-		    OR (NOT EXISTS (SELECT 1 FROM topn) AND s.sha256 = ANY($4::text[]))`,
-		parentSHA, limit, linkedSHAs, fallbackSHAs)
+		SELECT s.sha256
+		  FROM sample_locations sl
+		  JOIN samples s ON s.sha256 = sl.sha256
+		 WHERE sl.parent_sha256 = $1
+		 ORDER BY s.score DESC, s.max_crit DESC, sl.path
+		 LIMIT $2`, parentSHA, limit)
 	if err != nil {
-		return nil, fmt.Errorf("hopper: members with samples by parent %s: %w", parentSHA, err)
+		return nil, fmt.Errorf("hopper: top member shas by parent %s: %w", parentSHA, err)
 	}
-	return scanPGSamples(rows)
+	return scanPGStrings(rows)
 }
 
 // parentArchivesForChildPG resolves a child sha to its parent archives in one

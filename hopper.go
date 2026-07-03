@@ -1995,26 +1995,48 @@ func (db *DB) BadMembersByParent(ctx context.Context, parentSHA string) ([]*Samp
 	return db.badMembersByParentSQLite(ctx, parentSHA)
 }
 
-// MembersWithSamplesByParent hydrates an archive's members in a single
-// round-trip — collapsing the former MembersByParent→SamplesBySHAs pair on the
-// page-load path. It returns full sample rows for the union of:
-//   - the top-`limit` members ranked by score (resolved through the
-//     sample_locations edge), and
-//   - linkedSHAs: members a container-level finding draws from, always included
-//     regardless of their standalone score.
+// MembersWithSamplesByParent hydrates an archive's members: the top-`limit`
+// members ranked by score (resolved through the sample_locations edge), plus
+// linkedSHAs (members a container-level finding draws from, always included
+// regardless of their standalone score), plus fallbackSHAs but only when the
+// parent has no sample_locations edges at all (an un-backfilled archive).
+// Order is unspecified; callers index the result by SHA.
 //
-// fallbackSHAs hydrate instead only when the parent has no sample_locations
-// edges at all (an un-backfilled archive) — folded into the same query via a
-// NOT EXISTS guard so an archive page is always exactly two queries (parent +
-// this), never three. Order is unspecified; callers index the result by SHA.
+// It runs two deterministic, index-driven queries rather than one clever join:
+// topMemberSHAsByParent resolves the SHA set off the indexed sample_locations
+// edge (reading only sha256), then SamplesBySHAs loads the full rows via
+// `sha256 = ANY(...)`, which is always a primary-key scan. The earlier
+// single-query form OR-ed these three SHA sets in the WHERE, which let the
+// planner seq-scan the whole (~5M-row) samples table to find ~25 rows — the
+// archive detail page's 30–60s timeout. Two indexed lookups cost one extra
+// round-trip and can never degrade to a scan.
 func (db *DB) MembersWithSamplesByParent(ctx context.Context, parentSHA string, limit int, linkedSHAs, fallbackSHAs []string) ([]*Sample, error) {
 	if parentSHA == "" || limit <= 0 {
 		return nil, nil
 	}
-	if db.pool != nil {
-		return db.membersWithSamplesByParentPG(ctx, parentSHA, limit, linkedSHAs, fallbackSHAs)
+	topn, err := db.topMemberSHAsByParent(ctx, parentSHA, limit)
+	if err != nil {
+		return nil, err
 	}
-	return db.membersWithSamplesByParentSQLite(ctx, parentSHA, limit, linkedSHAs, fallbackSHAs)
+	wanted := make([]string, 0, len(topn)+len(linkedSHAs)+len(fallbackSHAs))
+	wanted = append(wanted, topn...)
+	wanted = append(wanted, linkedSHAs...)
+	// The envelope fallback hydrates only when the parent has no edges yet.
+	if len(topn) == 0 {
+		wanted = append(wanted, fallbackSHAs...)
+	}
+	return db.SamplesBySHAs(ctx, wanted)
+}
+
+// topMemberSHAsByParent returns up to limit member SHAs of parentSHA, ranked by
+// score (then max_crit, then path). It reads only sha256 off the indexed
+// sample_locations→samples edge, so no heavy cleave/litmus blob detoasts here;
+// SamplesBySHAs loads those for just the wanted set.
+func (db *DB) topMemberSHAsByParent(ctx context.Context, parentSHA string, limit int) ([]string, error) {
+	if db.pool != nil {
+		return db.topMemberSHAsByParentPG(ctx, parentSHA, limit)
+	}
+	return db.topMemberSHAsByParentSQLite(ctx, parentSHA, limit)
 }
 
 // ParentRef identifies one archive a child sha was extracted from, carrying just

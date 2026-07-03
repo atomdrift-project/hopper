@@ -1278,36 +1278,19 @@ func (db *DB) samplesBySHAsSQLite(ctx context.Context, shas []string) ([]*Sample
 	return scanLiteSamples(rows)
 }
 
-// membersWithSamplesByParentSQLite mirrors membersWithSamplesByParentPG. SQLite
-// has no array binding, so the linked/fallback sets become IN placeholder lists
-// (an empty set collapses to the constant-false `0`). Argument order follows the
-// `?` order in the SQL text: parentSHA, limit, then linked, then fallback.
-func (db *DB) membersWithSamplesByParentSQLite(
-	ctx context.Context, parentSHA string, limit int, linkedSHAs, fallbackSHAs []string,
-) ([]*Sample, error) {
-	args := []any{parentSHA, limit}
-	linkedClause, args := sqliteInClause("s.sha256", linkedSHAs, args)
-	fallbackClause, args := sqliteInClause("s.sha256", fallbackSHAs, args)
-	//nolint:gosec // G202: clauses are constant-false or '?' placeholder lists; sha values are bound via args.
-	q := `
-		WITH topn AS (
-			SELECT s.sha256 AS sha256
-			  FROM sample_locations sl
-			  JOIN samples s ON s.sha256 = sl.sha256
-			 WHERE sl.parent_sha256 = ?
-			 ORDER BY s.score DESC, s.max_crit DESC, sl.path
-			 LIMIT ?
-		)
-		SELECT ` + liteSampleCols + `
-		  FROM samples s
-		 WHERE s.sha256 IN (SELECT sha256 FROM topn)
-		    OR ` + linkedClause + `
-		    OR (NOT EXISTS (SELECT 1 FROM topn) AND ` + fallbackClause + `)`
-	rows, err := db.lite.QueryContext(ctx, q, args...)
+// topMemberSHAsByParentSQLite mirrors topMemberSHAsByParentPG.
+func (db *DB) topMemberSHAsByParentSQLite(ctx context.Context, parentSHA string, limit int) ([]string, error) {
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT s.sha256
+		  FROM sample_locations sl
+		  JOIN samples s ON s.sha256 = sl.sha256
+		 WHERE sl.parent_sha256 = ?
+		 ORDER BY s.score DESC, s.max_crit DESC, sl.path
+		 LIMIT ?`, parentSHA, limit)
 	if err != nil {
-		return nil, fmt.Errorf("hopper: members with samples by parent %s: %w", parentSHA, err)
+		return nil, fmt.Errorf("hopper: top member shas by parent %s: %w", parentSHA, err)
 	}
-	return scanLiteSamples(rows)
+	return scanLiteStrings(rows)
 }
 
 // parentArchivesForChildSQLite mirrors parentArchivesForChildPG. SQLite has no
@@ -1346,21 +1329,6 @@ func (db *DB) parentArchivesForChildSQLite(ctx context.Context, childSHA string,
 		out = append(out, p)
 	}
 	return out, rows.Err()
-}
-
-// sqliteInClause builds an `expr IN (?,?,…)` fragment and appends the values to
-// args. An empty set yields the constant-false `0` so the caller's surrounding
-// OR stays valid without a binding.
-func sqliteInClause(expr string, vals []string, args []any) (clause string, out []any) {
-	if len(vals) == 0 {
-		return "0", args
-	}
-	ph := make([]string, len(vals))
-	for i, v := range vals {
-		ph[i] = "?"
-		args = append(args, v)
-	}
-	return expr + " IN (" + strings.Join(ph, ",") + ")", args
 }
 
 func (db *DB) badMembersByParentSQLite(ctx context.Context, parentSHA string) ([]*Sample, error) {
