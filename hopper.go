@@ -50,14 +50,28 @@ const maxArchiveMembers = 100_000
 // when deriving criticality from a v6 litmus envelope's `ml.l`. `l <= CriticalLevel`
 // is hostile (fires at or below our critical line); `l > CriticalLevel` is
 // suspicious (fired only at noisier operating points); `-1` is benign; `null`
-// (manual-mode hostile) is hostile. Mirrors DefaultSeverityLevel in collimator,
-// litmus, autocollie, prism, and promoter — see
-// collimator/src/collimator/thresholds/__init__.py for the cross-repo group.
+// (manual-mode hostile) is hostile.
 //
-// It is the default for feed queries that don't pin their own cutoff via
-// [FeedQuery.CriticalLevel]; callers should pin it so a future divergence in
-// any one repo can't silently desync the class derivation.
-const CriticalLevel = 4
+// L50 is our standard operating level — the level the model is currently
+// deployed and calibrated at (scan's DEFAULT_SEVERITY_LEVEL). We may tighten it
+// in the future, so it lives in this single constant. The level is
+// consumer-owned: this is only hopper's *default*, and any caller can override
+// it per-query via [FeedQuery.CriticalLevel] (as scan's users do with `-l`),
+// which the derivation honors.
+const CriticalLevel = 50
+
+// SuspiciousCeiling is the loosest fired-level (FP per 100M benigns) that still
+// reads as suspicious. A firing at or below CriticalLevel is hostile; above
+// CriticalLevel and up to (and including) SuspiciousCeiling is suspicious;
+// anything looser is treated as benign informational noise rather than a
+// suspicious verdict.
+//
+// Set to L100 — the precision elbow from the fired-level analysis: L250 and
+// looser add more false positives than true positives (L100 fires at ~91%
+// precision vs good, L250 at ~31%), so capping here drops the loose tail to
+// benign. Mirrors scan's SUSPICIOUS_LEVEL_CEILING and promoter/prism's
+// SuspiciousCeiling; keep the cross-repo group in sync.
+const SuspiciousCeiling = 100
 
 // Pool labels, ordered by precedence: bad > good > unknown.
 const (
@@ -3336,13 +3350,15 @@ func (q *FeedQuery) requireLitmus() bool {
 // as a literal — the same approach as workflowSamplesPG — rather than a bound
 // parameter: a conditionally-referenced parameter would dangle untyped when the
 // column path is taken instead, which Postgres rejects (SQLSTATE 42P18). The
-// inline form is identical to the trigger's and to workflowSamplesPG's; keep all
-// three in sync.
+// inline form is identical to the trigger's, workflowSamplesPG's, and
+// backfillLitmusClassPG's — including the SuspiciousCeiling cap above which a
+// firing reads benign; keep all four in sync.
 func (q *FeedQuery) feedClassExpr() string {
 	if q.criticalLevel() == CriticalLevel {
 		return "litmus_class"
 	}
 	cutoff := strconv.Itoa(q.criticalLevel())
+	ceiling := strconv.Itoa(SuspiciousCeiling)
 	return `COALESCE(
 				(litmus_result->>'class')::int,
 				CASE
@@ -3350,7 +3366,8 @@ func (q *FeedQuery) feedClassExpr() string {
 					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l') IS NULL THEN 2
 					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int < 0 THEN 0
 					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= ` + cutoff + ` THEN 2
-					ELSE 1
+					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= ` + ceiling + ` THEN 1
+					ELSE 0
 				END)`
 }
 

@@ -570,11 +570,12 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 					WHEN COALESCE(NEW.litmus_result->>'lvl', NEW.litmus_result->>'l') IS NULL THEN 2
 					WHEN COALESCE(NEW.litmus_result->>'lvl', NEW.litmus_result->>'l')::int < 0 THEN 0
 					WHEN COALESCE(NEW.litmus_result->>'lvl', NEW.litmus_result->>'l')::int <= %d THEN 2
-					ELSE 1
+					WHEN COALESCE(NEW.litmus_result->>'lvl', NEW.litmus_result->>'l')::int <= %d THEN 1
+					ELSE 0
 				END);
 			RETURN NEW;
 		END;
-		$$`, CriticalLevel),
+		$$`, CriticalLevel, SuspiciousCeiling),
 		`CREATE OR REPLACE TRIGGER samples_derive_litmus_score_trg
 			BEFORE INSERT OR UPDATE OF litmus_result ON samples
 			FOR EACH ROW EXECUTE FUNCTION samples_derive_litmus_score()`,
@@ -1356,10 +1357,11 @@ func (db *DB) workflowSamplesPG(ctx context.Context, where string, limit int) ([
 					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l') IS NULL THEN 2
 					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int < 0 THEN 0
 					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= %d THEN 2
-					ELSE 1
+					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= %d THEN 1
+					ELSE 0
 				END
 			)
-		FROM samples `+where, CriticalLevel, CriticalLevel), limit)
+		FROM samples `+where, CriticalLevel, CriticalLevel, SuspiciousCeiling), limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: workflow samples: %w", err)
 	}
@@ -3726,13 +3728,14 @@ func (db *DB) backfillLitmusClassPG(ctx context.Context, limit int) (int64, erro
 					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l') IS NULL THEN 2
 					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int < 0 THEN 0
 					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= %d THEN 2
-					ELSE 1
+					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= %d THEN 1
+					ELSE 0
 				END)
 			WHERE sha256 IN (
 				SELECT sha256 FROM samples
 				WHERE litmus_result IS NOT NULL AND litmus_class IS NULL
 				LIMIT $1
-			)`, CriticalLevel), limit)
+			)`, CriticalLevel, SuspiciousCeiling), limit)
 		if err != nil {
 			return total, fmt.Errorf("hopper: backfill litmus_class: %w", err)
 		}

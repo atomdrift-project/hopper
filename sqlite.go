@@ -638,10 +638,11 @@ func (db *DB) workflowSamplesSQLite(ctx context.Context, where string, limit int
 					WHEN COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) IS NULL THEN 2
 					WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) < 0 THEN 0
 					WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) <= %d THEN 2
-					ELSE 1
+					WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) <= %d THEN 1
+					ELSE 0
 				END
 			)
-		FROM samples `+where, CriticalLevel, CriticalLevel), limit)
+		FROM samples `+where, CriticalLevel, CriticalLevel, SuspiciousCeiling), limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: workflow samples: %w", err)
 	}
@@ -3503,10 +3504,12 @@ func (q *FeedQuery) whereSQLite() (where string, args []any) {
 		}
 		// Match either schema: legacy `class` field, or v6 `l`-derived. Mirror
 		// prism's envelopeClass / the scan query above: class first; else derive
-		// from l using the cutoff `?` (null is manual-mode hostile/2; -1 benign/0;
-		// 0..=cutoff hostile/2; above cutoff suspicious/1). The cutoff `?` precedes
-		// the IN(...) placeholders in the SQL, so its arg is appended first.
-		args = append(args, q.criticalLevel())
+		// from l using the cutoff `?` and the SuspiciousCeiling `?` (null is
+		// manual-mode hostile/2; -1 benign/0; 0..=cutoff hostile/2; cutoff <
+		// l <= ceiling suspicious/1; looser is benign/0). The two `?` precede
+		// the IN(...) placeholders in the SQL, so their args are appended first,
+		// cutoff then ceiling.
+		args = append(args, q.criticalLevel(), SuspiciousCeiling)
 		for i := range q.LitmusClasses {
 			args = append(args, q.LitmusClasses[i])
 		}
@@ -3516,7 +3519,8 @@ func (q *FeedQuery) whereSQLite() (where string, args []any) {
 				"WHEN COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) IS NULL THEN 2 "+
 				"WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) < 0 THEN 0 "+
 				"WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) <= ? THEN 2 "+
-				"ELSE 1 END) "+
+				"WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) <= ? THEN 1 "+
+				"ELSE 0 END) "+
 				"IN ("+strings.Join(placeholders, ", ")+")")
 	}
 	if q.RequireLitmus {
