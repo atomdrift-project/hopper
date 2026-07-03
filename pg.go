@@ -1191,6 +1191,21 @@ const pgSampleColsLight = `id, sha256, source, feed, ecosystem, filename, file_t
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime, traits_version,
 	url, domain, package, version, purl_base`
 
+// pgSampleColsFeed is pgSampleCols with the two largest JSONB blobs the feed
+// never renders — cleave_result (the archive member tree, up to megabytes) and
+// llm_result — replaced by NULL literals. Selecting literals rather than the
+// columns keeps the projection positionally identical to pgSampleCols, so
+// pgSampleDest / scanPGSamples read it unchanged (CleaveResult and LLMResult
+// scan as nil), while the planner skips the heap-TOAST detoast of those columns
+// for every one of the up-to-500 feed rows. litmus_result stays: the feed
+// derives each row's criticality from it. Only feedSamplesPG uses this; the
+// detail page (SampleBySHA256) still selects the full row.
+const pgSampleColsFeed = `id, sha256, source, feed, ecosystem, filename, file_type,
+	size_bytes, label, label_source, NULL::jsonb AS cleave_result, litmus_result, NULL::jsonb AS llm_result, litmus_score,
+	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
+	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime, traits_version,
+	url, domain, package, version, purl_base`
+
 func pgSampleDest(s *Sample) []any {
 	return []any{
 		&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
@@ -3607,14 +3622,20 @@ func (db *DB) rehealCleaveCritPG(ctx context.Context) (int64, error) {
 					COALESCE((
 						SELECT MAX((COALESCE(tr->>'crit', tr->>'l'))::int)
 						FROM jsonb_array_elements(
-							COALESCE(cleave_result->'files'->0->'traits', cleave_result->'files'->0->'find', cleave_result->'fs'->0->'ts', '[]'::jsonb)
+							COALESCE(
+								cleave_result->'files'->0->'traits',
+								cleave_result->'files'->0->'find',
+								cleave_result->'fs'->0->'ts', '[]'::jsonb)
 						) AS tr
 						WHERE COALESCE(tr->>'crit', tr->>'l') IS NOT NULL
 					), 0) AS mc,
 					(
 						SELECT COUNT(*)::int
 						FROM jsonb_array_elements(
-							COALESCE(cleave_result->'files'->0->'traits', cleave_result->'files'->0->'find', cleave_result->'fs'->0->'ts', '[]'::jsonb)
+							COALESCE(
+								cleave_result->'files'->0->'traits',
+								cleave_result->'files'->0->'find',
+								cleave_result->'fs'->0->'ts', '[]'::jsonb)
 						) AS tr
 						WHERE COALESCE(tr->>'crit', tr->>'l') IS NOT NULL
 							AND (COALESCE(tr->>'crit', tr->>'l'))::int >= 4
@@ -4397,7 +4418,7 @@ func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error
 	// The class filter reads the indexed litmus_class column at the default
 	// cutoff and re-derives from litmus_result otherwise; see feedClassExpr.
 	rows, err := db.pool.Query(ctx, `
-		SELECT `+pgSampleCols+` FROM samples
+		SELECT `+pgSampleColsFeed+` FROM samples
 		WHERE ($1 = '' OR source = $1)
 			AND ($2 = '' OR label = $2)
 			AND cleave_result IS NOT NULL

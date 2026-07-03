@@ -341,7 +341,7 @@ func addQualifier(tail, qualifier string) string {
 	if !hasQ {
 		return tail + "?" + qualifier
 	}
-	for _, q := range strings.Split(quals, "&") {
+	for q := range strings.SplitSeq(quals, "&") {
 		if k, _, _ := strings.Cut(q, "="); strings.EqualFold(k, key) {
 			return tail // already qualified; don't duplicate
 		}
@@ -414,7 +414,7 @@ func escapePURL(s string) string {
 	}
 	var b strings.Builder
 	b.Grow(len(s) + 8)
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		if c := s[i]; purlUnreserved(c) {
 			b.WriteByte(c)
 		} else {
@@ -427,7 +427,7 @@ func escapePURL(s string) string {
 }
 
 func purlNeedsEscape(s string) bool {
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		if !purlUnreserved(s[i]) {
 			return true
 		}

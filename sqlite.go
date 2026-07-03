@@ -498,6 +498,20 @@ const liteSampleColsLight = `id, sha256, source, feed, ecosystem,
 	traits_version,
 	url, domain, package, version, purl_base`
 
+// liteSampleColsFeed is the SQLite counterpart of pgSampleColsFeed: liteSampleCols
+// with cleave_result and llm_result — the blobs the feed never renders — replaced
+// by NULL literals so the projection stays positionally identical and scanLiteSamples
+// reads it unchanged. litmus_result stays for the row's criticality. Keeps the two
+// backends' feed contract identical (a feed row carries no cleave_result).
+const liteSampleColsFeed = `id, sha256, source, feed, ecosystem,
+	filename, file_type, size_bytes, label, label_source,
+	NULL AS cleave_result, litmus_result, NULL AS llm_result, litmus_score,
+	path, status, note, canonical_sha256, parent, skip,
+	formula, elements, score, max_crit, suspicious_count,
+	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime,
+	traits_version,
+	url, domain, package, version, purl_base`
+
 func scanLiteSamplesLight(rows *sql.Rows) ([]*Sample, error) {
 	defer rows.Close() //nolint:errcheck // best-effort cleanup
 	var out []*Sample
@@ -3440,7 +3454,7 @@ func (db *DB) applyCleanupSQLite(ctx context.Context, stage CleanupStage) (int64
 
 func (db *DB) feedSamplesSQLite(ctx context.Context, q *FeedQuery) ([]*Sample, error) {
 	where, args := q.whereSQLite()
-	query := `SELECT ` + liteSampleCols + ` FROM samples ` + where + //nolint:gosec // built from fixed query fragments and validated sort key.
+	query := `SELECT ` + liteSampleColsFeed + ` FROM samples ` + where + //nolint:gosec // built from fixed query fragments and validated sort key.
 		` ORDER BY ` + q.sortBy() + ` LIMIT ? OFFSET ?`
 	args = append(args, q.Limit, q.Offset)
 

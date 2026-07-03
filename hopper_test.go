@@ -3150,6 +3150,59 @@ func TestFeedSamples(t *testing.T) {
 	}
 }
 
+// TestFeedSamplesProjectionOmitsBlobs locks the feed projection contract:
+// FeedSamples must not carry cleave_result (the archive member tree — up to
+// megabytes) or llm_result, which the feed never renders, while it must keep
+// litmus_result, from which each row's criticality is derived. The detail-page
+// path (SampleBySHA256) still returns every blob. Guards both the PG
+// (pgSampleColsFeed) and SQLite (liteSampleColsFeed) projections against a
+// regression that would reintroduce the per-row blob load.
+func TestFeedSamplesProjectionOmitsBlobs(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	s := &Sample{SHA256: "feedproj1", Source: "test", Ecosystem: "eco1", Label: "bad"}
+	mustInsert(t, ctx, db, s)
+
+	// StoreResult persists all three JSON blobs atomically. The cleave payload
+	// yields a non-empty file_type so the row is kept, not deleted.
+	cleave := []byte(`{"fs":[{"sha":"feedproj1","type":"elf","dp":0}]}`)
+	litmus := []byte(`{"class":1,"l":1}`)
+	llm := []byte(`{"summary":"benign helper"}`)
+	if _, err := db.StoreResult(ctx, "feedproj1", cleave, litmus, llm, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// The detail-page path keeps every blob.
+	full, err := db.SampleBySHA256(ctx, "feedproj1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(full.CleaveResult) == 0 || len(full.LitmusResult) == 0 || len(full.LLMResult) == 0 {
+		t.Fatalf("SampleBySHA256 must keep all blobs: cleave=%d litmus=%d llm=%d",
+			len(full.CleaveResult), len(full.LitmusResult), len(full.LLMResult))
+	}
+
+	// The feed drops the two blobs it never renders but keeps litmus_result.
+	rows, err := db.FeedSamples(ctx, &FeedQuery{Source: "test", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 feed row, got %d", len(rows))
+	}
+	r := rows[0]
+	if r.CleaveResult != nil {
+		t.Errorf("feed row must omit cleave_result, got %d bytes", len(r.CleaveResult))
+	}
+	if r.LLMResult != nil {
+		t.Errorf("feed row must omit llm_result, got %d bytes", len(r.LLMResult))
+	}
+	if len(r.LitmusResult) == 0 {
+		t.Error("feed row must retain litmus_result (criticality source)")
+	}
+}
+
 // TestFeedSamplesSearch exercises the free-text Search predicate: a
 // case-insensitive filename substring or an exact sha256, applied in SQL so it
 // spans the whole index rather than an in-memory page. LIKE metacharacters in
@@ -3235,12 +3288,12 @@ func TestFeedSamplesLitmusClassesV6V7(t *testing.T) {
 		litmus string
 		class  int
 	}{
-		{"v6null", `{"v":"6","l":null}`, 2}, // manual-mode hostile, fail-safe
-		{"v6lo", `{"v":"6","l":0}`, 2},      // fires at the strictest level
-		{"v6inband", `{"v":"6","l":4}`, 2},  // well inside the hostile band (<= L50)
-		{"v6crit", `{"v":"6","l":50}`, 2},   // at the L50 critical line: hostile
-		{"v6susp", `{"v":"6","l":75}`, 1},   // above the line, within the ceiling
-		{"v6benign", `{"v":"6","l":-1}`, 0}, // never fires
+		{"v6null", `{"v":"6","l":null}`, 2},   // manual-mode hostile, fail-safe
+		{"v6lo", `{"v":"6","l":0}`, 2},        // fires at the strictest level
+		{"v6inband", `{"v":"6","l":4}`, 2},    // well inside the hostile band (<= L50)
+		{"v6crit", `{"v":"6","l":50}`, 2},     // at the L50 critical line: hostile
+		{"v6susp", `{"v":"6","l":75}`, 1},     // above the line, within the ceiling
+		{"v6benign", `{"v":"6","l":-1}`, 0},   // never fires
 		{"v6loose", `{"v":"6","l":20000}`, 0}, // above the L100 ceiling: benign, not suspicious
 		{"v7null", `{"v":"7","lvl":null}`, 2},
 		{"v7lo", `{"v":"7","lvl":0}`, 2},
