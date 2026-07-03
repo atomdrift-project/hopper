@@ -1256,6 +1256,24 @@ func TestHandleUploadMultipartRejections(t *testing.T) {
 		}
 	})
 
+	t.Run("provenance too large", func(t *testing.T) {
+		t.Parallel()
+		api := uploadAPI(t)
+		// A provenance part past the transport cap must be rejected as oversized,
+		// not truncated into unparseable JSON and misreported as invalid. Pad
+		// well-formed JSON past uploadProvenanceMaxBytes; the read never parses it.
+		oversized := append([]byte(`{"pad":"`), bytes.Repeat([]byte("a"), uploadProvenanceMaxBytes+1)...)
+		oversized = append(oversized, []byte(`"}`)...)
+		body, ct := multipartUpload(t, oversized, file, true)
+		w := postUpload(t, api, body, ct)
+		if w.Code != http.StatusRequestEntityTooLarge {
+			t.Errorf("code=%d body=%s want 413", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "provenance too large") {
+			t.Errorf("body=%s want provenance too large", w.Body.String())
+		}
+	})
+
 	t.Run("missing required field", func(t *testing.T) {
 		t.Parallel()
 		api := uploadAPI(t)

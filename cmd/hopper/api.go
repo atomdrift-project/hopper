@@ -2157,12 +2157,23 @@ func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request
 
 		switch part.FormName() {
 		case "provenance":
-			buf, rerr := io.ReadAll(io.LimitReader(part, uploadProvenanceMaxBytes))
+			// Read one byte past the cap so a part that exactly fills the limit
+			// is distinguishable from one that overflows it. A bare
+			// LimitReader(cap) truncates an over-cap part silently, and the
+			// half-JSON that survives fails json.Unmarshal below — surfacing an
+			// oversized payload as the misleading "invalid provenance json".
+			buf, rerr := io.ReadAll(io.LimitReader(part, uploadProvenanceMaxBytes+1))
 			_ = part.Close() //nolint:errcheck // best-effort
 			if rerr != nil {
 				slog.WarnContext(r.Context(), "upload rejected: provenance read failed",
 					"remote", r.RemoteAddr, "error", rerr)
 				writeJSONError(w, http.StatusBadRequest, `{"error":"provenance read failed"}`)
+				return
+			}
+			if len(buf) > uploadProvenanceMaxBytes {
+				slog.WarnContext(r.Context(), "upload rejected: provenance exceeds size limit",
+					"remote", r.RemoteAddr, "limit", uploadProvenanceMaxBytes)
+				writeJSONError(w, http.StatusRequestEntityTooLarge, `{"error":"provenance too large"}`)
 				return
 			}
 			var sc hopper.Sidecar
