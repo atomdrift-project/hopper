@@ -52,13 +52,13 @@ const maxArchiveMembers = 100_000
 // suspicious (fired only at noisier operating points); `-1` is benign; `null`
 // (manual-mode hostile) is hostile.
 //
-// L50 is our standard operating level — the level the model is currently
-// deployed and calibrated at (scan's DEFAULT_SEVERITY_LEVEL). We may tighten it
-// in the future, so it lives in this single constant. The level is
-// consumer-owned: this is only hopper's *default*, and any caller can override
-// it per-query via [FeedQuery.CriticalLevel] (as scan's users do with `-l`),
-// which the derivation honors.
-const CriticalLevel = 50
+// L25 is our standard operating level — the level the model is currently
+// deployed and calibrated at (scan's DEFAULT_SEVERITY_LEVEL); tightened from L50
+// (2026-07) to the knee of the hostile curve, just below the sharp L30->L40 FP
+// cliff. It lives in this single constant. The level is consumer-owned: this is
+// only hopper's *default*, and any caller can override it per-query via
+// [FeedQuery.CriticalLevel] (as scan's users do with `-l`), which the derivation honors.
+const CriticalLevel = 25
 
 // SuspiciousCeiling is the loosest fired-level (FP per 100M benigns) that still
 // reads as suspicious. A firing at or below CriticalLevel is hostile; above
@@ -66,12 +66,16 @@ const CriticalLevel = 50
 // anything looser is treated as benign informational noise rather than a
 // suspicious verdict.
 //
-// Set to L100 — the precision elbow from the fired-level analysis: L250 and
-// looser add more false positives than true positives (L100 fires at ~91%
-// precision vs good, L250 at ~31%), so capping here drops the loose tail to
-// benign. Mirrors scan's SUSPICIOUS_LEVEL_CEILING and promoter/prism's
-// SuspiciousCeiling; keep the cross-repo group in sync.
-const SuspiciousCeiling = 100
+// Set to L3000 — an EXPERIMENTAL widening (2026-07) to surface as much of the
+// weak-signal tail as the calibration curve supports (recall peaks at L4000 then
+// collapses ~8pp at L5000, so L3000 is the loosest robustly-stable point). This
+// overrides the prior L100 precision elbow from hopper's own fired-level analysis
+// (L100 ~91% precision vs good, L250 ~31%; L250+ adds more false positives than
+// true positives), so it knowingly re-admits a low-precision tail — re-measure
+// the elbow and tighten back if the suspicious bucket floods. Mirrors scan's
+// SUSPICIOUS_LEVEL_CEILING and promoter/prism's SuspiciousCeiling; keep the
+// cross-repo group in sync.
+const SuspiciousCeiling = 3000
 
 // Pool labels, ordered by precedence: bad > good > unknown.
 const (

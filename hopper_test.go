@@ -3282,25 +3282,27 @@ func TestFeedSamplesLitmusClassesV6V7(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
-	// class is the expected 0/1/2 bucket under the standard CriticalLevel (50).
+	// class is the expected 0/1/2 bucket under the standard bands. Boundary
+	// levels are derived from CriticalLevel/SuspiciousCeiling so the fixtures
+	// track the operating point instead of hardcoding it.
 	rows := []struct {
 		sha    string
 		litmus string
 		class  int
 	}{
-		{"v6null", `{"v":"6","l":null}`, 2},   // manual-mode hostile, fail-safe
-		{"v6lo", `{"v":"6","l":0}`, 2},        // fires at the strictest level
-		{"v6inband", `{"v":"6","l":4}`, 2},    // well inside the hostile band (<= L50)
-		{"v6crit", `{"v":"6","l":50}`, 2},     // at the L50 critical line: hostile
-		{"v6susp", `{"v":"6","l":75}`, 1},     // above the line, within the ceiling
-		{"v6benign", `{"v":"6","l":-1}`, 0},   // never fires
-		{"v6loose", `{"v":"6","l":20000}`, 0}, // above the L100 ceiling: benign, not suspicious
+		{"v6null", `{"v":"6","l":null}`, 2},                                  // manual-mode hostile, fail-safe
+		{"v6lo", `{"v":"6","l":0}`, 2},                                       // fires at the strictest level
+		{"v6inband", fmt.Sprintf(`{"v":"6","l":%d}`, CriticalLevel/2), 2},    // well inside the hostile band
+		{"v6crit", fmt.Sprintf(`{"v":"6","l":%d}`, CriticalLevel), 2},        // at the critical line: hostile
+		{"v6susp", fmt.Sprintf(`{"v":"6","l":%d}`, CriticalLevel+1), 1},      // just above the line: suspicious
+		{"v6benign", `{"v":"6","l":-1}`, 0},                                  // never fires
+		{"v6loose", fmt.Sprintf(`{"v":"6","l":%d}`, SuspiciousCeiling+1), 0}, // above the ceiling: benign, not suspicious
 		{"v7null", `{"v":"7","lvl":null}`, 2},
 		{"v7lo", `{"v":"7","lvl":0}`, 2},
-		{"v7crit", `{"v":"7","lvl":50}`, 2},   // at the L50 critical line: hostile
-		{"v7susp", `{"v":"7","lvl":51}`, 1},   // just above the line: suspicious
-		{"v7ceil", `{"v":"7","lvl":100}`, 1},  // at the L100 ceiling: still suspicious
-		{"v7loose", `{"v":"7","lvl":250}`, 0}, // above the ceiling: benign, not suspicious
+		{"v7crit", fmt.Sprintf(`{"v":"7","lvl":%d}`, CriticalLevel), 2},        // at the critical line: hostile
+		{"v7susp", fmt.Sprintf(`{"v":"7","lvl":%d}`, CriticalLevel+1), 1},      // just above the line: suspicious
+		{"v7ceil", fmt.Sprintf(`{"v":"7","lvl":%d}`, SuspiciousCeiling), 1},    // at the ceiling: still suspicious
+		{"v7loose", fmt.Sprintf(`{"v":"7","lvl":%d}`, SuspiciousCeiling+1), 0}, // above the ceiling: benign, not suspicious
 		{"v7benign", `{"v":"7","lvl":-1}`, 0},
 		{"legacy2", `{"v":"4","class":2}`, 2},
 		{"legacy1", `{"v":"4","class":1}`, 1},
@@ -3316,8 +3318,8 @@ func TestFeedSamplesLitmusClassesV6V7(t *testing.T) {
 	}
 
 	for class := range 3 {
-		// Pin the standard L50 cutoff explicitly so the expectations above are
-		// deterministic regardless of the package default.
+		// Pin the standard critical-level cutoff explicitly so the expectations
+		// above are deterministic regardless of the package default.
 		q := FeedQuery{Source: "v6test", Limit: 100, CriticalLevel: CriticalLevel, LitmusClasses: []int{class}}
 		samples, err := db.FeedSamples(ctx, &q)
 		if err != nil {
@@ -3341,10 +3343,11 @@ func TestFeedSamplesLitmusClassesV6V7(t *testing.T) {
 		}
 	}
 
-	// A caller-pinned cutoff moves the line: with CriticalLevel=3, level 50
-	// (hostile at the default L50 cutoff) becomes suspicious. This is the
-	// consumer-owned override knob (the FeedQuery equivalent of scan's `-l`).
-	q := FeedQuery{Source: "v6test", Limit: 100, CriticalLevel: 3, LitmusClasses: []int{1}}
+	// A caller-pinned cutoff moves the line: with a stricter cutoff one below the
+	// critical line, v6crit (hostile at the default cutoff, since it fires exactly
+	// at the line) becomes suspicious. This is the consumer-owned override knob
+	// (the FeedQuery equivalent of scan's `-l`).
+	q := FeedQuery{Source: "v6test", Limit: 100, CriticalLevel: CriticalLevel - 1, LitmusClasses: []int{1}}
 	samples, err := db.FeedSamples(ctx, &q)
 	if err != nil {
 		t.Fatal(err)
@@ -3356,7 +3359,7 @@ func TestFeedSamplesLitmusClassesV6V7(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("CriticalLevel=3: expected v6crit (level=4) to be classed suspicious")
+		t.Errorf("stricter cutoff: expected v6crit (fires at the critical line) to be classed suspicious")
 	}
 }
 
