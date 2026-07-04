@@ -282,6 +282,18 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// lookups by package are fast.
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS purl_base TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_domain ON samples(domain) WHERE domain != ''`,
+		// Mirror of idx_samples_eco_top_created for the domain-filtered feed
+		// (feedSamplesPG with domain = ANY($9)): an ordered seek to the domain
+		// walked created_at DESC that stops at LIMIT with no sort and no per-row
+		// JSONB read. Without it a popular domain (e.g. registry.npmjs.org) scans
+		// hundreds of thousands of idx_samples_domain rows then sorts. Same partial
+		// predicate as the ecosystem feed index, so the planner uses it whenever the
+		// feed's TopLevelOnly + litmus-done flags are set (the normal feed path).
+		// Built CONCURRENTLY by createIndexConcurrently.
+		`CREATE INDEX IF NOT EXISTS idx_samples_dom_top_created ` +
+			`ON samples(domain, created_at DESC) ` +
+			`WHERE parent = '' AND cleave_result IS NOT NULL ` +
+			`AND litmus_result IS NOT NULL AND domain <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_package_version ON samples(package, version) WHERE package != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_purl_base ON samples(purl_base) WHERE purl_base != ''`,
 		// Collector provenance sidecar (forager) + artifact fetch time. JSONB so
