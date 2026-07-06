@@ -2366,6 +2366,27 @@ type ReconcileStats struct {
 	Revived           int64 // members whose containing archive reappeared
 }
 
+// logRelabelSkipChange emits one Info line for a reconcile relabel that changed a
+// sample's skip — the cases worth surfacing per file: a previously missing or
+// unsupported sample revived by reappearing in a pool, or a sample newly in
+// conflict (asserted in both good/ and bad/ at once). Plain bad<->good moves that
+// leave skip unchanged are covered by the aggregate relabel count, not logged
+// individually.
+func logRelabelSkipChange(sha, fromLabel, toLabel, fromSkip, toSkip string) {
+	switch {
+	case toSkip == "" && (fromSkip == "missing" || fromSkip == "unsupported"):
+		slog.Info("reconcile relabel revived sample (re-observed in pool)",
+			"sha256", sha, "from_skip", fromSkip, "label", toLabel)
+	case toSkip == "conflict":
+		slog.Info("reconcile relabel marked conflict (in both pools)",
+			"sha256", sha, "from_label", fromLabel, "from_skip", fromSkip)
+	default:
+		slog.Info("reconcile relabel changed skip",
+			"sha256", sha, "from_label", fromLabel, "to_label", toLabel,
+			"from_skip", fromSkip, "to_skip", toSkip)
+	}
+}
+
 // ReconcilePools makes samples.label/skip authoritative against the current
 // state of the good/ and bad/ pool directories. It runs at the end of a full
 // walk and reconciles the derived label/skip cache to the truth — correcting
@@ -2391,7 +2412,14 @@ type ReconcileStats struct {
 // label_events in the same transaction as the change. A >50% missing rate aborts
 // before any write, on the assumption the data directory is misconfigured rather
 // than legitimately emptied.
-func (db *DB) ReconcilePools(ctx context.Context, diskPath func(string) string) (ReconcileStats, error) {
+//
+// markMissing=false (the --dataset-incomplete deployment) runs step 1 only: the
+// data root deliberately holds just part of the corpus, so a locally-absent file
+// is "not on this host", not "gone from the corpus". Steps 2–4 — which would mark
+// it skip='missing'/'unsupported' and cascade that to archive members — are
+// suppressed so those records stay trainable and the marking never replicates to
+// the primary. Relabel still applies pool moves among the locally-present files.
+func (db *DB) ReconcilePools(ctx context.Context, diskPath func(string) string, markMissing bool) (ReconcileStats, error) {
 	var stats ReconcileStats
 	var err error
 
@@ -2404,6 +2432,15 @@ func (db *DB) ReconcilePools(ctx context.Context, diskPath func(string) string) 
 	}
 	if err != nil {
 		return stats, fmt.Errorf("hopper: reconcile relabel: %w", err)
+	}
+
+	if !markMissing {
+		// Dataset-incomplete: local disk is not authoritative for presence, so
+		// stop after relabel — skip the stale-scan, missing/unsupported marking,
+		// and archive-member cascade (steps 2–4).
+		slog.Info("reconcile: missing-marking suppressed (dataset-incomplete)",
+			"relabeled", stats.Relabeled)
+		return stats, nil
 	}
 
 	// 2. Find top-level samples (skip empty or 'conflict') not seen this walk,

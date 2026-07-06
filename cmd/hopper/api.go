@@ -61,11 +61,21 @@ type apiServer struct {
 	// commit. Stored in an atomic.Pointer so the periodic rules-update
 	// goroutine can refresh it concurrently with read traffic from
 	// /api/next, /api/result, and the dashboard. Empty = rescan disabled.
-	traitsVersion       atomic.Pointer[string]
-	hopperStart         time.Time // process start; gates force-rescan claim tier
-	dataRoot            string    // resolved absolute path to the data directory
-	allowedDirs         []string  // resolved absolute paths that /api/file may serve from
-	forceRescanPrefixes []string  // normalized relative paths to re-analyze when analysis predates hopperStart
+	traitsVersion atomic.Pointer[string]
+	hopperStart   time.Time // process start; gates force-rescan claim tier
+	dataRoot      string    // resolved absolute path to the data directory
+	// datasetIncomplete means the data root deliberately does not hold the full
+	// sample set (e.g. this host has only new files; the historical corpus is
+	// unavailable). It makes local disk non-authoritative: a locally-absent file
+	// is no longer marked skip='missing' at claim time or on a worker
+	// "path does not exist" error, so those records stay trainable and the
+	// missing-marking never replicates to the primary. The caller runs reconcile
+	// in the same mode with missing-marking suppressed (relabel still applies pool
+	// moves among the present files). Serving never prunes in any mode — that
+	// moved to the `hopper prune` subcommand.
+	datasetIncomplete   bool
+	allowedDirs         []string // resolved absolute paths that /api/file may serve from
+	forceRescanPrefixes []string // normalized relative paths to re-analyze when analysis predates hopperStart
 	rescanAge           time.Duration
 	// uploadTokenHash holds sha256(HOPPER_UPLOAD_TOKEN). Storing only the
 	// hash means a process-memory disclosure (core dump, /proc/<pid>/mem,
@@ -1135,6 +1145,18 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		diskPath := sampleDiskPath(s.dataRoot, filepath.FromSlash(j.Path))
 		info, err := os.Stat(diskPath) //nolint:gosec // path from DB lookup, not user input
 		if err != nil {
+			if s.datasetIncomplete {
+				// Local disk is not authoritative in this mode — the file being
+				// absent here says nothing about whether it exists in the corpus.
+				// Release the claim without marking it, so the record stays
+				// trainable (skip=''); it'll be handed out again if the bytes
+				// ever land locally. Attempts aren't incremented for unclaimed
+				// jobs (below), so this can't trip the poison reaper.
+				slog.Debug("claimed file absent locally; leaving unmarked (dataset-incomplete)", //nolint:gosec // structured logging
+					"worker", worker, "sha256", j.SHA256, "path", j.Path)
+				unclaimSHAs = append(unclaimSHAs, j.SHA256)
+				continue
+			}
 			//nolint:gosec // worker validated, sha256/path from DB
 			slog.Warn("claimed file missing on disk",
 				"worker", worker, "sha256", j.SHA256, "path", j.Path, "disk_path", diskPath)
@@ -1355,7 +1377,16 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 			samplePath = sample.Path
 		}
 
-		if skip, permanent := classifyResultError(req.Error); permanent {
+		skip, permanent := classifyResultError(req.Error)
+		if permanent && s.datasetIncomplete && skip == "missing" {
+			// Dataset-incomplete mode: a worker that can't find the bytes locally
+			// says nothing about whether the sample exists in the corpus. Demote
+			// this to a transient error (recorded as a note, re-queued) instead of
+			// marking skip='missing', so the record stays trainable and the
+			// missing-marking never replicates to the primary.
+			permanent = false
+		}
+		if permanent {
 			// Permanent failure (unsupported file type, missing file, etc.) —
 			// mark so it's never queued again, but preserve the record.
 			if err := retryDBAccessNoValue(ctx, "mark permanent failure", req.SHA256, func(ctx context.Context) error {

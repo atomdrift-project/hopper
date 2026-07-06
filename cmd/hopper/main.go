@@ -59,6 +59,7 @@ commands:
   purge-unsupported  delete analyzed rows cleave could not classify
   normalize-ecosystems  re-canonicalize stored ecosystem labels (dry-run)
   cleanup            delete wonky samples by skip category (interactive)
+  prune              drop location rows for files gone from disk, mark orphaned samples missing (run on the full mirror)
   rescan             queue files for repair-tier re-analysis (--missing-members or SHA-256 args)
   triage             fetch mislabeled samples to /var/tmp/hopper-triage
   post-triage        apply triage verdicts: re-scan, move + flip mislabeled samples
@@ -518,6 +519,8 @@ func run(ctx context.Context) error {
 		return cmdNormalizeEcosystems(ctx)
 	case "cleanup":
 		return cmdCleanup(ctx)
+	case "prune":
+		return cmdPrune(ctx)
 	case "rescan":
 		return cmdRescan(ctx)
 	case "triage":
@@ -906,14 +909,17 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	dsn := f.String("db", "", "database connection string")
 	dataDir := f.String("data", "", "data directory containing bad/, good/, unknown/ subdirectories")
 	source := f.String("source", "forager", "sample source tag")
-	// Default on: prune only deletes location rows (rebuilt by the next walk)
-	// and marks samples skip='missing' (auto-revived on re-observation) — it
-	// never deletes a sample, analysis, or report, and it stats the filesystem
-	// directly, so a mistaken run self-heals and a partial walk can't cause it.
-	// The 40% safety cap guards the unmount/wrong-root case. Pass
-	// --prune-missing-paths=false to disable.
-	pruneMissingPaths := f.Bool("prune-missing-paths", true, "drop location rows for files gone from disk, mark sample missing (=false to disable)")
-	force := f.Bool("force", false, "override safety guards (currently: bypass the 40%-of-rows safety cap on --prune-missing-paths)")
+	// Deprecated: serving no longer prunes. Pruning location rows for gone files
+	// moved to the `hopper prune` subcommand so the ingest loop is never
+	// destructive and a partial mirror can't mark present-in-corpus files missing.
+	// Accepted (and ignored) so older unit files that still pass it keep booting.
+	_ = f.Bool("prune-missing-paths", false, "deprecated no-op; run `hopper prune` instead")
+	// Set when this host's data root deliberately does not hold the full corpus
+	// (e.g. the historical samples are unavailable). Treats local disk as non-
+	// authoritative: locally-absent files are never marked skip='missing', so they
+	// stay trainable and the marking never replicates. Reconcile still relabels
+	// pool moves among the present files. New/present files still ingest normally.
+	datasetIncomplete := f.Bool("dataset-incomplete", false, "data root does not hold the full sample set; do not mark locally-absent files missing (reconcile still relabels local pool moves)")
 	hashWorkers := f.Int("hash-workers", 8, "concurrent hash/insert workers for file walking")
 	cleaveBinFlag := f.String("cleave", "cleave", "path to cleave binary (used for file enumeration)")
 	litmusBin := f.String("litmus", "ascan", "path to the Atomdrift Scan binary (ascan; codename litmus; pass empty to disable)")
@@ -936,6 +942,9 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	parseFlags(f, os.Args[2:])
 	explicitLitmusBin := flagWasSet(f, "litmus")
 	explicitCleaveBin := flagWasSet(f, "cleave")
+	if flagWasSet(f, "prune-missing-paths") {
+		slog.Warn("--prune-missing-paths is deprecated and ignored; serving no longer prunes — run `hopper prune` instead")
+	}
 
 	if *maxFileMB > 0 {
 		maxFileSize = *maxFileMB * 1024 * 1024
@@ -1306,6 +1315,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// dataDir was already resolved (symlinks + absolute) at startup.
 	api.db = db
 	api.dataRoot = *dataDir
+	api.datasetIncomplete = *datasetIncomplete
 	api.allowedDirs = allowedDirs
 
 	// Nested-archive extraction spools intermediate containers to disk before
@@ -1413,26 +1423,10 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		"serving_api", servingAPI,
 		"local_litmus", litmus != nil)
 
-	if *pruneMissingPaths {
-		// Default cap: refuse to prune more than 40% of the location
-		// rows under the data root. Catches the unmount-race case
-		// (data dir gone → all paths "missing" → mass deletion) and
-		// other obvious misconfiguration. --force disables the cap.
-		maxFraction := 0.40
-		if *force {
-			maxFraction = 1.0
-		}
-		removed, err := db.PruneMissingLocations(ctx, *dataDir, maxFraction)
-		switch {
-		case err == nil:
-			slog.Info("pruned missing locations", "removed", removed, "data_dir", *dataDir)
-		case errors.As(err, new(*hopper.PruneSafetyExceeded)):
-			slog.Error("prune safety cap tripped — refusing to delete; pass --force to override after sanity check",
-				"error", err, "data_dir", *dataDir)
-		default:
-			slog.Error("prune missing locations failed", "error", err)
-		}
-	}
+	// Serving never prunes: statting the tree to delete "missing" location rows is
+	// wrong on a host that holds only part of the corpus, and even on the full
+	// mirror it's a destructive maintenance step that shouldn't ride the ingest
+	// loop. Pruning now lives in the explicit `hopper prune` subcommand.
 
 	// Block while there is something useful to keep alive: the dashboard/API
 	// for remote workers, or the local litmus worker process.
@@ -1599,6 +1593,16 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 ) int {
 	slog.Info("loading", "dirs", len(dirs))
 	start := time.Now()
+
+	// markMissing is false when the data root deliberately holds only part of the
+	// corpus (--dataset-incomplete). Reconcile still runs — so bad<->good pool
+	// moves among the locally-present files are relabeled — but the passes that
+	// treat a locally-absent file as gone (mark skip='missing'/'unsupported' and
+	// the archive-member cascade) are suppressed: here "not on this host" does not
+	// mean "gone from the corpus", and marking it would drop the record from
+	// training and replicate to the primary.
+	markMissing := api == nil || !api.datasetIncomplete
+
 	var progress loadProgress
 	progress.analyzeDurationMin.Store(math.MaxInt64)
 
@@ -1711,7 +1715,7 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 		// pathological pass is abandoned instead of stranding the walk loop (and
 		// with it all ingestion), as an unbounded reconcile once did.
 		if stageOK && ctx.Err() == nil {
-			reconcilePools(ctx, db, dirs)
+			reconcilePools(ctx, db, dirs, markMissing)
 		}
 
 		logLoadSummary(start, experimentTag, dirs, &progress)
@@ -1772,14 +1776,15 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 // moved/missing/relabeled files. It is bounded by reconcileTimeout: an
 // unbounded pass once ran for over an hour and stranded all ingestion, so a
 // pathological pass is now abandoned and retried next cycle. Only called after a
-// complete, staged walk.
-func reconcilePools(ctx context.Context, db *hopper.DB, dirs []struct{ dir, label string }) {
+// complete, staged walk. markMissing=false (--dataset-incomplete) keeps the
+// relabel pass but suppresses the missing/unsupported marking and cascade.
+func reconcilePools(ctx context.Context, db *hopper.DB, dirs []struct{ dir, label string }, markMissing bool) {
 	ctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
 	defer cancel()
 	toDiskPath := func(path string) string {
 		return sampleDiskPath(filepath.Dir(dirs[0].dir), filepath.FromSlash(path))
 	}
-	st, err := db.ReconcilePools(ctx, toDiskPath)
+	st, err := db.ReconcilePools(ctx, toDiskPath, markMissing)
 	if err != nil {
 		slog.Error("reconcile pools failed", "error", err)
 		return
@@ -3208,6 +3213,58 @@ func cmdBackfillPURL(ctx context.Context) error {
 	}
 	slog.Info("backfill-purl complete", "rows_filled", n)
 	return nil
+}
+
+// cmdPrune drops sample_locations rows whose files are gone from disk (ENOENT)
+// and marks any top-level sample left with no surviving location skip='missing'.
+// It stats the tree directly, so it MUST run on a host that holds the full sample
+// corpus — on a partial mirror it would mark present-in-corpus files missing. The
+// serving loop (`hopper load`) deliberately never prunes; this is the explicit,
+// operator-run maintenance step instead. A 40%-of-rows safety cap aborts the
+// unmount/wrong-root case; --force lifts it after you've confirmed the mount. A
+// re-observed file auto-reverts skip to ” on the next walk, so a mistaken prune
+// self-heals.
+func cmdPrune(ctx context.Context) error {
+	f := flag.NewFlagSet("prune", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	dataDir := f.String("data", "", "data directory containing bad/, good/, unknown/ subdirectories")
+	force := f.Bool("force", false, "bypass the 40%-of-rows safety cap (use only after confirming the data root is fully mounted)")
+	parseFlags(f, os.Args[2:])
+
+	if *dataDir == "" {
+		return errors.New("pass --data <directory> (the fully-mounted sample tree)")
+	}
+	// Resolve symlinks + absolute so paths match the roots stored in the DB.
+	if resolved, err := filepath.EvalSymlinks(*dataDir); err == nil {
+		*dataDir = resolved
+	}
+	if abs, err := filepath.Abs(*dataDir); err == nil {
+		*dataDir = abs
+	}
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		return err
+	}
+
+	maxFraction := 0.40
+	if *force {
+		maxFraction = 1.0
+	}
+	removed, err := db.PruneMissingLocations(ctx, *dataDir, maxFraction)
+	switch {
+	case err == nil:
+		slog.Info("pruned missing locations", "removed", removed, "data_dir", *dataDir)
+		return nil
+	case errors.As(err, new(*hopper.PruneSafetyExceeded)):
+		return fmt.Errorf("prune safety cap tripped — refusing to delete; pass --force after confirming the data root is fully mounted: %w", err)
+	default:
+		return fmt.Errorf("prune missing locations: %w", err)
+	}
 }
 
 // cmdRescan queues files for re-analysis in the repair tier (rescan_priority=1),

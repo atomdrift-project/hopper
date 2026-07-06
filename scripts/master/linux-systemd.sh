@@ -19,6 +19,9 @@
 #   MAX_MEMORY_GB  --max-memory-gb    litmus RSS cap in GB, forwarded as
 #                 --max-rss-gb (default: 48; 0 = litmus self-throttle,
 #                 -1 = disable in-process throttling)
+#   DATASET_INCOMPLETE  --dataset-incomplete  (default: 1) non-authoritative
+#                 posture: never mark locally-absent files skip='missing'.
+#                 Set 0 for a node that owns the full sample tree.
 #   PULL_DISABLE  set to 1 to skip the git pull of ../scan and ../cleave and
 #                 build the current checkouts as-is (e.g. when the remote is down)
 
@@ -35,6 +38,11 @@ SOURCE="${SOURCE:-forager}"
 DASH_ADDR="${DASH_ADDR:-0.0.0.0:8081}"
 WORKERS="${WORKERS:-40}"
 MAX_MEMORY_GB="${MAX_MEMORY_GB:-48}"
+# Default deploy posture: non-authoritative. This host's data root may not hold
+# the full historical corpus (samples served from a remote/partial mount), so
+# hopper must never mark locally-absent files skip='missing'. Set
+# DATASET_INCOMPLETE=0 to deploy an authoritative node that owns the whole tree.
+DATASET_INCOMPLETE="${DATASET_INCOMPLETE:-1}"
 PULL_DISABLE="${PULL_DISABLE:-0}"
 
 readonly SERVICE_USER=hopper
@@ -312,6 +320,15 @@ workers_arg=""
 max_mem_arg=""
 (( MAX_MEMORY_GB != 0 )) && max_mem_arg=" --max-memory-gb ${MAX_MEMORY_GB}"
 
+# --dataset-incomplete is the default deploy posture (DATASET_INCOMPLETE=1):
+# locally-absent files are never marked skip='missing', so training records and
+# replication aren't polluted when the corpus isn't fully mounted here. Reconcile
+# still relabels bad<->good pool moves among the present files. Serving never
+# prunes regardless — pruning is the separate `hopper prune` maintenance command,
+# run on the full mirror. Set DATASET_INCOMPLETE=0 for an authoritative node.
+dataset_arg=""
+[[ "${DATASET_INCOMPLETE}" != "0" ]] && dataset_arg=" --dataset-incomplete"
+
 cat >"$tmp_unit" <<EOF
 [Unit]
 Description=Hopper sample ingester (spawns Atomdrift Scan workers)
@@ -342,7 +359,7 @@ CacheDirectory=${SERVICE_NAME}
 CacheDirectoryMode=0750
 
 WorkingDirectory=%S/${SERVICE_NAME}
-ExecStart=${BIN_PATH} load --data ${DATA_DIR} --db ${DB} --source ${SOURCE} --dashboard-addr ${DASH_ADDR} --litmus ${SCAN_BIN} --cleave ${CLEAVE_BIN} --prune-missing-paths${workers_arg}${max_mem_arg}
+ExecStart=${BIN_PATH} load --data ${DATA_DIR} --db ${DB} --source ${SOURCE} --dashboard-addr ${DASH_ADDR} --litmus ${SCAN_BIN} --cleave ${CLEAVE_BIN}${dataset_arg}${workers_arg}${max_mem_arg}
 Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=60s

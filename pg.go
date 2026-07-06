@@ -2265,11 +2265,15 @@ func (db *DB) pruneMissingLocationsPG(ctx context.Context, absRoot string, maxFr
 			  AND NOT EXISTS (SELECT 1 FROM sample_locations sl WHERE sl.sha256 = samples.sha256)`, shas); err != nil {
 			return 0, fmt.Errorf("hopper: prune missing audit: %w", err)
 		}
-		if _, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			UPDATE samples SET skip = 'missing', updated_at = now()
 			WHERE parent = '' AND skip = '' AND sha256 = ANY($1)
-			  AND NOT EXISTS (SELECT 1 FROM sample_locations sl WHERE sl.sha256 = samples.sha256)`, shas); err != nil {
+			  AND NOT EXISTS (SELECT 1 FROM sample_locations sl WHERE sl.sha256 = samples.sha256)`, shas)
+		if err != nil {
 			return 0, fmt.Errorf("hopper: prune mark missing: %w", err)
+		}
+		if n := tag.RowsAffected(); n > 0 {
+			slog.Info("prune marked samples missing (no surviving location)", "count", n)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -4017,7 +4021,7 @@ func (db *DB) relabelFromPoolsPG(ctx context.Context) (int64, error) {
 	// INSERT audits them. PG executes every data-modifying CTE exactly once, so
 	// the UPDATE runs even though the INSERT reads pre-update values from
 	// `changed`. Atomic by construction.
-	tag, err := db.pool.Exec(ctx, `
+	rows, err := db.pool.Query(ctx, `
 		WITH pools AS (
 			SELECT sha256,
 				bool_or(path LIKE 'bad/%')  AS in_bad,
@@ -4050,11 +4054,31 @@ func (db *DB) relabelFromPoolsPG(ctx context.Context) (int64, error) {
 		INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
 		SELECT sha256, old_label, new_label, old_skip, new_skip,
 			CASE WHEN new_skip = 'conflict' THEN 'conflict' ELSE 'relabel' END, now()
-		FROM changed`)
+		FROM changed
+		RETURNING sha256, from_label, to_label, from_skip, to_skip`)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: relabel: %w", err)
 	}
-	return tag.RowsAffected(), nil
+	defer rows.Close()
+
+	// Log the operationally interesting relabels (a missing/unsupported file
+	// revived by reappearing in a pool, or a new conflict) one line each; the
+	// count of all relabels — plain bad<->good moves included — is returned.
+	var n int64
+	for rows.Next() {
+		var sha, fromLabel, toLabel, fromSkip, toSkip string
+		if err := rows.Scan(&sha, &fromLabel, &toLabel, &fromSkip, &toSkip); err != nil {
+			return 0, fmt.Errorf("hopper: relabel scan: %w", err)
+		}
+		n++
+		if fromSkip != toSkip {
+			logRelabelSkipChange(sha, fromLabel, toLabel, fromSkip, toSkip)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("hopper: relabel: %w", err)
+	}
+	return n, nil
 }
 
 func (db *DB) staleStandaloneSamplesPG(ctx context.Context) ([]SampleLocationKey, int64, error) {

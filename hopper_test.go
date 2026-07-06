@@ -3921,7 +3921,7 @@ func TestReconcilePoolsRelabel(t *testing.T) {
 		loc("conf", "good/conf.bin"), loc("conf", "bad/conf.bin"),
 		loc("mark", "bad/mark.bin"),
 	)
-	if _, err := db.ReconcilePools(ctx, func(p string) string { return p }); err != nil {
+	if _, err := db.ReconcilePools(ctx, func(p string) string { return p }, true); err != nil {
 		t.Fatalf("ReconcilePools: %v", err)
 	}
 
@@ -3977,7 +3977,7 @@ func TestReconcilePoolsMissing(t *testing.T) {
 	mustInsert(t, ctx, db, &Sample{SHA256: "unsup", Path: "bad/present.bin", Label: "bad"})
 
 	stageWalk(t, ctx, db, loc("seen", "bad/seen.bin"))
-	st, err := db.ReconcilePools(ctx, disk)
+	st, err := db.ReconcilePools(ctx, disk, true)
 	if err != nil {
 		t.Fatalf("ReconcilePools: %v", err)
 	}
@@ -3992,6 +3992,75 @@ func TestReconcilePoolsMissing(t *testing.T) {
 	}
 	if got := skipOf(t, ctx, db, "unsup"); got != "unsupported" {
 		t.Errorf("unsup skip = %q, want unsupported", got)
+	}
+}
+
+// TestReconcilePoolsDatasetIncomplete verifies the --dataset-incomplete contract
+// (markMissing=false): relabelling still applies to files whose standalone copy
+// is present in a local pool this walk, but locally-absent files are never marked
+// skip='missing'/'unsupported' — they stay trainable.
+func TestReconcilePoolsDatasetIncomplete(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	disk := func(p string) string {
+		return filepath.Join(t.TempDir(), "nope", p) // never exists
+	}
+
+	// moved: standalone copy now in good/ this walk → relabel bad→good must apply.
+	// gone: not seen this walk and absent on disk → must stay trainable, not missing.
+	mustInsert(t, ctx, db, &Sample{SHA256: "moved", Path: "bad/moved.bin", Label: "bad"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "gone", Path: "bad/gone.bin", Label: "bad"})
+
+	stageWalk(t, ctx, db, loc("moved", "good/moved.bin"))
+	st, err := db.ReconcilePools(ctx, disk, false)
+	if err != nil {
+		t.Fatalf("ReconcilePools: %v", err)
+	}
+	if st.MarkedMissing != 0 || st.MarkedUnsupported != 0 {
+		t.Errorf("stats missing=%d unsupported=%d, want 0/0 (dataset-incomplete)",
+			st.MarkedMissing, st.MarkedUnsupported)
+	}
+	if got := labelOf(t, ctx, db, "moved"); got != "good" {
+		t.Errorf("moved label = %q, want good (relabel must still work)", got)
+	}
+	if got := skipOf(t, ctx, db, "gone"); got != "" {
+		t.Errorf("gone skip = %q, want empty (locally-absent file must stay trainable)", got)
+	}
+}
+
+// TestReconcilePoolsDatasetIncompleteEmptyTree models the outage-node startup:
+// /data/samples is empty (walk_staging has no present files) while the
+// authoritative DB is fully populated. With markMissing=false the reconcile must
+// be a complete no-op — nothing marked missing/unsupported, nothing relabeled,
+// and an already-missing row is not revived — so an empty local tree can never
+// mass-mark the authoritative rows missing (and replicate that loss).
+func TestReconcilePoolsDatasetIncompleteEmptyTree(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{SHA256: "a", Path: "bad/a.bin", Label: "bad"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "b", Path: "good/b.bin", Label: "good"})
+	// An already-missing row must not be revived by an empty walk either.
+	mustInsert(t, ctx, db, &Sample{SHA256: "c", Path: "bad/c.bin", Label: "bad"})
+	if err := db.SetSkip(ctx, "c", "missing"); err != nil {
+		t.Fatalf("SetSkip: %v", err)
+	}
+
+	stageWalk(t, ctx, db) // empty present-set: nothing on local disk
+	disk := func(p string) string { return filepath.Join(t.TempDir(), "nope", p) }
+	st, err := db.ReconcilePools(ctx, disk, false)
+	if err != nil {
+		t.Fatalf("ReconcilePools: %v", err)
+	}
+	if st.Relabeled != 0 || st.MarkedMissing != 0 || st.MarkedUnsupported != 0 || st.CascadedMissing != 0 {
+		t.Errorf("stats = %+v, want all zero (empty tree must not touch authoritative rows)", st)
+	}
+	if got := skipOf(t, ctx, db, "a"); got != "" {
+		t.Errorf("a skip = %q, want empty", got)
+	}
+	if got := skipOf(t, ctx, db, "c"); got != "missing" {
+		t.Errorf("c skip = %q, want missing (unchanged, not revived)", got)
 	}
 }
 
@@ -4014,7 +4083,7 @@ func TestReconcilePoolsCascade(t *testing.T) {
 
 	// P moved away; only G is present this walk.
 	stageWalk(t, ctx, db, loc("G", "good/pkg.tgz"))
-	st, err := db.ReconcilePools(ctx, gone)
+	st, err := db.ReconcilePools(ctx, gone, true)
 	if err != nil {
 		t.Fatalf("ReconcilePools: %v", err)
 	}
@@ -4033,7 +4102,7 @@ func TestReconcilePoolsCascade(t *testing.T) {
 
 	// P reappears: both archives present this walk → C1 revives.
 	stageWalk(t, ctx, db, loc("G", "good/pkg.tgz"), loc("P", "bad/arch.tgz"))
-	st2, err := db.ReconcilePools(ctx, func(p string) string { return p })
+	st2, err := db.ReconcilePools(ctx, func(p string) string { return p }, true)
 	if err != nil {
 		t.Fatalf("ReconcilePools revive: %v", err)
 	}
@@ -4056,7 +4125,7 @@ func TestReconcilePoolsMovedToNewPath(t *testing.T) {
 
 	// Seen this walk only at a new bad/ path.
 	stageWalk(t, ctx, db, loc("mv", "bad/x.bin"))
-	if _, err := db.ReconcilePools(ctx, func(p string) string { return p }); err != nil {
+	if _, err := db.ReconcilePools(ctx, func(p string) string { return p }, true); err != nil {
 		t.Fatalf("ReconcilePools: %v", err)
 	}
 	if got := labelOf(t, ctx, db, "mv"); got != "bad" {
@@ -4079,7 +4148,7 @@ func TestReconcilePoolsBadUnknownGood(t *testing.T) {
 
 	// → unknown/: label retained (unknown/ does not downgrade), still present.
 	stageWalk(t, ctx, db, loc("t", "unknown/t.bin"))
-	if _, err := db.ReconcilePools(ctx, keep); err != nil {
+	if _, err := db.ReconcilePools(ctx, keep, true); err != nil {
 		t.Fatal(err)
 	}
 	if got := labelOf(t, ctx, db, "t"); got != "bad" {
@@ -4091,7 +4160,7 @@ func TestReconcilePoolsBadUnknownGood(t *testing.T) {
 
 	// → good/: now demoted to good.
 	stageWalk(t, ctx, db, loc("t", "good/t.bin"))
-	if _, err := db.ReconcilePools(ctx, keep); err != nil {
+	if _, err := db.ReconcilePools(ctx, keep, true); err != nil {
 		t.Fatal(err)
 	}
 	if got := labelOf(t, ctx, db, "t"); got != "good" {
@@ -4112,7 +4181,7 @@ func TestReconcilePoolsRemovedThenReadded(t *testing.T) {
 	// Removed from bad/ entirely (nothing present this walk) → missing.
 	gone := func(p string) string { return filepath.Join(t.TempDir(), "nope", p) }
 	stageWalk(t, ctx, db)
-	if _, err := db.ReconcilePools(ctx, gone); err != nil {
+	if _, err := db.ReconcilePools(ctx, gone, true); err != nil {
 		t.Fatal(err)
 	}
 	if got := skipOf(t, ctx, db, "rb"); got != "missing" {
@@ -4124,7 +4193,7 @@ func TestReconcilePoolsRemovedThenReadded(t *testing.T) {
 
 	// Re-added to bad/ at a different path → revived (skip cleared).
 	stageWalk(t, ctx, db, loc("rb", "bad/b.bin"))
-	if _, err := db.ReconcilePools(ctx, func(p string) string { return p }); err != nil {
+	if _, err := db.ReconcilePools(ctx, func(p string) string { return p }, true); err != nil {
 		t.Fatal(err)
 	}
 	if got := skipOf(t, ctx, db, "rb"); got != "" {

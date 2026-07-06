@@ -1326,6 +1326,65 @@ func TestClassifyResultError(t *testing.T) {
 	}
 }
 
+// TestHandleResultMissingRespectsDatasetIncomplete pins the disconnected-dataset
+// contract for the worker-error path: a "Path does not exist" report marks the
+// sample skip='missing' by default, but in --dataset-incomplete mode it is
+// demoted to a transient error (note recorded, skip left empty) so the record
+// stays trainable and the missing-marking never replicates to the primary.
+func TestHandleResultMissingRespectsDatasetIncomplete(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		datasetIncomplete bool
+		wantSkip          string
+	}{
+		{"default marks missing", false, "missing"},
+		{"dataset-incomplete leaves trainable", true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := mustOpenDB(t, ctx, t.TempDir()+"/hopper.db")
+			defer db.Close()
+			if err := db.Migrate(ctx); err != nil {
+				t.Fatalf("Migrate: %v", err)
+			}
+
+			sha := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+			if err := db.InsertSample(ctx, &hopper.Sample{
+				SHA256: sha, Source: "test", Path: "bad/gone.bin",
+				Label: "bad", LabelSource: "test",
+			}); err != nil {
+				t.Fatalf("InsertSample: %v", err)
+			}
+
+			body, err := json.Marshal(resultRequest{
+				SHA256: sha, Worker: "worker1", Error: "Path does not exist",
+			})
+			if err != nil {
+				t.Fatalf("Marshal: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/api/result", bytes.NewReader(body))
+			rec := httptest.NewRecorder()
+			api := &apiServer{
+				db: db, tracker: newWorkerTracker(), progress: &loadProgress{},
+				datasetIncomplete: tc.datasetIncomplete,
+			}
+
+			api.handleResult(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+
+			sample, err := db.SampleBySHA256(ctx, sha)
+			if err != nil {
+				t.Fatalf("SampleBySHA256: %v", err)
+			}
+			if sample.Skip != tc.wantSkip {
+				t.Errorf("skip = %q, want %q", sample.Skip, tc.wantSkip)
+			}
+		})
+	}
+}
+
 // TestAcquireSlot pins the shed-fast contract: a free slot is taken instantly, a
 // saturated pool sheds with errSaturated within the bound (not blocking until
 // the client times out), and a cancelled context returns its own error so the

@@ -1514,6 +1514,7 @@ func (db *DB) pruneMissingLocationsSQLite(ctx context.Context, absRoot string, m
 func markPrunedSamplesMissingSQLite(ctx context.Context, tx *sql.Tx, shas []string) error {
 	ts := now()
 	const chunk = 400 // stay under SQLite's default bind-variable limit
+	var marked int64
 	for start := 0; start < len(shas); start += chunk {
 		batch := shas[start:min(start+chunk, len(shas))]
 		ph := strings.Repeat(",?", len(batch))[1:]
@@ -1532,12 +1533,19 @@ func markPrunedSamplesMissingSQLite(ctx context.Context, tx *sql.Tx, shas []stri
 			return fmt.Errorf("hopper: prune missing audit: %w", err)
 		}
 		//nolint:gosec // ph is a run of '?' bind markers; sha values are parameterized.
-		if _, err := tx.ExecContext(ctx, `
+		res, err := tx.ExecContext(ctx, `
 			UPDATE samples SET skip = 'missing', updated_at = ?
 			WHERE parent = '' AND skip = '' AND sha256 IN (`+ph+`)
-			  AND NOT EXISTS (SELECT 1 FROM sample_locations sl WHERE sl.sha256 = samples.sha256)`, args...); err != nil {
+			  AND NOT EXISTS (SELECT 1 FROM sample_locations sl WHERE sl.sha256 = samples.sha256)`, args...)
+		if err != nil {
 			return fmt.Errorf("hopper: prune mark missing: %w", err)
 		}
+		if n, err := res.RowsAffected(); err == nil {
+			marked += n
+		}
+	}
+	if marked > 0 {
+		slog.Info("prune marked samples missing (no surviving location)", "count", marked)
 	}
 	return nil
 }
@@ -3145,6 +3153,29 @@ func (db *DB) relabelFromPoolsSQLite(ctx context.Context) (int64, error) {
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM _relabel WHERE new_label = old_label AND new_skip = old_skip`); err != nil {
 		return 0, fmt.Errorf("hopper: relabel prune: %w", err)
+	}
+
+	// Surface the operationally interesting relabels — a missing/unsupported file
+	// revived by reappearing in a pool, or a new conflict — one line each. Drain
+	// and close before the writes below: SQLite forbids an Exec on a tx that still
+	// has open rows. Ordinary bad<->good moves are covered by the returned count.
+	logRows, err := tx.QueryContext(ctx, `
+		SELECT sha256, old_label, new_label, old_skip, new_skip
+		FROM _relabel WHERE old_skip <> new_skip`)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: relabel log scan: %w", err)
+	}
+	for logRows.Next() {
+		var sha, oldLabel, newLabel, oldSkip, newSkip string
+		if err := logRows.Scan(&sha, &oldLabel, &newLabel, &oldSkip, &newSkip); err != nil {
+			logRows.Close() //nolint:errcheck,sqlclosecheck,gosec // best-effort cleanup before error return
+			return 0, fmt.Errorf("hopper: relabel log row: %w", err)
+		}
+		logRelabelSkipChange(sha, oldLabel, newLabel, oldSkip, newSkip)
+	}
+	logRows.Close() //nolint:errcheck,gosec // best-effort cleanup
+	if err := logRows.Err(); err != nil {
+		return 0, fmt.Errorf("hopper: relabel log rows: %w", err)
 	}
 
 	if _, err := tx.ExecContext(ctx, `
