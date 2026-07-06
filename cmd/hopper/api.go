@@ -851,6 +851,24 @@ func filterCandidatesByWorkerTools(cands []hopper.ClaimJob, tools *workerToolSet
 	return out
 }
 
+// filterCandidatesBySize drops candidates larger than the worker's advertised
+// max file size, so a memory-constrained worker is never handed an archive that
+// would OOM it during analysis. maxBytes <= 0 means the worker set no cap (a
+// large worker, or one on a version predating the max_bytes signal), in which
+// case every candidate is eligible. Compacts in place like the tools filter.
+func filterCandidatesBySize(cands []hopper.ClaimJob, maxBytes int64) []hopper.ClaimJob {
+	if maxBytes <= 0 || len(cands) == 0 {
+		return cands
+	}
+	out := cands[:0]
+	for _, c := range cands {
+		if c.SizeBytes <= maxBytes {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // sizeClass buckets a job by on-disk size for handout interleaving:
 // 0 = small (<1 MiB), 1 = medium (<32 MiB), 2 = large. Matches the litmus
 // worker-benchmark classes so measurements line up across both repos.
@@ -1071,6 +1089,15 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 			load1 = f
 		}
 	}
+	// Largest file the worker will accept (bytes); absent/0 means no cap. Only
+	// files this size or smaller are handed to the worker, keeping large archives
+	// off memory-constrained workers that would OOM analyzing them.
+	var maxBytes int64
+	if v := r.URL.Query().Get("max_bytes"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			maxBytes = n
+		}
+	}
 
 	// Cap claims for workers that haven't returned any results yet.
 	if limit := s.tracker.claimLimit(worker); limit == 0 {
@@ -1100,7 +1127,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	jobs, err := s.claimJobs(ctx, worker, count, toolCaps)
+	jobs, err := s.claimJobs(ctx, worker, count, toolCaps, maxBytes)
 	if err != nil {
 		slog.Error("claim jobs failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
@@ -1486,7 +1513,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 // count that aren't held by another worker. Over-fetches so that
 // contention with other concurrent pollers doesn't starve a requester at
 // the head of the queue.
-func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, tools *workerToolSet) ([]hopper.ClaimJob, error) {
+func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, tools *workerToolSet, maxBytes int64) ([]hopper.ClaimJob, error) {
 	want := count
 	overfetch := max(count*candidateOverfetch, minCandidates)
 
@@ -1497,7 +1524,7 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, too
 	if err != nil {
 		return nil, err
 	}
-	cands = filterCandidatesByWorkerTools(cands, tools)
+	cands = filterCandidatesBySize(filterCandidatesByWorkerTools(cands, tools), maxBytes)
 	out := s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)
 	if len(out) >= count {
 		return out, nil
@@ -1512,7 +1539,7 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, too
 	if err != nil {
 		return out, err
 	}
-	cands = filterCandidatesByWorkerTools(cands, tools)
+	cands = filterCandidatesBySize(filterCandidatesByWorkerTools(cands, tools), maxBytes)
 	out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
 	if len(out) >= count {
 		return out, nil
@@ -1527,7 +1554,7 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, too
 	if err != nil {
 		return out, err
 	}
-	cands = interleaveBySizeClass(filterCandidatesByWorkerTools(cands, tools))
+	cands = interleaveBySizeClass(filterCandidatesBySize(filterCandidatesByWorkerTools(cands, tools), maxBytes))
 	out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
 	if len(out) >= count {
 		return out, nil
@@ -1543,7 +1570,7 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, too
 	if err != nil {
 		return out, err
 	}
-	cands = filterCandidatesByWorkerTools(cands, tools)
+	cands = filterCandidatesBySize(filterCandidatesByWorkerTools(cands, tools), maxBytes)
 	out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
 	if len(out) >= count {
 		return out, nil
@@ -1555,7 +1582,7 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, too
 		if err != nil {
 			return out, err
 		}
-		cands = filterCandidatesByWorkerTools(cands, tools)
+		cands = filterCandidatesBySize(filterCandidatesByWorkerTools(cands, tools), maxBytes)
 		out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
 		if len(out) >= count {
 			return out, nil
@@ -1568,7 +1595,7 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, too
 		if err != nil {
 			return out, err
 		}
-		cands = filterCandidatesByWorkerTools(cands, tools)
+		cands = filterCandidatesBySize(filterCandidatesByWorkerTools(cands, tools), maxBytes)
 		out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
 	}
 	return out, nil

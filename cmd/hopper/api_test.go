@@ -326,6 +326,26 @@ func TestFilterCandidatesByWorkerToolsKeepsCompatibleJobsUnclaimed(t *testing.T)
 	}
 }
 
+func TestFilterCandidatesBySize(t *testing.T) {
+	cands := []hopper.ClaimJob{
+		{SHA256: "small", SizeBytes: 1 << 20},        // 1 MiB
+		{SHA256: "atcap", SizeBytes: 32 << 20},       // exactly 32 MiB
+		{SHA256: "big", SizeBytes: (32 << 20) + 1},   // just over 32 MiB
+		{SHA256: "huge", SizeBytes: 300 * (1 << 20)}, // 300 MiB
+	}
+	got := filterCandidatesBySize(cands, 32<<20)
+	if len(got) != 2 || got[0].SHA256 != "small" || got[1].SHA256 != "atcap" {
+		t.Fatalf("filtered candidates = %+v, want small and atcap only (<= 32 MiB)", got)
+	}
+
+	// maxBytes <= 0 means the worker advertised no cap: every candidate stays.
+	for _, limit := range []int64{0, -1} {
+		if uncapped := filterCandidatesBySize(cands, limit); len(uncapped) != len(cands) {
+			t.Fatalf("cap %d filtered candidates: %+v", limit, uncapped)
+		}
+	}
+}
+
 func TestTrimClientError(t *testing.T) {
 	in := "cleave failed:\n\n   Failed to load traits\tfrom /usr/local/share/litmus/traits due to many validation errors while parsing the installed bundle"
 	got := trimClientError(in)
