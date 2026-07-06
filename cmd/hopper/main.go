@@ -922,7 +922,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	datasetIncomplete := f.Bool("dataset-incomplete", false, "data root does not hold the full sample set; do not mark locally-absent files missing (reconcile still relabels local pool moves)")
 	hashWorkers := f.Int("hash-workers", 8, "concurrent hash/insert workers for file walking")
 	cleaveBinFlag := f.String("cleave", "cleave", "path to cleave binary (used for file enumeration)")
-	litmusBin := f.String("litmus", "ascan", "path to the Atomdrift Scan binary (ascan; codename litmus; pass empty to disable)")
+	litmusBin := f.String("litmus", "atomscan", "path to the Atomdrift Scan binary (atomscan; codename litmus; pass empty to disable)")
 	litmusWorkers := f.Int("workers", 0, "concurrent analysis workers for the local litmus (0 = auto: min(2, cores/2))")
 	// Remote litmus workers self-register via the pull API; no --litmus-nodes flag needed.
 	maxRSSGB := f.Int("max-memory-gb", 0, "litmus RSS limit in GB (0 = auto: let litmus self-throttle, -1 = disable in-process throttling)")
@@ -1092,7 +1092,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		// fresh fetch — never disables the local worker.
 	}
 
-	// Start the local scan (ascan) worker under a supervisor that never gives
+	// Start the local scan (atomscan) worker under a supervisor that never gives
 	// up: it waits for cleave traits to validate, starts the worker, and lets
 	// Monitor restart it on every crash — all in the background, so a flaky local
 	// worker never blocks ingestion (remote workers keep running). Failures

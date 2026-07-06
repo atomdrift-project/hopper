@@ -598,7 +598,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		`<meta charset="utf-8"><meta http-equiv="refresh" content="60">` +
 		`<title>hopper</title><style>` + css + `</style></head><body>`)
 
-	// Big red banner when the local scan (ascan) worker is down — crashing or
+	// Big red banner when the local scan (atomscan) worker is down — crashing or
 	// not starting. Reason, onset timestamp, and the last few log/output lines
 	// come straight from the worker's published health (see superviseLocalWorker
 	// / litmusServer.setHealth) so the banner is enough to debug the failure.

@@ -55,7 +55,7 @@ type litmusServer struct {
 	verbose    bool
 }
 
-// localWorkerHealth is the current state of the in-process scan (ascan) worker,
+// localWorkerHealth is the current state of the in-process scan (atomscan) worker,
 // published for the web dashboard's status banner. since marks when the present
 // ok-state began, so a persistent failure shows a stable "down since <time>".
 // detail holds the last few log/output lines for the failure so the banner is
@@ -92,7 +92,7 @@ func (s *litmusServer) workerLogTail(n int) string {
 
 // litmusConfig holds options for starting a litmus worker.
 type litmusConfig struct {
-	Bin        string // path to the Atomdrift Scan binary (codename: litmus); default "ascan"
+	Bin        string // path to the Atomdrift Scan binary (codename: litmus); default "atomscan"
 	HopperURL  string // hopper API URL (e.g. http://127.0.0.1:8081)
 	DataDir    string // data root for local file access
 	MaxRSSGB   int    // memory limit in GB (0 = let litmus decide, -1 = disable in-process throttling)
@@ -102,7 +102,7 @@ type litmusConfig struct {
 
 func newLitmusServer(cfg litmusConfig) *litmusServer {
 	if cfg.Bin == "" {
-		cfg.Bin = "ascan"
+		cfg.Bin = "atomscan"
 	}
 	if cfg.MaxWorkers < 1 {
 		cfg.MaxWorkers = max(2, runtime.NumCPU()/2)
@@ -755,7 +755,7 @@ func lastNLines(s string, n int) string {
 	return sanitizeLogString(strings.Join(lines, "\n"))
 }
 
-// superviseLocalWorker keeps the in-process scan (ascan) worker running for the
+// superviseLocalWorker keeps the in-process scan (atomscan) worker running for the
 // life of ctx and never gives up. It loops: validate cleave traits (retrying —
 // a fresh fetch may still be landing, or may have failed, in which case it
 // re-pulls rules), then start the worker and hand off to Monitor, which restarts

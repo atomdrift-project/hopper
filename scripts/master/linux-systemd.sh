@@ -15,7 +15,7 @@
 #                                    (default: postgres://hopper@hopper-db/hopper?sslmode=disable)
 #   SOURCE    --source tag           (default: forager)
 #   DASH_ADDR --dashboard-addr       (default: 0.0.0.0:8081)
-#   WORKERS   --workers              (default: 40; set 0 for hopper's auto-pick)
+#   WORKERS   --workers              (default: 32; set 0 for hopper's auto-pick)
 #   MAX_MEMORY_GB  --max-memory-gb    litmus RSS cap in GB, forwarded as
 #                 --max-rss-gb (default: 48; 0 = litmus self-throttle,
 #                 -1 = disable in-process throttling)
@@ -36,7 +36,7 @@ SAMPLES_GROUP="${SAMPLES_GROUP:-samples}"
 DB="${DB:-postgres://hopper@hopper-db/hopper?sslmode=disable}"
 SOURCE="${SOURCE:-forager}"
 DASH_ADDR="${DASH_ADDR:-0.0.0.0:8081}"
-WORKERS="${WORKERS:-40}"
+WORKERS="${WORKERS:-32}"
 MAX_MEMORY_GB="${MAX_MEMORY_GB:-48}"
 # Default deploy posture: non-authoritative. This host's data root may not hold
 # the full historical corpus (samples served from a remote/partial mount), so
@@ -89,9 +89,9 @@ case "$HEAL_PERMS_INTERVAL_MIN" in *[!0-9]*|'') die "HEAL_PERMS_INTERVAL_MIN mus
 # TOOLS_DIR.
 readonly SCAN_SRC=../scan
 readonly CLEAVE_SRC=../cleave
-# Atomdrift Scan installs as 'ascan' to avoid colliding with the unrelated
+# Atomdrift Scan installs as 'atomscan' to avoid colliding with the unrelated
 # 'litmus' WebDAV tool. ('litmus' remains the internal codename in hopper/db.)
-readonly SCAN_BIN=${TOOLS_DIR}/ascan
+readonly SCAN_BIN=${TOOLS_DIR}/atomscan
 readonly CLEAVE_BIN=${TOOLS_DIR}/cleave
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -182,7 +182,7 @@ update_tool_source cleave "${CLEAVE_SRC}"
 
 log "Building Atomdrift Scan (release)"
 make -C "${SCAN_SRC}" release >/dev/null
-[[ -x ${SCAN_SRC}/out/ascan ]] || die "scan build did not produce ${SCAN_SRC}/out/ascan"
+[[ -x ${SCAN_SRC}/out/atomscan ]] || die "scan build did not produce ${SCAN_SRC}/out/atomscan"
 
 log "Building cleave (release)"
 make -C "${CLEAVE_SRC}" release >/dev/null
@@ -250,7 +250,7 @@ install_tool() {
     priv install -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${src}" "${dst}"
     binary_changed=1
 }
-install_tool "${SCAN_SRC}/out/ascan" "${SCAN_BIN}" ascan
+install_tool "${SCAN_SRC}/out/atomscan" "${SCAN_BIN}" atomscan
 install_tool "${CLEAVE_SRC}/out/cleave" "${CLEAVE_BIN}" cleave
 
 # --- .pgpass (optional, from the invoking user) -----------------------------

@@ -402,7 +402,7 @@ func cmdPostTriage(ctx context.Context) error {
 	f.Var(&misplacedBad, "misplaced-bad",
 		"dir of files re-classified hostile (was good); repeatable or comma-separated")
 	noUpload := f.Bool("no-upload", false, "skip pushing fresh analysis (default: scan fs --hopper each misplaced dir first)")
-	scanBin := f.String("scan", "scan", "path to the scan (ascan) binary used for --upload")
+	scanBin := f.String("scan", "atomscan", "path to the scan (atomscan) binary used for --upload")
 	token := f.String("token", os.Getenv("HOPPER_UPLOAD_TOKEN"), "upload bearer token (default: $HOPPER_UPLOAD_TOKEN)")
 	dryRun := f.Bool("dry-run", false, "ask the master to report the planned moves without touching anything")
 	parseFlags(f, os.Args[2:])

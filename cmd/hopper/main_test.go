@@ -1004,11 +1004,11 @@ func TestNewLitmusServer(t *testing.T) {
 		t.Errorf("bin = %q", s.bin)
 	}
 
-	// Defaults: bin falls back to "ascan" (the installed Atomdrift Scan binary),
+	// Defaults: bin falls back to "atomscan" (the installed Atomdrift Scan binary),
 	// workers to max(2, NumCPU/2).
 	s2 := newLitmusServer(litmusConfig{})
-	if s2.bin != "ascan" {
-		t.Errorf("default bin = %q, want ascan", s2.bin)
+	if s2.bin != "atomscan" {
+		t.Errorf("default bin = %q, want atomscan", s2.bin)
 	}
 	wantWorkers := max(2, runtime.NumCPU()/2)
 	if s2.Workers() != wantWorkers {
