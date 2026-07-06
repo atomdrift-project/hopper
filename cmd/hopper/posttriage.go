@@ -62,6 +62,7 @@ type triageVerdict struct {
 	SHA256  string `json:"sha256"`
 	Verdict string `json:"verdict,omitempty"`
 	Ruling  string `json:"ruling,omitempty"`
+	Source  string `json:"source,omitempty"` // overrides the recorded label_source (e.g. "cyclotron:bad")
 }
 
 // Promotion pool layout. hopper owns where a ruled sample lands; promoter sends
@@ -281,6 +282,12 @@ func (s *apiServer) triagePlan(samp *hopper.Sample, oldRel string, v triageVerdi
 		plan, ok := rulingPlan(samp, oldRel, v.Ruling)
 		if !ok {
 			return placement{}, errors.New(`ruling must be "good", "bad", or "review"`)
+		}
+		// A client-supplied source attributes the relabel to its author (e.g.
+		// "cyclotron:bad") instead of the default "promoter". Only for rulings
+		// that actually relabel — "review" keeps the sample's existing source.
+		if v.Source != "" && (v.Ruling == "good" || v.Ruling == "bad") {
+			plan.source = v.Source
 		}
 		return plan, nil
 	}

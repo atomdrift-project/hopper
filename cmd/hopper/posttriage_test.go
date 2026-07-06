@@ -173,18 +173,22 @@ func TestHandleTriageRulings(t *testing.T) {
 	cases := []struct {
 		ruling   string
 		sha      string
+		source   string
 		wantPath string
 		wantLbl  string
 		wantSrc  string
 	}{
-		{"good", repeat("1"), filepath.Join("good", "foraged-promote", "npm", "a.tgz"), "good", "promoter"},
-		{"bad", repeat("2"), filepath.Join("bad", "foraged-quarantine", "npm", "b.tgz"), "bad", "promoter"},
-		{"review", repeat("3"), filepath.Join("unknown", "foraged-review", "npm", "c.tgz"), "unknown", "forager"},
+		// No source → default "promoter".
+		{"good", repeat("1"), "", filepath.Join("good", "foraged-promote", "npm", "a.tgz"), "good", "promoter"},
+		// Client source overrides the recorded label_source.
+		{"bad", repeat("2"), "cyclotron:bad", filepath.Join("bad", "foraged-quarantine", "npm", "b.tgz"), "bad", "cyclotron:bad"},
+		// review relabels nothing, so it keeps the existing source and ignores the override.
+		{"review", repeat("3"), "cyclotron:review", filepath.Join("unknown", "foraged-review", "npm", "c.tgz"), "unknown", "forager"},
 	}
 	for _, tc := range cases {
 		sub := filepath.Join("npm", map[string]string{"good": "a.tgz", "bad": "b.tgz", "review": "c.tgz"}[tc.ruling])
 		oldRel := seed(tc.sha, sub)
-		resp := callTriage(t, api, triageRequest{Verdicts: []triageVerdict{{SHA256: tc.sha, Ruling: tc.ruling}}})
+		resp := callTriage(t, api, triageRequest{Verdicts: []triageVerdict{{SHA256: tc.sha, Ruling: tc.ruling, Source: tc.source}}})
 		if resp.Moved != 1 || resp.Failed != 0 {
 			t.Fatalf("%s: moved=%d failed=%d results=%+v", tc.ruling, resp.Moved, resp.Failed, resp.Results)
 		}
@@ -205,7 +209,7 @@ func TestHandleTriageRulings(t *testing.T) {
 			t.Fatalf("%s: row label=%q source=%q path=%q", tc.ruling, samp.Label, samp.LabelSource, samp.Path)
 		}
 		// Idempotent re-run.
-		again := callTriage(t, api, triageRequest{Verdicts: []triageVerdict{{SHA256: tc.sha, Ruling: tc.ruling}}})
+		again := callTriage(t, api, triageRequest{Verdicts: []triageVerdict{{SHA256: tc.sha, Ruling: tc.ruling, Source: tc.source}}})
 		if again.Noop != 1 || again.Moved != 0 {
 			t.Fatalf("%s: re-run noop=%d moved=%d", tc.ruling, again.Noop, again.Moved)
 		}
