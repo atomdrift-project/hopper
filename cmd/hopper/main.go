@@ -919,7 +919,9 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// authoritative: locally-absent files are never marked skip='missing', so they
 	// stay trainable and the marking never replicates. Reconcile still relabels
 	// pool moves among the present files. New/present files still ingest normally.
-	datasetIncomplete := f.Bool("dataset-incomplete", false, "data root does not hold the full sample set; do not mark locally-absent files missing (reconcile still relabels local pool moves)")
+	datasetIncomplete := f.Bool("dataset-incomplete", false,
+		"data root does not hold the full sample set; do not mark locally-absent "+
+			"files missing (reconcile still relabels local pool moves)")
 	hashWorkers := f.Int("hash-workers", 8, "concurrent hash/insert workers for file walking")
 	cleaveBinFlag := f.String("cleave", "cleave", "path to cleave binary (used for file enumeration)")
 	litmusBin := f.String("litmus", "atomscan", "path to the Atomdrift Scan binary (atomscan; codename litmus; pass empty to disable)")

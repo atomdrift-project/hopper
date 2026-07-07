@@ -1460,3 +1460,61 @@ func TestAcquireSlot(t *testing.T) {
 		}
 	})
 }
+
+// TestHandleRescan covers the re-queue endpoint prism's rescan button drives: an
+// eligible top-level sample is queued (200 {"status":"queued"}), an unknown sha
+// is refused as not-eligible (409), a malformed sha is rejected before any DB
+// access (400), and a not-yet-ready server reports starting (503).
+func TestHandleRescan(t *testing.T) {
+	t.Parallel()
+	api := uploadAPI(t)
+	ctx := context.Background()
+
+	sha := strings.Repeat("a", 64)
+	if err := api.db.InsertSample(ctx, &hopper.Sample{
+		SHA256: sha, Source: "test", Path: "test/a", Label: "unknown",
+	}); err != nil {
+		t.Fatalf("InsertSample: %v", err)
+	}
+
+	post := func(target string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, "/api/rescan/"+target, http.NoBody)
+		r.SetPathValue("sha256", target)
+		rec := httptest.NewRecorder()
+		api.handleRescan(rec, r)
+		return rec
+	}
+
+	// Eligible: a freshly inserted, never-analyzed top-level sample re-queues.
+	rec := post(sha)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("eligible rescan: status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	var got map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got["status"] != "queued" {
+		t.Errorf("status field = %q, want %q", got["status"], "queued")
+	}
+
+	// Unknown sha: RequestRescan affects zero rows -> not eligible.
+	if rec := post(strings.Repeat("b", 64)); rec.Code != http.StatusConflict {
+		t.Errorf("unknown sha: status = %d, want 409", rec.Code)
+	}
+
+	// Malformed sha: rejected before any DB access.
+	if rec := post("NOT-A-VALID-SHA"); rec.Code != http.StatusBadRequest {
+		t.Errorf("bad sha: status = %d, want 400", rec.Code)
+	}
+
+	// DB still starting (db nil): 503.
+	starting := &apiServer{}
+	r := httptest.NewRequest(http.MethodPost, "/api/rescan/"+sha, http.NoBody)
+	r.SetPathValue("sha256", sha)
+	rec = httptest.NewRecorder()
+	starting.handleRescan(rec, r)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("starting: status = %d, want 503", rec.Code)
+	}
+}

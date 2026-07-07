@@ -38,53 +38,21 @@ import (
 // /api/file/{sha256}. Sample data lives in the database; per-job claim
 // state lives in workerTracker (see below).
 type apiServer struct {
-	db       *hopper.DB
-	tracker  *workerTracker
-	progress *loadProgress
-	// extractSem bounds in-flight archive-member extractions. Each can run a
-	// decompressor and spool a multi-GB intermediate container to disk, so an
-	// unbounded burst of /api/file requests for members would otherwise pile up
-	// CPU and scratch space. nil disables the limit (e.g. in tests).
-	extractSem chan struct{}
-	// resultSem bounds in-flight /api/result ingestions. Each decodes a result
-	// body up to maxResultBodyBytes and, for an archive, expands the whole
-	// envelope into per-member rows — several times the body size, held live
-	// across a DB store that can stall on lock contention. Without a cap, a
-	// burst of large archive results (or a DB slowdown) lets these expansions
-	// accumulate into a heap blow-up. nil disables the limit (e.g. in tests).
-	resultSem chan struct{}
-	// extractCache holds decompressed compressed-tar parents so the members of
-	// one archive are decompressed once, not once per request. nil disables it,
-	// in which case every member streams through a fresh decompressor.
-	extractCache *extractCache
-	// traitsVersion holds the short prefix of the current traits repo
-	// commit. Stored in an atomic.Pointer so the periodic rules-update
-	// goroutine can refresh it concurrently with read traffic from
-	// /api/next, /api/result, and the dashboard. Empty = rescan disabled.
-	traitsVersion atomic.Pointer[string]
-	hopperStart   time.Time // process start; gates force-rescan claim tier
-	dataRoot      string    // resolved absolute path to the data directory
-	// datasetIncomplete means the data root deliberately does not hold the full
-	// sample set (e.g. this host has only new files; the historical corpus is
-	// unavailable). It makes local disk non-authoritative: a locally-absent file
-	// is no longer marked skip='missing' at claim time or on a worker
-	// "path does not exist" error, so those records stay trainable and the
-	// missing-marking never replicates to the primary. The caller runs reconcile
-	// in the same mode with missing-marking suppressed (relabel still applies pool
-	// moves among the present files). Serving never prunes in any mode — that
-	// moved to the `hopper prune` subcommand.
-	datasetIncomplete   bool
-	allowedDirs         []string // resolved absolute paths that /api/file may serve from
-	forceRescanPrefixes []string // normalized relative paths to re-analyze when analysis predates hopperStart
+	hopperStart         time.Time
+	traitsVersion       atomic.Pointer[string]
+	progress            *loadProgress
+	extractSem          chan struct{}
+	resultSem           chan struct{}
+	extractCache        *extractCache
+	db                  *hopper.DB
+	tracker             *workerTracker
+	dataRoot            string
+	allowedDirs         []string
+	forceRescanPrefixes []string
 	rescanAge           time.Duration
-	// uploadTokenHash holds sha256(HOPPER_UPLOAD_TOKEN). Storing only the
-	// hash means a process-memory disclosure (core dump, /proc/<pid>/mem,
-	// swap) does not leak the secret in usable form. Compare with
-	// subtle.ConstantTimeCompare against sha256(incoming). uploadTokenSet
-	// distinguishes "no token configured" from the 2^-256 case of a hash
-	// that happens to be all-zero.
-	uploadTokenHash [sha256.Size]byte
-	uploadTokenSet  bool
+	uploadTokenHash     [sha256.Size]byte
+	datasetIncomplete   bool
+	uploadTokenSet      bool
 }
 
 // errSaturated is returned by the slot-acquire helpers when no slot frees
@@ -627,6 +595,7 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/upload", s.handleUpload)
 	mux.HandleFunc("POST /api/known", s.handleKnown)
 	mux.HandleFunc("POST /api/triage", s.handleTriage)
+	mux.HandleFunc("POST /api/rescan/{sha256}", s.handleRescan)
 	mux.HandleFunc("GET /api/file/{sha256}", s.handleFile)
 	mux.HandleFunc("GET /api/provenance/{sha256}", s.handleProvenance)
 	mux.Handle("GET /data/", s.safeFileServer())
@@ -2700,6 +2669,55 @@ func (s *apiServer) handleProvenance(w http.ResponseWriter, r *http.Request) {
 	if _, err := w.Write(prov); err != nil { //nolint:gosec // prov is stored JSON served with nosniff; sha256 validated by validSHA256
 		slog.Warn("write provenance failed", "sha256", sha, "error", err) //nolint:gosec // sha256 validated by validSHA256
 	}
+}
+
+// rescanRequestCooldown is the minimum age of the most recent analysis before a
+// manual re-queue via POST /api/rescan is accepted. It bounds re-queue storms
+// for a single sample, enforced atomically in RequestRescan's UPDATE. prism
+// applies a matching UI cooldown before offering its rescan button and caps the
+// aggregate request rate; keep the two values in sync if either changes.
+const rescanRequestCooldown = 15 * time.Minute
+
+// handleRescan re-queues one top-level sample for re-analysis: RequestRescan
+// clears its cached analysis fields so the next worker poll picks it up as Tier
+// 1 (unanalyzed) work. This is the write side of prism's rescan button — prism
+// reads from a replica but routes the write here so it lands on the master,
+// keeping every write funneled through hopper. Like /api/result it is an
+// internal, worker-facing endpoint (no bearer token); hopper-api is not
+// publicly reachable.
+//
+// POST /api/rescan/{sha256}. 200 {"status":"queued"} on success; 409 when the
+// sample is not eligible (unknown, an archive child, skipped, or analyzed
+// within rescanRequestCooldown); 503 while the DB is still starting; 500 on an
+// unexpected store error.
+func (s *apiServer) handleRescan(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
+		return
+	}
+	sha := strings.ToLower(r.PathValue("sha256"))
+	if !validSHA256(sha) {
+		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid sha256"}`)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
+	defer cancel()
+
+	if err := s.db.RequestRescan(ctx, sha, rescanRequestCooldown); err != nil {
+		if errors.Is(err, hopper.ErrRescanNotEligible) {
+			writeJSONError(w, http.StatusConflict, `{"error":"not eligible"}`)
+			return
+		}
+		slog.ErrorContext(r.Context(), "rescan: request failed",
+			"sha256", sha, "error", err, "remote", r.RemoteAddr)
+		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		return
+	}
+	slog.InfoContext(r.Context(), "rescan queued", "sha256", sha, "remote", r.RemoteAddr)
+	w.Header().Set("Content-Type", "application/json")
+	//nolint:errcheck,errchkjson // map[string]string is JSON-safe; best-effort response
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "queued"})
 }
 
 // handleFile serves file content for remote workers.
