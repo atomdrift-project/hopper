@@ -15,10 +15,11 @@
 #                                    (default: postgres://hopper@hopper-db/hopper?sslmode=disable)
 #   SOURCE    --source tag           (default: forager)
 #   DASH_ADDR --dashboard-addr       (default: 0.0.0.0:8081)
-#   WORKERS   --workers              (default: 32; set 0 for hopper's auto-pick)
-#   MAX_MEMORY_GB  --max-memory-gb    litmus RSS cap in GB, forwarded as
-#                 --max-rss-gb (default: 48; 0 = litmus self-throttle,
-#                 -1 = disable in-process throttling)
+#   WORKERS   --workers              (default: 0 = defer to hopper's built-in
+#                 cap of 40; set non-zero only to override for this host)
+#   MAX_MEMORY_GB  --max-memory-gb    atomscan RSS cap in GB, forwarded as
+#                 --max-rss-gb (default: 0 = defer to hopper's built-in cap of
+#                 48 GB; -1 = disable in-process throttling)
 #   DATASET_INCOMPLETE  --dataset-incomplete  (default: 1) non-authoritative
 #                 posture: never mark locally-absent files skip='missing'.
 #                 Set 0 for a node that owns the full sample tree.
@@ -36,8 +37,12 @@ SAMPLES_GROUP="${SAMPLES_GROUP:-samples}"
 DB="${DB:-postgres://hopper@hopper-db/hopper?sslmode=disable}"
 SOURCE="${SOURCE:-forager}"
 DASH_ADDR="${DASH_ADDR:-0.0.0.0:8081}"
-WORKERS="${WORKERS:-32}"
-MAX_MEMORY_GB="${MAX_MEMORY_GB:-48}"
+# Both default to 0 so the generated unit emits no --workers/--max-memory-gb and
+# the local atomscan worker's caps come solely from hopper's built-in defaults
+# (40 workers / 48 GB RAM, in cmd/hopper/main.go) — the single source of truth.
+# Set a non-zero value here only to override those caps for a specific host.
+WORKERS="${WORKERS:-0}"
+MAX_MEMORY_GB="${MAX_MEMORY_GB:-0}"
 # Default deploy posture: non-authoritative. This host's data root may not hold
 # the full historical corpus (samples served from a remote/partial mount), so
 # hopper must never mark locally-absent files skip='missing'. Set

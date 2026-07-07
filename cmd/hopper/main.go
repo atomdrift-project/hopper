@@ -925,9 +925,9 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	hashWorkers := f.Int("hash-workers", 8, "concurrent hash/insert workers for file walking")
 	cleaveBinFlag := f.String("cleave", "cleave", "path to cleave binary (used for file enumeration)")
 	litmusBin := f.String("litmus", "atomscan", "path to the Atomdrift Scan binary (atomscan; codename litmus; pass empty to disable)")
-	litmusWorkers := f.Int("workers", 0, "concurrent analysis workers for the local litmus (0 = auto: min(2, cores/2))")
+	litmusWorkers := f.Int("workers", 40, "concurrent analysis workers for the local atomscan worker (0 = auto: min(2, cores/2))")
 	// Remote litmus workers self-register via the pull API; no --litmus-nodes flag needed.
-	maxRSSGB := f.Int("max-memory-gb", 0, "litmus RSS limit in GB (0 = auto: let litmus self-throttle, -1 = disable in-process throttling)")
+	maxRSSGB := f.Int("max-memory-gb", 48, "local atomscan worker RSS limit in GB, forwarded as --max-rss-gb (0 = auto: let atomscan self-throttle, -1 = disable in-process throttling)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
 	rescanAge := f.Duration("rescan-age", 120*time.Hour, "minimum age before a stale-traits sample is eligible for rescan")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")

@@ -4,10 +4,12 @@ DATA_DIR  ?= /data/samples
 DB        ?= postgres://hopper@hopper-db/hopper?sslmode=disable
 SOURCE    ?= harvest
 DASH_ADDR ?= 0.0.0.0:8081
-# Local litmus worker slots. Pinned to 56 (not auto=cores/2=64 on the 128-core
-# server box) to leave RAM headroom for the co-located API server + DB feeder,
-# which were being starved into swap at 64. Override with WORKERS=N if needed.
-WORKERS   ?= 56
+# Local atomscan worker slots. Left at 0 so the deploy carries no competing
+# default and defers to hopper's own built-in cap (40 workers / 48 GB RAM, set
+# once in cmd/hopper/main.go) — the single source of truth. Override per-host
+# with WORKERS=N (and MAX_MEMORY_GB=N, passed through to the systemd script) —
+# e.g. the 128-core box used WORKERS=56 to trade RAM headroom for throughput.
+WORKERS   ?= 0
 
 help:
 	@echo "Available targets:"
