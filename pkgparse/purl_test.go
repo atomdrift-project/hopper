@@ -2,58 +2,6 @@ package pkgparse
 
 import "testing"
 
-func TestBuildPURL(t *testing.T) {
-	cases := []struct {
-		name          string
-		eco, pkg, ver string
-		want          string
-		wantOK        bool
-	}{
-		// Registry-form inputs (the live forager path).
-		{"npm plain", "npm", "lodash", "4.17.21", "pkg:npm/lodash@4.17.21", true},
-		{"npm scoped", "npm", "@babel/core", "7.24.0", "pkg:npm/%40babel/core@7.24.0", true},
-		{"npm no version", "npm", "express", "", "pkg:npm/express", true},
-		{"pypi lower", "pypi", "Django", "5.0.1", "pkg:pypi/django@5.0.1", true},
-		{"pypi underscore", "pypi", "ruamel_yaml", "0.18.6", "pkg:pypi/ruamel-yaml@0.18.6", true},
-		{"pypi alias pip", "pip", "requests", "2.31.0", "pkg:pypi/requests@2.31.0", true},
-		{"golang alias go", "go", "rsc.io/quote", "v1.5.2", "pkg:golang/rsc.io/quote@v1.5.2", true},
-		{"crates", "crates", "serde", "1.0.197", "pkg:cargo/serde@1.0.197", true},
-		{"cargo alias", "cargo", "tokio", "1.36.0", "pkg:cargo/tokio@1.36.0", true},
-		{"composer", "packagist", "Symfony/Console", "6.4.0", "pkg:composer/symfony/console@6.4.0", true},
-		{"nuget", "nuget", "Newtonsoft.Json", "13.0.3", "pkg:nuget/Newtonsoft.Json@13.0.3", true},
-		{"gem", "rubygems", "rails", "7.1.3", "pkg:gem/rails@7.1.3", true},
-		{"huggingface", "huggingface", "microsoft/resnet-50", "main", "pkg:huggingface/microsoft/resnet-50@main", true},
-
-		// Runtime/language-form inputs — the cases the old forager mapping dropped.
-		{"language javascript", "javascript", "@scope/evil", "1.0.0", "pkg:npm/%40scope/evil@1.0.0", true},
-		{"language python", "python", "Mailconfirmer", "3.3.27", "pkg:pypi/mailconfirmer@3.3.27", true},
-		{"language ruby", "ruby", "rails", "7.1.3", "pkg:gem/rails@7.1.3", true},
-		{"language rust", "rust", "serde", "1.0.0", "pkg:cargo/serde@1.0.0", true},
-		{"language java", "java", "org.apache:commons", "1.0", "pkg:maven/org.apache/commons@1.0", true},
-		{"language dotnet", "dotnet", "Newtonsoft.Json", "13.0.3", "pkg:nuget/Newtonsoft.Json@13.0.3", true},
-		{"language php", "php", "symfony/console", "6.4.0", "pkg:composer/symfony/console@6.4.0", true},
-
-		// Malformed coordinate for the type → no PURL.
-		{"maven missing group", "maven", "commons-lang3", "3.14.0", "", false},
-		{"composer missing vendor", "packagist", "console", "6.4.0", "", false},
-
-		// Non-language ecosystems aren't handled by BuildPURL (use SourcePURLIdentity).
-		{"chrome via BuildPURL", "chrome", "abcdefghij", "1.0", "", false},
-		{"empty", "", "", "", "", false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, ok := BuildPURL(tc.eco, tc.pkg, tc.ver)
-			if ok != tc.wantOK {
-				t.Fatalf("BuildPURL(%q,%q,%q) ok = %v, want %v", tc.eco, tc.pkg, tc.ver, ok, tc.wantOK)
-			}
-			if got != tc.want {
-				t.Errorf("BuildPURL(%q,%q,%q) = %q, want %q", tc.eco, tc.pkg, tc.ver, got, tc.want)
-			}
-		})
-	}
-}
-
 func TestSourcePURLIdentity(t *testing.T) {
 	cases := []struct {
 		name             string
@@ -78,6 +26,9 @@ func TestSourcePURLIdentity(t *testing.T) {
 		{"debian eco", "debian", "debian.org", "libatopology2t64", "pkg:deb/debian/libatopology2t64", true},
 		{"fedora eco", "fedora", "fedoraproject.org", "atari800", "pkg:rpm/fedora/atari800", true},
 		{"arch eco", "arch", "archlinux.org", "franki-os-git", "pkg:alpm/arch/franki-os-git", true},
+		// AUR → the spec form: arch vendor namespace, AUR named in a repository_url
+		// qualifier (never "aur" in the namespace, which the spec reserves for the vendor).
+		{"aur eco", "aur", "archlinux.org", "bamboo-end-store-bin", "pkg:alpm/arch/bamboo-end-store-bin?repository_url=https://aur.archlinux.org", true},
 		{"wolfi eco", "wolfi", "wolfi.dev", "py3.11-jupyterlab-bin", "pkg:apk/wolfi/py3.11-jupyterlab-bin", true},
 
 		// Mislabelled ecosystem ("linux"/"macos") recovered from the domain.
@@ -101,6 +52,58 @@ func TestSourcePURLIdentity(t *testing.T) {
 	}
 }
 
+func TestSourcePURL(t *testing.T) {
+	cases := []struct {
+		name                      string
+		eco, domain, pkg, version string
+		want                      string
+		wantOK                    bool
+	}{
+		// Versioned across families: language, distro (AUR with its qualifier after
+		// the version), and an extension. Empty version yields the bare identity.
+		{"npm versioned", "npm", "npmjs.org", "lodash", "4.17.21", "pkg:npm/lodash@4.17.21", true},
+		{"aur versioned", "aur", "archlinux.org", "bamboo-end-store-bin", "1.2.2-1", "pkg:alpm/arch/bamboo-end-store-bin@1.2.2-1?repository_url=https://aur.archlinux.org", true},
+		{"openvsx versioned", "vscode", "open-vsx.org", "jinryx/crontally", "1.0.3", "pkg:vscode-extension/jinryx/crontally@1.0.3?repository_url=https://open-vsx.org", true},
+		{"aur no version", "aur", "archlinux.org", "yay", "", "pkg:alpm/arch/yay?repository_url=https://aur.archlinux.org", true},
+		// Case-insensitive types (deb/apk/alpm) lowercase the name per spec; rpm is
+		// case-sensitive and keeps it.
+		{"alpm lowercases name", "aur", "archlinux.org", "Foo-Bar", "1.0-1", "pkg:alpm/arch/foo-bar@1.0-1?repository_url=https://aur.archlinux.org", true},
+		{"deb lowercases name", "debian", "debian.org", "LibFoo", "1.0", "pkg:deb/debian/libfoo@1.0", true},
+		{"rpm preserves case", "fedora", "fedoraproject.org", "LibFoo", "1.0", "pkg:rpm/fedora/LibFoo@1.0", true},
+
+		// Language normalization: scoped npm percent-encodes the @; pypi lowercases
+		// and dashes underscores; composer lowercases vendor/name.
+		{"npm scoped", "npm", "", "@babel/core", "7.24.0", "pkg:npm/%40babel/core@7.24.0", true},
+		{"pypi normalizes", "pypi", "", "ruamel_yaml", "0.18.6", "pkg:pypi/ruamel-yaml@0.18.6", true},
+		{"composer lowercased", "packagist", "", "Symfony/Console", "6.4.0", "pkg:composer/symfony/console@6.4.0", true},
+		// huggingface keeps owner/model and is case-sensitive.
+		{"huggingface", "huggingface", "", "microsoft/resnet-50", "main", "pkg:huggingface/microsoft/resnet-50@main", true},
+
+		// Runtime/language aliases resolve to their dominant registry.
+		{"lang ruby", "ruby", "", "rails", "7.1.3", "pkg:gem/rails@7.1.3", true},
+		{"lang rust", "rust", "", "serde", "1.0.0", "pkg:cargo/serde@1.0.0", true},
+		{"lang java", "java", "", "org.apache:commons", "1.0", "pkg:maven/org.apache/commons@1.0", true},
+		{"lang php", "php", "", "symfony/console", "6.4.0", "pkg:composer/symfony/console@6.4.0", true},
+
+		// Malformed coordinate for the type → no PURL.
+		{"maven missing group", "maven", "", "commons-lang3", "3.14.0", "", false},
+		{"composer missing vendor", "packagist", "", "console", "6.4.0", "", false},
+
+		{"junk", "datasets", "", "x", "1.0", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := SourcePURL(tc.eco, tc.domain, tc.pkg, tc.version)
+			if ok != tc.wantOK {
+				t.Fatalf("SourcePURL(%q,%q,%q,%q) ok = %v, want %v", tc.eco, tc.domain, tc.pkg, tc.version, ok, tc.wantOK)
+			}
+			if got != tc.want {
+				t.Errorf("SourcePURL(%q,%q,%q,%q) = %q, want %q", tc.eco, tc.domain, tc.pkg, tc.version, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCanonicalizePURL(t *testing.T) {
 	cases := []struct{ in, want string }{
 		// Legacy fletch spellings fold onto the spec form.
@@ -114,8 +117,17 @@ func TestCanonicalizePURL(t *testing.T) {
 		{"pkg:fedora/curl", "pkg:rpm/fedora/curl"},
 		{"pkg:alpine/musl", "pkg:apk/alpine/musl"},
 
+		// Both AUR spellings fold onto the spec form (arch vendor + repository_url):
+		// the bare legacy type, and the older aur-in-namespace variation. A version
+		// keeps its place before the qualifier.
+		{"pkg:aur/yay", "pkg:alpm/arch/yay?repository_url=https://aur.archlinux.org"},
+		{"pkg:aur/yay@12.0.0-1", "pkg:alpm/arch/yay@12.0.0-1?repository_url=https://aur.archlinux.org"},
+		{"pkg:alpm/aur/bamboo-end-store-bin@1.2.2-1", "pkg:alpm/arch/bamboo-end-store-bin@1.2.2-1?repository_url=https://aur.archlinux.org"},
+		{"pkg:alpm/aur/Foo-Bar", "pkg:alpm/arch/foo-bar?repository_url=https://aur.archlinux.org"},
+
 		// Already-canonical or unremapped types pass through untouched.
 		{"pkg:npm/lodash@1.0.0", "pkg:npm/lodash@1.0.0"},
+		{"pkg:alpm/arch/pacman@6.0.1-1?arch=x86_64", "pkg:alpm/arch/pacman@6.0.1-1?arch=x86_64"},
 		{"pkg:chrome-extension/khkimila", "pkg:chrome-extension/khkimila"},
 		{"pkg:vscode-extension/pub/name?repository_url=https://open-vsx.org", "pkg:vscode-extension/pub/name?repository_url=https://open-vsx.org"},
 		{"not-a-purl", "not-a-purl"},

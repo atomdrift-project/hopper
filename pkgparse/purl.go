@@ -45,30 +45,11 @@ func languageType(ecosystem string) (string, bool) {
 	}
 }
 
-// BuildPURL returns the canonical PURL for a language-registry coordinate and
-// whether one can be formed. ecosystem may be a registry name or a runtime
-// ecosystem (see languageType); name uses each ecosystem's native separator
-// (maven "group:artifact", composer "vendor/package", npm "@scope/name", golang
-// module path); version may be empty. For non-language sources (distros, browser
-// and editor extensions), use SourcePURLIdentity, which also needs the domain.
-func BuildPURL(ecosystem, name, version string) (string, bool) {
-	typ, ok := languageType(ecosystem)
-	if !ok {
-		return "", false
-	}
-	return buildTyped(typ, name, version)
-}
-
-// PURLIdentity returns the version-less language-registry PURL (e.g.
-// "pkg:npm/lodash"). Built from the coordinate, never by stripping the version off
-// a PURL string, so an encoded "@" in a name can't confuse it.
-func PURLIdentity(ecosystem, name string) (string, bool) {
-	return BuildPURL(ecosystem, name, "")
-}
-
-// SourcePURLIdentity builds the version-less purl_base from a sample's stored
-// ecosystem, download domain, and package coordinate, across every registry
-// family fletch can fetch. Resolution order:
+// SourcePURL builds the versioned canonical PURL from a sample's stored ecosystem,
+// download domain, package coordinate, and version, across every registry family
+// fletch can fetch. It is the one resolver forager (at ingestion), hopper (at
+// backfill), and fletch (at fetch) share, so a package has a single identity
+// everywhere. Resolution order:
 //
 //   - VS Code editor extensions resolve openvsx vs the Microsoft marketplace from
 //     the domain (the ecosystem column folds both into "vscode").
@@ -79,9 +60,10 @@ func PURLIdentity(ecosystem, name string) (string, bool) {
 //     column mislabels (a Debian package tagged "linux"/"macos" still resolves via
 //     debian.org).
 //
-// Returns ok=false when no confident type resolves, leaving purl_base empty rather
-// than emitting a PURL fletch could not fetch.
-func SourcePURLIdentity(ecosystem, domain, name string) (string, bool) {
+// version may be empty (yielding the version-less identity). Returns ok=false when
+// no confident type resolves, leaving the PURL empty rather than emitting one
+// fletch could not fetch.
+func SourcePURL(ecosystem, domain, name, version string) (string, bool) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return "", false
@@ -93,18 +75,25 @@ func SourcePURLIdentity(ecosystem, domain, name string) (string, bool) {
 	// distinguishable by where it was downloaded from.
 	if eco == "vscode" || eco == "openvsx" {
 		if dom == "open-vsx.org" {
-			return buildTyped("openvsx", name, "")
+			return buildTyped("openvsx", name, version)
 		}
-		return buildTyped("vscode", name, "")
+		return buildTyped("vscode", name, version)
 	}
 
 	if typ, ok := ecosystemType(eco); ok {
-		return buildTyped(typ, name, "")
+		return buildTyped(typ, name, version)
 	}
 	if typ, ok := domainType(dom); ok {
-		return buildTyped(typ, name, "")
+		return buildTyped(typ, name, version)
 	}
 	return "", false
+}
+
+// SourcePURLIdentity returns the version-less purl_base — a package's identity
+// across versions, promoted to the indexed samples.purl_base column. It is
+// [SourcePURL] with an empty version; see there for the resolution order.
+func SourcePURLIdentity(ecosystem, domain, name string) (string, bool) {
+	return SourcePURL(ecosystem, domain, name, "")
 }
 
 // ecosystemType maps a known samples.ecosystem value to its fletch PURL type: the
@@ -254,9 +243,11 @@ func buildTyped(key, name, version string) (string, bool) {
 		return renderPURL("chrome-extension", "", lastSegment(name), version, ""), true
 
 	default:
-		// Distros → the spec deb/rpm/apk/alpm types with the distro as namespace.
-		if typ, ns, ok := distroSpec(key); ok {
-			return renderPURL(typ, ns, lastSegment(name), version, ""), true
+		// Distros → the spec deb/rpm/apk/alpm types with the distro as namespace,
+		// plus any repository qualifier the spec needs (the AUR names itself in a
+		// repository_url; fletch routes that back to the AUR RPC).
+		if d, ok := distroSpec(key); ok {
+			return renderPURL(d.typ, d.namespace, d.name(name), version, d.qualifier), true
 		}
 		// Registries the spec doesn't cover (firefox, wordpress, jetbrains, snap,
 		// homebrew, the BSDs, and the language registries gem/cargo/nuget/hex/
@@ -265,41 +256,68 @@ func buildTyped(key, name, version string) (string, bool) {
 	}
 }
 
-// distroSpec maps a distro registry key to its purl-spec type and the namespace
-// (the distro) the spec places the vendor in: Debian-family → deb, RPM-family →
-// rpm, Alpine-family → apk, Arch-family → alpm.
-func distroSpec(key string) (purlType, namespace string, ok bool) {
+// distroPURL is the purl-spec rendering of a distro registry key: the type, the
+// namespace (the distro/vendor the spec places there), an optional qualifier, and
+// whether the spec lowercases the package name.
+type distroPURL struct {
+	typ       string // deb, rpm, apk, or alpm
+	namespace string // the vendor: debian, fedora, arch, …
+	qualifier string // optional, e.g. the AUR's repository_url
+	// lowerName is true where the spec says the name is case-insensitive and must
+	// be lowercased (deb, apk, alpm). rpm is deliberately excluded: its spec marks
+	// the name case-sensitive.
+	lowerName bool
+}
+
+// distroSpec maps a distro registry key to its purl-spec rendering: Debian-family
+// → deb, RPM-family → rpm, Alpine-family → apk, Arch-family → alpm. The AUR is not
+// a vendor but a repository within the arch vendor, so the spec keeps arch in the
+// namespace and names the AUR in a repository_url qualifier (fletch routes that
+// back to the AUR RPC); every other distro carries no qualifier.
+func distroSpec(key string) (distroPURL, bool) {
 	switch key {
 	case "debian":
-		return "deb", "debian", true
+		return distroPURL{"deb", "debian", "", true}, true
 	case "ubuntu":
-		return "deb", "ubuntu", true
+		return distroPURL{"deb", "ubuntu", "", true}, true
 	case "fedora":
-		return "rpm", "fedora", true
+		return distroPURL{"rpm", "fedora", "", false}, true
 	case "opensuse":
-		return "rpm", "opensuse", true
+		return distroPURL{"rpm", "opensuse", "", false}, true
 	case "rpmfusion":
-		return "rpm", "rpmfusion", true
+		return distroPURL{"rpm", "rpmfusion", "", false}, true
 	case "arch":
-		return "alpm", "arch", true
+		return distroPURL{"alpm", "arch", "", true}, true
 	case "aur":
-		return "alpm", "aur", true
+		return distroPURL{"alpm", "arch", "repository_url=https://aur.archlinux.org", true}, true
 	case "alpine":
-		return "apk", "alpine", true
+		return distroPURL{"apk", "alpine", "", true}, true
 	case "wolfi":
-		return "apk", "wolfi", true
+		return distroPURL{"apk", "wolfi", "", true}, true
 	default:
-		return "", "", false
+		return distroPURL{}, false
 	}
+}
+
+// distroName renders a distro package name per the type's spec: the bare package
+// (any vendor path dropped), lowercased where the spec requires it.
+func (d distroPURL) name(raw string) string {
+	name := lastSegment(raw)
+	if d.lowerName {
+		return strings.ToLower(name)
+	}
+	return name
 }
 
 // CanonicalizePURL rewrites a PURL onto the spec/common-practice form we generate,
 // folding the non-spec spellings we emitted before (and that fletch still fetches)
 // so old and new identities compare equal: pkg:chrome→chrome-extension,
 // pkg:vscode/pub/name & pkg:openvsx/pub/name→vscode-extension (Open VSX keeping its
-// repository_url qualifier), and the bare distro types pkg:debian|arch|fedora|…→
-// deb/rpm/apk/alpm with the distro namespace. Inputs already in canonical form, or
-// of a type we don't remap, are returned unchanged. A string that isn't a PURL is
+// repository_url qualifier), the bare distro types pkg:debian|arch|fedora|…→
+// deb/rpm/apk/alpm with the distro namespace, and both AUR spellings (bare
+// pkg:aur/<name> and the older pkg:alpm/aur/<name>)→pkg:alpm/arch/<name> with a
+// repository_url qualifier naming the AUR. Inputs already in canonical form, or of
+// a type we don't remap, are returned unchanged. A string that isn't a PURL is
 // returned as-is.
 func CanonicalizePURL(purl string) string {
 	body, ok := strings.CutPrefix(purl, "pkg:")
@@ -326,16 +344,29 @@ func CanonicalizePURL(purl string) string {
 		return "pkg:vscode-extension/" + path + tail
 	case "openvsx":
 		return "pkg:vscode-extension/" + path + addQualifier(tail, "repository_url=https://open-vsx.org")
+	case "alpm":
+		// Fold the legacy AUR-in-namespace spelling (pkg:alpm/aur/<name>) onto the
+		// spec form: the AUR is a repository within the arch vendor, carried as a
+		// repository_url qualifier. Any other alpm namespace is already canonical.
+		if name, found := strings.CutPrefix(path, "aur/"); found {
+			aur, _ := distroSpec("aur")
+			return "pkg:alpm/arch/" + aur.name(name) + addQualifier(tail, aur.qualifier)
+		}
+		return purl
 	}
-	if spec, ns, ok := distroSpec(typ); ok {
-		return "pkg:" + spec + "/" + ns + "/" + lastSegment(path) + tail
+	if d, ok := distroSpec(typ); ok {
+		return "pkg:" + d.typ + "/" + d.namespace + "/" + d.name(path) + addQualifier(tail, d.qualifier)
 	}
 	return purl
 }
 
 // addQualifier merges one qualifier into a PURL version/qualifier tail
-// ("@v", "?k=v", "@v?k=v", or ""), leaving an already-present key untouched.
+// ("@v", "?k=v", "@v?k=v", or ""), leaving an already-present key untouched. An
+// empty qualifier is a no-op, so distro keys without one pass their tail through.
 func addQualifier(tail, qualifier string) string {
+	if qualifier == "" {
+		return tail
+	}
 	key, _, _ := strings.Cut(qualifier, "=")
 	ver, quals, hasQ := strings.Cut(tail, "?")
 	if !hasQ {
