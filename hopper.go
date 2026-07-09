@@ -381,53 +381,62 @@ func (db *DB) reportBackfill(current, total int64) {
 
 // Sample is a binary in the registry.
 type Sample struct {
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
-	FetchedAt           *time.Time
-	MarkerMtime         *time.Time
-	Mtime               *time.Time
-	LastErrorAt         *time.Time
-	FirstAnalyzedAt     *time.Time
-	AnalyzedAt          *time.Time
-	PURLBase            string
-	Elements            string
-	Package             string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	FetchedAt       *time.Time
+	MarkerMtime     *time.Time
+	Mtime           *time.Time
+	LastErrorAt     *time.Time
+	FirstAnalyzedAt *time.Time
+	AnalyzedAt      *time.Time
+	PURLBase        string
+	Elements        string
+	Package         string
+	// RegistryTitle/RegistryDescription (with RegistryDownloads below) are
+	// the marketplace display title, capped short description, and install
+	// count from the provenance sidecar's registry record, extracted at
+	// query time. Populated only by FeedSamples and SampleBySHA256.
 	RegistryTitle       string
 	RegistryDescription string
-	SHA256              string
-	Filename            string
-	FileType            string
-	Label               string
-	LabelSource         string
-	Path                string
-	Status              string
-	Note                string
-	CanonicalSHA256     string
-	Parent              string
-	Skip                string
-	Formula             string
-	Version             string
-	TraitsVersion       string
-	Domain              string
-	URL                 string
-	Ecosystem           string
-	Feed                string
-	Source              string
-	CleaveResult        []byte
-	LitmusResult        []byte
-	LLMResult           []byte
-	Provenance          []byte
-	RegistryDownloads   int64
-	LitmusScore         float64
-	ID                  int64
-	SizeBytes           int64
-	Score               int
-	MaxCrit             int
-	SuspiciousCount     int
+	// TopTraits is the JSON []TopTrait column: the sample's few strongest
+	// suspicious+ trait ids, derived on every result write (PG trigger /
+	// ParseCleaveResult). "" when nothing reaches the bar or for rows
+	// written before the column existed (healed by backfill).
+	TopTraits         string
+	SHA256            string
+	Filename          string
+	FileType          string
+	Label             string
+	LabelSource       string
+	Path              string
+	Status            string
+	Note              string
+	CanonicalSHA256   string
+	Parent            string
+	Skip              string
+	Formula           string
+	Version           string
+	TraitsVersion     string
+	Domain            string
+	URL               string
+	Ecosystem         string
+	Feed              string
+	Source            string
+	CleaveResult      []byte
+	LitmusResult      []byte
+	LLMResult         []byte
+	Provenance        []byte
+	RegistryDownloads int64
+	LitmusScore       float64
+	ID                int64
+	SizeBytes         int64
+	Score             int
+	MaxCrit           int
+	SuspiciousCount   int
 	// Corroborated mirrors the samples.corroborated column: an external threat
-	// feed has cited this sample's sha256 or purl_base. Populated only on the
-	// feed read path (scanPGSamplesFeed / scanLiteSamplesFeed); the detail path
-	// leaves it false and reads per-source detail via SightingsFor instead.
+	// feed has cited this sample's sha256 or purl_base. Populated by the feed
+	// and detail read paths (FeedSamples / SampleBySHA256, which select the
+	// registry extras); per-source detail comes from SightingsFor.
 	Corroborated bool
 }
 
@@ -562,11 +571,26 @@ type Report struct {
 	DurationMS int
 }
 
+// TopTrait is one entry in a sample's top_traits column: a suspicious-or-worse
+// trait id with its criticality level. The column stores up to three as a
+// compact JSON array (`[{"id":"objectives/exfil/dns-tunnel","crit":5}]`, ""
+// when none reach the bar) so the feed can name a row's headline traits
+// without touching the cleave blob. Derived on write by the PG trigger and by
+// ParseCleaveResult for the SQLite path — keep the two in sync.
+type TopTrait struct {
+	ID   string `json:"id"`
+	Crit int    `json:"crit"`
+}
+
+// topTraitLimit caps the top_traits column at the few chips the feed renders.
+const topTraitLimit = 3
+
 // cleaveFileInfo holds per-file metadata extracted from a cleave result.
 type cleaveFileInfo struct {
 	Formula         string
 	Elements        string
 	FileType        string
+	TopTraits       string // JSON []TopTrait, "" when none; see TopTrait
 	Score           int
 	MaxCrit         int
 	SuspiciousCount int
@@ -581,6 +605,8 @@ type CleaveParseResult struct {
 }
 
 type cleaveTraitEntry struct {
+	ID       string  `json:"id"`
+	OldID    string  `json:"i"` // v4
 	Conf     float64 `json:"conf"`
 	OldConf  float64 `json:"c"`
 	Level    int     `json:"crit"`
@@ -658,6 +684,7 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 		}
 		maxCrit := 0
 		suspicious := 0
+		var top []TopTrait
 		for _, t := range traits {
 			level := t.Level
 			if level == 0 {
@@ -668,12 +695,16 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 			}
 			if level >= 4 {
 				suspicious++
+				if id := firstNonEmptyStr(t.ID, t.OldID); id != "" {
+					top = append(top, TopTrait{ID: id, Crit: level})
+				}
 			}
 		}
 		fi = cleaveFileInfo{
 			Formula:         formula,
 			Elements:        stripSubscripts(formula),
 			FileType:        f.FileType,
+			TopTraits:       encodeTopTraits(top),
 			Score:           score,
 			MaxCrit:         maxCrit,
 			SuspiciousCount: suspicious,
@@ -701,6 +732,34 @@ func parsedCleaveFilesLookCompact(files []cleaveCompactFileEntry) bool {
 // parseCleaveFile extracts file info only (for callers that don't need canonical SHA).
 func parseCleaveFile(sha256 string, result []byte) cleaveFileInfo {
 	return ParseCleaveResult(sha256, result).FileInfo
+}
+
+// encodeTopTraits renders the top_traits column value: the highest-criticality
+// entries (stable order within a level, mirroring the finding order cleave
+// emitted), capped at topTraitLimit, as compact JSON — "" when none qualify.
+func encodeTopTraits(top []TopTrait) string {
+	if len(top) == 0 {
+		return ""
+	}
+	slices.SortStableFunc(top, func(a, b TopTrait) int { return b.Crit - a.Crit })
+	if len(top) > topTraitLimit {
+		top = top[:topTraitLimit]
+	}
+	out, err := json.Marshal(top)
+	if err != nil {
+		return ""
+	}
+	return string(out)
+}
+
+// firstNonEmptyStr returns the first non-empty string.
+func firstNonEmptyStr(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // stripSubscripts removes Unicode subscript digits (₀-₉) from a formula,

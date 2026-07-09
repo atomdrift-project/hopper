@@ -3165,8 +3165,14 @@ func TestFeedSamplesProjectionOmitsBlobs(t *testing.T) {
 	mustInsert(t, ctx, db, s)
 
 	// StoreResult persists all three JSON blobs atomically. The cleave payload
-	// yields a non-empty file_type so the row is kept, not deleted.
-	cleave := []byte(`{"fs":[{"sha":"feedproj1","type":"elf","dp":0}]}`)
+	// yields a non-empty file_type so the row is kept, not deleted, and its
+	// traits feed the derived top_traits column.
+	cleave := []byte(`{"files":[{"sha":"feedproj1","type":"elf","traits":[
+		{"id":"micro-behaviors/net/beacon","crit":4},
+		{"id":"objectives/exfil/dns-tunnel","crit":5},
+		{"id":"metadata/pkg/obfuscated","crit":4},
+		{"id":"micro-behaviors/fs/tmp-write","crit":4},
+		{"id":"metadata/pkg/minified","crit":2}]}]}`)
 	litmus := []byte(`{"class":1,"l":1}`)
 	llm := []byte(`{"summary":"benign helper"}`)
 	if _, err := db.StoreResult(ctx, "feedproj1", cleave, litmus, llm, nil, ""); err != nil {
@@ -3203,6 +3209,14 @@ func TestFeedSamplesProjectionOmitsBlobs(t *testing.T) {
 	if len(r.LitmusResult) == 0 {
 		t.Error("feed row must retain litmus_result (criticality source)")
 	}
+	// top_traits: hostile first, then suspicious in emitted order, capped at
+	// 3 — the crit-2 trait never qualifies.
+	wantTraits := `[{"id":"objectives/exfil/dns-tunnel","crit":5},` +
+		`{"id":"micro-behaviors/net/beacon","crit":4},` +
+		`{"id":"metadata/pkg/obfuscated","crit":4}]`
+	if r.TopTraits != wantTraits {
+		t.Errorf("TopTraits = %q, want %q", r.TopTraits, wantTraits)
+	}
 	// No provenance sidecar: the registry scalars stay zero rather than erroring.
 	if r.RegistryTitle != "" || r.RegistryDownloads != 0 {
 		t.Errorf("no-sidecar row must have zero registry scalars, got %q/%d", r.RegistryTitle, r.RegistryDownloads)
@@ -3229,6 +3243,15 @@ func TestFeedSamplesProjectionOmitsBlobs(t *testing.T) {
 	}
 	if rows[0].RegistryDownloads != 412033 {
 		t.Errorf("RegistryDownloads = %d, want 412033", rows[0].RegistryDownloads)
+	}
+
+	// The detail path surfaces the same registry scalars.
+	full, err = db.SampleBySHA256(ctx, "feedproj1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if full.RegistryTitle != "Volume Max — Sound Booster" || full.RegistryDownloads != 412033 {
+		t.Errorf("SampleBySHA256 registry scalars = %q/%d, want title/412033", full.RegistryTitle, full.RegistryDownloads)
 	}
 }
 

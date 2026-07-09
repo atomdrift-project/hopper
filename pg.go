@@ -87,6 +87,16 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS score INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS max_crit INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS suspicious_count INTEGER NOT NULL DEFAULT 0`,
+		// top_traits: JSON []TopTrait of the few strongest suspicious+ trait
+		// ids (see TopTrait). Nullable with no default, like litmus_class:
+		// ADD COLUMN stays metadata-only and the backfill gate (top_traits
+		// IS NULL) shrinks monotonically. The derive trigger fills it on
+		// every write; backfillTopTraitsPG heals pre-trigger rows.
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS top_traits TEXT`,
+		// Drains itself as the top_traits backfill completes, keeping each
+		// batch's gating SELECT off the heap (same pattern as elements).
+		`CREATE INDEX IF NOT EXISTS idx_samples_toptraits_pending ON samples(sha256) ` +
+			`WHERE top_traits IS NULL AND cleave_result IS NOT NULL`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS litmus_result JSONB`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS llm_result JSONB`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS litmus_score DOUBLE PRECISION NOT NULL DEFAULT 0`,
@@ -522,9 +532,11 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		END$$`,
 
 		// Trigger that derives every cleave-sourced column (file_type, score,
-		// formula, elements, max_crit, suspicious_count) from the cleave result
-		// on every write, reading the v7 'files' key first and falling back to
-		// the legacy 'fs' key for cached rows. The per-file trait array was named
+		// formula, elements, max_crit, suspicious_count, top_traits) from the
+		// cleave result on every write, reading the v7 'files' key first and
+		// falling back to the legacy 'fs' key for cached rows. top_traits
+		// mirrors encodeTopTraits (crit desc, original order within a level
+		// via WITH ORDINALITY, capped at 3) — keep the two in sync. The per-file trait array was named
 		// 'find' through v7 and renamed 'traits' in v8; max_crit/suspicious_count
 		// read 'traits' first, then 'find', then the v4 'ts' key, so a missed
 		// rename can't silently zero the criticality of every new sample (it did:
@@ -564,6 +576,25 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 				FROM jsonb_array_elements(finds) AS t
 				WHERE COALESCE(t->>'crit', t->>'l') IS NOT NULL
 					AND (COALESCE(t->>'crit', t->>'l'))::int >= 4);
+			-- Benign rows (the vast majority, including bulk-inserted archive
+			-- members) can never have top traits: suspicious_count = 0 means
+			-- no entry clears the >= 4 bar, so skip the sort/agg entirely.
+			IF NEW.suspicious_count = 0 THEN
+				NEW.top_traits := '';
+			ELSE
+				NEW.top_traits := COALESCE((
+					SELECT jsonb_agg(jsonb_build_object('id', q.id, 'crit', q.crit))::text
+					FROM (
+						SELECT COALESCE(t->>'id', t->>'i') AS id,
+							   (COALESCE(t->>'crit', t->>'l'))::int AS crit
+						FROM jsonb_array_elements(finds) WITH ORDINALITY AS f(t, ord)
+						WHERE COALESCE(t->>'crit', t->>'l') IS NOT NULL
+							AND (COALESCE(t->>'crit', t->>'l'))::int >= 4
+							AND COALESCE(t->>'id', t->>'i') IS NOT NULL
+						ORDER BY (COALESCE(t->>'crit', t->>'l'))::int DESC, ord
+						LIMIT 3
+					) AS q), '');
+			END IF;
 			RETURN NEW;
 		END;
 		$$`,
@@ -1219,7 +1250,8 @@ const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, cleave_result, litmus_result, llm_result, litmus_score,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime, traits_version,
-	url, domain, package, version, purl_base`
+	url, domain, package, version, purl_base,
+	COALESCE(top_traits, '') AS top_traits`
 
 // pgSampleColsLight excludes cleave_result and litmus_result to avoid loading
 // potentially large JSON blobs when only metadata is needed (e.g. claim queries).
@@ -1227,7 +1259,8 @@ const pgSampleColsLight = `id, sha256, source, feed, ecosystem, filename, file_t
 	size_bytes, label, label_source, litmus_score,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime, traits_version,
-	url, domain, package, version, purl_base`
+	url, domain, package, version, purl_base,
+	COALESCE(top_traits, '') AS top_traits`
 
 // pgSampleColsFeed is pgSampleCols with cleave_result — the one JSONB blob the
 // feed never renders (the archive member tree, up to megabytes) — replaced by a
@@ -1244,15 +1277,17 @@ const pgSampleColsFeed = `id, sha256, source, feed, ecosystem, filename, file_ty
 	size_bytes, label, label_source, NULL::jsonb AS cleave_result, litmus_result, llm_result, litmus_score,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime, traits_version,
-	url, domain, package, version, purl_base`
+	url, domain, package, version, purl_base,
+	COALESCE(top_traits, '') AS top_traits`
 
-// pgSampleColsFeedExtra appends the registry-record scalars the feed renders —
+// pgSampleColsRegistryExtra appends the registry-record scalars prism renders —
 // the marketplace display title, short description (capped here so an
 // essay-length listing can't bloat the projection), and install/download
-// count — extracted from the provenance sidecar's registry record. Feed-only:
-// extracting them detoasts provenance, a cost the claim/detail projections
-// don't pay, and scanPGSamplesFeed is the matching reader.
-const pgSampleColsFeedExtra = `,
+// count — extracted from the provenance sidecar's registry record. Selected
+// only by FeedSamples and SampleBySHA256: extracting them detoasts
+// provenance, a cost the claim projections don't pay. scanPGSamplesFeed and
+// scanPGSample are the matching readers.
+const pgSampleColsRegistryExtra = `,
 	COALESCE(provenance->'registry'->'record'->>'title', '') AS registry_title,
 	COALESCE(LEFT(provenance->'registry'->'record'->>'description', 300), '') AS registry_description,
 	COALESCE((provenance->'registry'->'record'->>'downloads_total')::bigint, 0) AS registry_downloads,
@@ -1268,6 +1303,7 @@ func pgSampleDest(s *Sample) []any {
 		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.FirstAnalyzedAt, &s.LastErrorAt, &s.Mtime, &s.MarkerMtime,
 		&s.TraitsVersion,
 		&s.URL, &s.Domain, &s.Package, &s.Version, &s.PURLBase,
+		&s.TopTraits,
 	}
 }
 
@@ -1281,12 +1317,15 @@ func pgSampleDestLight(s *Sample) []any {
 		&s.CreatedAt, &s.UpdatedAt, &s.AnalyzedAt, &s.FirstAnalyzedAt, &s.LastErrorAt, &s.Mtime, &s.MarkerMtime,
 		&s.TraitsVersion,
 		&s.URL, &s.Domain, &s.Package, &s.Version, &s.PURLBase,
+		&s.TopTraits,
 	}
 }
 
+// scanPGSample reads one full sample row plus the registry extras — its only
+// caller (sampleBySHA256PG) selects pgSampleCols + pgSampleColsRegistryExtra.
 func scanPGSample(row pgx.Row) (*Sample, error) {
 	s := &Sample{}
-	err := row.Scan(pgSampleDest(s)...)
+	err := row.Scan(append(pgSampleDest(s), &s.RegistryTitle, &s.RegistryDescription, &s.RegistryDownloads, &s.Corroborated)...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -2045,7 +2084,7 @@ func (db *DB) storeResultPG(
 
 func (db *DB) sampleBySHA256PG(ctx context.Context, sha256 string) (*Sample, error) {
 	s, err := scanPGSample(db.pool.QueryRow(ctx,
-		`SELECT `+pgSampleCols+` FROM samples WHERE sha256 = $1`, sha256))
+		`SELECT `+pgSampleCols+pgSampleColsRegistryExtra+` FROM samples WHERE sha256 = $1`, sha256))
 	if err != nil {
 		return nil, fmt.Errorf("hopper: sample %s: %w", sha256, err)
 	}
@@ -3595,6 +3634,16 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 	stats.Updated += lc
 	db.reportBackfill(stats.Updated, stats.Scanned)
 
+	// Pass 1e: top_traits for rows analyzed before it became a trigger-fed
+	// column. Self-draining like Pass 1d (NULL → non-NULL), gated by the
+	// partial idx_samples_toptraits_pending.
+	tt, err := db.backfillTopTraitsPG(ctx, backfillBatch)
+	if err != nil {
+		return stats, err
+	}
+	stats.Updated += tt
+	db.reportBackfill(stats.Updated, stats.Scanned)
+
 	// Pass 1: elements / max_crit / suspicious_count for rows whose cleave
 	// columns predate the derive trigger. Candidate rows have cleave_result but
 	// elements wasn't derived yet AND the JSON would actually produce a
@@ -3879,6 +3928,69 @@ func (db *DB) backfillPURLPG(ctx context.Context) (int64, error) {
 // cutoff, matching the trigger and feedClassExpr's default-cutoff path; the WHERE
 // guarantees litmus_result IS NOT NULL, so the trigger's null branch is omitted.
 // No updated_at bump: healing a derived column must not reshuffle update queues.
+// backfillTopTraitsPG heals top_traits for rows written before the derive
+// trigger learned the column, in two sweeps so the benign majority never
+// costs a cleave_result detoast: rows with suspicious_count = 0 can't have
+// top traits, so the first sweep sets ” straight from that scalar column;
+// only rows with suspicious traits pay the JSON extraction, whose expression
+// mirrors the trigger's (and encodeTopTraits) — crit desc, original order
+// within a level, capped at 3 — keep the three in sync. Does not bump
+// updated_at: healing a derived column is not a real change.
+func (db *DB) backfillTopTraitsPG(ctx context.Context, limit int) (int64, error) {
+	var total int64
+	for {
+		tag, err := db.pool.Exec(ctx, `
+			UPDATE samples SET top_traits = ''
+			WHERE sha256 IN (
+				SELECT sha256 FROM samples
+				WHERE top_traits IS NULL AND cleave_result IS NOT NULL
+					AND suspicious_count = 0
+				LIMIT $1
+			)`, limit)
+		if err != nil {
+			return total, fmt.Errorf("hopper: backfill top_traits (benign): %w", err)
+		}
+		n := tag.RowsAffected()
+		total += n
+		if n < int64(limit) {
+			break
+		}
+		slog.Info("backfill top_traits benign batch", "batch", n, "total", total)
+	}
+	for {
+		tag, err := db.pool.Exec(ctx, `
+			UPDATE samples SET top_traits = COALESCE((
+				SELECT jsonb_agg(jsonb_build_object('id', q.id, 'crit', q.crit))::text
+				FROM (
+					SELECT COALESCE(t->>'id', t->>'i') AS id,
+						   (COALESCE(t->>'crit', t->>'l'))::int AS crit
+					FROM jsonb_array_elements(
+						COALESCE(cleave_result->'files'->0->'traits', cleave_result->'files'->0->'find', cleave_result->'fs'->0->'ts', '[]'::jsonb)
+					) WITH ORDINALITY AS f(t, ord)
+					WHERE COALESCE(t->>'crit', t->>'l') IS NOT NULL
+						AND (COALESCE(t->>'crit', t->>'l'))::int >= 4
+						AND COALESCE(t->>'id', t->>'i') IS NOT NULL
+					ORDER BY (COALESCE(t->>'crit', t->>'l'))::int DESC, ord
+					LIMIT 3
+				) AS q), '')
+			WHERE sha256 IN (
+				SELECT sha256 FROM samples
+				WHERE top_traits IS NULL AND cleave_result IS NOT NULL
+					AND suspicious_count > 0
+				LIMIT $1
+			)`, limit)
+		if err != nil {
+			return total, fmt.Errorf("hopper: backfill top_traits: %w", err)
+		}
+		n := tag.RowsAffected()
+		total += n
+		if n < int64(limit) {
+			return total, nil
+		}
+		slog.Info("backfill top_traits batch", "batch", n, "total", total)
+	}
+}
+
 func (db *DB) backfillLitmusClassPG(ctx context.Context, limit int) (int64, error) {
 	var total int64
 	for {
@@ -4578,7 +4690,7 @@ func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error
 	// The class filter reads the indexed litmus_class column at the default
 	// cutoff and re-derives from litmus_result otherwise; see feedClassExpr.
 	rows, err := db.pool.Query(ctx, `
-		SELECT `+pgSampleColsFeed+pgSampleColsFeedExtra+` FROM samples
+		SELECT `+pgSampleColsFeed+pgSampleColsRegistryExtra+` FROM samples
 		WHERE ($1 = '' OR source = $1)
 			AND ($2 = '' OR label = $2)
 			AND cleave_result IS NOT NULL
@@ -4604,7 +4716,7 @@ func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error
 }
 
 // scanPGSamplesFeed is scanPGSamples plus the two feed-only registry scalars
-// pgSampleColsFeedExtra appends to the projection.
+// pgSampleColsRegistryExtra appends to the projection.
 func scanPGSamplesFeed(rows pgx.Rows) ([]*Sample, error) {
 	defer rows.Close()
 	var out []*Sample

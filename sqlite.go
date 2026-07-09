@@ -276,6 +276,10 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		{"purl_base", `ALTER TABLE samples ADD COLUMN purl_base TEXT NOT NULL DEFAULT ''`},
 		{"provenance", `ALTER TABLE samples ADD COLUMN provenance TEXT`},
 		{"fetched_at", `ALTER TABLE samples ADD COLUMN fetched_at DATETIME`},
+		// top_traits: JSON []TopTrait of the strongest suspicious+ trait ids,
+		// written by the Go result-store paths (ParseCleaveResult). Defaults
+		// to '' — pre-existing dev/test rows simply have no headline traits.
+		{"top_traits", `ALTER TABLE samples ADD COLUMN top_traits TEXT NOT NULL DEFAULT ''`},
 	} {
 		if pragmaHasColumn(ctx, db.lite, col.name) == 0 {
 			if _, err := db.lite.ExecContext(ctx, col.ddl); err != nil {
@@ -513,7 +517,8 @@ const liteSampleCols = `id, sha256, source, feed, ecosystem,
 	formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime,
 	traits_version,
-	url, domain, package, version, purl_base`
+	url, domain, package, version, purl_base,
+	COALESCE(top_traits, '') AS top_traits`
 
 // liteSampleColsLight excludes cleave_result and litmus_result to avoid
 // loading large JSON blobs when only metadata is needed.
@@ -524,7 +529,8 @@ const liteSampleColsLight = `id, sha256, source, feed, ecosystem,
 	formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime,
 	traits_version,
-	url, domain, package, version, purl_base`
+	url, domain, package, version, purl_base,
+	COALESCE(top_traits, '') AS top_traits`
 
 // liteSampleColsFeed is the SQLite counterpart of pgSampleColsFeed: liteSampleCols
 // with cleave_result — the one blob the feed never renders — replaced by a NULL
@@ -539,12 +545,13 @@ const liteSampleColsFeed = `id, sha256, source, feed, ecosystem,
 	formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime,
 	traits_version,
-	url, domain, package, version, purl_base`
+	url, domain, package, version, purl_base,
+	COALESCE(top_traits, '') AS top_traits`
 
-// liteSampleColsFeedExtra is the SQLite counterpart of pgSampleColsFeedExtra:
+// liteSampleColsRegistryExtra is the SQLite counterpart of pgSampleColsRegistryExtra:
 // the marketplace title, capped short description, and install count from the
 // provenance sidecar's registry record, read by scanLiteSamplesFeed.
-const liteSampleColsFeedExtra = `,
+const liteSampleColsRegistryExtra = `,
 	COALESCE(json_extract(provenance, '$.registry.record.title'), '') AS registry_title,
 	COALESCE(substr(json_extract(provenance, '$.registry.record.description'), 1, 300), '') AS registry_description,
 	COALESCE(json_extract(provenance, '$.registry.record.downloads_total'), 0) AS registry_downloads,
@@ -566,6 +573,7 @@ func scanLiteSamplesLight(rows *sql.Rows) ([]*Sample, error) {
 			&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &firstAnalyzedAt, &lastErrorAt, &mtime, &markerMtime,
 			&s.TraitsVersion,
 			&s.URL, &s.Domain, &s.Package, &s.Version, &s.PURLBase,
+			&s.TopTraits,
 		); err != nil {
 			return nil, err
 		}
@@ -718,6 +726,8 @@ func (db *DB) workflowSamplesSQLite(ctx context.Context, where string, limit int
 	return out, rows.Err()
 }
 
+// scanLiteSample reads one full sample row plus the registry extras — its only
+// caller (sampleBySHA256SQLite) selects liteSampleCols + liteSampleColsRegistryExtra.
 func scanLiteSample(row *sql.Row) (*Sample, error) {
 	s := &Sample{}
 	var cleaveResult, litmusResult, llmResult, status sql.NullString
@@ -730,6 +740,8 @@ func scanLiteSample(row *sql.Row) (*Sample, error) {
 		&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &firstAnalyzedAt, &lastErrorAt, &mtime, &markerMtime,
 		&s.TraitsVersion,
 		&s.URL, &s.Domain, &s.Package, &s.Version, &s.PURLBase,
+		&s.TopTraits,
+		&s.RegistryTitle, &s.RegistryDescription, &s.RegistryDownloads, &s.Corroborated,
 	)
 
 	if errors.Is(err, sql.ErrNoRows) {
@@ -772,7 +784,7 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 }
 
 // scanLiteSamplesFeed is scanLiteSamples plus the two feed-only registry
-// scalars liteSampleColsFeedExtra appends to the projection.
+// scalars liteSampleColsRegistryExtra appends to the projection.
 func scanLiteSamplesFeed(rows *sql.Rows) ([]*Sample, error) {
 	return scanLiteSamplesExtra(rows, func(s *Sample) []any {
 		return []any{&s.RegistryTitle, &s.RegistryDescription, &s.RegistryDownloads, &s.Corroborated}
@@ -797,6 +809,7 @@ func scanLiteSamplesExtra(rows *sql.Rows, extra func(*Sample) []any) ([]*Sample,
 			&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &firstAnalyzedAt, &lastErrorAt, &mtime, &markerMtime,
 			&s.TraitsVersion,
 			&s.URL, &s.Domain, &s.Package, &s.Version, &s.PURLBase,
+			&s.TopTraits,
 		}
 		if extra != nil {
 			dest = append(dest, extra(s)...)
@@ -984,16 +997,16 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename,
 			size_bytes, label, label_source, path, status,
 			canonical_sha256, parent, skip, elements,
-			max_crit, suspicious_count, mtime, marker_mtime,
+			max_crit, suspicious_count, top_traits, mtime, marker_mtime,
 			cleave_result, litmus_result,
 			url, domain, package, version, provenance, fetched_at, purl_base)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`+sampleConflictUpdateSQLite,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
 		s.SHA256, s.Parent, s.Skip, s.Elements,
-		s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
+		s.MaxCrit, s.SuspiciousCount, s.TopTraits, s.Mtime, s.MarkerMtime,
 		jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult),
 		s.URL, s.Domain, s.Package, s.Version, jsonTextOrNil(s.Provenance), s.FetchedAt, s.PURLBase)
 	if err != nil {
@@ -1280,7 +1293,7 @@ func (db *DB) refreshStaleMemberAnalysisSQLite(ctx context.Context, rows []stale
 
 func (db *DB) sampleBySHA256SQLite(ctx context.Context, sha256 string) (*Sample, error) {
 	s, err := scanLiteSample(db.lite.QueryRowContext(ctx,
-		`SELECT `+liteSampleCols+` FROM samples WHERE sha256 = ?`, sha256))
+		`SELECT `+liteSampleCols+liteSampleColsRegistryExtra+` FROM samples WHERE sha256 = ?`, sha256))
 	if err != nil {
 		return nil, fmt.Errorf("hopper: sample %s: %w", sha256, err)
 	}
@@ -1679,7 +1692,7 @@ func (db *DB) updateCleaveResultSQLite(
 	_, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET cleave_result = ?,
 			canonical_sha256 = ?, elements = ?,
-			max_crit = ?, suspicious_count = ?,
+			max_crit = ?, suspicious_count = ?, top_traits = ?,
 			litmus_result = NULL,
 			note = '', last_error_at = NULL,
 			traits_version = ?,
@@ -1688,7 +1701,7 @@ func (db *DB) updateCleaveResultSQLite(
 			analyzed_at = ?, updated_at = ?
 		WHERE sha256 = ?`,
 		string(result), canonical, fi.Elements,
-		fi.MaxCrit, fi.SuspiciousCount,
+		fi.MaxCrit, fi.SuspiciousCount, fi.TopTraits,
 		traitsVersion, n, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
@@ -1729,7 +1742,7 @@ func (db *DB) storeResultSQLite(
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE samples SET cleave_result = ?,
 			canonical_sha256 = ?, elements = ?,
-			max_crit = ?, suspicious_count = ?,
+			max_crit = ?, suspicious_count = ?, top_traits = ?,
 			litmus_result = ?, llm_result = ?,
 			note = '', last_error_at = NULL,
 			traits_version = ?, rescan_priority = 0, rescan_requested_at = NULL,
@@ -1737,7 +1750,7 @@ func (db *DB) storeResultSQLite(
 			analyzed_at = ?, updated_at = ?
 		WHERE sha256 = ?`,
 		string(truncated), p.CanonicalSHA, p.FileInfo.Elements,
-		p.FileInfo.MaxCrit, p.FileInfo.SuspiciousCount,
+		p.FileInfo.MaxCrit, p.FileInfo.SuspiciousCount, p.FileInfo.TopTraits,
 		jsonTextOrNil(litmusML), jsonTextOrNil(llm),
 		traitsVersion, nowStr, nowStr, nowStr, sha256); err != nil {
 		return StoreStats{}, fmt.Errorf("hopper: update parent: %w", err)
@@ -2473,14 +2486,14 @@ func (db *DB) updateSampleSQLite(ctx context.Context, sha256, status string, res
 	_, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET status = ?, cleave_result = ?,
 			canonical_sha256 = ?, elements = ?,
-			max_crit = ?, suspicious_count = ?,
+			max_crit = ?, suspicious_count = ?, top_traits = ?,
 			litmus_result = NULL,
 			note = '', last_error_at = NULL,
 			first_analyzed_at = COALESCE(first_analyzed_at, ?),
 			analyzed_at = ?, updated_at = ?
 		WHERE sha256 = ?`,
 		status, string(result), canonical,
-		fi.Elements, fi.MaxCrit, fi.SuspiciousCount, n, n, n, sha256)
+		fi.Elements, fi.MaxCrit, fi.SuspiciousCount, fi.TopTraits, n, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update sample: %w", err)
 	}
@@ -3615,7 +3628,7 @@ func (db *DB) applyCleanupSQLite(ctx context.Context, stage CleanupStage) (int64
 
 func (db *DB) feedSamplesSQLite(ctx context.Context, q *FeedQuery) ([]*Sample, error) {
 	where, args := q.whereSQLite()
-	query := `SELECT ` + liteSampleColsFeed + liteSampleColsFeedExtra + //nolint:gosec // built from fixed query fragments and validated sort key.
+	query := `SELECT ` + liteSampleColsFeed + liteSampleColsRegistryExtra + //nolint:gosec // built from fixed query fragments and validated sort key.
 		` FROM samples ` + where + ` ORDER BY ` + q.sortBy() + ` LIMIT ? OFFSET ?`
 	args = append(args, q.Limit, q.Offset)
 
