@@ -2703,11 +2703,6 @@ func streamCleaveIterFiles(ctx context.Context, dir string, newerThan time.Time,
 
 	start := time.Now()
 	cmd := exec.CommandContext(ctx, cleaveBinary, args...)
-	// Walk helpers count against the workers' memory budget, not the
-	// master's protected floor (see workercgroup.go).
-	if fd := workerCgroupFD.Load(); fd > 0 {
-		cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(fd)}
-	}
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 	stdout, err := cmd.StdoutPipe()
@@ -2717,6 +2712,9 @@ func streamCleaveIterFiles(ctx context.Context, dir string, newerThan time.Time,
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("cleave iter-files start: %w", err)
 	}
+	// Walk helpers count against the workers' memory budget, not the
+	// master's protected floor (see workercgroup.go).
+	moveToWorkerCgroup(cmd.Process.Pid)
 	slog.Info("cleave iter-files started", "dir", dir, "pid", cmd.Process.Pid)
 
 	var emitted int

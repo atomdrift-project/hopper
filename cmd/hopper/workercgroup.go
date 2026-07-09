@@ -23,9 +23,10 @@ import (
 // off-heap memory and the shared cgroup's reclaim evicted the *master's*
 // executable pages — the broker died for the workers' sins. With this split
 // the kernel accounts the entire worker process tree (including rizin/yara
-// grandchildren that pid-level supervision can't see), OOM-kills the whole
-// tree together the instant it blows its cap (memory.oom.group), and the
-// master's working set is never on the same reclaim LRU.
+// grandchildren that pid-level supervision can't see, and whatever they
+// allocate after entering workers/), OOM-kills the whole tree together the
+// instant it blows its cap (memory.oom.group), and the master's working set
+// is never on the same reclaim LRU.
 //
 // Everything here is best-effort: without a delegated subtree (laptop runs,
 // non-systemd rc.d, missing cgroup2) setup logs at debug and hopper behaves
@@ -45,11 +46,15 @@ const (
 	masterMemoryMin = uint64(1) << 30
 )
 
-// workerCgroupFD holds an open directory fd for the workers/ cgroup, used to
-// clone children directly into it (CLONE_INTO_CGROUP — no post-spawn move
-// race). 0 means delegation is unavailable; fd 0 itself is stdin and can
-// never be a cgroup fd. The fd stays open for the process lifetime.
-var workerCgroupFD atomic.Int64
+// workerCgroupDir holds the workers/ cgroup path once delegation succeeds;
+// nil means isolation is off. Children are spawned normally and then moved
+// in via cgroup.procs (see moveToWorkerCgroup) rather than cloned in with
+// CLONE_INTO_CGROUP: the unit's SystemCallFilter seccomp policy ENOSYSes
+// clone3 (observed on the 2026-07-09 deploy — every spawn failed with
+// "function not implemented"), and a microseconds-wide window in master/
+// before the move is a far better trade than depending on the seccomp
+// allowlist knowing clone3 on every host.
+var workerCgroupDir atomic.Pointer[string]
 
 // setupWorkerCgroup builds the subtree and publishes the workers/ fd. Call
 // once, before the first worker spawn. budgetGB is --max-rss-gb; with no
@@ -107,14 +112,22 @@ func setupWorkerCgroup(budgetGB int) {
 	if err := os.WriteFile(filepath.Join(workers, "memory.oom.group"), []byte("1"), 0); err != nil {
 		slog.Warn("could not set workers memory.oom.group", "error", err)
 	}
-	dir, err := os.Open(workers)
-	if err != nil {
-		slog.Warn("worker cgroup isolation off: cannot open workers/", "error", err)
+	workerCgroupDir.Store(&workers)
+	slog.Info("worker cgroup isolation on", "workers", workers, "budget_gb", budgetGB, "slack", workerCgroupSlack)
+}
+
+// moveToWorkerCgroup migrates a freshly spawned child into the workers/
+// cgroup. No-op when delegation is off. Best-effort: on failure the child
+// simply stays in master/, where the litmusServer RSS watchdog still bounds
+// it — log and carry on, never fail the spawn over accounting placement.
+func moveToWorkerCgroup(pid int) {
+	dir := workerCgroupDir.Load()
+	if dir == nil {
 		return
 	}
-	// Deliberately never closed: spawns need it for the process lifetime.
-	workerCgroupFD.Store(int64(dir.Fd())) //nolint:gosec // fd is a small non-negative kernel handle, nowhere near overflow
-	slog.Info("worker cgroup isolation on", "workers", workers, "budget_gb", budgetGB, "slack", workerCgroupSlack)
+	if err := os.WriteFile(filepath.Join(*dir, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0); err != nil {
+		slog.Warn("could not move child into workers cgroup", "pid", pid, "error", err)
+	}
 }
 
 // ownCgroupDir returns this process's cgroup v2 directory under the unified

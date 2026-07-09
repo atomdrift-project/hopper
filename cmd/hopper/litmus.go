@@ -413,13 +413,6 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 	// whole tree (rizin/yara children spawned by the worker) at once. Killing
 	// only the parent leaves orphaned descendants behind.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	// Clone straight into the delegated workers/ cgroup when one exists (see
-	// workercgroup.go) so the kernel bounds the worker tree's memory from its
-	// first instruction — no post-spawn move race.
-	if fd := workerCgroupFD.Load(); fd > 0 {
-		cmd.SysProcAttr.UseCgroupFD = true
-		cmd.SysProcAttr.CgroupFD = int(fd)
-	}
 	// Soft trait validation for the worker's own startup gate (see
 	// preflightCleaveValidate): reject a bundle only for load/detection flaws,
 	// not authoring hygiene. Ignored by litmus builds predating soft support.
@@ -464,6 +457,9 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 		slog.Warn("could not raise litmus oom_score_adj; worker keeps inherited OOM protection",
 			"pid", cmd.Process.Pid, "error", err)
 	}
+	// Under the kernel-enforced budget from (nearly) birth — see
+	// workercgroup.go for why this is a post-spawn move, not CLONE_INTO_CGROUP.
+	moveToWorkerCgroup(cmd.Process.Pid)
 
 	//nolint:gosec // values are sanitized or derived locally; this is a false positive on structured slog fields.
 	slog.Info("starting litmus worker",
