@@ -499,18 +499,27 @@ const liteSampleColsLight = `id, sha256, source, feed, ecosystem,
 	url, domain, package, version, purl_base`
 
 // liteSampleColsFeed is the SQLite counterpart of pgSampleColsFeed: liteSampleCols
-// with cleave_result and llm_result — the blobs the feed never renders — replaced
-// by NULL literals so the projection stays positionally identical and scanLiteSamples
-// reads it unchanged. litmus_result stays for the row's criticality. Keeps the two
-// backends' feed contract identical (a feed row carries no cleave_result).
+// with cleave_result — the one blob the feed never renders — replaced by a NULL
+// literal so the projection stays positionally identical and scanLiteSamples
+// reads it unchanged. litmus_result stays for the row's criticality, and the
+// small llm_result stays for the row's rationale. Keeps the two backends' feed
+// contract identical (a feed row carries no cleave_result).
 const liteSampleColsFeed = `id, sha256, source, feed, ecosystem,
 	filename, file_type, size_bytes, label, label_source,
-	NULL AS cleave_result, litmus_result, NULL AS llm_result, litmus_score,
+	NULL AS cleave_result, litmus_result, llm_result, litmus_score,
 	path, status, note, canonical_sha256, parent, skip,
 	formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime,
 	traits_version,
 	url, domain, package, version, purl_base`
+
+// liteSampleColsFeedExtra is the SQLite counterpart of pgSampleColsFeedExtra:
+// the marketplace title, capped short description, and install count from the
+// provenance sidecar's registry record, read by scanLiteSamplesFeed.
+const liteSampleColsFeedExtra = `,
+	COALESCE(json_extract(provenance, '$.registry.record.title'), '') AS registry_title,
+	COALESCE(substr(json_extract(provenance, '$.registry.record.description'), 1, 300), '') AS registry_description,
+	COALESCE(json_extract(provenance, '$.registry.record.downloads_total'), 0) AS registry_downloads`
 
 func scanLiteSamplesLight(rows *sql.Rows) ([]*Sample, error) {
 	defer rows.Close() //nolint:errcheck // best-effort cleanup
@@ -730,13 +739,27 @@ func scanLiteSample(row *sql.Row) (*Sample, error) {
 }
 
 func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
+	return scanLiteSamplesExtra(rows, nil)
+}
+
+// scanLiteSamplesFeed is scanLiteSamples plus the two feed-only registry
+// scalars liteSampleColsFeedExtra appends to the projection.
+func scanLiteSamplesFeed(rows *sql.Rows) ([]*Sample, error) {
+	return scanLiteSamplesExtra(rows, func(s *Sample) []any {
+		return []any{&s.RegistryTitle, &s.RegistryDescription, &s.RegistryDownloads}
+	})
+}
+
+// scanLiteSamplesExtra reads sample rows, appending extra(s)'s destinations to
+// the scan list for projections that select columns beyond liteSampleCols.
+func scanLiteSamplesExtra(rows *sql.Rows, extra func(*Sample) []any) ([]*Sample, error) {
 	defer rows.Close() //nolint:errcheck // best-effort cleanup
 	var out []*Sample
 	for rows.Next() {
 		s := &Sample{}
 		var cleaveResult, litmusResult, llmResult, status sql.NullString
 		var analyzedAt, firstAnalyzedAt, lastErrorAt, mtime, markerMtime sql.NullTime
-		if err := rows.Scan(
+		dest := []any{
 			&s.ID, &s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename,
 			&s.FileType, &s.SizeBytes, &s.Label, &s.LabelSource, &cleaveResult, &litmusResult, &llmResult, &s.LitmusScore,
 			&s.Path, &status, &s.Note, &s.CanonicalSHA256,
@@ -745,7 +768,11 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 			&s.CreatedAt, &s.UpdatedAt, &analyzedAt, &firstAnalyzedAt, &lastErrorAt, &mtime, &markerMtime,
 			&s.TraitsVersion,
 			&s.URL, &s.Domain, &s.Package, &s.Version, &s.PURLBase,
-		); err != nil {
+		}
+		if extra != nil {
+			dest = append(dest, extra(s)...)
+		}
+		if err := rows.Scan(dest...); err != nil {
 			return nil, err
 		}
 		if cleaveResult.Valid {
@@ -3453,15 +3480,15 @@ func (db *DB) applyCleanupSQLite(ctx context.Context, stage CleanupStage) (int64
 
 func (db *DB) feedSamplesSQLite(ctx context.Context, q *FeedQuery) ([]*Sample, error) {
 	where, args := q.whereSQLite()
-	query := `SELECT ` + liteSampleColsFeed + ` FROM samples ` + where + //nolint:gosec // built from fixed query fragments and validated sort key.
-		` ORDER BY ` + q.sortBy() + ` LIMIT ? OFFSET ?`
+	query := `SELECT ` + liteSampleColsFeed + liteSampleColsFeedExtra + //nolint:gosec // built from fixed query fragments and validated sort key.
+		` FROM samples ` + where + ` ORDER BY ` + q.sortBy() + ` LIMIT ? OFFSET ?`
 	args = append(args, q.Limit, q.Offset)
 
 	rows, err := db.lite.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed samples: %w", err)
 	}
-	return scanLiteSamples(rows)
+	return scanLiteSamplesFeed(rows)
 }
 
 func (db *DB) feedSamplesCountSQLite(ctx context.Context, q *FeedQuery) (int, error) {

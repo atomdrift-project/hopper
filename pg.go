@@ -1203,20 +1203,33 @@ const pgSampleColsLight = `id, sha256, source, feed, ecosystem, filename, file_t
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime, traits_version,
 	url, domain, package, version, purl_base`
 
-// pgSampleColsFeed is pgSampleCols with the two largest JSONB blobs the feed
-// never renders — cleave_result (the archive member tree, up to megabytes) and
-// llm_result — replaced by NULL literals. Selecting literals rather than the
-// columns keeps the projection positionally identical to pgSampleCols, so
-// pgSampleDest / scanPGSamples read it unchanged (CleaveResult and LLMResult
-// scan as nil), while the planner skips the heap-TOAST detoast of those columns
-// for every one of the up-to-500 feed rows. litmus_result stays: the feed
-// derives each row's criticality from it. Only feedSamplesPG uses this; the
-// detail page (SampleBySHA256) still selects the full row.
+// pgSampleColsFeed is pgSampleCols with cleave_result — the one JSONB blob the
+// feed never renders (the archive member tree, up to megabytes) — replaced by a
+// NULL literal. Selecting a literal rather than the column keeps the projection
+// positionally identical to pgSampleCols, so pgSampleDest / scanPGSamples read
+// it unchanged (CleaveResult scans as nil), while the planner skips the
+// heap-TOAST detoast of that column for every one of the up-to-500 feed rows.
+// litmus_result stays: the feed derives each row's criticality from it.
+// llm_result stays too: it is one small object (a one-sentence rationale plus
+// confidence) and the feed renders it on every suspicious/hostile row. Only
+// feedSamplesPG uses this; the detail page (SampleBySHA256) still selects the
+// full row.
 const pgSampleColsFeed = `id, sha256, source, feed, ecosystem, filename, file_type,
-	size_bytes, label, label_source, NULL::jsonb AS cleave_result, litmus_result, NULL::jsonb AS llm_result, litmus_score,
+	size_bytes, label, label_source, NULL::jsonb AS cleave_result, litmus_result, llm_result, litmus_score,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime, traits_version,
 	url, domain, package, version, purl_base`
+
+// pgSampleColsFeedExtra appends the registry-record scalars the feed renders —
+// the marketplace display title, short description (capped here so an
+// essay-length listing can't bloat the projection), and install/download
+// count — extracted from the provenance sidecar's registry record. Feed-only:
+// extracting them detoasts provenance, a cost the claim/detail projections
+// don't pay, and scanPGSamplesFeed is the matching reader.
+const pgSampleColsFeedExtra = `,
+	COALESCE(provenance->'registry'->'record'->>'title', '') AS registry_title,
+	COALESCE(LEFT(provenance->'registry'->'record'->>'description', 300), '') AS registry_description,
+	COALESCE((provenance->'registry'->'record'->>'downloads_total')::bigint, 0) AS registry_downloads`
 
 func pgSampleDest(s *Sample) []any {
 	return []any{
@@ -4444,7 +4457,7 @@ func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error
 	// The class filter reads the indexed litmus_class column at the default
 	// cutoff and re-derives from litmus_result otherwise; see feedClassExpr.
 	rows, err := db.pool.Query(ctx, `
-		SELECT `+pgSampleColsFeed+` FROM samples
+		SELECT `+pgSampleColsFeed+pgSampleColsFeedExtra+` FROM samples
 		WHERE ($1 = '' OR source = $1)
 			AND ($2 = '' OR label = $2)
 			AND cleave_result IS NOT NULL
@@ -4465,7 +4478,23 @@ func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed samples: %w", err)
 	}
-	return scanPGSamples(rows)
+	return scanPGSamplesFeed(rows)
+}
+
+// scanPGSamplesFeed is scanPGSamples plus the two feed-only registry scalars
+// pgSampleColsFeedExtra appends to the projection.
+func scanPGSamplesFeed(rows pgx.Rows) ([]*Sample, error) {
+	defer rows.Close()
+	var out []*Sample
+	for rows.Next() {
+		s := &Sample{}
+		if err := rows.Scan(append(pgSampleDest(s), &s.RegistryTitle, &s.RegistryDescription, &s.RegistryDownloads)...); err != nil {
+			return nil, err
+		}
+		s.restoreJSONB()
+		out = append(out, s)
+	}
+	return out, rows.Err()
 }
 
 func (db *DB) feedSamplesCountPG(ctx context.Context, q *FeedQuery) (int, error) {

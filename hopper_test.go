@@ -3183,7 +3183,9 @@ func TestFeedSamplesProjectionOmitsBlobs(t *testing.T) {
 			len(full.CleaveResult), len(full.LitmusResult), len(full.LLMResult))
 	}
 
-	// The feed drops the two blobs it never renders but keeps litmus_result.
+	// The feed drops the one blob it never renders (cleave_result) but keeps
+	// litmus_result (criticality source) and the small llm_result (per-row
+	// rationale).
 	rows, err := db.FeedSamples(ctx, &FeedQuery{Source: "test", Limit: 10})
 	if err != nil {
 		t.Fatal(err)
@@ -3195,11 +3197,38 @@ func TestFeedSamplesProjectionOmitsBlobs(t *testing.T) {
 	if r.CleaveResult != nil {
 		t.Errorf("feed row must omit cleave_result, got %d bytes", len(r.CleaveResult))
 	}
-	if r.LLMResult != nil {
-		t.Errorf("feed row must omit llm_result, got %d bytes", len(r.LLMResult))
+	if len(r.LLMResult) == 0 {
+		t.Error("feed row must retain llm_result (rationale source)")
 	}
 	if len(r.LitmusResult) == 0 {
 		t.Error("feed row must retain litmus_result (criticality source)")
+	}
+	// No provenance sidecar: the registry scalars stay zero rather than erroring.
+	if r.RegistryTitle != "" || r.RegistryDownloads != 0 {
+		t.Errorf("no-sidecar row must have zero registry scalars, got %q/%d", r.RegistryTitle, r.RegistryDownloads)
+	}
+
+	// A sidecar with a registry record surfaces its marketplace title,
+	// description, and install count on the feed row.
+	sidecar := []byte(`{"schema_version":1,"registry":{"record":{"ecosystem":"chrome","name":"abcdef","title":"Volume Max — Sound Booster","description":"Boost your volume up to 600%.","downloads_total":412033}}}`)
+	if ok, err := db.SetProvenance(ctx, &Sample{SHA256: "feedproj1", Provenance: sidecar}); err != nil || !ok {
+		t.Fatalf("SetProvenance: ok=%v err=%v", ok, err)
+	}
+	rows, err = db.FeedSamples(ctx, &FeedQuery{Source: "test", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 feed row, got %d", len(rows))
+	}
+	if rows[0].RegistryTitle != "Volume Max — Sound Booster" {
+		t.Errorf("RegistryTitle = %q, want the sidecar's record title", rows[0].RegistryTitle)
+	}
+	if rows[0].RegistryDescription != "Boost your volume up to 600%." {
+		t.Errorf("RegistryDescription = %q, want the sidecar's record description", rows[0].RegistryDescription)
+	}
+	if rows[0].RegistryDownloads != 412033 {
+		t.Errorf("RegistryDownloads = %d, want 412033", rows[0].RegistryDownloads)
 	}
 }
 

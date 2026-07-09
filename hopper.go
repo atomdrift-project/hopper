@@ -381,46 +381,49 @@ func (db *DB) reportBackfill(current, total int64) {
 
 // Sample is a binary in the registry.
 type Sample struct {
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
-	SHA256          string
-	Source          string
-	Feed            string
-	Ecosystem       string
-	URL             string // canonical URL the bytes were fetched from
-	Domain          string // registered domain (eTLD+1), populated via golang.org/x/net/publicsuffix
-	Package         string // software package this file belongs to, e.g. "lodash" or "@vue/cli"
-	Version         string // package version, e.g. "4.17.21"
-	PURLBase        string // version-less canonical PURL, e.g. "pkg:npm/lodash"; "" if not a known package ecosystem
-	Filename        string
-	FileType        string
-	Label           string // "bad", "good", "unknown"
-	LabelSource     string
-	Path            string
-	Status          string
-	Note            string
-	CanonicalSHA256 string // min SHA256 across sample + embedded files; for train/test split
-	Parent          string // SHA256 of archive this was extracted from; "" for top-level
-	Skip            string // non-empty = excluded from training, value = reason
-	Formula         string // cleave chemical formula (behavioral signature)
-	Elements        string // formula without counts (qualitative composition)
-	TraitsVersion   string // short prefix of traits repo commit used for analysis
-	AnalyzedAt      *time.Time
-	FirstAnalyzedAt *time.Time
-	LastErrorAt     *time.Time
-	Mtime           *time.Time
-	MarkerMtime     *time.Time
-	FetchedAt       *time.Time // when the collector fetched the artifact (UTC); distinct from CreatedAt
-	CleaveResult    []byte     // raw cleave JSON, nil if unanalyzed
-	LitmusResult    []byte     // litmus classification envelope JSON, nil if unclassified
-	LLMResult       []byte     // LLM interpretation JSON (envelope `llm`), nil when no interpretation pass ran
-	Provenance      []byte     // collector provenance sidecar JSON, nil if none
-	LitmusScore     float64    // litmus confidence score (0.0-1.0)
-	ID              int64
-	SizeBytes       int64
-	Score           int // cleave raw score
-	MaxCrit         int // max trait criticality level (5=hostile, 4=suspicious, ...)
-	SuspiciousCount int // count of traits with level>=4 (suspicious or hostile)
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+	FetchedAt           *time.Time
+	MarkerMtime         *time.Time
+	Mtime               *time.Time
+	LastErrorAt         *time.Time
+	FirstAnalyzedAt     *time.Time
+	AnalyzedAt          *time.Time
+	PURLBase            string
+	Elements            string
+	Package             string
+	RegistryTitle       string
+	RegistryDescription string
+	SHA256              string
+	Filename            string
+	FileType            string
+	Label               string
+	LabelSource         string
+	Path                string
+	Status              string
+	Note                string
+	CanonicalSHA256     string
+	Parent              string
+	Skip                string
+	Formula             string
+	Version             string
+	TraitsVersion       string
+	Domain              string
+	URL                 string
+	Ecosystem           string
+	Feed                string
+	Source              string
+	CleaveResult        []byte
+	LitmusResult        []byte
+	LLMResult           []byte
+	Provenance          []byte
+	RegistryDownloads   int64
+	LitmusScore         float64
+	ID                  int64
+	SizeBytes           int64
+	Score               int
+	MaxCrit             int
+	SuspiciousCount     int
 }
 
 // restoreJSONB reverses the write-time nulSentinel substitution on a sample's
