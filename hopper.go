@@ -424,6 +424,11 @@ type Sample struct {
 	Score               int
 	MaxCrit             int
 	SuspiciousCount     int
+	// Corroborated mirrors the samples.corroborated column: an external threat
+	// feed has cited this sample's sha256 or purl_base. Populated only on the
+	// feed read path (scanPGSamplesFeed / scanLiteSamplesFeed); the detail path
+	// leaves it false and reads per-source detail via SightingsFor instead.
+	Corroborated bool
 }
 
 // restoreJSONB reverses the write-time nulSentinel substitution on a sample's
@@ -3268,6 +3273,7 @@ type FeedQuery struct {
 	Domains       []string // optional: filter by domain column values
 	LitmusClasses []int    // optional: filter by litmus_result class values
 	RequireLitmus bool     // require any litmus_result without filtering by class
+	Corroborated  bool     // only samples cited by an external threat feed (samples.corroborated)
 	TopLevelOnly  bool     // only samples with no archive parent
 	Offset        int      // pagination offset
 	Limit         int      // page size (clamped to 1–1000)
@@ -3476,6 +3482,71 @@ func (q *FeedQuery) sortBy() string {
 	default:
 		return "mtime DESC NULLS LAST"
 	}
+}
+
+// Sighting is one external-corroboration record: an outside source (threat
+// feed, scanner, blog, advisory) cited a subject.
+//
+// Subject is either a lowercase-hex sha256 or a PURL. For a PURL the canonical
+// form is the VERSION-LESS purl_base (pkg:npm/lodash, not pkg:npm/lodash@1.2.3):
+// it is what samples.purl_base holds and what prism queries, so both the
+// corroborated-flag match and SightingsFor are clean exact-equality lookups. A
+// source that flagged one specific version records that version in Note or URL,
+// not in Subject. The zero value is a harmless no-op that AddSightings skips.
+type Sighting struct {
+	FirstSeen time.Time // set by the store on first insert; ignored on write
+	Source    string    // 'aikido','osv','socket','clamav','cyclotron:bleepingcomputer'
+	Subject   string    // a sha256, or a version-less PURL (purl_base)
+	URL       string    // advisory / blog / report link (optional)
+	Note      string    // source's own tag: 'malware','MAL-2024-1234' (optional)
+}
+
+// valid reports whether the sighting carries the minimum to be stored: a source
+// and a subject that is a sha256 or a PURL. Callers should normalize a sha256 to
+// lowercase before this; a PURL is matched by its "pkg:" prefix.
+func (s Sighting) valid() bool {
+	if s.Source == "" || s.Subject == "" {
+		return false
+	}
+	return isSHA256Hex(s.Subject) || strings.HasPrefix(s.Subject, "pkg:")
+}
+
+// AddSightings idempotently upserts external-corroboration records and flips
+// samples.corroborated true for any sample whose sha256 or purl_base a newly
+// changed sighting matches. Re-recording an unchanged sighting is a no-op (the
+// delta-guarded upsert writes nothing), so a producer may safely re-push a whole
+// feed snapshot on every poll. Invalid entries (missing source, or a subject
+// that is neither a sha256 nor a PURL) are skipped. Returns the number of
+// sightings inserted or updated.
+func (db *DB) AddSightings(ctx context.Context, s []Sighting) (int, error) {
+	valid := s[:0:0]
+	for _, x := range s {
+		if x.valid() {
+			valid = append(valid, x)
+		}
+	}
+	if len(valid) == 0 {
+		return 0, nil
+	}
+	if db.pool != nil {
+		return db.addSightingsPG(ctx, valid)
+	}
+	return db.addSightingsSQLite(ctx, valid)
+}
+
+// SightingsFor returns every sighting whose subject is in subjects, grouped by
+// subject. Callers pool the sha256 and purl_base of the samples they are
+// rendering (one page, or one sample's [sha, purl]) and read the map back. An
+// empty subjects slice returns an empty map.
+func (db *DB) SightingsFor(ctx context.Context, subjects []string) (map[string][]Sighting, error) {
+	out := make(map[string][]Sighting, len(subjects))
+	if len(subjects) == 0 {
+		return out, nil
+	}
+	if db.pool != nil {
+		return db.sightingsForPG(ctx, subjects)
+	}
+	return db.sightingsForSQLite(ctx, subjects)
 }
 
 // InsertReport stores an analysis report. Multiple reports per sample are allowed;

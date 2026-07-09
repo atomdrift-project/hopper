@@ -48,6 +48,9 @@ CREATE TABLE IF NOT EXISTS samples (
 	                   STORED,
 	max_crit      INTEGER NOT NULL DEFAULT 0,
 	suspicious_count INTEGER NOT NULL DEFAULT 0,
+	-- corroborated: 1 when an external threat feed has cited this sample's sha256
+	-- or purl_base (see the sightings table). SQLite mirror of the PG boolean.
+	corroborated  INTEGER NOT NULL DEFAULT 0,
 	created_at    DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
 	updated_at    DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
 
@@ -79,6 +82,19 @@ CREATE TABLE IF NOT EXISTS reports (
 );
 
 CREATE INDEX IF NOT EXISTS idx_reports_sha256_type ON reports(sha256, report_type);
+
+-- sightings: external-corroboration ledger. SQLite mirror of schema.sql's table.
+-- subject is a sha256 or a PURL; the primary key makes writes idempotent.
+CREATE TABLE IF NOT EXISTS sightings (
+	source     TEXT NOT NULL,
+	subject    TEXT NOT NULL,
+	url        TEXT NOT NULL DEFAULT '',
+	note       TEXT NOT NULL DEFAULT '',
+	first_seen DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+	PRIMARY KEY (source, subject)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sightings_subject ON sightings(subject);
 
 CREATE TABLE IF NOT EXISTS workers (
 	name      TEXT PRIMARY KEY,

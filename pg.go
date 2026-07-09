@@ -151,6 +151,32 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// Grafana analysis-latency panels bucket reports by created_at over wide
 		// ranges; idx_reports_sha256_type doesn't help time-range scans.
 		`CREATE INDEX IF NOT EXISTS idx_reports_created_at ON reports(created_at DESC)`,
+		// External-corroboration ledger (see schema.sql) and the denormalized
+		// samples.corroborated flag it maintains. The ADD COLUMN has a constant
+		// default, so it is a metadata-only change (no table rewrite) on PG11+.
+		`CREATE TABLE IF NOT EXISTS sightings (
+			source     TEXT NOT NULL,
+			subject    TEXT NOT NULL,
+			url        TEXT NOT NULL DEFAULT '',
+			note       TEXT NOT NULL DEFAULT '',
+			first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+			PRIMARY KEY (source, subject)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_sightings_subject ON sightings(subject)`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS corroborated BOOLEAN NOT NULL DEFAULT false`,
+		// Partial indexes holding only corroborated top-level ready rows: the
+		// "?feeds=1" filter (FeedQuery.Corroborated) walks these in created_at
+		// order and stops at LIMIT without a sort, and because the subset is a
+		// small fraction of samples the index stays tiny. One plain-recency and
+		// one ecosystem-prefixed variant, mirroring idx_samples_top_ready_created
+		// / idx_samples_eco_top_created so an ecosystem-filtered corroborated feed
+		// is also an ordered seek.
+		`CREATE INDEX IF NOT EXISTS idx_samples_corroborated_created ` +
+			`ON samples(created_at DESC) ` +
+			`WHERE corroborated AND parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_corroborated_eco_created ` +
+			`ON samples(ecosystem, created_at DESC) ` +
+			`WHERE corroborated AND parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL`,
 		// benignReviewPG / badReviewPG filter on skip='misclassified' which is excluded
 		// from idx_samples_review (WHERE skip=''). Separate partial index for misclassified review.
 		`CREATE INDEX IF NOT EXISTS idx_samples_misclassified_review ` +
@@ -1229,7 +1255,8 @@ const pgSampleColsFeed = `id, sha256, source, feed, ecosystem, filename, file_ty
 const pgSampleColsFeedExtra = `,
 	COALESCE(provenance->'registry'->'record'->>'title', '') AS registry_title,
 	COALESCE(LEFT(provenance->'registry'->'record'->>'description', 300), '') AS registry_description,
-	COALESCE((provenance->'registry'->'record'->>'downloads_total')::bigint, 0) AS registry_downloads`
+	COALESCE((provenance->'registry'->'record'->>'downloads_total')::bigint, 0) AS registry_downloads,
+	corroborated`
 
 func pgSampleDest(s *Sample) []any {
 	return []any{
@@ -3205,6 +3232,100 @@ func (db *DB) staleSamplesPG(ctx context.Context, prefixes []string, olderThan t
 	return scanPGSamples(rows)
 }
 
+// sightingUpsertChunk bounds one INSERT…unnest statement so a producer pushing a
+// whole feed snapshot (tens of thousands of rows) is split into several ordinary
+// statements rather than one enormous array literal. AddSightings loops over the
+// input in chunks of this size.
+const sightingUpsertChunk = 5000
+
+func (db *DB) addSightingsPG(ctx context.Context, s []Sighting) (int, error) {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: add sightings: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rolled back unless Commit succeeds
+
+	changed := make(map[string]struct{})
+	for start := 0; start < len(s); start += sightingUpsertChunk {
+		end := min(start+sightingUpsertChunk, len(s))
+		batch := s[start:end]
+		sources := make([]string, len(batch))
+		subjects := make([]string, len(batch))
+		urls := make([]string, len(batch))
+		notes := make([]string, len(batch))
+		for i, x := range batch {
+			sources[i], subjects[i], urls[i], notes[i] = x.Source, x.Subject, x.URL, x.Note
+		}
+		// Delta-guarded upsert: an unchanged row (same url+note) trips the WHERE
+		// and writes nothing, so re-pushing a snapshot is near-free. RETURNING
+		// yields only the rows that actually inserted or changed — the real delta
+		// we feed into the samples flag update below.
+		rows, err := tx.Query(ctx, `
+			INSERT INTO sightings (source, subject, url, note)
+			SELECT src, subj, u, n
+			FROM unnest($1::text[], $2::text[], $3::text[], $4::text[]) AS t(src, subj, u, n)
+			ON CONFLICT (source, subject) DO UPDATE
+				SET url = EXCLUDED.url, note = EXCLUDED.note
+				WHERE sightings.url IS DISTINCT FROM EXCLUDED.url
+				   OR sightings.note IS DISTINCT FROM EXCLUDED.note
+			RETURNING subject`, sources, subjects, urls, notes)
+		if err != nil {
+			return 0, fmt.Errorf("hopper: upsert sightings: %w", err)
+		}
+		for rows.Next() {
+			var subj string
+			if err := rows.Scan(&subj); err != nil {
+				rows.Close()
+				return 0, fmt.Errorf("hopper: scan sighting subject: %w", err)
+			}
+			changed[subj] = struct{}{}
+		}
+		if err := rows.Err(); err != nil {
+			return 0, fmt.Errorf("hopper: upsert sightings: %w", err)
+		}
+	}
+
+	if len(changed) > 0 {
+		subs := make([]string, 0, len(changed))
+		for subj := range changed {
+			subs = append(subs, subj)
+		}
+		// Flip the denormalized flag only for the changed subjects, guarded by
+		// NOT corroborated so a re-run touches nothing. The sha256/purl_base OR
+		// lives here on the write path, never in the feed read query.
+		if _, err := tx.Exec(ctx, `
+			UPDATE samples SET corroborated = true
+			WHERE NOT corroborated AND (sha256 = ANY($1) OR purl_base = ANY($1))`, subs); err != nil {
+			return 0, fmt.Errorf("hopper: mark corroborated: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("hopper: commit sightings: %w", err)
+	}
+	return len(changed), nil
+}
+
+func (db *DB) sightingsForPG(ctx context.Context, subjects []string) (map[string][]Sighting, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT source, subject, url, note, first_seen
+		FROM sightings WHERE subject = ANY($1)
+		ORDER BY source`, subjects)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: sightings for subjects: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string][]Sighting, len(subjects))
+	for rows.Next() {
+		var x Sighting
+		if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen); err != nil {
+			return nil, fmt.Errorf("hopper: scan sighting: %w", err)
+		}
+		out[x.Subject] = append(out[x.Subject], x)
+	}
+	return out, rows.Err()
+}
+
 func (db *DB) insertReportPG(ctx context.Context, r *Report) error {
 	_, err := db.pool.Exec(ctx, `
 		INSERT INTO reports (sha256, report_type, content, provider, duration_ms)
@@ -4470,11 +4591,12 @@ func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error
 			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))
 			AND ($12 = '' OR filename ILIKE '%' || $12 || '%' ESCAPE '\'
 				OR sha256 = $12)
+			AND (NOT $13 OR corroborated)
 		ORDER BY `+q.sortBy()+`
 		LIMIT $10 OFFSET $11`,
 		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
 		q.Formula, q.requireLitmus(), q.Domains, q.Limit, q.Offset,
-		q.searchTerm())
+		q.searchTerm(), q.Corroborated)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed samples: %w", err)
 	}
@@ -4488,7 +4610,7 @@ func scanPGSamplesFeed(rows pgx.Rows) ([]*Sample, error) {
 	var out []*Sample
 	for rows.Next() {
 		s := &Sample{}
-		if err := rows.Scan(append(pgSampleDest(s), &s.RegistryTitle, &s.RegistryDescription, &s.RegistryDownloads)...); err != nil {
+		if err := rows.Scan(append(pgSampleDest(s), &s.RegistryTitle, &s.RegistryDescription, &s.RegistryDownloads, &s.Corroborated)...); err != nil {
 			return nil, err
 		}
 		s.restoreJSONB()
@@ -4512,9 +4634,10 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q *FeedQuery) (int, error)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
 			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))
 			AND ($10 = '' OR filename ILIKE '%' || $10 || '%' ESCAPE '\'
-				OR sha256 = $10)`,
+				OR sha256 = $10)
+			AND (NOT $11 OR corroborated)`,
 		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
-		q.Formula, q.requireLitmus(), q.Domains, q.searchTerm()).Scan(&n)
+		q.Formula, q.requireLitmus(), q.Domains, q.searchTerm(), q.Corroborated).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: feed samples count: %w", err)
 	}

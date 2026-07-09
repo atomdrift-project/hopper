@@ -293,6 +293,34 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		}
 	}
 
+	// External-corroboration flag + ledger (see schema.sql). SQLite mirror of the
+	// PG migration: the boolean is an INTEGER 0/1 column, maintained by
+	// AddSightings, and drives the feed's corroborated-only filter.
+	if pragmaHasColumn(ctx, db.lite, "corroborated") == 0 {
+		if _, err := db.lite.ExecContext(ctx,
+			`ALTER TABLE samples ADD COLUMN corroborated INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite samples.corroborated: %w", err)
+		}
+	}
+	for _, ddl := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_samples_corroborated ` +
+			`ON samples(created_at) ` +
+			`WHERE corroborated = 1 AND parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL`,
+		`CREATE TABLE IF NOT EXISTS sightings (
+			source     TEXT NOT NULL,
+			subject    TEXT NOT NULL,
+			url        TEXT NOT NULL DEFAULT '',
+			note       TEXT NOT NULL DEFAULT '',
+			first_seen DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+			PRIMARY KEY (source, subject)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_sightings_subject ON sightings(subject)`,
+	} {
+		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite sightings: %w", err)
+		}
+	}
+
 	// Covers FP/FN seed queries ordered by impact. SQLite needs the explicit
 	// `litmus_score IS NULL` prefix to match the `NULLS LAST` semantics our
 	// queries use (see liteSeedOrder).
@@ -519,7 +547,8 @@ const liteSampleColsFeed = `id, sha256, source, feed, ecosystem,
 const liteSampleColsFeedExtra = `,
 	COALESCE(json_extract(provenance, '$.registry.record.title'), '') AS registry_title,
 	COALESCE(substr(json_extract(provenance, '$.registry.record.description'), 1, 300), '') AS registry_description,
-	COALESCE(json_extract(provenance, '$.registry.record.downloads_total'), 0) AS registry_downloads`
+	COALESCE(json_extract(provenance, '$.registry.record.downloads_total'), 0) AS registry_downloads,
+	corroborated`
 
 func scanLiteSamplesLight(rows *sql.Rows) ([]*Sample, error) {
 	defer rows.Close() //nolint:errcheck // best-effort cleanup
@@ -746,7 +775,7 @@ func scanLiteSamples(rows *sql.Rows) ([]*Sample, error) {
 // scalars liteSampleColsFeedExtra appends to the projection.
 func scanLiteSamplesFeed(rows *sql.Rows) ([]*Sample, error) {
 	return scanLiteSamplesExtra(rows, func(s *Sample) []any {
-		return []any{&s.RegistryTitle, &s.RegistryDescription, &s.RegistryDownloads}
+		return []any{&s.RegistryTitle, &s.RegistryDescription, &s.RegistryDownloads, &s.Corroborated}
 	})
 }
 
@@ -2601,6 +2630,112 @@ func (db *DB) staleSamplesSQLite(ctx context.Context, prefixes []string, olderTh
 	return scanLiteSamples(rows)
 }
 
+func (db *DB) addSightingsSQLite(ctx context.Context, s []Sighting) (int, error) {
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: add sightings: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // rolled back unless Commit succeeds
+
+	// SQLite has no array unnest, so upsert row by row. RETURNING (SQLite 3.35+,
+	// bundled by mattn) yields the changed subjects for the flag update, matching
+	// the PG delta guard: the WHERE skips rows whose url+note are unchanged.
+	changed := make(map[string]struct{})
+	for i := range s {
+		var subj string
+		err := tx.QueryRowContext(ctx, `
+			INSERT INTO sightings (source, subject, url, note)
+			VALUES (?, ?, ?, ?)
+			ON CONFLICT (source, subject) DO UPDATE
+				SET url = excluded.url, note = excluded.note
+				WHERE sightings.url IS NOT excluded.url
+				   OR sightings.note IS NOT excluded.note
+			RETURNING subject`, s[i].Source, s[i].Subject, s[i].URL, s[i].Note).Scan(&subj)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue // unchanged row: DO UPDATE guard tripped, nothing returned
+		}
+		if err != nil {
+			return 0, fmt.Errorf("hopper: upsert sighting: %w", err)
+		}
+		changed[subj] = struct{}{}
+	}
+
+	if len(changed) > 0 {
+		subs := make([]string, 0, len(changed))
+		for subj := range changed {
+			subs = append(subs, subj)
+		}
+		// Flip the flag for changed subjects, guarded by corroborated = 0.
+		// Chunked IN lists keep any single statement bounded.
+		const chunk = 500
+		for start := 0; start < len(subs); start += chunk {
+			end := min(start+chunk, len(subs))
+			batch := subs[start:end]
+			ph := make([]string, len(batch))
+			args := make([]any, 0, len(batch)*2)
+			for i := range batch {
+				ph[i] = "?"
+			}
+			for i := range batch {
+				args = append(args, batch[i])
+			}
+			for i := range batch {
+				args = append(args, batch[i])
+			}
+			list := strings.Join(ph, ", ")
+			//nolint:gosec // G202: list is fixed "?" placeholders; subjects are bound args.
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE samples SET corroborated = 1 WHERE corroborated = 0 AND `+
+					`(sha256 IN (`+list+`) OR purl_base IN (`+list+`))`, args...); err != nil {
+				return 0, fmt.Errorf("hopper: mark corroborated: %w", err)
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("hopper: commit sightings: %w", err)
+	}
+	return len(changed), nil
+}
+
+func (db *DB) sightingsForSQLite(ctx context.Context, subjects []string) (map[string][]Sighting, error) {
+	out := make(map[string][]Sighting, len(subjects))
+	const chunk = 500
+	// One chunk per closure so defer rows.Close() runs at chunk boundary, not
+	// function exit — SQLite has no array binding, so subjects go in an IN list.
+	readChunk := func(batch []string) error {
+		ph := make([]string, len(batch))
+		args := make([]any, len(batch))
+		for i := range batch {
+			ph[i] = "?"
+			args[i] = batch[i]
+		}
+		//nolint:gosec // G202: ph is a slice of fixed "?" placeholders; subjects are bound args.
+		rows, err := db.lite.QueryContext(ctx,
+			`SELECT source, subject, url, note, first_seen FROM sightings `+
+				`WHERE subject IN (`+strings.Join(ph, ", ")+`) ORDER BY source`, args...)
+		if err != nil {
+			return fmt.Errorf("hopper: sightings for subjects: %w", err)
+		}
+		defer rows.Close() //nolint:errcheck // best-effort cleanup
+		for rows.Next() {
+			var x Sighting
+			if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen); err != nil {
+				return fmt.Errorf("hopper: scan sighting: %w", err)
+			}
+			out[x.Subject] = append(out[x.Subject], x)
+		}
+		return rows.Err()
+	}
+	for start := 0; start < len(subjects); start += chunk {
+		end := min(start+chunk, len(subjects))
+		if err := readChunk(subjects[start:end]); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 func (db *DB) insertReportSQLite(ctx context.Context, r *Report) error {
 	_, err := db.lite.ExecContext(ctx, `
 		INSERT INTO reports (sha256, report_type, content, provider, duration_ms)
@@ -3569,6 +3704,10 @@ func (q *FeedQuery) whereSQLite() (where string, args []any) {
 
 	if q.TopLevelOnly {
 		clauses = append(clauses, "parent = ''")
+	}
+
+	if q.Corroborated {
+		clauses = append(clauses, "corroborated = 1")
 	}
 
 	if q.Formula != "" {

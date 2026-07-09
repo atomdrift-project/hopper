@@ -594,6 +594,7 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/result", s.handleResult)
 	mux.HandleFunc("POST /api/upload", s.handleUpload)
 	mux.HandleFunc("POST /api/known", s.handleKnown)
+	mux.HandleFunc("POST /api/sightings", s.handleSightings)
 	mux.HandleFunc("POST /api/triage", s.handleTriage)
 	mux.HandleFunc("POST /api/rescan/{sha256}", s.handleRescan)
 	mux.HandleFunc("GET /api/file/{sha256}", s.handleFile)
@@ -2072,6 +2073,114 @@ func (s *apiServer) handleKnown(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(knownResponse{Known: known}) //nolint:errcheck,errchkjson // best-effort response
+}
+
+// maxSightingsBatch caps the records one /api/sightings request may carry.
+// Producers pushing a large feed snapshot (Aikido, OSV) chunk into requests of
+// at most this size; the store upserts each request in its own transaction.
+const maxSightingsBatch = 50000
+
+// maxSightingBody bounds the request body. Each record is small (a source, a
+// subject, an optional url + note); this leaves generous headroom per row.
+const maxSightingBody = maxSightingsBatch * 1024
+
+type sightingRequest struct {
+	Source  string `json:"source"`
+	Subject string `json:"subject"`
+	URL     string `json:"url"`
+	Note    string `json:"note"`
+}
+
+type sightingsResponse struct {
+	Changed int `json:"changed"`
+}
+
+// handleSightings idempotently records external-corroboration sightings. A
+// producer (gauntlet, forager, cyclotron, promoter) POSTs the citations it
+// already parsed; the store upserts them and flips samples.corroborated for any
+// matching sample. Re-pushing an unchanged snapshot is a cheap no-op, so a
+// producer may safely re-send on every poll.
+//
+// Body is either a JSON array ([{source,subject,url,note},…]) for the small
+// trickle, or NDJSON (one object per line, Content-Type application/x-ndjson)
+// for streaming a large feed. Like /api/result and /api/rescan it is internal
+// and unauthenticated; hopper-api is not publicly reachable.
+//
+// 200 {"changed":N}; 400 on malformed JSON; 413 when the batch exceeds
+// maxSightingsBatch; 503 while the DB is still starting.
+func (s *apiServer) handleSightings(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
+		return
+	}
+
+	body := io.LimitReader(r.Body, maxSightingBody+1)
+	var reqs []sightingRequest
+	var err error
+	if ndjson := strings.Contains(r.Header.Get("Content-Type"), "ndjson"); ndjson {
+		reqs, err = decodeSightingsNDJSON(body)
+	} else {
+		err = json.NewDecoder(body).Decode(&reqs)
+	}
+	if err != nil {
+		slog.WarnContext(r.Context(), "sightings rejected: invalid json", "remote", r.RemoteAddr, "error", err)
+		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid json"}`)
+		return
+	}
+	if len(reqs) > maxSightingsBatch {
+		slog.WarnContext(r.Context(), "sightings rejected: batch too large",
+			"remote", r.RemoteAddr, "count", len(reqs), "max", maxSightingsBatch)
+		writeJSONError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(`{"error":"too many sightings (max %d)"}`, maxSightingsBatch))
+		return
+	}
+
+	sightings := make([]hopper.Sighting, len(reqs))
+	for i, req := range reqs {
+		subject := req.Subject
+		// Normalize a sha256 subject to lowercase to match stored digests; a PURL
+		// is left verbatim. AddSightings drops anything that is neither.
+		if validSHA256(strings.ToLower(subject)) {
+			subject = strings.ToLower(subject)
+		}
+		sightings[i] = hopper.Sighting{Source: req.Source, Subject: subject, URL: req.URL, Note: req.Note}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
+	defer cancel()
+	changed, err := s.db.AddSightings(ctx, sightings)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "sightings: store failed", "error", err, "remote", r.RemoteAddr)
+		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		return
+	}
+	slog.InfoContext(r.Context(), "sightings recorded", "received", len(sightings), "changed", changed, "remote", r.RemoteAddr)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(sightingsResponse{Changed: changed}) //nolint:errcheck,errchkjson // best-effort response
+}
+
+// decodeSightingsNDJSON reads newline-delimited sighting objects from r. A
+// json.Decoder consumes successive JSON values across newlines, so no line
+// buffering is needed; blank input yields an empty slice.
+func decodeSightingsNDJSON(r io.Reader) ([]sightingRequest, error) {
+	dec := json.NewDecoder(r)
+	var out []sightingRequest
+	for {
+		var one sightingRequest
+		err := dec.Decode(&one)
+		if errors.Is(err, io.EOF) {
+			return out, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, one)
+		if len(out) > maxSightingsBatch {
+			return out, nil // caller rejects; stop reading an oversized stream
+		}
+	}
 }
 
 //nolint:gosec // G706: structured logging of request-derived fields (remote, error); not a format string
