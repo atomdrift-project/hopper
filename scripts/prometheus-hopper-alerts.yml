@@ -98,6 +98,20 @@ groups:
           summary: "Hopper is not scrapeable"
           description: "Prometheus cannot scrape hopper ({{ $labels.instance }}) — process or dashboard endpoint down."
 
+      # The local worker's kernel-reported memory (VmRSS+VmSwap, measured by
+      # hopper from /proc — not the worker's own estimate) is past its budget.
+      # The supervisor kills it at 1.25x sustained and the workers cgroup caps
+      # it at 1.5x; alerting at 1x is the early warning that the worker's
+      # self-throttle has already failed and the safety nets are next.
+      - alert: HopperLocalWorkerOverBudget
+        expr: hopper_local_worker_memory_bytes > hopper_local_worker_memory_budget_bytes
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hopper local scan worker is over its memory budget"
+          description: "Worker at {{ $value | humanize1024 }}B against its configured budget; supervisor kill imminent at 1.25x."
+
       # The supervisor is restarting the local worker repeatedly: it starts, dies,
       # restarts. up may read 1 between restarts, so watch the restart counter.
       - alert: HopperLocalWorkerFlapping

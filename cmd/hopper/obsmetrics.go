@@ -37,6 +37,7 @@ type instruments struct {
 	wActive, wSlots, wQueue, wRSS                 metric.Int64Observable
 	wAnalyzed, wErrors, wErrorsRecent             metric.Int64Observable
 	localUp, localRestarts                        metric.Int64Observable
+	localMem, localMemBudget                      metric.Int64Observable
 	extractInUse, extractMax                      metric.Int64Observable
 }
 
@@ -174,6 +175,14 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 		// "local worker down" alert; restarts trends supervisor churn.
 		localUp:       gauge("hopper.local_worker.up", "1 when the in-process scan worker is healthy, 0 when down.", ""),
 		localRestarts: counter("hopper.local_worker.restarts", "Cumulative supervisor restarts of the local scan worker.", "{restart}"),
+		// Ground truth from /proc, not the worker's self-report: the
+		// 2026-07-09 incident had a worker 33 GB past its self-reported
+		// number, so the discrepancy between this gauge and the heartbeat's
+		// rss_mb is itself a signal. The supervisor kills the worker when
+		// this sustains above budget × the kill factor; alert at 1× budget
+		// to see it coming.
+		localMem:       gauge("hopper.local_worker.memory", "Kernel-reported memory (VmRSS+VmSwap) of the local scan worker.", "By"),
+		localMemBudget: gauge("hopper.local_worker.memory_budget", "The local scan worker's configured memory budget (--max-memory-gb).", "By"),
 
 		// Archive-member extraction concurrency. in_use approaching max means
 		// /api/file member requests are queuing (or being shed with 503); the
@@ -272,6 +281,14 @@ func (wd *webDashboard) observe(ctx context.Context, o metric.Observer, in *inst
 		}
 		o.ObserveInt64(in.localUp, up)
 		o.ObserveInt64(in.localRestarts, litmus.restarts.Load())
+		if pid := litmus.currentPID(); pid > 0 {
+			if mem, err := procMemoryBytes(pid); err == nil {
+				o.ObserveInt64(in.localMem, int64(mem)) //nolint:gosec // /proc memory values are far below int64 range
+			}
+		}
+		if litmus.maxRSSGB > 0 {
+			o.ObserveInt64(in.localMemBudget, int64(litmus.maxRSSGB)<<30)
+		}
 	}
 
 	// len/cap of the buffered semaphore: a non-blocking read of in-flight

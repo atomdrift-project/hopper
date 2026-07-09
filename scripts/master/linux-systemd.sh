@@ -369,6 +369,24 @@ Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=60s
 
+# Self-attesting watchdog. hopper sends WATCHDOG=1 only after a GET /healthz
+# against its own listener succeeds over a FRESH TCP connection (see
+# sdwatchdog.go) — the exact path that silently died in the 2026-07-09
+# incident while every established keep-alive connection (worker polls,
+# Prometheus scrapes) kept working. If accepts wedge for any reason, pings
+# stop, systemd SIGABRTs (the Go runtime dumps all goroutine stacks to the
+# journal) and Restart= above brings hopper back. 3 minutes ≈ 6 missed probes.
+WatchdogSec=180
+NotifyAccess=main
+
+# Delegate the memory controller so hopper can carve its cgroup into
+# master/ (itself, memory.min-protected) and workers/ (litmus + cleave,
+# hard-capped, memory.oom.group) — see workercgroup.go. The kernel then
+# accounts and bounds the whole worker tree continuously; worker memory
+# pressure can no longer evict the master's pages. Requires
+# ProtectControlGroups to stay off (it would mount cgroupfs read-only).
+Delegate=memory
+
 Environment=HOME=%S/${SERVICE_NAME}
 Environment=XDG_CACHE_HOME=%C/${SERVICE_NAME}
 Environment=PGPASSFILE=%E/${SERVICE_NAME}/.pgpass
@@ -447,7 +465,10 @@ PrivateMounts=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true
-ProtectControlGroups=true
+# ProtectControlGroups intentionally omitted: it mounts /sys/fs/cgroup
+# read-only, which would break the Delegate=memory worker isolation above.
+# Delegation only chowns this unit's own subtree; the rest of the cgroup
+# hierarchy stays root-owned and unwritable to the hopper user anyway.
 ProtectClock=true
 ProtectHostname=true
 ProtectProc=invisible

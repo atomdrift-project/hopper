@@ -1028,6 +1028,12 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 			}
 		}
 	}
+	// Feed the systemd watchdog (no-op outside a watchdog-armed unit). Started
+	// after the listener so the self-probe tests a socket that should exist.
+	go runSDWatchdog(ctx, *dashAddr)
+	// Carve the delegated workers/ cgroup before anything spawns children, so
+	// litmus and cleave land under the kernel-enforced budget from the start.
+	setupWorkerCgroup(*maxRSSGB)
 	wd.beginStage("discover", "Discovering label directories")
 
 	// Discover label directories under --data.
@@ -2697,6 +2703,11 @@ func streamCleaveIterFiles(ctx context.Context, dir string, newerThan time.Time,
 
 	start := time.Now()
 	cmd := exec.CommandContext(ctx, cleaveBinary, args...)
+	// Walk helpers count against the workers' memory budget, not the
+	// master's protected floor (see workercgroup.go).
+	if fd := workerCgroupFD.Load(); fd > 0 {
+		cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(fd)}
+	}
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 	stdout, err := cmd.StdoutPipe()
