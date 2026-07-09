@@ -32,6 +32,20 @@ const (
 	// SIGUSR1 (which makes litmus dump every thread's backtrace to its log)
 	// before SIGKILLing a wedged worker, so the dump has time to flush.
 	wedgeDumpDelay = 10 * time.Second
+	// rssKillFactor is how far past --max-rss-gb the worker's kernel-reported
+	// memory (VmRSS+VmSwap) may grow before the watchdog kills it. litmus
+	// throttles itself against the budget, but its accounting is
+	// allocator-level and misses off-heap growth (mmap'd archives, native
+	// libs): a 2026-07-09 incident had the worker at 73 GB against a 48 GB
+	// budget while self-reporting 40 GB, pinning the service cgroup into
+	// memory.high direct-reclaim purgatory that starved hopper's own accept
+	// loops. The margin leaves the worker's own throttle room to work; only a
+	// blowout it demonstrably isn't handling triggers the kill.
+	rssKillFactor = 1.25
+	// rssKillStrikes is how many consecutive watchdog ticks (1/min) the
+	// worker must be over budget before it is killed, so a transient spike
+	// from one huge archive isn't a death sentence.
+	rssKillStrikes = 2
 )
 
 type litmusServer struct {
@@ -429,6 +443,21 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 	s.spawnedAt.Store(time.Now().UnixNano())
 	s.pid.Store(int64(cmd.Process.Pid))
 
+	// The systemd unit protects hopper with OOMScoreAdjust=-800 and children
+	// inherit it, which makes a runaway worker exactly as OOM-proof as the
+	// master it is starving (observed 2026-07-09: the cgroup OOM killer had
+	// no preferred victim, so nothing died and the whole service sat in
+	// reclaim throttling instead). Shed the inherited shield: +500 makes the
+	// worker the cgroup's designated casualty, Monitor respawns it, and its
+	// claims are retried. Raising another same-uid process's score needs no
+	// privilege; failure is non-fatal because the livenessWatchdog memory
+	// check still bounds the damage.
+	oomPath := "/proc/" + strconv.Itoa(cmd.Process.Pid) + "/oom_score_adj"
+	if err := os.WriteFile(oomPath, []byte("500"), 0); err != nil {
+		slog.Warn("could not raise litmus oom_score_adj; worker keeps inherited OOM protection",
+			"pid", cmd.Process.Pid, "error", err)
+	}
+
 	//nolint:gosec // values are sanitized or derived locally; this is a false positive on structured slog fields.
 	slog.Info("starting litmus worker",
 		"pid", cmd.Process.Pid,
@@ -594,6 +623,9 @@ func (s *litmusServer) Monitor(ctx context.Context) error {
 func (s *litmusServer) livenessWatchdog(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
+	// Memory-breach strike counter, keyed to the pid it was observed on so a
+	// restart never inherits the previous process's strikes.
+	var breachPID, breaches int
 	for {
 		select {
 		case <-ticker.C:
@@ -606,6 +638,43 @@ func (s *litmusServer) livenessWatchdog(ctx context.Context) {
 		pid := s.currentPID()
 		if pid == 0 {
 			continue // no process running (between restarts)
+		}
+		// Ground-truth memory check against the kernel's accounting (see
+		// rssKillFactor). The worker's own self-reported number is not
+		// consulted here: the failure mode being defended against is exactly
+		// the one where that number is wrong.
+		if s.maxRSSGB > 0 {
+			budget := uint64(s.maxRSSGB) << 30 //nolint:gosec // guarded positive by the branch condition
+			limit := uint64(float64(budget) * rssKillFactor)
+			mem, err := procMemoryBytes(pid)
+			switch {
+			case err != nil:
+				// Process may have just exited; Monitor handles that.
+			case mem > limit:
+				if pid == breachPID {
+					breaches++
+				} else {
+					breachPID, breaches = pid, 1
+				}
+				slog.Warn("local litmus worker over memory budget",
+					"worker", s.workerName,
+					"pid", pid,
+					"mem_gb", mem>>30,
+					"budget_gb", s.maxRSSGB,
+					"strike", breaches,
+					"strikes_to_kill", rssKillStrikes)
+				if breaches >= rssKillStrikes {
+					breachPID, breaches = 0, 0
+					if !s.dumpAndKill(ctx, pid, "failed to kill over-budget litmus group") {
+						return
+					}
+				}
+				continue
+			default:
+				if pid == breachPID {
+					breachPID, breaches = 0, 0
+				}
+			}
 		}
 		// Count a fresh (re)start as activity: a just-spawned process must
 		// be given the full liveness window to load its model and start
@@ -623,33 +692,72 @@ func (s *litmusServer) livenessWatchdog(ctx context.Context) {
 		if idle <= livenessTimeout {
 			continue
 		}
-		// Ask litmus to dump every thread's backtrace (SIGUSR1, handled in
-		// litmus/src/main.rs) into its log so the wedge is diagnosable, give
-		// it a moment to flush, then SIGKILL the whole group. Signal the
-		// process directly, not the group: only litmus handles SIGUSR1, and
-		// the default disposition would terminate its rizin/yara children.
 		slog.Warn("local litmus worker appears wedged, dumping backtrace then killing",
 			"worker", s.workerName,
 			"last_seen", s.tracker.lastSeen(s.workerName).Format(time.RFC3339),
 			"idle", idle.Round(time.Second),
 			"pid", pid)
-		if err := syscall.Kill(pid, syscall.SIGUSR1); err != nil && !errors.Is(err, syscall.ESRCH) {
-			slog.Warn("failed to signal wedged litmus for backtrace", "pid", pid, "error", err)
-		}
-		select {
-		case <-time.After(wedgeDumpDelay):
-		case <-ctx.Done():
+		if !s.dumpAndKill(ctx, pid, "failed to kill wedged litmus group") {
 			return
 		}
-		s.mu.Lock()
-		// Guard against the process having been replaced during the dump
-		// window (e.g. a concurrent rebuild) so we never kill a newer pid.
-		if s.cmd != nil && s.cmd.Process != nil && s.cmd.Process.Pid == pid {
-			killGroup("failed to kill wedged litmus group", pid, syscall.SIGKILL,
-				"worker", s.workerName)
-		}
-		s.mu.Unlock()
 	}
+}
+
+// dumpAndKill asks litmus to dump every thread's backtrace (SIGUSR1, handled
+// in litmus/src/main.rs) into its log so the failure is diagnosable, gives
+// the dump a moment to flush, then SIGKILLs the whole group. Signal the
+// process directly, not the group: only litmus handles SIGUSR1, and the
+// default disposition would terminate its rizin/yara children. Returns false
+// if ctx was cancelled while waiting for the dump to flush.
+func (s *litmusServer) dumpAndKill(ctx context.Context, pid int, killMsg string) bool {
+	if err := syscall.Kill(pid, syscall.SIGUSR1); err != nil && !errors.Is(err, syscall.ESRCH) {
+		slog.Warn("failed to signal litmus for backtrace", "pid", pid, "error", err)
+	}
+	select {
+	case <-time.After(wedgeDumpDelay):
+	case <-ctx.Done():
+		return false
+	}
+	s.mu.Lock()
+	// Guard against the process having been replaced during the dump
+	// window (e.g. a concurrent rebuild) so we never kill a newer pid.
+	if s.cmd != nil && s.cmd.Process != nil && s.cmd.Process.Pid == pid {
+		killGroup(killMsg, pid, syscall.SIGKILL, "worker", s.workerName)
+	}
+	s.mu.Unlock()
+	return true
+}
+
+// procMemoryBytes returns pid's VmRSS+VmSwap from /proc — the kernel's own
+// accounting, immune to allocator-level undercounting inside the process.
+// Swap is included because the service cgroup runs with a small swap quota:
+// pages a bloated worker pushed there still hold the budget it was given.
+func procMemoryBytes(pid int) (uint64, error) {
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/status")
+	if err != nil {
+		return 0, err
+	}
+	var kb uint64
+	seen := false
+	for line := range strings.Lines(string(data)) {
+		if !strings.HasPrefix(line, "VmRSS:") && !strings.HasPrefix(line, "VmSwap:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		v, err := strconv.ParseUint(fields[1], 10, 64) // value is in kB
+		if err != nil {
+			return 0, fmt.Errorf("parse %q: %w", strings.TrimSpace(line), err)
+		}
+		kb += v
+		seen = true
+	}
+	if !seen {
+		return 0, errors.New("no VmRSS line in /proc status")
+	}
+	return kb << 10, nil
 }
 
 func (s *litmusServer) waitExit(ctx context.Context) error {

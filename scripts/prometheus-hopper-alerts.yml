@@ -80,6 +80,15 @@ groups:
 
       # Hopper itself is unreachable (process down, dashboard port closed, host
       # gone). Distinct from the gauge above, which needs hopper up to report.
+      #
+      # Caveat (2026-07-09): this can stay green while hopper is dead to the
+      # world. Prometheus scrapes over a persistent keep-alive connection, and
+      # in the memory-pressure incident the accept loop starved — NEW
+      # connections queued forever while established ones kept being served.
+      # `up` only goes 0 if the scrape connection itself is torn down. For a
+      # probe that exercises the accept path every time, point blackbox_exporter
+      # (or any external HTTP checker that opens a fresh connection per probe)
+      # at GET /healthz on the dashboard port and alert on that as well.
       - alert: HopperDown
         expr: up{job="hopper"} == 0
         for: 5m

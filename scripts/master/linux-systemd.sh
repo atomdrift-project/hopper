@@ -400,7 +400,19 @@ Environment=GOMEMLIMIT=32GiB
 # instead, set OTEL_EXPORTER_OTLP_ENDPOINT (and _LOGS_ENDPOINT) in the env.
 
 # Resource caps — hopper + litmus children combined.
-MemoryHigh=80G
+#
+# No MemoryHigh here, on purpose. memory.high never kills: it throttles every
+# allocating/faulting task in the cgroup into direct reclaim. With an
+# anon-heavy workload and MemorySwapMax spent, reclaim has nothing left to
+# evict except the cgroup's few file pages — hopper's own executable text —
+# so the cgroup freezes *below* MemoryMax and the OOM kill that would clear
+# the runaway child never fires. 2026-07-09 incident: litmus at 73 GB pinned
+# the cgroup against MemoryHigh=80G for hours (55e9 pages direct-scanned at
+# 0.4% yield); hopper's accept loops thrashed on text refaults and the API
+# was unreachable while everything technically still "ran". A hard MemoryMax
+# with a prompt, contained OOM kill (OOMPolicy=continue below, litmus's
+# raised oom_score_adj set at spawn) is the correct backstop; a soft ceiling
+# is a purgatory machine.
 MemoryMax=96G
 # Bound cgroup swap. Without this, MemoryMax is toothless: pages spill into
 # swap (zram, i.e. compressed RAM) without limit, cannibalizing host memory
@@ -413,7 +425,10 @@ TasksMax=8192
 OOMPolicy=continue
 # Protect the primary service. If the shared slice hits its ceiling the kernel
 # kills the highest-scoring task in the slice; a strongly negative bias here
-# makes hopper the last to be chosen (promoter, +600, goes first).
+# makes hopper the last to be chosen (promoter, +600, goes first). Children
+# inherit this value, which would shield a runaway litmus worker exactly as
+# strongly as the master it starves — so hopper raises each spawned worker's
+# oom_score_adj to +500 right after fork (see litmusServer.startLocked).
 OOMScoreAdjust=-800
 
 # Filesystem isolation. hopper is the pool's relocation authority: besides
@@ -436,6 +451,11 @@ ProtectControlGroups=true
 ProtectClock=true
 ProtectHostname=true
 ProtectProc=invisible
+# NB: ProcSubset=pid hides /proc/sys, so Go cannot read net.core.somaxconn and
+# every listener falls back to a 128-connection accept backlog regardless of
+# the sysctl. Harmless while accepts are prompt (the backlog only buffers the
+# gap between SYN and accept()), but don't chase a "Send-Q 128" in ss output —
+# it's this, not a kernel limit.
 ProcSubset=pid
 UMask=0077
 
@@ -522,7 +542,10 @@ Before=slices.target
 [Slice]
 # Whole-pipeline ceiling. Bounds the sum of every service nested below it, so a
 # runaway in one cannot exhaust host RAM and provoke the global OOM killer.
-MemoryHigh=112G
+# Hard max only — no MemoryHigh. A soft ceiling over an anon-heavy workload
+# with capped swap throttles the slice into unreclaimable direct-reclaim
+# purgatory *below* the kill threshold instead of shedding the runaway (see
+# the hopper.service memory comments for the 2026-07-09 incident this caused).
 MemoryMax=120G
 # Swap is zram here — compressed RAM. Uncapped, swap-out cannibalizes the very
 # headroom MemoryMax reserves, so bound what the slice can push into it.

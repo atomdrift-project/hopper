@@ -191,6 +191,28 @@ func TestWorkerTrackerOldestPerWorkerPrunesStale(t *testing.T) {
 	}
 }
 
+func TestHandleHealthzNeedsNothing(t *testing.T) {
+	// db and tracker deliberately nil: healthz is the probe that must answer
+	// even when everything behind the HTTP layer is broken, so constructing
+	// it with a gutted server is the point, not a shortcut.
+	api := &apiServer{hopperStart: time.Now().Add(-90 * time.Second)}
+	rec := httptest.NewRecorder()
+	api.handleHealthz(rec, httptest.NewRequest(http.MethodGet, "/healthz", http.NoBody))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	var body struct {
+		Status string `json:"status"`
+		Uptime string `json:"uptime"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("healthz body %q is not JSON: %v", rec.Body.String(), err)
+	}
+	if body.Status != "ok" || body.Uptime == "" {
+		t.Fatalf("healthz body = %+v, want status ok with uptime", body)
+	}
+}
+
 func TestHandleHeartbeatRecordsTelemetryAndConvertsAges(t *testing.T) {
 	api := &apiServer{tracker: newWorkerTracker()} // db nil: heartbeat must not touch it
 

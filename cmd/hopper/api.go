@@ -589,6 +589,7 @@ func (wt *workerTracker) all() []namedWorkerStats {
 
 // registerAPI mounts the work API routes on the given mux.
 func (s *apiServer) registerAPI(mux *http.ServeMux) {
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /api/next", s.handleNext)
 	mux.HandleFunc("GET /api/heartbeat", s.handleHeartbeat)
 	mux.HandleFunc("POST /api/result", s.handleResult)
@@ -600,6 +601,21 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/file/{sha256}", s.handleFile)
 	mux.HandleFunc("GET /api/provenance/{sha256}", s.handleProvenance)
 	mux.Handle("GET /data/", s.safeFileServer())
+}
+
+// handleHealthz is a liveness probe that deliberately touches nothing — no
+// database, no locks, no allocation-heavy path — so it answers exactly when
+// the HTTP serving loop itself is healthy and times out exactly when it
+// isn't. During the 2026-07-09 memory-pressure incident every existing
+// endpoint needed a DB pool or the dashboard render to diagnose remotely;
+// this gives monitors and humans a probe whose failure isolates the fault to
+// the process/server layer.
+func (s *apiServer) handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{ //nolint:errcheck,errchkjson // best-effort response
+		"status": "ok",
+		"uptime": time.Since(s.hopperStart).Round(time.Second).String(),
+	})
 }
 
 const (
