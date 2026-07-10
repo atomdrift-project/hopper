@@ -55,10 +55,9 @@ const (
 //   - Verdict ("good"|"bad") is the operator post-triage flow: the file moves
 //     into a <verdict>/mislabeled-<old-label>/ bucket (basename only) and is
 //     relabeled.
-//   - Ruling ("good"|"bad"|"review"|"sighted") is the remote flow (promoter,
-//     or the demote-sighted backfill): the file moves into the ruling's pool
-//     tree with its source subpath preserved, and is relabeled (good/bad/
-//     sighted) or left labeled (review). See rulingPlan.
+//   - Ruling ("good"|"bad"|"sighted") is the remote flow (promoter, or the
+//     demote-sighted backfill): the file moves into the ruling's pool tree
+//     with its source subpath preserved and is relabeled. See rulingPlan.
 type triageVerdict struct {
 	SHA256  string `json:"sha256"`
 	Verdict string `json:"verdict,omitempty"`
@@ -73,10 +72,9 @@ type triageVerdict struct {
 // good/foraged-promote/npm/foo.tgz and bad/foraged/npm/foo.tgz demotes to
 // sighted/foraged/npm/foo.tgz.
 const (
-	promoteGoodTree   = "good/foraged-promote"
-	promoteBadTree    = "bad/foraged-quarantine"
-	promoteReviewTree = "unknown/foraged-review"
-	sightedTree       = "sighted/foraged"
+	promoteGoodTree = "good/foraged-promote"
+	promoteBadTree  = "bad/foraged-quarantine"
+	sightedTree     = "sighted/foraged"
 )
 
 // promoteSrcRoots are the foraged discovery trees a ruled sample may start
@@ -94,11 +92,12 @@ type placement struct {
 
 // rulingPlan resolves a promoter ruling to its placement: the destination path
 // (subpath preserved beneath the ruling's tree) plus the label change to apply.
-// For "review" the sample keeps its existing label and label_source (the review
-// queue does not relabel — it only relocates out of the discovery prefix).
 // "sighted" demotes a feed-claimed sample out of bad/ into the sighted pool,
 // pending re-promotion by evidence. ok is false for an unrecognized ruling.
-func rulingPlan(samp *hopper.Sample, oldRel, ruling string) (placement, bool) {
+// (A "review" ruling once parked one-signal samples in unknown/foraged-review;
+// promoter now leaves them in the discovery tree so their evidence keeps
+// accumulating instead of freezing.)
+func rulingPlan(_ *hopper.Sample, oldRel, ruling string) (placement, bool) {
 	sub := filepath.Base(oldRel) // not under a source root: preserve only the basename
 	for _, root := range promoteSrcRoots {
 		if rest := strings.TrimPrefix(oldRel, root); rest != oldRel {
@@ -111,8 +110,6 @@ func rulingPlan(samp *hopper.Sample, oldRel, ruling string) (placement, bool) {
 		return placement{filepath.Join(promoteGoodTree, sub), "good", "promoter"}, true
 	case "bad":
 		return placement{filepath.Join(promoteBadTree, sub), "bad", "promoter"}, true
-	case "review":
-		return placement{filepath.Join(promoteReviewTree, sub), samp.Label, samp.LabelSource}, true
 	case "sighted":
 		return placement{filepath.Join(sightedTree, sub), "sighted", "promoter"}, true
 	}
@@ -234,21 +231,18 @@ func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun
 	res.OldPath = oldRel
 
 	// Idempotency: a sample already at its destination is a no-op, so retries
-	// and re-runs are safe. good/bad are recognized by their terminal label;
-	// review keeps the unknown label, so it is recognized by already living
-	// under the review tree. Keying on label/tree (not recomputed path equality)
-	// stays correct after the move, when the subpath no longer starts at the
-	// source root.
+	// and re-runs are safe. good/bad are recognized by their terminal label.
+	// Keying on label/tree (not recomputed path equality) stays correct after
+	// the move, when the subpath no longer starts at the source root.
 	switch {
 	case v.Verdict != "" && samp.Label == v.Verdict,
 		v.Ruling == "good" && samp.Label == "good",
 		v.Ruling == "bad" && samp.Label == "bad",
-		// "sighted" is tree-aware like "review": a row can be labeled sighted
+		// "sighted" is additionally tree-aware: a row can be labeled sighted
 		// with its file still outside the sighted pool (forager's
 		// version-matched purl re-flag relabels DB-only), and the ruling is
 		// how the file catches up — so label alone must not short-circuit.
-		v.Ruling == "sighted" && samp.Label == "sighted" && strings.HasPrefix(oldRel, sightedTree+"/"),
-		v.Ruling == "review" && strings.HasPrefix(oldRel, promoteReviewTree+"/"):
+		v.Ruling == "sighted" && samp.Label == "sighted" && strings.HasPrefix(oldRel, sightedTree+"/"):
 		res.Status = "noop"
 		return res
 	}
@@ -300,13 +294,11 @@ func (s *apiServer) triagePlan(samp *hopper.Sample, oldRel string, v triageVerdi
 	if v.Ruling != "" {
 		plan, ok := rulingPlan(samp, oldRel, v.Ruling)
 		if !ok {
-			return placement{}, errors.New(`ruling must be "good", "bad", "review", or "sighted"`)
+			return placement{}, errors.New(`ruling must be "good", "bad", or "sighted"`)
 		}
 		// A client-supplied source attributes the relabel to its author (e.g.
-		// "cyclotron:bad", "sighted-backfill") instead of the default
-		// "promoter". Only for rulings that actually relabel — "review" keeps
-		// the sample's existing source.
-		if v.Source != "" && v.Ruling != "review" {
+		// "cyclotron:bad", "sighted-backfill") instead of the default "promoter".
+		if v.Source != "" {
 			plan.source = v.Source
 		}
 		return plan, nil

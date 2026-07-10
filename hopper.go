@@ -3702,12 +3702,24 @@ func normalizeSubject(subject string) string {
 // that is neither a sha256 nor a PURL) are skipped. Returns the number of
 // sightings inserted or updated.
 func (db *DB) AddSightings(ctx context.Context, s []Sighting) (int, error) {
+	// Dedupe by (source, subject) within the batch — first occurrence wins.
+	// Producers naturally repeat pairs (two versions of one package share a
+	// purl_base; normalization can collapse two spellings into one subject),
+	// and Postgres rejects an upsert that touches the same row twice
+	// (SQLSTATE 21000).
+	seen := make(map[[2]string]struct{}, len(s))
 	valid := s[:0:0]
 	for _, x := range s {
 		x.Subject = normalizeSubject(x.Subject)
-		if x.valid() {
-			valid = append(valid, x)
+		if !x.valid() {
+			continue
 		}
+		key := [2]string{x.Source, x.Subject}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		valid = append(valid, x)
 	}
 	if len(valid) == 0 {
 		return 0, nil

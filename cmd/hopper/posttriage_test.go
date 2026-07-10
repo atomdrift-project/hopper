@@ -139,8 +139,8 @@ func TestHandleTriageUnknownSHA(t *testing.T) {
 }
 
 // TestHandleTriageRulings covers promoter's remote flow: each ruling preserves
-// the source subpath into its pool tree, good/bad relabel while review does not,
-// and re-running is idempotent.
+// the source subpath into its pool tree and relabels, and re-running is
+// idempotent.
 func TestHandleTriageRulings(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -182,11 +182,9 @@ func TestHandleTriageRulings(t *testing.T) {
 		{"good", repeat("1"), "", filepath.Join("good", "foraged-promote", "npm", "a.tgz"), "good", "promoter"},
 		// Client source overrides the recorded label_source.
 		{"bad", repeat("2"), "cyclotron:bad", filepath.Join("bad", "foraged-quarantine", "npm", "b.tgz"), "bad", "cyclotron:bad"},
-		// review relabels nothing, so it keeps the existing source and ignores the override.
-		{"review", repeat("3"), "cyclotron:review", filepath.Join("unknown", "foraged-review", "npm", "c.tgz"), "unknown", "forager"},
 	}
 	for _, tc := range cases {
-		sub := filepath.Join("npm", map[string]string{"good": "a.tgz", "bad": "b.tgz", "review": "c.tgz"}[tc.ruling])
+		sub := filepath.Join("npm", map[string]string{"good": "a.tgz", "bad": "b.tgz"}[tc.ruling])
 		oldRel := seed(tc.sha, sub)
 		resp := callTriage(t, api, triageRequest{Verdicts: []triageVerdict{{SHA256: tc.sha, Ruling: tc.ruling, Source: tc.source}}})
 		if resp.Moved != 1 || resp.Failed != 0 {
