@@ -396,6 +396,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			path          TEXT NOT NULL CHECK (path <> ''),
 			parent_sha256 TEXT NOT NULL DEFAULT ''
 				CHECK (parent_sha256 = '' OR parent_sha256 ~ '^[0-9a-f]{64}$'),
+			rel           TEXT NOT NULL DEFAULT '',
 			filename      TEXT NOT NULL DEFAULT '',
 			source        TEXT NOT NULL DEFAULT '',
 			feed          TEXT NOT NULL DEFAULT '',
@@ -405,6 +406,9 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
 			UNIQUE (sha256, path)
 		)`,
+		// Edge type to parent_sha256 ("" contained, "fetched", "unpacked",
+		// "registry") — see SampleLocation.Rel. Metadata-only on PG 11+.
+		`ALTER TABLE sample_locations ADD COLUMN IF NOT EXISTS rel TEXT NOT NULL DEFAULT ''`,
 		// Indexes tuned for the expected read patterns.
 		// Primary lookup: "where is this sha seen?" → idx_sl_sha256.
 		// Feed/source rollups stay selective via the partial predicate.
@@ -1548,15 +1552,16 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 	if s.Path != "" {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO sample_locations
-				(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+				(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 			ON CONFLICT (sha256, path) DO UPDATE SET
 				last_seen_at = now(),
+				rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
 				source = CASE WHEN EXCLUDED.source <> '' THEN EXCLUDED.source ELSE sample_locations.source END,
 				feed = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE sample_locations.feed END,
 				ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE sample_locations.ecosystem END,
 				mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)`,
-			s.SHA256, s.Path, s.Parent, s.Filename, s.Source, s.Feed, s.Ecosystem, s.Mtime); err != nil {
+			s.SHA256, s.Path, s.Parent, s.LocationRel, s.Filename, s.Source, s.Feed, s.Ecosystem, s.Mtime); err != nil {
 			return false, fmt.Errorf("hopper: upsert location: %w", err)
 		}
 	}
@@ -1609,7 +1614,7 @@ func (db *DB) refreshStaleMemberAnalysisPG(ctx context.Context, rows []staleRefr
 var insertBatchStagingCols = []string{
 	"sha256", "source", "feed", "ecosystem", "filename",
 	"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
-	"parent", "skip", "elements", "max_crit", "suspicious_count",
+	"parent", "rel", "skip", "elements", "max_crit", "suspicious_count",
 	"mtime", "marker_mtime", "cleave_result", "litmus_result", "analyzed_at", "first_analyzed_at",
 	"url", "domain", "package", "version", "provenance", "fetched_at",
 }
@@ -1618,7 +1623,7 @@ const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 	sha256 TEXT, source TEXT, feed TEXT, ecosystem TEXT, filename TEXT,
 	size_bytes BIGINT, label TEXT, label_source TEXT,
 	path TEXT, status TEXT, canonical_sha256 TEXT,
-	parent TEXT, skip TEXT, elements TEXT,
+	parent TEXT, rel TEXT, skip TEXT, elements TEXT,
 	max_crit INTEGER, suspicious_count INTEGER,
 	mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ,
 	cleave_result JSONB, litmus_result JSONB, analyzed_at TIMESTAMPTZ, first_analyzed_at TIMESTAMPTZ,
@@ -1777,7 +1782,7 @@ func sampleStagingRows(samples []*Sample) [][]any {
 		rows[i] = []any{
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256,
-			s.Parent, s.Skip, s.Elements, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
+			s.Parent, s.LocationRel, s.Skip, s.Elements, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
 			sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult), s.AnalyzedAt, firstAnalyzedAt,
 			s.URL, s.Domain, s.Package, s.Version, sanitizeJSONB(s.Provenance), s.FetchedAt,
 		}
@@ -1791,13 +1796,14 @@ func sampleStagingRows(samples []*Sample) [][]any {
 // insert and the atomic store.
 const locationsFromStagingPG = `
 	INSERT INTO sample_locations
-		(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime)
+		(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
 	SELECT DISTINCT ON (sha256, path)
-		sha256, path, parent, filename, source, feed, ecosystem, mtime
+		sha256, path, parent, rel, filename, source, feed, ecosystem, mtime
 	  FROM _staging
 	 WHERE path <> ''
 	ON CONFLICT (sha256, path) DO UPDATE SET
 		last_seen_at = now(),
+		rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
 		source = CASE WHEN EXCLUDED.source <> '' THEN EXCLUDED.source ELSE sample_locations.source END,
 		feed = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE sample_locations.feed END,
 		ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE sample_locations.ecosystem END,
@@ -2153,10 +2159,10 @@ func (db *DB) topMemberSHAsByParentPG(ctx context.Context, parentSHA string, lim
 // the outer ORDER BY then ranks parents by recency and caps the set.
 func (db *DB) parentArchivesForChildPG(ctx context.Context, childSHA string, limit int) ([]ParentRef, error) {
 	rows, err := db.pool.Query(ctx, `
-		SELECT sha256, filename, sample_path, loc_path, litmus_result, analyzed_at FROM (
+		SELECT sha256, filename, sample_path, loc_path, rel, litmus_result, analyzed_at FROM (
 			SELECT DISTINCT ON (s.sha256)
 			       s.sha256, s.filename, s.path AS sample_path, sl.path AS loc_path,
-			       s.litmus_result, s.analyzed_at, sl.last_seen_at
+			       sl.rel, s.litmus_result, s.analyzed_at, sl.last_seen_at
 			  FROM sample_locations sl
 			  JOIN samples s ON s.sha256 = sl.parent_sha256
 			 WHERE sl.sha256 = $1 AND sl.parent_sha256 <> ''
@@ -2171,7 +2177,7 @@ func (db *DB) parentArchivesForChildPG(ctx context.Context, childSHA string, lim
 	var out []ParentRef
 	for rows.Next() {
 		var p ParentRef
-		if err := rows.Scan(&p.SHA256, &p.Filename, &p.SamplePath, &p.Path, &p.LitmusResult, &p.AnalyzedAt); err != nil {
+		if err := rows.Scan(&p.SHA256, &p.Filename, &p.SamplePath, &p.Path, &p.Rel, &p.LitmusResult, &p.AnalyzedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -2232,11 +2238,11 @@ func (db *DB) reconcileLocationParentEdgesPG(ctx context.Context, cursor int64) 
 	return nil
 }
 
-const pgLocationCols = `id, sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime, first_seen_at, last_seen_at`
+const pgLocationCols = `id, sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime, first_seen_at, last_seen_at`
 
 func scanPGLocation(row interface{ Scan(...any) error }) (*SampleLocation, error) {
 	var loc SampleLocation
-	if err := row.Scan(&loc.ID, &loc.SHA256, &loc.Path, &loc.ParentSHA256,
+	if err := row.Scan(&loc.ID, &loc.SHA256, &loc.Path, &loc.ParentSHA256, &loc.Rel,
 		&loc.Filename, &loc.Source, &loc.Feed, &loc.Ecosystem,
 		&loc.Mtime, &loc.FirstSeenAt, &loc.LastSeenAt); err != nil {
 		return nil, err
@@ -2247,12 +2253,13 @@ func scanPGLocation(row interface{ Scan(...any) error }) (*SampleLocation, error
 func (db *DB) upsertLocationPG(ctx context.Context, loc *SampleLocation) error {
 	_, err := db.pool.Exec(ctx, `
 		INSERT INTO sample_locations
-			(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (sha256, path) DO UPDATE SET
 			last_seen_at = now(),
+			rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
 			mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)`,
-		loc.SHA256, loc.Path, loc.ParentSHA256, loc.Filename,
+		loc.SHA256, loc.Path, loc.ParentSHA256, loc.Rel, loc.Filename,
 		loc.Source, loc.Feed, loc.Ecosystem, loc.Mtime)
 	if err != nil {
 		return fmt.Errorf("hopper: upsert location %s: %w", loc.SHA256, err)

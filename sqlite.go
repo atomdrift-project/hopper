@@ -418,6 +418,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 			sha256        TEXT NOT NULL REFERENCES samples(sha256) ON DELETE CASCADE,
 			path          TEXT NOT NULL CHECK (path <> ''),
 			parent_sha256 TEXT NOT NULL DEFAULT '',
+			rel           TEXT NOT NULL DEFAULT '',
 			filename      TEXT NOT NULL DEFAULT '',
 			source        TEXT NOT NULL DEFAULT '',
 			feed          TEXT NOT NULL DEFAULT '',
@@ -434,6 +435,15 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 	} {
 		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite sample_locations: %w", err)
+		}
+	}
+	// rel: edge type to parent_sha256 ("" contained, "fetched", "unpacked",
+	// "registry") — added after the table shipped, so existing DBs need the
+	// column grafted on (SQLite has no ADD COLUMN IF NOT EXISTS).
+	if pragmaHasColumnIn(ctx, db.lite, "sample_locations", "rel") == 0 {
+		if _, err := db.lite.ExecContext(ctx,
+			`ALTER TABLE sample_locations ADD COLUMN rel TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite sample_locations rel: %w", err)
 		}
 	}
 	// One-shot backfill, gated on emptiness.
@@ -1024,15 +1034,16 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 	if s.Path != "" {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO sample_locations
-				(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+				(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256, path) DO UPDATE SET
 				last_seen_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
+				rel = CASE WHEN excluded.rel != '' THEN excluded.rel ELSE sample_locations.rel END,
 				source = CASE WHEN excluded.source != '' THEN excluded.source ELSE sample_locations.source END,
 				feed = CASE WHEN excluded.feed != '' THEN excluded.feed ELSE sample_locations.feed END,
 				ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE sample_locations.ecosystem END,
 				mtime = COALESCE(excluded.mtime, sample_locations.mtime)`,
-			s.SHA256, s.Path, s.Parent, s.Filename, s.Source, s.Feed, s.Ecosystem, s.Mtime); err != nil {
+			s.SHA256, s.Path, s.Parent, s.LocationRel, s.Filename, s.Source, s.Feed, s.Ecosystem, s.Mtime); err != nil {
 			return false, fmt.Errorf("hopper: upsert location: %w", err)
 		}
 	}
@@ -1131,10 +1142,11 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 
 	locStmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO sample_locations
-			(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256, path) DO UPDATE SET
 			last_seen_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
+			rel = CASE WHEN excluded.rel != '' THEN excluded.rel ELSE sample_locations.rel END,
 			source = CASE WHEN excluded.source != '' THEN excluded.source ELSE sample_locations.source END,
 			feed = CASE WHEN excluded.feed != '' THEN excluded.feed ELSE sample_locations.feed END,
 			ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE sample_locations.ecosystem END,
@@ -1171,7 +1183,7 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		}
 		if s.Path != "" {
 			if _, err := locStmt.ExecContext(ctx,
-				s.SHA256, s.Path, s.Parent, s.Filename, s.Source, s.Feed, s.Ecosystem, s.Mtime); err != nil {
+				s.SHA256, s.Path, s.Parent, s.LocationRel, s.Filename, s.Source, s.Feed, s.Ecosystem, s.Mtime); err != nil {
 				return 0, nil, fmt.Errorf("hopper: upsert location %s: %w", s.SHA256, err)
 			}
 		}
@@ -1368,7 +1380,7 @@ func (db *DB) topMemberSHAsByParentSQLite(ctx context.Context, parentSHA string,
 // parent's most-recent location.
 func (db *DB) parentArchivesForChildSQLite(ctx context.Context, childSHA string, limit int) ([]ParentRef, error) {
 	rows, err := db.lite.QueryContext(ctx, `
-		SELECT s.sha256, s.filename, s.path, sl.path, s.litmus_result, s.analyzed_at, MAX(sl.last_seen_at) AS lsa
+		SELECT s.sha256, s.filename, s.path, sl.path, sl.rel, s.litmus_result, s.analyzed_at, MAX(sl.last_seen_at) AS lsa
 		  FROM sample_locations sl
 		  JOIN samples s ON s.sha256 = sl.parent_sha256
 		 WHERE sl.sha256 = ? AND sl.parent_sha256 <> ''
@@ -1385,7 +1397,7 @@ func (db *DB) parentArchivesForChildSQLite(ctx context.Context, childSHA string,
 		var litmus sql.NullString
 		var analyzedAt sql.NullTime
 		var lsa sql.NullString // ordering key only; never returned
-		if err := rows.Scan(&p.SHA256, &p.Filename, &p.SamplePath, &p.Path, &litmus, &analyzedAt, &lsa); err != nil {
+		if err := rows.Scan(&p.SHA256, &p.Filename, &p.SamplePath, &p.Path, &p.Rel, &litmus, &analyzedAt, &lsa); err != nil {
 			return nil, err
 		}
 		if litmus.Valid {
@@ -1453,11 +1465,11 @@ func (db *DB) reconcileLocationParentEdgesSQLite(ctx context.Context, cursor int
 	return nil
 }
 
-const liteLocationCols = `id, sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime, first_seen_at, last_seen_at`
+const liteLocationCols = `id, sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime, first_seen_at, last_seen_at`
 
 func scanLiteLocation(row interface{ Scan(...any) error }) (*SampleLocation, error) {
 	var loc SampleLocation
-	if err := row.Scan(&loc.ID, &loc.SHA256, &loc.Path, &loc.ParentSHA256,
+	if err := row.Scan(&loc.ID, &loc.SHA256, &loc.Path, &loc.ParentSHA256, &loc.Rel,
 		&loc.Filename, &loc.Source, &loc.Feed, &loc.Ecosystem,
 		&loc.Mtime, &loc.FirstSeenAt, &loc.LastSeenAt); err != nil {
 		return nil, err
@@ -1468,12 +1480,13 @@ func scanLiteLocation(row interface{ Scan(...any) error }) (*SampleLocation, err
 func (db *DB) upsertLocationSQLite(ctx context.Context, loc *SampleLocation) error {
 	_, err := db.lite.ExecContext(ctx, `
 		INSERT INTO sample_locations
-			(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256, path) DO UPDATE SET
 			last_seen_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
+			rel = CASE WHEN excluded.rel != '' THEN excluded.rel ELSE sample_locations.rel END,
 			mtime = COALESCE(excluded.mtime, sample_locations.mtime)`,
-		loc.SHA256, loc.Path, loc.ParentSHA256, loc.Filename,
+		loc.SHA256, loc.Path, loc.ParentSHA256, loc.Rel, loc.Filename,
 		loc.Source, loc.Feed, loc.Ecosystem, loc.Mtime)
 	if err != nil {
 		return fmt.Errorf("hopper: upsert location %s: %w", loc.SHA256, err)
@@ -1794,10 +1807,11 @@ func (db *DB) storeResultSQLite(
 		defer memStmt.Close() //nolint:errcheck // best-effort cleanup
 		locStmt, err := tx.PrepareContext(ctx, `
 			INSERT INTO sample_locations
-				(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+				(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (sha256, path) DO UPDATE SET
 				last_seen_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
+				rel = CASE WHEN excluded.rel != '' THEN excluded.rel ELSE sample_locations.rel END,
 				mtime = COALESCE(excluded.mtime, sample_locations.mtime)`)
 		if err != nil {
 			return StoreStats{}, fmt.Errorf("hopper: prepare member location: %w", err)
@@ -1824,7 +1838,7 @@ func (db *DB) storeResultSQLite(
 			}
 			if m.Path != "" {
 				if _, err := locStmt.ExecContext(ctx,
-					m.SHA256, m.Path, m.Parent, m.Filename, m.Source, m.Feed, m.Ecosystem, m.Mtime); err != nil {
+					m.SHA256, m.Path, m.Parent, m.LocationRel, m.Filename, m.Source, m.Feed, m.Ecosystem, m.Mtime); err != nil {
 					return StoreStats{}, fmt.Errorf("hopper: upsert member location %s: %w", m.SHA256, err)
 				}
 			}

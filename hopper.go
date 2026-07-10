@@ -413,6 +413,11 @@ type Sample struct {
 	Note              string
 	CanonicalSHA256   string
 	Parent            string
+	// LocationRel is the edge type of this sample's Path observation to
+	// Parent, mirroring cleave's `rel` ("", "fetched", "unpacked",
+	// "registry" — see SampleLocation.Rel). It rides into sample_locations
+	// only; the samples table does not store it.
+	LocationRel       string
 	Skip              string
 	Formula           string
 	Version           string
@@ -505,11 +510,17 @@ type SampleLocation struct {
 	SHA256       string
 	Path         string
 	ParentSHA256 string // sha of the archive this observation was extracted from; "" if top-level
-	Filename     string
-	Source       string // "forager", "upload", ... ("harvest" persists on legacy rows)
-	Feed         string
-	Ecosystem    string
-	ID           int64
+	// Rel is the edge type to ParentSHA256, mirroring cleave's `rel`:
+	// "" for an ordinary contained member, "fetched" for content retrieved
+	// over the network from a reference the parent declares (never actually
+	// inside it), "unpacked" for a transform product (UPX, base64),
+	// "registry" for a provenance sidecar. "" on rows predating the column.
+	Rel       string
+	Filename  string
+	Source    string // "forager", "upload", ... ("harvest" persists on legacy rows)
+	Feed      string
+	Ecosystem string
+	ID        int64
 }
 
 // WorkflowSnapshot is the compact operational view used by Hopper dashboards.
@@ -914,6 +925,13 @@ func (e *memberEnvelope) buildRange(start, end int) []*Sample {
 			SHA256   string        `json:"sha"`
 			FileType string        `json:"type"`
 			Path     string        `json:"path"`
+			// Rel is cleave's edge type to the parent: absent for an
+			// ordinary contained member, "fetched" for content retrieved
+			// from a reference the parent declares (never inside it),
+			// "unpacked"/"registry" for transform/sidecar nodes. Carried
+			// into sample_locations.rel so consumers can tell "found in
+			// this archive" from "referenced by this sample".
+			Rel      string        `json:"rel"`
 			V8Traits []memberTrait `json:"traits"`
 			V7Traits []memberTrait `json:"find"`
 			V4Traits []memberTrait `json:"ts"`
@@ -1028,6 +1046,7 @@ func (e *memberEnvelope) buildRange(start, end int) []*Sample {
 			LitmusResult:    e.litmus.forMember(id),
 			CanonicalSHA256: e.parent.CanonicalSHA256,
 			Parent:          e.parent.SHA256,
+			LocationRel:     entry.Rel,
 			Skip:            skip,
 			AnalyzedAt:      e.parent.AnalyzedAt,
 			FirstAnalyzedAt: firstAnalyzedAt,
@@ -2119,6 +2138,7 @@ type ParentRef struct {
 	Filename     string // parent archive's filename
 	SamplePath   string // parent archive's own path (basename fallback for Filename)
 	Path         string // path of the child within this parent (from sample_locations)
+	Rel          string // edge type: "" contained, "fetched"/"unpacked"/"registry" (SampleLocation.Rel)
 	AnalyzedAt   *time.Time
 	LitmusResult []byte // parent's raw verdict blob; cleave_result is never loaded
 }

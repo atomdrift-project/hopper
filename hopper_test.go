@@ -366,6 +366,67 @@ func TestStoreResultAtomicMembers(t *testing.T) {
 	}
 }
 
+// TestStoreResultRecordsFetchedRel locks the provenance edge: a member whose
+// cleave node carries rel="fetched" (content retrieved from a URL the parent
+// references — never actually inside it) records that edge type on its
+// sample_locations row, while an ordinary contained member records "". Without
+// this, a fetched web page is indistinguishable from an extracted archive
+// member and renders as "found in archive" — a false containment claim.
+func TestStoreResultRecordsFetchedRel(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	archive := strings.Repeat("a", 64)
+	contained := strings.Repeat("b", 64)
+	fetched := strings.Repeat("f", 64)
+
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: archive, Source: "test", Label: "bad", LabelSource: "test",
+		Path: "bad/app.elf",
+	})
+
+	full := fmt.Appendf(nil, `{"v":8,"files":[
+		{"id":0,"sha":%q,"type":"elf","depth":0,"path":"app.elf"},
+		{"id":1,"sha":%q,"type":"javascript","depth":1,"path":"app.elf!!a.js"},
+		{"id":2,"sha":%q,"type":"unknown","depth":1,"path":"compatibility","pid":0,"rel":"fetched","via":"https://example.test/compatibility"}
+	]}`, archive, contained, fetched)
+	if _, err := db.StoreResult(ctx, archive, full, []byte(`{"prob":0.1}`), nil, nil, "tv1"); err != nil {
+		t.Fatalf("StoreResult: %v", err)
+	}
+
+	relFor := func(sha string) string {
+		t.Helper()
+		locs, err := db.LocationsForSHA(ctx, sha)
+		if err != nil || len(locs) == 0 {
+			t.Fatalf("LocationsForSHA(%s) = %v, %v", sha[:4], locs, err)
+		}
+		return locs[0].Rel
+	}
+	if got := relFor(contained); got != "" {
+		t.Errorf("contained member rel = %q, want \"\"", got)
+	}
+	if got := relFor(fetched); got != "fetched" {
+		t.Errorf("fetched member rel = %q, want \"fetched\"", got)
+	}
+
+	// The backlink query surfaces the edge type so a renderer can say
+	// "referenced by" instead of "found in".
+	parents, err := db.ParentArchivesForChild(ctx, fetched, 5)
+	if err != nil || len(parents) != 1 {
+		t.Fatalf("ParentArchivesForChild = %v, %v; want one parent", parents, err)
+	}
+	if parents[0].SHA256 != archive || parents[0].Rel != "fetched" {
+		t.Errorf("parent ref = %s rel %q, want %s rel \"fetched\"", parents[0].SHA256[:4], parents[0].Rel, archive[:4])
+	}
+
+	// Direct location upsert roundtrips rel too (the walker/mirror path).
+	if err := db.UpsertLocation(ctx, &SampleLocation{
+		SHA256: fetched, Path: "unknown/uploads/f" + fetched[:2], Rel: "fetched",
+	}); err != nil {
+		t.Fatalf("UpsertLocation: %v", err)
+	}
+}
+
 // TestRepairQueue locks the repair tier end to end: QueueMissingMembersForRepair
 // flags only truncated top-level archives that lack member rows (priority 1),
 // RepairCandidates returns exactly those, and an interactive RequestRescan
