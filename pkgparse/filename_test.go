@@ -102,11 +102,34 @@ func TestParseFilename(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.filename, func(t *testing.T) {
-			gotName, gotVersion := ParseFilename(tt.filename)
+			gotName, gotVersion, _ := ParseFilename(tt.filename)
 			if gotName != tt.wantName || gotVersion != tt.wantVersion {
 				t.Errorf("ParseFilename(%q) = (%q, %q), want (%q, %q)",
 					tt.filename, gotName, gotVersion, tt.wantName, tt.wantVersion)
 			}
 		})
+	}
+}
+
+func TestParseFilenameArch(t *testing.T) {
+	cases := map[string]string{
+		// deb/rpm/alpm filenames carry the architecture; it becomes the
+		// purl-spec `arch` qualifier value.
+		"wget_1.21.4-1ubuntu3_amd64.deb":     "amd64",
+		"curl-8.0.0-1.fc40.x86_64.rpm":       "x86_64",
+		"qgis-3.42.1-2.fc42.aarch64.rpm":     "aarch64",
+		"kernel-6.10.0-1.fc41.src.rpm":       "src",
+		"python-3.12.0-1-x86_64.pkg.tar.zst": "x86_64",
+		"python-pip-21.0-1-any.pkg.tar.zst":  "any",
+		// apk keeps arch in the repository path, not the filename.
+		"zfs-2.4.1-r0.apk": "",
+		// Non-distro formats have no arch.
+		"lodash-4.17.21.tgz": "",
+		"evil.exe":           "",
+	}
+	for filename, want := range cases {
+		if _, _, got := ParseFilename(filename); got != want {
+			t.Errorf("ParseFilename(%q) arch = %q, want %q", filename, got, want)
+		}
 	}
 }

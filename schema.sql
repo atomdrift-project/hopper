@@ -19,7 +19,10 @@ CREATE TABLE IF NOT EXISTS samples (
 	-- computed by the collector at ingestion. It is the package's stable identity
 	-- across versions: GROUP BY purl_base collapses every version of a package.
 	-- Empty for files that aren't a known package ecosystem. The full versioned
-	-- PURL is purl_base || '@' || version.
+	-- PURL splices '@' || version in *before* any '?qualifiers' tail (purl-spec
+	-- order; a purl_base can carry one, e.g. the AUR's repository_url) — a plain
+	-- purl_base || '@' || version misplaces the version for those. See scan's
+	-- scripts/bloom_pool.sql for the splice.
 	purl_base     TEXT NOT NULL DEFAULT '',
 	filename      TEXT NOT NULL DEFAULT '',
 	file_type     TEXT NOT NULL DEFAULT '',

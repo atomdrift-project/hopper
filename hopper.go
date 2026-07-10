@@ -3330,6 +3330,18 @@ func (db *DB) BackfillPURL(ctx context.Context) (int64, error) {
 	return 0, nil
 }
 
+// CanonicalizePURLBases rewrites stored samples.purl_base values onto the
+// current canonical spelling, in id-cursor batches that never lock more than
+// one batch of rows at a time (see canonicalizePURLBasesPG). Idempotent and
+// resumable; dryRun only reports. Postgres-only; the SQLite path is unused for
+// this repair. Returns the number of rows rewritten (or that would be).
+func (db *DB) CanonicalizePURLBases(ctx context.Context, dryRun bool) (int64, error) {
+	if db.pool != nil {
+		return db.canonicalizePURLBasesPG(ctx, dryRun)
+	}
+	return 0, nil
+}
+
 // RecomputeCanonicalSHA256 recalculates canonical_sha256 for all analyzed
 // samples using SQL-side JSON_TABLE, avoiding the need to fetch cleave_result
 // blobs into Go. Returns the number of rows updated.

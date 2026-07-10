@@ -29,17 +29,18 @@ var filenamePatterns = []*regexp.Regexp{
 	// `(.+)` for the name and let the trailing constraints lock in the
 	// boundary at the LAST hyphen-digit before the version-anchor.
 
-	// alpine/wolfi apk: <name>-<version>-r<rel>.apk.
+	// alpine/wolfi apk: <name>-<version>-r<rel>.apk. The arch is not in the
+	// filename (it lives in the repository path), so no arch group.
 	regexp.MustCompile(`^(?P<name>.+)-(?P<version>\d+\.\S*-r\d+)\.apk$`),
 
 	// debian deb: <name>_<version>_<arch>.deb.
-	regexp.MustCompile(`^(?P<name>[^_]+)_(?P<version>[^_]+)_[^_]+\.deb$`),
+	regexp.MustCompile(`^(?P<name>[^_]+)_(?P<version>[^_]+)_(?P<arch>[^_]+)\.deb$`),
 
 	// rpm: <name>-<version>-<release>.<arch>.rpm. Combine version+release.
-	regexp.MustCompile(`^(?P<name>.+)-(?P<version>\d[\w.+~]*-[\w.+~]+)\.\w+\.rpm$`),
+	regexp.MustCompile(`^(?P<name>.+)-(?P<version>\d[\w.+~]*-[\w.+~]+)\.(?P<arch>\w+)\.rpm$`),
 
 	// archlinux .pkg.tar.zst: <name>-<version>-<release>-<arch>.pkg.tar.zst
-	regexp.MustCompile(`^(?P<name>.+)-(?P<version>\d[\w.+~]*-\d+)-\w+\.pkg\.tar\.\w+$`),
+	regexp.MustCompile(`^(?P<name>.+)-(?P<version>\d[\w.+~]*-\d+)-(?P<arch>\w+)\.pkg\.tar\.\w+$`),
 
 	// conda: <name>-<version>-<build>.conda.
 	regexp.MustCompile(`^(?P<name>.+)-(?P<version>\d[\w.+~]*-[\w.+~]+)\.conda$`),
@@ -79,21 +80,25 @@ var filenamePatterns = []*regexp.Regexp{
 	regexp.MustCompile(`^(?P<name>.+?)-(?P<version>v?\d[\w.+~]*)\.[\w.]+$`),
 }
 
-// ParseFilename extracts package name and version from a download
-// filename. Returns ("", "") when no recognized format matches.
+// ParseFilename extracts package name, version, and — for the distro formats
+// whose filenames carry one (deb/rpm/alpm) — the package architecture from a
+// download filename. arch is the purl-spec `arch` qualifier value, "" when the
+// format doesn't encode one (apk keeps it in the repository path). Returns
+// ("", "", "") when no recognized format matches.
 //
 // Examples:
 //
-//	"lodash-4.17.21.tgz"             → ("lodash", "4.17.21")
-//	"zfs-2.4.1-r0.apk"               → ("zfs", "2.4.1-r0")
-//	"ztunnel-1.29-compat-1.29.0-r0.apk" → ("ztunnel-1.29-compat", "1.29.0-r0")
-//	"curl-8.0.0-1.fc40.x86_64.rpm"   → ("curl", "8.0.0-1.fc40")
-//	"wget_1.21.4-1ubuntu3_amd64.deb" → ("wget", "1.21.4-1ubuntu3")
-//	"NotepadPPPortable_8.9.4.paf.exe" → ("NotepadPPPortable", "8.9.4")
-//	"github.com-gorilla-mux-v1.8.1.zip" → ("github.com-gorilla-mux", "v1.8.1")
-//	"cjpalhdlnbpafiamejdnhcphjbkeiagm.crx" → ("", "")  (no version)
-//	"evil.exe"                        → ("", "")
-func ParseFilename(filename string) (name, version string) {
+//	"lodash-4.17.21.tgz"             → ("lodash", "4.17.21", "")
+//	"zfs-2.4.1-r0.apk"               → ("zfs", "2.4.1-r0", "")
+//	"ztunnel-1.29-compat-1.29.0-r0.apk" → ("ztunnel-1.29-compat", "1.29.0-r0", "")
+//	"curl-8.0.0-1.fc40.x86_64.rpm"   → ("curl", "8.0.0-1.fc40", "x86_64")
+//	"wget_1.21.4-1ubuntu3_amd64.deb" → ("wget", "1.21.4-1ubuntu3", "amd64")
+//	"python-3.12.0-1-x86_64.pkg.tar.zst" → ("python", "3.12.0-1", "x86_64")
+//	"NotepadPPPortable_8.9.4.paf.exe" → ("NotepadPPPortable", "8.9.4", "")
+//	"github.com-gorilla-mux-v1.8.1.zip" → ("github.com-gorilla-mux", "v1.8.1", "")
+//	"cjpalhdlnbpafiamejdnhcphjbkeiagm.crx" → ("", "", "")  (no version)
+//	"evil.exe"                        → ("", "", "")
+func ParseFilename(filename string) (name, version, arch string) {
 	for _, re := range filenamePatterns {
 		m := re.FindStringSubmatch(filename)
 		if m == nil {
@@ -104,7 +109,10 @@ func ParseFilename(filename string) (name, version string) {
 		if nameIdx <= 0 || versionIdx <= 0 {
 			continue
 		}
-		return m[nameIdx], m[versionIdx]
+		if archIdx := re.SubexpIndex("arch"); archIdx > 0 {
+			arch = m[archIdx]
+		}
+		return m[nameIdx], m[versionIdx], arch
 	}
-	return "", ""
+	return "", "", ""
 }

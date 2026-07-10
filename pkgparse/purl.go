@@ -6,12 +6,12 @@ import "strings"
 // see https://github.com/package-url/purl-spec) from the coordinates hopper
 // stores. It is dependency-free so it can be shared: forager computes the PURL at
 // ingestion, hopper's backfill rebuilds it for older rows, and both must produce
-// exactly what fletch (src/registry.rs) parses when it fetches a PURL — the type
-// vocabulary here mirrors fletch's resolver so a stored purl_base round-trips to a
-// real registry lookup. Note fletch uses its own spellings, not the purl-spec
-// ratified ones (chrome not chrome-extension, vscode + a separate openvsx type not
-// vscode-extension, the distro name as the type not deb/rpm/apk); we stay
-// consistent with the fetcher, since that is what the bloom's decide_purl matches.
+// exactly what fletch (src/registry.rs) parses when it fetches a PURL. We emit
+// the purl-spec ratified spellings (chrome-extension, vscode-extension,
+// deb/rpm/apk/alpm with the vendor as namespace); fletch accepts both these and
+// its older legacy spellings, and the crosscheck_test suite drives every
+// generated form through `fletch purl` to prove the two tools read the same
+// coordinates — that shared reading is what the bloom's decide_purl matches.
 
 // languageType maps an ecosystem — a registry name or the runtime/language form
 // stored in samples.ecosystem (see runtimeMap) — to its PURL type for the
@@ -60,10 +60,12 @@ func languageType(ecosystem string) (string, bool) {
 //     column mislabels (a Debian package tagged "linux"/"macos" still resolves via
 //     debian.org).
 //
-// version may be empty (yielding the version-less identity). Returns ok=false when
+// version may be empty (yielding the version-less identity), as may arch — the
+// purl-spec `arch` qualifier value (from [ParseFilename]), emitted only for the
+// distro types whose spec defines it (deb/rpm/apk/alpm). Returns ok=false when
 // no confident type resolves, leaving the PURL empty rather than emitting one
 // fletch could not fetch.
-func SourcePURL(ecosystem, domain, name, version string) (string, bool) {
+func SourcePURL(ecosystem, domain, name, version, arch string) (string, bool) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return "", false
@@ -75,25 +77,27 @@ func SourcePURL(ecosystem, domain, name, version string) (string, bool) {
 	// distinguishable by where it was downloaded from.
 	if eco == "vscode" || eco == "openvsx" {
 		if dom == "open-vsx.org" {
-			return buildTyped("openvsx", name, version)
+			return buildTyped("openvsx", name, version, arch)
 		}
-		return buildTyped("vscode", name, version)
+		return buildTyped("vscode", name, version, arch)
 	}
 
 	if typ, ok := ecosystemType(eco); ok {
-		return buildTyped(typ, name, version)
+		return buildTyped(typ, name, version, arch)
 	}
 	if typ, ok := domainType(dom); ok {
-		return buildTyped(typ, name, version)
+		return buildTyped(typ, name, version, arch)
 	}
 	return "", false
 }
 
 // SourcePURLIdentity returns the version-less purl_base — a package's identity
 // across versions, promoted to the indexed samples.purl_base column. It is
-// [SourcePURL] with an empty version; see there for the resolution order.
+// [SourcePURL] with an empty version and no arch: identity is the release
+// coordinate, never a particular artifact of it. See there for the resolution
+// order.
 func SourcePURLIdentity(ecosystem, domain, name string) (string, bool) {
-	return SourcePURL(ecosystem, domain, name, "")
+	return SourcePURL(ecosystem, domain, name, "", "")
 }
 
 // ecosystemType maps a known samples.ecosystem value to its fletch PURL type: the
@@ -188,8 +192,10 @@ func domainType(dom string) (string, bool) {
 // the emitted PURL type follows the purl-spec where one exists — deb/rpm/apk/alpm
 // with the distro as namespace, chrome-extension, vscode-extension (Open VSX via a
 // repository_url qualifier) — and an invented type where the spec defines none
-// (firefox, wordpress, jetbrains, snap, homebrew, the BSDs).
-func buildTyped(key, name, version string) (string, bool) {
+// (firefox, wordpress, jetbrains, snap, homebrew, the BSDs). arch is emitted as
+// the spec's `arch` qualifier on the distro types that define it; every other
+// type ignores it.
+func buildTyped(key, name, version, arch string) (string, bool) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return "", false
@@ -202,8 +208,9 @@ func buildTyped(key, name, version string) (string, bool) {
 		}
 		return renderPURL(key, "", name, version, ""), true
 	case "pypi":
-		// PEP 503: lowercase, underscores to dashes.
-		return renderPURL(key, "", strings.ToLower(strings.ReplaceAll(name, "_", "-")), version, ""), true
+		// PEP 503: the registry's own name equivalence (lowercase, separator
+		// runs collapsed), so every spelling of a project shares one identity.
+		return renderPURL(key, "", pep503(name), version, ""), true
 	case "maven":
 		group, artifact, found := strings.Cut(name, ":")
 		if !found || group == "" || artifact == "" {
@@ -211,7 +218,7 @@ func buildTyped(key, name, version string) (string, bool) {
 		}
 		return renderPURL(key, group, artifact, version, ""), true
 	case "composer":
-		vendor, pkg, found := strings.Cut(strings.ToLower(name), "/")
+		vendor, pkg, found := strings.Cut(asciiLower(name), "/")
 		if !found || vendor == "" || pkg == "" {
 			return "", false
 		}
@@ -243,11 +250,22 @@ func buildTyped(key, name, version string) (string, bool) {
 		return renderPURL("chrome-extension", "", lastSegment(name), version, ""), true
 
 	default:
-		// Distros → the spec deb/rpm/apk/alpm types with the distro as namespace,
-		// plus any repository qualifier the spec needs (the AUR names itself in a
-		// repository_url; fletch routes that back to the AUR RPC).
+		// Distros → the spec deb/rpm/apk/alpm types with the distro as
+		// namespace (the AUR is its own alpm namespace, pkg:alpm/aur/<name>,
+		// which fletch routes to the AUR RPC), carrying the artifact's
+		// architecture as the spec's `arch` qualifier when known. `arch` sorts
+		// before any other qualifier key we emit, keeping the spec's canonical
+		// key order.
 		if d, ok := distroSpec(key); ok {
-			return renderPURL(d.typ, d.namespace, d.name(name), version, d.qualifier), true
+			q := d.qualifier
+			if arch != "" {
+				if q != "" {
+					q = "arch=" + arch + "&" + q
+				} else {
+					q = "arch=" + arch
+				}
+			}
+			return renderPURL(d.typ, d.namespace, d.name(name), version, q), true
 		}
 		// Registries the spec doesn't cover (firefox, wordpress, jetbrains, snap,
 		// homebrew, the BSDs, and the language registries gem/cargo/nuget/hex/
@@ -270,10 +288,12 @@ type distroPURL struct {
 }
 
 // distroSpec maps a distro registry key to its purl-spec rendering: Debian-family
-// → deb, RPM-family → rpm, Alpine-family → apk, Arch-family → alpm. The AUR is not
-// a vendor but a repository within the arch vendor, so the spec keeps arch in the
-// namespace and names the AUR in a repository_url qualifier (fletch routes that
-// back to the AUR RPC); every other distro carries no qualifier.
+// → deb, RPM-family → rpm, Alpine-family → apk, Arch-family → alpm. The AUR is
+// carried as its own alpm namespace (pkg:alpm/aur/<name>): distinguishing it from
+// the official repos is what the namespace is for, and the bare name is what the
+// AUR RPC and fletch's fetcher key on. (We previously emitted the arch vendor
+// plus a repository_url qualifier; the canonicalizer folds that spelling onto
+// this one.)
 func distroSpec(key string) (distroPURL, bool) {
 	switch key {
 	case "debian":
@@ -289,7 +309,7 @@ func distroSpec(key string) (distroPURL, bool) {
 	case "arch":
 		return distroPURL{"alpm", "arch", "", true}, true
 	case "aur":
-		return distroPURL{"alpm", "arch", "repository_url=https://aur.archlinux.org", true}, true
+		return distroPURL{"alpm", "aur", "", true}, true
 	case "alpine":
 		return distroPURL{"apk", "alpine", "", true}, true
 	case "wolfi":
@@ -304,7 +324,7 @@ func distroSpec(key string) (distroPURL, bool) {
 func (d distroPURL) name(raw string) string {
 	name := lastSegment(raw)
 	if d.lowerName {
-		return strings.ToLower(name)
+		return asciiLower(name)
 	}
 	return name
 }
@@ -315,20 +335,29 @@ func (d distroPURL) name(raw string) string {
 // pkg:vscode/pub/name & pkg:openvsx/pub/name→vscode-extension (Open VSX keeping its
 // repository_url qualifier), the bare distro types pkg:debian|arch|fedora|…→
 // deb/rpm/apk/alpm with the distro namespace, and both AUR spellings (bare
-// pkg:aur/<name> and the older pkg:alpm/aur/<name>)→pkg:alpm/arch/<name> with a
-// repository_url qualifier naming the AUR. Inputs already in canonical form, or of
-// a type we don't remap, are returned unchanged. A string that isn't a PURL is
-// returned as-is.
+// pkg:aur/<name> and the vendor-plus-qualifier
+// pkg:alpm/arch/<name>?repository_url=…aur.archlinux.org)→pkg:alpm/aur/<name>,
+// the AUR as its own alpm namespace. For the spec distro types (deb/rpm/apk/alpm)
+// it lowercases the vendor namespace (case-insensitive per spec) and recovers a
+// missing one from the distro=<vendor>-<release> qualifier (see [distroPath]).
+// It also repairs the non-spec "?qualifiers@version" ordering older exports
+// composed (purl_base || '@' || version glued the version after a
+// qualifier-bearing base), restoring the spec "@version?qualifiers" order.
+// Inputs already in canonical form, or of a type we don't remap, are returned
+// unchanged. A string that isn't a PURL is returned as-is.
 func CanonicalizePURL(purl string) string {
-	body, ok := strings.CutPrefix(purl, "pkg:")
+	// The `pkg` scheme and the type are case-insensitive per spec (and pasted
+	// purls arrive padded), so fold their case and trim before anything else —
+	// matching fletch's purl::normalize, which must produce identical output.
+	purl = strings.TrimSpace(purl)
+	if len(purl) < 4 || !strings.EqualFold(purl[:4], "pkg:") {
+		return purl
+	}
+	typ, rest, ok := strings.Cut(purl[4:], "/")
 	if !ok {
 		return purl
 	}
-	typ, rest, ok := strings.Cut(body, "/")
-	if !ok {
-		return purl
-	}
-	typ = strings.ToLower(typ)
+	typ = asciiLower(typ)
 
 	// Split the remainder into path and the version/qualifier tail so we can
 	// re-key the type without disturbing "@version" or "?qualifiers".
@@ -336,28 +365,180 @@ func CanonicalizePURL(purl string) string {
 	if i := strings.IndexAny(rest, "@?"); i >= 0 {
 		path, tail = rest[:i], rest[i:]
 	}
+	// A degenerate coordinate (empty type or name) has no canonical form —
+	// the Rust twin (fletch's purl::normalize) rejects these outright — so
+	// pass the input through untouched rather than half-rewriting it.
+	if typ == "" || lastSegment(path) == "" {
+		return purl
+	}
+	// Repair the non-spec "?qualifiers@version" ordering older exports emitted
+	// (a version appended to a qualifier-bearing purl_base): move the trailing
+	// version back before the qualifiers. The chunk after the last '@' is only
+	// a version when it is free of '='/'&'/'/', any of which would mark it as
+	// part of a qualifier value (e.g. a repository_url with userinfo) instead.
+	// (No change flag: the unchanged-input paths below compare their rebuilt
+	// output against the input, which detects this repair, a recovered or
+	// re-cased namespace, and a folded scheme/type alike.)
+	if strings.HasPrefix(tail, "?") {
+		if i := strings.LastIndexByte(tail, '@'); i > 0 {
+			if v := tail[i+1:]; v != "" && !strings.ContainsAny(v, "=&/") {
+				tail = "@" + v + tail[:i]
+			}
+		}
+	}
 
 	switch typ {
-	case "chrome":
-		return "pkg:chrome-extension/" + lastSegment(path) + tail
-	case "vscode":
-		return "pkg:vscode-extension/" + path + tail
+	// The extension types are case-insensitive per spec (store ids are
+	// lowercase), so their bodies are lowercased — matching buildTyped and
+	// fletch's purl::normalize. The ratified spellings are handled alongside
+	// the legacy ones so an already-ratified input still gets its case folded.
+	case "chrome", "chrome-extension":
+		return "pkg:chrome-extension/" + asciiLower(lastSegment(path)) + tail
+	case "vscode", "vscode-extension":
+		return "pkg:vscode-extension/" + asciiLower(path) + tail
 	case "openvsx":
-		return "pkg:vscode-extension/" + path + addQualifier(tail, "repository_url=https://open-vsx.org")
+		return "pkg:vscode-extension/" + asciiLower(path) + addQualifier(tail, "repository_url=https://open-vsx.org")
+	// PyPI treats '-'/'_'/'.' as one separator and names as case-insensitive
+	// (PEP 503, the registry's own equivalence); composer names are
+	// case-insensitive per spec and lowercased. npm is deliberately NOT
+	// folded: legacy mixed-case names were grandfathered in and stay distinct.
+	case "pypi":
+		return "pkg:pypi/" + pep503(path) + tail
+	case "composer":
+		return "pkg:composer/" + asciiLower(path) + tail
+	case "deb", "rpm", "apk":
+		if out := "pkg:" + typ + "/" + distroPath(typ, path, tail) + tail; out != purl {
+			return out
+		}
+		return purl
 	case "alpm":
-		// Fold the legacy AUR-in-namespace spelling (pkg:alpm/aur/<name>) onto the
-		// spec form: the AUR is a repository within the arch vendor, carried as a
-		// repository_url qualifier. Any other alpm namespace is already canonical.
-		if name, found := strings.CutPrefix(path, "aur/"); found {
-			aur, _ := distroSpec("aur")
-			return "pkg:alpm/arch/" + aur.name(name) + addQualifier(tail, aur.qualifier)
+		vendored := distroPath(typ, path, tail)
+		// The AUR is its own alpm namespace: pkg:alpm/aur/<name>. Fold the
+		// earlier vendor-plus-qualifier spelling we generated
+		// (pkg:alpm/arch/<name>?repository_url=…aur.archlinux.org) onto it,
+		// dropping that qualifier. A repository_url naming anything else, and
+		// the other alpm namespaces (the official repos), are already
+		// canonical.
+		if val, rest, found := cutQualifier(tail, "repository_url"); found && strings.Contains(val, "aur.archlinux.org") {
+			return "pkg:alpm/aur/" + asciiLower(lastSegment(vendored)) + rest
+		}
+		if name, found := strings.CutPrefix(vendored, "aur/"); found {
+			return "pkg:alpm/aur/" + asciiLower(name) + tail
+		}
+		if out := "pkg:alpm/" + vendored + tail; out != purl {
+			return out
 		}
 		return purl
 	}
 	if d, ok := distroSpec(typ); ok {
-		return "pkg:" + d.typ + "/" + d.namespace + "/" + d.name(path) + addQualifier(tail, d.qualifier)
+		ns := d.namespace
+		// An AUR repository_url wins over the mapped vendor: a legacy bare
+		// type carrying it (pkg:aur/x redundantly, or pkg:arch/x pointing at
+		// the AUR) folds onto the aur namespace with the now-redundant
+		// qualifier dropped — the same fold the alpm case applies, so a
+		// single pass converges to the fixed point.
+		if d.typ == "alpm" {
+			if val, rest, found := cutQualifier(tail, "repository_url"); found && strings.Contains(val, "aur.archlinux.org") {
+				ns, tail = "aur", rest
+			}
+		}
+		return "pkg:" + d.typ + "/" + ns + "/" + d.name(path) + addQualifier(tail, d.qualifier)
+	}
+	if out := "pkg:" + typ + "/" + path + tail; out != purl {
+		return out
 	}
 	return purl
+}
+
+// distroPath canonicalizes the vendor namespace of a spec distro type's
+// (deb/rpm/apk/alpm) coordinate path. The spec marks the namespace
+// case-insensitive and lowercased in canonical form, so an existing vendor is
+// lowercased. A *missing* vendor is recovered from a distro=<vendor>-<release>
+// qualifier — the spec's rpm note says the repository is implied by `distro` —
+// but only when the vendor prefix names a distro this project models for that
+// type (fedora-25 → fedora; a bare codename like jessie never matches). The
+// qualifier itself is left in place: identity layers strip it downstream.
+func distroPath(typ, path, tail string) string {
+	if ns, name, found := strings.Cut(path, "/"); found {
+		if lower := asciiLower(ns); lower != ns {
+			return lower + "/" + name
+		}
+		return path
+	}
+	if val, _, found := cutQualifier(tail, "distro"); found {
+		vendor, _, _ := strings.Cut(val, "-")
+		vendor = asciiLower(vendor)
+		if d, ok := distroSpec(vendor); ok && d.typ == typ && d.namespace == vendor {
+			return vendor + "/" + path
+		}
+	}
+	return path
+}
+
+// VersionlessPURL strips the "@version" from a Package URL, yielding the
+// identity form stored in samples.purl_base (e.g. "pkg:npm/lodash@4.17.21" →
+// "pkg:npm/lodash"). The version separator is the last '@' before the
+// qualifiers; a scoped npm name's '@' sits earlier (or is percent-encoded), so
+// it is never mistaken for it. A trailing "@version" *inside* the qualifier
+// tail — the non-spec ordering older composers emitted — is stripped too, when
+// the chunk after the '@' is free of '='/'&'/'/' and so can't be part of a
+// qualifier value.
+//
+// Of the qualifiers, only repository_url survives: it selects which registry
+// the name lives in (Open VSX vs the Microsoft marketplace), which *is*
+// identity. Artifact-selection qualifiers an SBOM-style client may stamp on
+// (arch, distro, kind, …) select which artifact of a release, not which
+// package — keeping them would split purl_base grouping against forager's
+// bare coordinates. Mirrors scan's fletch::purl::identity, minus the version.
+// Callers wanting a canonical identity compose [CanonicalizePURL] first.
+// Empty in, empty out.
+func VersionlessPURL(fullPURL string) string {
+	body, quals, hasQuals := strings.Cut(fullPURL, "?")
+	if i := strings.LastIndexByte(body, '@'); i > 0 {
+		body = body[:i]
+	}
+	if !hasQuals {
+		return body
+	}
+	if i := strings.LastIndexByte(quals, '@'); i > 0 && !strings.ContainsAny(quals[i+1:], "=&/") {
+		quals = quals[:i]
+	}
+	kept := make([]string, 0, 1)
+	for q := range strings.SplitSeq(quals, "&") {
+		if k, _, _ := strings.Cut(q, "="); strings.EqualFold(k, "repository_url") {
+			kept = append(kept, q)
+		}
+	}
+	if len(kept) == 0 {
+		return body
+	}
+	return body + "?" + strings.Join(kept, "&")
+}
+
+// cutQualifier removes the named qualifier from a PURL version/qualifier tail,
+// returning its value and the tail without it (the "?" goes too when it was the
+// only qualifier). found is false — and the tail returned unchanged — when the
+// key isn't present.
+func cutQualifier(tail, key string) (value, rest string, found bool) {
+	ver, quals, hasQ := strings.Cut(tail, "?")
+	if !hasQ {
+		return "", tail, false
+	}
+	kept := make([]string, 0, 4)
+	for q := range strings.SplitSeq(quals, "&") {
+		if k, v, _ := strings.Cut(q, "="); !found && strings.EqualFold(k, key) {
+			value, found = v, true
+			continue
+		}
+		kept = append(kept, q)
+	}
+	if !found {
+		return "", tail, false
+	}
+	if len(kept) == 0 {
+		return value, ver, true
+	}
+	return value, ver + "?" + strings.Join(kept, "&"), true
 }
 
 // addQualifier merges one qualifier into a PURL version/qualifier tail
@@ -384,7 +565,7 @@ func addQualifier(tail, qualifier string) string {
 // lowercased to canonical form. Marketplace ids use "publisher.name"; Open VSX
 // exports "publisher/name". A bare id yields an empty publisher.
 func splitExtensionID(name string) (publisher, ext string) {
-	name = strings.ToLower(name)
+	name = asciiLower(name)
 	if pub, e, found := strings.Cut(name, "/"); found {
 		return pub, e
 	}
@@ -392,6 +573,46 @@ func splitExtensionID(name string) (publisher, ext string) {
 		return pub, e
 	}
 	return "", name
+}
+
+// asciiLower lowercases ASCII letters only, leaving every other byte
+// untouched — the exact fold Rust's to_ascii_lowercase applies, so the two
+// canonicalizers stay byte-identical even on non-ASCII names (which
+// strings.ToLower would case-fold differently).
+func asciiLower(s string) string {
+	lower := func(r rune) rune {
+		if r >= 'A' && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return r
+	}
+	return strings.Map(lower, s)
+}
+
+// pep503 normalizes a PyPI project name per PEP 503 — ASCII-lowercase, any run
+// of '-'/'_'/'.' collapsed to a single '-' — the registry's own name
+// equivalence. filefacts' manifest parser and fletch's purl::normalize apply
+// the same fold, so a requirements.txt spelling and a download-derived
+// spelling of one project always share a key.
+func pep503(name string) string {
+	var b strings.Builder
+	b.Grow(len(name))
+	sep := false
+	for _, r := range name {
+		if r == '-' || r == '_' || r == '.' {
+			if !sep {
+				b.WriteByte('-')
+				sep = true
+			}
+			continue
+		}
+		sep = false
+		if r >= 'A' && r <= 'Z' {
+			r += 'a' - 'A'
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // lastSegment returns the final "/"-separated segment (fletch drops any vendor
@@ -471,6 +692,11 @@ func purlUnreserved(c byte) bool {
 	case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
 		return true
 	case c == '-', c == '.', c == '_', c == '~':
+		return true
+	case c == ':':
+		// The spec's canonical test vectors keep ':' literal (an rpm/deb/alpm
+		// epoch: "attr@1:2.4.47-2%2Bb1", "containers-common@1:0.47.4-4") —
+		// only '+' and the truly reserved bytes are percent-encoded.
 		return true
 	default:
 		return false

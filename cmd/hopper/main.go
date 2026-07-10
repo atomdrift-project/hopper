@@ -56,6 +56,7 @@ commands:
   backfill           re-derive columns from cleave_result/litmus_result blobs
   reheal-crit        repair max_crit/suspicious_count zeroed by the pre-v8 cleave trigger (postgres)
   backfill-purl      derive missing samples.purl_base from ecosystem+package (never overwrites; postgres)
+  canonicalize-purls rewrite stored purl_base spellings onto the current canonical form (batched; -dry-run; postgres)
   purge-unsupported  delete analyzed rows cleave could not classify
   normalize-ecosystems  re-canonicalize stored ecosystem labels (dry-run)
   cleanup            delete wonky samples by skip category (interactive)
@@ -513,6 +514,8 @@ func run(ctx context.Context) error {
 		return cmdRehealCrit(ctx)
 	case "backfill-purl":
 		return cmdBackfillPURL(ctx)
+	case "canonicalize-purls":
+		return cmdCanonicalizePURLs(ctx)
 	case "purge-unsupported":
 		return cmdPurgeUnsupported(ctx)
 	case "normalize-ecosystems":
@@ -2903,7 +2906,7 @@ func fillSampleProvenance(s *hopper.Sample, prov pathProvenance, filename string
 	s.Domain = prov.domain
 	s.Package = prov.pkg
 	s.Version = prov.version
-	parsedName, parsedVersion := pkgparse.ParseFilename(filename)
+	parsedName, parsedVersion, _ := pkgparse.ParseFilename(filename)
 	if s.Package == "" {
 		s.Package = parsedName
 	}
@@ -3224,6 +3227,38 @@ func cmdBackfillPURL(ctx context.Context) error {
 		return err
 	}
 	slog.Info("backfill-purl complete", "rows_filled", n)
+	return nil
+}
+
+// cmdCanonicalizePURLs rewrites every stored purl_base onto the current
+// canonical spelling — the follow-up whenever a normalization fold changes
+// (the AUR namespace move, PEP 503 PyPI names, extension-id case folds).
+// Batched by id cursor so it never locks more than ~20k rows at a time,
+// idempotent (canonicalization is a fixed point), and safe to re-run or
+// interrupt. Run with -dry-run first to see how many rows a fold touches;
+// rebuild the published bloom filters afterwards so the exported keys match.
+func cmdCanonicalizePURLs(ctx context.Context) error {
+	f := flag.NewFlagSet("canonicalize-purls", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	dryRun := f.Bool("dry-run", false, "report what would be rewritten without writing")
+	parseFlags(f, os.Args[2:])
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	if err := db.Migrate(ctx); err != nil {
+		return err
+	}
+
+	slog.Info("canonicalizing stored purl_base spellings", "dry_run", *dryRun)
+	n, err := db.CanonicalizePURLBases(ctx, *dryRun)
+	if err != nil {
+		return err
+	}
+	slog.Info("canonicalize-purls complete", "rows_rewritten", n, "dry_run", *dryRun)
 	return nil
 }
 

@@ -3925,6 +3925,87 @@ func (db *DB) backfillPURLPG(ctx context.Context) (int64, error) {
 	return updated, nil
 }
 
+// canonicalizePURLBasesPG rewrites every stored samples.purl_base onto the
+// current canonical spelling (pkgparse.CanonicalizePURL + VersionlessPURL) —
+// the repair for rows written before a fold existed: the qualifier-form AUR
+// identity, dotted PyPI names, mixed-case extension ids, legacy bare distro
+// types. It never blocks the table: rows stream in id-cursor batches (each
+// SELECT is a snapshot read), the canonical form is computed client-side, and
+// only rows whose spelling actually changes are written — one short
+// batch-sized transaction of row-level locks apiece. The `purl_base = old`
+// guard skips any row that changed concurrently, and canonicalization is a
+// fixed point, so the sweep is idempotent and safely resumable. purl_base-only
+// updates fire no trigger (samples_derive_cleave_cols is `UPDATE OF
+// cleave_result`) and bump no updated_at: a respelled identity is not a state
+// change. dryRun reports what would be rewritten without writing.
+func (db *DB) canonicalizePURLBasesPG(ctx context.Context, dryRun bool) (int64, error) {
+	const batchRows = 20000
+	var rewritten, cursor int64
+	for {
+		rows, err := db.pool.Query(ctx, `
+			SELECT id, purl_base FROM samples
+			WHERE id > $1 AND purl_base <> ''
+			ORDER BY id LIMIT $2`, cursor, batchRows)
+		if err != nil {
+			return rewritten, fmt.Errorf("hopper: canonicalize purl select: %w", err)
+		}
+		var ids []int64
+		var olds, news []string
+		var seen int
+		var maxID int64
+		for rows.Next() {
+			var id int64
+			var pb string
+			if err := rows.Scan(&id, &pb); err != nil {
+				rows.Close()
+				return rewritten, fmt.Errorf("hopper: canonicalize purl scan: %w", err)
+			}
+			seen++
+			maxID = id
+			// VersionlessPURL after canonicalization: the order repair can
+			// surface a version a legacy composer had buried in the
+			// qualifier tail, and purl_base is the version-less identity.
+			canon := pkgparse.VersionlessPURL(pkgparse.CanonicalizePURL(pb))
+			if canon != pb && canon != "" {
+				ids = append(ids, id)
+				olds = append(olds, pb)
+				news = append(news, canon)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return rewritten, fmt.Errorf("hopper: canonicalize purl iterate: %w", err)
+		}
+		rows.Close()
+		if seen == 0 {
+			break
+		}
+		if len(ids) > 0 {
+			if dryRun {
+				rewritten += int64(len(ids))
+				slog.Info("canonicalize purl would rewrite",
+					"count", len(ids), "example_old", olds[0], "example_new", news[0])
+			} else {
+				tag, err := db.pool.Exec(ctx, `
+					UPDATE samples s SET purl_base = v.new
+					FROM unnest($1::bigint[], $2::text[], $3::text[]) AS v(id, old, new)
+					WHERE s.id = v.id AND s.purl_base = v.old`, ids, olds, news)
+				if err != nil {
+					return rewritten, fmt.Errorf("hopper: canonicalize purl update: %w", err)
+				}
+				rewritten += tag.RowsAffected()
+			}
+		}
+		cursor = maxID
+		slog.Info("canonicalize purl batch",
+			"through_id", cursor, "rewritten_total", rewritten, "dry_run", dryRun)
+		if seen < batchRows {
+			break
+		}
+	}
+	return rewritten, nil
+}
+
 // backfillLitmusClassPG heals litmus_class for litmus-bearing rows analyzed
 // before it became a trigger-fed column (the column is nullable, so those rows
 // are NULL until healed). The samples_derive_litmus_score trigger fills it on
