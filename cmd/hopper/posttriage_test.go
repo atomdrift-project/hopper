@@ -122,6 +122,41 @@ func TestHandleTriageDryRunDoesNotMove(t *testing.T) {
 	}
 }
 
+// TestHandleTriageAbsentBytes: on a partial mirror the DB row exists but the
+// bytes don't. The verdict must be deferred — no move, no DB-only relabel
+// (which the next full-corpus load walk would flip back by pool precedence).
+func TestHandleTriageAbsentBytes(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db := mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	api := &apiServer{db: db, dataRoot: root, tracker: newWorkerTracker()}
+
+	sha := repeat("7")
+	rel := filepath.Join("bad", "foraged", "npm", "gone", "gone-1.0.tgz")
+	// DB row only — no file on disk.
+	if err := db.InsertSample(ctx, &hopper.Sample{
+		SHA256: sha, Source: "test", Path: rel, Label: "bad", LabelSource: "harvest",
+	}); err != nil {
+		t.Fatalf("InsertSample: %v", err)
+	}
+
+	resp := callTriage(t, api, triageRequest{Verdicts: []triageVerdict{{SHA256: sha, Ruling: "sighted", Source: "sighted-backfill"}}})
+	if resp.Absent != 1 || resp.Failed != 0 || resp.Moved != 0 {
+		t.Fatalf("absent=%d failed=%d moved=%d, want 1/0/0: %+v", resp.Absent, resp.Failed, resp.Moved, resp.Results)
+	}
+	samp, err := db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatalf("SampleBySHA256: %v", err)
+	}
+	if samp.Label != "bad" || samp.Path != rel {
+		t.Fatalf("deferred row must be untouched: label=%q path=%q", samp.Label, samp.Path)
+	}
+}
+
 func TestHandleTriageUnknownSHA(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

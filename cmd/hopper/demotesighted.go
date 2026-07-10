@@ -263,7 +263,7 @@ func demoteParents(ctx context.Context, baseURL, token, manifestPath string, dem
 	defer mf.Close() //nolint:errcheck // flushed per write; nothing buffered
 
 	enc := json.NewEncoder(mf)
-	var moved, noop, failed int
+	var moved, noop, absent, failed int
 	for start := 0; start < len(demote); start += batch {
 		chunk := demote[start:min(start+batch, len(demote))]
 		verdicts := make([]triageVerdict, 0, len(chunk))
@@ -284,11 +284,16 @@ func demoteParents(ctx context.Context, baseURL, token, manifestPath string, dem
 		}
 		moved += resp.Moved
 		noop += resp.Noop
+		absent += resp.Absent
 		failed += resp.Failed
-		writeStdoutf("demoted %d/%d (noop %d, failed %d)\n", moved, len(demote), noop, failed)
+		writeStdoutf("demoted %d/%d (noop %d, absent %d, failed %d)\n", moved, len(demote), noop, absent, failed)
 	}
-	writeStdoutf("\nSummary: %d demoted to sighted/, %d noop, %d failed (manifest: %s)\n",
-		moved, noop, failed, manifestPath)
+	writeStdoutf("\nSummary: %d demoted to sighted/, %d noop, %d absent, %d failed (manifest: %s)\n",
+		moved, noop, absent, failed, manifestPath)
+	if absent > 0 {
+		writeStdoutf("%d row(s) deferred: their bytes are not on this host (partial mirror); their labels\n"+
+			"are untouched — re-run demote-sighted after the full corpus is attached to converge.\n", absent)
+	}
 	if failed > 0 {
 		return fmt.Errorf("demote-sighted: %d row(s) failed", failed)
 	}

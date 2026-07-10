@@ -125,7 +125,9 @@ type triageRequest struct {
 // triageResult reports the outcome for one verdict. Status is one of:
 // "moved" (relocated + relabeled), "plan" (dry-run, would move),
 // "noop" (already in the corrected pool), "not_found" (unknown sha or no
-// on-disk pool copy), or "error".
+// on-disk pool copy), "absent" (the DB row is real but its bytes are not on
+// this host — a partial mirror; the verdict is deferred, re-submit once the
+// full corpus is attached), or "error".
 type triageResult struct {
 	SHA256  string `json:"sha256"`
 	Status  string `json:"status"`
@@ -139,6 +141,7 @@ type triageResponse struct {
 	Results []triageResult `json:"results"`
 	Moved   int            `json:"moved"`
 	Noop    int            `json:"noop"`
+	Absent  int            `json:"absent"` // rows whose bytes are not on this host (deferred)
 	Failed  int            `json:"failed"`
 }
 
@@ -184,6 +187,8 @@ func (s *apiServer) handleTriage(w http.ResponseWriter, r *http.Request) {
 			resp.Moved++
 		case "noop":
 			resp.Noop++
+		case "absent":
+			resp.Absent++
 		default:
 			resp.Failed++
 		}
@@ -253,6 +258,16 @@ func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun
 		return res
 	}
 	res.NewPath = plan.newRel
+
+	// A partial mirror may hold the row without the bytes. Deliberately do
+	// NOT relabel DB-only: the pool directory is ground truth, and a label
+	// that contradicts where the bytes actually sit would be flipped back by
+	// the next load walk over the full corpus (pool precedence). The verdict
+	// is simply deferred until it is re-submitted on a host with the file.
+	if _, statErr := os.Stat(oldAbs); errors.Is(statErr, os.ErrNotExist) {
+		res.Status, res.Error = "absent", "bytes not on this host; re-submit once the full corpus is attached"
+		return res
+	}
 
 	newAbs, err := s.resolveDataPath(plan.newRel)
 	if err != nil {
