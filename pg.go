@@ -4697,7 +4697,9 @@ func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error
 			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
 			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
 			AND (coalesce(cardinality($5::int[]), 0) = 0 OR `+q.feedClassExpr()+` = ANY($5))
-			AND (NOT $6 OR parent = '')
+			AND (NOT $6 OR (parent = '' AND NOT EXISTS (
+				SELECT FROM sample_locations sl
+				WHERE sl.sha256 = samples.sha256 AND sl.parent_sha256 <> '')))
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
 			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))
@@ -4741,7 +4743,9 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q *FeedQuery) (int, error)
 			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
 			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
 			AND (coalesce(cardinality($5::int[]), 0) = 0 OR `+q.feedClassExpr()+` = ANY($5))
-			AND (NOT $6 OR parent = '')
+			AND (NOT $6 OR (parent = '' AND NOT EXISTS (
+				SELECT FROM sample_locations sl
+				WHERE sl.sha256 = samples.sha256 AND sl.parent_sha256 <> '')))
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
 			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))

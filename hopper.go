@@ -3333,7 +3333,7 @@ type FeedQuery struct {
 	LitmusClasses []int    // optional: filter by litmus_result class values
 	RequireLitmus bool     // require any litmus_result without filtering by class
 	Corroborated  bool     // only samples cited by an external threat feed (samples.corroborated)
-	TopLevelOnly  bool     // only samples with no archive parent
+	TopLevelOnly  bool     // only samples that appear in no archive: parent = '' AND no parented sample_locations row (children may have multiple parents; the locations ledger is the authority)
 	Offset        int      // pagination offset
 	Limit         int      // page size (clamped to 1–1000)
 	// CriticalLevel pins the hostile/suspicious cutoff used when deriving

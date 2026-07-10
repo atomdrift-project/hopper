@@ -3150,6 +3150,71 @@ func TestFeedSamples(t *testing.T) {
 	}
 }
 
+// TestFeedTopLevelOnlyExcludesArchiveChildren locks the TopLevelOnly contract:
+// a sample that appears inside any archive per the sample_locations ledger is
+// not top-level, even when its own parent column is empty. That combination is
+// exactly what scan's dependency mirroring produces (a fetched payload
+// uploaded as its own sample) — and children may have multiple parents, which
+// the single-valued parent column cannot represent.
+func TestFeedTopLevelOnlyExcludesArchiveChildren(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	const archive = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	resultFor := func(sha string) []byte {
+		return []byte(`{"fs":[{"sha":"` + sha + `","type":"elf","dp":0}]}`)
+	}
+
+	// A genuinely top-level sample: empty parent, no parented locations.
+	mustInsert(t, ctx, db, &Sample{SHA256: "top", Source: "test"})
+	if err := db.UpdateCleaveResult(ctx, "top", resultFor("top"), nil, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// A mirrored dependency: its samples.parent is empty (it was uploaded as
+	// its own sample), but the locations ledger records it as a member of an
+	// archive.
+	mustInsert(t, ctx, db, &Sample{SHA256: "dep", Source: "test"})
+	if err := db.UpdateCleaveResult(ctx, "dep", resultFor("dep"), nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertLocation(ctx, &SampleLocation{
+		SHA256:       "dep",
+		Path:         "bad/feed/" + archive + "/" + archive + ".elf!!dep",
+		ParentSHA256: archive,
+		Filename:     "dep",
+		Source:       "test",
+	}); err != nil {
+		t.Fatalf("UpsertLocation: %v", err)
+	}
+
+	q := FeedQuery{Source: "test", TopLevelOnly: true, Limit: 10}
+	samples, err := db.FeedSamples(ctx, &q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 1 || samples[0].SHA256 != "top" {
+		t.Fatalf("TopLevelOnly feed = %+v, want just top", samples)
+	}
+	n, err := db.FeedSamplesCount(ctx, &q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("TopLevelOnly count = %d, want 1", n)
+	}
+
+	// Without TopLevelOnly both remain reachable.
+	q.TopLevelOnly = false
+	samples, err = db.FeedSamples(ctx, &q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 2 {
+		t.Fatalf("unfiltered feed = %d rows, want 2", len(samples))
+	}
+}
+
 // TestFeedSamplesProjectionOmitsBlobs locks the feed projection contract:
 // FeedSamples must not carry cleave_result (the archive member tree — up to
 // megabytes) or llm_result, which the feed never renders, while it must keep

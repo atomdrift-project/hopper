@@ -3716,7 +3716,14 @@ func (q *FeedQuery) whereSQLite() (where string, args []any) {
 	}
 
 	if q.TopLevelOnly {
-		clauses = append(clauses, "parent = ''")
+		// parent='' alone is not enough: a file mirrored into its own sample
+		// row (e.g. a fetched dependency pushed by scan) has an empty parent
+		// column while sample_locations records it as a member of one or more
+		// archives. Children may have multiple parents, so the locations
+		// ledger — not the single-valued parent column — is the authority.
+		clauses = append(clauses, "parent = '' AND NOT EXISTS ("+
+			"SELECT 1 FROM sample_locations sl "+
+			"WHERE sl.sha256 = samples.sha256 AND sl.parent_sha256 <> '')")
 	}
 
 	if q.Corroborated {
