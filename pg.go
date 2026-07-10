@@ -1640,8 +1640,9 @@ const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 // re-observations, used by both the single-row (insertSampleNewPG) and batch
 // (insertBatchStagingInsert) upserts so their resolution logic can't drift.
 //
-// Pool-precedence label resolution (rank: bad>good>unknown), evaluated in
-// order — see classifyLabelTransition for the mirror used by logging:
+// Pool-precedence label resolution (rank: bad>good>sighted>unknown, see
+// labelRank/labelRankSQL), evaluated in order — see classifyLabelTransition
+// for the mirror used by logging:
 //  1. incoming marker present        → take the marker's label, re-quarantine
 //  2. stored marker, none incoming   → marker gone, the directory governs again
 //  3. good+bad across pools          → resolve to bad, quarantine as 'conflict'
@@ -1651,14 +1652,14 @@ const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 // Only walker writes (parent=”) may touch the row; explode writes
 // (parent=<archive-sha>) are excluded by the WHERE so an archive member never
 // changes a top-level label or clobbers its path on a content-hash collision.
-const sampleConflictUpdatePG = `ON CONFLICT (sha256) DO UPDATE SET
+var sampleConflictUpdatePG = `ON CONFLICT (sha256) DO UPDATE SET
 	label = CASE
 		WHEN EXCLUDED.label_source = 'marker' THEN EXCLUDED.label
 		WHEN samples.label_source = 'marker' THEN EXCLUDED.label
 		WHEN (samples.label = 'good' AND EXCLUDED.label = 'bad')
 		  OR (samples.label = 'bad' AND EXCLUDED.label = 'good') THEN 'bad'
-		WHEN (CASE EXCLUDED.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
-		   > (CASE samples.label  WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END) THEN EXCLUDED.label
+		WHEN ` + labelRankSQL("EXCLUDED.label") + `
+		   > ` + labelRankSQL("samples.label") + ` THEN EXCLUDED.label
 		ELSE samples.label
 	END,
 	label_source = CASE
@@ -1666,8 +1667,8 @@ const sampleConflictUpdatePG = `ON CONFLICT (sha256) DO UPDATE SET
 		WHEN samples.label_source = 'marker' THEN EXCLUDED.label_source
 		WHEN (samples.label = 'good' AND EXCLUDED.label = 'bad')
 		  OR (samples.label = 'bad' AND EXCLUDED.label = 'good') THEN 'conflict'
-		WHEN (CASE EXCLUDED.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
-		   > (CASE samples.label  WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END) THEN EXCLUDED.label_source
+		WHEN ` + labelRankSQL("EXCLUDED.label") + `
+		   > ` + labelRankSQL("samples.label") + ` THEN EXCLUDED.label_source
 		ELSE samples.label_source
 	END,
 	feed  = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE samples.feed END,
@@ -1693,8 +1694,8 @@ const sampleConflictUpdatePG = `ON CONFLICT (sha256) DO UPDATE SET
 		WHEN ((samples.label = 'good' AND EXCLUDED.label = 'bad')
 		   OR (samples.label = 'bad' AND EXCLUDED.label = 'good'))
 		  AND samples.skip IN ('', 'misclassified', 'conflict', 'missing', 'unsupported') THEN 'conflict'
-		WHEN (CASE EXCLUDED.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
-		   > (CASE samples.label  WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
+		WHEN ` + labelRankSQL("EXCLUDED.label") + `
+		   > ` + labelRankSQL("samples.label") + `
 		  AND samples.skip IN ('misclassified', 'conflict') THEN ''
 		WHEN samples.skip IN ('missing','unsupported') THEN ''
 		ELSE samples.skip
@@ -1709,15 +1710,15 @@ WHERE EXCLUDED.parent = ''
     OR (samples.purl_base = '' AND EXCLUDED.purl_base <> '')
     OR samples.skip IN ('missing','unsupported')
     -- Pool-precedence transitions must fire even when path/mtime are unchanged.
-    OR ((CASE EXCLUDED.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
-      > (CASE samples.label  WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END))
+    OR (` + labelRankSQL("EXCLUDED.label") + `
+      > ` + labelRankSQL("samples.label") + `)
     OR ((samples.label = 'good' AND EXCLUDED.label = 'bad')
       OR (samples.label = 'bad' AND EXCLUDED.label = 'good'))
     OR (EXCLUDED.label_source = 'marker'
         AND (samples.label <> EXCLUDED.label OR samples.label_source <> 'marker' OR samples.skip <> 'misclassified'))
     OR (samples.label_source = 'marker' AND EXCLUDED.label_source <> 'marker'))`
 
-const insertBatchStagingInsert = `INSERT INTO samples (
+var insertBatchStagingInsert = `INSERT INTO samples (
 	sha256, source, feed, ecosystem, filename,
 	size_bytes, label, label_source, path, status,
 	canonical_sha256, parent, skip, elements,
@@ -1751,8 +1752,8 @@ func logLabelTransitionsPG(ctx context.Context, tx pgx.Tx) {
 		    OR (s.label_source <> 'marker'
 		        AND ((s.label = 'good' AND st.label = 'bad')
 		          OR (s.label = 'bad' AND st.label = 'good')
-		          OR (CASE st.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
-		           > (CASE s.label  WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END))))`)
+		          OR `+labelRankSQL("st.label")+`
+		           > `+labelRankSQL("s.label")+`)))`)
 	if err != nil {
 		slog.Warn("label transition log query failed", "error", err)
 		return
@@ -2522,6 +2523,14 @@ func (db *DB) relocateSamplePG(ctx context.Context, sha256, oldRel, newRel, labe
 		return fmt.Errorf("hopper: relocate begin: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+	// Audit the label transition before applying it (reading the pre-update
+	// row); a pure path move (label unchanged) writes no event.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
+		SELECT sha256, label, $2, skip, '', 'triage', now()
+		FROM samples WHERE sha256 = $1 AND label <> $2`, sha256, label); err != nil {
+		return fmt.Errorf("hopper: relocate audit: %w", err)
+	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE samples
 		   SET label = $2, label_source = $3, path = $4,
@@ -2583,14 +2592,17 @@ func cascadeMembersForParentPG(ctx context.Context, tx pgx.Tx, parent, label, so
 	// Each query selects the members (via sample_locations, the membership
 	// source of truth) eligible for a transition. $1 is the parent; later
 	// placeholders bind extra args.
+	// Unverified members (unknown, or sighted by a feed) follow a verified
+	// parent in both directions: a good parent vouches for its sighted members;
+	// a bad parent drags suspicious sighted members along.
 	const promoteMembers = `SELECT sha256, label FROM samples
-		WHERE label = 'unknown'
+		WHERE label IN ('unknown', 'sighted')
 		  AND sha256 IN (SELECT sha256 FROM sample_locations WHERE parent_sha256 = $1)`
 	const revertMembers = `SELECT sha256, label FROM samples
 		WHERE label = 'bad' AND label_source = $2
 		  AND sha256 IN (SELECT sha256 FROM sample_locations WHERE parent_sha256 = $1)`
 	const demoteMembers = `SELECT sha256, label FROM samples
-		WHERE label = 'unknown' AND score >= $2
+		WHERE label IN ('unknown', 'sighted') AND score >= $2
 		  AND sha256 IN (SELECT sha256 FROM sample_locations WHERE parent_sha256 = $1)`
 
 	children := 0
@@ -2686,7 +2698,7 @@ func (db *DB) cascadeBackfillPendingPG(ctx context.Context) (bool, error) {
 			FROM samples p
 			JOIN sample_locations l ON l.parent_sha256 = p.sha256
 			JOIN samples m ON m.sha256 = l.sha256
-			WHERE p.parent = '' AND m.label = 'unknown'
+			WHERE p.parent = '' AND m.label IN ('unknown', 'sighted')
 			  AND (p.label = 'good' OR (p.label = 'bad' AND m.score >= $1))
 		)`, CascadeDemoteScore).Scan(&pending)
 	if err != nil {
@@ -2698,7 +2710,8 @@ func (db *DB) cascadeBackfillPendingPG(ctx context.Context) (bool, error) {
 // cascadeBackfillPG re-applies the member cascade to every already-labeled
 // archive so children labeled before CascadeLabel existed are brought into
 // agreement. Bad archives are processed before good ones: a member shared by a
-// bad and a good archive must end up bad (precedence bad > good > unknown), and
+// bad and a good archive must end up bad (precedence bad > good > sighted >
+// unknown), and
 // since demote claims only unknown members while promote never overrides bad,
 // bad-first yields that outcome — good-first would whitewash it. Each archive
 // commits in its own transaction so the pass never holds a table-wide lock and
@@ -2715,7 +2728,7 @@ func (db *DB) cascadeBackfillPG(ctx context.Context, dryRun bool) (CascadeBackfi
 		WHERE parent = '' AND label = 'bad'
 		  AND EXISTS (
 			SELECT 1 FROM sample_locations l JOIN samples m ON m.sha256 = l.sha256
-			WHERE l.parent_sha256 = s.sha256 AND m.label = 'unknown' AND m.score >= $1)
+			WHERE l.parent_sha256 = s.sha256 AND m.label IN ('unknown', 'sighted') AND m.score >= $1)
 		ORDER BY id`
 	const goodArchives = `
 		SELECT sha256, label_source FROM samples s
@@ -2723,7 +2736,7 @@ func (db *DB) cascadeBackfillPG(ctx context.Context, dryRun bool) (CascadeBackfi
 		  AND EXISTS (
 			SELECT 1 FROM sample_locations l JOIN samples m ON m.sha256 = l.sha256
 			WHERE l.parent_sha256 = s.sha256
-			  AND (m.label = 'unknown' OR (m.label = 'bad' AND m.label_source = 'cascade:' || s.sha256)))
+			  AND (m.label IN ('unknown', 'sighted') OR (m.label = 'bad' AND m.label_source = 'cascade:' || s.sha256)))
 		ORDER BY id`
 
 	var st CascadeBackfillStats
@@ -2798,17 +2811,17 @@ func (db *DB) samplesByLabelPG(ctx context.Context, label string, limit int) ([]
 	return scanPGSamples(rows)
 }
 
-func (db *DB) promotionCandidatesPG(ctx context.Context, pathPrefix string, olderThan time.Time, afterSHA string, limit int) ([]*Sample, error) {
+func (db *DB) candidatesByLabelPG(ctx context.Context, label, pathPrefix string, olderThan time.Time, afterSHA string, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
-		 WHERE label = 'unknown' AND parent = '' AND skip = ''
-		   AND starts_with(path, $1)
-		   AND mtime IS NOT NULL AND mtime < $2
-		   AND sha256 > $3
-		 ORDER BY sha256 LIMIT $4`,
-		pathPrefix, olderThan.UTC(), afterSHA, limit)
+		 WHERE label = $1 AND parent = '' AND skip = ''
+		   AND starts_with(path, $2)
+		   AND mtime IS NOT NULL AND mtime < $3
+		   AND sha256 > $4
+		 ORDER BY sha256 LIMIT $5`,
+		label, pathPrefix, olderThan.UTC(), afterSHA, limit)
 	if err != nil {
-		return nil, fmt.Errorf("hopper: promotion candidates: %w", err)
+		return nil, fmt.Errorf("hopper: candidates by label: %w", err)
 	}
 	return scanPGSamples(rows)
 }
@@ -4006,6 +4019,66 @@ func (db *DB) canonicalizePURLBasesPG(ctx context.Context, dryRun bool) (int64, 
 	return rewritten, nil
 }
 
+// canonicalizeSightingSubjectsPG rewrites every sightings.subject onto the
+// ledger keying convention (see normalizeSubject). The ledger is small
+// (thousands of rows), so this is a single read + per-change transaction. A
+// canonical collision with an existing (source, subject) row merges into it:
+// insert-if-absent then delete the old spelling, keeping the survivor's
+// first_seen.
+func (db *DB) canonicalizeSightingSubjectsPG(ctx context.Context, dryRun bool) (int64, error) {
+	rows, err := db.pool.Query(ctx, `SELECT source, subject FROM sightings ORDER BY source, subject`)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: canonicalize sightings scan: %w", err)
+	}
+	type change struct{ source, old, canon string }
+	var changes []change
+	for rows.Next() {
+		var source, subject string
+		if err := rows.Scan(&source, &subject); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("hopper: canonicalize sightings row: %w", err)
+		}
+		if canon := normalizeSubject(subject); canon != subject && canon != "" {
+			changes = append(changes, change{source, subject, canon})
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if dryRun {
+		for _, c := range changes {
+			slog.Info("canonicalize sighting would rewrite", "source", c.source, "old", c.old, "new", c.canon)
+		}
+		return int64(len(changes)), nil
+	}
+	var rewritten int64
+	for _, c := range changes {
+		tx, err := db.pool.Begin(ctx)
+		if err != nil {
+			return rewritten, fmt.Errorf("hopper: canonicalize sighting begin: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO sightings (source, subject, url, note, first_seen)
+			SELECT source, $3, url, note, first_seen FROM sightings
+			WHERE source = $1 AND subject = $2
+			ON CONFLICT (source, subject) DO NOTHING`, c.source, c.old, c.canon); err != nil {
+			tx.Rollback(ctx) //nolint:errcheck // already failing
+			return rewritten, fmt.Errorf("hopper: canonicalize sighting insert: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM sightings WHERE source = $1 AND subject = $2`, c.source, c.old); err != nil {
+			tx.Rollback(ctx) //nolint:errcheck // already failing
+			return rewritten, fmt.Errorf("hopper: canonicalize sighting delete: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return rewritten, fmt.Errorf("hopper: canonicalize sighting commit: %w", err)
+		}
+		rewritten++
+	}
+	return rewritten, nil
+}
+
 // backfillLitmusClassPG heals litmus_class for litmus-bearing rows analyzed
 // before it became a trigger-fed column (the column is nullable, so those rows
 // are NULL until healed). The samples_derive_litmus_score trigger fills it on
@@ -4358,14 +4431,19 @@ func (db *DB) relabelFromPoolsPG(ctx context.Context) (int64, error) {
 	rows, err := db.pool.Query(ctx, `
 		WITH pools AS (
 			SELECT sha256,
-				bool_or(path LIKE 'bad/%')  AS in_bad,
-				bool_or(path LIKE 'good/%') AS in_good
+				bool_or(path LIKE 'bad/%')     AS in_bad,
+				bool_or(path LIKE 'good/%')    AS in_good,
+				bool_or(path LIKE 'sighted/%') AS in_sighted
 			FROM walk_staging
 			GROUP BY sha256
 		),
 		target AS (
 			SELECT s.sha256, s.label AS old_label, s.skip AS old_skip,
-				CASE WHEN p.in_bad THEN 'bad' WHEN p.in_good THEN 'good' ELSE s.label END AS new_label,
+				-- sighted/ only lifts unknown rows (rank sighted > unknown); it
+				-- never demotes a verified good/bad label back to a feed claim.
+				CASE WHEN p.in_bad THEN 'bad' WHEN p.in_good THEN 'good'
+				     WHEN p.in_sighted AND s.label = 'unknown' THEN 'sighted'
+				     ELSE s.label END AS new_label,
 				CASE WHEN p.in_bad AND p.in_good THEN 'conflict'
 				     WHEN s.skip IN ('conflict', 'missing', 'unsupported') THEN ''
 				     ELSE s.skip END AS new_skip,

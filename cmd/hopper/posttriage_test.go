@@ -222,6 +222,97 @@ func TestHandleTriageRulings(t *testing.T) {
 	}
 }
 
+// TestHandleTriageSightedRulings covers the sighted pool's two flows: the
+// demote-sighted backfill (bad/foraged → sighted/foraged, subpath mirrored)
+// and promoter's re-promotion (sighted/foraged → bad/foraged-quarantine).
+func TestHandleTriageSightedRulings(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db := mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	api := &apiServer{db: db, dataRoot: root, tracker: newWorkerTracker()}
+
+	seed := func(sha, rel, label, source string) {
+		t.Helper()
+		abs := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(abs), 0o750); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(abs, []byte("data"), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if err := db.InsertSample(ctx, &hopper.Sample{
+			SHA256: sha, Source: "test", Path: rel, Label: label, LabelSource: source,
+		}); err != nil {
+			t.Fatalf("InsertSample: %v", err)
+		}
+	}
+	rule := func(sha, ruling, source string) triageResult {
+		t.Helper()
+		resp := callTriage(t, api, triageRequest{Verdicts: []triageVerdict{{SHA256: sha, Ruling: ruling, Source: source}}})
+		if resp.Failed != 0 {
+			t.Fatalf("%s: failed=%d results=%+v", ruling, resp.Failed, resp.Results)
+		}
+		return resp.Results[0]
+	}
+
+	// Backfill demotion: bad/foraged → sighted/foraged with the subpath mirrored,
+	// relabeled sighted with the client-supplied source.
+	shaA := repeat("5")
+	seed(shaA, filepath.Join("bad", "foraged", "npm", "registry", "socket", "evil", "evil-1.0.tgz"), "bad", "harvest")
+	res := rule(shaA, "sighted", "sighted-backfill")
+	wantA := filepath.Join("sighted", "foraged", "npm", "registry", "socket", "evil", "evil-1.0.tgz")
+	if res.NewPath != wantA {
+		t.Fatalf("demote path = %q, want %q", res.NewPath, wantA)
+	}
+	if _, err := os.Stat(filepath.Join(root, wantA)); err != nil {
+		t.Fatalf("moved file missing: %v", err)
+	}
+	samp, err := db.SampleBySHA256(ctx, shaA)
+	if err != nil {
+		t.Fatalf("SampleBySHA256: %v", err)
+	}
+	if samp.Label != "sighted" || samp.LabelSource != "sighted-backfill" || samp.Path != wantA {
+		t.Fatalf("row after demote: label=%q source=%q path=%q", samp.Label, samp.LabelSource, samp.Path)
+	}
+	// Idempotent re-run.
+	if again := rule(shaA, "sighted", "sighted-backfill"); again.Status != "noop" {
+		t.Fatalf("re-run status = %q, want noop", again.Status)
+	}
+
+	// Relocation: forager's version-matched purl re-flag relabels DB-only, so
+	// a sighted-labeled row can still sit under unknown/foraged. The sighted
+	// ruling is tree-aware: it must move the file rather than noop on label.
+	shaB := repeat("6")
+	seed(shaB, filepath.Join("unknown", "foraged", "pypi", "registry", "osv", "pkg", "pkg-2.0.tgz"), "sighted", "forager")
+	res = rule(shaB, "sighted", "")
+	wantRelo := filepath.Join("sighted", "foraged", "pypi", "registry", "osv", "pkg", "pkg-2.0.tgz")
+	if res.Status != "moved" || res.NewPath != wantRelo {
+		t.Fatalf("relocation status=%q path=%q, want moved %q", res.Status, res.NewPath, wantRelo)
+	}
+	if again := rule(shaB, "sighted", ""); again.Status != "noop" {
+		t.Fatalf("relocation re-run status = %q, want noop", again.Status)
+	}
+
+	// Promoter re-promotion: sighted/foraged → bad/foraged-quarantine, subpath
+	// mirrored, default promoter source.
+	res = rule(shaA, "bad", "")
+	wantB := filepath.Join("bad", "foraged-quarantine", "npm", "registry", "socket", "evil", "evil-1.0.tgz")
+	if res.NewPath != wantB {
+		t.Fatalf("re-promote path = %q, want %q", res.NewPath, wantB)
+	}
+	samp, err = db.SampleBySHA256(ctx, shaA)
+	if err != nil {
+		t.Fatalf("SampleBySHA256: %v", err)
+	}
+	if samp.Label != "bad" || samp.LabelSource != "promoter" {
+		t.Fatalf("row after re-promote: label=%q source=%q", samp.Label, samp.LabelSource)
+	}
+}
+
 func repeat(b string) string {
 	out := ""
 	for len(out) < 64 {

@@ -930,14 +930,14 @@ func jsonTextOrNil(b []byte) any {
 // batch (insertSampleBatchSQLite) upserts so their resolution can't drift. It
 // is the SQLite twin of sampleConflictUpdatePG; see that constant for the
 // rule-by-rule explanation of the pool-precedence label resolution.
-const sampleConflictUpdateSQLite = `ON CONFLICT (sha256) DO UPDATE SET
+var sampleConflictUpdateSQLite = `ON CONFLICT (sha256) DO UPDATE SET
 	label = CASE
 		WHEN excluded.label_source = 'marker' THEN excluded.label
 		WHEN samples.label_source = 'marker' THEN excluded.label
 		WHEN (samples.label = 'good' AND excluded.label = 'bad')
 		  OR (samples.label = 'bad' AND excluded.label = 'good') THEN 'bad'
-		WHEN (CASE excluded.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
-		   > (CASE samples.label  WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END) THEN excluded.label
+		WHEN ` + labelRankSQL("excluded.label") + `
+		   > ` + labelRankSQL("samples.label") + ` THEN excluded.label
 		ELSE samples.label
 	END,
 	label_source = CASE
@@ -945,8 +945,8 @@ const sampleConflictUpdateSQLite = `ON CONFLICT (sha256) DO UPDATE SET
 		WHEN samples.label_source = 'marker' THEN excluded.label_source
 		WHEN (samples.label = 'good' AND excluded.label = 'bad')
 		  OR (samples.label = 'bad' AND excluded.label = 'good') THEN 'conflict'
-		WHEN (CASE excluded.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
-		   > (CASE samples.label  WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END) THEN excluded.label_source
+		WHEN ` + labelRankSQL("excluded.label") + `
+		   > ` + labelRankSQL("samples.label") + ` THEN excluded.label_source
 		ELSE samples.label_source
 	END,
 	feed  = CASE WHEN excluded.feed  != '' THEN excluded.feed  ELSE samples.feed  END,
@@ -970,8 +970,8 @@ const sampleConflictUpdateSQLite = `ON CONFLICT (sha256) DO UPDATE SET
 		WHEN ((samples.label = 'good' AND excluded.label = 'bad')
 		   OR (samples.label = 'bad' AND excluded.label = 'good'))
 		  AND samples.skip IN ('', 'misclassified', 'conflict', 'missing', 'unsupported') THEN 'conflict'
-		WHEN (CASE excluded.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
-		   > (CASE samples.label  WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
+		WHEN ` + labelRankSQL("excluded.label") + `
+		   > ` + labelRankSQL("samples.label") + `
 		  AND samples.skip IN ('misclassified', 'conflict') THEN ''
 		WHEN samples.skip IN ('missing','unsupported') THEN ''
 		ELSE samples.skip
@@ -986,8 +986,8 @@ WHERE excluded.parent = ''
     OR (samples.purl_base = '' AND excluded.purl_base != '')
     OR samples.skip IN ('missing','unsupported')
     -- Pool-precedence transitions must fire even when path/mtime are unchanged.
-    OR ((CASE excluded.label WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END)
-      > (CASE samples.label  WHEN 'bad' THEN 2 WHEN 'good' THEN 1 ELSE 0 END))
+    OR (` + labelRankSQL("excluded.label") + `
+      > ` + labelRankSQL("samples.label") + `)
     OR ((samples.label = 'good' AND excluded.label = 'bad')
       OR (samples.label = 'bad' AND excluded.label = 'good'))
     OR (excluded.label_source = 'marker'
@@ -1948,13 +1948,13 @@ func cascadeMembersForParentSQLite(ctx context.Context, tx *sql.Tx, parent, labe
 	// Member-selection queries mirror cascadeMembersForParentPG. The trailing ?
 	// binds the parent SHA256; earlier ? bind the extra args passed alongside.
 	const promoteMembers = `SELECT sha256, label FROM samples
-		WHERE label = 'unknown'
+		WHERE label IN ('unknown', 'sighted')
 		  AND sha256 IN (SELECT sha256 FROM sample_locations WHERE parent_sha256 = ?)`
 	const revertMembers = `SELECT sha256, label FROM samples
 		WHERE label = 'bad' AND label_source = ?
 		  AND sha256 IN (SELECT sha256 FROM sample_locations WHERE parent_sha256 = ?)`
 	const demoteMembers = `SELECT sha256, label FROM samples
-		WHERE label = 'unknown' AND score >= ?
+		WHERE label IN ('unknown', 'sighted') AND score >= ?
 		  AND sha256 IN (SELECT sha256 FROM sample_locations WHERE parent_sha256 = ?)`
 
 	children := 0
@@ -2047,7 +2047,7 @@ func (db *DB) cascadeBackfillPendingSQLite(ctx context.Context) (bool, error) {
 			FROM samples p
 			JOIN sample_locations l ON l.parent_sha256 = p.sha256
 			JOIN samples m ON m.sha256 = l.sha256
-			WHERE p.parent = '' AND m.label = 'unknown'
+			WHERE p.parent = '' AND m.label IN ('unknown', 'sighted')
 			  AND (p.label = 'good' OR (p.label = 'bad' AND m.score >= ?))
 		)`, CascadeDemoteScore).Scan(&pending)
 	if err != nil {
@@ -2064,7 +2064,7 @@ func (db *DB) cascadeBackfillSQLite(ctx context.Context, dryRun bool) (CascadeBa
 		WHERE parent = '' AND label = 'bad'
 		  AND EXISTS (
 			SELECT 1 FROM sample_locations l JOIN samples m ON m.sha256 = l.sha256
-			WHERE l.parent_sha256 = s.sha256 AND m.label = 'unknown' AND m.score >= ?)
+			WHERE l.parent_sha256 = s.sha256 AND m.label IN ('unknown', 'sighted') AND m.score >= ?)
 		ORDER BY id`
 	const goodArchives = `
 		SELECT sha256, label_source FROM samples s
@@ -2072,7 +2072,7 @@ func (db *DB) cascadeBackfillSQLite(ctx context.Context, dryRun bool) (CascadeBa
 		  AND EXISTS (
 			SELECT 1 FROM sample_locations l JOIN samples m ON m.sha256 = l.sha256
 			WHERE l.parent_sha256 = s.sha256
-			  AND (m.label = 'unknown' OR (m.label = 'bad' AND m.label_source = 'cascade:' || s.sha256)))
+			  AND (m.label IN ('unknown', 'sighted') OR (m.label = 'bad' AND m.label_source = 'cascade:' || s.sha256)))
 		ORDER BY id`
 
 	var st CascadeBackfillStats
@@ -2136,6 +2136,13 @@ func (db *DB) relocateSampleSQLite(ctx context.Context, sha256, oldRel, newRel, 
 	}
 	defer tx.Rollback() //nolint:errcheck // commit or rollback
 	ts := now()
+	// Audit the label transition before applying it (see relocateSamplePG).
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
+		SELECT sha256, label, ?, skip, '', 'triage', ?
+		FROM samples WHERE sha256 = ? AND label <> ?`, label, ts, sha256, label); err != nil {
+		return fmt.Errorf("hopper: relocate audit: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE samples
 		   SET label = ?, label_source = ?, path = ?,
@@ -2172,21 +2179,21 @@ func (db *DB) samplesByLabelSQLite(ctx context.Context, label string, limit int)
 	return scanLiteSamples(rows)
 }
 
-func (db *DB) promotionCandidatesSQLite(ctx context.Context, pathPrefix string, olderThan time.Time, afterSHA string, limit int) ([]*Sample, error) {
+func (db *DB) candidatesByLabelSQLite(ctx context.Context, label, pathPrefix string, olderThan time.Time, afterSHA string, limit int) ([]*Sample, error) {
 	// Timestamps are stored as RFC3339Nano text and compare lexicographically
 	// (matching staleSamplesSQLite); mtime is written in the same format. GLOB is
 	// case-sensitive and uses the path index for a prefix match.
 	threshold := olderThan.UTC().Format(time.RFC3339Nano)
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples
-		 WHERE label = 'unknown' AND parent = '' AND skip = ''
+		 WHERE label = ? AND parent = '' AND skip = ''
 		   AND path GLOB ? || '*'
 		   AND mtime IS NOT NULL AND mtime < ?
 		   AND sha256 > ?
 		 ORDER BY sha256 LIMIT ?`,
-		pathPrefix, threshold, afterSHA, limit)
+		label, pathPrefix, threshold, afterSHA, limit)
 	if err != nil {
-		return nil, fmt.Errorf("hopper: promotion candidates: %w", err)
+		return nil, fmt.Errorf("hopper: candidates by label: %w", err)
 	}
 	return scanLiteSamples(rows)
 }
@@ -3320,14 +3327,17 @@ func (db *DB) relabelFromPoolsSQLite(ctx context.Context) (int64, error) {
 		INSERT INTO _relabel
 		WITH pools AS (
 			SELECT sha256,
-				MAX(path LIKE 'bad/%')  AS in_bad,
-				MAX(path LIKE 'good/%') AS in_good
+				MAX(path LIKE 'bad/%')     AS in_bad,
+				MAX(path LIKE 'good/%')    AS in_good,
+				MAX(path LIKE 'sighted/%') AS in_sighted
 			FROM walk_staging
 			GROUP BY sha256
 		)
 		SELECT s.sha256, s.label, s.skip,
 			CASE WHEN p.in_bad = 1 THEN 'bad'
 			     WHEN p.in_good = 1 THEN 'good'
+			     -- sighted/ only lifts unknown rows; it never demotes good/bad.
+			     WHEN p.in_sighted = 1 AND s.label = 'unknown' THEN 'sighted'
 			     ELSE s.label END,
 			CASE WHEN p.in_bad = 1 AND p.in_good = 1 THEN 'conflict'
 			     WHEN s.skip IN ('conflict', 'missing', 'unsupported') THEN ''

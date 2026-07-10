@@ -97,6 +97,40 @@ func TestPromotionCandidates(t *testing.T) {
 	}
 }
 
+// TestCandidatesByLabelSighted verifies the generalized candidate query feeds
+// promoter's sighted pass: only sighted-labeled rows under sighted/foraged/,
+// with unknown rows and other pools excluded.
+func TestCandidatesByLabelSighted(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	old := time.Now().Add(-90 * 24 * time.Hour)
+	sha := func(prefix byte) string { return strings.Repeat(string(prefix), 64) }
+	cand := func(s, label, path string) *Sample {
+		return &Sample{SHA256: s, Source: "test", Label: label, LabelSource: "forager", Path: path, Mtime: &old}
+	}
+
+	mustInsert(t, ctx, db, cand(sha('1'), "sighted", "sighted/foraged/npm/a.tgz"))
+	mustInsert(t, ctx, db, cand(sha('2'), "sighted", "sighted/foraged/pypi/b.tgz"))
+	mustInsert(t, ctx, db, cand(sha('3'), "unknown", "unknown/foraged/npm/c.tgz")) // wrong label
+	mustInsert(t, ctx, db, cand(sha('4'), "bad", "bad/foraged/npm/d.tgz"))         // wrong label
+	mustInsert(t, ctx, db, cand(sha('5'), "sighted", "unknown/foraged/npm/e.tgz")) // wrong pool prefix
+
+	got, err := db.CandidatesByLabel(ctx, "sighted", "sighted/foraged/", time.Now(), "", 100)
+	if err != nil {
+		t.Fatalf("CandidatesByLabel: %v", err)
+	}
+	want := []string{sha('1'), sha('2')}
+	if len(got) != len(want) {
+		t.Fatalf("got %d candidates, want %d: %v", len(got), len(want), shas(got))
+	}
+	for i, s := range got {
+		if s.SHA256 != want[i] {
+			t.Errorf("candidate %d = %s, want %s", i, s.SHA256, want[i])
+		}
+	}
+}
+
 func shas(samples []*Sample) []string {
 	out := make([]string, len(samples))
 	for i, s := range samples {

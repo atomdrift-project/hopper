@@ -2,6 +2,7 @@ package hopper
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -121,6 +122,63 @@ func TestSightingsCorroboratedFeedFilter(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("corroborated count = %d, want 1", n)
+	}
+}
+
+// TestAddSightingsNormalizesSubjects: the ledger keys corroboration by exact
+// match, so subjects must land in canonical form no matter what spelling the
+// producer holds — uppercase hashes lowercase, PURLs fold onto the canonical
+// version-less purl_base.
+func TestAddSightingsNormalizesSubjects(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	upperSHA := strings.ToUpper(strings.Repeat("ab", 32))
+	n, err := db.AddSightings(ctx, []Sighting{
+		{Source: "blog", Subject: upperSHA},
+		{Source: "socket", Subject: "PKG:NPM/evil-pkg@1.2.3"}, // case + version drift
+	})
+	if err != nil {
+		t.Fatalf("AddSightings: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("AddSightings changed %d, want 2", n)
+	}
+
+	got, err := db.SightingsFor(ctx, []string{strings.ToLower(upperSHA), "pkg:npm/evil-pkg"})
+	if err != nil {
+		t.Fatalf("SightingsFor: %v", err)
+	}
+	if len(got[strings.ToLower(upperSHA)]) != 1 {
+		t.Errorf("uppercase sha not stored lowercase: %v", got)
+	}
+	if len(got["pkg:npm/evil-pkg"]) != 1 {
+		t.Errorf("purl not stored as canonical version-less base: %v", got)
+	}
+}
+
+func TestSightingFamily(t *testing.T) {
+	tests := []struct{ source, want string }{
+		{"ghsa", "github-advisories"},
+		{"supplychain", "github-advisories"},
+		{"osv", "ossf-malpkgs"},
+		{"ossf", "ossf-malpkgs"},
+		{"socket", "socket"}, // its own family
+		{"aikido", "aikido"}, // kept separate from ossf despite overlap
+		{"clamav", "clamav"}, // promoter's own detection is independent evidence
+		{"cyclotron:https://example.com/feed", "cyclotron:https://example.com/feed"},
+	}
+	for _, tt := range tests {
+		if got := SightingFamily(tt.source); got != tt.want {
+			t.Errorf("SightingFamily(%q) = %q, want %q", tt.source, got, tt.want)
+		}
+	}
+	// The 2-independent-family rule collapses same-upstream pairs to one vote.
+	if SightingFamily("ghsa") != SightingFamily("supplychain") {
+		t.Error("ghsa and supplychain must share a family")
+	}
+	if SightingFamily("ghsa") == SightingFamily("socket") {
+		t.Error("ghsa and socket must be independent families")
 	}
 }
 

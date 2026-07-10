@@ -55,9 +55,10 @@ const (
 //   - Verdict ("good"|"bad") is the operator post-triage flow: the file moves
 //     into a <verdict>/mislabeled-<old-label>/ bucket (basename only) and is
 //     relabeled.
-//   - Ruling ("good"|"bad"|"review") is promoter's remote flow: the file moves
-//     into the ruling's pool tree with its source subpath preserved, and is
-//     relabeled (good/bad) or left labeled (review). See rulingPlan.
+//   - Ruling ("good"|"bad"|"review"|"sighted") is the remote flow (promoter,
+//     or the demote-sighted backfill): the file moves into the ruling's pool
+//     tree with its source subpath preserved, and is relabeled (good/bad/
+//     sighted) or left labeled (review). See rulingPlan.
 type triageVerdict struct {
 	SHA256  string `json:"sha256"`
 	Verdict string `json:"verdict,omitempty"`
@@ -65,16 +66,23 @@ type triageVerdict struct {
 	Source  string `json:"source,omitempty"` // overrides the recorded label_source (e.g. "cyclotron:bad")
 }
 
-// Promotion pool layout. hopper owns where a ruled sample lands; promoter sends
-// only the abstract ruling. The source tree is forager's unknown/foraged; the
-// subpath beneath it is preserved into the destination tree, so
-// unknown/foraged/npm/foo.tgz promotes to good/foraged-promote/npm/foo.tgz.
+// Promotion pool layout. hopper owns where a ruled sample lands; the client
+// (promoter, or the demote-sighted backfill) sends only the abstract ruling.
+// The subpath beneath the sample's source tree is preserved into the
+// destination tree, so unknown/foraged/npm/foo.tgz promotes to
+// good/foraged-promote/npm/foo.tgz and bad/foraged/npm/foo.tgz demotes to
+// sighted/foraged/npm/foo.tgz.
 const (
-	promoteSrcRoot    = "unknown/foraged/"
 	promoteGoodTree   = "good/foraged-promote"
 	promoteBadTree    = "bad/foraged-quarantine"
 	promoteReviewTree = "unknown/foraged-review"
+	sightedTree       = "sighted/foraged"
 )
+
+// promoteSrcRoots are the foraged discovery trees a ruled sample may start
+// from; the first matching prefix is stripped to preserve the subpath. The
+// trailing slashes keep siblings like unknown/foraged-review/ excluded.
+var promoteSrcRoots = []string{"unknown/foraged/", "sighted/foraged/", "bad/foraged/"}
 
 // placement is a triage item's resolved destination: the new relative path and
 // the label + label_source to record.
@@ -87,12 +95,16 @@ type placement struct {
 // rulingPlan resolves a promoter ruling to its placement: the destination path
 // (subpath preserved beneath the ruling's tree) plus the label change to apply.
 // For "review" the sample keeps its existing label and label_source (the review
-// queue does not relabel — it only relocates out of the discovery prefix). ok is
-// false for an unrecognized ruling.
+// queue does not relabel — it only relocates out of the discovery prefix).
+// "sighted" demotes a feed-claimed sample out of bad/ into the sighted pool,
+// pending re-promotion by evidence. ok is false for an unrecognized ruling.
 func rulingPlan(samp *hopper.Sample, oldRel, ruling string) (placement, bool) {
-	sub := strings.TrimPrefix(oldRel, promoteSrcRoot)
-	if sub == oldRel { // not under the source root: preserve only the basename
-		sub = filepath.Base(oldRel)
+	sub := filepath.Base(oldRel) // not under a source root: preserve only the basename
+	for _, root := range promoteSrcRoots {
+		if rest := strings.TrimPrefix(oldRel, root); rest != oldRel {
+			sub = rest
+			break
+		}
 	}
 	switch ruling {
 	case "good":
@@ -101,6 +113,8 @@ func rulingPlan(samp *hopper.Sample, oldRel, ruling string) (placement, bool) {
 		return placement{filepath.Join(promoteBadTree, sub), "bad", "promoter"}, true
 	case "review":
 		return placement{filepath.Join(promoteReviewTree, sub), samp.Label, samp.LabelSource}, true
+	case "sighted":
+		return placement{filepath.Join(sightedTree, sub), "sighted", "promoter"}, true
 	}
 	return placement{}, false
 }
@@ -229,6 +243,11 @@ func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun
 	case v.Verdict != "" && samp.Label == v.Verdict,
 		v.Ruling == "good" && samp.Label == "good",
 		v.Ruling == "bad" && samp.Label == "bad",
+		// "sighted" is tree-aware like "review": a row can be labeled sighted
+		// with its file still outside the sighted pool (forager's
+		// version-matched purl re-flag relabels DB-only), and the ruling is
+		// how the file catches up — so label alone must not short-circuit.
+		v.Ruling == "sighted" && samp.Label == "sighted" && strings.HasPrefix(oldRel, sightedTree+"/"),
 		v.Ruling == "review" && strings.HasPrefix(oldRel, promoteReviewTree+"/"):
 		res.Status = "noop"
 		return res
@@ -281,12 +300,13 @@ func (s *apiServer) triagePlan(samp *hopper.Sample, oldRel string, v triageVerdi
 	if v.Ruling != "" {
 		plan, ok := rulingPlan(samp, oldRel, v.Ruling)
 		if !ok {
-			return placement{}, errors.New(`ruling must be "good", "bad", or "review"`)
+			return placement{}, errors.New(`ruling must be "good", "bad", "review", or "sighted"`)
 		}
 		// A client-supplied source attributes the relabel to its author (e.g.
-		// "cyclotron:bad") instead of the default "promoter". Only for rulings
-		// that actually relabel — "review" keeps the sample's existing source.
-		if v.Source != "" && (v.Ruling == "good" || v.Ruling == "bad") {
+		// "cyclotron:bad", "sighted-backfill") instead of the default
+		// "promoter". Only for rulings that actually relabel — "review" keeps
+		// the sample's existing source.
+		if v.Source != "" && v.Ruling != "review" {
 			plan.source = v.Source
 		}
 		return plan, nil

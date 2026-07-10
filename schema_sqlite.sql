@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS samples (
 	                   (COALESCE(json_extract(cleave_result, '$.files[0].type'), json_extract(cleave_result, '$.fs[0].type'), ''))
 	                   STORED,
 	size_bytes    INTEGER NOT NULL DEFAULT 0,
+	-- label: 'bad' > 'good' > 'sighted' > 'unknown' (see labelRank in hopper.go).
 	label         TEXT NOT NULL DEFAULT 'unknown',
 	label_source  TEXT NOT NULL DEFAULT '',
 	cleave_result TEXT,

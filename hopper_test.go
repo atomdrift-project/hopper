@@ -1696,6 +1696,12 @@ func TestClassifyLabelTransition(t *testing.T) {
 		{"conflict bad then good", "bad", "forager", "", "good", "forager", "conflict", "bad", "bad"},
 		{"unknown does not demote good", "good", "forager", "", "unknown", "forager", "", "", ""},
 		{"equal labels no change", "bad", "forager", "", "bad", "forager", "", "", ""},
+		{"promote unknown to sighted", "unknown", "forager", "", "sighted", "forager", "promoted", "unknown", "sighted"},
+		{"promote sighted to good", "sighted", "forager", "", "good", "forager", "promoted", "sighted", "good"},
+		{"promote sighted to bad", "sighted", "forager", "", "bad", "promoter", "promoted", "sighted", "bad"},
+		{"sighted does not demote good", "good", "forager", "", "sighted", "forager", "", "", ""},
+		{"sighted does not demote bad", "bad", "forager", "", "sighted", "forager", "", "", ""},
+		{"cleared marker rehabilitates to sighted dir", "good", "marker", "", "sighted", "forager", "rehabilitated", "good", "sighted"},
 		{"incoming marker is logged in go", "unknown", "forager", "", "good", "marker", "", "", ""},
 		{"rehabilitate cleared marker", "bad", "marker", "misclassified", "bad", "forager", "rehabilitated", "bad", "bad"},
 		{"rehabilitate flipped marker", "good", "marker", "misclassified", "bad", "forager", "rehabilitated", "good", "bad"},
@@ -1772,6 +1778,46 @@ func TestLabelPrecedenceOnReobservation(t *testing.T) {
 		reobserve(t, ctx, db, &Sample{SHA256: "d1", Source: "test", Label: "good", LabelSource: "forager", Path: "good/d1", SizeBytes: 1})
 		reobserve(t, ctx, db, &Sample{SHA256: "d1", Source: "test", Label: "unknown", LabelSource: "forager", Path: "unknown/d1", SizeBytes: 1})
 		want(t, ctx, db, "d1", "good", "forager", "")
+	})
+
+	t.Run("promote unknown to sighted", func(t *testing.T) {
+		db := openTestDB(t)
+		ctx := context.Background()
+		reobserve(t, ctx, db, &Sample{SHA256: "s1", Source: "test", Label: "unknown", LabelSource: "forager", Path: "unknown/s1", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "s1", Source: "test", Label: "sighted", LabelSource: "forager", Path: "sighted/s1", SizeBytes: 1})
+		want(t, ctx, db, "s1", "sighted", "forager", "")
+	})
+
+	t.Run("sighted does not demote good", func(t *testing.T) {
+		db := openTestDB(t)
+		ctx := context.Background()
+		reobserve(t, ctx, db, &Sample{SHA256: "s2", Source: "test", Label: "good", LabelSource: "forager", Path: "good/s2", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "s2", Source: "test", Label: "sighted", LabelSource: "forager", Path: "sighted/s2", SizeBytes: 1})
+		want(t, ctx, db, "s2", "good", "forager", "")
+	})
+
+	t.Run("sighted does not demote bad", func(t *testing.T) {
+		db := openTestDB(t)
+		ctx := context.Background()
+		reobserve(t, ctx, db, &Sample{SHA256: "s3", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/s3", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "s3", Source: "test", Label: "sighted", LabelSource: "forager", Path: "sighted/s3", SizeBytes: 1})
+		want(t, ctx, db, "s3", "bad", "forager", "")
+	})
+
+	t.Run("promote sighted to bad", func(t *testing.T) {
+		db := openTestDB(t)
+		ctx := context.Background()
+		reobserve(t, ctx, db, &Sample{SHA256: "s4", Source: "test", Label: "sighted", LabelSource: "forager", Path: "sighted/s4", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "s4", Source: "test", Label: "bad", LabelSource: "promoter", Path: "bad/s4", SizeBytes: 1})
+		want(t, ctx, db, "s4", "bad", "promoter", "")
+	})
+
+	t.Run("promote sighted to good", func(t *testing.T) {
+		db := openTestDB(t)
+		ctx := context.Background()
+		reobserve(t, ctx, db, &Sample{SHA256: "s5", Source: "test", Label: "sighted", LabelSource: "forager", Path: "sighted/s5", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "s5", Source: "test", Label: "good", LabelSource: "forager", Path: "good/s5", SizeBytes: 1})
+		want(t, ctx, db, "s5", "good", "forager", "")
 	})
 
 	t.Run("incoming marker is authoritative", func(t *testing.T) {
@@ -5336,6 +5382,62 @@ func TestCascadeLabel(t *testing.T) {
 	if got := countEvents("cascade-revert"); got != 1 {
 		t.Errorf("cascade-revert events = %d, want 1", got)
 	}
+}
+
+// TestCascadeLabelSightedMembers verifies that feed-claimed (sighted) members
+// follow a verified parent the way unknown members do: a good parent vouches
+// for them, a bad parent drags the suspicious ones along, and the demote
+// score floor still applies.
+func TestCascadeLabelSightedMembers(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	want := func(sha, label, source string) {
+		t.Helper()
+		s, err := db.SampleBySHA256(ctx, sha)
+		if err != nil {
+			t.Fatalf("SampleBySHA256(%s): %v", sha[:4], err)
+		}
+		if s.Label != label || s.LabelSource != source {
+			t.Errorf("%s = {%q,%q}, want {%q,%q}", sha[:4], s.Label, s.LabelSource, label, source)
+		}
+	}
+	member := func(sha, parent string, score int) *Sample {
+		return &Sample{
+			SHA256: sha, Source: "test", Label: "sighted", LabelSource: "forager", Parent: parent,
+			Path:         parent + "!!pkg/" + sha[:4] + ".js",
+			CleaveResult: fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"js","x":%d,"dp":1}]}`, sha, score),
+		}
+	}
+
+	// Bad parent: sighted members at/above the score floor demote, below stays.
+	archA := sha64('k')
+	mustInsert(t, ctx, db, &Sample{SHA256: archA, Source: "test", Label: "sighted", LabelSource: "forager", Path: "sighted/k.tgz"})
+	aHot, aCold := sha64('l'), sha64('m')
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{member(aHot, archA, 90), member(aCold, archA, 10)}); err != nil {
+		t.Fatalf("InsertSampleBatch: %v", err)
+	}
+	n, err := db.CascadeLabel(ctx, archA, "bad", "promoter")
+	if err != nil {
+		t.Fatalf("CascadeLabel demote: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("demote cascaded %d members, want 1 (aHot)", n)
+	}
+	want(aHot, "bad", cascadeSource(archA))
+	want(aCold, "sighted", "forager") // below the score floor
+
+	// Good parent: sighted members are vouched for regardless of score.
+	archB := sha64('n')
+	mustInsert(t, ctx, db, &Sample{SHA256: archB, Source: "test", Label: "sighted", LabelSource: "forager", Path: "sighted/n.tgz"})
+	bMem := sha64('o')
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{member(bMem, archB, 90)}); err != nil {
+		t.Fatalf("InsertSampleBatch: %v", err)
+	}
+	if _, err := db.CascadeLabel(ctx, archB, "good", "operator"); err != nil {
+		t.Fatalf("CascadeLabel promote: %v", err)
+	}
+	want(bMem, "good", "operator")
 }
 
 func TestCascadeBackfill(t *testing.T) {

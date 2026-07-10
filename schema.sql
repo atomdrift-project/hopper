@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS samples (
 	filename      TEXT NOT NULL DEFAULT '',
 	file_type     TEXT NOT NULL DEFAULT '',
 	size_bytes    BIGINT NOT NULL DEFAULT 0,
+	-- label: 'bad' > 'good' > 'sighted' > 'unknown' (see labelRank in
+	-- hopper.go). 'sighted' = a threat feed claimed it, pending verification;
+	-- invisible to the training triage queues.
 	label         TEXT NOT NULL DEFAULT 'unknown',
 	label_source  TEXT NOT NULL DEFAULT '',
 	cleave_result JSONB,

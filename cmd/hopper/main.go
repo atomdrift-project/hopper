@@ -64,6 +64,7 @@ commands:
   rescan             queue files for repair-tier re-analysis (--missing-members or SHA-256 args)
   triage             fetch mislabeled samples to /var/tmp/hopper-triage
   post-triage        apply triage verdicts: re-scan, move + flip mislabeled samples
+  demote-sighted     move uncorroborated feed-claimed samples from bad/ to sighted/ (dry-run; -apply)
   cascade-backfill   propagate good/bad archive labels to their members (dry-run)
   stats              show sample counts
 `
@@ -530,6 +531,8 @@ func run(ctx context.Context) error {
 		return cmdTriage(ctx)
 	case "post-triage":
 		return cmdPostTriage(ctx)
+	case "demote-sighted":
+		return cmdDemoteSighted(ctx)
 	case "cascade-backfill":
 		return cmdCascadeBackfill(ctx)
 	case "stats":
@@ -1040,11 +1043,13 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	wd.beginStage("discover", "Discovering label directories")
 
 	// Discover label directories under --data.
-	// Convention: bad/ → label "bad", good/ → label "good", unknown/ → label "unknown".
+	// Convention: each pool directory maps 1:1 to its label — bad/, good/,
+	// sighted/ (feed claims pending verification), unknown/.
 	var loadDirs []struct{ dir, label string }
 	for _, entry := range []struct{ name, label string }{
 		{"bad", "bad"},
 		{"good", "good"},
+		{"sighted", "sighted"},
 		{"unknown", "unknown"},
 	} {
 		dir := filepath.Join(*dataDir, entry.name)
@@ -1053,8 +1058,8 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		}
 	}
 	if len(loadDirs) == 0 {
-		wd.failStage("discover", fmt.Sprintf("no bad/, good/, or unknown/ in %s", *dataDir))
-		return fmt.Errorf("no bad/, good/, or unknown/ subdirectories found in %s", *dataDir)
+		wd.failStage("discover", fmt.Sprintf("no bad/, good/, sighted/, or unknown/ in %s", *dataDir))
+		return fmt.Errorf("no bad/, good/, sighted/, or unknown/ subdirectories found in %s", *dataDir)
 	}
 	wd.endStage("discover")
 
@@ -3258,7 +3263,14 @@ func cmdCanonicalizePURLs(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	slog.Info("canonicalize-purls complete", "rows_rewritten", n, "dry_run", *dryRun)
+	// The sightings ledger keys corroboration by the same version-less
+	// canonical purl_base; drifted subject spellings would silently miss the
+	// exact-match joins, so re-key it in the same pass.
+	s, err := db.CanonicalizeSightingSubjects(ctx, *dryRun)
+	if err != nil {
+		return err
+	}
+	slog.Info("canonicalize-purls complete", "rows_rewritten", n, "sightings_rewritten", s, "dry_run", *dryRun)
 	return nil
 }
 

@@ -36,6 +36,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/mattn/go-sqlite3" // register sqlite3 driver
+
+	"codeberg.org/atomdrift/hopper/pkgparse"
 )
 
 const skipBenignArchiveItem = "skip-benign-archive-item"
@@ -77,9 +79,17 @@ const CriticalLevel = 25
 // cross-repo group in sync.
 const SuspiciousCeiling = 3000
 
-// Pool labels, ordered by precedence: bad > good > unknown.
+// Pool labels, ordered by precedence: bad > good > sighted > unknown.
+//
+// "sighted" is a feed claim pending verification: an external threat feed
+// named the package or hash (see the sightings ledger) but no independent
+// evidence has confirmed it. Sighted samples are invisible to the training
+// triage queues (which select bad/good/unknown exactly) and are promoted to
+// bad only by promoter's corroboration rules. "unknown" remains the
+// no-claims background pool.
 const (
 	labelUnknown = "unknown"
+	labelSighted = "sighted"
 	labelGood    = "good"
 	labelBad     = "bad"
 )
@@ -136,16 +146,28 @@ func logLabelTransition(sha, path, stored, storedSrc, storedSkip, in, inSrc stri
 }
 
 // labelRank orders pool labels for precedence resolution: bad outranks good
-// outranks unknown. Used to decide whether a re-observation promotes a sample.
+// outranks sighted outranks unknown. Used to decide whether a re-observation
+// promotes a sample. A feed claim (sighted) never overrides a verified good
+// or bad label. Keep in sync with labelRankSQL.
 func labelRank(label string) int {
 	switch label {
 	case labelBad:
-		return 2
+		return 3
 	case labelGood:
+		return 2
+	case labelSighted:
 		return 1
 	default:
 		return 0
 	}
+}
+
+// labelRankSQL renders labelRank as a SQL CASE expression over the given
+// column reference. It is interpolated (never parameterized — col is always a
+// compile-time constant) into the upsert/relabel statements in pg.go and
+// sqlite.go so the precedence order cannot drift between Go and SQL.
+func labelRankSQL(col string) string {
+	return "(CASE " + col + " WHEN 'bad' THEN 3 WHEN 'good' THEN 2 WHEN 'sighted' THEN 1 ELSE 0 END)"
 }
 
 // classifyLabelTransition mirrors the ON CONFLICT label-resolution rules (see
@@ -2932,10 +2954,19 @@ func (db *DB) TriageNew(ctx context.Context, limit int, f TriageFilter) ([]*Samp
 // sibling like "unknown/foraged-review/" is excluded). Stored paths are
 // slash-relative to the data root.
 func (db *DB) PromotionCandidates(ctx context.Context, pathPrefix string, olderThan time.Time, afterSHA string, limit int) ([]*Sample, error) {
+	return db.CandidatesByLabel(ctx, labelUnknown, pathPrefix, olderThan, afterSHA, limit)
+}
+
+// CandidatesByLabel generalizes PromotionCandidates to any pool label: it
+// returns up to limit top-level samples carrying label under pathPrefix with
+// on-disk mtime older than olderThan, keyset-paginated by sha256 > afterSHA.
+// Promoter's sighted→bad pass uses it with label "sighted" and prefix
+// "sighted/foraged/".
+func (db *DB) CandidatesByLabel(ctx context.Context, label, pathPrefix string, olderThan time.Time, afterSHA string, limit int) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.promotionCandidatesPG(ctx, pathPrefix, olderThan, afterSHA, limit)
+		return db.candidatesByLabelPG(ctx, label, pathPrefix, olderThan, afterSHA, limit)
 	}
-	return db.promotionCandidatesSQLite(ctx, pathPrefix, olderThan, afterSHA, limit)
+	return db.candidatesByLabelSQLite(ctx, label, pathPrefix, olderThan, afterSHA, limit)
 }
 
 // ConflictReview returns samples flagged with a good+bad pool conflict
@@ -3342,6 +3373,19 @@ func (db *DB) CanonicalizePURLBases(ctx context.Context, dryRun bool) (int64, er
 	return 0, nil
 }
 
+// CanonicalizeSightingSubjects rewrites stored sightings.subject values onto
+// the ledger keying convention (see normalizeSubject): lowercase sha256,
+// canonical version-less purl_base. Rows whose canonical spelling collides
+// with an existing (source, subject) row are merged into it (the older row
+// wins, preserving its first_seen). Idempotent; dryRun only reports.
+// Postgres-only, like CanonicalizePURLBases. Returns rows rewritten.
+func (db *DB) CanonicalizeSightingSubjects(ctx context.Context, dryRun bool) (int64, error) {
+	if db.pool != nil {
+		return db.canonicalizeSightingSubjectsPG(ctx, dryRun)
+	}
+	return 0, nil
+}
+
 // RecomputeCanonicalSHA256 recalculates canonical_sha256 for all analyzed
 // samples using SQL-side JSON_TABLE, avoiding the need to fetch cleave_result
 // blobs into Go. Returns the number of rows updated.
@@ -3592,6 +3636,33 @@ type Sighting struct {
 	Note      string    // source's own tag: 'malware','MAL-2024-1234' (optional)
 }
 
+// sightingFamilies maps sighting sources that repackage a shared upstream
+// corpus to one family name, so corroboration counts distinct evidence, not
+// distinct mirrors. Measured 2026-07: ghsa and supplychain
+// (supplychainattack.org, curated "predominantly from the GitHub Advisory
+// Database" per its own description) shared 131 of supplychain's 145
+// subjects; OSV.dev's MAL- records ARE the OSSF malicious-packages corpus.
+// aikido and ossf overlap on 41 subjects but have distinct pipelines — kept
+// separate for now; re-measure if aikido corroborations look inflated.
+var sightingFamilies = map[string]string{
+	"ghsa":        "github-advisories",
+	"supplychain": "github-advisories",
+	"osv":         "ossf-malpkgs",
+	"ossf":        "ossf-malpkgs",
+}
+
+// SightingFamily returns the evidence family a sighting source belongs to.
+// Sources without a mapping are their own family (including per-feed
+// "cyclotron:<url>" sources and "clamav"). Promotion rules that require N
+// independent sources must count distinct families, not distinct sources —
+// two mirrors of the same advisory database are one piece of evidence.
+func SightingFamily(source string) string {
+	if fam, ok := sightingFamilies[source]; ok {
+		return fam
+	}
+	return source
+}
+
 // valid reports whether the sighting carries the minimum to be stored: a source
 // and a subject that is a sha256 or a PURL. Callers should normalize a sha256 to
 // lowercase before this; a PURL is matched by its "pkg:" prefix.
@@ -3602,9 +3673,30 @@ func (s Sighting) valid() bool {
 	return isSHA256Hex(s.Subject) || strings.HasPrefix(s.Subject, "pkg:")
 }
 
+// normalizeSubject folds a sighting subject onto the ledger's keying
+// convention so every consumer's exact-equality join (corroborated flag,
+// SightingsFor, promoter's family counting, the sha-cited sweep) hits:
+// sha256 subjects lowercase, PURL subjects on the canonical version-less
+// purl_base spelling — the same normalization samples.purl_base carries
+// (pkgparse.CanonicalizePURL + VersionlessPURL; a source that flagged one
+// specific version records it in Note or URL, never in Subject). Anything
+// else is passed through for valid() to reject.
+func normalizeSubject(subject string) string {
+	subject = strings.TrimSpace(subject)
+	if lower := strings.ToLower(subject); isSHA256Hex(lower) {
+		return lower
+	}
+	if canon := pkgparse.VersionlessPURL(pkgparse.CanonicalizePURL(subject)); canon != "" {
+		return canon
+	}
+	return subject
+}
+
 // AddSightings idempotently upserts external-corroboration records and flips
 // samples.corroborated true for any sample whose sha256 or purl_base a newly
-// changed sighting matches. Re-recording an unchanged sighting is a no-op (the
+// changed sighting matches. Subjects are normalized onto the ledger's keying
+// convention first (see normalizeSubject), so producers may send whatever
+// spelling they hold. Re-recording an unchanged sighting is a no-op (the
 // delta-guarded upsert writes nothing), so a producer may safely re-push a whole
 // feed snapshot on every poll. Invalid entries (missing source, or a subject
 // that is neither a sha256 nor a PURL) are skipped. Returns the number of
@@ -3612,6 +3704,7 @@ func (s Sighting) valid() bool {
 func (db *DB) AddSightings(ctx context.Context, s []Sighting) (int, error) {
 	valid := s[:0:0]
 	for _, x := range s {
+		x.Subject = normalizeSubject(x.Subject)
 		if x.valid() {
 			valid = append(valid, x)
 		}
