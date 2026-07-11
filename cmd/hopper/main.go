@@ -2916,7 +2916,15 @@ func fillSampleProvenance(s *hopper.Sample, prov pathProvenance, filename string
 		s.Package = parsedName
 	}
 	if s.Version == "" {
-		s.Version = parsedVersion
+		// Prefer the name-anchored split: ParseFilename has to guess the
+		// name/version boundary jointly, and digit-bearing names like
+		// "@kl-starfish/test-01" make it absorb name segments into the version
+		// ("01-1.0.0"). With the package name known, the split is unambiguous.
+		if v := pkgparse.VersionForName(filename, s.Package); v != "" {
+			s.Version = v
+		} else {
+			s.Version = parsedVersion
+		}
 	}
 	enrichFromVendorSidecar(s)
 }

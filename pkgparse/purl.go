@@ -120,6 +120,16 @@ func ecosystemType(eco string) (string, bool) {
 	// pkg:github type fletch fetches as a source archive.
 	case "github", "github_repo", "github_actions", "github_release":
 		return "github", true
+	// Container images under both forager registry labels ("docker" for the
+	// Docker Hub goodfeed, "oci" for ghcr/quay/generic refs) → the ratified
+	// pkg:oci type, host-qualified via repository_url.
+	case "oci", "docker":
+		return "oci", true
+	// Agent-skill registries. ClawHub is its own registry (an invented type,
+	// like jetbrains/homebrew); a skills.sh skill installs from its backing
+	// GitHub repo, so it resolves to that repo's pkg:github identity.
+	case "clawhub", "skills_sh":
+		return eco, true
 	default:
 		return "", false
 	}
@@ -189,6 +199,12 @@ func domainType(dom string) (string, bool) {
 		return "snap", true
 	case "github.com":
 		return "github", true
+	case "docker.com", "docker.io":
+		return "oci", true
+	case "clawhub.ai":
+		return "clawhub", true
+	case "skills.sh":
+		return "skills_sh", true
 	default:
 		return "", false
 	}
@@ -251,6 +267,63 @@ func buildTyped(key, name, version, arch string) (string, bool) {
 			return "", false
 		}
 		return renderPURL(key, asciiLower(owner), asciiLower(repo), version, ""), true
+
+	case "skills_sh":
+		// A skills.sh skill names owner/repo[/skill] and installs from the
+		// backing GitHub repository (see forager's DownloadSkillsSH): the repo
+		// archive is the artifact that gets hashed, so skills sharing a repo
+		// share bytes and correctly share the repo's pkg:github identity.
+		parts := strings.SplitN(name, "/", 3)
+		if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+			return "", false
+		}
+		return renderPURL("github", asciiLower(parts[0]), asciiLower(parts[1]), version, ""), true
+
+	case "clawhub":
+		// ClawHub skill: owner/slug when the publisher is known (slugs are not
+		// unique across publishers), bare slug otherwise. Lowercased — the
+		// registry treats both as case-insensitive handles.
+		if owner, slug, found := strings.Cut(name, "/"); found {
+			if owner == "" || slug == "" || strings.Contains(slug, "/") {
+				return "", false
+			}
+			return renderPURL(key, asciiLower(owner), asciiLower(slug), version, ""), true
+		}
+		return renderPURL(key, "", asciiLower(name), version, ""), true
+
+	case "oci":
+		// The ratified pkg:oci type (purl-spec types/oci-definition.json): the
+		// bare image name, lowercased, no namespace; the registry-qualified
+		// repository path rides the repository_url qualifier — slashes
+		// percent-encoded per the standard's character-encoding clause (':'
+		// is never encoded) — so docker.io/library/nginx and ghcr.io/evil/nginx
+		// stay distinct identities. Bare and un-namespaced refs normalize onto
+		// Docker Hub's implied coordinates ("nginx" → docker.io/library/nginx),
+		// matching forager's docker goodfeed and osm's container reports. The
+		// spec reserves version for the sha256:… digest; a mutable tag rides
+		// the tag qualifier instead (lexicographic key order: repository_url
+		// before tag).
+		ref := asciiLower(name)
+		if first, _, ok := strings.Cut(ref, "/"); !ok || !strings.ContainsAny(first, ".:") {
+			if !strings.Contains(ref, "/") {
+				ref = "library/" + ref
+			}
+			ref = "docker.io/" + ref
+		}
+		img := lastSegment(ref)
+		if img == "" {
+			return "", false
+		}
+		qualifier := "repository_url=" + escapePURL(ref)
+		digest := ""
+		if v := strings.TrimSpace(version); v != "" {
+			if strings.HasPrefix(strings.ToLower(v), "sha256:") {
+				digest = asciiLower(v)
+			} else {
+				qualifier += "&tag=" + escapePURL(v)
+			}
+		}
+		return renderPURL(key, "", img, digest, qualifier), true
 
 	// Editor extensions → the ratified pkg:vscode-extension type; Open VSX is the
 	// same type distinguished by a repository_url qualifier (it defaults to the

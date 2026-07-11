@@ -1844,3 +1844,65 @@ func TestNormalizeForceRescanDirs(t *testing.T) {
 		t.Fatal("normalizeForceRescanDirs with out-of-root absolute path succeeded, want error")
 	}
 }
+
+// TestFillSampleProvenance covers the name-anchored version split: when the
+// forager path supplies the package name, the version must be derived by
+// anchoring on that name, not by ParseFilename's joint name/version guess —
+// which absorbs digit-bearing name segments into the version
+// ("@kl-starfish-test-01-1.0.0.tgz" → "01-1.0.0", shipped to socket.dev as a
+// purl that matches nothing).
+func TestFillSampleProvenance(t *testing.T) {
+	tests := []struct {
+		name        string
+		prov        pathProvenance
+		filename    string
+		wantPkg     string
+		wantVersion string
+	}{
+		{
+			name:        "digit-bearing scoped name anchors the version",
+			prov:        pathProvenance{ecosystem: "javascript", pkg: "@kl-starfish/test-01"},
+			filename:    "@kl-starfish-test-01-1.0.0.tgz",
+			wantPkg:     "@kl-starfish/test-01",
+			wantVersion: "1.0.0",
+		},
+		{
+			name:        "plain name: anchored and joint splits agree",
+			prov:        pathProvenance{ecosystem: "javascript", pkg: "lodash"},
+			filename:    "lodash-4.17.21.tgz",
+			wantPkg:     "lodash",
+			wantVersion: "4.17.21",
+		},
+		{
+			name:        "no path name: joint parse supplies both",
+			prov:        pathProvenance{ecosystem: "javascript"},
+			filename:    "lodash-4.17.21.tgz",
+			wantPkg:     "lodash",
+			wantVersion: "4.17.21",
+		},
+		{
+			name:        "path name that fails anchoring falls back to joint parse",
+			prov:        pathProvenance{ecosystem: "javascript", pkg: "renamed-on-disk"},
+			filename:    "lodash-4.17.21.tgz",
+			wantPkg:     "renamed-on-disk",
+			wantVersion: "4.17.21",
+		},
+		{
+			name:        "path version wins over any filename parse",
+			prov:        pathProvenance{ecosystem: "javascript", pkg: "lodash", version: "9.9.9"},
+			filename:    "lodash-4.17.21.tgz",
+			wantPkg:     "lodash",
+			wantVersion: "9.9.9",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &hopper.Sample{}
+			fillSampleProvenance(s, tt.prov, tt.filename)
+			if s.Package != tt.wantPkg || s.Version != tt.wantVersion {
+				t.Errorf("fillSampleProvenance(%q) = (%q, %q), want (%q, %q)",
+					tt.filename, s.Package, s.Version, tt.wantPkg, tt.wantVersion)
+			}
+		})
+	}
+}

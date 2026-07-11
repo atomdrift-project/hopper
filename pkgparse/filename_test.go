@@ -133,3 +133,50 @@ func TestParseFilenameArch(t *testing.T) {
 		}
 	}
 }
+
+func TestVersionForName(t *testing.T) {
+	tests := []struct {
+		filename string
+		name     string
+		want     string
+	}{
+		// The 2026-07-10 regression: a digit-bearing scoped npm name. The joint
+		// ParseFilename split yields version "01-1.0.0"; the name-anchored split
+		// must recover "1.0.0".
+		{"@kl-starfish-test-01-1.0.0.tgz", "@kl-starfish/test-01", "1.0.0"},
+		// npm registry-native tarball (no scope in the filename).
+		{"test-01-1.0.0.tgz", "@kl-starfish/test-01", "1.0.0"},
+		// jsr.io layout: scope flattened with double underscore, "@" dropped.
+		{"runforge__ai-0.1.0.tgz", "@runforge/ai", "0.1.0"},
+		{"bearmetal__auth-0.0.4.tgz", "@bearmetal/auth", "0.0.4"},
+		// go module zip: slashes flattened to hyphens, pseudo-version tail.
+		{"github.com-stackrox-stackrox-v0.0.0-20260709101900-cfbbf6f1341e.zip",
+			"github.com/stackrox/stackrox", "v0.0.0-20260709101900-cfbbf6f1341e"},
+		// Unscoped name, prerelease suffix stays whole.
+		{"mypkg-1.0.0-beta.2.tgz", "mypkg", "1.0.0-beta.2"},
+		// Scoped npm in forager layout, digit-free name (sanity).
+		{"@wagni_bot-web3-agent-1.2.0.tgz", "@wagni_bot/web3-agent", "1.2.0"},
+		// CRAN-style underscore separator.
+		{"devtools_2.5.2.tar.gz", "devtools", "2.5.2"},
+		// Name doesn't prefix the filename: defer to ParseFilename.
+		{"lodash-4.17.21.tgz", "react", ""},
+		// Remainder isn't version-shaped: defer.
+		{"foo-bar.tgz", "foo", ""},
+		// deb/rpm carry release+arch after the version; must defer to
+		// ParseFilename's anchored patterns rather than swallow the arch.
+		{"wget_1.21.4-1ubuntu3_amd64.deb", "wget", ""},
+		{"curl-8.0.0-1.fc40.x86_64.rpm", "curl", ""},
+		// apk's version+release is the desired combined form.
+		{"zfs-2.4.1-r0.apk", "zfs", "2.4.1-r0"},
+		// Empty inputs.
+		{"", "foo", ""},
+		{"lodash-4.17.21.tgz", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.filename+"|"+tt.name, func(t *testing.T) {
+			if got := VersionForName(tt.filename, tt.name); got != tt.want {
+				t.Errorf("VersionForName(%q, %q) = %q, want %q", tt.filename, tt.name, got, tt.want)
+			}
+		})
+	}
+}

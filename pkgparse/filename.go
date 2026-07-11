@@ -11,7 +11,10 @@
 // filename at the wrong boundary.
 package pkgparse
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 // filenamePatterns matches the (name, version) split for the package
 // formats forager downloads. Patterns are tried in order; the first
@@ -115,4 +118,79 @@ func ParseFilename(filename string) (name, version, arch string) {
 		return m[nameIdx], m[versionIdx], arch
 	}
 	return "", "", ""
+}
+
+// archiveExtensions are the suffixes VersionForName strips before splitting,
+// compound forms first so ".tar.gz" wins over ".gz"-less ".tar".
+var archiveExtensions = []string{
+	".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".paf.exe",
+	".tgz", ".tar", ".whl", ".crate", ".jar", ".gem", ".nupkg",
+	".zip", ".vsix", ".crx", ".xpi", ".AppImage", ".conda", ".apk",
+}
+
+// versionShape is the loose validity check for a name-anchored version tail:
+// digit-led (optional "v"), then the usual version alphabet.
+var versionShape = regexp.MustCompile(`^v?\d[\w.+~-]*$`)
+
+// VersionForName extracts the version from a download filename when the
+// package name is already known (e.g. from a forager path component or feed
+// metadata), anchoring the split at the name instead of re-deriving both
+// halves jointly. ParseFilename must guess the name/version boundary, and for
+// digit-bearing names it guesses wrong: "@kl-starfish-test-01-1.0.0.tgz"
+// splits at the first hyphen-digit, yielding version "01-1.0.0". With the
+// name in hand there is no ambiguity: flatten it the way the download layouts
+// do, strip it, and what remains (minus the archive extension) is the version.
+//
+// Flattenings tried, in order:
+//
+//	@scope/pkg → @scope-pkg   (npm scoped tarballs in forager layout)
+//	@scope/pkg → scope__pkg   (jsr.io tarballs)
+//	a/b/c      → a-b-c        (go module zips)
+//	@scope/pkg → pkg          (npm registry-native tarball name)
+//	name as-is
+//
+// Returns "" when the name doesn't prefix the filename or the remainder
+// doesn't look like a version; callers should then fall back to
+// ParseFilename's joint guess.
+func VersionForName(filename, name string) string {
+	if name == "" || filename == "" {
+		return ""
+	}
+	// Only formats whose filenames are exactly <name><sep><version>.<ext>.
+	// deb/rpm/alpm carry release+arch after the version; their anchored
+	// ParseFilename patterns split them correctly, so defer to that.
+	base := ""
+	for _, ext := range archiveExtensions {
+		if strings.HasSuffix(filename, ext) {
+			base = strings.TrimSuffix(filename, ext)
+			break
+		}
+	}
+	if base == "" {
+		return ""
+	}
+
+	flat := strings.ReplaceAll(name, "/", "-")
+	candidates := []string{
+		flat,
+		strings.ReplaceAll(strings.TrimPrefix(name, "@"), "/", "__"),
+		strings.TrimPrefix(flat, "@"),
+	}
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		candidates = append(candidates, name[i+1:])
+	}
+	candidates = append(candidates, name)
+
+	for _, c := range candidates {
+		for _, sep := range []string{"-", "_"} {
+			rest, ok := strings.CutPrefix(base, c+sep)
+			if !ok {
+				continue
+			}
+			if versionShape.MatchString(rest) {
+				return rest
+			}
+		}
+	}
+	return ""
 }

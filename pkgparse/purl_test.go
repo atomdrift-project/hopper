@@ -44,6 +44,22 @@ func TestSourcePURLIdentity(t *testing.T) {
 		{"github bare name", "github_repo", "github.com", "norepo", "", false},
 		{"github extra segments", "github_repo", "github.com", "a/b/c", "", false},
 
+		// Container images → the ratified pkg:oci type: bare image name,
+		// registry path on the repository_url qualifier (slashes
+		// percent-encoded per the standard), Docker Hub implied for host-less
+		// refs.
+		{"oci ghcr ref", "oci", "docker.com", "ghcr.io/EvilOrg/BadImg", "pkg:oci/badimg?repository_url=ghcr.io%2Fevilorg%2Fbadimg", true},
+		{"docker bare image", "docker", "docker.com", "nginx", "pkg:oci/nginx?repository_url=docker.io%2Flibrary%2Fnginx", true},
+		{"docker namespaced image", "docker", "docker.com", "library/nginx", "pkg:oci/nginx?repository_url=docker.io%2Flibrary%2Fnginx", true},
+
+		// Agent skills: ClawHub is its own registry; a skills.sh skill is its
+		// backing GitHub repo (owner/repo[/skill] → the repo identity).
+		{"clawhub owned slug", "clawhub", "clawhub.ai", "Owner/Cool-Skill", "pkg:clawhub/owner/cool-skill", true},
+		{"clawhub bare slug", "clawhub", "clawhub.ai", "coolskill", "pkg:clawhub/coolskill", true},
+		{"skills.sh three segments", "skills_sh", "skills.sh", "Owner/Repo/skill-name", "pkg:github/owner/repo", true},
+		{"skills.sh two segments", "skills_sh", "skills.sh", "owner/repo", "pkg:github/owner/repo", true},
+		{"skills.sh bare name", "skills_sh", "skills.sh", "norepo", "", false},
+
 		// Nothing resolvable → empty, never a wrong PURL.
 		{"junk no domain", "datasets", "", "something", "", false},
 		{"empty name", "python", "pypi.org", "", "", false},
@@ -109,6 +125,17 @@ func TestSourcePURL(t *testing.T) {
 		{"lang rust", "rust", "", "serde", "1.0.0", "", "pkg:cargo/serde@1.0.0", true},
 		{"lang java", "java", "", "org.apache:commons", "1.0", "", "pkg:maven/org.apache/commons@1.0", true},
 		{"lang php", "php", "", "symfony/console", "6.4.0", "", "pkg:composer/symfony/console@6.4.0", true},
+
+		// pkg:oci per spec: version carries only the sha256:… digest (':'
+		// literal); a mutable tag rides the tag qualifier, sorted after
+		// repository_url; the repository path percent-encodes its slashes.
+		{"oci digest version", "oci", "docker.com", "ghcr.io/owner/img", "sha256:244fd47e07d10", "",
+			"pkg:oci/img@sha256:244fd47e07d10?repository_url=ghcr.io%2Fowner%2Fimg", true},
+		{"oci tag version", "docker", "docker.com", "nginx", "1.25-alpine", "",
+			"pkg:oci/nginx?repository_url=docker.io%2Flibrary%2Fnginx&tag=1.25-alpine", true},
+		// GitHub versions are commits or tags, passed through opaquely.
+		{"github versioned", "github_repo", "github.com", "EvilOrg/BadRepo", "244fd47", "",
+			"pkg:github/evilorg/badrepo@244fd47", true},
 
 		// Malformed coordinate for the type → no PURL.
 		{"maven missing group", "maven", "", "commons-lang3", "3.14.0", "", "", false},
