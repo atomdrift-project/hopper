@@ -2414,6 +2414,21 @@ func (db *DB) triageNewSQLite(ctx context.Context, limit int, f TriageFilter) ([
 	return scanLiteSamples(rows)
 }
 
+func (db *DB) triageSightedSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	extra, args := triageFilterClauseSQLite(f)
+	args = append(args, limit)
+	//nolint:gosec // G202: label predicate and column list are constant; filter values are parameterized via ? args
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleCols+` FROM samples
+		 WHERE label = 'sighted' AND cleave_result IS NOT NULL AND parent = ''`+extra+`
+		 ORDER BY created_at DESC, id DESC LIMIT ?`,
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage sighted: %w", err)
+	}
+	return scanLiteSamples(rows)
+}
+
 func (db *DB) conflictReviewSQLite(ctx context.Context, _, limit int) ([]*Sample, error) {
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples

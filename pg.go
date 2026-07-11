@@ -3054,6 +3054,20 @@ func (db *DB) triageNewPG(ctx context.Context, limit int, f TriageFilter) ([]*Sa
 	return scanPGSamples(rows)
 }
 
+func (db *DB) triageSightedPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	extra, args := triageFilterClausePG(f, 1)
+	args = append(args, limit)
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE label = 'sighted' AND cleave_result IS NOT NULL AND parent = ''`+extra+`
+		 ORDER BY created_at DESC, id DESC LIMIT $`+strconv.Itoa(len(args)),
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage sighted: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
 func (db *DB) conflictReviewPG(ctx context.Context, _, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples

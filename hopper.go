@@ -2941,6 +2941,19 @@ func (db *DB) TriageNew(ctx context.Context, limit int, f TriageFilter) ([]*Samp
 	return db.triageNewSQLite(ctx, limit, f)
 }
 
+// TriageSighted returns analyzed top-level sighted-labeled samples — feed
+// claims pending verification — taking up to limit of the most recently added
+// (created_at). Unlike TriageBad/TriageGood there is no detection-gap
+// predicate: every sighted sample is an unconfirmed claim that needs triage
+// and a real label, so all of them qualify until a ruling relabels them out of
+// the pool (bad or good). No skip/status filters — intended for manual triage.
+func (db *DB) TriageSighted(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.triageSightedPG(ctx, limit, f)
+	}
+	return db.triageSightedSQLite(ctx, limit, f)
+}
+
 // PromotionCandidates returns up to limit top-level, unknown-labeled samples
 // whose stored path is under pathPrefix and whose on-disk mtime is older than
 // olderThan, excluding training-skipped rows. Results are ordered by sha256 and

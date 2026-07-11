@@ -4960,11 +4960,13 @@ func TestTriageMostRecent(t *testing.T) {
 		analyze("bad", "apk", 1)
 		analyze("good", "apk", 5)
 		analyze("unknown", "apk", 5)
+		analyze("sighted", "apk", 1)
 	}
 	for range 2 {
 		analyze("bad", "deb", 1)
 		analyze("good", "deb", 5)
 		analyze("unknown", "deb", 5)
+		analyze("sighted", "deb", 1)
 	}
 
 	for _, tc := range []struct {
@@ -4974,6 +4976,7 @@ func TestTriageMostRecent(t *testing.T) {
 		{"bad", db.TriageBad},
 		{"good", db.TriageGood},
 		{"new", db.TriageNew},
+		{"sighted", db.TriageSighted},
 	} {
 		got, err := tc.fetch(ctx, 2, TriageFilter{})
 		if err != nil {
@@ -5085,6 +5088,22 @@ func TestTriageThresholds(t *testing.T) {
 	}
 	if !has(bad, badLoneHostile) || !has(bad, badTwoSusp) || !has(bad, badBenign) {
 		t.Errorf("TriageBad missing a detection-miss sample")
+	}
+
+	// sighted: no detection threshold — every analyzed sighted sample is an
+	// unconfirmed claim needing triage, whether cleave flags it or not.
+	sightedConfident := analyze("sighted", 5, 4)
+	sightedBenign := analyze("sighted", 1)
+
+	sighted, err := db.TriageSighted(ctx, 100, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageSighted: %v", err)
+	}
+	if !has(sighted, sightedConfident) || !has(sighted, sightedBenign) {
+		t.Errorf("TriageSighted must surface every sighted sample regardless of detection state")
+	}
+	if has(sighted, badBenign) {
+		t.Errorf("TriageSighted included a non-sighted sample")
 	}
 }
 
