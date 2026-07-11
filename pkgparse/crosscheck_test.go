@@ -118,6 +118,28 @@ func TestFletchReadsGeneratedPURLs(t *testing.T) {
 			"openvsx", "vscode", "open-vsx.org", "jinryx/crontally", "1.0.3", "",
 			"vscode-extension", "jinryx/crontally", "1.0.3", "open-vsx.org", false,
 		},
+		{
+			"github repo", "github_repo", "github.com", "EvilOrg/BadRepo", "", "",
+			"github", "evilorg/badrepo", "", "api.github.com", true,
+		},
+		{
+			// A tag rides the tag qualifier, so fletch reads no version; the
+			// repository_url qualifier routes the metadata lookup.
+			"oci tagged image", "docker", "docker.com", "nginx", "1.25", "",
+			"oci", "nginx", "", "hub.docker.com", true,
+		},
+		{
+			// A sha256 digest IS the version — the content-addressed identity
+			// both exporters (crane and fletch's oci module) agree on. Quay
+			// (unlike ghcr) has an anonymous metadata API, so a registry
+			// route must also resolve.
+			"oci digest image", "oci", "docker.com", "quay.io/owner/img", "sha256:244fd47e07d10", "",
+			"oci", "img", "sha256:244fd47e07d10", "quay.io", true,
+		},
+		{
+			"clawhub skill", "clawhub", "clawhub.ai", "Owner/Cool-Skill", "1.0.2", "",
+			"clawhub", "owner/cool-skill", "1.0.2", "clawhub.ai", true,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
