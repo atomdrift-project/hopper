@@ -114,6 +114,12 @@ func ecosystemType(eco string) (string, bool) {
 		"arch", "aur", "debian", "ubuntu", "fedora", "opensuse", "rpmfusion",
 		"alpine", "wolfi", "netbsd", "freebsd", "openbsd":
 		return eco, true
+	// GitHub-hosted code under every label forager and the walker use for it
+	// (release downloads, actions, repo archives, and the samples.ecosystem
+	// value they all normalize to). The identity is the repository — the
+	// pkg:github type fletch fetches as a source archive.
+	case "github", "github_repo", "github_actions", "github_release":
+		return "github", true
 	default:
 		return "", false
 	}
@@ -181,6 +187,8 @@ func domainType(dom string) (string, bool) {
 		return "homebrew", true
 	case "snapcraft.io":
 		return "snap", true
+	case "github.com":
+		return "github", true
 	default:
 		return "", false
 	}
@@ -233,6 +241,16 @@ func buildTyped(key, name, version, arch string) (string, bool) {
 			return renderPURL(key, owner, model, version, ""), true
 		}
 		return renderPURL(key, "", name, version, ""), true
+	case "github":
+		// The repository is the identity: exactly owner/repo, lowercased (the
+		// purl-spec github type marks both case-insensitive). A bare name or
+		// extra path segments has no certain repo identity — emit nothing
+		// rather than a coordinate fletch would fetch as the wrong repo.
+		owner, repo, found := strings.Cut(name, "/")
+		if !found || owner == "" || repo == "" || strings.Contains(repo, "/") {
+			return "", false
+		}
+		return renderPURL(key, asciiLower(owner), asciiLower(repo), version, ""), true
 
 	// Editor extensions → the ratified pkg:vscode-extension type; Open VSX is the
 	// same type distinguished by a repository_url qualifier (it defaults to the

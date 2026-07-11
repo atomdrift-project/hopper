@@ -34,6 +34,16 @@ func TestSourcePURLIdentity(t *testing.T) {
 		{"mislabel linux->arch", "linux", "archlinux.org", "podman", "pkg:alpm/arch/podman", true},
 		{"mislabel macos->debian", "macos", "debian.org", "nvi", "pkg:deb/debian/nvi", true},
 
+		// GitHub-hosted code: every label converges on pkg:github/owner/repo,
+		// lowercased. Identity requires exactly owner/repo — anything else
+		// emits nothing rather than a coordinate for the wrong repo.
+		{"github repo eco", "github_repo", "github.com", "EvilOrg/BadRepo", "pkg:github/evilorg/badrepo", true},
+		{"github actions eco", "github_actions", "github.com", "actions/checkout", "pkg:github/actions/checkout", true},
+		{"github release eco", "github_release", "github.com", "owner/tool", "pkg:github/owner/tool", true},
+		{"github by domain", "agent", "github.com", "owner/skill-repo", "pkg:github/owner/skill-repo", true},
+		{"github bare name", "github_repo", "github.com", "norepo", "", false},
+		{"github extra segments", "github_repo", "github.com", "a/b/c", "", false},
+
 		// Nothing resolvable → empty, never a wrong PURL.
 		{"junk no domain", "datasets", "", "something", "", false},
 		{"empty name", "python", "pypi.org", "", "", false},
