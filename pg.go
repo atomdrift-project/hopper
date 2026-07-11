@@ -4870,13 +4870,15 @@ func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error
 			AND (NOT $8 OR litmus_result IS NOT NULL)
 			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))
 			AND ($12 = '' OR filename ILIKE '%' || $12 || '%' ESCAPE '\'
-				OR sha256 = $12)
+				OR sha256 = $12 OR package = $16)
 			AND (NOT $13 OR corroborated)
+			AND ($14 = '' OR purl_base = $14)
+			AND ($15 = '' OR version = $15)
 		ORDER BY `+q.sortBy()+`
 		LIMIT $10 OFFSET $11`,
 		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
 		q.Formula, q.requireLitmus(), q.Domains, q.Limit, q.Offset,
-		q.searchTerm(), q.Corroborated)
+		q.searchTerm(), q.Corroborated, q.PURLBase, q.PURLVersion, q.packageTerm())
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed samples: %w", err)
 	}
@@ -4916,10 +4918,13 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q *FeedQuery) (int, error)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
 			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))
 			AND ($10 = '' OR filename ILIKE '%' || $10 || '%' ESCAPE '\'
-				OR sha256 = $10)
-			AND (NOT $11 OR corroborated)`,
+				OR sha256 = $10 OR package = $14)
+			AND (NOT $11 OR corroborated)
+			AND ($12 = '' OR purl_base = $12)
+			AND ($13 = '' OR version = $13)`,
 		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
-		q.Formula, q.requireLitmus(), q.Domains, q.searchTerm(), q.Corroborated).Scan(&n)
+		q.Formula, q.requireLitmus(), q.Domains, q.searchTerm(), q.Corroborated,
+		q.PURLBase, q.PURLVersion, q.packageTerm()).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: feed samples count: %w", err)
 	}

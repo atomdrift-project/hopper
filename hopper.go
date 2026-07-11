@@ -424,17 +424,17 @@ type Sample struct {
 	// suspicious+ trait ids, derived on every result write (PG trigger /
 	// ParseCleaveResult). "" when nothing reaches the bar or for rows
 	// written before the column existed (healed by backfill).
-	TopTraits         string
-	SHA256            string
-	Filename          string
-	FileType          string
-	Label             string
-	LabelSource       string
-	Path              string
-	Status            string
-	Note              string
-	CanonicalSHA256   string
-	Parent            string
+	TopTraits       string
+	SHA256          string
+	Filename        string
+	FileType        string
+	Label           string
+	LabelSource     string
+	Path            string
+	Status          string
+	Note            string
+	CanonicalSHA256 string
+	Parent          string
 	// LocationRel is the edge type of this sample's Path observation to
 	// Parent, mirroring cleave's `rel` ("", "fetched", "unpacked",
 	// "registry" — see SampleLocation.Rel). It rides into sample_locations
@@ -944,9 +944,9 @@ func (e *memberEnvelope) buildRange(start, end int) []*Sample {
 		// size ("size"/"sz"). Decode every generation so old envelopes still
 		// explode; the cascade below prefers the newest present.
 		var entry struct {
-			SHA256   string        `json:"sha"`
-			FileType string        `json:"type"`
-			Path     string        `json:"path"`
+			SHA256   string `json:"sha"`
+			FileType string `json:"type"`
+			Path     string `json:"path"`
 			// Rel is cleave's edge type to the parent: absent for an
 			// ordinary contained member, "fetched" for content retrieved
 			// from a reference the parent declares (never inside it),
@@ -3398,20 +3398,28 @@ func (db *DB) RecomputeCanonicalSHA256(ctx context.Context) (int64, error) {
 
 // FeedQuery specifies filters for paginated feed queries.
 type FeedQuery struct {
-	Source        string   // "forager" or "upload" ("harvest" matches legacy rows)
-	Label         string   // "bad", "good", "unknown", or "" (match any)
-	OrderBy       string   // "mtime" (default), "created_at", or "analyzed_at"
-	Formula       string   // optional: filter by exact cleave chemical formula
-	Search        string   // optional free-text: case-insensitive filename substring OR exact sha256
-	Feeds         []string // optional: filter by feed column values
-	Ecosystems    []string // optional: filter by ecosystem column values
-	Domains       []string // optional: filter by domain column values
-	LitmusClasses []int    // optional: filter by litmus_result class values
-	RequireLitmus bool     // require any litmus_result without filtering by class
-	Corroborated  bool     // only samples cited by an external threat feed (samples.corroborated)
-	TopLevelOnly  bool     // only samples that appear in no archive: parent = '' AND no parented sample_locations row (children may have multiple parents; the locations ledger is the authority)
-	Offset        int      // pagination offset
-	Limit         int      // page size (clamped to 1–1000)
+	Source     string   // "forager" or "upload" ("harvest" matches legacy rows)
+	Label      string   // "bad", "good", "unknown", or "" (match any)
+	OrderBy    string   // "mtime" (default), "created_at", or "analyzed_at"
+	Formula    string   // optional: filter by exact cleave chemical formula
+	Search     string   // optional free-text: case-insensitive filename substring OR exact sha256 OR exact package name
+	Feeds      []string // optional: filter by feed column values
+	Ecosystems []string // optional: filter by ecosystem column values
+	Domains    []string // optional: filter by domain column values
+	// PURLBase restricts the feed to one package identity: an exact match on
+	// the indexed samples.purl_base column (the version-less canonical PURL,
+	// e.g. "pkg:npm/lodash"). PURLVersion, when also set, pins the exact
+	// release (samples.version). Both are exact equality — callers pass an
+	// already-canonicalized value (see pkgparse.CanonicalizePURL /
+	// VersionlessPURL); an empty field matches everything.
+	PURLBase      string
+	PURLVersion   string
+	LitmusClasses []int // optional: filter by litmus_result class values
+	RequireLitmus bool  // require any litmus_result without filtering by class
+	Corroborated  bool  // only samples cited by an external threat feed (samples.corroborated)
+	TopLevelOnly  bool  // only samples that appear in no archive: parent = '' AND no parented sample_locations row (children may have multiple parents; the locations ledger is the authority)
+	Offset        int   // pagination offset
+	Limit         int   // page size (clamped to 1–1000)
 	// CriticalLevel pins the hostile/suspicious cutoff used when deriving
 	// criticality from a v6 envelope's `ml.l` (see LitmusClasses). Callers
 	// set it to their own consumer-side definition so the class derivation
@@ -3596,6 +3604,22 @@ func (q *FeedQuery) searchTerm() string {
 		return ""
 	}
 	return likeEscaper.Replace(strings.ToLower(q.Search))
+}
+
+// packageTerm normalizes [FeedQuery.Search] for the exact package-name disjunct
+// of the feed predicate. It is lowercased — registry names in the ecosystems
+// that matter (npm, pypi, …) are lowercase-normalized, and callers lowercase the
+// box term too — but, unlike [searchTerm], it is NOT LIKE-escaped: it backs a
+// `package = $n` equality against the indexed package column, not a LIKE
+// pattern, so escaping would corrupt the common names that carry '_' (e.g.
+// python_dateutil). This turns a bare package name typed into the search box
+// into an indexed exact hit even when the filename embeds no such substring
+// (e.g. "xz-utils" against xz-5.6.1.tar.gz). Empty Search yields "".
+func (q *FeedQuery) packageTerm() string {
+	if q.Search == "" {
+		return ""
+	}
+	return strings.ToLower(q.Search)
 }
 
 // sortBy returns the full ORDER BY direction clause for the configured

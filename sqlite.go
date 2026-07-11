@@ -3764,8 +3764,19 @@ func (q *FeedQuery) whereSQLite() (where string, args []any) {
 	// meet the lowercase-stored column).
 	if term := q.searchTerm(); term != "" {
 		clauses = append(clauses,
-			`(filename LIKE '%' || ? || '%' ESCAPE '\' OR sha256 = ?)`)
-		args = append(args, term, term)
+			`(filename LIKE '%' || ? || '%' ESCAPE '\' OR sha256 = ? OR package = ?)`)
+		args = append(args, term, term, q.packageTerm())
+	}
+
+	// Exact package-identity filter: purl_base is the version-less canonical
+	// PURL, version pins the release. Both are equality against stored columns.
+	if q.PURLBase != "" {
+		clauses = append(clauses, "purl_base = ?")
+		args = append(args, q.PURLBase)
+	}
+	if q.PURLVersion != "" {
+		clauses = append(clauses, "version = ?")
+		args = append(args, q.PURLVersion)
 	}
 
 	return "WHERE " + strings.Join(clauses, " AND "), args
