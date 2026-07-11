@@ -2879,6 +2879,7 @@ func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	diskPath := sampleDiskPath(s.dataRoot, filepath.FromSlash(sample.Path))
 	resolved, err := filepath.EvalSymlinks(diskPath)
 	if err != nil {
+		s.markServeMissing(ctx, sample, err)
 		writeMissingSampleFile(w, err, `{"error":"sample file gone"}`)
 		return
 	}
@@ -2901,12 +2902,14 @@ func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	// Serve the file directly (no directory listings — the path is a file).
 	f, err := os.Open(resolved) //nolint:gosec // path validated above
 	if err != nil {
+		s.markServeMissing(ctx, sample, err)
 		writeMissingSampleFile(w, err, `{"error":"sample file gone"}`)
 		return
 	}
 	defer f.Close() //nolint:errcheck // best-effort close
 	stat, err := f.Stat()
 	if err != nil {
+		s.markServeMissing(ctx, sample, err)
 		writeMissingSampleFile(w, err, `{"error":"sample file gone"}`)
 		return
 	}
@@ -2947,6 +2950,36 @@ const (
 func writeRetryable(w http.ResponseWriter, retryAfterSec int, body string) {
 	w.Header().Set("Retry-After", strconv.Itoa(retryAfterSec))
 	http.Error(w, body, http.StatusServiceUnavailable)
+}
+
+// markServeMissing flips a top-level sample to skip='missing' when a serve
+// found its bytes gone from disk (ENOENT), so selection queries that exclude
+// skipped rows (promoter's candidate walks, gauntlet's cohorts) stop offering
+// a file no client can download — one wasted fetch total instead of one per
+// client per pass until the next reconcile walk notices the deletion (hours).
+// Mirrors /api/next's claim validation: only ENOENT marks (transient I/O
+// errors stay retryable), dataset-incomplete mode never marks (local disk is
+// not authoritative there), and an existing skip is preserved. A vanished
+// dataRoot (unmounted volume) makes every file ENOENT, so marking also
+// requires the root itself to still exist. A stray mark self-heals: the
+// walker clears 'missing' when it re-observes the file.
+func (s *apiServer) markServeMissing(ctx context.Context, sample *hopper.Sample, err error) {
+	// Member rows (parent != '') have no direct disk path — their "!!"-delimited
+	// Path never resolves — so only a top-level row's ENOENT is evidence of a
+	// deletion. Members are cascaded by the reconcile walk.
+	if !errors.Is(err, os.ErrNotExist) || s.datasetIncomplete || sample.Skip != "" || sample.Parent != "" {
+		return
+	}
+	if _, rerr := os.Stat(s.dataRoot); rerr != nil {
+		slog.Error("data root inaccessible; not marking sample missing",
+			"data_root", s.dataRoot, "sha256", sample.SHA256, "error", rerr)
+		return
+	}
+	//nolint:gosec // sha256/path come from the DB row, not the request
+	slog.Warn("sample bytes gone on disk; marking missing", "sha256", sample.SHA256, "path", sample.Path)
+	if merr := s.db.SetSkip(ctx, sample.SHA256, "missing"); merr != nil {
+		slog.Error("mark missing failed", "sha256", sample.SHA256, "error", merr) //nolint:gosec // structured logging
+	}
 }
 
 // writeMissingSampleFile maps a failure to resolve or open a sample file whose
@@ -3019,6 +3052,9 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 	diskPath := sampleDiskPath(s.dataRoot, filepath.FromSlash(parent.Path))
 	resolved, err := filepath.EvalSymlinks(diskPath)
 	if err != nil {
+		// The bytes that vanished are the parent archive's; the member rows are
+		// cascaded by the reconcile walk once the parent is marked.
+		s.markServeMissing(ctx, parent, err)
 		writeMissingSampleFile(w, err, `{"error":"parent file gone"}`)
 		return
 	}
@@ -3040,12 +3076,14 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 
 	f, err := os.Open(resolved) //nolint:gosec // path validated above
 	if err != nil {
+		s.markServeMissing(ctx, parent, err)
 		writeMissingSampleFile(w, err, `{"error":"parent file gone"}`)
 		return
 	}
 	defer f.Close() //nolint:errcheck // best-effort close
 	stat, err := f.Stat()
 	if err != nil {
+		s.markServeMissing(ctx, parent, err)
 		writeMissingSampleFile(w, err, `{"error":"parent file gone"}`)
 		return
 	}

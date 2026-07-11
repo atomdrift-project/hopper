@@ -1540,3 +1540,87 @@ func TestHandleRescan(t *testing.T) {
 		t.Errorf("starting: status = %d, want 503", rec.Code)
 	}
 }
+
+// TestHandleFileMarksMissing: a top-level row whose bytes vanished from disk
+// must be marked skip='missing' on the first fetch (410), so the selection
+// queries promoter/gauntlet run stop returning it. Files that are present, or
+// servers in dataset-incomplete mode, must not mark.
+func TestHandleFileMarksMissing(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db := mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+
+	goneSHA := strings.Repeat("a", 64)
+	hereSHA := strings.Repeat("b", 64)
+	for _, s := range []*hopper.Sample{
+		{SHA256: goneSHA, Source: "test", Path: "bad/gone.bin", Label: "bad", LabelSource: "test"},
+		{SHA256: hereSHA, Source: "test", Path: "bad/here.bin", Label: "bad", LabelSource: "test"},
+	} {
+		if err := db.InsertSample(ctx, s); err != nil {
+			t.Fatalf("InsertSample: %v", err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(root, "bad"), 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "bad", "here.bin"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	api := &apiServer{db: db, dataRoot: root, allowedDirs: []string{resolvedRoot}, tracker: newWorkerTracker()}
+
+	get := func(t *testing.T, srv *apiServer, sha string) int {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodGet, "/api/file/"+sha, http.NoBody)
+		r.SetPathValue("sha256", sha)
+		rec := httptest.NewRecorder()
+		srv.handleFile(rec, r)
+		return rec.Code
+	}
+	skipOf := func(t *testing.T, sha string) string {
+		t.Helper()
+		samp, err := db.SampleBySHA256(ctx, sha)
+		if err != nil {
+			t.Fatalf("SampleBySHA256: %v", err)
+		}
+		return samp.Skip
+	}
+
+	// Vanished bytes: 410 and the row is marked missing.
+	if code := get(t, api, goneSHA); code != http.StatusGone {
+		t.Fatalf("gone file: status = %d, want 410", code)
+	}
+	if got := skipOf(t, goneSHA); got != "missing" {
+		t.Errorf("gone file: skip = %q, want %q", got, "missing")
+	}
+
+	// Present bytes: 200 and no mark.
+	if code := get(t, api, hereSHA); code != http.StatusOK {
+		t.Fatalf("present file: status = %d, want 200", code)
+	}
+	if got := skipOf(t, hereSHA); got != "" {
+		t.Errorf("present file: skip = %q, want empty", got)
+	}
+
+	// Dataset-incomplete: local disk is not authoritative, so a vanished file
+	// still 410s this request but must not be marked.
+	if err := db.SetSkip(ctx, goneSHA, ""); err != nil {
+		t.Fatalf("SetSkip reset: %v", err)
+	}
+	incomplete := &apiServer{db: db, dataRoot: root, allowedDirs: []string{resolvedRoot}, tracker: newWorkerTracker(), datasetIncomplete: true}
+	if code := get(t, incomplete, goneSHA); code != http.StatusGone {
+		t.Fatalf("dataset-incomplete: status = %d, want 410", code)
+	}
+	if got := skipOf(t, goneSHA); got != "" {
+		t.Errorf("dataset-incomplete: skip = %q, want empty", got)
+	}
+}
