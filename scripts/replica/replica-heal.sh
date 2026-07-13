@@ -322,8 +322,24 @@ heal_names="${missing_names}${generated_names}"
 if [ -z "$heal_ddl" ]; then
     # No healable drift (no missing column, no generated-vs-published mismatch).
     if [ "$enabled" = "t" ]; then
+        # Schema parity is necessary but not sufficient: an enabled, schema-
+        # clean subscription can still be arbitrarily far behind (2026-07-13:
+        # ~1 TB of WAL backlog while every run here logged "in parity"). Check
+        # the publisher-side slot lag and page when it crosses the threshold.
+        # Bucketed to 100 GB steps so the dedup signature stays stable while a
+        # slow drain is in progress, but re-fires as the order of magnitude
+        # changes. Best-effort: an unreadable publisher never fails this run.
+        lag_gb=$(remote -tAc "SELECT COALESCE(floor(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)/1073741824), 0)
+                                FROM pg_replication_slots WHERE slot_name = '$SUBSCRIPTION'" 2>/dev/null | tr -d '[:space:]')
+        threshold="${HEAL_LAG_WARN_GB:-50}"
+        case "$lag_gb" in *[!0-9]*|'') lag_gb="" ;; esac
+        if [ -n "$lag_gb" ] && [ "$lag_gb" -ge "$threshold" ]; then
+            bucket=$(( lag_gb / 100 * 100 ))
+            alert warn "subscription '$SUBSCRIPTION' schema is in parity but replication is ~${bucket}+ GB behind the publisher (threshold ${threshold} GB) — apply is not keeping up; check apply throughput / replica IO (RUNBOOK: replication lag)"
+            exit 1
+        fi
         clear_alert
-        log "ok: '$SUBSCRIPTION' enabled, schema in parity with publisher"
+        log "ok: '$SUBSCRIPTION' enabled, schema in parity with publisher${lag_gb:+, lag ${lag_gb} GB}"
         exit 0
     fi
     # Disabled but schema is fine → it tripped on a non-schema apply error

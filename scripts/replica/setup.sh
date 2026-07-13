@@ -317,6 +317,15 @@ fi
 log "Running '$HOPPER init' to ensure schema (lock_timeout=30s)"
 "$HOPPER" init -db "postgres://$LOCAL_USER@localhost/$LOCAL_DB?sslmode=disable&lock_timeout=30s"
 
+# Drop the master-only worker-queue/ingest indexes a read replica never scans.
+# Runs right after init so a fresh replica never bulk-builds them and the
+# steady-state apply worker never maintains them (~590 GB of write dead weight,
+# see slim-indexes.sh). REPLICA_SLIM_INDEXES=false opts out; promote.sh
+# restores them if this replica is ever promoted to primary.
+log "Slimming replica indexes (REPLICA_SLIM_INDEXES=${REPLICA_SLIM_INDEXES:-true})"
+LOCAL_DB="$LOCAL_DB" "$SCRIPT_DIR/slim-indexes.sh" \
+    || log "warning: slim-indexes failed (continuing — replica keeps full index set)"
+
 # --- Remote publication ----------------------------------------------------
 # Reconcile the publisher before creating or refreshing the local
 # subscription. A subscription can have a healthy apply worker even when its
@@ -449,10 +458,13 @@ ALTER SUBSCRIPTION :"sub" SET PUBLICATION :"pub" WITH (refresh = false);
 -- Contain schema drift: on any apply error (e.g. a missing replicated column
 -- after the publisher gains one) the subscription disables itself instead of
 -- crash-looping and pinning the publisher's WAL. replica-heal.sh re-enables it.
--- streaming=on ships large in-progress transactions incrementally instead of
--- buffering+spilling them whole on the publisher — important for this workload's
--- big full-table backfill migrations.
-ALTER SUBSCRIPTION :"sub" SET (disable_on_error = true, streaming = on);
+-- streaming=parallel ships large in-progress transactions incrementally
+-- instead of buffering+spilling them whole on the publisher — important for
+-- this workload's big full-table backfill migrations — and applies them via
+-- parallel apply workers instead of spooling to disk and replaying at commit
+-- (a single ~300 GB backfill txn stalled apply feedback for hours on
+-- 2026-07-13 under plain streaming=on).
+ALTER SUBSCRIPTION :"sub" SET (disable_on_error = true, streaming = parallel);
 ALTER SUBSCRIPTION :"sub" ENABLE;
 ALTER SUBSCRIPTION :"sub" REFRESH PUBLICATION WITH (copy_data = $COPY_DATA);
 SQL
@@ -480,7 +492,7 @@ SQL
 CREATE SUBSCRIPTION :"sub"
     CONNECTION :'conn'
     PUBLICATION :"pub"
-    WITH (copy_data = $COPY_DATA, disable_on_error = true, streaming = on);
+    WITH (copy_data = $COPY_DATA, disable_on_error = true, streaming = parallel);
 SQL
 fi
 

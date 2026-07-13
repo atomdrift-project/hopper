@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -252,6 +254,99 @@ func TestHandleTriageRulings(t *testing.T) {
 	bad := callTriage(t, api, triageRequest{Verdicts: []triageVerdict{{SHA256: repeat("4")}}})
 	if bad.Failed != 1 {
 		t.Fatalf("empty item: failed=%d results=%+v", bad.Failed, bad.Results)
+	}
+}
+
+// TestHandleTriageRulingCollision covers a ruling whose destination is already
+// occupied — pool files are stored read-only, so without explicit handling the
+// copy fails EACCES on every retry and the sample churns through triage
+// forever. Identical bytes at the destination are adopted in place (source
+// dropped); different bytes (forager re-fetched a same-named build) get a
+// sha-suffixed slot beside the incumbent.
+func TestHandleTriageRulingCollision(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db := mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	api := &apiServer{db: db, dataRoot: root, tracker: newWorkerTracker()}
+
+	// write places content at rel, read-only like real pool files.
+	write := func(rel string, content []byte) {
+		t.Helper()
+		abs := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(abs), 0o750); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(abs, content, 0o444); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	seed := func(sha, rel string, content []byte) {
+		t.Helper()
+		write(rel, content)
+		if err := db.InsertSample(ctx, &hopper.Sample{
+			SHA256: sha, Source: "test", Path: rel, Label: "bad", LabelSource: "harvest",
+		}); err != nil {
+			t.Fatalf("InsertSample: %v", err)
+		}
+	}
+	shaOf := func(content []byte) string {
+		sum := sha256.Sum256(content)
+		return hex.EncodeToString(sum[:])
+	}
+
+	// Same bytes already at the destination: adopt in place.
+	sameContent := []byte("identical bytes")
+	sameSHA := shaOf(sameContent)
+	oldRelA := filepath.Join("bad", "foraged", "npm", "same.tgz")
+	destRelA := filepath.Join("good", "foraged-promote", "npm", "same.tgz")
+	seed(sameSHA, oldRelA, sameContent)
+	write(destRelA, sameContent)
+	resp := callTriage(t, api, triageRequest{Verdicts: []triageVerdict{{SHA256: sameSHA, Ruling: "good"}}})
+	if resp.Moved != 1 || resp.Failed != 0 {
+		t.Fatalf("adopt: moved=%d failed=%d results=%+v", resp.Moved, resp.Failed, resp.Results)
+	}
+	if got := resp.Results[0].NewPath; got != destRelA {
+		t.Fatalf("adopt: new path = %q, want %q", got, destRelA)
+	}
+	if _, err := os.Stat(filepath.Join(root, oldRelA)); !os.IsNotExist(err) {
+		t.Fatalf("adopt: source should be gone, err=%v", err)
+	}
+	samp, err := db.SampleBySHA256(ctx, sameSHA)
+	if err != nil {
+		t.Fatalf("adopt: SampleBySHA256: %v", err)
+	}
+	if samp.Label != "good" || samp.Path != destRelA {
+		t.Fatalf("adopt: row label=%q path=%q", samp.Label, samp.Path)
+	}
+
+	// Different bytes at the destination: sha-suffix this sample's basename.
+	newContent := []byte("newer build")
+	newSHA := shaOf(newContent)
+	oldRelB := filepath.Join("bad", "foraged", "npm", "pkg.tgz")
+	destRelB := filepath.Join("good", "foraged-promote", "npm", "pkg.tgz")
+	seed(newSHA, oldRelB, newContent)
+	write(destRelB, []byte("older build, different bytes"))
+	resp = callTriage(t, api, triageRequest{Verdicts: []triageVerdict{{SHA256: newSHA, Ruling: "good"}}})
+	if resp.Moved != 1 || resp.Failed != 0 {
+		t.Fatalf("suffix: moved=%d failed=%d results=%+v", resp.Moved, resp.Failed, resp.Results)
+	}
+	wantRel := filepath.Join("good", "foraged-promote", "npm", "pkg."+newSHA[:12]+".tgz")
+	if got := resp.Results[0].NewPath; got != wantRel {
+		t.Fatalf("suffix: new path = %q, want %q", got, wantRel)
+	}
+	got, err := os.ReadFile(filepath.Join(root, wantRel))
+	if err != nil || !bytes.Equal(got, newContent) {
+		t.Fatalf("suffix: moved bytes wrong: err=%v content=%q", err, got)
+	}
+	if incumbent, err := os.ReadFile(filepath.Join(root, destRelB)); err != nil || bytes.Equal(incumbent, newContent) {
+		t.Fatalf("suffix: incumbent clobbered: err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, oldRelB)); !os.IsNotExist(err) {
+		t.Fatalf("suffix: source should be gone, err=%v", err)
 	}
 }
 

@@ -280,13 +280,53 @@ func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun
 		return res
 	}
 
-	if err := mkdirSharedAll(filepath.Dir(newAbs)); err != nil {
-		res.Status, res.Error = "error", "mkdir: "+err.Error()
+	// The destination may already be occupied: forager re-fetches package
+	// builds whose bytes differ but whose tree path is identical, and pool
+	// files are stored read-only, so a blind copy-over fails EACCES on every
+	// retry instead of overwriting — the verdict then never applies and the
+	// sample churns through triage forever. Same bytes → the move already
+	// happened, just drop the source. Different bytes → keep both by
+	// sha-suffixing this sample's basename (the operator-verdict collision
+	// rule); that slot is keyed by this sha, so whatever occupies it is ours
+	// (at worst a truncated leftover) and is simply cleared and rewritten.
+	adopt := false
+	if exists, statErr := pathExists(newAbs); statErr != nil {
+		res.Status, res.Error = "error", "stat destination: "+statErr.Error()
 		return res
+	} else if exists {
+		same, hashErr := fileMatchesSHA256(newAbs, sha)
+		if hashErr != nil {
+			res.Status, res.Error = "error", "hash destination: "+hashErr.Error()
+			return res
+		}
+		adopt = same
+		if !same {
+			plan.newRel = shaSuffixedRel(plan.newRel, sha)
+			res.NewPath = plan.newRel
+			if newAbs, err = s.resolveDataPath(plan.newRel); err != nil {
+				res.Status, res.Error = "error", err.Error()
+				return res
+			}
+			if err := os.Remove(newAbs); err != nil && !errors.Is(err, os.ErrNotExist) {
+				res.Status, res.Error = "error", "clear suffixed slot: "+err.Error()
+				return res
+			}
+		}
 	}
-	if err := moveSample(oldAbs, newAbs); err != nil {
-		res.Status, res.Error = "error", "move: "+err.Error()
-		return res
+	if adopt {
+		if err := os.Remove(oldAbs); err != nil {
+			res.Status, res.Error = "error", "remove source after adopt: "+err.Error()
+			return res
+		}
+	} else {
+		if err := mkdirSharedAll(filepath.Dir(newAbs)); err != nil {
+			res.Status, res.Error = "error", "mkdir: "+err.Error()
+			return res
+		}
+		if err := moveSample(oldAbs, newAbs); err != nil {
+			res.Status, res.Error = "error", "move: "+err.Error()
+			return res
+		}
 	}
 	// The DB is now authoritative; drop any stale litmus markers left beside the
 	// old location so a future walk can't resurrect the wrong label.
@@ -336,17 +376,38 @@ func (s *apiServer) triagePlan(samp *hopper.Sample, oldRel string, v triageVerdi
 	if err != nil {
 		return placement{}, err
 	}
-	// Disambiguate a basename collision in the flat bucket by prefixing the sha;
+	// Disambiguate a basename collision in the flat bucket by suffixing the sha;
 	// keeps the bucket human-browsable while staying unique.
 	if collides, err := pathExists(newAbs); err != nil {
 		return placement{}, err
 	} else if collides {
-		base := filepath.Base(oldRel)
-		ext := filepath.Ext(base)
-		stem := strings.TrimSuffix(base, ext)
-		newRel = filepath.Join(v.Verdict, "mislabeled-"+wrong, stem+"."+samp.SHA256[:12]+ext)
+		newRel = shaSuffixedRel(newRel, samp.SHA256)
 	}
 	return placement{newRel, v.Verdict, "triage"}, nil
+}
+
+// shaSuffixedRel disambiguates rel's basename with the sample's sha prefix:
+// dir/foo.tgz → dir/foo.<sha12>.tgz. Lets same-named, different-content
+// samples coexist while staying human-attributable.
+func shaSuffixedRel(rel, sha string) string {
+	dir, base := filepath.Split(rel)
+	ext := filepath.Ext(base)
+	return filepath.Join(dir, strings.TrimSuffix(base, ext)+"."+sha[:12]+ext)
+}
+
+// fileMatchesSHA256 reports whether path's content hashes to sha
+// (lowercase hex).
+func fileMatchesSHA256(path, sha string) (bool, error) {
+	f, err := os.Open(path) //nolint:gosec // path resolved within dataRoot
+	if err != nil {
+		return false, err
+	}
+	defer f.Close() //nolint:errcheck // read-only handle
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return false, err
+	}
+	return hex.EncodeToString(h.Sum(nil)) == sha, nil
 }
 
 // moveSample relocates a sample file between pool trees. It tries an atomic

@@ -184,6 +184,19 @@ admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
 ALTER SYSTEM SET synchronous_commit = on;
 SELECT pg_reload_conf();
 SQL
+# Rebuild the master-only indexes slim-indexes.sh dropped — a primary's write
+# pipeline (worker queues, ingest lookups) needs them, a read replica didn't.
+# Best-effort: CREATE INDEX over TB-scale tables takes hours, so run it here
+# where the operator is watching rather than leaving the new primary quietly
+# queue-less. The DDL file only exists if slim-indexes.sh ever ran.
+SLIM_RESTORE="${HEAL_STATE_DIR:-$HOME/.hopper-replica-heal}/slim-index-restore.sql"
+if [ -f "$SLIM_RESTORE" ]; then
+    log "Rebuilding master-only indexes dropped for replica duty (this can take hours)"
+    admin -d "$LOCAL_DB" -f "$SLIM_RESTORE" \
+        && mv "$SLIM_RESTORE" "$SLIM_RESTORE.applied" \
+        || log "warning: index rebuild failed or partial — re-run by hand: psql -d $LOCAL_DB -f $SLIM_RESTORE"
+fi
+
 # ZFS: sync=disabled -> standard. Best-effort and a no-op inside a jail (see the
 # manual note below) or on non-ZFS boxes.
 log "Reverting disposable-replica ZFS tuning"

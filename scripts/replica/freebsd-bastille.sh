@@ -262,10 +262,12 @@ fi
 # derive the canonical hopper_replica_<hostname>.
 sub_env=""
 [ -n "$SUBSCRIPTION" ] && sub_env="SUBSCRIPTION='$SUBSCRIPTION' "
-# Forward fast-sync knobs (bulkload.sh) when the operator set them, e.g.
-# BULK_MAINT_MEM=8GB on a big-RAM jail. ZFS_TUNE=false: the host handled ZFS.
+# Forward fast-sync knobs (bulkload.sh) and the slim-index opt-out when the
+# operator set them, e.g. BULK_MAINT_MEM=8GB on a big-RAM jail or
+# REPLICA_SLIM_INDEXES=false to keep the full master index set.
+# ZFS_TUNE=false: the host handled ZFS.
 bulk_env=""
-for _v in FAST_SYNC BULK_MAINT_MEM BULK_MAX_PARALLEL_MAINT BULK_MAX_WAL BULK_POLL_SECS; do
+for _v in FAST_SYNC BULK_MAINT_MEM BULK_MAX_PARALLEL_MAINT BULK_MAX_WAL BULK_POLL_SECS REPLICA_SLIM_INDEXES; do
     eval "_val=\${$_v:-}"
     [ -n "$_val" ] && bulk_env="$bulk_env $_v='$_val'"
 done
