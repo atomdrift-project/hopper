@@ -298,32 +298,49 @@ fi
 
 # --- Logical replication publication ---
 #
-# Creates a publication for the samples table so replica machines can
-# subscribe for a real-time local replica (CREATE SUBSCRIPTION on the
-# subscriber). The publication is idempotent — CREATE IF NOT EXISTS isn't
-# supported for publications, so we check first.
+# Publishes the tables replica machines subscribe to for a real-time local
+# replica (CREATE SUBSCRIPTION on the subscriber). Idempotent — CREATE IF NOT
+# EXISTS isn't supported for publications, so we check first, then reconcile the
+# member set against the canonical list below.
+#
+# The canonical replicated-tables list is the single source of truth for what
+# the replica subscribes to. Adding a new replicated table (e.g. 'sightings')
+# means adding it HERE: the next deploy publishes it, and the replica healer
+# (scripts/replica/replica-heal.sh) then creates it on subscribers and REFRESHes.
+# Forgetting this step is exactly what silently broke 'sightings' — published
+# nowhere, so replication reported healthy while every reader hit "relation does
+# not exist". A table absent locally is skipped and picked up once it exists.
 
-log "Ensuring logical replication publication exists"
+log "Ensuring logical replication publication publishes the canonical table set"
 doas bastille cmd "$RUN" su -l postgres -c "
     psql -d hopper -v ON_ERROR_STOP=1 <<'SQL'
 DO \\\$\\\$
+DECLARE
+    t text;
+    replicated text[] := ARRAY['samples', 'reports', 'sample_locations', 'sightings'];
 BEGIN
+    -- Back-compat: an earlier deploy named this publication hopper_training.
     IF EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'hopper_training')
        AND NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'hopper_replica') THEN
         ALTER PUBLICATION hopper_training RENAME TO hopper_replica;
     END IF;
 
     IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'hopper_replica') THEN
-        CREATE PUBLICATION hopper_replica FOR TABLE samples;
-    ELSIF NOT EXISTS (
-        SELECT 1
-          FROM pg_publication_tables
-         WHERE pubname = 'hopper_replica'
-           AND schemaname = 'public'
-           AND tablename = 'samples'
-    ) THEN
-        ALTER PUBLICATION hopper_replica ADD TABLE samples;
+        CREATE PUBLICATION hopper_replica;
     END IF;
+
+    FOREACH t IN ARRAY replicated LOOP
+        IF EXISTS (
+            SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public' AND c.relname = t AND c.relkind = 'r'
+        ) AND NOT EXISTS (
+            SELECT 1 FROM pg_publication_tables
+             WHERE pubname = 'hopper_replica' AND schemaname = 'public' AND tablename = t
+        ) THEN
+            EXECUTE format('ALTER PUBLICATION hopper_replica ADD TABLE public.%I', t);
+            RAISE NOTICE 'added table % to publication hopper_replica', t;
+        END IF;
+    END LOOP;
 END \\\$\\\$;
 SQL
 "

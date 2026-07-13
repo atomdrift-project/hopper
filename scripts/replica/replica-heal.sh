@@ -4,32 +4,43 @@
 #
 # Logical replication does not replicate DDL, so the subscriber's apply worker
 # dies (and, with disable_on_error=true, disables the subscription) when the
-# local schema cannot accept what the publisher sends. Two such cases are safe
-# and unambiguous to reconcile against the publisher's live catalog:
+# local schema cannot accept what the publisher sends. Three such cases are
+# safe and unambiguous to reconcile against the publisher's live catalog:
 #   1. a newly ADDed published column the local table lacks; or
 #   2. a column the publisher publishes PLAIN while it is still STORED-generated
-#      locally — you cannot write a replicated value into a generated column.
-# This script restores LIVENESS by reconciling exactly those two cases, then
-# re-enables the subscription.
+#      locally — you cannot write a replicated value into a generated column; or
+#   3. a whole published table that does not exist locally at all — e.g. a table
+#      added to the publication between deploys (the gap that silently broke
+#      'sightings': published on the master, never created here, so every reader
+#      query hit "relation does not exist" while replication reported itself
+#      healthy). It is recreated from the publisher's live catalog — columns plus
+#      the primary key, which is the replica identity apply needs for streamed
+#      UPDATE/DELETE — then the subscription REFRESHes to add the relation and
+#      copy_data backfills it.
+# This script restores LIVENESS by reconciling exactly those cases, then
+# re-enables (and, for case 3, REFRESHes) the subscription.
 #
 # Design / scope (read before extending):
 #   * LIVENESS, not parity. The job is "every published column exists locally
-#     with a compatible type" so the apply worker can run. Canonical schema
-#     (indexes, constraints, NOT NULL backfills) remains 'hopper init's job at
-#     deploy time; this heal is the gap-filler between deploys. A column this
-#     script adds gets reconciled to canonical by the next 'make replica'.
-#   * BOUNDED, LOSSLESS HEALS ONLY — the two cases above, and nothing else.
-#     ADD COLUMN (nullable / non-volatile default) and ALTER COLUMN ... DROP
-#     EXPRESSION are both metadata-only fast operations that retain existing
-#     data and never rewrite the table. Real migrations — drops, renames, true
-#     type changes — are never guessed: it alerts and leaves the subscription
-#     disabled for a human + the next deploy.
+#     with a compatible type, in a table apply can write" so the worker can run.
+#     Full canonical schema (secondary indexes, CHECK/FK constraints, NOT NULL
+#     backfills) remains 'hopper init's job at deploy time; this heal is the
+#     gap-filler between deploys. What it adds — a column, or a bare table with
+#     its PK — gets reconciled to canonical by the next 'make replica'.
+#   * BOUNDED, LOSSLESS HEALS ONLY — the three cases above, and nothing else.
+#     ADD COLUMN (nullable / non-volatile default), ALTER COLUMN ... DROP
+#     EXPRESSION, and CREATE TABLE (empty, from the publisher's catalog) are all
+#     metadata-only fast operations that never rewrite or drop existing data.
+#     Real migrations — drops, renames, true type changes — are never guessed:
+#     it alerts and leaves the subscription disabled for a human + the next
+#     deploy.
 #   * VERSION-INDEPENDENT. It reads the publisher's live catalog as the source
-#     of truth (not a migration list), so it consumes any future column add —
-#     even ones newer than anything deployed here. No hopper binary required.
+#     of truth (not a migration list), so it consumes any future column or table
+#     add — even ones newer than anything deployed here. No hopper binary needed.
 #   * SAFE-BY-DEFAULT. It never disables a subscription merely because the
 #     publisher was unreachable; it never re-enables a subscription that was
-#     disabled for a non-schema reason.
+#     disabled for a non-schema reason; it only ever ADDs (never drops) to close
+#     a gap.
 #
 # Runs as the postgres superuser (local admin) on a schedule (systemd timer on
 # Linux, cron inside the FreeBSD jail). Idempotent; cheap when there's no drift.
@@ -188,6 +199,25 @@ if [ -z "$published" ]; then
     exit 1
 fi
 
+# Per published table: its primary-key DDL, reproduced from the publisher so a
+# table this script has to CREATE (case 3) gets the replica identity apply needs
+# for streamed UPDATE/DELETE. Emitted as "qt|ALTER TABLE ... ADD CONSTRAINT ...".
+# Only tables that have a PK on the publisher appear; a published table without
+# one is flagged when created (see pk_missing) rather than silently left
+# identity-less. pg_get_constraintdef renders the fully-quoted, ready-to-run def.
+published_pk=$(remote -tAF '|' -v pub="$PUBLICATION" <<'SQL' 2>/dev/null || true
+SELECT format('%I.%I', n.nspname, c.relname),
+       format('ALTER TABLE %I.%I ADD CONSTRAINT %I %s',
+              n.nspname, c.relname, con.conname, pg_get_constraintdef(con.oid))
+  FROM pg_publication_tables pt
+  JOIN pg_namespace n     ON n.nspname = pt.schemaname
+  JOIN pg_class c         ON c.relname = pt.tablename AND c.relnamespace = n.oid
+  JOIN pg_constraint con  ON con.conrelid = c.oid AND con.contype = 'p'
+ WHERE pt.pubname = :'pub'
+ ORDER BY 1;
+SQL
+)
+
 # Local table.column set (and which tables exist locally at all).
 local_cols=$(admin -d "$LOCAL_DB" -tAF '|' <<'SQL'
 SELECT format('%I.%I', n.nspname, c.relname), a.attname
@@ -216,10 +246,12 @@ SELECT format('%I.%I', n.nspname, c.relname), a.attname
 SQL
 )
 
-# Compute missing columns (and missing whole tables, which we will NOT create).
+# Compute the heals: whole tables to create (case 3), columns to add, and
+# generated->plain conversions.
+create_ddl=""         # newline-separated CREATE TABLE stubs for absent tables
+created_tables=""     # space-separated tables created locally this run
 missing_ddl=""        # newline-separated ADD COLUMN statements to run
 missing_names=""      # space-separated table.col for logging
-missing_table=""      # space-separated tables published but absent locally
 notnull_unenforced="" # space-separated table.col added nullable despite NOT NULL
 generated_ddl=""      # newline-separated DROP EXPRESSION statements to run
 generated_names=""    # space-separated table.col converted generated->plain
@@ -231,7 +263,20 @@ for line in $published; do
     col=${rest%%|*}; rest=${rest#*|}
     ddl=${rest%|*}; flag=${rest##*|}
     if ! printf '%s\n' "$local_tables" | grep -qxF "$qt"; then
-        case " $missing_table " in *" $qt "*) ;; *) missing_table="$missing_table $qt" ;; esac
+        # Whole published table absent locally (case 3). Create it empty from the
+        # publisher's catalog — once per table — then fall through so each of its
+        # published columns is added below (they read as "missing"); the PK is
+        # appended after the columns exist (see "Decide & act"). The per-column
+        # ADD COLUMN is not listed as column drift — it is implied by the table.
+        case " $created_tables " in
+            *" $qt "*) ;;
+            *)  create_ddl="${create_ddl}CREATE TABLE IF NOT EXISTS ${qt} ();
+"
+                created_tables="$created_tables $qt" ;;
+        esac
+        missing_ddl="${missing_ddl}${ddl};
+"
+        [ "$flag" = "notnull_unenforced" ] && notnull_unenforced="$notnull_unenforced $qt.$col"
         continue
     fi
     if ! printf '%s\n' "$local_cols" | grep -qxF "$qt|$col"; then
@@ -251,15 +296,28 @@ done
 IFS=$oldIFS
 
 # --- Decide & act ----------------------------------------------------------
-if [ -n "$missing_table" ]; then
-    # A whole published table is absent locally — that's hopper init's job, not
-    # an additive column fix. Refuse to guess; page a human.
-    alert warn "published table(s) absent locally:$missing_table — run 'make replica' (hopper init creates tables); subscription '$SUBSCRIPTION' left as-is (enabled=$enabled)"
-    exit 1
-fi
+# For each table we're creating, resolve its primary-key DDL (reproduced from
+# the publisher above). It runs AFTER the table's columns exist and gives the
+# new table the replica identity apply needs for streamed UPDATE/DELETE. A
+# published table with no PK on the publisher yields no line here — record it
+# (pk_missing) so a human sets a replica identity rather than us silently
+# creating a table that will re-break apply on the first UPDATE.
+pk_ddl=""
+pk_missing=""
+for qt in $created_tables; do
+    pkline=$(printf '%s\n' "$published_pk" | grep -F "$qt|" | head -n1)
+    if [ -n "$pkline" ]; then
+        pk_ddl="${pk_ddl}${pkline#*|};
+"
+    else
+        pk_missing="$pk_missing $qt"
+    fi
+done
 
-heal_ddl="${missing_ddl}${generated_ddl}"
+# Order matters: CREATE TABLE -> ADD COLUMN -> ADD PRIMARY KEY -> DROP EXPRESSION.
+heal_ddl="${create_ddl}${missing_ddl}${pk_ddl}${generated_ddl}"
 heal_names="${missing_names}${generated_names}"
+[ -n "$created_tables" ] && heal_names="$heal_names (created tables:$created_tables)"
 
 if [ -z "$heal_ddl" ]; then
     # No healable drift (no missing column, no generated-vs-published mismatch).
@@ -278,8 +336,10 @@ if [ -z "$heal_ddl" ]; then
 fi
 
 # Healable drift confirmed → heal.
+[ -n "$created_tables" ]  && log "new published table(s) on '$SUBSCRIPTION': creating locally from publisher catalog:$created_tables"
 [ -n "$missing_names" ]   && log "additive drift on '$SUBSCRIPTION': adding missing column(s):$missing_names"
 [ -n "$generated_names" ] && log "generated/plain drift on '$SUBSCRIPTION': converting to plain (DROP EXPRESSION):$generated_names"
+[ -n "$pk_missing" ]      && alert warn "created table(s) have NO primary key on the publisher:$pk_missing — apply of UPDATE/DELETE will fail until a REPLICA IDENTITY is set; run 'make replica' to apply canonical schema."
 
 # Disable during DDL so the apply worker's locks don't fight it. (If it was
 # disabled by disable_on_error, this is a no-op.)
@@ -288,9 +348,12 @@ if [ "$enabled" = "t" ]; then
     admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -c "ALTER SUBSCRIPTION $SUBSCRIPTION DISABLE;"
 fi
 
-# Apply the heal DDL with a bounded lock wait. ADD COLUMN (nullable / non-volatile
-# default) and ALTER COLUMN ... DROP EXPRESSION are both metadata-only fast ops.
-printf "SET lock_timeout = '%s';\n%s" "$HEAL_LOCK_TIMEOUT" "$heal_ddl" \
+# Apply the heal DDL atomically with a bounded lock wait. CREATE TABLE, ADD
+# COLUMN (nullable / non-volatile default), ADD PRIMARY KEY, and ALTER COLUMN
+# ... DROP EXPRESSION are all metadata-only fast, transactional ops — wrapping
+# them in one transaction means a mid-sequence failure rolls back cleanly rather
+# than leaving, say, a new table with columns but no PK for the next run to miss.
+printf "BEGIN;\nSET LOCAL lock_timeout = '%s';\n%sCOMMIT;\n" "$HEAL_LOCK_TIMEOUT" "$heal_ddl" \
     | admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
     || { alert warn "failed to apply heal DDL on '$LOCAL_DB' (lock contention or bad type?); subscription left DISABLED. DDL targeted:$heal_names"; exit 1; }
 
@@ -323,10 +386,23 @@ fi
 log "re-enabling subscription '$SUBSCRIPTION'"
 admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -c "ALTER SUBSCRIPTION $SUBSCRIPTION ENABLE;"
 
+# A table we just created is in the publication but not yet in this
+# subscription's relation set — REFRESH adds it and copy_data backfills the
+# existing rows, after which it streams. Only needed when a table was created;
+# column heals don't change the rel set, and REFRESH is cheap for tables already
+# in sync (only newly added rels are copied). Run after ENABLE so tablesync
+# starts immediately.
+if [ -n "$created_tables" ]; then
+    log "refreshing subscription to pick up new table(s):$created_tables"
+    admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
+        -c "ALTER SUBSCRIPTION $SUBSCRIPTION REFRESH PUBLICATION WITH (copy_data = true);" \
+        || { alert warn "created table(s)$created_tables locally but REFRESH PUBLICATION failed on '$SUBSCRIPTION' — run 'ALTER SUBSCRIPTION $SUBSCRIPTION REFRESH PUBLICATION' by hand to start the backfill."; exit 1; }
+fi
+
 if [ -n "$notnull_unenforced" ]; then
     alert warn "healed drift, but added these NULLABLE despite publisher NOT NULL (no reproducible default):$notnull_unenforced — run 'make replica' to apply the canonical migration/backfill."
-else
+elif [ -z "$pk_missing" ]; then
     clear_alert
 fi
-alert info "healed drift on '$SUBSCRIPTION' — columns:$heal_names; subscription re-enabled"
+alert info "healed drift on '$SUBSCRIPTION' —$heal_names; subscription re-enabled${created_tables:+ & refreshed}"
 log "done"
