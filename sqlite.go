@@ -2383,13 +2383,15 @@ func (db *DB) triageBadSQLite(ctx context.Context, limit int, f TriageFilter) ([
 }
 
 func (db *DB) triageGoodSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClauseSQLite(f)
+	extra, fargs := triageFilterClauseSQLite(f)
+	// litmusClassSQLite's two `?` (cutoff, then ceiling) come first in the SQL.
+	args := append([]any{CriticalLevel, SuspiciousCeiling}, fargs...)
 	args = append(args, limit)
 	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples
 		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = ''
-		   AND suspicious_count >= 1`+extra+`
+		   AND (max_crit >= 5 OR suspicious_count >= 2 OR `+litmusClassSQLite+` >= 1)`+extra+`
 		 ORDER BY created_at DESC, id DESC LIMIT ?`,
 		args...)
 	if err != nil {
@@ -3688,6 +3690,23 @@ func (db *DB) feedSamplesCountSQLite(ctx context.Context, q *FeedQuery) (int, er
 	return n, nil
 }
 
+// litmusClassSQLite is the SQL expression yielding a sample's criticality
+// class (0=benign, 1=suspicious, 2=hostile) — SQLite has no trigger-maintained
+// litmus_class column, so every query derives it inline. Match either schema:
+// legacy `class` field, or v6 `l`/`lvl`-derived (null is manual-mode
+// hostile/2; -1 benign/0; 0..=cutoff hostile/2; cutoff < l <= ceiling
+// suspicious/1; looser is benign/0). Consumes two `?` args, cutoff then
+// ceiling — bind them before any placeholders that appear later in the query.
+// Mirrors prism's envelopeClass, PG's feedClassExpr, and [LitmusClass]; keep
+// the group in sync.
+const litmusClassSQLite = `COALESCE(CAST(json_extract(litmus_result, '$.class') AS INTEGER), ` +
+	`CASE WHEN litmus_result IS NULL THEN 0 ` +
+	`WHEN COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) IS NULL THEN 2 ` +
+	`WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) < 0 THEN 0 ` +
+	`WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) <= ? THEN 2 ` +
+	`WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) <= ? THEN 1 ` +
+	`ELSE 0 END)`
+
 func (q *FeedQuery) whereSQLite() (where string, args []any) {
 	clauses := []string{"source = ?", "cleave_result IS NOT NULL"}
 	args = []any{q.Source}
@@ -3729,26 +3748,13 @@ func (q *FeedQuery) whereSQLite() (where string, args []any) {
 		for i := range q.LitmusClasses {
 			placeholders[i] = "?"
 		}
-		// Match either schema: legacy `class` field, or v6 `l`-derived. Mirror
-		// prism's envelopeClass / the scan query above: class first; else derive
-		// from l using the cutoff `?` and the SuspiciousCeiling `?` (null is
-		// manual-mode hostile/2; -1 benign/0; 0..=cutoff hostile/2; cutoff <
-		// l <= ceiling suspicious/1; looser is benign/0). The two `?` precede
-		// the IN(...) placeholders in the SQL, so their args are appended first,
-		// cutoff then ceiling.
+		// litmusClassSQLite's two `?` (cutoff, then ceiling) precede the
+		// IN(...) placeholders in the SQL, so their args are appended first.
 		args = append(args, q.criticalLevel(), SuspiciousCeiling)
 		for i := range q.LitmusClasses {
 			args = append(args, q.LitmusClasses[i])
 		}
-		clauses = append(clauses,
-			"COALESCE(CAST(json_extract(litmus_result, '$.class') AS INTEGER), "+
-				"CASE WHEN litmus_result IS NULL THEN 0 "+
-				"WHEN COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) IS NULL THEN 2 "+
-				"WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) < 0 THEN 0 "+
-				"WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) <= ? THEN 2 "+
-				"WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) <= ? THEN 1 "+
-				"ELSE 0 END) "+
-				"IN ("+strings.Join(placeholders, ", ")+")")
+		clauses = append(clauses, litmusClassSQLite+" IN ("+strings.Join(placeholders, ", ")+")")
 	}
 	if q.RequireLitmus {
 		clauses = append(clauses, "litmus_result IS NOT NULL")

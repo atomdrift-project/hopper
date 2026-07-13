@@ -5002,10 +5002,13 @@ func TestTriageMostRecent(t *testing.T) {
 	}
 }
 
-// TestTriageThresholds pins the detection boundaries: good/new surface any
-// sample with at least one suspicious-or-hostile finding (suspicious_count >= 1),
-// while bad surfaces samples that fall short of a confident detection — those
-// lacking either a hostile finding or a second suspicious-or-hostile finding
+// TestTriageThresholds pins the detection boundaries: good surfaces samples
+// that trip detection — a hostile finding, a second suspicious-or-hostile
+// finding, or a litmus class of suspicious or higher (max_crit >= 5 OR
+// suspicious_count >= 2 OR litmus class >= 1); new surfaces any sample with at
+// least one suspicious-or-hostile finding (suspicious_count >= 1); bad
+// surfaces samples that fall short of a confident detection — those lacking
+// either a hostile finding or a second suspicious-or-hostile finding
 // (max_crit < 5 OR suspicious_count < 2).
 func TestTriageThresholds(t *testing.T) {
 	ctx := context.Background()
@@ -5040,13 +5043,27 @@ func TestTriageThresholds(t *testing.T) {
 		return false
 	}
 
-	// good/new: a lone suspicious finding (l=4) now qualifies; a lone hostile
-	// finding (l=5) qualifies too; an all-benign sample does not.
-	goodSusp := analyze("good", 4)
+	// good: detection needs a hostile finding, a second suspicious-or-hostile
+	// finding, or a litmus class of suspicious or higher — a lone suspicious
+	// finding no longer qualifies. new: a lone suspicious finding qualifies.
+	goodLoneSusp := analyze("good", 4)
+	goodTwoSusp := analyze("good", 4, 4)
 	goodHostile := analyze("good", 5)
 	goodBenign := analyze("good", 1, 3)
 	newSusp := analyze("unknown", 4)
 	newBenign := analyze("unknown", 2)
+
+	// The litmus arm queues trait-clean good samples the litmus grid still
+	// fires on: a level within SuspiciousCeiling reads suspicious (class 1); a
+	// looser firing reads benign and does not qualify.
+	goodLitmusSusp := analyze("good", 1)
+	if err := db.UpdateLitmusResult(ctx, goodLitmusSusp, []byte(`{"l":100}`)); err != nil {
+		t.Fatalf("UpdateLitmusResult: %v", err)
+	}
+	goodLitmusBenign := analyze("good", 1)
+	if err := db.UpdateLitmusResult(ctx, goodLitmusBenign, []byte(`{"l":5000}`)); err != nil {
+		t.Fatalf("UpdateLitmusResult: %v", err)
+	}
 
 	// bad: a confident detection (hostile + a second suspicious finding) is NOT a
 	// miss; everything short of that bar is. A lone hostile finding lacks the
@@ -5061,11 +5078,11 @@ func TestTriageThresholds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TriageGood: %v", err)
 	}
-	if !has(good, goodSusp) || !has(good, goodHostile) {
-		t.Errorf("TriageGood missing suspicious/hostile sample")
+	if !has(good, goodTwoSusp) || !has(good, goodHostile) || !has(good, goodLitmusSusp) {
+		t.Errorf("TriageGood missing a detected sample")
 	}
-	if has(good, goodBenign) {
-		t.Errorf("TriageGood included an all-benign sample")
+	if has(good, goodLoneSusp) || has(good, goodBenign) || has(good, goodLitmusBenign) {
+		t.Errorf("TriageGood included an undetected sample")
 	}
 
 	gotNew, err := db.TriageNew(ctx, 100, TriageFilter{})
@@ -5104,6 +5121,29 @@ func TestTriageThresholds(t *testing.T) {
 	}
 	if has(sighted, badBenign) {
 		t.Errorf("TriageSighted included a non-sighted sample")
+	}
+}
+
+// TestLitmusClass pins the Go mirror of the SQL class derivation.
+func TestLitmusClass(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int
+	}{
+		{"", 0},                   // no litmus result
+		{`{"class":2}`, 2},        // legacy class field wins
+		{`{"class":0,"l":10}`, 0}, // ... even over a hostile-looking level
+		{`{}`, 2},                 // present envelope, no level: manual-mode hostile
+		{`{"l":-1}`, 0},           // never fires
+		{`{"l":25}`, 2},           // at the hostile cutoff (CriticalLevel)
+		{`{"l":26}`, 1},           // just past the cutoff: suspicious
+		{`{"lvl":3000}`, 1},       // at the ceiling, via the v7 'lvl' key
+		{`{"l":3001}`, 0},         // looser than SuspiciousCeiling: benign
+	}
+	for _, c := range cases {
+		if got := LitmusClass([]byte(c.in)); got != c.want {
+			t.Errorf("LitmusClass(%q) = %d, want %d", c.in, got, c.want)
+		}
 	}
 }
 

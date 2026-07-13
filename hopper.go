@@ -79,6 +79,48 @@ const CriticalLevel = 25
 // cross-repo group in sync.
 const SuspiciousCeiling = 3000
 
+// LitmusClass derives a sample's criticality class (0=benign, 1=suspicious,
+// 2=hostile) from its litmus envelope at the default [CriticalLevel] cutoff.
+// It is the Go mirror of the SQL derivation (feedClassExpr, the
+// samples_derive_litmus_cols trigger, litmusClassSQLite — keep them in sync):
+// legacy envelopes carry 'class' directly; v6/v7 use 'lvl'/'l', the strictest
+// grid level at which the file fires. A missing level on a present envelope is
+// manual-mode hostile (fail-safe); a negative level never fires (benign);
+// <= CriticalLevel is hostile; <= SuspiciousCeiling is suspicious; looser is
+// benign. A nil, empty, or unparseable result is benign.
+func LitmusClass(result []byte) int {
+	if len(result) == 0 {
+		return 0
+	}
+	var env struct {
+		Class *int `json:"class"`
+		Lvl   *int `json:"lvl"`
+		L     *int `json:"l"`
+	}
+	if json.Unmarshal(result, &env) != nil {
+		return 0
+	}
+	if env.Class != nil {
+		return *env.Class
+	}
+	lvl := env.Lvl
+	if lvl == nil {
+		lvl = env.L
+	}
+	switch {
+	case lvl == nil:
+		return 2
+	case *lvl < 0:
+		return 0
+	case *lvl <= CriticalLevel:
+		return 2
+	case *lvl <= SuspiciousCeiling:
+		return 1
+	default:
+		return 0
+	}
+}
+
 // Pool labels, ordered by precedence: bad > good > sighted > unknown.
 //
 // "sighted" is a feed claim pending verification: an external threat feed
@@ -2919,8 +2961,9 @@ func (db *DB) TriageBad(ctx context.Context, limit int, f TriageFilter) ([]*Samp
 	return db.triageBadSQLite(ctx, limit, f)
 }
 
-// TriageGood returns analyzed top-level good-labeled samples that cleave flagged
-// with at least one suspicious-or-hostile finding (suspicious_count >= 1),
+// TriageGood returns analyzed top-level good-labeled samples that trip
+// detection — a hostile trait (max_crit >= 5), a second suspicious-or-hostile
+// trait (suspicious_count >= 2), or a litmus class of suspicious or higher —
 // taking up to limit of the most recently added (created_at). No skip/status
 // filters — intended for manual triage.
 func (db *DB) TriageGood(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
