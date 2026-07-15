@@ -639,7 +639,7 @@ type WorkflowSample struct {
 type Report struct {
 	CreatedAt  time.Time
 	SHA256     string
-	Type       string // "re", "gap", "fpr"
+	Type       string // "re", "gap", "fpr", "second" (completed second-opinion review; TriageSecondOpinion anti-joins on it)
 	Content    string
 	Provider   string
 	ID         int64
@@ -3002,6 +3002,47 @@ func (db *DB) TriageSighted(ctx context.Context, limit int, f TriageFilter) ([]*
 		return db.triageSightedPG(ctx, limit, f)
 	}
 	return db.triageSightedSQLite(ctx, limit, f)
+}
+
+// TrustedBadSources are the sighting sources that independently host or curate
+// malware rather than merely predict it — forager's straight-to-bad feeds
+// (ThreatFeed Category "bad") plus the hash corpora it records via
+// RecordHashSightings. A claim from any one of them is strong enough on its own
+// to dispute a good label; vendor-prediction feeds (aikido, socket, safedep, …)
+// are not listed and only count toward the two-independent-sources bar.
+var TrustedBadSources = []string{
+	"bazaar",    // MalwareBazaar: hosts the bytes
+	"virussign", // VirusSign: hosts the bytes
+	"malshare",  // MalShare: hosts the bytes
+	"vxug",      // vx-underground: hosts the bytes
+	"osm",       // opensourcemalware.com: curated malware-report registry
+	"osv",       // OSV MAL-* advisories
+	"ghsa",      // GitHub malware advisories
+	"extsentry", // browser-extension malware registry
+	"vsxsentry", // VS Code extension malware registry
+}
+
+// TriageSecondOpinion returns analyzed top-level good-labeled samples whose
+// benign label an outside source disputes — a sighting from one of the trusted
+// sources, or sightings from two-plus distinct sources — taking up to limit of
+// the most recently added (created_at). Samples that trip detection are
+// excluded: those are exactly TriageGood's set, and keeping the two queues
+// disjoint preserves the invariant that no two triage workers ever hold the
+// same sample (they share per-sha tmp dirs); a disputed sample flows here only
+// after the good queue resolves its detection gap. Rows analyzed at or after
+// analyzedBefore are skipped (a settling window so a just-analyzed sample
+// isn't immediately second-guessed), and rows carrying a reports row of type
+// "second" are skipped permanently — recording that report is how a reviewer
+// drains the queue when the good label stands. Candidacy also requires
+// samples.corroborated, the denormalized sightings flag; a sample inserted
+// after its (unchanged) purl sighting can miss the flip and be invisible here,
+// which is accepted — the flag is the system-wide corroboration join and any
+// gap is its to heal, not this query's.
+func (db *DB) TriageSecondOpinion(ctx context.Context, limit int, trusted []string, analyzedBefore time.Time, f TriageFilter) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.triageSecondOpinionPG(ctx, limit, trusted, analyzedBefore, f)
+	}
+	return db.triageSecondOpinionSQLite(ctx, limit, trusted, analyzedBefore, f)
 }
 
 // PromotionCandidates returns up to limit top-level, unknown-labeled samples

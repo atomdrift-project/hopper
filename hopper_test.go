@@ -5180,6 +5180,137 @@ func TestTriageThresholds(t *testing.T) {
 	}
 }
 
+// TestTriageSecondOpinion pins the second-opinion candidacy rules: a
+// good-labeled sample qualifies on a trusted-source sighting or on sightings
+// from two-plus distinct sources, is deferred while its analysis is fresh, is
+// drained permanently by a reports row of type "second", and — to stay
+// disjoint from TriageGood's set — never trips detection.
+func TestTriageSecondOpinion(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	var n int
+	// analyzeLevels inserts an analyzed top-level sample with one trait per
+	// level and records the given sightings for it, in that order so
+	// AddSightings flips samples.corroborated.
+	analyzeLevels := func(label, purlBase string, levels []int, sources ...string) string {
+		n++
+		sha := fmt.Sprintf("%064x", n)
+		mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test", Label: label, LabelSource: "test", PURLBase: purlBase})
+		ts := make([]string, len(levels))
+		for i, l := range levels {
+			ts[i] = fmt.Sprintf(`{"l":%d}`, l)
+		}
+		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"apk","x":0,"dp":0,"ts":[%s]}]}`,
+			sha, strings.Join(ts, ","))
+		if err := db.UpdateCleaveResult(ctx, sha, result, nil, ""); err != nil {
+			t.Fatalf("UpdateCleaveResult: %v", err)
+		}
+		var sightings []Sighting
+		for _, src := range sources {
+			sightings = append(sightings, Sighting{Source: src, Subject: sha})
+		}
+		if len(sightings) > 0 {
+			if _, err := db.AddSightings(ctx, sightings); err != nil {
+				t.Fatalf("AddSightings: %v", err)
+			}
+		}
+		return sha
+	}
+	benign := []int{1}
+	analyze := func(label, purlBase string, sources ...string) string {
+		return analyzeLevels(label, purlBase, benign, sources...)
+	}
+
+	has := func(samples []*Sample, sha string) bool {
+		for _, s := range samples {
+			if s.SHA256 == sha {
+				return true
+			}
+		}
+		return false
+	}
+
+	trustedOne := analyze("good", "", "bazaar")
+	vendorOne := analyze("good", "", "aikido")
+	vendorTwo := analyze("good", "", "aikido", "socket")
+	unseen := analyze("good", "")
+	badTrusted := analyze("bad", "", "bazaar")
+	drained := analyze("good", "", "virussign")
+	reported := analyze("good", "", "virussign")
+	// Detection-trippers belong to TriageGood, not here (disjoint queues).
+	detectedHostile := analyzeLevels("good", "", []int{5}, "bazaar")
+	detectedTwoSusp := analyzeLevels("good", "", []int{4, 4}, "bazaar")
+
+	// A purl-cited sample qualifies via its purl_base subject.
+	purlCited := analyze("good", "pkg:npm/evil-pkg")
+	if _, err := db.AddSightings(ctx, []Sighting{{Source: "osm", Subject: "pkg:npm/evil-pkg"}}); err != nil {
+		t.Fatalf("AddSightings(purl): %v", err)
+	}
+
+	// A "second" report drains; a report of any other type does not.
+	if err := db.InsertReport(ctx, &Report{SHA256: drained, Type: "second", Provider: "claude"}); err != nil {
+		t.Fatalf("InsertReport: %v", err)
+	}
+	if err := db.InsertReport(ctx, &Report{SHA256: reported, Type: "re", Provider: "claude"}); err != nil {
+		t.Fatalf("InsertReport: %v", err)
+	}
+
+	// Every sample above was analyzed just now, so a future cutoff admits all
+	// eligible rows and a past cutoff (the settling window) admits none.
+	future := time.Now().Add(time.Hour)
+	got, err := db.TriageSecondOpinion(ctx, 100, TrustedBadSources, future, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageSecondOpinion: %v", err)
+	}
+	for _, want := range []struct {
+		name string
+		sha  string
+	}{
+		{"trusted single source", trustedOne},
+		{"two vendor sources", vendorTwo},
+		{"purl-cited trusted source", purlCited},
+		{"non-second report", reported},
+	} {
+		if !has(got, want.sha) {
+			t.Errorf("TriageSecondOpinion missing %s", want.name)
+		}
+	}
+	for _, wantNot := range []struct {
+		name string
+		sha  string
+	}{
+		{"lone vendor source", vendorOne},
+		{"no sightings", unseen},
+		{"bad-labeled", badTrusted},
+		{"second-report drained", drained},
+		{"detection-tripping (hostile trait)", detectedHostile},
+		{"detection-tripping (two suspicious)", detectedTwoSusp},
+	} {
+		if has(got, wantNot.sha) {
+			t.Errorf("TriageSecondOpinion included %s", wantNot.name)
+		}
+	}
+
+	past := time.Now().Add(-time.Hour)
+	got, err = db.TriageSecondOpinion(ctx, 100, TrustedBadSources, past, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageSecondOpinion(past): %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("TriageSecondOpinion(past cutoff) = %d rows, want 0 (settling window)", len(got))
+	}
+
+	// An empty trusted list still admits the two-source arm.
+	got, err = db.TriageSecondOpinion(ctx, 100, nil, future, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageSecondOpinion(nil trusted): %v", err)
+	}
+	if !has(got, vendorTwo) || has(got, trustedOne) {
+		t.Errorf("TriageSecondOpinion(nil trusted): want only the two-source arm, got %d rows", len(got))
+	}
+}
+
 // TestLitmusClass pins the Go mirror of the SQL class derivation.
 func TestLitmusClass(t *testing.T) {
 	cases := []struct {

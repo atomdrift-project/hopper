@@ -2431,6 +2431,48 @@ func (db *DB) triageSightedSQLite(ctx context.Context, limit int, f TriageFilter
 	return scanLiteSamples(rows)
 }
 
+// triageSecondOpinionSQLite: see TriageSecondOpinion. Mirrors
+// triageSecondOpinionPG; the trusted list expands to IN placeholders, with an
+// always-false arm when the list is empty (SQLite rejects `IN ()`).
+func (db *DB) triageSecondOpinionSQLite(
+	ctx context.Context, limit int, trusted []string, analyzedBefore time.Time, f TriageFilter,
+) ([]*Sample, error) {
+	trustedClause := "1 = 0"
+	// litmusClassSQLite's two `?` (cutoff, then ceiling) come first in the SQL.
+	args := []any{CriticalLevel, SuspiciousCeiling, analyzedBefore.UTC().Format(time.RFC3339Nano)}
+	if len(trusted) > 0 {
+		trustedClause = `EXISTS (SELECT 1 FROM sightings s
+		                WHERE (s.subject = samples.sha256
+		                       OR (samples.purl_base != '' AND s.subject = samples.purl_base))
+		                  AND s.source IN (?` + strings.Repeat(",?", len(trusted)-1) + `))`
+		for _, src := range trusted {
+			args = append(args, src)
+		}
+	}
+	extra, fargs := triageFilterClauseSQLite(f)
+	args = append(args, fargs...)
+	args = append(args, limit)
+	//nolint:gosec // G202: predicates and column list are constant; trusted expands to `?` placeholders, values are parameterized via ? args
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleCols+` FROM samples
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = ''
+		   AND corroborated = 1
+		   AND NOT (max_crit >= 5 OR suspicious_count >= 2 OR `+litmusClassSQLite+` >= 1)
+		   AND analyzed_at < ?
+		   AND (`+trustedClause+`
+		        OR (SELECT count(DISTINCT s.source) FROM sightings s
+		            WHERE s.subject = samples.sha256
+		               OR (samples.purl_base != '' AND s.subject = samples.purl_base)) >= 2)
+		   AND NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'second')`+extra+`
+		 ORDER BY created_at DESC, id DESC LIMIT ?`,
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage second opinion: %w", err)
+	}
+	return scanLiteSamples(rows)
+}
+
 func (db *DB) conflictReviewSQLite(ctx context.Context, _, limit int) ([]*Sample, error) {
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples

@@ -3071,6 +3071,40 @@ func (db *DB) triageSightedPG(ctx context.Context, limit int, f TriageFilter) ([
 	return scanPGSamples(rows)
 }
 
+// triageSecondOpinionPG: see TriageSecondOpinion. The sightings probes match a
+// sample by either subject spelling (sha256 or version-less purl_base); the
+// purl arm is guarded so a sample with no purl identity can't join sightings
+// with an empty subject. An empty trusted list simply disables that arm.
+func (db *DB) triageSecondOpinionPG(ctx context.Context, limit int, trusted []string, analyzedBefore time.Time, f TriageFilter) ([]*Sample, error) {
+	if trusted == nil {
+		trusted = []string{}
+	}
+	extra, fargs := triageFilterClausePG(f, 3)
+	args := append([]any{analyzedBefore, trusted}, fargs...)
+	args = append(args, limit)
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = ''
+		   AND corroborated
+		   AND NOT (max_crit >= 5 OR suspicious_count >= 2 OR litmus_class >= 1)
+		   AND analyzed_at < $1
+		   AND (EXISTS (SELECT 1 FROM sightings s
+		                WHERE (s.subject = samples.sha256
+		                       OR (samples.purl_base != '' AND s.subject = samples.purl_base))
+		                  AND s.source = ANY($2))
+		        OR (SELECT count(DISTINCT s.source) FROM sightings s
+		            WHERE s.subject = samples.sha256
+		               OR (samples.purl_base != '' AND s.subject = samples.purl_base)) >= 2)
+		   AND NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'second')`+extra+`
+		 ORDER BY created_at DESC, id DESC LIMIT $`+strconv.Itoa(len(args)),
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage second opinion: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
 func (db *DB) conflictReviewPG(ctx context.Context, _, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
