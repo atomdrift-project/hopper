@@ -586,11 +586,14 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			IF NEW.suspicious_count = 0 THEN
 				NEW.top_traits := '';
 			ELSE
+				-- jsonb_strip_nulls drops 'dep' for the (vast majority of)
+				-- traits that don't carry one, keeping entries at {id, crit}.
 				NEW.top_traits := COALESCE((
-					SELECT jsonb_agg(jsonb_build_object('id', q.id, 'crit', q.crit))::text
+					SELECT jsonb_agg(jsonb_strip_nulls(jsonb_build_object('id', q.id, 'crit', q.crit, 'dep', q.dep)))::text
 					FROM (
 						SELECT COALESCE(t->>'id', t->>'i') AS id,
-							   (COALESCE(t->>'crit', t->>'l'))::int AS crit
+							   (COALESCE(t->>'crit', t->>'l'))::int AS crit,
+							   t->'dep' AS dep
 						FROM jsonb_array_elements(finds) WITH ORDINALITY AS f(t, ord)
 						WHERE COALESCE(t->>'crit', t->>'l') IS NOT NULL
 							AND (COALESCE(t->>'crit', t->>'l'))::int >= 4
@@ -4135,10 +4138,11 @@ func (db *DB) backfillTopTraitsPG(ctx context.Context, limit int) (int64, error)
 	for {
 		tag, err := db.pool.Exec(ctx, `
 			UPDATE samples SET top_traits = COALESCE((
-				SELECT jsonb_agg(jsonb_build_object('id', q.id, 'crit', q.crit))::text
+				SELECT jsonb_agg(jsonb_strip_nulls(jsonb_build_object('id', q.id, 'crit', q.crit, 'dep', q.dep)))::text
 				FROM (
 					SELECT COALESCE(t->>'id', t->>'i') AS id,
-						   (COALESCE(t->>'crit', t->>'l'))::int AS crit
+						   (COALESCE(t->>'crit', t->>'l'))::int AS crit,
+						   t->'dep' AS dep
 					FROM jsonb_array_elements(
 						COALESCE(cleave_result->'files'->0->'traits', cleave_result->'files'->0->'find', cleave_result->'fs'->0->'ts', '[]'::jsonb)
 					) WITH ORDINALITY AS f(t, ord)

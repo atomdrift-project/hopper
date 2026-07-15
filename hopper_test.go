@@ -3842,6 +3842,62 @@ func TestParseCleaveResultV7KeepsMetadata(t *testing.T) {
 	}
 }
 
+// A fetch/dependency-verdict trait carries a machine-readable dep object
+// ({locator, sha, type}) that must ride through into top_traits verbatim —
+// hopper is a pass-through; scan produces the shape and prism consumes it.
+// Traits without a dep must stay bare {id, crit}, exactly as before.
+func TestParseCleaveResultForwardsDependencyIdentity(t *testing.T) {
+	depSHA := strings.Repeat("d", 64)
+	result := []byte(`{"rev":"abcde","files":[{"sha":"aaa","type":"gzip","mol":"O₂","risk":40,"depth":0,"traits":[
+		{"id":"fetch/dependency-verdict","crit":5,"desc":"Malicious dependency: pkg:npm/zaboodle@1.49 | ` + depSHA + `","dep":{"locator":"pkg:npm/zaboodle@1.49","sha":"` + depSHA + `","type":"javascript"}},
+		{"id":"micro-behaviors/net/beacon","crit":4}]}]}`)
+	parsed := ParseCleaveResult("aaa", result)
+
+	var top []TopTrait
+	if err := json.Unmarshal([]byte(parsed.FileInfo.TopTraits), &top); err != nil {
+		t.Fatalf("top_traits does not parse: %v (%q)", err, parsed.FileInfo.TopTraits)
+	}
+	if len(top) != 2 {
+		t.Fatalf("expected 2 top traits, got %d: %q", len(top), parsed.FileInfo.TopTraits)
+	}
+
+	var dep struct {
+		Locator string `json:"locator"`
+		SHA     string `json:"sha"`
+		Type    string `json:"type"`
+	}
+	if err := json.Unmarshal(top[0].Dep, &dep); err != nil {
+		t.Fatalf("dep does not parse: %v (%q)", err, top[0].Dep)
+	}
+	if dep.Locator != "pkg:npm/zaboodle@1.49" || dep.SHA != depSHA || dep.Type != "javascript" {
+		t.Errorf("dep = %+v, want the scan-emitted identity verbatim", dep)
+	}
+
+	// The ordinary trait stays bare: no dep key at all, not "dep":null.
+	if top[1].Dep != nil {
+		t.Errorf("non-dependency trait must carry no dep, got %q", top[1].Dep)
+	}
+	if strings.Contains(parsed.FileInfo.TopTraits, `"dep":null`) {
+		t.Errorf("encoded top_traits must omit absent deps, got %q", parsed.FileInfo.TopTraits)
+	}
+}
+
+// Rows scanned before scan emitted dep (or hopper learned the field) decode
+// into a TopTrait with a nil Dep — the consumer's fallback-to-generic-chip
+// path — and old bare entries re-encode without inventing a dep key.
+func TestTopTraitsDependencyIdentityBackwardCompat(t *testing.T) {
+	var top []TopTrait
+	if err := json.Unmarshal([]byte(`[{"id":"fetch/dependency-verdict","crit":5}]`), &top); err != nil {
+		t.Fatal(err)
+	}
+	if top[0].Dep != nil {
+		t.Errorf("pre-dep row must decode to nil Dep, got %q", top[0].Dep)
+	}
+	if got := encodeTopTraits(top); got != `[{"id":"fetch/dependency-verdict","crit":5}]` {
+		t.Errorf("re-encode must stay bare, got %q", got)
+	}
+}
+
 func TestUpdateCleaveResultSetsFormulaAndScore(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
