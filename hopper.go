@@ -1351,6 +1351,22 @@ func (db *DB) ReapStuck(ctx context.Context) (int64, error) {
 	return db.reapStuckSQLite(ctx, maxClaimAttempts)
 }
 
+// MaxJobBytes is the largest sample any scan worker will analyze (workers
+// advertise the same value as max_bytes on /api/next and reject anything
+// larger). Kept in sync with MAX_JOB_BYTES in scan's worker.
+const MaxJobBytes = 16 * 1024 * 1024 * 1024
+
+// ReapOversized marks pending samples larger than MaxJobBytes as
+// skip='oversized'. Every worker filters its claims to max_bytes ≤ MaxJobBytes,
+// so such samples would otherwise sit in the pending pool forever without ever
+// being handed out. Returns the number reaped.
+func (db *DB) ReapOversized(ctx context.Context) (int64, error) {
+	if db.pool != nil {
+		return db.reapOversizedPG(ctx, MaxJobBytes)
+	}
+	return db.reapOversizedSQLite(ctx, MaxJobBytes)
+}
+
 // SampleLocationKey identifies one (sha256, path) standalone file.
 type SampleLocationKey struct {
 	SHA256 string

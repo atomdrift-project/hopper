@@ -1560,6 +1560,42 @@ func TestReapStuckSamples(t *testing.T) {
 	}
 }
 
+func TestReapOversizedSamples(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// huge: bigger than any worker's advertised cap → reaped.
+	mustInsert(t, ctx, db, &Sample{SHA256: "huge", Source: "test", Label: "unknown", LabelSource: "test", SizeBytes: MaxJobBytes + 1})
+	// fits: exactly at the cap → left alone (workers accept it).
+	mustInsert(t, ctx, db, &Sample{SHA256: "fits", Source: "test", Label: "unknown", LabelSource: "test", SizeBytes: MaxJobBytes})
+	// bigdone: oversized but already analyzed → never reaped.
+	mustInsert(t, ctx, db, &Sample{SHA256: "bigdone", Source: "test", Label: "unknown", LabelSource: "test", SizeBytes: MaxJobBytes + 1})
+	mustAnalyze(t, ctx, db, "bigdone", 1)
+
+	n, err := db.ReapOversized(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("ReapOversized reaped %d, want 1 (only the pending oversized sample)", n)
+	}
+
+	if got := skipOf(t, ctx, db, "huge"); got != "oversized" {
+		t.Errorf("huge skip = %q, want %q", got, "oversized")
+	}
+	if got := skipOf(t, ctx, db, "fits"); got != "" {
+		t.Errorf("fits skip = %q, want empty (at the cap, still claimable)", got)
+	}
+	if got := skipOf(t, ctx, db, "bigdone"); got != "" {
+		t.Errorf("bigdone skip = %q, want empty (analyzed rows are never reaped)", got)
+	}
+
+	// Idempotent: a second pass finds nothing new.
+	if n, err := db.ReapOversized(ctx); err != nil || n != 0 {
+		t.Fatalf("second ReapOversized = (%d, %v), want (0, nil)", n, err)
+	}
+}
+
 func TestSetNote(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()

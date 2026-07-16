@@ -1999,6 +1999,11 @@ func runQueueMaintenance(
 		} else if n > 0 {
 			slog.Info("reaped stuck samples", "count", n, "max_attempts", hopper.MaxClaimAttempts)
 		}
+		if n, err := db.ReapOversized(ctx); err != nil {
+			slog.Warn("reap oversized samples failed", "error", err)
+		} else if n > 0 {
+			slog.Info("reaped oversized samples", "count", n, "max_job_bytes", int64(hopper.MaxJobBytes))
+		}
 		if metrics != nil {
 			sampleQueueMetrics(ctx, db, progress, metrics, traitsVersion, rescanAge, retention)
 		}

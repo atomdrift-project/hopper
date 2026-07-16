@@ -1350,6 +1350,8 @@ func TestClassifyResultError(t *testing.T) {
 		{"decode depth guard", "cleave analysis of x.gz: Maximum decode depth 8 exceeded", "oversized", true},
 		{"file count limit", "file count limit exceeded", "oversized", true},
 		{"zip bomb", "Archive has suspicious compression ratio (potential zip bomb)", "oversized", true},
+		{"worker size cap", "file size 17179869185 exceeds per-job cap of 17179869184 bytes", "oversized", true},
+		{"legacy prefetch cap", "file size 1359668904 exceeds per-job prefetch cap of 536870912 bytes", "oversized", true},
 		{"corrupt gzip", "cleave analysis of x.tar.gz: Failed to read tar entry: invalid gzip header", "corrupt", true},
 		{"missing", "Path does not exist", "missing", true},
 		// Load-shedding must stay retryable: the same input succeeds once capacity frees up.

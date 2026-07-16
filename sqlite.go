@@ -3335,6 +3335,22 @@ func (db *DB) reapStuckSQLite(ctx context.Context, maxAttempts int) (int64, erro
 	return n, nil
 }
 
+// reapOversizedSQLite mirrors reapOversizedPG.
+func (db *DB) reapOversizedSQLite(ctx context.Context, maxBytes int64) (int64, error) {
+	ts := now()
+	res, err := db.lite.ExecContext(ctx, `
+		UPDATE samples SET skip = 'oversized', skipped_at = ?, updated_at = ?
+		WHERE cleave_result IS NULL AND skip = '' AND size_bytes > ?`, ts, ts, maxBytes)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: reap oversized: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("hopper: reap oversized rows: %w", err)
+	}
+	return n, nil
+}
+
 func (db *DB) startWalkStagingSQLite(ctx context.Context) error {
 	if _, err := db.lite.ExecContext(ctx, `DELETE FROM walk_staging`); err != nil {
 		return fmt.Errorf("hopper: clear walk staging: %w", err)

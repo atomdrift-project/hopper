@@ -2714,7 +2714,12 @@ func classifyResultError(errMsg string) (string, bool) {
 		strings.Contains(errMsg, "file count limit exceeded"),
 		strings.Contains(errMsg, "Maximum archive depth"),
 		strings.Contains(errMsg, "Maximum decode depth"),
-		strings.Contains(errMsg, "potential zip bomb"):
+		strings.Contains(errMsg, "potential zip bomb"),
+		// Worker size-cap rejections: current workers say "exceeds per-job
+		// cap", pre-spool workers said "exceeds per-job prefetch cap". Both
+		// are deterministic for a given file size, so re-queuing only bounces
+		// the sample between hopper and the worker until the reaper gives up.
+		strings.Contains(errMsg, "exceeds per-job"):
 		// Deterministic analysis-guard trips (file count, archive/decode depth,
 		// total extraction size, decompression bomb). The same input always
 		// blows the same guard, so re-queuing only burns worker capacity until

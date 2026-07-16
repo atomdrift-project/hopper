@@ -4451,6 +4451,18 @@ func (db *DB) reapStuckPG(ctx context.Context, maxAttempts int) (int64, error) {
 	return tag.RowsAffected(), nil
 }
 
+// reapOversizedPG marks pending samples no worker will ever claim (larger than
+// the advertised per-job cap) as skip='oversized'. See ReapOversized.
+func (db *DB) reapOversizedPG(ctx context.Context, maxBytes int64) (int64, error) {
+	tag, err := db.pool.Exec(ctx, `
+		UPDATE samples SET skip = 'oversized', skipped_at = now(), updated_at = now()
+		WHERE cleave_result IS NULL AND skip = '' AND size_bytes > $1`, maxBytes)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: reap oversized: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (db *DB) startWalkStagingPG(ctx context.Context) error {
 	if _, err := db.pool.Exec(ctx, `TRUNCATE walk_staging`); err != nil {
 		return fmt.Errorf("hopper: clear walk staging: %w", err)
