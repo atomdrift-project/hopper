@@ -3048,8 +3048,10 @@ var TrustedBadSources = []string{
 // after the good queue resolves its detection gap. Rows analyzed at or after
 // analyzedBefore are skipped (a settling window so a just-analyzed sample
 // isn't immediately second-guessed), and rows carrying a reports row of type
-// "second" are skipped permanently — recording that report is how a reviewer
-// drains the queue when the good label stands. Candidacy also requires
+// "second" newer than the newest trusted sighting are skipped — recording that
+// report is how a reviewer drains the queue when the good label stands, and a
+// trusted source citing the sample AFTER its review is new evidence that
+// re-admits it for one more pass. Candidacy also requires
 // samples.corroborated, the denormalized sightings flag; a sample inserted
 // after its (unchanged) purl sighting can miss the flip and be invisible here,
 // which is accepted — the flag is the system-wide corroboration join and any
@@ -3059,6 +3061,26 @@ func (db *DB) TriageSecondOpinion(ctx context.Context, limit int, trusted []stri
 		return db.triageSecondOpinionPG(ctx, limit, trusted, analyzedBefore, f)
 	}
 	return db.triageSecondOpinionSQLite(ctx, limit, trusted, analyzedBefore, f)
+}
+
+// TriageAcquit returns analyzed top-level bad-labeled samples whose conviction
+// no outside evidence supports: the sample carries a provenance sidecar (a
+// collector fetched it — walked-in dataset corpora have none) with no
+// threat-feed record (nothing told us to download it as malware), and no
+// sighting has ever cited its sha256 or purl_base. Only confidently-detected
+// rows qualify (max_crit >= 5 AND suspicious_count >= 2) — the complement is
+// TriageBad's set, and the disjointness keeps any sample out of two workers at
+// once. Rows created at or after createdBefore are skipped (a grace window so
+// feeds have time to corroborate a fresh conviction), conflict rows are
+// skipped (pool reconciliation owns their label; a ruling would be flipped
+// right back), and rows carrying a reports row of type "acquit" are skipped
+// permanently — recording that report is how a reviewer drains the queue when
+// the conviction stands.
+func (db *DB) TriageAcquit(ctx context.Context, limit int, createdBefore time.Time, f TriageFilter) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.triageAcquitPG(ctx, limit, createdBefore, f)
+	}
+	return db.triageAcquitSQLite(ctx, limit, createdBefore, f)
 }
 
 // PromotionCandidates returns up to limit top-level, unknown-labeled samples

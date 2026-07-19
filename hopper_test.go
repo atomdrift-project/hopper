@@ -5347,6 +5347,168 @@ func TestTriageSecondOpinion(t *testing.T) {
 	}
 }
 
+// TestTriageSecondOpinionEvidenceRefresh pins the re-admission rule: a
+// "second" report drains only while it is newer than the newest trusted
+// sighting; a trusted source citing the sample after its review re-admits it,
+// an untrusted one does not.
+func TestTriageSecondOpinionEvidenceRefresh(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	sha := fmt.Sprintf("%064x", 7777)
+	mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test", Label: "good", LabelSource: "test"})
+	result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"apk","x":0,"dp":0,"ts":[{"l":1}]}]}`, sha)
+	if err := db.UpdateCleaveResult(ctx, sha, result, nil, ""); err != nil {
+		t.Fatalf("UpdateCleaveResult: %v", err)
+	}
+	if _, err := db.AddSightings(ctx, []Sighting{{Source: "bazaar", Subject: sha}}); err != nil {
+		t.Fatalf("AddSightings: %v", err)
+	}
+
+	future := time.Now().Add(time.Hour)
+	selected := func(want bool, when string) {
+		t.Helper()
+		got, err := db.TriageSecondOpinion(ctx, 100, TrustedBadSources, future, TriageFilter{})
+		if err != nil {
+			t.Fatalf("TriageSecondOpinion (%s): %v", when, err)
+		}
+		found := false
+		for _, s := range got {
+			if s.SHA256 == sha {
+				found = true
+			}
+		}
+		if found != want {
+			t.Errorf("%s: selected = %v, want %v", when, found, want)
+		}
+	}
+
+	selected(true, "before any review")
+
+	// Report newer than the sighting → drained. (Sleeps order the ISO-8601
+	// text timestamps, which have millisecond resolution in SQLite.)
+	time.Sleep(5 * time.Millisecond)
+	if err := db.InsertReport(ctx, &Report{SHA256: sha, Type: "second", Provider: "claude"}); err != nil {
+		t.Fatalf("InsertReport: %v", err)
+	}
+	selected(false, "after review")
+
+	// An untrusted sighting arriving after the review is not new evidence.
+	time.Sleep(5 * time.Millisecond)
+	if _, err := db.AddSightings(ctx, []Sighting{{Source: "aikido", Subject: sha}}); err != nil {
+		t.Fatalf("AddSightings(aikido): %v", err)
+	}
+	selected(false, "after untrusted sighting")
+
+	// A trusted sighting arriving after the review re-admits the sample…
+	if _, err := db.AddSightings(ctx, []Sighting{{Source: "virussign", Subject: sha}}); err != nil {
+		t.Fatalf("AddSightings(virussign): %v", err)
+	}
+	selected(true, "after new trusted sighting")
+
+	// …until the follow-up review drains it again.
+	time.Sleep(5 * time.Millisecond)
+	if err := db.InsertReport(ctx, &Report{SHA256: sha, Type: "second", Provider: "claude"}); err != nil {
+		t.Fatalf("InsertReport(2): %v", err)
+	}
+	selected(false, "after follow-up review")
+}
+
+// TestTriageAcquit pins the acquit candidacy rules: a bad-labeled,
+// confidently-detected sample with a non-feed provenance sidecar and no
+// sighting from anyone qualifies; feed-discovered, cited, provenance-less,
+// detection-gap, conflict, young, and acquit-reported rows do not.
+func TestTriageAcquit(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	registryProv := []byte(`{"schema_version":"1","artifact":{"sha256":"x"},"fetch":{"category":"good"}}`)
+	feedProv := []byte(`{"schema_version":"1","artifact":{"sha256":"x"},"fetch":{"category":"bad"},"feed":{"collector":"bazaar","category":"bad"}}`)
+
+	var n int
+	analyze := func(label string, prov []byte, levels []int, sources ...string) string {
+		n++
+		sha := fmt.Sprintf("%063x1", n)
+		mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test", Label: label, LabelSource: "test", Provenance: prov})
+		ts := make([]string, len(levels))
+		for i, l := range levels {
+			ts[i] = fmt.Sprintf(`{"l":%d}`, l)
+		}
+		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"apk","x":0,"dp":0,"ts":[%s]}]}`,
+			sha, strings.Join(ts, ","))
+		if err := db.UpdateCleaveResult(ctx, sha, result, nil, ""); err != nil {
+			t.Fatalf("UpdateCleaveResult: %v", err)
+		}
+		var sightings []Sighting
+		for _, src := range sources {
+			sightings = append(sightings, Sighting{Source: src, Subject: sha})
+		}
+		if len(sightings) > 0 {
+			if _, err := db.AddSightings(ctx, sightings); err != nil {
+				t.Fatalf("AddSightings: %v", err)
+			}
+		}
+		return sha
+	}
+	detected := []int{5, 4} // hostile + a second suspicious finding
+
+	uncited := analyze("bad", registryProv, detected)
+	reported := analyze("bad", registryProv, detected)
+	feedBorn := analyze("bad", feedProv, detected)
+	noProv := analyze("bad", nil, detected)
+	cited := analyze("bad", registryProv, detected, "aikido")
+	gap := analyze("bad", registryProv, []int{5}) // lone hostile: TriageBad's set
+	goodRow := analyze("good", registryProv, detected)
+	conflicted := analyze("bad", registryProv, detected)
+	if err := db.SetSkip(ctx, conflicted, "conflict"); err != nil {
+		t.Fatalf("SetSkip: %v", err)
+	}
+	// A non-acquit report does not drain; an acquit report does.
+	if err := db.InsertReport(ctx, &Report{SHA256: uncited, Type: "second", Provider: "claude"}); err != nil {
+		t.Fatalf("InsertReport(second): %v", err)
+	}
+	if err := db.InsertReport(ctx, &Report{SHA256: reported, Type: "acquit", Provider: "claude"}); err != nil {
+		t.Fatalf("InsertReport(acquit): %v", err)
+	}
+
+	got, err := db.TriageAcquit(ctx, 100, time.Now().Add(time.Hour), TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageAcquit: %v", err)
+	}
+	selected := map[string]bool{}
+	for _, s := range got {
+		selected[s.SHA256] = true
+	}
+	if !selected[uncited] {
+		t.Error("TriageAcquit missing the qualifying uncited sample")
+	}
+	for _, tc := range []struct {
+		name string
+		sha  string
+	}{
+		{"feed-discovered provenance", feedBorn},
+		{"no provenance sidecar", noProv},
+		{"cited by a source", cited},
+		{"detection-gap (bad queue's set)", gap},
+		{"good-labeled", goodRow},
+		{"conflict-skipped", conflicted},
+		{"acquit-reported", reported},
+	} {
+		if selected[tc.sha] {
+			t.Errorf("TriageAcquit included %s", tc.name)
+		}
+	}
+
+	// The grace window: a past cutoff excludes everything created since.
+	got, err = db.TriageAcquit(ctx, 100, time.Now().Add(-time.Hour), TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageAcquit(past): %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("TriageAcquit(past cutoff) = %d rows, want 0 (grace window)", len(got))
+	}
+}
+
 // TestLitmusClass pins the Go mirror of the SQL class derivation.
 func TestLitmusClass(t *testing.T) {
 	cases := []struct {

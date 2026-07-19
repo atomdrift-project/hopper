@@ -2438,13 +2438,32 @@ func (db *DB) triageSecondOpinionSQLite(
 	ctx context.Context, limit int, trusted []string, analyzedBefore time.Time, f TriageFilter,
 ) ([]*Sample, error) {
 	trustedClause := "1 = 0"
+	// With no trusted sources there can be no trusted-sighting timestamps, so
+	// any 'second' report drains permanently.
+	refreshClause := `NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'second')`
 	// litmusClassSQLite's two `?` (cutoff, then ceiling) come first in the SQL.
 	args := []any{CriticalLevel, SuspiciousCeiling, analyzedBefore.UTC().Format(time.RFC3339Nano)}
 	if len(trusted) > 0 {
+		in := "(?" + strings.Repeat(",?", len(trusted)-1) + ")"
 		trustedClause = `EXISTS (SELECT 1 FROM sightings s
 		                WHERE (s.subject = samples.sha256
 		                       OR (samples.purl_base != '' AND s.subject = samples.purl_base))
-		                  AND s.source IN (?` + strings.Repeat(",?", len(trusted)-1) + `))`
+		                  AND s.source IN ` + in + `)`
+		for _, src := range trusted {
+			args = append(args, src)
+		}
+		// A report only drains while it is newer than the newest trusted
+		// sighting; a trusted source citing the sample after its review is new
+		// evidence that re-admits it. Timestamps are ISO-8601 text in SQLite,
+		// so string comparison orders correctly and '' is older than any.
+		refreshClause = `NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'second'
+		                     AND r.created_at > COALESCE(
+		                       (SELECT max(s2.first_seen) FROM sightings s2
+		                        WHERE (s2.subject = samples.sha256
+		                               OR (samples.purl_base != '' AND s2.subject = samples.purl_base))
+		                          AND s2.source IN ` + in + `), ''))`
 		for _, src := range trusted {
 			args = append(args, src)
 		}
@@ -2463,12 +2482,40 @@ func (db *DB) triageSecondOpinionSQLite(
 		        OR (SELECT count(DISTINCT s.source) FROM sightings s
 		            WHERE s.subject = samples.sha256
 		               OR (samples.purl_base != '' AND s.subject = samples.purl_base)) >= 2)
-		   AND NOT EXISTS (SELECT 1 FROM reports r
-		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'second')`+extra+`
+		   AND `+refreshClause+extra+`
 		 ORDER BY created_at DESC, id DESC LIMIT ?`,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage second opinion: %w", err)
+	}
+	return scanLiteSamples(rows)
+}
+
+// triageAcquitSQLite: see TriageAcquit. Mirrors triageAcquitPG; the provenance
+// tests use the JSON1 functions over the TEXT sidecar column.
+func (db *DB) triageAcquitSQLite(ctx context.Context, limit int, createdBefore time.Time, f TriageFilter) ([]*Sample, error) {
+	extra, fargs := triageFilterClauseSQLite(f)
+	args := append([]any{createdBefore.UTC().Format(time.RFC3339Nano)}, fargs...)
+	args = append(args, limit)
+	//nolint:gosec // G202: predicates and column list are constant; filter values are parameterized via ? args
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleCols+` FROM samples
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = ''
+		   AND skip != 'conflict' AND label_source != 'conflict'
+		   AND max_crit >= 5 AND suspicious_count >= 2
+		   AND created_at < ?
+		   AND provenance IS NOT NULL AND json_valid(provenance)
+		   AND json_type(provenance) = 'object'
+		   AND json_extract(provenance, '$.feed') IS NULL
+		   AND NOT EXISTS (SELECT 1 FROM sightings s
+		                   WHERE s.subject = samples.sha256
+		                      OR (samples.purl_base != '' AND s.subject = samples.purl_base))
+		   AND NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'acquit')`+extra+`
+		 ORDER BY created_at DESC, id DESC LIMIT ?`,
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage acquit: %w", err)
 	}
 	return scanLiteSamples(rows)
 }

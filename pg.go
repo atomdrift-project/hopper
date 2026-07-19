@@ -3096,11 +3096,44 @@ func (db *DB) triageSecondOpinionPG(ctx context.Context, limit int, trusted []st
 		            WHERE s.subject = samples.sha256
 		               OR (samples.purl_base != '' AND s.subject = samples.purl_base)) >= 2)
 		   AND NOT EXISTS (SELECT 1 FROM reports r
-		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'second')`+extra+`
+		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'second'
+		                     AND r.created_at > COALESCE(
+		                       (SELECT max(s2.first_seen) FROM sightings s2
+		                        WHERE (s2.subject = samples.sha256
+		                               OR (samples.purl_base != '' AND s2.subject = samples.purl_base))
+		                          AND s2.source = ANY($2)),
+		                       '-infinity'::timestamptz))`+extra+`
 		 ORDER BY created_at DESC, id DESC LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage second opinion: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
+// triageAcquitPG: see TriageAcquit. jsonb operators express the provenance
+// tests directly: a sidecar object exists and carries no 'feed' key.
+func (db *DB) triageAcquitPG(ctx context.Context, limit int, createdBefore time.Time, f TriageFilter) ([]*Sample, error) {
+	extra, fargs := triageFilterClausePG(f, 2)
+	args := append([]any{createdBefore}, fargs...)
+	args = append(args, limit)
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = ''
+		   AND skip != 'conflict' AND label_source != 'conflict'
+		   AND max_crit >= 5 AND suspicious_count >= 2
+		   AND created_at < $1
+		   AND provenance IS NOT NULL AND jsonb_typeof(provenance) = 'object'
+		   AND NOT provenance ? 'feed'
+		   AND NOT EXISTS (SELECT 1 FROM sightings s
+		                   WHERE s.subject = samples.sha256
+		                      OR (samples.purl_base != '' AND s.subject = samples.purl_base))
+		   AND NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'acquit')`+extra+`
+		 ORDER BY created_at DESC, id DESC LIMIT $`+strconv.Itoa(len(args)),
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage acquit: %w", err)
 	}
 	return scanPGSamples(rows)
 }
