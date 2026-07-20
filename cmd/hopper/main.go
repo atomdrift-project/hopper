@@ -2890,12 +2890,26 @@ func attachSidecarProvenance(s *hopper.Sample, artifactPath string) {
 	}
 	s.Provenance = data
 	var meta struct {
+		Artifact struct {
+			Filename string `json:"filename"`
+			SHA256   string `json:"sha256"`
+		} `json:"artifact"`
 		Fetch struct {
 			At time.Time `json:"at"`
 		} `json:"fetch"`
 	}
-	if err := json.Unmarshal(data, &meta); err == nil && !meta.Fetch.At.IsZero() {
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return
+	}
+	if !meta.Fetch.At.IsZero() {
 		s.FetchedAt = &meta.Fetch.At
+	}
+	// Prefer the producer's recorded filename over the on-disk basename: it is
+	// the original upstream name (e.g. "k.php"), immune to a transient sha-named
+	// copy a relocation may leave beside the sample. The sha256 binds the sidecar
+	// to these exact bytes, so adopt the name only when it matches what we hashed.
+	if meta.Artifact.Filename != "" && strings.EqualFold(meta.Artifact.SHA256, s.SHA256) {
+		s.Filename = meta.Artifact.Filename
 	}
 }
 

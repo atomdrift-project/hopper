@@ -1677,6 +1677,10 @@ var sampleConflictUpdatePG = `ON CONFLICT (sha256) DO UPDATE SET
 	feed  = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE samples.feed END,
 	ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE samples.ecosystem END,
 	path  = CASE WHEN EXCLUDED.path  <> ''   THEN EXCLUDED.path  ELSE samples.path  END,
+	-- Track filename with path: a walk that relocates the bytes also renames the
+	-- display name, so a stale sha-named filename (left by a relocation transient)
+	-- heals to the current on-disk / sidecar-recorded name.
+	filename = CASE WHEN EXCLUDED.path <> '' THEN EXCLUDED.filename ELSE samples.filename END,
 	mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END,
 	url     = CASE WHEN samples.url     = '' THEN EXCLUDED.url     ELSE samples.url     END,
 	domain  = CASE WHEN samples.domain  = '' THEN EXCLUDED.domain  ELSE samples.domain  END,

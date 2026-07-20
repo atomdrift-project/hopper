@@ -952,6 +952,10 @@ var sampleConflictUpdateSQLite = `ON CONFLICT (sha256) DO UPDATE SET
 	feed  = CASE WHEN excluded.feed  != '' THEN excluded.feed  ELSE samples.feed  END,
 	ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE samples.ecosystem END,
 	path  = CASE WHEN excluded.path  != ''   THEN excluded.path  ELSE samples.path  END,
+	-- Track filename with path (SQLite twin of the PG clause): a relocation that
+	-- moves the bytes also renames the display name, so a stale sha-named
+	-- filename heals to the current on-disk / sidecar-recorded name.
+	filename = CASE WHEN excluded.path != '' THEN excluded.filename ELSE samples.filename END,
 	mtime = CASE WHEN excluded.mtime IS NOT NULL THEN excluded.mtime ELSE samples.mtime END,
 	url     = CASE WHEN samples.url     = '' THEN excluded.url     ELSE samples.url     END,
 	domain  = CASE WHEN samples.domain  = '' THEN excluded.domain  ELSE samples.domain  END,
