@@ -587,6 +587,44 @@ type SampleLocation struct {
 	ID        int64
 }
 
+// Rel is the edge type from a sample to its parent, mirroring cleave's `rel`.
+// It answers one question: does the parent *contain* these bytes, or did it
+// merely *point at* them?
+//
+// The two are routinely conflated, and every consequence of that is a bug. A
+// contained member can be recovered from its parent's bytes and shares its
+// provenance. A referenced artifact was fetched from somewhere else entirely —
+// it carries its own identity, its own verdict, and is inside nothing.
+type Rel string
+
+const (
+	// RelContained is an ordinary archive member: the parent's bytes contain it.
+	RelContained Rel = ""
+	// RelUnpacked is a transform product (decompressed, decoded, unpacked) —
+	// derived from the parent's bytes, so still recoverable from them.
+	RelUnpacked Rel = "unpacked"
+	// RelFetched is content retrieved over the network from a locator the parent
+	// declares. Never inside the parent.
+	RelFetched Rel = "fetched"
+	// RelRegistry is a provenance sidecar *about* the parent — a registry record,
+	// not content the parent contains.
+	RelRegistry Rel = "registry"
+)
+
+// IsContainment reports whether this edge claims the parent's bytes contain (or
+// derive) the child's. Only a containment edge licenses the things containment
+// implies: reassembling the child from its parent, inheriting the parent's
+// label, or describing the child as "found in" that archive. A reference edge
+// makes no such claim.
+func (r Rel) IsContainment() bool {
+	return r == RelContained || r == RelUnpacked
+}
+
+// containmentRelsSQL is [Rel.IsContainment] as a SQL literal list, for queries
+// that must make the same distinction. TestContainmentRelsSQLMatchesPredicate
+// asserts the two agree, so neither can drift.
+const containmentRelsSQL = `('', 'unpacked')`
+
 // WorkflowSnapshot is the compact operational view used by Hopper dashboards.
 type WorkflowSnapshot struct {
 	Health        WorkflowHealth
@@ -1982,12 +2020,37 @@ func (db *DB) SetProvenance(ctx context.Context, s *Sample) (bool, error) {
 	return db.setProvenanceSQLite(ctx, s)
 }
 
-// KnownSHA256 returns the subset of the given digests that already have a
-// sample row. It is a deliberately minimal existence probe — a single
-// index-only scan of the unique sha256 key, hydrating no row data — so a bulk
-// producer (a remote forager) can skip transferring bytes hopper already holds.
-// Order is unspecified; treat the result as a set. Callers must bound the input
-// size; the API edge caps it.
+// knownRetrievableSQL narrows a sha match to the rows whose bytes hopper can
+// actually produce. Shared by both backends so the two can never disagree about
+// what "known" means; appended to a query whose samples table is aliased `s`.
+const knownRetrievableSQL = `
+	  AND s.path <> ''
+	  AND s.skip <> 'missing'
+	  AND (s.parent = '' OR EXISTS (
+	        SELECT 1 FROM sample_locations sl
+	         WHERE sl.sha256 = s.sha256
+	           AND sl.parent_sha256 <> ''
+	           AND sl.rel IN ` + containmentRelsSQL + `))`
+
+// KnownSHA256 returns the subset of the given digests whose bytes hopper can
+// actually produce, so a bulk producer (a remote forager, a scanner) skips
+// transferring only what hopper genuinely holds. Order is unspecified; treat
+// the result as a set. Callers must bound the input size; the API edge caps it.
+//
+// "Known" means retrievable, not merely present as a row — the question the
+// caller is really asking. A row alone is not evidence of bytes: explode writes
+// rows for content it never stored, so answering from row existence made hopper
+// claim artifacts it had never held, and the producer that would have supplied
+// them was told not to bother. The two arms mirror how [handleFile] serves
+// bytes: a top-level row from its own path on disk, a member by extraction from
+// the archive that contains it.
+//
+// Deliberately conservative. A false "known" loses the bytes permanently; a
+// false "unknown" costs one redundant upload. Only the cheap mistake is
+// acceptable, so anything hopper cannot justify is reported unknown: rows with
+// no path, rows already marked missing, and rows whose only tie to a parent is
+// a reference edge — a dependency was never inside the package that named it,
+// so there is nothing to extract it from.
 func (db *DB) KnownSHA256(ctx context.Context, shas []string) ([]string, error) {
 	if len(shas) == 0 {
 		return nil, nil
@@ -1995,7 +2058,8 @@ func (db *DB) KnownSHA256(ctx context.Context, shas []string) ([]string, error) 
 	known := make([]string, 0, len(shas))
 
 	if db.pool != nil {
-		rows, err := db.pool.Query(ctx, `SELECT sha256 FROM samples WHERE sha256 = ANY($1)`, shas)
+		rows, err := db.pool.Query(ctx,
+			`SELECT sha256 FROM samples s WHERE s.sha256 = ANY($1)`+knownRetrievableSQL, shas)
 		if err != nil {
 			return nil, fmt.Errorf("hopper: known sha256: %w", err)
 		}
@@ -2022,7 +2086,8 @@ func (db *DB) KnownSHA256(ctx context.Context, shas []string) ([]string, error) 
 		args[i] = s
 	}
 	//nolint:gosec // G202: the concatenated text is a fixed "?,?,…" placeholder list; the digests are bound parameters
-	rows, err := db.lite.QueryContext(ctx, `SELECT sha256 FROM samples WHERE sha256 IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT sha256 FROM samples s WHERE s.sha256 IN (`+strings.Join(placeholders, ",")+`)`+knownRetrievableSQL, args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: known sha256: %w", err)
 	}
