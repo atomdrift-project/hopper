@@ -625,6 +625,79 @@ func (r Rel) IsContainment() bool {
 // asserts the two agree, so neither can drift.
 const containmentRelsSQL = `('', 'unpacked')`
 
+// uncontainedSQL matches the samples no archive contains — the artifacts that
+// stand on their own and are worth judging, labelling, and listing as
+// themselves. A fetched dependency qualifies: some package named it, but nothing
+// contains it, and it has its own author, registry entry, and verdict.
+//
+// `parent = ”` alone is close but not exact: a file submitted standalone and
+// later found inside an archive keeps an empty parent, because the conflict
+// clauses deliberately refuse to let a member rewrite a standalone row's
+// identity. (Filling parent there is not an option — handleFile routes any row
+// with a parent through archive extraction, so it would stop serving bytes that
+// are sitting right there on disk. See TestExplodeDoesNotClobberWalkerPath.) The
+// ledger settles it, and a child can have several parents, so the ledger is the
+// only place that can.
+//
+// Use this where the result set is bounded. The subquery costs a probe per
+// candidate row, which a LIMIT-ed page can afford; uncontainedCountSQL is for
+// where it cannot.
+const uncontainedSQL = `parent = '' AND NOT EXISTS (
+	SELECT 1 FROM sample_locations sl
+	 WHERE sl.sha256 = samples.sha256
+	   AND sl.parent_sha256 <> ''
+	   AND sl.rel IN ` + containmentRelsSQL + `)`
+
+// uncontainedCountSQL is uncontainedSQL for count(*), which has no LIMIT to stop
+// it early: the subquery would probe the ledger once per top-level row, across a
+// table headed for 500M, on every page render. It also forfeits the six partial
+// indexes predicated on `parent = ”` — see idx_samples_eco_top_created, whose
+// comment records that matching their constant predicates is what makes the
+// count an index-only scan and the difference between sub-second and
+// multi-second on a large ecosystem. A subquery can never appear in a partial
+// index predicate, so precision here costs the index outright.
+//
+// So the count trades exactness for a bounded plan: it over-counts by the
+// standalone-and-also-in-an-archive rows that uncontainedSQL excludes from the
+// page itself. That population is small, the error is in the total rather than
+// in what anyone reads, and the alternative is the most expensive query in the
+// system. Displayed rows stay exact.
+//
+// Postgres only. The SQLite backend shares one WHERE between its page and count
+// queries and keeps the precise form: it backs tests and small deployments,
+// where the probe costs nothing and exactness is worth more than a plan. The
+// divergence is a marginal over-count on Postgres, never a difference in which
+// rows are returned.
+const uncontainedCountSQL = `parent = ''`
+
+// containmentColumns projects an observation onto the two samples columns that
+// are containment claims rather than facts about the artifact itself:
+//
+//	parent — "this archive contains these bytes"
+//	path   — "the bytes are at this location on disk"
+//
+// Only a containment edge supports either. A referenced artifact — a fetched
+// dependency, a registry sidecar — was *named* by its parent, not contained by
+// it: nothing can extract it from that archive, and hopper may hold no bytes for
+// it at all until whoever fetched it uploads them. So both come back empty, and
+// the observation is recorded in sample_locations, where every edge belongs and
+// where the reference stays visible as "referenced by" rather than "found in".
+//
+// This is the single definition of that projection, and every writer of a
+// samples row goes through it — so a reference cannot be recorded as a member by
+// forgetting a rule. TestNoWriterRecordsAReferenceAsAMember covers each entry
+// point; TestContainmentInvariantHolds is the standing assertion over the data.
+//
+// Empty columns are safe against re-observation: the ON CONFLICT clause fills
+// path only when the incoming one is non-empty, so a later upload carrying real
+// bytes heals the row and nothing ever blanks it back.
+func containmentColumns(s *Sample) (parent, path string) {
+	if !Rel(s.LocationRel).IsContainment() {
+		return "", ""
+	}
+	return s.Parent, s.Path
+}
+
 // WorkflowSnapshot is the compact operational view used by Hopper dashboards.
 type WorkflowSnapshot struct {
 	Health        WorkflowHealth
@@ -1105,9 +1178,23 @@ func (e *memberEnvelope) buildRange(start, end int) []*Sample {
 			}
 		}
 
+		// A member's label and skip are inherited from the archive: shipping
+		// inside a bad package is evidence about the member, and an unremarkable
+		// member of one is not worth queueing on its own. Neither argument
+		// survives a reference edge. A package naming a dependency says nothing
+		// about that dependency's contents — the dependency has its own author,
+		// its own registry entry, and its own verdict, and inheriting "bad" here
+		// is how a benign library ends up labelled hostile because something
+		// hostile depended on it. A referenced artifact stays unlabelled until it
+		// is judged on its own bytes.
+		containment := Rel(entry.Rel).IsContainment()
+		label, labelSource := "", ""
 		skip := ""
-		if e.parent.Label == "bad" && maxLevel < 5 && suspiciousCount <= 1 {
-			skip = skipBenignArchiveItem
+		if containment {
+			label, labelSource = e.parent.Label, e.parent.LabelSource
+			if e.parent.Label == "bad" && maxLevel < 5 && suspiciousCount <= 1 {
+				skip = skipBenignArchiveItem
+			}
 		}
 
 		singleFile, err := json.Marshal(struct {
@@ -1148,8 +1235,8 @@ func (e *memberEnvelope) buildRange(start, end int) []*Sample {
 			Filename:        inArchive,
 			FileType:        entry.FileType,
 			SizeBytes:       entry.Size,
-			Label:           e.parent.Label,
-			LabelSource:     e.parent.LabelSource,
+			Label:           label,
+			LabelSource:     labelSource,
 			Path:            memberPath,
 			CleaveResult:    singleFile,
 			LitmusResult:    e.litmus.forMember(id),
@@ -1197,6 +1284,17 @@ func (db *DB) RefreshStaleMemberAnalysis(ctx context.Context, members []*Sample)
 	rows := make([]staleRefresh, 0, len(members))
 	for _, m := range members {
 		if m == nil || m.SHA256 == "" || len(m.CleaveResult) == 0 || m.AnalyzedAt == nil {
+			continue
+		}
+		// Only a containment member's analysis is a refinement of the archive's
+		// own. What this pushes is a single-file slice of the parent's report,
+		// which for a contained member is the whole story. A referenced artifact
+		// has its own standalone report — for a dependency that is itself an
+		// archive, an entire member tree — and overwriting it with a one-node
+		// stub would erase that analysis and re-derive max_crit and
+		// suspicious_count from the stub, dropping the dependency out of the
+		// triage queues that select on them.
+		if !Rel(m.LocationRel).IsContainment() {
 			continue
 		}
 		rows = append(rows, staleRefresh{
@@ -2185,6 +2283,100 @@ func (db *DB) reconcileLocationParentEdges(ctx context.Context) error {
 		return db.reconcileLocationParentEdgesPG(ctx, cursor)
 	}
 	return db.reconcileLocationParentEdgesSQLite(ctx, cursor)
+}
+
+// Keys and chunk size for repairReferenceParents, mirroring the location
+// backfill above: a done marker so restarts are cheap no-ops, a cursor so an
+// interrupted run resumes instead of restarting.
+const (
+	referenceParentRepairDoneKey = "repair:samples:reference-parent:v1"
+	referenceParentRepairCurKey  = "repair:samples:reference-parent:cursor"
+	referenceParentRepairBatch   = 5000
+)
+
+// repairReferenceParents clears the containment columns on rows that were
+// recorded as archive members but are tied to their parent only by a reference
+// edge — the fetched dependencies explode used to mint before it distinguished
+// the two. See [containmentColumns] for why those columns are a containment
+// claim and why a reference cannot make one.
+//
+// The columns are insert-only under the ON CONFLICT clause (parent is not in
+// its SET list), so these rows cannot heal on their own: the later upload that
+// carries the artifact's real path and verdict is rejected by the clause's
+// `EXCLUDED.parent = ”` guard. Left alone they stay invisible to every consumer
+// that asks `parent = ”` — the bloom pool, promoter, cyclotron, and prism's
+// feed — no matter how many times they are re-scanned.
+//
+// label is cleared with them, and safely: such a row could never have been
+// curated. Promotion requires a path under a discovery tree, and hopper's triage
+// refuses to relabel a row whose bytes are not on disk — a "<archive>!!<name>"
+// path satisfies neither. So any label these rows carry was inherited from the
+// archive that named them, and an inherited "good" is the dangerous one: left in
+// place, the repair would promote a dependency nobody vouched for into the
+// known-good bloom filter, and a known-good coordinate is never fetched again.
+//
+// Data-only: no schema change, no index rebuild, no column added. One short
+// autocommit UPDATE per id window, row locks released immediately.
+func (db *DB) repairReferenceParents(ctx context.Context) error {
+	switch done, err := db.KVGet(ctx, referenceParentRepairDoneKey); {
+	case err != nil && !errors.Is(err, ErrNotFound):
+		return fmt.Errorf("hopper: repair reference parents: read marker: %w", err)
+	case done == "done":
+		return nil
+	}
+	cursor := int64(0)
+	if v, err := db.KVGet(ctx, referenceParentRepairCurKey); err == nil {
+		if n, perr := strconv.ParseInt(v, 10, 64); perr == nil {
+			cursor = n
+		}
+	}
+	if db.pool != nil {
+		return db.repairReferenceParentsPG(ctx, cursor)
+	}
+	return db.repairReferenceParentsSQLite(ctx, cursor)
+}
+
+// referenceParentPredicate matches a samples row making a containment claim the
+// ledger does not support: it names a parent, but no observation of it is a
+// containment edge. Written against the table name (no alias) so it composes
+// into both the repair and [DB.ContainmentViolations].
+const referenceParentPredicate = `samples.parent <> '' AND NOT EXISTS (
+	SELECT 1 FROM sample_locations sl
+	 WHERE sl.sha256 = samples.sha256
+	   AND sl.parent_sha256 <> ''
+	   AND sl.rel IN ` + containmentRelsSQL + `)`
+
+// ContainmentViolations counts rows whose containment columns claim more than
+// the ledger supports, stopping at limit. It is the standing proof that
+// [containmentColumns] is holding: zero in a healthy database, and it stays zero
+// because every writer of a samples row projects through that one function.
+//
+// Bounded on purpose. The predicate cannot be answered from samples alone, so it
+// probes the ledger per candidate row, and the candidates are every row with a
+// parent — the archive members, which are most of the table. An unbounded count
+// would be a heavier query than the fault it looks for. A monitor only needs to
+// know whether the number is zero, so it asks for a handful and alerts on any.
+//
+// A non-zero result means some writer began recording references as members
+// again, and the dependencies it wrote are invisible to promoter, cyclotron, and
+// prism's feed until it is fixed and repairReferenceParents re-run.
+func (db *DB) ContainmentViolations(ctx context.Context, limit int) (int, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	q := `SELECT count(*) FROM (SELECT 1 FROM samples WHERE ` + referenceParentPredicate +
+		` LIMIT $1) t`
+	var n int
+	var err error
+	if db.pool != nil {
+		err = db.pool.QueryRow(ctx, q, limit).Scan(&n)
+	} else {
+		err = db.lite.QueryRowContext(ctx, strings.Replace(q, "$1", "?", 1), limit).Scan(&n)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("hopper: containment violations: %w", err)
+	}
+	return n, nil
 }
 
 // ArchiveMember is a lightweight listing of one member of an archive: enough to

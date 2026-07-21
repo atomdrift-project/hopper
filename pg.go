@@ -428,6 +428,19 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// parents without thousands of heap fetches.
 		`CREATE INDEX IF NOT EXISTS idx_sl_sha256_parents ON sample_locations(sha256) ` +
 			`INCLUDE (parent_sha256, last_seen_at, path) WHERE parent_sha256 <> ''`,
+		// "Is this sha contained by any archive?" — the question that separates an
+		// artifact worth judging on its own from an archive member that isn't.
+		// Asked by the feed's TopLevelOnly, by KnownSHA256 before deciding whether
+		// a producer must send bytes, and by the reference-parent repair.
+		//
+		// Partial on the containment rels, so it indexes only the edges that can
+		// answer yes: reference edges (a fetched dependency, a registry sidecar)
+		// are the majority on a package corpus and are excluded entirely, keeping
+		// the index a fraction of the ledger. sha256 alone is the key — the
+		// predicate settles rel and parent_sha256, so the probe is index-only and
+		// never touches the heap.
+		`CREATE INDEX IF NOT EXISTS idx_sl_containment ON sample_locations(sha256) ` +
+			`WHERE parent_sha256 <> '' AND rel IN ` + containmentRelsSQL,
 		`CREATE INDEX IF NOT EXISTS idx_sl_last_seen ON sample_locations(last_seen_at)`,
 
 		// One-shot backfill from the existing denormalized columns. Guarded
@@ -850,6 +863,12 @@ func (db *DB) migrateServingPG(ctx context.Context, allowRewrite bool) (func(con
 		// boot, so a transient hiccup never blocks startup.
 		if err := db.reconcileLocationParentEdges(ctx); err != nil {
 			slog.Warn("sample_locations parent-edge backfill incomplete; will resume on next boot", "error", err)
+		}
+		// Runs after the edge backfill, which is what its predicate reads: a row
+		// whose edges have not been backfilled yet would look parentless and be
+		// repaired on no evidence.
+		if err := db.repairReferenceParents(ctx); err != nil {
+			slog.Warn("reference-parent repair incomplete; will resume on next boot", "error", err)
 		}
 		return nil
 	}, nil
@@ -1518,6 +1537,10 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 		return false, fmt.Errorf("hopper: begin insert: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+	// The samples row records the artifact; the locations row below records this
+	// observation of it. parent/path are containment claims and belong only to
+	// the former — see containmentColumns.
+	samplesParent, samplesPath := containmentColumns(s)
 	// cleave_result and litmus_result are the only analysis fields the
 	// writer sets — file_type, score, formula are derived DB-side by the
 	// samples_derive_cleave_cols trigger and litmus_score by the
@@ -1536,8 +1559,8 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 			$20, $21, $22, $23, $24, $25, $26)
 		`+sampleConflictUpdatePG,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
-		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
-		s.Parent, s.Skip, s.Elements,
+		s.SizeBytes, s.Label, s.LabelSource, samplesPath, s.Status,
+		samplesParent, s.Skip, s.Elements,
 		s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
 		sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult),
 		s.URL, s.Domain, s.Package, s.Version, sanitizeJSONB(s.Provenance), s.FetchedAt, s.PURLBase)
@@ -1620,6 +1643,12 @@ var insertBatchStagingCols = []string{
 	"parent", "rel", "skip", "elements", "max_crit", "suspicious_count",
 	"mtime", "marker_mtime", "cleave_result", "litmus_result", "analyzed_at", "first_analyzed_at",
 	"url", "domain", "package", "version", "provenance", "fetched_at",
+	// The containment projection of parent/path, computed once in Go by
+	// containmentColumns. Staging carries both spellings because the two
+	// destinations want different ones: sample_locations records the
+	// observation as it happened (parent/path/rel), samples records only what
+	// the observation licenses as a containment claim.
+	"sample_parent", "sample_path",
 }
 
 const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
@@ -1630,7 +1659,8 @@ const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 	max_crit INTEGER, suspicious_count INTEGER,
 	mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ,
 	cleave_result JSONB, litmus_result JSONB, analyzed_at TIMESTAMPTZ, first_analyzed_at TIMESTAMPTZ,
-	url TEXT, domain TEXT, package TEXT, version TEXT, provenance JSONB, fetched_at TIMESTAMPTZ
+	url TEXT, domain TEXT, package TEXT, version TEXT, provenance JSONB, fetched_at TIMESTAMPTZ,
+	sample_parent TEXT, sample_path TEXT
 ) ON COMMIT DROP`
 
 // file_type, score, formula are derived DB-side by the
@@ -1734,8 +1764,8 @@ var insertBatchStagingInsert = `INSERT INTO samples (
 	url, domain, package, version, provenance, fetched_at)
 SELECT DISTINCT ON (sha256)
 	sha256, source, feed, ecosystem, filename,
-	size_bytes, label, label_source, path, status,
-	canonical_sha256, parent, skip, elements,
+	size_bytes, label, label_source, sample_path, status,
+	canonical_sha256, sample_parent, skip, elements,
 	max_crit, suspicious_count, mtime, marker_mtime,
 	cleave_result, litmus_result, analyzed_at, first_analyzed_at,
 	url, domain, package, version, provenance, fetched_at
@@ -1753,7 +1783,7 @@ func logLabelTransitionsPG(ctx context.Context, tx pgx.Tx) {
 			st.sha256, st.path, s.label, s.label_source, s.skip, st.label, st.label_source
 		FROM _staging st
 		JOIN samples s ON s.sha256 = st.sha256
-		WHERE st.parent = '' AND s.parent = ''
+		WHERE st.sample_parent = '' AND s.parent = ''
 		  AND st.label_source <> 'marker'
 		  AND ((s.label_source = 'marker' AND (s.label <> st.label OR s.skip = 'misclassified'))
 		    OR (s.label_source <> 'marker'
@@ -1787,12 +1817,14 @@ func sampleStagingRows(samples []*Sample) [][]any {
 		if firstAnalyzedAt == nil {
 			firstAnalyzedAt = s.AnalyzedAt
 		}
+		samplesParent, samplesPath := containmentColumns(s)
 		rows[i] = []any{
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256,
 			s.Parent, s.LocationRel, s.Skip, s.Elements, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
 			sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult), s.AnalyzedAt, firstAnalyzedAt,
 			s.URL, s.Domain, s.Package, s.Version, sanitizeJSONB(s.Provenance), s.FetchedAt,
+			samplesParent, samplesPath,
 		}
 	}
 	return rows
@@ -1862,8 +1894,8 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 		UPDATE samples s
 		SET skip = 'replaced'
 		FROM _staging st
-		WHERE s.path = st.path
-			AND st.path != ''
+		WHERE s.path = st.sample_path
+			AND st.sample_path != ''
 			AND s.sha256 != st.sha256
 			AND s.skip = ''
 			AND s.cleave_result IS NULL`); err != nil {
@@ -1924,8 +1956,8 @@ const insertMembersFromStagingPG = `INSERT INTO samples (
 	url, domain, package, version, provenance, fetched_at)
 SELECT DISTINCT ON (sha256)
 	sha256, source, feed, ecosystem, filename,
-	size_bytes, label, label_source, path, status,
-	canonical_sha256, parent, skip, elements,
+	size_bytes, label, label_source, sample_path, status,
+	canonical_sha256, sample_parent, skip, elements,
 	max_crit, suspicious_count, mtime, marker_mtime,
 	cleave_result, litmus_result, analyzed_at, first_analyzed_at,
 	url, domain, package, version, provenance, fetched_at
@@ -2243,6 +2275,47 @@ func (db *DB) reconcileLocationParentEdgesPG(ctx context.Context, cursor int64) 
 		return fmt.Errorf("hopper: backfill locations: done marker: %w", err)
 	}
 	slog.Info("sample_locations parent-edge backfill complete", "max_id", maxID)
+	return nil
+}
+
+// repairReferenceParentsPG walks samples by id, clearing the containment
+// columns on reference rows a window at a time. Same shape as the location
+// backfill above: bounded PK range scan per statement, cursor checkpointed after
+// each window so an interrupted run resumes where it stopped.
+func (db *DB) repairReferenceParentsPG(ctx context.Context, cursor int64) error {
+	var maxID, repaired int64
+	if err := db.pool.QueryRow(ctx,
+		`SELECT COALESCE(max(id), 0) FROM samples WHERE parent <> ''`).Scan(&maxID); err != nil {
+		return fmt.Errorf("hopper: repair reference parents: bounds: %w", err)
+	}
+	for cursor < maxID {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		hi := cursor + referenceParentRepairBatch
+		tag, err := db.pool.Exec(ctx, `
+			UPDATE samples
+			   SET parent = '', path = '', label = 'unknown', label_source = ''
+			 WHERE id > $1 AND id <= $2 AND `+referenceParentPredicate, cursor, hi)
+		if err != nil {
+			return fmt.Errorf("hopper: repair reference parents: chunk (%d,%d]: %w", cursor, hi, err)
+		}
+		repaired += tag.RowsAffected()
+		cursor = hi
+		if _, err := db.pool.Exec(ctx,
+			`INSERT INTO hopper_kv (key, value) VALUES ($1, $2)
+			 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+			referenceParentRepairCurKey, strconv.FormatInt(cursor, 10)); err != nil {
+			return fmt.Errorf("hopper: repair reference parents: save cursor: %w", err)
+		}
+	}
+	if _, err := db.pool.Exec(ctx,
+		`INSERT INTO hopper_kv (key, value) VALUES ($1, 'done')
+		 ON CONFLICT (key) DO UPDATE SET value = 'done'`,
+		referenceParentRepairDoneKey); err != nil {
+		return fmt.Errorf("hopper: repair reference parents: done marker: %w", err)
+	}
+	slog.Info("reference-parent repair complete", "max_id", maxID, "repaired", repaired)
 	return nil
 }
 
@@ -4964,9 +5037,7 @@ func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error
 			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
 			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
 			AND (coalesce(cardinality($5::int[]), 0) = 0 OR `+q.feedClassExpr()+` = ANY($5))
-			AND (NOT $6 OR (parent = '' AND NOT EXISTS (
-				SELECT FROM sample_locations sl
-				WHERE sl.sha256 = samples.sha256 AND sl.parent_sha256 <> '')))
+			AND (NOT $6 OR (`+uncontainedSQL+`))
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
 			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))
@@ -5012,9 +5083,7 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q *FeedQuery) (int, error)
 			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
 			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
 			AND (coalesce(cardinality($5::int[]), 0) = 0 OR `+q.feedClassExpr()+` = ANY($5))
-			AND (NOT $6 OR (parent = '' AND NOT EXISTS (
-				SELECT FROM sample_locations sl
-				WHERE sl.sha256 = samples.sha256 AND sl.parent_sha256 <> '')))
+			AND (NOT $6 OR (`+uncontainedCountSQL+`))
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
 			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))

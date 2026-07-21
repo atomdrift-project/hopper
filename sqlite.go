@@ -516,6 +516,12 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 	if err := db.reconcileLocationParentEdges(ctx); err != nil {
 		slog.Warn("sample_locations parent-edge backfill incomplete; will resume on next boot", "error", err)
 	}
+	// After the edge backfill, which is what its predicate reads: a row whose
+	// edges have not been backfilled yet would look parentless and be repaired
+	// on no evidence.
+	if err := db.repairReferenceParents(ctx); err != nil {
+		slog.Warn("reference-parent repair incomplete; will resume on next boot", "error", err)
+	}
 
 	return nil
 }
@@ -1004,6 +1010,10 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 		return false, fmt.Errorf("hopper: begin insert: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // commit or rollback
+	// The samples row records the artifact; the locations row below records this
+	// observation of it. parent/path are containment claims and belong only to
+	// the former — see containmentColumns.
+	samplesParent, samplesPath := containmentColumns(s)
 	// file_type, score, formula, litmus_score are GENERATED STORED columns
 	// (SQLite 3.31+). They auto-derive from cleave_result / litmus_result
 	// so writing to them is neither necessary nor legal.
@@ -1018,8 +1028,8 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`+sampleConflictUpdateSQLite,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
-		s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
-		s.SHA256, s.Parent, s.Skip, s.Elements,
+		s.SizeBytes, s.Label, s.LabelSource, samplesPath, s.Status,
+		s.SHA256, samplesParent, s.Skip, s.Elements,
 		s.MaxCrit, s.SuspiciousCount, s.TopTraits, s.Mtime, s.MarkerMtime,
 		jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult),
 		s.URL, s.Domain, s.Package, s.Version, jsonTextOrNil(s.Provenance), s.FetchedAt, s.PURLBase)
@@ -1167,10 +1177,11 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		if firstAnalyzedAt == nil {
 			firstAnalyzedAt = s.AnalyzedAt
 		}
+		samplesParent, samplesPath := containmentColumns(s)
 		res, err := stmt.ExecContext(ctx,
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
-			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status,
-			s.SHA256, s.Parent, s.Skip, s.Elements,
+			s.SizeBytes, s.Label, s.LabelSource, samplesPath, s.Status,
+			s.SHA256, samplesParent, s.Skip, s.Elements,
 			s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
 			jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult), s.AnalyzedAt, firstAnalyzedAt,
 			s.URL, s.Domain, s.Package, s.Version, jsonTextOrNil(s.Provenance), s.FetchedAt)
@@ -1426,6 +1437,48 @@ func (db *DB) badMembersByParentSQLite(ctx context.Context, parentSHA string) ([
 		return nil, fmt.Errorf("hopper: bad members by parent %s: %w", parentSHA, err)
 	}
 	return scanLiteSamples(rows)
+}
+
+// repairReferenceParentsSQLite mirrors repairReferenceParentsPG: one short
+// autocommit UPDATE per id window, so SQLite's whole-DB write lock is taken
+// briefly and released between chunks rather than held for the whole repair.
+func (db *DB) repairReferenceParentsSQLite(ctx context.Context, cursor int64) error {
+	var maxID, repaired int64
+	if err := db.lite.QueryRowContext(ctx,
+		`SELECT COALESCE(max(id), 0) FROM samples WHERE parent <> ''`).Scan(&maxID); err != nil {
+		return fmt.Errorf("hopper: repair reference parents: bounds: %w", err)
+	}
+	for cursor < maxID {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		hi := cursor + referenceParentRepairBatch
+		res, err := db.lite.ExecContext(ctx, `
+			UPDATE samples
+			   SET parent = '', path = '', label = 'unknown', label_source = ''
+			 WHERE id > ? AND id <= ? AND `+referenceParentPredicate, cursor, hi)
+		if err != nil {
+			return fmt.Errorf("hopper: repair reference parents: chunk (%d,%d]: %w", cursor, hi, err)
+		}
+		if n, aerr := res.RowsAffected(); aerr == nil {
+			repaired += n
+		}
+		cursor = hi
+		if _, err := db.lite.ExecContext(ctx,
+			`INSERT INTO hopper_kv (key, value) VALUES (?, ?)
+			 ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
+			referenceParentRepairCurKey, strconv.FormatInt(cursor, 10)); err != nil {
+			return fmt.Errorf("hopper: repair reference parents: save cursor: %w", err)
+		}
+	}
+	if _, err := db.lite.ExecContext(ctx,
+		`INSERT INTO hopper_kv (key, value) VALUES (?, 'done')
+		 ON CONFLICT (key) DO UPDATE SET value = 'done'`,
+		referenceParentRepairDoneKey); err != nil {
+		return fmt.Errorf("hopper: repair reference parents: done marker: %w", err)
+	}
+	slog.Info("reference-parent repair complete", "max_id", maxID, "repaired", repaired)
+	return nil
 }
 
 func (db *DB) reconcileLocationParentEdgesSQLite(ctx context.Context, cursor int64) error {
@@ -3870,14 +3923,7 @@ func (q *FeedQuery) whereSQLite() (where string, args []any) {
 	}
 
 	if q.TopLevelOnly {
-		// parent='' alone is not enough: a file mirrored into its own sample
-		// row (e.g. a fetched dependency pushed by scan) has an empty parent
-		// column while sample_locations records it as a member of one or more
-		// archives. Children may have multiple parents, so the locations
-		// ledger — not the single-valued parent column — is the authority.
-		clauses = append(clauses, "parent = '' AND NOT EXISTS ("+
-			"SELECT 1 FROM sample_locations sl "+
-			"WHERE sl.sha256 = samples.sha256 AND sl.parent_sha256 <> '')")
+		clauses = append(clauses, uncontainedSQL)
 	}
 
 	if q.Corroborated {

@@ -84,3 +84,184 @@ func TestKnownSHA256ReportsOnlyRetrievableBytes(t *testing.T) {
 		}
 	}
 }
+
+// depObservation is a fetched dependency as explode sees it: named by an
+// archive, never inside it.
+func depObservation(sha, archive string) *Sample {
+	return &Sample{
+		SHA256: sha, Path: "unknown/foraged/npm/app.tgz!!evil-1.0.0.tgz",
+		Parent: archive, LocationRel: string(RelFetched),
+		Label: "bad", LabelSource: "promoter", // inherited from the archive
+	}
+}
+
+// Every path that writes a samples row must project through containmentColumns.
+// One writer forgetting is how a dependency silently becomes an archive member
+// again — invisible to the bloom pool, promoter, cyclotron, and prism's feed —
+// so each entry point is covered separately rather than trusting the shared
+// helper to be reached.
+func TestNoWriterRecordsAReferenceAsAMember(t *testing.T) {
+	ctx := context.Background()
+	archive := strings.Repeat("a", 64)
+
+	for _, tc := range []struct {
+		name  string
+		write func(t *testing.T, db *DB, s *Sample)
+	}{
+		{"InsertSample", func(t *testing.T, db *DB, s *Sample) {
+			if err := db.InsertSample(ctx, s); err != nil {
+				t.Fatalf("InsertSample: %v", err)
+			}
+		}},
+		{"InsertSampleBatch", func(t *testing.T, db *DB, s *Sample) {
+			if _, _, err := db.InsertSampleBatch(ctx, []*Sample{s}); err != nil {
+				t.Fatalf("InsertSampleBatch: %v", err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			mustInsert(t, ctx, db, &Sample{SHA256: archive, Path: "unknown/foraged/npm/app.tgz"})
+			dep := strings.Repeat("d", 64)
+			tc.write(t, db, depObservation(dep, archive))
+
+			got, err := db.SampleBySHA256(ctx, dep)
+			if err != nil {
+				t.Fatalf("SampleBySHA256: %v", err)
+			}
+			if got.Parent != "" {
+				t.Errorf("parent = %q, want \"\" — a reference is contained by nothing", got.Parent)
+			}
+			if got.Path != "" {
+				t.Errorf("path = %q, want \"\" — hopper holds no bytes for it yet", got.Path)
+			}
+
+			// The edge still exists: that is what "referenced by" is rendered from.
+			locs, err := db.LocationsForSHA(ctx, dep)
+			if err != nil || len(locs) != 1 {
+				t.Fatalf("LocationsForSHA = %v, %v; want one observation", locs, err)
+			}
+			if locs[0].ParentSHA256 != archive || locs[0].Rel != string(RelFetched) {
+				t.Errorf("edge = parent %q rel %q, want %q/fetched",
+					locs[0].ParentSHA256, locs[0].Rel, archive)
+			}
+
+			if n, err := db.ContainmentViolations(ctx, 10); err != nil || n != 0 {
+				t.Errorf("ContainmentViolations = %d, %v; want 0", n, err)
+			}
+		})
+	}
+}
+
+// The repair clears containment columns the ledger doesn't support, and leaves
+// genuine members alone. Rows are planted through the DB directly because the
+// writers no longer produce this shape — it is the legacy state on disk.
+func TestRepairReferenceParentsClearsOnlyReferences(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	archive := strings.Repeat("a", 64)
+	member := strings.Repeat("b", 64)
+	dep := strings.Repeat("d", 64)
+	mustInsert(t, ctx, db, &Sample{SHA256: archive, Path: "unknown/foraged/npm/app.tgz"})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: member, Path: "unknown/foraged/npm/app.tgz!!lib/index.js",
+		Parent: archive, LocationRel: string(RelContained), Label: "bad", LabelSource: "promoter",
+	})
+	mustInsert(t, ctx, db, depObservation(dep, archive))
+
+	// Re-damage the dependency row the way pre-fix explode left it, bypassing
+	// the writers so the repair has something to find.
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET parent = ?, path = ?, label = 'bad', label_source = 'promoter' WHERE sha256 = ?`,
+		archive, "unknown/foraged/npm/app.tgz!!evil-1.0.0.tgz", dep); err != nil {
+		t.Fatalf("plant damaged row: %v", err)
+	}
+	if n, err := db.ContainmentViolations(ctx, 10); err != nil || n != 1 {
+		t.Fatalf("ContainmentViolations before repair = %d, %v; want 1", n, err)
+	}
+
+	// Clear the done marker the migration set at open, so the repair runs here.
+	if _, err := db.lite.ExecContext(ctx, `DELETE FROM hopper_kv WHERE key LIKE 'repair:samples:%'`); err != nil {
+		t.Fatalf("clear marker: %v", err)
+	}
+	if err := db.repairReferenceParents(ctx); err != nil {
+		t.Fatalf("repairReferenceParents: %v", err)
+	}
+
+	repaired, err := db.SampleBySHA256(ctx, dep)
+	if err != nil {
+		t.Fatalf("SampleBySHA256(dep): %v", err)
+	}
+	if repaired.Parent != "" || repaired.Path != "" {
+		t.Errorf("dep after repair: parent=%q path=%q, want both empty", repaired.Parent, repaired.Path)
+	}
+	// An inherited label is the dangerous leftover: a "good" carried over from
+	// the archive would promote a dependency nobody vouched for into the
+	// known-good bloom, and a known-good coordinate is never fetched again.
+	if repaired.Label != "unknown" || repaired.LabelSource != "" {
+		t.Errorf("dep after repair: label=%q source=%q, want unknown/\"\"",
+			repaired.Label, repaired.LabelSource)
+	}
+
+	kept, err := db.SampleBySHA256(ctx, member)
+	if err != nil {
+		t.Fatalf("SampleBySHA256(member): %v", err)
+	}
+	if kept.Parent != archive {
+		t.Errorf("contained member parent = %q, want %q — genuine containment is untouched", kept.Parent, archive)
+	}
+	if kept.Label != "bad" {
+		t.Errorf("contained member label = %q, want bad — inheritance is legitimate for a member", kept.Label)
+	}
+
+	if n, err := db.ContainmentViolations(ctx, 10); err != nil || n != 0 {
+		t.Errorf("ContainmentViolations after repair = %d, %v; want 0", n, err)
+	}
+}
+
+// The feed lists artifacts, and a fetched dependency is one: some package named
+// it, but nothing contains it. It was excluded because TopLevelOnly rejected any
+// row with a parented edge, which is the same conflation — an edge is not
+// containment. A contained archive member stays out, since it has no identity
+// apart from the archive that holds it.
+func TestFeedListsDependenciesButNotArchiveMembers(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	archive := strings.Repeat("a", 64)
+	member := strings.Repeat("b", 64)
+	dep := strings.Repeat("d", 64)
+
+	mustInsert(t, ctx, db, &Sample{SHA256: archive, Path: "unknown/foraged/npm/app.tgz"})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: member, Path: "unknown/foraged/npm/app.tgz!!lib/index.js",
+		Parent: archive, LocationRel: string(RelContained),
+	})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: dep, Path: "unknown/uploads/dd/dd/evil-1.0.0.tgz",
+		Parent: archive, LocationRel: string(RelFetched),
+	})
+	for _, sha := range []string{archive, member, dep} {
+		mustAnalyze(t, ctx, db, sha, 1)
+	}
+
+	rows, err := db.FeedSamples(ctx, &FeedQuery{TopLevelOnly: true, Limit: 50})
+	if err != nil {
+		t.Fatalf("FeedSamples: %v", err)
+	}
+	listed := map[string]bool{}
+	for _, r := range rows {
+		listed[r.SHA256] = true
+	}
+
+	if !listed[dep] {
+		t.Error("fetched dependency missing from the feed — it is an artifact in its own right")
+	}
+	if !listed[archive] {
+		t.Error("archive missing from the feed")
+	}
+	if listed[member] {
+		t.Error("contained member listed — it has no identity apart from its archive")
+	}
+}

@@ -2609,6 +2609,12 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 // descriptive columns and the finalized sidecar is preserved verbatim in the
 // provenance JSONB.
 func uploadSample(sha, filename, relPath string, size int64, prov *hopper.Sidecar) *hopper.Sample {
+	// An uploaded artifact is observed now — nothing else records when it
+	// arrived, and the row is only as old as this write. mtime is what the
+	// promotion queue ages against, so leaving it NULL kept every upload out of
+	// promotion entirely rather than merely young: a row with no mtime never
+	// satisfies the age gate, no matter how long it sits.
+	now := time.Now().UTC()
 	sample := &hopper.Sample{
 		SHA256:      sha,
 		Source:      "upload",
@@ -2617,9 +2623,17 @@ func uploadSample(sha, filename, relPath string, size int64, prov *hopper.Sideca
 		Label:       "unknown",
 		LabelSource: "upload",
 		SizeBytes:   size,
+		Mtime:       &now,
 	}
 	if prov == nil {
 		return sample
+	}
+	// Capture time when the producer recorded one: a dependency fetched from a
+	// registry was published before we saw it, and the age gate should measure
+	// from when the bytes existed, not from when they reached us.
+	if !prov.Fetch.At.IsZero() {
+		at := prov.Fetch.At
+		sample.Mtime = &at
 	}
 	if provJSON, err := json.Marshal(prov); err == nil {
 		sample.Provenance = provJSON

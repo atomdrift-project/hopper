@@ -77,10 +77,16 @@ const (
 	sightedTree     = "sighted/foraged"
 )
 
-// promoteSrcRoots are the foraged discovery trees a ruled sample may start
-// from; the first matching prefix is stripped to preserve the subpath. The
-// trailing slashes keep siblings like unknown/foraged-review/ excluded.
-var promoteSrcRoots = []string{"unknown/foraged/", "sighted/foraged/", "bad/foraged/"}
+// promoteSrcRoots are the discovery trees a ruled sample may start from; the
+// first matching prefix is stripped to preserve the subpath. The trailing
+// slashes keep siblings like unknown/foraged-review/ excluded.
+//
+// uploads/ is here because a scanner push is a discovery too — a fetched
+// dependency is often the first time anyone has seen those bytes. Without it a
+// ruled upload matched no root and fell back to the basename, collapsing the
+// sha shard (uploads/ab/cd/x.tgz) into a flat good/foraged-promote/x.tgz where
+// two packages sharing a filename would collide.
+var promoteSrcRoots = []string{"unknown/foraged/", "sighted/foraged/", "bad/foraged/", "unknown/uploads/"}
 
 // placement is a triage item's resolved destination: the new relative path and
 // the label + label_source to record.
