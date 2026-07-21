@@ -3249,6 +3249,20 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 		return
 	}
 
+	// Presence probe: everything a HEAD can truthfully answer is already
+	// settled — the member row exists, its path carries an archive delimiter,
+	// and the parent's bytes are on disk and readable. Extracting to serve a
+	// body net/http will discard would re-run a whole decompressor per probe,
+	// and the triage queues that batch archive members probe far more samples
+	// than they fetch. Answer here instead. Content-Length is deliberately
+	// omitted: the member's extracted size isn't known without doing the work,
+	// and a wrong one is worse than none.
+	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	// Content-addressed by sha256: the extracted member's bytes never change.
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")

@@ -241,6 +241,28 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			`ON samples(ecosystem, litmus_class, created_at DESC) ` +
 			`WHERE parent = '' AND cleave_result IS NOT NULL ` +
 			`AND litmus_result IS NOT NULL AND ecosystem <> ''`,
+		// TriageHighest walks good-labeled samples the ensemble scored hostile,
+		// worst first. Deliberately carries no parent = '' predicate: the rows
+		// that pin a route's operating point are overwhelmingly archive members
+		// (95.8% of benign PE scoring >= 0.9999), which every other triage index
+		// excludes. litmus_score leads so the ORDER BY is an ordered scan rather
+		// than a sort over the whole class-2 partition.
+		//
+		// NULLS LAST is load-bearing, not decoration. A DESC index defaults to
+		// NULLS FIRST, which does not match the selector's `DESC NULLS LAST` —
+		// the ordering then goes unused, every row in the partition is scanned
+		// and top-N sorted, and the query costs ~900ms instead of ~5ms. The
+		// ASC mirror below needs no such spelling: ASC already defaults to
+		// NULLS LAST, which is why TriageLowest was fast from the start.
+		`CREATE INDEX IF NOT EXISTS idx_samples_good_hostile_score ` +
+			`ON samples(litmus_score DESC NULLS LAST, id DESC) ` +
+			`WHERE label = 'good' AND litmus_class >= 2 AND cleave_result IS NOT NULL AND skip = ''`,
+		// TriageLowest is the mirror: bad-labeled samples the ensemble scores
+		// clean, best-hidden first. Same reasoning on the missing parent = ''
+		// predicate — 54% of bad rows scoring <= 0.1 are archive members.
+		`CREATE INDEX IF NOT EXISTS idx_samples_bad_clean_score ` +
+			`ON samples(litmus_score ASC, id DESC) ` +
+			`WHERE label = 'bad' AND litmus_class = 0 AND cleave_result IS NOT NULL AND skip = ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_top_ready_first_analyzed ` +
 			`ON samples(first_analyzed_at DESC, id) ` +
 			`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND first_analyzed_at IS NOT NULL`,
@@ -3244,6 +3266,60 @@ func (db *DB) triageSecondOpinionPG(ctx context.Context, limit int, trusted []st
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage second opinion: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
+// triageHighestPG: see TriageHighest. The drain anti-joins on the *root*
+// sample — a member's parent, or the sample itself when top-level — because
+// the worker triages whole archives: one ruling on `audacity-win.zip` covers
+// every hot DLL inside it, and keying the report on the member would re-queue
+// its 40 siblings on the next pass. Archive nesting is one level deep in
+// practice, so `parent` is always the root.
+func (db *DB) triageHighestPG(ctx context.Context, limit int, createdBefore time.Time, f TriageFilter) ([]*Sample, error) {
+	extra, fargs := triageFilterClausePG(f, 2)
+	args := append([]any{createdBefore}, fargs...)
+	args = append(args, limit)
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND skip = ''
+		   AND litmus_class >= 2
+		   AND (parent = '' OR path LIKE '%!!%')
+		   AND created_at < $1
+		   AND NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = CASE WHEN samples.parent = '' THEN samples.sha256 ELSE samples.parent END
+		                     AND r.report_type = 'highest')`+extra+`
+		 ORDER BY litmus_score DESC NULLS LAST, id DESC LIMIT $`+strconv.Itoa(len(args)),
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage highest: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
+// triageLowestPG: see TriageLowest. Diverges from triageHighestPG on the drain
+// key. A good archive vouches for its contents as a whole, so one ruling covers
+// every member; a bad archive's malice lives in a few members while the rest is
+// inert content that inherited the label, so each member needs its own verdict
+// and its own report row. Keying this drain on the parent would let one ruling
+// speak for files it never examined.
+func (db *DB) triageLowestPG(ctx context.Context, limit int, createdBefore time.Time, f TriageFilter) ([]*Sample, error) {
+	extra, fargs := triageFilterClausePG(f, 2)
+	args := append([]any{createdBefore}, fargs...)
+	args = append(args, limit)
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND skip = ''
+		   AND litmus_class = 0
+		   AND label_source != 'conflict'
+		   AND (parent = '' OR path LIKE '%!!%')
+		   AND created_at < $1
+		   AND NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'lowest')`+extra+`
+		 ORDER BY litmus_score ASC NULLS LAST, id DESC LIMIT $`+strconv.Itoa(len(args)),
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage lowest: %w", err)
 	}
 	return scanPGSamples(rows)
 }

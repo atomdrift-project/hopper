@@ -2475,6 +2475,57 @@ func (db *DB) triageGoodSQLite(ctx context.Context, limit int, f TriageFilter) (
 	return scanLiteSamples(rows)
 }
 
+// triageHighestSQLite: see TriageHighest. Mirrors triageHighestPG — no
+// parent = '' predicate (the operating-point setters are archive members), and
+// the drain keys on the root sample so one archive ruling covers its members.
+func (db *DB) triageHighestSQLite(ctx context.Context, limit int, createdBefore time.Time, f TriageFilter) ([]*Sample, error) {
+	extra, fargs := triageFilterClauseSQLite(f)
+	// litmusClassSQLite's two `?` (cutoff, then ceiling) come first in the SQL.
+	args := append([]any{CriticalLevel, SuspiciousCeiling, createdBefore.UTC().Format(time.RFC3339Nano)}, fargs...)
+	args = append(args, limit)
+	//nolint:gosec // G202: label/class predicates and column list are constant; filter values are parameterized via ? args
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleCols+` FROM samples
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND skip = ''
+		   AND `+litmusClassSQLite+` >= 2
+		   AND (parent = '' OR path LIKE '%!!%')
+		   AND created_at < ?
+		   AND NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = CASE WHEN samples.parent = '' THEN samples.sha256 ELSE samples.parent END
+		                     AND r.report_type = 'highest')`+extra+`
+		 ORDER BY litmus_score DESC, id DESC LIMIT ?`,
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage highest: %w", err)
+	}
+	return scanLiteSamples(rows)
+}
+
+// triageLowestSQLite: see TriageLowest. Mirrors triageLowestPG, including the
+// per-member drain key (a bad archive's members each need their own verdict).
+func (db *DB) triageLowestSQLite(ctx context.Context, limit int, createdBefore time.Time, f TriageFilter) ([]*Sample, error) {
+	extra, fargs := triageFilterClauseSQLite(f)
+	// litmusClassSQLite's two `?` (cutoff, then ceiling) come first in the SQL.
+	args := append([]any{CriticalLevel, SuspiciousCeiling, createdBefore.UTC().Format(time.RFC3339Nano)}, fargs...)
+	args = append(args, limit)
+	//nolint:gosec // G202: label/class predicates and column list are constant; filter values are parameterized via ? args
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleCols+` FROM samples
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND skip = ''
+		   AND `+litmusClassSQLite+` = 0
+		   AND label_source != 'conflict'
+		   AND (parent = '' OR path LIKE '%!!%')
+		   AND created_at < ?
+		   AND NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'lowest')`+extra+`
+		 ORDER BY litmus_score ASC, id DESC LIMIT ?`,
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage lowest: %w", err)
+	}
+	return scanLiteSamples(rows)
+}
+
 func (db *DB) triageNewSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
 	extra, args := triageFilterClauseSQLite(f)
 	args = append(args, limit)

@@ -220,6 +220,65 @@ func TestRepairReferenceParentsClearsOnlyReferences(t *testing.T) {
 	}
 }
 
+// A damaged row whose path was healed to real bytes on disk keeps that path.
+// The upload that landed after explode froze parent repaired path but could not
+// repair parent (it is absent from the ON CONFLICT SET list), so these rows have
+// a valid byte pointer and a wrong containment claim. Clearing both would strand
+// bytes hopper actually holds — and KnownSHA256 would then report them unknown
+// forever, so nothing would ever serve them.
+func TestRepairKeepsRealPathsAndClearsVirtualOnes(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	archive := strings.Repeat("a", 64)
+	healed := strings.Repeat("e", 64)
+	virtual := strings.Repeat("f", 64)
+	mustInsert(t, ctx, db, &Sample{SHA256: archive, Path: "unknown/foraged/npm/app.tgz"})
+	for _, sha := range []string{healed, virtual} {
+		mustInsert(t, ctx, db, &Sample{
+			SHA256: sha, Path: "unknown/foraged/npm/app.tgz!!dep.tgz",
+			Parent: archive, LocationRel: string(RelFetched),
+		})
+	}
+
+	// Plant the two damaged shapes explode leaves behind.
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET parent = ?, path = ? WHERE sha256 = ?`,
+		archive, "unknown/uploads/ee/ee/dep.tgz", healed); err != nil {
+		t.Fatalf("plant healed row: %v", err)
+	}
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET parent = ?, path = ? WHERE sha256 = ?`,
+		archive, "unknown/foraged/npm/app.tgz!!dep.tgz", virtual); err != nil {
+		t.Fatalf("plant virtual row: %v", err)
+	}
+	if _, err := db.lite.ExecContext(ctx, `DELETE FROM hopper_kv WHERE key LIKE 'repair:samples:%'`); err != nil {
+		t.Fatalf("clear marker: %v", err)
+	}
+	if err := db.repairReferenceParents(ctx); err != nil {
+		t.Fatalf("repairReferenceParents: %v", err)
+	}
+
+	got, err := db.SampleBySHA256(ctx, healed)
+	if err != nil {
+		t.Fatalf("SampleBySHA256(healed): %v", err)
+	}
+	if got.Path != "unknown/uploads/ee/ee/dep.tgz" {
+		t.Errorf("healed row path = %q, want the real disk path preserved", got.Path)
+	}
+	if got.Parent != "" {
+		t.Errorf("healed row parent = %q, want cleared", got.Parent)
+	}
+
+	gotVirtual, err := db.SampleBySHA256(ctx, virtual)
+	if err != nil {
+		t.Fatalf("SampleBySHA256(virtual): %v", err)
+	}
+	if gotVirtual.Path != "" {
+		t.Errorf("virtual row path = %q, want cleared — nothing can extract it", gotVirtual.Path)
+	}
+}
+
 // The feed lists artifacts, and a fetched dependency is one: some package named
 // it, but nothing contains it. It was excluded because TopLevelOnly rejected any
 // row with a parented edge, which is the same conflation — an edge is not

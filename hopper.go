@@ -3275,6 +3275,53 @@ func (db *DB) TriageGood(ctx context.Context, limit int, f TriageFilter) ([]*Sam
 	return db.triageGoodSQLite(ctx, limit, f)
 }
 
+// TriageHighest returns good-labeled samples the routed ensemble scores
+// hostile (litmus_class >= 2), worst first by litmus_score. These are the rows
+// that pin each route's operating point: a per-route threshold is placed at the
+// highest-scoring benign in the slice, so a single mislabelled or genuinely
+// hard benign caps the recall reported for its whole filetype.
+//
+// Three deliberate departures from TriageGood. There is no parent = ''
+// predicate — 95.8% of benign PE scoring >= 0.9999 are archive members, which
+// every other triage selector excludes. The drain anti-joins on the root sample
+// so one ruling on an archive covers every hot member inside it: a clean
+// package vouches for its contents as a whole. And skip = '' matches
+// collimator's LABELED_WHERE, so the queue only ever holds rows that actually
+// reach training — fixing a row the trainer already ignores moves nothing.
+// createdBefore keeps the queue off TriageGood's newest-first end of the table.
+//
+// Members whose path carries no "!!" archive delimiter are excluded: the API
+// cannot extract them (it answers 422, permanently), and a presence probe would
+// spend a round trip to learn what the path already says.
+func (db *DB) TriageHighest(ctx context.Context, limit int, createdBefore time.Time, f TriageFilter) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.triageHighestPG(ctx, limit, createdBefore, f)
+	}
+	return db.triageHighestSQLite(ctx, limit, createdBefore, f)
+}
+
+// TriageLowest is TriageHighest's mirror: bad-labeled samples the ensemble
+// scores clean (litmus_class = 0), best-hidden first by ascending litmus_score
+// — the detection misses.
+//
+// It drains per member rather than per archive, unlike TriageHighest. A bad
+// archive's malice lives in a few files while the rest is inert content that
+// inherited the label at explode time (hopper.go: members take the parent's
+// label under containment), so each member needs its own verdict and one
+// archive-level ruling must not speak for files it never opened.
+//
+// skip = '' does most of the filtering here: ~97% of low-scoring bad members
+// already carry skip-benign-archive-item, which collimator's LABELED_WHERE
+// excludes from training, so their inherited label harms nothing and they are
+// not worth a review. What remains — ~25k members and ~190k top-level rows —
+// is labelled bad, scored clean, and actually in the training set.
+func (db *DB) TriageLowest(ctx context.Context, limit int, createdBefore time.Time, f TriageFilter) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.triageLowestPG(ctx, limit, createdBefore, f)
+	}
+	return db.triageLowestSQLite(ctx, limit, createdBefore, f)
+}
+
 // TriageNew returns analyzed top-level unknown-labeled samples that cleave
 // flagged with at least one suspicious-or-hostile finding (suspicious_count >=
 // 1), taking up to limit of the most recently added (created_at). No skip/status
