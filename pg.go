@@ -441,6 +441,17 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// never touches the heap.
 		`CREATE INDEX IF NOT EXISTS idx_sl_containment ON sample_locations(sha256) ` +
 			`WHERE parent_sha256 <> '' AND rel IN ` + containmentRelsSQL,
+		// The inverse of idx_sl_containment: reference edges only — a package
+		// naming a dependency, a registry sidecar. Enumerates "everything ever
+		// referenced by something" without touching the containment edges that
+		// dominate the ledger.
+		//
+		// Keyed on id with sha256 included so a paged walk is index-only. That is
+		// what lets repairReferenceParents cost the number of referenced artifacts
+		// rather than the number of archive members, and it answers "what pulled
+		// this in" for the same price.
+		`CREATE INDEX IF NOT EXISTS idx_sl_reference ON sample_locations(id) ` +
+			`INCLUDE (sha256) WHERE parent_sha256 <> '' AND rel NOT IN ` + containmentRelsSQL,
 		`CREATE INDEX IF NOT EXISTS idx_sl_last_seen ON sample_locations(last_seen_at)`,
 
 		// One-shot backfill from the existing denormalized columns. Guarded
@@ -2278,30 +2289,79 @@ func (db *DB) reconcileLocationParentEdgesPG(ctx context.Context, cursor int64) 
 	return nil
 }
 
-// repairReferenceParentsPG walks samples by id, clearing the containment
-// columns on reference rows a window at a time. Same shape as the location
-// backfill above: bounded PK range scan per statement, cursor checkpointed after
-// each window so an interrupted run resumes where it stopped.
+// repairReferenceParentsPG repairs the rows explode damaged, driving from the
+// ledger's reference edges rather than from samples.
+//
+// Direction is the whole cost. Scanning samples means testing every row that has
+// a parent — the archive members, most of a 500M-row table — and probing the
+// ledger for each, to find a comparatively tiny set. Every damaged row
+// necessarily carries a reference edge (that is what explode mis-recorded), so
+// enumerating those edges reaches exactly the same rows while doing work
+// proportional to referenced artifacts. idx_sl_reference makes the walk
+// index-only.
+//
+// The full predicate still runs per candidate, so a sha that also has a genuine
+// containment edge is left alone: the edge list finds candidates, it does not
+// decide them.
 func (db *DB) repairReferenceParentsPG(ctx context.Context, cursor int64) error {
-	var maxID, repaired int64
-	if err := db.pool.QueryRow(ctx,
-		`SELECT COALESCE(max(id), 0) FROM samples WHERE parent <> ''`).Scan(&maxID); err != nil {
-		return fmt.Errorf("hopper: repair reference parents: bounds: %w", err)
-	}
-	for cursor < maxID {
+	var repaired, windows int64
+	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		hi := cursor + referenceParentRepairBatch
-		tag, err := db.pool.Exec(ctx, `
-			UPDATE samples
-			   SET parent = '', path = '', label = 'unknown', label_source = ''
-			 WHERE id > $1 AND id <= $2 AND `+referenceParentPredicate, cursor, hi)
+		// Keyset pagination over the reference index, not fixed id windows: ids
+		// are sparse (a ~1.8B id space over ~440M rows, and reference edges are a
+		// few percent of those), so stepping the id space in fixed strides would
+		// spend hundreds of thousands of round trips on windows containing nothing.
+		// Taking the next N edges from the index instead makes the iteration count
+		// proportional to the edges that actually exist.
+		//
+		// `targets` locks the rows it will update in sha256 order, matching the
+		// ordering every other writer of member rows uses (see
+		// insertMembersFromStagingPG's ORDER BY). Without it the planner acquires
+		// row locks in hash order, and a concurrent archive store touching the same
+		// shas in sha256 order closes a deadlock cycle — which aborts the whole
+		// repair, not just the window.
+		//
+		// One statement per window: pick the batch, lock and repair only the damaged
+		// rows in it, and return the new cursor and the repair count together. Each
+		// autocommits, so locks are held for one window, never across the run.
+		var nextCursor, n int64
+		err := db.pool.QueryRow(ctx, `
+			WITH batch AS (
+				SELECT id, sha256 FROM sample_locations
+				 WHERE id > $1 AND parent_sha256 <> '' AND rel NOT IN `+containmentRelsSQL+`
+				 ORDER BY id LIMIT $2
+			), targets AS (
+				SELECT s.sha256 FROM samples s
+				 WHERE s.sha256 IN (SELECT sha256 FROM batch)
+				   AND `+referenceParentPredicate("s")+`
+				 ORDER BY s.sha256
+				 FOR UPDATE OF s
+			), upd AS (
+				UPDATE samples
+				   SET parent = '',
+				       -- Only a virtual in-archive path is a lie. A row whose
+				       -- path was healed to real bytes on disk (an upload that
+				       -- landed after explode froze parent) keeps it: clearing
+				       -- it would strand bytes hopper actually holds.
+				       path = CASE WHEN path LIKE '%!!%' THEN '' ELSE path END,
+				       label = 'unknown', label_source = ''
+				 WHERE sha256 IN (SELECT sha256 FROM targets)
+				RETURNING 1
+			)
+			SELECT COALESCE((SELECT max(id) FROM batch), 0),
+			       (SELECT count(*) FROM upd)`,
+			cursor, referenceParentRepairBatch).Scan(&nextCursor, &n)
 		if err != nil {
-			return fmt.Errorf("hopper: repair reference parents: chunk (%d,%d]: %w", cursor, hi, err)
+			return fmt.Errorf("hopper: repair reference parents: window from %d: %w", cursor, err)
 		}
-		repaired += tag.RowsAffected()
-		cursor = hi
+		if nextCursor == 0 {
+			break // no reference edges past the cursor; done
+		}
+		repaired += n
+		windows++
+		cursor = nextCursor
 		if _, err := db.pool.Exec(ctx,
 			`INSERT INTO hopper_kv (key, value) VALUES ($1, $2)
 			 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
@@ -2315,7 +2375,7 @@ func (db *DB) repairReferenceParentsPG(ctx context.Context, cursor int64) error 
 		referenceParentRepairDoneKey); err != nil {
 		return fmt.Errorf("hopper: repair reference parents: done marker: %w", err)
 	}
-	slog.Info("reference-parent repair complete", "max_id", maxID, "repaired", repaired)
+	slog.Info("reference-parent repair complete", "repaired", repaired, "windows", windows)
 	return nil
 }
 
@@ -5217,6 +5277,26 @@ func scanPGCounts(rows pgx.Rows) (map[string]int, error) {
 // unanalyzedCandidatesPG returns Tier 1 work (samples that have never been
 // analyzed). A random SHA pivot avoids time/path clustering and spreads
 // concurrent pollers across the queue without ORDER BY random().
+// bigArchiveCandidatesPG selects the largest unanalyzed samples above minBytes.
+// A straight indexed scan (no random pivot) — big archives are rare, so the
+// whole pending set is small and cheap to order by size.
+func (db *DB) bigArchiveCandidatesPG(ctx context.Context, minBytes int64, hopperStart time.Time, limit int) ([]ClaimJob, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT sha256, path, size_bytes, file_type
+		FROM samples
+		WHERE size_bytes > $1
+		  AND cleave_result IS NULL AND skip = '' AND parent = ''
+		  AND (note = '' OR last_error_at IS NULL OR last_error_at < $2)
+		  AND attempts < $3
+		ORDER BY size_bytes DESC
+		LIMIT $4`,
+		minBytes, hopperStart.UTC(), maxClaimAttempts, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: big archive candidates: %w", err)
+	}
+	return scanClaimRows(rows)
+}
+
 func (db *DB) unanalyzedCandidatesPG(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
 	pivot := randomSHA256Pivot()
 	rows, err := db.pool.Query(ctx, `

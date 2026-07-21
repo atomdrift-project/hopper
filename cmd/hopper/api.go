@@ -193,8 +193,28 @@ type workerTracker struct {
 // claim records that a sha256 is currently out with a worker.
 type claim struct {
 	at     time.Time
+	lease  time.Duration // size-scaled hold before another worker may steal it
 	worker string
 	path   string // for dashboard/log display; avoids a per-worker DB lookup
+}
+
+// claimLease returns how long a claim on a sample of sizeBytes is held before
+// another worker may steal it. Small samples keep baseLease; a large archive
+// (a multi-GB ISO) whose scan can outrun the base gets a lease scaled to a
+// pessimistic scan-rate floor, capped at maxClaimLease — so a legitimately
+// in-progress big scan keeps its claim instead of being re-claimed mid-flight
+// (which would double the work and burn one of its limited retry attempts).
+func claimLease(baseLease time.Duration, sizeBytes int64) time.Duration {
+	lease := baseLease
+	if sizeBytes > 0 {
+		if scaled := time.Duration(sizeBytes/leaseBytesPerSecond) * time.Second; scaled > lease {
+			lease = scaled
+		}
+	}
+	if lease > maxClaimLease {
+		lease = maxClaimLease
+	}
+	return lease
 }
 
 type workerStats struct {
@@ -235,10 +255,11 @@ func newWorkerTracker() *workerTracker {
 }
 
 // tryClaimBatch picks up to want candidates that aren't currently held by
-// another worker (or whose hold is older than expiry), records them under
-// the given worker name, and returns the claimed jobs. Order of cands
-// determines priority — the caller pre-sorts.
-func (wt *workerTracker) tryClaimBatch(cands []hopper.ClaimJob, worker string, expiry time.Duration, want int) []hopper.ClaimJob {
+// another worker (or whose per-claim lease has elapsed), records them under
+// the given worker name, and returns the claimed jobs. baseLease is the minimum
+// hold; a large sample's lease is scaled up from it by claimLease. Order of
+// cands determines priority — the caller pre-sorts.
+func (wt *workerTracker) tryClaimBatch(cands []hopper.ClaimJob, worker string, baseLease time.Duration, want int) []hopper.ClaimJob {
 	if want <= 0 || len(cands) == 0 {
 		return nil
 	}
@@ -248,12 +269,12 @@ func (wt *workerTracker) tryClaimBatch(cands []hopper.ClaimJob, worker string, e
 	out := make([]hopper.ClaimJob, 0, want)
 	for _, c := range cands {
 		if existing, ok := wt.claims[c.SHA256]; ok {
-			if now.Sub(existing.at) < expiry {
+			if now.Sub(existing.at) < existing.lease {
 				continue
 			}
 			wt.decrementActiveLocked(existing.worker)
 		}
-		wt.claims[c.SHA256] = claim{worker: worker, path: c.Path, at: now}
+		wt.claims[c.SHA256] = claim{worker: worker, path: c.Path, at: now, lease: claimLease(baseLease, c.SizeBytes)}
 		out = append(out, c)
 		if len(out) == want {
 			break
@@ -297,6 +318,27 @@ func (wt *workerTracker) release(sha string) string {
 	return c.path
 }
 
+// renewClaims refreshes the hold timestamp on the worker's in-progress claims,
+// so a legitimately long-running scan (a multi-hour ISO) keeps its claim for as
+// long as the worker keeps heartbeating about it — instead of expiring after a
+// fixed lease and being re-claimed mid-flight. Scan time is driven by member
+// count, not bytes, so no size-derived lease can predict it; liveness can. Only
+// claims this worker actually holds are touched; unknown or other-worker shas
+// are ignored, so a stale or spoofed heartbeat can't extend someone else's hold.
+func (wt *workerTracker) renewClaims(worker string, shas []string, now time.Time) {
+	if len(shas) == 0 {
+		return
+	}
+	wt.mu.Lock()
+	defer wt.mu.Unlock()
+	for _, sha := range shas {
+		if c, ok := wt.claims[sha]; ok && c.worker == worker {
+			c.at = now
+			wt.claims[sha] = c
+		}
+	}
+}
+
 // releaseMany drops a batch of claims.
 func (wt *workerTracker) releaseMany(shas []string) {
 	if len(shas) == 0 {
@@ -336,13 +378,12 @@ func (wt *workerTracker) oldestPerWorker(maxAge time.Duration) map[string]hopper
 	return out
 }
 
-func (wt *workerTracker) pruneExpiredClaimsLocked(worker string, expiry time.Duration, now time.Time) {
-	if expiry <= 0 {
-		return
-	}
-	cutoff := now.Add(-expiry)
+// pruneExpiredClaimsLocked drops the named worker's claims whose per-claim lease
+// (size-scaled at claim time) has elapsed, so a worker's stale holds don't count
+// against its claim limit.
+func (wt *workerTracker) pruneExpiredClaimsLocked(worker string, now time.Time) {
 	for sha, c := range wt.claims {
-		if c.worker == worker && c.at.Before(cutoff) {
+		if c.worker == worker && now.Sub(c.at) >= c.lease {
 			delete(wt.claims, sha)
 			wt.decrementActiveLocked(c.worker)
 		}
@@ -481,7 +522,7 @@ func (wt *workerTracker) claimLimit(name string) int {
 	if !ok {
 		return maxClaimCount
 	}
-	wt.pruneExpiredClaimsLocked(name, claimExpiry, time.Now())
+	wt.pruneExpiredClaimsLocked(name, time.Now())
 	if ws.Analyzed+ws.Errors > 0 {
 		return maxClaimCount // proven worker, no warmup cap
 	}
@@ -620,11 +661,26 @@ func (s *apiServer) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 const (
-	maxClaimCount      = 32
-	claimExpiry        = 30 * time.Minute
-	staleClaimAge      = 2 * time.Hour
-	maxWorkerNameLen   = 64
-	maxResultBodyBytes = 512 << 20 // 512 MiB — some archive cleave reports legitimately exceed 256 MiB.
+	maxClaimCount = 32
+	claimExpiry   = 30 * time.Minute // base (minimum) claim lease
+	staleClaimAge = 2 * time.Hour
+	// leaseBytesPerSecond scales a large sample's claim lease past claimExpiry so
+	// an in-progress multi-GB scan is not re-claimed mid-flight. A deliberately
+	// low, pessimistic scan-rate floor (not a real throughput figure) so the
+	// lease comfortably exceeds actual scan time: ~2 MiB/s → a 13 GiB ISO leases
+	// ~1.8 h. Small samples stay at claimExpiry.
+	leaseBytesPerSecond = 2 << 20
+	// maxClaimLease caps the size-scaled lease so a worker that dies mid-scan
+	// releases even a huge archive within a bounded window.
+	maxClaimLease    = 2 * time.Hour
+	maxWorkerNameLen = 64
+	// maxResultBodyBytes caps the DECOMPRESSED result body. Raised to 1 GiB for
+	// multi-GB OS ISOs, which explode into tens of thousands of members whose
+	// combined report can exceed 512 MiB. Ingestion holds the envelope and
+	// expands several times over, bounded by the resultSem fan-in (min(8,NCPU)),
+	// so the broker's worst-case result memory scales with this — size the hopper
+	// host accordingly, or add a low-concurrency large-result lane if it bites.
+	maxResultBodyBytes = 1 << 30 // 1 GiB
 	maxTrackedWorkers  = 200
 	apiQueryTimeout    = 30 * time.Second
 	resultStoreTimeout = 10 * time.Minute
@@ -675,8 +731,9 @@ const (
 	uploadBodyTimeout = 5 * time.Minute
 	// resultBodyTimeout caps how long the body of a single /api/result may
 	// take to arrive — the same slow-loris defense as uploadBodyTimeout, but
-	// roomier because a result body may reach maxResultBodyBytes (512 MiB).
-	// Workers run on the local network, so even a slow-link budget is ample.
+	// roomier because a result body may reach maxResultBodyBytes (1 GiB
+	// decompressed, though zstd-compressed far smaller on the wire). Workers run
+	// on the local network, so even a slow-link budget is ample.
 	resultBodyTimeout = 10 * time.Minute
 	// uploadTokenMinLen is the smallest acceptable HOPPER_UPLOAD_TOKEN.
 	// 32 chars yields >=128 bits with hex encoding, >=192 bits with base64.
@@ -856,6 +913,45 @@ func filterCandidatesBySize(cands []hopper.ClaimJob, maxBytes int64) []hopper.Cl
 	return out
 }
 
+const (
+	// bigArchiveBytes is the size above which a sample (a multi-GB OS ISO or
+	// similar container) is routed only to high-core workers. Unpacking and
+	// scanning it pins a machine for many minutes, so it belongs on a box that
+	// can chew through its members in parallel and still serve other work — not
+	// a small node it would monopolize.
+	bigArchiveBytes = 1 << 30 // 1 GiB
+	// bigArchiveMinSlots is the minimum advertised worker slots required to be
+	// offered a big archive.
+	bigArchiveMinSlots = 16
+)
+
+// filterCandidatesBySlots keeps big archives (> bigArchiveBytes) off workers
+// advertising fewer than bigArchiveMinSlots slots. Small workers keep serving
+// the high-rate stream of ordinary samples; a big archive simply waits for a
+// capable worker to poll — it stays unanalyzed (cleave_result IS NULL), so
+// nothing is lost, and the memory-admission gate on the capable worker still
+// governs how many it runs at once. A worker that reports no slot count
+// (older builds default to slots=1) is treated as small. Compacts in place.
+func filterCandidatesBySlots(cands []hopper.ClaimJob, slots int) []hopper.ClaimJob {
+	if slots >= bigArchiveMinSlots || len(cands) == 0 {
+		return cands
+	}
+	out := cands[:0]
+	for _, c := range cands {
+		if c.SizeBytes <= bigArchiveBytes {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// filterCandidates applies the worker-eligibility filters every claim tier
+// shares: tool capabilities, the worker's per-file size cap, and big-archive
+// slot routing. One place so a new eligibility rule can't be forgotten in a tier.
+func filterCandidates(cands []hopper.ClaimJob, tools *workerToolSet, maxBytes int64, slots int) []hopper.ClaimJob {
+	return filterCandidatesBySlots(filterCandidatesBySize(filterCandidatesByWorkerTools(cands, tools), maxBytes), slots)
+}
+
 // sizeClass buckets a job by on-disk size for handout interleaving:
 // 0 = small (<1 MiB), 1 = medium (<32 MiB), 2 = large. Matches the litmus
 // worker-benchmark classes so measurements line up across both repos.
@@ -927,6 +1023,23 @@ func interleaveBySizeClass(cands []hopper.ClaimJob) []hopper.ClaimJob {
 // persisted to the DB — the worker recomputes everything each beat, so a DB
 // write would be pure load with no recovery value.
 // GET /api/heartbeat?worker=nuc&slots=4&active=3&queue=2&fps=1.5&version=0.8.2&...
+// parseActiveSHAs splits a heartbeat's comma-separated in-progress-sha list,
+// keeping only well-formed sha256s and bounding the count (by the max a worker
+// could hold) so a malformed or hostile heartbeat can't drive an unbounded walk.
+func parseActiveSHAs(list string) []string {
+	parts := strings.Split(list, ",")
+	if len(parts) > maxClaimCount {
+		parts = parts[:maxClaimCount]
+	}
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if validSHA256(p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func (s *apiServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	worker := r.URL.Query().Get("worker")
 	if !validWorkerName(worker) {
@@ -960,6 +1073,12 @@ func (s *apiServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	hb.tools, _ = parseWorkerTools(q["tools"])
 	if n := queryIntDefault(q, "rss_mb", -1); n >= 0 {
 		hb.rssMB = n
+	}
+	// Refresh the lease on the worker's in-progress claims so a long-running scan
+	// (a multi-hour ISO) isn't re-claimed mid-flight. The list is bounded by the
+	// worker's slot count, so it stays small.
+	if active := q.Get("active_shas"); active != "" {
+		s.tracker.renewClaims(worker, parseActiveSHAs(active), now)
 	}
 	// Ages arrive relative to the worker's clock; anchor them to hopper's clock
 	// at receipt so the dashboard renders a live "x ago" without clock-sync.
@@ -1114,7 +1233,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	jobs, err := s.claimJobs(ctx, worker, count, toolCaps, maxBytes)
+	jobs, err := s.claimJobs(ctx, worker, count, toolCaps, maxBytes, slots)
 	if err != nil {
 		slog.Error("claim jobs failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
@@ -1328,8 +1447,8 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 			"remote", r.RemoteAddr, "waited_ms", waited.Milliseconds())
 	}
 	defer s.releaseResult()
-	// Slow-loris defense: bound how long the (up to 256 MiB) body may take to
-	// arrive, mirroring handleUpload. Uses the per-request response controller
+	// Slow-loris defense: bound how long the (up to maxResultBodyBytes) body may
+	// take to arrive, mirroring handleUpload. Uses the per-request response controller
 	// so it doesn't impose a global ReadTimeout on long-lived /data downloads.
 	// SetReadDeadline returns http.ErrNotSupported under httptest; harmless.
 	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(resultBodyTimeout)) //nolint:errcheck // optional
@@ -1500,7 +1619,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 // count that aren't held by another worker. Over-fetches so that
 // contention with other concurrent pollers doesn't starve a requester at
 // the head of the queue.
-func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, tools *workerToolSet, maxBytes int64) ([]hopper.ClaimJob, error) {
+func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, tools *workerToolSet, maxBytes int64, slots int) ([]hopper.ClaimJob, error) {
 	want := count
 	overfetch := max(count*candidateOverfetch, minCandidates)
 
@@ -1511,7 +1630,7 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, too
 	if err != nil {
 		return nil, err
 	}
-	cands = filterCandidatesBySize(filterCandidatesByWorkerTools(cands, tools), maxBytes)
+	cands = filterCandidates(cands, tools, maxBytes, slots)
 	out := s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)
 	if len(out) >= count {
 		return out, nil
@@ -1526,10 +1645,29 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, too
 	if err != nil {
 		return out, err
 	}
-	cands = filterCandidatesBySize(filterCandidatesByWorkerTools(cands, tools), maxBytes)
+	cands = filterCandidates(cands, tools, maxBytes, slots)
 	out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
 	if len(out) >= count {
 		return out, nil
+	}
+
+	// Tier B: big archives (multi-GB ISOs) for capable workers only. Rare and
+	// large, a big archive seldom falls inside a busy worker's small random-pivot
+	// poll window (Tier 1), so without a dedicated lookup it would be claimed
+	// almost only by large startup polls and could sit unscanned for a long time.
+	// A capable worker drains any pending one up front, regardless of poll size;
+	// the slot gate keeps big archives off small workers they would monopolize.
+	if slots >= bigArchiveMinSlots {
+		want = count - len(out)
+		cands, err = s.db.BigArchiveCandidates(ctx, bigArchiveBytes, s.hopperStart, want*candidateOverfetch)
+		if err != nil {
+			return out, err
+		}
+		cands = filterCandidates(cands, tools, maxBytes, slots)
+		out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
+		if len(out) >= count {
+			return out, nil
+		}
 	}
 
 	// Tier 1: the main unanalyzed-samples queue. Candidates arrive in random
@@ -1541,7 +1679,7 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, too
 	if err != nil {
 		return out, err
 	}
-	cands = interleaveBySizeClass(filterCandidatesBySize(filterCandidatesByWorkerTools(cands, tools), maxBytes))
+	cands = interleaveBySizeClass(filterCandidates(cands, tools, maxBytes, slots))
 	out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
 	if len(out) >= count {
 		return out, nil
@@ -1557,7 +1695,7 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, too
 	if err != nil {
 		return out, err
 	}
-	cands = filterCandidatesBySize(filterCandidatesByWorkerTools(cands, tools), maxBytes)
+	cands = filterCandidates(cands, tools, maxBytes, slots)
 	out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
 	if len(out) >= count {
 		return out, nil
@@ -1569,7 +1707,7 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, too
 		if err != nil {
 			return out, err
 		}
-		cands = filterCandidatesBySize(filterCandidatesByWorkerTools(cands, tools), maxBytes)
+		cands = filterCandidates(cands, tools, maxBytes, slots)
 		out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
 		if len(out) >= count {
 			return out, nil
@@ -1582,7 +1720,7 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, too
 		if err != nil {
 			return out, err
 		}
-		cands = filterCandidatesBySize(filterCandidatesByWorkerTools(cands, tools), maxBytes)
+		cands = filterCandidates(cands, tools, maxBytes, slots)
 		out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
 	}
 	return out, nil

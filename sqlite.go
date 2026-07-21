@@ -1439,31 +1439,49 @@ func (db *DB) badMembersByParentSQLite(ctx context.Context, parentSHA string) ([
 	return scanLiteSamples(rows)
 }
 
-// repairReferenceParentsSQLite mirrors repairReferenceParentsPG: one short
-// autocommit UPDATE per id window, so SQLite's whole-DB write lock is taken
-// briefly and released between chunks rather than held for the whole repair.
+// repairReferenceParentsSQLite mirrors repairReferenceParentsPG: driven from the
+// ledger's reference edges, one short autocommit statement per window so the
+// whole-DB write lock is taken briefly and released between chunks.
 func (db *DB) repairReferenceParentsSQLite(ctx context.Context, cursor int64) error {
-	var maxID, repaired int64
-	if err := db.lite.QueryRowContext(ctx,
-		`SELECT COALESCE(max(id), 0) FROM samples WHERE parent <> ''`).Scan(&maxID); err != nil {
-		return fmt.Errorf("hopper: repair reference parents: bounds: %w", err)
-	}
-	for cursor < maxID {
+	var repaired, windows int64
+	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		hi := cursor + referenceParentRepairBatch
+		// Keyset pagination over the reference edges; see the PG twin for why the
+		// id space cannot be stepped in fixed strides. SQLite takes two
+		// statements — no data-modifying CTE — but each is short and autocommits,
+		// so the whole-DB write lock is held only for the update.
+		var next sql.NullInt64
+		if err := db.lite.QueryRowContext(ctx, `
+			SELECT max(id) FROM (
+			  SELECT id FROM sample_locations
+			   WHERE id > ? AND parent_sha256 <> '' AND rel NOT IN `+containmentRelsSQL+`
+			   ORDER BY id LIMIT ?)`,
+			cursor, referenceParentRepairBatch).Scan(&next); err != nil {
+			return fmt.Errorf("hopper: repair reference parents: window from %d: %w", cursor, err)
+		}
+		if !next.Valid {
+			break // no reference edges past the cursor; done
+		}
 		res, err := db.lite.ExecContext(ctx, `
 			UPDATE samples
-			   SET parent = '', path = '', label = 'unknown', label_source = ''
-			 WHERE id > ? AND id <= ? AND `+referenceParentPredicate, cursor, hi)
+			   SET parent = '',
+			       path = CASE WHEN path LIKE '%!!%' THEN '' ELSE path END,
+			       label = 'unknown', label_source = ''
+			 WHERE sha256 IN (
+			       SELECT sha256 FROM sample_locations
+			        WHERE id > ? AND id <= ?
+			          AND parent_sha256 <> '' AND rel NOT IN `+containmentRelsSQL+`)
+			   AND `+referenceParentPredicate("samples"), cursor, next.Int64)
 		if err != nil {
-			return fmt.Errorf("hopper: repair reference parents: chunk (%d,%d]: %w", cursor, hi, err)
+			return fmt.Errorf("hopper: repair reference parents: window (%d,%d]: %w", cursor, next.Int64, err)
 		}
 		if n, aerr := res.RowsAffected(); aerr == nil {
 			repaired += n
 		}
-		cursor = hi
+		windows++
+		cursor = next.Int64
 		if _, err := db.lite.ExecContext(ctx,
 			`INSERT INTO hopper_kv (key, value) VALUES (?, ?)
 			 ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
@@ -1477,7 +1495,7 @@ func (db *DB) repairReferenceParentsSQLite(ctx context.Context, cursor int64) er
 		referenceParentRepairDoneKey); err != nil {
 		return fmt.Errorf("hopper: repair reference parents: done marker: %w", err)
 	}
-	slog.Info("reference-parent repair complete", "max_id", maxID, "repaired", repaired)
+	slog.Info("reference-parent repair complete", "repaired", repaired, "windows", windows)
 	return nil
 }
 
@@ -4046,6 +4064,20 @@ func (db *DB) feedDomainsSQLite(ctx context.Context, source, label string) ([]st
 
 // Pull-based work scheduling (SQLite). See pg.go for design rationale —
 // claim ownership lives in workerTracker, not the database.
+
+// bigArchiveCandidatesSQLite mirrors bigArchiveCandidatesPG: the largest
+// unanalyzed samples above minBytes, largest first.
+func (db *DB) bigArchiveCandidatesSQLite(ctx context.Context, minBytes int64, hopperStart time.Time, limit int) ([]ClaimJob, error) {
+	startCutoff := hopperStart.UTC().Format(time.RFC3339Nano)
+	return queryLiteCandidates(ctx, db.lite,
+		`SELECT sha256, path, size_bytes, file_type FROM samples
+		 WHERE size_bytes > ?
+		   AND cleave_result IS NULL AND skip = '' AND parent = ''
+		   AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
+		   AND attempts < ?
+		 ORDER BY size_bytes DESC
+		 LIMIT ?`, minBytes, startCutoff, maxClaimAttempts, limit)
+}
 
 func (db *DB) unanalyzedCandidatesSQLite(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
 	startCutoff := hopperStart.UTC().Format(time.RFC3339Nano)

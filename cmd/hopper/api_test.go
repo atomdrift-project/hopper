@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -57,14 +58,106 @@ func TestWorkerTrackerClaimExpiry(t *testing.T) {
 	if got := wt.tryClaimBatch(cands, "w1", time.Minute, 1); len(got) != 1 {
 		t.Fatalf("first claim: got %d, want 1", len(got))
 	}
+	// A claim's lease is fixed at claim time, so a fresh hold can't be stolen.
+	if got := wt.tryClaimBatch(cands, "w2", time.Minute, 1); len(got) != 0 {
+		t.Fatalf("w2 stole a fresh claim: %+v", got)
+	}
 
-	// Zero expiry treats every claim as already-expired and re-issues it.
-	got := wt.tryClaimBatch(cands, "w2", 0, 1)
+	// Age w1's hold past its lease; now w2 re-issues it and the active-claim
+	// accounting moves across.
+	wt.mu.Lock()
+	c := wt.claims["exp1"]
+	c.at = time.Now().Add(-2 * time.Minute)
+	wt.claims["exp1"] = c
+	wt.mu.Unlock()
+
+	got := wt.tryClaimBatch(cands, "w2", time.Minute, 1)
 	if len(got) != 1 || got[0].SHA256 != "exp1" {
-		t.Fatalf("zero-expiry steal: got %+v, want [{exp1 ...}]", got)
+		t.Fatalf("expired steal: got %+v, want [{exp1 ...}]", got)
 	}
 	if wt.activeClaims("w1") != 0 || wt.activeClaims("w2") != 1 {
 		t.Fatalf("active claims after steal: w1=%d w2=%d, want 0/1", wt.activeClaims("w1"), wt.activeClaims("w2"))
+	}
+}
+
+func TestClaimLease(t *testing.T) {
+	if got := claimLease(claimExpiry, 4*(1<<20)); got != claimExpiry {
+		t.Errorf("small (4 MiB) sample lease = %v, want base %v", got, claimExpiry)
+	}
+	iso := claimLease(claimExpiry, 13*(1<<30)) // 13 GiB
+	if iso <= claimExpiry {
+		t.Errorf("13 GiB ISO lease = %v, want > base %v", iso, claimExpiry)
+	}
+	if iso > maxClaimLease {
+		t.Errorf("13 GiB ISO lease = %v, want <= cap %v", iso, maxClaimLease)
+	}
+	if got := claimLease(claimExpiry, 1<<50); got != maxClaimLease {
+		t.Errorf("pathological sample lease = %v, want cap %v", got, maxClaimLease)
+	}
+}
+
+// TestBigArchiveClaimSurvivesBaseExpiry is the regression guard for the fix: a
+// multi-GB archive still being scanned must not be stealable just because the
+// base 30-minute lease elapsed, while an ordinary sample still is.
+func TestBigArchiveClaimSurvivesBaseExpiry(t *testing.T) {
+	wt := newWorkerTracker()
+	cands := []hopper.ClaimJob{{SHA256: "iso", Path: "p/iso", SizeBytes: 13 * (1 << 30)}}
+	if got := wt.tryClaimBatch(cands, "w1", claimExpiry, 1); len(got) != 1 {
+		t.Fatalf("claim: got %d, want 1", len(got))
+	}
+	// Age the claim past the base lease but within its size-scaled lease.
+	wt.mu.Lock()
+	for sha, c := range wt.claims {
+		c.at = time.Now().Add(-(claimExpiry + 10*time.Minute))
+		wt.claims[sha] = c
+	}
+	wt.mu.Unlock()
+	if got := wt.tryClaimBatch(cands, "w2", claimExpiry, 1); len(got) != 0 {
+		t.Fatalf("w2 stole a big archive still within its lease: %+v", got)
+	}
+
+	// A same-age ordinary sample (no size) is past its base lease and stealable.
+	small := []hopper.ClaimJob{{SHA256: "small", Path: "p/s"}}
+	wt.tryClaimBatch(small, "w1", claimExpiry, 1)
+	wt.mu.Lock()
+	c := wt.claims["small"]
+	c.at = time.Now().Add(-(claimExpiry + time.Minute))
+	wt.claims["small"] = c
+	wt.mu.Unlock()
+	if got := wt.tryClaimBatch(small, "w2", claimExpiry, 1); len(got) != 1 {
+		t.Fatalf("w2 could not steal an expired small claim: %+v", got)
+	}
+}
+
+// TestRenewClaimsExtendsLease covers the multi-hour-scan fix: a worker
+// heartbeating about an in-progress sha keeps its claim indefinitely, while a
+// non-owner's heartbeat can't extend (or steal) it.
+func TestRenewClaimsExtendsLease(t *testing.T) {
+	wt := newWorkerTracker()
+	cands := []hopper.ClaimJob{{SHA256: "iso", Path: "p", SizeBytes: 13 << 30}}
+	if got := wt.tryClaimBatch(cands, "w1", claimExpiry, 1); len(got) != 1 {
+		t.Fatalf("setup claim: got %d, want 1", len(got))
+	}
+	age := func(d time.Duration) {
+		wt.mu.Lock()
+		c := wt.claims["iso"]
+		c.at = time.Now().Add(d)
+		wt.claims["iso"] = c
+		wt.mu.Unlock()
+	}
+
+	// Past even the 2h lease cap, but the owner's heartbeat renews it → not stealable.
+	age(-3 * time.Hour)
+	wt.renewClaims("w1", []string{"iso"}, time.Now())
+	if got := wt.tryClaimBatch(cands, "w2", claimExpiry, 1); len(got) != 0 {
+		t.Fatalf("renewed claim was stolen: %+v", got)
+	}
+
+	// A non-owner's renewal is ignored; once truly stale, the claim is reclaimable.
+	age(-3 * time.Hour)
+	wt.renewClaims("w2", []string{"iso"}, time.Now())
+	if got := wt.tryClaimBatch(cands, "w2", claimExpiry, 1); len(got) != 1 || got[0].SHA256 != "iso" {
+		t.Fatalf("stale claim not reclaimable after non-owner renew: %+v", got)
 	}
 }
 
@@ -365,6 +458,94 @@ func TestFilterCandidatesBySize(t *testing.T) {
 		if uncapped := filterCandidatesBySize(cands, limit); len(uncapped) != len(cands) {
 			t.Fatalf("cap %d filtered candidates: %+v", limit, uncapped)
 		}
+	}
+}
+
+func TestFilterCandidatesBySlots(t *testing.T) {
+	cands := []hopper.ClaimJob{
+		{SHA256: "pkg", SizeBytes: 300 * (1 << 20)}, // 300 MiB — ordinary
+		{SHA256: "atcap", SizeBytes: 1 << 30},       // exactly 1 GiB
+		{SHA256: "iso", SizeBytes: (1 << 30) + 1},   // just over 1 GiB — big archive
+		{SHA256: "dvd", SizeBytes: 13 * (1 << 30)},  // 13 GiB DVD
+	}
+
+	// A small worker (< bigArchiveMinSlots) is offered no big archives.
+	got := filterCandidatesBySlots(cands, bigArchiveMinSlots-1)
+	if len(got) != 2 || got[0].SHA256 != "pkg" || got[1].SHA256 != "atcap" {
+		t.Fatalf("small-worker filter = %+v, want pkg and atcap only (<= 1 GiB)", got)
+	}
+
+	// A worker advertising slots=1 (older builds' default) counts as small.
+	if got := filterCandidatesBySlots(cands, 1); len(got) != 2 {
+		t.Fatalf("slots=1 worker got %d candidates, want 2", len(got))
+	}
+
+	// A big worker (>= bigArchiveMinSlots) keeps every candidate.
+	if got := filterCandidatesBySlots(cands, bigArchiveMinSlots); len(got) != len(cands) {
+		t.Fatalf("big-worker filter dropped candidates: %+v", got)
+	}
+}
+
+// TestClaimJobsBigArchiveDistribution asserts efficient work distribution for
+// rare multi-GB archives against two quirks the audit surfaced:
+//  1. a small worker must never be handed a big archive (routing), and
+//  2. a capable worker must claim a pending big archive even on a tiny
+//     steady-state poll — not only on a large startup poll. Before Tier B, a
+//     count=1 poll sampled too narrow a random-pivot window to surface the rare
+//     ISO, so a busy worker would seldom claim it.
+func TestClaimJobsBigArchiveDistribution(t *testing.T) {
+	ctx := context.Background()
+	db, err := hopper.Open(ctx, filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	// 200 ordinary small samples plus one rare 4 GiB ISO.
+	for i := range 200 {
+		sha := fmt.Sprintf("%064x", i)
+		if err := db.InsertSample(ctx, &hopper.Sample{
+			SHA256: sha, Source: "test", Label: "good", LabelSource: "test",
+			Path: "good/small/" + sha, SizeBytes: 1 << 20,
+		}); err != nil {
+			t.Fatalf("insert small %d: %v", i, err)
+		}
+	}
+	const isoSHA = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	if err := db.InsertSample(ctx, &hopper.Sample{
+		SHA256: isoSHA, Source: "test", Label: "good", LabelSource: "test",
+		Path: "good/iso/big.iso", SizeBytes: 4 << 30,
+	}); err != nil {
+		t.Fatalf("insert iso: %v", err)
+	}
+
+	api := &apiServer{tracker: newWorkerTracker(), db: db}
+
+	// (1) A sub-16-slot worker draining small work one job at a time is never
+	// handed the ISO.
+	for i := range 50 {
+		jobs, err := api.claimJobs(ctx, "small", 1, nil, 0, 8)
+		if err != nil {
+			t.Fatalf("small claim %d: %v", i, err)
+		}
+		for _, j := range jobs {
+			if j.SHA256 == isoSHA {
+				t.Fatalf("small worker (8 slots) was handed the ISO")
+			}
+		}
+	}
+
+	// (2) A capable worker's first single-job poll claims the ISO up front,
+	// despite the tiny poll window.
+	jobs, err := api.claimJobs(ctx, "big", 1, nil, 0, 16)
+	if err != nil {
+		t.Fatalf("big claim: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].SHA256 != isoSHA {
+		t.Fatalf("capable worker's count=1 poll = %+v, want the ISO up front", jobs)
 	}
 }
 

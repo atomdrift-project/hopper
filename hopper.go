@@ -2291,7 +2291,9 @@ func (db *DB) reconcileLocationParentEdges(ctx context.Context) error {
 const (
 	referenceParentRepairDoneKey = "repair:samples:reference-parent:v1"
 	referenceParentRepairCurKey  = "repair:samples:reference-parent:cursor"
-	referenceParentRepairBatch   = 5000
+	// A window over sample_locations.id — the reference edges the repair walks,
+	// not samples.id.
+	referenceParentRepairBatch = 5000
 )
 
 // repairReferenceParents clears the containment columns on rows that were
@@ -2338,13 +2340,19 @@ func (db *DB) repairReferenceParents(ctx context.Context) error {
 
 // referenceParentPredicate matches a samples row making a containment claim the
 // ledger does not support: it names a parent, but no observation of it is a
-// containment edge. Written against the table name (no alias) so it composes
-// into both the repair and [DB.ContainmentViolations].
-const referenceParentPredicate = `samples.parent <> '' AND NOT EXISTS (
-	SELECT 1 FROM sample_locations sl
-	 WHERE sl.sha256 = samples.sha256
-	   AND sl.parent_sha256 <> ''
-	   AND sl.rel IN ` + containmentRelsSQL + `)`
+// containment edge. Those are the rows explode wrote for referenced artifacts.
+//
+// Takes the table alias rather than hardcoding one, so a caller that needs an
+// alias (the repair locks `samples s`) and one that does not (the monitor)
+// share a single definition of "damaged" instead of one rewriting the other's
+// SQL by string substitution.
+func referenceParentPredicate(alias string) string {
+	return alias + `.parent <> '' AND NOT EXISTS (
+		SELECT 1 FROM sample_locations sl
+		 WHERE sl.sha256 = ` + alias + `.sha256
+		   AND sl.parent_sha256 <> ''
+		   AND sl.rel IN ` + containmentRelsSQL + `)`
+}
 
 // ContainmentViolations counts rows whose containment columns claim more than
 // the ledger supports, stopping at limit. It is the standing proof that
@@ -2364,7 +2372,7 @@ func (db *DB) ContainmentViolations(ctx context.Context, limit int) (int, error)
 	if limit <= 0 {
 		limit = 100
 	}
-	q := `SELECT count(*) FROM (SELECT 1 FROM samples WHERE ` + referenceParentPredicate +
+	q := `SELECT count(*) FROM (SELECT 1 FROM samples WHERE ` + referenceParentPredicate("samples") +
 		` LIMIT $1) t`
 	var n int
 	var err error
@@ -2985,6 +2993,20 @@ func (db *DB) UnanalyzedCandidates(ctx context.Context, hopperStart time.Time, l
 		return db.unanalyzedCandidatesPG(ctx, hopperStart, limit)
 	}
 	return db.unanalyzedCandidatesSQLite(ctx, hopperStart, limit)
+}
+
+// BigArchiveCandidates returns up to limit unanalyzed samples larger than
+// minBytes (multi-GB ISOs and the like). Offered to capable workers ahead of
+// the random-pivot backlog: big archives are rare and large, so one seldom
+// falls inside a busy worker's small poll window — without a dedicated lookup it
+// would be claimed almost only by large startup polls and could sit unscanned
+// while ordinary work streams past. Largest first. Pure SELECT; claim ownership
+// lives in the API server's in-memory tracker.
+func (db *DB) BigArchiveCandidates(ctx context.Context, minBytes int64, hopperStart time.Time, limit int) ([]ClaimJob, error) {
+	if db.pool != nil {
+		return db.bigArchiveCandidatesPG(ctx, minBytes, hopperStart, limit)
+	}
+	return db.bigArchiveCandidatesSQLite(ctx, minBytes, hopperStart, limit)
 }
 
 // ForcedRescanCandidates returns up to limit Tier 0 jobs: samples an operator
