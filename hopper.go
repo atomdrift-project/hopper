@@ -162,6 +162,13 @@ const ReportTypeMissing = "missing"
 // without an operator having to clear anything.
 const MissingRetry = 4 * 24 * time.Hour
 
+// highestInnerScan bounds TriageHighest's member scan before it collapses hot
+// members to their archives. It must exceed the number of distinct roots a
+// batch could need by a wide margin; the hot set is concentrated enough (a few
+// hundred archives over the top thousands of members) that this is generous
+// while keeping the ordered index scan short.
+const highestInnerScan = 1000
+
 // CascadeDemoteScore is the minimum cleave risk score (samples.score) an
 // unlabeled archive member must carry to be demoted alongside a bad parent.
 // A bad archive's malice lives in a few members, not every file; shared benign
@@ -1802,6 +1809,18 @@ func PathInsideArchive(samplePath string) string {
 	return samplePath[idx+2:]
 }
 
+// ArchivePathOf returns the on-disk archive path of a member — everything
+// before the first "!!" delimiter — or "" for a top-level (non-member) path.
+// The complement of PathInsideArchive; nesting is one level in practice, so the
+// first delimiter is the archive boundary.
+func ArchivePathOf(samplePath string) string {
+	idx := strings.Index(samplePath, "!!")
+	if idx < 0 {
+		return ""
+	}
+	return samplePath[:idx]
+}
+
 // Errors returned by StreamArchiveMember (and the ExtractFromArchive wrapper)
 // so HTTP callers can map them to status codes before any bytes are written.
 var (
@@ -3316,18 +3335,24 @@ func (db *DB) TriageGood(ctx context.Context, limit int, f TriageFilter) ([]*Sam
 // highest-scoring benign in the slice, so a single mislabelled or genuinely
 // hard benign caps the recall reported for its whole filetype.
 //
-// Three deliberate departures from TriageGood. There is no parent = ''
-// predicate — 95.8% of benign PE scoring >= 0.9999 are archive members, which
-// every other triage selector excludes. The drain anti-joins on the root sample
-// so one ruling on an archive covers every hot member inside it: a clean
-// package vouches for its contents as a whole. And skip = '' matches
-// collimator's LABELED_WHERE, so the queue only ever holds rows that actually
-// reach training — fixing a row the trainer already ignores moves nothing.
-// createdBefore keeps the queue off TriageGood's newest-first end of the table.
+// The unit of work is the archive, not the member: the query finds hot good
+// members (no parent = '' predicate — 95.8% of benign PE scoring >= 0.9999 are
+// members, which every other selector excludes), then collapses them to their
+// root archive and returns one row per archive, ranked by its hottest member.
+// The worker fetches and judges that whole archive, so its provenance and
+// sibling files inform the call; the drain is keyed on the root, so one ruling
+// covers every hot member inside. A root is returned only when its own sample
+// is labelled good or unknown — a bad-labelled archive belongs to TriageLowest,
+// whose members it holds. skip = '' matches collimator's LABELED_WHERE, so the
+// queue only holds rows that actually reach training; fixing a row the trainer
+// already ignores moves nothing. createdBefore keeps the queue off TriageGood's
+// newest-first end of the table.
 //
-// Members whose path carries no "!!" archive delimiter are excluded: the API
-// cannot extract them (it answers 422, permanently), and a presence probe would
-// spend a round trip to learn what the path already says.
+// Members whose path carries no "!!" archive delimiter, or whose parent row is
+// itself absent, are excluded: the API cannot extract them (it answers 422 /
+// "parent not found", permanently), so a presence probe would spend a round
+// trip to learn what the row already says.
+//
 // Samples carrying a ReportTypeMissing marker newer than missingBefore are
 // suppressed: on an incomplete mirror ~70% of the top of this queue by score
 // has no bytes on disk, and without an expiring marker those rows would never

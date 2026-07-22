@@ -2475,9 +2475,11 @@ func (db *DB) triageGoodSQLite(ctx context.Context, limit int, f TriageFilter) (
 	return scanLiteSamples(rows)
 }
 
-// triageHighestSQLite: see TriageHighest. Mirrors triageHighestPG — no
-// parent = '' predicate (the operating-point setters are archive members), and
-// the drain keys on the root sample so one archive ruling covers its members.
+// triageHighestSQLite: see TriageHighest. Mirrors triageHighestPG — collapses
+// hot good members to their root archive and returns one sample row per archive
+// (good/unknown parents only), ranked by its hottest member. SQLite has no
+// DISTINCT ON, so the collapse is GROUP BY root with MAX(best); the innermost
+// LIMIT bounds the member scan before the grouping, same as the PG version.
 func (db *DB) triageHighestSQLite(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
 	extra, fargs := triageFilterClauseSQLite(f)
 	// litmusClassSQLite's two `?` (cutoff, then ceiling) come first in the SQL.
@@ -2489,17 +2491,25 @@ func (db *DB) triageHighestSQLite(ctx context.Context, limit int, createdBefore,
 	args = append(args, limit)
 	//nolint:gosec // G202: label/class predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleCols+` FROM samples
-		 WHERE label = 'good' AND cleave_result IS NOT NULL AND skip = ''
-		   AND `+litmusClassSQLite+` >= 2
-		   AND (parent = '' OR path LIKE '%!!%')
-		   AND (parent = '' OR EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = samples.parent))
-		   AND created_at < ?
-		   AND NOT EXISTS (SELECT 1 FROM reports r
-		                   WHERE r.sha256 = CASE WHEN samples.parent = '' THEN samples.sha256 ELSE samples.parent END
-		                     AND (r.report_type = 'highest'
-		                          OR (r.report_type = '`+ReportTypeMissing+`' AND r.created_at > ?)))`+extra+`
-		 ORDER BY litmus_score DESC, id DESC LIMIT ?`,
+		`SELECT `+liteSampleCols+` FROM (
+		   SELECT root, MAX(best) AS best FROM (
+		     SELECT CASE WHEN parent = '' THEN sha256 ELSE parent END AS root, litmus_score AS best
+		     FROM samples s0
+		     WHERE label = 'good' AND cleave_result IS NOT NULL AND skip = ''
+		       AND `+litmusClassSQLite+` >= 2
+		       AND (parent = '' OR path LIKE '%!!%')
+		       AND (parent = '' OR EXISTS (SELECT 1 FROM samples pp WHERE pp.sha256 = s0.parent))
+		       AND created_at < ?
+		       AND NOT EXISTS (SELECT 1 FROM reports r
+		                       WHERE r.sha256 = CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END
+		                         AND (r.report_type = 'highest'
+		                              OR (r.report_type = '`+ReportTypeMissing+`' AND r.created_at > ?)))`+extra+`
+		     ORDER BY litmus_score DESC
+		     LIMIT `+strconv.Itoa(highestInnerScan)+`
+		   ) hot GROUP BY root
+		 ) roots
+		 JOIN samples ON samples.sha256 = roots.root AND samples.label IN ('good', 'unknown')
+		 ORDER BY roots.best DESC, samples.id DESC LIMIT ?`,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage highest: %w", err)

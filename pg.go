@@ -3270,28 +3270,43 @@ func (db *DB) triageSecondOpinionPG(ctx context.Context, limit int, trusted []st
 	return scanPGSamples(rows)
 }
 
-// triageHighestPG: see TriageHighest. The drain anti-joins on the *root*
-// sample — a member's parent, or the sample itself when top-level — because
-// the worker triages whole archives: one ruling on `audacity-win.zip` covers
-// every hot DLL inside it, and keying the report on the member would re-queue
-// its 40 siblings on the next pass. Archive nesting is one level deep in
-// practice, so `parent` is always the root.
+// triageHighestPG: see TriageHighest. Returns one row per archive (the root
+// sample), not per hot member: the worker fetches and judges the whole archive,
+// so selecting its 40 hot members separately would re-fetch the same bytes 40
+// times and judge files in isolation. The inner scan walks the score-ordered
+// index over hot good members, DISTINCT ON collapses them to their root, and
+// the outer join resolves each root to its own sample row — restricted to
+// good/unknown parents, since a bad-labelled archive is TriageLowest's domain.
+//
+// The inner LIMIT bounds the collapse: it reads the top highestInnerScan
+// members by score before deduping to roots. Given how concentrated the hot
+// set is (a few hundred archives hold the top thousands of members), that is
+// far more than enough to fill a batch's worth of distinct archives, while
+// keeping the scan off the full multi-hundred-thousand-row partition.
 func (db *DB) triageHighestPG(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
 	extra, fargs := triageFilterClausePG(f, 3)
 	args := append([]any{createdBefore, missingBefore}, fargs...)
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM samples
-		 WHERE label = 'good' AND cleave_result IS NOT NULL AND skip = ''
-		   AND litmus_class >= 2
-		   AND (parent = '' OR path LIKE '%!!%')
-		   AND (parent = '' OR EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = samples.parent))
-		   AND created_at < $1
-		   AND NOT EXISTS (SELECT 1 FROM reports r
-		                   WHERE r.sha256 = CASE WHEN samples.parent = '' THEN samples.sha256 ELSE samples.parent END
-		                     AND (r.report_type = 'highest'
-		                          OR (r.report_type = '`+ReportTypeMissing+`' AND r.created_at > $2)))`+extra+`
-		 ORDER BY litmus_score DESC NULLS LAST, id DESC LIMIT $`+strconv.Itoa(len(args)),
+		`SELECT `+pgSampleCols+` FROM (
+		   SELECT DISTINCT ON (root) root, best FROM (
+		     SELECT CASE WHEN parent = '' THEN sha256 ELSE parent END AS root, litmus_score AS best
+		     FROM samples s0
+		     WHERE label = 'good' AND cleave_result IS NOT NULL AND skip = ''
+		       AND litmus_class >= 2
+		       AND (parent = '' OR path LIKE '%!!%')
+		       AND (parent = '' OR EXISTS (SELECT 1 FROM samples pp WHERE pp.sha256 = s0.parent))
+		       AND created_at < $1
+		       AND NOT EXISTS (SELECT 1 FROM reports r
+		                       WHERE r.sha256 = CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END
+		                         AND (r.report_type = 'highest'
+		                              OR (r.report_type = '`+ReportTypeMissing+`' AND r.created_at > $2)))`+extra+`
+		     ORDER BY litmus_score DESC NULLS LAST
+		     LIMIT `+strconv.Itoa(highestInnerScan)+`
+		   ) hot ORDER BY root, best DESC
+		 ) roots
+		 JOIN samples ON samples.sha256 = roots.root AND samples.label IN ('good', 'unknown')
+		 ORDER BY roots.best DESC NULLS LAST, samples.id DESC LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage highest: %w", err)
