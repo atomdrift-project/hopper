@@ -3276,19 +3276,21 @@ func (db *DB) triageSecondOpinionPG(ctx context.Context, limit int, trusted []st
 // every hot DLL inside it, and keying the report on the member would re-queue
 // its 40 siblings on the next pass. Archive nesting is one level deep in
 // practice, so `parent` is always the root.
-func (db *DB) triageHighestPG(ctx context.Context, limit int, createdBefore time.Time, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClausePG(f, 2)
-	args := append([]any{createdBefore}, fargs...)
+func (db *DB) triageHighestPG(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
+	extra, fargs := triageFilterClausePG(f, 3)
+	args := append([]any{createdBefore, missingBefore}, fargs...)
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
 		 WHERE label = 'good' AND cleave_result IS NOT NULL AND skip = ''
 		   AND litmus_class >= 2
 		   AND (parent = '' OR path LIKE '%!!%')
+		   AND (parent = '' OR EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = samples.parent))
 		   AND created_at < $1
 		   AND NOT EXISTS (SELECT 1 FROM reports r
 		                   WHERE r.sha256 = CASE WHEN samples.parent = '' THEN samples.sha256 ELSE samples.parent END
-		                     AND r.report_type = 'highest')`+extra+`
+		                     AND (r.report_type = 'highest'
+		                          OR (r.report_type = '`+ReportTypeMissing+`' AND r.created_at > $2)))`+extra+`
 		 ORDER BY litmus_score DESC NULLS LAST, id DESC LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
@@ -3303,9 +3305,9 @@ func (db *DB) triageHighestPG(ctx context.Context, limit int, createdBefore time
 // inert content that inherited the label, so each member needs its own verdict
 // and its own report row. Keying this drain on the parent would let one ruling
 // speak for files it never examined.
-func (db *DB) triageLowestPG(ctx context.Context, limit int, createdBefore time.Time, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClausePG(f, 2)
-	args := append([]any{createdBefore}, fargs...)
+func (db *DB) triageLowestPG(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
+	extra, fargs := triageFilterClausePG(f, 3)
+	args := append([]any{createdBefore, missingBefore}, fargs...)
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
@@ -3313,9 +3315,13 @@ func (db *DB) triageLowestPG(ctx context.Context, limit int, createdBefore time.
 		   AND litmus_class = 0
 		   AND label_source != 'conflict'
 		   AND (parent = '' OR path LIKE '%!!%')
+		   AND (parent = '' OR EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = samples.parent))
 		   AND created_at < $1
 		   AND NOT EXISTS (SELECT 1 FROM reports r
-		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'lowest')`+extra+`
+		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'lowest')
+		   AND NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = CASE WHEN samples.parent = '' THEN samples.sha256 ELSE samples.parent END
+		                     AND r.report_type = '`+ReportTypeMissing+`' AND r.created_at > $2)`+extra+`
 		 ORDER BY litmus_score ASC NULLS LAST, id DESC LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {

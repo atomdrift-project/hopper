@@ -793,23 +793,52 @@ func extractCanonicalSHA(sha256 string, raw json.RawMessage) string {
 
 const updateErrorDelay = 30 * time.Second
 
-// refreshLitmusRules runs `litmus update-rules` to pull the latest rule and
-// model bundles. The binary itself is already rebuilt by Start's background
-// goroutine via updateSiblingTool. If update-rules fails we pause briefly
-// so a concurrent rebuild has time to settle before we check the version.
-func refreshLitmusRules(ctx context.Context, bin string) {
-	ur := exec.CommandContext(ctx, bin, "update-rules")
-	if out, err := ur.CombinedOutput(); err != nil {
-		attrs := []any{"error", err, "output", string(out)}
-		attrs = append(attrs, commandDiagnostics(ur)...)
-		slog.Warn("litmus update-rules failed (non-fatal)", attrs...)
-		slog.Info("pausing after litmus update-rules error", "delay", updateErrorDelay)
-		select {
-		case <-time.After(updateErrorDelay):
-		case <-ctx.Done():
-		}
-	} else {
-		slog.Info("litmus update-rules succeeded", "bin", bin)
+// updateRulesTimeout bounds a single `update-rules` run. The subcommand fetches
+// over the network, and binding it only to the process-lifetime context would
+// let one stalled fetch hang forever — wedging both the startup stage and
+// superviseLocalWorker's retry loop, which could then never re-validate. Sized
+// to match preflightCleaveValidate's gate so a cold bundle fetch still fits.
+const updateRulesTimeout = 5 * time.Minute
+
+// refreshToolRules runs `<bin> update-rules` to pull the latest trait/rule and
+// model bundles for one tool; tool names it in logs ("litmus", "cleave").
+//
+// This is the only thing that advances a tool's bundles: both tools resolve
+// them from a data directory that is bootstrap-installed once and then reused
+// as-is forever, so a bundle left stale there is never repaired on its own. The
+// binaries themselves are rebuilt separately (Start's updateSiblingTool).
+//
+// Failure is non-fatal — we log it, pause briefly so a concurrent rebuild or
+// fetch can settle, and leave the retry to the caller.
+func refreshToolRules(ctx context.Context, tool, bin string) {
+	if bin == "" {
+		slog.Warn("skipping update-rules: no binary configured", "tool", tool)
+		return
+	}
+
+	// Bound the command, but pause on the parent context: when the command
+	// itself times out its context is already done, and the pause still has to
+	// hold off the caller's next attempt.
+	cmdCtx, cancel := context.WithTimeout(ctx, updateRulesTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(cmdCtx, bin, "update-rules")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		slog.Info("update-rules succeeded", "tool", tool, "bin", bin, "output", lastLines(out, 5))
+		return
+	}
+
+	attrs := []any{"tool", tool, "error", err, "output", lastLines(out, 30)}
+	if cmdCtx.Err() != nil && ctx.Err() == nil {
+		attrs = append(attrs, "timeout", updateRulesTimeout)
+	}
+	attrs = append(attrs, commandDiagnostics(cmd)...)
+	slog.Warn("update-rules failed (non-fatal)", attrs...)
+	slog.Info("pausing after update-rules error", "tool", tool, "delay", updateErrorDelay)
+	select {
+	case <-time.After(updateErrorDelay):
+	case <-ctx.Done():
 	}
 }
 
@@ -869,20 +898,23 @@ func lastNLines(s string, n int) string {
 // superviseLocalWorker keeps the in-process scan (atomscan) worker running for the
 // life of ctx and never gives up. It loops: validate cleave traits (retrying —
 // a fresh fetch may still be landing, or may have failed, in which case it
-// re-pulls rules), then start the worker and hand off to Monitor, which restarts
-// it on every crash. Every failure is logged and published to the dashboard
-// banner via setHealth; the worker is never permanently disabled and never
-// blocks ingestion — remote workers keep analyzing regardless.
-func superviseLocalWorker(ctx context.Context, litmus *litmusServer, litmusBin, cleaveBin string) {
+// re-pulls cleave's traits), then start the worker and hand off to Monitor,
+// which restarts it on every crash. Every failure is logged and published to the
+// dashboard banner via setHealth; the worker is never permanently disabled and
+// never blocks ingestion — remote workers keep analyzing regardless.
+func superviseLocalWorker(ctx context.Context, litmus *litmusServer, cleaveBin string) {
 	for attempt := 1; ctx.Err() == nil; attempt++ {
 		if detail, err := preflightCleaveValidate(ctx, cleaveBin); err != nil {
 			delay := workerRetryDelay(attempt)
 			litmus.setHealth(false, "cleave validate failed: "+err.Error(), detail)
 			slog.Error("local scan worker not started: cleave validate failed; retrying",
 				"error", err, "cleave_bin", cleaveBin, "attempt", attempt, "retry_in", delay)
-			// Re-pull rules in case the traits fetch genuinely failed, not just a
-			// startup race where they were still landing.
-			refreshLitmusRules(ctx, litmusBin)
+			// Re-pull cleave's traits — the bundle that just failed to validate.
+			// It must be cleave's own, not litmus': cleave resolves traits from a
+			// data dir it populates once and then never refreshes, so stale traits
+			// there are repaired only by this call. Refreshing any other tool here
+			// would leave the failure untouched and retry forever.
+			refreshToolRules(ctx, "cleave", cleaveBin)
 			if !sleepCtx(ctx, delay) {
 				return
 			}
@@ -979,29 +1011,46 @@ func cmdEnvValue(cmd *exec.Cmd, key string) (string, bool) {
 	return "", false
 }
 
+// dataHome is the platform data directory the tools resolve their bundles
+// against — Rust's dirs::data_dir, which both cleave and atomscan use:
+// $XDG_DATA_HOME when set, else $HOME/.local/share. Returns "" when neither is
+// known, so callers fall through to a bare relative path exactly as the tools
+// do. Read from the command's own environment so these paths describe the run
+// we are reporting on, not hopper's.
+func dataHome(cmd *exec.Cmd) string {
+	if val, ok := cmdEnvValue(cmd, "XDG_DATA_HOME"); ok && val != "" {
+		return val
+	}
+	if home := cmdHome(cmd); home != "" {
+		return filepath.Join(home, ".local", "share")
+	}
+	return ""
+}
+
+// resolvedTraitsDir mirrors cleave's traits_repo::resolve_and_ensure so the
+// diagnostics name the directory cleave actually reads: explicit override, then
+// a workspace-local "traits" checkout, then <data dir>/atomdrift/cleave/traits.
+// The atomdrift segment is load-bearing — dropping it names a path that does not
+// exist and sends the reader hunting the wrong bundle.
 func resolvedTraitsDir(cmd *exec.Cmd) string {
 	if val, ok := cmdEnvValue(cmd, "CLEAVE_TRAITS_DIR"); ok && val != "" {
 		return val
 	}
-	if looksLikeTraitsDir("traits") {
-		return "traits"
+	// cleave probes "traits" relative to its own working directory, so resolve
+	// the probe against cmd.Dir; an empty Dir means it inherits ours, which is
+	// what the bare relative path already means.
+	local := filepath.Join(cmd.Dir, "traits")
+	if info, err := os.Stat(local); err == nil && info.IsDir() {
+		return local
 	}
-	home := cmdHome(cmd)
-	if home == "" {
-		return filepath.Join("cleave", "traits")
-	}
-	return filepath.Join(home, ".local", "share", "cleave", "traits")
+	return filepath.Join(dataHome(cmd), "atomdrift", "cleave", "traits")
 }
 
 func resolvedModelsDir(cmd *exec.Cmd) string {
 	if val, ok := cmdEnvValue(cmd, "SCAN_MODELS_DIR"); ok && val != "" {
 		return val
 	}
-	home := cmdHome(cmd)
-	if home == "" {
-		return filepath.Join("atomdrift", "scan", "models")
-	}
-	return filepath.Join(home, ".local", "share", "atomdrift", "scan", "models")
+	return filepath.Join(dataHome(cmd), "atomdrift", "scan", "models")
 }
 
 func cmdHome(cmd *exec.Cmd) string {
@@ -1012,11 +1061,6 @@ func cmdHome(cmd *exec.Cmd) string {
 		return home
 	}
 	return ""
-}
-
-func looksLikeTraitsDir(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.IsDir()
 }
 
 func reproduceCommand(cmd *exec.Cmd, wd string, unsetKeys, setKeys []string) string {

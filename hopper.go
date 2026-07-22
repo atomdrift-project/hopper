@@ -136,6 +136,32 @@ const (
 	labelBad     = "bad"
 )
 
+// ReportTypeMissing marks a sample whose bytes a triage worker could not fetch
+// — the row outlived its file, which happens by design on a mirror running with
+// --dataset-incomplete, where markServeMissing deliberately does not set
+// skip='missing'. It is keyed on the root sample (a member's parent), since the
+// bytes that vanished are the archive's and every member shares their fate.
+//
+// The score-ranked queues need this because absence is otherwise undrainable:
+// a processed sample leaves via its queue's report row, but an unfetchable one
+// has no verdict to record, so it would hold its place at the top of a
+// score-ordered window forever while real work queued behind it. Selectors
+// treat the marker as expiring (see MissingRetry) rather than permanent, so a
+// re-synced pool brings its samples back on its own.
+//
+// Because it is parent-keyed and reports.sha256 has a foreign key to
+// samples.sha256, the selectors exclude members whose parent row is itself
+// absent (an orphaned "!!" path) — otherwise the insert would violate the FK.
+// Those members are unservable anyway (the API answers "parent not found"), so
+// dropping them from selection is correct independent of the marker.
+const ReportTypeMissing = "missing"
+
+// MissingRetry is how long a ReportTypeMissing marker suppresses a sample.
+// Long enough that a queue is not re-probing the same dead rows every cycle,
+// short enough that bytes restored to an incomplete mirror are picked up
+// without an operator having to clear anything.
+const MissingRetry = 4 * 24 * time.Hour
+
 // CascadeDemoteScore is the minimum cleave risk score (samples.score) an
 // unlabeled archive member must carry to be demoted alongside a bad parent.
 // A bad archive's malice lives in a few members, not every file; shared benign
@@ -2615,8 +2641,16 @@ type StoreStats struct {
 // timeout cannot abort a partially-applied store; the transaction itself is
 // all-or-nothing regardless.
 //
-// If cleave could not classify the file (FileType == ""), the row is deleted —
-// the belt-and-suspenders complement to cleave's ingest-time filter.
+// If cleave could not classify the file (FileType == ""), the row is tombstoned
+// with skip='unsupported' rather than deleted. The authoritative worker analysis
+// is retracting a row the cheaper ingest-time classifier (cleave iter-files)
+// created, but preserving the row is what makes that safe: a non-empty skip
+// drops it from the claim queue and training set (both gate on an empty skip),
+// so it is no longer re-analyzed, while the row staying present lets a concurrent
+// store of the same content SHA update it instead of hitting an absent-sample
+// error and retrying forever. This mirrors how a worker-reported "unsupported" error is
+// tombstoned, and remains the belt-and-suspenders complement to the ingest-time
+// filter; a later purge-unsupported sweep reaps these.
 func (db *DB) StoreResult(ctx context.Context, sha256 string, cleaveRaw, litmusML, llm []byte, parsed *CleaveParseResult, traitsVersion string) (StoreStats, error) {
 	var p CleaveParseResult
 	if parsed != nil {
@@ -2625,7 +2659,8 @@ func (db *DB) StoreResult(ctx context.Context, sha256 string, cleaveRaw, litmusM
 		p = ParseCleaveResult(sha256, cleaveRaw)
 	}
 	if p.FileInfo.FileType == "" {
-		return StoreStats{}, db.DeleteSample(ctx, sha256)
+		slog.Info("tombstoning unsupported sample (cleave returned no file type)", "sha256", sha256)
+		return StoreStats{}, db.SetSkip(ctx, sha256, "unsupported")
 	}
 	now := time.Now().UTC()
 	if db.pool != nil {
@@ -3293,11 +3328,15 @@ func (db *DB) TriageGood(ctx context.Context, limit int, f TriageFilter) ([]*Sam
 // Members whose path carries no "!!" archive delimiter are excluded: the API
 // cannot extract them (it answers 422, permanently), and a presence probe would
 // spend a round trip to learn what the path already says.
-func (db *DB) TriageHighest(ctx context.Context, limit int, createdBefore time.Time, f TriageFilter) ([]*Sample, error) {
+// Samples carrying a ReportTypeMissing marker newer than missingBefore are
+// suppressed: on an incomplete mirror ~70% of the top of this queue by score
+// has no bytes on disk, and without an expiring marker those rows would never
+// drain and would eventually fill the selection window.
+func (db *DB) TriageHighest(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.triageHighestPG(ctx, limit, createdBefore, f)
+		return db.triageHighestPG(ctx, limit, createdBefore, missingBefore, f)
 	}
-	return db.triageHighestSQLite(ctx, limit, createdBefore, f)
+	return db.triageHighestSQLite(ctx, limit, createdBefore, missingBefore, f)
 }
 
 // TriageLowest is TriageHighest's mirror: bad-labeled samples the ensemble
@@ -3315,11 +3354,14 @@ func (db *DB) TriageHighest(ctx context.Context, limit int, createdBefore time.T
 // excludes from training, so their inherited label harms nothing and they are
 // not worth a review. What remains — ~25k members and ~190k top-level rows —
 // is labelled bad, scored clean, and actually in the training set.
-func (db *DB) TriageLowest(ctx context.Context, limit int, createdBefore time.Time, f TriageFilter) ([]*Sample, error) {
+// The ReportTypeMissing marker is keyed on the root even though the queue's own
+// drain is per-member: a verdict applies to one file, but vanished bytes are the
+// parent archive's and take every member with them.
+func (db *DB) TriageLowest(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.triageLowestPG(ctx, limit, createdBefore, f)
+		return db.triageLowestPG(ctx, limit, createdBefore, missingBefore, f)
 	}
-	return db.triageLowestSQLite(ctx, limit, createdBefore, f)
+	return db.triageLowestSQLite(ctx, limit, createdBefore, missingBefore, f)
 }
 
 // TriageNew returns analyzed top-level unknown-labeled samples that cleave

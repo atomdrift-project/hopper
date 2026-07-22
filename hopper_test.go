@@ -366,6 +366,51 @@ func TestStoreResultAtomicMembers(t *testing.T) {
 	}
 }
 
+// TestStoreResultTombstonesUnsupportedFileType locks the tombstone contract: when
+// the worker's analysis cannot classify the file (empty file_type), StoreResult
+// marks the row skip='unsupported' and preserves it, rather than deleting it.
+// Preserving the row is what keeps a concurrent store of the same content SHA
+// from hitting an absent-sample error and retrying forever; the skip is what
+// drops it from the claim queue so it is not endlessly re-analyzed.
+func TestStoreResultTombstonesUnsupportedFileType(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	// A claimed, unanalyzed row whose cheap ingest classifier gave it a type.
+	sha := strings.Repeat("e", 64)
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: sha, Source: "test", Label: "unknown", LabelSource: "test",
+		Path: "unknown/mystery.bin", FileType: "elf",
+	})
+
+	// A result the authoritative pass could not classify: no fs[] entry for the
+	// sha → parsed file_type is empty.
+	stats, err := db.StoreResult(ctx, sha, []byte(`{"fs":[]}`), nil, nil, nil, "tv1")
+	if err != nil {
+		t.Fatalf("StoreResult(unsupported): %v", err)
+	}
+	if stats.Members != 0 {
+		t.Errorf("members = %d, want 0", stats.Members)
+	}
+
+	// The row is preserved (not deleted) and tombstoned skip='unsupported'.
+	row, err := db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatalf("row should be preserved, got err=%v", err)
+	}
+	if row.Skip != "unsupported" {
+		t.Errorf("skip = %q, want %q", row.Skip, "unsupported")
+	}
+
+	// Tombstoning an already-absent row is a harmless no-op, not an error — this
+	// is what lets a store racing a concurrent delete of the same SHA succeed
+	// instead of erroring out.
+	absent := strings.Repeat("f", 64)
+	if _, err := db.StoreResult(ctx, absent, []byte(`{"fs":[]}`), nil, nil, nil, "tv1"); err != nil {
+		t.Errorf("StoreResult(unsupported, absent row) = %v, want nil", err)
+	}
+}
+
 // TestStoreResultRecordsFetchedRel locks the provenance edge: a member whose
 // cleave node carries rel="fetched" (content retrieved from a URL the parent
 // references — never actually inside it) records that edge type on its

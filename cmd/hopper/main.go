@@ -1097,7 +1097,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	var traitsVersion string
 	if *litmusBin != "" {
 		wd.beginStage("litmus.rules", "Refreshing litmus rules")
-		refreshLitmusRules(ctx, *litmusBin)
+		refreshToolRules(ctx, "litmus", *litmusBin)
 		traitsVersion = litmusTraitsVersion(ctx, *litmusBin)
 		wd.endStage("litmus.rules")
 		if traitsVersion != "" {
@@ -1138,7 +1138,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		litmus.workerName = "local"
 		litmus.setHealth(false, "starting", "")
 		defer litmus.Stop()
-		go superviseLocalWorker(ctx, litmus, *litmusBin, *cleaveBinFlag)
+		go superviseLocalWorker(ctx, litmus, *cleaveBinFlag)
 	}
 
 	// Run independent startup work in parallel: hash cache load, DB
