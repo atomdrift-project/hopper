@@ -17,8 +17,8 @@ import (
 
 	"github.com/codeGROOVE-dev/fido"
 
-	"codeberg.org/atomdrift/hopper"
-	"codeberg.org/atomdrift/obs"
+	"github.com/atomdrift-project/hopper"
+	"github.com/atomdrift-project/obs"
 )
 
 // dashQueryTimeout bounds each dashboard stat query. The counts/aggregations

@@ -1,9 +1,9 @@
-codeberg.org/atomdrift/obs v0.0.0-20260619160844-cb5f9d8bdccd h1:w2Y50eZ8MIsPzPxBEa4lGoH7sBWv1lg8Ggy8HjphMak=
-codeberg.org/atomdrift/obs v0.0.0-20260619160844-cb5f9d8bdccd/go.mod h1:N3CvSuq9LM9bAt7dwB6s6sQxnEJZdliK5+2eRCcwHCA=
-codeberg.org/atomdrift/obs v0.0.0-20260627201349-c7b3fc663ee7 h1:jcq6l55mJK2BEBdQ1qAndAFwKAdvFJperCzY5tWQ/gQ=
-codeberg.org/atomdrift/obs v0.0.0-20260627201349-c7b3fc663ee7/go.mod h1:N3CvSuq9LM9bAt7dwB6s6sQxnEJZdliK5+2eRCcwHCA=
-codeberg.org/atomdrift/obs v0.0.0-20260703082727-3c749c4cdf21 h1:92VpnsEBRTKT8FAsdAJTN9cIarm7OkiMLaOhiKlL/bc=
-codeberg.org/atomdrift/obs v0.0.0-20260703082727-3c749c4cdf21/go.mod h1:N3CvSuq9LM9bAt7dwB6s6sQxnEJZdliK5+2eRCcwHCA=
+github.com/atomdrift-project/obs v0.0.0-20260619160844-cb5f9d8bdccd h1:w2Y50eZ8MIsPzPxBEa4lGoH7sBWv1lg8Ggy8HjphMak=
+github.com/atomdrift-project/obs v0.0.0-20260619160844-cb5f9d8bdccd/go.mod h1:N3CvSuq9LM9bAt7dwB6s6sQxnEJZdliK5+2eRCcwHCA=
+github.com/atomdrift-project/obs v0.0.0-20260627201349-c7b3fc663ee7 h1:jcq6l55mJK2BEBdQ1qAndAFwKAdvFJperCzY5tWQ/gQ=
+github.com/atomdrift-project/obs v0.0.0-20260627201349-c7b3fc663ee7/go.mod h1:N3CvSuq9LM9bAt7dwB6s6sQxnEJZdliK5+2eRCcwHCA=
+github.com/atomdrift-project/obs v0.0.0-20260703082727-3c749c4cdf21 h1:92VpnsEBRTKT8FAsdAJTN9cIarm7OkiMLaOhiKlL/bc=
+github.com/atomdrift-project/obs v0.0.0-20260703082727-3c749c4cdf21/go.mod h1:N3CvSuq9LM9bAt7dwB6s6sQxnEJZdliK5+2eRCcwHCA=
 github.com/andybalholm/brotli v1.2.1 h1:R+f5xP285VArJDRgowrfb9DqL18yVK0gKAW/F+eTWro=
 github.com/andybalholm/brotli v1.2.1/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
 github.com/andybalholm/brotli v1.2.2 h1:HzTuoo2ErYQqf5qvcJInB8uvqSVxRttzkFexPWtnceM=

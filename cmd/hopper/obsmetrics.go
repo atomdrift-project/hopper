@@ -14,7 +14,7 @@ import (
 // meterName scopes hopper's domain instruments. Per the atomdrift observability
 // conventions, domain metrics use a service-scoped meter (not the obs package
 // meter, which carries the shared HTTP/pool instrumentation).
-const meterName = "codeberg.org/atomdrift/hopper"
+const meterName = "github.com/atomdrift-project/hopper"
 
 // metricsCollectTimeout bounds the database work a single scrape may trigger.
 // The collector shares the dashboard's caches, so on a warm cache it does no

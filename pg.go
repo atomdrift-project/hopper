@@ -19,7 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
 
-	"codeberg.org/atomdrift/hopper/pkgparse"
+	"github.com/atomdrift-project/hopper/pkgparse"
 )
 
 func openPG(ctx context.Context, dsn string) (*DB, error) {

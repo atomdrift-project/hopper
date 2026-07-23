@@ -37,7 +37,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/mattn/go-sqlite3" // register sqlite3 driver
 
-	"codeberg.org/atomdrift/hopper/pkgparse"
+	"github.com/atomdrift-project/hopper/pkgparse"
 )
 
 const skipBenignArchiveItem = "skip-benign-archive-item"

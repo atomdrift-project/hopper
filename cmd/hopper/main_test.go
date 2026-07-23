@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"codeberg.org/atomdrift/hopper"
+	"github.com/atomdrift-project/hopper"
 )
 
 func mustWriteFile(t *testing.T, path string, data []byte) {

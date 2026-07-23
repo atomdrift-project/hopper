@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"codeberg.org/atomdrift/hopper"
+	"github.com/atomdrift-project/hopper"
 )
 
 func TestHandleTriageMovesAndFlips(t *testing.T) {

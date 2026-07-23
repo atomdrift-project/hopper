@@ -20,7 +20,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"codeberg.org/atomdrift/hopper"
+	"github.com/atomdrift-project/hopper"
 	"github.com/klauspost/compress/zstd"
 )
 

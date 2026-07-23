@@ -35,7 +35,7 @@ import (
 	"slices"
 	"sort"
 
-	"codeberg.org/atomdrift/hopper"
+	"github.com/atomdrift-project/hopper"
 )
 
 // demoteSightedSource is the label_source stamped on rows this backfill

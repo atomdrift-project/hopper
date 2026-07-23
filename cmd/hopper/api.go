@@ -27,8 +27,8 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"codeberg.org/atomdrift/hopper"
-	"codeberg.org/atomdrift/hopper/pkgparse"
+	"github.com/atomdrift-project/hopper"
+	"github.com/atomdrift-project/hopper/pkgparse"
 	"github.com/codeGROOVE-dev/retry"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/klauspost/compress/zstd"

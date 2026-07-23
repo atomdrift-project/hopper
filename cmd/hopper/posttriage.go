@@ -20,7 +20,7 @@ import (
 	"syscall"
 	"time"
 
-	"codeberg.org/atomdrift/hopper"
+	"github.com/atomdrift-project/hopper"
 )
 
 // post-triage closes the triage loop. After an operator (or an /xtriage-*

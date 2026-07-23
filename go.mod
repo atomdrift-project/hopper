@@ -1,9 +1,9 @@
-module codeberg.org/atomdrift/hopper
+module github.com/atomdrift-project/hopper
 
 go 1.25.4
 
 require (
-	codeberg.org/atomdrift/obs v0.0.0-20260703082727-3c749c4cdf21
+	github.com/atomdrift-project/obs v0.0.0-20260703082727-3c749c4cdf21
 	github.com/bodgit/sevenzip v1.6.5
 	github.com/codeGROOVE-dev/fido v1.11.0
 	github.com/codeGROOVE-dev/retry v1.3.1

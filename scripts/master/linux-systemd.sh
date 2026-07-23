@@ -161,8 +161,8 @@ fi
 # mode during deploy. Their Makefiles drop the binary into ./out/<name>;
 # we install those artifacts into TOOLS_DIR so the service has a single,
 # hopper-owned location to exec from.
-[[ -d ${SCAN_SRC}/.git ]] || die "Atomdrift Scan source not found at ${SCAN_SRC}; check out codeberg.org/atomdrift/scan there"
-[[ -d ${CLEAVE_SRC}/.git ]] || die "cleave source not found at ${CLEAVE_SRC}; check out codeberg.org/atomdrift/cleave there"
+[[ -d ${SCAN_SRC}/.git ]] || die "Atomdrift Scan source not found at ${SCAN_SRC}; check out github.com/atomdrift-project/scan there"
+[[ -d ${CLEAVE_SRC}/.git ]] || die "cleave source not found at ${CLEAVE_SRC}; check out github.com/atomdrift-project/cleave there"
 command -v cargo >/dev/null || die "cargo not found on PATH; install the Rust toolchain to build litmus and cleave"
 
 # --- Build -------------------------------------------------------------------
@@ -337,7 +337,7 @@ dataset_arg=""
 cat >"$tmp_unit" <<EOF
 [Unit]
 Description=Hopper sample ingester (spawns Atomdrift Scan workers)
-Documentation=https://codeberg.org/atomdrift/hopper
+Documentation=https://github.com/atomdrift-project/hopper
 After=network-online.target postgresql.service
 Wants=network-online.target
 
@@ -557,7 +557,7 @@ tmp_slice=$(mktemp -t "${SLICE_NAME}.slice.XXXXXX"); TMP_FILES+=("$tmp_slice")
 cat >"$tmp_slice" <<EOF
 [Unit]
 Description=Atomdrift sample pipeline memory budget (hopper + forager + promoter)
-Documentation=https://codeberg.org/atomdrift/hopper
+Documentation=https://github.com/atomdrift-project/hopper
 Before=slices.target
 
 [Slice]
@@ -664,7 +664,7 @@ tmp_heal_tmr=$(mktemp -t hopper-heal-perms.timer.XXXXXX); TMP_FILES+=("$tmp_heal
 cat >"$tmp_heal_svc" <<EOF
 [Unit]
 Description=Heal shared sample-tree permissions (group/setgid/read-only)
-Documentation=https://codeberg.org/atomdrift/hopper
+Documentation=https://github.com/atomdrift-project/hopper
 
 [Service]
 Type=oneshot

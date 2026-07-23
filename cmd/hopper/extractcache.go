@@ -8,7 +8,7 @@ import (
 	"os"
 	"sync"
 
-	"codeberg.org/atomdrift/hopper"
+	"github.com/atomdrift-project/hopper"
 	"golang.org/x/sync/singleflight"
 )
 

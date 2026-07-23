@@ -34,9 +34,9 @@ import (
 	"syscall"
 	"time"
 
-	"codeberg.org/atomdrift/hopper"
-	"codeberg.org/atomdrift/hopper/pkgparse"
-	"codeberg.org/atomdrift/obs"
+	"github.com/atomdrift-project/hopper"
+	"github.com/atomdrift-project/hopper/pkgparse"
+	"github.com/atomdrift-project/obs"
 )
 
 const usageText = `usage: hopper <command>

@@ -18,7 +18,7 @@ import (
 	"syscall"
 	"time"
 
-	"codeberg.org/atomdrift/hopper"
+	"github.com/atomdrift-project/hopper"
 )
 
 // litmusServer manages a local litmus worker subprocess. In pull mode,

@@ -4,7 +4,7 @@
 
 # hopper
 
-Job broker and sample store for the [atomdrift](https://codeberg.org/atomdrift) malware analysis pipeline. Hopper catalogs samples, distributes analysis work to [litmus](https://codeberg.org/atomdrift/litmus) workers, and publishes labeled results to [collimator](https://codeberg.org/atomdrift/collimator) for ML training.
+Job broker and sample store for the [atomdrift](https://github.com/atomdrift-project) malware analysis pipeline. Hopper catalogs samples, distributes analysis work to [litmus](https://github.com/atomdrift-project/litmus) workers, and publishes labeled results to [collimator](https://github.com/atomdrift-project/collimator) for ML training.
 
 ```
   samples ──► hopper ◄──► litmus workers (pull jobs, return verdicts)

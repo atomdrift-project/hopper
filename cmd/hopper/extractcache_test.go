@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"codeberg.org/atomdrift/hopper"
+	"github.com/atomdrift-project/hopper"
 	"github.com/ulikunitz/xz"
 )
 
