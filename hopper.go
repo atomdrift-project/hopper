@@ -1946,11 +1946,11 @@ func PathInsideArchive(samplePath string) string {
 // The complement of PathInsideArchive; nesting is one level in practice, so the
 // first delimiter is the archive boundary.
 func ArchivePathOf(samplePath string) string {
-	idx := strings.Index(samplePath, "!!")
-	if idx < 0 {
+	before, _, ok := strings.Cut(samplePath, "!!")
+	if !ok {
 		return ""
 	}
-	return samplePath[:idx]
+	return before
 }
 
 // Errors returned by StreamArchiveMember (and the ExtractFromArchive wrapper)

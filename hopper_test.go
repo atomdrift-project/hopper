@@ -17,7 +17,11 @@ import (
 
 func openTestDB(t *testing.T) *DB {
 	t.Helper()
-	ctx := context.Background()
+	return openTestDBContext(t, context.Background())
+}
+
+func openTestDBContext(t *testing.T, ctx context.Context) *DB {
+	t.Helper()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)

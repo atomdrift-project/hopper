@@ -194,9 +194,9 @@ type workerTracker struct {
 // claim records that a sha256 is currently out with a worker.
 type claim struct {
 	at     time.Time
-	lease  time.Duration // size-scaled hold before another worker may steal it
 	worker string
-	path   string // for dashboard/log display; avoids a per-worker DB lookup
+	path   string
+	lease  time.Duration
 }
 
 // claimLease returns how long a claim on a sample of sizeBytes is held before
@@ -1687,7 +1687,9 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 // count that aren't held by another worker. Over-fetches so that
 // contention with other concurrent pollers doesn't starve a requester at
 // the head of the queue.
-func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, tools *workerToolSet, maxBytes int64, slots int) ([]hopper.ClaimJob, error) {
+func (s *apiServer) claimJobs(
+	ctx context.Context, worker string, count int, tools *workerToolSet, maxBytes int64, slots int,
+) ([]hopper.ClaimJob, error) {
 	want := count
 	overfetch := max(count*candidateOverfetch, minCandidates)
 

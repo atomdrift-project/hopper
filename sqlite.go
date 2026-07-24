@@ -1437,6 +1437,7 @@ func (db *DB) repairReferenceParentsSQLite(ctx context.Context, cursor int64) er
 		if !next.Valid {
 			break // no reference edges past the cursor; done
 		}
+		//nolint:gosec // G202: all interpolated SQL fragments are fixed internal constants, not input values
 		res, err := db.lite.ExecContext(ctx, `
 			UPDATE samples
 			   SET parent = '',

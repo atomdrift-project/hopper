@@ -109,18 +109,20 @@ func TestNoWriterRecordsAReferenceAsAMember(t *testing.T) {
 		write func(t *testing.T, db *DB, s *Sample)
 	}{
 		{"InsertSample", func(t *testing.T, db *DB, s *Sample) {
+			t.Helper()
 			if err := db.InsertSample(ctx, s); err != nil {
 				t.Fatalf("InsertSample: %v", err)
 			}
 		}},
 		{"InsertSampleBatch", func(t *testing.T, db *DB, s *Sample) {
+			t.Helper()
 			if _, _, err := db.InsertSampleBatch(ctx, []*Sample{s}); err != nil {
 				t.Fatalf("InsertSampleBatch: %v", err)
 			}
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			db := openTestDB(t)
+			db := openTestDBContext(t, ctx)
 			mustInsert(t, ctx, db, &Sample{SHA256: archive, Path: "unknown/foraged/npm/app.tgz"})
 			dep := strings.Repeat("d", 64)
 			tc.write(t, db, depObservation(dep, archive))
