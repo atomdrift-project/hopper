@@ -80,11 +80,11 @@ var listingFeeds = map[string]string{
 }
 
 // backfillLabelSources are the label_source values a candidate may carry:
-// forager's direct inserts ("forager"), the pre-rename spelling ("harvest"),
-// and the odd walker row with no recorded source. Rows relabeled by markers,
-// conflict resolution, triage, or cyclotron are real evidence and never
-// candidates.
-var backfillLabelSources = []string{"forager", "harvest", ""}
+// forager's direct inserts ("forager"), hopper's own load-walk gap-fills
+// (SourceFilesystem), the pre-rename spelling ("harvest"), and the odd walker
+// row with no recorded source. Rows relabeled by markers, conflict resolution,
+// triage, or cyclotron are real evidence and never candidates.
+var backfillLabelSources = []string{"forager", hopper.SourceFilesystem, "harvest", ""}
 
 // demoteCandidate is one bad/foraged row to demote. litmusClass rides along
 // only for the dry-run report (it predicts how many rows promoter will

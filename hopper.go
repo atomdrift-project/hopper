@@ -614,11 +614,32 @@ type SampleLocation struct {
 	// "registry" for a provenance sidecar. "" on rows predating the column.
 	Rel       string
 	Filename  string
-	Source    string // "forager", "upload", ... ("harvest" persists on legacy rows)
+	// Source records what INSERTED this row (not its collector feed, which is
+	// Feed). Collector direct-inserts are "forager"/"upload"; rows hopper itself
+	// materializes while ingesting the sample tree use SourceFilesystem or
+	// SourceExploded. "harvest" persists on legacy pre-rename rows. Queries span
+	// every Source value rather than filtering to one — see FeedQuery.Source="".
+	Source    string
 	Feed      string
 	Ecosystem string
 	ID        int64
 }
+
+// Source values for rows hopper materializes itself, as distinct from a
+// collector's direct insert ("forager") or an interactive upload ("upload"):
+//   - SourceFilesystem: a top-level file the load-walk found on disk that no
+//     collector had inserted (e.g. the bespoke bad-feed corpora, which write
+//     bytes+sidecars but do not direct-insert).
+//   - SourceExploded: an archive member hopper extracted; the parent lineage is
+//     kept in Parent, so the member's own Source names its immediate producer.
+//
+// Legacy rows written before the collector rename carry "harvest"; it is not
+// re-emitted. Consumers must not exclude these values — reports span all
+// sources (FeedQuery.Source=="") so hopper-materialized rows are never dropped.
+const (
+	SourceFilesystem = "fs"
+	SourceExploded   = "x"
+)
 
 // Rel is the edge type from a sample to its parent, mirroring cleave's `rel`.
 // It answers one question: does the parent *contain* these bytes, or did it
@@ -1257,7 +1278,7 @@ func (e *memberEnvelope) buildRange(start, end int) []*Sample {
 		}
 		members = append(members, &Sample{
 			SHA256:          entry.SHA256,
-			Source:          e.parent.Source,
+			Source:          SourceExploded, // hopper extracted this row; parent lineage is in Parent
 			Feed:            e.parent.Feed,
 			Ecosystem:       e.parent.Ecosystem,
 			Filename:        inArchive,

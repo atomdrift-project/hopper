@@ -914,7 +914,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	f := flag.NewFlagSet("load", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
 	dataDir := f.String("data", "", "data directory containing bad/, good/, unknown/ subdirectories")
-	source := f.String("source", "forager", "sample source tag")
+	source := f.String("source", hopper.SourceFilesystem, "source tag for top-level rows this walk inserts that no collector already recorded (default \"fs\"; forager direct-inserts its own rows as \"forager\")")
 	// Deprecated: serving no longer prunes. Pruning location rows for gone files
 	// moved to the `hopper prune` subcommand so the ingest loop is never
 	// destructive and a partial mirror can't mark present-in-corpus files missing.

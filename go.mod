@@ -3,7 +3,7 @@ module github.com/atomdrift-project/hopper
 go 1.25.4
 
 require (
-	github.com/atomdrift-project/obs v0.0.0-20260703082727-3c749c4cdf21
+	github.com/atomdrift-project/obs v0.0.0-20260723192826-95a12564dd6f
 	github.com/bodgit/sevenzip v1.6.5
 	github.com/codeGROOVE-dev/fido v1.11.0
 	github.com/codeGROOVE-dev/retry v1.3.1
