@@ -3127,7 +3127,8 @@ func (s *apiServer) markServeMissing(ctx context.Context, sample *hopper.Sample,
 	if !errors.Is(err, os.ErrNotExist) || s.datasetIncomplete || sample.Skip != "" || sample.Parent != "" {
 		return
 	}
-	if _, rerr := os.Stat(s.dataRoot); rerr != nil {
+	if _, rerr := os.Stat(s.dataRoot); rerr != nil { //nolint:gosec // G703: dataRoot is trusted process configuration
+		//nolint:gosec // G706: structured logging of trusted process configuration and DB fields
 		slog.Error("data root inaccessible; not marking sample missing",
 			"data_root", s.dataRoot, "sha256", sample.SHA256, "error", rerr)
 		return

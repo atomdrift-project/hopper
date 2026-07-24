@@ -109,10 +109,13 @@ func ecosystemType(eco string) (string, bool) {
 		return t, true
 	}
 	switch eco {
+	// Agent-skill registries are identity-preserving too. ClawHub is its own
+	// registry (an invented type, like jetbrains/homebrew); skills.sh entries
+	// resolve to their backing repository later via domain/name normalization.
 	case "chrome", "firefox", "wordpress", "jetbrains", "snap", "jsr", "conda",
 		"hex", "cran", "cpan", "pub", "clojars",
 		"arch", "aur", "debian", "ubuntu", "fedora", "opensuse", "rpmfusion",
-		"alpine", "wolfi", "netbsd", "freebsd", "openbsd":
+		"alpine", "wolfi", "netbsd", "freebsd", "openbsd", "clawhub", "skills_sh":
 		return eco, true
 	// GitHub-hosted code under every label forager and the walker use for it
 	// (release downloads, actions, repo archives, and the samples.ecosystem
@@ -125,11 +128,6 @@ func ecosystemType(eco string) (string, bool) {
 	// pkg:oci type, host-qualified via repository_url.
 	case "oci", "docker":
 		return "oci", true
-	// Agent-skill registries. ClawHub is its own registry (an invented type,
-	// like jetbrains/homebrew); a skills.sh skill installs from its backing
-	// GitHub repo, so it resolves to that repo's pkg:github identity.
-	case "clawhub", "skills_sh":
-		return eco, true
 	default:
 		return "", false
 	}

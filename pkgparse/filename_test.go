@@ -150,8 +150,10 @@ func TestVersionForName(t *testing.T) {
 		{"runforge__ai-0.1.0.tgz", "@runforge/ai", "0.1.0"},
 		{"bearmetal__auth-0.0.4.tgz", "@bearmetal/auth", "0.0.4"},
 		// go module zip: slashes flattened to hyphens, pseudo-version tail.
-		{"github.com-stackrox-stackrox-v0.0.0-20260709101900-cfbbf6f1341e.zip",
-			"github.com/stackrox/stackrox", "v0.0.0-20260709101900-cfbbf6f1341e"},
+		{
+			"github.com-stackrox-stackrox-v0.0.0-20260709101900-cfbbf6f1341e.zip",
+			"github.com/stackrox/stackrox", "v0.0.0-20260709101900-cfbbf6f1341e",
+		},
 		// Unscoped name, prerelease suffix stays whole.
 		{"mypkg-1.0.0-beta.2.tgz", "mypkg", "1.0.0-beta.2"},
 		// Scoped npm in forager layout, digit-free name (sanity).

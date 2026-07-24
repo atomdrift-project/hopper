@@ -3403,6 +3403,46 @@ func TestFeedTopLevelOnlyExcludesArchiveChildren(t *testing.T) {
 	}
 }
 
+// TestFeedExcludesRegistrySidecars locks that the feed never lists provenance
+// sidecars — the `*.registry.json` snapshots cleave types "registry", stored
+// top-level beside a package. They describe an artifact rather than being one,
+// so both FeedSamples and FeedSamplesCount must drop them.
+func TestFeedExcludesRegistrySidecars(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// file_type is GENERATED from cleave_result's depth-0 type, so the sidecar
+	// gets file_type='registry' by carrying that type in its result.
+	resultWithType := func(sha, typ string) []byte {
+		return []byte(`{"fs":[{"sha":"` + sha + `","type":"` + typ + `","dp":0}]}`)
+	}
+
+	mustInsert(t, ctx, db, &Sample{SHA256: "pkg", Source: "test"})
+	if err := db.UpdateCleaveResult(ctx, "pkg", resultWithType("pkg", "npm"), nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	mustInsert(t, ctx, db, &Sample{SHA256: "sidecar", Source: "test"})
+	if err := db.UpdateCleaveResult(ctx, "sidecar", resultWithType("sidecar", "registry"), nil, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	q := FeedQuery{Source: "test", Limit: 10}
+	samples, err := db.FeedSamples(ctx, &q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 1 || samples[0].SHA256 != "pkg" {
+		t.Fatalf("feed = %+v, want just pkg (registry sidecar excluded)", samples)
+	}
+	n, err := db.FeedSamplesCount(ctx, &q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("feed count = %d, want 1 (registry sidecar excluded)", n)
+	}
+}
+
 // TestFeedSamplesProjectionOmitsBlobs locks the feed projection contract:
 // FeedSamples must not carry cleave_result (the archive member tree — up to
 // megabytes) or llm_result, which the feed never renders, while it must keep

@@ -106,7 +106,7 @@ type placement struct {
 func rulingPlan(_ *hopper.Sample, oldRel, ruling string) (placement, bool) {
 	sub := filepath.Base(oldRel) // not under a source root: preserve only the basename
 	for _, root := range promoteSrcRoots {
-		if rest := strings.TrimPrefix(oldRel, root); rest != oldRel {
+		if rest, ok := strings.CutPrefix(oldRel, root); ok {
 			sub = rest
 			break
 		}
@@ -270,7 +270,7 @@ func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun
 	// that contradicts where the bytes actually sit would be flipped back by
 	// the next load walk over the full corpus (pool precedence). The verdict
 	// is simply deferred until it is re-submitted on a host with the file.
-	if _, statErr := os.Stat(oldAbs); errors.Is(statErr, os.ErrNotExist) {
+	if _, statErr := os.Stat(oldAbs); errors.Is(statErr, os.ErrNotExist) { //nolint:gosec // G703: oldAbs is a DB sample path rooted at dataRoot
 		res.Status, res.Error = "absent", "bytes not on this host; re-submit once the full corpus is attached"
 		return res
 	}
@@ -313,6 +313,7 @@ func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun
 				res.Status, res.Error = "error", err.Error()
 				return res
 			}
+			//nolint:gosec // G703: newAbs was confined to dataRoot by resolveDataPath
 			if err := os.Remove(newAbs); err != nil && !errors.Is(err, os.ErrNotExist) {
 				res.Status, res.Error = "error", "clear suffixed slot: "+err.Error()
 				return res
@@ -320,7 +321,7 @@ func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun
 		}
 	}
 	if adopt {
-		if err := os.Remove(oldAbs); err != nil {
+		if err := os.Remove(oldAbs); err != nil { //nolint:gosec // G703: oldAbs is a DB sample path rooted at dataRoot
 			res.Status, res.Error = "error", "remove source after adopt: "+err.Error()
 			return res
 		}

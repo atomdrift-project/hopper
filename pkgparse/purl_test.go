@@ -129,13 +129,19 @@ func TestSourcePURL(t *testing.T) {
 		// pkg:oci per spec: version carries only the sha256:… digest (':'
 		// literal); a mutable tag rides the tag qualifier, sorted after
 		// repository_url; the repository path percent-encodes its slashes.
-		{"oci digest version", "oci", "docker.com", "ghcr.io/owner/img", "sha256:244fd47e07d10", "",
-			"pkg:oci/img@sha256:244fd47e07d10?repository_url=ghcr.io%2Fowner%2Fimg", true},
-		{"oci tag version", "docker", "docker.com", "nginx", "1.25-alpine", "",
-			"pkg:oci/nginx?repository_url=docker.io%2Flibrary%2Fnginx&tag=1.25-alpine", true},
+		{
+			"oci digest version", "oci", "docker.com", "ghcr.io/owner/img", "sha256:244fd47e07d10", "",
+			"pkg:oci/img@sha256:244fd47e07d10?repository_url=ghcr.io%2Fowner%2Fimg", true,
+		},
+		{
+			"oci tag version", "docker", "docker.com", "nginx", "1.25-alpine", "",
+			"pkg:oci/nginx?repository_url=docker.io%2Flibrary%2Fnginx&tag=1.25-alpine", true,
+		},
 		// GitHub versions are commits or tags, passed through opaquely.
-		{"github versioned", "github_repo", "github.com", "EvilOrg/BadRepo", "244fd47", "",
-			"pkg:github/evilorg/badrepo@244fd47", true},
+		{
+			"github versioned", "github_repo", "github.com", "EvilOrg/BadRepo", "244fd47", "",
+			"pkg:github/evilorg/badrepo@244fd47", true,
+		},
 
 		// Malformed coordinate for the type → no PURL.
 		{"maven missing group", "maven", "", "commons-lang3", "3.14.0", "", "", false},

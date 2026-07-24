@@ -1017,6 +1017,7 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 	// file_type, score, formula, litmus_score are GENERATED STORED columns
 	// (SQLite 3.31+). They auto-derive from cleave_result / litmus_result
 	// so writing to them is neither necessary nor legal.
+	//nolint:gosec // G202: the appended conflict clause is fixed internal SQL; all sample values remain parameterized
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename,
 			size_bytes, label, label_source, path, status,
@@ -1140,7 +1141,7 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		placeholders[i] = "?"
 	}
 
-	query := fmt.Sprintf( //nolint:gosec // column list and placeholders are derived from fixed local constants.
+	query := fmt.Sprintf(
 		`
 		INSERT INTO samples (%s)
 		VALUES (%s)
@@ -2254,7 +2255,9 @@ func (db *DB) samplesByLabelSQLite(ctx context.Context, label string, limit int)
 	return scanLiteSamples(rows)
 }
 
-func (db *DB) candidatesByLabelSQLite(ctx context.Context, label, pathPrefix string, olderThan time.Time, afterSHA string, limit int) ([]*Sample, error) {
+func (db *DB) candidatesByLabelSQLite(
+	ctx context.Context, label, pathPrefix string, olderThan time.Time, afterSHA string, limit int,
+) ([]*Sample, error) {
 	// Timestamps are stored as RFC3339Nano text and compare lexicographically
 	// (matching staleSamplesSQLite); mtime is written in the same format. GLOB is
 	// case-sensitive and uses the path index for a prefix match.
@@ -3963,7 +3966,11 @@ const litmusClassSQLite = `COALESCE(CAST(json_extract(litmus_result, '$.class') 
 	`ELSE 0 END)`
 
 func (q *FeedQuery) whereSQLite() (where string, args []any) {
-	clauses := []string{"source = ?", "cleave_result IS NOT NULL"}
+	// file_type <> 'registry' drops provenance sidecars — the `*.registry.json`
+	// snapshots cleave types "registry", stored top-level beside a package.
+	// They describe an artifact rather than being one, so the feed never lists
+	// them (mirrors the PG feed/count queries).
+	clauses := []string{"source = ?", "cleave_result IS NOT NULL", "file_type <> 'registry'"}
 	args = []any{q.Source}
 
 	if q.Label != "" {

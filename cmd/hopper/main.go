@@ -2890,13 +2890,13 @@ func attachSidecarProvenance(s *hopper.Sample, artifactPath string) {
 	}
 	s.Provenance = data
 	var meta struct {
+		Fetch struct {
+			At time.Time `json:"at"`
+		} `json:"fetch"`
 		Artifact struct {
 			Filename string `json:"filename"`
 			SHA256   string `json:"sha256"`
 		} `json:"artifact"`
-		Fetch struct {
-			At time.Time `json:"at"`
-		} `json:"fetch"`
 	}
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return

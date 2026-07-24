@@ -29,6 +29,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -115,7 +116,7 @@ func cmdDemoteSighted(ctx context.Context) error {
 	}
 	defer db.Close()
 	if db.Pool() == nil {
-		return fmt.Errorf("demote-sighted requires the postgres backend (sightings evidence lives there)")
+		return errors.New("demote-sighted requires the postgres backend (sightings evidence lives there)")
 	}
 
 	cands, err := demoteCandidates(ctx, db)

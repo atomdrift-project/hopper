@@ -143,10 +143,10 @@ var versionShape = regexp.MustCompile(`^v?\d[\w.+~-]*$`)
 //
 // Flattenings tried, in order:
 //
-//	@scope/pkg → @scope-pkg   (npm scoped tarballs in forager layout)
-//	@scope/pkg → scope__pkg   (jsr.io tarballs)
+//	@scope/pkg	→ @scope-pkg   (npm scoped tarballs in forager layout)
+//	@scope/pkg	→ scope__pkg   (jsr.io tarballs)
 //	a/b/c      → a-b-c        (go module zips)
-//	@scope/pkg → pkg          (npm registry-native tarball name)
+//	@scope/pkg	→ pkg          (npm registry-native tarball name)
 //	name as-is
 //
 // Returns "" when the name doesn't prefix the filename or the remainder
@@ -161,8 +161,8 @@ func VersionForName(filename, name string) string {
 	// ParseFilename patterns split them correctly, so defer to that.
 	base := ""
 	for _, ext := range archiveExtensions {
-		if strings.HasSuffix(filename, ext) {
-			base = strings.TrimSuffix(filename, ext)
+		if before, ok := strings.CutSuffix(filename, ext); ok {
+			base = before
 			break
 		}
 	}

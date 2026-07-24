@@ -4381,13 +4381,13 @@ func (db *DB) canonicalizeSightingSubjectsPG(ctx context.Context, dryRun bool) (
 			SELECT source, $3, url, note, first_seen FROM sightings
 			WHERE source = $1 AND subject = $2
 			ON CONFLICT (source, subject) DO NOTHING`, c.source, c.old, c.canon); err != nil {
-			tx.Rollback(ctx) //nolint:errcheck // already failing
-			return rewritten, fmt.Errorf("hopper: canonicalize sighting insert: %w", err)
+			rollbackErr := tx.Rollback(ctx)
+			return rewritten, errors.Join(fmt.Errorf("hopper: canonicalize sighting insert: %w", err), rollbackErr)
 		}
 		if _, err := tx.Exec(ctx, `
 			DELETE FROM sightings WHERE source = $1 AND subject = $2`, c.source, c.old); err != nil {
-			tx.Rollback(ctx) //nolint:errcheck // already failing
-			return rewritten, fmt.Errorf("hopper: canonicalize sighting delete: %w", err)
+			rollbackErr := tx.Rollback(ctx)
+			return rewritten, errors.Join(fmt.Errorf("hopper: canonicalize sighting delete: %w", err), rollbackErr)
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return rewritten, fmt.Errorf("hopper: canonicalize sighting commit: %w", err)
@@ -5203,6 +5203,7 @@ func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error
 			AND (NOT $13 OR corroborated)
 			AND ($14 = '' OR purl_base = $14)
 			AND ($15 = '' OR version = $15)
+			AND file_type <> 'registry'
 		ORDER BY `+q.sortBy()+`
 		LIMIT $10 OFFSET $11`,
 		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
@@ -5248,7 +5249,8 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q *FeedQuery) (int, error)
 				OR sha256 = $10 OR package = $14)
 			AND (NOT $11 OR corroborated)
 			AND ($12 = '' OR purl_base = $12)
-			AND ($13 = '' OR version = $13)`,
+			AND ($13 = '' OR version = $13)
+			AND file_type <> 'registry'`,
 		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
 		q.Formula, q.requireLitmus(), q.Domains, q.searchTerm(), q.Corroborated,
 		q.PURLBase, q.PURLVersion, q.packageTerm()).Scan(&n)

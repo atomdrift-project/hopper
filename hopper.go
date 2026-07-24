@@ -797,14 +797,9 @@ type Report struct {
 // without touching the cleave blob. Derived on write by the PG trigger and by
 // ParseCleaveResult for the SQLite path — keep the two in sync.
 type TopTrait struct {
-	ID   string `json:"id"`
-	Crit int    `json:"crit"`
-	// Dep is the machine-readable dependency identity scan attaches to its
-	// synthetic fetch/dependency-verdict trait ({locator, sha, type}).
-	// Forwarded opaquely — hopper never interprets the shape; scan produces
-	// it and prism formats it into the feed's dependency chip. Absent on
-	// every other trait and on rows scanned before scan emitted it.
-	Dep json.RawMessage `json:"dep,omitempty"`
+	ID   string          `json:"id"`
+	Dep  json.RawMessage `json:"dep,omitempty"`
+	Crit int             `json:"crit"`
 }
 
 // topTraitLimit caps the top_traits column at the few chips the feed renders.
@@ -831,12 +826,12 @@ type CleaveParseResult struct {
 
 type cleaveTraitEntry struct {
 	ID       string          `json:"id"`
-	OldID    string          `json:"i"` // v4
+	OldID    string          `json:"i"`
+	Dep      json.RawMessage `json:"dep"`
 	Conf     float64         `json:"conf"`
 	OldConf  float64         `json:"c"`
 	Level    int             `json:"crit"`
 	OldLevel int             `json:"l"`
-	Dep      json.RawMessage `json:"dep"` // see TopTrait.Dep
 }
 
 type cleaveCompactFileEntry struct {
