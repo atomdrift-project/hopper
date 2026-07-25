@@ -1395,14 +1395,20 @@ func (db *DB) topMemberSHAsByParentSQLite(ctx context.Context, parentSHA string,
 // the result the bare columns come from the row holding that max — i.e. each
 // parent's most-recent location.
 func (db *DB) parentArchivesForChildSQLite(ctx context.Context, childSHA string, limit int) ([]ParentRef, error) {
+	// Limit before the join (see parentArchivesForChildPG): the top-N distinct
+	// parents come from sample_locations alone; samples is joined for only those N.
 	rows, err := db.lite.QueryContext(ctx, `
-		SELECT s.sha256, s.filename, s.path, sl.path, sl.rel, s.litmus_result, s.analyzed_at, MAX(sl.last_seen_at) AS lsa
-		  FROM sample_locations sl
-		  JOIN samples s ON s.sha256 = sl.parent_sha256
-		 WHERE sl.sha256 = ? AND sl.parent_sha256 <> ''
-		 GROUP BY s.sha256
-		 ORDER BY lsa DESC
-		 LIMIT ?`, childSHA, limit)
+		SELECT s.sha256, s.filename, s.path, tp.loc_path, tp.rel, s.litmus_result, s.analyzed_at, tp.lsa
+		  FROM (
+		    SELECT parent_sha256, path AS loc_path, rel, MAX(last_seen_at) AS lsa
+		      FROM sample_locations
+		     WHERE sha256 = ? AND parent_sha256 <> ''
+		     GROUP BY parent_sha256
+		     ORDER BY lsa DESC
+		     LIMIT ?
+		  ) tp
+		  JOIN samples s ON s.sha256 = tp.parent_sha256
+		 ORDER BY tp.lsa DESC`, childSHA, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: parent archives for child %s: %w", childSHA, err)
 	}
@@ -1566,6 +1572,37 @@ func (db *DB) upsertLocationSQLite(ctx context.Context, loc *SampleLocation) err
 		loc.Source, loc.Feed, loc.Ecosystem, loc.Mtime)
 	if err != nil {
 		return fmt.Errorf("hopper: upsert location %s: %w", loc.SHA256, err)
+	}
+	return nil
+}
+
+// upsertLocationBatchSQLite applies the single-row upsert to every location in
+// one transaction — SQLite has no unnest, and one write lock beats one per row.
+func (db *DB) upsertLocationBatchSQLite(ctx context.Context, locs []*SampleLocation) error {
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("hopper: begin location batch: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
+	const q = `
+		INSERT INTO sample_locations
+			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (sha256, path) DO UPDATE SET
+			last_seen_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
+			rel = CASE WHEN excluded.rel != '' THEN excluded.rel ELSE sample_locations.rel END,
+			source = CASE WHEN excluded.source != '' THEN excluded.source ELSE sample_locations.source END,
+			feed = CASE WHEN excluded.feed != '' THEN excluded.feed ELSE sample_locations.feed END,
+			ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE sample_locations.ecosystem END,
+			mtime = COALESCE(excluded.mtime, sample_locations.mtime)`
+	for _, l := range locs {
+		if _, err := tx.ExecContext(ctx, q, l.SHA256, l.Path, l.ParentSHA256, l.Rel,
+			l.Filename, l.Source, l.Feed, l.Ecosystem, l.Mtime); err != nil {
+			return fmt.Errorf("hopper: upsert location %s: %w", l.SHA256, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("hopper: commit location batch: %w", err)
 	}
 	return nil
 }

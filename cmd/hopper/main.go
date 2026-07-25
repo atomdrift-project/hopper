@@ -1554,8 +1554,8 @@ func (p *loadProgress) recentErrors() []progressError {
 
 const (
 	loadBatchSize      = 2000
-	minFileSize        = 13                // skip trivially small files (markers, empty, etc.)
-	defaultMaxFileSize = 100 * 1024 * 1024 // 100 MiB
+	minFileSize        = 13                      // skip trivially small files (markers, empty, etc.)
+	defaultMaxFileSize = 20 * 1024 * 1024 * 1024 // 20 GiB — admit full OS images (ISO/UDF, DMG) from the os-image feed; cleave streams-to-temp and workers are memory-scheduled
 )
 
 const (

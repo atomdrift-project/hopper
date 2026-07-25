@@ -612,8 +612,8 @@ type SampleLocation struct {
 	// over the network from a reference the parent declares (never actually
 	// inside it), "unpacked" for a transform product (UPX, base64),
 	// "registry" for a provenance sidecar. "" on rows predating the column.
-	Rel       string
-	Filename  string
+	Rel      string
+	Filename string
 	// Source records what INSERTED this row (not its collector feed, which is
 	// Feed). Collector direct-inserts are "forager"/"upload"; rows hopper itself
 	// materializes while ingesting the sample tree use SourceFilesystem or
@@ -1812,6 +1812,29 @@ func (db *DB) UpsertLocation(ctx context.Context, loc *SampleLocation) error {
 		return db.upsertLocationPG(ctx, loc)
 	}
 	return db.upsertLocationSQLite(ctx, loc)
+}
+
+// UpsertLocationBatch records many observations in one round-trip — the same
+// upsert as UpsertLocation, applied to every row. It is the write path for a
+// producer that exploded a container itself (e.g. forager unpacking an ISO) and
+// needs to attach thousands of containment edges at once. Rows with an empty
+// sha256 or path are dropped. As with UpsertLocation, ON CONFLICT never rewrites
+// parent_sha256: a standalone (sha, path) already recorded keeps its identity, so
+// a containment edge must carry its own distinct in-archive path.
+func (db *DB) UpsertLocationBatch(ctx context.Context, locs []*SampleLocation) error {
+	valid := locs[:0]
+	for _, l := range locs {
+		if l != nil && l.SHA256 != "" && l.Path != "" {
+			valid = append(valid, l)
+		}
+	}
+	if len(valid) == 0 {
+		return nil
+	}
+	if db.pool != nil {
+		return db.upsertLocationBatchPG(ctx, valid)
+	}
+	return db.upsertLocationBatchSQLite(ctx, valid)
 }
 
 // PathInsideArchive returns the segment of an archive-member sample's
@@ -3352,14 +3375,14 @@ func (db *DB) TriageGood(ctx context.Context, limit int, f TriageFilter) ([]*Sam
 // hard benign caps the recall reported for its whole filetype.
 //
 // The unit of work is the archive, not the member: the query finds hot good
-// members (no parent = '' predicate — 95.8% of benign PE scoring >= 0.9999 are
+// members (no parent = ” predicate — 95.8% of benign PE scoring >= 0.9999 are
 // members, which every other selector excludes), then collapses them to their
 // root archive and returns one row per archive, ranked by its hottest member.
 // The worker fetches and judges that whole archive, so its provenance and
 // sibling files inform the call; the drain is keyed on the root, so one ruling
 // covers every hot member inside. A root is returned only when its own sample
 // is labelled good or unknown — a bad-labelled archive belongs to TriageLowest,
-// whose members it holds. skip = '' matches collimator's LABELED_WHERE, so the
+// whose members it holds. skip = ” matches collimator's LABELED_WHERE, so the
 // queue only holds rows that actually reach training; fixing a row the trainer
 // already ignores moves nothing. createdBefore keeps the queue off TriageGood's
 // newest-first end of the table.
@@ -3390,7 +3413,7 @@ func (db *DB) TriageHighest(ctx context.Context, limit int, createdBefore, missi
 // label under containment), so each member needs its own verdict and one
 // archive-level ruling must not speak for files it never opened.
 //
-// skip = '' does most of the filtering here: ~97% of low-scoring bad members
+// skip = ” does most of the filtering here: ~97% of low-scoring bad members
 // already carry skip-benign-archive-item, which collimator's LABELED_WHERE
 // excludes from training, so their inherited label harms nothing and they are
 // not worth a review. What remains — ~25k members and ~190k top-level rows —

@@ -2231,18 +2231,22 @@ func (db *DB) topMemberSHAsByParentPG(ctx context.Context, parentSHA string, lim
 // light-projection join. DISTINCT ON keeps each parent's most-recent location;
 // the outer ORDER BY then ranks parents by recency and caps the set.
 func (db *DB) parentArchivesForChildPG(ctx context.Context, childSHA string, limit int) ([]ParentRef, error) {
+	// Limit before the join: pick the top-N distinct parents from sample_locations
+	// first (served by idx_sl_sha256_parents), THEN join samples for only those N.
+	// The heavy TOASTed litmus_result is detoasted N times, not once per parent —
+	// which for a file shared across thousands of archives is the whole cost.
 	rows, err := db.pool.Query(ctx, `
-		SELECT sha256, filename, sample_path, loc_path, rel, litmus_result, analyzed_at FROM (
-			SELECT DISTINCT ON (s.sha256)
-			       s.sha256, s.filename, s.path AS sample_path, sl.path AS loc_path,
-			       sl.rel, s.litmus_result, s.analyzed_at, sl.last_seen_at
-			  FROM sample_locations sl
-			  JOIN samples s ON s.sha256 = sl.parent_sha256
-			 WHERE sl.sha256 = $1 AND sl.parent_sha256 <> ''
-			 ORDER BY s.sha256, sl.last_seen_at DESC
-		) d
-		ORDER BY d.last_seen_at DESC
-		LIMIT $2`, childSHA, limit)
+		WITH top_parents AS (
+			SELECT DISTINCT ON (parent_sha256)
+			       parent_sha256, path AS loc_path, rel, last_seen_at
+			  FROM sample_locations
+			 WHERE sha256 = $1 AND parent_sha256 <> ''
+			 ORDER BY parent_sha256, last_seen_at DESC
+		)
+		SELECT s.sha256, s.filename, s.path, tp.loc_path, tp.rel, s.litmus_result, s.analyzed_at
+		  FROM (SELECT * FROM top_parents ORDER BY last_seen_at DESC LIMIT $2) tp
+		  JOIN samples s ON s.sha256 = tp.parent_sha256
+		 ORDER BY tp.last_seen_at DESC`, childSHA, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: parent archives for child %s: %w", childSHA, err)
 	}
@@ -2426,6 +2430,41 @@ func (db *DB) upsertLocationPG(ctx context.Context, loc *SampleLocation) error {
 		loc.Source, loc.Feed, loc.Ecosystem, loc.Mtime)
 	if err != nil {
 		return fmt.Errorf("hopper: upsert location %s: %w", loc.SHA256, err)
+	}
+	return nil
+}
+
+// upsertLocationBatchPG applies the upsertLocationPG upsert to every row in one
+// round-trip via unnest — no per-row Exec and no staging table. Column arrays are
+// positional; keep them aligned with the INSERT list.
+func (db *DB) upsertLocationBatchPG(ctx context.Context, locs []*SampleLocation) error {
+	n := len(locs)
+	sha := make([]string, n)
+	path := make([]string, n)
+	parent := make([]string, n)
+	rel := make([]string, n)
+	filename := make([]string, n)
+	source := make([]string, n)
+	feed := make([]string, n)
+	eco := make([]string, n)
+	for i, l := range locs {
+		sha[i], path[i], parent[i], rel[i] = l.SHA256, l.Path, l.ParentSHA256, l.Rel
+		filename[i], source[i], feed[i], eco[i] = l.Filename, l.Source, l.Feed, l.Ecosystem
+	}
+	_, err := db.pool.Exec(ctx, `
+		INSERT INTO sample_locations
+			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem)
+		SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[],
+			$5::text[], $6::text[], $7::text[], $8::text[])
+		ON CONFLICT (sha256, path) DO UPDATE SET
+			last_seen_at = now(),
+			rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
+			source = CASE WHEN EXCLUDED.source <> '' THEN EXCLUDED.source ELSE sample_locations.source END,
+			feed = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE sample_locations.feed END,
+			ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE sample_locations.ecosystem END`,
+		sha, path, parent, rel, filename, source, feed, eco)
+	if err != nil {
+		return fmt.Errorf("hopper: upsert location batch (%d): %w", n, err)
 	}
 	return nil
 }
