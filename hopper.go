@@ -2575,6 +2575,10 @@ type ParentRef struct {
 	SamplePath   string // parent archive's own path (basename fallback for Filename)
 	Path         string // path of the child within this parent (from sample_locations)
 	Rel          string // edge type: "" contained, "fetched"/"unpacked"/"registry" (SampleLocation.Rel)
+	Feed         string // parent's feed, e.g. "osimage" — lets a renderer special-case image members
+	Ecosystem    string // parent's ecosystem, e.g. the OS name for an image container
+	Version      string // parent's version, e.g. an OS release — the clean value, not parsed from the filename
+	Package      string // parent's package id, e.g. "netbsd/amd64" (os/edition) for an image
 	AnalyzedAt   *time.Time
 	LitmusResult []byte // parent's raw verdict blob; cleave_result is never loaded
 }

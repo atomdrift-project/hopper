@@ -1398,7 +1398,7 @@ func (db *DB) parentArchivesForChildSQLite(ctx context.Context, childSHA string,
 	// Limit before the join (see parentArchivesForChildPG): the top-N distinct
 	// parents come from sample_locations alone; samples is joined for only those N.
 	rows, err := db.lite.QueryContext(ctx, `
-		SELECT s.sha256, s.filename, s.path, tp.loc_path, tp.rel, s.litmus_result, s.analyzed_at, tp.lsa
+		SELECT s.sha256, s.filename, s.path, tp.loc_path, tp.rel, s.feed, s.ecosystem, s.version, s.package, s.litmus_result, s.analyzed_at, tp.lsa
 		  FROM (
 		    SELECT parent_sha256, path AS loc_path, rel, MAX(last_seen_at) AS lsa
 		      FROM sample_locations
@@ -1419,7 +1419,7 @@ func (db *DB) parentArchivesForChildSQLite(ctx context.Context, childSHA string,
 		var litmus sql.NullString
 		var analyzedAt sql.NullTime
 		var lsa sql.NullString // ordering key only; never returned
-		if err := rows.Scan(&p.SHA256, &p.Filename, &p.SamplePath, &p.Path, &p.Rel, &litmus, &analyzedAt, &lsa); err != nil {
+		if err := rows.Scan(&p.SHA256, &p.Filename, &p.SamplePath, &p.Path, &p.Rel, &p.Feed, &p.Ecosystem, &p.Version, &p.Package, &litmus, &analyzedAt, &lsa); err != nil {
 			return nil, err
 		}
 		if litmus.Valid {

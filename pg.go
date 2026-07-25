@@ -2243,7 +2243,7 @@ func (db *DB) parentArchivesForChildPG(ctx context.Context, childSHA string, lim
 			 WHERE sha256 = $1 AND parent_sha256 <> ''
 			 ORDER BY parent_sha256, last_seen_at DESC
 		)
-		SELECT s.sha256, s.filename, s.path, tp.loc_path, tp.rel, s.litmus_result, s.analyzed_at
+		SELECT s.sha256, s.filename, s.path, tp.loc_path, tp.rel, s.feed, s.ecosystem, s.version, s.package, s.litmus_result, s.analyzed_at
 		  FROM (SELECT * FROM top_parents ORDER BY last_seen_at DESC LIMIT $2) tp
 		  JOIN samples s ON s.sha256 = tp.parent_sha256
 		 ORDER BY tp.last_seen_at DESC`, childSHA, limit)
@@ -2254,7 +2254,7 @@ func (db *DB) parentArchivesForChildPG(ctx context.Context, childSHA string, lim
 	var out []ParentRef
 	for rows.Next() {
 		var p ParentRef
-		if err := rows.Scan(&p.SHA256, &p.Filename, &p.SamplePath, &p.Path, &p.Rel, &p.LitmusResult, &p.AnalyzedAt); err != nil {
+		if err := rows.Scan(&p.SHA256, &p.Filename, &p.SamplePath, &p.Path, &p.Rel, &p.Feed, &p.Ecosystem, &p.Version, &p.Package, &p.LitmusResult, &p.AnalyzedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
