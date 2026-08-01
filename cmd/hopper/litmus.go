@@ -28,6 +28,17 @@ const (
 	restartRecoveryDelay = 15 * time.Second
 	litmusTmpSentinel    = ".hopper-litmus-managed"
 	livenessTimeout      = 25 * time.Minute
+	// startupTimeout is the budget for a freshly spawned worker to check in
+	// for the very first time, and is deliberately far longer than
+	// livenessTimeout. The two measure different things: livenessTimeout only
+	// has to cover the gap between two polls of a worker already in its steady
+	// state, while startup does bounded-but-slow work that scales with the
+	// corpus and the host — rule compilation, model load, and building the
+	// local sample index. Charging that against the wedge timeout is a
+	// deadlock: on 2026-08-01 a 3.5 M-file data dir on a saturated spindle
+	// took longer to index than the 25 min wedge window, so the worker was
+	// SIGKILLed mid-walk and restarted forever, never once polling for work.
+	startupTimeout = 2 * time.Hour
 	// wedgeDumpDelay is how long the liveness watchdog waits after sending
 	// SIGUSR1 (which makes litmus dump every thread's backtrace to its log)
 	// before SIGKILLing a wedged worker, so the dump has time to flush.
@@ -679,26 +690,35 @@ func (s *litmusServer) livenessWatchdog(ctx context.Context) {
 				}
 			}
 		}
-		// Count a fresh (re)start as activity: a just-spawned process must
-		// be given the full liveness window to load its model and start
-		// polling, rather than being judged by the previous process's
-		// heartbeat — which never advances until the new process checks in
-		// and would otherwise kill it on sight, wedging the restart loop.
-		ref := s.tracker.lastSeen(s.workerName)
-		if started := s.spawnTime(); started.After(ref) {
-			ref = started
+		// Which clock applies depends on whether this process has ever been
+		// heard from. Before its first check-in it is still starting up, and
+		// is judged from its spawn against the generous startupTimeout; the
+		// previous process's heartbeat is ignored, since it never advances
+		// until the new process checks in and would otherwise kill it on
+		// sight, wedging the restart loop. After the first check-in the
+		// tighter livenessTimeout applies to the gap since that check-in.
+		seen := s.tracker.lastSeen(s.workerName)
+		ref, budget, phase := s.spawnTime(), startupTimeout, "starting"
+		if seen.After(ref) {
+			ref, budget, phase = seen, livenessTimeout, "running"
 		}
 		if ref.IsZero() {
 			continue // nothing has started yet
 		}
 		idle := time.Since(ref)
-		if idle <= livenessTimeout {
+		if idle <= budget {
 			continue
+		}
+		lastSeen := "never"
+		if !seen.IsZero() {
+			lastSeen = seen.Format(time.RFC3339)
 		}
 		slog.Warn("local litmus worker appears wedged, dumping backtrace then killing",
 			"worker", s.workerName,
-			"last_seen", s.tracker.lastSeen(s.workerName).Format(time.RFC3339),
+			"phase", phase,
+			"last_seen", lastSeen,
 			"idle", idle.Round(time.Second),
+			"budget", budget,
 			"pid", pid)
 		if !s.dumpAndKill(ctx, pid, "failed to kill wedged litmus group") {
 			return
