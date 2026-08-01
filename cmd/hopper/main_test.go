@@ -1719,6 +1719,49 @@ func TestExtractPathProvenance(t *testing.T) {
 			},
 		},
 		{
+			// forager writes a scoped name as two directory levels, so the
+			// package is everything past the feed — not just the scope.
+			name:  "foraged scoped name spans two components",
+			path:  "/srv/data/unknown/foraged/javascript/npmjs.org/_/@vue/cli/cli-5.0.0.tgz",
+			label: "unknown",
+			want: pathProvenance{
+				ecosystem: "javascript",
+				domain:    "npmjs.org",
+				feed:      "npmjs.org",
+				pkg:       "@vue/cli",
+			},
+		},
+		{
+			// Promotion preserves the discovery subpath, so provenance is still
+			// recoverable one level deeper — in whichever grammar wrote it.
+			name:  "promoted foraged sample keeps its provenance",
+			path:  "/srv/data/good/foraged-promote/javascript/npmjs.org/aikido.dev/lodash/lodash-4.17.21.tgz",
+			label: "good",
+			want: pathProvenance{
+				ecosystem: "javascript",
+				domain:    "npmjs.org",
+				feed:      "aikido.dev",
+				pkg:       "lodash",
+			},
+		},
+		{
+			name:  "quarantined upload keeps its coordinate",
+			path:  "/srv/data/bad/foraged-quarantine/pkg/npm/lodash/4.17.21/lodash-4.17.21.tgz",
+			label: "bad",
+			want: pathProvenance{
+				ecosystem: "npm",
+				pkg:       "lodash",
+				version:   "4.17.21",
+				purl:      "pkg:npm/lodash@4.17.21",
+			},
+		},
+		{
+			name:  "reviewed upload keeps its origin domain",
+			path:  "/srv/data/unknown/foraged-bad-review/sha/example.com/3f/a9/3fa9c1/tool.tgz",
+			label: "unknown",
+			want:  pathProvenance{domain: "example.com"},
+		},
+		{
 			name:  "foraged with _ feed collapse expands to domain",
 			path:  "/srv/data/good/foraged/javascript/npmjs.org/_/lodash/lodash-1.0.0.tgz",
 			label: "good",

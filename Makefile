@@ -10,6 +10,12 @@ DASH_ADDR ?= 0.0.0.0:8081
 # with WORKERS=N (and MAX_MEMORY_GB=N, passed through to the systemd script) —
 # e.g. the 128-core box used WORKERS=56 to trade RAM headroom for throughput.
 WORKERS   ?= 0
+# Local atomscan worker RSS cap in GB, forwarded as --max-rss-gb. Same rule as
+# WORKERS: 0 defers to hopper's built-in default. Set it per-host on the deploy
+# invocation, and keep it under (hopper.service MemoryMax / rssKillFactor) —
+# 1.25x this value is where the liveness watchdog kills, and it has to land
+# below the cgroup limit or the kernel OOM killer wins the race instead.
+MAX_MEMORY_GB ?= 0
 
 help:
 	@echo "Available targets:"
@@ -19,7 +25,8 @@ help:
 	@echo "  make clean                  Clean build artifacts"
 	@echo "  make install-precommit      Install the git pre-commit hook (test + lint + go.mod)"
 	@echo "  make deploy                 Install as a hardened systemd service on this Linux host"
-	@echo "                              (DATA_DIR=$(DATA_DIR) DB=... SOURCE=$(SOURCE) DASH_ADDR=$(DASH_ADDR) WORKERS=$(WORKERS))"
+	@echo "                              (DATA_DIR=$(DATA_DIR) DB=... SOURCE=$(SOURCE) DASH_ADDR=$(DASH_ADDR)"
+	@echo "                               WORKERS=$(WORKERS) MAX_MEMORY_GB=$(MAX_MEMORY_GB))"
 	@echo "  make rollout-bastille       Deploy to Bastille jails (BUILD=build RUN=hopper [DB_ONLY=1])"
 	@echo "  make rollout-replica-bastille Deploy a Bastille jail as a logical replica"
 	@echo "                              (RUN=<jail> REMOTE_HOST=hopper-db SUBSCRIPTION=...;"
@@ -50,6 +57,7 @@ RUN ?= hopper
 deploy:
 	DATA_DIR='$(DATA_DIR)' DB='$(DB)' SOURCE='$(SOURCE)' \
 	DASH_ADDR='$(DASH_ADDR)' WORKERS='$(WORKERS)' \
+	MAX_MEMORY_GB='$(MAX_MEMORY_GB)' \
 	./scripts/master/linux-systemd.sh
 
 rollout-bastille:

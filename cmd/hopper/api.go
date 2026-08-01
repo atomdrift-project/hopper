@@ -751,9 +751,11 @@ const (
 	// chew through transient blips with full-jitter backoff; short enough
 	// to surface a real outage to logs without leaving the file orphaned.
 	uploadStoreTimeout = 2 * time.Minute
-	// uploadDir is the directory under dataRoot where interactive uploads
-	// land: <root>/unknown/uploads. Workers pick them up via the upload
-	// tier in claimJobs.
+	// uploadDir is the fallback upload root under dataRoot,
+	// <root>/unknown/uploads. A recognized producer gets its own tree (see
+	// uploadRelDir); this receives everything else, and holds the .tmp spool
+	// and extract cache shared by every upload. Workers pick uploads up via
+	// the upload tier in claimJobs regardless of which tree they landed in.
 	uploadDir = "unknown/uploads"
 )
 
@@ -1909,18 +1911,6 @@ type uploadResponse struct {
 	Size            int64  `json:"size"`
 }
 
-// reservedWindowsNames are device names that Windows treats specially in any
-// directory, with or without an extension. We never want to write a file
-// whose stem matches one of these — even on Linux deployments, the corpus
-// occasionally gets rsync'd onto Windows analyst boxes.
-var reservedWindowsNames = map[string]struct{}{
-	"con": {}, "prn": {}, "aux": {}, "nul": {},
-	"com1": {}, "com2": {}, "com3": {}, "com4": {}, "com5": {},
-	"com6": {}, "com7": {}, "com8": {}, "com9": {},
-	"lpt1": {}, "lpt2": {}, "lpt3": {}, "lpt4": {}, "lpt5": {},
-	"lpt6": {}, "lpt7": {}, "lpt8": {}, "lpt9": {},
-}
-
 // sanitizeUploadFilename returns a safe on-disk filename component, or ""
 // if nothing usable survives. Hardening, in order:
 //
@@ -1977,11 +1967,7 @@ func sanitizeUploadFilename(raw string) string {
 		return ""
 	}
 	// Reserved Windows device name (case-insensitive, with or without extension).
-	stem := strings.ToLower(out)
-	if i := strings.IndexByte(stem, '.'); i >= 0 {
-		stem = stem[:i]
-	}
-	if _, bad := reservedWindowsNames[stem]; bad {
+	if pkgparse.ReservedDeviceName(out) {
 		return ""
 	}
 	if len(out) > uploadFilenameMax {
@@ -2147,10 +2133,10 @@ func (s *apiServer) resolveDataPath(rel string) (string, error) {
 	return abs, nil
 }
 
-// handleUpload accepts an interactive file upload from prism, persists it
-// under <dataRoot>/unknown/uploads/<aa>/<bb>/<filename>, and inserts a
-// sample row tagged Source="upload" so the upload tier in claimJobs hands
-// it to the next free worker. The request body IS the file (no
+// handleUpload accepts a file upload from prism, a scan worker or a forager
+// node, persists it under the tree its provenance routes it to (see
+// uploadRelDir), and inserts a sample row tagged Source="upload" so the upload
+// tier in claimJobs hands it to the next free worker. The request body IS the file (no
 // multipart): keeps the streaming write zero-copy and lets prism just
 // io.Copy its incoming body straight through.
 //
@@ -2570,9 +2556,9 @@ func (s *apiServer) storeProvenanceOnly(w http.ResponseWriter, r *http.Request, 
 	_ = json.NewEncoder(w).Encode(map[string]any{"sha256": sha, "provenance_backfilled": applied})
 }
 
-// storeUpload streams src to a sha-sharded path under the uploads root while
-// hashing, verifies the bytes against the provenance claim (when present),
-// dedupes by sha, and upserts the sample row. prov is nil for the legacy raw
+// storeUpload streams src to the upload tree its provenance routes it to (see
+// uploadRelDir) while hashing, verifies the bytes against the provenance claim
+// (when present), dedupes by sha, and upserts the sample row. prov is nil for the legacy raw
 // path. When present, its scalar claims fill the descriptive columns, but the
 // trust-bearing label is never taken from it — an upload arrives over a lightly
 // trusted boundary, so analysis, not the producer, decides a sample's label.
@@ -2600,7 +2586,7 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 		return
 	}
 	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath) //nolint:errcheck // best-effort; succeeds on error path, no-op after rename
+	defer os.Remove(tmpPath) //nolint:errcheck // best-effort; drops the spool copy on both the error path and after the final link
 
 	hasher := sha256.New()
 	written, copyErr := io.Copy(io.MultiWriter(tmpFile, hasher), src)
@@ -2654,11 +2640,10 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
 
-	// Look up any existing row for this sha BEFORE writing the final path.
-	// If we already have this sample, reuse its on-disk filename rather
-	// than spawning a second copy under a new shard path — otherwise an
-	// uploader re-sending the same bytes with a rotating filename fills the
-	// disk despite the sha-level dedupe.
+	// Look up any existing row for this sha BEFORE writing the final path:
+	// placeUpload keeps bytes hopper already holds exactly where they are, so
+	// re-sending a known sample — under a rotating filename, or with provenance
+	// that would route it elsewhere entirely — never spawns a second copy.
 	existing, err := retryDBAccess(ctx, "upload sample lookup", sha, func(ctx context.Context) (*hopper.Sample, error) {
 		return s.db.SampleBySHA256(ctx, sha)
 	})
@@ -2667,53 +2652,19 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 	}
 	alreadyAnalyzed := existing != nil && len(existing.CleaveResult) > 0
 
-	// Final location: unknown/uploads/<aa>/<bb>/<filename>. hopper always picks
-	// this sha-shard — an upload never controls its on-disk path — so the bucket
-	// taxonomy a producer claims lives in the row's columns, not the layout.
-	// When the sha is already known, reuse the stored filename so we land at the
-	// same path instead of creating a duplicate.
-	if existing != nil && existing.Filename != "" {
-		if reuse := sanitizeUploadFilename(existing.Filename); reuse != "" {
-			filename = reuse
-		}
-	}
-	relDir := filepath.Join(uploadDir, sha[:2], sha[2:4])
-	relPath := filepath.Join(relDir, filename)
-	absDir, err := s.resolveDataPath(relDir)
+	relPath, err := s.placeUpload(r.Context(), tmpPath, sha, filename, prov, existing)
 	if err != nil {
-		slog.ErrorContext(r.Context(), "upload: shard path escapes data root", "rel", relDir, "error", err)
-		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid filename"}`)
-		return
-	}
-	absPath, err := s.resolveDataPath(relPath)
-	if err != nil {
-		slog.ErrorContext(r.Context(), "upload: target path escapes data root", "rel", relPath, "error", err)
-		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid filename"}`)
-		return
-	}
-	if err := mkdirSharedAll(absDir); err != nil {
-		slog.ErrorContext(r.Context(), "upload: mkdir shard", "error", err, "dir", absDir)
+		slog.ErrorContext(r.Context(), "upload: store bytes", "sha256", sha, "error", err)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
 	}
-	// Idempotent: if the file already exists for this sha, Rename atomically
-	// replaces it. Same content, same sha — bytes are identical.
-	if err := os.Rename(tmpPath, absPath); err != nil {
-		slog.Error("upload: rename", "error", err, "from", tmpPath, "to", absPath)
-		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
-		return
-	}
-	// Uploaded samples are immutable; force the read-only, group-readable sample
-	// mode (os.CreateTemp left the temp file at 0600, owner-only).
-	if err := os.Chmod(absPath, sampleFileMode); err != nil {
-		slog.Warn("upload: chmod sample read-only", "error", err, "path", absPath)
-	}
+	filename = filepath.Base(relPath)
 
 	// Insert (sticky upsert; no-op on the bytes for a duplicate sha). The store
 	// context is detached from r.Context() so a client disconnect during DB
 	// retries doesn't orphan the on-disk file behind a missing row; matches
 	// handleResult's persistence model.
-	sample := uploadSample(sha, filename, filepath.ToSlash(relPath), written, prov)
+	sample := uploadSample(sha, filename, relPath, written, prov)
 	storeCtx, cancelStore := context.WithTimeout(context.WithoutCancel(r.Context()), uploadStoreTimeout)
 	defer cancelStore()
 	if err := retryDBAccessNoValue(storeCtx, "upload sample insert", sha, func(ctx context.Context) error {
@@ -2738,6 +2689,101 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 		Size:            written,
 		AlreadyAnalyzed: alreadyAnalyzed,
 	})
+}
+
+// placeUpload publishes the spooled bytes and returns the path to record on the
+// row, relative to the data root and slash-separated.
+//
+// Bytes hopper already holds stay exactly where they are: an upload of a known
+// digest refreshes the row's provenance without laying down a second copy under
+// whatever path this handler would choose today. Producers negotiate with
+// /api/known before sending, so a re-send is rare — but the guarantee belongs on
+// this side of the trust boundary rather than in every client, and it is what
+// keeps a layout change from duplicating the corpus.
+//
+// The components uploadRelDir derives from producer claims are validated by
+// pkgparse.SafePathSegment, and every resulting path is confined to dataRoot by
+// resolveDataPath.
+//
+//nolint:gosec // G703: paths confined to dataRoot by resolveDataPath; see above
+func (s *apiServer) placeUpload(ctx context.Context, tmpPath, sha, filename string, prov *hopper.Sidecar, existing *hopper.Sample) (string, error) {
+	// Already recorded at a path whose file is still there: keep it.
+	if existing != nil && existing.Path != "" {
+		if abs, err := s.resolveDataPath(existing.Path); err == nil {
+			if _, err := os.Stat(abs); err == nil {
+				return existing.Path, nil
+			}
+		}
+	}
+	// A known digest re-sent under a rotating filename must not spawn a second
+	// copy, so the stored name wins over the claimed one.
+	if existing != nil && existing.Filename != "" {
+		if reuse := sanitizeUploadFilename(existing.Filename); reuse != "" {
+			filename = reuse
+		}
+	}
+
+	relDir, digestKeyed := uploadRelDir(sha, prov)
+	absPath, err := s.resolveDataPath(filepath.Join(relDir, filename))
+	if err != nil {
+		return "", err
+	}
+	// filename is a sanitized basename, so the target's parent is the shard.
+	absDir := filepath.Dir(absPath)
+	if err := mkdirSharedAll(absDir); err != nil {
+		return "", fmt.Errorf("mkdir %s: %w", absDir, err)
+	}
+	claimed, err := claimSamplePath(tmpPath, absPath, sha, digestKeyed)
+	if err != nil {
+		return "", err
+	}
+	if claimed != absPath {
+		slog.WarnContext(ctx, "upload: path held by another digest; stored under a qualified name",
+			"sha256", sha, "dir", relDir, "filename", filepath.Base(claimed))
+	}
+	// Uploaded samples are immutable; force the read-only, group-readable sample
+	// mode (os.CreateTemp left the spool file at 0600, owner-only).
+	if err := os.Chmod(claimed, sampleFileMode); err != nil {
+		slog.WarnContext(ctx, "upload: chmod sample read-only", "error", err, "path", claimed)
+	}
+	return filepath.ToSlash(filepath.Join(relDir, filepath.Base(claimed))), nil
+}
+
+// claimSamplePath publishes the spooled file at abs and returns the path it
+// actually claimed, which differs from abs only when abs was already held by a
+// different sample's bytes.
+//
+// It links rather than renames because a rename silently clobbers. Neither the
+// coordinate tier nor the legacy shard — keyed on only sha[:4] — makes a path
+// unique to one digest, so two unrelated samples sharing a filename collide, and
+// a corpus is full of "index.js" and "setup.py". The clobbered sample's row
+// survives the overwrite still pointing at the path, so its recorded digest no
+// longer describes the bytes stored there. os.Link fails with EEXIST instead,
+// making the collision observable.
+//
+// digestKeyed reports whether abs is derived from the full digest, in which case
+// an occupant can only be this same sample's bytes and is kept as-is.
+func claimSamplePath(src, abs, sha string, digestKeyed bool) (string, error) {
+	err := os.Link(src, abs)
+	if err == nil || (digestKeyed && errors.Is(err, os.ErrExist)) {
+		return abs, nil
+	}
+	if !errors.Is(err, os.ErrExist) {
+		return "", fmt.Errorf("link %s: %w", abs, err)
+	}
+	// Foreign bytes hold the path. Qualify with our own digest, which cannot
+	// collide with another sample; a second EEXIST is this sample's own earlier
+	// upload landing on the same qualified name. The digest goes before the
+	// extension so the file still sniffs as its own type
+	// ("…/ab/cd/index.js" → "…/ab/cd/index-9f2c1a7bd004.js"); twelve hex digits
+	// are far beyond collision range for the handful of samples that can share
+	// one path, and keep the name inside NAME_MAX given uploadFilenameMax.
+	ext := filepath.Ext(abs)
+	qualified := strings.TrimSuffix(abs, ext) + "-" + sha[:12] + ext
+	if err := os.Link(src, qualified); err != nil && !errors.Is(err, os.ErrExist) {
+		return "", fmt.Errorf("link %s: %w", qualified, err)
+	}
+	return qualified, nil
 }
 
 // uploadSample builds the row for a stored upload. Source is always "upload"
@@ -2781,6 +2827,13 @@ func uploadSample(sha, filename, relPath string, size int64, prov *hopper.Sideca
 		sample.FetchedAt = &at
 	}
 	sample.URL = prov.Fetch.URL
+	// Where the bytes were served from. Derived rather than claimed — the
+	// sidecar has no domain field — and the same eTLD+1 forager records, so
+	// uploads group alongside foraged samples in the domain column. An unknown
+	// origin leaves the column empty; only the path uses a placeholder.
+	if domain := uploadDomain(prov.Fetch.URL); domain != unknownDomain {
+		sample.Domain = domain
+	}
 	sample.Ecosystem = prov.Package.Ecosystem
 	sample.Package = prov.Package.Name
 	sample.Version = prov.Package.Version

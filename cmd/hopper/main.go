@@ -2930,6 +2930,11 @@ func fillSampleProvenance(s *hopper.Sample, prov pathProvenance, filename string
 	s.Domain = prov.domain
 	s.Package = prov.pkg
 	s.Version = prov.version
+	// A coordinate-tier upload path carries a complete PURL, so the walk can
+	// populate the queryable identity column without reading a sidecar.
+	if prov.purl != "" {
+		s.PURLBase = pkgparse.VersionlessPURL(prov.purl)
+	}
 	parsedName, parsedVersion, _ := pkgparse.ParseFilename(filename)
 	if s.Package == "" {
 		s.Package = parsedName
@@ -3022,6 +3027,11 @@ type pathProvenance struct {
 	domain    string
 	pkg       string
 	version   string
+	// purl is set only by the upload trees' coordinate tier, whose layout is a
+	// reversible projection of the PURL. The foraged layout cannot recover one:
+	// it names a registry and a package but never a version, so there is no
+	// complete coordinate to rebuild.
+	purl string
 }
 
 // extractPathProvenance parses provenance fields from a forager output path.
@@ -3052,11 +3062,38 @@ func extractPathProvenance(path, label string) pathProvenance {
 	}
 	dirs := after[:len(after)-1]
 
-	if marker == "foraged" {
+	switch {
+	case marker == "foraged":
+		return parseForagedDirs(dirs)
+	case isUploadProducer(marker):
+		return parseUploadDirs(dirs)
+	case isPromotionTree(marker):
+		// Promotion keeps whatever layout the sample had where it was
+		// discovered, so the grammar is whichever wrote it: an upload tree's
+		// leading tier segment, or forager's runtime/domain/feed/name. "pkg"
+		// and "sha" are reserved — neither is ever a runtime name — so the two
+		// are told apart without guessing.
+		if len(dirs) > 0 && (dirs[0] == coordinateTier || dirs[0] == digestTier) {
+			return parseUploadDirs(dirs)
+		}
 		return parseForagedDirs(dirs)
 	}
 	return parseHarvestDirs(dirs, label)
 }
+
+// promotionTrees are the destinations a ruled or reviewed sample is moved into,
+// by promoter's own passes or by /api/triage. Each preserves the subpath the
+// sample had in its discovery tree (see rulingPlan), so its provenance is still
+// written in the path — just one level deeper than where it started.
+var promotionTrees = []string{
+	"foraged-promote",           // good/: ruled good
+	"foraged-quarantine",        // bad/: ruled bad
+	"foraged-suspicious-review", // unknown/: promoter's LLM tier wants a human
+	"foraged-undetermined",      // unknown/: the LLM could not grade it
+	"foraged-bad-review",        // unknown/: likely bad, awaiting confirmation
+}
+
+func isPromotionTree(marker string) bool { return slices.Contains(promotionTrees, marker) }
 
 // findLayoutMarker scans path components for the layout-marker segment.
 // Prefers a marker immediately following the label segment so paths that
@@ -3070,9 +3107,15 @@ func findLayoutMarker(parts []string, label string) (marker string, idx int) {
 		}
 	}
 	if labelIdx >= 0 && labelIdx+1 < len(parts) {
-		switch parts[labelIdx+1] {
-		case "foraged", "harvest":
-			return parts[labelIdx+1], labelIdx + 1
+		switch next := parts[labelIdx+1]; {
+		case next == "foraged", next == "harvest":
+			return next, labelIdx + 1
+		case isUploadProducer(next), isPromotionTree(next):
+			// Only recognized directly under the label. A producer name is an
+			// ordinary word ("scan") that could equally be a package name
+			// deeper in a path, so unlike the forager markers these never match
+			// on the positional fallback below.
+			return next, labelIdx + 1
 		}
 	}
 	for i, p := range parts {
@@ -3086,7 +3129,8 @@ func findLayoutMarker(parts []string, label string) (marker string, idx int) {
 // parseForagedDirs maps the directory components between the "foraged"
 // marker and the filename onto the new-layout provenance fields.
 //
-// Expected dirs slice (length 4): [runtime, domain, feed, name].
+// Expected dirs slice (length 4+): [runtime, domain, feed, name...], where a
+// scoped package name occupies more than one component.
 // Shorter slices fall through gracefully — fields stay empty.
 // Version is not a path component; it lives in the filename.
 //
@@ -3109,7 +3153,11 @@ func parseForagedDirs(dirs []string) pathProvenance {
 		p.feed = feed
 	}
 	if len(dirs) >= 4 {
-		p.pkg = unknownToEmpty(dirs[3])
+		// A scoped name spans several directories: forager's
+		// sanitizePathSegment deliberately preserves the slash in a package
+		// name, so "@vue/cli" is written as two levels. Rejoin everything past
+		// the feed or the scope alone ("@vue") would be recorded as the package.
+		p.pkg = unknownToEmpty(strings.Join(dirs[3:], "/"))
 	}
 	return p
 }

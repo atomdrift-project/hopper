@@ -86,7 +86,11 @@ const (
 // ruled upload matched no root and fell back to the basename, collapsing the
 // sha shard (uploads/ab/cd/x.tgz) into a flat good/foraged-promote/x.tgz where
 // two packages sharing a filename would collide.
-var promoteSrcRoots = []string{"unknown/foraged/", "sighted/foraged/", "bad/foraged/", "unknown/uploads/"}
+var promoteSrcRoots = []string{
+	"unknown/foraged/", "sighted/foraged/", "bad/foraged/",
+	"unknown/scan/", "unknown/prism/", "unknown/forager/",
+	"unknown/uploads/", // legacy root: rows written before the per-producer trees
+}
 
 // placement is a triage item's resolved destination: the new relative path and
 // the label + label_source to record.

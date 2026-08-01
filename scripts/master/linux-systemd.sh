@@ -30,6 +30,12 @@ set -euo pipefail
 
 DATA_DIR="${DATA_DIR:-/data/samples}"
 UPLOAD_DIR="${DATA_DIR}/unknown/uploads"
+# Every tree hopper writes uploads into. One per producer (see
+# cmd/hopper/uploadpath.go), plus UPLOAD_DIR, which is both the legacy root for
+# unrecognized producers and the home of the .tmp spool every upload stages in.
+# All live under the unknown pool, which the unit already lists in
+# ReadWritePaths, so adding a producer needs no isolation change.
+UPLOAD_DIRS="${UPLOAD_DIR} ${DATA_DIR}/unknown/scan ${DATA_DIR}/unknown/prism ${DATA_DIR}/unknown/forager"
 # Shared group for the sample tree. forager, hopper, and promoter all run in it
 # so any of them can read/traverse the others' output; setgid dirs make new
 # children inherit it. hopper's upload tree joins this contract.
@@ -217,20 +223,27 @@ fi
 priv install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
     "${STATE_HOME}" "${CACHE_HOME}" "${CONFIG_DIR}" "${TOOLS_DIR}"
 
-# Upload tree: part of the shared samples-group contract. Group ${SAMPLES_GROUP},
-# setgid 2775 dirs so hopper's runtime sha-shard mkdirs (and .tmp staging)
-# inherit the group, and read-only files. hopper writes here at runtime; the
-# perms-heal timer deliberately skips this subtree (HEAL_EXCLUDE=${UPLOAD_DIR}),
-# so this deploy is the only thing that (re)asserts the contract on it.
-priv install -d -m 2775 -o "${SERVICE_USER}" -g "${SAMPLES_GROUP}" "${UPLOAD_DIR}"
+# Upload trees: part of the shared samples-group contract. Group
+# ${SAMPLES_GROUP}, setgid 2775 dirs so hopper's runtime mkdirs (the per-producer
+# trees and .tmp staging) inherit the group, and read-only files. Created here
+# rather than left to the first upload so a restrictive parent, or a hardening
+# option that blocks a setgid mkdir, surfaces at deploy time instead of as a
+# failed upload.
+for dir in ${UPLOAD_DIRS}; do
+    priv install -d -m 2775 -o "${SERVICE_USER}" -g "${SAMPLES_GROUP}" "${dir}"
+done
 priv install -d -m 2775 -o "${SERVICE_USER}" -g "${SAMPLES_GROUP}" "${UPLOAD_DIR}/.tmp"
 # Heal a pre-existing tree from before this contract (e.g. hopper:hopper / 0750,
 # or shards left group-private by the old setgid-blocked code path): regroup to
 # ${SAMPLES_GROUP}, setgid+group-write every dir, mark every file read-only 0440.
-log "Asserting shared-group contract on ${UPLOAD_DIR}"
-priv chgrp -R "${SAMPLES_GROUP}" "${UPLOAD_DIR}"
-priv find "${UPLOAD_DIR}" -type d -exec chmod 2775 {} +
-priv find "${UPLOAD_DIR}" -type f -exec chmod 0440 {} +
+# The perms-heal timer asserts the same contract on a schedule; this makes a
+# fresh deploy correct immediately rather than at the next timer run.
+for dir in ${UPLOAD_DIRS}; do
+    log "Asserting shared-group contract on ${dir}"
+    priv chgrp -R "${SAMPLES_GROUP}" "${dir}"
+    priv find "${dir}" -type d -exec chmod 2775 {} +
+    priv find "${dir}" -type f -exec chmod 0440 {} +
+done
 
 # --- Binary ------------------------------------------------------------------
 

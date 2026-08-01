@@ -46,9 +46,11 @@ set -eu
 DATA_DIR="${DATA_DIR:-/data/samples}"
 GROUP="${SAMPLES_GROUP:-samples}"
 
-# hopper's upload tree is healed like the rest (group + 2775 dirs), but its
-# sample files are 0440 not 0444 (see header), so the file pass splits on it.
+# hopper's upload trees are healed like the rest (group + 2775 dirs), but their
+# sample files are 0440 not 0444 (see header), so the file pass splits on them.
+# One tree per producer plus the legacy root, which also holds the .tmp spool.
 UPLOAD_DIR="$DATA_DIR/unknown/uploads"
+UPLOAD_DIRS="$UPLOAD_DIR $DATA_DIR/unknown/scan $DATA_DIR/unknown/prism $DATA_DIR/unknown/forager"
 
 # Subtree to leave untouched: only hopper's in-flight upload staging dir. Its
 # temp files are mid-write with transient modes, and hopper sets their final
@@ -85,17 +87,30 @@ grp_out=$(find "$DATA_DIR" -path "$EXCLUDE" -prune -o ! -group "$GROUP" -print0 
 dir_out=$(find "$DATA_DIR" -path "$EXCLUDE" -prune -o -type d ! -perm 2775 -print0 \
     | xargs -0 -r -n 2048 chmod -c 2775 -- 2>/dev/null) || true
 
-# 3. Regular files outside the upload tree → 0444 (read-only, world-readable).
-#    The whole upload tree is pruned here and handled by pass 4. Immutability is
-#    deliberate; see the contract above.
-file_out=$(find "$DATA_DIR" -path "$UPLOAD_DIR" -prune -o -type f ! -perm 0444 -print0 \
+# 3. Regular files outside the upload trees → 0444 (read-only, world-readable).
+#    Every upload tree is pruned here and handled by pass 4. Immutability is
+#    deliberate; see the contract above. The prune expression is built in the
+#    positional parameters so a path containing spaces survives word splitting.
+set -- "("
+for tree in $UPLOAD_DIRS; do
+    [ "$#" -eq 1 ] || set -- "$@" -o
+    set -- "$@" -path "$tree"
+done
+set -- "$@" ")"
+file_out=$(find "$DATA_DIR" "$@" -prune -o -type f ! -perm 0444 -print0 \
     | xargs -0 -r -n 4096 chmod -c 0444 -- 2>/dev/null) || true
 
-# 4. Upload sample files → 0440 (group-private; see header). Only when the tree
-#    exists, pruning the in-flight .tmp staging dir.
+# 4. Upload sample files → 0440 (group-private; see header). Walks only the trees
+#    that exist, pruning the in-flight .tmp staging dir.
+set --
+for tree in $UPLOAD_DIRS; do
+    # An explicit if, not "[ -d ] && set": under set -e a false AND-OR list
+    # exits the script, so the first absent tree would abort the heal.
+    if [ -d "$tree" ]; then set -- "$@" "$tree"; fi
+done
 upload_out=""
-if [ -d "$UPLOAD_DIR" ]; then
-    upload_out=$(find "$UPLOAD_DIR" -path "$EXCLUDE" -prune -o -type f ! -perm 0440 -print0 \
+if [ "$#" -gt 0 ]; then
+    upload_out=$(find "$@" -path "$EXCLUDE" -prune -o -type f ! -perm 0440 -print0 \
         | xargs -0 -r -n 4096 chmod -c 0440 -- 2>/dev/null) || true
 fi
 

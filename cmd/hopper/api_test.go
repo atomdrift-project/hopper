@@ -1248,8 +1248,206 @@ func TestHandleUploadMultipartEnrichesRow(t *testing.T) {
 	if got.URL != "https://registry.npmjs.org/evil/-/evil-1.0.0.tgz" {
 		t.Errorf("URL = %q, want the provenance fetch URL", got.URL)
 	}
-	if !strings.HasPrefix(got.Path, "unknown/uploads/") {
-		t.Errorf("Path = %q, want hopper-controlled shard under unknown/uploads/", got.Path)
+	// No PURL in this sidecar, so the bytes are keyed by digest under the
+	// producer's tree, with the fetch host as the only legible handle.
+	if want := "unknown/forager/sha/npmjs.org/" + sha[:2] + "/" + sha[2:4] + "/" + sha + "/evil-1.0.0.tgz"; got.Path != want {
+		t.Errorf("Path = %q, want %q", got.Path, want)
+	}
+	if got.Domain != "npmjs.org" {
+		t.Errorf("Domain = %q, want npmjs.org derived from the fetch URL", got.Domain)
+	}
+}
+
+// provenanceFrom builds an upload sidecar with an explicit collector and PURL,
+// so a test can steer which tree the bytes land in.
+func provenanceFrom(t *testing.T, file []byte, sha, collector, purl string) []byte {
+	t.Helper()
+	sc := hopper.Sidecar{
+		SchemaVersion: hopper.SidecarSchemaVersion,
+		Artifact:      hopper.Artifact{Filename: "evil-1.0.0.tgz", SHA256: sha, SizeBytes: int64(len(file))},
+		Package:       hopper.PackageRef{PURL: purl},
+		Fetch:         hopper.Fetch{Collector: collector, Category: "submitted", At: time.Now().UTC()},
+	}
+	b, err := json.Marshal(&sc)
+	if err != nil {
+		t.Fatalf("marshal provenance: %v", err)
+	}
+	return b
+}
+
+// collidingPayloads returns two distinct payloads whose digests share the first
+// four hex digits — the whole of the upload shard key. With 65536 shards a pair
+// turns up within a few hundred probes.
+func collidingPayloads(t *testing.T) (first, second []byte) {
+	t.Helper()
+	seen := make(map[string][]byte)
+	for i := range 1 << 20 {
+		payload := []byte("collision probe " + strconv.Itoa(i))
+		key := hexSHA256(payload)[:4]
+		if prev, ok := seen[key]; ok {
+			return prev, payload
+		}
+		seen[key] = payload
+	}
+	t.Fatal("no shard collision found")
+	return nil, nil
+}
+
+func hexSHA256(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// TestHandleUploadShardCollision proves two distinct digests that share a shard
+// prefix and a filename both survive with their own bytes. The legacy root is
+// keyed on sha[:4] alone, so a corpus full of common basenames ("index.js",
+// "setup.py") collides routinely; storing the second over the first would leave
+// the first row pointing at bytes whose digest it no longer describes.
+//
+// An unlisted collector is what routes these there — that root still receives
+// every producer hopper does not recognize.
+func TestHandleUploadShardCollision(t *testing.T) {
+	t.Parallel()
+	api := uploadAPI(t)
+	ctx := context.Background()
+
+	first, second := collidingPayloads(t)
+	upload := func(payload []byte) {
+		t.Helper()
+		prov := provenanceFrom(t, payload, hexSHA256(payload), "some-unlisted-tool", "")
+		body, ct := multipartUpload(t, prov, payload, true)
+		if w := postUpload(t, api, body, ct); w.Code != http.StatusOK {
+			t.Fatalf("upload: code=%d body=%s want 200", w.Code, w.Body.String())
+		}
+	}
+	upload(first)
+	upload(second)
+	if !strings.HasPrefix(mustUploadPath(t, api, hexSHA256(first)), "unknown/uploads/") {
+		t.Fatal("test precondition: an unlisted collector must route to the legacy root")
+	}
+
+	rows := make([]*hopper.Sample, 0, 2)
+	for _, payload := range [][]byte{first, second} {
+		row, err := api.db.SampleBySHA256(ctx, hexSHA256(payload))
+		if err != nil {
+			t.Fatalf("SampleBySHA256: %v", err)
+		}
+		rows = append(rows, row)
+	}
+	if rows[0].Path == rows[1].Path {
+		t.Fatalf("colliding digests share path %q; one sample's bytes were overwritten", rows[0].Path)
+	}
+	// The decisive check: the bytes on disk must hash to the digest their own
+	// row records. An overwrite leaves the survivor's content under both paths.
+	for _, row := range rows {
+		stored, err := os.ReadFile(filepath.Join(api.dataRoot, row.Path))
+		if err != nil {
+			t.Fatalf("read stored sample %s: %v", row.Path, err)
+		}
+		if got := hexSHA256(stored); got != row.SHA256 {
+			t.Errorf("file at %s hashes to %s, but its row records %s", row.Path, got, row.SHA256)
+		}
+	}
+
+	// Re-uploading known bytes must land on the existing path, not spawn a
+	// third qualified copy alongside it.
+	upload(first)
+	again, err := api.db.SampleBySHA256(ctx, hexSHA256(first))
+	if err != nil {
+		t.Fatalf("SampleBySHA256 after re-upload: %v", err)
+	}
+	if again.Path != rows[0].Path {
+		t.Errorf("re-upload moved sample from %q to %q", rows[0].Path, again.Path)
+	}
+	shard := filepath.Dir(filepath.Join(api.dataRoot, rows[0].Path))
+	entries, err := os.ReadDir(shard)
+	if err != nil {
+		t.Fatalf("read shard dir: %v", err)
+	}
+	if len(entries) != 2 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("shard holds %d files %v, want exactly the 2 colliding samples", len(entries), names)
+	}
+}
+
+func mustUploadPath(t *testing.T, api *apiServer, sha string) string {
+	t.Helper()
+	row, err := api.db.SampleBySHA256(context.Background(), sha)
+	if err != nil {
+		t.Fatalf("SampleBySHA256(%s): %v", sha, err)
+	}
+	return row.Path
+}
+
+// TestHandleUploadCoordinateCollision covers the one place the coordinate tier
+// can collide: two artifacts claiming a single PURL. Qualifiers are deliberately
+// kept out of the path, so an Open VSX build and a Microsoft marketplace build of
+// one extension share a directory — and must still keep their own bytes.
+func TestHandleUploadCoordinateCollision(t *testing.T) {
+	t.Parallel()
+	api := uploadAPI(t)
+	const purl = "pkg:vscode-extension/ms-python/python@2024.1.0"
+	const wantDir = "unknown/scan/pkg/vscode-extension/ms-python/python/2024.1.0"
+	payloads := [][]byte{[]byte("open vsx build"), []byte("marketplace build")}
+
+	for _, payload := range payloads {
+		prov := provenanceFrom(t, payload, hexSHA256(payload), "scan+build07", purl)
+		body, ct := multipartUpload(t, prov, payload, true)
+		if w := postUpload(t, api, body, ct); w.Code != http.StatusOK {
+			t.Fatalf("upload: code=%d body=%s want 200", w.Code, w.Body.String())
+		}
+	}
+	for _, payload := range payloads {
+		sha := hexSHA256(payload)
+		rel := mustUploadPath(t, api, sha)
+		if dir := filepath.ToSlash(filepath.Dir(rel)); dir != wantDir {
+			t.Errorf("Path = %q, want a file under %q", rel, wantDir)
+		}
+		stored, err := os.ReadFile(filepath.Join(api.dataRoot, rel))
+		if err != nil {
+			t.Fatalf("read stored sample %s: %v", rel, err)
+		}
+		if got := hexSHA256(stored); got != sha {
+			t.Errorf("file at %s hashes to %s, but its row records %s", rel, got, sha)
+		}
+	}
+}
+
+// TestHandleUploadKeepsKnownBytesInPlace proves an upload of a digest hopper
+// already holds refreshes the row without laying down a second copy — even when
+// the new sidecar would route those bytes into an entirely different tree. It is
+// what keeps a layout change, or a producer that skips the /api/known probe,
+// from duplicating the corpus.
+func TestHandleUploadKeepsKnownBytesInPlace(t *testing.T) {
+	t.Parallel()
+	api := uploadAPI(t)
+	payload := []byte("submitted by a human, later identified as a package")
+	sha := hexSHA256(payload)
+
+	send := func(collector, purl string) {
+		t.Helper()
+		prov := provenanceFrom(t, payload, sha, collector, purl)
+		body, ct := multipartUpload(t, prov, payload, true)
+		if w := postUpload(t, api, body, ct); w.Code != http.StatusOK {
+			t.Fatalf("upload: code=%d body=%s want 200", w.Code, w.Body.String())
+		}
+	}
+	send("prism", "")
+	first := mustUploadPath(t, api, sha)
+	if want := "unknown/prism/sha/_unknown/"; !strings.HasPrefix(first, want) {
+		t.Fatalf("Path = %q, want a digest-keyed path under %q", first, want)
+	}
+
+	// Same bytes, now carrying a coordinate that routes elsewhere.
+	send("scan+build07", "pkg:npm/lodash@4.17.21")
+	if got := mustUploadPath(t, api, sha); got != first {
+		t.Errorf("known bytes moved from %q to %q", first, got)
+	}
+	if _, err := os.Stat(filepath.Join(api.dataRoot, "unknown", "scan")); !os.IsNotExist(err) {
+		t.Errorf("a second copy was written under unknown/scan (stat err = %v)", err)
 	}
 }
 
