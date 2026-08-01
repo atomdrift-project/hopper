@@ -77,10 +77,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 			`ALTER TABLE samples ADD COLUMN elements TEXT NOT NULL DEFAULT ''`,
 			`ALTER TABLE samples ADD COLUMN score INTEGER NOT NULL DEFAULT 0`,
 			`CREATE INDEX IF NOT EXISTS idx_samples_formula ON samples(formula) WHERE formula != ''`,
-			`CREATE INDEX IF NOT EXISTS idx_samples_elements ON samples(elements) WHERE elements != ''`,
 			// Drains itself as backfill completes: rows leave the index when elements
 			// is populated. Without it, each batch's gating SELECT seq-scans the heap.
-			`CREATE INDEX IF NOT EXISTS idx_samples_backfill_pending ON samples(sha256) WHERE cleave_result IS NOT NULL AND elements = ''`,
 			`CREATE INDEX IF NOT EXISTS idx_samples_score ON samples(score) WHERE score != 0`,
 			`CREATE INDEX IF NOT EXISTS idx_samples_feed_source ON samples(source, label, analyzed_at DESC) WHERE cleave_result IS NOT NULL`,
 			`CREATE INDEX IF NOT EXISTS idx_samples_feed ON samples(feed) WHERE feed != ''`,
@@ -124,7 +122,6 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 			`ALTER TABLE samples ADD COLUMN mtime DATETIME`,
 			`CREATE INDEX IF NOT EXISTS idx_samples_mtime ON samples(mtime) WHERE mtime IS NOT NULL`,
 			`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_mtime ON samples(source, label, mtime DESC) WHERE cleave_result IS NOT NULL`,
-			`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_created ON samples(source, label, created_at DESC) WHERE cleave_result IS NOT NULL`,
 			`CREATE INDEX IF NOT EXISTS idx_samples_feed_top_created_done ` +
 				`ON samples(source, label, created_at DESC) ` +
 				`WHERE cleave_result IS NOT NULL AND parent = '' AND litmus_result IS NOT NULL`,
@@ -171,8 +168,6 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		return fmt.Errorf("hopper: migrate sqlite: %w", err)
 	}
 	for _, ddl := range []string{
-		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_created ` +
-			`ON samples(source, label, created_at DESC) WHERE cleave_result IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed_top_created_done ` +
 			`ON samples(source, label, created_at DESC) ` +
 			`WHERE cleave_result IS NOT NULL AND parent = '' AND litmus_result IS NOT NULL`,
@@ -325,22 +320,6 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		}
 	}
 
-	// Covers FP/FN seed queries ordered by impact. SQLite needs the explicit
-	// `litmus_score IS NULL` prefix to match the `NULLS LAST` semantics our
-	// queries use (see liteSeedOrder).
-	for _, ddl := range []string{
-		`CREATE INDEX IF NOT EXISTS idx_samples_seed_pool ` +
-			`ON samples(label, litmus_score IS NULL, litmus_score DESC, score DESC, analyzed_at ASC) ` +
-			`WHERE cleave_result IS NOT NULL AND status = '' AND skip = ''`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_pipeline_stage ` +
-			`ON samples(status, litmus_score IS NULL, litmus_score DESC, score DESC, updated_at ASC) ` +
-			`WHERE status != ''`,
-	} {
-		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
-			return fmt.Errorf("hopper: migrate sqlite: %w", err)
-		}
-	}
-
 	// Worker heartbeat table for dashboard.
 	if _, err := db.lite.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS workers (
 		name      TEXT PRIMARY KEY,
@@ -357,18 +336,12 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 	// Partial indexes matching PG for review and dashboard queries.
 	for _, ddl := range []string{
 		// falsePositives / truePositives / falseNegatives
-		`CREATE INDEX IF NOT EXISTS idx_samples_review ` +
-			`ON samples(label, score) ` +
-			`WHERE cleave_result IS NOT NULL AND status = '' AND skip = ''`,
 		// benignReview / badReview
 		`CREATE INDEX IF NOT EXISTS idx_samples_misclassified_review ` +
 			`ON samples(label, max_crit, suspicious_count) ` +
 			`WHERE label_source = 'marker' AND skip = 'misclassified' ` +
 			`AND cleave_result IS NOT NULL AND status = ''`,
 		// conflictReview
-		`CREATE INDEX IF NOT EXISTS idx_samples_conflict_review ` +
-			`ON samples(updated_at) ` +
-			`WHERE skip = 'conflict' AND status = ''`,
 		// CountAnalyzed
 		`CREATE INDEX IF NOT EXISTS idx_samples_litmus_done ` +
 			`ON samples(id) WHERE litmus_result IS NOT NULL`,
@@ -389,9 +362,6 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		`CREATE INDEX IF NOT EXISTS idx_samples_top_ready_created ` +
 			`ON samples(created_at DESC, id) ` +
 			`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_top_ready_first_analyzed ` +
-			`ON samples(first_analyzed_at DESC, id) ` +
-			`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND first_analyzed_at IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_top_ready_first_analyzed_coalesce ` +
 			`ON samples(COALESCE(first_analyzed_at, analyzed_at) DESC, id) ` +
 			`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL`,
@@ -429,9 +399,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 			UNIQUE (sha256, path)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_sl_sha256 ON sample_locations(sha256)`,
-		`CREATE INDEX IF NOT EXISTS idx_sl_source ON sample_locations(source, feed) WHERE feed <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_sl_parent ON sample_locations(parent_sha256) WHERE parent_sha256 <> ''`,
-		`CREATE INDEX IF NOT EXISTS idx_sl_last_seen ON sample_locations(last_seen_at)`,
 	} {
 		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite sample_locations: %w", err)
@@ -1052,12 +1020,11 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 				(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256, path) DO UPDATE SET
-				last_seen_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
 				rel = CASE WHEN excluded.rel != '' THEN excluded.rel ELSE sample_locations.rel END,
 				source = CASE WHEN excluded.source != '' THEN excluded.source ELSE sample_locations.source END,
 				feed = CASE WHEN excluded.feed != '' THEN excluded.feed ELSE sample_locations.feed END,
 				ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE sample_locations.ecosystem END,
-				mtime = COALESCE(excluded.mtime, sample_locations.mtime)`,
+				mtime = COALESCE(excluded.mtime, sample_locations.mtime)`+locationChangedSQLite,
 			s.SHA256, s.Path, s.Parent, s.LocationRel, s.Filename, s.Source, s.Feed, s.Ecosystem, s.Mtime); err != nil {
 			return false, fmt.Errorf("hopper: upsert location: %w", err)
 		}
@@ -1160,12 +1127,11 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256, path) DO UPDATE SET
-			last_seen_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
 			rel = CASE WHEN excluded.rel != '' THEN excluded.rel ELSE sample_locations.rel END,
 			source = CASE WHEN excluded.source != '' THEN excluded.source ELSE sample_locations.source END,
 			feed = CASE WHEN excluded.feed != '' THEN excluded.feed ELSE sample_locations.feed END,
 			ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE sample_locations.ecosystem END,
-			mtime = COALESCE(excluded.mtime, sample_locations.mtime)`)
+			mtime = COALESCE(excluded.mtime, sample_locations.mtime)`+locationChangedSQLite)
 	if err != nil {
 		return 0, nil, fmt.Errorf("hopper: prepare location upsert: %w", err)
 	}
@@ -1559,15 +1525,32 @@ func scanLiteLocation(row interface{ Scan(...any) error }) (*SampleLocation, err
 	return &loc, nil
 }
 
+// locationChangedSQLite mirrors locationChangedPG: it makes re-observing an
+// unchanged location a no-op instead of a row rewrite. SQLite's `IS NOT` is the
+// null-safe inequality, i.e. Postgres's IS DISTINCT FROM. Keep the predicate
+// aligned with the SET list it guards. locationChangedRelMtimeSQLite is the
+// narrower form for the two sites that only refresh rel and mtime.
+const (
+	locationChangedSQLite = `
+		WHERE (excluded.rel != ''       AND excluded.rel       IS NOT sample_locations.rel)
+		   OR (excluded.source != ''    AND excluded.source    IS NOT sample_locations.source)
+		   OR (excluded.feed != ''      AND excluded.feed      IS NOT sample_locations.feed)
+		   OR (excluded.ecosystem != '' AND excluded.ecosystem IS NOT sample_locations.ecosystem)
+		   OR (excluded.mtime IS NOT NULL AND excluded.mtime IS NOT sample_locations.mtime)`
+
+	locationChangedRelMtimeSQLite = `
+		WHERE (excluded.rel != '' AND excluded.rel IS NOT sample_locations.rel)
+		   OR (excluded.mtime IS NOT NULL AND excluded.mtime IS NOT sample_locations.mtime)`
+)
+
 func (db *DB) upsertLocationSQLite(ctx context.Context, loc *SampleLocation) error {
 	_, err := db.lite.ExecContext(ctx, `
 		INSERT INTO sample_locations
 			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256, path) DO UPDATE SET
-			last_seen_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
 			rel = CASE WHEN excluded.rel != '' THEN excluded.rel ELSE sample_locations.rel END,
-			mtime = COALESCE(excluded.mtime, sample_locations.mtime)`,
+			mtime = COALESCE(excluded.mtime, sample_locations.mtime)`+locationChangedRelMtimeSQLite,
 		loc.SHA256, loc.Path, loc.ParentSHA256, loc.Rel, loc.Filename,
 		loc.Source, loc.Feed, loc.Ecosystem, loc.Mtime)
 	if err != nil {
@@ -1589,12 +1572,11 @@ func (db *DB) upsertLocationBatchSQLite(ctx context.Context, locs []*SampleLocat
 			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256, path) DO UPDATE SET
-			last_seen_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
 			rel = CASE WHEN excluded.rel != '' THEN excluded.rel ELSE sample_locations.rel END,
 			source = CASE WHEN excluded.source != '' THEN excluded.source ELSE sample_locations.source END,
 			feed = CASE WHEN excluded.feed != '' THEN excluded.feed ELSE sample_locations.feed END,
 			ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE sample_locations.ecosystem END,
-			mtime = COALESCE(excluded.mtime, sample_locations.mtime)`
+			mtime = COALESCE(excluded.mtime, sample_locations.mtime)` + locationChangedSQLite
 	for _, l := range locs {
 		if _, err := tx.ExecContext(ctx, q, l.SHA256, l.Path, l.ParentSHA256, l.Rel,
 			l.Filename, l.Source, l.Feed, l.Ecosystem, l.Mtime); err != nil {
@@ -1923,9 +1905,8 @@ func (db *DB) storeResultSQLite(
 				(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (sha256, path) DO UPDATE SET
-				last_seen_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
 				rel = CASE WHEN excluded.rel != '' THEN excluded.rel ELSE sample_locations.rel END,
-				mtime = COALESCE(excluded.mtime, sample_locations.mtime)`)
+				mtime = COALESCE(excluded.mtime, sample_locations.mtime)`+locationChangedRelMtimeSQLite)
 		if err != nil {
 			return StoreStats{}, fmt.Errorf("hopper: prepare member location: %w", err)
 		}

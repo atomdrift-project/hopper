@@ -95,17 +95,13 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS top_traits TEXT`,
 		// Drains itself as the top_traits backfill completes, keeping each
 		// batch's gating SELECT off the heap (same pattern as elements).
-		`CREATE INDEX IF NOT EXISTS idx_samples_toptraits_pending ON samples(sha256) ` +
-			`WHERE top_traits IS NULL AND cleave_result IS NOT NULL`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS litmus_result JSONB`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS llm_result JSONB`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS litmus_score DOUBLE PRECISION NOT NULL DEFAULT 0`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent) WHERE parent != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_formula ON samples(formula) WHERE formula != ''`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_elements ON samples(elements) WHERE elements != ''`,
 		// Drains itself as backfill completes: rows leave the index when elements
 		// is populated. Without it, each batch's gating SELECT seq-scans the heap.
-		`CREATE INDEX IF NOT EXISTS idx_samples_backfill_pending ON samples(sha256) WHERE cleave_result IS NOT NULL AND elements = ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_score ON samples(score) WHERE score != 0`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS mtime TIMESTAMPTZ`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS last_error_at TIMESTAMPTZ`,
@@ -113,7 +109,6 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS marker_mtime TIMESTAMPTZ`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source ON samples(source, label, analyzed_at DESC NULLS LAST) WHERE cleave_result IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_mtime ON samples(source, label, mtime DESC NULLS LAST) WHERE cleave_result IS NOT NULL`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_created ON samples(source, label, created_at DESC) WHERE cleave_result IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_feed_top_created_done ` +
 			`ON samples(source, label, created_at DESC) ` +
 			`WHERE cleave_result IS NOT NULL AND parent = '' AND litmus_result IS NOT NULL`,
@@ -126,7 +121,6 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_unanalyzed_id ON samples(id) WHERE cleave_result IS NULL`,
 		// Covers falsePositivesPG / truePositivesPG / falseNegativesPG — all filter
 		// (label, score, cleave_result IS NOT NULL, status='', skip='').
-		`CREATE INDEX IF NOT EXISTS idx_samples_review ON samples(label, score DESC) WHERE cleave_result IS NOT NULL AND status = '' AND skip = ''`,
 		// countAnalyzedPG: SELECT count(*) WHERE litmus_result IS NOT NULL — no index existed.
 		`CREATE INDEX IF NOT EXISTS idx_samples_litmus_done ON samples(id) WHERE litmus_result IS NOT NULL`,
 		// Pull-based work scheduling: claim tracking columns + index.
@@ -184,19 +178,13 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_corroborated_created ` +
 			`ON samples(created_at DESC) ` +
 			`WHERE corroborated AND parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_corroborated_eco_created ` +
-			`ON samples(ecosystem, created_at DESC) ` +
-			`WHERE corroborated AND parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL`,
-		// benignReviewPG / badReviewPG filter on skip='misclassified' which is excluded
-		// from idx_samples_review (WHERE skip=''). Separate partial index for misclassified review.
+		// benignReviewPG / badReviewPG filter on skip='misclassified', so they need
+		// their own partial index for misclassified review.
 		`CREATE INDEX IF NOT EXISTS idx_samples_misclassified_review ` +
 			`ON samples(label, max_crit DESC, suspicious_count DESC) ` +
 			`WHERE label_source = 'marker' AND skip = 'misclassified' ` +
 			`AND cleave_result IS NOT NULL AND status = ''`,
 		// conflictReviewPG: good+bad conflicts flagged skip='conflict'.
-		`CREATE INDEX IF NOT EXISTS idx_samples_conflict_review ` +
-			`ON samples(updated_at DESC) ` +
-			`WHERE skip = 'conflict' AND status = ''`,
 		// staleSamplesPG: WHERE updated_at < $1 ORDER BY updated_at — no status prefix.
 		`CREATE INDEX IF NOT EXISTS idx_samples_updated_at ON samples(updated_at)`,
 		// Workflow dashboard freshness: global top-level recency cannot use the
@@ -263,9 +251,6 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_bad_clean_score ` +
 			`ON samples(litmus_score ASC, id DESC) ` +
 			`WHERE label = 'bad' AND litmus_class = 0 AND cleave_result IS NOT NULL AND skip = ''`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_top_ready_first_analyzed ` +
-			`ON samples(first_analyzed_at DESC, id) ` +
-			`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND first_analyzed_at IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_top_ready_first_analyzed_coalesce ` +
 			`ON samples((COALESCE(first_analyzed_at, analyzed_at)) DESC, id) ` +
 			`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL`,
@@ -292,13 +277,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// variants, seedCandidatesInPathsPG) ordered by impact. The detection
 		// filter (max_crit / suspicious_count) and cyclotron_attempted_at
 		// cooldown apply as residual predicates after the indexed scan.
-		`CREATE INDEX IF NOT EXISTS idx_samples_seed_pool ` +
-			`ON samples(label, litmus_score DESC NULLS LAST, score DESC, analyzed_at ASC NULLS FIRST) ` +
-			`WHERE cleave_result IS NOT NULL AND status = '' AND skip = ''`,
 		// Covers SamplesInPipelineStage drain (impact-ordered mid-pipeline pull).
-		`CREATE INDEX IF NOT EXISTS idx_samples_pipeline_stage ` +
-			`ON samples(status, litmus_score DESC NULLS LAST, score DESC, updated_at ASC) ` +
-			`WHERE status != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_stale_traits ` +
 			`ON samples(traits_version, analyzed_at) ` +
 			`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''`,
@@ -348,10 +327,6 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// predicate as the ecosystem feed index, so the planner uses it whenever the
 		// feed's TopLevelOnly + litmus-done flags are set (the normal feed path).
 		// Built CONCURRENTLY by createIndexConcurrently.
-		`CREATE INDEX IF NOT EXISTS idx_samples_dom_top_created ` +
-			`ON samples(domain, created_at DESC) ` +
-			`WHERE parent = '' AND cleave_result IS NOT NULL ` +
-			`AND litmus_result IS NOT NULL AND domain <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_package_version ON samples(package, version) WHERE package != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_purl_base ON samples(purl_base) WHERE purl_base != ''`,
 		// Collector provenance sidecar (forager) + artifact fetch time. JSONB so
@@ -436,7 +411,6 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// Feed/source rollups stay selective via the partial predicate.
 		// Parent lookups are rare (exploded-from query) and stay partial.
 		`CREATE INDEX IF NOT EXISTS idx_sl_sha256 ON sample_locations(sha256)`,
-		`CREATE INDEX IF NOT EXISTS idx_sl_source ON sample_locations(source, feed) WHERE feed <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_sl_parent ON sample_locations(parent_sha256) WHERE parent_sha256 <> ''`,
 		// Covering index for the reconcile reachability walk (cascadeMembersPG):
 		// finding a parent's child sha256 is then index-only — no heap fetch —
@@ -474,7 +448,6 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// this in" for the same price.
 		`CREATE INDEX IF NOT EXISTS idx_sl_reference ON sample_locations(id) ` +
 			`INCLUDE (sha256) WHERE parent_sha256 <> '' AND rel NOT IN ` + containmentRelsSQL,
-		`CREATE INDEX IF NOT EXISTS idx_sl_last_seen ON sample_locations(last_seen_at)`,
 
 		// One-shot backfill from the existing denormalized columns. Guarded
 		// by a table-emptiness check so restarts are cheap no-ops; re-running
@@ -716,9 +689,6 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// (or the derive trigger) sets a non-empty file_type. The predicate
 		// must stay in sync with pgFileTypeBackfillWhere. Built CONCURRENTLY by
 		// the migration runner, so it never blocks writes.
-		`CREATE INDEX IF NOT EXISTS idx_samples_filetype_pending ON samples(sha256) ` +
-			`WHERE cleave_result IS NOT NULL AND file_type = '' ` +
-			`AND COALESCE(cleave_result->'files'->0->>'type', cleave_result->'fs'->0->>'type', '') <> ''`,
 
 		// Claim state moved to memory (see workerTracker in cmd/hopper/api.go).
 		// idx_samples_claimed exists only to serve OldestClaims, which is gone;
@@ -1614,12 +1584,11 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 				(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 			ON CONFLICT (sha256, path) DO UPDATE SET
-				last_seen_at = now(),
 				rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
 				source = CASE WHEN EXCLUDED.source <> '' THEN EXCLUDED.source ELSE sample_locations.source END,
 				feed = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE sample_locations.feed END,
 				ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE sample_locations.ecosystem END,
-				mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)`,
+				mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)`+locationChangedPG,
 			s.SHA256, s.Path, s.Parent, s.LocationRel, s.Filename, s.Source, s.Feed, s.Ecosystem, s.Mtime); err != nil {
 			return false, fmt.Errorf("hopper: upsert location: %w", err)
 		}
@@ -1863,9 +1832,30 @@ func sampleStagingRows(samples []*Sample) [][]any {
 	return rows
 }
 
+// locationChangedPG guards the ON CONFLICT arms below so that re-observing an
+// unchanged location writes nothing at all. Every walk re-observes nearly the
+// whole corpus, and the old upsert rewrote each row unconditionally: it stamped
+// last_seen_at = now() and the CASE arms wrote the existing value back when the
+// incoming field was blank. Postgres has no same-value-skip, so each of those
+// was a fresh row version — and because last_seen_at rides in the INCLUDE list
+// of idx_sl_sha256_parents no such update could ever be HOT, so one no-op
+// re-observation cost a heap tuple plus an entry in all ten indexes. That churn,
+// not new data, was what buried the logical replicas in WAL. last_seen_at is no
+// longer maintained: nothing compares it against a threshold and nothing outside
+// this package reads it, so the three ORDER BY sites just sort on a frozen value.
+//
+// Keep the predicate aligned with the SET list it guards — a field that is set
+// but not tested here would silently stop being refreshed.
+const locationChangedPG = `
+	WHERE (EXCLUDED.rel <> ''       AND EXCLUDED.rel       IS DISTINCT FROM sample_locations.rel)
+	   OR (EXCLUDED.source <> ''    AND EXCLUDED.source    IS DISTINCT FROM sample_locations.source)
+	   OR (EXCLUDED.feed <> ''      AND EXCLUDED.feed      IS DISTINCT FROM sample_locations.feed)
+	   OR (EXCLUDED.ecosystem <> '' AND EXCLUDED.ecosystem IS DISTINCT FROM sample_locations.ecosystem)
+	   OR (EXCLUDED.mtime IS NOT NULL AND EXCLUDED.mtime IS DISTINCT FROM sample_locations.mtime)`
+
 // locationsFromStagingPG fans _staging rows out into sample_locations. DISTINCT
-// ON collapses duplicates within the batch; ON CONFLICT bumps last_seen_at on
-// re-observation without clobbering an existing mtime. Shared by the batch
+// ON collapses duplicates within the batch; ON CONFLICT backfills fields that
+// actually changed, without clobbering an existing mtime. Shared by the batch
 // insert and the atomic store.
 const locationsFromStagingPG = `
 	INSERT INTO sample_locations
@@ -1875,12 +1865,11 @@ const locationsFromStagingPG = `
 	  FROM _staging
 	 WHERE path <> ''
 	ON CONFLICT (sha256, path) DO UPDATE SET
-		last_seen_at = now(),
 		rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
 		source = CASE WHEN EXCLUDED.source <> '' THEN EXCLUDED.source ELSE sample_locations.source END,
 		feed = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE sample_locations.feed END,
 		ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE sample_locations.ecosystem END,
-		mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)`
+		mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)` + locationChangedPG
 
 func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inserted int64, needsAnalysis []string, err error) {
 	rows := sampleStagingRows(samples)
@@ -2423,9 +2412,10 @@ func (db *DB) upsertLocationPG(ctx context.Context, loc *SampleLocation) error {
 			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (sha256, path) DO UPDATE SET
-			last_seen_at = now(),
 			rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
-			mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)`,
+			mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)
+		WHERE (EXCLUDED.rel <> '' AND EXCLUDED.rel IS DISTINCT FROM sample_locations.rel)
+		   OR (EXCLUDED.mtime IS NOT NULL AND EXCLUDED.mtime IS DISTINCT FROM sample_locations.mtime)`,
 		loc.SHA256, loc.Path, loc.ParentSHA256, loc.Rel, loc.Filename,
 		loc.Source, loc.Feed, loc.Ecosystem, loc.Mtime)
 	if err != nil {
@@ -2457,11 +2447,14 @@ func (db *DB) upsertLocationBatchPG(ctx context.Context, locs []*SampleLocation)
 		SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[],
 			$5::text[], $6::text[], $7::text[], $8::text[])
 		ON CONFLICT (sha256, path) DO UPDATE SET
-			last_seen_at = now(),
 			rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
 			source = CASE WHEN EXCLUDED.source <> '' THEN EXCLUDED.source ELSE sample_locations.source END,
 			feed = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE sample_locations.feed END,
-			ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE sample_locations.ecosystem END`,
+			ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE sample_locations.ecosystem END
+		WHERE (EXCLUDED.rel <> ''       AND EXCLUDED.rel       IS DISTINCT FROM sample_locations.rel)
+		   OR (EXCLUDED.source <> ''    AND EXCLUDED.source    IS DISTINCT FROM sample_locations.source)
+		   OR (EXCLUDED.feed <> ''      AND EXCLUDED.feed      IS DISTINCT FROM sample_locations.feed)
+		   OR (EXCLUDED.ecosystem <> '' AND EXCLUDED.ecosystem IS DISTINCT FROM sample_locations.ecosystem)`,
 		sha, path, parent, rel, filename, source, feed, eco)
 	if err != nil {
 		return fmt.Errorf("hopper: upsert location batch (%d): %w", n, err)
@@ -3869,8 +3862,9 @@ const pgCleaveBackfillWhere = `cleave_result IS NOT NULL
 
 // pgFileTypeBackfillWhere selects rows whose file_type/score/formula were left
 // empty by the pre-v7 fs-only generated expression: file_type is blank yet the
-// JSON carries a type to derive. Must stay in sync with
-// idx_samples_filetype_pending so the gate stays index-backed and self-draining.
+// JSON carries a type to derive. The matching partial index was dropped as
+// unused (0 scans in 34 days), so this gate now costs a scan — recreate
+// idx_samples_filetype_pending if the pass ever needs to run hot again.
 const pgFileTypeBackfillWhere = `cleave_result IS NOT NULL
 	AND file_type = ''
 	AND COALESCE(cleave_result->'files'->0->>'type', cleave_result->'fs'->0->>'type', '') <> ''`
@@ -3940,9 +3934,9 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 	// Pass 1b runs first because it is small and index-backed: heal file_type /
 	// score / formula for rows stored under the v7 'files' key while those
 	// columns were still generated from the legacy 'fs' key (every such row has
-	// file_type=''). The pgFileTypeBackfillWhere gate is served by
-	// idx_samples_filetype_pending and self-drains — a row leaves it the moment
-	// file_type becomes non-empty — so this finishes fast and is never held
+	// file_type=''). The pgFileTypeBackfillWhere gate self-drains — a row leaves
+	// it the moment file_type becomes non-empty — so this finishes fast (though
+	// it now scans, see pgFileTypeBackfillWhere) and is never held
 	// behind the much larger elements pass below. The derive trigger fixes
 	// writes from here on; this drains the pre-trigger rows using the same
 	// dual-key expressions. Does not bump updated_at — healing a derived column
@@ -4012,8 +4006,8 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 	db.reportBackfill(stats.Updated, stats.Scanned)
 
 	// Pass 1e: top_traits for rows analyzed before it became a trigger-fed
-	// column. Self-draining like Pass 1d (NULL → non-NULL), gated by the
-	// partial idx_samples_toptraits_pending.
+	// column. Self-draining like Pass 1d (NULL → non-NULL); its partial index
+	// was dropped as unused, so the gate now scans.
 	tt, err := db.backfillTopTraitsPG(ctx, backfillBatch)
 	if err != nil {
 		return stats, err
@@ -4156,7 +4150,7 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 // findings, dropping all post-v8 malware out of the bloom's bad tiers
 // (label='bad' AND max_crit>=4) and out of every prism/promoter criticality
 // gate. The standard Backfill Pass 1 cannot reach these rows: its gate is
-// elements=” (idx_samples_backfill_pending), and the broken trigger still
+// elements=” (whose partial index was dropped as unused), and the broken trigger still
 // derived elements/formula/file_type/score correctly (those keys did not
 // rename) — only the two crit columns are wrong. So this is a separate,
 // explicit, one-time heal.

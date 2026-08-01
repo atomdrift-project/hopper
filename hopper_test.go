@@ -2981,9 +2981,9 @@ func TestExplodeArchiveMembersEmpty(t *testing.T) {
 }
 
 // TestLocationsDualWrite verifies that both the single-insert and batch-insert
-// paths populate sample_locations alongside samples, that re-observing the
-// same (sha, path) pair updates last_seen_at without adding a row, and that
-// a second observation of the same sha at a new path adds a second location.
+// paths populate sample_locations alongside samples, that re-observing an
+// unchanged (sha, path) pair rewrites nothing at all, and that a second
+// observation of the same sha at a new path adds a second location.
 func TestLocationsDualWrite(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -3000,7 +3000,10 @@ func TestLocationsDualWrite(t *testing.T) {
 	firstSeen := locs[0].FirstSeenAt
 	firstLastSeen := locs[0].LastSeenAt
 
-	// Re-inserting the same (sha, path) should upsert: no new row, last_seen_at bumped.
+	// Re-observing an unchanged (sha, path) must be a complete no-op: no new
+	// row, and no rewrite of the existing one. Rewriting here is what buried
+	// the logical replicas — every walk re-observes nearly the whole corpus,
+	// and no such update can be HOT, so each one costs an entry in every index.
 	time.Sleep(5 * time.Millisecond)
 	mustInsert(t, ctx, db, &Sample{SHA256: "loc1", Path: "bad/a.exe", Source: "harvest", Feed: "feed-a"})
 	locs, err = db.LocationsForSHA(ctx, "loc1")
@@ -3013,8 +3016,8 @@ func TestLocationsDualWrite(t *testing.T) {
 	if !locs[0].FirstSeenAt.Equal(firstSeen) {
 		t.Errorf("first_seen_at moved: got %v, want %v", locs[0].FirstSeenAt, firstSeen)
 	}
-	if !locs[0].LastSeenAt.After(firstLastSeen) {
-		t.Errorf("last_seen_at should advance on re-observe: was %v, now %v", firstLastSeen, locs[0].LastSeenAt)
+	if !locs[0].LastSeenAt.Equal(firstLastSeen) {
+		t.Errorf("unchanged re-observe rewrote the row: last_seen_at was %v, now %v", firstLastSeen, locs[0].LastSeenAt)
 	}
 
 	// Observing the same sha at a new path adds a second row (this is the

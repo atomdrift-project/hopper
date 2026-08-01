@@ -598,8 +598,13 @@ func (s *Sample) scrubNULs() {
 // single sha256 can have many locations — the same jQuery.min.js shows up
 // in thousands of npm packages, the same stub in many droppers — so path /
 // source / feed / parent are per-observation, not per-content. The row is
-// upsert-keyed on (sha256, path): re-observing the same pair bumps
-// last_seen_at and refreshes mtime.
+// upsert-keyed on (sha256, path): re-observing the same pair refreshes mtime
+// and any field that actually changed, and writes nothing when nothing did.
+//
+// LastSeenAt is no longer maintained — it is set once on insert and never
+// bumped. Re-stamping it on every walk rewrote nearly the whole table each
+// pass and swamped the logical replicas; see locationChangedPG. It survives
+// only as a stable sort key, so treat it as "first seen", not "last seen".
 type SampleLocation struct {
 	FirstSeenAt  time.Time
 	LastSeenAt   time.Time
