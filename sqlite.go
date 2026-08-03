@@ -2509,28 +2509,28 @@ func (db *DB) triageGoodSQLite(ctx context.Context, limit int, f TriageFilter) (
 	return scanLiteSamples(rows)
 }
 
-// triageHighestSQLite: see TriageHighest. Mirrors triageHighestPG — collapses
-// hot good members to their root archive and returns one sample row per archive
-// (good/unknown parents only), ranked by its hottest member. SQLite has no
-// DISTINCT ON, so the collapse is GROUP BY root with MAX(best); the innermost
-// LIMIT bounds the member scan before the grouping, same as the PG version.
+// triageHighestSQLite: see TriageHighest. Mirrors triageHighestPG's per-route
+// windows — SQLite has no LATERAL, so the per-file_type top-K comes from a
+// ROW_NUMBER() PARTITION BY file_type window over the eligible set (dev-scale
+// tables; no index gymnastics needed), and the collapse is GROUP BY root with
+// MAX(best)/MIN(rank) instead of DISTINCT ON.
 func (db *DB) triageHighestSQLite(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
 	extra, fargs := triageFilterClauseSQLite(f)
-	// litmusClassSQLite's two `?` (cutoff, then ceiling) come first in the SQL.
 	args := append([]any{
-		CriticalLevel, SuspiciousCeiling,
 		createdBefore.UTC().Format(time.RFC3339Nano),
 		missingBefore.UTC().Format(time.RFC3339Nano),
 	}, fargs...)
 	args = append(args, limit)
-	//nolint:gosec // G202: label/class predicates and column list are constant; filter values are parameterized via ? args
+	//nolint:gosec // G202: label predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM (
-		   SELECT root, MAX(best) AS best FROM (
-		     SELECT CASE WHEN parent = '' THEN sha256 ELSE parent END AS root, litmus_score AS best
+		   SELECT root, MAX(best) AS best, MIN(rank) AS rank FROM (
+		     SELECT CASE WHEN parent = '' THEN sha256 ELSE parent END AS root,
+		            litmus_score AS best,
+		            ROW_NUMBER() OVER (PARTITION BY file_type ORDER BY litmus_score DESC) AS rank
 		     FROM samples s0
 		     WHERE label = 'good' AND cleave_result IS NOT NULL AND skip = ''
-		       AND `+litmusClassSQLite+` >= 2
+		       AND litmus_score IS NOT NULL
 		       AND (parent = '' OR path LIKE '%!!%')
 		       AND (parent = '' OR EXISTS (SELECT 1 FROM samples pp WHERE pp.sha256 = s0.parent))
 		       AND created_at < ?
@@ -2538,12 +2538,11 @@ func (db *DB) triageHighestSQLite(ctx context.Context, limit int, createdBefore,
 		                       WHERE r.sha256 = CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END
 		                         AND (r.report_type = 'highest'
 		                              OR (r.report_type = '`+ReportTypeMissing+`' AND r.created_at > ?)))`+extra+`
-		     ORDER BY litmus_score DESC
-		     LIMIT `+strconv.Itoa(highestInnerScan)+`
-		   ) hot GROUP BY root
+		   ) hot WHERE rank <= `+strconv.Itoa(triagePerRouteK)+`
+		   GROUP BY root
 		 ) roots
 		 JOIN samples ON samples.sha256 = roots.root AND samples.label IN ('good', 'unknown')
-		 ORDER BY roots.best DESC, samples.id DESC LIMIT ?`,
+		 ORDER BY roots.rank ASC, roots.best DESC, samples.id DESC LIMIT ?`,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage highest: %w", err)
@@ -2551,35 +2550,78 @@ func (db *DB) triageHighestSQLite(ctx context.Context, limit int, createdBefore,
 	return scanLiteSamples(rows)
 }
 
-// triageLowestSQLite: see TriageLowest. Mirrors triageLowestPG, including the
-// per-member drain key (a bad archive's members each need their own verdict).
+// triageLowestSQLite: see TriageLowest. Mirrors triageLowestPG (per-route
+// bottom-K via a PARTITION BY file_type window), including the per-member
+// drain key (a bad archive's members each need their own verdict).
 func (db *DB) triageLowestSQLite(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
 	extra, fargs := triageFilterClauseSQLite(f)
-	// litmusClassSQLite's two `?` (cutoff, then ceiling) come first in the SQL.
 	args := append([]any{
-		CriticalLevel, SuspiciousCeiling,
 		createdBefore.UTC().Format(time.RFC3339Nano),
 		missingBefore.UTC().Format(time.RFC3339Nano),
 	}, fargs...)
 	args = append(args, limit)
-	//nolint:gosec // G202: label/class predicates and column list are constant; filter values are parameterized via ? args
+	//nolint:gosec // G202: label predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleCols+` FROM samples
-		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND skip = ''
-		   AND `+litmusClassSQLite+` = 0
-		   AND label_source != 'conflict'
-		   AND (parent = '' OR path LIKE '%!!%')
-		   AND (parent = '' OR EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = samples.parent))
-		   AND created_at < ?
-		   AND NOT EXISTS (SELECT 1 FROM reports r
-		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'lowest')
-		   AND NOT EXISTS (SELECT 1 FROM reports r
-		                   WHERE r.sha256 = CASE WHEN samples.parent = '' THEN samples.sha256 ELSE samples.parent END
-		                     AND r.report_type = '`+ReportTypeMissing+`' AND r.created_at > ?)`+extra+`
-		 ORDER BY litmus_score ASC, id DESC LIMIT ?`,
+		`SELECT `+liteSampleCols+` FROM (
+		   SELECT samples.*,
+		          ROW_NUMBER() OVER (PARTITION BY file_type ORDER BY litmus_score ASC) AS rank
+		   FROM samples
+		   WHERE label = 'bad' AND cleave_result IS NOT NULL AND skip = ''
+		     AND litmus_score IS NOT NULL
+		     AND label_source != 'conflict'
+		     AND (parent = '' OR path LIKE '%!!%')
+		     AND (parent = '' OR EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = samples.parent))
+		     AND created_at < ?
+		     AND NOT EXISTS (SELECT 1 FROM reports r
+		                     WHERE r.sha256 = samples.sha256 AND r.report_type = 'lowest')
+		     AND NOT EXISTS (SELECT 1 FROM reports r
+		                     WHERE r.sha256 = CASE WHEN samples.parent = '' THEN samples.sha256 ELSE samples.parent END
+		                       AND r.report_type = '`+ReportTypeMissing+`' AND r.created_at > ?)`+extra+`
+		 ) samples
+		 WHERE rank <= `+strconv.Itoa(triagePerRouteK)+`
+		 ORDER BY rank ASC, litmus_score ASC, id DESC LIMIT ?`,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage lowest: %w", err)
+	}
+	return scanLiteSamples(rows)
+}
+
+// triageStrandedSQLite: see TriageStranded. Mirrors triageStrandedPG —
+// GROUP BY root with MAX(best) stands in for DISTINCT ON.
+func (db *DB) triageStrandedSQLite(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
+	extra, fargs := triageFilterClauseSQLite(f)
+	args := append([]any{
+		createdBefore.UTC().Format(time.RFC3339Nano),
+		missingBefore.UTC().Format(time.RFC3339Nano),
+	}, fargs...)
+	args = append(args, limit)
+	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleCols+` FROM (
+		   SELECT root, MAX(best) AS best FROM (
+		     SELECT m.parent AS root, m.score AS best
+		     FROM samples m
+		     WHERE m.label = 'good' AND m.cleave_result IS NOT NULL AND m.skip = ''
+		       AND m.parent != '' AND m.path LIKE '%!!%'
+		       AND m.score > 0 AND m.max_crit >= `+strconv.Itoa(notableCrit)+`
+		       AND m.label_source NOT LIKE 'cyclotron:%'
+		       AND m.created_at < ?
+		       AND EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = m.parent AND p.label = 'bad')
+		       AND NOT EXISTS (SELECT 1 FROM reports r
+		                       WHERE r.sha256 = m.sha256 AND r.report_type = 'stranded')
+		       AND NOT EXISTS (SELECT 1 FROM reports r
+		                       WHERE r.sha256 = m.parent
+		                         AND r.report_type = '`+ReportTypeMissing+`' AND r.created_at > ?)`+extra+`
+		     ORDER BY m.score DESC
+		     LIMIT `+strconv.Itoa(strandedInnerScan)+`
+		   ) hot GROUP BY root
+		 ) roots
+		 JOIN samples ON samples.sha256 = roots.root AND samples.label = 'bad'
+		 ORDER BY roots.best DESC, samples.id DESC LIMIT ?`,
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage stranded: %w", err)
 	}
 	return scanLiteSamples(rows)
 }

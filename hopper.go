@@ -162,12 +162,26 @@ const ReportTypeMissing = "missing"
 // without an operator having to clear anything.
 const MissingRetry = 4 * 24 * time.Hour
 
-// highestInnerScan bounds TriageHighest's member scan before it collapses hot
-// members to their archives. It must exceed the number of distinct roots a
-// batch could need by a wide margin; the hot set is concentrated enough (a few
-// hundred archives over the top thousands of members) that this is generous
-// while keeping the ordered index scan short.
-const highestInnerScan = 1000
+// triagePerRouteK bounds each file_type's candidate window in TriageHighest /
+// TriageLowest. K=10 covers the threshold-pinning band: a route's operating
+// point is an interpolated quantile over its top benign scores, so the top
+// ~10 are the files whose labels decide reported recall — and fixing #1
+// simply promotes #2 into the window on the next pass. Small enough that 80+
+// routes still fit one selection batch's ordering (every route's #1 sorts
+// before any route's #2).
+const triagePerRouteK = 10
+
+// notableCrit is the cleave criticality floor for the stranded queue's
+// member gate — 3 = "notable" in the shared severity ladder (mirrors
+// collimator's traits.py CRIT_LEVELS; info=1..hostile=5). Members below it
+// are inert content whose inherited-good label threatens nothing.
+const notableCrit = 3
+
+// strandedInnerScan bounds TriageStranded's member walk before the collapse
+// to parent archives — same role highestInnerScan used to play; the stranded
+// population is small (~tens of thousands) and score-concentrated, so this
+// comfortably fills any batch of distinct archives.
+const strandedInnerScan = 1000
 
 // CascadeDemoteScore is the minimum cleave risk score (samples.score) an
 // unlabeled archive member must carry to be demoted alongside a bad parent.
@@ -3506,11 +3520,23 @@ func (db *DB) TriageGood(ctx context.Context, limit int, f TriageFilter) ([]*Sam
 	return db.triageGoodSQLite(ctx, limit, f)
 }
 
-// TriageHighest returns good-labeled samples the routed ensemble scores
-// hostile (litmus_class >= 2), worst first by litmus_score. These are the rows
-// that pin each route's operating point: a per-route threshold is placed at the
-// highest-scoring benign in the slice, so a single mislabelled or genuinely
-// hard benign caps the recall reported for its whole filetype.
+// TriageHighest returns good-labeled samples at the TOP of their own
+// file_type's score distribution — each route's top-K by litmus_score
+// (triagePerRouteK), every route's #1 ranked before any route's #2. These are
+// the rows that pin each route's operating point: a per-route threshold is an
+// interpolated quantile over the slice's highest-scoring benigns, so a single
+// mislabelled or genuinely hard benign caps the recall reported for its whole
+// filetype.
+//
+// Two properties of the 2026-08-03 redesign are deliberate:
+//   - No litmus_class gate. The threshold-pinning band sits just BELOW the
+//     hostile cutoff by construction (the threshold is placed at/above the
+//     top benign), so a `class >= hostile` gate could only ever see
+//     already-flagged FPs, never the files that actually set the threshold.
+//     Class-NULL backfill lag stops mattering for the same reason.
+//   - Per-route windows, not a global score window. A global top-N never
+//     exits the tie band at score 1.0 (~70k good members), so routes whose
+//     FPs top out below 1.0 (PE: 0.997) were structurally unreachable.
 //
 // The unit of work is the archive, not the member: the query finds hot good
 // members (no parent = ” predicate — 95.8% of benign PE scoring >= 0.9999 are
@@ -3541,9 +3567,11 @@ func (db *DB) TriageHighest(ctx context.Context, limit int, createdBefore, missi
 	return db.triageHighestSQLite(ctx, limit, createdBefore, missingBefore, f)
 }
 
-// TriageLowest is TriageHighest's mirror: bad-labeled samples the ensemble
-// scores clean (litmus_class = 0), best-hidden first by ascending litmus_score
-// — the detection misses.
+// TriageLowest is TriageHighest's mirror: each file_type's bottom-K
+// bad-labeled samples by ascending litmus_score (triagePerRouteK, rank-first
+// across routes) — the best-hidden detection misses. Like the mirror it
+// carries no litmus_class gate (2026-08-03): per-route bottom-K IS "scored
+// clean" without depending on class derivation or its backfill.
 //
 // It drains per member rather than per archive, unlike TriageHighest. A bad
 // archive's malice lives in a few files while the rest is inert content that
@@ -3564,6 +3592,61 @@ func (db *DB) TriageLowest(ctx context.Context, limit int, createdBefore, missin
 		return db.triageLowestPG(ctx, limit, createdBefore, missingBefore, f)
 	}
 	return db.triageLowestSQLite(ctx, limit, createdBefore, missingBefore, f)
+}
+
+// TriageStranded returns bad-labeled parent archives that still contain
+// good-labeled members with real findings (score > 0, max_crit >= notable)
+// whose benign label was inherited before the parent's conviction — never
+// individually reviewed (label_source not cyclotron:*). Those members sit in
+// the benign training and threshold pools while living inside convicted
+// archives; measured 2026-08-03: ~77k stranded members, ~36k scoring >= 0.9.
+//
+// Unit of work is the ARCHIVE (dedup by parent, ranked by its riskiest
+// member's score descending) — the worker fetches and judges the whole
+// package for context — but the drain is PER MEMBER ('stranded' reports), so
+// an archive resurfaces until every qualifying member has been examined, and
+// a ruling never silently covers members the judge did not see. Companion
+// StrandedMembers lists the members awaiting verdicts for one root.
+func (db *DB) TriageStranded(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.triageStrandedPG(ctx, limit, createdBefore, missingBefore, f)
+	}
+	return db.triageStrandedSQLite(ctx, limit, createdBefore, missingBefore, f)
+}
+
+// StrandedMembers lists root's stranded members still awaiting a per-member
+// verdict — the same population TriageStranded's inner scan walks, filtered
+// to one archive, risk-score descending. The worker uses it to name the
+// members in the batch prompt and to know which shas to rule and drain.
+func (db *DB) StrandedMembers(ctx context.Context, root string) ([]*Sample, error) {
+	if db.pool != nil {
+		rows, err := db.pool.Query(ctx,
+			`SELECT `+pgSampleCols+` FROM samples
+			 WHERE label = 'good' AND cleave_result IS NOT NULL AND skip = ''
+			   AND parent = $1 AND path LIKE '%!!%'
+			   AND score > 0 AND max_crit >= `+strconv.Itoa(notableCrit)+`
+			   AND label_source NOT LIKE 'cyclotron:%'
+			   AND NOT EXISTS (SELECT 1 FROM reports r
+			                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'stranded')
+			 ORDER BY score DESC, id DESC`, root)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: stranded members: %w", err)
+		}
+		return scanPGSamples(rows)
+	}
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleCols+` FROM samples
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND skip = ''
+		   AND parent = ? AND path LIKE '%!!%'
+		   AND score > 0 AND max_crit >= `+strconv.Itoa(notableCrit)+`
+		   AND label_source NOT LIKE 'cyclotron:%'
+		   AND NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'stranded')
+		 ORDER BY score DESC, id DESC`, root)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: stranded members: %w", err)
+	}
+	return scanLiteSamples(rows)
 }
 
 // TriageNew returns analyzed top-level unknown-labeled samples that cleave

@@ -251,6 +251,27 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_bad_clean_score ` +
 			`ON samples(litmus_score ASC, id DESC) ` +
 			`WHERE label = 'bad' AND litmus_class = 0 AND cleave_result IS NOT NULL AND skip = ''`,
+		// Per-route triage windows (TriageHighest/TriageLowest, 2026-08-03
+		// redesign): each file_type's top/bottom-K by litmus_score. The
+		// leading file_type key lets the per-route LATERAL walk each route's
+		// score tail as a short ordered scan. litmus_score IS NOT NULL is in
+		// the predicate (never-scanned rows rank nowhere), so no NULLS
+		// spelling gymnastics are needed for planner matching. The older
+		// class-gated idx_samples_{good_hostile,bad_clean}_score indexes
+		// stay for any remaining class-band consumers.
+		`CREATE INDEX IF NOT EXISTS idx_samples_good_route_score ` +
+			`ON samples(file_type, litmus_score DESC) ` +
+			`WHERE label = 'good' AND litmus_score IS NOT NULL AND cleave_result IS NOT NULL AND skip = ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_bad_route_score ` +
+			`ON samples(file_type, litmus_score ASC) ` +
+			`WHERE label = 'bad' AND litmus_score IS NOT NULL AND cleave_result IS NOT NULL AND skip = ''`,
+		// TriageStranded's member walk: good members with real findings,
+		// risk-score descending; parent's bad label is probed per row via
+		// the sha256 unique index (cross-row predicates can't live in a
+		// partial index). StrandedMembers reuses it via the parent column.
+		`CREATE INDEX IF NOT EXISTS idx_samples_stranded_member ` +
+			`ON samples(score DESC, id DESC) ` +
+			`WHERE label = 'good' AND parent != '' AND score > 0 AND max_crit >= 3 AND cleave_result IS NOT NULL AND skip = ''`,
 		// The four newest-first selectors (TriageBad/Good/New/Sighted). Without
 		// these the planner walks idx_samples_top_created — which carries only
 		// parent = '' — and applies label plus the detection predicate as a
@@ -3382,43 +3403,75 @@ func (db *DB) triageSecondOpinionPG(ctx context.Context, limit int, trusted []st
 	return scanPGSamples(rows)
 }
 
+// Predicate fragments for the recursive skip-scan that enumerates distinct
+// file_types (Postgres has no loose index scan; DISTINCT over the ~11M-row
+// partial index costs ~100s, the recursive probe ~80 index descents / ~ms).
+// Must stay byte-compatible with idx_samples_{good,bad}_route_score's WHERE.
+const (
+	triageGoodScoredWherePG        = `label = 'good' AND litmus_score IS NOT NULL AND cleave_result IS NOT NULL AND skip = ''`
+	triageGoodScoredWherePGAliased = `s.label = 'good' AND s.litmus_score IS NOT NULL AND s.cleave_result IS NOT NULL AND s.skip = ''`
+	triageBadScoredWherePG         = `label = 'bad' AND litmus_score IS NOT NULL AND cleave_result IS NOT NULL AND skip = ''`
+	triageBadScoredWherePGAliased  = `s.label = 'bad' AND s.litmus_score IS NOT NULL AND s.cleave_result IS NOT NULL AND s.skip = ''`
+)
+
 // triageHighestPG: see TriageHighest. Returns one row per archive (the root
 // sample), not per hot member: the worker fetches and judges the whole archive,
 // so selecting its 40 hot members separately would re-fetch the same bytes 40
-// times and judge files in isolation. The inner scan walks the score-ordered
-// index over hot good members, DISTINCT ON collapses them to their root, and
-// the outer join resolves each root to its own sample row — restricted to
-// good/unknown parents, since a bad-labelled archive is TriageLowest's domain.
+// times and judge files in isolation. The member->parent existence check the
+// old query carried is gone: the outer root join already requires the parent
+// row (an orphan member wastes one of its route's K slots, nothing more).
 //
-// The inner LIMIT bounds the collapse: it reads the top highestInnerScan
-// members by score before deduping to roots. Given how concentrated the hot
-// set is (a few hundred archives hold the top thousands of members), that is
-// far more than enough to fill a batch's worth of distinct archives, while
-// keeping the scan off the full multi-hundred-thousand-row partition.
+// Shape: a LATERAL per distinct file_type walks that route's score-ordered
+// partial index (idx_samples_good_route_score) and stops after
+// triagePerRouteK eligible members, tagging each with its per-route rank.
+// DISTINCT ON collapses members to their root (keeping the hottest member's
+// score+rank), and the outer join resolves each root to its own sample row —
+// restricted to good/unknown parents, since a bad-labelled archive is
+// TriageLowest's domain. The final ORDER BY is rank-first: every route's #1
+// pinner sorts before any route's #2, so no route's tail (or the ~70k-member
+// score-1.0 tie band that archives own) can monopolize a batch.
+// The empty file_type is its own partition — rows there are rare (analyzed
+// rows carry a type) and excluding them would hide real pinners.
 func (db *DB) triageHighestPG(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
 	extra, fargs := triageFilterClausePG(f, 3)
 	args := append([]any{createdBefore, missingBefore}, fargs...)
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM (
-		   SELECT DISTINCT ON (root) root, best FROM (
-		     SELECT CASE WHEN parent = '' THEN sha256 ELSE parent END AS root, litmus_score AS best
-		     FROM samples s0
-		     WHERE label = 'good' AND cleave_result IS NOT NULL AND skip = ''
-		       AND litmus_class >= 2
-		       AND (parent = '' OR path LIKE '%!!%')
-		       AND (parent = '' OR EXISTS (SELECT 1 FROM samples pp WHERE pp.sha256 = s0.parent))
-		       AND created_at < $1
-		       AND NOT EXISTS (SELECT 1 FROM reports r
-		                       WHERE r.sha256 = CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END
-		                         AND (r.report_type = 'highest'
-		                              OR (r.report_type = '`+ReportTypeMissing+`' AND r.created_at > $2)))`+extra+`
-		     ORDER BY litmus_score DESC NULLS LAST
-		     LIMIT `+strconv.Itoa(highestInnerScan)+`
-		   ) hot ORDER BY root, best DESC
+		`WITH RECURSIVE fts AS (
+		   (SELECT file_type FROM samples
+		     WHERE `+triageGoodScoredWherePG+`
+		     ORDER BY file_type LIMIT 1)
+		   UNION ALL
+		   SELECT (SELECT s.file_type FROM samples s
+		           WHERE `+triageGoodScoredWherePGAliased+` AND s.file_type > fts.file_type
+		           ORDER BY s.file_type LIMIT 1)
+		   FROM fts WHERE fts.file_type IS NOT NULL
+		 )
+		 SELECT `+pgSampleCols+` FROM (
+		   SELECT DISTINCT ON (root) root, best, rank FROM (
+		     SELECT k.root, k.best, k.rank
+		     FROM (SELECT file_type FROM fts WHERE file_type IS NOT NULL) f
+		     CROSS JOIN LATERAL (
+		       SELECT CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END AS root,
+		              s0.litmus_score AS best,
+		              ROW_NUMBER() OVER (ORDER BY s0.litmus_score DESC) AS rank
+		       FROM samples s0
+		       WHERE s0.label = 'good' AND s0.cleave_result IS NOT NULL AND s0.skip = ''
+		         AND s0.litmus_score IS NOT NULL
+		         AND s0.file_type = f.file_type
+		         AND (s0.parent = '' OR s0.path LIKE '%!!%')
+		         AND s0.created_at < $1
+		         AND NOT EXISTS (SELECT 1 FROM reports r
+		                         WHERE r.sha256 = CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END
+		                           AND (r.report_type = 'highest'
+		                                OR (r.report_type = '`+ReportTypeMissing+`' AND r.created_at > $2)))`+extra+`
+		       ORDER BY s0.litmus_score DESC
+		       LIMIT `+strconv.Itoa(triagePerRouteK)+`
+		     ) k
+		   ) hot ORDER BY root, best DESC, rank ASC
 		 ) roots
 		 JOIN samples ON samples.sha256 = roots.root AND samples.label IN ('good', 'unknown')
-		 ORDER BY roots.best DESC NULLS LAST, samples.id DESC LIMIT $`+strconv.Itoa(len(args)),
+		 ORDER BY roots.rank ASC, roots.best DESC NULLS LAST, samples.id DESC LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage highest: %w", err)
@@ -3437,22 +3490,85 @@ func (db *DB) triageLowestPG(ctx context.Context, limit int, createdBefore, miss
 	args := append([]any{createdBefore, missingBefore}, fargs...)
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM samples
-		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND skip = ''
-		   AND litmus_class = 0
-		   AND label_source != 'conflict'
-		   AND (parent = '' OR path LIKE '%!!%')
-		   AND (parent = '' OR EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = samples.parent))
-		   AND created_at < $1
-		   AND NOT EXISTS (SELECT 1 FROM reports r
-		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'lowest')
-		   AND NOT EXISTS (SELECT 1 FROM reports r
-		                   WHERE r.sha256 = CASE WHEN samples.parent = '' THEN samples.sha256 ELSE samples.parent END
-		                     AND r.report_type = '`+ReportTypeMissing+`' AND r.created_at > $2)`+extra+`
-		 ORDER BY litmus_score ASC NULLS LAST, id DESC LIMIT $`+strconv.Itoa(len(args)),
+		`WITH RECURSIVE fts AS (
+		   (SELECT file_type FROM samples
+		     WHERE `+triageBadScoredWherePG+`
+		     ORDER BY file_type LIMIT 1)
+		   UNION ALL
+		   SELECT (SELECT s.file_type FROM samples s
+		           WHERE `+triageBadScoredWherePGAliased+` AND s.file_type > fts.file_type
+		           ORDER BY s.file_type LIMIT 1)
+		   FROM fts WHERE fts.file_type IS NOT NULL
+		 )
+		 SELECT `+pgSampleCols+` FROM (
+		   SELECT k.*
+		   FROM (SELECT file_type FROM fts WHERE file_type IS NOT NULL) f
+		   CROSS JOIN LATERAL (
+		     SELECT s0.*, ROW_NUMBER() OVER (ORDER BY s0.litmus_score ASC) AS rank
+		     FROM samples s0
+		     WHERE s0.label = 'bad' AND s0.cleave_result IS NOT NULL AND s0.skip = ''
+		       AND s0.litmus_score IS NOT NULL
+		       AND s0.file_type = f.file_type
+		       AND s0.label_source != 'conflict'
+		       AND (s0.parent = '' OR s0.path LIKE '%!!%')
+		       AND (s0.parent = '' OR EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = s0.parent))
+		       AND s0.created_at < $1
+		       AND NOT EXISTS (SELECT 1 FROM reports r
+		                       WHERE r.sha256 = s0.sha256 AND r.report_type = 'lowest')
+		       AND NOT EXISTS (SELECT 1 FROM reports r
+		                       WHERE r.sha256 = CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END
+		                         AND r.report_type = '`+ReportTypeMissing+`' AND r.created_at > $2)`+extra+`
+		     ORDER BY s0.litmus_score ASC
+		     LIMIT `+strconv.Itoa(triagePerRouteK)+`
+		   ) k
+		 ) samples
+		 ORDER BY rank ASC, litmus_score ASC NULLS LAST, id DESC LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage lowest: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
+// triageStrandedPG: see TriageStranded. The inner scan walks good-labeled
+// members with real findings (score > 0, max_crit >= notableCrit) whose
+// PARENT is bad-labeled, in member risk-score order; the collapse dedups to
+// the parent archive (unit of work — the worker fetches and judges the whole
+// archive with the member in context); the drain is PER MEMBER
+// (report_type='stranded'), so an archive resurfaces as long as any
+// qualifying member is unexamined, and never for members already covered.
+// label_source NOT LIKE 'cyclotron:%' excludes members whose good label came
+// from an individual review (the lowest queue's acquittals are correct state,
+// not stranded inheritance).
+func (db *DB) triageStrandedPG(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
+	extra, fargs := triageFilterClausePG(f, 3)
+	args := append([]any{createdBefore, missingBefore}, fargs...)
+	args = append(args, limit)
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM (
+		   SELECT DISTINCT ON (root) root, best FROM (
+		     SELECT m.parent AS root, m.score AS best
+		     FROM samples m
+		     WHERE m.label = 'good' AND m.cleave_result IS NOT NULL AND m.skip = ''
+		       AND m.parent != '' AND m.path LIKE '%!!%'
+		       AND m.score > 0 AND m.max_crit >= `+strconv.Itoa(notableCrit)+`
+		       AND m.label_source NOT LIKE 'cyclotron:%'
+		       AND m.created_at < $1
+		       AND EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = m.parent AND p.label = 'bad')
+		       AND NOT EXISTS (SELECT 1 FROM reports r
+		                       WHERE r.sha256 = m.sha256 AND r.report_type = 'stranded')
+		       AND NOT EXISTS (SELECT 1 FROM reports r
+		                       WHERE r.sha256 = m.parent
+		                         AND r.report_type = '`+ReportTypeMissing+`' AND r.created_at > $2)`+extra+`
+		     ORDER BY m.score DESC
+		     LIMIT `+strconv.Itoa(strandedInnerScan)+`
+		   ) hot ORDER BY root, best DESC
+		 ) roots
+		 JOIN samples ON samples.sha256 = roots.root AND samples.label = 'bad'
+		 ORDER BY roots.best DESC, samples.id DESC LIMIT $`+strconv.Itoa(len(args)),
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage stranded: %w", err)
 	}
 	return scanPGSamples(rows)
 }

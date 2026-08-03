@@ -361,3 +361,146 @@ func TestTriageSelectorsExcludeSkipped(t *testing.T) {
 		}
 	}
 }
+
+// TestTriageHighestPerRouteReach covers the 2026-08-03 redesign: files that
+// pin a small route's operating point must surface even when (a) they score
+// below the hostile class band and (b) another route owns a deep tie band at
+// the top of the global ordering — the two structural exclusions that kept
+// threshold-pinning benigns invisible to the old class-gated global window.
+// Ordering is rank-first across routes (every route's #1 before any #2).
+func TestTriageHighestPerRouteReach(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	analyzeAs := func(sha, ftype string, score int) {
+		t.Helper()
+		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":%q,"x":%d,"dp":0,"ts":[]}]}`, sha, ftype, score)
+		if err := db.UpdateCleaveResult(ctx, sha, result, nil, ""); err != nil {
+			t.Fatalf("UpdateCleaveResult(%s): %v", sha, err)
+		}
+	}
+	sha := func(i int) string { return fmt.Sprintf("%064d", i) }
+
+	// A "jar" tie band: more than triagePerRouteK good top-level files all at
+	// score 1.0 — the shape that monopolized the old global score window.
+	for i := 0; i < triagePerRouteK+5; i++ {
+		s := sha(100 + i)
+		mustInsert(t, ctx, db, &Sample{SHA256: s, Label: "good", Path: fmt.Sprintf("good/j%d.jar", i)})
+		analyzeAs(s, "jar", 5)
+		setLitmus(t, ctx, db, s, 2, 1.0)
+	}
+	// The PE-shaped pinners: class 1 (below the hostile band) and scores below
+	// the jar tie band — excluded by BOTH old mechanisms.
+	pe1, pe2 := sha(1), sha(2)
+	for _, p := range []struct {
+		sha   string
+		score float64
+	}{{pe1, 0.997}, {pe2, 0.95}} {
+		mustInsert(t, ctx, db, &Sample{SHA256: p.sha, Label: "good", Path: "good/" + p.sha[:4] + ".exe"})
+		analyzeAs(p.sha, "pe", 5)
+		setLitmus(t, ctx, db, p.sha, 1, p.score)
+	}
+
+	before := time.Now().Add(time.Hour)
+	missing := time.Now().Add(-MissingRetry)
+	got, err := db.TriageHighest(ctx, 4, before, missing, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageHighest: %v", err)
+	}
+	set := shaSet(got)
+	if !set[pe1] {
+		t.Errorf("pe route's #1 pinner (sub-hostile, sub-tie-band) not selected: %v", keysOf(set))
+	}
+	if !set[pe2] {
+		t.Errorf("pe rank-2 displaced by deeper jar ranks: %v", keysOf(set))
+	}
+	// Rank-first: positions 0-1 are the two routes' #1 files (jar 1.0 by
+	// score, then pe 0.997), positions 2-3 the rank-2 pair.
+	if got[1].SHA256 != pe1 {
+		t.Errorf("rank-first order violated: row 1 = %q, want pe #1", got[1].SHA256[:8])
+	}
+	if got[3].SHA256 != pe2 {
+		t.Errorf("rank-first order violated: row 3 = %q, want pe #2", got[3].SHA256[:8])
+	}
+}
+
+// TestTriageStrandedPerMemberDrain covers the stranded queue (2026-08-03):
+// good-labeled members with real findings inside bad-labeled archives are
+// surfaced AS their parent archive (dedup), gated on score>0 + notable crit +
+// never-individually-reviewed label_source, and drained PER MEMBER so the
+// archive resurfaces until every qualifying member has a verdict.
+func TestTriageStrandedPerMemberDrain(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	sha := func(c byte) string {
+		s := make([]byte, 64)
+		for i := range s {
+			s[i] = c
+		}
+		return string(s)
+	}
+	analyzeCrit := func(sa string, score int, crit int) {
+		t.Helper()
+		result := fmt.Appendf(nil,
+			`{"fs":[{"sha":%q,"type":"pe","x":%d,"dp":0,"ts":[{"l":%d,"c":1.0}]}]}`,
+			sa, score, crit)
+		if err := db.UpdateCleaveResult(ctx, sa, result, nil, ""); err != nil {
+			t.Fatalf("UpdateCleaveResult(%s): %v", sa, err)
+		}
+	}
+
+	pBad, pGood := sha('a'), sha('b')
+	m1, m2, mLow, mAcq, mUnderGood := sha('1'), sha('2'), sha('3'), sha('4'), sha('5')
+	mustInsert(t, ctx, db, &Sample{SHA256: pBad, Label: "bad", Path: "bad/x.tgz"})
+	mustInsert(t, ctx, db, &Sample{SHA256: pGood, Label: "good", Path: "good/y.tgz"})
+	// Two qualifying stranded members under the bad parent.
+	mustInsert(t, ctx, db, &Sample{SHA256: m1, Label: "good", Parent: pBad, Path: "bad/x.tgz!!a.exe"})
+	analyzeCrit(m1, 90, 4)
+	mustInsert(t, ctx, db, &Sample{SHA256: m2, Label: "good", Parent: pBad, Path: "bad/x.tgz!!b.exe"})
+	analyzeCrit(m2, 40, 3)
+	// Excluded: crit below notable.
+	mustInsert(t, ctx, db, &Sample{SHA256: mLow, Label: "good", Parent: pBad, Path: "bad/x.tgz!!c.txt"})
+	analyzeCrit(mLow, 5, 1)
+	// Excluded: individually acquitted by the lowest queue.
+	mustInsert(t, ctx, db, &Sample{SHA256: mAcq, Label: "good", Parent: pBad, Path: "bad/x.tgz!!d.dll", LabelSource: "cyclotron:lowest"})
+	analyzeCrit(mAcq, 80, 4)
+	// Excluded: parent is not bad.
+	mustInsert(t, ctx, db, &Sample{SHA256: mUnderGood, Label: "good", Parent: pGood, Path: "good/y.tgz!!e.exe"})
+	analyzeCrit(mUnderGood, 95, 5)
+
+	before := time.Now().Add(time.Hour)
+	missing := time.Now().Add(-MissingRetry)
+	got, err := db.TriageStranded(ctx, 10, before, missing, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageStranded: %v", err)
+	}
+	if len(got) != 1 || got[0].SHA256 != pBad {
+		t.Fatalf("want exactly [pBad], got %v", keysOf(shaSet(got)))
+	}
+
+	members, err := db.StrandedMembers(ctx, pBad)
+	if err != nil {
+		t.Fatalf("StrandedMembers: %v", err)
+	}
+	if len(members) != 2 || members[0].SHA256 != m1 || members[1].SHA256 != m2 {
+		t.Fatalf("StrandedMembers want [m1 m2] score-desc, got %d rows", len(members))
+	}
+
+	// Drain one member: archive must RESURFACE (m2 still unexamined).
+	if err := db.InsertReport(ctx, &Report{SHA256: m1, Type: "stranded", Content: "benign"}); err != nil {
+		t.Fatalf("InsertReport: %v", err)
+	}
+	got2, _ := db.TriageStranded(ctx, 10, before, missing, TriageFilter{})
+	if len(got2) != 1 || got2[0].SHA256 != pBad {
+		t.Fatalf("archive with an unexamined member must resurface, got %v", keysOf(shaSet(got2)))
+	}
+	// Drain the last member: archive leaves the queue.
+	if err := db.InsertReport(ctx, &Report{SHA256: m2, Type: "stranded", Content: "malicious"}); err != nil {
+		t.Fatalf("InsertReport: %v", err)
+	}
+	got3, _ := db.TriageStranded(ctx, 10, before, missing, TriageFilter{})
+	if len(got3) != 0 {
+		t.Fatalf("fully-examined archive must drain, got %v", keysOf(shaSet(got3)))
+	}
+}
