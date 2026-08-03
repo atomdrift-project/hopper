@@ -439,6 +439,69 @@ func TestHandleTriageSightedRulings(t *testing.T) {
 	if samp.Label != "bad" || samp.LabelSource != "promoter" {
 		t.Fatalf("row after re-promote: label=%q source=%q", samp.Label, samp.LabelSource)
 	}
+
+	// Acquittal out of a destination tree: bad/foraged-quarantine →
+	// good/foraged-promote. The quarantine tree is a source root, so the subpath
+	// survives the round trip instead of collapsing to a flat basename.
+	res = rule(shaA, "good", "cyclotron:acquit")
+	wantC := filepath.Join("good", "foraged-promote", "npm", "registry", "socket", "evil", "evil-1.0.tgz")
+	if res.NewPath != wantC {
+		t.Fatalf("acquit path = %q, want %q", res.NewPath, wantC)
+	}
+	if _, err := os.Stat(filepath.Join(root, wantC)); err != nil {
+		t.Fatalf("acquitted file missing: %v", err)
+	}
+	samp, err = db.SampleBySHA256(ctx, shaA)
+	if err != nil {
+		t.Fatalf("SampleBySHA256: %v", err)
+	}
+	if samp.Label != "good" || samp.LabelSource != "cyclotron:acquit" || samp.Path != wantC {
+		t.Fatalf("row after acquit: label=%q source=%q path=%q", samp.Label, samp.LabelSource, samp.Path)
+	}
+}
+
+// TestRulingPlanPreservesSubpath pins the placement arithmetic on its own. Every
+// tree a ruled sample can sit in — discovery, upload shard, and the three ruling
+// destinations — must preserve the subpath, because a ruling is not final and a
+// sample can re-enter from wherever the last one put it. Only a genuinely
+// unrooted path may fall back to the basename.
+func TestRulingPlanPreservesSubpath(t *testing.T) {
+	const sub = "npm/registry/socket/evil/evil-1.0.tgz"
+	cases := []struct {
+		name   string
+		oldRel string
+		ruling string
+		want   string
+	}{
+		{"discovery promote", "unknown/foraged/" + sub, "good", "good/foraged-promote/" + sub},
+		{"discovery demote", "unknown/foraged/" + sub, "bad", "bad/foraged-quarantine/" + sub},
+		{"upload shard", "unknown/uploads/ab/cd/evil-1.0.tgz", "good", "good/foraged-promote/ab/cd/evil-1.0.tgz"},
+		{"sighted promote", "sighted/foraged/" + sub, "bad", "bad/foraged-quarantine/" + sub},
+		// Round trips out of a destination tree: these flattened to the basename
+		// before the destinations were themselves source roots.
+		{"quarantine acquit", "bad/foraged-quarantine/" + sub, "good", "good/foraged-promote/" + sub},
+		{"promoted demote", "good/foraged-promote/" + sub, "bad", "bad/foraged-quarantine/" + sub},
+		{"promoted to sighted", "good/foraged-promote/" + sub, "sighted", "sighted/foraged/" + sub},
+		// bad/foraged/ must not shadow bad/foraged-quarantine/.
+		{"bad discovery demote", "bad/foraged/" + sub, "sighted", "sighted/foraged/" + sub},
+		// Not under any root: basename is all that can be salvaged.
+		{"unrooted", "unknown/foraged-undetermined/" + sub, "good", "good/foraged-promote/evil-1.0.tgz"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := rulingPlan(nil, tc.oldRel, tc.ruling)
+			if !ok {
+				t.Fatalf("rulingPlan(%q, %q) not ok", tc.oldRel, tc.ruling)
+			}
+			if got.newRel != tc.want {
+				t.Errorf("newRel = %q, want %q", got.newRel, tc.want)
+			}
+		})
+	}
+
+	if _, ok := rulingPlan(nil, "unknown/foraged/"+sub, "review"); ok {
+		t.Error("unrecognized ruling should not be ok")
+	}
 }
 
 func repeat(b string) string {

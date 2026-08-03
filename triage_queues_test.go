@@ -194,3 +194,109 @@ func keysOf(m map[string]bool) []string {
 	}
 	return out
 }
+
+// TestTriageStaleOrdering pins the TriageStale contract on the selectors that
+// support it: rank least-recently-analyzed first, honour MinAnalyzedAt as a
+// floor, and let ExcludeReportType park a row until it is re-analyzed. The
+// default (TriageNewest) must keep ranking by created_at so existing callers
+// are untouched.
+func TestTriageStaleOrdering(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	now := time.Now().UTC().Truncate(time.Second)
+	setTimes := func(sha string, created, analyzed time.Time) {
+		t.Helper()
+		if _, err := db.lite.ExecContext(ctx,
+			`UPDATE samples SET created_at = ?, analyzed_at = ? WHERE sha256 = ?`,
+			created.Format(time.RFC3339Nano), analyzed.Format(time.RFC3339Nano), sha); err != nil {
+			t.Fatalf("set times: %v", err)
+		}
+	}
+
+	// created order is deliberately the reverse of analyzed order, so a test
+	// that accidentally kept created_at ordering cannot pass.
+	type row struct {
+		sha                string
+		created, analyzed  time.Time
+	}
+	rows := []row{
+		{sha: staleTestSHA(1), created: now.Add(-3 * time.Hour), analyzed: now.Add(-90 * 24 * time.Hour)},
+		{sha: staleTestSHA(2), created: now.Add(-2 * time.Hour), analyzed: now.Add(-30 * 24 * time.Hour)},
+		{sha: staleTestSHA(3), created: now.Add(-1 * time.Hour), analyzed: now.Add(-1 * 24 * time.Hour)},
+	}
+	for _, r := range rows {
+		mustInsert(t, ctx, db, &Sample{
+			SHA256: r.sha, Source: "test", Label: "bad", LabelSource: "test",
+			Path: "bad/" + r.sha, FileType: "elf",
+			CleaveResult:    []byte(`{"files":[]}`),
+			MaxCrit:         0,
+			SuspiciousCount: 0, // (max_crit<5 OR suspicious_count<2) => in queue
+		})
+		setTimes(r.sha, r.created, r.analyzed)
+	}
+
+	staleOrder := func(f TriageFilter) []string {
+		t.Helper()
+		got, err := db.TriageBad(ctx, 10, f)
+		if err != nil {
+			t.Fatalf("TriageBad(%+v): %v", f, err)
+		}
+		return shaList(got)
+	}
+
+	oldest, mid, newest := rows[0].sha[:8], rows[1].sha[:8], rows[2].sha[:8]
+
+	if got, want := staleOrder(TriageFilter{Order: TriageStale}), []string{oldest, mid, newest}; !slicesEqual(got, want) {
+		t.Errorf("stale order = %v, want %v (oldest analysis first)", got, want)
+	}
+	// Default ordering is unchanged — newest created first, the exact reverse.
+	if got, want := staleOrder(TriageFilter{}), []string{newest, mid, oldest}; !slicesEqual(got, want) {
+		t.Errorf("newest order = %v, want %v (newest created first)", got, want)
+	}
+	// MinAnalyzedAt drops the rows whose verdict predates the floor.
+	if got, want := staleOrder(TriageFilter{Order: TriageStale, MinAnalyzedAt: now.Add(-7 * 24 * time.Hour)}), []string{newest}; !slicesEqual(got, want) {
+		t.Errorf("min-analyzed = %v, want %v", got, want)
+	}
+
+	// A report filed after the sample's last analysis parks it...
+	if err := db.InsertReport(ctx, &Report{SHA256: rows[0].sha, Type: "bad-stale", CreatedAt: now}); err != nil {
+		t.Fatalf("insert report: %v", err)
+	}
+	if got, want := staleOrder(TriageFilter{Order: TriageStale, ExcludeReportType: "bad-stale"}), []string{mid, newest}; !slicesEqual(got, want) {
+		t.Errorf("exclude-report = %v, want %v", got, want)
+	}
+
+	// ...until a re-analysis supersedes it, which makes the row eligible again
+	// and sorts it last, since it now holds the freshest verdict.
+	setTimes(rows[0].sha, rows[0].created, now.Add(time.Minute))
+	if got, want := staleOrder(TriageFilter{Order: TriageStale, ExcludeReportType: "bad-stale"}), []string{mid, newest, oldest}; !slicesEqual(got, want) {
+		t.Errorf("post-rescan = %v, want %v (re-analysis clears the report)", got, want)
+	}
+}
+
+// staleTestSHA builds a valid 64-char hex sha256 that differs in its FIRST
+// bytes, so shaList's 8-char prefix distinguishes rows. A "%064x" of a small
+// int puts every distinguishing digit at the tail and renders them all as
+// "00000000", which silently turns every ordering assertion into a tautology.
+func staleTestSHA(n int) string { return fmt.Sprintf("%02x%062x", n, 0) }
+
+func shaList(ss []*Sample) []string {
+	out := make([]string, len(ss))
+	for i, s := range ss {
+		out[i] = s.SHA256[:8]
+	}
+	return out
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

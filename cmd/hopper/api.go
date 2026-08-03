@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime/debug"
 	"slices"
@@ -751,13 +752,78 @@ const (
 	// chew through transient blips with full-jitter backoff; short enough
 	// to surface a real outage to logs without leaving the file orphaned.
 	uploadStoreTimeout = 2 * time.Minute
-	// uploadDir is the fallback upload root under dataRoot,
-	// <root>/unknown/uploads. A recognized producer gets its own tree (see
-	// uploadRelDir); this receives everything else, and holds the .tmp spool
-	// and extract cache shared by every upload. Workers pick uploads up via
-	// the upload tier in claimJobs regardless of which tree they landed in.
+	// uploadDir is the legacy/fallback directory under dataRoot where uploads
+	// land: <root>/unknown/uploads. Workers pick them up via the upload tier
+	// in claimJobs. It also anchors the spool (.tmp) and extract cache for
+	// EVERY upload regardless of destination tree — the post-hash rename must
+	// stay on one filesystem, and the service unit grants ReadWritePaths on
+	// this root — while recognized producers use the richer coordinate/digest
+	// layout in uploadRelDir.
 	uploadDir = "unknown/uploads"
+	// uploadDirScan and uploadDirPrism split uploads by producer so each tree
+	// can carry its own promotion policy. Worker dependency mirroring and
+	// `atomscan --hopper` are registry artifacts with fetch provenance and are
+	// promotable; prism uploads are arbitrary user submissions, which may be
+	// demoted to bad on evidence but must never be auto-promoted into the good
+	// pool (a blessed coordinate suppresses future scanning, so promoting
+	// attacker-chosen bytes is a poisoning path). Producers are told apart by
+	// the sidecar's required fetch.collector.
+	uploadDirScan  = "unknown/scan"
+	uploadDirPrism = "unknown/prism"
 )
+
+// uploadRootFor picks the destination tree for a new upload from the producer
+// recorded in its provenance sidecar: "scan+<host>" (worker mirroring or the
+// --hopper CLI) and "prism" get their own roots, and everything else — other
+// collectors, and the deprecated raw-body path that carries no sidecar at all —
+// keeps the legacy root. Unattributable bytes therefore never land in a tree a
+// promoting daemon watches.
+func uploadRootFor(prov *hopper.Sidecar) string {
+	if prov == nil {
+		return uploadDir
+	}
+	collector := prov.Fetch.Collector
+	// The producer identity is the part before the instance suffix
+	// ("scan+galadriel" -> "scan", "forager+0a45da17" -> "forager").
+	if i := strings.IndexByte(collector, '+'); i >= 0 {
+		collector = collector[:i]
+	}
+	switch collector {
+	case "scan":
+		return uploadDirScan
+	case "prism":
+		return uploadDirPrism
+	default:
+		return uploadDir
+	}
+}
+
+// uploadRoots are the trees uploadRootFor can choose. Used to decide whether a
+// re-uploaded sha already sits in an upload tree (and must stay there) or lives
+// elsewhere in the pool entirely.
+var uploadRoots = []string{uploadDir, uploadDirScan, uploadDirPrism}
+
+// existingUploadDir returns the directory of an already-stored sample when it
+// sits in one of the upload trees, else "". A sha parked in an upload tree keeps
+// its directory on re-upload: re-sending the same bytes (a legacy
+// unknown/uploads/ row re-sent by scan now that it routes to unknown/scan/, or a
+// producer retrying) must be idempotent, not a second copy in another tree that
+// the single row can only point at one of. Rows outside the upload trees
+// (already promoted, foraged) return "" and fall through to the producer's root,
+// exactly as they did when every upload shared one directory.
+func existingUploadDir(existingPath string) string {
+	// path.Dir("") is ".", so an absent path falls out here too.
+	dir := path.Dir(filepath.ToSlash(existingPath))
+	if dir == "." {
+		return ""
+	}
+	for _, root := range uploadRoots {
+		if dir == root || strings.HasPrefix(dir, root+"/") {
+			return dir
+		}
+	}
+	return ""
+}
 
 // validWorkerName checks that the name is non-empty, <= maxWorkerNameLen,
 // and contains only printable ASCII without control chars or whitespace tricks.
@@ -1643,7 +1709,7 @@ func (s *apiServer) claimJobs(ctx context.Context, worker string, count int, too
 	// instead of waiting for its SHA prefix to come up in the Tier 1
 	// random-pivot rotation.
 	want = count - len(out)
-	cands, err = s.db.ForcedRescanCandidates(ctx, overfetch)
+	cands, err = s.db.ForcedRescanCandidates(ctx, s.hopperStart, overfetch)
 	if err != nil {
 		return out, err
 	}

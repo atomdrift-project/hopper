@@ -1198,6 +1198,66 @@ func validProvenance(t *testing.T, file []byte, claimedSHA string) []byte {
 	return b
 }
 
+func TestUploadRootFor(t *testing.T) {
+	t.Parallel()
+	prov := func(collector string) *hopper.Sidecar {
+		return &hopper.Sidecar{Fetch: hopper.Fetch{Collector: collector}}
+	}
+	for _, tc := range []struct {
+		name string
+		prov *hopper.Sidecar
+		want string
+	}{
+		// Worker dependency mirroring and `atomscan --hopper` both identify as
+		// "scan+<host>"; these are registry artifacts a promoting daemon may
+		// bless into the good pool.
+		{"worker mirror", prov("scan+galadriel"), uploadDirScan},
+		{"scan with no instance suffix", prov("scan"), uploadDirScan},
+		// Prism uploads are arbitrary user submissions: own tree, never
+		// auto-promoted.
+		{"prism", prov("prism"), uploadDirPrism},
+		// Everything else keeps the legacy root, including the deprecated
+		// raw-body path that carries no sidecar at all — unattributable bytes
+		// must not land in a tree a promoting daemon watches.
+		{"forager", prov("forager+0a45da172e3f"), uploadDir},
+		{"unknown collector", prov("somethingelse"), uploadDir},
+		{"no provenance", nil, uploadDir},
+		// A collector must not be able to steer itself into another tree by
+		// prefixing its name.
+		{"lookalike collector", prov("scanner+evil"), uploadDir},
+		{"empty collector", prov(""), uploadDir},
+	} {
+		if got := uploadRootFor(tc.prov); got != tc.want {
+			t.Errorf("%s: uploadRootFor = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A sha already stored in an upload tree must keep its directory when
+// re-uploaded, even by a producer that routes elsewhere now: re-sending the
+// same bytes is idempotent, not a second copy in a new tree that the row can
+// only point at one of. Rows outside the upload trees keep the old behavior of
+// landing in the producer's root.
+func TestUploadRootKeepsExistingUploadPath(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		existing string
+		want     string // "" means: use the producer's root, not the existing dir
+	}{
+		{"legacy uploads row re-sent by scan", "unknown/uploads/ab/cd/pkg.tgz", "unknown/uploads/ab/cd"},
+		{"already in the scan tree", "unknown/scan/ab/cd/pkg.tgz", "unknown/scan/ab/cd"},
+		{"already in the prism tree", "unknown/prism/ab/cd/pkg.tgz", "unknown/prism/ab/cd"},
+		{"promoted row", "good/foraged-promote/ab/cd/pkg.tgz", ""},
+		{"foraged row", "unknown/foraged/ab/cd/pkg.tgz", ""},
+		{"no path", "", ""},
+	} {
+		if got := existingUploadDir(tc.existing); got != tc.want {
+			t.Errorf("%s: reused dir = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 func mustJSON(t *testing.T, v any) []byte {
 	t.Helper()
 	b, err := json.Marshal(v)

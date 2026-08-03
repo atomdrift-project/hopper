@@ -534,7 +534,7 @@ func TestRepairQueue(t *testing.T) {
 	if len(afterPromote) != 0 {
 		t.Errorf("after interactive rescan, repair tier should be empty, got %+v", afterPromote)
 	}
-	forced, err := db.ForcedRescanCandidates(ctx, 50)
+	forced, err := db.ForcedRescanCandidates(ctx, time.Now(), 50)
 	if err != nil {
 		t.Fatalf("ForcedRescanCandidates: %v", err)
 	}
@@ -4795,7 +4795,7 @@ func TestRequestRescanQueuesTier0(t *testing.T) {
 		t.Fatalf("RequestRescan: %v", err)
 	}
 
-	jobs, err := db.ForcedRescanCandidates(ctx, 10)
+	jobs, err := db.ForcedRescanCandidates(ctx, time.Now(), 10)
 	if err != nil {
 		t.Fatalf("ForcedRescanCandidates: %v", err)
 	}
@@ -4858,7 +4858,7 @@ func TestUpdateCleaveResultClearsForcedRescan(t *testing.T) {
 
 	mustAnalyze(t, ctx, db, sha, 2) // simulates a worker finishing the rescan
 
-	jobs, err := db.ForcedRescanCandidates(ctx, 10)
+	jobs, err := db.ForcedRescanCandidates(ctx, time.Now(), 10)
 	if err != nil {
 		t.Fatalf("ForcedRescanCandidates: %v", err)
 	}
@@ -4891,7 +4891,7 @@ func TestForcedRescanCandidatesOrder(t *testing.T) {
 		}
 	}
 
-	jobs, err := db.ForcedRescanCandidates(ctx, 10)
+	jobs, err := db.ForcedRescanCandidates(ctx, time.Now(), 10)
 	if err != nil {
 		t.Fatalf("ForcedRescanCandidates: %v", err)
 	}
@@ -4902,6 +4902,93 @@ func TestForcedRescanCandidatesOrder(t *testing.T) {
 		if j.SHA256 != shas[i] {
 			t.Fatalf("jobs[%d] = %s, want %s (FIFO order)", i, j.SHA256, shas[i])
 		}
+	}
+}
+
+// TestForcedRescanCandidatesHoldsBackErrors covers the Tier 0 error-backoff
+// guard. Tier 0 drains before every other tier, so a sample that fails analysis
+// would otherwise sit at the head of the FIFO and be re-offered on every poll,
+// starving the forced rescans queued behind it. A row that errored during this
+// run is withheld; a restart (a hopperStart later than the error) offers it
+// again, matching Tier 1's contract.
+//
+// The guard deliberately keys on last_error_at rather than attempts: attempts
+// is never reset, so an attempts ceiling here would make a sample rescanned
+// MaxClaimAttempts times over its life permanently unrescannable.
+func TestForcedRescanCandidatesHoldsBackErrors(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	const sha = "bbccdd0000000000000000000000000000000000000000000000000000000011"
+	mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test", Label: "good", LabelSource: "test"})
+	mustAnalyze(t, ctx, db, sha, 1)
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET analyzed_at = ? WHERE sha256 = ?`,
+		time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), sha); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	if err := db.RequestRescan(ctx, sha, 15*time.Minute); err != nil {
+		t.Fatalf("RequestRescan: %v", err)
+	}
+
+	runStart := time.Now().Add(-time.Hour)
+	jobs, err := db.ForcedRescanCandidates(ctx, runStart, 10)
+	if err != nil {
+		t.Fatalf("ForcedRescanCandidates: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].SHA256 != sha {
+		t.Fatalf("queued sample = %+v, want one job for %s", jobs, sha)
+	}
+
+	// A worker picks it up and fails.
+	if err := db.SetNote(ctx, sha, "worker failed"); err != nil {
+		t.Fatalf("SetNote: %v", err)
+	}
+	jobs, err = db.ForcedRescanCandidates(ctx, runStart, 10)
+	if err != nil {
+		t.Fatalf("ForcedRescanCandidates after error: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("errored sample still offered: got %+v, want none", jobs)
+	}
+
+	// A restart gives it one more chance.
+	jobs, err = db.ForcedRescanCandidates(ctx, time.Now().Add(time.Hour), 10)
+	if err != nil {
+		t.Fatalf("ForcedRescanCandidates after restart: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].SHA256 != sha {
+		t.Fatalf("after restart = %+v, want one job for %s", jobs, sha)
+	}
+}
+
+// TestForcedRescanCandidatesIgnoresAttempts guards the deliberate absence of an
+// attempts ceiling in Tier 0. attempts counts every claim a sample has ever had
+// and is never reset — not by StoreResult, and ReapStuck only reaps rows that
+// are still unanalyzed — so a ceiling here would quietly retire the rescan
+// button for the samples operators revisit most.
+func TestForcedRescanCandidatesIgnoresAttempts(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	const sha = "bbccdd0000000000000000000000000000000000000000000000000000000012"
+	mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test", Label: "good", LabelSource: "test"})
+	mustAnalyze(t, ctx, db, sha, 1)
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET analyzed_at = ?, attempts = ? WHERE sha256 = ?`,
+		time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), MaxClaimAttempts*3, sha); err != nil {
+		t.Fatalf("stamp attempts: %v", err)
+	}
+	if err := db.RequestRescan(ctx, sha, 15*time.Minute); err != nil {
+		t.Fatalf("RequestRescan: %v", err)
+	}
+
+	jobs, err := db.ForcedRescanCandidates(ctx, time.Now(), 10)
+	if err != nil {
+		t.Fatalf("ForcedRescanCandidates: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].SHA256 != sha {
+		t.Fatalf("well-travelled sample = %+v, want one job for %s", jobs, sha)
 	}
 }
 
@@ -4941,7 +5028,7 @@ func TestRequestRescanPreservesEnvelope(t *testing.T) {
 
 	// After the rescan request the row must remain in Tier 0 *and* still
 	// expose its cached envelope to readers.
-	jobs, err := db.ForcedRescanCandidates(ctx, 10)
+	jobs, err := db.ForcedRescanCandidates(ctx, time.Now(), 10)
 	if err != nil {
 		t.Fatalf("ForcedRescanCandidates: %v", err)
 	}
@@ -6148,4 +6235,70 @@ func TestCascadeBackfill(t *testing.T) {
 	if again.MembersDemoted != 0 || again.MembersPromoted != 0 {
 		t.Errorf("re-run = {%d demoted, %d promoted}, want {0, 0} (idempotent)", again.MembersDemoted, again.MembersPromoted)
 	}
+}
+
+// TestReferenceEdgeMembersLabelledUnknown pins the label a reference-edge member
+// is born with. A fetched/registry edge must not inherit the parent's label (a
+// package naming a dependency says nothing about that dependency's bytes), but
+// "unlabelled" has to mean labelUnknown, not "". Every triage selector matches
+// the four pool labels exactly, so a member stored as "" is invisible to all of
+// them and never gets judged on its own bytes — and nothing heals it later,
+// since labelRank scores "" and 'unknown' alike and the upsert promotes only on
+// a strictly greater rank. Contained members must still inherit.
+func TestReferenceEdgeMembersLabelledUnknown(t *testing.T) {
+	mk := func(i int) string { return fmt.Sprintf("%064x", i+1) }
+
+	for _, tc := range []struct {
+		name      string
+		rel       Rel
+		wantLabel string
+		wantSrc   string
+	}{
+		{"contained inherits", RelContained, "bad", "ls"},
+		{"unpacked inherits", RelUnpacked, "bad", "ls"},
+		{"fetched stays unknown", RelFetched, labelUnknown, ""},
+		{"registry stays unknown", RelRegistry, labelUnknown, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := &Sample{
+				SHA256: mk(99), Source: "s", Feed: "fd", Ecosystem: "e",
+				Label: "bad", LabelSource: "ls", Path: "bad/pkg.tar",
+				CleaveResult: []byte(fmt.Sprintf(
+					`{"files":[{"sha":%q,"type":"elf","path":"pkg/f.so","depth":1,"size":100,`+
+						`"rel":%q,"traits":[{"crit":5,"conf":0.9}]}]}`, mk(0), string(tc.rel))),
+			}
+			members := memberSamplesFromEnvelope(parent)
+			if len(members) != 1 {
+				t.Fatalf("got %d members, want 1", len(members))
+			}
+			if got := members[0].Label; got != tc.wantLabel {
+				t.Errorf("label = %q, want %q", got, tc.wantLabel)
+			}
+			if got := members[0].LabelSource; got != tc.wantSrc {
+				t.Errorf("label_source = %q, want %q", got, tc.wantSrc)
+			}
+		})
+	}
+}
+
+// TestNormalizeLabelCoercesZeroValue guards the write-boundary invariant: the
+// label column is NOT NULL DEFAULT 'unknown', but every insert names the column
+// explicitly, so the default never fires and a caller leaving Sample.Label at
+// Go's zero value would otherwise persist "". Callers that do set a label keep
+// it untouched.
+func TestNormalizeLabelCoercesZeroValue(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"", labelUnknown},
+		{labelUnknown, labelUnknown},
+		{"good", "good"},
+		{"bad", "bad"},
+		{labelSighted, labelSighted},
+	} {
+		s := &Sample{SHA256: "a", Path: "p", Label: tc.in}
+		normalizeLabel(s)
+		if s.Label != tc.want {
+			t.Errorf("normalizeLabel(%q) = %q, want %q", tc.in, s.Label, tc.want)
+		}
+	}
+	normalizeLabel(nil) // must not panic
 }

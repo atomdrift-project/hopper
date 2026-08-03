@@ -77,19 +77,35 @@ const (
 	sightedTree     = "sighted/foraged"
 )
 
-// promoteSrcRoots are the discovery trees a ruled sample may start from; the
-// first matching prefix is stripped to preserve the subpath. The trailing
-// slashes keep siblings like unknown/foraged-review/ excluded.
+// promoteSrcRoots are the trees a ruled sample may start from; the first
+// matching prefix is stripped to preserve the subpath. The trailing slashes
+// keep siblings like unknown/foraged-review/ excluded, and keep bad/foraged/
+// from shadowing bad/foraged-quarantine/.
 //
 // uploads/ is here because a scanner push is a discovery too — a fetched
 // dependency is often the first time anyone has seen those bytes. Without it a
 // ruled upload matched no root and fell back to the basename, collapsing the
 // sha shard (uploads/ab/cd/x.tgz) into a flat good/foraged-promote/x.tgz where
 // two packages sharing a filename would collide.
+// The destination trees are roots too, because a ruling is not final: a sample
+// promoted to good/foraged-promote/npm/foo.tgz and later demoted, or demoted to
+// bad/foraged-quarantine and later acquitted, re-enters rulingPlan from its
+// destination. Without them that round trip matched no root and flattened an
+// already-preserved subpath. sightedTree needs no separate entry — it is also a
+// discovery root, which is why round trips through the sighted pool never
+// collapsed.
 var promoteSrcRoots = []string{
-	"unknown/foraged/", "sighted/foraged/", "bad/foraged/",
-	"unknown/scan/", "unknown/prism/", "unknown/forager/",
+	"unknown/foraged/",
+	"sighted/foraged/", // == sightedTree: both a discovery root and a ruling destination
+	"bad/foraged/",
+	"unknown/scan/",
+	"unknown/prism/",
+	"unknown/forager/",
 	"unknown/uploads/", // legacy root: rows written before the per-producer trees
+	uploadDirScan + "/",
+	uploadDirPrism + "/",
+	promoteGoodTree + "/",
+	promoteBadTree + "/",
 }
 
 // placement is a triage item's resolved destination: the new relative path and

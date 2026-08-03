@@ -251,6 +251,32 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_bad_clean_score ` +
 			`ON samples(litmus_score ASC, id DESC) ` +
 			`WHERE label = 'bad' AND litmus_class = 0 AND cleave_result IS NOT NULL AND skip = ''`,
+		// The three TriageStale selectors: same populations as TriageBad /
+		// TriageGood / TriageNew, ranked least-recently-analyzed first so triage
+		// reaches verdicts rendered by old trait sets instead of re-working the
+		// newest arrivals forever. Each index's WHERE must stay byte-identical
+		// to its selector's predicate or the planner won't match the partial.
+		//
+		// These are not optional. Without them the planner falls back to
+		// idx_samples_analyzed_at (which carries no label or detection
+		// predicate), scans the whole analyzed-since window, and filters — the
+		// bad queue measured 2m23s for a single LIMIT 64 poll against a live
+		// table, the same failure idx_samples_stale_traits_pri was added to fix.
+		// analyzed_at leads so the ORDER BY is an ordered scan that stops at
+		// LIMIT. No NULLS spelling needed: ASC already defaults to NULLS LAST,
+		// matching the selectors' `analyzed_at ASC NULLS LAST`.
+		`CREATE INDEX IF NOT EXISTS idx_samples_bad_stale ` +
+			`ON samples(analyzed_at, id) ` +
+			`WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = '' ` +
+			`AND (max_crit < 5 OR suspicious_count < 2)`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_good_stale ` +
+			`ON samples(analyzed_at, id) ` +
+			`WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = '' ` +
+			`AND (max_crit >= 5 OR suspicious_count >= 2 OR litmus_class >= 1)`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_new_stale ` +
+			`ON samples(analyzed_at, id) ` +
+			`WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' ` +
+			`AND suspicious_count >= 1`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_top_ready_first_analyzed_coalesce ` +
 			`ON samples((COALESCE(first_analyzed_at, analyzed_at)) DESC, id) ` +
 			`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL`,
@@ -1814,7 +1840,8 @@ func logLabelTransitionsPG(ctx context.Context, tx pgx.Tx) {
 func sampleStagingRows(samples []*Sample) [][]any {
 	rows := make([][]any, len(samples))
 	for i, s := range samples {
-		s.scrubNULs() // PG TEXT can't hold 0x00 (SQLSTATE 22021); see scrubNULs.
+		s.scrubNULs()     // PG TEXT can't hold 0x00 (SQLSTATE 22021); see scrubNULs.
+		normalizeLabel(s) // "" is not a selectable label; see normalizeLabel.
 		firstAnalyzedAt := s.FirstAnalyzedAt
 		if firstAnalyzedAt == nil {
 			firstAnalyzedAt = s.AnalyzedAt
@@ -3200,7 +3227,29 @@ func triageFilterClausePG(f TriageFilter, startIdx int) (clause string, args []a
 		args = append(args, f.FileType)
 		clause += fmt.Sprintf(" AND file_type = $%d", startIdx+len(args)-1)
 	}
+	if !f.MinAnalyzedAt.IsZero() {
+		args = append(args, f.MinAnalyzedAt.UTC())
+		clause += fmt.Sprintf(" AND analyzed_at >= $%d", startIdx+len(args)-1)
+	}
+	if f.ExcludeReportType != "" {
+		args = append(args, f.ExcludeReportType)
+		clause += fmt.Sprintf(
+			` AND NOT EXISTS (SELECT 1 FROM reports r`+
+				` WHERE r.sha256 = samples.sha256 AND r.report_type = $%d`+
+				` AND r.created_at > samples.analyzed_at)`, startIdx+len(args)-1)
+	}
 	return clause, args
+}
+
+// triageOrderSQL renders the ORDER BY for a triage selector. The stale spelling
+// must stay byte-compatible with the idx_samples_*_stale indexes (analyzed_at
+// leading, ASC, NULLS LAST) or the planner sorts the whole partition instead of
+// walking the index — see the migration list for what that costs.
+func triageOrderSQL(f TriageFilter) string {
+	if f.Order == TriageStale {
+		return "ORDER BY analyzed_at ASC NULLS LAST, id ASC"
+	}
+	return "ORDER BY created_at DESC, id DESC"
 }
 
 func (db *DB) triageBadPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
@@ -3210,7 +3259,7 @@ func (db *DB) triageBadPG(ctx context.Context, limit int, f TriageFilter) ([]*Sa
 		`SELECT `+pgSampleCols+` FROM samples
 		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = ''
 		   AND (max_crit < 5 OR suspicious_count < 2)`+extra+`
-		 ORDER BY created_at DESC, id DESC LIMIT $`+strconv.Itoa(len(args)),
+		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage bad: %w", err)
@@ -3225,7 +3274,7 @@ func (db *DB) triageGoodPG(ctx context.Context, limit int, f TriageFilter) ([]*S
 		`SELECT `+pgSampleCols+` FROM samples
 		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = ''
 		   AND (max_crit >= 5 OR suspicious_count >= 2 OR litmus_class >= 1)`+extra+`
-		 ORDER BY created_at DESC, id DESC LIMIT $`+strconv.Itoa(len(args)),
+		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage good: %w", err)
@@ -3240,7 +3289,7 @@ func (db *DB) triageNewPG(ctx context.Context, limit int, f TriageFilter) ([]*Sa
 		`SELECT `+pgSampleCols+` FROM samples
 		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = ''
 		   AND suspicious_count >= 1`+extra+`
-		 ORDER BY created_at DESC, id DESC LIMIT $`+strconv.Itoa(len(args)),
+		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage new: %w", err)
@@ -5478,13 +5527,22 @@ func (db *DB) unanalyzedCandidatesPG(ctx context.Context, hopperStart time.Time,
 // window. Tier 1 (`cleave_result IS NULL`) therefore can't overlap with
 // this tier, and overlap with Tier 2/3 is harmless because Tier 0 drains
 // first and tryClaimBatch dedupes in-memory.
-func (db *DB) forcedRescanCandidatesPG(ctx context.Context, limit int) ([]ClaimJob, error) {
+//
+// It does not filter on `attempts` either, and must not: attempts counts every
+// claim a sample has ever had and is never reset, so a sample rescanned
+// maxClaimAttempts times over its life would become permanently unrescannable.
+// The error-backoff guard below is what keeps a failing sample from looping —
+// a row that errors out is parked until the next hopper restart, and once it
+// has burned maxClaimAttempts claims ReapStuck marks it skip='stuck', which
+// drops it from this tier for good.
+func (db *DB) forcedRescanCandidatesPG(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT sha256, path, size_bytes, file_type FROM samples
 		WHERE rescan_priority = 2
 		  AND skip = '' AND parent = ''
+		  AND (note = '' OR last_error_at IS NULL OR last_error_at < $1)
 		ORDER BY rescan_requested_at ASC
-		LIMIT $1`, limit)
+		LIMIT $2`, hopperStart.UTC(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: forced rescan candidates: %w", err)
 	}

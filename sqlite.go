@@ -1878,6 +1878,9 @@ func (db *DB) storeResultSQLite(
 		parent.FirstAnalyzedAt = &now
 	}
 	members := memberSamplesFromEnvelope(&parent)
+	for _, m := range members {
+		normalizeLabel(m) // "" is not a selectable label; see normalizeLabel.
+	}
 
 	var stats StoreStats
 	stats.Members = len(members)
@@ -2459,6 +2462,16 @@ func triageFilterClauseSQLite(f TriageFilter) (clause string, args []any) {
 		clause += " AND file_type = ?"
 		args = append(args, f.FileType)
 	}
+	if !f.MinAnalyzedAt.IsZero() {
+		clause += " AND analyzed_at >= ?"
+		args = append(args, f.MinAnalyzedAt.UTC().Format(time.RFC3339Nano))
+	}
+	if f.ExcludeReportType != "" {
+		clause += ` AND NOT EXISTS (SELECT 1 FROM reports r` +
+			` WHERE r.sha256 = samples.sha256 AND r.report_type = ?` +
+			` AND r.created_at > samples.analyzed_at)`
+		args = append(args, f.ExcludeReportType)
+	}
 	return clause, args
 }
 
@@ -2470,7 +2483,7 @@ func (db *DB) triageBadSQLite(ctx context.Context, limit int, f TriageFilter) ([
 		`SELECT `+liteSampleCols+` FROM samples
 		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = ''
 		   AND (max_crit < 5 OR suspicious_count < 2)`+extra+`
-		 ORDER BY created_at DESC, id DESC LIMIT ?`,
+		 `+triageOrderSQL(f)+` LIMIT ?`,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage bad: %w", err)
@@ -2488,7 +2501,7 @@ func (db *DB) triageGoodSQLite(ctx context.Context, limit int, f TriageFilter) (
 		`SELECT `+liteSampleCols+` FROM samples
 		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = ''
 		   AND (max_crit >= 5 OR suspicious_count >= 2 OR `+litmusClassSQLite+` >= 1)`+extra+`
-		 ORDER BY created_at DESC, id DESC LIMIT ?`,
+		 `+triageOrderSQL(f)+` LIMIT ?`,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage good: %w", err)
@@ -2579,7 +2592,7 @@ func (db *DB) triageNewSQLite(ctx context.Context, limit int, f TriageFilter) ([
 		`SELECT `+liteSampleCols+` FROM samples
 		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = ''
 		   AND suspicious_count >= 1`+extra+`
-		 ORDER BY created_at DESC, id DESC LIMIT ?`,
+		 `+triageOrderSQL(f)+` LIMIT ?`,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage new: %w", err)
@@ -4214,14 +4227,17 @@ func (db *DB) unanalyzedCandidatesSQLite(ctx context.Context, hopperStart time.T
 }
 
 // forcedRescanCandidatesSQLite mirrors forcedRescanCandidatesPG: Tier 0
-// operator-requested rescans, oldest first.
-func (db *DB) forcedRescanCandidatesSQLite(ctx context.Context, limit int) ([]ClaimJob, error) {
+// operator-requested rescans, oldest first, skipping rows that errored since
+// this hopper started.
+func (db *DB) forcedRescanCandidatesSQLite(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
+	startCutoff := hopperStart.UTC().Format(time.RFC3339Nano)
 	return queryLiteCandidates(ctx, db.lite, `
 		SELECT sha256, path, size_bytes, file_type FROM samples
 		WHERE rescan_priority = 2
 		  AND skip = '' AND parent = ''
+		  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
 		ORDER BY rescan_requested_at ASC
-		LIMIT ?`, limit)
+		LIMIT ?`, startCutoff, limit)
 }
 
 // repairCandidatesSQLite mirrors repairCandidatesPG.

@@ -1240,9 +1240,15 @@ func (e *memberEnvelope) buildRange(start, end int) []*Sample {
 		// its own registry entry, and its own verdict, and inheriting "bad" here
 		// is how a benign library ends up labelled hostile because something
 		// hostile depended on it. A referenced artifact stays unlabelled until it
-		// is judged on its own bytes.
+		// is judged on its own bytes — which means labelUnknown, the no-claims
+		// pool the triage queues select, and NOT "". An empty label is invisible
+		// to every selector (they match 'bad'/'good'/'unknown'/'sighted'
+		// exactly), so writing "" here is what would keep the dependency from
+		// ever being judged at all. It is also unrecoverable: labelRank scores
+		// "" and 'unknown' both 0, and the upsert only promotes on a strictly
+		// greater rank, so a later insert carrying 'unknown' cannot heal it.
 		containment := Rel(entry.Rel).IsContainment()
-		label, labelSource := "", ""
+		label, labelSource := labelUnknown, ""
 		skip := ""
 		if containment {
 			label, labelSource = e.parent.Label, e.parent.LabelSource
@@ -1760,6 +1766,30 @@ func validSample(s *Sample) bool {
 	return s != nil && s.SHA256 != "" && s.Path != ""
 }
 
+// normalizeLabel rewrites an unset label to labelUnknown, the canonical
+// no-claims value. Both mean "nothing has claimed this sample", but only
+// 'unknown' is selectable: every triage query matches the four pool labels
+// exactly, so a row stored as "" is invisible to all of them, to the cascade
+// backfill, and to the sighted-promotion arm of relabelFromPools. Nothing
+// repairs it afterwards either — labelRank scores "" and 'unknown' alike, and
+// the upsert promotes only on a strictly greater rank, so a later write
+// carrying 'unknown' leaves the "" in place.
+//
+// The column is NOT NULL DEFAULT 'unknown', but every insert names the label
+// column explicitly, so the default never fires and a caller that leaves
+// Sample.Label at Go's zero value writes "". This is the guard that makes the
+// zero value mean what it reads as.
+//
+// Applied at the write boundaries rather than inside each backend's SQL, so the
+// rule reads the same on both: InsertSampleNew and InsertSampleBatch cover the
+// public entry points, sampleStagingRows covers the PG batch and member-staging
+// paths that bypass them, and storeResultSQLite covers the SQLite member path.
+func normalizeLabel(s *Sample) {
+	if s != nil && s.Label == "" {
+		s.Label = labelUnknown
+	}
+}
+
 // InsertSampleNew adds a sample and reports whether the row was actually inserted
 // (true) or was a duplicate that was silently skipped (false). Samples with an
 // empty sha256 or path are rejected — callers should have derived both before
@@ -1769,6 +1799,7 @@ func (db *DB) InsertSampleNew(ctx context.Context, s *Sample) (bool, error) {
 		slog.Warn("rejecting invalid sample", "sha256", s.SHA256, "path", s.Path)
 		return false, nil
 	}
+	normalizeLabel(s)
 	if db.pool != nil {
 		return db.insertSampleNewPG(ctx, s)
 	}
@@ -1792,6 +1823,7 @@ func (db *DB) InsertSampleBatch(ctx context.Context, samples []*Sample) (inserte
 			skipped++
 			continue
 		}
+		normalizeLabel(s)
 		valid = append(valid, s)
 	}
 	if skipped > 0 {
@@ -3116,11 +3148,17 @@ func (db *DB) BigArchiveCandidates(ctx context.Context, minBytes int64, hopperSt
 // this before Tier 1 (unanalyzed) so a user-requested rescan jumps the queue
 // regardless of how big the backlog is. Ordered by rescan_requested_at
 // ascending (oldest request first) for FIFO fairness across operators.
-func (db *DB) ForcedRescanCandidates(ctx context.Context, limit int) ([]ClaimJob, error) {
+//
+// Samples that failed analysis since hopperStart are held back, the same way
+// Tier 1 and the big-archive tier hold them back. Without that guard a sample
+// that cannot be analyzed would sit at the head of this FIFO and be re-offered
+// on every poll — and because Tier 0 drains first, it would starve every other
+// forced rescan behind it.
+func (db *DB) ForcedRescanCandidates(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
 	if db.pool != nil {
-		return db.forcedRescanCandidatesPG(ctx, limit)
+		return db.forcedRescanCandidatesPG(ctx, hopperStart, limit)
 	}
-	return db.forcedRescanCandidatesSQLite(ctx, limit)
+	return db.forcedRescanCandidatesSQLite(ctx, hopperStart, limit)
 }
 
 // RepairCandidates returns up to limit jobs flagged for re-analysis via the
@@ -3351,7 +3389,52 @@ func (db *DB) BadReview(ctx context.Context, scoreThreshold, limit int) ([]*Samp
 type TriageFilter struct {
 	Ecosystem string // e.g. "wolfi", "archlinux" — empty means no filter
 	FileType  string // e.g. "apk", "pkg.tar.zst" — empty means no filter
+
+	// Order ranks the queue. See TriageOrder.
+	Order TriageOrder
+
+	// MinAnalyzedAt, when non-zero, drops rows analyzed before it. A row's
+	// queue membership (max_crit, suspicious_count, litmus_class) is whatever
+	// its last scan computed, so an old analysis is a stale claim: current
+	// traits may already catch a sample the queue still lists as a miss.
+	// Bounding the window trades reach for a verdict worth spending a premium
+	// triage on. Zero means no bound — take the stalest rows in the table and
+	// let ExcludeReportType clear out the ones that turn out to be already
+	// fixed.
+	MinAnalyzedAt time.Time
+
+	// ExcludeReportType, when set, drops rows carrying a report of this type
+	// filed after their last analysis. This is what keeps a TriageStale queue
+	// from jamming: unlike the newest-first queues, which are pushed along by
+	// fresh arrivals, a stale queue's head does not move on its own, so a
+	// sample nothing can be done about would sit at the top being re-selected
+	// every cooldown expiry forever. Filing a report parks it. Comparing
+	// against analyzed_at (rather than suppressing outright) is what makes it
+	// self-resetting: a re-scan produces a new verdict and the sample becomes
+	// eligible again, which is exactly the question a staleness queue asks.
+	ExcludeReportType string
 }
+
+// TriageOrder selects how a triage queue ranks its candidates.
+type TriageOrder int
+
+const (
+	// TriageNewest ranks most-recently-added first (created_at DESC, id DESC).
+	// The queues self-drain — a row leaves when the fix lands — and fresh
+	// arrivals continuously refresh the head, so an unfixable sample sinks on
+	// its own. That property is why this ordering needs no drain machinery, and
+	// also why it never reaches the backlog: while arrivals outpace triage the
+	// cursor never descends past the newest few days.
+	TriageNewest TriageOrder = iota
+
+	// TriageStale ranks least-recently-analyzed first (analyzed_at ASC NULLS
+	// LAST) — the rows whose verdict rests on the oldest trait set. Reaches the
+	// backlog the newest-first ordering cannot, and unlike ordering by
+	// created_at it is self-advancing: re-analysis bumps analyzed_at and moves
+	// the row to the back of its own queue. Requires the matching
+	// idx_samples_*_stale partial index; see the migration list.
+	TriageStale
+)
 
 // TriageBad returns analyzed top-level bad-labeled samples that cleave did not
 // confidently flag — lacking either a hostile finding or a second
