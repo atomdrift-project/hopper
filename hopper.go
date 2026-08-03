@@ -3439,8 +3439,12 @@ const (
 // TriageBad returns analyzed top-level bad-labeled samples that cleave did not
 // confidently flag — lacking either a hostile finding or a second
 // suspicious-or-hostile finding (max_crit < 5 OR suspicious_count < 2) — taking
-// up to limit of the most recently added (created_at). No skip/status filters —
-// intended for manual triage.
+// up to limit of the most recently added (created_at).
+//
+// Skipped rows are excluded (skip = ”), matching TriageHighest/TriageLowest.
+// A skip means the sample cannot be worked: 'missing' and 'corrupt' have no
+// bytes to fetch, 'unsupported' is a type cleave cannot parse, so no trait can
+// be written for it. Selecting them spent a batch slot to reach a dead end.
 func (db *DB) TriageBad(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
 		return db.triageBadPG(ctx, limit, f)
@@ -3536,7 +3540,9 @@ func (db *DB) TriageNew(ctx context.Context, limit int, f TriageFilter) ([]*Samp
 // (created_at). Unlike TriageBad/TriageGood there is no detection-gap
 // predicate: every sighted sample is an unconfirmed claim that needs triage
 // and a real label, so all of them qualify until a ruling relabels them out of
-// the pool (bad or good). No skip/status filters — intended for manual triage.
+// the pool (bad or good). Skipped rows are excluded (skip = ”): a sample whose
+// bytes are missing or whose type cleave cannot parse can be neither verified
+// nor relabelled, so selecting it only burns a batch slot.
 func (db *DB) TriageSighted(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
 		return db.triageSightedPG(ctx, limit, f)

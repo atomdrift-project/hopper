@@ -251,6 +251,37 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_bad_clean_score ` +
 			`ON samples(litmus_score ASC, id DESC) ` +
 			`WHERE label = 'bad' AND litmus_class = 0 AND cleave_result IS NOT NULL AND skip = ''`,
+		// The four newest-first selectors (TriageBad/Good/New/Sighted). Without
+		// these the planner walks idx_samples_top_created — which carries only
+		// parent = '' — and applies label plus the detection predicate as a
+		// filter, so cost scales with how RARE the queue's population is, not
+		// how large. Measured against the live table at LIMIT 64: sighted 99.1s
+		// (~1.3k matching rows in a ~10.2M-entry index, so it scans almost all
+		// of it), good 7.97s, bad 7.85s, new 1.00s — every one of them an
+		// Incremental Sort or quicksort rather than an ordered walk. The stale
+		// selectors over the same populations run in 3.7-4.7ms because they
+		// have a matching partial index; these are the missing mirrors.
+		//
+		// created_at is NOT NULL, so unlike idx_samples_good_hostile_score no
+		// NULLS spelling is needed for the DESC key to match the ORDER BY.
+		// Each WHERE must stay byte-identical to its selector's predicate,
+		// skip = '' included, or the planner will not match the partial.
+		`CREATE INDEX IF NOT EXISTS idx_samples_bad_newest ` +
+			`ON samples(created_at DESC, id DESC) ` +
+			`WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = '' ` +
+			`AND skip = '' AND (max_crit < 5 OR suspicious_count < 2)`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_good_newest ` +
+			`ON samples(created_at DESC, id DESC) ` +
+			`WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = '' ` +
+			`AND skip = '' AND (max_crit >= 5 OR suspicious_count >= 2 OR litmus_class >= 1)`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_unknown_newest ` +
+			`ON samples(created_at DESC, id DESC) ` +
+			`WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' ` +
+			`AND skip = '' AND suspicious_count >= 1`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_sighted_newest ` +
+			`ON samples(created_at DESC, id DESC) ` +
+			`WHERE label = 'sighted' AND cleave_result IS NOT NULL AND parent = '' ` +
+			`AND skip = ''`,
 		// The three TriageStale selectors: same populations as TriageBad /
 		// TriageGood / TriageNew, ranked least-recently-analyzed first so triage
 		// reaches verdicts rendered by old trait sets instead of re-working the
@@ -3257,7 +3288,7 @@ func (db *DB) triageBadPG(ctx context.Context, limit int, f TriageFilter) ([]*Sa
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
-		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = ''
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''
 		   AND (max_crit < 5 OR suspicious_count < 2)`+extra+`
 		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
@@ -3272,7 +3303,7 @@ func (db *DB) triageGoodPG(ctx context.Context, limit int, f TriageFilter) ([]*S
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
-		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = ''
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''
 		   AND (max_crit >= 5 OR suspicious_count >= 2 OR litmus_class >= 1)`+extra+`
 		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
@@ -3287,7 +3318,7 @@ func (db *DB) triageNewPG(ctx context.Context, limit int, f TriageFilter) ([]*Sa
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
-		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = ''
+		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''
 		   AND suspicious_count >= 1`+extra+`
 		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
@@ -3302,7 +3333,7 @@ func (db *DB) triageSightedPG(ctx context.Context, limit int, f TriageFilter) ([
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
-		 WHERE label = 'sighted' AND cleave_result IS NOT NULL AND parent = ''`+extra+`
+		 WHERE label = 'sighted' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''`+extra+`
 		 ORDER BY created_at DESC, id DESC LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {

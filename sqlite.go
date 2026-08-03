@@ -2481,7 +2481,7 @@ func (db *DB) triageBadSQLite(ctx context.Context, limit int, f TriageFilter) ([
 	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples
-		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = ''
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''
 		   AND (max_crit < 5 OR suspicious_count < 2)`+extra+`
 		 `+triageOrderSQL(f)+` LIMIT ?`,
 		args...)
@@ -2499,7 +2499,7 @@ func (db *DB) triageGoodSQLite(ctx context.Context, limit int, f TriageFilter) (
 	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples
-		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = ''
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''
 		   AND (max_crit >= 5 OR suspicious_count >= 2 OR `+litmusClassSQLite+` >= 1)`+extra+`
 		 `+triageOrderSQL(f)+` LIMIT ?`,
 		args...)
@@ -2590,7 +2590,7 @@ func (db *DB) triageNewSQLite(ctx context.Context, limit int, f TriageFilter) ([
 	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples
-		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = ''
+		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''
 		   AND suspicious_count >= 1`+extra+`
 		 `+triageOrderSQL(f)+` LIMIT ?`,
 		args...)
@@ -2606,7 +2606,7 @@ func (db *DB) triageSightedSQLite(ctx context.Context, limit int, f TriageFilter
 	//nolint:gosec // G202: label predicate and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples
-		 WHERE label = 'sighted' AND cleave_result IS NOT NULL AND parent = ''`+extra+`
+		 WHERE label = 'sighted' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''`+extra+`
 		 ORDER BY created_at DESC, id DESC LIMIT ?`,
 		args...)
 	if err != nil {

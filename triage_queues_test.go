@@ -217,8 +217,8 @@ func TestTriageStaleOrdering(t *testing.T) {
 	// created order is deliberately the reverse of analyzed order, so a test
 	// that accidentally kept created_at ordering cannot pass.
 	type row struct {
-		sha                string
-		created, analyzed  time.Time
+		sha               string
+		created, analyzed time.Time
 	}
 	rows := []row{
 		{sha: staleTestSHA(1), created: now.Add(-3 * time.Hour), analyzed: now.Add(-90 * 24 * time.Hour)},
@@ -299,4 +299,65 @@ func slicesEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestTriageSelectorsExcludeSkipped pins the skip filter on the four
+// label-partitioned selectors. A skipped sample cannot be worked -- 'missing'
+// and 'corrupt' have no bytes, 'unsupported' is a type cleave cannot parse --
+// so selecting one spends a batch slot to reach a dead end. Both orderings are
+// covered, since they share the predicate.
+//
+// second and acquit are deliberately NOT included: acquit carries its own
+// skip != 'conflict' rule, and neither was measured in the audit that motivated
+// this filter.
+func TestTriageSelectorsExcludeSkipped(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	mk := func(n int, label, skip string, crit, susp int) string {
+		t.Helper()
+		sha := staleTestSHA(n)
+		mustInsert(t, ctx, db, &Sample{
+			SHA256: sha, Source: "test", Label: label, LabelSource: "test",
+			Path: label + "/" + sha, FileType: "elf",
+			CleaveResult: []byte(`{"files":[]}`),
+			MaxCrit:      crit, SuspiciousCount: susp,
+		})
+		if skip != "" {
+			if err := db.SetSkip(ctx, sha, skip); err != nil {
+				t.Fatalf("SetSkip(%s): %v", sha, err)
+			}
+		}
+		return sha
+	}
+
+	// One workable and one skipped row in each of the three detection-gap pools.
+	badOK, badSkip := mk(1, "bad", "", 0, 0), mk(2, "bad", "missing", 0, 0)
+	goodOK, goodSkip := mk(3, "good", "", 5, 2), mk(4, "good", "unsupported", 5, 2)
+	newOK, newSkip := mk(5, "unknown", "", 0, 1), mk(6, "unknown", "corrupt", 0, 1)
+
+	for _, tc := range []struct {
+		name       string
+		sel        func(TriageFilter) ([]*Sample, error)
+		want, deny string
+	}{
+		{"bad", func(f TriageFilter) ([]*Sample, error) { return db.TriageBad(ctx, 10, f) }, badOK, badSkip},
+		{"good", func(f TriageFilter) ([]*Sample, error) { return db.TriageGood(ctx, 10, f) }, goodOK, goodSkip},
+		{"new", func(f TriageFilter) ([]*Sample, error) { return db.TriageNew(ctx, 10, f) }, newOK, newSkip},
+	} {
+		for _, order := range []TriageOrder{TriageNewest, TriageStale} {
+			got, err := tc.sel(TriageFilter{Order: order})
+			if err != nil {
+				t.Fatalf("%s (order %v): %v", tc.name, order, err)
+			}
+			set := shaSet(got)
+			if !set[tc.want] {
+				t.Errorf("%s (order %v): workable sample missing from queue", tc.name, order)
+			}
+			if set[tc.deny] {
+				t.Errorf("%s (order %v): skipped sample was selected; skip filter not applied",
+					tc.name, order)
+			}
+		}
+	}
 }
