@@ -6302,3 +6302,40 @@ func TestNormalizeLabelCoercesZeroValue(t *testing.T) {
 	}
 	normalizeLabel(nil) // must not panic
 }
+
+// TestMaxMemberLitmusClass covers the question TriageHighest's population asks:
+// the selector keys on a hot MEMBER's class but returns the root archive, so a
+// consumer holding a fresh scan of the archive needs the max over members, not
+// the envelope's own class.
+func TestMaxMemberLitmusClass(t *testing.T) {
+	// Envelope-level lvl is benign; one member scores hostile.
+	mixed := []byte(`{"v":"7","lvl":50000,"files":[
+		{"id":0,"prob":0.01,"class":0},
+		{"id":1,"prob":0.99,"class":2},
+		{"id":2,"prob":0.30,"class":1}]}`)
+	if got := MaxMemberLitmusClass(mixed); got != 2 {
+		t.Errorf("mixed envelope = %d, want 2 (the hottest member)", got)
+	}
+	// The envelope's own class would have said otherwise — that is the bug this
+	// helper exists to avoid.
+	if env := LitmusClass(mixed); env >= 2 {
+		t.Fatalf("fixture is not discriminating: envelope class = %d", env)
+	}
+
+	// All members cold: the archive has left the queue.
+	cold := []byte(`{"v":"7","lvl":50000,"files":[
+		{"id":0,"prob":0.01,"class":0},
+		{"id":1,"prob":0.02,"class":0}]}`)
+	if got := MaxMemberLitmusClass(cold); got != 0 {
+		t.Errorf("cold envelope = %d, want 0", got)
+	}
+
+	// No member array: fall back to the envelope's own class.
+	plain := []byte(`{"class":2}`)
+	if got := MaxMemberLitmusClass(plain); got != 2 {
+		t.Errorf("member-less envelope = %d, want the envelope class 2", got)
+	}
+	if got := MaxMemberLitmusClass(nil); got != 0 {
+		t.Errorf("nil envelope = %d, want 0", got)
+	}
+}

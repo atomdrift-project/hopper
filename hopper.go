@@ -1460,6 +1460,48 @@ func (idx *litmusMemberIndex) forMember(id int) []byte {
 	return b
 }
 
+// MaxMemberLitmusClass returns the highest [LitmusClass] across an envelope's
+// per-member entries, falling back to the envelope's own class when it carries
+// no member array.
+//
+// This is the question TriageHighest's population actually asks. That selector
+// keys on a hot MEMBER's litmus_class but returns the member's ROOT ARCHIVE, so
+// a consumer holding a fresh scan of the archive cannot answer "does this still
+// belong in the queue" from the envelope-level class alone -- the archive
+// aggregate is not the member's class. Taking the max over members restores the
+// predicate: the archive qualifies while any member still scores hostile.
+//
+// Each member is resolved through the same merge forMember performs, so a member
+// carrying no class of its own inherits the envelope's level exactly as it would
+// when stored -- keeping this in lockstep with what the DB column would hold.
+func MaxMemberLitmusClass(envelope []byte) int {
+	idx := newLitmusMemberIndex(envelope)
+	if idx == nil {
+		return LitmusClass(envelope)
+	}
+	seen := false
+	best := 0
+	consider := func(slice []byte) {
+		if len(slice) == 0 {
+			return
+		}
+		seen = true
+		if c := LitmusClass(slice); c > best {
+			best = c
+		}
+	}
+	for i := range idx.byIndex {
+		consider(idx.forMember(i))
+	}
+	for id := range idx.byID {
+		consider(idx.forMember(id))
+	}
+	if !seen {
+		return LitmusClass(envelope)
+	}
+	return best
+}
+
 // litmusResultForMember extracts a single member's litmus slice. It is a
 // single-shot wrapper over litmusMemberIndex; callers exploding many members
 // should build the index once (memberEnvelope does) to amortize the parse.
