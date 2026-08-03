@@ -4,18 +4,26 @@ DATA_DIR  ?= /data/samples
 DB        ?= postgres://hopper@hopper-db/hopper?sslmode=disable
 SOURCE    ?= harvest
 DASH_ADDR ?= 0.0.0.0:8081
-# Local atomscan worker slots. Left at 0 so the deploy carries no competing
-# default and defers to hopper's own built-in cap (40 workers / 48 GB RAM, set
-# once in cmd/hopper/main.go) — the single source of truth. Override per-host
-# with WORKERS=N (and MAX_MEMORY_GB=N, passed through to the systemd script) —
-# e.g. the 128-core box used WORKERS=56 to trade RAM headroom for throughput.
-WORKERS   ?= 0
-# Local atomscan worker RSS cap in GB, forwarded as --max-rss-gb. Same rule as
-# WORKERS: 0 defers to hopper's built-in default. Set it per-host on the deploy
-# invocation, and keep it under (hopper.service MemoryMax / rssKillFactor) —
+# Local atomscan worker slots and RSS cap in GB, forwarded to the systemd
+# script as --workers and --max-memory-gb. 0 for either emits no flag and
+# defers to hopper's built-in default (40 workers / 48 GB, set once in
+# cmd/hopper/main.go).
+#
+# These carry real values rather than 0 because a setting that lives only in
+# the generated unit file is silently lost on the next bare `make deploy` —
+# which is how the swap cap regressed once already, and how --workers 60 came
+# within one deploy of dropping to 40 on 2026-08-01. Only `make deploy`
+# (scripts/master/linux-systemd.sh) reads these; the Bastille rollouts ignore
+# them. Override per-host on the invocation.
+#
+# Sized for nazgul: 128 cores, 125 GB RAM, hopper.service MemoryMax=96G.
+# MAX_MEMORY_GB must stay under (hopper.service MemoryMax / rssKillFactor):
 # 1.25x this value is where the liveness watchdog kills, and it has to land
-# below the cgroup limit or the kernel OOM killer wins the race instead.
-MAX_MEMORY_GB ?= 0
+# below the cgroup limit or the kernel OOM killer wins the race instead —
+# 72 x 1.25 = 90G, under the 96G cap. Raising it means raising that cap and
+# cutting ARC c_max to stay inside physical RAM.
+WORKERS       ?= 60
+MAX_MEMORY_GB ?= 72
 
 help:
 	@echo "Available targets:"
