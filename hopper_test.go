@@ -6267,9 +6267,9 @@ func TestReferenceEdgeMembersLabelledUnknown(t *testing.T) {
 			parent := &Sample{
 				SHA256: mk(99), Source: "s", Feed: "fd", Ecosystem: "e",
 				Label: "bad", LabelSource: "ls", Path: "bad/pkg.tar",
-				CleaveResult: []byte(fmt.Sprintf(
+				CleaveResult: fmt.Appendf(nil,
 					`{"files":[{"sha":%q,"type":"elf","path":"pkg/f.so","depth":1,"size":100,`+
-						`"rel":%q,"traits":[{"crit":5,"conf":0.9}]}]}`, mk(0), string(tc.rel))),
+						`"rel":%q,"traits":[{"crit":5,"conf":0.9}]}]}`, mk(0), string(tc.rel)),
 			}
 			members := memberSamplesFromEnvelope(parent)
 			if len(members) != 1 {

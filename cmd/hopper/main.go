@@ -914,7 +914,9 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	f := flag.NewFlagSet("load", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
 	dataDir := f.String("data", "", "data directory containing bad/, good/, unknown/ subdirectories")
-	source := f.String("source", hopper.SourceFilesystem, "source tag for top-level rows this walk inserts that no collector already recorded (default \"fs\"; forager direct-inserts its own rows as \"forager\")")
+	source := f.String("source", hopper.SourceFilesystem,
+		"source tag for top-level rows this walk inserts that no collector already recorded "+
+			"(default \"fs\"; forager direct-inserts its own rows as \"forager\")")
 	// Deprecated: serving no longer prunes. Pruning location rows for gone files
 	// moved to the `hopper prune` subcommand so the ingest loop is never
 	// destructive and a partial mirror can't mark present-in-corpus files missing.
@@ -940,7 +942,12 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
 	experimentTag := f.String("experiment-tag", "", "label for experiment comparison")
-	litmusVerbose := f.Bool("litmus-verbose", true, "enable debug logging in litmus server")
+	// Off by default: --verbose makes the worker log a DEBUG line per analyzed
+	// file, which runs 0.5-1.3 GB per spawn. That buries the crash tail hopper
+	// attaches to its own logs (large enough that Grafana Cloud rejected the
+	// push outright: "structured metadata too large") and filled the state dir
+	// with 14 GB on 2026-08-10. Turn it on deliberately when debugging a worker.
+	litmusVerbose := f.Bool("litmus-verbose", false, "enable debug logging in litmus server")
 	dashAddr := f.String("dashboard-addr", "0.0.0.0:8081", "web dashboard listen address (empty to disable)")
 	pprofAddr := f.String("pprof-addr", "127.0.0.1:6060", "net/http/pprof listen address; loopback-only by default (empty to disable)")
 	localOnly := f.Bool("local", false, "listen only on loopback for dashboard and worker API")
@@ -1553,9 +1560,11 @@ func (p *loadProgress) recentErrors() []progressError {
 }
 
 const (
-	loadBatchSize      = 2000
-	minFileSize        = 13                      // skip trivially small files (markers, empty, etc.)
-	defaultMaxFileSize = 20 * 1024 * 1024 * 1024 // 20 GiB — admit full OS images (ISO/UDF, DMG) from the os-image feed; cleave streams-to-temp and workers are memory-scheduled
+	loadBatchSize = 2000
+	minFileSize   = 13 // skip trivially small files (markers, empty, etc.)
+	// 20 GiB — admit full OS images (ISO/UDF, DMG) from the os-image feed;
+	// cleave streams-to-temp and workers are memory-scheduled.
+	defaultMaxFileSize = 20 * 1024 * 1024 * 1024
 )
 
 const (

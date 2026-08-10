@@ -173,3 +173,49 @@ func TestRefreshToolRulesCancelledContext(t *testing.T) {
 		t.Fatal("refreshToolRules ignored a cancelled context during its error pause")
 	}
 }
+
+// A crash-looping worker opens a fresh litmus-*.log every spawn and nothing
+// else reclaims them, so the sweep is the only bound on the state directory.
+// It must drop aged-out logs, spare recent ones (an active worker's log is
+// always recent), and leave unrelated files alone.
+func TestSweepStaleLitmusLogs(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	past := time.Now().Add(-2 * litmusLogMaxAge)
+
+	write := func(name string, aged bool) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if aged {
+			if err := os.Chtimes(path, past, past); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return path
+	}
+
+	stale := write("litmus-123.log", true)
+	fresh := write("litmus-456.log", false)
+	foreign := write("scan-789.log", true)
+	wrongSuffix := write("litmus-789.txt", true)
+
+	sweepStaleLitmusLogs(dir)
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale litmus log was not removed: err=%v", err)
+	}
+	for _, keep := range []string{fresh, foreign, wrongSuffix} {
+		if _, err := os.Stat(keep); err != nil {
+			t.Errorf("%s was removed: err=%v", filepath.Base(keep), err)
+		}
+	}
+}
+
+// The spawn path creates the log directory first, so an unreadable one is
+// abnormal — but it is still only worth a warning, never a failed spawn.
+func TestSweepStaleLitmusLogsMissingDir(t *testing.T) {
+	t.Parallel()
+	sweepStaleLitmusLogs(filepath.Join(t.TempDir(), "absent"))
+}

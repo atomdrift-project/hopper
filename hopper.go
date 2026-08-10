@@ -3443,11 +3443,8 @@ func (db *DB) BadReview(ctx context.Context, scoreThreshold, limit int) ([]*Samp
 
 // TriageFilter optionally narrows triage queries to a specific ecosystem and/or file type.
 type TriageFilter struct {
-	Ecosystem string // e.g. "wolfi", "archlinux" — empty means no filter
-	FileType  string // e.g. "apk", "pkg.tar.zst" — empty means no filter
-
-	// Order ranks the queue. See TriageOrder.
-	Order TriageOrder
+	// Field order is chosen for alignment (time.Time, then strings, then the
+	// int) rather than for reading order; govet's fieldalignment enforces it.
 
 	// MinAnalyzedAt, when non-zero, drops rows analyzed before it. A row's
 	// queue membership (max_crit, suspicious_count, litmus_class) is whatever
@@ -3459,6 +3456,9 @@ type TriageFilter struct {
 	// fixed.
 	MinAnalyzedAt time.Time
 
+	Ecosystem string // e.g. "wolfi", "archlinux" — empty means no filter
+	FileType  string // e.g. "apk", "pkg.tar.zst" — empty means no filter
+
 	// ExcludeReportType, when set, drops rows carrying a report of this type
 	// filed after their last analysis. This is what keeps a TriageStale queue
 	// from jamming: unlike the newest-first queues, which are pushed along by
@@ -3469,6 +3469,9 @@ type TriageFilter struct {
 	// self-resetting: a re-scan produces a new verdict and the sample becomes
 	// eligible again, which is exactly the question a staleness queue asks.
 	ExcludeReportType string
+
+	// Order ranks the queue. See TriageOrder.
+	Order TriageOrder
 }
 
 // TriageOrder selects how a triage queue ranks its candidates.
@@ -3634,6 +3637,7 @@ func (db *DB) StrandedMembers(ctx context.Context, root string) ([]*Sample, erro
 		}
 		return scanPGSamples(rows)
 	}
+	//nolint:gosec // G202: the concatenated parts are the constant column list and a constant int; root is bound as a ? parameter.
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples
 		 WHERE label = 'good' AND cleave_result IS NOT NULL AND skip = ''

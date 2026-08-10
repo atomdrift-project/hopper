@@ -888,24 +888,24 @@ func workerCanAnalyzeFileType(fileType string, tools *workerToolSet) bool {
 	return workerCanAnalyzeFile(fileType, "", tools)
 }
 
-func workerCanAnalyzeFile(fileType, path string, tools *workerToolSet) bool {
+func workerCanAnalyzeFile(fileType, filePath string, tools *workerToolSet) bool {
 	if tools == nil {
 		return true
 	}
 	ft := normalizeFileType(fileType)
-	if ft == "" && path == "" {
+	if ft == "" && filePath == "" {
 		return true
 	}
-	if requiresTool(ft, path, "rizin") && !(*tools)["rizin"] {
+	if requiresTool(ft, filePath, "rizin") && !(*tools)["rizin"] {
 		return false
 	}
-	if requiresTool(ft, path, "upx") && !(*tools)["upx"] {
+	if requiresTool(ft, filePath, "upx") && !(*tools)["upx"] {
 		return false
 	}
-	if requiresTool(ft, path, "innoextract") && !(*tools)["innoextract"] {
+	if requiresTool(ft, filePath, "innoextract") && !(*tools)["innoextract"] {
 		return false
 	}
-	if requiresTool(ft, path, "7z") && !(*tools)["7z"] {
+	if requiresTool(ft, filePath, "7z") && !(*tools)["7z"] {
 		return false
 	}
 	return true
@@ -918,14 +918,14 @@ func normalizeFileType(fileType string) string {
 	return ft
 }
 
-func requiresTool(fileType, path, tool string) bool {
+func requiresTool(fileType, filePath, tool string) bool {
 	switch tool {
 	case "rizin":
 		return isNativeBinaryFileType(fileType)
 	case "upx":
 		return fileType == "elf" || fileType == "pe"
 	case "innoextract":
-		return fileType == "msi" || hasFileExtension(path, ".msi", ".msp") || fileType == "pe"
+		return fileType == "msi" || hasFileExtension(filePath, ".msi", ".msp") || fileType == "pe"
 	case "7z":
 		return fileType == "pe"
 	default:
@@ -942,11 +942,11 @@ func isNativeBinaryFileType(fileType string) bool {
 	}
 }
 
-func hasFileExtension(path string, exts ...string) bool {
-	if path == "" {
+func hasFileExtension(filePath string, exts ...string) bool {
+	if filePath == "" {
 		return false
 	}
-	ext := strings.ToLower(filepath.Ext(path))
+	ext := strings.ToLower(filepath.Ext(filePath))
 	return slices.Contains(exts, ext)
 }
 
@@ -1670,11 +1670,11 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		slog.Info("stored archive members atomically",
 			"sha256", req.SHA256, "members", stats.Members, "stored", stats.MembersStored)
 	}
-	path := s.tracker.release(req.SHA256)
+	claimedPath := s.tracker.release(req.SHA256)
 	s.tracker.recordResult(req.Worker, false)
 
 	//nolint:gosec // worker sanitized by validWorkerName, sha256 by validSHA256, path from in-memory claim
-	slog.Info("result stored", "worker", req.Worker, "sha256", req.SHA256, "path", path,
+	slog.Info("result stored", "worker", req.Worker, "sha256", req.SHA256, "path", claimedPath,
 		"duration_ms", req.DurationMs, "active_claims", s.tracker.activeClaims(req.Worker))
 
 	w.Header().Set("Content-Type", "application/json")
@@ -2943,8 +2943,8 @@ func (s *apiServer) sweepUploadTmp() {
 		if info.ModTime().After(cutoff) {
 			continue
 		}
-		path := filepath.Join(tmpDir, e.Name())
-		if err := os.Remove(path); err == nil {
+		full := filepath.Join(tmpDir, e.Name())
+		if err := os.Remove(full); err == nil {
 			removed++
 		}
 	}
@@ -3521,8 +3521,8 @@ func writeExtractError(ctx context.Context, w http.ResponseWriter, err error, in
 // that differs from the resolved dataRoot. EvalSymlinks resolves the entire
 // chain including intermediate symlinks.
 func stripDataRoot(dbPath, prefix string) string {
-	strip := func(path, root string) (string, bool) {
-		rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	strip := func(abs, root string) (string, bool) {
+		rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(abs))
 		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			return rel, true
 		}

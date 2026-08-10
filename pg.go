@@ -2303,6 +2303,7 @@ func (db *DB) parentArchivesForChildPG(ctx context.Context, childSHA string, lim
 	// first (served by idx_sl_sha256_parents), THEN join samples for only those N.
 	// The heavy TOASTed litmus_result is detoasted N times, not once per parent —
 	// which for a file shared across thousands of archives is the whole cost.
+	//nolint:unqueryvet // the wildcard is over top_parents, a CTE this query defines with four named columns; re-listing them adds nothing.
 	rows, err := db.pool.Query(ctx, `
 		WITH top_parents AS (
 			SELECT DISTINCT ON (parent_sha256)
@@ -2322,7 +2323,10 @@ func (db *DB) parentArchivesForChildPG(ctx context.Context, childSHA string, lim
 	var out []ParentRef
 	for rows.Next() {
 		var p ParentRef
-		if err := rows.Scan(&p.SHA256, &p.Filename, &p.SamplePath, &p.Path, &p.Rel, &p.Feed, &p.Ecosystem, &p.Version, &p.Package, &p.LitmusResult, &p.AnalyzedAt); err != nil {
+		if err := rows.Scan(
+			&p.SHA256, &p.Filename, &p.SamplePath, &p.Path, &p.Rel, &p.Feed,
+			&p.Ecosystem, &p.Version, &p.Package, &p.LitmusResult, &p.AnalyzedAt,
+		); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -2520,6 +2524,7 @@ func (db *DB) upsertLocationBatchPG(ctx context.Context, locs []*SampleLocation)
 		sha[i], path[i], parent[i], rel[i] = l.SHA256, l.Path, l.ParentSHA256, l.Rel
 		filename[i], source[i], feed[i], eco[i] = l.Filename, l.Source, l.Feed, l.Ecosystem
 	}
+	//nolint:unqueryvet // the wildcard is over unnest() of eight explicitly typed arrays, whose columns are positional by construction.
 	_, err := db.pool.Exec(ctx, `
 		INSERT INTO sample_locations
 			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem)
@@ -3489,6 +3494,7 @@ func (db *DB) triageLowestPG(ctx context.Context, limit int, createdBefore, miss
 	extra, fargs := triageFilterClausePG(f, 3)
 	args := append([]any{createdBefore, missingBefore}, fargs...)
 	args = append(args, limit)
+	//nolint:unqueryvet // k.*/s0.* feed the LATERAL join and window function; the outer select names its columns via pgSampleCols.
 	rows, err := db.pool.Query(ctx,
 		`WITH RECURSIVE fts AS (
 		   (SELECT file_type FROM samples

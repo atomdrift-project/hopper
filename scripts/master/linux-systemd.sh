@@ -412,6 +412,20 @@ Environment=PATH=${TOOLS_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
 # Environment=HOPPER_UPLOAD_TOKEN=<token>.
 Environment=HOPPER_UPLOAD_OPEN=1
 
+# jemalloc (the allocator in the litmus/cleave children, inherited from here)
+# defaults to retain:true on Linux: freed extents keep their address space and
+# are decommitted with mprotect(PROT_NONE) instead of being unmapped. Every
+# decommit splits a VMA, and cleave's archive-member workload frees
+# variable-sized buffers continuously, so the worker's mapping count climbs
+# ~1400/s with flat RSS until it hits vm.max_map_count — where mmap returns
+# ENOMEM, Rust's allocator gets null, and the worker aborts
+# ("memory allocation of N bytes failed", which reads like OOM but is not:
+# 2026-08-10, RSS 19-36 GB against a 108 GB cgroup limit, oom_kill 0).
+# retain:false makes jemalloc munmap instead, so adjacent free ranges coalesce
+# and the VMA count stays bounded. NB: Go ignores MALLOC_CONF, so this is inert
+# for hopper itself and only affects the children that actually use jemalloc.
+Environment=MALLOC_CONF=retain:false
+
 # Bound the Go heap so the runtime applies GC backpressure *before* the cgroup
 # MemoryHigh below forces pages into swap. The hopper process RSS is almost
 # entirely Go heap; without this the runtime grows to ~2x the live working set

@@ -335,14 +335,12 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 
 	// Partial indexes matching PG for review and dashboard queries.
 	for _, ddl := range []string{
-		// falsePositives / truePositives / falseNegatives
-		// benignReview / badReview
+		// serves falsePositives, truePositives, falseNegatives, benignReview, badReview
 		`CREATE INDEX IF NOT EXISTS idx_samples_misclassified_review ` +
 			`ON samples(label, max_crit, suspicious_count) ` +
 			`WHERE label_source = 'marker' AND skip = 'misclassified' ` +
 			`AND cleave_result IS NOT NULL AND status = ''`,
-		// conflictReview
-		// CountAnalyzed
+		// serves conflictReview and CountAnalyzed
 		`CREATE INDEX IF NOT EXISTS idx_samples_litmus_done ` +
 			`ON samples(id) WHERE litmus_result IS NOT NULL`,
 		// CountPending / claimable ordering
@@ -1385,7 +1383,10 @@ func (db *DB) parentArchivesForChildSQLite(ctx context.Context, childSHA string,
 		var litmus sql.NullString
 		var analyzedAt sql.NullTime
 		var lsa sql.NullString // ordering key only; never returned
-		if err := rows.Scan(&p.SHA256, &p.Filename, &p.SamplePath, &p.Path, &p.Rel, &p.Feed, &p.Ecosystem, &p.Version, &p.Package, &litmus, &analyzedAt, &lsa); err != nil {
+		if err := rows.Scan(
+			&p.SHA256, &p.Filename, &p.SamplePath, &p.Path, &p.Rel, &p.Feed,
+			&p.Ecosystem, &p.Version, &p.Package, &litmus, &analyzedAt, &lsa,
+		); err != nil {
 			return nil, err
 		}
 		if litmus.Valid {
@@ -2561,7 +2562,10 @@ func (db *DB) triageLowestSQLite(ctx context.Context, limit int, createdBefore, 
 		missingBefore.UTC().Format(time.RFC3339Nano),
 	}, fargs...)
 	args = append(args, limit)
-	//nolint:gosec // G202: label predicates and column list are constant; filter values are parameterized via ? args
+	// The inner samples.* feeds the window function; the outer select names its
+	// columns via liteSampleCols. Label predicates and the column list are
+	// constant; filter values are bound as ? args.
+	//nolint:gosec,unqueryvet // G202 and the wildcard are both accounted for above.
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM (
 		   SELECT samples.*,

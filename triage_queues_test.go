@@ -100,7 +100,10 @@ func TestTriageHighestCollapsesToParent(t *testing.T) {
 	if err := db.InsertReport(ctx, &Report{SHA256: pGood, Type: "highest", Content: "done"}); err != nil {
 		t.Fatalf("InsertReport highest: %v", err)
 	}
-	got2, _ := db.TriageHighest(ctx, 20, before, missing, TriageFilter{})
+	got2, err := db.TriageHighest(ctx, 20, before, missing, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageHighest: %v", err)
+	}
 	if shaSet(got2)[pGood] {
 		t.Errorf("drained root pGood still returned")
 	}
@@ -109,12 +112,18 @@ func TestTriageHighestCollapsesToParent(t *testing.T) {
 	if err := db.InsertReport(ctx, &Report{SHA256: pUnk, Type: ReportTypeMissing, Content: "gone"}); err != nil {
 		t.Fatalf("InsertReport missing: %v", err)
 	}
-	got3, _ := db.TriageHighest(ctx, 20, before, missing, TriageFilter{})
+	got3, err := db.TriageHighest(ctx, 20, before, missing, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageHighest: %v", err)
+	}
 	if shaSet(got3)[pUnk] {
 		t.Errorf("root pUnk with fresh missing marker still returned")
 	}
 	// missingBefore in the future => even a just-written marker counts as expired.
-	got4, _ := db.TriageHighest(ctx, 20, before, time.Now().Add(time.Hour), TriageFilter{})
+	got4, err := db.TriageHighest(ctx, 20, before, time.Now().Add(time.Hour), TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageHighest: %v", err)
+	}
 	if !shaSet(got4)[pUnk] {
 		t.Errorf("root pUnk with expired missing marker not returned")
 	}
@@ -177,7 +186,10 @@ func TestTriageLowestPerMember(t *testing.T) {
 	if err := db.InsertReport(ctx, &Report{SHA256: lm1, Type: "lowest", Content: "done"}); err != nil {
 		t.Fatalf("InsertReport lowest: %v", err)
 	}
-	got2, _ := db.TriageLowest(ctx, 20, before, missing, TriageFilter{})
+	got2, err := db.TriageLowest(ctx, 20, before, missing, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageLowest: %v", err)
+	}
 	set2 := shaSet(got2)
 	if set2[lm1] {
 		t.Errorf("drained member lm1 still returned")
@@ -383,7 +395,7 @@ func TestTriageHighestPerRouteReach(t *testing.T) {
 
 	// A "jar" tie band: more than triagePerRouteK good top-level files all at
 	// score 1.0 — the shape that monopolized the old global score window.
-	for i := 0; i < triagePerRouteK+5; i++ {
+	for i := range triagePerRouteK + 5 {
 		s := sha(100 + i)
 		mustInsert(t, ctx, db, &Sample{SHA256: s, Label: "good", Path: fmt.Sprintf("good/j%d.jar", i)})
 		analyzeAs(s, "jar", 5)
@@ -491,7 +503,10 @@ func TestTriageStrandedPerMemberDrain(t *testing.T) {
 	if err := db.InsertReport(ctx, &Report{SHA256: m1, Type: "stranded", Content: "benign"}); err != nil {
 		t.Fatalf("InsertReport: %v", err)
 	}
-	got2, _ := db.TriageStranded(ctx, 10, before, missing, TriageFilter{})
+	got2, err := db.TriageStranded(ctx, 10, before, missing, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageStranded: %v", err)
+	}
 	if len(got2) != 1 || got2[0].SHA256 != pBad {
 		t.Fatalf("archive with an unexamined member must resurface, got %v", keysOf(shaSet(got2)))
 	}
@@ -499,7 +514,10 @@ func TestTriageStrandedPerMemberDrain(t *testing.T) {
 	if err := db.InsertReport(ctx, &Report{SHA256: m2, Type: "stranded", Content: "malicious"}); err != nil {
 		t.Fatalf("InsertReport: %v", err)
 	}
-	got3, _ := db.TriageStranded(ctx, 10, before, missing, TriageFilter{})
+	got3, err := db.TriageStranded(ctx, 10, before, missing, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageStranded: %v", err)
+	}
 	if len(got3) != 0 {
 		t.Fatalf("fully-examined archive must drain, got %v", keysOf(shaSet(got3)))
 	}

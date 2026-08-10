@@ -57,6 +57,17 @@ const (
 	// worker must be over budget before it is killed, so a transient spike
 	// from one huge archive isn't a death sentence.
 	rssKillStrikes = 2
+	// litmusLogMaxAge bounds how long a departed worker's stdout/stderr log is
+	// kept. Every spawn opens a fresh litmus-*.log and a --verbose worker emits
+	// 0.5-1.3 GB apiece, so nothing reclaimed them: on 2026-08-10 a worker
+	// crash-looping since 08-04 had left 3,579 files totalling 14 GB. Two days
+	// keeps the previous night's crash available to debug while bounding the
+	// directory to what a sustained restart loop can produce in that window.
+	litmusLogMaxAge = 48 * time.Hour
+	// litmusLogSweepInterval is how often the liveness watchdog ages out logs.
+	// Spawns sweep too, but a worker healthy for days would never trigger one,
+	// so retention cannot rest on restarts alone.
+	litmusLogSweepInterval = 1 * time.Hour
 )
 
 type litmusServer struct {
@@ -319,6 +330,42 @@ func sweepStaleLitmusTmpDirs(current string) {
 	}
 }
 
+// sweepStaleLitmusLogs removes litmus-*.log files last written more than
+// litmusLogMaxAge ago. Called on every spawn, just before the new log is
+// created: the outgoing worker's log was written moments ago, so an active log
+// is never a candidate no matter how long that worker ran. Best-effort
+// throughout — a log that cannot be reaped must never block a worker start.
+func sweepStaleLitmusLogs(logDir string) {
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		slog.Warn("read litmus log dir for sweep failed", "dir", logDir, "error", err)
+		return
+	}
+	cutoff := time.Now().Add(-litmusLogMaxAge)
+	removed, freed := 0, int64(0)
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "litmus-") || !strings.HasSuffix(name, ".log") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() || info.ModTime().After(cutoff) {
+			continue
+		}
+		full := filepath.Join(logDir, name)
+		if err := os.Remove(full); err != nil {
+			slog.Warn("remove stale litmus log failed", "path", full, "error", err)
+			continue
+		}
+		removed++
+		freed += info.Size()
+	}
+	if removed > 0 {
+		slog.Info("swept stale litmus logs",
+			"dir", logDir, "removed", removed, "freed_mb", freed/(1<<20), "max_age", litmusLogMaxAge)
+	}
+}
+
 func sweepLitmusTmpChildren(root string, maxAge time.Duration) {
 	cleanRoot := filepath.Clean(root)
 	if _, err := os.Stat(filepath.Join(cleanRoot, litmusTmpSentinel)); err != nil {
@@ -433,6 +480,7 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 	if err := os.MkdirAll(logDir, 0o750); err != nil {
 		return fmt.Errorf("create litmus log directory: %w", err)
 	}
+	sweepStaleLitmusLogs(logDir)
 
 	logFile, err := os.CreateTemp(logDir, "litmus-*.log")
 	if err != nil {
@@ -640,6 +688,7 @@ func (s *litmusServer) livenessWatchdog(ctx context.Context) {
 	// Memory-breach strike counter, keyed to the pid it was observed on so a
 	// restart never inherits the previous process's strikes.
 	var breachPID, breaches int
+	var lastLogSweep time.Time
 	for {
 		select {
 		case <-ticker.C:
@@ -648,6 +697,10 @@ func (s *litmusServer) livenessWatchdog(ctx context.Context) {
 		}
 		if s.stopped.Load() || s.building.Load() {
 			continue
+		}
+		if time.Since(lastLogSweep) >= litmusLogSweepInterval {
+			lastLogSweep = time.Now()
+			sweepStaleLitmusLogs(xdgLogDir())
 		}
 		pid := s.currentPID()
 		if pid == 0 {
