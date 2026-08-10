@@ -144,9 +144,11 @@ func TestIsStagingPath(t *testing.T) {
 		{"bad/foraged/javascript/pkg/.tmp/pkg-unpkg.tgz", true},
 		{"good/.tmp/x.tgz", true},
 		{".tmp/x.tgz", true},
+		{"good/.partial-1104359443", true}, // legacy vendor-fetch scratch file
 		{"bad/foraged/javascript/npmjs.org/kmsec.uk/chalk-pro/chalk-pro-unpkg-tmp.tgz", true},
 		{"bad/foraged/pkg-1.0.0.tgz", false},
-		{"good/foo.tmp.tgz", false}, // ".tmp" as a substring, not a path component
+		{"good/foo.tmp.tgz", false},            // ".tmp" as a substring, not a path component
+		{"good/foo.partial-1104359443", false}, // prefix must match the basename
 		{"unknown/uploads/sample.bin", false},
 		{"", false},
 	}

@@ -2641,11 +2641,20 @@ const stagingDirName = ".tmp"
 // too until every forager is redeployed.
 const legacyUnpkgScratchSuffix = "-unpkg-tmp.tgz"
 
+// legacyPartialScratchPrefix matches the pre-staging vendor-fetch scratch name
+// forager used directly in the host directory. Keep this guard for stale files
+// left by an older forager or a crashed download; current forager stages these
+// under .tmp instead.
+const legacyPartialScratchPrefix = ".partial-"
+
 // isStagingPath reports whether path is a transient artifact that enumeration
 // must not ingest: anything inside a stagingDirName component, or a legacy
-// unpkg scratch tarball sitting beside real samples.
+// unpkg/partial scratch file sitting beside real samples.
 func isStagingPath(path string) bool {
 	if strings.HasSuffix(path, legacyUnpkgScratchSuffix) {
+		return true
+	}
+	if strings.HasPrefix(filepath.Base(path), legacyPartialScratchPrefix) {
 		return true
 	}
 	// Match stagingDirName as a whole path component, not a substring, so a
