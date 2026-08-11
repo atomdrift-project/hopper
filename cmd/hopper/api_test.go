@@ -726,6 +726,44 @@ func TestResultBody(t *testing.T) {
 	}
 }
 
+func TestUploadSampleFilenameFallback(t *testing.T) {
+	t.Parallel()
+	const sha = "60d11b7004c80ae17a900094bbddd0a92273167af2b15f7597b9749d1b5edaa2"
+
+	// Real case (live audit 2026-08-08): a dependency uploaded with a
+	// version-less PURL claim — the release is only in the filename.
+	prov := &hopper.Sidecar{
+		Package: hopper.PackageRef{Ecosystem: "javascript", Name: "pg", PURL: "pkg:npm/pg"},
+	}
+	s := uploadSample(sha, "pg-8.23.0.tgz", "unknown/uploads/pg-8.23.0.tgz", 1, prov)
+	if s.Package != "pg" || s.Version != "8.23.0" {
+		t.Errorf("versionless-PURL upload = (%q, %q), want (\"pg\", \"8.23.0\")", s.Package, s.Version)
+	}
+	if s.PURLBase != "pkg:npm/pg" {
+		t.Errorf("PURLBase = %q, want \"pkg:npm/pg\"", s.PURLBase)
+	}
+
+	// Producer claims win: the parse must not override an explicit version.
+	prov = &hopper.Sidecar{
+		Package: hopper.PackageRef{Name: "pg", Version: "9.0.0-claimed", PURL: "pkg:npm/pg@9.0.0-claimed"},
+	}
+	s = uploadSample(sha, "pg-8.23.0.tgz", "unknown/uploads/pg-8.23.0.tgz", 1, prov)
+	if s.Package != "pg" || s.Version != "9.0.0-claimed" {
+		t.Errorf("claimed-version upload = (%q, %q), want (\"pg\", \"9.0.0-claimed\")", s.Package, s.Version)
+	}
+
+	// No provenance at all: identity comes from the filename alone, and an
+	// unparseable filename stays empty rather than guessing.
+	s = uploadSample(sha, "lodash-4.17.21.tgz", "unknown/uploads/lodash-4.17.21.tgz", 1, nil)
+	if s.Package != "lodash" || s.Version != "4.17.21" {
+		t.Errorf("bare upload = (%q, %q), want (\"lodash\", \"4.17.21\")", s.Package, s.Version)
+	}
+	s = uploadSample(sha, "evil.exe", "unknown/uploads/evil.exe", 1, nil)
+	if s.Package != "" || s.Version != "" {
+		t.Errorf("unparseable upload = (%q, %q), want empty", s.Package, s.Version)
+	}
+}
+
 func TestSanitizeUploadFilename(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

@@ -88,15 +88,20 @@ type Artifact struct {
 
 // Fetch describes the act of acquiring the artifact bytes. All times are UTC.
 // URL is where the artifact itself came from; the metadata source URLs live on
-// [Sidecar.Feed] and [Sidecar.Registry]. Collector identifies the producer
-// (e.g. "forager+0a45da172e3f" or "prism"); Category is the producer's claimed
-// bucket (good | new | bad | submitted) — a claim hopper records but does not
-// trust to set a sample's authoritative label.
+// [Sidecar.Feed] and [Sidecar.Registry]. OriginalURL is the canonical registry
+// URL the artifact was originally published at, recorded only when the bytes
+// were recovered from a different location than that canonical source (e.g. an
+// Internet Archive replay or a CDN mirror); it is empty when URL already is the
+// canonical source. Collector identifies the producer (e.g.
+// "forager+0a45da172e3f" or "prism"); Category is the producer's claimed bucket
+// (good | new | bad | submitted) — a claim hopper records but does not trust to
+// set a sample's authoritative label.
 type Fetch struct {
 	Collector    string    `json:"collector"`
 	Category     string    `json:"category"`
 	At           time.Time `json:"at"`
 	URL          string    `json:"url,omitempty"`
+	OriginalURL  string    `json:"original_url,omitempty"`
 	ETag         string    `json:"etag,omitempty"`
 	LastModified string    `json:"last_modified,omitempty"`
 }

@@ -861,6 +861,49 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// top-level working set without scanning the full samples heap.
 		`CREATE INDEX IF NOT EXISTS idx_samples_reconcile_toplevel ON samples(sha256)
 			WHERE parent = '' AND (skip = '' OR skip = 'conflict')`,
+
+		// claims: append-only ledger of analyzer-derived identity assertions —
+		// files[].ident (PE version resources, bundle manifests, code
+		// signatures) projected at StoreResult time. Registry identity stays
+		// on samples (package/version/purl_base); the asset_claims view below
+		// unions the two. See claims.go.
+		`CREATE TABLE IF NOT EXISTS claims (
+			sha256      TEXT NOT NULL REFERENCES samples(sha256) ON DELETE CASCADE,
+			source      TEXT NOT NULL,
+			name        TEXT NOT NULL,
+			version     TEXT NOT NULL DEFAULT '',
+			signer      TEXT NOT NULL DEFAULT '',
+			verified    BOOLEAN NOT NULL DEFAULT false,
+			trust       TEXT NOT NULL DEFAULT '',
+			observed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			PRIMARY KEY (sha256, source)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_claims_name ON claims(name, version)`,
+		`CREATE INDEX IF NOT EXISTS idx_claims_signer ON claims(signer) WHERE signer != ''`,
+
+		// asset_claims: the one query surface for "who says these bytes are
+		// what" — registry claims and filename parses (both from samples)
+		// unioned with analyzer claims. Every branch is exact-match indexed
+		// (idx_samples_package_version, idx_claims_name), so a name= or
+		// purl-derived filter pushes down into each. The 'filename' branch
+		// is the pre-registry population: identity parsed from the name the
+		// file travels under (pkgparse, at walk/upload time), the weakest
+		// claim and labeled as such — thirty years of wuftpd-10.9.2.tgz
+		// belong in the same query as pkg:npm/lodash.
+		`CREATE OR REPLACE VIEW asset_claims AS
+			SELECT sha256, 'registry' AS source, package AS name, version,
+			       '' AS signer, false AS verified, '' AS trust, domain,
+			       created_at AS observed_at
+			  FROM samples WHERE purl_base != ''
+			UNION ALL
+			SELECT sha256, 'filename' AS source, package AS name, version,
+			       '' AS signer, false AS verified, '' AS trust, domain,
+			       created_at AS observed_at
+			  FROM samples WHERE purl_base = '' AND package != ''
+			UNION ALL
+			SELECT sha256, source, name, version, signer, verified, trust,
+			       '' AS domain, observed_at
+			  FROM claims`,
 	}
 }
 
@@ -2083,6 +2126,44 @@ const memberStoreBatch = 1000
 // shared member locks in the same order and concurrent archives cannot form a
 // deadlock cycle. Returns the number of member rows inserted or freshness-
 // refreshed. The caller drives the batching; see storeResultPG.
+// storeClaimsPG batch-upserts analyzer identity claims. The samples join
+// drops claims for members that never became rows (explosion skips) instead
+// of failing the FK; the delta guard leaves unchanged rows untouched so a
+// re-analysis of the same bytes is a pure no-op.
+func (db *DB) storeClaimsPG(ctx context.Context, claims []Claim) error {
+	if len(claims) == 0 {
+		return nil
+	}
+	n := len(claims)
+	shas := make([]string, n)
+	sources := make([]string, n)
+	names := make([]string, n)
+	versions := make([]string, n)
+	signers := make([]string, n)
+	verified := make([]bool, n)
+	trusts := make([]string, n)
+	for i, c := range claims {
+		shas[i], sources[i], names[i] = c.SHA256, c.Source, c.Name
+		versions[i], signers[i], verified[i], trusts[i] = c.Version, c.Signer, c.Verified, c.Trust
+	}
+	if _, err := db.pool.Exec(ctx, `
+		INSERT INTO claims (sha256, source, name, version, signer, verified, trust)
+		SELECT c.sha256, c.source, c.name, c.version, c.signer, c.verified, c.trust
+		  FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::boolean[], $7::text[])
+		       AS c(sha256, source, name, version, signer, verified, trust)
+		  JOIN samples s ON s.sha256 = c.sha256
+		ON CONFLICT (sha256, source) DO UPDATE SET
+			name = EXCLUDED.name, version = EXCLUDED.version, signer = EXCLUDED.signer,
+			verified = EXCLUDED.verified, trust = EXCLUDED.trust
+		WHERE (claims.name, claims.version, claims.signer, claims.verified, claims.trust)
+		      IS DISTINCT FROM
+		      (EXCLUDED.name, EXCLUDED.version, EXCLUDED.signer, EXCLUDED.verified, EXCLUDED.trust)`,
+		shas, sources, names, versions, signers, verified, trusts); err != nil {
+		return fmt.Errorf("hopper: store claims: %w", err)
+	}
+	return nil
+}
+
 func (db *DB) storeMemberRowsPG(ctx context.Context, rows [][]any) (int64, error) {
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
@@ -2190,6 +2271,13 @@ func (db *DB) storeResultPG(
 			return StoreStats{}, err
 		}
 		stats.MembersStored += n
+	}
+
+	// Analyzer identity claims from the same envelope — after the members so
+	// each claim's row exists, before the parent UPDATE so a retried store
+	// re-runs them as no-ops like everything else here.
+	if err := db.storeClaimsPG(ctx, ClaimsFromEnvelope(cleaveRaw)); err != nil {
+		return StoreStats{}, err
 	}
 
 	// Parent last, in its own short transaction. Truncating it only after the
@@ -5438,12 +5526,18 @@ func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error
 			AND (NOT $13 OR corroborated)
 			AND ($14 = '' OR purl_base = $14)
 			AND ($15 = '' OR version = $15)
+			AND (($17 = '' AND $18 = '') OR EXISTS (
+				SELECT 1 FROM asset_claims ac
+				 WHERE ac.sha256 = samples.sha256
+				   AND ($17 = '' OR ac.name = $17)
+				   AND ($18 = '' OR ac.signer = $18)))
 			AND file_type <> 'registry'
 		ORDER BY `+q.sortBy()+`
 		LIMIT $10 OFFSET $11`,
 		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
 		q.Formula, q.requireLitmus(), q.Domains, q.Limit, q.Offset,
-		q.searchTerm(), q.Corroborated, q.PURLBase, q.PURLVersion, q.packageTerm())
+		q.searchTerm(), q.Corroborated, q.PURLBase, q.PURLVersion, q.packageTerm(),
+		q.ClaimName, q.ClaimSigner)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed samples: %w", err)
 	}
@@ -5485,10 +5579,15 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q *FeedQuery) (int, error)
 			AND (NOT $11 OR corroborated)
 			AND ($12 = '' OR purl_base = $12)
 			AND ($13 = '' OR version = $13)
+			AND (($15 = '' AND $16 = '') OR EXISTS (
+				SELECT 1 FROM asset_claims ac
+				 WHERE ac.sha256 = samples.sha256
+				   AND ($15 = '' OR ac.name = $15)
+				   AND ($16 = '' OR ac.signer = $16)))
 			AND file_type <> 'registry'`,
 		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
 		q.Formula, q.requireLitmus(), q.Domains, q.searchTerm(), q.Corroborated,
-		q.PURLBase, q.PURLVersion, q.packageTerm()).Scan(&n)
+		q.PURLBase, q.PURLVersion, q.packageTerm(), q.ClaimName, q.ClaimSigner).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: feed samples count: %w", err)
 	}

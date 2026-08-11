@@ -515,6 +515,8 @@ func run(ctx context.Context) error {
 		return cmdRehealCrit(ctx)
 	case "backfill-purl":
 		return cmdBackfillPURL(ctx)
+	case "backfill-claims":
+		return cmdBackfillClaims(ctx)
 	case "canonicalize-purls":
 		return cmdCanonicalizePURLs(ctx)
 	case "purge-unsupported":
@@ -3328,6 +3330,35 @@ func cmdBackfillPURL(ctx context.Context) error {
 	return nil
 }
 
+// cmdBackfillClaims projects identity claims out of stored envelopes that
+// already carry ident blocks (generation >= 8) — rows analyzed after v8
+// shipped but before the claims table existed, and the completeness sweeper
+// to run once a --pre-ident rescan wave has drained. Resumable (--start-id)
+// and idempotent; safe to re-run any time.
+func cmdBackfillClaims(ctx context.Context) error {
+	f := flag.NewFlagSet("backfill-claims", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	startID := f.Int64("start-id", 0, "resume the walk after this samples.id")
+	parseFlags(f, os.Args[2:])
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		return err
+	}
+
+	slog.Info("backfilling claims from stored ident-bearing envelopes", "start_id", *startID)
+	rows, claims, err := db.BackfillClaims(ctx, *startID)
+	if err != nil {
+		return err
+	}
+	slog.Info("backfill-claims complete", "rows_walked", rows, "claims_upserted", claims)
+	return nil
+}
+
 // cmdCanonicalizePURLs rewrites every stored purl_base onto the current
 // canonical spelling — the follow-up whenever a normalization fold changes
 // (the AUR namespace move, PEP 503 PyPI names, extension-id case folds).
@@ -3422,13 +3453,19 @@ func cmdPrune(ctx context.Context) error {
 // cmdRescan queues files for re-analysis in the repair tier (rescan_priority=1),
 // drained behind new ingestion so it never starves fresh work. With
 // --missing-members it flags every truncated archive that has no member rows —
-// the historical data-loss backlog from the old async explosion; otherwise it
+// the historical data-loss backlog from the old async explosion. With
+// --pre-ident it flags every active top-level sample whose stored envelope
+// predates the per-file identity block (claims backfill; --types narrows the
+// sweep for a tiered rollout, --dry-run counts without flagging). Otherwise it
 // flags the SHA-256s given as arguments. For an interactive, ahead-of-new rescan
 // of a single file, use prism's per-file rescan button (RequestRescan).
 func cmdRescan(ctx context.Context) error {
 	f := flag.NewFlagSet("rescan", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
 	missingMembers := f.Bool("missing-members", false, "flag every truncated archive that has no member rows")
+	preIdent := f.Bool("pre-ident", false, "flag active top-level samples analyzed before the identity-block envelope (claims backfill)")
+	types := f.String("types", "", "with --pre-ident: comma-separated file_type filter, e.g. pe,macho,elf (empty = every type)")
+	dryRun := f.Bool("dry-run", false, "with --pre-ident: count matching rows without flagging them")
 	parseFlags(f, os.Args[2:])
 
 	db, err := openDB(ctx, *dsn)
@@ -3449,9 +3486,24 @@ func cmdRescan(ctx context.Context) error {
 		return nil
 	}
 
+	if *preIdent {
+		var fileTypes []string
+		for t := range strings.SplitSeq(*types, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				fileTypes = append(fileTypes, t)
+			}
+		}
+		n, err := db.QueuePreIdentForRepair(ctx, fileTypes, *dryRun)
+		if err != nil {
+			return err
+		}
+		slog.Info("pre-ident rescan", "matched", n, "types", *types, "dry_run", *dryRun)
+		return nil
+	}
+
 	shas := f.Args()
 	if len(shas) == 0 {
-		return errors.New("rescan: pass --missing-members, or one or more SHA-256 arguments")
+		return errors.New("rescan: pass --missing-members, --pre-ident, or one or more SHA-256 arguments")
 	}
 	norm := make([]string, len(shas))
 	for i, s := range shas {

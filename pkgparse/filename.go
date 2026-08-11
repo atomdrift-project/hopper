@@ -68,9 +68,19 @@ var filenamePatterns = []*regexp.Regexp{
 	// nupkg / vsix / crx / xpi / AppImage. Non-greedy `(.+?)` captures
 	// the shortest plausible name so the version captures all trailing
 	// build metadata (semver build suffixes like "1.0.6+spec-1.1.0").
-	// Version may carry an optional "v" prefix.
+	// Version may carry an optional "v" prefix. The tarball alternation
+	// includes the pre-gzip era's spellings (.tar.Z compress, .taz,
+	// .tbz2, .txz) so thirty-year-old source releases parse too.
 	regexp.MustCompile(`^(?P<name>.+?)-(?P<version>v?\d[\w.+~-]*)\.` +
-		`(?:tgz|tar\.gz|tar\.bz2|tar\.xz|tar\.zst|tar|whl|crate|jar|gem|nupkg|zip|vsix|crx|xpi|AppImage)$`),
+		`(?:tgz|taz|tbz2|txz|tar\.gz|tar\.bz2|tar\.xz|tar\.zst|tar\.[zZ]|tar|whl|crate|jar|gem|nupkg|zip|vsix|crx|xpi|AppImage)$`),
+
+	// Dotted-separator source tarballs of the same era: sendmail.8.9.1.tar.gz.
+	// After the hyphen rule, so a dotted *name* with a hyphen split
+	// ("mod.ssl-2.8.tar.gz") keeps its hyphen boundary; archive
+	// extensions only — dotted names with versions are otherwise too
+	// ambiguous to guess.
+	regexp.MustCompile(`^(?P<name>.+?)\.(?P<version>\d[\w+~-]*(?:\.[\w+~-]+)*?)\.` +
+		`(?:tgz|taz|tbz2|txz|tar\.gz|tar\.bz2|tar\.xz|tar\.zst|tar\.[zZ]|tar|zip)$`),
 
 	// nuget with dot-separated name + version (Microsoft.X.Y.Z.W.nupkg).
 	// Non-greedy name so version grabs the trailing dotted-int sequence.
@@ -99,9 +109,11 @@ var filenamePatterns = []*regexp.Regexp{
 //	"python-3.12.0-1-x86_64.pkg.tar.zst" → ("python", "3.12.0-1", "x86_64")
 //	"NotepadPPPortable_8.9.4.paf.exe" → ("NotepadPPPortable", "8.9.4", "")
 //	"github.com-gorilla-mux-v1.8.1.zip" → ("github.com-gorilla-mux", "v1.8.1", "")
+//	"2026-03-18-big-nunber-v5.0.5.zip" → ("big-nunber", "v5.0.5", "")
 //	"cjpalhdlnbpafiamejdnhcphjbkeiagm.crx" → ("", "", "")  (no version)
 //	"evil.exe"                        → ("", "", "")
 func ParseFilename(filename string) (name, version, arch string) {
+	filename = datePrefix.ReplaceAllString(filename, "")
 	for _, re := range filenamePatterns {
 		m := re.FindStringSubmatch(filename)
 		if m == nil {
@@ -123,14 +135,22 @@ func ParseFilename(filename string) (name, version, arch string) {
 // archiveExtensions are the suffixes VersionForName strips before splitting,
 // compound forms first so ".tar.gz" wins over ".gz"-less ".tar".
 var archiveExtensions = []string{
-	".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".paf.exe",
-	".tgz", ".tar", ".whl", ".crate", ".jar", ".gem", ".nupkg",
-	".zip", ".vsix", ".crx", ".xpi", ".AppImage", ".conda", ".apk",
+	".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tar.Z", ".tar.z", ".paf.exe",
+	".tgz", ".taz", ".tbz2", ".txz", ".tar", ".whl", ".crate", ".jar", ".gem",
+	".nupkg", ".zip", ".vsix", ".crx", ".xpi", ".AppImage", ".conda", ".apk",
 }
 
 // versionShape is the loose validity check for a name-anchored version tail:
 // digit-led (optional "v"), then the usual version alphabet.
 var versionShape = regexp.MustCompile(`^v?\d[\w.+~-]*$`)
+
+// datePrefix matches a leading YYYY-MM-DD- disclosure-date stamp, as used by
+// threat-feed datasets that name samples "<date>-<name>-v<version>.zip"
+// (Datadog's malicious-packages layout). Without stripping it, the generic
+// name/version split takes the year as the name: "2026-03-18-big-nunber-v5.0.5.zip"
+// parsed as name "2026". The month/day digit bounds keep version-like names
+// ("1234-56-78-foo") from being mistaken for dates.
+var datePrefix = regexp.MustCompile(`^(?:19|20)\d\d-[01]\d-[0-3]\d-`)
 
 // VersionForName extracts the version from a download filename when the
 // package name is already known (e.g. from a forager path component or feed

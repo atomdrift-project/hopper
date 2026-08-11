@@ -77,6 +77,29 @@ func TestParseFilename(t *testing.T) {
 		// golang module zips with v-prefix versions.
 		{"github.com-jackc-pgx-v5-v5.9.1.zip", "github.com-jackc-pgx-v5", "v5.9.1"},
 		{"github.com-gorilla-mux-v1.8.1.zip", "github.com-gorilla-mux", "v1.8.1"},
+		{
+			"github.com-glotchimo-discordgo-v0.0.0-20260608180630-ba495b2345c7.zip",
+			"github.com-glotchimo-discordgo", "v0.0.0-20260608180630-ba495b2345c7",
+		},
+		// Disclosure-date-stamped dataset samples (Datadog malicious-packages
+		// layout): the leading YYYY-MM-DD- is metadata, not the name. Without
+		// stripping it these parsed as name "2026" (real hopper rows).
+		{"2026-03-18-big-nunber-v5.0.5.zip", "big-nunber", "v5.0.5"},
+		{"2026-03-20-archgate-win32-x64-v0.15.0.zip", "archgate-win32-x64", "v0.15.0"},
+		{"2026-03-02-svg-content-validation-v1.0.8.zip", "svg-content-validation", "v1.0.8"},
+		{"2026-03-21-react-autolink-text-v2.0.1.zip", "react-autolink-text", "v2.0.1"},
+		// Version-like leading digits that are NOT dates stay part of the name.
+		{"2020-vision-1.0.0.tgz", "2020-vision", "1.0.0"},
+		// FTP-era source releases: pre-gzip compress spelling, dotted
+		// separators, patchlevel versions — thirty-year-old real names.
+		{"wuftpd-10.9.2.tgz", "wuftpd", "10.9.2"},
+		{"sendmail-8.9.1.tgz", "sendmail", "8.9.1"},
+		{"sendmail.8.9.1.tar.gz", "sendmail", "8.9.1"},
+		{"apache_1.3.9.tar.gz", "apache", "1.3.9"},
+		{"bind-4.9.5-P1.tar.gz", "bind", "4.9.5-P1"},
+		{"ncompress-4.2.4.tar.Z", "ncompress", "4.2.4"},
+		{"elm-2.5.8.tar.gz", "elm", "2.5.8"},
+		{"mod.ssl-2.8.31-1.3.41.tar.gz", "mod.ssl", "2.8.31-1.3.41"},
 		// docker image tarballs.
 		{"docker.io_library_logstash_9.2.4.tar.xz", "docker.io_library_logstash", "9.2.4"},
 		{"docker.io_library_memcached_1.6.40-alpine3.23.tar.xz", "docker.io_library_memcached", "1.6.40-alpine3.23"},

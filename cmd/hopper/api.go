@@ -2877,41 +2877,55 @@ func uploadSample(sha, filename, relPath string, size int64, prov *hopper.Sideca
 		SizeBytes:   size,
 		Mtime:       &now,
 	}
-	if prov == nil {
-		return sample
+	if prov != nil {
+		// Capture time when the producer recorded one: a dependency fetched from a
+		// registry was published before we saw it, and the age gate should measure
+		// from when the bytes existed, not from when they reached us.
+		if !prov.Fetch.At.IsZero() {
+			at := prov.Fetch.At
+			sample.Mtime = &at
+		}
+		if provJSON, err := json.Marshal(prov); err == nil {
+			sample.Provenance = provJSON
+		}
+		if !prov.Fetch.At.IsZero() {
+			at := prov.Fetch.At
+			sample.FetchedAt = &at
+		}
+		sample.URL = prov.Fetch.URL
+		// Where the bytes were served from. Derived rather than claimed — the
+		// sidecar has no domain field — and the same eTLD+1 forager records, so
+		// uploads group alongside foraged samples in the domain column. An unknown
+		// origin leaves the column empty; only the path uses a placeholder.
+		if domain := uploadDomain(prov.Fetch.URL); domain != unknownDomain {
+			sample.Domain = domain
+		}
+		sample.Ecosystem = prov.Package.Ecosystem
+		sample.Package = prov.Package.Name
+		sample.Version = prov.Package.Version
+		sample.Feed = prov.Package.Feed
+		// Project the version-less PURL into the queryable column, mirroring
+		// forager's direct-insert path — so an uploaded dependency is findable by
+		// purl_base, not just by the PURL buried in the provenance JSONB.
+		// Canonicalized first, so a purl_base is written in one spelling no matter
+		// which form the (possibly older) uploading client used.
+		sample.PURLBase = pkgparse.VersionlessPURL(pkgparse.CanonicalizePURL(prov.Package.PURL))
 	}
-	// Capture time when the producer recorded one: a dependency fetched from a
-	// registry was published before we saw it, and the age gate should measure
-	// from when the bytes existed, not from when they reached us.
-	if !prov.Fetch.At.IsZero() {
-		at := prov.Fetch.At
-		sample.Mtime = &at
+	// Fill name/version gaps from the filename, mirroring the walker's
+	// fillSampleProvenance: producer claims win, the parse only fills blanks.
+	// Uploaded dependencies often carry a version-less PURL ("pkg:npm/pg")
+	// whose release is visible only in the filename ("pg-8.23.0.tgz").
+	parsedName, parsedVersion, _ := pkgparse.ParseFilename(filename)
+	if sample.Package == "" {
+		sample.Package = parsedName
 	}
-	if provJSON, err := json.Marshal(prov); err == nil {
-		sample.Provenance = provJSON
+	if sample.Version == "" {
+		if v := pkgparse.VersionForName(filename, sample.Package); v != "" {
+			sample.Version = v
+		} else {
+			sample.Version = parsedVersion
+		}
 	}
-	if !prov.Fetch.At.IsZero() {
-		at := prov.Fetch.At
-		sample.FetchedAt = &at
-	}
-	sample.URL = prov.Fetch.URL
-	// Where the bytes were served from. Derived rather than claimed — the
-	// sidecar has no domain field — and the same eTLD+1 forager records, so
-	// uploads group alongside foraged samples in the domain column. An unknown
-	// origin leaves the column empty; only the path uses a placeholder.
-	if domain := uploadDomain(prov.Fetch.URL); domain != unknownDomain {
-		sample.Domain = domain
-	}
-	sample.Ecosystem = prov.Package.Ecosystem
-	sample.Package = prov.Package.Name
-	sample.Version = prov.Package.Version
-	sample.Feed = prov.Package.Feed
-	// Project the version-less PURL into the queryable column, mirroring
-	// forager's direct-insert path — so an uploaded dependency is findable by
-	// purl_base, not just by the PURL buried in the provenance JSONB.
-	// Canonicalized first, so a purl_base is written in one spelling no matter
-	// which form the (possibly older) uploading client used.
-	sample.PURLBase = pkgparse.VersionlessPURL(pkgparse.CanonicalizePURL(prov.Package.PURL))
 	return sample
 }
 

@@ -460,6 +460,43 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		}
 	}
 
+	// claims: analyzer-derived identity assertions + the asset_claims union
+	// view. Mirrors the PG runtime migration; see claims.go.
+	for _, ddl := range []string{
+		`CREATE TABLE IF NOT EXISTS claims (
+			sha256      TEXT NOT NULL REFERENCES samples(sha256) ON DELETE CASCADE,
+			source      TEXT NOT NULL,
+			name        TEXT NOT NULL,
+			version     TEXT NOT NULL DEFAULT '',
+			signer      TEXT NOT NULL DEFAULT '',
+			verified    INTEGER NOT NULL DEFAULT 0,
+			trust       TEXT NOT NULL DEFAULT '',
+			observed_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+			PRIMARY KEY (sha256, source)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_claims_name ON claims(name, version)`,
+		`CREATE INDEX IF NOT EXISTS idx_claims_signer ON claims(signer) WHERE signer != ''`,
+		`DROP VIEW IF EXISTS asset_claims`,
+		`CREATE VIEW asset_claims AS
+			SELECT sha256, 'registry' AS source, package AS name, version,
+			       '' AS signer, 0 AS verified, '' AS trust, domain,
+			       created_at AS observed_at
+			  FROM samples WHERE purl_base != ''
+			UNION ALL
+			SELECT sha256, 'filename' AS source, package AS name, version,
+			       '' AS signer, 0 AS verified, '' AS trust, domain,
+			       created_at AS observed_at
+			  FROM samples WHERE purl_base = '' AND package != ''
+			UNION ALL
+			SELECT sha256, source, name, version, signer, verified, trust,
+			       '' AS domain, observed_at
+			  FROM claims`,
+	} {
+		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite claims: %w", err)
+		}
+	}
+
 	// walk_staging holds (sha256, path) for every standalone file seen in the
 	// current walk; reconciliation anti-joins it against samples. See the pg.go
 	// equivalent. SQLite has no UNLOGGED tables, but this DB is the local cache
@@ -1940,6 +1977,30 @@ func (db *DB) storeResultSQLite(
 					m.SHA256, m.Path, m.Parent, m.LocationRel, m.Filename, m.Source, m.Feed, m.Ecosystem, m.Mtime); err != nil {
 					return StoreStats{}, fmt.Errorf("hopper: upsert member location %s: %w", m.SHA256, err)
 				}
+			}
+		}
+	}
+
+	// Analyzer identity claims from the same envelope, mirroring
+	// storeClaimsPG: the EXISTS guard drops claims for members that never
+	// became rows (explosion skips) instead of failing the FK.
+	if claims := ClaimsFromEnvelope(cleaveRaw); len(claims) > 0 {
+		stmt, err := tx.PrepareContext(ctx, `
+			INSERT INTO claims (sha256, source, name, version, signer, verified, trust)
+			SELECT ?, ?, ?, ?, ?, ?, ?
+			 WHERE EXISTS (SELECT 1 FROM samples WHERE sha256 = ?)
+			ON CONFLICT (sha256, source) DO UPDATE SET
+				name = excluded.name, version = excluded.version, signer = excluded.signer,
+				verified = excluded.verified, trust = excluded.trust`)
+		if err != nil {
+			return StoreStats{}, fmt.Errorf("hopper: prepare claims upsert: %w", err)
+		}
+		defer stmt.Close() //nolint:errcheck // best-effort cleanup
+		for _, c := range claims {
+			if _, err := stmt.ExecContext(ctx,
+				c.SHA256, c.Source, c.Name, c.Version, c.Signer, c.Verified, c.Trust,
+				c.SHA256); err != nil {
+				return StoreStats{}, fmt.Errorf("hopper: upsert claim %s: %w", c.SHA256, err)
 			}
 		}
 	}
@@ -4131,6 +4192,16 @@ func (q *FeedQuery) whereSQLite() (where string, args []any) {
 	if q.PURLVersion != "" {
 		clauses = append(clauses, "version = ?")
 		args = append(args, q.PURLVersion)
+	}
+
+	// Identity-claim filter, mirroring the PG feed: any claim in the
+	// asset_claims view (registry or analyzer) asserting this name/signer.
+	if q.ClaimName != "" || q.ClaimSigner != "" {
+		clauses = append(clauses, `EXISTS (SELECT 1 FROM asset_claims ac
+			WHERE ac.sha256 = samples.sha256
+			  AND (? = '' OR ac.name = ?)
+			  AND (? = '' OR ac.signer = ?))`)
+		args = append(args, q.ClaimName, q.ClaimName, q.ClaimSigner, q.ClaimSigner)
 	}
 
 	return "WHERE " + strings.Join(clauses, " AND "), args

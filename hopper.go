@@ -4213,8 +4213,15 @@ type FeedQuery struct {
 	// release (samples.version). Both are exact equality — callers pass an
 	// already-canonicalized value (see pkgparse.CanonicalizePURL /
 	// VersionlessPURL); an empty field matches everything.
-	PURLBase      string
-	PURLVersion   string
+	PURLBase    string
+	PURLVersion string
+	// ClaimName / ClaimSigner restrict the feed to samples some identity
+	// claim — registry or analyzer, via the asset_claims view — asserts to
+	// carry this name / signer (exact equality, both view branches indexed).
+	// ClaimSigner alone lists everything by one signer; with ClaimName it
+	// pins the (name, voucher) pair a version-timeline UI groups by.
+	ClaimName     string
+	ClaimSigner   string
 	LitmusClasses []int // optional: filter by litmus_result class values
 	RequireLitmus bool  // require any litmus_result without filtering by class
 	Corroborated  bool  // only samples cited by an external threat feed (samples.corroborated)
