@@ -425,13 +425,39 @@ Environment=HOPPER_UPLOAD_OPEN=1
 # allocation of N bytes failed" — which reads like OOM and is not (2026-08-10:
 # RSS 19-36 GB against a 108 GB cgroup limit, oom_kill 0).
 #
+# retain:false alone is NOT enough, and measuring it is what showed why: it
+# stops the PROT_NONE holes, but jemalloc then unmaps freed extents and
+# re-mmaps small ones, so live extents scatter into their own VMAs. A 10-minute
+# A/B on the live worker, each config after a full restart (2026-08-10):
+#
+#   retain:false,muzzy_decay_ms:-1        7,501 maps    +360/min    37 GB RSS
+#   retain:false                        366,585 maps +32,109/min    17 GB RSS
+#   retain:true,dirty=10s,muzzy=10s     531,228 maps +47,664/min    37 GB RSS
+#   compiled-in default (no retain)   1,034,683 maps +74,935/min    29 GB RSS
+#
+# The last row is the control: it reached the 1048576 ceiling inside ten
+# minutes, reproducing the abort exactly. muzzy_decay_ms:-1 is what makes the
+# count plateau rather than merely grow slower — extents stay mapped and are
+# reused in place instead of being returned and re-acquired.
+#
+# muzzy_decay_ms:-1 (never purge) wins on mappings alone, but its RSS climbs
+# toward the peak working set — 68-74 GB over 13 h against --max-rss-gb 72. A
+# second round under verified load (2026-08-11, 20 min each) picked the decay:
+#
+#   muzzy_decay_ms:600000   ~83,000 maps flat    ~4.5 GB RSS, stable
+#   muzzy_decay_ms:-1        ~8,000 maps flat    ~10 GB RSS, climbing
+#   muzzy_decay_ms:60000   ~350,000 maps noisy   ~15-21 GB RSS
+#
+# 600000 trades mappings we have headroom for (12x under the default ceiling)
+# against RSS that holds steady instead of eating the memory budget.
+#
 # The variable name is load-bearing. tikv-jemallocator builds jemalloc with the
 # _rjem_ prefix, so it reads _RJEM_MALLOC_CONF; plain MALLOC_CONF is parsed by
 # the system allocator and silently ignored, which is how a first attempt at
 # this looked applied while doing nothing. Verify with
 # `_RJEM_MALLOC_CONF=bogus:1 atomscan version` — it must print "Invalid conf
 # pair". Go ignores both, so this is inert for hopper itself.
-Environment=_RJEM_MALLOC_CONF=retain:false
+Environment=_RJEM_MALLOC_CONF=retain:false,muzzy_decay_ms:600000
 
 # Bound the Go heap so the runtime applies GC backpressure *before* the cgroup
 # MemoryHigh below forces pages into swap. The hopper process RSS is almost
