@@ -412,19 +412,26 @@ Environment=PATH=${TOOLS_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
 # Environment=HOPPER_UPLOAD_TOKEN=<token>.
 Environment=HOPPER_UPLOAD_OPEN=1
 
-# jemalloc (the allocator in the litmus/cleave children, inherited from here)
-# defaults to retain:true on Linux: freed extents keep their address space and
-# are decommitted with mprotect(PROT_NONE) instead of being unmapped. Every
-# decommit splits a VMA, and cleave's archive-member workload frees
-# variable-sized buffers continuously, so the worker's mapping count climbs
-# ~1400/s with flat RSS until it hits vm.max_map_count — where mmap returns
-# ENOMEM, Rust's allocator gets null, and the worker aborts
-# ("memory allocation of N bytes failed", which reads like OOM but is not:
-# 2026-08-10, RSS 19-36 GB against a 108 GB cgroup limit, oom_kill 0).
-# retain:false makes jemalloc munmap instead, so adjacent free ranges coalesce
-# and the VMA count stays bounded. NB: Go ignores MALLOC_CONF, so this is inert
-# for hopper itself and only affects the children that actually use jemalloc.
-Environment=MALLOC_CONF=retain:false
+# Bridge until an atomscan/cleave carrying the compiled-in fix is deployed;
+# remove this line then (the binaries set the same option themselves).
+#
+# jemalloc — the allocator in the litmus/cleave children, which inherit this
+# environment — defaults to retain:true on Linux: a freed extent keeps its
+# address space and is decommitted with mprotect(PROT_NONE) instead of being
+# unmapped. Every decommit splits a VMA, and cleave's archive-member workload
+# frees variable-sized buffers continuously, so the worker's mapping count
+# climbed ~1400/s with flat RSS until it hit vm.max_map_count; mmap then returns
+# ENOMEM, Rust's allocator gets null and the worker aborts with "memory
+# allocation of N bytes failed" — which reads like OOM and is not (2026-08-10:
+# RSS 19-36 GB against a 108 GB cgroup limit, oom_kill 0).
+#
+# The variable name is load-bearing. tikv-jemallocator builds jemalloc with the
+# _rjem_ prefix, so it reads _RJEM_MALLOC_CONF; plain MALLOC_CONF is parsed by
+# the system allocator and silently ignored, which is how a first attempt at
+# this looked applied while doing nothing. Verify with
+# `_RJEM_MALLOC_CONF=bogus:1 atomscan version` — it must print "Invalid conf
+# pair". Go ignores both, so this is inert for hopper itself.
+Environment=_RJEM_MALLOC_CONF=retain:false
 
 # Bound the Go heap so the runtime applies GC backpressure *before* the cgroup
 # MemoryHigh below forces pages into swap. The hopper process RSS is almost
