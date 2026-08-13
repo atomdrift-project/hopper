@@ -470,7 +470,7 @@ Environment=HOPPER_UPLOAD_OPEN=1
 # _rjem_ prefix, so it reads _RJEM_MALLOC_CONF; plain MALLOC_CONF is parsed by
 # the system allocator and silently ignored, which is how a first attempt at
 # this looked applied while doing nothing. Verify with
-# `_RJEM_MALLOC_CONF=bogus:1 atomscan version` — it must print "Invalid conf
+# '_RJEM_MALLOC_CONF=bogus:1 atomscan version' — it must print "Invalid conf
 # pair". Go ignores both, so this is inert for hopper itself.
 Environment=_RJEM_MALLOC_CONF=retain:false,muzzy_decay_ms:600000
 
