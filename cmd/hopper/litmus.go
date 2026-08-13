@@ -78,6 +78,7 @@ type litmusServer struct {
 	bin        string                            // path to litmus binary
 	hopperURL  string                            // hopper API base URL for the worker to poll
 	dataDir    string                            // data root for --data-dir
+	llmURL     string                            // --interpret endpoint (SCAN_LLM); empty leaves the pass off
 	workerName string                            // qualified name used to look up in tracker
 	tmpDir     string
 	pid        atomic.Int64
@@ -131,6 +132,7 @@ type litmusConfig struct {
 	Bin        string // path to the Atomdrift Scan binary (codename: litmus); default "atomscan"
 	HopperURL  string // hopper API URL (e.g. http://127.0.0.1:8081)
 	DataDir    string // data root for local file access
+	LLMURL     string // OpenAI-compatible endpoint for the --interpret pass; empty disables it
 	MaxRSSGB   int    // memory limit in GB (0 = let litmus decide, -1 = disable in-process throttling)
 	MaxWorkers int    // max concurrent analysis workers
 	Verbose    bool   // enable debug logging in litmus
@@ -147,6 +149,7 @@ func newLitmusServer(cfg litmusConfig) *litmusServer {
 		bin:        cfg.Bin,
 		hopperURL:  cfg.HopperURL,
 		dataDir:    cfg.DataDir,
+		llmURL:     cfg.LLMURL,
 		maxRSSGB:   cfg.MaxRSSGB,
 		maxWorkers: cfg.MaxWorkers,
 		verbose:    cfg.Verbose,
@@ -442,7 +445,11 @@ func updateSiblingTool(ctx context.Context, name, dir string) {
 	slog.Info("tool updated successfully", "tool", name, "pulled", pulled)
 }
 
-func (s *litmusServer) startLocked(ctx context.Context) error {
+// workerArgs builds the atomscan argv for the local worker. Pure so the
+// composition is testable without spawning: the flags here are the only thing
+// that distinguishes this worker from a remote fleet one, and a missing flag is
+// invisible at runtime (see --interpret below).
+func (s *litmusServer) workerArgs() []string {
 	args := []string{}
 	if s.verbose {
 		args = append(args, "--verbose")
@@ -460,6 +467,22 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 	if s.maxWorkers > 0 {
 		args = append(args, "--workers", strconv.Itoa(s.maxWorkers))
 	}
+	// LLM second-opinion pass, exactly as the remote fleet runs it: the
+	// `--interpret` flag plus SCAN_LLM naming the endpoint (see scan's
+	// scripts/worker/worker-linux.sh). Without it this worker stores no
+	// llm_result at all, and since it claims the largest share of the queue
+	// that left ~half of every hostile sample with a verdict and no rationale —
+	// the gaps on prism's /fallout page. Gated on a configured endpoint rather
+	// than always-on: bare `--interpret` would aim at localhost:8000, and a
+	// missing endpoint costs a health-gate wait per sample.
+	if s.llmURL != "" {
+		args = append(args, "--interpret")
+	}
+	return args
+}
+
+func (s *litmusServer) startLocked(ctx context.Context) error {
+	args := s.workerArgs()
 
 	tmpDir, err := s.ensureTmpDirLocked()
 	if err != nil {
@@ -475,6 +498,9 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 	// preflightCleaveValidate): reject a bundle only for load/detection flaws,
 	// not authoring hygiene. Ignored by litmus builds predating soft support.
 	cmd.Env = append(os.Environ(), "TMPDIR="+tmpDir, "CLEAVE_VALIDATE_SOFT=1")
+	if s.llmURL != "" {
+		cmd.Env = append(cmd.Env, "SCAN_LLM="+s.llmURL)
+	}
 
 	logDir := xdgLogDir()
 	if err := os.MkdirAll(logDir, 0o750); err != nil {

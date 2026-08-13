@@ -937,6 +937,8 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	litmusBin := f.String("litmus", "atomscan", "path to the Atomdrift Scan binary (atomscan; codename litmus; pass empty to disable)")
 	litmusWorkers := f.Int("workers", 56, "concurrent analysis workers for the local atomscan worker (0 = auto: min(2, cores/2))")
 	// Remote litmus workers self-register via the pull API; no --litmus-nodes flag needed.
+	litmusLLM := f.String("litmus-llm", os.Getenv("SCAN_LLM"),
+		"OpenAI-compatible endpoint enabling the local atomscan worker's --interpret pass, as the remote fleet runs it (defaults to $SCAN_LLM; empty disables the pass and stores no llm_result)")
 	maxRSSGB := f.Int("max-memory-gb", 48,
 		"local atomscan worker RSS limit in GB, forwarded as --max-rss-gb (0 = auto: let atomscan self-throttle, -1 = disable in-process throttling)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
@@ -1139,6 +1141,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 			Bin:        *litmusBin,
 			HopperURL:  hopperURL,
 			DataDir:    *dataDir,
+			LLMURL:     *litmusLLM,
 			MaxRSSGB:   *maxRSSGB,
 			MaxWorkers: *litmusWorkers,
 			Verbose:    *litmusVerbose,

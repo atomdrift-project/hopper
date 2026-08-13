@@ -20,6 +20,10 @@
 #   MAX_MEMORY_GB  --max-memory-gb    atomscan RSS cap in GB, forwarded as
 #                 --max-rss-gb (default: 0 = defer to hopper's built-in cap of
 #                 48 GB; -1 = disable in-process throttling)
+#   LLM       --litmus-llm  OpenAI-compatible endpoint for the local atomscan
+#                 worker's --interpret pass, matching the remote fleet's LLM
+#                 default. Empty disables the pass (no llm_result written).
+#                                    (default: http://10.9.8.149:8000/v1)
 #   DATASET_INCOMPLETE  --dataset-incomplete  (default: 1) non-authoritative
 #                 posture: never mark locally-absent files skip='missing'.
 #                 Set 0 for a node that owns the full sample tree.
@@ -54,6 +58,9 @@ MAX_MEMORY_GB="${MAX_MEMORY_GB:-0}"
 # hopper must never mark locally-absent files skip='missing'. Set
 # DATASET_INCOMPLETE=0 to deploy an authoritative node that owns the whole tree.
 DATASET_INCOMPLETE="${DATASET_INCOMPLETE:-1}"
+# Same default endpoint the scan fleet's worker installers use (their LLM var);
+# keep the two in step so every worker interprets against one model.
+LLM="${LLM:-http://10.9.8.149:8000/v1}"
 PULL_DISABLE="${PULL_DISABLE:-0}"
 
 readonly SERVICE_USER=hopper
@@ -347,6 +354,14 @@ max_mem_arg=""
 dataset_arg=""
 [[ "${DATASET_INCOMPLETE}" != "0" ]] && dataset_arg=" --dataset-incomplete"
 
+# --litmus-llm turns on the local worker's LLM interpretation pass, the same
+# pass every remote fleet worker runs (scan's scripts/worker/* pass --interpret
+# with SCAN_LLM). Without it this worker — which claims the largest share of the
+# queue — stores no llm_result, leaving hostile samples with a verdict and no
+# rationale on prism's /fallout page. Set LLM= to disable.
+llm_arg=""
+[[ -n "${LLM}" ]] && llm_arg=" --litmus-llm ${LLM}"
+
 cat >"$tmp_unit" <<EOF
 [Unit]
 Description=Hopper sample ingester (spawns Atomdrift Scan workers)
@@ -377,7 +392,7 @@ CacheDirectory=${SERVICE_NAME}
 CacheDirectoryMode=0750
 
 WorkingDirectory=%S/${SERVICE_NAME}
-ExecStart=${BIN_PATH} load --data ${DATA_DIR} --db ${DB} --source ${SOURCE} --dashboard-addr ${DASH_ADDR} --litmus ${SCAN_BIN} --cleave ${CLEAVE_BIN}${dataset_arg}${workers_arg}${max_mem_arg}
+ExecStart=${BIN_PATH} load --data ${DATA_DIR} --db ${DB} --source ${SOURCE} --dashboard-addr ${DASH_ADDR} --litmus ${SCAN_BIN} --cleave ${CLEAVE_BIN}${dataset_arg}${workers_arg}${max_mem_arg}${llm_arg}
 Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=60s

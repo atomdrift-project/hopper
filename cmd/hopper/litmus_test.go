@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -218,4 +219,32 @@ func TestSweepStaleLitmusLogs(t *testing.T) {
 func TestSweepStaleLitmusLogsMissingDir(t *testing.T) {
 	t.Parallel()
 	sweepStaleLitmusLogs(filepath.Join(t.TempDir(), "absent"))
+}
+
+// TestWorkerArgsInterpret pins the LLM pass onto the local worker. It ran for
+// months without --interpret while every remote fleet worker had it, so the
+// worker claiming the largest share of the queue wrote no llm_result at all —
+// invisible at runtime, because a scan with no interpretation succeeds exactly
+// like one with it. The endpoint gate is the other half: bare --interpret aims
+// at localhost:8000 and a missing endpoint costs a health-gate wait per sample.
+func TestWorkerArgsInterpret(t *testing.T) {
+	t.Parallel()
+
+	has := func(args []string, want string) bool {
+		return slices.Contains(args, want)
+	}
+
+	configured := newLitmusServer(litmusConfig{
+		HopperURL: "http://127.0.0.1:8081",
+		LLMURL:    "http://10.9.8.149:8000/v1",
+	})
+	args := configured.workerArgs()
+	if !has(args, "--interpret") {
+		t.Errorf("configured endpoint must pass --interpret, got %v", args)
+	}
+
+	off := newLitmusServer(litmusConfig{HopperURL: "http://127.0.0.1:8081"})
+	if args := off.workerArgs(); has(args, "--interpret") {
+		t.Errorf("no endpoint must leave --interpret off, got %v", args)
+	}
 }
