@@ -3694,6 +3694,30 @@ func (db *DB) triageAcquitPG(ctx context.Context, limit int, createdBefore time.
 	return scanPGSamples(rows)
 }
 
+// triageFalloutPG: see TriageFallout. litmus_result IS NOT NULL is implied by
+// litmus_class = 2 (the trigger derives the class from the result) but stated
+// so the predicate reads against the feed query it mirrors.
+func (db *DB) triageFalloutPG(ctx context.Context, limit int, createdAfter time.Time, f TriageFilter) ([]*Sample, error) {
+	extra, fargs := triageFilterClausePG(f, 2)
+	args := append([]any{createdAfter}, fargs...)
+	args = append(args, limit)
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples
+		 WHERE litmus_class = 2 AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL
+		   AND skip = '' AND file_type <> 'registry'
+		   AND created_at > $1
+		   AND (llm_result IS NULL OR COALESCE(llm_result->>'interpretation', '') = '')
+		   AND NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'fallout')
+		   AND `+uncontainedSQL+extra+`
+		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage fallout: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
 func (db *DB) conflictReviewPG(ctx context.Context, _, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples

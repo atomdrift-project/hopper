@@ -2812,6 +2812,35 @@ func (db *DB) triageAcquitSQLite(ctx context.Context, limit int, createdBefore t
 	return scanLiteSamples(rows)
 }
 
+// triageFalloutSQLite: see TriageFallout. Mirrors triageFalloutPG; SQLite has
+// no litmus_class column, so the class derives inline (litmusClassSQLite, two
+// leading ? args).
+func (db *DB) triageFalloutSQLite(ctx context.Context, limit int, createdAfter time.Time, f TriageFilter) ([]*Sample, error) {
+	extra, fargs := triageFilterClauseSQLite(f)
+	args := []any{CriticalLevel, SuspiciousCeiling, createdAfter.UTC().Format(time.RFC3339Nano)}
+	args = append(args, fargs...)
+	args = append(args, limit)
+	//nolint:gosec // G202: predicates and column list are constant; filter values are parameterized via ? args
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleCols+` FROM samples
+		 WHERE `+litmusClassSQLite+` = 2 AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL
+		   AND skip = '' AND file_type <> 'registry'
+		   AND created_at > ?
+		   AND (llm_result IS NULL OR COALESCE(json_extract(llm_result, '$.interpretation'), '') = '')
+		   AND NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'fallout')
+		   AND parent = '' AND NOT EXISTS (
+		     SELECT 1 FROM sample_locations sl
+		      WHERE sl.sha256 = samples.sha256
+		        AND sl.parent_sha256 <> '' AND sl.rel IN `+containmentRelsSQL+`)`+extra+`
+		 `+triageOrderSQL(f)+` LIMIT ?`,
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage fallout: %w", err)
+	}
+	return scanLiteSamples(rows)
+}
+
 func (db *DB) conflictReviewSQLite(ctx context.Context, _, limit int) ([]*Sample, error) {
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples

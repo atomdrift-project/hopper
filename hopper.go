@@ -3679,6 +3679,30 @@ func (db *DB) TriageSighted(ctx context.Context, limit int, f TriageFilter) ([]*
 	return db.triageSightedSQLite(ctx, limit, f)
 }
 
+// TriageFallout returns analyzed top-level litmus-hostile samples (class 2)
+// carrying no LLM interpretation — llm_result is NULL or its interpretation is
+// empty (a failed pass stores only an error) — taking up to limit of the most
+// recently added (created_at), restricted to rows created after createdAfter.
+// This is the population prism's /fallout page renders with no rationale line:
+// litmus classified the bytes hostile but no reasoning pass ever ran (arrivals
+// outpace the new queue, which ranks a litmus-hostile sample no higher than any
+// other suspicious unknown) or the pass failed. There is deliberately no label
+// predicate — the page has none either, and most of the population is unlabeled.
+// Two drains: storing an interpretation (the write-back scan's interpret pass)
+// removes the row from the predicate, and rows carrying a reports row of type
+// "fallout" are skipped permanently — the reviewer files it on a completed
+// judgement, which covers samples whose interpret pass errors (large renders
+// overflow the endpoint) and would otherwise re-select every cooldown until
+// they aged out of the createdAfter window.
+// Registry sidecars are excluded and containment is judged by the
+// sample_locations ledger, both mirroring the feed query the page is built on.
+func (db *DB) TriageFallout(ctx context.Context, limit int, createdAfter time.Time, f TriageFilter) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.triageFalloutPG(ctx, limit, createdAfter, f)
+	}
+	return db.triageFalloutSQLite(ctx, limit, createdAfter, f)
+}
+
 // TrustedBadSources are the sighting sources that independently host or curate
 // malware rather than merely predict it — forager's straight-to-bad feeds
 // (ThreatFeed Category "bad") plus the hash corpora it records via

@@ -448,6 +448,24 @@ if [ "$sub_exists" = "1" ]; then
         die "subscription '$SUBSCRIPTION' uses replication slot '$current_slot', expected '$SUBSCRIPTION'; rebuild the local replica instead of refreshing across a slot rename"
     fi
 
+    # The subscription's slot is created exactly once, by CREATE SUBSCRIPTION.
+    # If it has since been dropped upstream (manual cleanup, or an invalidated
+    # slot reaped during an ENOSPC recovery), NOTHING below can bring it back:
+    # ALTER ... CONNECTION / SET PUBLICATION / ENABLE / REFRESH all leave the
+    # slot alone, so the apply worker just crash-loops on "replication slot
+    # does not exist" and setup.sh reports a misleading partial success. Bail
+    # out here pointing at the only real fix. Counterpart of the orphan-slot
+    # drop below (slot without subscription); this is subscription without slot.
+    remote_slot=$(psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" -tAc \
+        "SELECT 'slot:' || count(*) FROM pg_replication_slots WHERE slot_name = '$SUBSCRIPTION'" \
+        2>/dev/null | tr -d '[:space:]')
+    case "$remote_slot" in
+        slot:0)
+            die "replication slot '$SUBSCRIPTION' no longer exists on $REMOTE_HOST, so this subscription can never reconnect (refreshing cannot recreate a slot). Recreating it would silently skip every change since the slot was dropped — including deletes — so an incremental resume is unsafe. Rebuild instead: make rebuild-replica FORCE=true" ;;
+        slot:*) ;;
+        *) log "warning: could not read replication slots on $REMOTE_HOST — proceeding without the missing-slot check" ;;
+    esac
+
     log "Subscription '$SUBSCRIPTION' exists — refreshing connection + tables"
     admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
         -v sub="$SUBSCRIPTION" \
@@ -497,26 +515,42 @@ SQL
 fi
 
 # --- Sanity: confirm data is actually flowing ------------------------------
-# The apply worker is asynchronous, so give it a beat before reading status.
-sleep 2
-
 log "Replication status:"
 
 # Main apply worker status. pg_stat_subscription has one row per worker —
 # the apply worker (relid IS NULL) plus one tablesync worker per table during
 # initial copy — so we filter to just the apply worker here. pid NULL means
 # it hasn't registered yet.
-admin -d "$LOCAL_DB" -v sub="$SUBSCRIPTION" -tA <<'SQL' | sed 's/^/    /'
-SELECT 'apply worker: ' ||
-    CASE WHEN pid IS NULL THEN 'not connected yet (check logs if this persists)'
-         ELSE format('pid=%s received_lsn=%s latest_end_lsn=%s',
-                     pid,
-                     COALESCE(received_lsn::text,   '0/0'),
-                     COALESCE(latest_end_lsn::text, '0/0'))
-    END
+#
+# The worker is asynchronous, so poll rather than sleeping once: a worker that
+# is crash-looping (each incarnation dying in well under a second) reads as
+# "pid IS NULL" on any single sample, which used to be reported as a benign
+# startup race. Treat a worker that never appears as the failure it is.
+apply_status=''
+i=0
+while [ "$i" -lt 10 ]; do
+    apply_status=$(admin -d "$LOCAL_DB" -v sub="$SUBSCRIPTION" -tA <<'SQL' | tr -d '\r'
+SELECT format('pid=%s received_lsn=%s latest_end_lsn=%s',
+              pid,
+              COALESCE(received_lsn::text,   '0/0'),
+              COALESCE(latest_end_lsn::text, '0/0'))
   FROM pg_stat_subscription
-  WHERE subname = :'sub' AND relid IS NULL;
+  WHERE subname = :'sub' AND relid IS NULL AND pid IS NOT NULL;
 SQL
+    )
+    [ -n "$apply_status" ] && break
+    i=$((i + 1))
+    sleep 2
+done
+
+if [ -n "$apply_status" ]; then
+    printf '    apply worker: %s\n' "$apply_status"
+else
+    printf '    apply worker: NOT RUNNING after 20s — replication is DOWN, not starting up.\n'
+    printf '    Check the subscriber log for the repeating error, e.g.:\n'
+    printf '        journalctl -u postgresql -n 50 | grep -i "logical replication"\n'
+    SETUP_FAILED=1
+fi
 
 # Per-table: sync state + exact row count. quote_ident() makes the identifier
 # shell/SQL-safe for the follow-up count query.
@@ -580,6 +614,14 @@ if [ -n "${BULK_DEFERRED:-}" ]; then
     # shellcheck disable=SC2086 # intentional word-split of the table list
     bulkload_finish $BULK_DEFERRED \
         || log "warning: fast-sync did not finish cleanly — check messages above and $( { [ -n "${HEAL_DIR:-}" ] && printf '%s/bulkload' "$HEAL_DIR"; } || printf 'the bulkload state dir')"
+fi
+
+if [ -n "${SETUP_FAILED:-}" ]; then
+    log "FAILED: the schema/subscription steps ran, but the apply worker is not"
+    log "        running, so this replica is NOT replicating. Re-running this"
+    log "        script will not change that — diagnose the error first:"
+    log "        make diagnose-replica REMOTE_HOST=$REMOTE_HOST SUBSCRIPTION=$SUBSCRIPTION"
+    exit 1
 fi
 
 log "Done. Re-run anytime — this script is idempotent."
