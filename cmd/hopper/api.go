@@ -1973,10 +1973,15 @@ func validSHA256(s string) bool {
 }
 
 // uploadResponse is the JSON body returned by POST /api/upload.
+// uploadResponse answers /api/upload. ProvenanceApplied separates the two things
+// an upload can accomplish — storing bytes and refreshing metadata — so a
+// producer can tell a sidecar that landed from one that did not. Without it a
+// re-send of known bytes and a genuine first store are indistinguishable 200s.
 type uploadResponse struct {
-	SHA256          string `json:"sha256"`
-	AlreadyAnalyzed bool   `json:"already_analyzed"`
-	Size            int64  `json:"size"`
+	SHA256            string `json:"sha256"`
+	AlreadyAnalyzed   bool   `json:"already_analyzed"`
+	ProvenanceApplied bool   `json:"provenance_applied"`
+	Size              int64  `json:"size"`
 }
 
 // sanitizeUploadFilename returns a safe on-disk filename component, or ""
@@ -2577,24 +2582,23 @@ func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request
 	writeJSONError(w, http.StatusBadRequest, `{"error":"missing file part"}`)
 }
 
-// storeProvenanceOnly attaches or refreshes a provenance sidecar on an existing
-// sample hopper already holds the bytes for (e.g. a dependency re-fetched by a
-// scan). No bytes move; the sample is matched by the sidecar's artifact.sha256.
-// When the row already carries provenance, the incoming sidecar is merged in
-// (see [hopper.Sidecar.MergeRefresh]): the registry snapshot is refreshed while
-// the original discovery wrapper — the Feed that recorded how the dependency was
-// first found — is preserved. A sample hopper doesn't have is left untouched. The
-// incoming sidecar was Finalized and Validated by the caller.
-func (s *apiServer) storeProvenanceOnly(w http.ResponseWriter, r *http.Request, prov *hopper.Sidecar) {
+// refreshProvenance merges an incoming sidecar onto whatever the row already
+// carries and writes the result, reporting whether a row matched. It is the only
+// writer for a provenance refresh, because the sample upsert deliberately is not
+// one: sampleConflictUpdatePG keeps a stored sidecar over an incoming one, which
+// is right for the walker (a later filesystem walk carries no provenance, so
+// first-write-wins protects the collector's capture-time record) and wrong for a
+// producer sending a newer registry snapshot. Routing both upload shapes through
+// here keeps them from disagreeing about what an accepted sidecar does.
+//
+// Merging preserves the original discovery wrapper — the Feed that recorded how
+// the dependency was first found — while swapping the registry snapshot (see
+// [hopper.Sidecar.MergeRefresh]). The read-then-write can race a concurrent
+// refresh; both preserve the same prior Feed, so the worst case is a lost
+// registry update recovered on the next scan, acceptable for best-effort
+// provenance. The incoming sidecar was Finalized and Validated by the caller.
+func (s *apiServer) refreshProvenance(ctx context.Context, prov *hopper.Sidecar) (bool, error) {
 	sha := prov.Artifact.SHA256 // Validate() guarantees 64 lowercase hex
-	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
-	defer cancel()
-
-	// Merge onto any prior sidecar so a refresh keeps the original discovery
-	// channel and only swaps the registry snapshot. A read-then-write here can
-	// race a concurrent refresh; both preserve the same prior Feed, so the worst
-	// case is a lost registry update recovered on the next scan — acceptable for
-	// best-effort provenance.
 	toStore := prov
 	if existingRaw, err := s.db.ProvenanceBySHA256(ctx, sha); err == nil && len(existingRaw) > 0 {
 		var existing hopper.Sidecar
@@ -2603,19 +2607,40 @@ func (s *apiServer) storeProvenanceOnly(w http.ResponseWriter, r *http.Request, 
 			existing.Finalize()
 			toStore = &existing
 		} else {
-			slog.WarnContext(r.Context(), "provenance refresh: unparseable prior sidecar; overwriting",
+			slog.WarnContext(ctx, "provenance refresh: unparseable prior sidecar; overwriting",
 				"sha256", sha, "error", err)
 		}
 	}
-
 	// Reuse the upload projection (provenance JSONB + scalar identity columns,
 	// including purl_base); SetProvenance only reads those, never the
 	// path/label/source fields, so the existing row's bytes and verdict are safe.
-	sample := uploadSample(sha, toStore.Artifact.Filename, "", toStore.Artifact.SizeBytes, toStore)
-	applied, err := s.db.SetProvenance(ctx, sample)
+	return s.db.SetProvenance(ctx, uploadSample(sha, toStore.Artifact.Filename, "", toStore.Artifact.SizeBytes, toStore))
+}
+
+// storeProvenanceOnly attaches or refreshes a provenance sidecar on a sample
+// hopper already holds the bytes for (e.g. a dependency re-fetched by a scan).
+// No bytes move; the sample is matched by the sidecar's artifact.sha256.
+//
+// A digest hopper has no row for is a 404, not a 200: there is nothing to attach
+// the sidecar to, so reporting success would tell the producer its metadata had
+// landed when the request changed nothing. Producers negotiate with /api/known
+// first, so this fires only when the row went away in between — which is worth a
+// log line rather than a silent no-op.
+func (s *apiServer) storeProvenanceOnly(w http.ResponseWriter, r *http.Request, prov *hopper.Sidecar) {
+	sha := prov.Artifact.SHA256 // Validate() guarantees 64 lowercase hex
+	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
+	defer cancel()
+
+	applied, err := s.refreshProvenance(ctx, prov)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "upload: set provenance", "sha256", sha, "error", err)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		return
+	}
+	if !applied {
+		slog.WarnContext(r.Context(), "provenance backfill rejected: no such sample",
+			"sha256", sha, "collector", prov.Fetch.Collector, "purl", prov.Package.PURL, "remote", r.RemoteAddr)
+		writeJSONError(w, http.StatusNotFound, `{"error":"unknown sample"}`)
 		return
 	}
 	slog.InfoContext(r.Context(), "provenance set", "sha256", sha, "applied", applied)
@@ -2744,18 +2769,44 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 		return
 	}
 
+	// A sidecar arriving with bytes must land the same way it would have arrived
+	// alone: the upsert above keeps a stored sidecar over an incoming one, so
+	// without this the producer that sent more (bytes AND metadata) would
+	// accomplish less than the one that sent metadata alone, and both would be
+	// answered with an identical 200.
+	//
+	// Unconditional, rather than skipped for rows this request created. Whether
+	// the row pre-existed is not knowable here: the lookup above tolerates its
+	// own failure, and a concurrent producer can insert between it and the
+	// upsert. Both would report a sidecar as applied that never was — the same
+	// lie in a new place, and an intermittent one that surfaces only under the DB
+	// contention this path already retries through. At ~120 such uploads a day
+	// the redundant write is not worth reasoning about; an observed result is.
+	// Best-effort: the bytes and the row are already durable, so a failed refresh
+	// is reported, not fatal.
+	var provApplied bool
+	if prov != nil {
+		applied, refreshErr := s.refreshProvenance(storeCtx, prov)
+		if refreshErr != nil {
+			slog.Error("upload: refresh provenance", "sha256", sha, "error", refreshErr)
+		}
+		provApplied = applied
+	}
+
 	//nolint:gosec // structured logging; filename sanitized, remote is r.RemoteAddr
 	slog.Info("upload accepted",
 		"sha256", sha, "size", written, "filename", filename,
-		"has_provenance", prov != nil, "already_analyzed", alreadyAnalyzed, "remote", r.RemoteAddr)
+		"has_provenance", prov != nil, "provenance_applied", provApplied,
+		"already_analyzed", alreadyAnalyzed, "remote", r.RemoteAddr)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(uploadResponse{ //nolint:errcheck,errchkjson // best-effort response
-		SHA256:          sha,
-		Size:            written,
-		AlreadyAnalyzed: alreadyAnalyzed,
+		SHA256:            sha,
+		Size:              written,
+		AlreadyAnalyzed:   alreadyAnalyzed,
+		ProvenanceApplied: provApplied,
 	})
 }
 
