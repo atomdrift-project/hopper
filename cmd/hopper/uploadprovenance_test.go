@@ -152,6 +152,62 @@ func TestUploadRefreshesRowFromAnotherWriter(t *testing.T) {
 	}
 }
 
+// TestUploadAdoptsDiscoveryFeedFromLaterProducer is what the refresh buys in
+// production. forager and a scan worker reach the same artifact independently,
+// and only forager's sidecar carries the discovery Feed — how the package was
+// first seen. forager skips bytes for a sha hopper already holds, so this fires
+// when its /api/known probe and its upload straddle another producer's insert:
+// it sends bytes + a Feed-carrying sidecar for a sha that just became known.
+//
+// forager has no provenance-only shape (pkg/forager/upload.go always writes both
+// a "provenance" and a "file" part), so the bytes path is the only way its Feed
+// can ever reach hopper. Dropping the sidecar there lost the discovery record
+// outright, with an "upload accepted" 200 over it.
+func TestUploadAdoptsDiscoveryFeedFromLaterProducer(t *testing.T) {
+	t.Parallel()
+	api := uploadAPI(t)
+	file := []byte("package both producers found")
+	sum := sha256.Sum256(file)
+	sha := hex.EncodeToString(sum[:])
+
+	// scan gets there first: a sidecar with a registry snapshot but no Feed.
+	scanSide := refreshSidecar(sha, len(file), "npm-old")
+	body, ct := multipartUpload(t, mustJSON(t, scanSide), file, true)
+	if w := postUpload(t, api, body, ct); w.Code != http.StatusOK {
+		t.Fatalf("scan upload: code=%d body=%s", w.Code, w.Body.String())
+	}
+
+	// forager follows with the same bytes and the discovery Feed.
+	foragerSide := refreshSidecar(sha, len(file), "npm-new")
+	foragerSide.Fetch.Collector = "forager+test"
+	foragerSide.Feed = &hopper.MetadataRecord{
+		SourceID: "npm-firehose", Format: "npm.event",
+		URL: "https://npm/feed", Status: hopper.MetadataComplete,
+	}
+	body2, ct2 := multipartUpload(t, mustJSON(t, foragerSide), file, true)
+	if w := postUpload(t, api, body2, ct2); w.Code != http.StatusOK {
+		t.Fatalf("forager upload: code=%d body=%s", w.Code, w.Body.String())
+	}
+
+	raw, err := api.db.ProvenanceBySHA256(context.Background(), sha)
+	if err != nil {
+		t.Fatalf("ProvenanceBySHA256: %v", err)
+	}
+	var got hopper.Sidecar
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal stored sidecar: %v", err)
+	}
+	if got.Feed == nil {
+		t.Fatal("discovery feed dropped: forager's sidecar arrived with bytes and was discarded")
+	}
+	if got.Feed.SourceID != "npm-firehose" {
+		t.Errorf("feed source_id = %q, want %q", got.Feed.SourceID, "npm-firehose")
+	}
+	if got.Registry.SourceID != "npm-new" {
+		t.Errorf("registry source_id = %q, want %q", got.Registry.SourceID, "npm-new")
+	}
+}
+
 // TestUploadShapesAgreeOnProvenance is the invariant the two shapes kept
 // breaking: for bytes hopper already holds, sending the sidecar with the file
 // and sending it alone must leave the same sidecar stored. The producer that
