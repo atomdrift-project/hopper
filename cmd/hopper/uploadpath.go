@@ -32,10 +32,17 @@ import (
 // bytes were served from is a fact about the fetch, recorded on the row, not
 // part of what the package is.
 const (
-	// uploadBucket is the pool an upload enters. Analysis, not the producer,
-	// decides a sample's label, so every upload starts unlabelled and promoter
-	// moves it later.
-	uploadBucket = "unknown"
+	// pendingPool is the cold unreviewed sample pool. Samples here still carry
+	// the DB classification label "unknown"; the directory names workflow state.
+	pendingPool = "pending"
+	// reviewPool is the cold human/extra-review queue, also label "unknown".
+	reviewPool = "review"
+	// legacyUnknownPool is the pre-pending storage root retained for old rows.
+	legacyUnknownPool = "unknown"
+	// uploadBucket is the hot pool an upload enters. Analysis, not the producer,
+	// decides a sample's label, so every upload starts unlabelled. Draino later
+	// moves old paths to pending/ without changing the suffix or verdict.
+	uploadBucket = "incoming"
 	// coordinateTier holds samples keyed by an immutable package coordinate.
 	coordinateTier = "pkg"
 	// digestTier holds samples keyed by their content hash.
@@ -55,18 +62,22 @@ var uploadProducers = []string{"forager", "prism", "scan"}
 
 func isUploadProducer(name string) bool { return slices.Contains(uploadProducers, name) }
 
+func isUnknownStorageRoot(name string) bool {
+	return name == legacyUnknownPool || name == pendingPool || name == reviewPool || name == uploadBucket
+}
+
 // uploadRelDir returns the directory an upload is stored in, relative to the
 // data root, along with whether that directory is derived from the digest.
 //
 // digestKeyed is what makes an existing file at the target safe to keep: when
 // the path contains the full sha, any occupant is necessarily these same bytes.
-// In the coordinate tier — and in the legacy shard, which is keyed on only the
+// In the coordinate tier — and in the fallback shard, which is keyed on only the
 // first four hex digits — an occupant may belong to a different sample, and the
 // caller must not overwrite it.
 func uploadRelDir(sha string, prov *hopper.Sidecar) (dir string, digestKeyed bool) {
 	// The collector names the producer, either bare or with an instance
 	// ("scan+build07", "forager+0a45da172e3f"). An absent or unlisted one leaves
-	// producer outside the allowlist and falls to the legacy root.
+	// producer outside the allowlist and falls to the fallback root.
 	var producer string
 	if prov != nil {
 		producer, _, _ = strings.Cut(prov.Fetch.Collector, "+")

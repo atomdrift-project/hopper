@@ -119,8 +119,9 @@ func TestStartEnumerationSkipsStaging(t *testing.T) {
 	sample := filepath.Join(dir, "pkg-1.0.0.tgz")
 	staged := filepath.Join(dir, stagingDirName, "pkg-unpkg.tgz")     // in a .tmp staging dir
 	legacy := filepath.Join(dir, "evil-pkg"+legacyUnpkgScratchSuffix) // pre-staging scratch name
+	drainoTemp := filepath.Join(dir, drainoPartialPrefix+"1234")
 	mustMkdirAll(t, filepath.Dir(staged))
-	for _, p := range []string{sample, staged, legacy} {
+	for _, p := range []string{sample, staged, legacy, drainoTemp} {
 		if err := os.WriteFile(p, []byte("data"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -145,11 +146,12 @@ func TestIsStagingPath(t *testing.T) {
 		{"good/.tmp/x.tgz", true},
 		{".tmp/x.tgz", true},
 		{"good/.partial-1104359443", true}, // legacy vendor-fetch scratch file
+		{"pending/foraged/.draino-1104359443", true},
 		{"bad/foraged/javascript/npmjs.org/kmsec.uk/chalk-pro/chalk-pro-unpkg-tmp.tgz", true},
 		{"bad/foraged/pkg-1.0.0.tgz", false},
 		{"good/foo.tmp.tgz", false},            // ".tmp" as a substring, not a path component
 		{"good/foo.partial-1104359443", false}, // prefix must match the basename
-		{"unknown/uploads/sample.bin", false},
+		{"incoming/uploads/sample.bin", false},
 		{"", false},
 	}
 	for _, tt := range tests {
@@ -803,6 +805,33 @@ func TestCmdLoadGood(t *testing.T) {
 	}
 	if counts["good"] != 1 {
 		t.Errorf("good count = %d, want 1", counts["good"])
+	}
+}
+
+func TestCmdLoadIncoming(t *testing.T) {
+	useTestPathLister(t)
+	ctx := t.Context()
+	dbPath := filepath.Join(t.TempDir(), "load-incoming.db")
+	data := t.TempDir()
+	mustMkdir(t, filepath.Join(data, "incoming"))
+	mustMkdir(t, filepath.Join(data, "incoming", "bad"))
+	mustMkdir(t, filepath.Join(data, "incoming", "bad", "foraged"))
+	mustWriteFile(t, filepath.Join(data, "incoming", "bad", "foraged", "fresh.bin"), []byte("new sample bytes"))
+
+	withArgs([]string{"hopper", "load", "-db", dbPath, "-data", data, "-workers", "1", "-litmus", "", "-dashboard-addr", "", "-no-cache"}, func() {
+		if err := cmdLoad(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	db := mustOpenDB(t, ctx, dbPath)
+	defer db.Close()
+	samples, err := db.SamplesByLabel(ctx, "unknown", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 1 || !strings.HasPrefix(filepath.ToSlash(samples[0].Path), "incoming/bad/foraged/") {
+		t.Fatalf("incoming samples = %+v", samples)
 	}
 }
 
@@ -1723,8 +1752,8 @@ func TestExtractPathProvenance(t *testing.T) {
 		{
 			// forager writes a scoped name as two directory levels, so the
 			// package is everything past the feed — not just the scope.
-			name:  "foraged scoped name spans two components",
-			path:  "/srv/data/unknown/foraged/javascript/npmjs.org/_/@vue/cli/cli-5.0.0.tgz",
+			name:  "pending foraged scoped name spans two components",
+			path:  "/srv/data/pending/foraged/javascript/npmjs.org/_/@vue/cli/cli-5.0.0.tgz",
 			label: "unknown",
 			want: pathProvenance{
 				ecosystem: "javascript",
@@ -1759,7 +1788,7 @@ func TestExtractPathProvenance(t *testing.T) {
 		},
 		{
 			name:  "reviewed upload keeps its origin domain",
-			path:  "/srv/data/unknown/foraged-bad-review/sha/example.com/3f/a9/3fa9c1/tool.tgz",
+			path:  "/srv/data/review/foraged-bad-review/sha/example.com/3f/a9/3fa9c1/tool.tgz",
 			label: "unknown",
 			want:  pathProvenance{domain: "example.com"},
 		},

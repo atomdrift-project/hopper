@@ -915,7 +915,7 @@ func cmdReset(ctx context.Context) error {
 func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,gocognit // complex command setup function.
 	f := flag.NewFlagSet("load", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
-	dataDir := f.String("data", "", "data directory containing bad/, good/, unknown/ subdirectories")
+	dataDir := f.String("data", "", "data directory containing bad/, good/, sighted/, incoming/, pending/, review/, or legacy unknown/ subdirectories")
 	source := f.String("source", hopper.SourceFilesystem,
 		"source tag for top-level rows this walk inserts that no collector already recorded "+
 			"(default \"fs\"; forager direct-inserts its own rows as \"forager\")")
@@ -974,7 +974,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	}
 
 	if *dataDir == "" {
-		return errors.New("pass --data <directory> (expects bad/, good/, unknown/ subdirectories)")
+		return errors.New("pass --data <directory> (expects sample pool subdirectories such as incoming/, pending/, or review/)")
 	}
 
 	// Resolve symlinks and make absolute early so that all paths derived
@@ -1053,15 +1053,18 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	setupWorkerCgroup(*maxRSSGB)
 	wd.beginStage("discover", "Discovering label directories")
 
-	// Discover label directories under --data.
-	// Convention: each pool directory maps 1:1 to its label — bad/, good/,
-	// sighted/ (feed claims pending verification), unknown/.
+	// Discover label directories under --data. bad/, good/, and sighted/ map
+	// directly to classification labels. pending/, review/, legacy unknown/,
+	// and incoming/ are workflow/storage roots for unclassified samples.
 	var loadDirs []struct{ dir, label string }
 	for _, entry := range []struct{ name, label string }{
 		{"bad", "bad"},
 		{"good", "good"},
 		{"sighted", "sighted"},
-		{"unknown", "unknown"},
+		{pendingPool, "unknown"},
+		{reviewPool, "unknown"},
+		{legacyUnknownPool, "unknown"},
+		{uploadBucket, "unknown"},
 	} {
 		dir := filepath.Join(*dataDir, entry.name)
 		if info, err := os.Stat(dir); err == nil && info.IsDir() {
@@ -1069,8 +1072,8 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		}
 	}
 	if len(loadDirs) == 0 {
-		wd.failStage("discover", fmt.Sprintf("no bad/, good/, sighted/, or unknown/ in %s", *dataDir))
-		return fmt.Errorf("no bad/, good/, sighted/, or unknown/ subdirectories found in %s", *dataDir)
+		wd.failStage("discover", fmt.Sprintf("no bad/, good/, sighted/, pending/, review/, unknown/, or incoming/ in %s", *dataDir))
+		return fmt.Errorf("no bad/, good/, sighted/, pending/, review/, unknown/, or incoming/ subdirectories found in %s", *dataDir)
 	}
 	wd.endStage("discover")
 
@@ -1927,9 +1930,9 @@ func runDirPipeline(
 		if isForagerSidecar(filepath.Base(lp.path)) {
 			continue
 		}
-		lp.label = target.label
 		progress.walked.Add(1)
 		storedPath := filepath.ToSlash(relativeSamplePath(filepath.Dir(target.dir), lp.path))
+		lp.label = target.label
 
 		hr, err := hashFile(ctx, lp.path, lp.label, lp.fileType, source, cache, progress)
 		if err != nil {
@@ -2661,14 +2664,22 @@ const legacyUnpkgScratchSuffix = "-unpkg-tmp.tgz"
 // under .tmp instead.
 const legacyPartialScratchPrefix = ".partial-"
 
+// drainoPartialPrefix names destination-side temporary hard links created
+// before Draino publishes a verified cross-filesystem copy. A crash may leave
+// one behind; it is recovery residue, never a distinct sample.
+const drainoPartialPrefix = ".draino-"
+
 // isStagingPath reports whether path is a transient artifact that enumeration
-// must not ingest: anything inside a stagingDirName component, or a legacy
-// unpkg/partial scratch file sitting beside real samples.
+// must not ingest: anything inside a stagingDirName component, or a known
+// writer's temporary file sitting beside real samples.
 func isStagingPath(path string) bool {
 	if strings.HasSuffix(path, legacyUnpkgScratchSuffix) {
 		return true
 	}
 	if strings.HasPrefix(filepath.Base(path), legacyPartialScratchPrefix) {
+		return true
+	}
+	if strings.HasPrefix(filepath.Base(path), drainoPartialPrefix) {
 		return true
 	}
 	// Match stagingDirName as a whole path component, not a substring, so a
@@ -3111,9 +3122,9 @@ func extractPathProvenance(path, label string) pathProvenance {
 var promotionTrees = []string{
 	"foraged-promote",           // good/: ruled good
 	"foraged-quarantine",        // bad/: ruled bad
-	"foraged-suspicious-review", // unknown/: promoter's LLM tier wants a human
-	"foraged-undetermined",      // unknown/: the LLM could not grade it
-	"foraged-bad-review",        // unknown/: likely bad, awaiting confirmation
+	"foraged-suspicious-review", // review/: promoter's LLM tier wants a human
+	"foraged-undetermined",      // review/: the LLM could not grade it
+	"foraged-bad-review",        // review/: likely bad, awaiting confirmation
 }
 
 func isPromotionTree(marker string) bool { return slices.Contains(promotionTrees, marker) }
@@ -3125,7 +3136,7 @@ func isPromotionTree(marker string) bool { return slices.Contains(promotionTrees
 func findLayoutMarker(parts []string, label string) (marker string, idx int) {
 	labelIdx := -1
 	for i, p := range parts {
-		if p == label {
+		if p == label || (label == "unknown" && isUnknownStorageRoot(p)) {
 			labelIdx = i
 		}
 	}
@@ -3413,7 +3424,7 @@ func cmdCanonicalizePURLs(ctx context.Context) error {
 func cmdPrune(ctx context.Context) error {
 	f := flag.NewFlagSet("prune", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
-	dataDir := f.String("data", "", "data directory containing bad/, good/, unknown/ subdirectories")
+	dataDir := f.String("data", "", "fully mounted sample data root")
 	force := f.Bool("force", false, "bypass the 40%-of-rows safety cap (use only after confirming the data root is fully mounted)")
 	parseFlags(f, os.Args[2:])
 

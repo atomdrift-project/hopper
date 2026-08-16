@@ -22,7 +22,7 @@ collectors ──► hopper ──► atomscan workers
 - PostgreSQL and SQLite storage for samples, labels, provenance, and reports
 - Pull-based jobs for horizontally scaled `atomscan worker` processes
 - A file and result API with worker liveness and retry handling
-- Local filesystem ingestion from `bad/`, `good/`, and `unknown/` pools
+- Local filesystem ingestion from `bad/`, `good/`, `pending/`, `review/`, and hot `incoming/` pools
 - A dashboard for queue depth, workers, and analysis rates
 - Review, rescan, reconciliation, import, and backfill commands
 
@@ -54,7 +54,9 @@ Create a small labeled pool:
 samples/
 ├── bad/
 ├── good/
-└── unknown/
+├── incoming/
+├── pending/
+└── review/
 ```
 
 Then initialize SQLite and ingest it:

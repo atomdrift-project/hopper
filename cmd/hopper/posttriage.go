@@ -55,9 +55,12 @@ const (
 //   - Verdict ("good"|"bad") is the operator post-triage flow: the file moves
 //     into a <verdict>/mislabeled-<old-label>/ bucket (basename only) and is
 //     relabeled.
-//   - Ruling ("good"|"bad"|"sighted") is the remote flow (promoter, or the
-//     demote-sighted backfill): the file moves into the ruling's pool tree
-//     with its source subpath preserved and is relabeled. See rulingPlan.
+//   - Ruling ("good"|"bad"|"sighted") is the remote classification flow
+//     (promoter, or the demote-sighted backfill): the file moves into the
+//     ruling's pool tree with its source subpath preserved and is relabeled.
+//   - Ruling ("pending"|"review") is a workflow move within the unknown-class
+//     pools: the file moves to that pool and keeps its DB label/source/skip.
+//     See rulingPlan.
 type triageVerdict struct {
 	SHA256  string `json:"sha256"`
 	Verdict string `json:"verdict,omitempty"`
@@ -68,7 +71,7 @@ type triageVerdict struct {
 // Promotion pool layout. hopper owns where a ruled sample lands; the client
 // (promoter, or the demote-sighted backfill) sends only the abstract ruling.
 // The subpath beneath the sample's source tree is preserved into the
-// destination tree, so unknown/foraged/npm/foo.tgz promotes to
+// destination tree, so pending/foraged/npm/foo.tgz promotes to
 // good/foraged-promote/npm/foo.tgz and bad/foraged/npm/foo.tgz demotes to
 // sighted/foraged/npm/foo.tgz.
 const (
@@ -79,7 +82,7 @@ const (
 
 // promoteSrcRoots are the trees a ruled sample may start from; the first
 // matching prefix is stripped to preserve the subpath. The trailing slashes
-// keep siblings like unknown/foraged-review/ excluded, and keep bad/foraged/
+// keep path components distinct, and keep bad/foraged/
 // from shadowing bad/foraged-quarantine/.
 //
 // uploads/ is here because a scanner push is a discovery too — a fetched
@@ -95,15 +98,22 @@ const (
 // discovery root, which is why round trips through the sighted pool never
 // collapsed.
 var promoteSrcRoots = []string{
-	"unknown/foraged/",
-	"sighted/foraged/", // == sightedTree: both a discovery root and a ruling destination
+	// All hot-pool layouts share one storage lifecycle root. Strip only that
+	// root so an incoming/bad/foraged/... acquisition keeps its full suffix.
+	uploadBucket + "/",
+	pendingPool + "/foraged/",
+	pendingPool + "/",
+	reviewPool + "/",
+	legacyUnknownPool + "/foraged/",
+	sightedTree + "/",
 	"bad/foraged/",
-	"unknown/scan/",
-	"unknown/prism/",
-	"unknown/forager/",
-	"unknown/uploads/", // legacy root: rows written before the per-producer trees
+	legacyUnknownPool + "/scan/",
+	legacyUnknownPool + "/prism/",
+	legacyUnknownPool + "/forager/",
+	legacyUnknownPool + "/uploads/", // legacy root: rows written before the per-producer trees
 	uploadDirScan + "/",
 	uploadDirPrism + "/",
+	uploadDirForager + "/",
 	promoteGoodTree + "/",
 	promoteBadTree + "/",
 }
@@ -114,15 +124,17 @@ type placement struct {
 	newRel string
 	label  string
 	source string
+	// workflow is true for path-only queue moves inside unknown-class storage
+	// roots. The DB label/source/skip are preserved for these moves.
+	workflow bool
 }
 
 // rulingPlan resolves a promoter ruling to its placement: the destination path
 // (subpath preserved beneath the ruling's tree) plus the label change to apply.
 // "sighted" demotes a feed-claimed sample out of bad/ into the sighted pool,
-// pending re-promotion by evidence. ok is false for an unrecognized ruling.
-// (A "review" ruling once parked one-signal samples in unknown/foraged-review;
-// promoter now leaves them in the discovery tree so their evidence keeps
-// accumulating instead of freezing.)
+// pending re-promotion by evidence. "pending" and "review" are path-only
+// workflow moves inside label="unknown" storage. ok is false for an
+// unrecognized ruling.
 func rulingPlan(_ *hopper.Sample, oldRel, ruling string) (placement, bool) {
 	sub := filepath.Base(oldRel) // not under a source root: preserve only the basename
 	for _, root := range promoteSrcRoots {
@@ -133,13 +145,36 @@ func rulingPlan(_ *hopper.Sample, oldRel, ruling string) (placement, bool) {
 	}
 	switch ruling {
 	case "good":
-		return placement{filepath.Join(promoteGoodTree, sub), "good", "promoter"}, true
+		return placement{newRel: filepath.Join(promoteGoodTree, sub), label: "good", source: "promoter"}, true
 	case "bad":
-		return placement{filepath.Join(promoteBadTree, sub), "bad", "promoter"}, true
+		return placement{newRel: filepath.Join(promoteBadTree, sub), label: "bad", source: "promoter"}, true
 	case "sighted":
-		return placement{filepath.Join(sightedTree, sub), "sighted", "promoter"}, true
+		return placement{newRel: filepath.Join(sightedTree, sub), label: "sighted", source: "promoter"}, true
+	case "pending":
+		return workflowPlan(oldRel, pendingPool), true
+	case "review":
+		return workflowPlan(oldRel, reviewPool), true
 	}
 	return placement{}, false
+}
+
+// workflowPlan moves an unknown-class sample between workflow pools while
+// preserving the source suffix below the workflow root. It deliberately has no
+// producer-specific cases: review/foraged is just review/<suffix>.
+func workflowPlan(oldRel, dstRoot string) placement {
+	sub := filepath.Base(oldRel)
+	for _, root := range []string{
+		pendingPool + "/",
+		reviewPool + "/",
+		uploadBucket + "/",
+		legacyUnknownPool + "/",
+	} {
+		if rest, ok := strings.CutPrefix(oldRel, root); ok {
+			sub = rest
+			break
+		}
+	}
+	return placement{newRel: filepath.Join(dstRoot, sub), label: "unknown", workflow: true}
 }
 
 // triageRequest is the JSON body for POST /api/triage.
@@ -284,6 +319,10 @@ func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun
 		return res
 	}
 	res.NewPath = plan.newRel
+	if plan.workflow && oldRel == plan.newRel {
+		res.Status = "noop"
+		return res
+	}
 
 	// A partial mirror may hold the row without the bytes. Deliberately do
 	// NOT relabel DB-only: the pool directory is ground truth, and a label
@@ -303,6 +342,22 @@ func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun
 
 	if dryRun {
 		res.Status = "plan"
+		return res
+	}
+	locked, err := lockSamplePath(ctx, oldAbs)
+	if err != nil {
+		res.Status, res.Error = "error", "lock source: "+err.Error()
+		return res
+	}
+	defer locked.Close() //nolint:errcheck // releases the advisory lock
+	lockedInfo, err := locked.Stat()
+	if err != nil {
+		res.Status, res.Error = "error", "stat locked source: "+err.Error()
+		return res
+	}
+	currentInfo, err := os.Stat(oldAbs) //nolint:gosec // G703: path resolved within dataRoot
+	if err != nil || !os.SameFile(lockedInfo, currentInfo) {
+		res.Status, res.Error = "error", "sample path changed while waiting for lock; retry"
 		return res
 	}
 
@@ -359,6 +414,20 @@ func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun
 	// old location so a future walk can't resurrect the wrong label.
 	removeMarkers(oldAbs)
 
+	if plan.workflow {
+		moved, err := s.db.RelocateLocation(ctx, sha, oldRel, plan.newRel)
+		if err != nil {
+			res.Status, res.Error = "error", "db relocate: "+err.Error()
+			return res
+		}
+		if !moved {
+			res.Status, res.Error = "error", "db relocate: source location missing"
+			return res
+		}
+		res.Status = "moved"
+		return res
+	}
+
 	if err := s.db.RelocateSample(ctx, sha, oldRel, plan.newRel, plan.label, plan.source); err != nil {
 		// The bytes already moved; report the error but leave them in place —
 		// the next load walk will reconcile the DB from the new pool location.
@@ -376,7 +445,10 @@ func (s *apiServer) triagePlan(samp *hopper.Sample, oldRel string, v triageVerdi
 	if v.Ruling != "" {
 		plan, ok := rulingPlan(samp, oldRel, v.Ruling)
 		if !ok {
-			return placement{}, errors.New(`ruling must be "good", "bad", or "sighted"`)
+			return placement{}, errors.New(`ruling must be "good", "bad", "sighted", "pending", or "review"`)
+		}
+		if plan.workflow && samp.Label != "unknown" {
+			return placement{}, errors.New(`workflow ruling requires label "unknown"`)
 		}
 		// A client-supplied source attributes the relabel to its author (e.g.
 		// "cyclotron:bad", "sighted-backfill") instead of the default "promoter".
@@ -410,7 +482,7 @@ func (s *apiServer) triagePlan(samp *hopper.Sample, oldRel string, v triageVerdi
 	} else if collides {
 		newRel = shaSuffixedRel(newRel, samp.SHA256)
 	}
-	return placement{newRel, v.Verdict, "triage"}, nil
+	return placement{newRel: newRel, label: v.Verdict, source: "triage"}, nil
 }
 
 // shaSuffixedRel disambiguates rel's basename with the sample's sha prefix:
@@ -420,6 +492,34 @@ func shaSuffixedRel(rel, sha string) string {
 	dir, base := filepath.Split(rel)
 	ext := filepath.Ext(base)
 	return filepath.Join(dir, strings.TrimSuffix(base, ext)+"."+sha[:12]+ext)
+}
+
+// lockSamplePath serializes physical moves of one inode across Hopper and
+// Draino. The nonblocking retry keeps request cancellation responsive while a
+// large cross-filesystem copy holds the lock.
+func lockSamplePath(ctx context.Context, name string) (*os.File, error) {
+	f, err := os.Open(name) //nolint:gosec // path resolved within dataRoot
+	if err != nil {
+		return nil, err
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return f, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			f.Close() //nolint:errcheck
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			f.Close() //nolint:errcheck
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // fileMatchesSHA256 reports whether path's content hashes to sha

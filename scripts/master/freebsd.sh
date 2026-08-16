@@ -93,6 +93,28 @@ if ! pw groupshow "$SAMPLES_GROUP" >/dev/null 2>&1; then
 fi
 $SUDO pw groupmod "$SAMPLES_GROUP" -m "$SERVICE_USER"
 
+# Cold pool roots. pending/ and review/ both hold samples whose DB
+# classification label is still "unknown"; the directory name is workflow state.
+for dir in "$DATA_DIR/pending" "$DATA_DIR/review"; do
+	if [ ! -d "$dir" ]; then
+		$SUDO install -d -m 2775 -o "$SERVICE_USER" -g "$SAMPLES_GROUP" "$dir"
+	fi
+	$SUDO chgrp "$SAMPLES_GROUP" "$dir"
+	$SUDO chmod 2775 "$dir"
+done
+
+# incoming/ is a separate hot ZFS dataset and the only destination for new
+# uploads. Assert the shared writer contract at deploy time so Hopper, Forager,
+# and Draino can all create and relocate entries beneath it.
+for dir in "$DATA_DIR/incoming" "$DATA_DIR/incoming/uploads" \
+	"$DATA_DIR/incoming/scan" "$DATA_DIR/incoming/prism" "$DATA_DIR/incoming/forager"; do
+	if [ ! -d "$dir" ]; then
+		$SUDO install -d -m 2775 -o "$SERVICE_USER" -g "$SAMPLES_GROUP" "$dir"
+	fi
+	$SUDO chgrp "$SAMPLES_GROUP" "$dir"
+	$SUDO chmod 2775 "$dir"
+done
+
 # Create scan before invoking scan's installer so it can be added to the same
 # group before the generated rc.d service starts.
 if ! id -u scan >/dev/null 2>&1; then

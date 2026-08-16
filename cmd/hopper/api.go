@@ -752,14 +752,14 @@ const (
 	// chew through transient blips with full-jitter backoff; short enough
 	// to surface a real outage to logs without leaving the file orphaned.
 	uploadStoreTimeout = 2 * time.Minute
-	// uploadDir is the legacy/fallback directory under dataRoot where uploads
-	// land: <root>/unknown/uploads. Workers pick them up via the upload tier
+	// uploadDir is the fallback directory under dataRoot where new uploads land:
+	// <root>/incoming/uploads. Workers pick them up via the upload tier
 	// in claimJobs. It also anchors the spool (.tmp) and extract cache for
 	// EVERY upload regardless of destination tree — the post-hash rename must
 	// stay on one filesystem, and the service unit grants ReadWritePaths on
 	// this root — while recognized producers use the richer coordinate/digest
 	// layout in uploadRelDir.
-	uploadDir = "unknown/uploads"
+	uploadDir = "incoming/uploads"
 	// uploadDirScan and uploadDirPrism split uploads by producer so each tree
 	// can carry its own promotion policy. Worker dependency mirroring and
 	// `atomscan --hopper` are registry artifacts with fetch provenance and are
@@ -768,8 +768,13 @@ const (
 	// pool (a blessed coordinate suppresses future scanning, so promoting
 	// attacker-chosen bytes is a poisoning path). Producers are told apart by
 	// the sidecar's required fetch.collector.
-	uploadDirScan  = "unknown/scan"
-	uploadDirPrism = "unknown/prism"
+	uploadDirScan       = "incoming/scan"
+	uploadDirPrism      = "incoming/prism"
+	uploadDirForager    = "incoming/forager"
+	legacyUploadDir     = "unknown/uploads"
+	legacyUploadScan    = "unknown/scan"
+	legacyUploadPrism   = "unknown/prism"
+	legacyUploadForager = "unknown/forager"
 )
 
 // uploadRootFor picks the destination tree for a new upload from the producer
@@ -788,20 +793,26 @@ func uploadRootFor(prov *hopper.Sidecar) string {
 	if i := strings.IndexByte(collector, '+'); i >= 0 {
 		collector = collector[:i]
 	}
+	collector = strings.ToLower(strings.TrimSpace(collector))
 	switch collector {
 	case "scan":
 		return uploadDirScan
 	case "prism":
 		return uploadDirPrism
+	case "forager":
+		return uploadDirForager
 	default:
 		return uploadDir
 	}
 }
 
-// uploadRoots are the trees uploadRootFor can choose. Used to decide whether a
+// uploadRoots are current and legacy upload trees. Used to decide whether a
 // re-uploaded sha already sits in an upload tree (and must stay there) or lives
 // elsewhere in the pool entirely.
-var uploadRoots = []string{uploadDir, uploadDirScan, uploadDirPrism}
+var uploadRoots = []string{
+	uploadDir, uploadDirScan, uploadDirPrism, uploadDirForager,
+	legacyUploadDir, legacyUploadScan, legacyUploadPrism, legacyUploadForager,
+}
 
 // existingUploadDir returns the directory of an already-stored sample when it
 // sits in one of the upload trees, else "". A sha parked in an upload tree keeps

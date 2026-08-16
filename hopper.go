@@ -2080,6 +2080,35 @@ func (db *DB) LocationsForSHA(ctx context.Context, sha256 string) ([]*SampleLoca
 	return db.locationsForSHASQLite(ctx, sha256)
 }
 
+// OldestIncomingLocations returns top-level files in the hot incoming/ pool,
+// oldest mtime first. before provides a finalization grace period and limit
+// bounds each drain batch. Rows without an mtime are omitted until the next
+// filesystem walk refreshes them.
+func (db *DB) OldestIncomingLocations(ctx context.Context, before time.Time, limit int) ([]*SampleLocation, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	if db.pool != nil {
+		return db.oldestIncomingLocationsPG(ctx, before, limit)
+	}
+	return db.oldestIncomingLocationsSQLite(ctx, before, limit)
+}
+
+// RelocateLocation atomically changes one top-level physical location without
+// changing label, label_source, skip, or analysis state. If samples.path names
+// oldRel it follows the location to newRel; a different primary path is left
+// alone. The operation is idempotent: it reports true when newRel is already
+// recorded and false when neither oldRel nor newRel exists.
+func (db *DB) RelocateLocation(ctx context.Context, sha256, oldRel, newRel string) (bool, error) {
+	if sha256 == "" || oldRel == "" || newRel == "" || oldRel == newRel {
+		return false, nil
+	}
+	if db.pool != nil {
+		return db.relocateLocationPG(ctx, sha256, oldRel, newRel)
+	}
+	return db.relocateLocationSQLite(ctx, sha256, oldRel, newRel)
+}
+
 // PruneSafetyExceeded is returned by PruneMissingLocations when the
 // number of rows that would be deleted exceeds the maxFraction safety
 // cap. The error carries the counts so the caller can decide whether
@@ -2157,6 +2186,35 @@ type PURLPromotion struct {
 	Present bool
 	// Promoted counts samples whose label or skip the feed observation changed.
 	Promoted int
+}
+
+// PackageVersionPresent reports whether Hopper holds a non-missing top-level
+// sample for the exact package identity and version. It is a read-only probe:
+// feed claims belong in the sightings ledger and do not change classification.
+func (db *DB) PackageVersionPresent(ctx context.Context, purlBase, version string) (bool, error) {
+	if purlBase == "" || version == "" {
+		return false, nil
+	}
+	const pgQuery = `SELECT EXISTS (
+		SELECT 1 FROM samples
+		WHERE purl_base = $1 AND version = $2 AND parent = '' AND skip <> 'missing'
+	)`
+	if db.pool != nil {
+		var present bool
+		if err := db.pool.QueryRow(ctx, pgQuery, purlBase, version).Scan(&present); err != nil {
+			return false, fmt.Errorf("hopper: probe package version: %w", err)
+		}
+		return present, nil
+	}
+	const sqliteQuery = `SELECT EXISTS (
+		SELECT 1 FROM samples
+		WHERE purl_base = ? AND version = ? AND parent = '' AND skip <> 'missing'
+	)`
+	var present bool
+	if err := db.lite.QueryRowContext(ctx, sqliteQuery, purlBase, version).Scan(&present); err != nil {
+		return false, fmt.Errorf("hopper: probe package version: %w", err)
+	}
+	return present, nil
 }
 
 // labelResolution is the post-precedence state of a sample after an incoming
@@ -3775,8 +3833,8 @@ func (db *DB) TriageAcquit(ctx context.Context, limit int, createdBefore time.Ti
 // coverage. Pass afterSHA="" to start at the keyspace floor.
 //
 // It is the remote replacement for promoter's local filesystem walk: pathPrefix
-// is the source tree (e.g. "unknown/foraged/", with the trailing slash so a
-// sibling like "unknown/foraged-review/" is excluded). Stored paths are
+// is the source tree (e.g. "pending/foraged/", with the trailing slash so the
+// review queue ("review/foraged/") is excluded). Stored paths are
 // slash-relative to the data root.
 func (db *DB) PromotionCandidates(ctx context.Context, pathPrefix string, olderThan time.Time, afterSHA string, limit int) ([]*Sample, error) {
 	return db.CandidatesByLabel(ctx, labelUnknown, pathPrefix, olderThan, afterSHA, limit)

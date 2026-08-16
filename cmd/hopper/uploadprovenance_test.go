@@ -129,7 +129,7 @@ func TestUploadRefreshesRowFromAnotherWriter(t *testing.T) {
 	sha := hex.EncodeToString(sum[:])
 
 	// Another writer lands the row (with an older snapshot) first.
-	seeded := uploadSample(sha, "foo-1.0.0.tgz", "unknown/uploads/seeded.tgz",
+	seeded := uploadSample(sha, "foo-1.0.0.tgz", "incoming/uploads/seeded.tgz",
 		int64(len(file)), refreshSidecar(sha, len(file), "npm-old"))
 	if err := api.db.InsertSample(context.Background(), seeded); err != nil {
 		t.Fatalf("seed row: %v", err)

@@ -18,7 +18,7 @@ package main
 // after -apply so hostile rows return to the bad pool within one pass.
 //
 // Demotion goes through the master's /api/triage ruling "sighted"
-// (EXDEV-safe file move bad/foraged/X → sighted/foraged/X + DB relabel +
+// (EXDEV-safe file move bad/foraged/X -> sighted/foraged/X + DB relabel +
 // label_events audit, per-row idempotent). Archive members of demoted parents
 // are demoted in a DB-only pass (members have no standalone file), and each
 // demoted parent's own feed claim is recorded in the sightings ledger so

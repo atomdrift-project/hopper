@@ -33,13 +33,13 @@
 set -euo pipefail
 
 DATA_DIR="${DATA_DIR:-/data/samples}"
-UPLOAD_DIR="${DATA_DIR}/unknown/uploads"
+UPLOAD_DIR="${DATA_DIR}/incoming/uploads"
 # Every tree hopper writes uploads into. One per producer (see
-# cmd/hopper/uploadpath.go), plus UPLOAD_DIR, which is both the legacy root for
+# cmd/hopper/uploadpath.go), plus UPLOAD_DIR, which is both the fallback root for
 # unrecognized producers and the home of the .tmp spool every upload stages in.
-# All live under the unknown pool, which the unit already lists in
+# All live under the incoming pool, which the unit lists in
 # ReadWritePaths, so adding a producer needs no isolation change.
-UPLOAD_DIRS="${UPLOAD_DIR} ${DATA_DIR}/unknown/scan ${DATA_DIR}/unknown/prism ${DATA_DIR}/unknown/forager"
+UPLOAD_DIRS="${UPLOAD_DIR} ${DATA_DIR}/incoming/scan ${DATA_DIR}/incoming/prism ${DATA_DIR}/incoming/forager"
 # Shared group for the sample tree. forager, hopper, and promoter all run in it
 # so any of them can read/traverse the others' output; setgid dirs make new
 # children inherit it. hopper's upload tree joins this contract.
@@ -525,15 +525,15 @@ OOMPolicy=continue
 OOMScoreAdjust=-800
 
 # Filesystem isolation. hopper is the pool's relocation authority: besides
-# interactive uploads it moves samples between the good/bad/unknown trees
+# interactive uploads it moves samples between the good/bad/pending/review/incoming trees
 # (post-triage and promoter rulings via /api/triage), so the whole sample tree
 # must be writable, not just the upload dir. The pools are separate ZFS mounts
-# (good, bad, unknown) under the DATA_DIR parent; list each mountpoint so the
+# (good, bad, pending, review, incoming) under the DATA_DIR parent; list each mountpoint so the
 # ProtectSystem=strict read-only remount can't leave a submount read-only and
 # fault a relocation with EROFS ("mkdir: read-only file system").
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=${DATA_DIR} ${DATA_DIR}/good ${DATA_DIR}/bad ${DATA_DIR}/unknown
+ReadWritePaths=${DATA_DIR} ${DATA_DIR}/good ${DATA_DIR}/bad ${DATA_DIR}/pending ${DATA_DIR}/review ${DATA_DIR}/unknown ${DATA_DIR}/incoming
 PrivateTmp=true
 PrivateDevices=true
 PrivateMounts=true
@@ -747,7 +747,7 @@ ExecStart=${HEAL_PERMS_BIN}
 Environment=DATA_DIR=${DATA_DIR}
 # The upload tree is now part of the shared contract and IS healed (group +
 # 2775 dirs; files to 0440). Only the in-flight .tmp staging dir is excluded —
-# the script defaults HEAL_EXCLUDE to \${DATA_DIR}/unknown/uploads/.tmp, so no
+# the script defaults HEAL_EXCLUDE to \${DATA_DIR}/incoming/uploads/.tmp, so no
 # override is needed here.
 Environment=HEAL_EXCLUDE=${UPLOAD_DIR}/.tmp
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

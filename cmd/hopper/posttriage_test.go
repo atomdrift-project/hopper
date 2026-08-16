@@ -6,11 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/atomdrift-project/hopper"
 )
@@ -257,6 +260,59 @@ func TestHandleTriageRulings(t *testing.T) {
 	}
 }
 
+func TestHandleTriageWorkflowMovePreservesCatalogState(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db := mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	sha := repeat("8")
+	oldRel := filepath.Join("incoming", "unknown", "foraged", "javascript", "npmjs.org", "npm", "pkg", "pkg-1.0.0.tgz")
+	newRel := filepath.Join("review", "unknown", "foraged", "javascript", "npmjs.org", "npm", "pkg", "pkg-1.0.0.tgz")
+	oldAbs := filepath.Join(root, oldRel)
+	if err := os.MkdirAll(filepath.Dir(oldAbs), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(oldAbs, []byte("sample"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertSample(ctx, &hopper.Sample{
+		SHA256: sha, Source: "forager", Path: oldRel, Label: "unknown",
+		LabelSource: "forager", Skip: "deferred",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	api := &apiServer{db: db, dataRoot: root, tracker: newWorkerTracker()}
+	resp := callTriage(t, api, triageRequest{Verdicts: []triageVerdict{{SHA256: sha, Ruling: "review"}}})
+	if resp.Moved != 1 || resp.Failed != 0 || resp.Results[0].NewPath != newRel {
+		t.Fatalf("workflow response = %+v", resp)
+	}
+	if _, err := os.Stat(filepath.Join(root, newRel)); err != nil {
+		t.Fatalf("review file missing: %v", err)
+	}
+	if _, err := os.Stat(oldAbs); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("incoming file still present: %v", err)
+	}
+
+	sample, err := db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sample.Path != newRel || sample.Label != "unknown" || sample.LabelSource != "forager" ||
+		sample.Source != "forager" || sample.Skip != "deferred" {
+		t.Fatalf("workflow move changed catalog state: %+v", sample)
+	}
+
+	again := callTriage(t, api, triageRequest{Verdicts: []triageVerdict{{SHA256: sha, Ruling: "review"}}})
+	if again.Noop != 1 || again.Moved != 0 {
+		t.Fatalf("workflow retry = %+v", again)
+	}
+}
+
 // TestHandleTriageRulingCollision covers a ruling whose destination is already
 // occupied — pool files are stored read-only, so without explicit handling the
 // copy fails EACCES on every retry and the sample churns through triage
@@ -351,8 +407,9 @@ func TestHandleTriageRulingCollision(t *testing.T) {
 }
 
 // TestHandleTriageSightedRulings covers the sighted pool's two flows: the
-// demote-sighted backfill (bad/foraged → sighted/foraged, subpath mirrored)
-// and promoter's re-promotion (sighted/foraged → bad/foraged-quarantine).
+// demote-sighted backfill (bad/foraged -> sighted/foraged, subpath mirrored)
+// and promoter's re-promotion (sighted/foraged ->
+// bad/foraged-quarantine).
 func TestHandleTriageSightedRulings(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -387,8 +444,8 @@ func TestHandleTriageSightedRulings(t *testing.T) {
 		return resp.Results[0]
 	}
 
-	// Backfill demotion: bad/foraged → sighted/foraged with the subpath mirrored,
-	// relabeled sighted with the client-supplied source.
+	// Backfill demotion: bad/foraged -> sighted/foraged with the
+	// subpath mirrored, relabeled sighted with the client-supplied source.
 	shaA := repeat("5")
 	seed(shaA, filepath.Join("bad", "foraged", "npm", "registry", "socket", "evil", "evil-1.0.tgz"), "bad", "harvest")
 	res := rule(shaA, "sighted", "sighted-backfill")
@@ -425,8 +482,8 @@ func TestHandleTriageSightedRulings(t *testing.T) {
 		t.Fatalf("relocation re-run status = %q, want noop", again.Status)
 	}
 
-	// Promoter re-promotion: sighted/foraged → bad/foraged-quarantine, subpath
-	// mirrored, default promoter source.
+	// Promoter re-promotion: sighted/foraged ->
+	// bad/foraged-quarantine, subpath mirrored, default promoter source.
 	res = rule(shaA, "bad", "")
 	wantB := filepath.Join("bad", "foraged-quarantine", "npm", "registry", "socket", "evil", "evil-1.0.tgz")
 	if res.NewPath != wantB {
@@ -473,10 +530,15 @@ func TestRulingPlanPreservesSubpath(t *testing.T) {
 		ruling string
 		want   string
 	}{
-		{"discovery promote", "unknown/foraged/" + sub, "good", "good/foraged-promote/" + sub},
-		{"discovery demote", "unknown/foraged/" + sub, "bad", "bad/foraged-quarantine/" + sub},
-		{"upload shard", "unknown/uploads/ab/cd/evil-1.0.tgz", "good", "good/foraged-promote/ab/cd/evil-1.0.tgz"},
+		{"hot foraged promote", "incoming/bad/foraged/" + sub, "good", "good/foraged-promote/bad/foraged/" + sub},
+		{"hot upload demote", "incoming/scan/sha/example.com/ab/cd/hash/" + sub, "bad", "bad/foraged-quarantine/scan/sha/example.com/ab/cd/hash/" + sub},
+		{"discovery promote", "pending/foraged/" + sub, "good", "good/foraged-promote/" + sub},
+		{"discovery demote", "pending/foraged/" + sub, "bad", "bad/foraged-quarantine/" + sub},
+		{"review promote", "review/foraged/" + sub, "good", "good/foraged-promote/foraged/" + sub},
+		{"legacy discovery promote", "unknown/foraged/" + sub, "good", "good/foraged-promote/" + sub},
+		{"legacy upload shard", "unknown/uploads/ab/cd/evil-1.0.tgz", "good", "good/foraged-promote/ab/cd/evil-1.0.tgz"},
 		{"sighted promote", "sighted/foraged/" + sub, "bad", "bad/foraged-quarantine/" + sub},
+		{"legacy sighted promote", "sighted/foraged/" + sub, "bad", "bad/foraged-quarantine/" + sub},
 		// Round trips out of a destination tree: these flattened to the basename
 		// before the destinations were themselves source roots.
 		{"quarantine acquit", "bad/foraged-quarantine/" + sub, "good", "good/foraged-promote/" + sub},
@@ -485,7 +547,7 @@ func TestRulingPlanPreservesSubpath(t *testing.T) {
 		// bad/foraged/ must not shadow bad/foraged-quarantine/.
 		{"bad discovery demote", "bad/foraged/" + sub, "sighted", "sighted/foraged/" + sub},
 		// Not under any root: basename is all that can be salvaged.
-		{"unrooted", "unknown/foraged-undetermined/" + sub, "good", "good/foraged-promote/evil-1.0.tgz"},
+		{"unrooted", "misc/foraged-undetermined/" + sub, "good", "good/foraged-promote/evil-1.0.tgz"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -499,8 +561,59 @@ func TestRulingPlanPreservesSubpath(t *testing.T) {
 		})
 	}
 
-	if _, ok := rulingPlan(nil, "unknown/foraged/"+sub, "review"); ok {
-		t.Error("unrecognized ruling should not be ok")
+	for _, tc := range []struct {
+		name   string
+		oldRel string
+		ruling string
+		want   string
+	}{
+		{"pending to review", "pending/foraged/" + sub, "review", "review/foraged/" + sub},
+		{"review to pending", "review/foraged/" + sub, "pending", "pending/foraged/" + sub},
+		{"incoming to review", "incoming/scan/sha/example.com/ab/cd/hash/pkg.tgz", "review", "review/scan/sha/example.com/ab/cd/hash/pkg.tgz"},
+		{"legacy review not special", "unknown/foraged-review/" + sub, "review", "review/foraged-review/" + sub},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := rulingPlan(nil, tc.oldRel, tc.ruling)
+			if !ok {
+				t.Fatalf("rulingPlan(%q, %q) not ok", tc.oldRel, tc.ruling)
+			}
+			if !got.workflow {
+				t.Fatalf("workflow = false")
+			}
+			if got.newRel != tc.want {
+				t.Errorf("newRel = %q, want %q", got.newRel, tc.want)
+			}
+			if got.label != "unknown" {
+				t.Errorf("label = %q, want unknown", got.label)
+			}
+		})
+	}
+}
+
+func TestLockSamplePathHonorsContext(t *testing.T) {
+	t.Parallel()
+	name := filepath.Join(t.TempDir(), "sample")
+	if err := os.WriteFile(name, []byte("sample"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	held, err := os.Open(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close() //nolint:errcheck
+	if err := syscall.Flock(int(held.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	lock, err := lockSamplePath(ctx, name)
+	if lock != nil {
+		lock.Close() //nolint:errcheck
+		t.Fatal("lockSamplePath acquired a held lock")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("lockSamplePath error = %v, want context deadline", err)
 	}
 }
 

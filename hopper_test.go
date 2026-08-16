@@ -3075,6 +3075,67 @@ func TestLocationsDualWrite(t *testing.T) {
 	}
 }
 
+func TestIncomingLocationDrainPrimitives(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	oldest := now.Add(-3 * time.Hour)
+	newer := now.Add(-2 * time.Hour)
+	cold := now.Add(-4 * time.Hour)
+
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: "incoming-old", Path: "incoming/bad/foraged/a.bin", Filename: "a.bin",
+		Label: "bad", LabelSource: "forager", Skip: "hold", Mtime: &oldest,
+	})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: "incoming-new", Path: "incoming/good/foraged/b.bin", Filename: "b.bin",
+		Label: "good", LabelSource: "forager", Mtime: &newer,
+	})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: "already-cold", Path: "pending/foraged/c.bin", Filename: "c.bin",
+		Label: "unknown", Mtime: &cold,
+	})
+
+	locs, err := db.OldestIncomingLocations(ctx, now.Add(-time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locs) != 2 || locs[0].SHA256 != "incoming-old" || locs[1].SHA256 != "incoming-new" {
+		t.Fatalf("oldest incoming = %+v, want incoming-old then incoming-new", locs)
+	}
+
+	moved, err := db.RelocateLocation(ctx, "incoming-old",
+		"incoming/bad/foraged/a.bin", "pending/bad/foraged/a.bin")
+	if err != nil || !moved {
+		t.Fatalf("RelocateLocation = %v, %v; want true, nil", moved, err)
+	}
+	got, err := db.SampleBySHA256(ctx, "incoming-old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Path != "pending/bad/foraged/a.bin" || got.Label != "bad" || got.LabelSource != "forager" || got.Skip != "hold" {
+		t.Errorf("relocated sample = path %q label %q source %q skip %q", got.Path, got.Label, got.LabelSource, got.Skip)
+	}
+	gotLocs, err := db.LocationsForSHA(ctx, "incoming-old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gotLocs) != 1 || gotLocs[0].Path != "pending/bad/foraged/a.bin" {
+		t.Fatalf("relocated locations = %+v", gotLocs)
+	}
+
+	// A replay after a crash is a successful no-op, while an unrelated stale
+	// source path is absent so Draino can discard its copied file.
+	if moved, err := db.RelocateLocation(ctx, "incoming-old",
+		"incoming/bad/foraged/a.bin", "pending/bad/foraged/a.bin"); err != nil || !moved {
+		t.Fatalf("idempotent RelocateLocation = %v, %v", moved, err)
+	}
+	if moved, err := db.RelocateLocation(ctx, "incoming-old",
+		"incoming/missing.bin", "pending/missing.bin"); err != nil || moved {
+		t.Fatalf("missing RelocateLocation = %v, %v; want false, nil", moved, err)
+	}
+}
+
 func TestCanonicalSHA(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -4658,6 +4719,31 @@ func TestReconcilePoolsBadUnknownGood(t *testing.T) {
 	}
 }
 
+func TestReconcilePoolsIncomingDoesNotDeriveNestedCategoryLabels(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: "hot", Path: "incoming/bad/foraged/hot.bin", Label: "bad", LabelSource: "forager",
+	})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: "feed", Path: "incoming/sighted/foraged/feed.bin", Label: "unknown", LabelSource: "forager",
+	})
+	stageWalk(t, ctx, db,
+		loc("hot", "incoming/bad/foraged/hot.bin"),
+		loc("feed", "incoming/sighted/foraged/feed.bin"),
+	)
+	if _, err := db.ReconcilePools(ctx, func(p string) string { return p }, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := labelOf(t, ctx, db, "hot"); got != "bad" {
+		t.Errorf("incoming evidence label = %q, want bad", got)
+	}
+	if got := labelOf(t, ctx, db, "feed"); got != "unknown" {
+		t.Errorf("incoming/sighted label = %q, want unknown", got)
+	}
+}
+
 // TestReconcilePoolsRemovedThenReadded covers removal from bad/ (→ missing,
 // label retained) followed by re-adding the same content to bad/ at a different
 // path (→ revived, skip cleared).
@@ -5974,6 +6060,44 @@ func TestPromoteLabelByPURL(t *testing.T) {
 	}
 	if res2.Promoted != 1 {
 		t.Errorf("Promoted = %d, want 1", res2.Promoted)
+	}
+}
+
+func TestPackageVersionPresentDoesNotChangeLabel(t *testing.T) {
+	ctx := t.Context()
+	db := openTestDB(t)
+	purlBase := "pkg:npm/example"
+	version := "1.2.3"
+	presentSHA := sha64('8')
+	missingSHA := sha64('9')
+	for _, sample := range []*Sample{
+		{SHA256: presentSHA, Path: "incoming/example-1.2.3.tgz", PURLBase: purlBase, Version: version, Label: "unknown", LabelSource: "forager"},
+		{SHA256: missingSHA, Path: "incoming/example-2.0.0.tgz", PURLBase: purlBase, Version: "2.0.0", Label: "unknown", LabelSource: "forager", Skip: "missing"},
+	} {
+		if err := db.InsertSample(ctx, sample); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	present, err := db.PackageVersionPresent(ctx, purlBase, version)
+	if err != nil || !present {
+		t.Fatalf("PackageVersionPresent = %v, %v; want true, nil", present, err)
+	}
+	missing, err := db.PackageVersionPresent(ctx, purlBase, "2.0.0")
+	if err != nil || missing {
+		t.Fatalf("missing PackageVersionPresent = %v, %v; want false, nil", missing, err)
+	}
+	blank, err := db.PackageVersionPresent(ctx, "", version)
+	if err != nil || blank {
+		t.Fatalf("blank PackageVersionPresent = %v, %v; want false, nil", blank, err)
+	}
+
+	sample, err := db.SampleBySHA256(ctx, presentSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sample.Label != "unknown" || sample.LabelSource != "forager" {
+		t.Fatalf("presence probe changed label state: %+v", sample)
 	}
 }
 

@@ -490,6 +490,11 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// Parent lookups are rare (exploded-from query) and stay partial.
 		`CREATE INDEX IF NOT EXISTS idx_sl_sha256 ON sample_locations(sha256)`,
 		`CREATE INDEX IF NOT EXISTS idx_sl_parent ON sample_locations(parent_sha256) WHERE parent_sha256 <> ''`,
+		// Draino asks only for the oldest top-level hot-pool locations. Keeping
+		// this partial makes that query proportional to the incoming pool rather
+		// than the full historical location ledger.
+		`CREATE INDEX IF NOT EXISTS idx_sl_incoming_mtime ON sample_locations(mtime, sha256, path) ` +
+			`WHERE parent_sha256 = '' AND path LIKE 'incoming/%' AND mtime IS NOT NULL`,
 		// Covering index for the reconcile reachability walk (cascadeMembersPG):
 		// finding a parent's child sha256 is then index-only — no heap fetch —
 		// which is what lets the BFS expand the alive set by index lookups instead
@@ -2650,6 +2655,76 @@ func (db *DB) locationsForSHAPG(ctx context.Context, sha256 string) ([]*SampleLo
 		out = append(out, loc)
 	}
 	return out, rows.Err()
+}
+
+func (db *DB) oldestIncomingLocationsPG(ctx context.Context, before time.Time, limit int) ([]*SampleLocation, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT `+pgLocationCols+` FROM sample_locations
+		 WHERE parent_sha256 = '' AND path LIKE 'incoming/%'
+		   AND mtime IS NOT NULL AND mtime < $1
+		 ORDER BY mtime, sha256, path LIMIT $2`, before.UTC(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: oldest incoming locations: %w", err)
+	}
+	defer rows.Close()
+	var out []*SampleLocation
+	for rows.Next() {
+		loc, err := scanPGLocation(rows)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: scan oldest incoming location: %w", err)
+		}
+		out = append(out, loc)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) relocateLocationPG(ctx context.Context, sha256, oldRel, newRel string) (bool, error) {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("hopper: relocate location begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+
+	var oldID int64
+	err = tx.QueryRow(ctx, `
+		SELECT id FROM sample_locations
+		 WHERE sha256 = $1 AND path = $2 AND parent_sha256 = ''
+		 FOR UPDATE`, sha256, oldRel).Scan(&oldID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var exists bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS(SELECT 1 FROM sample_locations
+			 WHERE sha256 = $1 AND path = $2 AND parent_sha256 = '')`, sha256, newRel).Scan(&exists); err != nil {
+			return false, fmt.Errorf("hopper: relocate location lookup: %w", err)
+		}
+		return exists, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("hopper: relocate location lock: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO sample_locations
+			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem,
+			 mtime, first_seen_at, last_seen_at)
+		SELECT sha256, $2, parent_sha256, rel, filename, source, feed, ecosystem,
+		       mtime, first_seen_at, now()
+		  FROM sample_locations WHERE id = $1
+		ON CONFLICT (sha256, path) DO NOTHING`, oldID, newRel); err != nil {
+		return false, fmt.Errorf("hopper: relocate location insert: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM sample_locations WHERE id = $1`, oldID); err != nil {
+		return false, fmt.Errorf("hopper: relocate location delete: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE samples SET path = $3, updated_at = now()
+		 WHERE sha256 = $1 AND path = $2`, sha256, oldRel, newRel); err != nil {
+		return false, fmt.Errorf("hopper: relocate primary path: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("hopper: relocate location commit: %w", err)
+	}
+	return true, nil
 }
 
 // pruneMissingLocationsPG mirrors pruneMissingLocationsSQLite for the

@@ -398,6 +398,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_sl_sha256 ON sample_locations(sha256)`,
 		`CREATE INDEX IF NOT EXISTS idx_sl_parent ON sample_locations(parent_sha256) WHERE parent_sha256 <> ''`,
+		`CREATE INDEX IF NOT EXISTS idx_sl_incoming_mtime ON sample_locations(mtime, sha256, path) ` +
+			`WHERE parent_sha256 = '' AND path GLOB 'incoming/*' AND mtime IS NOT NULL`,
 	} {
 		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite sample_locations: %w", err)
@@ -1644,6 +1646,76 @@ func (db *DB) locationsForSHASQLite(ctx context.Context, sha256 string) ([]*Samp
 		out = append(out, loc)
 	}
 	return out, rows.Err()
+}
+
+func (db *DB) oldestIncomingLocationsSQLite(ctx context.Context, before time.Time, limit int) ([]*SampleLocation, error) {
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT `+liteLocationCols+` FROM sample_locations
+		 WHERE parent_sha256 = '' AND path GLOB 'incoming/*'
+		   AND mtime IS NOT NULL AND mtime < ?
+		 ORDER BY mtime, sha256, path LIMIT ?`, before.UTC().Format(time.RFC3339Nano), limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: oldest incoming locations: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // read-only query
+	var out []*SampleLocation
+	for rows.Next() {
+		loc, err := scanLiteLocation(rows)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: scan oldest incoming location: %w", err)
+		}
+		out = append(out, loc)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) relocateLocationSQLite(ctx context.Context, sha256, oldRel, newRel string) (bool, error) {
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("hopper: relocate location begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
+
+	var oldID int64
+	err = tx.QueryRowContext(ctx, `
+		SELECT id FROM sample_locations
+		 WHERE sha256 = ? AND path = ? AND parent_sha256 = ''`, sha256, oldRel).Scan(&oldID)
+	if errors.Is(err, sql.ErrNoRows) {
+		var exists bool
+		if err := tx.QueryRowContext(ctx, `
+			SELECT EXISTS(SELECT 1 FROM sample_locations
+			 WHERE sha256 = ? AND path = ? AND parent_sha256 = '')`, sha256, newRel).Scan(&exists); err != nil {
+			return false, fmt.Errorf("hopper: relocate location lookup: %w", err)
+		}
+		return exists, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("hopper: relocate location lookup: %w", err)
+	}
+
+	ts := now()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO sample_locations
+			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem,
+			 mtime, first_seen_at, last_seen_at)
+		SELECT sha256, ?, parent_sha256, rel, filename, source, feed, ecosystem,
+		       mtime, first_seen_at, ?
+		  FROM sample_locations WHERE id = ?
+		ON CONFLICT (sha256, path) DO NOTHING`, newRel, ts, oldID); err != nil {
+		return false, fmt.Errorf("hopper: relocate location insert: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sample_locations WHERE id = ?`, oldID); err != nil {
+		return false, fmt.Errorf("hopper: relocate location delete: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE samples SET path = ?, updated_at = ?
+		 WHERE sha256 = ? AND path = ?`, newRel, ts, sha256, oldRel); err != nil {
+		return false, fmt.Errorf("hopper: relocate primary path: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("hopper: relocate location commit: %w", err)
+	}
+	return true, nil
 }
 
 // pruneVictim names a sample_locations row that should be deleted.

@@ -25,7 +25,7 @@ func TestPromotionCandidates(t *testing.T) {
 			Source:      "test",
 			Label:       "unknown",
 			LabelSource: "test",
-			Path:        "unknown/foraged/npm/" + s[:8] + ".tgz",
+			Path:        "pending/foraged/npm/" + s[:8] + ".tgz",
 			Mtime:       &old,
 		}
 		if mut != nil {
@@ -41,20 +41,20 @@ func TestPromotionCandidates(t *testing.T) {
 	mustInsert(t, ctx, db, cand(sha('5'), nil))
 
 	// Ineligible rows that every filter must reject.
-	mustInsert(t, ctx, db, cand(sha('6'), func(s *Sample) { s.Label = "good" }))                            // wrong label
-	mustInsert(t, ctx, db, cand(sha('7'), func(s *Sample) { s.Parent = sha('1') }))                         // archive member
-	mustInsert(t, ctx, db, cand(sha('8'), func(s *Sample) { s.Skip = "missing" }))                          // training-skipped
-	mustInsert(t, ctx, db, cand(sha('9'), func(s *Sample) { s.Mtime = &recent }))                           // too young
-	mustInsert(t, ctx, db, cand(sha('a'), func(s *Sample) { s.Mtime = nil }))                               // unknown mtime
-	mustInsert(t, ctx, db, cand(sha('b'), func(s *Sample) { s.Path = "good/foraged-promote/npm/x.tgz" }))   // other pool
-	mustInsert(t, ctx, db, cand(sha('c'), func(s *Sample) { s.Path = "unknown/foraged-review/npm/x.tgz" })) // sibling review queue
+	mustInsert(t, ctx, db, cand(sha('6'), func(s *Sample) { s.Label = "good" }))                          // wrong label
+	mustInsert(t, ctx, db, cand(sha('7'), func(s *Sample) { s.Parent = sha('1') }))                       // archive member
+	mustInsert(t, ctx, db, cand(sha('8'), func(s *Sample) { s.Skip = "missing" }))                        // training-skipped
+	mustInsert(t, ctx, db, cand(sha('9'), func(s *Sample) { s.Mtime = &recent }))                         // too young
+	mustInsert(t, ctx, db, cand(sha('a'), func(s *Sample) { s.Mtime = nil }))                             // unknown mtime
+	mustInsert(t, ctx, db, cand(sha('b'), func(s *Sample) { s.Path = "good/foraged-promote/npm/x.tgz" })) // other pool
+	mustInsert(t, ctx, db, cand(sha('c'), func(s *Sample) { s.Path = "review/foraged/npm/x.tgz" }))       // review queue
 
-	const prefix = "unknown/foraged/"
+	const prefix = "pending/foraged/"
 	cutoff := time.Now().Add(-30 * 24 * time.Hour)
 
 	// Full sweep from the keyspace floor returns exactly the three eligible rows,
-	// in sha order. The "-review" sibling must NOT appear — that exclusion is how
-	// the review queue self-excludes from re-discovery.
+	// in sha order. The review queue must NOT appear — that exclusion is how
+	// human-review samples self-exclude from re-discovery.
 	got, err := db.PromotionCandidates(ctx, prefix, cutoff, "", 100)
 	if err != nil {
 		t.Fatalf("PromotionCandidates: %v", err)

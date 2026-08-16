@@ -16,7 +16,7 @@
 #                                grants — a file's own write bit is never
 #                                required to relayout the tree.
 #
-# Exception — hopper's upload tree (unknown/uploads): same group + 2775 dirs, but
+# Exception — hopper's upload tree (incoming/uploads): same group + 2775 dirs, but
 # its sample files are 0440 (group-private, no world read) since they are
 # hopper's own ingest and nothing outside the group reads them off disk. Its
 # .tmp staging dir is skipped entirely: those files are mid-write with transient
@@ -48,9 +48,11 @@ GROUP="${SAMPLES_GROUP:-samples}"
 
 # hopper's upload trees are healed like the rest (group + 2775 dirs), but their
 # sample files are 0440 not 0444 (see header), so the file pass splits on them.
-# One tree per producer plus the legacy root, which also holds the .tmp spool.
-UPLOAD_DIR="$DATA_DIR/unknown/uploads"
-UPLOAD_DIRS="$UPLOAD_DIR $DATA_DIR/unknown/scan $DATA_DIR/unknown/prism $DATA_DIR/unknown/forager"
+# One tree per producer plus the fallback root, which also holds the .tmp spool.
+# Keep the former unknown/ trees in this permission class while old files drain.
+UPLOAD_DIR="$DATA_DIR/incoming/uploads"
+UPLOAD_DIRS="$UPLOAD_DIR $DATA_DIR/incoming/scan $DATA_DIR/incoming/prism $DATA_DIR/incoming/forager \
+$DATA_DIR/unknown/uploads $DATA_DIR/unknown/scan $DATA_DIR/unknown/prism $DATA_DIR/unknown/forager"
 
 # Subtree to leave untouched: only hopper's in-flight upload staging dir. Its
 # temp files are mid-write with transient modes, and hopper sets their final

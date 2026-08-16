@@ -735,7 +735,7 @@ func TestUploadSampleFilenameFallback(t *testing.T) {
 	prov := &hopper.Sidecar{
 		Package: hopper.PackageRef{Ecosystem: "javascript", Name: "pg", PURL: "pkg:npm/pg"},
 	}
-	s := uploadSample(sha, "pg-8.23.0.tgz", "unknown/uploads/pg-8.23.0.tgz", 1, prov)
+	s := uploadSample(sha, "pg-8.23.0.tgz", "incoming/uploads/pg-8.23.0.tgz", 1, prov)
 	if s.Package != "pg" || s.Version != "8.23.0" {
 		t.Errorf("versionless-PURL upload = (%q, %q), want (\"pg\", \"8.23.0\")", s.Package, s.Version)
 	}
@@ -747,18 +747,18 @@ func TestUploadSampleFilenameFallback(t *testing.T) {
 	prov = &hopper.Sidecar{
 		Package: hopper.PackageRef{Name: "pg", Version: "9.0.0-claimed", PURL: "pkg:npm/pg@9.0.0-claimed"},
 	}
-	s = uploadSample(sha, "pg-8.23.0.tgz", "unknown/uploads/pg-8.23.0.tgz", 1, prov)
+	s = uploadSample(sha, "pg-8.23.0.tgz", "incoming/uploads/pg-8.23.0.tgz", 1, prov)
 	if s.Package != "pg" || s.Version != "9.0.0-claimed" {
 		t.Errorf("claimed-version upload = (%q, %q), want (\"pg\", \"9.0.0-claimed\")", s.Package, s.Version)
 	}
 
 	// No provenance at all: identity comes from the filename alone, and an
 	// unparseable filename stays empty rather than guessing.
-	s = uploadSample(sha, "lodash-4.17.21.tgz", "unknown/uploads/lodash-4.17.21.tgz", 1, nil)
+	s = uploadSample(sha, "lodash-4.17.21.tgz", "incoming/uploads/lodash-4.17.21.tgz", 1, nil)
 	if s.Package != "lodash" || s.Version != "4.17.21" {
 		t.Errorf("bare upload = (%q, %q), want (\"lodash\", \"4.17.21\")", s.Package, s.Version)
 	}
-	s = uploadSample(sha, "evil.exe", "unknown/uploads/evil.exe", 1, nil)
+	s = uploadSample(sha, "evil.exe", "incoming/uploads/evil.exe", 1, nil)
 	if s.Package != "" || s.Version != "" {
 		t.Errorf("unparseable upload = (%q, %q), want empty", s.Package, s.Version)
 	}
@@ -1000,7 +1000,7 @@ func TestResolveDataPath(t *testing.T) {
 	root := t.TempDir()
 	api := &apiServer{dataRoot: root}
 
-	if abs, err := api.resolveDataPath("unknown/uploads/ab/cd/foo.bin"); err != nil {
+	if abs, err := api.resolveDataPath("incoming/uploads/ab/cd/foo.bin"); err != nil {
 		t.Errorf("normal path errored: %v (got %q)", err, abs)
 	}
 	for _, bad := range []string{
@@ -1254,10 +1254,10 @@ func TestUploadRootFor(t *testing.T) {
 		// Prism uploads are arbitrary user submissions: own tree, never
 		// auto-promoted.
 		{"prism", prov("prism"), uploadDirPrism},
-		// Everything else keeps the legacy root, including the deprecated
+		{"forager", prov("forager+0a45da172e3f"), uploadDirForager},
+		// Everything else keeps the fallback root, including the deprecated
 		// raw-body path that carries no sidecar at all — unattributable bytes
 		// must not land in a tree a promoting daemon watches.
-		{"forager", prov("forager+0a45da172e3f"), uploadDir},
 		{"unknown collector", prov("somethingelse"), uploadDir},
 		{"no provenance", nil, uploadDir},
 		// A collector must not be able to steer itself into another tree by
@@ -1283,9 +1283,14 @@ func TestUploadRootKeepsExistingUploadPath(t *testing.T) {
 		existing string
 		want     string // "" means: use the producer's root, not the existing dir
 	}{
-		{"legacy uploads row re-sent by scan", "unknown/uploads/ab/cd/pkg.tgz", "unknown/uploads/ab/cd"},
-		{"already in the scan tree", "unknown/scan/ab/cd/pkg.tgz", "unknown/scan/ab/cd"},
-		{"already in the prism tree", "unknown/prism/ab/cd/pkg.tgz", "unknown/prism/ab/cd"},
+		{"current uploads row re-sent by scan", "incoming/uploads/ab/cd/pkg.tgz", "incoming/uploads/ab/cd"},
+		{"already in the scan tree", "incoming/scan/ab/cd/pkg.tgz", "incoming/scan/ab/cd"},
+		{"already in the prism tree", "incoming/prism/ab/cd/pkg.tgz", "incoming/prism/ab/cd"},
+		{"already in the forager tree", "incoming/forager/ab/cd/pkg.tgz", "incoming/forager/ab/cd"},
+		{"legacy uploads row", "unknown/uploads/ab/cd/pkg.tgz", "unknown/uploads/ab/cd"},
+		{"legacy scan row", "unknown/scan/ab/cd/pkg.tgz", "unknown/scan/ab/cd"},
+		{"legacy prism row", "unknown/prism/ab/cd/pkg.tgz", "unknown/prism/ab/cd"},
+		{"legacy forager row", "unknown/forager/ab/cd/pkg.tgz", "unknown/forager/ab/cd"},
 		{"promoted row", "good/foraged-promote/ab/cd/pkg.tgz", ""},
 		{"foraged row", "unknown/foraged/ab/cd/pkg.tgz", ""},
 		{"no path", "", ""},
@@ -1348,7 +1353,7 @@ func TestHandleUploadMultipartEnrichesRow(t *testing.T) {
 	}
 	// No PURL in this sidecar, so the bytes are keyed by digest under the
 	// producer's tree, with the fetch host as the only legible handle.
-	if want := "unknown/forager/sha/npmjs.org/" + sha[:2] + "/" + sha[2:4] + "/" + sha + "/evil-1.0.0.tgz"; got.Path != want {
+	if want := "incoming/forager/sha/npmjs.org/" + sha[:2] + "/" + sha[2:4] + "/" + sha + "/evil-1.0.0.tgz"; got.Path != want {
 		t.Errorf("Path = %q, want %q", got.Path, want)
 	}
 	if got.Domain != "npmjs.org" {
@@ -1420,8 +1425,8 @@ func TestHandleUploadShardCollision(t *testing.T) {
 	}
 	upload(first)
 	upload(second)
-	if !strings.HasPrefix(mustUploadPath(t, api, hexSHA256(first)), "unknown/uploads/") {
-		t.Fatal("test precondition: an unlisted collector must route to the legacy root")
+	if !strings.HasPrefix(mustUploadPath(t, api, hexSHA256(first)), "incoming/uploads/") {
+		t.Fatal("test precondition: an unlisted collector must route to the fallback root")
 	}
 
 	rows := make([]*hopper.Sample, 0, 2)
@@ -1488,7 +1493,7 @@ func TestHandleUploadCoordinateCollision(t *testing.T) {
 	t.Parallel()
 	api := uploadAPI(t)
 	const purl = "pkg:vscode-extension/ms-python/python@2024.1.0"
-	const wantDir = "unknown/scan/pkg/vscode-extension/ms-python/python/2024.1.0"
+	const wantDir = "incoming/scan/pkg/vscode-extension/ms-python/python/2024.1.0"
 	payloads := [][]byte{[]byte("open vsx build"), []byte("marketplace build")}
 
 	for _, payload := range payloads {
@@ -1535,7 +1540,7 @@ func TestHandleUploadKeepsKnownBytesInPlace(t *testing.T) {
 	}
 	send("prism", "")
 	first := mustUploadPath(t, api, sha)
-	if want := "unknown/prism/sha/_unknown/"; !strings.HasPrefix(first, want) {
+	if want := "incoming/prism/sha/_unknown/"; !strings.HasPrefix(first, want) {
 		t.Fatalf("Path = %q, want a digest-keyed path under %q", first, want)
 	}
 
@@ -1544,8 +1549,8 @@ func TestHandleUploadKeepsKnownBytesInPlace(t *testing.T) {
 	if got := mustUploadPath(t, api, sha); got != first {
 		t.Errorf("known bytes moved from %q to %q", first, got)
 	}
-	if _, err := os.Stat(filepath.Join(api.dataRoot, "unknown", "scan")); !os.IsNotExist(err) {
-		t.Errorf("a second copy was written under unknown/scan (stat err = %v)", err)
+	if _, err := os.Stat(filepath.Join(api.dataRoot, "incoming", "scan")); !os.IsNotExist(err) {
+		t.Errorf("a second copy was written under incoming/scan (stat err = %v)", err)
 	}
 }
 

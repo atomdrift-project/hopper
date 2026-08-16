@@ -30,67 +30,67 @@ func TestUploadRelDir(t *testing.T) {
 		{
 			name: "scan dependency with a coordinate",
 			prov: sidecar("scan+build07", "pkg:npm/lodash@4.17.21", "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"),
-			want: "unknown/scan/pkg/npm/lodash/4.17.21",
+			want: "incoming/scan/pkg/npm/lodash/4.17.21",
 		},
 		{
 			name: "scoped coordinate keeps the scope as a level",
 			prov: sidecar("scan+build07", "pkg:npm/%40vue/cli@5.0.8", ""),
-			want: "unknown/scan/pkg/npm/@vue/cli/5.0.8",
+			want: "incoming/scan/pkg/npm/@vue/cli/5.0.8",
 		},
 		{
 			// The origin host is a fact about the fetch, not about what the
 			// package is, so it stays on the row and out of this tier.
 			name: "coordinate tier ignores the fetch host",
 			prov: sidecar("scan+build07", "pkg:pypi/requests@2.31.0", "https://files.pythonhosted.org/packages/x/requests-2.31.0.tar.gz"),
-			want: "unknown/scan/pkg/pypi/requests/2.31.0",
+			want: "incoming/scan/pkg/pypi/requests/2.31.0",
 		},
 		{
 			name:            "scan URL fetch with no coordinate",
 			prov:            sidecar("scan+build07", "", "https://cdn.example.com/releases/tool.tgz"),
-			want:            "unknown/scan/sha/example.com/3f/a9/" + testSHA,
+			want:            "incoming/scan/sha/example.com/3f/a9/" + testSHA,
 			wantDigestKeyed: true,
 		},
 		{
 			name:            "scan local file has no origin at all",
 			prov:            sidecar("scan+build07", "", ""),
-			want:            "unknown/scan/sha/_unknown/3f/a9/" + testSHA,
+			want:            "incoming/scan/sha/_unknown/3f/a9/" + testSHA,
 			wantDigestKeyed: true,
 		},
 		{
 			name:            "prism submission",
 			prov:            sidecar("prism", "", ""),
-			want:            "unknown/prism/sha/_unknown/3f/a9/" + testSHA,
+			want:            "incoming/prism/sha/_unknown/3f/a9/" + testSHA,
 			wantDigestKeyed: true,
 		},
 		{
 			name: "forager node upload",
 			prov: sidecar("forager+0a45da172e3f", "pkg:npm/evil@1.0.0", "https://registry.npmjs.org/evil/-/evil-1.0.0.tgz"),
-			want: "unknown/forager/pkg/npm/evil/1.0.0",
+			want: "incoming/forager/pkg/npm/evil/1.0.0",
 		},
 		{
 			// A version-less PURL is not an immutable coordinate: two fetches of
 			// it are not the same artifact, so the digest is the only honest key.
 			name:            "version-less coordinate falls back to the digest",
 			prov:            sidecar("scan+build07", "pkg:npm/lodash", "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"),
-			want:            "unknown/scan/sha/npmjs.org/3f/a9/" + testSHA,
+			want:            "incoming/scan/sha/npmjs.org/3f/a9/" + testSHA,
 			wantDigestKeyed: true,
 		},
 		{
 			// The collector is a producer claim; an unlisted one must never mint
 			// a directory of its own choosing.
-			name: "unlisted producer falls back to the legacy root",
+			name: "unlisted producer falls back to the fallback root",
 			prov: sidecar("some-new-tool+1", "pkg:npm/lodash@4.17.21", ""),
-			want: "unknown/uploads/3f/a9",
+			want: "incoming/uploads/3f/a9",
 		},
 		{
-			name: "no provenance at all falls back to the legacy root",
+			name: "no provenance at all falls back to the fallback root",
 			prov: nil,
-			want: "unknown/uploads/3f/a9",
+			want: "incoming/uploads/3f/a9",
 		},
 		{
 			name: "producer name is matched case-insensitively",
 			prov: sidecar("SCAN+Build07", "pkg:npm/lodash@4.17.21", ""),
-			want: "unknown/scan/pkg/npm/lodash/4.17.21",
+			want: "incoming/scan/pkg/npm/lodash/4.17.21",
 		},
 	}
 	for _, tt := range tests {
