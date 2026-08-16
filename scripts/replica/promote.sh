@@ -29,6 +29,7 @@ OFFLINE_PROMOTE="${OFFLINE_PROMOTE:-0}"
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$SCRIPT_DIR/replicated-tables.sh"
 
 # Admin probe — same ladder as setup-replica.sh so this works cleanly on
 # CachyOS (doas), FreeBSD (doas or sudo), Debian (sudo), or a box where
@@ -124,23 +125,30 @@ fi
 
 # --- 4. Make this database publishable ------------------------------------
 
-log "Ensuring local publication '$SUBSCRIPTION' publishes public.samples"
+log "Ensuring local publication '$SUBSCRIPTION' publishes: $REPLICATED_TABLES"
 pub_exists=$(admin -d "$LOCAL_DB" -tAc \
     "SELECT 1 FROM pg_publication WHERE pubname = '$SUBSCRIPTION'" | tr -d '[:space:]')
-if [ "$pub_exists" = "1" ]; then
-    pub_has_samples=$(admin -d "$LOCAL_DB" -tAc \
-        "SELECT 1 FROM pg_publication_tables WHERE pubname = '$SUBSCRIPTION' AND schemaname = 'public' AND tablename = 'samples'" \
-        | tr -d '[:space:]')
-    if [ "$pub_has_samples" != "1" ]; then
-        admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -v pub="$SUBSCRIPTION" <<'SQL'
-ALTER PUBLICATION :"pub" ADD TABLE public.samples;
-SQL
-    fi
-else
+if [ "$pub_exists" != "1" ]; then
     admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -v pub="$SUBSCRIPTION" <<'SQL'
-CREATE PUBLICATION :"pub" FOR TABLE public.samples;
+CREATE PUBLICATION :"pub";
 SQL
 fi
+
+for table in $REPLICATED_TABLES; do
+    table_exists=$(admin -d "$LOCAL_DB" -tAc \
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = '$table'" \
+        | tr -d '[:space:]')
+    [ "$table_exists" = "1" ] || die "expected replicated table public.$table is missing; run 'make replica' or './hopper init' first"
+
+    pub_has_table=$(admin -d "$LOCAL_DB" -tAc \
+        "SELECT 1 FROM pg_publication_tables WHERE pubname = '$SUBSCRIPTION' AND schemaname = 'public' AND tablename = '$table'" \
+        | tr -d '[:space:]')
+    if [ "$pub_has_table" != "1" ]; then
+        admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -v pub="$SUBSCRIPTION" <<SQL
+ALTER PUBLICATION :"pub" ADD TABLE public.$table;
+SQL
+    fi
+done
 
 log "Granting hopper role REPLICATION for future subscribers"
 admin -v ON_ERROR_STOP=1 <<'SQL'

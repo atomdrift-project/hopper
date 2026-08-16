@@ -1,18 +1,21 @@
 #!/bin/sh
 # rebuild-replica.sh — tear down a wedged replica and rebuild it from
 # scratch. Use when the upstream replication slot has been invalidated
-# (e.g. max_slot_wal_keep_size exceeded) and the apply worker can no
-# longer resume, so an incremental refresh is impossible.
+# (e.g. max_slot_wal_keep_size exceeded), or when stale local rows make an
+# incremental/initial refresh impossible because of data conflicts.
 #
-# This is destructive: it TRUNCATEs the locally replicated tables and
-# re-copies every row from the publisher. setup.sh deliberately never
-# truncates — Postgres' initial tablesync COPY appends, so a re-copy on
-# top of stale rows would collide on the primary key. Guard with FORCE=true.
+# This is destructive: it TRUNCATEs the locally published tables and
+# re-copies every row from the publisher. The table list is read from the
+# publisher's publication at runtime, so newly published tables are included.
+# setup.sh deliberately never truncates — Postgres' initial tablesync COPY
+# appends, so a re-copy on top of stale rows would collide on primary keys.
+# Guard with FORCE=true.
 #
 # Steps:
 #   1. Disable + drop the local subscription (slot_name = NONE so DROP
 #      doesn't block trying to reach the dead remote slot).
-#   2. TRUNCATE samples, sample_locations, reports (RESTART IDENTITY CASCADE).
+#   2. TRUNCATE every locally-present table in the publisher's publication
+#      (RESTART IDENTITY CASCADE).
 #   3. Re-run setup.sh with COPY_DATA=true, which drops any orphan remote
 #      slot, recreates the subscription, and triggers a fresh full copy.
 #
@@ -20,7 +23,7 @@
 # re-copies again (the subscription is dropped and recreated each time).
 #
 # Overridable via env: REMOTE_HOST, REMOTE_USER, REMOTE_DB, LOCAL_DB,
-# SUBSCRIPTION, FORCE. setup.sh's own env (PUBLICATION, PGPASSFILE, …) is
+# SUBSCRIPTION, PUBLICATION, FORCE. setup.sh's own env (PGPASSFILE, …) is
 # inherited and passed through.
 
 set -eu
@@ -29,6 +32,7 @@ REMOTE_HOST="${REMOTE_HOST:-hopper-db}"
 REMOTE_USER="${REMOTE_USER:-hopper}"
 REMOTE_DB="${REMOTE_DB:-hopper}"
 LOCAL_DB="${LOCAL_DB:-hopper}"
+PUBLICATION="${PUBLICATION:-hopper_replica}"
 # Mirror setup.sh's per-host default so a bare `make rebuild-replica`
 # targets the same subscription a bare `make replica` created. For a
 # Bastille jail, pass SUBSCRIPTION explicitly (same as diagnose).
@@ -48,6 +52,7 @@ validate_ident() {
 }
 
 validate_ident SUBSCRIPTION "$SUBSCRIPTION"
+validate_ident PUBLICATION "$PUBLICATION"
 case "$FORCE" in
     true) ;;
     *) die "rebuild is destructive (TRUNCATEs + full re-copy). Re-run with FORCE=true to proceed." ;;
@@ -71,6 +76,7 @@ elif command -v sudo >/dev/null 2>&1 && sudo -u postgres psql -tAc 'SELECT 1' >/
 else
     die "no admin access to local postgres (tried 'psql -U postgres', doas, sudo)"
 fi
+
 if [ -z "$ESCALATE" ]; then
     admin() { psql -U postgres "$@"; }
     pg_sh() { sh -c "$1"; }
@@ -80,6 +86,45 @@ else
     # shellcheck disable=SC2086
     pg_sh() { $ESCALATE sh -c "$1"; }
 fi
+
+# Read the publisher's current publication before dropping the subscription.
+# This keeps the destructive reset in step with the actual publication rather
+# than a stale hand-maintained list (notably, this includes sightings).
+if ! published_tables=$(psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" \
+        -tA -F '|' -c \
+        "SELECT schemaname, tablename
+           FROM pg_publication_tables
+          WHERE pubname = '$PUBLICATION'
+          ORDER BY schemaname, tablename"); then
+    die "could not read publication '$PUBLICATION' from $REMOTE_HOST"
+fi
+[ -n "$published_tables" ] || die "publication '$PUBLICATION' has no tables on $REMOTE_HOST"
+
+truncate_tables=''
+while IFS='|' read -r schema table; do
+    [ -n "$schema" ] || continue
+    case "$schema" in
+        public) ;;
+        *) die "publication '$PUBLICATION' contains unsupported schema '$schema'; rebuild expects public tables" ;;
+    esac
+    case "$table" in
+        ""|[!A-Za-z_]*|*[!A-Za-z0-9_]*)
+            die "publication '$PUBLICATION' contains unsupported table name '$table'" ;;
+    esac
+
+    local_table=$(admin -d "$LOCAL_DB" -tAc \
+        "SELECT to_regclass('public.$table') IS NOT NULL" | tr -d '[:space:]')
+    if [ "$local_table" = "t" ]; then
+        truncate_tables="$truncate_tables public.$table,"
+    else
+        log "Published table '$schema.$table' is not local yet; setup.sh will create it"
+    fi
+done <<EOF
+$published_tables
+EOF
+
+[ -n "$truncate_tables" ] || die "none of the publisher's published tables exist locally; refusing an empty rebuild"
+truncate_tables=${truncate_tables%,}
 
 # Suppress the schema-drift self-healer for the rebuild — it must not try to
 # re-enable the subscription while we deliberately drop, truncate, and re-copy.
@@ -106,22 +151,22 @@ else
 fi
 
 # --- 2. Clear the replicated tables ----------------------------------------
-# RESTART IDENTITY resets id sequences; CASCADE covers the FKs from
-# sample_locations / reports to samples. This matches hopper's own reset.
-log "Truncating samples, sample_locations, reports (full re-copy follows)"
-admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 <<'SQL'
-TRUNCATE samples, sample_locations, reports RESTART IDENTITY CASCADE;
-SQL
+# RESTART IDENTITY resets id sequences. CASCADE also clears local FK-dependent
+# tables that are not themselves published (for example claims -> samples).
+log "Truncating published tables:$truncate_tables (full re-copy follows)"
+admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -c \
+    "TRUNCATE $truncate_tables RESTART IDENTITY CASCADE;"
 
 # --- 3. Recreate the subscription with a fresh full copy -------------------
 # setup.sh recreates the role/db (no-ops here), reconciles the publication,
 # drops any orphan remote slot, and CREATE SUBSCRIPTION ... copy_data=true.
 log "Re-running setup.sh for a fresh copy (COPY_DATA=true)"
 COPY_DATA=true \
-REMOTE_HOST="$REMOTE_HOST" \
-REMOTE_USER="$REMOTE_USER" \
-REMOTE_DB="$REMOTE_DB" \
-LOCAL_DB="$LOCAL_DB" \
+    REMOTE_HOST="$REMOTE_HOST" \
+    REMOTE_USER="$REMOTE_USER" \
+    REMOTE_DB="$REMOTE_DB" \
+    PUBLICATION="$PUBLICATION" \
+    LOCAL_DB="$LOCAL_DB" \
 SUBSCRIPTION="$SUBSCRIPTION" \
     "$SCRIPT_DIR/setup.sh"
 

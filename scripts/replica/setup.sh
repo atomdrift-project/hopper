@@ -217,11 +217,25 @@ fi
 # don't race. pg_sh runs a command as the postgres OS user (same escalation as
 # admin()) so files land where the healer — also postgres — reads them.
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$SCRIPT_DIR/replicated-tables.sh"
+REPLICATED_TABLES_SQL=$(printf "'%s'," $REPLICATED_TABLES | sed 's/,$//')
 if [ -z "$ESCALATE" ]; then
     pg_sh() { sh -c "$1"; }
 else
     # shellcheck disable=SC2086
     pg_sh() { $ESCALATE sh -c "$1"; }
+fi
+
+# A disabled subscription may be stopped intentionally, but it may also have
+# been disabled by disable_on_error after a data conflict. Do not blindly
+# re-enable an existing disabled subscription: make replica is non-destructive
+# setup, not a repair/rebuild operation. rebuild.sh drops the subscription and
+# creates a fresh one after clearing the published tables.
+existing_sub_enabled=$(admin -d "$LOCAL_DB" -tAc \
+    "SELECT subenabled FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" \
+    | tr -d '[:space:]')
+if [ "$existing_sub_enabled" = "f" ]; then
+    die "subscription '$SUBSCRIPTION' is disabled; make replica will not re-enable it after an apply/sync error. Diagnose it, or run 'SUBSCRIPTION=$SUBSCRIPTION make rebuild-replica FORCE=true' for a full re-copy"
 fi
 HEAL_DIR=$(pg_sh 'printf %s "${HEAL_STATE_DIR:-$HOME/.hopper-replica-heal}"' 2>/dev/null || true)
 maint_on()  { [ -n "${HEAL_DIR:-}" ] && pg_sh "mkdir -p '$HEAL_DIR' && : > '$HEAL_DIR/maintenance'" 2>/dev/null || true; }
@@ -330,13 +344,15 @@ LOCAL_DB="$LOCAL_DB" "$SCRIPT_DIR/slim-indexes.sh" \
 # Reconcile the publisher before creating or refreshing the local
 # subscription. A subscription can have a healthy apply worker even when its
 # publication has no tables, so make the publication/table membership explicit.
-log "Ensuring remote publication '$PUBLICATION' publishes public.samples"
+log "Ensuring remote publication '$PUBLICATION' publishes: $REPLICATED_TABLES"
 psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" \
     -v ON_ERROR_STOP=1 <<SQL
 DO \$$
 DECLARE
     target_pub text := '$PUBLICATION';
     old_pub    text := '$LEGACY_PUBLICATION';
+    t          text;
+    replicated text[] := ARRAY[$REPLICATED_TABLES_SQL];
 BEGIN
     IF target_pub <> old_pub
        AND EXISTS (SELECT 1 FROM pg_publication WHERE pubname = old_pub)
@@ -345,21 +361,34 @@ BEGIN
     END IF;
 
     IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = target_pub) THEN
-        EXECUTE format('CREATE PUBLICATION %I FOR TABLE public.samples', target_pub);
-    ELSIF NOT EXISTS (
-        SELECT 1
-          FROM pg_publication_tables
-         WHERE pubname = target_pub
-           AND schemaname = 'public'
-           AND tablename = 'samples'
-    ) THEN
-        EXECUTE format('ALTER PUBLICATION %I ADD TABLE public.samples', target_pub);
+        EXECUTE format('CREATE PUBLICATION %I', target_pub);
     END IF;
+
+    FOREACH t IN ARRAY replicated LOOP
+        IF EXISTS (
+            SELECT 1
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public'
+               AND c.relname = t
+               AND c.relkind IN ('r', 'p')
+        ) AND NOT EXISTS (
+            SELECT 1
+              FROM pg_publication_tables
+             WHERE pubname = target_pub
+               AND schemaname = 'public'
+               AND tablename = t
+        ) THEN
+            EXECUTE format('ALTER PUBLICATION %I ADD TABLE public.%I', target_pub, t);
+            RAISE NOTICE 'added table % to publication %', t, target_pub;
+        END IF;
+    END LOOP;
 END \$$;
 SQL
 
 # --- Schema parity gate ----------------------------------------------------
-# A logical subscriber must have every column the publisher replicates. If it
+# A logical subscriber must have every column on every table the publisher
+# replicates. If it
 # doesn't, the tablesync/apply worker dies on startup with "missing replicated
 # column" and the launcher restarts it forever — a crash loop that pins the
 # publisher's replication slot and retains WAL on the master without bound
@@ -372,29 +401,47 @@ SQL
 #
 # Published column set: pg_publication_tables.attnames lists exactly the
 # columns the publisher sends (all of them when the publication has no column
-# list, as ours doesn't). We require the local table to be a superset.
-log "Verifying local public.samples covers every column the publisher replicates"
-published_cols=$(psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" -tAc \
-    "SELECT unnest(attnames) FROM pg_publication_tables
-      WHERE pubname = '$PUBLICATION' AND schemaname = 'public' AND tablename = 'samples'" \
-    2>/dev/null | sort -u)
-[ -n "$published_cols" ] || die "publisher reports no published columns for public.samples under '$PUBLICATION' — publication missing or unreachable"
-local_cols=$(admin -d "$LOCAL_DB" -tAc \
-    "SELECT column_name FROM information_schema.columns
-      WHERE table_schema = 'public' AND table_name = 'samples'" | sort -u)
-[ -n "$local_cols" ] || die "local public.samples has no columns (table missing?) — run 'hopper init' first"
-# Set subtraction "published minus local": grep -F reads each line of $local_cols
-# as a fixed, whole-line (-x) pattern, and -v prints the published columns that
-# match none of them. Done as a single set op rather than a shell for-loop —
-# word-splitting $published_cols is IFS-dependent and brittle. (|| true: grep
-# exits 1 when nothing is missing, which is the good case and must not trip
-# 'set -e'.)
-missing=$(printf '%s\n' "$published_cols" | grep -vxF "$local_cols" || true)
+# list). Require every local published table to be a superset.
+log "Verifying local tables cover every column the publisher replicates"
+published_tables=$(psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" -tA -F '|' -c \
+    "SELECT schemaname, tablename
+       FROM pg_publication_tables
+      WHERE pubname = '$PUBLICATION'
+      ORDER BY schemaname, tablename" 2>/dev/null)
+[ -n "$published_tables" ] || die "publisher reports no tables under publication '$PUBLICATION' — publication missing or unreachable"
+
+missing=''
+while IFS='|' read -r schema table; do
+    [ -n "$schema" ] || continue
+    published_cols=$(psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" -tAc \
+        "SELECT unnest(attnames) FROM pg_publication_tables
+          WHERE pubname = '$PUBLICATION'
+            AND schemaname = '$schema'
+            AND tablename = '$table'" 2>/dev/null | sort -u)
+    [ -n "$published_cols" ] || die "publisher reports no columns for $schema.$table under '$PUBLICATION'"
+    local_cols=$(admin -d "$LOCAL_DB" -tAc \
+        "SELECT column_name FROM information_schema.columns
+          WHERE table_schema = '$schema' AND table_name = '$table'" | sort -u)
+    if [ -z "$local_cols" ]; then
+        table_missing="$published_cols"
+    else
+        # Set subtraction: grep treats each local column as a fixed,
+        # whole-line pattern. (grep exits 1 for the good/no-missing case.)
+        table_missing=$(printf '%s\n' "$published_cols" | grep -vxF "$local_cols" || true)
+    fi
+    if [ -n "$table_missing" ]; then
+        missing="$missing $schema.$table:$(printf '%s' "$table_missing" | tr '\n' ',')"
+    fi
+done <<EOF
+$published_tables
+EOF
+
 if [ -n "$missing" ]; then
-    die "local public.samples is missing column(s) the publisher replicates: $(printf '%s' "$missing" | tr '\n' ' ')
+    die "local published table(s) are missing replicated column(s):$missing
        The local schema is behind the publisher — the hopper binary that ran
        'init' is likely stale (built before these columns' migrations existed).
-       Rebuild it and re-run:  make build && make replica
+       Rebuild it and re-run:  make build && make replica (or use
+       make rebuild-replica FORCE=true if this subscription is disabled)
        Skipping CREATE/REFRESH SUBSCRIPTION: subscribing now would crash-loop
        the apply worker and retain WAL on the publisher without bound."
 fi
