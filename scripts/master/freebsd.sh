@@ -27,10 +27,14 @@ SERVICE_USER=hopper
 HOPPER_BIN=/usr/local/bin/hopper
 CLEAVE_BIN=/usr/local/bin/cleave
 HOPPER_RCD=/usr/local/etc/rc.d/hopper
+HEAL_PERMS_BIN=/usr/local/sbin/hopper-heal-perms
+HEAL_PERMS_PERIODIC=/usr/local/etc/periodic/daily/480.hopper-heal-perms
 RC_TMP=""
+PERIODIC_TMP=""
 
 cleanup() {
 	[ -z "$RC_TMP" ] || rm -f "$RC_TMP"
+	[ -z "$PERIODIC_TMP" ] || rm -f "$PERIODIC_TMP"
 }
 trap cleanup EXIT
 
@@ -159,6 +163,21 @@ fi
 log "Installing binaries"
 $SUDO install -m 0755 -o root -g wheel ./hopper "$HOPPER_BIN"
 $SUDO install -m 0755 -o root -g wheel "$CLEAVE_DIR/out/cleave" "$CLEAVE_BIN"
+
+# A full corpus walk must not hold up Hopper readiness. Install the shared-tree
+# healer as a daily periodic task instead; it repairs drift from manual moves,
+# imports, and files restored with numeric IDs from another host.
+log "Installing sample permission healer"
+$SUDO install -d -m 0755 -o root -g wheel /usr/local/sbin /usr/local/etc/periodic/daily
+$SUDO install -m 0755 -o root -g wheel scripts/master/heal-perms.sh "$HEAL_PERMS_BIN"
+PERIODIC_TMP=$(mktemp -t hopper.heal-periodic.XXXXXX)
+cat >"$PERIODIC_TMP" <<EOF
+#!/bin/sh
+exec env DATA_DIR='$DATA_DIR' SAMPLES_GROUP='$SAMPLES_GROUP' '$HEAL_PERMS_BIN'
+EOF
+if ! $SUDO cmp -s "$PERIODIC_TMP" "$HEAL_PERMS_PERIODIC" 2>/dev/null; then
+	$SUDO install -m 0755 -o root -g wheel "$PERIODIC_TMP" "$HEAL_PERMS_PERIODIC"
+fi
 
 log "Refreshing cleave rules"
 $SUDO su -l "$SERVICE_USER" -c "$CLEAVE_BIN update-rules" \

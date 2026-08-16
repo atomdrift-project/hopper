@@ -43,8 +43,19 @@
 #   SAMPLES_GROUP   owning group     (default samples)
 set -eu
 
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
 DATA_DIR="${DATA_DIR:-/data/samples}"
 GROUP="${SAMPLES_GROUP:-samples}"
+
+# GNU coreutils reports only changed entries with -c; FreeBSD provides the
+# equivalent useful output with -v. The find predicates already select only
+# entries that need repair, so -v remains one line per change.
+case "$(uname -s)" in
+FreeBSD) CHANGE_FLAG=-v ;;
+*)       CHANGE_FLAG=-c ;;
+esac
 
 # hopper's upload trees are healed like the rest (group + 2775 dirs), but their
 # sample files are 0440 not 0444 (see header), so the file pass splits on them.
@@ -83,11 +94,11 @@ log() { echo "heal-perms: $*"; }
 #    upload shards included). -h regroups a stray symlink as the link itself
 #    rather than following it to its target.
 grp_out=$(find "$DATA_DIR" -path "$EXCLUDE" -prune -o ! -group "$GROUP" -print0 \
-    | xargs -0 -r -n 4096 chgrp -ch "$GROUP" -- 2>/dev/null) || true
+    | xargs -0 -r -n 4096 chgrp "$CHANGE_FLAG" -h "$GROUP" 2>/dev/null) || true
 
 # 2. Directories not already exactly 2775 (setgid + group-writable), whole tree.
 dir_out=$(find "$DATA_DIR" -path "$EXCLUDE" -prune -o -type d ! -perm 2775 -print0 \
-    | xargs -0 -r -n 2048 chmod -c 2775 -- 2>/dev/null) || true
+    | xargs -0 -r -n 2048 chmod "$CHANGE_FLAG" 2775 2>/dev/null) || true
 
 # 3. Regular files outside the upload trees → 0444 (read-only, world-readable).
 #    Every upload tree is pruned here and handled by pass 4. Immutability is
@@ -100,7 +111,7 @@ for tree in $UPLOAD_DIRS; do
 done
 set -- "$@" ")"
 file_out=$(find "$DATA_DIR" "$@" -prune -o -type f ! -perm 0444 -print0 \
-    | xargs -0 -r -n 4096 chmod -c 0444 -- 2>/dev/null) || true
+    | xargs -0 -r -n 4096 chmod "$CHANGE_FLAG" 0444 2>/dev/null) || true
 
 # 4. Upload sample files → 0440 (group-private; see header). Walks only the trees
 #    that exist, pruning the in-flight .tmp staging dir.
@@ -113,7 +124,7 @@ done
 upload_out=""
 if [ "$#" -gt 0 ]; then
     upload_out=$(find "$@" -path "$EXCLUDE" -prune -o -type f ! -perm 0440 -print0 \
-        | xargs -0 -r -n 4096 chmod -c 0440 -- 2>/dev/null) || true
+        | xargs -0 -r -n 4096 chmod "$CHANGE_FLAG" 0440 2>/dev/null) || true
 fi
 
 # Per-path heal log to the journal (nothing on a clean tree).
