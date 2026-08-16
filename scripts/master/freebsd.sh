@@ -1,0 +1,183 @@
+#!/bin/sh
+# freebsd.sh - Install Hopper and its separately supervised Scan worker on a
+# native FreeBSD host.
+#
+# Hopper owns ingestion and the HTTP API. Atomdrift Scan is installed as the
+# independent scan-worker rc.d service from the sibling scan checkout; it is
+# deliberately not a child of hopper, so an analysis OOM cannot take the API
+# down with it.
+
+set -eu
+
+DATA_DIR="${DATA_DIR:-/data/samples}"
+DB="${DB:-postgres://hopper@hopper-db/hopper?sslmode=disable}"
+SOURCE="${SOURCE:-harvest}"
+DASH_ADDR="${DASH_ADDR:-0.0.0.0:8081}"
+WORKERS="${WORKERS:-}"
+MAX_MEMORY_GB="${MAX_MEMORY_GB:-0}"
+LLM="${LLM:-http://10.9.8.149:8000/v1}"
+SCAN_DIR="${SCAN_DIR:-../scan}"
+CLEAVE_DIR="${CLEAVE_DIR:-../cleave}"
+SAMPLES_GROUP="${SAMPLES_GROUP:-samples}"
+PULL_DISABLE="${PULL_DISABLE:-0}"
+DATASET_INCOMPLETE="${DATASET_INCOMPLETE:-1}"
+
+SERVICE_USER=hopper
+HOPPER_BIN=/usr/local/bin/hopper
+CLEAVE_BIN=/usr/local/bin/cleave
+HOPPER_RCD=/usr/local/etc/rc.d/hopper
+
+die() {
+	echo "error: $*" >&2
+	exit 1
+}
+
+log() {
+	echo "==> $*"
+}
+
+[ "$(uname -s)" = "FreeBSD" ] || die "this script is for FreeBSD"
+[ -d "$DATA_DIR" ] || die "DATA_DIR does not exist: $DATA_DIR"
+[ -f Makefile ] || die "run from the Hopper repository root"
+[ -d "$SCAN_DIR" ] || die "Scan source not found at $SCAN_DIR"
+[ -d "$CLEAVE_DIR" ] || die "cleave source not found at $CLEAVE_DIR"
+
+if command -v doas >/dev/null 2>&1; then
+	SUDO=doas
+elif command -v sudo >/dev/null 2>&1; then
+	SUDO=sudo
+else
+	die "need doas or sudo"
+fi
+
+missing=""
+for pkg in go gmake git rust pkgconf mold 7-zip upx rizin innoextract; do
+	pkg info -e "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"
+done
+if [ -n "$missing" ]; then
+	log "Installing packages:$missing"
+	# shellcheck disable=SC2086
+	$SUDO pkg install -y $missing
+fi
+
+update_source() {
+	name=$1
+	dir=$2
+	if [ "$PULL_DISABLE" != 0 ]; then
+		log "Skipping $name source pull (PULL_DISABLE=$PULL_DISABLE)"
+		return
+	fi
+	log "Updating $name source"
+	git -C "$dir" pull --ff-only
+}
+
+log "Updating sibling sources"
+update_source scan "$SCAN_DIR"
+update_source cleave "$CLEAVE_DIR"
+
+log "Building Hopper"
+gmake build
+
+log "Building cleave"
+gmake -C "$CLEAVE_DIR" release >/dev/null
+[ -x "$CLEAVE_DIR/out/cleave" ] || die "cleave build did not produce $CLEAVE_DIR/out/cleave"
+
+log "Ensuring Hopper service user exists"
+if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
+	$SUDO pw useradd "$SERVICE_USER" -m -s /bin/sh -c "Hopper Service"
+fi
+
+log "Ensuring shared sample group exists"
+if ! pw groupshow "$SAMPLES_GROUP" >/dev/null 2>&1; then
+	$SUDO pw groupadd "$SAMPLES_GROUP"
+fi
+$SUDO pw groupmod "$SAMPLES_GROUP" -m "$SERVICE_USER"
+
+# Create scan before invoking scan's installer so it can be added to the same
+# group before the generated rc.d service starts.
+if ! id -u scan >/dev/null 2>&1; then
+	$SUDO pw useradd scan -m -s /bin/sh -c "Atomdrift Scan Worker"
+fi
+$SUDO pw groupmod "$SAMPLES_GROUP" -m scan
+
+# Use the deploying user's pgpass when the DSN does not carry credentials.
+# Keep it in Hopper's home so both the migration command and rc.d service use
+# the same libpq lookup without putting a password in rc.conf.
+PGPASS_SRC="${PGPASSFILE:-${HOME:-}/.pgpass}"
+if [ -r "$PGPASS_SRC" ]; then
+	$SUDO install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_USER" \
+		"$PGPASS_SRC" "/home/$SERVICE_USER/.pgpass"
+fi
+
+log "Installing binaries"
+$SUDO install -m 0755 -o root -g wheel ./hopper "$HOPPER_BIN"
+$SUDO install -m 0755 -o root -g wheel "$CLEAVE_DIR/out/cleave" "$CLEAVE_BIN"
+
+log "Refreshing cleave rules"
+$SUDO su -l "$SERVICE_USER" -c "$CLEAVE_BIN update-rules" \
+	|| die "cleave update-rules failed"
+
+log "Running Hopper migrations"
+$SUDO su -l "$SERVICE_USER" -c "$HOPPER_BIN init --db '$DB'" \
+	|| die "Hopper database initialization failed"
+
+$SUDO install -d -m 0755 -o root -g wheel /usr/local/etc/rc.d
+RC_TMP=$(mktemp -t hopper.rcd.XXXXXX)
+trap 'rm -f "$RC_TMP"' EXIT
+
+dataset_arg=""
+[ "$DATASET_INCOMPLETE" != 0 ] && dataset_arg=" --dataset-incomplete"
+
+cat >"$RC_TMP" <<EOF
+#!/bin/sh
+
+# PROVIDE: hopper
+# REQUIRE: LOGIN DAEMON NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="hopper"
+rcvar="hopper_enable"
+
+load_rc_config \$name
+
+: \${hopper_enable:="NO"}
+: \${hopper_data:="$DATA_DIR"}
+: \${hopper_db:="$DB"}
+: \${hopper_source:="$SOURCE"}
+: \${hopper_bind:="$DASH_ADDR"}
+: \${hopper_logfile:="/var/log/hopper.log"}
+
+pidfile="/var/run/\${name}.pid"
+command="/usr/sbin/daemon"
+# --litmus '' is intentional: the Scan worker is a separate rc.d service.
+command_args="-c -f -r -R 10 -P \${pidfile} -o \${hopper_logfile} -u hopper /usr/bin/env HOME=/home/hopper DATABASE_URL=\${hopper_db} $HOPPER_BIN load --data \${hopper_data} --db \${hopper_db} --source \${hopper_source} --dashboard-addr \${hopper_bind} --litmus '' --cleave $CLEAVE_BIN$dataset_arg"
+
+run_rc_command "\$1"
+EOF
+
+if ! $SUDO cmp -s "$RC_TMP" "$HOPPER_RCD" 2>/dev/null; then
+	log "Installing Hopper rc.d service"
+	$SUDO install -m 0755 -o root -g wheel "$RC_TMP" "$HOPPER_RCD"
+else
+	log "Hopper rc.d service unchanged"
+fi
+$SUDO sysrc hopper_enable=YES >/dev/null
+
+if $SUDO service hopper status >/dev/null 2>&1; then
+	log "Restarting Hopper"
+	$SUDO service hopper restart
+else
+	log "Starting Hopper"
+	$SUDO service hopper start
+fi
+
+log "Deploying separate Scan worker"
+(cd "$SCAN_DIR" && \
+	DATA_DIR="$DATA_DIR" WORKERS="$WORKERS" MAX_RSS_GB="$MAX_MEMORY_GB" LLM="$LLM" \
+		./scripts/worker/worker-freebsd.sh "http://127.0.0.1:8081")
+
+log "Deployment complete"
+log "Hopper API: http://127.0.0.1:8081"
+log "Hopper database: $DB"

@@ -101,6 +101,30 @@ Protect the worker/file API, database, dashboard, and bearer tokens as
 sensitive infrastructure. Hopper can serve malware bytes and store authoritative
 labels; it should not be exposed directly to the public internet.
 
+## Native FreeBSD deployment
+
+On FreeBSD, `make deploy` installs Hopper and the Scan worker as separate
+`rc.d` services. Hopper runs the ingestion/API process with its local worker
+disabled; `scan-worker` pulls jobs from Hopper and can read the same sample tree
+directly.
+
+```bash
+make deploy \
+  DATA_DIR=/data/samples \
+  DB='postgres://hopper@hopper-db/hopper?sslmode=disable' \
+  SCAN_DIR=../scan \
+  FREEBSD_WORKERS=96 \
+  FREEBSD_MAX_MEMORY_GB=0
+```
+
+`FREEBSD_MAX_MEMORY_GB=0` leaves Scan's RSS admission threshold automatic.
+
+The deploy also builds and installs `cleave`, runs Hopper migrations, refreshes
+the tool rules, and configures `hopper` to listen on port 8081. The worker is
+supervised independently, so a worker crash or memory failure does not stop the
+Hopper API. The `scan` account must be able to read `DATA_DIR`; the installer
+adds both service accounts to the `samples` group by default.
+
 ## Useful commands
 
 ```bash

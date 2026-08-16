@@ -1,20 +1,17 @@
-.PHONY: build test clean deploy rollout-bastille rollout-replica-bastille replica rebuild-replica diagnose-replica promote-replica install-precommit help
+.PHONY: build test clean deploy deploy-linux deploy-freebsd rollout-replica-bastille replica rebuild-replica diagnose-replica promote-replica install-precommit help
 
 DATA_DIR  ?= /data/samples
 DB        ?= postgres://hopper@hopper-db/hopper?sslmode=disable
 SOURCE    ?= harvest
 DASH_ADDR ?= 0.0.0.0:8081
-# Local atomscan worker slots and RSS cap in GB, forwarded to the systemd
-# script as --workers and --max-memory-gb. 0 for either emits no flag and
-# defers to hopper's built-in default (40 workers / 48 GB, set once in
-# cmd/hopper/main.go).
+# Linux atomscan worker slots and RSS cap in GB, forwarded to the systemd
+# deploy script as --workers and --max-memory-gb.
 #
 # These carry real values rather than 0 because a setting that lives only in
 # the generated unit file is silently lost on the next bare `make deploy` —
 # which is how the swap cap regressed once already, and how --workers 60 came
-# within one deploy of dropping to 40 on 2026-08-01. Only `make deploy`
-# (scripts/master/linux-systemd.sh) reads these; the Bastille rollouts ignore
-# them. Override per-host on the invocation.
+# within one deploy of dropping to 40 on 2026-08-01. Override per-host on the
+# invocation.
 #
 # Sized for nazgul: 128 cores, 125 GB RAM, hopper.service MemoryMax=96G.
 # MAX_MEMORY_GB must stay under (hopper.service MemoryMax / rssKillFactor):
@@ -24,6 +21,12 @@ DASH_ADDR ?= 0.0.0.0:8081
 # cutting ARC c_max to stay inside physical RAM.
 WORKERS       ?= 60
 MAX_MEMORY_GB ?= 72
+# Native FreeBSD runs the worker as a separate rc.d service. Let Scan choose
+# its RSS admission threshold automatically unless a host needs an override.
+FREEBSD_WORKERS       ?= 96
+FREEBSD_MAX_MEMORY_GB ?= 0
+SCAN_DIR      ?= ../scan
+LLM           ?= http://10.9.8.149:8000/v1
 
 help:
 	@echo "Available targets:"
@@ -32,10 +35,10 @@ help:
 	@echo "  make lint                   Run linters"
 	@echo "  make clean                  Clean build artifacts"
 	@echo "  make install-precommit      Install the git pre-commit hook (test + lint + go.mod)"
-	@echo "  make deploy                 Install as a hardened systemd service on this Linux host"
+	@echo "  make deploy                 Install Hopper and its separate scan worker"
 	@echo "                              (DATA_DIR=$(DATA_DIR) DB=... SOURCE=$(SOURCE) DASH_ADDR=$(DASH_ADDR)"
-	@echo "                               WORKERS=$(WORKERS) MAX_MEMORY_GB=$(MAX_MEMORY_GB))"
-	@echo "  make rollout-bastille       Deploy to Bastille jails (BUILD=build RUN=hopper [DB_ONLY=1])"
+	@echo "                               Linux: WORKERS=$(WORKERS) MAX_MEMORY_GB=$(MAX_MEMORY_GB)"
+	@echo "                               FreeBSD: WORKERS=$(FREEBSD_WORKERS) MAX_MEMORY_GB=$(FREEBSD_MAX_MEMORY_GB) SCAN_DIR=$(SCAN_DIR))"
 	@echo "  make rollout-replica-bastille Deploy a Bastille jail as a logical replica"
 	@echo "                              (RUN=<jail> REMOTE_HOST=hopper-db SUBSCRIPTION=...;"
 	@echo "                               REBUILD=true for a destructive re-copy of a wedged jail,"
@@ -59,21 +62,23 @@ install-precommit:
 test:
 	go test ./...
 
-BUILD ?= build
-RUN ?= hopper
-
 deploy:
+	@case "$$(uname -s)" in \
+		FreeBSD) $$(MAKE) deploy-freebsd ;; \
+		*)       $$(MAKE) deploy-linux ;; \
+	esac
+
+deploy-linux:
 	DATA_DIR='$(DATA_DIR)' DB='$(DB)' SOURCE='$(SOURCE)' \
 	DASH_ADDR='$(DASH_ADDR)' WORKERS='$(WORKERS)' \
 	MAX_MEMORY_GB='$(MAX_MEMORY_GB)' \
 	./scripts/master/linux-systemd.sh
 
-rollout-bastille:
-	@if [ -n "$(DB_ONLY)" ]; then \
-		DB_ONLY=1 ./scripts/master/freebsd-bastille.sh "" "$(RUN)"; \
-	else \
-		./scripts/master/freebsd-bastille.sh "$(BUILD)" "$(RUN)"; \
-	fi
+deploy-freebsd:
+	DATA_DIR='$(DATA_DIR)' DB='$(DB)' SOURCE='$(SOURCE)' \
+	DASH_ADDR='$(DASH_ADDR)' WORKERS='$(FREEBSD_WORKERS)' \
+	MAX_MEMORY_GB='$(FREEBSD_MAX_MEMORY_GB)' SCAN_DIR='$(SCAN_DIR)' LLM='$(LLM)' \
+		./scripts/master/freebsd.sh
 
 rollout-replica-bastille:
 	@./scripts/replica/freebsd-bastille.sh "$(RUN)"
