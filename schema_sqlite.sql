@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS reports (
 );
 
 CREATE INDEX IF NOT EXISTS idx_reports_sha256_type ON reports(sha256, report_type);
+CREATE INDEX IF NOT EXISTS idx_reports_sha256_type_created ON reports(sha256, report_type, created_at DESC);
 
 -- sightings: external-corroboration ledger. SQLite mirror of schema.sql's table.
 -- subject is a sha256 or a PURL; the primary key makes writes idempotent.

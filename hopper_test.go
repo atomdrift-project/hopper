@@ -3075,7 +3075,7 @@ func TestLocationsDualWrite(t *testing.T) {
 	}
 }
 
-func TestIncomingLocationDrainPrimitives(t *testing.T) {
+func TestOldestIncomingLocations(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
@@ -3084,12 +3084,12 @@ func TestIncomingLocationDrainPrimitives(t *testing.T) {
 	cold := now.Add(-4 * time.Hour)
 
 	mustInsert(t, ctx, db, &Sample{
-		SHA256: "incoming-old", Path: "incoming/bad/foraged/a.bin", Filename: "a.bin",
-		Label: "bad", LabelSource: "forager", Skip: "hold", Mtime: &oldest,
+		SHA256: "incoming-old", Path: "incoming/forager/a.bin", Filename: "a.bin",
+		Label: "unknown", LabelSource: "forager", Mtime: &oldest,
 	})
 	mustInsert(t, ctx, db, &Sample{
-		SHA256: "incoming-new", Path: "incoming/good/foraged/b.bin", Filename: "b.bin",
-		Label: "good", LabelSource: "forager", Mtime: &newer,
+		SHA256: "incoming-new", Path: "incoming/forager/b.bin", Filename: "b.bin",
+		Label: "unknown", LabelSource: "forager", Mtime: &newer,
 	})
 	mustInsert(t, ctx, db, &Sample{
 		SHA256: "already-cold", Path: "pending/foraged/c.bin", Filename: "c.bin",
@@ -3102,37 +3102,6 @@ func TestIncomingLocationDrainPrimitives(t *testing.T) {
 	}
 	if len(locs) != 2 || locs[0].SHA256 != "incoming-old" || locs[1].SHA256 != "incoming-new" {
 		t.Fatalf("oldest incoming = %+v, want incoming-old then incoming-new", locs)
-	}
-
-	moved, err := db.RelocateLocation(ctx, "incoming-old",
-		"incoming/bad/foraged/a.bin", "pending/bad/foraged/a.bin")
-	if err != nil || !moved {
-		t.Fatalf("RelocateLocation = %v, %v; want true, nil", moved, err)
-	}
-	got, err := db.SampleBySHA256(ctx, "incoming-old")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Path != "pending/bad/foraged/a.bin" || got.Label != "bad" || got.LabelSource != "forager" || got.Skip != "hold" {
-		t.Errorf("relocated sample = path %q label %q source %q skip %q", got.Path, got.Label, got.LabelSource, got.Skip)
-	}
-	gotLocs, err := db.LocationsForSHA(ctx, "incoming-old")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(gotLocs) != 1 || gotLocs[0].Path != "pending/bad/foraged/a.bin" {
-		t.Fatalf("relocated locations = %+v", gotLocs)
-	}
-
-	// A replay after a crash is a successful no-op, while an unrelated stale
-	// source path is absent so Draino can discard its copied file.
-	if moved, err := db.RelocateLocation(ctx, "incoming-old",
-		"incoming/bad/foraged/a.bin", "pending/bad/foraged/a.bin"); err != nil || !moved {
-		t.Fatalf("idempotent RelocateLocation = %v, %v", moved, err)
-	}
-	if moved, err := db.RelocateLocation(ctx, "incoming-old",
-		"incoming/missing.bin", "pending/missing.bin"); err != nil || moved {
-		t.Fatalf("missing RelocateLocation = %v, %v; want false, nil", moved, err)
 	}
 }
 
@@ -4676,14 +4645,74 @@ func TestReconcilePoolsMovedToNewPath(t *testing.T) {
 
 	// Seen this walk only at a new bad/ path.
 	stageWalk(t, ctx, db, loc("mv", "bad/x.bin"))
-	if _, err := db.ReconcilePools(ctx, func(p string) string { return p }, true); err != nil {
+	st, err := db.ReconcilePools(ctx, func(p string) string { return p }, true)
+	if err != nil {
 		t.Fatalf("ReconcilePools: %v", err)
+	}
+	if st.ObservedLocations != 1 {
+		t.Fatalf("ObservedLocations = %d, want 1", st.ObservedLocations)
 	}
 	if got := labelOf(t, ctx, db, "mv"); got != "bad" {
 		t.Errorf("mv label = %q, want bad (relabeled after good→bad move)", got)
 	}
 	if got := skipOf(t, ctx, db, "mv"); got != "" {
 		t.Errorf("mv skip = %q, want empty (must not be marked missing)", got)
+	}
+	locs, err := db.TopLevelLocationsForSHA(ctx, "mv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, location := range locs {
+		found = found || location.Path == "bad/x.bin"
+	}
+	if !found {
+		t.Fatalf("new path not learned from staging: %+v", locs)
+	}
+}
+
+func TestReconcilePoolsFifteenPercentAggregateGuard(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	for i := range 100 {
+		sha := fmt.Sprintf("guard-%03d", i)
+		mustInsert(t, ctx, db, &Sample{SHA256: sha, Path: fmt.Sprintf("pending/%03d.bin", i), Label: "unknown"})
+		if i < 84 {
+			if err := db.StageLocations(ctx, []SampleLocationKey{{SHA256: sha, Path: fmt.Sprintf("pending/%03d.bin", i)}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if _, err := db.ReconcilePools(ctx, func(string) string { return filepath.Join(t.TempDir(), "gone") }, true); err == nil || !strings.Contains(err.Error(), ">15%") {
+		t.Fatalf("ReconcilePools error = %v, want 15%% guard", err)
+	}
+	if got := skipOf(t, ctx, db, "guard-099"); got != "" {
+		t.Fatalf("guarded sample skip = %q, want unchanged", got)
+	}
+}
+
+func TestReconcilePoolsFifteenPercentPerPoolGuard(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	for i := range 1000 {
+		root := "pending"
+		seen := true
+		if i < 100 {
+			root = "incoming"
+			seen = i < 84
+		}
+		sha := fmt.Sprintf("pool-guard-%04d", i)
+		path := fmt.Sprintf("%s/%04d.bin", root, i)
+		mustInsert(t, ctx, db, &Sample{SHA256: sha, Path: path, Label: "unknown"})
+		if seen {
+			if err := db.StageLocations(ctx, []SampleLocationKey{{SHA256: sha, Path: path}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	_, err := db.ReconcilePools(ctx, func(string) string { return filepath.Join(t.TempDir(), "gone") }, true)
+	if err == nil || !strings.Contains(err.Error(), `"incoming" pool`) {
+		t.Fatalf("ReconcilePools error = %v, want per-incoming-pool guard", err)
 	}
 }
 
@@ -5360,13 +5389,9 @@ func TestTriageMostRecent(t *testing.T) {
 }
 
 // TestTriageThresholds pins the detection boundaries: good surfaces samples
-// that trip detection — a hostile finding, a second suspicious-or-hostile
-// finding, or a litmus class of suspicious or higher (max_crit >= 5 OR
-// suspicious_count >= 2 OR litmus class >= 1); new surfaces any sample with at
-// least one suspicious-or-hostile finding (suspicious_count >= 1); bad
-// surfaces samples that fall short of a confident detection — those lacking
-// either a hostile finding or a second suspicious-or-hostile finding
-// (max_crit < 5 OR suspicious_count < 2).
+// that trip Cleave detection (max_crit >= 5 OR suspicious_count >= 2); new
+// surfaces any sample with at least one suspicious-or-hostile finding; bad is
+// the exact inverse of detection (max_crit < 5 AND suspicious_count < 2).
 func TestTriageThresholds(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
@@ -5410,9 +5435,9 @@ func TestTriageThresholds(t *testing.T) {
 	newSusp := analyze("unknown", 4)
 	newBenign := analyze("unknown", 2)
 
-	// The litmus arm queues trait-clean good samples the litmus grid still
-	// fires on: a level within SuspiciousCeiling reads suspicious (class 1); a
-	// looser firing reads benign and does not qualify.
+	// Litmus-only disagreement is not a Cleave false positive. TriageHighest's
+	// premium route-balanced review owns those rows; TriageGood requires a
+	// concrete trait finding it can repair.
 	goodLitmusSusp := analyze("good", 1)
 	if err := db.UpdateLitmusResult(ctx, goodLitmusSusp, []byte(`{"l":100}`)); err != nil {
 		t.Fatalf("UpdateLitmusResult: %v", err)
@@ -5422,10 +5447,8 @@ func TestTriageThresholds(t *testing.T) {
 		t.Fatalf("UpdateLitmusResult: %v", err)
 	}
 
-	// bad: a confident detection (hostile + a second suspicious finding) is NOT a
-	// miss; everything short of that bar is. A lone hostile finding lacks the
-	// second finding, and a pair of suspicious findings lacks the hostile one —
-	// both are misses worth surfacing.
+	// bad: any hostile finding or two suspicious findings is already detected;
+	// only samples below both thresholds are repair candidates.
 	badConfident := analyze("bad", 5, 4)
 	badLoneHostile := analyze("bad", 5)
 	badTwoSusp := analyze("bad", 4, 4)
@@ -5435,10 +5458,10 @@ func TestTriageThresholds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TriageGood: %v", err)
 	}
-	if !has(good, goodTwoSusp) || !has(good, goodHostile) || !has(good, goodLitmusSusp) {
+	if !has(good, goodTwoSusp) || !has(good, goodHostile) {
 		t.Errorf("TriageGood missing a detected sample")
 	}
-	if has(good, goodLoneSusp) || has(good, goodBenign) || has(good, goodLitmusBenign) {
+	if has(good, goodLoneSusp) || has(good, goodBenign) || has(good, goodLitmusSusp) || has(good, goodLitmusBenign) {
 		t.Errorf("TriageGood included an undetected sample")
 	}
 
@@ -5457,10 +5480,10 @@ func TestTriageThresholds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TriageBad: %v", err)
 	}
-	if has(bad, badConfident) {
-		t.Errorf("TriageBad included a confidently-detected sample")
+	if has(bad, badConfident) || has(bad, badLoneHostile) || has(bad, badTwoSusp) {
+		t.Errorf("TriageBad included a detected sample")
 	}
-	if !has(bad, badLoneHostile) || !has(bad, badTwoSusp) || !has(bad, badBenign) {
+	if !has(bad, badBenign) {
 		t.Errorf("TriageBad missing a detection-miss sample")
 	}
 
@@ -5722,7 +5745,7 @@ func TestTriageAcquit(t *testing.T) {
 	feedBorn := analyze("bad", feedProv, detected)
 	noProv := analyze("bad", nil, detected)
 	cited := analyze("bad", registryProv, detected, "aikido")
-	gap := analyze("bad", registryProv, []int{5}) // lone hostile: TriageBad's set
+	gap := analyze("bad", registryProv, []int{4}) // lone suspicious: TriageBad's set
 	goodRow := analyze("good", registryProv, detected)
 	conflicted := analyze("bad", registryProv, detected)
 	if err := db.SetSkip(ctx, conflicted, "conflict"); err != nil {
@@ -5875,6 +5898,21 @@ func TestPruneMissingLocations(t *testing.T) {
 	if got := locCount(member); got != 1 {
 		t.Errorf("member: loc=%d, want 1 (archive members are never stat-pruned)", got)
 	}
+	for sha, wantPath := range map[string]string{
+		gone:   "bad/gone.js",
+		twoLoc: "bad/twoloc-b.js",
+	} {
+		retired, err := db.RetiredLocationsForSHA(ctx, sha)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(retired) != 1 || retired[0].Path != wantPath || retired[0].Reason != "prune" || retired[0].SuccessorPath != "" {
+			t.Errorf("retired locations for %s = %+v", sha[:6], retired)
+		}
+	}
+	if retired, err := db.RetiredLocationsForSHA(ctx, present); err != nil || len(retired) != 0 {
+		t.Errorf("present retired locations = %+v, %v", retired, err)
+	}
 
 	// A label_event records the missing transition for audit.
 	var events int
@@ -5932,134 +5970,9 @@ func TestPruneMissingLocationsSafetyCap(t *testing.T) {
 		if s.Skip != "" {
 			t.Errorf("%s skip=%q, want '' (cap aborts before any mark)", sha[:6], s.Skip)
 		}
-	}
-}
-
-func TestResolveIncomingLabel(t *testing.T) {
-	tests := []struct {
-		name                            string
-		curLabel, curSource, curSkip    string
-		incLabel, incSource             string
-		wantLabel, wantSource, wantSkip string
-		wantChanged                     bool
-	}{
-		{"unknown promotes to bad", "unknown", "forager", "", "bad", "forager", "bad", "forager", "", true},
-		{"good vs bad is a conflict", "good", "test", "", "bad", "forager", "bad", "conflict", "conflict", true},
-		{"bad vs good stays bad but conflicts", "bad", "test", "", "good", "forager", "bad", "conflict", "conflict", true},
-		{"equal label no change", "bad", "test", "", "bad", "forager", "bad", "test", "", false},
-		{"lower rank no change", "bad", "test", "", "unknown", "forager", "bad", "test", "", false},
-		{"missing skip preserved on promote", "unknown", "forager", "missing", "bad", "forager", "bad", "forager", "missing", true},
-		{"unsupported skip preserved on promote", "unknown", "forager", "unsupported", "bad", "forager", "bad", "forager", "unsupported", true},
-		{"incoming marker wins", "unknown", "forager", "", "bad", "marker", "bad", "marker", "misclassified", true},
-		{"existing marker overridden by feed", "good", "marker", "", "bad", "forager", "bad", "forager", "conflict", true},
-		{"existing marker rehabilitated to same label", "bad", "marker", "misclassified", "bad", "forager", "bad", "forager", "", true},
-		{"promote clears misclassified skip", "unknown", "test", "misclassified", "bad", "forager", "bad", "forager", "", true},
-		{"promote clears conflict skip", "unknown", "conflict", "conflict", "bad", "forager", "bad", "forager", "", true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := resolveIncomingLabel(tt.curLabel, tt.curSource, tt.curSkip, tt.incLabel, tt.incSource)
-			if got.label != tt.wantLabel || got.labelSource != tt.wantSource || got.skip != tt.wantSkip || got.changed != tt.wantChanged {
-				t.Errorf("resolveIncomingLabel(%q,%q,%q ← %q,%q) = {%q,%q,%q,%v}, want {%q,%q,%q,%v}",
-					tt.curLabel, tt.curSource, tt.curSkip, tt.incLabel, tt.incSource,
-					got.label, got.labelSource, got.skip, got.changed,
-					tt.wantLabel, tt.wantSource, tt.wantSkip, tt.wantChanged)
-			}
-		})
-	}
-}
-
-func TestPromoteLabelByPURL(t *testing.T) {
-	ctx := context.Background()
-	db := openTestDB(t)
-
-	const purlBase, version = "pkg:npm/evil-pkg", "1.0.0"
-	mk := func(sha, label, source, skip, ver string) {
-		mustInsert(t, ctx, db, &Sample{
-			SHA256: sha, Source: "test", Label: label, LabelSource: source, Skip: skip,
-			PURLBase: purlBase, Version: ver, Path: "unknown/" + sha[:8] + ".tgz",
-		})
-	}
-	var (
-		unk    = sha64('1') // unknown → promoted to bad
-		good   = sha64('2') // good → conflict
-		alrdy  = sha64('3') // already bad → unchanged
-		gone   = sha64('4') // unknown but file missing → label promoted, skip kept
-		otherV = sha64('5') // different version → untouched
-		member = sha64('6') // archive member (parent set) → untouched
-	)
-	mk(unk, "unknown", "forager", "", version)
-	mk(good, "good", "test", "", version)
-	mk(alrdy, "bad", "test", "", version)
-	mk(gone, "unknown", "forager", "missing", version)
-	mk(otherV, "unknown", "forager", "", "2.0.0")
-	mustInsert(t, ctx, db, &Sample{
-		SHA256: member, Source: "test", Label: "unknown", LabelSource: "forager",
-		Parent: sha64('a'), PURLBase: purlBase, Version: version, Path: sha64('a') + "!!pkg/x.js",
-	})
-
-	res, err := db.PromoteLabelByPURL(ctx, purlBase, version, "bad", "forager", "kmsec.uk")
-	if err != nil {
-		t.Fatalf("PromoteLabelByPURL: %v", err)
-	}
-	if !res.Present {
-		t.Error("Present = false, want true (unk has bytes)")
-	}
-	if res.Promoted != 3 {
-		t.Errorf("Promoted = %d, want 3 (unk, good, gone)", res.Promoted)
-	}
-
-	check := func(sha, wantLabel, wantSource, wantSkip string) {
-		s, err := db.SampleBySHA256(ctx, sha)
-		if err != nil {
-			t.Fatalf("SampleBySHA256(%s): %v", sha, err)
+		if retired, err := db.RetiredLocationsForSHA(ctx, sha); err != nil || len(retired) != 0 {
+			t.Errorf("%s retired locations = %+v, %v; cap must be atomic", sha[:6], retired, err)
 		}
-		if s.Label != wantLabel || s.LabelSource != wantSource || s.Skip != wantSkip {
-			t.Errorf("%s = {%q,%q,%q}, want {%q,%q,%q}", sha[:6], s.Label, s.LabelSource, s.Skip, wantLabel, wantSource, wantSkip)
-		}
-	}
-	check(unk, "bad", "forager", "")
-	check(good, "bad", "conflict", "conflict")
-	check(alrdy, "bad", "test", "") // unchanged
-	check(gone, "bad", "forager", "missing")
-	check(otherV, "unknown", "forager", "") // different version, untouched
-	check(member, "unknown", "forager", "") // archive member, untouched
-
-	// The feed name is recorded on the rows we actually changed.
-	for _, sha := range []string{unk, good, gone} {
-		s, err := db.SampleBySHA256(ctx, sha)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if s.Feed != "kmsec.uk" {
-			t.Errorf("%s feed = %q, want kmsec.uk", sha[:6], s.Feed)
-		}
-	}
-
-	var events int
-	if err := db.lite.QueryRowContext(ctx,
-		`SELECT count(*) FROM label_events WHERE reason='purl-promote'`).Scan(&events); err != nil {
-		t.Fatal(err)
-	}
-	if events != 3 {
-		t.Errorf("purl-promote label_events = %d, want 3", events)
-	}
-
-	// Present=false when the only copy is missing.
-	const p2, v2 = "pkg:npm/ghost-pkg", "9.9.9"
-	mustInsert(t, ctx, db, &Sample{
-		SHA256: sha64('7'), Source: "test", Label: "unknown", LabelSource: "forager",
-		Skip: "missing", PURLBase: p2, Version: v2, Path: "unknown/ghost.tgz",
-	})
-	res2, err := db.PromoteLabelByPURL(ctx, p2, v2, "bad", "forager", "aikido.dev")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res2.Present {
-		t.Error("Present = true, want false (only copy is missing → re-download wanted)")
-	}
-	if res2.Promoted != 1 {
-		t.Errorf("Promoted = %d, want 1", res2.Promoted)
 	}
 }
 

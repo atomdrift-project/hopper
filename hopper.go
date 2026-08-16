@@ -136,6 +136,20 @@ const (
 	labelBad     = "bad"
 )
 
+// Unknown-class storage roots. The root records workflow and storage tier; it
+// is deliberately independent of the sample's classification label.
+const (
+	PoolIncoming      = "incoming"
+	PoolPending       = "pending"
+	PoolReview        = "review"
+	PoolLegacyUnknown = "unknown"
+)
+
+// ProvenanceSidecarSuffix is the suffix used by Forager's on-disk metadata
+// sidecar. A physical location move treats the artifact and this sidecar as one
+// unit even though only the artifact has a catalog location row.
+const ProvenanceSidecarSuffix = ".forage.json"
+
 // ReportTypeMissing marks a sample whose bytes a triage worker could not fetch
 // — the row outlived its file, which happens by design on a mirror running with
 // --dataset-incomplete, where markServeMissing deliberately does not set
@@ -644,6 +658,16 @@ type SampleLocation struct {
 	ID        int64
 }
 
+// RetiredSampleLocation is an append-only record of a location removed from
+// the active ledger. Managed moves and missing-file pruning retain the old
+// path here so physical provenance is not lost when sample_locations changes.
+type RetiredSampleLocation struct {
+	SampleLocation
+	RetiredAt     time.Time
+	Reason        string
+	SuccessorPath string
+}
+
 // Source values for rows hopper materializes itself, as distinct from a
 // collector's direct insert ("forager") or an interactive upload ("upload"):
 //   - SourceFilesystem: a top-level file the load-walk found on disk that no
@@ -860,6 +884,7 @@ type cleaveFileInfo struct {
 // of a cleave result, combining file info and canonical SHA computation.
 type CleaveParseResult struct {
 	CanonicalSHA  string
+	RootSHA       string // depth-zero digest reported by cleave, when present and valid
 	TraitsVersion string // "tv" field from compact report (first 5 chars of traits commit)
 	FileInfo      cleaveFileInfo
 }
@@ -910,10 +935,19 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 
 	// Canonical SHA: lexicographic minimum across sample and all embedded files.
 	canonical := sha256
+	rootSHA := ""
 	for i := range report.Files {
 		f := &report.Files[i]
 		if len(f.SHA256) == 64 && f.SHA256 < canonical {
 			canonical = f.SHA256
+		}
+		depth := f.Depth
+		if depth == 0 {
+			depth = f.OldDepth
+		}
+		candidate := strings.ToLower(f.SHA256)
+		if rootSHA == "" && depth == 0 && isLowerHexSHA256(candidate) {
+			rootSHA = candidate
 		}
 	}
 
@@ -925,7 +959,7 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 		if depth == 0 {
 			depth = f.OldDepth
 		}
-		if f.SHA256 != sha256 && depth != 0 {
+		if f.SHA256 != "" && !strings.EqualFold(f.SHA256, sha256) {
 			continue
 		}
 		formula := f.Formula
@@ -977,7 +1011,7 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 	if tv == "" {
 		tv = report.OldTraitsVersion
 	}
-	return CleaveParseResult{CanonicalSHA: canonical, FileInfo: fi, TraitsVersion: tv}
+	return CleaveParseResult{CanonicalSHA: canonical, RootSHA: rootSHA, FileInfo: fi, TraitsVersion: tv}
 }
 
 func parsedCleaveFilesLookCompact(files []cleaveCompactFileEntry) bool {
@@ -2080,6 +2114,43 @@ func (db *DB) LocationsForSHA(ctx context.Context, sha256 string) ([]*SampleLoca
 	return db.locationsForSHASQLite(ctx, sha256)
 }
 
+// TopLevelLocationsForSHA returns the active on-disk locations for sha256.
+// Archive-member observations are excluded because their paths are virtual.
+func (db *DB) TopLevelLocationsForSHA(ctx context.Context, sha256 string) ([]*SampleLocation, error) {
+	if db.pool != nil {
+		return db.topLevelLocationsForSHAPG(ctx, sha256)
+	}
+	return db.topLevelLocationsForSHASQLite(ctx, sha256)
+}
+
+// RetiredLocationsForSHA returns location-retirement events newest first.
+func (db *DB) RetiredLocationsForSHA(ctx context.Context, sha256 string) ([]*RetiredSampleLocation, error) {
+	if db.pool != nil {
+		return db.retiredLocationsForSHAPG(ctx, sha256)
+	}
+	return db.retiredLocationsForSHASQLite(ctx, sha256)
+}
+
+// PromotePrimaryLocation replaces a stale canonical path with a known active
+// top-level location. The old path predicate makes this a compare-and-swap, so
+// a concurrent move or walk cannot be overwritten by a serving request.
+func (db *DB) PromotePrimaryLocation(ctx context.Context, sha256, oldPath, newPath string) (bool, error) {
+	if db.pool != nil {
+		return db.promotePrimaryLocationPG(ctx, sha256, oldPath, newPath)
+	}
+	return db.promotePrimaryLocationSQLite(ctx, sha256, oldPath, newPath)
+}
+
+// ReactivatePrimaryLocation restores a physically verified canonical path that
+// was previously marked or pruned as missing. If prune retired the active row,
+// its latest metadata is copied back from the append-only history ledger.
+func (db *DB) ReactivatePrimaryLocation(ctx context.Context, sha256, path string) (bool, error) {
+	if db.pool != nil {
+		return db.reactivatePrimaryLocationPG(ctx, sha256, path)
+	}
+	return db.reactivatePrimaryLocationSQLite(ctx, sha256, path)
+}
+
 // OldestIncomingLocations returns top-level files in the hot incoming/ pool,
 // oldest mtime first. before provides a finalization grace period and limit
 // bounds each drain batch. Rows without an mtime are omitted until the next
@@ -2094,19 +2165,20 @@ func (db *DB) OldestIncomingLocations(ctx context.Context, before time.Time, lim
 	return db.oldestIncomingLocationsSQLite(ctx, before, limit)
 }
 
-// RelocateLocation atomically changes one top-level physical location without
-// changing label, label_source, skip, or analysis state. If samples.path names
-// oldRel it follows the location to newRel; a different primary path is left
-// alone. The operation is idempotent: it reports true when newRel is already
-// recorded and false when neither oldRel nor newRel exists.
-func (db *DB) RelocateLocation(ctx context.Context, sha256, oldRel, newRel string) (bool, error) {
-	if sha256 == "" || oldRel == "" || newRel == "" || oldRel == newRel {
-		return false, nil
-	}
+func (db *DB) prepareLocationMove(
+	ctx context.Context, sha256, oldRel, newRel string, relabel *LocationRelabel,
+) (bool, error) {
 	if db.pool != nil {
-		return db.relocateLocationPG(ctx, sha256, oldRel, newRel)
+		return db.prepareLocationMovePG(ctx, sha256, oldRel, newRel, relabel)
 	}
-	return db.relocateLocationSQLite(ctx, sha256, oldRel, newRel)
+	return db.prepareLocationMoveSQLite(ctx, sha256, oldRel, newRel, relabel)
+}
+
+func (db *DB) finishLocationMove(ctx context.Context, sha256, oldRel, newRel string) (bool, error) {
+	if db.pool != nil {
+		return db.finishLocationMovePG(ctx, sha256, oldRel, newRel)
+	}
+	return db.finishLocationMoveSQLite(ctx, sha256, oldRel, newRel)
 }
 
 // PruneSafetyExceeded is returned by PruneMissingLocations when the
@@ -2179,15 +2251,6 @@ func prunePathResolve(absRoot, path string) (resolved string, ok bool) {
 	return resolved, true
 }
 
-// PURLPromotion reports the outcome of PromoteLabelByPURL.
-type PURLPromotion struct {
-	// Present is true when hopper already holds a non-missing sample for the
-	// queried (purlBase, version); the collector can skip re-downloading.
-	Present bool
-	// Promoted counts samples whose label or skip the feed observation changed.
-	Promoted int
-}
-
 // PackageVersionPresent reports whether Hopper holds a non-missing top-level
 // sample for the exact package identity and version. It is a read-only probe:
 // feed claims belong in the sightings ledger and do not change classification.
@@ -2215,89 +2278,6 @@ func (db *DB) PackageVersionPresent(ctx context.Context, purlBase, version strin
 		return false, fmt.Errorf("hopper: probe package version: %w", err)
 	}
 	return present, nil
-}
-
-// labelResolution is the post-precedence state of a sample after an incoming
-// (label, source) observation, mirroring the sample-upsert conflict clause.
-type labelResolution struct {
-	label, labelSource, skip string
-	changed                  bool
-}
-
-// resolveIncomingLabel applies an incoming (incLabel, incSource) observation to
-// a sample currently at (curLabel, curSource, curSkip) and returns the resolved
-// state. It mirrors sampleConflictUpdate{SQLite,PG} (the INSERT...ON CONFLICT
-// label/label_source/skip CASE ladders) exactly, so a label asserted without a
-// re-download resolves identically to one carried by a walk:
-//   - a marker observation wins; an existing marker is overridden by a
-//     non-marker observation (as the upsert does);
-//   - opposite poles (good vs bad) resolve to bad/conflict;
-//   - otherwise a strictly higher-ranked label wins; ties keep the current one.
-//
-// It deviates in exactly one, deliberate way: it never resurrects a sample whose
-// skip is 'missing' or 'unsupported'. The upsert clears those because re-seeing
-// a file proves the bytes are back; a feed sighting carries no bytes, so the
-// label is promoted but skip is preserved — the row is restored (and skip
-// cleared) only by an actual re-download.
-func resolveIncomingLabel(curLabel, curSource, curSkip, incLabel, incSource string) labelResolution {
-	opposite := (curLabel == labelGood && incLabel == labelBad) || (curLabel == labelBad && incLabel == labelGood)
-	higher := labelRank(incLabel) > labelRank(curLabel)
-
-	out := labelResolution{label: curLabel, labelSource: curSource, skip: curSkip}
-
-	switch {
-	case incSource == labelSourceMarker:
-		out.label, out.labelSource = incLabel, labelSourceMarker
-	case curSource == labelSourceMarker:
-		out.label, out.labelSource = incLabel, incSource
-	case opposite:
-		out.label, out.labelSource = labelBad, labelSourceConflict
-	case higher:
-		out.label, out.labelSource = incLabel, incSource
-	}
-
-	// Bytes are not proven present here, so a missing/unsupported sample keeps
-	// its skip even as its label is promoted (see doc comment).
-	if curSkip != "missing" && curSkip != "unsupported" {
-		switch {
-		case incSource == labelSourceMarker:
-			out.skip = skipMisclassified
-		case curSource == labelSourceMarker && curSkip == skipMisclassified:
-			out.skip = ""
-		case opposite && (curSkip == "" || curSkip == skipMisclassified || curSkip == skipConflict):
-			out.skip = skipConflict
-		case higher && (curSkip == skipMisclassified || curSkip == skipConflict):
-			out.skip = ""
-		}
-	}
-
-	out.changed = out.label != curLabel || out.labelSource != curSource || out.skip != curSkip
-	return out
-}
-
-// PromoteLabelByPURL records that a feed reported the package identity purlBase
-// at version with (label, labelSource), promoting every top-level sample hopper
-// already holds for that exact package@version per resolveIncomingLabel and
-// writing a label_event for each change. It also reports whether a non-missing
-// copy already exists, so a collector can skip re-downloading bytes hopper
-// already has while still upgrading an 'unknown' row to 'bad'.
-//
-// The scan is a single indexed probe (idx_samples_purl_base) touching only the
-// handful of rows for one package@version. A blank purlBase, version, or label
-// is a no-op.
-func (db *DB) PromoteLabelByPURL(ctx context.Context, purlBase, version, label, labelSource, feed string) (PURLPromotion, error) {
-	if purlBase == "" || version == "" || label == "" {
-		return PURLPromotion{}, nil
-	}
-	if db.pool != nil {
-		return db.promoteLabelByPURLPG(ctx, purlBase, version, label, labelSource, feed)
-	}
-	return db.promoteLabelByPURLSQLite(ctx, purlBase, version, label, labelSource, feed)
-}
-
-// purlCandidate is one sample matched by (purl_base, version) during promotion.
-type purlCandidate struct {
-	sha, label, source, skip string
 }
 
 // distinctVictimSHAs returns the unique sha256s among pruned locations, so the
@@ -2471,6 +2451,26 @@ func (db *DB) KVSetIfAbsent(ctx context.Context, key, value string) error {
 		_, err = db.lite.ExecContext(ctx,
 			`INSERT INTO hopper_kv (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING`,
 			key, value)
+	}
+	if err != nil {
+		return fmt.Errorf("hopper: kv set %q: %w", key, err)
+	}
+	return nil
+}
+
+// KVSet stores an operator-supplied value, replacing any previous value. It is
+// reserved for explicit configuration such as secret rotation; generated
+// bootstrap values should use KVSetIfAbsent so concurrent starters converge.
+func (db *DB) KVSet(ctx context.Context, key, value string) error {
+	var err error
+	if db.pool != nil {
+		_, err = db.pool.Exec(ctx, `
+			INSERT INTO hopper_kv (key, value) VALUES ($1, $2)
+			ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, key, value)
+	} else {
+		_, err = db.lite.ExecContext(ctx, `
+			INSERT INTO hopper_kv (key, value) VALUES (?, ?)
+			ON CONFLICT (key) DO UPDATE SET value = excluded.value`, key, value)
 	}
 	if err != nil {
 		return fmt.Errorf("hopper: kv set %q: %w", key, err)
@@ -3021,21 +3021,6 @@ func (db *DB) CascadeBackfill(ctx context.Context, dryRun bool) (CascadeBackfill
 	return db.cascadeBackfillSQLite(ctx, dryRun)
 }
 
-// RelocateSample records a triage verdict atomically: it flips the sample's
-// label to `label` (label_source `source`), clears any skip, repoints
-// samples.path to newRel, and updates the matching top-level
-// sample_locations row from oldRel to newRel. Paths are relative to the data
-// root. The caller performs the on-disk os.Rename; this only brings the DB
-// into agreement so the next load walk has nothing to reconcile and
-// /api/file resolves the moved file immediately rather than 404ing until the
-// walk catches up.
-func (db *DB) RelocateSample(ctx context.Context, sha256, oldRel, newRel, label, source string) error {
-	if db.pool != nil {
-		return db.relocateSamplePG(ctx, sha256, oldRel, newRel, label, source)
-	}
-	return db.relocateSampleSQLite(ctx, sha256, oldRel, newRel, label, source)
-}
-
 // Unanalyzed returns up to limit samples lacking a cleave result.
 func (db *DB) Unanalyzed(ctx context.Context, limit int) ([]*Sample, error) {
 	if db.pool != nil {
@@ -3046,6 +3031,7 @@ func (db *DB) Unanalyzed(ctx context.Context, limit int) ([]*Sample, error) {
 
 // ReconcileStats summarizes one reconciliation pass.
 type ReconcileStats struct {
+	ObservedLocations int64 // staged paths newly added to the active location ledger
 	Relabeled         int64 // top-level samples whose pool label/skip changed
 	MarkedMissing     int64 // standalone files gone from disk
 	MarkedUnsupported int64 // standalone files present but not enumerated
@@ -3081,24 +3067,26 @@ func logRelabelSkipChange(sha, fromLabel, toLabel, fromSkip, toSkip string) {
 // can only build mid-walk — using sample_locations as the source of truth for
 // presence and containment.
 //
-// It does four things, in order:
-//  1. Relabels top-level samples from the pools they currently live in: a file
+// It does five things, in order:
+//  1. Learns newly observed standalone paths, including same-inode renames that
+//     the hash cache can identify without another sample upsert.
+//  2. Relabels top-level samples from the pools they currently live in: a file
 //     moved bad→good is demoted to good, good→bad is promoted to bad, and a file
 //     asserted in both pools at once resolves to bad with skip='conflict'.
-//  2. Marks standalone files not seen this walk as skip='missing' (gone) or
+//  3. Marks standalone files not seen this walk as skip='missing' (gone) or
 //     'unsupported' (present on disk but not enumerated).
-//  3. Cascades skip='missing' to archive members orphaned by a missing parent —
+//  4. Cascades skip='missing' to archive members orphaned by a missing parent —
 //     unless the member is still reachable through another live archive (the
 //     supply-chain case: a benign file shared with a present package survives).
-//  4. Revives members whose containing archive reappeared.
+//  5. Revives members whose containing archive reappeared.
 //
 // Presence is read from walk_staging, which the caller fills (StartWalkStaging
 // then StageLocations) with every standalone file seen this walk. diskPath maps
 // a stored path to a local filesystem path so a stale standalone file can be
 // classified missing vs unsupported. Every transition is recorded in
-// label_events in the same transaction as the change. A >50% missing rate aborts
-// before any write, on the assumption the data directory is misconfigured rather
-// than legitimately emptied.
+// label_events in the same transaction as the change. Aggregate and per-pool
+// missing rates above 15% abort before any missing write, on the assumption the
+// walk or storage topology is incomplete rather than legitimately emptied.
 //
 // markMissing=false (the --dataset-incomplete deployment) runs step 1 only: the
 // data root deliberately holds just part of the corpus, so a locally-absent file
@@ -3110,7 +3098,22 @@ func (db *DB) ReconcilePools(ctx context.Context, diskPath func(string) string, 
 	var stats ReconcileStats
 	var err error
 
-	// 1. Relabel top-level, non-marker samples from the pools their standalone
+	// 1. Merge every newly observed standalone path into the active location
+	//    ledger. This is what makes a same-inode rename or an additional hardlink
+	//    visible even when the hash cache proves the bytes were already inserted.
+	if db.pool != nil {
+		stats.ObservedLocations, err = db.observeStagedLocationsPG(ctx)
+	} else {
+		stats.ObservedLocations, err = db.observeStagedLocationsSQLite(ctx)
+	}
+	if err != nil {
+		return stats, fmt.Errorf("hopper: reconcile observe locations: %w", err)
+	}
+	if stats.ObservedLocations > 0 {
+		slog.Info("reconcile learned sample locations", "count", stats.ObservedLocations)
+	}
+
+	// 2. Relabel top-level, non-marker samples from the pools their standalone
 	//    copies live in this walk (demote bad→good, promote good→bad, both→conflict).
 	if db.pool != nil {
 		stats.Relabeled, err = db.relabelFromPoolsPG(ctx)
@@ -3130,10 +3133,11 @@ func (db *DB) ReconcilePools(ctx context.Context, diskPath func(string) string, 
 		return stats, nil
 	}
 
-	// 2. Find top-level samples (skip empty or 'conflict') not seen this walk,
-	//    with the >50% guard checked before any write.
+	// 3. Find top-level samples (skip empty or 'conflict') not seen this walk,
+	//    with aggregate and per-pool guards checked before any missing write.
 	var stale []SampleLocationKey
 	var eligible int64
+	var eligibleByRoot map[string]int64
 	if db.pool != nil {
 		stale, eligible, err = db.staleStandaloneSamplesPG(ctx)
 	} else {
@@ -3142,16 +3146,38 @@ func (db *DB) ReconcilePools(ctx context.Context, diskPath func(string) string, 
 	if err != nil {
 		return stats, fmt.Errorf("hopper: reconcile stale scan: %w", err)
 	}
+	if db.pool != nil {
+		eligibleByRoot, err = db.eligibleStandaloneRootsPG(ctx)
+	} else {
+		eligibleByRoot, err = db.eligibleStandaloneRootsSQLite(ctx)
+	}
+	if err != nil {
+		return stats, fmt.Errorf("hopper: reconcile root counts: %w", err)
+	}
 	const minBulkMarkGuardSamples = 100
-	if eligible >= minBulkMarkGuardSamples && int64(len(stale))*2 > eligible {
+	const maxMissingPercent int64 = 15
+	if eligible >= minBulkMarkGuardSamples && int64(len(stale))*100 > eligible*maxMissingPercent {
 		return stats, fmt.Errorf(
 			"hopper: reconcile: refusing to mark %d of %d standalone samples missing"+
-				" (>50%%); this likely indicates a misconfigured data directory",
-			len(stale), eligible,
+				" (>%d%%); this likely indicates an incomplete walk or storage failure",
+			len(stale), eligible, maxMissingPercent,
 		)
 	}
+	staleByRoot := make(map[string]int64)
+	for _, s := range stale {
+		staleByRoot[samplePathRoot(s.Path)]++
+	}
+	for root, missing := range staleByRoot {
+		total := eligibleByRoot[root]
+		if total >= minBulkMarkGuardSamples && missing*100 > total*maxMissingPercent {
+			return stats, fmt.Errorf(
+				"hopper: reconcile: refusing to mark %d of %d %q pool samples missing"+
+					" (>%d%%); this likely indicates an incomplete pool walk or missing mount",
+				missing, total, root, maxMissingPercent)
+		}
+	}
 
-	// 3. Classify each stale standalone file: gone → missing, present → unsupported.
+	// 4. Classify each stale standalone file: gone → missing, present → unsupported.
 	for _, s := range stale {
 		skip := "unsupported" // present on disk but not enumerated by iter-files
 		if _, statErr := os.Stat(diskPath(s.Path)); statErr != nil {
@@ -3188,6 +3214,12 @@ func (db *DB) ReconcilePools(ctx context.Context, diskPath func(string) string, 
 		return stats, fmt.Errorf("hopper: reconcile cascade: %w", err)
 	}
 	return stats, nil
+}
+
+func samplePathRoot(path string) string {
+	path = strings.TrimPrefix(filepath.ToSlash(path), "/")
+	root, _, _ := strings.Cut(path, "/")
+	return root
 }
 
 // Pull-based work scheduling.
@@ -3528,8 +3560,17 @@ type TriageFilter struct {
 	// eligible again, which is exactly the question a staleness queue asks.
 	ExcludeReportType string
 
+	// AttemptReportType, with MaxAttempts > 0, limits how many completed
+	// attempts of that report type a sample may receive. Unlike
+	// ExcludeReportType this is a lifetime budget: callers use a distinct type
+	// per queue, and an operator can explicitly clear or rename those reports to
+	// re-admit a stalled sample. Infrastructure failures should not be reported
+	// as attempts.
+	AttemptReportType string
+
 	// Order ranks the queue. See TriageOrder.
-	Order TriageOrder
+	Order       TriageOrder
+	MaxAttempts int
 }
 
 // TriageOrder selects how a triage queue ranks its candidates.
@@ -3551,12 +3592,19 @@ const (
 	// the row to the back of its own queue. Requires the matching
 	// idx_samples_*_stale partial index; see the migration list.
 	TriageStale
+
+	// TriageInteresting ranks externally corroborated and strongly detected
+	// samples first, then the oldest analysis within equal evidence. It is for
+	// adjudication queues such as review and new; repair queues have different
+	// notions of value and retain their queue-specific ordering.
+	TriageInteresting
 )
 
-// TriageBad returns analyzed top-level bad-labeled samples that cleave did not
-// confidently flag — lacking either a hostile finding or a second
-// suspicious-or-hostile finding (max_crit < 5 OR suspicious_count < 2) — taking
-// up to limit of the most recently added (created_at).
+// TriageBad returns analyzed top-level bad-labeled samples that Cleave did not
+// detect: no hostile finding and fewer than two suspicious-or-hostile findings
+// (max_crit < 5 AND suspicious_count < 2). This is the exact inverse of
+// Cyclotron's AnalysisReport.Detected predicate, so a successful repair leaves
+// the queue without requiring a separate drain marker.
 //
 // Skipped rows are excluded (skip = ”), matching TriageHighest/TriageLowest.
 // A skip means the sample cannot be worked: 'missing' and 'corrupt' have no
@@ -3569,11 +3617,12 @@ func (db *DB) TriageBad(ctx context.Context, limit int, f TriageFilter) ([]*Samp
 	return db.triageBadSQLite(ctx, limit, f)
 }
 
-// TriageGood returns analyzed top-level good-labeled samples that trip
-// detection — a hostile trait (max_crit >= 5), a second suspicious-or-hostile
-// trait (suspicious_count >= 2), or a litmus class of suspicious or higher —
-// taking up to limit of the most recently added (created_at). No skip/status
-// filters — intended for manual triage.
+// TriageGood returns analyzed top-level good-labeled samples that trip Cleave
+// detection — a hostile trait (max_crit >= 5) or a second
+// suspicious-or-hostile trait (suspicious_count >= 2) — taking up to limit of
+// the most recently added (created_at). Litmus-only disagreements belong to
+// TriageHighest's premium, route-balanced label review; mixing them into this
+// repair queue made trait-clean rows cycle without a trait to fix.
 func (db *DB) TriageGood(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
 		return db.triageGoodPG(ctx, limit, f)
@@ -3711,15 +3760,29 @@ func (db *DB) StrandedMembers(ctx context.Context, root string) ([]*Sample, erro
 	return scanLiteSamples(rows)
 }
 
-// TriageNew returns analyzed top-level unknown-labeled samples that cleave
-// flagged with at least one suspicious-or-hostile finding (suspicious_count >=
-// 1), taking up to limit of the most recently added (created_at). No skip/status
-// filters — intended for manual triage.
+// TriageNew returns analyzed top-level unknown-labeled samples outside the
+// review pool that cleave flagged with at least one suspicious-or-hostile
+// finding (suspicious_count >= 1), taking up to limit of the most recently
+// added (created_at). The review pool is a separate, explicit queue; keeping it
+// out of this selector prevents two workers from judging the same sample.
 func (db *DB) TriageNew(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
 		return db.triageNewPG(ctx, limit, f)
 	}
 	return db.triageNewSQLite(ctx, limit, f)
+}
+
+// TriageReview returns every analyzed top-level unknown-labeled sample in the
+// review pool, taking up to limit of the most recently added. Review membership
+// is the disposition: promoter puts a sample there after exactly one bad signal,
+// including signals that do not appear in cleave_result, so this selector must
+// not add a detection predicate. A good/bad ruling moves and relabels the sample
+// out of the pool, which drains the queue.
+func (db *DB) TriageReview(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.triageReviewPG(ctx, limit, f)
+	}
+	return db.triageReviewSQLite(ctx, limit, f)
 }
 
 // TriageSighted returns analyzed top-level sighted-labeled samples — feed
@@ -3808,10 +3871,11 @@ func (db *DB) TriageSecondOpinion(ctx context.Context, limit int, trusted []stri
 // no outside evidence supports: the sample carries a provenance sidecar (a
 // collector fetched it — walked-in dataset corpora have none) with no
 // threat-feed record (nothing told us to download it as malware), and no
-// sighting has ever cited its sha256 or purl_base. Only confidently-detected
-// rows qualify (max_crit >= 5 AND suspicious_count >= 2) — the complement is
-// TriageBad's set, and the disjointness keeps any sample out of two workers at
-// once. Rows created at or after createdBefore are skipped (a grace window so
+// sighting has ever cited its sha256 or purl_base. Only strongly detected rows
+// qualify (max_crit >= 5 AND suspicious_count >= 2), a deliberately higher bar
+// than ordinary detection. This remains disjoint from TriageBad, while samples
+// at the confidence boundary belong to neither queue. Rows created at or after
+// createdBefore are skipped (a grace window so
 // feeds have time to corroborate a fresh conviction), conflict rows are
 // skipped (pool reconciliation owns their label; a ruling would be flipped
 // right back), and rows carrying a reports row of type "acquit" are skipped
@@ -3850,6 +3914,18 @@ func (db *DB) CandidatesByLabel(ctx context.Context, label, pathPrefix string, o
 		return db.candidatesByLabelPG(ctx, label, pathPrefix, olderThan, afterSHA, limit)
 	}
 	return db.candidatesByLabelSQLite(ctx, label, pathPrefix, olderThan, afterSHA, limit)
+}
+
+// SHACitedUnknowns returns unknown-labeled top-level samples under pathPrefix
+// whose exact sha256 has a sightings-ledger entry. Results use the same sha256
+// keyset pagination as CandidatesByLabel. PURL-only sightings are deliberately
+// excluded: a package citation does not prove that a particular version's
+// bytes are the cited artifact.
+func (db *DB) SHACitedUnknowns(ctx context.Context, pathPrefix, afterSHA string, limit int) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.shaCitedUnknownsPG(ctx, pathPrefix, afterSHA, limit)
+	}
+	return db.shaCitedUnknownsSQLite(ctx, pathPrefix, afterSHA, limit)
 }
 
 // ConflictReview returns samples flagged with a good+bad pool conflict
@@ -4666,6 +4742,34 @@ func (db *DB) InsertReport(ctx context.Context, r *Report) error {
 		return db.insertReportPG(ctx, r)
 	}
 	return db.insertReportSQLite(ctx, r)
+}
+
+// TryClaimSample acquires an expiring exclusive lease on sha256. The lease is
+// stored on the sample row, so every process sharing the database observes the
+// same owner. A stale lease may be replaced after ttl; a live lease, including
+// one held by the same owner string, is not re-entrant. Callers should therefore
+// use a unique owner per unit of work and release it when all feedback is done.
+func (db *DB) TryClaimSample(ctx context.Context, sha256, owner string, ttl time.Duration) (bool, error) {
+	if sha256 == "" || owner == "" || ttl <= 0 {
+		return false, nil
+	}
+	staleBefore := time.Now().Add(-ttl)
+	if db.pool != nil {
+		return db.tryClaimSamplePG(ctx, sha256, owner, staleBefore)
+	}
+	return db.tryClaimSampleSQLite(ctx, sha256, owner, staleBefore)
+}
+
+// ReleaseSampleClaim releases sha256 only when owner still holds its lease.
+// It is idempotent: expiry, replacement, or a repeated release is a no-op.
+func (db *DB) ReleaseSampleClaim(ctx context.Context, sha256, owner string) error {
+	if sha256 == "" || owner == "" {
+		return nil
+	}
+	if db.pool != nil {
+		return db.releaseSampleClaimPG(ctx, sha256, owner)
+	}
+	return db.releaseSampleClaimSQLite(ctx, sha256, owner)
 }
 
 // ReportsBySHA256 returns all reports for a sample, newest first.

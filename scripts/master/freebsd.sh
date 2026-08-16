@@ -13,7 +13,7 @@ DATA_DIR="${DATA_DIR:-/data/samples}"
 DB="${DB:-postgres://hopper@hopper-db/hopper?sslmode=disable}"
 SOURCE="${SOURCE:-harvest}"
 DASH_ADDR="${DASH_ADDR:-0.0.0.0:8081}"
-WORKERS="${WORKERS:-}"
+WORKERS="${WORKERS:-96}"
 MAX_MEMORY_GB="${MAX_MEMORY_GB:-0}"
 LLM="${LLM:-http://10.9.8.149:8000/v1}"
 SCAN_DIR="${SCAN_DIR:-../scan}"
@@ -21,11 +21,22 @@ CLEAVE_DIR="${CLEAVE_DIR:-../cleave}"
 SAMPLES_GROUP="${SAMPLES_GROUP:-samples}"
 PULL_DISABLE="${PULL_DISABLE:-0}"
 DATASET_INCOMPLETE="${DATASET_INCOMPLETE:-1}"
+REQUIRED_MOUNTS="${REQUIRED_MOUNTS:-bad,good,incoming,pending,review}"
 
 SERVICE_USER=hopper
 HOPPER_BIN=/usr/local/bin/hopper
 CLEAVE_BIN=/usr/local/bin/cleave
 HOPPER_RCD=/usr/local/etc/rc.d/hopper
+HOPPER_ETC=/usr/local/etc/hopper
+HOPPER_ENV=$HOPPER_ETC/env
+RC_TMP=""
+ENV_TMP=""
+
+cleanup() {
+	[ -z "$RC_TMP" ] || rm -f "$RC_TMP"
+	[ -z "$ENV_TMP" ] || rm -f "$ENV_TMP"
+}
+trap cleanup EXIT
 
 die() {
 	echo "error: $*" >&2
@@ -93,12 +104,28 @@ if ! pw groupshow "$SAMPLES_GROUP" >/dev/null 2>&1; then
 fi
 $SUDO pw groupmod "$SAMPLES_GROUP" -m "$SERVICE_USER"
 
-# Cold pool roots. pending/ and review/ both hold samples whose DB
-# classification label is still "unknown"; the directory name is workflow state.
+# Refuse to turn absent datasets into ordinary directories. Hopper's reconcile
+# treats these roots as authoritative, so a missing mount must stop deployment
+# before any mkdir or service restart can hide it.
+old_ifs=$IFS
+IFS=,
+for rel in $REQUIRED_MOUNTS; do
+	IFS=$old_ifs
+	[ -n "$rel" ] || die "REQUIRED_MOUNTS contains an empty entry"
+	case "$rel" in
+	/*|.|..|../*|*/../*|*/..) die "invalid required mount: $rel" ;;
+	esac
+	mountpoint="$DATA_DIR/$rel"
+	[ -d "$mountpoint" ] || die "required pool does not exist: $mountpoint"
+	mount -p | awk -v target="$mountpoint" '$2 == target { found = 1 } END { exit !found }' \
+		|| die "required pool is not mounted: $mountpoint"
+	IFS=,
+done
+IFS=$old_ifs
+
+# pending/ and review/ hold samples whose classification is still "unknown";
+# their directory name is workflow state. The roots already exist as mounts.
 for dir in "$DATA_DIR/pending" "$DATA_DIR/review"; do
-	if [ ! -d "$dir" ]; then
-		$SUDO install -d -m 2775 -o "$SERVICE_USER" -g "$SAMPLES_GROUP" "$dir"
-	fi
 	$SUDO chgrp "$SAMPLES_GROUP" "$dir"
 	$SUDO chmod 2775 "$dir"
 done
@@ -106,14 +133,16 @@ done
 # incoming/ is a separate hot ZFS dataset and the only destination for new
 # uploads. Assert the shared writer contract at deploy time so Hopper, Forager,
 # and Draino can all create and relocate entries beneath it.
-for dir in "$DATA_DIR/incoming" "$DATA_DIR/incoming/uploads" \
-	"$DATA_DIR/incoming/scan" "$DATA_DIR/incoming/prism" "$DATA_DIR/incoming/forager"; do
+for dir in "$DATA_DIR/incoming/uploads" "$DATA_DIR/incoming/scan" \
+	"$DATA_DIR/incoming/prism" "$DATA_DIR/incoming/forager"; do
 	if [ ! -d "$dir" ]; then
 		$SUDO install -d -m 2775 -o "$SERVICE_USER" -g "$SAMPLES_GROUP" "$dir"
 	fi
 	$SUDO chgrp "$SAMPLES_GROUP" "$dir"
 	$SUDO chmod 2775 "$dir"
 done
+$SUDO chgrp "$SAMPLES_GROUP" "$DATA_DIR/incoming"
+$SUDO chmod 2775 "$DATA_DIR/incoming"
 
 # Create scan before invoking scan's installer so it can be added to the same
 # group before the generated rc.d service starts.
@@ -135,6 +164,21 @@ log "Installing binaries"
 $SUDO install -m 0755 -o root -g wheel ./hopper "$HOPPER_BIN"
 $SUDO install -m 0755 -o root -g wheel "$CLEAVE_DIR/out/cleave" "$CLEAVE_BIN"
 
+log "Ensuring shared Hopper upload credential exists"
+$SUDO install -d -m 0700 -o root -g wheel "$HOPPER_ETC"
+if ! $SUDO test -s "$HOPPER_ENV"; then
+	command -v openssl >/dev/null 2>&1 || die "openssl is required to generate $HOPPER_ENV"
+	ENV_TMP=$(mktemp -t hopper.env.XXXXXX)
+	TOKEN=$(openssl rand -hex 32)
+	{
+		printf 'HOPPER_UPLOAD_TOKEN=%s\n' "$TOKEN"
+		printf 'export HOPPER_UPLOAD_TOKEN\n'
+	} >"$ENV_TMP"
+	$SUDO install -m 0600 -o root -g wheel "$ENV_TMP" "$HOPPER_ENV"
+	rm -f "$ENV_TMP"
+	ENV_TMP=""
+fi
+
 log "Refreshing cleave rules"
 $SUDO su -l "$SERVICE_USER" -c "$CLEAVE_BIN update-rules" \
 	|| die "cleave update-rules failed"
@@ -145,7 +189,6 @@ $SUDO su -l "$SERVICE_USER" -c "$HOPPER_BIN init --db '$DB'" \
 
 $SUDO install -d -m 0755 -o root -g wheel /usr/local/etc/rc.d
 RC_TMP=$(mktemp -t hopper.rcd.XXXXXX)
-trap 'rm -f "$RC_TMP"' EXIT
 
 dataset_arg=""
 [ "$DATASET_INCOMPLETE" != 0 ] && dataset_arg=" --dataset-incomplete"
@@ -170,11 +213,33 @@ load_rc_config \$name
 : \${hopper_source:="$SOURCE"}
 : \${hopper_bind:="$DASH_ADDR"}
 : \${hopper_logfile:="/var/log/hopper.log"}
+: \${hopper_env_file:="$HOPPER_ENV"}
+: \${hopper_required_mounts:="$REQUIRED_MOUNTS"}
+
+mount_args=""
+old_ifs=\$IFS
+IFS=,
+for required_mount in \${hopper_required_mounts}; do
+	IFS=\$old_ifs
+	mount_args="\${mount_args} --require-mount \${required_mount}"
+	IFS=,
+done
+IFS=\$old_ifs
 
 pidfile="/var/run/\${name}.pid"
 command="/usr/sbin/daemon"
+start_precmd="hopper_precmd"
+hopper_precmd()
+{
+	if [ ! -r "\${hopper_env_file}" ]; then
+		echo "hopper credential file is missing or unreadable: \${hopper_env_file}" >&2
+		return 1
+	fi
+	. "\${hopper_env_file}"
+	export HOPPER_UPLOAD_TOKEN
+}
 # --litmus '' is intentional: the Scan worker is a separate rc.d service.
-command_args="-c -f -r -R 10 -P \${pidfile} -o \${hopper_logfile} -u hopper /usr/bin/env HOME=/home/hopper DATABASE_URL=\${hopper_db} $HOPPER_BIN load --data \${hopper_data} --db \${hopper_db} --source \${hopper_source} --dashboard-addr \${hopper_bind} --litmus '' --cleave $CLEAVE_BIN$dataset_arg"
+command_args="-c -f -r -R 10 -P \${pidfile} -o \${hopper_logfile} -u hopper /usr/bin/env HOME=/home/hopper DATABASE_URL=\${hopper_db} $HOPPER_BIN load --data \${hopper_data} --db \${hopper_db} --source \${hopper_source} --dashboard-addr \${hopper_bind} --litmus '' --cleave $CLEAVE_BIN\${mount_args}$dataset_arg"
 
 run_rc_command "\$1"
 EOF
@@ -193,6 +258,21 @@ if $SUDO service hopper status >/dev/null 2>&1; then
 else
 	log "Starting Hopper"
 	$SUDO service hopper start
+fi
+
+log "Waiting for Hopper readiness"
+ready=0
+ready_port=${DASH_ADDR##*:}
+for attempt in $(jot 60 1); do
+	if fetch -qo - "http://127.0.0.1:$ready_port/_/ready" >/dev/null 2>&1; then
+		ready=1
+		break
+	fi
+	sleep 1
+done
+if [ "$ready" -ne 1 ]; then
+	$SUDO tail -n 100 /var/log/hopper.log >&2 || true
+	die "Hopper did not become ready within 60 seconds"
 fi
 
 log "Deploying separate Scan worker"

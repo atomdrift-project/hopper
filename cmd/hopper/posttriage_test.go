@@ -11,7 +11,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
 	"time"
 
@@ -28,7 +27,7 @@ func TestHandleTriageMovesAndFlips(t *testing.T) {
 	}
 
 	// A file that lived in the bad/ pool but triage decided is actually benign.
-	sha := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	sha := testSHA256([]byte("hello"))
 	oldRel := filepath.Join("bad", "foo.bin")
 	oldAbs := filepath.Join(root, oldRel)
 	if err := os.MkdirAll(filepath.Dir(oldAbs), 0o750); err != nil {
@@ -199,7 +198,7 @@ func TestHandleTriageRulings(t *testing.T) {
 		if err := os.MkdirAll(filepath.Dir(abs), 0o750); err != nil {
 			t.Fatalf("mkdir: %v", err)
 		}
-		if err := os.WriteFile(abs, []byte("data"), 0o600); err != nil {
+		if err := os.WriteFile(abs, []byte(sub), 0o600); err != nil {
 			t.Fatalf("write: %v", err)
 		}
 		if err := db.InsertSample(ctx, &hopper.Sample{
@@ -219,9 +218,9 @@ func TestHandleTriageRulings(t *testing.T) {
 		wantSrc  string
 	}{
 		// No source → default "promoter".
-		{"good", repeat("1"), "", filepath.Join("good", "foraged-promote", "npm", "a.tgz"), "good", "promoter"},
+		{"good", testSHA256([]byte(filepath.Join("npm", "a.tgz"))), "", filepath.Join("good", "foraged-promote", "npm", "a.tgz"), "good", "promoter"},
 		// Client source overrides the recorded label_source.
-		{"bad", repeat("2"), "cyclotron:bad", filepath.Join("bad", "foraged-quarantine", "npm", "b.tgz"), "bad", "cyclotron:bad"},
+		{"bad", testSHA256([]byte(filepath.Join("npm", "b.tgz"))), "cyclotron:bad", filepath.Join("bad", "foraged-quarantine", "npm", "b.tgz"), "bad", "cyclotron:bad"},
 	}
 	for _, tc := range cases {
 		sub := filepath.Join("npm", map[string]string{"good": "a.tgz", "bad": "b.tgz"}[tc.ruling])
@@ -269,7 +268,7 @@ func TestHandleTriageWorkflowMovePreservesCatalogState(t *testing.T) {
 		t.Fatalf("Migrate: %v", err)
 	}
 
-	sha := repeat("8")
+	sha := testSHA256([]byte("sample"))
 	oldRel := filepath.Join("incoming", "unknown", "foraged", "javascript", "npmjs.org", "npm", "pkg", "pkg-1.0.0.tgz")
 	newRel := filepath.Join("review", "unknown", "foraged", "javascript", "npmjs.org", "npm", "pkg", "pkg-1.0.0.tgz")
 	oldAbs := filepath.Join(root, oldRel)
@@ -310,6 +309,42 @@ func TestHandleTriageWorkflowMovePreservesCatalogState(t *testing.T) {
 	again := callTriage(t, api, triageRequest{Verdicts: []triageVerdict{{SHA256: sha, Ruling: "review"}}})
 	if again.Noop != 1 || again.Moved != 0 {
 		t.Fatalf("workflow retry = %+v", again)
+	}
+}
+
+func TestHandleIncomingLocationsOldestFirst(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db := mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour).UTC()
+	newer := old.Add(time.Hour)
+	for _, sample := range []*hopper.Sample{
+		{SHA256: repeat("1"), Path: "incoming/forager/old.bin", Label: "unknown", Mtime: &old},
+		{SHA256: repeat("2"), Path: "incoming/forager/new.bin", Label: "unknown", Mtime: &newer},
+		{SHA256: repeat("3"), Path: "pending/forager/cold.bin", Label: "unknown", Mtime: &old},
+	} {
+		if err := db.InsertSample(ctx, sample); err != nil {
+			t.Fatal(err)
+		}
+	}
+	api := &apiServer{db: db, dataRoot: root, tracker: newWorkerTracker()}
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/locations/incoming?before="+time.Now().UTC().Format(time.RFC3339Nano)+"&limit=1", nil)
+	rec := httptest.NewRecorder()
+	api.handleIncomingLocations(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var response incomingLocationsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Locations) != 1 || response.Locations[0].Path != "incoming/forager/old.bin" {
+		t.Fatalf("locations = %+v", response.Locations)
 	}
 }
 
@@ -420,13 +455,15 @@ func TestHandleTriageSightedRulings(t *testing.T) {
 	}
 	api := &apiServer{db: db, dataRoot: root, tracker: newWorkerTracker()}
 
-	seed := func(sha, rel, label, source string) {
+	seed := func(rel, label, source string) string {
 		t.Helper()
 		abs := filepath.Join(root, rel)
+		content := []byte(rel)
+		sha := testSHA256(content)
 		if err := os.MkdirAll(filepath.Dir(abs), 0o750); err != nil {
 			t.Fatalf("mkdir: %v", err)
 		}
-		if err := os.WriteFile(abs, []byte("data"), 0o600); err != nil {
+		if err := os.WriteFile(abs, content, 0o600); err != nil {
 			t.Fatalf("write: %v", err)
 		}
 		if err := db.InsertSample(ctx, &hopper.Sample{
@@ -434,6 +471,7 @@ func TestHandleTriageSightedRulings(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("InsertSample: %v", err)
 		}
+		return sha
 	}
 	rule := func(sha, ruling, source string) triageResult {
 		t.Helper()
@@ -446,8 +484,7 @@ func TestHandleTriageSightedRulings(t *testing.T) {
 
 	// Backfill demotion: bad/foraged -> sighted/foraged with the
 	// subpath mirrored, relabeled sighted with the client-supplied source.
-	shaA := repeat("5")
-	seed(shaA, filepath.Join("bad", "foraged", "npm", "registry", "socket", "evil", "evil-1.0.tgz"), "bad", "harvest")
+	shaA := seed(filepath.Join("bad", "foraged", "npm", "registry", "socket", "evil", "evil-1.0.tgz"), "bad", "harvest")
 	res := rule(shaA, "sighted", "sighted-backfill")
 	wantA := filepath.Join("sighted", "foraged", "npm", "registry", "socket", "evil", "evil-1.0.tgz")
 	if res.NewPath != wantA {
@@ -471,8 +508,7 @@ func TestHandleTriageSightedRulings(t *testing.T) {
 	// Relocation: forager's version-matched purl re-flag relabels DB-only, so
 	// a sighted-labeled row can still sit under unknown/foraged. The sighted
 	// ruling is tree-aware: it must move the file rather than noop on label.
-	shaB := repeat("6")
-	seed(shaB, filepath.Join("unknown", "foraged", "pypi", "registry", "osv", "pkg", "pkg-2.0.tgz"), "sighted", "forager")
+	shaB := seed(filepath.Join("unknown", "foraged", "pypi", "registry", "osv", "pkg", "pkg-2.0.tgz"), "sighted", "forager")
 	res = rule(shaB, "sighted", "")
 	wantRelo := filepath.Join("sighted", "foraged", "pypi", "registry", "osv", "pkg", "pkg-2.0.tgz")
 	if res.Status != "moved" || res.NewPath != wantRelo {
@@ -577,43 +613,13 @@ func TestRulingPlanPreservesSubpath(t *testing.T) {
 			if !ok {
 				t.Fatalf("rulingPlan(%q, %q) not ok", tc.oldRel, tc.ruling)
 			}
-			if !got.workflow {
-				t.Fatalf("workflow = false")
-			}
 			if got.newRel != tc.want {
 				t.Errorf("newRel = %q, want %q", got.newRel, tc.want)
 			}
-			if got.label != "unknown" {
-				t.Errorf("label = %q, want unknown", got.label)
+			if got.label != "" {
+				t.Errorf("label = %q, want path-only move", got.label)
 			}
 		})
-	}
-}
-
-func TestLockSamplePathHonorsContext(t *testing.T) {
-	t.Parallel()
-	name := filepath.Join(t.TempDir(), "sample")
-	if err := os.WriteFile(name, []byte("sample"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	held, err := os.Open(name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer held.Close() //nolint:errcheck
-	if err := syscall.Flock(int(held.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
-	defer cancel()
-	lock, err := lockSamplePath(ctx, name)
-	if lock != nil {
-		lock.Close() //nolint:errcheck
-		t.Fatal("lockSamplePath acquired a held lock")
-	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("lockSamplePath error = %v, want context deadline", err)
 	}
 }
 
@@ -623,6 +629,11 @@ func repeat(b string) string {
 		out += b
 	}
 	return out[:64]
+}
+
+func testSHA256(content []byte) string {
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:])
 }
 
 func callTriage(t *testing.T, api *apiServer, req triageRequest) triageResponse {

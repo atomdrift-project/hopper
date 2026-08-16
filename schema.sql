@@ -107,6 +107,7 @@ CREATE TABLE IF NOT EXISTS reports (
 );
 
 CREATE INDEX IF NOT EXISTS idx_reports_sha256_type ON reports(sha256, report_type);
+CREATE INDEX IF NOT EXISTS idx_reports_sha256_type_created ON reports(sha256, report_type, created_at DESC);
 
 -- sightings is the external-corroboration ledger: one row per (source, subject)
 -- recording that an outside threat feed, scanner, blog, or advisory cited a

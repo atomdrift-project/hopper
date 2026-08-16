@@ -52,9 +52,11 @@ type apiServer struct {
 	allowedDirs         []string
 	forceRescanPrefixes []string
 	rescanAge           time.Duration
+	requiredMounts      []string
 	uploadTokenHash     [sha256.Size]byte
 	datasetIncomplete   bool
 	uploadTokenSet      bool
+	ready               atomic.Bool
 }
 
 // errSaturated is returned by the slot-acquire helpers when no slot frees
@@ -639,6 +641,7 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/upload", s.handleUpload)
 	mux.HandleFunc("POST /api/known", s.handleKnown)
 	mux.HandleFunc("POST /api/sightings", s.handleSightings)
+	mux.HandleFunc("GET /api/locations/incoming", s.handleIncomingLocations)
 	mux.HandleFunc("POST /api/triage", s.handleTriage)
 	mux.HandleFunc("POST /api/rescan/{sha256}", s.handleRescan)
 	mux.HandleFunc("GET /api/file/{sha256}", s.handleFile)
@@ -1354,8 +1357,8 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 			unclaimSHAs = append(unclaimSHAs, j.SHA256)
 			continue
 		}
-		diskPath := sampleDiskPath(s.dataRoot, filepath.FromSlash(j.Path))
-		info, err := os.Stat(diskPath) //nolint:gosec // path from DB lookup, not user input
+		location := &hopper.Sample{SHA256: j.SHA256, Path: j.Path}
+		f, info, err := s.openKnownSampleFile(ctx, location, worker)
 		if err != nil {
 			if s.datasetIncomplete {
 				// Local disk is not authoritative in this mode — the file being
@@ -1369,15 +1372,32 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 				unclaimSHAs = append(unclaimSHAs, j.SHA256)
 				continue
 			}
+			skip := ""
+			switch {
+			case errors.Is(err, os.ErrNotExist):
+				skip = "missing"
+			case errors.Is(err, errSamplePathRejected):
+				skip = "invalid_path"
+			case errors.Is(err, errSampleNotRegular):
+				skip = "corrupt"
+			}
+			if skip == "" {
+				slog.Warn("claimed file temporarily unavailable; releasing claim",
+					"worker", worker, "sha256", j.SHA256, "path", j.Path, "error", err)
+				unclaimSHAs = append(unclaimSHAs, j.SHA256)
+				continue
+			}
 			//nolint:gosec // worker validated, sha256/path from DB
-			slog.Warn("claimed file missing on disk",
-				"worker", worker, "sha256", j.SHA256, "path", j.Path, "disk_path", diskPath)
-			if err := s.db.SetSkip(ctx, j.SHA256, "missing"); err != nil {
-				slog.Error("mark missing failed", "sha256", j.SHA256, "error", err) //nolint:gosec // structured logging
+			slog.Warn("claimed file unavailable on all known paths",
+				"worker", worker, "sha256", j.SHA256, "path", j.Path, "skip", skip, "error", err)
+			if err := s.db.SetSkip(ctx, j.SHA256, skip); err != nil {
+				slog.Error("mark unavailable sample failed", "sha256", j.SHA256, "skip", skip, "error", err) //nolint:gosec // structured logging
 			}
 			unclaimSHAs = append(unclaimSHAs, j.SHA256)
 			continue
 		}
+		_ = f.Close()
+		j.Path = location.Path
 		if j.SizeBytes > 0 && info.Size() != j.SizeBytes {
 			//nolint:gosec // sha256 validated, path from DB, sizes are int64
 			slog.Warn("claimed file size mismatch — file was likely replaced",
@@ -1632,6 +1652,16 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 
 	// Parse cleave result once — used for both storage and explosion.
 	parsed := hopper.ParseCleaveResult(req.SHA256, req.Raw)
+	if parsed.RootSHA != "" && parsed.RootSHA != req.SHA256 {
+		claimedPath := s.tracker.release(req.SHA256)
+		s.tracker.recordResult(req.Worker, true)
+		s.progress.recordErrorf(1, "identity", "result root sha mismatch: claimed %s reported %s", req.SHA256, parsed.RootSHA)
+		slog.Warn("result rejected: cleave root sha mismatch",
+			"worker", req.Worker, "claimed_sha256", req.SHA256,
+			"reported_sha256", parsed.RootSHA, "path", claimedPath)
+		writeJSONError(w, http.StatusUnprocessableEntity, `{"error":"cleave result root sha256 does not match claimed sample"}`)
+		return
+	}
 
 	// Determine the traits version used for this analysis: prefer the
 	// version embedded in the cleave result (authoritative), fall back to
@@ -1658,6 +1688,19 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		return s.db.StoreResult(ctx, req.SHA256, req.Raw, req.ML, req.LLM, &parsed, tv)
 	})
 	if err != nil {
+		if errors.Is(err, hopper.ErrNotFound) {
+			claimedPath := s.tracker.release(req.SHA256)
+			s.tracker.recordResult(req.Worker, false)
+			// The row can disappear after a claim when a concurrent authoritative
+			// walk reconciles a moved/deleted file. The worker completed valid work,
+			// but there is no longer a record to update; acknowledge it so the client
+			// does not retry the same permanent no-op.
+			slog.Info("discarded stale result for absent sample",
+				"worker", req.Worker, "sha256", req.SHA256, "path", claimedPath)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "stored": false}) //nolint:errcheck,errchkjson // best-effort response
+			return
+		}
 		logResultStoreError(r.Context(), ctx, "store result failed after accepting worker result", req.SHA256, err)
 		// Drop the claim and bump errors so the worker's slot frees up — without
 		// this, the worker's ActiveClaims is permanently inflated for this job.
@@ -2694,6 +2737,10 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 
 	hasher := sha256.New()
 	written, copyErr := io.Copy(io.MultiWriter(tmpFile, hasher), src)
+	var syncErr error
+	if copyErr == nil {
+		syncErr = tmpFile.Sync()
+	}
 	closeErr := tmpFile.Close()
 	if copyErr != nil {
 		var maxErr *http.MaxBytesError
@@ -2716,6 +2763,11 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 	}
 	if closeErr != nil {
 		slog.ErrorContext(r.Context(), "upload: temp close", "error", closeErr)
+		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		return
+	}
+	if syncErr != nil {
+		slog.ErrorContext(r.Context(), "upload: temp sync", "error", syncErr)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
 	}
@@ -2779,6 +2831,16 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
 	}
+	if existing != nil && existing.Path != "" && existing.Path != relPath {
+		healed, healErr := s.db.PromotePrimaryLocation(storeCtx, sha, existing.Path, relPath)
+		if healErr != nil {
+			slog.Error("upload: promote verified replacement location",
+				"sha256", sha, "old_path", existing.Path, "new_path", relPath, "error", healErr)
+		} else if healed {
+			slog.Info("upload: replaced unusable canonical location with verified bytes",
+				"sha256", sha, "old_path", existing.Path, "new_path", relPath)
+		}
+	}
 
 	// A sidecar arriving with bytes must land the same way it would have arrived
 	// alone: the upsert above keeps a stored sidecar over an incoming one, so
@@ -2840,8 +2902,11 @@ func (s *apiServer) placeUpload(ctx context.Context, tmpPath, sha, filename stri
 	// Already recorded at a path whose file is still there: keep it.
 	if existing != nil && existing.Path != "" {
 		if abs, err := s.resolveDataPath(existing.Path); err == nil {
-			if _, err := os.Stat(abs); err == nil {
+			if matches, matchErr := fileMatchesSHA256(abs, sha); matchErr == nil && matches {
 				return existing.Path, nil
+			} else if matchErr == nil {
+				slog.WarnContext(ctx, "upload: existing path has wrong bytes; publishing a verified replacement location",
+					"sha256", sha, "path", existing.Path)
 			}
 		}
 	}
@@ -2876,6 +2941,9 @@ func (s *apiServer) placeUpload(ctx context.Context, tmpPath, sha, filename stri
 	if err := os.Chmod(claimed, sampleFileMode); err != nil {
 		slog.WarnContext(ctx, "upload: chmod sample read-only", "error", err, "path", claimed)
 	}
+	if err := syncUploadDir(filepath.Dir(claimed)); err != nil {
+		return "", fmt.Errorf("sync upload directory: %w", err)
+	}
 	return filepath.ToSlash(filepath.Join(relDir, filepath.Base(claimed))), nil
 }
 
@@ -2895,11 +2963,16 @@ func (s *apiServer) placeUpload(ctx context.Context, tmpPath, sha, filename stri
 // an occupant can only be this same sample's bytes and is kept as-is.
 func claimSamplePath(src, abs, sha string, digestKeyed bool) (string, error) {
 	err := os.Link(src, abs)
-	if err == nil || (digestKeyed && errors.Is(err, os.ErrExist)) {
+	if err == nil {
 		return abs, nil
 	}
 	if !errors.Is(err, os.ErrExist) {
 		return "", fmt.Errorf("link %s: %w", abs, err)
+	}
+	if matches, matchErr := fileMatchesSHA256(abs, sha); matchErr == nil && matches {
+		return abs, nil
+	} else if digestKeyed && matchErr != nil {
+		return "", fmt.Errorf("verify existing digest-keyed path %s: %w", abs, matchErr)
 	}
 	// Foreign bytes hold the path. Qualify with our own digest, which cannot
 	// collide with another sample; a second EEXIST is this sample's own earlier
@@ -2910,10 +2983,28 @@ func claimSamplePath(src, abs, sha string, digestKeyed bool) (string, error) {
 	// one path, and keep the name inside NAME_MAX given uploadFilenameMax.
 	ext := filepath.Ext(abs)
 	qualified := strings.TrimSuffix(abs, ext) + "-" + sha[:12] + ext
-	if err := os.Link(src, qualified); err != nil && !errors.Is(err, os.ErrExist) {
-		return "", fmt.Errorf("link %s: %w", qualified, err)
+	if err := os.Link(src, qualified); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return "", fmt.Errorf("link %s: %w", qualified, err)
+		}
+		matches, matchErr := fileMatchesSHA256(qualified, sha)
+		if matchErr != nil {
+			return "", fmt.Errorf("verify qualified upload path %s: %w", qualified, matchErr)
+		}
+		if !matches {
+			return "", fmt.Errorf("qualified upload path %s is occupied by different bytes", qualified)
+		}
 	}
 	return qualified, nil
+}
+
+func syncUploadDir(path string) error {
+	dir, err := os.Open(path) //nolint:gosec // caller confines upload paths to dataRoot
+	if err != nil {
+		return err
+	}
+	defer dir.Close() //nolint:errcheck // sync result is authoritative
+	return dir.Sync()
 }
 
 // uploadSample builds the row for a stored upload. Source is always "upload"
@@ -2992,7 +3083,7 @@ func uploadSample(sha, filename, relPath string, size int64, prov *hopper.Sideca
 }
 
 // sweepUploadTmp removes orphaned upload temp files older than uploadTmpMaxAge.
-// Crashes mid-upload leave files in <dataRoot>/unknown/uploads/.tmp/up-* that
+// Crashes mid-upload leave files in <dataRoot>/incoming/uploads/.tmp/up-* that
 // nothing else cleans up; without this they accumulate forever.
 func (s *apiServer) sweepUploadTmp() {
 	if s.dataRoot == "" {
@@ -3227,54 +3318,147 @@ func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Path containment: resolve symlinks and verify the file is under
-	// one of the allowed sample directories. Prevents serving arbitrary
-	// files if a sample row has a crafted or symlinked path.
-	diskPath := sampleDiskPath(s.dataRoot, filepath.FromSlash(sample.Path))
-	resolved, err := filepath.EvalSymlinks(diskPath)
+	f, stat, err := s.openKnownSampleFile(ctx, sample, r.RemoteAddr)
 	if err != nil {
 		s.markServeMissing(ctx, sample, err)
-		writeMissingSampleFile(w, err, `{"error":"sample file gone"}`)
-		return
-	}
-	allowed := false
-	for _, dir := range s.allowedDirs {
-		if strings.HasPrefix(resolved, dir+string(filepath.Separator)) || resolved == dir {
-			allowed = true
-			break
+		if errors.Is(err, errSamplePathRejected) || errors.Is(err, errSampleNotRegular) {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
 		}
-	}
-	if !allowed {
-		//nolint:gosec // sha256 validated by validSHA256, path from DB lookup
-		slog.Warn("file request blocked: path outside allowed directories",
-			"sha256", sha, "path", sample.Path, "resolved", resolved,
-			"remote", r.RemoteAddr, "allowed_dirs", s.allowedDirs)
-		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
-		return
-	}
-
-	// Serve the file directly (no directory listings — the path is a file).
-	f, err := os.Open(resolved) //nolint:gosec // path validated above
-	if err != nil {
-		s.markServeMissing(ctx, sample, err)
 		writeMissingSampleFile(w, err, `{"error":"sample file gone"}`)
 		return
 	}
 	defer f.Close() //nolint:errcheck // best-effort close
-	stat, err := f.Stat()
-	if err != nil {
-		s.markServeMissing(ctx, sample, err)
-		writeMissingSampleFile(w, err, `{"error":"sample file gone"}`)
-		return
-	}
-	if stat.IsDir() {
-		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
-		return
-	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	// Content-addressed by sha256: the bytes never change, so cache forever.
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
+}
+
+var (
+	errSamplePathRejected = errors.New("sample path outside allowed directories")
+	errSampleNotRegular   = errors.New("sample path is not a regular file")
+)
+
+// openKnownSampleFile opens the canonical path first. Only if that fails does
+// it query the active top-level location ledger and try each distinct path in
+// newest-first order. A successful fallback compare-and-swaps samples.path so
+// later requests return to the one-query fast path.
+func (s *apiServer) openKnownSampleFile(ctx context.Context, sample *hopper.Sample, remote string) (*os.File, os.FileInfo, error) {
+	open := func(storedPath string) (*os.File, os.FileInfo, error) {
+		diskPath := sampleDiskPath(s.dataRoot, filepath.FromSlash(storedPath))
+		resolved, err := filepath.EvalSymlinks(diskPath)
+		if err != nil {
+			return nil, nil, err
+		}
+		allowed := false
+		for _, dir := range s.allowedDirs {
+			if strings.HasPrefix(resolved, dir+string(filepath.Separator)) || resolved == dir {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return nil, nil, fmt.Errorf("%w: %s", errSamplePathRejected, resolved)
+		}
+		f, err := os.Open(resolved) //nolint:gosec // resolved path passed containment check above
+		if err != nil {
+			return nil, nil, err
+		}
+		stat, err := f.Stat()
+		if err != nil {
+			_ = f.Close()
+			return nil, nil, err
+		}
+		if !stat.Mode().IsRegular() {
+			_ = f.Close()
+			return nil, nil, fmt.Errorf("%w: %s", errSampleNotRegular, resolved)
+		}
+		return f, stat, nil
+	}
+
+	f, stat, primaryErr := open(sample.Path)
+	if primaryErr == nil {
+		if sample.Skip == "missing" {
+			reactivated, err := s.db.ReactivatePrimaryLocation(ctx, sample.SHA256, sample.Path)
+			if err != nil {
+				slog.WarnContext(ctx, "recovered sample path catalog repair failed",
+					"sha256", sample.SHA256, "path", sample.Path, "error", err)
+			} else if reactivated {
+				sample.Skip = ""
+				slog.InfoContext(ctx, "sample path recovered",
+					"sha256", sample.SHA256, "path", sample.Path, "remote", remote)
+			}
+		}
+		return f, stat, nil
+	}
+	locations, err := s.db.TopLevelLocationsForSHA(ctx, sample.SHA256)
+	if err != nil {
+		slog.ErrorContext(ctx, "sample location fallback lookup failed",
+			"sha256", sample.SHA256, "primary_path", sample.Path, "error", err, "remote", remote)
+		return nil, nil, fmt.Errorf("lookup alternate sample locations: %w", err)
+	}
+
+	seen := map[string]struct{}{sample.Path: {}}
+	paths := []string{sample.Path}
+	for _, loc := range locations {
+		if loc.Path == "" {
+			continue
+		}
+		if _, ok := seen[loc.Path]; ok {
+			continue
+		}
+		seen[loc.Path] = struct{}{}
+		paths = append(paths, loc.Path)
+	}
+
+	firstTransient := error(nil)
+	rejected := errors.Is(primaryErr, errSamplePathRejected)
+	notRegular := errors.Is(primaryErr, errSampleNotRegular)
+	if !errors.Is(primaryErr, os.ErrNotExist) && !rejected && !notRegular {
+		firstTransient = primaryErr
+	}
+	attempts := 1
+	for _, candidate := range paths[1:] {
+		attempts++
+		f, stat, err = open(candidate)
+		if err == nil {
+			healed, healErr := s.db.PromotePrimaryLocation(ctx, sample.SHA256, sample.Path, candidate)
+			if healErr != nil {
+				slog.WarnContext(ctx, "sample path fallback healing failed",
+					"sha256", sample.SHA256, "old_path", sample.Path,
+					"selected_path", candidate, "error", healErr)
+			}
+			slog.InfoContext(ctx, "sample path fallback succeeded",
+				"sha256", sample.SHA256, "old_path", sample.Path,
+				"selected_path", candidate, "candidate_count", len(paths),
+				"attempts", attempts, "primary_healed", healed, "remote", remote)
+			sample.Path = candidate
+			return f, stat, nil
+		}
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+		case errors.Is(err, errSamplePathRejected):
+			rejected = true
+		case errors.Is(err, errSampleNotRegular):
+			notRegular = true
+		case firstTransient == nil:
+			firstTransient = err
+		}
+	}
+	if firstTransient != nil {
+		return nil, nil, firstTransient
+	}
+	if rejected {
+		slog.WarnContext(ctx, "file request blocked: all known paths unavailable or outside allowed directories",
+			"sha256", sample.SHA256, "primary_path", sample.Path,
+			"candidate_count", len(paths), "remote", remote, "allowed_dirs", s.allowedDirs)
+		return nil, nil, errSamplePathRejected
+	}
+	if notRegular {
+		return nil, nil, errSampleNotRegular
+	}
+	return nil, nil, os.ErrNotExist
 }
 
 // isClientGone reports whether err (or the request context) indicates the
@@ -3404,48 +3588,21 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 		return
 	}
 
-	diskPath := sampleDiskPath(s.dataRoot, filepath.FromSlash(parent.Path))
-	resolved, err := filepath.EvalSymlinks(diskPath)
+	f, stat, err := s.openKnownSampleFile(ctx, parent, r.RemoteAddr)
 	if err != nil {
-		// The bytes that vanished are the parent archive's; the member rows are
-		// cascaded by the reconcile walk once the parent is marked.
 		s.markServeMissing(ctx, parent, err)
-		writeMissingSampleFile(w, err, `{"error":"parent file gone"}`)
-		return
-	}
-	allowed := false
-	for _, dir := range s.allowedDirs {
-		if strings.HasPrefix(resolved, dir+string(filepath.Separator)) || resolved == dir {
-			allowed = true
-			break
+		if errors.Is(err, errSamplePathRejected) {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
 		}
-	}
-	if !allowed {
-		//nolint:gosec // sha256 validated by validSHA256, path from DB lookup
-		slog.Warn("archive-member request blocked: parent path outside allowed directories",
-			"sha256", sha, "parent_sha", parent.SHA256, "parent_path", parent.Path,
-			"resolved", resolved, "remote", r.RemoteAddr, "allowed_dirs", s.allowedDirs)
-		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
-		return
-	}
-
-	f, err := os.Open(resolved) //nolint:gosec // path validated above
-	if err != nil {
-		s.markServeMissing(ctx, parent, err)
+		if errors.Is(err, errSampleNotRegular) {
+			http.Error(w, `{"error":"parent not a file"}`, http.StatusUnprocessableEntity)
+			return
+		}
 		writeMissingSampleFile(w, err, `{"error":"parent file gone"}`)
 		return
 	}
 	defer f.Close() //nolint:errcheck // best-effort close
-	stat, err := f.Stat()
-	if err != nil {
-		s.markServeMissing(ctx, parent, err)
-		writeMissingSampleFile(w, err, `{"error":"parent file gone"}`)
-		return
-	}
-	if stat.IsDir() {
-		http.Error(w, `{"error":"parent not a file"}`, http.StatusUnprocessableEntity)
-		return
-	}
 
 	// Presence probe: everything a HEAD can truthfully answer is already
 	// settled — the member row exists, its path carries an archive delimiter,

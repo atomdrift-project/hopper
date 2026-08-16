@@ -125,6 +125,49 @@ func TestSightingsCorroboratedFeedFilter(t *testing.T) {
 	}
 }
 
+func TestSHACitedUnknowns(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	sha1 := strings.Repeat("1", 64)
+	sha2 := strings.Repeat("2", 64)
+	purlOnly := strings.Repeat("3", 64)
+	outside := strings.Repeat("4", 64)
+	for sha, path := range map[string]string{
+		sha1:     "incoming/forager/npm/one.tgz",
+		sha2:     "incoming/forager/npm/two.tgz",
+		purlOnly: "incoming/forager/npm/three.tgz",
+		outside:  "pending/forager/npm/four.tgz",
+	} {
+		mustInsert(t, ctx, db, &Sample{
+			SHA256: sha, Source: "forager", Label: labelUnknown,
+			LabelSource: "forager", Path: path, PURLBase: "pkg:npm/" + sha[:4],
+		})
+	}
+	if _, err := db.AddSightings(ctx, []Sighting{
+		{Source: "socket", Subject: sha1},
+		{Source: "socket", Subject: sha2},
+		{Source: "socket", Subject: "pkg:npm/" + purlOnly[:4]},
+		{Source: "socket", Subject: outside},
+	}); err != nil {
+		t.Fatalf("AddSightings: %v", err)
+	}
+
+	page, err := db.SHACitedUnknowns(ctx, "incoming/", "", 1)
+	if err != nil {
+		t.Fatalf("SHACitedUnknowns page 1: %v", err)
+	}
+	if len(page) != 1 || page[0].SHA256 != sha1 || page[0].Path != "incoming/forager/npm/one.tgz" {
+		t.Fatalf("page 1 = %+v, want %s at its exact path", page, sha1)
+	}
+	page, err = db.SHACitedUnknowns(ctx, "incoming/", page[0].SHA256, 10)
+	if err != nil {
+		t.Fatalf("SHACitedUnknowns page 2: %v", err)
+	}
+	if len(page) != 1 || page[0].SHA256 != sha2 {
+		t.Fatalf("page 2 = %+v, want only %s", page, sha2)
+	}
+}
+
 // TestAddSightingsNormalizesSubjects: the ledger keys corroboration by exact
 // match, so subjects must land in canonical form no matter what spelling the
 // producer holds — uppercase hashes lowercase, PURLs fold onto the canonical

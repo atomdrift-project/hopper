@@ -59,6 +59,10 @@ samples/
 └── review/
 ```
 
+`incoming/`, `pending/`, and `review/` are physical workflow roots. Samples in
+all three retain the catalog label `unknown`, and moves between them preserve
+the complete suffix below the root. New API uploads land in `incoming/`.
+
 Then initialize SQLite and ingest it:
 
 ```bash

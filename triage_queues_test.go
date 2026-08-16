@@ -27,6 +27,213 @@ func shaSet(samples []*Sample) map[string]bool {
 	return m
 }
 
+func TestTriageUnknownPoolsAreDisjoint(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	sha := func(c byte) string {
+		return fmt.Sprintf("%064x", c)
+	}
+	add := func(c byte, path string, crit int, skip string) string {
+		t.Helper()
+		s := sha(c)
+		mustInsert(t, ctx, db, &Sample{SHA256: s, Label: "unknown", Path: path})
+		traits := ""
+		if crit > 0 {
+			traits = fmt.Sprintf(`{"l":%d}`, crit)
+		}
+		mustAnalyzeWithTraits(t, ctx, db, s, 0, traits)
+		if skip != "" {
+			if err := db.SetSkip(ctx, s, skip); err != nil {
+				t.Fatalf("SetSkip(%s): %v", s, err)
+			}
+		}
+		return s
+	}
+
+	incoming := add(1, "incoming/forager/a.tgz", 4, "")
+	pending := add(2, "pending/forager/b.tgz", 4, "")
+	legacy := add(3, "unknown/forager/c.tgz", 4, "")
+	reviewClean := add(4, "review/forager/d.tgz", 0, "")
+	reviewFlagged := add(5, "review/forager/e.tgz", 4, "")
+	reviewSkipped := add(6, "review/forager/f.tgz", 4, "unsupported")
+
+	newRows, err := db.TriageNew(ctx, 20, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageNew: %v", err)
+	}
+	newSet := shaSet(newRows)
+	for _, want := range []string{incoming, pending, legacy} {
+		if !newSet[want] {
+			t.Errorf("TriageNew missing %s", want)
+		}
+	}
+	for _, deny := range []string{reviewClean, reviewFlagged, reviewSkipped} {
+		if newSet[deny] {
+			t.Errorf("TriageNew included review sample %s", deny)
+		}
+	}
+
+	reviewRows, err := db.TriageReview(ctx, 20, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageReview: %v", err)
+	}
+	reviewSet := shaSet(reviewRows)
+	for _, want := range []string{reviewClean, reviewFlagged} {
+		if !reviewSet[want] {
+			t.Errorf("TriageReview missing %s", want)
+		}
+	}
+	for _, deny := range []string{incoming, pending, legacy, reviewSkipped} {
+		if reviewSet[deny] {
+			t.Errorf("TriageReview included ineligible sample %s", deny)
+		}
+	}
+}
+
+func TestTriageQueuesReturnLightSamples(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	sha := staleTestSHA(89)
+	mustInsert(t, ctx, db, &Sample{SHA256: sha, Label: "unknown", Path: "review/" + sha})
+	mustAnalyzeWithTraits(t, ctx, db, sha, 7, `{"l":4}`)
+	setLitmus(t, ctx, db, sha, 2, 0.95)
+	if err := db.UpdateLLMResult(ctx, sha, []byte(`{"interpretation":"test"}`)); err != nil {
+		t.Fatalf("UpdateLLMResult: %v", err)
+	}
+
+	got, err := db.TriageReview(ctx, 1, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageReview: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("TriageReview returned %d samples, want 1", len(got))
+	}
+	s := got[0]
+	if len(s.CleaveResult) != 0 || len(s.LitmusResult) != 0 || len(s.LLMResult) != 0 {
+		t.Fatalf("triage result includes blobs: cleave=%d litmus=%d llm=%d",
+			len(s.CleaveResult), len(s.LitmusResult), len(s.LLMResult))
+	}
+	if s.SHA256 != sha || s.Path != "review/"+sha || s.MaxCrit != 4 || s.LitmusScore != 0.95 {
+		t.Fatalf("triage metadata incomplete: %+v", s)
+	}
+}
+
+func TestTriageAttemptBudget(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	sha := staleTestSHA(90)
+	mustInsert(t, ctx, db, &Sample{SHA256: sha, Label: "bad", Path: "bad/x"})
+	mustAnalyzeWithTraits(t, ctx, db, sha, 0, "")
+
+	filter := TriageFilter{AttemptReportType: "cyclotron-attempt:bad", MaxAttempts: 2}
+	selected := func() bool {
+		t.Helper()
+		got, err := db.TriageBad(ctx, 10, filter)
+		if err != nil {
+			t.Fatalf("TriageBad: %v", err)
+		}
+		return shaSet(got)[sha]
+	}
+	if !selected() {
+		t.Fatal("fresh sample missing from retry-budgeted queue")
+	}
+	for i := range 2 {
+		if err := db.InsertReport(ctx, &Report{SHA256: sha, Type: "cyclotron-attempt:bad", Content: fmt.Sprintf("attempt=%d", i+1)}); err != nil {
+			t.Fatalf("InsertReport: %v", err)
+		}
+		if got := selected(); got != (i == 0) {
+			t.Fatalf("selected after %d attempts = %v, want %v", i+1, got, i == 0)
+		}
+	}
+	// Another queue's attempts do not consume this queue's budget.
+	if err := db.InsertReport(ctx, &Report{SHA256: sha, Type: "cyclotron-attempt:good"}); err != nil {
+		t.Fatalf("InsertReport(other queue): %v", err)
+	}
+	if selected() {
+		t.Fatal("other queue report changed an already-exhausted bad budget")
+	}
+}
+
+func TestSampleClaimLease(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	sha := staleTestSHA(95)
+	mustInsert(t, ctx, db, &Sample{SHA256: sha, Label: "unknown", Path: "incoming/" + sha})
+
+	claimed, err := db.TryClaimSample(ctx, sha, "worker-a", time.Hour)
+	if err != nil || !claimed {
+		t.Fatalf("first claim = %v, %v; want true, nil", claimed, err)
+	}
+	for _, owner := range []string{"worker-a", "worker-b"} {
+		claimed, err = db.TryClaimSample(ctx, sha, owner, time.Hour)
+		if err != nil || claimed {
+			t.Fatalf("live claim by %q = %v, %v; want false, nil", owner, claimed, err)
+		}
+	}
+	if err := db.ReleaseSampleClaim(ctx, sha, "worker-b"); err != nil {
+		t.Fatalf("release by non-owner: %v", err)
+	}
+	claimed, err = db.TryClaimSample(ctx, sha, "worker-b", time.Hour)
+	if err != nil || claimed {
+		t.Fatalf("claim after non-owner release = %v, %v; want false, nil", claimed, err)
+	}
+	if err := db.ReleaseSampleClaim(ctx, sha, "worker-a"); err != nil {
+		t.Fatalf("owner release: %v", err)
+	}
+	claimed, err = db.TryClaimSample(ctx, sha, "worker-b", time.Hour)
+	if err != nil || !claimed {
+		t.Fatalf("claim after owner release = %v, %v; want true, nil", claimed, err)
+	}
+
+	if _, err := db.lite.ExecContext(ctx, `UPDATE samples SET claimed_at = ? WHERE sha256 = ?`,
+		time.Now().Add(-2*time.Hour).UTC().Format(time.RFC3339Nano), sha); err != nil {
+		t.Fatalf("backdate claim: %v", err)
+	}
+	claimed, err = db.TryClaimSample(ctx, sha, "worker-c", time.Hour)
+	if err != nil || !claimed {
+		t.Fatalf("replace expired claim = %v, %v; want true, nil", claimed, err)
+	}
+}
+
+func TestTriageInterestingOrder(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	add := func(n, crit, suspicious int, score float64, corroborated bool) string {
+		t.Helper()
+		sha := staleTestSHA(n)
+		mustInsert(t, ctx, db, &Sample{SHA256: sha, Label: "unknown", Path: "review/" + sha})
+		traits := ""
+		if crit > 0 {
+			traits = fmt.Sprintf(`{"l":%d}`, crit)
+		}
+		mustAnalyzeWithTraits(t, ctx, db, sha, 0, traits)
+		if suspicious > 1 {
+			mustAnalyzeWithTraits(t, ctx, db, sha, 0, `{"l":4},{"l":4}`)
+		}
+		setLitmus(t, ctx, db, sha, 0, score)
+		if corroborated {
+			if _, err := db.lite.ExecContext(ctx, `UPDATE samples SET corroborated = 1 WHERE sha256 = ?`, sha); err != nil {
+				t.Fatalf("set corroborated: %v", err)
+			}
+		}
+		return sha
+	}
+
+	corroborated := add(91, 0, 0, 0.1, true)
+	hostile := add(92, 5, 1, 0.8, false)
+	twoSuspicious := add(93, 4, 2, 0.9, false)
+	weak := add(94, 0, 0, 0.99, false)
+	got, err := db.TriageReview(ctx, 10, TriageFilter{Order: TriageInteresting})
+	if err != nil {
+		t.Fatalf("TriageReview: %v", err)
+	}
+	want := []string{corroborated[:8], hostile[:8], twoSuspicious[:8], weak[:8]}
+	if list := shaList(got); !slicesEqual(list, want) {
+		t.Fatalf("interesting order = %v, want %v", list, want)
+	}
+}
+
 // TestTriageHighestCollapsesToParent covers the parent-collapse contract: hot
 // good members are returned as their archive (one row per root, ranked by the
 // hottest member), top-level hot good files as themselves, bad-parent members
@@ -243,7 +450,7 @@ func TestTriageStaleOrdering(t *testing.T) {
 			Path: "bad/" + r.sha, FileType: "elf",
 			CleaveResult:    []byte(`{"files":[]}`),
 			MaxCrit:         0,
-			SuspiciousCount: 0, // (max_crit<5 OR suspicious_count<2) => in queue
+			SuspiciousCount: 0, // max_crit<5 AND suspicious_count<2 => in queue
 		})
 		setTimes(r.sha, r.created, r.analyzed)
 	}
@@ -433,6 +640,37 @@ func TestTriageHighestPerRouteReach(t *testing.T) {
 	}
 	if got[3].SHA256 != pe2 {
 		t.Errorf("rank-first order violated: row 3 = %q, want pe #2", got[3].SHA256[:8])
+	}
+}
+
+func TestTriageHighestAttemptBudgetUsesRoot(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	root, member := staleTestSHA(201), staleTestSHA(202)
+	mustInsert(t, ctx, db, &Sample{SHA256: root, Label: "good", Path: "good/archive.zip"})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: member, Label: "good", Parent: root, Path: "good/archive.zip!!payload.exe",
+	})
+	mustAnalyzeWithTraits(t, ctx, db, member, 90, `{"l":5}`)
+	setLitmus(t, ctx, db, member, 2, 0.99)
+
+	filter := TriageFilter{AttemptReportType: "cyclotron-attempt:highest", MaxAttempts: 1}
+	selectRoot := func() bool {
+		t.Helper()
+		got, err := db.TriageHighest(ctx, 10, time.Now().Add(time.Hour), time.Now().Add(-MissingRetry), filter)
+		if err != nil {
+			t.Fatalf("TriageHighest: %v", err)
+		}
+		return shaSet(got)[root]
+	}
+	if !selectRoot() {
+		t.Fatal("archive root missing before attempt")
+	}
+	if err := db.InsertReport(ctx, &Report{SHA256: root, Type: "cyclotron-attempt:highest"}); err != nil {
+		t.Fatalf("InsertReport(root attempt): %v", err)
+	}
+	if selectRoot() {
+		t.Fatal("root remained eligible after exhausting highest attempt budget")
 	}
 }
 

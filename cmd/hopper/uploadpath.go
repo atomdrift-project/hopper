@@ -34,15 +34,15 @@ import (
 const (
 	// pendingPool is the cold unreviewed sample pool. Samples here still carry
 	// the DB classification label "unknown"; the directory names workflow state.
-	pendingPool = "pending"
+	pendingPool = hopper.PoolPending
 	// reviewPool is the cold human/extra-review queue, also label "unknown".
-	reviewPool = "review"
+	reviewPool = hopper.PoolReview
 	// legacyUnknownPool is the pre-pending storage root retained for old rows.
-	legacyUnknownPool = "unknown"
+	legacyUnknownPool = hopper.PoolLegacyUnknown
 	// uploadBucket is the hot pool an upload enters. Analysis, not the producer,
 	// decides a sample's label, so every upload starts unlabelled. Draino later
 	// moves old paths to pending/ without changing the suffix or verdict.
-	uploadBucket = "incoming"
+	uploadBucket = hopper.PoolIncoming
 	// coordinateTier holds samples keyed by an immutable package coordinate.
 	coordinateTier = "pkg"
 	// digestTier holds samples keyed by their content hash.

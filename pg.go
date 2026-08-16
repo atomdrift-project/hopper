@@ -155,6 +155,11 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// Grafana analysis-latency panels bucket reports by created_at over wide
 		// ranges; idx_reports_sha256_type doesn't help time-range scans.
 		`CREATE INDEX IF NOT EXISTS idx_reports_created_at ON reports(created_at DESC)`,
+		// Cyclotron's durable retry budgets count one queue-specific report type
+		// per sample. Including created_at also covers the existing analysis-relative
+		// report exclusions without a heap walk.
+		`CREATE INDEX IF NOT EXISTS idx_reports_sha256_type_created ` +
+			`ON reports(sha256, report_type, created_at DESC)`,
 		// External-corroboration ledger (see schema.sql) and the denormalized
 		// samples.corroborated flag it maintains. The ADD COLUMN has a constant
 		// default, so it is a metadata-only change (no table rewrite) on PG11+.
@@ -272,7 +277,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_stranded_member ` +
 			`ON samples(score DESC, id DESC) ` +
 			`WHERE label = 'good' AND parent != '' AND score > 0 AND max_crit >= 3 AND cleave_result IS NOT NULL AND skip = ''`,
-		// The four newest-first selectors (TriageBad/Good/New/Sighted). Without
+		// The five newest-first selectors (TriageBad/Good/New/Review/Sighted). Without
 		// these the planner walks idx_samples_top_created — which carries only
 		// parent = '' — and applies label plus the detection predicate as a
 		// filter, so cost scales with how RARE the queue's population is, not
@@ -287,18 +292,32 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// NULLS spelling is needed for the DESC key to match the ORDER BY.
 		// Each WHERE must stay byte-identical to its selector's predicate,
 		// skip = '' included, or the planner will not match the partial.
-		`CREATE INDEX IF NOT EXISTS idx_samples_bad_newest ` +
+		`CREATE INDEX IF NOT EXISTS idx_samples_bad_miss_newest ` +
 			`ON samples(created_at DESC, id DESC) ` +
 			`WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = '' ` +
-			`AND skip = '' AND (max_crit < 5 OR suspicious_count < 2)`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_good_newest ` +
+			`AND skip = '' AND max_crit < 5 AND suspicious_count < 2`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_good_repair_newest ` +
 			`ON samples(created_at DESC, id DESC) ` +
 			`WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = '' ` +
-			`AND skip = '' AND (max_crit >= 5 OR suspicious_count >= 2 OR litmus_class >= 1)`,
+			`AND skip = '' AND (max_crit >= 5 OR suspicious_count >= 2)`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_unknown_newest ` +
 			`ON samples(created_at DESC, id DESC) ` +
 			`WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' ` +
 			`AND skip = '' AND suspicious_count >= 1`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_review_newest ` +
+			`ON samples(created_at DESC, id DESC) ` +
+			`WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' ` +
+			`AND skip = '' AND path LIKE 'review/%'`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_review_interesting ` +
+			`ON samples(corroborated DESC, max_crit DESC, suspicious_count DESC, ` +
+			`litmus_score DESC NULLS LAST, analyzed_at, id) ` +
+			`WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' ` +
+			`AND skip = '' AND path LIKE 'review/%'`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_new_interesting ` +
+			`ON samples(corroborated DESC, max_crit DESC, suspicious_count DESC, ` +
+			`litmus_score DESC NULLS LAST, analyzed_at, id) ` +
+			`WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' ` +
+			`AND skip = '' AND suspicious_count >= 1 AND path NOT LIKE 'review/%'`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_sighted_newest ` +
 			`ON samples(created_at DESC, id DESC) ` +
 			`WHERE label = 'sighted' AND cleave_result IS NOT NULL AND parent = '' ` +
@@ -317,14 +336,14 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// analyzed_at leads so the ORDER BY is an ordered scan that stops at
 		// LIMIT. No NULLS spelling needed: ASC already defaults to NULLS LAST,
 		// matching the selectors' `analyzed_at ASC NULLS LAST`.
-		`CREATE INDEX IF NOT EXISTS idx_samples_bad_stale ` +
+		`CREATE INDEX IF NOT EXISTS idx_samples_bad_miss_stale ` +
 			`ON samples(analyzed_at, id) ` +
 			`WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = '' ` +
-			`AND (max_crit < 5 OR suspicious_count < 2)`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_good_stale ` +
+			`AND skip = '' AND max_crit < 5 AND suspicious_count < 2`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_good_repair_stale ` +
 			`ON samples(analyzed_at, id) ` +
 			`WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = '' ` +
-			`AND (max_crit >= 5 OR suspicious_count >= 2 OR litmus_class >= 1)`,
+			`AND skip = '' AND (max_crit >= 5 OR suspicious_count >= 2)`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_new_stale ` +
 			`ON samples(analyzed_at, id) ` +
 			`WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' ` +
@@ -532,6 +551,28 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_sl_reference ON sample_locations(id) ` +
 			`INCLUDE (sha256) WHERE parent_sha256 <> '' AND rel NOT IN ` + containmentRelsSQL,
 
+		// Retired locations are kept outside the active ledger: serving and
+		// workflow queries stay small, while moves/prunes preserve path history.
+		// Deliberately no FK: deleting a sample must not erase its provenance.
+		`CREATE TABLE IF NOT EXISTS sample_location_history (
+			id             BIGSERIAL PRIMARY KEY,
+			sha256         TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+			path           TEXT NOT NULL CHECK (path <> ''),
+			parent_sha256  TEXT NOT NULL DEFAULT '',
+			rel            TEXT NOT NULL DEFAULT '',
+			filename       TEXT NOT NULL DEFAULT '',
+			source         TEXT NOT NULL DEFAULT '',
+			feed           TEXT NOT NULL DEFAULT '',
+			ecosystem      TEXT NOT NULL DEFAULT '',
+			mtime          TIMESTAMPTZ,
+			first_seen_at  TIMESTAMPTZ NOT NULL,
+			last_seen_at   TIMESTAMPTZ NOT NULL,
+			retired_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+			reason         TEXT NOT NULL CHECK (reason <> ''),
+			successor_path TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_slh_sha256_retired ON sample_location_history(sha256, retired_at DESC, id DESC)`,
+
 		// One-shot backfill from the existing denormalized columns. Guarded
 		// by a table-emptiness check so restarts are cheap no-ops; re-running
 		// the migration never re-scans the 3M-row samples table once done.
@@ -561,6 +602,12 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			GREATEST(
 				(SELECT COALESCE(max(id), 0) FROM sample_locations),
 				(SELECT last_value FROM sample_locations_id_seq)
+			),
+			true)`,
+		`SELECT setval('sample_location_history_id_seq',
+			GREATEST(
+				(SELECT COALESCE(max(id), 0) FROM sample_location_history),
+				(SELECT last_value FROM sample_location_history_id_seq)
 			),
 			true)`,
 		`SELECT setval('reports_id_seq',
@@ -773,11 +820,10 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// must stay in sync with pgFileTypeBackfillWhere. Built CONCURRENTLY by
 		// the migration runner, so it never blocks writes.
 
-		// Claim state moved to memory (see workerTracker in cmd/hopper/api.go).
-		// idx_samples_claimed exists only to serve OldestClaims, which is gone;
-		// the claimed_by / claimed_at columns are no longer written. Drop the
-		// index now to recover its bloat; the columns can be dropped in a
-		// follow-up once we're sure no rollback is needed.
+		// Analyzer claim state moved to memory (see workerTracker in
+		// cmd/hopper/api.go). Cyclotron reuses claimed_by / claimed_at for its
+		// sparse, cross-process triage leases, but those point updates use the
+		// sha256 index and do not need the old dashboard-oriented index.
 		`DROP INDEX IF EXISTS idx_samples_claimed`,
 
 		// Operator-initiated re-queue (Tier 0). Set by RequestRescan; cleared
@@ -1408,8 +1454,8 @@ const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
 	url, domain, package, version, purl_base,
 	COALESCE(top_traits, '') AS top_traits`
 
-// pgSampleColsLight excludes cleave_result and litmus_result to avoid loading
-// potentially large JSON blobs when only metadata is needed (e.g. claim queries).
+// pgSampleColsLight excludes all result blobs to avoid loading potentially
+// large JSON when only metadata is needed (e.g. claim queries).
 const pgSampleColsLight = `id, sha256, source, feed, ecosystem, filename, file_type,
 	size_bytes, label, label_source, litmus_score,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
@@ -2572,11 +2618,24 @@ func (db *DB) repairReferenceParentsPG(ctx context.Context, cursor int64) error 
 
 const pgLocationCols = `id, sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime, first_seen_at, last_seen_at`
 
+const pgRetiredLocationCols = pgLocationCols + `, retired_at, reason, successor_path`
+
 func scanPGLocation(row interface{ Scan(...any) error }) (*SampleLocation, error) {
 	var loc SampleLocation
 	if err := row.Scan(&loc.ID, &loc.SHA256, &loc.Path, &loc.ParentSHA256, &loc.Rel,
 		&loc.Filename, &loc.Source, &loc.Feed, &loc.Ecosystem,
 		&loc.Mtime, &loc.FirstSeenAt, &loc.LastSeenAt); err != nil {
+		return nil, err
+	}
+	return &loc, nil
+}
+
+func scanPGRetiredLocation(row interface{ Scan(...any) error }) (*RetiredSampleLocation, error) {
+	var loc RetiredSampleLocation
+	if err := row.Scan(&loc.ID, &loc.SHA256, &loc.Path, &loc.ParentSHA256, &loc.Rel,
+		&loc.Filename, &loc.Source, &loc.Feed, &loc.Ecosystem,
+		&loc.Mtime, &loc.FirstSeenAt, &loc.LastSeenAt,
+		&loc.RetiredAt, &loc.Reason, &loc.SuccessorPath); err != nil {
 		return nil, err
 	}
 	return &loc, nil
@@ -2657,6 +2716,96 @@ func (db *DB) locationsForSHAPG(ctx context.Context, sha256 string) ([]*SampleLo
 	return out, rows.Err()
 }
 
+func (db *DB) topLevelLocationsForSHAPG(ctx context.Context, sha256 string) ([]*SampleLocation, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT `+pgLocationCols+` FROM sample_locations
+		 WHERE sha256 = $1 AND parent_sha256 = ''
+		 ORDER BY last_seen_at DESC, id DESC`, sha256)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: top-level locations %s: %w", sha256, err)
+	}
+	defer rows.Close()
+	var out []*SampleLocation
+	for rows.Next() {
+		loc, err := scanPGLocation(rows)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: scan top-level location: %w", err)
+		}
+		out = append(out, loc)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) retiredLocationsForSHAPG(ctx context.Context, sha256 string) ([]*RetiredSampleLocation, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT `+pgRetiredLocationCols+` FROM sample_location_history
+		 WHERE sha256 = $1 ORDER BY retired_at DESC, id DESC`, sha256)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: retired locations %s: %w", sha256, err)
+	}
+	defer rows.Close()
+	var out []*RetiredSampleLocation
+	for rows.Next() {
+		loc, err := scanPGRetiredLocation(rows)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: scan retired location: %w", err)
+		}
+		out = append(out, loc)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) promotePrimaryLocationPG(ctx context.Context, sha256, oldPath, newPath string) (bool, error) {
+	tag, err := db.pool.Exec(ctx, `
+		UPDATE samples
+		   SET path = $3,
+		       skip = CASE WHEN skip = 'missing' THEN '' ELSE skip END,
+		       skipped_at = CASE WHEN skip = 'missing' THEN NULL ELSE skipped_at END,
+		       updated_at = now()
+		 WHERE sha256 = $1 AND path = $2
+		   AND EXISTS (SELECT 1 FROM sample_locations
+		                WHERE sha256 = $1 AND path = $3 AND parent_sha256 = '')`,
+		sha256, oldPath, newPath)
+	if err != nil {
+		return false, fmt.Errorf("hopper: promote primary location %s: %w", sha256, err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+func (db *DB) reactivatePrimaryLocationPG(ctx context.Context, sha256, path string) (bool, error) {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("hopper: reactivate primary location begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO sample_locations
+			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem,
+			 mtime, first_seen_at, last_seen_at)
+		SELECT h.sha256, h.path, '', h.rel, h.filename, h.source, h.feed, h.ecosystem,
+		       h.mtime, h.first_seen_at, now()
+		  FROM sample_location_history h
+		  JOIN samples s ON s.sha256 = h.sha256 AND s.path = h.path
+		 WHERE h.sha256 = $1 AND h.path = $2 AND h.parent_sha256 = ''
+		 ORDER BY h.retired_at DESC, h.id DESC LIMIT 1
+		ON CONFLICT (sha256, path) DO NOTHING`, sha256, path); err != nil {
+		return false, fmt.Errorf("hopper: restore retired primary location: %w", err)
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE samples
+		   SET skip = '', skipped_at = NULL, updated_at = now()
+		 WHERE sha256 = $1 AND path = $2 AND skip = 'missing'
+		   AND EXISTS (SELECT 1 FROM sample_locations
+		                WHERE sha256 = $1 AND path = $2 AND parent_sha256 = '')`, sha256, path)
+	if err != nil {
+		return false, fmt.Errorf("hopper: clear recovered primary location: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("hopper: reactivate primary location commit: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 func (db *DB) oldestIncomingLocationsPG(ctx context.Context, before time.Time, limit int) ([]*SampleLocation, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT `+pgLocationCols+` FROM sample_locations
@@ -2678,10 +2827,12 @@ func (db *DB) oldestIncomingLocationsPG(ctx context.Context, before time.Time, l
 	return out, rows.Err()
 }
 
-func (db *DB) relocateLocationPG(ctx context.Context, sha256, oldRel, newRel string) (bool, error) {
+func (db *DB) prepareLocationMovePG(
+	ctx context.Context, sha256, oldRel, newRel string, relabel *LocationRelabel,
+) (bool, error) {
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
-		return false, fmt.Errorf("hopper: relocate location begin: %w", err)
+		return false, fmt.Errorf("hopper: prepare location move begin: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
 
@@ -2690,41 +2841,98 @@ func (db *DB) relocateLocationPG(ctx context.Context, sha256, oldRel, newRel str
 		SELECT id FROM sample_locations
 		 WHERE sha256 = $1 AND path = $2 AND parent_sha256 = ''
 		 FOR UPDATE`, sha256, oldRel).Scan(&oldID)
+	oldExists := err == nil
 	if errors.Is(err, pgx.ErrNoRows) {
-		var exists bool
+		var destinationExists bool
 		if err := tx.QueryRow(ctx, `
-			SELECT EXISTS(SELECT 1 FROM sample_locations
-			 WHERE sha256 = $1 AND path = $2 AND parent_sha256 = '')`, sha256, newRel).Scan(&exists); err != nil {
-			return false, fmt.Errorf("hopper: relocate location lookup: %w", err)
+				SELECT EXISTS(SELECT 1 FROM sample_locations
+				 WHERE sha256 = $1 AND path = $2 AND parent_sha256 = '')`, sha256, newRel).Scan(&destinationExists); err != nil {
+			return false, fmt.Errorf("hopper: prepare location move lookup: %w", err)
 		}
-		return exists, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("hopper: relocate location lock: %w", err)
+		if !destinationExists {
+			return false, nil
+		}
+	} else if err != nil {
+		return false, fmt.Errorf("hopper: prepare location move lock: %w", err)
 	}
 
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO sample_locations
-			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem,
-			 mtime, first_seen_at, last_seen_at)
+	if oldExists {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO sample_locations
+				(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem,
+				 mtime, first_seen_at, last_seen_at)
 		SELECT sha256, $2, parent_sha256, rel, filename, source, feed, ecosystem,
 		       mtime, first_seen_at, now()
-		  FROM sample_locations WHERE id = $1
-		ON CONFLICT (sha256, path) DO NOTHING`, oldID, newRel); err != nil {
-		return false, fmt.Errorf("hopper: relocate location insert: %w", err)
+			  FROM sample_locations WHERE id = $1
+			ON CONFLICT (sha256, path) DO NOTHING`, oldID, newRel); err != nil {
+			return false, fmt.Errorf("hopper: prepare destination location: %w", err)
+		}
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM sample_locations WHERE id = $1`, oldID); err != nil {
-		return false, fmt.Errorf("hopper: relocate location delete: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `
+
+	if relabel != nil {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
+			SELECT sha256, label, $2, skip, '', 'triage', now()
+			  FROM samples WHERE sha256 = $1 AND label <> $2`, sha256, relabel.Label); err != nil {
+			return false, fmt.Errorf("hopper: prepare location move audit: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE samples
+			   SET label = $2, label_source = $3,
+			       path = CASE WHEN path = $4 THEN $5 ELSE path END,
+			       skip = '', skipped_at = NULL, updated_at = now()
+			 WHERE sha256 = $1`, sha256, relabel.Label, relabel.Source, oldRel, newRel); err != nil {
+			return false, fmt.Errorf("hopper: prepare sample relabel: %w", err)
+		}
+	} else if _, err := tx.Exec(ctx, `
 		UPDATE samples SET path = $3, updated_at = now()
 		 WHERE sha256 = $1 AND path = $2`, sha256, oldRel, newRel); err != nil {
-		return false, fmt.Errorf("hopper: relocate primary path: %w", err)
+		return false, fmt.Errorf("hopper: prepare primary path: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("hopper: relocate location commit: %w", err)
+		return false, fmt.Errorf("hopper: prepare location move commit: %w", err)
 	}
 	return true, nil
+}
+
+func (db *DB) finishLocationMovePG(ctx context.Context, sha256, oldRel, newRel string) (bool, error) {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("hopper: finish location move begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO sample_location_history
+			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem,
+			 mtime, first_seen_at, last_seen_at, retired_at, reason, successor_path)
+		SELECT old.sha256, old.path, old.parent_sha256, old.rel, old.filename,
+		       old.source, old.feed, old.ecosystem, old.mtime,
+		       old.first_seen_at, old.last_seen_at, now(), 'move', $3
+		  FROM sample_locations old
+		 WHERE old.sha256 = $1 AND old.path = $2 AND old.parent_sha256 = ''
+		   AND EXISTS (SELECT 1 FROM sample_locations new
+		                WHERE new.sha256 = $1 AND new.path = $3 AND new.parent_sha256 = '')`,
+		sha256, oldRel, newRel); err != nil {
+		return false, fmt.Errorf("hopper: finish location move archive source: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM sample_locations old
+		 WHERE old.sha256 = $1 AND old.path = $2 AND old.parent_sha256 = ''
+		   AND EXISTS (SELECT 1 FROM sample_locations new
+		                WHERE new.sha256 = $1 AND new.path = $3 AND new.parent_sha256 = '')`,
+		sha256, oldRel, newRel); err != nil {
+		return false, fmt.Errorf("hopper: finish location move delete source: %w", err)
+	}
+	var destinationExists bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM sample_locations
+		 WHERE sha256 = $1 AND path = $2 AND parent_sha256 = '')`, sha256, newRel).Scan(&destinationExists); err != nil {
+		return false, fmt.Errorf("hopper: finish location move lookup: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("hopper: finish location move commit: %w", err)
+	}
+	return destinationExists, nil
 }
 
 // pruneMissingLocationsPG mirrors pruneMissingLocationsSQLite for the
@@ -2778,6 +2986,15 @@ func (db *DB) pruneMissingLocationsPG(ctx context.Context, absRoot string, maxFr
 		return 0, fmt.Errorf("hopper: begin prune: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO sample_location_history
+			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem,
+			 mtime, first_seen_at, last_seen_at, retired_at, reason, successor_path)
+		SELECT sha256, path, parent_sha256, rel, filename, source, feed, ecosystem,
+		       mtime, first_seen_at, last_seen_at, now(), 'prune', ''
+		  FROM sample_locations WHERE id = ANY($1)`, ids); err != nil {
+		return 0, fmt.Errorf("hopper: archive %d pruned locations: %w", len(ids), err)
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM sample_locations WHERE id = ANY($1)`, ids); err != nil {
 		return 0, fmt.Errorf("hopper: delete %d locations: %w", len(ids), err)
 	}
@@ -2807,67 +3024,8 @@ func (db *DB) pruneMissingLocationsPG(ctx context.Context, absRoot string, maxFr
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("hopper: commit prune: %w", err)
 	}
+	slog.Info("sample locations retired by prune", "count", len(victims))
 	return len(victims), nil
-}
-
-func (db *DB) promoteLabelByPURLPG(ctx context.Context, purlBase, version, incLabel, incSource, feed string) (PURLPromotion, error) {
-	tx, err := db.pool.Begin(ctx)
-	if err != nil {
-		return PURLPromotion{}, fmt.Errorf("hopper: begin promote: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
-
-	rows, err := tx.Query(ctx,
-		`SELECT sha256, label, label_source, skip FROM samples WHERE purl_base = $1 AND version = $2 AND parent = ''`,
-		purlBase, version)
-	if err != nil {
-		return PURLPromotion{}, fmt.Errorf("hopper: scan purl candidates: %w", err)
-	}
-	var cands []purlCandidate
-	present := false
-	for rows.Next() {
-		var c purlCandidate
-		if err := rows.Scan(&c.sha, &c.label, &c.source, &c.skip); err != nil {
-			rows.Close()
-			return PURLPromotion{}, fmt.Errorf("hopper: scan purl candidate: %w", err)
-		}
-		if c.skip != "missing" {
-			present = true
-		}
-		cands = append(cands, c)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return PURLPromotion{}, err
-	}
-
-	promoted := 0
-	for _, c := range cands {
-		r := resolveIncomingLabel(c.label, c.source, c.skip, incLabel, incSource)
-		if !r.changed {
-			continue
-		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
-			VALUES ($1, $2, $3, $4, $5, 'purl-promote', now())`,
-			c.sha, c.label, r.label, c.skip, r.skip); err != nil {
-			return PURLPromotion{}, fmt.Errorf("hopper: promote audit: %w", err)
-		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE samples
-			SET label = $1, label_source = $2, skip = $3,
-				feed = CASE WHEN $4 <> '' THEN $4 ELSE feed END,
-				updated_at = now()
-			WHERE sha256 = $5`,
-			r.label, r.labelSource, r.skip, feed, c.sha); err != nil {
-			return PURLPromotion{}, fmt.Errorf("hopper: promote update: %w", err)
-		}
-		promoted++
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return PURLPromotion{}, fmt.Errorf("hopper: commit promote: %w", err)
-	}
-	return PURLPromotion{Present: present, Promoted: promoted}, nil
 }
 
 func (db *DB) updateCleaveResultPG(
@@ -2954,40 +3112,6 @@ func (db *DB) updateLLMResultPG(ctx context.Context, sha256 string, result []byt
 		WHERE sha256 = $1`, sha256, val)
 	if err != nil {
 		return fmt.Errorf("hopper: update llm result: %w", err)
-	}
-	return nil
-}
-
-func (db *DB) relocateSamplePG(ctx context.Context, sha256, oldRel, newRel, label, source string) error {
-	tx, err := db.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("hopper: relocate begin: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
-	// Audit the label transition before applying it (reading the pre-update
-	// row); a pure path move (label unchanged) writes no event.
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
-		SELECT sha256, label, $2, skip, '', 'triage', now()
-		FROM samples WHERE sha256 = $1 AND label <> $2`, sha256, label); err != nil {
-		return fmt.Errorf("hopper: relocate audit: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE samples
-		   SET label = $2, label_source = $3, path = $4,
-		       skip = '', skipped_at = now(), updated_at = now()
-		 WHERE sha256 = $1`, sha256, label, source, newRel); err != nil {
-		return fmt.Errorf("hopper: relocate sample: %w", err)
-	}
-	// Update only the top-level pool observation (parent_sha256 = ''); archive
-	// members keep their container-relative path.
-	if _, err := tx.Exec(ctx, `
-		UPDATE sample_locations SET path = $3
-		 WHERE sha256 = $1 AND path = $2 AND parent_sha256 = ''`, sha256, oldRel, newRel); err != nil {
-		return fmt.Errorf("hopper: relocate location: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("hopper: relocate commit: %w", err)
 	}
 	return nil
 }
@@ -3267,6 +3391,21 @@ func (db *DB) candidatesByLabelPG(ctx context.Context, label, pathPrefix string,
 	return scanPGSamples(rows)
 }
 
+func (db *DB) shaCitedUnknownsPG(ctx context.Context, pathPrefix, afterSHA string, limit int) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleCols+` FROM samples s
+		 WHERE s.label = 'unknown' AND s.parent = '' AND s.skip = ''
+		   AND starts_with(s.path, $1)
+		   AND s.sha256 > $2
+		   AND EXISTS (SELECT 1 FROM sightings g WHERE g.subject = s.sha256)
+		 ORDER BY s.sha256 LIMIT $3`,
+		pathPrefix, afterSHA, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: sha-cited unknowns: %w", err)
+	}
+	return scanPGSamples(rows)
+}
+
 func (db *DB) countByLabelPG(ctx context.Context) (map[string]int, error) {
 	rows, err := db.pool.Query(ctx, `SELECT label, count(*) FROM samples GROUP BY label`)
 	if err != nil {
@@ -3438,25 +3577,40 @@ func (db *DB) badReviewPG(ctx context.Context, _, limit int) ([]*Sample, error) 
 	return scanPGSamples(rows)
 }
 
-func triageFilterClausePG(f TriageFilter, startIdx int) (clause string, args []any) {
+func triageFilterClausePG(f TriageFilter, startIdx int, sampleAlias string) (clause string, args []any) {
+	col := func(name string) string { return sampleAlias + "." + name }
+	return triageFilterClausePGKey(f, startIdx, sampleAlias, col("sha256"))
+}
+
+func triageFilterClausePGKey(f TriageFilter, startIdx int, sampleAlias, reportKey string) (clause string, args []any) {
+	col := func(name string) string { return sampleAlias + "." + name }
 	if f.Ecosystem != "" {
 		args = append(args, f.Ecosystem)
-		clause += fmt.Sprintf(" AND ecosystem = $%d", startIdx+len(args)-1)
+		clause += fmt.Sprintf(" AND %s = $%d", col("ecosystem"), startIdx+len(args)-1)
 	}
 	if f.FileType != "" {
 		args = append(args, f.FileType)
-		clause += fmt.Sprintf(" AND file_type = $%d", startIdx+len(args)-1)
+		clause += fmt.Sprintf(" AND %s = $%d", col("file_type"), startIdx+len(args)-1)
 	}
 	if !f.MinAnalyzedAt.IsZero() {
 		args = append(args, f.MinAnalyzedAt.UTC())
-		clause += fmt.Sprintf(" AND analyzed_at >= $%d", startIdx+len(args)-1)
+		clause += fmt.Sprintf(" AND %s >= $%d", col("analyzed_at"), startIdx+len(args)-1)
 	}
 	if f.ExcludeReportType != "" {
 		args = append(args, f.ExcludeReportType)
 		clause += fmt.Sprintf(
 			` AND NOT EXISTS (SELECT 1 FROM reports r`+
-				` WHERE r.sha256 = samples.sha256 AND r.report_type = $%d`+
-				` AND r.created_at > samples.analyzed_at)`, startIdx+len(args)-1)
+				` WHERE r.sha256 = %s AND r.report_type = $%d`+
+				` AND r.created_at > %s)`, reportKey, startIdx+len(args)-1, col("analyzed_at"))
+	}
+	if f.AttemptReportType != "" && f.MaxAttempts > 0 {
+		args = append(args, f.AttemptReportType, f.MaxAttempts)
+		typeIdx := startIdx + len(args) - 2
+		maxIdx := startIdx + len(args) - 1
+		clause += fmt.Sprintf(
+			` AND (SELECT count(*) FROM reports r`+
+				` WHERE r.sha256 = %s AND r.report_type = $%d) < $%d`,
+			reportKey, typeIdx, maxIdx)
 	}
 	return clause, args
 }
@@ -3466,69 +3620,89 @@ func triageFilterClausePG(f TriageFilter, startIdx int) (clause string, args []a
 // leading, ASC, NULLS LAST) or the planner sorts the whole partition instead of
 // walking the index — see the migration list for what that costs.
 func triageOrderSQL(f TriageFilter) string {
-	if f.Order == TriageStale {
+	switch f.Order {
+	case TriageStale:
 		return "ORDER BY analyzed_at ASC NULLS LAST, id ASC"
+	case TriageInteresting:
+		return "ORDER BY corroborated DESC, max_crit DESC, suspicious_count DESC, " +
+			"litmus_score DESC NULLS LAST, analyzed_at ASC NULLS LAST, id ASC"
+	default:
+		return "ORDER BY created_at DESC, id DESC"
 	}
-	return "ORDER BY created_at DESC, id DESC"
 }
 
 func (db *DB) triageBadPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClausePG(f, 1)
+	extra, args := triageFilterClausePG(f, 1, "samples")
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM samples
+		`SELECT `+pgSampleColsLight+` FROM samples
 		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''
-		   AND (max_crit < 5 OR suspicious_count < 2)`+extra+`
+		   AND max_crit < 5 AND suspicious_count < 2`+extra+`
 		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage bad: %w", err)
 	}
-	return scanPGSamples(rows)
+	return scanPGSamplesLight(rows)
 }
 
 func (db *DB) triageGoodPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClausePG(f, 1)
+	extra, args := triageFilterClausePG(f, 1, "samples")
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM samples
+		`SELECT `+pgSampleColsLight+` FROM samples
 		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''
-		   AND (max_crit >= 5 OR suspicious_count >= 2 OR litmus_class >= 1)`+extra+`
+		   AND (max_crit >= 5 OR suspicious_count >= 2)`+extra+`
 		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage good: %w", err)
 	}
-	return scanPGSamples(rows)
+	return scanPGSamplesLight(rows)
 }
 
 func (db *DB) triageNewPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClausePG(f, 1)
+	extra, args := triageFilterClausePG(f, 1, "samples")
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM samples
+		`SELECT `+pgSampleColsLight+` FROM samples
 		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''
-		   AND suspicious_count >= 1`+extra+`
+		   AND suspicious_count >= 1 AND path NOT LIKE 'review/%'`+extra+`
 		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage new: %w", err)
 	}
-	return scanPGSamples(rows)
+	return scanPGSamplesLight(rows)
+}
+
+func (db *DB) triageReviewPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	extra, args := triageFilterClausePG(f, 1, "samples")
+	args = append(args, limit)
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleColsLight+` FROM samples
+		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''
+		   AND path LIKE 'review/%'`+extra+`
+		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage review: %w", err)
+	}
+	return scanPGSamplesLight(rows)
 }
 
 func (db *DB) triageSightedPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClausePG(f, 1)
+	extra, args := triageFilterClausePG(f, 1, "samples")
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM samples
+		`SELECT `+pgSampleColsLight+` FROM samples
 		 WHERE label = 'sighted' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''`+extra+`
 		 ORDER BY created_at DESC, id DESC LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage sighted: %w", err)
 	}
-	return scanPGSamples(rows)
+	return scanPGSamplesLight(rows)
 }
 
 // triageSecondOpinionPG: see TriageSecondOpinion. The sightings probes match a
@@ -3539,14 +3713,14 @@ func (db *DB) triageSecondOpinionPG(ctx context.Context, limit int, trusted []st
 	if trusted == nil {
 		trusted = []string{}
 	}
-	extra, fargs := triageFilterClausePG(f, 3)
+	extra, fargs := triageFilterClausePG(f, 3, "samples")
 	args := append([]any{analyzedBefore, trusted}, fargs...)
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM samples
+		`SELECT `+pgSampleColsLight+` FROM samples
 		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = ''
 		   AND corroborated
-		   AND NOT (max_crit >= 5 OR suspicious_count >= 2 OR litmus_class >= 1)
+		   AND NOT (max_crit >= 5 OR suspicious_count >= 2)
 		   AND analyzed_at < $1
 		   AND (EXISTS (SELECT 1 FROM sightings s
 		                WHERE (s.subject = samples.sha256
@@ -3568,7 +3742,7 @@ func (db *DB) triageSecondOpinionPG(ctx context.Context, limit int, trusted []st
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage second opinion: %w", err)
 	}
-	return scanPGSamples(rows)
+	return scanPGSamplesLight(rows)
 }
 
 // Predicate fragments for the recursive skip-scan that enumerates distinct
@@ -3601,7 +3775,8 @@ const (
 // The empty file_type is its own partition — rows there are rare (analyzed
 // rows carry a type) and excluding them would hide real pinners.
 func (db *DB) triageHighestPG(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClausePG(f, 3)
+	extra, fargs := triageFilterClausePGKey(f, 3, "s0",
+		"CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END")
 	args := append([]any{createdBefore, missingBefore}, fargs...)
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
@@ -3615,7 +3790,7 @@ func (db *DB) triageHighestPG(ctx context.Context, limit int, createdBefore, mis
 		           ORDER BY s.file_type LIMIT 1)
 		   FROM fts WHERE fts.file_type IS NOT NULL
 		 )
-		 SELECT `+pgSampleCols+` FROM (
+		 SELECT `+pgSampleColsLight+` FROM (
 		   SELECT DISTINCT ON (root) root, best, rank FROM (
 		     SELECT k.root, k.best, k.rank
 		     FROM (SELECT file_type FROM fts WHERE file_type IS NOT NULL) f
@@ -3644,7 +3819,7 @@ func (db *DB) triageHighestPG(ctx context.Context, limit int, createdBefore, mis
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage highest: %w", err)
 	}
-	return scanPGSamples(rows)
+	return scanPGSamplesLight(rows)
 }
 
 // triageLowestPG: see TriageLowest. Diverges from triageHighestPG on the drain
@@ -3654,10 +3829,10 @@ func (db *DB) triageHighestPG(ctx context.Context, limit int, createdBefore, mis
 // and its own report row. Keying this drain on the parent would let one ruling
 // speak for files it never examined.
 func (db *DB) triageLowestPG(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClausePG(f, 3)
+	extra, fargs := triageFilterClausePG(f, 3, "s0")
 	args := append([]any{createdBefore, missingBefore}, fargs...)
 	args = append(args, limit)
-	//nolint:unqueryvet // k.*/s0.* feed the LATERAL join and window function; the outer select names its columns via pgSampleCols.
+	//nolint:unqueryvet // k.*/s0.* feed the LATERAL join and window function; the outer select names its columns via pgSampleColsLight.
 	rows, err := db.pool.Query(ctx,
 		`WITH RECURSIVE fts AS (
 		   (SELECT file_type FROM samples
@@ -3669,7 +3844,7 @@ func (db *DB) triageLowestPG(ctx context.Context, limit int, createdBefore, miss
 		           ORDER BY s.file_type LIMIT 1)
 		   FROM fts WHERE fts.file_type IS NOT NULL
 		 )
-		 SELECT `+pgSampleCols+` FROM (
+		 SELECT `+pgSampleColsLight+` FROM (
 		   SELECT k.*
 		   FROM (SELECT file_type FROM fts WHERE file_type IS NOT NULL) f
 		   CROSS JOIN LATERAL (
@@ -3696,7 +3871,7 @@ func (db *DB) triageLowestPG(ctx context.Context, limit int, createdBefore, miss
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage lowest: %w", err)
 	}
-	return scanPGSamples(rows)
+	return scanPGSamplesLight(rows)
 }
 
 // triageStrandedPG: see TriageStranded. The inner scan walks good-labeled
@@ -3710,7 +3885,7 @@ func (db *DB) triageLowestPG(ctx context.Context, limit int, createdBefore, miss
 // from an individual review (the lowest queue's acquittals are correct state,
 // not stranded inheritance).
 func (db *DB) triageStrandedPG(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClausePG(f, 3)
+	extra, fargs := triageFilterClausePG(f, 3, "m")
 	args := append([]any{createdBefore, missingBefore}, fargs...)
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
@@ -3745,11 +3920,11 @@ func (db *DB) triageStrandedPG(ctx context.Context, limit int, createdBefore, mi
 // triageAcquitPG: see TriageAcquit. jsonb operators express the provenance
 // tests directly: a sidecar object exists and carries no 'feed' key.
 func (db *DB) triageAcquitPG(ctx context.Context, limit int, createdBefore time.Time, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClausePG(f, 2)
+	extra, fargs := triageFilterClausePG(f, 2, "samples")
 	args := append([]any{createdBefore}, fargs...)
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM samples
+		`SELECT `+pgSampleColsLight+` FROM samples
 		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = ''
 		   AND skip != 'conflict' AND label_source != 'conflict'
 		   AND max_crit >= 5 AND suspicious_count >= 2
@@ -3766,14 +3941,14 @@ func (db *DB) triageAcquitPG(ctx context.Context, limit int, createdBefore time.
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage acquit: %w", err)
 	}
-	return scanPGSamples(rows)
+	return scanPGSamplesLight(rows)
 }
 
 // triageFalloutPG: see TriageFallout. litmus_result IS NOT NULL is implied by
 // litmus_class = 2 (the trigger derives the class from the result) but stated
 // so the predicate reads against the feed query it mirrors.
 func (db *DB) triageFalloutPG(ctx context.Context, limit int, createdAfter time.Time, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClausePG(f, 2)
+	extra, fargs := triageFilterClausePG(f, 2, "samples")
 	args := append([]any{createdAfter}, fargs...)
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
@@ -4131,6 +4306,31 @@ func (db *DB) insertReportPG(ctx context.Context, r *Report) error {
 		r.SHA256, r.Type, r.Content, r.Provider, r.DurationMS)
 	if err != nil {
 		return fmt.Errorf("hopper: insert report: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) tryClaimSamplePG(ctx context.Context, sha256, owner string, staleBefore time.Time) (bool, error) {
+	var claimed bool
+	err := db.pool.QueryRow(ctx, `
+		UPDATE samples SET claimed_by = $2, claimed_at = now()
+		WHERE sha256 = $1
+		  AND (claimed_by = '' OR claimed_at IS NULL OR claimed_at < $3)
+		RETURNING true`, sha256, owner, staleBefore.UTC()).Scan(&claimed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("hopper: claim sample: %w", err)
+	}
+	return claimed, nil
+}
+
+func (db *DB) releaseSampleClaimPG(ctx context.Context, sha256, owner string) error {
+	if _, err := db.pool.Exec(ctx, `
+		UPDATE samples SET claimed_by = '', claimed_at = NULL
+		WHERE sha256 = $1 AND claimed_by = $2`, sha256, owner); err != nil {
+		return fmt.Errorf("hopper: release sample claim: %w", err)
 	}
 	return nil
 }
@@ -5176,6 +5376,45 @@ func (db *DB) stageLocationsPG(ctx context.Context, keys []SampleLocationKey) er
 	return nil
 }
 
+func (db *DB) observeStagedLocationsPG(ctx context.Context) (int64, error) {
+	tag, err := db.pool.Exec(ctx, `
+		INSERT INTO sample_locations
+			(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime,
+			 first_seen_at, last_seen_at)
+		SELECT w.sha256, w.path, '', s.filename, s.source, s.feed, s.ecosystem, s.mtime,
+		       now(), now()
+		FROM walk_staging w
+		JOIN samples s ON s.sha256 = w.sha256
+		WHERE s.parent = ''
+		ON CONFLICT (sha256, path) DO NOTHING`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+func (db *DB) eligibleStandaloneRootsPG(ctx context.Context) (map[string]int64, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT split_part(ltrim(path, '/'), '/', 1) AS root, count(*)
+		FROM samples
+		WHERE parent = '' AND skip IN ('', 'conflict')
+		GROUP BY root`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]int64)
+	for rows.Next() {
+		var root string
+		var n int64
+		if err := rows.Scan(&root, &n); err != nil {
+			return nil, err
+		}
+		out[root] = n
+	}
+	return out, rows.Err()
+}
+
 func (db *DB) relabelFromPoolsPG(ctx context.Context) (int64, error) {
 	// One statement: a writable CTE updates the changed rows and the final
 	// INSERT audits them. PG executes every data-modifying CTE exactly once, so
@@ -5568,7 +5807,7 @@ func (db *DB) deleteAllPG(ctx context.Context) error {
 	// RESTART IDENTITY resets the id sequences so a post-reset ingest
 	// starts at 1 instead of continuing from pre-reset max.
 	_, err := db.pool.Exec(ctx,
-		`TRUNCATE samples, sample_locations, reports RESTART IDENTITY CASCADE`)
+		`TRUNCATE samples, sample_locations, sample_location_history, reports RESTART IDENTITY CASCADE`)
 	if err != nil {
 		return fmt.Errorf("hopper: delete all: %w", err)
 	}

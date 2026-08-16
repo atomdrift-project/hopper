@@ -369,7 +369,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		`CREATE INDEX IF NOT EXISTS idx_samples_pending_litmus_group ` +
 			`ON samples(source, feed, ecosystem, updated_at) ` +
 			`WHERE parent = '' AND skip = '' AND cleave_result IS NOT NULL AND litmus_result IS NULL`,
-		// Claim state moved to memory; no longer reading these columns.
+		// Analyzer claims moved to memory. Cyclotron's sparse triage leases use
+		// the columns but not the old dashboard-oriented index.
 		`DROP INDEX IF EXISTS idx_samples_claimed`,
 		`UPDATE samples SET skip = 'skip-benign-archive-item' WHERE skip = 'weak-findings'`,
 	} {
@@ -400,6 +401,24 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		`CREATE INDEX IF NOT EXISTS idx_sl_parent ON sample_locations(parent_sha256) WHERE parent_sha256 <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_sl_incoming_mtime ON sample_locations(mtime, sha256, path) ` +
 			`WHERE parent_sha256 = '' AND path GLOB 'incoming/*' AND mtime IS NOT NULL`,
+		`CREATE TABLE IF NOT EXISTS sample_location_history (
+			id             INTEGER PRIMARY KEY AUTOINCREMENT,
+			sha256         TEXT NOT NULL,
+			path           TEXT NOT NULL CHECK (path <> ''),
+			parent_sha256  TEXT NOT NULL DEFAULT '',
+			rel            TEXT NOT NULL DEFAULT '',
+			filename       TEXT NOT NULL DEFAULT '',
+			source         TEXT NOT NULL DEFAULT '',
+			feed           TEXT NOT NULL DEFAULT '',
+			ecosystem      TEXT NOT NULL DEFAULT '',
+			mtime          DATETIME,
+			first_seen_at  DATETIME NOT NULL,
+			last_seen_at   DATETIME NOT NULL,
+			retired_at     DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+			reason         TEXT NOT NULL CHECK (reason <> ''),
+			successor_path TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_slh_sha256_retired ON sample_location_history(sha256, retired_at DESC, id DESC)`,
 	} {
 		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite sample_locations: %w", err)
@@ -541,8 +560,8 @@ const liteSampleCols = `id, sha256, source, feed, ecosystem,
 	url, domain, package, version, purl_base,
 	COALESCE(top_traits, '') AS top_traits`
 
-// liteSampleColsLight excludes cleave_result and litmus_result to avoid
-// loading large JSON blobs when only metadata is needed.
+// liteSampleColsLight excludes all result blobs to avoid loading large JSON
+// when only metadata is needed.
 const liteSampleColsLight = `id, sha256, source, feed, ecosystem,
 	filename, file_type, size_bytes, label, label_source,
 	litmus_score,
@@ -1556,11 +1575,24 @@ func (db *DB) reconcileLocationParentEdgesSQLite(ctx context.Context, cursor int
 
 const liteLocationCols = `id, sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime, first_seen_at, last_seen_at`
 
+const liteRetiredLocationCols = liteLocationCols + `, retired_at, reason, successor_path`
+
 func scanLiteLocation(row interface{ Scan(...any) error }) (*SampleLocation, error) {
 	var loc SampleLocation
 	if err := row.Scan(&loc.ID, &loc.SHA256, &loc.Path, &loc.ParentSHA256, &loc.Rel,
 		&loc.Filename, &loc.Source, &loc.Feed, &loc.Ecosystem,
 		&loc.Mtime, &loc.FirstSeenAt, &loc.LastSeenAt); err != nil {
+		return nil, err
+	}
+	return &loc, nil
+}
+
+func scanLiteRetiredLocation(row interface{ Scan(...any) error }) (*RetiredSampleLocation, error) {
+	var loc RetiredSampleLocation
+	if err := row.Scan(&loc.ID, &loc.SHA256, &loc.Path, &loc.ParentSHA256, &loc.Rel,
+		&loc.Filename, &loc.Source, &loc.Feed, &loc.Ecosystem,
+		&loc.Mtime, &loc.FirstSeenAt, &loc.LastSeenAt,
+		&loc.RetiredAt, &loc.Reason, &loc.SuccessorPath); err != nil {
 		return nil, err
 	}
 	return &loc, nil
@@ -1648,6 +1680,102 @@ func (db *DB) locationsForSHASQLite(ctx context.Context, sha256 string) ([]*Samp
 	return out, rows.Err()
 }
 
+func (db *DB) topLevelLocationsForSHASQLite(ctx context.Context, sha256 string) ([]*SampleLocation, error) {
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT `+liteLocationCols+` FROM sample_locations
+		 WHERE sha256 = ? AND parent_sha256 = ''
+		 ORDER BY last_seen_at DESC, id DESC`, sha256)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: top-level locations %s: %w", sha256, err)
+	}
+	defer rows.Close() //nolint:errcheck // read-only query
+	var out []*SampleLocation
+	for rows.Next() {
+		loc, err := scanLiteLocation(rows)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: scan top-level location: %w", err)
+		}
+		out = append(out, loc)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) retiredLocationsForSHASQLite(ctx context.Context, sha256 string) ([]*RetiredSampleLocation, error) {
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT `+liteRetiredLocationCols+` FROM sample_location_history
+		 WHERE sha256 = ? ORDER BY retired_at DESC, id DESC`, sha256)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: retired locations %s: %w", sha256, err)
+	}
+	defer rows.Close() //nolint:errcheck // read-only query
+	var out []*RetiredSampleLocation
+	for rows.Next() {
+		loc, err := scanLiteRetiredLocation(rows)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: scan retired location: %w", err)
+		}
+		out = append(out, loc)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) promotePrimaryLocationSQLite(ctx context.Context, sha256, oldPath, newPath string) (bool, error) {
+	res, err := db.lite.ExecContext(ctx, `
+		UPDATE samples
+		   SET path = ?,
+		       skip = CASE WHEN skip = 'missing' THEN '' ELSE skip END,
+		       skipped_at = CASE WHEN skip = 'missing' THEN NULL ELSE skipped_at END,
+		       updated_at = ?
+		 WHERE sha256 = ? AND path = ?
+		   AND EXISTS (SELECT 1 FROM sample_locations
+		                WHERE sha256 = ? AND path = ? AND parent_sha256 = '')`,
+		newPath, now(), sha256, oldPath, sha256, newPath)
+	if err != nil {
+		return false, fmt.Errorf("hopper: promote primary location %s: %w", sha256, err)
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+func (db *DB) reactivatePrimaryLocationSQLite(ctx context.Context, sha256, path string) (bool, error) {
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("hopper: reactivate primary location begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO sample_locations
+			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem,
+			 mtime, first_seen_at, last_seen_at)
+		SELECT h.sha256, h.path, '', h.rel, h.filename, h.source, h.feed, h.ecosystem,
+		       h.mtime, h.first_seen_at, ?
+		  FROM sample_location_history h
+		  JOIN samples s ON s.sha256 = h.sha256 AND s.path = h.path
+		 WHERE h.sha256 = ? AND h.path = ? AND h.parent_sha256 = ''
+		 ORDER BY h.retired_at DESC, h.id DESC LIMIT 1
+		ON CONFLICT (sha256, path) DO NOTHING`, now(), sha256, path); err != nil {
+		return false, fmt.Errorf("hopper: restore retired primary location: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE samples
+		   SET skip = '', skipped_at = NULL, updated_at = ?
+		 WHERE sha256 = ? AND path = ? AND skip = 'missing'
+		   AND EXISTS (SELECT 1 FROM sample_locations
+		                WHERE sha256 = ? AND path = ? AND parent_sha256 = '')`,
+		now(), sha256, path, sha256, path)
+	if err != nil {
+		return false, fmt.Errorf("hopper: clear recovered primary location: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("hopper: recovered primary location rows: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("hopper: reactivate primary location commit: %w", err)
+	}
+	return n > 0, nil
+}
+
 func (db *DB) oldestIncomingLocationsSQLite(ctx context.Context, before time.Time, limit int) ([]*SampleLocation, error) {
 	rows, err := db.lite.QueryContext(ctx, `
 		SELECT `+liteLocationCols+` FROM sample_locations
@@ -1669,10 +1797,12 @@ func (db *DB) oldestIncomingLocationsSQLite(ctx context.Context, before time.Tim
 	return out, rows.Err()
 }
 
-func (db *DB) relocateLocationSQLite(ctx context.Context, sha256, oldRel, newRel string) (bool, error) {
+func (db *DB) prepareLocationMoveSQLite(
+	ctx context.Context, sha256, oldRel, newRel string, relabel *LocationRelabel,
+) (bool, error) {
 	tx, err := db.lite.BeginTx(ctx, nil)
 	if err != nil {
-		return false, fmt.Errorf("hopper: relocate location begin: %w", err)
+		return false, fmt.Errorf("hopper: prepare location move begin: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // commit or rollback
 
@@ -1680,42 +1810,98 @@ func (db *DB) relocateLocationSQLite(ctx context.Context, sha256, oldRel, newRel
 	err = tx.QueryRowContext(ctx, `
 		SELECT id FROM sample_locations
 		 WHERE sha256 = ? AND path = ? AND parent_sha256 = ''`, sha256, oldRel).Scan(&oldID)
+	oldExists := err == nil
 	if errors.Is(err, sql.ErrNoRows) {
-		var exists bool
+		var destinationExists bool
 		if err := tx.QueryRowContext(ctx, `
 			SELECT EXISTS(SELECT 1 FROM sample_locations
-			 WHERE sha256 = ? AND path = ? AND parent_sha256 = '')`, sha256, newRel).Scan(&exists); err != nil {
-			return false, fmt.Errorf("hopper: relocate location lookup: %w", err)
+			 WHERE sha256 = ? AND path = ? AND parent_sha256 = '')`, sha256, newRel).Scan(&destinationExists); err != nil {
+			return false, fmt.Errorf("hopper: prepare location move lookup: %w", err)
 		}
-		return exists, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("hopper: relocate location lookup: %w", err)
+		if !destinationExists {
+			return false, nil
+		}
+	} else if err != nil {
+		return false, fmt.Errorf("hopper: prepare location move lookup: %w", err)
 	}
 
 	ts := now()
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO sample_locations
-			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem,
-			 mtime, first_seen_at, last_seen_at)
-		SELECT sha256, ?, parent_sha256, rel, filename, source, feed, ecosystem,
-		       mtime, first_seen_at, ?
-		  FROM sample_locations WHERE id = ?
-		ON CONFLICT (sha256, path) DO NOTHING`, newRel, ts, oldID); err != nil {
-		return false, fmt.Errorf("hopper: relocate location insert: %w", err)
+	if oldExists {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO sample_locations
+				(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem,
+				 mtime, first_seen_at, last_seen_at)
+			SELECT sha256, ?, parent_sha256, rel, filename, source, feed, ecosystem,
+			       mtime, first_seen_at, ?
+			  FROM sample_locations WHERE id = ?
+			ON CONFLICT (sha256, path) DO NOTHING`, newRel, ts, oldID); err != nil {
+			return false, fmt.Errorf("hopper: prepare destination location: %w", err)
+		}
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM sample_locations WHERE id = ?`, oldID); err != nil {
-		return false, fmt.Errorf("hopper: relocate location delete: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
+	if relabel != nil {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
+			SELECT sha256, label, ?, skip, '', 'triage', ?
+			  FROM samples WHERE sha256 = ? AND label <> ?`, relabel.Label, ts, sha256, relabel.Label); err != nil {
+			return false, fmt.Errorf("hopper: prepare location move audit: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE samples
+			   SET label = ?, label_source = ?,
+			       path = CASE WHEN path = ? THEN ? ELSE path END,
+			       skip = '', skipped_at = NULL, updated_at = ?
+			 WHERE sha256 = ?`, relabel.Label, relabel.Source, oldRel, newRel, ts, sha256); err != nil {
+			return false, fmt.Errorf("hopper: prepare sample relabel: %w", err)
+		}
+	} else if _, err := tx.ExecContext(ctx, `
 		UPDATE samples SET path = ?, updated_at = ?
 		 WHERE sha256 = ? AND path = ?`, newRel, ts, sha256, oldRel); err != nil {
-		return false, fmt.Errorf("hopper: relocate primary path: %w", err)
+		return false, fmt.Errorf("hopper: prepare primary path: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("hopper: relocate location commit: %w", err)
+		return false, fmt.Errorf("hopper: prepare location move commit: %w", err)
 	}
 	return true, nil
+}
+
+func (db *DB) finishLocationMoveSQLite(ctx context.Context, sha256, oldRel, newRel string) (bool, error) {
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("hopper: finish location move begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO sample_location_history
+			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem,
+			 mtime, first_seen_at, last_seen_at, retired_at, reason, successor_path)
+		SELECT old.sha256, old.path, old.parent_sha256, old.rel, old.filename,
+		       old.source, old.feed, old.ecosystem, old.mtime,
+		       old.first_seen_at, old.last_seen_at, ?, 'move', ?
+		  FROM sample_locations old
+		 WHERE old.sha256 = ? AND old.path = ? AND old.parent_sha256 = ''
+		   AND EXISTS (SELECT 1 FROM sample_locations new
+		                WHERE new.sha256 = ? AND new.path = ? AND new.parent_sha256 = '')`,
+		now(), newRel, sha256, oldRel, sha256, newRel); err != nil {
+		return false, fmt.Errorf("hopper: finish location move archive source: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM sample_locations
+		 WHERE sha256 = ? AND path = ? AND parent_sha256 = ''
+		   AND EXISTS (SELECT 1 FROM sample_locations
+		                WHERE sha256 = ? AND path = ? AND parent_sha256 = '')`,
+		sha256, oldRel, sha256, newRel); err != nil {
+		return false, fmt.Errorf("hopper: finish location move delete source: %w", err)
+	}
+	var destinationExists bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM sample_locations
+		 WHERE sha256 = ? AND path = ? AND parent_sha256 = '')`, sha256, newRel).Scan(&destinationExists); err != nil {
+		return false, fmt.Errorf("hopper: finish location move lookup: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("hopper: finish location move commit: %w", err)
+	}
+	return destinationExists, nil
 }
 
 // pruneVictim names a sample_locations row that should be deleted.
@@ -1780,6 +1966,15 @@ func (db *DB) pruneMissingLocationsSQLite(ctx context.Context, absRoot string, m
 	}
 	defer tx.Rollback() //nolint:errcheck // commit or rollback
 	for _, v := range victims {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO sample_location_history
+				(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem,
+				 mtime, first_seen_at, last_seen_at, retired_at, reason, successor_path)
+			SELECT sha256, path, parent_sha256, rel, filename, source, feed, ecosystem,
+			       mtime, first_seen_at, last_seen_at, ?, 'prune', ''
+			  FROM sample_locations WHERE id = ?`, now(), v.id); err != nil {
+			return 0, fmt.Errorf("hopper: archive pruned location %d: %w", v.id, err)
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM sample_locations WHERE id = ?`, v.id); err != nil {
 			return 0, fmt.Errorf("hopper: delete location %d: %w", v.id, err)
 		}
@@ -1790,6 +1985,7 @@ func (db *DB) pruneMissingLocationsSQLite(ctx context.Context, absRoot string, m
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("hopper: commit prune: %w", err)
 	}
+	slog.Info("sample locations retired by prune", "count", len(victims))
 	return len(victims), nil
 }
 
@@ -1836,67 +2032,6 @@ func markPrunedSamplesMissingSQLite(ctx context.Context, tx *sql.Tx, shas []stri
 		slog.Info("prune marked samples missing (no surviving location)", "count", marked)
 	}
 	return nil
-}
-
-func (db *DB) promoteLabelByPURLSQLite(ctx context.Context, purlBase, version, incLabel, incSource, feed string) (PURLPromotion, error) {
-	tx, err := db.lite.BeginTx(ctx, nil)
-	if err != nil {
-		return PURLPromotion{}, fmt.Errorf("hopper: begin promote: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck // commit or rollback
-
-	rows, err := tx.QueryContext(ctx,
-		`SELECT sha256, label, label_source, skip FROM samples WHERE purl_base = ? AND version = ? AND parent = ''`,
-		purlBase, version)
-	if err != nil {
-		return PURLPromotion{}, fmt.Errorf("hopper: scan purl candidates: %w", err)
-	}
-	var cands []purlCandidate
-	present := false
-	for rows.Next() {
-		var c purlCandidate
-		if err := rows.Scan(&c.sha, &c.label, &c.source, &c.skip); err != nil {
-			rows.Close() //nolint:errcheck,sqlclosecheck,gosec // best-effort cleanup before error return
-			return PURLPromotion{}, fmt.Errorf("hopper: scan purl candidate: %w", err)
-		}
-		if c.skip != "missing" {
-			present = true
-		}
-		cands = append(cands, c)
-	}
-	rows.Close() //nolint:errcheck,gosec // best-effort cleanup
-	if err := rows.Err(); err != nil {
-		return PURLPromotion{}, err
-	}
-
-	ts := now()
-	promoted := 0
-	for _, c := range cands {
-		r := resolveIncomingLabel(c.label, c.source, c.skip, incLabel, incSource)
-		if !r.changed {
-			continue
-		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
-			VALUES (?, ?, ?, ?, ?, 'purl-promote', ?)`,
-			c.sha, c.label, r.label, c.skip, r.skip, ts); err != nil {
-			return PURLPromotion{}, fmt.Errorf("hopper: promote audit: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE samples
-			SET label = ?, label_source = ?, skip = ?,
-				feed = CASE WHEN ? != '' THEN ? ELSE feed END,
-				updated_at = ?
-			WHERE sha256 = ?`,
-			r.label, r.labelSource, r.skip, feed, feed, ts, c.sha); err != nil {
-			return PURLPromotion{}, fmt.Errorf("hopper: promote update: %w", err)
-		}
-		promoted++
-	}
-	if err := tx.Commit(); err != nil {
-		return PURLPromotion{}, fmt.Errorf("hopper: commit promote: %w", err)
-	}
-	return PURLPromotion{Present: present, Promoted: promoted}, nil
 }
 
 func (db *DB) updateCleaveResultSQLite(
@@ -2361,38 +2496,6 @@ func (db *DB) cascadeBackfillSQLite(ctx context.Context, dryRun bool) (CascadeBa
 	return st, nil
 }
 
-func (db *DB) relocateSampleSQLite(ctx context.Context, sha256, oldRel, newRel, label, source string) error {
-	tx, err := db.lite.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("hopper: relocate begin: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck // commit or rollback
-	ts := now()
-	// Audit the label transition before applying it (see relocateSamplePG).
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
-		SELECT sha256, label, ?, skip, '', 'triage', ?
-		FROM samples WHERE sha256 = ? AND label <> ?`, label, ts, sha256, label); err != nil {
-		return fmt.Errorf("hopper: relocate audit: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE samples
-		   SET label = ?, label_source = ?, path = ?,
-		       skip = '', skipped_at = ?, updated_at = ?
-		 WHERE sha256 = ?`, label, source, newRel, ts, ts, sha256); err != nil {
-		return fmt.Errorf("hopper: relocate sample: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE sample_locations SET path = ?
-		 WHERE sha256 = ? AND path = ? AND parent_sha256 = ''`, newRel, sha256, oldRel); err != nil {
-		return fmt.Errorf("hopper: relocate location: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("hopper: relocate commit: %w", err)
-	}
-	return nil
-}
-
 func (db *DB) unanalyzedSQLite(ctx context.Context, limit int) ([]*Sample, error) {
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleCols+` FROM samples WHERE cleave_result IS NULL ORDER BY id LIMIT ?`, limit)
@@ -2428,6 +2531,21 @@ func (db *DB) candidatesByLabelSQLite(
 		label, pathPrefix, threshold, afterSHA, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: candidates by label: %w", err)
+	}
+	return scanLiteSamples(rows)
+}
+
+func (db *DB) shaCitedUnknownsSQLite(ctx context.Context, pathPrefix, afterSHA string, limit int) ([]*Sample, error) {
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleCols+` FROM samples s
+		 WHERE s.label = 'unknown' AND s.parent = '' AND s.skip = ''
+		   AND s.path GLOB ? || '*'
+		   AND s.sha256 > ?
+		   AND EXISTS (SELECT 1 FROM sightings g WHERE g.subject = s.sha256)
+		 ORDER BY s.sha256 LIMIT ?`,
+		pathPrefix, afterSHA, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: sha-cited unknowns: %w", err)
 	}
 	return scanLiteSamples(rows)
 }
@@ -2588,60 +2706,69 @@ func (db *DB) badReviewSQLite(ctx context.Context, _, limit int) ([]*Sample, err
 	return scanLiteSamples(rows)
 }
 
-func triageFilterClauseSQLite(f TriageFilter) (clause string, args []any) {
+func triageFilterClauseSQLite(f TriageFilter, sampleAlias string) (clause string, args []any) {
+	col := func(name string) string { return sampleAlias + "." + name }
+	return triageFilterClauseSQLiteKey(f, sampleAlias, col("sha256"))
+}
+
+func triageFilterClauseSQLiteKey(f TriageFilter, sampleAlias, reportKey string) (clause string, args []any) {
+	col := func(name string) string { return sampleAlias + "." + name }
 	if f.Ecosystem != "" {
-		clause += " AND ecosystem = ?"
+		clause += " AND " + col("ecosystem") + " = ?"
 		args = append(args, f.Ecosystem)
 	}
 	if f.FileType != "" {
-		clause += " AND file_type = ?"
+		clause += " AND " + col("file_type") + " = ?"
 		args = append(args, f.FileType)
 	}
 	if !f.MinAnalyzedAt.IsZero() {
-		clause += " AND analyzed_at >= ?"
+		clause += " AND " + col("analyzed_at") + " >= ?"
 		args = append(args, f.MinAnalyzedAt.UTC().Format(time.RFC3339Nano))
 	}
 	if f.ExcludeReportType != "" {
 		clause += ` AND NOT EXISTS (SELECT 1 FROM reports r` +
-			` WHERE r.sha256 = samples.sha256 AND r.report_type = ?` +
-			` AND r.created_at > samples.analyzed_at)`
+			` WHERE r.sha256 = ` + reportKey + ` AND r.report_type = ?` +
+			` AND r.created_at > ` + col("analyzed_at") + `)`
 		args = append(args, f.ExcludeReportType)
+	}
+	if f.AttemptReportType != "" && f.MaxAttempts > 0 {
+		clause += ` AND (SELECT count(*) FROM reports r` +
+			` WHERE r.sha256 = ` + reportKey + ` AND r.report_type = ?) < ?`
+		args = append(args, f.AttemptReportType, f.MaxAttempts)
 	}
 	return clause, args
 }
 
 func (db *DB) triageBadSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClauseSQLite(f)
+	extra, args := triageFilterClauseSQLite(f, "samples")
 	args = append(args, limit)
 	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleCols+` FROM samples
+		`SELECT `+liteSampleColsLight+` FROM samples
 		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''
-		   AND (max_crit < 5 OR suspicious_count < 2)`+extra+`
+		   AND max_crit < 5 AND suspicious_count < 2`+extra+`
 		 `+triageOrderSQL(f)+` LIMIT ?`,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage bad: %w", err)
 	}
-	return scanLiteSamples(rows)
+	return scanLiteSamplesLight(rows)
 }
 
 func (db *DB) triageGoodSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClauseSQLite(f)
-	// litmusClassSQLite's two `?` (cutoff, then ceiling) come first in the SQL.
-	args := append([]any{CriticalLevel, SuspiciousCeiling}, fargs...)
+	extra, args := triageFilterClauseSQLite(f, "samples")
 	args = append(args, limit)
 	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleCols+` FROM samples
+		`SELECT `+liteSampleColsLight+` FROM samples
 		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''
-		   AND (max_crit >= 5 OR suspicious_count >= 2 OR `+litmusClassSQLite+` >= 1)`+extra+`
+		   AND (max_crit >= 5 OR suspicious_count >= 2)`+extra+`
 		 `+triageOrderSQL(f)+` LIMIT ?`,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage good: %w", err)
 	}
-	return scanLiteSamples(rows)
+	return scanLiteSamplesLight(rows)
 }
 
 // triageHighestSQLite: see TriageHighest. Mirrors triageHighestPG's per-route
@@ -2650,7 +2777,8 @@ func (db *DB) triageGoodSQLite(ctx context.Context, limit int, f TriageFilter) (
 // tables; no index gymnastics needed), and the collapse is GROUP BY root with
 // MAX(best)/MIN(rank) instead of DISTINCT ON.
 func (db *DB) triageHighestSQLite(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClauseSQLite(f)
+	extra, fargs := triageFilterClauseSQLiteKey(f, "s0",
+		"CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END")
 	args := append([]any{
 		createdBefore.UTC().Format(time.RFC3339Nano),
 		missingBefore.UTC().Format(time.RFC3339Nano),
@@ -2658,7 +2786,7 @@ func (db *DB) triageHighestSQLite(ctx context.Context, limit int, createdBefore,
 	args = append(args, limit)
 	//nolint:gosec // G202: label predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleCols+` FROM (
+		`SELECT `+liteSampleColsLight+` FROM (
 		   SELECT root, MAX(best) AS best, MIN(rank) AS rank FROM (
 		     SELECT CASE WHEN parent = '' THEN sha256 ELSE parent END AS root,
 		            litmus_score AS best,
@@ -2682,25 +2810,25 @@ func (db *DB) triageHighestSQLite(ctx context.Context, limit int, createdBefore,
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage highest: %w", err)
 	}
-	return scanLiteSamples(rows)
+	return scanLiteSamplesLight(rows)
 }
 
 // triageLowestSQLite: see TriageLowest. Mirrors triageLowestPG (per-route
 // bottom-K via a PARTITION BY file_type window), including the per-member
 // drain key (a bad archive's members each need their own verdict).
 func (db *DB) triageLowestSQLite(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClauseSQLite(f)
+	extra, fargs := triageFilterClauseSQLite(f, "s0")
 	args := append([]any{
 		createdBefore.UTC().Format(time.RFC3339Nano),
 		missingBefore.UTC().Format(time.RFC3339Nano),
 	}, fargs...)
 	args = append(args, limit)
 	// The inner samples.* feeds the window function; the outer select names its
-	// columns via liteSampleCols. Label predicates and the column list are
+	// columns via liteSampleColsLight. Label predicates and the column list are
 	// constant; filter values are bound as ? args.
 	//nolint:gosec,unqueryvet // G202 and the wildcard are both accounted for above.
 	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleCols+` FROM (
+		`SELECT `+liteSampleColsLight+` FROM (
 		   SELECT samples.*,
 		          ROW_NUMBER() OVER (PARTITION BY file_type ORDER BY litmus_score ASC) AS rank
 		   FROM samples
@@ -2722,13 +2850,13 @@ func (db *DB) triageLowestSQLite(ctx context.Context, limit int, createdBefore, 
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage lowest: %w", err)
 	}
-	return scanLiteSamples(rows)
+	return scanLiteSamplesLight(rows)
 }
 
 // triageStrandedSQLite: see TriageStranded. Mirrors triageStrandedPG —
 // GROUP BY root with MAX(best) stands in for DISTINCT ON.
 func (db *DB) triageStrandedSQLite(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClauseSQLite(f)
+	extra, fargs := triageFilterClauseSQLite(f, "m")
 	args := append([]any{
 		createdBefore.UTC().Format(time.RFC3339Nano),
 		missingBefore.UTC().Format(time.RFC3339Nano),
@@ -2765,34 +2893,50 @@ func (db *DB) triageStrandedSQLite(ctx context.Context, limit int, createdBefore
 }
 
 func (db *DB) triageNewSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClauseSQLite(f)
+	extra, args := triageFilterClauseSQLite(f, "samples")
 	args = append(args, limit)
 	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleCols+` FROM samples
+		`SELECT `+liteSampleColsLight+` FROM samples
 		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''
-		   AND suspicious_count >= 1`+extra+`
+		   AND suspicious_count >= 1 AND path NOT GLOB 'review/*'`+extra+`
 		 `+triageOrderSQL(f)+` LIMIT ?`,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage new: %w", err)
 	}
-	return scanLiteSamples(rows)
+	return scanLiteSamplesLight(rows)
+}
+
+func (db *DB) triageReviewSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	extra, args := triageFilterClauseSQLite(f, "samples")
+	args = append(args, limit)
+	//nolint:gosec // G202: label/path predicates and column list are constant; filter values are parameterized via ? args
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleColsLight+` FROM samples
+		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''
+		   AND path GLOB 'review/*'`+extra+`
+		 `+triageOrderSQL(f)+` LIMIT ?`,
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage review: %w", err)
+	}
+	return scanLiteSamplesLight(rows)
 }
 
 func (db *DB) triageSightedSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClauseSQLite(f)
+	extra, args := triageFilterClauseSQLite(f, "samples")
 	args = append(args, limit)
 	//nolint:gosec // G202: label predicate and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleCols+` FROM samples
+		`SELECT `+liteSampleColsLight+` FROM samples
 		 WHERE label = 'sighted' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''`+extra+`
 		 ORDER BY created_at DESC, id DESC LIMIT ?`,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage sighted: %w", err)
 	}
-	return scanLiteSamples(rows)
+	return scanLiteSamplesLight(rows)
 }
 
 // triageSecondOpinionSQLite: see TriageSecondOpinion. Mirrors
@@ -2806,8 +2950,7 @@ func (db *DB) triageSecondOpinionSQLite(
 	// any 'second' report drains permanently.
 	refreshClause := `NOT EXISTS (SELECT 1 FROM reports r
 		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'second')`
-	// litmusClassSQLite's two `?` (cutoff, then ceiling) come first in the SQL.
-	args := []any{CriticalLevel, SuspiciousCeiling, analyzedBefore.UTC().Format(time.RFC3339Nano)}
+	args := []any{analyzedBefore.UTC().Format(time.RFC3339Nano)}
 	if len(trusted) > 0 {
 		in := "(?" + strings.Repeat(",?", len(trusted)-1) + ")"
 		trustedClause = `EXISTS (SELECT 1 FROM sightings s
@@ -2832,15 +2975,15 @@ func (db *DB) triageSecondOpinionSQLite(
 			args = append(args, src)
 		}
 	}
-	extra, fargs := triageFilterClauseSQLite(f)
+	extra, fargs := triageFilterClauseSQLite(f, "samples")
 	args = append(args, fargs...)
 	args = append(args, limit)
 	//nolint:gosec // G202: predicates and column list are constant; trusted expands to `?` placeholders, values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleCols+` FROM samples
+		`SELECT `+liteSampleColsLight+` FROM samples
 		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = ''
 		   AND corroborated = 1
-		   AND NOT (max_crit >= 5 OR suspicious_count >= 2 OR `+litmusClassSQLite+` >= 1)
+		   AND NOT (max_crit >= 5 OR suspicious_count >= 2)
 		   AND analyzed_at < ?
 		   AND (`+trustedClause+`
 		        OR (SELECT count(DISTINCT s.source) FROM sightings s
@@ -2852,18 +2995,18 @@ func (db *DB) triageSecondOpinionSQLite(
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage second opinion: %w", err)
 	}
-	return scanLiteSamples(rows)
+	return scanLiteSamplesLight(rows)
 }
 
 // triageAcquitSQLite: see TriageAcquit. Mirrors triageAcquitPG; the provenance
 // tests use the JSON1 functions over the TEXT sidecar column.
 func (db *DB) triageAcquitSQLite(ctx context.Context, limit int, createdBefore time.Time, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClauseSQLite(f)
+	extra, fargs := triageFilterClauseSQLite(f, "samples")
 	args := append([]any{createdBefore.UTC().Format(time.RFC3339Nano)}, fargs...)
 	args = append(args, limit)
 	//nolint:gosec // G202: predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleCols+` FROM samples
+		`SELECT `+liteSampleColsLight+` FROM samples
 		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = ''
 		   AND skip != 'conflict' AND label_source != 'conflict'
 		   AND max_crit >= 5 AND suspicious_count >= 2
@@ -2881,14 +3024,14 @@ func (db *DB) triageAcquitSQLite(ctx context.Context, limit int, createdBefore t
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage acquit: %w", err)
 	}
-	return scanLiteSamples(rows)
+	return scanLiteSamplesLight(rows)
 }
 
 // triageFalloutSQLite: see TriageFallout. Mirrors triageFalloutPG; SQLite has
 // no litmus_class column, so the class derives inline (litmusClassSQLite, two
 // leading ? args).
 func (db *DB) triageFalloutSQLite(ctx context.Context, limit int, createdAfter time.Time, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClauseSQLite(f)
+	extra, fargs := triageFilterClauseSQLite(f, "samples")
 	args := []any{CriticalLevel, SuspiciousCeiling, createdAfter.UTC().Format(time.RFC3339Nano)}
 	args = append(args, fargs...)
 	args = append(args, limit)
@@ -3276,6 +3419,31 @@ func (db *DB) insertReportSQLite(ctx context.Context, r *Report) error {
 		r.SHA256, r.Type, r.Content, r.Provider, r.DurationMS)
 	if err != nil {
 		return fmt.Errorf("hopper: insert report: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) tryClaimSampleSQLite(ctx context.Context, sha256, owner string, staleBefore time.Time) (bool, error) {
+	res, err := db.lite.ExecContext(ctx, `
+		UPDATE samples SET claimed_by = ?, claimed_at = ?
+		WHERE sha256 = ?
+		  AND (claimed_by = '' OR claimed_at IS NULL OR claimed_at < ?)`,
+		owner, time.Now().UTC().Format(time.RFC3339Nano), sha256, staleBefore.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return false, fmt.Errorf("hopper: claim sample: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("hopper: claim sample rows affected: %w", err)
+	}
+	return n == 1, nil
+}
+
+func (db *DB) releaseSampleClaimSQLite(ctx context.Context, sha256, owner string) error {
+	if _, err := db.lite.ExecContext(ctx, `
+		UPDATE samples SET claimed_by = '', claimed_at = NULL
+		WHERE sha256 = ? AND claimed_by = ?`, sha256, owner); err != nil {
+		return fmt.Errorf("hopper: release sample claim: %w", err)
 	}
 	return nil
 }
@@ -3820,6 +3988,48 @@ func (db *DB) stageLocationsSQLite(ctx context.Context, keys []SampleLocationKey
 	return nil
 }
 
+func (db *DB) observeStagedLocationsSQLite(ctx context.Context) (int64, error) {
+	ts := now()
+	res, err := db.lite.ExecContext(ctx, `
+		INSERT OR IGNORE INTO sample_locations
+			(sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime,
+			 first_seen_at, last_seen_at)
+		SELECT w.sha256, w.path, '', s.filename, s.source, s.feed, s.ecosystem, s.mtime,
+		       ?, ?
+		FROM walk_staging w
+		JOIN samples s ON s.sha256 = w.sha256
+		WHERE s.parent = ''`, ts, ts)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (db *DB) eligibleStandaloneRootsSQLite(ctx context.Context) (map[string]int64, error) {
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT CASE WHEN instr(ltrim(path, '/'), '/') > 0
+		            THEN substr(ltrim(path, '/'), 1, instr(ltrim(path, '/'), '/') - 1)
+		            ELSE ltrim(path, '/') END AS root,
+		       count(*)
+		FROM samples
+		WHERE parent = '' AND skip IN ('', 'conflict')
+		GROUP BY root`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck // best-effort cleanup
+	out := make(map[string]int64)
+	for rows.Next() {
+		var root string
+		var n int64
+		if err := rows.Scan(&root, &n); err != nil {
+			return nil, err
+		}
+		out[root] = n
+	}
+	return out, rows.Err()
+}
+
 func (db *DB) relabelFromPoolsSQLite(ctx context.Context) (int64, error) {
 	ts := now()
 	tx, err := db.lite.BeginTx(ctx, nil)
@@ -4116,11 +4326,12 @@ func (db *DB) deleteAllSQLite(ctx context.Context) error {
 	// fires with PRAGMA foreign_keys = ON, which we don't set globally,
 	// so we can't rely on it here.
 	for _, q := range []string{
+		`DELETE FROM sample_location_history`,
 		`DELETE FROM sample_locations`,
 		`DELETE FROM reports`,
 		`DELETE FROM samples`,
 		// Reset AUTOINCREMENT counters so next insert starts at 1.
-		`DELETE FROM sqlite_sequence WHERE name IN ('samples','reports','sample_locations')`,
+		`DELETE FROM sqlite_sequence WHERE name IN ('samples','reports','sample_locations','sample_location_history')`,
 	} {
 		if _, err := db.lite.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("hopper: delete all (%s): %w", q, err)

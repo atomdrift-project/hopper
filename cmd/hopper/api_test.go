@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -9,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -622,6 +624,73 @@ func TestHandleResultStoresAfterRequestContextCanceled(t *testing.T) {
 	}
 }
 
+func TestHandleResultAcknowledgesAbsentSample(t *testing.T) {
+	sha := strings.Repeat("9", 64)
+	raw := json.RawMessage(`{"fs":[{"sha":"` + sha + `","type":"elf","dp":0}]}`)
+	body, err := json.Marshal(resultRequest{SHA256: sha, Worker: "worker1", Raw: raw, ML: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	api := &apiServer{db: db, tracker: newWorkerTracker(), progress: &loadProgress{}}
+	req := httptest.NewRequest(http.MethodPost, "/api/result", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	api.handleResult(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		OK     bool `json:"ok"`
+		Stored bool `json:"stored"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.OK || response.Stored {
+		t.Fatalf("response = %+v, want ok=true stored=false", response)
+	}
+}
+
+func TestHandleResultRejectsRootSHAMismatch(t *testing.T) {
+	ctx := context.Background()
+	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	claimed := strings.Repeat("a", 64)
+	reported := strings.Repeat("b", 64)
+	if err := db.InsertSample(ctx, &hopper.Sample{SHA256: claimed, Path: "pending/sample.bin", Label: "unknown"}); err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(resultRequest{
+		SHA256: claimed,
+		Worker: "worker1",
+		Raw:    json.RawMessage(`{"fs":[{"sha":"` + reported + `","type":"elf","dp":0}]}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := &apiServer{db: db, tracker: newWorkerTracker(), progress: &loadProgress{}}
+	rec := httptest.NewRecorder()
+	api.handleResult(rec, httptest.NewRequest(http.MethodPost, "/api/result", bytes.NewReader(body)))
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	row, err := db.SampleBySHA256(ctx, claimed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(row.CleaveResult) != 0 {
+		t.Fatal("mismatched result was stored")
+	}
+}
+
 // TestHandleResultShedsLoadWhenSaturated verifies that with no ingestion slot
 // free the handler sheds load with 503 + Retry-After instead of reading and
 // buffering the body. A pre-filled cap-1 resultSem plus a cancelled request
@@ -1073,9 +1142,33 @@ func TestBootstrapUploadTokenFromEnv(t *testing.T) {
 	if !api.uploadTokenSet {
 		t.Fatal("uploadTokenSet false after env bootstrap")
 	}
-	// Env path must NOT touch the DB.
-	if _, err := db.KVGet(ctx, uploadTokenKVKey); !errors.Is(err, hopper.ErrNotFound) {
-		t.Errorf("env path wrote to DB: err=%v", err)
+	stored, err := db.KVGet(ctx, uploadTokenKVKey)
+	if err != nil || stored != "env-supplied-token-32-bytes-long!" {
+		t.Errorf("env token was not persisted: got=%q err=%v", stored, err)
+	}
+}
+
+func TestBootstrapUploadTokenFromEnvRotatesPersistedValue(t *testing.T) {
+	t.Setenv("HOPPER_UPLOAD_TOKEN", "replacement-token-at-least-32-bytes!")
+	ctx := t.Context()
+	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "bs.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.KVSetIfAbsent(ctx, uploadTokenKVKey, "old-persisted-token-at-least-32-bytes"); err != nil {
+		t.Fatal(err)
+	}
+	api := &apiServer{tracker: newWorkerTracker()}
+
+	bootstrapUploadToken(ctx, api, db)
+
+	stored, err := db.KVGet(ctx, uploadTokenKVKey)
+	if err != nil || stored != "replacement-token-at-least-32-bytes!" {
+		t.Fatalf("persisted token = %q, %v", stored, err)
+	}
+	if sum := sha256.Sum256([]byte(stored)); !api.uploadTokenSet || sum != api.uploadTokenHash {
+		t.Fatal("API token does not match rotated persisted token")
 	}
 }
 
@@ -1473,6 +1566,42 @@ func TestHandleUploadShardCollision(t *testing.T) {
 			names = append(names, e.Name())
 		}
 		t.Errorf("shard holds %d files %v, want exactly the 2 colliding samples", len(entries), names)
+	}
+}
+
+func TestHandleUploadRepairsExistingPathWithWrongBytes(t *testing.T) {
+	t.Parallel()
+	api := uploadAPI(t)
+	payload := []byte("the verified payload")
+	sha := hexSHA256(payload)
+	prov := provenanceFrom(t, payload, sha, "some-unlisted-tool", "")
+	upload := func() *httptest.ResponseRecorder {
+		body, ct := multipartUpload(t, prov, payload, true)
+		return postUpload(t, api, body, ct)
+	}
+	if rec := upload(); rec.Code != http.StatusOK {
+		t.Fatalf("first upload: %d %s", rec.Code, rec.Body.String())
+	}
+	original := mustUploadPath(t, api, sha)
+	if err := os.Chmod(filepath.Join(api.dataRoot, original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(api.dataRoot, original), []byte("corrupt replacement"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if rec := upload(); rec.Code != http.StatusOK {
+		t.Fatalf("repair upload: %d %s", rec.Code, rec.Body.String())
+	}
+	repaired := mustUploadPath(t, api, sha)
+	if repaired == original {
+		t.Fatalf("canonical path remained on corrupted bytes: %q", repaired)
+	}
+	stored, err := os.ReadFile(filepath.Join(api.dataRoot, repaired))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hexSHA256(stored); got != sha {
+		t.Fatalf("repaired path hashes to %s, want %s", got, sha)
 	}
 }
 
@@ -2086,6 +2215,17 @@ func TestHandleFileMarksMissing(t *testing.T) {
 	if got := skipOf(t, goneSHA); got != "missing" {
 		t.Errorf("gone file: skip = %q, want %q", got, "missing")
 	}
+	// A direct SHA fetch is also a recovery signal. If the original bytes come
+	// back before the next walk, serving clears the stale missing mark.
+	if err := os.WriteFile(filepath.Join(root, "bad", "gone.bin"), []byte("revived"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := get(t, api, goneSHA); code != http.StatusOK {
+		t.Fatalf("revived file: status = %d, want 200", code)
+	}
+	if got := skipOf(t, goneSHA); got != "" {
+		t.Errorf("revived file: skip = %q, want empty", got)
+	}
 
 	// Present bytes: 200 and no mark.
 	if code := get(t, api, hereSHA); code != http.StatusOK {
@@ -2097,8 +2237,8 @@ func TestHandleFileMarksMissing(t *testing.T) {
 
 	// Dataset-incomplete: local disk is not authoritative, so a vanished file
 	// still 410s this request but must not be marked.
-	if err := db.SetSkip(ctx, goneSHA, ""); err != nil {
-		t.Fatalf("SetSkip reset: %v", err)
+	if err := os.Remove(filepath.Join(root, "bad", "gone.bin")); err != nil {
+		t.Fatal(err)
 	}
 	incomplete := &apiServer{db: db, dataRoot: root, allowedDirs: []string{resolvedRoot}, tracker: newWorkerTracker(), datasetIncomplete: true}
 	if code := get(t, incomplete, goneSHA); code != http.StatusGone {
@@ -2106,5 +2246,286 @@ func TestHandleFileMarksMissing(t *testing.T) {
 	}
 	if got := skipOf(t, goneSHA); got != "" {
 		t.Errorf("dataset-incomplete: skip = %q, want empty", got)
+	}
+}
+
+func TestHandleFileReactivatesPrunedPrimaryLocation(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db := mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("2", 64)
+	rel := "pending/feed/revived.bin"
+	if err := db.InsertSample(ctx, &hopper.Sample{SHA256: sha, Source: "test", Path: rel, Label: "unknown"}); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := db.PruneMissingLocations(ctx, root, 1); err != nil || removed != 1 {
+		t.Fatalf("prune = %d, %v", removed, err)
+	}
+	locations, err := db.TopLevelLocationsForSHA(ctx, sha)
+	if err != nil || len(locations) != 0 {
+		t.Fatalf("locations after prune = %+v, %v", locations, err)
+	}
+	abs := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(abs), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(abs, []byte("back again"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	api := &apiServer{db: db, dataRoot: root, allowedDirs: []string{resolvedRoot}, tracker: newWorkerTracker()}
+	r := httptest.NewRequest(http.MethodGet, "/api/file/"+sha, http.NoBody)
+	r.SetPathValue("sha256", sha)
+	rec := httptest.NewRecorder()
+	api.handleFile(rec, r)
+	if rec.Code != http.StatusOK || rec.Body.String() != "back again" {
+		t.Fatalf("response = %d %q", rec.Code, rec.Body.String())
+	}
+	sample, err := db.SampleBySHA256(ctx, sha)
+	if err != nil || sample.Skip != "" {
+		t.Fatalf("reactivated sample = %+v, %v", sample, err)
+	}
+	locations, err = db.TopLevelLocationsForSHA(ctx, sha)
+	if err != nil || len(locations) != 1 || locations[0].Path != rel {
+		t.Fatalf("reactivated locations = %+v, %v", locations, err)
+	}
+	retired, err := db.RetiredLocationsForSHA(ctx, sha)
+	if err != nil || len(retired) != 1 || retired[0].Path != rel {
+		t.Fatalf("retired audit after reactivation = %+v, %v", retired, err)
+	}
+}
+
+func TestHandleFileFallsBackAndHealsPrimaryPath(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db := mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sha := strings.Repeat("c", 64)
+	validPath := "pending/feed/sample.bin"
+	stalePath := "incoming/feed/sample.bin"
+	validAbs := filepath.Join(root, filepath.FromSlash(validPath))
+	if err := os.MkdirAll(filepath.Dir(validAbs), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("fallback bytes")
+	if err := os.WriteFile(validAbs, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The later observation becomes samples.path, while both paths remain in
+	// sample_locations. This models a stale canonical path after a manual move.
+	for _, path := range []string{validPath, stalePath} {
+		if err := db.InsertSample(ctx, &hopper.Sample{SHA256: sha, Source: "test", Path: path, Label: "unknown"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.SetSkip(ctx, sha, "missing"); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	api := &apiServer{db: db, dataRoot: root, allowedDirs: []string{resolvedRoot}, tracker: newWorkerTracker()}
+	r := httptest.NewRequest(http.MethodGet, "/api/file/"+sha, http.NoBody)
+	r.SetPathValue("sha256", sha)
+	rec := httptest.NewRecorder()
+	api.handleFile(rec, r)
+	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), want) {
+		t.Fatalf("fallback response = %d %q", rec.Code, rec.Body.Bytes())
+	}
+	sample, err := db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sample.Path != validPath || sample.Skip != "" {
+		t.Fatalf("healed sample = path %q skip %q", sample.Path, sample.Skip)
+	}
+	locations, err := db.TopLevelLocationsForSHA(ctx, sha)
+	if err != nil || len(locations) != 2 {
+		t.Fatalf("active locations = %+v, %v", locations, err)
+	}
+	logText := logs.String()
+	for _, field := range []string{
+		`"msg":"sample path fallback succeeded"`,
+		`"old_path":"incoming/feed/sample.bin"`,
+		`"selected_path":"pending/feed/sample.bin"`,
+		`"candidate_count":2`,
+		`"primary_healed":true`,
+	} {
+		if !strings.Contains(logText, field) {
+			t.Errorf("fallback log missing %s: %s", field, logText)
+		}
+	}
+}
+
+func TestHandleFileFallbackMarksMissingOnlyAfterAllLocationsFail(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db := mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("d", 64)
+	for _, path := range []string{"pending/feed/gone.bin", "incoming/feed/gone.bin"} {
+		if err := db.InsertSample(ctx, &hopper.Sample{SHA256: sha, Source: "test", Path: path, Label: "unknown"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	api := &apiServer{db: db, dataRoot: root, allowedDirs: []string{resolvedRoot}, tracker: newWorkerTracker()}
+	r := httptest.NewRequest(http.MethodGet, "/api/file/"+sha, http.NoBody)
+	r.SetPathValue("sha256", sha)
+	rec := httptest.NewRecorder()
+	api.handleFile(rec, r)
+	if rec.Code != http.StatusGone {
+		t.Fatalf("status = %d, want 410", rec.Code)
+	}
+	sample, err := db.SampleBySHA256(ctx, sha)
+	if err != nil || sample.Skip != "missing" {
+		t.Fatalf("sample after failed fallbacks = %+v, %v", sample, err)
+	}
+}
+
+func TestHandleNextFallsBackBeforeMarkingClaimMissing(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db := mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("1", 64)
+	wantPath := "pending/feed/claim.bin"
+	stalePath := "incoming/feed/claim.bin"
+	wantAbs := filepath.Join(root, filepath.FromSlash(wantPath))
+	if err := os.MkdirAll(filepath.Dir(wantAbs), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("claim fallback")
+	if err := os.WriteFile(wantAbs, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{wantPath, stalePath} {
+		if err := db.InsertSample(ctx, &hopper.Sample{
+			SHA256: sha, Source: "test", Path: path, Label: "unknown", SizeBytes: int64(len(content)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	api := &apiServer{db: db, dataRoot: root, allowedDirs: []string{resolvedRoot}, tracker: newWorkerTracker()}
+	r := httptest.NewRequest(http.MethodGet, "/api/next?worker=tester&count=1&slots=1", http.NoBody)
+	rec := httptest.NewRecorder()
+	api.handleNext(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Jobs []hopper.ClaimJob `json:"jobs"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Jobs) != 1 || response.Jobs[0].SHA256 != sha || response.Jobs[0].Path != wantPath {
+		t.Fatalf("jobs = %+v", response.Jobs)
+	}
+	sample, err := db.SampleBySHA256(ctx, sha)
+	if err != nil || sample.Path != wantPath || sample.Skip != "" {
+		t.Fatalf("sample after claim fallback = %+v, %v", sample, err)
+	}
+}
+
+func TestHandleArchiveMemberFallsBackToKnownParentLocation(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db := mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parentSHA := strings.Repeat("e", 64)
+	childSHA := strings.Repeat("f", 64)
+	validPath := "pending/feed/parent.zip"
+	stalePath := "incoming/feed/parent.zip"
+	validAbs := filepath.Join(root, filepath.FromSlash(validPath))
+	if err := os.MkdirAll(filepath.Dir(validAbs), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(validAbs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	entry, err := zw.Create("pkg/member.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("member bytes")
+	if _, err := entry.Write(want); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	analysis := []byte(`{"files":[{"type":"zip"}]}`)
+	for _, path := range []string{validPath, stalePath} {
+		if err := db.InsertSample(ctx, &hopper.Sample{
+			SHA256: parentSHA, Source: "test", Path: path, Label: "unknown", CleaveResult: analysis,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.InsertSample(ctx, &hopper.Sample{
+		SHA256: childSHA, Source: "test", Parent: parentSHA,
+		Path: parentSHA + "!!pkg/member.txt", Label: "unknown",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	api := &apiServer{db: db, dataRoot: root, allowedDirs: []string{resolvedRoot}, tracker: newWorkerTracker()}
+	r := httptest.NewRequest(http.MethodGet, "/api/file/"+childSHA, http.NoBody)
+	r.SetPathValue("sha256", childSHA)
+	rec := httptest.NewRecorder()
+	api.handleFile(rec, r)
+	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), want) {
+		t.Fatalf("archive fallback response = %d %q", rec.Code, rec.Body.Bytes())
+	}
+	parent, err := db.SampleBySHA256(ctx, parentSHA)
+	if err != nil || parent.Path != validPath {
+		t.Fatalf("healed parent = %+v, %v", parent, err)
 	}
 }

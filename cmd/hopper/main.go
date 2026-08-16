@@ -182,7 +182,8 @@ func uploadOpenRequested() bool {
 //     in the KV (steps 2–3) so prism and other token-sending clients keep
 //     working, but it is not enforced — a tokenless scan/forager push is
 //     accepted. The frictionless choice for an internal deployment.
-//  1. HOPPER_UPLOAD_TOKEN env var (operator override; never written to DB).
+//  1. HOPPER_UPLOAD_TOKEN env var (operator override, persisted to the KV so
+//     database-reading and environment-reading clients use the same value).
 //  2. The persisted hopper_kv row (set by a previous run or peer instance).
 //  3. A freshly-generated 32-byte random token, persisted via INSERT…
 //     ON CONFLICT DO NOTHING so concurrent first-starters converge on
@@ -200,12 +201,25 @@ func bootstrapUploadToken(ctx context.Context, api *apiServer, db *hopper.DB) {
 		// the endpoint open — a tokenless scan/forager push is accepted too.
 		slog.Warn("upload endpoint OPEN: /api/upload requires no token (HOPPER_UPLOAD_OPEN set)")
 	} else if env := strings.TrimSpace(os.Getenv("HOPPER_UPLOAD_TOKEN")); env != "" {
+		if len(env) < uploadTokenMinLen {
+			slog.Error("HOPPER_UPLOAD_TOKEN rejected; /api/upload disabled",
+			"error", fmt.Sprintf("token must be at least %d bytes (got %d)", uploadTokenMinLen, len(env)))
+			return
+		}
+		persistCtx, cancel := context.WithTimeout(ctx, kvBootstrapTimeout)
+		defer cancel()
+		if err := retryDBAccessNoValue(persistCtx, "kv persist configured upload token", uploadTokenKVKey, func(ctx context.Context) error {
+			return db.KVSet(ctx, uploadTokenKVKey, env)
+		}); err != nil {
+			slog.Error("configured upload token persistence failed; /api/upload disabled", "error", err)
+			return
+		}
 		if err := api.setUploadToken(env); err != nil {
-			slog.Error("HOPPER_UPLOAD_TOKEN rejected; /api/upload disabled", "error", err)
+			slog.Error("HOPPER_UPLOAD_TOKEN rejected after persistence; /api/upload disabled", "error", err)
 			return
 		}
 		//nolint:gosec // logging integer length only; token bytes never logged
-		slog.Info("upload endpoint enabled", "source", "env", "token_len", len(env))
+		slog.Info("upload endpoint enabled", "source", "env+db", "token_len", len(env))
 		return
 	}
 
@@ -932,6 +946,9 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	datasetIncomplete := f.Bool("dataset-incomplete", false,
 		"data root does not hold the full sample set; do not mark locally-absent "+
 			"files missing (reconcile still relabels local pool moves)")
+	var requiredMounts stringListFlag
+	f.Var(&requiredMounts, "require-mount",
+		"pool path below --data that must be an active mountpoint before absence is authoritative; may be repeated or comma-separated")
 	hashWorkers := f.Int("hash-workers", 8, "concurrent hash/insert workers for file walking")
 	cleaveBinFlag := f.String("cleave", "cleave", "path to cleave binary (used for file enumeration)")
 	litmusBin := f.String("litmus", "atomscan", "path to the Atomdrift Scan binary (atomscan; codename litmus; pass empty to disable)")
@@ -985,6 +1002,10 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	if abs, err := filepath.Abs(*dataDir); err == nil {
 		*dataDir = abs
 	}
+	requiredReconcileMounts = append(requiredReconcileMounts[:0], requiredMounts...)
+	if err := validateRequiredMounts(*dataDir, requiredReconcileMounts); err != nil {
+		return fmt.Errorf("sample storage is not authoritative: %w", err)
+	}
 
 	cleaveBinary = *cleaveBinFlag
 
@@ -1027,6 +1048,18 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	api.registerAPI(httpMux)
 	httpMux.HandleFunc("GET /_/health", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok")) //nolint:errcheck // best-effort HTTP response
+	})
+	httpMux.HandleFunc("GET /_/ready", func(w http.ResponseWriter, _ *http.Request) {
+		if !api.ready.Load() {
+			http.Error(w, "starting", http.StatusServiceUnavailable)
+			return
+		}
+		if err := validateRequiredMounts(api.dataRoot, api.requiredMounts); err != nil {
+			slog.Error("readiness failed: sample storage is not authoritative", "error", err)
+			http.Error(w, "sample storage unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte("ready")) //nolint:errcheck // best-effort HTTP response
 	})
 	httpMux.Handle("GET /_/metrik", obs.MetricsHandler())
 
@@ -1176,7 +1209,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 
 	// Start file enumeration early — cleave iter-files doesn't need the
 	// hash cache or database, so overlap it with those slower init steps.
-	fileChs := make([]<-chan labeledPath, len(loadDirs))
+	fileChs := make([]enumerationStream, len(loadDirs))
 	for i, d := range loadDirs {
 		fileChs[i] = startEnumeration(ctx, d.dir, time.Time{}) // full enumeration on startup
 	}
@@ -1347,6 +1380,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// dataDir was already resolved (symlinks + absolute) at startup.
 	api.db = db
 	api.dataRoot = *dataDir
+	api.requiredMounts = append([]string(nil), requiredReconcileMounts...)
 	api.datasetIncomplete = *datasetIncomplete
 	api.allowedDirs = allowedDirs
 
@@ -1416,6 +1450,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// the SHA-256 lives in api once setUploadToken returns. Prism reads
 	// the persisted value from hopper_kv to discover the same token.
 	bootstrapUploadToken(ctx, api, db)
+	api.ready.Store(true)
 	if api.uploadTokenSet && *dashAddr != "" && !isLoopbackAddr(*dashAddr) {
 		slog.Warn("dashboard bound to non-loopback; /api/file and /data remain unauthenticated",
 			"addr", *dashAddr,
@@ -1595,6 +1630,11 @@ const (
 // and analysis. Overridable via the load command's --max-file-size flag.
 var maxFileSize int64 = defaultMaxFileSize
 
+// requiredReconcileMounts is populated by cmdLoad after --data is resolved.
+// Tests and one-shot callers leave it empty; production deployments declare
+// every independently mounted pool that must be present for absence inference.
+var requiredReconcileMounts []string
+
 var (
 	errTooSmall = errors.New("too small")
 	errTooLarge = errors.New("too large")
@@ -1615,7 +1655,7 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	api *apiServer,
 	cache *hashCache,
 	dirs []struct{ dir, label string },
-	fileChs []<-chan labeledPath,
+	fileChs []enumerationStream,
 	source string,
 	nworkers int,
 	_ bool,
@@ -1645,10 +1685,14 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 		api.progress = &progress
 	}
 
-	// Progress dashboard — runs until ctx is cancelled (ctrl-C).
+	// Dashboard-side tasks share a child lifetime. In serving mode they run
+	// until ctx is cancelled; a one-shot load cancels and joins them before
+	// returning so they cannot retain the DB or process-global terminal state.
+	backgroundCtx, stopBackground := context.WithCancel(ctx)
+	defer stopBackground()
 	var dashWG sync.WaitGroup
 	dashWG.Go(func() {
-		runDashboard(ctx, &progress, litmus, tracker, db, start, maxAnalyzed, len(dirs), traitsVersion, rescanAge)
+		runDashboard(backgroundCtx, &progress, litmus, tracker, db, start, maxAnalyzed, len(dirs), traitsVersion, rescanAge)
 	})
 
 	// Local time-series cache for the dashboard queue graphs. Historical queue
@@ -1678,12 +1722,14 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	// taking minutes. The dashboard is already configured above, so it switches
 	// to the live view immediately and these baselines fill in once the counts
 	// return; until then the session delta is simply measured from zero.
-	go seedProgressBaseline(ctx, db, &progress)
+	dashWG.Go(func() {
+		seedProgressBaseline(backgroundCtx, db, &progress)
+	})
 
 	// Queue maintenance: reap poison samples and (when the cache is open)
 	// sample queue depths for the graphs, on one ticker tied to ctx.
 	dashWG.Go(func() {
-		runQueueMaintenance(ctx, db, &progress, metrics, traitsVersion, rescanAge)
+		runQueueMaintenance(backgroundCtx, db, &progress, metrics, traitsVersion, rescanAge)
 	})
 
 	// runWalk executes one enumeration→hash→insert pass across all dirs. When
@@ -1691,7 +1737,7 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	// or after cutoff are considered. When reconcile is true the pass also
 	// records a present-set in walk_staging and runs ReconcilePools; otherwise
 	// it is a pure ingest pass that never touches the staging table.
-	runWalk := func(chs []<-chan labeledPath, cutoff time.Time, reconcile bool) {
+	runWalk := func(chs []enumerationStream, cutoff time.Time, reconcile bool) {
 		// Only a reconcile pass touches walk_staging: it records a fresh
 		// present-set that ReconcilePools anti-joins against samples to find
 		// moved/missing files. Ingest passes skip staging entirely, so they
@@ -1720,7 +1766,7 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 		progress.hashErrors.Store(0)
 
 		if chs == nil {
-			chs = make([]<-chan labeledPath, len(dirs))
+			chs = make([]enumerationStream, len(dirs))
 			for i, d := range dirs {
 				chs[i] = startEnumeration(ctx, d.dir, cutoff)
 			}
@@ -1728,8 +1774,9 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 
 		sem := make(chan struct{}, max(1, nworkers))
 		var pipeWG sync.WaitGroup
+		pipeErrs := make(chan error, len(dirs))
 		for i, d := range dirs {
-			ch := chs[i]
+			stream := chs[i]
 			pipeWG.Go(func() {
 				select {
 				case sem <- struct{}{}:
@@ -1737,10 +1784,25 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 				case <-ctx.Done():
 					return
 				}
-				runDirPipeline(ctx, db, d, source, cache, &progress, ch, stageOK)
+				pipeErrs <- runDirPipeline(ctx, db, d, source, cache, &progress, stream.paths, stageOK)
 			})
 		}
 		pipeWG.Wait()
+		close(pipeErrs)
+		walkComplete := true
+		for err := range pipeErrs {
+			if err != nil {
+				walkComplete = false
+				slog.Warn("directory pipeline incomplete; reconciliation disabled for this pass", "error", err)
+			}
+		}
+		for i, stream := range chs {
+			if err := <-stream.done; err != nil {
+				walkComplete = false
+				slog.Warn("enumeration incomplete; reconciliation disabled for this pass",
+					"dir", dirs[i].dir, "error", err)
+			}
+		}
 		progress.walkDone.Store(true)
 
 		// Reconcile the derived label/skip cache against the pools, but only
@@ -1748,8 +1810,10 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 		// present files look missing. Bounded by reconcileTimeout so a
 		// pathological pass is abandoned instead of stranding the walk loop (and
 		// with it all ingestion), as an unbounded reconcile once did.
-		if stageOK && ctx.Err() == nil {
+		if stageOK && walkComplete && ctx.Err() == nil {
 			reconcilePools(ctx, db, dirs, markMissing)
+		} else if stageOK && ctx.Err() == nil {
+			slog.Warn("skipping authoritative reconcile after incomplete walk")
 		}
 
 		logLoadSummary(start, experimentTag, dirs, &progress)
@@ -1801,6 +1865,9 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	// wait for (remote workers also need the server to stay up).
 	if litmus != nil {
 		dashWG.Wait()
+	} else {
+		stopBackground()
+		dashWG.Wait()
 	}
 
 	return int(progress.inserted.Load() + progress.skipped.Load())
@@ -1813,10 +1880,15 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 // complete, staged walk. markMissing=false (--dataset-incomplete) keeps the
 // relabel pass but suppresses the missing/unsupported marking and cascade.
 func reconcilePools(ctx context.Context, db *hopper.DB, dirs []struct{ dir, label string }, markMissing bool) {
+	dataRoot := filepath.Dir(dirs[0].dir)
+	if err := validateRequiredMounts(dataRoot, requiredReconcileMounts); err != nil {
+		slog.Error("reconcile skipped: sample storage is not authoritative", "error", err)
+		return
+	}
 	ctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
 	defer cancel()
 	toDiskPath := func(path string) string {
-		return sampleDiskPath(filepath.Dir(dirs[0].dir), filepath.FromSlash(path))
+		return sampleDiskPath(dataRoot, filepath.FromSlash(path))
 	}
 	st, err := db.ReconcilePools(ctx, toDiskPath, markMissing)
 	if err != nil {
@@ -1840,6 +1912,7 @@ func reconcilePools(ctx context.Context, db *hopper.DB, dirs []struct{ dir, labe
 type walkStager struct {
 	db    *hopper.DB
 	batch []hopper.SampleLocationKey
+	err   error
 }
 
 func (s *walkStager) add(ctx context.Context, sha, path string) {
@@ -1850,11 +1923,14 @@ func (s *walkStager) add(ctx context.Context, sha, path string) {
 }
 
 func (s *walkStager) flush(ctx context.Context) {
-	if len(s.batch) == 0 {
+	if len(s.batch) == 0 || s.err != nil {
 		return
 	}
-	if err := s.db.StageLocations(ctx, s.batch); err != nil && ctx.Err() == nil {
-		slog.Warn("stage locations failed", "error", err, "batch_size", len(s.batch))
+	if err := s.db.StageLocations(ctx, s.batch); err != nil {
+		s.err = fmt.Errorf("stage %d locations: %w", len(s.batch), err)
+		if ctx.Err() == nil {
+			slog.Warn("stage locations failed", "error", err, "batch_size", len(s.batch))
+		}
 	}
 	s.batch = s.batch[:0]
 }
@@ -1872,10 +1948,11 @@ func runDirPipeline(
 	progress *loadProgress,
 	fileCh <-chan labeledPath,
 	stage bool,
-) {
+) error {
 	batch := make([]*hopper.Sample, 0, loadBatchSize)
 	batchKeys := make([]cacheKey, 0, loadBatchSize)
 	pathBySha := make(map[string]string, loadBatchSize)
+	var pipelineErr error
 
 	// On a reconcile pass every standalone file seen is staged for
 	// reconciliation, regardless of whether it also goes through the batch
@@ -1884,7 +1961,6 @@ func runDirPipeline(
 	var stager *walkStager
 	if stage {
 		stager = &walkStager{db: db}
-		defer stager.flush(ctx)
 	}
 
 	flush := func() {
@@ -1893,6 +1969,7 @@ func runDirPipeline(
 		}
 		n, _, err := db.InsertSampleBatch(ctx, batch)
 		if err != nil {
+			pipelineErr = errors.Join(pipelineErr, fmt.Errorf("insert batch in %s: %w", target.dir, err))
 			if ctx.Err() == nil {
 				progress.recordInsertFailure(int64(len(batch)), err)
 				slog.Error("batch insert failed", "error", err, "batch_size", len(batch), "dir", target.dir)
@@ -1941,10 +2018,16 @@ func runDirPipeline(
 				progress.tooSmall.Add(1)
 			case errors.Is(err, errTooLarge):
 				progress.tooLarge.Add(1)
+			case errors.Is(err, os.ErrNotExist):
+				// A cooperating mover can remove a file after enumeration but
+				// before hashFile stats/opens it. The next walk sees its destination;
+				// this is expected churn, not a hash or data-integrity failure.
+				slog.Debug("file disappeared before hashing", "path", lp.path)
 			default:
 				progress.hashErrors.Add(1)
 				progress.recordErrorf(1, "hash", "hash: %s: %v", filepath.Base(lp.path), err)
 				slog.Warn("hash failed", "path", lp.path, "error", err)
+				pipelineErr = errors.Join(pipelineErr, fmt.Errorf("hash %s: %w", lp.path, err))
 			}
 			continue
 		}
@@ -1993,6 +2076,12 @@ func runDirPipeline(
 			flush()
 		}
 	}
+	flush()
+	if stager != nil {
+		stager.flush(ctx)
+		pipelineErr = errors.Join(pipelineErr, stager.err)
+	}
+	return pipelineErr
 }
 
 // runQueueMaintenance runs the periodic background jobs that keep the pending
@@ -2664,10 +2753,10 @@ const legacyUnpkgScratchSuffix = "-unpkg-tmp.tgz"
 // under .tmp instead.
 const legacyPartialScratchPrefix = ".partial-"
 
-// drainoPartialPrefix names destination-side temporary hard links created
-// before Draino publishes a verified cross-filesystem copy. A crash may leave
-// one behind; it is recovery residue, never a distinct sample.
-const drainoPartialPrefix = ".draino-"
+// movePartialPrefixes name unpublished destination files left by interrupted
+// cross-filesystem moves. Keep the old Draino prefix during the transition so
+// stale recovery residue is never ingested as a distinct sample.
+var movePartialPrefixes = []string{".hopper-move-", ".draino-"}
 
 // isStagingPath reports whether path is a transient artifact that enumeration
 // must not ingest: anything inside a stagingDirName component, or a known
@@ -2679,18 +2768,30 @@ func isStagingPath(path string) bool {
 	if strings.HasPrefix(filepath.Base(path), legacyPartialScratchPrefix) {
 		return true
 	}
-	if strings.HasPrefix(filepath.Base(path), drainoPartialPrefix) {
-		return true
+	for _, prefix := range movePartialPrefixes {
+		if strings.HasPrefix(filepath.Base(path), prefix) {
+			return true
+		}
 	}
 	// Match stagingDirName as a whole path component, not a substring, so a
 	// legitimately-named file like "foo.tmp.tgz" is not skipped.
 	return slices.Contains(strings.Split(path, string(filepath.Separator)), stagingDirName)
 }
 
+// enumerationStream carries both streamed paths and the authoritative completion
+// status. Closing the paths channel says only that no more records are coming;
+// callers must also receive a nil error from done before using the walk to infer
+// absence.
+type enumerationStream struct {
+	paths <-chan labeledPath
+	done  <-chan error
+}
+
 // startEnumeration streams files under dir. A non-zero newerThan makes the
 // enumeration incremental: only files modified at or after it are emitted.
-func startEnumeration(ctx context.Context, dir string, newerThan time.Time) <-chan labeledPath {
+func startEnumeration(ctx context.Context, dir string, newerThan time.Time) enumerationStream {
 	ch := make(chan labeledPath, 4096)
+	done := make(chan error, 1)
 	go func() {
 		defer close(ch)
 		slog.Info("listing files", "dir", dir, "newer_than", newerThan)
@@ -2711,8 +2812,10 @@ func startEnumeration(ctx context.Context, dir string, newerThan time.Time) <-ch
 		if err != nil {
 			slog.Warn("list files failed", "dir", dir, "error", err)
 		}
+		done <- err
+		close(done)
 	}()
-	return ch
+	return enumerationStream{paths: ch, done: done}
 }
 
 // cleaveBinary is the path (or name, for $PATH lookup) of the cleave binary
@@ -2766,6 +2869,7 @@ func streamCleaveIterFiles(ctx context.Context, dir string, newerThan time.Time,
 
 	var emitted int
 	var stopped bool
+	var decodeErr error
 	dec := json.NewDecoder(stdout)
 	for dec.More() {
 		var rec struct {
@@ -2775,6 +2879,7 @@ func streamCleaveIterFiles(ctx context.Context, dir string, newerThan time.Time,
 		}
 		if err := dec.Decode(&rec); err != nil {
 			slog.Warn("cleave iter-files decode", "dir", dir, "error", err)
+			decodeErr = fmt.Errorf("decode output: %w", err)
 			break
 		}
 		if !emit(labeledPath{path: rec.Path, fileType: rec.FileType}) {
@@ -2790,17 +2895,20 @@ func streamCleaveIterFiles(ctx context.Context, dir string, newerThan time.Time,
 		_, _ = io.Copy(io.Discard, stdout) //nolint:errcheck // drained for shutdown, error expected
 	}
 
-	if err := cmd.Wait(); err != nil {
+	waitErr := cmd.Wait()
+	if waitErr != nil {
 		// Context cancellation is an orderly shutdown, not a cleave crash.
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return fmt.Errorf("cleave iter-files: %w", ctxErr)
 		}
 		stderrTail := tailBytes(stderrBuf.Bytes(), 2048)
-		if emitted == 0 {
-			return fmt.Errorf("cleave iter-files: %w (stderr: %s)", err, stderrTail)
-		}
 		slog.Warn("cleave iter-files exited with error",
-			"dir", dir, "error", err, "emitted", emitted, "stderr", stderrTail)
+			"dir", dir, "error", waitErr, "emitted", emitted, "stderr", stderrTail)
+		return errors.Join(decodeErr,
+			fmt.Errorf("cleave iter-files: %w (emitted=%d, stderr: %s)", waitErr, emitted, stderrTail))
+	}
+	if decodeErr != nil {
+		return fmt.Errorf("cleave iter-files: %w", decodeErr)
 	}
 	slog.Info("cleave iter-files complete",
 		"dir", dir, "files", emitted, "elapsed", time.Since(start).Round(time.Millisecond))
@@ -3884,6 +3992,7 @@ func cmdTriage(ctx context.Context) error {
 		{name: "bad", fetch: func(ctx context.Context, n int) ([]*hopper.Sample, error) { return db.TriageBad(ctx, n, filter) }},
 		{name: "good", fetch: func(ctx context.Context, n int) ([]*hopper.Sample, error) { return db.TriageGood(ctx, n, filter) }},
 		{name: "new", fetch: func(ctx context.Context, n int) ([]*hopper.Sample, error) { return db.TriageNew(ctx, n, filter) }},
+		{name: "review", fetch: func(ctx context.Context, n int) ([]*hopper.Sample, error) { return db.TriageReview(ctx, n, filter) }},
 	}
 
 	if err := os.RemoveAll(*out); err != nil {

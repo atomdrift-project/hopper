@@ -104,8 +104,12 @@ func TestStartEnumerationSkipsSidecars(t *testing.T) {
 	}
 
 	var got []string
-	for lp := range startEnumeration(context.Background(), dir, time.Time{}) {
+	stream := startEnumeration(context.Background(), dir, time.Time{})
+	for lp := range stream.paths {
 		got = append(got, filepath.Base(lp.path))
+	}
+	if err := <-stream.done; err != nil {
+		t.Fatal(err)
 	}
 
 	if len(got) != 1 || got[0] != "pkg-1.0.0.tar.gz" {
@@ -119,7 +123,7 @@ func TestStartEnumerationSkipsStaging(t *testing.T) {
 	sample := filepath.Join(dir, "pkg-1.0.0.tgz")
 	staged := filepath.Join(dir, stagingDirName, "pkg-unpkg.tgz")     // in a .tmp staging dir
 	legacy := filepath.Join(dir, "evil-pkg"+legacyUnpkgScratchSuffix) // pre-staging scratch name
-	drainoTemp := filepath.Join(dir, drainoPartialPrefix+"1234")
+	drainoTemp := filepath.Join(dir, movePartialPrefixes[0]+"1234")
 	mustMkdirAll(t, filepath.Dir(staged))
 	for _, p := range []string{sample, staged, legacy, drainoTemp} {
 		if err := os.WriteFile(p, []byte("data"), 0o644); err != nil {
@@ -128,8 +132,12 @@ func TestStartEnumerationSkipsStaging(t *testing.T) {
 	}
 
 	var got []string
-	for lp := range startEnumeration(context.Background(), dir, time.Time{}) {
+	stream := startEnumeration(context.Background(), dir, time.Time{})
+	for lp := range stream.paths {
 		got = append(got, filepath.Base(lp.path))
+	}
+	if err := <-stream.done; err != nil {
+		t.Fatal(err)
 	}
 
 	if len(got) != 1 || got[0] != "pkg-1.0.0.tgz" {
@@ -454,6 +462,56 @@ func TestHashCachePersistence(t *testing.T) {
 	}
 	if sha != "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234" {
 		t.Fatalf("persisted sha = %q", sha)
+	}
+}
+
+func TestHashCachePersistenceWithHighBitIdentifiers(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "cache.db")
+	const (
+		dev   = uint64(1)<<63 | 42
+		inode = ^uint64(0) - 17
+		want  = "1234567812345678123456781234567812345678123456781234567812345678"
+	)
+	c, err := openHashCache(t.Context(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.store(t.Context(), dev, inode, 2048, fixedTime(), want)
+	c.close(t.Context())
+
+	c, err = openHashCache(t.Context(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.close(t.Context())
+	got, _, ok := c.lookup(t.Context(), dev, inode, 2048, fixedTime())
+	if !ok || got != want {
+		t.Fatalf("high-bit cache lookup = %q, %v; want %q, true", got, ok, want)
+	}
+}
+
+func TestHashCacheRetainsBatchAfterCanceledFlush(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "cache.db")
+	const want = "abcdef01abcdef01abcdef01abcdef01abcdef01abcdef01abcdef01abcdef01"
+	c, err := openHashCache(t.Context(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.store(t.Context(), 7, 11, 4096, fixedTime(), want)
+
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	c.flush(canceled)
+	c.close(canceled)
+
+	c, err = openHashCache(t.Context(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.close(t.Context())
+	got, _, ok := c.lookup(t.Context(), 7, 11, 4096, fixedTime())
+	if !ok || got != want {
+		t.Fatalf("cache lookup after retry = %q, %v; want %q, true", got, ok, want)
 	}
 }
 
@@ -1240,6 +1298,58 @@ func TestLoadDirWithCache(t *testing.T) {
 	n2 := loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, cache, []struct{ dir, label string }{{dir, "bad"}}, nil, "test", 1, false, 0, "", nil, "", 0)
 	if n2 != 1 { // 1 total (0 inserted + 1 skipped)
 		t.Errorf("second load = %d, want 1", n2)
+	}
+}
+
+func TestLoadSkipsReconcileAfterEnumerationFailure(t *testing.T) {
+	ctx := t.Context()
+	db, err := hopper.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	good := filepath.Join(root, "good")
+	if err := os.Mkdir(good, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("a", 64)
+	if err := db.InsertSample(ctx, &hopper.Sample{SHA256: sha, Path: "good/gone.bin", Label: "good"}); err != nil {
+		t.Fatal(err)
+	}
+
+	original := pathLister
+	pathLister = func(context.Context, string, time.Time, func(labeledPath) bool) error {
+		return errors.New("injected listing failure")
+	}
+	t.Cleanup(func() { pathLister = original })
+
+	loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil,
+		[]struct{ dir, label string }{{good, "good"}}, nil,
+		"test", 1, false, 0, "", nil, "", 0)
+	got, err := db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Skip != "" {
+		t.Fatalf("skip = %q after failed enumeration, want unchanged", got.Skip)
+	}
+}
+
+func TestValidateRequiredMountsFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "incoming"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := mountPointProbe
+	mountPointProbe = func(string) (bool, string, error) { return false, "", nil }
+	t.Cleanup(func() { mountPointProbe = original })
+	if err := validateRequiredMounts(root, []string{"incoming"}); err == nil {
+		t.Fatal("expected an ordinary directory to fail the required-mount check")
 	}
 }
 

@@ -16,8 +16,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/atomdrift-project/hopper"
@@ -46,8 +46,66 @@ const (
 	defaultMisplacedBad  = "/tmp/triage/misplaced-bad"
 	// maxTriageVerdicts caps a single /api/triage request. Triage runs move
 	// dozens of files; this is a generous backstop against a malformed batch.
-	maxTriageVerdicts = 10_000
+	maxTriageVerdicts    = 10_000
+	maxIncomingLocations = 1_000
 )
+
+type incomingLocation struct {
+	Mtime  time.Time `json:"mtime"`
+	SHA256 string    `json:"sha256"`
+	Path   string    `json:"path"`
+}
+
+type incomingLocationsResponse struct {
+	Locations []incomingLocation `json:"locations"`
+}
+
+// handleIncomingLocations exposes a bounded, oldest-first work feed for the
+// hot-pool controller. It returns exact catalog paths so a later move is a
+// compare-and-swap against one physical observation, not samples.path.
+func (s *apiServer) handleIncomingLocations(w http.ResponseWriter, r *http.Request) {
+	if err := s.checkUploadAuth(r); err != nil {
+		writeJSONError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	before := time.Now().UTC()
+	if raw := r.URL.Query().Get("before"); raw != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid before timestamp")
+			return
+		}
+		before = parsed
+	}
+	limit := 128
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 || parsed > maxIncomingLocations {
+			writeJSONError(w, http.StatusBadRequest, "limit must be between 1 and 1000")
+			return
+		}
+		limit = parsed
+	}
+	locations, err := s.db.OldestIncomingLocations(r.Context(), before, limit)
+	if err != nil {
+		slog.Error("list incoming locations failed", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "server error")
+		return
+	}
+	resp := incomingLocationsResponse{Locations: make([]incomingLocation, 0, len(locations))}
+	for _, loc := range locations {
+		if loc.Mtime == nil {
+			continue
+		}
+		resp.Locations = append(resp.Locations, incomingLocation{
+			Mtime:  loc.Mtime.UTC(),
+			SHA256: loc.SHA256,
+			Path:   loc.Path,
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp) //nolint:errcheck,errchkjson // best-effort response
+}
 
 // triageVerdict is one corrected classification for the sample identified by
 // SHA256. Exactly one of Verdict or Ruling is set:
@@ -65,7 +123,8 @@ type triageVerdict struct {
 	SHA256  string `json:"sha256"`
 	Verdict string `json:"verdict,omitempty"`
 	Ruling  string `json:"ruling,omitempty"`
-	Source  string `json:"source,omitempty"` // overrides the recorded label_source (e.g. "cyclotron:bad")
+	Source  string `json:"source,omitempty"`   // overrides the recorded label_source (e.g. "cyclotron:bad")
+	OldPath string `json:"old_path,omitempty"` // exact catalog location; required by storage lifecycle clients
 }
 
 // Promotion pool layout. hopper owns where a ruled sample lands; the client
@@ -124,9 +183,6 @@ type placement struct {
 	newRel string
 	label  string
 	source string
-	// workflow is true for path-only queue moves inside unknown-class storage
-	// roots. The DB label/source/skip are preserved for these moves.
-	workflow bool
 }
 
 // rulingPlan resolves a promoter ruling to its placement: the destination path
@@ -151,9 +207,9 @@ func rulingPlan(_ *hopper.Sample, oldRel, ruling string) (placement, bool) {
 	case "sighted":
 		return placement{newRel: filepath.Join(sightedTree, sub), label: "sighted", source: "promoter"}, true
 	case "pending":
-		return workflowPlan(oldRel, pendingPool), true
+		return workflowPlan(oldRel, pendingPool)
 	case "review":
-		return workflowPlan(oldRel, reviewPool), true
+		return workflowPlan(oldRel, reviewPool)
 	}
 	return placement{}, false
 }
@@ -161,20 +217,12 @@ func rulingPlan(_ *hopper.Sample, oldRel, ruling string) (placement, bool) {
 // workflowPlan moves an unknown-class sample between workflow pools while
 // preserving the source suffix below the workflow root. It deliberately has no
 // producer-specific cases: review/foraged is just review/<suffix>.
-func workflowPlan(oldRel, dstRoot string) placement {
-	sub := filepath.Base(oldRel)
-	for _, root := range []string{
-		pendingPool + "/",
-		reviewPool + "/",
-		uploadBucket + "/",
-		legacyUnknownPool + "/",
-	} {
-		if rest, ok := strings.CutPrefix(oldRel, root); ok {
-			sub = rest
-			break
-		}
+func workflowPlan(oldRel, dstRoot string) (placement, bool) {
+	newRel, err := hopper.RebasePoolPath(filepath.ToSlash(oldRel), dstRoot)
+	if err != nil {
+		return placement{}, false
 	}
-	return placement{newRel: filepath.Join(dstRoot, sub), label: "unknown", workflow: true}
+	return placement{newRel: filepath.FromSlash(newRel)}, true
 }
 
 // triageRequest is the JSON body for POST /api/triage.
@@ -190,11 +238,13 @@ type triageRequest struct {
 // this host — a partial mirror; the verdict is deferred, re-submit once the
 // full corpus is attached), or "error".
 type triageResult struct {
-	SHA256  string `json:"sha256"`
-	Status  string `json:"status"`
-	OldPath string `json:"old_path,omitempty"`
-	NewPath string `json:"new_path,omitempty"`
-	Error   string `json:"error,omitempty"`
+	SHA256        string `json:"sha256"`
+	Status        string `json:"status"`
+	OldPath       string `json:"old_path,omitempty"`
+	NewPath       string `json:"new_path,omitempty"`
+	Error         string `json:"error,omitempty"`
+	BytesFreed    int64  `json:"bytes_freed,omitempty"`
+	SourceRemoved bool   `json:"source_removed,omitempty"`
 }
 
 // triageResponse is the JSON body returned by POST /api/triage.
@@ -260,11 +310,8 @@ func (s *apiServer) handleTriage(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp) //nolint:errcheck,errchkjson // best-effort response
 }
 
-// relocateTriaged moves one sample into its corrected location and updates its
-// DB label+path atomically. It is idempotent: a sample already at its
-// destination returns "noop" so re-running a batch is safe. It serves both the
-// operator verdict flow (mislabeled bucket) and promoter's ruling flow (pool
-// tree with preserved subpath); triagePlan resolves which.
+// relocateTriaged resolves one exact catalog location, then delegates the
+// durable filesystem and catalog transition to hopper.DB.MoveLocation.
 func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun bool) triageResult {
 	res := triageResult{SHA256: v.SHA256}
 	sha := strings.ToLower(strings.TrimSpace(v.SHA256))
@@ -287,30 +334,29 @@ func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun
 		res.Status, res.Error = "error", err.Error()
 		return res
 	}
-	if samp.Path == "" {
+	if samp.Path == "" && v.OldPath == "" {
 		res.Status, res.Error = "not_found", "sample has no on-disk path"
 		return res
 	}
 
-	oldRel := relativeSamplePath(s.dataRoot, samp.Path)
-	oldAbs := sampleDiskPath(s.dataRoot, oldRel)
+	oldRel := v.OldPath
+	if oldRel == "" {
+		oldRel = relativeSamplePath(s.dataRoot, samp.Path)
+	}
 	res.OldPath = oldRel
 
-	// Idempotency: a sample already at its destination is a no-op, so retries
-	// and re-runs are safe. good/bad are recognized by their terminal label.
-	// Keying on label/tree (not recomputed path equality) stays correct after
-	// the move, when the subpath no longer starts at the source root.
-	switch {
-	case v.Verdict != "" && samp.Label == v.Verdict,
-		v.Ruling == "good" && samp.Label == "good",
-		v.Ruling == "bad" && samp.Label == "bad",
-		// "sighted" is additionally tree-aware: a row can be labeled sighted
-		// with its file still outside the sighted pool (forager's
-		// version-matched purl re-flag relabels DB-only), and the ruling is
-		// how the file catches up — so label alone must not short-circuit.
-		v.Ruling == "sighted" && samp.Label == "sighted" && strings.HasPrefix(oldRel, sightedTree+"/"):
-		res.Status = "noop"
-		return res
+	if v.OldPath == "" {
+		// Stateless clients omit old_path and can use the terminal label/tree as
+		// their idempotency key. Exact-location clients retain the old row until
+		// source cleanup, so they must proceed through MoveLocation on retries.
+		switch {
+		case v.Verdict != "" && samp.Label == v.Verdict,
+			v.Ruling == "good" && samp.Label == "good",
+			v.Ruling == "bad" && samp.Label == "bad",
+			v.Ruling == "sighted" && samp.Label == "sighted" && strings.HasPrefix(oldRel, sightedTree+"/"):
+			res.Status = "noop"
+			return res
+		}
 	}
 
 	plan, err := s.triagePlan(samp, oldRel, v)
@@ -319,121 +365,117 @@ func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun
 		return res
 	}
 	res.NewPath = plan.newRel
-	if plan.workflow && oldRel == plan.newRel {
+	if oldRel == plan.newRel {
 		res.Status = "noop"
 		return res
 	}
 
-	// A partial mirror may hold the row without the bytes. Deliberately do
-	// NOT relabel DB-only: the pool directory is ground truth, and a label
-	// that contradicts where the bytes actually sit would be flipped back by
-	// the next load walk over the full corpus (pool precedence). The verdict
-	// is simply deferred until it is re-submitted on a host with the file.
-	if _, statErr := os.Stat(oldAbs); errors.Is(statErr, os.ErrNotExist) { //nolint:gosec // G703: oldAbs is a DB sample path rooted at dataRoot
-		res.Status, res.Error = "absent", "bytes not on this host; re-submit once the full corpus is attached"
-		return res
+	// Classification destinations may already contain a different package build
+	// with the same human-readable path. Preserve both using a deterministic
+	// SHA suffix. Workflow moves preserve the exact suffix and treat a conflict
+	// as an invariant violation.
+	if plan.label != "" {
+		newAbs, err := s.resolveDataPath(plan.newRel)
+		if err != nil {
+			res.Status, res.Error = "error", err.Error()
+			return res
+		}
+		if exists, statErr := pathExists(newAbs); statErr != nil {
+			res.Status, res.Error = "error", "stat destination: "+statErr.Error()
+			return res
+		} else if exists {
+			same, hashErr := fileMatchesSHA256(newAbs, sha)
+			if hashErr != nil {
+				res.Status, res.Error = "error", "hash destination: "+hashErr.Error()
+				return res
+			}
+			if !same {
+				plan.newRel = shaSuffixedRel(plan.newRel, sha)
+				res.NewPath = plan.newRel
+			}
+		}
 	}
 
+	oldAbs, err := s.resolveDataPath(oldRel)
+	if err != nil {
+		res.Status, res.Error = "error", err.Error()
+		return res
+	}
 	newAbs, err := s.resolveDataPath(plan.newRel)
 	if err != nil {
 		res.Status, res.Error = "error", err.Error()
 		return res
 	}
 
-	if dryRun {
-		res.Status = "plan"
-		return res
-	}
-	locked, err := lockSamplePath(ctx, oldAbs)
-	if err != nil {
-		res.Status, res.Error = "error", "lock source: "+err.Error()
-		return res
-	}
-	defer locked.Close() //nolint:errcheck // releases the advisory lock
-	lockedInfo, err := locked.Stat()
-	if err != nil {
-		res.Status, res.Error = "error", "stat locked source: "+err.Error()
-		return res
-	}
-	currentInfo, err := os.Stat(oldAbs) //nolint:gosec // G703: path resolved within dataRoot
-	if err != nil || !os.SameFile(lockedInfo, currentInfo) {
-		res.Status, res.Error = "error", "sample path changed while waiting for lock; retry"
-		return res
-	}
-
-	// The destination may already be occupied: forager re-fetches package
-	// builds whose bytes differ but whose tree path is identical, and pool
-	// files are stored read-only, so a blind copy-over fails EACCES on every
-	// retry instead of overwriting — the verdict then never applies and the
-	// sample churns through triage forever. Same bytes → the move already
-	// happened, just drop the source. Different bytes → keep both by
-	// sha-suffixing this sample's basename (the operator-verdict collision
-	// rule); that slot is keyed by this sha, so whatever occupies it is ours
-	// (at worst a truncated leftover) and is simply cleared and rewritten.
-	adopt := false
-	if exists, statErr := pathExists(newAbs); statErr != nil {
-		res.Status, res.Error = "error", "stat destination: "+statErr.Error()
-		return res
-	} else if exists {
-		same, hashErr := fileMatchesSHA256(newAbs, sha)
-		if hashErr != nil {
-			res.Status, res.Error = "error", "hash destination: "+hashErr.Error()
-			return res
-		}
-		adopt = same
-		if !same {
-			plan.newRel = shaSuffixedRel(plan.newRel, sha)
-			res.NewPath = plan.newRel
-			if newAbs, err = s.resolveDataPath(plan.newRel); err != nil {
-				res.Status, res.Error = "error", err.Error()
-				return res
-			}
-			//nolint:gosec // G703: newAbs was confined to dataRoot by resolveDataPath
-			if err := os.Remove(newAbs); err != nil && !errors.Is(err, os.ErrNotExist) {
-				res.Status, res.Error = "error", "clear suffixed slot: "+err.Error()
-				return res
-			}
-		}
-	}
-	if adopt {
-		if err := os.Remove(oldAbs); err != nil { //nolint:gosec // G703: oldAbs is a DB sample path rooted at dataRoot
-			res.Status, res.Error = "error", "remove source after adopt: "+err.Error()
-			return res
-		}
-	} else {
-		if err := mkdirSharedAll(filepath.Dir(newAbs)); err != nil {
-			res.Status, res.Error = "error", "mkdir: "+err.Error()
-			return res
-		}
-		if err := moveSample(oldAbs, newAbs); err != nil {
-			res.Status, res.Error = "error", "move: "+err.Error()
-			return res
-		}
-	}
-	// The DB is now authoritative; drop any stale litmus markers left beside the
-	// old location so a future walk can't resurrect the wrong label.
-	removeMarkers(oldAbs)
-
-	if plan.workflow {
-		moved, err := s.db.RelocateLocation(ctx, sha, oldRel, plan.newRel)
+	if v.OldPath != "" {
+		locations, err := s.db.LocationsForSHA(ctx, sha)
 		if err != nil {
-			res.Status, res.Error = "error", "db relocate: "+err.Error()
+			res.Status, res.Error = "error", "lookup locations: "+err.Error()
 			return res
 		}
-		if !moved {
-			res.Status, res.Error = "error", "db relocate: source location missing"
+		var oldRecorded, newRecorded bool
+		for _, loc := range locations {
+			if loc.ParentSHA256 != "" {
+				continue
+			}
+			oldRecorded = oldRecorded || loc.Path == oldRel
+			newRecorded = newRecorded || loc.Path == plan.newRel
+		}
+		if !oldRecorded && !newRecorded {
+			res.Status, res.Error = "not_found", "exact source location is not recorded"
 			return res
 		}
-		res.Status = "moved"
+	}
+
+	oldExists, err := pathExists(oldAbs)
+	if err != nil {
+		res.Status, res.Error = "error", "stat source: "+err.Error()
+		return res
+	}
+	newExists, err := pathExists(newAbs)
+	if err != nil {
+		res.Status, res.Error = "error", "stat destination: "+err.Error()
+		return res
+	}
+	if !oldExists && !newExists {
+		res.Status, res.Error = "absent", "bytes not on this host; re-submit once the full corpus is attached"
 		return res
 	}
 
-	if err := s.db.RelocateSample(ctx, sha, oldRel, plan.newRel, plan.label, plan.source); err != nil {
-		// The bytes already moved; report the error but leave them in place —
-		// the next load walk will reconcile the DB from the new pool location.
-		res.Status, res.Error = "error", "db relocate: "+err.Error()
+	if dryRun {
+		if !oldExists && newExists {
+			res.Status = "noop"
+		} else {
+			res.Status = "plan"
+		}
 		return res
 	}
+
+	// A decision supersedes any filesystem marker at the old location. Removing
+	// it before prepare prevents a crash from leaving contradictory metadata
+	// beside the retained source location.
+	removeMarkers(oldAbs)
+	var relabel *hopper.LocationRelabel
+	if plan.label != "" {
+		relabel = &hopper.LocationRelabel{Label: plan.label, Source: plan.source}
+	}
+	result, err := s.db.MoveLocation(ctx, hopper.MoveLocationOptions{
+		DataRoot: s.dataRoot,
+		SHA256:   sha,
+		OldPath:  oldRel,
+		NewPath:  plan.newRel,
+		Relabel:  relabel,
+	})
+	if err != nil {
+		res.Status, res.Error = "error", "move location: "+err.Error()
+		return res
+	}
+	if !result.Relocated {
+		res.Status, res.Error = "error", "move location did not record destination"
+		return res
+	}
+	res.BytesFreed = result.BytesFreed
+	res.SourceRemoved = result.SourceRemoved
 	res.Status = "moved"
 	return res
 }
@@ -447,7 +489,7 @@ func (s *apiServer) triagePlan(samp *hopper.Sample, oldRel string, v triageVerdi
 		if !ok {
 			return placement{}, errors.New(`ruling must be "good", "bad", "sighted", "pending", or "review"`)
 		}
-		if plan.workflow && samp.Label != "unknown" {
+		if (v.Ruling == "pending" || v.Ruling == "review") && samp.Label != "unknown" {
 			return placement{}, errors.New(`workflow ruling requires label "unknown"`)
 		}
 		// A client-supplied source attributes the relabel to its author (e.g.
@@ -471,17 +513,6 @@ func (s *apiServer) triagePlan(samp *hopper.Sample, oldRel string, v triageVerdi
 		wrong = "unknown"
 	}
 	newRel := filepath.Join(v.Verdict, "mislabeled-"+wrong, filepath.Base(oldRel))
-	newAbs, err := s.resolveDataPath(newRel)
-	if err != nil {
-		return placement{}, err
-	}
-	// Disambiguate a basename collision in the flat bucket by suffixing the sha;
-	// keeps the bucket human-browsable while staying unique.
-	if collides, err := pathExists(newAbs); err != nil {
-		return placement{}, err
-	} else if collides {
-		newRel = shaSuffixedRel(newRel, samp.SHA256)
-	}
 	return placement{newRel: newRel, label: v.Verdict, source: "triage"}, nil
 }
 
@@ -492,34 +523,6 @@ func shaSuffixedRel(rel, sha string) string {
 	dir, base := filepath.Split(rel)
 	ext := filepath.Ext(base)
 	return filepath.Join(dir, strings.TrimSuffix(base, ext)+"."+sha[:12]+ext)
-}
-
-// lockSamplePath serializes physical moves of one inode across Hopper and
-// Draino. The nonblocking retry keeps request cancellation responsive while a
-// large cross-filesystem copy holds the lock.
-func lockSamplePath(ctx context.Context, name string) (*os.File, error) {
-	f, err := os.Open(name) //nolint:gosec // path resolved within dataRoot
-	if err != nil {
-		return nil, err
-	}
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-		if err == nil {
-			return f, nil
-		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
-			f.Close() //nolint:errcheck
-			return nil, err
-		}
-		select {
-		case <-ctx.Done():
-			f.Close() //nolint:errcheck
-			return nil, ctx.Err()
-		case <-ticker.C:
-		}
-	}
 }
 
 // fileMatchesSHA256 reports whether path's content hashes to sha
@@ -535,54 +538,6 @@ func fileMatchesSHA256(path, sha string) (bool, error) {
 		return false, err
 	}
 	return hex.EncodeToString(h.Sum(nil)) == sha, nil
-}
-
-// moveSample relocates a sample file between pool trees. It tries an atomic
-// rename and falls back to copy-then-remove across filesystem boundaries: the
-// good/, bad/, and unknown/ pools live on separate filesystems, so a cross-pool
-// move yields EXDEV. The destination's parent directory must already exist.
-//
-//nolint:gosec // G703: oldAbs/newAbs are sample paths the caller resolved within dataRoot
-func moveSample(oldAbs, newAbs string) error {
-	if err := os.Rename(oldAbs, newAbs); err == nil {
-		return nil
-	} else if !errors.Is(err, syscall.EXDEV) {
-		return fmt.Errorf("rename: %w", err)
-	}
-	if err := copySample(oldAbs, newAbs); err != nil {
-		return err
-	}
-	if err := os.Remove(oldAbs); err != nil {
-		return fmt.Errorf("remove source after copy: %w", err)
-	}
-	return nil
-}
-
-// copySample streams src to dst, truncating any existing destination and
-// preserving src's permission bits.
-func copySample(src, dst string) error {
-	in, err := os.Open(src) //nolint:gosec // src is a sample path resolved within dataRoot
-	if err != nil {
-		return fmt.Errorf("open source: %w", err)
-	}
-	defer in.Close() //nolint:errcheck // read-only handle
-	info, err := in.Stat()
-	if err != nil {
-		return fmt.Errorf("stat source: %w", err)
-	}
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode()) //nolint:gosec // dst resolved within dataRoot
-	if err != nil {
-		return fmt.Errorf("create destination: %w", err)
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()    //nolint:errcheck // already failing
-		_ = os.Remove(dst) //nolint:errcheck,gosec // best-effort cleanup; G703: dst resolved within dataRoot
-		return fmt.Errorf("copy: %w", err)
-	}
-	if err := out.Close(); err != nil {
-		return fmt.Errorf("close destination: %w", err)
-	}
-	return nil
 }
 
 // pathExists reports whether path exists, distinguishing a real stat error

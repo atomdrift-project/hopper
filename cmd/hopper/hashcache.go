@@ -106,10 +106,12 @@ func (c *hashCache) load(ctx context.Context) error {
 
 	for rows.Next() {
 		var k cacheKey
+		var dev, inode int64
 		var shaHex string
-		if err := rows.Scan(&k.dev, &k.inode, &k.size, &k.mtime, &shaHex); err != nil {
+		if err := rows.Scan(&dev, &inode, &k.size, &k.mtime, &shaHex); err != nil {
 			return fmt.Errorf("hashcache: scan: %w", err)
 		}
+		k.dev, k.inode = uint64(dev), uint64(inode)
 		var sha [32]byte
 		if _, err := hex.Decode(sha[:], []byte(shaHex)); err != nil {
 			return fmt.Errorf("hashcache: decode sha: %w", err)
@@ -142,7 +144,7 @@ func (c *hashCache) lookup(ctx context.Context, dev, inode uint64, size int64, m
 	var shaHex string
 	err := c.db.QueryRowContext(ctx,
 		`SELECT sha256 FROM hash_cache WHERE dev = ? AND inode = ? AND size = ? AND mtime = ?`,
-		dev, inode, size, k.mtime).Scan(&shaHex)
+		sqliteID(dev), sqliteID(inode), size, k.mtime).Scan(&shaHex)
 	if err != nil {
 		return "", false, false
 	}
@@ -216,6 +218,7 @@ func (c *hashCache) flush(ctx context.Context) {
 
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
+		c.requeue(batch)
 		slog.Warn("hashcache: begin tx", "error", err)
 		return
 	}
@@ -225,6 +228,7 @@ func (c *hashCache) flush(ctx context.Context) {
 		if rollbackErr := tx.Rollback(); rollbackErr != nil {
 			slog.Warn("hashcache: rollback after prepare failure", "error", rollbackErr)
 		}
+		c.requeue(batch)
 		slog.Warn("hashcache: prepare", "error", err)
 		return
 	}
@@ -239,18 +243,40 @@ func (c *hashCache) flush(ctx context.Context) {
 			ins = 1
 		}
 		if _, execErr := stmt.ExecContext(ctx,
-			e.key.dev, e.key.inode, e.key.size, e.key.mtime, hex.EncodeToString(e.sha256[:]), ins); execErr != nil {
-			slog.Warn("hashcache: exec", "error", execErr)
+			sqliteID(e.key.dev), sqliteID(e.key.inode), e.key.size, e.key.mtime, hex.EncodeToString(e.sha256[:]), ins); execErr != nil {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil {
+				slog.Warn("hashcache: rollback after write failure", "error", rollbackErr)
+			}
+			c.requeue(batch)
+			slog.Warn("hashcache: batch write failed; retained for retry", "total", len(batch), "error", execErr)
+			return
 		}
 	}
 	if err := tx.Commit(); err != nil {
+		c.requeue(batch)
 		slog.Warn("hashcache: commit", "error", err)
 	}
 }
 
+// requeue restores a failed batch ahead of entries accumulated while it was
+// being written. Keeping the older entries first means a newer update for the
+// same filesystem identity is applied last and remains authoritative.
+func (c *hashCache) requeue(batch []dirtyEntry) {
+	c.mu.Lock()
+	c.dirty = append(batch, c.dirty...)
+	c.mu.Unlock()
+}
+
+// sqliteID maps an opaque unsigned filesystem identifier into SQLite's signed
+// INTEGER domain without losing bits. Casting back to uint64 on load restores
+// the exact device/inode value, including IDs whose high bit is set on ZFS.
+func sqliteID(v uint64) int64 { return int64(v) }
+
 // close flushes remaining entries and closes the database.
 func (c *hashCache) close(ctx context.Context) {
-	c.flush(ctx)
+	// Shutdown normally follows cancellation of the load context. Cache writes
+	// are local and idempotent, so let the final flush finish independently.
+	c.flush(context.WithoutCancel(ctx))
 	if c.db != nil {
 		if err := c.db.Close(); err != nil {
 			slog.Warn("hashcache: close", "error", err)
