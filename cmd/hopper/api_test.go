@@ -920,10 +920,9 @@ func TestCheckBrowserCSRF(t *testing.T) {
 		{"raw upload octet-stream", "same-origin", "application/octet-stream", true},
 		{"cross-site blocked", "cross-site", "application/octet-stream", false},
 		{"form-urlencoded blocked", "same-origin", "application/x-www-form-urlencoded", false},
-		// multipart carries the provenance envelope from Bearer-authed clients
-		// (forager, prism backend); auth runs before this guard, so a browser
-		// form cannot reach the store. Same-origin multipart is allowed; a
-		// cross-site one is still blocked by the Sec-Fetch-Site check above.
+		// Multipart carries the provenance envelope from forager and scan.
+		// Same-origin multipart is allowed; a cross-site one is still blocked
+		// by the Sec-Fetch-Site check above.
 		{"multipart allowed (provenance upload)", "same-origin", "multipart/form-data; boundary=xyz", true},
 		{"multipart cross-site blocked", "cross-site", "multipart/form-data; boundary=xyz", false},
 		{"text/plain blocked (CORS simple)", "same-origin", "text/plain", false},
@@ -944,123 +943,6 @@ func TestCheckBrowserCSRF(t *testing.T) {
 				t.Errorf("checkBrowserCSRF ok = %v, want %v", gotOK, tc.wantOK)
 			}
 		})
-	}
-}
-
-func TestHandleUploadAuth(t *testing.T) {
-	t.Parallel()
-	api := &apiServer{
-		tracker:  newWorkerTracker(),
-		dataRoot: t.TempDir(),
-	}
-	if err := api.setUploadToken("test-token-with-32-chars-or-more!!"); err != nil {
-		t.Fatalf("setUploadToken rejected the test token: %v", err)
-	}
-	// Stub db to non-nil so we get past the "starting" guard. Auth runs
-	// before any DB access, so a nil pool is fine here.
-	api.db = &hopper.DB{}
-
-	check := func(name, auth string, wantCode int) {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			r := httptest.NewRequest(http.MethodPost, "/api/upload", strings.NewReader("x"))
-			if auth != "" {
-				r.Header.Set("Authorization", auth)
-			}
-			r.Header.Set("Content-Type", "application/octet-stream")
-			r.ContentLength = 1
-			w := httptest.NewRecorder()
-			api.handleUpload(w, r)
-			if w.Code != wantCode {
-				t.Errorf("code=%d body=%s want=%d", w.Code, w.Body.String(), wantCode)
-			}
-		})
-	}
-
-	// Every rejected request returns the same Unauthorized status and the
-	// same body shape so an attacker cannot distinguish "wrong scheme"
-	// from "wrong-length token" from "right-length but wrong bytes". The
-	// reason-string is only logged, not echoed.
-	check("missing header", "", http.StatusUnauthorized)
-	check("wrong scheme", "Basic foo", http.StatusUnauthorized)
-	check("wrong token correct length", "Bearer not-the-right-token-value-okay-but-32-plus", http.StatusUnauthorized)
-	check("wrong token short", "Bearer short", http.StatusUnauthorized)
-	check("empty bearer value", "Bearer ", http.StatusUnauthorized)
-
-	t.Run("open when no token configured", func(t *testing.T) {
-		t.Parallel()
-		// With no token set the endpoint is open: auth passes regardless of (or
-		// without) an Authorization header, so an internal client can push content
-		// without shared-secret plumbing. The browser CSRF guard, checked later in
-		// the handler, is the remaining gate.
-		api2 := &apiServer{tracker: newWorkerTracker(), dataRoot: t.TempDir()}
-		if err := api2.checkUploadAuth(httptest.NewRequest(http.MethodPost, "/api/upload", http.NoBody)); err != nil {
-			t.Errorf("checkUploadAuth with no token configured = %v, want nil (open)", err)
-		}
-	})
-}
-
-func TestSetUploadTokenRejectsShortTokens(t *testing.T) {
-	t.Parallel()
-	api := &apiServer{}
-	if err := api.setUploadToken(""); err == nil {
-		t.Error("empty token accepted")
-	}
-	if err := api.setUploadToken(strings.Repeat("a", uploadTokenMinLen-1)); err == nil {
-		t.Error("token one byte too short accepted")
-	}
-	if err := api.setUploadToken(strings.Repeat("a", uploadTokenMinLen)); err != nil {
-		t.Errorf("minimum-length token rejected: %v", err)
-	}
-	if !api.uploadTokenSet {
-		t.Error("uploadTokenSet false after successful setUploadToken")
-	}
-}
-
-func TestCheckUploadAuthConstantShape(t *testing.T) {
-	t.Parallel()
-	api := &apiServer{}
-	if err := api.setUploadToken("the-correct-token-with-32-or-more!"); err != nil {
-		t.Fatalf("setUploadToken rejected the fixture: %v", err)
-	}
-
-	mkReq := func(authHeader string) *http.Request {
-		r := httptest.NewRequest(http.MethodPost, "/api/upload", http.NoBody)
-		if authHeader != "" {
-			r.Header.Set("Authorization", authHeader)
-		}
-		return r
-	}
-
-	// Negative cases of varying lengths — all must return a non-nil error.
-	bads := []string{
-		"",
-		"Basic xyz",
-		"Bearer ",
-		"Bearer a",
-		"Bearer " + strings.Repeat("x", 1),
-		"Bearer " + strings.Repeat("x", 32),
-		"Bearer " + strings.Repeat("x", 1024),
-		"Bearer the-correct-token-with-32-or-more!!", // one byte off
-	}
-	for _, h := range bads {
-		if err := api.checkUploadAuth(mkReq(h)); err == nil {
-			t.Errorf("bad auth header accepted: %q", h)
-		}
-	}
-
-	// Positive: the literal correct token passes.
-	if err := api.checkUploadAuth(mkReq("Bearer the-correct-token-with-32-or-more!")); err != nil {
-		t.Errorf("correct token rejected: %v", err)
-	}
-
-	// Plaintext is not retained: the stored 32-byte field must not be the
-	// raw bytes of the token (taking the first 32 chars of the plaintext).
-	// Defence-in-depth: catches a regression where someone "optimizes"
-	// setUploadToken to keep the plaintext.
-	plain := "the-correct-token-with-32-or-more!"
-	if string(api.uploadTokenHash[:]) == plain[:sha256.Size] {
-		t.Error("uploadTokenHash appears to contain the plaintext token")
 	}
 }
 
@@ -1127,145 +1009,12 @@ func TestSweepUploadTmp(t *testing.T) {
 	}
 }
 
-func TestBootstrapUploadTokenFromEnv(t *testing.T) {
-	t.Setenv("HOPPER_UPLOAD_TOKEN", "env-supplied-token-32-bytes-long!")
-	ctx := t.Context()
-	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "bs.db"))
-	defer db.Close()
-	if err := db.Migrate(ctx); err != nil {
-		t.Fatal(err)
-	}
-	api := &apiServer{tracker: newWorkerTracker()}
-
-	bootstrapUploadToken(ctx, api, db)
-
-	if !api.uploadTokenSet {
-		t.Fatal("uploadTokenSet false after env bootstrap")
-	}
-	stored, err := db.KVGet(ctx, uploadTokenKVKey)
-	if err != nil || stored != "env-supplied-token-32-bytes-long!" {
-		t.Errorf("env token was not persisted: got=%q err=%v", stored, err)
-	}
-}
-
-func TestBootstrapUploadTokenFromEnvRotatesPersistedValue(t *testing.T) {
-	t.Setenv("HOPPER_UPLOAD_TOKEN", "replacement-token-at-least-32-bytes!")
-	ctx := t.Context()
-	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "bs.db"))
-	defer db.Close()
-	if err := db.Migrate(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.KVSetIfAbsent(ctx, uploadTokenKVKey, "old-persisted-token-at-least-32-bytes"); err != nil {
-		t.Fatal(err)
-	}
-	api := &apiServer{tracker: newWorkerTracker()}
-
-	bootstrapUploadToken(ctx, api, db)
-
-	stored, err := db.KVGet(ctx, uploadTokenKVKey)
-	if err != nil || stored != "replacement-token-at-least-32-bytes!" {
-		t.Fatalf("persisted token = %q, %v", stored, err)
-	}
-	if sum := sha256.Sum256([]byte(stored)); !api.uploadTokenSet || sum != api.uploadTokenHash {
-		t.Fatal("API token does not match rotated persisted token")
-	}
-}
-
-func TestBootstrapUploadTokenOpenMode(t *testing.T) {
-	t.Setenv("HOPPER_UPLOAD_OPEN", "1")
-	// A token in the env must not override open mode — open is checked first.
-	t.Setenv("HOPPER_UPLOAD_TOKEN", "would-be-token-32-bytes-or-more!!")
-	ctx := t.Context()
-	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "bs.db"))
-	defer db.Close()
-	if err := db.Migrate(ctx); err != nil {
-		t.Fatal(err)
-	}
-	api := &apiServer{tracker: newWorkerTracker()}
-
-	bootstrapUploadToken(ctx, api, db)
-
-	// Open: the endpoint is not enforced, so a tokenless push is accepted.
-	if api.uploadTokenSet {
-		t.Fatal("uploadTokenSet true under HOPPER_UPLOAD_OPEN; /api/upload should be open")
-	}
-	// But a token is still provisioned in the KV, so prism (which reads it) keeps
-	// working and dropping open mode later re-enforces this same token.
-	stored, err := db.KVGet(ctx, uploadTokenKVKey)
-	if err != nil {
-		t.Fatalf("open mode did not provision a KV token: %v", err)
-	}
-	if stored == "" {
-		t.Error("provisioned upload token is empty")
-	}
-}
-
-func TestBootstrapUploadTokenGeneratesAndPersists(t *testing.T) {
-	t.Setenv("HOPPER_UPLOAD_TOKEN", "")
-	ctx := t.Context()
-	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "bs.db"))
-	defer db.Close()
-	if err := db.Migrate(ctx); err != nil {
-		t.Fatal(err)
-	}
-	api := &apiServer{tracker: newWorkerTracker()}
-
-	bootstrapUploadToken(ctx, api, db)
-
-	if !api.uploadTokenSet {
-		t.Fatal("uploadTokenSet false after generate bootstrap")
-	}
-	stored, err := db.KVGet(ctx, uploadTokenKVKey)
-	if err != nil {
-		t.Fatalf("KVGet after generate: %v", err)
-	}
-	if len(stored) < uploadTokenMinLen {
-		t.Errorf("persisted token too short: len=%d want>=%d", len(stored), uploadTokenMinLen)
-	}
-	// Hash in api must match the stored value — proves prism (reading the
-	// same row) will speak the same token.
-	if sum := sha256.Sum256([]byte(stored)); sum != api.uploadTokenHash {
-		t.Error("api hash does not match stored token's sha256")
-	}
-}
-
-func TestBootstrapUploadTokenReusesPersistedValue(t *testing.T) {
-	t.Setenv("HOPPER_UPLOAD_TOKEN", "")
-	ctx := t.Context()
-	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "bs.db"))
-	defer db.Close()
-	if err := db.Migrate(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	// Seed the DB as if a previous run had persisted a token.
-	const seeded = "previously-persisted-token-32-or-more!"
-	if err := db.KVSetIfAbsent(ctx, uploadTokenKVKey, seeded); err != nil {
-		t.Fatal(err)
-	}
-
-	api := &apiServer{tracker: newWorkerTracker()}
-	bootstrapUploadToken(ctx, api, db)
-
-	if !api.uploadTokenSet {
-		t.Fatal("uploadTokenSet false after db bootstrap")
-	}
-	if sum := sha256.Sum256([]byte(seeded)); sum != api.uploadTokenHash {
-		t.Error("api hash does not match seeded token's sha256")
-	}
-	// And the persisted value is unchanged — second startup didn't rotate.
-	if got, err := db.KVGet(ctx, uploadTokenKVKey); err != nil || got != seeded {
-		t.Errorf("persisted token mutated: got=%q err=%v, want %q", got, err, seeded)
-	}
-}
-
 // Silences "imported and not used" complaints if a previous test gets
 // trimmed; harmless when other tests reference io/os/filepath.
 var _ = io.EOF
 
 // uploadAPI builds an apiServer wired to a real sqlite DB and a fresh data
-// root, with the upload token configured, for exercising the full store path.
+// root for exercising the full store path.
 func uploadAPI(t *testing.T) *apiServer {
 	t.Helper()
 	db, err := hopper.Open(context.Background(), filepath.Join(t.TempDir(), "test.db"))
@@ -1276,11 +1025,7 @@ func uploadAPI(t *testing.T) *apiServer {
 		t.Fatalf("migrate: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
-	api := &apiServer{tracker: newWorkerTracker(), dataRoot: t.TempDir(), db: db}
-	if err := api.setUploadToken("test-token-with-32-chars-or-more!!"); err != nil {
-		t.Fatalf("setUploadToken: %v", err)
-	}
-	return api
+	return &apiServer{tracker: newWorkerTracker(), dataRoot: t.TempDir(), db: db}
 }
 
 // multipartUpload encodes a provenance+file body. provFirst=false puts the file
@@ -1406,14 +1151,13 @@ func mustJSON(t *testing.T, v any) []byte {
 func postUpload(t *testing.T, api *apiServer, body *bytes.Buffer, contentType string) *httptest.ResponseRecorder {
 	t.Helper()
 	r := httptest.NewRequest(http.MethodPost, "/api/upload", body)
-	r.Header.Set("Authorization", "Bearer test-token-with-32-chars-or-more!!")
 	r.Header.Set("Content-Type", contentType)
 	w := httptest.NewRecorder()
 	api.handleUpload(w, r)
 	return w
 }
 
-func TestHandleUploadMultipartEnrichesRow(t *testing.T) {
+func TestHandleUploadMultipartWithoutAuthorizationEnrichesRow(t *testing.T) {
 	t.Parallel()
 	api := uploadAPI(t)
 	file := []byte("malicious package bytes")

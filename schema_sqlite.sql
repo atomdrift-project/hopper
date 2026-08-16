@@ -109,8 +109,7 @@ CREATE TABLE IF NOT EXISTS workers (
 );
 
 -- hopper_kv stores internal key/value state that needs to survive process
--- restart but doesn't belong in a domain table. Used today for the
--- upload-token bootstrap (shared with prism via this row).
+-- restart but doesn't belong in a domain table.
 CREATE TABLE IF NOT EXISTS hopper_kv (
 	key        TEXT PRIMARY KEY,
 	value      TEXT NOT NULL,

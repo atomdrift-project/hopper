@@ -64,10 +64,6 @@ type incomingLocationsResponse struct {
 // hot-pool controller. It returns exact catalog paths so a later move is a
 // compare-and-swap against one physical observation, not samples.path.
 func (s *apiServer) handleIncomingLocations(w http.ResponseWriter, r *http.Request) {
-	if err := s.checkUploadAuth(r); err != nil {
-		writeJSONError(w, http.StatusUnauthorized, err.Error())
-		return
-	}
 	before := time.Now().UTC()
 	if raw := r.URL.Query().Get("before"); raw != "" {
 		parsed, err := time.Parse(time.RFC3339Nano, raw)
@@ -256,14 +252,10 @@ type triageResponse struct {
 	Failed  int            `json:"failed"`
 }
 
-// handleTriage applies a batch of corrected verdicts. Auth mirrors
-// /api/upload: a Bearer token (when configured) plus the cross-site CSRF
-// guard. The heavy lifting — disk move + DB flip — is in relocateTriaged.
+// handleTriage applies a batch of corrected verdicts. The cross-site CSRF
+// guard rejects browser form posts. The heavy lifting — disk move + DB flip —
+// is in relocateTriaged.
 func (s *apiServer) handleTriage(w http.ResponseWriter, r *http.Request) {
-	if err := s.checkUploadAuth(r); err != nil {
-		writeJSONError(w, http.StatusUnauthorized, err.Error())
-		return
-	}
 	if err := checkBrowserCSRF(r); err != nil {
 		writeJSONError(w, http.StatusForbidden, err.Error())
 		return
@@ -580,7 +572,6 @@ func cmdPostTriage(ctx context.Context) error {
 		"dir of files re-classified hostile (was good); repeatable or comma-separated")
 	noUpload := f.Bool("no-upload", false, "skip pushing fresh analysis (default: scan fs --hopper each misplaced dir first)")
 	scanBin := f.String("scan", "atomscan", "path to the scan (atomscan) binary used for --upload")
-	token := f.String("token", os.Getenv("HOPPER_UPLOAD_TOKEN"), "upload bearer token (default: $HOPPER_UPLOAD_TOKEN)")
 	dryRun := f.Bool("dry-run", false, "ask the master to report the planned moves without touching anything")
 	parseFlags(f, os.Args[2:])
 
@@ -653,7 +644,7 @@ func cmdPostTriage(ctx context.Context) error {
 		len(verdicts), len(verdicts)-len(bad), len(bad))
 
 	// 3. POST to the master, which performs the move + label flip on its disk.
-	resp, err := postTriage(ctx, *baseURL, *token, triageRequest{Verdicts: verdicts, DryRun: *dryRun})
+	resp, err := postTriage(ctx, *baseURL, triageRequest{Verdicts: verdicts, DryRun: *dryRun})
 	if err != nil {
 		return err
 	}
@@ -699,8 +690,6 @@ func dedupExistingDirs(dirs []string) []string {
 // runScanUpload shells out to `scan fs --hopper <url> <dir>`, streaming its
 // output through. `fs` is the filesystem-scan subcommand; --hopper (alias
 // --upload) renews each result on the master by POSTing to <url>/api/result.
-// scan authenticates on its own (reading $HOPPER_UPLOAD_TOKEN when the master
-// enforces a token), so the child inherits this process's environment.
 func runScanUpload(ctx context.Context, scanBin, baseURL, dir string) error {
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 		return fmt.Errorf("not a directory: %s", dir)
@@ -758,7 +747,7 @@ func hashFileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func postTriage(ctx context.Context, baseURL, token string, req triageRequest) (*triageResponse, error) {
+func postTriage(ctx context.Context, baseURL string, req triageRequest) (*triageResponse, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
@@ -771,9 +760,6 @@ func postTriage(ctx context.Context, baseURL, token string, req triageRequest) (
 	httpReq.Header.Set("Content-Type", "application/json")
 	// Marks the request as a non-browser client for the CSRF guard.
 	httpReq.Header.Set("Sec-Fetch-Site", "same-origin")
-	if token != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+token)
-	}
 	client := &http.Client{Timeout: 5 * time.Minute}
 	resp, err := client.Do(httpReq) //nolint:gosec // G704: baseURL is the operator-provided trusted master endpoint
 	if err != nil {

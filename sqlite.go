@@ -449,8 +449,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		}
 	}
 
-	// Internal key/value store. Used for the upload-token bootstrap (prism
-	// reads it to discover the bearer token for /api/upload).
+	// Internal key/value store for resumable maintenance and migration state.
 	if _, err := db.lite.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS hopper_kv (
 		key        TEXT PRIMARY KEY,
 		value      TEXT NOT NULL,

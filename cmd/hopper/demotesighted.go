@@ -104,7 +104,6 @@ func cmdDemoteSighted(ctx context.Context) error {
 	dsn := f.String("db", "", "database DSN (default: $DATABASE_URL)")
 	//nolint:revive // unsecure-url-scheme: the master API is a plain-http internal cluster endpoint
 	baseURL := f.String("url", "http://hopper-api:8081/", "hopper master API base URL")
-	token := f.String("token", os.Getenv("HOPPER_UPLOAD_TOKEN"), "upload bearer token (default: $HOPPER_UPLOAD_TOKEN)")
 	apply := f.Bool("apply", false, "apply the demotions (default: dry-run report only)")
 	batch := f.Int("batch", 1000, "verdicts per /api/triage request")
 	manifest := f.String("manifest", "demote-sighted-manifest.jsonl", "append per-row move results here (the rollback record)")
@@ -145,7 +144,7 @@ func cmdDemoteSighted(ctx context.Context) error {
 		return err
 	}
 
-	if err := demoteParents(ctx, *baseURL, *token, *manifest, cands, *batch); err != nil {
+	if err := demoteParents(ctx, *baseURL, *manifest, cands, *batch); err != nil {
 		return err
 	}
 
@@ -256,7 +255,7 @@ func backfillSelfSightings(ctx context.Context, db *hopper.DB, cands []*demoteCa
 // each per-row result to the manifest file (the rollback record). The master
 // performs the move + relabel and is per-row idempotent, so a rerun after a
 // crash converges.
-func demoteParents(ctx context.Context, baseURL, token, manifestPath string, demote []*demoteCandidate, batch int) error {
+func demoteParents(ctx context.Context, baseURL, manifestPath string, demote []*demoteCandidate, batch int) error {
 	mf, err := os.OpenFile(manifestPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644) //nolint:gosec // operator-chosen log path
 	if err != nil {
 		return fmt.Errorf("demote-sighted: open manifest: %w", err)
@@ -271,7 +270,7 @@ func demoteParents(ctx context.Context, baseURL, token, manifestPath string, dem
 		for _, c := range chunk {
 			verdicts = append(verdicts, triageVerdict{SHA256: c.sha256, Ruling: "sighted", Source: demoteSightedSource})
 		}
-		resp, err := postTriage(ctx, baseURL, token, triageRequest{Verdicts: verdicts})
+		resp, err := postTriage(ctx, baseURL, triageRequest{Verdicts: verdicts})
 		if err != nil {
 			return fmt.Errorf("demote-sighted: triage batch at %d/%d: %w", start, len(demote), err)
 		}

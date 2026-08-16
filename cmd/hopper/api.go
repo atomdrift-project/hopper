@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -53,9 +52,7 @@ type apiServer struct {
 	forceRescanPrefixes []string
 	rescanAge           time.Duration
 	requiredMounts      []string
-	uploadTokenHash     [sha256.Size]byte
 	datasetIncomplete   bool
-	uploadTokenSet      bool
 	ready               atomic.Bool
 }
 
@@ -136,19 +133,6 @@ func (s *apiServer) releaseResult() {
 	if s.resultSem != nil {
 		<-s.resultSem
 	}
-}
-
-// setUploadToken stores sha256(token) for later constant-time comparison.
-// The plaintext is scoped to this call; once it returns, the only in-memory
-// copy is the SHA-256 digest. Returns an error if the token is too short to
-// meet the minimum-entropy threshold.
-func (s *apiServer) setUploadToken(token string) error {
-	if len(token) < uploadTokenMinLen {
-		return fmt.Errorf("token must be at least %d bytes (got %d)", uploadTokenMinLen, len(token))
-	}
-	s.uploadTokenHash = sha256.Sum256([]byte(token))
-	s.uploadTokenSet = true
-	return nil
 }
 
 // TraitsVersion returns the current canonical traits version. Safe for
@@ -739,12 +723,6 @@ const (
 	// decompressed, though zstd-compressed far smaller on the wire). Workers run
 	// on the local network, so even a slow-link budget is ample.
 	resultBodyTimeout = 10 * time.Minute
-	// uploadTokenMinLen is the smallest acceptable HOPPER_UPLOAD_TOKEN.
-	// 32 chars yields >=128 bits with hex encoding, >=192 bits with base64.
-	// A random `openssl rand -hex 32` produces 64 chars and meets this with
-	// room to spare. Rejecting short tokens at config time keeps a typo
-	// from silently degrading auth strength below the threat model.
-	uploadTokenMinLen = 32
 	// uploadTmpMaxAge is how long an orphaned .tmp/up-* file may live
 	// before startup sweep deletes it. Long enough that an in-flight
 	// upload across a process restart still survives if the operator
@@ -2184,42 +2162,10 @@ func snippet(b []byte, limit int) string {
 	return s
 }
 
-// checkUploadAuth validates the bearer token on /api/upload. Both sides
-// are hashed to a fixed 32-byte digest before comparison so:
-//
-//   - subtle.ConstantTimeCompare runs over constant-length inputs — it
-//     would otherwise short-circuit on length mismatch and leak the server
-//     token's length via response timing.
-//   - The plaintext token never sits in long-lived process memory; only
-//     its SHA-256 does. A core dump or /proc/<pid>/mem read by a
-//     post-compromise adversary still finds the hash, not the secret.
-//
-// When no token is configured the endpoint is open: a bearer token is enforced
-// only when one is set, so an internal deployment can push content without
-// shared-secret plumbing while the browser CSRF guard still blocks form posts.
-// A configured-but-wrong token returns a 401 the caller maps from any error.
-func (s *apiServer) checkUploadAuth(r *http.Request) error {
-	if !s.uploadTokenSet {
-		return nil
-	}
-	auth := r.Header.Get("Authorization")
-	const prefix = "Bearer "
-	if !strings.HasPrefix(auth, prefix) {
-		return errors.New("missing or malformed Authorization header")
-	}
-	got := sha256.Sum256([]byte(auth[len(prefix):]))
-	if subtle.ConstantTimeCompare(got[:], s.uploadTokenHash[:]) != 1 {
-		return errors.New("invalid token")
-	}
-	return nil
-}
-
 // checkBrowserCSRF rejects requests that browser security signals identify
 // as cross-origin form posts. The upload endpoint should never be hit by a
-// browser-served HTML form: prism uploads with an explicit fetch(),
-// command-line clients send Authorization headers. Anything that looks
-// like a cross-site form submit is treated as hostile. Returns nil when
-// the request passes.
+// browser-served HTML form. Anything that looks like a cross-site form submit
+// is treated as hostile. Returns nil when the request passes.
 func checkBrowserCSRF(r *http.Request) error {
 	// Sec-Fetch-Site is set by every modern browser. "same-origin" and
 	// "same-site" are normal user-driven requests from prism; "none" is a
@@ -2229,12 +2175,10 @@ func checkBrowserCSRF(r *http.Request) error {
 	}
 	// Block obvious form-submission content types. Raw uploads are
 	// application/octet-stream or unset; provenance-carrying uploads are
-	// multipart/form-data sent by non-browser clients (forager, prism's
-	// backend) that already hold a Bearer token — which a browser cannot set
-	// on a cross-site request without a preflight the server never answers, so
-	// such a request fails auth above and never reaches here. multipart is
-	// therefore deliberately NOT blocked. The classic CSRF-able simple types
-	// below have no legitimate use on this endpoint.
+	// multipart/form-data sent by non-browser clients (forager and scan).
+	// Multipart is deliberately not blocked because provenance uploads require
+	// it; Sec-Fetch-Site remains the browser boundary. The classic CSRF-able
+	// simple types below have no legitimate use on this endpoint.
 	ct := r.Header.Get("Content-Type")
 	if i := strings.IndexByte(ct, ';'); i >= 0 {
 		ct = ct[:i]
@@ -2266,9 +2210,6 @@ func (s *apiServer) resolveDataPath(rel string) (string, error) {
 // tier in claimJobs hands it to the next free worker. The request body IS the file (no
 // multipart): keeps the streaming write zero-copy and lets prism just
 // io.Copy its incoming body straight through.
-//
-// Auth: requires "Authorization: Bearer <HOPPER_UPLOAD_TOKEN>". When the
-// env var is unset the route is disabled (returns 503) — fail-closed.
 //
 // Query parameters:
 //   - filename: optional, hint for on-disk name and DB.Filename. Sanitized
@@ -2459,15 +2400,6 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.dataRoot == "" {
 		writeJSONError(w, http.StatusServiceUnavailable, `{"error":"no data root configured"}`)
-		return
-	}
-
-	// Auth first — every later step touches disk or DB. Only enforced when a
-	// token is configured; otherwise the endpoint is open (CSRF guard still runs).
-	if err := s.checkUploadAuth(r); err != nil {
-		slog.Warn("upload rejected: auth", "reason", err, "remote", r.RemoteAddr)
-		w.Header().Set("WWW-Authenticate", `Bearer realm="hopper"`)
-		writeJSONError(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
 		return
 	}
 
@@ -3244,8 +3176,7 @@ const rescanRequestCooldown = 15 * time.Minute
 // 1 (unanalyzed) work. This is the write side of prism's rescan button — prism
 // reads from a replica but routes the write here so it lands on the master,
 // keeping every write funneled through hopper. Like /api/result it is an
-// internal, worker-facing endpoint (no bearer token); hopper-api is not
-// publicly reachable.
+// internal, worker-facing endpoint; hopper-api is not publicly reachable.
 //
 // POST /api/rescan/{sha256}. 200 {"status":"queued"} on success; 409 when the
 // sample is not eligible (unknown, an archive child, skipped, or analyzed

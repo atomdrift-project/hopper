@@ -2440,7 +2440,7 @@ func (db *DB) KVGet(ctx context.Context, key string) (string, error) {
 // KVSetIfAbsent inserts (key, value) into hopper_kv only when the key is
 // not yet present. Concurrent callers that lose the race observe no
 // error; the next KVGet returns whichever value won. Used by bootstrap
-// flows that need a self-generated secret to converge across replicas.
+// flows that need to converge across replicas.
 func (db *DB) KVSetIfAbsent(ctx context.Context, key, value string) error {
 	var err error
 	if db.pool != nil {
@@ -2458,9 +2458,9 @@ func (db *DB) KVSetIfAbsent(ctx context.Context, key, value string) error {
 	return nil
 }
 
-// KVSet stores an operator-supplied value, replacing any previous value. It is
-// reserved for explicit configuration such as secret rotation; generated
-// bootstrap values should use KVSetIfAbsent so concurrent starters converge.
+// KVSet stores an operator-supplied value, replacing any previous value.
+// Generated bootstrap values should use KVSetIfAbsent so concurrent starters
+// converge.
 func (db *DB) KVSet(ctx context.Context, key, value string) error {
 	var err error
 	if db.pool != nil {

@@ -103,8 +103,8 @@ Run `./hopper <command> -h` for command-specific flags. Review the deployment
 scripts before using them: they encode Atomdrift's own topology, database
 roles, replication, and service assumptions.
 
-Protect the worker/file API, database, dashboard, and bearer tokens as
-sensitive infrastructure. Hopper can serve malware bytes and store authoritative
+Protect the worker/file API, database, and dashboard as sensitive
+infrastructure. Hopper can accept and serve malware bytes and store authoritative
 labels; it should not be exposed directly to the public internet.
 
 ## Native FreeBSD deployment

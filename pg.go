@@ -874,8 +874,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			autovacuum_vacuum_cost_limit = 2000
 		)`,
 
-		// Internal key/value store. Used for the upload-token bootstrap
-		// (prism reads it to discover the bearer token for /api/upload).
+		// Internal key/value store for resumable maintenance and migration state.
 		`CREATE TABLE IF NOT EXISTS hopper_kv (
 			key        TEXT PRIMARY KEY,
 			value      TEXT NOT NULL,

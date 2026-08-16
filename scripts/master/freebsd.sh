@@ -27,14 +27,10 @@ SERVICE_USER=hopper
 HOPPER_BIN=/usr/local/bin/hopper
 CLEAVE_BIN=/usr/local/bin/cleave
 HOPPER_RCD=/usr/local/etc/rc.d/hopper
-HOPPER_ETC=/usr/local/etc/hopper
-HOPPER_ENV=$HOPPER_ETC/env
 RC_TMP=""
-ENV_TMP=""
 
 cleanup() {
 	[ -z "$RC_TMP" ] || rm -f "$RC_TMP"
-	[ -z "$ENV_TMP" ] || rm -f "$ENV_TMP"
 }
 trap cleanup EXIT
 
@@ -164,28 +160,13 @@ log "Installing binaries"
 $SUDO install -m 0755 -o root -g wheel ./hopper "$HOPPER_BIN"
 $SUDO install -m 0755 -o root -g wheel "$CLEAVE_DIR/out/cleave" "$CLEAVE_BIN"
 
-log "Ensuring shared Hopper upload credential exists"
-$SUDO install -d -m 0700 -o root -g wheel "$HOPPER_ETC"
-if ! $SUDO test -s "$HOPPER_ENV"; then
-	command -v openssl >/dev/null 2>&1 || die "openssl is required to generate $HOPPER_ENV"
-	ENV_TMP=$(mktemp -t hopper.env.XXXXXX)
-	TOKEN=$(openssl rand -hex 32)
-	{
-		printf 'HOPPER_UPLOAD_TOKEN=%s\n' "$TOKEN"
-		printf 'export HOPPER_UPLOAD_TOKEN\n'
-	} >"$ENV_TMP"
-	$SUDO install -m 0600 -o root -g wheel "$ENV_TMP" "$HOPPER_ENV"
-	rm -f "$ENV_TMP"
-	ENV_TMP=""
-fi
-
 log "Refreshing cleave rules"
 $SUDO su -l "$SERVICE_USER" -c "$CLEAVE_BIN update-rules" \
 	|| die "cleave update-rules failed"
 
-log "Running Hopper migrations"
-$SUDO su -l "$SERVICE_USER" -c "$HOPPER_BIN init --db '$DB'" \
-	|| die "Hopper database initialization failed"
+# The serving command applies required schema migrations before readiness and
+# builds optional indexes in the background. Running the one-shot `init` here
+# would put those index builds back on the deployment critical path.
 
 $SUDO install -d -m 0755 -o root -g wheel /usr/local/etc/rc.d
 RC_TMP=$(mktemp -t hopper.rcd.XXXXXX)
@@ -213,7 +194,6 @@ load_rc_config \$name
 : \${hopper_source:="$SOURCE"}
 : \${hopper_bind:="$DASH_ADDR"}
 : \${hopper_logfile:="/var/log/hopper.log"}
-: \${hopper_env_file:="$HOPPER_ENV"}
 : \${hopper_required_mounts:="$REQUIRED_MOUNTS"}
 
 mount_args=""
@@ -228,16 +208,6 @@ IFS=\$old_ifs
 
 pidfile="/var/run/\${name}.pid"
 command="/usr/sbin/daemon"
-start_precmd="hopper_precmd"
-hopper_precmd()
-{
-	if [ ! -r "\${hopper_env_file}" ]; then
-		echo "hopper credential file is missing or unreadable: \${hopper_env_file}" >&2
-		return 1
-	fi
-	. "\${hopper_env_file}"
-	export HOPPER_UPLOAD_TOKEN
-}
 # --litmus '' is intentional: the Scan worker is a separate rc.d service.
 command_args="-c -f -r -R 10 -P \${pidfile} -o \${hopper_logfile} -u hopper /usr/bin/env HOME=/home/hopper DATABASE_URL=\${hopper_db} $HOPPER_BIN load --data \${hopper_data} --db \${hopper_db} --source \${hopper_source} --dashboard-addr \${hopper_bind} --litmus '' --cleave $CLEAVE_BIN\${mount_args}$dataset_arg"
 
