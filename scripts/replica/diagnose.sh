@@ -13,6 +13,7 @@ REMOTE_USER="${REMOTE_USER:-hopper}"
 REMOTE_DB="${REMOTE_DB:-hopper}"
 LOCAL_DB="${LOCAL_DB:-hopper}"
 SUBSCRIPTION="${SUBSCRIPTION:-}"
+EXACT_COUNTS="${EXACT_COUNTS:-false}"
 
 section() { printf '\n=== %s ===\n' "$*"; }
 
@@ -130,8 +131,13 @@ SQL
 )
 printf '%s\n' "$tables" | while read -r q; do
     [ -n "$q" ] || continue
-    n=$(admin -d "$LOCAL_DB" -tAc "SELECT count(*) FROM $q" 2>/dev/null | tr -d '[:space:]')
-    printf '  %s: %s rows\n' "$q" "${n:-?}"
+    if [ "$EXACT_COUNTS" = 'true' ]; then
+        n=$(admin -d "$LOCAL_DB" -tAc "SET statement_timeout='15s'; SELECT count(*) FROM $q" 2>/dev/null | tr -d '[:space:]')
+        printf '  %s: %s exact rows\n' "$q" "${n:-timed out}"
+    else
+        n=$(admin -d "$LOCAL_DB" -tAc "SELECT n_live_tup FROM pg_stat_user_tables WHERE relid = '$q'::regclass" 2>/dev/null | tr -d '[:space:]')
+        printf '  %s: ~%s estimated rows\n' "$q" "${n:-?}"
+    fi
 done
 
 # ---------------------------------------------------------------------------

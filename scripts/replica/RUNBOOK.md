@@ -96,8 +96,11 @@ Because it rebuilds after the copy, `setup.sh` now **blocks until the copy
 completes** when it deferred anything (a steady-state reconcile defers nothing
 and still returns immediately). Saved DDL lives under the healer state dir
 (`~postgres/.hopper-replica-heal/bulkload/`); if a copy is interrupted the
-indexes are recorded there — re-run `make rebuild-replica` or apply the files by
-hand. The healer is paused (maintenance flag) for the whole window.
+indexes are recorded there — re-run `make replica` (resumes: post-COPY catch-up
+for `f`/`s`, truncates + retries mid-COPY `i`/`d` with leftover rows, finishes
+pending index rebuilds) or apply the files by hand. Use `make rebuild-replica`
+only for lost slots / hard apply wedges. The healer is paused (maintenance flag)
+for the whole window.
 
 Knobs (env): `FAST_SYNC=false` disables it (plain indexed copy, async return);
 `BULK_MAINT_MEM` (default `1GB` — raise on a big box, e.g. `8GB`),

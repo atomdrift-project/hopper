@@ -46,6 +46,7 @@ BULK_POLL_SECS="${BULK_POLL_SECS:-15}"
 # the caller to hand back to bulkload_finish. (Returned via a global rather
 # than stdout because log() prints to stdout.)
 BULK_DEFERRED=''
+BULK_GUCS_ACTIVE=false
 
 # GUCs we override during the load and RESET afterwards. RESET reverts only our
 # postgresql.auto.conf override, so a value the operator set in postgresql.conf
@@ -149,17 +150,25 @@ bulkload_defer() {
     done
     BULK_DEFERRED="${_deferred# }"
     if [ -n "$BULK_DEFERRED" ]; then
-        # Capture each GUC's CURRENT value first, as a restore script, so
-        # bulkload_finish puts back exactly what was there — including values a
-        # deploy script set via ALTER SYSTEM (e.g. max_wal_size=16GB). A plain
-        # ALTER SYSTEM RESET would wrongly revert those to the PG defaults.
-        _gf="$(_bulk_state_dir)/guc-restore.sql"
-        _in=$(printf "'%s'," $_BULK_GUCS | sed 's/,$//')
-        admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
+        _bulk_apply_gucs
+    fi
+}
+
+# _bulk_apply_gucs — capture + relax bulk GUCs if not already active. Shared by
+# defer (before COPY) and resume_pending (index rebuild after an interrupted run).
+# Capture each GUC's CURRENT value first, as a restore script, so finish puts
+# back exactly what was there — including values a deploy script set via
+# ALTER SYSTEM (e.g. max_wal_size=16GB). A plain ALTER SYSTEM RESET would
+# wrongly revert those to the PG defaults.
+_bulk_apply_gucs() {
+    [ "${BULK_GUCS_ACTIVE:-false}" = true ] && return 0
+    _gf="$(_bulk_state_dir)/guc-restore.sql"
+    _in=$(printf "'%s'," $_BULK_GUCS | sed 's/,$//')
+    admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
 \copy (SELECT 'ALTER SYSTEM SET '||name||' = '''||setting||coalesce(unit,'')||''';' FROM pg_settings WHERE name IN ($_in)) TO '$_gf'
 SQL
-        log "fast-sync: relaxing bulk GUCs for the copy (maintenance_work_mem=$BULK_MAINT_MEM, autovacuum off)"
-        admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
+    log "fast-sync: relaxing bulk GUCs for the copy (maintenance_work_mem=$BULK_MAINT_MEM, autovacuum off)"
+    admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
 ALTER SYSTEM SET maintenance_work_mem = '$BULK_MAINT_MEM';
 ALTER SYSTEM SET max_parallel_maintenance_workers = $BULK_MAX_PARALLEL_MAINT;
 ALTER SYSTEM SET max_wal_size = '$BULK_MAX_WAL';
@@ -168,7 +177,7 @@ ALTER SYSTEM SET synchronous_commit = off;
 ALTER SYSTEM SET wal_compression = off;
 SELECT pg_reload_conf();
 SQL
-    fi
+    BULK_GUCS_ACTIVE=true
 }
 
 # _bulk_srsubstate TABLE — print the tablesync state letter for TABLE under
@@ -199,6 +208,64 @@ _bulk_reindex_one() {
     fi
 }
 
+# bulkload_restore_gucs — restore the values captured before the bulk copy.
+# This is also called from setup.sh's EXIT trap, so an apply error, setup
+# failure, or operator interruption does not leave bulk-only GUCs in place.
+bulkload_restore_gucs() {
+    [ "${BULK_GUCS_ACTIVE:-false}" = true ] || return 0
+    _gf="$(_bulk_state_dir)/guc-restore.sql"
+    if pg_sh "test -s '$_gf'" 2>/dev/null; then
+        if ! admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -f "$_gf" >/dev/null; then
+            log "fast-sync: WARNING — could not restore captured bulk GUCs from $_gf"
+            return 1
+        fi
+        admin -d "$LOCAL_DB" -tAc 'SELECT pg_reload_conf()' >/dev/null || return 1
+        pg_sh "rm -f '$_gf'" 2>/dev/null || true
+    else
+        # No capture on hand (older state / interrupted) — RESET our overrides.
+        admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
+$(for g in $_BULK_GUCS; do printf 'ALTER SYSTEM RESET %s;\n' "$g"; done)
+SELECT pg_reload_conf();
+SQL
+    fi
+    BULK_GUCS_ACTIVE=false
+    return 0
+}
+
+bulkload_cleanup() {
+    bulkload_restore_gucs || true
+}
+
+# bulkload_resume_pending — pick up reindex-*.sql left by an interrupted prior
+# run and merge those tables into BULK_DEFERRED so finish rebuilds them. Does
+# not drop indexes again (COPY may already be done).
+bulkload_resume_pending() {
+    [ "$FAST_SYNC" = "true" ] || return 0
+    _sd=$(_bulk_state_dir)
+    _files=$(pg_sh "ls '$_sd'/reindex.*.sql 2>/dev/null" 2>/dev/null || true)
+    [ -n "$_files" ] || return 0
+    _pending=''
+    for _f in $_files; do
+        _base=${_f##*/}
+        # reindex.<table>.sql — table names are [A-Za-z0-9_]+ from _bulk_safe.
+        _t=$(printf '%s' "$_base" | sed -n 's/^reindex\.\(.*\)\.sql$/\1/p')
+        _bulk_valid_table "$_t" || continue
+        case " $_pending $BULK_DEFERRED " in
+            *" $_t "*) ;;
+            *) _pending="$_pending $_t" ;;
+        esac
+    done
+    _pending="${_pending# }"
+    [ -n "$_pending" ] || return 0
+    log "fast-sync: resuming deferred index rebuild(s) from $_sd: $_pending"
+    if [ -n "$BULK_DEFERRED" ]; then
+        BULK_DEFERRED="$BULK_DEFERRED $_pending"
+    else
+        BULK_DEFERRED="$_pending"
+    fi
+    _bulk_apply_gucs
+}
+
 # bulkload_finish TABLE... — block until each deferred table finishes its copy,
 # rebuilding its indexes as it does, then restore the bulk GUCs. Bails (leaving
 # the DDL files) if the subscription disables itself on an apply error.
@@ -215,6 +282,7 @@ bulkload_finish() {
         if [ "$_en" != "t" ]; then
             log "fast-sync: subscription '$SUBSCRIPTION' is no longer enabled (apply error / disable_on_error?)."
             log "fast-sync: leaving deferred-index DDL in $(_bulk_state_dir) — rebuild it after the subscription recovers."
+            bulkload_restore_gucs || true
             return 1
         fi
         _next=''
@@ -236,18 +304,5 @@ bulkload_finish() {
         fi
     done
     log "fast-sync: all deferred indexes rebuilt — restoring GUCs to their pre-copy values"
-    _gf="$(_bulk_state_dir)/guc-restore.sql"
-    if pg_sh "test -s '$_gf'" 2>/dev/null; then
-        admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -f "$_gf" >/dev/null
-        admin -d "$LOCAL_DB" -tAc 'SELECT pg_reload_conf()' >/dev/null
-        pg_sh "rm -f '$_gf'" 2>/dev/null || true
-    else
-        # No capture on hand (older state / interrupted) — RESET our overrides,
-        # which reverts to postgresql.conf / defaults.
-        admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
-$(for g in $_BULK_GUCS; do printf 'ALTER SYSTEM RESET %s;\n' "$g"; done)
-SELECT pg_reload_conf();
-SQL
-    fi
-    return 0
+    bulkload_restore_gucs
 }

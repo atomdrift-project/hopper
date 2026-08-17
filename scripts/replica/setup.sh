@@ -1,6 +1,10 @@
 #!/bin/sh
 # setup-replica.sh — configure local PostgreSQL as a logical replica of a
-# remote hopper instance. Idempotent: re-running reconciles state.
+# remote hopper instance. Idempotent and resumable: re-running reconciles
+# schema/publication state, resumes post-COPY catch-up (srsubstate f/s), and
+# safely retries an interrupted mid-COPY (truncate those tables, then
+# tablesync again). Lost replication slots / disable_on_error still need
+# rebuild-replica.
 #
 # Assumes:
 #   * Local postgres is running (pg_isready ok) but otherwise unconfigured.
@@ -30,6 +34,7 @@ default_sub_suffix=$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -
 [ -z "$default_sub_suffix" ] && default_sub_suffix="local"
 SUBSCRIPTION="${SUBSCRIPTION:-hopper_replica_${default_sub_suffix}}"
 COPY_DATA="${COPY_DATA:-true}"
+SETUP_EXACT_COUNTS="${SETUP_EXACT_COUNTS:-false}"
 LEGACY_PUBLICATION="${LEGACY_PUBLICATION:-hopper_training}"
 PGPASS="${PGPASSFILE:-$HOME/.pgpass}"
 
@@ -240,13 +245,91 @@ fi
 HEAL_DIR=$(pg_sh 'printf %s "${HEAL_STATE_DIR:-$HOME/.hopper-replica-heal}"' 2>/dev/null || true)
 maint_on()  { [ -n "${HEAL_DIR:-}" ] && pg_sh "mkdir -p '$HEAL_DIR' && : > '$HEAL_DIR/maintenance'" 2>/dev/null || true; }
 maint_off() { [ -n "${HEAL_DIR:-}" ] && pg_sh "rm -f '$HEAL_DIR/maintenance'" 2>/dev/null || true; }
-trap 'maint_off' EXIT
 maint_on
 
 # Fast-sync helpers: defer secondary-index maintenance during the initial COPY
 # and rebuild in bulk afterwards (the single biggest lever for large, heavily
 # indexed tables). Sourced here so admin()/pg_sh()/log()/HEAL_DIR are defined.
 . "$SCRIPT_DIR/bulkload.sh"
+trap 'bulkload_cleanup; maint_off' EXIT
+
+# Do not start schema work while a reader is actively using the replica. A
+# long diagnostic count(*) takes an AccessShareLock for its entire scan and
+# can make init/slim-index DDL queue behind it. Fail before disabling the
+# subscription so a status check cannot leave the replica stopped.
+busy=$(admin -d "$LOCAL_DB" -tAc "
+    SELECT count(*) FROM pg_stat_activity
+     WHERE datname = '$LOCAL_DB' AND pid <> pg_backend_pid()
+       AND backend_type = 'client backend'
+       AND (state <> 'idle' OR xact_start IS NOT NULL)" | tr -d '[:space:]')
+if [ "${busy:-0}" -gt 0 ]; then
+    log "$busy active/idle-in-transaction client backend(s) on '$LOCAL_DB':"
+    admin -d "$LOCAL_DB" -tA -F '  ' <<'SQL' | sed 's/^/    /'
+SELECT pid, state, coalesce(wait_event, '-'),
+       coalesce((now() - xact_start)::text, '-') AS xact_age,
+       left(query, 100)
+  FROM pg_stat_activity
+ WHERE datname = current_database() AND pid <> pg_backend_pid()
+   AND backend_type = 'client backend'
+   AND (state <> 'idle' OR xact_start IS NOT NULL);
+SQL
+    die "refusing replica setup while client transactions are active; stop the reader(s) and re-run"
+fi
+
+# Classify per-table tablesync state so re-running make replica is safe:
+#
+#   r           — steady-state streaming; leave alone
+#   f / s       — COPY already committed (FINISHEDCOPY / SYNCDONE). Postgres
+#                 resumes catch-up without re-COPY; do NOT truncate or refuse
+#   i / d       — COPY not finished. Tablesync COPY appends, so leftover rows
+#                 collide on PKs when the worker retries. Truncate those tables
+#                 after workers are stopped (below), then let tablesync restart
+#
+# A full rebuild-replica is still required for lost slots / disable_on_error.
+RETRY_TRUNCATE=''
+catching_up=''
+partial_tables=$(admin -d "$LOCAL_DB" -tA -F '|' -c \
+    "SELECT c.relname, r.srsubstate
+       FROM pg_subscription_rel r
+       JOIN pg_subscription s ON s.oid = r.srsubid
+       JOIN pg_class c ON c.oid = r.srrelid
+      WHERE s.subname = '$SUBSCRIPTION'
+      ORDER BY c.relname")
+while IFS='|' read -r table state; do
+    [ -n "$table" ] || continue
+    case "$table" in
+        *[!A-Za-z0-9_]*) die "unexpected table name from pg_subscription_rel: '$table'" ;;
+    esac
+    case "$state" in
+        r) continue ;;
+        f|s)
+            catching_up="$catching_up $table(state=$state)"
+            ;;
+        i|d)
+            has_rows=$(admin -d "$LOCAL_DB" -tAc \
+                "SELECT EXISTS (SELECT 1 FROM public.$table LIMIT 1)" | tr -d '[:space:]')
+            if [ "$has_rows" = 't' ]; then
+                RETRY_TRUNCATE="$RETRY_TRUNCATE $table"
+            fi
+            ;;
+        *)
+            die "unexpected srsubstate '$state' for table '$table'; diagnose with make diagnose-replica, or rebuild: SUBSCRIPTION=$SUBSCRIPTION make rebuild-replica FORCE=true"
+            ;;
+    esac
+done <<EOF
+$partial_tables
+EOF
+RETRY_TRUNCATE=${RETRY_TRUNCATE# }
+if [ -n "$catching_up" ]; then
+    log "Resuming post-copy catch-up (COPY already finished; not truncating):$catching_up"
+fi
+if [ -n "$RETRY_TRUNCATE" ]; then
+    if [ "$COPY_DATA" != "true" ]; then
+        die "interrupted mid-COPY with leftover rows:$RETRY_TRUNCATE
+       Refusing COPY_DATA=false resume (would leave empty/partial tables). Re-run with COPY_DATA=true, or: SUBSCRIPTION=$SUBSCRIPTION make rebuild-replica FORCE=true"
+    fi
+    log "Interrupted mid-COPY with leftover rows — will truncate for a clean tablesync retry:$RETRY_TRUNCATE"
+fi
 
 # Disposable read-replica ZFS tuning (sync=disabled, logbias=throughput). A
 # replica is read-only and rebuildable, so trade crash durability for write
@@ -308,22 +391,21 @@ SQL
     sleep 1
 fi
 
-# Show any pre-existing backends on this DB so a stuck one is visible before
-# we queue behind it.
-busy=$(admin -d "$LOCAL_DB" -tAc "
-    SELECT count(*) FROM pg_stat_activity
-     WHERE datname = '$LOCAL_DB' AND pid <> pg_backend_pid()
-       AND backend_type = 'client backend'" | tr -d '[:space:]')
-if [ "${busy:-0}" -gt 0 ]; then
-    log "$busy existing client backend(s) on '$LOCAL_DB':"
-    admin -d "$LOCAL_DB" -tA -F '  ' <<'SQL' | sed 's/^/    /'
-SELECT pid, state, coalesce(wait_event, '-'),
-       coalesce((now() - xact_start)::text, '-') AS xact_age,
-       left(query, 80)
-  FROM pg_stat_activity
- WHERE datname = current_database() AND pid <> pg_backend_pid()
-   AND backend_type = 'client backend';
-SQL
+# Truncate tables left mid-COPY (state i/d with rows). Must run with
+# tablesync/apply workers stopped — COPY appends, so a retry without an empty
+# table hits duplicate keys. Avoid CASCADE so a ready sibling table is not
+# wiped via FK; if truncate fails, fall back to rebuild-replica.
+if [ -n "${RETRY_TRUNCATE:-}" ]; then
+    trunc_list=''
+    for t in $RETRY_TRUNCATE; do
+        trunc_list="$trunc_list public.$t,"
+    done
+    trunc_list=${trunc_list%,}
+    log "Truncating interrupted mid-COPY tables: $trunc_list"
+    if ! admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -c \
+            "TRUNCATE $trunc_list RESTART IDENTITY;"; then
+        die "could not truncate interrupted mid-COPY tables ($RETRY_TRUNCATE) — FK dependencies may require a full rebuild: SUBSCRIPTION=$SUBSCRIPTION make rebuild-replica FORCE=true"
+    fi
 fi
 
 # Set lock_timeout via DSN (pgx honors query-string GUCs reliably); keeps
@@ -457,10 +539,11 @@ sub_exists=$(admin -d "$LOCAL_DB" -tAc \
 # --- fast-sync: defer secondary-index maintenance during the copy ----------
 # Drop each to-be-copied table's non-PK indexes before tablesync so the COPY
 # runs index-light; they're rebuilt in bulk after (see bulkload.sh). The set
-# that will actually be (re)copied = publication tables not already 'ready'
-# locally: a fresh/rebuilt subscription has none ready (all copy); a refresh
-# copies only newly-added tables. Best-effort — a hiccup here must not abort
-# setup, it just means a slower (indexed) copy.
+# that will actually be (re)copied = publication tables not already past COPY:
+#   r / f / s — leave indexes alone (steady-state or post-copy catch-up)
+#   i / d / absent — defer for a (re)copy
+# Best-effort — a hiccup here must not abort setup, it just means a slower
+# (indexed) copy.
 BULK_DEFERRED=''
 if [ "$FAST_SYNC" = "true" ] && [ "$COPY_DATA" = "true" ]; then
     pub_tables=$(psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" -tAc \
@@ -468,23 +551,29 @@ if [ "$FAST_SYNC" = "true" ] && [ "$COPY_DATA" = "true" ]; then
           WHERE pubname = '$PUBLICATION' AND schemaname = 'public'" 2>/dev/null)
     to_copy=''
     for t in $pub_tables; do
-        ready=''
+        state=''
         if [ "$sub_exists" = "1" ]; then
-            ready=$(admin -d "$LOCAL_DB" -tAc \
-                "SELECT 1 FROM pg_subscription_rel r
+            state=$(admin -d "$LOCAL_DB" -tAc \
+                "SELECT r.srsubstate FROM pg_subscription_rel r
                    JOIN pg_subscription s ON s.oid = r.srsubid
                    JOIN pg_class c ON c.oid = r.srrelid
                    JOIN pg_namespace n ON n.oid = c.relnamespace
                   WHERE s.subname = '$SUBSCRIPTION' AND n.nspname = 'public'
-                    AND c.relname = '$t' AND r.srsubstate = 'r'" | tr -d '[:space:]')
+                    AND c.relname = '$t'" | tr -d '[:space:]')
         fi
-        [ "$ready" = "1" ] || to_copy="$to_copy $t"
+        case "$state" in
+            r|f|s) ;;
+            *) to_copy="$to_copy $t" ;;
+        esac
     done
     if [ -n "$to_copy" ]; then
         # shellcheck disable=SC2086 # intentional word-split of the table list
         bulkload_defer $to_copy \
             || log "warning: fast-sync defer incomplete; copy proceeds with remaining indexes"
     fi
+    # Pick up reindex DDL left by an interrupted prior run (e.g. COPY reached
+    # 'f' but indexes were never rebuilt).
+    bulkload_resume_pending
 fi
 
 if [ "$sub_exists" = "1" ]; then
@@ -622,8 +711,13 @@ SQL
 
 printf '%s\n' "$tables" | while IFS='|' read -r qualified state; do
     [ -n "$qualified" ] || continue
-    rows=$(admin -d "$LOCAL_DB" -tAc "SELECT count(*) FROM $qualified" 2>/dev/null | tr -d '[:space:]')
-    printf '    table %s: %s (%s rows)\n' "$qualified" "$state" "${rows:-?}"
+    if [ "$SETUP_EXACT_COUNTS" = 'true' ]; then
+        rows=$(admin -d "$LOCAL_DB" -tAc "SET statement_timeout='15s'; SELECT count(*) FROM $qualified" 2>/dev/null | tr -d '[:space:]')
+        printf '    table %s: %s (%s exact rows)\n' "$qualified" "$state" "${rows:-timed out}"
+    else
+        rows=$(admin -d "$LOCAL_DB" -tAc "SELECT n_live_tup FROM pg_stat_user_tables WHERE relid = '$qualified'::regclass" 2>/dev/null | tr -d '[:space:]')
+        printf '    table %s: %s (~%s estimated rows)\n' "$qualified" "$state" "${rows:-?}"
+    fi
 done
 
 # --- Schema-drift self-healer ----------------------------------------------
@@ -659,8 +753,24 @@ PGPASSFILE="${PG_PGPASS:-$PGPASS}" \
 if [ -n "${BULK_DEFERRED:-}" ]; then
     log "Watch from another shell: make diagnose-replica SUBSCRIPTION=$SUBSCRIPTION"
     # shellcheck disable=SC2086 # intentional word-split of the table list
-    bulkload_finish $BULK_DEFERRED \
-        || log "warning: fast-sync did not finish cleanly — check messages above and $( { [ -n "${HEAL_DIR:-}" ] && printf '%s/bulkload' "$HEAL_DIR"; } || printf 'the bulkload state dir')"
+    if ! bulkload_finish $BULK_DEFERRED; then
+        log "warning: fast-sync did not finish cleanly — check messages above and $( { [ -n "${HEAL_DIR:-}" ] && printf '%s/bulkload' "$HEAL_DIR"; } || printf 'the bulkload state dir')"
+        SETUP_FAILED=1
+    fi
+fi
+
+# The worker can disable the subscription asynchronously after the initial
+# status poll. Make the final result authoritative: a command that leaves a
+# disabled subscription must exit nonzero, never print a successful "Done".
+final_enabled=$(admin -d "$LOCAL_DB" -tAc \
+    "SELECT subenabled FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" \
+    | tr -d '[:space:]')
+final_apply=$(admin -d "$LOCAL_DB" -tAc \
+    "SELECT 1 FROM pg_stat_subscription WHERE subname = '$SUBSCRIPTION' AND relid IS NULL AND pid IS NOT NULL" \
+    | tr -d '[:space:]')
+if [ "$final_enabled" != 't' ] || [ "$final_apply" != '1' ]; then
+    log "FAILED: final replication health check failed (enabled=$final_enabled apply_worker=${final_apply:-absent})"
+    SETUP_FAILED=1
 fi
 
 if [ -n "${SETUP_FAILED:-}" ]; then
@@ -671,7 +781,7 @@ if [ -n "${SETUP_FAILED:-}" ]; then
     exit 1
 fi
 
-log "Done. Re-run anytime — this script is idempotent."
+log "Done. Re-run anytime — this script is idempotent and resumes interrupted copies."
 # psql's built-in \watch works on FreeBSD and Linux alike; GNU watch(1) does
 # not exist on FreeBSD (watch(8) there is an unrelated tty-snooping tool).
 log "Live monitor: psql -h localhost -U $LOCAL_USER -d $LOCAL_DB -c 'SELECT * FROM pg_stat_subscription \watch 2'"
