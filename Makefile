@@ -65,8 +65,8 @@ test:
 
 deploy:
 	@case "$$(uname -s)" in \
-		FreeBSD) $$(MAKE) deploy-freebsd ;; \
-		*)       $$(MAKE) deploy-linux ;; \
+		FreeBSD) $(MAKE) deploy-freebsd ;; \
+		*)       $(MAKE) deploy-linux ;; \
 	esac
 
 deploy-linux:

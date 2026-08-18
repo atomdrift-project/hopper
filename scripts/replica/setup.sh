@@ -1,10 +1,10 @@
 #!/bin/sh
 # setup-replica.sh — configure local PostgreSQL as a logical replica of a
 # remote hopper instance. Idempotent and resumable: re-running reconciles
-# schema/publication state, resumes post-COPY catch-up (srsubstate f/s), and
-# safely retries an interrupted mid-COPY (truncate those tables, then
-# tablesync again). Lost replication slots / disable_on_error still need
-# rebuild-replica.
+# schema/publication state, resumes after disable_on_error (init + ENABLE),
+# resumes post-COPY catch-up (srsubstate f/s), and safely retries an
+# interrupted mid-COPY (truncate those tables, then tablesync again).
+# Lost replication slots still need rebuild-replica.
 #
 # Assumes:
 #   * Local postgres is running (pg_isready ok) but otherwise unconfigured.
@@ -231,16 +231,16 @@ else
     pg_sh() { $ESCALATE sh -c "$1"; }
 fi
 
-# A disabled subscription may be stopped intentionally, but it may also have
-# been disabled by disable_on_error after a data conflict. Do not blindly
-# re-enable an existing disabled subscription: make replica is non-destructive
-# setup, not a repair/rebuild operation. rebuild.sh drops the subscription and
-# creates a fresh one after clearing the published tables.
+# A disabled subscription is a resume case, not a hard fail: disable_on_error
+# often means schema drift that hopper init below will fix, or a mid-COPY
+# conflict that the truncate+tablesync path retries. The subscription block
+# re-ENABLEs after migration; if apply fails again the final health check
+# exits nonzero. Lost slots still die later with a rebuild-replica pointer.
 existing_sub_enabled=$(admin -d "$LOCAL_DB" -tAc \
     "SELECT subenabled FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" \
     | tr -d '[:space:]')
 if [ "$existing_sub_enabled" = "f" ]; then
-    die "subscription '$SUBSCRIPTION' is disabled; make replica will not re-enable it after an apply/sync error. Diagnose it, or run 'SUBSCRIPTION=$SUBSCRIPTION make rebuild-replica FORCE=true' for a full re-copy"
+    log "Subscription '$SUBSCRIPTION' is disabled — will reconcile schema, resume tablesync, and re-enable"
 fi
 HEAL_DIR=$(pg_sh 'printf %s "${HEAL_STATE_DIR:-$HOME/.hopper-replica-heal}"' 2>/dev/null || true)
 maint_on()  { [ -n "${HEAL_DIR:-}" ] && pg_sh "mkdir -p '$HEAL_DIR' && : > '$HEAL_DIR/maintenance'" 2>/dev/null || true; }
@@ -285,7 +285,7 @@ fi
 #                 collide on PKs when the worker retries. Truncate those tables
 #                 after workers are stopped (below), then let tablesync restart
 #
-# A full rebuild-replica is still required for lost slots / disable_on_error.
+# A full rebuild-replica is still required for lost slots (checked later).
 RETRY_TRUNCATE=''
 catching_up=''
 partial_tables=$(admin -d "$LOCAL_DB" -tA -F '|' -c \
@@ -775,9 +775,11 @@ fi
 
 if [ -n "${SETUP_FAILED:-}" ]; then
     log "FAILED: the schema/subscription steps ran, but the apply worker is not"
-    log "        running, so this replica is NOT replicating. Re-running this"
-    log "        script will not change that — diagnose the error first:"
+    log "        running, so this replica is NOT replicating. Diagnose first:"
     log "        make diagnose-replica REMOTE_HOST=$REMOTE_HOST SUBSCRIPTION=$SUBSCRIPTION"
+    log "        If the root cause is fixed (or was schema drift), re-run make replica;"
+    log "        if the slot is gone or apply keeps wedging on data, use:"
+    log "        SUBSCRIPTION=$SUBSCRIPTION make rebuild-replica FORCE=true"
     exit 1
 fi
 
