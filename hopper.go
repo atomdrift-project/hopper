@@ -4682,6 +4682,22 @@ func normalizeSubject(subject string) string {
 	return subject
 }
 
+// splitSightingSubjects partitions ledger subjects into sha256 digests and
+// purl_base keys. Mark-corroborated updates MUST hit each column separately:
+// a single `sha256 = ANY(...) OR purl_base = ANY(...)` predicate forces a
+// sequential scan of samples (tens of millions of rows), which blows the
+// /api/sightings timeout. PK / idx_samples_purl_base look-ups stay cheap.
+func splitSightingSubjects(subs []string) (shas, purls []string) {
+	for _, s := range subs {
+		if isSHA256Hex(s) {
+			shas = append(shas, s)
+		} else {
+			purls = append(purls, s)
+		}
+	}
+	return shas, purls
+}
+
 // AddSightings idempotently upserts external-corroboration records and flips
 // samples.corroborated true for any sample whose sha256 or purl_base a newly
 // changed sighting matches. Subjects are normalized onto the ledger's keying

@@ -139,6 +139,9 @@ adds both service accounts to the `samples` group by default.
 ./hopper false-negatives --db "$DATABASE_URL"
 ./hopper rescan --db "$DATABASE_URL" <sha256>
 ./hopper import --from old.db --db "$DATABASE_URL"
+
+# Audit hot samples queries for seq-scan regressions (needs production-like stats):
+HOPPER_PLAN_DSN="$DATABASE_URL" go test ./... -run TestPlanAudit -count=1
 ```
 
 The bare `./hopper` command prints the maintained command list, including

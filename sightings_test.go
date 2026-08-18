@@ -168,6 +168,17 @@ func TestSHACitedUnknowns(t *testing.T) {
 	}
 }
 
+func TestSplitSightingSubjects(t *testing.T) {
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	shas, purls := splitSightingSubjects([]string{sha, "pkg:npm/evil", "pkg:chrome-extension/abc"})
+	if len(shas) != 1 || shas[0] != sha {
+		t.Fatalf("shas = %v, want [%s]", shas, sha)
+	}
+	if len(purls) != 2 {
+		t.Fatalf("purls = %v, want 2", purls)
+	}
+}
+
 // TestAddSightingsNormalizesSubjects: the ledger keys corroboration by exact
 // match, so subjects must land in canonical form no matter what spelling the
 // producer holds — uppercase hashes lowercase, PURLs fold onto the canonical

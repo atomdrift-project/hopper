@@ -4204,6 +4204,18 @@ func (db *DB) staleSamplesPG(ctx context.Context, prefixes []string, olderThan t
 	return scanPGSamples(rows)
 }
 
+// Mark-corroborated updates MUST be single-column. OR-ing sha256 and purl_base
+// in one predicate forces a sequential scan of samples on large corpora (see
+// plan_audit_test.go). Keep these as separate statements and never merge them.
+const (
+	markCorroboratedBySHASQL = `
+		UPDATE samples SET corroborated = true
+		WHERE NOT corroborated AND sha256 = ANY($1)`
+	markCorroboratedByPURLSQL = `
+		UPDATE samples SET corroborated = true
+		WHERE purl_base = ANY($1) AND purl_base <> '' AND NOT corroborated`
+)
+
 // sightingUpsertChunk bounds one INSERT…unnest statement so a producer pushing a
 // whole feed snapshot (tens of thousands of rows) is split into several ordinary
 // statements rather than one enormous array literal. AddSightings loops over the
@@ -4263,12 +4275,19 @@ func (db *DB) addSightingsPG(ctx context.Context, s []Sighting) (int, error) {
 			subs = append(subs, subj)
 		}
 		// Flip the denormalized flag only for the changed subjects, guarded by
-		// NOT corroborated so a re-run touches nothing. The sha256/purl_base OR
-		// lives here on the write path, never in the feed read query.
-		if _, err := tx.Exec(ctx, `
-			UPDATE samples SET corroborated = true
-			WHERE NOT corroborated AND (sha256 = ANY($1) OR purl_base = ANY($1))`, subs); err != nil {
-			return 0, fmt.Errorf("hopper: mark corroborated: %w", err)
+		// NOT corroborated so a re-run touches nothing. Two single-column
+		// updates (never OR'd) so Postgres can use the sha256 PK and
+		// idx_samples_purl_base instead of seq-scanning samples.
+		shas, purls := splitSightingSubjects(subs)
+		if len(shas) > 0 {
+			if _, err := tx.Exec(ctx, markCorroboratedBySHASQL, shas); err != nil {
+				return 0, fmt.Errorf("hopper: mark corroborated: %w", err)
+			}
+		}
+		if len(purls) > 0 {
+			if _, err := tx.Exec(ctx, markCorroboratedByPURLSQL, purls); err != nil {
+				return 0, fmt.Errorf("hopper: mark corroborated: %w", err)
+			}
 		}
 	}
 

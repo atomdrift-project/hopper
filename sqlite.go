@@ -3341,29 +3341,41 @@ func (db *DB) addSightingsSQLite(ctx context.Context, s []Sighting) (int, error)
 			subs = append(subs, subj)
 		}
 		// Flip the flag for changed subjects, guarded by corroborated = 0.
-		// Chunked IN lists keep any single statement bounded.
+		// Two single-column updates (never OR'd) so each hits its own index;
+		// chunked IN lists keep any single statement bounded.
 		const chunk = 500
-		for start := 0; start < len(subs); start += chunk {
-			end := min(start+chunk, len(subs))
-			batch := subs[start:end]
-			ph := make([]string, len(batch))
-			args := make([]any, 0, len(batch)*2)
-			for i := range batch {
-				ph[i] = "?"
+		mark := func(col string, keys []string) error {
+			for start := 0; start < len(keys); start += chunk {
+				end := min(start+chunk, len(keys))
+				batch := keys[start:end]
+				ph := make([]string, len(batch))
+				args := make([]any, len(batch))
+				for i := range batch {
+					ph[i] = "?"
+					args[i] = batch[i]
+				}
+				list := strings.Join(ph, ", ")
+				// purl_base is a partial index (purl_base != ''); include that
+				// predicate so SQLite can use it the same way Postgres does.
+				extra := ""
+				if col == "purl_base" {
+					extra = " AND purl_base != ''"
+				}
+				//nolint:gosec // G202: col is a fixed identifier; list is "?" placeholders; keys are bound args.
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE samples SET corroborated = 1 WHERE corroborated = 0`+extra+` AND `+
+						col+` IN (`+list+`)`, args...); err != nil {
+					return fmt.Errorf("hopper: mark corroborated: %w", err)
+				}
 			}
-			for i := range batch {
-				args = append(args, batch[i])
-			}
-			for i := range batch {
-				args = append(args, batch[i])
-			}
-			list := strings.Join(ph, ", ")
-			//nolint:gosec // G202: list is fixed "?" placeholders; subjects are bound args.
-			if _, err := tx.ExecContext(ctx,
-				`UPDATE samples SET corroborated = 1 WHERE corroborated = 0 AND `+
-					`(sha256 IN (`+list+`) OR purl_base IN (`+list+`))`, args...); err != nil {
-				return 0, fmt.Errorf("hopper: mark corroborated: %w", err)
-			}
+			return nil
+		}
+		shas, purls := splitSightingSubjects(subs)
+		if err := mark("sha256", shas); err != nil {
+			return 0, err
+		}
+		if err := mark("purl_base", purls); err != nil {
+			return 0, err
 		}
 	}
 
