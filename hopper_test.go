@@ -5504,6 +5504,106 @@ func TestTriageThresholds(t *testing.T) {
 	}
 }
 
+// TestTriageExcludesEmptyPathReferences locks that reference-only rows —
+// registry sidecars and fetched deps, which [containmentColumns] stores with
+// samples.path '' — never enter the queues cyclotron polls. Without this they
+// match TriageNew (suspicious_count from the exploded stub) and burn a HEAD
+// /api/file probe each cycle for bytes hopper will never serve.
+func TestTriageExcludesEmptyPathReferences(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	const (
+		archive = "aa00000000000000000000000000000000000000000000000000000000000000"
+		sidecar = "bb00000000000000000000000000000000000000000000000000000000000000"
+		fetched = "cc00000000000000000000000000000000000000000000000000000000000000"
+		real    = "dd00000000000000000000000000000000000000000000000000000000000000"
+	)
+
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: archive, Source: "test", Label: "unknown", LabelSource: "test",
+		Path: "incoming/pkg.tgz",
+	})
+	// Virtual !! path satisfies validSample; LocationRel blanks samples.path.
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: sidecar, Source: "test", Label: "unknown", LabelSource: "test",
+		Path: "incoming/pkg.tgz!!pkg@1.0.0.registry.json", Parent: archive,
+		LocationRel: string(RelRegistry),
+	})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: fetched, Source: "test", Label: "unknown", LabelSource: "test",
+		Path: "incoming/pkg.tgz!!dep-1.0.0.tgz", Parent: archive,
+		LocationRel: string(RelFetched),
+	})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: real, Source: "test", Label: "unknown", LabelSource: "test",
+		Path: "incoming/real.bin",
+	})
+
+	for _, sha := range []string{sidecar, fetched, real} {
+		got, err := db.SampleBySHA256(ctx, sha)
+		if err != nil {
+			t.Fatalf("SampleBySHA256(%s): %v", sha, err)
+		}
+		switch sha {
+		case real:
+			if got.Path == "" {
+				t.Fatalf("real sample path unexpectedly empty")
+			}
+		default:
+			if got.Path != "" || got.Parent != "" {
+				t.Fatalf("%s: path=%q parent=%q, want both empty (reference projection)",
+					sha, got.Path, got.Parent)
+			}
+		}
+	}
+
+	analyze := func(sha, typ string) {
+		t.Helper()
+		cleave := fmt.Appendf(nil,
+			`{"fs":[{"sha":%q,"type":%q,"dp":0,"ts":[{"l":5},{"l":4},{"l":4},{"l":4}]}]}`,
+			sha, typ)
+		litmus := []byte(`{"class":2,"l":2}`)
+		if _, err := db.StoreResult(ctx, sha, cleave, litmus, nil, nil, ""); err != nil {
+			t.Fatalf("StoreResult(%s): %v", sha, err)
+		}
+	}
+	analyze(sidecar, "registry")
+	analyze(fetched, "npm")
+	analyze(real, "elf")
+
+	has := func(samples []*Sample, sha string) bool {
+		for _, s := range samples {
+			if s.SHA256 == sha {
+				return true
+			}
+		}
+		return false
+	}
+
+	gotNew, err := db.TriageNew(ctx, 100, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageNew: %v", err)
+	}
+	if !has(gotNew, real) {
+		t.Errorf("TriageNew missing real on-disk sample")
+	}
+	if has(gotNew, sidecar) || has(gotNew, fetched) {
+		t.Errorf("TriageNew included empty-path reference sample(s): %+v", gotNew)
+	}
+
+	gotFallout, err := db.TriageFallout(ctx, 100, time.Time{}, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageFallout: %v", err)
+	}
+	if !has(gotFallout, real) {
+		t.Errorf("TriageFallout missing real on-disk sample")
+	}
+	if has(gotFallout, sidecar) || has(gotFallout, fetched) {
+		t.Errorf("TriageFallout included empty-path reference sample(s)")
+	}
+}
+
 // TestTriageSecondOpinion pins the second-opinion candidacy rules: a
 // good-labeled sample qualifies on a trusted-source sighting or on sightings
 // from two-plus distinct sources, is deferred while its analysis is fresh, is

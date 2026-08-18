@@ -2345,6 +2345,16 @@ const knownRetrievableSQL = `
 	           AND sl.parent_sha256 <> ''
 	           AND sl.rel IN ` + containmentRelsSQL + `))`
 
+// triageServablePathSQL excludes samples whose bytes hopper cannot serve.
+// Reference edges (rel=registry / rel=fetched) deliberately leave samples.path
+// empty via [containmentColumns] — there is nothing on disk and nothing to
+// extract — and without this filter triage queues hand those SHAs to cyclotron,
+// which HEAD-probes /api/file and logs a permanent "outside allowed directories"
+// WARN for every one. Unaliased samples rows only; aliased forms spell
+// `<alias>.path <> ''` inline. Partial indexes that back these selectors must
+// carry the same predicate or the planner will not match them.
+const triageServablePathSQL = ` AND path <> ''`
+
 // KnownSHA256 returns the subset of the given digests whose bytes hopper can
 // actually produce, so a bulk producer (a remote forager, a scanner) skips
 // transferring only what hopper genuinely holds. Order is unspecified; treat
@@ -3610,6 +3620,8 @@ const (
 // A skip means the sample cannot be worked: 'missing' and 'corrupt' have no
 // bytes to fetch, 'unsupported' is a type cleave cannot parse, so no trait can
 // be written for it. Selecting them spent a batch slot to reach a dead end.
+// Empty paths are excluded too ([triageServablePathSQL]): reference-only rows
+// (registry sidecars, fetched deps not yet uploaded) are permanently unservable.
 func (db *DB) TriageBad(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
 		return db.triageBadPG(ctx, limit, f)
@@ -3765,6 +3777,8 @@ func (db *DB) StrandedMembers(ctx context.Context, root string) ([]*Sample, erro
 // finding (suspicious_count >= 1), taking up to limit of the most recently
 // added (created_at). The review pool is a separate, explicit queue; keeping it
 // out of this selector prevents two workers from judging the same sample.
+// Empty paths are excluded ([triageServablePathSQL]): explode records
+// registry/fetched references with samples.path '' and no bytes to fetch.
 func (db *DB) TriageNew(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
 		return db.triageNewPG(ctx, limit, f)
@@ -3815,8 +3829,10 @@ func (db *DB) TriageSighted(ctx context.Context, limit int, f TriageFilter) ([]*
 // judgement, which covers samples whose interpret pass errors (large renders
 // overflow the endpoint) and would otherwise re-select every cooldown until
 // they aged out of the createdAfter window.
-// Registry sidecars are excluded and containment is judged by the
-// sample_locations ledger, both mirroring the feed query the page is built on.
+// Registry sidecars are excluded (file_type), empty paths are excluded
+// ([triageServablePathSQL] — covers fetched deps that share the same
+// unservable shape), and containment is judged by the sample_locations ledger,
+// all mirroring the feed query the page is built on.
 func (db *DB) TriageFallout(ctx context.Context, limit int, createdAfter time.Time, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
 		return db.triageFalloutPG(ctx, limit, createdAfter, f)

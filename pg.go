@@ -291,19 +291,46 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// created_at is NOT NULL, so unlike idx_samples_good_hostile_score no
 		// NULLS spelling is needed for the DESC key to match the ORDER BY.
 		// Each WHERE must stay byte-identical to its selector's predicate,
-		// skip = '' included, or the planner will not match the partial.
+		// skip = '' and path <> '' included, or the planner will not match the
+		// partial. path <> '' drops reference-only rows (registry/fetched)
+		// that triage would otherwise hand to cyclotron with no bytes to fetch.
+		//
+		// Recreate when an older definition is missing path <> '': CREATE INDEX
+		// IF NOT EXISTS will not rewrite a pre-existing partial predicate.
+		`DO $$
+		DECLARE
+			idx text;
+			def text;
+		BEGIN
+			FOREACH idx IN ARRAY ARRAY[
+				'idx_samples_bad_miss_newest',
+				'idx_samples_good_repair_newest',
+				'idx_samples_unknown_newest',
+				'idx_samples_new_interesting',
+				'idx_samples_sighted_newest',
+				'idx_samples_bad_miss_stale',
+				'idx_samples_good_repair_stale',
+				'idx_samples_new_stale'
+			]
+			LOOP
+				SELECT pg_get_indexdef(to_regclass(idx)) INTO def;
+				IF def IS NOT NULL AND def NOT ILIKE '%path <>%' THEN
+					EXECUTE format('DROP INDEX %I', idx);
+				END IF;
+			END LOOP;
+		END$$`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_bad_miss_newest ` +
 			`ON samples(created_at DESC, id DESC) ` +
 			`WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = '' ` +
-			`AND skip = '' AND max_crit < 5 AND suspicious_count < 2`,
+			`AND skip = '' AND path <> '' AND max_crit < 5 AND suspicious_count < 2`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_good_repair_newest ` +
 			`ON samples(created_at DESC, id DESC) ` +
 			`WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = '' ` +
-			`AND skip = '' AND (max_crit >= 5 OR suspicious_count >= 2)`,
+			`AND skip = '' AND path <> '' AND (max_crit >= 5 OR suspicious_count >= 2)`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_unknown_newest ` +
 			`ON samples(created_at DESC, id DESC) ` +
 			`WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' ` +
-			`AND skip = '' AND suspicious_count >= 1`,
+			`AND skip = '' AND path <> '' AND suspicious_count >= 1`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_review_newest ` +
 			`ON samples(created_at DESC, id DESC) ` +
 			`WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' ` +
@@ -317,11 +344,11 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			`ON samples(corroborated DESC, max_crit DESC, suspicious_count DESC, ` +
 			`litmus_score DESC NULLS LAST, analyzed_at, id) ` +
 			`WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' ` +
-			`AND skip = '' AND suspicious_count >= 1 AND path NOT LIKE 'review/%'`,
+			`AND skip = '' AND path <> '' AND suspicious_count >= 1 AND path NOT LIKE 'review/%'`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_sighted_newest ` +
 			`ON samples(created_at DESC, id DESC) ` +
 			`WHERE label = 'sighted' AND cleave_result IS NOT NULL AND parent = '' ` +
-			`AND skip = ''`,
+			`AND skip = '' AND path <> ''`,
 		// The three TriageStale selectors: same populations as TriageBad /
 		// TriageGood / TriageNew, ranked least-recently-analyzed first so triage
 		// reaches verdicts rendered by old trait sets instead of re-working the
@@ -339,15 +366,15 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_bad_miss_stale ` +
 			`ON samples(analyzed_at, id) ` +
 			`WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = '' ` +
-			`AND skip = '' AND max_crit < 5 AND suspicious_count < 2`,
+			`AND skip = '' AND path <> '' AND max_crit < 5 AND suspicious_count < 2`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_good_repair_stale ` +
 			`ON samples(analyzed_at, id) ` +
 			`WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = '' ` +
-			`AND skip = '' AND (max_crit >= 5 OR suspicious_count >= 2)`,
+			`AND skip = '' AND path <> '' AND (max_crit >= 5 OR suspicious_count >= 2)`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_new_stale ` +
 			`ON samples(analyzed_at, id) ` +
 			`WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' ` +
-			`AND suspicious_count >= 1`,
+			`AND skip = '' AND path <> '' AND suspicious_count >= 1`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_top_ready_first_analyzed_coalesce ` +
 			`ON samples((COALESCE(first_analyzed_at, analyzed_at)) DESC, id) ` +
 			`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL`,
@@ -3635,7 +3662,8 @@ func (db *DB) triageBadPG(ctx context.Context, limit int, f TriageFilter) ([]*Sa
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''`+
+			triageServablePathSQL+`
 		   AND max_crit < 5 AND suspicious_count < 2`+extra+`
 		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
@@ -3650,7 +3678,8 @@ func (db *DB) triageGoodPG(ctx context.Context, limit int, f TriageFilter) ([]*S
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''`+
+			triageServablePathSQL+`
 		   AND (max_crit >= 5 OR suspicious_count >= 2)`+extra+`
 		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
@@ -3665,7 +3694,8 @@ func (db *DB) triageNewPG(ctx context.Context, limit int, f TriageFilter) ([]*Sa
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''
+		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''`+
+			triageServablePathSQL+`
 		   AND suspicious_count >= 1 AND path NOT LIKE 'review/%'`+extra+`
 		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
@@ -3695,7 +3725,8 @@ func (db *DB) triageSightedPG(ctx context.Context, limit int, f TriageFilter) ([
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE label = 'sighted' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''`+extra+`
+		 WHERE label = 'sighted' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''`+
+			triageServablePathSQL+extra+`
 		 ORDER BY created_at DESC, id DESC LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
@@ -3717,7 +3748,8 @@ func (db *DB) triageSecondOpinionPG(ctx context.Context, limit int, trusted []st
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = ''
+		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = ''`+
+			triageServablePathSQL+`
 		   AND corroborated
 		   AND NOT (max_crit >= 5 OR suspicious_count >= 2)
 		   AND analyzed_at < $1
@@ -3749,10 +3781,10 @@ func (db *DB) triageSecondOpinionPG(ctx context.Context, limit int, trusted []st
 // partial index costs ~100s, the recursive probe ~80 index descents / ~ms).
 // Must stay byte-compatible with idx_samples_{good,bad}_route_score's WHERE.
 const (
-	triageGoodScoredWherePG        = `label = 'good' AND litmus_score IS NOT NULL AND cleave_result IS NOT NULL AND skip = ''`
-	triageGoodScoredWherePGAliased = `s.label = 'good' AND s.litmus_score IS NOT NULL AND s.cleave_result IS NOT NULL AND s.skip = ''`
-	triageBadScoredWherePG         = `label = 'bad' AND litmus_score IS NOT NULL AND cleave_result IS NOT NULL AND skip = ''`
-	triageBadScoredWherePGAliased  = `s.label = 'bad' AND s.litmus_score IS NOT NULL AND s.cleave_result IS NOT NULL AND s.skip = ''`
+	triageGoodScoredWherePG        = `label = 'good' AND litmus_score IS NOT NULL AND cleave_result IS NOT NULL AND skip = '' AND path <> ''`
+	triageGoodScoredWherePGAliased = `s.label = 'good' AND s.litmus_score IS NOT NULL AND s.cleave_result IS NOT NULL AND s.skip = '' AND s.path <> ''`
+	triageBadScoredWherePG         = `label = 'bad' AND litmus_score IS NOT NULL AND cleave_result IS NOT NULL AND skip = '' AND path <> ''`
+	triageBadScoredWherePGAliased  = `s.label = 'bad' AND s.litmus_score IS NOT NULL AND s.cleave_result IS NOT NULL AND s.skip = '' AND s.path <> ''`
 )
 
 // triageHighestPG: see TriageHighest. Returns one row per archive (the root
@@ -3924,7 +3956,8 @@ func (db *DB) triageAcquitPG(ctx context.Context, limit int, createdBefore time.
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = ''
+		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = ''`+
+			triageServablePathSQL+`
 		   AND skip != 'conflict' AND label_source != 'conflict'
 		   AND max_crit >= 5 AND suspicious_count >= 2
 		   AND created_at < $1
@@ -3953,7 +3986,7 @@ func (db *DB) triageFalloutPG(ctx context.Context, limit int, createdAfter time.
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleCols+` FROM samples
 		 WHERE litmus_class = 2 AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL
-		   AND skip = '' AND file_type <> 'registry'
+		   AND skip = '' AND file_type <> 'registry'`+triageServablePathSQL+`
 		   AND created_at > $1
 		   AND (llm_result IS NULL OR COALESCE(llm_result->>'interpretation', '') = '')
 		   AND NOT EXISTS (SELECT 1 FROM reports r

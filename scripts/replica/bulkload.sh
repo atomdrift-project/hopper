@@ -266,9 +266,30 @@ bulkload_resume_pending() {
     _bulk_apply_gucs
 }
 
+# _bulk_tablesync_busy — true if a tablesync worker or live COPY is driving
+# progress right now. Mid-sync srsubstate alone is not enough: disable_on_error
+# can kill workers and leave i/d/f/s stale.
+_bulk_tablesync_busy() {
+    _w=$(admin -d "$LOCAL_DB" -tAc \
+        "SELECT 1 FROM pg_stat_activity
+          WHERE backend_type LIKE 'logical replication tablesync%'
+          LIMIT 1" 2>/dev/null | tr -d '[:space:]')
+    [ "$_w" = "1" ] && return 0
+    _c=$(admin -d "$LOCAL_DB" -tAc \
+        "SELECT 1 FROM pg_stat_progress_copy LIMIT 1" 2>/dev/null | tr -d '[:space:]')
+    [ "$_c" = "1" ] && return 0
+    return 1
+}
+
 # bulkload_finish TABLE... — block until each deferred table finishes its copy,
-# rebuilding its indexes as it does, then restore the bulk GUCs. Bails (leaving
-# the DDL files) if the subscription disables itself on an apply error.
+# rebuilding its indexes as it does, then restore the bulk GUCs.
+#
+# disable_on_error can flip subenabled off while a tablesync COPY is still
+# healthy (apply died; tablesync keeps going). Reindex ready tables and keep
+# waiting while a tablesync worker / COPY is alive. Only bail early when the
+# sub is disabled AND tablesync looks idle — leaving deferred-index DDL for a
+# later make replica. (setup.sh's final health check still fails if apply is
+# down after indexes are rebuilt.)
 bulkload_finish() {
     [ "$FAST_SYNC" = "true" ] || return 0
     _remaining=$(printf '%s' "$*" | tr -s ' ')
@@ -276,15 +297,11 @@ bulkload_finish() {
     [ -n "$_remaining" ] || return 0
     log "fast-sync: waiting for tablesync to finish, rebuilding indexes as each table completes (this blocks until the copy is done)"
     _beats=0
+    _disabled_logged=
+    _disabled_idle=0
     while [ -n "$_remaining" ]; do
-        _en=$(admin -d "$LOCAL_DB" -tAc \
-            "SELECT subenabled FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" 2>/dev/null | tr -d '[:space:]')
-        if [ "$_en" != "t" ]; then
-            log "fast-sync: subscription '$SUBSCRIPTION' is no longer enabled (apply error / disable_on_error?)."
-            log "fast-sync: leaving deferred-index DDL in $(_bulk_state_dir) — rebuild it after the subscription recovers."
-            bulkload_restore_gucs || true
-            return 1
-        fi
+        # Reindex newly-ready tables BEFORE the enabled check so a disable that
+        # races a tablesync finish still gets that table's deferred indexes.
         _next=''
         for _t in $_remaining; do
             if [ "$(_bulk_srsubstate "$_t")" = "r" ]; then
@@ -294,14 +311,42 @@ bulkload_finish() {
             fi
         done
         _remaining="${_next# }"
-        if [ -n "$_remaining" ]; then
-            _beats=$((_beats + 1))
-            # Heartbeat roughly every ~5 minutes so a long copy shows progress.
-            if [ $((_beats % 20)) -eq 0 ]; then
+        [ -n "$_remaining" ] || break
+
+        _en=$(admin -d "$LOCAL_DB" -tAc \
+            "SELECT subenabled FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" 2>/dev/null | tr -d '[:space:]')
+        if [ "$_en" != "t" ]; then
+            if _bulk_tablesync_busy; then
+                _disabled_idle=0
+                if [ -z "$_disabled_logged" ]; then
+                    log "fast-sync: subscription '$SUBSCRIPTION' disabled (disable_on_error?) — still waiting on tablesync:$_remaining"
+                    _disabled_logged=1
+                fi
+            else
+                # Brief grace: worker/COPY can flap between tables or polls.
+                _disabled_idle=$((_disabled_idle + 1))
+                if [ "$_disabled_idle" -ge 3 ]; then
+                    log "fast-sync: subscription '$SUBSCRIPTION' is no longer enabled (apply error / disable_on_error?)."
+                    log "fast-sync: tablesync is idle with unfinished tables ($_remaining) — leaving deferred-index DDL in $(_bulk_state_dir)."
+                    log "fast-sync: re-run make replica once the sub can be re-enabled to finish indexes / catch-up."
+                    bulkload_restore_gucs || true
+                    return 1
+                fi
+            fi
+        else
+            _disabled_idle=0
+        fi
+
+        _beats=$((_beats + 1))
+        # Heartbeat roughly every ~5 minutes so a long copy shows progress.
+        if [ $((_beats % 20)) -eq 0 ]; then
+            if [ -n "$_disabled_logged" ]; then
+                log "fast-sync: still copying (sub disabled):$_remaining"
+            else
                 log "fast-sync: still copying:$_remaining"
             fi
-            sleep "$BULK_POLL_SECS"
         fi
+        sleep "$BULK_POLL_SECS"
     done
     log "fast-sync: all deferred indexes rebuilt — restoring GUCs to their pre-copy values"
     bulkload_restore_gucs
