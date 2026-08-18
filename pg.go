@@ -998,21 +998,34 @@ const trgmIndexDDL = `CREATE INDEX IF NOT EXISTS idx_samples_filename_trgm ` +
 	`ON samples USING gin (filename gin_trgm_ops) ` +
 	`WHERE cleave_result IS NOT NULL AND parent = ''`
 
-// isDeferrableIndexDDL reports whether ddl is a CREATE INDEX that can be built
-// in the background after the server starts. A missing index only makes
-// queries slower; building one on a large table holds an ACCESS-blocking lock
-// or a long concurrent scan, which would strand workers if it ran on the
-// startup critical path.
+// isDeferrableIndexDDL reports whether ddl is index or stats work that can
+// wait until after the server is serving. A missing or stale index only makes
+// queries slower; a regular DROP/CREATE INDEX takes ACCESS EXCLUSIVE, which
+// cannot run while a logical-replication tablesync COPY holds ACCESS SHARE
+// (hours on samples). ANALYZE is the same class: useful, never required to
+// accept work. Startup must not die on any of these.
 func isDeferrableIndexDDL(ddl string) bool {
-	return strings.HasPrefix(strings.TrimSpace(ddl), "CREATE INDEX")
+	s := strings.TrimSpace(ddl)
+	u := strings.ToUpper(s)
+	switch {
+	case strings.HasPrefix(s, "CREATE INDEX"), strings.HasPrefix(u, "DROP INDEX"):
+		return true
+	case strings.HasPrefix(u, "ANALYZE "):
+		return true
+	case strings.HasPrefix(u, "DO $$") && strings.Contains(u, "DROP INDEX"):
+		return true
+	default:
+		return false
+	}
 }
 
 // migrateServingPG applies the migrations a server needs before it can safely
 // accept work — the base schema, columns, and the pg_trgm extension — and
-// returns a function that builds the deferrable indexes. The caller runs that
-// function in the background once it is serving, so a new index build never
-// blocks workers. On an established database every index already exists, so the
-// returned function is a fast sequence of ledger-skipped no-ops.
+// returns a function that builds the deferrable indexes (and ANALYZE). The
+// caller runs that function in the background once it is serving, so a new
+// index build or stale-index rewrite never blocks workers. On an established
+// database every index already exists, so the returned function is a fast
+// sequence of ledger-skipped no-ops.
 func (db *DB) migrateServingPG(ctx context.Context, allowRewrite bool) (func(context.Context) error, error) {
 	if err := db.ensurePGMigrationLedger(ctx); err != nil {
 		return nil, fmt.Errorf("hopper: migrate: %w", err)
@@ -1050,16 +1063,19 @@ func (db *DB) migrateServingPG(ctx context.Context, allowRewrite bool) (func(con
 
 	return func(ctx context.Context) error {
 		for _, ddl := range deferred {
-			if err := db.execPGMigrationDDL(ctx, ddl, allowRewrite); err != nil {
-				return fmt.Errorf("hopper: migrate index: %w", err)
-			}
+		if err := db.execPGMigrationDDL(ctx, ddl, allowRewrite); err != nil {
+			// Serving already started; a lock timeout here (e.g. ACCESS
+			// EXCLUSIVE behind a logical-replication COPY) must not take
+			// hopper down. The caller retries until this returns nil.
+			return fmt.Errorf("hopper: migrate index: %w", err)
 		}
-		if trgmReady {
-			if err := db.execPGMigrationDDL(ctx, trgmIndexDDL, allowRewrite); err != nil {
-				slog.Warn("optional migration skipped; continuing without it", "ddl", trgmIndexDDL, "error", err)
-			}
+	}
+	if trgmReady {
+		if err := db.execPGMigrationDDL(ctx, trgmIndexDDL, allowRewrite); err != nil {
+			slog.Warn("optional migration skipped; continuing without it", "ddl", trgmIndexDDL, "error", err)
 		}
-		slog.Info("index migrations applied", "count", len(deferred))
+	}
+	slog.Info("index migrations applied", "count", len(deferred))
 		// One-time, chunked, resumable; a non-fatal failure just resumes next
 		// boot, so a transient hiccup never blocks startup.
 		if err := db.reconcileLocationParentEdges(ctx); err != nil {
@@ -1133,6 +1149,18 @@ func (db *DB) execPGMigrationDDL(ctx context.Context, ddl string, allowRewrite b
 
 	if idx, ok := concurrentIndexDDL(ddl); ok {
 		if err := db.createIndexConcurrently(ctx, ddl, idx); err != nil {
+			return err
+		}
+		return db.recordPGMigration(ctx, id, ddl)
+	}
+	if name, ok := concurrentDropIndexDDL(ddl); ok {
+		if err := db.dropIndexConcurrently(ctx, name); err != nil {
+			return err
+		}
+		return db.recordPGMigration(ctx, id, ddl)
+	}
+	if isIndexRewriteDO(ddl) {
+		if err := db.execIndexRewriteDO(ctx, ddl); err != nil {
 			return err
 		}
 		return db.recordPGMigration(ctx, id, ddl)
@@ -1263,6 +1291,9 @@ func (db *DB) pgMigrationAlreadySatisfied(ctx context.Context, ddl string) (bool
 	// block is a guaranteed no-op, so record it satisfied without executing it.
 	if isCleaveDeriveColumnsDDL(ddl) {
 		return db.pgCleaveDeriveColumnsConverted(ctx)
+	}
+	if isIndexRewriteDO(ddl) {
+		return db.pgIndexRewriteAlreadySatisfied(ctx, ddl)
 	}
 	switch normalizeMigrationDDL(ddl) {
 	case `ALTER TABLE samples ADD COLUMN IF NOT EXISTS traits_version TEXT NOT NULL DEFAULT ''`:
@@ -1410,7 +1441,128 @@ func concurrentIndexDDL(ddl string) (string, bool) {
 	return fields[5], true
 }
 
-func (db *DB) createIndexConcurrently(ctx context.Context, ddl, indexName string) error {
+func concurrentDropIndexDDL(ddl string) (string, bool) {
+	fields := strings.Fields(strings.TrimSpace(ddl))
+	if len(fields) < 3 || !strings.EqualFold(fields[0], "DROP") || !strings.EqualFold(fields[1], "INDEX") {
+		return "", false
+	}
+	i := 2
+	if i < len(fields) && strings.EqualFold(fields[i], "CONCURRENTLY") {
+		i++
+	}
+	if i+1 < len(fields) && strings.EqualFold(fields[i], "IF") && strings.EqualFold(fields[i+1], "EXISTS") {
+		i += 2
+	}
+	if i >= len(fields) {
+		return "", false
+	}
+	return strings.Trim(fields[i], ";"), true
+}
+
+func isIndexRewriteDO(ddl string) bool {
+	s := strings.TrimSpace(ddl)
+	u := strings.ToUpper(s)
+	return strings.HasPrefix(u, "DO $$") && strings.Contains(u, "DROP INDEX")
+}
+
+func indexNamesInDDL(ddl string) []string {
+	var names []string
+	seen := map[string]struct{}{}
+	for s := ddl; ; {
+		i := strings.Index(s, "idx_")
+		if i < 0 {
+			return names
+		}
+		j := i + len("idx_")
+		for j < len(s) {
+			c := s[j]
+			if c != '_' && (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+				break
+			}
+			j++
+		}
+		name := s[i:j]
+		if _, ok := seen[name]; !ok {
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+		s = s[j:]
+	}
+}
+
+func indexRewriteHasKnownPredicate(ddl string) bool {
+	return strings.Contains(ddl, "NOT ILIKE '%path <>%'") ||
+		(strings.Contains(ddl, "idx_samples_claimable") && strings.Contains(ddl, "updated_at NULLS FIRST"))
+}
+
+func indexDefNeedsRewrite(ddl, def string) bool {
+	lower := strings.ToLower(def)
+	if strings.Contains(ddl, "NOT ILIKE '%path <>%'") {
+		return !strings.Contains(lower, "path <>")
+	}
+	if strings.Contains(ddl, "idx_samples_claimable") {
+		return !strings.Contains(lower, "on public.samples using btree (updated_at nulls first, id)") ||
+			!strings.Contains(lower, "where ((cleave_result is null) and (skip = ''::text) and (parent = ''::text))")
+	}
+	return true
+}
+
+func (db *DB) pgIndexDef(ctx context.Context, name string) (def string, exists bool, err error) {
+	var s *string
+	if err := db.pool.QueryRow(ctx, `SELECT pg_get_indexdef(to_regclass($1))`, name).Scan(&s); err != nil {
+		return "", false, err
+	}
+	if s == nil || *s == "" {
+		return "", false, nil
+	}
+	return *s, true, nil
+}
+
+func (db *DB) pgIndexRewriteAlreadySatisfied(ctx context.Context, ddl string) (bool, error) {
+	if !indexRewriteHasKnownPredicate(ddl) {
+		return false, nil
+	}
+	names := indexNamesInDDL(ddl)
+	if len(names) == 0 {
+		return false, nil
+	}
+	for _, name := range names {
+		def, exists, err := db.pgIndexDef(ctx, name)
+		if err != nil {
+			return false, err
+		}
+		if exists && indexDefNeedsRewrite(ddl, def) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (db *DB) execIndexRewriteDO(ctx context.Context, ddl string) error {
+	// DROP INDEX CONCURRENTLY cannot run inside a DO block (it is not
+	// transaction-safe). A regular DROP INDEX takes ACCESS EXCLUSIVE, which
+	// waits forever behind a logical-replication COPY. Evaluate the catalog
+	// predicate in Go and drop only the stale indexes concurrently.
+	if !indexRewriteHasKnownPredicate(ddl) {
+		return db.execMigrationWithLockRetry(ctx, ddl)
+	}
+	for _, name := range indexNamesInDDL(ddl) {
+		def, exists, err := db.pgIndexDef(ctx, name)
+		if err != nil {
+			return err
+		}
+		if !exists || !indexDefNeedsRewrite(ddl, def) {
+			continue
+		}
+		slog.Info("dropping stale migration index", "index", name)
+		if err := db.dropIndexConcurrently(ctx, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *DB) withUnlockedMigrationConn(ctx context.Context, fn func(*pgxpool.Conn) error) error {
 	// CREATE/DROP INDEX CONCURRENTLY briefly needs ShareUpdateExclusive and waits
 	// for concurrent transactions to drain. The server-wide lock_timeout (kept low
 	// to protect the hot write path) would otherwise cancel the build with
@@ -1431,29 +1583,49 @@ func (db *DB) createIndexConcurrently(ctx context.Context, ddl, indexName string
 		conn.Release()
 	}()
 	if _, err := conn.Exec(ctx, `SET lock_timeout = 0`); err != nil {
-		return fmt.Errorf("hopper: disable lock_timeout for index build: %w", err)
+		return fmt.Errorf("hopper: disable lock_timeout for index migration: %w", err)
 	}
+	return fn(conn)
+}
 
-	invalid, err := db.invalidPGIndex(ctx, indexName)
-	if err != nil {
-		return err
-	}
-	if invalid {
-		drop := "DROP INDEX CONCURRENTLY IF EXISTS " + indexName
-		slog.Info("dropping invalid migration index", "index", indexName, "ddl", drop)
-		if _, err := conn.Exec(ctx, drop); err != nil {
-			return err
-		}
-	}
-
-	ddl = strings.Replace(ddl, "CREATE INDEX IF NOT EXISTS ", "CREATE INDEX CONCURRENTLY IF NOT EXISTS ", 1)
+func (db *DB) dropIndexConcurrently(ctx context.Context, indexName string) error {
+	drop := "DROP INDEX CONCURRENTLY IF EXISTS " + indexName
 	start := time.Now()
-	slog.Info("executing migration ddl", "ddl", ddl)
-	if _, err := conn.Exec(ctx, ddl); err != nil {
+	slog.Info("executing migration ddl", "ddl", drop)
+	err := db.withUnlockedMigrationConn(ctx, func(conn *pgxpool.Conn) error {
+		_, err := conn.Exec(ctx, drop)
+		return err
+	})
+	if err != nil {
 		return err
 	}
 	slog.Info("migration ddl complete", "elapsed", time.Since(start).String())
 	return nil
+}
+
+func (db *DB) createIndexConcurrently(ctx context.Context, ddl, indexName string) error {
+	return db.withUnlockedMigrationConn(ctx, func(conn *pgxpool.Conn) error {
+		invalid, err := db.invalidPGIndex(ctx, indexName)
+		if err != nil {
+			return err
+		}
+		if invalid {
+			drop := "DROP INDEX CONCURRENTLY IF EXISTS " + indexName
+			slog.Info("dropping invalid migration index", "index", indexName, "ddl", drop)
+			if _, err := conn.Exec(ctx, drop); err != nil {
+				return err
+			}
+		}
+
+		ddl = strings.Replace(ddl, "CREATE INDEX IF NOT EXISTS ", "CREATE INDEX CONCURRENTLY IF NOT EXISTS ", 1)
+		start := time.Now()
+		slog.Info("executing migration ddl", "ddl", ddl)
+		if _, err := conn.Exec(ctx, ddl); err != nil {
+			return err
+		}
+		slog.Info("migration ddl complete", "elapsed", time.Since(start).String())
+		return nil
+	})
 }
 
 func (db *DB) invalidPGIndex(ctx context.Context, indexName string) (bool, error) {

@@ -1299,11 +1299,13 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// On an established database these are ledger-skipped no-ops; a genuinely
 	// new index warms up without blocking workers, who keep running on the
 	// existing query plans until it becomes valid. Uses the root ctx (not
-	// loadCtx) so a long build isn't cut short by load completion.
+	// loadCtx) so a long build isn't cut short by load completion. Failures
+	// (lock timeout behind a replica COPY, IO) retry inside buildIndexes;
+	// they must never take the process down.
 	if dr.buildIndexes != nil {
 		go func() {
 			if err := dr.buildIndexes(ctx); err != nil {
-				slog.Warn("background index migration failed; queries may be slower until next restart", "error", err)
+				slog.Warn("background index migration failed; queries may be slower until retry", "error", err)
 			}
 		}()
 	}

@@ -1522,23 +1522,41 @@ func TestSetSkip(t *testing.T) {
 }
 
 func TestPGMigrationPartition(t *testing.T) {
-	// The serving path runs core DDL synchronously and defers index builds.
-	// Correctness rests on two invariants: nothing classified as "core" is a
-	// CREATE INDEX (those are the slow builds we move off the startup path),
-	// and the list actually contains both kinds.
+	// The serving path runs core DDL synchronously and defers index work.
+	// Nothing that needs ACCESS EXCLUSIVE on an existing index (DROP/CREATE
+	// INDEX, or a DO block that issues DROP INDEX) may run before hopper is
+	// serving: a logical-replica COPY holds ACCESS SHARE for hours.
 	var coreN, indexN int
+	sawPathRewrite := false
 	for _, ddl := range pgRuntimeMigrations() {
 		if isDeferrableIndexDDL(ddl) {
 			indexN++
+			if strings.Contains(ddl, "NOT ILIKE '%path <>%'") {
+				sawPathRewrite = true
+			}
 			continue
 		}
 		coreN++
-		if strings.HasPrefix(strings.TrimSpace(ddl), "CREATE INDEX") {
+		s := strings.TrimSpace(ddl)
+		u := strings.ToUpper(s)
+		if strings.HasPrefix(s, "CREATE INDEX") {
 			t.Errorf("CREATE INDEX leaked into the synchronous core phase: %q", ddl)
+		}
+		if strings.HasPrefix(u, "DROP INDEX") {
+			t.Errorf("DROP INDEX leaked into the synchronous core phase: %q", ddl)
+		}
+		if strings.HasPrefix(u, "ANALYZE ") {
+			t.Errorf("ANALYZE leaked into the synchronous core phase: %q", ddl)
+		}
+		if strings.HasPrefix(u, "DO $$") && strings.Contains(u, "DROP INDEX") {
+			t.Errorf("index-rewrite DO leaked into the synchronous core phase: %q", ddl)
 		}
 	}
 	if coreN == 0 || indexN == 0 {
 		t.Fatalf("expected both core and index DDL, got core=%d index=%d", coreN, indexN)
+	}
+	if !sawPathRewrite {
+		t.Fatal("expected the path <> index-rewrite DO to be deferred")
 	}
 
 	// pg_trgm: the extension is core (cheap), the GIN index is deferred.
@@ -1547,6 +1565,69 @@ func TestPGMigrationPartition(t *testing.T) {
 	}
 	if !isDeferrableIndexDDL(trgmIndexDDL) {
 		t.Error("trgm GIN index should be deferred with the other indexes")
+	}
+}
+
+func TestIndexRewriteHelpers(t *testing.T) {
+	name, ok := concurrentDropIndexDDL(`DROP INDEX IF EXISTS idx_samples_claimed`)
+	if !ok || name != "idx_samples_claimed" {
+		t.Fatalf("concurrentDropIndexDDL = %q, %v", name, ok)
+	}
+	if _, ok := concurrentDropIndexDDL(`ALTER TABLE samples DROP COLUMN IF EXISTS forced_rescan_at`); ok {
+		t.Fatal("DROP COLUMN must not look like DROP INDEX")
+	}
+
+	pathDDL := ""
+	claimDDL := ""
+	for _, ddl := range pgRuntimeMigrations() {
+		if strings.Contains(ddl, "NOT ILIKE '%path <>%'") {
+			pathDDL = ddl
+		}
+		if strings.Contains(ddl, "idx_samples_claimable") && strings.Contains(ddl, "DROP INDEX") {
+			claimDDL = ddl
+		}
+	}
+	if pathDDL == "" || claimDDL == "" {
+		t.Fatalf("missing rewrite DO blocks: path=%t claimable=%t", pathDDL != "", claimDDL != "")
+	}
+	if !isIndexRewriteDO(pathDDL) || !isDeferrableIndexDDL(pathDDL) {
+		t.Fatal("path <> rewrite must be a deferrable index-rewrite DO")
+	}
+	names := indexNamesInDDL(pathDDL)
+	if len(names) < 8 {
+		t.Fatalf("path rewrite indexes = %v", names)
+	}
+	old := `CREATE INDEX idx_samples_sighted_newest ON public.samples USING btree (created_at DESC, id DESC) WHERE ((label = 'sighted'::text) AND (parent = ''::text))`
+	if !indexDefNeedsRewrite(pathDDL, old) {
+		t.Fatal("old sighted index missing path <> must be stale")
+	}
+	fresh := old + ` AND (path <> ''::text)`
+	if indexDefNeedsRewrite(pathDDL, fresh) {
+		t.Fatal("index already carrying path <> must not be rewritten")
+	}
+	if !indexRewriteHasKnownPredicate(claimDDL) {
+		t.Fatal("claimable rewrite should have a known predicate")
+	}
+}
+
+func TestRetryDeferredMigrationsSoftFail(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	build := func(context.Context) error {
+		calls++
+		if calls == 1 {
+			cancel()
+			return errors.New("lock timeout")
+		}
+		t.Fatal("must not retry after ctx cancel")
+		return nil
+	}
+	if err := retryDeferredMigrations(ctx, build); err != nil {
+		t.Fatalf("retryDeferredMigrations returned %v, want nil (soft fail)", err)
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1", calls)
 	}
 }
 

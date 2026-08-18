@@ -1795,24 +1795,66 @@ func (db *DB) Migrate(ctx context.Context) error {
 
 // MigrateServing applies the migrations a server needs before it can accept
 // work and returns a function that performs the remaining, deferrable
-// migrations — the index builds. The caller should run that function in the
-// background after it begins serving: a missing index only makes queries
-// slower, never wrong, and building one on a large table can take many minutes
-// — long enough to strand workers if it blocks startup. On SQLite everything is
-// applied up front (local databases are small and have no serving-gap concern)
-// and the returned function is a no-op.
+// migrations — index drops/creates and ANALYZE. The caller should run that
+// function in the background after it begins serving: a missing index only
+// makes queries slower, never wrong, and building one on a large table can
+// take many minutes — long enough to strand workers if it blocks startup.
+// The returned function retries on failure until ctx is cancelled; serving
+// is more important than finishing the index work (logical-replica COPY can
+// hold ACCESS SHARE for hours). On SQLite everything is applied up front
+// (local databases are small and have no serving-gap concern) and the
+// returned function is a no-op.
 func (db *DB) MigrateServing(ctx context.Context) (func(context.Context) error, error) {
 	if db.pool != nil {
 		// allowRewrite is false: the serving path must never run a
 		// table-rewriting migration on a populated samples table, since the
 		// ACCESS EXCLUSIVE lock would freeze every reader and writer for the
 		// length of the rewrite. Such a migration is deferred to `hopper init`.
-		return db.migrateServingPG(ctx, false)
+		build, err := db.migrateServingPG(ctx, false)
+		if err != nil {
+			return nil, err
+		}
+		return func(ctx context.Context) error {
+			return retryDeferredMigrations(ctx, build)
+		}, nil
 	}
 	if err := db.migrateSQLite(ctx); err != nil {
 		return nil, err
 	}
 	return func(context.Context) error { return nil }, nil
+}
+
+const (
+	indexMigrationRetry    = 15 * time.Second
+	indexMigrationRetryMax = 5 * time.Minute
+)
+
+// retryDeferredMigrations keeps trying index/ANALYZE DDL until it succeeds or
+// the process is shutting down. Failures are logged and swallowed: the server
+// is already accepting work, and a lock timeout behind replica tablesync must
+// not become a crash loop.
+func retryDeferredMigrations(ctx context.Context, build func(context.Context) error) error {
+	backoff := indexMigrationRetry
+	for attempt := 1; ; attempt++ {
+		err := build(ctx)
+		if err == nil {
+			return nil
+		}
+		slog.Warn("background index migration failed; retrying (serving continues)",
+			"attempt", attempt, "retry_in", backoff, "error", err)
+		select {
+		case <-ctx.Done():
+			slog.Warn("background index migration abandoned", "error", ctx.Err(), "last_error", err)
+			return nil
+		case <-time.After(backoff):
+		}
+		if backoff < indexMigrationRetryMax {
+			backoff *= 2
+			if backoff > indexMigrationRetryMax {
+				backoff = indexMigrationRetryMax
+			}
+		}
+	}
 }
 
 // DeleteAll removes all rows from reports and samples, preserving the schema.
