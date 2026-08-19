@@ -47,6 +47,11 @@
 #   Local scan (litmus) worker:
 #     hopper_local_worker_up            1 healthy, 0 down
 #     hopper_local_worker_restarts_total  cumulative supervisor restarts
+#     hopper_local_worker_memory_bytes / hopper_local_worker_memory_budget_bytes
+#   Concurrency / backpressure:
+#     hopper_extract_slots_in_use / hopper_extract_slots_max
+#     hopper_result_slots_in_use / hopper_result_slots_max
+#     hopper_load_shed_total{pool="result"|"extract"}
 #
 # Shared obs instrumentation (every atomdrift service exposes these — see the
 # obs package). Labeled by job/instance, pool="<name>" for db_pool_*:
@@ -194,3 +199,15 @@ groups:
         annotations:
           summary: "Hopper DB pool {{ $labels.pool }} acquires being canceled"
           description: "{{ $value | printf \"%.2f\" }} acquire cancellations/sec on pool {{ $labels.pool }} over 10m; connections are not available in time."
+
+      # Result ingestion or archive extraction is shedding work (503 +
+      # Retry-After). Sustained shedding means callers are being turned away —
+      # usually the paired slots_in_use gauge is at slots_max.
+      - alert: HopperLoadShedding
+        expr: sum by (pool) (rate(hopper_load_shed_total[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hopper is load-shedding {{ $labels.pool }} requests"
+          description: "{{ $value | printf \"%.2f\" }} shed requests/sec on pool {{ $labels.pool }} over 10m; check hopper_{{ $labels.pool }}_slots_in_use vs slots_max."

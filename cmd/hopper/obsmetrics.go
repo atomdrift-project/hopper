@@ -39,6 +39,7 @@ type instruments struct {
 	localUp, localRestarts                        metric.Int64Observable
 	localMem, localMemBudget                      metric.Int64Observable
 	extractInUse, extractMax                      metric.Int64Observable
+	resultInUse, resultMax                        metric.Int64Observable
 }
 
 // loadShedCount counts load-shedding events: requests turned away with a
@@ -189,6 +190,10 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 		// ratio is the saturation signal for the extraction cap.
 		extractInUse: gauge("hopper.extract.slots_in_use", "Archive-member extraction slots currently held.", "{slot}"),
 		extractMax:   gauge("hopper.extract.slots_max", "Maximum concurrent archive-member extraction slots.", "{slot}"),
+		// Result-ingestion concurrency. Same shape as extract; pair with
+		// hopper.load_shed.total{pool="result"}.
+		resultInUse: gauge("hopper.result.slots_in_use", "Result-ingestion slots currently held.", "{slot}"),
+		resultMax:   gauge("hopper.result.slots_max", "Maximum concurrent result-ingestion slots.", "{slot}"),
 	}
 	if firstErr != nil {
 		return firstErr
@@ -291,11 +296,15 @@ func (wd *webDashboard) observe(ctx context.Context, o metric.Observer, in *inst
 		}
 	}
 
-	// len/cap of the buffered semaphore: a non-blocking read of in-flight
-	// extractions and the configured ceiling. nil when the cap is disabled.
+	// len/cap of the buffered semaphores: a non-blocking read of in-flight
+	// work and the configured ceiling. nil when the cap is disabled.
 	if api != nil && api.extractSem != nil {
 		o.ObserveInt64(in.extractInUse, int64(len(api.extractSem)))
 		o.ObserveInt64(in.extractMax, int64(cap(api.extractSem)))
+	}
+	if api != nil && api.resultSem != nil {
+		o.ObserveInt64(in.resultInUse, int64(len(api.resultSem)))
+		o.ObserveInt64(in.resultMax, int64(cap(api.resultSem)))
 	}
 }
 

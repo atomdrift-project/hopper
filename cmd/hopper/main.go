@@ -836,9 +836,9 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	experimentTag := f.String("experiment-tag", "", "label for experiment comparison")
 	// Off by default: --verbose makes the worker log a DEBUG line per analyzed
 	// file, which runs 0.5-1.3 GB per spawn. That buries the crash tail hopper
-	// attaches to its own logs (large enough that Grafana Cloud rejected the
-	// push outright: "structured metadata too large") and filled the state dir
-	// with 14 GB on 2026-08-10. Turn it on deliberately when debugging a worker.
+	// attaches to its own logs (large enough that remote OTLP log sinks have
+	// rejected the push: "structured metadata too large") and filled the state
+	// dir with 14 GB on 2026-08-10. Turn it on deliberately when debugging a worker.
 	litmusVerbose := f.Bool("litmus-verbose", false, "enable debug logging in litmus server")
 	dashAddr := f.String("dashboard-addr", "0.0.0.0:8081", "web dashboard listen address (empty to disable)")
 	pprofAddr := f.String("pprof-addr", "127.0.0.1:6060", "net/http/pprof listen address; loopback-only by default (empty to disable)")

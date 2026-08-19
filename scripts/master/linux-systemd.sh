@@ -29,6 +29,9 @@
 #                 Set 0 for a node that owns the full sample tree.
 #   PULL_DISABLE  set to 1 to skip the git pull of ../scan and ../cleave and
 #                 build the current checkouts as-is (e.g. when the remote is down)
+#   OTEL_EXPORTER_OTLP_ENDPOINT  OTLP/HTTP base for metrics (default:
+#                 http://otel:9090/api/v1/otlp)
+#   OTEL_ENV  deployment.environment resource attribute (default: prod)
 
 set -euo pipefail
 
@@ -301,34 +304,6 @@ elif [[ ! -e $pgpass_dst ]]; then
     log "No ~/.pgpass found; hopper will fail to authenticate until one is provided at ${pgpass_dst}"
 fi
 
-# --- Grafana Cloud OTLP token (optional, from the invoking user) ------------
-
-# obs reads the base64 OTLP credential from $HOME/.tok/graf and, when present,
-# pushes metrics/traces/logs to Grafana Cloud. HOME is the StateDirectory
-# (%S/${SERVICE_NAME}), so stage the token there for the service user. Mirrors
-# the .pgpass drop above: sourced from the deploying user, change-detected, 0600.
-graf_src=""
-for candidate in "${GRAF_TOKEN:-}" "${HOME}/.tok/graf"; do
-    if [[ -n $candidate && -f $candidate ]]; then
-        graf_src=$candidate
-        break
-    fi
-done
-
-graf_dst="${STATE_HOME}/.tok/graf"
-if [[ -n $graf_src ]]; then
-    priv install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_HOME}/.tok"
-    if priv cmp -s "$graf_src" "$graf_dst" 2>/dev/null; then
-        log "Grafana token unchanged"
-    else
-        log "Installing Grafana Cloud token from ${graf_src}"
-        priv install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
-            "$graf_src" "$graf_dst"
-    fi
-elif [[ ! -e $graf_dst ]]; then
-    log "No ~/.tok/graf found; OTLP push to Grafana Cloud disabled until one is provided at ${graf_dst}"
-fi
-
 # --- Unit --------------------------------------------------------------------
 
 tmp_unit=$(mktemp -t "${SERVICE_NAME}.service.XXXXXX")
@@ -480,10 +455,12 @@ Environment=_RJEM_MALLOC_CONF=retain:false,muzzy_decay_ms:600000
 # memory fix; revisit downward once the working set is actually bounded.
 Environment=GOMEMLIMIT=32GiB
 
-# OpenTelemetry → Grafana Cloud. No endpoint is set here on purpose: obs falls
-# back to the Grafana Cloud OTLP gateway using the credential staged at
-# $HOME/.tok/graf (see the token drop above). To target a self-hosted fleet
-# instead, set OTEL_EXPORTER_OTLP_ENDPOINT (and _LOGS_ENDPOINT) in the env.
+# OpenTelemetry -> self-hosted Grafana fleet (host otel).
+# Override OTEL_EXPORTER_OTLP_ENDPOINT only when targeting a different collector.
+Environment=OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel:9090/api/v1/otlp}
+Environment=OTEL_DEPLOYMENT_ENVIRONMENT=${OTEL_ENV:-prod}
+# Logs stay local (journald + file); domain metrics push via obs. Init also
+# exposes /_/metrik on the dashboard for scrape-based debugging.
 
 # Resource caps — hopper + litmus children combined.
 #

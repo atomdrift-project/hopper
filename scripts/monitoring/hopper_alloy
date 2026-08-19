@@ -4,7 +4,8 @@
 # REQUIRE: NETWORKING
 # KEYWORD: shutdown
 #
-# Grafana Alloy shipping hopper's Postgres replication metrics to Grafana Cloud.
+# Grafana Alloy shipping hopper's Postgres replication metrics to the
+# self-hosted Grafana fleet (host otel).
 # Install as /usr/local/etc/rc.d/hopper_alloy, then:  sysrc hopper_alloy_enable=YES
 #
 # rc.conf knobs (defaults below):

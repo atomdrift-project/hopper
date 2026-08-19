@@ -5,19 +5,16 @@
 // as a network client, so it needn't be co-located, and FreeBSD/amd64 is an
 // official Alloy build target (unlike illumos). One connection to the publisher
 // is enough: pg_replication_slots there shows every replica's lag and status.
-// Its ONLY job is to ship that replication state to Grafana Cloud — app/runtime
-// metrics already arrive via each Go service's native OTel exporter, so Alloy
-// deliberately does NOT scrape those.
+// Its ONLY job is to ship that replication state to the self-hosted Grafana
+// fleet — app/runtime metrics already arrive via each Go service's native
+// OTel exporter, so Alloy deliberately does NOT scrape those.
 //
-// Transport: scrape the embedded postgres_exporter, then push via OTLP to the
-// Grafana Cloud gateway — the same ingestion path the Go services use (the
-// stack token in ~/.tok/graf is an OTLP-write token for region prod-us-east-3).
+// Transport: scrape the embedded postgres_exporter, then push via OTLP/HTTP
+// to the same collector the Go services use (host otel, no auth).
 //
 // Env (loaded from alloy.env by the rc.d script, see RUNBOOK.md):
-//   EXPORTER_DSN   postgresql://hopper_exporter:PW@hopper-db:5432/hopper?sslmode=disable
-//   GC_OTLP_URL    https://otlp-gateway-prod-us-east-3.grafana.net/otlp
-//   GC_OTLP_USER   Grafana Cloud instance id (1669252)
-//   GC_OTLP_TOKEN  glc_... access-policy token
+//   EXPORTER_DSN    postgresql://hopper_exporter:PW@hopper-db:5432/hopper?sslmode=disable
+//   OTLP_ENDPOINT    http://otel:9090/api/v1/otlp
 
 prometheus.exporter.postgres "publisher" {
   data_source_names          = [sys.env("EXPORTER_DSN")]
@@ -49,7 +46,7 @@ prometheus.relabel "labels" {
   }
 }
 
-// Prometheus -> OTLP -> Grafana Cloud gateway.
+// Prometheus -> OTLP -> self-hosted Grafana fleet (host otel).
 otelcol.receiver.prometheus "default" {
   output {
     metrics = [otelcol.processor.batch.default.input]
@@ -58,18 +55,12 @@ otelcol.receiver.prometheus "default" {
 
 otelcol.processor.batch "default" {
   output {
-    metrics = [otelcol.exporter.otlphttp.grafanacloud.input]
+    metrics = [otelcol.exporter.otlphttp.otel.input]
   }
 }
 
-otelcol.exporter.otlphttp "grafanacloud" {
+otelcol.exporter.otlphttp "otel" {
   client {
-    endpoint = sys.env("GC_OTLP_URL")
-    auth     = otelcol.auth.basic.grafanacloud.handler
+    endpoint = sys.env("OTLP_ENDPOINT")
   }
-}
-
-otelcol.auth.basic "grafanacloud" {
-  username = sys.env("GC_OTLP_USER")
-  password = sys.env("GC_OTLP_TOKEN")
 }

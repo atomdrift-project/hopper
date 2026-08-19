@@ -1,9 +1,10 @@
-# Replica lag monitoring — Grafana Cloud
+# Replica lag monitoring — self-hosted Grafana
 
 Ships Postgres **replication** metrics (the gap the app's OTel pipeline doesn't
-cover) to Grafana Cloud and pages when a replica falls behind, a slot is
-invalidated, or a replica goes away. Alerts evaluate **in the cloud**, so a dead
-replica still pages — the failure mode of the 2026-06-27 galadriel outage.
+cover) to the self-hosted Grafana fleet and pages when a replica falls behind, a
+slot is invalidated, or a replica goes away. Alerts evaluate **in Grafana**, so
+a dead replica still pages — the failure mode of the 2026-06-27 galadriel
+outage.
 
 ## Topology
 
@@ -11,9 +12,9 @@ replica still pages — the failure mode of the 2026-06-27 galadriel outage.
  publisher hopper-db (illumos)        uruk-hai (FreeBSD, 10.9.8.5)
    postgres :5432  ◄───── tailnet ───  Alloy: prometheus.exporter.postgres
    pg_replication_slots                 (hopper_exporter, pg_monitor)
-   (sees every replica's lag)                    │ remote_write
+   (sees every replica's lag)                    │ OTLP/HTTP
                                                  ▼
-                                          Grafana Cloud (Mimir)
+                                          otel (self-hosted Grafana/Mimir)
                                           + replication-alerts.yml
 ```
 
@@ -21,7 +22,7 @@ One Alloy, one connection to the publisher: `pg_replication_slots` on the
 publisher shows galadriel, `.62`, and any tablesync at once. uruk-hai is a
 non-replica box (a monitor shouldn't share a failure domain with what it
 watches), and FreeBSD/amd64 is an official Alloy build target. App/runtime
-metrics already reach Grafana Cloud via each Go service's OTel exporter — not
+metrics already reach the fleet via each Go service's OTel exporter — not
 Alloy's job.
 
 Files in this dir: `config.alloy`, `queries.yaml`, `exporter-role.sql`,
@@ -72,11 +73,13 @@ Copy from this repo dir onto uruk-hai (scp/rsync from a checkout):
 install -m 0644 config.alloy queries.yaml /usr/local/etc/hopper-alloy/
 install -m 0600 -o alloy -g alloy alloy.env.example \
   /usr/local/etc/hopper-alloy/alloy.env
-vi /usr/local/etc/hopper-alloy/alloy.env      # EXPORTER_DSN + GC_* creds
+vi /usr/local/etc/hopper-alloy/alloy.env      # EXPORTER_DSN (+ OTLP_ENDPOINT if needed)
 ```
 
 `config.alloy` already points `custom_queries_config_path` at
-`/usr/local/etc/hopper-alloy/queries.yaml`.
+`/usr/local/etc/hopper-alloy/queries.yaml`. Default `OTLP_ENDPOINT` is
+`http://otel:9090/api/v1/otlp` (no auth). Ensure uruk-hai resolves `otel`
+(e.g. via `/etc/hosts` or DNS) to the collector host.
 
 ## 4. Service (rc.d)
 
@@ -94,21 +97,16 @@ and drops to the `alloy` user.
 ## 5. Verify metrics are flowing
 
 - Alloy's own UI/health: `http://10.9.8.5:12345` (component graph — the
-  `prometheus.exporter.postgres.publisher` and `remote_write` should be healthy).
-- In Grafana Cloud → Explore (Prometheus), query
+  `prometheus.exporter.postgres.publisher` and OTLP exporter should be healthy).
+- In Grafana → Explore (Prometheus), query
   `hopper_replication_slot_retained_wal_bytes` — expect one series per slot with
   a `kind` label, plus `up{job="postgres-publisher"} == 1`.
 
-## 6. Load the alerts (cloud-evaluated)
+## 6. Load the alerts
 
-```sh
-mimirtool rules load replication-alerts.yml \
-  --address="$GC_PROM_URL_BASE" --id="$GC_TENANT" --key="$GC_TOKEN"
-mimirtool rules print --address="$GC_PROM_URL_BASE" --id="$GC_TENANT" --key="$GC_TOKEN"
-```
-(`GC_PROM_URL_BASE` is the Prometheus base URL without `/api/prom/push`; `GC_TENANT`
-is the instance id; `GC_TOKEN` an access-policy token with `metrics:write`.)
-Wire a notification policy/contact point in Grafana Cloud for `severity=page`.
+Load `replication-alerts.yml` into the self-hosted Prometheus/Mimir that
+backs Grafana on `otel` (same rule-load path you use for other hopper alerts).
+Wire a notification policy/contact point for `severity=page`.
 
 ## 7. (Optional) subscriber-side detail
 
@@ -123,7 +121,7 @@ prometheus.exporter.postgres "replica_62" {
 }
 prometheus.scrape "replica_62" {
   targets = prometheus.exporter.postgres.replica_62.targets
-  forward_to = [prometheus.remote_write.grafanacloud.receiver]
+  forward_to = [prometheus.relabel.labels.receiver]
   job_name = "postgres-replica"
   scrape_interval = "30s"
 }
