@@ -34,4 +34,30 @@ hopper_replication_slot:
     - active:             { usage: "GAUGE", description: "1 if a walsender is currently consuming the slot" }
     - wal_status_code:    { usage: "GAUGE", description: "0=reserved 1=extended 2=unreserved 3=lost(invalidated)" }
     - retained_wal_bytes: { usage: "GAUGE", description: "WAL bytes pinned by this slot = replica lag" }
-    - confirmed_lag_bytes:{ usage: "GAUGE", description: "Bytes between current WAL and slot confirmed_flush_lsn" }
+    - confirmed_lag_bytes: { usage: "GAUGE", description: "Bytes between current WAL and slot confirmed_flush_lsn" }
+
+# Publisher health beyond slots: connections + on-disk WAL.
+hopper_pg_stat:
+  query: |
+    SELECT
+      1::int AS up,
+      (SELECT count(*) FROM pg_stat_activity WHERE datname = current_database())::int AS connections,
+      (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') AS max_connections,
+      (SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND state = 'active')::int AS connections_active,
+      (SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock')::int AS connections_waiting_lock,
+      COALESCE((SELECT sum(size)::bigint FROM pg_ls_waldir()), 0) AS wal_bytes
+  master: true
+  metrics:
+    - up: { usage: "GAUGE", description: "1 if publisher query succeeded" }
+    - connections: { usage: "GAUGE", description: "Backends connected to this database" }
+    - max_connections: { usage: "GAUGE", description: "max_connections setting" }
+    - connections_active: { usage: "GAUGE", description: "Active backends" }
+    - connections_waiting_lock: { usage: "GAUGE", description: "Backends waiting on locks" }
+    - wal_bytes: { usage: "GAUGE", description: "Total bytes in pg_wal via pg_ls_waldir" }
+
+hopper_pg_database_size:
+  query: |
+    SELECT pg_database_size(current_database())::bigint AS bytes
+  master: true
+  metrics:
+    - bytes: { usage: "GAUGE", description: "Size of current database in bytes" }

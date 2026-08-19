@@ -14,9 +14,10 @@
 # when its own host is unreachable, so publisher-side scraping alone covers
 # every incident this topology has actually had.
 #
-# Backstop context: publisher max_slot_wal_keep_size = 1500GB; WAL burn
-# ~35-40 GB/h. A slot that crosses the backstop is invalidated ("lost") and its
-# replica needs a full rebuild, so the lag pages fire with hours of runway left.
+# Backstop context: publisher max_slot_wal_keep_size = 1200GB (was 1500GB in
+# earlier notes); WAL burn ~35-40 GB/h. A slot that crosses the backstop is
+# invalidated ("lost") and its replica needs a full rebuild, so the lag pages
+# fire with hours of runway left.
 
 groups:
   - name: hopper-replication
@@ -63,15 +64,31 @@ groups:
           summary: "Replica slot {{ $labels.slot_name }} retaining >300GB WAL"
           description: "{{ $value | humanize1024 }}B pinned by {{ $labels.slot_name }} — the streaming replica is lagging (backstop 1500GB)."
 
-      # Any slot within ~300GB of the 1500GB backstop (~8h runway). Page: if it
-      # crosses, the slot is invalidated and the replica must be rebuilt.
+      # Any slot within ~300GB of the 1200GB backstop. Page: if it crosses, the
+      # slot is invalidated and the replica must be rebuilt.
       - alert: ReplicaSlotLagCritical
-        expr: hopper_replication_slot_retained_wal_bytes > 1200e9
+        expr: hopper_replication_slot_retained_wal_bytes > 900e9
         for: 5m
         labels: { severity: page }
         annotations:
           summary: "Replication slot {{ $labels.slot_name }} near the backstop"
-          description: "{{ $value | humanize1024 }}B pinned by {{ $labels.slot_name }} ({{ $labels.kind }}) — within ~300GB of max_slot_wal_keep_size. It will self-invalidate if it crosses."
+          description: "{{ $value | humanize1024 }}B pinned by {{ $labels.slot_name }} ({{ $labels.kind }}) — within ~300GB of max_slot_wal_keep_size (1200GB). It will self-invalidate if it crosses."
+
+      - alert: PostgresWalOnDiskHigh
+        expr: hopper_pg_stat_wal_bytes > 800e9
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Publisher pg_wal is {{ $value | humanize1024 }}B on disk"
+          description: "pg_ls_waldir sum is large — slots or archive/removal lagging."
+
+      - alert: PostgresConnectionsHigh
+        expr: hopper_pg_stat_connections / hopper_pg_stat_max_connections > 0.8
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Publisher connections at {{ $value | humanizePercentage }} of max"
+          description: "{{ $labels.job }} hopper backends nearing max_connections."
 
       # An initial tablesync (e.g. .62's sample_locations copy) freezes its
       # slot's restart_lsn for the whole COPY, so retention only grows. Expected,

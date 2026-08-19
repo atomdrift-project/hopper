@@ -670,7 +670,16 @@ const (
 	// host accordingly, or add a low-concurrency large-result lane if it bites.
 	maxResultBodyBytes = 1 << 30 // 1 GiB
 	maxTrackedWorkers  = 200
-	apiQueryTimeout    = 30 * time.Second
+	apiQueryTimeout = 30 * time.Second
+	// sightingsStoreTimeout bounds one AddSightings attempt. Large feed
+	// snapshots can flip many samples.corroborated rows; the old shared
+	// apiQueryTimeout (30s) was too tight and timed out under load
+	// (2026-08-17). Each attempt gets a fresh budget; see sightingsAttempts.
+	sightingsStoreTimeout = 5 * time.Minute
+	// sightingsAttempts is how many times /api/sightings retries AddSightings
+	// on a transient failure (lock timeout, brief outage, per-attempt
+	// deadline). Permanent PG errors and a canceled request stop immediately.
+	sightingsAttempts = 3
 	resultStoreTimeout = 10 * time.Minute
 	dbRetryInitial     = 100 * time.Millisecond
 	dbRetryMax         = 5 * time.Second
@@ -2316,7 +2325,9 @@ type sightingsResponse struct {
 // and unauthenticated; hopper-api is not publicly reachable.
 //
 // 200 {"changed":N}; 400 on malformed JSON; 413 when the batch exceeds
-// maxSightingsBatch; 503 while the DB is still starting.
+// maxSightingsBatch; 503 while the DB is still starting. Store retries up to
+// sightingsAttempts times with full-jitter backoff; each attempt is capped at
+// sightingsStoreTimeout.
 func (s *apiServer) handleSightings(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
 		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
@@ -2354,9 +2365,35 @@ func (s *apiServer) handleSightings(w http.ResponseWriter, r *http.Request) {
 		sightings[i] = hopper.Sighting{Source: req.Source, Subject: subject, URL: req.URL, Note: req.Note}
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
-	defer cancel()
-	changed, err := s.db.AddSightings(ctx, sightings)
+	changed, err := retry.DoWithData(
+		func() (int, error) {
+			ctx, cancel := context.WithTimeout(r.Context(), sightingsStoreTimeout)
+			defer cancel()
+			n, err := s.db.AddSightings(ctx, sightings)
+			if err == nil {
+				return n, nil
+			}
+			// Client gone or a deterministic PG fault → stop. Per-attempt
+			// deadline and lock timeouts stay retryable within sightingsAttempts.
+			if r.Context().Err() != nil ||
+				errors.Is(err, context.Canceled) ||
+				permanentPGError(err) {
+				return n, retry.Unrecoverable(err)
+			}
+			return n, err
+		},
+		retry.Context(r.Context()),
+		retry.Attempts(sightingsAttempts),
+		retry.Delay(dbRetryInitial),
+		retry.MaxDelay(dbRetryMax),
+		retry.DelayType(retry.FullJitterBackoffDelay),
+		retry.LastErrorOnly(true),
+		retry.WrapContextErrorWithLastError(true),
+		retry.OnRetry(func(attempt uint, err error) {
+			slog.WarnContext(r.Context(), "sightings: store failed; retrying",
+				"attempt", attempt+1, "error", err, "remote", r.RemoteAddr)
+		}),
+	)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "sightings: store failed", "error", err, "remote", r.RemoteAddr)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
