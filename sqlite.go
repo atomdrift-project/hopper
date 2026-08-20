@@ -288,9 +288,10 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		`CREATE INDEX IF NOT EXISTS idx_samples_domain ON samples(domain) WHERE domain != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_package_version ON samples(package, version) WHERE package != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_purl_base ON samples(purl_base) WHERE purl_base != ''`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_purl_analyzed ` +
+		`CREATE INDEX IF NOT EXISTS idx_samples_purl_lookup ` +
 			`ON samples (purl_base, version, analyzed_at DESC) ` +
-			`WHERE purl_base != '' AND parent = '' AND litmus_result IS NOT NULL AND cleave_result IS NOT NULL`,
+			`WHERE purl_base != '' AND litmus_result IS NOT NULL AND cleave_result IS NOT NULL`,
+		`DROP INDEX IF EXISTS idx_samples_purl_analyzed`,
 	} {
 		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite samples index: %w", err)
@@ -1355,15 +1356,16 @@ func (db *DB) sampleBySHA256SQLite(ctx context.Context, sha256 string) (*Sample,
 }
 
 // sampleByPURLSQLite mirrors [sampleByPURLSQL]; the redundant-looking
-// non-empty purl_base is what lets SQLite match idx_samples_purl_analyzed,
-// whose WHERE terms must all appear in the query.
+// non-empty purl_base is what lets SQLite match idx_samples_purl_lookup, whose
+// WHERE terms must all appear in the query. No containment test, for the reason
+// sampleByPURLSQL gives: a member has no purl_base, so purl_base = ? has
+// already excluded every one of them.
 const sampleByPURLSQLite = `SELECT ` + liteSampleCols + ` FROM samples
 		WHERE purl_base = ?
 		  AND purl_base <> ''
 		  AND litmus_result IS NOT NULL
 		  AND cleave_result IS NOT NULL
-		  AND file_type <> 'registry'
-		  AND ` + uncontainedSQL
+		  AND file_type <> 'registry'`
 
 func (db *DB) sampleByPURLSQLite(ctx context.Context, base, version string) (*Sample, error) {
 	query := sampleByPURLSQLite

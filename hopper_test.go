@@ -3836,14 +3836,28 @@ func TestSampleByPURL(t *testing.T) {
 	}
 	mustInsert(t, ctx, db, &Sample{SHA256: "old", Source: "test", PURLBase: "pkg:npm/lodash", Version: "4.17.20"})
 	analyze("old")
+	// A registry artifact that some archive also bundles. It was fetched from a
+	// registry, so it has provenance, a version and a purl_base of its own —
+	// being copied into someone else's archive is a fact about the archive, and
+	// must not hide the package from its own PURL.
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: "bundled", Source: "forager", PURLBase: "pkg:npm/lodash", Version: "4.17.19",
+		Parent: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	})
+	analyze("bundled")
 	time.Sleep(20 * time.Millisecond)
 	mustInsert(t, ctx, db, &Sample{SHA256: "new", Source: "test", PURLBase: "pkg:npm/lodash", Version: "4.17.21"})
 	analyze("new")
 	mustInsert(t, ctx, db, &Sample{SHA256: "pending", Source: "test", PURLBase: "pkg:npm/lodash", Version: "4.17.22"})
+	// A faithful archive member. explodeMembers copies feed, ecosystem, label
+	// and parent lineage but never package, version or purl_base: a member has
+	// no identity of its own, and that — not containment — is what keeps it out
+	// of a PURL lookup. The previous fixture hand-assigned it a purl_base no
+	// ingest path can produce.
 	mustInsert(t, ctx, db, &Sample{
-		SHA256: "inside", Source: "test", Parent: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		Path:     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!!lib.js",
-		PURLBase: "pkg:npm/lodash", Version: "9.9.9",
+		SHA256: "inside", Source: SourceExploded,
+		Parent: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Path:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!!lib.js",
 	})
 	analyze("inside")
 
@@ -3871,6 +3885,13 @@ func TestSampleByPURL(t *testing.T) {
 	}
 	if _, err := db.SampleByPURL(ctx, "pkg:npm/lodash", "9.9.9"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("archive member: err = %v, want ErrNotFound", err)
+	}
+	got, err = db.SampleByPURL(ctx, "pkg:npm/lodash", "4.17.19")
+	if err != nil {
+		t.Fatalf("bundled release: %v", err)
+	}
+	if got.SHA256 != "bundled" {
+		t.Errorf("bundled sha = %q, want bundled: an archive holding a copy must not hide the release", got.SHA256)
 	}
 	if _, err := db.SampleByPURL(ctx, "pkg:npm/nope", "1.0.0"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("miss: err = %v, want ErrNotFound", err)

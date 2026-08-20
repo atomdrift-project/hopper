@@ -4575,6 +4575,22 @@ func (db *DB) CanonicalizePURLBases(ctx context.Context, dryRun bool) (int64, er
 	return n, err
 }
 
+// RepairStandaloneParents clears samples.parent on rows whose bytes are stored
+// on disk under their own sha, so handleFile serves them directly instead of
+// trying to extract them from an archive (see repairStandaloneParentsPG).
+// Idempotent and resumable; dryRun only reports. Postgres-only. Returns the
+// number of rows repaired (or that would be).
+func (db *DB) RepairStandaloneParents(ctx context.Context, dryRun bool) (int64, error) {
+	if db.pool == nil {
+		return 0, nil
+	}
+	n, err := db.repairStandaloneParentsPG(ctx, dryRun)
+	if err == nil && !dryRun && n > 0 {
+		db.flushLookups()
+	}
+	return n, err
+}
+
 // CanonicalizeSightingSubjects rewrites stored sightings.subject values onto
 // the ledger keying convention (see normalizeSubject): lowercase sha256,
 // canonical version-less purl_base. Rows whose canonical spelling collides

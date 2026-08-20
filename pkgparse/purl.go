@@ -450,15 +450,40 @@ func CanonicalizePURL(purl string) string {
 
 	// Split the remainder into path and the version/qualifier tail so we can
 	// re-key the type without disturbing "@version" or "?qualifiers".
+	//
+	// A *leading* '@' opens an npm scope ("@scope/name"), never a version: a
+	// coordinate path cannot begin with its own version separator. Searching
+	// from 0 would take the whole path as the tail, leaving an empty name that
+	// the guard below then passes through unchanged — so every scoped package
+	// kept whichever spelling it arrived in, while renderPURL emits the escaped
+	// "%40scope". Two keys for one package. purlVersionIndex already guards the
+	// same trap; this is the site that missed it.
+	//
+	// It is a scope only when a '/' closes it. Where the next delimiter is a
+	// version or a qualifier instead, the '@' really does open a version over
+	// an empty name ("pkg:npm/@1.0.0"), which must still reach the guard.
+	scopeSigil := 0
+	if strings.HasPrefix(rest, "@") {
+		if i := strings.IndexAny(rest[1:], "/@?"); i >= 0 && rest[1+i] == '/' {
+			scopeSigil = 1
+		}
+	}
 	path, tail := rest, ""
-	if i := strings.IndexAny(rest, "@?"); i >= 0 {
-		path, tail = rest[:i], rest[i:]
+	if i := strings.IndexAny(rest[scopeSigil:], "@?"); i >= 0 {
+		path, tail = rest[:scopeSigil+i], rest[scopeSigil+i:]
 	}
 	// A degenerate coordinate (empty type or name) has no canonical form —
 	// the Rust twin (fletch's purl::normalize) rejects these outright — so
 	// pass the input through untouched rather than half-rewriting it.
 	if typ == "" || lastSegment(path) == "" {
 		return purl
+	}
+	// Fold a literal npm scope onto the escaped spelling renderPURL produces,
+	// so a purl this package generated and one pasted in by hand are the same
+	// key. Mirrors fletch's purl::normalize; distro namespaces are vendors and
+	// never carry the sigil, so this is a no-op for them.
+	if scope, found := strings.CutPrefix(path, "@"); found {
+		path = "%40" + scope
 	}
 	// Repair the non-spec "?qualifiers@version" ordering older exports emitted
 	// (a version appended to a qualifier-bearing purl_base): move the trailing

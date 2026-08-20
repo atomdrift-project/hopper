@@ -314,6 +314,16 @@ func TestCanonicalFormMatchesFletchNormalize(t *testing.T) {
 	corpus := []string{
 		"pkg:npm/lodash@4.17.21",
 		"pkg:npm/%40babel/core@7.24.0",
+		// Both spellings of an npm scope. The literal one is why this test
+		// exists: each side read the leading '@' as a version separator, and
+		// with no scoped case in this corpus the twins drifted unnoticed —
+		// fletch rejecting the purl outright while Go passed it through.
+		// (The degenerate "pkg:npm/@1.0.0" is deliberately absent: there the
+		// two sides differ by contract, Go passing through where fletch
+		// rejects, so it belongs in each side's own tests, not the lockstep.)
+		"pkg:npm/@babel/core@7.24.0",
+		"pkg:npm/@scope/name",
+		"pkg:npm/@scope/name@1.0.0?arch=x64",
 		"pkg:chrome/KhKimila@25.7.1",
 		"pkg:vscode/Saoudrizwan/Claude-Dev",
 		"pkg:openvsx/jinryx/crontally@1.0.3",

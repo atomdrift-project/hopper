@@ -456,15 +456,20 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_package_version ON samples(package, version) WHERE package != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_purl_base ON samples(purl_base) WHERE purl_base != ''`,
 		// GET /api/sample?purl= (SampleByPURL): equality on purl_base + version,
-		// newest analyzed_at, top-level analyzed rows only. idx_samples_purl_base
-		// is a single-column identity index and cannot satisfy ORDER BY
-		// analyzed_at DESC LIMIT 1; the prism feed query's ($n = '' OR col = $n)
-		// shape plus that ORDER BY made the planner walk idx_samples_analyzed_at
-		// until a purl hit (or the whole table, on a miss). Beamline times out
-		// at 2s. Built CONCURRENTLY by createIndexConcurrently.
-		`CREATE INDEX IF NOT EXISTS idx_samples_purl_analyzed ` +
+		// newest analyzed_at, analyzed rows only. idx_samples_purl_base is a
+		// single-column identity index and cannot satisfy ORDER BY analyzed_at
+		// DESC LIMIT 1; the prism feed query's ($n = '' OR col = $n) shape plus
+		// that ORDER BY made the planner walk idx_samples_analyzed_at until a
+		// purl hit (or the whole table, on a miss). Beamline times out at 2s.
+		// Built CONCURRENTLY by createIndexConcurrently.
+		//
+		// Predicated exactly on sampleByPURLSQL's constants — no `parent = ''`,
+		// which that query no longer tests (see sampleByPURLSQL). Created before
+		// the old index is dropped so the lookup is never left uncovered.
+		`CREATE INDEX IF NOT EXISTS idx_samples_purl_lookup ` +
 			`ON samples (purl_base, version, analyzed_at DESC NULLS LAST) ` +
-			`WHERE purl_base != '' AND parent = '' AND litmus_result IS NOT NULL AND cleave_result IS NOT NULL`,
+			`WHERE purl_base != '' AND litmus_result IS NOT NULL AND cleave_result IS NOT NULL`,
+		`DROP INDEX IF EXISTS idx_samples_purl_analyzed`,
 		// Collector provenance sidecar (forager) + artifact fetch time. JSONB so
 		// the registry/feed records inside are directly queryable.
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS provenance JSONB`,
@@ -2589,19 +2594,32 @@ func (db *DB) sampleBySHA256PG(ctx context.Context, sha256 string) (*Sample, err
 
 // sampleByPURLSQL is the sargable point lookup for GET /api/sample?purl=.
 // Every predicate is a constant — never the feed's empty-or-equal disjunction
-// over a parameter — so they match idx_samples_purl_analyzed. purl_base is
+// over a parameter — so they match idx_samples_purl_lookup. purl_base is
 // pinned non-empty even though base is already checked non-empty in Go: the
 // planner cannot prove that of a parameter, and without the literal it cannot
 // use a partial index predicated on it. Full pgSampleCols — not the feed projection —
-// so the envelope keeps raw (cleave_result). uncontainedSQL is one ledger
-// probe after the index seek, cheap at LIMIT 1.
+// so the envelope keeps raw (cleave_result).
+//
+// Deliberately no containment test. uncontainedSQL exists to keep archive
+// members — a lib/index.js pulled out of a tarball — from being listed and
+// judged as artifacts in their own right, and members carry no package
+// identity: explodeMembers copies feed, ecosystem and label from the parent
+// but never package, version or purl_base. So `purl_base = $1` has already
+// excluded every member before containment could weigh in, and the only rows
+// left for it to reject are ones that *do* carry a registry identity —
+// provenance, a fetch URL, a version. Those are exactly the artifacts this
+// endpoint exists to answer for; that some archive also bundles a copy is a
+// fact about the archive. Requiring uncontained here could only ever produce
+// false negatives, and did: foraged npm and golang releases went unfindable
+// because something, somewhere, embedded them. The feed and triage queries
+// still use it, and there it is load-bearing — those are not filtered by
+// purl_base, so members really are candidates.
 const sampleByPURLSQL = `SELECT ` + pgSampleCols + ` FROM samples
 		WHERE purl_base = $1
 		  AND purl_base <> ''
 		  AND litmus_result IS NOT NULL
 		  AND cleave_result IS NOT NULL
-		  AND file_type <> 'registry'
-		  AND ` + uncontainedSQL
+		  AND file_type <> 'registry'`
 
 func (db *DB) sampleByPURLPG(ctx context.Context, base, version string) (*Sample, error) {
 	query := sampleByPURLSQL
@@ -5231,6 +5249,85 @@ func (db *DB) canonicalizePURLBasesPG(ctx context.Context, dryRun bool) (int64, 
 		}
 	}
 	return rewritten, nil
+}
+
+// repairStandaloneParentsPG clears samples.parent on rows whose bytes are on
+// disk under their own path.
+//
+// `parent` is a storage locator, not a containment fact: handleFile reads it as
+// "these bytes are not stored under this sha, stream them out of that archive
+// instead". A row that also has a standalone location in the ledger has its
+// bytes right there, so a non-empty parent sends handleFile extracting from an
+// archive for a file it could have opened — and it answers 422 when that
+// archive is gone or no longer holds the member. The uncontainedSQL comment
+// names this exact hazard as the reason a member write must never claim a
+// standalone row's identity; these are the rows where that already happened,
+// because ON CONFLICT never SETs parent and so the first writer keeps it.
+//
+// Containment is deliberately not consulted. Whether an archive also contains
+// this artifact is a question for the ledger and uncontainedSQL; it has no
+// bearing on where the bytes are, which is all parent is for. Rows with no
+// standalone location keep their parent — extraction is the only way to serve
+// them.
+//
+// Batched on the id cursor like canonicalizePURLBasesPG, so no batch locks more
+// than batchRows. Idempotent and resumable; dryRun only counts.
+func (db *DB) repairStandaloneParentsPG(ctx context.Context, dryRun bool) (int64, error) {
+	const batchRows = 20000
+	var repaired, cursor int64
+	for {
+		rows, err := db.pool.Query(ctx, `
+			SELECT id FROM samples
+			WHERE id > $1 AND parent <> ''
+			  AND EXISTS (SELECT 1 FROM sample_locations sl
+			               WHERE sl.sha256 = samples.sha256 AND sl.parent_sha256 = '')
+			ORDER BY id LIMIT $2`, cursor, batchRows)
+		if err != nil {
+			return repaired, fmt.Errorf("hopper: repair parents select: %w", err)
+		}
+		var ids []int64
+		var maxID int64
+		var seen int
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return repaired, fmt.Errorf("hopper: repair parents scan: %w", err)
+			}
+			seen++
+			maxID = id
+			ids = append(ids, id)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return repaired, fmt.Errorf("hopper: repair parents iterate: %w", err)
+		}
+		rows.Close()
+		if seen == 0 {
+			break
+		}
+		if dryRun {
+			repaired += int64(len(ids))
+		} else {
+			// Re-check parent <> '' in the UPDATE: another writer may have
+			// cleared it between the select and here.
+			tag, err := db.pool.Exec(ctx, `
+				UPDATE samples SET parent = ''
+				FROM unnest($1::bigint[]) AS v(id)
+				WHERE samples.id = v.id AND samples.parent <> ''`, ids)
+			if err != nil {
+				return repaired, fmt.Errorf("hopper: repair parents update: %w", err)
+			}
+			repaired += tag.RowsAffected()
+		}
+		cursor = maxID
+		slog.Info("repair-parents batch",
+			"through_id", cursor, "repaired_total", repaired, "dry_run", dryRun)
+		if seen < batchRows {
+			break
+		}
+	}
+	return repaired, nil
 }
 
 // canonicalizeSightingSubjectsPG rewrites every sightings.subject onto the

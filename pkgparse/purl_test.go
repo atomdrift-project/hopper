@@ -234,6 +234,23 @@ func TestCanonicalizePURL(t *testing.T) {
 		{"  pkg:npm/lodash@1.0.0  ", "pkg:npm/lodash@1.0.0"},
 		{"pkg:RPM/Fedora/curl@1.0", "pkg:rpm/fedora/curl@1.0"},
 
+		// An npm scope's leading '@' is part of the name, not the version
+		// separator. Read as a separator it left an empty coordinate, and the
+		// degenerate guard then passed the input through — so a scoped package
+		// kept whichever spelling it arrived in while renderPURL emitted the
+		// escaped form, giving one package two purl_base keys. Both spellings
+		// now fold onto the escaped one, which is the spec's canonical form
+		// and what this package already generates.
+		{"pkg:npm/@babel/core@7.24.0", "pkg:npm/%40babel/core@7.24.0"},
+		{"pkg:npm/%40babel/core@7.24.0", "pkg:npm/%40babel/core@7.24.0"},
+		{"pkg:npm/@scope/name", "pkg:npm/%40scope/name"},
+		{"pkg:npm/@scope/name@1.0.0?arch=x64", "pkg:npm/%40scope/name@1.0.0?arch=x64"},
+		// The sigil is a scope only when a '/' closes it. These name nothing,
+		// so they stay degenerate and pass through untouched.
+		{"pkg:npm/@1.0.0", "pkg:npm/@1.0.0"},
+		{"pkg:npm/@1.0.0?repository_url=https://x/y", "pkg:npm/@1.0.0?repository_url=https://x/y"},
+		{"pkg:npm/@", "pkg:npm/@"},
+
 		// Already-canonical or unremapped types pass through untouched.
 		{"pkg:npm/lodash@1.0.0", "pkg:npm/lodash@1.0.0"},
 		{"pkg:alpm/arch/pacman@6.0.1-1?arch=x86_64", "pkg:alpm/arch/pacman@6.0.1-1?arch=x86_64"},
@@ -249,6 +266,45 @@ func TestCanonicalizePURL(t *testing.T) {
 		// through more than once can never drift onto a second spelling.
 		if again := CanonicalizePURL(tc.want); again != tc.want {
 			t.Errorf("CanonicalizePURL(%q) = %q, not a fixed point", tc.want, again)
+		}
+	}
+}
+
+// The `canonicalize-purls` repair rewrites a stored samples.purl_base whenever
+// VersionlessPURL(CanonicalizePURL(pb)) differs from it — see
+// canonicalizePURLBasesPG, which computes exactly this per row. The repair
+// itself is Postgres-only, so pin the decision it makes here: a legacy scoped
+// spelling must move onto the canonical one, and the canonical one must be a
+// fixed point or a resumable repair would rewrite the same rows forever.
+func TestCanonicalizePURLBaseRewriteRule(t *testing.T) {
+	rewrite := func(pb string) string { return VersionlessPURL(CanonicalizePURL(pb)) }
+
+	// Rows stored before CanonicalizePURL folded the scope sigil: the literal
+	// spelling passed through untouched, so these are the rows the repair has
+	// to find and move.
+	for _, tc := range []struct{ stored, want string }{
+		{"pkg:npm/@zynkit/jwtbytes", "pkg:npm/%40zynkit/jwtbytes"},
+		{"pkg:npm/@babel/core", "pkg:npm/%40babel/core"},
+	} {
+		got := rewrite(tc.stored)
+		if got != tc.want {
+			t.Errorf("rewrite(%q) = %q, want %q", tc.stored, got, tc.want)
+		}
+		if again := rewrite(got); again != got {
+			t.Errorf("rewrite is not a fixed point: %q -> %q", got, again)
+		}
+	}
+
+	// Rows already canonical must not be rewritten, or every run would churn
+	// the whole table and re-key the sightings ledger for nothing.
+	for _, pb := range []string{
+		"pkg:npm/%40babel/core",
+		"pkg:npm/left-pad",
+		"pkg:alpm/aur/yay",
+		"pkg:pypi/ruamel-yaml",
+	} {
+		if got := rewrite(pb); got != pb {
+			t.Errorf("rewrite(%q) = %q, want unchanged", pb, got)
 		}
 	}
 }

@@ -55,6 +55,7 @@ commands:
   backfill           re-derive columns from cleave_result/litmus_result blobs
   reheal-crit        repair max_crit/suspicious_count zeroed by the pre-v8 cleave trigger (postgres)
   backfill-purl      derive missing samples.purl_base from ecosystem+package (never overwrites; postgres)
+  repair-parents     clear samples.parent where the bytes are on disk standalone (--dry-run; postgres)
   canonicalize-purls rewrite stored purl_base spellings onto the current canonical form (batched; -dry-run; postgres)
   purge-unsupported  delete analyzed rows cleave could not classify
   normalize-ecosystems  re-canonicalize stored ecosystem labels (dry-run)
@@ -398,6 +399,8 @@ func run(ctx context.Context) error {
 		return cmdBackfill(ctx)
 	case "reheal-crit":
 		return cmdRehealCrit(ctx)
+	case "repair-parents":
+		return cmdRepairParents(ctx)
 	case "backfill-purl":
 		return cmdBackfillPURL(ctx)
 	case "backfill-claims":
@@ -3364,6 +3367,35 @@ func cmdRehealCrit(ctx context.Context) error {
 		return err
 	}
 	slog.Info("reheal-crit complete", "rows_repaired", n)
+	return nil
+}
+
+// cmdRepairParents clears samples.parent on rows the ledger says are stored on
+// disk under their own sha. Such a row makes handleFile stream-extract from an
+// archive for bytes it could open directly, and answer 422 when that archive no
+// longer holds the member — see repairStandaloneParentsPG. Safe to re-run.
+func cmdRepairParents(ctx context.Context) error {
+	f := flag.NewFlagSet("repair-parents", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	dryRun := f.Bool("dry-run", false, "report how many rows would be repaired, change nothing")
+	parseFlags(f, os.Args[2:])
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	if err := db.Migrate(ctx); err != nil {
+		return err
+	}
+
+	slog.Info("repairing samples.parent on rows stored standalone", "dry_run", *dryRun)
+	n, err := db.RepairStandaloneParents(ctx, *dryRun)
+	if err != nil {
+		return err
+	}
+	slog.Info("repair-parents complete", "rows_repaired", n, "dry_run", *dryRun)
 	return nil
 }
 

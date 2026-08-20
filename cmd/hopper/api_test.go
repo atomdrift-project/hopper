@@ -24,6 +24,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/atomdrift-project/hopper"
+	"github.com/atomdrift-project/hopper/pkgparse"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -2396,10 +2397,20 @@ func TestHandleSampleByPURL(t *testing.T) {
 	// A scoped npm name carries an '@' that is namespace, not version. Split on
 	// the last one and base becomes "pkg:npm/" — a coordinate no row holds — so
 	// every scoped package 404s, versioned and versionless alike.
+	//
+	// Seeded through the same canonicalization the upload path applies (see
+	// handleUpload's purl_base projection) rather than a hardcoded spelling, so
+	// this asserts the property that matters — what ingest stores is what a
+	// lookup finds — and keeps holding if the canonical spelling of a scope
+	// ever changes again.
 	scoped := strings.Repeat("e", 64)
+	scopedBase := pkgparse.VersionlessPURL(pkgparse.CanonicalizePURL("pkg:npm/@zynkit/jwtbytes@0.5.2"))
+	if scopedBase == "" || strings.HasSuffix(scopedBase, "/") {
+		t.Fatalf("scoped purl_base collapsed to %q — the scope was read as a version", scopedBase)
+	}
 	if err := db.InsertSample(ctx, &hopper.Sample{
 		SHA256: scoped, Path: "incoming/jwtbytes.tgz", Source: "forager",
-		PURLBase: "pkg:npm/@zynkit/jwtbytes", Version: "0.5.2",
+		PURLBase: scopedBase, Version: "0.5.2",
 	}); err != nil {
 		t.Fatalf("InsertSample: %v", err)
 	}
