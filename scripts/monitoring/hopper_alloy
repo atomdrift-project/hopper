@@ -5,7 +5,10 @@
 # KEYWORD: shutdown
 #
 # Grafana Alloy shipping hopper's Postgres replication metrics to otel.
-# NOTE: do NOT name a knob hopper_alloy_env — FreeBSD rc.subr reserves ${name}_env.
+# NOTE: do NOT name a knob hopper_alloy_env or hopper_alloy_user — FreeBSD rc.subr
+# reserves ${name}_env and ${name}_user. A ${name}_user knob makes rc.subr run the
+# whole command under su(1), so daemon(8) itself would be unprivileged and could
+# not write its pidfile under /var/run.
 
 . /etc/rc.subr
 
@@ -16,7 +19,7 @@ rcvar="hopper_alloy_enable"
 load_rc_config $name
 
 : ${hopper_alloy_enable:="NO"}
-: ${hopper_alloy_user:="alloy"}
+: ${hopper_alloy_runas:="alloy"}
 : ${hopper_alloy_config:="/usr/local/etc/hopper-alloy/config.alloy"}
 : ${hopper_alloy_secrets:="/usr/local/etc/hopper-alloy/alloy.env"}
 : ${hopper_alloy_storage:="/var/db/hopper-alloy"}
@@ -25,13 +28,13 @@ load_rc_config $name
 
 pidfile="/var/run/${name}.pid"
 command="/usr/sbin/daemon"
-command_args="-r -P ${pidfile} -S -T ${name} -u ${hopper_alloy_user} \
+command_args="-r -P ${pidfile} -S -T ${name} -u ${hopper_alloy_runas} \
 	${hopper_alloy_wrapper}"
 
 start_precmd="hopper_alloy_precmd"
 hopper_alloy_precmd()
 {
-	install -d -o "${hopper_alloy_user}" -g "${hopper_alloy_user}" -m 0750 \
+	install -d -o "${hopper_alloy_runas}" -g "${hopper_alloy_runas}" -m 0750 \
 		"${hopper_alloy_storage}"
 	# Wrapper sources secrets then execs alloy (avoids DSN shell-escaping issues).
 	cat >"${hopper_alloy_wrapper}" <<EOF

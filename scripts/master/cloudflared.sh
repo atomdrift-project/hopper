@@ -154,7 +154,10 @@ rcvar="${SERVICE_NAME}_enable"
 load_rc_config \$name
 
 : \${${SERVICE_NAME}_enable:="NO"}
-: \${${SERVICE_NAME}_user:="$SERVICE_USER"}
+# Deliberately not "${SERVICE_NAME}_user": rc.subr reserves \${name}_user and
+# would run the whole command line under su(1), leaving daemon(8) itself
+# unprivileged and unable to write its pidfile under /var/run.
+: \${${SERVICE_NAME}_runas:="$SERVICE_USER"}
 : \${${SERVICE_NAME}_token_file:="$TOKEN_FILE"}
 : \${${SERVICE_NAME}_logfile:="$CLOUDFLARED_LOG"}
 
@@ -162,7 +165,7 @@ pidfile="/var/run/\${name}.pid"
 command="/usr/sbin/daemon"
 # The token is read from a file rather than passed as an argument so it never
 # appears in ps(1) output.
-command_args="-c -f -r -R 5 -P \${pidfile} -o \${${SERVICE_NAME}_logfile} -u \${${SERVICE_NAME}_user} /usr/bin/env HOME=$SERVICE_HOME $CLOUDFLARED_BIN tunnel --no-autoupdate run --token-file \${${SERVICE_NAME}_token_file}"
+command_args="-c -f -r -R 5 -P \${pidfile} -o \${${SERVICE_NAME}_logfile} -u \${${SERVICE_NAME}_runas} /usr/bin/env HOME=$SERVICE_HOME $CLOUDFLARED_BIN tunnel --no-autoupdate run --token-file \${${SERVICE_NAME}_token_file}"
 
 run_rc_command "\$1"
 EOF
