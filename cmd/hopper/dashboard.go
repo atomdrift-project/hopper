@@ -18,7 +18,6 @@ import (
 	"github.com/codeGROOVE-dev/fido"
 
 	"github.com/atomdrift-project/hopper"
-	"github.com/atomdrift-project/obs"
 )
 
 // dashQueryTimeout bounds each dashboard stat query. The counts/aggregations
@@ -250,13 +249,18 @@ func (wd *webDashboard) ratesOver(window time.Duration) (combined float64, perNo
 	return combined, perNode
 }
 
-func startWebDashboard(ctx context.Context, addr string, wd *webDashboard, mux *http.ServeMux) error {
-	mux.HandleFunc("/", wd.handler)
+// startHTTPServer binds addr and serves handler until ctx is cancelled.
+//
+// Used for both listeners: the work API and the web dashboard. Each supplies
+// its own middleware chain, which is what keeps their access policies separate
+// — the API authenticates, the dashboard does not, and neither can leak a
+// route to the other.
+func startHTTPServer(ctx context.Context, addr string, handler http.Handler) error {
 	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
 	if err != nil {
-		return fmt.Errorf("web dashboard listen %s: %w", addr, err)
+		return fmt.Errorf("listen %s: %w", addr, err)
 	}
-	srv := &http.Server{Handler: recoverMiddleware(obs.Middleware(mux)), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
 		<-ctx.Done()
 		// Graceful shutdown — let in-flight /data/* downloads finish so workers
@@ -266,13 +270,15 @@ func startWebDashboard(ctx context.Context, addr string, wd *webDashboard, mux *
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			slog.Warn("web dashboard graceful shutdown timed out; forcing close", "error", err)
+			slog.Warn("graceful shutdown timed out; forcing close", "addr", addr, "error", err)
 			_ = srv.Close() //nolint:errcheck // last-resort close after Shutdown timeout
 		}
 	}()
 	go func() {
+		// srv.Addr is unset when serving a pre-bound listener; log the address
+		// we actually bound.
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			slog.Error("web dashboard server stopped", "error", err, "addr", srv.Addr)
+			slog.Error("HTTP server stopped", "error", err, "addr", addr)
 		}
 	}()
 	return nil

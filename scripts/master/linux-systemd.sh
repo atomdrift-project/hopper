@@ -14,7 +14,18 @@
 #   DB        postgres DSN (password resolved from the installed .pgpass)
 #                                    (default: postgres://hopper@hopper-db/hopper?sslmode=disable)
 #   SOURCE    --source tag           (default: forager)
-#   DASH_ADDR --dashboard-addr       (default: 0.0.0.0:8081)
+#   API_ADDR  --api-addr            work API listen address; this is the
+#                 Cloudflare Tunnel origin and it requires a bearer token
+#                                    (default: 0.0.0.0:8081)
+#   DASH_ADDR --dashboard-addr      HTML dashboard listen address. A browser
+#                 cannot present a bearer token, so this listener has no
+#                 authentication and stays on loopback: reach it over an SSH
+#                 forward, never through the tunnel.
+#                                    (default: 127.0.0.1:8082)
+#   TOKEN_SRC token file installed for the API (empty disables authentication)
+#                 Generated on first deploy if absent. Clients — the local
+#                 atomscan worker included — read the same path.
+#                                    (default: ~/.tok/hopper)
 #   WORKERS   --workers              (default: 0 = defer to hopper's built-in
 #                 cap of 40; set non-zero only to override for this host)
 #   MAX_MEMORY_GB  --max-memory-gb    atomscan RSS cap in GB, forwarded as
@@ -49,7 +60,11 @@ UPLOAD_DIRS="${UPLOAD_DIR} ${DATA_DIR}/incoming/scan ${DATA_DIR}/incoming/prism 
 SAMPLES_GROUP="${SAMPLES_GROUP:-samples}"
 DB="${DB:-postgres://hopper@hopper-db/hopper?sslmode=disable}"
 SOURCE="${SOURCE:-forager}"
-DASH_ADDR="${DASH_ADDR:-0.0.0.0:8081}"
+API_ADDR="${API_ADDR:-0.0.0.0:8081}"
+DASH_ADDR="${DASH_ADDR:-127.0.0.1:8082}"
+# `TOKEN_SRC-` (no colon) keeps an explicit empty, so an operator can
+# deliberately deploy an unauthenticated API on a host they trust.
+TOKEN_SRC="${TOKEN_SRC-${HOME}/.tok/hopper}"
 # Both default to 0 so the generated unit emits no --workers/--max-memory-gb and
 # the local atomscan worker's caps come solely from hopper's built-in defaults
 # (40 workers / 48 GB RAM, in cmd/hopper/main.go) — the single source of truth.
@@ -304,6 +319,47 @@ elif [[ ! -e $pgpass_dst ]]; then
     log "No ~/.pgpass found; hopper will fail to authenticate until one is provided at ${pgpass_dst}"
 fi
 
+# --- API token ---------------------------------------------------------------
+
+# The work API requires `Authorization: Bearer <token>` on every route but the
+# probes, loopback callers included: cloudflared terminates the tunnel on
+# loopback, so a loopback exemption would be an internet exemption.
+#
+# The token is a file, never an argument or an Environment= line — argv is
+# world-readable through ps(1) and unit files are world-readable in
+# /etc/systemd/system. It is never held in a shell variable either, so no trace
+# or error message can echo it. Clients read the same ~/.tok/hopper path; the
+# local atomscan worker inherits HOME from the unit and finds it there.
+token_dst="${STATE_HOME}/.tok/hopper"
+token_arg=""
+token_changed=0
+if [[ -n $TOKEN_SRC ]]; then
+    token_arg=" --token-file ${token_dst}"
+    if [[ ! -s $TOKEN_SRC ]] && ! priv test -s "$token_dst"; then
+        (umask 077; mkdir -p "$(dirname "$TOKEN_SRC")")
+        (umask 077; { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; echo; } > "$TOKEN_SRC")
+        [[ -s $TOKEN_SRC ]] || die "failed to generate a token at ${TOKEN_SRC}"
+        log "Generated an API token at ${TOKEN_SRC}"
+        log "  clients: curl -H \"Authorization: Bearer \$(cat ${TOKEN_SRC})\" ..."
+    fi
+    if [[ -s $TOKEN_SRC ]]; then
+        priv install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_HOME}/.tok"
+        # A rotated token needs a restart: hopper reads it once, at startup, so
+        # installing a new one without restarting leaves the old one live.
+        if priv cmp -s "$TOKEN_SRC" "$token_dst" 2>/dev/null; then
+            log "API token unchanged"
+        else
+            log "Installing API token from ${TOKEN_SRC}"
+            priv install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
+                "$TOKEN_SRC" "$token_dst"
+            token_changed=1
+        fi
+    fi
+    priv test -s "$token_dst" || die "no API token at ${token_dst}"
+else
+    log "TOKEN_SRC is empty — deploying an UNAUTHENTICATED work API"
+fi
+
 # --- Unit --------------------------------------------------------------------
 
 tmp_unit=$(mktemp -t "${SERVICE_NAME}.service.XXXXXX")
@@ -367,7 +423,7 @@ CacheDirectory=${SERVICE_NAME}
 CacheDirectoryMode=0750
 
 WorkingDirectory=%S/${SERVICE_NAME}
-ExecStart=${BIN_PATH} load --data ${DATA_DIR} --db ${DB} --source ${SOURCE} --dashboard-addr ${DASH_ADDR} --litmus ${SCAN_BIN} --cleave ${CLEAVE_BIN}${dataset_arg}${workers_arg}${max_mem_arg}${llm_arg}
+ExecStart=${BIN_PATH} load --data ${DATA_DIR} --db ${DB} --source ${SOURCE} --api-addr ${API_ADDR} --dashboard-addr ${DASH_ADDR}${token_arg} --litmus ${SCAN_BIN} --cleave ${CLEAVE_BIN}${dataset_arg}${workers_arg}${max_mem_arg}${llm_arg}
 Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=60s
@@ -576,7 +632,7 @@ fi
 
 priv systemctl enable --now "${SERVICE_NAME}.service" >/dev/null
 
-if (( binary_changed || unit_changed )); then
+if (( binary_changed || unit_changed || token_changed )); then
     log "Restarting ${SERVICE_NAME}"
     if ! priv systemctl restart "${SERVICE_NAME}.service"; then
         priv systemctl --no-pager --full status "${SERVICE_NAME}.service" || true

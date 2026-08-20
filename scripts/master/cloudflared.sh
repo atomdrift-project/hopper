@@ -5,7 +5,14 @@
 # The tunnel and its ingress rules are configured in the Cloudflare dashboard
 # (Zero Trust -> Networks -> Tunnels); this script only installs the connector
 # and points it at the token issued there. Ingress should target
-# http://127.0.0.1:8081, the address Hopper's dashboard listens on.
+# http://127.0.0.1:8081, the address Hopper's work API listens on — and only
+# that. The HTML dashboard is a separate listener (--dashboard-addr, loopback
+# by default) with no authentication of its own, so it must never be given a
+# tunnel hostname; reach it over an SSH forward instead.
+#
+# The API requires `Authorization: Bearer <token>` on every route but the
+# liveness, readiness, and metrics probes, so publishing this hostname does not
+# publish the samples behind it.
 #
 # First deployment:
 #   CF_TUNNEL_TOKEN='...' gmake deploy

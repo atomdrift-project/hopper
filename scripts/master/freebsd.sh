@@ -12,7 +12,12 @@ set -eu
 DATA_DIR="${DATA_DIR:-/data/samples}"
 DB="${DB:-postgres://hopper@hopper-db/hopper?sslmode=disable}"
 SOURCE="${SOURCE:-harvest}"
-DASH_ADDR="${DASH_ADDR:-0.0.0.0:8081}"
+API_ADDR="${API_ADDR:-0.0.0.0:8081}"
+# The dashboard has no authentication of its own — a browser cannot present a
+# bearer token — so it gets its own loopback listener and is never the tunnel
+# origin. Reach it over an SSH forward.
+DASH_ADDR="${DASH_ADDR:-127.0.0.1:8082}"
+TOKEN_SRC="${TOKEN_SRC-${HOME}/.tok/hopper}"
 WORKERS="${WORKERS:-96}"
 MAX_MEMORY_GB="${MAX_MEMORY_GB:-0}"
 LLM="${LLM:-http://10.9.8.149:8000/v1}"
@@ -193,6 +198,39 @@ $SUDO su -l "$SERVICE_USER" -c "$CLEAVE_BIN update-rules" \
 # builds optional indexes in the background. Running the one-shot `init` here
 # would put those index builds back on the deployment critical path.
 
+# --- API token ---------------------------------------------------------------
+#
+# The work API requires `Authorization: Bearer <token>` on every route but the
+# probes, loopback callers included: cloudflared terminates the tunnel on
+# loopback, so a loopback exemption would be an internet exemption.
+#
+# The token is a file, never an argument or an environment variable, and is
+# never held in a shell variable — so nothing can echo it. Clients read the
+# same ~/.tok/hopper path; the Scan worker deployed below runs as this same
+# service user and finds it there.
+TOKEN_DST="/home/${SERVICE_USER}/.tok/hopper"
+token_arg=""
+if [ -n "$TOKEN_SRC" ]; then
+	token_arg=" --token-file $TOKEN_DST"
+	if [ ! -s "$TOKEN_SRC" ] && ! $SUDO test -s "$TOKEN_DST"; then
+		(umask 077; mkdir -p "$(dirname "$TOKEN_SRC")")
+		(umask 077; { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; echo; } > "$TOKEN_SRC")
+		[ -s "$TOKEN_SRC" ] || die "failed to generate a token at $TOKEN_SRC"
+		log "Generated an API token at $TOKEN_SRC"
+		log "  clients: curl -H \"Authorization: Bearer \$(cat $TOKEN_SRC)\" ..."
+	fi
+	$SUDO install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" \
+		"/home/${SERVICE_USER}/.tok"
+	if [ -s "$TOKEN_SRC" ]; then
+		$SUDO install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_USER" \
+			"$TOKEN_SRC" "$TOKEN_DST"
+	fi
+	$SUDO test -s "$TOKEN_DST" || die "no API token at $TOKEN_DST"
+	log "API token installed at $TOKEN_DST"
+else
+	log "TOKEN_SRC is empty — deploying an UNAUTHENTICATED work API"
+fi
+
 $SUDO install -d -m 0755 -o root -g wheel /usr/local/etc/rc.d
 RC_TMP=$(mktemp -t hopper.rcd.XXXXXX)
 
@@ -217,6 +255,7 @@ load_rc_config \$name
 : \${hopper_data:="$DATA_DIR"}
 : \${hopper_db:="$DB"}
 : \${hopper_source:="$SOURCE"}
+: \${hopper_api_bind:="$API_ADDR"}
 : \${hopper_bind:="$DASH_ADDR"}
 : \${hopper_logfile:="/var/log/hopper.log"}
 : \${hopper_required_mounts:="$REQUIRED_MOUNTS"}
@@ -234,7 +273,7 @@ IFS=\$old_ifs
 pidfile="/var/run/\${name}.pid"
 command="/usr/sbin/daemon"
 # --litmus '' is intentional: the Scan worker is a separate rc.d service.
-command_args="-c -f -r -R 10 -P \${pidfile} -o \${hopper_logfile} -u hopper /usr/bin/env HOME=/home/hopper DATABASE_URL=\${hopper_db} $HOPPER_BIN load --data \${hopper_data} --db \${hopper_db} --source \${hopper_source} --dashboard-addr \${hopper_bind} --litmus '' --cleave $CLEAVE_BIN\${mount_args}$dataset_arg"
+command_args="-c -f -r -R 10 -P \${pidfile} -o \${hopper_logfile} -u hopper /usr/bin/env HOME=/home/hopper DATABASE_URL=\${hopper_db} $HOPPER_BIN load --data \${hopper_data} --db \${hopper_db} --source \${hopper_source} --api-addr \${hopper_api_bind} --dashboard-addr \${hopper_bind}$token_arg --litmus '' --cleave $CLEAVE_BIN\${mount_args}$dataset_arg"
 
 run_rc_command "\$1"
 EOF

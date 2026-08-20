@@ -1,7 +1,9 @@
 # Prometheus alerting rules for hopper.
 #
-# Hopper publishes its dashboard numerics at GET /_/metrik on the dashboard
-# address (default :8081, flag -dashboard-addr). Point a Prometheus scrape at
+# Hopper publishes its dashboard numerics at GET /_/metrik on the API address
+# (default :8081, flag -api-addr) — not the dashboard listener, which is
+# loopback-only. The probes and /_/metrik are exempt from the API's bearer
+# token, so the scrape needs no credential. Point a Prometheus scrape at
 # it; once a minute is plenty — the collector reuses the dashboard's 45s query
 # caches, so a scrape adds no database load the page would not already cause.
 #
@@ -80,6 +82,7 @@ groups:
         labels:
           severity: page
         annotations:
+          runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/docs/runbook.md#hopperlocalworkerdown"
           summary: "Hopper local scan worker is down"
           description: "hopper_local_worker_up has been 0 for 10m; the in-process litmus worker is not analyzing."
 
@@ -93,13 +96,14 @@ groups:
       # `up` only goes 0 if the scrape connection itself is torn down. For a
       # probe that exercises the accept path every time, point blackbox_exporter
       # (or any external HTTP checker that opens a fresh connection per probe)
-      # at GET /healthz on the dashboard port and alert on that as well.
+      # at GET /healthz on the API port and alert on that as well.
       - alert: HopperDown
         expr: up{job="hopper"} == 0
         for: 5m
         labels:
           severity: page
         annotations:
+          runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/docs/runbook.md#hopperdown"
           summary: "Hopper is not scrapeable"
           description: "Prometheus cannot scrape hopper ({{ $labels.instance }}) — process or dashboard endpoint down."
 
@@ -114,6 +118,7 @@ groups:
         labels:
           severity: warning
         annotations:
+          runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/docs/runbook.md#hopperlocalworkeroverbudget"
           summary: "Hopper local scan worker is over its memory budget"
           description: "Worker at {{ $value | humanize1024 }}B against its configured budget; supervisor kill imminent at 1.25x."
 
@@ -125,6 +130,7 @@ groups:
         labels:
           severity: warning
         annotations:
+          runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/docs/runbook.md#hopperlocalworkerflapping"
           summary: "Hopper local scan worker is flapping"
           description: "{{ $value | printf \"%.0f\" }} local-worker restarts in the last 15m."
 
@@ -137,6 +143,7 @@ groups:
         labels:
           severity: warning
         annotations:
+          runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/docs/runbook.md#hopperworkerstale"
           summary: "Hopper worker {{ $labels.worker }} is stale"
           description: "{{ $labels.worker }} last checked in {{ $value | printf \"%.0f\" }}s ago."
 
@@ -150,6 +157,7 @@ groups:
         labels:
           severity: page
         annotations:
+          runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/docs/runbook.md#hopperanalysisstalled"
           summary: "Hopper analysis has stalled"
           description: "No sample analyzed in {{ $value | printf \"%.0f\" }}s while the pending queue is non-empty."
 
@@ -161,6 +169,7 @@ groups:
         labels:
           severity: warning
         annotations:
+          runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/docs/runbook.md#hopperingestionstalled"
           summary: "Hopper ingestion has stalled"
           description: "No sample added in {{ $value | printf \"%.0f\" }}s; upstream ingestion may be down."
 
@@ -175,6 +184,7 @@ groups:
         labels:
           severity: warning
         annotations:
+          runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/docs/runbook.md#hopperinsertlockcontention"
           summary: "Hopper inserts failing on lock contention"
           description: "{{ $value | printf \"%.2f\" }} samples/sec failing to insert on lock_timeout over 10m; check database lock waits."
 
@@ -186,6 +196,7 @@ groups:
         labels:
           severity: warning
         annotations:
+          runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/docs/runbook.md#hopperdbpoolsaturated"
           summary: "Hopper DB pool {{ $labels.pool }} is saturated"
           description: "pool {{ $labels.pool }} is {{ $value | humanizePercentage }} checked out for 10m; connections are queuing."
 
@@ -197,6 +208,7 @@ groups:
         labels:
           severity: warning
         annotations:
+          runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/docs/runbook.md#hopperdbpoolacquirecanceled"
           summary: "Hopper DB pool {{ $labels.pool }} acquires being canceled"
           description: "{{ $value | printf \"%.2f\" }} acquire cancellations/sec on pool {{ $labels.pool }} over 10m; connections are not available in time."
 

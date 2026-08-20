@@ -842,7 +842,20 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// rejected the push: "structured metadata too large") and filled the state
 	// dir with 14 GB on 2026-08-10. Turn it on deliberately when debugging a worker.
 	litmusVerbose := f.Bool("litmus-verbose", false, "enable debug logging in litmus server")
-	dashAddr := f.String("dashboard-addr", "0.0.0.0:8081", "web dashboard listen address (empty to disable)")
+	// Two listeners, so each one carries a single access policy end to end and
+	// a route added later cannot inherit the wrong one. The API is the tunnel
+	// origin and requires a bearer token; the HTML dashboard has no token to
+	// present from a browser, so it stays on loopback and is reached over an
+	// SSH forward.
+	// Loopback by default: this listener serves /api/upload, /api/file and
+	// /data, and is unauthenticated unless --token-file is passed, so an
+	// ad-hoc `hopper load` must not put it on every interface by accident. A
+	// master serving remote workers sets the address explicitly — the deploy
+	// scripts pass --api-addr 0.0.0.0:8081 — and a tunnel origin terminates on
+	// loopback anyway.
+	apiAddr := f.String("api-addr", "127.0.0.1:8081", "work API listen address; pass 0.0.0.0:8081 to serve remote workers (empty to disable)")
+	dashAddr := f.String("dashboard-addr", "127.0.0.1:8082", "web dashboard listen address (empty to disable)")
+	tokenFile := f.String("token-file", "", "file holding the bearer token the API requires; empty serves the API unauthenticated")
 	pprofAddr := f.String("pprof-addr", "127.0.0.1:6060", "net/http/pprof listen address; loopback-only by default (empty to disable)")
 	localOnly := f.Bool("local", false, "listen only on loopback for dashboard and worker API")
 	maxFileMB := f.Int64("max-file-size", defaultMaxFileSize/(1024*1024), "skip files larger than this many MiB")
@@ -859,8 +872,23 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	if *maxFileMB > 0 {
 		maxFileSize = *maxFileMB * 1024 * 1024
 	}
-	if *localOnly && *dashAddr != "" {
+	if *localOnly {
+		*apiAddr = localListenAddr(*apiAddr)
 		*dashAddr = localListenAddr(*dashAddr)
+	}
+	if *apiAddr != "" && *apiAddr == *dashAddr {
+		return fmt.Errorf("--api-addr and --dashboard-addr are both %s; they are separate listeners with "+
+			"separate access policies (the API requires a token, the dashboard does not)", *apiAddr)
+	}
+
+	// Fail closed: an operator who asked for authentication must never get an
+	// open API because the token file went missing.
+	var apiToken *tokenDigest
+	if *tokenFile != "" {
+		var err error
+		if apiToken, err = loadTokenDigest(*tokenFile); err != nil {
+			return err
+		}
 	}
 
 	if *dataDir == "" {
@@ -903,7 +931,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		slog.Info("pprof listening", "addr", *pprofAddr)
 	}
 
-	httpMux := http.NewServeMux()
+	apiMux := http.NewServeMux()
 	tracker := newWorkerTracker()
 	// Cap concurrent archive-member extractions to the CPU count (decompression
 	// is CPU-bound), clamped so a many-core host can't pile up unbounded disk
@@ -918,11 +946,11 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		// large archive results can't blow up the heap.
 		resultSem: make(chan struct{}, min(8, max(2, runtime.NumCPU()))),
 	} // db, progress, and allowedDirs are set after initialization
-	api.registerAPI(httpMux)
-	httpMux.HandleFunc("GET /_/health", func(w http.ResponseWriter, _ *http.Request) {
+	api.registerAPI(apiMux)
+	apiMux.HandleFunc("GET /_/health", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok")) //nolint:errcheck // best-effort HTTP response
 	})
-	httpMux.HandleFunc("GET /_/ready", func(w http.ResponseWriter, _ *http.Request) {
+	apiMux.HandleFunc("GET /_/ready", func(w http.ResponseWriter, _ *http.Request) {
 		if !api.ready.Load() {
 			http.Error(w, "starting", http.StatusServiceUnavailable)
 			return
@@ -934,16 +962,31 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		}
 		_, _ = w.Write([]byte("ready")) //nolint:errcheck // best-effort HTTP response
 	})
-	httpMux.Handle("GET /_/metrik", obs.MetricsHandler())
+	apiMux.Handle("GET /_/metrik", obs.MetricsHandler())
 
+	// The API listener: the tunnel origin, and the only one that authenticates.
+	// Auth sits inside obs.Middleware so rejected requests are still traced and
+	// counted, and inside recoverMiddleware so a panic anywhere is logged.
+	if *apiAddr != "" {
+		handler := recoverMiddleware(obs.Middleware(authMiddleware(apiToken, apiMux)))
+		if err := startHTTPServer(ctx, *apiAddr, handler); err != nil {
+			return fmt.Errorf("work API: %w", err)
+		}
+		slog.Info("work API listening", "addr", *apiAddr, "authenticated", apiToken != nil)
+	}
+
+	// The dashboard listener: no token — a browser cannot present one — so it
+	// is loopback by default and is never the tunnel origin.
 	var wd *webDashboard
 	if *dashAddr != "" {
 		wd = &webDashboard{}
-		if err := startWebDashboard(ctx, *dashAddr, wd, httpMux); err != nil {
+		dashMux := http.NewServeMux()
+		dashMux.HandleFunc("/", wd.handler)
+		if err := startHTTPServer(ctx, *dashAddr, recoverMiddleware(obs.Middleware(dashMux))); err != nil {
 			slog.Warn("web dashboard disabled", "error", err)
 			wd = nil
 		} else {
-			slog.Info("web dashboard + API listening", "addr", *dashAddr)
+			slog.Info("web dashboard listening", "addr", *dashAddr)
 			// Publish the dashboard's numerics at /_/metrik. Registered now;
 			// the callback no-ops until the load session is configured.
 			if err := wd.enableMetrics(); err != nil {
@@ -953,7 +996,8 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	}
 	// Feed the systemd watchdog (no-op outside a watchdog-armed unit). Started
 	// after the listener so the self-probe tests a socket that should exist.
-	go runSDWatchdog(ctx, *dashAddr)
+	// It probes /healthz, which lives on the API listener.
+	go runSDWatchdog(ctx, *apiAddr)
 	// Carve the delegated workers/ cgroup before anything spawns children, so
 	// litmus and cleave land under the kernel-enforced budget from the start.
 	setupWorkerCgroup(*maxRSSGB)
@@ -1036,11 +1080,14 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// surface on the dashboard banner via the server's published health.
 	var litmus *litmusServer
 	if *litmusBin != "" {
-		// Local worker always connects to loopback. Replace 0.0.0.0 with
-		// 127.0.0.1 since 0.0.0.0 is a bind address, not a destination.
+		// Local worker always connects to the API over loopback. Replace
+		// 0.0.0.0 with 127.0.0.1 since 0.0.0.0 is a bind address, not a
+		// destination. It authenticates like any other client — loopback is not
+		// exempt — reading the token from ~/.tok/hopper in the service
+		// account's home, which it inherits through the environment.
 		hopperURL := "http://127.0.0.1:8081"
-		if *dashAddr != "" {
-			addr := *dashAddr
+		if *apiAddr != "" {
+			addr := *apiAddr
 			if after, ok := strings.CutPrefix(addr, "0.0.0.0:"); ok {
 				addr = "127.0.0.1:" + after
 			}
@@ -1321,10 +1368,19 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	api.sweepUploadTmp()
 
 	api.ready.Store(true)
+	// An unauthenticated API is open to anyone who can reach the socket. A
+	// loopback bind is not evidence of safety: cloudflared terminates the
+	// tunnel on loopback, putting the internet on the other side of it. So
+	// warn whenever there is no token, wherever it is bound.
+	if *apiAddr != "" && apiToken == nil {
+		slog.Warn("no --token-file: /api/*, /api/upload, /api/file, and /data are unauthenticated",
+			"addr", *apiAddr,
+			"recommendation", "pass --token-file, or run with --local on a host you trust")
+	}
 	if *dashAddr != "" && !isLoopbackAddr(*dashAddr) {
-		slog.Warn("dashboard bound to non-loopback; /api/upload, /api/file, and /data are unauthenticated",
+		slog.Warn("dashboard bound to non-loopback; it has no authentication of its own",
 			"addr", *dashAddr,
-			"recommendation", "run with --local or behind an authenticated reverse proxy")
+			"recommendation", "leave it on loopback and reach it over an SSH forward, or put an authenticating proxy in front")
 	}
 
 	slog.Info("load prep complete",
@@ -1354,7 +1410,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 			"skipped_missing_sample", stats.SkippedMissingSample,
 			"skipped_invalid", stats.SkippedInvalid)
 	}
-	servingAPI := *dashAddr != ""
+	servingAPI := *apiAddr != ""
 	slog.Info("file walk complete",
 		"samples", total,
 		"serving_api", servingAPI,
@@ -3983,6 +4039,9 @@ func fetchSample(ctx context.Context, client *http.Client, fileURL, dest string)
 			cancel()
 			return "bad request: " + err.Error(), false
 		}
+		// /api/file requires a bearer token on a master deployed with
+		// --token-file, loopback callers included.
+		authorizeRequest(req)
 		resp, err := client.Do(req) //nolint:gosec // fileURL derives from the operator-supplied --url; this is a CLI client, not a server
 		if err != nil {
 			cancel()

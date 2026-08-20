@@ -3,7 +3,12 @@
 DATA_DIR  ?= /data/samples
 DB        ?= postgres://hopper@hopper-db/hopper?sslmode=disable
 SOURCE    ?= harvest
-DASH_ADDR ?= 0.0.0.0:8081
+# Two listeners with two access policies. The work API is the Cloudflare Tunnel
+# origin and requires a bearer token; the HTML dashboard has no authentication
+# of its own — a browser cannot present a token — so it stays on loopback and is
+# reached over an SSH forward. Never point the tunnel at DASH_ADDR.
+API_ADDR  ?= 0.0.0.0:8081
+DASH_ADDR ?= 127.0.0.1:8082
 # Linux atomscan worker slots and RSS cap in GB, forwarded to the systemd
 # deploy script as --workers and --max-memory-gb.
 #
@@ -41,7 +46,8 @@ help:
 	@echo "  make clean                  Clean build artifacts"
 	@echo "  make install-precommit      Install the git pre-commit hook (test + lint + go.mod)"
 	@echo "  make deploy                 Install Hopper and its separate scan worker"
-	@echo "                              (DATA_DIR=$(DATA_DIR) DB=... SOURCE=$(SOURCE) DASH_ADDR=$(DASH_ADDR)"
+	@echo "                              (DATA_DIR=$(DATA_DIR) DB=... SOURCE=$(SOURCE)"
+	@echo "                               API_ADDR=$(API_ADDR) DASH_ADDR=$(DASH_ADDR) TOKEN_SRC=~/.tok/hopper"
 	@echo "                               Linux: WORKERS=$(WORKERS) MAX_MEMORY_GB=$(MAX_MEMORY_GB)"
 	@echo "                               FreeBSD: WORKERS=$(FREEBSD_WORKERS) MAX_MEMORY_GB=$(FREEBSD_MAX_MEMORY_GB) SCAN_DIR=$(SCAN_DIR)"
 	@echo "                                        CLOUDFLARED=$(CLOUDFLARED); first tunnel deploy needs CF_TUNNEL_TOKEN=...)"
@@ -77,13 +83,13 @@ deploy:
 
 deploy-linux:
 	DATA_DIR='$(DATA_DIR)' DB='$(DB)' SOURCE='$(SOURCE)' \
-	DASH_ADDR='$(DASH_ADDR)' WORKERS='$(WORKERS)' \
+	API_ADDR='$(API_ADDR)' DASH_ADDR='$(DASH_ADDR)' WORKERS='$(WORKERS)' \
 	MAX_MEMORY_GB='$(MAX_MEMORY_GB)' \
 	./scripts/master/linux-systemd.sh
 
 deploy-freebsd:
 	DATA_DIR='$(DATA_DIR)' DB='$(DB)' SOURCE='$(SOURCE)' \
-	DASH_ADDR='$(DASH_ADDR)' WORKERS='$(FREEBSD_WORKERS)' \
+	API_ADDR='$(API_ADDR)' DASH_ADDR='$(DASH_ADDR)' WORKERS='$(FREEBSD_WORKERS)' \
 	MAX_MEMORY_GB='$(FREEBSD_MAX_MEMORY_GB)' SCAN_DIR='$(SCAN_DIR)' LLM='$(LLM)' \
 	CLOUDFLARED='$(CLOUDFLARED)' \
 		./scripts/master/freebsd.sh

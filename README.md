@@ -74,9 +74,11 @@ Then initialize SQLite and ingest it:
   --workers 1
 ```
 
-`load` remains running: it watches the corpus, runs the local worker, and serves
-the dashboard/API. `--local` binds the dashboard to loopback; use it for a
-workstation unless remote access is explicitly required.
+`load` remains running: it watches the corpus, runs the local worker, and
+serves two listeners — the work API (`--api-addr`) and the HTML dashboard
+(`--dashboard-addr`, loopback by default). They are separate so each carries one
+access policy: the API requires a bearer token, the dashboard has none and is
+not meant to leave the host. `--local` binds both to loopback.
 
 To run a disposable local PostgreSQL instance instead, install PostgreSQL's
 `initdb`, `postgres`, `createdb`, and `pg_isready` tools, then run:
@@ -96,16 +98,29 @@ development. Do not expose that database to a network.
 ./hopper load \
   --db "$DATABASE_URL" \
   --data /srv/samples \
-  --dashboard-addr 127.0.0.1:8081
+  --api-addr 0.0.0.0:8081 \
+  --token-file ~/.tok/hopper \
+  --dashboard-addr 127.0.0.1:8082
 ```
+
+`--token-file` requires `Authorization: Bearer <token>` on every API route
+except the liveness, readiness, and metrics probes — loopback callers included,
+because a Cloudflare tunnel terminates on loopback and a loopback exemption
+would be an internet exemption. Clients (scan's workers and uploader, hopper's
+own `triage` and `post-triage`) read the same token from `~/.tok/hopper`. The
+deploy scripts generate one on first run and install it for the service user;
+rotation is an edit plus a restart, since it is read once at startup.
 
 Run `./hopper <command> -h` for command-specific flags. Review the deployment
 scripts before using them: they encode Atomdrift's own topology, database
 roles, replication, and service assumptions.
 
 Protect the worker/file API, database, and dashboard as sensitive
-infrastructure. Hopper can accept and serve malware bytes and store authoritative
-labels; it should not be exposed directly to the public internet.
+infrastructure. Hopper can accept and serve malware bytes and store
+authoritative labels. Only the API listener is designed to be published — and
+only with `--token-file` set. The dashboard has no authentication of its own,
+so it must stay on loopback and be reached over an SSH forward; never give it a
+tunnel hostname.
 
 ## Native FreeBSD deployment
 
@@ -130,6 +145,22 @@ the tool rules, and configures `hopper` to listen on port 8081. The worker is
 supervised independently, so a worker crash or memory failure does not stop the
 Hopper API. The `scan` account must be able to read `DATA_DIR`; the installer
 adds both service accounts to the `samples` group by default.
+
+## Operations
+
+- [Production readiness packet](docs/production-readiness.md) — architecture,
+  dependencies, failure modes, resource limits, and the open risk register
+- [Alert runbook](docs/runbook.md) — one procedure per alert rule
+- [SLI/SLO proposal](docs/slo.md) — proposed objectives (targets not yet adopted)
+- [Replica runbook](scripts/replica/RUNBOOK.md) · [monitoring setup](scripts/monitoring/RUNBOOK.md)
+
+Metrics are exported for Prometheus at `GET /_/metrik` on the **API** address
+(`--api-addr`, default `0.0.0.0:8081`), not the dashboard one. Like the
+liveness and readiness probes it is exempt from the bearer token so a scraper
+needs no credential — keep the scrape path reachable only from your monitoring
+network, and scope the tunnel's ingress to the routes you mean to publish.
+Alert rules live in `scripts/prometheus-hopper-alerts.yml` and a Grafana
+dashboard in `scripts/grafana-hopper-dashboard.json`.
 
 ## Useful commands
 

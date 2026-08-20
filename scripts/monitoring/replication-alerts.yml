@@ -30,6 +30,7 @@ groups:
         for: 5m
         labels: { severity: page }
         annotations:
+          runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/scripts/monitoring/RUNBOOK.md#what-pages-you-and-why"
           summary: "Postgres replication exporter is down"
           description: "Alloy/postgres_exporter on the publisher has been unscrapeable for 5m — replication lag is no longer being observed."
 
@@ -40,6 +41,7 @@ groups:
         for: 0m
         labels: { severity: page }
         annotations:
+          runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/scripts/replica/RUNBOOK.md#fast-rebuild-deferred-index-bulk-copy"
           summary: "Replication slot {{ $labels.slot_name }} is LOST"
           description: "wal_status=lost on {{ $labels.slot_name }} ({{ $labels.kind }}) — exceeded max_slot_wal_keep_size and was invalidated. The replica needs a full rebuild (make rebuild-replica)."
 
@@ -52,6 +54,7 @@ groups:
         for: 10m
         labels: { severity: page }
         annotations:
+          runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/scripts/monitoring/RUNBOOK.md#what-pages-you-and-why"
           summary: "Streaming replica slot {{ $labels.slot_name }} has no consumer"
           description: "No walsender has consumed {{ $labels.slot_name }} for 10m — the replica is disconnected (host/PG down or subscription disabled)."
 
@@ -61,6 +64,7 @@ groups:
         for: 15m
         labels: { severity: warning }
         annotations:
+          runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/scripts/monitoring/RUNBOOK.md#what-pages-you-and-why"
           summary: "Replica slot {{ $labels.slot_name }} retaining >300GB WAL"
           description: "{{ $value | humanize1024 }}B pinned by {{ $labels.slot_name }} — the streaming replica is lagging (backstop 1500GB)."
 
@@ -71,6 +75,7 @@ groups:
         for: 5m
         labels: { severity: page }
         annotations:
+          runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/scripts/replica/RUNBOOK.md#fast-rebuild-deferred-index-bulk-copy"
           summary: "Replication slot {{ $labels.slot_name }} near the backstop"
           description: "{{ $value | humanize1024 }}B pinned by {{ $labels.slot_name }} ({{ $labels.kind }}) — within ~300GB of max_slot_wal_keep_size (1200GB). It will self-invalidate if it crosses."
 
@@ -98,6 +103,7 @@ groups:
         for: 30m
         labels: { severity: warning }
         annotations:
+          runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/scripts/monitoring/RUNBOOK.md#what-pages-you-and-why"
           summary: "Tablesync slot {{ $labels.slot_name }} retaining >400GB WAL"
           description: "An initial tablesync is pinning {{ $value | humanize1024 }}B and rising. Normal during a large copy; watch it against the 1500GB backstop."
 

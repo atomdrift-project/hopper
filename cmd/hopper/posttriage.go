@@ -760,6 +760,9 @@ func postTriage(ctx context.Context, baseURL string, req triageRequest) (*triage
 	httpReq.Header.Set("Content-Type", "application/json")
 	// Marks the request as a non-browser client for the CSRF guard.
 	httpReq.Header.Set("Sec-Fetch-Site", "same-origin")
+	// /api/triage requires a bearer token on a master deployed with
+	// --token-file, loopback callers included.
+	authorizeRequest(httpReq)
 	client := &http.Client{Timeout: 5 * time.Minute}
 	resp, err := client.Do(httpReq) //nolint:gosec // G704: baseURL is the operator-provided trusted master endpoint
 	if err != nil {
