@@ -16,14 +16,12 @@ package main
 import (
 	"crypto/sha256"
 	"crypto/subtle"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
-	"sync"
+
+	"github.com/atomdrift-project/hopper"
 )
 
 // minTokenLen is the shortest token accepted from --token-file. A short secret
@@ -70,18 +68,6 @@ func (d *tokenDigest) matches(presented []byte) bool {
 func (*tokenDigest) String() string { return "tokenDigest(<redacted>)" }
 
 // readTokenFile returns the first non-empty, trimmed line of path.
-func readTokenFile(path string) (string, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	for line := range strings.SplitSeq(string(b), "\n") {
-		if t := strings.TrimSpace(line); t != "" {
-			return t, nil
-		}
-	}
-	return "", errors.New("file is empty")
-}
 
 // loadTokenDigest reads the token at path and returns its digest.
 //
@@ -89,7 +75,7 @@ func readTokenFile(path string) (string, error) {
 // for authentication must never end up serving an open API because the token
 // file went missing.
 func loadTokenDigest(path string) (*tokenDigest, error) {
-	token, err := readTokenFile(path)
+	token, err := hopper.ReadTokenFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("--token-file %s: %w", path, err)
 	}
@@ -140,41 +126,10 @@ func authMiddleware(digest *tokenDigest, next http.Handler) http.Handler {
 
 // clientToken is the bearer token this process presents when it *calls* a
 // hopper API: the CLI subcommands (`triage`, `post-triage`, `demote-sighted`)
-// that speak to a master over HTTP.
-//
-// $HOPPER_TOKEN wins, for callers that inject the token some other way;
-// otherwise it is the first non-empty line of ~/.tok/hopper — the same file
-// the deploy scripts install, and the same convention scan's worker uses
-// (scan/src/upload.rs). An empty result means "no credential", which is
-// correct against an unauthenticated master and earns an honest 401 against an
-// authenticated one.
-//
-// Resolved once per process: a master reads its own copy once at startup too,
-// so rotation is a restart on both ends.
-var clientToken = sync.OnceValue(func() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		slog.Debug("no home directory; API calls will carry no bearer token", "error", err)
-		return resolveClientToken(os.Getenv("HOPPER_TOKEN"), "")
-	}
-	return resolveClientToken(os.Getenv("HOPPER_TOKEN"), filepath.Join(home, ".tok", "hopper"))
-})
-
-// resolveClientToken holds the precedence behind [clientToken], split out so it
-// is testable without touching the process environment or the sync.Once.
-func resolveClientToken(env, path string) string {
-	if t := strings.TrimSpace(env); t != "" {
-		return t
-	}
-	if path == "" {
-		return ""
-	}
-	token, err := readTokenFile(path)
-	if err != nil {
-		return ""
-	}
-	return token
-}
+// that speak to a master over HTTP. It is a var so tests can stub it; the
+// resolution itself lives in [hopper.APIToken], shared with every other client
+// in the fleet.
+var clientToken = hopper.APIToken
 
 // authorizeRequest attaches this host's bearer token to an outgoing API
 // request. A host with no token sends none — the master answers 401 if it

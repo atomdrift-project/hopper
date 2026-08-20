@@ -71,40 +71,6 @@ func TestTokenDigestStringRedacts(t *testing.T) {
 	}
 }
 
-func TestReadTokenFile(t *testing.T) {
-	dir := t.TempDir()
-	for name, content := range map[string]string{
-		"plain":   testToken,
-		"newline": testToken + "\n",
-		"leading": "\n\n  " + testToken + "  \nignored\n",
-	} {
-		path := filepath.Join(dir, name)
-		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		got, err := readTokenFile(path)
-		if err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-		if got != testToken {
-			t.Errorf("%s: got %q", name, got)
-		}
-	}
-
-	empty := filepath.Join(dir, "empty")
-	if err := os.WriteFile(empty, []byte("\n  \n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := readTokenFile(empty); err == nil {
-		t.Error("empty file accepted")
-	}
-	if _, err := readTokenFile(filepath.Join(dir, "absent")); err == nil {
-		t.Error("missing file accepted")
-	}
-}
-
-// A missing, empty, or too-short token file must be an error, never a nil
-// digest — that would silently serve an open API.
 func TestLoadTokenDigestFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	short := filepath.Join(dir, "short")
@@ -244,28 +210,6 @@ func TestAuthMiddlewareNilDigestIsPassthrough(t *testing.T) {
 	authMiddleware(nil, inner).ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || !reached {
 		t.Errorf("status = %d, reached = %v", rec.Code, reached)
-	}
-}
-
-func TestResolveClientToken(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "hopper")
-	if err := os.WriteFile(path, []byte("  "+testToken+"  \nignored\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	for name, tc := range map[string]struct {
-		env, path, want string
-	}{
-		"env wins over file":    {env: "from-env", path: path, want: "from-env"},
-		"blank env falls back":  {env: "   ", path: path, want: testToken},
-		"file is trimmed":       {env: "", path: path, want: testToken},
-		"env is trimmed":        {env: " padded ", path: "", want: "padded"},
-		"no env and no file":    {env: "", path: "", want: ""},
-		"missing file is empty": {env: "", path: filepath.Join(dir, "absent"), want: ""},
-	} {
-		if got := resolveClientToken(tc.env, tc.path); got != tc.want {
-			t.Errorf("%s: resolveClientToken(%q, %q) = %q, want %q", name, tc.env, tc.path, got, tc.want)
-		}
 	}
 }
 
