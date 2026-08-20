@@ -43,7 +43,7 @@ SUBSCRIPTION="${SUBSCRIPTION:-}"
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 
 validate_ident() {
     case "$2" in

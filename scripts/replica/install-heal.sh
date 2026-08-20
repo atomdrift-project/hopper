@@ -16,7 +16,7 @@
 
 set -eu
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 HEAL="$SCRIPT_DIR/replica-heal.sh"
 [ -f "$HEAL" ] || { echo "install-heal: $HEAL not found" >&2; exit 1; }
 chmod +x "$HEAL" 2>/dev/null || true

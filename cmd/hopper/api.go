@@ -672,7 +672,7 @@ const (
 	// host accordingly, or add a low-concurrency large-result lane if it bites.
 	maxResultBodyBytes = 1 << 30 // 1 GiB
 	maxTrackedWorkers  = 200
-	apiQueryTimeout = 30 * time.Second
+	apiQueryTimeout    = 30 * time.Second
 	// sightingsStoreTimeout bounds one AddSightings attempt. Large feed
 	// snapshots can flip many samples.corroborated rows; the old shared
 	// apiQueryTimeout (30s) was too tight and timed out under load
@@ -681,7 +681,7 @@ const (
 	// sightingsAttempts is how many times /api/sightings retries AddSightings
 	// on a transient failure (lock timeout, brief outage, per-attempt
 	// deadline). Permanent PG errors and a canceled request stop immediately.
-	sightingsAttempts = 3
+	sightingsAttempts  = 3
 	resultStoreTimeout = 10 * time.Minute
 	dbRetryInitial     = 100 * time.Millisecond
 	dbRetryMax         = 5 * time.Second
@@ -2388,35 +2388,7 @@ func (s *apiServer) handleSightings(w http.ResponseWriter, r *http.Request) {
 		sightings[i] = hopper.Sighting{Source: req.Source, Subject: subject, URL: req.URL, Note: req.Note}
 	}
 
-	changed, err := retry.DoWithData(
-		func() (int, error) {
-			ctx, cancel := context.WithTimeout(r.Context(), sightingsStoreTimeout)
-			defer cancel()
-			n, err := s.db.AddSightings(ctx, sightings)
-			if err == nil {
-				return n, nil
-			}
-			// Client gone or a deterministic PG fault → stop. Per-attempt
-			// deadline and lock timeouts stay retryable within sightingsAttempts.
-			if r.Context().Err() != nil ||
-				errors.Is(err, context.Canceled) ||
-				permanentPGError(err) {
-				return n, retry.Unrecoverable(err)
-			}
-			return n, err
-		},
-		retry.Context(r.Context()),
-		retry.Attempts(sightingsAttempts),
-		retry.Delay(dbRetryInitial),
-		retry.MaxDelay(dbRetryMax),
-		retry.DelayType(retry.FullJitterBackoffDelay),
-		retry.LastErrorOnly(true),
-		retry.WrapContextErrorWithLastError(true),
-		retry.OnRetry(func(attempt uint, err error) {
-			slog.WarnContext(r.Context(), "sightings: store failed; retrying",
-				"attempt", attempt+1, "error", err, "remote", r.RemoteAddr)
-		}),
-	)
+	changed, err := s.storeSightings(r.Context(), sightings, r.RemoteAddr)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "sightings: store failed", "error", err, "remote", r.RemoteAddr)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
@@ -2428,6 +2400,42 @@ func (s *apiServer) handleSightings(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(sightingsResponse{Changed: changed}) //nolint:errcheck,errchkjson // best-effort response
+}
+
+// storeSightings writes a batch, retrying transient failures with full-jitter
+// backoff. Each attempt gets its own sightingsStoreTimeout budget, so a slow
+// snapshot does not consume the whole allowance on the first try; ctx bounds
+// the retries as a whole.
+func (s *apiServer) storeSightings(ctx context.Context, sightings []hopper.Sighting, remote string) (int, error) {
+	return retry.DoWithData(
+		func() (int, error) {
+			attemptCtx, cancel := context.WithTimeout(ctx, sightingsStoreTimeout)
+			defer cancel()
+			n, err := s.db.AddSightings(attemptCtx, sightings)
+			if err == nil {
+				return n, nil
+			}
+			// Client gone or a deterministic PG fault → stop. Per-attempt
+			// deadline and lock timeouts stay retryable within sightingsAttempts.
+			if ctx.Err() != nil ||
+				errors.Is(err, context.Canceled) ||
+				permanentPGError(err) {
+				return n, retry.Unrecoverable(err)
+			}
+			return n, err
+		},
+		retry.Context(ctx),
+		retry.Attempts(sightingsAttempts),
+		retry.Delay(dbRetryInitial),
+		retry.MaxDelay(dbRetryMax),
+		retry.DelayType(retry.FullJitterBackoffDelay),
+		retry.LastErrorOnly(true),
+		retry.WrapContextErrorWithLastError(true),
+		retry.OnRetry(func(attempt uint, err error) {
+			slog.WarnContext(ctx, "sightings: store failed; retrying",
+				"attempt", attempt+1, "error", err, "remote", remote)
+		}),
+	)
 }
 
 // decodeSightingsNDJSON reads newline-delimited sighting objects from r. A

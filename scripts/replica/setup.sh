@@ -221,7 +221,7 @@ fi
 # subscription to run DDL, raise a maintenance flag the healer honors so they
 # don't race. pg_sh runs a command as the postgres OS user (same escalation as
 # admin()) so files land where the healer — also postgres — reads them.
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 . "$SCRIPT_DIR/replicated-tables.sh"
 REPLICATED_TABLES_SQL=$(printf "'%s'," $REPLICATED_TABLES | sed 's/,$//')
 if [ -z "$ESCALATE" ]; then

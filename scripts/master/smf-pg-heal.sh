@@ -140,7 +140,7 @@ do_install() {
 	[ "$(id -u)" = 0 ] || die "install must run as root inside the postgres zone"
 
 	# Illumos dirname/basename do not accept GNU "--"; never pass it.
-	self=$(CDPATH= cd "$(dirname "$0")" && pwd)/$(basename "$0")
+	self=$(CDPATH='' cd "$(dirname "$0")" && pwd)/$(basename "$0")
 	[ -f "$self" ] || die "cannot locate self at $self"
 
 	bindir=$(dirname "$HEAL_BIN")

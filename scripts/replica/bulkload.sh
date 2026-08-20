@@ -1,3 +1,4 @@
+# shellcheck shell=sh
 # bulkload.sh — accelerate a logical-replication initial COPY by deferring
 # secondary-index maintenance (sourced by setup.sh; not executed directly).
 #

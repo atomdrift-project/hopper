@@ -72,7 +72,7 @@ pg_isready -q || die "local postgres is not reachable — start it first"
 [ -f "$PGPASS" ] || die "$PGPASS not found; add the upstream entry first"
 chmod 600 "$PGPASS"
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 [ -x "$SCRIPT_DIR/setup.sh" ] || die "$SCRIPT_DIR/setup.sh not found or not executable"
 
 # --- Admin access probe (matches setup.sh) ---------------------------------

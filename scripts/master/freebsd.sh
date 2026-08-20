@@ -297,7 +297,7 @@ fi
 log "Waiting for Hopper readiness"
 ready=0
 ready_port=${DASH_ADDR##*:}
-for attempt in $(jot 60 1); do
+for _ in $(jot 60 1); do
 	if fetch -qo - "http://127.0.0.1:$ready_port/_/ready" >/dev/null 2>&1; then
 		ready=1
 		break

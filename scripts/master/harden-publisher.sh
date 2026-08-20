@@ -137,7 +137,7 @@ do_install() {
         log "no --keep-size given — leaving max_slot_wal_keep_size unchanged"
     fi
 
-    self=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/$(basename -- "$0")
+    self=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/$(basename -- "$0")
     logf="$STATE_DIR/monitor.log"
     line="*/$INTERVAL_MIN * * * * WARN_GB=$WARN_GB REAP_GB=$REAP_GB REAP_GRACE_MIN=$REAP_GRACE_MIN REAP=$REAP PGDB=$PGDB $self monitor >> $logf 2>&1"
     mkdir -p "$STATE_DIR" 2>/dev/null || true
