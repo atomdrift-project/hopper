@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 )
 
-func isMountPoint(path string) (bool, string, error) {
+// isMountPoint reports whether path is the root of a mounted filesystem, and
+// names the device or remote it was mounted from when the platform can say.
+func isMountPoint(path string) (mounted bool, source string, err error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return false, "", err

@@ -230,9 +230,7 @@ func TestSweepStaleLitmusLogsMissingDir(t *testing.T) {
 func TestWorkerArgsInterpret(t *testing.T) {
 	t.Parallel()
 
-	has := func(args []string, want string) bool {
-		return slices.Contains(args, want)
-	}
+	has := slices.Contains[[]string, string]
 
 	configured := newLitmusServer(litmusConfig{
 		HopperURL: "http://127.0.0.1:8081",

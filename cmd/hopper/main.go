@@ -800,7 +800,8 @@ func cmdReset(ctx context.Context) error {
 func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,gocognit // complex command setup function.
 	f := flag.NewFlagSet("load", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
-	dataDir := f.String("data", "", "data directory containing bad/, good/, sighted/, incoming/, pending/, review/, or legacy unknown/ subdirectories")
+	dataDir := f.String("data", "",
+		"data directory containing bad/, good/, sighted/, incoming/, pending/, review/, or legacy unknown/ subdirectories")
 	source := f.String("source", hopper.SourceFilesystem,
 		"source tag for top-level rows this walk inserts that no collector already recorded "+
 			"(default \"fs\"; forager direct-inserts its own rows as \"forager\")")
@@ -826,7 +827,8 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	litmusWorkers := f.Int("workers", 56, "concurrent analysis workers for the local atomscan worker (0 = auto: min(2, cores/2))")
 	// Remote litmus workers self-register via the pull API; no --litmus-nodes flag needed.
 	litmusLLM := f.String("litmus-llm", os.Getenv("SCAN_LLM"),
-		"OpenAI-compatible endpoint enabling the local atomscan worker's --interpret pass, as the remote fleet runs it (defaults to $SCAN_LLM; empty disables the pass and stores no llm_result)")
+		"OpenAI-compatible endpoint enabling the local atomscan worker's --interpret pass, as the remote fleet runs it "+
+			"(defaults to $SCAN_LLM; empty disables the pass and stores no llm_result)")
 	maxRSSGB := f.Int("max-memory-gb", 48,
 		"local atomscan worker RSS limit in GB, forwarded as --max-rss-gb (0 = auto: let atomscan self-throttle, -1 = disable in-process throttling)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
@@ -1514,6 +1516,108 @@ var (
 // the directory pipelines; then the analysis queue is closed and drained;
 // then the summary is logged. nworkers bounds how many directory pipelines
 // may run concurrently (irrelevant for typical 3-dir loads).
+// walkPass is one enumeration→hash→insert pass over the configured pools, plus
+// the state every pass shares. Extracted from loadAll so the pass logic — which
+// runs once at startup and then on two tickers — reads on its own.
+type walkPass struct {
+	db            *hopper.DB
+	cache         *hashCache
+	progress      *loadProgress
+	start         time.Time
+	source        string
+	experimentTag string
+	dirs          []struct{ dir, label string }
+	nworkers      int
+	markMissing   bool
+}
+
+// run executes one pass. When cutoff is non-zero the enumeration is incremental
+// — only files modified at or after cutoff are considered. When reconcile is
+// true the pass also records a present-set in walk_staging and runs
+// ReconcilePools; otherwise it is a pure ingest pass that never touches the
+// staging table. chs supplies pre-started enumerations; nil starts them here.
+func (p *walkPass) run(ctx context.Context, chs []enumerationStream, cutoff time.Time, reconcile bool) {
+	// Only a reconcile pass touches walk_staging: it records a fresh
+	// present-set that ReconcilePools anti-joins against samples to find
+	// moved/missing files. Ingest passes skip staging entirely, so they
+	// never contend on the table and an incremental (partial) present-set
+	// can never make live files look missing. If the table can't be cleared
+	// we skip reconcile rather than stage onto a stale set (the original
+	// cause of unbounded walk_staging growth).
+	stageOK := false
+	if reconcile {
+		if err := p.db.StartWalkStaging(ctx); err != nil {
+			slog.Error("walk staging clear failed; skipping reconcile this pass", "error", err)
+		} else {
+			stageOK = true
+		}
+	}
+
+	// Reset walk-phase counters so they reflect the current pass, not a
+	// cumulative total across re-walks.
+	p.progress.walked.Store(0)
+	p.progress.hashed.Store(0)
+	p.progress.inserted.Store(0)
+	p.progress.skipped.Store(0)
+	p.progress.cacheHits.Store(0)
+	p.progress.tooSmall.Store(0)
+	p.progress.tooLarge.Store(0)
+	p.progress.hashErrors.Store(0)
+
+	if chs == nil {
+		chs = make([]enumerationStream, len(p.dirs))
+		for i, d := range p.dirs {
+			chs[i] = startEnumeration(ctx, d.dir, cutoff)
+		}
+	}
+
+	sem := make(chan struct{}, max(1, p.nworkers))
+	var pipeWG sync.WaitGroup
+	pipeErrs := make(chan error, len(p.dirs))
+	for i, d := range p.dirs {
+		stream := chs[i]
+		pipeWG.Go(func() {
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
+			pipeErrs <- runDirPipeline(ctx, p.db, d, p.source, p.cache, p.progress, stream.paths, stageOK)
+		})
+	}
+	pipeWG.Wait()
+	close(pipeErrs)
+	walkComplete := true
+	for err := range pipeErrs {
+		if err != nil {
+			walkComplete = false
+			slog.Warn("directory pipeline incomplete; reconciliation disabled for this pass", "error", err)
+		}
+	}
+	for i, stream := range chs {
+		if err := <-stream.done; err != nil {
+			walkComplete = false
+			slog.Warn("enumeration incomplete; reconciliation disabled for this pass",
+				"dir", p.dirs[i].dir, "error", err)
+		}
+	}
+	p.progress.walkDone.Store(true)
+
+	// Reconcile the derived label/skip cache against the pools, but only
+	// after a complete staged walk — a cancelled (partial) walk would make
+	// present files look missing. Bounded by reconcileTimeout so a
+	// pathological pass is abandoned instead of stranding the walk loop (and
+	// with it all ingestion), as an unbounded reconcile once did.
+	if stageOK && walkComplete && ctx.Err() == nil {
+		reconcilePools(ctx, p.db, p.dirs, p.markMissing)
+	} else if stageOK && ctx.Err() == nil {
+		slog.Warn("skipping authoritative reconcile after incomplete walk")
+	}
+
+	logLoadSummary(p.start, p.experimentTag, p.dirs, p.progress)
+}
+
 func loadAll( //nolint:nolintlint,revive // many params reflect the many subsystems coordinated here.
 	ctx context.Context,
 	_ context.CancelFunc,
@@ -1600,91 +1704,9 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 		runQueueMaintenance(backgroundCtx, db, &progress, metrics, traitsVersion, rescanAge)
 	})
 
-	// runWalk executes one enumeration→hash→insert pass across all dirs. When
-	// cutoff is non-zero the enumeration is incremental — only files modified at
-	// or after cutoff are considered. When reconcile is true the pass also
-	// records a present-set in walk_staging and runs ReconcilePools; otherwise
-	// it is a pure ingest pass that never touches the staging table.
-	runWalk := func(chs []enumerationStream, cutoff time.Time, reconcile bool) {
-		// Only a reconcile pass touches walk_staging: it records a fresh
-		// present-set that ReconcilePools anti-joins against samples to find
-		// moved/missing files. Ingest passes skip staging entirely, so they
-		// never contend on the table and an incremental (partial) present-set
-		// can never make live files look missing. If the table can't be cleared
-		// we skip reconcile rather than stage onto a stale set (the original
-		// cause of unbounded walk_staging growth).
-		stageOK := false
-		if reconcile {
-			if err := db.StartWalkStaging(ctx); err != nil {
-				slog.Error("walk staging clear failed; skipping reconcile this pass", "error", err)
-			} else {
-				stageOK = true
-			}
-		}
-
-		// Reset walk-phase counters so they reflect the current pass, not a
-		// cumulative total across re-walks.
-		progress.walked.Store(0)
-		progress.hashed.Store(0)
-		progress.inserted.Store(0)
-		progress.skipped.Store(0)
-		progress.cacheHits.Store(0)
-		progress.tooSmall.Store(0)
-		progress.tooLarge.Store(0)
-		progress.hashErrors.Store(0)
-
-		if chs == nil {
-			chs = make([]enumerationStream, len(dirs))
-			for i, d := range dirs {
-				chs[i] = startEnumeration(ctx, d.dir, cutoff)
-			}
-		}
-
-		sem := make(chan struct{}, max(1, nworkers))
-		var pipeWG sync.WaitGroup
-		pipeErrs := make(chan error, len(dirs))
-		for i, d := range dirs {
-			stream := chs[i]
-			pipeWG.Go(func() {
-				select {
-				case sem <- struct{}{}:
-					defer func() { <-sem }()
-				case <-ctx.Done():
-					return
-				}
-				pipeErrs <- runDirPipeline(ctx, db, d, source, cache, &progress, stream.paths, stageOK)
-			})
-		}
-		pipeWG.Wait()
-		close(pipeErrs)
-		walkComplete := true
-		for err := range pipeErrs {
-			if err != nil {
-				walkComplete = false
-				slog.Warn("directory pipeline incomplete; reconciliation disabled for this pass", "error", err)
-			}
-		}
-		for i, stream := range chs {
-			if err := <-stream.done; err != nil {
-				walkComplete = false
-				slog.Warn("enumeration incomplete; reconciliation disabled for this pass",
-					"dir", dirs[i].dir, "error", err)
-			}
-		}
-		progress.walkDone.Store(true)
-
-		// Reconcile the derived label/skip cache against the pools, but only
-		// after a complete staged walk — a cancelled (partial) walk would make
-		// present files look missing. Bounded by reconcileTimeout so a
-		// pathological pass is abandoned instead of stranding the walk loop (and
-		// with it all ingestion), as an unbounded reconcile once did.
-		if stageOK && walkComplete && ctx.Err() == nil {
-			reconcilePools(ctx, db, dirs, markMissing)
-		} else if stageOK && ctx.Err() == nil {
-			slog.Warn("skipping authoritative reconcile after incomplete walk")
-		}
-
-		logLoadSummary(start, experimentTag, dirs, &progress)
+	pass := &walkPass{
+		db: db, cache: cache, progress: &progress, dirs: dirs, source: source,
+		experimentTag: experimentTag, start: start, nworkers: nworkers, markMissing: markMissing,
 	}
 
 	// Initial pass: a full walk (pre-started enumeration channels) that also
@@ -1693,7 +1715,7 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	// runs on every restart, which matters on a host that recycles more often
 	// than reconcileWalkInterval (otherwise reconcile would rarely run at all).
 	initialStart := time.Now()
-	runWalk(fileChs, time.Time{}, true)
+	pass.run(ctx, fileChs, time.Time{}, true)
 
 	// Periodic passes pick up files forager's direct-insert missed while workers
 	// analyze. Ingest walks are incremental (only files modified since the
@@ -1714,12 +1736,12 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 					lastStart = time.Now()
 					progress.walkDone.Store(false)
 					slog.Info("starting incremental ingest walk", "since", cutoff)
-					runWalk(nil, cutoff, false)
+					pass.run(ctx, nil, cutoff, false)
 				case <-recon.C:
 					lastStart = time.Now()
 					progress.walkDone.Store(false)
 					slog.Info("starting full reconcile walk")
-					runWalk(nil, time.Time{}, true)
+					pass.run(ctx, nil, time.Time{}, true)
 				case <-ctx.Done():
 					return
 				}
@@ -1778,9 +1800,9 @@ func reconcilePools(ctx context.Context, db *hopper.DB, dirs []struct{ dir, labe
 // Appending to an unlogged staging table is far cheaper than the per-file
 // last_seen_at UPDATE it replaces (millions of indexed writes per walk).
 type walkStager struct {
+	err   error
 	db    *hopper.DB
 	batch []hopper.SampleLocationKey
-	err   error
 }
 
 func (s *walkStager) add(ctx context.Context, sha, path string) {

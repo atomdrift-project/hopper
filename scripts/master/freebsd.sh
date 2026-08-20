@@ -22,6 +22,12 @@ SAMPLES_GROUP="${SAMPLES_GROUP:-samples}"
 PULL_DISABLE="${PULL_DISABLE:-0}"
 DATASET_INCOMPLETE="${DATASET_INCOMPLETE:-1}"
 REQUIRED_MOUNTS="${REQUIRED_MOUNTS:-bad,good,incoming,pending,review}"
+# Cloudflare Tunnel exposure. "auto" configures the tunnel only when a token is
+# supplied or one was stored by an earlier deploy, so hosts that serve Hopper
+# on the LAN alone need no extra flags. Set CLOUDFLARED=1 to require it, or
+# CLOUDFLARED=0 to skip it even when a token is present.
+CLOUDFLARED="${CLOUDFLARED:-auto}"
+CF_TUNNEL_TOKEN_FILE="${CF_TUNNEL_TOKEN_FILE:-/usr/local/etc/hopper/cloudflared-token}"
 
 SERVICE_USER=hopper
 HOPPER_BIN=/usr/local/bin/hopper
@@ -264,6 +270,31 @@ if [ "$ready" -ne 1 ]; then
 	die "Hopper did not become ready within 60 seconds"
 fi
 
+case "$CLOUDFLARED" in
+0 | no | NO)
+	want_tunnel=0
+	;;
+auto)
+	want_tunnel=0
+	if [ -n "${CF_TUNNEL_TOKEN:-}" ] || $SUDO test -s "$CF_TUNNEL_TOKEN_FILE"; then
+		want_tunnel=1
+	fi
+	;;
+*)
+	want_tunnel=1
+	;;
+esac
+
+if [ "$want_tunnel" = 1 ]; then
+	# Started only after readiness: a connector that advertises an origin
+	# which is not yet serving hands Cloudflare a 502 window on every deploy.
+	log "Deploying Cloudflare Tunnel"
+	CF_TUNNEL_TOKEN_FILE="$CF_TUNNEL_TOKEN_FILE" \
+		./scripts/master/cloudflared.sh "http://127.0.0.1:$ready_port"
+else
+	log "Skipping Cloudflare Tunnel (CLOUDFLARED=$CLOUDFLARED)"
+fi
+
 log "Deploying separate Scan worker"
 (cd "$SCAN_DIR" && \
 	DATA_DIR="$DATA_DIR" WORKERS="$WORKERS" MAX_RSS_GB="$MAX_MEMORY_GB" LLM="$LLM" \
@@ -272,3 +303,6 @@ log "Deploying separate Scan worker"
 log "Deployment complete"
 log "Hopper API: http://127.0.0.1:8081"
 log "Hopper database: $DB"
+if [ "$want_tunnel" = 1 ]; then
+	log "Cloudflare Tunnel: service hopper_tunnel status"
+fi

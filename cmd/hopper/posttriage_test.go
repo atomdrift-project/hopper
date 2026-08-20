@@ -332,8 +332,7 @@ func TestHandleIncomingLocationsOldestFirst(t *testing.T) {
 		}
 	}
 	api := &apiServer{db: db, dataRoot: root, tracker: newWorkerTracker()}
-	req := httptest.NewRequest(http.MethodGet,
-		"/api/locations/incoming?before="+time.Now().UTC().Format(time.RFC3339Nano)+"&limit=1", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/locations/incoming?before="+time.Now().UTC().Format(time.RFC3339Nano)+"&limit=1", http.NoBody)
 	rec := httptest.NewRecorder()
 	api.handleIncomingLocations(rec, req)
 	if rec.Code != http.StatusOK {

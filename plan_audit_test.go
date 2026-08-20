@@ -160,7 +160,7 @@ func explainText(t *testing.T, ctx context.Context, db *DB, sql string, args []s
 }
 
 func planSeqScansSamples(plan string) bool {
-	for _, line := range strings.Split(plan, "\n") {
+	for line := range strings.SplitSeq(plan, "\n") {
 		if !strings.Contains(line, "Seq Scan on samples") {
 			continue
 		}

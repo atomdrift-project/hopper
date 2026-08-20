@@ -26,7 +26,9 @@ func openSQLite(ctx context.Context, dsn string) (*DB, error) {
 		}
 		return nil, fmt.Errorf("hopper: ping sqlite: %w", err)
 	}
-	return &DB{lite: lite}, nil
+	db := newDB()
+	db.lite = lite
+	return db, nil
 }
 
 func pragmaHasColumn(ctx context.Context, db *sql.DB, column string) int {
@@ -286,6 +288,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		`CREATE INDEX IF NOT EXISTS idx_samples_domain ON samples(domain) WHERE domain != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_package_version ON samples(package, version) WHERE package != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_purl_base ON samples(purl_base) WHERE purl_base != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_purl_analyzed ` +
+			`ON samples (purl_base, version, analyzed_at DESC) ` +
+			`WHERE purl_base != '' AND parent = '' AND litmus_result IS NOT NULL AND cleave_result IS NOT NULL`,
 	} {
 		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite samples index: %w", err)
@@ -1347,6 +1352,39 @@ func (db *DB) sampleBySHA256SQLite(ctx context.Context, sha256 string) (*Sample,
 		return nil, fmt.Errorf("hopper: sample %s: %w", sha256, err)
 	}
 	return s, nil
+}
+
+// sampleByPURLSQLite mirrors [sampleByPURLSQL]; the redundant-looking
+// non-empty purl_base is what lets SQLite match idx_samples_purl_analyzed,
+// whose WHERE terms must all appear in the query.
+const sampleByPURLSQLite = `SELECT ` + liteSampleCols + ` FROM samples
+		WHERE purl_base = ?
+		  AND purl_base <> ''
+		  AND litmus_result IS NOT NULL
+		  AND cleave_result IS NOT NULL
+		  AND file_type <> 'registry'
+		  AND ` + uncontainedSQL
+
+func (db *DB) sampleByPURLSQLite(ctx context.Context, base, version string) (*Sample, error) {
+	query := sampleByPURLSQLite
+	args := []any{base}
+	if version != "" {
+		query += ` AND version = ?`
+		args = append(args, version)
+	}
+	query += ` ORDER BY analyzed_at DESC LIMIT 1`
+	rows, err := db.lite.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: sample purl %s@%s: %w", base, version, err)
+	}
+	samples, err := scanLiteSamples(rows)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: sample purl %s@%s: %w", base, version, err)
+	}
+	if len(samples) == 0 {
+		return nil, ErrNotFound
+	}
+	return samples[0], nil
 }
 
 func (db *DB) membersByParentSQLite(ctx context.Context, parentSHA string, limit int) ([]ArchiveMember, int, error) {
@@ -4438,8 +4476,11 @@ func (q *FeedQuery) whereSQLite() (where string, args []any) {
 	// snapshots cleave types "registry", stored top-level beside a package.
 	// They describe an artifact rather than being one, so the feed never lists
 	// them (mirrors the PG feed/count queries).
-	clauses := []string{"source = ?", "cleave_result IS NOT NULL", "file_type <> 'registry'"}
-	args = []any{q.Source}
+	// Empty source spans every ingest source, matching feedSamplesPG
+	// (`$1 = '' OR source = $1`) and FeedEcosystems. Beamline PURL lookup
+	// relies on this: it does not know whether the row came from forager.
+	clauses := []string{"(? = '' OR source = ?)", "cleave_result IS NOT NULL", "file_type <> 'registry'"}
+	args = []any{q.Source, q.Source}
 
 	if q.Label != "" {
 		clauses = append(clauses, "label = ?")

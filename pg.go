@@ -44,7 +44,9 @@ func openPG(ctx context.Context, dsn string) (*DB, error) {
 		pool.Close()
 		return nil, fmt.Errorf("hopper: ping: %w", err)
 	}
-	return &DB{pool: pool}, nil
+	db := newDB()
+	db.pool = pool
+	return db, nil
 }
 
 // migratePG applies every migration synchronously — core DDL (tables, columns,
@@ -453,6 +455,16 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// Built CONCURRENTLY by createIndexConcurrently.
 		`CREATE INDEX IF NOT EXISTS idx_samples_package_version ON samples(package, version) WHERE package != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_purl_base ON samples(purl_base) WHERE purl_base != ''`,
+		// GET /api/sample?purl= (SampleByPURL): equality on purl_base + version,
+		// newest analyzed_at, top-level analyzed rows only. idx_samples_purl_base
+		// is a single-column identity index and cannot satisfy ORDER BY
+		// analyzed_at DESC LIMIT 1; the prism feed query's ($n = '' OR col = $n)
+		// shape plus that ORDER BY made the planner walk idx_samples_analyzed_at
+		// until a purl hit (or the whole table, on a miss). Beamline times out
+		// at 2s. Built CONCURRENTLY by createIndexConcurrently.
+		`CREATE INDEX IF NOT EXISTS idx_samples_purl_analyzed ` +
+			`ON samples (purl_base, version, analyzed_at DESC NULLS LAST) ` +
+			`WHERE purl_base != '' AND parent = '' AND litmus_result IS NOT NULL AND cleave_result IS NOT NULL`,
 		// Collector provenance sidecar (forager) + artifact fetch time. JSONB so
 		// the registry/feed records inside are directly queryable.
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS provenance JSONB`,
@@ -1063,19 +1075,19 @@ func (db *DB) migrateServingPG(ctx context.Context, allowRewrite bool) (func(con
 
 	return func(ctx context.Context) error {
 		for _, ddl := range deferred {
-		if err := db.execPGMigrationDDL(ctx, ddl, allowRewrite); err != nil {
-			// Serving already started; a lock timeout here (e.g. ACCESS
-			// EXCLUSIVE behind a logical-replication COPY) must not take
-			// hopper down. The caller retries until this returns nil.
-			return fmt.Errorf("hopper: migrate index: %w", err)
+			if err := db.execPGMigrationDDL(ctx, ddl, allowRewrite); err != nil {
+				// Serving already started; a lock timeout here (e.g. ACCESS
+				// EXCLUSIVE behind a logical-replication COPY) must not take
+				// hopper down. The caller retries until this returns nil.
+				return fmt.Errorf("hopper: migrate index: %w", err)
+			}
 		}
-	}
-	if trgmReady {
-		if err := db.execPGMigrationDDL(ctx, trgmIndexDDL, allowRewrite); err != nil {
-			slog.Warn("optional migration skipped; continuing without it", "ddl", trgmIndexDDL, "error", err)
+		if trgmReady {
+			if err := db.execPGMigrationDDL(ctx, trgmIndexDDL, allowRewrite); err != nil {
+				slog.Warn("optional migration skipped; continuing without it", "ddl", trgmIndexDDL, "error", err)
+			}
 		}
-	}
-	slog.Info("index migrations applied", "count", len(deferred))
+		slog.Info("index migrations applied", "count", len(deferred))
 		// One-time, chunked, resumable; a non-fatal failure just resumes next
 		// boot, so a transient hiccup never blocks startup.
 		if err := db.reconcileLocationParentEdges(ctx); err != nil {
@@ -2575,6 +2587,44 @@ func (db *DB) sampleBySHA256PG(ctx context.Context, sha256 string) (*Sample, err
 	return s, nil
 }
 
+// sampleByPURLSQL is the sargable point lookup for GET /api/sample?purl=.
+// Every predicate is a constant — never the feed's empty-or-equal disjunction
+// over a parameter — so they match idx_samples_purl_analyzed. purl_base is
+// pinned non-empty even though base is already checked non-empty in Go: the
+// planner cannot prove that of a parameter, and without the literal it cannot
+// use a partial index predicated on it. Full pgSampleCols — not the feed projection —
+// so the envelope keeps raw (cleave_result). uncontainedSQL is one ledger
+// probe after the index seek, cheap at LIMIT 1.
+const sampleByPURLSQL = `SELECT ` + pgSampleCols + ` FROM samples
+		WHERE purl_base = $1
+		  AND purl_base <> ''
+		  AND litmus_result IS NOT NULL
+		  AND cleave_result IS NOT NULL
+		  AND file_type <> 'registry'
+		  AND ` + uncontainedSQL
+
+func (db *DB) sampleByPURLPG(ctx context.Context, base, version string) (*Sample, error) {
+	query := sampleByPURLSQL
+	args := []any{base}
+	if version != "" {
+		query += ` AND version = $2`
+		args = append(args, version)
+	}
+	query += ` ORDER BY analyzed_at DESC NULLS LAST LIMIT 1`
+	rows, err := db.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: sample purl %s@%s: %w", base, version, err)
+	}
+	samples, err := scanPGSamples(rows)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: sample purl %s@%s: %w", base, version, err)
+	}
+	if len(samples) == 0 {
+		return nil, ErrNotFound
+	}
+	return samples[0], nil
+}
+
 func (db *DB) membersByParentPG(ctx context.Context, parentSHA string, limit int) ([]ArchiveMember, int, error) {
 	var total int
 	if err := db.pool.QueryRow(ctx,
@@ -3954,9 +4004,10 @@ func (db *DB) triageSecondOpinionPG(ctx context.Context, limit int, trusted []st
 // Must stay byte-compatible with idx_samples_{good,bad}_route_score's WHERE.
 const (
 	triageGoodScoredWherePG        = `label = 'good' AND litmus_score IS NOT NULL AND cleave_result IS NOT NULL AND skip = '' AND path <> ''`
-	triageGoodScoredWherePGAliased = `s.label = 'good' AND s.litmus_score IS NOT NULL AND s.cleave_result IS NOT NULL AND s.skip = '' AND s.path <> ''`
-	triageBadScoredWherePG         = `label = 'bad' AND litmus_score IS NOT NULL AND cleave_result IS NOT NULL AND skip = '' AND path <> ''`
-	triageBadScoredWherePGAliased  = `s.label = 'bad' AND s.litmus_score IS NOT NULL AND s.cleave_result IS NOT NULL AND s.skip = '' AND s.path <> ''`
+	triageGoodScoredWherePGAliased = `s.label = 'good' AND s.litmus_score IS NOT NULL AND s.cleave_result IS NOT NULL ` +
+		`AND s.skip = '' AND s.path <> ''`
+	triageBadScoredWherePG        = `label = 'bad' AND litmus_score IS NOT NULL AND cleave_result IS NOT NULL AND skip = '' AND path <> ''`
+	triageBadScoredWherePGAliased = `s.label = 'bad' AND s.litmus_score IS NOT NULL AND s.cleave_result IS NOT NULL AND s.skip = '' AND s.path <> ''`
 )
 
 // triageHighestPG: see TriageHighest. Returns one row per archive (the root

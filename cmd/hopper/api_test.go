@@ -14,6 +14,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -2271,5 +2272,157 @@ func TestHandleArchiveMemberFallsBackToKnownParentLocation(t *testing.T) {
 	parent, err := db.SampleBySHA256(ctx, parentSHA)
 	if err != nil || parent.Path != validPath {
 		t.Fatalf("healed parent = %+v, %v", parent, err)
+	}
+}
+
+func TestHandleSample(t *testing.T) {
+	ctx := context.Background()
+	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	api := &apiServer{db: db, tracker: newWorkerTracker()}
+
+	analyzed := strings.Repeat("a", 64)
+	pending := strings.Repeat("b", 64)
+	missing := strings.Repeat("c", 64)
+
+	for _, s := range []*hopper.Sample{
+		{SHA256: analyzed, Path: "incoming/a.bin", Source: "", PURLBase: "pkg:npm/left-pad", Version: "1.3.0"},
+		{SHA256: pending, Path: "incoming/b.bin", Source: ""},
+	} {
+		if err := db.InsertSample(ctx, s); err != nil {
+			t.Fatalf("InsertSample: %v", err)
+		}
+	}
+	cleave := []byte(`{"fs":[{"sha":"` + analyzed + `","type":"js","dp":0}]}`)
+	if err := db.UpdateCleaveResult(ctx, analyzed, cleave, nil, ""); err != nil {
+		t.Fatalf("UpdateCleaveResult: %v", err)
+	}
+	if err := db.UpdateLitmusResult(ctx, analyzed, []byte(`{"v":"7","prob":0.01,"lvl":-1}`)); err != nil {
+		t.Fatalf("UpdateLitmusResult: %v", err)
+	}
+
+	get := func(sha string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodGet, "/api/sample/"+sha, http.NoBody)
+		r.SetPathValue("sha256", sha)
+		rec := httptest.NewRecorder()
+		api.handleSample(rec, r)
+		return rec
+	}
+
+	rec := get(analyzed)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("analyzed: status = %d body = %s", rec.Code, rec.Body.Bytes())
+	}
+	if rec.Header().Get("X-Sha256") != analyzed {
+		t.Errorf("X-Sha256 = %q", rec.Header().Get("X-Sha256"))
+	}
+	var env map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("envelope json: %v", err)
+	}
+	if _, ok := env["ml"]; !ok {
+		t.Fatalf("envelope missing ml: %s", rec.Body.Bytes())
+	}
+
+	if rec := get(pending); rec.Code != http.StatusNoContent {
+		t.Fatalf("pending: status = %d, want 204", rec.Code)
+	}
+	if rec := get(missing); rec.Code != http.StatusNotFound {
+		t.Fatalf("missing: status = %d, want 404", rec.Code)
+	}
+	if rec := get("nope"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid sha: status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandleSampleByPURL(t *testing.T) {
+	ctx := context.Background()
+	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	api := &apiServer{db: db, tracker: newWorkerTracker()}
+
+	sha := strings.Repeat("d", 64)
+	if err := db.InsertSample(ctx, &hopper.Sample{
+		SHA256: sha, Path: "incoming/left-pad.tgz", Source: "forager",
+		PURLBase: "pkg:npm/left-pad", Version: "1.3.0",
+	}); err != nil {
+		t.Fatalf("InsertSample: %v", err)
+	}
+	cleave := []byte(`{"fs":[{"sha":"` + sha + `","type":"js","dp":0}]}`)
+	if err := db.UpdateCleaveResult(ctx, sha, cleave, nil, ""); err != nil {
+		t.Fatalf("UpdateCleaveResult: %v", err)
+	}
+	if err := db.UpdateLitmusResult(ctx, sha, []byte(`{"v":"7","prob":0.01,"lvl":-1}`)); err != nil {
+		t.Fatalf("UpdateLitmusResult: %v", err)
+	}
+
+	get := func(purl string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodGet, "/api/sample?purl="+url.QueryEscape(purl), http.NoBody)
+		rec := httptest.NewRecorder()
+		api.handleSampleByPURL(rec, r)
+		return rec
+	}
+
+	rec := get("pkg:npm/left-pad@1.3.0")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("versioned: status = %d body = %s", rec.Code, rec.Body.Bytes())
+	}
+	if rec.Header().Get("X-Sha256") != sha {
+		t.Errorf("X-Sha256 = %q, want %s", rec.Header().Get("X-Sha256"), sha)
+	}
+	var env map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("envelope json: %v", err)
+	}
+	if _, ok := env["ml"]; !ok {
+		t.Fatalf("envelope missing ml: %s", rec.Body.Bytes())
+	}
+	if _, ok := env["raw"]; !ok {
+		t.Fatalf("envelope missing raw (cleave): %s", rec.Body.Bytes())
+	}
+
+	if rec := get("pkg:npm/left-pad"); rec.Code != http.StatusOK {
+		t.Fatalf("versionless: status = %d, want 200", rec.Code)
+	}
+
+	// A scoped npm name carries an '@' that is namespace, not version. Split on
+	// the last one and base becomes "pkg:npm/" — a coordinate no row holds — so
+	// every scoped package 404s, versioned and versionless alike.
+	scoped := strings.Repeat("e", 64)
+	if err := db.InsertSample(ctx, &hopper.Sample{
+		SHA256: scoped, Path: "incoming/jwtbytes.tgz", Source: "forager",
+		PURLBase: "pkg:npm/@zynkit/jwtbytes", Version: "0.5.2",
+	}); err != nil {
+		t.Fatalf("InsertSample: %v", err)
+	}
+	if err := db.UpdateCleaveResult(ctx, scoped,
+		[]byte(`{"fs":[{"sha":"`+scoped+`","type":"js","dp":0}]}`), nil, ""); err != nil {
+		t.Fatalf("UpdateCleaveResult: %v", err)
+	}
+	if err := db.UpdateLitmusResult(ctx, scoped, []byte(`{"v":"7","prob":0.01,"lvl":-1}`)); err != nil {
+		t.Fatalf("UpdateLitmusResult: %v", err)
+	}
+	for _, purl := range []string{"pkg:npm/@zynkit/jwtbytes@0.5.2", "pkg:npm/@zynkit/jwtbytes"} {
+		rec := get(purl)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("scoped %s: status = %d, want 200", purl, rec.Code)
+		}
+		if rec.Header().Get("X-Sha256") != scoped {
+			t.Errorf("scoped %s: X-Sha256 = %q, want %s", purl, rec.Header().Get("X-Sha256"), scoped)
+		}
+	}
+	if rec := get("pkg:npm/no-such-package@1.0.0"); rec.Code != http.StatusNotFound {
+		t.Fatalf("miss: status = %d, want 404", rec.Code)
+	}
+	if rec := get(""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("empty: status = %d, want 400", rec.Code)
 	}
 }

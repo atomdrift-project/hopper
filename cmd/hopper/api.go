@@ -40,20 +40,20 @@ import (
 // state lives in workerTracker (see below).
 type apiServer struct {
 	hopperStart         time.Time
-	traitsVersion       atomic.Pointer[string]
+	db                  *hopper.DB
 	progress            *loadProgress
 	extractSem          chan struct{}
 	resultSem           chan struct{}
 	extractCache        *extractCache
-	db                  *hopper.DB
+	traitsVersion       atomic.Pointer[string]
 	tracker             *workerTracker
 	dataRoot            string
 	allowedDirs         []string
 	forceRescanPrefixes []string
-	rescanAge           time.Duration
 	requiredMounts      []string
-	datasetIncomplete   bool
+	rescanAge           time.Duration
 	ready               atomic.Bool
+	datasetIncomplete   bool
 }
 
 // errSaturated is returned by the slot-acquire helpers when no slot frees
@@ -628,6 +628,8 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/locations/incoming", s.handleIncomingLocations)
 	mux.HandleFunc("POST /api/triage", s.handleTriage)
 	mux.HandleFunc("POST /api/rescan/{sha256}", s.handleRescan)
+	mux.HandleFunc("GET /api/sample/{sha256}", s.handleSample)
+	mux.HandleFunc("GET /api/sample", s.handleSampleByPURL)
 	mux.HandleFunc("GET /api/file/{sha256}", s.handleFile)
 	mux.HandleFunc("GET /api/provenance/{sha256}", s.handleProvenance)
 	mux.Handle("GET /data/", s.safeFileServer())
@@ -1216,8 +1218,6 @@ func queryAgeBefore(q url.Values, name string, now time.Time) (time.Time, bool) 
 
 // handleNext claims work items for a worker.
 // GET /api/next?worker=nuc&count=3&slots=4&version=0.8.2&traits=abc123.
-//
-//nolint:gocognit,maintidx // single sequence of input validation + claim flow; splitting hides control flow
 func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
 		http.Error(w, `{"error":"starting"}`, http.StatusServiceUnavailable)
@@ -1329,77 +1329,9 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate files before handing them to workers. Files that were
-	// replaced or removed since indexing are released back from the in-
-	// memory claim set and marked skip so they don't block the queue.
-	var unclaimSHAs []string
-	validated := jobs[:0]
-	for _, j := range jobs {
-		if j.Path == "" || j.Path == "." {
-			slog.Warn("skipping job with empty path", //nolint:gosec // structured logging, worker validated
-				"worker", worker, "sha256", j.SHA256)
-			if err := s.db.SetSkip(ctx, j.SHA256, "empty_path"); err != nil {
-				slog.Error("mark empty_path failed", "sha256", j.SHA256, "error", err) //nolint:gosec // structured logging
-			}
-			unclaimSHAs = append(unclaimSHAs, j.SHA256)
-			continue
-		}
-		location := &hopper.Sample{SHA256: j.SHA256, Path: j.Path}
-		f, info, err := s.openKnownSampleFile(ctx, location, worker)
-		if err != nil {
-			if s.datasetIncomplete {
-				// Local disk is not authoritative in this mode — the file being
-				// absent here says nothing about whether it exists in the corpus.
-				// Release the claim without marking it, so the record stays
-				// trainable (skip=''); it'll be handed out again if the bytes
-				// ever land locally. Attempts aren't incremented for unclaimed
-				// jobs (below), so this can't trip the poison reaper.
-				slog.Debug("claimed file absent locally; leaving unmarked (dataset-incomplete)", //nolint:gosec // structured logging
-					"worker", worker, "sha256", j.SHA256, "path", j.Path)
-				unclaimSHAs = append(unclaimSHAs, j.SHA256)
-				continue
-			}
-			skip := ""
-			switch {
-			case errors.Is(err, os.ErrNotExist):
-				skip = "missing"
-			case errors.Is(err, errSamplePathRejected):
-				skip = "invalid_path"
-			case errors.Is(err, errSampleNotRegular):
-				skip = "corrupt"
-			}
-			if skip == "" {
-				slog.Warn("claimed file temporarily unavailable; releasing claim",
-					"worker", worker, "sha256", j.SHA256, "path", j.Path, "error", err)
-				unclaimSHAs = append(unclaimSHAs, j.SHA256)
-				continue
-			}
-			//nolint:gosec // worker validated, sha256/path from DB
-			slog.Warn("claimed file unavailable on all known paths",
-				"worker", worker, "sha256", j.SHA256, "path", j.Path, "skip", skip, "error", err)
-			if err := s.db.SetSkip(ctx, j.SHA256, skip); err != nil {
-				slog.Error("mark unavailable sample failed", "sha256", j.SHA256, "skip", skip, "error", err) //nolint:gosec // structured logging
-			}
-			unclaimSHAs = append(unclaimSHAs, j.SHA256)
-			continue
-		}
-		_ = f.Close()
-		j.Path = location.Path
-		if j.SizeBytes > 0 && info.Size() != j.SizeBytes {
-			//nolint:gosec // sha256 validated, path from DB, sizes are int64
-			slog.Warn("claimed file size mismatch — file was likely replaced",
-				"worker", worker, "sha256", j.SHA256, "path", j.Path,
-				"db_size", j.SizeBytes, "disk_size", info.Size())
-			if err := s.db.SetSkip(ctx, j.SHA256, "corrupt"); err != nil {
-				slog.Error("mark corrupt failed", "sha256", j.SHA256, "error", err) //nolint:gosec // structured logging
-			}
-			unclaimSHAs = append(unclaimSHAs, j.SHA256)
-			continue
-		}
-		validated = append(validated, j)
-	}
-	jobs = validated
-	s.tracker.releaseMany(unclaimSHAs)
+	// Files replaced or removed since indexing are released back from the
+	// in-memory claim set and marked skip so they don't block the queue.
+	jobs = s.validateClaimJobs(ctx, jobs, worker)
 
 	// Count this hand-out against each sample. Poison samples that wedge a
 	// worker never report a result, so the attempt counter is the only signal
@@ -1458,6 +1390,86 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// validateClaimJobs drops jobs whose bytes are not servable before a worker is
+// handed them, releasing each dropped job's in-memory claim. A file removed or
+// replaced since indexing is marked skip so it stops re-entering the queue; one
+// that is merely unreachable right now is released unmarked, so it comes back
+// when the mount does. Filters in place: the returned slice aliases jobs.
+func (s *apiServer) validateClaimJobs(ctx context.Context, jobs []hopper.ClaimJob, worker string) []hopper.ClaimJob {
+	var unclaimSHAs []string
+	validated := jobs[:0]
+	for _, j := range jobs {
+		if j.Path == "" || j.Path == "." {
+			slog.Warn("skipping job with empty path", //nolint:gosec // structured logging, worker validated
+				"worker", worker, "sha256", j.SHA256)
+			if err := s.db.SetSkip(ctx, j.SHA256, "empty_path"); err != nil {
+				slog.Error("mark empty_path failed", "sha256", j.SHA256, "error", err) //nolint:gosec // structured logging
+			}
+			unclaimSHAs = append(unclaimSHAs, j.SHA256)
+			continue
+		}
+		location := &hopper.Sample{SHA256: j.SHA256, Path: j.Path}
+		f, info, err := s.openKnownSampleFile(ctx, location, worker)
+		if err != nil {
+			if s.datasetIncomplete {
+				// Local disk is not authoritative in this mode — the file being
+				// absent here says nothing about whether it exists in the corpus.
+				// Release the claim without marking it, so the record stays
+				// trainable (skip=''); it'll be handed out again if the bytes
+				// ever land locally. Attempts aren't incremented for unclaimed
+				// jobs (below), so this can't trip the poison reaper.
+				slog.Debug("claimed file absent locally; leaving unmarked (dataset-incomplete)", //nolint:gosec // structured logging
+					"worker", worker, "sha256", j.SHA256, "path", j.Path)
+				unclaimSHAs = append(unclaimSHAs, j.SHA256)
+				continue
+			}
+			skip := ""
+			switch {
+			case errors.Is(err, os.ErrNotExist):
+				skip = "missing"
+			case errors.Is(err, errSamplePathRejected):
+				skip = "invalid_path"
+			case errors.Is(err, errSampleNotRegular):
+				skip = "corrupt"
+			default:
+				// Transient (EIO, a mount still coming up): leave skip empty so
+				// the claim is released rather than the sample condemned.
+			}
+			if skip == "" {
+				//nolint:gosec // G706: worker is validated; sha256/path come from the DB
+				slog.Warn("claimed file temporarily unavailable; releasing claim",
+					"worker", worker, "sha256", j.SHA256, "path", j.Path, "error", err)
+				unclaimSHAs = append(unclaimSHAs, j.SHA256)
+				continue
+			}
+			//nolint:gosec // worker validated, sha256/path from DB
+			slog.Warn("claimed file unavailable on all known paths",
+				"worker", worker, "sha256", j.SHA256, "path", j.Path, "skip", skip, "error", err)
+			if err := s.db.SetSkip(ctx, j.SHA256, skip); err != nil {
+				slog.Error("mark unavailable sample failed", "sha256", j.SHA256, "skip", skip, "error", err) //nolint:gosec // structured logging
+			}
+			unclaimSHAs = append(unclaimSHAs, j.SHA256)
+			continue
+		}
+		f.Close() //nolint:errcheck,gosec // probe handle; only the stat mattered
+		j.Path = location.Path
+		if j.SizeBytes > 0 && info.Size() != j.SizeBytes {
+			//nolint:gosec // sha256 validated, path from DB, sizes are int64
+			slog.Warn("claimed file size mismatch — file was likely replaced",
+				"worker", worker, "sha256", j.SHA256, "path", j.Path,
+				"db_size", j.SizeBytes, "disk_size", info.Size())
+			if err := s.db.SetSkip(ctx, j.SHA256, "corrupt"); err != nil {
+				slog.Error("mark corrupt failed", "sha256", j.SHA256, "error", err) //nolint:gosec // structured logging
+			}
+			unclaimSHAs = append(unclaimSHAs, j.SHA256)
+			continue
+		}
+		validated = append(validated, j)
+	}
+	s.tracker.releaseMany(unclaimSHAs)
+	return validated
+}
+
 // resultRequest is the JSON body for POST /api/result.
 type resultRequest struct {
 	SHA256     string          `json:"sha256"`
@@ -1506,6 +1518,62 @@ func resultBody(r *http.Request) (resultReader, error) {
 	default:
 		return resultReader{}, errors.New("unsupported content-encoding")
 	}
+}
+
+// recordWorkerError applies a worker's self-reported analysis failure and
+// answers it. A permanent cause (unsupported type, missing bytes) marks skip so
+// the sample never re-enters the queue; anything else is recorded as a note and
+// left queueable. Either way the in-memory claim is dropped so the worker's slot
+// frees up. ctx is the store context, already detached from the request.
+func (s *apiServer) recordWorkerError(ctx context.Context, w http.ResponseWriter, req *resultRequest) {
+	clientErr := trimClientError(req.Error)
+
+	// Look up the sample path for more useful error logs.
+	samplePath := ""
+	if sample, err := retryDBAccess(ctx, "sample lookup for worker error", req.SHA256, func(ctx context.Context) (*hopper.Sample, error) {
+		return s.db.SampleBySHA256(ctx, req.SHA256)
+	}); err == nil {
+		samplePath = sample.Path
+	}
+
+	skip, permanent := classifyResultError(req.Error)
+	if permanent && s.datasetIncomplete && skip == "missing" {
+		// Dataset-incomplete mode: a worker that can't find the bytes locally
+		// says nothing about whether the sample exists in the corpus. Demote
+		// this to a transient error (recorded as a note, re-queued) instead of
+		// marking skip='missing', so the record stays trainable and the
+		// missing-marking never replicates to the primary.
+		permanent = false
+	}
+	if permanent {
+		// Permanent failure (unsupported file type, missing file, etc.) —
+		// mark so it's never queued again, but preserve the record.
+		if err := retryDBAccessNoValue(ctx, "mark permanent failure", req.SHA256, func(ctx context.Context) error {
+			return s.db.SetSkip(ctx, req.SHA256, skip)
+		}); err != nil {
+			slog.Error("mark permanent failure failed", "sha256", req.SHA256, "error", err)
+		} else {
+			//nolint:gosec // sha256 validated, path from DB.
+			slog.Info("marked sample", "sha256", req.SHA256,
+				"path", samplePath, "skip", skip, "reason", clientErr)
+		}
+	} else {
+		if err := retryDBAccessNoValue(ctx, "record analysis error", req.SHA256, func(ctx context.Context) error {
+			return s.db.SetNote(ctx, req.SHA256, clientErr)
+		}); err != nil {
+			slog.Error("record analysis error failed", "sha256", req.SHA256, "error", err)
+		}
+		//nolint:gosec // worker sanitized by validWorkerName, sha256 by validSHA256, path from DB
+		slog.Warn("worker reported analysis error",
+			"worker", req.Worker, "sha256", req.SHA256, "path", samplePath, "error", clientErr)
+	}
+	s.progress.recordErrorf(1, "worker", "worker: %s: %s", req.SHA256, clientErr)
+	// Drop the in-memory claim so another worker can try it. Order matters:
+	// release decrements ActiveClaims, then recordResult bumps Errors.
+	s.tracker.release(req.SHA256)
+	s.tracker.recordResult(req.Worker, true)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true}) //nolint:errcheck,errchkjson // best-effort response
 }
 
 // handleResult receives an analysis result from a worker.
@@ -1586,54 +1654,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	defer cancelStore()
 
 	if req.Error != "" {
-		clientErr := trimClientError(req.Error)
-
-		// Look up the sample path for more useful error logs.
-		samplePath := ""
-		if sample, err := retryDBAccess(ctx, "sample lookup for worker error", req.SHA256, func(ctx context.Context) (*hopper.Sample, error) {
-			return s.db.SampleBySHA256(ctx, req.SHA256)
-		}); err == nil {
-			samplePath = sample.Path
-		}
-
-		skip, permanent := classifyResultError(req.Error)
-		if permanent && s.datasetIncomplete && skip == "missing" {
-			// Dataset-incomplete mode: a worker that can't find the bytes locally
-			// says nothing about whether the sample exists in the corpus. Demote
-			// this to a transient error (recorded as a note, re-queued) instead of
-			// marking skip='missing', so the record stays trainable and the
-			// missing-marking never replicates to the primary.
-			permanent = false
-		}
-		if permanent {
-			// Permanent failure (unsupported file type, missing file, etc.) —
-			// mark so it's never queued again, but preserve the record.
-			if err := retryDBAccessNoValue(ctx, "mark permanent failure", req.SHA256, func(ctx context.Context) error {
-				return s.db.SetSkip(ctx, req.SHA256, skip)
-			}); err != nil {
-				slog.Error("mark permanent failure failed", "sha256", req.SHA256, "error", err)
-			} else {
-				//nolint:gosec // sha256 validated, path from DB.
-				slog.Info("marked sample", "sha256", req.SHA256,
-					"path", samplePath, "skip", skip, "reason", clientErr)
-			}
-		} else {
-			if err := retryDBAccessNoValue(ctx, "record analysis error", req.SHA256, func(ctx context.Context) error {
-				return s.db.SetNote(ctx, req.SHA256, clientErr)
-			}); err != nil {
-				slog.Error("record analysis error failed", "sha256", req.SHA256, "error", err)
-			}
-			//nolint:gosec // worker sanitized by validWorkerName, sha256 by validSHA256, path from DB
-			slog.Warn("worker reported analysis error",
-				"worker", req.Worker, "sha256", req.SHA256, "path", samplePath, "error", clientErr)
-		}
-		s.progress.recordErrorf(1, "worker", "worker: %s: %s", req.SHA256, clientErr)
-		// Drop the in-memory claim so another worker can try it. Order matters:
-		// release decrements ActiveClaims, then recordResult bumps Errors.
-		s.tracker.release(req.SHA256)
-		s.tracker.recordResult(req.Worker, true)
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true}) //nolint:errcheck,errchkjson // best-effort response
+		s.recordWorkerError(ctx, w, &req)
 		return
 	}
 
@@ -1643,6 +1664,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		claimedPath := s.tracker.release(req.SHA256)
 		s.tracker.recordResult(req.Worker, true)
 		s.progress.recordErrorf(1, "identity", "result root sha mismatch: claimed %s reported %s", req.SHA256, parsed.RootSHA)
+		//nolint:gosec // G706: worker is validated; both shas are hex-checked
 		slog.Warn("result rejected: cleave root sha mismatch",
 			"worker", req.Worker, "claimed_sha256", req.SHA256,
 			"reported_sha256", parsed.RootSHA, "path", claimedPath)
@@ -1682,6 +1704,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 			// walk reconciles a moved/deleted file. The worker completed valid work,
 			// but there is no longer a record to update; acknowledge it so the client
 			// does not retry the same permanent no-op.
+			//nolint:gosec // G706: worker is validated; sha256 is hex-checked, path from the DB
 			slog.Info("discarded stale result for absent sample",
 				"worker", req.Worker, "sha256", req.SHA256, "path", claimedPath)
 			w.Header().Set("Content-Type", "application/json")
@@ -2967,8 +2990,8 @@ func claimSamplePath(src, abs, sha string, digestKeyed bool) (string, error) {
 	return qualified, nil
 }
 
-func syncUploadDir(path string) error {
-	dir, err := os.Open(path) //nolint:gosec // caller confines upload paths to dataRoot
+func syncUploadDir(name string) error {
+	dir, err := os.Open(name) //nolint:gosec // caller confines upload paths to dataRoot
 	if err != nil {
 		return err
 	}
@@ -3156,6 +3179,99 @@ func trimClientError(msg string) string {
 	return msg
 }
 
+// handleSample returns the stored analysis envelope for a sha256.
+// GET /api/sample/{sha256}
+//
+// 200 is hopper.Envelope (ml / llm / raw as stored). 204 means the row exists
+// but has not been analyzed yet. 404 is unknown. Parent archive envelopes are
+// not reassembled — beamline wants the stored columns, fast.
+func (s *apiServer) handleSample(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
+		return
+	}
+	sha := r.PathValue("sha256")
+	if !validSHA256(sha) {
+		http.Error(w, `{"error":"invalid sha256"}`, http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
+	defer cancel()
+
+	sample, err := s.db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		if errors.Is(err, hopper.ErrNotFound) {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		} else {
+			slog.ErrorContext(r.Context(), "sample: lookup failed",
+				"sha256", sha, "error", err, "remote", r.RemoteAddr)
+			http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		}
+		return
+	}
+	writeSampleEnvelope(w, sample)
+}
+
+// handleSampleByPURL returns the newest analyzed top-level sample for a PURL.
+// GET /api/sample?purl=pkg:...
+//
+// This is a point lookup (SampleByPURL), not the prism feed. The feed query
+// walks analyzed_at and omits cleave_result; beamline needs both a seek on
+// purl_base and a full envelope (ml / llm / raw).
+func (s *apiServer) handleSampleByPURL(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
+		return
+	}
+	raw := strings.TrimSpace(r.URL.Query().Get("purl"))
+	if raw == "" {
+		http.Error(w, `{"error":"missing purl"}`, http.StatusBadRequest)
+		return
+	}
+	canon := pkgparse.CanonicalizePURL(raw)
+	if len(canon) < 4 || !strings.EqualFold(canon[:4], "pkg:") {
+		http.Error(w, `{"error":"not a package URL"}`, http.StatusBadRequest)
+		return
+	}
+	base := pkgparse.VersionlessPURL(canon)
+	version := pkgparse.PURLVersion(canon)
+
+	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
+	defer cancel()
+
+	sample, err := s.db.SampleByPURL(ctx, base, version)
+	if err != nil {
+		if errors.Is(err, hopper.ErrNotFound) {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
+		}
+		slog.ErrorContext(r.Context(), "sample: purl lookup failed",
+			"purl", canon, "error", err, "remote", r.RemoteAddr)
+		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		return
+	}
+	writeSampleEnvelope(w, sample)
+}
+
+func writeSampleEnvelope(w http.ResponseWriter, sample *hopper.Sample) {
+	if len(sample.LitmusResult) == 0 && len(sample.CleaveResult) == 0 && len(sample.LLMResult) == 0 {
+		w.Header().Set("X-Sha256", sample.SHA256)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	env := hopper.Envelope(sample)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Sha256", sample.SHA256)
+	// gosec taints env and sample.SHA256 through the DB from the request's
+	// purl: env is machine-generated JSON served as application/json with
+	// nosniff (never interpreted as markup), and SHA256 is a stored hash.
+	if _, err := w.Write(env); err != nil { //nolint:gosec // G705: JSON body, not markup; see above
+		slog.Warn("write sample envelope failed", "sha256", sample.SHA256, "error", err) //nolint:gosec // G706: sha256 is a stored hash
+	}
+}
+
 // handleProvenance serves the provenance sidecar a sample was ingested with, so
 // a worker can apply its registry record (and a forensic reader can inspect the
 // raw upstream documents) without re-fetching. GET /api/provenance/{sha256}.
@@ -3335,11 +3451,11 @@ func (s *apiServer) openKnownSampleFile(ctx context.Context, sample *hopper.Samp
 		}
 		stat, err := f.Stat()
 		if err != nil {
-			_ = f.Close()
+			f.Close() //nolint:errcheck,gosec // abandoning the handle; the stat error is what matters
 			return nil, nil, err
 		}
 		if !stat.Mode().IsRegular() {
-			_ = f.Close()
+			f.Close() //nolint:errcheck,gosec // abandoning a handle we will not serve from
 			return nil, nil, fmt.Errorf("%w: %s", errSampleNotRegular, resolved)
 		}
 		return f, stat, nil
@@ -3412,6 +3528,8 @@ func (s *apiServer) openKnownSampleFile(ctx context.Context, sample *hopper.Samp
 			notRegular = true
 		case firstTransient == nil:
 			firstTransient = err
+		default:
+			// A later transient error; the first one is the one reported.
 		}
 	}
 	if firstTransient != nil {

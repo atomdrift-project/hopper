@@ -1,6 +1,7 @@
 package hopper
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -72,7 +73,7 @@ func TestMoveLocationMovesBundleAndCatalog(t *testing.T) {
 	if !result.Relocated || !result.SourceRemoved || result.BytesFreed != int64(len(content)) {
 		t.Fatalf("result = %+v", result)
 	}
-	if got, err := os.ReadFile(newAbs); err != nil || string(got) != string(content) {
+	if got, err := os.ReadFile(newAbs); err != nil || !bytes.Equal(got, content) {
 		t.Fatalf("destination = %q, %v", got, err)
 	}
 	if got, err := os.ReadFile(newAbs + ProvenanceSidecarSuffix); err != nil || string(got) != `{"source":"test"}` {
@@ -245,7 +246,7 @@ func TestMoveLocationDoesNotClobberConflict(t *testing.T) {
 	if got, err := os.ReadFile(newAbs); err != nil || string(got) != "incumbent" {
 		t.Fatalf("destination was clobbered: %q, %v", got, err)
 	}
-	if got, err := os.ReadFile(oldAbs); err != nil || string(got) != string(content) {
+	if got, err := os.ReadFile(oldAbs); err != nil || !bytes.Equal(got, content) {
 		t.Fatalf("source changed: %q, %v", got, err)
 	}
 }
@@ -260,7 +261,7 @@ func TestLockMoveSourceHonorsContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer held.Close() //nolint:errcheck
+	defer held.Close() //nolint:errcheck // releasing the test lock; nothing depends on the close
 	if err := syscall.Flock(int(held.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +269,7 @@ func TestLockMoveSourceHonorsContext(t *testing.T) {
 	defer cancel()
 	locked, err := lockMoveSource(ctx, name)
 	if locked != nil {
-		locked.Close() //nolint:errcheck
+		locked.Close() //nolint:errcheck // test is already failing
 		t.Fatal("lockMoveSource acquired a held lock")
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {

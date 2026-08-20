@@ -26,6 +26,11 @@ MAX_MEMORY_GB ?= 72
 FREEBSD_WORKERS       ?= 96
 FREEBSD_MAX_MEMORY_GB ?= 0
 SCAN_DIR      ?= ../scan
+# Cloudflare Tunnel (FreeBSD only). "auto" installs and starts cloudflared when
+# CF_TUNNEL_TOKEN is passed or a token from an earlier deploy is on disk; 0
+# skips it. CF_TUNNEL_TOKEN is read from the environment, never from here, so
+# the token stays out of the repository and out of ps(1) on the deploy host.
+CLOUDFLARED   ?= auto
 LLM           ?= http://10.9.8.149:8000/v1
 
 help:
@@ -38,7 +43,8 @@ help:
 	@echo "  make deploy                 Install Hopper and its separate scan worker"
 	@echo "                              (DATA_DIR=$(DATA_DIR) DB=... SOURCE=$(SOURCE) DASH_ADDR=$(DASH_ADDR)"
 	@echo "                               Linux: WORKERS=$(WORKERS) MAX_MEMORY_GB=$(MAX_MEMORY_GB)"
-	@echo "                               FreeBSD: WORKERS=$(FREEBSD_WORKERS) MAX_MEMORY_GB=$(FREEBSD_MAX_MEMORY_GB) SCAN_DIR=$(SCAN_DIR))"
+	@echo "                               FreeBSD: WORKERS=$(FREEBSD_WORKERS) MAX_MEMORY_GB=$(FREEBSD_MAX_MEMORY_GB) SCAN_DIR=$(SCAN_DIR)"
+	@echo "                                        CLOUDFLARED=$(CLOUDFLARED); first tunnel deploy needs CF_TUNNEL_TOKEN=...)"
 	@echo "  make rollout-replica-bastille Deploy a Bastille jail as a logical replica"
 	@echo "                              (RUN=<jail> REMOTE_HOST=hopper-db SUBSCRIPTION=...;"
 	@echo "                               REBUILD=true for a destructive re-copy of a wedged jail,"
@@ -79,6 +85,7 @@ deploy-freebsd:
 	DATA_DIR='$(DATA_DIR)' DB='$(DB)' SOURCE='$(SOURCE)' \
 	DASH_ADDR='$(DASH_ADDR)' WORKERS='$(FREEBSD_WORKERS)' \
 	MAX_MEMORY_GB='$(FREEBSD_MAX_MEMORY_GB)' SCAN_DIR='$(SCAN_DIR)' LLM='$(LLM)' \
+	CLOUDFLARED='$(CLOUDFLARED)' \
 		./scripts/master/freebsd.sh
 
 rollout-replica-bastille:

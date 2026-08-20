@@ -111,7 +111,7 @@ func (c *hashCache) load(ctx context.Context) error {
 		if err := rows.Scan(&dev, &inode, &k.size, &k.mtime, &shaHex); err != nil {
 			return fmt.Errorf("hashcache: scan: %w", err)
 		}
-		k.dev, k.inode = uint64(dev), uint64(inode)
+		k.dev, k.inode = fsID(dev), fsID(inode)
 		var sha [32]byte
 		if _, err := hex.Decode(sha[:], []byte(shaHex)); err != nil {
 			return fmt.Errorf("hashcache: decode sha: %w", err)
@@ -270,7 +270,12 @@ func (c *hashCache) requeue(batch []dirtyEntry) {
 // sqliteID maps an opaque unsigned filesystem identifier into SQLite's signed
 // INTEGER domain without losing bits. Casting back to uint64 on load restores
 // the exact device/inode value, including IDs whose high bit is set on ZFS.
-func sqliteID(v uint64) int64 { return int64(v) }
+func sqliteID(v uint64) int64 { return int64(v) } //nolint:gosec // G115: reinterpreted, not narrowed; fsID is the exact inverse
+
+// fsID is the inverse of [sqliteID]: it reinterprets a stored SQLite INTEGER as
+// the filesystem identifier it was written from. No value is lost either way —
+// the two casts round-trip every uint64, including the high-bit IDs ZFS emits.
+func fsID(v int64) uint64 { return uint64(v) } //nolint:gosec // G115: reinterpreted, not narrowed; see above
 
 // close flushes remaining entries and closes the database.
 func (c *hashCache) close(ctx context.Context) {

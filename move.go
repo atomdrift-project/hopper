@@ -3,6 +3,7 @@ package hopper
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -28,11 +29,11 @@ type LocationRelabel struct {
 // deterministic destination. Paths are slash-separated and relative to
 // DataRoot.
 type MoveLocationOptions struct {
+	Relabel  *LocationRelabel
 	DataRoot string
 	SHA256   string
 	OldPath  string
 	NewPath  string
-	Relabel  *LocationRelabel
 }
 
 // MoveLocationResult reports durable progress for one physical move.
@@ -138,7 +139,13 @@ func (db *DB) MoveLocation(ctx context.Context, opts MoveLocationOptions) (MoveL
 	}
 	sidecarCreated, sidecarPresent, err := publishMoveSidecar(ctx, oldAbs, newAbs)
 	if err != nil {
-		_ = rollbackMoveDestination(newAbs, artifactCreated, sidecarCreated)
+		if rbErr := rollbackMoveDestination(newAbs, artifactCreated, sidecarCreated); rbErr != nil {
+			// The destination keeps whatever was published before the sidecar
+			// failed; the catalog still points at the source, so the move is
+			// safe to retry, but the leftover needs an operator's eye.
+			slog.ErrorContext(ctx, "move rollback failed; destination may hold a partial copy",
+				"dst", newAbs, "error", rbErr)
+		}
 		return result, fmt.Errorf("hopper: publish sidecar: %w", err)
 	}
 
@@ -229,17 +236,18 @@ func lockMoveSource(ctx context.Context, name string) (*os.File, error) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		//nolint:gosec // G115: a descriptor from os.File.Fd always fits in int
 		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 		if err == nil {
 			return f, nil
 		}
 		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
-			_ = f.Close()
+			f.Close() //nolint:errcheck,gosec // abandoning an unlocked file; the flock error is what matters
 			return nil, err
 		}
 		select {
 		case <-ctx.Done():
-			_ = f.Close()
+			f.Close() //nolint:errcheck,gosec // abandoning an unlocked file; the ctx error is what matters
 			return nil, ctx.Err()
 		case <-ticker.C:
 		}
@@ -284,13 +292,22 @@ func publishMoveFile(ctx context.Context, src, dst, expected string) (bool, erro
 	}
 
 	dir := filepath.Dir(dst)
-	if err := os.MkdirAll(dir, 0o775); err != nil {
+	// Group-writable on purpose: /data/samples is shared by forager, hopper,
+	// and promoter through the samples group (see cmd/hopper's sharedDirMode).
+	if err := os.MkdirAll(dir, 0o775); err != nil { //nolint:gosec // G301: shared samples tree, see above
 		return false, err
 	}
 	if err := os.Link(src, dst); err == nil {
 		if err := verifyMoveFile(dst, expected); err != nil {
-			_ = os.Remove(dst)
-			_ = syncMoveDir(dir)
+			if rmErr := os.Remove(dst); rmErr != nil {
+				// The link is corrupt and now unremovable: leaving it would let
+				// a later move take the ErrExist path and adopt bad bytes.
+				slog.ErrorContext(ctx, "cannot remove unverifiable destination link",
+					"dst", dst, "error", rmErr)
+			} else if syncErr := syncMoveDir(dir); syncErr != nil {
+				slog.WarnContext(ctx, "destination dir sync failed after removing bad link",
+					"dir", dir, "error", syncErr)
+			}
 			return false, err
 		}
 		if err := syncMoveDir(dir); err != nil {
@@ -309,19 +326,26 @@ func publishMoveFile(ctx context.Context, src, dst, expected string) (bool, erro
 	}
 	tmpName := tmp.Name()
 	defer func() {
-		if tmpName != "" {
-			_ = os.Remove(tmpName)
-			_ = syncMoveDir(dir)
+		if tmpName == "" {
+			return
+		}
+		if err := os.Remove(tmpName); err != nil {
+			slog.WarnContext(ctx, "partial copy left behind", "tmp", tmpName, "error", err)
+			return
+		}
+		if err := syncMoveDir(dir); err != nil {
+			slog.WarnContext(ctx, "destination dir sync failed after discarding partial copy",
+				"dir", dir, "error", err)
 		}
 	}()
 	if err := tmp.Chmod(info.Mode().Perm()); err != nil {
-		_ = tmp.Close()
+		tmp.Close() //nolint:errcheck,gosec // abandoning the partial copy, which the defer removes
 		return false, err
 	}
 
 	in, err := os.Open(src)
 	if err != nil {
-		_ = tmp.Close()
+		tmp.Close() //nolint:errcheck,gosec // abandoning the partial copy, which the defer removes
 		return false, err
 	}
 	h := sha256.New()
@@ -330,7 +354,7 @@ func publishMoveFile(ctx context.Context, src, dst, expected string) (bool, erro
 	if copyErr == nil {
 		copyErr = closeInErr
 	}
-	if copyErr == nil && fmt.Sprintf("%x", h.Sum(nil)) != expected {
+	if copyErr == nil && hex.EncodeToString(h.Sum(nil)) != expected {
 		copyErr = fmt.Errorf("sha256 changed while copying %s", src)
 	}
 	if copyErr == nil {
@@ -352,7 +376,7 @@ func publishMoveFile(ctx context.Context, src, dst, expected string) (bool, erro
 		}
 		return false, err
 	}
-	if err := os.Remove(tmpName); err != nil {
+	if err := os.Remove(tmpName); err != nil { //nolint:gosec // G703: name from os.CreateTemp under a resolveMoveTarget-validated dir
 		return true, err
 	}
 	tmpName = ""
@@ -404,7 +428,7 @@ func hashMoveFile(name string) (string, error) {
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func verifyMoveFile(name, expected string) error {

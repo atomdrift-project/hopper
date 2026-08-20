@@ -33,6 +33,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/codeGROOVE-dev/fido"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/mattn/go-sqlite3" // register sqlite3 driver
@@ -480,6 +481,7 @@ var ErrNotFound = errors.New("hopper: not found")
 type DB struct {
 	pool             *pgxpool.Pool
 	lite             *sql.DB
+	lookup           *fido.Cache[string, *Sample]
 	backfillProgress atomic.Pointer[BackfillProgressFn]
 }
 
@@ -661,8 +663,13 @@ type SampleLocation struct {
 // RetiredSampleLocation is an append-only record of a location removed from
 // the active ledger. Managed moves and missing-file pruning retain the old
 // path here so physical provenance is not lost when sample_locations changes.
-type RetiredSampleLocation struct {
+//
+// The embedded location must come first (an embedded field cannot be ordered
+// among the plain ones), which costs 8 pointer bytes over what fieldalignment
+// would pick: SampleLocation's own trailing scalar lands mid-struct here.
+type RetiredSampleLocation struct { //nolint:govet // fieldalignment: see above
 	SampleLocation
+
 	RetiredAt     time.Time
 	Reason        string
 	SuccessorPath string
@@ -955,10 +962,6 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 	var fi cleaveFileInfo
 	for i := range report.Files {
 		f := &report.Files[i]
-		depth := f.Depth
-		if depth == 0 {
-			depth = f.OldDepth
-		}
 		if f.SHA256 != "" && !strings.EqualFold(f.SHA256, sha256) {
 			continue
 		}
@@ -1416,9 +1419,17 @@ func (db *DB) RefreshStaleMemberAnalysis(ctx context.Context, members []*Sample)
 		return 0, nil
 	}
 	if db.pool != nil {
-		return db.refreshStaleMemberAnalysisPG(ctx, rows)
+		n, err := db.refreshStaleMemberAnalysisPG(ctx, rows)
+		if err == nil {
+			db.forgetSamples(members)
+		}
+		return n, err
 	}
-	return db.refreshStaleMemberAnalysisSQLite(ctx, rows)
+	n, err := db.refreshStaleMemberAnalysisSQLite(ctx, rows)
+	if err == nil {
+		db.forgetSamples(members)
+	}
+	return n, err
 }
 
 // staleRefresh is one row's freshness-gated analysis refresh: the content to
@@ -1584,9 +1595,9 @@ func cleaveFileIndexForSHA(result []byte, sha256 string) (int, bool) {
 // Pass "" to clear.
 func (db *DB) SetSkip(ctx context.Context, sha256, skip string) error {
 	if db.pool != nil {
-		return db.setSkipPG(ctx, sha256, skip)
+		return db.writeSHA(sha256, db.setSkipPG(ctx, sha256, skip))
 	}
-	return db.setSkipSQLite(ctx, sha256, skip)
+	return db.writeSHA(sha256, db.setSkipSQLite(ctx, sha256, skip))
 }
 
 // MaxClaimAttempts is the number of times a pending sample may be handed to a
@@ -1604,10 +1615,16 @@ const maxClaimAttempts = MaxClaimAttempts
 // does not touch updated_at — a claim is not progress. Called from /api/next
 // with the batch a worker just claimed.
 func (db *DB) IncrementAttempts(ctx context.Context, shas []string) error {
+	var err error
 	if db.pool != nil {
-		return db.incrementAttemptsPG(ctx, shas)
+		err = db.incrementAttemptsPG(ctx, shas)
+	} else {
+		err = db.incrementAttemptsSQLite(ctx, shas)
 	}
-	return db.incrementAttemptsSQLite(ctx, shas)
+	if err == nil {
+		db.forgetSHAs(shas)
+	}
+	return err
 }
 
 // ShasWithProvenance returns the subset of shas whose sample row carries a
@@ -1631,10 +1648,17 @@ func (db *DB) ShasWithProvenance(ctx context.Context, shas []string) (map[string
 // without a result as skip='stuck', removing them from the pending pool.
 // Returns the number reaped.
 func (db *DB) ReapStuck(ctx context.Context) (int64, error) {
+	var n int64
+	var err error
 	if db.pool != nil {
-		return db.reapStuckPG(ctx, maxClaimAttempts)
+		n, err = db.reapStuckPG(ctx, maxClaimAttempts)
+	} else {
+		n, err = db.reapStuckSQLite(ctx, maxClaimAttempts)
 	}
-	return db.reapStuckSQLite(ctx, maxClaimAttempts)
+	if err == nil && n > 0 {
+		db.flushLookups()
+	}
+	return n, err
 }
 
 // MaxJobBytes is the largest sample any scan worker will analyze (workers
@@ -1647,10 +1671,17 @@ const MaxJobBytes = 16 * 1024 * 1024 * 1024
 // so such samples would otherwise sit in the pending pool forever without ever
 // being handed out. Returns the number reaped.
 func (db *DB) ReapOversized(ctx context.Context) (int64, error) {
+	var n int64
+	var err error
 	if db.pool != nil {
-		return db.reapOversizedPG(ctx, MaxJobBytes)
+		n, err = db.reapOversizedPG(ctx, MaxJobBytes)
+	} else {
+		n, err = db.reapOversizedSQLite(ctx, MaxJobBytes)
 	}
-	return db.reapOversizedSQLite(ctx, MaxJobBytes)
+	if err == nil && n > 0 {
+		db.flushLookups()
+	}
+	return n, err
 }
 
 // SampleLocationKey identifies one (sha256, path) standalone file.
@@ -1686,10 +1717,13 @@ func (db *DB) StageLocations(ctx context.Context, keys []SampleLocationKey) erro
 // DeleteSample removes a single sample by SHA256. Returns nil even if no
 // row matched (idempotent, like a DELETE with a WHERE clause).
 func (db *DB) DeleteSample(ctx context.Context, sha256 string) error {
+	var err error
 	if db.pool != nil {
-		return db.deleteSamplePG(ctx, sha256)
+		err = db.deleteSamplePG(ctx, sha256)
+	} else {
+		err = db.deleteSampleSQLite(ctx, sha256)
 	}
-	return db.deleteSampleSQLite(ctx, sha256)
+	return db.writeSHA(sha256, err)
 }
 
 // PurgeUnsupported deletes all samples that were analyzed but for which
@@ -1700,10 +1734,17 @@ func (db *DB) DeleteSample(ctx context.Context, sha256 string) error {
 //
 // Uses the idx_samples_file_type index, so it's cheap even on large tables.
 func (db *DB) PurgeUnsupported(ctx context.Context, dryRun bool) (int64, error) {
+	var n int64
+	var err error
 	if db.pool != nil {
-		return db.purgeUnsupportedPG(ctx, dryRun)
+		n, err = db.purgeUnsupportedPG(ctx, dryRun)
+	} else {
+		n, err = db.purgeUnsupportedSQLite(ctx, dryRun)
 	}
-	return db.purgeUnsupportedSQLite(ctx, dryRun)
+	if err == nil && !dryRun && n > 0 {
+		db.flushLookups()
+	}
+	return n, err
 }
 
 // CleanupStage identifies a category of dead-end samples — records whose
@@ -1749,10 +1790,17 @@ func (db *DB) CountCleanup(ctx context.Context, stage CleanupStage) (int64, erro
 // ApplyCleanup deletes the rows matched by stage (plus their reports) in
 // a single transaction. Returns the number of sample rows removed.
 func (db *DB) ApplyCleanup(ctx context.Context, stage CleanupStage) (int64, error) {
+	var n int64
+	var err error
 	if db.pool != nil {
-		return db.applyCleanupPG(ctx, stage)
+		n, err = db.applyCleanupPG(ctx, stage)
+	} else {
+		n, err = db.applyCleanupSQLite(ctx, stage)
 	}
-	return db.applyCleanupSQLite(ctx, stage)
+	if err == nil && n > 0 {
+		db.flushLookups()
+	}
+	return n, err
 }
 
 // Open connects to the registry. DSNs starting with postgres:// or
@@ -1859,10 +1907,16 @@ func retryDeferredMigrations(ctx context.Context, build func(context.Context) er
 
 // DeleteAll removes all rows from reports and samples, preserving the schema.
 func (db *DB) DeleteAll(ctx context.Context) error {
+	var err error
 	if db.pool != nil {
-		return db.deleteAllPG(ctx)
+		err = db.deleteAllPG(ctx)
+	} else {
+		err = db.deleteAllSQLite(ctx)
 	}
-	return db.deleteAllSQLite(ctx)
+	if err == nil {
+		db.flushLookups()
+	}
+	return err
 }
 
 // InsertSample adds a sample. Duplicate SHA256 values are silently ignored.
@@ -1933,9 +1987,17 @@ func (db *DB) InsertSampleNew(ctx context.Context, s *Sample) (bool, error) {
 	}
 	normalizeLabel(s)
 	if db.pool != nil {
-		return db.insertSampleNewPG(ctx, s)
+		ok, err := db.insertSampleNewPG(ctx, s)
+		if err == nil {
+			db.forgetSample(s)
+		}
+		return ok, err
 	}
-	return db.insertSampleNewSQLite(ctx, s)
+	ok, err := db.insertSampleNewSQLite(ctx, s)
+	if err == nil {
+		db.forgetSample(s)
+	}
+	return ok, err
 }
 
 // InsertSampleBatch inserts multiple samples in a single transaction/COPY.
@@ -1965,9 +2027,17 @@ func (db *DB) InsertSampleBatch(ctx context.Context, samples []*Sample) (inserte
 		return 0, nil, nil
 	}
 	if db.pool != nil {
-		return db.insertSampleBatchPG(ctx, valid)
+		n, need, err := db.insertSampleBatchPG(ctx, valid)
+		if err == nil {
+			db.forgetSamples(valid)
+		}
+		return n, need, err
 	}
-	return db.insertSampleBatchSQLite(ctx, valid)
+	n, need, err := db.insertSampleBatchSQLite(ctx, valid)
+	if err == nil {
+		db.forgetSamples(valid)
+	}
+	return n, need, err
 }
 
 // UpsertLocation records an observation of a sample at a path. On a
@@ -2177,20 +2247,34 @@ func (db *DB) RetiredLocationsForSHA(ctx context.Context, sha256 string) ([]*Ret
 // top-level location. The old path predicate makes this a compare-and-swap, so
 // a concurrent move or walk cannot be overwritten by a serving request.
 func (db *DB) PromotePrimaryLocation(ctx context.Context, sha256, oldPath, newPath string) (bool, error) {
+	var ok bool
+	var err error
 	if db.pool != nil {
-		return db.promotePrimaryLocationPG(ctx, sha256, oldPath, newPath)
+		ok, err = db.promotePrimaryLocationPG(ctx, sha256, oldPath, newPath)
+	} else {
+		ok, err = db.promotePrimaryLocationSQLite(ctx, sha256, oldPath, newPath)
 	}
-	return db.promotePrimaryLocationSQLite(ctx, sha256, oldPath, newPath)
+	if err == nil {
+		db.forgetSHA(sha256)
+	}
+	return ok, err
 }
 
 // ReactivatePrimaryLocation restores a physically verified canonical path that
 // was previously marked or pruned as missing. If prune retired the active row,
 // its latest metadata is copied back from the append-only history ledger.
 func (db *DB) ReactivatePrimaryLocation(ctx context.Context, sha256, path string) (bool, error) {
+	var ok bool
+	var err error
 	if db.pool != nil {
-		return db.reactivatePrimaryLocationPG(ctx, sha256, path)
+		ok, err = db.reactivatePrimaryLocationPG(ctx, sha256, path)
+	} else {
+		ok, err = db.reactivatePrimaryLocationSQLite(ctx, sha256, path)
 	}
-	return db.reactivatePrimaryLocationSQLite(ctx, sha256, path)
+	if err == nil {
+		db.forgetSHA(sha256)
+	}
+	return ok, err
 }
 
 // OldestIncomingLocations returns top-level files in the hot incoming/ pool,
@@ -2210,17 +2294,31 @@ func (db *DB) OldestIncomingLocations(ctx context.Context, before time.Time, lim
 func (db *DB) prepareLocationMove(
 	ctx context.Context, sha256, oldRel, newRel string, relabel *LocationRelabel,
 ) (bool, error) {
+	var ok bool
+	var err error
 	if db.pool != nil {
-		return db.prepareLocationMovePG(ctx, sha256, oldRel, newRel, relabel)
+		ok, err = db.prepareLocationMovePG(ctx, sha256, oldRel, newRel, relabel)
+	} else {
+		ok, err = db.prepareLocationMoveSQLite(ctx, sha256, oldRel, newRel, relabel)
 	}
-	return db.prepareLocationMoveSQLite(ctx, sha256, oldRel, newRel, relabel)
+	if err == nil {
+		db.forgetSHA(sha256)
+	}
+	return ok, err
 }
 
 func (db *DB) finishLocationMove(ctx context.Context, sha256, oldRel, newRel string) (bool, error) {
+	var ok bool
+	var err error
 	if db.pool != nil {
-		return db.finishLocationMovePG(ctx, sha256, oldRel, newRel)
+		ok, err = db.finishLocationMovePG(ctx, sha256, oldRel, newRel)
+	} else {
+		ok, err = db.finishLocationMoveSQLite(ctx, sha256, oldRel, newRel)
 	}
-	return db.finishLocationMoveSQLite(ctx, sha256, oldRel, newRel)
+	if err == nil {
+		db.forgetSHA(sha256)
+	}
+	return ok, err
 }
 
 // PruneSafetyExceeded is returned by PruneMissingLocations when the
@@ -2270,9 +2368,17 @@ func (db *DB) PruneMissingLocations(ctx context.Context, dataRoot string, maxFra
 		return 0, fmt.Errorf("hopper: resolve dataRoot: %w", err)
 	}
 	if db.pool != nil {
-		return db.pruneMissingLocationsPG(ctx, absRoot, maxFraction)
+		n, err := db.pruneMissingLocationsPG(ctx, absRoot, maxFraction)
+		if err == nil && n > 0 {
+			db.flushLookups()
+		}
+		return n, err
 	}
-	return db.pruneMissingLocationsSQLite(ctx, absRoot, maxFraction)
+	n, err := db.pruneMissingLocationsSQLite(ctx, absRoot, maxFraction)
+	if err == nil && n > 0 {
+		db.flushLookups()
+	}
+	return n, err
 }
 
 // prunePathResolve resolves a stored sample_locations path to an on-disk path
@@ -2343,10 +2449,19 @@ func distinctVictimSHAs(victims []pruneVictim) []string {
 // SampleBySHA256 retrieves a sample by its hash.
 // Returns ErrNotFound if no such sample exists.
 func (db *DB) SampleBySHA256(ctx context.Context, sha256 string) (*Sample, error) {
-	if db.pool != nil {
-		return db.sampleBySHA256PG(ctx, sha256)
+	return db.lookupSampleBySHA256(ctx, sha256)
+}
+
+// SampleByPURL returns the newest analyzed top-level sample for a package
+// identity. base is the version-less canonical PURL (samples.purl_base);
+// version, when non-empty, pins samples.version. This is the point lookup
+// behind GET /api/sample?purl= — not the prism feed. Returns ErrNotFound
+// when nothing matches.
+func (db *DB) SampleByPURL(ctx context.Context, base, version string) (*Sample, error) {
+	if base == "" {
+		return nil, ErrNotFound
 	}
-	return db.sampleBySHA256SQLite(ctx, sha256)
+	return db.lookupSampleByPURL(ctx, base, version)
 }
 
 // ProvenanceBySHA256 returns just the provenance sidecar bytes for a sample,
@@ -2369,10 +2484,17 @@ func (db *DB) ProvenanceBySHA256(ctx context.Context, sha256 string) ([]byte, er
 // responsibility; this is the unconditional write. Scalar identity columns are
 // filled only where currently empty, so a refresh never blanks a populated one.
 func (db *DB) SetProvenance(ctx context.Context, s *Sample) (bool, error) {
+	var ok bool
+	var err error
 	if db.pool != nil {
-		return db.setProvenancePG(ctx, s)
+		ok, err = db.setProvenancePG(ctx, s)
+	} else {
+		ok, err = db.setProvenanceSQLite(ctx, s)
 	}
-	return db.setProvenanceSQLite(ctx, s)
+	if err == nil {
+		db.forgetSample(s)
+	}
+	return ok, err
 }
 
 // knownRetrievableSQL narrows a sha match to the rows whose bytes hopper can
@@ -2393,7 +2515,7 @@ const knownRetrievableSQL = `
 // extract — and without this filter triage queues hand those SHAs to cyclotron,
 // which HEAD-probes /api/file and logs a permanent "outside allowed directories"
 // WARN for every one. Unaliased samples rows only; aliased forms spell
-// `<alias>.path <> ''` inline. Partial indexes that back these selectors must
+// `<alias>.path <> ”` inline. Partial indexes that back these selectors must
 // carry the same predicate or the planner will not match them.
 const triageServablePathSQL = ` AND path <> ''`
 
@@ -2882,9 +3004,9 @@ func (db *DB) RequestRescan(ctx context.Context, sha256 string, cooldown time.Du
 	}
 	cutoff := time.Now().Add(-cooldown)
 	if db.pool != nil {
-		return db.requestRescanPG(ctx, sha256, cutoff)
+		return db.writeSHA(sha256, db.requestRescanPG(ctx, sha256, cutoff))
 	}
-	return db.requestRescanSQLite(ctx, sha256, cutoff)
+	return db.writeSHA(sha256, db.requestRescanSQLite(ctx, sha256, cutoff))
 }
 
 // StoreStats reports what StoreResult persisted, for logging and telemetry.
@@ -2928,10 +3050,17 @@ func (db *DB) StoreResult(ctx context.Context, sha256 string, cleaveRaw, litmusM
 		return StoreStats{}, db.SetSkip(ctx, sha256, "unsupported")
 	}
 	now := time.Now().UTC()
+	var stats StoreStats
+	var err error
 	if db.pool != nil {
-		return db.storeResultPG(ctx, sha256, cleaveRaw, litmusML, llm, p, traitsVersion, now)
+		stats, err = db.storeResultPG(ctx, sha256, cleaveRaw, litmusML, llm, p, traitsVersion, now)
+	} else {
+		stats, err = db.storeResultSQLite(ctx, sha256, cleaveRaw, litmusML, llm, p, traitsVersion, now)
 	}
-	return db.storeResultSQLite(ctx, sha256, cleaveRaw, litmusML, llm, p, traitsVersion, now)
+	if err == nil {
+		db.forgetSHA(sha256)
+	}
+	return stats, err
 }
 
 // UpdateCleaveResult stores analysis output for a sample.
@@ -2954,9 +3083,9 @@ func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []by
 	}
 	result = compactCleaveResultForStorage(result)
 	if db.pool != nil {
-		return db.updateCleaveResultPG(ctx, sha256, result, p.CanonicalSHA, p.FileInfo, traitsVersion)
+		return db.writeSHA(sha256, db.updateCleaveResultPG(ctx, sha256, result, p.CanonicalSHA, p.FileInfo, traitsVersion))
 	}
-	return db.updateCleaveResultSQLite(ctx, sha256, result, p.CanonicalSHA, p.FileInfo, traitsVersion)
+	return db.writeSHA(sha256, db.updateCleaveResultSQLite(ctx, sha256, result, p.CanonicalSHA, p.FileInfo, traitsVersion))
 }
 
 // UpdateLitmusResult stores the litmus classification envelope for a sample.
@@ -2965,9 +3094,9 @@ func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []by
 // the new envelope — no separate score parameter needed.
 func (db *DB) UpdateLitmusResult(ctx context.Context, sha256 string, result []byte) error {
 	if db.pool != nil {
-		return db.updateLitmusResultPG(ctx, sha256, result)
+		return db.writeSHA(sha256, db.updateLitmusResultPG(ctx, sha256, result))
 	}
-	return db.updateLitmusResultSQLite(ctx, sha256, result)
+	return db.writeSHA(sha256, db.updateLitmusResultSQLite(ctx, sha256, result))
 }
 
 // UpdateLLMResult stores the optional LLM interpretation (envelope `llm`) for a
@@ -2976,9 +3105,9 @@ func (db *DB) UpdateLitmusResult(ctx context.Context, sha256 string, result []by
 // a stale interpretation behind.
 func (db *DB) UpdateLLMResult(ctx context.Context, sha256 string, result []byte) error {
 	if db.pool != nil {
-		return db.updateLLMResultPG(ctx, sha256, result)
+		return db.writeSHA(sha256, db.updateLLMResultPG(ctx, sha256, result))
 	}
-	return db.updateLLMResultSQLite(ctx, sha256, result)
+	return db.writeSHA(sha256, db.updateLLMResultSQLite(ctx, sha256, result))
 }
 
 // MarkCyclotronAttempt stamps cyclotron_attempted_at = now() so the sample
@@ -2989,20 +3118,20 @@ func (db *DB) MarkCyclotronAttempt(ctx context.Context, sha256 string) error {
 	if db.pool != nil {
 		_, err := db.pool.Exec(ctx,
 			`UPDATE samples SET cyclotron_attempted_at = now() WHERE sha256 = $1`, sha256)
-		return err
+		return db.writeSHA(sha256, err)
 	}
 	_, err := db.lite.ExecContext(ctx,
 		`UPDATE samples SET cyclotron_attempted_at = ? WHERE sha256 = ?`,
 		time.Now().UTC().Format(time.RFC3339Nano), sha256)
-	return err
+	return db.writeSHA(sha256, err)
 }
 
 // Reclassify changes a sample's label.
 func (db *DB) Reclassify(ctx context.Context, sha256, label, source string) error {
 	if db.pool != nil {
-		return db.reclassifyPG(ctx, sha256, label, source)
+		return db.writeSHA(sha256, db.reclassifyPG(ctx, sha256, label, source))
 	}
-	return db.reclassifySQLite(ctx, sha256, label, source)
+	return db.writeSHA(sha256, db.reclassifySQLite(ctx, sha256, label, source))
 }
 
 // CascadeLabel relabels an archive (sha256) to label/source and propagates the
@@ -3024,10 +3153,17 @@ func (db *DB) Reclassify(ctx context.Context, sha256, label, source string) erro
 // Any other label updates only the parent. Each member transition is recorded
 // in label_events within the same transaction as the change.
 func (db *DB) CascadeLabel(ctx context.Context, sha256, label, source string) (int, error) {
+	var n int
+	var err error
 	if db.pool != nil {
-		return db.cascadeLabelPG(ctx, sha256, label, source)
+		n, err = db.cascadeLabelPG(ctx, sha256, label, source)
+	} else {
+		n, err = db.cascadeLabelSQLite(ctx, sha256, label, source)
 	}
-	return db.cascadeLabelSQLite(ctx, sha256, label, source)
+	if err == nil {
+		db.flushLookups()
+	}
+	return n, err
 }
 
 // CascadeBackfillStats reports the outcome of [DB.CascadeBackfill].
@@ -3067,10 +3203,17 @@ func (db *DB) CascadeBackfillPending(ctx context.Context) (bool, error) {
 // bad > good > unknown), each in its own transaction. dryRun counts the members
 // that would change without writing. It is idempotent and safe to re-run.
 func (db *DB) CascadeBackfill(ctx context.Context, dryRun bool) (CascadeBackfillStats, error) {
+	var stats CascadeBackfillStats
+	var err error
 	if db.pool != nil {
-		return db.cascadeBackfillPG(ctx, dryRun)
+		stats, err = db.cascadeBackfillPG(ctx, dryRun)
+	} else {
+		stats, err = db.cascadeBackfillSQLite(ctx, dryRun)
 	}
-	return db.cascadeBackfillSQLite(ctx, dryRun)
+	if err == nil && !dryRun {
+		db.flushLookups()
+	}
+	return stats, err
 }
 
 // Unanalyzed returns up to limit samples lacking a cleave result.
@@ -3182,6 +3325,7 @@ func (db *DB) ReconcilePools(ctx context.Context, diskPath func(string) string, 
 		// and archive-member cascade (steps 2–4).
 		slog.Info("reconcile: missing-marking suppressed (dataset-incomplete)",
 			"relabeled", stats.Relabeled)
+		db.flushLookups()
 		return stats, nil
 	}
 
@@ -3265,6 +3409,7 @@ func (db *DB) ReconcilePools(ctx context.Context, diskPath func(string) string, 
 	if err != nil {
 		return stats, fmt.Errorf("hopper: reconcile cascade: %w", err)
 	}
+	db.flushLookups()
 	return stats, nil
 }
 
@@ -3381,10 +3526,17 @@ func (db *DB) QueueRescan(ctx context.Context, shas []string) (int64, error) {
 	if len(shas) == 0 {
 		return 0, nil
 	}
+	var n int64
+	var err error
 	if db.pool != nil {
-		return db.queueRescanPG(ctx, shas)
+		n, err = db.queueRescanPG(ctx, shas)
+	} else {
+		n, err = db.queueRescanSQLite(ctx, shas)
 	}
-	return db.queueRescanSQLite(ctx, shas)
+	if err == nil && n > 0 {
+		db.forgetSHAs(shas)
+	}
+	return n, err
 }
 
 // QueueMissingMembersForRepair flags every top-level archive whose stored
@@ -3393,10 +3545,17 @@ func (db *DB) QueueRescan(ctx context.Context, shas []string) (int64, error) {
 // detecting NOT EXISTS scan runs once here, not per claim poll; thereafter Tier
 // 1b drains the cheap rescan flag. Returns the number flagged.
 func (db *DB) QueueMissingMembersForRepair(ctx context.Context) (int64, error) {
+	var n int64
+	var err error
 	if db.pool != nil {
-		return db.queueMissingMembersForRepairPG(ctx)
+		n, err = db.queueMissingMembersForRepairPG(ctx)
+	} else {
+		n, err = db.queueMissingMembersForRepairSQLite(ctx)
 	}
-	return db.queueMissingMembersForRepairSQLite(ctx)
+	if err == nil && n > 0 {
+		db.flushLookups()
+	}
+	return n, err
 }
 
 // SampleAnalyzed reports whether a sample with the given SHA-256 exists
@@ -3482,18 +3641,18 @@ func (db *DB) CountByLabel(ctx context.Context) (map[string]int, error) {
 // Pass "" to clear.
 func (db *DB) SetNote(ctx context.Context, sha256, note string) error {
 	if db.pool != nil {
-		return db.setNotePG(ctx, sha256, note)
+		return db.writeSHA(sha256, db.setNotePG(ctx, sha256, note))
 	}
-	return db.setNoteSQLite(ctx, sha256, note)
+	return db.writeSHA(sha256, db.setNoteSQLite(ctx, sha256, note))
 }
 
 // SetStatus updates the pipeline status and updated_at timestamp.
 // Clears note on status change (assumes success).
 func (db *DB) SetStatus(ctx context.Context, sha256, status string) error {
 	if db.pool != nil {
-		return db.setStatusPG(ctx, sha256, status)
+		return db.writeSHA(sha256, db.setStatusPG(ctx, sha256, status))
 	}
-	return db.setStatusSQLite(ctx, sha256, status)
+	return db.writeSHA(sha256, db.setStatusSQLite(ctx, sha256, status))
 }
 
 // SamplesInPipelineStage returns up to limit samples currently parked in the
@@ -3820,7 +3979,7 @@ func (db *DB) StrandedMembers(ctx context.Context, root string) ([]*Sample, erro
 // added (created_at). The review pool is a separate, explicit queue; keeping it
 // out of this selector prevents two workers from judging the same sample.
 // Empty paths are excluded ([triageServablePathSQL]): explode records
-// registry/fetched references with samples.path '' and no bytes to fetch.
+// registry/fetched references with samples.path ” and no bytes to fetch.
 func (db *DB) TriageNew(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
 		return db.triageNewPG(ctx, limit, f)
@@ -4191,10 +4350,17 @@ func (db *DB) RelativizePaths(ctx context.Context, dataRoot string) (int64, erro
 	if dataRoot != "" {
 		prefix = filepath.ToSlash(filepath.Clean(dataRoot)) + "/"
 	}
+	var n int64
+	var err error
 	if db.pool != nil {
-		return db.relativizePathsPG(ctx, prefix)
+		n, err = db.relativizePathsPG(ctx, prefix)
+	} else {
+		n, err = db.relativizePathsSQLite(ctx, prefix)
 	}
-	return db.relativizePathsSQLite(ctx, prefix)
+	if err == nil && n > 0 {
+		db.flushLookups()
+	}
+	return n, err
 }
 
 // UpdateSample updates status, cleave result, and updated_at in one operation.
@@ -4212,9 +4378,9 @@ func (db *DB) UpdateSample(ctx context.Context, sha256, status string, result []
 	}
 	result = compactCleaveResultForStorage(result)
 	if db.pool != nil {
-		return db.updateSamplePG(ctx, sha256, status, result, canonicalSHA256, p.FileInfo)
+		return db.writeSHA(sha256, db.updateSamplePG(ctx, sha256, status, result, canonicalSHA256, p.FileInfo))
 	}
-	return db.updateSampleSQLite(ctx, sha256, status, result, canonicalSHA256, p.FileInfo)
+	return db.writeSHA(sha256, db.updateSampleSQLite(ctx, sha256, status, result, canonicalSHA256, p.FileInfo))
 }
 
 // SamplesByStatusInPaths returns samples matching status whose path
@@ -4339,10 +4505,17 @@ const (
 // Currently backfills: elements, max_crit, suspicious_count, archive member
 // litmus_result, archive member analyzed_at, and stale misclassified markers.
 func (db *DB) Backfill(ctx context.Context) (BackfillStats, error) {
+	var stats BackfillStats
+	var err error
 	if db.pool != nil {
-		return db.backfillPG(ctx)
+		stats, err = db.backfillPG(ctx)
+	} else {
+		stats, err = db.backfillSQLite(ctx)
 	}
-	return db.backfillSQLite(ctx)
+	if err == nil {
+		db.flushLookups()
+	}
+	return stats, err
 }
 
 // BackfillPending counts rows matched by each explicit Backfill pass.
@@ -4360,10 +4533,14 @@ func (db *DB) BackfillPending(ctx context.Context) (BackfillPending, error) {
 // since the format landed, so SQLite rows were never affected. Returns the
 // number of rows repaired.
 func (db *DB) RehealCleaveCrit(ctx context.Context) (int64, error) {
-	if db.pool != nil {
-		return db.rehealCleaveCritPG(ctx)
+	if db.pool == nil {
+		return 0, nil
 	}
-	return 0, nil
+	n, err := db.rehealCleaveCritPG(ctx)
+	if err == nil && n > 0 {
+		db.flushLookups()
+	}
+	return n, err
 }
 
 // BackfillPURL fills samples.purl_base for top-level rows that have a package
@@ -4372,10 +4549,14 @@ func (db *DB) RehealCleaveCrit(ctx context.Context) (int64, error) {
 // overwrites an existing purl_base. Postgres-only; the SQLite path is unused for
 // this repair. Returns the number of rows filled.
 func (db *DB) BackfillPURL(ctx context.Context) (int64, error) {
-	if db.pool != nil {
-		return db.backfillPURLPG(ctx)
+	if db.pool == nil {
+		return 0, nil
 	}
-	return 0, nil
+	n, err := db.backfillPURLPG(ctx)
+	if err == nil && n > 0 {
+		db.flushLookups()
+	}
+	return n, err
 }
 
 // CanonicalizePURLBases rewrites stored samples.purl_base values onto the
@@ -4384,10 +4565,14 @@ func (db *DB) BackfillPURL(ctx context.Context) (int64, error) {
 // resumable; dryRun only reports. Postgres-only; the SQLite path is unused for
 // this repair. Returns the number of rows rewritten (or that would be).
 func (db *DB) CanonicalizePURLBases(ctx context.Context, dryRun bool) (int64, error) {
-	if db.pool != nil {
-		return db.canonicalizePURLBasesPG(ctx, dryRun)
+	if db.pool == nil {
+		return 0, nil
 	}
-	return 0, nil
+	n, err := db.canonicalizePURLBasesPG(ctx, dryRun)
+	if err == nil && !dryRun && n > 0 {
+		db.flushLookups()
+	}
+	return n, err
 }
 
 // CanonicalizeSightingSubjects rewrites stored sightings.subject values onto
@@ -4407,10 +4592,17 @@ func (db *DB) CanonicalizeSightingSubjects(ctx context.Context, dryRun bool) (in
 // samples using SQL-side JSON_TABLE, avoiding the need to fetch cleave_result
 // blobs into Go. Returns the number of rows updated.
 func (db *DB) RecomputeCanonicalSHA256(ctx context.Context) (int64, error) {
+	var n int64
+	var err error
 	if db.pool != nil {
-		return db.recomputeCanonicalSHA256PG(ctx)
+		n, err = db.recomputeCanonicalSHA256PG(ctx)
+	} else {
+		n, err = db.recomputeCanonicalSHA256SQLite(ctx)
 	}
-	return db.recomputeCanonicalSHA256SQLite(ctx)
+	if err == nil && n > 0 {
+		db.flushLookups()
+	}
+	return n, err
 }
 
 // FeedQuery specifies filters for paginated feed queries.
@@ -4515,9 +4707,17 @@ func (db *DB) UpdateEcosystems(ctx context.Context, mapping map[string]string) (
 		return 0, nil
 	}
 	if db.pool != nil {
-		return db.updateEcosystemsPG(ctx, mapping)
+		n, err := db.updateEcosystemsPG(ctx, mapping)
+		if err == nil && n > 0 {
+			db.flushLookups()
+		}
+		return n, err
 	}
-	return db.updateEcosystemsSQLite(ctx, mapping)
+	n, err := db.updateEcosystemsSQLite(ctx, mapping)
+	if err == nil && n > 0 {
+		db.flushLookups()
+	}
+	return n, err
 }
 
 // sortedKeys returns m's keys in sorted order, so the generated SQL and its
@@ -4828,10 +5028,17 @@ func (db *DB) TryClaimSample(ctx context.Context, sha256, owner string, ttl time
 		return false, nil
 	}
 	staleBefore := time.Now().Add(-ttl)
+	var ok bool
+	var err error
 	if db.pool != nil {
-		return db.tryClaimSamplePG(ctx, sha256, owner, staleBefore)
+		ok, err = db.tryClaimSamplePG(ctx, sha256, owner, staleBefore)
+	} else {
+		ok, err = db.tryClaimSampleSQLite(ctx, sha256, owner, staleBefore)
 	}
-	return db.tryClaimSampleSQLite(ctx, sha256, owner, staleBefore)
+	if err == nil && ok {
+		db.forgetSHA(sha256)
+	}
+	return ok, err
 }
 
 // ReleaseSampleClaim releases sha256 only when owner still holds its lease.
@@ -4841,9 +5048,9 @@ func (db *DB) ReleaseSampleClaim(ctx context.Context, sha256, owner string) erro
 		return nil
 	}
 	if db.pool != nil {
-		return db.releaseSampleClaimPG(ctx, sha256, owner)
+		return db.writeSHA(sha256, db.releaseSampleClaimPG(ctx, sha256, owner))
 	}
-	return db.releaseSampleClaimSQLite(ctx, sha256, owner)
+	return db.writeSHA(sha256, db.releaseSampleClaimSQLite(ctx, sha256, owner))
 }
 
 // ReportsBySHA256 returns all reports for a sample, newest first.

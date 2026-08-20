@@ -304,15 +304,15 @@ func (s *apiServer) handleTriage(w http.ResponseWriter, r *http.Request) {
 
 // relocateTriaged resolves one exact catalog location, then delegates the
 // durable filesystem and catalog transition to hopper.DB.MoveLocation.
-func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun bool) triageResult {
-	res := triageResult{SHA256: v.SHA256}
-	sha := strings.ToLower(strings.TrimSpace(v.SHA256))
+func (s *apiServer) relocateTriaged(ctx context.Context, verdict triageVerdict, dryRun bool) triageResult {
+	res := triageResult{SHA256: verdict.SHA256}
+	sha := strings.ToLower(strings.TrimSpace(verdict.SHA256))
 	if !validSHA256(sha) {
 		res.Status, res.Error = "error", "invalid sha256"
 		return res
 	}
 	res.SHA256 = sha
-	if (v.Verdict == "") == (v.Ruling == "") {
+	if (verdict.Verdict == "") == (verdict.Ruling == "") {
 		res.Status, res.Error = "error", `exactly one of "verdict" or "ruling" must be set`
 		return res
 	}
@@ -326,32 +326,32 @@ func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun
 		res.Status, res.Error = "error", err.Error()
 		return res
 	}
-	if samp.Path == "" && v.OldPath == "" {
+	if samp.Path == "" && verdict.OldPath == "" {
 		res.Status, res.Error = "not_found", "sample has no on-disk path"
 		return res
 	}
 
-	oldRel := v.OldPath
+	oldRel := verdict.OldPath
 	if oldRel == "" {
 		oldRel = relativeSamplePath(s.dataRoot, samp.Path)
 	}
 	res.OldPath = oldRel
 
-	if v.OldPath == "" {
+	if verdict.OldPath == "" {
 		// Stateless clients omit old_path and can use the terminal label/tree as
 		// their idempotency key. Exact-location clients retain the old row until
 		// source cleanup, so they must proceed through MoveLocation on retries.
 		switch {
-		case v.Verdict != "" && samp.Label == v.Verdict,
-			v.Ruling == "good" && samp.Label == "good",
-			v.Ruling == "bad" && samp.Label == "bad",
-			v.Ruling == "sighted" && samp.Label == "sighted" && strings.HasPrefix(oldRel, sightedTree+"/"):
+		case verdict.Verdict != "" && samp.Label == verdict.Verdict,
+			verdict.Ruling == "good" && samp.Label == "good",
+			verdict.Ruling == "bad" && samp.Label == "bad",
+			verdict.Ruling == "sighted" && samp.Label == "sighted" && strings.HasPrefix(oldRel, sightedTree+"/"):
 			res.Status = "noop"
 			return res
 		}
 	}
 
-	plan, err := s.triagePlan(samp, oldRel, v)
+	plan, err := s.triagePlan(samp, oldRel, verdict)
 	if err != nil {
 		res.Status, res.Error = "error", err.Error()
 		return res
@@ -399,7 +399,7 @@ func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun
 		return res
 	}
 
-	if v.OldPath != "" {
+	if verdict.OldPath != "" {
 		locations, err := s.db.LocationsForSHA(ctx, sha)
 		if err != nil {
 			res.Status, res.Error = "error", "lookup locations: "+err.Error()
@@ -475,7 +475,7 @@ func (s *apiServer) relocateTriaged(ctx context.Context, v triageVerdict, dryRun
 // triagePlan resolves a triage item to its destination path, target label, and
 // label_source. A Ruling uses promoter's pool-tree placement (subpath
 // preserved); a Verdict uses the operator mislabeled-bucket placement.
-func (s *apiServer) triagePlan(samp *hopper.Sample, oldRel string, v triageVerdict) (placement, error) {
+func (*apiServer) triagePlan(samp *hopper.Sample, oldRel string, v triageVerdict) (placement, error) {
 	if v.Ruling != "" {
 		plan, ok := rulingPlan(samp, oldRel, v.Ruling)
 		if !ok {

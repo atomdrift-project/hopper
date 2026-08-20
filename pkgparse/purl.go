@@ -583,7 +583,7 @@ func distroPath(typ, path, tail string) string {
 // Empty in, empty out.
 func VersionlessPURL(fullPURL string) string {
 	body, quals, hasQuals := strings.Cut(fullPURL, "?")
-	if i := strings.LastIndexByte(body, '@'); i > 0 {
+	if i := purlVersionIndex(body); i > 0 {
 		body = body[:i]
 	}
 	if !hasQuals {
@@ -602,6 +602,42 @@ func VersionlessPURL(fullPURL string) string {
 		return body
 	}
 	return body + "?" + strings.Join(kept, "&")
+}
+
+// purlVersionIndex returns the index within body — a PURL with its qualifier
+// tail already removed — of the '@' separating the version from the name, or
+// -1 when the coordinate is versionless. Only an '@' inside the final name
+// segment is that separator: a scoped npm namespace ("pkg:npm/@scope/name")
+// carries one earlier, and reading it as a version collapses every scoped
+// package onto the single identity "pkg:npm/". A "#subpath" trails the version
+// rather than being part of the name, so the search stops before it.
+func purlVersionIndex(body string) int {
+	name, _, _ := strings.Cut(body, "#")
+	start := strings.LastIndexByte(name, '/') + 1
+	if i := strings.IndexByte(name[start:], '@'); i > 0 {
+		return start + i
+	}
+	return -1
+}
+
+// PURLVersion returns the version of a Package URL, or "" when it carries
+// none. It is the exact complement of [VersionlessPURL]: together the two split
+// one canonical PURL into the (purl_base, version) pair samples stores, so a
+// lookup composed from them addresses the row the same PURL was ingested as.
+// Like VersionlessPURL it also understands the non-spec "?qualifiers@version"
+// ordering older composers emitted.
+func PURLVersion(fullPURL string) string {
+	body, quals, hasQuals := strings.Cut(fullPURL, "?")
+	if i := purlVersionIndex(body); i > 0 {
+		version, _, _ := strings.Cut(body[i+1:], "#")
+		return version
+	}
+	if hasQuals {
+		if i := strings.LastIndexByte(quals, '@'); i > 0 && !strings.ContainsAny(quals[i+1:], "=&/") {
+			return quals[i+1:]
+		}
+	}
+	return ""
 }
 
 // cutQualifier removes the named qualifier from a PURL version/qualifier tail,

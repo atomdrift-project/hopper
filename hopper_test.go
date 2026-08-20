@@ -3818,6 +3818,68 @@ func TestFeedSamplesPURL(t *testing.T) {
 	}
 }
 
+// TestSampleByPURL is the beamline point lookup: newest analyzed top-level
+// row for a package identity, full envelope (cleave kept), members and
+// unanalyzed rows skipped. Empty base is ErrNotFound without a table scan.
+func TestSampleByPURL(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	analyze := func(sha string) {
+		t.Helper()
+		if err := db.UpdateCleaveResult(ctx, sha, []byte(`{"fs":[{"sha":"`+sha+`","type":"elf","dp":0}]}`), nil, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.UpdateLitmusResult(ctx, sha, []byte(`{"v":"7","prob":0.01,"lvl":-1}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustInsert(t, ctx, db, &Sample{SHA256: "old", Source: "test", PURLBase: "pkg:npm/lodash", Version: "4.17.20"})
+	analyze("old")
+	time.Sleep(20 * time.Millisecond)
+	mustInsert(t, ctx, db, &Sample{SHA256: "new", Source: "test", PURLBase: "pkg:npm/lodash", Version: "4.17.21"})
+	analyze("new")
+	mustInsert(t, ctx, db, &Sample{SHA256: "pending", Source: "test", PURLBase: "pkg:npm/lodash", Version: "4.17.22"})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: "inside", Source: "test", Parent: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Path:     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!!lib.js",
+		PURLBase: "pkg:npm/lodash", Version: "9.9.9",
+	})
+	analyze("inside")
+
+	got, err := db.SampleByPURL(ctx, "pkg:npm/lodash", "4.17.20")
+	if err != nil {
+		t.Fatalf("versioned: %v", err)
+	}
+	if got.SHA256 != "old" {
+		t.Errorf("versioned sha = %q, want old", got.SHA256)
+	}
+	if len(got.CleaveResult) == 0 {
+		t.Error("versioned dropped cleave_result (feed projection?)")
+	}
+
+	got, err = db.SampleByPURL(ctx, "pkg:npm/lodash", "")
+	if err != nil {
+		t.Fatalf("versionless: %v", err)
+	}
+	if got.SHA256 != "new" {
+		t.Errorf("versionless sha = %q, want newest analyzed (new), not pending or member", got.SHA256)
+	}
+
+	if _, err := db.SampleByPURL(ctx, "pkg:npm/lodash", "4.17.22"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unanalyzed version: err = %v, want ErrNotFound", err)
+	}
+	if _, err := db.SampleByPURL(ctx, "pkg:npm/lodash", "9.9.9"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("archive member: err = %v, want ErrNotFound", err)
+	}
+	if _, err := db.SampleByPURL(ctx, "pkg:npm/nope", "1.0.0"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("miss: err = %v, want ErrNotFound", err)
+	}
+	if _, err := db.SampleByPURL(ctx, "", ""); !errors.Is(err, ErrNotFound) {
+		t.Errorf("empty base: err = %v, want ErrNotFound", err)
+	}
+}
+
 // TestFeedSamplesLitmusClassesV6V7 locks in the compact level → 0/1/2 class
 // derivation used by the LitmusClasses filter, mirroring prism's envelopeClass:
 // -1 benign, null manual-mode hostile, 0..=CriticalLevel hostile, above
@@ -5587,7 +5649,7 @@ func TestTriageThresholds(t *testing.T) {
 
 // TestTriageExcludesEmptyPathReferences locks that reference-only rows —
 // registry sidecars and fetched deps, which [containmentColumns] stores with
-// samples.path '' — never enter the queues cyclotron polls. Without this they
+// samples.path ” — never enter the queues cyclotron polls. Without this they
 // match TriageNew (suspicious_count from the exploded stub) and burn a HEAD
 // /api/file probe each cycle for bytes hopper will never serve.
 func TestTriageExcludesEmptyPathReferences(t *testing.T) {
@@ -5598,7 +5660,7 @@ func TestTriageExcludesEmptyPathReferences(t *testing.T) {
 		archive = "aa00000000000000000000000000000000000000000000000000000000000000"
 		sidecar = "bb00000000000000000000000000000000000000000000000000000000000000"
 		fetched = "cc00000000000000000000000000000000000000000000000000000000000000"
-		real    = "dd00000000000000000000000000000000000000000000000000000000000000"
+		realSHA = "dd00000000000000000000000000000000000000000000000000000000000000"
 	)
 
 	mustInsert(t, ctx, db, &Sample{
@@ -5617,17 +5679,17 @@ func TestTriageExcludesEmptyPathReferences(t *testing.T) {
 		LocationRel: string(RelFetched),
 	})
 	mustInsert(t, ctx, db, &Sample{
-		SHA256: real, Source: "test", Label: "unknown", LabelSource: "test",
+		SHA256: realSHA, Source: "test", Label: "unknown", LabelSource: "test",
 		Path: "incoming/real.bin",
 	})
 
-	for _, sha := range []string{sidecar, fetched, real} {
+	for _, sha := range []string{sidecar, fetched, realSHA} {
 		got, err := db.SampleBySHA256(ctx, sha)
 		if err != nil {
 			t.Fatalf("SampleBySHA256(%s): %v", sha, err)
 		}
 		switch sha {
-		case real:
+		case realSHA:
 			if got.Path == "" {
 				t.Fatalf("real sample path unexpectedly empty")
 			}
@@ -5651,7 +5713,7 @@ func TestTriageExcludesEmptyPathReferences(t *testing.T) {
 	}
 	analyze(sidecar, "registry")
 	analyze(fetched, "npm")
-	analyze(real, "elf")
+	analyze(realSHA, "elf")
 
 	has := func(samples []*Sample, sha string) bool {
 		for _, s := range samples {
@@ -5666,7 +5728,7 @@ func TestTriageExcludesEmptyPathReferences(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TriageNew: %v", err)
 	}
-	if !has(gotNew, real) {
+	if !has(gotNew, realSHA) {
 		t.Errorf("TriageNew missing real on-disk sample")
 	}
 	if has(gotNew, sidecar) || has(gotNew, fetched) {
@@ -5677,7 +5739,7 @@ func TestTriageExcludesEmptyPathReferences(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TriageFallout: %v", err)
 	}
-	if !has(gotFallout, real) {
+	if !has(gotFallout, realSHA) {
 		t.Errorf("TriageFallout missing real on-disk sample")
 	}
 	if has(gotFallout, sidecar) || has(gotFallout, fetched) {
