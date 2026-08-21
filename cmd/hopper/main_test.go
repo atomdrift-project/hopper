@@ -208,7 +208,7 @@ func mustStat(t *testing.T, path string) os.FileInfo {
 
 func mustOpenDB(t *testing.T, ctx context.Context, path string) *hopper.DB {
 	t.Helper()
-	db, err := hopper.Open(ctx, path)
+	db, err := hopper.Open(ctx, path, "hopper-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -615,7 +615,7 @@ func TestCmdInit(t *testing.T) {
 		}
 	})
 	// Verify DB was created and is usable.
-	db, err := hopper.Open(t.Context(), dbPath)
+	db, err := hopper.Open(t.Context(), dbPath, "hopper-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -629,7 +629,7 @@ func TestCmdInit(t *testing.T) {
 func TestCmdReset(t *testing.T) {
 	ctx := t.Context()
 	dbPath := filepath.Join(t.TempDir(), "reset-test.db")
-	db, err := hopper.Open(ctx, dbPath)
+	db, err := hopper.Open(ctx, dbPath, "hopper-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -665,7 +665,7 @@ func TestCmdReset(t *testing.T) {
 func TestCmdStats(t *testing.T) {
 	ctx := t.Context()
 	dbPath := filepath.Join(t.TempDir(), "stats-test.db")
-	db, err := hopper.Open(ctx, dbPath)
+	db, err := hopper.Open(ctx, dbPath, "hopper-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1131,7 +1131,7 @@ func TestLoadDir(t *testing.T) {
 
 	// Set up a temp SQLite DB.
 	dbPath := filepath.Join(t.TempDir(), "test.db")
-	db, err := hopper.Open(ctx, dbPath)
+	db, err := hopper.Open(ctx, dbPath, "hopper-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1173,7 +1173,7 @@ func TestLoadDirSkipsForagerSidecars(t *testing.T) {
 	ctx := t.Context()
 
 	dbPath := filepath.Join(t.TempDir(), "test.db")
-	db, err := hopper.Open(ctx, dbPath)
+	db, err := hopper.Open(ctx, dbPath, "hopper-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1217,7 +1217,7 @@ func TestLoadDirReadsVendorSidecar(t *testing.T) {
 	ctx := t.Context()
 
 	dbPath := filepath.Join(t.TempDir(), "test.db")
-	db, err := hopper.Open(ctx, dbPath)
+	db, err := hopper.Open(ctx, dbPath, "hopper-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1265,7 +1265,7 @@ func TestLoadDirWithCache(t *testing.T) {
 	ctx := t.Context()
 
 	dbPath := filepath.Join(t.TempDir(), "test.db")
-	db, err := hopper.Open(ctx, dbPath)
+	db, err := hopper.Open(ctx, dbPath, "hopper-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1303,7 +1303,7 @@ func TestLoadDirWithCache(t *testing.T) {
 
 func TestLoadSkipsReconcileAfterEnumerationFailure(t *testing.T) {
 	ctx := t.Context()
-	db, err := hopper.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	db, err := hopper.Open(ctx, filepath.Join(t.TempDir(), "test.db"), "hopper-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1358,7 +1358,7 @@ func TestLoadDirMarkers(t *testing.T) {
 	ctx := t.Context()
 
 	dbPath := filepath.Join(t.TempDir(), "test.db")
-	db, err := hopper.Open(ctx, dbPath)
+	db, err := hopper.Open(ctx, dbPath, "hopper-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1396,7 +1396,7 @@ func TestLoadDirMarkersRefreshMarkerMtimeOnDuplicate(t *testing.T) {
 	ctx := t.Context()
 
 	dbPath := filepath.Join(t.TempDir(), "test.db")
-	db, err := hopper.Open(ctx, dbPath)
+	db, err := hopper.Open(ctx, dbPath, "hopper-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1456,7 +1456,7 @@ func TestLoadRehabilitatesAfterMarkerRemoved(t *testing.T) {
 	useTestPathLister(t)
 	ctx := t.Context()
 	dbPath := filepath.Join(t.TempDir(), "rehab.db")
-	db, err := hopper.Open(ctx, dbPath)
+	db, err := hopper.Open(ctx, dbPath, "hopper-test")
 	if err != nil {
 		t.Fatal(err)
 	}

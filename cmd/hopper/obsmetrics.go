@@ -316,3 +316,52 @@ func observeAge(o metric.Observer, g metric.Float64Observable, now, t time.Time)
 	}
 	o.ObserveFloat64(g, max(now.Sub(t).Seconds(), 0))
 }
+
+// dbRetryCount counts retry attempts inside retryDBAccess, keyed by the
+// operation and the classified cause. It exists because retried contention was
+// invisible: retryDBAccess logs each attempt and then, having eventually
+// succeeded, returns normally — so a result store that burned six lock_timeout
+// retries and thirty seconds of a worker's throughput emitted no metric at all.
+// hopper.insert.failures.total does not cover it either; that counter is fed
+// only from the walk flush, so every lock timeout on the /api/result member
+// upsert (the path that actually stalls the fleet) went unrecorded.
+//
+// The "cause" attribute reuses classifyInsertFailure's vocabulary rather than
+// the raw SQLSTATE: the label set is already bounded and already understood on
+// the insert-failure panel, so the two metrics read in the same terms and a
+// lock_timeout means the same thing on both. "op" is one of a handful of string
+// literals at the call sites, so the pair stays low-cardinality.
+var (
+	dbRetryOnce  sync.Once
+	dbRetryCount metric.Int64Counter
+)
+
+// recordDBRetry increments the retry counter for one attempt. Created lazily on
+// first use like recordLoadShed, and a creation failure leaves it nil for a
+// silent no-op. ctx carries the calling span so the metric links back.
+func recordDBRetry(ctx context.Context, op string, cause insertFailCause) {
+	dbRetryOnce.Do(func() { dbRetryCount = newDBRetryCounter(otel.Meter(meterName)) })
+	if dbRetryCount != nil {
+		dbRetryCount.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("op", op),
+			attribute.String("cause", cause.String()),
+		))
+	}
+}
+
+// newDBRetryCounter builds the retry counter on meter, returning nil if the
+// instrument cannot be created (recordDBRetry then degrades to a no-op). Split
+// out for the same reason registerMetrics takes a meter: a test can bind the
+// counter to its own provider and registry, so pinning the exported name does
+// not require installing a global meter provider — which would retroactively
+// attach every other instrument the suite created to that registry.
+func newDBRetryCounter(m metric.Meter) metric.Int64Counter {
+	c, err := m.Int64Counter(
+		"hopper.db.retries.total",
+		metric.WithDescription("Database operations retried inside retryDBAccess, by operation and cause."),
+	)
+	if err != nil {
+		return nil
+	}
+	return c
+}

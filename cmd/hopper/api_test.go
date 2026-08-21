@@ -499,7 +499,7 @@ func TestFilterCandidatesBySlots(t *testing.T) {
 //     ISO, so a busy worker would seldom claim it.
 func TestClaimJobsBigArchiveDistribution(t *testing.T) {
 	ctx := context.Background()
-	db, err := hopper.Open(ctx, filepath.Join(t.TempDir(), "t.db"))
+	db, err := hopper.Open(ctx, filepath.Join(t.TempDir(), "t.db"), "hopper-test")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -1019,7 +1019,7 @@ var _ = io.EOF
 // root for exercising the full store path.
 func uploadAPI(t *testing.T) *apiServer {
 	t.Helper()
-	db, err := hopper.Open(context.Background(), filepath.Join(t.TempDir(), "test.db"))
+	db, err := hopper.Open(context.Background(), filepath.Join(t.TempDir(), "test.db"), "hopper-test")
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}

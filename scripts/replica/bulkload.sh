@@ -165,9 +165,25 @@ _bulk_apply_gucs() {
     [ "${BULK_GUCS_ACTIVE:-false}" = true ] && return 0
     _gf="$(_bulk_state_dir)/guc-restore.sql"
     _in=$(printf "'%s'," $_BULK_GUCS | sed 's/,$//')
-    admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
+    # NEVER overwrite an existing capture. If one is already on disk, a previous
+    # run applied the bulk GUCs and died before restoring them — so the CURRENT
+    # values ARE the bulk values. Re-capturing here would write
+    # `ALTER SYSTEM SET autovacuum = 'off'` into the restore script as though the
+    # operator had chosen it, and every restore from then on would faithfully put
+    # it back. The failure is silent and permanent.
+    #
+    # Observed on galadriel 2026-08-21: all six bulk GUCs had been stranded in
+    # postgresql.auto.conf since the 08-16 rebuild. samples had taken ~14M
+    # modifications with analyze_count=0 and carried 13.9M dead tuples, and
+    # prism's corpus counter — which reads pg_class.reltuples, a value only
+    # VACUUM/ANALYZE updates — had been frozen at ~89.7M the whole time.
+    if pg_sh "test -s '$_gf'" 2>/dev/null; then
+        log "fast-sync: keeping the bulk-GUC capture from an interrupted run ($_gf) — not re-capturing bulk values"
+    else
+        admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
 \copy (SELECT 'ALTER SYSTEM SET '||name||' = '''||setting||coalesce(unit,'')||''';' FROM pg_settings WHERE name IN ($_in)) TO '$_gf'
 SQL
+    fi
     log "fast-sync: relaxing bulk GUCs for the copy (maintenance_work_mem=$BULK_MAINT_MEM, autovacuum off)"
     admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
 ALTER SYSTEM SET maintenance_work_mem = '$BULK_MAINT_MEM';
@@ -213,8 +229,15 @@ _bulk_reindex_one() {
 # This is also called from setup.sh's EXIT trap, so an apply error, setup
 # failure, or operator interruption does not leave bulk-only GUCs in place.
 bulkload_restore_gucs() {
-    [ "${BULK_GUCS_ACTIVE:-false}" = true ] || return 0
     _gf="$(_bulk_state_dir)/guc-restore.sql"
+    # Gate on the capture FILE, not only the in-memory flag. ALTER SYSTEM writes
+    # persist across processes while BULK_GUCS_ACTIVE does not, so a run killed
+    # without its EXIT trap (SIGKILL, reboot, dropped SSH) leaves the GUCs applied
+    # and the flag gone. Keying off the file lets any later run — including a
+    # plain re-run of setup.sh — finish the restore the dead one never did.
+    if [ "${BULK_GUCS_ACTIVE:-false}" != true ] && ! pg_sh "test -s '$_gf'" 2>/dev/null; then
+        return 0
+    fi
     if pg_sh "test -s '$_gf'" 2>/dev/null; then
         if ! admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -f "$_gf" >/dev/null; then
             log "fast-sync: WARNING — could not restore captured bulk GUCs from $_gf"

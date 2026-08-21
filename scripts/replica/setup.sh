@@ -410,14 +410,32 @@ fi
 
 # Set lock_timeout via DSN (pgx honors query-string GUCs reliably); keeps
 # hopper init from hanging forever if something else holds a table lock.
-log "Running '$HOPPER init' to ensure schema (lock_timeout=30s)"
-"$HOPPER" init -db "postgres://$LOCAL_USER@localhost/$LOCAL_DB?sslmode=disable&lock_timeout=30s"
+# -replica makes init consult the same REPLICA_KEEP_INDEXES allowlist that
+# slim-indexes.sh applies below, so the master-only indexes are never built here
+# in the first place. Without it init builds the full canonical set and
+# slim-indexes.sh drops it moments later — a round trip that is not free on a
+# multi-hundred-GB sample_locations, and that on 2026-08-21 consumed the last
+# of the replica's disk and broke apply with ENOSPC.
+#
+# Probed rather than passed blindly: an older hopper on PATH would exit(2) on
+# the unknown flag, and retrying on failure would be indistinguishable from a
+# genuine init error.
+if "$HOPPER" init -h 2>&1 | grep -q -- '-replica'; then
+    REPLICA_INIT_FLAG=-replica
+else
+    REPLICA_INIT_FLAG=
+    log "warning: $HOPPER predates 'init -replica' — the replica will bulk-build indexes slim-indexes.sh then drops; rebuild with 'make replica'"
+fi
+
+log "Running '$HOPPER init${REPLICA_INIT_FLAG:+ $REPLICA_INIT_FLAG}' to ensure schema (lock_timeout=30s)"
+# shellcheck disable=SC2086 # REPLICA_INIT_FLAG is a single literal flag or empty
+"$HOPPER" init $REPLICA_INIT_FLAG -db "postgres://$LOCAL_USER@localhost/$LOCAL_DB?sslmode=disable&lock_timeout=30s"
 
 # Drop the master-only worker-queue/ingest indexes a read replica never scans.
-# Runs right after init so a fresh replica never bulk-builds them and the
-# steady-state apply worker never maintains them (~590 GB of write dead weight,
-# see slim-indexes.sh). REPLICA_SLIM_INDEXES=false opts out; promote.sh
-# restores them if this replica is ever promoted to primary.
+# With 'init -replica' above this is now a no-op on a fresh replica (they were
+# never built); it remains the backstop that reconciles a replica created before
+# that flag existed, or one whose policy changed since. REPLICA_SLIM_INDEXES=false
+# opts out; promote.sh restores them if this replica is ever promoted to primary.
 log "Slimming replica indexes (REPLICA_SLIM_INDEXES=${REPLICA_SLIM_INDEXES:-true})"
 LOCAL_DB="$LOCAL_DB" "$SCRIPT_DIR/slim-indexes.sh" \
     || log "warning: slim-indexes failed (continuing — replica keeps full index set)"

@@ -31,7 +31,7 @@ func openPlanDB(t *testing.T) *DB {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	db, err := Open(ctx, planAuditDSN(t))
+	db, err := Open(ctx, planAuditDSN(t), "hopper-test")
 	if err != nil {
 		t.Fatalf("Open plan DSN: %v", err)
 	}

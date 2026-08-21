@@ -141,3 +141,73 @@ func metricLines(body, prefix string) string {
 	}
 	return b.String()
 }
+
+// TestRetryDBAccessRecordsRetries pins hopper_db_retries_total — its exported
+// name and both label keys — and covers the wiring end to end rather than just
+// the recorder, because the wiring is the point. A store that hits a lock
+// timeout and then succeeds returns no error and logs only at warn level, so
+// before this counter existed that case was invisible to Prometheus: the
+// throughput was gone and nothing recorded where it went. The dashboard's "DB
+// retries by cause" panel and any alert on it read these exact strings.
+//
+// It binds the counter to an isolated meter through newDBRetryCounter rather
+// than installing a global meter provider. Installing one here would be worse
+// than untidy: OTel retroactively delegates every instrument the suite already
+// created on the global no-op provider to the newly installed one, which drags
+// unrelated collectors (obs.PoolStats among them) into this registry.
+func TestRetryDBAccessRecordsRetries(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	exporter, err := otelprom.New(otelprom.WithRegisterer(reg))
+	if err != nil {
+		t.Fatalf("prometheus exporter: %v", err)
+	}
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(exporter))
+	t.Cleanup(func() {
+		if err := provider.Shutdown(context.Background()); err != nil {
+			t.Logf("meter provider shutdown: %v", err)
+		}
+	})
+
+	// Claim the sync.Once so recordDBRetry uses this counter rather than
+	// creating its own against the global provider. The instrument definition
+	// still comes from production code, so a rename there fails this test.
+	dbRetryOnce.Do(func() {})
+	dbRetryCount = newDBRetryCounter(provider.Meter(meterName))
+	t.Cleanup(func() { dbRetryCount = nil })
+
+	// Fail once with a lock timeout (55P03), then succeed — the exact shape of
+	// the member-upsert contention seen on the publisher on 2026-08-21.
+	calls := 0
+	_, err = retryDBAccess(context.Background(), "store result", strings.Repeat("a", 64),
+		func(context.Context) (struct{}, error) {
+			calls++
+			if calls == 1 {
+				return struct{}{}, fmt.Errorf("store: %w", &pgconn.PgError{Code: "55P03"})
+			}
+			return struct{}{}, nil
+		})
+	if err != nil {
+		t.Fatalf("retryDBAccess returned %v, want success on the second attempt", err)
+	}
+	if calls != 2 {
+		t.Fatalf("fn called %d times, want 2", calls)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", http.NoBody)
+	rec := httptest.NewRecorder()
+	promhttp.HandlerFor(reg, promhttp.HandlerOpts{}).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scrape status = %d", rec.Code)
+	}
+	body := rec.Body.String()
+
+	for _, want := range []string{
+		"hopper_db_retries_total{",
+		`cause="lock_timeout"`,
+		`op="store result"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("scrape missing %q\n---\n%s", want, metricLines(body, "hopper_db_"))
+		}
+	}
+}

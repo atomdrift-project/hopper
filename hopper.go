@@ -483,6 +483,9 @@ type DB struct {
 	lite             *sql.DB
 	lookup           *fido.Cache[string, *Sample]
 	backfillProgress atomic.Pointer[BackfillProgressFn]
+	// replicaIndexPolicy makes migrations decline secondary indexes a logical
+	// replica does not need. See SetReplicaIndexPolicy.
+	replicaIndexPolicy bool
 }
 
 // BackfillProgressFn reports per-batch progress during Backfill. current is
@@ -1805,9 +1808,57 @@ func (db *DB) ApplyCleanup(ctx context.Context, stage CleanupStage) (int64, erro
 
 // Open connects to the registry. DSNs starting with postgres:// or
 // postgresql:// use PostgreSQL; everything else is treated as a SQLite path.
-func Open(ctx context.Context, dsn string) (*DB, error) {
+// AppName identifies the connecting service to PostgreSQL. It lands in
+// application_name, which is what pg_stat_activity, pg_stat_statements and
+// log_line_prefix attribute a backend by.
+//
+// It is a distinct type rather than a plain string so the DSN cannot be passed
+// in its place: an untyped constant ("prism") converts implicitly and reads
+// naturally, while a string variable holding a DSN does not compile.
+//
+// Why Open requires it instead of defaulting: every service on this fleet —
+// hopper, prism, promoter, forager, cyclotron, gauntlet — connects to the same
+// database as the same `hopper` role. With application_name unset they are one
+// undifferentiated block in pg_stat_activity. On 2026-08-21 the publisher sat
+// at 90 of max_connections=100 with 64 of those idle, and there was no way to
+// tell which service was holding them; the answer had to be inferred from pool
+// sizes. A default here would have been silently accepted by every caller and
+// left the same hole, so it is a required argument.
+type AppName string
+
+// maxAppNameBytes is PostgreSQL's NAMEDATALEN-1. Longer values are accepted by
+// the server and silently truncated, which is worse than refusing them: two
+// services sharing a 63-byte prefix become indistinguishable again.
+const maxAppNameBytes = 63
+
+func (a AppName) valid() error {
+	switch {
+	case a == "":
+		return errors.New("hopper: application name is required (see hopper.AppName)")
+	case len(a) > maxAppNameBytes:
+		return fmt.Errorf("hopper: application name %q is %d bytes; PostgreSQL truncates at %d",
+			string(a), len(a), maxAppNameBytes)
+	}
+	// PostgreSQL replaces non-printable and non-ASCII bytes in application_name
+	// with '?', so reject them here rather than ship a name full of question marks.
+	for i := 0; i < len(a); i++ {
+		if c := a[i]; c < 0x20 || c > 0x7e {
+			return fmt.Errorf("hopper: application name %q has a non-printable-ASCII byte at %d", string(a), i)
+		}
+	}
+	return nil
+}
+
+// Open connects to a hopper database. app names the calling service and is
+// required; see AppName. It is recorded as application_name on PostgreSQL and
+// ignored by the SQLite backend, which has no equivalent — required there too
+// so a service cannot become anonymous by switching backends.
+func Open(ctx context.Context, dsn string, app AppName) (*DB, error) {
+	if err := app.valid(); err != nil {
+		return nil, err
+	}
 	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
-		return openPG(ctx, dsn)
+		return openPG(ctx, dsn, app)
 	}
 	return openSQLite(ctx, dsn)
 }
@@ -2910,10 +2961,10 @@ type ParentRef struct {
 
 // ParentArchivesForChild returns, in a single round-trip, the archives a child
 // sha appears in: each parent's identity plus the child's path within it, most
-// recently seen first and deduplicated by parent. It replaces the per-parent
+// recently recorded first and deduplicated by parent. It replaces the per-parent
 // SampleBySHA256 fan-out (an N+1 that detoasted every parent's cleave_result for
-// a backlink that needs none) with one light-projection join, served by
-// idx_sl_sha256_parents. Capped at `limit` parents.
+// a backlink that needs none) with one light-projection join. Capped at `limit`
+// parents.
 func (db *DB) ParentArchivesForChild(ctx context.Context, childSHA string, limit int) ([]ParentRef, error) {
 	if childSHA == "" || limit <= 0 {
 		return nil, nil

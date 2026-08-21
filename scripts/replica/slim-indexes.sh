@@ -91,6 +91,7 @@ idx_samples_purl_lookup
 idx_samples_sighted_newest
 idx_samples_unknown_newest
 idx_sightings_subject
+idx_sl_child_parents
 '
 
 # Master-only: worker queues, ingest lookups, and covering variants prism never
@@ -146,7 +147,6 @@ idx_sl_parent
 idx_sl_parent_child
 idx_sl_reference
 idx_sl_sha256
-idx_sl_sha256_parents
 idx_sl_standalone
 '
 

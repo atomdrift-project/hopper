@@ -95,6 +95,48 @@ groups:
           summary: "Publisher connections at {{ $value | humanizePercentage }} of max"
           description: "{{ $labels.job }} hopper backends nearing max_connections."
 
+      # Statistics freshness. Added 2026-08-21 after bulkload.sh left
+      # autovacuum=off on the replica for days: `samples` took ~14M
+      # modifications with analyze_count=0, pg_class.reltuples froze, and
+      # prism's corpus counter — which reads reltuples — sat at a number that
+      # had stopped moving. Nothing errored; the only symptom was a statistic
+      # that looked plausible and was wrong, which is why this needs an alert
+      # rather than a dashboard panel someone might notice.
+      - alert: TableNeverAnalyzed
+        expr: hopper_pg_table_stats_never_analyzed == 1
+        for: 30m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.table }} has never been ANALYZEd"
+          description: >-
+            No ANALYZE on record for {{ $labels.table }}. Query plans are being
+            chosen from absent statistics and pg_class.reltuples is frozen, so
+            anything reading it (prism's corpus counter) is reporting a stale
+            number. Check `SHOW autovacuum` — bulkload.sh turns it off for the
+            fast sync and a run killed without its EXIT trap leaves it off.
+
+      - alert: TableAnalyzeStale
+        expr: hopper_pg_table_stats_analyze_age_seconds > 86400
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.table }} last analyzed {{ $value | humanizeDuration }} ago"
+          description: >-
+            Statistics older than 24h on a table taking continuous writes.
+            reltuples drifts from the real row count and the planner works from
+            stale selectivity estimates.
+
+      - alert: AutovacuumDisabled
+        expr: hopper_pg_table_stats_dead_tup > 5e6 and hopper_pg_table_stats_vacuum_age_seconds > 86400
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.table }} has {{ $value }} dead tuples and no recent VACUUM"
+          description: >-
+            Dead tuples accumulating with no vacuum in 24h — bloat grows and,
+            left long enough, anti-wraparound autovacuum becomes the only thing
+            standing between this and a forced emergency vacuum.
+
       # An initial tablesync (e.g. .62's sample_locations copy) freezes its
       # slot's restart_lsn for the whole COPY, so retention only grows. Expected,
       # but warn so a slow copy doesn't silently march into the backstop.

@@ -22,7 +22,7 @@ import (
 	"github.com/atomdrift-project/hopper/pkgparse"
 )
 
-func openPG(ctx context.Context, dsn string) (*DB, error) {
+func openPG(ctx context.Context, dsn string, app AppName) (*DB, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: parse dsn: %w", err)
@@ -36,6 +36,14 @@ func openPG(ctx context.Context, dsn string) (*DB, error) {
 	cfg.MaxConns = 32
 	cfg.MinConns = 8
 	cfg.MaxConnIdleTime = 5 * time.Minute
+	// Name the connections so pg_stat_activity can attribute them; see AppName
+	// for why this is a required argument rather than a default. Set after
+	// ParseConfig so it wins over any application_name in the DSN — the caller's
+	// identity is not something a connection string should be able to spoof.
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	cfg.ConnConfig.RuntimeParams["application_name"] = string(app)
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: connect: %w", err)
@@ -532,13 +540,40 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// which is what lets the BFS expand the alive set by index lookups instead
 		// of seq-scanning + sorting all of sample_locations.
 		`CREATE INDEX IF NOT EXISTS idx_sl_parent_child ON sample_locations(parent_sha256) INCLUDE (sha256) WHERE parent_sha256 <> ''`,
-		// Reverse edge for the page's "found in" backlinks (ParentArchivesForChild):
-		// resolve a child sha to its parent archives index-only. Partial, so it
-		// covers only the minority of rows that actually carry a parent — a widely
-		// shared file (the same jquery.min.js in thousands of packages) resolves its
-		// parents without thousands of heap fetches.
-		`CREATE INDEX IF NOT EXISTS idx_sl_sha256_parents ON sample_locations(sha256) ` +
-			`INCLUDE (parent_sha256, last_seen_at, path) WHERE parent_sha256 <> ''`,
+		// Reverse edge for the page's "found in" backlinks
+		// (ParentArchivesForChild): a child sha -> the archives containing it.
+		//
+		// Keyed (sha256, parent_sha256, id), not covering, because this query
+		// needs ORDER and not payload. Its predecessor idx_sl_sha256_parents put
+		// parent_sha256 in an INCLUDE list, which buys index-only access but no
+		// ordering — so DISTINCT ON (parent_sha256) had to sort every matching
+		// row, and the planner preferred idx_sl_sha256 plus an explicit sort over
+		// the 339 GB index built for the query. Measured 2026-08-21 on the
+		// empty-file sha (e3b0c442…, ~6.5M locations): 183s and 1.6 GB spilled to
+		// temp, with that covering index present and unused.
+		//
+		// Leading sha256 then parent_sha256 makes one child's entries arrive
+		// already grouped by parent, so the DISTINCT ON is a streaming Unique over
+		// an index-only scan and the LIMIT stops it early — O(limit), not
+		// O(locations). id trails so "newest location for this parent" needs no
+		// heap visit. id is DESC in the key on purpose: the ORDER BY below is
+		// (parent_sha256 ASC, id DESC), and a forward scan can only satisfy that if
+		// the index declares the same mixed direction — otherwise the planner sorts.
+		//
+		// The tail is what forces this. Fan-out is savagely skewed: p50 is 1
+		// location and p99 is 40, but the empty file sits in ~6.5M and the next
+		// worst in ~4.8M. Any plan proportional to locations is a timeout there,
+		// covering index or not.
+		//
+		// It is also ~95 GB against the old 339 GB, because INCLUDE columns
+		// disable btree deduplication — idx_sl_parent and idx_sl_parent_child
+		// differ only by an INCLUDE and measure 8.2 GB against 109 GB.
+		`CREATE INDEX IF NOT EXISTS idx_sl_child_parents ON sample_locations ` +
+			`(sha256, parent_sha256, id DESC) WHERE parent_sha256 <> ''`,
+		// Superseded by idx_sl_child_parents. Created before this drop so the
+		// lookup is never left uncovered — same discipline as the purl_lookup /
+		// purl_analyzed swap above.
+		`DROP INDEX IF EXISTS idx_sl_sha256_parents`,
 		// "Is this sha contained by any archive?" — the question that separates an
 		// artifact worth judging on its own from an archive member that isn't.
 		// Asked by the feed's TopLevelOnly, by KnownSHA256 before deciding whether
@@ -1043,8 +1078,21 @@ func (db *DB) migrateServingPG(ctx context.Context, allowRewrite bool) (func(con
 	// Core DDL (columns, tables, cleanup) runs now; index builds are collected
 	// for the background phase.
 	var deferred []string
+	var declined int
 	for _, ddl := range pgRuntimeMigrations() {
 		if isDeferrableIndexDDL(ddl) {
+			// In replica mode, decline the indexes slim-indexes.sh would drop
+			// anyway rather than build them first. Not recorded in the ledger:
+			// see SetReplicaIndexPolicy.
+			skip, err := db.skipReplicaIndex(ddl)
+			if err != nil {
+				return nil, fmt.Errorf("hopper: migrate: %w", err)
+			}
+			if skip {
+				declined++
+				slog.Debug("replica index policy: declining index", "ddl", ddl) //nolint:gosec // trusted migration DDL
+				continue
+			}
 			deferred = append(deferred, ddl)
 			continue
 		}
@@ -1058,7 +1106,22 @@ func (db *DB) migrateServingPG(ctx context.Context, allowRewrite bool) (func(con
 		slog.Warn("optional migration skipped; continuing without it", "ddl", trgmExtensionDDL, "error", err)
 		trgmReady = false
 	}
-	slog.Info("core migrations applied", "deferred_indexes", len(deferred))
+	// The trgm index sits on a published table, so it answers to the same
+	// replica policy as every other index — it is built in the closure below,
+	// but the decision belongs here with its peers.
+	buildTrgmIndex := trgmReady
+	if buildTrgmIndex {
+		skip, err := db.skipReplicaIndex(trgmIndexDDL)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: migrate: %w", err)
+		}
+		if skip {
+			declined++
+			buildTrgmIndex = false
+		}
+	}
+	slog.Info("core migrations applied",
+		"deferred_indexes", len(deferred), "declined_replica_indexes", declined)
 
 	return func(ctx context.Context) error {
 		for _, ddl := range deferred {
@@ -1069,7 +1132,7 @@ func (db *DB) migrateServingPG(ctx context.Context, allowRewrite bool) (func(con
 				return fmt.Errorf("hopper: migrate index: %w", err)
 			}
 		}
-		if trgmReady {
+		if buildTrgmIndex {
 			if err := db.execPGMigrationDDL(ctx, trgmIndexDDL, allowRewrite); err != nil {
 				slog.Warn("optional migration skipped; continuing without it", "ddl", trgmIndexDDL, "error", err)
 			}
@@ -2207,12 +2270,20 @@ func sampleStagingRows(samples []*Sample) [][]any {
 // whole corpus, and the old upsert rewrote each row unconditionally: it stamped
 // last_seen_at = now() and the CASE arms wrote the existing value back when the
 // incoming field was blank. Postgres has no same-value-skip, so each of those
-// was a fresh row version — and because last_seen_at rides in the INCLUDE list
-// of idx_sl_sha256_parents no such update could ever be HOT, so one no-op
+// was a fresh row version — and because last_seen_at then rode in the INCLUDE
+// list of idx_sl_sha256_parents no such update could ever be HOT, so one no-op
 // re-observation cost a heap tuple plus an entry in all ten indexes. That churn,
 // not new data, was what buried the logical replicas in WAL. last_seen_at is no
 // longer maintained: nothing compares it against a threshold and nothing outside
-// this package reads it, so the three ORDER BY sites just sort on a frozen value.
+// this package reads it.
+//
+// idx_sl_sha256_parents was replaced by idx_sl_child_parents on 2026-08-21 and
+// last_seen_at is in no index at all now, so re-stamping it would be HOT-able
+// again. That is not an invitation to resume: the column still has no reader,
+// and this guard is what keeps an unchanged re-observation from writing any row
+// version whatsoever. locationsForSHA256PG and the two dashboard queries still
+// ORDER BY it; they sort by last-write, which is honest but is not the "last
+// seen" their names imply — worth revisiting when someone touches them.
 //
 // Keep the predicate aligned with the SET list it guards — a field that is set
 // but not tested here would silently stop being refreshed.
@@ -2367,6 +2438,20 @@ ORDER BY sha256
 // per-batch staging + COPY round trips while keeping that window short.
 const memberStoreBatch = 1000
 
+// memberBatchTimeout bounds ONE member batch, inside the caller's overall store
+// deadline (resultStoreTimeout, 10m). Without it a single batch inherits the
+// whole 10 minutes, and because it holds a pooled connection for that entire
+// time it converts one slow archive into pool starvation for everything else —
+// which is what "begin member batch: context deadline exceeded" is: pool.Begin
+// waiting out the full store deadline for a connection that never frees.
+//
+// The publisher runs near its connection ceiling (90 of max_connections=100 on
+// 2026-08-21, shared with prism/promoter/forager on the same role), so a
+// connection held for minutes is the scarce resource, not the batch itself.
+// Failing a batch at 90s frees it ~6.7x sooner and still leaves the store room
+// to complete several batches within its own deadline.
+const memberBatchTimeout = 90 * time.Second
+
 // storeMemberRowsPG upserts one batch of archive-member rows in its own
 // transaction: stage, COPY, analysis-only upsert, then fan the same rows out
 // into sample_locations. Both writes are internally ordered by sha256 (the
@@ -2514,8 +2599,21 @@ func (db *DB) storeResultPG(
 		if len(batch) == 0 {
 			continue
 		}
-		n, err := db.storeMemberRowsPG(ctx, sampleStagingRows(batch))
+		// Own deadline per batch, cancelled before the next iteration rather
+		// than deferred, so a stalled batch releases its pooled connection
+		// instead of pinning it for the rest of the store deadline.
+		batchCtx, cancelBatch := context.WithTimeout(ctx, memberBatchTimeout)
+		n, err := db.storeMemberRowsPG(batchCtx, sampleStagingRows(batch))
+		cancelBatch()
 		if err != nil {
+			// Distinguish "this batch ran out of its own time" from "the whole
+			// store ran out": the first is a slow batch worth retrying, the
+			// second means the caller's budget is gone and a retry is futile.
+			if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+				return StoreStats{}, fmt.Errorf(
+					"hopper: member batch at offset %d exceeded %s: %w",
+					start, memberBatchTimeout, err)
+			}
 			return StoreStats{}, err
 		}
 		stats.MembersStored += n
@@ -2686,23 +2784,37 @@ func (db *DB) topMemberSHAsByParentPG(ctx context.Context, parentSHA string, lim
 // light-projection join. DISTINCT ON keeps each parent's most-recent location;
 // the outer ORDER BY then ranks parents by recency and caps the set.
 func (db *DB) parentArchivesForChildPG(ctx context.Context, childSHA string, limit int) ([]ParentRef, error) {
-	// Limit before the join: pick the top-N distinct parents from sample_locations
-	// first (served by idx_sl_sha256_parents), THEN join samples for only those N.
-	// The heavy TOASTed litmus_result is detoasted N times, not once per parent —
-	// which for a file shared across thousands of archives is the whole cost.
-	//nolint:unqueryvet // the wildcard is over top_parents, a CTE this query defines with four named columns; re-listing them adds nothing.
+	// Bound the work at $2 parents, not at the number of locations. With
+	// idx_sl_child_parents the matching rows arrive already grouped by
+	// parent_sha256, so DISTINCT ON is a streaming Unique over an index-only
+	// scan and the LIMIT stops the scan — O(limit), not O(locations). That is
+	// the whole design: the fan-out tail is extreme (the empty-file sha is in
+	// ~6.5M locations), and the previous shape, which applied LIMIT after the
+	// DISTINCT ON and ordered by last_seen_at, sorted every one of them — 183s
+	// and 1.6 GB of temp spill.
+	//
+	// The cost is that these are the lexically-first N parents, not the N most
+	// recent. Nothing regresses: last_seen_at stopped being maintained when
+	// locationChangedPG landed, so the ordering this replaces was already
+	// arbitrary while claiming recency — and for a file present in millions of
+	// archives no cross-parent ranking is meaningful anyway. Within a parent,
+	// id DESC still selects that parent's most recently recorded location.
+	//
+	// Limiting before the join also keeps the heavy TOASTed litmus_result to N
+	// detoasts rather than one per location row.
 	rows, err := db.pool.Query(ctx, `
 		WITH top_parents AS (
 			SELECT DISTINCT ON (parent_sha256)
-			       parent_sha256, path AS loc_path, rel, last_seen_at
+			       parent_sha256, path AS loc_path, rel, id
 			  FROM sample_locations
 			 WHERE sha256 = $1 AND parent_sha256 <> ''
-			 ORDER BY parent_sha256, last_seen_at DESC
+			 ORDER BY parent_sha256, id DESC
+			 LIMIT $2
 		)
 		SELECT s.sha256, s.filename, s.path, tp.loc_path, tp.rel, s.feed, s.ecosystem, s.version, s.package, s.litmus_result, s.analyzed_at
-		  FROM (SELECT * FROM top_parents ORDER BY last_seen_at DESC LIMIT $2) tp
+		  FROM top_parents tp
 		  JOIN samples s ON s.sha256 = tp.parent_sha256
-		 ORDER BY tp.last_seen_at DESC`, childSHA, limit)
+		 ORDER BY tp.parent_sha256`, childSHA, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: parent archives for child %s: %w", childSHA, err)
 	}

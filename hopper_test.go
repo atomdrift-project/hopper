@@ -22,7 +22,7 @@ func openTestDB(t *testing.T) *DB {
 
 func openTestDBContext(t *testing.T, ctx context.Context) *DB {
 	t.Helper()
-	db, err := Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "test.db"), "hopper-test")
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

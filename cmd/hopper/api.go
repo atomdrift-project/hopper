@@ -2076,8 +2076,11 @@ func retryDBAccess[T any](ctx context.Context, op, shaHex string, fn func(contex
 		retry.LastErrorOnly(true),
 		retry.WrapContextErrorWithLastError(true),
 		retry.OnRetry(func(attempt uint, err error) {
+			cause := classifyInsertFailure(err)
+			recordDBRetry(ctx, op, cause)
 			slog.Warn("database operation failed; retrying",
-				"op", op, "sha256", shaHex, "attempt", attempt+1, "error", err)
+				"op", op, "sha256", shaHex, "attempt", attempt+1,
+				"cause", cause.String(), "error", err)
 		}),
 	)
 }

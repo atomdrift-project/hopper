@@ -591,7 +591,7 @@ func openDB(ctx context.Context, dsn string) (*hopper.DB, error) {
 		dsn = "postgres://hopper@hopper-db:5432/hopper"
 	}
 	slog.Info("connecting to database", "dsn", redactDSN(dsn)) //nolint:gosec // dsn is redacted before logging
-	return hopper.Open(ctx, dsn)
+	return hopper.Open(ctx, dsn, "hopper")
 }
 
 func cmdServe(ctx context.Context) error {
@@ -653,7 +653,7 @@ func cmdServe(ctx context.Context) error {
 
 	// Run migrations.
 	dsn := fmt.Sprintf("postgres://localhost:%s/hopper", p)
-	db, err := hopper.Open(ctx, dsn)
+	db, err := hopper.Open(ctx, dsn, "hopper-migrate")
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
@@ -672,6 +672,9 @@ func cmdServe(ctx context.Context) error {
 func cmdInit(ctx context.Context) error {
 	f := flag.NewFlagSet("init", flag.ExitOnError)
 	dsn := f.String("db", "", "database (postgres:// DSN or sqlite file path)")
+	replica := f.Bool("replica", false,
+		"target is a logical replica: skip secondary indexes it does not need "+
+			"(the allowlist in scripts/replica/slim-indexes.sh decides)")
 	parseFlags(f, os.Args[2:])
 
 	db, err := openDB(ctx, *dsn)
@@ -679,10 +682,13 @@ func cmdInit(ctx context.Context) error {
 		return err
 	}
 	defer db.Close()
+	// Set before Migrate: the policy is read while the migration list is
+	// partitioned, so flipping it afterwards would be too late to matter.
+	db.SetReplicaIndexPolicy(*replica)
 	if err := db.Migrate(ctx); err != nil {
 		return err
 	}
-	slog.Info("schema up to date")
+	slog.Info("schema up to date", "replica_index_policy", *replica)
 	return nil
 }
 
@@ -709,7 +715,7 @@ func cmdImport(ctx context.Context) error {
 	}
 
 	slog.Info("opening source database", "dsn", *srcDSN)
-	src, err := hopper.Open(ctx, *srcDSN)
+	src, err := hopper.Open(ctx, *srcDSN, "hopper-copy-src")
 	if err != nil {
 		return fmt.Errorf("open source: %w", err)
 	}
@@ -1268,8 +1274,15 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	defer db.Close()
 	slog.Info("database ready", "elapsed", time.Since(dbStart))
 
-	if err := obs.PoolStats("hopper", db.Pool()); err != nil {
-		slog.Warn("pool stats registration", "error", err)
+	// Only with a real pool: PoolStats' observable callback calls pool.Stat()
+	// on every scrape, and pgxpool.(*Pool).Stat dereferences a nil receiver. On
+	// the SQLite backend db.Pool() is nil, so registering here made the first
+	// /_/metrik scrape panic inside the collector and return 500 for the whole
+	// endpoint — taking every unrelated metric down with it.
+	if pool := db.Pool(); pool != nil {
+		if err := obs.PoolStats("hopper", pool); err != nil {
+			slog.Warn("pool stats registration", "error", err)
+		}
 	}
 
 	// Periodic pgxpool stats so saturation is visible. Without this, a

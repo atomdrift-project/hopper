@@ -61,3 +61,252 @@ hopper_pg_database_size:
   master: true
   metrics:
     - bytes: { usage: "GAUGE", description: "Size of current database in bytes" }
+
+# ---------------------------------------------------------------------------
+# RECOVERED DRIFT 2026-08-21. hopper_pg_xact was live on uruk-hai but absent
+# from this file, so the next deploy-hopper-alloy.sh would have silently
+# deleted it and blanked the throughput panels on Service Health. It is the
+# source for commits/s, rows-inserted/s and the buffer cache hit ratio.
+# ---------------------------------------------------------------------------
+hopper_pg_xact:
+  query: |
+    SELECT
+      xact_commit::bigint   AS commit,
+      xact_rollback::bigint AS rollback,
+      tup_returned::bigint  AS tup_returned,
+      tup_fetched::bigint   AS tup_fetched,
+      tup_inserted::bigint  AS tup_inserted,
+      blks_read::bigint     AS blks_read,
+      blks_hit::bigint      AS blks_hit
+    FROM pg_stat_database
+    WHERE datname = 'hopper'
+  master: true
+  metrics:
+    - commit:       { usage: "COUNTER", description: "Transactions committed on hopper" }
+    - rollback:     { usage: "COUNTER", description: "Transactions rolled back on hopper" }
+    - tup_returned: { usage: "COUNTER", description: "Rows returned by queries on hopper" }
+    - tup_fetched:  { usage: "COUNTER", description: "Rows fetched by queries on hopper" }
+    - tup_inserted: { usage: "COUNTER", description: "Rows inserted on hopper" }
+    - blks_read:    { usage: "COUNTER", description: "Disk blocks read on hopper" }
+    - blks_hit:     { usage: "COUNTER", description: "Buffer cache hits on hopper" }
+
+# ---------------------------------------------------------------------------
+# Wait events. Added 2026-08-21 because this was the single measurement that
+# explained a day-long incident and nothing in the fleet recorded it: a
+# snapshot of pg_stat_activity showed every INSERT queued on LWLock:WALWrite
+# behind IO:WalInitSync, which pointed straight at wal_init_zero=on being
+# wrong for ZFS. From metrics alone that was invisible — the connection and
+# lock-wait counters showed only that backends were busy, not what on.
+#
+# Grouped by (type, event), not just type: "IO" is useless, "IO/WalInitSync"
+# versus "IO/DataFileRead" is the entire diagnosis. Cardinality is bounded by
+# max_connections (100) at any instant and settles around 30-50 distinct pairs.
+#
+# Excludes idle backends so the series tracks work, not pool size. Requires
+# pg_read_all_stats to see other roles' wait fields; hopper_exporter has it
+# via pg_monitor.
+# ---------------------------------------------------------------------------
+hopper_pg_wait:
+  query: |
+    SELECT
+      wait_event_type,
+      wait_event,
+      count(*)::int AS backends
+    FROM pg_stat_activity
+    WHERE datname = 'hopper'
+      AND state <> 'idle'
+      AND wait_event_type IS NOT NULL
+    GROUP BY 1, 2
+  master: true
+  metrics:
+    - wait_event_type: { usage: "LABEL", description: "Wait class: LWLock, Lock, IO, Client, IPC, Timeout" }
+    - wait_event:      { usage: "LABEL", description: "Specific wait, e.g. WALWrite, WalInitSync, DataFileRead" }
+    - backends:        { usage: "GAUGE", description: "Non-idle backends in this wait" }
+
+# ---------------------------------------------------------------------------
+# WAL PRODUCTION, which is not the same thing as hopper_pg_stat_wal_bytes:
+# that one is pg_ls_waldir(), i.e. how much WAL is being RETAINED on disk.
+# This is how much is being GENERATED. Distinguishing them matters — retention
+# climbing with flat production means a replication slot is holding segments,
+# which is a different fault from a write storm.
+#
+# wal_fpi is worth its own series: full-page images are emitted on the first
+# touch of a page after each checkpoint, so they scale with checkpoint
+# frequency rather than with useful work. On 2026-08-21 they were the bulk of
+# WAL bytes, and full_page_writes=off collapsed them from 11.5M/h to 2.5k/h.
+#
+# PG18 column set: wal_write/wal_sync and their timings moved to pg_stat_io,
+# so this deliberately selects only the four counters that still exist here.
+# ---------------------------------------------------------------------------
+hopper_pg_wal_gen:
+  query: |
+    SELECT
+      wal_records::bigint      AS records,
+      wal_fpi::bigint          AS fpi,
+      wal_bytes::bigint        AS bytes,
+      wal_buffers_full::bigint AS buffers_full
+    FROM pg_stat_wal
+  master: true
+  metrics:
+    - records:      { usage: "COUNTER", description: "WAL records generated" }
+    - fpi:          { usage: "COUNTER", description: "WAL full-page images generated" }
+    - bytes:        { usage: "COUNTER", description: "WAL bytes generated" }
+    - buffers_full: { usage: "COUNTER", description: "Times WAL buffers filled, forcing a write" }
+
+# ---------------------------------------------------------------------------
+# Checkpoints. The number that matters is `requested`: a timed checkpoint is
+# the schedule working, a requested one means max_wal_size was hit and the
+# interval is being set by WAL volume instead. requested staying at 0 is what
+# licensed raising checkpoint_timeout to 1800s on 2026-08-21; if it starts
+# climbing, max_wal_size (32 GB) needs to grow or the interval come back down.
+#
+# write_time is wall clock across the spread-out write phase and will sit near
+# checkpoint_timeout * checkpoint_completion_target (0.9) by construction — it
+# is NOT a saturation signal, and reading it as one cost an hour. buffers_written
+# is the honest measure of checkpoint work.
+# ---------------------------------------------------------------------------
+hopper_pg_checkpoint:
+  query: |
+    SELECT
+      num_timed::bigint       AS timed,
+      num_requested::bigint   AS requested,
+      buffers_written::bigint AS buffers_written,
+      write_time::bigint      AS write_time_ms,
+      sync_time::bigint       AS sync_time_ms
+    FROM pg_stat_checkpointer
+  master: true
+  metrics:
+    - timed:           { usage: "COUNTER", description: "Checkpoints started on schedule" }
+    - requested:       { usage: "COUNTER", description: "Checkpoints forced by max_wal_size — should stay flat" }
+    - buffers_written: { usage: "COUNTER", description: "Buffers written by the checkpointer" }
+    - write_time_ms:   { usage: "COUNTER", description: "Checkpoint write-phase wall clock (paced, not saturation)" }
+    - sync_time_ms:    { usage: "COUNTER", description: "Checkpoint fsync wall clock" }
+
+# ---------------------------------------------------------------------------
+# Table statistics freshness. Added 2026-08-21 after a bug that was invisible
+# for the better part of a week: bulkload.sh had left autovacuum=off on the
+# replica, so `samples` accumulated ~14M modifications with analyze_count=0.
+# Nothing broke loudly — but pg_class.reltuples froze, and prism's corpus
+# counter reads reltuples, so the number on lab.atomdrift.org sat at ~89.7M
+# while the table really held 90.8M. Stale statistics also mean stale query
+# plans, which is the more expensive half of the same fault.
+#
+# never_analyzed is a separate gauge on purpose. A table that has NEVER been
+# analyzed has last_analyze AND last_autoanalyze NULL, so any age arithmetic
+# yields NULL and the series simply vanishes — the worst possible encoding for
+# the exact condition worth paging on. analyze_age_seconds therefore falls back
+# to postmaster uptime ("at least this long"), and never_analyzed carries the
+# distinction the age cannot.
+#
+# n_tup_upd / n_tup_hot_upd were added 2026-08-21 to settle a specific
+# question: whether updates to `samples` are going through HOT (heap-only
+# tuple) or writing a fresh tuple into EVERY index on the table. The ratio
+# hot_upd/upd is the whole answer. Near 1 means updates are cheap. Near 0
+# means each one costs ~54 index writes, which is a write-amplification
+# factor no amount of worker or connection tuning can compensate for, and it
+# is the difference between "Postgres is busy" and "Postgres is busy doing
+# something avoidable".
+#
+# Two things defeat HOT, and both are suspected here: an UPDATE that changes
+# any indexed column (samples has a plain btree on updated_at, which the
+# write paths set to now()), and a page with no free space to put the new
+# tuple in (samples has no fillfactor set, so it is at the default 100).
+# Graph the ratio, not the raw counters — the counters only ever climb.
+#
+# All columns here are catalog/statistics reads. No table is touched, so this
+# costs the same whether samples holds 90 million rows or 90.
+# ---------------------------------------------------------------------------
+hopper_pg_table_stats:
+  query: |
+    SELECT
+      c.relname                                                   AS "table",
+      c.reltuples::bigint                                         AS reltuples,
+      s.n_live_tup::bigint                                        AS live_tup,
+      s.n_dead_tup::bigint                                        AS dead_tup,
+      s.n_tup_upd::bigint                                         AS tup_upd,
+      s.n_tup_hot_upd::bigint                                     AS tup_hot_upd,
+      s.n_mod_since_analyze::bigint                               AS mod_since_analyze,
+      (GREATEST(s.last_analyze, s.last_autoanalyze) IS NULL)::int AS never_analyzed,
+      extract(epoch FROM now() - COALESCE(
+        GREATEST(s.last_analyze, s.last_autoanalyze),
+        pg_postmaster_start_time()))::bigint                      AS analyze_age_seconds,
+      extract(epoch FROM now() - COALESCE(
+        GREATEST(s.last_vacuum, s.last_autovacuum),
+        pg_postmaster_start_time()))::bigint                      AS vacuum_age_seconds
+    FROM pg_class c
+    JOIN pg_stat_user_tables s ON s.relid = c.oid
+    WHERE c.relname IN ('samples', 'sample_locations', 'reports', 'sightings')
+  master: true
+  metrics:
+    - table:               { usage: "LABEL",  description: "Table name" }
+    - reltuples:           { usage: "GAUGE",  description: "Planner row estimate — what prism's corpus counter reads; only VACUUM/ANALYZE moves it" }
+    - live_tup:            { usage: "GAUGE",  description: "Live tuples per the stats collector" }
+    - dead_tup:            { usage: "GAUGE",  description: "Dead tuples awaiting vacuum" }
+    - tup_upd:             { usage: "COUNTER", description: "Rows updated. Denominator for the HOT ratio" }
+    - tup_hot_upd:         { usage: "COUNTER", description: "Rows updated via HOT (no index write). hot_upd/upd near 0 means every update writes all ~54 indexes" }
+    - mod_since_analyze:   { usage: "GAUGE",  description: "Rows changed since the last ANALYZE" }
+    - never_analyzed:      { usage: "GAUGE",  description: "1 if this table has never been analyzed at all" }
+    - analyze_age_seconds: { usage: "GAUGE",  description: "Seconds since the last ANALYZE, or since postmaster start if never" }
+    - vacuum_age_seconds:  { usage: "GAUGE",  description: "Seconds since the last VACUUM, or since postmaster start if never" }
+
+# ---------------------------------------------------------------------------
+# STATEMENT-LEVEL ATTRIBUTION. Added 2026-08-21, and deliberately shipped
+# COMMENTED OUT — see the activation step below before uncommenting.
+#
+# Everything else in this file measures that Postgres is busy or blocked.
+# None of it says WHICH statement. On 2026-08-21 the walk-path staging upsert
+# and the /api/result member upsert were both running 10-13s and timing out
+# on each other's tuple locks; that was only visible because
+# log_min_duration_statement happened to catch it in the server log. Nothing
+# in the fleet trended it, so it could not be seen starting, and could not be
+# shown to have stopped after a fix.
+#
+# Ranked by total_exec_time, not mean: a 12s statement run twice an hour is a
+# curiosity, and a 40ms statement run 300 times a second is the actual load.
+# Only the top 20 are emitted, and queryid is the label rather than the query
+# text — text is unbounded and would be a cardinality disaster. Resolve a
+# queryid to its text ad hoc:
+#
+#   SELECT query FROM pg_stat_statements WHERE queryid = <id>;
+#
+# ACTIVATION (two steps, requires a Postgres RESTART):
+#   1. sh scripts/pg-stat-statements.sh     # stages shared_preload_libraries
+#      <restart Postgres>
+#      sh scripts/pg-stat-statements.sh     # CREATE EXTENSION + verify
+#   2. Uncomment this block, reinstall queries.yaml, restart Alloy
+#      (see RUNBOOK.md "Deploy").
+#
+# Do NOT uncomment before step 1. A custom query naming a relation that does
+# not exist fails to plan on every scrape: this block would emit nothing,
+# log an error each interval, and — the reason it ships commented — this is
+# the file where an editing mistake silently blanked live panels once already.
+# ---------------------------------------------------------------------------
+# hopper_pg_statements:
+#   query: |
+#     SELECT
+#       s.queryid::text                     AS queryid,
+#       s.calls::bigint                     AS calls,
+#       s.total_exec_time::bigint           AS total_exec_time_ms,
+#       s.mean_exec_time::bigint            AS mean_exec_time_ms,
+#       s.rows::bigint                      AS rows,
+#       (s.shared_blks_read
+#        + s.local_blks_read)::bigint       AS blks_read,
+#       (s.shared_blks_dirtied
+#        + s.local_blks_dirtied)::bigint    AS blks_dirtied,
+#       s.wal_bytes::bigint                 AS wal_bytes
+#     FROM pg_stat_statements s
+#     JOIN pg_database d ON d.oid = s.dbid
+#     WHERE d.datname = 'hopper'
+#       AND s.calls > 0
+#     ORDER BY s.total_exec_time DESC
+#     LIMIT 20
+#   master: true
+#   metrics:
+#     - queryid:            { usage: "LABEL",   description: "pg_stat_statements queryid; resolve to text ad hoc" }
+#     - calls:              { usage: "COUNTER", description: "Times this statement was executed" }
+#     - total_exec_time_ms: { usage: "COUNTER", description: "Total execution time. THE ranking column — this is where the database's time goes" }
+#     - mean_exec_time_ms:  { usage: "GAUGE",   description: "Mean execution time per call" }
+#     - rows:               { usage: "COUNTER", description: "Rows returned or affected" }
+#     - blks_read:          { usage: "COUNTER", description: "Blocks read from disk (cache misses)" }
+#     - blks_dirtied:       { usage: "COUNTER", description: "Blocks dirtied — the write-amplification signal per statement" }
+#     - wal_bytes:          { usage: "COUNTER", description: "WAL generated by this statement" }

@@ -1,31 +1,10 @@
 package hopper
 
 import (
-	"os"
-	"regexp"
 	"sort"
 	"strings"
 	"testing"
 )
-
-// replicaPublishedTables are the tables in the 'hopper_replica' publication.
-// An index on any other table never costs a subscriber anything — apply only
-// maintains indexes on tables it actually receives rows for — so the replica
-// index policy deliberately says nothing about them.
-//
-// Keep in sync with the publication (scripts/replica/setup.sh); a table added
-// there needs its indexes classified here too.
-var replicaPublishedTables = map[string]bool{
-	"samples":          true,
-	"sample_locations": true,
-	"reports":          true,
-	"sightings":        true,
-}
-
-// createIndexRE matches the CREATE INDEX forms hopper's migration list uses,
-// capturing the index name and the table it targets.
-var createIndexRE = regexp.MustCompile(
-	`(?is)CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?([a-z0-9_]+)\s+ON\s+(?:public\.)?([a-z0-9_]+)`)
 
 // TestReplicaIndexPolicyIsComplete fails when hopper gains an index on a
 // published table that scripts/replica/slim-indexes.sh does not classify.
@@ -46,7 +25,7 @@ var createIndexRE = regexp.MustCompile(
 //
 // This is the same guard shape as TestCleaveTriggerKnowsAllTraitKeys.
 func TestReplicaIndexPolicyIsComplete(t *testing.T) {
-	keep, drop := parseReplicaIndexPolicy(t)
+	keep, drop, published := mustReplicaPolicy(t)
 
 	stmts := append(pgRuntimeMigrations(), trgmIndexDDL)
 	seen := map[string]bool{}
@@ -55,7 +34,7 @@ func TestReplicaIndexPolicyIsComplete(t *testing.T) {
 	for _, stmt := range stmts {
 		for _, m := range createIndexRE.FindAllStringSubmatch(stmt, -1) {
 			name, table := m[1], m[2]
-			if !replicaPublishedTables[table] || seen[name] {
+			if !published[table] || seen[name] {
 				continue
 			}
 			seen[name] = true
@@ -99,39 +78,136 @@ func TestReplicaIndexPolicyIsComplete(t *testing.T) {
 	}
 }
 
-// parseReplicaIndexPolicy reads the two shell lists out of slim-indexes.sh.
-// Parsing the script rather than duplicating the names in Go keeps one source
-// of truth: the file the operator actually edits is the file under test.
-func parseReplicaIndexPolicy(t *testing.T) (keep, drop map[string]bool) {
-	t.Helper()
-	const path = "scripts/replica/slim-indexes.sh"
-	src, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
+// TestReplicaIndexPolicyMatchesSlimIndexes is the behavioural half of the guard
+// above. The completeness test proves every index is *classified*; this proves
+// migrateServingPG's replica mode actually acts on that classification, so a
+// replica declines exactly the set slim-indexes.sh would have dropped. If these
+// two ever disagree, `make replica` is back to building indexes only to drop
+// them — the round trip that filled galadriel's disk on 2026-08-21.
+func TestReplicaIndexPolicyMatchesSlimIndexes(t *testing.T) {
+	keep, drop, published := mustReplicaPolicy(t)
+
+	checked := map[string]bool{}
+	for _, stmt := range append(pgRuntimeMigrations(), trgmIndexDDL) {
+		m := createIndexRE.FindStringSubmatch(strings.TrimSpace(stmt))
+		if m == nil {
+			continue
+		}
+		name, table := m[1], m[2]
+		if !published[table] || checked[name] {
+			continue
+		}
+		checked[name] = true
+
+		skip, err := replicaSkipsIndexDDL(stmt)
+		if err != nil {
+			t.Fatalf("replicaSkipsIndexDDL(%q): %v", name, err)
+		}
+		switch {
+		case keep[name] && skip:
+			t.Errorf("index %q is in REPLICA_KEEP_INDEXES but replica mode declines to build it — "+
+				"prism would read the replica without it", name)
+		case drop[name] && !skip:
+			t.Errorf("index %q is in REPLICA_DROP_INDEXES but replica mode still builds it — "+
+				"slim-indexes.sh will drop it right after, which is the round trip this policy exists to avoid", name)
+		}
 	}
-	keep = parseShellIndexList(t, string(src), "REPLICA_KEEP_INDEXES")
-	drop = parseShellIndexList(t, string(src), "REPLICA_DROP_INDEXES")
-	return keep, drop
+	if len(checked) == 0 {
+		t.Fatal("checked no indexes — the migration list or regex changed shape")
+	}
 }
 
-// parseShellIndexList extracts NAME='\n a \n b \n' single-quoted list bodies.
-func parseShellIndexList(t *testing.T, src, name string) map[string]bool {
+func TestReplicaSkipsIndexDDL(t *testing.T) {
+	tests := []struct {
+		name string
+		ddl  string
+		want bool
+		why  string
+	}{{
+		name: "published table, not in keep list",
+		ddl:  `CREATE INDEX IF NOT EXISTS idx_sl_standalone ON sample_locations(id) INCLUDE (sha256) WHERE parent_sha256 = ''`,
+		want: true,
+		why:  "master-only repair index; slim-indexes.sh drops it on the replica",
+	}, {
+		name: "published table, in keep list",
+		ddl:  `CREATE INDEX IF NOT EXISTS idx_samples_purl_lookup ON samples(purl_base)`,
+		want: false,
+		why:  "prism's feed lookup reads this on the replica",
+	}, {
+		name: "unpublished table is none of the policy's business",
+		ddl:  `CREATE INDEX IF NOT EXISTS idx_workers_seen ON workers(last_seen)`,
+		want: false,
+		why:  "apply never touches an unreplicated table, so its indexes cost the replica nothing",
+	}, {
+		name: "DROP INDEX is never declined",
+		ddl:  `DROP INDEX IF EXISTS idx_samples_status`,
+		want: false,
+		why:  "a migration that retires an index must retire it on the replica too",
+	}, {
+		name: "non-index DDL is never declined",
+		ddl:  `ALTER TABLE samples ADD COLUMN IF NOT EXISTS parent TEXT NOT NULL DEFAULT ''`,
+		want: false,
+	}, {
+		name: "unique index is never declined",
+		ddl:  `CREATE UNIQUE INDEX IF NOT EXISTS idx_samples_made_up ON samples(sha256)`,
+		want: false,
+		why:  "uniqueness is a correctness guarantee, not a lookup path",
+	}, {
+		name: "schema-qualified table still resolves",
+		ddl:  `CREATE INDEX IF NOT EXISTS idx_samples_score ON public.samples(score) WHERE score != 0`,
+		want: true,
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := replicaSkipsIndexDDL(tt.ddl)
+			if err != nil {
+				t.Fatalf("replicaSkipsIndexDDL: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("replicaSkipsIndexDDL = %v, want %v (%s)", got, tt.want, tt.why)
+			}
+		})
+	}
+}
+
+// TestReplicaIndexPolicyOffByDefault pins the default: a DB that was never told
+// it is a replica builds everything. Getting this backwards would quietly strip
+// the master's write-path indexes on the next `hopper init`.
+func TestReplicaIndexPolicyOffByDefault(t *testing.T) {
+	db := &DB{}
+	skip, err := db.skipReplicaIndex(
+		`CREATE INDEX IF NOT EXISTS idx_sl_standalone ON sample_locations(id) WHERE parent_sha256 = ''`)
+	if err != nil {
+		t.Fatalf("skipReplicaIndex: %v", err)
+	}
+	if skip {
+		t.Fatal("a DB with no replica policy set declined an index; the master would lose it")
+	}
+
+	db.SetReplicaIndexPolicy(true)
+	skip, err = db.skipReplicaIndex(
+		`CREATE INDEX IF NOT EXISTS idx_sl_standalone ON sample_locations(id) WHERE parent_sha256 = ''`)
+	if err != nil {
+		t.Fatalf("skipReplicaIndex: %v", err)
+	}
+	if !skip {
+		t.Fatal("replica policy is on but the index was still built")
+	}
+}
+
+// mustReplicaPolicy loads the three embedded lists or fails the test.
+func mustReplicaPolicy(t *testing.T) (keep, drop, published map[string]bool) {
 	t.Helper()
-	open := name + "='"
-	_, rest, found := strings.Cut(src, open)
-	if !found {
-		t.Fatalf("%s not found in slim-indexes.sh", name)
+	var err error
+	if keep, err = replicaKeepIndexes(); err != nil {
+		t.Fatalf("REPLICA_KEEP_INDEXES: %v", err)
 	}
-	body, _, found := strings.Cut(rest, "'")
-	if !found {
-		t.Fatalf("%s is not closed by a single quote", name)
+	if drop, err = replicaDropIndexes(); err != nil {
+		t.Fatalf("REPLICA_DROP_INDEXES: %v", err)
 	}
-	out := map[string]bool{}
-	for line := range strings.FieldsSeq(body) {
-		out[line] = true
+	if published, err = replicaPublishedTables(); err != nil {
+		t.Fatalf("REPLICATED_TABLES: %v", err)
 	}
-	if len(out) == 0 {
-		t.Fatalf("%s parsed as empty", name)
-	}
-	return out
+	return keep, drop, published
 }
