@@ -14,9 +14,10 @@ DB="${DB:-postgres://hopper@hopper-db/hopper?sslmode=disable}"
 SOURCE="${SOURCE:-harvest}"
 API_ADDR="${API_ADDR:-0.0.0.0:8081}"
 # The dashboard has no authentication of its own — a browser cannot present a
-# bearer token — so it gets its own loopback listener and is never the tunnel
-# origin. Reach it over an SSH forward.
-DASH_ADDR="${DASH_ADDR:-127.0.0.1:8082}"
+# bearer token — so it gets its own listener and is never the tunnel origin.
+# It is read-only; keep it on a trusted network, or set DASH_ADDR=127.0.0.1:8082
+# to restrict it to an SSH forward.
+DASH_ADDR="${DASH_ADDR:-0.0.0.0:8082}"
 TOKEN_SRC="${TOKEN_SRC-${HOME}/.tok/hopper}"
 WORKERS="${WORKERS:-96}"
 MAX_MEMORY_GB="${MAX_MEMORY_GB:-0}"

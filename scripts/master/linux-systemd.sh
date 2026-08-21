@@ -19,9 +19,10 @@
 #                                    (default: 0.0.0.0:8081)
 #   DASH_ADDR --dashboard-addr      HTML dashboard listen address. A browser
 #                 cannot present a bearer token, so this listener has no
-#                 authentication and stays on loopback: reach it over an SSH
-#                 forward, never through the tunnel.
-#                                    (default: 127.0.0.1:8082)
+#                 authentication of its own: it is read-only, but keep it on a
+#                 trusted network and never route the tunnel to it. Set
+#                 127.0.0.1:8082 to restrict it to an SSH forward.
+#                                    (default: 0.0.0.0:8082)
 #   TOKEN_SRC token file installed for the API (empty disables authentication)
 #                 Generated on first deploy if absent. Clients — the local
 #                 atomscan worker included — read the same path.
@@ -61,7 +62,7 @@ SAMPLES_GROUP="${SAMPLES_GROUP:-samples}"
 DB="${DB:-postgres://hopper@hopper-db/hopper?sslmode=disable}"
 SOURCE="${SOURCE:-forager}"
 API_ADDR="${API_ADDR:-0.0.0.0:8081}"
-DASH_ADDR="${DASH_ADDR:-127.0.0.1:8082}"
+DASH_ADDR="${DASH_ADDR:-0.0.0.0:8082}"
 # `TOKEN_SRC-` (no colon) keeps an explicit empty, so an operator can
 # deliberately deploy an unauthenticated API on a host they trust.
 TOKEN_SRC="${TOKEN_SRC-${HOME}/.tok/hopper}"

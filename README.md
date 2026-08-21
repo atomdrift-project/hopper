@@ -76,9 +76,11 @@ Then initialize SQLite and ingest it:
 
 `load` remains running: it watches the corpus, runs the local worker, and
 serves two listeners — the work API (`--api-addr`) and the HTML dashboard
-(`--dashboard-addr`, loopback by default). They are separate so each carries one
-access policy: the API requires a bearer token, the dashboard has none and is
-not meant to leave the host. `--local` binds both to loopback.
+(`--dashboard-addr`, every interface by default). They are separate so each
+carries one access policy: the API requires a bearer token, the dashboard has
+none — it is read-only, so keep it on a trusted network and never route the
+tunnel to it. `--local`, or `--dashboard-addr 127.0.0.1:8082`, binds it back to
+loopback for an SSH forward.
 
 To run a disposable local PostgreSQL instance instead, install PostgreSQL's
 `initdb`, `postgres`, `createdb`, and `pg_isready` tools, then run:
@@ -100,7 +102,7 @@ development. Do not expose that database to a network.
   --data /srv/samples \
   --api-addr 0.0.0.0:8081 \
   --token-file ~/.tok/hopper \
-  --dashboard-addr 127.0.0.1:8082
+  --dashboard-addr 0.0.0.0:8082
 ```
 
 `--token-file` requires `Authorization: Bearer <token>` on every API route

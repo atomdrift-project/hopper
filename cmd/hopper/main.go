@@ -848,8 +848,10 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// Two listeners, so each one carries a single access policy end to end and
 	// a route added later cannot inherit the wrong one. The API is the tunnel
 	// origin and requires a bearer token; the HTML dashboard has no token to
-	// present from a browser, so it stays on loopback and is reached over an
-	// SSH forward.
+	// present from a browser, so it is never the tunnel origin — but it is
+	// read-only and useless bound to loopback on a headless master, so it
+	// binds every interface and relies on the network around it. Pass
+	// --dashboard-addr 127.0.0.1:8082 (or --local) to put it back on loopback.
 	// Loopback by default: this listener serves /api/upload, /api/file and
 	// /data, and is unauthenticated unless --token-file is passed, so an
 	// ad-hoc `hopper load` must not put it on every interface by accident. A
@@ -857,7 +859,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// scripts pass --api-addr 0.0.0.0:8081 — and a tunnel origin terminates on
 	// loopback anyway.
 	apiAddr := f.String("api-addr", "127.0.0.1:8081", "work API listen address; pass 0.0.0.0:8081 to serve remote workers (empty to disable)")
-	dashAddr := f.String("dashboard-addr", "127.0.0.1:8082", "web dashboard listen address (empty to disable)")
+	dashAddr := f.String("dashboard-addr", "0.0.0.0:8082", "web dashboard listen address; it has no authentication, so pass 127.0.0.1:8082 to keep it on loopback (empty to disable)")
 	tokenFile := f.String("token-file", "", "file holding the bearer token the API requires; empty serves the API unauthenticated")
 	pprofAddr := f.String("pprof-addr", "127.0.0.1:6060", "net/http/pprof listen address; loopback-only by default (empty to disable)")
 	localOnly := f.Bool("local", false, "listen only on loopback for dashboard and worker API")
@@ -979,7 +981,8 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	}
 
 	// The dashboard listener: no token — a browser cannot present one — so it
-	// is loopback by default and is never the tunnel origin.
+	// is never the tunnel origin, and a non-loopback bind is warned about
+	// below.
 	var wd *webDashboard
 	if *dashAddr != "" {
 		wd = &webDashboard{}
@@ -1383,7 +1386,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	if *dashAddr != "" && !isLoopbackAddr(*dashAddr) {
 		slog.Warn("dashboard bound to non-loopback; it has no authentication of its own",
 			"addr", *dashAddr,
-			"recommendation", "leave it on loopback and reach it over an SSH forward, or put an authenticating proxy in front")
+			"recommendation", "keep it on a trusted network, or pass --dashboard-addr 127.0.0.1:8082 and reach it over an SSH forward, or put an authenticating proxy in front")
 	}
 
 	slog.Info("load prep complete",
