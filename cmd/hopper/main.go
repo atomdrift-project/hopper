@@ -874,6 +874,14 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	reportsDir := f.String("reports-dir", "", "cyclotron reports directory to ingest (<sha>.md, optional)")
 	var forceRescanDirs stringListFlag
 	f.Var(&forceRescanDirs, "force-rescan", "directory prefix to force re-analysis for; may be repeated or comma-separated")
+	// Maintenance lever, born 2026-08-21: the startup walk's staging upserts and
+	// a background CREATE INDEX CONCURRENTLY contend for the same saturated
+	// samples/sample_locations I/O, and the only way to keep hopper serving
+	// (its migration goroutine IS the index build) while shedding the walk load
+	// was to not have a switch. Now there is one.
+	pauseWalk := f.Bool("pause-walk", false,
+		"serve workers, results, and migrations but run no corpus walks (initial, ingest, or reconcile); "+
+			"for maintenance windows — new files on disk are not ingested while set")
 	parseFlags(f, os.Args[2:])
 	explicitLitmusBin := flagWasSet(f, "litmus")
 	explicitCleaveBin := flagWasSet(f, "cleave")
@@ -1164,9 +1172,13 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 
 	// Start file enumeration early — cleave iter-files doesn't need the
 	// hash cache or database, so overlap it with those slower init steps.
+	// Not under --pause-walk: loadAll will never consume these, and while a
+	// parked producer is harmless, enumerating a corpus nobody reads isn't.
 	fileChs := make([]enumerationStream, len(loadDirs))
-	for i, d := range loadDirs {
-		fileChs[i] = startEnumeration(ctx, d.dir, time.Time{}) // full enumeration on startup
+	if !*pauseWalk {
+		for i, d := range loadDirs {
+			fileChs[i] = startEnumeration(ctx, d.dir, time.Time{}) // full enumeration on startup
+		}
 	}
 
 	type cacheResult struct {
@@ -1435,7 +1447,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		"next", "load samples")
 
 	total := loadAll(loadCtx, loadCancel, db, litmus, tracker, api, cache,
-		loadDirs, fileChs, *source, *hashWorkers, *rescan, *maxAnalyzed, *experimentTag, wd, traitsVersion, *rescanAge)
+		loadDirs, fileChs, *source, *hashWorkers, *rescan, *maxAnalyzed, *experimentTag, wd, traitsVersion, *rescanAge, *pauseWalk)
 	if *reportsDir != "" {
 		wd.beginStage("reports.ingest", "Ingesting reports")
 		stats, err := db.IngestReportsDir(ctx, *reportsDir, "re", "cyclotron")
@@ -1735,8 +1747,9 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	wd *webDashboard,
 	traitsVersion string,
 	rescanAge time.Duration,
+	pauseWalk bool,
 ) int {
-	slog.Info("loading", "dirs", len(dirs))
+	slog.Info("loading", "dirs", len(dirs), "pause_walk", pauseWalk)
 	start := time.Now()
 
 	// markMissing is false when the data root deliberately holds only part of the
@@ -1813,15 +1826,26 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	// longer strand startup the way an unbounded pass once did — yet it still
 	// runs on every restart, which matters on a host that recycles more often
 	// than reconcileWalkInterval (otherwise reconcile would rarely run at all).
+	//
+	// --pause-walk suppresses this pass and the periodic ones below, and must
+	// also mark the walk done: the dashboard and the drain logic read walkDone,
+	// and a walk that never starts would otherwise read as one that never
+	// finishes. The pre-started enumeration channels are left to drain
+	// unconsumed; their goroutines exit with ctx.
 	initialStart := time.Now()
-	pass.run(ctx, fileChs, time.Time{}, true)
+	if pauseWalk {
+		slog.Warn("corpus walks paused by --pause-walk; new files will not be ingested until restarted without it")
+		progress.walkDone.Store(true)
+	} else {
+		pass.run(ctx, fileChs, time.Time{}, true)
+	}
 
 	// Periodic passes pick up files forager's direct-insert missed while workers
 	// analyze. Ingest walks are incremental (only files modified since the
 	// previous walk began) and skip reconcile, so they stay cheap; a slower full
 	// pass also reconciles pools. Both fire from one goroutine via select, so a
 	// reconcile and an ingest pass never overlap or contend on walk_staging.
-	if litmus != nil {
+	if litmus != nil && !pauseWalk {
 		go func() {
 			lastStart := initialStart
 			ingest := time.NewTicker(ingestWalkInterval)
