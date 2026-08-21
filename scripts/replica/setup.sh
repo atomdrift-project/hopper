@@ -784,7 +784,7 @@ if [ -n "${SETUP_FAILED:-}" ]; then
 fi
 
 log "Done. Re-run anytime — this script is idempotent and resumes interrupted copies."
-# psql's built-in \watch works on FreeBSD and Linux alike; GNU watch(1) does
-# not exist on FreeBSD (watch(8) there is an unrelated tty-snooping tool).
-log "Live monitor: psql -h localhost -U $LOCAL_USER -d $LOCAL_DB -c 'SELECT * FROM pg_stat_subscription \watch 2'"
+# GNU watch(1) does not exist on FreeBSD (watch(8) there is an unrelated
+# tty-snooping tool); replica-watch.sh loops in portable sh instead.
+log "Live monitor: make replica-watch"
 log "Full status:  make diagnose-replica REMOTE_HOST=$REMOTE_HOST SUBSCRIPTION=$SUBSCRIPTION"

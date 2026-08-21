@@ -1,4 +1,4 @@
-.PHONY: build test clean deploy deploy-linux deploy-freebsd rollout-replica-bastille replica rebuild-replica diagnose-replica promote-replica install-precommit help
+.PHONY: build test clean deploy deploy-linux deploy-freebsd rollout-replica-bastille replica rebuild-replica diagnose-replica replica-watch promote-replica install-precommit help
 
 DATA_DIR  ?= /data/samples
 DB        ?= postgres://hopper@hopper-db/hopper?sslmode=disable
@@ -61,6 +61,8 @@ help:
 	@echo "                              apply conflict) and rebuild from scratch —"
 	@echo "                              TRUNCATEs + full re-copy (FORCE=true)"
 	@echo "  make diagnose-replica       Dump replication status from both sides (read-only)"
+	@echo "  make replica-watch          Live per-table replica health + completion ETA"
+	@echo "                              (INTERVAL=60 ETA_WINDOW=900 ONCE=true SUBSCRIPTION=...)"
 	@echo "  make promote-replica        Turn the local replica into a standalone primary"
 	@echo "                              (writes must already be stopped; idempotent)"
 
@@ -105,6 +107,9 @@ rebuild-replica: build
 
 diagnose-replica:
 	@./scripts/replica/diagnose.sh
+
+replica-watch:
+	@exec ./scripts/replica/watch.sh
 
 promote-replica:
 	@./scripts/replica/promote.sh

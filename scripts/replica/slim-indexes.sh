@@ -1,5 +1,5 @@
 #!/bin/sh
-# slim-indexes.sh — drop the master-only indexes on a disposable read replica.
+# slim-indexes.sh — keep a disposable read replica's index set minimal.
 #
 # 'hopper init' creates the full canonical index set, most of which exists for
 # the MASTER's write pipeline: worker-queue partial indexes (*_pending,
@@ -11,20 +11,42 @@
 # ~1 TB WAL backlog sat behind it. Dropping them cut the index working set
 # below ARC size and multiplied apply throughput.
 #
+# ALLOWLIST, not denylist (changed 2026-08-20). This script used to carry a
+# hand-maintained list of indexes to DROP, which meant every index added to
+# hopper landed on the replica by default and silently taxed apply until
+# someone noticed and extended the list. It drifted exactly that way: by
+# 2026-08-20 the master had 77 indexes across the published tables against a
+# 21-name drop list, and 16 never-scanned indexes (~19 GB) were queued to be
+# built here. The default is now inverted — the replica keeps ONLY what
+# REPLICA_KEEP_INDEXES names, and anything else on a subscribed table is
+# dropped. A new master-side index therefore costs the replica nothing until
+# someone deliberately opts it in.
+#
+# The two lists below are a partition of every index hopper creates on a
+# published table, and TestReplicaIndexPolicyIsComplete (replica_index_policy_test.go)
+# fails the build when an index belongs to neither. REPLICA_DROP_INDEXES does
+# not drive behaviour — anything absent from the keep list is dropped either
+# way — it exists so that "we looked at this and the replica does not need it"
+# is recorded rather than inferred from silence.
+#
 # Scope / safety:
 #   * DROP INDEX CONCURRENTLY — prism readers never block; the one
 #     constraint-backed entry uses a bounded-lock retry loop.
-#   * The PK / replica identity and every index prism's queries use are NOT in
-#     this list. Uniqueness lost with sample_locations_sha256_path_key is
-#     enforced by the master; apply replays its already-unique stream.
+#   * Never drops a PRIMARY KEY, the configured replica identity, or any
+#     constraint-backed index (those are handled via SLIM_CONSTRAINTS).
+#     Uniqueness lost with sample_locations_sha256_path_key is enforced by the
+#     master; apply replays its already-unique stream.
+#   * Only touches tables this replica actually subscribes to (pg_subscription_rel),
+#     so local-only tables keep their indexes.
 #   * Restore DDL is captured to $HEAL_STATE_DIR/slim-index-restore.sql before
 #     dropping. promote.sh replays it, because a replica promoted to PRIMARY
 #     needs the worker-queue indexes back.
-#   * Idempotent: IF EXISTS everywhere; re-running is a no-op.
+#   * Idempotent: re-running is a no-op once the replica is slim.
 #
-# Maintaining the list: when hopper gains a new master-side index, add it here
-# if prism doesn't read it. When in doubt, leave it in place and check
-# pg_stat_user_indexes.idx_scan on a warm replica.
+# Maintaining the lists: when hopper gains an index on a published table, the
+# guard test fails until you put its name in one of the two lists. Put it in
+# REPLICA_KEEP_INDEXES only if a prism read path needs it; when in doubt leave
+# it out and check pg_stat_user_indexes.idx_scan on a warm replica.
 #
 # Env: LOCAL_DB (=hopper), HEAL_STATE_DIR (=$HOME/.hopper-replica-heal),
 # SLIM_LOCK_TIMEOUT (=15s), REPLICA_SLIM_INDEXES (=true; 'false' skips).
@@ -55,43 +77,120 @@ else
     exit 0
 fi
 
-# Master-only indexes: worker queues, ingest lookups, and covering variants
-# prism never scans. One name per line. sample_locations_sha256_path_key is a
-# UNIQUE constraint and is handled separately below.
-SLIM_INDEXES='
-idx_sl_sha256_parents
-idx_sl_parent_child
-idx_sl_last_seen
-idx_sl_source
-idx_samples_path
-idx_samples_seed_pool
-idx_samples_backfill_pending
-idx_samples_toptraits_pending
-idx_samples_litmus_done
-idx_samples_feed_source
-idx_samples_feed_source_created
-idx_samples_parent
-idx_samples_analyzed_at
-idx_samples_feed_source_mtime
-idx_samples_updated_at
-idx_samples_label
-idx_samples_review
-idx_samples_score
-idx_samples_source_feed
-idx_samples_feed
-idx_samples_stale_traits_pri
+# --- The policy -------------------------------------------------------------
+# Indexes a prism read path needs on the replica. One name per line.
+# Everything else on a subscribed table is dropped.
+REPLICA_KEEP_INDEXES='
+idx_samples_bad_miss_newest
+idx_samples_bad_miss_stale
+idx_samples_good_repair_newest
+idx_samples_good_repair_stale
+idx_samples_new_interesting
+idx_samples_new_stale
+idx_samples_sighted_newest
+idx_samples_unknown_newest
+idx_sightings_subject
 '
+
+# Master-only: worker queues, ingest lookups, and covering variants prism never
+# scans. Listed for the completeness guard only — see the header. If prism
+# starts needing one, MOVE it to REPLICA_KEEP_INDEXES rather than deleting it
+# from here, so the guard keeps passing.
+REPLICA_DROP_INDEXES='
+idx_reports_created_at
+idx_reports_sha256_type_created
+idx_samples_analyzed_at
+idx_samples_bad_clean_score
+idx_samples_bad_route_score
+idx_samples_claimable
+idx_samples_claimable_sha
+idx_samples_claimed
+idx_samples_corroborated_created
+idx_samples_created_at
+idx_samples_domain
+idx_samples_eco_class_created
+idx_samples_eco_top_created
+idx_samples_ecosystem
+idx_samples_feed
+idx_samples_feed_source
+idx_samples_feed_source_mtime
+idx_samples_feed_top_created_done
+idx_samples_file_type
+idx_samples_filename_trgm
+idx_samples_formula
+idx_samples_good_hostile_score
+idx_samples_good_route_score
+idx_samples_litmus_done
+idx_samples_misclassified_review
+idx_samples_mtime
+idx_samples_package_version
+idx_samples_parent
+idx_samples_pending_cleave_group
+idx_samples_pending_litmus_group
+idx_samples_purl_base
+idx_samples_reconcile_toplevel
+idx_samples_rescan_queue
+idx_samples_review_interesting
+idx_samples_review_newest
+idx_samples_score
+idx_samples_source_ecosystem
+idx_samples_source_feed
+idx_samples_stale_traits
+idx_samples_stale_traits_pri
+idx_samples_stranded_member
+idx_samples_top_created
+idx_samples_top_ready_created
+idx_samples_top_ready_first_analyzed_coalesce
+idx_samples_unanalyzed_id
+idx_samples_updated_at
+idx_sl_containment
+idx_sl_incoming_mtime
+idx_sl_parent
+idx_sl_parent_child
+idx_sl_reference
+idx_sl_sha256
+idx_sl_sha256_parents
+'
+
 SLIM_CONSTRAINTS='sample_locations|sample_locations_sha256_path_key'
 
-# Capture restore DDL for everything that still exists, BEFORE dropping, so
+keep_csv=$(printf '%s\n' "$REPLICA_KEEP_INDEXES" | grep -v '^$' | sed "s/^/'/; s/\$/'/" | paste -sd, -)
+[ -n "$keep_csv" ] || keep_csv="''"
+
+# --- What to drop -----------------------------------------------------------
+# Resolved from the live catalog, not a name list: every non-PK, non-identity,
+# non-constraint-backed index on a table this replica subscribes to that the
+# keep list does not name. A master-side index added after this script was last
+# edited is therefore dropped by default rather than silently retained.
+droppable_sql="
+SELECT c.relname
+  FROM pg_index i
+  JOIN pg_class c ON c.oid = i.indexrelid
+  JOIN pg_class t ON t.oid = i.indrelid
+  JOIN pg_namespace n ON n.oid = t.relnamespace
+ WHERE n.nspname = 'public'
+   AND i.indrelid IN (SELECT srrelid FROM pg_subscription_rel)
+   AND NOT i.indisprimary
+   AND NOT i.indisreplident
+   AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conindid = i.indexrelid)
+   AND c.relname NOT IN ($keep_csv)
+ ORDER BY pg_relation_size(i.indexrelid) DESC"
+
+targets=$(admin -d "$LOCAL_DB" -tA -c "$droppable_sql" | grep -v '^$' || true)
+
+# Capture restore DDL for everything we are about to drop, BEFORE dropping, so
 # promote.sh can rebuild a promoted primary's full index set.
 mkdir -p "$HEAL_STATE_DIR" 2>/dev/null || true
 restore="$HEAL_STATE_DIR/slim-index-restore.sql"
-names_csv=$(printf '%s\n' "$SLIM_INDEXES" | grep -v '^$' | sed "s/^/'/; s/\$/'/" | paste -sd, -)
-admin -d "$LOCAL_DB" -tA >>"$restore" <<SQL || warn "could not capture restore DDL (continuing)"
+if [ -n "$targets" ]; then
+    names_csv=$(printf '%s\n' "$targets" | sed "s/^/'/; s/\$/'/" | paste -sd, -)
+    admin -d "$LOCAL_DB" -tA >>"$restore" <<SQL || warn "could not capture restore DDL (continuing)"
 SELECT pg_get_indexdef(i.indexrelid) || ';'
   FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
  WHERE c.relname IN ($names_csv);
+SQL
+fi
+admin -d "$LOCAL_DB" -tA >>"$restore" <<'SQL' || warn "could not capture constraint restore DDL (continuing)"
 SELECT format('ALTER TABLE public.%I ADD CONSTRAINT %I %s;',
               t.relname, con.conname, pg_get_constraintdef(con.oid))
   FROM pg_constraint con JOIN pg_class t ON t.oid = con.conrelid
@@ -99,15 +198,12 @@ SELECT format('ALTER TABLE public.%I ADD CONSTRAINT %I %s;',
 SQL
 
 dropped=0
-for idx in $SLIM_INDEXES; do
+for idx in $targets; do
     [ -n "$idx" ] || continue
-    if admin -d "$LOCAL_DB" -tAc \
-        "SELECT 1 FROM pg_class WHERE relname='$idx' AND relkind='i'" | grep -q 1; then
-        log "dropping $idx"
-        admin -d "$LOCAL_DB" -c "DROP INDEX CONCURRENTLY IF EXISTS public.\"$idx\";" \
-            || warn "drop of $idx failed (continuing)"
-        dropped=$((dropped+1))
-    fi
+    log "dropping $idx"
+    admin -d "$LOCAL_DB" -c "DROP INDEX CONCURRENTLY IF EXISTS public.\"$idx\";" \
+        || warn "drop of $idx failed (continuing)"
+    dropped=$((dropped+1))
 done
 
 oldIFS=$IFS; IFS='

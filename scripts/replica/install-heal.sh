@@ -11,8 +11,15 @@
 # warns and prints manual steps but never aborts replica setup — the healer
 # script still exists and can be scheduled by hand.
 #
+# Alongside the healer it schedules replica-textfile.sh, which publishes
+# subscriber-side health as Prometheus textfile metrics. That runs on its OWN
+# timer, not as a second ExecStart of the healer: the healer exits non-zero
+# whenever it alerts, and metrics must keep flowing exactly then.
+#
 # Env: REMOTE_HOST, REMOTE_USER, REMOTE_DB, LOCAL_DB, PUBLICATION, SUBSCRIPTION,
-# PGPASSFILE, HEAL_ALERT_CMD (baked into the schedule), HEAL_INTERVAL_MIN (=5).
+# PGPASSFILE, HEAL_ALERT_CMD (baked into the schedule), HEAL_INTERVAL_MIN (=5),
+# TEXTFILE_INTERVAL_MIN (=1), HOST_MON_TEXTFILE_DIR (=/var/lib/host-mon/textfile),
+# REPLICA_TEXTFILE (=true; 'false' skips the metrics timer).
 
 set -eu
 
@@ -20,6 +27,12 @@ SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 HEAL="$SCRIPT_DIR/replica-heal.sh"
 [ -f "$HEAL" ] || { echo "install-heal: $HEAL not found" >&2; exit 1; }
 chmod +x "$HEAL" 2>/dev/null || true
+
+TEXTFILE_SRC="$SCRIPT_DIR/replica-textfile.sh"
+SLIM_SRC="$SCRIPT_DIR/slim-indexes.sh"
+TEXTFILE_DIR="${HOST_MON_TEXTFILE_DIR:-/var/lib/host-mon/textfile}"
+TEXTFILE_INTERVAL_MIN="${TEXTFILE_INTERVAL_MIN:-1}"
+case "$TEXTFILE_INTERVAL_MIN" in *[!0-9]*|'') echo "install-heal: TEXTFILE_INTERVAL_MIN must be an integer" >&2; exit 1 ;; esac
 
 INTERVAL_MIN="${HEAL_INTERVAL_MIN:-5}"
 case "$INTERVAL_MIN" in *[!0-9]*|'') echo "install-heal: HEAL_INTERVAL_MIN must be an integer" >&2; exit 1 ;; esac
@@ -34,6 +47,17 @@ heal_env() {
         eval "val=\${$v:-}"
         [ -n "${val:-}" ] && printf '%s=%s\n' "$v" "$val"
     done
+}
+
+# The emitter needs the publisher coordinates (for lag) and the textfile dir.
+# It reads the keep list from slim-indexes.sh next to itself, so both are
+# installed to the same directory below.
+textfile_env() {
+    for v in REMOTE_HOST REMOTE_USER REMOTE_DB LOCAL_DB SUBSCRIPTION PGPASSFILE; do
+        eval "val=\${$v:-}"
+        [ -n "${val:-}" ] && printf '%s=%s\n' "$v" "$val"
+    done
+    printf 'HOST_MON_TEXTFILE_DIR=%s\n' "$TEXTFILE_DIR"
 }
 
 as_root() {
@@ -108,6 +132,57 @@ EOF
     log "installed systemd timer (every ${INTERVAL_MIN}min): hopper-replica-heal.timer"
     log "  status:  systemctl status hopper-replica-heal.timer"
     log "  run now: systemctl start hopper-replica-heal.service && journalctl -u hopper-replica-heal -n 50"
+
+    install_systemd_textfile || warn "metrics timer not installed (healer is still scheduled)"
+}
+
+# Separate unit from the healer on purpose: the healer exits 1 whenever it
+# alerts, and a second ExecStart in the same oneshot would be skipped exactly
+# when the replica is unhealthy — i.e. when the metrics matter most.
+install_systemd_textfile() {
+    [ "${REPLICA_TEXTFILE:-true}" = true ] || { log "REPLICA_TEXTFILE=false — skipping metrics timer"; return 0; }
+    [ -f "$TEXTFILE_EXEC" ] || { warn "replica-textfile.sh not installed — skipping metrics timer"; return 1; }
+
+    unit_dir=/etc/systemd/system
+    tf_svc="$unit_dir/hopper-replica-textfile.service"
+    tf_tmr="$unit_dir/hopper-replica-textfile.timer"
+    tf_envlines=$(textfile_env | sed 's/^/Environment=/')
+
+    as_root install -d -o postgres -g postgres -m 0755 "$TEXTFILE_DIR" 2>/dev/null \
+        || warn "could not create $TEXTFILE_DIR as postgres — the emitter will try at run time"
+
+    tf_svc_body=$(cat <<EOF
+[Unit]
+Description=hopper logical-replica health metrics (Prometheus textfile)
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=postgres
+ExecStart=$TEXTFILE_EXEC
+$tf_envlines
+EOF
+)
+    tf_tmr_body=$(cat <<EOF
+[Unit]
+Description=emit hopper replica health metrics every ${TEXTFILE_INTERVAL_MIN}min
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=${TEXTFILE_INTERVAL_MIN}min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+)
+    printf '%s\n' "$tf_svc_body" | as_root tee "$tf_svc" >/dev/null || return 1
+    printf '%s\n' "$tf_tmr_body" | as_root tee "$tf_tmr" >/dev/null || return 1
+    as_root systemctl daemon-reload || return 1
+    as_root systemctl enable --now hopper-replica-textfile.timer || return 1
+    log "installed metrics timer (every ${TEXTFILE_INTERVAL_MIN}min) -> $TEXTFILE_DIR/hopper-replica.prom"
+    log "  NOTE: Alloy must have the textfile collector enabled for this directory."
+    log "        host-mon/alloy/linux.alloy needs \"textfile\" in set_collectors + a textfile block."
 }
 
 # --- cron path (postgres crontab) ------------------------------------------
@@ -140,8 +215,20 @@ install_cron() {
     ( [ "$(id -un 2>/dev/null)" = postgres ] && mkdir -p "$logdir" ) 2>/dev/null \
         || as_root install -d -o postgres -g postgres "$logdir" 2>/dev/null || true
 
-    { get_crontab | grep -v 'replica-heal.sh' || true; printf '%s\n' "$line"; } | set_crontab || return 1
+    tf_line=""
+    if [ "${REPLICA_TEXTFILE:-true}" = true ] && [ -f "$TEXTFILE_EXEC" ]; then
+        tf_envstr=$(textfile_env | tr '\n' ' ')
+        tf_line="*/$TEXTFILE_INTERVAL_MIN * * * * ${tf_envstr}$TEXTFILE_EXEC >/dev/null 2>&1"
+        mkdir -p "$TEXTFILE_DIR" 2>/dev/null \
+            || as_root install -d -o postgres -g postgres "$TEXTFILE_DIR" 2>/dev/null || true
+    fi
+
+    { get_crontab | grep -v -e 'replica-heal.sh' -e 'replica-textfile.sh' || true
+      printf '%s\n' "$line"
+      [ -n "$tf_line" ] && printf '%s\n' "$tf_line"
+    } | set_crontab || return 1
     log "installed postgres crontab entry (every ${INTERVAL_MIN}min)"
+    [ -n "$tf_line" ] && log "installed metrics crontab entry (every ${TEXTFILE_INTERVAL_MIN}min) -> $TEXTFILE_DIR/hopper-replica.prom"
     log "  view:    crontab -u postgres -l   (or as postgres: crontab -l)"
     log "  logfile: $logfile"
 }
@@ -158,6 +245,27 @@ if [ "$HEAL" != "$INSTALL_PATH" ]; then
     else
         warn "could not copy healer to $INSTALL_PATH; using in-place $HEAL (postgres must be able to read it)"
     fi
+fi
+
+# The emitter and the slim-indexes policy travel with the healer: the emitter
+# reads REPLICA_KEEP_INDEXES from slim-indexes.sh sitting next to it, so both
+# must land in the same postgres-readable directory.
+TEXTFILE_EXEC="${REPLICA_TEXTFILE_INSTALL_PATH:-/usr/local/bin/hopper-replica-textfile.sh}"
+if [ -f "$TEXTFILE_SRC" ]; then
+    if as_root install -D -m 0755 "$TEXTFILE_SRC" "$TEXTFILE_EXEC" 2>/dev/null; then
+        log "installed metrics emitter -> $TEXTFILE_EXEC"
+        if [ -f "$SLIM_SRC" ]; then
+            slim_dst="$(dirname "$TEXTFILE_EXEC")/slim-indexes.sh"
+            as_root install -D -m 0755 "$SLIM_SRC" "$slim_dst" 2>/dev/null \
+                || warn "could not copy slim-indexes.sh to $slim_dst — index-policy metrics will be absent"
+        fi
+    else
+        warn "could not copy replica-textfile.sh to $TEXTFILE_EXEC — metrics will not be scheduled"
+        TEXTFILE_EXEC=""
+    fi
+else
+    warn "replica-textfile.sh not found next to the healer — metrics will not be scheduled"
+    TEXTFILE_EXEC=""
 fi
 
 # --- pick scheduler --------------------------------------------------------

@@ -107,19 +107,83 @@ groups:
           summary: "Tablesync slot {{ $labels.slot_name }} retaining >400GB WAL"
           description: "An initial tablesync is pinning {{ $value | humanize1024 }}B and rising. Normal during a large copy; watch it against the 1500GB backstop."
 
-# ---------------------------------------------------------------------------
-# OPTIONAL subscriber-side rules — require ALSO scraping the replicas
-# (job="postgres-replica"), which needs the exporter to reach each replica's
-# postgres. .62 is reachable; galadriel currently listens socket-only, so it
-# would need listen_addresses/pg_hba opened to the tailnet or a local exporter.
-# These give earlier, cleaner signal than the publisher-side lag climb:
-#
-#   - alert: SubscriptionDisabled
-#     expr: pg_subscription_enabled == 0          # custom query on the replica
-#     for: 2m
-#     labels: { severity: page }
-#   - alert: SubscriptionApplyErrors
-#     expr: increase(pg_stat_subscription_stats_apply_error_count[15m]) > 0
-#     for: 0m
-#     labels: { severity: warning }
-# ---------------------------------------------------------------------------
+  # --- Subscriber-side ------------------------------------------------------
+  # Fed by hopper/scripts/replica/replica-textfile.sh on each replica, via the
+  # node_exporter textfile collector -> Alloy -> OTLP. These used to be blocked
+  # on scraping each replica's postgres directly (galadriel listens socket-only,
+  # and opening listen_addresses/pg_hba to the tailnet for it was not worth it);
+  # a local emitter needs none of that.
+  #
+  # They earn their place because the publisher-side rules above only see a sick
+  # subscriber INDIRECTLY, as slot lag. On 2026-08-20 a routine publisher restart
+  # tripped disable_on_error on galadriel at 00:49 EDT and the subscription stayed
+  # disabled for 5h22m; SubscriptionDisabled would have paged in two minutes.
+  - name: hopper-replication-subscriber
+    rules:
+      # The emitter is the only source for every rule below it, so a dead emitter
+      # silently disarms them. Page on staleness before trusting anything else.
+      - alert: ReplicaMetricsStale
+        expr: |
+          (time() - node_textfile_mtime_seconds{file="hopper-replica.prom"}) > 900
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "Replica health metrics stale on {{ $labels.host }}"
+          description: "hopper-replica.prom has not been rewritten for {{ $value | humanizeDuration }} — the emitter timer, postgres, or the host is down, and every subscriber-side replication alert is now blind."
+
+      # disable_on_error=true means any apply error disables the subscription,
+      # and replica-heal.sh deliberately refuses to re-enable a non-schema one.
+      # Nothing then re-enables it until a human does.
+      - alert: SubscriptionDisabled
+        expr: hopper_replica_subscription_enabled == 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "Subscription {{ $labels.subscription }} is DISABLED"
+          description: "The subscription on {{ $labels.host }} is disabled and will not re-enable itself. WAL now accumulates on the publisher against its slot. Re-enable with: ALTER SUBSCRIPTION {{ $labels.subscription }} ENABLE;"
+
+      - alert: SubscriptionApplyWorkerMissing
+        expr: |
+          hopper_replica_subscription_enabled == 1
+          and hopper_replica_apply_worker_running == 0
+        for: 10m
+        labels: { severity: page }
+        annotations:
+          summary: "Subscription {{ $labels.subscription }} enabled but no apply worker"
+          description: "Enabled for 10m with no apply worker attached on {{ $labels.host }} — the worker is crash-looping (a lost/invalidated slot does this every 5s) or max_logical_replication_workers is exhausted."
+
+      - alert: SubscriptionApplyErrors
+        expr: increase(hopper_replica_apply_error_count[15m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "Apply errors on {{ $labels.subscription }}"
+          description: "{{ $value | printf \"%.0f\" }} apply error(s) in 15m on {{ $labels.host }}. With disable_on_error=true the next one can disable the subscription."
+
+      - alert: ReplicaTablesNotReady
+        expr: |
+          hopper_replica_tables_ready < hopper_replica_tables_total
+        for: 6h
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.subscription }} has tables not in 'ready' state"
+          description: "{{ $value }} of {{ $labels.subscription }}'s tables are still copying/syncing after 6h on {{ $labels.host }} — a stuck tablesync holds its own slot and its own WAL."
+
+      # Index drift: the replica keeps a deliberately minimal index set
+      # (scripts/replica/slim-indexes.sh). DDL does not replicate, so a
+      # master-side index never arrives on its own — 'make replica' has to run.
+      # This is what silently diverged to 14 indexes vs the master's 77.
+      - alert: ReplicaIndexPolicyDrift
+        expr: hopper_replica_index_policy_missing > 0
+        for: 6h
+        labels: { severity: warning }
+        annotations:
+          summary: "Replica {{ $labels.host }} is missing {{ $value }} policy index(es)"
+          description: "{{ $value }} index(es) named by REPLICA_KEEP_INDEXES are absent — 'make replica' has not run since hopper gained them, so prism read paths are unindexed. Run 'make replica' on {{ $labels.host }}."
+
+      - alert: ReplicaIndexPolicyExtra
+        expr: hopper_replica_index_policy_extra > 0
+        for: 24h
+        labels: { severity: warning }
+        annotations:
+          summary: "Replica {{ $labels.host }} carries {{ $value }} unslimmed index(es)"
+          description: "{{ $value }} index(es) on subscribed tables are not in the keep list — on a logical replica every one is maintained per applied row. Run scripts/replica/slim-indexes.sh on {{ $labels.host }}."
