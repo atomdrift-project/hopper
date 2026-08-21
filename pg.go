@@ -102,9 +102,6 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS litmus_score DOUBLE PRECISION NOT NULL DEFAULT 0`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent) WHERE parent != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_formula ON samples(formula) WHERE formula != ''`,
-		// Drains itself as backfill completes: rows leave the index when elements
-		// is populated. Without it, each batch's gating SELECT seq-scans the heap.
-		`CREATE INDEX IF NOT EXISTS idx_samples_score ON samples(score) WHERE score != 0`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS mtime TIMESTAMPTZ`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS last_error_at TIMESTAMPTZ`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS first_analyzed_at TIMESTAMPTZ`,
@@ -118,8 +115,8 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_ecosystem ON samples(ecosystem) WHERE ecosystem != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_mtime ON samples(mtime) WHERE mtime IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_file_type ON samples(file_type)`,
-		// idx_samples_unanalyzed indexes sha256 but unanalyzedPG orders by id;
-		// this index lets that query avoid a sort at 100M rows.
+		// unanalyzedPG orders by id, so the pending set is indexed on id rather
+		// than sha256 — that lets the query avoid a sort at 100M rows.
 		`CREATE INDEX IF NOT EXISTS idx_samples_unanalyzed_id ON samples(id) WHERE cleave_result IS NULL`,
 		// Covers falsePositivesPG / truePositivesPG / falseNegativesPG — all filter
 		// (label, score, cleave_result IS NOT NULL, status='', skip='').
@@ -185,12 +182,6 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_corroborated_created ` +
 			`ON samples(created_at DESC) ` +
 			`WHERE corroborated AND parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL`,
-		// benignReviewPG / badReviewPG filter on skip='misclassified', so they need
-		// their own partial index for misclassified review.
-		`CREATE INDEX IF NOT EXISTS idx_samples_misclassified_review ` +
-			`ON samples(label, max_crit DESC, suspicious_count DESC) ` +
-			`WHERE label_source = 'marker' AND skip = 'misclassified' ` +
-			`AND cleave_result IS NOT NULL AND status = ''`,
 		// conflictReviewPG: good+bad conflicts flagged skip='conflict'.
 		// staleSamplesPG: WHERE updated_at < $1 ORDER BY updated_at — no status prefix.
 		`CREATE INDEX IF NOT EXISTS idx_samples_updated_at ON samples(updated_at)`,
@@ -236,28 +227,6 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			`ON samples(ecosystem, litmus_class, created_at DESC) ` +
 			`WHERE parent = '' AND cleave_result IS NOT NULL ` +
 			`AND litmus_result IS NOT NULL AND ecosystem <> ''`,
-		// TriageHighest walks good-labeled samples the ensemble scored hostile,
-		// worst first. Deliberately carries no parent = '' predicate: the rows
-		// that pin a route's operating point are overwhelmingly archive members
-		// (95.8% of benign PE scoring >= 0.9999), which every other triage index
-		// excludes. litmus_score leads so the ORDER BY is an ordered scan rather
-		// than a sort over the whole class-2 partition.
-		//
-		// NULLS LAST is load-bearing, not decoration. A DESC index defaults to
-		// NULLS FIRST, which does not match the selector's `DESC NULLS LAST` —
-		// the ordering then goes unused, every row in the partition is scanned
-		// and top-N sorted, and the query costs ~900ms instead of ~5ms. The
-		// ASC mirror below needs no such spelling: ASC already defaults to
-		// NULLS LAST, which is why TriageLowest was fast from the start.
-		`CREATE INDEX IF NOT EXISTS idx_samples_good_hostile_score ` +
-			`ON samples(litmus_score DESC NULLS LAST, id DESC) ` +
-			`WHERE label = 'good' AND litmus_class >= 2 AND cleave_result IS NOT NULL AND skip = ''`,
-		// TriageLowest is the mirror: bad-labeled samples the ensemble scores
-		// clean, best-hidden first. Same reasoning on the missing parent = ''
-		// predicate — 54% of bad rows scoring <= 0.1 are archive members.
-		`CREATE INDEX IF NOT EXISTS idx_samples_bad_clean_score ` +
-			`ON samples(litmus_score ASC, id DESC) ` +
-			`WHERE label = 'bad' AND litmus_class = 0 AND cleave_result IS NOT NULL AND skip = ''`,
 		// Per-route triage windows (TriageHighest/TriageLowest, 2026-08-03
 		// redesign): each file_type's top/bottom-K by litmus_score. The
 		// leading file_type key lets the per-route LATERAL walk each route's
@@ -395,7 +364,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// Poison-sample protection: count claims that never produced a result
 		// and record skip timing. No dedicated index — the reaper's
 		// "attempts >= N" sweep runs every few minutes and rides the existing
-		// idx_samples_unanalyzed (the pending set is small), and an index on
+		// idx_samples_unanalyzed_id (the pending set is small), and an index on
 		// attempts would take a write on the hot claim path for every bump.
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS skipped_at TIMESTAMPTZ`,
@@ -868,7 +837,6 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// the IF NOT EXISTS keeps them correct on a fresh database too.
 		`CREATE INDEX IF NOT EXISTS idx_samples_file_type ON samples(file_type)`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_formula   ON samples(formula)   WHERE formula   != ''`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_score     ON samples(score)     WHERE score     != 0`,
 
 		// Drives the one-time Pass 1b heal in backfillPG: rows stored under the
 		// v7 'files' key while file_type/score/formula were generated from the

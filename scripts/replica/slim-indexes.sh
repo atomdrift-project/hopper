@@ -87,6 +87,7 @@ idx_samples_good_repair_newest
 idx_samples_good_repair_stale
 idx_samples_new_interesting
 idx_samples_new_stale
+idx_samples_purl_lookup
 idx_samples_sighted_newest
 idx_samples_unknown_newest
 idx_sightings_subject
@@ -100,7 +101,6 @@ REPLICA_DROP_INDEXES='
 idx_reports_created_at
 idx_reports_sha256_type_created
 idx_samples_analyzed_at
-idx_samples_bad_clean_score
 idx_samples_bad_route_score
 idx_samples_claimable
 idx_samples_claimable_sha
@@ -118,10 +118,8 @@ idx_samples_feed_top_created_done
 idx_samples_file_type
 idx_samples_filename_trgm
 idx_samples_formula
-idx_samples_good_hostile_score
 idx_samples_good_route_score
 idx_samples_litmus_done
-idx_samples_misclassified_review
 idx_samples_mtime
 idx_samples_package_version
 idx_samples_parent
@@ -132,7 +130,6 @@ idx_samples_reconcile_toplevel
 idx_samples_rescan_queue
 idx_samples_review_interesting
 idx_samples_review_newest
-idx_samples_score
 idx_samples_source_ecosystem
 idx_samples_source_feed
 idx_samples_stale_traits
@@ -150,6 +147,7 @@ idx_sl_parent_child
 idx_sl_reference
 idx_sl_sha256
 idx_sl_sha256_parents
+idx_sl_standalone
 '
 
 SLIM_CONSTRAINTS='sample_locations|sample_locations_sha256_path_key'
