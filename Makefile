@@ -5,10 +5,11 @@ DB        ?= postgres://hopper@hopper-db/hopper?sslmode=disable
 SOURCE    ?= harvest
 # Two listeners with two access policies. The work API is the Cloudflare Tunnel
 # origin and requires a bearer token; the HTML dashboard has no authentication
-# of its own — a browser cannot present a token — so it stays on loopback and is
-# reached over an SSH forward. Never point the tunnel at DASH_ADDR.
+# of its own — a browser cannot present a token — so it is read-only, belongs on
+# a trusted network, and must never be the tunnel origin. Override with
+# DASH_ADDR=127.0.0.1:8082 to restrict it to an SSH forward.
 API_ADDR  ?= 0.0.0.0:8081
-DASH_ADDR ?= 127.0.0.1:8082
+DASH_ADDR ?= 0.0.0.0:8082
 # Linux atomscan worker slots and RSS cap in GB, forwarded to the systemd
 # deploy script as --workers and --max-memory-gb.
 #
