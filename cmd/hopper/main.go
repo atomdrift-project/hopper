@@ -941,7 +941,20 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	tracker := newWorkerTracker()
 	// The shared result-ingestion budget. Workers get all but the reserved
 	// slots; renewals may use any of them.
-	resultSlots := min(8, max(2, runtime.NumCPU()))
+	//
+	// 16 rather than 8: ingestion is memory-bound, and the cap is only safe
+	// while the box has memory to spare. It did not — the FreeBSD master ran
+	// its scan worker uncapped (85% of RAM) beside this process, leaving 5 GB
+	// free and 48 GB in laundry, which held every slot open long enough to
+	// saturate the pool. With the worker capped (FREEBSD_MAX_MEMORY_GB) that
+	// box now sits at 62 GB free and 1 GB laundry, and hopper holds ~2 GB per
+	// slot, so doubling costs ~17 GB of real headroom.
+	//
+	// This is still a count where the risk is bytes; a large-result lane, or
+	// admission on declared body size, would bound the thing that actually
+	// runs out. Until then, keep this in step with the memory the host can
+	// actually spare.
+	resultSlots := min(16, max(2, runtime.NumCPU()))
 	// Cap concurrent archive-member extractions to the CPU count (decompression
 	// is CPU-bound), clamped so a many-core host can't pile up unbounded disk
 	// spooling from a request burst.

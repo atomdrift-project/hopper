@@ -118,17 +118,16 @@ func parseReplicaIndexPolicy(t *testing.T) (keep, drop map[string]bool) {
 func parseShellIndexList(t *testing.T, src, name string) map[string]bool {
 	t.Helper()
 	open := name + "='"
-	i := strings.Index(src, open)
-	if i < 0 {
+	_, rest, found := strings.Cut(src, open)
+	if !found {
 		t.Fatalf("%s not found in slim-indexes.sh", name)
 	}
-	rest := src[i+len(open):]
-	j := strings.Index(rest, "'")
-	if j < 0 {
+	body, _, found := strings.Cut(rest, "'")
+	if !found {
 		t.Fatalf("%s is not closed by a single quote", name)
 	}
 	out := map[string]bool{}
-	for _, line := range strings.Fields(rest[:j]) {
+	for line := range strings.FieldsSeq(body) {
 		out[line] = true
 	}
 	if len(out) == 0 {
