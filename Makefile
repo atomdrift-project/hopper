@@ -29,8 +29,21 @@ WORKERS       ?= 60
 MAX_MEMORY_GB ?= 72
 # Native FreeBSD runs the worker as a separate rc.d service. Let Scan choose
 # its RSS admission threshold automatically unless a host needs an override.
-FREEBSD_WORKERS       ?= 96
-FREEBSD_MAX_MEMORY_GB ?= 0
+# The FreeBSD master (smaug) runs the hopper API, forager, and the local scan
+# worker on one 256 GB box, so the worker cannot be sized as if it owned the
+# machine. MAX_MEMORY_GB=0 asks atomscan to auto-resolve its cap to 85% of
+# system RAM — 217 GB here — which leaves nothing for hopper: measured
+# 2026-08-21 with the worker at 167 GB RSS, hopper at 31 GB, 48 GB in laundry
+# and 5 GB free, load 154 against 68% idle CPU. A box paging that hard holds
+# every result-ingestion slot open long enough to saturate the pool, and hopper
+# then sheds result submissions it will never be offered again.
+#
+# 160 GB leaves ~96 GB for hopper (31 GB measured), forager (5 GB), wired pages
+# (40 GB), and ARC. 80 workers rather than atomscan's auto-sized 96 trims the
+# concurrency that drives the peak. Both are explicit because the auto-sizing
+# defaults are right only for a host the worker has to itself.
+FREEBSD_WORKERS       ?= 80
+FREEBSD_MAX_MEMORY_GB ?= 160
 SCAN_DIR      ?= ../scan
 # Cloudflare Tunnel (FreeBSD only). "auto" installs and starts cloudflared when
 # CF_TUNNEL_TOKEN is passed or a token from an earlier deploy is on disk; 0

@@ -19,8 +19,11 @@ API_ADDR="${API_ADDR:-0.0.0.0:8081}"
 # to restrict it to an SSH forward.
 DASH_ADDR="${DASH_ADDR:-0.0.0.0:8082}"
 TOKEN_SRC="${TOKEN_SRC-${HOME}/.tok/hopper}"
-WORKERS="${WORKERS:-96}"
-MAX_MEMORY_GB="${MAX_MEMORY_GB:-0}"
+# Sized for a master that shares its box with the hopper API and forager, not
+# for a dedicated worker host. MAX_MEMORY_GB=0 would auto-resolve to 85% of
+# system RAM and starve hopper; see FREEBSD_WORKERS in the Makefile.
+WORKERS="${WORKERS:-80}"
+MAX_MEMORY_GB="${MAX_MEMORY_GB:-160}"
 LLM="${LLM:-http://10.9.8.149:8000/v1}"
 SCAN_DIR="${SCAN_DIR:-../scan}"
 CLEAVE_DIR="${CLEAVE_DIR:-../cleave}"

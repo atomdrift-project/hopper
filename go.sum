@@ -6,6 +6,8 @@ github.com/atomdrift-project/obs v0.0.0-20260804141423-6dff25bbc747 h1:u+orE68ZG
 github.com/atomdrift-project/obs v0.0.0-20260804141423-6dff25bbc747/go.mod h1:O9Xg+Bi7ql4Cb1G0S9NX1OSvpXnAwoF+U1cSVzgNn5s=
 github.com/atomdrift-project/obs v0.0.0-20260819134200-4a59c5d10c9d h1:+a1y/Ao+GN5sxW9RHp2UyUVHAyXwsm18QtxdHjTfAaA=
 github.com/atomdrift-project/obs v0.0.0-20260819134200-4a59c5d10c9d/go.mod h1:O9Xg+Bi7ql4Cb1G0S9NX1OSvpXnAwoF+U1cSVzgNn5s=
+github.com/atomdrift-project/obs v0.0.0-20260819141836-f9e00a0e1174 h1:wHU2OZLm25uOfuhczNK9eCtLFbaL0w1r0l8jTrXVYQg=
+github.com/atomdrift-project/obs v0.0.0-20260819141836-f9e00a0e1174/go.mod h1:9k/ifvPZ6fqp+qG/02fKMxCnA5C1SbUytmygMFHomBw=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
 github.com/bodgit/plumbing v1.3.0 h1:pf9Itz1JOQgn7vEOE7v7nlEfBykYqvUYioC61TwWCFU=
@@ -208,12 +210,16 @@ google.golang.org/genproto/googleapis/api v0.0.0-20260810153831-ec0a7760b754 h1:
 google.golang.org/genproto/googleapis/api v0.0.0-20260810153831-ec0a7760b754/go.mod h1:q/3oV3jAi5vwelxsVAprMBC8BcM2zmNe+IjRGd+9/ks=
 google.golang.org/genproto/googleapis/api v0.0.0-20260818201246-1b0934165a6f h1:zRL8hmUGXSGBJ2D+r85c0S3xhrg6BtfQ3V6KKbR/I9M=
 google.golang.org/genproto/googleapis/api v0.0.0-20260818201246-1b0934165a6f/go.mod h1:q/3oV3jAi5vwelxsVAprMBC8BcM2zmNe+IjRGd+9/ks=
+google.golang.org/genproto/googleapis/api v0.0.0-20260819154853-08b0e4226688 h1:ax2KzoSRIZU/M0cIxri3pKxy99vniH1PVxWC6si/eZI=
+google.golang.org/genproto/googleapis/api v0.0.0-20260819154853-08b0e4226688/go.mod h1:1RJ9BQGyNdZwkGc1eTqkErfRZ6RJyYPHZo73BZ1vQqI=
 google.golang.org/genproto/googleapis/rpc v0.0.0-20260706201446-f0a921348800 h1:qEHAMpSaUhtD0p3NbEEI83HwNGFxEwaSJ1G9PLnCBZE=
 google.golang.org/genproto/googleapis/rpc v0.0.0-20260706201446-f0a921348800/go.mod h1:4Hqkh8ycfw05ld/3BWL7rJOSfebL2Q+DVDeRgYgxUU8=
 google.golang.org/genproto/googleapis/rpc v0.0.0-20260810153831-ec0a7760b754 h1:k5CJw9e5ONCcA/u0webKt092npXuY+KeGh3Q8NAVf0g=
 google.golang.org/genproto/googleapis/rpc v0.0.0-20260810153831-ec0a7760b754/go.mod h1:4Hqkh8ycfw05ld/3BWL7rJOSfebL2Q+DVDeRgYgxUU8=
 google.golang.org/genproto/googleapis/rpc v0.0.0-20260818201246-1b0934165a6f h1:kMQMi+2r0XRQ/Ad2/tgd+5S7JYSBGYO4pwkLTE8F2y0=
 google.golang.org/genproto/googleapis/rpc v0.0.0-20260818201246-1b0934165a6f/go.mod h1:4Hqkh8ycfw05ld/3BWL7rJOSfebL2Q+DVDeRgYgxUU8=
+google.golang.org/genproto/googleapis/rpc v0.0.0-20260819154853-08b0e4226688 h1:cYNAzI2sUwhmCcoj9TxvihSrqsxt6uIkj3rDRhSDmW4=
+google.golang.org/genproto/googleapis/rpc v0.0.0-20260819154853-08b0e4226688/go.mod h1:DjtHYE8FKJLivXcBEjGwndXfIC23G0VpXiXKqG179uA=
 google.golang.org/grpc v1.82.0 h1:vguDnZUPjE26w09A63VoxZPnvPjB5Riyc0mkXPFmAIU=
 google.golang.org/grpc v1.82.0/go.mod h1:yzTZ1TB1Z3SG+LIYaI+WiE8D5+PZ3ArnrSp8zF3+/ZA=
 google.golang.org/grpc v1.83.0 h1:JeNZEKJFbQxArAMl+hiytHauacDNqJUllNfmIMmpqnQ=

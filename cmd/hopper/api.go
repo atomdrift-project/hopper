@@ -44,6 +44,7 @@ type apiServer struct {
 	progress            *loadProgress
 	extractSem          chan struct{}
 	resultSem           chan struct{}
+	workerResultSem     chan struct{}
 	extractCache        *extractCache
 	traitsVersion       atomic.Pointer[string]
 	tracker             *workerTracker
@@ -120,18 +121,85 @@ func (s *apiServer) releaseExtract() {
 	}
 }
 
+// laneHeader lets a client declare which ingestion lane its result belongs to.
+// It is a header rather than a body field because the gate runs before the body
+// is read — which is the whole point of the gate — and the worker name that
+// would otherwise identify the caller lives inside the payload.
+const laneHeader = "X-Hopper-Lane"
+
+// laneRenew marks a result renewed by `atomscan serve --hopper`: a scan the
+// server performed for a caller that is now holding the verdict in its own
+// cache.
+//
+// Renewals get a reservation because shedding one is not the same as shedding
+// a worker result, even though both are a 503 on the same route:
+//
+//   - A worker result is retryable for free. The job returns to the queue,
+//     another worker claims it, and hopper dispatches it again. Nothing is
+//     lost but the work already done.
+//   - A renewal is one-shot. The caller has already cached the verdict, so the
+//     same artifact is never requested again — and if the renewal does not
+//     land, that artifact never enters the corpus at all. The loss is silent
+//     and permanent.
+//
+// Without the reservation the free-to-shed class starves the irreversible one:
+// a deep worker backlog keeps every slot busy indefinitely, and every renewal
+// is dropped for as long as the backlog lasts.
+const laneRenew = "renew"
+
+// resultReservedSlots is how many result-ingestion slots stay available to
+// renewals. Sized for the peak concurrent renewals a small precache fleet
+// produces, not for throughput: renewal payloads are single artifacts, so a
+// slot turns over quickly and three is enough to keep the lane moving.
+const resultReservedSlots = 3
+
+// renewalLane reports whether r declared itself a renewal. Anything else —
+// including a client too old to send the header — takes the worker lane, so a
+// caller can only ever opt *into* the restricted majority pool, never silently
+// into the reservation.
+func renewalLane(r *http.Request) bool {
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get(laneHeader)), laneRenew)
+}
+
 // acquireResult takes a result-ingestion slot, shedding with errSaturated if
 // none frees within slotAcquireWait. Gating before the body is decoded means a
 // saturated server leaves request bodies unread in the kernel socket buffer
 // instead of materializing them on the heap.
-func (s *apiServer) acquireResult(ctx context.Context) error {
+//
+// A worker result must first take a slot from the smaller worker pool, which is
+// what leaves resultReservedSlots of the shared pool for renewals. Renewals
+// take only the shared slot, so they may still use spare worker capacity when
+// the fleet is idle — the reservation is a floor, not a partition.
+//
+// The nesting cannot deadlock: workers always take workerResultSem before
+// resultSem and renewals take only resultSem, so there is no cycle, and each
+// acquire sheds on its own bound anyway.
+func (s *apiServer) acquireResult(ctx context.Context, renewal bool) error {
+	if !renewal {
+		if err := acquireSlot(ctx, s.workerResultSem); err != nil {
+			return err
+		}
+		if err := acquireSlot(ctx, s.resultSem); err != nil {
+			releaseSlot(s.workerResultSem)
+			return err
+		}
+		return nil
+	}
 	return acquireSlot(ctx, s.resultSem)
 }
 
-// releaseResult returns a slot taken by acquireResult.
-func (s *apiServer) releaseResult() {
-	if s.resultSem != nil {
-		<-s.resultSem
+// releaseResult returns the slots taken by acquireResult.
+func (s *apiServer) releaseResult(renewal bool) {
+	releaseSlot(s.resultSem)
+	if !renewal {
+		releaseSlot(s.workerResultSem)
+	}
+}
+
+// releaseSlot returns a token to sem, tolerating the nil sem tests use.
+func releaseSlot(sem chan struct{}) {
+	if sem != nil {
+		<-sem
 	}
 }
 
@@ -1587,20 +1655,27 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	// DB store that can stall, so an unbounded fan-in is a heap blow-up. When
 	// saturated, shed load with a Retry-After rather than buffering more bodies.
 	waitStart := time.Now()
-	if err := s.acquireResult(r.Context()); err != nil {
+	renewal := renewalLane(r)
+	lane := "worker"
+	if renewal {
+		lane = laneRenew
+	}
+	if err := s.acquireResult(r.Context(), renewal); err != nil {
 		if errors.Is(err, errSaturated) {
-			recordLoadShed(r.Context(), "result")
+			recordLoadShed(r.Context(), "result:"+lane)
+			// A shed renewal is worth more attention than a shed worker
+			// result: the sender cannot fall back on the queue.
 			slog.WarnContext(r.Context(), "result shed: ingestion slots saturated",
-				"remote", r.RemoteAddr, "wait", slotAcquireWait.String())
+				"lane", lane, "remote", r.RemoteAddr, "wait", slotAcquireWait.String())
 		}
 		writeRetryable(w, retryAfterBusy, `{"error":"busy: result ingestion saturated"}`)
 		return
 	}
 	if waited := time.Since(waitStart); waited > slotWaitLogThreshold {
 		slog.WarnContext(r.Context(), "result ingestion slot wait was slow",
-			"remote", r.RemoteAddr, "waited_ms", waited.Milliseconds())
+			"lane", lane, "remote", r.RemoteAddr, "waited_ms", waited.Milliseconds())
 	}
-	defer s.releaseResult()
+	defer s.releaseResult(renewal)
 	// Slow-loris defense: bound how long the (up to maxResultBodyBytes) body may
 	// take to arrive, mirroring handleUpload. Uses the per-request response controller
 	// so it doesn't impose a global ReadTimeout on long-lived /data downloads.

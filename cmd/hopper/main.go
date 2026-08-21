@@ -859,7 +859,8 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// scripts pass --api-addr 0.0.0.0:8081 — and a tunnel origin terminates on
 	// loopback anyway.
 	apiAddr := f.String("api-addr", "127.0.0.1:8081", "work API listen address; pass 0.0.0.0:8081 to serve remote workers (empty to disable)")
-	dashAddr := f.String("dashboard-addr", "0.0.0.0:8082", "web dashboard listen address; it has no authentication, so pass 127.0.0.1:8082 to keep it on loopback (empty to disable)")
+	dashAddr := f.String("dashboard-addr", "0.0.0.0:8082", "web dashboard listen address; it has no authentication, so pass "+
+		"127.0.0.1:8082 to keep it on loopback (empty to disable)")
 	tokenFile := f.String("token-file", "", "file holding the bearer token the API requires; empty serves the API unauthenticated")
 	pprofAddr := f.String("pprof-addr", "127.0.0.1:6060", "net/http/pprof listen address; loopback-only by default (empty to disable)")
 	localOnly := f.Bool("local", false, "listen only on loopback for dashboard and worker API")
@@ -938,6 +939,9 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 
 	apiMux := http.NewServeMux()
 	tracker := newWorkerTracker()
+	// The shared result-ingestion budget. Workers get all but the reserved
+	// slots; renewals may use any of them.
+	resultSlots := min(8, max(2, runtime.NumCPU()))
 	// Cap concurrent archive-member extractions to the CPU count (decompression
 	// is CPU-bound), clamped so a many-core host can't pile up unbounded disk
 	// spooling from a request burst.
@@ -949,7 +953,13 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		// several times its size), not CPU-bound, so cap it tighter than
 		// extraction: enough for steady throughput, low enough that a burst of
 		// large archive results can't blow up the heap.
-		resultSem: make(chan struct{}, min(8, max(2, runtime.NumCPU()))),
+		resultSem: make(chan struct{}, resultSlots),
+		// Worker results take a slot from this smaller pool as well, which
+		// keeps resultReservedSlots of resultSem available to `serve --hopper`
+		// renewals. A worker result that is shed goes back on the queue and is
+		// dispatched again; a shed renewal is gone for good, so the two must
+		// not compete on equal terms. See laneRenew in api.go.
+		workerResultSem: make(chan struct{}, resultSlots-min(resultReservedSlots, resultSlots-1)),
 	} // db, progress, and allowedDirs are set after initialization
 	api.registerAPI(apiMux)
 	apiMux.HandleFunc("GET /_/health", func(w http.ResponseWriter, _ *http.Request) {
@@ -1386,7 +1396,8 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	if *dashAddr != "" && !isLoopbackAddr(*dashAddr) {
 		slog.Warn("dashboard bound to non-loopback; it has no authentication of its own",
 			"addr", *dashAddr,
-			"recommendation", "keep it on a trusted network, or pass --dashboard-addr 127.0.0.1:8082 and reach it over an SSH forward, or put an authenticating proxy in front")
+			"recommendation", "keep it on a trusted network, or pass --dashboard-addr 127.0.0.1:8082 and "+
+				"reach it over an SSH forward, or put an authenticating proxy in front")
 	}
 
 	slog.Info("load prep complete",
