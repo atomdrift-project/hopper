@@ -160,15 +160,75 @@ func explainText(t *testing.T, ctx context.Context, db *DB, sql string, args []s
 }
 
 func planSeqScansSamples(plan string) bool {
+	return planSeqScans(plan, "samples")
+}
+
+// planSeqScans reports whether the plan scans table sequentially. Matches both
+// spellings the planner emits:
+//
+//	Parallel Seq Scan on <table>  → bad
+//	Seq Scan on <table>           → bad
+func planSeqScans(plan, table string) bool {
 	for line := range strings.SplitSeq(plan, "\n") {
-		if !strings.Contains(line, "Seq Scan on samples") {
-			continue
+		if strings.Contains(line, "Seq Scan on "+table) {
+			return true
 		}
-		// Parallel Seq Scan on samples  → bad
-		// Seq Scan on samples           → bad
-		return true
 	}
 	return false
+}
+
+// TestPlanAuditRepairStandaloneParents guards the shape repair-parents pages
+// with. Paging on samples.id instead let the planner drive the semi-join from
+// the ledger side: a full scan of sample_locations per batch with the cursor
+// demoted to a post-scan filter, so every batch redid the same scan and the
+// same sort to keep 20k rows of it — a repair that should cost minutes instead
+// re-scanned the whole ledger once per page. The page must stay an ordered
+// walk of sample_locations bounded by its own id.
+func TestPlanAuditRepairStandaloneParents(t *testing.T) {
+	db := openPlanDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	var reltuples float64
+	if err := db.Pool().QueryRow(ctx,
+		`SELECT reltuples FROM pg_class WHERE relname = 'sample_locations'`).Scan(&reltuples); err != nil {
+		t.Fatalf("sample_locations reltuples: %v", err)
+	}
+	const minRows = 100_000
+	if reltuples < minRows {
+		t.Skipf("sample_locations reltuples=%.0f < %d; need production-like stats", reltuples, minRows)
+	}
+	t.Logf("sample_locations reltuples=%.0f", reltuples)
+
+	rows, err := db.Pool().Query(ctx, `EXPLAIN `+repairStandaloneParentsPageSQL, int64(0), 20000)
+	if err != nil {
+		t.Fatalf("EXPLAIN: %v\nSQL: %s", err, compactSQL(repairStandaloneParentsPageSQL))
+	}
+	var b strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			rows.Close()
+			t.Fatalf("scan EXPLAIN: %v", err)
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("EXPLAIN rows: %v", err)
+	}
+	plan := b.String()
+
+	if planSeqScans(plan, "sample_locations") {
+		t.Errorf("repair page seq-scans sample_locations:\n%s", plan)
+	}
+	// The cursor must bound the scan, not filter its result. Without this the
+	// plan is still index-ish but every page walks the whole ledger again.
+	if !strings.Contains(plan, "Index Cond: (id > ") {
+		t.Errorf("repair page does not use id as an index bound:\n%s", plan)
+	}
+	t.Logf("repair_standalone_parents_page: ok\n%s", firstPlanLines(plan, 8))
 }
 
 func planAuditSHAs(n int) []string {

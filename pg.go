@@ -595,6 +595,20 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_sl_reference ON sample_locations(id) ` +
 			`INCLUDE (sha256) WHERE parent_sha256 <> '' AND rel NOT IN ` + containmentRelsSQL,
 
+		// The standalone counterpart to idx_sl_reference: ledger rows whose bytes
+		// are stored under their own sha, no archive involved. Keyed on id with
+		// sha256 included so repairStandaloneParentsPG pages it index-only, the
+		// same shape and for the same reason as the reference walk above.
+		//
+		// Every other partial index on this table covers parent_sha256 <> ''.
+		// This is the only one that answers "is this artifact stored standalone",
+		// which is what the repair asks. Without it that question is a seq scan of
+		// the whole ledger — and because the planner drives the semi-join from
+		// this side rather than from samples, it is one scan per batch, which no
+		// cursor on samples.id can prune.
+		`CREATE INDEX IF NOT EXISTS idx_sl_standalone ON sample_locations(id) ` +
+			`INCLUDE (sha256) WHERE parent_sha256 = ''`,
+
 		// Retired locations are kept outside the active ledger: serving and
 		// workflow queries stay small, while moves/prunes preserve path history.
 		// Deliberately no FK: deleting a sample must not erase its provenance.
@@ -5270,33 +5284,58 @@ func (db *DB) canonicalizePURLBasesPG(ctx context.Context, dryRun bool) (int64, 
 // standalone location keep their parent — extraction is the only way to serve
 // them.
 //
-// Batched on the id cursor like canonicalizePURLBasesPG, so no batch locks more
-// than batchRows. Idempotent and resumable; dryRun only counts.
+// Paged over sample_locations.id — the driving table — not samples.id. The
+// planner resolves the standalone test as a semi-join driven from the ledger
+// side (a scan of every parent_sha256 = ” row, hash-aggregated to distinct
+// sha256), so a cursor on samples.id lands as a filter *after* that scan and
+// prunes nothing: every batch repeats the same full ledger scan and the same
+// sort, then keeps 20k rows of it. Paging the side the scan actually starts
+// from is what makes the cursor advance real work, and idx_sl_standalone makes
+// each page index-only. No batch locks more than batchRows worth of samples.
+//
+// Idempotent and resumable. dryRun only counts, and counts a shade high: one
+// sha256 can hold several standalone locations, and when they fall in different
+// pages the same row is counted once per page. The live path cannot double-count
+// — the UPDATE's parent <> ” is already false the second time.
+// repairStandaloneParentsPageSQL is one page of the standalone-location walk.
+// Ordered by the ledger's own id and bounded by it, so the cursor prunes the
+// scan rather than filtering its output — see repairStandaloneParentsPG.
+// TestPlanAuditRepairStandaloneParents fails if this stops being an ordered
+// index walk of sample_locations.
+const repairStandaloneParentsPageSQL = `
+	SELECT id, sha256 FROM sample_locations
+	WHERE id > $1 AND parent_sha256 = ''
+	ORDER BY id LIMIT $2`
+
 func (db *DB) repairStandaloneParentsPG(ctx context.Context, dryRun bool) (int64, error) {
 	const batchRows = 20000
 	var repaired, cursor int64
 	for {
-		rows, err := db.pool.Query(ctx, `
-			SELECT id FROM samples
-			WHERE id > $1 AND parent <> ''
-			  AND EXISTS (SELECT 1 FROM sample_locations sl
-			               WHERE sl.sha256 = samples.sha256 AND sl.parent_sha256 = '')
-			ORDER BY id LIMIT $2`, cursor, batchRows)
+		rows, err := db.pool.Query(ctx, repairStandaloneParentsPageSQL, cursor, batchRows)
 		if err != nil {
 			return repaired, fmt.Errorf("hopper: repair parents select: %w", err)
 		}
-		var ids []int64
+		// One sha256 can hold several standalone locations, so dedupe within the
+		// page: the UPDATE would be a no-op on the repeats, but they would other-
+		// wise bloat the array parameter for no gain.
+		shas := make([]string, 0, batchRows)
+		seenSHA := make(map[string]struct{}, batchRows)
 		var maxID int64
 		var seen int
 		for rows.Next() {
 			var id int64
-			if err := rows.Scan(&id); err != nil {
+			var sha string
+			if err := rows.Scan(&id, &sha); err != nil {
 				rows.Close()
 				return repaired, fmt.Errorf("hopper: repair parents scan: %w", err)
 			}
 			seen++
 			maxID = id
-			ids = append(ids, id)
+			if _, dup := seenSHA[sha]; dup {
+				continue
+			}
+			seenSHA[sha] = struct{}{}
+			shas = append(shas, sha)
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
@@ -5307,14 +5346,19 @@ func (db *DB) repairStandaloneParentsPG(ctx context.Context, dryRun bool) (int64
 			break
 		}
 		if dryRun {
-			repaired += int64(len(ids))
+			var n int64
+			if err := db.pool.QueryRow(ctx, `
+				SELECT count(*) FROM samples
+				WHERE sha256 = ANY($1) AND parent <> ''`, shas).Scan(&n); err != nil {
+				return repaired, fmt.Errorf("hopper: repair parents count: %w", err)
+			}
+			repaired += n
 		} else {
-			// Re-check parent <> '' in the UPDATE: another writer may have
-			// cleared it between the select and here.
+			// parent <> '' both selects the rows worth writing and makes the
+			// statement idempotent: a re-run, or a repeated sha256, matches nothing.
 			tag, err := db.pool.Exec(ctx, `
 				UPDATE samples SET parent = ''
-				FROM unnest($1::bigint[]) AS v(id)
-				WHERE samples.id = v.id AND samples.parent <> ''`, ids)
+				WHERE sha256 = ANY($1) AND parent <> ''`, shas)
 			if err != nil {
 				return repaired, fmt.Errorf("hopper: repair parents update: %w", err)
 			}
