@@ -2622,28 +2622,67 @@ func (db *DB) storeClaimsPG(ctx context.Context, claims []Claim) error {
 	return nil
 }
 
+// storeMemberRowsPG writes one member batch as TWO transactions over a
+// session staging table, exactly mirroring insertSampleBatchPG and for the
+// same measured reason: the member upsert's ON CONFLICT row locks are the
+// fleet-wide contention point (this statement was ~70% of all DB execution
+// time on 2026-08-22 — initially misattributed to the walk upsert, whose text
+// shares the same first 64 characters), and holding them across the
+// sample_locations fan-out (a multi-second write against 526GB of indexes)
+// convoyed every concurrent store and walk batch behind a single archive.
+// tx1 commits the members and releases the contended locks; tx2 writes the
+// locations ledger with nobody queueing on it.
+//
+// Failure window: members committed, locations fan-out failed. The caller
+// fails the whole store, the worker retries the result, and the batch re-runs
+// idempotently (the upsert is analyzed_at-gated), landing the edges then.
+// StoreResult's crash contract is unchanged: the parent's truncating UPDATE
+// still runs only after every member batch has fully succeeded.
 func (db *DB) storeMemberRowsPG(ctx context.Context, rows [][]any) (int64, error) {
-	tx, err := db.pool.Begin(ctx)
+	conn, err := db.pool.Acquire(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: acquire member batch conn: %w", err)
+	}
+	defer conn.Release()
+	defer func() {
+		dropCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if _, derr := conn.Exec(dropCtx, `DROP TABLE IF EXISTS _staging`); derr != nil {
+			slog.Warn("drop member staging table failed; discarding connection", "error", derr)
+			conn.Conn().Close(dropCtx) //nolint:errcheck // already tearing down
+		}
+	}()
+
+	if _, err := conn.Exec(ctx, insertBatchStagingSessionDDL); err != nil {
+		return 0, fmt.Errorf("hopper: create member staging: %w", err)
+	}
+	if _, err := conn.Conn().CopyFrom(ctx, pgx.Identifier{"_staging"}, insertBatchStagingCols, pgx.CopyFromRows(rows)); err != nil {
+		return 0, fmt.Errorf("hopper: copy members to staging: %w", err)
+	}
+
+	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: begin member batch: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
-
-	if _, err := tx.Exec(ctx, insertBatchStagingDDL); err != nil {
-		return 0, fmt.Errorf("hopper: create member staging: %w", err)
-	}
-	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"_staging"}, insertBatchStagingCols, pgx.CopyFromRows(rows)); err != nil {
-		return 0, fmt.Errorf("hopper: copy members to staging: %w", err)
-	}
 	tag, err := tx.Exec(ctx, insertMembersFromStagingPG)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: upsert members: %w", err)
 	}
-	if _, err := tx.Exec(ctx, locationsFromStagingPG); err != nil {
-		return 0, fmt.Errorf("hopper: upsert member locations: %w", err)
-	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("hopper: commit member batch: %w", err)
+	}
+
+	tx2, err := conn.Begin(ctx)
+	if err != nil {
+		return tag.RowsAffected(), fmt.Errorf("hopper: begin member locations: %w", err)
+	}
+	defer tx2.Rollback(ctx) //nolint:errcheck // commit or rollback
+	if _, err := tx2.Exec(ctx, locationsFromStagingPG); err != nil {
+		return tag.RowsAffected(), fmt.Errorf("hopper: upsert member locations: %w", err)
+	}
+	if err := tx2.Commit(ctx); err != nil {
+		return tag.RowsAffected(), fmt.Errorf("hopper: commit member locations: %w", err)
 	}
 	return tag.RowsAffected(), nil
 }
