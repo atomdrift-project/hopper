@@ -36,6 +36,7 @@ func (db *DB) SetPopularPackages(ctx context.Context, pkgs []PopularPackage) err
 	if len(pkgs) == 0 {
 		return nil
 	}
+	pkgs = dedupePopular(pkgs)
 	for start := 0; start < len(pkgs); start += popularUpsertBatch {
 		end := min(start+popularUpsertBatch, len(pkgs))
 		if err := db.upsertPopularBatch(ctx, pkgs[start:end]); err != nil {
@@ -43,6 +44,35 @@ func (db *DB) SetPopularPackages(ctx context.Context, pkgs []PopularPackage) err
 		}
 	}
 	return nil
+}
+
+// dedupePopular collapses entries sharing a purl_base, keeping the best rank.
+//
+// Two packages really can be one identity here, and it is not an input error:
+// the PURL spec folds case for golang and folds case *and* underscores for
+// pypi, so `Foo_Bar` and `foo-bar` are the same package to everyone downstream.
+// A ranking of the top few thousand pypi packages reliably contains such a
+// pair. Postgres refuses ON CONFLICT DO UPDATE when one statement touches a row
+// twice, so without this a whole publish fails — which is precisely how it
+// failed in production, for pypi and golang and no other ecosystem.
+//
+// The lower rank wins: if one spelling is the twelfth most-used package and the
+// other is the three-thousandth, the identity they share is worth treating as
+// the twelfth.
+func dedupePopular(pkgs []PopularPackage) []PopularPackage {
+	best := make(map[string]int, len(pkgs))
+	out := make([]PopularPackage, 0, len(pkgs))
+	for _, p := range pkgs {
+		if at, seen := best[p.PURLBase]; seen {
+			if p.Rank < out[at].Rank {
+				out[at] = p
+			}
+			continue
+		}
+		best[p.PURLBase] = len(out)
+		out = append(out, p)
+	}
+	return out
 }
 
 func (db *DB) upsertPopularBatch(ctx context.Context, pkgs []PopularPackage) error {

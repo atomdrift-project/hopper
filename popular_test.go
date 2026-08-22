@@ -182,3 +182,71 @@ func TestPopularRanksReturnsTheWholeSet(t *testing.T) {
 		t.Error("PopularRanks invented an identity")
 	}
 }
+
+// Two packages collapsing onto one identity is normal, not an input error: the
+// PURL spec folds case for golang and case plus underscores for pypi. Postgres
+// refuses a statement that touches one row twice, so a whole publish used to
+// fail on it — which is exactly how pypi and golang failed in production.
+func TestSetPopularPackagesSurvivesCollidingIdentities(t *testing.T) {
+	db := openTestDB(t)
+	ctx := t.Context()
+	if err := db.SetPopularPackages(ctx, []PopularPackage{
+		{PURLBase: "pkg:pypi/foo-bar", Ecosystem: "pypi", Rank: 12, Source: "poppy"},
+		{PURLBase: "pkg:pypi/other", Ecosystem: "pypi", Rank: 50, Source: "poppy"},
+		// `Foo_Bar` normalizes onto the same identity as `foo-bar`.
+		{PURLBase: "pkg:pypi/foo-bar", Ecosystem: "pypi", Rank: 3000, Source: "poppy"},
+	}); err != nil {
+		t.Fatalf("a colliding ranking must still publish: %v", err)
+	}
+
+	n, err := db.PopularPackageCount(ctx)
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("count = %d, want 2 distinct identities", n)
+	}
+	ranks, err := db.PopularRanks(ctx)
+	if err != nil {
+		t.Fatalf("PopularRanks: %v", err)
+	}
+	if got := ranks["pkg:pypi/foo-bar"]; got != 12 {
+		t.Errorf("rank = %d, want 12 — the better rank must win the collision", got)
+	}
+}
+
+// The collision may straddle a batch boundary, where it would not raise an
+// error but would make the stored rank depend on batching order.
+func TestDedupePopularSpansBatchBoundaries(t *testing.T) {
+	pkgs := make([]PopularPackage, 0, popularUpsertBatch+2)
+	pkgs = append(pkgs, PopularPackage{PURLBase: "pkg:pypi/edge", Ecosystem: "pypi", Rank: 9, Source: "poppy"})
+	for i := range popularUpsertBatch {
+		pkgs = append(pkgs, PopularPackage{
+			PURLBase: "pkg:pypi/f" + strconv.Itoa(i), Ecosystem: "pypi", Rank: i + 100, Source: "poppy",
+		})
+	}
+	pkgs = append(pkgs, PopularPackage{PURLBase: "pkg:pypi/edge", Ecosystem: "pypi", Rank: 8000, Source: "poppy"})
+
+	got := dedupePopular(pkgs)
+	if len(got) != popularUpsertBatch+1 {
+		t.Errorf("len = %d, want %d", len(got), popularUpsertBatch+1)
+	}
+	if got[0].PURLBase != "pkg:pypi/edge" || got[0].Rank != 9 {
+		t.Errorf("first entry = %+v, want the edge identity at rank 9", got[0])
+	}
+}
+
+func TestDedupePopularKeepsOrderAndLeavesCleanInputAlone(t *testing.T) {
+	in := []PopularPackage{
+		{PURLBase: "pkg:npm/a", Rank: 1}, {PURLBase: "pkg:npm/b", Rank: 2}, {PURLBase: "pkg:npm/c", Rank: 3},
+	}
+	got := dedupePopular(in)
+	if len(got) != 3 {
+		t.Fatalf("len = %d, want 3", len(got))
+	}
+	for i, p := range got {
+		if p != in[i] {
+			t.Errorf("entry %d = %+v, want %+v — clean input must pass through in order", i, p, in[i])
+		}
+	}
+}

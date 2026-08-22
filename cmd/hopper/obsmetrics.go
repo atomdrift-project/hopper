@@ -43,6 +43,7 @@ type instruments struct {
 	resultInUse, resultMax                        metric.Int64Observable
 	lookupReqs                                    metric.Int64Observable
 	lookupEntries, lookupCapacity                 metric.Int64Observable
+	popularPackages                               metric.Int64Observable
 }
 
 // loadShedCount counts load-shedding events: requests turned away with a
@@ -206,6 +207,12 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 			"Sample lookup entries currently held in the in-process pool.", "{entry}"),
 		lookupCapacity: gauge("hopper.lookup.capacity",
 			"Maximum sample lookup entries the in-process pool will hold.", "{entry}"),
+		// Whether a publisher's ranking actually landed is otherwise only
+		// visible from the publisher's own side, which reports what it sent
+		// rather than what was stored. Those are different claims, and after a
+		// restart race they disagreed.
+		popularPackages: gauge("hopper.popular.packages",
+			"Package identities marked as popular, across all sources.", "{package}"),
 	}
 	if firstErr != nil {
 		return firstErr
@@ -262,6 +269,10 @@ func (wd *webDashboard) observe(ctx context.Context, o metric.Observer, in *inst
 
 		cctx, cancel := context.WithTimeout(ctx, metricsCollectTimeout)
 		defer cancel()
+
+		if n, err := db.PopularPackageCount(cctx); err == nil {
+			o.ObserveInt64(in.popularPackages, int64(n))
+		}
 		o.ObserveInt64(in.pending, wd.pendingCount(cctx))
 		o.ObserveInt64(in.rescan, wd.rescanPending(cctx))
 
