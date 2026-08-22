@@ -693,6 +693,7 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/upload", s.handleUpload)
 	mux.HandleFunc("POST /api/known", s.handleKnown)
 	mux.HandleFunc("POST /api/sightings", s.handleSightings)
+	mux.HandleFunc("POST /api/popular", s.handlePopular)
 	mux.HandleFunc("GET /api/locations/incoming", s.handleIncomingLocations)
 	mux.HandleFunc("POST /api/triage", s.handleTriage)
 	mux.HandleFunc("POST /api/rescan/{sha256}", s.handleRescan)
@@ -2429,6 +2430,85 @@ type sightingsResponse struct {
 // maxSightingsBatch; 503 while the DB is still starting. Store retries up to
 // sightingsAttempts times with full-jitter backoff; each attempt is capped at
 // sightingsStoreTimeout.
+// maxPopularBatch bounds one publish. poppy sends a whole ecosystem at once —
+// a few thousand entries — and the cap is set well above that so a caller
+// raising its own -top does not silently start losing the tail.
+const (
+	maxPopularBatch = 20000
+	maxPopularBody  = 8 << 20
+)
+
+type popularRequest struct {
+	Source   string `json:"source"`
+	Packages []struct {
+		PURLBase  string `json:"purl_base"`
+		Ecosystem string `json:"ecosystem"`
+		Rank      int    `json:"rank"`
+	} `json:"packages"`
+}
+
+// POST /api/popular — record which package identities are worth extra scrutiny.
+//
+// The body is one source's whole ranking. Entries are keyed on the version-less
+// PURL, so a mark covers releases that do not exist yet; see the
+// popular_packages migration for why this is a table of its own rather than a
+// sighting.
+func (s *apiServer) handlePopular(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
+		return
+	}
+	var req popularRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxPopularBody+1)).Decode(&req); err != nil {
+		slog.WarnContext(r.Context(), "popular rejected: invalid json", "remote", r.RemoteAddr, "error", err)
+		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid json"}`)
+		return
+	}
+	if req.Source == "" {
+		writeJSONError(w, http.StatusBadRequest, `{"error":"source is required"}`)
+		return
+	}
+	if len(req.Packages) > maxPopularBatch {
+		writeJSONError(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf(`{"error":"too many packages (max %d)"}`, maxPopularBatch))
+		return
+	}
+
+	pkgs := make([]hopper.PopularPackage, 0, len(req.Packages))
+	for _, p := range req.Packages {
+		// A version-less PURL is the whole contract here. Anything else would
+		// join against nothing and sit in the table misleading whoever read it.
+		if !strings.HasPrefix(p.PURLBase, "pkg:") || strings.Contains(p.PURLBase, "@") {
+			continue
+		}
+		if p.Rank <= 0 {
+			continue
+		}
+		pkgs = append(pkgs, hopper.PopularPackage{
+			PURLBase:  p.PURLBase,
+			Ecosystem: p.Ecosystem,
+			Source:    req.Source,
+			Rank:      p.Rank,
+		})
+	}
+	if err := s.db.SetPopularPackages(r.Context(), pkgs); err != nil {
+		slog.ErrorContext(r.Context(), "popular publish failed", "remote", r.RemoteAddr, "error", err)
+		writeJSONError(w, http.StatusInternalServerError, `{"error":"internal"}`)
+		return
+	}
+	slog.InfoContext(r.Context(), "popular packages recorded",
+		"source", req.Source, "sent", len(req.Packages), "stored", len(pkgs))
+	// A concrete type rather than map[string]any: the linter cannot prove an
+	// `any` is encodable, and it is right to ask — this shape is fixed.
+	resp := struct {
+		Status   string `json:"status"`
+		Stored   int    `json:"stored"`
+		Rejected int    `json:"rejected"`
+	}{Status: "ok", Stored: len(pkgs), Rejected: len(req.Packages) - len(pkgs)}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp) //nolint:errcheck,errchkjson // best-effort response
+}
+
 func (s *apiServer) handleSightings(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
 		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)

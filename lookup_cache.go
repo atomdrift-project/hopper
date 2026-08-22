@@ -5,6 +5,7 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/codeGROOVE-dev/fido"
@@ -25,7 +26,7 @@ import (
 // cache bounds entry count, not bytes. Oversized samples are served and dropped,
 // capping the pool near lookupCacheSize * lookupEntryBytes.
 const (
-	lookupCacheSize  = 8192
+	lookupCacheSize  = 32768
 	lookupTTL        = 48 * time.Hour
 	lookupEntryBytes = 128 << 10
 )
@@ -37,6 +38,51 @@ const (
 
 func newDB() *DB {
 	return &DB{lookup: fido.New[string, *Sample](fido.Size(lookupCacheSize), fido.TTL(lookupTTL))}
+}
+
+// lookupCounters tallies what the pool absorbed, split by which key was asked
+// about. Plain atomics: the library stays free of any telemetry dependency, and
+// cmd/hopper publishes these through the same observable-instrument path the
+// worker and progress trackers already use.
+type lookupCounters struct {
+	shaServed, shaLoaded   atomic.Uint64
+	purlServed, purlLoaded atomic.Uint64
+}
+
+// LookupStats is a snapshot of sample-lookup traffic since process start.
+//
+// The split that matters is Served versus Loaded, and it is deliberately not
+// the textbook hit/miss pair. Loaded counts the times a request actually ran a
+// query; Served counts every request that did not — a live cache entry, or a
+// concurrent miss that coalesced onto somebody else's in-flight load. Both
+// spare the database equally, which is the question these numbers exist to
+// answer, so both are Served.
+type LookupStats struct {
+	// SHAServed and SHALoaded cover GET /api/sample/{sha256}.
+	SHAServed, SHALoaded uint64
+	// PURLServed and PURLLoaded cover GET /api/sample?purl=.
+	PURLServed, PURLLoaded uint64
+	// Entries currently held, against the fixed capacity below it. A pool
+	// pinned at capacity with a poor served rate is one worth resizing; a pool
+	// well under capacity is not, whatever its hit rate.
+	Entries, Capacity int
+}
+
+// LookupStats reports the in-process sample pool's effect on database load.
+// Safe to call concurrently; the counters are read independently, so a snapshot
+// taken under load may be skewed by a request or two.
+func (db *DB) LookupStats() LookupStats {
+	st := LookupStats{
+		SHAServed:  db.lookupCounts.shaServed.Load(),
+		SHALoaded:  db.lookupCounts.shaLoaded.Load(),
+		PURLServed: db.lookupCounts.purlServed.Load(),
+		PURLLoaded: db.lookupCounts.purlLoaded.Load(),
+		Capacity:   lookupCacheSize,
+	}
+	if db.lookup != nil {
+		st.Entries = db.lookup.Len()
+	}
+	return st
 }
 
 func lookupSHAKey(sha string) string { return lookupSHAPrefix + sha }
@@ -63,18 +109,20 @@ func (db *DB) lookupSampleBySHA256(ctx context.Context, sha256 string) (*Sample,
 	if db.lookup == nil {
 		return db.sampleBySHA256Uncached(ctx, sha256)
 	}
-	return db.fetchSample(lookupSHAKey(sha256), func() (*Sample, error) {
-		return db.sampleBySHA256Uncached(ctx, sha256)
-	})
+	return db.fetchSample(lookupSHAKey(sha256), &db.lookupCounts.shaServed, &db.lookupCounts.shaLoaded,
+		func() (*Sample, error) {
+			return db.sampleBySHA256Uncached(ctx, sha256)
+		})
 }
 
 func (db *DB) lookupSampleByPURL(ctx context.Context, base, version string) (*Sample, error) {
 	if db.lookup == nil {
 		return db.sampleByPURLUncached(ctx, base, version)
 	}
-	return db.fetchSample(lookupPURLKey(base, version), func() (*Sample, error) {
-		return db.sampleByPURLUncached(ctx, base, version)
-	})
+	return db.fetchSample(lookupPURLKey(base, version), &db.lookupCounts.purlServed, &db.lookupCounts.purlLoaded,
+		func() (*Sample, error) {
+			return db.sampleByPURLUncached(ctx, base, version)
+		})
 }
 
 // fetchSample serves key from the pool, loading it once across concurrent
@@ -82,8 +130,22 @@ func (db *DB) lookupSampleByPURL(ctx context.Context, base, version string) (*Sa
 // holding it past the entry's life) cannot corrupt the shared copy. Errors are
 // never cached — a failed load leaves the key open for the next request, which
 // is what keeps a database blip from being memoized as a lasting 404.
-func (db *DB) fetchSample(key string, load func() (*Sample, error)) (*Sample, error) {
-	s, err := db.lookup.Fetch(key, load)
+func (db *DB) fetchSample(key string, served, loaded *atomic.Uint64, load func() (*Sample, error)) (*Sample, error) {
+	// Whether this request reached the database is not observable from the
+	// outside, so ask the only component that knows: the loader itself. fido
+	// runs it exactly once per genuine miss and never for a caller that hit a
+	// live entry or joined an in-flight load, which is precisely the line we
+	// want to count on.
+	ran := false
+	s, err := db.lookup.Fetch(key, func() (*Sample, error) {
+		ran = true
+		return load()
+	})
+	if ran {
+		loaded.Add(1)
+	} else {
+		served.Add(1)
+	}
 	if err != nil {
 		return nil, err
 	}

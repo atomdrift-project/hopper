@@ -102,8 +102,7 @@ type demoteCandidate struct {
 func cmdDemoteSighted(ctx context.Context) error {
 	f := flag.NewFlagSet("demote-sighted", flag.ExitOnError)
 	dsn := f.String("db", "", "database DSN (default: $DATABASE_URL)")
-	//nolint:revive // unsecure-url-scheme: the master API is a plain-http internal cluster endpoint
-	baseURL := f.String("url", "http://hopper-api:8081/", "hopper master API base URL")
+	baseURL := f.String("url", "http://hopper-api:8081/", "hopper master API base URL") //nolint:revive // unsecure-url-scheme: internal cluster HTTP
 	apply := f.Bool("apply", false, "apply the demotions (default: dry-run report only)")
 	batch := f.Int("batch", 1000, "verdicts per /api/triage request")
 	manifest := f.String("manifest", "demote-sighted-manifest.jsonl", "append per-row move results here (the rollback record)")

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -40,6 +41,8 @@ type instruments struct {
 	localMem, localMemBudget                      metric.Int64Observable
 	extractInUse, extractMax                      metric.Int64Observable
 	resultInUse, resultMax                        metric.Int64Observable
+	lookupReqs                                    metric.Int64Observable
+	lookupEntries, lookupCapacity                 metric.Int64Observable
 }
 
 // loadShedCount counts load-shedding events: requests turned away with a
@@ -194,6 +197,15 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 		// hopper.load_shed.total{pool="result"}.
 		resultInUse: gauge("hopper.result.slots_in_use", "Result-ingestion slots currently held.", "{slot}"),
 		resultMax:   gauge("hopper.result.slots_max", "Maximum concurrent result-ingestion slots.", "{slot}"),
+		// Labeled by key kind and by whether the request reached the database,
+		// so the served fraction — the whole point of the pool — is one query
+		// away rather than something to infer from two unrelated counters.
+		lookupReqs: counter("hopper.lookup.requests",
+			"Sample lookups, by key and by whether the request reached the database.", "{request}"),
+		lookupEntries: gauge("hopper.lookup.entries",
+			"Sample lookup entries currently held in the in-process pool.", "{entry}"),
+		lookupCapacity: gauge("hopper.lookup.capacity",
+			"Maximum sample lookup entries the in-process pool will hold.", "{entry}"),
 	}
 	if firstErr != nil {
 		return firstErr
@@ -207,6 +219,17 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 		return fmt.Errorf("register hopper metrics callback: %w", err)
 	}
 	return nil
+}
+
+// clampCount narrows a counter for the Int64 observer. Saturating rather than
+// wrapping: a counter that overflowed would otherwise be reported as negative,
+// and a monotonic instrument going backwards is read downstream as a process
+// restart. Unreachable in practice at any plausible request rate.
+func clampCount(v uint64) int64 {
+	if v > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(v)
 }
 
 // observe gathers one snapshot and records it. It runs per scrape; until the
@@ -223,6 +246,20 @@ func (wd *webDashboard) observe(ctx context.Context, o metric.Observer, in *inst
 	now := time.Now()
 
 	if db != nil {
+		// In-memory counters: no query, no timeout needed, and safe to observe
+		// before the load session is configured.
+		ls := db.LookupStats()
+		lookup := func(key string, served, loaded uint64) {
+			o.ObserveInt64(in.lookupReqs, clampCount(served),
+				metric.WithAttributes(attribute.String("key", key), attribute.String("source", "pool")))
+			o.ObserveInt64(in.lookupReqs, clampCount(loaded),
+				metric.WithAttributes(attribute.String("key", key), attribute.String("source", "database")))
+		}
+		lookup("sha256", ls.SHAServed, ls.SHALoaded)
+		lookup("purl", ls.PURLServed, ls.PURLLoaded)
+		o.ObserveInt64(in.lookupEntries, int64(ls.Entries))
+		o.ObserveInt64(in.lookupCapacity, int64(ls.Capacity))
+
 		cctx, cancel := context.WithTimeout(ctx, metricsCollectTimeout)
 		defer cancel()
 		o.ObserveInt64(in.pending, wd.pendingCount(cctx))

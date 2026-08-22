@@ -563,8 +563,7 @@ func removeMarkers(samplePath string) {
 // Client: `hopper post-triage`.
 func cmdPostTriage(ctx context.Context) error {
 	f := flag.NewFlagSet("post-triage", flag.ExitOnError)
-	//nolint:revive // unsecure-url-scheme: the master API is a plain-http internal cluster endpoint
-	baseURL := f.String("url", "http://hopper-api:8081/", "hopper master API base URL")
+	baseURL := f.String("url", "http://hopper-api:8081/", "hopper master API base URL") //nolint:revive // unsecure-url-scheme: internal cluster HTTP
 	var misplacedGood, misplacedBad stringListFlag
 	f.Var(&misplacedGood, "misplaced-good",
 		"dir of files re-classified benign (was bad); repeatable or comma-separated")

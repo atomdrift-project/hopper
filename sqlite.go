@@ -311,6 +311,16 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		`CREATE INDEX IF NOT EXISTS idx_samples_corroborated ` +
 			`ON samples(created_at) ` +
 			`WHERE corroborated = 1 AND parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL`,
+		// popular_packages: see the Postgres migration for why this is keyed on
+		// the version-less identity and why it is not a sighting.
+		`CREATE TABLE IF NOT EXISTS popular_packages (
+			purl_base  TEXT PRIMARY KEY,
+			ecosystem  TEXT    NOT NULL,
+			rank       INTEGER NOT NULL,
+			source     TEXT    NOT NULL,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_popular_rank ON popular_packages(rank)`,
 		`CREATE TABLE IF NOT EXISTS sightings (
 			source     TEXT NOT NULL,
 			subject    TEXT NOT NULL,

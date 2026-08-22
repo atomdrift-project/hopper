@@ -942,6 +942,36 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 
+		// popular_packages: which package identities are worth extra scrutiny,
+		// and how much. Written by poppy on each daily catalog refresh (~4k rows
+		// per ecosystem, upserted), read by cyclotron's "popular" queue.
+		//
+		// Keyed on purl_base — the version-less identity — for the reason that
+		// makes the whole mechanism work: a marker set on the package applies to
+		// releases that do not exist yet, so tomorrow's version is already in
+		// scope without anyone re-marking it. samples.purl_base is indexed
+		// already, so the join costs nothing.
+		//
+		// Deliberately not a sighting. Sightings have the opposite polarity and
+		// two existing queues read them: a "this is popular" sighting would
+		// count toward TriageSecondOpinion's two-source quorum and would empty
+		// TriageAcquit, which requires that no sighting has ever cited the
+		// subject. Popularity is not evidence about a sample; it is a statement
+		// about how much a mistake would cost.
+		//
+		// `source` is what generalizes it — a customer SBOM or an internal
+		// allowlist is another source in the same table, no schema change.
+		`CREATE TABLE IF NOT EXISTS popular_packages (
+			purl_base  TEXT PRIMARY KEY,
+			ecosystem  TEXT        NOT NULL,
+			rank       INTEGER     NOT NULL,
+			source     TEXT        NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		// The queue orders by rank: a miss on the third most-used package
+		// outranks a miss on the nine-hundredth.
+		`CREATE INDEX IF NOT EXISTS idx_popular_rank ON popular_packages(rank)`,
+
 		// label_events: append-only audit of every label/skip transition
 		// applied by pool reconciliation. Lets a data scientist reconstruct a
 		// sample's ground-truth at a point in time and audit demote/conflict/
@@ -1090,7 +1120,7 @@ func (db *DB) migrateServingPG(ctx context.Context, allowRewrite bool) (func(con
 			}
 			if skip {
 				declined++
-				slog.Debug("replica index policy: declining index", "ddl", ddl) //nolint:gosec // trusted migration DDL
+				slog.Debug("replica index policy: declining index", "ddl", ddl)
 				continue
 			}
 			deferred = append(deferred, ddl)

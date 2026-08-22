@@ -483,6 +483,7 @@ type DB struct {
 	lite             *sql.DB
 	lookup           *fido.Cache[string, *Sample]
 	backfillProgress atomic.Pointer[BackfillProgressFn]
+	lookupCounts     lookupCounters
 	// replicaIndexPolicy makes migrations decline secondary indexes a logical
 	// replica does not need. See SetReplicaIndexPolicy.
 	replicaIndexPolicy bool
@@ -1806,8 +1807,6 @@ func (db *DB) ApplyCleanup(ctx context.Context, stage CleanupStage) (int64, erro
 	return n, err
 }
 
-// Open connects to the registry. DSNs starting with postgres:// or
-// postgresql:// use PostgreSQL; everything else is treated as a SQLite path.
 // AppName identifies the connecting service to PostgreSQL. It lands in
 // application_name, which is what pg_stat_activity, pg_stat_statements and
 // log_line_prefix attribute a backend by.
@@ -1841,7 +1840,7 @@ func (a AppName) valid() error {
 	}
 	// PostgreSQL replaces non-printable and non-ASCII bytes in application_name
 	// with '?', so reject them here rather than ship a name full of question marks.
-	for i := 0; i < len(a); i++ {
+	for i := range len(a) {
 		if c := a[i]; c < 0x20 || c > 0x7e {
 			return fmt.Errorf("hopper: application name %q has a non-printable-ASCII byte at %d", string(a), i)
 		}
@@ -1849,10 +1848,12 @@ func (a AppName) valid() error {
 	return nil
 }
 
-// Open connects to a hopper database. app names the calling service and is
-// required; see AppName. It is recorded as application_name on PostgreSQL and
-// ignored by the SQLite backend, which has no equivalent — required there too
-// so a service cannot become anonymous by switching backends.
+// Open connects to the registry. DSNs starting with postgres:// or
+// postgresql:// use PostgreSQL; everything else is treated as a SQLite path.
+// app names the calling service and is required; see AppName. It is recorded
+// as application_name on PostgreSQL and ignored by the SQLite backend, which
+// has no equivalent — required there too so a service cannot become anonymous
+// by switching backends.
 func Open(ctx context.Context, dsn string, app AppName) (*DB, error) {
 	if err := app.valid(); err != nil {
 		return nil, err
