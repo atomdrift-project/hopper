@@ -38,8 +38,9 @@ if psql -U postgres $HOSTARG -tAc 'SELECT 1' >/dev/null 2>&1; then
     admin() { psql -U postgres $HOSTARG "$@"; }
 elif command -v doas >/dev/null 2>&1 && doas -u postgres psql -tAc 'SELECT 1' >/dev/null 2>&1; then
     admin() { doas -u postgres psql "$@"; }
-elif command -v pfexec >/dev/null 2>&1 && pfexec -u postgres psql -tAc 'SELECT 1' >/dev/null 2>&1; then
-    admin() { pfexec -u postgres psql "$@"; }
+elif command -v pfexec >/dev/null 2>&1 && pfexec su postgres -c "psql -tAc 'SELECT 1'" >/dev/null 2>&1; then
+    # Not `pfexec -u`: OmniOS pfexec has no -u flag (that is Solaris 11).
+    admin() { pfexec su postgres -c "psql $*"; }
 elif command -v sudo >/dev/null 2>&1 && sudo -u postgres psql -tAc 'SELECT 1' >/dev/null 2>&1; then
     admin() { sudo -u postgres psql "$@"; }
 else
@@ -47,7 +48,14 @@ else
     exit 1
 fi
 
-if [ "$(admin -d "$DB" -tAc 'SELECT current_setting(''is_superuser'')' 2>/dev/null)" != "on" ]; then
+# Distinguish "not superuser" from "cannot even reach $DB": the ladder above
+# probes the default maintenance DB, and pg_hba may allow that while denying
+# $DB — reporting that as a role problem cost real debugging time (2026-08-22).
+if ! admin -d "$DB" -tAc 'SELECT 1' >/dev/null 2>&1; then
+    echo "error: cannot connect to db=$DB as the selected admin role (pg_hba?)" >&2
+    exit 1
+fi
+if [ "$(admin -d "$DB" -tAc "SELECT current_setting('is_superuser')" 2>/dev/null)" != "on" ]; then
     echo "error: connected role is not a superuser; ALTER SYSTEM would fail" >&2
     exit 1
 fi
@@ -55,7 +63,13 @@ fi
 run() {
     printf '  %s\n' "$1" >&2
     [ "$DRY_RUN" = "1" ] && return 0
-    admin -d "$DB" -v ON_ERROR_STOP=1 -qc "$1"
+    # Hard stop on failure: each statement is its own psql, so without this a
+    # failed ALTER is silently followed by the rest and leaves a partial
+    # config staged in postgresql.auto.conf (observed 2026-08-22).
+    admin -d "$DB" -v ON_ERROR_STOP=1 -qc "$1" || {
+        echo "error: statement failed; aborting before staging a partial config" >&2
+        exit 1
+    }
 }
 
 # Already loaded? Then we are on the second pass: just create the extension.
@@ -66,12 +80,16 @@ loaded=$(admin -d "$DB" -tAc \
 if [ "$loaded" != "1" ]; then
     echo "== step 1: stage pg_stat_statements in shared_preload_libraries ==" >&2
     # Append rather than overwrite — never clobber an existing preload list.
-    run "ALTER SYSTEM SET shared_preload_libraries =
-         (SELECT string_agg(DISTINCT lib, ',')
-          FROM (SELECT unnest(string_to_array(
-                  current_setting('shared_preload_libraries'), ',')) AS lib
-                WHERE lib <> ''
-                UNION SELECT 'pg_stat_statements') x)"
+    # Read-modify-write from the shell: ALTER SYSTEM accepts only literal
+    # values, never expressions or subqueries, so the merge cannot be done in
+    # SQL (a subquery here is a syntax error — found the hard way 2026-08-22).
+    cur=$(admin -d "$DB" -tAc "SHOW shared_preload_libraries" | tr -d ' ')
+    case ",$cur," in
+        *,pg_stat_statements,*) new="$cur" ;;
+        ,,)                     new="pg_stat_statements" ;;
+        *)                      new="$cur,pg_stat_statements" ;;
+    esac
+    run "ALTER SYSTEM SET shared_preload_libraries = '$new'"
     run "ALTER SYSTEM SET pg_stat_statements.max = $MAX"
     run "ALTER SYSTEM SET pg_stat_statements.track = 'top'"
     cat >&2 <<'EOF'
