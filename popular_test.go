@@ -161,3 +161,24 @@ func TestTriagePopularRanksByImportanceNotLabel(t *testing.T) {
 		}
 	}
 }
+
+func TestPopularRanksReturnsTheWholeSet(t *testing.T) {
+	db := openTestDB(t)
+	ctx := t.Context()
+	if err := db.SetPopularPackages(ctx, []PopularPackage{
+		{PURLBase: "pkg:npm/left-pad", Ecosystem: "npm", Rank: 7, Source: "poppy"},
+		{PURLBase: "pkg:gem/rails", Ecosystem: "gem", Rank: 2, Source: "poppy"},
+	}); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	got, err := db.PopularRanks(ctx)
+	if err != nil {
+		t.Fatalf("PopularRanks: %v", err)
+	}
+	if len(got) != 2 || got["pkg:npm/left-pad"] != 7 || got["pkg:gem/rails"] != 2 {
+		t.Errorf("PopularRanks = %v, want left-pad:7 rails:2", got)
+	}
+	if _, ok := got["pkg:npm/never-marked"]; ok {
+		t.Error("PopularRanks invented an identity")
+	}
+}
