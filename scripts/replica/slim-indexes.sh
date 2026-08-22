@@ -81,17 +81,29 @@ fi
 # Indexes a prism read path needs on the replica. One name per line.
 # Everything else on a subscribed table is dropped.
 REPLICA_KEEP_INDEXES='
+idx_claims_name
+idx_claims_signer
+idx_label_events_sha
+idx_reports_sha256_type_created
 idx_samples_bad_miss_newest
 idx_samples_bad_miss_stale
+idx_samples_domain
+idx_samples_eco_top_created
+idx_samples_ecosystem
+idx_samples_feed
+idx_samples_feed_top_created_done
 idx_samples_good_repair_newest
 idx_samples_good_repair_stale
 idx_samples_new_interesting
 idx_samples_new_stale
 idx_samples_purl_lookup
 idx_samples_sighted_newest
+idx_samples_top_ready_created
 idx_samples_unknown_newest
 idx_sightings_subject
 idx_sl_child_parents
+idx_sl_containment
+idx_slh_sha256_retired
 '
 
 # Master-only: worker queues, ingest lookups, and covering variants prism never
@@ -100,7 +112,6 @@ idx_sl_child_parents
 # from here, so the guard keeps passing.
 REPLICA_DROP_INDEXES='
 idx_reports_created_at
-idx_reports_sha256_type_created
 idx_samples_analyzed_at
 idx_samples_bad_route_score
 idx_samples_claimable
@@ -108,14 +119,9 @@ idx_samples_claimable_sha
 idx_samples_claimed
 idx_samples_corroborated_created
 idx_samples_created_at
-idx_samples_domain
 idx_samples_eco_class_created
-idx_samples_eco_top_created
-idx_samples_ecosystem
-idx_samples_feed
 idx_samples_feed_source
 idx_samples_feed_source_mtime
-idx_samples_feed_top_created_done
 idx_samples_file_type
 idx_samples_filename_trgm
 idx_samples_formula
@@ -126,6 +132,8 @@ idx_samples_package_version
 idx_samples_parent
 idx_samples_pending_cleave_group
 idx_samples_pending_litmus_group
+idx_samples_pending_path
+idx_samples_pending_size
 idx_samples_purl_base
 idx_samples_reconcile_toplevel
 idx_samples_rescan_queue
@@ -137,11 +145,9 @@ idx_samples_stale_traits
 idx_samples_stale_traits_pri
 idx_samples_stranded_member
 idx_samples_top_created
-idx_samples_top_ready_created
 idx_samples_top_ready_first_analyzed_coalesce
 idx_samples_unanalyzed_id
 idx_samples_updated_at
-idx_sl_containment
 idx_sl_incoming_mtime
 idx_sl_parent
 idx_sl_parent_child

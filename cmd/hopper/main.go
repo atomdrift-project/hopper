@@ -1584,7 +1584,16 @@ func (p *loadProgress) recentErrors() []progressError {
 }
 
 const (
-	loadBatchSize = 2000
+	// 500, down from 2000 (2026-08-22): the batch upsert takes ON CONFLICT row
+	// locks on every sha in the batch, and result stores share those rows
+	// (archive members are usually also on-disk files), so batch size is
+	// directly the width of the lock window concurrent stores can queue
+	// behind. 2000-row batches ran multi-second and showed up as 70% of DB
+	// time with 10-deep lock convoys; 500 keeps COPY amortization while
+	// cutting the worst-case hold to a quarter. Pairs with the two-transaction
+	// split in insertSampleBatchPG, which stops the fan-out writes from
+	// extending the hold further.
+	loadBatchSize = 500
 	minFileSize   = 13 // skip trivially small files (markers, empty, etc.)
 	// 20 GiB — admit full OS images (ISO/UDF, DMG) from the os-image feed;
 	// cleave streams-to-temp and workers are memory-scheduled.

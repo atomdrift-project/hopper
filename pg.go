@@ -126,6 +126,21 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// unanalyzedPG orders by id, so the pending set is indexed on id rather
 		// than sha256 — that lets the query avoid a sort at 100M rows.
 		`CREATE INDEX IF NOT EXISTS idx_samples_unanalyzed_id ON samples(id) WHERE cleave_result IS NULL`,
+		// bigArchiveCandidatesPG hands the largest pending samples to
+		// big-slot workers, ORDER BY size_bytes DESC. Without this index the
+		// planner scanned a fat index and sorted — 4.5s/call, #5 by total
+		// exec time (pg_stat_statements, 2026-08-22) — inside every
+		// /api/next poll from a capable worker. Pending-set-only, so it
+		// stays a few MB regardless of corpus size.
+		`CREATE INDEX IF NOT EXISTS idx_samples_pending_size ON samples(size_bytes DESC) ` +
+			`WHERE cleave_result IS NULL AND skip = '' AND parent = ''`,
+		// The walk's mark-replaced UPDATE joins staged paths against live
+		// pending rows (s.path = st.sample_path AND skip = '' AND
+		// cleave_result IS NULL). samples has no other path index, so every
+		// walk batch seq-scanned the 143GB heap — 8.8s/call, #4 by total
+		// exec time. Same tiny pending-set footprint as above.
+		`CREATE INDEX IF NOT EXISTS idx_samples_pending_path ON samples(path) ` +
+			`WHERE cleave_result IS NULL AND skip = ''`,
 		// Covers falsePositivesPG / truePositivesPG / falseNegativesPG — all filter
 		// (label, score, cleave_result IS NOT NULL, status='', skip='').
 		// countAnalyzedPG: SELECT count(*) WHERE litmus_result IS NOT NULL — no index existed.
@@ -2115,7 +2130,7 @@ var insertBatchStagingCols = []string{
 	"sample_parent", "sample_path",
 }
 
-const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
+const insertBatchStagingCore = `CREATE TEMP TABLE _staging (
 	sha256 TEXT, source TEXT, feed TEXT, ecosystem TEXT, filename TEXT,
 	size_bytes BIGINT, label TEXT, label_source TEXT,
 	path TEXT, status TEXT, canonical_sha256 TEXT,
@@ -2125,7 +2140,19 @@ const insertBatchStagingDDL = `CREATE TEMP TABLE _staging (
 	cleave_result JSONB, litmus_result JSONB, analyzed_at TIMESTAMPTZ, first_analyzed_at TIMESTAMPTZ,
 	url TEXT, domain TEXT, package TEXT, version TEXT, provenance JSONB, fetched_at TIMESTAMPTZ,
 	sample_parent TEXT, sample_path TEXT
-) ON COMMIT DROP`
+)`
+
+// insertBatchStagingDDL is the single-transaction form: the table vanishes at
+// commit, so one tx stages, upserts, and cleans up after itself.
+const insertBatchStagingDDL = insertBatchStagingCore + ` ON COMMIT DROP`
+
+// insertBatchStagingSessionDDL is the cross-transaction form used by
+// insertSampleBatchPG, which stages once and then runs SEVERAL transactions
+// over the same rows (see that function for why). The table is session-scoped,
+// so the function must drop it before releasing its connection back to the
+// pool — a leaked _staging on a pooled connection makes the next borrower's
+// CREATE TEMP TABLE _staging fail.
+const insertBatchStagingSessionDDL = insertBatchStagingCore
 
 // file_type, score, formula are derived DB-side by the
 // samples_derive_cleave_cols trigger and litmus_score by the
@@ -2219,6 +2246,14 @@ WHERE EXCLUDED.parent = ''
         AND (samples.label <> EXCLUDED.label OR samples.label_source <> 'marker' OR samples.skip <> 'misclassified'))
     OR (samples.label_source = 'marker' AND EXCLUDED.label_source <> 'marker'))`
 
+// insertBatchStagingInsert upserts the staged walk rows into samples. The
+// trailing ORDER BY sha256 mirrors insertMembersFromStagingPG: walk batches and
+// member stores frequently touch the SAME rows (an archive member exploded into
+// samples is often also a file on disk the walker finds), and with both writers
+// acquiring row locks in sha256 order they queue instead of deadlocking, and
+// the queueing itself stays orderly. Measured 2026-08-22: this statement was
+// 70% of all DB execution time with 10-deep transactionid convoys — ordering is
+// load-bearing, not cosmetic. The leading column also satisfies DISTINCT ON.
 var insertBatchStagingInsert = `INSERT INTO samples (
 	sha256, source, feed, ecosystem, filename,
 	size_bytes, label, label_source, path, status,
@@ -2234,6 +2269,7 @@ SELECT DISTINCT ON (sha256)
 	cleave_result, litmus_result, analyzed_at, first_analyzed_at,
 	url, domain, package, version, provenance, fetched_at
 FROM _staging
+ORDER BY sha256
 ` + sampleConflictUpdatePG
 
 // logLabelTransitionsPG logs each top-level re-observation in _staging whose
@@ -2342,21 +2378,66 @@ const locationsFromStagingPG = `
 		ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE sample_locations.ecosystem END,
 		mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)` + locationChangedPG
 
+// insertSampleBatchPG upserts one walk batch. It deliberately runs as TWO
+// transactions over one session-scoped staging table, not one:
+//
+// The samples upsert takes ON CONFLICT row locks on every sha in the batch,
+// and those rows are shared with the result-store path (archive members
+// exploded into samples are usually also files on disk the walker sees). As a
+// single transaction, those locks were held across the sample_locations
+// fan-out and two more UPDATEs — multi-second work against a table whose
+// indexes dwarf the buffer cache — and every concurrent store queued behind
+// them. Measured 2026-08-22: this statement alone was ~70% of database
+// execution time, 3.5s mean with a 1.5% cache-miss rate (pure lock wait), with
+// 10-deep transactionid convoys behind single batches. Committing the samples
+// upsert FIRST releases the contended locks in milliseconds-to-a-second;
+// the derived writes then run without anyone queueing on them.
+//
+// Crash/failure window this buys into: tx1 committed, tx2 failed → sample
+// rows exist with their location fan-out missing. That is benign and
+// self-healing: the caller reports the batch failed, so the hash cache never
+// records these files, and the next walk re-stages them — tx1 re-runs as a
+// delta-guarded no-op and tx2 gets its retry. (The same shape as a crash
+// between the two, which the single-transaction form also could not survive
+// without the re-walk.)
 func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inserted int64, needsAnalysis []string, err error) {
 	rows := sampleStagingRows(samples)
 
-	tx, err := db.pool.Begin(ctx)
+	// One connection for the whole batch: the staging table is session-scoped
+	// so it can outlive tx1. It MUST be dropped before the connection returns
+	// to the pool — the next borrower's CREATE TEMP TABLE _staging would
+	// collide — and the drop uses a detached context so a canceled batch
+	// can't leak the table onto a healthy pooled connection.
+	conn, err := db.pool.Acquire(ctx)
+	if err != nil {
+		return 0, nil, fmt.Errorf("hopper: acquire batch conn: %w", err)
+	}
+	defer conn.Release()
+	defer func() {
+		dropCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if _, derr := conn.Exec(dropCtx, `DROP TABLE IF EXISTS _staging`); derr != nil {
+			// The connection is likely broken; poison it so the pool discards
+			// it instead of handing the leftover table to the next borrower.
+			slog.Warn("drop batch staging table failed; discarding connection", "error", derr)
+			conn.Conn().Close(dropCtx) //nolint:errcheck // already tearing down
+		}
+	}()
+
+	if _, err := conn.Exec(ctx, insertBatchStagingSessionDDL); err != nil {
+		return 0, nil, fmt.Errorf("hopper: create staging: %w", err)
+	}
+	if _, err := conn.Conn().CopyFrom(ctx, pgx.Identifier{"_staging"}, insertBatchStagingCols, pgx.CopyFromRows(rows)); err != nil {
+		return 0, nil, fmt.Errorf("hopper: copy to staging: %w", err)
+	}
+
+	// tx1: ONLY the contended samples upsert, so its row locks are released
+	// the moment the batch's identity resolution lands.
+	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return 0, nil, fmt.Errorf("hopper: begin batch: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
-
-	if _, err := tx.Exec(ctx, insertBatchStagingDDL); err != nil {
-		return 0, nil, fmt.Errorf("hopper: create staging: %w", err)
-	}
-	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"_staging"}, insertBatchStagingCols, pgx.CopyFromRows(rows)); err != nil {
-		return 0, nil, fmt.Errorf("hopper: copy to staging: %w", err)
-	}
 
 	logLabelTransitionsPG(ctx, tx)
 
@@ -2365,25 +2446,36 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 		return 0, nil, fmt.Errorf("hopper: insert from staging: %w", err)
 	}
 	inserted = tag.RowsAffected()
-
-	// Fan the staging rows out into sample_locations in the same transaction.
-	if _, err := tx.Exec(ctx, locationsFromStagingPG); err != nil {
-		return 0, nil, fmt.Errorf("hopper: upsert locations from staging: %w", err)
+	if err := tx.Commit(ctx); err != nil {
+		return 0, nil, fmt.Errorf("hopper: commit batch: %w", err)
 	}
 
-	if _, err := tx.Exec(ctx, `
+	// tx2: derived writes. These touch disjoint or per-row-cheap state (the
+	// locations ledger, marker refresh, replaced marking) and no longer extend
+	// the samples locks' hold time.
+	tx2, err := conn.Begin(ctx)
+	if err != nil {
+		return inserted, nil, fmt.Errorf("hopper: begin batch fanout: %w", err)
+	}
+	defer tx2.Rollback(ctx) //nolint:errcheck // commit or rollback
+
+	if _, err := tx2.Exec(ctx, locationsFromStagingPG); err != nil {
+		return inserted, nil, fmt.Errorf("hopper: upsert locations from staging: %w", err)
+	}
+
+	if _, err := tx2.Exec(ctx, `
 		UPDATE samples s
 		SET marker_mtime = st.marker_mtime
 		FROM _staging st
 		WHERE s.sha256 = st.sha256
 			AND st.marker_mtime IS NOT NULL`); err != nil {
-		return 0, nil, fmt.Errorf("hopper: refresh marker mtime: %w", err)
+		return inserted, nil, fmt.Errorf("hopper: refresh marker mtime: %w", err)
 	}
 
 	// Mark stale rows whose path now belongs to a different SHA256.
 	// This happens when a file is replaced on disk — the walk inserts a
 	// new row for the new content but the old row lingers in the queue.
-	if _, err := tx.Exec(ctx, `
+	if _, err := tx2.Exec(ctx, `
 		UPDATE samples s
 		SET skip = 'replaced'
 		FROM _staging st
@@ -2392,29 +2484,32 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 			AND s.sha256 != st.sha256
 			AND s.skip = ''
 			AND s.cleave_result IS NULL`); err != nil {
-		return 0, nil, fmt.Errorf("hopper: mark replaced: %w", err)
+		return inserted, nil, fmt.Errorf("hopper: mark replaced: %w", err)
+	}
+
+	if err := tx2.Commit(ctx); err != nil {
+		return inserted, nil, fmt.Errorf("hopper: commit batch fanout: %w", err)
 	}
 
 	// Find SHAs that lack analysis results (including ones we just skipped).
-	query := `SELECT s.sha256 FROM samples s
+	// A plain read over committed state — no transaction to hold open for it.
+	queryRows, err := conn.Query(ctx, `SELECT s.sha256 FROM samples s
 		JOIN _staging st ON s.sha256 = st.sha256
-		WHERE s.litmus_result IS NULL`
-	queryRows, err := tx.Query(ctx, query)
+		WHERE s.litmus_result IS NULL`)
 	if err != nil {
-		return 0, nil, fmt.Errorf("hopper: query needs analysis: %w", err)
+		return inserted, nil, fmt.Errorf("hopper: query needs analysis: %w", err)
 	}
 	defer queryRows.Close()
 
 	for queryRows.Next() {
 		var sha string
 		if err := queryRows.Scan(&sha); err != nil {
-			return 0, nil, fmt.Errorf("hopper: scan needs analysis: %w", err)
+			return inserted, nil, fmt.Errorf("hopper: scan needs analysis: %w", err)
 		}
 		needsAnalysis = append(needsAnalysis, sha)
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return 0, nil, fmt.Errorf("hopper: commit batch: %w", err)
+	if err := queryRows.Err(); err != nil {
+		return inserted, nil, fmt.Errorf("hopper: needs analysis rows: %w", err)
 	}
 
 	return inserted, needsAnalysis, nil
