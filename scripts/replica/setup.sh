@@ -549,7 +549,13 @@ fi
 # --- Subscription ----------------------------------------------------------
 # We keep the password out of argv by passing it through psql's -v mechanism
 # (:'name' expands to a properly-quoted SQL literal inside the client).
-CONN="host=$REMOTE_HOST dbname=$REMOTE_DB user=$REMOTE_USER password=$REMOTE_PW"
+# options=-c lock_timeout=0: the publisher runs a global lock_timeout (10s),
+# but a tablesync worker's CREATE_REPLICATION_SLOT must wait for a consistent
+# snapshot behind whatever transactions are in flight there — on 2026-08-22 a
+# 15-minute master transaction cancelled slot creation at 10s and
+# disable_on_error shut the subscription off. Scoped to the replication
+# connections only; nothing else on the publisher is affected.
+CONN="host=$REMOTE_HOST dbname=$REMOTE_DB user=$REMOTE_USER password=$REMOTE_PW options='-c lock_timeout=0'"
 
 sub_exists=$(admin -d "$LOCAL_DB" -tAc \
     "SELECT 1 FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" | tr -d '[:space:]')

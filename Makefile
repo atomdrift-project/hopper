@@ -103,6 +103,13 @@ deploy-linux:
 	MAX_MEMORY_GB='$(MAX_MEMORY_GB)' \
 	./scripts/master/linux-systemd.sh
 
+# Read-only lookup API on a replica box (systemd): serves GET /api/sample and
+# friends from the local replica DB so beamline's lookups never queue behind
+# publisher ingestion. Writes are refused at the route AND session layer.
+deploy-replica: build
+	DB='$(REPLICA_DB)' API_ADDR='$(REPLICA_API_ADDR)' \
+		./scripts/replica/deploy-replica-api.sh
+
 deploy-freebsd:
 	DATA_DIR='$(DATA_DIR)' DB='$(DB)' SOURCE='$(SOURCE)' \
 	API_ADDR='$(API_ADDR)' DASH_ADDR='$(DASH_ADDR)' WORKERS='$(FREEBSD_WORKERS)' \

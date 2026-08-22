@@ -55,6 +55,10 @@ type apiServer struct {
 	rescanAge           time.Duration
 	ready               atomic.Bool
 	datasetIncomplete   bool
+	// readOnly marks a serve-replica instance: mutating routes answer 403 and
+	// the DB sessions run under default_transaction_read_only (see
+	// cmdServeReplica for why both layers exist).
+	readOnly bool
 }
 
 // errSaturated is returned by the slot-acquire helpers when no slot frees
@@ -686,7 +690,39 @@ func (wt *workerTracker) all() []namedWorkerStats {
 
 // registerAPI mounts the work API routes on the given mux.
 func (s *apiServer) registerAPI(mux *http.ServeMux) {
+	// Read routes: safe against any backend, including a logical-replication
+	// subscriber (serve-replica). File-serving routes need a data root; a
+	// replica API typically has no corpus on disk, and registering
+	// safeFileServer with an empty root would be a path-containment bug
+	// waiting to happen, so they exist only when there are bytes to serve.
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("GET /api/sample/{sha256}", s.handleSample)
+	mux.HandleFunc("GET /api/sample", s.handleSampleByPURL)
+	mux.HandleFunc("GET /api/provenance/{sha256}", s.handleProvenance)
+	mux.HandleFunc("GET /api/locations/incoming", s.handleIncomingLocations)
+	if s.dataRoot != "" || !s.readOnly {
+		mux.HandleFunc("GET /api/file/{sha256}", s.handleFile)
+		mux.Handle("GET /data/", s.safeFileServer())
+	}
+
+	if s.readOnly {
+		// A logical replica is WRITABLE at the Postgres level (a subscriber is
+		// an ordinary primary), and a write here would silently diverge it
+		// from the publisher until the next conflict wedged replication. The
+		// session-level default_transaction_read_only guard is the backstop;
+		// this is the front door: every mutating route answers 403 so a
+		// misconfigured worker or collector learns immediately that it is
+		// talking to the wrong hopper.
+		for _, ep := range []string{
+			"GET /api/next", "GET /api/heartbeat", "POST /api/result",
+			"POST /api/upload", "POST /api/known", "POST /api/sightings",
+			"POST /api/popular", "POST /api/triage", "POST /api/rescan/{sha256}",
+		} {
+			mux.HandleFunc(ep, handleReadOnlyRefusal)
+		}
+		return
+	}
+
 	mux.HandleFunc("GET /api/next", s.handleNext)
 	mux.HandleFunc("GET /api/heartbeat", s.handleHeartbeat)
 	mux.HandleFunc("POST /api/result", s.handleResult)
@@ -694,14 +730,15 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/known", s.handleKnown)
 	mux.HandleFunc("POST /api/sightings", s.handleSightings)
 	mux.HandleFunc("POST /api/popular", s.handlePopular)
-	mux.HandleFunc("GET /api/locations/incoming", s.handleIncomingLocations)
 	mux.HandleFunc("POST /api/triage", s.handleTriage)
 	mux.HandleFunc("POST /api/rescan/{sha256}", s.handleRescan)
-	mux.HandleFunc("GET /api/sample/{sha256}", s.handleSample)
-	mux.HandleFunc("GET /api/sample", s.handleSampleByPURL)
-	mux.HandleFunc("GET /api/file/{sha256}", s.handleFile)
-	mux.HandleFunc("GET /api/provenance/{sha256}", s.handleProvenance)
-	mux.Handle("GET /data/", s.safeFileServer())
+}
+
+// handleReadOnlyRefusal answers every mutating route on a read-only replica.
+// 403 rather than 405: the method is fine, the server will never allow it, and
+// clients must not retry (a 503 would invite exactly that).
+func handleReadOnlyRefusal(w http.ResponseWriter, _ *http.Request) {
+	writeJSONError(w, http.StatusForbidden, `{"error":"read-only replica; writes go to the primary hopper"}`)
 }
 
 // handleHealthz is a liveness probe that deliberately touches nothing — no

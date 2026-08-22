@@ -319,12 +319,19 @@ func main() {
 
 	// Init OTel. DisableSlog so we keep the stderr+file fan-out built by
 	// setupLogging and just add the OTLP sink as one more handler.
-	obsShutdown, err := obs.Init(ctx, obs.Config{ServiceName: "hopper", DisableSlog: true})
+	// The replica API must not report as the primary: its millisecond replica
+	// lookups pushed under job="hopper" would blend into (and cosmetically
+	// cure) the primary's latency series. Same binary, distinct identity.
+	serviceName := "hopper"
+	if len(os.Args) > 1 && os.Args[1] == "serve-replica" {
+		serviceName = "hopper-replica"
+	}
+	obsShutdown, err := obs.Init(ctx, obs.Config{ServiceName: serviceName, DisableSlog: true})
 	if err != nil {
 		writeStderrf("obs init: %v\n", err)
 		os.Exit(1)
 	}
-	slog.SetDefault(slog.New(obs.TeeSlog(slog.Default().Handler(), "hopper")))
+	slog.SetDefault(slog.New(obs.TeeSlog(slog.Default().Handler(), serviceName)))
 
 	// Force-exit on a second interrupt so cleanup can't hang forever.
 	go func() {
@@ -375,6 +382,8 @@ func run(ctx context.Context) error {
 	switch os.Args[1] {
 	case "serve":
 		return cmdServe(ctx)
+	case "serve-replica":
+		return cmdServeReplica(ctx)
 	case "init":
 		return cmdInit(ctx)
 	case "import":
@@ -592,6 +601,144 @@ func openDB(ctx context.Context, dsn string) (*hopper.DB, error) {
 	}
 	slog.Info("connecting to database", "dsn", redactDSN(dsn)) //nolint:gosec // dsn is redacted before logging
 	return hopper.Open(ctx, dsn, "hopper")
+}
+
+// cmdServeReplica runs the read-only lookup API against a local replica
+// database — GET /api/sample, /api/sample/{sha}, /api/provenance and friends,
+// with every mutating route answering 403. It exists so read traffic
+// (beamline's purl lookups above all) rides the replica's idle disk instead of
+// competing with ingestion on the publisher: measured 2026-08-22, the
+// publisher's lookup path was millisecond-indexed and cached yet showed a ~7s
+// p95, purely from read-tail I/O queueing behind the walk and stores — which
+// fired beamline's scan hedge and reflected the load back as redundant scans
+// and renewals.
+//
+// Two independent read-only guards, both load-bearing: a logical-replication
+// subscriber is an ORDINARY WRITABLE PRIMARY (pg_is_in_recovery() = false), so
+// one stray write silently diverges it from the publisher until the apply
+// worker hits the conflict and replication wedges. The route layer 403s
+// mutations; the session layer forces default_transaction_read_only=on via
+// the DSN and startup fails closed if the setting did not take.
+func cmdServeReplica(ctx context.Context) error {
+	f := flag.NewFlagSet("serve-replica", flag.ExitOnError)
+	dsn := f.String("db", "postgres://hopper@127.0.0.1:5432/hopper",
+		"replica database (postgres:// DSN; sessions are forced read-only)")
+	apiAddr := f.String("api-addr", "127.0.0.1:8091",
+		"listen address for the read-only API; pass 0.0.0.0:8091 to serve the LAN")
+	tokenFile := f.String("token-file", "",
+		"file holding the bearer token the API requires; empty serves unauthenticated (loopback binds only)")
+	dataDir := f.String("data", "",
+		"optional corpus root for /api/file and /data/; empty disables byte serving")
+	parseFlags(f, os.Args[2:])
+
+	// Force read-only sessions in the DSN itself so every pooled connection
+	// starts with default_transaction_read_only=on — no application code path
+	// can forget to set it.
+	roDSN, err := forceReadOnlyDSN(*dsn)
+	if err != nil {
+		return fmt.Errorf("serve-replica: %w", err)
+	}
+
+	var apiToken *tokenDigest
+	if *tokenFile != "" {
+		if apiToken, err = loadTokenDigest(*tokenFile); err != nil {
+			return fmt.Errorf("serve-replica: %w", err)
+		}
+	} else if !strings.HasPrefix(*apiAddr, "127.") && !strings.HasPrefix(*apiAddr, "localhost:") {
+		return errors.New("serve-replica: refusing a non-loopback --api-addr without --token-file")
+	}
+
+	db, err := hopper.Open(ctx, roDSN, "hopper-replica")
+	if err != nil {
+		return fmt.Errorf("serve-replica: open: %w", err)
+	}
+	defer db.Close()
+
+	// Fail closed: prove the read-only session guard actually took before
+	// serving a single request. A DSN typo here must be fatal, not a warning.
+	if err := verifyReadOnlySession(ctx, db); err != nil {
+		return err
+	}
+
+	api := &apiServer{
+		hopperStart: time.Now().UTC(),
+		db:          db,
+		tracker:     newWorkerTracker(),
+		readOnly:    true,
+	}
+	if *dataDir != "" {
+		root, rerr := filepath.EvalSymlinks(*dataDir)
+		if rerr != nil {
+			return fmt.Errorf("serve-replica: resolve --data: %w", rerr)
+		}
+		api.dataRoot = root
+		api.allowedDirs = []string{root}
+	}
+	api.ready.Store(true)
+
+	mux := http.NewServeMux()
+	api.registerAPI(mux)
+	mux.Handle("GET /_/metrik", obs.MetricsHandler())
+	// The same auth-exempt probe trio the primary serves, so monitoring needs
+	// no per-flavor configuration. /_/ready proves the one thing this service
+	// exists to do — answer lookups from the replica DB — with a bounded ping.
+	mux.HandleFunc("GET /_/health", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok")) //nolint:errcheck // best-effort HTTP response
+	})
+	mux.HandleFunc("GET /_/ready", func(w http.ResponseWriter, r *http.Request) {
+		pingCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := db.Pool().Ping(pingCtx); err != nil {
+			http.Error(w, "replica database unreachable", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte("ok")) //nolint:errcheck // best-effort HTTP response
+	})
+	if err := obs.PoolStats("hopper-replica", db.Pool()); err != nil {
+		slog.Warn("serve-replica: pool stats registration", "error", err)
+	}
+
+	handler := recoverMiddleware(obs.Middleware(authMiddleware(apiToken, mux)))
+	slog.Info("read-only replica API listening",
+		"addr", *apiAddr, "authenticated", apiToken != nil, "bytes", api.dataRoot != "")
+	srv := &http.Server{Addr: *apiAddr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shCtx) //nolint:errcheck // best-effort drain on signal
+	}()
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("serve-replica: %w", err)
+	}
+	return nil
+}
+
+// forceReadOnlyDSN appends default_transaction_read_only=on to a postgres URL's
+// options, preserving any options already present.
+func forceReadOnlyDSN(dsn string) (string, error) {
+	u, err := url.Parse(dsn)
+	if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") {
+		return "", fmt.Errorf("--db must be a postgres:// DSN (got %q)", dsn)
+	}
+	q := u.Query()
+	opts := strings.TrimSpace(q.Get("options") + " -c default_transaction_read_only=on")
+	q.Set("options", opts)
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}
+
+// verifyReadOnlySession confirms the pooled sessions really are read-only.
+func verifyReadOnlySession(ctx context.Context, db *hopper.DB) error {
+	var setting string
+	if err := db.Pool().QueryRow(ctx,
+		`SELECT current_setting('default_transaction_read_only')`).Scan(&setting); err != nil {
+		return fmt.Errorf("serve-replica: verify read-only: %w", err)
+	}
+	if setting != "on" {
+		return fmt.Errorf("serve-replica: sessions are NOT read-only (default_transaction_read_only=%q); refusing to serve", setting)
+	}
+	return nil
 }
 
 func cmdServe(ctx context.Context) error {
