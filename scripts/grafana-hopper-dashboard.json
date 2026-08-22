@@ -81,7 +81,7 @@
   "timezone": "utc",
   "title": "Hopper — Health",
   "uid": "hopper-health",
-  "version": 2,
+  "version": 3,
   "panels": [
     {
       "type": "row",
@@ -345,10 +345,54 @@
       ]
     },
     {
+      "type": "timeseries",
+      "id": 15,
+      "title": "Queue net rate (samples/s)",
+      "description": "Slope of each queue gauge over a trailing 10-minute regression (deriv). Positive = the queue is growing — arrivals outpace the fleet; negative = draining. This is the single number 'are we winning?': the depth panel above says where you are, this says which way you're moving and how fast. 10m smooths scrape noise at the cost of ~5 minutes of lag on a trend flip; drop to [5m] in Explore when watching a change land in real time.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 22 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 15, "showPoints": "never", "axisCenteredZero": true },
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "mean"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "deriv(hopper_queue_pending{job=\"$job\"}[10m])", "legendFormat": "pending /s" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "deriv(hopper_queue_rescan{job=\"$job\"}[10m])", "legendFormat": "rescan /s" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "deriv(hopper_queue_cleave_pending{job=\"$job\"}[10m])", "legendFormat": "cleave /s" },
+        { "refId": "D", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "deriv(hopper_queue_litmus_pending{job=\"$job\"}[10m])", "legendFormat": "litmus /s" }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 16,
+      "title": "Pending trend",
+      "description": "Net samples/s on the first-analysis queue right now (10m slope). Green and negative: draining. Red and positive: growing — arrivals are beating the fleet and the backlog ETA is infinite until this flips sign.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 22 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 0.01 } ] }
+        },
+        "overrides": []
+      },
+      "options": { "graphMode": "area", "colorMode": "value", "textMode": "value_and_name", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "deriv(hopper_queue_pending{job=\"$job\"}[10m])", "legendFormat": "pending /s" }
+      ]
+    },
+    {
       "type": "row",
       "id": 20,
       "title": "Insert failures",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 30 },
       "collapsed": false,
       "panels": []
     },
@@ -358,7 +402,7 @@
       "title": "Insert failures by cause",
       "description": "Failed sample inserts per second, broken out by cause. lock_timeout sustained > 0 is the silent batch-drop mode that took out ingestion on 2026-06-14 — a whole batch fails at once and is dropped, not retried.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 23 },
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 31 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -380,7 +424,7 @@
       "title": "Insert failures by cause (1h)",
       "description": "Samples that failed to insert in the last hour, by cause. Anything non-zero under lock_timeout means samples were dropped on lock contention.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 23 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 31 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -398,7 +442,7 @@
       "type": "row",
       "id": 25,
       "title": "Request latency (obs http_server_*)",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 },
       "collapsed": false,
       "panels": []
     },
@@ -408,7 +452,7 @@
       "title": "API latency p95 by route",
       "description": "Where request time actually goes, per endpoint. obs.Middleware has been pushing this since it was wired, but it had no panel until 2026-08-21 \u2014 so \"is the fleet waiting on workers or on Postgres?\" was unanswerable from Grafana even though the answer was already in the TSDB. /api/result climbing while /api/next stays flat means workers finish fine and then queue up to hand results back: the fix is on the database write path, not the worker fleet.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
@@ -428,7 +472,7 @@
       "title": "/api/result latency (p50 / p95 / p99)",
       "description": "Result ingestion end to end: resultSem slot wait + body read + StoreResult (member batches, claims, parent UPDATE), including any retryDBAccess backoff. A p99 in the tens of seconds alongside a sane p50 is the signature of lock contention on samples \u2014 most stores are fine, and the ones that collide with a walk flush are not. Pair with \"DB retries by cause\": latency says how much throughput was lost, retries say to what.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
@@ -452,7 +496,7 @@
       "title": "/api/next \u2014 polls returning no work",
       "description": "Share of worker polls answered 204 No Content. High means dispatch is starving the fleet: workers are asking and hopper has nothing to give them, so the ceiling is upstream of the workers (queue drained, or claimJobs' tier cascade finding nothing claimable) and adding worker capacity buys nothing. Low, with high /api/result latency, is the opposite reading \u2014 workers are saturated and blocked on the write path.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 40 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 48 },
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
@@ -472,7 +516,7 @@
       "title": "Request rate by route",
       "description": "Requests per second per endpoint \u2014 the denominator for both latency panels, and the fastest check that a flat graph means \"not happening\" rather than \"not scraped\".",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 40 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 48 },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
@@ -492,7 +536,7 @@
       "title": "DB retries by cause",
       "description": "Retry attempts inside retryDBAccess, by cause. Until this existed a result store could hit lock_timeout six times, succeed, and report nothing at all: retryDBAccess logs and then returns normally, and hopper_insert_failures_total is fed only from the walk flush, never from /api/result. The contention that stalls the fleet was invisible while the panels above it looked healthy. Sustained lock_timeout or deadlock here is throughput being burned on retries. Read it next to \"Insert failures by cause\": same vocabulary, opposite code path \u2014 that panel is the walker, this one is the result path.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 40 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 48 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -512,7 +556,7 @@
       "type": "row",
       "id": 35,
       "title": "Postgres write path (publisher \u2014 job=postgres-publisher)",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 56 },
       "collapsed": false,
       "panels": []
     },
@@ -522,7 +566,7 @@
       "title": "HOT update ratio by table",
       "description": "Share of updates that went through HOT (heap-only tuple), i.e. wrote NO index entries. This is the write-amplification measure. Near 1 is healthy. Near 0 on samples means every update writes a fresh tuple into all ~54 of its indexes, and no amount of worker or connection tuning compensates for that \u2014 it is the cost of the write itself. Two things force it to 0, and both were suspected on 2026-08-21: an UPDATE touching any indexed column (samples has a plain btree on updated_at, which write paths set to now()), and pages with no room for the new tuple (samples has no fillfactor, so it sits at the default 100). If this reads near 0, ALTER TABLE samples SET (fillfactor = 85) and an audit of idx_samples_updated_at are the first two moves.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 49 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 57 },
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
@@ -542,7 +586,7 @@
       "title": "Backends waiting, by wait event",
       "description": "Non-idle publisher backends grouped by what they are blocked on. Lock/* is writer-versus-writer contention on rows \u2014 the walk staging upsert and the /api/result member upsert colliding on samples tuples. LWLock/WALWrite and IO/* are storage-side instead, a different fault with a different fix. The class alone (\"IO\") is useless; the specific event is the diagnosis, which is why the exporter groups by both.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 49 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 57 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -560,7 +604,7 @@
       "type": "row",
       "id": 30,
       "title": "Worker fleet",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 57 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 65 },
       "collapsed": false,
       "panels": []
     },
@@ -570,7 +614,7 @@
       "title": "Workers",
       "description": "Current state of every worker the tracker knows. Last seen rising past ~600s means the node went quiet.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 58 },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 66 },
       "fieldConfig": {
         "defaults": { "custom": { "align": "auto", "cellOptions": { "type": "auto" } }, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } },
         "overrides": [
@@ -630,7 +674,7 @@
       "title": "Per-worker files/sec",
       "description": "Throughput each worker reports. A worker flatlining at zero while others run is wedged.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 67 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 75 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -650,7 +694,7 @@
       "title": "Per-worker last seen age",
       "description": "Seconds since each worker last checked in. A climbing line is a node going stale (alert fires at 600s).",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 67 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 75 },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
@@ -671,7 +715,7 @@
       "title": "Claim utilization (active / slots)",
       "description": "Fraction of each worker's advertised slots currently holding a task. Pinned near 1 fleet-wide means add capacity; near 0 with backlog means dispatch is starved.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 67 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 75 },
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
@@ -691,7 +735,7 @@
       "type": "row",
       "id": 40,
       "title": "Local scan worker",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 75 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 83 },
       "collapsed": false,
       "panels": []
     },
@@ -701,7 +745,7 @@
       "title": "Local worker up",
       "description": "Health of the in-process litmus worker over time. 0 means down.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 76 },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 84 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -724,7 +768,7 @@
       "title": "Local worker restarts",
       "description": "Supervisor restarts of the local scan worker per 15m. Repeated restarts mean it is crash-looping (flapping alert fires above 3 in 15m).",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 76 },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 84 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -743,7 +787,7 @@
       "type": "row",
       "id": 50,
       "title": "Database pool (obs db_pool_*)",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 82 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 90 },
       "collapsed": false,
       "panels": []
     },
@@ -753,7 +797,7 @@
       "title": "Pool connections",
       "description": "pgx pool composition against its ceiling. acquired riding max with idle near zero is saturation — the precondition for the lock-timeout insert drops above.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 83 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 91 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -778,7 +822,7 @@
       "title": "Pool saturation",
       "description": "Checked-out connections as a fraction of the pool ceiling. Sustained near 1.0 means queries are queuing for a connection.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 83 },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 91 },
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
@@ -801,7 +845,7 @@
       "title": "Acquire waits & cancellations",
       "description": "Rate of acquires that had to wait for an empty pool, and acquires canceled by context (timeout) while waiting. canceled_acquire climbing means callers are giving up before getting a connection — direct contention pressure.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 83 },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 91 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -822,7 +866,7 @@
       "type": "row",
       "id": 60,
       "title": "Process & runtime (obs go_* / process_*)",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 91 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 99 },
       "collapsed": false,
       "panels": []
     },
@@ -832,7 +876,7 @@
       "title": "Resident memory (RSS)",
       "description": "process_resident_memory_bytes — the figure the OOM killer and the cgroup MemoryMax watch. Hopper has a swap-death history; watch this against the host's limit.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 92 },
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 100 },
       "fieldConfig": {
         "defaults": {
           "unit": "bytes",
@@ -853,7 +897,7 @@
       "title": "CPU (cores)",
       "description": "rate(process_cpu_seconds_total) — CPU seconds consumed per second, i.e. effective cores in use.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 92 },
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 100 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -874,7 +918,7 @@
       "title": "Goroutines & threads",
       "description": "go_goroutines and go_threads. A goroutine count that climbs without bound is a leak (often blocked on the DB).",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 92 },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 100 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -895,7 +939,7 @@
       "title": "Open file descriptors",
       "description": "process_open_fds against process_max_fds. Approaching the max means accept()/open() will start failing.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 92 },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 100 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -918,7 +962,7 @@
       "title": "Heap & GC target",
       "description": "Live heap vs the next-GC target. Heap riding its target with frequent GCs means allocation pressure.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 100 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 108 },
       "fieldConfig": {
         "defaults": {
           "unit": "bytes",
@@ -939,7 +983,7 @@
       "title": "GC pause & frequency",
       "description": "Stop-the-world GC pause quantiles (go_gc_duration_seconds) and collections per second. Rising pauses add tail latency.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 100 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 108 },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
