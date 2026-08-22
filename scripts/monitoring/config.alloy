@@ -36,6 +36,15 @@ prometheus.scrape "publisher" {
 // would land in target_info instead of on the series).
 prometheus.relabel "labels" {
   forward_to = [otelcol.receiver.prometheus.default.receiver]
+  // job_name on the scrape block above does NOT apply: the exporter's targets
+  // carry a built-in job="integrations/postgres" label, and a target's own
+  // label wins. Every consumer (RUNBOOK verification, dashboard panels,
+  // alert exprs) was written against "postgres-publisher", so force it here —
+  // discovered 2026-08-22 when panels filtered on a label that never existed.
+  rule {
+    target_label = "job"
+    replacement  = "postgres-publisher"
+  }
   rule {
     target_label = "cluster"
     replacement  = "hopper"
