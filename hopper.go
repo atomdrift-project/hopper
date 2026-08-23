@@ -5006,21 +5006,74 @@ func (q *FeedQuery) sortBy() string {
 	}
 }
 
-// Sighting is one external-corroboration record: an outside source (threat
-// feed, scanner, blog, advisory) cited a subject.
+// SightingClaim is what a source is actually asserting.
+//
+// Named for its table because Claim in this package is already an identity
+// assertion about bytes. Sources disagree about how strong a statement they are
+// making, and the ledger used to flatten it: a malware feed naming a typosquat
+// and a capability scanner noting that a deployment skill can reach the shell
+// both arrived as one undifferentiated row, and both counted toward
+// corroboration.
+type SightingClaim string
+
+const (
+	// ClaimMalicious means the subject is malware. The default, because it is
+	// what every row written before this column existed meant.
+	ClaimMalicious SightingClaim = "malicious"
+	// ClaimSuspicious means a source flagged it without committing to malice.
+	// Never sufficient on its own.
+	ClaimSuspicious SightingClaim = "suspicious"
+	// ClaimVulnerable means a security defect in the versions named by
+	// Affected. The package is legitimate; some releases are not. Not malware,
+	// and must never be counted as it.
+	ClaimVulnerable SightingClaim = "vulnerable"
+)
+
+// A Sighting is one source's claim about one subject, as the source made it:
+// an outside threat feed, scanner, blog or advisory cited it.
 //
 // Subject is either a lowercase-hex sha256 or a PURL. For a PURL the canonical
 // form is the VERSION-LESS purl_base (pkg:npm/lodash, not pkg:npm/lodash@1.2.3):
 // it is what samples.purl_base holds and what prism queries, so both the
 // corroborated-flag match and SightingsFor are clean exact-equality lookups. A
-// source that flagged one specific version records that version in Note or URL,
-// not in Subject. The zero value is a harmless no-op that AddSightings skips.
+// source that flagged specific versions names them in Affected, never in
+// Subject. The zero value is a harmless no-op that AddSightings skips.
+//
+// The two timestamps answer different questions and must not be conflated.
+// PublishedAt is the SOURCE's date and is zero for the many feeds that publish
+// none — an undated blocklist knows nothing about when an entry appeared.
+// FirstSeen is when the claim entered OUR world, which for those feeds is the
+// only date that exists, and is what "reported in the last 48 hours" means.
 type Sighting struct {
-	FirstSeen time.Time // set by the store on first insert; ignored on write
-	Source    string    // 'aikido','osv','socket','clamav','cyclotron:bleepingcomputer'
-	Subject   string    // a sha256, or a version-less PURL (purl_base)
-	URL       string    // advisory / blog / report link (optional)
-	Note      string    // source's own tag: 'malware','MAL-2024-1234' (optional)
+	// FirstSeen is when the claim entered our world. Set by the store; a
+	// writer cannot backdate it, except that a source's first BULK import is
+	// backdated rather than stamped now — see AddSightings. Ignored on write.
+	FirstSeen time.Time
+	// PublishedAt is when the source says it published the claim. Zero when
+	// the source publishes no date, which is most blocklists.
+	PublishedAt time.Time
+	Source      string // 'aikido','osv','socket','clamav','cyclotron:bleepingcomputer'
+	// Operator is the body of evidence the source speaks for. Two sources
+	// sharing one are ONE voice: osv.dev and the OSSF malicious-packages
+	// project publish the same corpus, and counting them separately is how a
+	// single opinion becomes "independently corroborated". Defaults to Source
+	// when a writer supplies none.
+	Operator string
+	Subject  string // a sha256, or a version-less PURL (purl_base)
+	// Affected is the version constraint as the source wrote it; empty means
+	// the subject as a whole. Part of the key, because one source can make two
+	// separate claims about one package — ossf carries one report for
+	// @whalent/agent 0.3.230-0.3.302 and another for 0.3.358 — and a key
+	// without it silently keeps whichever was written last.
+	Affected string
+	URL      string // advisory / blog / report link (optional)
+	Note     string // source's own words: 'malware','MAL-2024-1234' (optional)
+	// FileName is what the artifact was called where this source saw it.
+	// Evidence, never identity: the same payload reaches a malware repository
+	// under a hundred names, and building a subject from one of them is what
+	// put 1,050 unmatchable rows in this table.
+	FileName string
+	Claim    SightingClaim
 }
 
 // sightingFamilies maps sighting sources that repackage a shared upstream
@@ -5039,6 +5092,12 @@ var sightingFamilies = map[string]string{
 }
 
 // SightingFamily returns the evidence family a sighting source belongs to.
+//
+// Superseded by Sighting.Operator, which arrives with the claim from the source
+// that made it rather than from a table here that has to be kept in step with
+// one somewhere else. Retained to default the column for writers that supply no
+// operator, and for promoter until it reads the column; delete both when it
+// does.
 // Sources without a mapping are their own family (including per-feed
 // "cyclotron:<url>" sources and "clamav"). Promotion rules that require N
 // independent sources must count distinct families, not distinct sources —
@@ -5140,20 +5199,118 @@ func splitSightingSubjects(subs []string) (shas, purls []string) {
 // feed snapshot on every poll. Invalid entries (missing source, or a subject
 // that is neither a sha256 nor a PURL) are skipped. Returns the number of
 // sightings inserted or updated.
+// sightingSeedBatch is how many rows one source must contribute at once for its
+// first appearance to count as a backlog import rather than as news.
+//
+// The number is standing in for a distinction we cannot observe directly: a
+// list walk arrives in bulk, a per-hash lookup arrives one row at a time. Adopt
+// a blocklist and its whole history lands in a single batch; look up one digest
+// in VirusTotal and one row lands.
+//
+// The asymmetry is deliberate. Mistaking news for a backlog costs one batch of
+// freshness on a source's very first walk; mistaking a backlog for news
+// presented 103,825 rows as "reported in the last 48 hours" the day this ledger
+// was last bulk-loaded. Err toward seeding.
+const sightingSeedBatch = 25
+
+// seedTimes decides which rows are a source's backlog rather than its news, and
+// returns the timestamp each row should carry — zero meaning "stamp it now".
+//
+// Decided once for the whole call rather than inside the insert, because
+// AddSightings writes in chunks: an EXISTS test evaluated per statement would
+// see the source as unknown for the first chunk and known for the rest, and
+// backdate exactly 5,000 rows of a 100,000-row import.
+func (db *DB) seedTimes(ctx context.Context, s []Sighting) ([]time.Time, error) {
+	bulk := map[string]int{}
+	for i := range s {
+		bulk[s[i].Source]++
+	}
+	seeding := make(map[string]bool, len(bulk))
+	for source, n := range bulk {
+		if n < sightingSeedBatch {
+			continue
+		}
+		known, err := db.sightingSourceKnown(ctx, source)
+		if err != nil {
+			return nil, err
+		}
+		seeding[source] = !known
+	}
+	if len(seeding) == 0 {
+		return make([]time.Time, len(s)), nil
+	}
+	out := make([]time.Time, len(s))
+	for i := range s {
+		if !seeding[s[i].Source] {
+			continue
+		}
+		// What the source says, or the epoch: "this predates our records" is
+		// the honest answer when a backlog carries no dates of its own, and
+		// now() would be a lie that reads as a zero-day.
+		out[i] = s[i].PublishedAt
+		if out[i].IsZero() {
+			out[i] = time.Unix(0, 0).UTC()
+		}
+	}
+	return out, nil
+}
+
+// sightingSourceKnown reports whether the ledger already holds anything from a
+// source.
+func (db *DB) sightingSourceKnown(ctx context.Context, source string) (bool, error) {
+	const q = `SELECT 1 FROM sightings WHERE source = $1 LIMIT 1`
+	var one int
+	if db.pool != nil {
+		err := db.pool.QueryRow(ctx, q, source).Scan(&one)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("hopper: sighting source lookup: %w", err)
+		}
+		return true, nil
+	}
+	err := db.lite.QueryRowContext(ctx, `SELECT 1 FROM sightings WHERE source = ? LIMIT 1`, source).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("hopper: sighting source lookup: %w", err)
+	}
+	return true, nil
+}
+
 func (db *DB) AddSightings(ctx context.Context, s []Sighting) (int, error) {
-	// Dedupe by (source, subject) within the batch — first occurrence wins.
-	// Producers naturally repeat pairs (two versions of one package share a
+	// Dedupe by the full key within the batch — first occurrence wins.
+	// Producers naturally repeat it (two versions of one package share a
 	// purl_base; normalization can collapse two spellings into one subject),
 	// and Postgres rejects an upsert that touches the same row twice
 	// (SQLSTATE 21000).
-	seen := make(map[[2]string]struct{}, len(s))
+	seen := make(map[[3]string]struct{}, len(s))
 	valid := s[:0:0]
-	for _, x := range s {
+	for i := range s {
+		x := s[i]
 		x.Subject = normalizeSubject(x.Subject)
 		if !x.valid() {
 			continue
 		}
-		key := [2]string{x.Source, x.Subject}
+		// Defaults that keep a writer from having to know about columns it
+		// does not care about: an unsaid claim is the malicious one every row
+		// meant before the column existed, and a source with no stated
+		// operator speaks only for itself.
+		switch x.Claim {
+		case ClaimSuspicious, ClaimVulnerable:
+			// as stated
+		default:
+			// Empty, or a word this package does not recognise. Malicious is
+			// what every row written before the column existed meant, and a
+			// claim we cannot read is not a licence to invent a weaker one.
+			x.Claim = ClaimMalicious
+		}
+		if x.Operator == "" {
+			x.Operator = SightingFamily(x.Source)
+		}
+		key := [3]string{x.Source, x.Subject, x.Affected}
 		if _, dup := seen[key]; dup {
 			continue
 		}
@@ -5162,6 +5319,13 @@ func (db *DB) AddSightings(ctx context.Context, s []Sighting) (int, error) {
 	}
 	if len(valid) == 0 {
 		return 0, nil
+	}
+	seeded, err := db.seedTimes(ctx, valid)
+	if err != nil {
+		return 0, err
+	}
+	for i := range valid {
+		valid[i].FirstSeen = seeded[i]
 	}
 	if db.pool != nil {
 		return db.addSightingsPG(ctx, valid)
@@ -5174,14 +5338,50 @@ func (db *DB) AddSightings(ctx context.Context, s []Sighting) (int, error) {
 // rendering (one page, or one sample's [sha, purl]) and read the map back. An
 // empty subjects slice returns an empty map.
 func (db *DB) SightingsFor(ctx context.Context, subjects []string) (map[string][]Sighting, error) {
-	out := make(map[string][]Sighting, len(subjects))
 	if len(subjects) == 0 {
-		return out, nil
+		return map[string][]Sighting{}, nil
 	}
+	// Ask in the ledger's spelling, answer in the caller's.
+	//
+	// AddSightings files every row under normalizeSubject, so a caller holding
+	// the ordinary spelling of a scoped package (pkg:npm/@scope/pkg) would
+	// otherwise be told nothing is known about it while the row sits under
+	// pkg:npm/%40scope/pkg. Silence is the most dangerous wrong answer a
+	// corroboration ledger can give, and it is indistinguishable from the
+	// truthful kind at the call site.
+	canonical := make([]string, 0, len(subjects))
+	spellings := make(map[string][]string, len(subjects))
+	for _, subject := range subjects {
+		canon := normalizeSubject(subject)
+		if _, dup := spellings[canon]; !dup {
+			canonical = append(canonical, canon)
+		}
+		spellings[canon] = append(spellings[canon], subject)
+	}
+
+	var (
+		found map[string][]Sighting
+		err   error
+	)
 	if db.pool != nil {
-		return db.sightingsForPG(ctx, subjects)
+		found, err = db.sightingsForPG(ctx, canonical)
+	} else {
+		found, err = db.sightingsForSQLite(ctx, canonical)
 	}
-	return db.sightingsForSQLite(ctx, subjects)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(map[string][]Sighting, len(subjects))
+	for canon, rows := range found {
+		// Under the stored spelling, for callers that already hold it, and
+		// under every spelling that asked for it.
+		out[canon] = rows
+		for _, subject := range spellings[canon] {
+			out[subject] = rows
+		}
+	}
+	return out, nil
 }
 
 // InsertReport stores an analysis report. Multiple reports per sample are allowed;
@@ -5334,4 +5534,129 @@ func (db *DB) IngestReportsDir(ctx context.Context, dir, reportType, provider st
 		return stats, fmt.Errorf("walk reports dir: %w", walkErr)
 	}
 	return stats, nil
+}
+
+// DropSightings deletes every claim the named sources recorded, and clears the
+// corroborated flag on any sample left with no evidence at all.
+//
+// This is the bootstrap half of a reseed: parallax can re-walk most of this
+// ledger from the sources' own lists, and a re-walk brings back what the old
+// writers never recorded — which releases a claim covers, how strong it is, and
+// which body of evidence it belongs to. But a re-walk alone cannot FIX the old
+// rows, because a version-less row and a versioned one are different keys: both
+// would survive, and the ledger would go on saying every release of a package
+// is malware alongside the row that says only 6.0.0 is. So the old rows go
+// first and the walk rebuilds them.
+//
+// Deleting is honest here only because of what these timestamps are. A row's
+// first_seen is meant to be when the claim reached us, and for a source whose
+// history arrived in one bulk load it is nothing of the kind: this ledger took
+// 103,825 rows on 2026-08-19 and 17,959 on 2026-07-10, all stamped with the day
+// somebody ran an import. Re-importing recovers real publication dates for the
+// sources that publish them and honest epochs for the ones that do not, which
+// is strictly better than preserving a load date that never meant anything.
+//
+// So: use it for sources parallax re-walks completely. NOT for sources whose
+// rows arrive one at a time from lookups (virustotal, triage) or from a blog
+// sweep (cyclotron:*) — nothing would bring those back, and their timestamps
+// are real.
+func (db *DB) DropSightings(ctx context.Context, sources []string, dryRun bool) (map[string]int64, error) {
+	if len(sources) == 0 {
+		return map[string]int64{}, nil
+	}
+	counts, err := db.sightingCounts(ctx, sources)
+	if err != nil {
+		return nil, err
+	}
+	if dryRun || len(counts) == 0 {
+		return counts, nil
+	}
+	if err := db.deleteSightings(ctx, sources); err != nil {
+		return nil, err
+	}
+	// A sample whose only evidence just vanished is no longer corroborated,
+	// and the flag is denormalized — nothing else recomputes it. Left set, it
+	// would keep a sample out of the very queue that should re-examine it.
+	if err := db.clearOrphanedCorroboration(ctx); err != nil {
+		return nil, err
+	}
+	// Rewrites rows it never enumerated, so there is nothing finer to drop:
+	// without this a server keeps answering "corroborated" from a cached
+	// sample whose last citation has just been deleted.
+	db.flushLookups()
+	return counts, nil
+}
+
+// sightingCounts reports how many rows each named source holds.
+func (db *DB) sightingCounts(ctx context.Context, sources []string) (map[string]int64, error) {
+	out := map[string]int64{}
+	scan := func(source string, n int64) { out[source] = n }
+
+	if db.pool != nil {
+		rows, err := db.pool.Query(ctx,
+			`SELECT source, count(*) FROM sightings WHERE source = ANY($1) GROUP BY source`, sources)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: count sightings: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var source string
+			var n int64
+			if err := rows.Scan(&source, &n); err != nil {
+				return nil, fmt.Errorf("hopper: count sightings: %w", err)
+			}
+			scan(source, n)
+		}
+		return out, rows.Err()
+	}
+
+	for _, source := range sources {
+		var n int64
+		if err := db.lite.QueryRowContext(ctx,
+			`SELECT count(*) FROM sightings WHERE source = ?`, source).Scan(&n); err != nil {
+			return nil, fmt.Errorf("hopper: count sightings: %w", err)
+		}
+		if n > 0 {
+			scan(source, n)
+		}
+	}
+	return out, nil
+}
+
+func (db *DB) deleteSightings(ctx context.Context, sources []string) error {
+	if db.pool != nil {
+		if _, err := db.pool.Exec(ctx, `DELETE FROM sightings WHERE source = ANY($1)`, sources); err != nil {
+			return fmt.Errorf("hopper: drop sightings: %w", err)
+		}
+		return nil
+	}
+	for _, source := range sources {
+		if _, err := db.lite.ExecContext(ctx, `DELETE FROM sightings WHERE source = ?`, source); err != nil {
+			return fmt.Errorf("hopper: drop sightings: %w", err)
+		}
+	}
+	return nil
+}
+
+// clearOrphanedCorroboration unsets the flag on samples nothing cites any more.
+//
+// A full pass over the corroborated rows, which is why it runs at maintenance
+// time and not on the write path: the two NOT EXISTS probes each hit
+// idx_sightings_subject, but the outer scan is every flagged sample.
+func (db *DB) clearOrphanedCorroboration(ctx context.Context) error {
+	const q = `
+		UPDATE samples SET corroborated = false
+		WHERE corroborated
+		  AND NOT EXISTS (SELECT 1 FROM sightings s WHERE s.subject = samples.sha256)
+		  AND NOT EXISTS (SELECT 1 FROM sightings s WHERE s.subject = samples.purl_base)`
+	if db.pool != nil {
+		if _, err := db.pool.Exec(ctx, q); err != nil {
+			return fmt.Errorf("hopper: clear orphaned corroboration: %w", err)
+		}
+		return nil
+	}
+	if _, err := db.lite.ExecContext(ctx, q); err != nil {
+		return fmt.Errorf("hopper: clear orphaned corroboration: %w", err)
+	}
+	return nil
 }

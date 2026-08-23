@@ -108,26 +108,53 @@ CREATE TABLE IF NOT EXISTS reports (
 CREATE INDEX IF NOT EXISTS idx_reports_sha256_type ON reports(sha256, report_type);
 CREATE INDEX IF NOT EXISTS idx_reports_sha256_type_created ON reports(sha256, report_type, created_at DESC);
 
--- sightings is the external-corroboration ledger: one row per (source, subject)
--- recording that an outside threat feed, scanner, blog, or advisory cited a
--- sample. subject is either a sha256 (64 hex) or a PURL (pkg:npm/lodash@1.2.3 or
--- the version-less pkg:npm/lodash) — the two namespaces never collide, so one
--- column carries both. The primary key makes writes idempotent: re-recording the
--- same sighting is a no-op unless url/note changed. Producers (gauntlet, forager,
--- cyclotron, promoter) upsert here; prism reads it for the "also detected by"
--- badge. url points at the advisory/blog/report; note is the source's own tag
--- ("malware", "MAL-2024-1234").
+-- sightings is the external-corroboration ledger: one row per claim an outside
+-- threat feed, scanner, blog, or advisory made about a sample. subject is either
+-- a sha256 (64 hex) or a PURL (pkg:npm/lodash@1.2.3 or the version-less
+-- pkg:npm/lodash) — the two namespaces never collide, so one column carries
+-- both. Producers (gauntlet, forager, cyclotron, promoter) upsert here; prism
+-- reads it for the "also detected by" badge.
+--
+-- The key includes affected because one source can make two SEPARATE claims
+-- about one package: ossf carries a report for @whalent/agent 0.3.230-0.3.302
+-- and another for 0.3.358. Keyed on (source, subject) alone, the second silently
+-- replaced the first. Writes stay idempotent: re-recording an unchanged claim is
+-- a no-op.
+--
+-- operator is the body of evidence the source speaks for, and two sources
+-- sharing one are ONE voice — osv.dev and the OSSF malicious-packages project
+-- publish the same corpus, so counting them separately is how a single opinion
+-- becomes "independently corroborated". Corroboration counts DISTINCT operator.
+--
+-- The two timestamps answer different questions and must never be conflated.
+-- published_at is the SOURCE's date and is NULL for the many feeds that publish
+-- none (an undated blocklist knows nothing about when an entry appeared).
+-- first_seen is when the claim entered OUR world, which for those feeds is the
+-- only date there is, and is what "reported in the last 48 hours" means. A
+-- source's FIRST import is backdated (see AddSightings) so that adopting a feed
+-- does not present its whole backlog as today's news.
 CREATE TABLE IF NOT EXISTS sightings (
-	source     TEXT NOT NULL,
-	subject    TEXT NOT NULL,
-	url        TEXT NOT NULL DEFAULT '',
-	note       TEXT NOT NULL DEFAULT '',
-	first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
-	PRIMARY KEY (source, subject)
+	source       TEXT NOT NULL,
+	subject      TEXT NOT NULL,
+	url          TEXT NOT NULL DEFAULT '',
+	note         TEXT NOT NULL DEFAULT '',
+	operator     TEXT NOT NULL DEFAULT '',
+	affected     TEXT NOT NULL DEFAULT '',
+	claim        TEXT NOT NULL DEFAULT 'malicious',
+	filename     TEXT NOT NULL DEFAULT '',
+	published_at TIMESTAMPTZ,
+	first_seen   TIMESTAMPTZ NOT NULL DEFAULT now(),
+	PRIMARY KEY (source, subject, affected)
 );
 
 -- Lookup by subject is the read path (SightingsFor): "who cited this sha/purl?".
 CREATE INDEX IF NOT EXISTS idx_sightings_subject ON sightings(subject);
+
+-- The cohort read path: what entered our world recently. Partial, because a
+-- benchmark drawing a fresh cohort is asking about malware, and the suspicious
+-- rows (capability scanners, unreviewed reports) outnumber it.
+CREATE INDEX IF NOT EXISTS idx_sightings_recent
+	ON sightings(first_seen DESC) WHERE claim = 'malicious';
 
 CREATE TABLE IF NOT EXISTS workers (
 	name      TEXT PRIMARY KEY,

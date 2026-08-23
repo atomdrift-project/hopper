@@ -322,18 +322,27 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_popular_rank ON popular_packages(rank)`,
 		`CREATE TABLE IF NOT EXISTS sightings (
-			source     TEXT NOT NULL,
-			subject    TEXT NOT NULL,
-			url        TEXT NOT NULL DEFAULT '',
-			note       TEXT NOT NULL DEFAULT '',
-			first_seen DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-			PRIMARY KEY (source, subject)
+			source       TEXT NOT NULL,
+			subject      TEXT NOT NULL,
+			url          TEXT NOT NULL DEFAULT '',
+			note         TEXT NOT NULL DEFAULT '',
+			operator     TEXT NOT NULL DEFAULT '',
+			affected     TEXT NOT NULL DEFAULT '',
+			claim        TEXT NOT NULL DEFAULT 'malicious',
+			filename     TEXT NOT NULL DEFAULT '',
+			published_at DATETIME,
+			first_seen   DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+			PRIMARY KEY (source, subject, affected)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_sightings_subject ON sightings(subject)`,
+		`CREATE INDEX IF NOT EXISTS idx_sightings_recent ON sightings(first_seen DESC) WHERE claim = 'malicious'`,
 	} {
 		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite sightings: %w", err)
 		}
+	}
+	if err := db.migrateLiteSightingsKey(ctx); err != nil {
+		return err
 	}
 
 	// Worker heartbeat table for dashboard.
@@ -3033,7 +3042,7 @@ func (db *DB) triageSecondOpinionSQLite(
 		   AND NOT (max_crit >= 5 OR suspicious_count >= 2)
 		   AND analyzed_at < ?
 		   AND (`+trustedClause+`
-		        OR (SELECT count(DISTINCT s.source) FROM sightings s
+		        OR (SELECT count(DISTINCT s.operator) FROM sightings s
 		            WHERE s.subject = samples.sha256
 		               OR (samples.purl_base != '' AND s.subject = samples.purl_base)) >= 2)
 		   AND `+refreshClause+extra+`
@@ -3355,6 +3364,65 @@ func (db *DB) staleSamplesSQLite(ctx context.Context, prefixes []string, olderTh
 	return scanLiteSamples(rows)
 }
 
+// migrateLiteSightingsKey rebuilds a sightings table written before a claim
+// carried its operator, versions and strength.
+//
+// SQLite cannot add a column conditionally or widen a primary key in place, so
+// a legacy table is copied into the current shape once. Guarded by the stored
+// DDL rather than by a version counter: the table either has the columns or it
+// does not, and asking it is cheaper than remembering.
+func (db *DB) migrateLiteSightingsKey(ctx context.Context) error {
+	var ddl string
+	err := db.lite.QueryRowContext(ctx,
+		`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sightings'`).Scan(&ddl)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("hopper: inspect sqlite sightings: %w", err)
+	}
+	if strings.Contains(ddl, "affected") {
+		return nil
+	}
+	for _, stmt := range []string{
+		`ALTER TABLE sightings RENAME TO sightings_legacy`,
+		`CREATE TABLE sightings (
+			source       TEXT NOT NULL,
+			subject      TEXT NOT NULL,
+			url          TEXT NOT NULL DEFAULT '',
+			note         TEXT NOT NULL DEFAULT '',
+			operator     TEXT NOT NULL DEFAULT '',
+			affected     TEXT NOT NULL DEFAULT '',
+			claim        TEXT NOT NULL DEFAULT 'malicious',
+			filename     TEXT NOT NULL DEFAULT '',
+			published_at DATETIME,
+			first_seen   DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+			PRIMARY KEY (source, subject, affected)
+		)`,
+		// Existing rows meant "malicious", which is all the old table could
+		// say, and their operator is the family their source belonged to —
+		// filled from the same map so corroboration counts do not shift across
+		// the migration.
+		`INSERT INTO sightings (source, subject, url, note, operator, first_seen)
+		 SELECT source, subject, url, note,
+		        CASE
+		          WHEN source IN ('ghsa','supplychain') THEN 'github-advisories'
+		          WHEN source IN ('osv','ossf') THEN 'ossf-malpkgs'
+		          ELSE source
+		        END,
+		        first_seen
+		 FROM sightings_legacy`,
+		`DROP TABLE sightings_legacy`,
+		`CREATE INDEX IF NOT EXISTS idx_sightings_subject ON sightings(subject)`,
+		`CREATE INDEX IF NOT EXISTS idx_sightings_recent ON sightings(first_seen DESC) WHERE claim = 'malicious'`,
+	} {
+		if _, err := db.lite.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("hopper: rebuild sqlite sightings: %w", err)
+		}
+	}
+	return nil
+}
+
 func (db *DB) addSightingsSQLite(ctx context.Context, s []Sighting) (int, error) {
 	tx, err := db.lite.BeginTx(ctx, nil)
 	if err != nil {
@@ -3368,14 +3436,34 @@ func (db *DB) addSightingsSQLite(ctx context.Context, s []Sighting) (int, error)
 	changed := make(map[string]struct{})
 	for i := range s {
 		var subj string
+		var published, seeded any
+		if !s[i].PublishedAt.IsZero() {
+			published = s[i].PublishedAt.UTC().Format("2006-01-02T15:04:05.000Z")
+		}
+		// Non-zero only for a source's first bulk import, which AddSightings
+		// backdates rather than presenting as today's news.
+		if !s[i].FirstSeen.IsZero() {
+			seeded = s[i].FirstSeen.UTC().Format("2006-01-02T15:04:05.000Z")
+		}
 		err := tx.QueryRowContext(ctx, `
-			INSERT INTO sightings (source, subject, url, note)
-			VALUES (?, ?, ?, ?)
-			ON CONFLICT (source, subject) DO UPDATE
-				SET url = excluded.url, note = excluded.note
+			INSERT INTO sightings
+				(source, subject, url, note, operator, affected, claim, filename, published_at, first_seen)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+				COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
+			ON CONFLICT (source, subject, affected) DO UPDATE
+				SET url = excluded.url, note = excluded.note,
+				    operator = excluded.operator, claim = excluded.claim,
+				    filename = excluded.filename, published_at = excluded.published_at
 				WHERE sightings.url IS NOT excluded.url
 				   OR sightings.note IS NOT excluded.note
-			RETURNING subject`, s[i].Source, s[i].Subject, s[i].URL, s[i].Note).Scan(&subj)
+				   OR sightings.operator IS NOT excluded.operator
+				   OR sightings.claim IS NOT excluded.claim
+				   OR sightings.filename IS NOT excluded.filename
+				   OR sightings.published_at IS NOT excluded.published_at
+			RETURNING subject`,
+			s[i].Source, s[i].Subject, s[i].URL, s[i].Note, s[i].Operator,
+			s[i].Affected, string(s[i].Claim), s[i].FileName, published,
+			seeded).Scan(&subj)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue // unchanged row: DO UPDATE guard tripped, nothing returned
 		}
@@ -3449,7 +3537,8 @@ func (db *DB) sightingsForSQLite(ctx context.Context, subjects []string) (map[st
 		}
 		//nolint:gosec // G202: ph is a slice of fixed "?" placeholders; subjects are bound args.
 		rows, err := db.lite.QueryContext(ctx,
-			`SELECT source, subject, url, note, first_seen FROM sightings `+
+			`SELECT source, subject, url, note, first_seen, `+
+				`operator, affected, claim, filename, published_at FROM sightings `+
 				`WHERE subject IN (`+strings.Join(ph, ", ")+`) ORDER BY source`, args...)
 		if err != nil {
 			return fmt.Errorf("hopper: sightings for subjects: %w", err)
@@ -3457,9 +3546,12 @@ func (db *DB) sightingsForSQLite(ctx context.Context, subjects []string) (map[st
 		defer rows.Close() //nolint:errcheck // best-effort cleanup
 		for rows.Next() {
 			var x Sighting
-			if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen); err != nil {
+			var published sql.NullTime
+			if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen,
+				&x.Operator, &x.Affected, &x.Claim, &x.FileName, &published); err != nil {
 				return fmt.Errorf("hopper: scan sighting: %w", err)
 			}
+			x.PublishedAt = published.Time
 			out[x.Subject] = append(out[x.Subject], x)
 		}
 		return rows.Err()

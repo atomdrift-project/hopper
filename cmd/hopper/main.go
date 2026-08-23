@@ -56,6 +56,7 @@ commands:
   reheal-crit        repair max_crit/suspicious_count zeroed by the pre-v8 cleave trigger (postgres)
   backfill-purl      derive missing samples.purl_base from ecosystem+package (never overwrites; postgres)
   repair-parents     clear samples.parent where the bytes are on disk standalone (--dry-run; postgres)
+  drop-sightings     delete the named sources' claims so a re-walk can rebuild them with versions
   canonicalize-purls rewrite stored purl_base and sightings.subject spellings onto the current canonical
                      form, then re-derive samples.corroborated (batched; -dry-run; postgres)
   purge-unsupported  delete analyzed rows cleave could not classify
@@ -417,6 +418,8 @@ func run(ctx context.Context) error {
 		return cmdBackfillClaims(ctx)
 	case "canonicalize-purls":
 		return cmdCanonicalizePURLs(ctx)
+	case "drop-sightings":
+		return cmdDropSightings(ctx)
 	case "purge-unsupported":
 		return cmdPurgeUnsupported(ctx)
 	case "normalize-ecosystems":
@@ -3798,6 +3801,70 @@ func cmdBackfillClaims(ctx context.Context) error {
 // idempotent (canonicalization is a fixed point), and safe to re-run or
 // interrupt. Run with -dry-run first to see how many rows a fold touches;
 // rebuild the published bloom filters afterwards so the exported keys match.
+// cmdDropSightings clears the named sources out of the ledger so that a
+// re-walk rebuilds them.
+//
+// The old rows record only that somebody flagged something. A re-walk through
+// parallax records which releases, how strong a claim, which body of evidence,
+// and when the source itself published it — but it cannot correct the old rows
+// in place, because a version-less row and a versioned one are different keys
+// and both would survive. Dropping first is what makes the rebuild a
+// correction rather than an addition.
+//
+// Sequence: drop, then let forager's sightings sync run (it walks every list),
+// then the corroborated flag is set again as the rows land.
+//
+// Name only sources parallax re-walks completely. Anything whose rows arrive
+// one at a time — virustotal and triage lookups, cyclotron's blog sweeps —
+// would simply be lost.
+func cmdDropSightings(ctx context.Context) error {
+	f := flag.NewFlagSet("drop-sightings", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	list := f.String("sources", "", "comma-separated sources to drop (required)")
+	dryRun := f.Bool("dry-run", true, "report what would be dropped without deleting")
+	parseFlags(f, os.Args[2:])
+
+	var sources []string
+	for name := range strings.SplitSeq(*list, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			sources = append(sources, name)
+		}
+	}
+	if len(sources) == 0 {
+		return errors.New("drop-sightings: -sources is required")
+	}
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		return err
+	}
+
+	counts, err := db.DropSightings(ctx, sources, *dryRun)
+	if err != nil {
+		return err
+	}
+	var total int64
+	for source, n := range counts {
+		total += n
+		slog.Info("sightings", "source", source, "rows", n, "dropped", !*dryRun)
+	}
+	for _, source := range sources {
+		if _, ok := counts[source]; !ok {
+			slog.Info("sightings", "source", source, "rows", 0, "note", "nothing recorded under this name")
+		}
+	}
+	if *dryRun {
+		slog.Info("drop-sightings dry run; re-run with -dry-run=false to delete", "rows", total)
+		return nil
+	}
+	slog.Info("sightings dropped; run forager's sightings sync to rebuild them", "rows", total)
+	return nil
+}
+
 func cmdCanonicalizePURLs(ctx context.Context) error {
 	f := flag.NewFlagSet("canonicalize-purls", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")

@@ -136,6 +136,7 @@ idx_slh_sha256_retired
 # splits the body on whitespace, so a '#' line would parse as index names and
 # fail the guard.
 REPLICA_DROP_INDEXES='
+idx_sightings_recent
 idx_popular_rank
 idx_reports_created_at
 idx_samples_analyzed_at

@@ -2561,6 +2561,29 @@ type sightingRequest struct {
 	Subject string `json:"subject"`
 	URL     string `json:"url"`
 	Note    string `json:"note"`
+	// The rest are optional, so a producer that predates them keeps working:
+	// an omitted claim is malicious (what every row meant before the column
+	// existed) and an omitted operator falls back to the source's family.
+	Operator    string `json:"operator"`
+	Affected    string `json:"affected"`
+	Claim       string `json:"claim"`
+	FileName    string `json:"filename"`
+	PublishedAt string `json:"published_at"`
+}
+
+// parseSightingTime reads a producer's published_at. An unparseable or absent
+// date is zero, which the ledger stores as "the source published no date" —
+// better than inventing one, and better than rejecting the whole claim over a
+// field that is optional by design.
+func parseSightingTime(s string) time.Time {
+	if strings.TrimSpace(s) == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, strings.TrimSpace(s))
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 type sightingsResponse struct {
@@ -2688,14 +2711,20 @@ func (s *apiServer) handleSightings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sightings := make([]hopper.Sighting, len(reqs))
-	for i, req := range reqs {
+	for i := range reqs {
+		req := &reqs[i]
 		subject := req.Subject
 		// Normalize a sha256 subject to lowercase to match stored digests; a PURL
 		// is left verbatim. AddSightings drops anything that is neither.
 		if validSHA256(strings.ToLower(subject)) {
 			subject = strings.ToLower(subject)
 		}
-		sightings[i] = hopper.Sighting{Source: req.Source, Subject: subject, URL: req.URL, Note: req.Note}
+		sightings[i] = hopper.Sighting{
+			Source: req.Source, Subject: subject, URL: req.URL, Note: req.Note,
+			Operator: req.Operator, Affected: req.Affected,
+			Claim: hopper.SightingClaim(req.Claim), FileName: req.FileName,
+			PublishedAt: parseSightingTime(req.PublishedAt),
+		}
 	}
 
 	changed, err := s.storeSightings(r.Context(), sightings, r.RemoteAddr)

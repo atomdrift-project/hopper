@@ -85,15 +85,21 @@ CREATE TABLE IF NOT EXISTS reports (
 CREATE INDEX IF NOT EXISTS idx_reports_sha256_type ON reports(sha256, report_type);
 CREATE INDEX IF NOT EXISTS idx_reports_sha256_type_created ON reports(sha256, report_type, created_at DESC);
 
--- sightings: external-corroboration ledger. SQLite mirror of schema.sql's table.
--- subject is a sha256 or a PURL; the primary key makes writes idempotent.
+-- sightings: external-corroboration ledger. SQLite mirror of schema.sql's table,
+-- where the columns are explained. subject is a sha256 or a PURL; the key
+-- includes affected so one source can make two claims about one package.
 CREATE TABLE IF NOT EXISTS sightings (
-	source     TEXT NOT NULL,
-	subject    TEXT NOT NULL,
-	url        TEXT NOT NULL DEFAULT '',
-	note       TEXT NOT NULL DEFAULT '',
-	first_seen DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-	PRIMARY KEY (source, subject)
+	source       TEXT NOT NULL,
+	subject      TEXT NOT NULL,
+	url          TEXT NOT NULL DEFAULT '',
+	note         TEXT NOT NULL DEFAULT '',
+	operator     TEXT NOT NULL DEFAULT '',
+	affected     TEXT NOT NULL DEFAULT '',
+	claim        TEXT NOT NULL DEFAULT 'malicious',
+	filename     TEXT NOT NULL DEFAULT '',
+	published_at DATETIME,
+	first_seen   DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+	PRIMARY KEY (source, subject, affected)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sightings_subject ON sightings(subject);

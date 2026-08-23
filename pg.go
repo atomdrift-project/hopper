@@ -194,6 +194,59 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			PRIMARY KEY (source, subject)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_sightings_subject ON sightings(subject)`,
+		// A claim is more than "somebody flagged this". Each column here was a
+		// question the flattened row could not answer: which body of evidence
+		// (so mirrors of one corpus count once), which releases, how strong a
+		// claim, and when the SOURCE said it as opposed to when we heard it.
+		`ALTER TABLE sightings ADD COLUMN IF NOT EXISTS operator TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sightings ADD COLUMN IF NOT EXISTS affected TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sightings ADD COLUMN IF NOT EXISTS claim TEXT NOT NULL DEFAULT 'malicious'`,
+		`ALTER TABLE sightings ADD COLUMN IF NOT EXISTS filename TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sightings ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ`,
+		// Rows written before the operator column meant their source's family;
+		// filling them from the same map keeps corroboration counts identical
+		// across the migration instead of briefly treating mirrors as
+		// independent.
+		`UPDATE sightings SET operator = 'github-advisories' WHERE operator = '' AND source IN ('ghsa','supplychain')`,
+		`UPDATE sightings SET operator = 'ossf-malpkgs' WHERE operator = '' AND source IN ('osv','ossf')`,
+		`UPDATE sightings SET operator = source WHERE operator = ''`,
+		// The key gains the version. One source can make two separate claims
+		// about one package — ossf carries a report for @whalent/agent
+		// 0.3.230-0.3.302 and another for 0.3.358 — and the old key kept
+		// whichever landed last.
+		//
+		// It stays a PRIMARY KEY rather than becoming a unique index because
+		// sightings is a PUBLISHED table (see scripts/replica/
+		// replicated-tables.sh): logical replication needs a replica identity
+		// for every UPDATE and DELETE, and a primary key is the one every
+		// other table here uses. A plain unique index would have left this
+		// table's identity unset and broken apply on the replica.
+		//
+		// Guarded on the column count rather than run unconditionally: the
+		// only two keys this table ever has are the legacy pair and this
+		// triple, and rebuilding a primary key on every startup would cost an
+		// index rebuild for nothing. Existing rows all have affected = '', so
+		// the widened key cannot collide.
+		`DO $$
+		BEGIN
+			IF EXISTS (
+				SELECT 1 FROM pg_constraint
+				WHERE conrelid = 'sightings'::regclass AND contype = 'p'
+				  AND array_length(conkey, 1) <> 3
+			) THEN
+				ALTER TABLE sightings DROP CONSTRAINT sightings_pkey;
+			END IF;
+			IF NOT EXISTS (
+				SELECT 1 FROM pg_constraint
+				WHERE conrelid = 'sightings'::regclass AND contype = 'p'
+			) THEN
+				ALTER TABLE sightings ADD PRIMARY KEY (source, subject, affected);
+			END IF;
+		END $$`,
+		// The cohort query: what entered our world recently, strongest claims
+		// first. Partial, because a benchmark drawing a fresh cohort is asking
+		// about malware and the suspicious rows outnumber it.
+		`CREATE INDEX IF NOT EXISTS idx_sightings_recent ON sightings(first_seen DESC) WHERE claim = 'malicious'`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS corroborated BOOLEAN NOT NULL DEFAULT false`,
 		// Partial indexes holding only corroborated top-level ready rows: the
 		// "?feeds=1" filter (FeedQuery.Corroborated) walks these in created_at
@@ -4268,7 +4321,7 @@ func (db *DB) triageSecondOpinionPG(ctx context.Context, limit int, trusted []st
 		                WHERE (s.subject = samples.sha256
 		                       OR (samples.purl_base != '' AND s.subject = samples.purl_base))
 		                  AND s.source = ANY($2))
-		        OR (SELECT count(DISTINCT s.source) FROM sightings s
+		        OR (SELECT count(DISTINCT s.operator) FROM sightings s
 		            WHERE s.subject = samples.sha256
 		               OR (samples.purl_base != '' AND s.subject = samples.purl_base)) >= 2)
 		   AND NOT EXISTS (SELECT 1 FROM reports r
@@ -4783,22 +4836,51 @@ func (db *DB) addSightingsPG(ctx context.Context, s []Sighting) (int, error) {
 		subjects := make([]string, len(batch))
 		urls := make([]string, len(batch))
 		notes := make([]string, len(batch))
-		for i, x := range batch {
+		operators := make([]string, len(batch))
+		affected := make([]string, len(batch))
+		claims := make([]string, len(batch))
+		filenames := make([]string, len(batch))
+		published := make([]*time.Time, len(batch))
+		seeded := make([]*time.Time, len(batch))
+		for i := range batch {
+			x := &batch[i]
 			sources[i], subjects[i], urls[i], notes[i] = x.Source, x.Subject, x.URL, x.Note
+			operators[i], affected[i] = x.Operator, x.Affected
+			claims[i], filenames[i] = string(x.Claim), x.FileName
+			if !x.PublishedAt.IsZero() {
+				t := x.PublishedAt.UTC()
+				published[i] = &t
+			}
+			// Non-zero only for a source's first bulk import, which
+			// AddSightings backdates rather than presenting as today's news.
+			if !x.FirstSeen.IsZero() {
+				t := x.FirstSeen.UTC()
+				seeded[i] = &t
+			}
 		}
 		// Delta-guarded upsert: an unchanged row (same url+note) trips the WHERE
 		// and writes nothing, so re-pushing a snapshot is near-free. RETURNING
 		// yields only the rows that actually inserted or changed — the real delta
 		// we feed into the samples flag update below.
 		rows, err := tx.Query(ctx, `
-			INSERT INTO sightings (source, subject, url, note)
-			SELECT src, subj, u, n
-			FROM unnest($1::text[], $2::text[], $3::text[], $4::text[]) AS t(src, subj, u, n)
-			ON CONFLICT (source, subject) DO UPDATE
-				SET url = EXCLUDED.url, note = EXCLUDED.note
+			INSERT INTO sightings
+				(source, subject, url, note, operator, affected, claim, filename, published_at, first_seen)
+			SELECT src, subj, u, n, op, aff, cl, fn, pub, COALESCE(seed, now())
+			FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
+			            $6::text[], $7::text[], $8::text[], $9::timestamptz[], $10::timestamptz[])
+				AS t(src, subj, u, n, op, aff, cl, fn, pub, seed)
+			ON CONFLICT (source, subject, affected) DO UPDATE
+				SET url = EXCLUDED.url, note = EXCLUDED.note,
+				    operator = EXCLUDED.operator, claim = EXCLUDED.claim,
+				    filename = EXCLUDED.filename, published_at = EXCLUDED.published_at
 				WHERE sightings.url IS DISTINCT FROM EXCLUDED.url
 				   OR sightings.note IS DISTINCT FROM EXCLUDED.note
-			RETURNING subject`, sources, subjects, urls, notes)
+				   OR sightings.operator IS DISTINCT FROM EXCLUDED.operator
+				   OR sightings.claim IS DISTINCT FROM EXCLUDED.claim
+				   OR sightings.filename IS DISTINCT FROM EXCLUDED.filename
+				   OR sightings.published_at IS DISTINCT FROM EXCLUDED.published_at
+			RETURNING subject`,
+			sources, subjects, urls, notes, operators, affected, claims, filenames, published, seeded)
 		if err != nil {
 			return 0, fmt.Errorf("hopper: upsert sightings: %w", err)
 		}
@@ -4902,7 +4984,8 @@ func (db *DB) remarkCorroboratedPG(ctx context.Context) (int64, error) {
 
 func (db *DB) sightingsForPG(ctx context.Context, subjects []string) (map[string][]Sighting, error) {
 	rows, err := db.pool.Query(ctx, `
-		SELECT source, subject, url, note, first_seen
+		SELECT source, subject, url, note, first_seen,
+		       operator, affected, claim, filename, published_at
 		FROM sightings WHERE subject = ANY($1)
 		ORDER BY source`, subjects)
 	if err != nil {
@@ -4912,8 +4995,13 @@ func (db *DB) sightingsForPG(ctx context.Context, subjects []string) (map[string
 	out := make(map[string][]Sighting, len(subjects))
 	for rows.Next() {
 		var x Sighting
-		if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen); err != nil {
+		var published *time.Time
+		if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen,
+			&x.Operator, &x.Affected, &x.Claim, &x.FileName, &published); err != nil {
 			return nil, fmt.Errorf("hopper: scan sighting: %w", err)
+		}
+		if published != nil {
+			x.PublishedAt = *published
 		}
 		out[x.Subject] = append(out[x.Subject], x)
 	}
