@@ -3839,10 +3839,14 @@ func cmdDropSightings(ctx context.Context) error {
 		return err
 	}
 	defer db.Close()
-	if err := db.Migrate(ctx); err != nil {
-		return err
-	}
 
+	// Deliberately does NOT migrate.
+	//
+	// This command counts and deletes rows by source; it reads no column the
+	// original sightings table lacked. Migrating first would take the whole
+	// schema's DDL locks on a live database to change nothing — and against a
+	// running hopper it does not merely waste time, it loses the lock race and
+	// the command never gets to do its job.
 	counts, err := db.DropSightings(ctx, sources, *dryRun)
 	if err != nil {
 		return err
