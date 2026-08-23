@@ -92,10 +92,12 @@ idx_samples_eco_top_created
 idx_samples_ecosystem
 idx_samples_feed
 idx_samples_feed_top_created_done
+idx_samples_filename_trgm
 idx_samples_good_repair_newest
 idx_samples_good_repair_stale
 idx_samples_new_interesting
 idx_samples_new_stale
+idx_samples_package_version
 idx_samples_purl_lookup
 idx_samples_sighted_newest
 idx_samples_top_ready_created
@@ -103,6 +105,7 @@ idx_samples_unknown_newest
 idx_sightings_subject
 idx_sl_child_parents
 idx_sl_containment
+idx_sl_parent_child
 idx_slh_sha256_retired
 '
 
@@ -123,12 +126,10 @@ idx_samples_eco_class_created
 idx_samples_feed_source
 idx_samples_feed_source_mtime
 idx_samples_file_type
-idx_samples_filename_trgm
 idx_samples_formula
 idx_samples_good_route_score
 idx_samples_litmus_done
 idx_samples_mtime
-idx_samples_package_version
 idx_samples_parent
 idx_samples_pending_cleave_group
 idx_samples_pending_litmus_group
@@ -149,8 +150,6 @@ idx_samples_top_ready_first_analyzed_coalesce
 idx_samples_unanalyzed_id
 idx_samples_updated_at
 idx_sl_incoming_mtime
-idx_sl_parent
-idx_sl_parent_child
 idx_sl_reference
 idx_sl_sha256
 idx_sl_standalone

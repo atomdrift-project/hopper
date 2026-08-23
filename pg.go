@@ -544,7 +544,10 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// Feed/source rollups stay selective via the partial predicate.
 		// Parent lookups are rare (exploded-from query) and stay partial.
 		`CREATE INDEX IF NOT EXISTS idx_sl_sha256 ON sample_locations(sha256)`,
-		`CREATE INDEX IF NOT EXISTS idx_sl_parent ON sample_locations(parent_sha256) WHERE parent_sha256 <> ''`,
+		// idx_sl_parent (parent_sha256 partial) was dropped 2026-08-22: it was
+		// fully shadowed by idx_sl_parent_child below — same key, same partial
+		// predicate, plus INCLUDE (sha256) — and idx_scan confirmed the planner
+		// always preferred the covering variant. 8.3 GB of pure write tax.
 		// Draino asks only for the oldest top-level hot-pool locations. Keeping
 		// this partial makes that query proportional to the incoming pool rather
 		// than the full historical location ledger.
@@ -6342,8 +6345,8 @@ func buildReconcileAliveSet(ctx context.Context, conn *pgxpool.Conn) error {
 				SELECT sl.sha256
 				FROM batch b
 				-- The redundant-looking parent_sha256 <> '' is load-bearing: it
-				-- lets the planner use the partial idx_sl_parent_child /
-				-- idx_sl_parent (both WHERE parent_sha256 <> '') for an index
+				-- lets the planner use the partial idx_sl_parent_child
+				-- (WHERE parent_sha256 <> '') for an index
 				-- nested loop. Without it the planner can't prove the join keys
 				-- are non-empty and falls back to a 105M-row seq scan + sort. The
 				-- frontier holds only real 64-hex sha256, so it changes no rows.
