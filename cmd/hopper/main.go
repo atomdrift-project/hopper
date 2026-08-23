@@ -3847,21 +3847,30 @@ func cmdDropSightings(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Printed, not just logged: the whole point of the dry run is for a person
+	// to read the counts before deleting anything, and hopper's logs go to a
+	// file. A destructive command that appears to do nothing is its own hazard.
 	var total int64
-	for source, n := range counts {
-		total += n
-		slog.Info("sightings", "source", source, "rows", n, "dropped", !*dryRun)
-	}
+	sort.Strings(sources)
 	for _, source := range sources {
-		if _, ok := counts[source]; !ok {
-			slog.Info("sightings", "source", source, "rows", 0, "note", "nothing recorded under this name")
+		n := counts[source]
+		total += n
+		if n == 0 {
+			fmt.Printf("%-16s %10s  nothing recorded under this name\n", source, "-")
+			continue
 		}
+		fmt.Printf("%-16s %10d\n", source, n)
 	}
+	fmt.Printf("%-16s %10d\n", "TOTAL", total)
+
 	if *dryRun {
-		slog.Info("drop-sightings dry run; re-run with -dry-run=false to delete", "rows", total)
+		fmt.Println("\ndry run: nothing deleted. Re-run with -dry-run=false to delete,")
+		fmt.Println("then rebuild with: forager sightings -db <dsn>")
+		slog.Info("drop-sightings dry run", "rows", total)
 		return nil
 	}
-	slog.Info("sightings dropped; run forager's sightings sync to rebuild them", "rows", total)
+	fmt.Println("\ndropped. Rebuild with: forager sightings -db <dsn>")
+	slog.Info("sightings dropped", "rows", total)
 	return nil
 }
 

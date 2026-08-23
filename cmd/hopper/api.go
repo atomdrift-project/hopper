@@ -1953,6 +1953,31 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	slog.Info("result stored", "worker", req.Worker, "sha256", req.SHA256, "path", claimedPath,
 		"duration_ms", req.DurationMs, "active_claims", s.tracker.activeClaims(req.Worker))
 
+	// A sample analyzed once should not be analyzed again soon: the rescan tiers
+	// are deliberate and rare, and a producer re-posting a verdict hopper already
+	// holds is pure write cost. Neither is visible in "result stored", which
+	// looks identical either way, so say so explicitly — and say which package,
+	// since a renewal loop is a property of a coordinate, not of a digest.
+	//
+	// The traits version separates the two. A different one means the analyzer
+	// moved and the re-analysis learned something. The same one means it could
+	// not have: that is a guard that failed upstream, so it is a WARN and reaches
+	// the console log, while an ordinary refresh stays at INFO in the file.
+	if stats.Renewed() {
+		args := []any{
+			"sha256", req.SHA256, "purl_base", stats.PURLBase, "worker", req.Worker,
+			"previous_analysis_age", time.Since(stats.PriorAnalyzedAt).Round(time.Second).String(),
+			"traits_version", tv, "previous_traits_version", stats.PriorTraitsVersion,
+		}
+		if stats.Redundant(tv) {
+			//nolint:gosec // G706: sha256 validated by validSHA256, worker by validWorkerName; the rest are our own columns
+			slog.Warn("result renewed with no analyzer change; the re-analysis learned nothing", args...)
+		} else {
+			//nolint:gosec // G706: same provenance as the WARN above
+			slog.Info("result renewed under a new analyzer", args...)
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true}) //nolint:errcheck,errchkjson // best-effort response
 }

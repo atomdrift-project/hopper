@@ -2791,16 +2791,30 @@ func (db *DB) storeResultPG(
 	// transaction.
 	var parent Sample
 	var firstAnalyzed sql.NullTime
+	var priorAnalyzed sql.NullTime
+	var priorTraits, purlBase string
 	if err := db.pool.QueryRow(ctx,
-		`SELECT label, label_source, source, feed, ecosystem, path, first_analyzed_at
+		`SELECT label, label_source, source, feed, ecosystem, path, first_analyzed_at,
+		        analyzed_at, traits_version, purl_base
 		   FROM samples WHERE sha256 = $1`, sha256).
 		Scan(&parent.Label, &parent.LabelSource, &parent.Source, &parent.Feed,
-			&parent.Ecosystem, &parent.Path, &firstAnalyzed); err != nil {
+			&parent.Ecosystem, &parent.Path, &firstAnalyzed,
+			&priorAnalyzed, &priorTraits, &purlBase); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return StoreStats{}, fmt.Errorf("hopper: store result for absent sample %s: %w", sha256, ErrNotFound)
 		}
 		return StoreStats{}, fmt.Errorf("hopper: read parent for store %s: %w", sha256, err)
 	}
+
+	// What this store is about to replace. Captured before the UPDATE overwrites
+	// it, so the handler can log a re-analysis and say whether it learned
+	// anything (see StoreStats.Redundant).
+	var stats StoreStats
+	if priorAnalyzed.Valid {
+		stats.PriorAnalyzedAt = priorAnalyzed.Time
+	}
+	stats.PriorTraitsVersion = priorTraits
+	stats.PURLBase = purlBase
 
 	// Build members from the FULL envelope, inheriting the parent's identity and
 	// stamped with this analysis time so the freshness gate orders refreshes.
@@ -2833,7 +2847,6 @@ func (db *DB) storeResultPG(
 	// archive from materializing every member's re-marshaled cleave/litmus slice
 	// at once — several times the envelope size — held across the whole store;
 	// each batch falls out of scope and is reclaimed before the next.
-	var stats StoreStats
 	for start := 0; start < env.len(); start += memberStoreBatch {
 		batch := env.buildRange(start, min(start+memberStoreBatch, env.len()))
 		stats.Members += len(batch)

@@ -2338,6 +2338,63 @@ func TestStaleTraitsSkipsRowsWithNoServablePath(t *testing.T) {
 	}
 }
 
+// A first analysis is not a renewal; a second one is, and whether it learned
+// anything is decided by the traits version rather than by the fact of the
+// re-run. The distinction is what separates a deliberate rescan from a producer
+// re-posting a verdict hopper already holds.
+func TestStoreResultReportsRenewals(t *testing.T) {
+	ctx := t.Context()
+	db := openTestDB(t)
+
+	const sha = "e100000000000000000000000000000000000000000000000000000000000000"
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: sha, Source: "test", Label: "unknown", LabelSource: "test",
+		Path: "incoming/thing.bin",
+	})
+	result := []byte(`{"files":[{"sha":"` + sha + `","type":"elf","depth":0}]}`)
+
+	first, err := db.StoreResult(ctx, sha, result, nil, nil, nil, "traits-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Renewed() {
+		t.Error("a first analysis must not report as a renewal")
+	}
+	if first.Redundant("traits-1") {
+		t.Error("a first analysis cannot be redundant")
+	}
+
+	// Same analyzer: the re-run could not have learned anything.
+	same, err := db.StoreResult(ctx, sha, result, nil, nil, nil, "traits-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !same.Renewed() {
+		t.Error("re-analyzing an analyzed sample is a renewal")
+	}
+	if !same.Redundant("traits-1") {
+		t.Error("a renewal at the same traits version is redundant")
+	}
+	if same.PriorTraitsVersion != "traits-1" {
+		t.Errorf("prior traits = %q, want traits-1", same.PriorTraitsVersion)
+	}
+	if same.PriorAnalyzedAt.IsZero() {
+		t.Error("a renewal must carry the analysis time it replaced")
+	}
+
+	// Analyzer moved: a real refresh, not waste.
+	moved, err := db.StoreResult(ctx, sha, result, nil, nil, nil, "traits-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !moved.Renewed() {
+		t.Error("still a renewal")
+	}
+	if moved.Redundant("traits-2") {
+		t.Error("a renewal under a new traits version learned something")
+	}
+}
+
 func TestRelativizePaths(t *testing.T) {
 	ctx := t.Context()
 	db := openTestDB(t)

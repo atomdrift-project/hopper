@@ -2139,17 +2139,31 @@ func (db *DB) storeResultSQLite(
 	defer tx.Rollback() //nolint:errcheck // commit or rollback
 
 	var parent Sample
-	var firstAnalyzed sql.NullString
+	var firstAnalyzed, priorAnalyzed sql.NullString
+	var priorTraits, purlBase string
 	if err := tx.QueryRowContext(ctx,
-		`SELECT label, label_source, source, feed, ecosystem, path, first_analyzed_at
+		`SELECT label, label_source, source, feed, ecosystem, path, first_analyzed_at,
+		        analyzed_at, traits_version, purl_base
 		   FROM samples WHERE sha256 = ?`, sha256).
 		Scan(&parent.Label, &parent.LabelSource, &parent.Source, &parent.Feed,
-			&parent.Ecosystem, &parent.Path, &firstAnalyzed); err != nil {
+			&parent.Ecosystem, &parent.Path, &firstAnalyzed,
+			&priorAnalyzed, &priorTraits, &purlBase); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return StoreStats{}, fmt.Errorf("hopper: store result for absent sample %s: %w", sha256, ErrNotFound)
 		}
 		return StoreStats{}, fmt.Errorf("hopper: read parent for store %s: %w", sha256, err)
 	}
+
+	// Mirrors storeResultPG: capture what this store replaces before the UPDATE
+	// overwrites it, so both backends report renewals identically.
+	var stats StoreStats
+	if priorAnalyzed.Valid {
+		if t, err := time.Parse(time.RFC3339Nano, priorAnalyzed.String); err == nil {
+			stats.PriorAnalyzedAt = t
+		}
+	}
+	stats.PriorTraitsVersion = priorTraits
+	stats.PURLBase = purlBase
 
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE samples SET cleave_result = ?,
@@ -2186,7 +2200,6 @@ func (db *DB) storeResultSQLite(
 		normalizeLabel(m) // "" is not a selectable label; see normalizeLabel.
 	}
 
-	var stats StoreStats
 	stats.Members = len(members)
 	if len(members) > 0 {
 		memStmt, err := tx.PrepareContext(ctx, `

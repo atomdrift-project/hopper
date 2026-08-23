@@ -3106,8 +3106,35 @@ func (db *DB) RequestRescan(ctx context.Context, sha256 string, cooldown time.Du
 
 // StoreStats reports what StoreResult persisted, for logging and telemetry.
 type StoreStats struct {
+	// What this store replaced, for the renewal log. A sample that has been
+	// analyzed before is being *re-analyzed*, which is supposed to be rare:
+	// either the stale-traits tier deliberately re-queued it, or a producer
+	// posted a verdict hopper already had. The second is waste, and the two are
+	// told apart by whether the traits version actually moved — hence both
+	// fields rather than a bare bool.
+	//
+	// Zero values mean a first analysis: PriorAnalyzedAt is the zero time and
+	// PriorTraitsVersion is empty, so Renewed() is false.
+	PriorAnalyzedAt    time.Time
+	PriorTraitsVersion string
+	// PURLBase identifies the package in that log line, so a renewal loop can be
+	// attributed to a package rather than to a bare digest. Empty for a sample
+	// with no package identity.
+	PURLBase string
+
 	Members       int   // members extracted from the archive envelope (0 = not an archive)
 	MembersStored int64 // member rows inserted or freshness-refreshed in this transaction
+}
+
+// Renewed reports whether this store replaced an existing analysis rather than
+// recording a first one.
+func (s StoreStats) Renewed() bool { return !s.PriorAnalyzedAt.IsZero() }
+
+// Redundant reports a renewal that produced the same verdict the row already
+// held, because the analyzer had not changed between the two runs. Nothing was
+// learned and the write was pure cost — the case worth alerting on.
+func (s StoreStats) Redundant(traitsVersion string) bool {
+	return s.Renewed() && s.PriorTraitsVersion != "" && s.PriorTraitsVersion == traitsVersion
 }
 
 // StoreResult atomically persists a worker's full analysis for a sample and,
