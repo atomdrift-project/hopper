@@ -57,6 +57,7 @@ commands:
   backfill-purl      derive missing samples.purl_base from ecosystem+package (never overwrites; postgres)
   repair-parents     clear samples.parent where the bytes are on disk standalone (--dry-run; postgres)
   drop-sightings     delete the named sources' claims so a re-walk can rebuild them with versions
+  reconcile-corroborated  clear the corroborated flag on samples nothing cites any more (run after a rebuild)
   canonicalize-purls rewrite stored purl_base and sightings.subject spellings onto the current canonical
                      form, then re-derive samples.corroborated (batched; -dry-run; postgres)
   purge-unsupported  delete analyzed rows cleave could not classify
@@ -420,6 +421,8 @@ func run(ctx context.Context) error {
 		return cmdCanonicalizePURLs(ctx)
 	case "drop-sightings":
 		return cmdDropSightings(ctx)
+	case "reconcile-corroborated":
+		return cmdReconcileCorroborated(ctx)
 	case "purge-unsupported":
 		return cmdPurgeUnsupported(ctx)
 	case "normalize-ecosystems":
@@ -3875,6 +3878,34 @@ func cmdDropSightings(ctx context.Context) error {
 	}
 	fmt.Println("\ndropped. Rebuild with: forager sightings -db <dsn>")
 	slog.Info("sightings dropped", "rows", total)
+	return nil
+}
+
+// cmdReconcileCorroborated recomputes the denormalized corroborated flag.
+//
+// Run it AFTER a drop-and-rebuild, not between the two: the re-walk re-cites
+// most of what a drop orphaned, so reconciling first only does the work twice.
+// Safe to interrupt — each batch commits on its own and re-running finishes.
+func cmdReconcileCorroborated(ctx context.Context) error {
+	f := flag.NewFlagSet("reconcile-corroborated", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	parseFlags(f, os.Args[2:])
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	// No migration: this reads and writes columns that have always existed,
+	// and taking the whole schema's DDL locks on a live cluster to change
+	// nothing is how the last maintenance command failed to run at all.
+	cleared, err := db.ReconcileCorroborated(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("cleared %d samples with no remaining citation\n", cleared)
+	slog.Info("corroboration reconciled", "cleared", cleared)
 	return nil
 }
 

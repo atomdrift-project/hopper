@@ -5601,15 +5601,19 @@ func (db *DB) DropSightings(ctx context.Context, sources []string, dryRun bool) 
 	if err := db.deleteSightings(ctx, sources); err != nil {
 		return nil, err
 	}
-	// A sample whose only evidence just vanished is no longer corroborated,
-	// and the flag is denormalized — nothing else recomputes it. Left set, it
-	// would keep a sample out of the very queue that should re-examine it.
-	if err := db.clearOrphanedCorroboration(ctx); err != nil {
-		return nil, err
-	}
-	// Rewrites rows it never enumerated, so there is nothing finer to drop:
-	// without this a server keeps answering "corroborated" from a cached
-	// sample whose last citation has just been deleted.
+	// The corroborated flag is deliberately NOT recomputed here.
+	//
+	// It is denormalized, so a sample whose last citation just went reads as
+	// corroborated until something recomputes it — but the honest fix costs
+	// two sequential scans of samples, which is 91.7 million rows on the
+	// cluster this was written for, and it is work the rebuild immediately
+	// undoes: a drop is followed by a re-walk that re-cites most of the same
+	// samples. Recompute once, after the rebuild, with
+	// [DB.ReconcileCorroborated].
+	//
+	// The lookup cache is still flushed: it rewrites rows it never enumerated,
+	// and without this a server keeps answering from a cached sample whose
+	// citation has just been deleted.
 	db.flushLookups()
 	return counts, nil
 }
@@ -5706,25 +5710,65 @@ func (db *DB) deleteSightings(ctx context.Context, sources []string) error {
 	return nil
 }
 
-// clearOrphanedCorroboration unsets the flag on samples nothing cites any more.
+// corroborationBatch bounds one reconcile statement. Small enough that any
+// single statement is interruptible and holds no lock worth noticing; large
+// enough that the walk is not dominated by round trips.
+const corroborationBatch = 50_000
+
+// ReconcileCorroborated unsets the flag on samples nothing cites any more,
+// walking the table in id order so each statement is short.
 //
-// A full pass over the corroborated rows, which is why it runs at maintenance
-// time and not on the write path: the two NOT EXISTS probes each hit
-// idx_sightings_subject, but the outer scan is every flagged sample.
-func (db *DB) clearOrphanedCorroboration(ctx context.Context) error {
+// Batched because the unbatched form does not finish. samples is a 91.7-million
+// row table on the cluster this was written for and carries no index on
+// corroborated alone — the partial ones all pin further predicates — so a
+// single UPDATE is a sequential scan of the whole table with two index probes
+// per row. Run once after a rebuild, never between a drop and one: the re-walk
+// re-cites most of what a drop orphaned, and reconciling first only does the
+// work twice.
+//
+// Interrupting it is safe. Each batch commits on its own, so a cancelled run
+// leaves the rows it reached correct and the rest as they were; running it
+// again finishes the job.
+func (db *DB) ReconcileCorroborated(ctx context.Context) (cleared int64, err error) {
 	const q = `
 		UPDATE samples SET corroborated = false
-		WHERE corroborated
+		WHERE id >= $1 AND id < $2 AND corroborated
 		  AND NOT EXISTS (SELECT 1 FROM sightings s WHERE s.subject = samples.sha256)
 		  AND NOT EXISTS (SELECT 1 FROM sightings s WHERE s.subject = samples.purl_base)`
+
+	var maxID int64
 	if db.pool != nil {
-		if _, err := db.pool.Exec(ctx, q); err != nil {
-			return fmt.Errorf("hopper: clear orphaned corroboration: %w", err)
+		if err := db.pool.QueryRow(ctx, `SELECT COALESCE(max(id), 0) FROM samples`).Scan(&maxID); err != nil {
+			return 0, fmt.Errorf("hopper: reconcile corroboration: %w", err)
 		}
-		return nil
+	} else if err := db.lite.QueryRowContext(ctx,
+		`SELECT COALESCE(max(id), 0) FROM samples`).Scan(&maxID); err != nil {
+		return 0, fmt.Errorf("hopper: reconcile corroboration: %w", err)
 	}
-	if _, err := db.lite.ExecContext(ctx, q); err != nil {
-		return fmt.Errorf("hopper: clear orphaned corroboration: %w", err)
+
+	for start := int64(0); start <= maxID; start += corroborationBatch {
+		end := start + corroborationBatch
+		var n int64
+		if db.pool != nil {
+			tag, err := db.pool.Exec(ctx, q, start, end)
+			if err != nil {
+				return cleared, fmt.Errorf("hopper: reconcile corroboration: %w", err)
+			}
+			n = tag.RowsAffected()
+		} else {
+			res, err := db.lite.ExecContext(ctx, `
+				UPDATE samples SET corroborated = false
+				WHERE id >= ? AND id < ? AND corroborated
+				  AND NOT EXISTS (SELECT 1 FROM sightings s WHERE s.subject = samples.sha256)
+				  AND NOT EXISTS (SELECT 1 FROM sightings s WHERE s.subject = samples.purl_base)`,
+				start, end)
+			if err != nil {
+				return cleared, fmt.Errorf("hopper: reconcile corroboration: %w", err)
+			}
+			n, _ = res.RowsAffected() //nolint:errcheck // driver reports it or does not
+		}
+		cleared += n
 	}
-	return nil
+	db.flushLookups()
+	return cleared, nil
 }

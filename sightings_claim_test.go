@@ -303,10 +303,11 @@ func TestDropSightingsRemovesOnlyTheNamedSources(t *testing.T) {
 	}
 }
 
-// The corroborated flag is denormalized and nothing else recomputes it. Left
-// set on a sample whose only evidence just vanished, it would keep that sample
-// out of the very queue that should re-examine it.
-func TestDropSightingsClearsOrphanedCorroboration(t *testing.T) {
+// The corroborated flag is denormalized, and a drop deliberately leaves it
+// alone: recomputing it costs two sequential scans of a 91.7-million row table,
+// and the rebuild that follows a drop re-cites most of what was orphaned. The
+// reconcile is a separate, batched step run once afterwards.
+func TestDropSightingsLeavesTheFlagForTheReconcile(t *testing.T) {
 	ctx := t.Context()
 	db := openTestDB(t)
 
@@ -329,8 +330,29 @@ func TestDropSightingsClearsOrphanedCorroboration(t *testing.T) {
 	if _, err := db.DropSightings(ctx, []string{"aikido"}, false); err != nil {
 		t.Fatalf("DropSightings: %v", err)
 	}
+	if !corroborated() {
+		t.Error("the drop must not pay for the reconcile; the flag stands until asked")
+	}
+
+	cleared, err := db.ReconcileCorroborated(ctx)
+	if err != nil {
+		t.Fatalf("ReconcileCorroborated: %v", err)
+	}
+	if cleared != 1 {
+		t.Errorf("cleared %d samples, want the one with no remaining citation", cleared)
+	}
 	if corroborated() {
 		t.Error("a sample whose only evidence was dropped is not corroborated")
+	}
+
+	// Idempotent: a second pass has nothing left to do, so an interrupted run
+	// can simply be repeated.
+	again, err := db.ReconcileCorroborated(ctx)
+	if err != nil {
+		t.Fatalf("ReconcileCorroborated (again): %v", err)
+	}
+	if again != 0 {
+		t.Errorf("second pass cleared %d, want none", again)
 	}
 }
 
@@ -348,6 +370,9 @@ func TestDropSightingsKeepsCorroborationWithRemainingEvidence(t *testing.T) {
 
 	if _, err := db.DropSightings(ctx, []string{"aikido"}, false); err != nil {
 		t.Fatalf("DropSightings: %v", err)
+	}
+	if _, err := db.ReconcileCorroborated(ctx); err != nil {
+		t.Fatalf("ReconcileCorroborated: %v", err)
 	}
 	s, err := db.SampleBySHA256(ctx, sha)
 	if err != nil {
