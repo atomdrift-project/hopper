@@ -2534,6 +2534,23 @@ WHERE EXCLUDED.analyzed_at > samples.analyzed_at OR samples.analyzed_at IS NULL`
 // member row locks in the same order, so two archives sharing members can't form
 // a lock cycle (deadlock); it also makes the residual contention orderly. The
 // leading column matches DISTINCT ON (sha256), which Postgres requires.
+//
+// The LEFT JOIN pre-filter is what keeps that residual contention small, and it
+// is not an optimization of the write — it is an elimination of a LOCK. Postgres
+// takes an exclusive row lock on every conflicting row BEFORE it evaluates the
+// DO UPDATE's WHERE, and holds it to commit, so a member whose stored analysis is
+// already at least as fresh was locked for the whole transaction while writing
+// nothing (verified directly: a DO UPDATE with a false WHERE blocks another
+// session's UPDATE of that row). That is the common case by far — popular
+// dependencies are members of thousands of archives, and every concurrent store
+// that shares one queued behind the others. Measured 2026-08-23: worker-lane
+// stores averaged 175-366 s and held 93% of all ingestion-slot time, with
+// ~22 of 28 member upserts blocked on each other at any moment.
+//
+// The predicate mirrors memberConflictUpdatePG's WHERE exactly, so a row is
+// filtered out here only when the conflict clause would have declined to write
+// it. The clause stays as the authority: the join reads an MVCC snapshot, so a
+// row that changes between the SELECT and the INSERT is still guarded there.
 const insertMembersFromStagingPG = `INSERT INTO samples (
 	sha256, source, feed, ecosystem, filename,
 	size_bytes, label, label_source, path, status,
@@ -2541,15 +2558,19 @@ const insertMembersFromStagingPG = `INSERT INTO samples (
 	max_crit, suspicious_count, mtime, marker_mtime,
 	cleave_result, litmus_result, analyzed_at, first_analyzed_at,
 	url, domain, package, version, provenance, fetched_at)
-SELECT DISTINCT ON (sha256)
-	sha256, source, feed, ecosystem, filename,
-	size_bytes, label, label_source, sample_path, status,
-	canonical_sha256, sample_parent, skip, elements,
-	max_crit, suspicious_count, mtime, marker_mtime,
-	cleave_result, litmus_result, analyzed_at, first_analyzed_at,
-	url, domain, package, version, provenance, fetched_at
-FROM _staging
-ORDER BY sha256
+SELECT DISTINCT ON (st.sha256)
+	st.sha256, st.source, st.feed, st.ecosystem, st.filename,
+	st.size_bytes, st.label, st.label_source, st.sample_path, st.status,
+	st.canonical_sha256, st.sample_parent, st.skip, st.elements,
+	st.max_crit, st.suspicious_count, st.mtime, st.marker_mtime,
+	st.cleave_result, st.litmus_result, st.analyzed_at, st.first_analyzed_at,
+	st.url, st.domain, st.package, st.version, st.provenance, st.fetched_at
+FROM _staging st
+LEFT JOIN samples s ON s.sha256 = st.sha256
+WHERE s.sha256 IS NULL
+   OR s.analyzed_at IS NULL
+   OR st.analyzed_at > s.analyzed_at
+ORDER BY st.sha256
 ` + memberConflictUpdatePG
 
 // memberStoreBatch caps how many member rows a single store transaction writes.

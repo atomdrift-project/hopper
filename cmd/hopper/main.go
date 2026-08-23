@@ -1149,11 +1149,17 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// admission on declared body size, would bound the thing that actually
 	// runs out. Until then, keep this in step with the memory the host can
 	// actually spare.
-	// 40 (2026-08-23): probing the 32..64 gap — the measured curve was
-	// 16:140 / 24:206 / 32:258 / 64:219 accepted-per-minute, so the peak sits
-	// somewhere in [32, 64). Watch accepted/min and the new
-	// hopper.result_phase.seconds histogram; revert to 32 if it regresses.
-	resultSlots := min(40, max(2, runtime.NumCPU()))
+	// 32 (2026-08-23) after sweeping 16/24/32/40/64. Accepted-per-minute peaked
+	// at 32 (16:140, 24:206, 32:258, 40 and 64 both lower), and
+	// hopper.result_phase.seconds explains why raising it cannot help: 97% of
+	// held slot-time is the store phase, and worker-lane stores average ~175 s
+	// because concurrent member upserts block each other, hit the publisher's
+	// 10 s lock_timeout, and retry — for up to resultStoreTimeout. More slots
+	// means more concurrent upserts, more blocking, longer stores, so the knob
+	// is self-defeating past the point where the store path saturates. The next
+	// real gains are in store duration (lock contention in the member upsert;
+	// index-descent I/O), not here.
+	resultSlots := min(32, max(2, runtime.NumCPU()))
 	// Cap concurrent archive-member extractions to the CPU count (decompression
 	// is CPU-bound), clamped so a many-core host can't pile up unbounded disk
 	// spooling from a request burst.
@@ -1785,12 +1791,60 @@ const (
 	defaultMaxFileSize = 20 * 1024 * 1024 * 1024
 )
 
+// reconcileDoneKey stores, in hopper_kv, when the last full reconcile pass
+// began (RFC3339). It is per-cluster state and deliberately not replicated.
+const reconcileDoneKey = "walk_reconcile_started_at"
+
+// startupWalkScope decides what the startup pass must do: a full reconcile, or
+// a cheap incremental catch-up because one ran recently enough.
+//
+// Fails safe in every direction — no recorded time, an unparseable one, a
+// future one (clock moved), or a database that cannot answer all yield a full
+// reconcile. The cost of a needless full pass is disk; the cost of wrongly
+// skipping one is undetected moved/missing files, so only the first mistake is
+// acceptable.
+func startupWalkScope(ctx context.Context, db *hopper.DB) (cutoff time.Time, reconcile bool) {
+	v, err := db.KVGet(ctx, reconcileDoneKey)
+	if err != nil || v == "" {
+		return time.Time{}, true
+	}
+	last, perr := time.Parse(time.RFC3339, v)
+	if perr != nil {
+		slog.Warn("unparseable reconcile timestamp; forcing a full reconcile walk", "value", v, "error", perr)
+		return time.Time{}, true
+	}
+	age := time.Since(last)
+	if age < 0 || age >= reconcileWalkInterval {
+		return time.Time{}, true
+	}
+	// Reconcile is current, so walk only what changed since it started. Using
+	// the reconcile's own start (not "now") is the conservative bound: anything
+	// written while it ran is re-examined rather than assumed seen.
+	return last, false
+}
+
+// recordReconcileDone stamps a completed reconcile pass. Best-effort: a write
+// failure only means the next start reconciles again, which is the safe way to
+// be wrong.
+func recordReconcileDone(ctx context.Context, db *hopper.DB, started time.Time) {
+	if err := db.KVSet(ctx, reconcileDoneKey, started.UTC().Format(time.RFC3339)); err != nil {
+		slog.Warn("could not record reconcile completion; next start will reconcile again", "error", err)
+	}
+}
+
 const (
 	// ingestWalkInterval is how often the backstop walk re-scans the data dir
 	// for new files forager's direct-insert missed. After the first full pass
 	// each walk is incremental (only files modified since the previous walk
 	// began), so it stays cheap.
-	ingestWalkInterval = 30 * time.Minute
+	//
+	// 1h rather than 30m (2026-08-23): this is a fallback for what direct-insert
+	// missed, not the ingestion path, so latency here costs nothing — while the
+	// enumeration competes for the publisher's disk with result-store index
+	// descents, which is the actual throughput constraint (worker stores are
+	// read-bound; see hopper.result_phase.seconds). Halving the walk rate halves
+	// that competition for a backstop nobody waits on.
+	ingestWalkInterval = time.Hour
 	// reconcileWalkInterval is the slower cadence for a full walk that also
 	// reconciles pools (detects moved/missing/relabeled files). It is kept
 	// separate from ingest so the expensive reconcile never gates ingestion.
@@ -2017,9 +2071,18 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 
 	// Initial pass: a full walk (pre-started enumeration channels) that also
 	// reconciles pools. Reconcile is bounded by reconcileTimeout, so it can no
-	// longer strand startup the way an unbounded pass once did — yet it still
-	// runs on every restart, which matters on a host that recycles more often
-	// than reconcileWalkInterval (otherwise reconcile would rarely run at all).
+	// longer strand startup the way an unbounded pass once did.
+	//
+	// Whether it reconciles is decided by WHEN reconcile last completed, not by
+	// the fact of restarting. It used to run unconditionally, so that a host
+	// recycling faster than reconcileWalkInterval still reconciled — but the
+	// same rule made every deploy re-walk the entire corpus (1.85M files on
+	// smaug), and that enumeration competes for the publisher's disk with the
+	// result-store index descents that gate ingest throughput. On 2026-08-23 a
+	// day of deploys meant a near-continuous full walk. Persisting the
+	// completion time in hopper_kv keeps the guarantee (a host that never stays
+	// up long enough still reconciles once per interval) while a routine
+	// restart costs only an incremental pass.
 	//
 	// --pause-walk suppresses this pass and the periodic ones below, and must
 	// also mark the walk done: the dashboard and the drain logic read walkDone,
@@ -2031,7 +2094,16 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 		slog.Warn("corpus walks paused by --pause-walk; new files will not be ingested until restarted without it")
 		progress.walkDone.Store(true)
 	} else {
-		pass.run(ctx, fileChs, time.Time{}, true)
+		cutoff, reconcile := startupWalkScope(ctx, db)
+		if reconcile {
+			slog.Info("startup walk: full pass with reconcile")
+		} else {
+			slog.Info("startup walk: incremental (reconcile still current)", "since", cutoff)
+		}
+		pass.run(ctx, fileChs, cutoff, reconcile)
+		if reconcile {
+			recordReconcileDone(ctx, db, initialStart)
+		}
 	}
 
 	// Periodic passes pick up files forager's direct-insert missed while workers
@@ -2055,10 +2127,12 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 					slog.Info("starting incremental ingest walk", "since", cutoff)
 					pass.run(ctx, nil, cutoff, false)
 				case <-recon.C:
-					lastStart = time.Now()
+					reconStart := time.Now()
+					lastStart = reconStart
 					progress.walkDone.Store(false)
 					slog.Info("starting full reconcile walk")
 					pass.run(ctx, nil, time.Time{}, true)
+					recordReconcileDone(ctx, db, reconStart)
 				case <-ctx.Done():
 					return
 				}
