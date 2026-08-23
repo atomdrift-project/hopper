@@ -630,6 +630,10 @@ func cmdServeReplica(ctx context.Context) error {
 		"file holding the bearer token the API requires; empty serves unauthenticated (loopback binds only)")
 	dataDir := f.String("data", "",
 		"optional corpus root for /api/file and /data/; empty disables byte serving")
+	relayTo := f.String("relay-writes-to", "",
+		"primary hopper base URL (e.g. http://hopper-api:8081); when set, client-facing mutations are proxied there verbatim instead of answering 403, and lookups honor ?fresh=1 — see relay.go. Worker routes are never relayed.")
+	relayTokenFile := f.String("relay-token-file", "",
+		"file holding a bearer token for the primary; when set the relay replaces the inbound Authorization header with it (for deployments where replica and primary tokens differ). Empty passes the client's token through.")
 	parseFlags(f, os.Args[2:])
 
 	// Force read-only sessions in the DSN itself so every pooled connection
@@ -667,6 +671,13 @@ func cmdServeReplica(ctx context.Context) error {
 		tracker:     newWorkerTracker(),
 		readOnly:    true,
 	}
+	if *relayTo != "" {
+		relay, rerr := newWriteRelay(*relayTo, *relayTokenFile)
+		if rerr != nil {
+			return fmt.Errorf("serve-replica: %w", rerr)
+		}
+		api.relay = relay
+	}
 	if *dataDir != "" {
 		root, rerr := filepath.EvalSymlinks(*dataDir)
 		if rerr != nil {
@@ -701,7 +712,8 @@ func cmdServeReplica(ctx context.Context) error {
 
 	handler := recoverMiddleware(obs.Middleware(authMiddleware(apiToken, mux)))
 	slog.Info("read-only replica API listening",
-		"addr", *apiAddr, "authenticated", apiToken != nil, "bytes", api.dataRoot != "")
+		"addr", *apiAddr, "authenticated", apiToken != nil, "bytes", api.dataRoot != "",
+		"relay", *relayTo)
 	srv := &http.Server{Addr: *apiAddr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()
@@ -1107,19 +1119,31 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// The shared result-ingestion budget. Workers get all but the reserved
 	// slots; renewals may use any of them.
 	//
-	// 16 rather than 8: ingestion is memory-bound, and the cap is only safe
-	// while the box has memory to spare. It did not — the FreeBSD master ran
-	// its scan worker uncapped (85% of RAM) beside this process, leaving 5 GB
-	// free and 48 GB in laundry, which held every slot open long enough to
-	// saturate the pool. With the worker capped (FREEBSD_MAX_MEMORY_GB) that
-	// box now sits at 62 GB free and 1 GB laundry, and hopper holds ~2 GB per
-	// slot, so doubling costs ~17 GB of real headroom.
+	// 32 (2026-08-23, from 16 via 24): the two constraints that set 16 both cleared.
+	// The 16->24 step cut sheds ~40% with zero insert-latency inflation (mean kept
+	// falling, 2300->2172ms) and rpool stayed sub-ms, so the remaining headroom
+	// supports a second step while the Optane index tablespace is pending.
+	// Memory: the cap guarded a box at 5 GB free / 48 GB laundry; smaug now
+	// runs 256 GB with ~124 GB reclaimable and ~1 GB laundry, so at the ~2 GB
+	// worst case per slot, +8 slots risks ~16 GB against that headroom.
+	// Store duration: "more slots don't help" was measured against a
+	// saturated single-device pool at 99-100%b and 3-4 s stores; the pool is
+	// now a mirrored pair at ~0.1 ms / no queue wait, and the post-index-diet
+	// store mean is ~1.7-2.3 s, while renew-lane sheds (lost forever, unlike
+	// worker sheds which retry) still fire thousands per hour.
+	// 64 was tried 2026-08-23 and reverted: shed rate and insert mean were
+	// unchanged vs 32 while Active memory grew 6->61 GB holding idle
+	// envelopes — past ~32 the constraint is store duration, not slots.
 	//
 	// This is still a count where the risk is bytes; a large-result lane, or
 	// admission on declared body size, would bound the thing that actually
 	// runs out. Until then, keep this in step with the memory the host can
 	// actually spare.
-	resultSlots := min(16, max(2, runtime.NumCPU()))
+	// 40 (2026-08-23): probing the 32..64 gap — the measured curve was
+	// 16:140 / 24:206 / 32:258 / 64:219 accepted-per-minute, so the peak sits
+	// somewhere in [32, 64). Watch accepted/min and the new
+	// hopper.result_phase.seconds histogram; revert to 32 if it regresses.
+	resultSlots := min(40, max(2, runtime.NumCPU()))
 	// Cap concurrent archive-member extractions to the CPU count (decompression
 	// is CPU-bound), clamped so a many-core host can't pile up unbounded disk
 	// spooling from a request burst.

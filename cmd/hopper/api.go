@@ -59,6 +59,11 @@ type apiServer struct {
 	// the DB sessions run under default_transaction_read_only (see
 	// cmdServeReplica for why both layers exist).
 	readOnly bool
+	// relay, when non-nil on a readOnly instance, proxies client-facing
+	// mutations to the primary hopper instead of refusing them, and backs the
+	// ?fresh=1 read-after-write escape hatch. Worker-loop routes are never
+	// relayed. See relay.go for the rules.
+	relay http.Handler
 }
 
 // errSaturated is returned by the slot-acquire helpers when no slot frees
@@ -696,10 +701,14 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	// safeFileServer with an empty root would be a path-containment bug
 	// waiting to happen, so they exist only when there are bytes to serve.
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
-	mux.HandleFunc("GET /api/sample/{sha256}", s.handleSample)
-	mux.HandleFunc("GET /api/sample", s.handleSampleByPURL)
-	mux.HandleFunc("GET /v1/lookup", s.handleV1Lookup)
-	mux.HandleFunc("GET /api/provenance/{sha256}", s.handleProvenance)
+	// Lookup routes answer from the local (replica) database; freshOr adds the
+	// ?fresh=1 / X-Hopper-Fresh escape hatch that routes one read to the
+	// primary when a client needs to see its own just-relayed write (a no-op
+	// wrapper when no relay is configured — including on the primary itself).
+	mux.HandleFunc("GET /api/sample/{sha256}", s.freshOr(s.handleSample))
+	mux.HandleFunc("GET /api/sample", s.freshOr(s.handleSampleByPURL))
+	mux.HandleFunc("GET /v1/lookup", s.freshOr(s.handleV1Lookup))
+	mux.HandleFunc("GET /api/provenance/{sha256}", s.freshOr(s.handleProvenance))
 	mux.HandleFunc("GET /api/locations/incoming", s.handleIncomingLocations)
 	if s.dataRoot != "" || !s.readOnly {
 		mux.HandleFunc("GET /api/file/{sha256}", s.handleFile)
@@ -711,15 +720,42 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 		// an ordinary primary), and a write here would silently diverge it
 		// from the publisher until the next conflict wedged replication. The
 		// session-level default_transaction_read_only guard is the backstop;
-		// this is the front door: every mutating route answers 403 so a
-		// misconfigured worker or collector learns immediately that it is
-		// talking to the wrong hopper.
-		for _, ep := range []string{
-			"GET /api/next", "GET /api/heartbeat", "POST /api/result",
+		// this is the front door: no mutating route ever touches the local DB.
+		//
+		// The worker loop is refused even with the relay enabled: result
+		// envelopes are the publisher's hot ingest path, and double-shipping
+		// them through this box helps no one (relay.go rule 2). Workers point
+		// at the primary directly.
+		//
+		// POST /api/result is split by lane: the renew lane (single-artifact
+		// renewals from `atomscan serve --hopper`, low-rate and further thinned
+		// by the currency skip) relays, so a host like cyclotron can point its
+		// ENTIRE stack at this one URL; the worker lane — the firehose — is
+		// refused as before.
+		for _, ep := range []string{"GET /api/next", "GET /api/heartbeat"} {
+			mux.HandleFunc(ep, handleWorkerRouteRefusal)
+		}
+		mux.HandleFunc("POST /api/result", func(w http.ResponseWriter, r *http.Request) {
+			if s.relay != nil && renewalLane(r) {
+				s.relay.ServeHTTP(w, r)
+				return
+			}
+			handleWorkerRouteRefusal(w, r)
+		})
+		// Client-facing mutations: proxied verbatim to the primary when the
+		// relay is configured, refused with the classic 403 otherwise.
+		clientWrites := []string{
 			"POST /api/upload", "POST /api/known", "POST /api/sightings",
 			"POST /api/popular", "POST /api/triage", "POST /api/rescan/{sha256}",
-		} {
-			mux.HandleFunc(ep, handleReadOnlyRefusal)
+		}
+		if s.relay != nil {
+			for _, ep := range clientWrites {
+				mux.Handle(ep, s.relay)
+			}
+		} else {
+			for _, ep := range clientWrites {
+				mux.HandleFunc(ep, handleReadOnlyRefusal)
+			}
 		}
 		return
 	}
@@ -740,6 +776,13 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 // clients must not retry (a 503 would invite exactly that).
 func handleReadOnlyRefusal(w http.ResponseWriter, _ *http.Request) {
 	writeJSONError(w, http.StatusForbidden, `{"error":"read-only replica; writes go to the primary hopper"}`)
+}
+
+// handleWorkerRouteRefusal answers the worker-loop routes on a read-only
+// replica, relay or no relay: workers are fleet config and belong on the
+// primary (see relay.go rule 2). Same 403-not-405 reasoning as above.
+func handleWorkerRouteRefusal(w http.ResponseWriter, _ *http.Request) {
+	writeJSONError(w, http.StatusForbidden, `{"error":"worker routes are never served or relayed by a replica; point workers at the primary hopper"}`)
 }
 
 // handleHealthz is a liveness probe that deliberately touches nothing — no
@@ -1715,6 +1758,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 			"lane", lane, "remote", r.RemoteAddr, "waited_ms", waited.Milliseconds())
 	}
 	defer s.releaseResult(renewal)
+	phaseStart := time.Now()
 	// Slow-loris defense: bound how long the (up to maxResultBodyBytes) body may
 	// take to arrive, mirroring handleUpload. Uses the per-request response controller
 	// so it doesn't impose a global ReadTimeout on long-lived /data downloads.
@@ -1759,6 +1803,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid sha256 or worker"}`, http.StatusBadRequest)
 		return
 	}
+	recordResultPhase(r.Context(), "body", lane, time.Since(phaseStart))
 	req.Worker = qualifiedWorkerName(req.Worker, r.RemoteAddr)
 
 	// Once the result body is accepted, persist it independently of the
@@ -1807,9 +1852,11 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	// Replaces the former "truncate now, recreate members later via a best-effort
 	// async pool" path, whose silent member loss produced truncated parents with
 	// no members (no content, permanent data loss).
+	storeStart := time.Now()
 	stats, err := retryDBAccess(ctx, "store result", req.SHA256, func(ctx context.Context) (hopper.StoreStats, error) {
 		return s.db.StoreResult(ctx, req.SHA256, req.Raw, req.ML, req.LLM, &parsed, tv)
 	})
+	recordResultPhase(r.Context(), "store", lane, time.Since(storeStart))
 	if err != nil {
 		if errors.Is(err, hopper.ErrNotFound) {
 			claimedPath := s.tracker.release(req.SHA256)
@@ -2376,10 +2423,19 @@ const maxKnownBatch = 1024
 
 type knownRequest struct {
 	SHA256 []string `json:"sha256"`
+	// TraitsVersion, when non-empty, asks which of these digests already hold
+	// an analysis at this traits version (the "rev" a scan report carries).
+	// The response's Current lists them, so a dependency-mirroring worker can
+	// skip re-posting verdicts hopper already has. Optional and additive: an
+	// old client never sends it and sees the response it always saw.
+	TraitsVersion string `json:"traits_version"`
 }
 
 type knownResponse struct {
 	Known []string `json:"known"`
+	// Current is the subset of Known whose stored verdict matches the
+	// request's TraitsVersion. Present only when the request asked.
+	Current []string `json:"current,omitempty"`
 }
 
 // handleKnown answers "which of these digests do you already have?" with a
@@ -2417,20 +2473,24 @@ func (s *apiServer) handleKnown(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
-	known, err := s.db.KnownSHA256(ctx, valid)
+	byVersion, err := s.db.KnownSHA256Versions(ctx, valid)
 	if err != nil {
 		slog.Error("known: query failed", "error", err)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
 	}
-	if known == nil {
-		known = []string{}
+	resp := knownResponse{Known: make([]string, 0, len(byVersion))}
+	for sha, tv := range byVersion {
+		resp.Known = append(resp.Known, sha)
+		if req.TraitsVersion != "" && tv == req.TraitsVersion {
+			resp.Current = append(resp.Current, sha)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
-	_ = json.NewEncoder(w).Encode(knownResponse{Known: known}) //nolint:errcheck,errchkjson // best-effort response
+	_ = json.NewEncoder(w).Encode(resp) //nolint:errcheck,errchkjson // best-effort response
 }
 
 // maxSightingsBatch caps the records one /api/sightings request may carry.

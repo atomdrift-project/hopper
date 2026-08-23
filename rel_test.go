@@ -326,3 +326,44 @@ func TestFeedListsDependenciesButNotArchiveMembers(t *testing.T) {
 		t.Error("contained member listed — it has no identity apart from its archive")
 	}
 }
+
+// KnownSHA256Versions is the currency half of the /api/known contract: each
+// known digest carries its stored traits_version so a dependency-mirroring
+// worker can skip re-posting verdicts hopper already holds at the same
+// analyzer version. The retrievability rules are identical to KnownSHA256
+// (same query), so this test pins only the version attachment: an analyzed
+// sample reports its version, an unanalyzed one reports "", and a
+// non-retrievable or absent sha stays out of the map entirely.
+func TestKnownSHA256VersionsAttachesTraitsVersion(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	const (
+		analyzed   = "aa" + "00000000000000000000000000000000000000000000000000000000000000"
+		unanalyzed = "bb" + "00000000000000000000000000000000000000000000000000000000000000"
+		absent     = "cc" + "00000000000000000000000000000000000000000000000000000000000000"
+	)
+	mustInsert(t, ctx, db, &Sample{SHA256: analyzed, Path: "unknown/uploads/aa/00/a.tgz"})
+	mustInsert(t, ctx, db, &Sample{SHA256: unanalyzed, Path: "unknown/uploads/bb/00/b.tgz"})
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET traits_version = 'abc12' WHERE sha256 = ?`, analyzed); err != nil {
+		t.Fatalf("set traits_version: %v", err)
+	}
+
+	got, err := db.KnownSHA256Versions(ctx, []string{analyzed, unanalyzed, absent})
+	if err != nil {
+		t.Fatalf("KnownSHA256Versions: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d entries (%v), want exactly the two retrievable samples", len(got), got)
+	}
+	if got[analyzed] != "abc12" {
+		t.Errorf("analyzed sample version = %q, want abc12", got[analyzed])
+	}
+	if v, ok := got[unanalyzed]; !ok || v != "" {
+		t.Errorf("unanalyzed sample = (%q, %v), want present with empty version", v, ok)
+	}
+	if _, ok := got[absent]; ok {
+		t.Error("absent sha reported known")
+	}
+}

@@ -10,11 +10,18 @@
 # renewals. The replica's disk is idle; lookups served here are immune to the
 # publisher's ingestion weather.
 #
-# The service is READ-ONLY by two independent guards (mutating routes 403;
-# database sessions forced default_transaction_read_only=on, verified at
-# startup, fail-closed). A logical replica is an ordinary writable primary —
-# one stray write diverges it from the publisher until replication wedges —
-# so never point workers or collectors at this listener.
+# The service is READ-ONLY against the LOCAL database by two independent
+# guards (no mutating route ever touches it; database sessions forced
+# default_transaction_read_only=on, verified at startup, fail-closed). A
+# logical replica is an ordinary writable primary — one stray write diverges
+# it from the publisher until replication wedges.
+#
+# Client-facing mutations (upload/known/sightings/popular/triage/rescan) are
+# RELAYED verbatim to the primary at RELAY_TO (default hopper-api), so a
+# client can point at this one URL for everything; lookups honor ?fresh=1 for
+# read-after-write. Worker routes (/api/next, /api/heartbeat, /api/result)
+# are refused regardless — never point workers at this listener; result
+# envelopes must not double-hop through the replica. See cmd/hopper/relay.go.
 #
 # Idempotent: re-running installs the current build and restarts only when
 # the binary or unit changed.
@@ -26,6 +33,11 @@
 #   TOKEN_SRC   token file to install  (default: ~/.tok/hopper — the same
 #                 token the primary uses, so clients need no second secret)
 #   SERVICE_USER  unix user            (default: current user)
+#   RELAY_TO    primary base URL for the write relay
+#                 (default: http://hopper-api:8081; set empty to disable the
+#                 relay and refuse client writes with 403 as before). The
+#                 client's bearer token passes through to the primary, which
+#                 works because TOKEN_SRC defaults to the primary's own token.
 
 set -euo pipefail
 
@@ -33,6 +45,7 @@ DB="${DB:-postgres://hopper@127.0.0.1:5432/hopper?sslmode=disable}"
 API_ADDR="${API_ADDR:-0.0.0.0:8091}"
 TOKEN_SRC="${TOKEN_SRC:-${HOME}/.tok/hopper}"
 SERVICE_USER="${SERVICE_USER:-$(id -un)}"
+RELAY_TO="${RELAY_TO-http://hopper-api:8081}"
 
 UNIT=/etc/systemd/system/hopper-replica.service
 BIN_PATH=/usr/local/bin/hopper
@@ -105,6 +118,14 @@ log "installing token -> ${TOKEN_DST}"
 priv install -d -m 0755 /etc/hopper
 priv install -m 0640 -o root -g "${SERVICE_USER}" "${TOKEN_SRC}" "${TOKEN_DST}"
 
+# The relay flag is appended only when RELAY_TO is set, so RELAY_TO="" yields
+# the classic refuse-all-writes unit.
+RELAY_ARGS=""
+if [ -n "${RELAY_TO}" ]; then
+    RELAY_ARGS=" \\
+    --relay-writes-to ${RELAY_TO}"
+fi
+
 UNIT_TMP=$(mktemp)
 cat >"${UNIT_TMP}" <<EOF
 # Installed by scripts/replica/deploy-replica-api.sh — edits are overwritten.
@@ -120,7 +141,7 @@ User=${SERVICE_USER}
 ExecStart=${BIN_PATH} serve-replica \\
     --db '${DB}' \\
     --api-addr ${API_ADDR} \\
-    --token-file ${TOKEN_DST}
+    --token-file ${TOKEN_DST}${RELAY_ARGS}
 Restart=always
 RestartSec=2
 # Read-only service, hardened accordingly: no filesystem writes at all beyond

@@ -75,6 +75,39 @@ func recordLoadShed(ctx context.Context, pool string) {
 	}
 }
 
+// resultPhaseHist times what a result-ingestion slot is actually held on once
+// acquired: "body" (streaming + decoding the envelope off the wire) versus
+// "store" (the StoreResult transaction, retries and lock waits included). The
+// HTTP route histogram measures the whole request — slot wait folded in — so
+// it can say a request was slow but not which phase pinned the slot; this
+// histogram is the difference between "raise the slot count" (bodies are slow;
+// concurrency is cheap) and "fix the store path" (the DB holds the slot, and
+// more slots only add contention — measured 2026-08-23 when 64 slots
+// throughput-regressed against 32). Labeled by lane so renewals and worker
+// results read separately.
+var (
+	resultPhaseOnce sync.Once
+	resultPhaseHist metric.Float64Histogram
+)
+
+// recordResultPhase records one phase duration for a held result slot. Same
+// lazy-create/no-op-on-failure contract as recordLoadShed.
+func recordResultPhase(ctx context.Context, phase, lane string, d time.Duration) {
+	resultPhaseOnce.Do(func() {
+		if h, err := otel.Meter(meterName).Float64Histogram(
+			"hopper.result_phase.seconds",
+			metric.WithDescription("Time a held result-ingestion slot spent in each phase (body = read+decode, store = DB transaction)."),
+			metric.WithExplicitBucketBoundaries(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 30, 60),
+		); err == nil {
+			resultPhaseHist = h
+		}
+	})
+	if resultPhaseHist != nil {
+		resultPhaseHist.Record(ctx, d.Seconds(), metric.WithAttributes(
+			attribute.String("phase", phase), attribute.String("lane", lane)))
+	}
+}
+
 // enableMetrics registers the OpenTelemetry instruments that publish every
 // numeric the web dashboard shows, so the trends are scrapeable at /_/metrik
 // without screen-scraping the HTML. The instruments are observable: a single

@@ -2611,24 +2611,43 @@ const triageServablePathSQL = ` AND path <> ''`
 // a reference edge — a dependency was never inside the package that named it,
 // so there is nothing to extract it from.
 func (db *DB) KnownSHA256(ctx context.Context, shas []string) ([]string, error) {
+	byVersion, err := db.KnownSHA256Versions(ctx, shas)
+	if err != nil || len(byVersion) == 0 {
+		return nil, err
+	}
+	known := make([]string, 0, len(byVersion))
+	for sha := range byVersion {
+		known = append(known, sha)
+	}
+	return known, nil
+}
+
+// KnownSHA256Versions is KnownSHA256 with each known digest's stored
+// traits_version attached ("" for a sample with no analysis yet). It exists so
+// /api/known can also answer "is your verdict for this sha already current?"
+// in the same single lookup — the probe a dependency-mirroring worker uses to
+// skip re-posting verdicts hopper already holds at the same analyzer version,
+// which for wildly popular dependencies (inherits, x/tools, setup-go) was one
+// redundant samples UPDATE per worker run, forever.
+func (db *DB) KnownSHA256Versions(ctx context.Context, shas []string) (map[string]string, error) {
 	if len(shas) == 0 {
 		return nil, nil
 	}
-	known := make([]string, 0, len(shas))
+	known := make(map[string]string, len(shas))
 
 	if db.pool != nil {
 		rows, err := db.pool.Query(ctx,
-			`SELECT sha256 FROM samples s WHERE s.sha256 = ANY($1)`+knownRetrievableSQL, shas)
+			`SELECT sha256, traits_version FROM samples s WHERE s.sha256 = ANY($1)`+knownRetrievableSQL, shas)
 		if err != nil {
 			return nil, fmt.Errorf("hopper: known sha256: %w", err)
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var s string
-			if err := rows.Scan(&s); err != nil {
+			var s, tv string
+			if err := rows.Scan(&s, &tv); err != nil {
 				return nil, fmt.Errorf("hopper: known sha256 scan: %w", err)
 			}
-			known = append(known, s)
+			known[s] = tv
 		}
 		if err := rows.Err(); err != nil {
 			return nil, fmt.Errorf("hopper: known sha256 rows: %w", err)
@@ -2646,17 +2665,17 @@ func (db *DB) KnownSHA256(ctx context.Context, shas []string) ([]string, error) 
 	}
 	//nolint:gosec // G202: the concatenated text is a fixed "?,?,…" placeholder list; the digests are bound parameters
 	rows, err := db.lite.QueryContext(ctx,
-		`SELECT sha256 FROM samples s WHERE s.sha256 IN (`+strings.Join(placeholders, ",")+`)`+knownRetrievableSQL, args...)
+		`SELECT sha256, traits_version FROM samples s WHERE s.sha256 IN (`+strings.Join(placeholders, ",")+`)`+knownRetrievableSQL, args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: known sha256: %w", err)
 	}
 	defer func() { _ = rows.Close() }() //nolint:errcheck // best-effort close
 	for rows.Next() {
-		var s string
-		if err := rows.Scan(&s); err != nil {
+		var s, tv string
+		if err := rows.Scan(&s, &tv); err != nil {
 			return nil, fmt.Errorf("hopper: known sha256 scan: %w", err)
 		}
-		known = append(known, s)
+		known[s] = tv
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("hopper: known sha256 rows: %w", err)
