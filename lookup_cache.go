@@ -37,7 +37,10 @@ const (
 )
 
 func newDB() *DB {
-	return &DB{lookup: fido.New[string, *Sample](fido.Size(lookupCacheSize), fido.TTL(lookupTTL))}
+	return &DB{
+		lookup:  fido.New[string, *Sample](fido.Size(lookupCacheSize), fido.TTL(lookupTTL)),
+		records: newRecordCache(),
+	}
 }
 
 // lookupCounters tallies what the pool absorbed, split by which key was asked
@@ -171,16 +174,23 @@ func sampleBlobBytes(s *Sample) int {
 // therefore unknown — is the sweep over the pool needed. Every write path pays
 // this, so keeping it off the hot path matters.
 func (db *DB) forgetSHA(sha string) {
-	if db.lookup == nil || sha == "" {
+	if sha == "" {
+		return
+	}
+	// Both pools answer the same question from the same row, so every key
+	// dropped here is dropped from each: one surviving a write the other saw
+	// would serve a verdict that is no longer true for as long as its TTL.
+	db.forget(lookupSHAKey(sha))
+	if db.lookup == nil {
+		db.forgetRecordsBySHA(map[string]struct{}{sha: {}})
 		return
 	}
 	cached, ok := db.lookup.Get(lookupSHAKey(sha))
 	if ok {
 		if cached != nil && cached.PURLBase != "" {
-			db.lookup.Delete(lookupPURLKey(cached.PURLBase, cached.Version))
-			db.lookup.Delete(lookupPURLKey(cached.PURLBase, ""))
+			db.forget(lookupPURLKey(cached.PURLBase, cached.Version))
+			db.forget(lookupPURLKey(cached.PURLBase, ""))
 		}
-		db.lookup.Delete(lookupSHAKey(sha))
 		return
 	}
 	for k, v := range db.lookup.Range() {
@@ -188,14 +198,35 @@ func (db *DB) forgetSHA(sha string) {
 			db.lookup.Delete(k)
 		}
 	}
+	// The record pool outlives the sample pool by four to one, so a record can
+	// still be held under a PURL whose sample has already been evicted — and
+	// the sweep above would not have found it.
+	db.forgetRecordsBySHA(map[string]struct{}{sha: {}})
+}
+
+// forget drops one key from both pools.
+func (db *DB) forget(key string) {
+	if db.lookup != nil {
+		db.lookup.Delete(key)
+	}
+	db.forgetRecord(key)
 }
 
 // forgetSHAs is forgetSHA over a batch, paying the pool sweep at most once for
 // the whole set rather than once per sha that is not itself cached.
 func (db *DB) forgetSHAs(shas []string) {
+	all := make(map[string]struct{}, len(shas))
+	for _, sha := range shas {
+		if sha != "" {
+			all[sha] = struct{}{}
+			db.forgetRecord(lookupSHAKey(sha))
+		}
+	}
 	if db.lookup == nil {
+		db.forgetRecordsBySHA(all)
 		return
 	}
+	defer db.forgetRecordsBySHA(all)
 	sweep := make(map[string]struct{}, len(shas))
 	for _, sha := range shas {
 		if sha == "" {
@@ -203,8 +234,8 @@ func (db *DB) forgetSHAs(shas []string) {
 		}
 		cached, ok := db.lookup.Get(lookupSHAKey(sha))
 		if ok && cached != nil && cached.PURLBase != "" {
-			db.lookup.Delete(lookupPURLKey(cached.PURLBase, cached.Version))
-			db.lookup.Delete(lookupPURLKey(cached.PURLBase, ""))
+			db.forget(lookupPURLKey(cached.PURLBase, cached.Version))
+			db.forget(lookupPURLKey(cached.PURLBase, ""))
 		}
 		db.lookup.Delete(lookupSHAKey(sha))
 		if !ok {

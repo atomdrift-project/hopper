@@ -2794,9 +2794,7 @@ func (db *DB) triageBadSQLite(ctx context.Context, limit int, f TriageFilter) ([
 	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleColsLight+` FROM samples
-		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''`+
-			triageServablePathSQL+`
-		   AND max_crit < 5 AND suspicious_count < 2`+extra+`
+		 WHERE `+triageBadWhere+extra+`
 		 `+triageOrderSQL(f)+` LIMIT ?`,
 		args...)
 	if err != nil {
@@ -2811,9 +2809,7 @@ func (db *DB) triageGoodSQLite(ctx context.Context, limit int, f TriageFilter) (
 	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleColsLight+` FROM samples
-		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''`+
-			triageServablePathSQL+`
-		   AND (max_crit >= 5 OR suspicious_count >= 2)`+extra+`
+		 WHERE `+triageGoodWhere+extra+`
 		 `+triageOrderSQL(f)+` LIMIT ?`,
 		args...)
 	if err != nil {
@@ -2949,9 +2945,7 @@ func (db *DB) triageNewSQLite(ctx context.Context, limit int, f TriageFilter) ([
 	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleColsLight+` FROM samples
-		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''`+
-			triageServablePathSQL+`
-		   AND suspicious_count >= 1 AND path NOT GLOB 'review/*'`+extra+`
+		 WHERE `+triageNewWhereSQLite+extra+`
 		 `+triageOrderSQL(f)+` LIMIT ?`,
 		args...)
 	if err != nil {
@@ -2982,8 +2976,7 @@ func (db *DB) triageSightedSQLite(ctx context.Context, limit int, f TriageFilter
 	//nolint:gosec // G202: label predicate and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleColsLight+` FROM samples
-		 WHERE label = 'sighted' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''`+
-			triageServablePathSQL+extra+`
+		 WHERE `+triageSightedWhere+extra+`
 		 ORDER BY created_at DESC, id DESC LIMIT ?`,
 		args...)
 	if err != nil {
@@ -3096,7 +3089,8 @@ func (db *DB) triageFalloutSQLite(ctx context.Context, limit int, createdAfter t
 		 WHERE `+litmusClassSQLite+` = 2 AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL
 		   AND skip = '' AND file_type <> 'registry'`+triageServablePathSQL+`
 		   AND created_at > ?
-		   AND (llm_result IS NULL OR COALESCE(json_extract(llm_result, '$.interpretation'), '') = '')
+		   AND ((llm_result IS NULL OR COALESCE(json_extract(llm_result, '$.interpretation'), '') = '')
+		        OR NOT corroborated)
 		   AND NOT EXISTS (SELECT 1 FROM reports r
 		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'fallout')
 		   AND parent = '' AND NOT EXISTS (

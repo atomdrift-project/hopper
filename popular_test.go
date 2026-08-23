@@ -122,11 +122,17 @@ func TestTriagePopularRanksByImportanceNotLabel(t *testing.T) {
 	highRank := add("pkg:npm/popular-900", "bad", 4) // rank 900, filed bad
 	unmarked := add("pkg:npm/nobody-imports", "unknown", 4)
 	benign := add("pkg:npm/popular-5", "unknown", 1) // marked, but no detection
+	// The boundary the queue turns on: "notable" is a finding worth recording,
+	// not one worth the deep chain and a fleet-wide stand-down. At the old
+	// notableCrit floor this row qualified, and 92% of the live population
+	// looked like it.
+	notable := add("pkg:npm/popular-7", "unknown", 3)
 
 	if err := db.SetPopularPackages(ctx, []PopularPackage{
 		{PURLBase: "pkg:npm/popular-3", Ecosystem: "npm", Rank: 3, Source: "poppy"},
 		{PURLBase: "pkg:npm/popular-900", Ecosystem: "npm", Rank: 900, Source: "poppy"},
 		{PURLBase: "pkg:npm/popular-5", Ecosystem: "npm", Rank: 5, Source: "poppy"},
+		{PURLBase: "pkg:npm/popular-7", Ecosystem: "npm", Rank: 7, Source: "poppy"},
 	}); err != nil {
 		t.Fatalf("SetPopularPackages: %v", err)
 	}
@@ -153,11 +159,62 @@ func TestTriagePopularRanksByImportanceNotLabel(t *testing.T) {
 	}{
 		{unmarked, "a package nobody marked as popular"},
 		{benign, "a marked package with no detection"},
+		{notable, "a marked package whose worst finding is only notable"},
 	} {
 		for _, s := range got {
 			if s.SHA256 == excluded.sha {
 				t.Errorf("TriagePopular included %s", excluded.why)
 			}
+		}
+	}
+}
+
+// Within one package the tie breaks on cleave risk score, worst first. It used
+// to break on analyzed_at, which ordered a package's artifacts by when we last
+// looked at them — no signal at all about which one is worth judging first, and
+// one that a re-analysis silently reshuffles.
+func TestTriagePopularBreaksTiesByRiskScore(t *testing.T) {
+	ctx := t.Context()
+	db := openTestDB(t)
+
+	var n int
+	add := func(risk int) string {
+		n++
+		sha := fmt.Sprintf("%063x1", n)
+		mustInsert(t, ctx, db, &Sample{
+			SHA256: sha, Source: "test", Label: "unknown", LabelSource: "test",
+			PURLBase: "pkg:npm/one-package", Version: fmt.Sprintf("1.0.%d", n),
+		})
+		// Same package, same rank, same crit — risk is the only thing separating
+		// them, so it is the only thing the ordering can be reading.
+		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"npm","x":%d,"dp":0,"ts":[{"l":4}]}]}`, sha, risk)
+		if err := db.UpdateCleaveResult(ctx, sha, result, nil, ""); err != nil {
+			t.Fatalf("UpdateCleaveResult: %v", err)
+		}
+		return sha
+	}
+
+	mild := add(10)
+	worst := add(900)
+	middling := add(400)
+
+	if err := db.SetPopularPackages(ctx, []PopularPackage{
+		{PURLBase: "pkg:npm/one-package", Ecosystem: "npm", Rank: 1, Source: "poppy"},
+	}); err != nil {
+		t.Fatalf("SetPopularPackages: %v", err)
+	}
+
+	got, err := db.TriagePopular(ctx, 100, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriagePopular: %v", err)
+	}
+	want := []string{worst, middling, mild}
+	if len(got) != len(want) {
+		t.Fatalf("selected %d samples, want %d", len(got), len(want))
+	}
+	for i, w := range want {
+		if got[i].SHA256 != w {
+			t.Errorf("position %d = %s, want %s (risk-descending)", i, got[i].SHA256, w)
 		}
 	}
 }

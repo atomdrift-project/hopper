@@ -145,7 +145,21 @@ func (db *DB) PopularPackageCount(ctx context.Context) (int, error) {
 }
 
 // TriagePopular returns analyzed top-level samples belonging to a marked
-// package that carry a detection, worst-ranked package first.
+// package whose worst finding is suspicious or hostile, worst-ranked package
+// first.
+//
+// The floor is suspiciousCrit, not notableCrit: the queue is for things that
+// look wrong, and "notable" does not. See suspiciousCrit for the measurement
+// that put it there — at the lower bar 92% of this population was notable-only.
+//
+// Within one package the tie is broken by cleave risk score, worst first, not
+// by recency. Both orderings are arbitrary with respect to the thing this queue
+// exists to find, but only one of them is arbitrary in a useful direction: a
+// package's riskiest artifact is the one whose verdict is worth having first,
+// whereas its most recently analyzed artifact is worth no more than any other.
+// Recency also aliased badly against the drain — a re-analysis moves a sample
+// back to the head of its own package — where the score does not move unless
+// the finding does.
 //
 // Label-agnostic on purpose. Every other triage queue selects on what we
 // believe about a sample; this one selects on what a mistake would cost. A
@@ -176,13 +190,9 @@ func (db *DB) triagePopularPG(ctx context.Context, limit int, f TriageFilter) ([
 	// cost nothing worth restructuring the column list to avoid.
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE cleave_result IS NOT NULL AND parent = ''`+triageServablePathSQL+`
-		   AND skip != 'conflict'
-		   AND max_crit >= 3
-		   AND purl_base != ''
-		   AND EXISTS (SELECT 1 FROM popular_packages p WHERE p.purl_base = samples.purl_base)`+extra+`
+		 WHERE `+triagePopularWhere+extra+`
 		 ORDER BY (SELECT p.rank FROM popular_packages p WHERE p.purl_base = samples.purl_base) ASC,
-		          analyzed_at DESC NULLS LAST, id DESC
+		          score DESC, id DESC
 		 LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
@@ -198,13 +208,9 @@ func (db *DB) triagePopularSQLite(ctx context.Context, limit int, f TriageFilter
 	//nolint:gosec // G202: predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleColsLight+` FROM samples
-		 WHERE cleave_result IS NOT NULL AND parent = ''`+triageServablePathSQL+`
-		   AND skip != 'conflict'
-		   AND max_crit >= 3
-		   AND purl_base != ''
-		   AND EXISTS (SELECT 1 FROM popular_packages p WHERE p.purl_base = samples.purl_base)`+extra+`
+		 WHERE `+triagePopularWhere+extra+`
 		 ORDER BY (SELECT p.rank FROM popular_packages p WHERE p.purl_base = samples.purl_base) ASC,
-		          analyzed_at DESC, id DESC
+		          score DESC, id DESC
 		 LIMIT ?`,
 		args...)
 	if err != nil {

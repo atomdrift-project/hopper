@@ -2329,8 +2329,11 @@ func TestHandleSample(t *testing.T) {
 		t.Fatalf("envelope missing ml: %s", rec.Body.Bytes())
 	}
 
-	if rec := get(pending); rec.Code != http.StatusNoContent {
-		t.Fatalf("pending: status = %d, want 204", rec.Code)
+	// A sample we hold but have not analyzed is "accepted, still working" —
+	// distinguishable from a 404 we know nothing about and from a 200 with a
+	// verdict, which is what lets a caller decide to wait.
+	if rec := get(pending); rec.Code != http.StatusAccepted {
+		t.Fatalf("pending: status = %d, want 202", rec.Code)
 	}
 	if rec := get(missing); rec.Code != http.StatusNotFound {
 		t.Fatalf("missing: status = %d, want 404", rec.Code)

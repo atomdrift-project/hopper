@@ -698,6 +698,7 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /api/sample/{sha256}", s.handleSample)
 	mux.HandleFunc("GET /api/sample", s.handleSampleByPURL)
+	mux.HandleFunc("GET /v1/lookup", s.handleV1Lookup)
 	mux.HandleFunc("GET /api/provenance/{sha256}", s.handleProvenance)
 	mux.HandleFunc("GET /api/locations/incoming", s.handleIncomingLocations)
 	if s.dataRoot != "" || !s.readOnly {
@@ -3457,10 +3458,21 @@ func (s *apiServer) handleSampleByPURL(w http.ResponseWriter, r *http.Request) {
 	writeSampleEnvelope(w, sample)
 }
 
+// sampleQueuedRetryAfter is what an unanalyzed sample tells a caller to wait.
+// A queue this deep is measured in minutes, but a caller that polls is usually
+// waiting on a user, so this is the shortest interval that is not a busy-wait.
+const sampleQueuedRetryAfter = 5
+
 func writeSampleEnvelope(w http.ResponseWriter, sample *hopper.Sample) {
 	if len(sample.LitmusResult) == 0 && len(sample.CleaveResult) == 0 && len(sample.LLMResult) == 0 {
+		// 202, not 204. We have the bytes and nothing has looked at them yet,
+		// which is "accepted, still working" — 204 says "success, nothing to
+		// send", and a caller cannot tell that apart from a sample we hold and
+		// know to be empty. The distinction matters because it is the one case
+		// worth waiting on rather than giving up on.
 		w.Header().Set("X-Sha256", sample.SHA256)
-		w.WriteHeader(http.StatusNoContent)
+		w.Header().Set("Retry-After", strconv.Itoa(sampleQueuedRetryAfter))
+		w.WriteHeader(http.StatusAccepted)
 		return
 	}
 	env := hopper.Envelope(sample)

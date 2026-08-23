@@ -56,7 +56,8 @@ commands:
   reheal-crit        repair max_crit/suspicious_count zeroed by the pre-v8 cleave trigger (postgres)
   backfill-purl      derive missing samples.purl_base from ecosystem+package (never overwrites; postgres)
   repair-parents     clear samples.parent where the bytes are on disk standalone (--dry-run; postgres)
-  canonicalize-purls rewrite stored purl_base spellings onto the current canonical form (batched; -dry-run; postgres)
+  canonicalize-purls rewrite stored purl_base and sightings.subject spellings onto the current canonical
+                     form, then re-derive samples.corroborated (batched; -dry-run; postgres)
   purge-unsupported  delete analyzed rows cleave could not classify
   normalize-ecosystems  re-canonicalize stored ecosystem labels (dry-run)
   cleanup            delete wonky samples by skip category (interactive)
@@ -988,6 +989,9 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	maxRSSGB := f.Int("max-memory-gb", 48,
 		"local atomscan worker RSS limit in GB, forwarded as --max-rss-gb (0 = auto: let atomscan self-throttle, -1 = disable in-process throttling)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
+	replica := f.Bool("replica", false,
+		"this process reads the logical replica: it sees no writes, so cached lookups age out "+
+			"rather than being invalidated")
 	rescanAge := f.Duration("rescan-age", 120*time.Hour, "minimum age before a stale-traits sample is eligible for rescan")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
@@ -1378,6 +1382,10 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		}
 		wd.endStage("db.connect")
 		slog.Info("database connection established", "elapsed", time.Since(dbStart))
+		// Before serving, while the pools are still empty.
+		if *replica {
+			d.ServesReplica()
+		}
 		dbPhase.Store("migrating schema")
 		wd.beginStage("db.migrate", "Migrating database")
 		slog.Info("running schema migrations")
@@ -3714,7 +3722,19 @@ func cmdCanonicalizePURLs(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	slog.Info("canonicalize-purls complete", "rows_rewritten", n, "sightings_rewritten", s, "dry_run", *dryRun)
+	// Rewriting a subject does not touch samples.corroborated — AddSightings
+	// sets that as it writes, and nothing has written since. A citation that
+	// only now names a real sample would stay uncorroborated without this, which
+	// is precisely how digest-wearing-a-purl rows left 767 confirmed-malicious
+	// samples looking uncited to the acquit queue.
+	var marked int64
+	if !*dryRun && s > 0 {
+		if marked, err = db.RemarkCorroborated(ctx); err != nil {
+			return err
+		}
+	}
+	slog.Info("canonicalize-purls complete",
+		"rows_rewritten", n, "sightings_rewritten", s, "samples_marked_corroborated", marked, "dry_run", *dryRun)
 	return nil
 }
 

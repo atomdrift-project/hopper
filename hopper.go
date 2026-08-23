@@ -192,6 +192,24 @@ const triagePerRouteK = 10
 // are inert content whose inherited-good label threatens nothing.
 const notableCrit = 3
 
+// suspiciousCrit is the cleave criticality floor for the popular queue — 4 =
+// "suspicious" in the same ladder. One above notableCrit, and the gap is the
+// whole point: "notable" means a finding worth recording, not a finding worth
+// a human's attention, and on a popular package it is overwhelmingly ordinary
+// behaviour that the detector is right to note and wrong to escalate.
+//
+// Measured before it was raised here: of 68,288 samples of ranked packages at
+// max_crit >= 3, 62,636 (92%) were notable-only, against 4,695 suspicious and
+// 957 hostile. The split was also lopsided by ecosystem — javascript and crates
+// supplied 69% of the rows and 8.6% of the suspicious ones — so the bar was
+// mostly buying a very large queue of very popular, very boring packages.
+//
+// That queue is expensive in a way the others are not: cyclotron runs it on the
+// deep provider chain AND stands every other sample queue down while it has
+// work, so its length is the whole fleet's latency. At >= 3 the backlog was
+// ~80 days of that; at >= 4 it is about a week.
+const suspiciousCrit = 4
+
 // strandedInnerScan bounds TriageStranded's member walk before the collapse
 // to parent archives — same role highestInnerScan used to play; the stranded
 // population is small (~tens of thousands) and score-concentrated, so this
@@ -482,8 +500,10 @@ type DB struct {
 	pool             *pgxpool.Pool
 	lite             *sql.DB
 	lookup           *fido.Cache[string, *Sample]
+	records          *fido.Cache[string, *cachedRecord]
 	backfillProgress atomic.Pointer[BackfillProgressFn]
 	lookupCounts     lookupCounters
+	recordCounts     recordCounters
 	// replicaIndexPolicy makes migrations decline secondary indexes a logical
 	// replica does not need. See SetReplicaIndexPolicy.
 	replicaIndexPolicy bool
@@ -4068,9 +4088,26 @@ func (db *DB) TriageSighted(ctx context.Context, limit int, f TriageFilter) ([]*
 }
 
 // TriageFallout returns analyzed top-level litmus-hostile samples (class 2)
-// carrying no LLM interpretation — llm_result is NULL or its interpretation is
-// empty (a failed pass stores only an error) — taking up to limit of the most
+// that are either UNDESCRIBED or UNCORROBORATED, taking up to limit of the most
 // recently added (created_at), restricted to rows created after createdAfter.
+//
+// Undescribed means llm_result is NULL or its interpretation is empty (a failed
+// pass stores only an error): the page shows a hostile verdict with no rationale
+// line. Uncorroborated means samples.corroborated is false: we call it hostile
+// and no outside source has ever cited it.
+//
+// One queue rather than two because measurement said they are one population.
+// Over a 7-day window: 337 samples on the page, 11 undescribed, 229
+// uncorroborated, and every undescribed sample was also uncorroborated — the
+// undescribed set was a strict subset, contributing nothing of its own. Two
+// queues over those populations would have run the same worker against the same
+// rows for two reasons, and the smaller reason would have been 5% of the work.
+//
+// The two halves want different products, which the reviewer's prompt handles
+// rather than the selector: an undescribed sample needs a rationale (the
+// write-back's interpret pass stores it), an uncorroborated one needs its
+// hostile verdict re-examined now that nobody outside has backed it up. A
+// completed judgement satisfies whichever applied.
 // This is the population prism's /fallout page renders with no rationale line:
 // litmus classified the bytes hostile but no reasoning pass ever ran (arrivals
 // outpace the new queue, which ranks a litmus-hostile sample no higher than any
@@ -4643,6 +4680,17 @@ func (db *DB) RepairStandaloneParents(ctx context.Context, dryRun bool) (int64, 
 	return n, err
 }
 
+// RemarkCorroborated re-derives samples.corroborated from the whole sightings
+// ledger, returning how many samples were newly flagged. Postgres-only, like
+// the canonicalisers it follows; the SQLite backend has no such maintenance
+// path. See remarkCorroboratedPG for why it only ever sets the flag.
+func (db *DB) RemarkCorroborated(ctx context.Context) (int64, error) {
+	if db.pool == nil {
+		return 0, nil
+	}
+	return db.remarkCorroboratedPG(ctx)
+}
+
 // CanonicalizeSightingSubjects rewrites stored sightings.subject values onto
 // the ledger keying convention (see normalizeSubject): lowercase sha256,
 // canonical version-less purl_base. Rows whose canonical spelling collides
@@ -4997,15 +5045,51 @@ func (s Sighting) valid() bool {
 // (pkgparse.CanonicalizePURL + VersionlessPURL; a source that flagged one
 // specific version records it in Note or URL, never in Subject). Anything
 // else is passed through for valid() to reject.
+//
+// A PURL whose name component is itself a sha256 is folded back to the bare
+// digest. Hash corpora cite BYTES, and a producer that pairs a digest with an
+// ecosystem mints pkg:<eco>/<64 hex> without noticing — a 64-character hex
+// string is a legal package name in every registry that takes free-form names,
+// so nothing upstream refuses it. The result matches no package and no file:
+// 1,050 such rows accumulated from bazaar and triage, 901 of them naming
+// samples we hold, and 767 of those were convicted malware that then read as
+// UNCORROBORATED to the queue whose job is overturning convictions.
+//
+// Coerced rather than rejected, deliberately. The citation is real and the
+// digest is right there in the string; refusing it would discard evidence
+// abuse.ch correctly reported. Because CanonicalizeSightingSubjects re-runs
+// this over stored rows, teaching it the shape also repairs the existing ones
+// in place — keeping each row's source, url and first_seen — rather than
+// needing them deleted and re-fetched.
 func normalizeSubject(subject string) string {
 	subject = strings.TrimSpace(subject)
 	if lower := strings.ToLower(subject); isSHA256Hex(lower) {
 		return lower
 	}
+	if sha, ok := digestWearingAPURL(subject); ok {
+		return sha
+	}
 	if canon := pkgparse.VersionlessPURL(pkgparse.CanonicalizePURL(subject)); canon != "" {
 		return canon
 	}
 	return subject
+}
+
+// digestWearingAPURL reports the sha256 inside a purl whose name component is a
+// digest, e.g. pkg:npm/<64 hex>. Any version, qualifier or subpath is ignored:
+// the digest identifies the bytes and the rest is noise a producer added.
+func digestWearingAPURL(subject string) (string, bool) {
+	if !strings.HasPrefix(subject, "pkg:") {
+		return "", false
+	}
+	name := subject[strings.LastIndex(subject, "/")+1:]
+	if i := strings.IndexAny(name, "@?#"); i >= 0 {
+		name = name[:i]
+	}
+	if lower := strings.ToLower(name); isSHA256Hex(lower) {
+		return lower, true
+	}
+	return "", false
 }
 
 // splitSightingSubjects partitions ledger subjects into sha256 digests and

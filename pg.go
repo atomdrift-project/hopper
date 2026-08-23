@@ -2423,7 +2423,7 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 			// The connection is likely broken; poison it so the pool discards
 			// it instead of handing the leftover table to the next borrower.
 			slog.Warn("drop batch staging table failed; discarding connection", "error", derr)
-			conn.Conn().Close(dropCtx) //nolint:errcheck // already tearing down
+			conn.Conn().Close(dropCtx) //nolint:errcheck,gosec // already tearing down
 		}
 	}()
 
@@ -4163,9 +4163,7 @@ func (db *DB) triageBadPG(ctx context.Context, limit int, f TriageFilter) ([]*Sa
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''`+
-			triageServablePathSQL+`
-		   AND max_crit < 5 AND suspicious_count < 2`+extra+`
+		 WHERE `+triageBadWhere+extra+`
 		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
@@ -4179,9 +4177,7 @@ func (db *DB) triageGoodPG(ctx context.Context, limit int, f TriageFilter) ([]*S
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''`+
-			triageServablePathSQL+`
-		   AND (max_crit >= 5 OR suspicious_count >= 2)`+extra+`
+		 WHERE `+triageGoodWhere+extra+`
 		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
@@ -4195,9 +4191,7 @@ func (db *DB) triageNewPG(ctx context.Context, limit int, f TriageFilter) ([]*Sa
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''`+
-			triageServablePathSQL+`
-		   AND suspicious_count >= 1 AND path NOT LIKE 'review/%'`+extra+`
+		 WHERE `+triageNewWherePG+extra+`
 		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
@@ -4226,8 +4220,7 @@ func (db *DB) triageSightedPG(ctx context.Context, limit int, f TriageFilter) ([
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE label = 'sighted' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''`+
-			triageServablePathSQL+extra+`
+		 WHERE `+triageSightedWhere+extra+`
 		 ORDER BY created_at DESC, id DESC LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
@@ -4490,7 +4483,8 @@ func (db *DB) triageFalloutPG(ctx context.Context, limit int, createdAfter time.
 		 WHERE litmus_class = 2 AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL
 		   AND skip = '' AND file_type <> 'registry'`+triageServablePathSQL+`
 		   AND created_at > $1
-		   AND (llm_result IS NULL OR COALESCE(llm_result->>'interpretation', '') = '')
+		   AND ((llm_result IS NULL OR COALESCE(llm_result->>'interpretation', '') = '')
+		        OR NOT corroborated)
 		   AND NOT EXISTS (SELECT 1 FROM reports r
 		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'fallout')
 		   AND `+uncontainedSQL+extra+`
@@ -4830,6 +4824,63 @@ func (db *DB) addSightingsPG(ctx context.Context, s []Sighting) (int, error) {
 		return 0, fmt.Errorf("hopper: commit sightings: %w", err)
 	}
 	return len(changed), nil
+}
+
+// remarkCorroboratedPG re-derives samples.corroborated from the whole ledger.
+//
+// AddSightings marks as it writes, which covers every ordinary path. This exists
+// for the case where a subject changes UNDERNEATH the flag: a canonicalisation
+// fold, or the digest-wearing-a-purl repair. Those rewrite sightings.subject and
+// leave samples untouched, so a citation that finally names a real sample still
+// reads as uncorroborated until something re-applies it — which is exactly how
+// 767 confirmed-malicious samples stayed visible to the acquit queue.
+//
+// Only ever sets the flag, never clears it: both statements are guarded by
+// NOT corroborated. A sighting that is deleted or re-keyed away does not
+// un-corroborate the sample it used to name, because we cannot tell from here
+// whether some other source still cites it. That asymmetry is deliberate — the
+// safe direction is to keep believing corroboration we once had.
+//
+// Batched over distinct subjects so no single statement carries a
+// hundred-thousand-element array.
+func (db *DB) remarkCorroboratedPG(ctx context.Context) (int64, error) {
+	rows, err := db.pool.Query(ctx, `SELECT DISTINCT subject FROM sightings ORDER BY subject`)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: remark corroborated scan: %w", err)
+	}
+	var subjects []string
+	for rows.Next() {
+		var subject string
+		if err := rows.Scan(&subject); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("hopper: remark corroborated row: %w", err)
+		}
+		subjects = append(subjects, subject)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	const batch = 5000
+	var marked int64
+	for start := 0; start < len(subjects); start += batch {
+		shas, purls := splitSightingSubjects(subjects[start:min(start+batch, len(subjects))])
+		for _, step := range []struct {
+			sql  string
+			args []string
+		}{{markCorroboratedBySHASQL, shas}, {markCorroboratedByPURLSQL, purls}} {
+			if len(step.args) == 0 {
+				continue
+			}
+			tag, err := db.pool.Exec(ctx, step.sql, step.args)
+			if err != nil {
+				return marked, fmt.Errorf("hopper: remark corroborated: %w", err)
+			}
+			marked += tag.RowsAffected()
+		}
+	}
+	return marked, nil
 }
 
 func (db *DB) sightingsForPG(ctx context.Context, subjects []string) (map[string][]Sighting, error) {
