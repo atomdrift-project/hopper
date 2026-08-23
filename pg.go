@@ -340,7 +340,9 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// Each WHERE must stay byte-identical to its selector's predicate,
 		// skip = '' and path <> '' included, or the planner will not match the
 		// partial. path <> '' drops reference-only rows (registry/fetched)
-		// that triage would otherwise hand to cyclotron with no bytes to fetch.
+		// that triage would otherwise hand to cyclotron with no bytes to fetch,
+		// and that the stale-traits claim tier would otherwise hand to a worker
+		// as a claim it can never satisfy.
 		//
 		// Recreate when an older definition is missing path <> '': CREATE INDEX
 		// IF NOT EXISTS will not rewrite a pre-existing partial predicate.
@@ -357,7 +359,9 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 				'idx_samples_sighted_newest',
 				'idx_samples_bad_miss_stale',
 				'idx_samples_good_repair_stale',
-				'idx_samples_new_stale'
+				'idx_samples_new_stale',
+				'idx_samples_stale_traits',
+				'idx_samples_stale_traits_pri'
 			]
 			LOOP
 				SELECT pg_get_indexdef(to_regclass(idx)) INTO def;
@@ -451,7 +455,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// Covers SamplesInPipelineStage drain (impact-ordered mid-pipeline pull).
 		`CREATE INDEX IF NOT EXISTS idx_samples_stale_traits ` +
 			`ON samples(traits_version, analyzed_at) ` +
-			`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''`,
+			`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''`,
 		// staleTraitsCandidatesPG orders by a priority expression (label-
 		// disagreement bucket, then |litmus_score-0.5|, then analyzed_at). The
 		// index above is keyed (traits_version, analyzed_at), which can't serve
@@ -470,7 +474,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			`WHEN label = 'bad' AND max_crit < 5 AND suspicious_count < 2 THEN 0 ELSE 1 END), ` +
 			`(ABS(litmus_score - 0.5)), ` +
 			`analyzed_at) ` +
-			`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''`,
+			`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''`,
 		// feedSourcesPG / feedEcosystemsPG: DISTINCT feed/ecosystem WHERE source = $1.
 		`CREATE INDEX IF NOT EXISTS idx_samples_source_feed ON samples(source, feed) WHERE feed != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_source_ecosystem ON samples(source, ecosystem) WHERE ecosystem != ''`,
@@ -7057,6 +7061,18 @@ func (db *DB) forceRescanCandidatesPG(ctx context.Context, hopperStart time.Time
 // staleTraitsCandidatesPG returns Tier 3 work: samples analyzed with a
 // different traits_version more than rescanAge ago. Prioritizes label
 // disagreements and boundary-confidence rows.
+//
+// path <> ” excludes rows whose bytes hopper cannot produce, the same rule
+// [triageServablePathSQL] applies to the triage queues. Reference-only rows —
+// registry sidecars, and fetched dependencies whose artifact never reached us —
+// keep samples.path empty via [containmentColumns], and there is nothing on disk
+// to serve and no containing archive to extract from. They are otherwise
+// perfectly eligible here: parent = ” by design (a dependency is uncontained),
+// and cleave_result is set, so this tier would hand a worker a claim it can
+// never satisfy. Nor would anything clean up after it — reapStuck only reaps
+// rows with cleave_result IS NULL, and the prune path only marks 'missing' when
+// no sample_locations row survives, which these have. Measured 2026-08-23:
+// ~47% of otherwise-eligible rows, ~94% of them registry sidecars.
 func (db *DB) staleTraitsCandidatesPG(
 	ctx context.Context, currentTraits string, rescanAge time.Duration,
 	hopperStart time.Time, limit int,
@@ -7066,7 +7082,7 @@ func (db *DB) staleTraitsCandidatesPG(
 	}
 	rows, err := db.pool.Query(ctx, `
 		SELECT sha256, path, size_bytes, file_type FROM samples
-		WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
+		WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''
 		  AND traits_version != $1
 		  AND analyzed_at < $2
 		  AND (note = '' OR last_error_at IS NULL OR last_error_at < $3)

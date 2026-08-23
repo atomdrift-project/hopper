@@ -5587,6 +5587,47 @@ func (db *DB) DropSightings(ctx context.Context, sources []string, dryRun bool) 
 	return counts, nil
 }
 
+// SightingSources reports how many claims each source has recorded.
+//
+// A source absent from the map has never written to this ledger, which is the
+// signal a producer needs to tell a first walk from a routine one: a routine
+// walk asks only for what is new, while a first walk — or the first after a
+// [DB.DropSightings] — must take everything the source has or the history it
+// was meant to rebuild is silently filtered away.
+func (db *DB) SightingSources(ctx context.Context) (map[string]int64, error) {
+	out := map[string]int64{}
+	if db.pool != nil {
+		rows, err := db.pool.Query(ctx, `SELECT source, count(*) FROM sightings GROUP BY source`)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: sighting sources: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var source string
+			var n int64
+			if err := rows.Scan(&source, &n); err != nil {
+				return nil, fmt.Errorf("hopper: sighting sources: %w", err)
+			}
+			out[source] = n
+		}
+		return out, rows.Err()
+	}
+	rows, err := db.lite.QueryContext(ctx, `SELECT source, count(*) FROM sightings GROUP BY source`)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: sighting sources: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // read-only
+	for rows.Next() {
+		var source string
+		var n int64
+		if err := rows.Scan(&source, &n); err != nil {
+			return nil, fmt.Errorf("hopper: sighting sources: %w", err)
+		}
+		out[source] = n
+	}
+	return out, rows.Err()
+}
+
 // sightingCounts reports how many rows each named source holds.
 func (db *DB) sightingCounts(ctx context.Context, sources []string) (map[string]int64, error) {
 	out := map[string]int64{}

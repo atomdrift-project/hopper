@@ -2271,6 +2271,73 @@ func TestClaimJobsStaleTraitsOrdering(t *testing.T) {
 	}
 }
 
+// A reference-only row — a registry sidecar or a fetched dependency whose bytes
+// never reached hopper — is claimable on every other count (parent = ” by
+// design, cleave_result set, traits stale) but has no path, so no worker can be
+// served its bytes. The stale-traits tier must not hand one out: nothing would
+// clean up after the failed claim, since reapStuck only reaps rows with
+// cleave_result IS NULL and prune only marks 'missing' when no location survives.
+func TestStaleTraitsSkipsRowsWithNoServablePath(t *testing.T) {
+	ctx := t.Context()
+	db := openTestDB(t)
+
+	const (
+		archive  = "a100000000000000000000000000000000000000000000000000000000000000"
+		servable = "b100000000000000000000000000000000000000000000000000000000000000"
+		fetched  = "c100000000000000000000000000000000000000000000000000000000000000"
+		sidecar  = "d100000000000000000000000000000000000000000000000000000000000000"
+	)
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: archive, Source: "test", Label: "unknown", LabelSource: "test",
+		Path: "incoming/pkg.tgz",
+	})
+	// A top-level sample with real bytes on disk: the tier's normal customer.
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: servable, Source: "test", Label: "unknown", LabelSource: "test",
+		Path: "incoming/standalone.bin",
+	})
+	// Reference edges: containmentColumns blanks samples.path for both.
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: fetched, Source: "test", Label: "unknown", LabelSource: "test",
+		Path: "incoming/pkg.tgz!!dep-1.0.0.tgz", Parent: archive,
+		LocationRel: string(RelFetched),
+	})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: sidecar, Source: "test", Label: "unknown", LabelSource: "test",
+		Path: "incoming/pkg.tgz!!pkg@1.0.0.registry.json", Parent: archive,
+		LocationRel: string(RelRegistry),
+	})
+	for _, sha := range []string{servable, fetched, sidecar} {
+		mustAnalyzeWithTraits(t, ctx, db, sha, 0, "")
+	}
+	old := time.Now().Add(-96 * time.Hour).UTC().Format(time.RFC3339Nano)
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET analyzed_at = ?, traits_version = 'old-traits'`, old); err != nil {
+		t.Fatal(err)
+	}
+
+	// Guard the premise: without the path filter these rows would qualify, so
+	// the assertion below tests the filter rather than some other exclusion.
+	for _, sha := range []string{fetched, sidecar} {
+		var parent, path string
+		if err := db.lite.QueryRowContext(ctx,
+			`SELECT parent, path FROM samples WHERE sha256 = ?`, sha).Scan(&parent, &path); err != nil {
+			t.Fatal(err)
+		}
+		if parent != "" || path != "" {
+			t.Fatalf("%s: parent=%q path=%q, want both empty", sha, parent, path)
+		}
+	}
+
+	jobs, err := db.StaleTraitsCandidates(ctx, "new-traits", 72*time.Hour, time.Now(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].SHA256 != servable {
+		t.Fatalf("got %+v, want only the servable sample %s", jobs, servable)
+	}
+}
+
 func TestRelativizePaths(t *testing.T) {
 	ctx := t.Context()
 	db := openTestDB(t)

@@ -4933,7 +4933,7 @@ func (db *DB) staleTraitsCandidatesSQLite(
 	startCutoff := hopperStart.UTC().Format(time.RFC3339Nano)
 	return queryLiteCandidates(ctx, db.lite,
 		`SELECT sha256, path, size_bytes, file_type FROM samples
-		WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
+		WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''
 		  AND traits_version != ?
 		  AND analyzed_at < ?
 		  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
