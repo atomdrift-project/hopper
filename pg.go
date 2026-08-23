@@ -2145,10 +2145,6 @@ const insertBatchStagingCore = `CREATE TEMP TABLE _staging (
 	sample_parent TEXT, sample_path TEXT
 )`
 
-// insertBatchStagingDDL is the single-transaction form: the table vanishes at
-// commit, so one tx stages, upserts, and cleans up after itself.
-const insertBatchStagingDDL = insertBatchStagingCore + ` ON COMMIT DROP`
-
 // insertBatchStagingSessionDDL is the cross-transaction form used by
 // insertSampleBatchPG, which stages once and then runs SEVERAL transactions
 // over the same rows (see that function for why). The table is session-scoped,
@@ -2652,7 +2648,7 @@ func (db *DB) storeMemberRowsPG(ctx context.Context, rows [][]any) (int64, error
 		defer cancel()
 		if _, derr := conn.Exec(dropCtx, `DROP TABLE IF EXISTS _staging`); derr != nil {
 			slog.Warn("drop member staging table failed; discarding connection", "error", derr)
-			conn.Conn().Close(dropCtx) //nolint:errcheck // already tearing down
+			conn.Conn().Close(dropCtx) //nolint:errcheck,gosec // G104: already tearing down; the drop failure above is what was reported
 		}
 	}()
 

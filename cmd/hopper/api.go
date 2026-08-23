@@ -39,15 +39,25 @@ import (
 // /api/file/{sha256}. Sample data lives in the database; per-job claim
 // state lives in workerTracker (see below).
 type apiServer struct {
-	hopperStart         time.Time
-	db                  *hopper.DB
-	progress            *loadProgress
-	extractSem          chan struct{}
-	resultSem           chan struct{}
-	workerResultSem     chan struct{}
-	extractCache        *extractCache
-	traitsVersion       atomic.Pointer[string]
-	tracker             *workerTracker
+	hopperStart     time.Time
+	db              *hopper.DB
+	progress        *loadProgress
+	extractSem      chan struct{}
+	resultSem       chan struct{}
+	workerResultSem chan struct{}
+	extractCache    *extractCache
+	traitsVersion   atomic.Pointer[string]
+	tracker         *workerTracker
+	triageClaims    *triageClaims
+	// relay, when non-nil on a readOnly instance, proxies client-facing
+	// mutations to the primary hopper instead of refusing them, and backs the
+	// ?fresh=1 read-after-write escape hatch. Worker-loop routes are never
+	// relayed. See relay.go for the rules.
+	//
+	// Grouped with the pointers rather than beside readOnly, which is where it
+	// reads more naturally: an interface is two words of pointer, and trailing
+	// it after the scalars below stretches the GC's pointer scan across them.
+	relay               http.Handler
 	dataRoot            string
 	allowedDirs         []string
 	forceRescanPrefixes []string
@@ -59,11 +69,6 @@ type apiServer struct {
 	// the DB sessions run under default_transaction_read_only (see
 	// cmdServeReplica for why both layers exist).
 	readOnly bool
-	// relay, when non-nil on a readOnly instance, proxies client-facing
-	// mutations to the primary hopper instead of refusing them, and backs the
-	// ?fresh=1 read-after-write escape hatch. Worker-loop routes are never
-	// relayed. See relay.go for the rules.
-	relay http.Handler
 }
 
 // errSaturated is returned by the slot-acquire helpers when no slot frees
@@ -695,6 +700,14 @@ func (wt *workerTracker) all() []namedWorkerStats {
 
 // registerAPI mounts the work API routes on the given mux.
 func (s *apiServer) registerAPI(mux *http.ServeMux) {
+	// Every construction path gets a claim set, including the tests that build
+	// an apiServer literal: a nil one would panic on the first select, and the
+	// claims are process state rather than configuration, so there is nothing
+	// for a caller to decide.
+	if s.triageClaims == nil {
+		s.triageClaims = newTriageClaims(triageClaimTTL)
+	}
+
 	// Read routes: safe against any backend, including a logical-replication
 	// subscriber (serve-replica). File-serving routes need a data root; a
 	// replica API typically has no corpus on disk, and registering
@@ -710,6 +723,34 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/lookup", s.freshOr(s.handleV1Lookup))
 	mux.HandleFunc("GET /api/provenance/{sha256}", s.freshOr(s.handleProvenance))
 	mux.HandleFunc("GET /api/locations/incoming", s.handleIncomingLocations)
+	// Triage selection. GET /api/triage/{queue} does not collide with the
+	// POST /api/triage ruling route below (different method, different depth),
+	// and the literal /queues outranks the {queue} wildcard by ServeMux
+	// precedence — which does mean a queue named "queues" would be
+	// unreachable, so do not register one.
+	//
+	// Deliberately NOT wrapped in freshOr, unlike the point lookups above. A
+	// selection walks a ranked population and a depth is a capped COUNT over a
+	// hundred-million-row table — they are the heavy reads this process exists
+	// to absorb, and honouring ?fresh=1 on one would put exactly that scan back
+	// on the publisher at a client's say-so. Replica lag costs a selection
+	// nothing anyway: a sample whose drain has not yet applied is handed out
+	// again, which is what the claim set and the consumer's cooldown already
+	// absorb.
+	mux.HandleFunc("GET /api/triage/queues", s.handleTriageQueues)
+	mux.HandleFunc("GET /api/triage/{queue}", s.handleTriageSelect)
+	mux.HandleFunc("GET /api/triage/{queue}/depth", s.handleTriageDepth)
+	// The two lookups a consumer needs alongside a selection. GET
+	// /api/sightings reads the resource POST /api/sightings appends to; it has
+	// to be a GET rather than a POST carrying a subject list, because a replica
+	// refuses every POST and this is a read.
+	//
+	// Both take freshOr: they are point lookups in the same family as
+	// /api/provenance, and both are genuine read-after-write pairs — sightings
+	// against POST /api/sightings, and the stranded member list against the
+	// per-member reports the same client files through /api/report.
+	mux.HandleFunc("GET /api/sightings", s.freshOr(s.handleSightingsFor))
+	mux.HandleFunc("GET /api/stranded/{sha256}", s.freshOr(s.handleStrandedMembers))
 	if s.dataRoot != "" || !s.readOnly {
 		mux.HandleFunc("GET /api/file/{sha256}", s.handleFile)
 		mux.Handle("GET /data/", s.safeFileServer())
@@ -744,9 +785,17 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 		})
 		// Client-facing mutations: proxied verbatim to the primary when the
 		// relay is configured, refused with the classic 403 otherwise.
+		//
+		// /api/report and /api/cleave-result belong here rather than with the
+		// worker loop despite also coming from a scan host. They are a triage
+		// consumer's per-judgement writes — one drain row and one re-scanned
+		// envelope per sample it actually worked, at tens per day — not the
+		// ingest firehose rule 2 keeps out. Relaying them is what lets a
+		// cyclotron point its whole stack at one URL.
 		clientWrites := []string{
 			"POST /api/upload", "POST /api/known", "POST /api/sightings",
 			"POST /api/popular", "POST /api/triage", "POST /api/rescan/{sha256}",
+			"POST /api/report", "POST /api/cleave-result",
 		}
 		if s.relay != nil {
 			for _, ep := range clientWrites {
@@ -769,6 +818,8 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/popular", s.handlePopular)
 	mux.HandleFunc("POST /api/triage", s.handleTriage)
 	mux.HandleFunc("POST /api/rescan/{sha256}", s.handleRescan)
+	mux.HandleFunc("POST /api/report", s.handleReport)
+	mux.HandleFunc("POST /api/cleave-result", s.handleCleaveResult)
 }
 
 // handleReadOnlyRefusal answers every mutating route on a read-only replica.
@@ -2421,14 +2472,17 @@ func (s *apiServer) resolveDataPath(rel string) (string, error) {
 // limit. A bulk producer chunks larger work into successive requests.
 const maxKnownBatch = 1024
 
+// Field order is layout, not reading order: the string precedes the slice so
+// the struct's pointer words sit together. JSON decoding is by tag, so the wire
+// format is unaffected.
 type knownRequest struct {
-	SHA256 []string `json:"sha256"`
 	// TraitsVersion, when non-empty, asks which of these digests already hold
 	// an analysis at this traits version (the "rev" a scan report carries).
 	// The response's Current lists them, so a dependency-mirroring worker can
 	// skip re-posting verdicts hopper already has. Optional and additive: an
 	// old client never sends it and sees the response it always saw.
-	TraitsVersion string `json:"traits_version"`
+	TraitsVersion string   `json:"traits_version"`
+	SHA256        []string `json:"sha256"`
 }
 
 type knownResponse struct {

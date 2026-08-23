@@ -2631,7 +2631,11 @@ func (db *DB) KnownSHA256(ctx context.Context, shas []string) ([]string, error) 
 // redundant samples UPDATE per worker run, forever.
 func (db *DB) KnownSHA256Versions(ctx context.Context, shas []string) (map[string]string, error) {
 	if len(shas) == 0 {
-		return nil, nil
+		// Empty rather than nil: "nothing was asked about" and "nothing is
+		// known" are the same answer to every caller here (both only take len
+		// and range), and returning a usable zero value keeps a nil map from
+		// reaching one that later decides to write into it.
+		return map[string]string{}, nil
 	}
 	known := make(map[string]string, len(shas))
 

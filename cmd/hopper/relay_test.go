@@ -69,11 +69,33 @@ func TestReplicaWithoutRelayRefusesAllMutations(t *testing.T) {
 		{http.MethodPost, "/api/popular"},
 		{http.MethodPost, "/api/triage"},
 		{http.MethodPost, "/api/rescan/" + strings.Repeat("a", 64)},
+		{http.MethodPost, "/api/report"},
+		{http.MethodPost, "/api/cleave-result"},
 	} {
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, httptest.NewRequest(ep.method, ep.path, http.NoBody))
 		if w.Code != http.StatusForbidden {
 			t.Errorf("%s %s without relay = %d, want 403", ep.method, ep.path, w.Code)
+		}
+	}
+}
+
+// TestRelayProxiesTriageWrites covers the two triage-consumer mutations added
+// with the queue registry. They are client-facing writes, so they relay like
+// the rest — the point of which is that a scan host can address ONE URL for
+// its selections and its judgements both.
+func TestRelayProxiesTriageWrites(t *testing.T) {
+	for _, path := range []string{"/api/report", "/api/cleave-result"} {
+		primary, rec := newRelayPrimary(t, http.StatusOK, `{"status":"recorded"}`)
+		mux := newReplicaMux(t, primary.URL, "")
+
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"sha256":"x"}`)))
+		if w.Code != http.StatusOK {
+			t.Errorf("POST %s via relay = %d, want the primary's 200", path, w.Code)
+		}
+		if rec.path != path || rec.method != http.MethodPost {
+			t.Errorf("primary saw (%s %s), want POST %s", rec.method, rec.path, path)
 		}
 	}
 }

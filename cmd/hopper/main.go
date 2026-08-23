@@ -631,9 +631,13 @@ func cmdServeReplica(ctx context.Context) error {
 	dataDir := f.String("data", "",
 		"optional corpus root for /api/file and /data/; empty disables byte serving")
 	relayTo := f.String("relay-writes-to", "",
-		"primary hopper base URL (e.g. http://hopper-api:8081); when set, client-facing mutations are proxied there verbatim instead of answering 403, and lookups honor ?fresh=1 — see relay.go. Worker routes are never relayed.")
+		"primary hopper base URL (e.g. http://hopper-api:8081); when set, client-facing mutations are "+
+			"proxied there verbatim instead of answering 403, and lookups honor ?fresh=1 — see relay.go. "+
+			"Worker routes are never relayed.")
 	relayTokenFile := f.String("relay-token-file", "",
-		"file holding a bearer token for the primary; when set the relay replaces the inbound Authorization header with it (for deployments where replica and primary tokens differ). Empty passes the client's token through.")
+		"file holding a bearer token for the primary; when set the relay replaces the inbound "+
+			"Authorization header with it (for deployments where replica and primary tokens differ). "+
+			"Empty passes the client's token through.")
 	parseFlags(f, os.Args[2:])
 
 	// Force read-only sessions in the DSN itself so every pooled connection
@@ -664,6 +668,12 @@ func cmdServeReplica(ctx context.Context) error {
 	if err := verifyReadOnlySession(ctx, db); err != nil {
 		return err
 	}
+
+	// Now that read-only is proven rather than assumed: this process executes
+	// no write path, so nothing in it ever invalidates a cached lookup and the
+	// TTL becomes the whole staleness bound. Not a flag — the guard above is a
+	// better witness than an operator remembering one.
+	db.ServesReplica()
 
 	api := &apiServer{
 		hopperStart: time.Now().UTC(),
@@ -717,7 +727,10 @@ func cmdServeReplica(ctx context.Context) error {
 	srv := &http.Server{Addr: *apiAddr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()
-		shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// WithoutCancel, not Background: the drain must outlive the cancellation
+		// that triggered it, but keeping the parent's values means the shutdown
+		// still carries this process's trace and logging context.
+		shCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shCtx) //nolint:errcheck // best-effort drain on signal
 	}()
@@ -1001,9 +1014,6 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	maxRSSGB := f.Int("max-memory-gb", 48,
 		"local atomscan worker RSS limit in GB, forwarded as --max-rss-gb (0 = auto: let atomscan self-throttle, -1 = disable in-process throttling)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
-	replica := f.Bool("replica", false,
-		"this process reads the logical replica: it sees no writes, so cached lookups age out "+
-			"rather than being invalidated")
 	rescanAge := f.Duration("rescan-age", 120*time.Hour, "minimum age before a stale-traits sample is eligible for rescan")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
@@ -1406,10 +1416,6 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		}
 		wd.endStage("db.connect")
 		slog.Info("database connection established", "elapsed", time.Since(dbStart))
-		// Before serving, while the pools are still empty.
-		if *replica {
-			d.ServesReplica()
-		}
 		dbPhase.Store("migrating schema")
 		wd.beginStage("db.migrate", "Migrating database")
 		slog.Info("running schema migrations")

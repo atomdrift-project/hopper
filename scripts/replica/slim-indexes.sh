@@ -45,8 +45,9 @@
 #
 # Maintaining the lists: when hopper gains an index on a published table, the
 # guard test fails until you put its name in one of the two lists. Put it in
-# REPLICA_KEEP_INDEXES only if a prism read path needs it; when in doubt leave
-# it out and check pg_stat_user_indexes.idx_scan on a warm replica.
+# REPLICA_KEEP_INDEXES only if a replica read path needs it — prism's lookups
+# or cyclotron's triage queues; when in doubt leave it out and check
+# pg_stat_user_indexes.idx_scan on a warm replica.
 #
 # Env: LOCAL_DB (=hopper), HEAL_STATE_DIR (=$HOME/.hopper-replica-heal),
 # SLIM_LOCK_TIMEOUT (=15s), REPLICA_SLIM_INDEXES (=true; 'false' skips).
@@ -78,8 +79,14 @@ else
 fi
 
 # --- The policy -------------------------------------------------------------
-# Indexes a prism read path needs on the replica. One name per line.
-# Everything else on a subscribed table is dropped.
+# Indexes a replica read path needs. One name per line. Everything else on a
+# subscribed table is dropped.
+#
+# Two consumers now, not one. prism's lookups came first; cyclotron's triage
+# queues joined when its selection moved off the master. They want different
+# indexes — prism probes single identities (purl_lookup, filename_trgm) while
+# cyclotron walks ranked populations (bad_route_score, stranded_member) — so
+# "prism does not scan it" is no longer sufficient reason to drop one.
 REPLICA_KEEP_INDEXES='
 idx_claims_name
 idx_claims_signer
@@ -87,6 +94,8 @@ idx_label_events_sha
 idx_reports_sha256_type_created
 idx_samples_bad_miss_newest
 idx_samples_bad_miss_stale
+idx_samples_bad_route_score
+idx_samples_corroborated_created
 idx_samples_domain
 idx_samples_eco_top_created
 idx_samples_ecosystem
@@ -95,11 +104,13 @@ idx_samples_feed_top_created_done
 idx_samples_filename_trgm
 idx_samples_good_repair_newest
 idx_samples_good_repair_stale
+idx_samples_good_route_score
 idx_samples_new_interesting
 idx_samples_new_stale
 idx_samples_package_version
 idx_samples_purl_lookup
 idx_samples_sighted_newest
+idx_samples_stranded_member
 idx_samples_top_ready_created
 idx_samples_unknown_newest
 idx_sightings_subject
@@ -109,25 +120,34 @@ idx_sl_parent_child
 idx_slh_sha256_retired
 '
 
-# Master-only: worker queues, ingest lookups, and covering variants prism never
-# scans. Listed for the completeness guard only — see the header. If prism
-# starts needing one, MOVE it to REPLICA_KEEP_INDEXES rather than deleting it
-# from here, so the guard keeps passing.
+# Master-only: worker queues, ingest lookups, and covering variants no replica
+# read path scans. Listed for the completeness guard only — see the header. If
+# prism or cyclotron starts needing one, MOVE it to REPLICA_KEEP_INDEXES rather
+# than deleting it from here, so the guard keeps passing.
+#
+# idx_popular_rank is here despite popular_packages being published, which looks
+# wrong until you read the query: TriagePopular probes `EXISTS (SELECT 1 FROM
+# popular_packages p WHERE p.purl_base = samples.purl_base)` and pulls `p.rank`
+# through that same correlated subquery, so both go through the purl_base
+# PRIMARY KEY. Nothing on the replica orders by rank, and the table is a few
+# thousand rows anyway.
+#
+# NOTE: no comments inside the quoted lists — parseShellWordList (Go, embedded)
+# splits the body on whitespace, so a '#' line would parse as index names and
+# fail the guard.
 REPLICA_DROP_INDEXES='
+idx_popular_rank
 idx_reports_created_at
 idx_samples_analyzed_at
-idx_samples_bad_route_score
 idx_samples_claimable
 idx_samples_claimable_sha
 idx_samples_claimed
-idx_samples_corroborated_created
 idx_samples_created_at
 idx_samples_eco_class_created
 idx_samples_feed_source
 idx_samples_feed_source_mtime
 idx_samples_file_type
 idx_samples_formula
-idx_samples_good_route_score
 idx_samples_litmus_done
 idx_samples_mtime
 idx_samples_parent
@@ -144,7 +164,6 @@ idx_samples_source_ecosystem
 idx_samples_source_feed
 idx_samples_stale_traits
 idx_samples_stale_traits_pri
-idx_samples_stranded_member
 idx_samples_top_created
 idx_samples_top_ready_first_analyzed_coalesce
 idx_samples_unanalyzed_id

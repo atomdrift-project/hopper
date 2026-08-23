@@ -80,8 +80,8 @@ func newWriteRelay(base string, tokenFile string) (http.Handler, error) {
 
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(u)          // scheme+host from the primary; path/query from the request
-			pr.SetXForwarded()    // X-Forwarded-For/Host/Proto for the primary's logs
+			pr.SetURL(u)         // scheme+host from the primary; path/query from the request
+			pr.SetXForwarded()   // X-Forwarded-For/Host/Proto for the primary's logs
 			pr.Out.Host = u.Host // primary routes/authenticates by its own name
 			// Everything else — Authorization, the lane header, content type —
 			// passes through verbatim from the inbound request.
