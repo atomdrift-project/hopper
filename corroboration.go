@@ -404,12 +404,15 @@ func (db *DB) fromLedger(ctx context.Context, sha256, purl string) (*LookupRecor
 		return nil, 0, ErrNotFound
 	}
 	r := &LookupRecord{
-		SHA256:   sha256,
 		Findings: []LookupFinding{feedFinding(a)},
 		FiresAt:  &floor,
 		// Answerable now. Analyzed selects the 202 that means "an answer is
 		// coming for this key", and none is: nothing holds these bytes.
 		Analyzed: true,
+	}
+	if sha256 != "" {
+		d := sha256
+		r.SHA256 = &d
 	}
 	if purl != "" {
 		p := purl

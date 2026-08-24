@@ -67,7 +67,13 @@ const (
 // Every field is always present — null where unknown, [] where empty — so a
 // caller writes one code path against a shape that does not move.
 type LookupRecord struct {
-	SHA256 string  `json:"sha256"`
+	// SHA256 is the bytes this record describes, and is nil when it describes
+	// none: a record standing on threat-feed citations for a package nothing
+	// has analyzed names a package, not an artifact. Null rather than "",
+	// because this field is the identity a caller compares when two spellings
+	// must be proven to be one thing — and every empty string compares equal
+	// to every other.
+	SHA256 *string `json:"sha256"`
 	PURL   *string `json:"purl"`
 	// FiresAt is the tightest false-positive budget per 100 million benign
 	// files at which this artifact grades hostile: lower is worse, -1 fires at
@@ -281,7 +287,10 @@ func (db *DB) forgetRecordsBySHA(shas map[string]struct{}) {
 		if v == nil || v.record == nil {
 			continue
 		}
-		if _, ok := shas[v.record.SHA256]; ok {
+		if v.record.SHA256 == nil {
+			continue // a ledger-backed record names no bytes to invalidate by
+		}
+		if _, ok := shas[*v.record.SHA256]; ok {
 			db.records.Delete(k)
 		}
 	}
@@ -293,8 +302,9 @@ func (db *DB) forgetRecordsBySHA(shas map[string]struct{}) {
 // — megabytes for an archive — and nothing here comes from it, so touching it
 // would pay a heap-TOAST detoast to render a few hundred bytes.
 func recordOf(s *Sample) *LookupRecord {
+	sha := s.SHA256
 	r := &LookupRecord{
-		SHA256:   s.SHA256,
+		SHA256:   &sha,
 		Findings: findingsOf(s.TopTraits),
 		Analyzed: len(s.LitmusResult) > 0 || len(s.LLMResult) > 0 || len(s.CleaveResult) > 0,
 	}

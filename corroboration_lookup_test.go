@@ -208,3 +208,41 @@ func TestLedgerBackedRecordsAgeOut(t *testing.T) {
 		t.Fatalf("ledgerTTL %v outlives the pool's own %v", ledgerTTL, recordTTL)
 	}
 }
+
+// sha256 is the identity a caller compares to prove two spellings name one
+// artifact. A record standing on citations for a package nothing has analyzed
+// names no bytes, and "" is not "none" — every empty string compares equal to
+// every other, so two unrelated derived records would read as the same file.
+func TestDerivedRecordNamesNoBytesRatherThanEmptyOnes(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	if _, err := db.AddSightings(ctx, []Sighting{
+		{Source: "osv", Operator: "ossf-malpkgs", Subject: "pkg:npm/nobytes", Claim: ClaimMalicious, Basis: BasisReviewed},
+		{Source: "aikido", Operator: "aikido", Subject: "pkg:npm/nobytes", Claim: ClaimMalicious, Basis: BasisPredicted},
+	}); err != nil {
+		t.Fatalf("AddSightings: %v", err)
+	}
+	rec, err := db.LookupRecord(ctx, "", "pkg:npm/nobytes", "1.0.0")
+	if err != nil {
+		t.Fatalf("LookupRecord: %v", err)
+	}
+	if rec.SHA256 != nil {
+		t.Errorf("SHA256 = %q, want nil: this record describes a package, not an artifact", *rec.SHA256)
+	}
+
+	// A digest-subject citation does name bytes, and must still say so.
+	const sha = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	if _, err := db.AddSightings(ctx, []Sighting{
+		{Source: "bazaar", Operator: "abuse.ch", Subject: sha, Claim: ClaimMalicious, Basis: BasisHosted},
+	}); err != nil {
+		t.Fatalf("AddSightings: %v", err)
+	}
+	byDigest, err := db.LookupRecord(ctx, sha, "", "")
+	if err != nil {
+		t.Fatalf("LookupRecord by digest: %v", err)
+	}
+	if byDigest.SHA256 == nil || *byDigest.SHA256 != sha {
+		t.Errorf("SHA256 = %v, want the digest that was cited", byDigest.SHA256)
+	}
+}

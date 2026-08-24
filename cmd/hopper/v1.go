@@ -81,7 +81,9 @@ func (s *apiServer) handleV1Lookup(w http.ResponseWriter, r *http.Request) {
 	// answer is coming for this key, which is worth waiting on rather than
 	// reading as "we looked and there was nothing".
 	if !record.Analyzed {
-		w.Header().Set("X-Sha256", record.SHA256)
+		if record.SHA256 != nil {
+			w.Header().Set("X-Sha256", *record.SHA256)
+		}
 		w.Header().Set("Retry-After", strconv.Itoa(sampleQueuedRetryAfter))
 		w.WriteHeader(http.StatusAccepted)
 		return
