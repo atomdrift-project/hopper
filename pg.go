@@ -351,6 +351,60 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_class_top_created ` +
 			`ON samples(litmus_class, created_at DESC) ` +
 			`WHERE parent = '' AND cleave_result IS NOT NULL`,
+		// prism's molecule view (?m=<formula>) filters the feed by an exact cleave
+		// formula — "show me everything with this structure". Without a matching
+		// index that predicate is not a seek but a filter applied while walking
+		// created_at order, so a formula matching a handful of rows costs a walk
+		// of the whole feed population to prove it. Measured on the replica
+		// 2026-08-24 from the slow-query log: 531 of these ran over 3s in 40
+		// minutes, totalling 6198 SECONDS with a worst case of 55s, and the
+		// average call burned 3.1 MILLION buffer hits to return 7 rows. It was
+		// the single largest consumer of CPU on the box once the disk problems
+		// were fixed.
+		//
+		// Deliberately not the master's idx_samples_formula, which is a plain
+		// (formula) over every row with one, 1390 MB. Restricting to the feed's
+		// own population — half the rows carry a formula, and archive members
+		// (parent <> '') are the bulk of the table — costs ~200 MB instead, and a
+		// partial index is skipped entirely when a write misses its predicate, so
+		// the replica stops paying apply cost on member churn it can never serve.
+		// created_at DESC is the second key so the common case and the worst case
+		// are the same plan: most formulas match ~2 rows, but the most common one
+		// matches on the order of a million, and only an ordered walk lets that
+		// stop at LIMIT rather than sorting the lot.
+		//
+		// litmus_result is NOT in the predicate, for the same reason as
+		// idx_samples_class_top_created above: FeedQuery.requireLitmus drops that
+		// qual for a class set containing 0, and an index the benign view cannot
+		// use is an index that leaves the worst case unfixed.
+		`CREATE INDEX IF NOT EXISTS idx_samples_formula_top ` +
+			`ON samples(formula, created_at DESC) ` +
+			`WHERE formula <> '' AND parent = '' AND cleave_result IS NOT NULL`,
+		// collimator's training-set export, one call per model route:
+		//   SELECT id, sha256, label, canonical_sha256, score, file_type FROM samples
+		//    WHERE label IN ('bad','good') AND cleave_result IS NOT NULL AND skip = ''
+		//      AND id <= <snapshot> AND file_type = ANY(<route>) ORDER BY id
+		// (collimator/src/collimator/data.py, stream_partitioned_metadata_grouped;
+		// its LABELED_WHERE is this index's predicate verbatim). data.py's own
+		// comment says the route filter is meant to be "index-backed" — on the
+		// replica it was not, so each route was a Parallel Seq Scan of ~93M rows
+		// costing 27,996,830 to return 16,113 vbs rows: ~100 seconds each,
+		// measured 2026-08-24, and collimator runs the suite per route.
+		//
+		// file_type leads because that is the equality; id follows so the scan is
+		// already in the ORDER BY's order and the `id <= snapshot` pin is a range
+		// bound on the same index rather than a filter. The projection is
+		// deliberately NOT covered by INCLUDE — sha256 and canonical_sha256 are 64
+		// bytes each, which would take this from a few hundred MB to multiple GB
+		// for a heap fetch per matched row that only the matched rows pay.
+		//
+		// Not a prism index, but it belongs to the same replica: collimator reads
+		// the replica too (postgres://hopper@localhost/hopper), and a training
+		// pipeline that seq-scans the corpus once per route is exactly the kind of
+		// bulkread traffic that starves the apply worker.
+		`CREATE INDEX IF NOT EXISTS idx_samples_labeled_route ` +
+			`ON samples(file_type, id) ` +
+			`WHERE label IN ('bad', 'good') AND cleave_result IS NOT NULL AND skip = ''`,
 		// Per-route triage windows (TriageHighest/TriageLowest, 2026-08-03
 		// redesign): each file_type's top/bottom-K by litmus_score. The
 		// leading file_type key lets the per-route LATERAL walk each route's
@@ -6827,13 +6881,13 @@ func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error
 		WHERE ($1 = '' OR source = $1)
 			AND ($2 = '' OR label = $2)
 			AND cleave_result IS NOT NULL
-			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
-			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
+			AND `+q.feedFeedsFilter(`$3`)+`
+			AND `+q.feedEcosystemsFilter(`$4`)+`
 			AND `+q.feedClassFilter(`$5`)+`
 			AND (NOT $6 OR (`+uncontainedSQL+`))
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
-			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))
+			AND `+q.feedDomainsFilter(`$9`)+`
 			AND ($12 = '' OR filename ILIKE '%' || $12 || '%' ESCAPE '\'
 				OR sha256 = $12 OR package = $16)
 			AND (NOT $13 OR corroborated)
@@ -6880,13 +6934,13 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q *FeedQuery) (int, error)
 		WHERE ($1 = '' OR source = $1)
 			AND ($2 = '' OR label = $2)
 			AND cleave_result IS NOT NULL
-			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
-			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
+			AND `+q.feedFeedsFilter(`$3`)+`
+			AND `+q.feedEcosystemsFilter(`$4`)+`
 			AND `+q.feedClassFilter(`$5`)+`
 			AND (NOT $6 OR (`+uncontainedCountSQL+`))
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
-			AND (coalesce(cardinality($9::text[]), 0) = 0 OR domain = ANY($9))
+			AND `+q.feedDomainsFilter(`$9`)+`
 			AND ($10 = '' OR filename ILIKE '%' || $10 || '%' ESCAPE '\'
 				OR sha256 = $10 OR package = $14)
 			AND (NOT $11 OR corroborated)

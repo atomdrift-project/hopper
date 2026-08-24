@@ -5083,36 +5083,60 @@ func (q *FeedQuery) requireLitmus() bool {
 	return !slices.Contains(q.LitmusClasses, 0)
 }
 
-// feedClassFilter returns the feed's criticality predicate, reading the class
-// array from the parameter named by param (e.g. "$5").
+// feedArrayFilter builds one of the feed's "match this array parameter, or match
+// everything when the caller passed none" predicates: the guard reads the array's
+// cardinality, so an empty or NULL parameter disables the filter.
 //
-// The array form (`= ANY($5)`) cannot be walked in index order: the planner has
-// to assume it may match several disjoint ranges, so a
-// (litmus_class, created_at DESC) index scan cannot promise created_at order and
-// a Sort is added above it. With a single class that Sort is pure loss, and it
-// is not small — measured on the replica 2026-08-24, the benign view sorted
-// 4.04M rows to return 100, cost 13,188,888. Emitting scalar equality instead
-// lets the same index seek the class and walk created_at DESC, so the LIMIT
-// stops after 100 rows: cost 323, a ~40,000x drop for that shape alone (and
-// ~240,000x against the pre-index plan).
+// The array form (`= ANY($n)`) cannot be walked in index order. The planner has to
+// assume the array may match several disjoint ranges, so an index whose leading
+// column is this one cannot promise the feed's created_at ordering and a Sort is
+// stacked on top of it. Measured on the replica 2026-08-24, both filters that
+// matter here paid for that: the benign class view sorted 4.04M rows to return 100
+// (cost 13,188,888 -> 323 scalar), and an ecosystem-filtered view sorted ~50k rows,
+// 231ms and 34,925 buffers against 24.6ms and 3,240 scalar — and the sorting plan
+// needed parallel workers to reach even that, which prism does not get (setup.sh
+// pins max_parallel_workers_per_gather=0 on the reader role).
 //
-// Every criticality choice prism offers from its dropdown — benign, suspicious,
-// hostile — is exactly one class, so this is the common path, not a corner. The
-// array form is kept for the parseCritExpr ranges (">=1") that really do select
-// several.
+// One value is the common case, not a corner: prism passes exactly one ecosystem
+// and one domain (it builds []string{args.ecosystem}), and every criticality its
+// dropdown offers — benign, suspicious, hostile — is a single class. The ANY form
+// stays for the multi-value cases that genuinely need it, such as the
+// parseCritExpr ranges (">=1").
 //
-// The class is inlined as a literal rather than bound, for the same reason
-// feedClassExpr inlines the cutoff: it is an int, and the parameter must stay
-// referenced by the cardinality guard regardless (a conditionally-referenced
-// parameter dangles untyped and Postgres rejects it, SQLSTATE 42P18). Callers
-// pass LitmusClasses as that same parameter, so the literal and the array can
-// never disagree.
-func (q *FeedQuery) feedClassFilter(param string) string {
-	guard := "coalesce(cardinality(" + param + "::int[]), 0) = 0 OR "
-	if len(q.LitmusClasses) == 1 {
-		return "(" + guard + q.feedClassExpr() + " = " + strconv.Itoa(q.LitmusClasses[0]) + ")"
+// The single value is read back out of the same parameter by subscript rather than
+// inlined as a literal: it keeps user-derived values bound (never interpolated),
+// and it keeps the parameter referenced, which the guard requires anyway — a
+// conditionally-referenced parameter dangles untyped and Postgres rejects it
+// (SQLSTATE 42P18). Verified to plan identically to an inlined constant.
+func feedArrayFilter(expr, param, cast string, n int) string {
+	typed := param + cast
+	guard := "coalesce(cardinality(" + typed + "), 0) = 0 OR "
+	if n == 1 {
+		return "(" + guard + expr + " = (" + typed + ")[1])"
 	}
-	return "(" + guard + q.feedClassExpr() + " = ANY(" + param + "))"
+	return "(" + guard + expr + " = ANY(" + param + "))"
+}
+
+// feedClassFilter matches a sample's criticality class against the class array
+// bound to param. The expression side is feedClassExpr, so a non-default cutoff
+// compares the inline re-derivation rather than the litmus_class column.
+func (q *FeedQuery) feedClassFilter(param string) string {
+	return feedArrayFilter(q.feedClassExpr(), param, "::int[]", len(q.LitmusClasses))
+}
+
+// feedFeedsFilter matches samples against the feed-name array bound to param.
+func (q *FeedQuery) feedFeedsFilter(param string) string {
+	return feedArrayFilter("feed", param, "::text[]", len(q.Feeds))
+}
+
+// feedEcosystemsFilter matches samples against the ecosystem array bound to param.
+func (q *FeedQuery) feedEcosystemsFilter(param string) string {
+	return feedArrayFilter("ecosystem", param, "::text[]", len(q.Ecosystems))
+}
+
+// feedDomainsFilter matches samples against the domain array bound to param.
+func (q *FeedQuery) feedDomainsFilter(param string) string {
+	return feedArrayFilter("domain", param, "::text[]", len(q.Domains))
 }
 
 // feedClassExpr returns the SQL expression that yields a sample's criticality
