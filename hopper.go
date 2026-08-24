@@ -4189,6 +4189,15 @@ func (db *DB) TriageFallout(ctx context.Context, limit int, createdAfter time.Ti
 // RecordHashSightings. A claim from any one of them is strong enough on its own
 // to dispute a good label; vendor-prediction feeds (aikido, socket, safedep, …)
 // are not listed and only count toward the two-independent-sources bar.
+//
+// A FALLBACK, not the authority. parallax owns this judgement now — it sits on
+// the source definitions themselves (parallax.Info, StandsAlone), which is
+// where a claim about a source belongs and where a newly added one carries it
+// automatically. hopper cannot read that: everything imports hopper, so hopper
+// imports almost nothing. Every caller of a query taking this list should pass
+// sources.StandsAlone() instead; this exists for the ones that have no parallax
+// to ask, and will drift the day somebody adds a source and only tells one of
+// the two. Prefer the parallax list wherever there is a choice.
 var TrustedBadSources = []string{
 	"bazaar",    // MalwareBazaar: hosts the bytes
 	"virussign", // VirusSign: hosts the bytes

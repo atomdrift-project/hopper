@@ -247,6 +247,15 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// first. Partial, because a benchmark drawing a fresh cohort is asking
 		// about malware and the suspicious rows outnumber it.
 		`CREATE INDEX IF NOT EXISTS idx_sightings_recent ON sightings(first_seen DESC) WHERE claim = 'malicious'`,
+		// Sighted triage has two ordered walks: digest claims and PURL claims. The
+		// leading expression lets both seek their half of the ledger and then read
+		// first_seen in queue order, stopping as soon as the requested batch fills.
+		// INCLUDE keeps subject/version scope off the heap. This is intentionally
+		// separate from idx_sightings_recent: cohort readers do not constrain the
+		// subject kind and need first_seen itself to remain the leading key.
+		`CREATE INDEX IF NOT EXISTS idx_sightings_review_queue ` +
+			`ON sightings ((starts_with(subject, 'pkg:')), first_seen DESC) ` +
+			`INCLUDE (subject, affected) WHERE claim IN ('malicious', 'suspicious')`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS corroborated BOOLEAN NOT NULL DEFAULT false`,
 		// Partial indexes holding only corroborated top-level ready rows: the
 		// "?feeds=1" filter (FeedQuery.Corroborated) walks these in created_at
@@ -4302,13 +4311,60 @@ func (db *DB) triageReviewPG(ctx context.Context, limit int, f TriageFilter) ([]
 
 func (db *DB) triageSightedPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
 	extra, args := triageFilterClausePG(f, 1, "samples")
-	args = append(args, limit)
+	limitIdx := len(args) + 1
+	// Each arm is bounded before digest/PURL matches are combined. The extra
+	// room absorbs the uncommon case where the same bytes have both identities
+	// (or several stored locations) and DISTINCT ON collapses them. Unlike the
+	// old all-ledger join, work is therefore proportional to the requested batch,
+	// not to every version of every cited package in the corpus.
+	overfetch := limit + 256
+	overIdx := len(args) + 2
+	args = append(args, limit, overfetch)
+	//nolint:unqueryvet // Derived-row schemas are fixed by pgSampleColsLight; the final projection is explicit.
 	rows, err := db.pool.Query(ctx,
-		triageSightedMatchCTE+`SELECT `+pgSampleColsLight+` FROM samples
-		 JOIN latest_sightings ON latest_sightings.matched_sha = samples.sha256
-		 WHERE `+triageSightedWhere+extra+`
-		 ORDER BY latest_sightings.sighted_at DESC,
-		          samples.created_at DESC, samples.id DESC LIMIT $`+strconv.Itoa(len(args)),
+		`WITH candidates AS (
+			(SELECT sm.*, c.sighted_at
+			   FROM (
+				SELECT subject, affected, first_seen AS sighted_at
+				  FROM sightings
+				 WHERE claim IN ('malicious', 'suspicious')
+				   AND NOT starts_with(subject, 'pkg:')
+				 ORDER BY first_seen DESC
+			   ) c
+			   CROSS JOIN LATERAL (
+				SELECT `+pgSampleColsLight+` FROM samples
+				 WHERE samples.sha256 = c.subject AND `+triageSightedWhere+extra+`
+				 ORDER BY samples.created_at DESC, samples.id DESC
+				 LIMIT $`+strconv.Itoa(overIdx)+`
+			   ) sm
+			  ORDER BY c.sighted_at DESC, sm.created_at DESC, sm.id DESC
+			  LIMIT $`+strconv.Itoa(overIdx)+`)
+			UNION ALL
+			(SELECT sm.*, c.sighted_at
+			   FROM (
+				SELECT subject, affected, first_seen AS sighted_at
+				  FROM sightings
+				 WHERE claim IN ('malicious', 'suspicious')
+				   AND starts_with(subject, 'pkg:')
+				 ORDER BY first_seen DESC
+			   ) c
+			   CROSS JOIN LATERAL (
+				SELECT `+pgSampleColsLight+` FROM samples
+				 WHERE samples.purl_base = c.subject AND samples.purl_base != ''
+				   AND (c.affected = '' OR c.affected = samples.version)
+				   AND `+triageSightedWhere+extra+`
+				 ORDER BY samples.created_at DESC, samples.id DESC
+				 LIMIT $`+strconv.Itoa(overIdx)+`
+			   ) sm
+			  ORDER BY c.sighted_at DESC, sm.created_at DESC, sm.id DESC
+			  LIMIT $`+strconv.Itoa(overIdx)+`)
+		), latest AS (
+			SELECT DISTINCT ON (sha256) * FROM candidates
+			 ORDER BY sha256, sighted_at DESC, created_at DESC, id DESC
+		)
+		SELECT `+pgSampleColsLight+` FROM latest
+		 ORDER BY sighted_at DESC, created_at DESC, id DESC
+		 LIMIT $`+strconv.Itoa(limitIdx),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage sighted: %w", err)

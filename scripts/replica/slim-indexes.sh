@@ -113,6 +113,7 @@ idx_samples_purl_lookup
 idx_samples_stranded_member
 idx_samples_top_ready_created
 idx_samples_unknown_newest
+idx_sightings_review_queue
 idx_sightings_subject
 idx_sl_child_parents
 idx_sl_containment

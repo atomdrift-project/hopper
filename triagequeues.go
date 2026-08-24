@@ -131,11 +131,11 @@ var TriageQueues = map[string]Queue{
 	// claims only cover that release; a claim without a version covers the whole
 	// package. Vulnerability claims stay out. The legacy sighted label is not
 	// evidence and does not select work. A bad ruling drains via relabel and a
-	// confirmed non-bad ruling via report.
+	// confirmed non-bad ruling via report. Depth is intentionally omitted: an
+	// exact count expands every broad package claim across the corpus, while the
+	// bounded selector only needs the head of that join.
 	"sighted": {Name: "sighted", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
 		return db.TriageSighted(ctx, n, TriageFilter{})
-	}, Depth: func(ctx context.Context, db *DB) (int64, error) {
-		return db.CountTriageSighted(ctx, TriageFilter{})
 	}},
 
 	// second: good-labeled samples whose benign label an outside source disputes
