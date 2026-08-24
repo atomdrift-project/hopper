@@ -24,8 +24,8 @@ func TestAssessCountsOperatorsNotSources(t *testing.T) {
 	if got := len(a.Operators); got != 1 {
 		t.Fatalf("two mirrors of one corpus counted as %d operators, want 1", got)
 	}
-	if a.Confidence != Moderate {
-		t.Errorf("Confidence = %v, want Moderate (one firsthand operator)", a.Confidence)
+	if a.Confidence != Strong {
+		t.Errorf("Confidence = %v, want Strong (one operator, adjudicated reports)", a.Confidence)
 	}
 }
 
@@ -57,14 +57,18 @@ func TestAssessLadder(t *testing.T) {
 		}, Weak},
 		{"one adjudicated report", []Sighting{
 			mal("osv", "ossf-malpkgs", BasisReviewed),
-		}, Moderate},
+		}, Strong},
 		{"one corpus holding the bytes", []Sighting{
 			mal("bazaar", "abuse.ch", BasisHosted),
 		}, Moderate},
+		{"one operator that both hosts and reviews takes the stronger", []Sighting{
+			mal("osm", "osm", BasisHosted),
+			mal("osm", "osm", BasisReviewed),
+		}, Strong},
 		{"two independent predictions", []Sighting{
 			mal("socket", "socket", BasisPredicted),
 			mal("aikido", "aikido", BasisPredicted),
-		}, Strong},
+		}, Corroborated},
 		{"three independent", []Sighting{
 			mal("socket", "socket", BasisPredicted),
 			mal("aikido", "aikido", BasisPredicted),
@@ -172,8 +176,9 @@ func TestFloor(t *testing.T) {
 	}{
 		{NoClaim, 0, false},
 		{Weak, 100, true},
-		{Moderate, 25, true},
-		{Strong, 10, true},
+		{Moderate, 50, true},
+		{Strong, 25, true},
+		{Corroborated, 10, true},
 		{Conclusive, 1, true},
 	} {
 		lvl, ok := Floor(tc.c)
@@ -187,7 +192,7 @@ func TestFloor(t *testing.T) {
 // every budget including zero, which would put a threat-feed citation above
 // every verdict our own analyzer has ever produced.
 func TestFloorNeverReachesZero(t *testing.T) {
-	for _, c := range []Confidence{Weak, Moderate, Strong, Conclusive} {
+	for _, c := range []Confidence{Weak, Moderate, Strong, Corroborated, Conclusive} {
 		if lvl, _ := Floor(c); lvl < 1 {
 			t.Errorf("Floor(%v) = %d, want at least 1", c, lvl)
 		}
@@ -197,7 +202,7 @@ func TestFloorNeverReachesZero(t *testing.T) {
 // The ladder must be monotone: more agreement never produces a looser level.
 func TestFloorIsMonotone(t *testing.T) {
 	prev := 1 << 30
-	for _, c := range []Confidence{Weak, Moderate, Strong, Conclusive} {
+	for _, c := range []Confidence{Weak, Moderate, Strong, Corroborated, Conclusive} {
 		lvl, ok := Floor(c)
 		if !ok {
 			t.Fatalf("Floor(%v) declined to answer", c)
@@ -206,5 +211,75 @@ func TestFloorIsMonotone(t *testing.T) {
 			t.Fatalf("Floor(%v) = %d loosens on the rung below (%d)", c, lvl, prev)
 		}
 		prev = lvl
+	}
+}
+
+// A corpus listing is firsthand but light: it says somebody filed these bytes
+// as malware, not that anybody confirmed it. It must land ABOVE the default
+// budget, so one listing flags without convicting, while an adjudicated report
+// lands at or below it.
+func TestHostedFlagsAndReviewedConvicts(t *testing.T) {
+	const defaultBudget = 25
+	hosted, _ := Floor(Assess([]Sighting{mal("bazaar", "abuse.ch", BasisHosted)}).Confidence)
+	reviewed, _ := Floor(Assess([]Sighting{mal("osv", "ossf-malpkgs", BasisReviewed)}).Confidence)
+
+	if hosted <= defaultBudget {
+		t.Errorf("a lone corpus listing reaches L%d and blocks by default; it should only flag", hosted)
+	}
+	if reviewed > defaultBudget {
+		t.Errorf("a lone adjudicated report reaches L%d and does not block by default", reviewed)
+	}
+	if hosted <= reviewed {
+		t.Errorf("hosted L%d must be looser than reviewed L%d", hosted, reviewed)
+	}
+}
+
+// The bug this pins: rank(Predicted) equals rank(the zero value), so a `>`
+// compare never inserted a predicted-only operator into the fold and the whole
+// ladder scored NoClaim. Every row in production reads `predicted` today, so
+// this would have silently disabled the feature outright.
+func TestPredictedOnlyOperatorsAreStillCounted(t *testing.T) {
+	one := Assess([]Sighting{mal("socket", "socket", BasisPredicted)})
+	if len(one.Operators) != 1 || one.Confidence != Weak {
+		t.Fatalf("one predicted operator: got %d operators, %v", len(one.Operators), one.Confidence)
+	}
+	three := Assess([]Sighting{
+		mal("socket", "socket", BasisPredicted),
+		mal("aikido", "aikido", BasisPredicted),
+		mal("triage", "triage", BasisPredicted),
+	})
+	if three.Confidence != Conclusive {
+		t.Fatalf("three predicted operators = %v, want Conclusive", three.Confidence)
+	}
+}
+
+// Our own analysis, when it fired, is a second and independent line of evidence
+// — unlike a verdict of ours in the ledger, which would only agree with itself.
+func TestOurOwnFiringAnalysisBacksAnOutsideClaim(t *testing.T) {
+	lvl := func(v int) *int { return &v }
+	for _, tc := range []struct {
+		name     string
+		measured *int
+		want     bool
+	}{
+		{"fired tight", lvl(5), true},
+		{"fired loosely, still suspicious", lvl(2999), true},
+		{"above the suspicious ceiling", lvl(5000), false},
+		{"benign sentinel: looked, found nothing", lvl(-1), false},
+		{"no level at all", nil, false},
+	} {
+		if got := fired(tc.measured); got != tc.want {
+			t.Errorf("%s: fired = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	if backed(Moderate) != Strong {
+		t.Error("a corpus listing our analyzer also fired on should reach the adjudicated rung")
+	}
+	if backed(Conclusive) != Conclusive {
+		t.Error("the top rung has nowhere to go")
+	}
+	if backed(NoClaim) != NoClaim {
+		t.Error("our own signal must never manufacture an outside claim")
 	}
 }

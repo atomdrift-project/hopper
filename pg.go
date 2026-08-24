@@ -5380,7 +5380,7 @@ func (db *DB) remarkCorroboratedPG(ctx context.Context) (int64, error) {
 func (db *DB) sightingsForPG(ctx context.Context, subjects []string) (map[string][]Sighting, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT source, subject, url, note, first_seen,
-		       operator, affected, claim, filename, published_at
+		       operator, affected, claim, filename, basis, published_at
 		FROM sightings WHERE subject = ANY($1)
 		ORDER BY source`, subjects)
 	if err != nil {
@@ -5392,7 +5392,7 @@ func (db *DB) sightingsForPG(ctx context.Context, subjects []string) (map[string
 		var x Sighting
 		var published *time.Time
 		if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen,
-			&x.Operator, &x.Affected, &x.Claim, &x.FileName, &published); err != nil {
+			&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Basis, &published); err != nil {
 			return nil, fmt.Errorf("hopper: scan sighting: %w", err)
 		}
 		if published != nil {

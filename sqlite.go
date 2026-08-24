@@ -3503,6 +3503,7 @@ func (db *DB) migrateLiteSightingsKey(ctx context.Context) error {
 			affected     TEXT NOT NULL DEFAULT '',
 			claim        TEXT NOT NULL DEFAULT 'malicious',
 			filename     TEXT NOT NULL DEFAULT '',
+			basis        TEXT NOT NULL DEFAULT 'predicted',
 			published_at DATETIME,
 			first_seen   DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
 			PRIMARY KEY (source, subject, affected)
@@ -3662,7 +3663,7 @@ func (db *DB) sightingsForSQLite(ctx context.Context, subjects []string) (map[st
 		//nolint:gosec // G202: ph is a slice of fixed "?" placeholders; subjects are bound args.
 		rows, err := db.lite.QueryContext(ctx,
 			`SELECT source, subject, url, note, first_seen, `+
-				`operator, affected, claim, filename, published_at FROM sightings `+
+				`operator, affected, claim, filename, basis, published_at FROM sightings `+
 				`WHERE subject IN (`+strings.Join(ph, ", ")+`) ORDER BY source`, args...)
 		if err != nil {
 			return fmt.Errorf("hopper: sightings for subjects: %w", err)
@@ -3672,7 +3673,7 @@ func (db *DB) sightingsForSQLite(ctx context.Context, subjects []string) (map[st
 			var x Sighting
 			var published sql.NullTime
 			if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen,
-				&x.Operator, &x.Affected, &x.Claim, &x.FileName, &published); err != nil {
+				&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Basis, &published); err != nil {
 				return fmt.Errorf("hopper: scan sighting: %w", err)
 			}
 			x.PublishedAt = published.Time

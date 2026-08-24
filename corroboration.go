@@ -60,15 +60,24 @@ const (
 	NoClaim Confidence = iota
 	// Weak is one operator, and it only predicts.
 	Weak
-	// Moderate is one operator whose claim is a finding rather than a guess.
-	Moderate
-	// Strong is two independent operators.
+	// Moderate is one operator that holds the artifact as malware.
 	//
-	// Above Moderate deliberately: two unrelated parties arriving at the same
-	// conclusion is stronger evidence than one party arriving at it carefully,
+	// Below Reviewed deliberately. A corpus accepts what people submit to it;
+	// curation is real but light, and presence means "somebody filed this as
+	// malware" rather than "somebody confirmed it". The claim is still
+	// firsthand — nobody is predicting anything about bytes they hold — which
+	// is what puts it above a detector's guess.
+	Moderate
+	// Strong is one operator whose report a person adjudicated before it was
+	// published.
+	Strong
+	// Corroborated is two independent operators.
+	//
+	// Above any single voice deliberately: two unrelated parties reaching the
+	// same conclusion is stronger than one party reaching it carefully,
 	// because the failure modes that produce a false positive are usually the
 	// one party's own.
-	Strong
+	Corroborated
 	// Conclusive is three or more independent operators.
 	Conclusive
 )
@@ -81,6 +90,8 @@ func (c Confidence) String() string {
 		return "moderate"
 	case Strong:
 		return "strong"
+	case Corroborated:
+		return "corroborated"
 	case Conclusive:
 		return "conclusive"
 	case NoClaim:
@@ -97,6 +108,14 @@ func (c Confidence) String() string {
 // apart is one you cannot debug, and — since this one can end in somebody's
 // install being refused — one you cannot defend either.
 type Assessment struct {
+	// Strongest is the best-supported basis among the counted operators, and
+	// what separates one corpus holding the bytes from one adjudicated report:
+	// they reach different levels.
+	//
+	// Field order here is chosen for alignment rather than reading order: the
+	// two pointer-bearing fields sit together at the front so the GC scans 24
+	// bytes rather than 32.
+	Strongest Basis
 	// Operators that made a malicious claim covering the whole subject, sorted.
 	// Operators, not sources: one vendor's three feeds are one voice, and osv
 	// and ossf publish the same corpus.
@@ -130,8 +149,10 @@ type Assessment struct {
 // could erase their shared false positive from the next run.
 func Assess(sightings []Sighting) Assessment {
 	// Folded on operator before counting, so volume from one voice cannot
-	// climb the ladder. Value is whether that operator ever claimed a finding.
-	firsthand := make(map[string]bool, len(sightings))
+	// climb the ladder. Value is the strongest basis that operator ever
+	// claimed: a source that both hosts bytes and publishes a reviewed report
+	// is credited with the stronger of the two, never the weaker.
+	strongest := make(map[string]Basis, len(sightings))
 	a := Assessment{}
 	for i := range sightings {
 		s := &sightings[i]
@@ -158,24 +179,37 @@ func Assess(sightings []Sighting) Assessment {
 		if op == "" {
 			continue
 		}
-		firsthand[op] = firsthand[op] || s.Basis.Firsthand()
+		// Inserted on first sight, then raised. A plain `>` compare would
+		// never insert a predicted-only operator at all: its rank equals the
+		// zero value's, so the operator would vanish from the count and a feed
+		// everything currently reports as `predicted` would score NoClaim.
+		if cur, seen := strongest[op]; !seen || rank(s.Basis) > rank(cur) {
+			strongest[op] = s.Basis
+		}
 	}
 
-	a.Operators = make([]string, 0, len(firsthand))
-	for op, first := range firsthand {
+	a.Operators = make([]string, 0, len(strongest))
+	for op, basis := range strongest {
 		a.Operators = append(a.Operators, op)
-		if first {
+		if basis.Firsthand() {
 			a.Firsthand++
+		}
+		if rank(basis) > rank(a.Strongest) {
+			a.Strongest = basis
 		}
 	}
 	slices.Sort(a.Operators)
 
+	// Corroboration outranks any single voice, however good; below that the
+	// rung is decided by what KIND of claim the lone operator made.
 	switch n := len(a.Operators); {
 	case n >= 3:
 		a.Confidence = Conclusive
 	case n == 2:
+		a.Confidence = Corroborated
+	case n == 1 && a.Strongest == BasisReviewed:
 		a.Confidence = Strong
-	case n == 1 && a.Firsthand == 1:
+	case n == 1 && a.Strongest == BasisHosted:
 		a.Confidence = Moderate
 	case n == 1:
 		a.Confidence = Weak
@@ -183,6 +217,20 @@ func Assess(sightings []Sighting) Assessment {
 		a.Confidence = NoClaim
 	}
 	return a
+}
+
+// rank orders bases by how much a single one of them is worth. Unrecognized
+// values rank lowest, with Predicted, so a basis this build cannot interpret
+// can never outrank one it can.
+func rank(b Basis) int {
+	switch b {
+	case BasisReviewed:
+		return 2
+	case BasisHosted:
+		return 1
+	default: // BasisPredicted, and anything this build cannot interpret
+		return 0
+	}
 }
 
 // Floor is the tightest fires_at that outside claims alone justify, and whether
@@ -201,15 +249,46 @@ func Floor(c Confidence) (lvl int, ok bool) {
 	switch c {
 	case Conclusive:
 		return 1, true
-	case Strong:
+	case Corroborated:
 		return 10, true
-	case Moderate:
+	case Strong:
 		return 25, true
+	case Moderate:
+		// Above the default budget on purpose, so a lone corpus listing does
+		// not block by itself: it answers `allow` with severity `suspicious`,
+		// and blocks only for a caller who has loosened past 50. A corpus takes
+		// what it is sent, and one submission is a flag rather than a verdict.
+		return 50, true
 	case Weak:
+		// The precision elbow scan measured on hopper data: at L100, 6168 bad
+		// against 591 good (91%); by L250 that inverts. A single prediction is
+		// worth about that much and no more.
 		return 100, true
 	default: // NoClaim, and any rung a newer build might add
 		return 0, false
 	}
+}
+
+// backed returns the confidence one rung higher, for an outside claim our own
+// analysis independently supports.
+//
+// Not circular, and the distinction matters. parallax's Ours standing exists to
+// keep our verdicts out of the corroboration LEDGER, where they would agree
+// with themselves and promote their own false positives. This is the opposite
+// direction: two genuinely independent lines of evidence — somebody else's
+// claim and our own measurement — meeting at answer time, which is what
+// corroboration actually means.
+//
+// Only a firing analysis backs anything. A benign verdict is our analyzer
+// having looked and found nothing, which is not support; a record with no level
+// is nothing at all. Neither may promote, and neither may demote either —
+// disputing our own clean verdict is the triage queues' question, not a
+// lookup's.
+func backed(c Confidence) Confidence {
+	if c == NoClaim || c >= Conclusive {
+		return c
+	}
+	return c + 1
 }
 
 // feedTraitID is the finding id carried by a record the ledger contributed to.
@@ -271,6 +350,17 @@ func feedReason(a Assessment) string {
 // nothing cannot loosen a verdict, and a feed that has spoken cannot either —
 // min() in one direction, which is what makes this safe to run over every
 // record rather than only over the ones nothing has analyzed.
+// suspiciousCeiling mirrors scan's SUSPICIOUS_LEVEL_CEILING. Above it a level
+// is not worse than benign whatever the grid, so a verdict up there is not our
+// analyzer supporting anybody's claim.
+const suspiciousCeiling = 3000
+
+// fired reports whether our own analysis found something. -1 is the sentinel
+// for "fires at no budget at all" and nil is no level: neither is a finding.
+func fired(measured *int) bool {
+	return measured != nil && *measured >= 0 && *measured <= suspiciousCeiling
+}
+
 func tighten(measured *int, floor int) int {
 	if measured == nil || *measured < 0 {
 		return floor
@@ -376,7 +466,14 @@ func (db *DB) corroborate(ctx context.Context, r *LookupRecord, flagged bool, su
 		// the two that mean something.
 	}
 
-	floor, ok := Floor(a.Confidence)
+	confidence := a.Confidence
+	// Our own analysis, when it fired, is a second and independent voice.
+	// fired() is deliberately the same band scan calls suspicious-or-worse: a
+	// level above that ceiling is not our analyzer backing anything up.
+	if fired(r.FiresAt) {
+		confidence = backed(confidence)
+	}
+	floor, ok := Floor(confidence)
 	if !ok {
 		return r, 0
 	}
