@@ -873,13 +873,18 @@ func (s *apiServer) handleReplicaStatus(w http.ResponseWriter, r *http.Request) 
 	body := map[string]any{"replica": s.readOnly}
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
-	if lag, err := s.db.DataLag(ctx); err != nil {
-		// Reported rather than hidden: a reader that cannot learn the lag must
-		// treat the replica as untrustworthy, and it can only do that if the
-		// failure reaches it.
-		slog.Warn("replica status: data lag unavailable", "err", err)
+	switch lag, known, err := s.db.ReplicationLag(ctx); {
+	case err != nil:
+		// Said out loud rather than hidden: a reader deciding whether to trust
+		// an absence has to be able to tell "current" from "cannot say", and it
+		// can only do that if the failure reaches it.
+		slog.Warn("replica status: replication lag unavailable", "err", err)
 		body["error"] = "lag unavailable"
-	} else {
+	case !known:
+		// No subscription, or no privilege to see it. Not zero: a publisher and
+		// a replica that cannot report must not look alike to a caller.
+		body["lag_seconds"] = nil
+	default:
 		body["lag_seconds"] = int64(lag.Seconds())
 	}
 	w.Header().Set("Content-Type", "application/json")

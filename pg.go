@@ -5865,34 +5865,44 @@ func (db *DB) canonicalizeSightingSubjectsPG(ctx context.Context, dryRun bool) (
 // guarantees litmus_result IS NOT NULL, so the trigger's null branch is omitted.
 // No updated_at bump: healing a derived column must not reshuffle update queues.
 
-// DataLag reports how far behind this instance's data is: the age of the
-// newest row it holds.
+// ReplicationLag reports how far behind this instance is. `known` is false
+// when it is not a subscriber, or cannot see the answer.
 //
-// Deliberately not a replication-internals measure. No subscription
-// privileges, no connection to the publisher, one index-only scan of
-// idx_samples_updated_at. What a reader needs to know is whether the answer it
-// is about to receive is current, and the age of the newest row asks that
-// question directly — where WAL byte counts and slot positions answer a
-// related but different one.
+// Asked of `pg_stat_subscription` rather than inferred from the data. The
+// first cut of this took the age of the newest row — `max(updated_at)` — on the
+// reasoning that a reader wants to know whether its answer is current, and that
+// idx_samples_updated_at made it an index-only scan. It does, on the publisher.
+// The replica *drops* that index on purpose (it is in REPLICA_DROP_INDEXES),
+// so on the one machine where the query actually runs it was a sequential scan
+// of the whole samples table, and every call timed out. The lesson is narrower
+// than "use the right view": a replica does not have the publisher's schema,
+// and a query written against one is not a query against the other.
 //
-// It reads the fleet's write rate as well as its replication delay, and in a
-// genuine write pause the two are indistinguishable. That is the safe
-// direction: it makes a reader more cautious, never less. On a primary it is
-// simply the age of the last write, which is what it should be.
-func (db *DB) DataLag(ctx context.Context) (time.Duration, error) {
-	var newest *time.Time
-	if err := db.pool.QueryRow(ctx, `SELECT max(updated_at) FROM samples`).Scan(&newest); err != nil {
-		return 0, fmt.Errorf("hopper: newest sample: %w", err)
+// `latest_end_time` is when the apply worker last reported progress to the
+// publisher, so its age is the delay a reader would experience. A NULL — no
+// subscription, no apply worker, or a role without the privilege to see it —
+// returns nil rather than zero, because "I cannot tell you" and "I am current"
+// must not be the same answer to a caller deciding whether to trust an absence.
+func (db *DB) ReplicationLag(ctx context.Context) (lag time.Duration, known bool, err error) {
+	var secs *int64
+	err = db.pool.QueryRow(ctx, `
+		SELECT EXTRACT(EPOCH FROM (now() - a.latest_end_time))::bigint
+		  FROM pg_stat_subscription a
+		 WHERE a.relid IS NULL AND a.pid IS NOT NULL
+		 ORDER BY a.latest_end_time DESC NULLS LAST
+		 LIMIT 1`).Scan(&secs)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// Not a subscriber. A publisher has no replication lag, and saying so
+		// is different from failing to answer.
+		return 0, false, nil
+	case err != nil:
+		return 0, false, fmt.Errorf("hopper: replication lag: %w", err)
+	case secs == nil:
+		return 0, false, nil
 	}
-	// An empty corpus is not a stale one.
-	if newest == nil {
-		return 0, nil
-	}
-	// Clocks disagree; a row stamped slightly ahead of us is not negative lag.
-	if lag := time.Since(*newest); lag > 0 {
-		return lag, nil
-	}
-	return 0, nil
+	// Clocks disagree; being fractionally ahead is not negative lag.
+	return time.Duration(max(*secs, 0)) * time.Second, true, nil
 }
 
 // backfillTopTraitsPG heals top_traits for rows written before the derive
