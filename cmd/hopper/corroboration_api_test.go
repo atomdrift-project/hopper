@@ -71,8 +71,8 @@ func TestCorroborationStatusTracksTheLookupPath(t *testing.T) {
 
 	before := derived()
 	if _, err := api.db.AddSightings(ctx, []hopper.Sighting{
-		{Source: "osv", Operator: "ossf-malpkgs", Subject: "pkg:npm/tracked", Claim: hopper.ClaimMalicious, Basis: hopper.BasisReviewed},
-		{Source: "aikido", Operator: "aikido", Subject: "pkg:npm/tracked", Claim: hopper.ClaimMalicious, Basis: hopper.BasisPredicted},
+		{Source: "osv", Operator: "ossf-malpkgs", Subject: "pkg:npm/tracked", Affected: hopper.AllVersions, Claim: hopper.ClaimMalicious, Basis: hopper.BasisReviewed},
+		{Source: "aikido", Operator: "aikido", Subject: "pkg:npm/tracked", Affected: hopper.AllVersions, Claim: hopper.ClaimMalicious, Basis: hopper.BasisPredicted},
 	}); err != nil {
 		t.Fatalf("AddSightings: %v", err)
 	}

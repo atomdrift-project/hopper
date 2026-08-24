@@ -2,6 +2,7 @@ package hopper
 
 import (
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -9,7 +10,7 @@ import (
 // stores it. Operator defaults to the source, as a producer that speaks only
 // for itself leaves it.
 func mal(source, operator string, basis Basis) Sighting {
-	return Sighting{Source: source, Operator: operator, Claim: ClaimMalicious, Basis: basis}
+	return Sighting{Source: source, Operator: operator, Claim: ClaimMalicious, Basis: basis, Affected: AllVersions}
 }
 
 func TestAssessCountsOperatorsNotSources(t *testing.T) {
@@ -108,8 +109,8 @@ func TestAssessIndependenceOutranksStanding(t *testing.T) {
 // version of an advised package became externally disputed.
 func TestAssessIgnoresNonMaliciousClaims(t *testing.T) {
 	a := Assess([]Sighting{
-		{Source: "ghsa", Operator: "github-advisories", Claim: ClaimVulnerable, Basis: BasisReviewed},
-		{Source: "manifest", Operator: "manifest", Claim: ClaimSuspicious, Basis: BasisPredicted},
+		{Source: "ghsa", Operator: "github-advisories", Claim: ClaimVulnerable, Basis: BasisReviewed, Affected: AllVersions},
+		{Source: "manifest", Operator: "manifest", Claim: ClaimSuspicious, Basis: BasisPredicted, Affected: AllVersions},
 	})
 	if a.Confidence != NoClaim {
 		t.Fatalf("Confidence = %v, want NoClaim: neither claim asserts malware", a.Confidence)
@@ -160,8 +161,8 @@ func TestAssessTreatsEmptyBasisAsAGuess(t *testing.T) {
 
 func TestAssessFallsBackToSourceWhenOperatorIsUnset(t *testing.T) {
 	a := Assess([]Sighting{
-		{Source: "socket", Claim: ClaimMalicious, Basis: BasisPredicted},
-		{Source: "aikido", Claim: ClaimMalicious, Basis: BasisPredicted},
+		{Source: "socket", Claim: ClaimMalicious, Basis: BasisPredicted, Affected: AllVersions},
+		{Source: "aikido", Claim: ClaimMalicious, Basis: BasisPredicted, Affected: AllVersions},
 	})
 	if !slices.Equal(a.Operators, []string{"aikido", "socket"}) {
 		t.Fatalf("Operators = %v, want the two source names, sorted", a.Operators)
@@ -281,5 +282,65 @@ func TestOurOwnFiringAnalysisBacksAnOutsideClaim(t *testing.T) {
 	}
 	if backed(NoClaim) != NoClaim {
 		t.Error("our own signal must never manufacture an outside claim")
+	}
+}
+
+// aikido publishes "*" for a package that exists only to be malware, and
+// parallax carries it through unchanged. 91,796 ledger rows are spelled that
+// way and every one of them counted for nothing: treated as a version scope,
+// so never folded into an operator, so the subject read as uncited.
+func TestWildcardAffectedIsAWholePackageClaim(t *testing.T) {
+	a := Assess([]Sighting{
+		{Source: "aikido", Operator: "aikido", Subject: "pkg:npm/evil", Affected: "*", Claim: ClaimMalicious},
+	})
+	if a.Confidence != Weak {
+		t.Fatalf("Confidence = %v, want Weak: '*' is every release, not a version scope", a.Confidence)
+	}
+	if a.Scoped != 0 {
+		t.Errorf("Scoped = %d, want 0", a.Scoped)
+	}
+	if len(a.Operators) != 1 {
+		t.Errorf("Operators = %v, want the one that made the claim", a.Operators)
+	}
+}
+
+// A real version scope must still be excluded — that is the num2words guard.
+func TestExplicitVersionsAreStillScoped(t *testing.T) {
+	a := Assess([]Sighting{
+		{Source: "osv", Operator: "ossf-malpkgs", Subject: "pkg:pypi/num2words", Affected: "0.5.15, 0.5.16", Claim: ClaimMalicious},
+	})
+	if a.Confidence != NoClaim || a.Scoped != 1 {
+		t.Fatalf("Confidence = %v, Scoped = %d; a versioned claim must not convict another release", a.Confidence, a.Scoped)
+	}
+}
+
+// An empty Affected on a PACKAGE claim is unknown scope, not "every release".
+// It must convict nothing: this is what num2words@0.5.14 turned on.
+func TestUnknownScopeConvictsNothing(t *testing.T) {
+	a := Assess([]Sighting{
+		{Source: "osv", Operator: "ossf-malpkgs", Subject: "pkg:pypi/num2words", Claim: ClaimMalicious},
+		{Source: "aikido", Operator: "aikido", Subject: "pkg:pypi/num2words", Claim: ClaimMalicious},
+		{Source: "osm", Operator: "osm", Subject: "pkg:pypi/num2words", Claim: ClaimMalicious},
+	})
+	if a.Confidence != NoClaim {
+		t.Fatalf("Confidence = %v, want NoClaim: three rows with no stated scope are three unknowns", a.Confidence)
+	}
+	if a.Scoped != 3 {
+		t.Errorf("Scoped = %d, want 3 — visible, and counted toward nothing", a.Scoped)
+	}
+}
+
+// A digest names exact bytes, which have no versions, so a digest claim covers
+// its subject entirely however Affected is spelled. Feeds write it empty.
+func TestDigestClaimsCoverTheirSubjectWithoutSayingSo(t *testing.T) {
+	sha := strings.Repeat("a", 64)
+	a := Assess([]Sighting{
+		{Source: "bazaar", Operator: "abuse.ch", Subject: sha, Claim: ClaimMalicious, Basis: BasisHosted},
+	})
+	if a.Confidence != Moderate {
+		t.Fatalf("Confidence = %v, want Moderate: bytes have no versions to scope", a.Confidence)
+	}
+	if a.Scoped != 0 {
+		t.Errorf("Scoped = %d, want 0", a.Scoped)
 	}
 }

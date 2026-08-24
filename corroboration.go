@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"slices"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -168,7 +169,7 @@ func Assess(sightings []Sighting) Assessment {
 			// package as externally disputed.
 			continue
 		}
-		if s.Affected != "" {
+		if !coversEveryRelease(s) {
 			a.Scoped++
 			continue
 		}
@@ -217,6 +218,45 @@ func Assess(sightings []Sighting) Assessment {
 		a.Confidence = NoClaim
 	}
 	return a
+}
+
+// AllVersions is the canonical way a source says "every release of this
+// package is malware".
+//
+// It is what aikido's own API publishes for a package that exists only to be
+// malware, and parallax carries it through unchanged, so the spelling is the
+// feed's rather than ours.
+//
+// The empty string is NOT the same claim. Empty means nobody told us the scope
+// — the source published none, or a producer lost it — and those are opposite
+// facts that wore one spelling until now. Only [AllVersions] convicts every
+// release; see [coversEveryRelease].
+//
+// Chosen over a word like "all" because the code that already parses version
+// constraints reads it correctly without being taught: "*" is the semver range
+// meaning "any", while "all" would be compared as a literal version string and
+// match only a release named "all".
+const AllVersions = "*"
+
+// coversEveryRelease reports whether a claim applies to the subject as a whole
+// rather than to particular versions of it.
+//
+// A digest names exact bytes, which have no versions, so a digest claim always
+// covers its subject entirely however Affected is spelled.
+//
+// A package claim must say [AllVersions]. An empty Affected is NOT that: it
+// means the scope is unknown — the source published none, or a producer lost it
+// on the way in — and convicting every release of a real package on a field
+// nobody filled is how pkg:pypi/num2words@0.5.14 was graded hostile while
+// every source that named versions named 0.5.15 and 0.5.16.
+//
+// Unknown scope therefore counts toward nothing. That under-blocks until the
+// empty rows are resynced into this spelling, which is the safe direction.
+func coversEveryRelease(s *Sighting) bool {
+	if isSHA256Hex(strings.ToLower(strings.TrimSpace(s.Subject))) {
+		return true
+	}
+	return strings.TrimSpace(s.Affected) == AllVersions
 }
 
 // rank orders bases by how much a single one of them is worth. Unrecognized

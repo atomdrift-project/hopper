@@ -31,8 +31,8 @@ func TestLookupRecordDerivesALevelForAnArtifactNobodyHasAnalyzed(t *testing.T) {
 	db := openTestDB(t)
 
 	if _, err := db.AddSightings(ctx, []Sighting{
-		{Source: "osv", Operator: "ossf-malpkgs", Subject: "pkg:npm/ghost", Claim: ClaimMalicious, Basis: BasisReviewed},
-		{Source: "aikido", Operator: "aikido", Subject: "pkg:npm/ghost", Claim: ClaimMalicious, Basis: BasisPredicted},
+		{Source: "osv", Operator: "ossf-malpkgs", Subject: "pkg:npm/ghost", Affected: AllVersions, Claim: ClaimMalicious, Basis: BasisReviewed},
+		{Source: "aikido", Operator: "aikido", Subject: "pkg:npm/ghost", Affected: AllVersions, Claim: ClaimMalicious, Basis: BasisPredicted},
 	}); err != nil {
 		t.Fatalf("AddSightings: %v", err)
 	}
@@ -121,9 +121,9 @@ func TestLookupRecordTightensAMeasuredLevel(t *testing.T) {
 		t.Fatalf("UpdateLitmusResult: %v", err)
 	}
 	if _, err := db.AddSightings(ctx, []Sighting{
-		{Source: "osv", Operator: "ossf-malpkgs", Subject: "pkg:npm/loose", Claim: ClaimMalicious, Basis: BasisReviewed},
-		{Source: "aikido", Operator: "aikido", Subject: "pkg:npm/loose", Claim: ClaimMalicious, Basis: BasisPredicted},
-		{Source: "socket", Operator: "socket", Subject: "pkg:npm/loose", Claim: ClaimMalicious, Basis: BasisPredicted},
+		{Source: "osv", Operator: "ossf-malpkgs", Subject: "pkg:npm/loose", Affected: AllVersions, Claim: ClaimMalicious, Basis: BasisReviewed},
+		{Source: "aikido", Operator: "aikido", Subject: "pkg:npm/loose", Affected: AllVersions, Claim: ClaimMalicious, Basis: BasisPredicted},
+		{Source: "socket", Operator: "socket", Subject: "pkg:npm/loose", Affected: AllVersions, Claim: ClaimMalicious, Basis: BasisPredicted},
 	}); err != nil {
 		t.Fatalf("AddSightings: %v", err)
 	}
@@ -154,7 +154,7 @@ func TestLookupRecordNeverLoosensAMeasuredLevel(t *testing.T) {
 	const sha = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 	mustInsertAnalyzed(t, ctx, db, sha, "tight", "2.1.0") // lvl 3
 	if _, err := db.AddSightings(ctx, []Sighting{
-		{Source: "socket", Operator: "socket", Subject: "pkg:npm/tight", Claim: ClaimMalicious, Basis: BasisPredicted},
+		{Source: "socket", Operator: "socket", Subject: "pkg:npm/tight", Affected: AllVersions, Claim: ClaimMalicious, Basis: BasisPredicted},
 	}); err != nil {
 		t.Fatalf("AddSightings: %v", err)
 	}
@@ -180,8 +180,8 @@ func TestLookupRecordFloorsTheBenignSentinel(t *testing.T) {
 		t.Fatalf("UpdateLitmusResult: %v", err)
 	}
 	if _, err := db.AddSightings(ctx, []Sighting{
-		{Source: "osv", Operator: "ossf-malpkgs", Subject: "pkg:npm/clean", Claim: ClaimMalicious, Basis: BasisReviewed},
-		{Source: "aikido", Operator: "aikido", Subject: "pkg:npm/clean", Claim: ClaimMalicious, Basis: BasisPredicted},
+		{Source: "osv", Operator: "ossf-malpkgs", Subject: "pkg:npm/clean", Affected: AllVersions, Claim: ClaimMalicious, Basis: BasisReviewed},
+		{Source: "aikido", Operator: "aikido", Subject: "pkg:npm/clean", Affected: AllVersions, Claim: ClaimMalicious, Basis: BasisPredicted},
 	}); err != nil {
 		t.Fatalf("AddSightings: %v", err)
 	}
@@ -218,8 +218,8 @@ func TestDerivedRecordNamesNoBytesRatherThanEmptyOnes(t *testing.T) {
 	db := openTestDB(t)
 
 	if _, err := db.AddSightings(ctx, []Sighting{
-		{Source: "osv", Operator: "ossf-malpkgs", Subject: "pkg:npm/nobytes", Claim: ClaimMalicious, Basis: BasisReviewed},
-		{Source: "aikido", Operator: "aikido", Subject: "pkg:npm/nobytes", Claim: ClaimMalicious, Basis: BasisPredicted},
+		{Source: "osv", Operator: "ossf-malpkgs", Subject: "pkg:npm/nobytes", Affected: AllVersions, Claim: ClaimMalicious, Basis: BasisReviewed},
+		{Source: "aikido", Operator: "aikido", Subject: "pkg:npm/nobytes", Affected: AllVersions, Claim: ClaimMalicious, Basis: BasisPredicted},
 	}); err != nil {
 		t.Fatalf("AddSightings: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestDerivedRecordNamesNoBytesRatherThanEmptyOnes(t *testing.T) {
 	// A digest-subject citation does name bytes, and must still say so.
 	const sha = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 	if _, err := db.AddSightings(ctx, []Sighting{
-		{Source: "bazaar", Operator: "abuse.ch", Subject: sha, Claim: ClaimMalicious, Basis: BasisHosted},
+		{Source: "bazaar", Operator: "abuse.ch", Subject: sha, Affected: AllVersions, Claim: ClaimMalicious, Basis: BasisHosted},
 	}); err != nil {
 		t.Fatalf("AddSightings: %v", err)
 	}
