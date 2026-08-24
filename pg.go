@@ -256,6 +256,19 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_sightings_review_queue ` +
 			`ON sightings ((starts_with(subject, 'pkg:')), first_seen DESC) ` +
 			`INCLUDE (subject, affected) WHERE claim IN ('malicious', 'suspicious')`,
+		// The other half of the sighted PURL walk. Production has ~604k review
+		// sightings but only ~1.7m sample PURLs; without a review-eligible covering
+		// index PostgreSQL performs a heap-backed idx_samples_purl_base lookup for
+		// every newest-first sighting until it finds an unreviewed sample. Empty
+		// queues therefore took more than ten minutes. Keep candidate identity,
+		// order, and optional triage filters in the index; the selector fetches the
+		// full sample row only after it has reduced the result to the requested
+		// batch. Every predicate here is a direct predicate in triageSightedWhere.
+		`CREATE INDEX IF NOT EXISTS idx_samples_sighted_purl ` +
+			`ON samples (purl_base, version) ` +
+			`INCLUDE (id, sha256, created_at, ecosystem, file_type, analyzed_at) ` +
+			`WHERE purl_base != '' AND label != 'bad' AND cleave_result IS NOT NULL ` +
+			`AND parent = '' AND skip = '' AND path != ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS corroborated BOOLEAN NOT NULL DEFAULT false`,
 		// Partial indexes holding only corroborated top-level ready rows: the
 		// "?feeds=1" filter (FeedQuery.Corroborated) walks these in created_at
@@ -4320,10 +4333,10 @@ func (db *DB) triageSightedPG(ctx context.Context, limit int, f TriageFilter) ([
 	overfetch := limit + 256
 	overIdx := len(args) + 2
 	args = append(args, limit, overfetch)
-	//nolint:unqueryvet // Derived-row schemas are fixed by pgSampleColsLight; the final projection is explicit.
 	rows, err := db.pool.Query(ctx,
 		`WITH candidates AS (
-			(SELECT sm.*, c.sighted_at
+			(SELECT sm.id AS candidate_id, sm.sha256 AS matched_sha,
+			        sm.created_at AS sample_created_at, c.sighted_at
 			   FROM (
 				SELECT subject, affected, first_seen AS sighted_at
 				  FROM sightings
@@ -4332,7 +4345,7 @@ func (db *DB) triageSightedPG(ctx context.Context, limit int, f TriageFilter) ([
 				 ORDER BY first_seen DESC
 			   ) c
 			   CROSS JOIN LATERAL (
-				SELECT `+pgSampleColsLight+` FROM samples
+				SELECT samples.id, samples.sha256, samples.created_at FROM samples
 				 WHERE samples.sha256 = c.subject AND `+triageSightedWhere+extra+`
 				 ORDER BY samples.created_at DESC, samples.id DESC
 				 LIMIT $`+strconv.Itoa(overIdx)+`
@@ -4340,7 +4353,8 @@ func (db *DB) triageSightedPG(ctx context.Context, limit int, f TriageFilter) ([
 			  ORDER BY c.sighted_at DESC, sm.created_at DESC, sm.id DESC
 			  LIMIT $`+strconv.Itoa(overIdx)+`)
 			UNION ALL
-			(SELECT sm.*, c.sighted_at
+			(SELECT sm.id AS candidate_id, sm.sha256 AS matched_sha,
+			        sm.created_at AS sample_created_at, c.sighted_at
 			   FROM (
 				SELECT subject, affected, first_seen AS sighted_at
 				  FROM sightings
@@ -4349,7 +4363,7 @@ func (db *DB) triageSightedPG(ctx context.Context, limit int, f TriageFilter) ([
 				 ORDER BY first_seen DESC
 			   ) c
 			   CROSS JOIN LATERAL (
-				SELECT `+pgSampleColsLight+` FROM samples
+				SELECT samples.id, samples.sha256, samples.created_at FROM samples
 				 WHERE samples.purl_base = c.subject AND samples.purl_base != ''
 				   AND (c.affected = '' OR c.affected = samples.version)
 				   AND `+triageSightedWhere+extra+`
@@ -4359,11 +4373,14 @@ func (db *DB) triageSightedPG(ctx context.Context, limit int, f TriageFilter) ([
 			  ORDER BY c.sighted_at DESC, sm.created_at DESC, sm.id DESC
 			  LIMIT $`+strconv.Itoa(overIdx)+`)
 		), latest AS (
-			SELECT DISTINCT ON (sha256) * FROM candidates
-			 ORDER BY sha256, sighted_at DESC, created_at DESC, id DESC
+			SELECT DISTINCT ON (matched_sha) candidate_id, matched_sha,
+			       sample_created_at, sighted_at
+			  FROM candidates
+			 ORDER BY matched_sha, sighted_at DESC, sample_created_at DESC, candidate_id DESC
 		)
 		SELECT `+pgSampleColsLight+` FROM latest
-		 ORDER BY sighted_at DESC, created_at DESC, id DESC
+		JOIN samples ON samples.id = latest.candidate_id
+		 ORDER BY latest.sighted_at DESC, latest.sample_created_at DESC, latest.candidate_id DESC
 		 LIMIT $`+strconv.Itoa(limitIdx),
 		args...)
 	if err != nil {

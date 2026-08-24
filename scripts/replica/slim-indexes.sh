@@ -110,6 +110,7 @@ idx_samples_new_stale
 idx_samples_package_version
 idx_samples_purl_base
 idx_samples_purl_lookup
+idx_samples_sighted_purl
 idx_samples_stranded_member
 idx_samples_top_ready_created
 idx_samples_unknown_newest
