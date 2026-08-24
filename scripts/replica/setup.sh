@@ -253,28 +253,11 @@ maint_on
 . "$SCRIPT_DIR/bulkload.sh"
 trap 'bulkload_cleanup; maint_off' EXIT
 
-# Do not start schema work while a reader is actively using the replica. A
-# long diagnostic count(*) takes an AccessShareLock for its entire scan and
-# can make init/slim-index DDL queue behind it. Fail before disabling the
-# subscription so a status check cannot leave the replica stopped.
-busy=$(admin -d "$LOCAL_DB" -tAc "
-    SELECT count(*) FROM pg_stat_activity
-     WHERE datname = '$LOCAL_DB' AND pid <> pg_backend_pid()
-       AND backend_type = 'client backend'
-       AND (state <> 'idle' OR xact_start IS NOT NULL)" | tr -d '[:space:]')
-if [ "${busy:-0}" -gt 0 ]; then
-    log "$busy active/idle-in-transaction client backend(s) on '$LOCAL_DB':"
-    admin -d "$LOCAL_DB" -tA -F '  ' <<'SQL' | sed 's/^/    /'
-SELECT pid, state, coalesce(wait_event, '-'),
-       coalesce((now() - xact_start)::text, '-') AS xact_age,
-       left(query, 100)
-  FROM pg_stat_activity
- WHERE datname = current_database() AND pid <> pg_backend_pid()
-   AND backend_type = 'client backend'
-   AND (state <> 'idle' OR xact_start IS NOT NULL);
-SQL
-    die "refusing replica setup while client transactions are active; stop the reader(s) and re-run"
-fi
+# Readers may remain connected while setup reconciles the replica. Most runs
+# have no schema work to do, and rejecting every active query made an
+# idempotent repair unnecessarily disruptive. If DDL really conflicts with a
+# reader, hopper init's bounded lock_timeout below reports that specific
+# conflict instead of this script refusing all client activity up front.
 
 # Classify per-table tablesync state so re-running make replica is safe:
 #
@@ -545,6 +528,63 @@ if [ -n "$missing" ]; then
        Skipping CREATE/REFRESH SUBSCRIPTION: subscribing now would crash-loop
        the apply worker and retain WAL on the publisher without bound."
 fi
+
+# Column parity is not sufficient: a subscriber-side key that is narrower than
+# the publisher's rejects rows that are distinct upstream. This happened when
+# sightings changed from (source, subject) to (source, subject, affected): one
+# valid publisher transaction carried multiple affected versions and apply
+# stopped with conflict=insert_exists. Logical replication does not copy DDL,
+# so mirror each published table's primary-key definition before enabling the
+# subscription. Do the drop+add atomically so a failed rebuild preserves the
+# old constraint, and bound the lock wait so active readers still cannot hang
+# make replica indefinitely.
+log "Verifying local primary keys match the publisher"
+publisher_pks=$(psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" -tA -F '|' -c \
+    "SELECT pt.schemaname, pt.tablename, con.conname,
+            pg_get_constraintdef(con.oid, false)
+       FROM pg_publication_tables pt
+       JOIN pg_namespace n ON n.nspname = pt.schemaname
+       JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = pt.tablename
+       JOIN pg_constraint con ON con.conrelid = c.oid AND con.contype = 'p'
+      WHERE pt.pubname = '$PUBLICATION'
+      ORDER BY pt.schemaname, pt.tablename" 2>/dev/null)
+while IFS='|' read -r schema table publisher_pk publisher_def; do
+    [ -n "$schema" ] || continue
+    validate_ident "publisher primary-key schema" "$schema"
+    validate_ident "publisher primary-key table" "$table"
+    validate_ident "publisher primary-key name" "$publisher_pk"
+    case "$publisher_def" in
+        'PRIMARY KEY ('*')') ;;
+        *) die "unexpected primary-key definition for $schema.$table from publisher: '$publisher_def'" ;;
+    esac
+
+    local_pk=$(admin -d "$LOCAL_DB" -tA -F '|' -c \
+        "SELECT con.conname, pg_get_constraintdef(con.oid, false)
+           FROM pg_constraint con
+           JOIN pg_class c ON c.oid = con.conrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = '$schema' AND c.relname = '$table'
+            AND con.contype = 'p'" | head -n 1)
+    local_pk_name=${local_pk%%|*}
+    if [ "$local_pk" = "$local_pk_name" ]; then
+        local_def=''
+    else
+        local_def=${local_pk#*|}
+    fi
+    [ "$local_def" = "$publisher_def" ] && continue
+
+    [ -n "$local_pk_name" ] && validate_ident "local primary-key name" "$local_pk_name"
+    log "Reconciling primary key on $schema.$table: ${local_def:-none} -> $publisher_def"
+    if [ -n "$local_pk_name" ]; then
+        drop_local_pk="ALTER TABLE \"$schema\".\"$table\" DROP CONSTRAINT \"$local_pk_name\";"
+    else
+        drop_local_pk=''
+    fi
+    admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -c \
+        "BEGIN; SET LOCAL lock_timeout = '30s'; $drop_local_pk ALTER TABLE \"$schema\".\"$table\" ADD CONSTRAINT \"$publisher_pk\" $publisher_def; COMMIT;"
+done <<EOF
+$publisher_pks
+EOF
 
 # --- Subscription ----------------------------------------------------------
 # We keep the password out of argv by passing it through psql's -v mechanism
