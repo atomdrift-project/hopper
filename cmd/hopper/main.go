@@ -1020,7 +1020,13 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	maxRSSGB := f.Int("max-memory-gb", 48,
 		"local atomscan worker RSS limit in GB, forwarded as --max-rss-gb (0 = auto: let atomscan self-throttle, -1 = disable in-process throttling)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
-	rescanAge := f.Duration("rescan-age", 120*time.Hour, "minimum age before a stale-traits sample is eligible for rescan")
+	// 30 days, up from 5 (2026-08-24): the stale-traits tier exists to catch
+	// detector improvements, not threats — a sample cited in a feed is force-
+	// rescanned via the sightings/cyclotron path regardless of this age, and
+	// scan's corpus precheck now skips re-analysis on the same 30-day benign
+	// window. 5 days meant the tier re-churned the corpus ~6x more often than
+	// either consumer needed, and its drain competes with fresh ingestion.
+	rescanAge := f.Duration("rescan-age", 30*24*time.Hour, "minimum age before a stale-traits sample is eligible for rescan")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
 	experimentTag := f.String("experiment-tag", "", "label for experiment comparison")
