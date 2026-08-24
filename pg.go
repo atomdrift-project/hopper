@@ -167,21 +167,6 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_claimable_sha ` +
 			`ON samples(sha256) ` +
 			`WHERE cleave_result IS NULL AND skip = '' AND parent = ''`,
-		// The sighted claim tier (sightedCandidatesPG): pending top-level samples an
-		// external feed has already cited. Production 2026-08-24 held 3,423 of
-		// these against 537,705 pending rows, so the index is a rounding error in
-		// size and the tier drains in a single ordered seek.
-		//
-		// It is a tier rather than an ORDER BY on the main queue because Tier 1
-		// scans from a random sha256 pivot precisely to avoid an ordering, and
-		// ranking 537k rows by a flag would replace that seek with a sort.
-		//
-		// Self-draining, which is what keeps it cheap forever: StoreResult sets
-		// cleave_result, the row falls out of the predicate, and the index shrinks
-		// back. It cannot accumulate the way an unpartitioned flag index would.
-		`CREATE INDEX IF NOT EXISTS idx_samples_pending_sighted ` +
-			`ON samples(id) ` +
-			`WHERE corroborated AND cleave_result IS NULL AND skip = '' AND parent = ''`,
 		// Covers the dashboard's OldestClaims query (DISTINCT ON claimed_by, ORDER BY claimed_at).
 		`CREATE INDEX IF NOT EXISTS idx_samples_claimed ON samples(claimed_by, claimed_at) WHERE claimed_by != ''`,
 		// newestAnalyzedAtPG: MAX(analyzed_at) — index-only max scan.
@@ -314,6 +299,26 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_corroborated_created ` +
 			`ON samples(created_at DESC) ` +
 			`WHERE corroborated AND parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL`,
+		// Placed here, AFTER the corroborated ADD COLUMN above, not up with the
+		// other claimable indexes where it belongs by subject. CREATE TABLE IF
+		// NOT EXISTS is a no-op on an existing database, so a database that
+		// predates the column only acquires it from that ALTER — and CREATE
+		// INDEX still reads the column. See the same warning in schema.sql.
+		// The sighted claim tier (sightedCandidatesPG): pending top-level samples an
+		// external feed has already cited. Production 2026-08-24 held 3,423 of
+		// these against 537,705 pending rows, so the index is a rounding error in
+		// size and the tier drains in a single ordered seek.
+		//
+		// It is a tier rather than an ORDER BY on the main queue because Tier 1
+		// scans from a random sha256 pivot precisely to avoid an ordering, and
+		// ranking 537k rows by a flag would replace that seek with a sort.
+		//
+		// Self-draining, which is what keeps it cheap forever: StoreResult sets
+		// cleave_result, the row falls out of the predicate, and the index shrinks
+		// back. It cannot accumulate the way an unpartitioned flag index would.
+		`CREATE INDEX IF NOT EXISTS idx_samples_pending_sighted ` +
+			`ON samples(id) ` +
+			`WHERE corroborated AND cleave_result IS NULL AND skip = '' AND parent = ''`,
 		// samples.corroborated is a cache of "some sighting cites this row's sha256
 		// or purl_base", and the claim queues now rank by it, so a stale bit is a
 		// mis-ordered queue rather than a cosmetic wart. Maintaining it from Go
@@ -5341,6 +5346,8 @@ func (db *DB) remarkCorroboratedPG(ctx context.Context) (int64, error) {
 	}
 
 	const batch = 5000
+	slog.InfoContext(ctx, "remark corroborated: scanning ledger", "subjects", len(subjects))
+
 	var marked int64
 	for start := 0; start < len(subjects); start += batch {
 		shas, purls := splitSightingSubjects(subjects[start:min(start+batch, len(subjects))])
@@ -5357,6 +5364,15 @@ func (db *DB) remarkCorroboratedPG(ctx context.Context) (int64, error) {
 			}
 			marked += tag.RowsAffected()
 		}
+		// Per batch, not per N-thousand rows: each statement is 5,000 index
+		// probes plus heap reads against a 91.7M-row table, so on a cold cache a
+		// single batch can take tens of seconds. A command that prints nothing
+		// for half an hour is indistinguishable from one that has wedged — which
+		// is exactly what this looked like the first time it ran against
+		// production.
+		slog.InfoContext(ctx, "remark corroborated progress",
+			"subjects_done", min(start+batch, len(subjects)), "subjects", len(subjects),
+			"marked", marked)
 	}
 	return marked, nil
 }

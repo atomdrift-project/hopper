@@ -4055,10 +4055,12 @@ func cmdReconcileCorroborated(ctx context.Context) error {
 	// Mark first, then clear. The two are independent — one walks the ledger,
 	// the other walks the flagged samples — but in this order a subject that is
 	// both newly cited and newly orphaned settles on the ledger's answer.
+	slog.Info("marking samples the ledger cites (pass 1 of 2)")
 	marked, err := db.RemarkCorroborated(ctx)
 	if err != nil {
 		return err
 	}
+	slog.Info("clearing samples nothing cites (pass 2 of 2)", "marked", marked)
 	cleared, err := db.ReconcileCorroborated(ctx)
 	if err != nil {
 		return err
