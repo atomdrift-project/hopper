@@ -107,7 +107,7 @@ deploy-linux:
 # friends from the local replica DB so beamline's lookups never queue behind
 # publisher ingestion. Writes are refused at the route AND session layer.
 deploy-replica: build
-	DB='$(REPLICA_DB)' API_ADDR='$(REPLICA_API_ADDR)' \
+	DB='$(REPLICA_DB)' API_ADDR='$(REPLICA_API_ADDR)' FORCE='$(FORCE)' \
 		./scripts/replica/deploy-replica-api.sh
 
 deploy-freebsd:

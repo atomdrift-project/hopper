@@ -76,6 +76,15 @@ type LookupRecord struct {
 	// against, and that comparison does not happen here.
 	FiresAt       *int            `json:"fires_at"`
 	EngineVersion *string         `json:"engine_version"`
+	// TraitsVersion is the analyzer-judgment hash this verdict was produced
+	// under — hopper's invalidation key. Distinct from EngineVersion (the scan
+	// build): a build can change without the judgment changing, and this field
+	// changes exactly when re-analysis could learn something. It exists so a
+	// scan worker can skip re-analyzing a dependency the corpus already holds
+	// at the worker's own traits version (the 2026-08-23 renewal storm:
+	// thousands of dependency re-scans per hour whose stores all logged
+	// "re-analysis learned nothing").
+	TraitsVersion *string `json:"traits_version"`
 	AnalyzedAt    *string         `json:"analyzed_at"`
 	Reason        *string         `json:"reason"`
 	Findings      []LookupFinding `json:"findings"`
@@ -251,6 +260,10 @@ func recordOf(s *Sample) *LookupRecord {
 	if ml.Eng != "" {
 		eng := ml.Eng
 		r.EngineVersion = &eng
+	}
+	if s.TraitsVersion != "" {
+		tv := s.TraitsVersion
+		r.TraitsVersion = &tv
 	}
 	switch {
 	case ml.AnalyzedAt != "":

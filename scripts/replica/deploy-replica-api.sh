@@ -38,6 +38,7 @@
 #                 relay and refuse client writes with 403 as before). The
 #                 client's bearer token passes through to the primary, which
 #                 works because TOKEN_SRC defaults to the primary's own token.
+#   FORCE       set to 1 to deploy despite applied data exceeding MAX_LAG_S
 
 set -euo pipefail
 
@@ -80,6 +81,7 @@ command -v systemctl >/dev/null || die "systemctl not found (this target is for 
 # `make replica-watch` is the tool for looking at why.
 # ---------------------------------------------------------------------------
 MAX_LAG_S="${MAX_LAG_S:-3600}"
+FORCE="${FORCE:-0}"
 log "replication health gate (max applied-data age: ${MAX_LAG_S}s)"
 HEALTH=$(PGCONNECT_TIMEOUT=5 psql -h 127.0.0.1 -U hopper -d hopper -tA <<'SQL'
 SELECT
@@ -98,7 +100,11 @@ IFS='|' read -r ENABLED_SUBS APPLY_WORKERS APPLIED_AGE TABLES_SYNCING <<<"${HEAL
 [ "${APPLY_WORKERS}" -ge 1 ] || die "health gate: subscription enabled but NO apply worker attached — replication is down, not catching up. See 'make replica-watch'."
 [ "${APPLIED_AGE}" -ge 0 ] || die "health gate: cannot determine applied-data age (no timestamps in pg_stat_subscription yet); retry in a minute"
 if [ "${APPLIED_AGE}" -gt "${MAX_LAG_S}" ]; then
-    die "health gate: applied data is ${APPLIED_AGE}s old (max ${MAX_LAG_S}s) — a lookup API this stale converts fresh analyses into redundant beamline scans. Let it catch up ('make replica-watch'), or override with MAX_LAG_S."
+    if [ "${FORCE}" = "1" ]; then
+        log "WARNING: FORCE=1: deploying despite applied data being ${APPLIED_AGE}s old (max ${MAX_LAG_S}s); lookups may trigger redundant beamline scans"
+    else
+        die "health gate: applied data is ${APPLIED_AGE}s old (max ${MAX_LAG_S}s) — a lookup API this stale converts fresh analyses into redundant beamline scans. Let it catch up ('make replica-watch'), override with MAX_LAG_S, or force startup with 'make deploy-replica FORCE=1'."
+    fi
 fi
 if [ "${TABLES_SYNCING}" -gt 0 ]; then
     log "note: ${TABLES_SYNCING} table(s) still in initial sync (srsubstate != 'r') — deploy proceeds; lookups may miss rows from those tables until sync completes"
