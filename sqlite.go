@@ -2233,13 +2233,14 @@ func (db *DB) storeResultSQLite(
 	var parent Sample
 	var firstAnalyzed, priorAnalyzed sql.NullString
 	var priorTraits, purlBase string
+	var createdAt sqliteNullTime
 	if err := tx.QueryRowContext(ctx,
 		`SELECT label, label_source, source, feed, ecosystem, path, first_analyzed_at,
-		        analyzed_at, traits_version, purl_base
+		        analyzed_at, traits_version, purl_base, created_at
 		   FROM samples WHERE sha256 = ?`, sha256).
 		Scan(&parent.Label, &parent.LabelSource, &parent.Source, &parent.Feed,
 			&parent.Ecosystem, &parent.Path, &firstAnalyzed,
-			&priorAnalyzed, &priorTraits, &purlBase); err != nil {
+			&priorAnalyzed, &priorTraits, &purlBase, &createdAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return StoreStats{}, fmt.Errorf("hopper: store result for absent sample %s: %w", sha256, ErrNotFound)
 		}
@@ -2256,6 +2257,7 @@ func (db *DB) storeResultSQLite(
 	}
 	stats.PriorTraitsVersion = priorTraits
 	stats.PURLBase = purlBase
+	stats.CreatedAt = createdAt.Time
 
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE samples SET cleave_result = ?,
@@ -4899,7 +4901,7 @@ func (db *DB) feedDomainsSQLite(ctx context.Context, source, label string) ([]st
 func (db *DB) bigArchiveCandidatesSQLite(ctx context.Context, minBytes int64, hopperStart time.Time, limit int) ([]ClaimJob, error) {
 	startCutoff := hopperStart.UTC().Format(time.RFC3339Nano)
 	return queryLiteCandidates(ctx, db.lite,
-		`SELECT sha256, path, size_bytes, file_type FROM samples
+		`SELECT sha256, path, size_bytes, file_type, created_at FROM samples
 		 WHERE size_bytes > ?
 		   AND cleave_result IS NULL AND skip = '' AND parent = ''
 		   AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
@@ -4913,7 +4915,7 @@ func (db *DB) bigArchiveCandidatesSQLite(ctx context.Context, minBytes int64, ho
 func (db *DB) sightedCandidatesSQLite(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
 	startCutoff := hopperStart.UTC().Format(time.RFC3339Nano)
 	return queryLiteCandidates(ctx, db.lite, `
-		SELECT sha256, path, size_bytes, file_type FROM samples
+		SELECT sha256, path, size_bytes, file_type, created_at FROM samples
 		WHERE corroborated = 1
 		  AND cleave_result IS NULL AND skip = '' AND parent = ''
 		  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
@@ -4927,7 +4929,7 @@ func (db *DB) unanalyzedCandidatesSQLite(ctx context.Context, hopperStart time.T
 	pivot := randomSHA256Pivot()
 	return queryLiteCandidates(ctx, db.lite,
 		`WITH picked AS (
-			SELECT sha256, path, size_bytes, file_type, 0 AS pass
+			SELECT sha256, path, size_bytes, file_type, created_at, 0 AS pass
 			FROM samples
 			WHERE sha256 >= ?
 			  AND cleave_result IS NULL AND skip = '' AND parent = ''
@@ -4937,7 +4939,7 @@ func (db *DB) unanalyzedCandidatesSQLite(ctx context.Context, hopperStart time.T
 			LIMIT ?
 		),
 		wrapped AS (
-			SELECT sha256, path, size_bytes, file_type, 1 AS pass
+			SELECT sha256, path, size_bytes, file_type, created_at, 1 AS pass
 			FROM samples
 			WHERE sha256 < ?
 			  AND cleave_result IS NULL AND skip = '' AND parent = ''
@@ -4946,11 +4948,11 @@ func (db *DB) unanalyzedCandidatesSQLite(ctx context.Context, hopperStart time.T
 			ORDER BY sha256
 			LIMIT ?
 		)
-		SELECT sha256, path, size_bytes, file_type
+		SELECT sha256, path, size_bytes, file_type, created_at
 		FROM (
-			SELECT sha256, path, size_bytes, file_type, pass FROM picked
+			SELECT sha256, path, size_bytes, file_type, created_at, pass FROM picked
 			UNION ALL
-			SELECT sha256, path, size_bytes, file_type, pass FROM wrapped
+			SELECT sha256, path, size_bytes, file_type, created_at, pass FROM wrapped
 		)
 		ORDER BY pass, sha256
 		LIMIT ?`, pivot, startCutoff, maxClaimAttempts, limit, pivot, startCutoff, maxClaimAttempts, limit, limit)
@@ -4962,7 +4964,7 @@ func (db *DB) unanalyzedCandidatesSQLite(ctx context.Context, hopperStart time.T
 func (db *DB) forcedRescanCandidatesSQLite(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
 	startCutoff := hopperStart.UTC().Format(time.RFC3339Nano)
 	return queryLiteCandidates(ctx, db.lite, `
-		SELECT sha256, path, size_bytes, file_type FROM samples
+		SELECT sha256, path, size_bytes, file_type, created_at FROM samples
 		WHERE rescan_priority = 2
 		  AND skip = '' AND parent = ''
 		  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
@@ -4973,7 +4975,7 @@ func (db *DB) forcedRescanCandidatesSQLite(ctx context.Context, hopperStart time
 // repairCandidatesSQLite mirrors repairCandidatesPG.
 func (db *DB) repairCandidatesSQLite(ctx context.Context, limit int) ([]ClaimJob, error) {
 	return queryLiteCandidates(ctx, db.lite, `
-		SELECT sha256, path, size_bytes, file_type FROM samples
+		SELECT sha256, path, size_bytes, file_type, created_at FROM samples
 		WHERE rescan_priority = 1 AND skip = '' AND parent = ''
 		ORDER BY rescan_requested_at ASC, score DESC
 		LIMIT ?`, limit)
@@ -5037,7 +5039,7 @@ func (db *DB) sampleAnalyzedSQLite(ctx context.Context, sha256 string) (exists, 
 // not yet analyzed, oldest first.
 func (db *DB) uploadCandidatesSQLite(ctx context.Context, limit int) ([]ClaimJob, error) {
 	return queryLiteCandidates(ctx, db.lite, `
-		SELECT sha256, path, size_bytes, file_type FROM samples
+		SELECT sha256, path, size_bytes, file_type, created_at FROM samples
 		WHERE source = 'upload' AND cleave_result IS NULL
 		  AND skip = '' AND parent = ''
 		ORDER BY id ASC
@@ -5056,7 +5058,7 @@ func (db *DB) forceRescanCandidatesSQLite(ctx context.Context, hopperStart time.
 		args = append(args, p, p+"/%")
 	}
 	args = append(args, startCutoff, limit)
-	query := `SELECT sha256, path, size_bytes, file_type FROM samples
+	query := `SELECT sha256, path, size_bytes, file_type, created_at FROM samples
 		WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
 		  AND analyzed_at < ?
 		  AND (` + strings.Join(clauses, " OR ") + `)
@@ -5076,7 +5078,7 @@ func (db *DB) staleTraitsCandidatesSQLite(
 	staleAge := time.Now().Add(-rescanAge).UTC().Format(time.RFC3339Nano)
 	startCutoff := hopperStart.UTC().Format(time.RFC3339Nano)
 	return queryLiteCandidates(ctx, db.lite,
-		`SELECT sha256, path, size_bytes, file_type FROM samples
+		`SELECT sha256, path, size_bytes, file_type, created_at FROM samples
 		WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''
 		  AND traits_version != ?
 		  AND (corroborated = 1 OR analyzed_at < ?)
@@ -5102,9 +5104,15 @@ func queryLiteCandidates(ctx context.Context, db *sql.DB, query string, args ...
 	var out []ClaimJob
 	for rows.Next() {
 		var j ClaimJob
-		if err := rows.Scan(&j.SHA256, &j.Path, &j.SizeBytes, &j.FileType); err != nil {
+		// created_at is a DATETIME string in SQLite, in whichever of the
+		// layouts sqliteNullTime knows; a row that somehow holds none leaves
+		// CreatedAt zero, which the age metric skips rather than reporting an
+		// epoch-sized lag.
+		var created sqliteNullTime
+		if err := rows.Scan(&j.SHA256, &j.Path, &j.SizeBytes, &j.FileType, &created); err != nil {
 			return nil, fmt.Errorf("hopper: candidate scan: %w", err)
 		}
+		j.CreatedAt = created.Time
 		out = append(out, j)
 	}
 	return out, rows.Err()

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/atomdrift-project/hopper"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -106,6 +107,125 @@ func recordResultPhase(ctx context.Context, phase, lane string, d time.Duration)
 		resultPhaseHist.Record(ctx, d.Seconds(), metric.WithAttributes(
 			attribute.String("phase", phase), attribute.String("lane", lane)))
 	}
+}
+
+// Sample-age histograms answer "how far behind is the queue" in the one unit
+// that survives a change in throughput: how old the work itself is. Queue depth
+// cannot answer it — a 500k backlog drained in SHA-pivot order and a 500k
+// backlog nobody is touching look identical — and neither can throughput, which
+// holds steady while the queue ages underneath it.
+//
+// Two measurements, both taken against samples.created_at (when the row entered
+// the queue), because the gap between them is the informative part:
+//
+//   - claim age: how long work waited before a worker was handed it. This is
+//     queue lag proper. Rising means we are reaching further back into the
+//     backlog to find work.
+//   - commit age: claim age plus however long the worker held the job. Rising
+//     faster than claim age means the fleet, not the queue, is the constraint.
+//
+// Histograms rather than gauges: the average is what was asked for and
+// rate(_sum)/rate(_count) gives it, but the distribution is what distinguishes
+// "everything is a day old" from "most work is fresh and a tail is ancient",
+// and those want different fixes. The buckets run from a minute to sixteen
+// weeks — hopper's backlog is measured in weeks, so a second-scale ladder would
+// pile every real observation into +Inf.
+var sampleAgeBuckets = []float64{
+	60, 300, 900, 3600, 4 * 3600, 12 * 3600, 24 * 3600,
+	3 * 24 * 3600, 7 * 24 * 3600, 14 * 24 * 3600, 30 * 24 * 3600,
+	60 * 24 * 3600, 120 * 24 * 3600,
+}
+
+// claimAgeHist and commitAgeHist follow the same lazy-create, nil-is-a-no-op
+// contract as recordLoadShed: the meter provider is installed by obs.Init long
+// before the first claim poll, and a creation failure degrades to silence
+// rather than to a panic on a request path.
+var (
+	claimAgeOnce  sync.Once
+	claimAgeHist  metric.Float64Histogram
+	commitAgeOnce sync.Once
+	commitAgeHist metric.Float64Histogram
+)
+
+// newSampleAgeHistogram builds one of the two age histograms on meter,
+// returning nil if the instrument cannot be created (the recorder then degrades
+// to a no-op). Split out for the same reason newDBRetryCounter is: a test can
+// bind the instrument to its own provider and registry and still assert against
+// the production definition, without installing a global meter provider —
+// which would retroactively drag every other instrument the suite created into
+// that registry.
+func newSampleAgeHistogram(m metric.Meter, name, desc string) metric.Float64Histogram {
+	h, err := m.Float64Histogram(name,
+		metric.WithDescription(desc),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(sampleAgeBuckets...),
+	)
+	if err != nil {
+		return nil
+	}
+	return h
+}
+
+const (
+	claimAgeName = "hopper.claim.sample_age"
+	claimAgeDesc = "Age of a sample (since its row was created) at the moment it was handed to a worker, by claim tier."
+
+	commitAgeName = "hopper.commit.sample_age"
+	commitAgeDesc = "Age of a sample (since its row was created) when its analysis was committed, " +
+		"by whether this was a first analysis or a renewal."
+)
+
+// recordClaimAges reports the queue age of every job in one hand-out, all
+// against a single clock read so a slow batch cannot make its later jobs look
+// older than its earlier ones.
+func recordClaimAges(ctx context.Context, jobs []hopper.ClaimJob) {
+	now := time.Now()
+	for _, j := range jobs {
+		recordClaimAge(ctx, j.Tier, j.CreatedAt, now)
+	}
+}
+
+// recordClaimAge records how old a sample was when it was handed to a worker,
+// labeled by the tier it was drawn from. The tier label is not decoration: the
+// rescan tiers deliberately re-serve rows that are months old, so a single
+// unlabeled average would report a permanently ancient queue no matter how
+// current the fresh-ingest path was. A zero createdAt (a row predating the
+// column, or a SQLite string that would not parse) is skipped rather than
+// reported as a 56-year lag.
+func recordClaimAge(ctx context.Context, tier string, createdAt, now time.Time) {
+	if createdAt.IsZero() {
+		return
+	}
+	claimAgeOnce.Do(func() {
+		claimAgeHist = newSampleAgeHistogram(otel.Meter(meterName), claimAgeName, claimAgeDesc)
+	})
+	if claimAgeHist != nil {
+		claimAgeHist.Record(ctx, max(now.Sub(createdAt).Seconds(), 0),
+			metric.WithAttributes(attribute.String("tier", tier)))
+	}
+}
+
+// recordCommitAge records how old a sample was when its result was committed.
+// Labeled "first" or "renewal" for the same reason claims are labeled by tier:
+// a renewal is by construction a re-analysis of an old row, and averaging the
+// two together hides the end-to-end latency of freshly ingested work, which is
+// the number that says whether the pipeline is keeping up.
+func recordCommitAge(ctx context.Context, renewal bool, createdAt, now time.Time) {
+	if createdAt.IsZero() {
+		return
+	}
+	commitAgeOnce.Do(func() {
+		commitAgeHist = newSampleAgeHistogram(otel.Meter(meterName), commitAgeName, commitAgeDesc)
+	})
+	if commitAgeHist == nil {
+		return
+	}
+	kind := "first"
+	if renewal {
+		kind = "renewal"
+	}
+	commitAgeHist.Record(ctx, max(now.Sub(createdAt).Seconds(), 0),
+		metric.WithAttributes(attribute.String("kind", kind)))
 }
 
 // enableMetrics registers the OpenTelemetry instruments that publish every

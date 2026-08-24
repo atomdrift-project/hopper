@@ -1462,6 +1462,49 @@ func queryAgeBefore(q url.Values, name string, now time.Time) (time.Time, bool) 
 	return now.Add(-time.Duration(secs) * time.Second), true
 }
 
+// nextParams is a worker's self-description from an /api/next query string:
+// how much work it wants, what it can run, and how loaded it is. Split out of
+// handleNext because it is nine independent "parse, validate, or fall back to a
+// default" clauses with no branching between them — inline they were half the
+// handler's length and all of its noise, and none of them can fail the request.
+type nextParams struct {
+	tools    string         // canonical comma-joined tool list, for the tracker
+	toolCaps *workerToolSet // the same tools as a lookup set, for candidate filtering
+	version  string
+	traits   string
+	count    int // jobs requested, clamped to maxClaimCount
+	slots    int // concurrent task slots the worker advertises
+	rssMB    int // worker's self-reported RSS
+	load1    float64
+	maxBytes int64 // largest file the worker will accept; 0 means no cap
+}
+
+// parseNextParams reads those fields from q. Every field has a working default,
+// so a malformed or absent value degrades to it rather than rejecting the poll:
+// a worker that gets its load average wrong should still be given work.
+func parseNextParams(q url.Values) nextParams {
+	p := nextParams{count: 1, slots: 1, version: q.Get("version"), traits: q.Get("traits")}
+	if n, err := strconv.Atoi(q.Get("count")); err == nil && n > 0 {
+		p.count = min(n, maxClaimCount)
+	}
+	if n, err := strconv.Atoi(q.Get("slots")); err == nil && n > 0 {
+		p.slots = n
+	}
+	p.tools, p.toolCaps = parseWorkerTools(q["tools"])
+	if n, err := strconv.Atoi(q.Get("rss_mb")); err == nil && n >= 0 {
+		p.rssMB = n
+	}
+	if f, err := strconv.ParseFloat(q.Get("load1"), 64); err == nil && f >= 0 {
+		p.load1 = f
+	}
+	// Only files this size or smaller are handed to the worker, keeping large
+	// archives off memory-constrained workers that would OOM analyzing them.
+	if n, err := strconv.ParseInt(q.Get("max_bytes"), 10, 64); err == nil && n > 0 {
+		p.maxBytes = n
+	}
+	return p
+}
+
 // handleNext claims work items for a worker.
 // GET /api/next?worker=nuc&count=3&slots=4&version=0.8.2&traits=abc123.
 func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
@@ -1478,54 +1521,15 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	}
 	worker = qualifiedWorkerName(worker, r.RemoteAddr)
 
-	count := 1
-	if v := r.URL.Query().Get("count"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			count = n
-		}
-	}
-	if count > maxClaimCount {
-		count = maxClaimCount
-	}
-
-	slots := 1
-	if v := r.URL.Query().Get("slots"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			slots = n
-		}
-	}
-	version := r.URL.Query().Get("version")
-	traits := r.URL.Query().Get("traits")
-	tools, toolCaps := parseWorkerTools(r.URL.Query()["tools"])
-
-	var rssMB int
-	if v := r.URL.Query().Get("rss_mb"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			rssMB = n
-		}
-	}
-	var load1 float64
-	if v := r.URL.Query().Get("load1"); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
-			load1 = f
-		}
-	}
-	// Largest file the worker will accept (bytes); absent/0 means no cap. Only
-	// files this size or smaller are handed to the worker, keeping large archives
-	// off memory-constrained workers that would OOM analyzing them.
-	var maxBytes int64
-	if v := r.URL.Query().Get("max_bytes"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			maxBytes = n
-		}
-	}
+	p := parseNextParams(r.URL.Query())
+	count, slots := p.count, p.slots
 
 	// Cap claims for workers that haven't returned any results yet.
 	if limit := s.tracker.claimLimit(worker); limit == 0 {
 		//nolint:gosec // worker is sanitized by validWorkerName
 		slog.Warn("unproven worker at active claim limit, waiting for results",
 			"worker", worker, "active", s.tracker.activeClaims(worker))
-		s.tracker.update(worker, slots, version, traits, rssMB, load1, tools)
+		s.tracker.update(worker, slots, p.version, p.traits, p.rssMB, p.load1, p.tools)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	} else if count > limit {
@@ -1533,7 +1537,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Heartbeat first so the dashboard sees the worker even on no-work polls.
-	s.tracker.update(worker, slots, version, traits, rssMB, load1, tools)
+	s.tracker.update(worker, slots, p.version, p.traits, p.rssMB, p.load1, p.tools)
 
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
@@ -1542,13 +1546,13 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	// dashboard reads live worker state from the in-memory tracker; the DB
 	// row is only for post-crash inspection.
 	if s.tracker.shouldUpsertWorker(worker, workerUpsertInterval) {
-		wk := hopper.Worker{Name: worker, Slots: slots, Version: version, Traits: traits}
+		wk := hopper.Worker{Name: worker, Slots: slots, Version: p.version, Traits: p.traits}
 		if err := s.db.UpsertWorker(ctx, wk); err != nil {
 			slog.Debug("upsert worker failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
 		}
 	}
 
-	jobs, err := s.claimJobs(ctx, worker, count, toolCaps, maxBytes, slots)
+	jobs, err := s.claimJobs(ctx, worker, count, p.toolCaps, p.maxBytes, slots)
 	if err != nil {
 		slog.Error("claim jobs failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
@@ -1622,6 +1626,11 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 			jobs[i].Path = filepath.ToSlash(stripDataRoot(jobs[i].Path, prefix))
 		}
 	}
+
+	// Queue age of what we are actually handing over, recorded after
+	// validateClaimJobs has dropped the unservable ones: a job the handler
+	// releases never reached a worker and must not inflate the lag reading.
+	recordClaimAges(r.Context(), jobs)
 
 	active := s.tracker.activeClaims(worker)
 	for _, j := range jobs {
@@ -1982,6 +1991,11 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// End-to-end age of what we just committed. Uses r.Context() for the trace
+	// link even though the store ran on the detached ctx: the measurement
+	// belongs to the request that delivered the result.
+	recordCommitAge(r.Context(), stats.Renewed(), stats.CreatedAt, time.Now())
+
 	s.progress.analyzed.Add(1)
 	if stats.Members > 0 {
 		s.progress.exploded.Add(stats.MembersStored)
@@ -1998,33 +2012,68 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	slog.Info("result stored", "worker", req.Worker, "sha256", req.SHA256, "path", claimedPath,
 		"duration_ms", req.DurationMs, "active_claims", s.tracker.activeClaims(req.Worker))
 
-	// A sample analyzed once should not be analyzed again soon: the rescan tiers
-	// are deliberate and rare, and a producer re-posting a verdict hopper already
-	// holds is pure write cost. Neither is visible in "result stored", which
-	// looks identical either way, so say so explicitly — and say which package,
-	// since a renewal loop is a property of a coordinate, not of a digest.
-	//
-	// The traits version separates the two. A different one means the analyzer
-	// moved and the re-analysis learned something. The same one means it could
-	// not have: that is a guard that failed upstream, so it is a WARN and reaches
-	// the console log, while an ordinary refresh stays at INFO in the file.
-	if stats.Renewed() {
-		args := []any{
-			"sha256", req.SHA256, "purl_base", stats.PURLBase, "worker", req.Worker,
-			"previous_analysis_age", time.Since(stats.PriorAnalyzedAt).Round(time.Second).String(),
-			"traits_version", tv, "previous_traits_version", stats.PriorTraitsVersion,
-		}
-		if stats.Redundant(tv) {
-			//nolint:gosec // G706: sha256 validated by validSHA256, worker by validWorkerName; the rest are our own columns
-			slog.Warn("result renewed with no analyzer change; the re-analysis learned nothing", args...)
-		} else {
-			//nolint:gosec // G706: same provenance as the WARN above
-			slog.Info("result renewed under a new analyzer", args...)
-		}
-	}
+	logResultRenewal(&req, &stats, tv)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true}) //nolint:errcheck,errchkjson // best-effort response
+}
+
+// logResultRenewal says so when a store re-analyzed a sample, and does nothing
+// otherwise.
+//
+// A sample analyzed once should not be analyzed again soon: the rescan tiers are
+// deliberate and rare, and a producer re-posting a verdict hopper already holds
+// is pure write cost. Neither is visible in "result stored", which looks
+// identical either way, so say so explicitly — and say which package, since a
+// renewal loop is a property of a coordinate, not of a digest.
+//
+// The traits version separates the two. A different one means the analyzer moved
+// and the re-analysis learned something. The same one means it could not have:
+// that is a guard that failed upstream, so it is a WARN and reaches the console
+// log, while an ordinary refresh stays at INFO in the file.
+func logResultRenewal(req *resultRequest, stats *hopper.StoreStats, tv string) {
+	if !stats.Renewed() {
+		return
+	}
+	args := []any{
+		"sha256", req.SHA256, "purl_base", stats.PURLBase, "worker", req.Worker,
+		"previous_analysis_age", time.Since(stats.PriorAnalyzedAt).Round(time.Second).String(),
+		"traits_version", tv, "previous_traits_version", stats.PriorTraitsVersion,
+	}
+	if stats.Redundant(tv) {
+		//nolint:gosec // G706: sha256 validated by validSHA256, worker by validWorkerName; the rest are our own columns
+		slog.Warn("result renewed with no analyzer change; the re-analysis learned nothing", args...)
+		return
+	}
+	//nolint:gosec // G706: same provenance as the WARN above
+	slog.Info("result renewed under a new analyzer", args...)
+}
+
+// Claim tier names, used as the "tier" label on the hand-out age histogram and
+// nowhere else. They are a closed set of string literals so the label stays
+// low-cardinality, and they name the tier rather than its number because the
+// numbering ("1s", "1b") reads as an ordering the code no longer strictly has.
+const (
+	tierUpload       = "upload"
+	tierForcedRescan = "forced_rescan"
+	tierSighted      = "sighted"
+	tierBigArchive   = "big_archive"
+	tierUnanalyzed   = "unanalyzed"
+	tierRepair       = "repair"
+	tierPathRescan   = "path_rescan"
+	tierStaleTraits  = "stale_traits"
+)
+
+// stampTier labels each claimed job with the tier it came from. The tier is
+// known only here — the DB layer returns an undifferentiated []ClaimJob and the
+// handler that eventually records the metric has lost the distinction — so it
+// rides along on the job itself. Returns jobs so it composes inside the
+// append(out, ...) the tiers already use.
+func stampTier(jobs []hopper.ClaimJob, tier string) []hopper.ClaimJob {
+	for i := range jobs {
+		jobs[i].Tier = tier
+	}
+	return jobs
 }
 
 // claimJobs walks the priority tiers (interactive uploads → forced rescans →
@@ -2047,7 +2096,7 @@ func (s *apiServer) claimJobs(
 		return nil, err
 	}
 	cands = filterCandidates(cands, tools, maxBytes, slots)
-	out := s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)
+	out := stampTier(s.tracker.tryClaimBatch(cands, worker, claimExpiry, want), tierUpload)
 	if len(out) >= count {
 		return out, nil
 	}
@@ -2062,7 +2111,7 @@ func (s *apiServer) claimJobs(
 		return out, err
 	}
 	cands = filterCandidates(cands, tools, maxBytes, slots)
-	out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
+	out = append(out, stampTier(s.tracker.tryClaimBatch(cands, worker, claimExpiry, want), tierForcedRescan)...)
 	if len(out) >= count {
 		return out, nil
 	}
@@ -2083,7 +2132,7 @@ func (s *apiServer) claimJobs(
 		return out, err
 	}
 	cands = filterCandidates(cands, tools, maxBytes, slots)
-	out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
+	out = append(out, stampTier(s.tracker.tryClaimBatch(cands, worker, claimExpiry, want), tierSighted)...)
 	if len(out) >= count {
 		return out, nil
 	}
@@ -2101,7 +2150,7 @@ func (s *apiServer) claimJobs(
 			return out, err
 		}
 		cands = filterCandidates(cands, tools, maxBytes, slots)
-		out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
+		out = append(out, stampTier(s.tracker.tryClaimBatch(cands, worker, claimExpiry, want), tierBigArchive)...)
 		if len(out) >= count {
 			return out, nil
 		}
@@ -2117,7 +2166,7 @@ func (s *apiServer) claimJobs(
 		return out, err
 	}
 	cands = interleaveBySizeClass(filterCandidates(cands, tools, maxBytes, slots))
-	out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
+	out = append(out, stampTier(s.tracker.tryClaimBatch(cands, worker, claimExpiry, want), tierUnanalyzed)...)
 	if len(out) >= count {
 		return out, nil
 	}
@@ -2133,7 +2182,7 @@ func (s *apiServer) claimJobs(
 		return out, err
 	}
 	cands = filterCandidates(cands, tools, maxBytes, slots)
-	out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
+	out = append(out, stampTier(s.tracker.tryClaimBatch(cands, worker, claimExpiry, want), tierRepair)...)
 	if len(out) >= count {
 		return out, nil
 	}
@@ -2145,7 +2194,7 @@ func (s *apiServer) claimJobs(
 			return out, err
 		}
 		cands = filterCandidates(cands, tools, maxBytes, slots)
-		out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
+		out = append(out, stampTier(s.tracker.tryClaimBatch(cands, worker, claimExpiry, want), tierPathRescan)...)
 		if len(out) >= count {
 			return out, nil
 		}
@@ -2158,7 +2207,7 @@ func (s *apiServer) claimJobs(
 			return out, err
 		}
 		cands = filterCandidates(cands, tools, maxBytes, slots)
-		out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
+		out = append(out, stampTier(s.tracker.tryClaimBatch(cands, worker, claimExpiry, want), tierStaleTraits)...)
 	}
 	return out, nil
 }

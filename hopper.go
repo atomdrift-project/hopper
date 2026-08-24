@@ -3237,7 +3237,19 @@ type StoreStats struct {
 	//
 	// Zero values mean a first analysis: PriorAnalyzedAt is the zero time and
 	// PriorTraitsVersion is empty, so Renewed() is false.
-	PriorAnalyzedAt    time.Time
+	PriorAnalyzedAt time.Time
+
+	// CreatedAt is samples.created_at, read from the same row the store already
+	// reads for the members' inherited identity — so the end-to-end age of what
+	// we just committed costs no extra query. Paired with ClaimJob.CreatedAt on
+	// the hand-out side: hand-out age is how long work waited to be dispatched,
+	// commit age is that plus the time the worker spent on it, and the gap
+	// between the two panels is the fleet's own contribution to queue lag.
+	//
+	// Adjacent to PriorAnalyzedAt so the pointer-bearing prefix stays short
+	// (fieldalignment), not because the two are related.
+	CreatedAt time.Time
+
 	PriorTraitsVersion string
 	// PURLBase identifies the package in that log line, so a renewal loop can be
 	// attributed to a package rather than to a bare digest. Empty for a sample
@@ -3667,10 +3679,37 @@ func samplePathRoot(path string) string {
 
 // ClaimJob is a work item returned to a litmus worker.
 type ClaimJob struct {
-	SHA256    string `json:"sha256"`
-	Path      string `json:"path"`
-	FileType  string `json:"file_type"`
-	SizeBytes int64  `json:"size_bytes"`
+	// CreatedAt is samples.created_at: when hopper's row for this sample was
+	// inserted, i.e. when the work entered the queue. Selected by every tier
+	// query so the hand-out age metric can say how deep in the backlog a claim
+	// came from — the difference between "we are current" and "we are handing
+	// out week-old work" is invisible in queue depth alone, because depth and
+	// throughput can both hold steady while age climbs.
+	//
+	// Not created_at's cousin fetched_at: that is when the collector fetched
+	// the artifact, which for a hopper-load backfill walk predates the row by
+	// however long the corpus sat on disk. Queue lag is measured from the
+	// moment hopper knew about the sample, which is created_at.
+	//
+	// Server-side only — workers have no use for it, and putting it on the wire
+	// would be a compatibility surface for nothing. First in the struct only to
+	// keep the pointer-bearing prefix short (fieldalignment).
+	CreatedAt time.Time `json:"-"`
+
+	SHA256   string `json:"sha256"`
+	Path     string `json:"path"`
+	FileType string `json:"file_type"`
+
+	// Tier names the claim tier this job was drawn from ("unanalyzed",
+	// "stale_traits", …). Stamped by the API server's claimJobs, not by the
+	// tier queries, and carried here only so the hand-out age histogram can
+	// separate backlog from deliberate rescans: a stale-traits job is by
+	// definition an old row, and averaged in with fresh work it would make the
+	// backlog look permanently months behind.
+	Tier string `json:"-"`
+
+	SizeBytes int64 `json:"size_bytes"`
+
 	// HasProvenance reports whether hopper holds a provenance sidecar for this
 	// sample, so the worker fetches /api/provenance/{sha256} for its registry
 	// record only when there is one — avoiding a wasted round-trip on the

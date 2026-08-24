@@ -211,3 +211,91 @@ func TestRetryDBAccessRecordsRetries(t *testing.T) {
 		}
 	}
 }
+
+// TestSampleAgeHistograms pins the exported names, unit suffix, and label keys
+// of the two queue-lag histograms. The Grafana panels and any alert on them
+// read `hopper_claim_sample_age_seconds_{sum,count,bucket}` and
+// `hopper_commit_sample_age_seconds_*` by hand, so an instrument rename here is
+// a silently blank panel there — which is precisely the failure mode these
+// metrics exist to prevent.
+//
+// It also asserts that a zero createdAt records nothing. A row with no
+// creation timestamp would otherwise report an age measured from the Go zero
+// time, and a single such observation drags the average past any threshold
+// anyone would set on it.
+//
+// Binds to an isolated meter through newSampleAgeHistogram for the reason
+// TestRetryDBAccessRecordsRetries documents.
+func TestSampleAgeHistograms(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	exporter, err := otelprom.New(otelprom.WithRegisterer(reg))
+	if err != nil {
+		t.Fatalf("prometheus exporter: %v", err)
+	}
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(exporter))
+	t.Cleanup(func() {
+		if err := provider.Shutdown(context.Background()); err != nil {
+			t.Logf("meter provider shutdown: %v", err)
+		}
+	})
+
+	meter := provider.Meter(meterName)
+	claimAgeOnce.Do(func() {})
+	claimAgeHist = newSampleAgeHistogram(meter, claimAgeName, claimAgeDesc)
+	commitAgeOnce.Do(func() {})
+	commitAgeHist = newSampleAgeHistogram(meter, commitAgeName, commitAgeDesc)
+	t.Cleanup(func() { claimAgeHist, commitAgeHist = nil, nil })
+
+	ctx := context.Background()
+	now := time.Now()
+	// A day-old sample handed out from the main backlog, and a month-old one
+	// from the stale-traits tier: the two the tier label must keep apart.
+	recordClaimAge(ctx, tierUnanalyzed, now.Add(-24*time.Hour), now)
+	recordClaimAge(ctx, tierStaleTraits, now.Add(-30*24*time.Hour), now)
+	recordClaimAge(ctx, tierUnanalyzed, time.Time{}, now) // no created_at: skipped
+	recordCommitAge(ctx, false, now.Add(-25*time.Hour), now)
+	recordCommitAge(ctx, true, now.Add(-90*24*time.Hour), now)
+	recordCommitAge(ctx, false, time.Time{}, now) // no created_at: skipped
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", http.NoBody)
+	rec := httptest.NewRecorder()
+	promhttp.HandlerFor(reg, promhttp.HandlerOpts{}).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scrape status = %d", rec.Code)
+	}
+	body := rec.Body.String()
+
+	for _, want := range []string{
+		`hopper_claim_sample_age_seconds_count{`,
+		`tier="unanalyzed"`,
+		`tier="stale_traits"`,
+		"hopper_claim_sample_age_seconds_sum{",
+		"hopper_claim_sample_age_seconds_bucket{",
+		`hopper_commit_sample_age_seconds_count{kind="first"`,
+		`hopper_commit_sample_age_seconds_count{kind="renewal"`,
+		"hopper_commit_sample_age_seconds_sum{",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("scrape missing %q\n---\n%s", want, metricLines(body, "hopper_c"))
+		}
+	}
+
+	// The skipped zero-time observations must not appear in the counts: one
+	// observation per labelled series, no more.
+	for _, ln := range []string{
+		`hopper_claim_sample_age_seconds_count{otel_scope_name="` + meterName + `",otel_scope_schema_url="",otel_scope_version="",tier="unanalyzed"} 1`,
+		`hopper_commit_sample_age_seconds_count{kind="first",otel_scope_name="` + meterName + `",otel_scope_schema_url="",otel_scope_version=""} 1`,
+	} {
+		if !strings.Contains(body, ln) {
+			t.Errorf("want exactly one observation, missing %q\n---\n%s", ln, metricLines(body, "hopper_c"))
+		}
+	}
+
+	// The day-old claim must land below the 3-day boundary and above the 12-hour
+	// one — proof the ladder is in seconds and spans the range a real backlog
+	// occupies, not the sub-second ladder a latency histogram would use.
+	if !strings.Contains(body, `le="43200"`) || !strings.Contains(body, `le="259200"`) {
+		t.Errorf("sample-age buckets are not the week-scale ladder\n---\n%s",
+			metricLines(body, "hopper_claim_sample_age_seconds_bucket"))
+	}
+}

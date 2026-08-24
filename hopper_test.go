@@ -6852,3 +6852,49 @@ func TestMaxMemberLitmusClass(t *testing.T) {
 		t.Errorf("nil envelope = %d, want 0", got)
 	}
 }
+
+// TestCandidateQueriesCarryCreatedAt verifies that every claim tier selects
+// samples.created_at into ClaimJob.CreatedAt. That field is the entire basis of
+// the hand-out age metric, and a tier that forgets it does not fail — it
+// silently contributes nothing, so the queue-lag panel under-reports by exactly
+// the tiers that dropped it, which is the failure this pins down.
+//
+// Runs against the SQLite backend, where created_at is a DATETIME string that
+// has to survive sqliteNullTime's layout list; the PG path scans a native
+// timestamptz and cannot fail this way.
+func TestCandidateQueriesCarryCreatedAt(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mustInsert(t, ctx, db, &Sample{SHA256: "agefresh", Path: "/data/fresh.exe", Label: "bad"})
+	mustInsert(t, ctx, db, &Sample{SHA256: "ageupload", Path: "/data/up.exe", Label: "bad", Source: "upload"})
+	if _, err := db.QueueRescan(ctx, []string{"agefresh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	before := time.Now().Add(-time.Minute)
+	tiers := map[string]func() ([]ClaimJob, error){
+		"unanalyzed": func() ([]ClaimJob, error) { return db.UnanalyzedCandidates(ctx, time.Now(), 10) },
+		"upload":     func() ([]ClaimJob, error) { return db.UploadCandidates(ctx, 10) },
+		"repair":     func() ([]ClaimJob, error) { return db.RepairCandidates(ctx, 10) },
+	}
+	for name, fn := range tiers {
+		jobs, err := fn()
+		if err != nil {
+			t.Fatalf("%s candidates: %v", name, err)
+		}
+		if len(jobs) == 0 {
+			t.Fatalf("%s candidates returned nothing; the fixture no longer exercises this tier", name)
+		}
+		for _, j := range jobs {
+			if j.CreatedAt.IsZero() {
+				t.Errorf("%s tier: %s has zero CreatedAt; the tier query dropped created_at", name, j.SHA256)
+				continue
+			}
+			if j.CreatedAt.Before(before) {
+				t.Errorf("%s tier: %s CreatedAt = %v, want a just-inserted timestamp after %v",
+					name, j.SHA256, j.CreatedAt, before)
+			}
+		}
+	}
+}

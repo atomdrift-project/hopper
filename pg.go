@@ -3073,13 +3073,14 @@ func (db *DB) storeResultPG(
 	var firstAnalyzed sql.NullTime
 	var priorAnalyzed sql.NullTime
 	var priorTraits, purlBase string
+	var createdAt time.Time
 	if err := db.pool.QueryRow(ctx,
 		`SELECT label, label_source, source, feed, ecosystem, path, first_analyzed_at,
-		        analyzed_at, traits_version, purl_base
+		        analyzed_at, traits_version, purl_base, created_at
 		   FROM samples WHERE sha256 = $1`, sha256).
 		Scan(&parent.Label, &parent.LabelSource, &parent.Source, &parent.Feed,
 			&parent.Ecosystem, &parent.Path, &firstAnalyzed,
-			&priorAnalyzed, &priorTraits, &purlBase); err != nil {
+			&priorAnalyzed, &priorTraits, &purlBase, &createdAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return StoreStats{}, fmt.Errorf("hopper: store result for absent sample %s: %w", sha256, ErrNotFound)
 		}
@@ -3095,6 +3096,7 @@ func (db *DB) storeResultPG(
 	}
 	stats.PriorTraitsVersion = priorTraits
 	stats.PURLBase = purlBase
+	stats.CreatedAt = createdAt
 
 	// Build members from the FULL envelope, inheriting the parent's identity and
 	// stamped with this analysis time so the freshness gate orders refreshes.
@@ -7335,7 +7337,7 @@ func scanPGCounts(rows pgx.Rows) (map[string]int, error) {
 // whole pending set is small and cheap to order by size.
 func (db *DB) bigArchiveCandidatesPG(ctx context.Context, minBytes int64, hopperStart time.Time, limit int) ([]ClaimJob, error) {
 	rows, err := db.pool.Query(ctx, `
-		SELECT sha256, path, size_bytes, file_type
+		SELECT sha256, path, size_bytes, file_type, created_at
 		FROM samples
 		WHERE size_bytes > $1
 		  AND cleave_result IS NULL AND skip = '' AND parent = ''
@@ -7375,7 +7377,7 @@ func (db *DB) bigArchiveCandidatesPG(ctx context.Context, minBytes int64, hopper
 // Hoisted into a constant so plan_audit_test.go EXPLAINs the statement that
 // actually runs rather than a paraphrase of it.
 const sightedCandidatesSQL = `
-	SELECT sha256, path, size_bytes, file_type FROM samples
+	SELECT sha256, path, size_bytes, file_type, created_at FROM samples
 	WHERE corroborated
 	  AND cleave_result IS NULL AND skip = '' AND parent = ''
 	  AND (note = '' OR last_error_at IS NULL OR last_error_at < $1)
@@ -7395,7 +7397,7 @@ func (db *DB) unanalyzedCandidatesPG(ctx context.Context, hopperStart time.Time,
 	pivot := randomSHA256Pivot()
 	rows, err := db.pool.Query(ctx, `
 		WITH picked AS (
-			SELECT sha256, path, size_bytes, file_type, 0 AS pass
+			SELECT sha256, path, size_bytes, file_type, created_at, 0 AS pass
 			FROM samples
 			WHERE sha256 >= $2
 			  AND cleave_result IS NULL AND skip = '' AND parent = ''
@@ -7405,7 +7407,7 @@ func (db *DB) unanalyzedCandidatesPG(ctx context.Context, hopperStart time.Time,
 			LIMIT $3
 		),
 		wrapped AS (
-			SELECT sha256, path, size_bytes, file_type, 1 AS pass
+			SELECT sha256, path, size_bytes, file_type, created_at, 1 AS pass
 			FROM samples
 			WHERE sha256 < $2
 			  AND cleave_result IS NULL AND skip = '' AND parent = ''
@@ -7414,11 +7416,11 @@ func (db *DB) unanalyzedCandidatesPG(ctx context.Context, hopperStart time.Time,
 			ORDER BY sha256
 			LIMIT $3
 		)
-		SELECT sha256, path, size_bytes, file_type
+		SELECT sha256, path, size_bytes, file_type, created_at
 		FROM (
-			SELECT sha256, path, size_bytes, file_type, pass FROM picked
+			SELECT sha256, path, size_bytes, file_type, created_at, pass FROM picked
 			UNION ALL
-			SELECT sha256, path, size_bytes, file_type, pass FROM wrapped
+			SELECT sha256, path, size_bytes, file_type, created_at, pass FROM wrapped
 		) q
 		ORDER BY pass, sha256
 		LIMIT $3`,
@@ -7450,7 +7452,7 @@ func (db *DB) unanalyzedCandidatesPG(ctx context.Context, hopperStart time.Time,
 // drops it from this tier for good.
 func (db *DB) forcedRescanCandidatesPG(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
 	rows, err := db.pool.Query(ctx, `
-		SELECT sha256, path, size_bytes, file_type FROM samples
+		SELECT sha256, path, size_bytes, file_type, created_at FROM samples
 		WHERE rescan_priority = 2
 		  AND skip = '' AND parent = ''
 		  AND (note = '' OR last_error_at IS NULL OR last_error_at < $1)
@@ -7467,7 +7469,7 @@ func (db *DB) forcedRescanCandidatesPG(ctx context.Context, hopperStart time.Tim
 // partial index — cheap regardless of backlog size.
 func (db *DB) repairCandidatesPG(ctx context.Context, limit int) ([]ClaimJob, error) {
 	rows, err := db.pool.Query(ctx, `
-		SELECT sha256, path, size_bytes, file_type FROM samples
+		SELECT sha256, path, size_bytes, file_type, created_at FROM samples
 		WHERE rescan_priority = 1 AND skip = '' AND parent = ''
 		ORDER BY rescan_requested_at ASC, score DESC
 		LIMIT $1`, limit)
@@ -7527,7 +7529,7 @@ func (db *DB) sampleAnalyzedPG(ctx context.Context, sha256 string) (exists, anal
 // claimJobs so prism users see results as soon as a worker is free.
 func (db *DB) uploadCandidatesPG(ctx context.Context, limit int) ([]ClaimJob, error) {
 	rows, err := db.pool.Query(ctx, `
-		SELECT sha256, path, size_bytes, file_type FROM samples
+		SELECT sha256, path, size_bytes, file_type, created_at FROM samples
 		WHERE source = 'upload' AND cleave_result IS NULL
 		  AND skip = '' AND parent = ''
 		ORDER BY id ASC
@@ -7545,7 +7547,7 @@ func (db *DB) forceRescanCandidatesPG(ctx context.Context, hopperStart time.Time
 		return nil, nil
 	}
 	rows, err := db.pool.Query(ctx, `
-		SELECT sha256, path, size_bytes, file_type FROM samples
+		SELECT sha256, path, size_bytes, file_type, created_at FROM samples
 		WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''
 		  AND analyzed_at < $1
 		  AND (path = ANY($2) OR path LIKE ANY($2))
@@ -7566,7 +7568,7 @@ func (db *DB) forceRescanCandidatesPG(ctx context.Context, hopperStart time.Time
 // plan_audit_test.go can assert that, on real statistics, the plan carries no
 // Sort node at all.
 const staleTraitsCandidatesSQL = `
-	SELECT sha256, path, size_bytes, file_type FROM samples
+	SELECT sha256, path, size_bytes, file_type, created_at FROM samples
 	WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''
 	  AND traits_version != $1
 	  AND (corroborated OR analyzed_at < $2)
@@ -7654,7 +7656,7 @@ func scanClaimRows(rows pgx.Rows) ([]ClaimJob, error) {
 	var jobs []ClaimJob
 	for rows.Next() {
 		var j ClaimJob
-		if err := rows.Scan(&j.SHA256, &j.Path, &j.SizeBytes, &j.FileType); err != nil {
+		if err := rows.Scan(&j.SHA256, &j.Path, &j.SizeBytes, &j.FileType, &j.CreatedAt); err != nil {
 			return nil, fmt.Errorf("hopper: candidate scan: %w", err)
 		}
 		jobs = append(jobs, j)
