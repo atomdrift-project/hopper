@@ -4707,8 +4707,13 @@ func (db *DB) feedEcosystemsSQLite(ctx context.Context, source, label string, si
 	if !since.IsZero() {
 		cutoff = since.UTC().Format(time.RFC3339Nano)
 	}
+	// Same feed-population predicates as feedEcosystemsPG — kept in step so the
+	// two backends answer identically, not for a plan (SQLite has no partial
+	// index here to match). See that function for why they belong in a dropdown
+	// query at all.
 	query := `SELECT DISTINCT ecosystem FROM samples
 		WHERE (? = '' OR source = ?) AND (? = '' OR label = ?) AND ecosystem != ''
+		AND parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL
 		AND (? = '' OR created_at >= ?)
 		ORDER BY ecosystem`
 	rows, err := db.lite.QueryContext(ctx, query, source, source, label, label, cutoff, cutoff)

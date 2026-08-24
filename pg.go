@@ -325,6 +325,32 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			`ON samples(ecosystem, litmus_class, created_at DESC) ` +
 			`WHERE parent = '' AND cleave_result IS NOT NULL ` +
 			`AND litmus_result IS NOT NULL AND ecosystem <> ''`,
+		// The same class-ordered seek for a criticality filter with NO ecosystem
+		// bound — prism's "benign"/"suspicious"/"hostile" dropdown on the
+		// unfiltered feed. Deliberately does NOT carry litmus_result IS NOT NULL,
+		// which is what separates it from idx_samples_top_ready_created: the
+		// derive trigger maps a NULL litmus_result to class 0, so roughly half of
+		// the benign band ARE null-litmus rows (measured 2026-08-24: 4228 of 9005
+		// sampled class-0 rows). feedClassExpr therefore cannot borrow the
+		// litmus-bearing indexes for class 0, and FeedQuery.requireLitmus
+		// correctly declines to add the predicate when the class set contains 0 —
+		// adding it would silently drop half the view.
+		//
+		// Without this index that query has no ordered path at all: the planner
+		// falls to a full scan of idx_samples_filename_trgm (its partial predicate
+		// happens to match the top-level feed exactly, so it serves as a cheap
+		// full-table enumerator), a Bitmap Heap Scan, and a Sort of ~4.19M rows to
+		// return 100 — cost 78.3M, measured on the replica 2026-08-24. It is also
+		// on a timer: {criticality: "benign"} is in prism's feedPrecacheVariants,
+		// so the static pre-cache tier reruns it every 15 minutes whether or not
+		// anyone opens the page. The other bands (1, 2) are unaffected because
+		// they exclude 0 and so do get litmus_result IS NOT NULL.
+		//
+		// No id tiebreak: the feed's ORDER BY is created_at DESC alone, so the
+		// two-column form is what the planner matches for an ordered walk.
+		`CREATE INDEX IF NOT EXISTS idx_samples_class_top_created ` +
+			`ON samples(litmus_class, created_at DESC) ` +
+			`WHERE parent = '' AND cleave_result IS NOT NULL`,
 		// Per-route triage windows (TriageHighest/TriageLowest, 2026-08-03
 		// redesign): each file_type's top/bottom-K by litmus_score. The
 		// leading file_type key lets the per-route LATERAL walk each route's
@@ -6803,7 +6829,7 @@ func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error
 			AND cleave_result IS NOT NULL
 			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
 			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
-			AND (coalesce(cardinality($5::int[]), 0) = 0 OR `+q.feedClassExpr()+` = ANY($5))
+			AND `+q.feedClassFilter(`$5`)+`
 			AND (NOT $6 OR (`+uncontainedSQL+`))
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
@@ -6856,7 +6882,7 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q *FeedQuery) (int, error)
 			AND cleave_result IS NOT NULL
 			AND (coalesce(cardinality($3::text[]), 0) = 0 OR feed = ANY($3))
 			AND (coalesce(cardinality($4::text[]), 0) = 0 OR ecosystem = ANY($4))
-			AND (coalesce(cardinality($5::int[]), 0) = 0 OR `+q.feedClassExpr()+` = ANY($5))
+			AND `+q.feedClassFilter(`$5`)+`
 			AND (NOT $6 OR (`+uncontainedCountSQL+`))
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
@@ -6898,9 +6924,37 @@ func (db *DB) feedEcosystemsPG(ctx context.Context, source, label string, since 
 		u := since.UTC()
 		sincePtr = &u
 	}
+	// parent/cleave_result/litmus_result are not filters the caller asked for —
+	// they are what makes this query use idx_samples_eco_top_created instead of
+	// reading the table. Its partial predicate is exactly these three plus
+	// ecosystem <> '', and a partial index is only usable when the query implies
+	// its predicate, so all of them have to be here or none of them help.
+	//
+	// Measured on the replica 2026-08-24, with prism's real 72h window: without
+	// them this is a Parallel Seq Scan costing 27,913,645 that ran 54 SECONDS per
+	// call and read 1.46 BILLION blocks (~11 TB) across 79 calls — by a wide
+	// margin the single largest source of physical reads on the box, and the
+	// bulkread traffic that was starving the logical apply worker. With them it
+	// is an Index Only Scan costing 5,711 that returns in well under a second.
+	//
+	// It is also the more correct answer. This list populates the feed's
+	// ecosystem dropdown, and every feed query carries parent = '' and
+	// cleave_result IS NOT NULL; an ecosystem outside that population renders an
+	// empty page when picked. The window narrowed from 72 entries to 45 —
+	// the 27 removed were exactly those dead-end choices.
+	//
+	// litmus_result is the one predicate that is not a strict feed invariant:
+	// FeedQuery.requireLitmus declines it when the criticality set contains 0
+	// (benign), because the derive trigger maps a null litmus_result to class 0.
+	// Checked rather than assumed — the ecosystem sets with and without that
+	// predicate were both 45, difference empty — so it costs nothing today. The
+	// residual exposure is an ecosystem whose only feed-eligible rows have not
+	// been analyzed yet, which is absent from the dropdown until the first
+	// litmus result lands and then heals itself.
 	rows, err := db.pool.Query(ctx, `
 		SELECT DISTINCT ecosystem FROM samples
 		WHERE ($1 = '' OR source = $1) AND ($2 = '' OR label = $2) AND ecosystem != ''
+		  AND parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL
 		  AND ($3::timestamptz IS NULL OR created_at >= $3)
 		ORDER BY ecosystem`, source, label, sincePtr)
 	if err != nil {

@@ -95,8 +95,10 @@ idx_reports_sha256_type_created
 idx_samples_bad_miss_newest
 idx_samples_bad_miss_stale
 idx_samples_bad_route_score
+idx_samples_class_top_created
 idx_samples_corroborated_created
 idx_samples_domain
+idx_samples_eco_class_created
 idx_samples_eco_top_created
 idx_samples_ecosystem
 idx_samples_feed
@@ -146,7 +148,6 @@ idx_samples_claimable
 idx_samples_claimable_sha
 idx_samples_claimed
 idx_samples_created_at
-idx_samples_eco_class_created
 idx_samples_feed_source
 idx_samples_feed_source_mtime
 idx_samples_file_type

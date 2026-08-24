@@ -3475,6 +3475,14 @@ func TestFeedSamples(t *testing.T) {
 	if err := db.UpdateCleaveResult(ctx, "s2", resultFor("s2"), nil, ""); err != nil {
 		t.Fatal(err)
 	}
+	// FeedEcosystems is scoped to the feed's own population, which includes
+	// litmus_result IS NOT NULL (see feedEcosystemsPG for why the dropdown
+	// carries the feed's predicates). Analyze both so they are feed-eligible.
+	for _, sha := range []string{"s1", "s2"} {
+		if err := db.UpdateLitmusResult(ctx, sha, []byte(`{"prob":0.1,"lvl":9000}`)); err != nil {
+			t.Fatalf("UpdateLitmusResult(%s): %v", sha, err)
+		}
+	}
 
 	q := FeedQuery{Source: "test", Limit: 10}
 	samples, err := db.FeedSamples(ctx, &q)
@@ -4159,6 +4167,51 @@ func TestFeedQueryClassExpr(t *testing.T) {
 	// read benign, so the derived expr must inline the ceiling too.
 	if !strings.Contains(got, fmt.Sprintf("<= %d THEN 1", SuspiciousCeiling)) {
 		t.Errorf("non-default cutoff expr missing the L%d suspicious ceiling: %q", SuspiciousCeiling, got)
+	}
+}
+
+func TestFeedQueryClassFilter(t *testing.T) {
+	// No class filter: the array form, and the parameter stays referenced by the
+	// cardinality guard so it can never dangle untyped (42P18).
+	got := (&FeedQuery{}).feedClassFilter("$5")
+	if !strings.Contains(got, "= ANY($5)") {
+		t.Errorf("no classes: want the ANY form, got %q", got)
+	}
+	if !strings.Contains(got, "cardinality($5::int[])") {
+		t.Errorf("no classes: parameter must stay referenced, got %q", got)
+	}
+
+	// Exactly one class — every criticality prism's dropdown offers — must emit
+	// scalar equality against an inlined literal. The ANY form cannot be walked
+	// in index order, so it forces a sort of the whole class band to return one
+	// page. Not a cosmetic difference: cost 13,188,888 vs 323 on the replica.
+	for _, class := range []int{0, 1, 2} {
+		got := (&FeedQuery{LitmusClasses: []int{class}}).feedClassFilter("$5")
+		if strings.Contains(got, "ANY") {
+			t.Errorf("class %d: single class must not use ANY, got %q", class, got)
+		}
+		if !strings.Contains(got, fmt.Sprintf("litmus_class = %d", class)) {
+			t.Errorf("class %d: want inlined scalar equality, got %q", class, got)
+		}
+		if !strings.Contains(got, "cardinality($5::int[])") {
+			t.Errorf("class %d: parameter must stay referenced, got %q", class, got)
+		}
+	}
+
+	// Several classes (the parseCritExpr ranges) genuinely need the array form.
+	got = (&FeedQuery{LitmusClasses: []int{1, 2}}).feedClassFilter("$5")
+	if !strings.Contains(got, "= ANY($5)") {
+		t.Errorf("multi-class: want the ANY form, got %q", got)
+	}
+
+	// A non-default cutoff re-derives the class inline; the scalar fast path must
+	// compare against that derivation, not against the litmus_class column.
+	got = (&FeedQuery{CriticalLevel: 3, LitmusClasses: []int{2}}).feedClassFilter("$5")
+	if strings.Contains(got, "ANY") {
+		t.Errorf("non-default cutoff, single class: want scalar form, got %q", got)
+	}
+	if !strings.Contains(got, "litmus_result->>'class'") || !strings.HasSuffix(got, "= 2)") {
+		t.Errorf("non-default cutoff must compare the derived expr to the literal: %q", got)
 	}
 }
 
