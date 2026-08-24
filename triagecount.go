@@ -49,8 +49,16 @@ const (
 		triageServablePathSQL + `
 		   AND (max_crit >= 5 OR suspicious_count >= 2)`
 
-	triageSightedWhere = `label = 'sighted' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''` +
-		triageServablePathSQL
+	// The sighted queue is derived from the sightings ledger, not from the
+	// legacy sighted label. A package claim applies either to the exact stored
+	// version named by affected, or to every version when affected is empty.
+	// Digest claims name bytes and therefore need no version arm. Malicious and
+	// suspicious claims both need adjudication; vulnerability records describe a
+	// legitimate package's security defect and do not belong in a malware queue.
+	triageSightedWhere = `label != 'bad' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''` +
+		triageServablePathSQL + `
+		   AND NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'sighted')`
 
 	triageNewWherePG = `label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''` +
 		triageServablePathSQL + `
@@ -60,6 +68,30 @@ const (
 		triageServablePathSQL + `
 		   AND suspicious_count >= 1 AND path NOT GLOB 'review/*'`
 )
+
+// triageSightedMatchCTE deliberately starts from the comparatively small
+// malware-relevant ledger slice and joins it into the indexed sample identities.
+// Starting at samples would make every sighted poll probe the ledger once for
+// each row in the full non-bad corpus. The UNION ALL keeps the digest and
+// package index lookups independent; latest_sightings then collapses multiple
+// sources and a possible digest+PURL double match to one candidate and its
+// newest evidence.
+const triageSightedMatchCTE = `WITH review_sightings AS (
+		SELECT subject, affected, first_seen FROM sightings
+		 WHERE claim IN ('malicious', 'suspicious')
+	), matching_sightings AS (
+		SELECT sm.sha256 AS matched_sha, s.first_seen AS sighted_at
+		  FROM review_sightings s JOIN samples sm ON sm.sha256 = s.subject
+		UNION ALL
+		SELECT sm.sha256 AS matched_sha, s.first_seen AS sighted_at
+		  FROM review_sightings s JOIN samples sm ON sm.purl_base = s.subject
+		 WHERE sm.purl_base != ''
+		   AND (s.affected = '' OR s.affected = sm.version)
+	), latest_sightings AS (
+		SELECT matched_sha, max(sighted_at) AS sighted_at
+		  FROM matching_sightings GROUP BY matched_sha
+	)
+`
 
 // triagePopularWhere is a var rather than a const because it embeds
 // suspiciousCrit, and spelling that bound as a SQL literal here would put the
@@ -89,7 +121,32 @@ func (db *DB) CountTriageNew(ctx context.Context, f TriageFilter) (int64, error)
 
 // CountTriageSighted reports TriageSighted's population, capped at [TriageDepthCap].
 func (db *DB) CountTriageSighted(ctx context.Context, f TriageFilter) (int64, error) {
-	return db.countTriage(ctx, "sighted", triageSightedWhere, triageSightedWhere, f)
+	var n int64
+	if db.pool != nil {
+		extra, args := triageFilterClausePG(f, 1, "samples")
+		args = append(args, TriageDepthCap)
+		q := triageSightedMatchCTE + `SELECT count(*) FROM (
+			SELECT 1 FROM samples
+			JOIN latest_sightings ON latest_sightings.matched_sha = samples.sha256
+			WHERE ` + triageSightedWhere + extra + `
+			LIMIT $` + strconv.Itoa(len(args)) + `) q`
+		if err := db.pool.QueryRow(ctx, q, args...).Scan(&n); err != nil {
+			return 0, fmt.Errorf("hopper: count triage sighted: %w", err)
+		}
+		return n, nil
+	}
+
+	extra, args := triageFilterClauseSQLite(f, "samples")
+	args = append(args, TriageDepthCap)
+	q := triageSightedMatchCTE + `SELECT count(*) FROM (
+		SELECT 1 FROM samples
+		JOIN latest_sightings ON latest_sightings.matched_sha = samples.sha256
+		WHERE ` + triageSightedWhere + extra + `
+		LIMIT ?) q`
+	if err := db.lite.QueryRowContext(ctx, q, args...).Scan(&n); err != nil {
+		return 0, fmt.Errorf("hopper: count triage sighted: %w", err)
+	}
+	return n, nil
 }
 
 // CountTriagePopular reports TriagePopular's population, capped at

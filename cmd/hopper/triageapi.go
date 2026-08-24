@@ -165,8 +165,9 @@ func (s *apiServer) triageQueue(w http.ResponseWriter, r *http.Request) (hopper.
 	return q, true
 }
 
-// handleTriageSelect returns claimed candidates from one queue.
-// GET /api/triage/{queue}?limit=N.
+// handleTriageSelect returns candidates from one queue.
+// GET /api/triage/{queue}?limit=N. By default the returned work is claimed;
+// preview=1 is a read-only snapshot for operator tooling and claims nothing.
 //
 // The samples are hopper.Sample values marshalled as-is. That makes the wire
 // format the struct's Go field names, which is safe precisely because this is an
@@ -196,10 +197,18 @@ func (s *apiServer) handleTriageSelect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	taken, withheld := s.triageClaims.claim(candidates, limit)
+	preview := r.URL.Query().Get("preview") == "1"
+	var taken []*hopper.Sample
+	withheld := 0
+	if preview {
+		taken = candidates[:min(limit, len(candidates))]
+	} else {
+		taken, withheld = s.triageClaims.claim(candidates, limit)
+	}
 	slog.InfoContext(r.Context(), "triage select",
 		"queue", q.Name, "limit", limit, "candidates", len(candidates),
-		"returned", len(taken), "withheld", withheld, "claims_held", s.triageClaims.held(),
+		"returned", len(taken), "withheld", withheld, "preview", preview,
+		"claims_held", s.triageClaims.held(),
 		"remote", r.RemoteAddr)
 
 	writeTriageJSON(w, map[string]any{
@@ -211,6 +220,7 @@ func (s *apiServer) handleTriageSelect(w http.ResponseWriter, r *http.Request) {
 		// the difference between "this queue is drained" and "this queue is
 		// busy", which is otherwise indistinguishable from an empty response.
 		"withheld": withheld,
+		"preview":  preview,
 	})
 }
 

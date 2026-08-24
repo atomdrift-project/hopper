@@ -2995,11 +2995,13 @@ func (db *DB) triageReviewSQLite(ctx context.Context, limit int, f TriageFilter)
 func (db *DB) triageSightedSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
 	extra, args := triageFilterClauseSQLite(f, "samples")
 	args = append(args, limit)
-	//nolint:gosec // G202: label predicate and column list are constant; filter values are parameterized via ? args
+
 	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleColsLight+` FROM samples
+		triageSightedMatchCTE+`SELECT `+liteSampleColsLight+` FROM samples
+		 JOIN latest_sightings ON latest_sightings.matched_sha = samples.sha256
 		 WHERE `+triageSightedWhere+extra+`
-		 ORDER BY created_at DESC, id DESC LIMIT ?`,
+		 ORDER BY latest_sightings.sighted_at DESC,
+		          samples.created_at DESC, samples.id DESC LIMIT ?`,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage sighted: %w", err)

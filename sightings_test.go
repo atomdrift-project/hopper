@@ -211,10 +211,11 @@ func TestAddSightingsNormalizesSubjects(t *testing.T) {
 	}
 }
 
-// TestAddSightingsDedupesBatch: a batch may repeat a (source, subject) pair —
-// two versions of one package share a purl_base, and normalization can
-// collapse distinct spellings onto one subject. The upsert must not be handed
-// the same row twice (Postgres rejects it, SQLSTATE 21000).
+// TestAddSightingsDedupesBatch: a batch may repeat a full
+// (source, subject, affected) key. Exact versioned PURLs are folded onto the
+// purl_base while preserving the version in affected, so they remain a separate
+// claim rather than broadening silently. The upsert must not be handed the same
+// full row twice (Postgres rejects it, SQLSTATE 21000).
 func TestAddSightingsDedupesBatch(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
@@ -222,7 +223,7 @@ func TestAddSightingsDedupesBatch(t *testing.T) {
 	n, err := db.AddSightings(ctx, []Sighting{
 		{Source: "aikido", Subject: "pkg:npm/evil-pkg", URL: "https://a/1"},
 		{Source: "aikido", Subject: "pkg:npm/evil-pkg", URL: "https://a/2"}, // same pair, other version's row
-		{Source: "aikido", Subject: "pkg:npm/evil-pkg@2.0"},                 // normalizes onto the same pair
+		{Source: "aikido", Subject: "pkg:npm/evil-pkg@2.0"},                 // same subject, exact 2.0 scope
 		{Source: "socket", Subject: "pkg:npm/evil-pkg"},                     // distinct source survives
 	})
 	if err != nil {
@@ -235,8 +236,15 @@ func TestAddSightingsDedupesBatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SightingsFor: %v", err)
 	}
-	if len(got["pkg:npm/evil-pkg"]) != 2 {
-		t.Errorf("expected 2 sightings (one per source), got %v", got)
+	if len(got["pkg:npm/evil-pkg"]) != 3 {
+		t.Errorf("expected 3 sightings (two scopes for aikido, one socket), got %v", got)
+	}
+	var foundExact bool
+	for _, sighting := range got["pkg:npm/evil-pkg"] {
+		foundExact = foundExact || (sighting.Source == "aikido" && sighting.Affected == "2.0")
+	}
+	if !foundExact {
+		t.Errorf("versioned PURL did not preserve exact scope: %v", got)
 	}
 }
 

@@ -20,7 +20,7 @@ func TestTriageDepthMatchesSelection(t *testing.T) {
 	// One sample per shape the countable selectors partition on, so every
 	// predicate has both members and non-members to discriminate.
 	var n int
-	add := func(label string, crit, suspicious int, path string) {
+	add := func(label string, crit, suspicious int, path string) string {
 		n++
 		sha := fmt.Sprintf("%063x1", n)
 		s := &Sample{
@@ -45,6 +45,7 @@ func TestTriageDepthMatchesSelection(t *testing.T) {
 		if err := db.UpdateCleaveResult(ctx, sha, result, nil, ""); err != nil {
 			t.Fatalf("UpdateCleaveResult: %v", err)
 		}
+		return sha
 	}
 
 	// Deliberately DISTINCT member counts per queue (bad 1, good 2, new 3,
@@ -66,10 +67,18 @@ func TestTriageDepthMatchesSelection(t *testing.T) {
 	add("unknown", 0, 0, "npm/quiet.tgz")   // silent      → excluded
 	add("unknown", 0, 1, "review/held.tgz") // review pool → excluded
 
-	add("sighted", 0, 0, "feed/a.bin") // sighted queue (4): no finding predicate
-	add("sighted", 1, 1, "feed/b.bin")
-	add("sighted", 0, 2, "feed/c.bin")
-	add("sighted", 0, 0, "feed/d.bin")
+	var sighted []Sighting
+	for _, sha := range []string{
+		add("sighted", 0, 0, "feed/a.bin"), // sighted queue (4): no finding predicate
+		add("sighted", 1, 1, "feed/b.bin"),
+		add("sighted", 0, 2, "feed/c.bin"),
+		add("sighted", 0, 0, "feed/d.bin"),
+	} {
+		sighted = append(sighted, Sighting{Source: "feed", Subject: sha})
+	}
+	if _, err := db.AddSightings(ctx, sighted); err != nil {
+		t.Fatalf("AddSightings(sighted fixtures): %v", err)
+	}
 
 	// popular discriminates on ranked-package membership as well as on max_crit,
 	// and lands on 5 — distinct from every other queue above.

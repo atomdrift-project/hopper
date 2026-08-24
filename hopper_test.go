@@ -1597,9 +1597,9 @@ func TestIndexRewriteHelpers(t *testing.T) {
 	if len(names) < 8 {
 		t.Fatalf("path rewrite indexes = %v", names)
 	}
-	old := `CREATE INDEX idx_samples_sighted_newest ON public.samples USING btree (created_at DESC, id DESC) WHERE ((label = 'sighted'::text) AND (parent = ''::text))`
+	old := `CREATE INDEX idx_samples_bad_miss_newest ON public.samples USING btree (created_at DESC, id DESC) WHERE ((label = 'bad'::text) AND (parent = ''::text))`
 	if !indexDefNeedsRewrite(pathDDL, old) {
-		t.Fatal("old sighted index missing path <> must be stale")
+		t.Fatal("old bad index missing path <> must be stale")
 	}
 	fresh := old + ` AND (path <> ''::text)`
 	if indexDefNeedsRewrite(pathDDL, fresh) {
@@ -5610,7 +5610,7 @@ func TestTriageMostRecent(t *testing.T) {
 	// with one trait => max_crit<5 && suspicious_count<2 (a "bad" miss); level>=5
 	// => flagged (a "good"/"new" hit). Samples are inserted oldest-first, so
 	// later inserts are the most recently added (higher created_at and id).
-	analyze := func(label, fileType string, level int) {
+	analyze := func(label, fileType string, level int) string {
 		n++
 		sha := fmt.Sprintf("%064x", n)
 		mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test", Label: label, LabelSource: "test"})
@@ -5618,6 +5618,7 @@ func TestTriageMostRecent(t *testing.T) {
 		if err := db.UpdateCleaveResult(ctx, sha, result, nil, ""); err != nil {
 			t.Fatalf("UpdateCleaveResult: %v", err)
 		}
+		return sha
 	}
 
 	counts := func(samples []*Sample) map[string]int {
@@ -5630,17 +5631,21 @@ func TestTriageMostRecent(t *testing.T) {
 
 	// bad misses: 3 apk then 2 deb; good/new hits mirror the structure. The deb
 	// rows are added last, so a global most-recent limit favors them.
+	var sightedClaims []Sighting
 	for range 3 {
 		analyze("bad", "apk", 1)
 		analyze("good", "apk", 5)
 		analyze("unknown", "apk", 5)
-		analyze("sighted", "apk", 1)
+		sightedClaims = append(sightedClaims, Sighting{Source: "feed", Subject: analyze("sighted", "apk", 1)})
 	}
 	for range 2 {
 		analyze("bad", "deb", 1)
 		analyze("good", "deb", 5)
 		analyze("unknown", "deb", 5)
-		analyze("sighted", "deb", 1)
+		sightedClaims = append(sightedClaims, Sighting{Source: "feed", Subject: analyze("sighted", "deb", 1)})
+	}
+	if _, err := db.AddSightings(ctx, sightedClaims); err != nil {
+		t.Fatalf("AddSightings(sighted): %v", err)
 	}
 
 	for _, tc := range []struct {
@@ -5775,20 +5780,26 @@ func TestTriageThresholds(t *testing.T) {
 		t.Errorf("TriageBad missing a detection-miss sample")
 	}
 
-	// sighted: no detection threshold — every analyzed sighted sample is an
-	// unconfirmed claim needing triage, whether cleave flags it or not.
+	// sighted: no detection threshold — every analyzed sample with a qualifying
+	// ledger claim needs triage, whether cleave flags it or not.
 	sightedConfident := analyze("sighted", 5, 4)
 	sightedBenign := analyze("sighted", 1)
+	if _, err := db.AddSightings(ctx, []Sighting{
+		{Source: "feed-a", Subject: sightedConfident},
+		{Source: "feed-b", Subject: sightedBenign},
+	}); err != nil {
+		t.Fatalf("AddSightings(sighted): %v", err)
+	}
 
 	sighted, err := db.TriageSighted(ctx, 100, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageSighted: %v", err)
 	}
 	if !has(sighted, sightedConfident) || !has(sighted, sightedBenign) {
-		t.Errorf("TriageSighted must surface every sighted sample regardless of detection state")
+		t.Errorf("TriageSighted must surface every claimed sample regardless of detection state")
 	}
 	if has(sighted, badBenign) {
-		t.Errorf("TriageSighted included a non-sighted sample")
+		t.Errorf("TriageSighted included a bad sample without qualifying evidence")
 	}
 }
 

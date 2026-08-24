@@ -4122,14 +4122,17 @@ func (db *DB) TriageReview(ctx context.Context, limit int, f TriageFilter) ([]*S
 	return db.triageReviewSQLite(ctx, limit, f)
 }
 
-// TriageSighted returns analyzed top-level sighted-labeled samples — feed
-// claims pending verification — taking up to limit of the most recently added
-// (created_at). Unlike TriageBad/TriageGood there is no detection-gap
-// predicate: every sighted sample is an unconfirmed claim that needs triage
-// and a real label, so all of them qualify until a ruling relabels them out of
-// the pool (bad or good). Skipped rows are excluded (skip = ”): a sample whose
-// bytes are missing or whose type cleave cannot parse can be neither verified
-// nor relabelled, so selecting it only burns a batch slot.
+// TriageSighted returns analyzed top-level, non-bad samples covered by a
+// malicious or suspicious sightings-ledger claim. Digest subjects match the
+// exact bytes. A package subject matches the exact sample version when Affected
+// is set and all versions when it is empty. Vulnerability claims do not qualify.
+// The legacy sighted label is deliberately not a membership predicate: it is a
+// disposition that can drift from the evidence ledger, not evidence itself.
+//
+// Results are ordered by the newest matching sighting first, then by sample
+// creation time. A bad ruling drains by relabelling; any completed judgement
+// also writes a "sighted" report, which drains a confirmed good/unknown ruling.
+// Skipped or unservable rows are excluded because they cannot be reviewed.
 func (db *DB) TriageSighted(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
 		return db.triageSightedPG(ctx, limit, f)
@@ -5151,9 +5154,10 @@ func (s Sighting) valid() bool {
 // SightingsFor, promoter's family counting, the sha-cited sweep) hits:
 // sha256 subjects lowercase, PURL subjects on the canonical version-less
 // purl_base spelling — the same normalization samples.purl_base carries
-// (pkgparse.CanonicalizePURL + VersionlessPURL; a source that flagged one
-// specific version records it in Note or URL, never in Subject). Anything
-// else is passed through for valid() to reject.
+// (pkgparse.CanonicalizePURL + VersionlessPURL). AddSightings preserves a
+// version supplied in Subject by moving it to Affected before calling this;
+// producers that already separate identity and scope can set Affected directly.
+// Anything else is passed through for valid() to reject.
 //
 // A PURL whose name component is itself a sha256 is folded back to the bare
 // digest. Hash corpora cite BYTES, and a producer that pairs a digest with an
@@ -5317,6 +5321,15 @@ func (db *DB) AddSightings(ctx context.Context, s []Sighting) (int, error) {
 	valid := s[:0:0]
 	for i := range s {
 		x := s[i]
+		// A producer may supply an exact versioned PURL directly. The ledger
+		// keys package identity on its version-less base, so preserve the
+		// version as the claim scope before normalizeSubject removes it. Writers
+		// that already supplied Affected remain authoritative.
+		if x.Affected == "" && strings.HasPrefix(strings.TrimSpace(x.Subject), "pkg:") {
+			if version := pkgparse.PURLVersion(pkgparse.CanonicalizePURL(x.Subject)); version != "" {
+				x.Affected = version
+			}
+		}
 		x.Subject = normalizeSubject(x.Subject)
 		if !x.valid() {
 			continue
@@ -5710,65 +5723,105 @@ func (db *DB) deleteSightings(ctx context.Context, sources []string) error {
 	return nil
 }
 
-// corroborationBatch bounds one reconcile statement. Small enough that any
-// single statement is interruptible and holds no lock worth noticing; large
-// enough that the walk is not dominated by round trips.
+// corroborationBatch bounds one reconcile statement: how many FLAGGED samples
+// a single pass considers, not how wide an id range it covers.
+//
+// Those are very different on a churned table. samples holds 91.7 million rows
+// under a sequence that has reached 3.29 billion, so a fixed id stride spends
+// almost all of its round trips on ranges where nothing lives any more —
+// measured at 65,820 statements to do the work of a few dozen.
 const corroborationBatch = 50_000
 
-// ReconcileCorroborated unsets the flag on samples nothing cites any more,
-// walking the table in id order so each statement is short.
+// corroborationProgressEvery logs a line after this many flagged samples, so a
+// long walk says where it is. A maintenance command that prints nothing for
+// twenty minutes is indistinguishable from one that has hung.
+const corroborationProgressEvery = 500_000
+
+// ReconcileCorroborated unsets the flag on samples nothing cites any more.
 //
-// Batched because the unbatched form does not finish. samples is a 91.7-million
-// row table on the cluster this was written for and carries no index on
-// corroborated alone — the partial ones all pin further predicates — so a
-// single UPDATE is a sequential scan of the whole table with two index probes
-// per row. Run once after a rebuild, never between a drop and one: the re-walk
-// re-cites most of what a drop orphaned, and reconciling first only does the
-// work twice.
+// The flag is denormalized and nothing else recomputes it, so it is rebuilt
+// here: after a drop-and-rebuild, once, when the ledger is settled. Running it
+// between a drop and its rebuild only does the work twice, since the re-walk
+// re-cites most of what the drop orphaned.
+//
+// Walks flagged samples in id order, keyset-paginated: each pass takes the next
+// batch of corroborated rows through the primary key and asks the sightings
+// index whether anything still cites them. Nothing scans the whole table and
+// nothing visits an id that no longer exists.
 //
 // Interrupting it is safe. Each batch commits on its own, so a cancelled run
 // leaves the rows it reached correct and the rest as they were; running it
 // again finishes the job.
 func (db *DB) ReconcileCorroborated(ctx context.Context) (cleared int64, err error) {
 	const q = `
-		UPDATE samples SET corroborated = false
-		WHERE id >= $1 AND id < $2 AND corroborated
-		  AND NOT EXISTS (SELECT 1 FROM sightings s WHERE s.subject = samples.sha256)
-		  AND NOT EXISTS (SELECT 1 FROM sightings s WHERE s.subject = samples.purl_base)`
+		WITH batch AS (
+			SELECT id, sha256, purl_base FROM samples
+			WHERE corroborated AND id > $1
+			ORDER BY id LIMIT $2
+		), stale AS (
+			SELECT b.id FROM batch b
+			WHERE NOT EXISTS (SELECT 1 FROM sightings s WHERE s.subject = b.sha256)
+			  AND NOT EXISTS (SELECT 1 FROM sightings s WHERE s.subject = b.purl_base)
+		), cleared AS (
+			UPDATE samples SET corroborated = false
+			WHERE id IN (SELECT id FROM stale)
+			RETURNING 1
+		)
+		SELECT COALESCE((SELECT max(id) FROM batch), 0),
+		       (SELECT count(*) FROM batch),
+		       (SELECT count(*) FROM cleared)`
 
-	var maxID int64
-	if db.pool != nil {
-		if err := db.pool.QueryRow(ctx, `SELECT COALESCE(max(id), 0) FROM samples`).Scan(&maxID); err != nil {
-			return 0, fmt.Errorf("hopper: reconcile corroboration: %w", err)
-		}
-	} else if err := db.lite.QueryRowContext(ctx,
-		`SELECT COALESCE(max(id), 0) FROM samples`).Scan(&maxID); err != nil {
-		return 0, fmt.Errorf("hopper: reconcile corroboration: %w", err)
-	}
-
-	for start := int64(0); start <= maxID; start += corroborationBatch {
-		end := start + corroborationBatch
-		var n int64
+	var cursor, seen int64
+	nextProgress := int64(corroborationProgressEvery)
+	for {
+		var last, inBatch, dropped int64
 		if db.pool != nil {
-			tag, err := db.pool.Exec(ctx, q, start, end)
-			if err != nil {
-				return cleared, fmt.Errorf("hopper: reconcile corroboration: %w", err)
-			}
-			n = tag.RowsAffected()
+			err = db.pool.QueryRow(ctx, q, cursor, corroborationBatch).Scan(&last, &inBatch, &dropped)
 		} else {
-			res, err := db.lite.ExecContext(ctx, `
-				UPDATE samples SET corroborated = false
-				WHERE id >= ? AND id < ? AND corroborated
-				  AND NOT EXISTS (SELECT 1 FROM sightings s WHERE s.subject = samples.sha256)
-				  AND NOT EXISTS (SELECT 1 FROM sightings s WHERE s.subject = samples.purl_base)`,
-				start, end)
-			if err != nil {
-				return cleared, fmt.Errorf("hopper: reconcile corroboration: %w", err)
-			}
-			n, _ = res.RowsAffected() //nolint:errcheck // driver reports it or does not
+			last, inBatch, dropped, err = db.reconcileLiteBatch(ctx, cursor)
 		}
-		cleared += n
+		if err != nil {
+			return cleared, fmt.Errorf("hopper: reconcile corroboration: %w", err)
+		}
+		if inBatch == 0 {
+			break // no flagged samples left beyond the cursor
+		}
+		cleared += dropped
+		seen += inBatch
+		cursor = last
+		if seen >= nextProgress {
+			slog.InfoContext(ctx, "reconciling corroboration",
+				"examined", seen, "cleared", cleared, "id", cursor)
+			nextProgress = seen + corroborationProgressEvery
+		}
 	}
 	db.flushLookups()
 	return cleared, nil
+}
+
+// reconcileLiteBatch is one pass of [DB.ReconcileCorroborated] for SQLite,
+// which has no data-modifying CTE: the batch is bounded first, then cleared
+// within that id window. Two statements where Postgres uses one, and the same
+// keyset walk.
+func (db *DB) reconcileLiteBatch(ctx context.Context, cursor int64) (last, inBatch, dropped int64, err error) {
+	if err := db.lite.QueryRowContext(ctx, `
+		SELECT COALESCE(max(id), 0), count(*) FROM (
+			SELECT id FROM samples WHERE corroborated AND id > ? ORDER BY id LIMIT ?
+		)`, cursor, corroborationBatch).Scan(&last, &inBatch); err != nil {
+		return 0, 0, 0, err
+	}
+	if inBatch == 0 {
+		return 0, 0, 0, nil
+	}
+	res, err := db.lite.ExecContext(ctx, `
+		UPDATE samples SET corroborated = false
+		WHERE corroborated AND id > ? AND id <= ?
+		  AND NOT EXISTS (SELECT 1 FROM sightings s WHERE s.subject = samples.sha256)
+		  AND NOT EXISTS (SELECT 1 FROM sightings s WHERE s.subject = samples.purl_base)`,
+		cursor, last)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	dropped, _ = res.RowsAffected() //nolint:errcheck // driver reports it or does not
+	return last, inBatch, dropped, nil
 }

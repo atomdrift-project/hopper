@@ -356,7 +356,6 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 				'idx_samples_good_repair_newest',
 				'idx_samples_unknown_newest',
 				'idx_samples_new_interesting',
-				'idx_samples_sighted_newest',
 				'idx_samples_bad_miss_stale',
 				'idx_samples_good_repair_stale',
 				'idx_samples_new_stale',
@@ -396,10 +395,9 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			`litmus_score DESC NULLS LAST, analyzed_at, id) ` +
 			`WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' ` +
 			`AND skip = '' AND path <> '' AND suspicious_count >= 1 AND path NOT LIKE 'review/%'`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_sighted_newest ` +
-			`ON samples(created_at DESC, id DESC) ` +
-			`WHERE label = 'sighted' AND cleave_result IS NOT NULL AND parent = '' ` +
-			`AND skip = '' AND path <> ''`,
+		// Sighted selection is now a ledger join ordered by sighting first_seen;
+		// the old label+sample-created ordering index has no reader.
+		`DROP INDEX IF EXISTS idx_samples_sighted_newest`,
 		// The three TriageStale selectors: same populations as TriageBad /
 		// TriageGood / TriageNew, ranked least-recently-analyzed first so triage
 		// reaches verdicts rendered by old trait sets instead of re-working the
@@ -4306,9 +4304,11 @@ func (db *DB) triageSightedPG(ctx context.Context, limit int, f TriageFilter) ([
 	extra, args := triageFilterClausePG(f, 1, "samples")
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleColsLight+` FROM samples
+		triageSightedMatchCTE+`SELECT `+pgSampleColsLight+` FROM samples
+		 JOIN latest_sightings ON latest_sightings.matched_sha = samples.sha256
 		 WHERE `+triageSightedWhere+extra+`
-		 ORDER BY created_at DESC, id DESC LIMIT $`+strconv.Itoa(len(args)),
+		 ORDER BY latest_sightings.sighted_at DESC,
+		          samples.created_at DESC, samples.id DESC LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage sighted: %w", err)

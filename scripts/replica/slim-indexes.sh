@@ -108,8 +108,8 @@ idx_samples_good_route_score
 idx_samples_new_interesting
 idx_samples_new_stale
 idx_samples_package_version
+idx_samples_purl_base
 idx_samples_purl_lookup
-idx_samples_sighted_newest
 idx_samples_stranded_member
 idx_samples_top_ready_created
 idx_samples_unknown_newest
@@ -156,7 +156,6 @@ idx_samples_pending_cleave_group
 idx_samples_pending_litmus_group
 idx_samples_pending_path
 idx_samples_pending_size
-idx_samples_purl_base
 idx_samples_reconcile_toplevel
 idx_samples_rescan_queue
 idx_samples_review_interesting

@@ -91,6 +91,103 @@ func TestTriageUnknownPoolsAreDisjoint(t *testing.T) {
 	}
 }
 
+// TestTriageSightedUsesLedgerScope pins the queue's contract with the sightings
+// ledger: exact releases match exactly, an unscoped package claim matches every
+// release, suspicious claims are reviewed, vulnerability-only records are not,
+// bad labels are already settled, and the old sighted label is not evidence.
+// The newest applicable sighting leads regardless of sample insertion order.
+func TestTriageSightedUsesLedgerScope(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	add := func(n int, label, purl, version string) string {
+		t.Helper()
+		sha := fmt.Sprintf("%064x", 100+n)
+		mustInsert(t, ctx, db, &Sample{
+			SHA256: sha, Label: label, LabelSource: "test", Path: "test/" + sha,
+			PURLBase: purl, Version: version,
+		})
+		mustAnalyzeWithTraits(t, ctx, db, sha, 0, "")
+		return sha
+	}
+
+	exact := add(1, "good", "pkg:npm/exact", "1.2.3")
+	wrongVersion := add(2, "good", "pkg:npm/exact", "2.0.0")
+	broad := add(3, "unknown", "pkg:pypi/broad", "9.0")
+	bad := add(4, "bad", "pkg:npm/settled", "1.0")
+	vulnerable := add(5, "good", "pkg:npm/vulnerable", "1.0")
+	suspicious := add(6, "good", "pkg:npm/suspicious", "3.0")
+	labelOnly := add(7, "sighted", "pkg:npm/no-evidence", "1.0")
+	digest := add(8, "unknown", "", "")
+
+	if _, err := db.AddSightings(ctx, []Sighting{
+		// Supplying the exact PURL directly must preserve 1.2.3 in Affected
+		// before the subject is folded to its version-less ledger key.
+		{Source: "exact", Subject: "pkg:npm/exact@1.2.3"},
+		{Source: "broad", Subject: "pkg:pypi/broad"},
+		{Source: "settled", Subject: "pkg:npm/settled", Affected: "1.0"},
+		{Source: "advisory", Subject: "pkg:npm/vulnerable", Affected: "1.0", Claim: ClaimVulnerable},
+		{Source: "scanner", Subject: "pkg:npm/suspicious", Affected: "3.0", Claim: ClaimSuspicious},
+		{Source: "digest", Subject: digest},
+	}); err != nil {
+		t.Fatalf("AddSightings: %v", err)
+	}
+
+	// Make the evidence order unambiguous. SQLite stores these timestamps as
+	// RFC3339 text, the same representation AddSightings uses.
+	now := time.Now().UTC()
+	for source, at := range map[string]time.Time{
+		"exact": now, "scanner": now.Add(-time.Hour),
+		"digest": now.Add(-2 * time.Hour), "broad": now.Add(-3 * time.Hour),
+	} {
+		if _, err := db.lite.ExecContext(ctx, `UPDATE sightings SET first_seen = ? WHERE source = ?`,
+			at.Format(time.RFC3339Nano), source); err != nil {
+			t.Fatalf("date %s: %v", source, err)
+		}
+	}
+
+	got, err := db.TriageSighted(ctx, 20, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageSighted: %v", err)
+	}
+	want := []string{exact, suspicious, digest, broad}
+	if len(got) != len(want) {
+		t.Fatalf("TriageSighted returned %d rows, want %d: %+v", len(got), len(want), got)
+	}
+	for i, sha := range want {
+		if got[i].SHA256 != sha {
+			t.Errorf("row %d = %s, want %s (newest applicable sighting first)", i, got[i].SHA256, sha)
+		}
+	}
+	denied := map[string]string{
+		wrongVersion: "wrong version", bad: "bad label", vulnerable: "vulnerability-only claim", labelOnly: "label without evidence",
+	}
+	for _, sample := range got {
+		if why := denied[sample.SHA256]; why != "" {
+			t.Errorf("TriageSighted included %s (%s)", sample.SHA256, why)
+		}
+	}
+
+	stored, err := db.SightingsFor(ctx, []string{"pkg:npm/exact"})
+	if err != nil || len(stored["pkg:npm/exact"]) != 1 || stored["pkg:npm/exact"][0].Affected != "1.2.3" {
+		t.Fatalf("exact PURL scope was not preserved: rows=%+v err=%v", stored, err)
+	}
+	if err := db.InsertReport(ctx, &Report{SHA256: exact, Type: "sighted", Provider: "test"}); err != nil {
+		t.Fatalf("InsertReport(sighted): %v", err)
+	}
+	after, err := db.TriageSighted(ctx, 20, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageSighted after report: %v", err)
+	}
+	if shaSet(after)[exact] {
+		t.Error("completed sighted report did not drain an upheld non-bad label")
+	}
+	depth, err := db.CountTriageSighted(ctx, TriageFilter{})
+	if err != nil || depth != int64(len(after)) {
+		t.Errorf("CountTriageSighted = %d, %v; selection has %d", depth, err, len(after))
+	}
+}
+
 func TestTriageQueuesReturnLightSamples(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)

@@ -126,10 +126,12 @@ var TriageQueues = map[string]Queue{
 		return db.CountTriageNew(ctx, TriageFilter{})
 	}},
 
-	// sighted: threat-feed-claimed samples pending verification → judge, write
-	// traits when malicious, and relabel (bad or good) — every sighted sample
-	// needs triage, so the selector carries no detection-gap predicate and the
-	// queue drains via the relabel.
+	// sighted: every non-bad sample covered by a malicious or suspicious ledger
+	// sighting → verify the claim, writing traits when malicious. Exact version
+	// claims only cover that release; a claim without a version covers the whole
+	// package. Vulnerability claims stay out. The legacy sighted label is not
+	// evidence and does not select work. A bad ruling drains via relabel and a
+	// confirmed non-bad ruling via report.
 	"sighted": {Name: "sighted", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
 		return db.TriageSighted(ctx, n, TriageFilter{})
 	}, Depth: func(ctx context.Context, db *DB) (int64, error) {

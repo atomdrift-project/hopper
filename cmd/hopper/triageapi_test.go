@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -118,6 +119,27 @@ func TestTriageSelectClaimsAcrossRequests(t *testing.T) {
 	}
 	if withheld != 6 {
 		t.Errorf("third select withheld = %d, want 6", withheld)
+	}
+}
+
+// Preview is observational: repeated previews return the same head and do not
+// withhold it from the next real worker claim.
+func TestTriageSelectPreviewDoesNotClaim(t *testing.T) {
+	ctx := context.Background()
+	api := newTriageAPI(t, ctx)
+	seedNewQueue(t, ctx, api.db, 3)
+
+	first, withheld, code := selectFrom(t, api, "new", "?limit=2&preview=1")
+	if code != http.StatusOK || len(first) != 2 || withheld != 0 {
+		t.Fatalf("first preview = %v withheld=%d status=%d", first, withheld, code)
+	}
+	second, withheld, _ := selectFrom(t, api, "new", "?limit=2&preview=1")
+	if !slices.Equal(first, second) || withheld != 0 {
+		t.Fatalf("second preview = %v withheld=%d, want same %v and zero", second, withheld, first)
+	}
+	claimed, withheld, _ := selectFrom(t, api, "new", "?limit=2")
+	if !slices.Equal(first, claimed) || withheld != 0 {
+		t.Fatalf("claim after previews = %v withheld=%d, want %v and zero", claimed, withheld, first)
 	}
 }
 
