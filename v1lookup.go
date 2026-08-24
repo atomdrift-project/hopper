@@ -102,7 +102,15 @@ type LookupRecord struct {
 // one this path exists to avoid reading. Reason carries the sentence a person
 // actually reads.
 type LookupFinding struct {
-	ID   string `json:"id"`
+	ID string `json:"id"`
+	// Desc is a sentence a person reads, and is empty for a trait the analyzer
+	// fired: those are described by the trait id, and the record's Reason
+	// already carries the sentence for the verdict as a whole.
+	//
+	// It exists for findings that are not the analyzer's, where Reason is
+	// either taken by a measured verdict or would be the only place the
+	// evidence could go. See [feedFinding].
+	Desc string `json:"desc,omitempty"`
 	Crit int    `json:"crit"`
 }
 
@@ -129,12 +137,20 @@ type cachedRecord struct {
 // are the same ones the sample pool uses, so a write deletes them directly.
 func (db *DB) LookupRecord(ctx context.Context, sha256, base, version string) (*LookupRecord, error) {
 	if sha256 != "" {
-		record, err := db.recordFor(lookupSHAKey(sha256), func() (*LookupRecord, error) {
+		record, err := db.recordFor(lookupSHAKey(sha256), func() (*LookupRecord, time.Duration, error) {
 			sample, err := db.SampleBySHA256(ctx, sha256)
 			if err != nil {
-				return nil, err
+				if errors.Is(err, ErrNotFound) {
+					// Nothing holds these bytes. Outside sources may still know
+					// them, and answering "nobody has analyzed this" about a
+					// digest several of them call malware is a worse answer
+					// than saying who says so.
+					return db.fromLedger(ctx, sha256, "")
+				}
+				return nil, 0, err
 			}
-			return recordOf(sample), nil
+			rec, ttl := db.corroborate(ctx, recordOf(sample), sample.Corroborated, sample.SHA256, sample.PURLBase)
+			return rec, ttl, nil
 		})
 		if err == nil {
 			return record, nil
@@ -146,32 +162,57 @@ func (db *DB) LookupRecord(ctx context.Context, sha256, base, version string) (*
 	if base == "" {
 		return nil, ErrNotFound
 	}
-	return db.recordFor(lookupPURLKey(base, version), func() (*LookupRecord, error) {
+	return db.recordFor(lookupPURLKey(base, version), func() (*LookupRecord, time.Duration, error) {
 		sample, err := db.SampleByPURL(ctx, base, version)
 		if err != nil {
-			return nil, err
+			if errors.Is(err, ErrNotFound) {
+				return db.fromLedger(ctx, "", base)
+			}
+			return nil, 0, err
 		}
-		return recordOf(sample), nil
+		rec, ttl := db.corroborate(ctx, recordOf(sample), sample.Corroborated, sample.SHA256, sample.PURLBase)
+		return rec, ttl, nil
 	})
 }
 
 // recordFor serves one key from the pool, rendering it once across concurrent
 // misses.
-func (db *DB) recordFor(key string, load func() (*LookupRecord, error)) (*LookupRecord, error) {
+//
+// load reports how long what it produced may be believed. Zero means "as long
+// as the analysis it came from", which is the ordinary case: an analysis that
+// has not been redone has not changed, so invalidation and recordTTL govern it.
+// A record standing on the sightings ledger names a real duration, because no
+// write this process sees invalidates one — the ledger moves underneath it, and
+// ageing out is the whole mechanism keeping it honest.
+func (db *DB) recordFor(key string, load func() (*LookupRecord, time.Duration, error)) (*LookupRecord, error) {
 	if db.records == nil {
-		return load()
+		record, _, err := load()
+		return record, err
 	}
-	if entry, ok := db.records.Get(key); ok && entry != nil && entry.live() {
-		db.recordCounts.served.Add(1)
-		if entry.record == nil {
-			return nil, ErrNotFound
+	if entry, ok := db.records.Get(key); ok && entry != nil {
+		if entry.live() {
+			db.recordCounts.served.Add(1)
+			if entry.record == nil {
+				return nil, ErrNotFound
+			}
+			return entry.record, nil
 		}
-		return entry.record, nil
+		// Evict before Fetch, or the expiry above is decorative.
+		//
+		// fido.Fetch returns whatever is in memory before it calls the loader,
+		// so falling through with the stale entry still present hands it back
+		// unchanged — recordMissTTL expired nothing, and the real bound was
+		// fido's own recordTTL: a week, or replicaRecordTTL on a replica. A
+		// package analyzed a minute after being asked about stayed "unknown"
+		// for days. It also has to be right before a derived record can be
+		// cached here at all, since that one is only ever correct for as long
+		// as the ledger behind it has not moved.
+		db.records.Delete(key)
 	}
 	ran := false
 	entry, err := db.records.Fetch(key, func() (*cachedRecord, error) {
 		ran = true
-		record, err := load()
+		record, ttl, err := load()
 		if errors.Is(err, ErrNotFound) {
 			// Absence is an answer and is cached as one, briefly. Any other
 			// error is not: a database blip must not be memoized as a lasting
@@ -182,7 +223,11 @@ func (db *DB) recordFor(key string, load func() (*LookupRecord, error)) (*Lookup
 		if err != nil {
 			return nil, err
 		}
-		return &cachedRecord{record: record}, nil
+		entry := &cachedRecord{record: record}
+		if ttl > 0 {
+			entry.expires = time.Now().Add(ttl)
+		}
+		return entry, nil
 	})
 	if ran {
 		db.recordCounts.loaded.Add(1)
@@ -198,10 +243,15 @@ func (db *DB) recordFor(key string, load func() (*LookupRecord, error)) (*Lookup
 	return entry.record, nil
 }
 
-// live reports whether a cached absence may still be believed. A found record
-// has no expiry of its own: invalidation and recordTTL govern it.
+// live reports whether a time-bound entry may still be believed.
+//
+// A zero expires means the entry is governed by invalidation and recordTTL
+// instead — which is every record derived from a stored analysis, because an
+// analysis that has not been redone has not changed. Absences and records
+// derived from the sightings ledger both set one: neither is invalidated by any
+// write this process sees, so ageing out is the only thing keeping them honest.
 func (c *cachedRecord) live() bool {
-	return c.record != nil || time.Now().Before(c.expires)
+	return c.expires.IsZero() || time.Now().Before(c.expires)
 }
 
 // forgetRecord drops one rendered record. Named for a key the sample pool uses

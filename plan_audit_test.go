@@ -52,6 +52,11 @@ func TestMarkCorroboratedSQLShape(t *testing.T) {
 	}{
 		{"by_sha", markCorroboratedBySHASQL, "sha256 = ANY"},
 		{"by_purl", markCorroboratedByPURLSQL, "purl_base = ANY"},
+		// The trigger body. Same rule, same reason: it is spliced into
+		// sightings_corroborate() and would be untested SQL living in a
+		// migration string otherwise.
+		{"one_sha", markCorroboratedOneSHASQL, "sha256 = NEW.subject"},
+		{"one_purl", markCorroboratedOnePURLSQL, "purl_base = NEW.subject"},
 	} {
 		sql := compactSQL(tc.sql)
 		if !strings.Contains(sql, tc.want) {
@@ -127,19 +132,77 @@ func TestPlanAuditSamplesHotPaths(t *testing.T) {
 			sql:  `EXPLAIN SELECT sha256 FROM samples WHERE sha256 = ANY($1)`,
 			args: shas,
 		},
+		{
+			// The trigger body, with NEW.subject standing in as a bind
+			// parameter. A seq scan here would mean every inserted sighting
+			// walks samples.
+			name: "mark_corroborated_one_sha",
+			sql: `EXPLAIN ` + strings.NewReplacer(
+				"SET corroborated = true", "SET corroborated = corroborated",
+				"NEW.subject", "$1").Replace(markCorroboratedOneSHASQL),
+			args: shas[:1],
+		},
+		{
+			name: "mark_corroborated_one_purl",
+			sql: `EXPLAIN ` + strings.NewReplacer(
+				"SET corroborated = true", "SET corroborated = corroborated",
+				"NEW.subject", "$1").Replace(markCorroboratedOnePURLSQL),
+			args: purls[:1],
+		},
 	} {
 		plan := explainText(t, ctx, db, tc.sql, tc.args)
 		if planSeqScansSamples(plan) {
 			t.Errorf("%s: unexpected Seq Scan on samples:\n%s", tc.name, plan)
 		} else {
-			t.Logf("%s: ok\n%s", tc.name, firstPlanLines(plan, 8))
+			t.Logf("%s: ok\n%s", tc.name, firstPlanLines(plan))
 		}
 	}
 }
 
-func explainText(t *testing.T, ctx context.Context, db *DB, sql string, args []string) string {
+// TestPlanAuditClaimQueues guards the two tiers that rank by corroboration.
+//
+// Both are polled by every worker on every claim, so a plan regression here is
+// not a slow report — it is the whole fleet idling. The sighted tier must ride
+// its partial index rather than filtering the 537k-row pending set, and the
+// stale-traits tier must WALK idx_samples_stale_traits_pri2 in order: its
+// failure mode is not a seq scan but a top-N sort over millions of rows, which
+// is what cost 18s per poll before the expression index existed. A Sort node in
+// that plan means the ORDER BY and the index definition have drifted apart.
+func TestPlanAuditClaimQueues(t *testing.T) {
+	db := openPlanDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	start := time.Now().Add(-time.Hour).UTC()
+
+	sighted := explainText(t, ctx, db, `EXPLAIN `+sightedCandidatesSQL, start, maxClaimAttempts, 200)
+	if planSeqScansSamples(sighted) {
+		t.Errorf("sighted_candidates: unexpected Seq Scan on samples:\n%s", sighted)
+	}
+	if !strings.Contains(sighted, "idx_samples_pending_sighted") {
+		t.Errorf("sighted_candidates: not using idx_samples_pending_sighted:\n%s", sighted)
+	}
+	t.Logf("sighted_candidates: ok\n%s", firstPlanLines(sighted))
+
+	stale := explainText(t, ctx, db, `EXPLAIN `+staleTraitsCandidatesSQL,
+		"plan-audit-traits", start, start, 200)
+	if planSeqScansSamples(stale) {
+		t.Errorf("stale_traits_candidates: unexpected Seq Scan on samples:\n%s", stale)
+	}
+	if !strings.Contains(stale, "idx_samples_stale_traits_pri2") {
+		t.Errorf("stale_traits_candidates: not using idx_samples_stale_traits_pri2 "+
+			"(ORDER BY drifted from the index?):\n%s", stale)
+	}
+	if strings.Contains(stale, "Sort") {
+		t.Errorf("stale_traits_candidates: plan sorts instead of walking the index "+
+			"in order; this is the 18s-per-poll regression:\n%s", stale)
+	}
+	t.Logf("stale_traits_candidates: ok\n%s", firstPlanLines(stale))
+}
+
+func explainText(t *testing.T, ctx context.Context, db *DB, sql string, args ...any) string {
 	t.Helper()
-	rows, err := db.Pool().Query(ctx, sql, args)
+	rows, err := db.Pool().Query(ctx, sql, args...)
 	if err != nil {
 		t.Fatalf("EXPLAIN: %v\nSQL: %s", err, compactSQL(sql))
 	}
@@ -228,7 +291,7 @@ func TestPlanAuditRepairStandaloneParents(t *testing.T) {
 	if !strings.Contains(plan, "Index Cond: (id > ") {
 		t.Errorf("repair page does not use id as an index bound:\n%s", plan)
 	}
-	t.Logf("repair_standalone_parents_page: ok\n%s", firstPlanLines(plan, 8))
+	t.Logf("repair_standalone_parents_page: ok\n%s", firstPlanLines(plan))
 }
 
 func planAuditSHAs(n int) []string {
@@ -251,10 +314,14 @@ func compactSQL(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
-func firstPlanLines(plan string, n int) string {
+// firstPlanLines trims a plan to its top nodes for -v output. Depth is fixed:
+// every caller wants the same look at the top of the tree, and the interesting
+// node — the scan or the sort — is always in the first few lines.
+func firstPlanLines(plan string) string {
+	const depth = 8
 	lines := strings.Split(strings.TrimSpace(plan), "\n")
-	if len(lines) > n {
-		lines = lines[:n]
+	if len(lines) > depth {
+		lines = lines[:depth]
 	}
 	for i, line := range lines {
 		// Collapse huge ANY('{...}') literals so -v output stays readable.

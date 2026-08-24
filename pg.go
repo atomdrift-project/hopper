@@ -167,6 +167,21 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_claimable_sha ` +
 			`ON samples(sha256) ` +
 			`WHERE cleave_result IS NULL AND skip = '' AND parent = ''`,
+		// The sighted claim tier (sightedCandidatesPG): pending top-level samples an
+		// external feed has already cited. Production 2026-08-24 held 3,423 of
+		// these against 537,705 pending rows, so the index is a rounding error in
+		// size and the tier drains in a single ordered seek.
+		//
+		// It is a tier rather than an ORDER BY on the main queue because Tier 1
+		// scans from a random sha256 pivot precisely to avoid an ordering, and
+		// ranking 537k rows by a flag would replace that seek with a sort.
+		//
+		// Self-draining, which is what keeps it cheap forever: StoreResult sets
+		// cleave_result, the row falls out of the predicate, and the index shrinks
+		// back. It cannot accumulate the way an unpartitioned flag index would.
+		`CREATE INDEX IF NOT EXISTS idx_samples_pending_sighted ` +
+			`ON samples(id) ` +
+			`WHERE corroborated AND cleave_result IS NULL AND skip = '' AND parent = ''`,
 		// Covers the dashboard's OldestClaims query (DISTINCT ON claimed_by, ORDER BY claimed_at).
 		`CREATE INDEX IF NOT EXISTS idx_samples_claimed ON samples(claimed_by, claimed_at) WHERE claimed_by != ''`,
 		// newestAnalyzedAtPG: MAX(analyzed_at) — index-only max scan.
@@ -256,6 +271,11 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_sightings_review_queue ` +
 			`ON sightings ((starts_with(subject, 'pkg:')), first_seen DESC) ` +
 			`INCLUDE (subject, affected) WHERE claim IN ('malicious', 'suspicious')`,
+		// basis: how the source arrived at the claim, stamped by the producer.
+		// See hopper.Basis. 'predicted' is the fail-safe default, so rows written
+		// before the column existed read as guesses until their feed re-pushes —
+		// which under-counts confidence rather than over-counting it.
+		`ALTER TABLE sightings ADD COLUMN IF NOT EXISTS basis TEXT NOT NULL DEFAULT 'predicted'`,
 		// The other half of the sighted PURL walk. Production has ~604k review
 		// sightings but only ~1.7m sample PURLs; without a review-eligible covering
 		// index PostgreSQL performs a heap-backed idx_samples_purl_base lookup for
@@ -264,6 +284,20 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// order, and optional triage filters in the index; the selector fetches the
 		// full sample row only after it has reduced the result to the requested
 		// batch. Every predicate here is a direct predicate in triageSightedWhere.
+		//
+		// Dropped first when it is INVALID. A CREATE INDEX CONCURRENTLY that
+		// fails leaves a 0-byte index that is invisible to the planner but still
+		// owns the name, so the IF NOT EXISTS below sees it, does nothing, and
+		// the query it exists for runs unindexed forever. Production carried one
+		// (indisvalid=f, indisready=f) — the failure mode is silent, and the
+		// only symptom is the ten-minute queue this index was added to fix.
+		`DO $$
+		 BEGIN
+		   IF EXISTS (SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+		               WHERE c.relname = 'idx_samples_sighted_purl' AND NOT i.indisvalid) THEN
+		     DROP INDEX idx_samples_sighted_purl;
+		   END IF;
+		 END $$`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_sighted_purl ` +
 			`ON samples (purl_base, version) ` +
 			`INCLUDE (id, sha256, created_at, ecosystem, file_type, analyzed_at) ` +
@@ -280,6 +314,74 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_corroborated_created ` +
 			`ON samples(created_at DESC) ` +
 			`WHERE corroborated AND parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL`,
+		// samples.corroborated is a cache of "some sighting cites this row's sha256
+		// or purl_base", and the claim queues now rank by it, so a stale bit is a
+		// mis-ordered queue rather than a cosmetic wart. Maintaining it from Go
+		// meant every writer had to remember: addSightingsPG did,
+		// canonicalizeSightingSubjectsPG (which re-keys a subject as INSERT+DELETE)
+		// did not, and a hand-written INSERT in psql never could. This trigger moves
+		// the invariant to where the writes are, so the ledger cannot gain a
+		// citation without the flag following it.
+		//
+		// FOR EACH ROW, not a statement trigger over a transition table: a
+		// transition table is a tuplestore with no statistics, so the planner
+		// estimates it at 1000 rows and can pick a hash join that sequentially
+		// scans a 91.7M-row samples. Constant equality per row cannot — it is an
+		// index probe by construction, which is the same reason
+		// markCorroborated*SQL must stay single-column. The cost is two probes per
+		// INSERTED or DELETED row; the ON CONFLICT delta guard in addSightingsPG
+		// means a re-pushed unchanged snapshot inserts nothing and so fires
+		// nothing, and a snapshot that only changes a note does not touch subject
+		// and so fires nothing either.
+		//
+		// All three events, so no operation on the ledger can leave the flag
+		// behind and nothing has to be swept up afterwards. DELETE clears, but
+		// only after proving no OTHER sighting still cites the subject — two
+		// sources naming one package is the normal case, and dropping one of them
+		// must not uncorroborate the sample. That check is one probe of
+		// idx_sightings_subject against the post-delete state, which is what an
+		// AFTER trigger sees.
+		//
+		// Clearing on DELETE is what removes reconcile-corroborated from the
+		// steady state: a source drop now settles inside its own transaction
+		// rather than leaving stale true bits until someone remembers to run a
+		// command. The command survives as a repair tool for history and restores,
+		// not as a scheduled dependency.
+		//
+		// This trigger cannot see the other half of the race — a sighting that
+		// already exists when the sample arrives. That is the ingest side's job;
+		// see corroborateStagedBySHAPG and insertSampleNewPG.
+		`CREATE OR REPLACE FUNCTION sightings_corroborate() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			-- Nested, not one AND-ed condition: SQL does not promise to
+			-- short-circuit, and OLD is unassigned on INSERT.
+			IF TG_OP IN ('DELETE', 'UPDATE') THEN
+				IF NOT EXISTS (SELECT 1 FROM sightings WHERE subject = OLD.subject) THEN
+					` + clearCorroboratedOneSHASQL + `;
+					` + clearCorroboratedOnePURLSQL + `;
+				END IF;
+			END IF;
+			IF TG_OP <> 'DELETE' THEN
+				` + markCorroboratedOneSHASQL + `;
+				` + markCorroboratedOnePURLSQL + `;
+			END IF;
+			RETURN NULL;
+		END;
+		$$`,
+		`CREATE OR REPLACE TRIGGER sightings_corroborate_trg
+			AFTER INSERT ON sightings
+			FOR EACH ROW EXECUTE FUNCTION sightings_corroborate()`,
+		`CREATE OR REPLACE TRIGGER sightings_uncorroborate_trg
+			AFTER DELETE ON sightings
+			FOR EACH ROW EXECUTE FUNCTION sightings_corroborate()`,
+		// UPDATE OF subject, so the delta-guarded snapshot re-push -- which only
+		// ever rewrites url/note/operator/claim/filename/published_at -- fires
+		// nothing at all. This exists for the writer that does not exist yet.
+		`CREATE OR REPLACE TRIGGER sightings_resubject_trg
+			AFTER UPDATE OF subject ON sightings
+			FOR EACH ROW WHEN (OLD.subject IS DISTINCT FROM NEW.subject)
+			EXECUTE FUNCTION sightings_corroborate()`,
 		// conflictReviewPG: good+bad conflicts flagged skip='conflict'.
 		// staleSamplesPG: WHERE updated_at < $1 ORDER BY updated_at — no status prefix.
 		`CREATE INDEX IF NOT EXISTS idx_samples_updated_at ON samples(updated_at)`,
@@ -462,7 +564,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 				'idx_samples_good_repair_stale',
 				'idx_samples_new_stale',
 				'idx_samples_stale_traits',
-				'idx_samples_stale_traits_pri'
+				'idx_samples_stale_traits_pri2'
 			]
 			LOOP
 				SELECT pg_get_indexdef(to_regclass(idx)) INTO def;
@@ -556,8 +658,9 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_stale_traits ` +
 			`ON samples(traits_version, analyzed_at) ` +
 			`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''`,
-		// staleTraitsCandidatesPG orders by a priority expression (label-
-		// disagreement bucket, then |litmus_score-0.5|, then analyzed_at). The
+		// staleTraitsCandidatesPG orders by a priority expression (corroboration,
+		// then label-disagreement bucket, then |litmus_score-0.5|, then
+		// analyzed_at). The
 		// index above is keyed (traits_version, analyzed_at), which can't serve
 		// that ordering: with traits_version filtered by inequality (!= current),
 		// Postgres scanned every eligible row and top-N sorted the lot — ~3.8M
@@ -568,13 +671,30 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// filters (both pass for ~all rows, so it terminates after ~LIMIT). The
 		// column expressions must stay byte-identical to the ORDER BY in
 		// staleTraitsCandidatesPG or the planner won't match them.
-		`CREATE INDEX IF NOT EXISTS idx_samples_stale_traits_pri ` +
+		//
+		// _pri2 supersedes _pri by prepending corroborated: a stale sample an
+		// outside feed has cited is re-analyzed before one nothing has. Costs
+		// nothing at read time — the walk still stops at LIMIT, it just starts in
+		// the corroborated half and falls through to the rest once that half is
+		// exhausted, which is the same scan the old index did.
+		//
+		// A NEW NAME, not an edited definition. CREATE INDEX IF NOT EXISTS is a
+		// no-op against an existing index with a different definition: it would
+		// keep the old one, the ORDER BY below would no longer match any index,
+		// and the tier would go straight back to top-N sorting ~3.8M rows at 18s
+		// per poll. Renaming makes the swap observable instead of silent.
+		`CREATE INDEX IF NOT EXISTS idx_samples_stale_traits_pri2 ` +
 			`ON samples(` +
+			`corroborated DESC, ` +
 			`(CASE WHEN label = 'good' AND (max_crit >= 5 OR suspicious_count >= 2) THEN 0 ` +
 			`WHEN label = 'bad' AND max_crit < 5 AND suspicious_count < 2 THEN 0 ELSE 1 END), ` +
 			`(ABS(litmus_score - 0.5)), ` +
 			`analyzed_at) ` +
 			`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''`,
+		// Dropped only after _pri2 exists above, so no poll falls between the two.
+		// concurrentDropIndexDDL rewrites this to DROP INDEX CONCURRENTLY; a plain
+		// DROP would take ACCESS EXCLUSIVE and wait behind the replication COPY.
+		`DROP INDEX IF EXISTS idx_samples_stale_traits_pri`,
 		// feedSourcesPG / feedEcosystemsPG: DISTINCT feed/ecosystem WHERE source = $1.
 		`CREATE INDEX IF NOT EXISTS idx_samples_source_feed ON samples(source, feed) WHERE feed != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_source_ecosystem ON samples(source, ecosystem) WHERE ecosystem != ''`,
@@ -2193,10 +2313,20 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 			canonical_sha256, parent, skip, elements,
 			max_crit, suspicious_count, mtime, marker_mtime,
 			cleave_result, litmus_result,
-			url, domain, package, version, provenance, fetched_at, purl_base)
+			url, domain, package, version, provenance, fetched_at, purl_base,
+			corroborated)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
 			$1, $11, $12, $13, $14, $15, $16, $17, $18, $19,
-			$20, $21, $22, $23, $24, $25, $26)
+			$20, $21, $22, $23, $24, $25, $26,
+			-- The direct-insert path is forager fetching a package a feed already
+			-- named, so the sighting almost always predates the row and the
+			-- sightings_corroborate trigger has nothing left to fire on. Seed the
+			-- flag from the ledger here instead. Two constant-equality probes into
+			-- idx_sightings_subject, never OR'd across two samples columns (that
+			-- is the seq scan plan_audit_test.go guards); the purl arm is skipped
+			-- outright for the files that carry no package identity.
+			EXISTS (SELECT 1 FROM sightings WHERE subject = $1)
+			  OR ($26 <> '' AND EXISTS (SELECT 1 FROM sightings WHERE subject = $26)))
 		`+sampleConflictUpdatePG,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, samplesPath, s.Status,
@@ -2534,6 +2664,43 @@ const locationsFromStagingPG = `
 		ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE sample_locations.ecosystem END,
 		mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)` + locationChangedPG
 
+// corroborateStagedBySHAPG / corroborateStagedByPURLPG close the half of the
+// corroboration invariant the sightings_corroborate trigger cannot see: a
+// sighting recorded BEFORE the sample it cites arrived. addSightingsPG's upsert
+// is delta-guarded, so re-pushing that unchanged sighting returns no subject and
+// marks nothing, and the row stays unflagged for as long as it sits in the
+// queue — which is precisely the row sightedCandidatesPG exists to hand out
+// first. Measured on production 2026-08-24: 9,845 pending samples whose sha256 a
+// sighting cites and 199 more by purl_base carried no flag, against 3,423 that
+// did. Three quarters of the sighted backlog was invisible.
+//
+// Two single-column statements, the same rule markCorroborated*SQL follows and
+// for the same reason. The cheap column tests come first, so a steady-state
+// re-walk pays a sightings probe only for staged rows that are still pending and
+// still unflagged — not for the 91.7M-row corpus it re-observes.
+//
+// Scoped to pending rows (cleave_result IS NULL) because that is the set the
+// claim tiers rank. An already-analyzed row that missed its flag changes no
+// queue order; healing it is RemarkCorroborated's job, and paying a probe for
+// every re-observed analyzed row on every walk to catch it would not be.
+//
+// Runs in tx2, never tx1: tx1 holds ON CONFLICT row locks that the result-store
+// path contends for, and extending its hold time is what the two-transaction
+// split in insertSampleBatchPG exists to avoid.
+const (
+	corroborateStagedBySHAPG = `
+		UPDATE samples s SET corroborated = true
+		FROM _staging st
+		WHERE s.sha256 = st.sha256 AND NOT s.corroborated AND s.cleave_result IS NULL
+		  AND EXISTS (SELECT 1 FROM sightings g WHERE g.subject = s.sha256)`
+	corroborateStagedByPURLPG = `
+		UPDATE samples s SET corroborated = true
+		FROM _staging st
+		WHERE s.sha256 = st.sha256 AND NOT s.corroborated AND s.cleave_result IS NULL
+		  AND s.purl_base <> ''
+		  AND EXISTS (SELECT 1 FROM sightings g WHERE g.subject = s.purl_base)`
+)
+
 // insertSampleBatchPG upserts one walk batch. It deliberately runs as TWO
 // transactions over one session-scoped staging table, not one:
 //
@@ -2626,6 +2793,14 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 		WHERE s.sha256 = st.sha256
 			AND st.marker_mtime IS NOT NULL`); err != nil {
 		return inserted, nil, fmt.Errorf("hopper: refresh marker mtime: %w", err)
+	}
+
+	// Flag staged rows a sighting already cited before they arrived. See
+	// corroborateStagedBySHAPG for why this cannot live on the sightings side.
+	for _, q := range []string{corroborateStagedBySHAPG, corroborateStagedByPURLPG} {
+		if _, err := tx2.Exec(ctx, q); err != nil {
+			return inserted, nil, fmt.Errorf("hopper: corroborate staged: %w", err)
+		}
 	}
 
 	// Mark stale rows whose path now belongs to a different SHA256.
@@ -4976,6 +5151,13 @@ func (db *DB) staleSamplesPG(ctx context.Context, prefixes []string, olderThan t
 // Mark-corroborated updates MUST be single-column. OR-ing sha256 and purl_base
 // in one predicate forces a sequential scan of samples on large corpora (see
 // plan_audit_test.go). Keep these as separate statements and never merge them.
+//
+// Two shapes of the same rule. The ANY($1) pair is the bulk form, used by
+// RemarkCorroborated's batched backfill. The one-subject pair is the body of
+// the sightings_corroborate trigger, where the subject is a plpgsql field
+// reference rather than a bind parameter; keeping them as constants means the
+// shape test and the EXPLAIN audit cover the trigger body too, instead of it
+// being SQL that only exists inside a migration string.
 const (
 	markCorroboratedBySHASQL = `
 		UPDATE samples SET corroborated = true
@@ -4983,6 +5165,20 @@ const (
 	markCorroboratedByPURLSQL = `
 		UPDATE samples SET corroborated = true
 		WHERE purl_base = ANY($1) AND purl_base <> '' AND NOT corroborated`
+
+	markCorroboratedOneSHASQL = `
+		UPDATE samples SET corroborated = true
+		WHERE NOT corroborated AND sha256 = NEW.subject`
+	markCorroboratedOnePURLSQL = `
+		UPDATE samples SET corroborated = true
+		WHERE purl_base = NEW.subject AND purl_base <> '' AND NOT corroborated`
+
+	clearCorroboratedOneSHASQL = `
+		UPDATE samples SET corroborated = false
+		WHERE corroborated AND sha256 = OLD.subject`
+	clearCorroboratedOnePURLSQL = `
+		UPDATE samples SET corroborated = false
+		WHERE purl_base = OLD.subject AND purl_base <> '' AND corroborated`
 )
 
 // sightingUpsertChunk bounds one INSERT…unnest statement so a producer pushing a
@@ -5010,10 +5206,17 @@ func (db *DB) addSightingsPG(ctx context.Context, s []Sighting) (int, error) {
 		affected := make([]string, len(batch))
 		claims := make([]string, len(batch))
 		filenames := make([]string, len(batch))
+		bases := make([]string, len(batch))
 		published := make([]*time.Time, len(batch))
 		seeded := make([]*time.Time, len(batch))
 		for i := range batch {
 			x := &batch[i]
+			// A producer that predates the column sends nothing, which stores
+			// as the weakest basis rather than as an empty string no consumer
+			// can interpret. See [Basis].
+			if bases[i] = string(x.Basis); bases[i] == "" {
+				bases[i] = string(BasisPredicted)
+			}
 			sources[i], subjects[i], urls[i], notes[i] = x.Source, x.Subject, x.URL, x.Note
 			operators[i], affected[i] = x.Operator, x.Affected
 			claims[i], filenames[i] = string(x.Claim), x.FileName
@@ -5034,23 +5237,29 @@ func (db *DB) addSightingsPG(ctx context.Context, s []Sighting) (int, error) {
 		// we feed into the samples flag update below.
 		rows, err := tx.Query(ctx, `
 			INSERT INTO sightings
-				(source, subject, url, note, operator, affected, claim, filename, published_at, first_seen)
-			SELECT src, subj, u, n, op, aff, cl, fn, pub, COALESCE(seed, now())
+				(source, subject, url, note, operator, affected, claim, filename, basis, published_at, first_seen)
+			SELECT src, subj, u, n, op, aff, cl, fn, bas, pub, COALESCE(seed, now())
 			FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
-			            $6::text[], $7::text[], $8::text[], $9::timestamptz[], $10::timestamptz[])
-				AS t(src, subj, u, n, op, aff, cl, fn, pub, seed)
+			            $6::text[], $7::text[], $8::text[], $9::text[], $10::timestamptz[], $11::timestamptz[])
+				AS t(src, subj, u, n, op, aff, cl, fn, bas, pub, seed)
 			ON CONFLICT (source, subject, affected) DO UPDATE
 				SET url = EXCLUDED.url, note = EXCLUDED.note,
 				    operator = EXCLUDED.operator, claim = EXCLUDED.claim,
-				    filename = EXCLUDED.filename, published_at = EXCLUDED.published_at
+				    filename = EXCLUDED.filename, basis = EXCLUDED.basis,
+				    published_at = EXCLUDED.published_at
 				WHERE sightings.url IS DISTINCT FROM EXCLUDED.url
 				   OR sightings.note IS DISTINCT FROM EXCLUDED.note
 				   OR sightings.operator IS DISTINCT FROM EXCLUDED.operator
 				   OR sightings.claim IS DISTINCT FROM EXCLUDED.claim
 				   OR sightings.filename IS DISTINCT FROM EXCLUDED.filename
+				   -- basis MUST be in the guard, not only in the SET. Without it
+				   -- an otherwise-unchanged row trips the WHERE, writes nothing,
+				   -- and never acquires the value the ladder reads — so every
+				   -- source would score as a guess forever, silently.
+				   OR sightings.basis IS DISTINCT FROM EXCLUDED.basis
 				   OR sightings.published_at IS DISTINCT FROM EXCLUDED.published_at
 			RETURNING subject`,
-			sources, subjects, urls, notes, operators, affected, claims, filenames, published, seeded)
+			sources, subjects, urls, notes, operators, affected, claims, filenames, bases, published, seeded)
 		if err != nil {
 			return 0, fmt.Errorf("hopper: upsert sightings: %w", err)
 		}
@@ -7125,6 +7334,47 @@ func (db *DB) bigArchiveCandidatesPG(ctx context.Context, minBytes int64, hopper
 	return scanClaimRows(rows)
 }
 
+// sightedCandidatesPG returns pending top-level samples an external threat feed
+// has already cited, oldest first. Drained ahead of the unanalyzed backlog so a
+// file something in the world has already called malicious does not wait for its
+// sha256 prefix to come up in Tier 1's random-pivot rotation — which, across a
+// 537k-row backlog, can be days.
+//
+// Reads the denormalized samples.corroborated rather than joining the sightings
+// ledger. Measured on production 2026-08-24, the join costs 780ms per poll at
+// the planner's best (a merge join walking 8,310 rows of idx_samples_claimable_sha
+// to find 200 matches); the nested-loop and hash-join shapes cost 4.4s and 3.9s.
+// This runs on every worker's every poll, so none of those are affordable. The
+// flag turns it into an ordered seek over idx_samples_pending_sighted, whose
+// whole population was 3,423 rows.
+//
+// FIFO by id. Ordering barely matters at this size, and id is the narrowest key
+// that cannot starve anything.
+//
+// Unlike Tier 0, this keeps the attempts guard: the tier drains before the main
+// backlog, so a sighted sample that wedges a worker every time would otherwise
+// sit at its head and be re-offered forever. Feeds cite malware, and malware is
+// exactly what crashes an analyzer.
+//
+// Hoisted into a constant so plan_audit_test.go EXPLAINs the statement that
+// actually runs rather than a paraphrase of it.
+const sightedCandidatesSQL = `
+	SELECT sha256, path, size_bytes, file_type FROM samples
+	WHERE corroborated
+	  AND cleave_result IS NULL AND skip = '' AND parent = ''
+	  AND (note = '' OR last_error_at IS NULL OR last_error_at < $1)
+	  AND attempts < $2
+	ORDER BY id
+	LIMIT $3`
+
+func (db *DB) sightedCandidatesPG(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
+	rows, err := db.pool.Query(ctx, sightedCandidatesSQL, hopperStart.UTC(), maxClaimAttempts, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: sighted candidates: %w", err)
+	}
+	return scanClaimRows(rows)
+}
+
 func (db *DB) unanalyzedCandidatesPG(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
 	pivot := randomSHA256Pivot()
 	rows, err := db.pool.Query(ctx, `
@@ -7293,9 +7543,59 @@ func (db *DB) forceRescanCandidatesPG(ctx context.Context, hopperStart time.Time
 	return scanClaimRows(rows)
 }
 
+// staleTraitsCandidatesSQL is Tier 3's statement. The ORDER BY must stay
+// byte-identical to idx_samples_stale_traits_pri2's column list — that is the
+// whole reason the index exists, and a drifted expression silently demotes the
+// tier to a top-N sort over millions of rows. Hoisted into a constant so
+// plan_audit_test.go can assert that, on real statistics, the plan carries no
+// Sort node at all.
+const staleTraitsCandidatesSQL = `
+	SELECT sha256, path, size_bytes, file_type FROM samples
+	WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''
+	  AND traits_version != $1
+	  AND (corroborated OR analyzed_at < $2)
+	  AND (note = '' OR last_error_at IS NULL OR last_error_at < $3)
+	ORDER BY
+	  corroborated DESC,
+	  CASE
+	    WHEN label = 'good' AND (max_crit >= 5 OR suspicious_count >= 2) THEN 0
+	    WHEN label = 'bad' AND max_crit < 5 AND suspicious_count < 2 THEN 0
+	    ELSE 1
+	  END,
+	  ABS(litmus_score - 0.5),
+	  analyzed_at ASC NULLS LAST
+	LIMIT $4`
+
 // staleTraitsCandidatesPG returns Tier 3 work: samples analyzed with a
-// different traits_version more than rescanAge ago. Prioritizes label
-// disagreements and boundary-confidence rows.
+// different traits_version more than rescanAge ago. Prioritizes externally
+// corroborated rows, then label disagreements and boundary-confidence rows.
+//
+// corroborated leads the ordering because a stale verdict on a sample some feed
+// has cited is the one most worth refreshing: it is the row a reviewer will be
+// looking at. It is a sort key here rather than its own tier (as on the pending
+// side) because this tier already walks an index built in ORDER BY order, so
+// prepending a column is free — the scan simply starts in the corroborated half
+// and falls through when it runs dry.
+//
+// A cited sample also SKIPS THE AGE GATE. rescanAge defaults to 30 days, so
+// without this a sample analyzed last week that a feed cites today waits three
+// more weeks before anything looks at it again — and it is the sample we now have
+// outside evidence against. The gate exists to stop the tier from churning
+// through freshly-analyzed rows; a citation is the signal that says this
+// particular row is worth the churn.
+//
+// What it deliberately does NOT do is re-analyze a sample the current analyzer
+// already judged: traits_version != $1 still gates every row. That is the whole
+// reason this is a relaxed predicate here rather than an auto-queue into the
+// repair tier when a sighting lands. A rescan cannot learn anything from the
+// sighting — the analyzer does not read the ledger — so its only value is a
+// changed analyzer, and re-running an unchanged one trips StoreResult's
+// Redundant() WARN ("the re-analysis learned nothing... a guard that failed
+// upstream"). Queueing those would fire that warning routinely for a legitimate
+// reason and destroy its meaning. The disagreement a citation creates against a
+// CURRENT analysis is a triage question, and TriageSighted / TriageSecondOpinion
+// already ask it — the latter gated on samples.corroborated, which the sightings
+// triggers now keep honest.
 //
 // path <> ” excludes rows whose bytes hopper cannot produce, the same rule
 // [triageServablePathSQL] applies to the triage queues. Reference-only rows —
@@ -7315,21 +7615,7 @@ func (db *DB) staleTraitsCandidatesPG(
 	if currentTraits == "" {
 		return nil, nil
 	}
-	rows, err := db.pool.Query(ctx, `
-		SELECT sha256, path, size_bytes, file_type FROM samples
-		WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''
-		  AND traits_version != $1
-		  AND analyzed_at < $2
-		  AND (note = '' OR last_error_at IS NULL OR last_error_at < $3)
-		ORDER BY
-		  CASE
-		    WHEN label = 'good' AND (max_crit >= 5 OR suspicious_count >= 2) THEN 0
-		    WHEN label = 'bad' AND max_crit < 5 AND suspicious_count < 2 THEN 0
-		    ELSE 1
-		  END,
-		  ABS(litmus_score - 0.5),
-		  analyzed_at ASC NULLS LAST
-		LIMIT $4`,
+	rows, err := db.pool.Query(ctx, staleTraitsCandidatesSQL,
 		currentTraits, time.Now().Add(-rescanAge).UTC(), hopperStart.UTC(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: stale-traits candidates: %w", err)

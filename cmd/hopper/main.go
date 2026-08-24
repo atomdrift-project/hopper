@@ -57,7 +57,9 @@ commands:
   backfill-purl      derive missing samples.purl_base from ecosystem+package (never overwrites; postgres)
   repair-parents     clear samples.parent where the bytes are on disk standalone (--dry-run; postgres)
   drop-sightings     delete the named sources' claims so a re-walk can rebuild them with versions
-  reconcile-corroborated  clear the corroborated flag on samples nothing cites any more (run after a rebuild)
+  reconcile-corroborated  re-derive samples.corroborated from the sightings ledger in both
+                     directions; a repair tool for history and restores — the triggers
+                     keep it correct in normal operation, so this should find nothing
   canonicalize-purls rewrite stored purl_base and sightings.subject spellings onto the current canonical
                      form, then re-derive samples.corroborated (batched; -dry-run; postgres)
   purge-unsupported  delete analyzed rows cleave could not classify
@@ -4016,7 +4018,21 @@ func cmdDropSightings(ctx context.Context) error {
 	return nil
 }
 
-// cmdReconcileCorroborated recomputes the denormalized corroborated flag.
+// cmdReconcileCorroborated makes samples.corroborated match the sightings ledger
+// exactly, in both directions: it marks samples something cites and clears
+// samples nothing cites any more.
+//
+// This is a REPAIR TOOL, not part of normal operation. Nothing schedules it and
+// nothing depends on it: the sightings_corroborate triggers settle the flag
+// inside the transaction that writes the ledger, in both directions, and the
+// ingest side covers the one case a trigger cannot see (a citation already on
+// file when the sample arrives). A correct database gets zero and zero from this.
+//
+// What it is for is history and restores — samples that arrived before either of
+// those mechanisms existed, and any database loaded from a dump taken without
+// them. Run it once after deploying them, and after a restore. If a scheduled run
+// ever reports a nonzero count, that is a bug in the triggers or the ingest fill,
+// not routine maintenance: find the writer that got past them.
 //
 // Run it AFTER a drop-and-rebuild, not between the two: the re-walk re-cites
 // most of what a drop orphaned, so reconciling first only does the work twice.
@@ -4035,12 +4051,21 @@ func cmdReconcileCorroborated(ctx context.Context) error {
 	// No migration: this reads and writes columns that have always existed,
 	// and taking the whole schema's DDL locks on a live cluster to change
 	// nothing is how the last maintenance command failed to run at all.
+	//
+	// Mark first, then clear. The two are independent — one walks the ledger,
+	// the other walks the flagged samples — but in this order a subject that is
+	// both newly cited and newly orphaned settles on the ledger's answer.
+	marked, err := db.RemarkCorroborated(ctx)
+	if err != nil {
+		return err
+	}
 	cleared, err := db.ReconcileCorroborated(ctx)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("cleared %d samples with no remaining citation\n", cleared)
-	slog.Info("corroboration reconciled", "cleared", cleared)
+	fmt.Printf("marked %d samples a sighting cites, cleared %d with no remaining citation\n",
+		marked, cleared)
+	slog.Info("corroboration reconciled", "marked", marked, "cleared", cleared)
 	return nil
 }
 

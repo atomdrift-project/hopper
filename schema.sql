@@ -55,10 +55,26 @@ CREATE TABLE IF NOT EXISTS samples (
 	max_crit      INTEGER NOT NULL DEFAULT 0,
 	suspicious_count INTEGER NOT NULL DEFAULT 0,
 	-- corroborated is true when at least one external threat feed has cited this
-	-- sample's sha256 or purl_base (see the sightings table). A denormalized flag,
-	-- maintained by AddSightings and sample ingest, so the feed's "?feeds=1" filter
-	-- stays a single-column predicate that composes with the tuned feed indexes
-	-- instead of joining the sightings ledger on the hot read path.
+	-- sample's sha256 or purl_base (see the sightings table). Any claim counts --
+	-- 'suspicious' sets it exactly as 'malicious' does; the graded notion is the
+	-- DISTINCT-operator corroboration COUNT, which is a different question asked
+	-- of the ledger directly. A denormalized flag, so the feed's "?feeds=1" filter
+	-- and the sighted claim tier stay single-column predicates that compose with
+	-- the tuned indexes instead of joining the sightings ledger on a hot path.
+	-- (Measured 2026-08-24: the join costs 780ms per claim poll at the planner's
+	-- best; the flag makes it an ordered seek over a 3,423-row partial index.)
+	--
+	-- Maintained from two sides, because one side cannot see the other:
+	--   * the sightings_corroborate trigger, for a citation that arrives after
+	--     the sample -- in the database, so no writer can forget it;
+	--   * corroborateStagedBySHAPG / insertSampleNewPG at ingest, for a citation
+	--     that was already on file when the sample arrived, which the trigger has
+	--     no event to fire on.
+	-- Between them those cover every ongoing path, so the flag is correct the
+	-- instant a transaction commits and no scheduled sweep maintains it.
+	-- reconcile-corroborated re-derives it from the whole ledger in both
+	-- directions; that is a repair tool for history and restores, not a
+	-- dependency of normal operation.
 	corroborated  BOOLEAN NOT NULL DEFAULT false,
 	created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
 	updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -142,6 +158,22 @@ CREATE TABLE IF NOT EXISTS sightings (
 	affected     TEXT NOT NULL DEFAULT '',
 	claim        TEXT NOT NULL DEFAULT 'malicious',
 	filename     TEXT NOT NULL DEFAULT '',
+	-- basis is how the source arrived at the claim: 'predicted' (a detector
+	-- or model fired and nobody adjudicated it), 'hosted' (the source holds
+	-- the artifact as malware) or 'reviewed' (a person adjudicated the report
+	-- before publication). Stamped by the producer from its parallax source
+	-- definition, for the same reason operator is: the judgement belongs
+	-- beside the definition it is about, and that lives in a module hopper
+	-- must not depend on. A copy of the list here would be a second opinion
+	-- that drifts, which is exactly what TrustedBadSources was.
+	--
+	-- It names a FACT, not a policy: "enough on its own" is enough for what,
+	-- and gauntlet, promoter and /v1/lookup each mean a different bar. Each
+	-- consumer applies its own threshold to this; see hopper.Assess.
+	--
+	-- 'predicted' is the fail-safe default, so rows written before the column
+	-- existed under-count confidence until their feed re-pushes.
+	basis        TEXT NOT NULL DEFAULT 'predicted',
 	published_at TIMESTAMPTZ,
 	first_seen   TIMESTAMPTZ NOT NULL DEFAULT now(),
 	PRIMARY KEY (source, subject, affected)
@@ -149,6 +181,59 @@ CREATE TABLE IF NOT EXISTS sightings (
 
 -- Lookup by subject is the read path (SightingsFor): "who cited this sha/purl?".
 CREATE INDEX IF NOT EXISTS idx_sightings_subject ON sightings(subject);
+
+-- Keeps samples.corroborated in step with the ledger on every write, so the flag
+-- can be trusted the instant a transaction commits and nothing has to sweep up
+-- afterwards. FOR EACH ROW (not a statement trigger over a transition table): a
+-- transition table has no statistics, so the planner can pick a hash join that
+-- sequentially scans samples, while constant equality is an index probe by
+-- construction -- the same rule the mark statements follow.
+--
+-- The DELETE arm clears only once the LAST citation is gone: two sources naming
+-- one package is the normal case, and dropping one of them must not
+-- uncorroborate the sample.
+--
+-- What no trigger here can see is a sighting already on file when the sample
+-- arrives; that is the ingest side's job (corroborateStagedBySHAPG,
+-- insertSampleNewPG).
+CREATE OR REPLACE FUNCTION sightings_corroborate() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+	-- Nested, not one AND-ed condition: SQL does not promise to short-circuit,
+	-- and OLD is unassigned on INSERT.
+	IF TG_OP IN ('DELETE', 'UPDATE') THEN
+		IF NOT EXISTS (SELECT 1 FROM sightings WHERE subject = OLD.subject) THEN
+			UPDATE samples SET corroborated = false
+			 WHERE corroborated AND sha256 = OLD.subject;
+			UPDATE samples SET corroborated = false
+			 WHERE purl_base = OLD.subject AND purl_base <> '' AND corroborated;
+		END IF;
+	END IF;
+	IF TG_OP <> 'DELETE' THEN
+		UPDATE samples SET corroborated = true
+		 WHERE NOT corroborated AND sha256 = NEW.subject;
+		UPDATE samples SET corroborated = true
+		 WHERE purl_base = NEW.subject AND purl_base <> '' AND NOT corroborated;
+	END IF;
+	RETURN NULL;
+END;
+$$;
+
+CREATE OR REPLACE TRIGGER sightings_corroborate_trg
+	AFTER INSERT ON sightings
+	FOR EACH ROW EXECUTE FUNCTION sightings_corroborate();
+
+CREATE OR REPLACE TRIGGER sightings_uncorroborate_trg
+	AFTER DELETE ON sightings
+	FOR EACH ROW EXECUTE FUNCTION sightings_corroborate();
+
+-- UPDATE OF subject, so a delta-guarded snapshot re-push -- which only ever
+-- rewrites url/note/operator/claim/filename/published_at -- fires nothing at
+-- all. This exists for the writer that does not exist yet.
+CREATE OR REPLACE TRIGGER sightings_resubject_trg
+	AFTER UPDATE OF subject ON sightings
+	FOR EACH ROW WHEN (OLD.subject IS DISTINCT FROM NEW.subject)
+	EXECUTE FUNCTION sightings_corroborate();
 
 -- The cohort read path: what entered our world recently. Partial, because a
 -- benchmark drawing a fresh cohort is asking about malware, and the suspicious

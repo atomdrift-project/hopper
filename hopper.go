@@ -497,13 +497,14 @@ var ErrNotFound = errors.New("hopper: not found")
 // DB is a connection to the sample registry.
 // Backed by either PostgreSQL (pool) or SQLite (lite).
 type DB struct {
-	pool             *pgxpool.Pool
-	lite             *sql.DB
-	lookup           *fido.Cache[string, *Sample]
-	records          *fido.Cache[string, *cachedRecord]
-	backfillProgress atomic.Pointer[BackfillProgressFn]
-	lookupCounts     lookupCounters
-	recordCounts     recordCounters
+	pool                *pgxpool.Pool
+	lite                *sql.DB
+	lookup              *fido.Cache[string, *Sample]
+	records             *fido.Cache[string, *cachedRecord]
+	backfillProgress    atomic.Pointer[BackfillProgressFn]
+	lookupCounts        lookupCounters
+	recordCounts        recordCounters
+	corroborationCounts corroborationCounters
 	// replicaIndexPolicy makes migrations decline secondary indexes a logical
 	// replica does not need. See SetReplicaIndexPolicy.
 	replicaIndexPolicy bool
@@ -3715,6 +3716,19 @@ func (db *DB) UnanalyzedCandidates(ctx context.Context, hopperStart time.Time, l
 	return db.unanalyzedCandidatesSQLite(ctx, hopperStart, limit)
 }
 
+// SightedCandidates returns up to limit pending samples an external threat feed
+// has already cited (samples.corroborated). Drained ahead of the unanalyzed
+// backlog: a file the outside world has already called malicious should not wait
+// for its sha256 prefix to come up in Tier 1's random-pivot rotation.
+//
+// Pure SELECT; claim ownership lives in the API server's in-memory tracker.
+func (db *DB) SightedCandidates(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
+	if db.pool != nil {
+		return db.sightedCandidatesPG(ctx, hopperStart, limit)
+	}
+	return db.sightedCandidatesSQLite(ctx, hopperStart, limit)
+}
+
 // BigArchiveCandidates returns up to limit unanalyzed samples larger than
 // minBytes (multi-GB ISOs and the like). Offered to capable workers ahead of
 // the random-pivot backlog: big archives are rare and large, so one seldom
@@ -5120,6 +5134,8 @@ func feedArrayFilter(expr, param, cast string, n int) string {
 // feedClassFilter matches a sample's criticality class against the class array
 // bound to param. The expression side is feedClassExpr, so a non-default cutoff
 // compares the inline re-derivation rather than the litmus_class column.
+//
+//nolint:unparam // param is always "$5" today, and stays a parameter on purpose: it keeps each placeholder written beside the query in pg.go that binds it, rather than hidden in a constant here where a reordered SELECT would silently mismatch. feedFeedsFilter, feedEcosystemsFilter and feedDomainsFilter are the same shape with fixed "$3"/"$4"/"$9"; dropping it from this one alone would break that symmetry for a linter's benefit.
 func (q *FeedQuery) feedClassFilter(param string) string {
 	return feedArrayFilter(q.feedClassExpr(), param, "::int[]", len(q.LitmusClasses))
 }
@@ -5297,6 +5313,20 @@ type Sighting struct {
 	// put 1,050 unmatchable rows in this table.
 	FileName string
 	Claim    SightingClaim
+	// Basis is how the source arrived at this claim, as the producer's source
+	// definition judged it at the moment of writing.
+	//
+	// Stamped by the writer for the same reason Operator is: the judgement
+	// belongs beside the source definition it is a judgement about, and that
+	// definition lives in a module hopper does not — and must not — depend on.
+	// A copy of it here would be a second opinion that drifts, which is exactly
+	// what TrustedBadSources was.
+	//
+	// It is the source's basis AS OF the write. A source reclassified later
+	// keeps the old value until its next snapshot re-pushes, which is the same
+	// staleness Operator already accepts and heals the same way. Empty reads as
+	// [BasisPredicted]; see [Basis.Firsthand].
+	Basis Basis
 }
 
 // sightingFamilies maps sighting sources that repackage a shared upstream

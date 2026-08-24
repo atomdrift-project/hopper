@@ -50,6 +50,58 @@ func pragmaHasColumnIn(ctx context.Context, db *sql.DB, table, column string) in
 	return count
 }
 
+// liteSightingCorroborationTriggers keeps samples.corroborated in step with the
+// sightings ledger on every write — insert, delete, and the re-key nothing does
+// yet — so a source drop settles inside its own transaction instead of leaving
+// stale flags for a maintenance command to find later. Mirror of the PG
+// sightings_corroborate function; SQLite has no TG_OP, so the one function
+// becomes three bodies. See pg.go for why the invariant lives in the database.
+//
+// Named once because it is created from two places: the migration list, and the
+// sightings rebuild, which renames the table out from under these and drops
+// them with it.
+var liteSightingCorroborationTriggers = []string{
+	`CREATE TRIGGER IF NOT EXISTS sightings_corroborate_trg
+		AFTER INSERT ON sightings
+		FOR EACH ROW
+		BEGIN
+			UPDATE samples SET corroborated = 1
+			 WHERE corroborated = 0 AND sha256 = NEW.subject;
+			UPDATE samples SET corroborated = 1
+			 WHERE purl_base = NEW.subject AND purl_base != '' AND corroborated = 0;
+		END`,
+	// Only once the LAST citation is gone: two sources naming one package is
+	// the normal case, and dropping one must not uncorroborate the sample.
+	`CREATE TRIGGER IF NOT EXISTS sightings_uncorroborate_trg
+		AFTER DELETE ON sightings
+		FOR EACH ROW
+		WHEN NOT EXISTS (SELECT 1 FROM sightings WHERE subject = OLD.subject)
+		BEGIN
+			UPDATE samples SET corroborated = 0
+			 WHERE corroborated = 1 AND sha256 = OLD.subject;
+			UPDATE samples SET corroborated = 0
+			 WHERE purl_base = OLD.subject AND purl_base != '' AND corroborated = 1;
+		END`,
+	// UPDATE OF subject, so a delta-guarded snapshot re-push — which only ever
+	// rewrites url/note/operator/claim/filename/published_at — fires nothing.
+	`CREATE TRIGGER IF NOT EXISTS sightings_resubject_trg
+		AFTER UPDATE OF subject ON sightings
+		FOR EACH ROW
+		WHEN OLD.subject IS NOT NEW.subject
+		BEGIN
+			UPDATE samples SET corroborated = 0
+			 WHERE corroborated = 1 AND sha256 = OLD.subject
+			   AND NOT EXISTS (SELECT 1 FROM sightings WHERE subject = OLD.subject);
+			UPDATE samples SET corroborated = 0
+			 WHERE purl_base = OLD.subject AND purl_base != '' AND corroborated = 1
+			   AND NOT EXISTS (SELECT 1 FROM sightings WHERE subject = OLD.subject);
+			UPDATE samples SET corroborated = 1
+			 WHERE corroborated = 0 AND sha256 = NEW.subject;
+			UPDATE samples SET corroborated = 1
+			 WHERE purl_base = NEW.subject AND purl_base != '' AND corroborated = 0;
+		END`,
+}
+
 func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maintidx,revive // sequential migration steps; splitting reduces clarity
 	slog.Debug("executing initial schema ddl")
 	if _, err := db.lite.ExecContext(ctx, schemaSQLite); err != nil {
@@ -257,6 +309,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		`DROP INDEX IF EXISTS idx_samples_forced_rescan`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_rescan_queue ` +
 			`ON samples(rescan_priority, rescan_requested_at) WHERE rescan_priority > 0`,
+		// Mirrors idx_samples_pending_sighted: the sighted claim tier. See pg.go
+		// for why the tier reads the denormalized flag instead of joining.
+		`CREATE INDEX IF NOT EXISTS idx_samples_pending_sighted ` +
+			`ON samples(id) ` +
+			`WHERE corroborated = 1 AND cleave_result IS NULL AND skip = '' AND parent = ''`,
 	} {
 		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite: %w", err)
@@ -307,7 +364,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 			return fmt.Errorf("hopper: migrate sqlite samples.corroborated: %w", err)
 		}
 	}
-	for _, ddl := range []string{
+	for _, ddl := range append([]string{
 		`CREATE INDEX IF NOT EXISTS idx_samples_corroborated ` +
 			`ON samples(created_at) ` +
 			`WHERE corroborated = 1 AND parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL`,
@@ -330,15 +387,26 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 			affected     TEXT NOT NULL DEFAULT '',
 			claim        TEXT NOT NULL DEFAULT 'malicious',
 			filename     TEXT NOT NULL DEFAULT '',
+			basis        TEXT NOT NULL DEFAULT 'predicted',
 			published_at DATETIME,
 			first_seen   DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
 			PRIMARY KEY (source, subject, affected)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_sightings_subject ON sightings(subject)`,
 		`CREATE INDEX IF NOT EXISTS idx_sightings_recent ON sightings(first_seen DESC) WHERE claim = 'malicious'`,
-	} {
+	}, liteSightingCorroborationTriggers...) {
 		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite sightings: %w", err)
+		}
+	}
+	// basis on a ledger that predates it. SQLite has no ADD COLUMN IF NOT
+	// EXISTS, so the PRAGMA decides. 'predicted' for existing rows is the
+	// fail-safe: adopting the column under-counts confidence until each feed
+	// re-pushes, rather than crediting claims nobody adjudicated.
+	if pragmaHasColumnIn(ctx, db.lite, "sightings", "basis") == 0 {
+		if _, err := db.lite.ExecContext(ctx,
+			`ALTER TABLE sightings ADD COLUMN basis TEXT NOT NULL DEFAULT 'predicted'`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite sightings basis: %w", err)
 		}
 	}
 	if err := db.migrateLiteSightingsKey(ctx); err != nil {
@@ -1072,16 +1140,22 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 			canonical_sha256, parent, skip, elements,
 			max_crit, suspicious_count, top_traits, mtime, marker_mtime,
 			cleave_result, litmus_result,
-			url, domain, package, version, provenance, fetched_at, purl_base)
+			url, domain, package, version, provenance, fetched_at, purl_base,
+			corroborated)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			-- Mirrors insertSampleNewPG: the sighting usually predates the row on
+			-- this path, so the sightings trigger has nothing left to fire on.
+			EXISTS (SELECT 1 FROM sightings WHERE subject = ?)
+			  OR (? != '' AND EXISTS (SELECT 1 FROM sightings WHERE subject = ?)))
 		`+sampleConflictUpdateSQLite,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, samplesPath, s.Status,
 		s.SHA256, samplesParent, s.Skip, s.Elements,
 		s.MaxCrit, s.SuspiciousCount, s.TopTraits, s.Mtime, s.MarkerMtime,
 		jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult),
-		s.URL, s.Domain, s.Package, s.Version, jsonTextOrNil(s.Provenance), s.FetchedAt, s.PURLBase)
+		s.URL, s.Domain, s.Package, s.Version, jsonTextOrNil(s.Provenance), s.FetchedAt, s.PURLBase,
+		s.SHA256, s.PURLBase, s.PURLBase)
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
@@ -1292,6 +1366,24 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 	for _, s := range samples {
 		if _, err := stagingStmt.ExecContext(ctx, s.SHA256); err != nil {
 			return 0, nil, fmt.Errorf("hopper: staging exec: %w", err)
+		}
+	}
+
+	// Flag staged rows a sighting already cited before they arrived — the half of
+	// the invariant the sightings trigger cannot see. Mirrors
+	// corroborateStagedBySHAPG / corroborateStagedByPURLPG; single-column each.
+	for _, q := range []string{
+		`UPDATE samples SET corroborated = 1
+		 WHERE corroborated = 0 AND cleave_result IS NULL
+		   AND sha256 IN (SELECT sha256 FROM _batch_shas)
+		   AND EXISTS (SELECT 1 FROM sightings g WHERE g.subject = samples.sha256)`,
+		`UPDATE samples SET corroborated = 1
+		 WHERE corroborated = 0 AND cleave_result IS NULL AND purl_base != ''
+		   AND sha256 IN (SELECT sha256 FROM _batch_shas)
+		   AND EXISTS (SELECT 1 FROM sightings g WHERE g.subject = samples.purl_base)`,
+	} {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return 0, nil, fmt.Errorf("hopper: corroborate staged: %w", err)
 		}
 	}
 
@@ -3386,6 +3478,7 @@ func (db *DB) staleSamplesSQLite(ctx context.Context, prefixes []string, olderTh
 // a legacy table is copied into the current shape once. Guarded by the stored
 // DDL rather than by a version counter: the table either has the columns or it
 // does not, and asking it is cheaper than remembering.
+
 func (db *DB) migrateLiteSightingsKey(ctx context.Context) error {
 	var ddl string
 	err := db.lite.QueryRowContext(ctx,
@@ -3399,7 +3492,7 @@ func (db *DB) migrateLiteSightingsKey(ctx context.Context) error {
 	if strings.Contains(ddl, "affected") {
 		return nil
 	}
-	for _, stmt := range []string{
+	for _, stmt := range append([]string{
 		`ALTER TABLE sightings RENAME TO sightings_legacy`,
 		`CREATE TABLE sightings (
 			source       TEXT NOT NULL,
@@ -3430,7 +3523,10 @@ func (db *DB) migrateLiteSightingsKey(ctx context.Context) error {
 		`DROP TABLE sightings_legacy`,
 		`CREATE INDEX IF NOT EXISTS idx_sightings_subject ON sightings(subject)`,
 		`CREATE INDEX IF NOT EXISTS idx_sightings_recent ON sightings(first_seen DESC) WHERE claim = 'malicious'`,
-	} {
+		// The rename carried the corroboration triggers onto sightings_legacy and
+		// the DROP took them with it; recreate them rather than leaving the ledger
+		// untriggered until the next startup.
+	}, liteSightingCorroborationTriggers...) {
 		if _, err := db.lite.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("hopper: rebuild sqlite sightings: %w", err)
 		}
@@ -3460,24 +3556,37 @@ func (db *DB) addSightingsSQLite(ctx context.Context, s []Sighting) (int, error)
 		if !s[i].FirstSeen.IsZero() {
 			seeded = s[i].FirstSeen.UTC().Format("2006-01-02T15:04:05.000Z")
 		}
+		// A producer that predates the column sends nothing, which stores as
+		// the weakest basis rather than as an empty string no consumer can
+		// interpret. See [Basis].
+		basis := string(s[i].Basis)
+		if basis == "" {
+			basis = string(BasisPredicted)
+		}
 		err := tx.QueryRowContext(ctx, `
 			INSERT INTO sightings
-				(source, subject, url, note, operator, affected, claim, filename, published_at, first_seen)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+				(source, subject, url, note, operator, affected, claim, filename, basis, published_at, first_seen)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 				COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
 			ON CONFLICT (source, subject, affected) DO UPDATE
 				SET url = excluded.url, note = excluded.note,
 				    operator = excluded.operator, claim = excluded.claim,
-				    filename = excluded.filename, published_at = excluded.published_at
+				    filename = excluded.filename, basis = excluded.basis,
+				    published_at = excluded.published_at
 				WHERE sightings.url IS NOT excluded.url
 				   OR sightings.note IS NOT excluded.note
 				   OR sightings.operator IS NOT excluded.operator
 				   OR sightings.claim IS NOT excluded.claim
 				   OR sightings.filename IS NOT excluded.filename
+				   -- basis MUST be in the guard, not only in the SET: without it
+				   -- an otherwise-unchanged row writes nothing and never acquires
+				   -- the value the ladder reads, so every source would score as a
+				   -- guess forever, silently.
+				   OR sightings.basis IS NOT excluded.basis
 				   OR sightings.published_at IS NOT excluded.published_at
 			RETURNING subject`,
 			s[i].Source, s[i].Subject, s[i].URL, s[i].Note, s[i].Operator,
-			s[i].Affected, string(s[i].Claim), s[i].FileName, published,
+			s[i].Affected, string(s[i].Claim), s[i].FileName, basis, published,
 			seeded).Scan(&subj)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue // unchanged row: DO UPDATE guard tripped, nothing returned
@@ -4798,6 +4907,20 @@ func (db *DB) bigArchiveCandidatesSQLite(ctx context.Context, minBytes int64, ho
 		 LIMIT ?`, minBytes, startCutoff, maxClaimAttempts, limit)
 }
 
+// sightedCandidatesSQLite mirrors sightedCandidatesPG: pending top-level samples
+// an external feed has already cited, oldest first, ahead of the main backlog.
+func (db *DB) sightedCandidatesSQLite(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
+	startCutoff := hopperStart.UTC().Format(time.RFC3339Nano)
+	return queryLiteCandidates(ctx, db.lite, `
+		SELECT sha256, path, size_bytes, file_type FROM samples
+		WHERE corroborated = 1
+		  AND cleave_result IS NULL AND skip = '' AND parent = ''
+		  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
+		  AND attempts < ?
+		ORDER BY id
+		LIMIT ?`, startCutoff, maxClaimAttempts, limit)
+}
+
 func (db *DB) unanalyzedCandidatesSQLite(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
 	startCutoff := hopperStart.UTC().Format(time.RFC3339Nano)
 	pivot := randomSHA256Pivot()
@@ -4955,9 +5078,10 @@ func (db *DB) staleTraitsCandidatesSQLite(
 		`SELECT sha256, path, size_bytes, file_type FROM samples
 		WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''
 		  AND traits_version != ?
-		  AND analyzed_at < ?
+		  AND (corroborated = 1 OR analyzed_at < ?)
 		  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
 		ORDER BY
+		  corroborated DESC,
 		  CASE
 		    WHEN label = 'good' AND (max_crit >= 5 OR suspicious_count >= 2) THEN 0
 		    WHEN label = 'bad' AND max_crit < 5 AND suspicious_count < 2 THEN 0

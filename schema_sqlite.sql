@@ -97,12 +97,73 @@ CREATE TABLE IF NOT EXISTS sightings (
 	affected     TEXT NOT NULL DEFAULT '',
 	claim        TEXT NOT NULL DEFAULT 'malicious',
 	filename     TEXT NOT NULL DEFAULT '',
+	-- basis is how the source arrived at the claim: 'predicted' (a detector
+	-- or model fired and nobody adjudicated it), 'hosted' (the source holds
+	-- the artifact as malware) or 'reviewed' (a person adjudicated the report
+	-- before publication). Stamped by the producer from its parallax source
+	-- definition, for the same reason operator is: the judgement belongs
+	-- beside the definition it is about, and that lives in a module hopper
+	-- must not depend on. A copy of the list here would be a second opinion
+	-- that drifts, which is exactly what TrustedBadSources was.
+	--
+	-- It names a FACT, not a policy: "enough on its own" is enough for what,
+	-- and gauntlet, promoter and /v1/lookup each mean a different bar. Each
+	-- consumer applies its own threshold to this; see hopper.Assess.
+	--
+	-- 'predicted' is the fail-safe default, so rows written before the column
+	-- existed under-count confidence until their feed re-pushes.
+	basis        TEXT NOT NULL DEFAULT 'predicted',
 	published_at DATETIME,
 	first_seen   DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
 	PRIMARY KEY (source, subject, affected)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sightings_subject ON sightings(subject);
+
+-- SQLite mirror of schema.sql's sightings_corroborate triggers: no operation on
+-- the ledger can leave samples.corroborated behind. SQLite has no TG_OP, so the
+-- one PG function becomes three bodies. Kept in step with
+-- liteSightingCorroborationTriggers in sqlite.go, which creates the same three
+-- on an already-migrated database.
+CREATE TRIGGER IF NOT EXISTS sightings_corroborate_trg
+AFTER INSERT ON sightings
+FOR EACH ROW
+BEGIN
+	UPDATE samples SET corroborated = 1
+	 WHERE corroborated = 0 AND sha256 = NEW.subject;
+	UPDATE samples SET corroborated = 1
+	 WHERE purl_base = NEW.subject AND purl_base != '' AND corroborated = 0;
+END;
+
+-- Only once the LAST citation is gone: two sources naming one package is the
+-- normal case, and dropping one must not uncorroborate the sample.
+CREATE TRIGGER IF NOT EXISTS sightings_uncorroborate_trg
+AFTER DELETE ON sightings
+FOR EACH ROW
+WHEN NOT EXISTS (SELECT 1 FROM sightings WHERE subject = OLD.subject)
+BEGIN
+	UPDATE samples SET corroborated = 0
+	 WHERE corroborated = 1 AND sha256 = OLD.subject;
+	UPDATE samples SET corroborated = 0
+	 WHERE purl_base = OLD.subject AND purl_base != '' AND corroborated = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS sightings_resubject_trg
+AFTER UPDATE OF subject ON sightings
+FOR EACH ROW
+WHEN OLD.subject IS NOT NEW.subject
+BEGIN
+	UPDATE samples SET corroborated = 0
+	 WHERE corroborated = 1 AND sha256 = OLD.subject
+	   AND NOT EXISTS (SELECT 1 FROM sightings WHERE subject = OLD.subject);
+	UPDATE samples SET corroborated = 0
+	 WHERE purl_base = OLD.subject AND purl_base != '' AND corroborated = 1
+	   AND NOT EXISTS (SELECT 1 FROM sightings WHERE subject = OLD.subject);
+	UPDATE samples SET corroborated = 1
+	 WHERE corroborated = 0 AND sha256 = NEW.subject;
+	UPDATE samples SET corroborated = 1
+	 WHERE purl_base = NEW.subject AND purl_base != '' AND corroborated = 0;
+END;
 
 CREATE TABLE IF NOT EXISTS workers (
 	name      TEXT PRIMARY KEY,

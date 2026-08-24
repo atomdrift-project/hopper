@@ -715,6 +715,10 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	// waiting to happen, so they exist only when there are bytes to serve.
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /_/replica", s.handleReplicaStatus)
+	// Process counters only. Deliberately NOT folded into /healthz, which says
+	// of itself that it touches no database and must stay a liveness check
+	// rather than growing into a diagnostics page.
+	mux.HandleFunc("GET /_/corroboration", s.handleCorroborationStatus)
 	// Lookup routes answer from the local (replica) database; freshOr adds the
 	// ?fresh=1 / X-Hopper-Fresh escape hatch that routes one read to the
 	// primary when a client needs to see its own just-relayed write (a no-op
@@ -2023,9 +2027,9 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true}) //nolint:errcheck,errchkjson // best-effort response
 }
 
-// claimJobs walks the priority tiers (interactive uploads → forced
-// rescans → unanalyzed backlog → path-prefix rescans → stale traits) in
-// order, fetching candidate batches from the DB and claiming the first
+// claimJobs walks the priority tiers (interactive uploads → forced rescans →
+// sighted backlog → unanalyzed backlog → path-prefix rescans → stale traits)
+// in order, fetching candidate batches from the DB and claiming the first
 // count that aren't held by another worker. Over-fetches so that
 // contention with other concurrent pollers doesn't starve a requester at
 // the head of the queue.
@@ -2054,6 +2058,27 @@ func (s *apiServer) claimJobs(
 	// random-pivot rotation.
 	want = count - len(out)
 	cands, err = s.db.ForcedRescanCandidates(ctx, s.hopperStart, overfetch)
+	if err != nil {
+		return out, err
+	}
+	cands = filterCandidates(cands, tools, maxBytes, slots)
+	out = append(out, s.tracker.tryClaimBatch(cands, worker, claimExpiry, want)...)
+	if len(out) >= count {
+		return out, nil
+	}
+
+	// Tier 1s: pending samples an external threat feed has already cited. Drained
+	// before the unanalyzed backlog because Tier 1 hands work out in random sha256
+	// order: a sighted sample entering a 537k-row backlog waits for its prefix to
+	// come up, which is days, and it is the one sample we already have outside
+	// evidence against. The tier is small (3,423 rows in production on
+	// 2026-08-24) and self-draining, so it cannot starve the tiers below it for
+	// long.
+	//
+	// After Tier 0, not before: an operator's explicit rescan and a user watching
+	// an upload page are human intent, and human intent outranks a feed hit.
+	want = count - len(out)
+	cands, err = s.db.SightedCandidates(ctx, s.hopperStart, overfetch)
 	if err != nil {
 		return out, err
 	}
@@ -2630,11 +2655,32 @@ type sightingRequest struct {
 	// The rest are optional, so a producer that predates them keeps working:
 	// an omitted claim is malicious (what every row meant before the column
 	// existed) and an omitted operator falls back to the source's family.
-	Operator    string `json:"operator"`
-	Affected    string `json:"affected"`
-	Claim       string `json:"claim"`
-	FileName    string `json:"filename"`
+	Operator string `json:"operator"`
+	Affected string `json:"affected"`
+	Claim    string `json:"claim"`
+	FileName string `json:"filename"`
+	// Basis is how the source arrived at the claim — 'predicted', 'hosted' or
+	// 'reviewed'. An omitted or unrecognized value is stored as 'predicted',
+	// the weakest, so a producer too old to send it under-counts confidence
+	// rather than crediting claims nobody adjudicated.
+	Basis       string `json:"basis"`
 	PublishedAt string `json:"published_at"`
+}
+
+// sightingBasis reads a producer's basis, refusing to interpret what it does
+// not recognize.
+//
+// A value this build does not know is a row written by a producer newer than
+// it, and crediting one we cannot interpret is the failure that costs
+// something: it would let an unknown string climb the ladder. Disbelieving one
+// costs a rung, which is the side to err on.
+func sightingBasis(s string) hopper.Basis {
+	switch b := hopper.Basis(strings.TrimSpace(s)); b {
+	case hopper.BasisHosted, hopper.BasisReviewed:
+		return b
+	default:
+		return hopper.BasisPredicted
+	}
 }
 
 // parseSightingTime reads a producer's published_at. An unparseable or absent
@@ -2789,6 +2835,7 @@ func (s *apiServer) handleSightings(w http.ResponseWriter, r *http.Request) {
 			Source: req.Source, Subject: subject, URL: req.URL, Note: req.Note,
 			Operator: req.Operator, Affected: req.Affected,
 			Claim: hopper.SightingClaim(req.Claim), FileName: req.FileName,
+			Basis:       sightingBasis(req.Basis),
 			PublishedAt: parseSightingTime(req.PublishedAt),
 		}
 	}

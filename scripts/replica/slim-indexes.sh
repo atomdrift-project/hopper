@@ -160,6 +160,7 @@ idx_samples_parent
 idx_samples_pending_cleave_group
 idx_samples_pending_litmus_group
 idx_samples_pending_path
+idx_samples_pending_sighted
 idx_samples_pending_size
 idx_samples_reconcile_toplevel
 idx_samples_rescan_queue
@@ -168,7 +169,7 @@ idx_samples_review_newest
 idx_samples_source_ecosystem
 idx_samples_source_feed
 idx_samples_stale_traits
-idx_samples_stale_traits_pri
+idx_samples_stale_traits_pri2
 idx_samples_top_created
 idx_samples_top_ready_first_analyzed_coalesce
 idx_samples_unanalyzed_id
