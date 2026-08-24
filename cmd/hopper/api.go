@@ -714,6 +714,7 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	// safeFileServer with an empty root would be a path-containment bug
 	// waiting to happen, so they exist only when there are bytes to serve.
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("GET /_/replica", s.handleReplicaStatus)
 	// Lookup routes answer from the local (replica) database; freshOr adds the
 	// ?fresh=1 / X-Hopper-Fresh escape hatch that routes one read to the
 	// primary when a client needs to see its own just-relayed write (a no-op
@@ -849,6 +850,41 @@ func (s *apiServer) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 		"status": "ok",
 		"uptime": time.Since(s.hopperStart).Round(time.Second).String(),
 	})
+}
+
+// handleReplicaStatus reports how current this instance's data is, and whether
+// it is a replica at all.
+//
+// Exists because a replica's staleness was invisible to the one component that
+// most needed it. A scan worker that cannot answer a lookup from its own index
+// asks the corpus, replica first, and takes a 404 as "nothing known" — on the
+// stated grounds that replication lag is a narrow window. Nothing enforced that
+// narrowness: measured at 27 minutes, during which every verdict the primary
+// already held read as absence, and a caller gating installs was told we knew
+// nothing about a package analyzed minutes earlier.
+//
+// With this, a reader can tell the two apart and reach for ?fresh=1 when the
+// replica is too far behind to be believed about an absence.
+//
+// Separate from /healthz on purpose: that one touches no database so its
+// failure isolates the serving loop. This one asks the database, which is the
+// entire point of it.
+func (s *apiServer) handleReplicaStatus(w http.ResponseWriter, r *http.Request) {
+	body := map[string]any{"replica": s.readOnly}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	if lag, err := s.db.DataLag(ctx); err != nil {
+		// Reported rather than hidden: a reader that cannot learn the lag must
+		// treat the replica as untrustworthy, and it can only do that if the
+		// failure reaches it.
+		slog.Warn("replica status: data lag unavailable", "err", err)
+		body["error"] = "lag unavailable"
+	} else {
+		body["lag_seconds"] = int64(lag.Seconds())
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(body) //nolint:errcheck,errchkjson // best-effort response
 }
 
 const (

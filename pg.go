@@ -5864,6 +5864,37 @@ func (db *DB) canonicalizeSightingSubjectsPG(ctx context.Context, dryRun bool) (
 // cutoff, matching the trigger and feedClassExpr's default-cutoff path; the WHERE
 // guarantees litmus_result IS NOT NULL, so the trigger's null branch is omitted.
 // No updated_at bump: healing a derived column must not reshuffle update queues.
+
+// DataLag reports how far behind this instance's data is: the age of the
+// newest row it holds.
+//
+// Deliberately not a replication-internals measure. No subscription
+// privileges, no connection to the publisher, one index-only scan of
+// idx_samples_updated_at. What a reader needs to know is whether the answer it
+// is about to receive is current, and the age of the newest row asks that
+// question directly — where WAL byte counts and slot positions answer a
+// related but different one.
+//
+// It reads the fleet's write rate as well as its replication delay, and in a
+// genuine write pause the two are indistinguishable. That is the safe
+// direction: it makes a reader more cautious, never less. On a primary it is
+// simply the age of the last write, which is what it should be.
+func (db *DB) DataLag(ctx context.Context) (time.Duration, error) {
+	var newest *time.Time
+	if err := db.pool.QueryRow(ctx, `SELECT max(updated_at) FROM samples`).Scan(&newest); err != nil {
+		return 0, fmt.Errorf("hopper: newest sample: %w", err)
+	}
+	// An empty corpus is not a stale one.
+	if newest == nil {
+		return 0, nil
+	}
+	// Clocks disagree; a row stamped slightly ahead of us is not negative lag.
+	if lag := time.Since(*newest); lag > 0 {
+		return lag, nil
+	}
+	return 0, nil
+}
+
 // backfillTopTraitsPG heals top_traits for rows written before the derive
 // trigger learned the column, in two sweeps so the benign majority never
 // costs a cleave_result detoast: rows with suspicious_count = 0 can't have
