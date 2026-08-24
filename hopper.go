@@ -1899,8 +1899,86 @@ func (db *DB) Close() {
 // Pool returns the underlying PostgreSQL connection pool, or nil for SQLite.
 func (db *DB) Pool() *pgxpool.Pool { return db.pool }
 
+// migrationLockKey serialises schema migration across every process that
+// touches one database. Any hopper migrating this cluster must use this key.
+//
+// The value spells "HOPPER"; it is arbitrary and only has to be agreed.
+const migrationLockKey int64 = 0x484F50504552
+
+// errMigrationLocked reports that another process is already migrating.
+var errMigrationLocked = errors.New("hopper: another process holds the migration lock")
+
+// tryMigrationLock takes the advisory lock that makes one hopper the only
+// migrator, returning a release function and whether it was acquired.
+//
+// A PostgreSQL SESSION advisory lock is the right primitive here, and the
+// alternatives are not:
+//
+//   - It is not transactional, so it coexists with CREATE INDEX CONCURRENTLY,
+//     which cannot run inside a transaction. A transaction-scoped lock would be
+//     unusable for exactly the DDL that most needs protecting.
+//   - The server releases it when the session ends, crash included, so there is
+//     no stale-lock recovery path to get wrong — which is where a hand-rolled
+//     lock table rots.
+//
+// It is a TRY, never a wait. Queueing behind another migrator is what produced
+// the 2026-08-24 incident: index migrations run with lock_timeout = 0 and so
+// wait forever, and a maintenance command sat 22 minutes in silence trying to
+// DROP an index the production hopper was 24 minutes into building.
+//
+// This is also what makes invalidPGIndex sound rather than lucky. That check
+// reads indisvalid = false as "left broken by a crash", which is equally the
+// state of an index another process is building right now; the two were
+// indistinguishable, so a second migrator would destroy the first one's work
+// and rebuild it. Under this lock no other migrator can be mid-build, and a
+// crashed one's session death has already released the lock — so the predicate
+// means what the code always assumed it meant.
+func (db *DB) tryMigrationLock(ctx context.Context) (release func(), acquired bool, err error) {
+	if db.pool == nil {
+		return func() {}, true, nil // SQLite: one file, one process, no contention
+	}
+	conn, err := db.pool.Acquire(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("hopper: acquire migration lock connection: %w", err)
+	}
+	var got bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, migrationLockKey).Scan(&got); err != nil {
+		conn.Release()
+		return nil, false, fmt.Errorf("hopper: take migration lock: %w", err)
+	}
+	if !got {
+		conn.Release()
+		return nil, false, nil
+	}
+	return func() {
+		// context.WithoutCancel: the lock must be released even when the caller
+		// is unwinding a cancelled context, or it lingers until the pool
+		// eventually recycles the connection.
+		if _, uerr := conn.Exec(context.WithoutCancel(ctx),
+			`SELECT pg_advisory_unlock($1)`, migrationLockKey); uerr != nil {
+			slog.Warn("failed to release migration lock; dropping connection", "error", uerr)
+			conn.Conn().Close(context.WithoutCancel(ctx)) //nolint:errcheck,gosec // discarding the tainted conn
+		}
+		conn.Release()
+	}, true, nil
+}
+
 // Migrate creates the schema if it does not exist.
+//
+// It is a no-op when another process is already migrating: the schema is that
+// process's responsibility, and the caller waiting on it is the failure mode
+// this lock exists to prevent.
 func (db *DB) Migrate(ctx context.Context) error {
+	release, acquired, err := db.tryMigrationLock(ctx)
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		slog.Warn("another hopper holds the migration lock; skipping migration")
+		return nil
+	}
+	defer release()
+
 	if db.pool != nil {
 		if err := db.migratePG(ctx); err != nil {
 			return err
@@ -1926,16 +2004,34 @@ func (db *DB) Migrate(ctx context.Context) error {
 // returned function is a no-op.
 func (db *DB) MigrateServing(ctx context.Context) (func(context.Context) error, error) {
 	if db.pool != nil {
+		release, acquired, err := db.tryMigrationLock(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !acquired {
+			// Another hopper is migrating. Serving the current schema beats
+			// blocking startup on someone else's index build, which is the
+			// judgement this whole path already makes about deferrable DDL.
+			slog.Warn("another hopper holds the migration lock; serving without migrating")
+			return func(context.Context) error { return nil }, nil
+		}
 		// allowRewrite is false: the serving path must never run a
 		// table-rewriting migration on a populated samples table, since the
 		// ACCESS EXCLUSIVE lock would freeze every reader and writer for the
 		// length of the rewrite. Such a migration is deferred to `hopper init`.
 		build, err := db.migrateServingPG(ctx, false)
+		release()
 		if err != nil {
 			return nil, err
 		}
+		// The lock is retaken per attempt rather than held across the whole
+		// background build: an attempt can retry for minutes, and pinning a
+		// pool connection for that long to guard work that is not yet running
+		// costs more than it protects. Contention returns errMigrationLocked,
+		// which retryDeferredMigrations already treats as "try again later" —
+		// the retry loop is the backoff this needs.
 		return func(ctx context.Context) error {
-			return retryDeferredMigrations(ctx, build)
+			return retryDeferredMigrations(ctx, db.lockedBuild(build))
 		}, nil
 	}
 	if err := db.migrateSQLite(ctx); err != nil {
@@ -1949,6 +2045,23 @@ const (
 	indexMigrationRetryMax = 5 * time.Minute
 )
 
+// lockedBuild wraps a deferred migration step so it runs only while this
+// process holds the migration lock, and reports contention as a retryable
+// error rather than silently doing nothing.
+func (db *DB) lockedBuild(build func(context.Context) error) func(context.Context) error {
+	return func(ctx context.Context) error {
+		release, acquired, err := db.tryMigrationLock(ctx)
+		if err != nil {
+			return err
+		}
+		if !acquired {
+			return errMigrationLocked
+		}
+		defer release()
+		return build(ctx)
+	}
+}
+
 // retryDeferredMigrations keeps trying index/ANALYZE DDL until it succeeds or
 // the process is shutting down. Failures are logged and swallowed: the server
 // is already accepting work, and a lock timeout behind replica tablesync must
@@ -1960,8 +2073,16 @@ func retryDeferredMigrations(ctx context.Context, build func(context.Context) er
 		if err == nil {
 			return nil
 		}
-		slog.Warn("background index migration failed; retrying (serving continues)",
-			"attempt", attempt, "retry_in", backoff, "error", err)
+		// Contention is not a failure: another hopper is doing this work, and
+		// saying "failed" about it would put a false alarm in the log every
+		// time two processes start together.
+		if errors.Is(err, errMigrationLocked) {
+			slog.Info("another hopper is migrating; deferring background index migration",
+				"attempt", attempt, "retry_in", backoff)
+		} else {
+			slog.Warn("background index migration failed; retrying (serving continues)",
+				"attempt", attempt, "retry_in", backoff, "error", err)
+		}
 		select {
 		case <-ctx.Done():
 			slog.Warn("background index migration abandoned", "error", ctx.Err(), "last_error", err)

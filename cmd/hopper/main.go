@@ -1067,6 +1067,12 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	pauseWalk := f.Bool("pause-walk", false,
 		"serve workers, results, and migrations but run no corpus walks (initial, ingest, or reconcile); "+
 			"for maintenance windows — new files on disk are not ingested while set")
+	// The only way past the once-a-day guard, and deliberately the only way: a
+	// full pass is expensive enough that starting one has to be something
+	// somebody asked for rather than something a restart can cause.
+	forceWalk := f.Bool("force-walk", false,
+		"run a full reconcile walk on this start even if one already ran today; "+
+			"the once-a-day guard exists because a full pass can outlast the gap between restarts")
 	parseFlags(f, os.Args[2:])
 	explicitLitmusBin := flagWasSet(f, "litmus")
 	explicitCleaveBin := flagWasSet(f, "cleave")
@@ -1650,7 +1656,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		"next", "load samples")
 
 	total := loadAll(loadCtx, loadCancel, db, litmus, tracker, api, cache,
-		loadDirs, fileChs, *source, *hashWorkers, *rescan, *maxAnalyzed, *experimentTag, wd, traitsVersion, *rescanAge, *pauseWalk)
+		loadDirs, fileChs, *source, *hashWorkers, *rescan, *maxAnalyzed, *experimentTag, wd, traitsVersion, *rescanAge, *pauseWalk, *forceWalk)
 	if *reportsDir != "" {
 		wd.beginStage("reports.ingest", "Ingesting reports")
 		stats, err := db.IngestReportsDir(ctx, *reportsDir, "re", "cyclotron")
@@ -1804,35 +1810,140 @@ const (
 )
 
 // reconcileDoneKey stores, in hopper_kv, when the last full reconcile pass
-// began (RFC3339). It is per-cluster state and deliberately not replicated.
+// began (RFC3339), written once that pass has finished. It is per-cluster
+// state and deliberately not replicated.
 const reconcileDoneKey = "walk_reconcile_started_at"
+
+// reconcileAttemptKey stores when the last full reconcile pass was *started*,
+// written before it runs and left behind whether or not it finishes.
+//
+// Its whole purpose is to survive a pass that never completes. reconcileDoneKey
+// cannot: it is written after the walk returns, so a corpus whose full pass
+// outlives the gap between restarts never stamps it at all.
+const reconcileAttemptKey = "walk_reconcile_attempted_at"
 
 // startupWalkScope decides what the startup pass must do: a full reconcile, or
 // a cheap incremental catch-up because one ran recently enough.
 //
 // Fails safe in every direction — no recorded time, an unparseable one, a
 // future one (clock moved), or a database that cannot answer all yield a full
-// reconcile. The cost of a needless full pass is disk; the cost of wrongly
-// skipping one is undetected moved/missing files, so only the first mistake is
-// acceptable.
-func startupWalkScope(ctx context.Context, db *hopper.DB) (cutoff time.Time, reconcile bool) {
-	v, err := db.KVGet(ctx, reconcileDoneKey)
+// reconcile. A needless full pass costs disk and a wrongly skipped one costs
+// undetected moved/missing files, so given one mistake the first is the one to
+// prefer.
+//
+// What that reasoning missed is that the two mistakes are not paid once each.
+// Skipping is paid once; reconciling is paid every time the process starts, and
+// a full pass over this corpus takes longer than the gap between restarts on a
+// bad day. Gating only on completion therefore stamps nothing, so every start
+// launches another full-tree walk over the same disks the last one is still
+// reading. Measured 2026-08-24: nineteen restarts in twenty hours left
+// thirty-six enumerations running at once, the oldest eleven hours old, and the
+// pool they shared became the bottleneck for result ingestion, corpus lookups
+// and logical replication alike — the corpus stopped learning entirely, which
+// is the cost skipping a reconcile was supposed to avoid.
+//
+// So a full pass is attempted at most once per interval whether or not it
+// finishes. A crash-loop now degrades to incremental walks instead of
+// compounding, and the reconcile is late rather than perpetual.
+func startupWalkScope(ctx context.Context, db *hopper.DB, force bool) (cutoff time.Time, reconcile bool) {
+	done, doneOK := reconcileStamp(ctx, db, reconcileDoneKey)
+	tried, triedOK := reconcileStamp(ctx, db, reconcileAttemptKey)
+	scope := decideWalkScope(
+		reconcileMark{at: done, ok: doneOK},
+		reconcileMark{at: tried, ok: triedOK},
+		force,
+		time.Now(),
+	)
+	switch {
+	case scope.forced:
+		slog.Warn("full reconcile forced by --force-walk; the once-a-day guard does not apply to this start")
+	case scope.unfinished:
+		slog.Warn("a full reconcile started within the last day and never finished; walking incrementally rather than starting another",
+			"attempted", tried,
+			"next_attempt_after", tried.Add(reconcileWalkInterval))
+	default:
+		// A pass that finished recently, or one that is genuinely due. Both are
+		// the ordinary case and the caller already logs which.
+	}
+	return scope.cutoff, scope.reconcile
+}
+
+// reconcileMark is one stamp as it was read. `ok` is false when the marker was
+// missing, unreadable or unparseable — all of which read as "no such pass".
+type reconcileMark struct {
+	at time.Time
+	ok bool
+}
+
+// walkScope is what the startup pass should do, given what the previous ones
+// left behind.
+//
+// Separated from the reading of the stamps so the rule itself can be exercised
+// directly. The version of this that lived only inside a database call was
+// tested through a hand-copied mirror of its logic, which is a test of the
+// mirror.
+type walkScope struct {
+	cutoff    time.Time
+	reconcile bool
+	// forced is set when the caller demanded a full pass outright.
+	forced bool
+	// unfinished is set when the decision rests on a full pass that started and
+	// was never recorded as finished — the case worth a line in the log,
+	// because it is the one where a reconcile is genuinely overdue.
+	unfinished bool
+}
+
+func decideWalkScope(done, attempt reconcileMark, force bool, now time.Time) walkScope {
+	if force {
+		return walkScope{reconcile: true, forced: true}
+	}
+	// A pass that finished inside the window leaves only what changed while it
+	// ran. Its start, not its finish, is the conservative bound: anything
+	// written during the pass is re-examined rather than assumed seen.
+	if done.ok && isCurrent(done.at, now) {
+		return walkScope{cutoff: done.at}
+	}
+	// A pass that started inside the window and never finished must not be
+	// joined by another. This is the whole guard: see startupWalkScope's
+	// history for what gating on completion alone did to the fleet.
+	if attempt.ok && isCurrent(attempt.at, now) {
+		return walkScope{cutoff: attempt.at, unfinished: true}
+	}
+	return walkScope{reconcile: true}
+}
+
+// isCurrent reports whether a pass stamped at t is recent enough that another
+// is not yet due. A future timestamp is not current: a clock that moved
+// backwards would otherwise suppress reconciles until it caught up.
+func isCurrent(t, now time.Time) bool {
+	age := now.Sub(t)
+	return age >= 0 && age < reconcileWalkInterval
+}
+
+// reconcileStamp reads one RFC3339 reconcile marker. A marker that is missing,
+// unreadable or unparseable reads as absent, which forces a full pass.
+func reconcileStamp(ctx context.Context, db *hopper.DB, key string) (time.Time, bool) {
+	v, err := db.KVGet(ctx, key)
 	if err != nil || v == "" {
-		return time.Time{}, true
+		return time.Time{}, false
 	}
-	last, perr := time.Parse(time.RFC3339, v)
+	t, perr := time.Parse(time.RFC3339, v)
 	if perr != nil {
-		slog.Warn("unparseable reconcile timestamp; forcing a full reconcile walk", "value", v, "error", perr)
-		return time.Time{}, true
+		slog.Warn("unparseable reconcile timestamp; ignoring it", "key", key, "value", v, "error", perr)
+		return time.Time{}, false
 	}
-	age := time.Since(last)
-	if age < 0 || age >= reconcileWalkInterval {
-		return time.Time{}, true
+	return t, true
+}
+
+// recordReconcileAttempt stamps the beginning of a full pass, before it runs,
+// so that a restart before it finishes does not start another.
+//
+// Best-effort, and wrong in the same direction as everything else here: a write
+// that fails leaves the next start free to reconcile again.
+func recordReconcileAttempt(ctx context.Context, db *hopper.DB, started time.Time) {
+	if err := db.KVSet(ctx, reconcileAttemptKey, started.UTC().Format(time.RFC3339)); err != nil {
+		slog.Warn("could not record reconcile start; a restart before this pass finishes will start another", "error", err)
 	}
-	// Reconcile is current, so walk only what changed since it started. Using
-	// the reconcile's own start (not "now") is the conservative bound: anything
-	// written while it ran is re-examined rather than assumed seen.
-	return last, false
 }
 
 // recordReconcileDone stamps a completed reconcile pass. Best-effort: a write
@@ -1860,7 +1971,17 @@ const (
 	// reconcileWalkInterval is the slower cadence for a full walk that also
 	// reconciles pools (detects moved/missing/relabeled files). It is kept
 	// separate from ingest so the expensive reconcile never gates ingestion.
-	reconcileWalkInterval = 6 * time.Hour
+	//
+	// Once a day, and it means once a day: the interval is both how often the
+	// periodic pass fires and how long a pass already made suppresses another,
+	// so a restart — a deploy, a crash, an operator — cannot buy a second full
+	// walk inside the same day. `--force-walk` is the way to ask for one
+	// anyway, and is the only way.
+	//
+	// 24h rather than 6h (2026-08-24): a full pass over this corpus does not
+	// reliably finish inside six hours, and an interval shorter than the work
+	// it schedules is not an interval at all.
+	reconcileWalkInterval = 24 * time.Hour
 	// reconcileTimeout bounds a single ReconcilePools pass. A reconcile that
 	// once ran unbounded for over an hour stranded all ingestion; capping it
 	// means a pathological pass is abandoned and retried next cycle instead.
@@ -2008,8 +2129,9 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	traitsVersion string,
 	rescanAge time.Duration,
 	pauseWalk bool,
+	forceWalk bool,
 ) int {
-	slog.Info("loading", "dirs", len(dirs), "pause_walk", pauseWalk)
+	slog.Info("loading", "dirs", len(dirs), "pause_walk", pauseWalk, "force_walk", forceWalk)
 	start := time.Now()
 
 	// markMissing is false when the data root deliberately holds only part of the
@@ -2106,9 +2228,12 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 		slog.Warn("corpus walks paused by --pause-walk; new files will not be ingested until restarted without it")
 		progress.walkDone.Store(true)
 	} else {
-		cutoff, reconcile := startupWalkScope(ctx, db)
+		cutoff, reconcile := startupWalkScope(ctx, db, forceWalk)
 		if reconcile {
 			slog.Info("startup walk: full pass with reconcile")
+			// Stamped before the walk, not after: this is the marker that stops
+			// the next start from launching a second full pass beside this one.
+			recordReconcileAttempt(ctx, db, initialStart)
 		} else {
 			slog.Info("startup walk: incremental (reconcile still current)", "since", cutoff)
 		}
@@ -2143,6 +2268,7 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 					lastStart = reconStart
 					progress.walkDone.Store(false)
 					slog.Info("starting full reconcile walk")
+					recordReconcileAttempt(ctx, db, reconStart)
 					pass.run(ctx, nil, time.Time{}, true)
 					recordReconcileDone(ctx, db, reconStart)
 				case <-ctx.Done():
@@ -3146,6 +3272,9 @@ func streamCleaveIterFiles(ctx context.Context, dir string, newerThan time.Time,
 
 	start := time.Now()
 	cmd := exec.CommandContext(ctx, cleaveBinary, args...)
+	// Context cancellation stops a walker only while there is a parent alive to
+	// do the cancelling. Ask the kernel to finish the job when there is not.
+	dieWithParent(cmd)
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 	stdout, err := cmd.StdoutPipe()
@@ -3927,10 +4056,16 @@ func cmdCanonicalizePURLs(ctx context.Context) error {
 	}
 	defer db.Close()
 
-	if err := db.Migrate(ctx); err != nil {
-		return err
-	}
-
+	// No migration, for the same reason reconcile-corroborated skips it: this
+	// rewrites purl_base and sightings.subject, columns that have always
+	// existed, so the whole schema's DDL is taken to change nothing.
+	//
+	// It is not merely wasteful. Index migrations run with lock_timeout = 0 and
+	// so wait forever, and invalidPGIndex reads indisvalid = false as "left
+	// broken by a crash" when it is equally the state of an index another
+	// hopper is building right now. On 2026-08-24 that combination parked this
+	// command for 22 minutes trying to DROP idx_samples_sighted_purl out from
+	// under the production hopper that was 24 minutes into building it.
 	slog.Info("canonicalizing stored purl_base spellings", "dry_run", *dryRun)
 	n, err := db.CanonicalizePURLBases(ctx, *dryRun)
 	if err != nil {

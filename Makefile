@@ -60,6 +60,8 @@ help:
 	@echo "  make clean                  Clean build artifacts"
 	@echo "  make install-precommit      Install the git pre-commit hook (test + lint + go.mod)"
 	@echo "  make deploy                 Install Hopper and its separate scan worker"
+	@echo "                              (reaps corpus walkers left by the previous run"
+	@echo "                               before restarting; they outlive an abrupt stop)"
 	@echo "                              (DATA_DIR=$(DATA_DIR) DB=... SOURCE=$(SOURCE)"
 	@echo "                               API_ADDR=$(API_ADDR) DASH_ADDR=$(DASH_ADDR) TOKEN_SRC=~/.tok/hopper"
 	@echo "                               Linux: WORKERS=$(WORKERS) MAX_MEMORY_GB=$(MAX_MEMORY_GB)"

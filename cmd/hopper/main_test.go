@@ -1150,7 +1150,7 @@ func TestLoadDir(t *testing.T) {
 
 	shared := &loadProgress{}
 	shared.analyzeDurationMin.Store(math.MaxInt64)
-	n := loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{dir, "bad"}}, nil, "test", 2, false, 0, "", nil, "", 0, false)
+	n := loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{dir, "bad"}}, nil, "test", 2, false, 0, "", nil, "", 0, false, false)
 	// 2 valid files inserted (tiny skipped, .git skipped)
 	if n != 2 {
 		t.Errorf("loadAll returned %d, want 2", n)
@@ -1191,7 +1191,7 @@ func TestLoadDirSkipsForagerSidecars(t *testing.T) {
 	mustWriteFile(t, filepath.Join(host, "."+binSHA+".sidecar.json"), []byte(`{"fetch_url":"https://example/x"}`))
 	mustWriteFile(t, filepath.Join(host, otherSHA+".json"), []byte(`{"fetch_url":"https://example/y"}`))
 
-	n := loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{dir, "good"}}, nil, "forager", 1, false, 0, "", nil, "", 0, false)
+	n := loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{dir, "good"}}, nil, "forager", 1, false, 0, "", nil, "", 0, false, false)
 	if n != 1 {
 		t.Errorf("loadAll returned %d, want 1 (only the binary, sidecars skipped)", n)
 	}
@@ -1237,7 +1237,7 @@ func TestLoadDirReadsVendorSidecar(t *testing.T) {
 	mustWriteFile(t, filepath.Join(host, "."+sha+".sidecar.json"),
 		fmt.Appendf(nil, `{"fetch_url":%q,"source":"amass","hostname":"owasp-amass.github.io"}`, url))
 
-	loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{dir, "good"}}, nil, "forager", 1, false, 0, "", nil, "", 0, false)
+	loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{dir, "good"}}, nil, "forager", 1, false, 0, "", nil, "", 0, false, false)
 
 	got, err := db.SampleBySHA256(ctx, sha)
 	if err != nil {
@@ -1287,7 +1287,7 @@ func TestLoadDirWithCache(t *testing.T) {
 	// First load: cache miss, hashes file.
 	s1 := &loadProgress{}
 	s1.analyzeDurationMin.Store(math.MaxInt64)
-	n1 := loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, cache, []struct{ dir, label string }{{dir, "bad"}}, nil, "test", 1, false, 0, "", nil, "", 0, false)
+	n1 := loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, cache, []struct{ dir, label string }{{dir, "bad"}}, nil, "test", 1, false, 0, "", nil, "", 0, false, false)
 	if n1 != 1 {
 		t.Errorf("first load = %d, want 1", n1)
 	}
@@ -1295,7 +1295,7 @@ func TestLoadDirWithCache(t *testing.T) {
 	// Second load: cache hit, same hash → duplicate skipped.
 	s2 := &loadProgress{}
 	s2.analyzeDurationMin.Store(math.MaxInt64)
-	n2 := loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, cache, []struct{ dir, label string }{{dir, "bad"}}, nil, "test", 1, false, 0, "", nil, "", 0, false)
+	n2 := loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, cache, []struct{ dir, label string }{{dir, "bad"}}, nil, "test", 1, false, 0, "", nil, "", 0, false, false)
 	if n2 != 1 { // 1 total (0 inserted + 1 skipped)
 		t.Errorf("second load = %d, want 1", n2)
 	}
@@ -1330,7 +1330,7 @@ func TestLoadSkipsReconcileAfterEnumerationFailure(t *testing.T) {
 
 	loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil,
 		[]struct{ dir, label string }{{good, "good"}}, nil,
-		"test", 1, false, 0, "", nil, "", 0, false)
+		"test", 1, false, 0, "", nil, "", 0, false, false)
 	got, err := db.SampleBySHA256(ctx, sha)
 	if err != nil {
 		t.Fatal(err)
@@ -1373,7 +1373,7 @@ func TestLoadDirMarkers(t *testing.T) {
 
 	sm := &loadProgress{}
 	sm.analyzeDurationMin.Store(math.MaxInt64)
-	loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{dir, "bad"}}, nil, "test", 1, false, 0, "", nil, "", 0, false)
+	loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{dir, "bad"}}, nil, "test", 1, false, 0, "", nil, "", 0, false, false)
 
 	// The sample should be flipped to "good" with skip="misclassified".
 	samples, err := db.SamplesByLabel(ctx, "good", 10)
@@ -1419,7 +1419,7 @@ func TestLoadDirMarkersRefreshMarkerMtimeOnDuplicate(t *testing.T) {
 
 	sm := &loadProgress{}
 	sm.analyzeDurationMin.Store(math.MaxInt64)
-	loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{dir, "bad"}}, nil, "test", 1, false, 0, "", nil, "", 0, false)
+	loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{dir, "bad"}}, nil, "test", 1, false, 0, "", nil, "", 0, false, false)
 
 	samples, err := db.SamplesByLabel(ctx, "good", 10)
 	if err != nil {
@@ -1434,7 +1434,7 @@ func TestLoadDirMarkersRefreshMarkerMtimeOnDuplicate(t *testing.T) {
 	}
 	sm = &loadProgress{}
 	sm.analyzeDurationMin.Store(math.MaxInt64)
-	loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{dir, "bad"}}, nil, "test", 1, false, 0, "", nil, "", 0, false)
+	loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{dir, "bad"}}, nil, "test", 1, false, 0, "", nil, "", 0, false, false)
 
 	samples, err = db.SamplesByLabel(ctx, "good", 10)
 	if err != nil {
@@ -1471,7 +1471,7 @@ func TestLoadRehabilitatesAfterMarkerRemoved(t *testing.T) {
 	goodDir := t.TempDir()
 	mustWriteFile(t, filepath.Join(goodDir, "x.bin"), content)
 	mustWriteFile(t, filepath.Join(goodDir, "._x.bin.BAD"), nil)
-	loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{goodDir, "good"}}, nil, "test", 1, false, 0, "", nil, "", 0, false)
+	loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{goodDir, "good"}}, nil, "test", 1, false, 0, "", nil, "", 0, false, false)
 
 	flipped, err := db.SamplesByLabel(ctx, "bad", 10)
 	if err != nil {
@@ -1488,7 +1488,7 @@ func TestLoadRehabilitatesAfterMarkerRemoved(t *testing.T) {
 	// Phase 2: same content now in bad/ with no marker → rehabilitate.
 	badDir := t.TempDir()
 	mustWriteFile(t, filepath.Join(badDir, "x.bin"), content)
-	loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{badDir, "bad"}}, nil, "test", 1, false, 0, "", nil, "", 0, false)
+	loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{badDir, "bad"}}, nil, "test", 1, false, 0, "", nil, "", 0, false, false)
 
 	got, err := db.SampleBySHA256(ctx, sha)
 	if err != nil {
@@ -2115,7 +2115,7 @@ func TestLoadAllPauseWalk(t *testing.T) {
 	mustWriteFile(t, filepath.Join(dir, "malware2.bin"), []byte("malicious payload two"))
 
 	n := loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil,
-		[]struct{ dir, label string }{{dir, "bad"}}, nil, "test", 1, false, 0, "", nil, "", 0, true)
+		[]struct{ dir, label string }{{dir, "bad"}}, nil, "test", 1, false, 0, "", nil, "", 0, true, false)
 	if n != 0 {
 		t.Errorf("loadAll with pauseWalk inserted %d samples, want 0", n)
 	}

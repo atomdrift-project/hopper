@@ -174,17 +174,18 @@ priv_noninteractive() {
 }
 if priv_noninteractive; then
     declare -a priv_missing=()
-    for c in install systemctl chgrp chmod find; do
+    for c in install systemctl chgrp chmod find pgrep pkill; do
         priv "$c" --version >/dev/null 2>&1 || priv_missing+=("$c")
     done
     if (( ${#priv_missing[@]} > 0 )); then
         die "doas/sudo is configured but not permitted to run: ${priv_missing[*]}
-  the deploy installs units (install, systemctl) and the perms-heal timer runs
-  chgrp/chmod as root. Grant these to $(id -un) — e.g. /etc/doas.conf:
+  the deploy installs units (install, systemctl), reaps the previous run's
+  corpus walkers (pgrep, pkill) and the perms-heal timer runs chgrp/chmod as
+  root. Grant these to $(id -un) — e.g. /etc/doas.conf:
       permit nopass $(id -un)
   (or a cmd-scoped rule covering the above) — or run 'make deploy' as root."
     fi
-    log "doas/sudo capability check passed (install, systemctl, chgrp, chmod, find)"
+    log "doas/sudo capability check passed (install, systemctl, chgrp, chmod, find, pgrep, pkill)"
 else
     log "escalation requires a password; skipping non-interactive doas capability probe"
 fi
@@ -633,7 +634,43 @@ fi
 
 priv systemctl enable --now "${SERVICE_NAME}.service" >/dev/null
 
+# Walkers left behind by the process we are about to replace.
+#
+# `cleave iter-files` enumerates the whole sample tree, and hopper moves it into
+# the worker cgroup (see workercgroup.go) so it counts against the workers'
+# memory budget rather than the master's floor. That also moves it out of the
+# unit's own cgroup, so a systemd restart does not necessarily take it with the
+# service — it survives, reading the sample pool for a pass nobody will collect,
+# and another set is left behind on the next restart. Measured 2026-08-24:
+# thirty-six of them from nineteen previous incarnations, the oldest eleven
+# hours old, between them holding the disks that result ingestion, corpus
+# lookups and logical replication all read from.
+#
+# Reaped before the restart, deliberately: every walker alive now belongs to the
+# outgoing process, and every walker alive afterwards belongs to its
+# replacement. Doing this after would kill the walk we just started.
+reap_walkers() {
+    local pattern='cleave.*iter-files' pids n
+    # Asked once and counted from that answer: a second pgrep can disagree with
+    # the first, and under `set -euo pipefail` a walker that exits between the
+    # two would abort the deploy over its own good news.
+    pids=$(priv pgrep -u "${SERVICE_USER}" -f "${pattern}" || true)
+    [[ -n ${pids} ]] || return 0
+    n=$(printf '%s\n' "${pids}" | wc -l | tr -d ' ')
+    log "Stopping ${n} corpus walker(s) left by the previous run"
+    priv pkill -TERM -u "${SERVICE_USER}" -f "${pattern}" 2>/dev/null || true
+    for _ in {1..10}; do
+        priv pgrep -u "${SERVICE_USER}" -f "${pattern}" >/dev/null 2>&1 || return 0
+        sleep 1
+    done
+    # A walker blocked in a disk read does not act on SIGTERM promptly, and
+    # giving those disks back is the entire point of reaping it.
+    log "Walkers still present after SIGTERM; sending SIGKILL"
+    priv pkill -KILL -u "${SERVICE_USER}" -f "${pattern}" 2>/dev/null || true
+}
+
 if (( binary_changed || unit_changed || token_changed )); then
+    reap_walkers
     log "Restarting ${SERVICE_NAME}"
     if ! priv systemctl restart "${SERVICE_NAME}.service"; then
         priv systemctl --no-pager --full status "${SERVICE_NAME}.service" || true

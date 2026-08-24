@@ -290,10 +290,50 @@ else
 fi
 $SUDO sysrc hopper_enable=YES >/dev/null
 
+# Walkers left behind by the process we are about to replace.
+#
+# `cleave iter-files` enumerates the whole sample tree. Hopper starts it, but
+# the supervisor does not own it: an abrupt stop leaves it running, reading the
+# sample pool for a pass nobody will ever collect, and each restart leaves
+# another set behind. Measured 2026-08-24: thirty-six of them from nineteen
+# previous incarnations, the oldest eleven hours old, between them holding the
+# disks that result ingestion, corpus lookups and logical replication all read
+# from. Hopper now asks the kernel to kill them with it, but that only covers
+# incarnations started by a build that has it.
+#
+# Reaped before the restart, deliberately: every walker alive now belongs to the
+# outgoing process, and every walker alive afterwards belongs to its
+# replacement. Doing this after would kill the walk we just started.
+reap_walkers() {
+	pattern='cleave.*iter-files'
+	# Asked once and counted from that answer: a second pgrep can disagree with
+	# the first, and under `set -e` a walker that exits between the two would
+	# abort the deploy over its own good news.
+	pids=$($SUDO pgrep -u "$SERVICE_USER" -f "$pattern" || true)
+	[ -n "$pids" ] || return 0
+	n=$(printf '%s\n' "$pids" | wc -l | tr -d ' ')
+	log "Stopping $n corpus walker(s) left by the previous run"
+	$SUDO pkill -TERM -u "$SERVICE_USER" -f "$pattern" 2>/dev/null || true
+	i=0
+	while [ "$i" -lt 10 ]; do
+		$SUDO pgrep -u "$SERVICE_USER" -f "$pattern" >/dev/null 2>&1 || return 0
+		sleep 1
+		i=$((i + 1))
+	done
+	# A walker blocked in a disk read does not act on SIGTERM promptly, and
+	# giving those disks back is the entire point of reaping it.
+	log "Walkers still present after SIGTERM; sending SIGKILL"
+	$SUDO pkill -KILL -u "$SERVICE_USER" -f "$pattern" 2>/dev/null || true
+}
+
 if $SUDO service hopper status >/dev/null 2>&1; then
+	reap_walkers
 	log "Restarting Hopper"
 	$SUDO service hopper restart
 else
+	# Nothing is supervising them, so anything still walking is orphaned by
+	# definition — a stopped service cannot be the parent of a running walk.
+	reap_walkers
 	log "Starting Hopper"
 	$SUDO service hopper start
 fi
