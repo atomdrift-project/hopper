@@ -74,8 +74,8 @@ type LookupRecord struct {
 	// no level at all, and null means no level applies to this record. It is
 	// measured, never chosen — a caller's own budget is what it gets compared
 	// against, and that comparison does not happen here.
-	FiresAt       *int            `json:"fires_at"`
-	EngineVersion *string         `json:"engine_version"`
+	FiresAt       *int    `json:"fires_at"`
+	EngineVersion *string `json:"engine_version"`
 	// TraitsVersion is the analyzer-judgment hash this verdict was produced
 	// under — hopper's invalidation key. Distinct from EngineVersion (the scan
 	// build): a build can change without the judgment changing, and this field
@@ -84,7 +84,7 @@ type LookupRecord struct {
 	// at the worker's own traits version (the 2026-08-23 renewal storm:
 	// thousands of dependency re-scans per hour whose stores all logged
 	// "re-analysis learned nothing").
-	TraitsVersion *string `json:"traits_version"`
+	TraitsVersion *string         `json:"traits_version"`
 	AnalyzedAt    *string         `json:"analyzed_at"`
 	Reason        *string         `json:"reason"`
 	Findings      []LookupFinding `json:"findings"`

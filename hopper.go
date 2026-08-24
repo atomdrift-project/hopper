@@ -5102,7 +5102,8 @@ type Sighting struct {
 	// Affected is the version constraint as the source wrote it; empty means
 	// the subject as a whole. Part of the key, because one source can make two
 	// separate claims about one package — ossf carries one report for
-	// @whalent/agent 0.3.230-0.3.302 and another for 0.3.358 — and a key
+	// the @whalent/agent package has one for 0.3.230-0.3.302 and another for
+	// 0.3.358 — and a key
 	// without it silently keeps whichever was written last.
 	Affected string
 	URL      string // advisory / blog / report link (optional)

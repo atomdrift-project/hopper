@@ -268,7 +268,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			`ON samples (purl_base, version) ` +
 			`INCLUDE (id, sha256, created_at, ecosystem, file_type, analyzed_at) ` +
 			`WHERE purl_base != '' AND label != 'bad' AND cleave_result IS NOT NULL ` +
-			`AND parent = '' AND skip = '' AND path != ''`,
+			`AND parent = '' AND skip = '' AND path <> ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS corroborated BOOLEAN NOT NULL DEFAULT false`,
 		// Partial indexes holding only corroborated top-level ready rows: the
 		// "?feeds=1" filter (FeedQuery.Corroborated) walks these in created_at
