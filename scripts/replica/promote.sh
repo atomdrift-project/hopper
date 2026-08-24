@@ -23,6 +23,7 @@ REMOTE_HOST="${REMOTE_HOST:-hopper}"
 REMOTE_USER="${REMOTE_USER:-hopper}"
 REMOTE_DB="${REMOTE_DB:-hopper}"
 LOCAL_DB="${LOCAL_DB:-hopper}"
+LOCAL_USER="${LOCAL_USER:-hopper}"
 SUBSCRIPTION="${SUBSCRIPTION:-hopper_replica}"
 OFFLINE_PROMOTE="${OFFLINE_PROMOTE:-0}"
 
@@ -151,8 +152,8 @@ SQL
 done
 
 log "Granting hopper role REPLICATION for future subscribers"
-admin -v ON_ERROR_STOP=1 <<'SQL'
-ALTER ROLE hopper WITH REPLICATION;
+admin -v ON_ERROR_STOP=1 -v role="$LOCAL_USER" <<'SQL'
+ALTER ROLE :"role" WITH REPLICATION;
 SQL
 
 # --- 5. Verify/backfill the new schema is in place ------------------------
@@ -185,13 +186,25 @@ fi
 
 # --- 6. Revert disposable-replica tuning ----------------------------------
 # A read replica trades durability for throughput; a primary must be durable.
-# Flip the pieces back. (full_page_writes stays off — it's safe on ZFS even for
-# a primary, since copy-on-write rules out torn pages.)
+# Flip the pieces back. (full_page_writes stays off — setup.sh only ever turns
+# it off on a copy-on-write filesystem, where the absence of in-place overwrite
+# rules out torn pages for a primary just as it did for the replica.
+# checkpoint_timeout stays at 30min too: that is what the publisher runs.)
 log "Restoring synchronous_commit=on (this box is becoming a durable primary)"
 admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
 ALTER SYSTEM SET synchronous_commit = on;
 SELECT pg_reload_conf();
 SQL
+
+# Reader parallelism: setup.sh pins max_parallel_workers_per_gather on the
+# reader role so feed queries cannot starve the single-threaded apply worker
+# for device queue. A primary has no apply worker to protect and does carry the
+# reporting queries that parallelism exists for, so hand the knob back to the
+# cluster default rather than leaving a role-level pin nobody remembers setting.
+log "Restoring $LOCAL_USER parallelism to the cluster default"
+admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
+    -c "ALTER ROLE \"$LOCAL_USER\" RESET max_parallel_workers_per_gather" >/dev/null \
+    || log "warning: could not reset $LOCAL_USER parallelism — do it by hand"
 # Rebuild the master-only indexes slim-indexes.sh dropped — a primary's write
 # pipeline (worker queues, ingest lookups) needs them, a read replica didn't.
 # Best-effort: CREATE INDEX over TB-scale tables takes hours, so run it here

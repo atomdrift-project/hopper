@@ -125,6 +125,43 @@ scripts/replica/zfs-tune.sh apply  zroot/bastille/jails/<jail>/pgdata
 # promote.sh prints the matching revert (sync=standard) for the host to run.
 ```
 
+**PostgreSQL server tuning — applied by `setup.sh` on every replica.** These
+used to live only in `freebsd-bastille.sh`, so a Linux replica (galadriel) never
+got them; `setup.sh` now applies them itself, on every platform.
+`REPLICA_TUNE=false` skips the durability/parallelism trades —
+`wal_receiver_timeout` is still applied, since that one is apply-worker
+resilience rather than something traded away:
+
+| setting | value | why |
+|---|---|---|
+| `wal_receiver_timeout` | `10min` | the 1-minute default turns a slow catch-up into a restart loop |
+| `checkpoint_timeout` | `30min` | FPIs regenerate on first touch after each checkpoint; the stock 5min does that 12×/hour. Matches the publisher |
+| `full_page_writes` | `off` **if CoW** | 64.7% of publisher WAL *bytes* were FPIs; off cut WAL 15.06 → 6.14 MB/s |
+| `max_parallel_workers_per_gather` | `0` on the reader role | one runaway feed query must not fork more bulkread scanners into the queue the apply worker is stuck behind |
+
+`full_page_writes=off` is **gated on the filesystem**, not on the replica being
+rebuildable. Copy-on-write (ZFS, btrfs) never overwrites a live block, so a torn
+8 KB page is unreachable; on ext4/xfs/ufs it is a corruption risk on power loss
+and `setup.sh` leaves the setting alone and says so. The probe reads the mount
+table rather than `df -T "$PGDATA"` — pgdata is mode 0700 and the script runs as
+the operator, so `df` would fail and silently take the safe branch forever.
+
+The parallelism cap is set with `ALTER ROLE`, not `ALTER SYSTEM`, so it applies
+to prism/beamline/cyclotron logins and deliberately *overrides* the cluster-wide
+`max_parallel_workers_per_gather=4` that `freebsd-bastille.sh` sets below;
+`hopper init`'s index builds read `max_parallel_maintenance_workers` and are
+untouched. Override with `REPLICA_MAX_PARALLEL_PER_GATHER=<n>`. `promote.sh`
+RESETs it — a primary has no apply worker to protect and does run the reporting
+queries parallelism exists for.
+
+Why this block exists at all: on 2026-08-24 the publisher generated 11.9 MB/s of
+WAL while the replica burned it down at 13.1 MB/s — a 1.2 MB/s net against a
+151 GB backlog. The publisher was *not* the constraint (its walsender sat 75% in
+`Client:WalSenderWriteData`, waiting on the subscriber); the apply worker was,
+60% in `IO:DataFileRead` behind a device carrying 3.6 GB/s at queue depth 65.
+Apply is single-threaded, so its ceiling is 1/latency — ~850 reads/s at the
+1.17 ms that queue was actually returning.
+
 **PostgreSQL read/apply tuning — now deploy defaults.** `freebsd-bastille.sh`
 sets these in its tuning block (they take effect on the restart it already
 does), sized from host RAM: `shared_buffers` (~RAM/8, capped 16 GB),

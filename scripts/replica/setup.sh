@@ -15,7 +15,9 @@
 #   * The hopper binary is built (./hopper) or installed on $PATH.
 #
 # Overridable via env: REMOTE_HOST, REMOTE_USER, REMOTE_DB, LOCAL_DB,
-# LOCAL_USER, PUBLICATION, SUBSCRIPTION, COPY_DATA, PGPASSFILE.
+# LOCAL_USER, PUBLICATION, SUBSCRIPTION, COPY_DATA, PGPASSFILE,
+# ZFS_TUNE, REPLICA_TUNE, REPLICA_MAX_PARALLEL_PER_GATHER,
+# REPLICA_SLIM_INDEXES.
 
 set -eu
 
@@ -314,6 +316,10 @@ if [ -n "$RETRY_TRUNCATE" ]; then
     log "Interrupted mid-COPY with leftover rows — will truncate for a clean tablesync retry:$RETRY_TRUNCATE"
 fi
 
+# PGDATA backs both the ZFS tuning below and the copy-on-write probe that
+# decides whether full_page_writes can safely be turned off. Resolve it once.
+PGDATA=$(admin -tAc 'SHOW data_directory' 2>/dev/null | tr -d '[:space:]')
+
 # Disposable read-replica ZFS tuning (sync=disabled, logbias=throughput). A
 # replica is read-only and rebuildable, so trade crash durability for write
 # throughput — a big win for the bulk copy and steady apply. Default on; set
@@ -321,19 +327,113 @@ fi
 # durable primary. Best-effort: a no-op inside a Bastille jail (tune the pool
 # from the host) and on non-ZFS boxes.
 if [ "${ZFS_TUNE:-true}" = "true" ]; then
-    PGDATA=$(admin -tAc 'SHOW data_directory' 2>/dev/null | tr -d '[:space:]') \
-        "$SCRIPT_DIR/zfs-tune.sh" apply \
+    PGDATA="$PGDATA" "$SCRIPT_DIR/zfs-tune.sh" apply \
         || log "warning: ZFS tuning step failed (continuing)"
 fi
 
-# Apply-worker resilience: the 1-minute default wal_receiver_timeout tears down
-# (and restarts from the slot's restart_lsn) any stream whose publisher-side
-# decode is slow — e.g. while catching up a large backlog. That turns a slow
-# catch-up into a restart loop. Give the receiver real slack.
-admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+# --- Disposable read-replica server tuning ---------------------------------
+# Everything here exists to keep the single-threaded apply worker fed. The
+# 2026-08-24 catch-up stall is the worked example: the publisher was generating
+# 11.9 MB/s of WAL and the replica was burning it down at 13.1 MB/s, a 1.2 MB/s
+# net against a 151 GB backlog — 35 hours if nothing else moved, and negative
+# whenever the master bursted. The walsender was idle 75% of the time blocked on
+# Client:WalSenderWriteData (i.e. waiting for THIS box), while the apply worker
+# sat 60% in IO:DataFileRead behind a device carrying 3.6 GB/s of reads at queue
+# depth 65. Apply is serial, so its ceiling is 1/latency: at the 1.17 ms the
+# device was actually returning, ~850 reads/s. Set REPLICA_TUNE=false to skip.
+if [ "${REPLICA_TUNE:-true}" = "true" ]; then
+
+    # Reader parallelism. A replica's job is to apply; serving reads is the
+    # side job that must not starve it. Every parallel worker a feed query
+    # forks scans with the bulkread ring buffer, and N concurrent readers each
+    # forking max_parallel_workers_per_gather more of them multiply into the
+    # device queue the apply worker is stuck behind — on 2026-08-24, 9.5 TB of
+    # the replica's 13.6 TB lifetime reads were bulkread, against a single
+    # apply worker doing 8 KB random reads. Capping it at 0 makes a heavy
+    # report slower and leaves apply able to make progress; that is the right
+    # trade on a box whose reason to exist is being current. Set on the role
+    # rather than the cluster so maintenance (hopper init's index builds, which
+    # read max_parallel_maintenance_workers instead) is untouched, and so the
+    # value applies to prism/beamline/cyclotron connections at login.
+    case "${REPLICA_MAX_PARALLEL_PER_GATHER:=0}" in
+        ''|*[!0-9]*) die "REPLICA_MAX_PARALLEL_PER_GATHER must be a non-negative integer, got '$REPLICA_MAX_PARALLEL_PER_GATHER'" ;;
+    esac
+    log "Capping reader parallelism: $LOCAL_USER max_parallel_workers_per_gather=$REPLICA_MAX_PARALLEL_PER_GATHER"
+    admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
+        -c "ALTER ROLE \"$LOCAL_USER\" SET max_parallel_workers_per_gather = $REPLICA_MAX_PARALLEL_PER_GATHER" \
+        >/dev/null || log "warning: could not cap $LOCAL_USER parallelism (continuing)"
+
+    # full_page_writes. After a checkpoint, the first write to each page ships
+    # the whole 8 KB page into WAL so replay can repair a torn write. Measured
+    # on the publisher 2026-08-21: FPIs are 13.4% of records but 64.7% of WAL
+    # BYTES, and turning them off cut WAL 15.06 -> 6.14 MB/s. The replica pays
+    # that tax on its own applied writes, and pays it on the same device the
+    # apply worker is trying to read from.
+    #
+    # Only safe where a torn page is unreachable. Copy-on-write filesystems
+    # never overwrite a live block — the write lands in a new extent and the
+    # metadata flips atomically — so ZFS and btrfs cannot tear an 8 KB page,
+    # and the publisher already runs this way. On an overwrite-in-place
+    # filesystem (ext4, xfs, ufs) it is a corruption risk on power loss, so
+    # probe rather than assume. Note this is a stronger requirement than the
+    # replica being rebuildable: a silently corrupt replica serves wrong
+    # answers to prism long before anyone thinks to rebuild it.
+    #
+    # Resolve the filesystem WITHOUT reading pgdata: it is mode 0700 owned by
+    # postgres and this script runs as the operator, so `df -T "$PGDATA"` just
+    # returns "Permission denied" and an empty type — which would silently and
+    # permanently take the safe branch. Match the longest mount point that
+    # prefixes the path instead. That is how the kernel resolves it anyway, and
+    # the mount table is world-readable on both Linux (/proc/mounts) and
+    # FreeBSD (`mount -p`), which share the device/mountpoint/type column
+    # order. Falls back to df for anything neither one describes.
+    fstype=$({ cat /proc/mounts 2>/dev/null || mount -p 2>/dev/null; } | awk -v path="$PGDATA" '
+        { mp = $2; ty = $3 }
+        {
+            pfx = (mp == "/") ? "/" : mp "/"
+            if (substr(path "/", 1, length(pfx)) == pfx && length(mp) >= best) {
+                best = length(mp); type = ty
+            }
+        }
+        END { print type }
+    ')
+    [ -n "$fstype" ] || fstype=$(df -T "$PGDATA" 2>/dev/null | awk 'NR==2 {print $2}')
+    case "$fstype" in
+        zfs|btrfs)
+            log "Disabling full_page_writes (pgdata is $fstype, copy-on-write — torn pages unreachable)"
+            admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
+                -c "ALTER SYSTEM SET full_page_writes = off" >/dev/null \
+                || log "warning: could not disable full_page_writes (continuing)"
+            ;;
+        *)
+            log "Leaving full_page_writes on (pgdata fs '${fstype:-unknown}' is not known copy-on-write)"
+            ;;
+    esac
+
+    # checkpoint_timeout. FPIs are generated on the first touch of each page
+    # after a checkpoint, so checkpoint frequency sets the FPI rate — the stock
+    # 5 minutes regenerates them twelve times an hour. 30 minutes matches the
+    # publisher and is the milder half of the same lever, which is why it is
+    # applied unconditionally: it helps on the filesystems where the probe
+    # above declined to turn full_page_writes off, and it costs only a longer
+    # crash recovery on a box that is rebuildable anyway.
+    #
+    # wal_receiver_timeout. The 1-minute default tears down (and restarts from
+    # the slot's restart_lsn) any stream whose publisher-side decode is slow —
+    # e.g. while catching up a large backlog. That turns a slow catch-up into a
+    # restart loop. Give the receiver real slack.
+    admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+ALTER SYSTEM SET wal_receiver_timeout = '10min';
+ALTER SYSTEM SET checkpoint_timeout = '30min';
+SELECT pg_reload_conf();
+SQL
+else
+    log "REPLICA_TUNE=false — leaving server tuning alone"
+    admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
 ALTER SYSTEM SET wal_receiver_timeout = '10min';
 SELECT pg_reload_conf();
 SQL
+fi
 
 # Refuse to stack on top of a hung hopper init — each new run would just
 # queue behind the first one's lock waits and make things worse.
