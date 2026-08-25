@@ -29,10 +29,10 @@ hopper_replication_slot:
     WHERE s.slot_type = 'logical'
   master: true          # only scrape this on the primary/publisher
   metrics:
-    - slot_name:          { usage: "LABEL", description: "Replication slot name" }
-    - kind:               { usage: "LABEL", description: "streaming or tablesync (initial copy)" }
-    - active:             { usage: "GAUGE", description: "1 if a walsender is currently consuming the slot" }
-    - wal_status_code:    { usage: "GAUGE", description: "0=reserved 1=extended 2=unreserved 3=lost(invalidated)" }
+    - slot_name: { usage: "LABEL", description: "Replication slot name" }
+    - kind: { usage: "LABEL", description: "streaming or tablesync (initial copy)" }
+    - active: { usage: "GAUGE", description: "1 if a walsender is currently consuming the slot" }
+    - wal_status_code: { usage: "GAUGE", description: "0=reserved 1=extended 2=unreserved 3=lost(invalidated)" }
     - retained_wal_bytes: { usage: "GAUGE", description: "WAL bytes pinned by this slot = replica lag" }
     - confirmed_lag_bytes: { usage: "GAUGE", description: "Bytes between current WAL and slot confirmed_flush_lsn" }
 
@@ -82,13 +82,13 @@ hopper_pg_xact:
     WHERE datname = 'hopper'
   master: true
   metrics:
-    - commit:       { usage: "COUNTER", description: "Transactions committed on hopper" }
-    - rollback:     { usage: "COUNTER", description: "Transactions rolled back on hopper" }
+    - commit: { usage: "COUNTER", description: "Transactions committed on hopper" }
+    - rollback: { usage: "COUNTER", description: "Transactions rolled back on hopper" }
     - tup_returned: { usage: "COUNTER", description: "Rows returned by queries on hopper" }
-    - tup_fetched:  { usage: "COUNTER", description: "Rows fetched by queries on hopper" }
+    - tup_fetched: { usage: "COUNTER", description: "Rows fetched by queries on hopper" }
     - tup_inserted: { usage: "COUNTER", description: "Rows inserted on hopper" }
-    - blks_read:    { usage: "COUNTER", description: "Disk blocks read on hopper" }
-    - blks_hit:     { usage: "COUNTER", description: "Buffer cache hits on hopper" }
+    - blks_read: { usage: "COUNTER", description: "Disk blocks read on hopper" }
+    - blks_hit: { usage: "COUNTER", description: "Buffer cache hits on hopper" }
 
 # ---------------------------------------------------------------------------
 # Wait events. Added 2026-08-21 because this was the single measurement that
@@ -120,8 +120,8 @@ hopper_pg_wait:
   master: true
   metrics:
     - wait_event_type: { usage: "LABEL", description: "Wait class: LWLock, Lock, IO, Client, IPC, Timeout" }
-    - wait_event:      { usage: "LABEL", description: "Specific wait, e.g. WALWrite, WalInitSync, DataFileRead" }
-    - backends:        { usage: "GAUGE", description: "Non-idle backends in this wait" }
+    - wait_event: { usage: "LABEL", description: "Specific wait, e.g. WALWrite, WalInitSync, DataFileRead" }
+    - backends: { usage: "GAUGE", description: "Non-idle backends in this wait" }
 
 # ---------------------------------------------------------------------------
 # WAL PRODUCTION, which is not the same thing as hopper_pg_stat_wal_bytes:
@@ -148,9 +148,9 @@ hopper_pg_wal_gen:
     FROM pg_stat_wal
   master: true
   metrics:
-    - records:      { usage: "COUNTER", description: "WAL records generated" }
-    - fpi:          { usage: "COUNTER", description: "WAL full-page images generated" }
-    - bytes:        { usage: "COUNTER", description: "WAL bytes generated" }
+    - records: { usage: "COUNTER", description: "WAL records generated" }
+    - fpi: { usage: "COUNTER", description: "WAL full-page images generated" }
+    - bytes: { usage: "COUNTER", description: "WAL bytes generated" }
     - buffers_full: { usage: "COUNTER", description: "Times WAL buffers filled, forcing a write" }
 
 # ---------------------------------------------------------------------------
@@ -176,11 +176,11 @@ hopper_pg_checkpoint:
     FROM pg_stat_checkpointer
   master: true
   metrics:
-    - timed:           { usage: "COUNTER", description: "Checkpoints started on schedule" }
-    - requested:       { usage: "COUNTER", description: "Checkpoints forced by max_wal_size — should stay flat" }
+    - timed: { usage: "COUNTER", description: "Checkpoints started on schedule" }
+    - requested: { usage: "COUNTER", description: "Checkpoints forced by max_wal_size — should stay flat" }
     - buffers_written: { usage: "COUNTER", description: "Buffers written by the checkpointer" }
-    - write_time_ms:   { usage: "COUNTER", description: "Checkpoint write-phase wall clock (paced, not saturation)" }
-    - sync_time_ms:    { usage: "COUNTER", description: "Checkpoint fsync wall clock" }
+    - write_time_ms: { usage: "COUNTER", description: "Checkpoint write-phase wall clock (paced, not saturation)" }
+    - sync_time_ms: { usage: "COUNTER", description: "Checkpoint fsync wall clock" }
 
 # ---------------------------------------------------------------------------
 # Table statistics freshness. Added 2026-08-21 after a bug that was invisible
@@ -238,16 +238,16 @@ hopper_pg_table_stats:
     WHERE c.relname IN ('samples', 'sample_locations', 'reports', 'sightings')
   master: true
   metrics:
-    - table:               { usage: "LABEL",  description: "Table name" }
-    - reltuples:           { usage: "GAUGE",  description: "Planner row estimate — what prism's corpus counter reads; only VACUUM/ANALYZE moves it" }
-    - live_tup:            { usage: "GAUGE",  description: "Live tuples per the stats collector" }
-    - dead_tup:            { usage: "GAUGE",  description: "Dead tuples awaiting vacuum" }
-    - tup_upd:             { usage: "COUNTER", description: "Rows updated. Denominator for the HOT ratio" }
-    - tup_hot_upd:         { usage: "COUNTER", description: "Rows updated via HOT (no index write). hot_upd/upd near 0 means every update writes all ~54 indexes" }
-    - mod_since_analyze:   { usage: "GAUGE",  description: "Rows changed since the last ANALYZE" }
-    - never_analyzed:      { usage: "GAUGE",  description: "1 if this table has never been analyzed at all" }
-    - analyze_age_seconds: { usage: "GAUGE",  description: "Seconds since the last ANALYZE, or since postmaster start if never" }
-    - vacuum_age_seconds:  { usage: "GAUGE",  description: "Seconds since the last VACUUM, or since postmaster start if never" }
+    - table: { usage: "LABEL", description: "Table name" }
+    - reltuples: { usage: "GAUGE", description: "Planner row estimate — what prism's corpus counter reads; only VACUUM/ANALYZE moves it" }
+    - live_tup: { usage: "GAUGE", description: "Live tuples per the stats collector" }
+    - dead_tup: { usage: "GAUGE", description: "Dead tuples awaiting vacuum" }
+    - tup_upd: { usage: "COUNTER", description: "Rows updated. Denominator for the HOT ratio" }
+    - tup_hot_upd: { usage: "COUNTER", description: "Rows updated via HOT (no index write). hot_upd/upd near 0 means every update writes all ~54 indexes" }
+    - mod_since_analyze: { usage: "GAUGE", description: "Rows changed since the last ANALYZE" }
+    - never_analyzed: { usage: "GAUGE", description: "1 if this table has never been analyzed at all" }
+    - analyze_age_seconds: { usage: "GAUGE", description: "Seconds since the last ANALYZE, or since postmaster start if never" }
+    - vacuum_age_seconds: { usage: "GAUGE", description: "Seconds since the last VACUUM, or since postmaster start if never" }
 
 # ---------------------------------------------------------------------------
 # STATEMENT-LEVEL ATTRIBUTION. Added 2026-08-21, and deliberately shipped
@@ -302,11 +302,11 @@ hopper_pg_table_stats:
 #     LIMIT 20
 #   master: true
 #   metrics:
-#     - queryid:            { usage: "LABEL",   description: "pg_stat_statements queryid; resolve to text ad hoc" }
-#     - calls:              { usage: "COUNTER", description: "Times this statement was executed" }
+#     - queryid: { usage: "LABEL", description: "pg_stat_statements queryid; resolve to text ad hoc" }
+#     - calls: { usage: "COUNTER", description: "Times this statement was executed" }
 #     - total_exec_time_ms: { usage: "COUNTER", description: "Total execution time. THE ranking column — this is where the database's time goes" }
-#     - mean_exec_time_ms:  { usage: "GAUGE",   description: "Mean execution time per call" }
-#     - rows:               { usage: "COUNTER", description: "Rows returned or affected" }
-#     - blks_read:          { usage: "COUNTER", description: "Blocks read from disk (cache misses)" }
-#     - blks_dirtied:       { usage: "COUNTER", description: "Blocks dirtied — the write-amplification signal per statement" }
-#     - wal_bytes:          { usage: "COUNTER", description: "WAL generated by this statement" }
+#     - mean_exec_time_ms: { usage: "GAUGE", description: "Mean execution time per call" }
+#     - rows: { usage: "COUNTER", description: "Rows returned or affected" }
+#     - blks_read: { usage: "COUNTER", description: "Blocks read from disk (cache misses)" }
+#     - blks_dirtied: { usage: "COUNTER", description: "Blocks dirtied — the write-amplification signal per statement" }
+#     - wal_bytes: { usage: "COUNTER", description: "WAL generated by this statement" }

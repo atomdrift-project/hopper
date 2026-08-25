@@ -6141,6 +6141,11 @@ func (db *DB) IngestReportsDir(ctx context.Context, dir, reportType, provider st
 	if !info.IsDir() {
 		return stats, fmt.Errorf("reports path is not a directory: %s", dir)
 	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return stats, fmt.Errorf("open reports root: %w", err)
+	}
+	defer func() { _ = root.Close() }()
 	walkErr := filepath.WalkDir(dir, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -6175,9 +6180,21 @@ func (db *DB) IngestReportsDir(ctx context.Context, dir, reportType, provider st
 			}
 			return err
 		}
-		content, err := os.ReadFile(path)
+		relPath, err := filepath.Rel(dir, path)
 		if err != nil {
 			return err
+		}
+		file, err := root.Open(relPath)
+		if err != nil {
+			return err
+		}
+		content, err := io.ReadAll(file)
+		closeErr := file.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
 		}
 		if existing, err := db.LatestReport(ctx, sha, reportType); err == nil {
 			if existing.Content == string(content) {

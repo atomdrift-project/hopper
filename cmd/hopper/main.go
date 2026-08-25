@@ -25,7 +25,6 @@ import (
 	"runtime"
 	"runtime/debug"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -2866,7 +2865,7 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 			writeStdoutf("\n  \033[2m  %-*s  tasks    seen    rate  analyzed  errors  oldest job\033[0m\n",
 				nameWidth, "worker")
 
-			sort.Slice(workers, func(i, j int) bool { return workers[i].Name < workers[j].Name })
+			slices.SortFunc(workers, func(a, b namedWorkerStats) int { return strings.Compare(a.Name, b.Name) })
 			for i := range workers {
 				idle := time.Since(workers[i].LastSeen)
 				status, dot := workerStatus(workers[i].ActiveClaims, idle)
@@ -4039,7 +4038,7 @@ func cmdDropSightings(ctx context.Context) error {
 	// to read the counts before deleting anything, and hopper's logs go to a
 	// file. A destructive command that appears to do nothing is its own hazard.
 	var total int64
-	sort.Strings(sources)
+	slices.Sort(sources)
 	for _, source := range sources {
 		n := counts[source]
 		total += n

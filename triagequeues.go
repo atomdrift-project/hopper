@@ -23,7 +23,7 @@ package hopper
 
 import (
 	"context"
-	"sort"
+	"slices"
 	"time"
 )
 
@@ -416,6 +416,6 @@ func TriageQueueNames() []string {
 	for name := range TriageQueues {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	return names
 }

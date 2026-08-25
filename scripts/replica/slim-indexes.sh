@@ -148,6 +148,7 @@ idx_slh_sha256_retired
 # NOTE: no comments inside the quoted lists — parseShellWordList (Go, embedded)
 # splits the body on whitespace, so a '#' line would parse as index names and
 # fail the guard.
+# shellcheck disable=SC2034
 REPLICA_DROP_INDEXES='
 idx_samples_good_repair_newest
 idx_samples_unknown_newest

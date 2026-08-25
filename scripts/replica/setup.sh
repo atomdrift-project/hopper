@@ -223,9 +223,10 @@ fi
 # subscription to run DDL, raise a maintenance flag the healer honors so they
 # don't race. pg_sh runs a command as the postgres OS user (same escalation as
 # admin()) so files land where the healer — also postgres — reads them.
+# shellcheck source=replicated-tables.sh
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 . "$SCRIPT_DIR/replicated-tables.sh"
-REPLICATED_TABLES_SQL=$(printf "'%s'," $REPLICATED_TABLES | sed 's/,$//')
+REPLICATED_TABLES_SQL=$(printf "'%s'," "$REPLICATED_TABLES" | sed 's/,$//')
 if [ -z "$ESCALATE" ]; then
     pg_sh() { sh -c "$1"; }
 else
@@ -244,6 +245,7 @@ existing_sub_enabled=$(admin -d "$LOCAL_DB" -tAc \
 if [ "$existing_sub_enabled" = "f" ]; then
     log "Subscription '$SUBSCRIPTION' is disabled — will reconcile schema, resume tablesync, and re-enable"
 fi
+# shellcheck disable=SC2016
 HEAL_DIR=$(pg_sh 'printf %s "${HEAL_STATE_DIR:-$HOME/.hopper-replica-heal}"' 2>/dev/null || true)
 maint_on()  { [ -n "${HEAL_DIR:-}" ] && pg_sh "mkdir -p '$HEAL_DIR' && : > '$HEAL_DIR/maintenance'" 2>/dev/null || true; }
 maint_off() { [ -n "${HEAL_DIR:-}" ] && pg_sh "rm -f '$HEAL_DIR/maintenance'" 2>/dev/null || true; }
@@ -252,6 +254,7 @@ maint_on
 # Fast-sync helpers: defer secondary-index maintenance during the initial COPY
 # and rebuild in bulk afterwards (the single biggest lever for large, heavily
 # indexed tables). Sourced here so admin()/pg_sh()/log()/HEAL_DIR are defined.
+# shellcheck source=bulkload.sh
 . "$SCRIPT_DIR/bulkload.sh"
 trap 'bulkload_cleanup; maint_off' EXIT
 
@@ -888,6 +891,7 @@ done
 # Give the postgres user (which the healer runs as) the upstream entry in its
 # own ~/.pgpass — the healer reads the publisher's catalog as postgres. Append
 # only if absent; password goes via stdin, never argv.
+# shellcheck disable=SC2016
 PG_PGPASS=$(pg_sh 'printf %s "$HOME/.pgpass"' 2>/dev/null || true)
 pat="^$REMOTE_HOST:[*]:$REMOTE_DB:$REMOTE_USER:"
 have=$(pg_sh "grep -c '$pat' \"\$HOME/.pgpass\" 2>/dev/null" 2>/dev/null || true)

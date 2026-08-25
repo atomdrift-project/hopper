@@ -164,7 +164,7 @@ bulkload_defer() {
 _bulk_apply_gucs() {
     [ "${BULK_GUCS_ACTIVE:-false}" = true ] && return 0
     _gf="$(_bulk_state_dir)/guc-restore.sql"
-    _in=$(printf "'%s'," $_BULK_GUCS | sed 's/,$//')
+    _in=$(printf "'%s'," "$_BULK_GUCS" | sed 's/,$//')
     # NEVER overwrite an existing capture. If one is already on disk, a previous
     # run applied the bulk GUCs and died before restoring them — so the CURRENT
     # values ARE the bulk values. Re-capturing here would write

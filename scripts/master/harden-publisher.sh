@@ -142,9 +142,11 @@ do_install() {
     line="*/$INTERVAL_MIN * * * * WARN_GB=$WARN_GB REAP_GB=$REAP_GB REAP_GRACE_MIN=$REAP_GRACE_MIN REAP=$REAP PGDB=$PGDB $self monitor >> $logf 2>&1"
     mkdir -p "$STATE_DIR" 2>/dev/null || true
     if command -v crontab >/dev/null 2>&1; then
-        { crontab -l 2>/dev/null | grep -v 'harden-publisher.sh monitor' || true; printf '%s\n' "$line"; } | crontab - \
-            && log "installed slot-monitor cron (every ${INTERVAL_MIN}min); log: $logf" \
-            || warn "could not install crontab — add manually: $line"
+        if { crontab -l 2>/dev/null | grep -v 'harden-publisher.sh monitor' || true; printf '%s\n' "$line"; } | crontab -; then
+            log "installed slot-monitor cron (every ${INTERVAL_MIN}min); log: $logf"
+        else
+            warn "could not install crontab — add manually: $line"
+        fi
     else
         warn "no crontab found — schedule '$self monitor' every ${INTERVAL_MIN}min by hand"
     fi

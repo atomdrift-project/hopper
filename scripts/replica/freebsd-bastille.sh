@@ -90,7 +90,7 @@ log "Installing replica dependencies"
 # the publisher has, leaving the replica's schema subtly behind.
 doas bastille pkg "$RUN" install -y \
     git go gmake sqlite3 \
-    postgresql${PGVER}-server postgresql${PGVER}-client postgresql${PGVER}-contrib
+    postgresql"${PGVER}"-server postgresql"${PGVER}"-client postgresql"${PGVER}"-contrib
 
 log "Selecting PostgreSQL ${PGVER} data directory"
 doas bastille sysrc "$RUN" postgresql_enable=YES >/dev/null

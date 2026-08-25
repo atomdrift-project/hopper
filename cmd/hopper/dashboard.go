@@ -9,7 +9,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -752,7 +752,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 			`<th>Analyzed</th><th>Errors</th><th>Oldest Job</th><th></th>` +
 			`</tr></thead><tbody>`)
 
-		sort.Slice(workers, func(i, j int) bool { return workers[i].Name < workers[j].Name })
+		slices.SortFunc(workers, func(a, b namedWorkerStats) int { return strings.Compare(a.Name, b.Name) })
 		for i := range workers {
 			w := &workers[i]
 			idle := time.Since(w.LastSeen)
@@ -1246,8 +1246,7 @@ func writeRecentErrors(buf *strings.Builder, progress *loadProgress) {
 	}
 	buf.WriteString(`<section><div class="label">Recent Errors</div>`)
 	buf.WriteString(`<table><thead><tr><th>Time</th><th>Stage</th><th>Error</th></tr></thead><tbody>`)
-	for i := len(errs) - 1; i >= 0; i-- {
-		e := errs[i]
+			for _, e := range slices.Backward(errs) {
 		fmt.Fprintf(buf,
 			`<tr><td class="err-time">%s</td><td class="err-stage">%s</td><td class="err-msg">%s</td></tr>`,
 			htmlEscape(e.At.Format("15:04:05")),

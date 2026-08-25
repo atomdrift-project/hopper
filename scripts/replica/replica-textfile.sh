@@ -31,7 +31,7 @@ OUT_DIR="${HOST_MON_TEXTFILE_DIR:-${NODE_EXPORTER_TEXTFILE_DIR:-/var/lib/host-mo
 TMP="${OUT_DIR}/hopper-replica.prom.$$"
 OUT="${OUT_DIR}/hopper-replica.prom"
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 SLIM_INDEXES_SH="${SLIM_INDEXES_SH:-$SCRIPT_DIR/slim-indexes.sh}"
 
 # Same local-admin ladder as replica-heal.sh. Unlike the healer we exit 0 on

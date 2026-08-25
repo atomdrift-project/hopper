@@ -30,6 +30,7 @@ OFFLINE_PROMOTE="${OFFLINE_PROMOTE:-0}"
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck source=replicated-tables.sh
 . "$SCRIPT_DIR/replicated-tables.sh"
 
 # Admin probe — same ladder as setup-replica.sh so this works cleanly on

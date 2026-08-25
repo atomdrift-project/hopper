@@ -6934,7 +6934,9 @@ func (db *DB) BackfillLitmusLevel(ctx context.Context, batchSize int, targetDura
 			       (SELECT count(*) FROM batch),
 			       (SELECT count(*) FROM updated)`, cursor, batchSize)
 		if err := row.Scan(&nextCursor, &scanned, &updated); err != nil {
-			_ = tx.Rollback(ctx)
+			if rollbackErr := tx.Rollback(ctx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+				return stats, fmt.Errorf("hopper: rollback litmus level backfill batch: %w", rollbackErr)
+			}
 			return stats, fmt.Errorf("hopper: scan litmus level backfill batch: %w", err)
 		}
 		if err := tx.Commit(ctx); err != nil {

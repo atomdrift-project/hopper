@@ -177,7 +177,7 @@ if [ -n "$recon_sql" ]; then
     note "--- captured statement (may be truncated at track_activity_query_size) ---"
     printf '%s\n' "$recon_sql" >>"$REPORT"
     case "$recon_sql" in
-        *'$1'*|*'$2'*)
+        *\$1*|*\$2*)
             note "--- has bind parameters; cannot EXPLAIN without values, skipping ---" ;;
         *)
             note "--- EXPLAIN (VERBOSE, SETTINGS) ---"

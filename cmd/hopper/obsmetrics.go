@@ -394,7 +394,7 @@ func clampCount(v uint64) int64 {
 
 // observe gathers one snapshot and records it. It runs per scrape; until the
 // load session is configured the trackers are nil and it observes nothing.
-func (wd *webDashboard) observe(ctx context.Context, o metric.Observer, in *instruments) {
+func (wd *webDashboard) observe(ctx context.Context, observer metric.Observer, in *instruments) {
 	wd.cfgMu.RLock()
 	progress := wd.progress
 	tracker := wd.tracker
@@ -410,73 +410,73 @@ func (wd *webDashboard) observe(ctx context.Context, o metric.Observer, in *inst
 		// before the load session is configured.
 		ls := db.LookupStats()
 		lookup := func(key string, served, loaded uint64) {
-			o.ObserveInt64(in.lookupReqs, clampCount(served),
+			observer.ObserveInt64(in.lookupReqs, clampCount(served),
 				metric.WithAttributes(attribute.String("key", key), attribute.String("source", "pool")))
-			o.ObserveInt64(in.lookupReqs, clampCount(loaded),
+			observer.ObserveInt64(in.lookupReqs, clampCount(loaded),
 				metric.WithAttributes(attribute.String("key", key), attribute.String("source", "database")))
 		}
 		lookup("sha256", ls.SHAServed, ls.SHALoaded)
 		lookup("purl", ls.PURLServed, ls.PURLLoaded)
-		o.ObserveInt64(in.lookupEntries, int64(ls.Entries))
-		o.ObserveInt64(in.lookupCapacity, int64(ls.Capacity))
+		observer.ObserveInt64(in.lookupEntries, int64(ls.Entries))
+		observer.ObserveInt64(in.lookupCapacity, int64(ls.Capacity))
 
 		cctx, cancel := context.WithTimeout(ctx, metricsCollectTimeout)
 		defer cancel()
 
 		if n, err := db.PopularPackageCount(cctx); err == nil {
-			o.ObserveInt64(in.popularPackages, int64(n))
+			observer.ObserveInt64(in.popularPackages, int64(n))
 		}
-		o.ObserveInt64(in.pending, wd.pendingCount(cctx))
-		o.ObserveInt64(in.rescan, wd.rescanPending(cctx))
+		observer.ObserveInt64(in.pending, wd.pendingCount(cctx))
+		observer.ObserveInt64(in.rescan, wd.rescanPending(cctx))
 
 		rates := wd.analysisRates(cctx)
-		o.ObserveFloat64(in.analysisRate, float64(rates.TopLevel)/analysisRateWindow.Seconds(),
+		observer.ObserveFloat64(in.analysisRate, float64(rates.TopLevel)/analysisRateWindow.Seconds(),
 			metric.WithAttributes(attribute.String("tier", "toplevel")))
-		o.ObserveFloat64(in.analysisRate, float64(rates.Rescans)/analysisRateWindow.Seconds(),
+		observer.ObserveFloat64(in.analysisRate, float64(rates.Rescans)/analysisRateWindow.Seconds(),
 			metric.WithAttributes(attribute.String("tier", "rescan")))
 
 		if h, ok := wd.workflowHealth(cctx); ok {
-			o.ObserveInt64(in.cleavePending, h.PendingCleave)
-			o.ObserveInt64(in.litmusPending, h.PendingLitmus)
-			observeAge(o, in.addedAge, now, h.LatestAdded)
-			observeAge(o, in.analyzedAge, now, h.LatestAnalyzed)
+			observer.ObserveInt64(in.cleavePending, h.PendingCleave)
+			observer.ObserveInt64(in.litmusPending, h.PendingLitmus)
+			observeAge(observer, in.addedAge, now, h.LatestAdded)
+			observeAge(observer, in.analyzedAge, now, h.LatestAnalyzed)
 			if !h.LatestAdded.IsZero() && !h.LatestReady.IsZero() {
-				o.ObserveFloat64(in.readyLag, max(h.LatestAdded.Sub(h.LatestReady).Seconds(), 0))
+				observer.ObserveFloat64(in.readyLag, max(h.LatestAdded.Sub(h.LatestReady).Seconds(), 0))
 			}
 		}
 	}
 
 	if progress != nil {
-		o.ObserveInt64(in.analyzed, progress.analyzed.Load())
-		o.ObserveInt64(in.walked, progress.walked.Load())
-		o.ObserveInt64(in.inserted, progress.inserted.Load())
-		o.ObserveInt64(in.cacheHits, progress.cacheHits.Load())
-		o.ObserveInt64(in.filtered, progress.tooSmall.Load()+progress.tooLarge.Load())
-		o.ObserveInt64(in.errors, progress.errors.Load())
+		observer.ObserveInt64(in.analyzed, progress.analyzed.Load())
+		observer.ObserveInt64(in.walked, progress.walked.Load())
+		observer.ObserveInt64(in.inserted, progress.inserted.Load())
+		observer.ObserveInt64(in.cacheHits, progress.cacheHits.Load())
+		observer.ObserveInt64(in.filtered, progress.tooSmall.Load()+progress.tooLarge.Load())
+		observer.ObserveInt64(in.errors, progress.errors.Load())
 		for c := range numInsertFailCauses {
-			o.ObserveInt64(in.insertFails, progress.insertFails[c].Load(),
+			observer.ObserveInt64(in.insertFails, progress.insertFails[c].Load(),
 				metric.WithAttributes(attribute.String("cause", c.String())))
 		}
 	}
 
 	combined, _ := wd.ratesOver(15 * time.Minute)
-	o.ObserveFloat64(in.filesRate, combined)
+	observer.ObserveFloat64(in.filesRate, combined)
 
 	if tracker != nil {
 		workers := tracker.all()
 		for i := range workers {
 			ws := &workers[i]
 			attr := metric.WithAttributes(attribute.String("worker", ws.Name))
-			o.ObserveFloat64(in.wLastSeen, now.Sub(ws.LastSeen).Seconds(), attr)
-			o.ObserveFloat64(in.wLoad, ws.Load1, attr)
-			o.ObserveFloat64(in.wFilesRate, ws.FilesPerSec, attr)
-			o.ObserveInt64(in.wActive, int64(ws.ActiveClaims), attr)
-			o.ObserveInt64(in.wSlots, int64(ws.Slots), attr)
-			o.ObserveInt64(in.wQueue, int64(ws.Queue), attr)
-			o.ObserveInt64(in.wRSS, int64(ws.RSSMB)<<20, attr)
-			o.ObserveInt64(in.wAnalyzed, ws.Analyzed, attr)
-			o.ObserveInt64(in.wErrors, ws.Errors, attr)
-			o.ObserveInt64(in.wErrorsRecent, int64(ws.ErrorsRecent), attr)
+			observer.ObserveFloat64(in.wLastSeen, now.Sub(ws.LastSeen).Seconds(), attr)
+			observer.ObserveFloat64(in.wLoad, ws.Load1, attr)
+			observer.ObserveFloat64(in.wFilesRate, ws.FilesPerSec, attr)
+			observer.ObserveInt64(in.wActive, int64(ws.ActiveClaims), attr)
+			observer.ObserveInt64(in.wSlots, int64(ws.Slots), attr)
+			observer.ObserveInt64(in.wQueue, int64(ws.Queue), attr)
+			observer.ObserveInt64(in.wRSS, int64(ws.RSSMB)<<20, attr)
+			observer.ObserveInt64(in.wAnalyzed, ws.Analyzed, attr)
+			observer.ObserveInt64(in.wErrors, ws.Errors, attr)
+			observer.ObserveInt64(in.wErrorsRecent, int64(ws.ErrorsRecent), attr)
 		}
 	}
 
@@ -485,37 +485,37 @@ func (wd *webDashboard) observe(ctx context.Context, o metric.Observer, in *inst
 		if h := litmus.healthSnapshot(); h != nil && h.ok {
 			up = 1
 		}
-		o.ObserveInt64(in.localUp, up)
-		o.ObserveInt64(in.localRestarts, litmus.restarts.Load())
+		observer.ObserveInt64(in.localUp, up)
+		observer.ObserveInt64(in.localRestarts, litmus.restarts.Load())
 		if pid := litmus.currentPID(); pid > 0 {
 			if mem, err := procMemoryBytes(pid); err == nil {
-				o.ObserveInt64(in.localMem, int64(mem)) //nolint:gosec // /proc memory values are far below int64 range
+				observer.ObserveInt64(in.localMem, int64(mem)) //nolint:gosec // /proc memory values are far below int64 range
 			}
 		}
 		if litmus.maxRSSGB > 0 {
-			o.ObserveInt64(in.localMemBudget, int64(litmus.maxRSSGB)<<30)
+			observer.ObserveInt64(in.localMemBudget, int64(litmus.maxRSSGB)<<30)
 		}
 	}
 
 	// len/cap of the buffered semaphores: a non-blocking read of in-flight
 	// work and the configured ceiling. nil when the cap is disabled.
 	if api != nil && api.extractSem != nil {
-		o.ObserveInt64(in.extractInUse, int64(len(api.extractSem)))
-		o.ObserveInt64(in.extractMax, int64(cap(api.extractSem)))
+		observer.ObserveInt64(in.extractInUse, int64(len(api.extractSem)))
+		observer.ObserveInt64(in.extractMax, int64(cap(api.extractSem)))
 	}
 	if api != nil && api.resultSem != nil {
-		o.ObserveInt64(in.resultInUse, int64(len(api.resultSem)))
-		o.ObserveInt64(in.resultMax, int64(cap(api.resultSem)))
+		observer.ObserveInt64(in.resultInUse, int64(len(api.resultSem)))
+		observer.ObserveInt64(in.resultMax, int64(cap(api.resultSem)))
 	}
 }
 
 // observeAge records the seconds elapsed since t, skipping a zero timestamp so
 // "never happened" reads as an absent series rather than a misleading epoch age.
-func observeAge(o metric.Observer, g metric.Float64Observable, now, t time.Time) {
+func observeAge(observer metric.Observer, g metric.Float64Observable, now, t time.Time) {
 	if t.IsZero() {
 		return
 	}
-	o.ObserveFloat64(g, max(now.Sub(t).Seconds(), 0))
+	observer.ObserveFloat64(g, max(now.Sub(t).Seconds(), 0))
 }
 
 // dbRetryCount counts retry attempts inside retryDBAccess, keyed by the

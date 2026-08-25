@@ -28,13 +28,13 @@ package main
 
 import (
 	"context"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"slices"
-	"sort"
 
 	"github.com/atomdrift-project/hopper"
 )
@@ -219,7 +219,7 @@ func printDemoteReport(cands []*demoteCandidate) {
 	for feed := range perFeed {
 		feeds = append(feeds, feed)
 	}
-	sort.Slice(feeds, func(i, j int) bool { return perFeed[feeds[i]].total > perFeed[feeds[j]].total })
+	slices.SortFunc(feeds, func(a, b string) int { return cmp.Compare(perFeed[b].total, perFeed[a].total) })
 
 	writeStdoutf("%-26s %9s %9s\n", "feed", "demote", "hostile")
 	for _, feed := range feeds {
