@@ -1496,7 +1496,7 @@ func (s *apiServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// are display-only, so without this the only signal is a number ticking
 		// up on the dashboard. Surface the actual error so it lands in the
 		// journal/Loki alongside hopper's own logs.
-		slog.Warn("worker reported error", //nolint:gosec // structured logging
+		slog.Warn("worker reported error",
 			"worker", worker,
 			"error", hb.lastError,
 			"errors_recent", hb.errorsRecent,
@@ -1605,7 +1605,6 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 
 	// Cap claims for workers that haven't returned any results yet.
 	if limit := s.tracker.claimLimit(worker); limit == 0 {
-		//nolint:gosec // worker is sanitized by validWorkerName
 		slog.Warn("unproven worker at active claim limit, waiting for results",
 			"worker", worker, "active", s.tracker.activeClaims(worker))
 		s.tracker.update(worker, slots, p.version, p.traits, p.rssMB, p.load1, p.tools)
@@ -1627,13 +1626,13 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	if s.tracker.shouldUpsertWorker(worker, workerUpsertInterval) {
 		wk := hopper.Worker{Name: worker, Slots: slots, Version: p.version, Traits: p.traits}
 		if err := s.db.UpsertWorker(ctx, wk); err != nil {
-			slog.Debug("upsert worker failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
+			slog.Debug("upsert worker failed", "worker", worker, "error", err)
 		}
 	}
 
 	jobs, err := s.claimJobs(ctx, worker, count, p.toolCaps, p.maxBytes, slots)
 	if err != nil {
-		slog.Error("claim jobs failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
+		slog.Error("claim jobs failed", "worker", worker, "error", err)
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
 		return
 	}
@@ -1644,10 +1643,10 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 			if n, err := s.db.CountRescanPending(ctx, s.TraitsVersion(), s.rescanAge); err == nil {
 				rescanPending = n
 			} else {
-				slog.Debug("count rescan pending failed", "worker", worker, "error", err) //nolint:gosec // worker is sanitized by validWorkerName
+				slog.Debug("count rescan pending failed", "worker", worker, "error", err)
 			}
 		}
-		//nolint:gosec // worker is sanitized by validWorkerName.
+
 		slog.Info("no work available", "worker", worker,
 			"active_claims", s.tracker.activeClaims(worker),
 			"traits_version", s.TraitsVersion(),
@@ -1670,7 +1669,6 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		claimedSHAs[i] = jobs[i].SHA256
 	}
 	if err := s.db.IncrementAttempts(ctx, claimedSHAs); err != nil {
-		//nolint:gosec // worker sanitized by validWorkerName
 		slog.Warn("increment claim attempts failed",
 			"worker", worker, "count", len(claimedSHAs), "error", err)
 	}
@@ -1680,7 +1678,6 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	// Best-effort: on a probe failure HasProvenance stays false and the
 	// worker simply skips the fetch — it never blocks handing out work.
 	if withProv, err := s.db.ShasWithProvenance(ctx, claimedSHAs); err != nil {
-		//nolint:gosec // worker sanitized by validWorkerName
 		slog.Warn("provenance presence probe failed",
 			"worker", worker, "count", len(claimedSHAs), "error", err)
 	} else {
@@ -1710,7 +1707,6 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 
 	active := s.tracker.activeClaims(worker)
 	for _, j := range jobs {
-		//nolint:gosec // worker is sanitized by validWorkerName.
 		slog.Info("claimed", "worker", worker, "sha256", j.SHA256,
 			"path", j.Path, "size", j.SizeBytes, "active_claims", active)
 	}
@@ -1741,10 +1737,10 @@ func (s *apiServer) validateClaimJobs(ctx context.Context, jobs []hopper.ClaimJo
 	validated := jobs[:0]
 	for _, j := range jobs {
 		if j.Path == "" || j.Path == "." {
-			slog.Warn("skipping job with empty path", //nolint:gosec // structured logging, worker validated
+			slog.Warn("skipping job with empty path",
 				"worker", worker, "sha256", j.SHA256)
 			if err := s.db.SetSkip(ctx, j.SHA256, "empty_path"); err != nil {
-				slog.Error("mark empty_path failed", "sha256", j.SHA256, "error", err) //nolint:gosec // structured logging
+				slog.Error("mark empty_path failed", "sha256", j.SHA256, "error", err)
 			}
 			unclaimSHAs = append(unclaimSHAs, j.SHA256)
 			continue
@@ -1759,7 +1755,7 @@ func (s *apiServer) validateClaimJobs(ctx context.Context, jobs []hopper.ClaimJo
 				// trainable (skip=''); it'll be handed out again if the bytes
 				// ever land locally. Attempts aren't incremented for unclaimed
 				// jobs (below), so this can't trip the poison reaper.
-				slog.Debug("claimed file absent locally; leaving unmarked (dataset-incomplete)", //nolint:gosec // structured logging
+				slog.Debug("claimed file absent locally; leaving unmarked (dataset-incomplete)",
 					"worker", worker, "sha256", j.SHA256, "path", j.Path)
 				unclaimSHAs = append(unclaimSHAs, j.SHA256)
 				continue
@@ -1777,17 +1773,16 @@ func (s *apiServer) validateClaimJobs(ctx context.Context, jobs []hopper.ClaimJo
 				// the claim is released rather than the sample condemned.
 			}
 			if skip == "" {
-				//nolint:gosec // G706: worker is validated; sha256/path come from the DB
 				slog.Warn("claimed file temporarily unavailable; releasing claim",
 					"worker", worker, "sha256", j.SHA256, "path", j.Path, "error", err)
 				unclaimSHAs = append(unclaimSHAs, j.SHA256)
 				continue
 			}
-			//nolint:gosec // worker validated, sha256/path from DB
+
 			slog.Warn("claimed file unavailable on all known paths",
 				"worker", worker, "sha256", j.SHA256, "path", j.Path, "skip", skip, "error", err)
 			if err := s.db.SetSkip(ctx, j.SHA256, skip); err != nil {
-				slog.Error("mark unavailable sample failed", "sha256", j.SHA256, "skip", skip, "error", err) //nolint:gosec // structured logging
+				slog.Error("mark unavailable sample failed", "sha256", j.SHA256, "skip", skip, "error", err)
 			}
 			unclaimSHAs = append(unclaimSHAs, j.SHA256)
 			continue
@@ -1795,12 +1790,11 @@ func (s *apiServer) validateClaimJobs(ctx context.Context, jobs []hopper.ClaimJo
 		f.Close() //nolint:errcheck,gosec // probe handle; only the stat mattered
 		j.Path = location.Path
 		if j.SizeBytes > 0 && info.Size() != j.SizeBytes {
-			//nolint:gosec // sha256 validated, path from DB, sizes are int64
 			slog.Warn("claimed file size mismatch — file was likely replaced",
 				"worker", worker, "sha256", j.SHA256, "path", j.Path,
 				"db_size", j.SizeBytes, "disk_size", info.Size())
 			if err := s.db.SetSkip(ctx, j.SHA256, "corrupt"); err != nil {
-				slog.Error("mark corrupt failed", "sha256", j.SHA256, "error", err) //nolint:gosec // structured logging
+				slog.Error("mark corrupt failed", "sha256", j.SHA256, "error", err)
 			}
 			unclaimSHAs = append(unclaimSHAs, j.SHA256)
 			continue
@@ -1894,7 +1888,6 @@ func (s *apiServer) recordWorkerError(ctx context.Context, w http.ResponseWriter
 		}); err != nil {
 			slog.Error("mark permanent failure failed", "sha256", req.SHA256, "error", err)
 		} else {
-			//nolint:gosec // sha256 validated, path from DB.
 			slog.Info("marked sample", "sha256", req.SHA256,
 				"path", samplePath, "skip", skip, "reason", clientErr)
 		}
@@ -1904,7 +1897,7 @@ func (s *apiServer) recordWorkerError(ctx context.Context, w http.ResponseWriter
 		}); err != nil {
 			slog.Error("record analysis error failed", "sha256", req.SHA256, "error", err)
 		}
-		//nolint:gosec // worker sanitized by validWorkerName, sha256 by validSHA256, path from DB
+
 		slog.Warn("worker reported analysis error",
 			"worker", req.Worker, "sha256", req.SHA256, "path", samplePath, "error", clientErr)
 	}
@@ -1960,7 +1953,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	// in memory once each, but we lose the second whole-body copy.
 	rb, err := resultBody(r)
 	if err != nil {
-		slog.Warn("result rejected: bad content-encoding", //nolint:gosec // structured logging
+		slog.Warn("result rejected: bad content-encoding",
 			"error", err,
 			"remote", r.RemoteAddr,
 		)
@@ -1975,14 +1968,14 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		// report it as 413 so the worker sees the real cause instead of a
 		// generic "invalid json" 400.
 		if rb.overLimit() {
-			slog.Warn("result rejected: body exceeds size limit", //nolint:gosec // structured logging
+			slog.Warn("result rejected: body exceeds size limit",
 				"limit_bytes", int64(maxResultBodyBytes),
 				"remote", r.RemoteAddr,
 			)
 			http.Error(w, `{"error":"result body exceeds size limit"}`, http.StatusRequestEntityTooLarge)
 			return
 		}
-		slog.Warn("result rejected: invalid json", //nolint:gosec // structured logging
+		slog.Warn("result rejected: invalid json",
 			"error", err,
 			"remote", r.RemoteAddr,
 		)
@@ -2014,7 +2007,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		claimedPath := s.tracker.release(req.SHA256)
 		s.tracker.recordResult(req.Worker, true)
 		s.progress.recordErrorf(1, "identity", "result root sha mismatch: claimed %s reported %s", req.SHA256, parsed.RootSHA)
-		//nolint:gosec // G706: worker is validated; both shas are hex-checked
+
 		slog.Warn("result rejected: cleave root sha mismatch",
 			"worker", req.Worker, "claimed_sha256", req.SHA256,
 			"reported_sha256", parsed.RootSHA, "path", claimedPath)
@@ -2056,7 +2049,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 			// walk reconciles a moved/deleted file. The worker completed valid work,
 			// but there is no longer a record to update; acknowledge it so the client
 			// does not retry the same permanent no-op.
-			//nolint:gosec // G706: worker is validated; sha256 is hex-checked, path from the DB
+
 			slog.Info("discarded stale result for absent sample",
 				"worker", req.Worker, "sha256", req.SHA256, "path", claimedPath)
 			w.Header().Set("Content-Type", "application/json")
@@ -2087,14 +2080,13 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		s.progress.exploded.Add(stats.MembersStored)
 		s.progress.queued.Add(stats.MembersStored)
 		s.progress.analyzed.Add(stats.MembersStored)
-		//nolint:gosec // sha256 validated by validSHA256; counts are ints
+
 		slog.Info("stored archive members atomically",
 			"sha256", req.SHA256, "members", stats.Members, "stored", stats.MembersStored)
 	}
 	claimedPath := s.tracker.release(req.SHA256)
 	s.tracker.recordResult(req.Worker, false)
 
-	//nolint:gosec // worker sanitized by validWorkerName, sha256 by validSHA256, path from in-memory claim
 	slog.Info("result stored", "worker", req.Worker, "sha256", req.SHA256, "path", claimedPath,
 		"duration_ms", req.DurationMs, "active_claims", s.tracker.activeClaims(req.Worker))
 
@@ -2127,11 +2119,10 @@ func logResultRenewal(req *resultRequest, stats *hopper.StoreStats, tv string) {
 		"traits_version", tv, "previous_traits_version", stats.PriorTraitsVersion,
 	}
 	if stats.Redundant(tv) {
-		//nolint:gosec // G706: sha256 validated by validSHA256, worker by validWorkerName; the rest are our own columns
 		slog.Warn("result renewed with no analyzer change; the re-analysis learned nothing", args...)
 		return
 	}
-	//nolint:gosec // G706: same provenance as the WARN above
+
 	slog.Info("result renewed under a new analyzer", args...)
 }
 
@@ -2592,7 +2583,7 @@ func writeJSONError(w http.ResponseWriter, code int, body string) {
 	// gosec G705: not an XSS vector — Content-Type is application/json with
 	// X-Content-Type-Options: nosniff (set above), so the body is never
 	// interpreted as HTML; the only interpolated values are JSON-escaped.
-	_, _ = io.WriteString(w, body) //nolint:errcheck,gosec // best-effort response; see above
+	_, _ = io.WriteString(w, body) //nolint:errcheck // best-effort response; see above
 }
 
 // recoverMiddleware turns a handler panic into a logged 500 rather than an
@@ -3067,7 +3058,6 @@ func decodeSightingsNDJSON(r io.Reader) ([]sightingRequest, error) {
 	}
 }
 
-//nolint:gosec // G706: structured logging of request-derived fields (remote, error); not a format string
 func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
 		writeJSONError(w, http.StatusServiceUnavailable, `{"error":"starting"}`)
@@ -3317,7 +3307,7 @@ func (s *apiServer) storeProvenanceOnly(w http.ResponseWriter, r *http.Request, 
 // trust-bearing label is never taken from it — an upload arrives over a lightly
 // trusted boundary, so analysis, not the producer, decides a sample's label.
 //
-//nolint:gosec // G703/G706: shard paths are confined to dataRoot via resolveDataPath; logging is structured
+
 func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.Reader, claimedName string, prov *hopper.Sidecar) {
 	// Stream to a temp file under the uploads root while hashing. Temp
 	// lives on the same filesystem as the final location so the post-hash
@@ -3358,12 +3348,11 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 		// Read-deadline expiration surfaces as a net.Error with Timeout()=true.
 		var netErr net.Error
 		if errors.As(copyErr, &netErr) && netErr.Timeout() {
-			//nolint:gosec // structured logging
 			slog.WarnContext(r.Context(), "upload: body read timeout", "bytes", written, "remote", r.RemoteAddr)
 			writeJSONError(w, http.StatusRequestTimeout, `{"error":"upload timeout"}`)
 			return
 		}
-		//nolint:gosec // structured logging
+
 		slog.WarnContext(r.Context(), "upload: stream copy failed", "error", copyErr, "bytes", written, "remote", r.RemoteAddr)
 		writeJSONError(w, http.StatusBadRequest, `{"error":"upload failed"}`)
 		return
@@ -3379,7 +3368,7 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 		return
 	}
 	if written == 0 {
-		slog.WarnContext(r.Context(), "upload rejected: empty body", "remote", r.RemoteAddr) //nolint:gosec // structured logging
+		slog.WarnContext(r.Context(), "upload rejected: empty body", "remote", r.RemoteAddr)
 		writeJSONError(w, http.StatusBadRequest, `{"error":"empty body"}`)
 		return
 	}
@@ -3389,7 +3378,6 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 	// The producer's claimed sha must match the bytes we actually received, so a
 	// tampered or mispaired provenance/file pair can't be stored as if matched.
 	if prov != nil && prov.Artifact.SHA256 != sha {
-		//nolint:gosec // structured logging
 		slog.WarnContext(r.Context(), "upload: provenance sha mismatch", "claimed", prov.Artifact.SHA256, "actual", sha, "remote", r.RemoteAddr)
 		writeJSONError(w, http.StatusBadRequest, `{"error":"content does not match provenance sha256"}`)
 		return
@@ -3473,7 +3461,6 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 		provApplied = applied
 	}
 
-	//nolint:gosec // structured logging; filename sanitized, remote is r.RemoteAddr
 	slog.Info("upload accepted",
 		"sha256", sha, "size", written, "filename", filename,
 		"has_provenance", prov != nil, "provenance_applied", provApplied,
@@ -3504,7 +3491,7 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 // pkgparse.SafePathSegment, and every resulting path is confined to dataRoot by
 // resolveDataPath.
 //
-//nolint:gosec // G703: paths confined to dataRoot by resolveDataPath; see above
+
 func (s *apiServer) placeUpload(ctx context.Context, tmpPath, sha, filename string, prov *hopper.Sidecar, existing *hopper.Sample) (string, error) {
 	// Already recorded at a path whose file is still there: keep it.
 	if existing != nil && existing.Path != "" {
@@ -3606,7 +3593,7 @@ func claimSamplePath(src, abs, sha string, digestKeyed bool) (string, error) {
 }
 
 func syncUploadDir(name string) error {
-	dir, err := os.Open(name) //nolint:gosec // caller confines upload paths to dataRoot
+	dir, err := os.Open(name)
 	if err != nil {
 		return err
 	}
@@ -3893,8 +3880,8 @@ func writeSampleEnvelope(w http.ResponseWriter, sample *hopper.Sample) {
 	// gosec taints env and sample.SHA256 through the DB from the request's
 	// purl: env is machine-generated JSON served as application/json with
 	// nosniff (never interpreted as markup), and SHA256 is a stored hash.
-	if _, err := w.Write(env); err != nil { //nolint:gosec // G705: JSON body, not markup; see above
-		slog.Warn("write sample envelope failed", "sha256", sample.SHA256, "error", err) //nolint:gosec // G706: sha256 is a stored hash
+	if _, err := w.Write(env); err != nil { //nolint:gosec // JSON is served with nosniff, never interpreted as markup
+		slog.Warn("write sample envelope failed", "sha256", sample.SHA256, "error", err)
 	}
 }
 
@@ -3938,8 +3925,8 @@ func (s *apiServer) handleProvenance(w http.ResponseWriter, r *http.Request) {
 	// The sidecar is fixed for a content-addressed sha256, so it never changes:
 	// mark it immutable with a one-year max-age (HTTP's effective "forever").
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	if _, err := w.Write(prov); err != nil { //nolint:gosec // prov is stored JSON served with nosniff; sha256 validated by validSHA256
-		slog.Warn("write provenance failed", "sha256", sha, "error", err) //nolint:gosec // sha256 validated by validSHA256
+	if _, err := w.Write(prov); err != nil {
+		slog.Warn("write provenance failed", "sha256", sha, "error", err)
 	}
 }
 
@@ -4071,7 +4058,7 @@ func (s *apiServer) openKnownSampleFile(ctx context.Context, sample *hopper.Samp
 		if !allowed {
 			return nil, nil, fmt.Errorf("%w: %s", errSamplePathRejected, resolved)
 		}
-		f, err := os.Open(resolved) //nolint:gosec // resolved path passed containment check above
+		f, err := os.Open(resolved)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -4220,16 +4207,15 @@ func (s *apiServer) markServeMissing(ctx context.Context, sample *hopper.Sample,
 	if !errors.Is(err, os.ErrNotExist) || s.datasetIncomplete || sample.Skip != "" || sample.Parent != "" {
 		return
 	}
-	if _, rerr := os.Stat(s.dataRoot); rerr != nil { //nolint:gosec // G703: dataRoot is trusted process configuration
-		//nolint:gosec // G706: structured logging of trusted process configuration and DB fields
+	if _, rerr := os.Stat(s.dataRoot); rerr != nil {
 		slog.Error("data root inaccessible; not marking sample missing",
 			"data_root", s.dataRoot, "sha256", sample.SHA256, "error", rerr)
 		return
 	}
-	//nolint:gosec // sha256/path come from the DB row, not the request
+
 	slog.Warn("sample bytes gone on disk; marking missing", "sha256", sample.SHA256, "path", sample.Path)
 	if merr := s.db.SetSkip(ctx, sample.SHA256, "missing"); merr != nil {
-		slog.Error("mark missing failed", "sha256", sample.SHA256, "error", merr) //nolint:gosec // structured logging
+		slog.Error("mark missing failed", "sha256", sample.SHA256, "error", merr)
 	}
 }
 
@@ -4293,7 +4279,7 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 		// then mints members without the delimiter, and they are unservable. It
 		// is a permanent condition, so return 422 (not a retryable 5xx) and log
 		// it — previously this was a silent 500 that workers retried forever.
-		//nolint:gosec // sha256 validated by validSHA256
+
 		slog.Warn("archive-member unservable: child path has no archive delimiter",
 			"sha256", sha, "parent_sha", child.Parent, "child_path", child.Path)
 		http.Error(w, `{"error":"child has no archive-relative path"}`, http.StatusUnprocessableEntity)
@@ -4416,7 +4402,7 @@ func writeExtractError(ctx context.Context, w http.ResponseWriter, err error, in
 	case errors.Is(err, hopper.ErrArchiveMemberNotFound):
 		http.Error(w, `{"error":"not found in archive"}`, http.StatusNotFound)
 	case errors.Is(err, hopper.ErrArchiveMemberTooLarge):
-		//nolint:gosec // sha256 validated by validSHA256
+
 		slog.Info("archive-member over size cap",
 			"sha256", sha, "parent_sha", parent.SHA256, "parent_type", parent.FileType,
 			"inner_path", innerPath, "cap_bytes", archiveMemberMaxBytes)
@@ -4426,7 +4412,7 @@ func writeExtractError(ctx context.Context, w http.ResponseWriter, err error, in
 	case errors.Is(err, hopper.ErrUnsupportedArchive):
 		// Log the container type so the coverage gap is visible: which
 		// parent/nested archive formats workers want but hopper can't serve.
-		//nolint:gosec // sha256 validated by validSHA256
+
 		slog.Info("archive-member unsupported container",
 			"sha256", sha, "parent_sha", parent.SHA256, "parent_type", parent.FileType,
 			"inner_path", innerPath, "error", err)
@@ -4436,11 +4422,11 @@ func writeExtractError(ctx context.Context, w http.ResponseWriter, err error, in
 		// request context expired. Not a server fault, and bytes may already be on
 		// the wire, so there is no status to set — just log it quietly so it stays
 		// out of the 5xx error budget.
-		//nolint:gosec // sha256 validated by validSHA256
+
 		slog.Debug("archive-member request abandoned by client",
 			"sha256", sha, "parent_sha", parent.SHA256, "error", err)
 	case hopper.IsCorruptArchive(err):
-		//nolint:gosec // sha256 validated by validSHA256
+
 		slog.Info("archive-member extraction: corrupt archive",
 			"sha256", sha, "parent_sha", parent.SHA256, "error", err)
 		http.Error(w, `{"error":"corrupt archive"}`, http.StatusUnprocessableEntity)
@@ -4452,7 +4438,7 @@ func writeExtractError(ctx context.Context, w http.ResponseWriter, err error, in
 		// 422 (not a retryable 5xx): the client must not loop on a fundamentally
 		// unextractable member. Logged at Warn because a spike here can also mean a
 		// genuine new gap worth investigating.
-		//nolint:gosec // sha256 validated by validSHA256
+
 		slog.Warn("archive-member extraction failed (treated as permanent)",
 			"sha256", sha, "parent_sha", parent.SHA256, "error", err)
 		// Headers may already be sent if the failure was mid-stream; in that case
@@ -4525,14 +4511,13 @@ func (s *apiServer) safeFileServer() http.Handler {
 			}
 		}
 		if !allowed {
-			//nolint:gosec // relPath is cleaned via filepath.Clean above; logging for diagnostics
 			slog.Warn("data request blocked: path outside allowed directories",
 				"rel", relPath, "resolved", resolved)
 			http.NotFound(w, r)
 			return
 		}
 
-		f, err := os.Open(resolved) //nolint:gosec // path validated above
+		f, err := os.Open(resolved)
 		if err != nil {
 			// /data makes no DB existence claim, so a vanished file is just 404.
 			// A non-ENOENT failure (fd exhaustion under load, transient I/O) is

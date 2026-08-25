@@ -6826,6 +6826,8 @@ const (
 // rate is calculated once and persisted with the cursor, so an interrupted
 // run resumes at the same pace. A zero duration disables pacing, which is
 // useful for tests and small local databases.
+//
+//nolint:gocognit,maintidx // resumable backfill state machine; keeping its transaction and cursor invariants together is safer
 func (db *DB) BackfillLitmusLevel(ctx context.Context, batchSize int, targetDuration time.Duration) (LitmusLevelBackfillStats, error) {
 	if db.pool == nil {
 		return LitmusLevelBackfillStats{}, errors.New("hopper: litmus level backfill requires postgres")

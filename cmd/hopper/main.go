@@ -16,7 +16,7 @@ import (
 	"math"
 	"net"
 	"net/http"
-	_ "net/http/pprof" //nolint:gosec // G108: pprof bound to a dedicated loopback listener (pprofAddr), never the public mux
+	_ "net/http/pprof" //nolint:gosec // pprof is bound to the loopback-only listener
 	"net/url"
 	"os"
 	"os/exec"
@@ -230,7 +230,6 @@ func envBytes(name string, def int64) int64 {
 	}
 	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil || n < 0 {
-		//nolint:gosec // name/v are operator-supplied env config, not request data
 		slog.Warn("ignoring invalid byte-count env var; using default", "var", name, "value", v, "default", def)
 		return def
 	}
@@ -379,7 +378,7 @@ func main() {
 		if len(os.Args) > 1 {
 			cmd = os.Args[1]
 		}
-		slog.Error("command failed", "command", cmd, "error", err) //nolint:gosec // cmd is os.Args[1]; slog escapes structured values
+		slog.Error("command failed", "command", cmd, "error", err)
 		os.Exit(1)
 	}
 }
@@ -613,7 +612,7 @@ func openDB(ctx context.Context, dsn string) (*hopper.DB, error) {
 	if dsn == "" {
 		dsn = "postgres://hopper@hopper-db:5432/hopper"
 	}
-	slog.Info("connecting to database", "dsn", redactDSN(dsn)) //nolint:gosec // dsn is redacted before logging
+	slog.Info("connecting to database", "dsn", redactDSN(dsn))
 	return hopper.Open(ctx, dsn, "hopper")
 }
 
@@ -2928,8 +2927,7 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 
 		if recent := progress.recentErrors(); len(recent) > 0 {
 			writeStdout("\n  \033[2mrecent errors\033[0m\n")
-			for i := len(recent) - 1; i >= 0; i-- {
-				e := recent[i]
+			for _, e := range slices.Backward(recent) {
 				writeStdoutf("  \033[31m%s %-7s\033[0m %s\n",
 					e.At.Format("15:04:05"), e.Stage, e.Message)
 			}
@@ -4740,7 +4738,7 @@ func fetchSample(ctx context.Context, client *http.Client, fileURL, dest string)
 		// /api/file requires a bearer token on a master deployed with
 		// --token-file, loopback callers included.
 		authorizeRequest(req)
-		resp, err := client.Do(req) //nolint:gosec // fileURL derives from the operator-supplied --url; this is a CLI client, not a server
+		resp, err := client.Do(req)
 		if err != nil {
 			cancel()
 			if ctx.Err() != nil {

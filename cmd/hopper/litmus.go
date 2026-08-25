@@ -161,7 +161,6 @@ func closeLogFile(name string, f *os.File) {
 		return
 	}
 	if err := f.Close(); err != nil {
-		//nolint:gosec // value is sanitized before logging; this is a false positive on slog taint flow.
 		slog.Warn("failed to close litmus log file", "log", sanitizeLogString(name), "error", err)
 	}
 }
@@ -489,7 +488,7 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 		return err
 	}
 
-	cmd := exec.CommandContext(ctx, s.bin, args...) //nolint:gosec // bin path is from trusted CLI flag
+	cmd := exec.CommandContext(ctx, s.bin, args...) //nolint:gosec // binary path is trusted configuration
 	// Run litmus as the leader of its own process group so we can signal the
 	// whole tree (rizin/yara children spawned by the worker) at once. Killing
 	// only the parent leaves orphaned descendants behind.
@@ -546,7 +545,6 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 	// workercgroup.go for why this is a post-spawn move, not CLONE_INTO_CGROUP.
 	moveToWorkerCgroup(cmd.Process.Pid)
 
-	//nolint:gosec // values are sanitized or derived locally; this is a false positive on structured slog fields.
 	slog.Info("starting litmus worker",
 		"pid", cmd.Process.Pid,
 		"log", sanitizeLogString(logFile.Name()),
@@ -737,7 +735,7 @@ func (s *litmusServer) livenessWatchdog(ctx context.Context) {
 		// consulted here: the failure mode being defended against is exactly
 		// the one where that number is wrong.
 		if s.maxRSSGB > 0 {
-			budget := uint64(s.maxRSSGB) << 30 //nolint:gosec // guarded positive by the branch condition
+			budget := uint64(s.maxRSSGB) << 30
 			limit := uint64(float64(budget) * rssKillFactor)
 			mem, err := procMemoryBytes(pid)
 			switch {

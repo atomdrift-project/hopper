@@ -548,7 +548,7 @@ func shaSuffixedRel(rel, sha string) string {
 // fileMatchesSHA256 reports whether path's content hashes to sha
 // (lowercase hex).
 func fileMatchesSHA256(path, sha string) (bool, error) {
-	f, err := os.Open(path) //nolint:gosec // path resolved within dataRoot
+	f, err := os.Open(path)
 	if err != nil {
 		return false, err
 	}
@@ -563,7 +563,7 @@ func fileMatchesSHA256(path, sha string) (bool, error) {
 // pathExists reports whether path exists, distinguishing a real stat error
 // (e.g. permission denied) from a clean "not there".
 func pathExists(path string) (bool, error) {
-	_, err := os.Stat(path) //nolint:gosec // G703: path is a sample destination resolved within dataRoot
+	_, err := os.Stat(path)
 	if err == nil {
 		return true, nil
 	}
@@ -581,9 +581,9 @@ func removeMarkers(samplePath string) {
 	base := filepath.Base(samplePath)
 	for _, suffix := range []string{markerBenign, markerBad} {
 		p := filepath.Join(dir, markerPrefix+base+suffix)
-		//nolint:gosec // G703: p is a marker beside a sample path within dataRoot
+
 		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
-			slog.Warn("remove stale marker failed", "path", p, "error", err) //nolint:gosec // G706: p is server-derived
+			slog.Warn("remove stale marker failed", "path", p, "error", err)
 		}
 	}
 }
@@ -791,7 +791,7 @@ func postTriage(ctx context.Context, baseURL string, req triageRequest) (*triage
 	// --token-file, loopback callers included.
 	authorizeRequest(httpReq)
 	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Do(httpReq) //nolint:gosec // G704: baseURL is the operator-provided trusted master endpoint
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		return nil, err
 	}

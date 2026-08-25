@@ -236,7 +236,6 @@ func lockMoveSource(ctx context.Context, name string) (*os.File, error) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		//nolint:gosec // G115: a descriptor from os.File.Fd always fits in int
 		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 		if err == nil {
 			return f, nil
@@ -294,7 +293,7 @@ func publishMoveFile(ctx context.Context, src, dst, expected string) (bool, erro
 	dir := filepath.Dir(dst)
 	// Group-writable on purpose: /data/samples is shared by forager, hopper,
 	// and promoter through the samples group (see cmd/hopper's sharedDirMode).
-	if err := os.MkdirAll(dir, 0o775); err != nil { //nolint:gosec // G301: shared samples tree, see above
+	if err := os.MkdirAll(dir, 0o775); err != nil { //nolint:gosec // shared samples directory permissions are intentional
 		return false, err
 	}
 	if err := os.Link(src, dst); err == nil {
@@ -376,7 +375,7 @@ func publishMoveFile(ctx context.Context, src, dst, expected string) (bool, erro
 		}
 		return false, err
 	}
-	if err := os.Remove(tmpName); err != nil { //nolint:gosec // G703: name from os.CreateTemp under a resolveMoveTarget-validated dir
+	if err := os.Remove(tmpName); err != nil {
 		return true, err
 	}
 	tmpName = ""

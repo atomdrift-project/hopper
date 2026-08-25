@@ -6145,7 +6145,11 @@ func (db *DB) IngestReportsDir(ctx context.Context, dir, reportType, provider st
 	if err != nil {
 		return stats, fmt.Errorf("open reports root: %w", err)
 	}
-	defer func() { _ = root.Close() }()
+	defer func() {
+		if closeErr := root.Close(); closeErr != nil {
+			slog.Warn("close reports root failed", "error", closeErr)
+		}
+	}()
 	walkErr := filepath.WalkDir(dir, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr

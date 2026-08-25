@@ -439,26 +439,26 @@ func (wd *webDashboard) renderStartup(w http.ResponseWriter) {
 		default:
 			// running — leave dot-warn
 		}
-		//nolint:gosec // dot is a literal CSS class; label is HTML-escaped.
+
 		fmt.Fprintf(&buf, `<tr><td><span class="dot %s">&#9679;</span>%s</td>`, dot, html.EscapeString(s.label))
 		buf.WriteString(`<td class="rate">`)
 		switch {
 		case s.err != "":
-			//nolint:gosec // err is HTML-escaped before write.
+
 			fmt.Fprintf(&buf, `<span class="err-inline">%s</span>`, html.EscapeString(s.err))
 		case s.total > 0 && s.current <= s.total:
 			pct := float64(s.current) / float64(s.total) * 100
-			//nolint:gosec // fmtN emits only digits and commas; pct is a float.
+
 			fmt.Fprintf(&buf, `%s / %s (%.0f%%)`, fmtN(s.current), fmtN(s.total), pct)
 		case s.current > 0:
 			// Either no upfront total, or current overshot it — show raw count
 			// rather than a misleading > 100% ratio.
-			//nolint:gosec // fmtN emits only digits and commas.
+
 			fmt.Fprintf(&buf, `%s processed`, fmtN(s.current))
 		default:
 			// no progress signal — render the duration only
 		}
-		//nolint:gosec // dur formats as a Go duration literal (digits + units).
+
 		fmt.Fprintf(&buf, `</td><td>%s</td></tr>`, dur)
 	}
 	buf.WriteString(`</tbody></table></section>`)
@@ -1101,7 +1101,6 @@ func writeWorkflowHealth(buf *strings.Builder, h hopper.WorkflowHealth) {
 }
 
 func writeMetricCard(buf *strings.Builder, label, value, sub string) {
-	//nolint:gosec // G705 false positive: every interpolated value is htmlEscape'd (html.EscapeString) before formatting.
 	fmt.Fprintf(buf,
 		`<div class="metric-card"><div class="metric-label">%s</div><div class="metric-value">%s</div><div class="metric-sub">%s</div></div>`,
 		htmlEscape(label), htmlEscape(value), htmlEscape(sub))
@@ -1116,7 +1115,7 @@ func writeWorkflowBacklogs(buf *strings.Builder, rows []hopper.WorkflowBacklog) 
 		`<th>Cleave</th><th>Litmus</th><th>Oldest</th><th>Newest</th></tr></thead><tbody>`)
 	for i := range rows {
 		r := &rows[i]
-		//nolint:gosec // G705 false positive: string values are htmlEscape'd and fmtN emits only digits/commas.
+
 		fmt.Fprintf(buf,
 			`<tr><td>%s</td><td>%s</td><td class="hi">%s</td><td class="hi">%s</td><td>%s</td><td>%s</td><td>%s</td></tr>`,
 			htmlEscape(dashIfEmpty(r.Source)),
@@ -1146,7 +1145,7 @@ func writeWorkflowSamples(buf *strings.Builder, label, note string, samples []ho
 			t = *s.FirstAnalyzedAt
 		}
 		name := firstNonEmpty(s.Filename, filepath.Base(s.Path), s.SHA256)
-		//nolint:gosec // G705 false positive: every interpolated value is htmlEscape'd or constant HTML from workflowStateHTML.
+
 		fmt.Fprintf(buf,
 			`<tr><td title="%s">%s</td><td>%s</td><td class="hi">%s</td><td>%s</td><td>%s</td><td>%s</td></tr>`,
 			htmlEscape(t.Format(time.RFC3339)),
@@ -1246,7 +1245,7 @@ func writeRecentErrors(buf *strings.Builder, progress *loadProgress) {
 	}
 	buf.WriteString(`<section><div class="label">Recent Errors</div>`)
 	buf.WriteString(`<table><thead><tr><th>Time</th><th>Stage</th><th>Error</th></tr></thead><tbody>`)
-			for _, e := range slices.Backward(errs) {
+	for _, e := range slices.Backward(errs) {
 		fmt.Fprintf(buf,
 			`<tr><td class="err-time">%s</td><td class="err-stage">%s</td><td class="err-msg">%s</td></tr>`,
 			htmlEscape(e.At.Format("15:04:05")),
@@ -1421,7 +1420,7 @@ func fmtN(n int64) string {
 		if i > 0 && (len(s)-i)%3 == 0 {
 			out = append(out, ',')
 		}
-		out = append(out, byte(c)) //nolint:gosec // c is always an ASCII digit from FormatInt
+		out = append(out, byte(c)) //nolint:gosec // c is restricted to ASCII digits
 	}
 	return string(out)
 }

@@ -183,7 +183,7 @@ func (c *extractCache) build(ctx context.Context, sha string, src io.ReaderAt, s
 		derr = cerr
 	}
 	if derr != nil {
-		_ = os.Remove(name) //nolint:errcheck,gosec // best-effort cleanup of our own temp file
+		_ = os.Remove(name) //nolint:errcheck // best-effort cleanup of our own temp file
 		if errors.Is(derr, hopper.ErrArchiveMemberTooLarge) {
 			return errCacheTooLarge
 		}
@@ -192,8 +192,8 @@ func (c *extractCache) build(ctx context.Context, sha string, src io.ReaderAt, s
 
 	// Reopen read-only and unlink: the open fd keeps the bytes alive (POSIX), so
 	// disk is reclaimed when the last reader closes it and a crash leaks nothing.
-	f, err := os.Open(name) //nolint:gosec // name is our own CreateTemp file under c.dir
-	_ = os.Remove(name)     //nolint:errcheck,gosec // unlink our temp file; f retains the data
+	f, err := os.Open(name)
+	_ = os.Remove(name) //nolint:errcheck // unlink our temp file; f retains the data
 	if err != nil {
 		return err
 	}

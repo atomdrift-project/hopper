@@ -30,7 +30,7 @@ OFFLINE_PROMOTE="${OFFLINE_PROMOTE:-0}"
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-# shellcheck source=replicated-tables.sh
+# shellcheck disable=SC1091
 . "$SCRIPT_DIR/replicated-tables.sh"
 
 # Admin probe — same ladder as setup-replica.sh so this works cleanly on
@@ -214,9 +214,11 @@ admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
 SLIM_RESTORE="${HEAL_STATE_DIR:-$HOME/.hopper-replica-heal}/slim-index-restore.sql"
 if [ -f "$SLIM_RESTORE" ]; then
     log "Rebuilding master-only indexes dropped for replica duty (this can take hours)"
-    admin -d "$LOCAL_DB" -f "$SLIM_RESTORE" \
-        && mv "$SLIM_RESTORE" "$SLIM_RESTORE.applied" \
-        || log "warning: index rebuild failed or partial — re-run by hand: psql -d $LOCAL_DB -f $SLIM_RESTORE"
+    if admin -d "$LOCAL_DB" -f "$SLIM_RESTORE"; then
+        mv "$SLIM_RESTORE" "$SLIM_RESTORE.applied" || log "warning: could not archive applied index restore: $SLIM_RESTORE"
+    else
+        log "warning: index rebuild failed or partial — re-run by hand: psql -d $LOCAL_DB -f $SLIM_RESTORE"
+    fi
 fi
 
 # ZFS: sync=disabled -> standard. Best-effort and a no-op inside a jail (see the

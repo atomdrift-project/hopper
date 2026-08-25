@@ -43,7 +43,7 @@ groups:
         annotations:
           runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/scripts/replica/RUNBOOK.md#fast-rebuild-deferred-index-bulk-copy"
           summary: "Replication slot {{ $labels.slot_name }} is LOST"
-          description: "wal_status=lost on {{ $labels.slot_name }} ({{ $labels.kind }}) — exceeded max_slot_wal_keep_size and was invalidated. The replica needs a full rebuild (make rebuild-replica)."
+          description: "wal_status=lost on {{ $labels.slot_name }} ({{ $labels.kind }}) — exceeded max_slot_wal_keep_size and was invalidated. The replica needs a full rebuild (make rebuild-replica)." # yamllint disable-line rule:line-length
 
       # A streaming replica's apply worker is no longer consuming its slot:
       # host/PG down (2026-06-27), subscription disabled by schema drift
@@ -77,7 +77,7 @@ groups:
         annotations:
           runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/scripts/replica/RUNBOOK.md#fast-rebuild-deferred-index-bulk-copy"
           summary: "Replication slot {{ $labels.slot_name }} near the backstop"
-          description: "{{ $value | humanize1024 }}B pinned by {{ $labels.slot_name }} ({{ $labels.kind }}) — within ~300GB of max_slot_wal_keep_size (1200GB). It will self-invalidate if it crosses."
+          description: "{{ $value | humanize1024 }}B pinned by {{ $labels.slot_name }} ({{ $labels.kind }}) — within ~300GB of max_slot_wal_keep_size (1200GB). It will self-invalidate if it crosses." # yamllint disable-line rule:line-length
 
       - alert: PostgresWalOnDiskHigh
         expr: hopper_pg_stat_wal_bytes > 800e9
@@ -147,7 +147,7 @@ groups:
         annotations:
           runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/scripts/monitoring/RUNBOOK.md#what-pages-you-and-why"
           summary: "Tablesync slot {{ $labels.slot_name }} retaining >400GB WAL"
-          description: "An initial tablesync is pinning {{ $value | humanize1024 }}B and rising. Normal during a large copy; watch it against the 1500GB backstop."
+          description: "An initial tablesync is pinning {{ $value | humanize1024 }}B and rising. Normal during a large copy; watch it against the 1500GB backstop." # yamllint disable-line rule:line-length
 
   # --- Subscriber-side ------------------------------------------------------
   # Fed by hopper/scripts/replica/replica-textfile.sh on each replica, via the
@@ -171,7 +171,7 @@ groups:
         labels: { severity: page }
         annotations:
           summary: "Replica health metrics stale on {{ $labels.host }}"
-          description: "hopper-replica.prom has not been rewritten for {{ $value | humanizeDuration }} — the emitter timer, postgres, or the host is down, and every subscriber-side replication alert is now blind."
+          description: "hopper-replica.prom has not been rewritten for {{ $value | humanizeDuration }} — the emitter timer, postgres, or the host is down, and every subscriber-side replication alert is now blind." # yamllint disable-line rule:line-length
 
       # disable_on_error=true means any apply error disables the subscription,
       # and replica-heal.sh deliberately refuses to re-enable a non-schema one.
@@ -182,7 +182,7 @@ groups:
         labels: { severity: page }
         annotations:
           summary: "Subscription {{ $labels.subscription }} is DISABLED"
-          description: "The subscription on {{ $labels.host }} is disabled and will not re-enable itself. WAL now accumulates on the publisher against its slot. Re-enable with: ALTER SUBSCRIPTION {{ $labels.subscription }} ENABLE;"
+          description: "The subscription on {{ $labels.host }} is disabled and will not re-enable itself. WAL now accumulates on the publisher against its slot. Re-enable with: ALTER SUBSCRIPTION {{ $labels.subscription }} ENABLE;" # yamllint disable-line rule:line-length
 
       - alert: SubscriptionApplyWorkerMissing
         expr: |
@@ -192,14 +192,14 @@ groups:
         labels: { severity: page }
         annotations:
           summary: "Subscription {{ $labels.subscription }} enabled but no apply worker"
-          description: "Enabled for 10m with no apply worker attached on {{ $labels.host }} — the worker is crash-looping (a lost/invalidated slot does this every 5s) or max_logical_replication_workers is exhausted."
+          description: "Enabled for 10m with no apply worker attached on {{ $labels.host }} — the worker is crash-looping (a lost/invalidated slot does this every 5s) or max_logical_replication_workers is exhausted." # yamllint disable-line rule:line-length
 
       - alert: SubscriptionApplyErrors
         expr: increase(hopper_replica_apply_error_count[15m]) > 0
         labels: { severity: warning }
         annotations:
           summary: "Apply errors on {{ $labels.subscription }}"
-          description: "{{ $value | printf \"%.0f\" }} apply error(s) in 15m on {{ $labels.host }}. With disable_on_error=true the next one can disable the subscription."
+          description: "{{ $value | printf \"%.0f\" }} apply error(s) in 15m on {{ $labels.host }}. With disable_on_error=true the next one can disable the subscription." # yamllint disable-line rule:line-length
 
       - alert: ReplicaTablesNotReady
         expr: |
@@ -208,7 +208,7 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "{{ $labels.subscription }} has tables not in 'ready' state"
-          description: "{{ $value }} of {{ $labels.subscription }}'s tables are still copying/syncing after 6h on {{ $labels.host }} — a stuck tablesync holds its own slot and its own WAL."
+          description: "{{ $value }} of {{ $labels.subscription }}'s tables are still copying/syncing after 6h on {{ $labels.host }} — a stuck tablesync holds its own slot and its own WAL." # yamllint disable-line rule:line-length
 
       # Index drift: the replica keeps a deliberately minimal index set
       # (scripts/replica/slim-indexes.sh). DDL does not replicate, so a
@@ -220,7 +220,7 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "Replica {{ $labels.host }} is missing {{ $value }} policy index(es)"
-          description: "{{ $value }} index(es) named by REPLICA_KEEP_INDEXES are absent — 'make replica' has not run since hopper gained them, so prism read paths are unindexed. Run 'make replica' on {{ $labels.host }}."
+          description: "{{ $value }} index(es) named by REPLICA_KEEP_INDEXES are absent — 'make replica' has not run since hopper gained them, so prism read paths are unindexed. Run 'make replica' on {{ $labels.host }}." # yamllint disable-line rule:line-length
 
       - alert: ReplicaIndexPolicyExtra
         expr: hopper_replica_index_policy_extra > 0
@@ -228,4 +228,4 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "Replica {{ $labels.host }} carries {{ $value }} unslimmed index(es)"
-          description: "{{ $value }} index(es) on subscribed tables are not in the keep list — on a logical replica every one is maintained per applied row. Run scripts/replica/slim-indexes.sh on {{ $labels.host }}."
+          description: "{{ $value }} index(es) on subscribed tables are not in the keep list — on a logical replica every one is maintained per applied row. Run scripts/replica/slim-indexes.sh on {{ $labels.host }}." # yamllint disable-line rule:line-length

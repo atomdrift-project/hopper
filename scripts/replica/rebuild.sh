@@ -129,6 +129,7 @@ truncate_tables=${truncate_tables%,}
 # Suppress the schema-drift self-healer for the rebuild — it must not try to
 # re-enable the subscription while we deliberately drop, truncate, and re-copy.
 # (setup.sh, invoked at step 3, manages the same flag on its own exit.)
+# shellcheck disable=SC2016
 HEAL_DIR=$(pg_sh 'printf %s "${HEAL_STATE_DIR:-$HOME/.hopper-replica-heal}"' 2>/dev/null || true)
 maint_off() { [ -n "${HEAL_DIR:-}" ] && pg_sh "rm -f '$HEAL_DIR/maintenance'" 2>/dev/null || true; }
 [ -n "${HEAL_DIR:-}" ] && pg_sh "mkdir -p '$HEAL_DIR' && : > '$HEAL_DIR/maintenance'" 2>/dev/null || true

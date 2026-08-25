@@ -222,4 +222,4 @@ groups:
           severity: warning
         annotations:
           summary: "Hopper is load-shedding {{ $labels.pool }} requests"
-          description: "{{ $value | printf \"%.2f\" }} shed requests/sec on pool {{ $labels.pool }} over 10m; check hopper_{{ $labels.pool }}_slots_in_use vs slots_max."
+          description: "{{ $value | printf \"%.2f\" }} shed requests/sec on pool {{ $labels.pool }} over 10m; check hopper_{{ $labels.pool }}_slots_in_use vs slots_max." # yamllint disable-line rule:line-length

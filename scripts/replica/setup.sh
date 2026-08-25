@@ -223,8 +223,8 @@ fi
 # subscription to run DDL, raise a maintenance flag the healer honors so they
 # don't race. pg_sh runs a command as the postgres OS user (same escalation as
 # admin()) so files land where the healer — also postgres — reads them.
-# shellcheck source=replicated-tables.sh
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck disable=SC1091
 . "$SCRIPT_DIR/replicated-tables.sh"
 REPLICATED_TABLES_SQL=$(printf "'%s'," "$REPLICATED_TABLES" | sed 's/,$//')
 if [ -z "$ESCALATE" ]; then
@@ -254,7 +254,7 @@ maint_on
 # Fast-sync helpers: defer secondary-index maintenance during the initial COPY
 # and rebuild in bulk afterwards (the single biggest lever for large, heavily
 # indexed tables). Sourced here so admin()/pg_sh()/log()/HEAL_DIR are defined.
-# shellcheck source=bulkload.sh
+# shellcheck disable=SC1091
 . "$SCRIPT_DIR/bulkload.sh"
 trap 'bulkload_cleanup; maint_off' EXIT
 
@@ -897,10 +897,13 @@ pat="^$REMOTE_HOST:[*]:$REMOTE_DB:$REMOTE_USER:"
 have=$(pg_sh "grep -c '$pat' \"\$HOME/.pgpass\" 2>/dev/null" 2>/dev/null || true)
 case "${have:-0}" in
     ''|0)
-        printf '%s:*:%s:%s:%s\n' "$REMOTE_HOST" "$REMOTE_DB" "$REMOTE_USER" "$REMOTE_PW" \
-          | pg_sh 'umask 077; f="$HOME/.pgpass"; touch "$f"; cat >> "$f"; chmod 600 "$f"' \
-          && log "Added upstream entry to postgres ~/.pgpass (for replica-heal.sh)" \
-          || log "warning: could not write postgres ~/.pgpass — add the upstream entry manually for the healer" ;;
+        # shellcheck disable=SC2016
+        if printf '%s:*:%s:%s:%s\n' "$REMOTE_HOST" "$REMOTE_DB" "$REMOTE_USER" "$REMOTE_PW" \
+          | pg_sh 'umask 077; f="$HOME/.pgpass"; touch "$f"; cat >> "$f"; chmod 600 "$f"'; then
+            log "Added upstream entry to postgres ~/.pgpass (for replica-heal.sh)"
+        else
+            log "warning: could not write postgres ~/.pgpass — add the upstream entry manually for the healer"
+        fi ;;
 esac
 
 # Schedule the healer (systemd timer on Linux, postgres cron in a FreeBSD jail).

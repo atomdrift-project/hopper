@@ -35,24 +35,24 @@ func mkdirSharedAll(path string) error {
 	// stay within the data root, so these are not attacker-controlled traversals.
 	firstNew := ""
 	for p := abs; p != "/" && p != "."; p = filepath.Dir(p) {
-		if _, err := os.Stat(p); err == nil { //nolint:gosec // G703: caller-validated path
+		if _, err := os.Stat(p); err == nil {
 			break
 		}
 		firstNew = p
 	}
-	if err := os.MkdirAll(abs, sharedDirMode); err != nil { //nolint:gosec // G703: caller-validated path
+	if err := os.MkdirAll(abs, sharedDirMode); err != nil {
 		return err
 	}
 	if firstNew == "" {
 		// Whole path pre-existed; align the target best-effort.
-		err := os.Chmod(abs, sharedDirMode) //nolint:gosec // G703: caller-validated path
+		err := os.Chmod(abs, sharedDirMode)
 		if err != nil && !errors.Is(err, fs.ErrPermission) {
 			return err
 		}
 		return nil
 	}
 	for p := abs; ; p = filepath.Dir(p) {
-		if err := os.Chmod(p, sharedDirMode); err != nil { //nolint:gosec // G703: caller-validated path
+		if err := os.Chmod(p, sharedDirMode); err != nil {
 			return err
 		}
 		if p == firstNew {

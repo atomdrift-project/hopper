@@ -92,7 +92,6 @@ func sdWatchdogInterval() (time.Duration, bool) {
 	}
 	usec, err := strconv.ParseInt(usecStr, 10, 64)
 	if err != nil || usec <= 0 {
-		//nolint:gosec // value is sanitized before logging; false positive on slog taint flow
 		slog.Warn("unparseable WATCHDOG_USEC; systemd watchdog disabled",
 			"value", sanitizeLogString(usecStr))
 		return 0, false
@@ -111,8 +110,8 @@ func sdNotify(state string) {
 	if strings.HasPrefix(sock, "@") { // abstract socket namespace
 		sock = "\x00" + sock[1:]
 	}
-	//nolint:gosec,noctx // dest is systemd's NOTIFY_SOCKET env (local unix dgram); connectionless, nothing for a ctx to cancel
-	conn, err := net.Dial("unixgram", sock)
+	//nolint:noctx // dest is systemd's NOTIFY_SOCKET env (local unix dgram); connectionless, nothing for a ctx to cancel
+	conn, err := net.Dial("unixgram", sock) //nolint:gosec // socket path is supplied by local systemd
 	if err != nil {
 		slog.Warn("dial systemd notify socket failed", "error", err)
 		return

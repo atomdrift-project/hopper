@@ -27,8 +27,8 @@ package main
 // Default is a dry-run report; nothing moves without -apply.
 
 import (
-	"context"
 	"cmp"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
