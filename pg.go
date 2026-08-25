@@ -108,6 +108,11 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS litmus_result JSONB`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS llm_result JSONB`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS litmus_score DOUBLE PRECISION NOT NULL DEFAULT 0`,
+		// lvl is the raw model firing level from litmus_result. Keep it nullable:
+		// older envelopes may not carry a level, and NULL is different from the
+		// model's -1 "never fires" sentinel. It is deliberately plain and trigger-
+		// fed so adding it is metadata-only on the large samples table.
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS lvl INTEGER`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent) WHERE parent != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_formula ON samples(formula) WHERE formula != ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS mtime TIMESTAMPTZ`,
@@ -1330,6 +1335,12 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		LANGUAGE plpgsql AS $$
 		BEGIN
 			NEW.litmus_score := COALESCE((NEW.litmus_result->>'prob')::double precision, 0);
+			-- litmus_result is normally the extracted ml object (flat lvl), but
+			-- archived envelopes can retain the outer {ml:{...}} wrapper. Keep
+			-- both spellings here while preserving the legacy v6/v7 l key.
+			NEW.lvl := NULLIF(COALESCE(NEW.litmus_result->'ml'->>'lvl',
+											NEW.litmus_result->>'lvl',
+											NEW.litmus_result->>'l'), '')::integer;
 			NEW.litmus_class := COALESCE(
 				(NEW.litmus_result->>'class')::smallint,
 				CASE
@@ -6788,6 +6799,192 @@ func (db *DB) backfillLitmusClassPG(ctx context.Context, limit int) (int64, erro
 			return total, nil
 		}
 		slog.Info("backfill litmus_class batch", "batch", n, "total", total)
+	}
+}
+
+const (
+	litmusLevelBackfillCursorKey    = "backfill:litmus-level:cursor"
+	litmusLevelBackfillTotalKey     = "backfill:litmus-level:total"
+	litmusLevelBackfillProcessedKey = "backfill:litmus-level:processed"
+	litmusLevelBackfillStartedKey   = "backfill:litmus-level:started"
+	litmusLevelBackfillDoneKey      = "backfill:litmus-level:done"
+)
+
+// BackfillLitmusLevel fills samples.lvl from the stored ML result in small,
+// resumable primary-key batches. It is intentionally separate from Backfill:
+// this pass may touch the whole analyzed corpus and is meant to run at a
+// deliberately low duty cycle over an operator-selected maintenance window.
+//
+// The new column is plain and the derive trigger fires only on
+// INSERT/UPDATE OF litmus_result, so this UPDATE does not recursively invoke
+// the trigger, does not bump updated_at, and does not rewrite already-correct
+// rows. The cursor advances over every row carrying litmus_result, including
+// legacy envelopes without a level; NULL is a valid final value for those
+// rows, so lvl IS NULL cannot be used as the backfill gate.
+//
+// targetDuration is the desired minimum duration for the initial corpus. The
+// rate is calculated once and persisted with the cursor, so an interrupted
+// run resumes at the same pace. A zero duration disables pacing, which is
+// useful for tests and small local databases.
+func (db *DB) BackfillLitmusLevel(ctx context.Context, batchSize int, targetDuration time.Duration) (LitmusLevelBackfillStats, error) {
+	if db.pool == nil {
+		return LitmusLevelBackfillStats{}, errors.New("hopper: litmus level backfill requires postgres")
+	}
+	if batchSize <= 0 {
+		return LitmusLevelBackfillStats{}, fmt.Errorf("hopper: litmus level backfill: invalid batch size %d", batchSize)
+	}
+
+	var stats LitmusLevelBackfillStats
+	var cursor, processed, total int64
+	var started time.Time
+
+	if v, err := db.KVGet(ctx, litmusLevelBackfillCursorKey); err == nil {
+		cursor, err = strconv.ParseInt(v, 10, 64)
+		if err != nil || cursor < 0 {
+			return stats, fmt.Errorf("hopper: parse litmus level backfill cursor %q: %w", v, err)
+		}
+		if v, err := db.KVGet(ctx, litmusLevelBackfillTotalKey); err == nil {
+			total, err = strconv.ParseInt(v, 10, 64)
+			if err != nil || total < 0 {
+				return stats, fmt.Errorf("hopper: parse litmus level backfill total %q: %w", v, err)
+			}
+		} else if !errors.Is(err, ErrNotFound) {
+			return stats, err
+		}
+		if v, err := db.KVGet(ctx, litmusLevelBackfillProcessedKey); err == nil {
+			processed, err = strconv.ParseInt(v, 10, 64)
+			if err != nil || processed < 0 {
+				return stats, fmt.Errorf("hopper: parse litmus level backfill processed %q: %w", v, err)
+			}
+		} else if !errors.Is(err, ErrNotFound) {
+			return stats, err
+		}
+		if v, err := db.KVGet(ctx, litmusLevelBackfillStartedKey); err == nil {
+			started, err = time.Parse(time.RFC3339Nano, v)
+			if err != nil {
+				return stats, fmt.Errorf("hopper: parse litmus level backfill start %q: %w", v, err)
+			}
+		} else if !errors.Is(err, ErrNotFound) {
+			return stats, err
+		}
+	} else if !errors.Is(err, ErrNotFound) {
+		return stats, err
+	}
+
+	if started.IsZero() {
+		if err := db.pool.QueryRow(ctx,
+			`SELECT count(*) FROM samples WHERE litmus_result IS NOT NULL`).Scan(&total); err != nil {
+			return stats, fmt.Errorf("hopper: count litmus level backfill rows: %w", err)
+		}
+		started = time.Now().UTC()
+		if err := db.KVSet(ctx, litmusLevelBackfillTotalKey, strconv.FormatInt(total, 10)); err != nil {
+			return stats, err
+		}
+		if err := db.KVSet(ctx, litmusLevelBackfillProcessedKey, "0"); err != nil {
+			return stats, err
+		}
+		if err := db.KVSet(ctx, litmusLevelBackfillStartedKey, started.Format(time.RFC3339Nano)); err != nil {
+			return stats, err
+		}
+	}
+	stats.Total = total
+	stats.Cursor = cursor
+	stats.Scanned = processed
+	if total == 0 {
+		if err := db.KVSet(ctx, litmusLevelBackfillDoneKey, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return stats, err
+		}
+		stats.Done = true
+		return stats, nil
+	}
+
+	var rate float64
+	if targetDuration > 0 {
+		rate = float64(total) / targetDuration.Seconds()
+	}
+
+	for {
+		var nextCursor, scanned, updated int64
+		tx, err := db.pool.Begin(ctx)
+		if err != nil {
+			return stats, fmt.Errorf("hopper: begin litmus level backfill: %w", err)
+		}
+		row := tx.QueryRow(ctx, `
+			WITH batch AS MATERIALIZED (
+				SELECT id
+				FROM samples
+				WHERE id > $1 AND litmus_result IS NOT NULL
+				ORDER BY id
+				LIMIT $2
+			), updated AS (
+				UPDATE samples s
+				SET lvl = NULLIF(COALESCE(
+					s.litmus_result->'ml'->>'lvl',
+					s.litmus_result->>'lvl',
+					s.litmus_result->>'l'), '')::integer
+				FROM batch
+				WHERE s.id = batch.id
+				  AND s.lvl IS DISTINCT FROM NULLIF(COALESCE(
+					s.litmus_result->'ml'->>'lvl',
+					s.litmus_result->>'lvl',
+					s.litmus_result->>'l'), '')::integer
+				RETURNING s.id
+			)
+			SELECT COALESCE((SELECT max(id) FROM batch), 0),
+			       (SELECT count(*) FROM batch),
+			       (SELECT count(*) FROM updated)`, cursor, batchSize)
+		if err := row.Scan(&nextCursor, &scanned, &updated); err != nil {
+			_ = tx.Rollback(ctx)
+			return stats, fmt.Errorf("hopper: scan litmus level backfill batch: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return stats, fmt.Errorf("hopper: commit litmus level backfill batch: %w", err)
+		}
+
+		if scanned == 0 {
+			if err := db.KVSet(ctx, litmusLevelBackfillCursorKey, strconv.FormatInt(cursor, 10)); err != nil {
+				return stats, err
+			}
+			if err := db.KVSet(ctx, litmusLevelBackfillDoneKey, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+				return stats, err
+			}
+			stats.Done = true
+			return stats, nil
+		}
+
+		cursor = nextCursor
+		processed += scanned
+		stats.Cursor = cursor
+		stats.Scanned = processed
+		stats.Updated += updated
+		if err := db.KVSet(ctx, litmusLevelBackfillCursorKey, strconv.FormatInt(cursor, 10)); err != nil {
+			return stats, err
+		}
+		if err := db.KVSet(ctx, litmusLevelBackfillProcessedKey, strconv.FormatInt(processed, 10)); err != nil {
+			return stats, err
+		}
+		slog.InfoContext(ctx, "litmus level backfill batch",
+			"scanned", scanned, "updated", updated, "total_scanned", processed,
+			"total_updated", stats.Updated, "cursor", cursor, "corpus", total)
+
+		if rate > 0 {
+			wantElapsed := time.Duration(float64(processed) / rate * float64(time.Second))
+			for wait := time.Until(started.Add(wantElapsed)); wait > 0; {
+				if wait > 30*time.Second {
+					wait = 30 * time.Second
+				}
+				timer := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					if !timer.Stop() {
+						<-timer.C
+					}
+					return stats, ctx.Err()
+				case <-timer.C:
+				}
+				wait = time.Until(started.Add(wantElapsed))
+			}
+		}
 	}
 }
 

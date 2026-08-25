@@ -5066,6 +5066,17 @@ type BackfillStats struct {
 	MarkersCleared int64 // skip='misclassified' rows reset to skip='' under the new heuristic
 }
 
+// LitmusLevelBackfillStats reports one resumable lvl backfill run. The cursor
+// is the highest samples.id examined, not the highest row changed: rows whose
+// envelope has no level still need to be passed once, but do not need a write.
+type LitmusLevelBackfillStats struct {
+	Total   int64
+	Scanned int64
+	Updated int64
+	Cursor  int64
+	Done    bool
+}
+
 // BackfillPending reports how much work each Backfill pass currently has.
 type BackfillPending struct {
 	CleaveColumns         int64 // elements / max_crit / suspicious_count from cleave_result

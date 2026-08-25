@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS samples (
 	cleave_result JSONB,
 	litmus_result JSONB,
 	litmus_score  DOUBLE PRECISION NOT NULL DEFAULT 0,
+	-- Raw model firing level from litmus_result; nullable for pre-level envelopes.
+	lvl           INTEGER,
 	-- provenance is the collector's per-artifact sidecar (forager's Sidecar:
 	-- artifact bytes, fetch act, feed event, and authoritative registry
 	-- snapshot). Mirrors the on-disk <artifact>.forage.json so the catalog is

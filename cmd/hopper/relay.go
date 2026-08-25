@@ -121,6 +121,11 @@ func (s *apiServer) freshOr(local http.HandlerFunc) http.HandlerFunc {
 			s.relay.ServeHTTP(w, r)
 			return
 		}
+		if s.readOnly {
+			w.Header().Set("X-Hopper-Source", "replica")
+		} else {
+			w.Header().Set("X-Hopper-Source", "primary")
+		}
 		local(w, r)
 	}
 }

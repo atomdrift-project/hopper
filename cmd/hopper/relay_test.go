@@ -31,6 +31,7 @@ func newRelayPrimary(t *testing.T, status int, respBody string) (*httptest.Serve
 			lane:   r.Header.Get(laneHeader),
 			xff:    r.Header.Get("X-Forwarded-For"),
 		}
+		w.Header().Set("X-Hopper-Source", "primary")
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte(respBody)) //nolint:errcheck // test stub
 	}))
@@ -279,6 +280,13 @@ func TestFreshQueryRoutesLookupToPrimary(t *testing.T) {
 			h(w, req)
 			if !strings.Contains(w.Body.String(), tt.wantOrigin) {
 				t.Errorf("body = %q, want served by %s", w.Body.String(), tt.wantOrigin)
+			}
+			wantSource := "primary"
+			if tt.wantOrigin == "replica" {
+				wantSource = "replica"
+			}
+			if got := w.Header().Get("X-Hopper-Source"); got != wantSource {
+				t.Errorf("source header = %q, want %q", got, wantSource)
 			}
 		})
 	}

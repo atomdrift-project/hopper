@@ -53,6 +53,7 @@ commands:
   bad-review         list marker-bad files cleave still considers benign
   conflict-review    list samples asserted both good and bad across pools
   backfill           re-derive columns from cleave_result/litmus_result blobs
+  backfill-lvl       materialize litmus model levels in small resumable batches (postgres)
   reheal-crit        repair max_crit/suspicious_count zeroed by the pre-v8 cleave trigger (postgres)
   backfill-purl      derive missing samples.purl_base from ecosystem+package (never overwrites; postgres)
   repair-parents     clear samples.parent where the bytes are on disk standalone (--dry-run; postgres)
@@ -412,6 +413,8 @@ func run(ctx context.Context) error {
 		return cmdConflictReview(ctx)
 	case "backfill":
 		return cmdBackfill(ctx)
+	case "backfill-lvl":
+		return cmdBackfillLitmusLevel(ctx)
 	case "reheal-crit":
 		return cmdRehealCrit(ctx)
 	case "repair-parents":
@@ -3814,6 +3817,44 @@ func cmdBackfill(ctx context.Context) error {
 		return err
 	}
 	slog.Info("backfill complete", "scanned", stats.Scanned, "updated", stats.Updated, "markers_cleared", stats.MarkersCleared)
+	return nil
+}
+
+// cmdBackfillLitmusLevel installs the lvl derive trigger and drains the
+// existing litmus corpus at a resumable, low-rate pace. The cursor and pacing
+// state live in hopper_kv, so an interrupted process can be restarted without
+// rescanning from the beginning. The default 72-hour window is deliberately a
+// target, not a lock or transaction lifetime: each batch commits independently.
+func cmdBackfillLitmusLevel(ctx context.Context) error {
+	f := flag.NewFlagSet("backfill-lvl", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	batch := f.Int("batch", 5000, "rows per committed batch")
+	hours := f.Float64("hours", 72, "target duration for the initial corpus")
+	parseFlags(f, os.Args[2:])
+	if *batch <= 0 {
+		return errors.New("-batch must be positive")
+	}
+	if *hours < 0 {
+		return errors.New("-hours must not be negative")
+	}
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		return err
+	}
+
+	slog.Info("backfilling samples.lvl", "batch", *batch, "target_hours", *hours)
+	stats, err := db.BackfillLitmusLevel(ctx, *batch, time.Duration(*hours*float64(time.Hour)))
+	if err != nil {
+		return err
+	}
+	slog.Info("litmus level backfill complete", "total", stats.Total,
+		"scanned", stats.Scanned, "updated", stats.Updated, "cursor", stats.Cursor,
+		"done", stats.Done)
 	return nil
 }
 

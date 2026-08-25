@@ -161,22 +161,63 @@ endif
 LINTERS :=
 FIXERS :=
 
+SHELLCHECK_VERSION ?= v0.11.0
+SHELLCHECK_BIN := $(LINT_ROOT)/out/linters/shellcheck-$(SHELLCHECK_VERSION)-$(LINT_ARCH)
+$(SHELLCHECK_BIN):
+	mkdir -p $(LINT_ROOT)/out/linters
+	curl -sSfL -o $@.tar.xz https://github.com/koalaman/shellcheck/releases/download/$(SHELLCHECK_VERSION)/shellcheck-$(SHELLCHECK_VERSION).$(LINT_OS_LOWER).$(LINT_ARCH).tar.xz \
+		|| echo "Unable to fetch shellcheck for $(LINT_OS)/$(LINT_ARCH): falling back to locally install"
+	test -f $@.tar.xz \
+		&& tar -C $(LINT_ROOT)/out/linters -xJf $@.tar.xz \
+		&& mv $(LINT_ROOT)/out/linters/shellcheck-$(SHELLCHECK_VERSION)/shellcheck $@ \
+		|| printf "#!/usr/bin/env shellcheck\n" > $@
+	chmod u+x $@
+
+LINTERS += shellcheck-lint
+shellcheck-lint: $(SHELLCHECK_BIN)
+	$(SHELLCHECK_BIN) $(shell find . -name "*.sh")
+
+FIXERS += shellcheck-fix
+shellcheck-fix: $(SHELLCHECK_BIN)
+	$(SHELLCHECK_BIN) $(shell find . -name "*.sh") -f diff | { read -t 1 line || exit 0; { echo "$$line" && cat; } | git apply -p2; }
+
 GOLANGCI_LINT_CONFIG := $(LINT_ROOT)/.golangci.yml
-GOLANGCI_LINT_VERSION ?= v2.10.1
+GOLANGCI_LINT_VERSION ?= v2.13.1
 GOLANGCI_LINT_BIN := $(LINT_ROOT)/out/linters/golangci-lint-$(GOLANGCI_LINT_VERSION)-$(LINT_ARCH)
 $(GOLANGCI_LINT_BIN):
 	mkdir -p $(LINT_ROOT)/out/linters
 	rm -rf $(LINT_ROOT)/out/linters/golangci-lint-*
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(LINT_ROOT)/out/linters $(GOLANGCI_LINT_VERSION)
+	curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b $(LINT_ROOT)/out/linters $(GOLANGCI_LINT_VERSION)
 	mv $(LINT_ROOT)/out/linters/golangci-lint $@
 
 LINTERS += golangci-lint-lint
 golangci-lint-lint: $(GOLANGCI_LINT_BIN)
-	"$(GOLANGCI_LINT_BIN)" run -c "$(GOLANGCI_LINT_CONFIG)" ./...
+	@exit_code=0; \
+	for gomod in $$(find . -name go.mod); do \
+		(cd "$$(dirname "$$gomod")" && "$(GOLANGCI_LINT_BIN)" run -c "$(GOLANGCI_LINT_CONFIG)") || exit_code=1; \
+	done; \
+	exit $$exit_code
 
 FIXERS += golangci-lint-fix
 golangci-lint-fix: $(GOLANGCI_LINT_BIN)
-	"$(GOLANGCI_LINT_BIN)" run -c "$(GOLANGCI_LINT_CONFIG)" --fix ./...
+	@exit_code=0; \
+	for gomod in $$(find . -name go.mod); do \
+		(cd "$$(dirname "$$gomod")" && "$(GOLANGCI_LINT_BIN)" run -c "$(GOLANGCI_LINT_CONFIG)" --fix) || true; \
+	done; \
+	exit $$exit_code
+
+YAMLLINT_VERSION ?= 1.37.1
+YAMLLINT_ROOT := $(LINT_ROOT)/out/linters/yamllint-$(YAMLLINT_VERSION)
+YAMLLINT_BIN := $(YAMLLINT_ROOT)/dist/bin/yamllint
+$(YAMLLINT_BIN):
+	mkdir -p $(LINT_ROOT)/out/linters
+	rm -rf $(LINT_ROOT)/out/linters/yamllint-*
+	curl -sSfL https://github.com/adrienverge/yamllint/archive/refs/tags/v$(YAMLLINT_VERSION).tar.gz | tar -C $(LINT_ROOT)/out/linters -zxf -
+	cd $(YAMLLINT_ROOT) && pip3 install --target dist . || pip install --target dist .
+
+LINTERS += yamllint-lint
+yamllint-lint: $(YAMLLINT_BIN)
+	PYTHONPATH=$(YAMLLINT_ROOT)/dist $(YAMLLINT_ROOT)/dist/bin/yamllint .
 
 .PHONY: _lint $(LINTERS)
 _lint:

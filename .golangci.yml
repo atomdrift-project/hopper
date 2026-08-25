@@ -34,7 +34,8 @@ linters:
     # linters that give advice contrary to what the Go authors advise
     - decorder # checks declaration order and count of types, constants, variables and functions
     - dupword # [useless without config] checks for duplicate words in the source code
-    - exhaustruct # [highly recommend to enable] checks if all structure fields are initialized
+    - exhaustruct # checks if all structure fields are initialized
+    - exhaustruct_v5 # no
     - forcetypeassert # [replaced by errcheck] finds forced type assertions
     - ginkgolinter # [if you use ginkgo/gomega] enforces standards of using ginkgo and gomega
     - gochecknoglobals # checks that no global variables exist
@@ -183,7 +184,7 @@ linters:
         - name: nested-structs
           disabled: true
         - name: max-public-structs
-          arguments: [15]
+          arguments: [10]
         - name: flag-parameter # fixes are difficult
           disabled: true
         - name: bare-return
@@ -218,7 +219,6 @@ linters:
         - r
         - w
         - f
-        - o
         - err
 
   exclusions:
