@@ -38,6 +38,7 @@ func TestKnownSHA256ReportsOnlyRetrievableBytes(t *testing.T) {
 		dep       = "d4" + "00000000000000000000000000000000000000000000000000000000000000"
 		gone      = "e5" + "00000000000000000000000000000000000000000000000000000000000000"
 		neverSeen = "f6" + "00000000000000000000000000000000000000000000000000000000000000"
+		metadata  = "07" + "00000000000000000000000000000000000000000000000000000000000000"
 	)
 
 	// A standalone artifact with its own bytes on disk.
@@ -60,8 +61,14 @@ func TestKnownSHA256ReportsOnlyRetrievableBytes(t *testing.T) {
 	if err := db.SetSkip(ctx, gone, "missing"); err != nil {
 		t.Fatalf("SetSkip: %v", err)
 	}
+	// Feed and historical-import rows can name an artifact without supplying
+	// bytes. Model that catalog-only state directly; the public insert path
+	// rightly rejects it for producers that claim to be uploading a sample.
+	if _, err := db.lite.ExecContext(ctx, `INSERT INTO samples (sha256, path) VALUES (?, '')`, metadata); err != nil {
+		t.Fatalf("insert metadata-only row: %v", err)
+	}
 
-	known, err := db.KnownSHA256(ctx, []string{topLevel, archive, member, dep, gone, neverSeen})
+	known, err := db.KnownSHA256(ctx, []string{topLevel, archive, member, dep, gone, metadata, neverSeen})
 	if err != nil {
 		t.Fatalf("KnownSHA256: %v", err)
 	}
@@ -77,6 +84,7 @@ func TestKnownSHA256ReportsOnlyRetrievableBytes(t *testing.T) {
 		{member, "contained member", true, "extractable from the archive that contains it"},
 		{dep, "fetched dependency", false, "never inside the archive that named it"},
 		{gone, "missing", false, "hopper already recorded the bytes as gone"},
+		{metadata, "metadata-only", false, "the catalog row carries no bytes"},
 		{neverSeen, "absent", false, "no row at all"},
 	} {
 		if has(tc.sha) != tc.want {

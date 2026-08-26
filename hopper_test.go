@@ -6455,6 +6455,7 @@ func TestPackageVersionPresentDoesNotChangeLabel(t *testing.T) {
 	version := "1.2.3"
 	presentSHA := sha64('8')
 	missingSHA := sha64('9')
+	metadataOnlySHA := sha64('7')
 	for _, sample := range []*Sample{
 		{SHA256: presentSHA, Path: "incoming/example-1.2.3.tgz", PURLBase: purlBase, Version: version, Label: "unknown", LabelSource: "forager"},
 		{SHA256: missingSHA, Path: "incoming/example-2.0.0.tgz", PURLBase: purlBase, Version: "2.0.0", Label: "unknown", LabelSource: "forager", Skip: "missing"},
@@ -6462,6 +6463,14 @@ func TestPackageVersionPresentDoesNotChangeLabel(t *testing.T) {
 		if err := db.InsertSample(ctx, sample); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// Producer inserts reject a sample with no bytes. Feed imports and old
+	// catalogs can still contain such rows, which is the state this probe must
+	// not confuse with an acquired package.
+	if _, err := db.lite.ExecContext(ctx, `
+		INSERT INTO samples (sha256, path, purl_base, version, label, label_source)
+		VALUES (?, '', ?, '3.0.0', 'unknown', 'feed')`, metadataOnlySHA, purlBase); err != nil {
+		t.Fatalf("insert metadata-only package row: %v", err)
 	}
 
 	present, err := db.PackageVersionPresent(ctx, purlBase, version)
@@ -6471,6 +6480,10 @@ func TestPackageVersionPresentDoesNotChangeLabel(t *testing.T) {
 	missing, err := db.PackageVersionPresent(ctx, purlBase, "2.0.0")
 	if err != nil || missing {
 		t.Fatalf("missing PackageVersionPresent = %v, %v; want false, nil", missing, err)
+	}
+	metadataOnly, err := db.PackageVersionPresent(ctx, purlBase, "3.0.0")
+	if err != nil || metadataOnly {
+		t.Fatalf("metadata-only PackageVersionPresent = %v, %v; want false, nil", metadataOnly, err)
 	}
 	blank, err := db.PackageVersionPresent(ctx, "", version)
 	if err != nil || blank {

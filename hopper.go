@@ -2593,16 +2593,17 @@ func prunePathResolve(absRoot, path string) (resolved string, ok bool) {
 	return resolved, true
 }
 
-// PackageVersionPresent reports whether Hopper holds a non-missing top-level
-// sample for the exact package identity and version. It is a read-only probe:
-// feed claims belong in the sightings ledger and do not change classification.
+// PackageVersionPresent reports whether Hopper holds retrievable top-level bytes
+// for the exact package identity and version. It is a read-only probe: feed
+// claims belong in the sightings ledger and do not change classification.
 func (db *DB) PackageVersionPresent(ctx context.Context, purlBase, version string) (bool, error) {
 	if purlBase == "" || version == "" {
 		return false, nil
 	}
 	const pgQuery = `SELECT EXISTS (
 		SELECT 1 FROM samples
-		WHERE purl_base = $1 AND version = $2 AND parent = '' AND skip <> 'missing'
+		WHERE purl_base = $1 AND version = $2 AND parent = ''
+		  AND path <> '' AND skip <> 'missing'
 	)`
 	if db.pool != nil {
 		var present bool
@@ -2613,7 +2614,8 @@ func (db *DB) PackageVersionPresent(ctx context.Context, purlBase, version strin
 	}
 	const sqliteQuery = `SELECT EXISTS (
 		SELECT 1 FROM samples
-		WHERE purl_base = ? AND version = ? AND parent = '' AND skip <> 'missing'
+		WHERE purl_base = ? AND version = ? AND parent = ''
+		  AND path <> '' AND skip <> 'missing'
 	)`
 	var present bool
 	if err := db.lite.QueryRowContext(ctx, sqliteQuery, purlBase, version).Scan(&present); err != nil {
