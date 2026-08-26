@@ -387,6 +387,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 			affected     TEXT NOT NULL DEFAULT '',
 			claim        TEXT NOT NULL DEFAULT 'malicious',
 			filename     TEXT NOT NULL DEFAULT '',
+			handle       TEXT NOT NULL DEFAULT '',
 			basis        TEXT NOT NULL DEFAULT 'predicted',
 			published_at DATETIME,
 			first_seen   DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -394,6 +395,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_sightings_subject ON sightings(subject)`,
 		`CREATE INDEX IF NOT EXISTS idx_sightings_recent ON sightings(first_seen DESC) WHERE claim = 'malicious'`,
+		`CREATE INDEX IF NOT EXISTS idx_sightings_acquisition_recent ` +
+			`ON sightings(first_seen DESC) WHERE claim IN ('malicious', 'suspicious')`,
 	}, liteSightingCorroborationTriggers...) {
 		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite sightings: %w", err)
@@ -407,6 +410,28 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		if _, err := db.lite.ExecContext(ctx,
 			`ALTER TABLE sightings ADD COLUMN basis TEXT NOT NULL DEFAULT 'predicted'`); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite sightings basis: %w", err)
+		}
+	}
+	if pragmaHasColumnIn(ctx, db.lite, "sightings", "handle") == 0 {
+		if _, err := db.lite.ExecContext(ctx,
+			`ALTER TABLE sightings ADD COLUMN handle TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite sightings handle: %w", err)
+		}
+	}
+	for _, ddl := range []string{
+		`CREATE TABLE IF NOT EXISTS sighting_acquisitions (
+			target       TEXT PRIMARY KEY,
+			attempts     INTEGER NOT NULL DEFAULT 0,
+			acquired     INTEGER NOT NULL DEFAULT 0,
+			last_attempt DATETIME,
+			next_attempt DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+			last_error   TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_sighting_acquisitions_due ` +
+			`ON sighting_acquisitions(next_attempt) WHERE acquired = 0`,
+	} {
+		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite sighting acquisitions: %w", err)
 		}
 	}
 	if err := db.migrateLiteSightingsKey(ctx); err != nil {
@@ -3568,19 +3593,21 @@ func (db *DB) addSightingsSQLite(ctx context.Context, s []Sighting) (int, error)
 		}
 		err := tx.QueryRowContext(ctx, `
 			INSERT INTO sightings
-				(source, subject, url, note, operator, affected, claim, filename, basis, published_at, first_seen)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+				(source, subject, url, note, operator, affected, claim, filename, handle, basis, published_at, first_seen)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 				COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
 			ON CONFLICT (source, subject, affected) DO UPDATE
 				SET url = excluded.url, note = excluded.note,
 				    operator = excluded.operator, claim = excluded.claim,
-				    filename = excluded.filename, basis = excluded.basis,
+				    filename = excluded.filename, handle = excluded.handle,
+				    basis = excluded.basis,
 				    published_at = excluded.published_at
 				WHERE sightings.url IS NOT excluded.url
 				   OR sightings.note IS NOT excluded.note
 				   OR sightings.operator IS NOT excluded.operator
 				   OR sightings.claim IS NOT excluded.claim
 				   OR sightings.filename IS NOT excluded.filename
+				   OR sightings.handle IS NOT excluded.handle
 				   -- basis MUST be in the guard, not only in the SET: without it
 				   -- an otherwise-unchanged row writes nothing and never acquires
 				   -- the value the ladder reads, so every source would score as a
@@ -3589,7 +3616,7 @@ func (db *DB) addSightingsSQLite(ctx context.Context, s []Sighting) (int, error)
 				   OR sightings.published_at IS NOT excluded.published_at
 			RETURNING subject`,
 			s[i].Source, s[i].Subject, s[i].URL, s[i].Note, s[i].Operator,
-			s[i].Affected, string(s[i].Claim), s[i].FileName, basis, published,
+			s[i].Affected, string(s[i].Claim), s[i].FileName, s[i].Handle, basis, published,
 			seeded).Scan(&subj)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue // unchanged row: DO UPDATE guard tripped, nothing returned
@@ -3665,7 +3692,7 @@ func (db *DB) sightingsForSQLite(ctx context.Context, subjects []string) (map[st
 		//nolint:gosec // G202: ph is a slice of fixed "?" placeholders; subjects are bound args.
 		rows, err := db.lite.QueryContext(ctx,
 			`SELECT source, subject, url, note, first_seen, `+
-				`operator, affected, claim, filename, basis, published_at FROM sightings `+
+				`operator, affected, claim, filename, handle, basis, published_at FROM sightings `+
 				`WHERE subject IN (`+strings.Join(ph, ", ")+`) ORDER BY source`, args...)
 		if err != nil {
 			return fmt.Errorf("hopper: sightings for subjects: %w", err)
@@ -3675,7 +3702,7 @@ func (db *DB) sightingsForSQLite(ctx context.Context, subjects []string) (map[st
 			var x Sighting
 			var published sql.NullTime
 			if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen,
-				&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Basis, &published); err != nil {
+				&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Handle, &x.Basis, &published); err != nil {
 				return fmt.Errorf("hopper: scan sighting: %w", err)
 			}
 			x.PublishedAt = published.Time
@@ -3690,6 +3717,66 @@ func (db *DB) sightingsForSQLite(ctx context.Context, subjects []string) (map[st
 		}
 	}
 	return out, nil
+}
+
+func (db *DB) recentAcquisitionSightingsSQLite(ctx context.Context, since time.Time) ([]Sighting, error) {
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT source, subject, url, note, first_seen,
+		       operator, affected, claim, filename, handle, basis, published_at
+		FROM sightings
+		WHERE first_seen >= ? AND claim IN ('malicious', 'suspicious')
+		ORDER BY first_seen DESC, source, subject, affected`, since.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("hopper: recent acquisition sightings: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // best-effort cleanup
+	var out []Sighting
+	for rows.Next() {
+		var x Sighting
+		var published sql.NullTime
+		if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen,
+			&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Handle, &x.Basis, &published); err != nil {
+			return nil, fmt.Errorf("hopper: scan acquisition sighting: %w", err)
+		}
+		x.PublishedAt = published.Time
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) tryClaimSightingAcquisitionSQLite(ctx context.Context, target string, lease time.Duration) (bool, error) {
+	now := time.Now().UTC()
+	until := now.Add(lease)
+	var claimed bool
+	err := db.lite.QueryRowContext(ctx, `
+		INSERT INTO sighting_acquisitions
+			(target, attempts, acquired, last_attempt, next_attempt)
+		VALUES (?, 1, 0, ?, ?)
+		ON CONFLICT (target) DO UPDATE
+			SET attempts = sighting_acquisitions.attempts + 1,
+			    last_attempt = excluded.last_attempt,
+			    next_attempt = excluded.next_attempt,
+			    last_error = ''
+			WHERE sighting_acquisitions.acquired = 0
+			  AND sighting_acquisitions.next_attempt <= excluded.last_attempt
+		RETURNING 1`, target, now, until).Scan(&claimed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("hopper: claim sighting acquisition: %w", err)
+	}
+	return claimed, nil
+}
+
+func (db *DB) finishSightingAcquisitionSQLite(ctx context.Context, target string, acquired bool, retryAfter time.Duration, lastError string) error {
+	if _, err := db.lite.ExecContext(ctx, `
+		UPDATE sighting_acquisitions
+		SET acquired = ?, next_attempt = ?, last_error = ?
+		WHERE target = ?`, acquired, time.Now().UTC().Add(retryAfter), lastError, target); err != nil {
+		return fmt.Errorf("hopper: finish sighting acquisition: %w", err)
+	}
+	return nil
 }
 
 func (db *DB) insertReportSQLite(ctx context.Context, r *Report) error {

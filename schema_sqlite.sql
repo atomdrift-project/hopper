@@ -97,6 +97,8 @@ CREATE TABLE IF NOT EXISTS sightings (
 	affected     TEXT NOT NULL DEFAULT '',
 	claim        TEXT NOT NULL DEFAULT 'malicious',
 	filename     TEXT NOT NULL DEFAULT '',
+	-- Opaque provider retrieval identifier. A hint, never artifact identity.
+	handle       TEXT NOT NULL DEFAULT '',
 	-- basis is how the source arrived at the claim: 'predicted' (a detector
 	-- or model fired and nobody adjudicated it), 'hosted' (the source holds
 	-- the artifact as malware) or 'reviewed' (a person adjudicated the report
@@ -119,6 +121,21 @@ CREATE TABLE IF NOT EXISTS sightings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sightings_subject ON sightings(subject);
+
+CREATE INDEX IF NOT EXISTS idx_sightings_acquisition_recent
+	ON sightings(first_seen DESC) WHERE claim IN ('malicious', 'suspicious');
+
+CREATE TABLE IF NOT EXISTS sighting_acquisitions (
+	target       TEXT PRIMARY KEY,
+	attempts     INTEGER NOT NULL DEFAULT 0,
+	acquired     INTEGER NOT NULL DEFAULT 0,
+	last_attempt DATETIME,
+	next_attempt DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+	last_error   TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_sighting_acquisitions_due
+	ON sighting_acquisitions(next_attempt) WHERE acquired = 0;
 
 -- SQLite mirror of schema.sql's sightings_corroborate triggers: no operation on
 -- the ledger can leave samples.corroborated behind. SQLite has no TG_OP, so the

@@ -158,6 +158,8 @@ CREATE TABLE IF NOT EXISTS sightings (
 	affected     TEXT NOT NULL DEFAULT '',
 	claim        TEXT NOT NULL DEFAULT 'malicious',
 	filename     TEXT NOT NULL DEFAULT '',
+	-- Opaque provider retrieval identifier. A hint, never artifact identity.
+	handle       TEXT NOT NULL DEFAULT '',
 	-- basis is how the source arrived at the claim: 'predicted' (a detector
 	-- or model fired and nobody adjudicated it), 'hosted' (the source holds
 	-- the artifact as malware) or 'reviewed' (a person adjudicated the report
@@ -240,6 +242,24 @@ CREATE OR REPLACE TRIGGER sightings_resubject_trg
 -- rows (capability scanners, unreviewed reports) outnumber it.
 CREATE INDEX IF NOT EXISTS idx_sightings_recent
 	ON sightings(first_seen DESC) WHERE claim = 'malicious';
+
+CREATE INDEX IF NOT EXISTS idx_sightings_acquisition_recent
+	ON sightings(first_seen DESC) WHERE claim IN ('malicious', 'suspicious');
+
+-- Durable suppression and retry state for consumers foraging artifacts named
+-- by sightings. target is intentionally opaque to Hopper: callers may key a
+-- digest, an exact PURL release, or another immutable coordinate.
+CREATE TABLE IF NOT EXISTS sighting_acquisitions (
+	target       TEXT PRIMARY KEY,
+	attempts     INTEGER NOT NULL DEFAULT 0,
+	acquired     BOOLEAN NOT NULL DEFAULT false,
+	last_attempt TIMESTAMPTZ,
+	next_attempt TIMESTAMPTZ NOT NULL DEFAULT now(),
+	last_error   TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_sighting_acquisitions_due
+	ON sighting_acquisitions(next_attempt) WHERE NOT acquired;
 
 CREATE TABLE IF NOT EXISTS workers (
 	name      TEXT PRIMARY KEY,

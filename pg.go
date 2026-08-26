@@ -202,6 +202,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`ALTER TABLE sightings ADD COLUMN IF NOT EXISTS affected TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sightings ADD COLUMN IF NOT EXISTS claim TEXT NOT NULL DEFAULT 'malicious'`,
 		`ALTER TABLE sightings ADD COLUMN IF NOT EXISTS filename TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sightings ADD COLUMN IF NOT EXISTS handle TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sightings ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ`,
 		// Rows written before the operator column meant their source's family;
 		// filling them from the same map keeps corroboration counts identical
@@ -247,6 +248,8 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// first. Partial, because a benchmark drawing a fresh cohort is asking
 		// about malware and the suspicious rows outnumber it.
 		`CREATE INDEX IF NOT EXISTS idx_sightings_recent ON sightings(first_seen DESC) WHERE claim = 'malicious'`,
+		`CREATE INDEX IF NOT EXISTS idx_sightings_acquisition_recent ` +
+			`ON sightings(first_seen DESC) WHERE claim IN ('malicious', 'suspicious')`,
 		// Sighted triage has two ordered walks: digest claims and PURL claims. The
 		// leading expression lets both seek their half of the ledger and then read
 		// first_seen in queue order, stopping as soon as the requested batch fills.
@@ -261,6 +264,16 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// before the column existed read as guesses until their feed re-pushes —
 		// which under-counts confidence rather than over-counting it.
 		`ALTER TABLE sightings ADD COLUMN IF NOT EXISTS basis TEXT NOT NULL DEFAULT 'predicted'`,
+		`CREATE TABLE IF NOT EXISTS sighting_acquisitions (
+			target       TEXT PRIMARY KEY,
+			attempts     INTEGER NOT NULL DEFAULT 0,
+			acquired     BOOLEAN NOT NULL DEFAULT false,
+			last_attempt TIMESTAMPTZ,
+			next_attempt TIMESTAMPTZ NOT NULL DEFAULT now(),
+			last_error   TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_sighting_acquisitions_due ` +
+			`ON sighting_acquisitions(next_attempt) WHERE NOT acquired`,
 		// The other half of the sighted PURL walk. Production has ~604k review
 		// sightings but only ~1.7m sample PURLs; without a review-eligible covering
 		// index PostgreSQL performs a heap-backed idx_samples_purl_base lookup for
@@ -5213,6 +5226,7 @@ func (db *DB) addSightingsPG(ctx context.Context, s []Sighting) (int, error) {
 		affected := make([]string, len(batch))
 		claims := make([]string, len(batch))
 		filenames := make([]string, len(batch))
+		handles := make([]string, len(batch))
 		bases := make([]string, len(batch))
 		published := make([]*time.Time, len(batch))
 		seeded := make([]*time.Time, len(batch))
@@ -5226,7 +5240,7 @@ func (db *DB) addSightingsPG(ctx context.Context, s []Sighting) (int, error) {
 			}
 			sources[i], subjects[i], urls[i], notes[i] = x.Source, x.Subject, x.URL, x.Note
 			operators[i], affected[i] = x.Operator, x.Affected
-			claims[i], filenames[i] = string(x.Claim), x.FileName
+			claims[i], filenames[i], handles[i] = string(x.Claim), x.FileName, x.Handle
 			if !x.PublishedAt.IsZero() {
 				t := x.PublishedAt.UTC()
 				published[i] = &t
@@ -5244,21 +5258,24 @@ func (db *DB) addSightingsPG(ctx context.Context, s []Sighting) (int, error) {
 		// we feed into the samples flag update below.
 		rows, err := tx.Query(ctx, `
 			INSERT INTO sightings
-				(source, subject, url, note, operator, affected, claim, filename, basis, published_at, first_seen)
-			SELECT src, subj, u, n, op, aff, cl, fn, bas, pub, COALESCE(seed, now())
+				(source, subject, url, note, operator, affected, claim, filename, handle, basis, published_at, first_seen)
+			SELECT src, subj, u, n, op, aff, cl, fn, h, bas, pub, COALESCE(seed, now())
 			FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
-			            $6::text[], $7::text[], $8::text[], $9::text[], $10::timestamptz[], $11::timestamptz[])
-				AS t(src, subj, u, n, op, aff, cl, fn, bas, pub, seed)
+			            $6::text[], $7::text[], $8::text[], $9::text[], $10::text[],
+			            $11::timestamptz[], $12::timestamptz[])
+				AS t(src, subj, u, n, op, aff, cl, fn, h, bas, pub, seed)
 			ON CONFLICT (source, subject, affected) DO UPDATE
 				SET url = EXCLUDED.url, note = EXCLUDED.note,
 				    operator = EXCLUDED.operator, claim = EXCLUDED.claim,
-				    filename = EXCLUDED.filename, basis = EXCLUDED.basis,
+				    filename = EXCLUDED.filename, handle = EXCLUDED.handle,
+				    basis = EXCLUDED.basis,
 				    published_at = EXCLUDED.published_at
 				WHERE sightings.url IS DISTINCT FROM EXCLUDED.url
 				   OR sightings.note IS DISTINCT FROM EXCLUDED.note
 				   OR sightings.operator IS DISTINCT FROM EXCLUDED.operator
 				   OR sightings.claim IS DISTINCT FROM EXCLUDED.claim
 				   OR sightings.filename IS DISTINCT FROM EXCLUDED.filename
+				   OR sightings.handle IS DISTINCT FROM EXCLUDED.handle
 				   -- basis MUST be in the guard, not only in the SET. Without it
 				   -- an otherwise-unchanged row trips the WHERE, writes nothing,
 				   -- and never acquires the value the ladder reads — so every
@@ -5266,7 +5283,7 @@ func (db *DB) addSightingsPG(ctx context.Context, s []Sighting) (int, error) {
 				   OR sightings.basis IS DISTINCT FROM EXCLUDED.basis
 				   OR sightings.published_at IS DISTINCT FROM EXCLUDED.published_at
 			RETURNING subject`,
-			sources, subjects, urls, notes, operators, affected, claims, filenames, bases, published, seeded)
+			sources, subjects, urls, notes, operators, affected, claims, filenames, handles, bases, published, seeded)
 		if err != nil {
 			return 0, fmt.Errorf("hopper: upsert sightings: %w", err)
 		}
@@ -5382,7 +5399,7 @@ func (db *DB) remarkCorroboratedPG(ctx context.Context) (int64, error) {
 func (db *DB) sightingsForPG(ctx context.Context, subjects []string) (map[string][]Sighting, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT source, subject, url, note, first_seen,
-		       operator, affected, claim, filename, basis, published_at
+		       operator, affected, claim, filename, handle, basis, published_at
 		FROM sightings WHERE subject = ANY($1)
 		ORDER BY source`, subjects)
 	if err != nil {
@@ -5394,7 +5411,7 @@ func (db *DB) sightingsForPG(ctx context.Context, subjects []string) (map[string
 		var x Sighting
 		var published *time.Time
 		if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen,
-			&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Basis, &published); err != nil {
+			&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Handle, &x.Basis, &published); err != nil {
 			return nil, fmt.Errorf("hopper: scan sighting: %w", err)
 		}
 		if published != nil {
@@ -5403,6 +5420,65 @@ func (db *DB) sightingsForPG(ctx context.Context, subjects []string) (map[string
 		out[x.Subject] = append(out[x.Subject], x)
 	}
 	return out, rows.Err()
+}
+
+func (db *DB) recentAcquisitionSightingsPG(ctx context.Context, since time.Time) ([]Sighting, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT source, subject, url, note, first_seen,
+		       operator, affected, claim, filename, handle, basis, published_at
+		FROM sightings
+		WHERE first_seen >= $1 AND claim IN ('malicious', 'suspicious')
+		ORDER BY first_seen DESC, source, subject, affected`, since.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("hopper: recent acquisition sightings: %w", err)
+	}
+	defer rows.Close()
+	var out []Sighting
+	for rows.Next() {
+		var x Sighting
+		var published *time.Time
+		if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen,
+			&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Handle, &x.Basis, &published); err != nil {
+			return nil, fmt.Errorf("hopper: scan acquisition sighting: %w", err)
+		}
+		if published != nil {
+			x.PublishedAt = *published
+		}
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) tryClaimSightingAcquisitionPG(ctx context.Context, target string, lease time.Duration) (bool, error) {
+	var claimed bool
+	err := db.pool.QueryRow(ctx, `
+		INSERT INTO sighting_acquisitions
+			(target, attempts, acquired, last_attempt, next_attempt)
+		VALUES ($1, 1, false, now(), now() + ($2 * interval '1 second'))
+		ON CONFLICT (target) DO UPDATE
+			SET attempts = sighting_acquisitions.attempts + 1,
+			    last_attempt = now(), next_attempt = now() + ($2 * interval '1 second'),
+			    last_error = ''
+			WHERE NOT sighting_acquisitions.acquired
+			  AND sighting_acquisitions.next_attempt <= now()
+		RETURNING true`, target, lease.Seconds()).Scan(&claimed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("hopper: claim sighting acquisition: %w", err)
+	}
+	return claimed, nil
+}
+
+func (db *DB) finishSightingAcquisitionPG(ctx context.Context, target string, acquired bool, retryAfter time.Duration, lastError string) error {
+	if _, err := db.pool.Exec(ctx, `
+		UPDATE sighting_acquisitions
+		SET acquired = $2, next_attempt = now() + ($3 * interval '1 second'), last_error = $4
+		WHERE target = $1`, target, acquired, retryAfter.Seconds(), lastError); err != nil {
+		return fmt.Errorf("hopper: finish sighting acquisition: %w", err)
+	}
+	return nil
 }
 
 func (db *DB) insertReportPG(ctx context.Context, r *Report) error {
@@ -6214,10 +6290,12 @@ func (db *DB) canonicalizeSightingSubjectsPG(ctx context.Context, dryRun bool) (
 			return rewritten, fmt.Errorf("hopper: canonicalize sighting begin: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO sightings (source, subject, url, note, first_seen)
-			SELECT source, $3, url, note, first_seen FROM sightings
+			INSERT INTO sightings
+				(source, subject, url, note, operator, affected, claim, filename, handle, basis, published_at, first_seen)
+			SELECT source, $3, url, note, operator, affected, claim, filename, handle, basis, published_at, first_seen
+			FROM sightings
 			WHERE source = $1 AND subject = $2
-			ON CONFLICT (source, subject) DO NOTHING`, c.source, c.old, c.canon); err != nil {
+			ON CONFLICT (source, subject, affected) DO NOTHING`, c.source, c.old, c.canon); err != nil {
 			rollbackErr := tx.Rollback(ctx)
 			return rewritten, errors.Join(fmt.Errorf("hopper: canonicalize sighting insert: %w", err), rollbackErr)
 		}

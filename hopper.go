@@ -5351,7 +5351,11 @@ type Sighting struct {
 	// under a hundred names, and building a subject from one of them is what
 	// put 1,050 unmatchable rows in this table.
 	FileName string
-	Claim    SightingClaim
+	// Handle is the source's opaque retrieval identifier, when fetching the
+	// artifact requires more than its digest or package coordinates. It is a
+	// retrieval hint, never identity, and is empty for nearly every source.
+	Handle string
+	Claim  SightingClaim
 	// Basis is how the source arrived at this claim, as the producer's source
 	// definition judged it at the moment of writing.
 	//
@@ -5366,6 +5370,52 @@ type Sighting struct {
 	// staleness Operator already accepts and heals the same way. Empty reads as
 	// [BasisPredicted]; see [Basis.Firsthand].
 	Basis Basis
+}
+
+// RecentAcquisitionSightings returns recent claims that can seed artifact
+// acquisition. It deliberately returns evidence, not download instructions:
+// Hopper stores the neutral ledger while its caller decides how a subject is
+// resolved and fetched.
+func (db *DB) RecentAcquisitionSightings(ctx context.Context, since time.Time) ([]Sighting, error) {
+	if db.pool != nil {
+		return db.recentAcquisitionSightingsPG(ctx, since)
+	}
+	return db.recentAcquisitionSightingsSQLite(ctx, since)
+}
+
+// TryClaimSightingAcquisition acquires a durable lease for one caller-defined
+// artifact target. Completed targets are never reclaimed; failed or abandoned
+// targets become eligible when their next-attempt time arrives.
+func (db *DB) TryClaimSightingAcquisition(ctx context.Context, target string, lease time.Duration) (bool, error) {
+	target = strings.TrimSpace(target)
+	if target == "" || lease <= 0 {
+		return false, nil
+	}
+	if db.pool != nil {
+		return db.tryClaimSightingAcquisitionPG(ctx, target, lease)
+	}
+	return db.tryClaimSightingAcquisitionSQLite(ctx, target, lease)
+}
+
+// FinishSightingAcquisition records an acquisition outcome. acquired makes the
+// target terminal; otherwise retryAfter schedules the next bounded attempt.
+func (db *DB) FinishSightingAcquisition(ctx context.Context, target string, acquired bool, retryAfter time.Duration, lastError string) error {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return nil
+	}
+	if retryAfter < 0 {
+		retryAfter = 0
+	}
+	// Operational errors belong in logs, not as unbounded database payloads.
+	const maxAcquisitionError = 2000
+	if len(lastError) > maxAcquisitionError {
+		lastError = lastError[:maxAcquisitionError]
+	}
+	if db.pool != nil {
+		return db.finishSightingAcquisitionPG(ctx, target, acquired, retryAfter, lastError)
+	}
+	return db.finishSightingAcquisitionSQLite(ctx, target, acquired, retryAfter, lastError)
 }
 
 // sightingFamilies maps sighting sources that repackage a shared upstream
@@ -5574,6 +5624,19 @@ func (db *DB) sightingSourceKnown(ctx context.Context, source string) (bool, err
 }
 
 func (db *DB) AddSightings(ctx context.Context, s []Sighting) (int, error) {
+	return db.addSightings(ctx, s, false)
+}
+
+// AddSightingsBackfill is AddSightings for a source's initial historical walk.
+// Every row is backdated to PublishedAt, or the epoch when the source supplied
+// no date. The explicit mode survives producer-side batching; inferring a
+// backfill independently for each batch makes only the first batch historical
+// and presents the remainder as today's news.
+func (db *DB) AddSightingsBackfill(ctx context.Context, s []Sighting) (int, error) {
+	return db.addSightings(ctx, s, true)
+}
+
+func (db *DB) addSightings(ctx context.Context, s []Sighting, backfill bool) (int, error) {
 	// Dedupe by the full key within the batch — first occurrence wins.
 	// Producers naturally repeat it (two versions of one package share a
 	// purl_base; normalization can collapse two spellings into one subject),
@@ -5622,12 +5685,21 @@ func (db *DB) AddSightings(ctx context.Context, s []Sighting) (int, error) {
 	if len(valid) == 0 {
 		return 0, nil
 	}
-	seeded, err := db.seedTimes(ctx, valid)
-	if err != nil {
-		return 0, err
-	}
-	for i := range valid {
-		valid[i].FirstSeen = seeded[i]
+	if backfill {
+		for i := range valid {
+			valid[i].FirstSeen = valid[i].PublishedAt
+			if valid[i].FirstSeen.IsZero() {
+				valid[i].FirstSeen = time.Unix(0, 0).UTC()
+			}
+		}
+	} else {
+		seeded, err := db.seedTimes(ctx, valid)
+		if err != nil {
+			return 0, err
+		}
+		for i := range valid {
+			valid[i].FirstSeen = seeded[i]
+		}
 	}
 	if db.pool != nil {
 		return db.addSightingsPG(ctx, valid)
