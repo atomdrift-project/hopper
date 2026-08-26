@@ -61,14 +61,18 @@ func TestAssessLadder(t *testing.T) {
 		}, Strong},
 		{"one corpus holding the bytes", []Sighting{
 			mal("bazaar", "abuse.ch", BasisHosted),
-		}, Moderate},
+		}, Weak},
 		{"one operator that both hosts and reviews takes the stronger", []Sighting{
 			mal("osm", "osm", BasisHosted),
 			mal("osm", "osm", BasisReviewed),
 		}, Strong},
-		{"two independent predictions", []Sighting{
+		{"two independent predictions corroborate", []Sighting{
 			mal("socket", "socket", BasisPredicted),
 			mal("aikido", "aikido", BasisPredicted),
+		}, Corroborated},
+		{"prediction corroborated by reviewed report", []Sighting{
+			mal("socket", "socket", BasisPredicted),
+			mal("osv", "ossf-malpkgs", BasisReviewed),
 		}, Corroborated},
 		{"three independent", []Sighting{
 			mal("socket", "socket", BasisPredicted),
@@ -84,9 +88,7 @@ func TestAssessLadder(t *testing.T) {
 	}
 }
 
-// Two ordinary feeds outrank one careful one, deliberately: the failure modes
-// that produce a false positive are usually one party's own, so independence
-// beats standing. Pinned because it is a real choice and easy to "fix" wrongly.
+// Two independent voices outrank one careful voice regardless of basis.
 func TestAssessIndependenceOutranksStanding(t *testing.T) {
 	careful := Assess([]Sighting{mal("osv", "ossf-malpkgs", BasisReviewed)})
 	independent := Assess([]Sighting{
@@ -237,8 +239,8 @@ func TestHostedFlagsAndReviewedConvicts(t *testing.T) {
 
 // The bug this pins: rank(Predicted) equals rank(the zero value), so a `>`
 // compare never inserted a predicted-only operator into the fold and the whole
-// ladder scored NoClaim. Every row in production reads `predicted` today, so
-// this would have silently disabled the feature outright.
+// ladder scored NoClaim. Predictions remain visible and independent operators
+// can corroborate one another.
 func TestPredictedOnlyOperatorsAreStillCounted(t *testing.T) {
 	one := Assess([]Sighting{mal("socket", "socket", BasisPredicted)})
 	if len(one.Operators) != 1 || one.Confidence != Weak {
@@ -337,8 +339,8 @@ func TestDigestClaimsCoverTheirSubjectWithoutSayingSo(t *testing.T) {
 	a := Assess([]Sighting{
 		{Source: "bazaar", Operator: "abuse.ch", Subject: sha, Claim: ClaimMalicious, Basis: BasisHosted},
 	})
-	if a.Confidence != Moderate {
-		t.Fatalf("Confidence = %v, want Moderate: bytes have no versions to scope", a.Confidence)
+	if a.Confidence != Weak {
+		t.Fatalf("Confidence = %v, want Weak: exact hosted bytes still need corroboration", a.Confidence)
 	}
 	if a.Scoped != 0 {
 		t.Errorf("Scoped = %d, want 0", a.Scoped)

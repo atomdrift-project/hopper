@@ -264,6 +264,9 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// before the column existed read as guesses until their feed re-pushes —
 		// which under-counts confidence rather than over-counting it.
 		`ALTER TABLE sightings ADD COLUMN IF NOT EXISTS basis TEXT NOT NULL DEFAULT 'predicted'`,
+		// Audit provenance: who copied the source's claim into this ledger. It is
+		// deliberately not part of the corroboration identity or primary key.
+		`ALTER TABLE sightings ADD COLUMN IF NOT EXISTS relayer TEXT NOT NULL DEFAULT ''`,
 		`CREATE TABLE IF NOT EXISTS sighting_acquisitions (
 			target       TEXT PRIMARY KEY,
 			attempts     INTEGER NOT NULL DEFAULT 0,
@@ -312,6 +315,14 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_corroborated_created ` +
 			`ON samples(created_at DESC) ` +
 			`WHERE corroborated AND parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL`,
+		// Gauntlet consumes the sightings-first acquisition queue immediately after
+		// Forager refreshes it, before Hopper's local analyzers necessarily finish.
+		// Keep that newest-first walk independent of analysis state. "corroborated"
+		// is the historical column name; the sightings trigger sets it for any
+		// cited SHA or PURL, including a single prediction.
+		`CREATE INDEX IF NOT EXISTS idx_samples_sighted_created ` +
+			`ON samples(created_at DESC) ` +
+			`WHERE corroborated AND parent = '' AND skip = ''`,
 		// Placed here, AFTER the corroborated ADD COLUMN above, not up with the
 		// other claimable indexes where it belongs by subject. CREATE TABLE IF
 		// NOT EXISTS is a no-op on an existing database, so a database that
@@ -5223,6 +5234,7 @@ func (db *DB) addSightingsPG(ctx context.Context, s []Sighting) (int, error) {
 		urls := make([]string, len(batch))
 		notes := make([]string, len(batch))
 		operators := make([]string, len(batch))
+		relayers := make([]string, len(batch))
 		affected := make([]string, len(batch))
 		claims := make([]string, len(batch))
 		filenames := make([]string, len(batch))
@@ -5239,6 +5251,7 @@ func (db *DB) addSightingsPG(ctx context.Context, s []Sighting) (int, error) {
 				bases[i] = string(BasisPredicted)
 			}
 			sources[i], subjects[i], urls[i], notes[i] = x.Source, x.Subject, x.URL, x.Note
+			relayers[i] = x.Relayer
 			operators[i], affected[i] = x.Operator, x.Affected
 			claims[i], filenames[i], handles[i] = string(x.Claim), x.FileName, x.Handle
 			if !x.PublishedAt.IsZero() {
@@ -5258,17 +5271,17 @@ func (db *DB) addSightingsPG(ctx context.Context, s []Sighting) (int, error) {
 		// we feed into the samples flag update below.
 		rows, err := tx.Query(ctx, `
 			INSERT INTO sightings
-				(source, subject, url, note, operator, affected, claim, filename, handle, basis, published_at, first_seen)
-			SELECT src, subj, u, n, op, aff, cl, fn, h, bas, pub, COALESCE(seed, now())
+				(source, subject, url, note, operator, affected, claim, filename, handle, basis, relayer, published_at, first_seen)
+			SELECT src, subj, u, n, op, aff, cl, fn, h, bas, relay, pub, COALESCE(seed, now())
 			FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
 			            $6::text[], $7::text[], $8::text[], $9::text[], $10::text[],
-			            $11::timestamptz[], $12::timestamptz[])
-				AS t(src, subj, u, n, op, aff, cl, fn, h, bas, pub, seed)
+			            $11::text[], $12::timestamptz[], $13::timestamptz[])
+				AS t(src, subj, u, n, op, aff, cl, fn, h, bas, relay, pub, seed)
 			ON CONFLICT (source, subject, affected) DO UPDATE
 				SET url = EXCLUDED.url, note = EXCLUDED.note,
 				    operator = EXCLUDED.operator, claim = EXCLUDED.claim,
 				    filename = EXCLUDED.filename, handle = EXCLUDED.handle,
-				    basis = EXCLUDED.basis,
+				    basis = EXCLUDED.basis, relayer = EXCLUDED.relayer,
 				    published_at = EXCLUDED.published_at,
 				    -- A first full source walk may follow point lookups from that
 				    -- source. Let the explicit backfill seed repair those rows; a
@@ -5285,10 +5298,11 @@ func (db *DB) addSightingsPG(ctx context.Context, s []Sighting) (int, error) {
 				   -- and never acquires the value the ladder reads — so every
 				   -- source would score as a guess forever, silently.
 				   OR sightings.basis IS DISTINCT FROM EXCLUDED.basis
+				   OR sightings.relayer IS DISTINCT FROM EXCLUDED.relayer
 				   OR sightings.published_at IS DISTINCT FROM EXCLUDED.published_at
 				   OR sightings.first_seen > EXCLUDED.first_seen
 			RETURNING subject`,
-			sources, subjects, urls, notes, operators, affected, claims, filenames, handles, bases, published, seeded)
+			sources, subjects, urls, notes, operators, affected, claims, filenames, handles, bases, relayers, published, seeded)
 		if err != nil {
 			return 0, fmt.Errorf("hopper: upsert sightings: %w", err)
 		}
@@ -5404,7 +5418,7 @@ func (db *DB) remarkCorroboratedPG(ctx context.Context) (int64, error) {
 func (db *DB) sightingsForPG(ctx context.Context, subjects []string) (map[string][]Sighting, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT source, subject, url, note, first_seen,
-		       operator, affected, claim, filename, handle, basis, published_at
+		       operator, affected, claim, filename, handle, basis, relayer, published_at
 		FROM sightings WHERE subject = ANY($1)
 		ORDER BY source`, subjects)
 	if err != nil {
@@ -5416,7 +5430,7 @@ func (db *DB) sightingsForPG(ctx context.Context, subjects []string) (map[string
 		var x Sighting
 		var published *time.Time
 		if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen,
-			&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Handle, &x.Basis, &published); err != nil {
+			&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Handle, &x.Basis, &x.Relayer, &published); err != nil {
 			return nil, fmt.Errorf("hopper: scan sighting: %w", err)
 		}
 		if published != nil {
@@ -5430,7 +5444,7 @@ func (db *DB) sightingsForPG(ctx context.Context, subjects []string) (map[string
 func (db *DB) recentAcquisitionSightingsPG(ctx context.Context, since time.Time) ([]Sighting, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT source, subject, url, note, first_seen,
-		       operator, affected, claim, filename, handle, basis, published_at
+		       operator, affected, claim, filename, handle, basis, relayer, published_at
 		FROM sightings
 		WHERE first_seen >= $1 AND claim IN ('malicious', 'suspicious')
 		ORDER BY first_seen DESC, source, subject, affected`, since.UTC())
@@ -5443,7 +5457,7 @@ func (db *DB) recentAcquisitionSightingsPG(ctx context.Context, since time.Time)
 		var x Sighting
 		var published *time.Time
 		if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen,
-			&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Handle, &x.Basis, &published); err != nil {
+			&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Handle, &x.Basis, &x.Relayer, &published); err != nil {
 			return nil, fmt.Errorf("hopper: scan acquisition sighting: %w", err)
 		}
 		if published != nil {
@@ -6296,8 +6310,8 @@ func (db *DB) canonicalizeSightingSubjectsPG(ctx context.Context, dryRun bool) (
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO sightings
-				(source, subject, url, note, operator, affected, claim, filename, handle, basis, published_at, first_seen)
-			SELECT source, $3, url, note, operator, affected, claim, filename, handle, basis, published_at, first_seen
+				(source, subject, url, note, operator, affected, claim, filename, handle, basis, relayer, published_at, first_seen)
+			SELECT source, $3, url, note, operator, affected, claim, filename, handle, basis, relayer, published_at, first_seen
 			FROM sightings
 			WHERE source = $1 AND subject = $2
 			ON CONFLICT (source, subject, affected) DO NOTHING`, c.source, c.old, c.canon); err != nil {

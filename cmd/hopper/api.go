@@ -2698,6 +2698,7 @@ const maxSightingBody = maxSightingsBatch * 1024
 
 type sightingRequest struct {
 	Source  string `json:"source"`
+	Relayer string `json:"relayer"`
 	Subject string `json:"subject"`
 	URL     string `json:"url"`
 	Note    string `json:"note"`
@@ -2882,7 +2883,7 @@ func (s *apiServer) handleSightings(w http.ResponseWriter, r *http.Request) {
 		}
 		sightings[i] = hopper.Sighting{
 			Source: req.Source, Subject: subject, URL: req.URL, Note: req.Note,
-			Operator: req.Operator, Affected: req.Affected,
+			Relayer: req.Relayer, Operator: req.Operator, Affected: req.Affected,
 			Claim: hopper.SightingClaim(req.Claim), FileName: req.FileName,
 			Basis:       sightingBasis(req.Basis),
 			PublishedAt: parseSightingTime(req.PublishedAt),
@@ -2891,6 +2892,11 @@ func (s *apiServer) handleSightings(w http.ResponseWriter, r *http.Request) {
 
 	changed, err := s.storeSightings(r.Context(), sightings, r.RemoteAddr)
 	if err != nil {
+		if errors.Is(err, hopper.ErrUnscopedLiteLLM) {
+			slog.ErrorContext(r.Context(), "sightings: FATAL integrity violation", "error", err, "remote", r.RemoteAddr)
+			writeJSONError(w, http.StatusBadRequest, `{"error":"unscoped litellm sighting rejected"}`)
+			return
+		}
 		slog.ErrorContext(r.Context(), "sightings: store failed", "error", err, "remote", r.RemoteAddr)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
@@ -2918,7 +2924,8 @@ func (s *apiServer) storeSightings(ctx context.Context, sightings []hopper.Sight
 			}
 			// Client gone or a deterministic PG fault → stop. Per-attempt
 			// deadline and lock timeouts stay retryable within sightingsAttempts.
-			if ctx.Err() != nil ||
+			if errors.Is(err, hopper.ErrUnscopedLiteLLM) ||
+				ctx.Err() != nil ||
 				errors.Is(err, context.Canceled) ||
 				permanentPGError(err) {
 				return n, retry.Unrecoverable(err)

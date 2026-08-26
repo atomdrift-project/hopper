@@ -368,6 +368,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		`CREATE INDEX IF NOT EXISTS idx_samples_corroborated ` +
 			`ON samples(created_at) ` +
 			`WHERE corroborated = 1 AND parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_sighted_created ` +
+			`ON samples(created_at DESC) WHERE corroborated = 1 AND parent = '' AND skip = ''`,
 		// popular_packages: see the Postgres migration for why this is keyed on
 		// the version-less identity and why it is not a sighting.
 		`CREATE TABLE IF NOT EXISTS popular_packages (
@@ -380,6 +382,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		`CREATE INDEX IF NOT EXISTS idx_popular_rank ON popular_packages(rank)`,
 		`CREATE TABLE IF NOT EXISTS sightings (
 			source       TEXT NOT NULL,
+			relayer      TEXT NOT NULL DEFAULT '',
 			subject      TEXT NOT NULL,
 			url          TEXT NOT NULL DEFAULT '',
 			note         TEXT NOT NULL DEFAULT '',
@@ -416,6 +419,12 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		if _, err := db.lite.ExecContext(ctx,
 			`ALTER TABLE sightings ADD COLUMN handle TEXT NOT NULL DEFAULT ''`); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite sightings handle: %w", err)
+		}
+	}
+	if pragmaHasColumnIn(ctx, db.lite, "sightings", "relayer") == 0 {
+		if _, err := db.lite.ExecContext(ctx,
+			`ALTER TABLE sightings ADD COLUMN relayer TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite sightings relayer: %w", err)
 		}
 	}
 	for _, ddl := range []string{
@@ -3523,6 +3532,7 @@ func (db *DB) migrateLiteSightingsKey(ctx context.Context) error {
 		`ALTER TABLE sightings RENAME TO sightings_legacy`,
 		`CREATE TABLE sightings (
 			source       TEXT NOT NULL,
+			relayer      TEXT NOT NULL DEFAULT '',
 			subject      TEXT NOT NULL,
 			url          TEXT NOT NULL DEFAULT '',
 			note         TEXT NOT NULL DEFAULT '',
@@ -3530,6 +3540,7 @@ func (db *DB) migrateLiteSightingsKey(ctx context.Context) error {
 			affected     TEXT NOT NULL DEFAULT '',
 			claim        TEXT NOT NULL DEFAULT 'malicious',
 			filename     TEXT NOT NULL DEFAULT '',
+			handle       TEXT NOT NULL DEFAULT '',
 			basis        TEXT NOT NULL DEFAULT 'predicted',
 			published_at DATETIME,
 			first_seen   DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -3593,14 +3604,14 @@ func (db *DB) addSightingsSQLite(ctx context.Context, s []Sighting) (int, error)
 		}
 		err := tx.QueryRowContext(ctx, `
 			INSERT INTO sightings
-				(source, subject, url, note, operator, affected, claim, filename, handle, basis, published_at, first_seen)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+				(source, subject, url, note, operator, affected, claim, filename, handle, basis, relayer, published_at, first_seen)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 				COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
 			ON CONFLICT (source, subject, affected) DO UPDATE
 				SET url = excluded.url, note = excluded.note,
 				    operator = excluded.operator, claim = excluded.claim,
 				    filename = excluded.filename, handle = excluded.handle,
-				    basis = excluded.basis,
+				    basis = excluded.basis, relayer = excluded.relayer,
 				    published_at = excluded.published_at,
 				    first_seen = MIN(sightings.first_seen, excluded.first_seen)
 				WHERE sightings.url IS NOT excluded.url
@@ -3614,11 +3625,12 @@ func (db *DB) addSightingsSQLite(ctx context.Context, s []Sighting) (int, error)
 				   -- the value the ladder reads, so every source would score as a
 				   -- guess forever, silently.
 				   OR sightings.basis IS NOT excluded.basis
+				   OR sightings.relayer IS NOT excluded.relayer
 				   OR sightings.published_at IS NOT excluded.published_at
 				   OR sightings.first_seen > excluded.first_seen
 			RETURNING subject`,
 			s[i].Source, s[i].Subject, s[i].URL, s[i].Note, s[i].Operator,
-			s[i].Affected, string(s[i].Claim), s[i].FileName, s[i].Handle, basis, published,
+			s[i].Affected, string(s[i].Claim), s[i].FileName, s[i].Handle, basis, s[i].Relayer, published,
 			seeded).Scan(&subj)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue // unchanged row: DO UPDATE guard tripped, nothing returned
@@ -3694,7 +3706,7 @@ func (db *DB) sightingsForSQLite(ctx context.Context, subjects []string) (map[st
 		//nolint:gosec // G202: ph is a slice of fixed "?" placeholders; subjects are bound args.
 		rows, err := db.lite.QueryContext(ctx,
 			`SELECT source, subject, url, note, first_seen, `+
-				`operator, affected, claim, filename, handle, basis, published_at FROM sightings `+
+				`operator, affected, claim, filename, handle, basis, relayer, published_at FROM sightings `+
 				`WHERE subject IN (`+strings.Join(ph, ", ")+`) ORDER BY source`, args...)
 		if err != nil {
 			return fmt.Errorf("hopper: sightings for subjects: %w", err)
@@ -3704,7 +3716,7 @@ func (db *DB) sightingsForSQLite(ctx context.Context, subjects []string) (map[st
 			var x Sighting
 			var published sql.NullTime
 			if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen,
-				&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Handle, &x.Basis, &published); err != nil {
+				&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Handle, &x.Basis, &x.Relayer, &published); err != nil {
 				return fmt.Errorf("hopper: scan sighting: %w", err)
 			}
 			x.PublishedAt = published.Time
@@ -3724,7 +3736,7 @@ func (db *DB) sightingsForSQLite(ctx context.Context, subjects []string) (map[st
 func (db *DB) recentAcquisitionSightingsSQLite(ctx context.Context, since time.Time) ([]Sighting, error) {
 	rows, err := db.lite.QueryContext(ctx, `
 		SELECT source, subject, url, note, first_seen,
-		       operator, affected, claim, filename, handle, basis, published_at
+		       operator, affected, claim, filename, handle, basis, relayer, published_at
 		FROM sightings
 		WHERE first_seen >= ? AND claim IN ('malicious', 'suspicious')
 		ORDER BY first_seen DESC, source, subject, affected`, since.UTC())
@@ -3737,7 +3749,7 @@ func (db *DB) recentAcquisitionSightingsSQLite(ctx context.Context, since time.T
 		var x Sighting
 		var published sql.NullTime
 		if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen,
-			&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Handle, &x.Basis, &published); err != nil {
+			&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Handle, &x.Basis, &x.Relayer, &published); err != nil {
 			return nil, fmt.Errorf("hopper: scan acquisition sighting: %w", err)
 		}
 		x.PublishedAt = published.Time

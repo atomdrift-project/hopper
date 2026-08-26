@@ -72,6 +72,21 @@ func TestHandleSightingsJSONArrayAndNDJSON(t *testing.T) {
 	}
 }
 
+func TestHandleSightingsRejectsUnscopedLiteLLM(t *testing.T) {
+	ctx := context.Background()
+	db := mustOpenDB(t, ctx, t.TempDir()+"/hopper.db")
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	api := &apiServer{db: db}
+	rec := postSightings(t, api, "application/json",
+		`[{"source":"jfrog","relayer":"gauntlet","subject":"pkg:pypi/litellm","affected":"*"}]`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestHandleSightingsUppercaseSHANormalized(t *testing.T) {
 	ctx := context.Background()
 	db := mustOpenDB(t, ctx, t.TempDir()+"/hopper.db")

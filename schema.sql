@@ -105,6 +105,8 @@ CREATE INDEX IF NOT EXISTS idx_samples_file_type ON samples(file_type);
 CREATE INDEX IF NOT EXISTS idx_samples_status ON samples(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_samples_path ON samples(path);
 CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent) WHERE parent != '';
+CREATE INDEX IF NOT EXISTS idx_samples_sighted_created
+	ON samples(created_at DESC) WHERE corroborated AND parent = '' AND skip = '';
 -- Indexes on url/domain/package/version live in the runtime migration
 -- list (pg.go) so they fire AFTER the ALTER TABLE ADD COLUMN. Putting
 -- them here would fail on existing databases that haven't yet acquired
@@ -152,6 +154,9 @@ CREATE INDEX IF NOT EXISTS idx_reports_sha256_type_created ON reports(sha256, re
 -- walk may move this backward when point lookups introduced the source first.
 CREATE TABLE IF NOT EXISTS sightings (
 	source       TEXT NOT NULL,
+	-- Component that relayed the source's claim into Hopper. Audit metadata;
+	-- never counted as an independent corroborating voice.
+	relayer      TEXT NOT NULL DEFAULT '',
 	subject      TEXT NOT NULL,
 	url          TEXT NOT NULL DEFAULT '',
 	note         TEXT NOT NULL DEFAULT '',

@@ -499,6 +499,7 @@ var ErrNotFound = errors.New("hopper: not found")
 type DB struct {
 	pool                *pgxpool.Pool
 	lite                *sql.DB
+	app                 AppName
 	lookup              *fido.Cache[string, *Sample]
 	records             *fido.Cache[string, *cachedRecord]
 	backfillProgress    atomic.Pointer[BackfillProgressFn]
@@ -1872,17 +1873,26 @@ func (a AppName) valid() error {
 // Open connects to the registry. DSNs starting with postgres:// or
 // postgresql:// use PostgreSQL; everything else is treated as a SQLite path.
 // app names the calling service and is required; see AppName. It is recorded
-// as application_name on PostgreSQL and ignored by the SQLite backend, which
-// has no equivalent — required there too so a service cannot become anonymous
-// by switching backends.
+// as application_name on PostgreSQL and stamped as sighting relayer provenance
+// on both backends, so a service cannot become anonymous by switching stores.
 func Open(ctx context.Context, dsn string, app AppName) (*DB, error) {
 	if err := app.valid(); err != nil {
 		return nil, err
 	}
+	var (
+		db  *DB
+		err error
+	)
 	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
-		return openPG(ctx, dsn, app)
+		db, err = openPG(ctx, dsn, app)
+	} else {
+		db, err = openSQLite(ctx, dsn)
 	}
-	return openSQLite(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.app = app
+	return db, nil
 }
 
 // Close releases all connections.
@@ -5332,6 +5342,10 @@ type Sighting struct {
 	// the source publishes no date, which is most blocklists.
 	PublishedAt time.Time
 	Source      string // 'aikido','osv','socket','clamav','cyclotron:bleepingcomputer'
+	// Relayer is the component that wrote this copy of the source's claim
+	// (forager, gauntlet, cyclotron, ...). It is provenance, not a voice:
+	// corroboration counts Source/Operator and never Relayer.
+	Relayer string
 	// Operator is the body of evidence the source speaks for. Two sources
 	// sharing one are ONE voice: osv.dev and the OSSF malicious-packages
 	// project publish the same corpus, and counting them separately is how a
@@ -5650,6 +5664,9 @@ func (db *DB) addSightings(ctx context.Context, s []Sighting, backfill bool) (in
 	valid := s[:0:0]
 	for i := range s {
 		x := s[i]
+		if x.Relayer == "" {
+			x.Relayer = string(db.app)
+		}
 		// A producer may supply an exact versioned PURL directly. The ledger
 		// keys package identity on its version-less base, so preserve the
 		// version as the claim scope before normalizeSubject removes it. Writers
@@ -5660,6 +5677,10 @@ func (db *DB) addSightings(ctx context.Context, s []Sighting, backfill bool) (in
 			}
 		}
 		x.Subject = normalizeSubject(x.Subject)
+		scope := strings.TrimSpace(x.Affected)
+		if x.Subject == "pkg:pypi/litellm" && (scope == "" || scope == AllVersions) {
+			return 0, fmt.Errorf("%w: source=%q relayer=%q", ErrUnscopedLiteLLM, x.Source, x.Relayer)
+		}
 		if !x.valid() {
 			continue
 		}
@@ -5710,6 +5731,12 @@ func (db *DB) addSightings(ctx context.Context, s []Sighting, backfill bool) (in
 	}
 	return db.addSightingsSQLite(ctx, valid)
 }
+
+// ErrUnscopedLiteLLM marks a sighting-integrity failure. LiteLLM has known bad
+// releases, but the package as a whole is not malware; a blank or wildcard
+// scope means a producer lost the version information. AddSightings rejects the
+// entire batch so the corruption is loud and cannot partly land.
+var ErrUnscopedLiteLLM = errors.New("hopper: pkg:pypi/litellm sighting has blank or wildcard scope")
 
 // SightingsFor returns every sighting whose subject is in subjects, grouped by
 // subject. Callers pool the sha256 and purl_base of the samples they are

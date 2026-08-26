@@ -61,18 +61,15 @@ const (
 	NoClaim Confidence = iota
 	// Weak is one operator, and it only predicts.
 	Weak
-	// Moderate is one operator that holds the artifact as malware.
-	//
-	// Below Reviewed deliberately. A corpus accepts what people submit to it;
-	// curation is real but light, and presence means "somebody filed this as
-	// malware" rather than "somebody confirmed it". The claim is still
-	// firsthand — nobody is predicting anything about bytes they hold — which
-	// is what puts it above a detector's guess.
+	// Moderate is one unreviewed outside claim backed by our own firing
+	// analysis. A hosted corpus and a predictor start at the same weak rung:
+	// either can accept a false positive without adjudication.
 	Moderate
 	// Strong is one operator whose report a person adjudicated before it was
 	// published.
 	Strong
-	// Corroborated is two independent operators.
+	// Corroborated is two independent operators, regardless of basis, or a
+	// reviewed claim independently backed by our own analysis.
 	//
 	// Above any single voice deliberately: two unrelated parties reaching the
 	// same conclusion is stronger than one party reaching it carefully,
@@ -201,18 +198,16 @@ func Assess(sightings []Sighting) Assessment {
 	}
 	slices.Sort(a.Operators)
 
-	// Corroboration outranks any single voice, however good; below that the
-	// rung is decided by what KIND of claim the lone operator made.
+	// Two independent outside voices corroborate regardless of basis. A reviewed
+	// exact claim may stand alone; a hosted or predicted claim may not.
 	switch n := len(a.Operators); {
 	case n >= 3:
 		a.Confidence = Conclusive
-	case n == 2:
+	case n >= 2:
 		a.Confidence = Corroborated
-	case n == 1 && a.Strongest == BasisReviewed:
+	case a.Strongest == BasisReviewed:
 		a.Confidence = Strong
-	case n == 1 && a.Strongest == BasisHosted:
-		a.Confidence = Moderate
-	case n == 1:
+	case n > 0:
 		a.Confidence = Weak
 	default:
 		a.Confidence = NoClaim

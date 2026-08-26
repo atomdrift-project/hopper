@@ -1,10 +1,38 @@
 package hopper
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 )
+
+func TestSightingsRejectUnscopedLiteLLMAtomically(t *testing.T) {
+	db := openTestDB(t)
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for _, affected := range []string{"", AllVersions} {
+		_, err := db.AddSightings(t.Context(), []Sighting{
+			{Source: "jfrog", Subject: "pkg:pypi/litellm", Affected: affected},
+			{Source: "bazaar", Subject: sha, Basis: BasisHosted},
+		})
+		if !errors.Is(err, ErrUnscopedLiteLLM) {
+			t.Fatalf("affected %q: err = %v, want ErrUnscopedLiteLLM", affected, err)
+		}
+		if got := sightingsFor(t, db, sha); len(got) != 0 {
+			t.Fatalf("affected %q: partial batch landed: %+v", affected, got)
+		}
+	}
+}
+
+func TestSightingsStampRelayerFromApplication(t *testing.T) {
+	db := openTestDB(t)
+	const sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	addSightings(t, db, Sighting{Source: "bazaar", Subject: sha, Basis: BasisHosted})
+	got := sightingsFor(t, db, sha)
+	if len(got) != 1 || got[0].Relayer != "hopper-test" {
+		t.Fatalf("relayer = %+v, want hopper-test", got)
+	}
+}
 
 func addSightings(t *testing.T, db *DB, s ...Sighting) {
 	t.Helper()
