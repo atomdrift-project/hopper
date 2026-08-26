@@ -5631,9 +5631,11 @@ func (db *DB) AddSightings(ctx context.Context, s []Sighting) (int, error) {
 
 // AddSightingsBackfill is AddSightings for a source's initial historical walk.
 // Every row is backdated to PublishedAt, or the epoch when the source supplied
-// no date. The explicit mode survives producer-side batching; inferring a
-// backfill independently for each batch makes only the first batch historical
-// and presents the remainder as today's news.
+// no date. It also moves an existing row's first_seen backward: point lookups
+// can cite a source before its first full list walk, and must not make that
+// source's entire backlog look new. The explicit mode survives producer-side
+// batching; inferring a backfill independently for each batch makes only the
+// first batch historical and presents the remainder as today's news.
 func (db *DB) AddSightingsBackfill(ctx context.Context, s []Sighting) (int, error) {
 	return db.addSightings(ctx, s, true)
 }

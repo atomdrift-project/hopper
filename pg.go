@@ -5269,7 +5269,11 @@ func (db *DB) addSightingsPG(ctx context.Context, s []Sighting) (int, error) {
 				    operator = EXCLUDED.operator, claim = EXCLUDED.claim,
 				    filename = EXCLUDED.filename, handle = EXCLUDED.handle,
 				    basis = EXCLUDED.basis,
-				    published_at = EXCLUDED.published_at
+				    published_at = EXCLUDED.published_at,
+				    -- A first full source walk may follow point lookups from that
+				    -- source. Let the explicit backfill seed repair those rows; a
+				    -- routine write supplies now() and therefore cannot move time.
+				    first_seen = LEAST(sightings.first_seen, EXCLUDED.first_seen)
 				WHERE sightings.url IS DISTINCT FROM EXCLUDED.url
 				   OR sightings.note IS DISTINCT FROM EXCLUDED.note
 				   OR sightings.operator IS DISTINCT FROM EXCLUDED.operator
@@ -5282,6 +5286,7 @@ func (db *DB) addSightingsPG(ctx context.Context, s []Sighting) (int, error) {
 				   -- source would score as a guess forever, silently.
 				   OR sightings.basis IS DISTINCT FROM EXCLUDED.basis
 				   OR sightings.published_at IS DISTINCT FROM EXCLUDED.published_at
+				   OR sightings.first_seen > EXCLUDED.first_seen
 			RETURNING subject`,
 			sources, subjects, urls, notes, operators, affected, claims, filenames, handles, bases, published, seeded)
 		if err != nil {

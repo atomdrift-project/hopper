@@ -148,7 +148,8 @@ CREATE INDEX IF NOT EXISTS idx_reports_sha256_type_created ON reports(sha256, re
 -- first_seen is when the claim entered OUR world, which for those feeds is the
 -- only date there is, and is what "reported in the last 48 hours" means. A
 -- source's FIRST import is backdated (see AddSightings) so that adopting a feed
--- does not present its whole backlog as today's news.
+-- does not present its whole backlog as today's news. An explicit first full
+-- walk may move this backward when point lookups introduced the source first.
 CREATE TABLE IF NOT EXISTS sightings (
 	source       TEXT NOT NULL,
 	subject      TEXT NOT NULL,

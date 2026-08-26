@@ -4,7 +4,44 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestBackfillRepairsPointLookupFirstSeen(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	published := time.Date(2021, 3, 4, 5, 6, 7, 0, time.UTC)
+	sighting := Sighting{
+		Source: "bulk-after-lookup", Subject: "pkg:npm/old-malware",
+		Affected: "1.0.0", PublishedAt: published,
+	}
+
+	if _, err := db.AddSightings(ctx, []Sighting{sighting}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := db.SightingsFor(ctx, []string{sighting.Subject})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := before[sighting.Subject][0].FirstSeen; !got.After(published) {
+		t.Fatalf("point lookup first_seen = %v, want newer than %v", got, published)
+	}
+
+	changed, err := db.AddSightingsBackfill(ctx, []Sighting{sighting})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed != 1 {
+		t.Fatalf("backfill changed = %d, want 1", changed)
+	}
+	after, err := db.SightingsFor(ctx, []string{sighting.Subject})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := after[sighting.Subject][0].FirstSeen; !got.Equal(published) {
+		t.Fatalf("repaired first_seen = %v, want %v", got, published)
+	}
+}
 
 // mustSample inserts a minimal analyzed top-level sample so the feed query and
 // corroborated-flag maintenance have a row to match.

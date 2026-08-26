@@ -3601,7 +3601,8 @@ func (db *DB) addSightingsSQLite(ctx context.Context, s []Sighting) (int, error)
 				    operator = excluded.operator, claim = excluded.claim,
 				    filename = excluded.filename, handle = excluded.handle,
 				    basis = excluded.basis,
-				    published_at = excluded.published_at
+				    published_at = excluded.published_at,
+				    first_seen = MIN(sightings.first_seen, excluded.first_seen)
 				WHERE sightings.url IS NOT excluded.url
 				   OR sightings.note IS NOT excluded.note
 				   OR sightings.operator IS NOT excluded.operator
@@ -3614,6 +3615,7 @@ func (db *DB) addSightingsSQLite(ctx context.Context, s []Sighting) (int, error)
 				   -- guess forever, silently.
 				   OR sightings.basis IS NOT excluded.basis
 				   OR sightings.published_at IS NOT excluded.published_at
+				   OR sightings.first_seen > excluded.first_seen
 			RETURNING subject`,
 			s[i].Source, s[i].Subject, s[i].URL, s[i].Note, s[i].Operator,
 			s[i].Affected, string(s[i].Claim), s[i].FileName, s[i].Handle, basis, published,
