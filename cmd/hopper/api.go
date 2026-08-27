@@ -965,9 +965,17 @@ const (
 	// matching write storm to the workers table.
 	workerUpsertInterval = 30 * time.Second
 
-	// maxUploadBytes caps the artifact bytes in an /api/upload. Matches prism's
-	// web upload limit so anything that gets past prism fits here too.
-	maxUploadBytes = 100 << 20
+	// maxUploadBytes caps the artifact bytes in an /api/upload. Raised from
+	// 100 MiB to 8 GiB on 2026-08-27: registry dependencies routinely exceed
+	// 100 MiB (tensorflow wheels, platform-specific npm binaries, AUR
+	// packages, AppImages) and were failing outright — hopper's Content-Length
+	// precheck rejects an oversized request before reading the body, but the
+	// client is already mid-write on a large multipart stream and sees the
+	// dropped connection as a bare "receiver is gone" rather than a clean
+	// 413. No longer matches prism's web upload limit (still 100 MiB last
+	// checked) — a human's browser upload and a registry mirror have
+	// different realistic size distributions, so the two are free to diverge.
+	maxUploadBytes = 8 << 30
 	// uploadProvenanceMaxBytes caps the provenance part of a multipart upload.
 	// A sidecar carries at most two metadata records, each with Raw bounded by
 	// hopper.MaxRawBytes (256 KiB), plus small scalar fields.
@@ -981,8 +989,13 @@ const (
 	uploadFilenameMax = 200
 	// uploadBodyTimeout caps how long the body of a single /api/upload may
 	// take to arrive. Defends against slow-loris streams that hold a temp
-	// file open while dripping bytes under maxUploadBytes.
-	uploadBodyTimeout = 5 * time.Minute
+	// file open while dripping bytes under maxUploadBytes. Scaled up
+	// alongside maxUploadBytes (2026-08-27): 5 minutes was sized for a
+	// 100 MiB cap and would false-positive-reject a genuinely slow link
+	// partway through a multi-GiB transfer; 30 minutes covers an 8 GiB
+	// upload down to ~4.5 MB/s, well below LAN speeds, while still bounding
+	// a truly stalled connection.
+	uploadBodyTimeout = 30 * time.Minute
 	// resultBodyTimeout caps how long the body of a single /api/result may
 	// take to arrive — the same slow-loris defense as uploadBodyTimeout, but
 	// roomier because a result body may reach maxResultBodyBytes (1 GiB
