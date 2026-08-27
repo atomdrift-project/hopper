@@ -4751,6 +4751,9 @@ func (db *DB) countCleanupSQLite(ctx context.Context, stage CleanupStage) (int64
 }
 
 func (db *DB) applyCleanupSQLite(ctx context.Context, stage CleanupStage) (int64, error) {
+	if stage.BatchSize > 0 {
+		return db.applyCleanupBatchSQLite(ctx, stage)
+	}
 	tx, err := db.lite.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: begin cleanup %s: %w", stage.Name, err)
@@ -4774,6 +4777,81 @@ func (db *DB) applyCleanupSQLite(ctx context.Context, stage CleanupStage) (int64
 		return 0, fmt.Errorf("hopper: commit cleanup %s: %w", stage.Name, err)
 	}
 	return n, nil
+}
+
+// applyCleanupBatchSQLite is applyCleanupBatchPG's SQLite counterpart — see
+// its doc comment. SQLite deployments never approach the row counts this
+// exists for, but the logic stays real (not stubbed to the single-transaction
+// path) so it has real test coverage without a Postgres fixture.
+func (db *DB) applyCleanupBatchSQLite(ctx context.Context, stage CleanupStage) (int64, error) {
+	var total int64
+	for {
+		//nolint:gosec // stage.predicate is an internal constant from CleanupStages, not user input.
+		rows, err := db.lite.QueryContext(ctx,
+			"SELECT id FROM samples WHERE "+stage.predicate+" ORDER BY id LIMIT ?", stage.BatchSize)
+		if err != nil {
+			return total, fmt.Errorf("hopper: cleanup %s select batch: %w", stage.Name, err)
+		}
+		var ids []int64
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return total, fmt.Errorf("hopper: cleanup %s scan batch: %w", stage.Name, err)
+			}
+			ids = append(ids, id)
+		}
+		rowsErr := rows.Err()
+		rows.Close()
+		if rowsErr != nil {
+			return total, fmt.Errorf("hopper: cleanup %s batch rows: %w", stage.Name, rowsErr)
+		}
+		if len(ids) == 0 {
+			return total, nil
+		}
+
+		placeholders := make([]string, len(ids))
+		args := make([]any, len(ids))
+		for i, id := range ids {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		inClause := strings.Join(placeholders, ",")
+
+		tx, err := db.lite.BeginTx(ctx, nil)
+		if err != nil {
+			return total, fmt.Errorf("hopper: begin cleanup %s batch: %w", stage.Name, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			//nolint:gosec // placeholders are '?' bind markers; ids are parameterized via args.
+			"DELETE FROM reports WHERE sha256 IN (SELECT sha256 FROM samples WHERE id IN ("+inClause+"))",
+			args...,
+		); err != nil {
+			tx.Rollback() //nolint:errcheck // best-effort
+			return total, fmt.Errorf("hopper: cleanup %s batch reports: %w", stage.Name, err)
+		}
+		//nolint:gosec // placeholders are '?' bind markers; ids are parameterized via args.
+		res, err := tx.ExecContext(ctx, "DELETE FROM samples WHERE id IN ("+inClause+")", args...)
+		if err != nil {
+			tx.Rollback() //nolint:errcheck // best-effort
+			return total, fmt.Errorf("hopper: cleanup %s batch samples: %w", stage.Name, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			tx.Rollback() //nolint:errcheck // best-effort
+			return total, fmt.Errorf("hopper: cleanup %s batch rows affected: %w", stage.Name, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return total, fmt.Errorf("hopper: commit cleanup %s batch: %w", stage.Name, err)
+		}
+		total += n
+
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		case <-time.After(cleanupBatchPause):
+		}
+	}
 }
 
 func (db *DB) feedSamplesSQLite(ctx context.Context, q *FeedQuery) ([]*Sample, error) {

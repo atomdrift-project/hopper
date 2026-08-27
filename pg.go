@@ -7347,6 +7347,9 @@ func (db *DB) countCleanupPG(ctx context.Context, stage CleanupStage) (int64, er
 }
 
 func (db *DB) applyCleanupPG(ctx context.Context, stage CleanupStage) (int64, error) {
+	if stage.BatchSize > 0 {
+		return db.applyCleanupBatchPG(ctx, stage)
+	}
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: begin cleanup %s: %w", stage.Name, err)
@@ -7364,6 +7367,72 @@ func (db *DB) applyCleanupPG(ctx context.Context, stage CleanupStage) (int64, er
 		return 0, fmt.Errorf("hopper: commit cleanup %s: %w", stage.Name, err)
 	}
 	return tag.RowsAffected(), nil
+}
+
+// applyCleanupBatchPG deletes stage's matching rows in chunks of
+// stage.BatchSize, each chunk its own transaction, so a stage that can reach
+// millions of rows never holds one lock — or bursts one commit's worth of
+// WAL — for the entire delete. Each iteration re-queries the same predicate:
+// rows already deleted no longer match, so the next chunk is always the next
+// `BatchSize` rows in id order. A short pause between chunks keeps continuous
+// deletion from crowding out concurrent traffic and gives a logical replica
+// room to keep up.
+func (db *DB) applyCleanupBatchPG(ctx context.Context, stage CleanupStage) (int64, error) {
+	var total int64
+	for {
+		rows, err := db.pool.Query(ctx,
+			"SELECT id FROM samples WHERE "+stage.predicate+" ORDER BY id LIMIT $1", stage.BatchSize)
+		if err != nil {
+			return total, fmt.Errorf("hopper: cleanup %s select batch: %w", stage.Name, err)
+		}
+		var ids []int64
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return total, fmt.Errorf("hopper: cleanup %s scan batch: %w", stage.Name, err)
+			}
+			ids = append(ids, id)
+		}
+		rowsErr := rows.Err()
+		rows.Close()
+		if rowsErr != nil {
+			return total, fmt.Errorf("hopper: cleanup %s batch rows: %w", stage.Name, rowsErr)
+		}
+		if len(ids) == 0 {
+			return total, nil
+		}
+
+		tx, err := db.pool.Begin(ctx)
+		if err != nil {
+			return total, fmt.Errorf("hopper: begin cleanup %s batch: %w", stage.Name, err)
+		}
+		// Reports first, matched through the samples rows this batch is
+		// about to remove — the same order the single-transaction path
+		// uses, for the same reason (a row's report is unreachable once the
+		// sample row naming its sha256 is gone).
+		if _, err := tx.Exec(ctx,
+			"DELETE FROM reports WHERE sha256 IN (SELECT sha256 FROM samples WHERE id = ANY($1))", ids,
+		); err != nil {
+			tx.Rollback(ctx) //nolint:errcheck // best-effort
+			return total, fmt.Errorf("hopper: cleanup %s batch reports: %w", stage.Name, err)
+		}
+		tag, err := tx.Exec(ctx, "DELETE FROM samples WHERE id = ANY($1)", ids)
+		if err != nil {
+			tx.Rollback(ctx) //nolint:errcheck // best-effort
+			return total, fmt.Errorf("hopper: cleanup %s batch samples: %w", stage.Name, err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return total, fmt.Errorf("hopper: commit cleanup %s batch: %w", stage.Name, err)
+		}
+		total += tag.RowsAffected()
+
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		case <-time.After(cleanupBatchPause):
+		}
+	}
 }
 
 func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error) {

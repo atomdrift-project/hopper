@@ -4630,6 +4630,87 @@ func TestPurgeUnsupported(t *testing.T) {
 	}
 }
 
+// TestApplyCleanupBatches exercises a CleanupStage with BatchSize set — the
+// path added for registry_metadata_only, whose real row count (6.2M) made a
+// single-transaction delete a bad idea. A batch size smaller than the total
+// row count forces the loop to run more than once, so this only passes if
+// every batch actually deletes its rows and the loop correctly re-queries
+// the (shrinking) predicate rather than looping forever or stopping early.
+func TestApplyCleanupBatches(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	const total = 10
+	for i := range total {
+		sha := fmt.Sprintf("batch-junk-%d", i)
+		mustInsert(t, ctx, db, &Sample{
+			SHA256:   sha,
+			Filename: fmt.Sprintf("pkg-%d@1.0.0.registry.json", i),
+			Source:   "test",
+			Label:    "unknown",
+		})
+		// mustInsert gives every sample a synthetic non-empty path —
+		// InsertSample rejects an empty one, same as production's real
+		// upload path. The rows this stage targets never went through that
+		// path at all (they were verdict-only /api/result posts), so force
+		// the state directly, the same way TestPurgeUnsupported simulates a
+		// historical row shape InsertSample wouldn't produce.
+		if _, err := db.lite.ExecContext(ctx, `UPDATE samples SET path = '' WHERE sha256 = ?`, sha); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.InsertReport(ctx, &Report{SHA256: sha, Type: "re", Content: "stale"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A sample this stage must not touch: real path, doesn't match the
+	// filename pattern.
+	mustInsert(t, ctx, db, &Sample{SHA256: "keep", Filename: "real.tgz", Path: "incoming/scan/real.tgz", Source: "test", Label: "unknown"})
+
+	stage := CleanupStage{
+		Name:      "test_batch",
+		predicate: "path = '' AND filename LIKE '%.registry.json'",
+		BatchSize: 3, // smaller than total, so this must loop more than once
+	}
+
+	n, err := db.CountCleanup(ctx, stage)
+	if err != nil {
+		t.Fatalf("CountCleanup: %v", err)
+	}
+	if n != total {
+		t.Fatalf("dry-run count = %d, want %d", n, total)
+	}
+
+	deleted, err := db.ApplyCleanup(ctx, stage)
+	if err != nil {
+		t.Fatalf("ApplyCleanup: %v", err)
+	}
+	if deleted != total {
+		t.Errorf("deleted = %d, want %d", deleted, total)
+	}
+	for i := range total {
+		sha := fmt.Sprintf("batch-junk-%d", i)
+		if _, err := db.SampleBySHA256(ctx, sha); !errors.Is(err, ErrNotFound) {
+			t.Errorf("%s should be gone, got err=%v", sha, err)
+		}
+		reports, err := db.ReportsBySHA256(ctx, sha)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(reports) != 0 {
+			t.Errorf("%s reports should be gone, got %d", sha, len(reports))
+		}
+	}
+	if _, err := db.SampleBySHA256(ctx, "keep"); err != nil {
+		t.Errorf("keep should still exist, got err=%v", err)
+	}
+
+	// Re-running against an already-clean stage must not error or loop
+	// forever — the first batch query returns zero rows and the loop exits.
+	if n, err := db.ApplyCleanup(ctx, stage); err != nil || n != 0 {
+		t.Errorf("re-apply on a clean stage = (%d, %v), want (0, nil)", n, err)
+	}
+}
+
 func TestSanitizeJSONB(t *testing.T) {
 	tests := []struct {
 		name string

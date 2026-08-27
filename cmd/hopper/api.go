@@ -300,6 +300,7 @@ type workerStats struct {
 	LastCompletion   time.Time
 	LastSeen         time.Time
 	LastPollAt       time.Time
+	HeldNothingSince time.Time
 	Tools            string
 	Traits           string
 	Version          string
@@ -492,18 +493,21 @@ func (wt *workerTracker) update(name string, slots int, version, traits string, 
 // telemetry, which the work-claim path can't supply. ActiveClaims/TotalClaimed/
 // LastClaimed stay owned by tryClaimBatch and release; do not bump them here.
 //
-// It returns true when hb carries a client-side error string that differs from
-// the previous beat's, so the caller can surface it to the log exactly once.
+// It also reconciles hopper's claim ledger against what the worker reports it
+// is holding, returning the number of abandoned claims it dropped.
+//
+// It returns newError when hb carries a client-side error string that differs
+// from the previous beat's, so the caller can surface it to the log once.
 // lastError is sticky across beats, so logging every non-empty value would
 // repeat the same line at the heartbeat cadence; keying on a change logs each
 // distinct error once while the trailing ErrorsRecent count conveys the volume.
-func (wt *workerTracker) heartbeat(name string, hb *workerHeartbeat) (newError bool) {
+func (wt *workerTracker) heartbeat(name string, hb *workerHeartbeat) (newError bool, abandoned int) {
 	wt.mu.Lock()
 	defer wt.mu.Unlock()
 	ws, ok := wt.workers[name]
 	if !ok {
 		if len(wt.workers) >= maxTrackedWorkers {
-			return false // silently drop to prevent memory exhaustion
+			return false, 0 // silently drop to prevent memory exhaustion
 		}
 		ws = &workerStats{}
 		wt.workers[name] = ws
@@ -530,7 +534,30 @@ func (wt *workerTracker) heartbeat(name string, hb *workerHeartbeat) (newError b
 	ws.ErrorsRecent = hb.errorsRecent
 	ws.LastError = hb.lastError
 	ws.LastErrorAt = hb.lastErrorAt
-	return newError
+
+	// Reconcile the claim ledger against what the worker says it holds. A
+	// worker reporting no running analysis and no staged job is holding
+	// nothing, so any claim still recorded against it here belongs to a
+	// process that no longer exists: the worker restarted, or dropped its
+	// batch without ever posting a result. Such claims are worse than inert —
+	// they pin their samples away from every other worker until the lease runs
+	// out (up to maxClaimLease), and they hold an unproven worker at a claim
+	// limit of zero, a deadlock it cannot poll its way out of.
+	//
+	// active and queue are the worker's own counters for exactly this: slots
+	// running an analysis, and samples staged behind them. Both zero is the
+	// whole condition — a worker with a full prefetch buffer it has not
+	// started yet still reports queue > 0 and is left alone.
+	if hb.active == 0 && hb.queue == 0 && ws.ActiveClaims > 0 {
+		if ws.HeldNothingSince.IsZero() {
+			ws.HeldNothingSince = ws.LastSeen
+		} else if ws.LastSeen.Sub(ws.HeldNothingSince) >= abandonedClaimGrace {
+			abandoned = wt.resetClaimsLocked(name)
+		}
+	} else {
+		ws.HeldNothingSince = time.Time{}
+	}
+	return newError, abandoned
 }
 
 // workerHeartbeat is the parsed payload of one /api/heartbeat request. Timestamps
@@ -663,14 +690,25 @@ func (wt *workerTracker) recordResult(name string, isError bool) {
 func (wt *workerTracker) resetClaims(name string) {
 	wt.mu.Lock()
 	defer wt.mu.Unlock()
+	wt.resetClaimsLocked(name)
+}
+
+// resetClaimsLocked is resetClaims with the lock already held. It returns how
+// many claims it dropped, so a caller acting on its own initiative — the
+// heartbeat's abandoned-claim reconciliation — can report what it did.
+func (wt *workerTracker) resetClaimsLocked(name string) int {
+	dropped := 0
 	for sha, c := range wt.claims {
 		if c.worker == name {
 			delete(wt.claims, sha)
+			dropped++
 		}
 	}
 	if ws, ok := wt.workers[name]; ok {
 		ws.ActiveClaims = 0
+		ws.HeldNothingSince = time.Time{}
 	}
+	return dropped
 }
 
 // namedWorkerStats is workerStats with the worker name attached.
@@ -906,6 +944,17 @@ const (
 	maxClaimCount = 32
 	claimExpiry   = 30 * time.Minute // base (minimum) claim lease
 	staleClaimAge = 2 * time.Hour
+	// abandonedClaimGrace is how long a worker must keep reporting that it is
+	// holding nothing — no analysis running, no job staged — while hopper still
+	// shows claims against it, before those claims are treated as abandoned and
+	// dropped. A restarted worker forgets its claims; hopper does not, and an
+	// unproven worker (one that has returned no result since this process
+	// started) is then held at claimLimit 0, which no amount of polling can
+	// clear: it cannot return a result to prove itself without first being
+	// given work. The delay is what separates a genuine restart from the
+	// ordinary race where a beat is assembled just before a fresh batch lands;
+	// at the worker's 15s heartbeat this is ~20 consecutive empty reports.
+	abandonedClaimGrace = 5 * time.Minute
 	// emptyTierWarnInterval is how often one claim tier may report that it held
 	// rows but produced no servable job.
 	emptyTierWarnInterval = time.Minute
@@ -1434,7 +1483,15 @@ func (s *apiServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		hb.lastErrorAt = s
 	}
 
-	if s.tracker.heartbeat(worker, &hb) {
+	newError, abandoned := s.tracker.heartbeat(worker, &hb)
+	if abandoned > 0 {
+		// The worker is being handed back work it silently lost. Say so at WARN:
+		// a worker that trips this repeatedly is crash-looping or failing to
+		// post results, and the claim release is only treating the symptom.
+		slog.Warn("released claims the worker no longer holds", //nolint:gosec // worker is sanitized by validWorkerName
+			"worker", worker, "released", abandoned, "grace", abandonedClaimGrace)
+	}
+	if newError {
 		// Worker-side analysis errors are otherwise invisible here: heartbeats
 		// are display-only, so without this the only signal is a number ticking
 		// up on the dashboard. Surface the actual error so it lands in the

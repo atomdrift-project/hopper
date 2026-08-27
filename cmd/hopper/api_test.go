@@ -193,6 +193,113 @@ func TestWorkerTrackerClaimLimitPrunesExpiredClaims(t *testing.T) {
 	}
 }
 
+// backdateHeldNothing rewinds when the worker first reported holding nothing,
+// so a test can cross abandonedClaimGrace without sleeping.
+func backdateHeldNothing(t *testing.T, wt *workerTracker, name string, d time.Duration) {
+	t.Helper()
+	wt.mu.Lock()
+	defer wt.mu.Unlock()
+	ws, ok := wt.workers[name]
+	if !ok {
+		t.Fatalf("worker %q is not tracked", name)
+	}
+	if ws.HeldNothingSince.IsZero() {
+		t.Fatalf("worker %q has no empty-report clock running", name)
+	}
+	ws.HeldNothingSince = time.Now().Add(-d)
+}
+
+// fullyClaimed leaves name holding a full batch it has returned no result for:
+// the state a worker restart strands, where claimLimit is 0 and the worker
+// cannot earn its way out.
+func fullyClaimed(t *testing.T, name string) (*workerTracker, []hopper.ClaimJob) {
+	t.Helper()
+	wt := newWorkerTracker()
+	cands := make([]hopper.ClaimJob, maxClaimCount)
+	for i := range cands {
+		cands[i] = hopper.ClaimJob{SHA256: string(rune('a' + i)), Path: "p/x"}
+	}
+	if got := wt.tryClaimBatch(cands, name, claimExpiry, maxClaimCount); len(got) != maxClaimCount {
+		t.Fatalf("claim batch: got %d, want %d", len(got), maxClaimCount)
+	}
+	if got := wt.claimLimit(name); got != 0 {
+		t.Fatalf("claimLimit while holding a full batch = %d, want 0", got)
+	}
+	return wt, cands
+}
+
+func TestWorkerTrackerHeartbeatReleasesAbandonedClaims(t *testing.T) {
+	wt, cands := fullyClaimed(t, "grima")
+
+	// The restarted worker reports an empty queue. The first such beat only
+	// starts the clock: a beat assembled just before a fresh batch landed
+	// looks exactly like this, and must not cost the worker its work.
+	if _, abandoned := wt.heartbeat("grima", &workerHeartbeat{}); abandoned != 0 {
+		t.Fatalf("first empty beat released %d claims, want 0", abandoned)
+	}
+	if got := wt.activeClaims("grima"); got != maxClaimCount {
+		t.Fatalf("active claims after first empty beat = %d, want %d", got, maxClaimCount)
+	}
+
+	// Still inside the grace period: still untouched.
+	backdateHeldNothing(t, wt, "grima", abandonedClaimGrace-time.Minute)
+	if _, abandoned := wt.heartbeat("grima", &workerHeartbeat{}); abandoned != 0 {
+		t.Fatalf("beat inside the grace period released %d claims, want 0", abandoned)
+	}
+	if got := wt.activeClaims("grima"); got != maxClaimCount {
+		t.Fatalf("active claims inside the grace period = %d, want %d", got, maxClaimCount)
+	}
+
+	// Past it: the claims are dropped and the worker is servable again.
+	backdateHeldNothing(t, wt, "grima", abandonedClaimGrace)
+	if _, abandoned := wt.heartbeat("grima", &workerHeartbeat{}); abandoned != maxClaimCount {
+		t.Fatalf("beat past the grace period released %d claims, want %d", abandoned, maxClaimCount)
+	}
+	if got := wt.claimLimit("grima"); got != maxClaimCount {
+		t.Fatalf("claimLimit after release = %d, want %d", got, maxClaimCount)
+	}
+	// The samples are genuinely free again, not merely uncounted.
+	if got := wt.tryClaimBatch(cands, "other", claimExpiry, 1); len(got) != 1 {
+		t.Fatalf("released sample not reclaimable by another worker: %+v", got)
+	}
+}
+
+func TestWorkerTrackerHeartbeatKeepsClaimsWorkerStillHolds(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		beat workerHeartbeat
+	}{
+		// Slots busy: an in-progress scan, however long, keeps its claims.
+		{"analysing", workerHeartbeat{active: 1}},
+		// Nothing running yet, but a full prefetch buffer staged behind the
+		// gate. These claims are real work the worker has not started.
+		{"staged", workerHeartbeat{queue: maxClaimCount}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wt, _ := fullyClaimed(t, "w1")
+
+			// Start the clock, then report holding work: that must stop it.
+			if _, abandoned := wt.heartbeat("w1", &workerHeartbeat{}); abandoned != 0 {
+				t.Fatalf("first empty beat released %d claims, want 0", abandoned)
+			}
+			backdateHeldNothing(t, wt, "w1", 2*abandonedClaimGrace)
+			beat := tc.beat
+			if _, abandoned := wt.heartbeat("w1", &beat); abandoned != 0 {
+				t.Fatalf("beat reporting held work released %d claims, want 0", abandoned)
+			}
+
+			// With the clock cleared, the next empty beat starts over rather
+			// than inheriting the elapsed time from before.
+			if _, abandoned := wt.heartbeat("w1", &workerHeartbeat{}); abandoned != 0 {
+				t.Fatalf("beat after the clock reset released %d claims, want 0", abandoned)
+			}
+			if got := wt.activeClaims("w1"); got != maxClaimCount {
+				t.Fatalf("active claims = %d, want %d", got, maxClaimCount)
+			}
+		})
+	}
+}
+
 func TestSizeClassBucketsByBounds(t *testing.T) {
 	for _, tc := range []struct {
 		bytes int64

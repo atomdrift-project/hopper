@@ -1777,6 +1777,12 @@ func (db *DB) PurgeUnsupported(ctx context.Context, dryRun bool) (int64, error) 
 	return n, err
 }
 
+// cleanupBatchPause is the delay between chunks of a batched cleanup delete
+// (CleanupStage.BatchSize > 0). Short enough that a multi-million-row stage
+// still finishes in a reasonable time, long enough to leave room for
+// concurrent traffic and a logical replica between chunks.
+const cleanupBatchPause = 200 * time.Millisecond
+
 // CleanupStage identifies a category of dead-end samples — records whose
 // skip marker means they can never be re-analyzed (missing on disk, lost
 // path, corrupt, encrypted) or have been superseded. Predicates are
@@ -1786,17 +1792,49 @@ type CleanupStage struct {
 	Name        string
 	Description string
 	predicate   string // SQL fragment applied to the samples table
+	// BatchSize, when nonzero, deletes this stage in chunks of this many
+	// rows (ordered by id, each chunk its own transaction, paused between)
+	// instead of one transaction for the whole stage. Every other stage here
+	// is small enough that a single transaction is no burden; a stage that
+	// can reach millions of rows needs batching so the delete doesn't hold
+	// one long-lived lock or throw off a burst of WAL a logical replica has
+	// to catch up through.
+	BatchSize int
 }
 
 // CleanupStages lists cleanup categories from largest/most-confidently-dead
 // to smallest/edge-case. Keep the order stable: the CLI walks it in this
 // order and users may rely on it when scripting with --stage.
 var CleanupStages = []CleanupStage{
-	{"empty_path", "samples whose original path was lost", "skip = 'empty_path'"},
-	{"missing", "files marked missing from disk", "skip = 'missing'"},
-	{"corrupt", "files too damaged to analyze", "skip = 'corrupt'"},
-	{"encrypted", "encrypted files that will never be analyzable", "skip = 'encrypted'"},
-	{"replaced", "samples superseded by a newer version", "skip = 'replaced'"},
+	{
+		Name: "registry_metadata_only",
+		Description: "root-purl registry-metadata fallbacks scan mistakenly content-addressed " +
+			"by a non-reproducible hash",
+		// scan's root-purl registry-metadata fallback (real artifact bytes
+		// unfetchable — a removed version, or a fetch failure) mistakenly
+		// content-addressed the registry's own JSON record: the record embeds
+		// call-time-relative fields (age_days, releases_24h, …), so it hashes
+		// differently on every single fetch of the same coordinate and never
+		// deduplicates. Fixed in scan's classify_purl on 2026-08-27 (it now
+		// redirects onto real content when hopper already holds it, or posts
+		// nothing at all when it doesn't) — these are the rows the bug
+		// already minted before the fix landed. `path = ''` because bytes
+		// never move for this filename pattern; safe alongside `filename
+		// LIKE` since a real artifact is never named this way
+		// (registry_doc_name() in scan's fetch.rs always appends the literal
+		// suffix). Measured 2026-08-27 against production: 6,197,578 rows —
+		// this bug had been running for roughly a week, not just that
+		// session. Batched: a single-transaction delete at this size would
+		// hold a long lock and burst enough WAL to visibly lag the
+		// hopper_replica_galadriel logical replication slot.
+		predicate: "path = '' AND filename LIKE '%.registry.json'",
+		BatchSize: 50_000,
+	},
+	{Name: "empty_path", Description: "samples whose original path was lost", predicate: "skip = 'empty_path'"},
+	{Name: "missing", Description: "files marked missing from disk", predicate: "skip = 'missing'"},
+	{Name: "corrupt", Description: "files too damaged to analyze", predicate: "skip = 'corrupt'"},
+	{Name: "encrypted", Description: "encrypted files that will never be analyzable", predicate: "skip = 'encrypted'"},
+	{Name: "replaced", Description: "samples superseded by a newer version", predicate: "skip = 'replaced'"},
 }
 
 // CleanupStageByName returns the stage with the given short name.
