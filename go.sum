@@ -1,5 +1,7 @@
 github.com/andybalholm/brotli v1.2.2 h1:HzTuoo2ErYQqf5qvcJInB8uvqSVxRttzkFexPWtnceM=
 github.com/andybalholm/brotli v1.2.2/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
+github.com/andybalholm/brotli v1.2.3 h1:8H1qwOkl2LPfjf3YezB90JnCliZb6SInJ/OJkEbA5NQ=
+github.com/andybalholm/brotli v1.2.3/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
 github.com/atomdrift-project/obs v0.0.0-20260723192826-95a12564dd6f h1:6tM+BLSWMfRa6F13inxucX3yhPUiPntIOiWjSqv0umk=
 github.com/atomdrift-project/obs v0.0.0-20260723192826-95a12564dd6f/go.mod h1:EX5LXJhxxhmZAV6N3s/Di+UU0mjn0EEZOPl0lSaRYlA=
 github.com/atomdrift-project/obs v0.0.0-20260804141423-6dff25bbc747 h1:u+orE68ZGdHtOiPsGjhhJvH2S8Iazjebz8cNsIFjx1w=
