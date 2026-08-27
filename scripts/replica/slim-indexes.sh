@@ -92,6 +92,7 @@ idx_claims_name
 idx_claims_signer
 idx_label_events_sha
 idx_reports_sha256_type_created
+idx_samples_acquit_newest
 idx_samples_bad_miss_newest
 idx_samples_bad_miss_stale
 idx_samples_bad_route_score
@@ -113,8 +114,10 @@ idx_samples_labeled_route
 idx_samples_new_interesting
 idx_samples_new_stale
 idx_samples_package_version
+idx_samples_popular_ranked
 idx_samples_purl_base
 idx_samples_purl_lookup
+idx_samples_second_newest
 idx_samples_sighted_purl
 idx_samples_stranded_member
 idx_samples_top_ready_created
@@ -143,6 +146,7 @@ idx_slh_sha256_retired
 # splits the body on whitespace, so a '#' line would parse as index names and
 # fail the guard.
 REPLICA_DROP_INDEXES='
+idx_samples_candidate_keyset
 idx_sightings_acquisition_recent
 idx_sightings_recent
 idx_popular_rank

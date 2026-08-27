@@ -4501,7 +4501,10 @@ func (db *DB) CountByStatus(ctx context.Context) (map[string]int, error) {
 	return db.countByStatusSQLite(ctx)
 }
 
-// CountAnalyzed returns the number of samples with analysis results.
+// CountAnalyzed returns how many samples carry analysis results. On Postgres
+// this is an ESTIMATE read from the catalog, accurate to well under a percent
+// and free; see countAnalyzedPG for why an exact count is not worth its cost.
+// Callers needing an exact figure must count it themselves.
 func (db *DB) CountAnalyzed(ctx context.Context) (int64, error) {
 	if db.pool != nil {
 		return db.countAnalyzedPG(ctx)

@@ -628,6 +628,102 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			`litmus_score DESC NULLS LAST, analyzed_at, id) ` +
 			`WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' ` +
 			`AND skip = '' AND path <> '' AND suspicious_count >= 1 AND path NOT LIKE 'review/%'`,
+		// The evidence-ranked pair (TriageAcquit / TriageSecondOpinion). Both
+		// were added after the mirrors above and neither got one, so each
+		// falls back to a generic scan and filter. Measured against the live
+		// table at LIMIT 64: acquit 71.0s — a BitmapAnd of idx_samples_label
+		// and idx_samples_class_top_created that goes lossy (1.10M lossy heap
+		// blocks, 6.33M rows dropped by recheck, 2.44M more by filter) to
+		// yield 649 candidates — and second 73.5s, an idx_samples_top_created
+		// walk that discards 2.99M rows to find 99. Both exceed the API's
+		// apiQueryTimeout, so cyclotron sees a 500 on every poll of either
+		// queue and the two premium-chain queues never run.
+		//
+		// The sightings anti-join is not the cost: it answers in ~0.08ms per
+		// candidate on idx_sightings_subject. It is the driving scan that has
+		// no partial to walk.
+		//
+		// acquit carries its provenance terms into the predicate — they are
+		// what cut 745,909 strongly-detected bad rows to the ~650 the queue
+		// can serve, and jsonb_typeof and ? are both immutable, so they are
+		// index-legal. Spell the existence test with the ? operator and not
+		// jsonb_exists(provenance, 'feed'): the planner matches a partial by
+		// expression shape, and the function-call form would not match the
+		// selector's operator form.
+		//
+		// second states max_crit < 5 AND suspicious_count < 2 where its
+		// selector writes NOT (max_crit >= 5 OR suspicious_count >= 2). Both
+		// columns are NOT NULL, so the two are equivalent and the planner
+		// canonicalizes them alike — it already prints the AND spelling in the
+		// selector's own EXPLAIN.
+		`CREATE INDEX IF NOT EXISTS idx_samples_acquit_newest ` +
+			`ON samples(created_at DESC, id DESC) ` +
+			`WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = '' ` +
+			`AND path <> '' AND skip <> 'conflict' AND label_source <> 'conflict' ` +
+			`AND max_crit >= 5 AND suspicious_count >= 2 ` +
+			`AND provenance IS NOT NULL AND jsonb_typeof(provenance) = 'object' ` +
+			`AND NOT provenance ? 'feed'`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_second_newest ` +
+			`ON samples(created_at DESC, id DESC) ` +
+			`WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = '' ` +
+			`AND path <> '' AND corroborated ` +
+			`AND max_crit < 5 AND suspicious_count < 2`,
+		// TriagePopular. Same missing-partial story, and the most expensive
+		// read on the box: 10,507 calls over two plan variants for 173,296s of
+		// execution, 38.3s for a single LIMIT 64 measured against the live
+		// table. The planner BitmapANDs idx_samples_purl_base with
+		// idx_samples_class_top_created, goes lossy (1,020,565 heap blocks,
+		// 193,756 rows dropped by recheck, 1,149,107 by filter) and yields
+		// 299,836 rows — of which the popular_packages probe keeps 12,478.
+		//
+		// That probe is the selective predicate (4%) and it is nearly free —
+		// Memoize turns it into 0.007ms per row — but it can only run after
+		// the heap scan has already happened. The index is what lets those
+		// 299,836 rows be enumerated without touching 8 GB of heap.
+		//
+		// purl_base leads rather than score: it is what the probe keys on, and
+		// an index ordered by it hands Memoize perfect locality (consecutive
+		// rows share a package, so the cache collapses to one probe each).
+		// score and id ride along in INCLUDE so the 299,836 -> 12,478 cut is
+		// index-only and just the survivors touch the heap for the drain.
+		// Ordering is not the point — the ORDER BY leads with a subquery
+		// against another table and can never be walked.
+		//
+		// Do NOT drive this query from popular_packages instead: 49,953 of
+		// them against 12,478 qualifying samples means a LATERAL walk spends
+		// nearly every probe on a package with nothing to serve. Measured, it
+		// is worse than what it replaced — over 180s against the live table.
+		//
+		// suspiciousCrit is interpolated, not spelled, so the predicate cannot
+		// drift from triagePopularWhere. Retuning that constant changes this
+		// DDL's text but not the index name, and CREATE INDEX IF NOT EXISTS
+		// will not rewrite a pre-existing partial predicate — a retune needs
+		// the old index dropped, the same hazard the path <> '' guard above
+		// handles for its own set.
+		// CandidatesByLabel — promoter's pool sweep, and the heaviest read on
+		// the box: 26,874 calls, 9.6s mean, 258,699s of execution. It pages the
+		// sha256 keyspace, but nothing indexes what it selects on, so the
+		// planner BitmapANDs mtime with parent, goes lossy (9,279,480 rows
+		// dropped by recheck to yield 1,165,638, 3.7M buffers) and then top-N
+		// heapsorts the survivors for a 500-row page.
+		//
+		// label leads and sha256 follows so one call is an ordered range scan
+		// over its own label — the keyset cursor becomes an index condition
+		// rather than a filter, the ORDER BY is free, and the LIMIT stops the
+		// walk. path and mtime stay out of the index: including path would
+		// roughly triple it for a prefix nearly every row in range satisfies,
+		// so they are cheaper to recheck on the few heap rows a bounded walk
+		// actually visits. Verified to match and to plan as an ordered walk
+		// with no sort; the population is bounded by parent = '' (13.9M rows,
+		// per idx_samples_top_created) so expect well under a gigabyte.
+		`CREATE INDEX IF NOT EXISTS idx_samples_candidate_keyset ` +
+			`ON samples(label, sha256) ` +
+			`WHERE parent = '' AND skip = '' AND mtime IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_popular_ranked ` +
+			`ON samples(purl_base) INCLUDE (score, id) ` +
+			`WHERE cleave_result IS NOT NULL AND parent = '' AND path <> '' ` +
+			`AND skip <> 'conflict' AND max_crit >= ` + strconv.Itoa(suspiciousCrit) + ` ` +
+			`AND purl_base <> ''`,
 		// Sighted selection is now a ledger join ordered by sighting first_seen;
 		// the old label+sample-created ordering index has no reader.
 		`DROP INDEX IF EXISTS idx_samples_sighted_newest`,
@@ -4296,9 +4392,19 @@ func (db *DB) samplesByLabelPG(ctx context.Context, label string, limit int) ([]
 	return scanPGSamples(rows)
 }
 
+// candidatesByLabelPG: see CandidatesByLabel. Projects pgSampleColsFeed, not
+// pgSampleCols — the archive member tree is megabytes per row and promoter, the
+// only caller, never reads it (verdictFromSample takes litmus_result, which
+// this keeps). The projection stays positionally identical, so scanPGSamples
+// reads it unchanged and CleaveResult simply scans as nil.
+//
+// Worth doing, but small: measured against the live table the blob is ~6% of
+// this query (171.7s against 161.7s for the same page, near-identical buffers).
+// The cost is the scan — see idx_samples_candidate_keyset, which is what
+// actually addresses it.
 func (db *DB) candidatesByLabelPG(ctx context.Context, label, pathPrefix string, olderThan time.Time, afterSHA string, limit int) ([]*Sample, error) {
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleCols+` FROM samples
+		`SELECT `+pgSampleColsFeed+` FROM samples
 		 WHERE label = $1 AND parent = '' AND skip = ''
 		   AND starts_with(path, $2)
 		   AND mtime IS NOT NULL AND mtime < $3
@@ -4963,10 +5069,36 @@ func (db *DB) countByStatusPG(ctx context.Context) (map[string]int, error) {
 	return scanPGCounts(rows)
 }
 
+// countAnalyzedPG estimates the analyzed population from the catalog rather
+// than counting it.
+//
+// idx_samples_litmus_done is partial on exactly `litmus_result IS NOT NULL`, so
+// its reltuples IS the number wanted, maintained by autovacuum for free. The
+// exact count walks every matching row even as an index-only scan: measured
+// against the live table at 238s and 34.9M buffers for 75,593,897 rows (1,060s
+// mean under load, 59,367s cumulative — one multi-minute burn per restart). The
+// catalog answered 75,730,632 for the same instant, 0.18% out.
+//
+// That precision is far inside what the number is for. Its one caller,
+// seedProgressBaseline, sets the denominator of a dashboard percentage and is
+// documented best-effort — a failed count there leaves the baseline at zero.
+// The throughput series counts in memory (progress.analyzed) and never re-reads
+// this, so a value lagging one autovacuum costs nothing downstream.
+//
+// reltuples is -1 on an index that has never been vacuumed or analyzed, and
+// to_regclass is NULL while the deferred migration is still building it; both
+// surface as 0, which is what the caller already does with a failure.
 func (db *DB) countAnalyzedPG(ctx context.Context) (int64, error) {
-	var n int64
-	err := db.pool.QueryRow(ctx, "SELECT count(*) FROM samples WHERE litmus_result IS NOT NULL").Scan(&n)
-	return n, err
+	var est float64
+	if err := db.pool.QueryRow(ctx,
+		`SELECT COALESCE((SELECT reltuples FROM pg_class
+		                   WHERE oid = to_regclass('idx_samples_litmus_done')), 0)`).Scan(&est); err != nil {
+		return 0, fmt.Errorf("hopper: count analyzed: %w", err)
+	}
+	if est < 0 {
+		return 0, nil
+	}
+	return int64(est), nil
 }
 
 func (db *DB) relativizePathsPG(ctx context.Context, prefix string) (int64, error) {
