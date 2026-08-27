@@ -497,12 +497,16 @@ var ErrNotFound = errors.New("hopper: not found")
 // DB is a connection to the sample registry.
 // Backed by either PostgreSQL (pool) or SQLite (lite).
 type DB struct {
-	pool                *pgxpool.Pool
-	lite                *sql.DB
+	pool             *pgxpool.Pool
+	lite             *sql.DB
+	lookup           *fido.Cache[string, *Sample]
+	records          *fido.Cache[string, *cachedRecord]
+	backfillProgress atomic.Pointer[BackfillProgressFn]
+	// app is a string, so it ends the GC's pointer-scan region rather than
+	// sitting in the middle of it: its length word is the first eight bytes
+	// the collector no longer has to walk. Hence last of the pointer-bearing
+	// fields, ahead of the pointer-free counters.
 	app                 AppName
-	lookup              *fido.Cache[string, *Sample]
-	records             *fido.Cache[string, *cachedRecord]
-	backfillProgress    atomic.Pointer[BackfillProgressFn]
 	lookupCounts        lookupCounters
 	recordCounts        recordCounters
 	corroborationCounts corroborationCounters
@@ -3502,6 +3506,13 @@ type ReconcileStats struct {
 	Revived           int64 // members whose containing archive reappeared
 }
 
+// relabelSkipChange is one relabel that also moved the sample's skip state,
+// held until the relabel transaction commits so a batch the breaker rejects is
+// never announced as though it happened.
+type relabelSkipChange struct {
+	sha, fromLabel, toLabel, fromSkip, toSkip string
+}
+
 // logRelabelSkipChange emits one Info line for a reconcile relabel that changed a
 // sample's skip — the cases worth surfacing per file: a previously missing or
 // unsupported sample revived by reappearing in a pool, or a sample newly in
@@ -3521,6 +3532,57 @@ func logRelabelSkipChange(sha, fromLabel, toLabel, fromSkip, toSkip string) {
 			"sha256", sha, "from_label", fromLabel, "to_label", toLabel,
 			"from_skip", fromSkip, "to_skip", toSkip)
 	}
+}
+
+const (
+	// minGuardedPopulation is the population below which the reconcile breakers
+	// do not apply. A corpus of a dozen files legitimately turns over wholesale;
+	// percentages only mean something once there is a body to take them of.
+	minGuardedPopulation = 100
+	// maxChangePercent is the share of the active top-level population a single
+	// reconcile may mark missing, or relabel out of its pool, before it is
+	// treated as evidence of a bad walk rather than a changed corpus.
+	maxChangePercent int64 = 15
+)
+
+// changeGuardLimit is the most rows one reconcile step may change out of a
+// population of n. Populations below minGuardedPopulation are unguarded, which
+// it expresses as "no limit" so callers stay a single comparison.
+func changeGuardLimit(n int64) int64 {
+	if n < minGuardedPopulation {
+		return math.MaxInt64
+	}
+	return n * maxChangePercent / 100
+}
+
+// eligibleStandaloneRoots counts the active top-level samples in each pool root
+// ("bad", "good", "pending", …). The sum is the population both reconcile
+// breakers measure against.
+func (db *DB) eligibleStandaloneRoots(ctx context.Context) (map[string]int64, error) {
+	if db.pool != nil {
+		return db.eligibleStandaloneRootsPG(ctx)
+	}
+	return db.eligibleStandaloneRootsSQLite(ctx)
+}
+
+// relabelFromPools applies step 2 of the reconcile, refusing the whole batch if
+// it would move more than maxChanged samples to a different label. The count is
+// only known after the work is done, so the guard runs inside the transaction
+// and rolls back.
+//
+// Only label changes are counted, not every relabelled row. The other thing
+// this step does is revive a sample that was marked missing and has now been
+// seen in a pool again, and a revive cannot be the damage the breaker is for:
+// it needs positive evidence that the file is present, it only ever moves a
+// record toward "here", and the rows it touches are by definition outside the
+// active population the limit is a share of. Mass mislabelling — a pool
+// remounted under another name, one pool shadowing another — is what shows up
+// as labels changing, and that is what gets stopped.
+func (db *DB) relabelFromPools(ctx context.Context, maxChanged int64) (int64, error) {
+	if db.pool != nil {
+		return db.relabelFromPoolsPG(ctx, maxChanged)
+	}
+	return db.relabelFromPoolsSQLite(ctx, maxChanged)
 }
 
 // ReconcilePools makes samples.label/skip authoritative against the current
@@ -3547,9 +3609,16 @@ func logRelabelSkipChange(sha, fromLabel, toLabel, fromSkip, toSkip string) {
 // then StageLocations) with every standalone file seen this walk. diskPath maps
 // a stored path to a local filesystem path so a stale standalone file can be
 // classified missing vs unsupported. Every transition is recorded in
-// label_events in the same transaction as the change. Aggregate and per-pool
-// missing rates above 15% abort before any missing write, on the assumption the
-// walk or storage topology is incomplete rather than legitimately emptied.
+// label_events in the same transaction as the change.
+//
+// Nothing here is bounded by a clock. A pass abandoned part-way has done no
+// useful work — every marking step is all-or-nothing by design — so a deadline
+// only guarantees the reconcile never lands, which is what left a renamed pool
+// unhealed for six days. What is bounded instead is blast radius: a walk that
+// enumerated too little must not be allowed to rewrite the corpus. Aggregate
+// and per-pool rates above maxChangePercent abort before any write, for both
+// kinds of damage a bad walk does — samples marked missing (step 3) and samples
+// relabelled out of their pool (step 2).
 //
 // markMissing=false (the --dataset-incomplete deployment) runs step 1 only: the
 // data root deliberately holds just part of the corpus, so a locally-absent file
@@ -3560,6 +3629,18 @@ func logRelabelSkipChange(sha, fromLabel, toLabel, fromSkip, toSkip string) {
 func (db *DB) ReconcilePools(ctx context.Context, diskPath func(string) string, markMissing bool) (ReconcileStats, error) {
 	var stats ReconcileStats
 	var err error
+
+	// The active top-level population, counted once per pass and by pool root.
+	// Both breakers divide by it, and it is the most expensive read here — the
+	// stale scan used to repeat the same count for itself.
+	eligibleByRoot, err := db.eligibleStandaloneRoots(ctx)
+	if err != nil {
+		return stats, fmt.Errorf("hopper: reconcile root counts: %w", err)
+	}
+	var eligible int64
+	for _, n := range eligibleByRoot {
+		eligible += n
+	}
 
 	// 1. Merge every newly observed standalone path into the active location
 	//    ledger. This is what makes a same-inode rename or an additional hardlink
@@ -3578,11 +3659,9 @@ func (db *DB) ReconcilePools(ctx context.Context, diskPath func(string) string, 
 
 	// 2. Relabel top-level, non-marker samples from the pools their standalone
 	//    copies live in this walk (demote bad→good, promote good→bad, both→conflict).
-	if db.pool != nil {
-		stats.Relabeled, err = db.relabelFromPoolsPG(ctx)
-	} else {
-		stats.Relabeled, err = db.relabelFromPoolsSQLite(ctx)
-	}
+	//    Guarded like the missing marking below: a walk that saw one pool and not
+	//    another would otherwise relabel the whole corpus into the pool it did see.
+	stats.Relabeled, err = db.relabelFromPools(ctx, changeGuardLimit(eligible))
 	if err != nil {
 		return stats, fmt.Errorf("hopper: reconcile relabel: %w", err)
 	}
@@ -3600,31 +3679,19 @@ func (db *DB) ReconcilePools(ctx context.Context, diskPath func(string) string, 
 	// 3. Find top-level samples (skip empty or 'conflict') not seen this walk,
 	//    with aggregate and per-pool guards checked before any missing write.
 	var stale []SampleLocationKey
-	var eligible int64
-	var eligibleByRoot map[string]int64
 	if db.pool != nil {
-		stale, eligible, err = db.staleStandaloneSamplesPG(ctx)
+		stale, err = db.staleStandaloneSamplesPG(ctx)
 	} else {
-		stale, eligible, err = db.staleStandaloneSamplesSQLite(ctx)
+		stale, err = db.staleStandaloneSamplesSQLite(ctx)
 	}
 	if err != nil {
 		return stats, fmt.Errorf("hopper: reconcile stale scan: %w", err)
 	}
-	if db.pool != nil {
-		eligibleByRoot, err = db.eligibleStandaloneRootsPG(ctx)
-	} else {
-		eligibleByRoot, err = db.eligibleStandaloneRootsSQLite(ctx)
-	}
-	if err != nil {
-		return stats, fmt.Errorf("hopper: reconcile root counts: %w", err)
-	}
-	const minBulkMarkGuardSamples = 100
-	const maxMissingPercent int64 = 15
-	if eligible >= minBulkMarkGuardSamples && int64(len(stale))*100 > eligible*maxMissingPercent {
+	if limit := changeGuardLimit(eligible); int64(len(stale)) > limit {
 		return stats, fmt.Errorf(
 			"hopper: reconcile: refusing to mark %d of %d standalone samples missing"+
 				" (>%d%%); this likely indicates an incomplete walk or storage failure",
-			len(stale), eligible, maxMissingPercent,
+			len(stale), eligible, maxChangePercent,
 		)
 	}
 	staleByRoot := make(map[string]int64)
@@ -3633,11 +3700,11 @@ func (db *DB) ReconcilePools(ctx context.Context, diskPath func(string) string, 
 	}
 	for root, missing := range staleByRoot {
 		total := eligibleByRoot[root]
-		if total >= minBulkMarkGuardSamples && missing*100 > total*maxMissingPercent {
+		if missing > changeGuardLimit(total) {
 			return stats, fmt.Errorf(
 				"hopper: reconcile: refusing to mark %d of %d %q pool samples missing"+
 					" (>%d%%); this likely indicates an incomplete pool walk or missing mount",
-				missing, total, root, maxMissingPercent)
+				missing, total, root, maxChangePercent)
 		}
 	}
 
@@ -5473,7 +5540,7 @@ func SightingFamily(source string) string {
 // valid reports whether the sighting carries the minimum to be stored: a source
 // and a subject that is a sha256 or a PURL. Callers should normalize a sha256 to
 // lowercase before this; a PURL is matched by its "pkg:" prefix.
-func (s Sighting) valid() bool {
+func (s *Sighting) valid() bool {
 	if s.Source == "" || s.Subject == "" {
 		return false
 	}

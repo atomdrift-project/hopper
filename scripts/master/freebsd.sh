@@ -29,7 +29,12 @@ SCAN_DIR="${SCAN_DIR:-../scan}"
 CLEAVE_DIR="${CLEAVE_DIR:-../cleave}"
 SAMPLES_GROUP="${SAMPLES_GROUP:-samples}"
 PULL_DISABLE="${PULL_DISABLE:-0}"
-DATASET_INCOMPLETE="${DATASET_INCOMPLETE:-1}"
+# The FreeBSD master holds the whole corpus — every pool the Linux host used to
+# serve was received here by the ZFS migration — so local absence is
+# authoritative and reconcile may mark and relabel. Set DATASET_INCOMPLETE=1 for
+# a host that deliberately carries only part of the corpus. ReconcilePools' own
+# breakers are what stop a short walk from acting on that authority.
+DATASET_INCOMPLETE="${DATASET_INCOMPLETE:-0}"
 REQUIRED_MOUNTS="${REQUIRED_MOUNTS:-bad,good,incoming,pending,review}"
 # Cloudflare Tunnel exposure. "auto" configures the tunnel only when a token is
 # supplied or one was stored by an earlier deploy, so hosts that serve Hopper

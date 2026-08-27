@@ -4378,8 +4378,11 @@ func (db *DB) observeStagedLocationsSQLite(ctx context.Context) (int64, error) {
 		SELECT w.sha256, w.path, '', s.filename, s.source, s.feed, s.ecosystem, s.mtime,
 		       ?, ?
 		FROM walk_staging w
-		JOIN samples s ON s.sha256 = w.sha256
-		WHERE s.parent = ''`, ts, ts)
+		JOIN samples s ON s.sha256 = w.sha256 AND s.parent = ''
+		WHERE NOT EXISTS (
+			SELECT 1 FROM sample_locations l
+			 WHERE l.sha256 = w.sha256 AND l.path = w.path
+		)`, ts, ts)
 	if err != nil {
 		return 0, err
 	}
@@ -4411,7 +4414,7 @@ func (db *DB) eligibleStandaloneRootsSQLite(ctx context.Context) (map[string]int
 	return out, rows.Err()
 }
 
-func (db *DB) relabelFromPoolsSQLite(ctx context.Context) (int64, error) {
+func (db *DB) relabelFromPoolsSQLite(ctx context.Context, maxChanged int64) (int64, error) {
 	ts := now()
 	tx, err := db.lite.BeginTx(ctx, nil)
 	if err != nil {
@@ -4460,23 +4463,41 @@ func (db *DB) relabelFromPoolsSQLite(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("hopper: relabel prune: %w", err)
 	}
 
-	// Surface the operationally interesting relabels — a missing/unsupported file
-	// revived by reappearing in a pool, or a new conflict — one line each. Drain
-	// and close before the writes below: SQLite forbids an Exec on a tx that still
-	// has open rows. Ordinary bad<->good moves are covered by the returned count.
+	// Breaker: refuse the batch before applying it. _relabel is already the
+	// exact change set, so the count is free here — unlike PG, which only
+	// learns it from the writable CTE's output.
+	var relabelled int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT count(*) FROM _relabel WHERE old_label <> new_label`).Scan(&relabelled); err != nil {
+		return 0, fmt.Errorf("hopper: relabel count: %w", err)
+	}
+	if relabelled > maxChanged {
+		return 0, fmt.Errorf(
+			"hopper: reconcile: refusing to move %d standalone samples to a different"+
+				" label (limit %d, %d%% of the active population); this likely indicates"+
+				" an incomplete pool walk or missing mount",
+			relabelled, maxChanged, maxChangePercent)
+	}
+
+	// Collect the operationally interesting relabels — a missing/unsupported file
+	// revived by reappearing in a pool, or a new conflict — and log them after the
+	// commit, so a rejected batch is never announced. Drain and close before the
+	// writes below: SQLite forbids an Exec on a tx that still has open rows.
+	// Ordinary bad<->good moves are covered by the returned count.
 	logRows, err := tx.QueryContext(ctx, `
 		SELECT sha256, old_label, new_label, old_skip, new_skip
 		FROM _relabel WHERE old_skip <> new_skip`)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: relabel log scan: %w", err)
 	}
+	var skipChanges []relabelSkipChange
 	for logRows.Next() {
-		var sha, oldLabel, newLabel, oldSkip, newSkip string
-		if err := logRows.Scan(&sha, &oldLabel, &newLabel, &oldSkip, &newSkip); err != nil {
+		var c relabelSkipChange
+		if err := logRows.Scan(&c.sha, &c.fromLabel, &c.toLabel, &c.fromSkip, &c.toSkip); err != nil {
 			logRows.Close() //nolint:errcheck,sqlclosecheck,gosec // best-effort cleanup before error return
 			return 0, fmt.Errorf("hopper: relabel log row: %w", err)
 		}
-		logRelabelSkipChange(sha, oldLabel, newLabel, oldSkip, newSkip)
+		skipChanges = append(skipChanges, c)
 	}
 	logRows.Close() //nolint:errcheck,gosec // best-effort cleanup
 	if err := logRows.Err(); err != nil {
@@ -4507,32 +4528,30 @@ func (db *DB) relabelFromPoolsSQLite(ctx context.Context) (int64, error) {
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("hopper: commit relabel: %w", err)
 	}
+	for _, c := range skipChanges {
+		logRelabelSkipChange(c.sha, c.fromLabel, c.toLabel, c.fromSkip, c.toSkip)
+	}
 	return n, nil
 }
 
-func (db *DB) staleStandaloneSamplesSQLite(ctx context.Context) ([]SampleLocationKey, int64, error) {
-	var eligible int64
-	if err := db.lite.QueryRowContext(ctx,
-		`SELECT count(*) FROM samples WHERE parent = '' AND skip IN ('', 'conflict')`).Scan(&eligible); err != nil {
-		return nil, 0, fmt.Errorf("hopper: stale count: %w", err)
-	}
+func (db *DB) staleStandaloneSamplesSQLite(ctx context.Context) ([]SampleLocationKey, error) {
 	rows, err := db.lite.QueryContext(ctx, `
 		SELECT s.sha256, s.path FROM samples s
 		WHERE s.parent = '' AND s.skip IN ('', 'conflict')
 		  AND s.sha256 NOT IN (SELECT sha256 FROM walk_staging)`)
 	if err != nil {
-		return nil, 0, fmt.Errorf("hopper: stale scan: %w", err)
+		return nil, fmt.Errorf("hopper: stale scan: %w", err)
 	}
 	defer rows.Close() //nolint:errcheck // best-effort cleanup
 	var out []SampleLocationKey
 	for rows.Next() {
 		var k SampleLocationKey
 		if err := rows.Scan(&k.SHA256, &k.Path); err != nil {
-			return nil, 0, fmt.Errorf("hopper: stale scan row: %w", err)
+			return nil, fmt.Errorf("hopper: stale scan row: %w", err)
 		}
 		out = append(out, k)
 	}
-	return out, eligible, rows.Err()
+	return out, rows.Err()
 }
 
 func (db *DB) setSkipWithEventSQLite(ctx context.Context, sha256, skip, reason string) (bool, error) {

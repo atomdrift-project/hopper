@@ -1984,10 +1984,6 @@ const (
 	// reliably finish inside six hours, and an interval shorter than the work
 	// it schedules is not an interval at all.
 	reconcileWalkInterval = 24 * time.Hour
-	// reconcileTimeout bounds a single ReconcilePools pass. A reconcile that
-	// once ran unbounded for over an hour stranded all ingestion; capping it
-	// means a pathological pass is abandoned and retried next cycle instead.
-	reconcileTimeout = 20 * time.Minute
 )
 
 // maxFileSize is the per-file byte cap applied during enumeration, hashing,
@@ -2100,9 +2096,7 @@ func (p *walkPass) run(ctx context.Context, chs []enumerationStream, cutoff time
 
 	// Reconcile the derived label/skip cache against the pools, but only
 	// after a complete staged walk — a cancelled (partial) walk would make
-	// present files look missing. Bounded by reconcileTimeout so a
-	// pathological pass is abandoned instead of stranding the walk loop (and
-	// with it all ingestion), as an unbounded reconcile once did.
+	// present files look missing.
 	if stageOK && walkComplete && ctx.Err() == nil {
 		reconcilePools(ctx, p.db, p.dirs, p.markMissing)
 	} else if stageOK && ctx.Err() == nil {
@@ -2206,8 +2200,7 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	}
 
 	// Initial pass: a full walk (pre-started enumeration channels) that also
-	// reconciles pools. Reconcile is bounded by reconcileTimeout, so it can no
-	// longer strand startup the way an unbounded pass once did.
+	// reconciles pools.
 	//
 	// Whether it reconciles is decided by WHEN reconcile last completed, not by
 	// the fact of restarting. It used to run unconditionally, so that a host
@@ -2295,19 +2288,25 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 }
 
 // reconcilePools anti-joins the just-staged present-set against samples to flag
-// moved/missing/relabeled files. It is bounded by reconcileTimeout: an
-// unbounded pass once ran for over an hour and stranded all ingestion, so a
-// pathological pass is now abandoned and retried next cycle. Only called after a
-// complete, staged walk. markMissing=false (--dataset-incomplete) keeps the
-// relabel pass but suppresses the missing/unsupported marking and cascade.
+// moved/missing/relabeled files. Only called after a complete, staged walk.
+// markMissing=false (--dataset-incomplete) keeps the relabel pass but suppresses
+// the missing/unsupported marking and cascade.
+//
+// It runs to completion; the pass is not on a clock. It used to be capped at 20
+// minutes on the theory that a pathological pass would be abandoned and retried
+// next cycle, but a reconcile is all-or-nothing — an abandoned one leaves the
+// corpus exactly as it found it, and the once-a-day guard then declined to try
+// again for another day. On this corpus that combination meant no reconcile
+// landed for six days, and a pool renamed on disk was never re-learned, which
+// starved the whole worker fleet. Bounding blast radius (see ReconcilePools'
+// breakers) is the protection that actually holds; bounding wall-clock only
+// guaranteed the work never finished.
 func reconcilePools(ctx context.Context, db *hopper.DB, dirs []struct{ dir, label string }, markMissing bool) {
 	dataRoot := filepath.Dir(dirs[0].dir)
 	if err := validateRequiredMounts(dataRoot, requiredReconcileMounts); err != nil {
 		slog.Error("reconcile skipped: sample storage is not authoritative", "error", err)
 		return
 	}
-	ctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
-	defer cancel()
 	toDiskPath := func(path string) string {
 		return sampleDiskPath(dataRoot, filepath.FromSlash(path))
 	}

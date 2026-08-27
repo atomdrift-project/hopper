@@ -553,6 +553,89 @@ func TestClaimJobsBigArchiveDistribution(t *testing.T) {
 	}
 }
 
+// TestClaimJobsUnservableTierFallsThrough pins the starvation bug: a
+// high-priority tier whose rows all fail validation must not consume the batch
+// and hide the tiers below it. In production the sighted tier — drained before
+// the main backlog, ordered FIFO by id — accumulated a head of rows whose bytes
+// were never fetched, and answered every poll from every worker with an empty
+// job list while 600k servable samples waited behind it.
+//
+// Staged here on the upload tier, which is drained first and, unlike the
+// backlog tier, selects on source rather than "never analyzed" — so the dead
+// rows are reached in a fixed order rather than wherever a random SHA pivot
+// happens to land.
+func TestClaimJobsUnservableTierFallsThrough(t *testing.T) {
+	ctx := context.Background()
+	db, err := hopper.Open(ctx, filepath.Join(t.TempDir(), "t.db"), "hopper-test")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	// A data root holding only the backlog sample. The upload rows point at
+	// paths that were never written — a citation whose artifact was never
+	// fetched, or a pool renamed out from under the stored paths.
+	root := t.TempDir()
+	pool := filepath.Join(root, "pending")
+	if err := os.MkdirAll(pool, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const goodSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	body := []byte("servable")
+	if err := os.WriteFile(filepath.Join(pool, "real.bin"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertSample(ctx, &hopper.Sample{
+		SHA256: goodSHA, Source: "test", Label: "unknown", LabelSource: "test",
+		Path: "pending/real.bin", SizeBytes: int64(len(body)),
+	}); err != nil {
+		t.Fatalf("insert backlog sample: %v", err)
+	}
+	// Exactly as many dead rows as the poll asks for: enough to fill the batch
+	// on their own (which is what used to end the search), and none left over to
+	// reappear as backlog candidates and make the assertion depend on where the
+	// random SHA pivot lands.
+	const dead = 4
+	for i := range dead {
+		sha := fmt.Sprintf("%064x", i)
+		if err := db.InsertSample(ctx, &hopper.Sample{
+			SHA256: sha, Source: "upload", Label: "unknown", LabelSource: "test",
+			Path: fmt.Sprintf("pending/gone/%s", sha), SizeBytes: 512,
+		}); err != nil {
+			t.Fatalf("insert dead %d: %v", i, err)
+		}
+	}
+
+	api := &apiServer{
+		tracker: newWorkerTracker(), db: db,
+		dataRoot: root, allowedDirs: []string{pool},
+	}
+
+	jobs, err := api.claimJobs(ctx, "w", dead, nil, 0, 4)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].SHA256 != goodSHA {
+		t.Fatalf("claim = %+v, want the one servable backlog sample", jobs)
+	}
+	if jobs[0].Tier != tierUnanalyzed {
+		t.Fatalf("tier = %q, want %q", jobs[0].Tier, tierUnanalyzed)
+	}
+
+	// Local disk is authoritative here, so the rows were marked on the way past
+	// and the tier drains instead of re-offering the same dead head forever.
+	cands, err := db.UploadCandidates(ctx, 64)
+	if err != nil {
+		t.Fatalf("upload candidates: %v", err)
+	}
+	if len(cands) != 0 {
+		t.Fatalf("upload tier still holds %d unservable rows, want 0", len(cands))
+	}
+}
+
 func TestTrimClientError(t *testing.T) {
 	in := "cleave failed:\n\n   Failed to load traits\tfrom /usr/local/share/litmus/traits due to many validation errors while parsing the installed bundle"
 	got := trimClientError(in)

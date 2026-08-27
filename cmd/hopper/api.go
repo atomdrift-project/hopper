@@ -57,11 +57,17 @@ type apiServer struct {
 	// Grouped with the pointers rather than beside readOnly, which is where it
 	// reads more naturally: an interface is two words of pointer, and trailing
 	// it after the scalars below stretches the GC's pointer scan across them.
-	relay               http.Handler
+	relay http.Handler
+	// emptyTierWarnedAt throttles the "tier had no servable work" warning to one
+	// line per tier per interval; the condition it reports is by nature one that
+	// repeats on every poll from every worker until an operator fixes it.
+	// Pointer-bearing, so it sits with the pointers above the scalars.
+	emptyTierWarnedAt   map[string]time.Time
 	dataRoot            string
 	allowedDirs         []string
 	forceRescanPrefixes []string
 	requiredMounts      []string
+	emptyTierMu         sync.Mutex
 	rescanAge           time.Duration
 	ready               atomic.Bool
 	datasetIncomplete   bool
@@ -900,6 +906,9 @@ const (
 	maxClaimCount = 32
 	claimExpiry   = 30 * time.Minute // base (minimum) claim lease
 	staleClaimAge = 2 * time.Hour
+	// emptyTierWarnInterval is how often one claim tier may report that it held
+	// rows but produced no servable job.
+	emptyTierWarnInterval = time.Minute
 	// leaseBytesPerSecond scales a large sample's claim lease past claimExpiry so
 	// an in-progress multi-GB scan is not re-claimed mid-flight. A deliberately
 	// low, pessimistic scan-rate floor (not a real throughput figure) so the
@@ -1579,37 +1588,34 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Files replaced or removed since indexing are released back from the
-	// in-memory claim set and marked skip so they don't block the queue.
-	jobs = s.validateClaimJobs(ctx, jobs, worker)
-
+	// Every job here is already validated: claimJobs drops unservable rows
+	// inside each tier so an unservable tier cannot mask the ones below it.
+	//
 	// Count this hand-out against each sample. Poison samples that wedge a
 	// worker never report a result, so the attempt counter is the only signal
 	// that catches them; the reaper skips a sample once it crosses
 	// hopper.MaxClaimAttempts. Best-effort: a failed bump must not deny work.
-	if len(jobs) > 0 {
-		claimedSHAs := make([]string, len(jobs))
-		for i := range jobs {
-			claimedSHAs[i] = jobs[i].SHA256
-		}
-		if err := s.db.IncrementAttempts(ctx, claimedSHAs); err != nil {
-			//nolint:gosec // worker sanitized by validWorkerName
-			slog.Warn("increment claim attempts failed",
-				"worker", worker, "count", len(claimedSHAs), "error", err)
-		}
+	claimedSHAs := make([]string, len(jobs))
+	for i := range jobs {
+		claimedSHAs[i] = jobs[i].SHA256
+	}
+	if err := s.db.IncrementAttempts(ctx, claimedSHAs); err != nil {
+		//nolint:gosec // worker sanitized by validWorkerName
+		slog.Warn("increment claim attempts failed",
+			"worker", worker, "count", len(claimedSHAs), "error", err)
+	}
 
-		// Stamp which claimed samples carry a provenance sidecar, so the worker
-		// fetches the registry record (/api/provenance/{sha256}) only for those.
-		// Best-effort: on a probe failure HasProvenance stays false and the
-		// worker simply skips the fetch — it never blocks handing out work.
-		if withProv, err := s.db.ShasWithProvenance(ctx, claimedSHAs); err != nil {
-			//nolint:gosec // worker sanitized by validWorkerName
-			slog.Warn("provenance presence probe failed",
-				"worker", worker, "count", len(claimedSHAs), "error", err)
-		} else {
-			for i := range jobs {
-				jobs[i].HasProvenance = withProv[jobs[i].SHA256]
-			}
+	// Stamp which claimed samples carry a provenance sidecar, so the worker
+	// fetches the registry record (/api/provenance/{sha256}) only for those.
+	// Best-effort: on a probe failure HasProvenance stays false and the
+	// worker simply skips the fetch — it never blocks handing out work.
+	if withProv, err := s.db.ShasWithProvenance(ctx, claimedSHAs); err != nil {
+		//nolint:gosec // worker sanitized by validWorkerName
+		slog.Warn("provenance presence probe failed",
+			"worker", worker, "count", len(claimedSHAs), "error", err)
+	} else {
+		for i := range jobs {
+			jobs[i].HasProvenance = withProv[jobs[i].SHA256]
 		}
 	}
 
@@ -1651,6 +1657,16 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 // that is merely unreachable right now is released unmarked, so it comes back
 // when the mount does. Filters in place: the returned slice aliases jobs.
 func (s *apiServer) validateClaimJobs(ctx context.Context, jobs []hopper.ClaimJob, worker string) []hopper.ClaimJob {
+	// Nothing to validate against. openKnownSampleFile admits a path only if it
+	// resolves under one of the discovered pool directories, so with none of
+	// them known every job would be rejected — and, where local disk is
+	// authoritative, every sample marked missing. That is a false verdict about
+	// the corpus rather than a fact about it, so hand the batch back untouched
+	// and let the fetch fail honestly if the bytes really are absent. Reachable
+	// before pool discovery finishes and in servers configured without --data.
+	if len(s.allowedDirs) == 0 {
+		return jobs
+	}
 	var unclaimSHAs []string
 	validated := jobs[:0]
 	for _, j := range jobs {
@@ -2076,140 +2092,153 @@ func stampTier(jobs []hopper.ClaimJob, tier string) []hopper.ClaimJob {
 	return jobs
 }
 
-// claimJobs walks the priority tiers (interactive uploads → forced rescans →
-// sighted backlog → unanalyzed backlog → path-prefix rescans → stale traits)
-// in order, fetching candidate batches from the DB and claiming the first
-// count that aren't held by another worker. Over-fetches so that
-// contention with other concurrent pollers doesn't starve a requester at
-// the head of the queue.
+// claimTier is one priority band of work plus the conditions under which this
+// worker may be offered it. Expressing the ladder as data rather than as a
+// dozen near-identical blocks is what lets claimJobs apply one rule — a tier
+// contributes only work that is actually servable — uniformly to all of them.
+type claimTier struct {
+	// candidates fetches up to limit rows from this tier, worst-first or
+	// FIFO as the tier's own ordering dictates.
+	candidates func(ctx context.Context, limit int) ([]hopper.ClaimJob, error)
+	// name is the tier label stamped on each job for the hand-out age metric.
+	name string
+	// minSlots, when non-zero, withholds the tier from workers advertising
+	// fewer slots — big archives would monopolise a small node.
+	minSlots int
+	// interleave spreads size classes across the batch. Only the main backlog
+	// wants it; every other tier has a deliberate ordering to preserve.
+	interleave bool
+}
+
+// claimLadder is the priority order work is offered in: interactive uploads →
+// operator rescans → sighted backlog → big archives → unanalyzed backlog →
+// repair → path-prefix rescans → stale traits. A tier is skipped entirely when
+// it is not applicable to this worker or not configured on this server.
+func (s *apiServer) claimLadder(slots int) []claimTier {
+	ladder := []claimTier{
+		// Tier U: interactive uploads (Source="upload"). Drained ahead of every
+		// other tier so a user staring at the /file/<sha> page gets their result
+		// as fast as a worker can produce it.
+		{name: tierUpload, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
+			return s.db.UploadCandidates(ctx, n)
+		}},
+		// Tier 0: operator-initiated rescans (RequestRescan). Drained before the
+		// unanalyzed backlog so a user-requested re-queue jumps the line instead
+		// of waiting for its SHA prefix to come up in the Tier 1 rotation.
+		{name: tierForcedRescan, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
+			return s.db.ForcedRescanCandidates(ctx, s.hopperStart, n)
+		}},
+		// Tier 1s: pending samples an external threat feed has already cited.
+		// Drained before the unanalyzed backlog because Tier 1 hands work out in
+		// random sha256 order: a sighted sample entering a 600k-row backlog waits
+		// for its prefix to come up, which is days, and it is the one sample we
+		// already have outside evidence against.
+		{name: tierSighted, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
+			return s.db.SightedCandidates(ctx, s.hopperStart, n)
+		}},
+		// Tier B: big archives (multi-GB ISOs) for capable workers only. Rare and
+		// large, a big archive seldom falls inside a busy worker's small
+		// random-pivot poll window, so without a dedicated lookup it could sit
+		// unscanned for a long time.
+		{name: tierBigArchive, minSlots: bigArchiveMinSlots, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
+			return s.db.BigArchiveCandidates(ctx, bigArchiveBytes, s.hopperStart, n)
+		}},
+		// Tier 1: the main unanalyzed-samples queue. Candidates arrive in random
+		// SHA order (pivot scan), so interleaving size classes loses nothing and
+		// guarantees every batch mixes small and large work.
+		{name: tierUnanalyzed, interleave: true, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
+			return s.db.UnanalyzedCandidates(ctx, s.hopperStart, n)
+		}},
+		// Tier 1b: repair jobs flagged via the rescan column. Drained after the
+		// unanalyzed backlog so bulk repair never starves fresh ingestion.
+		{name: tierRepair, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
+			return s.db.RepairCandidates(ctx, n)
+		}},
+	}
+	if len(s.forceRescanPrefixes) > 0 {
+		ladder = append(ladder, claimTier{name: tierPathRescan, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
+			return s.db.ForceRescanCandidates(ctx, s.hopperStart, s.forceRescanPrefixes, n)
+		}})
+	}
+	if v := s.TraitsVersion(); v != "" {
+		ladder = append(ladder, claimTier{name: tierStaleTraits, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
+			return s.db.StaleTraitsCandidates(ctx, v, s.rescanAge, s.hopperStart, n)
+		}})
+	}
+	out := ladder[:0]
+	for _, t := range ladder {
+		if t.minSlots == 0 || slots >= t.minSlots {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// claimJobs walks the priority ladder in order and returns up to count jobs
+// this worker can actually run. Over-fetches candidates so that contention with
+// other concurrent pollers doesn't starve a requester at the head of the queue.
+//
+// A tier only counts toward `count` by what survives validation. That is the
+// whole point of validating here rather than in the caller: a tier whose rows
+// are all unservable — bytes missing, a pool renamed out from under the stored
+// paths — used to fill the batch, satisfy the early return, and hide every tier
+// below it. Workers then polled a 600k-row backlog and were told, correctly and
+// uselessly, that there were no jobs. Priority means "offered first", not
+// "allowed to block everything behind it when it has nothing to give".
 func (s *apiServer) claimJobs(
 	ctx context.Context, worker string, count int, tools *workerToolSet, maxBytes int64, slots int,
 ) ([]hopper.ClaimJob, error) {
-	want := count
-	overfetch := max(count*candidateOverfetch, minCandidates)
-
-	// Tier U: interactive uploads (Source="upload"). Drained ahead of
-	// every other tier so a user staring at the /file/<sha> page gets
-	// their result as fast as a worker can produce it.
-	cands, err := s.db.UploadCandidates(ctx, overfetch)
-	if err != nil {
-		return nil, err
-	}
-	cands = filterCandidates(cands, tools, maxBytes, slots)
-	out := stampTier(s.tracker.tryClaimBatch(cands, worker, claimExpiry, want), tierUpload)
-	if len(out) >= count {
-		return out, nil
-	}
-
-	// Tier 0: operator-initiated rescans (RequestRescan). Drained before
-	// the unanalyzed backlog so a user-requested re-queue jumps the line
-	// instead of waiting for its SHA prefix to come up in the Tier 1
-	// random-pivot rotation.
-	want = count - len(out)
-	cands, err = s.db.ForcedRescanCandidates(ctx, s.hopperStart, overfetch)
-	if err != nil {
-		return out, err
-	}
-	cands = filterCandidates(cands, tools, maxBytes, slots)
-	out = append(out, stampTier(s.tracker.tryClaimBatch(cands, worker, claimExpiry, want), tierForcedRescan)...)
-	if len(out) >= count {
-		return out, nil
-	}
-
-	// Tier 1s: pending samples an external threat feed has already cited. Drained
-	// before the unanalyzed backlog because Tier 1 hands work out in random sha256
-	// order: a sighted sample entering a 537k-row backlog waits for its prefix to
-	// come up, which is days, and it is the one sample we already have outside
-	// evidence against. The tier is small (3,423 rows in production on
-	// 2026-08-24) and self-draining, so it cannot starve the tiers below it for
-	// long.
-	//
-	// After Tier 0, not before: an operator's explicit rescan and a user watching
-	// an upload page are human intent, and human intent outranks a feed hit.
-	want = count - len(out)
-	cands, err = s.db.SightedCandidates(ctx, s.hopperStart, overfetch)
-	if err != nil {
-		return out, err
-	}
-	cands = filterCandidates(cands, tools, maxBytes, slots)
-	out = append(out, stampTier(s.tracker.tryClaimBatch(cands, worker, claimExpiry, want), tierSighted)...)
-	if len(out) >= count {
-		return out, nil
-	}
-
-	// Tier B: big archives (multi-GB ISOs) for capable workers only. Rare and
-	// large, a big archive seldom falls inside a busy worker's small random-pivot
-	// poll window (Tier 1), so without a dedicated lookup it would be claimed
-	// almost only by large startup polls and could sit unscanned for a long time.
-	// A capable worker drains any pending one up front, regardless of poll size;
-	// the slot gate keeps big archives off small workers they would monopolize.
-	if slots >= bigArchiveMinSlots {
-		want = count - len(out)
-		cands, err = s.db.BigArchiveCandidates(ctx, bigArchiveBytes, s.hopperStart, want*candidateOverfetch)
+	var out []hopper.ClaimJob
+	for _, tier := range s.claimLadder(slots) {
+		want := count - len(out)
+		if want <= 0 {
+			break
+		}
+		cands, err := tier.candidates(ctx, max(want*candidateOverfetch, minCandidates))
 		if err != nil {
 			return out, err
 		}
 		cands = filterCandidates(cands, tools, maxBytes, slots)
-		out = append(out, stampTier(s.tracker.tryClaimBatch(cands, worker, claimExpiry, want), tierBigArchive)...)
-		if len(out) >= count {
-			return out, nil
+		if tier.interleave {
+			cands = interleaveBySizeClass(cands)
 		}
-	}
-
-	// Tier 1: the main unanalyzed-samples queue. Candidates arrive in random
-	// SHA order (pivot scan), so interleaving size classes loses nothing and
-	// guarantees every batch mixes small and large work — the other tiers keep
-	// their deliberate orderings (upload FIFO, operator FIFO, staleness).
-	want = count - len(out)
-	cands, err = s.db.UnanalyzedCandidates(ctx, s.hopperStart, want*candidateOverfetch)
-	if err != nil {
-		return out, err
-	}
-	cands = interleaveBySizeClass(filterCandidates(cands, tools, maxBytes, slots))
-	out = append(out, stampTier(s.tracker.tryClaimBatch(cands, worker, claimExpiry, want), tierUnanalyzed)...)
-	if len(out) >= count {
-		return out, nil
-	}
-
-	// Tier 1b: repair jobs flagged via the rescan column (e.g. archives left
-	// memberless by the former async explosion — re-analysis regenerates members
-	// atomically via StoreResult). Drained after the unanalyzed backlog so bulk
-	// repair never starves fresh ingestion, but ahead of path-prefix and
-	// stale-traits rescans.
-	want = count - len(out)
-	cands, err = s.db.RepairCandidates(ctx, want*candidateOverfetch)
-	if err != nil {
-		return out, err
-	}
-	cands = filterCandidates(cands, tools, maxBytes, slots)
-	out = append(out, stampTier(s.tracker.tryClaimBatch(cands, worker, claimExpiry, want), tierRepair)...)
-	if len(out) >= count {
-		return out, nil
-	}
-
-	if len(s.forceRescanPrefixes) > 0 {
-		want = count - len(out)
-		cands, err = s.db.ForceRescanCandidates(ctx, s.hopperStart, s.forceRescanPrefixes, want*candidateOverfetch)
-		if err != nil {
-			return out, err
+		claimed := stampTier(s.tracker.tryClaimBatch(cands, worker, claimExpiry, want), tier.name)
+		if len(claimed) == 0 {
+			continue
 		}
-		cands = filterCandidates(cands, tools, maxBytes, slots)
-		out = append(out, stampTier(s.tracker.tryClaimBatch(cands, worker, claimExpiry, want), tierPathRescan)...)
-		if len(out) >= count {
-			return out, nil
+		// Files replaced or removed since indexing are released back from the
+		// in-memory claim set here, and marked skip where local disk is
+		// authoritative, so they stop re-entering the queue.
+		usable := s.validateClaimJobs(ctx, claimed, worker)
+		if len(usable) == 0 {
+			s.warnEmptyTier(worker, tier.name, len(claimed))
+			continue
 		}
-	}
-
-	if s.TraitsVersion() != "" {
-		want = count - len(out)
-		cands, err = s.db.StaleTraitsCandidates(ctx, s.TraitsVersion(), s.rescanAge, s.hopperStart, want*candidateOverfetch)
-		if err != nil {
-			return out, err
-		}
-		cands = filterCandidates(cands, tools, maxBytes, slots)
-		out = append(out, stampTier(s.tracker.tryClaimBatch(cands, worker, claimExpiry, want), tierStaleTraits)...)
+		out = append(out, usable...)
 	}
 	return out, nil
+}
+
+// warnEmptyTier reports a tier that held claimable rows but could not produce a
+// single servable job, throttled to one line per tier per emptyTierWarnInterval.
+// Unthrottled this fires on every poll from every worker for as long as the
+// condition lasts, which is precisely when the log needs to stay readable.
+func (s *apiServer) warnEmptyTier(worker, tier string, claimed int) {
+	s.emptyTierMu.Lock()
+	last, seen := s.emptyTierWarnedAt[tier]
+	now := time.Now()
+	if seen && now.Sub(last) < emptyTierWarnInterval {
+		s.emptyTierMu.Unlock()
+		return
+	}
+	if s.emptyTierWarnedAt == nil {
+		s.emptyTierWarnedAt = make(map[string]time.Time)
+	}
+	s.emptyTierWarnedAt[tier] = now
+	s.emptyTierMu.Unlock()
+	//nolint:gosec // worker is sanitized by validWorkerName
+	slog.Warn("claim tier had no servable work; falling through to lower tiers",
+		"tier", tier, "worker", worker, "claimed_then_dropped", claimed)
 }
 
 // permanentPGError reports whether err is a deterministic PostgreSQL error

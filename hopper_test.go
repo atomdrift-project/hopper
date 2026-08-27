@@ -5077,6 +5077,56 @@ func TestReconcilePoolsFifteenPercentPerPoolGuard(t *testing.T) {
 	}
 }
 
+// TestReconcilePoolsFifteenPercentRelabelGuard covers the other half of a bad
+// walk: not files that vanished, but files seen in the wrong pool. A mount
+// shadowing bad/ with good/ would relabel the whole corpus benign in a single
+// pass — worse than any amount of missing-marking — so it trips the same
+// breaker and the batch is rolled back whole.
+func TestReconcilePoolsFifteenPercentRelabelGuard(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	for i := range 1000 {
+		sha := fmt.Sprintf("relabel-guard-%04d", i)
+		// Recorded as bad/, seen in good/ this walk: a pool-wide flip, far past 15%.
+		mustInsert(t, ctx, db, &Sample{SHA256: sha, Path: fmt.Sprintf("bad/%04d.bin", i), Label: "bad"})
+		if err := db.StageLocations(ctx, []SampleLocationKey{
+			{SHA256: sha, Path: fmt.Sprintf("good/%04d.bin", i)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := db.ReconcilePools(ctx, func(p string) string { return p }, true)
+	if err == nil || !strings.Contains(err.Error(), "different label") {
+		t.Fatalf("ReconcilePools error = %v, want relabel guard", err)
+	}
+	if got := labelOf(t, ctx, db, "relabel-guard-0000"); got != "bad" {
+		t.Fatalf("guarded sample label = %q, want bad (batch rolled back)", got)
+	}
+}
+
+// TestReconcilePoolsRelabelGuardAllowsRevival checks the guard does not block a
+// revive. A sample marked missing sits outside the active population the limit
+// is a share of, so counting revives would make the limit unmeetable exactly
+// when storage came back — the case the reconcile exists to handle.
+func TestReconcilePoolsRelabelGuardAllowsRevival(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	for i := range 200 {
+		sha := fmt.Sprintf("revive-%04d", i)
+		path := fmt.Sprintf("bad/%04d.bin", i)
+		mustInsert(t, ctx, db, &Sample{SHA256: sha, Path: path, Label: "bad", Skip: "missing"})
+		if err := db.StageLocations(ctx, []SampleLocationKey{{SHA256: sha, Path: path}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.ReconcilePools(ctx, func(p string) string { return p }, true); err != nil {
+		t.Fatalf("ReconcilePools() = %v, want revival to pass the guard", err)
+	}
+	if got := skipOf(t, ctx, db, "revive-0000"); got != "" {
+		t.Fatalf("revived sample skip = %q, want cleared", got)
+	}
+}
+
 // TestReconcilePoolsBadUnknownGood walks a sample through bad/ → unknown/ →
 // good/. unknown/ asserts no pool, so the label is retained there; the final
 // good/ placement demotes it.

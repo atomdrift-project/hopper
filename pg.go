@@ -6861,6 +6861,15 @@ func (db *DB) stageLocationsPG(ctx context.Context, keys []SampleLocationKey) er
 	return nil
 }
 
+// observeStagedLocationsPG records every staged path that the location ledger
+// does not already hold. The NOT EXISTS is what makes the pass affordable: on a
+// steady-state walk essentially every staged row is already known, and the
+// anti-join settles each one with a probe of the UNIQUE (sha256, path) index
+// instead of a speculative insert that has to be created and then killed. That
+// difference is the whole cost of the step — with ON CONFLICT alone it was
+// twelve million doomed inserts per pass, which is what timed out for six days
+// running and left renamed pools unlearned. ON CONFLICT stays as the guard for
+// duplicates inside this one batch, which the anti-join cannot see.
 func (db *DB) observeStagedLocationsPG(ctx context.Context) (int64, error) {
 	tag, err := db.pool.Exec(ctx, `
 		INSERT INTO sample_locations
@@ -6869,8 +6878,11 @@ func (db *DB) observeStagedLocationsPG(ctx context.Context) (int64, error) {
 		SELECT w.sha256, w.path, '', s.filename, s.source, s.feed, s.ecosystem, s.mtime,
 		       now(), now()
 		FROM walk_staging w
-		JOIN samples s ON s.sha256 = w.sha256
-		WHERE s.parent = ''
+		JOIN samples s ON s.sha256 = w.sha256 AND s.parent = ''
+		WHERE NOT EXISTS (
+			SELECT 1 FROM sample_locations l
+			 WHERE l.sha256 = w.sha256 AND l.path = w.path
+		)
 		ON CONFLICT (sha256, path) DO NOTHING`)
 	if err != nil {
 		return 0, err
@@ -6900,12 +6912,23 @@ func (db *DB) eligibleStandaloneRootsPG(ctx context.Context) (map[string]int64, 
 	return out, rows.Err()
 }
 
-func (db *DB) relabelFromPoolsPG(ctx context.Context) (int64, error) {
+func (db *DB) relabelFromPoolsPG(ctx context.Context, maxChanged int64) (int64, error) {
+	// The breaker needs a count the statement only yields once it has run, so
+	// the work happens inside an explicit transaction and is thrown away if it
+	// turns out to be too much. Doing it the other way — count first, then
+	// relabel — would need the same expensive aggregate twice and still race a
+	// concurrent walk between the two.
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: relabel begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
 	// One statement: a writable CTE updates the changed rows and the final
 	// INSERT audits them. PG executes every data-modifying CTE exactly once, so
 	// the UPDATE runs even though the INSERT reads pre-update values from
 	// `changed`. Atomic by construction.
-	rows, err := db.pool.Query(ctx, `
+	rows, err := tx.Query(ctx, `
 		WITH pools AS (
 			SELECT sha256,
 				bool_or(path LIKE 'bad/%')     AS in_bad,
@@ -6950,49 +6973,63 @@ func (db *DB) relabelFromPoolsPG(ctx context.Context) (int64, error) {
 	}
 	defer rows.Close()
 
-	// Log the operationally interesting relabels (a missing/unsupported file
-	// revived by reappearing in a pool, or a new conflict) one line each; the
-	// count of all relabels — plain bad<->good moves included — is returned.
-	var n int64
+	// Collect before logging: these lines describe changes that only become
+	// true at commit, and the breaker below may still discard the batch.
+	var n, relabelled int64
+	var skipChanges []relabelSkipChange
 	for rows.Next() {
-		var sha, fromLabel, toLabel, fromSkip, toSkip string
-		if err := rows.Scan(&sha, &fromLabel, &toLabel, &fromSkip, &toSkip); err != nil {
+		var c relabelSkipChange
+		if err := rows.Scan(&c.sha, &c.fromLabel, &c.toLabel, &c.fromSkip, &c.toSkip); err != nil {
 			return 0, fmt.Errorf("hopper: relabel scan: %w", err)
 		}
 		n++
-		if fromSkip != toSkip {
-			logRelabelSkipChange(sha, fromLabel, toLabel, fromSkip, toSkip)
+		if c.fromLabel != c.toLabel {
+			relabelled++
+		}
+		if c.fromSkip != c.toSkip {
+			skipChanges = append(skipChanges, c)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return 0, fmt.Errorf("hopper: relabel: %w", err)
 	}
+	if relabelled > maxChanged {
+		return 0, fmt.Errorf(
+			"hopper: reconcile: refusing to move %d standalone samples to a different"+
+				" label (limit %d, %d%% of the active population); this likely indicates"+
+				" an incomplete pool walk or missing mount",
+			relabelled, maxChanged, maxChangePercent)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("hopper: relabel commit: %w", err)
+	}
+	// Log the operationally interesting relabels (a missing/unsupported file
+	// revived by reappearing in a pool, or a new conflict) one line each; the
+	// count of all relabels — plain bad<->good moves included — is returned.
+	for _, c := range skipChanges {
+		logRelabelSkipChange(c.sha, c.fromLabel, c.toLabel, c.fromSkip, c.toSkip)
+	}
 	return n, nil
 }
 
-func (db *DB) staleStandaloneSamplesPG(ctx context.Context) ([]SampleLocationKey, int64, error) {
-	var eligible int64
-	if err := db.pool.QueryRow(ctx,
-		`SELECT count(*) FROM samples WHERE parent = '' AND skip IN ('', 'conflict')`).Scan(&eligible); err != nil {
-		return nil, 0, fmt.Errorf("hopper: stale count: %w", err)
-	}
+func (db *DB) staleStandaloneSamplesPG(ctx context.Context) ([]SampleLocationKey, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT s.sha256, s.path FROM samples s
 		WHERE s.parent = '' AND s.skip IN ('', 'conflict')
 		  AND NOT EXISTS (SELECT 1 FROM walk_staging w WHERE w.sha256 = s.sha256)`)
 	if err != nil {
-		return nil, 0, fmt.Errorf("hopper: stale scan: %w", err)
+		return nil, fmt.Errorf("hopper: stale scan: %w", err)
 	}
 	defer rows.Close()
 	var out []SampleLocationKey
 	for rows.Next() {
 		var k SampleLocationKey
 		if err := rows.Scan(&k.SHA256, &k.Path); err != nil {
-			return nil, 0, fmt.Errorf("hopper: stale scan row: %w", err)
+			return nil, fmt.Errorf("hopper: stale scan row: %w", err)
 		}
 		out = append(out, k)
 	}
-	return out, eligible, rows.Err()
+	return out, rows.Err()
 }
 
 func (db *DB) setSkipWithEventPG(ctx context.Context, sha256, skip, reason string) (bool, error) {
