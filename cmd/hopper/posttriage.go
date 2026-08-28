@@ -146,17 +146,16 @@ const (
 // from shadowing bad/foraged-quarantine/.
 //
 // uploads/ is here because a scanner push is a discovery too — a fetched
-// dependency is often the first time anyone has seen those bytes. Without it a
-// ruled upload matched no root and fell back to the basename, collapsing the
-// sha shard (uploads/ab/cd/x.tgz) into a flat good/foraged-promote/x.tgz where
-// two packages sharing a filename would collide.
+// dependency is often the first time anyone has seen those bytes, so its
+// producer component belongs to the source tree rather than to the subpath the
+// destination preserves.
 // The destination trees are roots too, because a ruling is not final: a sample
 // promoted to good/foraged-promote/npm/foo.tgz and later demoted, or demoted to
 // bad/foraged-quarantine and later acquitted, re-enters rulingPlan from its
-// destination. Without them that round trip matched no root and flattened an
-// already-preserved subpath. sightedTree needs no separate entry — it is also a
-// discovery root, which is why round trips through the sighted pool never
-// collapsed.
+// destination. Without them that round trip re-nested an already-preserved
+// subpath under the previous ruling's tree. sightedTree needs no separate entry
+// — it is also a discovery root, which is why round trips through the sighted
+// pool never doubled up.
 var promoteSrcRoots = []string{
 	// All hot-pool layouts share one storage lifecycle root. Strip only that
 	// root so an incoming/bad/foraged/... acquisition keeps its full suffix.
@@ -194,13 +193,7 @@ type placement struct {
 // workflow moves inside label="unknown" storage. ok is false for an
 // unrecognized ruling.
 func rulingPlan(_ *hopper.Sample, oldRel, ruling string) (placement, bool) {
-	sub := filepath.Base(oldRel) // not under a source root: preserve only the basename
-	for _, root := range promoteSrcRoots {
-		if rest, ok := strings.CutPrefix(oldRel, root); ok {
-			sub = rest
-			break
-		}
-	}
+	sub := rulingSubpath(oldRel)
 	switch ruling {
 	case "good":
 		return placement{newRel: filepath.Join(promoteGoodTree, sub), label: "good", source: "promoter"}, true
@@ -216,6 +209,32 @@ func rulingPlan(_ *hopper.Sample, oldRel, ruling string) (placement, bool) {
 		return workflowPlan(oldRel, reviewPool)
 	}
 	return placement{}, false
+}
+
+// rulingSubpath resolves the part of oldRel to preserve beneath the ruling's
+// destination tree. A promoteSrcRoots prefix is stripped whole, because those
+// roots carry a discovery or shard component the destination tree replaces.
+// Everything else keeps its whole path below the pool root.
+//
+// That fallback is not the same as the basename. The pools grow trees nobody
+// enumerated above — the mislabeled-<label>/ buckets triagePlan itself writes,
+// for one — and a basename both discards the provenance the subpath records
+// and piles unrelated samples into the destination root. purgatoryTree is the
+// bare pool root, so there it piled them into /data/samples/purgatory itself.
+// Only a single-component path has nothing left below its root to preserve.
+func rulingSubpath(oldRel string) string {
+	for _, root := range promoteSrcRoots {
+		if rest, ok := strings.CutPrefix(oldRel, root); ok {
+			if rest != "" {
+				return rest
+			}
+			break
+		}
+	}
+	if _, rest, ok := strings.Cut(oldRel, "/"); ok && rest != "" {
+		return rest
+	}
+	return filepath.Base(oldRel)
 }
 
 // workflowPlan moves an unknown-class sample between workflow pools while

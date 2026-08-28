@@ -555,8 +555,9 @@ func TestHandleTriageSightedRulings(t *testing.T) {
 // TestRulingPlanPreservesSubpath pins the placement arithmetic on its own. Every
 // tree a ruled sample can sit in — discovery, upload shard, and the three ruling
 // destinations — must preserve the subpath, because a ruling is not final and a
-// sample can re-enter from wherever the last one put it. Only a genuinely
-// unrooted path may fall back to the basename.
+// sample can re-enter from wherever the last one put it. A tree no root
+// enumerates keeps its whole path below the pool root; only a single-component
+// path falls back to the basename.
 func TestRulingPlanPreservesSubpath(t *testing.T) {
 	const sub = "npm/registry/socket/evil/evil-1.0.tgz"
 	cases := []struct {
@@ -581,8 +582,19 @@ func TestRulingPlanPreservesSubpath(t *testing.T) {
 		{"promoted to sighted", "good/foraged-promote/" + sub, "sighted", "sighted/foraged/" + sub},
 		// bad/foraged/ must not shadow bad/foraged-quarantine/.
 		{"bad discovery demote", "bad/foraged/" + sub, "sighted", "sighted/foraged/" + sub},
-		// Not under any root: basename is all that can be salvaged.
-		{"unrooted", "misc/foraged-undetermined/" + sub, "good", "good/foraged-promote/evil-1.0.tgz"},
+		// The mislabeled-<label>/ buckets triagePlan writes are trees no root
+		// enumerates. They must keep everything below their pool root: with a
+		// basename they piled flat into the destination root, and purgatoryTree
+		// being the bare pool root put them in /data/samples/purgatory itself.
+		{"mislabeled to purgatory", "bad/mislabeled-good/" + sub, "purgatory", "purgatory/mislabeled-good/" + sub},
+		{"mislabeled to sighted", "good/mislabeled-bad/" + sub, "sighted", "sighted/foraged/mislabeled-bad/" + sub},
+		{"mislabeled acquit", "bad/mislabeled-good/" + sub, "good", "good/foraged-promote/mislabeled-good/" + sub},
+		// Any other unenumerated pool tree keeps its subpath the same way.
+		{"unenumerated bad tree", "bad/cyclotron/" + sub, "purgatory", "purgatory/cyclotron/" + sub},
+		{"unenumerated sighted tree", "sighted/aur/" + sub, "purgatory", "purgatory/aur/" + sub},
+		{"unrooted", "misc/foraged-undetermined/" + sub, "good", "good/foraged-promote/foraged-undetermined/" + sub},
+		// Only a single-component path has nothing below a root to preserve.
+		{"single component", "evil-1.0.tgz", "purgatory", "purgatory/evil-1.0.tgz"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

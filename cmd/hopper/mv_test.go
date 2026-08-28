@@ -251,7 +251,9 @@ func TestCmdMvTargetValidation(t *testing.T) {
 
 // Greyware: the sample moves into purgatory/ and takes the "purgatory" label,
 // which no training or triage selector names, so the corpus stops seeing it as
-// either class.
+// either class. good/datasets/ is a tree promoteSrcRoots does not enumerate, so
+// this also pins the subpath below the pool root against collapsing to a
+// basename and piling flat into purgatory/ itself.
 func TestCmdMvPurgatoryParksGreyware(t *testing.T) {
 	ctx := t.Context()
 	root := t.TempDir()
@@ -266,7 +268,7 @@ func TestCmdMvPurgatoryParksGreyware(t *testing.T) {
 		}
 	})
 
-	wantRel := filepath.Join("purgatory", "dual-use.exe")
+	wantRel := filepath.Join("purgatory", "datasets", "PE", "dual-use.exe")
 	if _, err := os.Stat(filepath.Join(root, wantRel)); err != nil {
 		t.Fatalf("expected moved file at %s: %v", wantRel, err)
 	}
