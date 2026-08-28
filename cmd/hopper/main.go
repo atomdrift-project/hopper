@@ -1260,14 +1260,15 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	setupWorkerCgroup(*maxRSSGB)
 	wd.beginStage("discover", "Discovering label directories")
 
-	// Discover label directories under --data. bad/, good/, and sighted/ map
-	// directly to classification labels. pending/, review/, legacy unknown/,
+	// Discover label directories under --data. bad/, good/, sighted/ and
+	// purgatory/ map directly to classification labels. pending/, review/, legacy unknown/,
 	// and incoming/ are workflow/storage roots for unclassified samples.
 	var loadDirs []struct{ dir, label string }
 	for _, entry := range []struct{ name, label string }{
 		{"bad", "bad"},
 		{"good", "good"},
 		{"sighted", "sighted"},
+		{purgatoryPool, "purgatory"},
 		{pendingPool, "unknown"},
 		{reviewPool, "unknown"},
 		{legacyUnknownPool, "unknown"},
@@ -1279,8 +1280,8 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		}
 	}
 	if len(loadDirs) == 0 {
-		wd.failStage("discover", fmt.Sprintf("no bad/, good/, sighted/, pending/, review/, unknown/, or incoming/ in %s", *dataDir))
-		return fmt.Errorf("no bad/, good/, sighted/, pending/, review/, unknown/, or incoming/ subdirectories found in %s", *dataDir)
+		wd.failStage("discover", fmt.Sprintf("no bad/, good/, sighted/, purgatory/, pending/, review/, unknown/, or incoming/ in %s", *dataDir))
+		return fmt.Errorf("no bad/, good/, sighted/, purgatory/, pending/, review/, unknown/, or incoming/ subdirectories found in %s", *dataDir)
 	}
 	wd.endStage("discover")
 

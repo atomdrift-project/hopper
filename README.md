@@ -22,7 +22,7 @@ collectors ──► hopper ──► atomscan workers
 - PostgreSQL and SQLite storage for samples, labels, provenance, and reports
 - Pull-based jobs for horizontally scaled `atomscan worker` processes
 - A file and result API with worker liveness and retry handling
-- Local filesystem ingestion from `bad/`, `good/`, `pending/`, `review/`, and hot `incoming/` pools
+- Local filesystem ingestion from `bad/`, `good/`, `sighted/`, `purgatory/`, `pending/`, `review/`, and hot `incoming/` pools
 - A dashboard for queue depth, workers, and analysis rates
 - Review, rescan, reconciliation, import, and backfill commands
 
@@ -56,8 +56,17 @@ samples/
 ├── good/
 ├── incoming/
 ├── pending/
-└── review/
+├── purgatory/
+├── review/
+└── sighted/
 ```
+
+`bad/`, `good/`, `sighted/` and `purgatory/` carry classification labels;
+`pending/`, `review/` and `incoming/` are workflow roots holding label
+`unknown`. `purgatory/` is greyware — dual-use tooling and artifacts that are
+neither certified benign nor malicious. Every training and triage selector
+names the labels it wants, so a purgatory sample is outside all of them and the
+corpus trains on it in neither direction.
 
 `incoming/`, `pending/`, and `review/` are physical workflow roots. Samples in
 all three retain the catalog label `unknown`, and moves between them preserve
@@ -177,6 +186,9 @@ dashboard in `scripts/grafana-hopper-dashboard.json`.
 # bucket and flips the label in one operation; nothing is uploaded.
 ./hopper mv -url "$HOPPER_URL" -target=bad <sha256> <sha256>
 ./hopper mv -url "$HOPPER_URL" -target=good -dry-run < shas.txt
+
+# Park greyware where training sees it as neither class.
+./hopper mv -url "$HOPPER_URL" -target=purgatory < shas.txt
 
 # Audit hot samples queries for seq-scan regressions (needs production-like stats):
 HOPPER_PLAN_DSN="$DATABASE_URL" go test ./... -run TestPlanAudit -count=1

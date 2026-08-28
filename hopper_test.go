@@ -7042,3 +7042,27 @@ func TestCandidateQueriesCarryCreatedAt(t *testing.T) {
 		}
 	}
 }
+
+// Purgatory outranks every observed label so a walk or feed claim cannot undo
+// an operator's greyware ruling, and the SQL rendering must agree with the Go
+// one or the upsert and the logging path disagree about the same transition.
+func TestLabelRankPurgatoryOutranksObservations(t *testing.T) {
+	for _, lower := range []string{labelBad, labelGood, labelSighted, labelUnknown, ""} {
+		if labelRank(labelPurgatory) <= labelRank(lower) {
+			t.Fatalf("purgatory rank %d does not outrank %q (%d)",
+				labelRank(labelPurgatory), lower, labelRank(lower))
+		}
+	}
+	// Ordering below purgatory is unchanged.
+	if !(labelRank(labelBad) > labelRank(labelGood) &&
+		labelRank(labelGood) > labelRank(labelSighted) &&
+		labelRank(labelSighted) > labelRank(labelUnknown)) {
+		t.Fatal("existing label precedence changed")
+	}
+	sql := labelRankSQL("x")
+	for _, want := range []string{"'purgatory' THEN 4", "'bad' THEN 3", "'good' THEN 2", "'sighted' THEN 1"} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("labelRankSQL missing %q: %s", want, sql)
+		}
+	}
+}

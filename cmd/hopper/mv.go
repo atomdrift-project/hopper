@@ -33,23 +33,25 @@ import (
 //   - verdict ("good"/"bad") is the operator correction — the file moves to
 //     <target>/mislabeled-<old-label>/<basename> so the bucket records what it
 //     was rescued from, and the label flips with source "triage".
-//   - ruling ("sighted"/"pending"/"review") is the classification flow — the
-//     file moves into that pool's tree with its source subpath preserved.
-//     "pending" and "review" are path-only workflow moves and the master
+//   - ruling ("sighted"/"purgatory"/"pending"/"review") is the classification
+//     flow — the file moves into that pool's tree with its source subpath
+//     preserved. "purgatory" is greyware the corpus must not train on either
+//     way. "pending" and "review" are path-only workflow moves and the master
 //     rejects them for anything not currently labeled "unknown".
 //
 // Correcting a mislabeled sample is the first flow, which is why -target=good
 // and -target=bad send a verdict rather than the identically-spelled ruling.
 var mvTargets = map[string]string{
-	"good":    "verdict",
-	"bad":     "verdict",
-	"sighted": "ruling",
-	"pending": "ruling",
-	"review":  "ruling",
+	"good":      "verdict",
+	"bad":       "verdict",
+	"sighted":   "ruling",
+	"purgatory": "ruling",
+	"pending":   "ruling",
+	"review":    "ruling",
 }
 
 func mvTargetNames() string {
-	return "good, bad, sighted, pending, review"
+	return "good, bad, sighted, purgatory, pending, review"
 }
 
 func cmdMv(ctx context.Context) error {

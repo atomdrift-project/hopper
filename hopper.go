@@ -122,7 +122,8 @@ func LitmusClass(result []byte) int {
 	}
 }
 
-// Pool labels, ordered by precedence: bad > good > sighted > unknown.
+// Pool labels, ordered by precedence: purgatory > bad > good > sighted >
+// unknown.
 //
 // "sighted" is a feed claim pending verification: an external threat feed
 // named the package or hash (see the sightings ledger) but no independent
@@ -130,11 +131,25 @@ func LitmusClass(result []byte) int {
 // triage queues (which select bad/good/unknown exactly) and are promoted to
 // bad only by promoter's corroboration rules. "unknown" remains the
 // no-claims background pool.
+//
+// "purgatory" is greyware: dual-use tooling and unclassifiable artifacts an
+// operator has decided are neither certified-benign nor malicious, so training
+// must see them as neither. It needs no selector of its own to achieve that —
+// every training and triage selector names the labels it wants (label = 'good',
+// label IN ('unknown','sighted')) rather than excluding 'bad', so an unlisted
+// label is already outside all of them.
+//
+// It ranks above bad deliberately. The rank decides only what a *re-observation*
+// may overwrite (see sampleConflictUpdatePG), and parking a sample here is a
+// human judgement that a later forager walk or feed claim must not silently
+// undo. An explicit ruling still moves it out: /api/triage writes the label
+// through MoveLocation, which assigns directly and never consults the rank.
 const (
-	labelUnknown = "unknown"
-	labelSighted = "sighted"
-	labelGood    = "good"
-	labelBad     = "bad"
+	labelUnknown   = "unknown"
+	labelSighted   = "sighted"
+	labelGood      = "good"
+	labelBad       = "bad"
+	labelPurgatory = "purgatory"
 )
 
 // Unknown-class storage roots. The root records workflow and storage tier; it
@@ -145,6 +160,11 @@ const (
 	PoolReview        = "review"
 	PoolLegacyUnknown = "unknown"
 )
+
+// PoolPurgatory is the greyware storage root. Unlike the pools above it is a
+// classification tree, not a workflow tree: the root and the label agree, the
+// same way sighted/ and label "sighted" do.
+const PoolPurgatory = "purgatory"
 
 // ProvenanceSidecarSuffix is the suffix used by Forager's on-disk metadata
 // sidecar. A physical location move treats the artifact and this sidecar as one
@@ -267,12 +287,15 @@ func logLabelTransition(sha, path, stored, storedSrc, storedSkip, in, inSrc stri
 	}
 }
 
-// labelRank orders pool labels for precedence resolution: bad outranks good
-// outranks sighted outranks unknown. Used to decide whether a re-observation
-// promotes a sample. A feed claim (sighted) never overrides a verified good
-// or bad label. Keep in sync with labelRankSQL.
+// labelRank orders pool labels for precedence resolution: purgatory outranks
+// bad outranks good outranks sighted outranks unknown. Used to decide whether a
+// re-observation promotes a sample. A feed claim (sighted) never overrides a
+// verified good or bad label, and nothing observed on a walk overrides an
+// operator's purgatory ruling. Keep in sync with labelRankSQL.
 func labelRank(label string) int {
 	switch label {
+	case labelPurgatory:
+		return 4
 	case labelBad:
 		return 3
 	case labelGood:
@@ -289,7 +312,8 @@ func labelRank(label string) int {
 // compile-time constant) into the upsert/relabel statements in pg.go and
 // sqlite.go so the precedence order cannot drift between Go and SQL.
 func labelRankSQL(col string) string {
-	return "(CASE " + col + " WHEN 'bad' THEN 3 WHEN 'good' THEN 2 WHEN 'sighted' THEN 1 ELSE 0 END)"
+	return "(CASE " + col + " WHEN 'purgatory' THEN 4 WHEN 'bad' THEN 3 " +
+		"WHEN 'good' THEN 2 WHEN 'sighted' THEN 1 ELSE 0 END)"
 }
 
 // classifyLabelTransition mirrors the ON CONFLICT label-resolution rules (see

@@ -248,3 +248,75 @@ func TestCmdMvTargetValidation(t *testing.T) {
 		})
 	}
 }
+
+// Greyware: the sample moves into purgatory/ and takes the "purgatory" label,
+// which no training or triage selector names, so the corpus stops seeing it as
+// either class.
+func TestCmdMvPurgatoryParksGreyware(t *testing.T) {
+	ctx := t.Context()
+	root := t.TempDir()
+	db, url := mvTestServer(t, ctx, root)
+
+	oldRel := filepath.Join("good", "datasets", "PE", "dual-use.exe")
+	sha := writeMvSample(t, db, ctx, root, oldRel, "good", "greyware-bytes")
+
+	withArgs([]string{"hopper", "mv", "-url", url, "-target", "purgatory", sha}, func() {
+		if err := cmdMv(ctx); err != nil {
+			t.Fatalf("cmdMv: %v", err)
+		}
+	})
+
+	wantRel := filepath.Join("purgatory", "dual-use.exe")
+	if _, err := os.Stat(filepath.Join(root, wantRel)); err != nil {
+		t.Fatalf("expected moved file at %s: %v", wantRel, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, oldRel)); !os.IsNotExist(err) {
+		t.Fatalf("old path should be gone, stat err = %v", err)
+	}
+	samp, err := db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatalf("SampleBySHA256: %v", err)
+	}
+	if samp.Label != "purgatory" || samp.Path != wantRel {
+		t.Fatalf("row not updated: label=%q path=%q", samp.Label, samp.Path)
+	}
+
+	// Idempotent: a re-submitted ruling is a noop, not a second move.
+	withArgs([]string{"hopper", "mv", "-url", url, "-target", "purgatory", sha}, func() {
+		if err := cmdMv(ctx); err != nil {
+			t.Fatalf("cmdMv re-run: %v", err)
+		}
+	})
+	if _, err := os.Stat(filepath.Join(root, wantRel)); err != nil {
+		t.Fatalf("re-run disturbed the parked file: %v", err)
+	}
+}
+
+// A ruling still moves a sample back out, and the suffix beneath purgatory/ is
+// preserved rather than collapsed on the round trip.
+func TestCmdMvPurgatoryRoundTrip(t *testing.T) {
+	ctx := t.Context()
+	root := t.TempDir()
+	db, url := mvTestServer(t, ctx, root)
+
+	sha := writeMvSample(t, db, ctx, root,
+		filepath.Join("purgatory", "npm", "pkg.tgz"), "purgatory", "round-trip-bytes")
+
+	withArgs([]string{"hopper", "mv", "-url", url, "-target", "bad", sha}, func() {
+		if err := cmdMv(ctx); err != nil {
+			t.Fatalf("cmdMv: %v", err)
+		}
+	})
+
+	wantRel := filepath.Join("bad", "mislabeled-purgatory", "pkg.tgz")
+	if _, err := os.Stat(filepath.Join(root, wantRel)); err != nil {
+		t.Fatalf("expected moved file at %s: %v", wantRel, err)
+	}
+	samp, err := db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatalf("SampleBySHA256: %v", err)
+	}
+	if samp.Label != "bad" {
+		t.Fatalf("label = %q, want bad", samp.Label)
+	}
+}
