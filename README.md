@@ -173,6 +173,11 @@ dashboard in `scripts/grafana-hopper-dashboard.json`.
 ./hopper rescan --db "$DATABASE_URL" <sha256>
 ./hopper import --from old.db --db "$DATABASE_URL"
 
+# Relabel by SHA-256. The master moves the bytes into the corrected pool
+# bucket and flips the label in one operation; nothing is uploaded.
+./hopper mv -url "$HOPPER_URL" -target=bad <sha256> <sha256>
+./hopper mv -url "$HOPPER_URL" -target=good -dry-run < shas.txt
+
 # Audit hot samples queries for seq-scan regressions (needs production-like stats):
 HOPPER_PLAN_DSN="$DATABASE_URL" go test ./... -run TestPlanAudit -count=1
 ```

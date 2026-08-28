@@ -69,6 +69,7 @@ commands:
   rescan             queue files for repair-tier re-analysis (--missing-members or SHA-256 args)
   triage             fetch mislabeled samples to /var/tmp/hopper-triage
   post-triage        apply triage verdicts: re-scan, move + flip mislabeled samples
+  mv                 relabel SHA-256s (-target=good|bad|sighted|pending|review): move + flip on the master
   demote-sighted     move uncorroborated feed-claimed samples from bad/ to sighted/ (dry-run; -apply)
   cascade-backfill   propagate good/bad archive labels to their members (dry-run)
   stats              show sample counts
@@ -439,6 +440,8 @@ func run(ctx context.Context) error {
 		return cmdTriage(ctx)
 	case "post-triage":
 		return cmdPostTriage(ctx)
+	case "mv":
+		return cmdMv(ctx)
 	case "demote-sighted":
 		return cmdDemoteSighted(ctx)
 	case "cascade-backfill":
