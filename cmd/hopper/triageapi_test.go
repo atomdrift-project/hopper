@@ -14,12 +14,12 @@ import (
 	"github.com/atomdrift-project/hopper"
 )
 
-// seedNewQueue inserts n unknown-labeled samples carrying a hostile trait, which
+// seedUnconvictedQueue inserts n unknown-labeled samples carrying a hostile trait, which
 // is TriageNew's population. The recipe mirrors hopper's own triage tests:
 // insert, then store a cleave result whose single file entry carries a trait
 // level, because queue membership is computed from the stored analysis rather
 // than from the row alone.
-func seedNewQueue(t *testing.T, ctx context.Context, db *hopper.DB, n int) {
+func seedUnconvictedQueue(t *testing.T, ctx context.Context, db *hopper.DB, n int) {
 	t.Helper()
 	for i := range n {
 		sha := fmt.Sprintf("%064x", i+1)
@@ -77,9 +77,9 @@ func selectFrom(t *testing.T, api *apiServer, queue, query string) (shas []strin
 func TestTriageSelectClaimsAcrossRequests(t *testing.T) {
 	ctx := context.Background()
 	api := newTriageAPI(t, ctx)
-	seedNewQueue(t, ctx, api.db, 6)
+	seedUnconvictedQueue(t, ctx, api.db, 6)
 
-	first, withheld, code := selectFrom(t, api, "new", "?limit=3")
+	first, withheld, code := selectFrom(t, api, "unconvicted-suspicious", "?limit=3")
 	if code != http.StatusOK {
 		t.Fatalf("first select: status = %d", code)
 	}
@@ -90,7 +90,7 @@ func TestTriageSelectClaimsAcrossRequests(t *testing.T) {
 		t.Errorf("first select withheld = %d, want 0 (nothing claimed yet)", withheld)
 	}
 
-	second, withheld, code := selectFrom(t, api, "new", "?limit=3")
+	second, withheld, code := selectFrom(t, api, "unconvicted-suspicious", "?limit=3")
 	if code != http.StatusOK {
 		t.Fatalf("second select: status = %d", code)
 	}
@@ -113,7 +113,7 @@ func TestTriageSelectClaimsAcrossRequests(t *testing.T) {
 
 	// The population is exhausted, so a third caller gets nothing rather than a
 	// repeat. withheld is what distinguishes that from a drained queue.
-	third, withheld, _ := selectFrom(t, api, "new", "?limit=3")
+	third, withheld, _ := selectFrom(t, api, "unconvicted-suspicious", "?limit=3")
 	if len(third) != 0 {
 		t.Errorf("third select returned %d samples, want 0 (all six claimed)", len(third))
 	}
@@ -127,17 +127,17 @@ func TestTriageSelectClaimsAcrossRequests(t *testing.T) {
 func TestTriageSelectPreviewDoesNotClaim(t *testing.T) {
 	ctx := context.Background()
 	api := newTriageAPI(t, ctx)
-	seedNewQueue(t, ctx, api.db, 3)
+	seedUnconvictedQueue(t, ctx, api.db, 3)
 
-	first, withheld, code := selectFrom(t, api, "new", "?limit=2&preview=1")
+	first, withheld, code := selectFrom(t, api, "unconvicted-suspicious", "?limit=2&preview=1")
 	if code != http.StatusOK || len(first) != 2 || withheld != 0 {
 		t.Fatalf("first preview = %v withheld=%d status=%d", first, withheld, code)
 	}
-	second, withheld, _ := selectFrom(t, api, "new", "?limit=2&preview=1")
+	second, withheld, _ := selectFrom(t, api, "unconvicted-suspicious", "?limit=2&preview=1")
 	if !slices.Equal(first, second) || withheld != 0 {
 		t.Fatalf("second preview = %v withheld=%d, want same %v and zero", second, withheld, first)
 	}
-	claimed, withheld, _ := selectFrom(t, api, "new", "?limit=2")
+	claimed, withheld, _ := selectFrom(t, api, "unconvicted-suspicious", "?limit=2")
 	if !slices.Equal(first, claimed) || withheld != 0 {
 		t.Fatalf("claim after previews = %v withheld=%d, want %v and zero", claimed, withheld, first)
 	}
@@ -148,15 +148,15 @@ func TestTriageSelectPreviewDoesNotClaim(t *testing.T) {
 func TestTriageClaimsExpire(t *testing.T) {
 	ctx := context.Background()
 	api := newTriageAPI(t, ctx)
-	seedNewQueue(t, ctx, api.db, 2)
+	seedUnconvictedQueue(t, ctx, api.db, 2)
 	api.triageClaims = newTriageClaims(time.Nanosecond)
 
-	first, _, _ := selectFrom(t, api, "new", "?limit=2")
+	first, _, _ := selectFrom(t, api, "unconvicted-suspicious", "?limit=2")
 	if len(first) != 2 {
 		t.Fatalf("first select returned %d, want 2", len(first))
 	}
 	// The TTL is a nanosecond, so both claims have already lapsed.
-	second, withheld, _ := selectFrom(t, api, "new", "?limit=2")
+	second, withheld, _ := selectFrom(t, api, "unconvicted-suspicious", "?limit=2")
 	if len(second) != 2 {
 		t.Errorf("second select returned %d, want 2 (claims should have lapsed)", len(second))
 	}
@@ -281,20 +281,20 @@ func TestTriageSelectUnknownQueue(t *testing.T) {
 func TestTriageSelectLimit(t *testing.T) {
 	ctx := context.Background()
 	api := newTriageAPI(t, ctx)
-	seedNewQueue(t, ctx, api.db, 3)
+	seedUnconvictedQueue(t, ctx, api.db, 3)
 
 	for _, bad := range []string{"?limit=0", "?limit=-1", "?limit=abc"} {
-		if _, _, code := selectFrom(t, api, "new", bad); code != http.StatusBadRequest {
+		if _, _, code := selectFrom(t, api, "unconvicted-suspicious", bad); code != http.StatusBadRequest {
 			t.Errorf("limit %q: status = %d, want 400", bad, code)
 		}
 	}
 	// Absent limit uses the default rather than erroring.
-	if _, _, code := selectFrom(t, api, "new", ""); code != http.StatusOK {
+	if _, _, code := selectFrom(t, api, "unconvicted-suspicious", ""); code != http.StatusOK {
 		t.Errorf("no limit: status = %d, want 200", code)
 	}
 	// An oversized limit is clamped, not refused: the caller still gets work.
 	api.triageClaims = newTriageClaims(triageClaimTTL)
-	got, _, code := selectFrom(t, api, "new", "?limit=100000")
+	got, _, code := selectFrom(t, api, "unconvicted-suspicious", "?limit=100000")
 	if code != http.StatusOK {
 		t.Fatalf("huge limit: status = %d, want 200", code)
 	}
@@ -306,7 +306,7 @@ func TestTriageSelectLimit(t *testing.T) {
 func TestTriageDepth(t *testing.T) {
 	ctx := context.Background()
 	api := newTriageAPI(t, ctx)
-	seedNewQueue(t, ctx, api.db, 4)
+	seedUnconvictedQueue(t, ctx, api.db, 4)
 
 	depth := func(queue string) *httptest.ResponseRecorder {
 		t.Helper()
@@ -317,7 +317,7 @@ func TestTriageDepth(t *testing.T) {
 		return rec
 	}
 
-	rec := depth("new")
+	rec := depth("unconvicted-suspicious")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("new depth: status = %d body = %s", rec.Code, rec.Body.Bytes())
 	}
@@ -329,7 +329,7 @@ func TestTriageDepth(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if body.Queue != "new" {
+	if body.Queue != "unconvicted-suspicious" {
 		t.Errorf("queue = %q, want new", body.Queue)
 	}
 	if body.Depth != 4 {

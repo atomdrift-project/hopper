@@ -110,20 +110,98 @@ var TriageQueues = map[string]Queue{
 		return db.CountTriageBad(ctx, TriageFilter{})
 	}},
 
-	// good: good-labeled samples that trip detection — a hostile trait, 2+
-	// suspicious traits, or a suspicious+ litmus class (false positives) →
-	// loosen traits.
-	"good": {Name: "good", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
-		return db.TriageGood(ctx, n, TriageFilter{})
+	// The unconvicted pair (2026-08-30), which REPLACED good and new. Those two
+	// split the same work by standing label — good-labeled files that trip
+	// detection, unknown-labeled files that trip detection — and since
+	// suspicious_count counts crit>=4 findings, `unknown AND suspicious_count>=1`
+	// was exactly `unknown AND max_crit>=4`. So the old pair's union is this
+	// pair's union, re-cut along the axis that decides what a mistake COSTS
+	// instead of the axis of what we currently believe.
+	//
+	// Two reasons the severity cut is the better one. It lets the hostile tier
+	// take a stronger provider chain than the suspicious tier, which the merged
+	// queues could not express. And it puts benign-labeled and unlabelled
+	// samples in the SAME batch: a queue that only ever shows a judge false
+	// positives teaches it that loosening is always the answer, which is the
+	// failure the highest queue's prompt already has to argue against.
+	//
+	// The standing label is not gone, it has moved — out of the queue's identity
+	// and into the prompt as per-sample evidence.
+	//
+	// Both drain themselves: the findings dropping below the tier's bar removes
+	// the row. Their -stale twins do not, and take the usual report park.
+	"unconvicted-hostile": {Name: "unconvicted-hostile", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+		return db.TriageUnconvictedHostile(ctx, n, TriageFilter{Order: TriageRepair})
 	}, Depth: func(ctx context.Context, db *DB) (int64, error) {
-		return db.CountTriageGood(ctx, TriageFilter{})
+		return db.CountTriageUnconvictedHostile(ctx, TriageFilter{})
 	}},
 
-	// new: unknown-labeled samples cleave flagged → classify, file, and train.
-	"new": {Name: "new", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
-		return db.TriageNew(ctx, n, TriageFilter{})
+	"unconvicted-suspicious": {Name: "unconvicted-suspicious", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+		return db.TriageUnconvictedSuspicious(ctx, n, TriageFilter{Order: TriageRepair})
 	}, Depth: func(ctx context.Context, db *DB) (int64, error) {
-		return db.CountTriageNew(ctx, TriageFilter{})
+		return db.CountTriageUnconvictedSuspicious(ctx, TriageFilter{})
+	}},
+
+	"unconvicted-hostile-stale": {Name: "unconvicted-hostile-stale", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+		return db.TriageUnconvictedHostile(ctx, n, staleTriageFilter("unconvicted-hostile-stale"))
+	}, Depth: func(ctx context.Context, db *DB) (int64, error) {
+		return db.CountTriageUnconvictedHostile(ctx, staleTriageFilter("unconvicted-hostile-stale"))
+	}},
+
+	"unconvicted-suspicious-stale": {Name: "unconvicted-suspicious-stale", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+		return db.TriageUnconvictedSuspicious(ctx, n, staleTriageFilter("unconvicted-suspicious-stale"))
+	}, Depth: func(ctx context.Context, db *DB) (int64, error) {
+		return db.CountTriageUnconvictedSuspicious(ctx, staleTriageFilter("unconvicted-suspicious-stale"))
+	}},
+
+	// version-drift: this release fires, an earlier release of the same package
+	// did not and is labelled good. Either the package was compromised between
+	// releases or a rule started over-firing — indistinguishable from one file,
+	// which is why the queue exists: the clean sibling gives the judge a diff.
+	//
+	// Self-draining, from either side: loosening the rule drops the row below the
+	// floor, and convicting the package moves it out of the unconvicted pool.
+	"version-drift": {Name: "version-drift", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+		return db.TriageVersionDrift(ctx, n, TriageFilter{})
+	}, Depth: func(ctx context.Context, db *DB) (int64, error) {
+		return db.CountTriageVersionDrift(ctx, TriageFilter{})
+	}},
+
+	// fp-trait: every sample in the batch fires the SAME over-firing trait — the
+	// one appearing on the most benign-labelled samples in the recent window.
+	//
+	// The other queues hand a judge N unrelated false positives and ask for N
+	// separate fixes. One bad rule produces thousands, so those are N passes
+	// spent on what is really one edit. Clustering the batch on a single trait is
+	// what makes the pattern legible, and it is the only queue here whose ranking
+	// is a property of our RULES rather than of a sample.
+	//
+	// Newest-first within the chosen trait; the trait selection is the ranking.
+	// Self-draining: loosening it drops its samples below the max_crit floor and
+	// the next pass ranks whatever is worst then.
+	"fp-trait": {Name: "fp-trait", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+		return db.TriageFPTrait(ctx, n, TriageFilter{})
+	}, Depth: func(ctx context.Context, db *DB) (int64, error) {
+		return db.CountTriageFPTrait(ctx, TriageFilter{})
+	}},
+
+	// discord: our rule engine and our ML ensemble disagree about the same bytes
+	// — one calls it hostile while the other is silent. Label-agnostic like
+	// popular and fallout, because a detector conflict is a defect wherever it
+	// lands; the standing label only decides WHICH detector is the suspect. See
+	// triageDiscordWhere for the four readings.
+	//
+	// This is the only queue on the litmus_class axis that is about detection
+	// quality: fallout also keys on class, but gates on being undescribed or
+	// uncorroborated, which makes it an explanation queue.
+	//
+	// Self-draining: whichever detector was wrong gets fixed, the two agree, and
+	// the row leaves. Newest-first — a conflict does not get more interesting
+	// with age, and both arms are narrow enough that the head keeps moving.
+	"discord": {Name: "discord", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+		return db.TriageDiscord(ctx, n, TriageFilter{})
+	}, Depth: func(ctx context.Context, db *DB) (int64, error) {
+		return db.CountTriageDiscord(ctx, TriageFilter{})
 	}},
 
 	// sighted: every non-bad sample covered by a malicious or suspicious ledger
@@ -257,17 +335,9 @@ var TriageQueues = map[string]Queue{
 	// its highest-scoring benign. The label-hygiene half of what bad-stale would
 	// have done (bad-labeled files that are really inert) is already covered by
 	// lowest, which is score-ranked and so reaches old samples natively.
-	"new-stale": {Name: "new-stale", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
-		return db.TriageNew(ctx, n, staleTriageFilter("new-stale"))
-	}, Depth: func(ctx context.Context, db *DB) (int64, error) {
-		return db.CountTriageNew(ctx, staleTriageFilter("new-stale"))
-	}},
-
-	"good-stale": {Name: "good-stale", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
-		return db.TriageGood(ctx, n, staleTriageFilter("good-stale"))
-	}, Depth: func(ctx context.Context, db *DB) (int64, error) {
-		return db.CountTriageGood(ctx, staleTriageFilter("good-stale"))
-	}},
+	// (good-stale and new-stale retired 2026-08-30; their populations are the
+	// unconvicted pair's -stale twins, registered above with the pair itself so
+	// each severity tier's two orderings sit together.)
 
 	// acquit: the second queue's mirror — bad-labeled samples whose conviction
 	// no outside evidence has ever supported (provenance shows a registry pull,

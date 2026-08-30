@@ -588,10 +588,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 				'idx_samples_bad_miss_newest',
 				'idx_samples_good_repair_newest',
 				'idx_samples_unknown_newest',
-				'idx_samples_new_interesting',
 				'idx_samples_bad_miss_stale',
-				'idx_samples_good_repair_stale',
-				'idx_samples_new_stale',
 				'idx_samples_stale_traits',
 				'idx_samples_stale_traits_pri2'
 			]
@@ -623,11 +620,82 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			`litmus_score DESC NULLS LAST, analyzed_at, id) ` +
 			`WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' ` +
 			`AND skip = '' AND path LIKE 'review/%'`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_new_interesting ` +
-			`ON samples(corroborated DESC, max_crit DESC, suspicious_count DESC, ` +
-			`litmus_score DESC NULLS LAST, analyzed_at, id) ` +
-			`WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' ` +
-			`AND skip = '' AND path <> '' AND suspicious_count >= 1 AND path NOT LIKE 'review/%'`,
+		// version-drift's outer walk. Its own partial: the sibling EXISTS is a
+		// cross-row predicate and cannot live in one, so the index covers the
+		// candidate side and the probe rides idx_samples_purl_base per row.
+		`CREATE INDEX IF NOT EXISTS idx_samples_version_drift_newest ` +
+			`ON samples(created_at DESC, id DESC) ` +
+			`WHERE ` + triageVersionDriftCandidates,
+		// fp-trait's window walk. No surviving partial covers it: the good
+		// newest-first index kept for `hopper export` is gated on
+		// (max_crit >= 5 OR suspicious_count >= 2), which is NARROWER than
+		// max_crit >= 4, and a query can only use a partial its own predicate
+		// implies — not the other way round.
+		`CREATE INDEX IF NOT EXISTS idx_samples_fp_trait_newest ` +
+			`ON samples(created_at DESC, id DESC) INCLUDE (top_traits) ` +
+			`WHERE ` + triageFPTraitWhere,
+		// The unconvicted pair's indexes. Built FROM the selector constants
+		// rather than restated, because the neighbours above are hand-copied
+		// predicates that the comment has to beg future editors to keep
+		// byte-identical — and a partial index whose predicate drifts from its
+		// query is not a slow index, it is an unused one (see the 8-99s
+		// measurements above). Postgres matches on the parsed predicate, not on
+		// the text, so sharing the constant costs nothing and removes the drift.
+		//
+		// Two orderings, two indexes, per queue:
+		//   *_repair  serves TriageRepair (corroborated ASC, created_at DESC, id
+		//             DESC). corroborated is boolean, so the leading key is a
+		//             two-bucket partition and the walk is ordered end to end —
+		//             no sort node, and the LIMIT stops inside the first bucket
+		//             whenever there is uncorroborated work, which is the case
+		//             this queue exists for.
+		//   *_stale   serves TriageStale (analyzed_at ASC NULLS LAST, id ASC),
+		//             the same shape as the -stale indexes it replaces.
+		//
+		// Net index count on this table goes DOWN: these four plus discord's one
+		// arrive as the five belonging to good/good-stale/new/new-stale leave.
+		`CREATE INDEX IF NOT EXISTS idx_samples_unconvicted_hostile_repair ` +
+			`ON samples(corroborated, created_at DESC, id DESC) ` +
+			`WHERE ` + triageUnconvictedHostileWhere,
+		`CREATE INDEX IF NOT EXISTS idx_samples_unconvicted_hostile_stale ` +
+			`ON samples(analyzed_at, id) ` +
+			`WHERE ` + triageUnconvictedHostileWhere,
+		`CREATE INDEX IF NOT EXISTS idx_samples_unconvicted_susp_repair ` +
+			`ON samples(corroborated, created_at DESC, id DESC) ` +
+			`WHERE ` + triageUnconvictedSuspiciousWhere,
+		`CREATE INDEX IF NOT EXISTS idx_samples_unconvicted_susp_stale ` +
+			`ON samples(analyzed_at, id) ` +
+			`WHERE ` + triageUnconvictedSuspiciousWhere,
+		// discord is newest-first only: a detector conflict is not more or less
+		// interesting for being corroborated, and its population is small enough
+		// (both arms are narrow bands) that a backlog crawler would drain it.
+		`CREATE INDEX IF NOT EXISTS idx_samples_discord_newest ` +
+			`ON samples(created_at DESC, id DESC) ` +
+			`WHERE ` + triageDiscordWherePG,
+		// TriageHighest's route walk, widened to the unconvicted pool (2026-08-30).
+		// The good-only partial below stays for triageLowest's mirror and for any
+		// consumer still on the narrow spelling; this is the one the widened
+		// LATERAL matches. Without it the widened query stops matching
+		// idx_samples_good_route_score and degrades to the full scan that
+		// per-route top-K exists to avoid.
+		`CREATE INDEX IF NOT EXISTS idx_samples_unconvicted_route_score ` +
+			`ON samples(file_type, litmus_score DESC) ` +
+			`WHERE label IN ('good', 'unknown') AND litmus_score IS NOT NULL ` +
+			`AND cleave_result IS NOT NULL AND skip = ''`,
+		// The retired queues' orderings. good/good-stale/new/new-stale were
+		// replaced by the unconvicted pair, whose union is their union exactly.
+		// Dropped rather than left orphaned: each is maintained on every write to
+		// a hot 100M-row table, and no caller is left for these three orderings —
+		// TriageGood and TriageNew survive only for `hopper export`, which asks
+		// for the default newest-first and never for stale or interesting.
+		//
+		// The two newest-first partials those exports DO walk stay below. They
+		// are the reason this list is three names and not five: retiring a queue
+		// does not retire a selector that something else still calls.
+		`DROP INDEX IF EXISTS idx_samples_good_repair_stale`,
+		`DROP INDEX IF EXISTS idx_samples_new_interesting`,
+		`DROP INDEX IF EXISTS idx_samples_new_stale`,
+
 		// The evidence-ranked pair (TriageAcquit / TriageSecondOpinion). Both
 		// were added after the mirrors above and neither got one, so each
 		// falls back to a generic scan and filter. Measured against the live
@@ -745,14 +813,6 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			`ON samples(analyzed_at, id) ` +
 			`WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = '' ` +
 			`AND skip = '' AND path <> '' AND max_crit < 5 AND suspicious_count < 2`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_good_repair_stale ` +
-			`ON samples(analyzed_at, id) ` +
-			`WHERE label = 'good' AND cleave_result IS NOT NULL AND parent = '' ` +
-			`AND skip = '' AND path <> '' AND (max_crit >= 5 OR suspicious_count >= 2)`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_new_stale ` +
-			`ON samples(analyzed_at, id) ` +
-			`WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' ` +
-			`AND skip = '' AND path <> '' AND suspicious_count >= 1`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_top_ready_first_analyzed_coalesce ` +
 			`ON samples((COALESCE(first_analyzed_at, analyzed_at)) DESC, id) ` +
 			`WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL`,
@@ -4652,6 +4712,13 @@ func triageOrderSQL(f TriageFilter) string {
 	case TriageInteresting:
 		return "ORDER BY corroborated DESC, max_crit DESC, suspicious_count DESC, " +
 			"litmus_score DESC NULLS LAST, analyzed_at ASC NULLS LAST, id ASC"
+	case TriageRepair:
+		// Deliberately narrow: three keys that an idx_samples_*_repair partial
+		// index can serve as a pure ordered walk. TriageInteresting's five-key
+		// spelling would need a five-column index on a much larger population
+		// for no gain — within one corroboration bucket a repair queue has no
+		// preference beyond recency.
+		return "ORDER BY corroborated ASC, created_at DESC, id DESC"
 	default:
 		return "ORDER BY created_at DESC, id DESC"
 	}
@@ -4695,6 +4762,109 @@ func (db *DB) triageNewPG(ctx context.Context, limit int, f TriageFilter) ([]*Sa
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage new: %w", err)
+	}
+	return scanPGSamplesLight(rows)
+}
+
+// triageFPTraitPG: see TriageFPTrait. Three CTEs, one scan.
+//
+// win is MATERIALIZED deliberately. Postgres would otherwise be free to inline
+// it into both referencing branches and walk the window twice — once to rank the
+// traits and once to re-find the matches — which is the one thing this shape
+// exists to avoid.
+//
+// top_traits is TEXT holding a JSON array (see TopTrait), so the cast happens
+// once per windowed row rather than per pool row; the predicate already excludes
+// NULL and ” so the cast cannot see a value it would reject. crit >= the
+// suspicious floor keeps the ranking to findings that actually select samples —
+// a notable-tier chip riding along in the same list is not why the row is here.
+func (db *DB) triageVersionDriftPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	extra, args := triageFilterClausePG(f, 1, "samples")
+	args = append(args, limit)
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleColsLight+` FROM samples
+		 WHERE `+triageVersionDriftWhere+extra+`
+		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage version drift: %w", err)
+	}
+	return scanPGSamplesLight(rows)
+}
+
+func (db *DB) triageFPTraitPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	extra, args := triageFilterClausePG(f, 1, "samples")
+	args = append(args, fpTraitWindow)
+	winIdx := strconv.Itoa(len(args))
+	args = append(args, limit)
+	limitIdx := strconv.Itoa(len(args))
+	rows, err := db.pool.Query(ctx,
+		`WITH win AS MATERIALIZED (
+		   -- Aliased: the outer SELECT's column list is bare names, so an
+		   -- unaliased id here is an ambiguous reference once win is joined.
+		   SELECT id AS win_id, top_traits::jsonb AS win_traits FROM samples
+		    WHERE `+triageFPTraitWhere+extra+`
+		    ORDER BY created_at DESC, id DESC
+		    LIMIT $`+winIdx+`
+		 ), worst AS (
+		   SELECT e->>'id' AS trait_id, count(*) AS n
+		     FROM win, LATERAL jsonb_array_elements(win.win_traits) e
+		    WHERE COALESCE((e->>'crit')::int, 0) >= `+strconv.Itoa(suspiciousCrit)+`
+		    GROUP BY 1
+		    -- trait_id breaks ties so a batch does not shuffle between polls.
+		    ORDER BY n DESC, trait_id ASC
+		    LIMIT 1
+		 )
+		 SELECT `+pgSampleColsLight+` FROM samples
+		  JOIN win ON win.win_id = samples.id
+		  CROSS JOIN worst
+		  WHERE win.win_traits @> jsonb_build_array(jsonb_build_object('id', worst.trait_id))
+		  ORDER BY samples.created_at DESC, samples.id DESC LIMIT $`+limitIdx,
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage fp-trait: %w", err)
+	}
+	return scanPGSamplesLight(rows)
+}
+
+func (db *DB) triageUnconvictedHostilePG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	extra, args := triageFilterClausePG(f, 1, "samples")
+	args = append(args, limit)
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleColsLight+` FROM samples
+		 WHERE `+triageUnconvictedHostileWhere+extra+`
+		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage unconvicted hostile: %w", err)
+	}
+	return scanPGSamplesLight(rows)
+}
+
+func (db *DB) triageUnconvictedSuspiciousPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	extra, args := triageFilterClausePG(f, 1, "samples")
+	args = append(args, limit)
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleColsLight+` FROM samples
+		 WHERE `+triageUnconvictedSuspiciousWhere+extra+`
+		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage unconvicted suspicious: %w", err)
+	}
+	return scanPGSamplesLight(rows)
+}
+
+func (db *DB) triageDiscordPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	extra, args := triageFilterClausePG(f, 1, "samples")
+	args = append(args, limit)
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleColsLight+` FROM samples
+		 WHERE `+triageDiscordWherePG+extra+`
+		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage discord: %w", err)
 	}
 	return scanPGSamplesLight(rows)
 }
@@ -4827,8 +4997,19 @@ func (db *DB) triageSecondOpinionPG(ctx context.Context, limit int, trusted []st
 // partial index costs ~100s, the recursive probe ~80 index descents / ~ms).
 // Must stay byte-compatible with idx_samples_{good,bad}_route_score's WHERE.
 const (
-	triageGoodScoredWherePG        = `label = 'good' AND litmus_score IS NOT NULL AND cleave_result IS NOT NULL AND skip = '' AND path <> ''`
-	triageGoodScoredWherePGAliased = `s.label = 'good' AND s.litmus_score IS NOT NULL AND s.cleave_result IS NOT NULL ` +
+	// The unconvicted pool, not just the good one (2026-08-30). An unknown-labelled
+	// file sitting at the top of its route's score distribution pins that route's
+	// threshold exactly as a good-labelled one does — the threshold is placed over
+	// the slice's highest-scoring NON-BAD files, and an unknown label is not a
+	// conviction. Before this, the inner walk required label='good', so those files
+	// were invisible to every confidence-ranked queue we have.
+	//
+	// Matches idx_samples_unconvicted_route_score. The narrower
+	// idx_samples_good_route_score no longer covers this predicate; keeping the
+	// query and the index in step is the whole reason that index was added.
+	triageUnconvictedScoredWherePG = `label IN ('good', 'unknown') AND litmus_score IS NOT NULL ` +
+		`AND cleave_result IS NOT NULL AND skip = '' AND path <> ''`
+	triageUnconvictedScoredWherePGAliased = `s.label IN ('good', 'unknown') AND s.litmus_score IS NOT NULL AND s.cleave_result IS NOT NULL ` +
 		`AND s.skip = '' AND s.path <> ''`
 	triageBadScoredWherePG        = `label = 'bad' AND litmus_score IS NOT NULL AND cleave_result IS NOT NULL AND skip = '' AND path <> ''`
 	triageBadScoredWherePGAliased = `s.label = 'bad' AND s.litmus_score IS NOT NULL AND s.cleave_result IS NOT NULL AND s.skip = '' AND s.path <> ''`
@@ -4860,11 +5041,11 @@ func (db *DB) triageHighestPG(ctx context.Context, limit int, createdBefore, mis
 	rows, err := db.pool.Query(ctx,
 		`WITH RECURSIVE fts AS (
 		   (SELECT file_type FROM samples
-		     WHERE `+triageGoodScoredWherePG+`
+		     WHERE `+triageUnconvictedScoredWherePG+`
 		     ORDER BY file_type LIMIT 1)
 		   UNION ALL
 		   SELECT (SELECT s.file_type FROM samples s
-		           WHERE `+triageGoodScoredWherePGAliased+` AND s.file_type > fts.file_type
+		           WHERE `+triageUnconvictedScoredWherePGAliased+` AND s.file_type > fts.file_type
 		           ORDER BY s.file_type LIMIT 1)
 		   FROM fts WHERE fts.file_type IS NOT NULL
 		 )
@@ -4877,7 +5058,7 @@ func (db *DB) triageHighestPG(ctx context.Context, limit int, createdBefore, mis
 		              s0.litmus_score AS best,
 		              ROW_NUMBER() OVER (ORDER BY s0.litmus_score DESC) AS rank
 		       FROM samples s0
-		       WHERE s0.label = 'good' AND s0.cleave_result IS NOT NULL AND s0.skip = ''
+		       WHERE s0.label IN ('good', 'unknown') AND s0.cleave_result IS NOT NULL AND s0.skip = ''
 		         AND s0.litmus_score IS NOT NULL
 		         AND s0.file_type = f.file_type
 		         AND (s0.parent = '' OR s0.path LIKE '%!!%')

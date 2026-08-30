@@ -4246,6 +4246,23 @@ const (
 	// adjudication queues such as review and new; repair queues have different
 	// notions of value and retain their queue-specific ordering.
 	TriageInteresting
+
+	// TriageRepair is TriageInteresting's mirror, for the false-positive repair
+	// queues: UNcorroborated first, newest within each bucket.
+	//
+	// The inversion is the whole point. If we flag a file and no threat feed,
+	// scanner or advisory has ever cited it, the only party claiming it is bad
+	// is us — which is what an over-firing rule looks like from the outside.
+	// When somebody else DOES cite it, our detection is most likely right and it
+	// is the benign LABEL that is wrong, which is the second queue's question,
+	// not a repair. So the rows least likely to be real detections sort first.
+	//
+	// corroborated is a boolean, so this is a two-bucket partition rather than a
+	// sort: with the matching idx_samples_*_repair partial index the walk is an
+	// ordered scan of the uncorroborated bucket and then the corroborated one,
+	// with no sort node at all. Keep the spelling byte-compatible with that
+	// index or the planner sorts the whole partition instead.
+	TriageRepair
 )
 
 // TriageBad returns analyzed top-level bad-labeled samples that Cleave did not
@@ -4268,11 +4285,15 @@ func (db *DB) TriageBad(ctx context.Context, limit int, f TriageFilter) ([]*Samp
 }
 
 // TriageGood returns analyzed top-level good-labeled samples that trip Cleave
-// detection — a hostile trait (max_crit >= 5) or a second
-// suspicious-or-hostile trait (suspicious_count >= 2) — taking up to limit of
-// the most recently added (created_at). Litmus-only disagreements belong to
-// TriageHighest's premium, route-balanced label review; mixing them into this
-// repair queue made trait-clean rows cycle without a trait to fix.
+// detection — a hostile trait (max_crit >= 5) or a second suspicious-or-hostile
+// trait (suspicious_count >= 2) — taking up to limit of the most recently added
+// (created_at).
+//
+// NOT a registered queue any more (2026-08-30): the "good" queue was replaced by
+// the unconvicted pair, which cuts the same population by severity instead of by
+// label. This selector survives for `hopper export`, whose dataset names are a
+// downstream contract. Nothing else calls it, and triage should not — the pair
+// is disjoint and the export is not.
 func (db *DB) TriageGood(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
 		return db.triageGoodPG(ctx, limit, f)
@@ -4308,8 +4329,8 @@ func (db *DB) TriageGood(ctx context.Context, limit int, f TriageFilter) ([]*Sam
 // is labelled good or unknown — a bad-labelled archive belongs to TriageLowest,
 // whose members it holds. skip = ” matches collimator's LABELED_WHERE, so the
 // queue only holds rows that actually reach training; fixing a row the trainer
-// already ignores moves nothing. createdBefore keeps the queue off TriageGood's
-// newest-first end of the table.
+// already ignores moves nothing. createdBefore keeps the queue off the
+// newest-first end of the table, where the unconvicted pair is already working.
 //
 // Members whose path carries no "!!" archive delimiter, or whose parent row is
 // itself absent, are excluded: the API cannot extract them (it answers 422 /
@@ -4415,6 +4436,10 @@ func (db *DB) StrandedMembers(ctx context.Context, root string) ([]*Sample, erro
 // finding (suspicious_count >= 1), taking up to limit of the most recently
 // added (created_at). The review pool is a separate, explicit queue; keeping it
 // out of this selector prevents two workers from judging the same sample.
+//
+// Like TriageGood, no longer a registered queue: suspicious_count >= 1 is
+// exactly max_crit >= 4, so this population is the unconvicted pair's, split
+// across its two severity tiers. Retained for `hopper export`.
 // Empty paths are excluded ([triageServablePathSQL]): explode records
 // registry/fetched references with samples.path ” and no bytes to fetch.
 func (db *DB) TriageNew(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
@@ -4435,6 +4460,97 @@ func (db *DB) TriageReview(ctx context.Context, limit int, f TriageFilter) ([]*S
 		return db.triageReviewPG(ctx, limit, f)
 	}
 	return db.triageReviewSQLite(ctx, limit, f)
+}
+
+// TriageVersionDrift returns unconvicted samples that fire, from packages whose
+// earlier release is labelled good and fires nothing. See
+// [triageVersionDriftWhere] for why the comparison is by arrival rather than by
+// parsed version.
+//
+// It pays twice: a real between-release compromise and a newly over-firing rule
+// look identical from one file, and both are worth finding. The clean sibling is
+// the evidence that separates them.
+func (db *DB) TriageVersionDrift(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.triageVersionDriftPG(ctx, limit, f)
+	}
+	return db.triageVersionDriftSQLite(ctx, limit, f)
+}
+
+// fpTraitWindow is how many recent good-pool rows fp-trait ranks traits within.
+//
+// Bounded on purpose, and this is the design decision that lets the queue exist
+// without a new table. Ranking traits across the whole good pool means an
+// aggregate over tens of millions of rows on every poll — the load the queue is
+// supposed to REDUCE. Ranking within the most recent window is one ordered
+// index walk, and it also answers the better question: an operator fixing false
+// positives cares which rule is over-firing NOW, not which one accumulated the
+// largest historical total before someone already loosened it.
+const fpTraitWindow = 5000
+
+// TriageFPTrait returns samples that all fire the SAME over-firing trait: the
+// one appearing on the most benign-labelled samples in the recent window.
+//
+// Every other queue hands the model N unrelated false positives and asks it to
+// find N separate defects. One bad rule can produce thousands of them, so that
+// is N passes to fix a thing that is one edit. This queue clusters the batch on
+// a single trait instead, which is what makes the pattern visible: twenty benign
+// files that all trip trait X show what X actually matches in a way one file
+// never can.
+//
+// The unit of work stays a SAMPLE, not a trait — the registry hands consumers
+// []*Sample and a trait is not one. The trait only chooses which samples.
+//
+// Both steps run inside the same bounded window, so the whole thing is one
+// ordered walk of idx_samples_fp_trait_newest plus an aggregate over at most
+// fpTraitWindow rows. The window carries only (id, traits) and the full columns
+// are fetched by primary key for the handful of rows actually returned — the
+// ranking needs the traits of thousands of samples but the metadata of none of
+// them. Self-draining: loosening the trait drops its samples below max_crit >= 4
+// and the next pass ranks whatever is now worst.
+func (db *DB) TriageFPTrait(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.triageFPTraitPG(ctx, limit, f)
+	}
+	return db.triageFPTraitSQLite(ctx, limit, f)
+}
+
+// TriageUnconvictedHostile returns top-level samples nothing has convicted
+// (label good or unknown) that our rule engine flags HOSTILE (max_crit >= 5).
+// These are the costliest disagreements we hold: either a benign file is being
+// called malware by a rule that needs loosening, or an unlabelled file really is
+// malware and needs settling. See [triageUnconvictedHostileWhere].
+//
+// Ordering is the caller's: TriageRepair puts uncorroborated rows first (the
+// likeliest false positives), TriageStale walks the backlog. Both drain by the
+// findings dropping below the bar, so the newest-first and repair orderings need
+// no report; the stale ordering does (see ExcludeReportType).
+func (db *DB) TriageUnconvictedHostile(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.triageUnconvictedHostilePG(ctx, limit, f)
+	}
+	return db.triageUnconvictedHostileSQLite(ctx, limit, f)
+}
+
+// TriageUnconvictedSuspicious is the hostile tier's lower half: unconvicted
+// top-level samples whose worst finding is SUSPICIOUS (max_crit = 4), with the
+// label-conditional count bar described at [triageUnconvictedSuspiciousWhere].
+func (db *DB) TriageUnconvictedSuspicious(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.triageUnconvictedSuspiciousPG(ctx, limit, f)
+	}
+	return db.triageUnconvictedSuspiciousSQLite(ctx, limit, f)
+}
+
+// TriageDiscord returns top-level samples our two detectors disagree about —
+// the rule engine hostile while the ML ensemble is benign, or the ensemble
+// hostile while the rules are quiet. Label-agnostic by design; see
+// [triageDiscordWhere] for how the standing label reads against each half.
+func (db *DB) TriageDiscord(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.triageDiscordPG(ctx, limit, f)
+	}
+	return db.triageDiscordSQLite(ctx, limit, f)
 }
 
 // TriageSighted returns analyzed top-level, non-bad samples covered by a
@@ -4478,8 +4594,8 @@ func (db *DB) TriageSighted(ctx context.Context, limit int, f TriageFilter) ([]*
 // completed judgement satisfies whichever applied.
 // This is the population prism's /fallout page renders with no rationale line:
 // litmus classified the bytes hostile but no reasoning pass ever ran (arrivals
-// outpace the new queue, which ranks a litmus-hostile sample no higher than any
-// other suspicious unknown) or the pass failed. There is deliberately no label
+// outpace unconvicted:suspicious, which ranks a litmus-hostile sample no higher
+// than any other suspicious unknown) or the pass failed. There is deliberately no label
 // predicate — the page has none either, and most of the population is unlabeled.
 // Two drains: storing an interpretation (the write-back scan's interpret pass)
 // removes the row from the predicate, and rows carrying a reports row of type
@@ -4529,10 +4645,10 @@ var TrustedBadSources = []string{
 // benign label an outside source disputes — a sighting from one of the trusted
 // sources, or sightings from two-plus distinct sources — taking up to limit of
 // the most recently added (created_at). Samples that trip detection are
-// excluded: those are exactly TriageGood's set, and keeping the two queues
+// excluded: those are exactly the unconvicted pair's set, and keeping the queues
 // disjoint preserves the invariant that no two triage workers ever hold the
 // same sample (they share per-sha tmp dirs); a disputed sample flows here only
-// after the good queue resolves its detection gap. Rows analyzed at or after
+// after that pair resolves its detection gap. Rows analyzed at or after
 // analyzedBefore are skipped (a settling window so a just-analyzed sample
 // isn't immediately second-guessed), and rows carrying a reports row of type
 // "second" newer than the newest trusted sighting are skipped — recording that

@@ -2953,6 +2953,103 @@ func (db *DB) triageBadSQLite(ctx context.Context, limit int, f TriageFilter) ([
 	return scanLiteSamplesLight(rows)
 }
 
+// triageFPTraitSQLite mirrors triageFPTraitPG. SQLite has no
+// jsonb_array_elements, so json_each walks the array; it also has no
+// MATERIALIZED hint, but its CTEs are materialized by default, which is the
+// behaviour the PG side has to ask for explicitly.
+func (db *DB) triageVersionDriftSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	extra, args := triageFilterClauseSQLite(f, "samples")
+	args = append(args, limit)
+	//nolint:gosec // G202: predicates and column list are constant; filter values are parameterized via ? args
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleColsLight+` FROM samples
+		 WHERE `+triageVersionDriftWhere+extra+`
+		 `+triageOrderSQL(f)+` LIMIT ?`,
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage version drift: %w", err)
+	}
+	return scanLiteSamplesLight(rows)
+}
+
+func (db *DB) triageFPTraitSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	extra, args := triageFilterClauseSQLite(f, "samples")
+	args = append(args, fpTraitWindow, limit)
+	//nolint:gosec // G202: predicates and column list are constant; filter values are parameterized via ? args
+	rows, err := db.lite.QueryContext(ctx,
+		`WITH win AS (
+		   -- Aliased for the same reason as the PG mirror: the outer column
+		   -- list is bare names and would otherwise be ambiguous once joined.
+		   SELECT id AS win_id, top_traits AS win_traits FROM samples
+		    WHERE `+triageFPTraitWhere+extra+`
+		    ORDER BY created_at DESC, id DESC
+		    LIMIT ?
+		 ), worst AS (
+		   SELECT json_extract(e.value, '$.id') AS trait_id, count(*) AS n
+		     FROM win, json_each(win.win_traits) e
+		    WHERE COALESCE(json_extract(e.value, '$.crit'), 0) >= `+strconv.Itoa(suspiciousCrit)+`
+		    GROUP BY 1
+		    ORDER BY n DESC, trait_id ASC
+		    LIMIT 1
+		 )
+		 SELECT `+liteSampleColsLight+` FROM samples
+		  JOIN win ON win.win_id = samples.id
+		  CROSS JOIN worst
+		  WHERE EXISTS (SELECT 1 FROM json_each(win.win_traits) e
+		                 WHERE json_extract(e.value, '$.id') = worst.trait_id)
+		  ORDER BY samples.created_at DESC, samples.id DESC LIMIT ?`,
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage fp-trait: %w", err)
+	}
+	return scanLiteSamplesLight(rows)
+}
+
+func (db *DB) triageUnconvictedHostileSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	extra, args := triageFilterClauseSQLite(f, "samples")
+	args = append(args, limit)
+	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleColsLight+` FROM samples
+		 WHERE `+triageUnconvictedHostileWhere+extra+`
+		 `+triageOrderSQL(f)+` LIMIT ?`,
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage unconvicted hostile: %w", err)
+	}
+	return scanLiteSamplesLight(rows)
+}
+
+func (db *DB) triageUnconvictedSuspiciousSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	extra, args := triageFilterClauseSQLite(f, "samples")
+	args = append(args, limit)
+	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleColsLight+` FROM samples
+		 WHERE `+triageUnconvictedSuspiciousWhere+extra+`
+		 `+triageOrderSQL(f)+` LIMIT ?`,
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage unconvicted suspicious: %w", err)
+	}
+	return scanLiteSamplesLight(rows)
+}
+
+func (db *DB) triageDiscordSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+	extra, args := triageFilterClauseSQLite(f, "samples")
+	args = append(args, limit)
+	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleColsLight+` FROM samples
+		 WHERE `+triageDiscordWhereSQLite+extra+`
+		 `+triageOrderSQL(f)+` LIMIT ?`,
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage discord: %w", err)
+	}
+	return scanLiteSamplesLight(rows)
+}
+
 func (db *DB) triageGoodSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
 	extra, args := triageFilterClauseSQLite(f, "samples")
 	args = append(args, limit)
@@ -2989,7 +3086,7 @@ func (db *DB) triageHighestSQLite(ctx context.Context, limit int, createdBefore,
 		            litmus_score AS best,
 		            ROW_NUMBER() OVER (PARTITION BY file_type ORDER BY litmus_score DESC) AS rank
 		     FROM samples s0
-		     WHERE label = 'good' AND cleave_result IS NOT NULL AND skip = ''
+		     WHERE label IN ('good', 'unknown') AND cleave_result IS NOT NULL AND skip = ''
 		       AND litmus_score IS NOT NULL AND path <> ''
 		       AND (parent = '' OR path LIKE '%!!%')
 		       AND (parent = '' OR EXISTS (SELECT 1 FROM samples pp WHERE pp.sha256 = s0.parent))
@@ -4886,13 +4983,32 @@ func (db *DB) feedSamplesCountSQLite(ctx context.Context, q *FeedQuery) (int, er
 // ceiling — bind them before any placeholders that appear later in the query.
 // Mirrors prism's envelopeClass, PG's feedClassExpr, and [LitmusClass]; keep
 // the group in sync.
-const litmusClassSQLite = `COALESCE(CAST(json_extract(litmus_result, '$.class') AS INTEGER), ` +
-	`CASE WHEN litmus_result IS NULL THEN 0 ` +
-	`WHEN COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) IS NULL THEN 2 ` +
-	`WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) < 0 THEN 0 ` +
-	`WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) <= ? THEN 2 ` +
-	`WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) <= ? THEN 1 ` +
-	`ELSE 0 END)`
+// litmusClassSQLiteExpr renders SQLite's stand-in for the litmus_class column,
+// which is Postgres-only (a trigger materializes it there; see the migration
+// list). crit and susp are the two level thresholds, spelled either as "?"
+// placeholders or as literals — see the two bindings below.
+func litmusClassSQLiteExpr(crit, susp string) string {
+	lvl := `COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l'))`
+	return `COALESCE(CAST(json_extract(litmus_result, '$.class') AS INTEGER), ` +
+		`CASE WHEN litmus_result IS NULL THEN 0 ` +
+		`WHEN ` + lvl + ` IS NULL THEN 2 ` +
+		`WHEN CAST(` + lvl + ` AS INTEGER) < 0 THEN 0 ` +
+		`WHEN CAST(` + lvl + ` AS INTEGER) <= ` + crit + ` THEN 2 ` +
+		`WHEN CAST(` + lvl + ` AS INTEGER) <= ` + susp + ` THEN 1 ` +
+		`ELSE 0 END)`
+}
+
+// litmusClassSQLite takes its two thresholds as bound ? args, for the callers
+// that already build an arg list around it.
+var litmusClassSQLite = litmusClassSQLiteExpr("?", "?")
+
+// litmusClassSQLiteInline is the same expression with both thresholds as
+// literals. Both are untyped int constants, so there is nothing to inject; what
+// it buys is a predicate carrying no args of its own, which is what lets a
+// selector share one WHERE constant with countTriage — whose arg list is
+// positional and assumes the population predicate contributes none.
+var litmusClassSQLiteInline = litmusClassSQLiteExpr(
+	strconv.Itoa(CriticalLevel), strconv.Itoa(SuspiciousCeiling))
 
 func (q *FeedQuery) whereSQLite() (where string, args []any) {
 	// file_type <> 'registry' drops provenance sidecars — the `*.registry.json`

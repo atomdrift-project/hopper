@@ -49,6 +49,68 @@ const (
 		triageServablePathSQL + `
 		   AND (max_crit >= 5 OR suspicious_count >= 2)`
 
+	// The unconvicted pair: samples nothing has convicted (label IN
+	// ('good','unknown')) that our own RULE ENGINE flags, split by the severity
+	// of that flag. Together they are exactly the old good + new populations —
+	// suspicious_count counts crit>=4 findings, so the old
+	// `unknown AND suspicious_count >= 1` was `unknown AND max_crit >= 4` — but
+	// split on the axis that decides how much a mistake costs rather than on the
+	// standing label. The label is not the queue's identity here; it rides into
+	// the prompt as per-sample evidence, which is what lets one batch mix
+	// benign-labeled false positives with unlabeled samples that need traits
+	// ADDED. A queue that only ever shows a judge false positives teaches it to
+	// loosen.
+	//
+	// The two are disjoint (max_crit >= 5 vs max_crit = 4) and their union is
+	// the old pair's union exactly, so the split costs no coverage.
+	triageUnconvictedHostileWhere = `label IN ('good', 'unknown') AND cleave_result IS NOT NULL AND parent = '' AND skip = ''` +
+		triageServablePathSQL + `
+		   AND max_crit >= 5`
+
+	// The suspicious tier's count bar is conditional on the label, because one
+	// suspicious finding means different things on either side of it: on a file
+	// we have already judged benign it is within policy (a benign sample is
+	// allowed one suspicious finding if it genuinely does something unusual), so
+	// it takes two to be worth a pass; on an unlabeled file it is the whole
+	// reason to look. Without the label arm this queue would silently drop the
+	// old new queue's weakest-but-largest slice.
+	triageUnconvictedSuspiciousWhere = `label IN ('good', 'unknown') AND cleave_result IS NOT NULL AND parent = '' AND skip = ''` +
+		triageServablePathSQL + `
+		   AND max_crit = 4 AND (suspicious_count >= 2 OR label = 'unknown')`
+
+	// discord: our two detectors disagree about the same bytes. The rule engine
+	// speaks through max_crit and the ML ensemble through litmus_class, and a
+	// file where one screams and the other is silent is a defect in whichever is
+	// wrong — which is why this is deliberately label-agnostic, like popular and
+	// fallout. The standing label picks the reading rather than the population:
+	//
+	//	good    + rules hostile, ML benign -> a rule is over-firing (FP)
+	//	good    + rules silent, ML hostile -> the ensemble is over-firing (FP)
+	//	bad     + rules hostile, ML benign -> an ML training gap
+	//	bad     + rules silent, ML hostile -> a rule gap
+	//	unknown + either                   -> classify, and the disagreement
+	//	                                      says which detector to trust
+	//
+	// One selector, four readings, and it closes the litmus_class axis that
+	// nothing but fallout touches — and fallout gates on being undescribed or
+	// uncorroborated, so it is an explanation queue, not a detector-conflict one.
+	//
+	// litmus_class IS NOT NULL excludes rows the ensemble has never scored:
+	// silence from a detector that never ran is not disagreement. The column is
+	// nullable with a backfill still healing older rows, so without this the
+	// queue would fill with samples nobody has an ML opinion about.
+	// Per-dialect, like triageNewWhere*: litmus_class is a Postgres-only
+	// materialized column (a trigger derives it there), so SQLite recomputes it
+	// from litmus_result with the same formula. The PG side additionally guards
+	// litmus_class IS NOT NULL — the column is nullable with a backfill still
+	// healing older rows, and silence from a detector that never ran is not
+	// disagreement. On SQLite the expression always yields a value, so the
+	// equivalent guard is on litmus_result itself.
+	triageDiscordWherePG = `cleave_result IS NOT NULL AND parent = '' AND skip = ''` +
+		triageServablePathSQL + `
+		   AND litmus_result IS NOT NULL AND litmus_class IS NOT NULL
+		   AND ((max_crit >= 5 AND litmus_class = 0) OR (max_crit < 4 AND litmus_class = 2))`
+
 	// The sighted queue is derived from the sightings ledger, not from the
 	// legacy sighted label. A package claim applies either to the exact stored
 	// version named by affected, or to every version when affected is empty.
@@ -97,11 +159,68 @@ const triageSightedMatchCTE = `WITH review_sightings AS (
 // suspiciousCrit, and spelling that bound as a SQL literal here would put the
 // number in two places — the one arrangement guaranteed to drift the day
 // somebody retunes the floor.
+// fp-trait: the good-labelled half of the unconvicted pool, restricted to
+// rows carrying a derived top_traits list. Deliberately good-ONLY, unlike the
+// unconvicted pair: this queue ranks by which of OUR RULES produces the most
+// false positives, and an unlabelled sample firing a trait is not evidence of
+// one. max_crit >= 4 rather than the pair's split bars, because a trait's
+// over-firing is worth counting at either severity.
+//
+// It overlaps both unconvicted tiers on purpose — same rows, different
+// question. popular and fallout already select across other queues'
+// populations for the same reason, and the consumer's process-wide claim set
+// is what keeps two workers off one sample.
+var triageFPTraitWhere = `label = 'good' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''` +
+	triageServablePathSQL + `
+	   AND max_crit >= ` + strconv.Itoa(suspiciousCrit) + `
+	   AND top_traits IS NOT NULL AND top_traits <> ''`
+
+// triagePopularWhere is a var for the same reason: an embedded threshold.
+// version-drift: an unconvicted sample that fires, from a package where an
+// EARLIER version is labelled good and fires nothing. Either the package was
+// compromised between releases, or the detection is new and wrong — and the
+// clean sibling is what makes the question answerable, because it hands the
+// judge a diff instead of a lone file to reason about.
+//
+// Ordering is by created_at rather than by parsed version. Version comparison
+// across npm, PyPI, Alpine and Arch is a rabbit hole with no shared grammar, and
+// "an earlier release of this package was clean" is what the queue actually
+// means; arrival order answers that without inventing a comparator.
+//
+// The sibling probe is an EXISTS on purl_base, which idx_samples_purl_base
+// serves, and a package has few versions — so the probe is a handful of rows per
+// candidate rather than a join across the corpus.
+// Split in two because only the first half can live in a partial index: the
+// sibling test is a cross-row predicate, which Postgres will not accept in one.
+// triageVersionDriftCandidates is therefore what idx_samples_version_drift_newest
+// is built from, and the full predicate (candidates AND the sibling EXISTS)
+// implies it — which is the direction partial-index matching needs.
+var triageVersionDriftCandidates = `label IN ('good', 'unknown') AND cleave_result IS NOT NULL AND parent = '' AND skip = ''` +
+	triageServablePathSQL + `
+	   AND max_crit >= ` + strconv.Itoa(suspiciousCrit) + `
+	   AND purl_base <> ''`
+
+var triageVersionDriftWhere = triageVersionDriftCandidates + `
+	   AND EXISTS (SELECT 1 FROM samples p
+	                WHERE p.purl_base = samples.purl_base AND p.sha256 <> samples.sha256
+	                  AND p.label = 'good' AND p.cleave_result IS NOT NULL AND p.skip = ''
+	                  AND p.max_crit < ` + strconv.Itoa(suspiciousCrit) + `
+	                  AND p.created_at < samples.created_at)`
+
 var triagePopularWhere = `cleave_result IS NOT NULL AND parent = ''` + triageServablePathSQL + `
 		   AND skip != 'conflict'
 		   AND max_crit >= ` + strconv.Itoa(suspiciousCrit) + `
 		   AND purl_base != ''
 		   AND EXISTS (SELECT 1 FROM popular_packages p WHERE p.purl_base = samples.purl_base)`
+
+// triageDiscordWhereSQLite mirrors [triageDiscordWherePG] with the class
+// expression inlined. A var rather than a const because it is built from
+// litmusClassSQLiteInline.
+var triageDiscordWhereSQLite = `cleave_result IS NOT NULL AND parent = '' AND skip = ''` +
+	triageServablePathSQL + `
+	   AND litmus_result IS NOT NULL
+	   AND ((max_crit >= 5 AND ` + litmusClassSQLiteInline + ` = 0)
+	        OR (max_crit < 4 AND ` + litmusClassSQLiteInline + ` = 2))`
 
 // CountTriageBad reports how many samples TriageBad would draw from, capped at
 // [TriageDepthCap]. Its siblings below mirror the other countable selectors.
@@ -117,6 +236,38 @@ func (db *DB) CountTriageGood(ctx context.Context, f TriageFilter) (int64, error
 // CountTriageNew reports TriageNew's population, capped at [TriageDepthCap].
 func (db *DB) CountTriageNew(ctx context.Context, f TriageFilter) (int64, error) {
 	return db.countTriage(ctx, "new", triageNewWherePG, triageNewWhereSQLite, f)
+}
+
+// CountTriageUnconvictedHostile reports the hostile-tier unconvicted population,
+// capped at [TriageDepthCap].
+func (db *DB) CountTriageUnconvictedHostile(ctx context.Context, f TriageFilter) (int64, error) {
+	return db.countTriage(ctx, "unconvicted-hostile", triageUnconvictedHostileWhere, triageUnconvictedHostileWhere, f)
+}
+
+// CountTriageUnconvictedSuspicious reports the suspicious-tier unconvicted
+// population, capped at [TriageDepthCap].
+func (db *DB) CountTriageUnconvictedSuspicious(ctx context.Context, f TriageFilter) (int64, error) {
+	return db.countTriage(ctx, "unconvicted-suspicious", triageUnconvictedSuspiciousWhere, triageUnconvictedSuspiciousWhere, f)
+}
+
+// CountTriageVersionDrift reports version-drift's population, capped at
+// [TriageDepthCap].
+func (db *DB) CountTriageVersionDrift(ctx context.Context, f TriageFilter) (int64, error) {
+	return db.countTriage(ctx, "version-drift", triageVersionDriftWhere, triageVersionDriftWhere, f)
+}
+
+// CountTriageFPTrait reports the population fp-trait ranks within, capped at
+// [TriageDepthCap]. It counts the POOL, not the current worst trait's share of
+// it: the trait changes as edits land, so a count of its matches would move for
+// reasons an operator reading a backlog cannot attribute to progress.
+func (db *DB) CountTriageFPTrait(ctx context.Context, f TriageFilter) (int64, error) {
+	return db.countTriage(ctx, "fp-trait", triageFPTraitWhere, triageFPTraitWhere, f)
+}
+
+// CountTriageDiscord reports the detector-disagreement population, capped at
+// [TriageDepthCap].
+func (db *DB) CountTriageDiscord(ctx context.Context, f TriageFilter) (int64, error) {
+	return db.countTriage(ctx, "discord", triageDiscordWherePG, triageDiscordWhereSQLite, f)
 }
 
 // CountTriageSighted reports TriageSighted's population, capped at [TriageDepthCap].
@@ -176,22 +327,27 @@ const TriageScoreDivider = 0.5
 // is the population good:fp-peak grinds down. Not the selector's output: that
 // is each route's top ten, whatever their scores.
 func (db *DB) CountTriageHighest(ctx context.Context, divider float64, createdBefore, missingBefore time.Time, f TriageFilter) (int64, error) {
-	return db.countScored(ctx, "highest", "good", ">=", divider, createdBefore, missingBefore, f)
+	return db.countScored(ctx, "highest", "label IN ('good', 'unknown')", ">=", divider, createdBefore, missingBefore, f)
 }
 
 // CountTriageLowest is the mirror: bad-labeled samples scored BELOW divider —
 // known malware our ensemble calls clean, the population bad:ml-blind works.
 func (db *DB) CountTriageLowest(ctx context.Context, divider float64, createdBefore, missingBefore time.Time, f TriageFilter) (int64, error) {
-	return db.countScored(ctx, "lowest", "bad", "<", divider, createdBefore, missingBefore, f)
+	return db.countScored(ctx, "lowest", "label = 'bad'", "<", divider, createdBefore, missingBefore, f)
 }
 
 // countScored counts one side of the model/label disagreement, excluding rows
-// already drained by a judgement report. cmp is ">=" or "<" and label is a
-// literal from the two callers above — neither is caller-controlled.
-func (db *DB) countScored(ctx context.Context, queue, label, cmp string, divider float64,
+// already drained by a judgement report. cmp is ">=" or "<" and labelPred is a
+// literal predicate from the two callers below — neither is caller-controlled.
+//
+// labelPred rather than a bare label because the two sides are no longer
+// symmetric: lowest counts one pool ('bad'), highest counts the whole unconvicted
+// pool, since an unknown-labelled file pins a route's threshold just as a
+// good-labelled one does.
+func (db *DB) countScored(ctx context.Context, queue, labelPred, cmp string, divider float64,
 	createdBefore, missingBefore time.Time, f TriageFilter,
 ) (int64, error) {
-	where := `label = '` + label + `' AND cleave_result IS NOT NULL AND skip = ''` +
+	where := labelPred + ` AND cleave_result IS NOT NULL AND skip = ''` +
 		triageServablePathSQL + `
 		   AND litmus_score IS NOT NULL AND litmus_score ` + cmp + ` %s
 		   AND (parent = '' OR path LIKE '%%!!%%')

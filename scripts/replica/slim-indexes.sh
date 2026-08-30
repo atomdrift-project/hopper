@@ -97,6 +97,7 @@ idx_samples_bad_miss_newest
 idx_samples_bad_miss_stale
 idx_samples_bad_route_score
 idx_samples_class_top_created
+idx_samples_discord_newest
 idx_samples_corroborated_created
 idx_samples_sighted_created
 idx_samples_domain
@@ -107,12 +108,9 @@ idx_samples_feed
 idx_samples_feed_top_created_done
 idx_samples_filename_trgm
 idx_samples_formula_top
-idx_samples_good_repair_newest
-idx_samples_good_repair_stale
+idx_samples_fp_trait_newest
 idx_samples_good_route_score
 idx_samples_labeled_route
-idx_samples_new_interesting
-idx_samples_new_stale
 idx_samples_package_version
 idx_samples_popular_ranked
 idx_samples_purl_base
@@ -121,7 +119,12 @@ idx_samples_second_newest
 idx_samples_sighted_purl
 idx_samples_stranded_member
 idx_samples_top_ready_created
-idx_samples_unknown_newest
+idx_samples_unconvicted_hostile_repair
+idx_samples_unconvicted_hostile_stale
+idx_samples_unconvicted_route_score
+idx_samples_unconvicted_susp_repair
+idx_samples_unconvicted_susp_stale
+idx_samples_version_drift_newest
 idx_sightings_review_queue
 idx_sightings_subject
 idx_sl_child_parents
@@ -146,6 +149,8 @@ idx_slh_sha256_retired
 # splits the body on whitespace, so a '#' line would parse as index names and
 # fail the guard.
 REPLICA_DROP_INDEXES='
+idx_samples_good_repair_newest
+idx_samples_unknown_newest
 idx_samples_candidate_keyset
 idx_sightings_acquisition_recent
 idx_sightings_recent

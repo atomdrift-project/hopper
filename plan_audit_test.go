@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -332,4 +333,212 @@ func firstPlanLines(plan string) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// TestPlanAuditUnconvictedQueues is the efficiency guard for the queues that
+// replaced good/new. Each selector must WALK its partial index in order rather
+// than scan-and-sort: at the table's real size the difference is the 8-99s
+// measurements recorded beside the index list, and every one of those exceeds
+// the API's apiQueryTimeout, which means the queue never runs at all.
+//
+// Two distinct failures are checked because they have different causes. A Seq
+// Scan means the partial index predicate no longer matches the query's (the
+// index is not slow, it is unused). A Sort means the ORDER BY drifted from the
+// index's key list — the plan still finds the rows, then sorts the whole
+// partition to order them.
+func TestPlanAuditUnconvictedQueues(t *testing.T) {
+	db := openPlanDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	for _, tc := range []struct {
+		name  string
+		where string
+		order TriageFilter
+		index string
+	}{
+		{
+			name: "unconvicted-hostile", where: triageUnconvictedHostileWhere,
+			order: TriageFilter{Order: TriageRepair}, index: "idx_samples_unconvicted_hostile_repair",
+		},
+		{
+			name: "unconvicted-hostile-stale", where: triageUnconvictedHostileWhere,
+			order: TriageFilter{Order: TriageStale}, index: "idx_samples_unconvicted_hostile_stale",
+		},
+		{
+			name: "unconvicted-suspicious", where: triageUnconvictedSuspiciousWhere,
+			order: TriageFilter{Order: TriageRepair}, index: "idx_samples_unconvicted_susp_repair",
+		},
+		{
+			name: "unconvicted-suspicious-stale", where: triageUnconvictedSuspiciousWhere,
+			order: TriageFilter{Order: TriageStale}, index: "idx_samples_unconvicted_susp_stale",
+		},
+		{
+			name: "discord", where: triageDiscordWherePG,
+			order: TriageFilter{}, index: "idx_samples_discord_newest",
+		},
+		{
+			name: "fp-trait", where: triageFPTraitWhere,
+			order: TriageFilter{}, index: "idx_samples_fp_trait_newest",
+		},
+		// version-drift's sibling test is a cross-row EXISTS and cannot live in
+		// the partial, so this checks the half that can: the candidate walk must
+		// still be an ordered index scan. What it CANNOT check is the filter
+		// rate — if few candidates have a clean earlier sibling, the walk runs
+		// long before LIMIT is satisfied. If that shows up in production the fix
+		// is a bounded created_at window like fallout's, not a wider index.
+		{
+			name: "version-drift", where: triageVersionDriftWhere,
+			order: TriageFilter{}, index: "idx_samples_version_drift_newest",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sql := `EXPLAIN SELECT ` + pgSampleColsLight + ` FROM samples WHERE ` + tc.where +
+				` ` + triageOrderSQL(tc.order) + ` LIMIT 64`
+			plan := explainText(t, ctx, db, sql)
+			if planSeqScansSamples(plan) {
+				t.Errorf("%s: Seq Scan on samples — the partial index predicate no longer "+
+					"matches the selector's:\n%s", tc.name, plan)
+			}
+			if !strings.Contains(plan, tc.index) {
+				t.Errorf("%s: not using %s:\n%s", tc.name, tc.index, plan)
+			}
+			if strings.Contains(plan, "Sort") {
+				t.Errorf("%s: plan sorts instead of walking %s in order; the ORDER BY has "+
+					"drifted from the index key list:\n%s", tc.name, tc.index, plan)
+			}
+			t.Logf("%s: ok\n%s", tc.name, firstPlanLines(plan))
+		})
+	}
+}
+
+// TestPlanAuditFPTraitWindow guards the bound that lets fp-trait exist without a
+// precomputed aggregate table. The ranking is only affordable because the window
+// is one ordered index walk of at most fpTraitWindow rows; if the plan seq-scans
+// or sorts to build it, the queue is aggregating the whole good pool on every
+// poll — which is the Postgres load it was designed to avoid.
+func TestPlanAuditFPTraitWindow(t *testing.T) {
+	db := openPlanDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	sql := `EXPLAIN SELECT ` + pgSampleColsLight + `, top_traits FROM samples
+	         WHERE ` + triageFPTraitWhere + `
+	         ORDER BY created_at DESC, id DESC LIMIT ` + strconv.Itoa(fpTraitWindow)
+	plan := explainText(t, ctx, db, sql)
+	if planSeqScansSamples(plan) {
+		t.Errorf("fp-trait window: Seq Scan on samples:\n%s", plan)
+	}
+	if !strings.Contains(plan, "idx_samples_fp_trait_newest") {
+		t.Errorf("fp-trait window: not using idx_samples_fp_trait_newest:\n%s", plan)
+	}
+	if strings.Contains(plan, "Sort") {
+		t.Errorf("fp-trait window: sorts instead of walking the index in order:\n%s", plan)
+	}
+	t.Logf("fp-trait window: ok\n%s", firstPlanLines(plan))
+}
+
+// TestPlanAuditHighestRouteWalk guards the 2026-08-30 widening of TriageHighest
+// to the unconvicted pool. The narrower idx_samples_good_route_score is a
+// label='good' partial and stops covering the widened predicate, so the
+// companion index is the only thing standing between the per-route LATERAL and
+// a full scan of every scored sample.
+func TestPlanAuditHighestRouteWalk(t *testing.T) {
+	db := openPlanDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	sql := `EXPLAIN SELECT file_type, litmus_score FROM samples
+	         WHERE ` + triageUnconvictedScoredWherePG + ` AND file_type = 'elf'
+	         ORDER BY litmus_score DESC LIMIT ` + strconv.Itoa(triagePerRouteK)
+	plan := explainText(t, ctx, db, sql)
+	if planSeqScansSamples(plan) {
+		t.Errorf("highest route walk: Seq Scan on samples:\n%s", plan)
+	}
+	if !strings.Contains(plan, "idx_samples_unconvicted_route_score") {
+		t.Errorf("highest route walk: not using idx_samples_unconvicted_route_score "+
+			"(the widened LATERAL cannot use the good-only partial):\n%s", plan)
+	}
+	if strings.Contains(plan, "Sort") {
+		t.Errorf("highest route walk: sorts instead of walking the route's score tail:\n%s", plan)
+	}
+	t.Logf("highest route walk: ok\n%s", firstPlanLines(plan))
+}
+
+// TestPlanAuditNewSelectorsExecute runs each Postgres selector added with the
+// unconvicted overhaul against a real database.
+//
+// It exists because the rest of the suite cannot: openTestDB is SQLite-backed,
+// so every triage*PG function is checked by the compiler and nothing else. That
+// gap is not theoretical — the fp-trait CTE shipped with an ambiguous `id`
+// reference that SQLite caught only because its own mirror had the same shape.
+// A PG-only mistake (a cast, a LATERAL, a jsonb operator, an ambiguous name)
+// would otherwise reach production as a 500 on every poll, which the API turns
+// into a queue that silently never runs.
+//
+// LIMIT 1 and no assertion on the rows: the point is that the server accepts and
+// executes the statement, not what the corpus happens to contain.
+func TestPlanAuditNewSelectorsExecute(t *testing.T) {
+	db := openPlanDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	now := time.Now()
+	for _, tc := range []struct {
+		run  func() ([]*Sample, error)
+		name string
+	}{
+		{name: "unconvicted-hostile", run: func() ([]*Sample, error) {
+			return db.TriageUnconvictedHostile(ctx, 1, TriageFilter{Order: TriageRepair})
+		}},
+		{name: "unconvicted-hostile-stale", run: func() ([]*Sample, error) {
+			return db.TriageUnconvictedHostile(ctx, 1, staleTriageFilter("unconvicted-hostile-stale"))
+		}},
+		{name: "unconvicted-suspicious", run: func() ([]*Sample, error) {
+			return db.TriageUnconvictedSuspicious(ctx, 1, TriageFilter{Order: TriageRepair})
+		}},
+		{name: "discord", run: func() ([]*Sample, error) {
+			return db.TriageDiscord(ctx, 1, TriageFilter{})
+		}},
+		{name: "fp-trait", run: func() ([]*Sample, error) {
+			return db.TriageFPTrait(ctx, 1, TriageFilter{})
+		}},
+		{name: "version-drift", run: func() ([]*Sample, error) {
+			return db.TriageVersionDrift(ctx, 1, TriageFilter{})
+		}},
+		{name: "highest (widened)", run: func() ([]*Sample, error) {
+			return db.TriageHighest(ctx, 1, now.Add(-OutlierGrace), now.Add(-MissingRetry), TriageFilter{})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.run(); err != nil {
+				t.Errorf("%s: %v", tc.name, err)
+			}
+		})
+	}
+
+	// The depth counts share the predicates but not the surrounding SQL, so a
+	// count can be broken while its selector works.
+	for _, tc := range []struct {
+		count func() (int64, error)
+		name  string
+	}{
+		{name: "unconvicted-hostile", count: func() (int64, error) {
+			return db.CountTriageUnconvictedHostile(ctx, TriageFilter{})
+		}},
+		{name: "unconvicted-suspicious", count: func() (int64, error) {
+			return db.CountTriageUnconvictedSuspicious(ctx, TriageFilter{})
+		}},
+		{name: "discord", count: func() (int64, error) { return db.CountTriageDiscord(ctx, TriageFilter{}) }},
+		{name: "fp-trait", count: func() (int64, error) { return db.CountTriageFPTrait(ctx, TriageFilter{}) }},
+		{name: "version-drift", count: func() (int64, error) {
+			return db.CountTriageVersionDrift(ctx, TriageFilter{})
+		}},
+	} {
+		t.Run("count/"+tc.name, func(t *testing.T) {
+			if _, err := tc.count(); err != nil {
+				t.Errorf("count %s: %v", tc.name, err)
+			}
+		})
+	}
 }

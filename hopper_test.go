@@ -1593,8 +1593,12 @@ func TestIndexRewriteHelpers(t *testing.T) {
 	if !isIndexRewriteDO(pathDDL) || !isDeferrableIndexDDL(pathDDL) {
 		t.Fatal("path <> rewrite must be a deferrable index-rewrite DO")
 	}
+	// The guard rewrites whatever partials still carry a pre-path <> ''
+	// predicate. Three left the list when good-stale/new-stale/new-interesting
+	// were retired with their queues, so the bound tracks the survivors rather
+	// than a fixed count that a retirement would break again.
 	names := indexNamesInDDL(pathDDL)
-	if len(names) < 8 {
+	if len(names) < 6 {
 		t.Fatalf("path rewrite indexes = %v", names)
 	}
 	old := `CREATE INDEX idx_samples_bad_miss_newest ON public.samples USING btree (created_at DESC, id DESC) WHERE ((label = 'bad'::text) AND (parent = ''::text))`

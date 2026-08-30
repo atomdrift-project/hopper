@@ -21,24 +21,24 @@ func postJSON(t *testing.T, h http.HandlerFunc, path, body string) *httptest.Res
 }
 
 // TestHandleReportDrainsAQueue proves the endpoint writes the row a selector
-// anti-joins on: after filing a "new-stale" report the sample leaves that
+// anti-joins on: after filing an "unconvicted-suspicious-stale" report the sample leaves that
 // queue, which is the whole purpose of the write.
 func TestHandleReportDrainsAQueue(t *testing.T) {
 	ctx := context.Background()
 	api := newTriageAPI(t, ctx)
-	seedNewQueue(t, ctx, api.db, 1)
+	seedUnconvictedQueue(t, ctx, api.db, 1)
 	const sha = "0000000000000000000000000000000000000000000000000000000000000001"
 
-	before, err := hopper.TriageQueues["new-stale"].Select(ctx, api.db, 5)
+	before, err := hopper.TriageQueues["unconvicted-suspicious-stale"].Select(ctx, api.db, 5)
 	if err != nil {
 		t.Fatalf("select before: %v", err)
 	}
 	if len(before) != 1 {
-		t.Fatalf("new-stale returned %d rows before the drain, want 1", len(before))
+		t.Fatalf("unconvicted-suspicious-stale returned %d rows before the drain, want 1", len(before))
 	}
 
 	rec := postJSON(t, api.handleReport, "/api/report",
-		`{"sha256":"`+sha+`","type":"new-stale","provider":"test","content":"judgement=confirmed"}`)
+		`{"sha256":"`+sha+`","type":"unconvicted-suspicious-stale","provider":"test","content":"judgement=confirmed"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.Bytes())
 	}
@@ -50,24 +50,24 @@ func TestHandleReportDrainsAQueue(t *testing.T) {
 		t.Errorf("status = %q, want recorded", got["status"])
 	}
 
-	after, err := hopper.TriageQueues["new-stale"].Select(ctx, api.db, 5)
+	after, err := hopper.TriageQueues["unconvicted-suspicious-stale"].Select(ctx, api.db, 5)
 	if err != nil {
 		t.Fatalf("select after: %v", err)
 	}
 	if len(after) != 0 {
-		t.Errorf("new-stale returned %d rows after the drain, want 0 — the report did not drain the queue", len(after))
+		t.Errorf("unconvicted-suspicious-stale returned %d rows after the drain, want 0 — the report did not drain the queue", len(after))
 	}
 }
 
 func TestHandleReportRejectsBadInput(t *testing.T) {
 	ctx := context.Background()
 	api := newTriageAPI(t, ctx)
-	seedNewQueue(t, ctx, api.db, 1)
+	seedUnconvictedQueue(t, ctx, api.db, 1)
 	const sha = "0000000000000000000000000000000000000000000000000000000000000001"
 
 	for name, body := range map[string]string{
-		"invalid sha":  `{"sha256":"nope","type":"new-stale"}`,
-		"missing sha":  `{"type":"new-stale"}`,
+		"invalid sha":  `{"sha256":"nope","type":"unconvicted-suspicious-stale"}`,
+		"missing sha":  `{"type":"unconvicted-suspicious-stale"}`,
 		"empty type":   `{"sha256":"` + sha + `","type":""}`,
 		"missing type": `{"sha256":"` + sha + `"}`,
 		"bad json":     `{`,
