@@ -388,7 +388,11 @@ func TestPlanAuditUnconvictedQueues(t *testing.T) {
 		// long before LIMIT is satisfied. If that shows up in production the fix
 		// is a bounded created_at window like fallout's, not a wider index.
 		{
-			name: "version-drift", where: triageVersionDriftWhere,
+			// Includes the window: without it this EXPLAIN measures a query the
+			// server no longer runs, which is how the unbounded version reached
+			// production green.
+			name:  "version-drift",
+			where: triageVersionDriftWhere + ` AND created_at > now() - interval '7 days'`,
 			order: TriageFilter{}, index: "idx_samples_version_drift_newest",
 		},
 	} {
@@ -504,7 +508,7 @@ func TestPlanAuditNewSelectorsExecute(t *testing.T) {
 			return db.TriageFPTrait(ctx, 1, TriageFilter{})
 		}},
 		{name: "version-drift", run: func() ([]*Sample, error) {
-			return db.TriageVersionDrift(ctx, 1, TriageFilter{})
+			return db.TriageVersionDrift(ctx, 1, now.Add(-VersionDriftWindow), TriageFilter{})
 		}},
 		{name: "highest (widened)", run: func() ([]*Sample, error) {
 			return db.TriageHighest(ctx, 1, now.Add(-OutlierGrace), now.Add(-MissingRetry), TriageFilter{})
@@ -532,7 +536,7 @@ func TestPlanAuditNewSelectorsExecute(t *testing.T) {
 		{name: "discord", count: func() (int64, error) { return db.CountTriageDiscord(ctx, TriageFilter{}) }},
 		{name: "fp-trait", count: func() (int64, error) { return db.CountTriageFPTrait(ctx, TriageFilter{}) }},
 		{name: "version-drift", count: func() (int64, error) {
-			return db.CountTriageVersionDrift(ctx, TriageFilter{})
+			return db.CountTriageVersionDrift(ctx, now.Add(-VersionDriftWindow), TriageFilter{})
 		}},
 	} {
 		t.Run("count/"+tc.name, func(t *testing.T) {

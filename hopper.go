@@ -4470,11 +4470,15 @@ func (db *DB) TriageReview(ctx context.Context, limit int, f TriageFilter) ([]*S
 // It pays twice: a real between-release compromise and a newly over-firing rule
 // look identical from one file, and both are worth finding. The clean sibling is
 // the evidence that separates them.
-func (db *DB) TriageVersionDrift(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+//
+// createdAfter is not optional in practice — see [VersionDriftWindow]. The
+// sibling probe is a per-row filter the index cannot absorb, so an unbounded
+// walk overruns the API's query budget rather than merely running slowly.
+func (db *DB) TriageVersionDrift(ctx context.Context, limit int, createdAfter time.Time, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.triageVersionDriftPG(ctx, limit, f)
+		return db.triageVersionDriftPG(ctx, limit, createdAfter, f)
 	}
-	return db.triageVersionDriftSQLite(ctx, limit, f)
+	return db.triageVersionDriftSQLite(ctx, limit, createdAfter, f)
 }
 
 // fpTraitWindow is how many recent good-pool rows fp-trait ranks traits within.

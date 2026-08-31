@@ -357,7 +357,7 @@ func TestTriageVersionDriftNeedsACleanEarlierSibling(t *testing.T) {
 	seed(7, "pkg:npm/convicted", "bad")
 	convicted := seed(8, "pkg:npm/convicted", "good", 4, 4)
 
-	got, err := db.TriageVersionDrift(ctx, 50, TriageFilter{})
+	got, err := db.TriageVersionDrift(ctx, 50, time.Now().Add(-VersionDriftWindow), TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageVersionDrift: %v", err)
 	}

@@ -2957,13 +2957,15 @@ func (db *DB) triageBadSQLite(ctx context.Context, limit int, f TriageFilter) ([
 // jsonb_array_elements, so json_each walks the array; it also has no
 // MATERIALIZED hint, but its CTEs are materialized by default, which is the
 // behaviour the PG side has to ask for explicitly.
-func (db *DB) triageVersionDriftSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClauseSQLite(f, "samples")
+func (db *DB) triageVersionDriftSQLite(ctx context.Context, limit int, createdAfter time.Time, f TriageFilter) ([]*Sample, error) {
+	extra, fargs := triageFilterClauseSQLite(f, "samples")
+	args := append([]any{createdAfter.UTC().Format(time.RFC3339Nano)}, fargs...)
 	args = append(args, limit)
 	//nolint:gosec // G202: predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleColsLight+` FROM samples
-		 WHERE `+triageVersionDriftWhere+extra+`
+		 WHERE `+triageVersionDriftWhere+`
+		   AND created_at > ?`+extra+`
 		 `+triageOrderSQL(f)+` LIMIT ?`,
 		args...)
 	if err != nil {

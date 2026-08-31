@@ -78,6 +78,22 @@ const (
 	// renders — the queue covers exactly what the page shows, and anything older
 	// backfills through the ordinary queues.
 	FalloutWindow = 7 * 24 * time.Hour
+
+	// VersionDriftWindow bounds how far back version-drift reaches, and unlike
+	// the grace windows above it exists for a hard performance reason.
+	//
+	// The queue's sibling test is a cross-row EXISTS, so it cannot live in a
+	// partial index: the planner walks the candidate index in created_at order
+	// and probes each row. When few candidates have a clean earlier release the
+	// walk runs long, and on 2026-08-31 it ran past the API's 30s query timeout
+	// on EVERY poll — 118 consecutive 500s, a queue that never once ran. The
+	// window caps the walk at rows that can still be reached inside the budget.
+	//
+	// A week is also the right answer on merit: what this queue looks for is a
+	// package compromised between releases, and the value of catching that
+	// decays by the day. A drift first published a month ago has either been
+	// caught by another queue or is already installed everywhere.
+	VersionDriftWindow = 7 * 24 * time.Hour
 )
 
 // staleTriageFilter builds the TriageFilter for a queue that walks
@@ -162,9 +178,9 @@ var TriageQueues = map[string]Queue{
 	// Self-draining, from either side: loosening the rule drops the row below the
 	// floor, and convicting the package moves it out of the unconvicted pool.
 	"version-drift": {Name: "version-drift", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
-		return db.TriageVersionDrift(ctx, n, TriageFilter{})
+		return db.TriageVersionDrift(ctx, n, time.Now().Add(-VersionDriftWindow), TriageFilter{})
 	}, Depth: func(ctx context.Context, db *DB) (int64, error) {
-		return db.CountTriageVersionDrift(ctx, TriageFilter{})
+		return db.CountTriageVersionDrift(ctx, time.Now().Add(-VersionDriftWindow), TriageFilter{})
 	}},
 
 	// fp-trait: every sample in the batch fires the SAME over-firing trait — the

@@ -4778,12 +4778,14 @@ func (db *DB) triageNewPG(ctx context.Context, limit int, f TriageFilter) ([]*Sa
 // NULL and ” so the cast cannot see a value it would reject. crit >= the
 // suspicious floor keeps the ranking to findings that actually select samples —
 // a notable-tier chip riding along in the same list is not why the row is here.
-func (db *DB) triageVersionDriftPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClausePG(f, 1, "samples")
+func (db *DB) triageVersionDriftPG(ctx context.Context, limit int, createdAfter time.Time, f TriageFilter) ([]*Sample, error) {
+	extra, fargs := triageFilterClausePG(f, 2, "samples")
+	args := append([]any{createdAfter}, fargs...)
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE `+triageVersionDriftWhere+extra+`
+		 WHERE `+triageVersionDriftWhere+`
+		   AND created_at > $1`+extra+`
 		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {

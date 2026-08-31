@@ -252,8 +252,9 @@ func (db *DB) CountTriageUnconvictedSuspicious(ctx context.Context, f TriageFilt
 
 // CountTriageVersionDrift reports version-drift's population, capped at
 // [TriageDepthCap].
-func (db *DB) CountTriageVersionDrift(ctx context.Context, f TriageFilter) (int64, error) {
-	return db.countTriage(ctx, "version-drift", triageVersionDriftWhere, triageVersionDriftWhere, f)
+func (db *DB) CountTriageVersionDrift(ctx context.Context, createdAfter time.Time, f TriageFilter) (int64, error) {
+	where := triageVersionDriftWhere + ` AND created_at > %s`
+	return db.countTriageArgs(ctx, "version-drift", where, []any{createdAfter}, f)
 }
 
 // CountTriageFPTrait reports the population fp-trait ranks within, capped at
