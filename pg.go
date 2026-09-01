@@ -7798,12 +7798,12 @@ func (db *DB) applyCleanupBatchPG(ctx context.Context, stage CleanupStage) (int6
 		if _, err := tx.Exec(ctx,
 			"DELETE FROM reports WHERE sha256 IN (SELECT sha256 FROM samples WHERE id = ANY($1))", ids,
 		); err != nil {
-			tx.Rollback(ctx) //nolint:errcheck // best-effort
+			tx.Rollback(ctx) //nolint:errcheck,gosec // returning the prior error
 			return total, fmt.Errorf("hopper: cleanup %s batch reports: %w", stage.Name, err)
 		}
 		tag, err := tx.Exec(ctx, "DELETE FROM samples WHERE id = ANY($1)", ids)
 		if err != nil {
-			tx.Rollback(ctx) //nolint:errcheck // best-effort
+			tx.Rollback(ctx) //nolint:errcheck,gosec // returning the prior error
 			return total, fmt.Errorf("hopper: cleanup %s batch samples: %w", stage.Name, err)
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -7820,20 +7820,41 @@ func (db *DB) applyCleanupBatchPG(ctx context.Context, stage CleanupStage) (int6
 }
 
 func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error) {
+	query, args := feedSamplesQueryPG(q)
+	rows, err := db.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: feed samples: %w", err)
+	}
+	return scanPGSamplesFeed(rows)
+}
+
+// feedSamplesQueryPG renders the feed's SELECT and its arguments. It is split
+// out of feedSamplesPG so a plan audit can EXPLAIN the statement the server
+// actually issues — including the created_at window, whose whole purpose is to
+// turn into an index range condition — rather than a copy of it that has since
+// drifted.
+func feedSamplesQueryPG(q *FeedQuery) (query string, args []any) {
 	// The class filter reads the indexed litmus_class column at the default
 	// cutoff and re-derives from litmus_result otherwise; see feedClassExpr.
-	rows, err := db.pool.Query(ctx, `
-		SELECT `+pgSampleColsFeed+pgSampleColsRegistryExtra+` FROM samples
+	window, windowArgs := q.createdWindowPG(19)
+	args = append([]any{
+		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
+		q.Formula, q.requireLitmus(), q.Domains, q.Limit, q.Offset,
+		q.searchTerm(), q.Corroborated, q.PURLBase, q.PURLVersion, q.packageTerm(),
+		q.ClaimName, q.ClaimSigner,
+	}, windowArgs...)
+	return `
+		SELECT ` + pgSampleColsFeed + pgSampleColsRegistryExtra + ` FROM samples
 		WHERE ($1 = '' OR source = $1)
 			AND ($2 = '' OR label = $2)
 			AND cleave_result IS NOT NULL
-			AND `+q.feedFeedsFilter(`$3`)+`
-			AND `+q.feedEcosystemsFilter(`$4`)+`
-			AND `+q.feedClassFilter(`$5`)+`
-			AND (NOT $6 OR (`+uncontainedSQL+`))
+			AND ` + q.feedFeedsFilter(`$3`) + `
+			AND ` + q.feedEcosystemsFilter(`$4`) + `
+			AND ` + q.feedClassFilter(`$5`) + `
+			AND (NOT $6 OR (` + uncontainedSQL + `))
 			AND ($7 = '' OR formula = $7)
 			AND (NOT $8 OR litmus_result IS NOT NULL)
-			AND `+q.feedDomainsFilter(`$9`)+`
+			AND ` + q.feedDomainsFilter(`$9`) + `
 			AND ($12 = '' OR filename ILIKE '%' || $12 || '%' ESCAPE '\'
 				OR sha256 = $12 OR package = $16)
 			AND (NOT $13 OR corroborated)
@@ -7844,17 +7865,9 @@ func (db *DB) feedSamplesPG(ctx context.Context, q *FeedQuery) ([]*Sample, error
 				 WHERE ac.sha256 = samples.sha256
 				   AND ($17 = '' OR ac.name = $17)
 				   AND ($18 = '' OR ac.signer = $18)))
-			AND file_type <> 'registry'
-		ORDER BY `+q.sortBy()+`
-		LIMIT $10 OFFSET $11`,
-		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
-		q.Formula, q.requireLitmus(), q.Domains, q.Limit, q.Offset,
-		q.searchTerm(), q.Corroborated, q.PURLBase, q.PURLVersion, q.packageTerm(),
-		q.ClaimName, q.ClaimSigner)
-	if err != nil {
-		return nil, fmt.Errorf("hopper: feed samples: %w", err)
-	}
-	return scanPGSamplesFeed(rows)
+			AND file_type <> 'registry'` + window + `
+		ORDER BY ` + q.sortBy() + `
+		LIMIT $10 OFFSET $11`, args
 }
 
 // scanPGSamplesFeed is scanPGSamples plus the two feed-only registry scalars
@@ -7874,6 +7887,12 @@ func scanPGSamplesFeed(rows pgx.Rows) ([]*Sample, error) {
 }
 
 func (db *DB) feedSamplesCountPG(ctx context.Context, q *FeedQuery) (int, error) {
+	window, windowArgs := q.createdWindowPG(17)
+	args := append([]any{
+		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
+		q.Formula, q.requireLitmus(), q.Domains, q.searchTerm(), q.Corroborated,
+		q.PURLBase, q.PURLVersion, q.packageTerm(), q.ClaimName, q.ClaimSigner,
+	}, windowArgs...)
 	var n int
 	err := db.pool.QueryRow(ctx, `
 		SELECT count(*) FROM samples
@@ -7897,10 +7916,8 @@ func (db *DB) feedSamplesCountPG(ctx context.Context, q *FeedQuery) (int, error)
 				 WHERE ac.sha256 = samples.sha256
 				   AND ($15 = '' OR ac.name = $15)
 				   AND ($16 = '' OR ac.signer = $16)))
-			AND file_type <> 'registry'`,
-		q.Source, q.Label, q.Feeds, q.Ecosystems, q.LitmusClasses, q.TopLevelOnly,
-		q.Formula, q.requireLitmus(), q.Domains, q.searchTerm(), q.Corroborated,
-		q.PURLBase, q.PURLVersion, q.packageTerm(), q.ClaimName, q.ClaimSigner).Scan(&n)
+			AND file_type <> 'registry'`+window,
+		args...).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("hopper: feed samples count: %w", err)
 	}

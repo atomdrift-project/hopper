@@ -5255,8 +5255,18 @@ type FeedQuery struct {
 	// carry this name / signer (exact equality, both view branches indexed).
 	// ClaimSigner alone lists everything by one signer; with ClaimName it
 	// pins the (name, voucher) pair a version-timeline UI groups by.
-	ClaimName     string
-	ClaimSigner   string
+	ClaimName   string
+	ClaimSigner string
+	// Since / Until bound the feed to a half-open created_at window,
+	// [Since, Until) — the column the feed's newest-first ordering already
+	// walks, so a bounded query is an ordered seek inside the same indexes an
+	// unbounded one uses rather than a filter over the whole class. Either
+	// bound may be left zero for an open end; both zero leaves the window out
+	// of the query entirely. A window makes the row cap a page size rather
+	// than a horizon: a caller wanting a whole period pages through it with
+	// Until walked down to the oldest row it has seen.
+	Since         time.Time
+	Until         time.Time
 	LitmusClasses []int // optional: filter by litmus_result class values
 	RequireLitmus bool  // require any litmus_result without filtering by class
 	Corroborated  bool  // only samples cited by an external threat feed (samples.corroborated)
@@ -5443,6 +5453,30 @@ func feedArrayFilter(expr, param, cast string, n int) string {
 		return "(" + guard + expr + " = (" + typed + ")[1])"
 	}
 	return "(" + guard + expr + " = ANY(" + param + "))"
+}
+
+// createdWindowPG renders the [Since, Until) bound as SQL fragments and their
+// arguments, numbering placeholders from next. It returns nothing at all when
+// neither bound is set, which is the point: an always-present range qual
+// spelled to match everything (a NULL guard, or sentinel timestamps at the
+// extremes of the representable range) is still a range qual, and a generic
+// plan — which cannot see that the bounds are open — costs it at Postgres's
+// default range selectivity and can pick a different plan for every unbounded
+// caller. Leaving the clause out keeps the unwindowed query byte-identical to
+// what it has always been, and gives the windowed one a prepared statement of
+// its own, planned for its own shape.
+func (q *FeedQuery) createdWindowPG(next int) (clause string, args []any) {
+	var b strings.Builder
+	args = make([]any, 0, 2)
+	if !q.Since.IsZero() {
+		fmt.Fprintf(&b, " AND created_at >= $%d", next+len(args))
+		args = append(args, q.Since)
+	}
+	if !q.Until.IsZero() {
+		fmt.Fprintf(&b, " AND created_at < $%d", next+len(args))
+		args = append(args, q.Until)
+	}
+	return b.String(), args
 }
 
 // feedClassFilter matches a sample's criticality class against the class array

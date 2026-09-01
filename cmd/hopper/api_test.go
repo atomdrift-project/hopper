@@ -690,6 +690,13 @@ func TestClaimJobsUnservableTierFallsThrough(t *testing.T) {
 	if err := os.MkdirAll(pool, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// serve resolves every allowed directory through EvalSymlinks before
+	// handing it to the API, and openKnownSampleFile compares against the
+	// resolved path; on macOS the temp root is itself a symlink.
+	resolvedPool, err := filepath.EvalSymlinks(pool)
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
 	const goodSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	body := []byte("servable")
 	if err := os.WriteFile(filepath.Join(pool, "real.bin"), body, 0o644); err != nil {
@@ -718,7 +725,7 @@ func TestClaimJobsUnservableTierFallsThrough(t *testing.T) {
 
 	api := &apiServer{
 		tracker: newWorkerTracker(), db: db,
-		dataRoot: root, allowedDirs: []string{pool},
+		dataRoot: root, allowedDirs: []string{resolvedPool},
 	}
 
 	jobs, err := api.claimJobs(ctx, "w", dead, nil, 0, 4)

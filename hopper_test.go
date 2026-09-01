@@ -7058,15 +7058,109 @@ func TestLabelRankPurgatoryOutranksObservations(t *testing.T) {
 		}
 	}
 	// Ordering below purgatory is unchanged.
-	if !(labelRank(labelBad) > labelRank(labelGood) &&
-		labelRank(labelGood) > labelRank(labelSighted) &&
-		labelRank(labelSighted) > labelRank(labelUnknown)) {
+	if labelRank(labelBad) <= labelRank(labelGood) ||
+		labelRank(labelGood) <= labelRank(labelSighted) ||
+		labelRank(labelSighted) <= labelRank(labelUnknown) {
 		t.Fatal("existing label precedence changed")
 	}
-	sql := labelRankSQL("x")
+	rankSQL := labelRankSQL("x")
 	for _, want := range []string{"'purgatory' THEN 4", "'bad' THEN 3", "'good' THEN 2", "'sighted' THEN 1"} {
-		if !strings.Contains(sql, want) {
-			t.Fatalf("labelRankSQL missing %q: %s", want, sql)
+		if !strings.Contains(rankSQL, want) {
+			t.Fatalf("labelRankSQL missing %q: %s", want, rankSQL)
 		}
 	}
+}
+
+// TestFeedSamplesCreatedWindow covers the half-open [Since, Until) created_at
+// bound: what it includes at each edge, that select and count agree on it, and
+// that walking Until down over a capped Limit reaches every row in a period —
+// the paging prism's fallout log does to render a whole week without the row
+// cap deciding how much history it shows.
+func TestFeedSamplesCreatedWindow(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Monday 00:00 UTC, the kind of boundary a calendar week is cut on.
+	weekStart := time.Date(2026, 8, 24, 0, 0, 0, 0, time.UTC)
+	created := map[string]time.Time{
+		"aa01": weekStart.Add(-time.Second),                  // the instant before the window
+		"aa02": weekStart,                                    // the window's first instant
+		"aa03": weekStart.Add(36 * time.Hour),                // mid-week
+		"aa04": weekStart.Add(6*24*time.Hour + 23*time.Hour), // last day
+		"aa05": weekStart.AddDate(0, 0, 7),                   // the next week's first instant
+	}
+	for sha, at := range created {
+		mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test"})
+		if err := db.UpdateCleaveResult(ctx, sha, []byte(`{"fs":[{"sha":"`+sha+`","type":"elf","dp":0}]}`), nil, ""); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.lite.ExecContext(ctx,
+			`UPDATE samples SET created_at = ? WHERE sha256 = ?`,
+			at.Format(time.RFC3339Nano), sha); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	shas := func(q FeedQuery) []string {
+		q.Source = "test"
+		q.OrderBy = "created_at"
+		if q.Limit == 0 {
+			q.Limit = 10
+		}
+		samples, err := db.FeedSamples(ctx, &q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		count, err := db.FeedSamplesCount(ctx, &q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if q.Limit >= 10 && count != len(samples) {
+			t.Errorf("count %d disagrees with %d rows", count, len(samples))
+		}
+		out := make([]string, len(samples))
+		for i, s := range samples {
+			out[i] = s.SHA256
+		}
+		return out
+	}
+
+	weekEnd := weekStart.AddDate(0, 0, 7)
+	for _, tt := range []struct {
+		name         string
+		since, until time.Time
+		want         []string
+	}{
+		{"unbounded", time.Time{}, time.Time{}, []string{"aa05", "aa04", "aa03", "aa02", "aa01"}},
+		{"one week", weekStart, weekEnd, []string{"aa04", "aa03", "aa02"}},
+		{"open end", weekStart, time.Time{}, []string{"aa05", "aa04", "aa03", "aa02"}},
+		{"open start", time.Time{}, weekEnd, []string{"aa04", "aa03", "aa02", "aa01"}},
+		{"empty period", weekEnd.AddDate(0, 0, 7), weekEnd.AddDate(0, 0, 14), nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shas(FeedQuery{Since: tt.since, Until: tt.until}); !slices.Equal(got, tt.want) {
+				t.Errorf("[%v, %v) = %v, want %v", tt.since, tt.until, got, tt.want)
+			}
+		})
+	}
+
+	// Paging a period out one row at a time: each page asks for what is left
+	// below the oldest row it has seen. The cap bounds the page, never the
+	// period, and no row is served twice or skipped.
+	t.Run("pages the whole period", func(t *testing.T) {
+		var walked []string
+		until := weekEnd
+		for range 10 {
+			page := shas(FeedQuery{Since: weekStart, Until: until, Limit: 1})
+			if len(page) == 0 {
+				break
+			}
+			walked = append(walked, page...)
+			until = created[page[len(page)-1]]
+		}
+		want := []string{"aa04", "aa03", "aa02"}
+		if !slices.Equal(walked, want) {
+			t.Errorf("paged walk = %v, want %v", walked, want)
+		}
+	})
 }

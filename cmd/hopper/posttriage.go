@@ -390,30 +390,13 @@ func (s *apiServer) relocateTriaged(ctx context.Context, verdict triageVerdict, 
 		return res
 	}
 
-	// Classification destinations may already contain a different package build
-	// with the same human-readable path. Preserve both using a deterministic
-	// SHA suffix. Workflow moves preserve the exact suffix and treat a conflict
-	// as an invariant violation.
 	if plan.label != "" {
-		newAbs, err := s.resolveDataPath(plan.newRel)
+		newRel, err := s.disambiguateDest(plan.newRel, sha)
 		if err != nil {
 			res.Status, res.Error = "error", err.Error()
 			return res
 		}
-		if exists, statErr := pathExists(newAbs); statErr != nil {
-			res.Status, res.Error = "error", "stat destination: "+statErr.Error()
-			return res
-		} else if exists {
-			same, hashErr := fileMatchesSHA256(newAbs, sha)
-			if hashErr != nil {
-				res.Status, res.Error = "error", "hash destination: "+hashErr.Error()
-				return res
-			}
-			if !same {
-				plan.newRel = shaSuffixedRel(plan.newRel, sha)
-				res.NewPath = plan.newRel
-			}
-		}
+		plan.newRel, res.NewPath = newRel, newRel
 	}
 
 	oldAbs, err := s.resolveDataPath(oldRel)
@@ -498,6 +481,34 @@ func (s *apiServer) relocateTriaged(ctx context.Context, verdict triageVerdict, 
 	res.SourceRemoved = result.SourceRemoved
 	res.Status = "moved"
 	return res
+}
+
+// disambiguateDest finalizes a classification destination against what is
+// already on disk. Classification destinations may already contain a different
+// package build with the same human-readable path; preserve both by suffixing
+// the basename with a deterministic SHA prefix. Workflow moves preserve the
+// exact path and treat a conflict as an invariant violation, so they never
+// come through here.
+func (s *apiServer) disambiguateDest(newRel, sha string) (string, error) {
+	newAbs, err := s.resolveDataPath(newRel)
+	if err != nil {
+		return "", err
+	}
+	exists, err := pathExists(newAbs)
+	if err != nil {
+		return "", fmt.Errorf("stat destination: %w", err)
+	}
+	if !exists {
+		return newRel, nil
+	}
+	same, err := fileMatchesSHA256(newAbs, sha)
+	if err != nil {
+		return "", fmt.Errorf("hash destination: %w", err)
+	}
+	if same {
+		return newRel, nil
+	}
+	return shaSuffixedRel(newRel, sha), nil
 }
 
 // triagePlan resolves a triage item to its destination path, target label, and

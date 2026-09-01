@@ -1014,6 +1014,11 @@ func scanLiteSamplesExtra(rows *sql.Rows, extra func(*Sample) []any) ([]*Sample,
 	return out, rows.Err()
 }
 
+// sqliteSecondPrefix is the fixed-width leading part of a stored RFC3339Nano
+// timestamp, up to and including whole seconds — what a created_at bound is
+// compared against (see whereSQLite).
+const sqliteSecondPrefix = "2006-01-02T15:04:05"
+
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
 type sqliteNullTime struct {
@@ -4895,13 +4900,13 @@ func (db *DB) applyCleanupBatchSQLite(ctx context.Context, stage CleanupStage) (
 		for rows.Next() {
 			var id int64
 			if err := rows.Scan(&id); err != nil {
-				rows.Close()
+				rows.Close() //nolint:errcheck,sqlclosecheck,gosec // best-effort cleanup before error return
 				return total, fmt.Errorf("hopper: cleanup %s scan batch: %w", stage.Name, err)
 			}
 			ids = append(ids, id)
 		}
 		rowsErr := rows.Err()
-		rows.Close()
+		rows.Close() //nolint:errcheck,gosec // best-effort cleanup
 		if rowsErr != nil {
 			return total, fmt.Errorf("hopper: cleanup %s batch rows: %w", stage.Name, rowsErr)
 		}
@@ -4926,18 +4931,18 @@ func (db *DB) applyCleanupBatchSQLite(ctx context.Context, stage CleanupStage) (
 			"DELETE FROM reports WHERE sha256 IN (SELECT sha256 FROM samples WHERE id IN ("+inClause+"))",
 			args...,
 		); err != nil {
-			tx.Rollback() //nolint:errcheck // best-effort
+			tx.Rollback() //nolint:errcheck,gosec // returning the prior error
 			return total, fmt.Errorf("hopper: cleanup %s batch reports: %w", stage.Name, err)
 		}
 		//nolint:gosec // placeholders are '?' bind markers; ids are parameterized via args.
 		res, err := tx.ExecContext(ctx, "DELETE FROM samples WHERE id IN ("+inClause+")", args...)
 		if err != nil {
-			tx.Rollback() //nolint:errcheck // best-effort
+			tx.Rollback() //nolint:errcheck,gosec // returning the prior error
 			return total, fmt.Errorf("hopper: cleanup %s batch samples: %w", stage.Name, err)
 		}
 		n, err := res.RowsAffected()
 		if err != nil {
-			tx.Rollback() //nolint:errcheck // best-effort
+			tx.Rollback() //nolint:errcheck,gosec // returning the prior error
 			return total, fmt.Errorf("hopper: cleanup %s batch rows affected: %w", stage.Name, err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -5103,6 +5108,23 @@ func (q *FeedQuery) whereSQLite() (where string, args []any) {
 	if q.PURLVersion != "" {
 		clauses = append(clauses, "version = ?")
 		args = append(args, q.PURLVersion)
+	}
+
+	// The half-open created_at window. created_at is stored as RFC3339Nano UTC
+	// text (see now()), which trims trailing zeros from the fraction and so is
+	// NOT fixed-width: '…T00:00:00.5Z' sorts before '…T00:00:00Z' because '.'
+	// precedes 'Z'. Comparing the fixed-width second prefix instead — the first
+	// 19 characters, 'YYYY-MM-DDTHH:MM:SS' for every row a four-digit year can
+	// write — restores the stored order, at the cost of honoring the bounds to
+	// the second. Callers pass day or period boundaries, which are second-
+	// aligned, so nothing is lost; a sub-second bound rounds down.
+	if !q.Since.IsZero() {
+		clauses = append(clauses, "substr(created_at, 1, 19) >= ?")
+		args = append(args, q.Since.UTC().Format(sqliteSecondPrefix))
+	}
+	if !q.Until.IsZero() {
+		clauses = append(clauses, "substr(created_at, 1, 19) < ?")
+		args = append(args, q.Until.UTC().Format(sqliteSecondPrefix))
 	}
 
 	// Identity-claim filter, mirroring the PG feed: any claim in the

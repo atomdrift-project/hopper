@@ -1488,7 +1488,7 @@ func (s *apiServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// The worker is being handed back work it silently lost. Say so at WARN:
 		// a worker that trips this repeatedly is crash-looping or failing to
 		// post results, and the claim release is only treating the symptom.
-		slog.Warn("released claims the worker no longer holds", //nolint:gosec // worker is sanitized by validWorkerName
+		slog.Warn("released claims the worker no longer holds",
 			"worker", worker, "released", abandoned, "grace", abandonedClaimGrace)
 	}
 	if newError {
@@ -2297,7 +2297,6 @@ func (s *apiServer) warnEmptyTier(worker, tier string, claimed int) {
 	}
 	s.emptyTierWarnedAt[tier] = now
 	s.emptyTierMu.Unlock()
-	//nolint:gosec // worker is sanitized by validWorkerName
 	slog.Warn("claim tier had no servable work; falling through to lower tiers",
 		"tier", tier, "worker", worker, "claimed_then_dropped", claimed)
 }

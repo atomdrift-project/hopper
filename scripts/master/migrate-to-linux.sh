@@ -141,7 +141,9 @@ say() { printf '==> %s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 
 run() {
-	if [ -n "$DRY_RUN" ]; then printf '  [dry-run] %s\n' "$*"; else eval "$@"; fi
+	# Every caller passes one already-composed command string, so eval it as a
+	# string: the dry-run print and the executed command are then the same text.
+	if [ -n "$DRY_RUN" ]; then printf '  [dry-run] %s\n' "$*"; else eval "$*"; fi
 }
 
 # pfexec only when we are not already root; keeps this usable in both cases.

@@ -79,9 +79,9 @@ func TestCollectMvSHAs(t *testing.T) {
 
 // mvTestServer stands up the one route cmdMv talks to, backed by a real
 // database and data root, and returns its base URL.
-func mvTestServer(t *testing.T, ctx context.Context, root string) (*hopper.DB, string) {
+func mvTestServer(t *testing.T, ctx context.Context, root string) (db *hopper.DB, baseURL string) {
 	t.Helper()
-	db := mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
+	db = mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
 	t.Cleanup(func() { db.Close() })
 	if err := db.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate: %v", err)

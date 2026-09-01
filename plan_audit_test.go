@@ -546,3 +546,57 @@ func TestPlanAuditNewSelectorsExecute(t *testing.T) {
 		})
 	}
 }
+
+// TestPlanAuditFeedWindow guards the created_at window prism's fallout log
+// asks its weeks for. The window's whole justification is that it becomes an
+// index range condition on idx_samples_class_created — an ordered seek into
+// one week of one class — rather than a filter applied to the class's entire
+// newest-first walk. A Seq Scan or a Sort here means a week costs the same as
+// the whole hostile history, and the log goes back to being as deep as its row
+// cap rather than as deep as the week it names.
+//
+// The statement comes from feedSamplesQueryPG, not from a copy of it, so the
+// audit cannot drift away from the query the server issues.
+func TestPlanAuditFeedWindow(t *testing.T) {
+	db := openPlanDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	week := time.Now().UTC().AddDate(0, 0, -7)
+	q := &FeedQuery{
+		OrderBy:       "created_at",
+		TopLevelOnly:  true,
+		LitmusClasses: []int{2},
+		Limit:         1000,
+		Since:         week,
+		Until:         week.AddDate(0, 0, 7),
+	}
+	sql, args := feedSamplesQueryPG(q)
+	plan := explainText(t, ctx, db, "EXPLAIN "+sql, args...)
+	if planSeqScansSamples(plan) {
+		t.Errorf("windowed feed: Seq Scan on samples:\n%s", plan)
+	}
+	if !strings.Contains(plan, "created_at") {
+		t.Errorf("windowed feed: created_at is not in the index conditions, so the "+
+			"window is being filtered rather than seeked:\n%s", plan)
+	}
+	if strings.Contains(plan, "Sort") {
+		t.Errorf("windowed feed: sorts instead of walking the window in order:\n%s", plan)
+	}
+	t.Logf("windowed feed: ok\n%s", firstPlanLines(plan))
+
+	// The unwindowed query must keep the plan it has always had: the window is
+	// spelled into the SQL only when it is set, precisely so an unbounded
+	// caller's statement — and its plan — is untouched by this feature.
+	plain := *q
+	plain.Since, plain.Until = time.Time{}, time.Time{}
+	plainSQL, plainArgs := feedSamplesQueryPG(&plain)
+	if strings.Contains(plainSQL, "created_at >=") {
+		t.Errorf("unwindowed feed carries a window predicate:\n%s", compactSQL(plainSQL))
+	}
+	plainPlan := explainText(t, ctx, db, "EXPLAIN "+plainSQL, plainArgs...)
+	if planSeqScansSamples(plainPlan) {
+		t.Errorf("unwindowed feed: Seq Scan on samples:\n%s", plainPlan)
+	}
+	t.Logf("unwindowed feed: ok\n%s", firstPlanLines(plainPlan))
+}
