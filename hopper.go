@@ -4462,9 +4462,25 @@ func (db *DB) TriageReview(ctx context.Context, limit int, f TriageFilter) ([]*S
 	return db.triageReviewSQLite(ctx, limit, f)
 }
 
+// versionDriftProbeBudget caps how many candidates version-drift tests for a
+// clean earlier release before it stops looking.
+//
+// This is the bound that matters. The sibling test is a per-row probe the index
+// cannot absorb and few rows pass it, so an unbounded walk costs whatever the
+// corpus happens to hold — which on 2026-08-31 was 118 consecutive timeouts and
+// a queue that never ran once, and kept timing out after a 7-day window was
+// added, because bounding the population is not the same as bounding the work.
+//
+// Capping the probes makes the cost the same every poll regardless of corpus
+// size. The trade is reach: if none of the newest candidates has a clean
+// sibling, the queue returns empty rather than digging. That is the right way
+// round for a newest-first queue whose whole subject is a package that changed
+// recently.
+const versionDriftProbeBudget = 5000
+
 // TriageVersionDrift returns unconvicted samples that fire, from packages whose
 // earlier release is labelled good and fires nothing. See
-// [triageVersionDriftWhere] for why the comparison is by arrival rather than by
+// [triageVersionDriftCandidates] for why the comparison is by arrival rather than by
 // parsed version.
 //
 // It pays twice: a real between-release compromise and a newly over-firing rule

@@ -388,11 +388,12 @@ func TestPlanAuditUnconvictedQueues(t *testing.T) {
 		// long before LIMIT is satisfied. If that shows up in production the fix
 		// is a bounded created_at window like fallout's, not a wider index.
 		{
-			// Includes the window: without it this EXPLAIN measures a query the
-			// server no longer runs, which is how the unbounded version reached
-			// production green.
+			// The candidate walk only. The sibling probe is applied outside it to
+			// a bounded slice (versionDriftProbeBudget), so what this must prove
+			// is that reaching those candidates is an ordered index scan — the
+			// probe cost is bounded by construction rather than by the plan.
 			name:  "version-drift",
-			where: triageVersionDriftWhere + ` AND created_at > now() - interval '7 days'`,
+			where: triageVersionDriftCandidates + ` AND created_at > now() - interval '7 days'`,
 			order: TriageFilter{}, index: "idx_samples_version_drift_newest",
 		},
 	} {
@@ -535,9 +536,6 @@ func TestPlanAuditNewSelectorsExecute(t *testing.T) {
 		}},
 		{name: "discord", count: func() (int64, error) { return db.CountTriageDiscord(ctx, TriageFilter{}) }},
 		{name: "fp-trait", count: func() (int64, error) { return db.CountTriageFPTrait(ctx, TriageFilter{}) }},
-		{name: "version-drift", count: func() (int64, error) {
-			return db.CountTriageVersionDrift(ctx, now.Add(-VersionDriftWindow), TriageFilter{})
-		}},
 	} {
 		t.Run("count/"+tc.name, func(t *testing.T) {
 			if _, err := tc.count(); err != nil {

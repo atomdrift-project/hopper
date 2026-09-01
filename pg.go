@@ -625,6 +625,13 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			`litmus_score DESC NULLS LAST, analyzed_at, id) ` +
 			`WHERE label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' ` +
 			`AND skip = '' AND path LIKE 'review/%'`,
+		// version-drift's sibling probe. Small — ~150k rows against the 14.5M
+		// clean benign samples, because only a release we can name by PURL can
+		// ever be somebody's earlier version. (purl_base, created_at) makes the
+		// probe an equality-plus-range lookup that stops at the first match.
+		`CREATE INDEX IF NOT EXISTS idx_samples_clean_release ` +
+			`ON samples(purl_base, created_at) ` +
+			`WHERE ` + cleanReleaseIndexPred,
 		// version-drift's outer walk. Its own partial: the sibling EXISTS is a
 		// cross-row predicate and cannot live in one, so the index covers the
 		// candidate side and the probe rides idx_samples_purl_base per row.
@@ -4794,10 +4801,17 @@ func (db *DB) triageVersionDriftPG(ctx context.Context, limit int, createdAfter 
 	args := append([]any{createdAfter}, fargs...)
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
-		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE `+triageVersionDriftWhere+`
-		   AND created_at > $1`+extra+`
-		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
+		`WITH cand AS MATERIALIZED (
+		   SELECT `+versionDriftCandCols+` FROM samples
+		    WHERE `+triageVersionDriftCandidates+`
+		      AND created_at > $1`+extra+`
+		    ORDER BY created_at DESC, id DESC
+		    LIMIT `+strconv.Itoa(versionDriftProbeBudget)+`
+		 )
+		 SELECT `+pgSampleColsLight+` FROM samples
+		  JOIN cand ON cand.cand_id = samples.id
+		  WHERE `+versionDriftSiblingExists+`
+		  ORDER BY samples.created_at DESC, samples.id DESC LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage version drift: %w", err)

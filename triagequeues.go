@@ -177,10 +177,12 @@ var TriageQueues = map[string]Queue{
 	//
 	// Self-draining, from either side: loosening the rule drops the row below the
 	// floor, and convicting the package moves it out of the unconvicted pool.
+	// No Depth, like second and acquit: the population is defined by a per-row
+	// sibling probe rather than a predicate over samples, so counting it costs
+	// exactly what the unbounded selector cost — which is what took the queue
+	// down. A bounded count would report the probe budget, not the backlog.
 	"version-drift": {Name: "version-drift", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
 		return db.TriageVersionDrift(ctx, n, time.Now().Add(-VersionDriftWindow), TriageFilter{})
-	}, Depth: func(ctx context.Context, db *DB) (int64, error) {
-		return db.CountTriageVersionDrift(ctx, time.Now().Add(-VersionDriftWindow), TriageFilter{})
 	}},
 
 	// fp-trait: every sample in the batch fires the SAME over-firing trait — the

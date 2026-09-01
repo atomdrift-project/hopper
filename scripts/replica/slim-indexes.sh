@@ -97,6 +97,7 @@ idx_samples_bad_miss_newest
 idx_samples_bad_miss_stale
 idx_samples_bad_route_score
 idx_samples_class_top_created
+idx_samples_clean_release
 idx_samples_discord_newest
 idx_samples_corroborated_created
 idx_samples_sighted_created

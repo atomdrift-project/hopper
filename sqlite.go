@@ -2968,10 +2968,17 @@ func (db *DB) triageVersionDriftSQLite(ctx context.Context, limit int, createdAf
 	args = append(args, limit)
 	//nolint:gosec // G202: predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
-		`SELECT `+liteSampleColsLight+` FROM samples
-		 WHERE `+triageVersionDriftWhere+`
-		   AND created_at > ?`+extra+`
-		 `+triageOrderSQL(f)+` LIMIT ?`,
+		`WITH cand AS (
+		   SELECT `+versionDriftCandCols+` FROM samples
+		    WHERE `+triageVersionDriftCandidates+`
+		      AND created_at > ?`+extra+`
+		    ORDER BY created_at DESC, id DESC
+		    LIMIT `+strconv.Itoa(versionDriftProbeBudget)+`
+		 )
+		 SELECT `+liteSampleColsLight+` FROM samples
+		  JOIN cand ON cand.cand_id = samples.id
+		  WHERE `+versionDriftSiblingExists+`
+		  ORDER BY samples.created_at DESC, samples.id DESC LIMIT ?`,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage version drift: %w", err)

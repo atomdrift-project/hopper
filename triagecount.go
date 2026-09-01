@@ -190,22 +190,48 @@ var triageFPTraitWhere = `label = 'good' AND cleave_result IS NOT NULL AND paren
 // The sibling probe is an EXISTS on purl_base, which idx_samples_purl_base
 // serves, and a package has few versions — so the probe is a handful of rows per
 // candidate rather than a join across the corpus.
-// Split in two because only the first half can live in a partial index: the
-// sibling test is a cross-row predicate, which Postgres will not accept in one.
-// triageVersionDriftCandidates is therefore what idx_samples_version_drift_newest
-// is built from, and the full predicate (candidates AND the sibling EXISTS)
-// implies it — which is the direction partial-index matching needs.
+// triageVersionDriftCandidates is version-drift's candidate side: everything
+// except the clean-sibling test, which is a cross-row EXISTS and cannot live in
+// a partial index. This is what idx_samples_version_drift_newest is built from.
+//
+// The sibling test is applied OUTSIDE, to a bounded slice of these — see
+// versionDriftProbeBudget. It is a per-row probe with a low hit rate, so its
+// cost scales with how many candidates are walked, not with how many match. A
+// created_at window alone does not bound that: bounding time bounds the
+// population, and 2026-08-31 showed a week of arrivals is still far more than
+// the query budget allows (118 consecutive 30s timeouts, then more after the
+// window landed). Only capping the number of probes bounds the work.
 var triageVersionDriftCandidates = `label IN ('good', 'unknown') AND cleave_result IS NOT NULL AND parent = '' AND skip = ''` +
 	triageServablePathSQL + `
 	   AND max_crit >= ` + strconv.Itoa(suspiciousCrit) + `
 	   AND purl_base <> ''`
 
-var triageVersionDriftWhere = triageVersionDriftCandidates + `
-	   AND EXISTS (SELECT 1 FROM samples p
-	                WHERE p.purl_base = samples.purl_base AND p.sha256 <> samples.sha256
+// versionDriftCandCols is the bounded candidate projection. Every column is
+// aliased because the outer query selects a bare column list from samples and
+// joins this back to it: an unaliased id is ambiguous there. The same shape bit
+// fp-trait first, which is why both now spell it out.
+const versionDriftCandCols = `id AS cand_id, sha256 AS cand_sha, purl_base AS cand_purl, created_at AS cand_created`
+
+// versionDriftSiblingExists is the clean-earlier-release test, correlated
+// against the bounded candidate set rather than against samples directly.
+// p.purl_base <> '' is redundant against the equality above — cand_purl is never
+// empty — but it is what makes idx_samples_clean_release applicable. Without it
+// the planner cannot see that the probe's population is the 150k clean releases
+// that HAVE a purl rather than all 14.5M clean benign samples, so it bitmap-scans
+// the lot and hash-joins. That mis-shape, not the probe count, is what kept the
+// queue at 25s+ after both earlier attempts to bound it.
+var versionDriftSiblingExists = `EXISTS (SELECT 1 FROM samples p
+	                WHERE p.purl_base = cand.cand_purl AND p.purl_base <> ''
+	                  AND p.sha256 <> cand.cand_sha
 	                  AND p.label = 'good' AND p.cleave_result IS NOT NULL AND p.skip = ''
 	                  AND p.max_crit < ` + strconv.Itoa(suspiciousCrit) + `
-	                  AND p.created_at < samples.created_at)`
+	                  AND p.created_at < cand.cand_created)`
+
+// cleanReleaseIndexPred is the probe's population: a benign-labelled release that
+// trips nothing and can be named by PURL. Shared with the migration so the index
+// predicate cannot drift from the query's.
+var cleanReleaseIndexPred = `label = 'good' AND max_crit < ` + strconv.Itoa(suspiciousCrit) +
+	` AND cleave_result IS NOT NULL AND skip = '' AND purl_base <> ''`
 
 var triagePopularWhere = `cleave_result IS NOT NULL AND parent = ''` + triageServablePathSQL + `
 		   AND skip != 'conflict'
@@ -248,13 +274,6 @@ func (db *DB) CountTriageUnconvictedHostile(ctx context.Context, f TriageFilter)
 // population, capped at [TriageDepthCap].
 func (db *DB) CountTriageUnconvictedSuspicious(ctx context.Context, f TriageFilter) (int64, error) {
 	return db.countTriage(ctx, "unconvicted-suspicious", triageUnconvictedSuspiciousWhere, triageUnconvictedSuspiciousWhere, f)
-}
-
-// CountTriageVersionDrift reports version-drift's population, capped at
-// [TriageDepthCap].
-func (db *DB) CountTriageVersionDrift(ctx context.Context, createdAfter time.Time, f TriageFilter) (int64, error) {
-	where := triageVersionDriftWhere + ` AND created_at > %s`
-	return db.countTriageArgs(ctx, "version-drift", where, []any{createdAfter}, f)
 }
 
 // CountTriageFPTrait reports the population fp-trait ranks within, capped at
