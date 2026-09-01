@@ -526,8 +526,10 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_sl_sha256 ON sample_locations(sha256)`,
 		`CREATE INDEX IF NOT EXISTS idx_sl_parent ON sample_locations(parent_sha256) WHERE parent_sha256 <> ''`,
-		`CREATE INDEX IF NOT EXISTS idx_sl_incoming_mtime ON sample_locations(mtime, sha256, path) ` +
-			`WHERE parent_sha256 = '' AND path GLOB 'incoming/*' AND mtime IS NOT NULL`,
+		// Keyed on first_seen_at, not mtime — see the pg.go DDL for why the drain
+		// must not order on a clock its producers control or leave NULL.
+		`CREATE INDEX IF NOT EXISTS idx_sl_incoming_seen ON sample_locations(first_seen_at, sha256, path) ` +
+			`WHERE parent_sha256 = '' AND path GLOB 'incoming/*'`,
 		`CREATE TABLE IF NOT EXISTS sample_location_history (
 			id             INTEGER PRIMARY KEY AUTOINCREMENT,
 			sha256         TEXT NOT NULL,
@@ -1969,8 +1971,8 @@ func (db *DB) oldestIncomingLocationsSQLite(ctx context.Context, before time.Tim
 	rows, err := db.lite.QueryContext(ctx, `
 		SELECT `+liteLocationCols+` FROM sample_locations
 		 WHERE parent_sha256 = '' AND path GLOB 'incoming/*'
-		   AND mtime IS NOT NULL AND mtime < ?
-		 ORDER BY mtime, sha256, path LIMIT ?`, before.UTC().Format(time.RFC3339Nano), limit)
+		   AND first_seen_at < ?
+		 ORDER BY first_seen_at, sha256, path LIMIT ?`, before.UTC().Format(time.RFC3339Nano), limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: oldest incoming locations: %w", err)
 	}

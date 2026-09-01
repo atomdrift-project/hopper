@@ -3288,29 +3288,74 @@ func TestOldestIncomingLocations(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
-	oldest := now.Add(-3 * time.Hour)
-	newer := now.Add(-2 * time.Hour)
-	cold := now.Add(-4 * time.Hour)
+	mtime := now.Add(-90 * time.Minute)
 
+	// incoming-nomtime carries no mtime at all. That is not an edge case: it is
+	// the shape every direct-inserted collector row has, and it is most of the
+	// hot pool by bytes. The drain must see it.
 	mustInsert(t, ctx, db, &Sample{
 		SHA256: "incoming-old", Path: "incoming/forager/a.bin", Filename: "a.bin",
-		Label: "unknown", LabelSource: "forager", Mtime: &oldest,
+		Label: "unknown", LabelSource: "forager", Mtime: &mtime,
 	})
 	mustInsert(t, ctx, db, &Sample{
 		SHA256: "incoming-new", Path: "incoming/forager/b.bin", Filename: "b.bin",
-		Label: "unknown", LabelSource: "forager", Mtime: &newer,
+		Label: "unknown", LabelSource: "forager", Mtime: &mtime,
 	})
 	mustInsert(t, ctx, db, &Sample{
-		SHA256: "already-cold", Path: "pending/foraged/c.bin", Filename: "c.bin",
-		Label: "unknown", Mtime: &cold,
+		SHA256: "incoming-nomtime", Path: "incoming/forager/c.bin", Filename: "c.bin",
+		Label: "unknown", LabelSource: "forager",
 	})
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: "already-cold", Path: "pending/foraged/d.bin", Filename: "d.bin",
+		Label: "unknown", Mtime: &mtime,
+	})
+
+	// first_seen_at defaults to insert time, so backdate it to pin the drain
+	// order. The intended order is the exact reverse of both sha256 order and
+	// insertion order, so a regression to either fails here instead of passing
+	// by coincidence. Every row shares one mtime for the same reason.
+	for _, seen := range []struct {
+		sha string
+		at  time.Time
+	}{
+		{"incoming-old", now.Add(-3 * time.Hour)},
+		{"incoming-nomtime", now.Add(-2 * time.Hour)},
+		{"incoming-new", now.Add(-80 * time.Minute)},
+		{"already-cold", now.Add(-4 * time.Hour)},
+	} {
+		if _, err := db.lite.ExecContext(ctx,
+			`UPDATE sample_locations SET first_seen_at = ? WHERE sha256 = ?`,
+			seen.at.Format(time.RFC3339Nano), seen.sha); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	locs, err := db.OldestIncomingLocations(ctx, now.Add(-time.Hour), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(locs) != 2 || locs[0].SHA256 != "incoming-old" || locs[1].SHA256 != "incoming-new" {
-		t.Fatalf("oldest incoming = %+v, want incoming-old then incoming-new", locs)
+	got := make([]string, 0, len(locs))
+	for _, loc := range locs {
+		got = append(got, loc.SHA256)
+	}
+	want := []string{"incoming-old", "incoming-nomtime", "incoming-new"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("oldest incoming = %v, want %v", got, want)
+	}
+	for _, loc := range locs {
+		if loc.SHA256 == "incoming-nomtime" && loc.Mtime != nil {
+			t.Errorf("incoming-nomtime mtime = %v, want nil", loc.Mtime)
+		}
+	}
+
+	// before is a first_seen_at cutoff, not an mtime one: the grace period that
+	// keeps a just-catalogued (possibly still-being-written) file out of a batch.
+	recent, err := db.OldestIncomingLocations(ctx, now.Add(-150*time.Minute), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recent) != 1 || recent[0].SHA256 != "incoming-old" {
+		t.Fatalf("before cutoff = %+v, want only incoming-old", recent)
 	}
 }
 

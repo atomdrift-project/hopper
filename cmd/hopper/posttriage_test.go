@@ -312,7 +312,13 @@ func TestHandleTriageWorkflowMovePreservesCatalogState(t *testing.T) {
 	}
 }
 
-func TestHandleIncomingLocationsOldestFirst(t *testing.T) {
+// TestHandleIncomingLocationsFeed covers the drain feed's contract: only the
+// hot pool, every row regardless of mtime, and a sort key the response actually
+// carries. The mtime-less row is the regression guard — the feed used to drop
+// those, which hid the majority of the hot pool from the only thing that
+// drains it. Ordering by first_seen_at is asserted in the hopper package, where
+// the column can be backdated; here every row is catalogued in the same instant.
+func TestHandleIncomingLocationsFeed(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	db := mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
@@ -320,19 +326,19 @@ func TestHandleIncomingLocationsOldestFirst(t *testing.T) {
 	if err := db.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	old := time.Now().Add(-2 * time.Hour).UTC()
-	newer := old.Add(time.Hour)
+	mtime := time.Now().Add(-2 * time.Hour).UTC()
 	for _, sample := range []*hopper.Sample{
-		{SHA256: repeat("1"), Path: "incoming/forager/old.bin", Label: "unknown", Mtime: &old},
-		{SHA256: repeat("2"), Path: "incoming/forager/new.bin", Label: "unknown", Mtime: &newer},
-		{SHA256: repeat("3"), Path: "pending/forager/cold.bin", Label: "unknown", Mtime: &old},
+		{SHA256: repeat("1"), Path: "incoming/forager/stamped.bin", Label: "unknown", Mtime: &mtime},
+		{SHA256: repeat("2"), Path: "incoming/forager/nomtime.bin", Label: "unknown"},
+		{SHA256: repeat("3"), Path: "pending/forager/cold.bin", Label: "unknown", Mtime: &mtime},
 	} {
 		if err := db.InsertSample(ctx, sample); err != nil {
 			t.Fatal(err)
 		}
 	}
 	api := &apiServer{db: db, dataRoot: root, tracker: newWorkerTracker()}
-	req := httptest.NewRequest(http.MethodGet, "/api/locations/incoming?before="+time.Now().UTC().Format(time.RFC3339Nano)+"&limit=1", http.NoBody)
+	before := time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano)
+	req := httptest.NewRequest(http.MethodGet, "/api/locations/incoming?before="+before+"&limit=10", http.NoBody)
 	rec := httptest.NewRecorder()
 	api.handleIncomingLocations(rec, req)
 	if rec.Code != http.StatusOK {
@@ -342,8 +348,31 @@ func TestHandleIncomingLocationsOldestFirst(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Locations) != 1 || response.Locations[0].Path != "incoming/forager/old.bin" {
-		t.Fatalf("locations = %+v", response.Locations)
+	byPath := make(map[string]incomingLocation, len(response.Locations))
+	for _, loc := range response.Locations {
+		byPath[loc.Path] = loc
+	}
+	if len(byPath) != 2 {
+		t.Fatalf("locations = %+v, want the two incoming/ rows only", response.Locations)
+	}
+	stamped, ok := byPath["incoming/forager/stamped.bin"]
+	if !ok {
+		t.Fatalf("stamped row missing from %+v", response.Locations)
+	}
+	if stamped.Mtime == nil || !stamped.Mtime.Equal(mtime) {
+		t.Errorf("stamped mtime = %v, want %v", stamped.Mtime, mtime)
+	}
+	nomtime, ok := byPath["incoming/forager/nomtime.bin"]
+	if !ok {
+		t.Fatalf("mtime-less row dropped from feed: %+v", response.Locations)
+	}
+	if nomtime.Mtime != nil {
+		t.Errorf("nomtime mtime = %v, want omitted", nomtime.Mtime)
+	}
+	for path, loc := range byPath {
+		if loc.FirstSeenAt.IsZero() {
+			t.Errorf("%s: first_seen_at is zero; the drain has no sort key", path)
+		}
 	}
 }
 

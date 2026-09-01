@@ -187,7 +187,7 @@ idx_samples_top_created
 idx_samples_top_ready_first_analyzed_coalesce
 idx_samples_unanalyzed_id
 idx_samples_updated_at
-idx_sl_incoming_mtime
+idx_sl_incoming_seen
 idx_sl_reference
 idx_sl_sha256
 idx_sl_standalone

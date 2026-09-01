@@ -2548,9 +2548,14 @@ func (db *DB) ReactivatePrimaryLocation(ctx context.Context, sha256, path string
 }
 
 // OldestIncomingLocations returns top-level files in the hot incoming/ pool,
-// oldest mtime first. before provides a finalization grace period and limit
-// bounds each drain batch. Rows without an mtime are omitted until the next
-// filesystem walk refreshes them.
+// oldest first_seen_at first — when hopper catalogued the path, not the mtime
+// its producer wrote. before provides a finalization grace period and limit
+// bounds each drain batch.
+//
+// first_seen_at is the only clock that orders the whole pool: it is NOT NULL,
+// hopper sets it, and no producer or archive can backdate itself to the head
+// of the drain queue. Ordering on mtime silently dropped every direct-inserted
+// row (NULL mtime) and let restored archive members claim the epoch.
 func (db *DB) OldestIncomingLocations(ctx context.Context, before time.Time, limit int) ([]*SampleLocation, error) {
 	if limit <= 0 {
 		return nil, nil

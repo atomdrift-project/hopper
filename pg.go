@@ -1022,11 +1022,25 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// fully shadowed by idx_sl_parent_child below — same key, same partial
 		// predicate, plus INCLUDE (sha256) — and idx_scan confirmed the planner
 		// always preferred the covering variant. 8.3 GB of pure write tax.
-		// Draino asks only for the oldest top-level hot-pool locations. Keeping
-		// this partial makes that query proportional to the incoming pool rather
-		// than the full historical location ledger.
-		`CREATE INDEX IF NOT EXISTS idx_sl_incoming_mtime ON sample_locations(mtime, sha256, path) ` +
-			`WHERE parent_sha256 = '' AND path LIKE 'incoming/%' AND mtime IS NOT NULL`,
+		// Draino asks only for the oldest top-level hot-pool locations, ordered by
+		// when hopper first catalogued them. Keeping this partial makes that query
+		// proportional to the incoming pool rather than the full historical
+		// location ledger.
+		//
+		// idx_sl_incoming_mtime (same shape, keyed on mtime) was replaced
+		// 2026-09-01 and removed from this DDL so init cannot resurrect it; the
+		// query below was its only consumer. mtime is the wrong clock for a
+		// storage-lifecycle drain twice over. Producers that direct-insert leave
+		// it NULL — 1.26M of 4.75M top-level incoming rows, the whole
+		// incoming/forager tree, which is also 2.9 of the hot pool's 3.3 TB — and
+		// an mtime-ordered feed omits exactly those. For anything unpacked the
+		// value is archive-controlled: restored squashfs members arrive with mtime
+		// AND birthtime at the epoch, so they sort to the head of the queue on a
+		// timestamp their producer chose. first_seen_at is NOT NULL and hopper
+		// stamps it, so it orders the entire pool and nothing upstream can forge
+		// its way to the front of the drain.
+		`CREATE INDEX IF NOT EXISTS idx_sl_incoming_seen ON sample_locations(first_seen_at, sha256, path) ` +
+			`WHERE parent_sha256 = '' AND path LIKE 'incoming/%'`,
 		// Covering index for the reconcile reachability walk (cascadeMembersPG):
 		// finding a parent's child sha256 is then index-only — no heap fetch —
 		// which is what lets the BFS expand the alive set by index lookups instead
@@ -3904,8 +3918,8 @@ func (db *DB) oldestIncomingLocationsPG(ctx context.Context, before time.Time, l
 	rows, err := db.pool.Query(ctx, `
 		SELECT `+pgLocationCols+` FROM sample_locations
 		 WHERE parent_sha256 = '' AND path LIKE 'incoming/%'
-		   AND mtime IS NOT NULL AND mtime < $1
-		 ORDER BY mtime, sha256, path LIMIT $2`, before.UTC(), limit)
+		   AND first_seen_at < $1
+		 ORDER BY first_seen_at, sha256, path LIMIT $2`, before.UTC(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: oldest incoming locations: %w", err)
 	}

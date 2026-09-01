@@ -51,9 +51,14 @@ const (
 )
 
 type incomingLocation struct {
-	Mtime  time.Time `json:"mtime"`
-	SHA256 string    `json:"sha256"`
-	Path   string    `json:"path"`
+	// FirstSeenAt is the drain's sort key: when hopper first catalogued this
+	// path. Mtime is advisory — it is what the producer wrote, is absent on
+	// direct-inserted rows, and is attacker-controlled for archive members, so
+	// a client may log or display it but must not order or age off it.
+	FirstSeenAt time.Time  `json:"first_seen_at"`
+	Mtime       *time.Time `json:"mtime,omitempty"`
+	SHA256      string     `json:"sha256"`
+	Path        string     `json:"path"`
 }
 
 type incomingLocationsResponse struct {
@@ -63,6 +68,10 @@ type incomingLocationsResponse struct {
 // handleIncomingLocations exposes a bounded, oldest-first work feed for the
 // hot-pool controller. It returns exact catalog paths so a later move is a
 // compare-and-swap against one physical observation, not samples.path.
+//
+// Oldest is by first_seen_at, and ?before= is a first_seen_at cutoff: it is the
+// grace period that keeps a file the walk catalogued seconds ago — possibly
+// still being written — out of a drain batch.
 func (s *apiServer) handleIncomingLocations(w http.ResponseWriter, r *http.Request) {
 	before := time.Now().UTC()
 	if raw := r.URL.Query().Get("before"); raw != "" {
@@ -90,14 +99,20 @@ func (s *apiServer) handleIncomingLocations(w http.ResponseWriter, r *http.Reque
 	}
 	resp := incomingLocationsResponse{Locations: make([]incomingLocation, 0, len(locations))}
 	for _, loc := range locations {
-		if loc.Mtime == nil {
-			continue
+		// A missing mtime no longer drops the row. It once did, back when mtime
+		// was the sort key and a NULL had no place in the order; that silently
+		// hid every direct-inserted location — the majority of the hot pool —
+		// from the only thing that drains it.
+		item := incomingLocation{
+			FirstSeenAt: loc.FirstSeenAt.UTC(),
+			SHA256:      loc.SHA256,
+			Path:        loc.Path,
 		}
-		resp.Locations = append(resp.Locations, incomingLocation{
-			Mtime:  loc.Mtime.UTC(),
-			SHA256: loc.SHA256,
-			Path:   loc.Path,
-		})
+		if loc.Mtime != nil {
+			mtime := loc.Mtime.UTC()
+			item.Mtime = &mtime
+		}
+		resp.Locations = append(resp.Locations, item)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp) //nolint:errcheck,errchkjson // best-effort response
