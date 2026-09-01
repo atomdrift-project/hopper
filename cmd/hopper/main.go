@@ -397,6 +397,8 @@ func run(ctx context.Context) error {
 		return cmdLoad(ctx)
 	case "ingest-reports":
 		return cmdIngestReports(ctx)
+	case "dedupe-locations":
+		return cmdDedupeLocations(ctx)
 	case "reset":
 		return cmdReset(ctx)
 	case "false-positives":
@@ -4078,6 +4080,119 @@ func cmdDropSightings(ctx context.Context) error {
 // Run it AFTER a drop-and-rebuild, not between the two: the re-walk re-cites
 // most of what a drop orphaned, so reconciling first only does the work twice.
 // Safe to interrupt — each batch commits on its own and re-running finishes.
+// cmdDedupeLocations collapses samples that are stored more than once onto a
+// single inode per filesystem.
+//
+// A sample legitimately has several locations — the same bytes really were seen
+// in two places, and both observations are worth keeping. What is not worth
+// keeping is two copies of the bytes. Consecutive OS images share ~88% of their
+// files, and a sample promoted out of the hot pool is often already present
+// inside a package collected months earlier, so the corpus accumulates these
+// steadily: 4.0M redundant rows and 1.36 TB inside good/ alone on 2026-09-01.
+//
+// This only ever hard-links copies that are already on one filesystem, so it
+// moves no data between pools and writes nothing to the catalog. Every path
+// resolves to the same bytes afterwards. It is safe to interrupt — a later run
+// simply finds the inodes already shared — and safe to re-run.
+//
+// Space does not come back while a snapshot still references the freed blocks.
+// On a pool with retained snapshots the reclaim lands when they expire.
+func cmdDedupeLocations(ctx context.Context) error {
+	f := flag.NewFlagSet("dedupe-locations", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	dataDir := f.String("data", "", "sample data root")
+	dryRun := f.Bool("dry-run", false, "report what would be collapsed without changing anything (does not verify contents)")
+	batch := f.Int("batch", 500, "samples to examine per database round trip")
+	limit := f.Int("limit", 0, "stop after examining this many samples (0 = no limit)")
+	after := f.String("after", "", "resume from this sha256 (exclusive)")
+	parseFlags(f, os.Args[2:])
+
+	if *dataDir == "" {
+		return errors.New("pass --data <directory> (the sample tree holding the copies)")
+	}
+	if resolved, err := filepath.EvalSymlinks(*dataDir); err == nil {
+		*dataDir = resolved
+	}
+	if *batch <= 0 {
+		return errors.New("--batch must be positive")
+	}
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	var examined, linked, skipped int
+	var saved int64
+	cursor := *after
+	for {
+		if err := ctx.Err(); err != nil {
+			break
+		}
+		size := *batch
+		if *limit > 0 && *limit-examined < size {
+			size = *limit - examined
+		}
+		if size <= 0 {
+			break
+		}
+		shas, err := db.DuplicateLocationSHAs(ctx, cursor, size)
+		if err != nil {
+			return err
+		}
+		if len(shas) == 0 {
+			break
+		}
+		for _, sha := range shas {
+			locations, err := db.TopLevelLocationsForSHA(ctx, sha)
+			if err != nil {
+				return err
+			}
+			rels := make([]string, 0, len(locations))
+			for _, loc := range locations {
+				rels = append(rels, loc.Path)
+			}
+			result, err := hopper.LinkDuplicateLocations(ctx, *dataDir, sha, rels, *dryRun)
+			if err != nil {
+				return err
+			}
+			examined++
+			linked += result.Linked
+			skipped += result.Skipped
+			saved += result.BytesSaved
+			cursor = sha
+		}
+		slog.Info("dedupe progress", "examined", examined, "linked", linked,
+			"skipped", skipped, "saved", humanBytes(saved), "cursor", cursor)
+	}
+
+	verb := "collapsed"
+	if *dryRun {
+		verb = "would collapse"
+	}
+	fmt.Printf("examined %d samples with multiple locations; %s %d copies (%s); skipped %d\n",
+		examined, verb, linked, humanBytes(saved), skipped)
+	if examined > 0 {
+		fmt.Printf("resume with --after %s\n", cursor)
+	}
+	return nil
+}
+
+// humanBytes formats a byte count in the powers-of-1024 units df -h prints, so
+// a reported saving can be compared against the pool directly.
+func humanBytes(n int64) string {
+	if n < 1024 {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(1024), 0
+	for v := n / 1024; v >= 1024; v /= 1024 {
+		div *= 1024
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
 func cmdReconcileCorroborated(ctx context.Context) error {
 	f := flag.NewFlagSet("reconcile-corroborated", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")

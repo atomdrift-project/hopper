@@ -3309,6 +3309,16 @@ func TestOldestIncomingLocations(t *testing.T) {
 		SHA256: "already-cold", Path: "pending/foraged/d.bin", Filename: "d.bin",
 		Label: "unknown", Mtime: &mtime,
 	})
+	// Classified but still sitting in the hot pool. A workflow move is refused
+	// for anything that is not "unknown", so offering it to the drain would be
+	// handing over work guaranteed to fail — and on the real pool this is the
+	// majority case, not a corner: 4.0M of 4.75M hot rows were labelled "good"
+	// on 2026-09-01. It is deliberately the oldest row of all, so a regression
+	// that drops the filter puts it first and fails loudly.
+	mustInsert(t, ctx, db, &Sample{
+		SHA256: "incoming-labelled", Path: "incoming/forager/e.bin", Filename: "e.bin",
+		Label: "good", LabelSource: "promoter", Mtime: &mtime,
+	})
 
 	// first_seen_at defaults to insert time, so backdate it to pin the drain
 	// order. The intended order is the exact reverse of both sha256 order and
@@ -3322,6 +3332,7 @@ func TestOldestIncomingLocations(t *testing.T) {
 		{"incoming-nomtime", now.Add(-2 * time.Hour)},
 		{"incoming-new", now.Add(-80 * time.Minute)},
 		{"already-cold", now.Add(-4 * time.Hour)},
+		{"incoming-labelled", now.Add(-5 * time.Hour)},
 	} {
 		if _, err := db.lite.ExecContext(ctx,
 			`UPDATE sample_locations SET first_seen_at = ? WHERE sha256 = ?`,

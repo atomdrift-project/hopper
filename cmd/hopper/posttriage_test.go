@@ -331,6 +331,8 @@ func TestHandleIncomingLocationsFeed(t *testing.T) {
 		{SHA256: repeat("1"), Path: "incoming/forager/stamped.bin", Label: "unknown", Mtime: &mtime},
 		{SHA256: repeat("2"), Path: "incoming/forager/nomtime.bin", Label: "unknown"},
 		{SHA256: repeat("3"), Path: "pending/forager/cold.bin", Label: "unknown", Mtime: &mtime},
+		// Classified rows stay out: hopper refuses a workflow move for them.
+		{SHA256: repeat("4"), Path: "incoming/forager/labelled.bin", Label: "good", Mtime: &mtime},
 	} {
 		if err := db.InsertSample(ctx, sample); err != nil {
 			t.Fatal(err)

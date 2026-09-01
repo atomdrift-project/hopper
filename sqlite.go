@@ -1972,6 +1972,8 @@ func (db *DB) oldestIncomingLocationsSQLite(ctx context.Context, before time.Tim
 		SELECT `+liteLocationCols+` FROM sample_locations
 		 WHERE parent_sha256 = '' AND path GLOB 'incoming/*'
 		   AND first_seen_at < ?
+		   AND EXISTS (SELECT 1 FROM samples s
+		                WHERE s.sha256 = sample_locations.sha256 AND s.label = 'unknown')
 		 ORDER BY first_seen_at, sha256, path LIMIT ?`, before.UTC().Format(time.RFC3339Nano), limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: oldest incoming locations: %w", err)
@@ -1984,6 +1986,27 @@ func (db *DB) oldestIncomingLocationsSQLite(ctx context.Context, before time.Tim
 			return nil, fmt.Errorf("hopper: scan oldest incoming location: %w", err)
 		}
 		out = append(out, loc)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) duplicateLocationSHAsSQLite(ctx context.Context, afterSHA string, limit int) ([]string, error) {
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT sha256 FROM sample_locations
+		 WHERE parent_sha256 = '' AND sha256 > ?
+		 GROUP BY sha256 HAVING count(*) > 1
+		 ORDER BY sha256 LIMIT ?`, afterSHA, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: duplicate location shas: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // read-only query
+	var out []string
+	for rows.Next() {
+		var sha string
+		if err := rows.Scan(&sha); err != nil {
+			return nil, fmt.Errorf("hopper: scan duplicate location sha: %w", err)
+		}
+		out = append(out, sha)
 	}
 	return out, rows.Err()
 }

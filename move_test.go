@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -280,4 +281,324 @@ func TestLockMoveSourceHonorsContext(t *testing.T) {
 func moveTestSHA(content []byte) string {
 	sum := sha256.Sum256(content)
 	return fmt.Sprintf("%x", sum[:])
+}
+
+// crossDeviceDir returns a temporary directory on a different filesystem from
+// want, skipping the test when the machine offers only one.
+//
+// The donor path exists precisely because /data/samples/incoming (zroot/hot)
+// and /data/samples/good (tank) are separate pools. A same-filesystem test
+// cannot reach it: os.Link(src, dst) simply succeeds and publishMoveFile never
+// looks for a donor.
+func crossDeviceDir(t *testing.T, want string) string {
+	t.Helper()
+	var target syscall.Stat_t
+	if err := syscall.Stat(want, &target); err != nil {
+		t.Fatal(err)
+	}
+	for _, base := range []string{"/dev/shm", os.TempDir(), os.Getenv("HOME")} {
+		if base == "" {
+			continue
+		}
+		var candidate syscall.Stat_t
+		if err := syscall.Stat(base, &candidate); err != nil || candidate.Dev == target.Dev {
+			continue
+		}
+		dir, err := os.MkdirTemp(base, "hopper-xdev-")
+		if err != nil {
+			continue
+		}
+		t.Cleanup(func() { os.RemoveAll(dir) }) //nolint:errcheck // best-effort test cleanup
+		return dir
+	}
+	t.Skip("no second filesystem available to exercise the cross-device donor path")
+	return ""
+}
+
+func moveTestInode(t *testing.T, name string) uint64 {
+	t.Helper()
+	var st syscall.Stat_t
+	if err := syscall.Stat(name, &st); err != nil {
+		t.Fatal(err)
+	}
+	return uint64(st.Ino)
+}
+
+// TestPublishMoveFilePrefersDonorOverCopy is the point of the whole donor path:
+// when the source is on another filesystem but the destination's own pool
+// already holds the bytes, publish by hard link and copy nothing. On the real
+// corpus this is the difference between moving ~900 GB off the hot pool and
+// also writing ~900 GB into tank.
+func TestPublishMoveFilePrefersDonorOverCopy(t *testing.T) {
+	ctx := context.Background()
+	dstRoot := t.TempDir()
+	srcRoot := crossDeviceDir(t, dstRoot)
+
+	content := []byte("shipped inside a package we already collected")
+	sha := moveTestSHA(content)
+	src := filepath.Join(srcRoot, "incoming.tgz")
+	donor := filepath.Join(dstRoot, "already-good.tgz")
+	dst := filepath.Join(dstRoot, "promoted", "example.tgz")
+	for _, name := range []string{src, donor} {
+		if err := os.WriteFile(name, content, 0o440); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	created, err := publishMoveFile(ctx, src, dst, sha, []string{donor})
+	if err != nil {
+		t.Fatalf("publishMoveFile: %v", err)
+	}
+	if !created {
+		t.Fatal("destination was not created")
+	}
+	if got, err := os.ReadFile(dst); err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("destination = %q, %v", got, err)
+	}
+	// Sharing an inode with the donor is the assertion that no bytes were
+	// copied; equal content alone would also pass on the copy path.
+	if moveTestInode(t, dst) != moveTestInode(t, donor) {
+		t.Error("destination does not share the donor's inode: it was copied, not linked")
+	}
+}
+
+// TestPublishMoveFileRejectsWrongDonor: a donor is trusted only after the bytes
+// that actually appear at the destination are hashed. A catalog row claiming a
+// sha it does not have must never publish those bytes.
+func TestPublishMoveFileRejectsWrongDonor(t *testing.T) {
+	ctx := context.Background()
+	dstRoot := t.TempDir()
+	srcRoot := crossDeviceDir(t, dstRoot)
+
+	content := []byte("the real sample bytes")
+	sha := moveTestSHA(content)
+	src := filepath.Join(srcRoot, "incoming.tgz")
+	if err := os.WriteFile(src, content, 0o440); err != nil {
+		t.Fatal(err)
+	}
+	liar := filepath.Join(dstRoot, "mislabelled.tgz")
+	if err := os.WriteFile(liar, []byte("entirely different bytes"), 0o440); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dstRoot, "promoted", "example.tgz")
+
+	created, err := publishMoveFile(ctx, src, dst, sha, []string{liar})
+	if err != nil {
+		t.Fatalf("publishMoveFile: %v", err)
+	}
+	if !created {
+		t.Fatal("destination was not created")
+	}
+	// The bad donor is rejected and the copy fallback runs, so the destination
+	// holds the right bytes and is nobody's link.
+	if got, err := os.ReadFile(dst); err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("destination = %q, %v", got, err)
+	}
+	if moveTestInode(t, dst) == moveTestInode(t, liar) {
+		t.Error("destination is linked to the mismatched donor")
+	}
+	if got, err := os.ReadFile(liar); err != nil || string(got) != "entirely different bytes" {
+		t.Errorf("donor was modified: %q, %v", got, err)
+	}
+}
+
+func TestSelectMoveDonors(t *testing.T) {
+	root := "/data/samples"
+	locs := func(paths ...string) []*SampleLocation {
+		out := make([]*SampleLocation, 0, len(paths))
+		for _, p := range paths {
+			out = append(out, &SampleLocation{Path: p})
+		}
+		return out
+	}
+	tests := []struct {
+		name   string
+		oldRel string
+		newRel string
+		locs   []*SampleLocation
+		want   []string
+	}{
+		{
+			name:   "same pool donor is offered",
+			oldRel: "incoming/forager/a.tgz",
+			newRel: "good/foraged-promote/a.tgz",
+			locs:   locs("incoming/forager/a.tgz", "good/foraged/mint/a.tgz"),
+			want:   []string{"/data/samples/good/foraged/mint/a.tgz"},
+		},
+		{
+			// incoming/ is a different pool on a different vdev; linking there
+			// is EXDEV, so it is not worth a syscall.
+			name:   "other pools are skipped",
+			oldRel: "incoming/forager/a.tgz",
+			newRel: "good/foraged-promote/a.tgz",
+			locs:   locs("incoming/forager/b.tgz", "pending/foraged/a.tgz", "bad/foraged/a.tgz"),
+			want:   []string{},
+		},
+		{
+			name:   "source and destination are never donors",
+			oldRel: "good/foraged/a.tgz",
+			newRel: "good/foraged-promote/a.tgz",
+			locs:   locs("good/foraged/a.tgz", "good/foraged-promote/a.tgz"),
+			want:   []string{},
+		},
+		{
+			name:   "capped so a damaged sha cannot cost unbounded hashes",
+			oldRel: "incoming/forager/a.tgz",
+			newRel: "good/foraged-promote/a.tgz",
+			locs:   locs("good/1.tgz", "good/2.tgz", "good/3.tgz", "good/4.tgz", "good/5.tgz", "good/6.tgz"),
+			want: []string{
+				"/data/samples/good/1.tgz", "/data/samples/good/2.tgz",
+				"/data/samples/good/3.tgz", "/data/samples/good/4.tgz",
+			},
+		},
+		{
+			name:   "traversal in a catalog path is not resolved",
+			oldRel: "incoming/forager/a.tgz",
+			newRel: "good/foraged-promote/a.tgz",
+			locs:   locs("good/../../etc/passwd"),
+			want:   []string{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pool, _, _ := strings.Cut(tt.newRel, "/")
+			got := selectMoveDonors(tt.locs, root, pool, tt.oldRel, tt.newRel)
+			if len(got) != len(tt.want) {
+				t.Fatalf("donors = %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if filepath.ToSlash(got[i]) != tt.want[i] {
+					t.Errorf("donor[%d] = %s, want %s", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// writeDedupeFile writes content at rel under root and returns the absolute path.
+func writeDedupeFile(t *testing.T, root, rel string, content []byte) string {
+	t.Helper()
+	abs := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(abs, content, 0o440); err != nil {
+		t.Fatal(err)
+	}
+	return abs
+}
+
+func TestLinkDuplicateLocations(t *testing.T) {
+	ctx := context.Background()
+	content := []byte("bytes stored twice because two images shipped them")
+	sha := moveTestSHA(content)
+	other := []byte("something else entirely, recorded by nobody")
+
+	t.Run("collapses duplicate copies", func(t *testing.T) {
+		root := t.TempDir()
+		a := writeDedupeFile(t, root, "good/a.tgz", content)
+		b := writeDedupeFile(t, root, "good/b.tgz", content)
+
+		result, err := LinkDuplicateLocations(ctx, root, sha, []string{"good/a.tgz", "good/b.tgz"}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Linked != 1 || result.Skipped != 0 || result.BytesSaved != int64(len(content)) {
+			t.Fatalf("result = %+v", result)
+		}
+		if moveTestInode(t, a) != moveTestInode(t, b) {
+			t.Error("copies were not collapsed onto one inode")
+		}
+		// Both observations must still resolve: the catalog was never updated,
+		// so a path that stopped working would now be a lie.
+		for _, name := range []string{a, b} {
+			if got, err := os.ReadFile(name); err != nil || !bytes.Equal(got, content) {
+				t.Errorf("%s = %q, %v", name, got, err)
+			}
+		}
+	})
+
+	t.Run("is idempotent", func(t *testing.T) {
+		root := t.TempDir()
+		writeDedupeFile(t, root, "good/a.tgz", content)
+		if err := os.Link(filepath.Join(root, "good/a.tgz"), filepath.Join(root, "good/b.tgz")); err != nil {
+			t.Fatal(err)
+		}
+		result, err := LinkDuplicateLocations(ctx, root, sha, []string{"good/a.tgz", "good/b.tgz"}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Linked != 0 || result.Skipped != 0 {
+			t.Fatalf("result = %+v, want a no-op on already-shared inodes", result)
+		}
+	})
+
+	t.Run("never overwrites a victim holding other bytes", func(t *testing.T) {
+		root := t.TempDir()
+		writeDedupeFile(t, root, "good/a.tgz", content)
+		z := writeDedupeFile(t, root, "good/z.tgz", other)
+
+		result, err := LinkDuplicateLocations(ctx, root, sha, []string{"good/a.tgz", "good/z.tgz"}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Linked != 0 || result.Skipped != 1 {
+			t.Fatalf("result = %+v", result)
+		}
+		// Those bytes are unaccounted for, which is exactly why they must
+		// survive for someone to look at.
+		if got, err := os.ReadFile(z); err != nil || !bytes.Equal(got, other) {
+			t.Fatalf("mismatched copy was destroyed: %q, %v", got, err)
+		}
+	})
+
+	t.Run("skips the whole group when the survivor is wrong", func(t *testing.T) {
+		root := t.TempDir()
+		a := writeDedupeFile(t, root, "good/a.tgz", other) // sorts first, becomes survivor
+		z := writeDedupeFile(t, root, "good/z.tgz", content)
+
+		result, err := LinkDuplicateLocations(ctx, root, sha, []string{"good/a.tgz", "good/z.tgz"}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Linked != 0 || result.Skipped != 2 {
+			t.Fatalf("result = %+v", result)
+		}
+		if got, _ := os.ReadFile(a); !bytes.Equal(got, other) {
+			t.Error("survivor was modified")
+		}
+		if got, _ := os.ReadFile(z); !bytes.Equal(got, content) {
+			t.Error("good copy was overwritten from a bad survivor")
+		}
+	})
+
+	t.Run("dry run changes nothing", func(t *testing.T) {
+		root := t.TempDir()
+		a := writeDedupeFile(t, root, "good/a.tgz", content)
+		b := writeDedupeFile(t, root, "good/b.tgz", content)
+
+		result, err := LinkDuplicateLocations(ctx, root, sha, []string{"good/a.tgz", "good/b.tgz"}, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Linked != 1 || result.BytesSaved != int64(len(content)) {
+			t.Fatalf("result = %+v", result)
+		}
+		if moveTestInode(t, a) == moveTestInode(t, b) {
+			t.Error("dry run collapsed the copies")
+		}
+	})
+
+	t.Run("absent copies are skipped", func(t *testing.T) {
+		root := t.TempDir()
+		writeDedupeFile(t, root, "good/a.tgz", content)
+
+		result, err := LinkDuplicateLocations(ctx, root, sha, []string{"good/a.tgz", "good/gone.tgz"}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Linked != 0 || result.Skipped != 1 {
+			t.Fatalf("result = %+v", result)
+		}
+	})
 }

@@ -2556,6 +2556,14 @@ func (db *DB) ReactivatePrimaryLocation(ctx context.Context, sha256, path string
 // hopper sets it, and no producer or archive can backdate itself to the head
 // of the drain queue. Ordering on mtime silently dropped every direct-inserted
 // row (NULL mtime) and let restored archive members claim the epoch.
+//
+// Only label="unknown" rows are returned, because that is the only thing a
+// caller can then do anything with: a workflow move to pending/ or review/ is
+// refused for a classified sample, so serving one would hand the drain work it
+// is guaranteed to fail on. That is not a rare case in the hot pool — measured
+// 2026-09-01, 4.0M of its 4.75M top-level rows were already labelled "good"
+// and would have been the entire head of the queue. Relocating those is
+// promoter's job, not the drain's.
 func (db *DB) OldestIncomingLocations(ctx context.Context, before time.Time, limit int) ([]*SampleLocation, error) {
 	if limit <= 0 {
 		return nil, nil
@@ -2564,6 +2572,24 @@ func (db *DB) OldestIncomingLocations(ctx context.Context, before time.Time, lim
 		return db.oldestIncomingLocationsPG(ctx, before, limit)
 	}
 	return db.oldestIncomingLocationsSQLite(ctx, before, limit)
+}
+
+// DuplicateLocationSHAs returns sha256s that have more than one live top-level
+// location, in ascending sha order after afterSHA so a sweep can resume.
+//
+// More than one location is not itself a fault: it records that the same bytes
+// were genuinely observed in two places, which is real provenance. What it also
+// means is that the pool may be storing those bytes twice, and where both
+// copies sit on one filesystem that second copy is pure waste — measured
+// 2026-09-01, 4.0M redundant rows and 1.36 TB inside good/ alone.
+func (db *DB) DuplicateLocationSHAs(ctx context.Context, afterSHA string, limit int) ([]string, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	if db.pool != nil {
+		return db.duplicateLocationSHAsPG(ctx, afterSHA, limit)
+	}
+	return db.duplicateLocationSHAsSQLite(ctx, afterSHA, limit)
 }
 
 func (db *DB) prepareLocationMove(

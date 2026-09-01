@@ -3919,6 +3919,8 @@ func (db *DB) oldestIncomingLocationsPG(ctx context.Context, before time.Time, l
 		SELECT `+pgLocationCols+` FROM sample_locations
 		 WHERE parent_sha256 = '' AND path LIKE 'incoming/%'
 		   AND first_seen_at < $1
+		   AND EXISTS (SELECT 1 FROM samples s
+		                WHERE s.sha256 = sample_locations.sha256 AND s.label = 'unknown')
 		 ORDER BY first_seen_at, sha256, path LIMIT $2`, before.UTC(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: oldest incoming locations: %w", err)
@@ -3931,6 +3933,27 @@ func (db *DB) oldestIncomingLocationsPG(ctx context.Context, before time.Time, l
 			return nil, fmt.Errorf("hopper: scan oldest incoming location: %w", err)
 		}
 		out = append(out, loc)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) duplicateLocationSHAsPG(ctx context.Context, afterSHA string, limit int) ([]string, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT sha256 FROM sample_locations
+		 WHERE parent_sha256 = '' AND sha256 > $1
+		 GROUP BY sha256 HAVING count(*) > 1
+		 ORDER BY sha256 LIMIT $2`, afterSHA, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: duplicate location shas: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var sha string
+		if err := rows.Scan(&sha); err != nil {
+			return nil, fmt.Errorf("hopper: scan duplicate location sha: %w", err)
+		}
+		out = append(out, sha)
 	}
 	return out, rows.Err()
 }
