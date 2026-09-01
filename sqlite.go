@@ -1967,25 +1967,39 @@ func (db *DB) reactivatePrimaryLocationSQLite(ctx context.Context, sha256, path 
 	return n > 0, nil
 }
 
-func (db *DB) oldestIncomingLocationsSQLite(ctx context.Context, before time.Time, limit int) ([]*SampleLocation, error) {
+func (db *DB) oldestIncomingLocationsSQLite(
+	ctx context.Context, before time.Time, limit int, class IncomingClass,
+) ([]*IncomingLocation, error) {
 	rows, err := db.lite.QueryContext(ctx, `
-		SELECT `+liteLocationCols+` FROM sample_locations
-		 WHERE parent_sha256 = '' AND path GLOB 'incoming/*'
-		   AND first_seen_at < ?
-		   AND EXISTS (SELECT 1 FROM samples s
-		                WHERE s.sha256 = sample_locations.sha256 AND s.label = 'unknown')
-		 ORDER BY first_seen_at, sha256, path LIMIT ?`, before.UTC().Format(time.RFC3339Nano), limit)
+		SELECT sl.first_seen_at, sl.mtime, sl.sha256, sl.path, s.label
+		  FROM sample_locations sl JOIN samples s ON s.sha256 = sl.sha256
+		 WHERE sl.parent_sha256 = '' AND sl.path GLOB 'incoming/*'
+		   AND sl.first_seen_at < ?
+		   AND ((? AND s.label = 'unknown') OR (NOT ? AND s.label <> 'unknown'))
+		 ORDER BY sl.first_seen_at, sl.sha256, sl.path LIMIT ?`,
+		before.UTC().Format(time.RFC3339Nano), class == IncomingUnknown, class == IncomingUnknown, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: oldest incoming locations: %w", err)
 	}
 	defer rows.Close() //nolint:errcheck // read-only query
-	var out []*SampleLocation
+	var out []*IncomingLocation
 	for rows.Next() {
-		loc, err := scanLiteLocation(rows)
-		if err != nil {
+		var loc IncomingLocation
+		var mtime, seen sql.NullString
+		if err := rows.Scan(&seen, &mtime, &loc.SHA256, &loc.Path, &loc.Label); err != nil {
 			return nil, fmt.Errorf("hopper: scan oldest incoming location: %w", err)
 		}
-		out = append(out, loc)
+		if seen.Valid {
+			if t, err := time.Parse(time.RFC3339Nano, seen.String); err == nil {
+				loc.FirstSeenAt = t
+			}
+		}
+		if mtime.Valid {
+			if t, err := time.Parse(time.RFC3339Nano, mtime.String); err == nil {
+				loc.Mtime = &t
+			}
+		}
+		out = append(out, &loc)
 	}
 	return out, rows.Err()
 }

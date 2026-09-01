@@ -3341,7 +3341,7 @@ func TestOldestIncomingLocations(t *testing.T) {
 		}
 	}
 
-	locs, err := db.OldestIncomingLocations(ctx, now.Add(-time.Hour), 10)
+	locs, err := db.OldestIncomingLocations(ctx, now.Add(-time.Hour), 10, IncomingUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3359,9 +3359,26 @@ func TestOldestIncomingLocations(t *testing.T) {
 		}
 	}
 
+	// The classified half is a separate population, not a filtered view of the
+	// same one: it must return exactly the row the unknown feed refuses, and
+	// carry the label that says where it belongs.
+	classified, err := db.OldestIncomingLocations(ctx, now.Add(-time.Hour), 10, IncomingClassified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(classified) != 1 || classified[0].SHA256 != "incoming-labelled" {
+		t.Fatalf("classified feed = %+v, want only incoming-labelled", classified)
+	}
+	if classified[0].Label != "good" {
+		t.Errorf("classified label = %q, want good — the caller echoes this back as its ruling", classified[0].Label)
+	}
+	if _, err := db.OldestIncomingLocations(ctx, now, 10, IncomingClass("sideways")); err == nil {
+		t.Error("an unknown class was accepted; a typo would silently drain the wrong half")
+	}
+
 	// before is a first_seen_at cutoff, not an mtime one: the grace period that
 	// keeps a just-catalogued (possibly still-being-written) file out of a batch.
-	recent, err := db.OldestIncomingLocations(ctx, now.Add(-150*time.Minute), 10)
+	recent, err := db.OldestIncomingLocations(ctx, now.Add(-150*time.Minute), 10, IncomingUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}

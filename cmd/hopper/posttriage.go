@@ -59,6 +59,10 @@ type incomingLocation struct {
 	Mtime       *time.Time `json:"mtime,omitempty"`
 	SHA256      string     `json:"sha256"`
 	Path        string     `json:"path"`
+	// Label is the sample's current classification. For a classified row it is
+	// also the ruling that relocates it: a caller echoes it back to move the
+	// sample into the pool it already belongs in, without reclassifying it.
+	Label string `json:"label"`
 }
 
 type incomingLocationsResponse struct {
@@ -72,6 +76,12 @@ type incomingLocationsResponse struct {
 // Oldest is by first_seen_at, and ?before= is a first_seen_at cutoff: it is the
 // grace period that keeps a file the walk catalogued seconds ago — possibly
 // still being written — out of a drain batch.
+//
+// ?class= picks which half of the pool to serve: "unknown" (the default) is
+// unjudged work whose only legal move is to pending/ or review/; "classified"
+// is finished samples that are only still here because nothing relocated them.
+// See hopper.IncomingClass for why a drain should take the classified half
+// first.
 func (s *apiServer) handleIncomingLocations(w http.ResponseWriter, r *http.Request) {
 	before := time.Now().UTC()
 	if raw := r.URL.Query().Get("before"); raw != "" {
@@ -91,7 +101,15 @@ func (s *apiServer) handleIncomingLocations(w http.ResponseWriter, r *http.Reque
 		}
 		limit = parsed
 	}
-	locations, err := s.db.OldestIncomingLocations(r.Context(), before, limit)
+	class := hopper.IncomingUnknown
+	if raw := r.URL.Query().Get("class"); raw != "" {
+		class = hopper.IncomingClass(raw)
+	}
+	locations, err := s.db.OldestIncomingLocations(r.Context(), before, limit, class)
+	if errors.Is(err, hopper.ErrNotFound) || (err != nil && strings.Contains(err.Error(), "unknown incoming class")) {
+		writeJSONError(w, http.StatusBadRequest, `class must be "unknown" or "classified"`)
+		return
+	}
 	if err != nil {
 		slog.Error("list incoming locations failed", "error", err)
 		writeJSONError(w, http.StatusInternalServerError, "server error")
@@ -107,6 +125,7 @@ func (s *apiServer) handleIncomingLocations(w http.ResponseWriter, r *http.Reque
 			FirstSeenAt: loc.FirstSeenAt.UTC(),
 			SHA256:      loc.SHA256,
 			Path:        loc.Path,
+			Label:       loc.Label,
 		}
 		if loc.Mtime != nil {
 			mtime := loc.Mtime.UTC()
@@ -474,7 +493,12 @@ func (s *apiServer) relocateTriaged(ctx context.Context, verdict triageVerdict, 
 	// beside the retained source location.
 	removeMarkers(oldAbs)
 	var relabel *hopper.LocationRelabel
-	if plan.label != "" {
+	// A ruling that agrees with the label the sample already carries is a
+	// relocation, not a reclassification. Rewriting label_source anyway would
+	// overwrite the attribution of whoever actually made the call: a sample
+	// cyclotron judged would come back reading "promoter" purely because
+	// something moved its bytes off a full disk.
+	if plan.label != "" && plan.label != samp.Label {
 		relabel = &hopper.LocationRelabel{Label: plan.label, Source: plan.source}
 	}
 	result, err := s.db.MoveLocation(ctx, hopper.MoveLocationOptions{

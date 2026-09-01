@@ -2557,21 +2557,59 @@ func (db *DB) ReactivatePrimaryLocation(ctx context.Context, sha256, path string
 // of the drain queue. Ordering on mtime silently dropped every direct-inserted
 // row (NULL mtime) and let restored archive members claim the epoch.
 //
-// Only label="unknown" rows are returned, because that is the only thing a
-// caller can then do anything with: a workflow move to pending/ or review/ is
-// refused for a classified sample, so serving one would hand the drain work it
-// is guaranteed to fail on. That is not a rare case in the hot pool — measured
-// 2026-09-01, 4.0M of its 4.75M top-level rows were already labelled "good"
-// and would have been the entire head of the queue. Relocating those is
-// promoter's job, not the drain's.
-func (db *DB) OldestIncomingLocations(ctx context.Context, before time.Time, limit int) ([]*SampleLocation, error) {
+// class splits the pool into the two populations a drain has to treat
+// differently; see [IncomingClass].
+func (db *DB) OldestIncomingLocations(ctx context.Context, before time.Time, limit int, class IncomingClass) ([]*IncomingLocation, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
-	if db.pool != nil {
-		return db.oldestIncomingLocationsPG(ctx, before, limit)
+	if err := class.valid(); err != nil {
+		return nil, err
 	}
-	return db.oldestIncomingLocationsSQLite(ctx, before, limit)
+	if db.pool != nil {
+		return db.oldestIncomingLocationsPG(ctx, before, limit, class)
+	}
+	return db.oldestIncomingLocationsSQLite(ctx, before, limit, class)
+}
+
+// IncomingClass selects which half of the hot pool a drain feed returns.
+//
+// The two are not interchangeable work. An IncomingUnknown sample is live work:
+// it has not been judged yet, moving it to pending/ is a real cross-pool byte
+// copy, and it will be slower to re-read when a worker finally gets to it. An
+// IncomingClassified sample is finished — it already belongs in good/, bad/,
+// sighted/ or purgatory/, it is only still on the hot pool because nothing ever
+// relocated it, and moving it is usually free: its destination pool already
+// holds the same bytes, so the move publishes by hard link instead of copying.
+//
+// A drain should therefore always evict the classified half first. Measured
+// 2026-09-01, that half was 4.0M rows and 914 GB of a 3.4 TB pool — a fifth of
+// the pool that no amount of draining the unknown half would ever reclaim.
+type IncomingClass string
+
+const (
+	IncomingUnknown    IncomingClass = "unknown"
+	IncomingClassified IncomingClass = "classified"
+)
+
+func (c IncomingClass) valid() error {
+	switch c {
+	case IncomingUnknown, IncomingClassified:
+		return nil
+	}
+	return fmt.Errorf("hopper: unknown incoming class %q", c)
+}
+
+// IncomingLocation is one drainable observation in the hot pool: where the
+// bytes are, when hopper first saw them there, and the label that decides where
+// they belong. Label is what a caller echoes back as its ruling, which is why
+// this carries it rather than reusing [SampleLocation].
+type IncomingLocation struct {
+	FirstSeenAt time.Time
+	Mtime       *time.Time
+	SHA256      string
+	Path        string
+	Label       string
 }
 
 // DuplicateLocationSHAs returns sha256s that have more than one live top-level

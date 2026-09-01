@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -695,4 +696,126 @@ func callTriage(t *testing.T, api *apiServer, req triageRequest) triageResponse 
 		t.Fatalf("decode response: %v", err)
 	}
 	return resp
+}
+
+// TestHandleTriageSameLabelKeepsAttribution: relocating a sample that is
+// already classified must not rewrite who classified it. draino evicts finished
+// samples off the hot pool by echoing their own label back as a ruling, so
+// without this every such move would restamp label_source to "promoter" and
+// erase the real judge — cyclotron, an operator, a backfill.
+func TestHandleTriageSameLabelKeepsAttribution(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db := mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	sha := testSHA256([]byte("already judged"))
+	oldRel := filepath.Join("incoming", "forager", "npm", "pkg-1.0.0.tgz")
+	oldAbs := filepath.Join(root, oldRel)
+	if err := os.MkdirAll(filepath.Dir(oldAbs), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(oldAbs, []byte("already judged"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertSample(ctx, &hopper.Sample{
+		SHA256: sha, Source: "forager", Path: oldRel,
+		Label: "good", LabelSource: "cyclotron:sighted",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	api := &apiServer{db: db, dataRoot: root, tracker: newWorkerTracker()}
+	resp := callTriage(t, api, triageRequest{Verdicts: []triageVerdict{
+		{SHA256: sha, Ruling: "good", OldPath: oldRel},
+	}})
+	if resp.Moved != 1 || resp.Failed != 0 {
+		t.Fatalf("relocation response = %+v", resp)
+	}
+	if _, err := os.Stat(oldAbs); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("hot-pool copy survived: %v", err)
+	}
+
+	sample, err := db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sample.Label != "good" {
+		t.Errorf("label = %q, want good (unchanged)", sample.Label)
+	}
+	if sample.LabelSource != "cyclotron:sighted" {
+		t.Errorf("label_source = %q, want cyclotron:sighted — a relocation overwrote the classifier's attribution", sample.LabelSource)
+	}
+	if !strings.HasPrefix(sample.Path, "good/") {
+		t.Errorf("path = %q, want a good/ tree", sample.Path)
+	}
+}
+
+// TestHandleIncomingLocationsClassified: the two halves of the pool are served
+// separately, and a bad class is refused rather than quietly draining the wrong
+// one.
+func TestHandleIncomingLocationsClassified(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db := mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, sample := range []*hopper.Sample{
+		{SHA256: repeat("1"), Path: "incoming/forager/open.bin", Label: "unknown"},
+		{SHA256: repeat("2"), Path: "incoming/forager/judged.bin", Label: "good", LabelSource: "promoter"},
+	} {
+		if err := db.InsertSample(ctx, sample); err != nil {
+			t.Fatal(err)
+		}
+	}
+	api := &apiServer{db: db, dataRoot: root, tracker: newWorkerTracker()}
+
+	fetch := func(class string) incomingLocationsResponse {
+		t.Helper()
+		before := time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano)
+		url := "/api/locations/incoming?limit=10&before=" + before
+		if class != "" {
+			url += "&class=" + class
+		}
+		rec := httptest.NewRecorder()
+		api.handleIncomingLocations(rec, httptest.NewRequest(http.MethodGet, url, http.NoBody))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("class=%q status = %d: %s", class, rec.Code, rec.Body.String())
+		}
+		var out incomingLocationsResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	// Default is the unknown half, so an old client keeps its behaviour.
+	for _, class := range []string{"", "unknown"} {
+		got := fetch(class)
+		if len(got.Locations) != 1 || got.Locations[0].Path != "incoming/forager/open.bin" {
+			t.Fatalf("class=%q locations = %+v", class, got.Locations)
+		}
+		if got.Locations[0].Label != "unknown" {
+			t.Errorf("class=%q label = %q", class, got.Locations[0].Label)
+		}
+	}
+
+	got := fetch("classified")
+	if len(got.Locations) != 1 || got.Locations[0].Path != "incoming/forager/judged.bin" {
+		t.Fatalf("classified locations = %+v", got.Locations)
+	}
+	if got.Locations[0].Label != "good" {
+		t.Errorf("classified label = %q, want good — this is the ruling the client echoes back", got.Locations[0].Label)
+	}
+
+	rec := httptest.NewRecorder()
+	api.handleIncomingLocations(rec, httptest.NewRequest(http.MethodGet, "/api/locations/incoming?class=sideways", http.NoBody))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("class=sideways status = %d, want 400", rec.Code)
+	}
 }
