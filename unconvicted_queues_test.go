@@ -186,17 +186,17 @@ func TestTriageDiscordSelectsOnlyDisagreement(t *testing.T) {
 
 	// class 0 = benign, 2 = hostile (litmus). max_crit is the rule engine.
 	rulesOnly := seedUnconvicted(t, ctx, db, 1, "good", 5) // rules hostile, ML silent
-	setLitmus(t, ctx, db, rulesOnly, 0, 0.1)
+	setLitmus(t, ctx, db, rulesOnly, 0, -1, 0.1)
 	mlOnly := seedUnconvicted(t, ctx, db, 2, "good", 3) // ML hostile, rules quiet
-	setLitmus(t, ctx, db, mlOnly, 2, 0.99)
+	setLitmus(t, ctx, db, mlOnly, 2, 10, 0.99)
 	bothAgreeHostile := seedUnconvicted(t, ctx, db, 3, "good", 5)
-	setLitmus(t, ctx, db, bothAgreeHostile, 2, 0.99)
+	setLitmus(t, ctx, db, bothAgreeHostile, 2, 10, 0.99)
 	bothAgreeQuiet := seedUnconvicted(t, ctx, db, 4, "good", 3)
-	setLitmus(t, ctx, db, bothAgreeQuiet, 0, 0.1)
+	setLitmus(t, ctx, db, bothAgreeQuiet, 0, -1, 0.1)
 	// Label-agnostic: a convicted sample with a detector conflict belongs here
 	// too, it just reads as a detection gap rather than a false positive.
 	badConflict := seedUnconvicted(t, ctx, db, 5, "bad", 5)
-	setLitmus(t, ctx, db, badConflict, 0, 0.1)
+	setLitmus(t, ctx, db, badConflict, 0, -1, 0.1)
 	// Never scored by the ensemble: silence from a detector that never ran is
 	// not disagreement.
 	neverScored := seedUnconvicted(t, ctx, db, 6, "good", 5)
@@ -237,11 +237,11 @@ func TestTriageHighestReachesUnknownMembers(t *testing.T) {
 	// Above HighestScoreFloor (0.999), the queue's membership bar since
 	// 2026-09-01 -- below it this fixture seeds an empty queue and the widening
 	// this test covers cannot be observed.
-	setLitmus(t, ctx, db, unknownTop, 2, 0.9998)
+	setLitmus(t, ctx, db, unknownTop, 2, 10, 0.9998)
 	// A convicted file is TriageLowest's domain and must stay out.
 	mustInsert(t, ctx, db, &Sample{SHA256: badTop, Label: "bad", Path: "bad/hot.exe"})
 	mustAnalyze(t, ctx, db, badTop, 5)
-	setLitmus(t, ctx, db, badTop, 2, 0.9999)
+	setLitmus(t, ctx, db, badTop, 2, 10, 0.9999)
 
 	before := time.Now().Add(time.Hour)
 	missing := time.Now().Add(-MissingRetry)

@@ -488,45 +488,40 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			`ON samples(litmus_class, created_at DESC) ` +
 			`WHERE parent = '' AND cleave_result IS NOT NULL`,
 
-		// samples.lvl at full resolution, one index per label pool (2026-09-02).
+		// samples.lvl, the level a sample fires at on azoth's grid — litmus's own
+		// answer using that sample's route policy (2026-09-02).
 		//
-		// litmus_class buckets lvl into three values against CriticalLevel, which
-		// is the right shape for a feed filter and the wrong one for a queue: at
-		// L25 the hostile bucket is a large fraction of the analyzed corpus, so a
-		// queue keyed on it swallows discord's ML-fires arm and fallout whole. lvl
-		// is the same signal ungrouped -- an FP-per-100M budget on azoth's 42-point
-		// grid -- so a queue can take a thin extreme band of it instead.
+		// TriageHighest's per-route walk. file_type LEADS, not lvl: route fairness
+		// comes from taking each route's top-K, so the walk is one ordered scan per
+		// route and the leading key has to be the route. A lvl-leading index would
+		// serve a global level band instead, which is a different query and a worse
+		// queue — LEVELS.md is explicit that the same level is a different true rate
+		// on different routes (resolution-adjusted by 1e8/n_benign), and 72 of 110
+		// routes cannot resolve their first false positive inside the grid at all.
+		// A global band would silently select from the high-resolution routes only,
+		// which is the same bias the 0.999 score floor had.
 		//
-		// What that buys over the litmus_score band the score-ranked queues use
-		// today is that a level means the SAME THING on every route. Raw
-		// probability does not: azoth deploys elf at 0.9998 and clojure at 0.0100
-		// (route_policies.md), so highest's HighestScoreFloor of 0.999 cannot see a
-		// false positive on any route calibrated below it -- which is most of them.
-		// A level bound is comparable by construction, and ORDER BY lvl is a
-		// globally meaningful ranking where ORDER BY litmus_score is not.
+		// lvl ASC second, so the walk emits each route's tightest-firing benign
+		// first and stops at K. analyzed_at third, NOT an afterthought — every
+		// queue carries a freshness floor, and a floor the index cannot resolve is
+		// decided per row after a heap fetch. That is exactly what took good:fp-peak
+		// down earlier today: the floor shipped without an index that carried
+		// analyzed_at, and the walk went from stopping at K to scanning a whole
+		// band to prove it had nothing.
 		//
-		// Shape: lvl leads so the band is a range seek and the ordering is an
-		// ordered walk that stops at LIMIT. analyzed_at is the second key, NOT an
-		// afterthought -- every queue carries a freshness floor, and a floor the
-		// index cannot resolve is decided per row after a heap fetch. That is
-		// exactly what took good:fp-peak down on 2026-09-02: the floor shipped
-		// without an index that carried analyzed_at, and the walk went from
-		// stopping at K to scanning a whole band to prove it had nothing.
-		//
-		// Split by label pool rather than one index over both: the two consumers
-		// want opposite ends (benigns firing at the tightest budgets, malware
-		// firing only at the loosest) and opposite sort orders, and each pool is a
-		// fraction of the table.
-		//
-		// BUILD THESE AFTER `hopper backfill-lvl` HAS DRAINED, not before. lvl is
-		// NULL for every row written before its derive trigger, so today these
-		// cover only recent writes; letting the backfill's UPDATEs grow them by
-		// ~100M entries costs far more WAL and bloat than one CONCURRENTLY build
-		// over the finished column. Deploying earlier is correct, just dearer.
-		`CREATE INDEX IF NOT EXISTS idx_samples_unconvicted_lvl ` +
-			`ON samples(lvl, analyzed_at, id) ` +
+		// BUILD AFTER `hopper backfill-lvl` HAS DRAINED, not before. lvl is NULL for
+		// every row written before its derive trigger, so today this covers only
+		// recent writes; letting the backfill's UPDATEs grow it by ~30M entries
+		// costs far more WAL and bloat than one CONCURRENTLY build over the finished
+		// column. Deploying earlier is correct, just dearer — and
+		// ReindexLitmusLevel is the repair when it happens anyway.
+		`CREATE INDEX IF NOT EXISTS idx_samples_unconvicted_route_lvl ` +
+			`ON samples(file_type, lvl, analyzed_at, id) ` +
 			`WHERE label IN ('good', 'unknown') AND lvl IS NOT NULL ` +
 			`AND cleave_result IS NOT NULL AND skip = ''`,
+		// Superseded by the route-leading index above: nothing selects a global
+		// level band, and TriageLowest still ranks by score.
+		`DROP INDEX IF EXISTS idx_samples_unconvicted_route_lvl`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_bad_lvl ` +
 			`ON samples(lvl DESC, analyzed_at, id) ` +
 			`WHERE label = 'bad' AND lvl IS NOT NULL ` +
@@ -5206,15 +5201,23 @@ func (db *DB) triageSecondOpinionPG(ctx context.Context, limit int, trusted []st
 // old query carried is gone: the outer root join already requires the parent
 // row (an orphan member wastes one of its route's K slots, nothing more).
 //
-// Shape: a LATERAL per distinct file_type walks that route's score-ordered
-// partial index (idx_samples_good_route_score) and stops after
+// Shape: a LATERAL per distinct file_type walks that route's level-ordered
+// partial index (idx_samples_unconvicted_route_lvl) and stops after
 // triagePerRouteK eligible members, tagging each with its per-route rank.
-// DISTINCT ON collapses members to their root (keeping the hottest member's
-// score+rank), and the outer join resolves each root to its own sample row —
+// DISTINCT ON collapses members to their root (keeping the tightest-firing
+// member's level+rank) — the same collapse collimator's _outermost_error_rows
+// performs — and the outer join resolves each root to its own sample row,
 // restricted to good/unknown parents, since a bad-labelled archive is
 // TriageLowest's domain. The final ORDER BY is rank-first: every route's #1
-// pinner sorts before any route's #2, so no route's tail (or the ~70k-member
-// score-1.0 tie band that archives own) can monopolize a batch.
+// pinner sorts before any route's #2, so no route's tail can monopolize a batch.
+//
+// Ordering is by lvl ASCENDING (2026-09-02): a lower level is a tighter
+// false-positive budget, so lvl 0 is the benign that fires even at the strictest
+// operating point — the one actually costing recall. It replaces litmus_score
+// DESC, which orders the same rows identically WITHIN a route (the two are
+// monotonic there) but says nothing across routes, since a probability is not
+// comparable between routes calibrated at 0.0100 and 0.9998. litmus_score
+// remains the tiebreak within a level.
 // The empty file_type is its own partition — rows there are rare (analyzed
 // rows carry a type) and excluding them would hide real pinners.
 func (db *DB) triageHighestPG(ctx context.Context, limit, perRouteK int,
@@ -5230,11 +5233,11 @@ func (db *DB) triageHighestPG(ctx context.Context, limit, perRouteK int,
 	rows, err := db.pool.Query(ctx,
 		`WITH RECURSIVE fts AS (
 		   (SELECT file_type FROM samples
-		     WHERE `+triageHighestRouteWhere("", fresh)+`
+		     WHERE `+triageHighestRouteWhere("", "lvl", fresh)+`
 		     ORDER BY file_type LIMIT 1)
 		   UNION ALL
 		   SELECT (SELECT s.file_type FROM samples s
-		           WHERE `+triageHighestRouteWhere("s.", fresh)+` AND s.file_type > fts.file_type
+		           WHERE `+triageHighestRouteWhere("s.", "s.lvl", fresh)+` AND s.file_type > fts.file_type
 		           ORDER BY s.file_type LIMIT 1)
 		   FROM fts WHERE fts.file_type IS NOT NULL
 		 )
@@ -5244,18 +5247,18 @@ func (db *DB) triageHighestPG(ctx context.Context, limit, perRouteK int,
 		     FROM (SELECT file_type FROM fts WHERE file_type IS NOT NULL) f
 		     CROSS JOIN LATERAL (
 		       SELECT CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END AS root,
-		              s0.litmus_score AS best,
-		              ROW_NUMBER() OVER (ORDER BY s0.litmus_score DESC) AS rank
+		              s0.lvl AS best,
+		              ROW_NUMBER() OVER (ORDER BY s0.lvl ASC, s0.litmus_score DESC) AS rank
 		       FROM samples s0
-		       WHERE `+triageHighestWhere("s0.", "$1", fresh, "$2")+`
+		       WHERE `+triageHighestWhere("s0.", "s0.lvl", "$1", fresh, "$2")+`
 		         AND s0.file_type = f.file_type`+extra+`
-		       ORDER BY s0.litmus_score DESC
+		       ORDER BY s0.lvl ASC, s0.litmus_score DESC
 		       LIMIT `+strconv.Itoa(perRouteK)+`
 		     ) k
-		   ) hot ORDER BY root, best DESC, rank ASC
+		   ) hot ORDER BY root, best ASC, rank ASC
 		 ) roots
 		 JOIN samples ON samples.sha256 = roots.root AND samples.label IN ('good', 'unknown')
-		 ORDER BY roots.rank ASC, roots.best DESC NULLS LAST, samples.id DESC LIMIT $`+strconv.Itoa(len(args)),
+		 ORDER BY roots.rank ASC, roots.best ASC, samples.id DESC LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage highest: %w", err)
@@ -7178,7 +7181,7 @@ func (db *DB) BackfillLitmusLevel(ctx context.Context, batchSize int, targetDura
 // litmusLevelIndexes are the partial indexes over samples.lvl, which
 // [ReindexLitmusLevel] rebuilds once the backfill that fills that column has
 // drained.
-var litmusLevelIndexes = [...]string{"idx_samples_unconvicted_lvl", "idx_samples_bad_lvl"}
+var litmusLevelIndexes = [...]string{"idx_samples_unconvicted_route_lvl", "idx_samples_bad_lvl"}
 
 // ReindexLitmusLevel rebuilds the samples.lvl indexes, once, after the backfill
 // completes. It is a no-op on a database where that has already happened.

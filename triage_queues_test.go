@@ -7,13 +7,19 @@ import (
 	"time"
 )
 
-// setLitmus stamps a sample's litmus_result so the generated columns derive the
-// given class and score: litmus_class comes from $.class (via litmusClassSQLite)
-// and litmus_score from $.prob (a GENERATED column — it cannot be written
-// directly).
-func setLitmus(t *testing.T, ctx context.Context, db *DB, sha string, class int, score float64) {
+// setLitmus writes a litmus envelope. lvl is the level the sample fires at on
+// azoth's grid, or -1 for one that fires nowhere; class is the derived
+// criticality, which real envelopes carry redundantly.
+//
+// The level is not optional decoration: it is what litmus actually emits, what
+// the derive trigger fills samples.lvl from, and what CriticalLevel /
+// SuspiciousCeiling bucket into class. A fixture carrying only class describes
+// an envelope litmus does not produce, and the score-ranked queues select on the
+// level -- so callers must keep the two consistent: lvl <= CriticalLevel is
+// class 2, lvl <= SuspiciousCeiling is class 1, and anything else is class 0.
+func setLitmus(t *testing.T, ctx context.Context, db *DB, sha string, class, lvl int, score float64) {
 	t.Helper()
-	body := fmt.Sprintf(`{"class":%d,"prob":%g}`, class, score)
+	body := fmt.Sprintf(`{"class":%d,"lvl":%d,"prob":%g}`, class, lvl, score)
 	if err := db.UpdateLitmusResult(ctx, sha, []byte(body)); err != nil {
 		t.Fatalf("UpdateLitmusResult(%s): %v", sha, err)
 	}
@@ -194,7 +200,7 @@ func TestTriageQueuesReturnLightSamples(t *testing.T) {
 	sha := staleTestSHA(89)
 	mustInsert(t, ctx, db, &Sample{SHA256: sha, Label: "unknown", Path: "review/" + sha})
 	mustAnalyzeWithTraits(t, ctx, db, sha, 7, `{"l":4}`)
-	setLitmus(t, ctx, db, sha, 2, 0.95)
+	setLitmus(t, ctx, db, sha, 2, 10, 0.95)
 	if err := db.UpdateLLMResult(ctx, sha, []byte(`{"interpretation":"test"}`)); err != nil {
 		t.Fatalf("UpdateLLMResult: %v", err)
 	}
@@ -308,7 +314,7 @@ func TestTriageInterestingOrder(t *testing.T) {
 		if suspicious > 1 {
 			mustAnalyzeWithTraits(t, ctx, db, sha, 0, `{"l":4},{"l":4}`)
 		}
-		setLitmus(t, ctx, db, sha, 0, score)
+		setLitmus(t, ctx, db, sha, 0, -1, score)
 		if corroborated {
 			if _, err := db.lite.ExecContext(ctx, `UPDATE samples SET corroborated = 1 WHERE sha256 = ?`, sha); err != nil {
 				t.Fatalf("set corroborated: %v", err)
@@ -368,7 +374,7 @@ func TestTriageHighestCollapsesToParent(t *testing.T) {
 	} {
 		mustInsert(t, ctx, db, &Sample{SHA256: m.sha, Label: "good", Parent: m.parent, Path: m.path})
 		mustAnalyze(t, ctx, db, m.sha, 5)
-		setLitmus(t, ctx, db, m.sha, 2, m.score)
+		setLitmus(t, ctx, db, m.sha, 2, 10, m.score)
 	}
 
 	before := time.Now().Add(time.Hour)
@@ -461,7 +467,7 @@ func TestTriageLowestPerMember(t *testing.T) {
 	} {
 		mustInsert(t, ctx, db, &Sample{SHA256: m.sha, Label: "bad", Parent: parent, Path: m.path})
 		mustAnalyze(t, ctx, db, m.sha, 0)
-		setLitmus(t, ctx, db, m.sha, 0, m.score)
+		setLitmus(t, ctx, db, m.sha, 0, -1, m.score)
 	}
 	// The skip-benign-archive-item member is out of training, so out of queue.
 	if err := db.SetSkip(ctx, lmSkip, "skip-benign-archive-item"); err != nil {
@@ -718,21 +724,25 @@ func TestTriageHighestPerRouteReach(t *testing.T) {
 		s := sha(100 + i)
 		mustInsert(t, ctx, db, &Sample{SHA256: s, Label: "good", Path: fmt.Sprintf("good/j%d.jar", i)})
 		analyzeAs(s, "jar", 5)
-		setLitmus(t, ctx, db, s, 2, 1.0)
+		setLitmus(t, ctx, db, s, 2, 10, 1.0)
 	}
 	// The PE-shaped pinners: class 1 (below the hostile band) and scores below
 	// the jar tie band — excluded by BOTH old mechanisms.
+	// Scores well below the jar tie band, restored 2026-09-02. They had been
+	// raised to 0.99995/0.9993 to clear HighestScoreFloor, which is exactly the
+	// blindness that floor caused: a benign firing on a route calibrated below
+	// 0.999 was unreachable at any rank. Membership is now the level, so a
+	// sub-hostile pinner at 0.62 selects on its merits and this fixture can say
+	// what it always meant to.
 	pe1, pe2 := sha(1), sha(2)
 	for _, p := range []struct {
 		sha   string
+		lvl   int
 		score float64
-		// Both above HighestScoreFloor (0.999): the queue's membership bar since
-		// 2026-09-01, so a fixture below it seeds an empty queue rather than the
-		// per-route reach this test is about.
-	}{{pe1, 0.99995}, {pe2, 0.9993}} {
+	}{{pe1, 100, 0.62}, {pe2, 250, 0.58}} {
 		mustInsert(t, ctx, db, &Sample{SHA256: p.sha, Label: "good", Path: "good/" + p.sha[:4] + ".exe"})
 		analyzeAs(p.sha, "pe", 5)
-		setLitmus(t, ctx, db, p.sha, 1, p.score)
+		setLitmus(t, ctx, db, p.sha, 1, p.lvl, p.score)
 	}
 
 	before := time.Now().Add(time.Hour)
@@ -767,7 +777,7 @@ func TestTriageHighestAttemptBudgetUsesRoot(t *testing.T) {
 		SHA256: member, Label: "good", Parent: root, Path: "good/archive.zip!!payload.exe",
 	})
 	mustAnalyzeWithTraits(t, ctx, db, member, 90, `{"l":5}`)
-	setLitmus(t, ctx, db, member, 2, 0.9999) // above HighestScoreFloor
+	setLitmus(t, ctx, db, member, 2, 10, 0.9999) // fires in the hostile band
 
 	filter := TriageFilter{AttemptReportType: "cyclotron-attempt:highest", MaxAttempts: 1}
 	selectRoot := func() bool {

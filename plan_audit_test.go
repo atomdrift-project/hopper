@@ -497,25 +497,25 @@ func TestPlanAuditHighestRouteWalk(t *testing.T) {
 	for _, tc := range []struct {
 		name, where string
 	}{
-		{"member walk", triageHighestWhere("s0.", lit(now), lit(fresh), lit(now)) +
+		{"member walk", triageHighestWhere("s0.", "s0.lvl", lit(now), lit(fresh), lit(now)) +
 			` AND s0.file_type = 'elf'`},
 		// The route enumeration's skip-scan. It must be index-served for the
 		// same reason: it runs once per distinct file_type.
-		{"route enumeration", triageHighestRouteWhere("s0.", lit(fresh)) +
+		{"route enumeration", triageHighestRouteWhere("s0.", "s0.lvl", lit(fresh)) +
 			` AND s0.file_type = 'elf'`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			sql := `EXPLAIN SELECT s0.file_type, s0.litmus_score FROM samples s0
+			sql := `EXPLAIN SELECT s0.file_type, s0.lvl FROM samples s0
 			         WHERE ` + tc.where + `
-			         ORDER BY s0.litmus_score DESC LIMIT ` + strconv.Itoa(triagePerRouteK)
+			         ORDER BY s0.lvl ASC, s0.litmus_score DESC LIMIT ` + strconv.Itoa(triagePerRouteK)
 			plan := explainText(t, ctx, db, sql)
 			if planSeqScansSamples(plan) {
 				t.Errorf("Seq Scan on samples:\n%s", plan)
 			}
-			if !strings.Contains(plan, "idx_samples_unconvicted_route_fresh") {
-				t.Errorf("not using idx_samples_unconvicted_route_fresh — without analyzed_at "+
-					"in the index the freshness floor costs a heap fetch per row and the walk "+
-					"cannot stop early:\n%s", plan)
+			if !strings.Contains(plan, "idx_samples_unconvicted_route_lvl") {
+				t.Errorf("not using idx_samples_unconvicted_route_lvl — the walk needs "+
+					"(file_type, lvl, analyzed_at) to emit each route's tightest-firing benign "+
+					"first and stop at K:\n%s", plan)
 			}
 			if strings.Contains(plan, "Sort") {
 				t.Errorf("sorts instead of walking the route's score tail:\n%s", plan)

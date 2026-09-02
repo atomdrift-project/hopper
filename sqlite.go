@@ -3183,18 +3183,22 @@ func (db *DB) triageHighestSQLite(ctx context.Context, limit, perRouteK int,
 	args = append(args, limit)
 	//nolint:gosec // G202: label predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
+		// MIN(best), not MAX: best is now the level, and lower is the tighter
+		// firing budget — the archive keeps its worst member's reading, same as
+		// the PG mirror's DISTINCT ON ... ORDER BY best ASC.
 		`SELECT `+liteSampleColsLight+` FROM (
-		   SELECT root, MAX(best) AS best, MIN(rank) AS rank FROM (
+		   SELECT root, MIN(best) AS best, MIN(rank) AS rank FROM (
 		     SELECT CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END AS root,
-		            s0.litmus_score AS best,
-		            ROW_NUMBER() OVER (PARTITION BY s0.file_type ORDER BY s0.litmus_score DESC) AS rank
+		            `+litmusLvlSQLite("s0.")+` AS best,
+		            ROW_NUMBER() OVER (PARTITION BY s0.file_type
+		                               ORDER BY `+litmusLvlSQLite("s0.")+` ASC, s0.litmus_score DESC) AS rank
 		     FROM samples s0
-		     WHERE `+triageHighestWhere("s0.", "?", "?", "?")+extra+`
+		     WHERE `+triageHighestWhere("s0.", litmusLvlSQLite("s0."), "?", "?", "?")+extra+`
 		   ) hot WHERE rank <= `+strconv.Itoa(perRouteK)+`
 		   GROUP BY root
 		 ) roots
 		 JOIN samples ON samples.sha256 = roots.root AND samples.label IN ('good', 'unknown')
-		 ORDER BY roots.rank ASC, roots.best DESC, samples.id DESC LIMIT ?`,
+		 ORDER BY roots.rank ASC, roots.best ASC, samples.id DESC LIMIT ?`,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage highest: %w", err)

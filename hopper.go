@@ -206,20 +206,11 @@ const MissingRetry = 4 * 24 * time.Hour
 // before any route's #2).
 const triagePerRouteK = 10
 
-// HighestScoreFloor is the membership bar for the highest queue: only samples
-// the ensemble is essentially certain about.
-//
-// The queue is good:fp-peak -- benign-labelled files scoring at the very top of
-// the hostile range -- so tightening the score makes it MORE what it already is
-// rather than redefining it, which is why this is a safe bound where a severity
-// or corroboration filter would not be. Its per-route top-K already picked the
-// extreme tail; this stops the tail being defined relative to a route that has
-// no high scorers at all.
-//
-// Measured 2026-09-01: the population is saturated at the top -- 62% of a 50k
-// sample scored exactly 1.0 -- so a lower floor buys nothing. At >= 0.999 with a
-// three-day freshness floor the queue holds 777.
-const HighestScoreFloor = 0.999
+// The highest queue's membership bar was a raw-probability floor
+// (HighestScoreFloor = 0.999) from 2026-09-01 until 2026-09-02. It is now
+// `lvl >= 0` -- see triageHighestRouteWhere, which records why a global
+// probability floor cannot express "is this a false positive" across routes
+// calibrated anywhere from 0.0100 to 0.9998.
 
 // The two score-ranked queues' membership predicates, in one place each.
 //
@@ -241,8 +232,11 @@ const HighestScoreFloor = 0.999
 // the per-row anti-joins -- a strict superset, so enumeration can never miss a
 // route the walk would have served, and the parts it drops are the ones that
 // cost a probe per row.
-func triageHighestWhere(a, created, fresh, missing string) string {
-	return triageHighestRouteWhere(a, fresh) + `
+// lvl is the dialect's spelling of samples.lvl: a plain column on Postgres,
+// where a trigger derives it, and a JSON extraction on SQLite, which has no such
+// column (see litmusLvlSQLite).
+func triageHighestWhere(a, lvl, created, fresh, missing string) string {
+	return triageHighestRouteWhere(a, lvl, fresh) + `
 		   AND ` + a + `created_at < ` + created + `
 		   AND NOT EXISTS (SELECT 1 FROM reports r
 		                   WHERE r.sha256 = CASE WHEN ` + a + `parent = '' THEN ` + a + `sha256 ELSE ` + a + `parent END
@@ -251,17 +245,48 @@ func triageHighestWhere(a, created, fresh, missing string) string {
 }
 
 // triageHighestRouteWhere is what makes a file_type worth walking at all: the
-// pool, a score in the pinning band, and a fresh enough analysis. The freshness
-// floor belongs here rather than only in the walk -- without it the enumeration
-// yields every route that has ever scored, and a route whose rows are all stale
-// costs a full scan of its score band to prove it has nothing.
-func triageHighestRouteWhere(a, fresh string) string {
+// pool, a benign that actually FIRES, and a fresh enough analysis.
+//
+// "Fires" is `lvl >= 0` -- the sample reaches some level on azoth's grid, which
+// is litmus's own answer using that route's calibrated policy. It is collimator's
+// membership test for a false positive verbatim: show_false_positives takes
+// label==0 rows matching _most_open_severity_level, i.e. those firing at the
+// loosest level the grid expresses. A row that fires nowhere carries lvl = -1.
+//
+// This replaces a global `litmus_score >= 0.999` floor, which was wrong in a way
+// that only a per-route view makes visible: azoth deploys elf at 0.9998 and
+// clojure at 0.0100 (route_policies.md), so the floor silently excluded every
+// route calibrated below it -- most of them -- from the queue that exists to find
+// their false positives. A benign firing at L20000 on a low-resolution route is a
+// real false positive at a real operating point; a raw probability of 0.5 on that
+// same route may be well below its threshold and no false positive at all. Only
+// the level knows which.
+//
+// What it does NOT do is make the bound route-comparable. LEVELS.md is explicit
+// that the same level is a different true rate on different routes, because it is
+// resolution-adjusted (floor_level = 1e8/n_benign); 72 of 110 routes cannot
+// resolve their first false positive inside the grid at all. Route fairness comes
+// from the per-route top-K below, exactly as it does in collimator, which runs
+// its report once per route. A global level cutoff would reintroduce the same
+// bias the score floor had.
+//
+// The freshness floor belongs here rather than only in the walk -- without it the
+// enumeration yields every route that has ever scored, and a route whose rows are
+// all stale costs a full scan to prove it has nothing.
+func triageHighestRouteWhere(a, lvl, fresh string) string {
 	return a + `label IN ('good', 'unknown') AND ` + a + `cleave_result IS NOT NULL AND ` + a + `skip = ''` +
 		` AND ` + a + `path <> ''
-		   AND ` + a + `litmus_score IS NOT NULL
-		   AND ` + a + `litmus_score >= ` + strconv.FormatFloat(HighestScoreFloor, 'f', -1, 64) + `
+		   AND ` + lvl + ` IS NOT NULL AND ` + lvl + ` >= 0
 		   AND ` + a + `analyzed_at > ` + fresh + `
 		   AND (` + a + `parent = '' OR ` + a + `path LIKE '%!!%')`
+}
+
+// litmusLvlSQLite spells samples.lvl for the dev backend, which carries no such
+// column: SQLite recomputes it from litmus_result the same way
+// litmusClassSQLiteExpr does, keeping both v6/v7 spellings of the key.
+func litmusLvlSQLite(a string) string {
+	return `CAST(COALESCE(json_extract(` + a + `litmus_result, '$.lvl'), ` +
+		`json_extract(` + a + `litmus_result, '$.l')) AS INTEGER)`
 }
 
 // triageLowestWhere is the mirror. It differs from highest in more than the
