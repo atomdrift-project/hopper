@@ -3254,17 +3254,7 @@ func (db *DB) triageStrandedSQLite(ctx context.Context, limit int, createdBefore
 		   SELECT root, MAX(best) AS best FROM (
 		     SELECT m.parent AS root, m.score AS best
 		     FROM samples m
-		     WHERE m.label = 'good' AND m.cleave_result IS NOT NULL AND m.skip = ''
-		       AND m.parent != '' AND m.path LIKE '%!!%'
-		       AND m.score > 0 AND m.max_crit >= `+strconv.Itoa(strandedMemberCrit)+`
-		       AND m.label_source NOT LIKE 'cyclotron:%'
-		       AND m.created_at < ?
-		       AND EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = m.parent AND p.label = 'bad')
-		       AND NOT EXISTS (SELECT 1 FROM reports r
-		                       WHERE r.sha256 = m.sha256 AND r.report_type = 'stranded')
-		       AND NOT EXISTS (SELECT 1 FROM reports r
-		                       WHERE r.sha256 = m.parent
-		                         AND r.report_type = '`+ReportTypeMissing+`' AND r.created_at > ?)`+extra+`
+		     WHERE `+triageStrandedWhere("?", "?")+extra+`
 		     ORDER BY m.score DESC
 		     LIMIT `+strconv.Itoa(strandedInnerScan)+`
 		   ) hot GROUP BY root
@@ -3276,6 +3266,29 @@ func (db *DB) triageStrandedSQLite(ctx context.Context, limit int, createdBefore
 		return nil, fmt.Errorf("hopper: triage stranded: %w", err)
 	}
 	return scanLiteSamples(rows)
+}
+
+// triageStrandedPopulationSQLite: see TriageStrandedPopulation. Mirrors
+// triageStrandedPopulationPG — the same predicate, no ordering, no collapse.
+func (db *DB) triageStrandedPopulationSQLite(ctx context.Context, limit int,
+	createdBefore, missingBefore time.Time, f TriageFilter,
+) ([]*Sample, error) {
+	extra, fargs := triageFilterClauseSQLite(f, "m")
+	args := append([]any{
+		createdBefore.UTC().Format(time.RFC3339Nano),
+		missingBefore.UTC().Format(time.RFC3339Nano),
+	}, fargs...)
+	args = append(args, limit)
+	//nolint:gosec // G202: the predicate and column list are constant; filter values are bound as ? args
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleColsLight+` FROM samples m
+		 WHERE `+triageStrandedWhere("?", "?")+extra+`
+		 LIMIT ?`,
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage stranded population: %w", err)
+	}
+	return scanLiteSamplesLight(rows)
 }
 
 func (db *DB) triageNewSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {

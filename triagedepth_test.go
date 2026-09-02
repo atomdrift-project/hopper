@@ -95,6 +95,64 @@ func TestScoredDepthsSeePastThePerRouteBound(t *testing.T) {
 	}
 }
 
+// stranded selects archives and is worked per member, so its depth counts
+// members. The divergence is deliberate and easy to undo by accident -- dropping
+// its CountSelect would silently start reporting packages waiting instead of
+// rulings waiting, which understates the backlog by whatever the members-per-
+// archive ratio happens to be (11 against 68 in production on 2026-09-02).
+func TestStrandedDepthCountsMembersNotArchives(t *testing.T) {
+	ctx := t.Context()
+	db := openTestDB(t)
+
+	pad := func(c byte) string {
+		s := make([]byte, 64)
+		for i := range s {
+			s[i] = c
+		}
+		return string(s)
+	}
+	// One convicted archive holding three qualifying members: the two numbers
+	// must differ, or the test cannot tell the shapes apart.
+	parent := pad('a')
+	mustInsert(t, ctx, db, &Sample{SHA256: parent, Label: "bad", Path: "bad/x.tgz"})
+	const wantMembers = 3
+	for i, c := range []byte{'1', '2', '3'} {
+		m := pad(c)
+		mustInsert(t, ctx, db, &Sample{
+			SHA256: m, Label: "good", Parent: parent,
+			Path: fmt.Sprintf("bad/x.tgz!!m%d.exe", i),
+		})
+		result := fmt.Appendf(nil,
+			`{"fs":[{"sha":%q,"type":"pe","x":90,"dp":0,"ts":[{"l":4,"c":1.0}]}]}`, m)
+		if err := db.UpdateCleaveResult(ctx, m, result, nil, ""); err != nil {
+			t.Fatalf("UpdateCleaveResult: %v", err)
+		}
+	}
+
+	if TriageQueues["stranded"].CountSelect == nil {
+		t.Fatal("stranded has no CountSelect; its depth would report archives, not members")
+	}
+	// Called directly rather than through the registry, whose closures pin
+	// createdBefore to OutlierGrace: backdating fixtures past a 48-hour age floor
+	// would test the floor instead of the unit mismatch this is about.
+	before, missing := time.Now().Add(time.Hour), time.Now().Add(-MissingRetry)
+	selected, err := db.TriageStranded(ctx, TriageDepthCap, before, missing, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageStranded: %v", err)
+	}
+	if len(selected) != 1 {
+		t.Fatalf("selection = %d archives, want 1 — fixture is not exercising the collapse", len(selected))
+	}
+	counted, err := db.TriageStrandedPopulation(ctx, TriageDepthCap, before, missing, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageStrandedPopulation: %v", err)
+	}
+	if len(counted) != wantMembers {
+		t.Errorf("depth = %d, want %d members (the selection's %d archives is the wrong unit)",
+			len(counted), wantMembers, len(selected))
+	}
+}
+
 // The cap is what keeps a depth query's cost bounded by us rather than by
 // whichever queue happens to be largest.
 func TestTriageDepthIsCapped(t *testing.T) {

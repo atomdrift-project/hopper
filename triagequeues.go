@@ -45,12 +45,19 @@ import (
 // it near a thousand rows, so the cap is a guard against a regression rather
 // than a routine truncation.
 //
-// CountSelect overrides Select for that count, and exists for exactly one
-// reason: highest and lowest bound each route to triagePerRouteK candidates, a
-// batching device that keeps one route from monopolizing a selection. Counting
-// through it would report the bound rather than the population, so their count
-// runs the same query with that K lifted to the cap as well. It is nil for every
-// other queue.
+// CountSelect overrides Select for that count. It is nil for most queues, and
+// set for the three whose selection is deliberately not the population:
+//
+//   - highest and lowest bound each route to triagePerRouteK candidates, a
+//     batching device that keeps one route from monopolizing a selection.
+//     Counting through it reports the bound, so their count runs the same query
+//     with that K lifted to the cap.
+//   - stranded selects archives but is worked per member, so counting its
+//     selection reports packages waiting rather than rulings waiting.
+//
+// Both cases keep the queue's predicate; only its shape changes. That is the
+// line to hold if a fourth is ever added — a CountSelect that re-states
+// membership is the drift this design exists to prevent.
 type Queue struct {
 	Select      func(ctx context.Context, db *DB, n int) ([]*Sample, error)
 	CountSelect func(ctx context.Context, db *DB, n int) ([]*Sample, error)
@@ -416,9 +423,20 @@ var TriageQueues = map[string]Queue{
 	// never individually reviewed. Unit of work is the archive (context);
 	// verdicts and the drain are PER MEMBER, so an archive resurfaces until every
 	// qualifying member has been judged.
+	//
+	// The second queue after highest/lowest to need a CountSelect, and for a
+	// different reason: not a batching bound, but a unit mismatch. Its selection
+	// is archives and its work is members, so counting the selection reports how
+	// many packages are waiting rather than how many rulings are — 11 against 68,
+	// measured 2026-09-02. Counting members is also 25x cheaper (0.6s against
+	// 17.3s); see TriageStrandedPopulation for why the archive shape is the
+	// expensive one.
 	"stranded": {Name: "stranded", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
 		now := time.Now()
 		return db.TriageStranded(ctx, n, now.Add(-OutlierGrace), now.Add(-MissingRetry), queueFilter("stranded", TriageFilter{}))
+	}, CountSelect: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+		now := time.Now()
+		return db.TriageStrandedPopulation(ctx, n, now.Add(-OutlierGrace), now.Add(-MissingRetry), queueFilter("stranded", TriageFilter{}))
 	}},
 
 	// popular: samples from a ranked package whose worst finding is suspicious

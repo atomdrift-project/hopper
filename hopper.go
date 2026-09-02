@@ -355,6 +355,36 @@ const strandedMemberCrit = suspiciousCrit
 // comfortably fills any batch of distinct archives.
 const strandedInnerScan = 1000
 
+// triageStrandedWhere is the stranded queue's membership predicate: a
+// good-labelled archive MEMBER, carrying real findings, whose benign label was
+// inherited before its parent was convicted and never individually reviewed.
+//
+// One definition, four readers — the archive selector collapses these to their
+// parent, the depth counts them as they are, and both have a SQLite mirror.
+//
+// Unlike the score-ranked pair's builders this takes no alias: every reader
+// selects FROM samples m, because the archive shape needs an alias for its
+// inner scan and the population shape matches it so the two read identically.
+// created and missing are the dialect's placeholder spellings for the two time
+// bounds, in the caller's own numbering.
+//
+// label_source NOT LIKE 'cyclotron:%' excludes members whose good label came
+// from an individual review: the lowest queue's acquittals are correct state,
+// not stranded inheritance.
+func triageStrandedWhere(created, missing string) string {
+	return `m.label = 'good' AND m.cleave_result IS NOT NULL AND m.skip = ''
+		   AND m.parent != '' AND m.path LIKE '%!!%'
+		   AND m.score > 0 AND m.max_crit >= ` + strconv.Itoa(strandedMemberCrit) + `
+		   AND m.label_source NOT LIKE 'cyclotron:%'
+		   AND m.created_at < ` + created + `
+		   AND EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = m.parent AND p.label = 'bad')
+		   AND NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = m.sha256 AND r.report_type = 'stranded')
+		   AND NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = m.parent
+		                     AND r.report_type = '` + ReportTypeMissing + `' AND r.created_at > ` + missing + `)`
+}
+
 // CascadeDemoteScore is the minimum cleave risk score (samples.score) an
 // unlabeled archive member must carry to be demoted alongside a bad parent.
 // A bad archive's malice lives in a few members, not every file; shared benign
@@ -4585,6 +4615,33 @@ func (db *DB) TriageStranded(ctx context.Context, limit int, createdBefore, miss
 		return db.triageStrandedPG(ctx, limit, createdBefore, missingBefore, f)
 	}
 	return db.triageStrandedSQLite(ctx, limit, createdBefore, missingBefore, f)
+}
+
+// TriageStrandedPopulation returns the stranded MEMBERS awaiting a verdict —
+// the same predicate TriageStranded selects from, without the collapse to
+// parent archives. It backs the queue's depth, and it exists because counting
+// through the archive selector is both the wrong number and an expensive way to
+// get it.
+//
+// Wrong number: members are what the work is measured in. An archive resurfaces
+// until every qualifying member inside it has been judged, so "11 archives"
+// understates a backlog that is really 68 rulings.
+//
+// Expensive: the archive selector's `ORDER BY score DESC LIMIT strandedInnerScan`
+// is an ordered index walk that probes three times per row, and it stops early
+// only if it can fill that limit. The population is far smaller than the limit,
+// so it never can — it walks the whole of idx_samples_stranded_member every
+// time, measured at 17.3s against 0.6s for this. That is the classic rare-
+// predicate trap the bad/sighted selectors already carry indexes to avoid: cost
+// scales with how RARE the population is, not how large.
+//
+// No ORDER BY here for the same reason. Ordering is what forces the walk; a
+// count does not care what order it counts in.
+func (db *DB) TriageStrandedPopulation(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.triageStrandedPopulationPG(ctx, limit, createdBefore, missingBefore, f)
+	}
+	return db.triageStrandedPopulationSQLite(ctx, limit, createdBefore, missingBefore, f)
 }
 
 // StrandedMembers lists root's stranded members still awaiting a per-member

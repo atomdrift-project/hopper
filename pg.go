@@ -487,6 +487,50 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_class_top_created ` +
 			`ON samples(litmus_class, created_at DESC) ` +
 			`WHERE parent = '' AND cleave_result IS NOT NULL`,
+
+		// samples.lvl at full resolution, one index per label pool (2026-09-02).
+		//
+		// litmus_class buckets lvl into three values against CriticalLevel, which
+		// is the right shape for a feed filter and the wrong one for a queue: at
+		// L25 the hostile bucket is a large fraction of the analyzed corpus, so a
+		// queue keyed on it swallows discord's ML-fires arm and fallout whole. lvl
+		// is the same signal ungrouped -- an FP-per-100M budget on azoth's 42-point
+		// grid -- so a queue can take a thin extreme band of it instead.
+		//
+		// What that buys over the litmus_score band the score-ranked queues use
+		// today is that a level means the SAME THING on every route. Raw
+		// probability does not: azoth deploys elf at 0.9998 and clojure at 0.0100
+		// (route_policies.md), so highest's HighestScoreFloor of 0.999 cannot see a
+		// false positive on any route calibrated below it -- which is most of them.
+		// A level bound is comparable by construction, and ORDER BY lvl is a
+		// globally meaningful ranking where ORDER BY litmus_score is not.
+		//
+		// Shape: lvl leads so the band is a range seek and the ordering is an
+		// ordered walk that stops at LIMIT. analyzed_at is the second key, NOT an
+		// afterthought -- every queue carries a freshness floor, and a floor the
+		// index cannot resolve is decided per row after a heap fetch. That is
+		// exactly what took good:fp-peak down on 2026-09-02: the floor shipped
+		// without an index that carried analyzed_at, and the walk went from
+		// stopping at K to scanning a whole band to prove it had nothing.
+		//
+		// Split by label pool rather than one index over both: the two consumers
+		// want opposite ends (benigns firing at the tightest budgets, malware
+		// firing only at the loosest) and opposite sort orders, and each pool is a
+		// fraction of the table.
+		//
+		// BUILD THESE AFTER `hopper backfill-lvl` HAS DRAINED, not before. lvl is
+		// NULL for every row written before its derive trigger, so today these
+		// cover only recent writes; letting the backfill's UPDATEs grow them by
+		// ~100M entries costs far more WAL and bloat than one CONCURRENTLY build
+		// over the finished column. Deploying earlier is correct, just dearer.
+		`CREATE INDEX IF NOT EXISTS idx_samples_unconvicted_lvl ` +
+			`ON samples(lvl, analyzed_at, id) ` +
+			`WHERE label IN ('good', 'unknown') AND lvl IS NOT NULL ` +
+			`AND cleave_result IS NOT NULL AND skip = ''`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_bad_lvl ` +
+			`ON samples(lvl DESC, analyzed_at, id) ` +
+			`WHERE label = 'bad' AND lvl IS NOT NULL ` +
+			`AND cleave_result IS NOT NULL AND skip = ''`,
 		// prism's molecule view (?m=<formula>) filters the feed by an exact cleave
 		// formula — "show me everything with this structure". Without a matching
 		// index that predicate is not a seek but a filter applied while walking
@@ -5285,17 +5329,7 @@ func (db *DB) triageStrandedPG(ctx context.Context, limit int, createdBefore, mi
 		   SELECT DISTINCT ON (root) root, best FROM (
 		     SELECT m.parent AS root, m.score AS best
 		     FROM samples m
-		     WHERE m.label = 'good' AND m.cleave_result IS NOT NULL AND m.skip = ''
-		       AND m.parent != '' AND m.path LIKE '%!!%'
-		       AND m.score > 0 AND m.max_crit >= `+strconv.Itoa(strandedMemberCrit)+`
-		       AND m.label_source NOT LIKE 'cyclotron:%'
-		       AND m.created_at < $1
-		       AND EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = m.parent AND p.label = 'bad')
-		       AND NOT EXISTS (SELECT 1 FROM reports r
-		                       WHERE r.sha256 = m.sha256 AND r.report_type = 'stranded')
-		       AND NOT EXISTS (SELECT 1 FROM reports r
-		                       WHERE r.sha256 = m.parent
-		                         AND r.report_type = '`+ReportTypeMissing+`' AND r.created_at > $2)`+extra+`
+		     WHERE `+triageStrandedWhere("$1", "$2")+extra+`
 		     ORDER BY m.score DESC
 		     LIMIT `+strconv.Itoa(strandedInnerScan)+`
 		   ) hot ORDER BY root, best DESC
@@ -5307,6 +5341,25 @@ func (db *DB) triageStrandedPG(ctx context.Context, limit int, createdBefore, mi
 		return nil, fmt.Errorf("hopper: triage stranded: %w", err)
 	}
 	return scanPGSamples(rows)
+}
+
+// triageStrandedPopulationPG: see TriageStrandedPopulation. The same predicate
+// with no ordering and no collapse — the shape a count wants.
+func (db *DB) triageStrandedPopulationPG(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
+	extra, fargs := triageFilterClausePG(f, 3, "m")
+	args := append([]any{createdBefore, missingBefore}, fargs...)
+	args = append(args, limit)
+	rows, err := db.pool.Query(ctx,
+		// Unqualified column list: samples m is the only table in this FROM, and
+		// the correlated subqueries inside the predicate carry their own aliases.
+		`SELECT `+pgSampleColsLight+` FROM samples m
+		 WHERE `+triageStrandedWhere("$1", "$2")+extra+`
+		 LIMIT $`+strconv.Itoa(len(args)),
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage stranded population: %w", err)
+	}
+	return scanPGSamplesLight(rows)
 }
 
 // triageAcquitPG: see TriageAcquit. jsonb operators express the provenance

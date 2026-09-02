@@ -93,6 +93,7 @@ idx_claims_signer
 idx_label_events_sha
 idx_reports_sha256_type_created
 idx_samples_acquit_newest
+idx_samples_bad_lvl
 idx_samples_bad_miss_newest
 idx_samples_bad_miss_stale
 idx_samples_bad_route_fresh
@@ -122,6 +123,7 @@ idx_samples_stranded_member
 idx_samples_top_ready_created
 idx_samples_unconvicted_hostile_repair
 idx_samples_unconvicted_hostile_stale
+idx_samples_unconvicted_lvl
 idx_samples_unconvicted_route_fresh
 idx_samples_unconvicted_susp_repair
 idx_samples_unconvicted_susp_stale
