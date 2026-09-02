@@ -226,7 +226,7 @@ func TestTriageAttemptBudget(t *testing.T) {
 	filter := TriageFilter{AttemptReportType: "cyclotron-attempt:bad", MaxAttempts: 2}
 	selected := func() bool {
 		t.Helper()
-		got, err := db.TriageBad(ctx, 10, filter)
+		got, err := db.TriageBad(ctx, 10, time.Time{}, filter)
 		if err != nil {
 			t.Fatalf("TriageBad: %v", err)
 		}
@@ -360,11 +360,11 @@ func TestTriageHighestCollapsesToParent(t *testing.T) {
 		sha, parent, path string
 		score             float64
 	}{
-		{m1, pGood, "good/pkg.tgz!!a.dll", 0.99},
-		{m2, pGood, "good/pkg.tgz!!b.dll", 0.90}, // sibling: must not appear separately
+		{m1, pGood, "good/pkg.tgz!!a.dll", 0.9999},
+		{m2, pGood, "good/pkg.tgz!!b.dll", 0.9995}, // sibling: must not appear separately
 		{mUnk, pUnk, "unknown/u.tgz!!x.dll", 1.0},
 		{mBad, pBad, "bad/b.tgz!!y.dll", 0.999}, // bad parent: excluded
-		{top, "", "good/t.exe", 0.97},
+		{top, "", "good/t.exe", 0.9997},
 	} {
 		mustInsert(t, ctx, db, &Sample{SHA256: m.sha, Label: "good", Parent: m.parent, Path: m.path})
 		mustAnalyze(t, ctx, db, m.sha, 5)
@@ -373,7 +373,7 @@ func TestTriageHighestCollapsesToParent(t *testing.T) {
 
 	before := time.Now().Add(time.Hour)
 	missing := time.Now().Add(-MissingRetry)
-	got, err := db.TriageHighest(ctx, 20, before, missing, TriageFilter{})
+	got, err := db.TriageHighest(ctx, 20, before, missing, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageHighest: %v", err)
 	}
@@ -404,7 +404,7 @@ func TestTriageHighestCollapsesToParent(t *testing.T) {
 	if err := db.InsertReport(ctx, &Report{SHA256: pGood, Type: "highest", Content: "done"}); err != nil {
 		t.Fatalf("InsertReport highest: %v", err)
 	}
-	got2, err := db.TriageHighest(ctx, 20, before, missing, TriageFilter{})
+	got2, err := db.TriageHighest(ctx, 20, before, missing, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageHighest: %v", err)
 	}
@@ -416,7 +416,7 @@ func TestTriageHighestCollapsesToParent(t *testing.T) {
 	if err := db.InsertReport(ctx, &Report{SHA256: pUnk, Type: ReportTypeMissing, Content: "gone"}); err != nil {
 		t.Fatalf("InsertReport missing: %v", err)
 	}
-	got3, err := db.TriageHighest(ctx, 20, before, missing, TriageFilter{})
+	got3, err := db.TriageHighest(ctx, 20, before, missing, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageHighest: %v", err)
 	}
@@ -424,7 +424,7 @@ func TestTriageHighestCollapsesToParent(t *testing.T) {
 		t.Errorf("root pUnk with fresh missing marker still returned")
 	}
 	// missingBefore in the future => even a just-written marker counts as expired.
-	got4, err := db.TriageHighest(ctx, 20, before, time.Now().Add(time.Hour), TriageFilter{})
+	got4, err := db.TriageHighest(ctx, 20, before, time.Now().Add(time.Hour), time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageHighest: %v", err)
 	}
@@ -470,7 +470,7 @@ func TestTriageLowestPerMember(t *testing.T) {
 
 	before := time.Now().Add(time.Hour)
 	missing := time.Now().Add(-MissingRetry)
-	got, err := db.TriageLowest(ctx, 20, before, missing, TriageFilter{})
+	got, err := db.TriageLowest(ctx, 20, before, missing, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageLowest: %v", err)
 	}
@@ -490,7 +490,7 @@ func TestTriageLowestPerMember(t *testing.T) {
 	if err := db.InsertReport(ctx, &Report{SHA256: lm1, Type: "lowest", Content: "done"}); err != nil {
 		t.Fatalf("InsertReport lowest: %v", err)
 	}
-	got2, err := db.TriageLowest(ctx, 20, before, missing, TriageFilter{})
+	got2, err := db.TriageLowest(ctx, 20, before, missing, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageLowest: %v", err)
 	}
@@ -554,7 +554,7 @@ func TestTriageStaleOrdering(t *testing.T) {
 
 	staleOrder := func(f TriageFilter) []string {
 		t.Helper()
-		got, err := db.TriageBad(ctx, 10, f)
+		got, err := db.TriageBad(ctx, 10, time.Time{}, f)
 		if err != nil {
 			t.Fatalf("TriageBad(%+v): %v", f, err)
 		}
@@ -575,8 +575,12 @@ func TestTriageStaleOrdering(t *testing.T) {
 		t.Errorf("min-analyzed = %v, want %v", got, want)
 	}
 
-	// A report filed after the sample's last analysis parks it...
-	if err := db.InsertReport(ctx, &Report{SHA256: rows[0].sha, Type: "bad-stale", CreatedAt: now}); err != nil {
+	// A report filed after the sample's last analysis parks it. Dated past
+	// ReportCooldown so this exercises the re-analysis half of the re-entry rule;
+	// a report younger than the cooldown parks regardless of rescans, which
+	// TestReportCooldownRequiresRescanAndAge covers.
+	reportAt := now.Add(-ReportCooldown - time.Hour)
+	if err := db.InsertReport(ctx, &Report{SHA256: rows[0].sha, Type: "bad-stale", CreatedAt: reportAt}); err != nil {
 		t.Fatalf("insert report: %v", err)
 	}
 	if got, want := staleOrder(TriageFilter{Order: TriageStale, ExcludeReportType: "bad-stale"}), []string{mid, newest}; !slicesEqual(got, want) {
@@ -630,6 +634,7 @@ func TestTriageSelectorsExcludeSkipped(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
 
+	now := time.Now()
 	mk := func(n int, label, skip string, crit, susp int) string {
 		t.Helper()
 		sha := staleTestSHA(n)
@@ -639,6 +644,16 @@ func TestTriageSelectorsExcludeSkipped(t *testing.T) {
 			CleaveResult: []byte(`{"files":[]}`),
 			MaxCrit:      crit, SuspiciousCount: susp,
 		})
+		// Stamped explicitly rather than through the Sample literal: InsertSample
+		// does not persist AnalyzedAt, so the row would land with a NULL one.
+		// A row carrying a cleave_result always carries the analyzed_at that
+		// produced it in production -- UpdateCleaveResult writes both together --
+		// and bad's freshness floor reads that column, so a NULL here is not a
+		// state the queue can ever see.
+		if _, err := db.lite.ExecContext(ctx,
+			`UPDATE samples SET analyzed_at = ? WHERE sha256 = ?`, now, sha); err != nil {
+			t.Fatalf("stamp analyzed_at(%s): %v", sha, err)
+		}
 		if skip != "" {
 			if err := db.SetSkip(ctx, sha, skip); err != nil {
 				t.Fatalf("SetSkip(%s): %v", sha, err)
@@ -657,7 +672,7 @@ func TestTriageSelectorsExcludeSkipped(t *testing.T) {
 		sel        func(TriageFilter) ([]*Sample, error)
 		want, deny string
 	}{
-		{"bad", func(f TriageFilter) ([]*Sample, error) { return db.TriageBad(ctx, 10, f) }, badOK, badSkip},
+		{"bad", func(f TriageFilter) ([]*Sample, error) { return db.TriageBad(ctx, 10, time.Time{}, f) }, badOK, badSkip},
 		{"good", func(f TriageFilter) ([]*Sample, error) { return db.TriageGood(ctx, 10, f) }, goodOK, goodSkip},
 		{"new", func(f TriageFilter) ([]*Sample, error) { return db.TriageNew(ctx, 10, f) }, newOK, newSkip},
 	} {
@@ -711,7 +726,10 @@ func TestTriageHighestPerRouteReach(t *testing.T) {
 	for _, p := range []struct {
 		sha   string
 		score float64
-	}{{pe1, 0.997}, {pe2, 0.95}} {
+		// Both above HighestScoreFloor (0.999): the queue's membership bar since
+		// 2026-09-01, so a fixture below it seeds an empty queue rather than the
+		// per-route reach this test is about.
+	}{{pe1, 0.99995}, {pe2, 0.9993}} {
 		mustInsert(t, ctx, db, &Sample{SHA256: p.sha, Label: "good", Path: "good/" + p.sha[:4] + ".exe"})
 		analyzeAs(p.sha, "pe", 5)
 		setLitmus(t, ctx, db, p.sha, 1, p.score)
@@ -719,7 +737,7 @@ func TestTriageHighestPerRouteReach(t *testing.T) {
 
 	before := time.Now().Add(time.Hour)
 	missing := time.Now().Add(-MissingRetry)
-	got, err := db.TriageHighest(ctx, 4, before, missing, TriageFilter{})
+	got, err := db.TriageHighest(ctx, 4, before, missing, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageHighest: %v", err)
 	}
@@ -749,12 +767,12 @@ func TestTriageHighestAttemptBudgetUsesRoot(t *testing.T) {
 		SHA256: member, Label: "good", Parent: root, Path: "good/archive.zip!!payload.exe",
 	})
 	mustAnalyzeWithTraits(t, ctx, db, member, 90, `{"l":5}`)
-	setLitmus(t, ctx, db, member, 2, 0.99)
+	setLitmus(t, ctx, db, member, 2, 0.9999) // above HighestScoreFloor
 
 	filter := TriageFilter{AttemptReportType: "cyclotron-attempt:highest", MaxAttempts: 1}
 	selectRoot := func() bool {
 		t.Helper()
-		got, err := db.TriageHighest(ctx, 10, time.Now().Add(time.Hour), time.Now().Add(-MissingRetry), filter)
+		got, err := db.TriageHighest(ctx, 10, time.Now().Add(time.Hour), time.Now().Add(-MissingRetry), time.Time{}, filter)
 		if err != nil {
 			t.Fatalf("TriageHighest: %v", err)
 		}
@@ -805,10 +823,13 @@ func TestTriageStrandedPerMemberDrain(t *testing.T) {
 	mustInsert(t, ctx, db, &Sample{SHA256: m1, Label: "good", Parent: pBad, Path: "bad/x.tgz!!a.exe"})
 	analyzeCrit(m1, 90, 4)
 	mustInsert(t, ctx, db, &Sample{SHA256: m2, Label: "good", Parent: pBad, Path: "bad/x.tgz!!b.exe"})
-	analyzeCrit(m2, 40, 3)
-	// Excluded: crit below notable.
+	analyzeCrit(m2, 40, 4)
+	// Excluded: below the member gate. That gate is strandedMemberCrit, raised
+	// from notable to suspicious on 2026-09-01 -- notable-only members were
+	// 99.6% of the live population -- so crit 3 sits just under it now and crit
+	// 1 further under.
 	mustInsert(t, ctx, db, &Sample{SHA256: mLow, Label: "good", Parent: pBad, Path: "bad/x.tgz!!c.txt"})
-	analyzeCrit(mLow, 5, 1)
+	analyzeCrit(mLow, 5, 3)
 	// Excluded: individually acquitted by the lowest queue.
 	mustInsert(t, ctx, db, &Sample{SHA256: mAcq, Label: "good", Parent: pBad, Path: "bad/x.tgz!!d.dll", LabelSource: "cyclotron:lowest"})
 	analyzeCrit(mAcq, 80, 4)

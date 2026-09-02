@@ -103,11 +103,19 @@ func TestTriageDepthMatchesSelection(t *testing.T) {
 		count  func(context.Context, TriageFilter) (int64, error)
 		selekt func(context.Context, int, TriageFilter) ([]*Sample, error)
 	}{
-		{"bad", db.CountTriageBad, db.TriageBad},
+		{"bad", func(ctx context.Context, f TriageFilter) (int64, error) {
+			return db.CountTriageBad(ctx, time.Time{}, f)
+		}, func(ctx context.Context, n int, f TriageFilter) ([]*Sample, error) {
+			return db.TriageBad(ctx, n, time.Time{}, f)
+		}},
 		{"good", db.CountTriageGood, db.TriageGood},
 		{"new", db.CountTriageNew, db.TriageNew},
 		{"sighted", db.CountTriageSighted, db.TriageSighted},
-		{"popular", db.CountTriagePopular, db.TriagePopular},
+		{"popular", func(ctx context.Context, f TriageFilter) (int64, error) {
+			return db.CountTriagePopular(ctx, time.Time{}, f)
+		}, func(ctx context.Context, n int, f TriageFilter) ([]*Sample, error) {
+			return db.TriagePopular(ctx, n, time.Time{}, f)
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// Both orderings: a -stale queue counts the same population through

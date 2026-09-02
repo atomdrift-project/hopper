@@ -5933,7 +5933,9 @@ func TestTriageMostRecent(t *testing.T) {
 		name  string
 		fetch func(context.Context, int, TriageFilter) ([]*Sample, error)
 	}{
-		{"bad", db.TriageBad},
+		{"bad", func(ctx context.Context, n int, f TriageFilter) ([]*Sample, error) {
+			return db.TriageBad(ctx, n, time.Now().Add(-BadFreshness), f)
+		}},
 		{"good", db.TriageGood},
 		{"new", db.TriageNew},
 		{"sighted", db.TriageSighted},
@@ -5953,7 +5955,7 @@ func TestTriageMostRecent(t *testing.T) {
 	}
 
 	// The file-type filter still narrows to a single type, capped by the limit.
-	got, err := db.TriageBad(ctx, 2, TriageFilter{FileType: "apk"})
+	got, err := db.TriageBad(ctx, 2, time.Time{}, TriageFilter{FileType: "apk"})
 	if err != nil {
 		t.Fatalf("TriageBad(apk): %v", err)
 	}
@@ -6050,7 +6052,7 @@ func TestTriageThresholds(t *testing.T) {
 		t.Errorf("TriageNew included an all-benign sample")
 	}
 
-	bad, err := db.TriageBad(ctx, 100, TriageFilter{})
+	bad, err := db.TriageBad(ctx, 100, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageBad: %v", err)
 	}

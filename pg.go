@@ -645,7 +645,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// implies — not the other way round.
 		`CREATE INDEX IF NOT EXISTS idx_samples_fp_trait_newest ` +
 			`ON samples(created_at DESC, id DESC) INCLUDE (top_traits) ` +
-			`WHERE ` + triageFPTraitWhere,
+			`WHERE ` + triageFPTraitPop,
 		// The unconvicted pair's indexes. Built FROM the selector constants
 		// rather than restated, because the neighbours above are hand-copied
 		// predicates that the comment has to beg future editors to keep
@@ -668,22 +668,24 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// arrive as the five belonging to good/good-stale/new/new-stale leave.
 		`CREATE INDEX IF NOT EXISTS idx_samples_unconvicted_hostile_repair ` +
 			`ON samples(corroborated, created_at DESC, id DESC) ` +
-			`WHERE ` + triageUnconvictedHostileWhere,
+			`WHERE ` + triageUnconvictedHostilePop,
+		// The stale ordering already leads on analyzed_at, so the floor is served
+		// by the same key that orders it -- no extra column needed.
 		`CREATE INDEX IF NOT EXISTS idx_samples_unconvicted_hostile_stale ` +
 			`ON samples(analyzed_at, id) ` +
-			`WHERE ` + triageUnconvictedHostileWhere,
+			`WHERE ` + triageUnconvictedHostilePop,
 		`CREATE INDEX IF NOT EXISTS idx_samples_unconvicted_susp_repair ` +
 			`ON samples(corroborated, created_at DESC, id DESC) ` +
-			`WHERE ` + triageUnconvictedSuspiciousWhere,
+			`WHERE ` + triageUnconvictedSuspiciousPop,
 		`CREATE INDEX IF NOT EXISTS idx_samples_unconvicted_susp_stale ` +
 			`ON samples(analyzed_at, id) ` +
-			`WHERE ` + triageUnconvictedSuspiciousWhere,
+			`WHERE ` + triageUnconvictedSuspiciousPop,
 		// discord is newest-first only: a detector conflict is not more or less
 		// interesting for being corroborated, and its population is small enough
 		// (both arms are narrow bands) that a backlog crawler would drain it.
 		`CREATE INDEX IF NOT EXISTS idx_samples_discord_newest ` +
 			`ON samples(created_at DESC, id DESC) ` +
-			`WHERE ` + triageDiscordWherePG,
+			`WHERE ` + triageDiscordPopPG,
 		// TriageHighest's route walk, widened to the unconvicted pool (2026-08-30).
 		// The good-only partial below stays for triageLowest's mirror and for any
 		// consumer still on the narrow spelling; this is the one the widened
@@ -2505,8 +2507,8 @@ func nullTime(t sql.NullTime) time.Time {
 	return time.Time{}
 }
 
-func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
-	s.scrubNULs() // PG TEXT can't hold 0x00 (SQLSTATE 22021); see scrubNULs.
+func (db *DB) insertSampleNewPG(ctx context.Context, sample *Sample) (bool, error) {
+	sample.scrubNULs() // PG TEXT can't hold 0x00 (SQLSTATE 22021); see scrubNULs.
 	// One transaction so the sample row and its sample_locations
 	// observation are created (or rolled back) atomically.
 	tx, err := db.pool.Begin(ctx)
@@ -2517,23 +2519,33 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 	// The samples row records the artifact; the locations row below records this
 	// observation of it. parent/path are containment claims and belong only to
 	// the former — see containmentColumns.
-	samplesParent, samplesPath := containmentColumns(s)
-	// cleave_result and litmus_result are the only analysis fields the
-	// writer sets — file_type, score, formula are derived DB-side by the
-	// samples_derive_cleave_cols trigger and litmus_score by the
+	samplesParent, samplesPath := containmentColumns(sample)
+	firstAnalyzedAt := sample.FirstAnalyzedAt
+	if firstAnalyzedAt == nil {
+		firstAnalyzedAt = sample.AnalyzedAt
+	}
+	// cleave_result, litmus_result and the two analysis timestamps are the only
+	// analysis fields the writer sets — file_type, score, formula are derived
+	// DB-side by the samples_derive_cleave_cols trigger and litmus_score by the
 	// samples_derive_litmus_score trigger, so the writer never sets them. ON
 	// CONFLICT leaves existing analysis alone
 	// so a walker-comes-after-Explode case doesn't wipe real results.
+	//
+	// analyzed_at/first_analyzed_at are here so Sample.AnalyzedAt means the same
+	// thing on every write path. They were carried by the batch paths and
+	// dropped by this one, so a caller setting the field got it persisted or
+	// silently discarded depending on which exported method it happened to call.
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename,
 			size_bytes, label, label_source, path, status,
 			canonical_sha256, parent, skip, elements,
 			max_crit, suspicious_count, mtime, marker_mtime,
-			cleave_result, litmus_result,
+			cleave_result, litmus_result, analyzed_at, first_analyzed_at, traits_version,
 			url, domain, package, version, provenance, fetched_at, purl_base,
 			corroborated)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
 			$1, $11, $12, $13, $14, $15, $16, $17, $18, $19,
+			$27, $28, $29,
 			$20, $21, $22, $23, $24, $25, $26,
 			-- The direct-insert path is forager fetching a package a feed already
 			-- named, so the sighting almost always predates the row and the
@@ -2545,24 +2557,25 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 			EXISTS (SELECT 1 FROM sightings WHERE subject = $1)
 			  OR ($26 <> '' AND EXISTS (SELECT 1 FROM sightings WHERE subject = $26)))
 		`+sampleConflictUpdatePG,
-		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
-		s.SizeBytes, s.Label, s.LabelSource, samplesPath, s.Status,
-		samplesParent, s.Skip, s.Elements,
-		s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
-		sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult),
-		s.URL, s.Domain, s.Package, s.Version, sanitizeJSONB(s.Provenance), s.FetchedAt, s.PURLBase)
+		sample.SHA256, sample.Source, sample.Feed, sample.Ecosystem, sample.Filename,
+		sample.SizeBytes, sample.Label, sample.LabelSource, samplesPath, sample.Status,
+		samplesParent, sample.Skip, sample.Elements,
+		sample.MaxCrit, sample.SuspiciousCount, sample.Mtime, sample.MarkerMtime,
+		sanitizeJSONB(sample.CleaveResult), sanitizeJSONB(sample.LitmusResult),
+		sample.URL, sample.Domain, sample.Package, sample.Version, sanitizeJSONB(sample.Provenance), sample.FetchedAt, sample.PURLBase,
+		sample.AnalyzedAt, firstAnalyzedAt, sample.TraitsVersion)
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
-	if tag.RowsAffected() == 0 && s.MarkerMtime != nil {
-		if _, err := tx.Exec(ctx, `UPDATE samples SET marker_mtime = $2 WHERE sha256 = $1`, s.SHA256, s.MarkerMtime); err != nil {
+	if tag.RowsAffected() == 0 && sample.MarkerMtime != nil {
+		if _, err := tx.Exec(ctx, `UPDATE samples SET marker_mtime = $2 WHERE sha256 = $1`, sample.SHA256, sample.MarkerMtime); err != nil {
 			return false, fmt.Errorf("hopper: refresh marker mtime: %w", err)
 		}
 	}
-	// Record the observation. validSample already guarantees s.Path != ""
+	// Record the observation. validSample already guarantees sample.Path != ""
 	// at the dispatch layer, but keep the guard here so a direct-call bug
 	// doesn't violate the CHECK constraint and abort the whole transaction.
-	if s.Path != "" {
+	if sample.Path != "" {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO sample_locations
 				(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
@@ -2573,7 +2586,8 @@ func (db *DB) insertSampleNewPG(ctx context.Context, s *Sample) (bool, error) {
 				feed = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE sample_locations.feed END,
 				ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE sample_locations.ecosystem END,
 				mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)`+locationChangedPG,
-			s.SHA256, s.Path, s.Parent, s.LocationRel, s.Filename, s.Source, s.Feed, s.Ecosystem, s.Mtime); err != nil {
+			sample.SHA256, sample.Path, sample.Parent, sample.LocationRel, sample.Filename,
+			sample.Source, sample.Feed, sample.Ecosystem, sample.Mtime); err != nil {
 			return false, fmt.Errorf("hopper: upsert location: %w", err)
 		}
 	}
@@ -2628,7 +2642,7 @@ var insertBatchStagingCols = []string{
 	"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
 	"parent", "rel", "skip", "elements", "max_crit", "suspicious_count",
 	"mtime", "marker_mtime", "cleave_result", "litmus_result", "analyzed_at", "first_analyzed_at",
-	"url", "domain", "package", "version", "provenance", "fetched_at",
+	"url", "domain", "package", "version", "provenance", "fetched_at", "purl_base", "traits_version",
 	// The containment projection of parent/path, computed once in Go by
 	// containmentColumns. Staging carries both spellings because the two
 	// destinations want different ones: sample_locations records the
@@ -2646,6 +2660,7 @@ const insertBatchStagingCore = `CREATE TEMP TABLE _staging (
 	mtime TIMESTAMPTZ, marker_mtime TIMESTAMPTZ,
 	cleave_result JSONB, litmus_result JSONB, analyzed_at TIMESTAMPTZ, first_analyzed_at TIMESTAMPTZ,
 	url TEXT, domain TEXT, package TEXT, version TEXT, provenance JSONB, fetched_at TIMESTAMPTZ,
+	purl_base TEXT, traits_version TEXT,
 	sample_parent TEXT, sample_path TEXT
 )`
 
@@ -2763,14 +2778,28 @@ var insertBatchStagingInsert = `INSERT INTO samples (
 	canonical_sha256, parent, skip, elements,
 	max_crit, suspicious_count, mtime, marker_mtime,
 	cleave_result, litmus_result, analyzed_at, first_analyzed_at,
-	url, domain, package, version, provenance, fetched_at)
+	url, domain, package, version, provenance, fetched_at, purl_base, traits_version,
+	corroborated)
 SELECT DISTINCT ON (sha256)
 	sha256, source, feed, ecosystem, filename,
 	size_bytes, label, label_source, sample_path, status,
 	canonical_sha256, sample_parent, skip, elements,
 	max_crit, suspicious_count, mtime, marker_mtime,
 	cleave_result, litmus_result, analyzed_at, first_analyzed_at,
-	url, domain, package, version, provenance, fetched_at
+	url, domain, package, version, provenance, fetched_at, purl_base, traits_version,
+	-- Seeded here for the same reason insertSampleNewPG seeds it inline: the
+	-- sightings_corroborate trigger fires AFTER INSERT ON sightings, never on a
+	-- sample arriving, so a bulk import of rows a feed already named would land
+	-- uncorroborated and nothing would ever revisit them. That is not cosmetic:
+	-- acquit and fallout both select on the ABSENCE of corroboration, so a stale
+	-- zero puts a corroborated sample into queues built to exclude it.
+	--
+	-- Two constant-equality probes into idx_sightings_subject, evaluated per
+	-- staged row rather than OR'd across two samples columns -- the shape
+	-- plan_audit_test.go guards against, because the OR form seq-scans.
+	EXISTS (SELECT 1 FROM sightings g WHERE g.subject = _staging.sha256)
+	  OR (_staging.purl_base <> ''
+	      AND EXISTS (SELECT 1 FROM sightings g WHERE g.subject = _staging.purl_base))
 FROM _staging
 ORDER BY sha256
 ` + sampleConflictUpdatePG
@@ -2827,8 +2856,8 @@ func sampleStagingRows(samples []*Sample) [][]any {
 			s.SizeBytes, s.Label, s.LabelSource, s.Path, s.Status, s.SHA256,
 			s.Parent, s.LocationRel, s.Skip, s.Elements, s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
 			sanitizeJSONB(s.CleaveResult), sanitizeJSONB(s.LitmusResult), s.AnalyzedAt, firstAnalyzedAt,
-			s.URL, s.Domain, s.Package, s.Version, sanitizeJSONB(s.Provenance), s.FetchedAt,
-			samplesParent, samplesPath,
+			s.URL, s.Domain, s.Package, s.Version, sanitizeJSONB(s.Provenance), s.FetchedAt, s.PURLBase,
+			s.TraitsVersion, samplesParent, samplesPath,
 		}
 	}
 	return rows
@@ -4748,7 +4777,13 @@ func triageFilterClausePGKey(f TriageFilter, startIdx int, sampleAlias, reportKe
 		clause += fmt.Sprintf(
 			` AND NOT EXISTS (SELECT 1 FROM reports r`+
 				` WHERE r.sha256 = %s AND r.report_type = $%d`+
-				` AND r.created_at > %s)`, reportKey, startIdx+len(args)-1, col("analyzed_at"))
+				// Parked while EITHER holds, so re-entry needs both to clear: the
+				// sample re-analyzed since the report, and the report older than
+				// ReportCooldown. See that constant for why re-analysis stands in
+				// for "the traits changed".
+				` AND (r.created_at > %s`+
+				`      OR r.created_at > now() - interval '%d hours'))`,
+			reportKey, startIdx+len(args)-1, col("analyzed_at"), int(ReportCooldown.Hours()))
 	}
 	if f.AttemptReportType != "" && f.MaxAttempts > 0 {
 		args = append(args, f.AttemptReportType, f.MaxAttempts)
@@ -4785,12 +4820,14 @@ func triageOrderSQL(f TriageFilter) string {
 	}
 }
 
-func (db *DB) triageBadPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClausePG(f, 1, "samples")
+func (db *DB) triageBadPG(ctx context.Context, limit int, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
+	// Freshness floor is $1; the filter clause numbers from 2.
+	extra, fargs := triageFilterClausePG(f, 2, "samples")
+	args := append([]any{analyzedAfter}, fargs...)
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE `+triageBadWhere+extra+`
+		 WHERE `+fmt.Sprintf(triageBadWhere, "$1")+extra+`
 		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
@@ -4862,8 +4899,11 @@ func (db *DB) triageVersionDriftPG(ctx context.Context, limit int, createdAfter 
 	return scanPGSamplesLight(rows)
 }
 
-func (db *DB) triageFPTraitPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClausePG(f, 1, "samples")
+func (db *DB) triageFPTraitPG(ctx context.Context, limit int, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
+	// The freshness floor is $1 so the filter clause can keep numbering from 2;
+	// triageFPTraitWhere carries the placeholder rather than the value.
+	extra, fargs := triageFilterClausePG(f, 2, "samples")
+	args := append([]any{analyzedAfter}, fargs...)
 	args = append(args, fpTraitWindow)
 	winIdx := strconv.Itoa(len(args))
 	args = append(args, limit)
@@ -4873,7 +4913,7 @@ func (db *DB) triageFPTraitPG(ctx context.Context, limit int, f TriageFilter) ([
 		   -- Aliased: the outer SELECT's column list is bare names, so an
 		   -- unaliased id here is an ambiguous reference once win is joined.
 		   SELECT id AS win_id, top_traits::jsonb AS win_traits FROM samples
-		    WHERE `+triageFPTraitWhere+extra+`
+		    WHERE `+fmt.Sprintf(triageFPTraitWhere, "$1")+extra+`
 		    ORDER BY created_at DESC, id DESC
 		    LIMIT $`+winIdx+`
 		 ), worst AS (
@@ -4897,12 +4937,14 @@ func (db *DB) triageFPTraitPG(ctx context.Context, limit int, f TriageFilter) ([
 	return scanPGSamplesLight(rows)
 }
 
-func (db *DB) triageUnconvictedHostilePG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClausePG(f, 1, "samples")
+func (db *DB) triageUnconvictedHostilePG(ctx context.Context, limit int, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
+	// Freshness floor is $1; the filter clause numbers from 2.
+	extra, fargs := triageFilterClausePG(f, 2, "samples")
+	args := append([]any{analyzedAfter}, fargs...)
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE `+triageUnconvictedHostileWhere+extra+`
+		 WHERE `+fmt.Sprintf(triageUnconvictedHostileWhere, "$1")+extra+`
 		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
@@ -4911,12 +4953,14 @@ func (db *DB) triageUnconvictedHostilePG(ctx context.Context, limit int, f Triag
 	return scanPGSamplesLight(rows)
 }
 
-func (db *DB) triageUnconvictedSuspiciousPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClausePG(f, 1, "samples")
+func (db *DB) triageUnconvictedSuspiciousPG(ctx context.Context, limit int, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
+	// Freshness floor is $1; the filter clause numbers from 2.
+	extra, fargs := triageFilterClausePG(f, 2, "samples")
+	args := append([]any{analyzedAfter}, fargs...)
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE `+triageUnconvictedSuspiciousWhere+extra+`
+		 WHERE `+fmt.Sprintf(triageUnconvictedSuspiciousWhere, "$1")+extra+`
 		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
@@ -4925,12 +4969,14 @@ func (db *DB) triageUnconvictedSuspiciousPG(ctx context.Context, limit int, f Tr
 	return scanPGSamplesLight(rows)
 }
 
-func (db *DB) triageDiscordPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClausePG(f, 1, "samples")
+func (db *DB) triageDiscordPG(ctx context.Context, limit int, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
+	// Freshness floor is $1; the filter clause numbers from 2.
+	extra, fargs := triageFilterClausePG(f, 2, "samples")
+	args := append([]any{analyzedAfter}, fargs...)
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE `+triageDiscordWherePG+extra+`
+		 WHERE `+fmt.Sprintf(triageDiscordWherePG, "$1")+extra+`
 		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)
 	if err != nil {
@@ -5103,10 +5149,15 @@ const (
 // score-1.0 tie band that archives own) can monopolize a batch.
 // The empty file_type is its own partition — rows there are rare (analyzed
 // rows carry a type) and excluding them would hide real pinners.
-func (db *DB) triageHighestPG(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
+func (db *DB) triageHighestPG(ctx context.Context, limit int,
+	createdBefore, missingBefore, analyzedAfter time.Time, f TriageFilter,
+) ([]*Sample, error) {
 	extra, fargs := triageFilterClausePGKey(f, 3, "s0",
 		"CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END")
 	args := append([]any{createdBefore, missingBefore}, fargs...)
+	// Appended after the filter clause so its own $3.. numbering is untouched.
+	args = append(args, analyzedAfter)
+	freshIdx := strconv.Itoa(len(args))
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`WITH RECURSIVE fts AS (
@@ -5133,6 +5184,8 @@ func (db *DB) triageHighestPG(ctx context.Context, limit int, createdBefore, mis
 		         AND s0.file_type = f.file_type
 		         AND (s0.parent = '' OR s0.path LIKE '%!!%')
 		         AND s0.created_at < $1
+		         AND s0.litmus_score >= `+strconv.FormatFloat(HighestScoreFloor, 'f', -1, 64)+`
+		         AND s0.analyzed_at > $`+freshIdx+`
 		         AND NOT EXISTS (SELECT 1 FROM reports r
 		                         WHERE r.sha256 = CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END
 		                           AND (r.report_type = 'highest'
@@ -5157,9 +5210,14 @@ func (db *DB) triageHighestPG(ctx context.Context, limit int, createdBefore, mis
 // inert content that inherited the label, so each member needs its own verdict
 // and its own report row. Keying this drain on the parent would let one ruling
 // speak for files it never examined.
-func (db *DB) triageLowestPG(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
+func (db *DB) triageLowestPG(ctx context.Context, limit int,
+	createdBefore, missingBefore, analyzedAfter time.Time, f TriageFilter,
+) ([]*Sample, error) {
 	extra, fargs := triageFilterClausePG(f, 3, "s0")
 	args := append([]any{createdBefore, missingBefore}, fargs...)
+	// Appended after the filter clause so its own $3.. numbering is untouched.
+	args = append(args, analyzedAfter)
+	freshIdx := strconv.Itoa(len(args))
 	args = append(args, limit)
 	//nolint:unqueryvet // k.*/s0.* feed the LATERAL join and window function; the outer select names its columns via pgSampleColsLight.
 	rows, err := db.pool.Query(ctx,
@@ -5183,6 +5241,7 @@ func (db *DB) triageLowestPG(ctx context.Context, limit int, createdBefore, miss
 		       AND s0.litmus_score IS NOT NULL
 		       AND s0.file_type = f.file_type
 		       AND s0.label_source != 'conflict'
+		       AND s0.analyzed_at > $`+freshIdx+`
 		       AND (s0.parent = '' OR s0.path LIKE '%!!%')
 		       AND (s0.parent = '' OR EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = s0.parent))
 		       AND s0.created_at < $1
@@ -5224,7 +5283,7 @@ func (db *DB) triageStrandedPG(ctx context.Context, limit int, createdBefore, mi
 		     FROM samples m
 		     WHERE m.label = 'good' AND m.cleave_result IS NOT NULL AND m.skip = ''
 		       AND m.parent != '' AND m.path LIKE '%!!%'
-		       AND m.score > 0 AND m.max_crit >= `+strconv.Itoa(notableCrit)+`
+		       AND m.score > 0 AND m.max_crit >= `+strconv.Itoa(strandedMemberCrit)+`
 		       AND m.label_source NOT LIKE 'cyclotron:%'
 		       AND m.created_at < $1
 		       AND EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = m.parent AND p.label = 'bad')
@@ -5884,10 +5943,19 @@ func (db *DB) finishSightingAcquisitionPG(ctx context.Context, target string, ac
 }
 
 func (db *DB) insertReportPG(ctx context.Context, r *Report) error {
+	var createdAt any
+	if !r.CreatedAt.IsZero() {
+		createdAt = r.CreatedAt
+	}
+	// created_at was omitted entirely, so the column default won and a caller
+	// setting Report.CreatedAt got it silently dropped -- the same shape as the
+	// InsertSample/AnalyzedAt gap. It matters now that ReportCooldown compares
+	// against it: a backdated report is how a test, or a backfill, expresses
+	// "this was judged days ago". Zero still means now.
 	_, err := db.pool.Exec(ctx, `
-		INSERT INTO reports (sha256, report_type, content, provider, duration_ms)
-		VALUES ($1, $2, $3, $4, $5)`,
-		r.SHA256, r.Type, r.Content, r.Provider, r.DurationMS)
+		INSERT INTO reports (sha256, report_type, content, provider, duration_ms, created_at)
+		VALUES ($1, $2, $3, $4, $5, COALESCE($6, now()))`,
+		r.SHA256, r.Type, r.Content, r.Provider, r.DurationMS, createdAt)
 	if err != nil {
 		return fmt.Errorf("hopper: insert report: %w", err)
 	}

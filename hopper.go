@@ -206,10 +206,32 @@ const MissingRetry = 4 * 24 * time.Hour
 // before any route's #2).
 const triagePerRouteK = 10
 
+// HighestScoreFloor is the membership bar for the highest queue: only samples
+// the ensemble is essentially certain about.
+//
+// The queue is good:fp-peak -- benign-labelled files scoring at the very top of
+// the hostile range -- so tightening the score makes it MORE what it already is
+// rather than redefining it, which is why this is a safe bound where a severity
+// or corroboration filter would not be. Its per-route top-K already picked the
+// extreme tail; this stops the tail being defined relative to a route that has
+// no high scorers at all.
+//
+// Measured 2026-09-01: the population is saturated at the top -- 62% of a 50k
+// sample scored exactly 1.0 -- so a lower floor buys nothing. At >= 0.999 with a
+// three-day freshness floor the queue holds 777.
+const HighestScoreFloor = 0.999
+
 // notableCrit is the cleave criticality floor for the stranded queue's
 // member gate — 3 = "notable" in the shared severity ladder (mirrors
 // collimator's traits.py CRIT_LEVELS; info=1..hostile=5). Members below it
 // are inert content whose inherited-good label threatens nothing.
+//
+// Unused in a predicate since strandedMemberCrit replaced it as the member gate,
+// but kept: it names level 3 in the shared ladder that suspiciousCrit and the
+// literal 5s elsewhere are positioned against, and deleting it would leave that
+// scale with a hole in the middle.
+//
+//nolint:unused // ladder definition; see the comment above
 const notableCrit = 3
 
 // suspiciousCrit is the cleave criticality floor for the popular queue — 4 =
@@ -229,6 +251,25 @@ const notableCrit = 3
 // work, so its length is the whole fleet's latency. At >= 3 the backlog was
 // ~80 days of that; at >= 4 it is about a week.
 const suspiciousCrit = 4
+
+// strandedMemberCrit is the stranded queue's member gate, raised from
+// notableCrit to suspiciousCrit on 2026-09-01 to bound the queue.
+//
+// The measured effect is drastic and worth stating plainly: 18,962 members
+// qualified at >= 3 and 68 at >= 4, so 99.6% of the population is notable-only.
+// That mirrors what raising the popular queue's floor found (92% notable-only)
+// and points at the same cause -- "notable" is a finding worth recording, not
+// one worth a pass.
+//
+// But the prior here is NOT the same as popular's, and that is the risk. These
+// members sit inside archives already convicted as malware, carrying a benign
+// label inherited from before that conviction. A notable finding on a popular
+// package is overwhelmingly ordinary behaviour; a notable finding inside known
+// malware might be a payload our traits are simply weak on. Raising the gate
+// leaves those members labelled benign and unexamined, which is the exact
+// failure the queue exists to catch. Revisit if relabel rates on this queue
+// fall to nothing.
+const strandedMemberCrit = suspiciousCrit
 
 // strandedInnerScan bounds TriageStranded's member walk before the collapse
 // to parent archives — same role highestInnerScan used to play; the stranded
@@ -4346,11 +4387,11 @@ const (
 // be written for it. Selecting them spent a batch slot to reach a dead end.
 // Empty paths are excluded too ([triageServablePathSQL]): reference-only rows
 // (registry sidecars, fetched deps not yet uploaded) are permanently unservable.
-func (db *DB) TriageBad(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+func (db *DB) TriageBad(ctx context.Context, limit int, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.triageBadPG(ctx, limit, f)
+		return db.triageBadPG(ctx, limit, analyzedAfter, f)
 	}
-	return db.triageBadSQLite(ctx, limit, f)
+	return db.triageBadSQLite(ctx, limit, analyzedAfter, f)
 }
 
 // TriageGood returns analyzed top-level good-labeled samples that trip Cleave
@@ -4410,11 +4451,11 @@ func (db *DB) TriageGood(ctx context.Context, limit int, f TriageFilter) ([]*Sam
 // suppressed: on an incomplete mirror ~70% of the top of this queue by score
 // has no bytes on disk, and without an expiring marker those rows would never
 // drain and would eventually fill the selection window.
-func (db *DB) TriageHighest(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
+func (db *DB) TriageHighest(ctx context.Context, limit int, createdBefore, missingBefore, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.triageHighestPG(ctx, limit, createdBefore, missingBefore, f)
+		return db.triageHighestPG(ctx, limit, createdBefore, missingBefore, analyzedAfter, f)
 	}
-	return db.triageHighestSQLite(ctx, limit, createdBefore, missingBefore, f)
+	return db.triageHighestSQLite(ctx, limit, createdBefore, missingBefore, analyzedAfter, f)
 }
 
 // TriageLowest is TriageHighest's mirror: each file_type's bottom-K
@@ -4437,11 +4478,11 @@ func (db *DB) TriageHighest(ctx context.Context, limit int, createdBefore, missi
 // The ReportTypeMissing marker is keyed on the root even though the queue's own
 // drain is per-member: a verdict applies to one file, but vanished bytes are the
 // parent archive's and take every member with them.
-func (db *DB) TriageLowest(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
+func (db *DB) TriageLowest(ctx context.Context, limit int, createdBefore, missingBefore, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.triageLowestPG(ctx, limit, createdBefore, missingBefore, f)
+		return db.triageLowestPG(ctx, limit, createdBefore, missingBefore, analyzedAfter, f)
 	}
-	return db.triageLowestSQLite(ctx, limit, createdBefore, missingBefore, f)
+	return db.triageLowestSQLite(ctx, limit, createdBefore, missingBefore, analyzedAfter, f)
 }
 
 // TriageStranded returns bad-labeled parent archives that still contain
@@ -4474,7 +4515,7 @@ func (db *DB) StrandedMembers(ctx context.Context, root string) ([]*Sample, erro
 			`SELECT `+pgSampleCols+` FROM samples
 			 WHERE label = 'good' AND cleave_result IS NOT NULL AND skip = ''
 			   AND parent = $1 AND path LIKE '%!!%'
-			   AND score > 0 AND max_crit >= `+strconv.Itoa(notableCrit)+`
+			   AND score > 0 AND max_crit >= `+strconv.Itoa(strandedMemberCrit)+`
 			   AND label_source NOT LIKE 'cyclotron:%'
 			   AND NOT EXISTS (SELECT 1 FROM reports r
 			                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'stranded')
@@ -4489,7 +4530,7 @@ func (db *DB) StrandedMembers(ctx context.Context, root string) ([]*Sample, erro
 		`SELECT `+liteSampleCols+` FROM samples
 		 WHERE label = 'good' AND cleave_result IS NOT NULL AND skip = ''
 		   AND parent = ? AND path LIKE '%!!%'
-		   AND score > 0 AND max_crit >= `+strconv.Itoa(notableCrit)+`
+		   AND score > 0 AND max_crit >= `+strconv.Itoa(strandedMemberCrit)+`
 		   AND label_source NOT LIKE 'cyclotron:%'
 		   AND NOT EXISTS (SELECT 1 FROM reports r
 		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'stranded')
@@ -4597,11 +4638,11 @@ const fpTraitWindow = 5000
 // ranking needs the traits of thousands of samples but the metadata of none of
 // them. Self-draining: loosening the trait drops its samples below max_crit >= 4
 // and the next pass ranks whatever is now worst.
-func (db *DB) TriageFPTrait(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+func (db *DB) TriageFPTrait(ctx context.Context, limit int, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.triageFPTraitPG(ctx, limit, f)
+		return db.triageFPTraitPG(ctx, limit, analyzedAfter, f)
 	}
-	return db.triageFPTraitSQLite(ctx, limit, f)
+	return db.triageFPTraitSQLite(ctx, limit, analyzedAfter, f)
 }
 
 // TriageUnconvictedHostile returns top-level samples nothing has convicted
@@ -4614,32 +4655,32 @@ func (db *DB) TriageFPTrait(ctx context.Context, limit int, f TriageFilter) ([]*
 // likeliest false positives), TriageStale walks the backlog. Both drain by the
 // findings dropping below the bar, so the newest-first and repair orderings need
 // no report; the stale ordering does (see ExcludeReportType).
-func (db *DB) TriageUnconvictedHostile(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+func (db *DB) TriageUnconvictedHostile(ctx context.Context, limit int, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.triageUnconvictedHostilePG(ctx, limit, f)
+		return db.triageUnconvictedHostilePG(ctx, limit, analyzedAfter, f)
 	}
-	return db.triageUnconvictedHostileSQLite(ctx, limit, f)
+	return db.triageUnconvictedHostileSQLite(ctx, limit, analyzedAfter, f)
 }
 
 // TriageUnconvictedSuspicious is the hostile tier's lower half: unconvicted
 // top-level samples whose worst finding is SUSPICIOUS (max_crit = 4), with the
 // label-conditional count bar described at [triageUnconvictedSuspiciousWhere].
-func (db *DB) TriageUnconvictedSuspicious(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+func (db *DB) TriageUnconvictedSuspicious(ctx context.Context, limit int, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.triageUnconvictedSuspiciousPG(ctx, limit, f)
+		return db.triageUnconvictedSuspiciousPG(ctx, limit, analyzedAfter, f)
 	}
-	return db.triageUnconvictedSuspiciousSQLite(ctx, limit, f)
+	return db.triageUnconvictedSuspiciousSQLite(ctx, limit, analyzedAfter, f)
 }
 
 // TriageDiscord returns top-level samples our two detectors disagree about —
 // the rule engine hostile while the ML ensemble is benign, or the ensemble
 // hostile while the rules are quiet. Label-agnostic by design; see
 // [triageDiscordWhere] for how the standing label reads against each half.
-func (db *DB) TriageDiscord(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+func (db *DB) TriageDiscord(ctx context.Context, limit int, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.triageDiscordPG(ctx, limit, f)
+		return db.triageDiscordPG(ctx, limit, analyzedAfter, f)
 	}
-	return db.triageDiscordSQLite(ctx, limit, f)
+	return db.triageDiscordSQLite(ctx, limit, analyzedAfter, f)
 }
 
 // TriageSighted returns analyzed top-level, non-bad samples covered by a

@@ -1174,17 +1174,21 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 	// file_type, score, formula, litmus_score are GENERATED STORED columns
 	// (SQLite 3.31+). They auto-derive from cleave_result / litmus_result
 	// so writing to them is neither necessary nor legal.
+	firstAnalyzedAt := s.FirstAnalyzedAt
+	if firstAnalyzedAt == nil {
+		firstAnalyzedAt = s.AnalyzedAt
+	}
 	//nolint:gosec // G202: the appended conflict clause is fixed internal SQL; all sample values remain parameterized
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename,
 			size_bytes, label, label_source, path, status,
 			canonical_sha256, parent, skip, elements,
 			max_crit, suspicious_count, top_traits, mtime, marker_mtime,
-			cleave_result, litmus_result,
+			cleave_result, litmus_result, analyzed_at, first_analyzed_at, traits_version,
 			url, domain, package, version, provenance, fetched_at, purl_base,
 			corroborated)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			-- Mirrors insertSampleNewPG: the sighting usually predates the row on
 			-- this path, so the sightings trigger has nothing left to fire on.
 			EXISTS (SELECT 1 FROM sightings WHERE subject = ?)
@@ -1194,7 +1198,7 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 		s.SizeBytes, s.Label, s.LabelSource, samplesPath, s.Status,
 		s.SHA256, samplesParent, s.Skip, s.Elements,
 		s.MaxCrit, s.SuspiciousCount, s.TopTraits, s.Mtime, s.MarkerMtime,
-		jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult),
+		jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult), s.AnalyzedAt, firstAnalyzedAt, s.TraitsVersion,
 		s.URL, s.Domain, s.Package, s.Version, jsonTextOrNil(s.Provenance), s.FetchedAt, s.PURLBase,
 		s.SHA256, s.PURLBase, s.PURLBase)
 	if err != nil {
@@ -1294,19 +1298,28 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 	cols := []string{
 		"sha256", "source", "feed", "ecosystem", "filename",
 		"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
-		"parent", "skip", "elements", "max_crit", "suspicious_count",
-		"mtime", "marker_mtime", "cleave_result", "litmus_result", "analyzed_at", "first_analyzed_at",
-		"url", "domain", "package", "version", "provenance", "fetched_at",
+		"parent", "skip", "elements", "max_crit", "suspicious_count", "top_traits",
+		"mtime", "marker_mtime", "cleave_result", "litmus_result", "analyzed_at", "first_analyzed_at", "traits_version",
+		"url", "domain", "package", "version", "provenance", "fetched_at", "purl_base",
 	}
 	placeholders := make([]string, len(cols))
 	for i := range cols {
 		placeholders[i] = "?"
 	}
 
+	// corroborated is appended rather than listed in cols: it is not a bound
+	// value but a probe into the sightings ledger, seeded here for the same
+	// reason insertSampleNewSQLite seeds it inline -- sightings_corroborate_trg
+	// fires AFTER INSERT ON sightings and never on a sample arriving, so a bulk
+	// import of rows a feed already named would stay uncorroborated forever.
+	// acquit and fallout select on the absence of that flag, so a stale zero is
+	// a mis-routed sample, not a cosmetic wart.
 	query := fmt.Sprintf(
 		`
-		INSERT INTO samples (%s)
-		VALUES (%s)
+		INSERT INTO samples (%s, corroborated)
+		VALUES (%s,
+			EXISTS (SELECT 1 FROM sightings WHERE subject = ?)
+			  OR (? != '' AND EXISTS (SELECT 1 FROM sightings WHERE subject = ?)))
 		`+sampleConflictUpdateSQLite,
 		strings.Join(cols, ", "),
 		strings.Join(placeholders, ", "))
@@ -1344,9 +1357,10 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 			s.SizeBytes, s.Label, s.LabelSource, samplesPath, s.Status,
 			s.SHA256, samplesParent, s.Skip, s.Elements,
-			s.MaxCrit, s.SuspiciousCount, s.Mtime, s.MarkerMtime,
-			jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult), s.AnalyzedAt, firstAnalyzedAt,
-			s.URL, s.Domain, s.Package, s.Version, jsonTextOrNil(s.Provenance), s.FetchedAt)
+			s.MaxCrit, s.SuspiciousCount, s.TopTraits, s.Mtime, s.MarkerMtime,
+			jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult), s.AnalyzedAt, firstAnalyzedAt, s.TraitsVersion,
+			s.URL, s.Domain, s.Package, s.Version, jsonTextOrNil(s.Provenance), s.FetchedAt, s.PURLBase,
+			s.SHA256, s.PURLBase, s.PURLBase)
 		if err != nil {
 			return 0, nil, fmt.Errorf("hopper: batch insert %s: %w", s.SHA256, err)
 		}
@@ -2969,10 +2983,19 @@ func triageFilterClauseSQLiteKey(f TriageFilter, sampleAlias, reportKey string) 
 		args = append(args, f.MinAnalyzedAt.UTC().Format(time.RFC3339Nano))
 	}
 	if f.ExcludeReportType != "" {
+		// Mirrors the PG clause: parked while EITHER holds, so re-entry needs the
+		// sample re-analyzed since the report AND the report older than
+		// ReportCooldown.
 		clause += ` AND NOT EXISTS (SELECT 1 FROM reports r` +
 			` WHERE r.sha256 = ` + reportKey + ` AND r.report_type = ?` +
-			` AND r.created_at > ` + col("analyzed_at") + `)`
-		args = append(args, f.ExcludeReportType)
+			` AND (r.created_at > ` + col("analyzed_at") +
+			`      OR r.created_at > ?))`
+		// The cutoff is formatted in Go rather than built with datetime(), which
+		// returns "YYYY-MM-DD HH:MM:SS" while these columns hold RFC3339Nano. The
+		// two differ at position 10 -- 'T' vs ' ' -- so a same-day comparison
+		// silently goes the wrong way.
+		args = append(args, f.ExcludeReportType,
+			time.Now().Add(-ReportCooldown).UTC().Format(time.RFC3339Nano))
 	}
 	if f.AttemptReportType != "" && f.MaxAttempts > 0 {
 		clause += ` AND (SELECT count(*) FROM reports r` +
@@ -2982,13 +3005,17 @@ func triageFilterClauseSQLiteKey(f TriageFilter, sampleAlias, reportKey string) 
 	return clause, args
 }
 
-func (db *DB) triageBadSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClauseSQLite(f, "samples")
+func (db *DB) triageBadSQLite(ctx context.Context, limit int, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
+	// The freshness placeholder sits ahead of the filter clause in SQL order,
+	// so its value leads the args. Text-formatted: SQLite stores timestamps as
+	// RFC3339Nano and a bound time.Time silently matches nothing.
+	extra, fargs := triageFilterClauseSQLite(f, "samples")
+	args := append([]any{analyzedAfter.UTC().Format(time.RFC3339Nano)}, fargs...)
 	args = append(args, limit)
 	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleColsLight+` FROM samples
-		 WHERE `+triageBadWhere+extra+`
+		 WHERE `+fmt.Sprintf(triageBadWhere, "?")+extra+`
 		 `+triageOrderSQL(f)+` LIMIT ?`,
 		args...)
 	if err != nil {
@@ -3025,8 +3052,14 @@ func (db *DB) triageVersionDriftSQLite(ctx context.Context, limit int, createdAf
 	return scanLiteSamplesLight(rows)
 }
 
-func (db *DB) triageFPTraitSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClauseSQLite(f, "samples")
+func (db *DB) triageFPTraitSQLite(ctx context.Context, limit int, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
+	// SQLite binds ? positionally in SQL order, and the freshness placeholder
+	// sits inside triageFPTraitWhere -- ahead of the filter clause -- so its
+	// value leads the argument list. Formatted as text for the same reason
+	// countTriageArgs does it: a bound time.Time compares as a different type
+	// against RFC3339Nano storage and silently matches nothing.
+	extra, fargs := triageFilterClauseSQLite(f, "samples")
+	args := append([]any{analyzedAfter.UTC().Format(time.RFC3339Nano)}, fargs...)
 	args = append(args, fpTraitWindow, limit)
 	//nolint:gosec // G202: predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
@@ -3034,7 +3067,7 @@ func (db *DB) triageFPTraitSQLite(ctx context.Context, limit int, f TriageFilter
 		   -- Aliased for the same reason as the PG mirror: the outer column
 		   -- list is bare names and would otherwise be ambiguous once joined.
 		   SELECT id AS win_id, top_traits AS win_traits FROM samples
-		    WHERE `+triageFPTraitWhere+extra+`
+		    WHERE `+fmt.Sprintf(triageFPTraitWhere, "?")+extra+`
 		    ORDER BY created_at DESC, id DESC
 		    LIMIT ?
 		 ), worst AS (
@@ -3058,13 +3091,16 @@ func (db *DB) triageFPTraitSQLite(ctx context.Context, limit int, f TriageFilter
 	return scanLiteSamplesLight(rows)
 }
 
-func (db *DB) triageUnconvictedHostileSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClauseSQLite(f, "samples")
+func (db *DB) triageUnconvictedHostileSQLite(ctx context.Context, limit int, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
+	// Freshness placeholder precedes the filter clause in SQL order, so its
+	// value leads the args; text-formatted for RFC3339Nano storage.
+	extra, fargs := triageFilterClauseSQLite(f, "samples")
+	args := append([]any{analyzedAfter.UTC().Format(time.RFC3339Nano)}, fargs...)
 	args = append(args, limit)
 	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleColsLight+` FROM samples
-		 WHERE `+triageUnconvictedHostileWhere+extra+`
+		 WHERE `+fmt.Sprintf(triageUnconvictedHostileWhere, "?")+extra+`
 		 `+triageOrderSQL(f)+` LIMIT ?`,
 		args...)
 	if err != nil {
@@ -3073,13 +3109,17 @@ func (db *DB) triageUnconvictedHostileSQLite(ctx context.Context, limit int, f T
 	return scanLiteSamplesLight(rows)
 }
 
-func (db *DB) triageUnconvictedSuspiciousSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClauseSQLite(f, "samples")
+func (db *DB) triageUnconvictedSuspiciousSQLite(ctx context.Context, limit int, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
+	// The freshness placeholder sits ahead of the filter clause in SQL order,
+	// so its value leads the args. Text-formatted: SQLite stores timestamps as
+	// RFC3339Nano and a bound time.Time silently matches nothing.
+	extra, fargs := triageFilterClauseSQLite(f, "samples")
+	args := append([]any{analyzedAfter.UTC().Format(time.RFC3339Nano)}, fargs...)
 	args = append(args, limit)
 	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleColsLight+` FROM samples
-		 WHERE `+triageUnconvictedSuspiciousWhere+extra+`
+		 WHERE `+fmt.Sprintf(triageUnconvictedSuspiciousWhere, "?")+extra+`
 		 `+triageOrderSQL(f)+` LIMIT ?`,
 		args...)
 	if err != nil {
@@ -3088,13 +3128,17 @@ func (db *DB) triageUnconvictedSuspiciousSQLite(ctx context.Context, limit int, 
 	return scanLiteSamplesLight(rows)
 }
 
-func (db *DB) triageDiscordSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClauseSQLite(f, "samples")
+func (db *DB) triageDiscordSQLite(ctx context.Context, limit int, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
+	// The freshness placeholder sits ahead of the filter clause in SQL order,
+	// so its value leads the args. Text-formatted: SQLite stores timestamps as
+	// RFC3339Nano and a bound time.Time silently matches nothing.
+	extra, fargs := triageFilterClauseSQLite(f, "samples")
+	args := append([]any{analyzedAfter.UTC().Format(time.RFC3339Nano)}, fargs...)
 	args = append(args, limit)
 	//nolint:gosec // G202: label/crit predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleColsLight+` FROM samples
-		 WHERE `+triageDiscordWhereSQLite+extra+`
+		 WHERE `+fmt.Sprintf(triageDiscordWhereSQLite, "?")+extra+`
 		 `+triageOrderSQL(f)+` LIMIT ?`,
 		args...)
 	if err != nil {
@@ -3123,11 +3167,14 @@ func (db *DB) triageGoodSQLite(ctx context.Context, limit int, f TriageFilter) (
 // ROW_NUMBER() PARTITION BY file_type window over the eligible set (dev-scale
 // tables; no index gymnastics needed), and the collapse is GROUP BY root with
 // MAX(best)/MIN(rank) instead of DISTINCT ON.
-func (db *DB) triageHighestSQLite(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
+func (db *DB) triageHighestSQLite(ctx context.Context, limit int,
+	createdBefore, missingBefore, analyzedAfter time.Time, f TriageFilter,
+) ([]*Sample, error) {
 	extra, fargs := triageFilterClauseSQLiteKey(f, "s0",
 		"CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END")
 	args := append([]any{
 		createdBefore.UTC().Format(time.RFC3339Nano),
+		analyzedAfter.UTC().Format(time.RFC3339Nano),
 		missingBefore.UTC().Format(time.RFC3339Nano),
 	}, fargs...)
 	args = append(args, limit)
@@ -3144,6 +3191,8 @@ func (db *DB) triageHighestSQLite(ctx context.Context, limit int, createdBefore,
 		       AND (parent = '' OR path LIKE '%!!%')
 		       AND (parent = '' OR EXISTS (SELECT 1 FROM samples pp WHERE pp.sha256 = s0.parent))
 		       AND created_at < ?
+		       AND litmus_score >= `+strconv.FormatFloat(HighestScoreFloor, 'f', -1, 64)+`
+		       AND analyzed_at > ?
 		       AND NOT EXISTS (SELECT 1 FROM reports r
 		                       WHERE r.sha256 = CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END
 		                         AND (r.report_type = 'highest'
@@ -3163,9 +3212,16 @@ func (db *DB) triageHighestSQLite(ctx context.Context, limit int, createdBefore,
 // triageLowestSQLite: see TriageLowest. Mirrors triageLowestPG (per-route
 // bottom-K via a PARTITION BY file_type window), including the per-member
 // drain key (a bad archive's members each need their own verdict).
-func (db *DB) triageLowestSQLite(ctx context.Context, limit int, createdBefore, missingBefore time.Time, f TriageFilter) ([]*Sample, error) {
-	extra, fargs := triageFilterClauseSQLite(f, "s0")
+func (db *DB) triageLowestSQLite(ctx context.Context, limit int,
+	createdBefore, missingBefore, analyzedAfter time.Time, f TriageFilter,
+) ([]*Sample, error) {
+	// Alias "samples", not "s0": the inner SELECT below is FROM samples with no
+	// alias, and the PG mirror's s0 does not exist here. This was inert while the
+	// filter was always empty; it produced "no such column: s0.sha256" the moment
+	// the queue started passing ExcludeReportType.
+	extra, fargs := triageFilterClauseSQLite(f, "samples")
 	args := append([]any{
+		analyzedAfter.UTC().Format(time.RFC3339Nano),
 		createdBefore.UTC().Format(time.RFC3339Nano),
 		missingBefore.UTC().Format(time.RFC3339Nano),
 	}, fargs...)
@@ -3182,6 +3238,7 @@ func (db *DB) triageLowestSQLite(ctx context.Context, limit int, createdBefore, 
 		   WHERE label = 'bad' AND cleave_result IS NOT NULL AND skip = ''
 		     AND litmus_score IS NOT NULL AND path <> ''
 		     AND label_source != 'conflict'
+		     AND analyzed_at > ?
 		     AND (parent = '' OR path LIKE '%!!%')
 		     AND (parent = '' OR EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = samples.parent))
 		     AND created_at < ?
@@ -3217,7 +3274,7 @@ func (db *DB) triageStrandedSQLite(ctx context.Context, limit int, createdBefore
 		     FROM samples m
 		     WHERE m.label = 'good' AND m.cleave_result IS NOT NULL AND m.skip = ''
 		       AND m.parent != '' AND m.path LIKE '%!!%'
-		       AND m.score > 0 AND m.max_crit >= `+strconv.Itoa(notableCrit)+`
+		       AND m.score > 0 AND m.max_crit >= `+strconv.Itoa(strandedMemberCrit)+`
 		       AND m.label_source NOT LIKE 'cyclotron:%'
 		       AND m.created_at < ?
 		       AND EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = m.parent AND p.label = 'bad')
@@ -3944,10 +4001,23 @@ func (db *DB) finishSightingAcquisitionSQLite(ctx context.Context, target string
 }
 
 func (db *DB) insertReportSQLite(ctx context.Context, r *Report) error {
+	var createdAt any
+	if !r.CreatedAt.IsZero() {
+		createdAt = r.CreatedAt.UTC().Format(time.RFC3339Nano)
+	}
+	// The fallback repeats the column's own DEFAULT expression rather than using
+	// CURRENT_TIMESTAMP, which renders "YYYY-MM-DD HH:MM:SS" and would not
+	// compare against the RFC3339Nano these columns hold.
+	//
+	// created_at was omitted entirely, so the column default won and a caller
+	// setting Report.CreatedAt got it silently dropped -- the same shape as the
+	// InsertSample/AnalyzedAt gap. It matters now that ReportCooldown compares
+	// against it: a backdated report is how a test, or a backfill, expresses
+	// "this was judged days ago". Zero still means now.
 	_, err := db.lite.ExecContext(ctx, `
-		INSERT INTO reports (sha256, report_type, content, provider, duration_ms)
-		VALUES (?, ?, ?, ?, ?)`,
-		r.SHA256, r.Type, r.Content, r.Provider, r.DurationMS)
+		INSERT INTO reports (sha256, report_type, content, provider, duration_ms, created_at)
+		VALUES (?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))`,
+		r.SHA256, r.Type, r.Content, r.Provider, r.DurationMS, createdAt)
 	if err != nil {
 		return fmt.Errorf("hopper: insert report: %w", err)
 	}

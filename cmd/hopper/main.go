@@ -4746,7 +4746,9 @@ func cmdTriage(ctx context.Context) error {
 		name  string
 	}
 	datasets := []dataset{
-		{name: "bad", fetch: func(ctx context.Context, n int) ([]*hopper.Sample, error) { return db.TriageBad(ctx, n, filter) }},
+		{name: "bad", fetch: func(ctx context.Context, n int) ([]*hopper.Sample, error) {
+			return db.TriageBad(ctx, n, time.Now().Add(-hopper.BadFreshness), filter)
+		}},
 		{name: "good", fetch: func(ctx context.Context, n int) ([]*hopper.Sample, error) { return db.TriageGood(ctx, n, filter) }},
 		{name: "new", fetch: func(ctx context.Context, n int) ([]*hopper.Sample, error) { return db.TriageNew(ctx, n, filter) }},
 		{name: "review", fetch: func(ctx context.Context, n int) ([]*hopper.Sample, error) { return db.TriageReview(ctx, n, filter) }},

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"testing"
+	"time"
 )
 
 func TestSetPopularPackagesUpsertsByIdentity(t *testing.T) {
@@ -118,26 +119,32 @@ func TestTriagePopularRanksByImportanceNotLabel(t *testing.T) {
 		return sha
 	}
 
-	lowRank := add("pkg:npm/popular-3", "good", 4)   // rank 3, filed good
-	highRank := add("pkg:npm/popular-900", "bad", 4) // rank 900, filed bad
-	unmarked := add("pkg:npm/nobody-imports", "unknown", 4)
+	lowRank := add("pkg:npm/popular-3", "good", 5)   // rank 3, filed good
+	highRank := add("pkg:npm/popular-900", "bad", 5) // rank 900, filed bad
+	unmarked := add("pkg:npm/nobody-imports", "unknown", 5)
 	benign := add("pkg:npm/popular-5", "unknown", 1) // marked, but no detection
-	// The boundary the queue turns on: "notable" is a finding worth recording,
-	// not one worth the deep chain and a fleet-wide stand-down. At the old
-	// notableCrit floor this row qualified, and 92% of the live population
-	// looked like it.
+	// The boundary the queue turns on, raised twice. "notable" is a finding worth
+	// recording, not one worth the deep chain and a fleet-wide stand-down; at the
+	// old notableCrit floor this row qualified and 92% of the live population
+	// looked like it. Since 2026-09-01 the floor is HOSTILE, so the suspicious
+	// row below is excluded too: what justifies standing the fleet down is a
+	// widely-installed package our rules call hostile, which is either a live
+	// supply-chain compromise or a false positive about to hit a great many
+	// people. Merely suspicious was 13,798 of the 13,906 population.
 	notable := add("pkg:npm/popular-7", "unknown", 3)
+	suspicious := add("pkg:npm/popular-11", "unknown", 4)
 
 	if err := db.SetPopularPackages(ctx, []PopularPackage{
 		{PURLBase: "pkg:npm/popular-3", Ecosystem: "npm", Rank: 3, Source: "poppy"},
 		{PURLBase: "pkg:npm/popular-900", Ecosystem: "npm", Rank: 900, Source: "poppy"},
 		{PURLBase: "pkg:npm/popular-5", Ecosystem: "npm", Rank: 5, Source: "poppy"},
 		{PURLBase: "pkg:npm/popular-7", Ecosystem: "npm", Rank: 7, Source: "poppy"},
+		{PURLBase: "pkg:npm/popular-11", Ecosystem: "npm", Rank: 11, Source: "poppy"},
 	}); err != nil {
 		t.Fatalf("SetPopularPackages: %v", err)
 	}
 
-	got, err := db.TriagePopular(ctx, 100, TriageFilter{})
+	got, err := db.TriagePopular(ctx, 100, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriagePopular: %v", err)
 	}
@@ -160,6 +167,7 @@ func TestTriagePopularRanksByImportanceNotLabel(t *testing.T) {
 		{unmarked, "a package nobody marked as popular"},
 		{benign, "a marked package with no detection"},
 		{notable, "a marked package whose worst finding is only notable"},
+		{suspicious, "a marked package whose worst finding is only suspicious"},
 	} {
 		for _, s := range got {
 			if s.SHA256 == excluded.sha {
@@ -187,7 +195,10 @@ func TestTriagePopularBreaksTiesByRiskScore(t *testing.T) {
 		})
 		// Same package, same rank, same crit — risk is the only thing separating
 		// them, so it is the only thing the ordering can be reading.
-		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"npm","x":%d,"dp":0,"ts":[{"l":4}]}]}`, sha, risk)
+		// Hostile, not suspicious: popular's bar is max_crit >= 5 since
+		// 2026-09-01, on the reasoning that a widely-installed package our rules
+		// call hostile is what justifies standing the fleet down for it.
+		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"npm","x":%d,"dp":0,"ts":[{"l":5}]}]}`, sha, risk)
 		if err := db.UpdateCleaveResult(ctx, sha, result, nil, ""); err != nil {
 			t.Fatalf("UpdateCleaveResult: %v", err)
 		}
@@ -204,7 +215,7 @@ func TestTriagePopularBreaksTiesByRiskScore(t *testing.T) {
 		t.Fatalf("SetPopularPackages: %v", err)
 	}
 
-	got, err := db.TriagePopular(ctx, 100, TriageFilter{})
+	got, err := db.TriagePopular(ctx, 100, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriagePopular: %v", err)
 	}

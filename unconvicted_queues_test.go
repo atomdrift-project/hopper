@@ -53,23 +53,30 @@ func TestUnconvictedPairCoversTheRetiredPair(t *testing.T) {
 		// unknown-labelled
 		"unknown hostile":        seedUnconvicted(t, ctx, db, 4, "unknown", 5),
 		"unknown two suspicious": seedUnconvicted(t, ctx, db, 5, "unknown", 4, 4),
-		// The sliver the label-conditional bar exists for: one suspicious
-		// finding is within policy on a benign-labelled file, and is the whole
-		// reason to look on an unlabelled one.
-		"unknown one suspicious": seedUnconvicted(t, ctx, db, 6, "unknown", 4),
 	}
 	// Neither pool selects these.
 	excluded := map[string]string{
-		"good one suspicious": seedUnconvicted(t, ctx, db, 3, "good", 4),
-		"good notable only":   seedUnconvicted(t, ctx, db, 7, "good", 3),
-		"bad hostile":         seedUnconvicted(t, ctx, db, 8, "bad", 5),
+		// DELIBERATELY DROPPED 2026-09-01. This is the sliver the old
+		// label-conditional bar existed for -- one suspicious finding is the
+		// whole reason to look at an unlabelled file -- and the union really did
+		// cover it until the count bar became unconditional.
+		//
+		// It went because it could not be bounded: the population was over
+		// 200,000 rows and no other axis trimmed it, while dropping the label arm
+		// alone took the queue to a size a fleet can finish. The slice is also
+		// the weakest evidence in the pool, so it is the cheapest coverage to
+		// give up. Reinstating it means reinstating an unbounded queue.
+		"unknown one suspicious": seedUnconvicted(t, ctx, db, 6, "unknown", 4),
+		"good one suspicious":    seedUnconvicted(t, ctx, db, 3, "good", 4),
+		"good notable only":      seedUnconvicted(t, ctx, db, 7, "good", 3),
+		"bad hostile":            seedUnconvicted(t, ctx, db, 8, "bad", 5),
 	}
 
-	hostile, err := db.TriageUnconvictedHostile(ctx, 100, TriageFilter{})
+	hostile, err := db.TriageUnconvictedHostile(ctx, 100, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageUnconvictedHostile: %v", err)
 	}
-	susp, err := db.TriageUnconvictedSuspicious(ctx, 100, TriageFilter{})
+	susp, err := db.TriageUnconvictedSuspicious(ctx, 100, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageUnconvictedSuspicious: %v", err)
 	}
@@ -101,8 +108,17 @@ func TestUnconvictedPairCoversTheRetiredPair(t *testing.T) {
 		}
 	}
 
-	// ...and the union really is the retired pair's union, read from the
-	// retired selectors themselves rather than from a hand-written expectation.
+	// ...and the union is a SUBSET of the retired pair's, read from the retired
+	// selectors themselves rather than from a hand-written expectation.
+	//
+	// It was an equality until 2026-09-01. The unconvicted pair was designed so
+	// its union matched good+new exactly, which is what made the migration free;
+	// bounding the suspicious tier gave that up in one specific place (see
+	// "unknown one suspicious" above). What still must hold is the other
+	// direction: the pair may select LESS than the retired queues did, but never
+	// something neither of them would have taken. A sample appearing here that
+	// good+new would have skipped means the population drifted rather than
+	// narrowed, which is a different and worse bug.
 	old, err := db.TriageGood(ctx, 100, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageGood: %v", err)
@@ -116,7 +132,7 @@ func TestUnconvictedPairCoversTheRetiredPair(t *testing.T) {
 		oldUnion[sha] = true
 	}
 	for sha := range oldUnion {
-		if !union[sha] {
+		if !union[sha] && sha != excluded["unknown one suspicious"] {
 			t.Errorf("sample %s was in good∪new but is in neither replacement tier", sha[:6])
 		}
 	}
@@ -149,7 +165,7 @@ func TestUnconvictedRepairOrderPutsUncorroboratedFirst(t *testing.T) {
 		t.Fatalf("AddSightings: %v", err)
 	}
 
-	got, err := db.TriageUnconvictedHostile(ctx, 10, TriageFilter{Order: TriageRepair})
+	got, err := db.TriageUnconvictedHostile(ctx, 10, time.Time{}, TriageFilter{Order: TriageRepair})
 	if err != nil {
 		t.Fatalf("TriageUnconvictedHostile: %v", err)
 	}
@@ -185,7 +201,7 @@ func TestTriageDiscordSelectsOnlyDisagreement(t *testing.T) {
 	// not disagreement.
 	neverScored := seedUnconvicted(t, ctx, db, 6, "good", 5)
 
-	got, err := db.TriageDiscord(ctx, 100, TriageFilter{})
+	got, err := db.TriageDiscord(ctx, 100, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageDiscord: %v", err)
 	}
@@ -218,15 +234,18 @@ func TestTriageHighestReachesUnknownMembers(t *testing.T) {
 	unknownTop, badTop := sha(1), sha(2)
 	mustInsert(t, ctx, db, &Sample{SHA256: unknownTop, Label: "unknown", Path: "unknown/hot.exe"})
 	mustAnalyze(t, ctx, db, unknownTop, 5)
-	setLitmus(t, ctx, db, unknownTop, 2, 0.98)
+	// Above HighestScoreFloor (0.999), the queue's membership bar since
+	// 2026-09-01 -- below it this fixture seeds an empty queue and the widening
+	// this test covers cannot be observed.
+	setLitmus(t, ctx, db, unknownTop, 2, 0.9998)
 	// A convicted file is TriageLowest's domain and must stay out.
 	mustInsert(t, ctx, db, &Sample{SHA256: badTop, Label: "bad", Path: "bad/hot.exe"})
 	mustAnalyze(t, ctx, db, badTop, 5)
-	setLitmus(t, ctx, db, badTop, 2, 0.999)
+	setLitmus(t, ctx, db, badTop, 2, 0.9999)
 
 	before := time.Now().Add(time.Hour)
 	missing := time.Now().Add(-MissingRetry)
-	got, err := db.TriageHighest(ctx, 20, before, missing, TriageFilter{})
+	got, err := db.TriageHighest(ctx, 20, before, missing, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageHighest: %v", err)
 	}
@@ -273,7 +292,7 @@ func TestTriageFPTraitClustersOnOneTrait(t *testing.T) {
 	// Seeded LAST, so plain newest-first ordering would put it at the head.
 	lonely := seedWithTraits(t, ctx, db, 4, "quiet/rule")
 
-	got, err := db.TriageFPTrait(ctx, 10, TriageFilter{})
+	got, err := db.TriageFPTrait(ctx, 10, time.Now().Add(-FPTraitFreshness), TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageFPTrait: %v", err)
 	}
@@ -313,7 +332,7 @@ func TestTriageFPTraitIsGoodOnly(t *testing.T) {
 	}
 	benign := seedWithTraits(t, ctx, db, 9, "benign/rule")
 
-	got, err := db.TriageFPTrait(ctx, 10, TriageFilter{})
+	got, err := db.TriageFPTrait(ctx, 10, time.Now().Add(-FPTraitFreshness), TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageFPTrait: %v", err)
 	}

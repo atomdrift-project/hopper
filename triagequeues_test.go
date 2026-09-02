@@ -99,7 +99,10 @@ func TestTriagePopularNeedsPopularPackages(t *testing.T) {
 		SHA256: sha, Label: "unknown", Path: "incoming/forager/a.tgz",
 		PURLBase: "pkg:npm/left-pad",
 	})
-	mustAnalyzeWithTraits(t, ctx, db, sha, 0, `{"l":4}`)
+	// popular selects on max_crit >= 5 since 2026-09-01 -- a merely
+	// suspicious finding on a popular package is not what the fleet stands
+	// down for -- so the fixture seeds a hostile trait.
+	mustAnalyzeWithTraits(t, ctx, db, sha, 0, `{"l":5}`)
 
 	got, err := TriageQueues["popular"].Select(ctx, db, 5)
 	if err != nil {

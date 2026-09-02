@@ -30,7 +30,11 @@ func seedUnconvictedQueue(t *testing.T, ctx context.Context, db *hopper.DB, n in
 		}); err != nil {
 			t.Fatalf("InsertSample(%s): %v", sha, err)
 		}
-		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"elf","x":0,"dp":0,"ts":[{"l":4}]}]}`, sha)
+		// Two crit-4 traits, not one: unconvicted-suspicious now requires
+		// suspicious_count > 1 unconditionally (the OR label='unknown' arm was
+		// removed to bound the population), so a single suspicious finding no
+		// longer selects and this fixture would seed an empty queue.
+		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"elf","x":0,"dp":0,"ts":[{"l":4},{"l":4}]}]}`, sha)
 		if err := db.UpdateCleaveResult(ctx, sha, result, nil, ""); err != nil {
 			t.Fatalf("UpdateCleaveResult(%s): %v", sha, err)
 		}

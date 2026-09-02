@@ -16,6 +16,17 @@ import (
 //
 //	HOPPER_PLAN_DSN='postgres://hopper@hopper-db/hopper?sslmode=disable' \
 //	  go test ./... -run TestPlanAudit -count=1
+//
+// fillFreshness substitutes a literal timestamp for the analyzed_at placeholder
+// the freshness-floored predicates carry, so a predicate can be EXPLAINed
+// directly. A predicate with no placeholder is returned unchanged.
+func fillFreshness(where string) string {
+	if !strings.Contains(where, "%s") {
+		return where
+	}
+	return fmt.Sprintf(where, "now() - interval '24 hours'")
+}
+
 func planAuditDSN(t *testing.T) string {
 	t.Helper()
 	for _, k := range []string{"HOPPER_PLAN_DSN", "DATABASE_URL"} {
@@ -352,10 +363,12 @@ func TestPlanAuditUnconvictedQueues(t *testing.T) {
 	defer cancel()
 
 	for _, tc := range []struct {
-		name  string
-		where string
-		order TriageFilter
-		index string
+		name      string
+		where     string
+		order     TriageFilter
+		index     string
+		altIndex  string
+		allowSort bool
 	}{
 		{
 			name: "unconvicted-hostile", where: triageUnconvictedHostileWhere,
@@ -368,6 +381,14 @@ func TestPlanAuditUnconvictedQueues(t *testing.T) {
 		{
 			name: "unconvicted-suspicious", where: triageUnconvictedSuspiciousWhere,
 			order: TriageFilter{Order: TriageRepair}, index: "idx_samples_unconvicted_susp_repair",
+			// Since the freshness floor landed, the planner may instead walk the
+			// STALE index -- whose leading key is analyzed_at -- to serve the floor
+			// as an Index Cond and top-N sort the handful of rows that survive.
+			// That is the better plan, not a regression: measured 2026-09-01 the
+			// floor cuts this queue to ~173 rows, and sorting 173 beats walking the
+			// repair index and filtering. Either index is acceptable here; a Seq
+			// Scan still is not.
+			altIndex: "idx_samples_unconvicted_susp_stale", allowSort: true,
 		},
 		{
 			name: "unconvicted-suspicious-stale", where: triageUnconvictedSuspiciousWhere,
@@ -398,17 +419,22 @@ func TestPlanAuditUnconvictedQueues(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			sql := `EXPLAIN SELECT ` + pgSampleColsLight + ` FROM samples WHERE ` + tc.where +
-				` ` + triageOrderSQL(tc.order) + ` LIMIT 64`
+			// Several predicates carry a %s for their analyzed_at freshness floor.
+			// EXPLAIN takes no bind parameters, so substitute a literal: the plan
+			// shape is what is under test, and a constant timestamp exercises the
+			// same index path a bound one would.
+			sql := `EXPLAIN SELECT ` + pgSampleColsLight + ` FROM samples WHERE ` +
+				fillFreshness(tc.where) + ` ` + triageOrderSQL(tc.order) + ` LIMIT 64`
 			plan := explainText(t, ctx, db, sql)
 			if planSeqScansSamples(plan) {
 				t.Errorf("%s: Seq Scan on samples — the partial index predicate no longer "+
 					"matches the selector's:\n%s", tc.name, plan)
 			}
-			if !strings.Contains(plan, tc.index) {
+			if !strings.Contains(plan, tc.index) &&
+				(tc.altIndex == "" || !strings.Contains(plan, tc.altIndex)) {
 				t.Errorf("%s: not using %s:\n%s", tc.name, tc.index, plan)
 			}
-			if strings.Contains(plan, "Sort") {
+			if !tc.allowSort && strings.Contains(plan, "Sort") {
 				t.Errorf("%s: plan sorts instead of walking %s in order; the ORDER BY has "+
 					"drifted from the index key list:\n%s", tc.name, tc.index, plan)
 			}
@@ -428,7 +454,7 @@ func TestPlanAuditFPTraitWindow(t *testing.T) {
 	defer cancel()
 
 	sql := `EXPLAIN SELECT ` + pgSampleColsLight + `, top_traits FROM samples
-	         WHERE ` + triageFPTraitWhere + `
+	         WHERE ` + fillFreshness(triageFPTraitWhere) + `
 	         ORDER BY created_at DESC, id DESC LIMIT ` + strconv.Itoa(fpTraitWindow)
 	plan := explainText(t, ctx, db, sql)
 	if planSeqScansSamples(plan) {
@@ -494,25 +520,25 @@ func TestPlanAuditNewSelectorsExecute(t *testing.T) {
 		name string
 	}{
 		{name: "unconvicted-hostile", run: func() ([]*Sample, error) {
-			return db.TriageUnconvictedHostile(ctx, 1, TriageFilter{Order: TriageRepair})
+			return db.TriageUnconvictedHostile(ctx, 1, time.Time{}, TriageFilter{Order: TriageRepair})
 		}},
 		{name: "unconvicted-hostile-stale", run: func() ([]*Sample, error) {
-			return db.TriageUnconvictedHostile(ctx, 1, staleTriageFilter("unconvicted-hostile-stale"))
+			return db.TriageUnconvictedHostile(ctx, 1, time.Time{}, staleTriageFilter("unconvicted-hostile-stale"))
 		}},
 		{name: "unconvicted-suspicious", run: func() ([]*Sample, error) {
-			return db.TriageUnconvictedSuspicious(ctx, 1, TriageFilter{Order: TriageRepair})
+			return db.TriageUnconvictedSuspicious(ctx, 1, time.Time{}, TriageFilter{Order: TriageRepair})
 		}},
 		{name: "discord", run: func() ([]*Sample, error) {
-			return db.TriageDiscord(ctx, 1, TriageFilter{})
+			return db.TriageDiscord(ctx, 1, time.Time{}, TriageFilter{})
 		}},
 		{name: "fp-trait", run: func() ([]*Sample, error) {
-			return db.TriageFPTrait(ctx, 1, TriageFilter{})
+			return db.TriageFPTrait(ctx, 1, now.Add(-FPTraitFreshness), TriageFilter{})
 		}},
 		{name: "version-drift", run: func() ([]*Sample, error) {
 			return db.TriageVersionDrift(ctx, 1, now.Add(-VersionDriftWindow), TriageFilter{})
 		}},
 		{name: "highest (widened)", run: func() ([]*Sample, error) {
-			return db.TriageHighest(ctx, 1, now.Add(-OutlierGrace), now.Add(-MissingRetry), TriageFilter{})
+			return db.TriageHighest(ctx, 1, now.Add(-OutlierGrace), now.Add(-MissingRetry), time.Time{}, TriageFilter{})
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -529,13 +555,15 @@ func TestPlanAuditNewSelectorsExecute(t *testing.T) {
 		name  string
 	}{
 		{name: "unconvicted-hostile", count: func() (int64, error) {
-			return db.CountTriageUnconvictedHostile(ctx, TriageFilter{})
+			return db.CountTriageUnconvictedHostile(ctx, time.Time{}, TriageFilter{})
 		}},
 		{name: "unconvicted-suspicious", count: func() (int64, error) {
-			return db.CountTriageUnconvictedSuspicious(ctx, TriageFilter{})
+			return db.CountTriageUnconvictedSuspicious(ctx, time.Time{}, TriageFilter{})
 		}},
-		{name: "discord", count: func() (int64, error) { return db.CountTriageDiscord(ctx, TriageFilter{}) }},
-		{name: "fp-trait", count: func() (int64, error) { return db.CountTriageFPTrait(ctx, TriageFilter{}) }},
+		{name: "discord", count: func() (int64, error) { return db.CountTriageDiscord(ctx, time.Time{}, TriageFilter{}) }},
+		{name: "fp-trait", count: func() (int64, error) {
+			return db.CountTriageFPTrait(ctx, time.Now().Add(-FPTraitFreshness), TriageFilter{})
+		}},
 	} {
 		t.Run("count/"+tc.name, func(t *testing.T) {
 			if _, err := tc.count(); err != nil {
