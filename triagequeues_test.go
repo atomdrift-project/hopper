@@ -56,15 +56,12 @@ func TestTriageQueuesRunAgainstASchema(t *testing.T) {
 			if len(got) != 0 {
 				t.Errorf("Select returned %d rows from an empty database", len(got))
 			}
-			if q.Depth == nil {
-				return
-			}
-			depth, err := q.Depth(ctx, db)
+			depth, capped, err := q.Count(ctx, db)
 			if err != nil {
-				t.Fatalf("Depth: %v", err)
+				t.Fatalf("Count: %v", err)
 			}
-			if depth != 0 {
-				t.Errorf("Depth = %d on an empty database", depth)
+			if depth != 0 || capped {
+				t.Errorf("depth = %d (capped=%v) on an empty database", depth, capped)
 			}
 		})
 	}

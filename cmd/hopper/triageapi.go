@@ -126,9 +126,11 @@ func (c *triageClaims) held() int {
 // triageQueueInfo describes one registered queue.
 type triageQueueInfo struct {
 	Name string `json:"name"`
-	// Depth reports whether this queue can answer /depth. Three queues select
-	// against the sightings ledger and have no countable population, so a client
-	// that renders backlog must skip them rather than showing a zero.
+	// Depth reports whether this queue can answer /depth. Always true since
+	// 2026-09-02: a depth is the queue's own selection counted, and every queue
+	// has a selection. Kept on the wire because a client pinned to an older
+	// hopper still reads it, and "every queue has one" is a cheap thing to keep
+	// saying explicitly.
 	Depth bool `json:"depth"`
 }
 
@@ -139,7 +141,7 @@ func (*apiServer) handleTriageQueues(w http.ResponseWriter, _ *http.Request) {
 	names := hopper.TriageQueueNames()
 	out := make([]triageQueueInfo, 0, len(names))
 	for _, name := range names {
-		out = append(out, triageQueueInfo{Name: name, Depth: hopper.TriageQueues[name].Depth != nil})
+		out = append(out, triageQueueInfo{Name: name, Depth: true})
 	}
 	writeTriageJSON(w, map[string]any{"queues": out})
 }
@@ -225,21 +227,19 @@ func (s *apiServer) handleTriageSelect(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleTriageDepth reports one queue's backlog. GET /api/triage/{queue}/depth.
-// 404 for the queues with no countable population — see triageQueueInfo.Depth.
+// Every queue can answer: a depth is the queue's own selection run to
+// hopper.TriageDepthCap and counted, so there is no longer a "no countable
+// population" case to 404 on.
 func (s *apiServer) handleTriageDepth(w http.ResponseWriter, r *http.Request) {
 	q, ok := s.triageQueue(w, r)
 	if !ok {
-		return
-	}
-	if q.Depth == nil {
-		writeJSONError(w, http.StatusNotFound, `{"error":"queue has no depth count"}`)
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
 
-	depth, err := q.Depth(ctx, s.db)
+	depth, capped, err := q.Count(ctx, s.db)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "triage: depth failed",
 			"queue", q.Name, "error", err, "remote", r.RemoteAddr)
@@ -249,9 +249,9 @@ func (s *apiServer) handleTriageDepth(w http.ResponseWriter, r *http.Request) {
 	writeTriageJSON(w, map[string]any{
 		"queue": q.Name,
 		"depth": depth,
-		// Every count is capped, so a queue at the cap reports the cap. Clients
-		// render that as "<cap>+" rather than as an exact backlog.
-		"capped": depth >= hopper.TriageDepthCap,
+		// A queue at the cap reports the cap. Clients render that as "<cap>+"
+		// rather than as an exact backlog.
+		"capped": capped,
 	})
 }
 

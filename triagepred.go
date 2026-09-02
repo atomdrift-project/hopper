@@ -1,38 +1,32 @@
 package hopper
 
-// triagecount.go answers "how much work is in this queue right now" for the
-// selectors whose population is a plain predicate over samples.
+// triagepred.go holds each triage queue's membership predicate: the WHERE that
+// says what is in the queue, in one place per queue, for every statement that
+// has to agree about it.
 //
-// The counts exist for an operator surface (cyclotron's dashboard and its
-// queue-depth metric), not for the fleet's own decisions, and that shapes two
-// choices:
+// There are more of those than there look to be. A queue's predicate is read by
+// its Postgres selector, by its SQLite mirror, and by the partial index that
+// makes the selector affordable -- and until 2026-09-02 it was also read by a
+// separate depth count, which is where this file got its old name and its old
+// job. That count is gone: a depth is now the queue's own selection run to a cap
+// and counted (see Queue.Count), because a second hand-written spelling of a
+// queue's membership is a number that looks authoritative and quietly stops
+// describing the queue it names. It did exactly that to highest and lowest.
 //
-//   - They are CAPPED. Nobody reading a backlog needs "254,197" rather than
-//     "100000+", and an uncapped count over a hundred-million-row table is a
-//     query whose cost is set by whichever queue happens to be largest.
-//   - They share the selectors' predicates by construction (the triage*Where
-//     constants below), because the failure mode of a hand-copied predicate is
-//     a number that looks authoritative and quietly stops matching the queue it
-//     claims to describe. TestTriageDepthMatchesSelection proves they agree.
+// What remains here is the half that genuinely cannot be shared with a
+// selector's SQL: a partial index predicate has to be a literal string, and it
+// has to be IMMUTABLE, so it can hold a queue's population but never its
+// freshness floor. Hence the split each queue below is written in -- a Pop half
+// the index is built from, and a Where half that is the Pop plus `analyzed_at >
+// %s`. The %s rather than $1 or ? is because the two dialects number
+// placeholders differently and only the caller knows where in its own argument
+// list the floor lands.
 //
-// highest, lowest and stranded are counted differently, and the difference is
-// worth knowing before reading their numbers. Those three select a bounded
-// slice by construction — each route's top-K, or one archive's members — so
-// counting what the selector RETURNS would just report the bound. What an
-// operator actually wants is the population those queues are working through,
-// so that is what they report, and it will not equal a selection. See
-// TriageScoreDivider.
+// The two score-ranked queues are the exception and live in hopper.go beside the
+// constants that bound them, because their predicates are functions of a table
+// alias rather than constants -- see triageHighestWhere.
 
-import (
-	"context"
-	"fmt"
-	"strconv"
-	"time"
-)
-
-// TriageDepthCap bounds every count here. A queue at the cap reports the cap;
-// callers that care render it as "<cap>+".
-const TriageDepthCap = 100000
+import "strconv"
 
 // The shared population predicates. Each is the exact WHERE its Triage*
 // selector uses, so the two cannot drift: the selector and the count read the
@@ -330,234 +324,3 @@ var triageDiscordWhereSQLite = triageDiscordPopSQLite + `
 // be indexed.
 var triagePopularWhere = triagePopularPop + `
 	   AND analyzed_at > %s`
-
-// CountTriageBad reports how many samples TriageBad would draw from, capped at
-// [TriageDepthCap]. Its siblings below mirror the other countable selectors.
-func (db *DB) CountTriageBad(ctx context.Context, analyzedAfter time.Time, f TriageFilter) (int64, error) {
-	return db.countTriageArgs(ctx, "bad", triageBadWhere, []any{analyzedAfter}, f)
-}
-
-// CountTriageGood reports TriageGood's population, capped at [TriageDepthCap].
-func (db *DB) CountTriageGood(ctx context.Context, f TriageFilter) (int64, error) {
-	return db.countTriage(ctx, "good", triageGoodWhere, triageGoodWhere, f)
-}
-
-// CountTriageNew reports TriageNew's population, capped at [TriageDepthCap].
-func (db *DB) CountTriageNew(ctx context.Context, f TriageFilter) (int64, error) {
-	return db.countTriage(ctx, "new", triageNewWherePG, triageNewWhereSQLite, f)
-}
-
-// CountTriageUnconvictedHostile reports the hostile-tier unconvicted population,
-// capped at [TriageDepthCap].
-func (db *DB) CountTriageUnconvictedHostile(ctx context.Context, analyzedAfter time.Time, f TriageFilter) (int64, error) {
-	return db.countTriageArgs(ctx, "unconvicted-hostile", triageUnconvictedHostileWhere, []any{analyzedAfter}, f)
-}
-
-// CountTriageUnconvictedSuspicious reports the suspicious-tier unconvicted
-// population, capped at [TriageDepthCap].
-func (db *DB) CountTriageUnconvictedSuspicious(ctx context.Context, analyzedAfter time.Time, f TriageFilter) (int64, error) {
-	return db.countTriageArgs(ctx, "unconvicted-suspicious", triageUnconvictedSuspiciousWhere, []any{analyzedAfter}, f)
-}
-
-// CountTriageFPTrait reports the population fp-trait ranks within, capped at
-// [TriageDepthCap]. It counts the POOL, not the current worst trait's share of
-// it: the trait changes as edits land, so a count of its matches would move for
-// reasons an operator reading a backlog cannot attribute to progress.
-func (db *DB) CountTriageFPTrait(ctx context.Context, analyzedAfter time.Time, f TriageFilter) (int64, error) {
-	return db.countTriageArgs(ctx, "fp-trait", triageFPTraitWhere, []any{analyzedAfter}, f)
-}
-
-// CountTriageDiscord reports the detector-disagreement population, capped at
-// [TriageDepthCap].
-func (db *DB) CountTriageDiscord(ctx context.Context, analyzedAfter time.Time, f TriageFilter) (int64, error) {
-	return db.countTriageArgs2(ctx, "discord", triageDiscordWherePG, triageDiscordWhereSQLite, []any{analyzedAfter}, f)
-}
-
-// CountTriageSighted reports TriageSighted's population, capped at [TriageDepthCap].
-func (db *DB) CountTriageSighted(ctx context.Context, f TriageFilter) (int64, error) {
-	var n int64
-	if db.pool != nil {
-		extra, args := triageFilterClausePG(f, 1, "samples")
-		args = append(args, TriageDepthCap)
-		q := triageSightedMatchCTE + `SELECT count(*) FROM (
-			SELECT 1 FROM samples
-			JOIN latest_sightings ON latest_sightings.matched_sha = samples.sha256
-			WHERE ` + triageSightedWhere + extra + `
-			LIMIT $` + strconv.Itoa(len(args)) + `) q`
-		if err := db.pool.QueryRow(ctx, q, args...).Scan(&n); err != nil {
-			return 0, fmt.Errorf("hopper: count triage sighted: %w", err)
-		}
-		return n, nil
-	}
-
-	extra, args := triageFilterClauseSQLite(f, "samples")
-	args = append(args, TriageDepthCap)
-	q := triageSightedMatchCTE + `SELECT count(*) FROM (
-		SELECT 1 FROM samples
-		JOIN latest_sightings ON latest_sightings.matched_sha = samples.sha256
-		WHERE ` + triageSightedWhere + extra + `
-		LIMIT ?) q`
-	if err := db.lite.QueryRowContext(ctx, q, args...).Scan(&n); err != nil {
-		return 0, fmt.Errorf("hopper: count triage sighted: %w", err)
-	}
-	return n, nil
-}
-
-// CountTriagePopular reports TriagePopular's population, capped at
-// [TriageDepthCap]. The most expensive of these by some margin — the EXISTS
-// against popular_packages is a per-row probe — which is the reason the cap and
-// the caller's refresh interval both exist.
-func (db *DB) CountTriagePopular(ctx context.Context, analyzedAfter time.Time, f TriageFilter) (int64, error) {
-	return db.countTriageArgs(ctx, "popular", triagePopularWhere, []any{analyzedAfter}, f)
-}
-
-// TriageScoreDivider splits the ensemble's opinion in half: at or above it the
-// model calls a sample malicious, below it benign. It is what turns the
-// score-ranked queues into a countable population, because their backlog is not
-// "rows matching a predicate" but "rows the model and the label disagree
-// about" — good samples scored hostile (highest) and bad samples scored clean
-// (lowest).
-//
-// 0.5 is the neutral reading of a probability and nothing more. The queues
-// themselves do NOT use it — they are rank-ordered and take each route's top-K
-// wherever it falls — so moving this changes the reported backlog and no
-// selection. That independence is the point: a depth that moved the work would
-// be a worse instrument than no depth.
-const TriageScoreDivider = 0.5
-
-// CountTriageHighest reports how many good-labeled samples the model scores at
-// or above divider — benign artifacts our own ensemble calls malicious, which
-// is the population good:fp-peak grinds down. Not the selector's output: that
-// is each route's top ten, whatever their scores.
-func (db *DB) CountTriageHighest(ctx context.Context, divider float64, createdBefore, missingBefore time.Time, f TriageFilter) (int64, error) {
-	return db.countScored(ctx, "highest", "label IN ('good', 'unknown')", ">=", divider, createdBefore, missingBefore, f)
-}
-
-// CountTriageLowest is the mirror: bad-labeled samples scored BELOW divider —
-// known malware our ensemble calls clean, the population bad:ml-blind works.
-func (db *DB) CountTriageLowest(ctx context.Context, divider float64, createdBefore, missingBefore time.Time, f TriageFilter) (int64, error) {
-	return db.countScored(ctx, "lowest", "label = 'bad'", "<", divider, createdBefore, missingBefore, f)
-}
-
-// countScored counts one side of the model/label disagreement, excluding rows
-// already drained by a judgement report. cmp is ">=" or "<" and labelPred is a
-// literal predicate from the two callers below — neither is caller-controlled.
-//
-// labelPred rather than a bare label because the two sides are no longer
-// symmetric: lowest counts one pool ('bad'), highest counts the whole unconvicted
-// pool, since an unknown-labelled file pins a route's threshold just as a
-// good-labelled one does.
-func (db *DB) countScored(ctx context.Context, queue, labelPred, cmp string, divider float64,
-	createdBefore, missingBefore time.Time, f TriageFilter,
-) (int64, error) {
-	where := labelPred + ` AND cleave_result IS NOT NULL AND skip = ''` +
-		triageServablePathSQL + `
-		   AND litmus_score IS NOT NULL AND litmus_score ` + cmp + ` %s
-		   AND (parent = '' OR path LIKE '%%!!%%')
-		   AND created_at < %s
-		   AND NOT EXISTS (SELECT 1 FROM reports r
-		                   WHERE r.sha256 = CASE WHEN samples.parent = '' THEN samples.sha256 ELSE samples.parent END
-		                     AND (r.report_type = '` + queue + `'
-		                          OR (r.report_type = '` + ReportTypeMissing + `' AND r.created_at > %s)))`
-	return db.countTriageArgs(ctx, queue, where, []any{divider, createdBefore, missingBefore}, f)
-}
-
-// CountTriageStranded reports how many archive MEMBERS are still awaiting a
-// verdict. Unlike highest/lowest this needs no divider: the queue's predicate is
-// already a plain count, it is only the SELECTOR that collapses members to their
-// parent archives. Members are what the work is measured in — one archive can
-// hold dozens — so this is the more useful of the two numbers anyway.
-func (db *DB) CountTriageStranded(ctx context.Context, createdBefore, missingBefore time.Time, f TriageFilter) (int64, error) {
-	where := `label = 'good' AND cleave_result IS NOT NULL AND skip = ''
-		   AND parent != '' AND path LIKE '%%!!%%'
-		   AND score > 0 AND max_crit >= ` + strconv.Itoa(strandedMemberCrit) + `
-		   AND label_source NOT LIKE 'cyclotron:%%'
-		   AND created_at < %s
-		   AND EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = samples.parent AND p.label = 'bad')
-		   AND NOT EXISTS (SELECT 1 FROM reports r
-		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'stranded')
-		   AND NOT EXISTS (SELECT 1 FROM reports r
-		                   WHERE r.sha256 = samples.parent
-		                     AND r.report_type = '` + ReportTypeMissing + `' AND r.created_at > %s)`
-	return db.countTriageArgs(ctx, "stranded", where, []any{createdBefore, missingBefore}, f)
-}
-
-// countTriageArgs runs a capped count whose predicate carries its own bound
-// parameters. where holds a %s per parameter, filled with the dialect's
-// placeholder so one predicate string serves both.
-func (db *DB) countTriageArgs(ctx context.Context, name, where string, pre []any, f TriageFilter) (int64, error) {
-	return db.countTriageArgs2(ctx, name, where, where, pre, f)
-}
-
-// countTriageArgs2 is countTriageArgs for a predicate that differs per dialect
-// -- discord's, whose litmus_class expression is Postgres-only. Both spellings
-// must carry the same placeholders in the same order, since one pre slice feeds
-// either.
-func (db *DB) countTriageArgs2(ctx context.Context, name, wherePG, whereLite string, pre []any, f TriageFilter) (int64, error) {
-	var n int64
-	if db.pool != nil {
-		ph := make([]any, len(pre))
-		for i := range pre {
-			ph[i] = "$" + strconv.Itoa(i+1)
-		}
-		extra, fargs := triageFilterClausePG(f, len(pre)+1, "samples")
-		args := append(append([]any{}, pre...), fargs...)
-		args = append(args, TriageDepthCap)
-		q := `SELECT count(*) FROM (SELECT 1 FROM samples WHERE ` +
-			fmt.Sprintf(wherePG, ph...) + extra + ` LIMIT $` + strconv.Itoa(len(args)) + `) q`
-		if err := db.pool.QueryRow(ctx, q, args...).Scan(&n); err != nil {
-			return 0, fmt.Errorf("hopper: count triage %s: %w", name, err)
-		}
-		return n, nil
-	}
-	ph := make([]any, len(pre))
-	for i := range pre {
-		ph[i] = "?"
-	}
-	extra, fargs := triageFilterClauseSQLite(f, "samples")
-	// SQLite stores timestamps as RFC3339Nano text, so a bound time.Time
-	// compares as a different type and silently matches nothing — the selectors
-	// spell this out at each call site (createdBefore.UTC().Format(...)); this
-	// helper takes any predicate's parameters, so it converts here instead.
-	args := make([]any, 0, len(pre)+len(fargs)+1)
-	for _, v := range pre {
-		if t, ok := v.(time.Time); ok {
-			v = t.UTC().Format(time.RFC3339Nano)
-		}
-		args = append(args, v)
-	}
-	args = append(args, fargs...)
-	args = append(args, TriageDepthCap)
-
-	q := `SELECT count(*) FROM (SELECT 1 FROM samples WHERE ` +
-		fmt.Sprintf(whereLite, ph...) + extra + ` LIMIT ?) q`
-	if err := db.lite.QueryRowContext(ctx, q, args...).Scan(&n); err != nil {
-		return 0, fmt.Errorf("hopper: count triage %s: %w", name, err)
-	}
-	return n, nil
-}
-
-// countTriage runs one capped count. The LIMIT lives inside a subquery rather
-// than beside the count so it bounds the ROWS EXAMINED; a LIMIT on the outer
-// aggregate would bound nothing, since count(*) always returns one row.
-func (db *DB) countTriage(ctx context.Context, name, wherePG, whereLite string, f TriageFilter) (int64, error) {
-	var n int64
-	if db.pool != nil {
-		extra, args := triageFilterClausePG(f, 1, "samples")
-		args = append(args, TriageDepthCap)
-		q := `SELECT count(*) FROM (SELECT 1 FROM samples WHERE ` + wherePG + extra +
-			` LIMIT $` + strconv.Itoa(len(args)) + `) q`
-		if err := db.pool.QueryRow(ctx, q, args...).Scan(&n); err != nil {
-			return 0, fmt.Errorf("hopper: count triage %s: %w", name, err)
-		}
-		return n, nil
-	}
-	extra, args := triageFilterClauseSQLite(f, "samples")
-	args = append(args, TriageDepthCap)
-
-	q := `SELECT count(*) FROM (SELECT 1 FROM samples WHERE ` + whereLite + extra + ` LIMIT ?) q`
-	if err := db.lite.QueryRowContext(ctx, q, args...).Scan(&n); err != nil {
-		return 0, fmt.Errorf("hopper: count triage %s: %w", name, err)
-	}
-	return n, nil
-}

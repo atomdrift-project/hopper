@@ -182,9 +182,9 @@ func TestTriageSightedUsesLedgerScope(t *testing.T) {
 	if shaSet(after)[exact] {
 		t.Error("completed sighted report did not drain an upheld non-bad label")
 	}
-	depth, err := db.CountTriageSighted(ctx, TriageFilter{})
+	depth, _, err := TriageQueues["sighted"].Count(ctx, db)
 	if err != nil || depth != int64(len(after)) {
-		t.Errorf("CountTriageSighted = %d, %v; selection has %d", depth, err, len(after))
+		t.Errorf("sighted depth = %d, %v; selection has %d", depth, err, len(after))
 	}
 }
 
@@ -373,7 +373,7 @@ func TestTriageHighestCollapsesToParent(t *testing.T) {
 
 	before := time.Now().Add(time.Hour)
 	missing := time.Now().Add(-MissingRetry)
-	got, err := db.TriageHighest(ctx, 20, before, missing, time.Time{}, TriageFilter{})
+	got, err := db.TriageHighest(ctx, 20, triagePerRouteK, before, missing, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageHighest: %v", err)
 	}
@@ -404,7 +404,7 @@ func TestTriageHighestCollapsesToParent(t *testing.T) {
 	if err := db.InsertReport(ctx, &Report{SHA256: pGood, Type: "highest", Content: "done"}); err != nil {
 		t.Fatalf("InsertReport highest: %v", err)
 	}
-	got2, err := db.TriageHighest(ctx, 20, before, missing, time.Time{}, TriageFilter{})
+	got2, err := db.TriageHighest(ctx, 20, triagePerRouteK, before, missing, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageHighest: %v", err)
 	}
@@ -416,7 +416,7 @@ func TestTriageHighestCollapsesToParent(t *testing.T) {
 	if err := db.InsertReport(ctx, &Report{SHA256: pUnk, Type: ReportTypeMissing, Content: "gone"}); err != nil {
 		t.Fatalf("InsertReport missing: %v", err)
 	}
-	got3, err := db.TriageHighest(ctx, 20, before, missing, time.Time{}, TriageFilter{})
+	got3, err := db.TriageHighest(ctx, 20, triagePerRouteK, before, missing, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageHighest: %v", err)
 	}
@@ -424,7 +424,7 @@ func TestTriageHighestCollapsesToParent(t *testing.T) {
 		t.Errorf("root pUnk with fresh missing marker still returned")
 	}
 	// missingBefore in the future => even a just-written marker counts as expired.
-	got4, err := db.TriageHighest(ctx, 20, before, time.Now().Add(time.Hour), time.Time{}, TriageFilter{})
+	got4, err := db.TriageHighest(ctx, 20, triagePerRouteK, before, time.Now().Add(time.Hour), time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageHighest: %v", err)
 	}
@@ -470,7 +470,7 @@ func TestTriageLowestPerMember(t *testing.T) {
 
 	before := time.Now().Add(time.Hour)
 	missing := time.Now().Add(-MissingRetry)
-	got, err := db.TriageLowest(ctx, 20, before, missing, time.Time{}, TriageFilter{})
+	got, err := db.TriageLowest(ctx, 20, triagePerRouteK, before, missing, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageLowest: %v", err)
 	}
@@ -490,7 +490,7 @@ func TestTriageLowestPerMember(t *testing.T) {
 	if err := db.InsertReport(ctx, &Report{SHA256: lm1, Type: "lowest", Content: "done"}); err != nil {
 		t.Fatalf("InsertReport lowest: %v", err)
 	}
-	got2, err := db.TriageLowest(ctx, 20, before, missing, time.Time{}, TriageFilter{})
+	got2, err := db.TriageLowest(ctx, 20, triagePerRouteK, before, missing, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageLowest: %v", err)
 	}
@@ -737,7 +737,7 @@ func TestTriageHighestPerRouteReach(t *testing.T) {
 
 	before := time.Now().Add(time.Hour)
 	missing := time.Now().Add(-MissingRetry)
-	got, err := db.TriageHighest(ctx, 4, before, missing, time.Time{}, TriageFilter{})
+	got, err := db.TriageHighest(ctx, 4, triagePerRouteK, before, missing, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageHighest: %v", err)
 	}
@@ -772,7 +772,7 @@ func TestTriageHighestAttemptBudgetUsesRoot(t *testing.T) {
 	filter := TriageFilter{AttemptReportType: "cyclotron-attempt:highest", MaxAttempts: 1}
 	selectRoot := func() bool {
 		t.Helper()
-		got, err := db.TriageHighest(ctx, 10, time.Now().Add(time.Hour), time.Now().Add(-MissingRetry), time.Time{}, filter)
+		got, err := db.TriageHighest(ctx, 10, triagePerRouteK, time.Now().Add(time.Hour), time.Now().Add(-MissingRetry), time.Time{}, filter)
 		if err != nil {
 			t.Fatalf("TriageHighest: %v", err)
 		}

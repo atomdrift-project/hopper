@@ -221,6 +221,84 @@ const triagePerRouteK = 10
 // three-day freshness floor the queue holds 777.
 const HighestScoreFloor = 0.999
 
+// The two score-ranked queues' membership predicates, in one place each.
+//
+// These exist because highest and lowest are the queues with the most places
+// that need to agree about what is in them: a per-route walk that selects from
+// the population, a route enumeration that decides which walks to run, a
+// SQLite mirror of both, and a depth that has to describe the same set. Every
+// one of those was a separate hand-written spelling, and they had drifted --
+// the route enumeration and the walk it fed disagreed about `path <> ”`, so
+// the enumeration handed the walk routes it could only ever find empty.
+//
+// a is the table alias INCLUDING its trailing dot ("s0." on Postgres, "" where
+// the SQLite mirror selects from an unaliased samples). created, fresh and
+// missing are the dialect's placeholder spellings for the three time bounds,
+// numbered by the caller. Nothing here is caller-controlled: every argument is
+// a literal chosen at a call site in this package.
+//
+// The route predicates below are deliberately the membership predicate minus
+// the per-row anti-joins -- a strict superset, so enumeration can never miss a
+// route the walk would have served, and the parts it drops are the ones that
+// cost a probe per row.
+func triageHighestWhere(a, created, fresh, missing string) string {
+	return triageHighestRouteWhere(a, fresh) + `
+		   AND ` + a + `created_at < ` + created + `
+		   AND NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = CASE WHEN ` + a + `parent = '' THEN ` + a + `sha256 ELSE ` + a + `parent END
+		                     AND (r.report_type = 'highest'
+		                          OR (r.report_type = '` + ReportTypeMissing + `' AND r.created_at > ` + missing + `)))`
+}
+
+// triageHighestRouteWhere is what makes a file_type worth walking at all: the
+// pool, a score in the pinning band, and a fresh enough analysis. The freshness
+// floor belongs here rather than only in the walk -- without it the enumeration
+// yields every route that has ever scored, and a route whose rows are all stale
+// costs a full scan of its score band to prove it has nothing.
+func triageHighestRouteWhere(a, fresh string) string {
+	return a + `label IN ('good', 'unknown') AND ` + a + `cleave_result IS NOT NULL AND ` + a + `skip = ''` +
+		` AND ` + a + `path <> ''
+		   AND ` + a + `litmus_score IS NOT NULL
+		   AND ` + a + `litmus_score >= ` + strconv.FormatFloat(HighestScoreFloor, 'f', -1, 64) + `
+		   AND ` + a + `analyzed_at > ` + fresh + `
+		   AND (` + a + `parent = '' OR ` + a + `path LIKE '%!!%')`
+}
+
+// triageLowestWhere is the mirror. It differs from highest in more than the
+// comparison direction: the drain keys on the member's own sha (a bad archive's
+// malice lives in a few files, so one ruling must not speak for the rest),
+// and conflicted rows are excluded because pool reconciliation owns their label.
+//
+// It also keeps the member->parent existence probe that highest can do without.
+// highest joins its collapsed root back to samples, so an orphan member drops
+// out there for free; lowest returns the member itself and never touches the
+// parent row, so without this probe it would hand out members the API cannot
+// extract (a permanent 422, "parent not found") until something else drained
+// them.
+func triageLowestWhere(a, created, fresh, missing string) string {
+	return triageLowestRouteWhere(a, fresh) + `
+		   AND ` + a + `created_at < ` + created + `
+		   AND (` + a + `parent = '' OR EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = ` + a + `parent))
+		   AND NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = ` + a + `sha256 AND r.report_type = 'lowest')
+		   AND NOT EXISTS (SELECT 1 FROM reports r
+		                   WHERE r.sha256 = CASE WHEN ` + a + `parent = '' THEN ` + a + `sha256 ELSE ` + a + `parent END
+		                     AND r.report_type = '` + ReportTypeMissing + `' AND r.created_at > ` + missing + `)`
+}
+
+// triageLowestRouteWhere: see triageHighestRouteWhere. No score floor -- this
+// queue's band is the BOTTOM of the range and its ceiling is the per-route K
+// itself, so a floor here would have to be a ceiling and there is no measured
+// value for one. The freshness floor still bounds the walk.
+func triageLowestRouteWhere(a, fresh string) string {
+	return a + `label = 'bad' AND ` + a + `cleave_result IS NOT NULL AND ` + a + `skip = ''` +
+		` AND ` + a + `path <> ''
+		   AND ` + a + `litmus_score IS NOT NULL
+		   AND ` + a + `label_source != 'conflict'
+		   AND ` + a + `analyzed_at > ` + fresh + `
+		   AND (` + a + `parent = '' OR ` + a + `path LIKE '%!!%')`
+}
+
 // notableCrit is the cleave criticality floor for the stranded queue's
 // member gate — 3 = "notable" in the shared severity ladder (mirrors
 // collimator's traits.py CRIT_LEVELS; info=1..hostile=5). Members below it
@@ -4451,11 +4529,14 @@ func (db *DB) TriageGood(ctx context.Context, limit int, f TriageFilter) ([]*Sam
 // suppressed: on an incomplete mirror ~70% of the top of this queue by score
 // has no bytes on disk, and without an expiring marker those rows would never
 // drain and would eventually fill the selection window.
-func (db *DB) TriageHighest(ctx context.Context, limit int, createdBefore, missingBefore, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
+// perRouteK bounds each route's candidate window; pass triagePerRouteK to
+// select a batch, or the depth cap to count the whole population (see
+// Queue.Count -- the count is this same selection with its bounds lifted).
+func (db *DB) TriageHighest(ctx context.Context, limit, perRouteK int, createdBefore, missingBefore, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.triageHighestPG(ctx, limit, createdBefore, missingBefore, analyzedAfter, f)
+		return db.triageHighestPG(ctx, limit, perRouteK, createdBefore, missingBefore, analyzedAfter, f)
 	}
-	return db.triageHighestSQLite(ctx, limit, createdBefore, missingBefore, analyzedAfter, f)
+	return db.triageHighestSQLite(ctx, limit, perRouteK, createdBefore, missingBefore, analyzedAfter, f)
 }
 
 // TriageLowest is TriageHighest's mirror: each file_type's bottom-K
@@ -4478,11 +4559,12 @@ func (db *DB) TriageHighest(ctx context.Context, limit int, createdBefore, missi
 // The ReportTypeMissing marker is keyed on the root even though the queue's own
 // drain is per-member: a verdict applies to one file, but vanished bytes are the
 // parent archive's and take every member with them.
-func (db *DB) TriageLowest(ctx context.Context, limit int, createdBefore, missingBefore, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
+// perRouteK: see TriageHighest.
+func (db *DB) TriageLowest(ctx context.Context, limit, perRouteK int, createdBefore, missingBefore, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.triageLowestPG(ctx, limit, createdBefore, missingBefore, analyzedAfter, f)
+		return db.triageLowestPG(ctx, limit, perRouteK, createdBefore, missingBefore, analyzedAfter, f)
 	}
-	return db.triageLowestSQLite(ctx, limit, createdBefore, missingBefore, analyzedAfter, f)
+	return db.triageLowestSQLite(ctx, limit, perRouteK, createdBefore, missingBefore, analyzedAfter, f)
 }
 
 // TriageStranded returns bad-labeled parent archives that still contain

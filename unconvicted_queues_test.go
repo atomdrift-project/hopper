@@ -245,7 +245,7 @@ func TestTriageHighestReachesUnknownMembers(t *testing.T) {
 
 	before := time.Now().Add(time.Hour)
 	missing := time.Now().Add(-MissingRetry)
-	got, err := db.TriageHighest(ctx, 20, before, missing, time.Time{}, TriageFilter{})
+	got, err := db.TriageHighest(ctx, 20, triagePerRouteK, before, missing, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageHighest: %v", err)
 	}

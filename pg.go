@@ -549,12 +549,13 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// spelling gymnastics are needed for planner matching. The older
 		// class-gated idx_samples_{good_hostile,bad_clean}_score indexes
 		// stay for any remaining class-band consumers.
+		//
+		// The pair these two were is now the *_route_fresh pair below, which
+		// carries analyzed_at as a third key; only the good-only spelling
+		// survives here, for consumers still on the narrow label predicate.
 		`CREATE INDEX IF NOT EXISTS idx_samples_good_route_score ` +
 			`ON samples(file_type, litmus_score DESC) ` +
 			`WHERE label = 'good' AND litmus_score IS NOT NULL AND cleave_result IS NOT NULL AND skip = ''`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_bad_route_score ` +
-			`ON samples(file_type, litmus_score ASC) ` +
-			`WHERE label = 'bad' AND litmus_score IS NOT NULL AND cleave_result IS NOT NULL AND skip = ''`,
 		// TriageStranded's member walk: good members with real findings,
 		// risk-score descending; parent's bad label is probed per row via
 		// the sha256 unique index (cross-row predicates can't live in a
@@ -692,10 +693,46 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// LATERAL matches. Without it the widened query stops matching
 		// idx_samples_good_route_score and degrades to the full scan that
 		// per-route top-K exists to avoid.
-		`CREATE INDEX IF NOT EXISTS idx_samples_unconvicted_route_score ` +
-			`ON samples(file_type, litmus_score DESC) ` +
+		// The same walk once it also carries a freshness floor (2026-09-02).
+		// analyzed_at is a trailing KEY, not a new leading one: the walk is still
+		// ordered by (file_type, litmus_score DESC) and still stops at the
+		// per-route K, so the ordering must not move. What the extra column buys
+		// is that `analyzed_at > $fresh` is decided FROM THE INDEX, before the
+		// heap fetch and before the reports anti-join -- which is the difference
+		// between rejecting a stale row for free and paying a page read plus a
+		// probe to reject it.
+		//
+		// Without this the queue does not merely get slower, it stops: the floor
+		// is the only predicate the walk cannot resolve early, so as the window
+		// slides past the analyzed bulk each route walks further to find its K,
+		// a route with nothing fresh walks its whole band to prove it, and the
+		// selection crosses the API's 30s budget and 500s on every poll. That is
+		// exactly how good:fp-peak went down at 05:31 on 2026-09-02, 7.5 hours
+		// after the floor shipped without this index.
+		//
+		// The floor is deliberately NOT in the partial predicate. It is immutable
+		// enough for one (a literal), but CREATE INDEX IF NOT EXISTS will not
+		// rebuild an index whose name already exists, so retuning
+		// HighestScoreFloor would silently leave a predicate that no longer
+		// matches the query. As a range bound on the second key it costs nothing
+		// anyway -- the ordered walk stops at the floor on its own.
+		`CREATE INDEX IF NOT EXISTS idx_samples_unconvicted_route_fresh ` +
+			`ON samples(file_type, litmus_score DESC, analyzed_at) ` +
 			`WHERE label IN ('good', 'unknown') AND litmus_score IS NOT NULL ` +
 			`AND cleave_result IS NOT NULL AND skip = ''`,
+		// TriageLowest's mirror. Same freshness floor, same reasoning; it has not
+		// fallen over only because LowestFreshness is 30 days against highest's 3,
+		// so ten times as many rows pass and the walk still reaches its K early.
+		// Same cliff, further from the edge.
+		`CREATE INDEX IF NOT EXISTS idx_samples_bad_route_fresh ` +
+			`ON samples(file_type, litmus_score ASC, analyzed_at) ` +
+			`WHERE label = 'bad' AND litmus_score IS NOT NULL ` +
+			`AND cleave_result IS NOT NULL AND skip = ''`,
+		// Superseded by the two above, which carry the same leading keys and the
+		// same predicate. Dropped rather than left: every one of them is
+		// maintained on every write to a matching row, and the corpus is ~100M.
+		`DROP INDEX IF EXISTS idx_samples_unconvicted_route_score`,
+		`DROP INDEX IF EXISTS idx_samples_bad_route_score`,
 		// The retired queues' orderings. good/good-stale/new/new-stale were
 		// replaced by the unconvicted pair, whose union is their union exactly.
 		// Dropped rather than left orphaned: each is maintained on every write to
@@ -5108,28 +5145,15 @@ func (db *DB) triageSecondOpinionPG(ctx context.Context, limit int, trusted []st
 	return scanPGSamplesLight(rows)
 }
 
-// Predicate fragments for the recursive skip-scan that enumerates distinct
-// file_types (Postgres has no loose index scan; DISTINCT over the ~11M-row
-// partial index costs ~100s, the recursive probe ~80 index descents / ~ms).
-// Must stay byte-compatible with idx_samples_{good,bad}_route_score's WHERE.
-const (
-	// The unconvicted pool, not just the good one (2026-08-30). An unknown-labelled
-	// file sitting at the top of its route's score distribution pins that route's
-	// threshold exactly as a good-labelled one does — the threshold is placed over
-	// the slice's highest-scoring NON-BAD files, and an unknown label is not a
-	// conviction. Before this, the inner walk required label='good', so those files
-	// were invisible to every confidence-ranked queue we have.
-	//
-	// Matches idx_samples_unconvicted_route_score. The narrower
-	// idx_samples_good_route_score no longer covers this predicate; keeping the
-	// query and the index in step is the whole reason that index was added.
-	triageUnconvictedScoredWherePG = `label IN ('good', 'unknown') AND litmus_score IS NOT NULL ` +
-		`AND cleave_result IS NOT NULL AND skip = '' AND path <> ''`
-	triageUnconvictedScoredWherePGAliased = `s.label IN ('good', 'unknown') AND s.litmus_score IS NOT NULL AND s.cleave_result IS NOT NULL ` +
-		`AND s.skip = '' AND s.path <> ''`
-	triageBadScoredWherePG        = `label = 'bad' AND litmus_score IS NOT NULL AND cleave_result IS NOT NULL AND skip = '' AND path <> ''`
-	triageBadScoredWherePGAliased = `s.label = 'bad' AND s.litmus_score IS NOT NULL AND s.cleave_result IS NOT NULL AND s.skip = '' AND s.path <> ''`
-)
+// The recursive skip-scan below enumerates distinct file_types because Postgres
+// has no loose index scan: DISTINCT over the ~11M-row partial index costs ~100s,
+// the recursive probe ~80 index descents / ~ms.
+//
+// Its predicate is triageHighestRouteWhere / triageLowestRouteWhere, the same
+// functions the per-route walk's own predicate is built from -- these used to be
+// four separate constants here, and the enumeration and the walk they fed had
+// drifted apart on `path <> ''`, so the enumeration handed the walk routes it
+// could only ever find empty.
 
 // triageHighestPG: see TriageHighest. Returns one row per archive (the root
 // sample), not per hot member: the worker fetches and judges the whole archive,
@@ -5149,7 +5173,7 @@ const (
 // score-1.0 tie band that archives own) can monopolize a batch.
 // The empty file_type is its own partition — rows there are rare (analyzed
 // rows carry a type) and excluding them would hide real pinners.
-func (db *DB) triageHighestPG(ctx context.Context, limit int,
+func (db *DB) triageHighestPG(ctx context.Context, limit, perRouteK int,
 	createdBefore, missingBefore, analyzedAfter time.Time, f TriageFilter,
 ) ([]*Sample, error) {
 	extra, fargs := triageFilterClausePGKey(f, 3, "s0",
@@ -5157,16 +5181,16 @@ func (db *DB) triageHighestPG(ctx context.Context, limit int,
 	args := append([]any{createdBefore, missingBefore}, fargs...)
 	// Appended after the filter clause so its own $3.. numbering is untouched.
 	args = append(args, analyzedAfter)
-	freshIdx := strconv.Itoa(len(args))
+	fresh := "$" + strconv.Itoa(len(args))
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
 		`WITH RECURSIVE fts AS (
 		   (SELECT file_type FROM samples
-		     WHERE `+triageUnconvictedScoredWherePG+`
+		     WHERE `+triageHighestRouteWhere("", fresh)+`
 		     ORDER BY file_type LIMIT 1)
 		   UNION ALL
 		   SELECT (SELECT s.file_type FROM samples s
-		           WHERE `+triageUnconvictedScoredWherePGAliased+` AND s.file_type > fts.file_type
+		           WHERE `+triageHighestRouteWhere("s.", fresh)+` AND s.file_type > fts.file_type
 		           ORDER BY s.file_type LIMIT 1)
 		   FROM fts WHERE fts.file_type IS NOT NULL
 		 )
@@ -5179,19 +5203,10 @@ func (db *DB) triageHighestPG(ctx context.Context, limit int,
 		              s0.litmus_score AS best,
 		              ROW_NUMBER() OVER (ORDER BY s0.litmus_score DESC) AS rank
 		       FROM samples s0
-		       WHERE s0.label IN ('good', 'unknown') AND s0.cleave_result IS NOT NULL AND s0.skip = ''
-		         AND s0.litmus_score IS NOT NULL
-		         AND s0.file_type = f.file_type
-		         AND (s0.parent = '' OR s0.path LIKE '%!!%')
-		         AND s0.created_at < $1
-		         AND s0.litmus_score >= `+strconv.FormatFloat(HighestScoreFloor, 'f', -1, 64)+`
-		         AND s0.analyzed_at > $`+freshIdx+`
-		         AND NOT EXISTS (SELECT 1 FROM reports r
-		                         WHERE r.sha256 = CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END
-		                           AND (r.report_type = 'highest'
-		                                OR (r.report_type = '`+ReportTypeMissing+`' AND r.created_at > $2)))`+extra+`
+		       WHERE `+triageHighestWhere("s0.", "$1", fresh, "$2")+`
+		         AND s0.file_type = f.file_type`+extra+`
 		       ORDER BY s0.litmus_score DESC
-		       LIMIT `+strconv.Itoa(triagePerRouteK)+`
+		       LIMIT `+strconv.Itoa(perRouteK)+`
 		     ) k
 		   ) hot ORDER BY root, best DESC, rank ASC
 		 ) roots
@@ -5210,24 +5225,24 @@ func (db *DB) triageHighestPG(ctx context.Context, limit int,
 // inert content that inherited the label, so each member needs its own verdict
 // and its own report row. Keying this drain on the parent would let one ruling
 // speak for files it never examined.
-func (db *DB) triageLowestPG(ctx context.Context, limit int,
+func (db *DB) triageLowestPG(ctx context.Context, limit, perRouteK int,
 	createdBefore, missingBefore, analyzedAfter time.Time, f TriageFilter,
 ) ([]*Sample, error) {
 	extra, fargs := triageFilterClausePG(f, 3, "s0")
 	args := append([]any{createdBefore, missingBefore}, fargs...)
 	// Appended after the filter clause so its own $3.. numbering is untouched.
 	args = append(args, analyzedAfter)
-	freshIdx := strconv.Itoa(len(args))
+	fresh := "$" + strconv.Itoa(len(args))
 	args = append(args, limit)
 	//nolint:unqueryvet // k.*/s0.* feed the LATERAL join and window function; the outer select names its columns via pgSampleColsLight.
 	rows, err := db.pool.Query(ctx,
 		`WITH RECURSIVE fts AS (
 		   (SELECT file_type FROM samples
-		     WHERE `+triageBadScoredWherePG+`
+		     WHERE `+triageLowestRouteWhere("", fresh)+`
 		     ORDER BY file_type LIMIT 1)
 		   UNION ALL
 		   SELECT (SELECT s.file_type FROM samples s
-		           WHERE `+triageBadScoredWherePGAliased+` AND s.file_type > fts.file_type
+		           WHERE `+triageLowestRouteWhere("s.", fresh)+` AND s.file_type > fts.file_type
 		           ORDER BY s.file_type LIMIT 1)
 		   FROM fts WHERE fts.file_type IS NOT NULL
 		 )
@@ -5237,21 +5252,10 @@ func (db *DB) triageLowestPG(ctx context.Context, limit int,
 		   CROSS JOIN LATERAL (
 		     SELECT s0.*, ROW_NUMBER() OVER (ORDER BY s0.litmus_score ASC) AS rank
 		     FROM samples s0
-		     WHERE s0.label = 'bad' AND s0.cleave_result IS NOT NULL AND s0.skip = ''
-		       AND s0.litmus_score IS NOT NULL
-		       AND s0.file_type = f.file_type
-		       AND s0.label_source != 'conflict'
-		       AND s0.analyzed_at > $`+freshIdx+`
-		       AND (s0.parent = '' OR s0.path LIKE '%!!%')
-		       AND (s0.parent = '' OR EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = s0.parent))
-		       AND s0.created_at < $1
-		       AND NOT EXISTS (SELECT 1 FROM reports r
-		                       WHERE r.sha256 = s0.sha256 AND r.report_type = 'lowest')
-		       AND NOT EXISTS (SELECT 1 FROM reports r
-		                       WHERE r.sha256 = CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END
-		                         AND r.report_type = '`+ReportTypeMissing+`' AND r.created_at > $2)`+extra+`
+		     WHERE `+triageLowestWhere("s0.", "$1", fresh, "$2")+`
+		       AND s0.file_type = f.file_type`+extra+`
 		     ORDER BY s0.litmus_score ASC
-		     LIMIT `+strconv.Itoa(triagePerRouteK)+`
+		     LIMIT `+strconv.Itoa(perRouteK)+`
 		   ) k
 		 ) samples
 		 ORDER BY rank ASC, litmus_score ASC NULLS LAST, id DESC LIMIT $`+strconv.Itoa(len(args)),

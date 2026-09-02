@@ -469,31 +469,60 @@ func TestPlanAuditFPTraitWindow(t *testing.T) {
 	t.Logf("fp-trait window: ok\n%s", firstPlanLines(plan))
 }
 
-// TestPlanAuditHighestRouteWalk guards the 2026-08-30 widening of TriageHighest
-// to the unconvicted pool. The narrower idx_samples_good_route_score is a
-// label='good' partial and stops covering the widened predicate, so the
-// companion index is the only thing standing between the per-route LATERAL and
-// a full scan of every scored sample.
+// TestPlanAuditHighestRouteWalk guards the per-route walk TriageHighest is built
+// on: one route's score tail, walked in order, stopping at the per-route K.
+//
+// The predicate comes from triageHighestWhere -- the same function the selector
+// builds its LATERAL body from -- and that is the whole point of the test now.
+// It used to EXPLAIN a hand-written approximation, and on 2026-09-01 the
+// selector gained an `analyzed_at >` floor the approximation did not have. The
+// index could not resolve that floor, the walk degraded to scanning each
+// route's whole band to find K fresh rows, and 7.5 hours later the queue was
+// answering 500 on every poll against the API's 30s budget. This test passed
+// throughout, because it was still explaining the old query.
+//
+// A predicate a test writes for itself proves the index covers that predicate,
+// and nothing about the one the server issues.
 func TestPlanAuditHighestRouteWalk(t *testing.T) {
 	db := openPlanDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	sql := `EXPLAIN SELECT file_type, litmus_score FROM samples
-	         WHERE ` + triageUnconvictedScoredWherePG + ` AND file_type = 'elf'
-	         ORDER BY litmus_score DESC LIMIT ` + strconv.Itoa(triagePerRouteK)
-	plan := explainText(t, ctx, db, sql)
-	if planSeqScansSamples(plan) {
-		t.Errorf("highest route walk: Seq Scan on samples:\n%s", plan)
+	// $1 created_at, $2 missing-marker cutoff, $3 freshness floor -- the bounds
+	// the registry passes, spelled here as literals so EXPLAIN needs no args.
+	now := time.Now().UTC().Format(time.RFC3339)
+	fresh := time.Now().Add(-HighestFreshness).UTC().Format(time.RFC3339)
+	lit := func(s string) string { return `'` + s + `'::timestamptz` }
+
+	for _, tc := range []struct {
+		name, where string
+	}{
+		{"member walk", triageHighestWhere("s0.", lit(now), lit(fresh), lit(now)) +
+			` AND s0.file_type = 'elf'`},
+		// The route enumeration's skip-scan. It must be index-served for the
+		// same reason: it runs once per distinct file_type.
+		{"route enumeration", triageHighestRouteWhere("s0.", lit(fresh)) +
+			` AND s0.file_type = 'elf'`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sql := `EXPLAIN SELECT s0.file_type, s0.litmus_score FROM samples s0
+			         WHERE ` + tc.where + `
+			         ORDER BY s0.litmus_score DESC LIMIT ` + strconv.Itoa(triagePerRouteK)
+			plan := explainText(t, ctx, db, sql)
+			if planSeqScansSamples(plan) {
+				t.Errorf("Seq Scan on samples:\n%s", plan)
+			}
+			if !strings.Contains(plan, "idx_samples_unconvicted_route_fresh") {
+				t.Errorf("not using idx_samples_unconvicted_route_fresh — without analyzed_at "+
+					"in the index the freshness floor costs a heap fetch per row and the walk "+
+					"cannot stop early:\n%s", plan)
+			}
+			if strings.Contains(plan, "Sort") {
+				t.Errorf("sorts instead of walking the route's score tail:\n%s", plan)
+			}
+			t.Logf("ok\n%s", firstPlanLines(plan))
+		})
 	}
-	if !strings.Contains(plan, "idx_samples_unconvicted_route_score") {
-		t.Errorf("highest route walk: not using idx_samples_unconvicted_route_score "+
-			"(the widened LATERAL cannot use the good-only partial):\n%s", plan)
-	}
-	if strings.Contains(plan, "Sort") {
-		t.Errorf("highest route walk: sorts instead of walking the route's score tail:\n%s", plan)
-	}
-	t.Logf("highest route walk: ok\n%s", firstPlanLines(plan))
 }
 
 // TestPlanAuditNewSelectorsExecute runs each Postgres selector added with the
@@ -538,7 +567,7 @@ func TestPlanAuditNewSelectorsExecute(t *testing.T) {
 			return db.TriageVersionDrift(ctx, 1, now.Add(-VersionDriftWindow), TriageFilter{})
 		}},
 		{name: "highest (widened)", run: func() ([]*Sample, error) {
-			return db.TriageHighest(ctx, 1, now.Add(-OutlierGrace), now.Add(-MissingRetry), time.Time{}, TriageFilter{})
+			return db.TriageHighest(ctx, 1, triagePerRouteK, now.Add(-OutlierGrace), now.Add(-MissingRetry), time.Time{}, TriageFilter{})
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -548,26 +577,16 @@ func TestPlanAuditNewSelectorsExecute(t *testing.T) {
 		})
 	}
 
-	// The depth counts share the predicates but not the surrounding SQL, so a
-	// count can be broken while its selector works.
-	for _, tc := range []struct {
-		count func() (int64, error)
-		name  string
-	}{
-		{name: "unconvicted-hostile", count: func() (int64, error) {
-			return db.CountTriageUnconvictedHostile(ctx, time.Time{}, TriageFilter{})
-		}},
-		{name: "unconvicted-suspicious", count: func() (int64, error) {
-			return db.CountTriageUnconvictedSuspicious(ctx, time.Time{}, TriageFilter{})
-		}},
-		{name: "discord", count: func() (int64, error) { return db.CountTriageDiscord(ctx, time.Time{}, TriageFilter{}) }},
-		{name: "fp-trait", count: func() (int64, error) {
-			return db.CountTriageFPTrait(ctx, time.Now().Add(-FPTraitFreshness), TriageFilter{})
-		}},
-	} {
-		t.Run("count/"+tc.name, func(t *testing.T) {
-			if _, err := tc.count(); err != nil {
-				t.Errorf("count %s: %v", tc.name, err)
+	// Every queue's depth, against real Postgres. A depth is now the queue's own
+	// selection run to the cap, so this is not a second body of SQL being
+	// checked -- it is each selector executing with its bounds lifted, which is
+	// the shape no other test runs and the shape a depth always takes. The list
+	// is the registry rather than a copy of it, so a queue added without a
+	// working selection fails here rather than on the dashboard.
+	for _, name := range TriageQueueNames() {
+		t.Run("depth/"+name, func(t *testing.T) {
+			if _, _, err := TriageQueues[name].Count(ctx, db); err != nil {
+				t.Errorf("depth %s: %v", name, err)
 			}
 		})
 	}

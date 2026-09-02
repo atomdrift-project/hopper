@@ -3167,14 +3167,17 @@ func (db *DB) triageGoodSQLite(ctx context.Context, limit int, f TriageFilter) (
 // ROW_NUMBER() PARTITION BY file_type window over the eligible set (dev-scale
 // tables; no index gymnastics needed), and the collapse is GROUP BY root with
 // MAX(best)/MIN(rank) instead of DISTINCT ON.
-func (db *DB) triageHighestSQLite(ctx context.Context, limit int,
+func (db *DB) triageHighestSQLite(ctx context.Context, limit, perRouteK int,
 	createdBefore, missingBefore, analyzedAfter time.Time, f TriageFilter,
 ) ([]*Sample, error) {
 	extra, fargs := triageFilterClauseSQLiteKey(f, "s0",
 		"CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END")
+	// Bound in the order triageHighestWhere emits its placeholders: the route
+	// predicate carries the freshness floor, then created_at, then the missing
+	// marker's cutoff.
 	args := append([]any{
-		createdBefore.UTC().Format(time.RFC3339Nano),
 		analyzedAfter.UTC().Format(time.RFC3339Nano),
+		createdBefore.UTC().Format(time.RFC3339Nano),
 		missingBefore.UTC().Format(time.RFC3339Nano),
 	}, fargs...)
 	args = append(args, limit)
@@ -3182,22 +3185,12 @@ func (db *DB) triageHighestSQLite(ctx context.Context, limit int,
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleColsLight+` FROM (
 		   SELECT root, MAX(best) AS best, MIN(rank) AS rank FROM (
-		     SELECT CASE WHEN parent = '' THEN sha256 ELSE parent END AS root,
-		            litmus_score AS best,
-		            ROW_NUMBER() OVER (PARTITION BY file_type ORDER BY litmus_score DESC) AS rank
+		     SELECT CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END AS root,
+		            s0.litmus_score AS best,
+		            ROW_NUMBER() OVER (PARTITION BY s0.file_type ORDER BY s0.litmus_score DESC) AS rank
 		     FROM samples s0
-		     WHERE label IN ('good', 'unknown') AND cleave_result IS NOT NULL AND skip = ''
-		       AND litmus_score IS NOT NULL AND path <> ''
-		       AND (parent = '' OR path LIKE '%!!%')
-		       AND (parent = '' OR EXISTS (SELECT 1 FROM samples pp WHERE pp.sha256 = s0.parent))
-		       AND created_at < ?
-		       AND litmus_score >= `+strconv.FormatFloat(HighestScoreFloor, 'f', -1, 64)+`
-		       AND analyzed_at > ?
-		       AND NOT EXISTS (SELECT 1 FROM reports r
-		                       WHERE r.sha256 = CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END
-		                         AND (r.report_type = 'highest'
-		                              OR (r.report_type = '`+ReportTypeMissing+`' AND r.created_at > ?)))`+extra+`
-		   ) hot WHERE rank <= `+strconv.Itoa(triagePerRouteK)+`
+		     WHERE `+triageHighestWhere("s0.", "?", "?", "?")+extra+`
+		   ) hot WHERE rank <= `+strconv.Itoa(perRouteK)+`
 		   GROUP BY root
 		 ) roots
 		 JOIN samples ON samples.sha256 = roots.root AND samples.label IN ('good', 'unknown')
@@ -3212,7 +3205,7 @@ func (db *DB) triageHighestSQLite(ctx context.Context, limit int,
 // triageLowestSQLite: see TriageLowest. Mirrors triageLowestPG (per-route
 // bottom-K via a PARTITION BY file_type window), including the per-member
 // drain key (a bad archive's members each need their own verdict).
-func (db *DB) triageLowestSQLite(ctx context.Context, limit int,
+func (db *DB) triageLowestSQLite(ctx context.Context, limit, perRouteK int,
 	createdBefore, missingBefore, analyzedAfter time.Time, f TriageFilter,
 ) ([]*Sample, error) {
 	// Alias "samples", not "s0": the inner SELECT below is FROM samples with no
@@ -3235,20 +3228,9 @@ func (db *DB) triageLowestSQLite(ctx context.Context, limit int,
 		   SELECT samples.*,
 		          ROW_NUMBER() OVER (PARTITION BY file_type ORDER BY litmus_score ASC) AS rank
 		   FROM samples
-		   WHERE label = 'bad' AND cleave_result IS NOT NULL AND skip = ''
-		     AND litmus_score IS NOT NULL AND path <> ''
-		     AND label_source != 'conflict'
-		     AND analyzed_at > ?
-		     AND (parent = '' OR path LIKE '%!!%')
-		     AND (parent = '' OR EXISTS (SELECT 1 FROM samples p WHERE p.sha256 = samples.parent))
-		     AND created_at < ?
-		     AND NOT EXISTS (SELECT 1 FROM reports r
-		                     WHERE r.sha256 = samples.sha256 AND r.report_type = 'lowest')
-		     AND NOT EXISTS (SELECT 1 FROM reports r
-		                     WHERE r.sha256 = CASE WHEN samples.parent = '' THEN samples.sha256 ELSE samples.parent END
-		                       AND r.report_type = '`+ReportTypeMissing+`' AND r.created_at > ?)`+extra+`
+		   WHERE `+triageLowestWhere("samples.", "?", "?", "?")+extra+`
 		 ) samples
-		 WHERE rank <= `+strconv.Itoa(triagePerRouteK)+`
+		 WHERE rank <= `+strconv.Itoa(perRouteK)+`
 		 ORDER BY rank ASC, litmus_score ASC, id DESC LIMIT ?`,
 		args...)
 	if err != nil {

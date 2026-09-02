@@ -243,8 +243,12 @@ func TestTriageQueuesListsRegistry(t *testing.T) {
 			t.Errorf("listed unknown queue %q", q.Name)
 			continue
 		}
-		if want := reg.Depth != nil; q.Depth != want {
-			t.Errorf("queue %q: depth = %v, want %v", q.Name, q.Depth, want)
+		if reg.Select == nil {
+			t.Errorf("queue %q: registry entry has no Select", q.Name)
+		}
+		// Every registered queue can answer a depth: it is the selection counted.
+		if !q.Depth {
+			t.Errorf("queue %q: depth = false, want true", q.Name)
 		}
 		// Sorted, because a client's worker start order derives from this list
 		// and Go randomizes map iteration.
@@ -343,10 +347,11 @@ func TestTriageDepth(t *testing.T) {
 		t.Errorf("capped = true for a depth of %d", body.Depth)
 	}
 
-	// A queue with no countable population must say so rather than report zero,
-	// which a dashboard would render as "drained".
-	if rec := depth("acquit"); rec.Code != http.StatusNotFound {
-		t.Errorf("acquit depth: status = %d, want 404 (no depth count)", rec.Code)
+	// The queues that used to have no countable population now answer like any
+	// other: their depth is their own selection counted, so there is no
+	// "uncountable" case left to 404 on.
+	if rec := depth("acquit"); rec.Code != http.StatusOK {
+		t.Errorf("acquit depth: status = %d, want 200 — every queue answers a depth now", rec.Code)
 	}
 	if rec := depth("nosuchqueue"); rec.Code != http.StatusNotFound {
 		t.Errorf("unknown queue depth: status = %d, want 404", rec.Code)
