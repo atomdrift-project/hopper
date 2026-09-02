@@ -3829,6 +3829,9 @@ func cmdBackfillLitmusLevel(ctx context.Context) error {
 	dsn := f.String("db", "", "database connection string")
 	batch := f.Int("batch", 5000, "rows per committed batch")
 	hours := f.Float64("hours", 72, "target duration for the initial corpus")
+	reindex := f.Bool("reindex", true, "when the backfill finishes, rebuild the samples.lvl "+
+		"indexes to reclaim the bloat its updates leave behind (once per database)")
+	force := f.Bool("force-reindex", false, "rebuild the samples.lvl indexes even if this database has already done so")
 	parseFlags(f, os.Args[2:])
 	if *batch <= 0 {
 		return errors.New("-batch must be positive")
@@ -3854,6 +3857,21 @@ func cmdBackfillLitmusLevel(ctx context.Context) error {
 	slog.Info("litmus level backfill complete", "total", stats.Total,
 		"scanned", stats.Scanned, "updated", stats.Updated, "cursor", stats.Cursor,
 		"done", stats.Done)
+
+	// Only once the corpus is drained. Rebuilding a half-filled index just means
+	// the remaining half bloats it again, and this command is meant to be re-run
+	// after an interrupted pass -- so an unfinished run must leave the repair for
+	// the run that finishes.
+	switch {
+	case !*reindex:
+	case !stats.Done && !*force:
+		slog.Info("backfill incomplete; leaving the samples.lvl indexes to the run that finishes",
+			"cursor", stats.Cursor)
+	default:
+		if err := db.ReindexLitmusLevel(ctx, *force); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

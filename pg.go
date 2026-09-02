@@ -6990,6 +6990,7 @@ const (
 	litmusLevelBackfillProcessedKey = "backfill:litmus-level:processed"
 	litmusLevelBackfillStartedKey   = "backfill:litmus-level:started"
 	litmusLevelBackfillDoneKey      = "backfill:litmus-level:done"
+	litmusLevelReindexedKey         = "backfill:litmus-level:reindexed"
 )
 
 // BackfillLitmusLevel fills samples.lvl from the stored ML result in small,
@@ -7172,6 +7173,87 @@ func (db *DB) BackfillLitmusLevel(ctx context.Context, batchSize int, targetDura
 			}
 		}
 	}
+}
+
+// litmusLevelIndexes are the partial indexes over samples.lvl, which
+// [ReindexLitmusLevel] rebuilds once the backfill that fills that column has
+// drained.
+var litmusLevelIndexes = [...]string{"idx_samples_unconvicted_lvl", "idx_samples_bad_lvl"}
+
+// ReindexLitmusLevel rebuilds the samples.lvl indexes, once, after the backfill
+// completes. It is a no-op on a database where that has already happened.
+//
+// It exists because of an ordering the tooling makes easy to get wrong.
+// BackfillLitmusLevel's command migrates first, so on a hopper carrying the lvl
+// index DDL the indexes are built BEFORE the column is populated — cheap at the
+// time, since the `lvl IS NOT NULL` partial matches almost nothing, and then
+// every one of the backfill's ~30M updates inserts into them. Those inserts
+// arrive in primary-key order and sort by lvl, so their insertion points are
+// scattered across the whole index and the pages split as they go. One rebuild
+// at the end costs a single pass and reclaims all of it.
+//
+// Building the indexes only after the backfill avoids the bloat entirely and is
+// the better order when you have the choice; this is the repair for when you did
+// not. Running it early is harmless — an index rebuilt before the writes arrive
+// simply bloats again, which the KV marker is there to stop happening silently.
+//
+// CONCURRENTLY throughout: this runs against a live serving database. A failed
+// rebuild leaves an invalid <index>_ccnew behind, which Postgres does not clean
+// up on its own, so a failure says so explicitly rather than leaving an operator
+// to find it. The marker is written only on success, so a retry is just a re-run.
+func (db *DB) ReindexLitmusLevel(ctx context.Context, force bool) error {
+	if db.pool == nil {
+		return errors.New("hopper: litmus level reindex requires postgres")
+	}
+	if !force {
+		switch at, err := db.KVGet(ctx, litmusLevelReindexedKey); {
+		case err == nil && at != "":
+			slog.InfoContext(ctx, "litmus level indexes already rebuilt; skipping", "at", at)
+			return nil
+		case err != nil && !errors.Is(err, ErrNotFound):
+			return err
+		}
+	}
+
+	for _, name := range litmusLevelIndexes {
+		var exists bool
+		if err := db.pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				  FROM pg_class c
+				  JOIN pg_namespace n ON n.oid = c.relnamespace
+				 WHERE n.nspname = current_schema()
+				   AND c.relkind = 'i'
+				   AND c.relname = $1
+			)`, name).Scan(&exists); err != nil {
+			return fmt.Errorf("hopper: look up index %s: %w", name, err)
+		}
+		if !exists {
+			// Not an error: the index ships with a later hopper than the one that
+			// ran the backfill, and it will be built correctly sized when it lands.
+			slog.InfoContext(ctx, "litmus level index absent; nothing to rebuild", "index", name)
+			continue
+		}
+
+		// The index name is a package-level constant, never caller input.
+		reindex := "REINDEX INDEX CONCURRENTLY " + name
+		start := time.Now()
+		slog.InfoContext(ctx, "rebuilding litmus level index", "index", name)
+		if err := db.withUnlockedMigrationConn(ctx, func(conn *pgxpool.Conn) error {
+			_, err := conn.Exec(ctx, reindex)
+			return err
+		}); err != nil {
+			if invalid, ierr := db.invalidPGIndex(ctx, name+"_ccnew"); ierr == nil && invalid {
+				slog.ErrorContext(ctx, "rebuild left an invalid index behind; drop it before retrying",
+					"index", name+"_ccnew", "drop", "DROP INDEX CONCURRENTLY "+name+"_ccnew")
+			}
+			return fmt.Errorf("hopper: reindex %s: %w", name, err)
+		}
+		slog.InfoContext(ctx, "litmus level index rebuilt",
+			"index", name, "elapsed", time.Since(start).String())
+	}
+
+	return db.KVSet(ctx, litmusLevelReindexedKey, time.Now().UTC().Format(time.RFC3339Nano))
 }
 
 func (db *DB) backfillArchiveMemberLitmusPG(ctx context.Context) (int64, error) {

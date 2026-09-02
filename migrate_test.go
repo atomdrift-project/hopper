@@ -307,3 +307,35 @@ func TestTransferSamples_Idempotent(t *testing.T) {
 		t.Errorf("second transfer = %d, want 0 (idempotent)", s2)
 	}
 }
+
+// ReindexLitmusLevel names the indexes it rebuilds as string constants, so a
+// rename in the migration DDL would leave it silently rebuilding nothing —
+// there is no index to fail on, only the "absent; nothing to rebuild" path,
+// which is a legitimate state on a hopper predating the index. That makes the
+// mismatch invisible at runtime, which is what this catches at build time.
+func TestLitmusLevelIndexesExistInMigrations(t *testing.T) {
+	created := map[string]bool{}
+	for _, stmt := range pgRuntimeMigrations() {
+		for _, m := range createIndexRE.FindAllStringSubmatch(stmt, -1) {
+			created[m[1]] = true
+		}
+	}
+	if len(created) == 0 {
+		t.Fatal("parsed no CREATE INDEX statements — the regex or the migration list changed shape")
+	}
+	for _, name := range litmusLevelIndexes {
+		if !created[name] {
+			t.Errorf("ReindexLitmusLevel rebuilds %q, which no migration creates; "+
+				"the rebuild would silently do nothing", name)
+		}
+	}
+}
+
+// The reindex is Postgres-only, like the backfill it repairs. A SQLite caller
+// must be told that rather than being handed a silent success.
+func TestReindexLitmusLevelRequiresPostgres(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.ReindexLitmusLevel(context.Background(), false); err == nil {
+		t.Error("ReindexLitmusLevel on SQLite returned nil; want an error")
+	}
+}
