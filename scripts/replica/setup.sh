@@ -401,17 +401,60 @@ if [ "${REPLICA_TUNE:-true}" = "true" ]; then
         END { print type }
     ')
     [ -n "$fstype" ] || fstype=$(df -T "$PGDATA" 2>/dev/null | awk 'NR==2 {print $2}')
+
+    # btrfs is copy-on-write only while the inode allows it. `chattr +C`
+    # (nodatacow) — routinely set on database directories to stop CoW
+    # fragmentation — restores overwrite-in-place AND disables btrfs's own data
+    # checksums, so an 8 KB page tears there exactly as it would on ext4.
+    # galadriel 2026-09-02: pgdata carried +C, ENOSPC crashed the cluster, and
+    # because a torn page keeps the *new* LSN in its already-written header,
+    # replay skipped the page instead of repairing it — postgres would not
+    # start, and a second torn page in `samples` went undetected until a query
+    # hit it days later. The flag is per-inode, so it does not appear in
+    # /proc/mounts and has to be read off pgdata itself, which needs the same
+    # escalation as psql. An unreadable flag is not a CoW guarantee: anything
+    # short of a confirmed CoW pgdata keeps full_page_writes on.
+    fpw_off_reason=""
     case "$fstype" in
-        zfs|btrfs)
-            log "Disabling full_page_writes (pgdata is $fstype, copy-on-write — torn pages unreachable)"
-            admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
-                -c "ALTER SYSTEM SET full_page_writes = off" >/dev/null \
-                || log "warning: could not disable full_page_writes (continuing)"
+        zfs)
+            fpw_off_reason="pgdata is zfs, copy-on-write — torn pages unreachable"
+            ;;
+        btrfs)
+            # Try hardest to actually read the flag before falling back to the
+            # safe branch. $ESCALATE is empty whenever `psql -U postgres` works
+            # directly (peer/trust), which is exactly when the operator cannot
+            # stat a 0700 pgdata — so a root rung is needed too, or every btrfs
+            # replica silently takes the safe branch and loses the FPW win the
+            # CoW case is entitled to.
+            btrfs_attrs=""
+            for esc in "" "$ESCALATE" "doas -n" "sudo -n"; do
+                # shellcheck disable=SC2086
+                btrfs_attrs=$($esc lsattr -d "$PGDATA" 2>/dev/null | awk 'NR==1 {print $1}')
+                [ -n "$btrfs_attrs" ] && break
+            done
+            case "$btrfs_attrs" in
+                '')  log "Leaving full_page_writes on (pgdata is btrfs but its nodatacow flag could not be read — not assuming copy-on-write)" ;;
+                *C*) log "Leaving full_page_writes on (pgdata is btrfs with nodatacow/+C — overwrite-in-place, pages CAN tear)" ;;
+                *)   fpw_off_reason="pgdata is btrfs without nodatacow, copy-on-write — torn pages unreachable" ;;
+            esac
             ;;
         *)
             log "Leaving full_page_writes on (pgdata fs '${fstype:-unknown}' is not known copy-on-write)"
             ;;
     esac
+    if [ -n "$fpw_off_reason" ]; then
+        log "Disabling full_page_writes ($fpw_off_reason)"
+        admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET full_page_writes = off" >/dev/null \
+            || log "warning: could not disable full_page_writes (continuing)"
+    else
+        # Converge, do not merely refrain: an earlier run of this script (before
+        # the nodatacow check existed) may have left full_page_writes = off in
+        # postgresql.auto.conf on a filesystem that cannot actually survive it.
+        admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET full_page_writes = on" >/dev/null \
+            || log "warning: could not enable full_page_writes (continuing)"
+    fi
 
     # checkpoint_timeout. FPIs are generated on the first touch of each page
     # after a checkpoint, so checkpoint frequency sets the FPI rate — the stock

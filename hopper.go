@@ -2733,18 +2733,49 @@ func (db *DB) ReactivatePrimaryLocation(ctx context.Context, sha256, path string
 //
 // class splits the pool into the two populations a drain has to treat
 // differently; see [IncomingClass].
-func (db *DB) OldestIncomingLocations(ctx context.Context, before time.Time, limit int, class IncomingClass) ([]*IncomingLocation, error) {
-	if limit <= 0 {
+func (db *DB) OldestIncomingLocations(ctx context.Context, q IncomingQuery) ([]*IncomingLocation, error) {
+	if q.Limit <= 0 {
 		return nil, nil
 	}
-	if err := class.valid(); err != nil {
+	if err := q.Class.valid(); err != nil {
 		return nil, err
 	}
 	if db.pool != nil {
-		return db.oldestIncomingLocationsPG(ctx, before, limit, class)
+		return db.oldestIncomingLocationsPG(ctx, q)
 	}
-	return db.oldestIncomingLocationsSQLite(ctx, before, limit, class)
+	return db.oldestIncomingLocationsSQLite(ctx, q)
 }
+
+// IncomingQuery selects one page of the hot-pool drain feed.
+type IncomingQuery struct {
+	// Before is the grace-period cutoff: only rows catalogued before this are
+	// returned, so a file the walk saw seconds ago and may still be writing is
+	// left alone.
+	Before time.Time
+	// After resumes where a previous page stopped. The zero value starts at the
+	// oldest row.
+	After IncomingCursor
+	Class IncomingClass
+	Limit int
+}
+
+// IncomingCursor is a keyset position in the drain feed, matching its sort
+// order. It exists so a drain can step past rows it has already dealt with —
+// including ones it could not move.
+//
+// That second part is the point. A location whose bytes are gone but whose row
+// survives is refused on every attempt and stays at the head of an oldest-first
+// feed forever. Without a cursor those accumulate until a whole page is nothing
+// but refusals, at which point the drain concludes there is no actionable work
+// and stops — permanently, because a restart re-reads the same head. The hot
+// pool then fills with nobody watching.
+type IncomingCursor struct {
+	FirstSeenAt time.Time
+	SHA256      string
+}
+
+// IsZero reports whether the cursor is unset, meaning "start at the oldest row".
+func (c IncomingCursor) IsZero() bool { return c.FirstSeenAt.IsZero() && c.SHA256 == "" }
 
 // IncomingClass selects which half of the hot pool a drain feed returns.
 //
@@ -2910,6 +2941,88 @@ func prunePathResolve(absRoot, path string) (resolved string, ok bool) {
 		return "", false
 	}
 	return resolved, true
+}
+
+// RepairMissingStats summarizes one repair-missing pass.
+type RepairMissingStats struct {
+	Checked      int // distinct skip='missing' standalone samples examined
+	Fixed        int // samples whose bytes were found and skip/path repaired (or would be, in dry-run)
+	StillMissing int // samples for which no candidate path resolved on disk
+}
+
+// missingCandidate is one path worth stat-ing for a skip='missing' sample:
+// either its own samples.path (which may have gone stale since it was last
+// marked missing — worth re-checking, not just trusting the flag) or a row
+// from sample_locations (a hardlink into another pool dir, or a location
+// recorded before/after the one that got marked missing).
+type missingCandidate struct {
+	path       string
+	lastSeenAt time.Time // zero for the samples.path candidate itself
+}
+
+// pickRevivalPath chooses which on-disk candidate becomes the new
+// authoritative samples.path for a revived sample. Preference: a path whose
+// top-level pool directory matches the sample's current label (bad/good/
+// sighted) — that is what "authoritative" means in this corpus, since
+// relabelFromPools already treats pool directory as the source of truth for
+// label. Failing that (label doesn't map to a pool dir, or none of the
+// found paths sit under it), fall back to the most recently observed path;
+// ties break on the path string for determinism.
+func pickRevivalPath(label string, found []missingCandidate) string {
+	if len(found) == 0 {
+		return ""
+	}
+	if len(found) == 1 {
+		return found[0].path
+	}
+	best := ""
+	bestSeen := time.Time{}
+	bestInPool := false
+	for _, c := range found {
+		inPool := label != "" && samplePathRoot(c.path) == label
+		switch {
+		case best == "":
+			best, bestSeen, bestInPool = c.path, c.lastSeenAt, inPool
+		case inPool && !bestInPool:
+			best, bestSeen, bestInPool = c.path, c.lastSeenAt, inPool
+		case inPool == bestInPool && c.lastSeenAt.After(bestSeen):
+			best, bestSeen, bestInPool = c.path, c.lastSeenAt, inPool
+		case inPool == bestInPool && c.lastSeenAt.Equal(bestSeen) && c.path < best:
+			best, bestSeen, bestInPool = c.path, c.lastSeenAt, inPool
+		}
+	}
+	return best
+}
+
+// RepairMissingLocations looks for on-disk bytes that back a skip='missing'
+// sample and, when found, clears the skip and repoints samples.path at the
+// authoritative location (see pickRevivalPath). Unlike ReconcilePools, this
+// never re-walks the data root or re-runs cleave/atomscan — it only stats
+// paths hopper already knows about (samples.path plus every row in
+// sample_locations for that sha256), so it is safe to run at any time as a
+// targeted backfill over the skip='missing' backlog.
+//
+// apply=false (dry-run) reports what would change without writing. Always
+// dry-run in effect for a sample with no surviving candidate — those are
+// left alone either way; only StillMissing counts them.
+func (db *DB) RepairMissingLocations(ctx context.Context, dataRoot string, apply bool) (RepairMissingStats, error) {
+	if dataRoot == "" {
+		return RepairMissingStats{}, errors.New("hopper: RepairMissingLocations requires a non-empty dataRoot")
+	}
+	absRoot, err := filepath.Abs(dataRoot)
+	if err != nil {
+		return RepairMissingStats{}, fmt.Errorf("hopper: resolve dataRoot: %w", err)
+	}
+	var stats RepairMissingStats
+	if db.pool != nil {
+		stats, err = db.repairMissingLocationsPG(ctx, absRoot, apply)
+	} else {
+		stats, err = db.repairMissingLocationsSQLite(ctx, absRoot, apply)
+	}
+	if err == nil && apply && stats.Fixed > 0 {
+		db.flushLookups()
+	}
+	return stats, err
 }
 
 // PackageVersionPresent reports whether Hopper holds retrievable top-level bytes

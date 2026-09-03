@@ -1,6 +1,9 @@
 package pkgparse
 
-import "strings"
+import (
+	"sort"
+	"strings"
+)
 
 // This is the single source of truth for building canonical Package URLs (PURLs,
 // see https://github.com/package-url/purl-spec) from the coordinates hopper
@@ -332,7 +335,7 @@ func buildTyped(key, name, version, arch string) (string, bool) {
 		return renderPURL("vscode-extension", pub, ext, version, ""), true
 	case "openvsx":
 		pub, ext := splitExtensionID(name)
-		return renderPURL("vscode-extension", pub, ext, version, "repository_url=https://open-vsx.org"), true
+		return renderPURL("vscode-extension", pub, ext, version, openVSXQualifier), true
 
 	// Chrome Web Store → the ratified pkg:chrome-extension type (no namespace).
 	case "chrome":
@@ -435,6 +438,209 @@ func (d distroPURL) name(raw string) string {
 // Inputs already in canonical form, or of a type we don't remap, are returned
 // unchanged. A string that isn't a PURL is returned as-is.
 func CanonicalizePURL(purl string) string {
+	out := encodePURLPath(canonicalizePURL(purl))
+	// Conservative in what we emit. The purl-spec's type definitions say which
+	// coordinates can exist at all — pypi has no namespace, a chrome extension
+	// id is 32 letters a-p — and a string that violates one has no canonical
+	// form to fold onto. Rewriting it anyway (lowercasing the type, say) mints
+	// a key for a package that cannot exist, and every consumer that looks it
+	// up misses. fletch's purl::normalize refuses these outright; this returns
+	// the input untouched, which is the same statement in a function that has
+	// no way to say "no".
+	//
+	// Liberal in what we accept: this runs on the CANONICAL form, not the raw
+	// input, so every legacy spelling still folds first. "pkg:aur/yay?
+	// repository_url=…aur.archlinux.org" becomes "pkg:alpm/aur/yay" and passes;
+	// only what is still invalid after folding is refused.
+	if !purlTypeAllows(out) {
+		return strings.TrimSpace(purl)
+	}
+	return out
+}
+
+// encodePURLPath percent-encodes the coordinate path, leaving the '/' segment
+// separators literal.
+//
+// The spec requires non-ASCII to be UTF-8 encoded and then percent-encoded, so
+// "pkg:npm/Ünicode" and "pkg:npm/%C3%9Cnicode" are one package; passing the raw
+// bytes through made them two keys. It runs on the canonical output rather than
+// the input so every type-specific fold (case, PEP 503, distro namespaces) has
+// already happened — encoding first would hide those letters behind %XX where
+// the folds could not see them.
+//
+// Decoding each segment before re-encoding keeps it idempotent, and a segment
+// with a malformed escape is left alone rather than mangled further.
+func encodePURLPath(purl string) string {
+	if len(purl) < 4 || !strings.EqualFold(purl[:4], "pkg:") {
+		return purl
+	}
+	typ, rest, ok := strings.Cut(purl[4:], "/")
+	if !ok {
+		return purl
+	}
+	path, tail := rest, ""
+	if i := strings.IndexAny(rest, "@?"); i >= 0 {
+		path, tail = rest[:i], rest[i:]
+	}
+	if !purlPathNeedsEncoding(path) {
+		return purl
+	}
+	segments := strings.Split(path, "/")
+	for i, seg := range segments {
+		decoded, ok := unescapePURL(seg)
+		if !ok {
+			continue
+		}
+		segments[i] = escapePURL(decoded)
+	}
+	return "pkg:" + typ + "/" + strings.Join(segments, "/") + tail
+}
+
+// purlPathNeedsEncoding reports whether any byte of the path is neither a
+// segment separator nor already canonical, so the common all-ASCII path costs
+// one scan and no allocation.
+func purlPathNeedsEncoding(path string) bool {
+	for i := range len(path) {
+		if c := path[i]; c != '/' && c != '%' && !purlUnreserved(c) {
+			return true
+		}
+	}
+	return false
+}
+
+// purlTypeAllows reports whether a canonical PURL satisfies its type's
+// definition. It mirrors fletch's apply_type_rules; the two must agree, because
+// a coordinate one tool keys and the other refuses is a lookup that silently
+// finds nothing.
+func purlTypeAllows(purl string) bool {
+	if len(purl) < 4 || !strings.EqualFold(purl[:4], "pkg:") {
+		return true // not ours to judge; canonicalizePURL passed it through
+	}
+	typ, rest, ok := strings.Cut(purl[4:], "/")
+	if !ok {
+		return true
+	}
+	path, tail := rest, ""
+	if i := strings.IndexAny(rest, "@?"); i >= 0 {
+		path, tail = rest[:i], rest[i:]
+	}
+	namespace, name := "", path
+	if i := strings.LastIndexByte(path, '/'); i >= 0 {
+		namespace, name = path[:i], path[i+1:]
+	}
+
+	switch purlNamespaceRequirement(typ) {
+	case purlNamespaceRequired:
+		// The spec's rpm note says a missing repository is implied by `distro`,
+		// and this project recovers an AUR namespace from repository_url the
+		// same way, so neither counts as a missing namespace.
+		if namespace == "" && !recoverableDistroNamespace(typ, tail) {
+			return false
+		}
+	case purlNamespaceForbidden:
+		if namespace != "" {
+			return false
+		}
+	}
+
+	switch typ {
+	case "chrome-extension":
+		// A Chrome Web Store id is exactly 32 characters drawn from a-p, and a
+		// store version is one to four dot-separated numbers.
+		if len(name) != 32 {
+			return false
+		}
+		for i := range len(name) {
+			if name[i] < 'a' || name[i] > 'p' {
+				return false
+			}
+		}
+		if v, _, _ := strings.Cut(strings.TrimPrefix(tail, "@"), "?"); strings.HasPrefix(tail, "@") {
+			if !chromeVersionShape(v) {
+				return false
+			}
+		}
+	case "cpan":
+		// A distribution name uses dashes; "::" spells a module, not a release.
+		if strings.Contains(name, "::") {
+			return false
+		}
+	case "julia":
+		if _, _, found := cutQualifier(tail, "uuid"); !found {
+			return false
+		}
+	case "swid":
+		if _, _, found := cutQualifier(tail, "tag_id"); !found {
+			return false
+		}
+	}
+	return true
+}
+
+const (
+	purlNamespaceOptional  = 0
+	purlNamespaceRequired  = 1
+	purlNamespaceForbidden = -1
+)
+
+// purlNamespaceRequirement is the purl-spec type definitions' namespace rule.
+// Kept as one table so it can be diffed against fletch's twin by eye.
+func purlNamespaceRequirement(typ string) int {
+	switch typ {
+	case "alpm", "apk", "bitbucket", "composer", "deb", "git", "github", "golang",
+		"huggingface", "maven", "qpkg", "rpm", "swift", "vscode-extension":
+		return purlNamespaceRequired
+	case "bazel", "bitnami", "cargo", "chrome-extension", "cocoapods", "conda", "cran",
+		"gem", "hackage", "julia", "mlflow", "nuget", "oci", "opam", "otp", "pub",
+		"pypi", "vcpkg":
+		return purlNamespaceForbidden
+	default:
+		return purlNamespaceOptional
+	}
+}
+
+// recoverableDistroNamespace reports whether a missing distro namespace is
+// implied by a qualifier rather than absent.
+func recoverableDistroNamespace(typ, tail string) bool {
+	if val, _, found := cutQualifier(tail, "distro"); found {
+		vendor, _, _ := strings.Cut(val, "-")
+		if d, ok := distroSpec(vendor); ok && d.typ == typ {
+			return true
+		}
+	}
+	if typ == "alpm" {
+		if val, _, found := cutQualifier(tail, "repository_url"); found &&
+			strings.Contains(val, "aur.archlinux.org") {
+			return true
+		}
+	}
+	return false
+}
+
+// chromeVersionShape reports whether v is a Chrome Web Store version: one to
+// four dot-separated runs of digits.
+func chromeVersionShape(v string) bool {
+	if v == "" {
+		return true // no version at all is fine; an empty one is not a version
+	}
+	segments := strings.Split(v, ".")
+	if len(segments) > 4 {
+		return false
+	}
+	for _, s := range segments {
+		if s == "" {
+			return false
+		}
+		for i := range len(s) {
+			if s[i] < '0' || s[i] > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func canonicalizePURL(purl string) string {
 	// The `pkg` scheme and the type are case-insensitive per spec (and pasted
 	// purls arrive padded), so fold their case and trim before anything else —
 	// matching fletch's purl::normalize, which must produce identical output.
@@ -501,6 +707,19 @@ func CanonicalizePURL(purl string) string {
 		}
 	}
 
+	// An empty version is the same as no version — "pkg:npm/x@" and "pkg:npm/x"
+	// name one coordinate — so drop the bare sigil rather than keying twice.
+	if ver, quals, hasQ := strings.Cut(tail, "?"); ver == "@" {
+		tail = ""
+		if hasQ {
+			tail = "?" + quals
+		}
+	}
+	// Qualifier values arrive in whatever spelling the producer used; fold them
+	// onto the canonical encoding before any branch inspects or rebuilds the
+	// tail, so every return path below emits one spelling.
+	tail = canonicalQualifiers(tail)
+
 	switch typ {
 	// The extension types are case-insensitive per spec (store ids are
 	// lowercase), so their bodies are lowercased — matching buildTyped and
@@ -511,7 +730,7 @@ func CanonicalizePURL(purl string) string {
 	case "vscode", "vscode-extension":
 		return "pkg:vscode-extension/" + asciiLower(path) + tail
 	case "openvsx":
-		return "pkg:vscode-extension/" + asciiLower(path) + addQualifier(tail, "repository_url=https://open-vsx.org")
+		return "pkg:vscode-extension/" + asciiLower(path) + addQualifier(tail, openVSXQualifier)
 	// PyPI treats '-'/'_'/'.' as one separator and names as case-insensitive
 	// (PEP 503, the registry's own equivalence); composer names are
 	// case-insensitive per spec and lowercased. npm is deliberately NOT
@@ -573,11 +792,20 @@ func CanonicalizePURL(purl string) string {
 // type (fedora-25 → fedora; a bare codename like jessie never matches). The
 // qualifier itself is left in place: identity layers strip it downstream.
 func distroPath(typ, path, tail string) string {
+	// deb, apk and alpm define their name as case-insensitive and lowercase it
+	// in canonical form. rpm deliberately does NOT: only its namespace folds,
+	// because an rpm name is case sensitive. Applying one rule to all four
+	// would either split "pkg:deb/debian/Curl" from "pkg:deb/debian/curl" or
+	// merge two distinct rpm packages, so the difference is per type.
+	foldName := typ == "deb" || typ == "apk" || typ == "alpm"
 	if ns, name, found := strings.Cut(path, "/"); found {
-		if lower := asciiLower(ns); lower != ns {
-			return lower + "/" + name
+		if foldName {
+			name = asciiLower(name)
 		}
-		return path
+		return asciiLower(ns) + "/" + name
+	}
+	if foldName {
+		path = asciiLower(path)
 	}
 	if val, _, found := cutQualifier(tail, "distro"); found {
 		vendor, _, _ := strings.Cut(val, "-")
@@ -694,6 +922,52 @@ func cutQualifier(tail, key string) (value, rest string, found bool) {
 // addQualifier merges one qualifier into a PURL version/qualifier tail
 // ("@v", "?k=v", "@v?k=v", or ""), leaving an already-present key untouched. An
 // empty qualifier is a no-op, so distro keys without one pass their tail through.
+// canonicalQualifiers re-encodes a purl's qualifier VALUES to the spec's
+// canonical percent-encoding, leaving keys and ordering alone.
+//
+// The spec's own test vectors encode reserved characters in qualifier values —
+// "repository_url=repo.spring.io%2Frelease" — and fletch's purl::normalize does
+// the same. Passing an input's spelling through instead meant
+// "?repository_url=https://x" and "?repository_url=https:%2F%2Fx" were two keys
+// for one package, and the two implementations disagreed on which was canonical.
+//
+// Decoding before re-encoding is what makes this idempotent: an already-encoded
+// value decodes to the same bytes and comes back unchanged, so canonicalizing
+// twice is canonicalizing once. A value with a malformed escape is left exactly
+// as it arrived — it is not this function's job to guess at a broken purl, and
+// rewriting it would invent a coordinate nobody published.
+// openVSXQualifier distinguishes Open VSX from the Visual Studio Marketplace,
+// which share the vscode-extension type. The value is written pre-encoded
+// because that is the canonical spelling — see canonicalQualifiers.
+const openVSXQualifier = "repository_url=https:%2F%2Fopen-vsx.org"
+
+func canonicalQualifiers(tail string) string {
+	ver, quals, ok := strings.Cut(tail, "?")
+	if !ok || quals == "" {
+		return tail
+	}
+	parts := strings.Split(quals, "&")
+	keys := make([]string, len(parts))
+	for i, q := range parts {
+		key, val, hasEq := strings.Cut(q, "=")
+		keys[i] = asciiLower(key)
+		if !hasEq || val == "" {
+			continue
+		}
+		decoded, ok := unescapePURL(val)
+		if !ok {
+			continue
+		}
+		parts[i] = key + "=" + escapePURL(decoded)
+	}
+	// The spec orders qualifiers by key, and fletch holds them in a BTreeMap,
+	// so the same set written in two orders is one canonical string. Sorted by
+	// the lowercased key because keys are case-insensitive; stable so a
+	// repeated key keeps the order it arrived in rather than shuffling.
+	sort.SliceStable(parts, func(i, j int) bool { return keys[i] < keys[j] })
+	return ver + "?" + strings.Join(parts, "&")
+}
+
 func addQualifier(tail, qualifier string) string {
 	if qualifier == "" {
 		return tail

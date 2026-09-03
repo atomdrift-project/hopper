@@ -1981,17 +1981,22 @@ func (db *DB) reactivatePrimaryLocationSQLite(ctx context.Context, sha256, path 
 	return n > 0, nil
 }
 
-func (db *DB) oldestIncomingLocationsSQLite(
-	ctx context.Context, before time.Time, limit int, class IncomingClass,
-) ([]*IncomingLocation, error) {
+func (db *DB) oldestIncomingLocationsSQLite(ctx context.Context, q IncomingQuery) ([]*IncomingLocation, error) {
+	afterSeen, afterSHA := "", ""
+	if !q.After.IsZero() {
+		afterSeen, afterSHA = q.After.FirstSeenAt.UTC().Format(time.RFC3339Nano), q.After.SHA256
+	}
+	unknown := q.Class == IncomingUnknown
 	rows, err := db.lite.QueryContext(ctx, `
 		SELECT sl.first_seen_at, sl.mtime, sl.sha256, sl.path, s.label
 		  FROM sample_locations sl JOIN samples s ON s.sha256 = sl.sha256
 		 WHERE sl.parent_sha256 = '' AND sl.path GLOB 'incoming/*'
 		   AND sl.first_seen_at < ?
 		   AND ((? AND s.label = 'unknown') OR (NOT ? AND s.label <> 'unknown'))
+		   AND (? = '' OR (sl.first_seen_at, sl.sha256) > (?, ?))
 		 ORDER BY sl.first_seen_at, sl.sha256, sl.path LIMIT ?`,
-		before.UTC().Format(time.RFC3339Nano), class == IncomingUnknown, class == IncomingUnknown, limit)
+		q.Before.UTC().Format(time.RFC3339Nano), unknown, unknown,
+		afterSeen, afterSeen, afterSHA, q.Limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: oldest incoming locations: %w", err)
 	}
@@ -2229,6 +2234,117 @@ func (db *DB) pruneMissingLocationsSQLite(ctx context.Context, absRoot string, m
 	}
 	slog.Info("sample locations retired by prune", "count", len(victims))
 	return len(victims), nil
+}
+
+func (db *DB) repairMissingLocationsSQLite(ctx context.Context, absRoot string, apply bool) (RepairMissingStats, error) {
+	var stats RepairMissingStats
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT s.sha256, s.label, s.path, loc.path, loc.last_seen_at
+		FROM samples s
+		LEFT JOIN sample_locations loc
+			ON loc.sha256 = s.sha256 AND (loc.parent_sha256 IS NULL OR loc.parent_sha256 = '')
+		WHERE s.parent = '' AND s.skip = 'missing'`)
+	if err != nil {
+		return stats, fmt.Errorf("hopper: scan missing samples: %w", err)
+	}
+	type group struct {
+		label      string
+		candidates []missingCandidate
+		seen       map[string]bool
+	}
+	groups := make(map[string]*group)
+	order := make([]string, 0)
+	for rows.Next() {
+		var sha, label, currentPath string
+		var locPath *string
+		var lastSeen *time.Time
+		if err := rows.Scan(&sha, &label, &currentPath, &locPath, &lastSeen); err != nil {
+			rows.Close() //nolint:errcheck,sqlclosecheck,gosec // best-effort cleanup before error return
+			return stats, fmt.Errorf("hopper: scan missing row: %w", err)
+		}
+		g, ok := groups[sha]
+		if !ok {
+			g = &group{label: label, seen: map[string]bool{}}
+			groups[sha] = g
+			order = append(order, sha)
+		}
+		if currentPath != "" && !g.seen[currentPath] {
+			g.seen[currentPath] = true
+			g.candidates = append(g.candidates, missingCandidate{path: currentPath})
+		}
+		if locPath != nil && *locPath != "" && !g.seen[*locPath] {
+			g.seen[*locPath] = true
+			c := missingCandidate{path: *locPath}
+			if lastSeen != nil {
+				c.lastSeenAt = *lastSeen
+			}
+			g.candidates = append(g.candidates, c)
+		}
+	}
+	rows.Close() //nolint:errcheck,gosec // best-effort cleanup
+	if err := rows.Err(); err != nil {
+		return stats, err
+	}
+
+	type fix struct{ sha256, path string }
+	var fixes []fix
+	for _, sha := range order {
+		g := groups[sha]
+		stats.Checked++
+		var found []missingCandidate
+		for _, c := range g.candidates {
+			resolved, ok := prunePathResolve(absRoot, c.path)
+			if !ok {
+				continue
+			}
+			if _, statErr := os.Stat(resolved); statErr == nil {
+				found = append(found, c)
+			}
+		}
+		chosen := pickRevivalPath(g.label, found)
+		if chosen == "" {
+			stats.StillMissing++
+			continue
+		}
+		stats.Fixed++
+		if apply {
+			fixes = append(fixes, fix{sha256: sha, path: chosen})
+		}
+	}
+
+	if !apply || len(fixes) == 0 {
+		return stats, nil
+	}
+
+	ts := now()
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return stats, fmt.Errorf("hopper: begin repair-missing: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit or rollback
+	var revived int64
+	for _, f := range fixes {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
+			SELECT sha256, label, label, 'missing', '', 'repair-missing', ?
+			FROM samples WHERE sha256 = ? AND skip = 'missing'`, ts, f.sha256); err != nil {
+			return stats, fmt.Errorf("hopper: repair-missing audit %s: %w", f.sha256, err)
+		}
+		res, err := tx.ExecContext(ctx, `
+			UPDATE samples SET skip = '', path = ?, updated_at = ?
+			WHERE sha256 = ? AND skip = 'missing'`, f.path, ts, f.sha256)
+		if err != nil {
+			return stats, fmt.Errorf("hopper: repair-missing update %s: %w", f.sha256, err)
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			revived += n
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return stats, fmt.Errorf("hopper: commit repair-missing: %w", err)
+	}
+	slog.Info("repair-missing revived samples", "count", revived)
+	return stats, nil
 }
 
 // markPrunedSamplesMissingSQLite flags any top-level sample among shas that has

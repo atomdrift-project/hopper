@@ -77,7 +77,8 @@ type incomingLocationsResponse struct {
 // grace period that keeps a file the walk catalogued seconds ago — possibly
 // still being written — out of a drain batch.
 //
-// ?class= picks which half of the pool to serve: "unknown" (the default) is
+// ?after_seen= / ?after_sha= resume a paged sweep, and ?class= picks which half
+// of the pool to serve: "unknown" (the default) is
 // unjudged work whose only legal move is to pending/ or review/; "classified"
 // is finished samples that are only still here because nothing relocated them.
 // See hopper.IncomingClass for why a drain should take the classified half
@@ -105,7 +106,22 @@ func (s *apiServer) handleIncomingLocations(w http.ResponseWriter, r *http.Reque
 	if raw := r.URL.Query().Get("class"); raw != "" {
 		class = hopper.IncomingClass(raw)
 	}
-	locations, err := s.db.OldestIncomingLocations(r.Context(), before, limit, class)
+	// Keyset resume. A client that has already dealt with a page — including
+	// rows the server refused to move — passes the last one back, so refusals
+	// cannot pile up at the head and starve it of work.
+	var after hopper.IncomingCursor
+	if raw := r.URL.Query().Get("after_seen"); raw != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid after_seen timestamp")
+			return
+		}
+		after.FirstSeenAt = parsed
+		after.SHA256 = r.URL.Query().Get("after_sha")
+	}
+	locations, err := s.db.OldestIncomingLocations(r.Context(), hopper.IncomingQuery{
+		Before: before, After: after, Class: class, Limit: limit,
+	})
 	if errors.Is(err, hopper.ErrNotFound) || (err != nil && strings.Contains(err.Error(), "unknown incoming class")) {
 		writeJSONError(w, http.StatusBadRequest, `class must be "unknown" or "classified"`)
 		return

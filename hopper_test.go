@@ -3341,7 +3341,7 @@ func TestOldestIncomingLocations(t *testing.T) {
 		}
 	}
 
-	locs, err := db.OldestIncomingLocations(ctx, now.Add(-time.Hour), 10, IncomingUnknown)
+	locs, err := db.OldestIncomingLocations(ctx, IncomingQuery{Before: now.Add(-time.Hour), Limit: 10, Class: IncomingUnknown})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3359,10 +3359,34 @@ func TestOldestIncomingLocations(t *testing.T) {
 		}
 	}
 
+	// The cursor is what lets a sweep step past rows it has already dealt with.
+	// Resuming from the first result must return the rest, in order, and never
+	// the row it resumed from.
+	page1, err := db.OldestIncomingLocations(ctx, IncomingQuery{
+		Before: now.Add(-time.Hour), Limit: 1, Class: IncomingUnknown,
+	})
+	if err != nil || len(page1) != 1 {
+		t.Fatalf("first page = %+v, %v", page1, err)
+	}
+	page2, err := db.OldestIncomingLocations(ctx, IncomingQuery{
+		Before: now.Add(-time.Hour), Limit: 10, Class: IncomingUnknown,
+		After: IncomingCursor{FirstSeenAt: page1[0].FirstSeenAt, SHA256: page1[0].SHA256},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = got[:0]
+	for _, loc := range page2 {
+		got = append(got, loc.SHA256)
+	}
+	if !slices.Equal(got, want[1:]) {
+		t.Fatalf("resumed page = %v, want %v", got, want[1:])
+	}
+
 	// The classified half is a separate population, not a filtered view of the
 	// same one: it must return exactly the row the unknown feed refuses, and
 	// carry the label that says where it belongs.
-	classified, err := db.OldestIncomingLocations(ctx, now.Add(-time.Hour), 10, IncomingClassified)
+	classified, err := db.OldestIncomingLocations(ctx, IncomingQuery{Before: now.Add(-time.Hour), Limit: 10, Class: IncomingClassified})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3372,13 +3396,13 @@ func TestOldestIncomingLocations(t *testing.T) {
 	if classified[0].Label != "good" {
 		t.Errorf("classified label = %q, want good — the caller echoes this back as its ruling", classified[0].Label)
 	}
-	if _, err := db.OldestIncomingLocations(ctx, now, 10, IncomingClass("sideways")); err == nil {
+	if _, err := db.OldestIncomingLocations(ctx, IncomingQuery{Before: now, Limit: 10, Class: IncomingClass("sideways")}); err == nil {
 		t.Error("an unknown class was accepted; a typo would silently drain the wrong half")
 	}
 
 	// before is a first_seen_at cutoff, not an mtime one: the grace period that
 	// keeps a just-catalogued (possibly still-being-written) file out of a batch.
-	recent, err := db.OldestIncomingLocations(ctx, now.Add(-150*time.Minute), 10, IncomingUnknown)
+	recent, err := db.OldestIncomingLocations(ctx, IncomingQuery{Before: now.Add(-150 * time.Minute), Limit: 10, Class: IncomingUnknown})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6655,6 +6679,124 @@ func TestPruneMissingLocationsSafetyCap(t *testing.T) {
 		if retired, err := db.RetiredLocationsForSHA(ctx, sha); err != nil || len(retired) != 0 {
 			t.Errorf("%s retired locations = %+v, %v; cap must be atomic", sha[:6], retired, err)
 		}
+	}
+}
+
+func TestRepairMissingLocations(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	root := t.TempDir()
+
+	writeUnder := func(rel string) {
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// addLocation records a location the way a past walk would have, without
+	// going through InsertSample/mustInsert — mustInsert's pool-relabel path
+	// would auto-revive a live match, which is exactly the full-walk behavior
+	// repair-missing exists to substitute for (see ReconcilePools). Tests here
+	// must exercise repair-missing's own stat-known-locations logic instead.
+	addLocation := func(sha, path string, lastSeen time.Time) {
+		if _, err := db.lite.ExecContext(ctx,
+			`INSERT INTO sample_locations (sha256, path, parent_sha256, first_seen_at, last_seen_at)
+			 VALUES (?, ?, '', ?, ?)`,
+			sha, path, now(), lastSeen.UTC().Format(time.RFC3339Nano)); err != nil {
+			t.Fatalf("insert location: %v", err)
+		}
+	}
+	markMissing := func(sha, path string) {
+		if _, err := db.lite.ExecContext(ctx,
+			`UPDATE samples SET skip = 'missing', path = ? WHERE sha256 = ?`, path, sha); err != nil {
+			t.Fatalf("mark missing: %v", err)
+		}
+	}
+	skipOf := func(sha string) string {
+		s, err := db.SampleBySHA256(ctx, sha)
+		if err != nil {
+			t.Fatalf("SampleBySHA256(%s): %v", sha, err)
+		}
+		return s.Skip
+	}
+	pathOf := func(sha string) string {
+		s, err := db.SampleBySHA256(ctx, sha)
+		if err != nil {
+			t.Fatalf("SampleBySHA256(%s): %v", sha, err)
+		}
+		return s.Path
+	}
+
+	var (
+		revivedElsewhere = sha64('1') // missing at current path; an older known location still has the bytes
+		stillGone        = sha64('2') // missing; no known location has bytes anywhere
+		poolTieBreak     = sha64('3') // missing; two live candidates, only one under the label's own pool dir
+	)
+
+	mustInsert(t, ctx, db, &Sample{SHA256: revivedElsewhere, Source: "test", Label: "bad", LabelSource: "test", Path: "bad/old.js"})
+	writeUnder("bad/old.js")
+	// Simulate: the file was later "moved" out from under hopper (path
+	// corruption, a bad migration, whatever) and got marked missing, without a
+	// fresh walk ever re-observing bad/old.js as a new location.
+	markMissing(revivedElsewhere, "bad/renamed-away.js")
+
+	mustInsert(t, ctx, db, &Sample{SHA256: stillGone, Source: "test", Label: "bad", LabelSource: "test", Path: "bad/gone.js"})
+	markMissing(stillGone, "bad/gone.js")
+
+	mustInsert(t, ctx, db, &Sample{SHA256: poolTieBreak, Source: "test", Label: "bad", LabelSource: "test", Path: "bad/original.js"})
+	writeUnder("sighted/dup.js")
+	writeUnder("bad/dup.js")
+	addLocation(poolTieBreak, "sighted/dup.js", time.Now().Add(-time.Hour))  // more recently seen…
+	addLocation(poolTieBreak, "bad/dup.js", time.Now().Add(-2*time.Hour))    // …but this is the label's own pool dir
+	markMissing(poolTieBreak, "bad/original.js")
+
+	// Dry-run: reports the fix but writes nothing.
+	stats, err := db.RepairMissingLocations(ctx, root, false)
+	if err != nil {
+		t.Fatalf("RepairMissingLocations dry-run: %v", err)
+	}
+	if stats.Checked != 3 || stats.Fixed != 2 || stats.StillMissing != 1 {
+		t.Errorf("dry-run stats = %+v, want {Checked:3 Fixed:2 StillMissing:1}", stats)
+	}
+	if skipOf(revivedElsewhere) != "missing" {
+		t.Errorf("dry-run must not write: revivedElsewhere skip=%q", skipOf(revivedElsewhere))
+	}
+
+	// Apply: the fixes land.
+	stats, err = db.RepairMissingLocations(ctx, root, true)
+	if err != nil {
+		t.Fatalf("RepairMissingLocations apply: %v", err)
+	}
+	if stats.Checked != 3 || stats.Fixed != 2 || stats.StillMissing != 1 {
+		t.Errorf("apply stats = %+v, want {Checked:3 Fixed:2 StillMissing:1}", stats)
+	}
+	if got := skipOf(revivedElsewhere); got != "" {
+		t.Errorf("revivedElsewhere skip=%q, want ''", got)
+	}
+	if got := pathOf(revivedElsewhere); got != "bad/old.js" {
+		t.Errorf("revivedElsewhere path=%q, want 'bad/old.js'", got)
+	}
+	if got := skipOf(stillGone); got != "missing" {
+		t.Errorf("stillGone skip=%q, want still 'missing'", got)
+	}
+	if got := skipOf(poolTieBreak); got != "" {
+		t.Errorf("poolTieBreak skip=%q, want ''", got)
+	}
+	if got := pathOf(poolTieBreak); got != "bad/dup.js" {
+		t.Errorf("poolTieBreak path=%q, want 'bad/dup.js' (label-pool match beats the more-recently-seen sighted/dup.js)", got)
+	}
+
+	var events int
+	if err := db.lite.QueryRowContext(ctx,
+		`SELECT count(*) FROM label_events WHERE sha256=? AND reason='repair-missing' AND from_skip='missing' AND to_skip=''`,
+		revivedElsewhere).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 1 {
+		t.Errorf("label_events for revivedElsewhere = %d, want 1", events)
 	}
 }
 

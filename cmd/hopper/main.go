@@ -66,6 +66,7 @@ commands:
   normalize-ecosystems  re-canonicalize stored ecosystem labels (dry-run)
   cleanup            delete wonky samples by skip category (interactive)
   prune              drop location rows for files gone from disk, mark orphaned samples missing (run on the full mirror)
+  repair-missing     re-check skip='missing' samples against known locations; revive + repoint path if bytes are found (--dry-run by default; --apply to write)
   rescan             queue files for repair-tier re-analysis (--missing-members or SHA-256 args)
   triage             fetch mislabeled samples to /var/tmp/hopper-triage
   post-triage        apply triage verdicts: re-scan, move + flip mislabeled samples
@@ -437,6 +438,8 @@ func run(ctx context.Context) error {
 		return cmdCleanup(ctx)
 	case "prune":
 		return cmdPrune(ctx)
+	case "repair-missing":
+		return cmdRepairMissing(ctx)
 	case "rescan":
 		return cmdRescan(ctx)
 	case "triage":
@@ -4345,6 +4348,54 @@ func cmdPrune(ctx context.Context) error {
 	default:
 		return fmt.Errorf("prune missing locations: %w", err)
 	}
+}
+
+// cmdRepairMissing looks for on-disk bytes backing skip='missing' samples
+// without re-walking the data root: it stats samples.path plus every path
+// hopper already has on file in sample_locations for that sha256. When
+// found, the sample's authoritative path is repointed there (preferring
+// whichever candidate sits under the pool directory matching the sample's
+// label, e.g. bad/) and skip is cleared. --dry-run by default (pass --apply
+// to write) since this flips label-bearing skip flags, not just location
+// bookkeeping like prune.
+func cmdRepairMissing(ctx context.Context) error {
+	f := flag.NewFlagSet("repair-missing", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	dataDir := f.String("data", "", "fully mounted sample data root")
+	apply := f.Bool("apply", false, "write the fixes (default: report only)")
+	parseFlags(f, os.Args[2:])
+
+	if *dataDir == "" {
+		return errors.New("pass --data <directory> (the fully-mounted sample tree)")
+	}
+	if resolved, err := filepath.EvalSymlinks(*dataDir); err == nil {
+		*dataDir = resolved
+	}
+	if abs, err := filepath.Abs(*dataDir); err == nil {
+		*dataDir = abs
+	}
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		return err
+	}
+
+	stats, err := db.RepairMissingLocations(ctx, *dataDir, *apply)
+	if err != nil {
+		return fmt.Errorf("repair missing locations: %w", err)
+	}
+	if *apply {
+		slog.Info("repair-missing complete", "checked", stats.Checked,
+			"fixed", stats.Fixed, "still_missing", stats.StillMissing)
+	} else {
+		slog.Info("repair-missing dry-run (pass --apply to write)", "checked", stats.Checked,
+			"would_fix", stats.Fixed, "still_missing", stats.StillMissing)
+	}
+	return nil
 }
 
 // cmdRescan queues files for re-analysis in the repair tier (rescan_priority=1),

@@ -17,7 +17,7 @@ func TestPURLPath(t *testing.T) {
 		{"distro vendor is a namespace", "pkg:deb/debian/curl@8.5.0", "deb/debian/curl/8.5.0"},
 		{"epoch survives in the version", "pkg:alpm/arch/containers-common@1:0.47.4-4", "alpm/arch/containers-common/1:0.47.4-4"},
 		{"qualifiers are dropped", "pkg:deb/debian/curl@8.5.0?arch=amd64", "deb/debian/curl/8.5.0"},
-		{"legacy spelling canonicalizes first", "pkg:chrome/abcdefg@2.1.0", "chrome-extension/abcdefg/2.1.0"},
+		{"legacy spelling canonicalizes first", "pkg:chrome/khkimiladblfhhmefghkpkoikghmdddf@2.1.0", "chrome-extension/khkimiladblfhhmefghkpkoikghmdddf/2.1.0"},
 		{"type case is folded", "PKG:NPM/Left-Pad@1.3.0", "npm/Left-Pad/1.3.0"},
 	}
 	for _, tt := range tests {

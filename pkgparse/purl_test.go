@@ -16,7 +16,7 @@ func TestSourcePURLIdentity(t *testing.T) {
 		// Browser / editor extensions → spec types.
 		{"chrome", "chrome", "google.com", "khkimiladblfhhmefghkpkoikghmdddf", "pkg:chrome-extension/khkimiladblfhhmefghkpkoikghmdddf", true},
 		{"vscode marketplace", "vscode", "vsassets.io", "saoudrizwan.claude-dev", "pkg:vscode-extension/saoudrizwan/claude-dev", true},
-		{"openvsx by domain", "vscode", "open-vsx.org", "jinryx/crontally", "pkg:vscode-extension/jinryx/crontally?repository_url=https://open-vsx.org", true},
+		{"openvsx by domain", "vscode", "open-vsx.org", "jinryx/crontally", "pkg:vscode-extension/jinryx/crontally?repository_url=https:%2F%2Fopen-vsx.org", true},
 
 		// Invented types where the spec defines none.
 		{"firefox", "firefox", "mozilla.org", "velobench-shop-essentials", "pkg:firefox/velobench-shop-essentials", true},
@@ -88,7 +88,7 @@ func TestSourcePURL(t *testing.T) {
 		// version yields the bare identity.
 		{"npm versioned", "npm", "npmjs.org", "lodash", "4.17.21", "", "pkg:npm/lodash@4.17.21", true},
 		{"aur versioned", "aur", "archlinux.org", "bamboo-end-store-bin", "1.2.2-1", "", "pkg:alpm/aur/bamboo-end-store-bin@1.2.2-1", true},
-		{"openvsx versioned", "vscode", "open-vsx.org", "jinryx/crontally", "1.0.3", "", "pkg:vscode-extension/jinryx/crontally@1.0.3?repository_url=https://open-vsx.org", true},
+		{"openvsx versioned", "vscode", "open-vsx.org", "jinryx/crontally", "1.0.3", "", "pkg:vscode-extension/jinryx/crontally@1.0.3?repository_url=https:%2F%2Fopen-vsx.org", true},
 		{"aur no version", "aur", "archlinux.org", "yay", "", "", "pkg:alpm/aur/yay", true},
 		// Case-insensitive types (deb/apk/alpm) lowercase the name per spec; rpm is
 		// case-sensitive and keeps it.
@@ -171,11 +171,11 @@ func TestSourcePURL(t *testing.T) {
 func TestCanonicalizePURL(t *testing.T) {
 	cases := []struct{ in, want string }{
 		// Legacy fletch spellings fold onto the spec form.
-		{"pkg:chrome/khkimila", "pkg:chrome-extension/khkimila"},
-		{"pkg:chrome/khkimila@1.2.3", "pkg:chrome-extension/khkimila@1.2.3"},
+		{"pkg:chrome/khkimiladblfhhmefghkpkoikghmdddf", "pkg:chrome-extension/khkimiladblfhhmefghkpkoikghmdddf"},
+		{"pkg:chrome/khkimiladblfhhmefghkpkoikghmdddf@1.2.3", "pkg:chrome-extension/khkimiladblfhhmefghkpkoikghmdddf@1.2.3"},
 		{"pkg:vscode/saoudrizwan/claude-dev", "pkg:vscode-extension/saoudrizwan/claude-dev"},
-		{"pkg:openvsx/jinryx/crontally", "pkg:vscode-extension/jinryx/crontally?repository_url=https://open-vsx.org"},
-		{"pkg:openvsx/jinryx/crontally@1.0.3", "pkg:vscode-extension/jinryx/crontally@1.0.3?repository_url=https://open-vsx.org"},
+		{"pkg:openvsx/jinryx/crontally", "pkg:vscode-extension/jinryx/crontally?repository_url=https:%2F%2Fopen-vsx.org"},
+		{"pkg:openvsx/jinryx/crontally@1.0.3", "pkg:vscode-extension/jinryx/crontally@1.0.3?repository_url=https:%2F%2Fopen-vsx.org"},
 		{"pkg:debian/curl", "pkg:deb/debian/curl"},
 		{"pkg:arch/pacman@6.0", "pkg:alpm/arch/pacman@6.0"},
 		{"pkg:fedora/curl", "pkg:rpm/fedora/curl"},
@@ -186,7 +186,7 @@ func TestCanonicalizePURL(t *testing.T) {
 		// vendor namespace is case-insensitive and lowercased; a distro value
 		// that names no vendor we model (a bare deb codename) never recovers.
 		{"pkg:rpm/fedora/curl@7.50.3-1.fc25?arch=i386&distro=fedora-25", "pkg:rpm/fedora/curl@7.50.3-1.fc25?arch=i386&distro=fedora-25"},
-		{"pkg:rpm/centerim@4.22.10-1.el6?arch=i686&epoch=1&distro=fedora-25", "pkg:rpm/fedora/centerim@4.22.10-1.el6?arch=i686&epoch=1&distro=fedora-25"},
+		{"pkg:rpm/centerim@4.22.10-1.el6?arch=i686&epoch=1&distro=fedora-25", "pkg:rpm/fedora/centerim@4.22.10-1.el6?arch=i686&distro=fedora-25&epoch=1"},
 		{"pkg:rpm/Fedora/curl@1.0", "pkg:rpm/fedora/curl@1.0"},
 		{"pkg:deb/curl@7.50.3-1?arch=i386&distro=jessie", "pkg:deb/curl@7.50.3-1?arch=i386&distro=jessie"},
 		{"pkg:deb/curl@7.50.3-1?arch=amd64&distro=ubuntu-22.04", "pkg:deb/ubuntu/curl@7.50.3-1?arch=amd64&distro=ubuntu-22.04"},
@@ -213,13 +213,13 @@ func TestCanonicalizePURL(t *testing.T) {
 		},
 		{
 			"pkg:vscode-extension/pub/name?repository_url=https://open-vsx.org@1.0.3",
-			"pkg:vscode-extension/pub/name@1.0.3?repository_url=https://open-vsx.org",
+			"pkg:vscode-extension/pub/name@1.0.3?repository_url=https:%2F%2Fopen-vsx.org",
 		},
 		// A qualifier value containing '@' (URL userinfo) is not a version, and
 		// a repository_url naming something other than the AUR is kept.
 		{
 			"pkg:alpm/arch/yay?repository_url=https://user@example.com/repo",
-			"pkg:alpm/arch/yay?repository_url=https://user@example.com/repo",
+			"pkg:alpm/arch/yay?repository_url=https:%2F%2Fuser%40example.com%2Frepo",
 		},
 
 		// The scheme and type are case-insensitive per spec, and pasted input
@@ -230,7 +230,7 @@ func TestCanonicalizePURL(t *testing.T) {
 		// (legacy mixed-case names are grandfathered and distinct).
 		{"pkg:pypi/Ruamel.Yaml@0.18.6", "pkg:pypi/ruamel-yaml@0.18.6"},
 		{"pkg:composer/Symfony/Console@6.4.0", "pkg:composer/symfony/console@6.4.0"},
-		{"pkg:CHROME/KhKimila", "pkg:chrome-extension/khkimila"},
+		{"pkg:CHROME/KHKIMILADBLFHHMEFGHKPKOIKGHMDDDF", "pkg:chrome-extension/khkimiladblfhhmefghkpkoikghmdddf"},
 		{"  pkg:npm/lodash@1.0.0  ", "pkg:npm/lodash@1.0.0"},
 		{"pkg:RPM/Fedora/curl@1.0", "pkg:rpm/fedora/curl@1.0"},
 
@@ -254,8 +254,8 @@ func TestCanonicalizePURL(t *testing.T) {
 		// Already-canonical or unremapped types pass through untouched.
 		{"pkg:npm/lodash@1.0.0", "pkg:npm/lodash@1.0.0"},
 		{"pkg:alpm/arch/pacman@6.0.1-1?arch=x86_64", "pkg:alpm/arch/pacman@6.0.1-1?arch=x86_64"},
-		{"pkg:chrome-extension/khkimila", "pkg:chrome-extension/khkimila"},
-		{"pkg:vscode-extension/pub/name?repository_url=https://open-vsx.org", "pkg:vscode-extension/pub/name?repository_url=https://open-vsx.org"},
+		{"pkg:chrome-extension/khkimiladblfhhmefghkpkoikghmdddf", "pkg:chrome-extension/khkimiladblfhhmefghkpkoikghmdddf"},
+		{"pkg:vscode-extension/pub/name?repository_url=https://open-vsx.org", "pkg:vscode-extension/pub/name?repository_url=https:%2F%2Fopen-vsx.org"},
 		{"not-a-purl", "not-a-purl"},
 	}
 	for _, tc := range cases {

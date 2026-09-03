@@ -4019,20 +4019,27 @@ func (db *DB) reactivatePrimaryLocationPG(ctx context.Context, sha256, path stri
 	return tag.RowsAffected() > 0, nil
 }
 
-func (db *DB) oldestIncomingLocationsPG(
-	ctx context.Context, before time.Time, limit int, class IncomingClass,
-) ([]*IncomingLocation, error) {
+func (db *DB) oldestIncomingLocationsPG(ctx context.Context, q IncomingQuery) ([]*IncomingLocation, error) {
+	var afterSeen *time.Time
+	var afterSHA string
+	if !q.After.IsZero() {
+		seen := q.After.FirstSeenAt.UTC()
+		afterSeen, afterSHA = &seen, q.After.SHA256
+	}
 	// The join is a memoized nested loop off idx_sl_incoming_seen: the index
 	// supplies the order, and each candidate costs one primary-key probe into
 	// samples. Measured 2026-09-01 on the live corpus, 12ms for 500 rows.
+	// The row-value comparison matches idx_sl_incoming_seen's leading columns,
+	// so resuming is a seek to the cursor rather than a scan up to it.
 	rows, err := db.pool.Query(ctx, `
 		SELECT sl.first_seen_at, sl.mtime, sl.sha256, sl.path, s.label
 		  FROM sample_locations sl JOIN samples s ON s.sha256 = sl.sha256
 		 WHERE sl.parent_sha256 = '' AND sl.path LIKE 'incoming/%'
 		   AND sl.first_seen_at < $1
 		   AND (($2 AND s.label = 'unknown') OR (NOT $2 AND s.label <> 'unknown'))
+		   AND ($4::timestamptz IS NULL OR (sl.first_seen_at, sl.sha256) > ($4, $5))
 		 ORDER BY sl.first_seen_at, sl.sha256, sl.path LIMIT $3`,
-		before.UTC(), class == IncomingUnknown, limit)
+		q.Before.UTC(), q.Class == IncomingUnknown, q.Limit, afterSeen, afterSHA)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: oldest incoming locations: %w", err)
 	}
@@ -4268,6 +4275,116 @@ func (db *DB) pruneMissingLocationsPG(ctx context.Context, absRoot string, maxFr
 	}
 	slog.Info("sample locations retired by prune", "count", len(victims))
 	return len(victims), nil
+}
+
+func (db *DB) repairMissingLocationsPG(ctx context.Context, absRoot string, apply bool) (RepairMissingStats, error) {
+	var stats RepairMissingStats
+	rows, err := db.pool.Query(ctx, `
+		SELECT s.sha256, s.label, s.path, loc.path, loc.last_seen_at
+		FROM samples s
+		LEFT JOIN sample_locations loc
+			ON loc.sha256 = s.sha256 AND (loc.parent_sha256 IS NULL OR loc.parent_sha256 = '')
+		WHERE s.parent = '' AND s.skip = 'missing'`)
+	if err != nil {
+		return stats, fmt.Errorf("hopper: scan missing samples: %w", err)
+	}
+	type group struct {
+		label      string
+		candidates []missingCandidate
+		seen       map[string]bool
+	}
+	groups := make(map[string]*group)
+	order := make([]string, 0)
+	for rows.Next() {
+		var sha, label, currentPath string
+		var locPath *string
+		var lastSeen *time.Time
+		if err := rows.Scan(&sha, &label, &currentPath, &locPath, &lastSeen); err != nil {
+			rows.Close()
+			return stats, fmt.Errorf("hopper: scan missing row: %w", err)
+		}
+		g, ok := groups[sha]
+		if !ok {
+			g = &group{label: label, seen: map[string]bool{}}
+			groups[sha] = g
+			order = append(order, sha)
+		}
+		if currentPath != "" && !g.seen[currentPath] {
+			g.seen[currentPath] = true
+			g.candidates = append(g.candidates, missingCandidate{path: currentPath})
+		}
+		if locPath != nil && *locPath != "" && !g.seen[*locPath] {
+			g.seen[*locPath] = true
+			c := missingCandidate{path: *locPath}
+			if lastSeen != nil {
+				c.lastSeenAt = *lastSeen
+			}
+			g.candidates = append(g.candidates, c)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return stats, err
+	}
+
+	type fix struct{ sha256, path string }
+	var fixes []fix
+	for _, sha := range order {
+		g := groups[sha]
+		stats.Checked++
+		var found []missingCandidate
+		for _, c := range g.candidates {
+			resolved, ok := prunePathResolve(absRoot, c.path)
+			if !ok {
+				continue
+			}
+			if _, statErr := os.Stat(resolved); statErr == nil {
+				found = append(found, c)
+			}
+		}
+		chosen := pickRevivalPath(g.label, found)
+		if chosen == "" {
+			stats.StillMissing++
+			continue
+		}
+		stats.Fixed++
+		if apply {
+			fixes = append(fixes, fix{sha256: sha, path: chosen})
+		}
+	}
+
+	if !apply || len(fixes) == 0 {
+		return stats, nil
+	}
+
+	shas := make([]string, len(fixes))
+	paths := make([]string, len(fixes))
+	for i, f := range fixes {
+		shas[i], paths[i] = f.sha256, f.path
+	}
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return stats, fmt.Errorf("hopper: begin repair-missing: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO label_events (sha256, from_label, to_label, from_skip, to_skip, reason, observed_at)
+		SELECT sha256, label, label, 'missing', '', 'repair-missing', now()
+		FROM samples WHERE sha256 = ANY($1) AND skip = 'missing'`, shas); err != nil {
+		return stats, fmt.Errorf("hopper: repair-missing audit: %w", err)
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE samples s SET skip = '', path = v.path, updated_at = now()
+		FROM unnest($1::text[], $2::text[]) AS v(sha256, path)
+		WHERE s.sha256 = v.sha256 AND s.skip = 'missing'`, shas, paths)
+	if err != nil {
+		return stats, fmt.Errorf("hopper: repair-missing update: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return stats, fmt.Errorf("hopper: commit repair-missing: %w", err)
+	}
+	slog.Info("repair-missing revived samples", "count", tag.RowsAffected())
+	return stats, nil
 }
 
 func (db *DB) updateCleaveResultPG(
