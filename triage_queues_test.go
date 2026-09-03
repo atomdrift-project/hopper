@@ -97,6 +97,44 @@ func TestTriageUnknownPoolsAreDisjoint(t *testing.T) {
 	}
 }
 
+// TestTriageReviewDrainsViaReport pins review's non-relabel drain path: the
+// move into review/ is path-only (the label stays "unknown"), so a CONFIRMING
+// judgement — cyclotron decides the standing state is fine and issues no
+// good/bad/sighted ruling — has no relabel to leave the selector on. Like
+// second/bad/discord (and unlike sighted, whose anti-join predates this and is
+// baked into triageSightedWhere directly), review carries no anti-join of its
+// own: draining on a "review" report is the caller's ExcludeReportType, via
+// queueFilter — exactly how TriageQueues["review"].Select calls it.
+func TestTriageReviewDrainsViaReport(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	sha := fmt.Sprintf("%064x", byte(7))
+	mustInsert(t, ctx, db, &Sample{SHA256: sha, Label: "unknown", Path: "review/forager/g.tgz"})
+	mustAnalyzeWithTraits(t, ctx, db, sha, 0, "")
+
+	filter := queueFilter("review", TriageFilter{})
+	rows, err := db.TriageReview(ctx, 20, filter)
+	if err != nil {
+		t.Fatalf("TriageReview: %v", err)
+	}
+	if !shaSet(rows)[sha] {
+		t.Fatalf("TriageReview should include an unjudged review-pool sample")
+	}
+
+	if err := db.InsertReport(ctx, &Report{SHA256: sha, Type: "review", Content: "confirmed, no change"}); err != nil {
+		t.Fatalf("InsertReport(review): %v", err)
+	}
+
+	rows, err = db.TriageReview(ctx, 20, filter)
+	if err != nil {
+		t.Fatalf("TriageReview after report: %v", err)
+	}
+	if shaSet(rows)[sha] {
+		t.Error("TriageReview re-offered a sample already confirmed by a review report")
+	}
+}
+
 // TestTriageSightedUsesLedgerScope pins the queue's contract with the sightings
 // ledger: exact releases match exactly, an unscoped package claim matches every
 // release, suspicious claims are reviewed, vulnerability-only records are not,

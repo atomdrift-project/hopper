@@ -359,6 +359,20 @@ var TriageQueues = map[string]Queue{
 		return db.TriageSighted(ctx, n, queueFilter("sighted", TriageFilter{}))
 	}},
 
+	// review: promoter's own corroboration rule found exactly one signal on an
+	// unknown-labeled sample and moved it here rather than leaving it
+	// unresolved (see promoter's dispReview/RuleReview) → confirm the standing
+	// label, or overturn it with a good/bad/sighted ruling. The move is
+	// path-only (label stays "unknown"), so an overturning ruling drains via
+	// the ordinary relabel and a confirming one drains via a "review" report
+	// (queueFilter's ExcludeReportType), exactly like second/acquit/highest/
+	// lowest. Its predicate is a plain path check, so — like discord and
+	// sighted — the selection counted is already what the queue can hand out;
+	// no CountSelect override needed.
+	"review": {Name: "review", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+		return db.TriageReview(ctx, n, queueFilter("review", TriageFilter{}))
+	}},
+
 	// second: good-labeled samples whose benign label an outside source disputes
 	// (a trusted malware-hosting source, or 2+ independent sources) → re-judge
 	// with a premium provider chain, write traits, and relabel when the model
