@@ -4290,8 +4290,8 @@ func (db *DB) repairMissingLocationsPG(ctx context.Context, absRoot string, appl
 	}
 	type group struct {
 		label      string
-		candidates []missingCandidate
 		seen       map[string]bool
+		candidates []missingCandidate
 	}
 	groups := make(map[string]*group)
 	order := make([]string, 0)

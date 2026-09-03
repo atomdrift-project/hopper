@@ -66,7 +66,8 @@ commands:
   normalize-ecosystems  re-canonicalize stored ecosystem labels (dry-run)
   cleanup            delete wonky samples by skip category (interactive)
   prune              drop location rows for files gone from disk, mark orphaned samples missing (run on the full mirror)
-  repair-missing     re-check skip='missing' samples against known locations; revive + repoint path if bytes are found (--dry-run by default; --apply to write)
+  repair-missing     re-check skip='missing' samples against known locations; revive + repoint
+                     path if bytes are found (--dry-run by default; --apply to write)
   rescan             queue files for repair-tier re-analysis (--missing-members or SHA-256 args)
   triage             fetch mislabeled samples to /var/tmp/hopper-triage
   post-triage        apply triage verdicts: re-scan, move + flip mislabeled samples

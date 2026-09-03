@@ -1,6 +1,7 @@
 package hopper
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,7 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -375,7 +376,7 @@ func publishMoveFile(ctx context.Context, src, dst, expected string, donors []st
 		return false, err
 	}
 	h := sha256.New()
-	_, copyErr := copyMoveContext(ctx, io.MultiWriter(tmp, h), in)
+	copyErr := copyMoveContext(ctx, io.MultiWriter(tmp, h), in)
 	closeInErr := in.Close()
 	if copyErr == nil {
 		copyErr = closeInErr
@@ -469,8 +470,8 @@ func LinkDuplicateLocations(ctx context.Context, dataRoot, sha string, rels []st
 			result.Skipped++
 			continue
 		}
-		dev := uint64(st.Dev) //nolint:unconvert,nolintlint // Dev is int32 on some platforms
-		byDevice[dev] = append(byDevice[dev], dedupeCandidate{abs: abs, ino: uint64(st.Ino), size: st.Size})
+		dev := uint64(st.Dev) //nolint:gosec,unconvert,nolintlint // Dev is int32 on Darwin and uint64 on Linux
+		byDevice[dev] = append(byDevice[dev], dedupeCandidate{abs: abs, ino: st.Ino, size: st.Size})
 	}
 	for _, group := range byDevice {
 		if err := ctx.Err(); err != nil {
@@ -506,11 +507,11 @@ func dedupeGroup(ctx context.Context, sha string, group []dedupeCandidate, dryRu
 	for _, c := range group {
 		counts[c.ino]++
 	}
-	sort.SliceStable(group, func(i, j int) bool {
-		if counts[group[i].ino] != counts[group[j].ino] {
-			return counts[group[i].ino] > counts[group[j].ino]
+	slices.SortStableFunc(group, func(a, b dedupeCandidate) int {
+		if c := cmp.Compare(counts[b.ino], counts[a.ino]); c != 0 {
+			return c
 		}
-		return group[i].abs < group[j].abs
+		return strings.Compare(a.abs, b.abs)
 	})
 
 	if dryRun {
@@ -623,7 +624,7 @@ func hashMoveReader(ctx context.Context, f *os.File) (string, error) {
 		return "", err
 	}
 	h := sha256.New()
-	if _, err := copyMoveContext(ctx, h, f); err != nil {
+	if err := copyMoveContext(ctx, h, f); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
@@ -731,29 +732,27 @@ func moveCopyFallback(err error) bool {
 		errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.EMLINK)
 }
 
-func copyMoveContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
+func copyMoveContext(ctx context.Context, dst io.Writer, src io.Reader) error {
 	buf := make([]byte, 1024*1024)
-	var written int64
 	for {
 		if err := ctx.Err(); err != nil {
-			return written, err
+			return err
 		}
 		n, readErr := src.Read(buf)
 		if n > 0 {
 			m, writeErr := dst.Write(buf[:n])
-			written += int64(m)
 			if writeErr != nil {
-				return written, writeErr
+				return writeErr
 			}
 			if m != n {
-				return written, io.ErrShortWrite
+				return io.ErrShortWrite
 			}
 		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
-				return written, nil
+				return nil
 			}
-			return written, readErr
+			return readErr
 		}
 	}
 }

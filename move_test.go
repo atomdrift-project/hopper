@@ -296,7 +296,9 @@ func crossDeviceDir(t *testing.T, want string) string {
 	if err := syscall.Stat(want, &target); err != nil {
 		t.Fatal(err)
 	}
-	for _, base := range []string{"/dev/shm", os.TempDir(), os.Getenv("HOME")} {
+	// t.TempDir() lives on os.TempDir(), which may be the very filesystem
+	// this helper is trying to escape, so the bases are probed by hand.
+	for _, base := range []string{"/dev/shm", os.TempDir(), os.Getenv("HOME")} { //nolint:usetesting // see above
 		if base == "" {
 			continue
 		}
@@ -304,7 +306,7 @@ func crossDeviceDir(t *testing.T, want string) string {
 		if err := syscall.Stat(base, &candidate); err != nil || candidate.Dev == target.Dev {
 			continue
 		}
-		dir, err := os.MkdirTemp(base, "hopper-xdev-")
+		dir, err := os.MkdirTemp(base, "hopper-xdev-") //nolint:usetesting // must land on base, not os.TempDir()
 		if err != nil {
 			continue
 		}
@@ -321,7 +323,7 @@ func moveTestInode(t *testing.T, name string) uint64 {
 	if err := syscall.Stat(name, &st); err != nil {
 		t.Fatal(err)
 	}
-	return uint64(st.Ino)
+	return st.Ino
 }
 
 // TestPublishMoveFilePrefersDonorOverCopy is the point of the whole donor path:
@@ -521,7 +523,7 @@ func TestLinkDuplicateLocations(t *testing.T) {
 	t.Run("is idempotent", func(t *testing.T) {
 		root := t.TempDir()
 		writeDedupeFile(t, root, "good/a.tgz", content)
-		if err := os.Link(filepath.Join(root, "good/a.tgz"), filepath.Join(root, "good/b.tgz")); err != nil {
+		if err := os.Link(filepath.Join(root, "good", "a.tgz"), filepath.Join(root, "good", "b.tgz")); err != nil {
 			t.Fatal(err)
 		}
 		result, err := LinkDuplicateLocations(ctx, root, sha, []string{"good/a.tgz", "good/b.tgz"}, false)
@@ -564,11 +566,11 @@ func TestLinkDuplicateLocations(t *testing.T) {
 		if result.Linked != 0 || result.Skipped != 2 {
 			t.Fatalf("result = %+v", result)
 		}
-		if got, _ := os.ReadFile(a); !bytes.Equal(got, other) {
-			t.Error("survivor was modified")
+		if got, err := os.ReadFile(a); err != nil || !bytes.Equal(got, other) {
+			t.Errorf("survivor was modified: %q, %v", got, err)
 		}
-		if got, _ := os.ReadFile(z); !bytes.Equal(got, content) {
-			t.Error("good copy was overwritten from a bad survivor")
+		if got, err := os.ReadFile(z); err != nil || !bytes.Equal(got, content) {
+			t.Errorf("good copy was overwritten from a bad survivor: %q, %v", got, err)
 		}
 	})
 

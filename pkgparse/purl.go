@@ -1,8 +1,10 @@
 package pkgparse
 
 import (
-	"sort"
+	"slices"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // This is the single source of truth for building canonical Package URLs (PURLs,
@@ -416,7 +418,7 @@ func distroSpec(key string) (distroPURL, bool) {
 func (d distroPURL) name(raw string) string {
 	name := lastSegment(raw)
 	if d.lowerName {
-		return asciiLower(name)
+		return purlLower(name)
 	}
 	return name
 }
@@ -474,8 +476,13 @@ func encodePURLPath(purl string) string {
 	if len(purl) < 4 || !strings.EqualFold(purl[:4], "pkg:") {
 		return purl
 	}
-	typ, rest, ok := strings.Cut(purl[4:], "/")
-	if !ok {
+	typ, rest, ok := strings.Cut(strings.TrimLeft(purl[4:], "/"), "/")
+	if !ok || !validPurlType(typ) {
+		// canonicalizePURL already returned this purl untouched because it
+		// has no canonical form (here, no real type — the split above would
+		// otherwise read into the path or a qualifier value as if it were
+		// one). Encoding a piece of that pass-through would half-rewrite
+		// something the caller already decided was invalid.
 		return purl
 	}
 	path, tail := rest, ""
@@ -506,6 +513,32 @@ func purlPathNeedsEncoding(path string) bool {
 		}
 	}
 	return false
+}
+
+// validPurlType reports whether typ is a syntactically valid PURL type token:
+// spec grammar is one ASCII letter followed by letters, digits, '.', or '-'.
+// Mirrors fletch's valid_type; without this a purl with no real '/' before
+// its qualifiers or version (e.g. "pkg:/lodash?repository_url=https://…")
+// reads everything up to the first accidental '/' — inside the qualifier
+// value — as the type instead of being refused.
+func validPurlType(typ string) bool {
+	if typ == "" || !purlAlpha(typ[0]) {
+		return false
+	}
+	for i := range len(typ) {
+		if c := typ[i]; !purlAlpha(c) && !purlDigit(c) && c != '.' && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func purlAlpha(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
+
+func purlDigit(c byte) bool {
+	return c >= '0' && c <= '9'
 }
 
 // purlTypeAllows reports whether a canonical PURL satisfies its type's
@@ -541,6 +574,8 @@ func purlTypeAllows(purl string) bool {
 		if namespace != "" {
 			return false
 		}
+	default:
+		// purlNamespaceOptional: either spelling is a valid coordinate.
 	}
 
 	switch typ {
@@ -573,6 +608,8 @@ func purlTypeAllows(purl string) bool {
 		if _, _, found := cutQualifier(tail, "tag_id"); !found {
 			return false
 		}
+	default:
+		// No per-type shape rule beyond the namespace check above.
 	}
 	return true
 }
@@ -640,6 +677,118 @@ func chromeVersionShape(v string) bool {
 	return true
 }
 
+// splitPurlCoordinate splits rest — everything after "pkg:<type>/" — into the
+// canonical path (namespace/name, with a literal npm scope already folded to
+// its escaped spelling) and tail ("@version?qualifiers", qualifier values
+// already canonicalized), or reports ok=false when rest names no coordinate
+// fletch would accept either. typ is already lowercased.
+func splitPurlCoordinate(typ, rest string) (path, tail string, ok bool) {
+	// Split the remainder into the coordinate (namespace/name@version) and the
+	// qualifier tail at the last '?', mirroring fletch's
+	// parse_purl_components: a second raw '?' left earlier in the coordinate
+	// is not data (it would have to be percent-encoded to be), so that shape
+	// has no canonical form either.
+	coordinate, qualifiers, hasQualifiers := rest, "", false
+	if i := strings.LastIndexByte(rest, '?'); i >= 0 {
+		coordinate, qualifiers, hasQualifiers = rest[:i], rest[i+1:], true
+		if strings.Contains(coordinate, "?") {
+			return "", "", false
+		}
+	}
+
+	// A version is the coordinate's rightmost '@' — except for npm, where a
+	// *leading* '@' opens a scope ("@scope/name") rather than a version, so
+	// its version (if any) is the rightmost '@' after the '/' that closes the
+	// scope. Determined up front because the repair below is only valid when
+	// the coordinate does not already carry a version of its own.
+	coordinateHasVersion := strings.Contains(coordinate, "@")
+	if typ == "npm" && strings.HasPrefix(coordinate, "@") {
+		coordinateHasVersion = false
+		if slash := strings.IndexByte(coordinate, '/'); slash >= 0 {
+			coordinateHasVersion = strings.Contains(coordinate[slash+1:], "@")
+		}
+	}
+
+	// Repair the non-spec "?qualifiers@version" ordering older exports
+	// emitted (a version appended to a qualifier-bearing purl_base): recover
+	// the trailing version and move it back before the qualifiers. Only when
+	// the coordinate has no version of its own — fletch's
+	// !coordinate_has_version gate — so a qualifier value that legitimately
+	// ends in "@something" (a repository_url with userinfo) next to an
+	// explicit version is never misread as one. The chunk after the last '@'
+	// is only a version when it is free of '='/'&'/'/', any of which would
+	// mark it as still part of the value.
+	repairedVersion := ""
+	if !coordinateHasVersion && hasQualifiers {
+		if i := strings.LastIndexByte(qualifiers, '@'); i >= 0 {
+			if v := qualifiers[i+1:]; v != "" && !strings.ContainsAny(v, "=&/") {
+				repairedVersion, qualifiers = v, qualifiers[:i]
+			}
+		}
+	}
+
+	coordinate = strings.Trim(coordinate, "/")
+
+	// Split the coordinate into path and version. A repaired version already
+	// claims the version slot, so the whole coordinate — leading '@' and
+	// all — is the path (fletch's repaired_version branch bypasses the
+	// scope/version split entirely: "pkg:npm/@1.0.0?repository_url=…@1.2-1"
+	// names the package "@1.0.0", versioned "1.2-1", never an empty name
+	// plus two competing version readings).
+	var version string
+	switch {
+	case repairedVersion != "":
+		path, version = coordinate, repairedVersion
+	case typ == "npm" && strings.HasPrefix(coordinate, "@"):
+		slash := strings.IndexByte(coordinate, '/')
+		if slash < 0 {
+			// An unclosed scope with no recoverable version has no
+			// canonical form — pass the input through untouched.
+			return "", "", false
+		}
+		if rel := strings.LastIndexByte(coordinate[slash+1:], '@'); rel >= 0 {
+			sep := slash + 1 + rel
+			path, version = coordinate[:sep], coordinate[sep+1:]
+		} else {
+			path = coordinate
+		}
+	default:
+		if i := strings.LastIndexByte(coordinate, '@'); i >= 0 {
+			path, version = coordinate[:i], coordinate[i+1:]
+		} else {
+			path = coordinate
+		}
+	}
+	path = strings.Trim(path, "/")
+	// A degenerate coordinate (empty type or name) has no canonical form —
+	// the Rust twin (fletch's purl::normalize) rejects these outright — so
+	// report failure rather than half-rewriting it.
+	if typ == "" || path == "" {
+		return "", "", false
+	}
+	// Fold a literal npm scope onto the escaped spelling renderPURL produces,
+	// so a purl this package generated and one pasted in by hand are the same
+	// key. Mirrors fletch's purl::normalize, which applies this to every
+	// type, not only npm: the split above already reads a leading '@' as part
+	// of the path whatever the type is, so it folds the same way here.
+	if scope, found := strings.CutPrefix(path, "@"); found {
+		path = "%40" + scope
+	}
+	// An empty version ("pkg:npm/x@") is the same as no version at all, so it
+	// never reaches here as a non-empty string; only a real version adds the
+	// '@' back.
+	if version != "" {
+		tail = "@" + version
+	}
+	if qualifiers != "" {
+		tail += "?" + qualifiers
+	}
+	// Qualifier values arrive in whatever spelling the producer used; fold them
+	// onto the canonical encoding before any branch inspects or rebuilds the
+	// tail, so every return path below emits one spelling.
+	return path, canonicalQualifiers(tail), true
+}
+
 func canonicalizePURL(purl string) string {
 	// The `pkg` scheme and the type are case-insensitive per spec (and pasted
 	// purls arrive padded), so fold their case and trim before anything else —
@@ -648,77 +797,29 @@ func canonicalizePURL(purl string) string {
 	if len(purl) < 4 || !strings.EqualFold(purl[:4], "pkg:") {
 		return purl
 	}
-	typ, rest, ok := strings.Cut(purl[4:], "/")
+	// A body that opens with one or more '/' (a stray "pkg:///fedora/curl")
+	// carries no data in them — mirrors fletch's body.trim_start_matches('/')
+	// — so they're noise to strip before the first '/' is taken as the type
+	// boundary, not an empty type with the real type pushed into the path.
+	body := strings.TrimLeft(purl[4:], "/")
+	typ, rest, ok := strings.Cut(body, "/")
 	if !ok {
+		return purl
+	}
+	// A type is a spec token, not free text: fletch's valid_type refuses
+	// anything else, so a purl with no '/' before its first qualifier or
+	// version — the "type" split above then grabbing "name?key=value…:" —
+	// has no canonical form. Checked before the fold below since case does
+	// not change which bytes qualify.
+	if !validPurlType(typ) {
 		return purl
 	}
 	typ = asciiLower(typ)
 
-	// Split the remainder into path and the version/qualifier tail so we can
-	// re-key the type without disturbing "@version" or "?qualifiers".
-	//
-	// A *leading* '@' opens an npm scope ("@scope/name"), never a version: a
-	// coordinate path cannot begin with its own version separator. Searching
-	// from 0 would take the whole path as the tail, leaving an empty name that
-	// the guard below then passes through unchanged — so every scoped package
-	// kept whichever spelling it arrived in, while renderPURL emits the escaped
-	// "%40scope". Two keys for one package. purlVersionIndex already guards the
-	// same trap; this is the site that missed it.
-	//
-	// It is a scope only when a '/' closes it. Where the next delimiter is a
-	// version or a qualifier instead, the '@' really does open a version over
-	// an empty name ("pkg:npm/@1.0.0"), which must still reach the guard.
-	scopeSigil := 0
-	if strings.HasPrefix(rest, "@") {
-		if i := strings.IndexAny(rest[1:], "/@?"); i >= 0 && rest[1+i] == '/' {
-			scopeSigil = 1
-		}
-	}
-	path, tail := rest, ""
-	if i := strings.IndexAny(rest[scopeSigil:], "@?"); i >= 0 {
-		path, tail = rest[:scopeSigil+i], rest[scopeSigil+i:]
-	}
-	// A degenerate coordinate (empty type or name) has no canonical form —
-	// the Rust twin (fletch's purl::normalize) rejects these outright — so
-	// pass the input through untouched rather than half-rewriting it.
-	if typ == "" || lastSegment(path) == "" {
+	path, tail, ok := splitPurlCoordinate(typ, rest)
+	if !ok {
 		return purl
 	}
-	// Fold a literal npm scope onto the escaped spelling renderPURL produces,
-	// so a purl this package generated and one pasted in by hand are the same
-	// key. Mirrors fletch's purl::normalize; distro namespaces are vendors and
-	// never carry the sigil, so this is a no-op for them.
-	if scope, found := strings.CutPrefix(path, "@"); found {
-		path = "%40" + scope
-	}
-	// Repair the non-spec "?qualifiers@version" ordering older exports emitted
-	// (a version appended to a qualifier-bearing purl_base): move the trailing
-	// version back before the qualifiers. The chunk after the last '@' is only
-	// a version when it is free of '='/'&'/'/', any of which would mark it as
-	// part of a qualifier value (e.g. a repository_url with userinfo) instead.
-	// (No change flag: the unchanged-input paths below compare their rebuilt
-	// output against the input, which detects this repair, a recovered or
-	// re-cased namespace, and a folded scheme/type alike.)
-	if strings.HasPrefix(tail, "?") {
-		if i := strings.LastIndexByte(tail, '@'); i > 0 {
-			if v := tail[i+1:]; v != "" && !strings.ContainsAny(v, "=&/") {
-				tail = "@" + v + tail[:i]
-			}
-		}
-	}
-
-	// An empty version is the same as no version — "pkg:npm/x@" and "pkg:npm/x"
-	// name one coordinate — so drop the bare sigil rather than keying twice.
-	if ver, quals, hasQ := strings.Cut(tail, "?"); ver == "@" {
-		tail = ""
-		if hasQ {
-			tail = "?" + quals
-		}
-	}
-	// Qualifier values arrive in whatever spelling the producer used; fold them
-	// onto the canonical encoding before any branch inspects or rebuilds the
-	// tail, so every return path below emits one spelling.
-	tail = canonicalQualifiers(tail)
 
 	switch typ {
 	// The extension types are case-insensitive per spec (store ids are
@@ -753,10 +854,10 @@ func canonicalizePURL(purl string) string {
 		// the other alpm namespaces (the official repos), are already
 		// canonical.
 		if val, rest, found := cutQualifier(tail, "repository_url"); found && strings.Contains(val, "aur.archlinux.org") {
-			return "pkg:alpm/aur/" + asciiLower(lastSegment(vendored)) + rest
+			return "pkg:alpm/aur/" + purlLower(lastSegment(vendored)) + rest
 		}
 		if name, found := strings.CutPrefix(vendored, "aur/"); found {
-			return "pkg:alpm/aur/" + asciiLower(name) + tail
+			return "pkg:alpm/aur/" + purlLower(name) + tail
 		}
 		if out := "pkg:alpm/" + vendored + tail; out != purl {
 			return out
@@ -800,12 +901,12 @@ func distroPath(typ, path, tail string) string {
 	foldName := typ == "deb" || typ == "apk" || typ == "alpm"
 	if ns, name, found := strings.Cut(path, "/"); found {
 		if foldName {
-			name = asciiLower(name)
+			name = purlLower(name)
 		}
-		return asciiLower(ns) + "/" + name
+		return purlLower(ns) + "/" + name
 	}
 	if foldName {
-		path = asciiLower(path)
+		path = purlLower(path)
 	}
 	if val, _, found := cutQualifier(tail, "distro"); found {
 		vendor, _, _ := strings.Cut(val, "-")
@@ -946,26 +1047,27 @@ func canonicalQualifiers(tail string) string {
 	if !ok || quals == "" {
 		return tail
 	}
-	parts := strings.Split(quals, "&")
-	keys := make([]string, len(parts))
-	for i, q := range parts {
+	type qualifier struct{ key, text string }
+	parts := make([]qualifier, 0, strings.Count(quals, "&")+1)
+	for q := range strings.SplitSeq(quals, "&") {
 		key, val, hasEq := strings.Cut(q, "=")
-		keys[i] = asciiLower(key)
-		if !hasEq || val == "" {
-			continue
+		if hasEq && val != "" {
+			if decoded, ok := unescapePURL(val); ok {
+				q = key + "=" + escapePURL(decoded)
+			}
 		}
-		decoded, ok := unescapePURL(val)
-		if !ok {
-			continue
-		}
-		parts[i] = key + "=" + escapePURL(decoded)
+		parts = append(parts, qualifier{key: asciiLower(key), text: q})
 	}
 	// The spec orders qualifiers by key, and fletch holds them in a BTreeMap,
 	// so the same set written in two orders is one canonical string. Sorted by
 	// the lowercased key because keys are case-insensitive; stable so a
 	// repeated key keeps the order it arrived in rather than shuffling.
-	sort.SliceStable(parts, func(i, j int) bool { return keys[i] < keys[j] })
-	return ver + "?" + strings.Join(parts, "&")
+	slices.SortStableFunc(parts, func(a, b qualifier) int { return strings.Compare(a.key, b.key) })
+	texts := make([]string, len(parts))
+	for i, p := range parts {
+		texts[i] = p.text
+	}
+	return ver + "?" + strings.Join(texts, "&")
 }
 
 func addQualifier(tail, qualifier string) string {
@@ -1000,30 +1102,101 @@ func splitExtensionID(name string) (publisher, ext string) {
 }
 
 // asciiLower lowercases ASCII letters only, leaving every other byte
-// untouched — the exact fold Rust's to_ascii_lowercase applies, so the two
-// canonicalizers stay byte-identical even on non-ASCII names (which
-// strings.ToLower would case-fold differently).
+// untouched — the exact fold Rust's to_ascii_lowercase applies. Most PURL
+// components fletch folds this way; the handful it instead folds with real
+// Unicode casing (a distro package's name and vendor namespace) use
+// [purlLower] below. A "%XX" percent-escape is
+// copied through byte-for-byte: its hex digits encode a byte, not a letter,
+// and this runs on the pre-escaping path — so on a second pass, once that
+// path already carries a canonical (uppercase-hex) escape from the first,
+// lowercasing "C" in "%C3" would make CanonicalizePURL diverge from its own
+// output instead of being a fixed point.
 func asciiLower(s string) string {
-	lower := func(r rune) rune {
-		if r >= 'A' && r <= 'Z' {
-			return r + ('a' - 'A')
+	if !strings.ContainsRune(s, '%') {
+		lower := func(r rune) rune {
+			if r >= 'A' && r <= 'Z' {
+				return r + ('a' - 'A')
+			}
+			return r
 		}
-		return r
+		return strings.Map(lower, s)
 	}
-	return strings.Map(lower, s)
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c == '%' && i+2 < len(s) {
+			if _, ok := unhex(s[i+1]); ok {
+				if _, ok := unhex(s[i+2]); ok {
+					b.WriteString(s[i : i+3])
+					i += 2
+					continue
+				}
+			}
+		}
+		if c := s[i]; c >= 'A' && c <= 'Z' {
+			b.WriteByte(c + ('a' - 'A'))
+		} else {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// purlLower is asciiLower's Unicode-aware counterpart. fletch's
+// apply_type_rules folds a distro package's name and vendor namespace
+// (deb/apk/alpm; rpm's namespace only, since its name is case-sensitive)
+// with Rust's real str::to_lowercase(), not the ASCII-only fold every other
+// component gets — so "Ünicode" there really does become "ünicode", not stay
+// unchanged the way asciiLower would leave it. A "%XX" percent-escape is left
+// alone for the same reason asciiLower leaves one alone.
+func purlLower(s string) string {
+	if !strings.ContainsRune(s, '%') {
+		return strings.ToLower(s)
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if c := s[i]; c == '%' && i+2 < len(s) {
+			if _, ok := unhex(s[i+1]); ok {
+				if _, ok := unhex(s[i+2]); ok {
+					b.WriteString(s[i : i+3])
+					i += 3
+					continue
+				}
+			}
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		b.WriteRune(unicode.ToLower(r))
+		i += size
+	}
+	return b.String()
 }
 
 // pep503 normalizes a PyPI project name per PEP 503 — ASCII-lowercase, any run
 // of '-'/'_'/'.' collapsed to a single '-' — the registry's own name
 // equivalence. filefacts' manifest parser and fletch's purl::normalize apply
 // the same fold, so a requirements.txt spelling and a download-derived
-// spelling of one project always share a key.
+// spelling of one project always share a key. A "%XX" percent-escape is left
+// alone for the same reason [asciiLower] leaves one alone: its hex digits are
+// not letters, and mangling their case would break CanonicalizePURL's fixed
+// point on its own already-escaped output.
 func pep503(name string) string {
 	var b strings.Builder
 	b.Grow(len(name))
 	sep := false
-	for _, r := range name {
-		if r == '-' || r == '_' || r == '.' {
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; c == '%' && i+2 < len(name) {
+			if _, ok := unhex(name[i+1]); ok {
+				if _, ok := unhex(name[i+2]); ok {
+					b.WriteString(name[i : i+3])
+					i += 2
+					sep = false
+					continue
+				}
+			}
+		}
+		c := name[i]
+		if c == '-' || c == '_' || c == '.' {
 			if !sep {
 				b.WriteByte('-')
 				sep = true
@@ -1031,10 +1204,10 @@ func pep503(name string) string {
 			continue
 		}
 		sep = false
-		if r >= 'A' && r <= 'Z' {
-			r += 'a' - 'A'
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
 		}
-		b.WriteRune(r)
+		b.WriteByte(c)
 	}
 	return b.String()
 }

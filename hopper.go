@@ -2956,8 +2956,8 @@ type RepairMissingStats struct {
 // from sample_locations (a hardlink into another pool dir, or a location
 // recorded before/after the one that got marked missing).
 type missingCandidate struct {
-	path       string
 	lastSeenAt time.Time // zero for the samples.path candidate itself
+	path       string
 }
 
 // pickRevivalPath chooses which on-disk candidate becomes the new

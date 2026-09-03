@@ -6749,8 +6749,8 @@ func TestRepairMissingLocations(t *testing.T) {
 	mustInsert(t, ctx, db, &Sample{SHA256: poolTieBreak, Source: "test", Label: "bad", LabelSource: "test", Path: "bad/original.js"})
 	writeUnder("sighted/dup.js")
 	writeUnder("bad/dup.js")
-	addLocation(poolTieBreak, "sighted/dup.js", time.Now().Add(-time.Hour))  // more recently seen…
-	addLocation(poolTieBreak, "bad/dup.js", time.Now().Add(-2*time.Hour))    // …but this is the label's own pool dir
+	addLocation(poolTieBreak, "sighted/dup.js", time.Now().Add(-time.Hour)) // more recently seen…
+	addLocation(poolTieBreak, "bad/dup.js", time.Now().Add(-2*time.Hour))   // …but this is the label's own pool dir
 	markMissing(poolTieBreak, "bad/original.js")
 
 	// Dry-run: reports the fix but writes nothing.

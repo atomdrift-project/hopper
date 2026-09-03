@@ -111,7 +111,7 @@ func TestReportCooldownRequiresRescanAndAge(t *testing.T) {
 
 	clause, args := triageFilterClauseSQLite(queueFilter("bad", TriageFilter{}), "samples")
 	rows, err := db.lite.QueryContext(ctx,
-		`SELECT sha256 FROM samples WHERE label = 'bad'`+clause, args...) //nolint:gosec // test-local clause
+		`SELECT sha256 FROM samples WHERE label = 'bad'`+clause, args...)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}

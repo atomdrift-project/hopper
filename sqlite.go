@@ -2249,8 +2249,8 @@ func (db *DB) repairMissingLocationsSQLite(ctx context.Context, absRoot string, 
 	}
 	type group struct {
 		label      string
-		candidates []missingCandidate
 		seen       map[string]bool
+		candidates []missingCandidate
 	}
 	groups := make(map[string]*group)
 	order := make([]string, 0)
@@ -2336,9 +2336,11 @@ func (db *DB) repairMissingLocationsSQLite(ctx context.Context, absRoot string, 
 		if err != nil {
 			return stats, fmt.Errorf("hopper: repair-missing update %s: %w", f.sha256, err)
 		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			revived += n
+		n, err := res.RowsAffected()
+		if err != nil {
+			return stats, fmt.Errorf("hopper: repair-missing rows affected %s: %w", f.sha256, err)
 		}
+		revived += n
 	}
 	if err := tx.Commit(); err != nil {
 		return stats, fmt.Errorf("hopper: commit repair-missing: %w", err)
