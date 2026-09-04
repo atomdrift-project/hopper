@@ -2670,6 +2670,27 @@ func (db *DB) LocationsForSHA(ctx context.Context, sha256 string) ([]*SampleLoca
 	return db.locationsForSHASQLite(ctx, sha256)
 }
 
+// DonorLocationsForSHA returns up to limit top-level locations of sha256 inside
+// pool — link candidates for a move whose destination is in that pool.
+//
+// Unordered on purpose. The caller wants any live copy on the destination's
+// dataset, not a particular one, and every candidate is verified after linking
+// and falls back to a copy if it fails (see publishMoveLink). Ordering the
+// matches would reintroduce the cost this exists to avoid: the empty file has
+// ~363k locations under incoming/ alone, so "sort them and take four" is a sort
+// of hundreds of thousands of rows, while "stop after four" is four index
+// entries. See idx_sl_donor for why the pool bound is a collation-pinned range
+// rather than a LIKE.
+func (db *DB) DonorLocationsForSHA(ctx context.Context, sha256, pool string, limit int) ([]*SampleLocation, error) {
+	if pool == "" || limit <= 0 {
+		return nil, nil
+	}
+	if db.pool != nil {
+		return db.donorLocationsForSHAPG(ctx, sha256, pool, limit)
+	}
+	return db.donorLocationsForSHASQLite(ctx, sha256, pool, limit)
+}
+
 // TopLevelLocationsRecorded reports whether sha256 has a top-level location at
 // each of two exact paths, in one round trip.
 //

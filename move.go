@@ -690,18 +690,38 @@ func publishMoveLink(ctx context.Context, donor, dst, expected, dir string) (boo
 // A lookup failure returns no donors rather than an error: publishing by copy
 // is always correct, and a move must not fail because an optimization could not
 // find its inputs.
+//
+// Both the pool restriction and the count are asked of the database rather than
+// applied to everything it can return. A sha's fan-out is savagely skewed — p50
+// is 1 location, the empty file sits in ~7.2M — so a form proportional to it
+// means minutes per move on exactly the tiny ubiquitous files a hot-pool drain
+// has the most of. A couple more than maxMoveDonors are fetched because the two
+// paths selectMoveDonors excludes may be among the first returned.
 func (db *DB) moveDonors(ctx context.Context, root, sha, oldRel, newRel string) []string {
 	pool, _, ok := strings.Cut(newRel, "/")
 	if !ok {
 		return nil
 	}
-	locs, err := db.TopLevelLocationsForSHA(ctx, sha)
+	locs, err := db.DonorLocationsForSHA(ctx, sha, pool, maxMoveDonors+2)
 	if err != nil {
 		slog.DebugContext(ctx, "donor lookup failed; publishing by copy",
 			"sha256", sha, "error", err)
 		return nil
 	}
 	return selectMoveDonors(locs, root, pool, oldRel, newRel)
+}
+
+// poolPathBounds returns the half-open byte range covering every path under
+// pool's root. '/' is 0x2f, so '0' is exactly its successor and no path can
+// sort between "pool/…" and "pool0".
+//
+// This is only equivalent to a "pool/" prefix under byte ordering, which is why
+// its PG caller pins the comparison (and idx_sl_donor) to COLLATE "C": the
+// database's en_US.UTF-8 ignores punctuation at primary strength, so there
+// "pending/a" sorts after "pending0" and the range would exclude the whole pool
+// it names. SQLite's default BINARY collation is already byte ordering.
+func poolPathBounds(pool string) (lo, hi string) {
+	return pool + "/", pool + "0"
 }
 
 // selectMoveDonors is the pure half of moveDonors: which of a sample's known

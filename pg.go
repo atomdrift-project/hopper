@@ -3964,6 +3964,32 @@ func (db *DB) locationsForSHAPG(ctx context.Context, sha256 string) ([]*SampleLo
 	return out, rows.Err()
 }
 
+func (db *DB) donorLocationsForSHAPG(ctx context.Context, sha256, pool string, limit int) ([]*SampleLocation, error) {
+	lo, hi := poolPathBounds(pool)
+	// COLLATE "C" on both sides so the range is byte ordering and matches
+	// idx_sl_donor's key; without it this is both slower and wrong. No ORDER BY:
+	// the LIMIT is what keeps this proportional to the donors wanted rather than
+	// to the sha's fan-out.
+	rows, err := db.pool.Query(ctx, `
+		SELECT `+pgLocationCols+` FROM sample_locations
+		 WHERE sha256 = $1 AND parent_sha256 = ''
+		   AND path COLLATE "C" >= $2 AND path COLLATE "C" < $3
+		 LIMIT $4`, sha256, lo, hi, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: donor locations %s: %w", sha256, err)
+	}
+	defer rows.Close()
+	var out []*SampleLocation
+	for rows.Next() {
+		loc, err := scanPGLocation(rows)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: scan donor location: %w", err)
+		}
+		out = append(out, loc)
+	}
+	return out, rows.Err()
+}
+
 func (db *DB) topLevelLocationsRecordedPG(ctx context.Context, sha256, first, second string) (bool, bool, error) {
 	var firstOK, secondOK bool
 	if err := db.pool.QueryRow(ctx, `

@@ -1885,6 +1885,31 @@ func (db *DB) locationsForSHASQLite(ctx context.Context, sha256 string) ([]*Samp
 	return out, rows.Err()
 }
 
+func (db *DB) donorLocationsForSHASQLite(ctx context.Context, sha256, pool string, limit int) ([]*SampleLocation, error) {
+	lo, hi := poolPathBounds(pool)
+	// SQLite's default BINARY collation is byte ordering, so the range needs no
+	// COLLATE the way the PG side does. Unordered and bounded for the same
+	// reason: see DonorLocationsForSHA.
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT `+liteLocationCols+` FROM sample_locations
+		 WHERE sha256 = ? AND parent_sha256 = ''
+		   AND path >= ? AND path < ?
+		 LIMIT ?`, sha256, lo, hi, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: donor locations %s: %w", sha256, err)
+	}
+	defer rows.Close() //nolint:errcheck // read-only query
+	var out []*SampleLocation
+	for rows.Next() {
+		loc, err := scanLiteLocation(rows)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: scan donor location: %w", err)
+		}
+		out = append(out, loc)
+	}
+	return out, rows.Err()
+}
+
 func (db *DB) topLevelLocationsRecordedSQLite(ctx context.Context, sha256, first, second string) (bool, bool, error) {
 	var firstOK, secondOK bool
 	if err := db.lite.QueryRowContext(ctx, `
