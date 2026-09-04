@@ -317,6 +317,7 @@ type workerStats struct {
 	LastClaim        int
 	BufferRoom       int
 	TotalClaimed     int64
+	Released         int64
 	Analyzed         int64
 	FilesPerSec      float64
 	ErrorsRecent     int
@@ -453,6 +454,9 @@ func (wt *workerTracker) releaseOwned(worker string, shas []string) []string {
 		}
 		delete(wt.claims, sha)
 		wt.decrementActiveLocked(worker)
+		if ws := wt.workers[worker]; ws != nil {
+			ws.Released++
+		}
 		dropped = append(dropped, sha)
 	}
 	return dropped

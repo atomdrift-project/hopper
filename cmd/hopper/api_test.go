@@ -494,6 +494,14 @@ func TestReleaseOwnedDropsOnlyThisWorkersClaims(t *testing.T) {
 	if got := wt.workers["b"].ActiveClaims; got != 1 {
 		t.Errorf("worker b ActiveClaims = %d, want 1", got)
 	}
+	// Released is the numerator of the abandoned-work ratio, so it must count
+	// the claim actually dropped — not everything the release asked for.
+	if got := wt.workers["a"].Released; got != 1 {
+		t.Errorf("worker a Released = %d, want 1", got)
+	}
+	if got := wt.workers["b"].Released; got != 0 {
+		t.Errorf("worker b Released = %d, want 0", got)
+	}
 
 	// Idempotent: replaying the same release is a no-op, so a retry after a
 	// partial failure cannot double-decrement the counter.
@@ -502,6 +510,9 @@ func TestReleaseOwnedDropsOnlyThisWorkersClaims(t *testing.T) {
 	}
 	if got := wt.workers["a"].ActiveClaims; got != 1 {
 		t.Errorf("ActiveClaims after replay = %d, want 1", got)
+	}
+	if got := wt.workers["a"].Released; got != 1 {
+		t.Errorf("Released after replay = %d, want 1", got)
 	}
 }
 

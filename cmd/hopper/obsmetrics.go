@@ -38,6 +38,7 @@ type instruments struct {
 	wLastSeen, wLoad, wFilesRate                  metric.Float64Observable
 	wActive, wSlots, wQueue, wRSS                 metric.Int64Observable
 	wAnalyzed, wErrors, wErrorsRecent             metric.Int64Observable
+	wClaimed, wReleased                           metric.Int64Observable
 	localUp, localRestarts                        metric.Int64Observable
 	localMem, localMemBudget                      metric.Int64Observable
 	extractInUse, extractMax                      metric.Int64Observable
@@ -318,14 +319,23 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 		insertFails: counter("hopper.insert.failures", "Sample inserts that failed this process lifetime, by cause.", "{sample}"),
 
 		// Per-worker, keyed by a bounded "worker" attribute.
-		wLastSeen:     fgauge("hopper.worker.last_seen_age", "Seconds since the worker last polled or sent a heartbeat.", "s"),
-		wLoad:         fgauge("hopper.worker.load1", "Worker host 1-minute load average.", ""),
-		wFilesRate:    fgauge("hopper.worker.files_rate", "Files per second the worker reports.", "{file}/s"),
-		wActive:       gauge("hopper.worker.active_claims", "Tasks the worker currently holds.", "{task}"),
-		wSlots:        gauge("hopper.worker.slots", "Concurrent task slots the worker advertises.", "{task}"),
-		wQueue:        gauge("hopper.worker.queue", "Items in the worker's local intake queue.", "{sample}"),
-		wRSS:          gauge("hopper.worker.rss", "Worker resident set size.", "By"),
-		wAnalyzed:     counter("hopper.worker.analyzed", "Cumulative samples analyzed by the worker.", "{sample}"),
+		wLastSeen:  fgauge("hopper.worker.last_seen_age", "Seconds since the worker last polled or sent a heartbeat.", "s"),
+		wLoad:      fgauge("hopper.worker.load1", "Worker host 1-minute load average.", ""),
+		wFilesRate: fgauge("hopper.worker.files_rate", "Files per second the worker reports.", "{file}/s"),
+		wActive:    gauge("hopper.worker.active_claims", "Tasks the worker currently holds.", "{task}"),
+		wSlots:     gauge("hopper.worker.slots", "Concurrent task slots the worker advertises.", "{task}"),
+		wQueue:     gauge("hopper.worker.queue", "Items in the worker's local intake queue.", "{sample}"),
+		wRSS:       gauge("hopper.worker.rss", "Worker resident set size.", "By"),
+		wAnalyzed:  counter("hopper.worker.analyzed", "Cumulative samples analyzed by the worker.", "{sample}"),
+		// Claimed and released are a pair: released/claimed is the share of
+		// handed-out work the worker gave back without a result. An embedded
+		// idle worker sheds staged work whenever its host server takes an
+		// interactive request, so a non-zero ratio is expected there — a
+		// *rising* one says the host is spending its queue capacity on work it
+		// never starts. Neither is meaningful without the other, so both are
+		// exported even though claimed was previously dashboard-only.
+		wClaimed:      counter("hopper.worker.claimed", "Cumulative samples handed out to the worker.", "{sample}"),
+		wReleased:     counter("hopper.worker.released", "Cumulative claims the worker handed back without a result.", "{sample}"),
 		wErrors:       counter("hopper.worker.errors", "Cumulative errors reported by the worker.", "{error}"),
 		wErrorsRecent: gauge("hopper.worker.errors_recent", "Errors the worker reported in the trailing 15 minutes.", "{error}"),
 
@@ -475,6 +485,8 @@ func (wd *webDashboard) observe(ctx context.Context, observer metric.Observer, i
 			observer.ObserveInt64(in.wQueue, int64(ws.Queue), attr)
 			observer.ObserveInt64(in.wRSS, int64(ws.RSSMB)<<20, attr)
 			observer.ObserveInt64(in.wAnalyzed, ws.Analyzed, attr)
+			observer.ObserveInt64(in.wClaimed, ws.TotalClaimed, attr)
+			observer.ObserveInt64(in.wReleased, ws.Released, attr)
 			observer.ObserveInt64(in.wErrors, ws.Errors, attr)
 			observer.ObserveInt64(in.wErrorsRecent, int64(ws.ErrorsRecent), attr)
 		}
