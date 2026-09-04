@@ -3990,8 +3990,7 @@ func (db *DB) donorLocationsForSHAPG(ctx context.Context, sha256, pool string, l
 	return out, rows.Err()
 }
 
-func (db *DB) topLevelLocationsRecordedPG(ctx context.Context, sha256, first, second string) (bool, bool, error) {
-	var firstOK, secondOK bool
+func (db *DB) topLevelLocationsRecordedPG(ctx context.Context, sha256, first, second string) (firstOK, secondOK bool, err error) {
 	if err := db.pool.QueryRow(ctx, `
 		SELECT EXISTS(SELECT 1 FROM sample_locations
 		               WHERE sha256 = $1 AND path = $2 AND parent_sha256 = ''),

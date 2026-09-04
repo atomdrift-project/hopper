@@ -467,6 +467,44 @@ func TestHandleHeartbeatRecordsTelemetryAndConvertsAges(t *testing.T) {
 	assertAge("LastErrorAt", ws.LastErrorAt, 5)
 }
 
+func TestReleaseOwnedDropsOnlyThisWorkersClaims(t *testing.T) {
+	wt := newWorkerTracker()
+	wt.workers["a"] = &workerStats{ActiveClaims: 2}
+	wt.workers["b"] = &workerStats{ActiveClaims: 1}
+	now := time.Now()
+	wt.claims["aa"] = claim{at: now, worker: "a", path: "a1.bin"}
+	wt.claims["ab"] = claim{at: now, worker: "a", path: "a2.bin"}
+	wt.claims["bb"] = claim{at: now, worker: "b", path: "b1.bin"}
+
+	// "bb" belongs to another worker and "zz" is not held at all: a release
+	// naming them must not touch either.
+	dropped := wt.releaseOwned("a", []string{"aa", "bb", "zz"})
+	if len(dropped) != 1 || dropped[0] != "aa" {
+		t.Fatalf("dropped = %v, want [aa]", dropped)
+	}
+	if _, held := wt.claims["aa"]; held {
+		t.Error("released claim is still held")
+	}
+	if c, held := wt.claims["bb"]; !held || c.worker != "b" {
+		t.Error("another worker's claim was released")
+	}
+	if got := wt.workers["a"].ActiveClaims; got != 1 {
+		t.Errorf("worker a ActiveClaims = %d, want 1", got)
+	}
+	if got := wt.workers["b"].ActiveClaims; got != 1 {
+		t.Errorf("worker b ActiveClaims = %d, want 1", got)
+	}
+
+	// Idempotent: replaying the same release is a no-op, so a retry after a
+	// partial failure cannot double-decrement the counter.
+	if again := wt.releaseOwned("a", []string{"aa"}); len(again) != 0 {
+		t.Errorf("replayed release dropped %v, want none", again)
+	}
+	if got := wt.workers["a"].ActiveClaims; got != 1 {
+		t.Errorf("ActiveClaims after replay = %d, want 1", got)
+	}
+}
+
 func TestHandleHeartbeatRejectsInvalidWorker(t *testing.T) {
 	api := &apiServer{tracker: newWorkerTracker()}
 	req := httptest.NewRequest(http.MethodGet, "/api/heartbeat?worker=bad%20name", http.NoBody)

@@ -1910,8 +1910,7 @@ func (db *DB) donorLocationsForSHASQLite(ctx context.Context, sha256, pool strin
 	return out, rows.Err()
 }
 
-func (db *DB) topLevelLocationsRecordedSQLite(ctx context.Context, sha256, first, second string) (bool, bool, error) {
-	var firstOK, secondOK bool
+func (db *DB) topLevelLocationsRecordedSQLite(ctx context.Context, sha256, first, second string) (firstOK, secondOK bool, err error) {
 	if err := db.lite.QueryRowContext(ctx, `
 		SELECT EXISTS(SELECT 1 FROM sample_locations
 		               WHERE sha256 = ? AND path = ? AND parent_sha256 = ''),

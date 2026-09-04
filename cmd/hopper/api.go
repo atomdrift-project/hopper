@@ -35,9 +35,10 @@ import (
 )
 
 // apiServer handles the pull-based work API. Workers poll /api/next for
-// jobs, submit results via /api/result, and fetch file content from
-// /api/file/{sha256}. Sample data lives in the database; per-job claim
-// state lives in workerTracker (see below).
+// jobs, submit results via /api/result, hand back claims they are not going to
+// analyze via /api/release, and fetch file content from /api/file/{sha256}.
+// Sample data lives in the database; per-job claim state lives in
+// workerTracker (see below).
 type apiServer struct {
 	hopperStart     time.Time
 	db              *hopper.DB
@@ -432,6 +433,31 @@ func (wt *workerTracker) releaseMany(shas []string) {
 	}
 }
 
+// releaseOwned drops the claims this worker actually holds and returns the
+// shas that were dropped, so the caller can log exactly what went back.
+//
+// Ownership is enforced the same way renewClaims enforces it: a sha claimed by
+// another worker is ignored rather than dropped, so a stale or spoofed release
+// cannot return someone else's in-flight work to the queue.
+func (wt *workerTracker) releaseOwned(worker string, shas []string) []string {
+	if len(shas) == 0 {
+		return nil
+	}
+	wt.mu.Lock()
+	defer wt.mu.Unlock()
+	dropped := make([]string, 0, len(shas))
+	for _, sha := range shas {
+		c, ok := wt.claims[sha]
+		if !ok || c.worker != worker {
+			continue
+		}
+		delete(wt.claims, sha)
+		wt.decrementActiveLocked(worker)
+		dropped = append(dropped, sha)
+	}
+	return dropped
+}
+
 // oldestPerWorker returns the oldest active claim per worker name, dropping
 // claims older than maxAge from the map as it walks. The dashboard calls
 // this on every render — there is no separate sweep goroutine.
@@ -822,7 +848,7 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 		// by the currency skip) relays, so a host like cyclotron can point its
 		// ENTIRE stack at this one URL; the worker lane — the firehose — is
 		// refused as before.
-		for _, ep := range []string{"GET /api/next", "GET /api/heartbeat"} {
+		for _, ep := range []string{"GET /api/next", "GET /api/heartbeat", "POST /api/release"} {
 			mux.HandleFunc(ep, handleWorkerRouteRefusal)
 		}
 		mux.HandleFunc("POST /api/result", func(w http.ResponseWriter, r *http.Request) {
@@ -860,6 +886,7 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /api/next", s.handleNext)
 	mux.HandleFunc("GET /api/heartbeat", s.handleHeartbeat)
+	mux.HandleFunc("POST /api/release", s.handleRelease)
 	mux.HandleFunc("POST /api/result", s.handleResult)
 	mux.HandleFunc("POST /api/upload", s.handleUpload)
 	mux.HandleFunc("POST /api/known", s.handleKnown)
@@ -1426,6 +1453,57 @@ func parseActiveSHAs(list string) []string {
 		}
 	}
 	return out
+}
+
+// handleRelease returns claims a worker is giving back without a result.
+//
+// The embedded idle worker in `atomscan serve` sheds staged queue work the
+// moment an interactive request arrives, so the claims it was holding must go
+// back to the queue immediately rather than waiting out claimExpiry or the
+// abandonedClaimGrace sweep — neither of which can fire while the same process
+// is busy analyzing (both need the worker to report holding nothing).
+//
+// Idempotent: a sha this worker does not hold is silently skipped, so a retry
+// after a partial failure is safe.
+func (s *apiServer) handleRelease(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		http.Error(w, `{"error":"starting"}`, http.StatusServiceUnavailable)
+		return
+	}
+	worker := r.URL.Query().Get("worker")
+	if !validWorkerName(worker) {
+		slog.WarnContext(r.Context(), "release rejected: invalid worker name",
+			"worker", worker, "remote", r.RemoteAddr)
+		http.Error(w, `{"error":"invalid worker name"}`, http.StatusBadRequest)
+		return
+	}
+	worker = qualifiedWorkerName(worker, r.RemoteAddr)
+	// Same comma-separated form and 32-sha cap as the heartbeat's active_shas:
+	// a release batch is bounded by the worker's slot count either way.
+	shas := parseActiveSHAs(r.URL.Query().Get("shas"))
+	if len(shas) == 0 {
+		http.Error(w, `{"error":"no valid sha256 in shas"}`, http.StatusBadRequest)
+		return
+	}
+	// Drop the in-memory claims first: that is what gates re-handout, and it
+	// tells us which shas this worker actually held. The DB rows are cleared
+	// after, so a failure there leaves a row whose claimed_at simply ages out
+	// rather than a claim this worker still appears to hold.
+	dropped := s.tracker.releaseOwned(worker, shas)
+	released := 0
+	for _, sha := range dropped {
+		if err := s.db.ReleaseSampleClaim(r.Context(), sha, worker); err != nil {
+			slog.WarnContext(r.Context(), "release: claim row not cleared; it will age out",
+				"worker", worker, "sha256", sha, "error", err)
+			continue
+		}
+		released++
+	}
+	slog.InfoContext(r.Context(), "worker released claims",
+		"worker", worker, "asked", len(shas), "dropped", len(dropped), "released", released)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	fmt.Fprintf(w, `{"released":%d,"dropped":%d}`, released, len(dropped)) //nolint:errcheck // best-effort response
 }
 
 func (s *apiServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
