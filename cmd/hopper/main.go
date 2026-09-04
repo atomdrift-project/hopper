@@ -1816,7 +1816,10 @@ const (
 	// split in insertSampleBatchPG, which stops the fan-out writes from
 	// extending the hold further.
 	loadBatchSize = 500
-	minFileSize   = 13 // skip trivially small files (markers, empty, etc.)
+	// Skip trivially small files (markers, empty, etc.). Stricter than the
+	// hopper.MinSampleSize floor every ingest path shares, and deliberately so:
+	// a corpus walk sees the marker files the pools are full of.
+	minFileSize = 13
 	// 20 GiB — admit full OS images (ISO/UDF, DMG) from the os-image feed;
 	// cleave streams-to-temp and workers are memory-scheduled.
 	defaultMaxFileSize = 20 * 1024 * 1024 * 1024

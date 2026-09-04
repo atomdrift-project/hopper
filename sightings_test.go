@@ -54,7 +54,7 @@ func mustCorroborationSample(t *testing.T, ctx context.Context, db *DB, sha, pur
 		LabelSource: "forager",
 		PURLBase:    purlBase,
 		Path:        "bad/" + sha,
-		SizeBytes:   1,
+		SizeBytes:   8,
 	})
 	mustAnalyze(t, ctx, db, sha, 100)
 }

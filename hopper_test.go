@@ -1913,89 +1913,89 @@ func TestLabelPrecedenceOnReobservation(t *testing.T) {
 	t.Run("promote unknown to good", func(t *testing.T) {
 		db := openTestDB(t)
 		ctx := context.Background()
-		reobserve(t, ctx, db, &Sample{SHA256: "p1", Source: "test", Label: "unknown", LabelSource: "forager", Path: "unknown/p1", SizeBytes: 1})
-		reobserve(t, ctx, db, &Sample{SHA256: "p1", Source: "test", Label: "good", LabelSource: "forager", Path: "good/p1", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "p1", Source: "test", Label: "unknown", LabelSource: "forager", Path: "unknown/p1", SizeBytes: 8})
+		reobserve(t, ctx, db, &Sample{SHA256: "p1", Source: "test", Label: "good", LabelSource: "forager", Path: "good/p1", SizeBytes: 8})
 		want(t, ctx, db, "p1", "good", "forager", "")
 	})
 
 	t.Run("promote unknown to bad", func(t *testing.T) {
 		db := openTestDB(t)
 		ctx := context.Background()
-		reobserve(t, ctx, db, &Sample{SHA256: "p2", Source: "test", Label: "unknown", LabelSource: "forager", Path: "unknown/p2", SizeBytes: 1})
-		reobserve(t, ctx, db, &Sample{SHA256: "p2", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/p2", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "p2", Source: "test", Label: "unknown", LabelSource: "forager", Path: "unknown/p2", SizeBytes: 8})
+		reobserve(t, ctx, db, &Sample{SHA256: "p2", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/p2", SizeBytes: 8})
 		want(t, ctx, db, "p2", "bad", "forager", "")
 	})
 
 	t.Run("conflict good then bad", func(t *testing.T) {
 		db := openTestDB(t)
 		ctx := context.Background()
-		reobserve(t, ctx, db, &Sample{SHA256: "c1", Source: "test", Label: "good", LabelSource: "forager", Path: "good/c1", SizeBytes: 1})
-		reobserve(t, ctx, db, &Sample{SHA256: "c1", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/c1", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "c1", Source: "test", Label: "good", LabelSource: "forager", Path: "good/c1", SizeBytes: 8})
+		reobserve(t, ctx, db, &Sample{SHA256: "c1", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/c1", SizeBytes: 8})
 		want(t, ctx, db, "c1", "bad", "conflict", "conflict")
 	})
 
 	t.Run("conflict bad then good resolves to bad", func(t *testing.T) {
 		db := openTestDB(t)
 		ctx := context.Background()
-		reobserve(t, ctx, db, &Sample{SHA256: "c2", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/c2", SizeBytes: 1})
-		reobserve(t, ctx, db, &Sample{SHA256: "c2", Source: "test", Label: "good", LabelSource: "forager", Path: "good/c2", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "c2", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/c2", SizeBytes: 8})
+		reobserve(t, ctx, db, &Sample{SHA256: "c2", Source: "test", Label: "good", LabelSource: "forager", Path: "good/c2", SizeBytes: 8})
 		want(t, ctx, db, "c2", "bad", "conflict", "conflict")
 	})
 
 	t.Run("unknown does not demote", func(t *testing.T) {
 		db := openTestDB(t)
 		ctx := context.Background()
-		reobserve(t, ctx, db, &Sample{SHA256: "d1", Source: "test", Label: "good", LabelSource: "forager", Path: "good/d1", SizeBytes: 1})
-		reobserve(t, ctx, db, &Sample{SHA256: "d1", Source: "test", Label: "unknown", LabelSource: "forager", Path: "unknown/d1", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "d1", Source: "test", Label: "good", LabelSource: "forager", Path: "good/d1", SizeBytes: 8})
+		reobserve(t, ctx, db, &Sample{SHA256: "d1", Source: "test", Label: "unknown", LabelSource: "forager", Path: "unknown/d1", SizeBytes: 8})
 		want(t, ctx, db, "d1", "good", "forager", "")
 	})
 
 	t.Run("promote unknown to sighted", func(t *testing.T) {
 		db := openTestDB(t)
 		ctx := context.Background()
-		reobserve(t, ctx, db, &Sample{SHA256: "s1", Source: "test", Label: "unknown", LabelSource: "forager", Path: "unknown/s1", SizeBytes: 1})
-		reobserve(t, ctx, db, &Sample{SHA256: "s1", Source: "test", Label: "sighted", LabelSource: "forager", Path: "sighted/s1", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "s1", Source: "test", Label: "unknown", LabelSource: "forager", Path: "unknown/s1", SizeBytes: 8})
+		reobserve(t, ctx, db, &Sample{SHA256: "s1", Source: "test", Label: "sighted", LabelSource: "forager", Path: "sighted/s1", SizeBytes: 8})
 		want(t, ctx, db, "s1", "sighted", "forager", "")
 	})
 
 	t.Run("sighted does not demote good", func(t *testing.T) {
 		db := openTestDB(t)
 		ctx := context.Background()
-		reobserve(t, ctx, db, &Sample{SHA256: "s2", Source: "test", Label: "good", LabelSource: "forager", Path: "good/s2", SizeBytes: 1})
-		reobserve(t, ctx, db, &Sample{SHA256: "s2", Source: "test", Label: "sighted", LabelSource: "forager", Path: "sighted/s2", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "s2", Source: "test", Label: "good", LabelSource: "forager", Path: "good/s2", SizeBytes: 8})
+		reobserve(t, ctx, db, &Sample{SHA256: "s2", Source: "test", Label: "sighted", LabelSource: "forager", Path: "sighted/s2", SizeBytes: 8})
 		want(t, ctx, db, "s2", "good", "forager", "")
 	})
 
 	t.Run("sighted does not demote bad", func(t *testing.T) {
 		db := openTestDB(t)
 		ctx := context.Background()
-		reobserve(t, ctx, db, &Sample{SHA256: "s3", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/s3", SizeBytes: 1})
-		reobserve(t, ctx, db, &Sample{SHA256: "s3", Source: "test", Label: "sighted", LabelSource: "forager", Path: "sighted/s3", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "s3", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/s3", SizeBytes: 8})
+		reobserve(t, ctx, db, &Sample{SHA256: "s3", Source: "test", Label: "sighted", LabelSource: "forager", Path: "sighted/s3", SizeBytes: 8})
 		want(t, ctx, db, "s3", "bad", "forager", "")
 	})
 
 	t.Run("promote sighted to bad", func(t *testing.T) {
 		db := openTestDB(t)
 		ctx := context.Background()
-		reobserve(t, ctx, db, &Sample{SHA256: "s4", Source: "test", Label: "sighted", LabelSource: "forager", Path: "sighted/s4", SizeBytes: 1})
-		reobserve(t, ctx, db, &Sample{SHA256: "s4", Source: "test", Label: "bad", LabelSource: "promoter", Path: "bad/s4", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "s4", Source: "test", Label: "sighted", LabelSource: "forager", Path: "sighted/s4", SizeBytes: 8})
+		reobserve(t, ctx, db, &Sample{SHA256: "s4", Source: "test", Label: "bad", LabelSource: "promoter", Path: "bad/s4", SizeBytes: 8})
 		want(t, ctx, db, "s4", "bad", "promoter", "")
 	})
 
 	t.Run("promote sighted to good", func(t *testing.T) {
 		db := openTestDB(t)
 		ctx := context.Background()
-		reobserve(t, ctx, db, &Sample{SHA256: "s5", Source: "test", Label: "sighted", LabelSource: "forager", Path: "sighted/s5", SizeBytes: 1})
-		reobserve(t, ctx, db, &Sample{SHA256: "s5", Source: "test", Label: "good", LabelSource: "forager", Path: "good/s5", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "s5", Source: "test", Label: "sighted", LabelSource: "forager", Path: "sighted/s5", SizeBytes: 8})
+		reobserve(t, ctx, db, &Sample{SHA256: "s5", Source: "test", Label: "good", LabelSource: "forager", Path: "good/s5", SizeBytes: 8})
 		want(t, ctx, db, "s5", "good", "forager", "")
 	})
 
 	t.Run("incoming marker is authoritative", func(t *testing.T) {
 		db := openTestDB(t)
 		ctx := context.Background()
-		reobserve(t, ctx, db, &Sample{SHA256: "m1", Source: "test", Label: "unknown", LabelSource: "forager", Path: "unknown/m1", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "m1", Source: "test", Label: "unknown", LabelSource: "forager", Path: "unknown/m1", SizeBytes: 8})
 		// A good/ file carrying a .BAD marker: Go flips it before insert.
-		reobserve(t, ctx, db, &Sample{SHA256: "m1", Source: "test", Label: "bad", LabelSource: "marker", Skip: "misclassified", Path: "good/m1", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "m1", Source: "test", Label: "bad", LabelSource: "marker", Skip: "misclassified", Path: "good/m1", SizeBytes: 8})
 		want(t, ctx, db, "m1", "bad", "marker", "misclassified")
 	})
 
@@ -2003,48 +2003,48 @@ func TestLabelPrecedenceOnReobservation(t *testing.T) {
 		db := openTestDB(t)
 		ctx := context.Background()
 		// Stored quarantine from a good/ file with a .BAD marker.
-		reobserve(t, ctx, db, &Sample{SHA256: "r1", Source: "test", Label: "bad", LabelSource: "marker", Skip: "misclassified", Path: "good/r1", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "r1", Source: "test", Label: "bad", LabelSource: "marker", Skip: "misclassified", Path: "good/r1", SizeBytes: 8})
 		// Moved into bad/ with the marker dropped: plain pool observation.
-		reobserve(t, ctx, db, &Sample{SHA256: "r1", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/r1", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "r1", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/r1", SizeBytes: 8})
 		want(t, ctx, db, "r1", "bad", "forager", "")
 	})
 
 	t.Run("missing auto-heals on re-observation", func(t *testing.T) {
 		db := openTestDB(t)
 		ctx := context.Background()
-		reobserve(t, ctx, db, &Sample{SHA256: "g1", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/g1", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "g1", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/g1", SizeBytes: 8})
 		if err := db.SetSkip(ctx, "g1", "missing"); err != nil {
 			t.Fatal(err)
 		}
-		reobserve(t, ctx, db, &Sample{SHA256: "g1", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/g1", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "g1", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/g1", SizeBytes: 8})
 		want(t, ctx, db, "g1", "bad", "forager", "")
 	})
 
 	t.Run("missing returning as conflict is quarantined", func(t *testing.T) {
 		db := openTestDB(t)
 		ctx := context.Background()
-		reobserve(t, ctx, db, &Sample{SHA256: "g2", Source: "test", Label: "good", LabelSource: "forager", Path: "good/g2", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "g2", Source: "test", Label: "good", LabelSource: "forager", Path: "good/g2", SizeBytes: 8})
 		if err := db.SetSkip(ctx, "g2", "missing"); err != nil {
 			t.Fatal(err)
 		}
-		reobserve(t, ctx, db, &Sample{SHA256: "g2", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/g2", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "g2", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/g2", SizeBytes: 8})
 		want(t, ctx, db, "g2", "bad", "conflict", "conflict")
 	})
 
 	t.Run("hard skip preserved on promotion", func(t *testing.T) {
 		db := openTestDB(t)
 		ctx := context.Background()
-		reobserve(t, ctx, db, &Sample{SHA256: "h1", Source: "test", Label: "unknown", LabelSource: "forager", Skip: "corrupt", Path: "unknown/h1", SizeBytes: 1})
-		reobserve(t, ctx, db, &Sample{SHA256: "h1", Source: "test", Label: "good", LabelSource: "forager", Path: "good/h1", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "h1", Source: "test", Label: "unknown", LabelSource: "forager", Skip: "corrupt", Path: "unknown/h1", SizeBytes: 8})
+		reobserve(t, ctx, db, &Sample{SHA256: "h1", Source: "test", Label: "good", LabelSource: "forager", Path: "good/h1", SizeBytes: 8})
 		want(t, ctx, db, "h1", "good", "forager", "corrupt")
 	})
 
 	t.Run("archive member never changes top-level label", func(t *testing.T) {
 		db := openTestDB(t)
 		ctx := context.Background()
-		reobserve(t, ctx, db, &Sample{SHA256: "a1", Source: "test", Label: "good", LabelSource: "forager", Path: "good/a1", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "a1", Source: "test", Label: "good", LabelSource: "forager", Path: "good/a1", SizeBytes: 8})
 		// Same content hash seen inside a bad archive (parent set).
-		reobserve(t, ctx, db, &Sample{SHA256: "a1", Source: "test", Label: "bad", LabelSource: "forager", Parent: "archivesha", Path: "bad/arc.zip!!a1", SizeBytes: 1})
+		reobserve(t, ctx, db, &Sample{SHA256: "a1", Source: "test", Label: "bad", LabelSource: "forager", Parent: "archivesha", Path: "bad/arc.zip!!a1", SizeBytes: 8})
 		want(t, ctx, db, "a1", "good", "forager", "")
 	})
 }
@@ -2054,13 +2054,13 @@ func TestConflictReview(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a good+bad conflict and an ordinary bad sample.
-	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{{SHA256: "k1", Source: "test", Label: "good", LabelSource: "forager", Path: "good/k1", SizeBytes: 1}}); err != nil {
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{{SHA256: "k1", Source: "test", Label: "good", LabelSource: "forager", Path: "good/k1", SizeBytes: 8}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{{SHA256: "k1", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/k1", SizeBytes: 1}}); err != nil {
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{{SHA256: "k1", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/k1", SizeBytes: 8}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{{SHA256: "k2", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/k2", SizeBytes: 1}}); err != nil {
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{{SHA256: "k2", Source: "test", Label: "bad", LabelSource: "forager", Path: "bad/k2", SizeBytes: 8}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -7380,4 +7380,52 @@ func TestFeedSamplesCreatedWindow(t *testing.T) {
 			t.Errorf("paged walk = %v, want %v", walked, want)
 		}
 	})
+}
+
+// TestValidSampleRejectsTrivialFiles pins the shared ingest floor: an empty
+// file (recognized by its digest, whatever size the caller reported) and any
+// row under MinSampleSize are refused, while a row whose size was never
+// learned still passes.
+func TestValidSampleRejectsTrivialFiles(t *testing.T) {
+	sha := fmt.Sprintf("%064x", 1)
+	tests := []struct {
+		name   string
+		sample *Sample
+		want   bool
+	}{
+		{"empty digest", &Sample{SHA256: emptySHA256, Path: "incoming/empty", SizeBytes: 8}, false},
+		{"empty digest with claimed size", &Sample{SHA256: emptySHA256, Path: "incoming/empty", SizeBytes: 42}, false},
+		{"below floor", &Sample{SHA256: sha, Path: "incoming/tiny", SizeBytes: MinSampleSize - 1}, false},
+		{"at floor", &Sample{SHA256: sha, Path: "incoming/small", SizeBytes: MinSampleSize}, true},
+		{"size unknown", &Sample{SHA256: sha, Path: "incoming/f"}, true},
+	}
+	for _, tt := range tests {
+		if got := validSample(tt.sample); got != tt.want {
+			t.Errorf("%s: validSample = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+// TestMemberSamplesFromEnvelopeSkipsTrivialMembers verifies that the archive
+// member path drops empty and under-floor members. It bypasses validSample on
+// the Postgres side, so the filter has to hold here.
+func TestMemberSamplesFromEnvelopeSkipsTrivialMembers(t *testing.T) {
+	keep := fmt.Sprintf("%064x", 7)
+	tiny := fmt.Sprintf("%064x", 8)
+	parent := &Sample{
+		SHA256: fmt.Sprintf("%064x", 99), Label: "bad", LabelSource: "ls", Path: "bad/pkg.tar",
+		CleaveResult: []byte(`{"files":[` +
+			fmt.Sprintf(`{"sha":%q,"type":"elf","path":"pkg/real.so","depth":1,"size":100},`, keep) +
+			fmt.Sprintf(`{"sha":%q,"type":"text","path":"pkg/tiny.txt","depth":1,"size":3},`, tiny) +
+			fmt.Sprintf(`{"sha":%q,"type":"text","path":"pkg/empty.txt","depth":1,"size":0}`, emptySHA256) +
+			`]}`),
+	}
+
+	members := memberSamplesFromEnvelope(parent)
+	if len(members) != 1 {
+		t.Fatalf("got %d members, want 1: %+v", len(members), members)
+	}
+	if members[0].SHA256 != keep {
+		t.Errorf("kept member = %s, want %s", members[0].SHA256, keep)
+	}
 }

@@ -17,7 +17,7 @@ func mustPendingSample(t *testing.T, ctx context.Context, db *DB, sha, purlBase 
 		LabelSource: "forager",
 		PURLBase:    purlBase,
 		Path:        "incoming/" + sha,
-		SizeBytes:   1,
+		SizeBytes:   8,
 	})
 }
 

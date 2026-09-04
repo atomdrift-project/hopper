@@ -3371,6 +3371,14 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 		writeJSONError(w, http.StatusBadRequest, `{"error":"empty body"}`)
 		return
 	}
+	// Below hopper.MinSampleSize there is nothing to classify, and the DB layer
+	// refuses the row anyway; saying so here keeps the producer from reading a
+	// 200 as "stored".
+	if written < hopper.MinSampleSize {
+		slog.WarnContext(r.Context(), "upload rejected: file too small", "bytes", written, "remote", r.RemoteAddr)
+		writeJSONError(w, http.StatusBadRequest, `{"error":"file too small"}`)
+		return
+	}
 
 	sha := hex.EncodeToString(hasher.Sum(nil))
 

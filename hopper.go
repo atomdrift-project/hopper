@@ -1482,6 +1482,14 @@ func (e *memberEnvelope) buildRange(start, end int) []*Sample {
 			continue
 		}
 
+		// Trivially small members are dropped for the same reason such files are
+		// never ingested from disk: too few bytes to classify. Checked here
+		// because member rows reach Postgres through sampleStagingRows, which
+		// bypasses validSample.
+		if entry.SHA256 == emptySHA256 || (entry.Size > 0 && entry.Size < MinSampleSize) {
+			continue
+		}
+
 		// Skip members cleave couldn't classify: they have no analytical value
 		// and inserting them just pollutes the DB with rows the pipeline will
 		// never usefully act on.
@@ -2386,14 +2394,38 @@ func isLowerHexSHA256(s string) bool {
 	return true
 }
 
+// emptySHA256 is the SHA-256 of zero bytes. Every 0-byte file hashes to it,
+// whatever its name, pool, or archive, which makes it the one check that
+// recognizes an empty file even where the byte count is not carried.
+const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// MinSampleSize is the smallest file worth a row. Below it there is nothing to
+// classify — a marker, a newline, a stub — and every such file costs the same
+// row, the same queue slot, and the same worker round-trip as a real sample.
+// The corpus walk applies a stricter floor of its own (minFileSize); this is
+// the floor every other ingest path shares.
+const MinSampleSize = 6
+
 // validSample enforces the minimum fields required for a sample row to
 // carry analytical value: a non-empty sha256 and a non-empty path (real or
 // virtual). Empty paths are the main historical source of junk rows. Strict
 // lowercase-hex enforcement on sha256 lives at the edges (API validator,
 // archive explode) and at the Postgres CHECK constraint — this guard stays
 // loose so tests can use short mock shas.
+//
+// Trivially small files are rejected here rather than at each caller: they
+// carry too few bytes to classify, and a 0-byte file is the same row under
+// every name it arrives under. A row whose SizeBytes is unset is not treated
+// as empty — callers that never learned the size still get their row — but the
+// 0-byte digest is refused on its own, since it can only mean an empty file.
 func validSample(s *Sample) bool {
-	return s != nil && s.SHA256 != "" && s.Path != ""
+	if s == nil || s.SHA256 == "" || s.Path == "" {
+		return false
+	}
+	if s.SHA256 == emptySHA256 {
+		return false
+	}
+	return s.SizeBytes == 0 || s.SizeBytes >= MinSampleSize
 }
 
 // normalizeLabel rewrites an unset label to labelUnknown, the canonical
@@ -2488,7 +2520,7 @@ func (db *DB) InsertSampleBatch(ctx context.Context, samples []*Sample) (inserte
 // duplicate (sha256, path) pair, last_seen_at is bumped to now() and
 // mtime is refreshed if the caller provided one.
 func (db *DB) UpsertLocation(ctx context.Context, loc *SampleLocation) error {
-	if loc == nil || loc.SHA256 == "" || loc.Path == "" {
+	if loc == nil || loc.SHA256 == "" || loc.Path == "" || loc.SHA256 == emptySHA256 {
 		return nil
 	}
 	if db.pool != nil {
@@ -2501,13 +2533,14 @@ func (db *DB) UpsertLocation(ctx context.Context, loc *SampleLocation) error {
 // upsert as UpsertLocation, applied to every row. It is the write path for a
 // producer that exploded a container itself (e.g. forager unpacking an ISO) and
 // needs to attach thousands of containment edges at once. Rows with an empty
-// sha256 or path are dropped. As with UpsertLocation, ON CONFLICT never rewrites
+// sha256 or path are dropped, as are rows for the 0-byte digest — validSample
+// refuses that sample, so a location for it could only ever dangle. As with UpsertLocation, ON CONFLICT never rewrites
 // parent_sha256: a standalone (sha, path) already recorded keeps its identity, so
 // a containment edge must carry its own distinct in-archive path.
 func (db *DB) UpsertLocationBatch(ctx context.Context, locs []*SampleLocation) error {
 	valid := locs[:0]
 	for _, l := range locs {
-		if l != nil && l.SHA256 != "" && l.Path != "" {
+		if l != nil && l.SHA256 != "" && l.Path != "" && l.SHA256 != emptySHA256 {
 			valid = append(valid, l)
 		}
 	}

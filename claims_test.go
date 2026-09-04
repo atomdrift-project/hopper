@@ -11,12 +11,12 @@ import (
 // envelope v8; see claims.go), and one member with no claims at all.
 const identEnvelope = `{"v":"8","files":[
  {"id":0,"sha":"ROOT","type":"npm","path":"pkg.tgz","size":10},
- {"id":1,"sha":"EXE","type":"pe","path":"pkg.tgz!!bin/tool.exe","size":5,"depth":1,
+ {"id":1,"sha":"EXE","type":"pe","path":"pkg.tgz!!bin/tool.exe","size":5120,"depth":1,
   "ident":{"name":{"value":"7-Zip","source":"pe.version.product_name","verified":true},
            "version":{"value":"24.08"},
            "trust":"ca_signed",
            "signer":{"organization":"Igor Pavlov"}}},
- {"id":2,"sha":"DOC","type":"markdown","path":"pkg.tgz!!README.md","size":1,"depth":1}
+ {"id":2,"sha":"DOC","type":"markdown","path":"pkg.tgz!!README.md","size":1024,"depth":1}
 ]}`
 
 func identEnvelopeFor(root, exe, doc string) []byte {
