@@ -2670,6 +2670,25 @@ func (db *DB) LocationsForSHA(ctx context.Context, sha256 string) ([]*SampleLoca
 	return db.locationsForSHASQLite(ctx, sha256)
 }
 
+// TopLevelLocationsRecorded reports whether sha256 has a top-level location at
+// each of two exact paths, in one round trip.
+//
+// This is the question a move's compare-and-swap actually asks — "is the path I
+// am moving from, or the one I am moving to, in the catalog" — and asking it
+// directly is why it costs two index probes against the UNIQUE (sha256, path)
+// constraint. Its caller used to answer it by pulling every location for the
+// sha back and comparing paths in Go, which for a widely duplicated sha means
+// millions of rows, an on-disk sort, and gigabytes on the wire to produce two
+// booleans. Fan-out is savagely skewed — p50 is 1 location, the empty file sits
+// in ~7.2M — so any form proportional to locations is a timeout on exactly the
+// tiny ubiquitous files a hot-pool drain has the most of.
+func (db *DB) TopLevelLocationsRecorded(ctx context.Context, sha256, first, second string) (firstOK, secondOK bool, err error) {
+	if db.pool != nil {
+		return db.topLevelLocationsRecordedPG(ctx, sha256, first, second)
+	}
+	return db.topLevelLocationsRecordedSQLite(ctx, sha256, first, second)
+}
+
 // TopLevelLocationsForSHA returns the active on-disk locations for sha256.
 // Archive-member observations are excluded because their paths are virtual.
 func (db *DB) TopLevelLocationsForSHA(ctx context.Context, sha256 string) ([]*SampleLocation, error) {

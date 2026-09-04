@@ -461,18 +461,14 @@ func (s *apiServer) relocateTriaged(ctx context.Context, verdict triageVerdict, 
 	}
 
 	if verdict.OldPath != "" {
-		locations, err := s.db.LocationsForSHA(ctx, sha)
+		// Two exact path probes, not the sha's whole location list: this asks
+		// only whether either end of the move is catalogued, and a sha that is
+		// duplicated across millions of paths must not make that question
+		// proportional to its fan-out. See TopLevelLocationsRecorded.
+		oldRecorded, newRecorded, err := s.db.TopLevelLocationsRecorded(ctx, sha, oldRel, plan.newRel)
 		if err != nil {
 			res.Status, res.Error = "error", "lookup locations: "+err.Error()
 			return res
-		}
-		var oldRecorded, newRecorded bool
-		for _, loc := range locations {
-			if loc.ParentSHA256 != "" {
-				continue
-			}
-			oldRecorded = oldRecorded || loc.Path == oldRel
-			newRecorded = newRecorded || loc.Path == plan.newRel
 		}
 		if !oldRecorded && !newRecorded {
 			res.Status, res.Error = "not_found", "exact source location is not recorded"

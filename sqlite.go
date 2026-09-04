@@ -1885,6 +1885,19 @@ func (db *DB) locationsForSHASQLite(ctx context.Context, sha256 string) ([]*Samp
 	return out, rows.Err()
 }
 
+func (db *DB) topLevelLocationsRecordedSQLite(ctx context.Context, sha256, first, second string) (bool, bool, error) {
+	var firstOK, secondOK bool
+	if err := db.lite.QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM sample_locations
+		               WHERE sha256 = ? AND path = ? AND parent_sha256 = ''),
+		       EXISTS(SELECT 1 FROM sample_locations
+		               WHERE sha256 = ? AND path = ? AND parent_sha256 = '')`,
+		sha256, first, sha256, second).Scan(&firstOK, &secondOK); err != nil {
+		return false, false, fmt.Errorf("hopper: locations recorded %s: %w", sha256, err)
+	}
+	return firstOK, secondOK, nil
+}
+
 func (db *DB) topLevelLocationsForSHASQLite(ctx context.Context, sha256 string) ([]*SampleLocation, error) {
 	rows, err := db.lite.QueryContext(ctx, `
 		SELECT `+liteLocationCols+` FROM sample_locations

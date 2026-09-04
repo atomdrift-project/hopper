@@ -1635,6 +1635,41 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			SELECT sha256, source, name, version, signer, verified, trust,
 			       '' AS domain, observed_at
 			  FROM claims`,
+
+		// Donor lookup for cross-pool moves (moveDonors). A move off the hot
+		// pool cannot hard link across datasets, so before copying bytes it
+		// asks for up to maxMoveDonors other live locations of the same sha
+		// inside the destination's pool root, and links one of those instead.
+		//
+		// The question is "this sha, in this pool" — a sha256 equality plus a
+		// path prefix — and no existing index can answer it. idx_sl_sha256 is
+		// keyed on sha256 alone, so the pool filter and the LIMIT both land in
+		// Go after every location for that sha is already on the wire. The
+		// UNIQUE (sha256, path) constraint has the right key but the wrong
+		// collation: under the database's en_US.UTF-8, glibc ignores
+		// punctuation at primary strength, so 'pending/a' sorts after
+		// 'pending0' and the prefix range [pending/, pending0) matches none of
+		// its own pool. Verified 2026-09-03: every pending/… case tested came
+		// back outside the range, so a range scan on that index is not merely
+		// slow, it is wrong. COLLATE "C" restores byte ordering and makes the
+		// bound exact, and the query must name the same collation to match.
+		//
+		// Partial on parent_sha256 = '' because only top-level rows name real
+		// files a link can be made from; that is ~21M of the ledger rather than
+		// all of it. path is a key column, not an INCLUDE, both because the
+		// range needs it and because INCLUDE would disable btree dedup on a
+		// column whose whole point here is shared prefixes.
+		//
+		// The tail is what forces this, the same way it forced
+		// idx_sl_child_parents. Measured 2026-09-03 on the empty-file sha
+		// (e3b0c442…): the unbounded donor query returns 7,190,943 rows,
+		// spills 2.9 GB to temp across five workers for the ORDER BY, and takes
+		// 2.4-3.7s — to choose at most four paths. draino's hot-pool drain pays
+		// that per file, and the files with millions of locations are the tiny
+		// ubiquitous ones (an OS image's sgml declarations, empty files) it has
+		// the most of.
+		`CREATE INDEX IF NOT EXISTS idx_sl_donor ON sample_locations ` +
+			`(sha256, path COLLATE "C") WHERE parent_sha256 = ''`,
 	}
 }
 
@@ -3927,6 +3962,19 @@ func (db *DB) locationsForSHAPG(ctx context.Context, sha256 string) ([]*SampleLo
 		out = append(out, loc)
 	}
 	return out, rows.Err()
+}
+
+func (db *DB) topLevelLocationsRecordedPG(ctx context.Context, sha256, first, second string) (bool, bool, error) {
+	var firstOK, secondOK bool
+	if err := db.pool.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM sample_locations
+		               WHERE sha256 = $1 AND path = $2 AND parent_sha256 = ''),
+		       EXISTS(SELECT 1 FROM sample_locations
+		               WHERE sha256 = $1 AND path = $3 AND parent_sha256 = '')`,
+		sha256, first, second).Scan(&firstOK, &secondOK); err != nil {
+		return false, false, fmt.Errorf("hopper: locations recorded %s: %w", sha256, err)
+	}
+	return firstOK, secondOK, nil
 }
 
 func (db *DB) topLevelLocationsForSHAPG(ctx context.Context, sha256 string) ([]*SampleLocation, error) {
