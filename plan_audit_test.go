@@ -505,9 +505,14 @@ func TestPlanAuditHighestRouteWalk(t *testing.T) {
 			` AND s0.file_type = 'elf'`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// lvl is the only sort key, matching the selector exactly. Adding a
+			// litmus_score tiebreak here would pass this test's index assertion
+			// and fail its Sort assertion -- which is what shipped on 2026-09-02
+			// and cost three hours of 30s timeouts, unseen because these audits
+			// skip without a DSN.
 			sql := `EXPLAIN SELECT s0.file_type, s0.lvl FROM samples s0
 			         WHERE ` + tc.where + `
-			         ORDER BY s0.lvl ASC, s0.litmus_score DESC LIMIT ` + strconv.Itoa(triagePerRouteK)
+			         ORDER BY s0.lvl ASC LIMIT ` + strconv.Itoa(triagePerRouteK)
 			plan := explainText(t, ctx, db, sql)
 			if planSeqScansSamples(plan) {
 				t.Errorf("Seq Scan on samples:\n%s", plan)
@@ -517,8 +522,12 @@ func TestPlanAuditHighestRouteWalk(t *testing.T) {
 					"(file_type, lvl, analyzed_at) to emit each route's tightest-firing benign "+
 					"first and stop at K:\n%s", plan)
 			}
+			// A Sort here means the ordering is not index-supplied, which stops
+			// the WindowAgg streaming and stops LIMIT ending the walk early: every
+			// route then scans its whole eligible set instead of stopping at K.
 			if strings.Contains(plan, "Sort") {
-				t.Errorf("sorts instead of walking the route's score tail:\n%s", plan)
+				t.Errorf("sorts instead of walking the route's level tail — LIMIT can no "+
+					"longer stop the walk early:\n%s", plan)
 			}
 			t.Logf("ok\n%s", firstPlanLines(plan))
 		})

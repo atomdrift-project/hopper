@@ -5523,8 +5523,17 @@ func (db *DB) triageSecondOpinionPG(ctx context.Context, limit int, trusted []st
 // operating point — the one actually costing recall. It replaces litmus_score
 // DESC, which orders the same rows identically WITHIN a route (the two are
 // monotonic there) but says nothing across routes, since a probability is not
-// comparable between routes calibrated at 0.0100 and 0.9998. litmus_score
-// remains the tiebreak within a level.
+// comparable between routes calibrated at 0.0100 and 0.9998.
+//
+// lvl is the ONLY sort key, and that is load-bearing rather than a simplification
+// (2026-09-03). It shipped as `lvl ASC, litmus_score DESC` — litmus_score as a
+// within-level tiebreak — which the index cannot supply: after the file_type
+// equality it yields lvl order and nothing more. Postgres answered with a Sort,
+// and a WindowAgg over unsorted input cannot stream, so LIMIT stopped being able
+// to end the walk early and every route scanned its whole eligible set. That was
+// a 30s timeout on every poll for three hours. A tiebreak here is not worth an
+// ordered walk; ties inside one level resolve arbitrarily, and the collapse below
+// picks a root per archive anyway.
 // The empty file_type is its own partition — rows there are rare (analyzed
 // rows carry a type) and excluding them would hide real pinners.
 func (db *DB) triageHighestPG(ctx context.Context, limit, perRouteK int,
@@ -5555,11 +5564,11 @@ func (db *DB) triageHighestPG(ctx context.Context, limit, perRouteK int,
 		     CROSS JOIN LATERAL (
 		       SELECT CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END AS root,
 		              s0.lvl AS best,
-		              ROW_NUMBER() OVER (ORDER BY s0.lvl ASC, s0.litmus_score DESC) AS rank
+		              ROW_NUMBER() OVER (ORDER BY s0.lvl ASC) AS rank
 		       FROM samples s0
 		       WHERE `+triageHighestWhere("s0.", "s0.lvl", "$1", fresh, "$2")+`
 		         AND s0.file_type = f.file_type`+extra+`
-		       ORDER BY s0.lvl ASC, s0.litmus_score DESC
+		       ORDER BY s0.lvl ASC
 		       LIMIT `+strconv.Itoa(perRouteK)+`
 		     ) k
 		   ) hot ORDER BY root, best ASC, rank ASC

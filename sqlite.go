@@ -3346,7 +3346,7 @@ func (db *DB) triageHighestSQLite(ctx context.Context, limit, perRouteK int,
 		     SELECT CASE WHEN s0.parent = '' THEN s0.sha256 ELSE s0.parent END AS root,
 		            `+litmusLvlSQLite("s0.")+` AS best,
 		            ROW_NUMBER() OVER (PARTITION BY s0.file_type
-		                               ORDER BY `+litmusLvlSQLite("s0.")+` ASC, s0.litmus_score DESC) AS rank
+		                               ORDER BY `+litmusLvlSQLite("s0.")+` ASC) AS rank
 		     FROM samples s0
 		     WHERE `+triageHighestWhere("s0.", litmusLvlSQLite("s0."), "?", "?", "?")+extra+`
 		   ) hot WHERE rank <= `+strconv.Itoa(perRouteK)+`

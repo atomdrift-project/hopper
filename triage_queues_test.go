@@ -402,17 +402,22 @@ func TestTriageHighestCollapsesToParent(t *testing.T) {
 	// Hot good members under each parent, plus a top-level hot good file.
 	for _, m := range []struct {
 		sha, parent, path string
+		lvl               int
 		score             float64
 	}{
-		{m1, pGood, "good/pkg.tgz!!a.dll", 0.9999},
-		{m2, pGood, "good/pkg.tgz!!b.dll", 0.9995}, // sibling: must not appear separately
-		{mUnk, pUnk, "unknown/u.tgz!!x.dll", 1.0},
-		{mBad, pBad, "bad/b.tgz!!y.dll", 0.999}, // bad parent: excluded
-		{top, "", "good/t.exe", 0.9997},
+		// Distinct levels, tightest first: lvl is the queue's only sort key, so
+		// giving every member the same one would leave the ranking this test
+		// asserts undefined. They mirror the score order they replace — a lower
+		// level is a tighter firing budget, as a higher score was.
+		{mUnk, pUnk, "unknown/u.tgz!!x.dll", 0, 1.0},
+		{m1, pGood, "good/pkg.tgz!!a.dll", 1, 0.9999},
+		{top, "", "good/t.exe", 2, 0.9997},
+		{m2, pGood, "good/pkg.tgz!!b.dll", 3, 0.9995}, // sibling: must not appear separately
+		{mBad, pBad, "bad/b.tgz!!y.dll", 4, 0.999},    // bad parent: excluded
 	} {
 		mustInsert(t, ctx, db, &Sample{SHA256: m.sha, Label: "good", Parent: m.parent, Path: m.path})
 		mustAnalyze(t, ctx, db, m.sha, 5)
-		setLitmus(t, ctx, db, m.sha, 2, 10, m.score)
+		setLitmus(t, ctx, db, m.sha, 2, m.lvl, m.score)
 	}
 
 	before := time.Now().Add(time.Hour)
