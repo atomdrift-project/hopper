@@ -124,7 +124,6 @@ idx_samples_top_ready_created
 idx_samples_unconvicted_hostile_repair
 idx_samples_unconvicted_hostile_stale
 idx_samples_unconvicted_route_lvl
-idx_samples_unconvicted_route_fresh
 idx_samples_unconvicted_susp_repair
 idx_samples_unconvicted_susp_stale
 idx_samples_version_drift_newest
@@ -152,7 +151,28 @@ idx_slh_sha256_retired
 # splits the body on whitespace, so a '#' line would parse as index names and
 # fail the guard.
 # shellcheck disable=SC2034
+#
+# NOTE: this list is whitespace-split by both sh and the guard test
+# (parseShellWordList) — every word inside the quotes is read as an index name,
+# so no comments may appear between them. Annotate above the list, as here.
+#
+# idx_samples_unconvicted_route_fresh is PARKED, not retired: move it back to
+# REPLICA_KEEP_INDEXES when cyclotron is repointed at the replica, and run
+# `make replica` to rebuild it BEFORE sending it traffic.
+#
+# It is cyclotron's ranked-queue index and cyclotron does not read galadriel
+# yet — zero scans over a 19h24m window (2026-09-05), with only prism and
+# hopper-replica holding connections. Meanwhile it is 6841 MB, 24% of the whole
+# samples index footprint on the replica, and its predicate
+# (label IN ('good','unknown') + cleave/litmus non-null) matches a large share
+# of what apply writes, because members inherit their parent's label.
+#
+# The ordering constraint that makes this temporary: cyclotron cannot move to
+# the replica until the replica catches up, and the replica catches up sooner
+# without maintaining an index nothing reads. Parking it is what unblocks the
+# repoint, not a decision against it.
 REPLICA_DROP_INDEXES='
+idx_samples_unconvicted_route_fresh
 idx_samples_good_repair_newest
 idx_samples_unknown_newest
 idx_samples_candidate_keyset

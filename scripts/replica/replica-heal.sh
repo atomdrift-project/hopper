@@ -295,6 +295,84 @@ for line in $published; do
 done
 IFS=$oldIFS
 
+# --- Storage-parameter parity (autovacuum tuning) ---------------------------
+# Storage parameters are NOT replicated: logical replication carries row
+# changes, never DDL, so a per-table autovacuum setting applied on the
+# publisher silently never reaches a subscriber. Nothing else in this repo
+# notices, because the schema stays in perfect parity while the drift is
+# entirely in reloptions.
+#
+# Found on galadriel 2026-09-05: `samples` carried the publisher's
+# autovacuum_*_scale_factor=0.02 but `sample_locations` carried nothing, so it
+# sat on the server default of 0.2. Autovacuum had NEVER run on it —
+# autovacuum_count 0, last_autovacuum and last_autoanalyze both null — leaving
+# its visibility map unset, which is what turns a replica index-only scan into
+# hundreds of thousands of heap fetches.
+#
+# Note what the threshold is actually computed from: pg_class.reltuples, NOT
+# pg_stat_all_tables.n_live_tup. Those disagree wildly on a subscriber that has
+# never been analyzed (761M vs 28.5M here), and only reltuples matters. So this
+# ALTER lowers the bar from 0.2*761M = 152M dead to 0.02*761M = 15.2M — real,
+# but still far above the 2.79M dead actually present, i.e. it prevents the
+# table from drifting further, it does NOT retroactively schedule a run. A table
+# already starved this long needs a one-off `VACUUM (ANALYZE)` from an operator
+# to set the visibility map; see the RUNBOOK.
+#
+# Reconciled here rather than in setup.sh because this is exactly the healer's
+# remit: a bounded, lossless difference against the publisher's live catalog.
+# SET is idempotent, so a run with no drift is a no-op. Publisher-side option
+# names are validated by Postgres itself, same trust model as the ADD COLUMN
+# DDL above. Set REPLICA_MATCH_RELOPTIONS=false to leave storage parameters
+# alone (a replica deliberately tuned differently from its publisher).
+if [ "${REPLICA_MATCH_RELOPTIONS:-true}" = "true" ]; then
+    remote_reloptions=$(remote -tAF '|' -v pub="$PUBLICATION" <<'SQL' 2>/dev/null || true
+SELECT format('%I.%I', n.nspname, c.relname),
+       array_to_string(c.reloptions, ', ')
+  FROM pg_publication_tables pt
+  JOIN pg_namespace n ON n.nspname = pt.schemaname
+  JOIN pg_class c     ON c.relname = pt.tablename AND c.relnamespace = n.oid
+ WHERE pt.pubname = :'pub' AND c.reloptions IS NOT NULL
+ ORDER BY 1;
+SQL
+    )
+    local_reloptions=$(admin -d "$LOCAL_DB" -tAF '|' <<'SQL' 2>/dev/null || true
+SELECT format('%I.%I', n.nspname, c.relname),
+       array_to_string(c.reloptions, ', ')
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE c.relkind = 'r' AND c.reloptions IS NOT NULL
+ ORDER BY 1;
+SQL
+    )
+    reloption_names=""
+    oldIFS=$IFS
+    IFS='
+'
+    for line in $remote_reloptions; do
+        qt=${line%%|*}; opts=${line#*|}
+        [ -n "$opts" ] || continue
+        # Only act on a table we actually have; a missing one is the column
+        # step's business, and it will be created with defaults there.
+        printf '%s\n' "$local_tables" | grep -qxF "$qt" || continue
+        if ! printf '%s\n' "$local_reloptions" | grep -qxF "$qt|$opts"; then
+            if admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
+                    -c "ALTER TABLE $qt SET ($opts);" >/dev/null 2>&1; then
+                reloption_names="$reloption_names $qt"
+            else
+                alert warn "could not apply publisher storage parameters to $qt ($opts) — autovacuum on the replica will use server defaults, which on a large replicated table can mean it never runs at all"
+            fi
+        fi
+    done
+    IFS=$oldIFS
+    if [ -n "$reloption_names" ]; then
+        # Deliberately no VACUUM/ANALYZE here: on a table this size it is a
+        # multi-hundred-GB scan that would either block this timer or, if
+        # backgrounded, be killed when the unit exits. Say plainly that the
+        # setting alone does not catch a table up, so nobody reads the synced
+        # message as "handled".
+        log "storage parameters synced from publisher:$reloption_names — this bounds FUTURE drift only; a table autovacuum has never touched still needs a one-off VACUUM (ANALYZE) by hand"
+    fi
+fi
+
 # --- Decide & act ----------------------------------------------------------
 # For each table we're creating, resolve its primary-key DDL (reproduced from
 # the publisher above). It runs AFTER the table's columns exist and gives the
