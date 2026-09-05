@@ -656,14 +656,17 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// heap tuple AND an index entry in every index the new row matches.
 		//
 		// A PARTIAL index only takes that write when the row matches its
-		// predicate. An UNCONDITIONAL one takes it on all 130M row-writes.
-		// That is why one statement — the analyzed_at upsert in
-		// insertSamplesPG — was 73.7% of all WAL on the master (990 GB, at
-		// 7.6 KB of WAL per row), and why galadriel then sat ~7.5h behind:
-		// single-threaded logical decode has to read every byte of it.
+		// predicate. An UNCONDITIONAL one takes it on all ~130M row-writes.
 		//
 		// Prefer a partial index. If an unconditional one is truly needed,
 		// price it at ~130M extra index writes per pg_stat_statements cycle.
+		//
+		// Scale note, measured 2026-09-05: retiring the two indexes below cut
+		// samples' index footprint 129 GB -> 93 GB but left WAL per row
+		// unchanged at ~7.6 KB. Index writes are real but they were NOT the
+		// dominant cost on this table — TOAST rewrite was. See
+		// memberConflictUpdatePG for that one. Fix the payload first; treat
+		// index count as the second-order win it is.
 		// ---------------------------------------------------------------
 		//
 		// idx_samples_path (unconditional, 28 GB) is retired: it was never
@@ -3271,9 +3274,47 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 // and never blanks litmus. New members fall through to a plain INSERT. The
 // samples_derive_cleave_cols trigger re-derives file_type/max_crit/etc on the
 // cleave_result write.
+//
+// The CASE guards are NOT cosmetic — do not "simplify" them back to a bare
+// assignment. Measured 2026-09-05, this one statement was 73.7% of ALL WAL on
+// the master (990 GB, 130M rows, ~7.6 KB of WAL per row) and it is why
+// galadriel sat ~7.5 h behind: single-threaded logical decode has to read every
+// byte of that WAL before it can apply anything.
+//
+// The bytes are TOAST, not indexes. cleave_result is JSONB averaging 6.6 KB
+// (p50 2.8 KB, p95 16 KB, max 2.2 MB) and 62% of rows exceed the TOAST
+// threshold, so a bare `cleave_result = EXCLUDED.cleave_result` re-TOASTs the
+// whole value — ~3 fresh chunks in samples' 933 GB TOAST table, every time.
+//
+// And it was almost always writing IDENTICAL bytes. The row is keyed by
+// sha256, so the same content yields the same cleave analysis; meanwhile a
+// popular dependency is a member of thousands of archives (see
+// insertMembersFromStagingPG below), and every one of those archives re-upserts
+// it with a fresh analyzed_at. The refresh that matters is the timestamp, which
+// is cheap; re-TOASTing an unchanged 6.6 KB payload alongside it is not.
+//
+// Assigning `samples.cleave_result` back hands heap_update the ORIGINAL external
+// TOAST pointer, which it preserves instead of writing new chunks and deleting
+// the old ones. Assigning EXCLUDED's copy — even byte-identical — is a fresh
+// datum and always re-TOASTs. That pointer identity is the whole mechanism.
+//
+// Semantics are unchanged: the stored value is the same either way, and the
+// column stays in the SET list so the `UPDATE OF cleave_result` trigger still
+// fires. The cost traded in is detoasting the old value to compare it, which is
+// a read (usually cached) in place of a write plus its WAL plus the later
+// vacuum of the dead chunks.
 const memberConflictUpdatePG = `ON CONFLICT (sha256) DO UPDATE SET
-	cleave_result = EXCLUDED.cleave_result,
-	litmus_result = COALESCE(EXCLUDED.litmus_result, samples.litmus_result),
+	cleave_result = CASE
+		WHEN samples.cleave_result IS DISTINCT FROM EXCLUDED.cleave_result
+		THEN EXCLUDED.cleave_result
+		ELSE samples.cleave_result
+	END,
+	litmus_result = CASE
+		WHEN EXCLUDED.litmus_result IS NOT NULL
+		 AND samples.litmus_result IS DISTINCT FROM EXCLUDED.litmus_result
+		THEN EXCLUDED.litmus_result
+		ELSE samples.litmus_result
+	END,
 	analyzed_at = EXCLUDED.analyzed_at,
 	first_analyzed_at = COALESCE(samples.first_analyzed_at, EXCLUDED.first_analyzed_at),
 	updated_at = now()

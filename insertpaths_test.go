@@ -2,6 +2,7 @@ package hopper
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -21,6 +22,39 @@ import (
 // lists stayed duplicated. This asserts the property that matters at the call
 // site rather than comparing the lists: a field set on Sample survives whichever
 // entry point the caller uses.
+// TestMemberUpsertPreservesUnchangedToastPointers pins the CASE guards in
+// memberConflictUpdatePG. A bare `cleave_result = EXCLUDED.cleave_result` reads
+// as the obvious simplification, and it is the more expensive statement in the
+// whole system: cleave_result is JSONB averaging 6.6 KB with 62% of rows over
+// the TOAST threshold, so assigning EXCLUDED's fresh datum re-TOASTs the value
+// even when the bytes are identical. Measured 2026-09-05, that made this one
+// statement 73.7% of all master WAL (990 GB) and left the logical replica ~7.5 h
+// behind. Assigning `samples.<col>` back preserves the original external TOAST
+// pointer, which heap_update keeps instead of writing new chunks.
+//
+// The guards are semantically transparent — verified against the full
+// stored/excluded NULL truth table — so only the write cost changes.
+func TestMemberUpsertPreservesUnchangedToastPointers(t *testing.T) {
+	for _, col := range []string{"cleave_result", "litmus_result"} {
+		// The ELSE branch must hand back the STORED datum, not EXCLUDED's copy.
+		if !strings.Contains(memberConflictUpdatePG, "ELSE samples."+col) {
+			t.Errorf("memberConflictUpdatePG must fall back to samples.%s to preserve "+
+				"the existing TOAST pointer; a bare EXCLUDED assignment re-TOASTs "+
+				"an unchanged %s and was 73.7%% of master WAL", col, col)
+		}
+		if !strings.Contains(memberConflictUpdatePG, "samples."+col+" IS DISTINCT FROM EXCLUDED."+col) {
+			t.Errorf("memberConflictUpdatePG must compare samples.%s against EXCLUDED.%s "+
+				"so an unchanged value is not rewritten", col, col)
+		}
+	}
+	// The timestamp refresh is the point of the statement and must stay
+	// unconditional — skipping it would strand rescan scheduling on a stale
+	// analyzed_at, which is a correctness change, not an optimization.
+	if !strings.Contains(memberConflictUpdatePG, "analyzed_at = EXCLUDED.analyzed_at") {
+		t.Error("memberConflictUpdatePG must still refresh analyzed_at unconditionally")
+	}
+}
+
 func TestInsertPathsAgreeOnPersistedFields(t *testing.T) {
 	ctx := context.Background()
 	analyzed := time.Now().UTC().Truncate(time.Second)

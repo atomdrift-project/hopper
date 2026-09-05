@@ -5,7 +5,7 @@ This is the operational checklist for changing a **derived column** on `samples`
 replicas healthy across such a change. It exists because one such change — done
 the naive way — froze the primary for 44 minutes and silently disabled a replica.
 
-## The three rules that make this safe
+## The four rules that make this safe
 
 1. **Never run a table-rewriting statement on `samples`.** Adding/recreating a
    `GENERATED ALWAYS AS … STORED` column, or `ALTER COLUMN … TYPE`, rewrites every
@@ -37,13 +37,8 @@ the naive way — froze the primary for 44 minutes and silently disabled a repli
    rows matching its predicate; an unconditional one pays it on all ~130M
    row-writes.
 
-   This is not theoretical: on 2026-09-05 a single statement — the `analyzed_at`
-   upsert in `insertSamplesPG` — was **73.7% of all WAL on the master** (990 GB,
-   ~7.6 KB of WAL per row), and galadriel sat **~7.5 h behind** because
-   single-threaded logical decode must read every byte of that WAL before it can
-   apply anything. The fix was not replica tuning; it was deleting index writes
-   on the primary. Two unconditional indexes accounted for 37 GB of the ~69 GB
-   always-written set:
+   Two unconditional indexes accounted for 37 GB of the ~69 GB always-written
+   set, and were retired on 2026-09-05:
    - `idx_samples_path` (28 GB) — **never once scanned** (`idx_scan` 0,
      `last_idx_scan` NULL); its only equality consumer carries
      `skip = '' AND cleave_result IS NULL` and plans via
@@ -58,6 +53,47 @@ the naive way — froze the primary for 44 minutes and silently disabled a repli
    in `REPLICA_KEEP_INDEXES` read zero on the master because prism reads them on
    the *replica*, and a tier that is merely switched off reads zero too. `EXPLAIN`
    the application's real SQL text before dropping anything.
+
+   Measured outcome, so nobody repeats it expecting more: that diet cut samples'
+   index footprint **129 GB → 93 GB** and left WAL per row **unchanged at
+   ~7.6 KB**. Index writes are real, but on this table they are second-order.
+   Rule 4 is where the bytes actually were.
+
+4. **Never assign a large TOASTed column unconditionally in an upsert.** This is
+   the big one. On 2026-09-05 a single statement — the member upsert in
+   `insertMembersFromStagingPG` — was **73.7% of all WAL on the master** (990 GB,
+   130M rows, ~7.6 KB each), and galadriel sat **~7.5 h behind** because
+   single-threaded logical decode must read every byte of that WAL before it can
+   apply anything.
+
+   Almost none of those bytes were new information. `samples.cleave_result` is
+   JSONB averaging **6.6 KB** (p50 2.8 KB, p95 16 KB, max 2.2 MB) with 62% of
+   rows over the TOAST threshold, and samples' TOAST table is **933 GB** taking
+   ~394M chunk inserts. The row is keyed by `sha256`, so identical content yields
+   an identical cleave analysis — while a popular dependency is a member of
+   thousands of archives, each of which re-upserts it with a fresh `analyzed_at`.
+   So the statement was re-TOASTing an unchanged 6.6 KB payload, over and over,
+   to refresh a timestamp.
+
+   The mechanism to know: assigning `EXCLUDED.<col>` hands `heap_update` a fresh
+   datum, which always re-TOASTs — even when the bytes are identical. Assigning
+   `samples.<col>` back hands it the **original external TOAST pointer**, which it
+   preserves instead of writing new chunks and deleting the old ones. So guard
+   the write:
+
+   ```sql
+   cleave_result = CASE
+       WHEN samples.cleave_result IS DISTINCT FROM EXCLUDED.cleave_result
+       THEN EXCLUDED.cleave_result
+       ELSE samples.cleave_result   -- preserves the TOAST pointer
+   END
+   ```
+
+   Keep the cheap scalar refreshes (`analyzed_at`) unconditional — skipping those
+   would strand rescan scheduling on a stale timestamp, which is a correctness
+   change rather than an optimization. `sampleConflictUpdatePG` already applies
+   this discipline via its `IS DISTINCT FROM` WHERE guard; `locationChangedPG` is
+   the same lesson learned earlier on `sample_locations`.
 
 ## Procedure: convert a derived column generated → plain
 
