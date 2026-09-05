@@ -521,7 +521,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			`AND cleave_result IS NOT NULL AND skip = ''`,
 		// Superseded by the route-leading index above: nothing selects a global
 		// level band, and TriageLowest still ranks by score.
-		`DROP INDEX IF EXISTS idx_samples_unconvicted_route_lvl`,
+		`DROP INDEX IF EXISTS idx_samples_unconvicted_lvl`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_bad_lvl ` +
 			`ON samples(lvl DESC, analyzed_at, id) ` +
 			`WHERE label = 'bad' AND lvl IS NOT NULL ` +
