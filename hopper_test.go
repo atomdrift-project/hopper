@@ -2621,6 +2621,58 @@ func TestExplodeArchiveMembers(t *testing.T) {
 // yields exactly the same members — identity, cleave slice, and per-member
 // litmus slice — as building them all at once. It also guards the parse-once
 // litmus index: every member must resolve a distinct, non-empty litmus result.
+// TestMemberEnvelopeCarriesTraitsVersion pins the traits version onto exploded
+// members. /api/known reports a stored verdict "current" only when
+// samples.traits_version matches the producer's, and scan skips re-posting
+// exactly those. Members used to inherit no version at all, so they were never
+// current, so every archive containing a popular dependency re-posted its
+// verdict — and the rev-less member envelope then overwrote the cleave_result of
+// any standalone row for the same sha, destroying the signal that would have
+// stopped it. Measured 2026-09-05: source 'x' (exploded) carried a version on
+// 2.0% of rows against 73-100% for every real producer.
+func TestMemberEnvelopeCarriesTraitsVersion(t *testing.T) {
+	sha := fmt.Sprintf("%064x", 1)
+	file := fmt.Sprintf(`{"sha":%q,"type":"elf","path":"pkg/f.so","depth":1,"size":100}`, sha)
+	mkParent := func(envelope, resolved string) *Sample {
+		return &Sample{
+			SHA256: fmt.Sprintf("%064x", 99), Source: "s", Label: "bad", Path: "bad/pkg.tar",
+			CleaveResult:  []byte(`{` + envelope + `"files":[` + file + `]}`),
+			TraitsVersion: resolved,
+		}
+	}
+
+	for _, tc := range []struct {
+		name     string
+		envelope string
+		resolved string
+		want     string
+	}{
+		{"resolved version wins", `"rev":"aaaaa",`, "bbbbb", "bbbbb"},
+		{"falls back to envelope rev (v8)", `"rev":"aaaaa",`, "", "aaaaa"},
+		{"falls back to envelope tv (v7)", `"tv":"ccccc",`, "", "ccccc"},
+		{"unknown stays empty", ``, "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			members := memberSamplesFromEnvelope(mkParent(tc.envelope, tc.resolved))
+			if len(members) != 1 {
+				t.Fatalf("got %d members, want 1", len(members))
+			}
+			if got := members[0].TraitsVersion; got != tc.want {
+				t.Errorf("member TraitsVersion = %q, want %q", got, tc.want)
+			}
+			// The stored envelope must be self-describing too: ParseCleaveResult
+			// reads "rev" back out, so a member that is later re-stored keeps its
+			// version rather than silently reverting to none.
+			if got := ParseCleaveResult(sha, members[0].CleaveResult).TraitsVersion; got != tc.want {
+				t.Errorf("round-tripped member envelope rev = %q, want %q", got, tc.want)
+			}
+			if tc.want == "" && bytes.Contains(members[0].CleaveResult, []byte(`"rev"`)) {
+				t.Errorf("unknown version must omit rev, got %s", members[0].CleaveResult)
+			}
+		})
+	}
+}
+
 func TestMemberEnvelopeBatchedBuildMatchesSingle(t *testing.T) {
 	mk := func(i int) string { return fmt.Sprintf("%064x", i+1) } // distinct lowercase-hex sha256
 

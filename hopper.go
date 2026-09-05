@@ -1373,6 +1373,12 @@ type memberEnvelope struct {
 	parent *Sample
 	litmus *litmusMemberIndex
 	files  []json.RawMessage
+	// traitsVersion is the analyzer traits revision this envelope was produced
+	// at, stamped onto every member row and re-emitted as "rev" in each
+	// member's single-file envelope. Without it an exploded member carries no
+	// version at all, and /api/known can never report its verdict current — see
+	// newMemberEnvelope for why that matters.
+	traitsVersion string
 }
 
 // newMemberEnvelope parses parent.CleaveResult into its member entries, applying
@@ -1386,6 +1392,9 @@ func newMemberEnvelope(parent *Sample) *memberEnvelope {
 	var report struct {
 		Files    []json.RawMessage `json:"files"`
 		OldFiles []json.RawMessage `json:"fs"`
+		// The parent's analyzer traits revision, v8 "rev" then v7 "tv".
+		TraitsVersion    string `json:"rev"`
+		OldTraitsVersion string `json:"tv"`
 	}
 	if err := json.Unmarshal(parent.CleaveResult, &report); err != nil {
 		slog.Warn("parse cleave result for member extraction", "parent", parent.SHA256, "error", err)
@@ -1394,6 +1403,28 @@ func newMemberEnvelope(parent *Sample) *memberEnvelope {
 	files := report.Files
 	if len(files) == 0 {
 		files = report.OldFiles
+	}
+
+	// Carry the traits version onto the members. This is load-bearing, not
+	// bookkeeping: /api/known reports a verdict "current" only when the stored
+	// samples.traits_version matches the producer's, and scan skips re-posting
+	// exactly those. Exploded members used to inherit no version, so they were
+	// never current, so every archive containing a popular dependency re-posted
+	// its verdict — which is the write this whole path is most expensive for
+	// (see memberConflictUpdatePG). Worse, it was self-perpetuating: a
+	// standalone row analyzed WITH a version had its cleave_result overwritten
+	// by a rev-less member envelope the next time any archive containing it was
+	// analyzed, destroying the very signal that would have stopped the fan-out.
+	//
+	// Prefer the version the caller resolved (StoreResult's argument, which has
+	// the report -> server litmus -> worker-reported fallback chain behind it)
+	// and fall back to whatever the envelope itself declares.
+	traitsVersion := parent.TraitsVersion
+	if traitsVersion == "" {
+		traitsVersion = report.TraitsVersion
+	}
+	if traitsVersion == "" {
+		traitsVersion = report.OldTraitsVersion
 	}
 
 	// Bound the fan-out. A cleave result is worker-supplied and capped only by
@@ -1409,9 +1440,10 @@ func newMemberEnvelope(parent *Sample) *memberEnvelope {
 		files = files[:maxArchiveMembers]
 	}
 	return &memberEnvelope{
-		parent: parent,
-		files:  files,
-		litmus: newLitmusMemberIndex(parent.LitmusResult),
+		parent:        parent,
+		files:         files,
+		litmus:        newLitmusMemberIndex(parent.LitmusResult),
+		traitsVersion: traitsVersion,
 	}
 }
 
@@ -1544,9 +1576,15 @@ func (e *memberEnvelope) buildRange(start, end int) []*Sample {
 			}
 		}
 
+		// Re-emit the parent's traits revision so a member's stored envelope is
+		// self-describing: ParseCleaveResult reads "rev" back out of it, so a
+		// member that is later re-stored keeps its version instead of silently
+		// reverting to none. Omitted when unknown rather than written empty —
+		// "" is not a version, and CompactReport omits the key too.
 		singleFile, err := json.Marshal(struct {
-			Files []json.RawMessage `json:"files"`
-		}{Files: []json.RawMessage{raw}})
+			TraitsVersion string            `json:"rev,omitempty"`
+			Files         []json.RawMessage `json:"files"`
+		}{TraitsVersion: e.traitsVersion, Files: []json.RawMessage{raw}})
 		if err != nil {
 			continue
 		}
@@ -1593,6 +1631,7 @@ func (e *memberEnvelope) buildRange(start, end int) []*Sample {
 			Skip:            skip,
 			AnalyzedAt:      e.parent.AnalyzedAt,
 			FirstAnalyzedAt: firstAnalyzedAt,
+			TraitsVersion:   e.traitsVersion,
 		})
 	}
 

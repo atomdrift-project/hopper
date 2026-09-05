@@ -3317,6 +3317,14 @@ const memberConflictUpdatePG = `ON CONFLICT (sha256) DO UPDATE SET
 	END,
 	analyzed_at = EXCLUDED.analyzed_at,
 	first_analyzed_at = COALESCE(samples.first_analyzed_at, EXCLUDED.first_analyzed_at),
+	-- Cheap scalar, but the one /api/known actually reads: it reports a verdict
+	-- "current" only when this matches the producer's version, and scan skips
+	-- re-posting exactly those. Never blank a known version with an unknown one
+	-- — "" is "we could not tell", not "no version".
+	traits_version = CASE
+		WHEN EXCLUDED.traits_version <> '' THEN EXCLUDED.traits_version
+		ELSE samples.traits_version
+	END,
 	updated_at = now()
 WHERE EXCLUDED.analyzed_at > samples.analyzed_at OR samples.analyzed_at IS NULL`
 
@@ -3349,14 +3357,15 @@ const insertMembersFromStagingPG = `INSERT INTO samples (
 	canonical_sha256, parent, skip, elements,
 	max_crit, suspicious_count, mtime, marker_mtime,
 	cleave_result, litmus_result, analyzed_at, first_analyzed_at,
-	url, domain, package, version, provenance, fetched_at)
+	url, domain, package, version, provenance, fetched_at, traits_version)
 SELECT DISTINCT ON (st.sha256)
 	st.sha256, st.source, st.feed, st.ecosystem, st.filename,
 	st.size_bytes, st.label, st.label_source, st.sample_path, st.status,
 	st.canonical_sha256, st.sample_parent, st.skip, st.elements,
 	st.max_crit, st.suspicious_count, st.mtime, st.marker_mtime,
 	st.cleave_result, st.litmus_result, st.analyzed_at, st.first_analyzed_at,
-	st.url, st.domain, st.package, st.version, st.provenance, st.fetched_at
+	st.url, st.domain, st.package, st.version, st.provenance, st.fetched_at,
+	st.traits_version
 FROM _staging st
 LEFT JOIN samples s ON s.sha256 = st.sha256
 WHERE s.sha256 IS NULL
@@ -3560,6 +3569,11 @@ func (db *DB) storeResultPG(
 	parent.LitmusResult = litmusML
 	parent.CanonicalSHA256 = parsed.CanonicalSHA
 	parent.AnalyzedAt = &now
+	// The version THIS analysis ran at, not the row's prior one (that is
+	// priorTraits, kept for stats). Members inherit it; see newMemberEnvelope
+	// for why an unversioned member row is what made scan re-post popular
+	// dependency verdicts on every run.
+	parent.TraitsVersion = traitsVersion
 	if firstAnalyzed.Valid {
 		parent.FirstAnalyzedAt = &firstAnalyzed.Time
 	} else {
