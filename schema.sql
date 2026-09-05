@@ -104,8 +104,11 @@ CREATE TABLE IF NOT EXISTS samples (
 
 CREATE INDEX IF NOT EXISTS idx_samples_label ON samples(label);
 CREATE INDEX IF NOT EXISTS idx_samples_file_type ON samples(file_type);
-CREATE INDEX IF NOT EXISTS idx_samples_status ON samples(status, updated_at);
-CREATE INDEX IF NOT EXISTS idx_samples_path ON samples(path);
+-- idx_samples_status and idx_samples_path used to be declared here as
+-- UNCONDITIONAL indexes. Both were retired 2026-09-05; their replacements
+-- live in pg.go's runtime migration list, which can also redefine them on
+-- existing databases (CREATE INDEX IF NOT EXISTS cannot). Read the WAL-cost
+-- note above them there before adding another unconditional index to samples.
 CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent) WHERE parent != '';
 CREATE INDEX IF NOT EXISTS idx_samples_sighted_created
 	ON samples(created_at DESC) WHERE corroborated AND parent = '' AND skip = '';

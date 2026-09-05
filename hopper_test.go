@@ -1579,6 +1579,7 @@ func TestIndexRewriteHelpers(t *testing.T) {
 
 	pathDDL := ""
 	claimDDL := ""
+	statusDDL := ""
 	for _, ddl := range pgRuntimeMigrations() {
 		if strings.Contains(ddl, "NOT ILIKE '%path <>%'") {
 			pathDDL = ddl
@@ -1586,6 +1587,31 @@ func TestIndexRewriteHelpers(t *testing.T) {
 		if strings.Contains(ddl, "idx_samples_claimable") && strings.Contains(ddl, "DROP INDEX") {
 			claimDDL = ddl
 		}
+		if strings.Contains(ddl, "NOT ILIKE '%status <>%'") {
+			statusDDL = ddl
+		}
+	}
+	// idx_samples_status is the partial-index rewrite. Its predicate MUST stay
+	// known to indexRewriteHasKnownPredicate: an unknown one falls through to
+	// execMigrationWithLockRetry, which runs the raw DO block and takes ACCESS
+	// EXCLUSIVE on samples — a lock that waits behind a logical-replication
+	// COPY and would wedge the very replica this index shrink exists to unblock.
+	if statusDDL == "" {
+		t.Fatal("missing idx_samples_status partial rewrite DO block")
+	}
+	if !isIndexRewriteDO(statusDDL) || !isDeferrableIndexDDL(statusDDL) {
+		t.Fatal("status <> rewrite must be a deferrable index-rewrite DO")
+	}
+	if !indexRewriteHasKnownPredicate(statusDDL) {
+		t.Fatal("status rewrite predicate must be known, or it takes ACCESS EXCLUSIVE")
+	}
+	fullStatus := `CREATE INDEX idx_samples_status ON public.samples USING btree (status, updated_at)`
+	if !indexDefNeedsRewrite(statusDDL, fullStatus) {
+		t.Fatal("unconditional idx_samples_status must be rewritten to the partial")
+	}
+	partialStatus := fullStatus + ` WHERE (status <> ''::text)`
+	if indexDefNeedsRewrite(statusDDL, partialStatus) {
+		t.Fatal("partial idx_samples_status must not be rewritten again")
 	}
 	if pathDDL == "" || claimDDL == "" {
 		t.Fatalf("missing rewrite DO blocks: path=%t claimable=%t", pathDDL != "", claimDDL != "")

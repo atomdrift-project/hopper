@@ -644,6 +644,64 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 				END IF;
 			END LOOP;
 		END$$`,
+		// ---------------------------------------------------------------
+		// WHY UNCONDITIONAL INDEXES ON samples ARE EXPENSIVE — read this
+		// before adding one.
+		//
+		// samples takes ~29 updates per insert (206M vs 7.1M measured
+		// 2026-09-05) and its HOT ratio is 0.04%: analyzed_at, updated_at,
+		// cleave_result and litmus_result are all either indexed outright
+		// or named in a partial index predicate, and any indexed column
+		// changing disables HOT. So essentially every update writes a new
+		// heap tuple AND an index entry in every index the new row matches.
+		//
+		// A PARTIAL index only takes that write when the row matches its
+		// predicate. An UNCONDITIONAL one takes it on all 130M row-writes.
+		// That is why one statement — the analyzed_at upsert in
+		// insertSamplesPG — was 73.7% of all WAL on the master (990 GB, at
+		// 7.6 KB of WAL per row), and why galadriel then sat ~7.5h behind:
+		// single-threaded logical decode has to read every byte of it.
+		//
+		// Prefer a partial index. If an unconditional one is truly needed,
+		// price it at ~130M extra index writes per pg_stat_statements cycle.
+		// ---------------------------------------------------------------
+		//
+		// idx_samples_path (unconditional, 28 GB) is retired: it was never
+		// once scanned (idx_scan 0, last_idx_scan NULL over a 5-day window)
+		// because its only equality consumer — the mark-replaced UPDATE in
+		// insertSamplesPG — carries `skip = '' AND cleave_result IS NULL`
+		// and so plans via idx_samples_pending_path (cost 2.66). The
+		// COLLATE "C" range scan that looks like a second consumer is on
+		// sample_locations, which a samples index cannot serve anyway.
+		`DROP INDEX IF EXISTS idx_samples_path`,
+		// idx_samples_status was unconditional (status, updated_at), 8955 MB
+		// of index over 106M rows, to serve countByStatusPG — which asks
+		// only `WHERE status != ''`, a population of 674,957 rows (0.63%,
+		// measured 2026-09-05). The old shape made that query a Parallel
+		// Index Only Scan of the whole index at cost 2,184,537. As a partial
+		// it is ~160x smaller (~56 MB) AND leaves the write path entirely
+		// for the 99.37% of rows whose status is ''.
+		//
+		// Keep updated_at as the second key: countByStatusPG only needs
+		// (status), but samplesByStatusInPathsPG filters status and orders
+		// by updated_at, and at this size the extra key is nearly free.
+		// Both callers pass a non-empty status, so a custom plan can prove
+		// the partial predicate holds; only a generic plan cannot, and for
+		// status = '' neither shape was ever index-worthy anyway.
+		//
+		// Recreate when an older definition is missing the predicate, for
+		// the same reason as the block above.
+		`DO $$
+		DECLARE
+			def text;
+		BEGIN
+			SELECT pg_get_indexdef(to_regclass('idx_samples_status')) INTO def;
+			IF def IS NOT NULL AND def NOT ILIKE '%status <>%' THEN
+				EXECUTE 'DROP INDEX idx_samples_status';
+			END IF;
+		END$$`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_status ` +
+			`ON samples(status, updated_at) WHERE status <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_bad_miss_newest ` +
 			`ON samples(created_at DESC, id DESC) ` +
 			`WHERE label = 'bad' AND cleave_result IS NOT NULL AND parent = '' ` +
@@ -2209,6 +2267,7 @@ func indexNamesInDDL(ddl string) []string {
 
 func indexRewriteHasKnownPredicate(ddl string) bool {
 	return strings.Contains(ddl, "NOT ILIKE '%path <>%'") ||
+		strings.Contains(ddl, "NOT ILIKE '%status <>%'") ||
 		(strings.Contains(ddl, "idx_samples_claimable") && strings.Contains(ddl, "updated_at NULLS FIRST"))
 }
 
@@ -2216,6 +2275,9 @@ func indexDefNeedsRewrite(ddl, def string) bool {
 	lower := strings.ToLower(def)
 	if strings.Contains(ddl, "NOT ILIKE '%path <>%'") {
 		return !strings.Contains(lower, "path <>")
+	}
+	if strings.Contains(ddl, "NOT ILIKE '%status <>%'") {
+		return !strings.Contains(lower, "status <>")
 	}
 	if strings.Contains(ddl, "idx_samples_claimable") {
 		return !strings.Contains(lower, "on public.samples using btree (updated_at nulls first, id)") ||

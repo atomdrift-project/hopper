@@ -5,7 +5,7 @@ This is the operational checklist for changing a **derived column** on `samples`
 replicas healthy across such a change. It exists because one such change — done
 the naive way — froze the primary for 44 minutes and silently disabled a replica.
 
-## The two rules that make this safe
+## The three rules that make this safe
 
 1. **Never run a table-rewriting statement on `samples`.** Adding/recreating a
    `GENERATED ALWAYS AS … STORED` column, or `ALTER COLUMN … TYPE`, rewrites every
@@ -26,6 +26,38 @@ the naive way — froze the primary for 44 minutes and silently disabled a repli
    write a replicated value into a generated column`) → the subscription disables
    itself → WAL piles up on the primary. This is why a generated↔plain change is a
    **coordinated primary + all-replicas migration**, not a primary-only one.
+
+3. **Never add an *unconditional* index to `samples`.** Prefer a partial one.
+   `samples` takes ~29 updates per insert (206M vs 7.1M, measured 2026-09-05)
+   and its HOT ratio is **0.04%** — `analyzed_at`, `updated_at`, `cleave_result`
+   and `litmus_result` are each either indexed outright or named in some partial
+   index's predicate, and HOT is disabled the moment *any* index-referenced
+   column changes. So nearly every update writes a new heap tuple plus an index
+   entry in every index the new row matches. A partial index pays that only for
+   rows matching its predicate; an unconditional one pays it on all ~130M
+   row-writes.
+
+   This is not theoretical: on 2026-09-05 a single statement — the `analyzed_at`
+   upsert in `insertSamplesPG` — was **73.7% of all WAL on the master** (990 GB,
+   ~7.6 KB of WAL per row), and galadriel sat **~7.5 h behind** because
+   single-threaded logical decode must read every byte of that WAL before it can
+   apply anything. The fix was not replica tuning; it was deleting index writes
+   on the primary. Two unconditional indexes accounted for 37 GB of the ~69 GB
+   always-written set:
+   - `idx_samples_path` (28 GB) — **never once scanned** (`idx_scan` 0,
+     `last_idx_scan` NULL); its only equality consumer carries
+     `skip = '' AND cleave_result IS NULL` and plans via
+     `idx_samples_pending_path`. Retired.
+   - `idx_samples_status` (8955 MB over 106M rows) — served `countByStatusPG`,
+     which only ever asks `WHERE status != ''`: 674,957 rows, 0.63%. Rewritten
+     as a partial, ~160x smaller.
+
+   Before adding one, check the cost with:
+   `SELECT indexrelname, idx_scan, last_idx_scan, pg_size_pretty(pg_relation_size(indexrelid)) FROM pg_stat_user_indexes WHERE relname='samples' ORDER BY idx_scan;`
+   and remember that **`idx_scan = 0` is not proof an index is dead** — indexes
+   in `REPLICA_KEEP_INDEXES` read zero on the master because prism reads them on
+   the *replica*, and a tier that is merely switched off reads zero too. `EXPLAIN`
+   the application's real SQL text before dropping anything.
 
 ## Procedure: convert a derived column generated → plain
 

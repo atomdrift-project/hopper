@@ -185,6 +185,7 @@ idx_samples_source_ecosystem
 idx_samples_source_feed
 idx_samples_stale_traits
 idx_samples_stale_traits_pri2
+idx_samples_status
 idx_samples_top_created
 idx_samples_top_ready_first_analyzed_coalesce
 idx_samples_unanalyzed_id

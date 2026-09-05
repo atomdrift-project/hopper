@@ -33,9 +33,15 @@ SLIM_SRC="$SCRIPT_DIR/slim-indexes.sh"
 TEXTFILE_DIR="${HOST_MON_TEXTFILE_DIR:-/var/lib/host-mon/textfile}"
 TEXTFILE_INTERVAL_MIN="${TEXTFILE_INTERVAL_MIN:-1}"
 case "$TEXTFILE_INTERVAL_MIN" in *[!0-9]*|'') echo "install-heal: TEXTFILE_INTERVAL_MIN must be an integer" >&2; exit 1 ;; esac
+# The timers below schedule with OnCalendar minute expressions (*:0/N), so an
+# interval has to be a whole number of minutes that fits inside one hour.
+[ "$TEXTFILE_INTERVAL_MIN" -ge 1 ] && [ "$TEXTFILE_INTERVAL_MIN" -le 59 ] \
+    || { echo "install-heal: TEXTFILE_INTERVAL_MIN must be 1-59, got '$TEXTFILE_INTERVAL_MIN'" >&2; exit 1; }
 
 INTERVAL_MIN="${HEAL_INTERVAL_MIN:-5}"
 case "$INTERVAL_MIN" in *[!0-9]*|'') echo "install-heal: HEAL_INTERVAL_MIN must be an integer" >&2; exit 1 ;; esac
+[ "$INTERVAL_MIN" -ge 1 ] && [ "$INTERVAL_MIN" -le 59 ] \
+    || { echo "install-heal: HEAL_INTERVAL_MIN must be 1-59, got '$INTERVAL_MIN'" >&2; exit 1; }
 
 log()  { echo "==> install-heal: $*"; }
 warn() { echo "install-heal: WARN $*" >&2; }
@@ -117,8 +123,19 @@ EOF
 Description=run hopper replica self-heal every ${INTERVAL_MIN}min
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=${INTERVAL_MIN}min
+# OnCalendar, NOT OnUnitActiveSec. OnUnitActiveSec re-arms off the SERVICE's
+# last activation, so if the service never activates after a boot the timer
+# elapses once and goes permanently dead: no next elapse, no healing, no
+# alerting, and nothing that says so except "NEXT: -" in `systemctl
+# list-timers`. That is exactly what happened on galadriel across the
+# 2026-09-03 21:45 reboot — both this timer and the textfile one went dead and
+# the replica ran unmonitored for 11.5h while lag grew to 224 GB. A calendar
+# schedule re-arms unconditionally, whether or not the previous run started,
+# finished, or failed (replica-heal.sh exits 1 by design when it alerts).
+OnCalendar=*:0/${INTERVAL_MIN}
+AccuracySec=10s
+# Meaningful only for calendar timers: catch up once immediately if a trigger
+# came due while the machine was down.
 Persistent=true
 
 [Install]
@@ -128,7 +145,11 @@ EOF
     printf '%s\n' "$svc_body" | as_root tee "$svc" >/dev/null || return 1
     printf '%s\n' "$tmr_body" | as_root tee "$tmr" >/dev/null || return 1
     as_root systemctl daemon-reload || return 1
-    as_root systemctl enable --now hopper-replica-heal.timer || return 1
+    as_root systemctl enable hopper-replica-heal.timer || return 1
+    # restart, not `enable --now`: --now does nothing to a timer that is
+    # already active, so an active-but-dead timer (or one still carrying the
+    # previous schedule) would survive a re-install untouched.
+    as_root systemctl restart hopper-replica-heal.timer || return 1
     log "installed systemd timer (every ${INTERVAL_MIN}min): hopper-replica-heal.timer"
     log "  status:  systemctl status hopper-replica-heal.timer"
     log "  run now: systemctl start hopper-replica-heal.service && journalctl -u hopper-replica-heal -n 50"
@@ -168,8 +189,10 @@ EOF
 Description=emit hopper replica health metrics every ${TEXTFILE_INTERVAL_MIN}min
 
 [Timer]
-OnBootSec=1min
-OnUnitActiveSec=${TEXTFILE_INTERVAL_MIN}min
+# See hopper-replica-heal.timer above: OnUnitActiveSec cannot re-arm when the
+# service never activates, which silently kills the timer across a reboot.
+OnCalendar=*:0/${TEXTFILE_INTERVAL_MIN}
+AccuracySec=10s
 Persistent=true
 
 [Install]
@@ -179,7 +202,11 @@ EOF
     printf '%s\n' "$tf_svc_body" | as_root tee "$tf_svc" >/dev/null || return 1
     printf '%s\n' "$tf_tmr_body" | as_root tee "$tf_tmr" >/dev/null || return 1
     as_root systemctl daemon-reload || return 1
-    as_root systemctl enable --now hopper-replica-textfile.timer || return 1
+    as_root systemctl enable hopper-replica-textfile.timer || return 1
+    # restart, not `enable --now`: --now does nothing to a timer that is
+    # already active, so an active-but-dead timer (or one still carrying the
+    # previous schedule) would survive a re-install untouched.
+    as_root systemctl restart hopper-replica-textfile.timer || return 1
     log "installed metrics timer (every ${TEXTFILE_INTERVAL_MIN}min) -> $TEXTFILE_DIR/hopper-replica.prom"
     log "  NOTE: Alloy must have the textfile collector enabled for this directory."
     log "        host-mon/alloy/linux.alloy needs \"textfile\" in set_collectors + a textfile block."
