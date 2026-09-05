@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"math"
@@ -39,6 +40,7 @@ type instruments struct {
 	wActive, wSlots, wQueue, wRSS                 metric.Int64Observable
 	wAnalyzed, wErrors, wErrorsRecent             metric.Int64Observable
 	wClaimed, wReleased                           metric.Int64Observable
+	wInfo                                         metric.Int64Observable
 	localUp, localRestarts                        metric.Int64Observable
 	localMem, localMemBudget                      metric.Int64Observable
 	extractInUse, extractMax                      metric.Int64Observable
@@ -338,6 +340,13 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 		wReleased:     counter("hopper.worker.released", "Cumulative claims the worker handed back without a result.", "{sample}"),
 		wErrors:       counter("hopper.worker.errors", "Cumulative errors reported by the worker.", "{error}"),
 		wErrorsRecent: gauge("hopper.worker.errors_recent", "Errors the worker reported in the trailing 15 minutes.", "{error}"),
+		// Always 1. The value is the label: the scan version the worker
+		// reports on every heartbeat, so a deploy is a visible edge on a
+		// graph and a rule can ask "did latency move within an hour of a
+		// version change on this worker". On 2026-09-04 a release tripled
+		// every worker's slot count and /analyze latency rose thirtyfold; the
+		// only record of when each box picked it up was a systemd journal.
+		wInfo: gauge("hopper.worker.info", "1 for every known worker, carrying the scan version it last reported as a label.", ""),
 
 		// Local scan (litmus) worker liveness. up is the signal for the
 		// "local worker down" alert; restarts trends supervisor churn.
@@ -489,6 +498,9 @@ func (wd *webDashboard) observe(ctx context.Context, observer metric.Observer, i
 			observer.ObserveInt64(in.wReleased, ws.Released, attr)
 			observer.ObserveInt64(in.wErrors, ws.Errors, attr)
 			observer.ObserveInt64(in.wErrorsRecent, int64(ws.ErrorsRecent), attr)
+			observer.ObserveInt64(in.wInfo, 1, metric.WithAttributes(
+				attribute.String("worker", ws.Name),
+				attribute.String("version", cmp.Or(ws.Version, "unknown"))))
 		}
 	}
 

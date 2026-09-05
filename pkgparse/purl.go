@@ -622,9 +622,18 @@ const (
 
 // purlNamespaceRequirement is the purl-spec type definitions' namespace rule.
 // Kept as one table so it can be diffed against fletch's twin by eye.
+//
+// One deliberate departure, shared with fletch: the spec marks golang's
+// namespace required, which leaves no spelling for a module whose path is a
+// single segment — tailscale.com, gioui.org, goji.io, collectd.org, go.m3o.com
+// are all real and all fetch from the proxy. The generator above already
+// emits them with an empty namespace; refusing them here (2026-09-05, twenty
+// times a day from the precache) meant a coordinate this package produced was
+// one fletch would not look up. So golang is optional: absent, the name is
+// the whole module path.
 func purlNamespaceRequirement(typ string) int {
 	switch typ {
-	case "alpm", "apk", "bitbucket", "composer", "deb", "git", "github", "golang",
+	case "alpm", "apk", "bitbucket", "composer", "deb", "git", "github",
 		"huggingface", "maven", "qpkg", "rpm", "swift", "vscode-extension":
 		return purlNamespaceRequired
 	case "bazel", "bitnami", "cargo", "chrome-extension", "cocoapods", "conda", "cran",

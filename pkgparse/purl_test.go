@@ -192,6 +192,12 @@ func TestCanonicalizePURL(t *testing.T) {
 		{"pkg:deb/curl@7.50.3-1?arch=amd64&distro=ubuntu-22.04", "pkg:deb/ubuntu/curl@7.50.3-1?arch=amd64&distro=ubuntu-22.04"},
 		{"pkg:alpine/musl", "pkg:apk/alpine/musl"},
 
+		// A Go module whose path is a single segment has no namespace to give.
+		// The spec calls golang's namespace required; purlNamespaceRequirement
+		// says why this project does not, and fletch agrees.
+		{"pkg:golang/tailscale.com@v1.102.3", "pkg:golang/tailscale.com@v1.102.3"},
+		{"pkg:golang/goji.io@v2.0.0%2Bincompatible", "pkg:golang/goji.io@v2.0.0%2Bincompatible"},
+
 		// All AUR spellings fold onto the aur-namespace form: the bare legacy
 		// type, and the vendor-plus-qualifier form we generated before (its
 		// repository_url qualifier is dropped; others are kept).
