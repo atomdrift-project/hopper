@@ -1122,11 +1122,16 @@ var sampleConflictUpdateSQLite = `ON CONFLICT (sha256) DO UPDATE SET
 	mtime = CASE WHEN excluded.mtime IS NOT NULL THEN excluded.mtime ELSE samples.mtime END,
 	url     = CASE WHEN samples.url     = '' THEN excluded.url     ELSE samples.url     END,
 	domain  = CASE WHEN samples.domain  = '' THEN excluded.domain  ELSE samples.domain  END,
-	package    = CASE WHEN samples.package    = '' THEN excluded.package    ELSE samples.package    END,
-	version = CASE WHEN samples.version = '' THEN excluded.version ELSE samples.version END,
-	purl_base = CASE WHEN samples.purl_base = '' THEN excluded.purl_base ELSE samples.purl_base END,
-	-- Capture-time provenance is written once by the collector's direct-insert;
-	-- a later walk carries none, so keep whatever is already there.
+	-- Package identity: a blank fills, and the first sidecar to arrive wins over
+	-- a filename guess (see sampleConflictUpdatePG).
+	package    = CASE WHEN excluded.package != '' AND (samples.package = '' OR (samples.provenance IS NULL AND excluded.provenance IS NOT NULL))
+	             THEN excluded.package ELSE samples.package END,
+	version = CASE WHEN excluded.version != '' AND (samples.version = '' OR (samples.provenance IS NULL AND excluded.provenance IS NOT NULL))
+	          THEN excluded.version ELSE samples.version END,
+	purl_base = CASE WHEN excluded.purl_base != '' AND (samples.purl_base = '' OR (samples.provenance IS NULL AND excluded.provenance IS NOT NULL))
+	            THEN excluded.purl_base ELSE samples.purl_base END,
+	-- Capture-time provenance is written once (direct-insert, or a walk that
+	-- found a sidecar beside the file), so keep whatever is already there.
 	provenance = CASE WHEN samples.provenance IS NOT NULL THEN samples.provenance ELSE excluded.provenance END,
 	fetched_at = CASE WHEN samples.fetched_at IS NOT NULL THEN samples.fetched_at ELSE excluded.fetched_at END,
 	-- Label-related skips ('misclassified'/'conflict') track the resolution;
@@ -1151,6 +1156,7 @@ WHERE excluded.parent = ''
     OR (samples.url = '' AND excluded.url != '')
     OR (samples.package = '' AND excluded.package != '')
     OR (samples.purl_base = '' AND excluded.purl_base != '')
+    OR (samples.provenance IS NULL AND excluded.provenance IS NOT NULL)
     OR samples.skip IN ('missing','unsupported')
     -- Pool-precedence transitions must fire even when path/mtime are unchanged.
     OR (` + labelRankSQL("excluded.label") + `
@@ -4651,6 +4657,47 @@ func (db *DB) setProvenanceSQLite(ctx context.Context, s *Sample) (bool, error) 
 	n, err := res.RowsAffected()
 	if err != nil {
 		return false, fmt.Errorf("hopper: set provenance rows %s: %w", s.SHA256, err)
+	}
+	return n > 0, nil
+}
+
+func (db *DB) datasetArtifactsWithoutProvenanceSQLite(ctx context.Context, pathPrefix string, afterID int64, limit int) ([]*Sample, error) {
+	rows, err := db.lite.QueryContext(ctx,
+		//nolint:gosec // the interpolated fragments are package constants, not caller input
+		`SELECT `+liteSampleColsLight+` FROM samples
+		 WHERE parent = '' AND provenance IS NULL
+		   AND substr(path, 1, length(?1)) = ?1 AND `+datasetTreeLike+`
+		   AND filename NOT IN (`+datasetMetadataNameList()+`)
+		   AND id > ?2
+		 ORDER BY id LIMIT ?3`,
+		pathPrefix, afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: dataset artifacts without provenance: %w", err)
+	}
+	return scanLiteSamplesLight(rows)
+}
+
+func (db *DB) adoptProvenanceSQLite(ctx context.Context, s *Sample) (bool, error) {
+	res, err := db.lite.ExecContext(ctx, `
+		UPDATE samples SET
+			provenance = ?,
+			ecosystem  = COALESCE(NULLIF(?, ''), ecosystem),
+			package    = COALESCE(NULLIF(?, ''), package),
+			version    = COALESCE(NULLIF(?, ''), version),
+			purl_base  = COALESCE(NULLIF(?, ''), purl_base),
+			url        = COALESCE(NULLIF(?, ''), url),
+			domain     = COALESCE(NULLIF(?, ''), domain),
+			feed       = COALESCE(NULLIF(?, ''), feed),
+			fetched_at = COALESCE(?, fetched_at)
+		WHERE sha256 = ?`,
+		jsonTextOrNil(s.Provenance), s.Ecosystem, s.Package, s.Version, s.PURLBase, s.URL, s.Domain, s.Feed,
+		s.FetchedAt, s.SHA256)
+	if err != nil {
+		return false, fmt.Errorf("hopper: adopt provenance %s: %w", s.SHA256, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("hopper: adopt provenance rows %s: %w", s.SHA256, err)
 	}
 	return n > 0, nil
 }

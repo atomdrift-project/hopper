@@ -2899,11 +2899,19 @@ var sampleConflictUpdatePG = `ON CONFLICT (sha256) DO UPDATE SET
 	mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END,
 	url     = CASE WHEN samples.url     = '' THEN EXCLUDED.url     ELSE samples.url     END,
 	domain  = CASE WHEN samples.domain  = '' THEN EXCLUDED.domain  ELSE samples.domain  END,
-	package    = CASE WHEN samples.package    = '' THEN EXCLUDED.package    ELSE samples.package    END,
-	version = CASE WHEN samples.version = '' THEN EXCLUDED.version ELSE samples.version END,
-	purl_base = CASE WHEN samples.purl_base = '' THEN EXCLUDED.purl_base ELSE samples.purl_base END,
-	-- Capture-time provenance is written once by the collector's direct-insert;
-	-- a later walk carries none, so keep whatever is already there.
+	-- Package identity: a blank fills, and the first sidecar to arrive wins over
+	-- a filename guess (the walk parses "forge-0.5.6.tgz" as "forge"; the
+	-- sidecar knows it is "@servicetitan/forge"). Once a row carries provenance
+	-- its identity is settled and a later observation only fills blanks.
+	package    = CASE WHEN EXCLUDED.package <> '' AND (samples.package = '' OR (samples.provenance IS NULL AND EXCLUDED.provenance IS NOT NULL))
+	             THEN EXCLUDED.package ELSE samples.package END,
+	version = CASE WHEN EXCLUDED.version <> '' AND (samples.version = '' OR (samples.provenance IS NULL AND EXCLUDED.provenance IS NOT NULL))
+	          THEN EXCLUDED.version ELSE samples.version END,
+	purl_base = CASE WHEN EXCLUDED.purl_base <> '' AND (samples.purl_base = '' OR (samples.provenance IS NULL AND EXCLUDED.provenance IS NOT NULL))
+	            THEN EXCLUDED.purl_base ELSE samples.purl_base END,
+	-- Capture-time provenance is written once — by the collector's direct-insert,
+	-- or by a walk that found a sidecar or dataset registry document beside the
+	-- file — so keep whatever is already there.
 	provenance = CASE WHEN samples.provenance IS NOT NULL THEN samples.provenance ELSE EXCLUDED.provenance END,
 	fetched_at = CASE WHEN samples.fetched_at IS NOT NULL THEN samples.fetched_at ELSE EXCLUDED.fetched_at END,
 	-- Label-related skips ('misclassified'/'conflict') track the resolution;
@@ -2930,6 +2938,7 @@ WHERE EXCLUDED.parent = ''
     OR (samples.url = '' AND EXCLUDED.url <> '')
     OR (samples.package = '' AND EXCLUDED.package <> '')
     OR (samples.purl_base = '' AND EXCLUDED.purl_base <> '')
+    OR (samples.provenance IS NULL AND EXCLUDED.provenance IS NOT NULL)
     OR samples.skip IN ('missing','unsupported')
     -- Pool-precedence transitions must fire even when path/mtime are unchanged.
     OR (` + labelRankSQL("EXCLUDED.label") + `
@@ -7753,6 +7762,42 @@ func (db *DB) setProvenancePG(ctx context.Context, s *Sample) (bool, error) {
 		s.Ecosystem, s.Package, s.Version, s.PURLBase, s.URL, s.FetchedAt)
 	if err != nil {
 		return false, fmt.Errorf("hopper: set provenance %s: %w", s.SHA256, err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+func (db *DB) datasetArtifactsWithoutProvenancePG(ctx context.Context, pathPrefix string, afterID int64, limit int) ([]*Sample, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+pgSampleColsLight+` FROM samples
+		 WHERE parent = '' AND provenance IS NULL
+		   AND starts_with(path, $1) AND `+datasetTreeLike+`
+		   AND filename NOT IN (`+datasetMetadataNameList()+`)
+		   AND id > $2
+		 ORDER BY id LIMIT $3`,
+		pathPrefix, afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: dataset artifacts without provenance: %w", err)
+	}
+	return scanPGSamplesLight(rows)
+}
+
+func (db *DB) adoptProvenancePG(ctx context.Context, s *Sample) (bool, error) {
+	tag, err := db.pool.Exec(ctx, `
+		UPDATE samples SET
+			provenance = $2,
+			ecosystem  = COALESCE(NULLIF($3::text, ''), ecosystem),
+			package    = COALESCE(NULLIF($4::text, ''), package),
+			version    = COALESCE(NULLIF($5::text, ''), version),
+			purl_base  = COALESCE(NULLIF($6::text, ''), purl_base),
+			url        = COALESCE(NULLIF($7::text, ''), url),
+			domain     = COALESCE(NULLIF($8::text, ''), domain),
+			feed       = COALESCE(NULLIF($9::text, ''), feed),
+			fetched_at = COALESCE($10, fetched_at)
+		WHERE sha256 = $1`,
+		s.SHA256, sanitizeJSONB(s.Provenance),
+		s.Ecosystem, s.Package, s.Version, s.PURLBase, s.URL, s.Domain, s.Feed, s.FetchedAt)
+	if err != nil {
+		return false, fmt.Errorf("hopper: adopt provenance %s: %w", s.SHA256, err)
 	}
 	return tag.RowsAffected() > 0, nil
 }

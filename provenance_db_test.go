@@ -2,9 +2,11 @@ package hopper
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestSetProvenance covers the provenance-only upload path: a sample with bytes
@@ -163,5 +165,75 @@ func TestShasWithProvenance(t *testing.T) {
 	// An empty input is a no-op, not a query.
 	if set, err := db.ShasWithProvenance(ctx, nil); err != nil || len(set) != 0 {
 		t.Fatalf("ShasWithProvenance(nil) = (%v, %v), want (empty, nil)", set, err)
+	}
+}
+
+func TestAdoptProvenance(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	sha := strings.Repeat("a", 64)
+	mustInsert(t, ctx, db, &Sample{SHA256: sha, Package: "forge", Version: "0.5.6", Ecosystem: "javascript", URL: "http://old"})
+
+	at := time.Date(2026, 8, 12, 10, 7, 15, 0, time.UTC)
+	claimed := &Sample{
+		SHA256: sha, Provenance: []byte(`{"schema_version":"1.0","feed":{"source_id":"bkc"}}`),
+		Package: "@servicetitan/forge", PURLBase: "pkg:npm/%40servicetitan/forge", Feed: "bkc", FetchedAt: &at,
+	}
+	applied, err := db.AdoptProvenance(ctx, claimed)
+	if err != nil || !applied {
+		t.Fatalf("AdoptProvenance = (%v, %v), want (true, nil)", applied, err)
+	}
+	got, err := db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Non-empty claims replace the guesses; empty ones leave the row alone.
+	if got.Package != "@servicetitan/forge" || got.PURLBase != "pkg:npm/%40servicetitan/forge" || got.Feed != "bkc" {
+		t.Errorf("claims not adopted: %+v", got)
+	}
+	if got.Version != "0.5.6" || got.Ecosystem != "javascript" || got.URL != "http://old" {
+		t.Errorf("empty claims must not blank columns: %+v", got)
+	}
+	if prov, err := db.ProvenanceBySHA256(ctx, sha); err != nil || !strings.Contains(string(prov), "bkc") {
+		t.Errorf("provenance = %q, %v", prov, err)
+	}
+	var fetched sql.NullString
+	if err := db.lite.QueryRowContext(ctx, `SELECT fetched_at FROM samples WHERE sha256 = ?`, sha).Scan(&fetched); err != nil {
+		t.Fatal(err)
+	}
+	if !fetched.Valid || !strings.Contains(fetched.String, "2026-08-12") {
+		t.Errorf("fetched_at = %q, want 2026-08-12", fetched.String)
+	}
+
+	if applied, err := db.AdoptProvenance(ctx, &Sample{SHA256: strings.Repeat("f", 64), Provenance: []byte(`{}`)}); err != nil || applied {
+		t.Errorf("absent sample: (%v, %v), want (false, nil)", applied, err)
+	}
+}
+
+func TestDatasetMetadataCleanupStage(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	tree := "bad/datasets/various/BKC/samples/npm/forge/0.5.6/"
+	doc, member := strings.Repeat("1", 64), strings.Repeat("2", 64)
+	mustInsert(t, ctx, db, &Sample{SHA256: strings.Repeat("0", 64), Path: tree + "forge-0.5.6.tgz", Filename: "forge-0.5.6.tgz"})
+	mustInsert(t, ctx, db, &Sample{SHA256: doc, Path: tree + "meta.json.zst", Filename: "meta.json.zst"})
+	mustInsert(t, ctx, db, &Sample{SHA256: member, Path: tree + "meta.json.zst!!meta.json", Filename: "meta.json", Parent: doc})
+	mustInsert(t, ctx, db, &Sample{SHA256: strings.Repeat("3", 64), Path: "good/x/metadata.json", Filename: "metadata.json"})
+
+	stage, ok := CleanupStageByName("dataset_metadata")
+	if !ok {
+		t.Fatal("stage missing")
+	}
+	if n, err := db.CountCleanup(ctx, stage); err != nil || n != 2 {
+		t.Fatalf("count = %d, %v; want 2", n, err)
+	}
+	if n, err := db.ApplyCleanup(ctx, stage); err != nil || n != 2 {
+		t.Fatalf("apply = %d, %v; want 2", n, err)
+	}
+	for _, sha := range []string{strings.Repeat("0", 64), strings.Repeat("3", 64)} {
+		if _, err := db.SampleBySHA256(ctx, sha); err != nil {
+			t.Errorf("%s should survive: %v", sha[:4], err)
+		}
 	}
 }

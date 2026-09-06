@@ -2080,6 +2080,12 @@ var CleanupStages = []CleanupStage{
 	{Name: "corrupt", Description: "files too damaged to analyze", predicate: "skip = 'corrupt'"},
 	{Name: "encrypted", Description: "encrypted files that will never be analyzable", predicate: "skip = 'encrypted'"},
 	{Name: "replaced", Description: "samples superseded by a newer version", predicate: "skip = 'replaced'"},
+	{
+		Name: "dataset_metadata",
+		Description: "registry documents (meta.json.zst, metadata.json, maintainers.json) a walk ingested " +
+			"as samples from a dataset tree before it learned they are provenance, plus their members",
+		predicate: datasetMetadataStagePredicate(),
+	},
 }
 
 // CleanupStageByName returns the stage with the given short name.

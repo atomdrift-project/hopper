@@ -7507,3 +7507,53 @@ func TestMemberSamplesFromEnvelopeSkipsTrivialMembers(t *testing.T) {
 		t.Errorf("kept member = %s, want %s", members[0].SHA256, keep)
 	}
 }
+
+// A walk re-observing a row that was inserted without provenance (its package
+// guessed from the filename) and now carrying a sidecar adopts the sidecar's
+// identity; once a row has provenance, a later observation only fills blanks.
+func TestInsertSampleFirstSidecarClaimsWin(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	mtime := time.Date(2026, 9, 4, 22, 30, 0, 0, time.UTC)
+	guess := &Sample{
+		SHA256: "fs1", Source: "harvest", Label: "bad", LabelSource: "harvest",
+		Path: "bad/datasets/x/samples/npm/@scope/forge/0.5.6/forge-0.5.6.tgz", SizeBytes: 10,
+		Package: "forge", Version: "0.5.6", Mtime: &mtime,
+	}
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{guess}); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed := *guess
+	claimed.Package = "@scope/forge"
+	claimed.PURLBase = "pkg:npm/%40scope/forge"
+	claimed.Provenance = []byte(`{"schema_version":"1.0","feed":{"source_id":"x"}}`)
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{&claimed}); err != nil {
+		t.Fatal(err)
+	}
+	var pkg, purl string
+	var prov []byte
+	if err := db.lite.QueryRowContext(ctx, `SELECT package, purl_base, provenance FROM samples WHERE sha256 = ?`, "fs1").
+		Scan(&pkg, &purl, &prov); err != nil {
+		t.Fatal(err)
+	}
+	if pkg != "@scope/forge" || purl != "pkg:npm/%40scope/forge" || len(prov) == 0 {
+		t.Fatalf("after sidecar: package=%q purl_base=%q provenance=%q", pkg, purl, prov)
+	}
+
+	// A second sidecar-bearing observation does not rewrite settled identity.
+	later := claimed
+	later.Package = "renamed"
+	later.Provenance = []byte(`{"schema_version":"1.0","feed":{"source_id":"y"}}`)
+	if _, _, err := db.InsertSampleBatch(ctx, []*Sample{&later}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.lite.QueryRowContext(ctx, `SELECT package, provenance FROM samples WHERE sha256 = ?`, "fs1").
+		Scan(&pkg, &prov); err != nil {
+		t.Fatal(err)
+	}
+	if pkg != "@scope/forge" || !strings.Contains(string(prov), `"x"`) {
+		t.Errorf("settled identity rewritten: package=%q provenance=%s", pkg, prov)
+	}
+}

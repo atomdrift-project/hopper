@@ -3690,6 +3690,37 @@ func syncUploadDir(name string) error {
 	return dir.Sync()
 }
 
+// applySidecarClaims projects a sidecar's scalar claims into the sample's
+// descriptive columns: fetch time, the URL the bytes came from and its domain,
+// and the package reference. Shared by the upload handler and the walk's
+// dataset-metadata fallback so a sidecar lands in the columns the same way no
+// matter which door it came through. Producer claims win over whatever the
+// caller derived from the path or filename.
+func applySidecarClaims(sample *hopper.Sample, prov *hopper.Sidecar) {
+	if !prov.Fetch.At.IsZero() {
+		at := prov.Fetch.At
+		sample.FetchedAt = &at
+	}
+	sample.URL = prov.Fetch.URL
+	// Where the bytes were served from. Derived rather than claimed — the
+	// sidecar has no domain field — and the same eTLD+1 forager records, so
+	// uploads group alongside foraged samples in the domain column. An unknown
+	// origin leaves the column empty; only the path uses a placeholder.
+	if domain := uploadDomain(prov.Fetch.URL); domain != unknownDomain {
+		sample.Domain = domain
+	}
+	sample.Ecosystem = prov.Package.Ecosystem
+	sample.Package = prov.Package.Name
+	sample.Version = prov.Package.Version
+	sample.Feed = prov.Package.Feed
+	// Project the version-less PURL into the queryable column, mirroring
+	// forager's direct-insert path — so an uploaded dependency is findable by
+	// purl_base, not just by the PURL buried in the provenance JSONB.
+	// Canonicalized first, so a purl_base is written in one spelling no matter
+	// which form the (possibly older) uploading client used.
+	sample.PURLBase = pkgparse.VersionlessPURL(pkgparse.CanonicalizePURL(prov.Package.PURL))
+}
+
 // uploadSample builds the row for a stored upload. Source is always "upload"
 // (the trust-boundary marker, distinct from a co-located forager's trusted
 // "forager" direct-insert) and Label is always "unknown" — neither is taken
@@ -3724,28 +3755,7 @@ func uploadSample(sha, filename, relPath string, size int64, prov *hopper.Sideca
 		if provJSON, err := json.Marshal(prov); err == nil {
 			sample.Provenance = provJSON
 		}
-		if !prov.Fetch.At.IsZero() {
-			at := prov.Fetch.At
-			sample.FetchedAt = &at
-		}
-		sample.URL = prov.Fetch.URL
-		// Where the bytes were served from. Derived rather than claimed — the
-		// sidecar has no domain field — and the same eTLD+1 forager records, so
-		// uploads group alongside foraged samples in the domain column. An unknown
-		// origin leaves the column empty; only the path uses a placeholder.
-		if domain := uploadDomain(prov.Fetch.URL); domain != unknownDomain {
-			sample.Domain = domain
-		}
-		sample.Ecosystem = prov.Package.Ecosystem
-		sample.Package = prov.Package.Name
-		sample.Version = prov.Package.Version
-		sample.Feed = prov.Package.Feed
-		// Project the version-less PURL into the queryable column, mirroring
-		// forager's direct-insert path — so an uploaded dependency is findable by
-		// purl_base, not just by the PURL buried in the provenance JSONB.
-		// Canonicalized first, so a purl_base is written in one spelling no matter
-		// which form the (possibly older) uploading client used.
-		sample.PURLBase = pkgparse.VersionlessPURL(pkgparse.CanonicalizePURL(prov.Package.PURL))
+		applySidecarClaims(sample, prov)
 	}
 	// Fill name/version gaps from the filename, mirroring the walker's
 	// fillSampleProvenance: producer claims win, the parse only fills blanks.

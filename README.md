@@ -173,6 +173,26 @@ network, and scope the tunnel's ingress to the routes you mean to publish.
 Alert rules live in `scripts/prometheus-hopper-alerts.yml` and a Grafana
 dashboard in `scripts/grafana-hopper-dashboard.json`.
 
+### Dataset registry metadata
+
+Curated corpora that do not pass through forager can still carry registry
+provenance. When a tree under a `datasets/` directory is laid out as
+`samples/<registry>/<name>/<version>/`, the walk treats `meta.json.zst`,
+`metadata.json` (an npm packument or a single-version manifest) and
+`maintainers.json` in that directory as provenance for the artifact beside
+them, not as samples: enumeration skips them, and the artifact's row gets a
+synthesized sidecar whose registry record holds the document (a packument is
+trimmed to the one release) and whose feed record names the dataset. The
+document's package name, version, PURL and tarball URL replace the walk's
+filename guesses. Only npm documents are understood today.
+
+Rows a walk wrote before this existed are repaired with
+`hopper backfill-dataset-metadata --data <root> [--path-prefix bad/datasets/]`:
+it pairs each provenance-less artifact with the document beside it and, with
+`--apply`, stores the sidecar and adopts its identity. `--purge` also runs the
+`dataset_metadata` cleanup stage, deleting the documents (and their exploded
+members) that were ingested as samples. Dry-run by default.
+
 ## Useful commands
 
 ```bash

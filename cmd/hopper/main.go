@@ -55,6 +55,8 @@ commands:
   backfill-lvl       materialize litmus model levels in small resumable batches (postgres)
   reheal-crit        repair max_crit/suspicious_count zeroed by the pre-v8 cleave trigger (postgres)
   backfill-purl      derive missing samples.purl_base from ecosystem+package (never overwrites; postgres)
+  backfill-dataset-metadata  attach registry documents beside dataset artifacts as provenance and adopt
+                     their package identity; --purge drops the documents ingested as samples (dry-run; --apply)
   repair-parents     clear samples.parent where the bytes are on disk standalone (--dry-run; postgres)
   drop-sightings     delete the named sources' claims so a re-walk can rebuild them with versions
   reconcile-corroborated  re-derive samples.corroborated from the sightings ledger in both
@@ -421,6 +423,8 @@ func run(ctx context.Context) error {
 		return cmdRehealCrit(ctx)
 	case "repair-parents":
 		return cmdRepairParents(ctx)
+	case "backfill-dataset-metadata":
+		return cmdBackfillDatasetMetadata(ctx)
 	case "backfill-purl":
 		return cmdBackfillPURL(ctx)
 	case "backfill-claims":
@@ -3232,6 +3236,9 @@ func startEnumeration(ctx context.Context, dir string, newerThan time.Time) enum
 			if isSidecarPath(lp.path) {
 				return true // provenance sidecar, not a sample; keep enumerating
 			}
+			if isDatasetMetadataPath(lp.path) {
+				return true // a dataset's registry document: provenance, not a sample
+			}
 			if isStagingPath(lp.path) {
 				return true // transient staging artifact; not a sample
 			}
@@ -3411,6 +3418,7 @@ func hashFile(ctx context.Context, path, label, fileType, source string, cache *
 			prov := extractPathProvenance(path, label)
 			fillSampleProvenance(s, prov, filepath.Base(path))
 			attachSidecarProvenance(s, path)
+			attachDatasetMetadata(s, path)
 			return hashResult{
 				cacheKey: ck,
 				sample:   s,
@@ -3452,6 +3460,7 @@ func hashFile(ctx context.Context, path, label, fileType, source string, cache *
 	prov := extractPathProvenance(path, label)
 	fillSampleProvenance(s, prov, filepath.Base(path))
 	attachSidecarProvenance(s, path)
+	attachDatasetMetadata(s, path)
 	return hashResult{cacheKey: ck, sample: s}, nil
 }
 
