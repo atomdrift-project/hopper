@@ -7781,6 +7781,28 @@ func (db *DB) datasetArtifactsWithoutProvenancePG(ctx context.Context, pathPrefi
 	return scanPGSamplesLight(rows)
 }
 
+func (db *DB) cleanupRowsPG(ctx context.Context, stage CleanupStage, afterID int64, limit int) ([]CleanupRow, error) {
+	rows, err := db.pool.Query(ctx,
+		"SELECT id, sha256, path FROM samples WHERE "+stage.predicate+" AND id > $1 ORDER BY id LIMIT $2",
+		afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: cleanup %s rows: %w", stage.Name, err)
+	}
+	defer rows.Close()
+	var out []CleanupRow
+	for rows.Next() {
+		var r CleanupRow
+		if err := rows.Scan(&r.ID, &r.SHA256, &r.Path); err != nil {
+			return nil, fmt.Errorf("hopper: cleanup %s rows scan: %w", stage.Name, err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("hopper: cleanup %s rows: %w", stage.Name, err)
+	}
+	return out, nil
+}
+
 func (db *DB) adoptProvenancePG(ctx context.Context, s *Sample) (bool, error) {
 	tag, err := db.pool.Exec(ctx, `
 		UPDATE samples SET

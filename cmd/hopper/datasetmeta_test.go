@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -160,17 +161,55 @@ func TestParseNPMRegistryDocumentPackument(t *testing.T) {
 
 func TestParseNPMRegistryDocumentRejectsMismatch(t *testing.T) {
 	layout := forgeLayout()
-	cases := map[string]string{
-		"other version":      strings.Replace(forgeManifest, `"version":"0.5.6"`, `"version":"0.5.7"`, 1),
-		"other package":      strings.Replace(forgeManifest, `"name":"@servicetitan/forge"`, `"name":"forge"`, 1),
-		"not a document":     `[1,2,3]`,
-		"missing version":    `{"name":"@servicetitan/forge"}`,
-		"packument w/o vers": `{"name":"@servicetitan/forge","versions":{"0.5.5":{"name":"@servicetitan/forge","version":"0.5.5"}}}`,
+	cases := map[string]struct {
+		raw  string
+		want error
+	}{
+		"other version":      {strings.Replace(forgeManifest, `"version":"0.5.6"`, `"version":"0.5.7"`, 1), errDocumentVersion},
+		"other package":      {strings.Replace(forgeManifest, `"name":"@servicetitan/forge"`, `"name":"forge"`, 1), errDocumentPackage},
+		"not a document":     {`[1,2,3]`, errNotRegistryDocument},
+		"missing version":    {`{"name":"@servicetitan/forge"}`, errNotRegistryDocument},
+		"packument w/o vers": {`{"name":"@servicetitan/forge","versions":{"0.5.5":{"name":"@servicetitan/forge","version":"0.5.5"}}}`, errPackumentNoVersion},
 	}
-	for name, raw := range cases {
-		if _, err := parseNPMRegistryDocument([]byte(raw), layout); err == nil {
-			t.Errorf("%s: want error", name)
+	for name, tc := range cases {
+		_, err := parseNPMRegistryDocument([]byte(tc.raw), layout)
+		if !errors.Is(err, tc.want) {
+			t.Errorf("%s: err = %v, want %v", name, err, tc.want)
 		}
+		if err != nil && skipReason(err) != tc.want.Error() {
+			t.Errorf("%s: skipReason = %q", name, skipReason(err))
+		}
+	}
+}
+
+func TestDatasetProvenanceReasons(t *testing.T) {
+	// No document beside the artifact.
+	artifact := datasetFixture(t, "meta.json.zst", []byte(forgeManifest), "")
+	if err := os.Remove(filepath.Join(filepath.Dir(artifact), "meta.json.zst")); err != nil {
+		t.Fatal(err)
+	}
+	s := &hopper.Sample{SHA256: strings.Repeat("ab", 32), Label: "bad", Path: artifact}
+	if err := datasetProvenance(s, artifact); !errors.Is(err, errNoDatasetDocument) {
+		t.Errorf("no document: %v", err)
+	}
+	// Unreadable document is reported, not treated as absent.
+	if err := os.WriteFile(filepath.Join(filepath.Dir(artifact), "meta.json.zst"), []byte("not zstd"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := datasetProvenance(s, artifact); err == nil || errors.Is(err, errNoDatasetDocument) {
+		t.Errorf("corrupt document: %v", err)
+	}
+	// Outside the grammar, and a registry we do not parse.
+	if err := datasetProvenance(s, filepath.Join(t.TempDir(), "x.tgz")); !errors.Is(err, errNotDatasetLayout) {
+		t.Errorf("not a dataset path: %v", err)
+	}
+	gem := filepath.Join(t.TempDir(), "bad", "datasets", "x", "samples", "gem", "rails", "7.0.0", "rails-7.0.0.gem")
+	if err := datasetProvenance(s, gem); err == nil || !strings.Contains(err.Error(), "only npm") {
+		t.Errorf("gem: %v", err)
+	}
+	s.Provenance = []byte(`{}`)
+	if err := datasetProvenance(s, artifact); !errors.Is(err, errProvenanceAlreadySet) {
+		t.Errorf("already set: %v", err)
 	}
 }
 

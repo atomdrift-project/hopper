@@ -54,6 +54,23 @@ func (db *DB) DatasetArtifactsWithoutProvenance(ctx context.Context, pathPrefix 
 	return db.datasetArtifactsWithoutProvenanceSQLite(ctx, pathPrefix, afterID, limit)
 }
 
+// CleanupRow identifies one row a cleanup stage would delete.
+type CleanupRow struct {
+	SHA256 string
+	Path   string
+	ID     int64
+}
+
+// CleanupRows pages, in id order after afterID, the rows stage matches — what
+// [DB.ApplyCleanup] would delete — so an operator can see the list before
+// committing to it, not just the count.
+func (db *DB) CleanupRows(ctx context.Context, stage CleanupStage, afterID int64, limit int) ([]CleanupRow, error) {
+	if db.pool != nil {
+		return db.cleanupRowsPG(ctx, stage, afterID, limit)
+	}
+	return db.cleanupRowsSQLite(ctx, stage, afterID, limit)
+}
+
 // AdoptProvenance writes s.Provenance onto the existing row and adopts every
 // non-empty scalar claim on s (ecosystem, package, version, purl_base, url,
 // domain, feed, fetched_at) over whatever the row holds. It is the repair

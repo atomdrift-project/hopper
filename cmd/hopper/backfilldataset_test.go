@@ -62,8 +62,16 @@ func TestCmdBackfillDatasetMetadata(t *testing.T) {
 			}
 		})
 	})
-	if !strings.Contains(out, "would attach provenance to 1 artifact(s)") || !strings.Contains(out, "would delete 2 row(s)") {
-		t.Fatalf("dry-run output:\n%s", out)
+	dsRoot := "bad/datasets/various/Backstabber's Knife Collection"
+	for _, want := range []string{
+		"would attach provenance to 1 artifact(s)",
+		"would delete 2 row(s)",
+		"1         0            0            " + dsRoot, // per-dataset outcome row
+		"       2  " + dsRoot,                           // per-dataset purge row
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("dry-run output lacks %q:\n%s", want, out)
+		}
 	}
 	if s, err := db.SampleBySHA256(ctx, artifactSHA); err != nil || s.Package != "forge" {
 		t.Fatalf("dry run must not write: %+v %v", s, err)

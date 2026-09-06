@@ -143,6 +143,15 @@ func datasetFeedID(dataset string) string {
 	return strings.TrimSuffix(b.String(), "-")
 }
 
+// Why datasetProvenance did not attach. Each is a distinct operator-facing
+// outcome: the backfill counts and logs them, so the reason a row was passed
+// over is never a silent nothing.
+var (
+	errProvenanceAlreadySet = errors.New("sample already carries provenance")
+	errNotDatasetLayout     = errors.New("path is not <…>/datasets/<…>/samples/<registry>/<name>/<version>/<file>")
+	errNoDatasetDocument    = errors.New("no registry document (meta.json.zst or metadata.json) beside the artifact")
+)
+
 // attachDatasetMetadata is the dataset counterpart of attachSidecarProvenance:
 // when the artifact at path sits in a dataset directory with a registry
 // document, it synthesizes the provenance sidecar onto s and projects the
@@ -153,22 +162,35 @@ func datasetFeedID(dataset string) string {
 // understand is walked exactly as before. Called while s.Path is still the
 // absolute on-disk path.
 func attachDatasetMetadata(s *hopper.Sample, path string) {
+	if err := datasetProvenance(s, path); err != nil && !errors.Is(err, errNotDatasetLayout) && !errors.Is(err, errProvenanceAlreadySet) {
+		slog.Debug("dataset metadata ignored", "path", path, "error", err)
+	}
+}
+
+// datasetProvenance does the work of attachDatasetMetadata and says why when
+// it did not: the returned error names the exact reason (not a dataset path,
+// unsupported registry, no document, document unreadable, document names a
+// different package or release, sidecar invalid). nil means s now carries the
+// synthesized sidecar and its claims.
+func datasetProvenance(s *hopper.Sample, path string) error {
 	if s.Provenance != nil {
-		return
+		return errProvenanceAlreadySet
 	}
 	layout, ok := parseDatasetLayout(path)
-	if !ok || layout.registry != "npm" {
-		return
+	if !ok {
+		return errNotDatasetLayout
+	}
+	if layout.registry != "npm" {
+		return fmt.Errorf("registry %q: only npm documents are understood", layout.registry)
 	}
 	dir := filepath.Dir(path)
-	raw, at, ok := readDatasetDocument(dir)
-	if !ok {
-		return
+	raw, at, err := readDatasetDocument(dir)
+	if err != nil {
+		return err
 	}
 	doc, err := parseNPMRegistryDocument(raw, layout)
 	if err != nil {
-		slog.Debug("dataset metadata ignored", "path", path, "error", err)
-		return
+		return err
 	}
 	maintainers := readMaintainers(dir)
 
@@ -179,12 +201,11 @@ func attachDatasetMetadata(s *hopper.Sample, path string) {
 	}, at, s.Label)
 	sc.Finalize()
 	if err := sc.Validate(); err != nil {
-		slog.Debug("dataset metadata sidecar invalid", "path", path, "error", err)
-		return
+		return fmt.Errorf("sidecar invalid: %w", err)
 	}
 	data, err := json.Marshal(sc)
 	if err != nil {
-		return
+		return fmt.Errorf("sidecar encode: %w", err)
 	}
 	s.Provenance = data
 	applySidecarClaims(s, sc)
@@ -192,26 +213,27 @@ func attachDatasetMetadata(s *hopper.Sample, path string) {
 	if eco := pkgparse.NormalizeEcosystem(sc.Package.Ecosystem); eco != "" {
 		s.Ecosystem = eco
 	}
+	return nil
 }
 
 // readDatasetDocument returns the first registry document found in dir,
 // decompressed, with its mtime — the closest thing the dataset records to the
-// moment the registry was consulted.
-func readDatasetDocument(dir string) (raw []byte, at time.Time, ok bool) {
+// moment the registry was consulted. A document that exists but cannot be read
+// is reported as such rather than falling through to "none".
+func readDatasetDocument(dir string) (raw []byte, at time.Time, err error) {
 	for _, name := range metadataDocumentNames {
 		p := filepath.Join(dir, name)
-		info, err := os.Stat(p)
-		if err != nil || !info.Mode().IsRegular() {
+		info, statErr := os.Stat(p)
+		if statErr != nil || !info.Mode().IsRegular() {
 			continue
 		}
-		data, err := readMaybeZstd(p)
-		if err != nil {
-			slog.Debug("dataset metadata unreadable", "path", p, "error", err)
-			continue
+		data, readErr := readMaybeZstd(p)
+		if readErr != nil {
+			return nil, time.Time{}, fmt.Errorf("%s: %w", name, readErr)
 		}
-		return data, info.ModTime(), true
+		return data, info.ModTime(), nil
 	}
-	return nil, time.Time{}, false
+	return nil, time.Time{}, errNoDatasetDocument
 }
 
 // readMaybeZstd reads a file, transparently decompressing a ".zst" name, with
@@ -284,7 +306,14 @@ type npmManifestFields struct {
 	} `json:"dist"`
 }
 
-var errNotRegistryDocument = errors.New("not an npm registry document")
+// Document rejections. Each wraps a sentinel so a caller can count by kind
+// while the message still names the offending package and release.
+var (
+	errNotRegistryDocument = errors.New("not an npm registry document")
+	errDocumentVersion     = errors.New("document names a different release than the directory")
+	errDocumentPackage     = errors.New("document names a different package than the directory")
+	errPackumentNoVersion  = errors.New("packument lacks the directory's release")
+)
 
 // parseNPMRegistryDocument accepts either document shape and checks it against
 // the directory it was found in: a document naming another package or release
@@ -307,7 +336,7 @@ func parseNPMRegistryDocument(raw []byte, layout datasetLayout) (npmDocument, er
 		}
 		manifest = versions[layout.version]
 		if manifest == nil {
-			return npmDocument{}, fmt.Errorf("packument has no version %q", layout.version)
+			return npmDocument{}, fmt.Errorf("%w: no versions[%q]", errPackumentNoVersion, layout.version)
 		}
 		doc.format = formatNPMPackument
 		doc.raw, doc.trimmed = trimPackument(top, layout.version, manifest, raw)
@@ -325,10 +354,10 @@ func parseNPMRegistryDocument(raw []byte, layout datasetLayout) (npmDocument, er
 		return npmDocument{}, fmt.Errorf("%w: manifest lacks name/version", errNotRegistryDocument)
 	}
 	if m.Version != layout.version {
-		return npmDocument{}, fmt.Errorf("document is %s@%s, directory is %s", m.Name, m.Version, layout.version)
+		return npmDocument{}, fmt.Errorf("%w: document is %s@%s, directory is %s", errDocumentVersion, m.Name, m.Version, layout.version)
 	}
 	if !strings.EqualFold(m.Name, layout.name) {
-		return npmDocument{}, fmt.Errorf("document is %s, directory is %s", m.Name, layout.name)
+		return npmDocument{}, fmt.Errorf("%w: document is %s, directory is %s", errDocumentPackage, m.Name, layout.name)
 	}
 	doc.name = m.Name
 	doc.version = m.Version

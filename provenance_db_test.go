@@ -228,6 +228,13 @@ func TestDatasetMetadataCleanupStage(t *testing.T) {
 	if n, err := db.CountCleanup(ctx, stage); err != nil || n != 2 {
 		t.Fatalf("count = %d, %v; want 2", n, err)
 	}
+	rows, err := db.CleanupRows(ctx, stage, 0, 10)
+	if err != nil || len(rows) != 2 || rows[0].Path != tree+"meta.json.zst" || rows[1].Path != tree+"meta.json.zst!!meta.json" {
+		t.Fatalf("CleanupRows = %+v, %v", rows, err)
+	}
+	if more, err := db.CleanupRows(ctx, stage, rows[1].ID, 10); err != nil || len(more) != 0 {
+		t.Fatalf("CleanupRows after last id = %+v, %v", more, err)
+	}
 	if n, err := db.ApplyCleanup(ctx, stage); err != nil || n != 2 {
 		t.Fatalf("apply = %d, %v; want 2", n, err)
 	}

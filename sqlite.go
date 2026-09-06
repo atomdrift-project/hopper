@@ -4677,6 +4677,29 @@ func (db *DB) datasetArtifactsWithoutProvenanceSQLite(ctx context.Context, pathP
 	return scanLiteSamplesLight(rows)
 }
 
+func (db *DB) cleanupRowsSQLite(ctx context.Context, stage CleanupStage, afterID int64, limit int) ([]CleanupRow, error) {
+	//nolint:gosec // stage.predicate is an internal constant from CleanupStages, not user input.
+	rows, err := db.lite.QueryContext(ctx,
+		"SELECT id, sha256, path FROM samples WHERE "+stage.predicate+" AND id > ? ORDER BY id LIMIT ?",
+		afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: cleanup %s rows: %w", stage.Name, err)
+	}
+	defer rows.Close() //nolint:errcheck // read-only cursor
+	var out []CleanupRow
+	for rows.Next() {
+		var r CleanupRow
+		if err := rows.Scan(&r.ID, &r.SHA256, &r.Path); err != nil {
+			return nil, fmt.Errorf("hopper: cleanup %s rows scan: %w", stage.Name, err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("hopper: cleanup %s rows: %w", stage.Name, err)
+	}
+	return out, nil
+}
+
 func (db *DB) adoptProvenanceSQLite(ctx context.Context, s *Sample) (bool, error) {
 	res, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET
