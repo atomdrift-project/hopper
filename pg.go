@@ -255,6 +255,33 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_sightings_recent ON sightings(first_seen DESC) WHERE claim = 'malicious'`,
 		`CREATE INDEX IF NOT EXISTS idx_sightings_acquisition_recent ` +
 			`ON sightings(first_seen DESC) WHERE claim IN ('malicious', 'suspicious')`,
+		// acquired_at records that a consumer has attempted to obtain the artifact
+		// this claim names. NULL means never attempted -- not "failed", not "due
+		// again": the attempt happens once and the stamp is set whatever the
+		// outcome, because a claim we could not fetch is a fact about the world
+		// rather than work to retry.
+		//
+		// It lives on the sightings row, beside the claim it describes, rather
+		// than being inferred from sighting_acquisitions. That table is keyed by
+		// an opaque target string only the consumer knows how to build, so
+		// "which claims have never been attempted" could only be answered by
+		// reconstructing every target in application code and probing for each
+		// one. That question went unasked for the whole life of the system, and
+		// the 2026-09-07 Shai-Hulud reactivation is what it cost: 500,713
+		// resolvable claims had never been attempted once, and two attempts to
+		// merely COUNT them timed out against the publisher.
+		//
+		// Nullable with no default, so this is a catalog-only rewrite on a table
+		// of any size.
+		`ALTER TABLE sightings ADD COLUMN IF NOT EXISTS acquired_at TIMESTAMPTZ`,
+		// The acquisition queue itself. Partial on the un-attempted rows, which
+		// is the shrinking side, and DESC because newest-first is the whole
+		// point: a claim minutes old names an artifact a registry may still be
+		// serving, while one from last year names bytes that are probably gone.
+		// Ordering oldest-first would put every fresh citation behind the entire
+		// historical backlog -- the same defect that sightedCandidatesSQL had.
+		`CREATE INDEX IF NOT EXISTS idx_sightings_unattempted ` +
+			`ON sightings(first_seen DESC) WHERE acquired_at IS NULL`,
 		// Sighted triage has two ordered walks: digest claims and PURL claims. The
 		// leading expression lets both seek their half of the ledger and then read
 		// first_seen in queue order, stopping as soon as the requested batch fills.
@@ -6268,6 +6295,70 @@ func (db *DB) sightingsForPG(ctx context.Context, subjects []string) (map[string
 	return out, rows.Err()
 }
 
+// scanSightingRows decodes the shared acquisition-sighting projection. The two
+// selectors below differ only in their WHERE and ORDER BY, so the column list
+// and the nullable published_at handling live here once.
+func scanSightingRows(rows pgx.Rows) ([]Sighting, error) {
+	defer rows.Close()
+	var out []Sighting
+	for rows.Next() {
+		var x Sighting
+		var published *time.Time
+		if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen,
+			&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Handle, &x.Basis, &x.Relayer, &published); err != nil {
+			return nil, fmt.Errorf("hopper: scan acquisition sighting: %w", err)
+		}
+		if published != nil {
+			x.PublishedAt = *published
+		}
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+
+// sightingAcquisitionCols is the projection both acquisition selectors read.
+const sightingAcquisitionCols = `source, subject, url, note, first_seen,
+	operator, affected, claim, filename, handle, basis, relayer, published_at`
+
+func (db *DB) unattemptedSightingsPG(ctx context.Context, limit int) ([]Sighting, error) {
+	// acquired_at IS NULL matches idx_sightings_unattempted's predicate and
+	// first_seen DESC is its order, so this is an ordered index walk that stops
+	// as soon as limit rows are read -- it never sorts the backlog.
+	rows, err := db.pool.Query(ctx, `
+		SELECT `+sightingAcquisitionCols+`
+		FROM sightings
+		WHERE acquired_at IS NULL AND claim IN ('malicious', 'suspicious')
+		ORDER BY first_seen DESC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: unattempted sightings: %w", err)
+	}
+	return scanSightingRows(rows)
+}
+
+func (db *DB) markSightingsAttemptedPG(ctx context.Context, sightings []Sighting) error {
+	// One statement over unnested arrays rather than a batch of updates: the
+	// caller stamps a whole pass at once, and a per-row round trip against the
+	// publisher is what the connection budget can least afford.
+	sources := make([]string, len(sightings))
+	subjects := make([]string, len(sightings))
+	affected := make([]string, len(sightings))
+	for i, s := range sightings {
+		sources[i], subjects[i], affected[i] = s.Source, s.Subject, s.Affected
+	}
+	_, err := db.pool.Exec(ctx, `
+		UPDATE sightings SET acquired_at = now()
+		FROM unnest($1::text[], $2::text[], $3::text[]) AS t(source, subject, affected)
+		WHERE sightings.source = t.source
+		  AND sightings.subject = t.subject
+		  AND sightings.affected = t.affected
+		  AND sightings.acquired_at IS NULL`, sources, subjects, affected)
+	if err != nil {
+		return fmt.Errorf("hopper: mark sightings attempted: %w", err)
+	}
+	return nil
+}
+
 func (db *DB) recentAcquisitionSightingsPG(ctx context.Context, since time.Time) ([]Sighting, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT source, subject, url, note, first_seen,
@@ -8824,13 +8915,23 @@ func (db *DB) bigArchiveCandidatesPG(ctx context.Context, minBytes int64, hopper
 //
 // Hoisted into a constant so plan_audit_test.go EXPLAINs the statement that
 // actually runs rather than a paraphrase of it.
+// Newest first, not by id. Oldest-first is the wrong order for a tier whose
+// whole purpose is latency: a sighting names an artifact the registry may pull
+// within hours (Shai-Hulud gave us 4h25m), so the newest citation is the one
+// with something left to lose. Under id order a freshly foraged sample queues
+// behind every older corroborated row, which is survivable at today's depth and
+// fatal the moment a backlog drain enqueues its predecessors.
+//
+// created_at DESC is also what idx_samples_sighted_created is declared on, with
+// this exact partial predicate, so the ordering is an index walk rather than a
+// sort over the whole corroborated population.
 const sightedCandidatesSQL = `
 	SELECT sha256, path, size_bytes, file_type, created_at FROM samples
 	WHERE corroborated
 	  AND cleave_result IS NULL AND skip = '' AND parent = ''
 	  AND (note = '' OR last_error_at IS NULL OR last_error_at < $1)
 	  AND attempts < $2
-	ORDER BY id
+	ORDER BY created_at DESC
 	LIMIT $3`
 
 func (db *DB) sightedCandidatesPG(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {

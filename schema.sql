@@ -192,6 +192,20 @@ CREATE TABLE IF NOT EXISTS sightings (
 	PRIMARY KEY (source, subject, affected)
 );
 
+-- acquired_at records that a consumer has attempted to obtain the artifact this
+-- claim names; NULL means never attempted. Set once, whatever the outcome --
+-- there is no retry schedule, because a claim we could not fetch is a fact
+-- rather than pending work. It lives here, next to the claim, so "which claims
+-- were never attempted" is an indexed predicate instead of a reconstruction of
+-- every opaque sighting_acquisitions target in application code.
+ALTER TABLE sightings ADD COLUMN IF NOT EXISTS acquired_at TIMESTAMPTZ;
+
+-- The acquisition queue: un-attempted claims, newest first. Newest-first is
+-- deliberate -- a claim minutes old names an artifact the registry may still be
+-- serving, one from last year names bytes that are probably gone.
+CREATE INDEX IF NOT EXISTS idx_sightings_unattempted
+	ON sightings(first_seen DESC) WHERE acquired_at IS NULL;
+
 -- Lookup by subject is the read path (SightingsFor): "who cited this sha/purl?".
 CREATE INDEX IF NOT EXISTS idx_sightings_subject ON sightings(subject);
 

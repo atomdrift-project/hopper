@@ -2251,17 +2251,54 @@ type claimTier struct {
 	// interleave spreads size classes across the batch. Only the main backlog
 	// wants it; every other tier has a deliberate ordering to preserve.
 	interleave bool
+	// maxShare caps the fraction of one poll's batch this tier may take, 0
+	// meaning uncapped. Only the sighted tier sets it, and it is a ceiling on
+	// a tier that is also first in the ladder -- the two together are what make
+	// its latency a bound rather than an average. First alone would let a feed
+	// backlog take every slot of every poll and starve ingestion behind it;
+	// a cap alone would leave it queued behind whatever ran first. See
+	// sightedMaxShare.
+	maxShare float64
 }
 
-// claimLadder is the priority order work is offered in: interactive uploads →
-// operator rescans → sighted backlog → big archives → unanalyzed backlog →
-// repair → path-prefix rescans → stale traits. A tier is skipped entirely when
-// it is not applicable to this worker or not configured on this server.
+// sightedMaxShare is the fraction of a poll's batch the sighted tier may take.
+//
+// Half. A sighting is the only work in the ladder with an externally imposed
+// deadline -- the registry can withdraw the artifact, and in the 2026-09-07
+// Shai-Hulud reactivation it did so 4h25m after publication -- so it goes first.
+// But "first" with no ceiling means a large feed backlog occupies every slot of
+// every poll indefinitely, which starves the unanalyzed backlog that everything
+// else depends on. Half guarantees the lane keeps moving under saturation, which
+// is this pool's normal state, while leaving the rest of the pipeline alive.
+const sightedMaxShare = 0.5
+
+// claimLadder is the priority order work is offered in: sighted (capped at half
+// the batch) → interactive uploads → operator rescans → big archives →
+// unanalyzed backlog → repair → path-prefix rescans → stale traits. A tier is
+// skipped entirely when it is not applicable to this worker or not configured on
+// this server.
 func (s *apiServer) claimLadder(slots int) []claimTier {
 	ladder := []claimTier{
+		// Tier S: pending samples an external threat feed has already cited.
+		//
+		// First in the ladder, ahead even of interactive uploads, because it is
+		// the only tier with a deadline set by someone other than us: the
+		// registry can withdraw the artifact, and once it has, the bytes are
+		// gone for good. In the 2026-09-07 Shai-Hulud reactivation that window
+		// was 4h25m from publication to takedown. A person waiting on an upload
+		// page can wait the extra seconds; a withdrawn package cannot be waited
+		// for at all.
+		//
+		// Capped at sightedMaxShare so being first cannot starve everything
+		// below it -- see the maxShare field. Ordered newest-first by the query
+		// itself (sightedCandidatesSQL), so a fresh citation is never queued
+		// behind an older backlog.
+		{name: tierSighted, maxShare: sightedMaxShare, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
+			return s.db.SightedCandidates(ctx, s.hopperStart, n)
+		}},
 		// Tier U: interactive uploads (Source="upload"). Drained ahead of every
-		// other tier so a user staring at the /file/<sha> page gets their result
-		// as fast as a worker can produce it.
+		// other tier but the sighted lane, so a user staring at the /file/<sha>
+		// page gets their result as fast as a worker can produce it.
 		{name: tierUpload, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
 			return s.db.UploadCandidates(ctx, n)
 		}},
@@ -2270,14 +2307,6 @@ func (s *apiServer) claimLadder(slots int) []claimTier {
 		// of waiting for its SHA prefix to come up in the Tier 1 rotation.
 		{name: tierForcedRescan, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
 			return s.db.ForcedRescanCandidates(ctx, s.hopperStart, n)
-		}},
-		// Tier 1s: pending samples an external threat feed has already cited.
-		// Drained before the unanalyzed backlog because Tier 1 hands work out in
-		// random sha256 order: a sighted sample entering a 600k-row backlog waits
-		// for its prefix to come up, which is days, and it is the one sample we
-		// already have outside evidence against.
-		{name: tierSighted, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
-			return s.db.SightedCandidates(ctx, s.hopperStart, n)
 		}},
 		// Tier B: big archives (multi-GB ISOs) for capable workers only. Rare and
 		// large, a big archive seldom falls inside a busy worker's small
@@ -2336,6 +2365,13 @@ func (s *apiServer) claimJobs(
 		want := count - len(out)
 		if want <= 0 {
 			break
+		}
+		// A capped tier takes at most its share of the whole batch, not of what
+		// is left, so the ceiling does not drift with ladder position. Always at
+		// least one: a cap must never round a tier down to nothing, or a small
+		// poll silently loses the lane the cap exists to protect.
+		if tier.maxShare > 0 {
+			want = min(want, max(1, int(float64(count)*tier.maxShare)))
 		}
 		cands, err := tier.candidates(ctx, max(want*candidateOverfetch, minCandidates))
 		if err != nil {

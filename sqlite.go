@@ -394,6 +394,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 			basis        TEXT NOT NULL DEFAULT 'predicted',
 			published_at DATETIME,
 			first_seen   DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+			acquired_at  TIMESTAMP,
 			PRIMARY KEY (source, subject, affected)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_sightings_subject ON sightings(subject)`,
@@ -445,6 +446,16 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 	}
 	if err := db.migrateLiteSightingsKey(ctx); err != nil {
 		return err
+	}
+	// After the key rebuild, which recreates the table from an older shape, so
+	// the column is added to whichever table survives that step. The queue index
+	// is created here too rather than in the DDL list above: it is partial on
+	// acquired_at, so it cannot be built before the column exists.
+	if err := db.migrateLiteSightingsAcquiredAt(ctx); err != nil {
+		return err
+	}
+	if _, err := db.lite.ExecContext(ctx, liteSightingsUnattemptedIndex); err != nil {
+		return fmt.Errorf("hopper: migrate sqlite sightings queue index: %w", err)
 	}
 
 	// Worker heartbeat table for dashboard.
@@ -3882,6 +3893,26 @@ func (db *DB) staleSamplesSQLite(ctx context.Context, prefixes []string, olderTh
 // DDL rather than by a version counter: the table either has the columns or it
 // does not, and asking it is cheaper than remembering.
 
+// migrateLiteSightingsAcquiredAt adds sightings.acquired_at to a database that
+// predates it. SQLite has no ALTER TABLE ... ADD COLUMN IF NOT EXISTS, so the
+// PRAGMA is the guard -- the same idiom the samples column migrations use.
+func (db *DB) migrateLiteSightingsAcquiredAt(ctx context.Context) error {
+	if pragmaHasColumnIn(ctx, db.lite, "sightings", "acquired_at") > 0 {
+		return nil
+	}
+	if _, err := db.lite.ExecContext(ctx,
+			`ALTER TABLE sightings ADD COLUMN acquired_at TIMESTAMP`); err != nil {
+		return fmt.Errorf("hopper: add sightings.acquired_at: %w", err)
+	}
+	return nil
+}
+
+// liteSightingsUnattemptedIndex is the acquisition queue: claims nothing has
+// tried to fetch, newest first. Partial on acquired_at, so it must be built
+// after migrateLiteSightingsAcquiredAt has ensured the column exists.
+const liteSightingsUnattemptedIndex = `CREATE INDEX IF NOT EXISTS idx_sightings_unattempted ` +
+	`ON sightings(first_seen DESC) WHERE acquired_at IS NULL`
+
 func (db *DB) migrateLiteSightingsKey(ctx context.Context) error {
 	var ddl string
 	err := db.lite.QueryRowContext(ctx,
@@ -4123,6 +4154,56 @@ func (db *DB) recentAcquisitionSightingsSQLite(ctx context.Context, since time.T
 		out = append(out, x)
 	}
 	return out, rows.Err()
+}
+
+func (db *DB) unattemptedSightingsSQLite(ctx context.Context, limit int) ([]Sighting, error) {
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT source, subject, url, note, first_seen,
+		       operator, affected, claim, filename, handle, basis, relayer, published_at
+		FROM sightings
+		WHERE acquired_at IS NULL AND claim IN ('malicious', 'suspicious')
+		ORDER BY first_seen DESC
+		LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: unattempted sightings: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // best-effort cleanup
+	var out []Sighting
+	for rows.Next() {
+		var x Sighting
+		var published sql.NullTime
+		if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen,
+			&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Handle, &x.Basis, &x.Relayer, &published); err != nil {
+			return nil, fmt.Errorf("hopper: scan unattempted sighting: %w", err)
+		}
+		x.PublishedAt = published.Time
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) markSightingsAttemptedSQLite(ctx context.Context, sightings []Sighting) error {
+	// SQLite has no array unnest, so this is a statement per row inside one
+	// transaction. The SQLite path serves single-node development, where a pass
+	// is tens of rows rather than thousands.
+	tx, err := db.lite.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("hopper: mark sightings attempted: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op once committed
+	now := time.Now().UTC()
+	for _, x := range sightings {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE sightings SET acquired_at = ?
+			WHERE source = ? AND subject = ? AND affected = ? AND acquired_at IS NULL`,
+			now, x.Source, x.Subject, x.Affected); err != nil {
+			return fmt.Errorf("hopper: mark sighting attempted: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("hopper: mark sightings attempted commit: %w", err)
+	}
+	return nil
 }
 
 func (db *DB) tryClaimSightingAcquisitionSQLite(ctx context.Context, target string, lease time.Duration) (bool, error) {
@@ -5589,7 +5670,7 @@ func (db *DB) bigArchiveCandidatesSQLite(ctx context.Context, minBytes int64, ho
 }
 
 // sightedCandidatesSQLite mirrors sightedCandidatesPG: pending top-level samples
-// an external feed has already cited, oldest first, ahead of the main backlog.
+// an external feed has already cited, newest first, ahead of the main backlog.
 func (db *DB) sightedCandidatesSQLite(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
 	startCutoff := hopperStart.UTC().Format(time.RFC3339Nano)
 	return queryLiteCandidates(ctx, db.lite, `
@@ -5598,7 +5679,7 @@ func (db *DB) sightedCandidatesSQLite(ctx context.Context, hopperStart time.Time
 		  AND cleave_result IS NULL AND skip = '' AND parent = ''
 		  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
 		  AND attempts < ?
-		ORDER BY id
+		ORDER BY created_at DESC
 		LIMIT ?`, startCutoff, maxClaimAttempts, limit)
 }
 

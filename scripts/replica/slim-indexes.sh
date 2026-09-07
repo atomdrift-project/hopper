@@ -177,6 +177,7 @@ idx_samples_good_repair_newest
 idx_samples_unknown_newest
 idx_samples_candidate_keyset
 idx_sightings_acquisition_recent
+idx_sightings_unattempted
 idx_sightings_recent
 idx_popular_rank
 idx_reports_created_at

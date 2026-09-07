@@ -6210,11 +6210,66 @@ type Sighting struct {
 // acquisition. It deliberately returns evidence, not download instructions:
 // Hopper stores the neutral ledger while its caller decides how a subject is
 // resolved and fetched.
+//
+// Deprecated: this is the windowed selector that lost the 2026-09-07 Shai-Hulud
+// reactivation. A caller polling it sees only claims younger than the window it
+// happens to pass, so a claim that lands while no pass is running is never
+// offered again by anything. Use [DB.UnattemptedSightings] and
+// [DB.MarkSightingsAttempted], which ask what has never been tried instead of
+// what is recent. Retained only until forager's acquisition loop is deployed.
 func (db *DB) RecentAcquisitionSightings(ctx context.Context, since time.Time) ([]Sighting, error) {
 	if db.pool != nil {
 		return db.recentAcquisitionSightingsPG(ctx, since)
 	}
 	return db.recentAcquisitionSightingsSQLite(ctx, since)
+}
+
+// UnattemptedSightings returns up to limit claims no consumer has yet tried to
+// acquire, newest first.
+//
+// Newest first is the point. A claim minutes old names an artifact its registry
+// is probably still serving; one from last year names bytes that have most
+// likely been withdrawn. Oldest-first would put every fresh citation behind the
+// whole historical backlog, which is exactly how the sighted claim tier used to
+// behave and is the failure this selector exists to prevent.
+//
+// There is no time window and no notion of "due". A claim is offered until it
+// has been attempted, then never again. That makes a missed poll, a crash or a
+// restart cost latency rather than the claim itself -- the property the windowed
+// selector did not have.
+//
+// Only malicious and suspicious claims are offered: a vulnerability names a
+// defect in working software, and fetching every advised release would fill the
+// corpus with clean packages.
+func (db *DB) UnattemptedSightings(ctx context.Context, limit int) ([]Sighting, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	if db.pool != nil {
+		return db.unattemptedSightingsPG(ctx, limit)
+	}
+	return db.unattemptedSightingsSQLite(ctx, limit)
+}
+
+// MarkSightingsAttempted stamps acquired_at on each claim, so it is never
+// offered again.
+//
+// Called whatever the attempt produced. A claim whose artifact could not be
+// fetched -- withdrawn, never mirrored, a range we cannot resolve -- is a fact
+// about the world, not work to retry, and leaving it un-stamped would make the
+// queue re-offer it forever while newer claims waited behind it. What went wrong
+// belongs in the caller's log; the queue only needs to know it is done.
+//
+// Keyed on the full primary key (source, subject, affected) because one subject
+// can carry several claims from one source and they are attempted separately.
+func (db *DB) MarkSightingsAttempted(ctx context.Context, sightings []Sighting) error {
+	if len(sightings) == 0 {
+		return nil
+	}
+	if db.pool != nil {
+		return db.markSightingsAttemptedPG(ctx, sightings)
+	}
+	return db.markSightingsAttemptedSQLite(ctx, sightings)
 }
 
 // TryClaimSightingAcquisition acquires a durable lease for one caller-defined
