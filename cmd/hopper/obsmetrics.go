@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"log/slog"
 	"math"
 	"sync"
 	"time"
@@ -31,6 +32,7 @@ const metricsCollectTimeout = 8 * time.Second
 // keeps the callback's parameter list to one pointer.
 type instruments struct {
 	pending, rescan, cleavePending, litmusPending metric.Int64Observable
+	unattemptedAge                                metric.Int64Observable
 	analyzed                                      metric.Int64Observable
 	analysisRate, filesRate                       metric.Float64Observable
 	addedAge, analyzedAge, readyLag               metric.Float64Observable
@@ -299,6 +301,12 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 		rescan:        gauge("hopper.queue.rescan", "Samples eligible for re-analysis under the live traits version.", "{sample}"),
 		cleavePending: gauge("hopper.queue.cleave_pending", "Samples awaiting the cleave stage.", "{sample}"),
 		litmusPending: gauge("hopper.queue.litmus_pending", "Samples awaiting the litmus stage.", "{sample}"),
+		// The 2026-09-07 post-mortem's alert. A threat-feed claim nothing has
+		// tried to fetch is the one failure that costs artifacts outright: a
+		// registry can withdraw the bytes while the claim waits, and then no
+		// amount of later effort recovers them.
+		unattemptedAge: gauge("hopper.sightings.unattempted_age",
+			"Age of the longest-waiting threat-feed claim that nothing has tried to acquire.", "s"),
 
 		// Throughput. analyzed is a process-lifetime monotonic total.
 		analyzed:     counter("hopper.analyzed", "Cumulative samples analyzed (database total at startup plus this session).", "{sample}"),
@@ -447,6 +455,24 @@ func (wd *webDashboard) observe(ctx context.Context, observer metric.Observer, i
 		}
 		observer.ObserveInt64(in.pending, wd.pendingCount(cctx))
 		observer.ObserveInt64(in.rescan, wd.rescanPending(cctx))
+
+		// Zero when the queue is empty, which is the healthy reading and the one
+		// an alert threshold treats correctly. Reporting nothing instead would
+		// leave the series stale at its last bad value after a drain.
+		//
+		// An error is logged rather than swallowed. This is the series behind the
+		// post-mortem's own alert, and the condition most likely to break it --
+		// a publisher too loaded to answer within metricsCollectTimeout -- is
+		// exactly when it needs to fire. A silently absent series reads as
+		// "nothing to report" on every dashboard it appears on.
+		if age, ok, err := db.OldestUnattemptedSighting(cctx); err != nil {
+			slog.Warn("unattempted-sighting age unavailable; the acquisition alert has no data this scrape", "error", err)
+		} else {
+			if !ok {
+				age = 0
+			}
+			observer.ObserveInt64(in.unattemptedAge, int64(age.Seconds()))
+		}
 
 		rates := wd.analysisRates(cctx)
 		observer.ObserveFloat64(in.analysisRate, float64(rates.TopLevel)/analysisRateWindow.Seconds(),

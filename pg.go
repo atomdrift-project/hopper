@@ -280,8 +280,19 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// serving, while one from last year names bytes that are probably gone.
 		// Ordering oldest-first would put every fresh citation behind the entire
 		// historical backlog -- the same defect that sightedCandidatesSQL had.
+		//
+		// The claim filter belongs IN the predicate, not only in the query. A
+		// vulnerability names a defect in working software, so nothing ever
+		// fetches one and nothing ever stamps one: left in the index they would
+		// accumulate forever and have to be skipped on every read. osv alone
+		// polls every 15 minutes and is overwhelmingly vulnerability advisories,
+		// so the index would end up mostly rows that can never leave it -- and
+		// the min() behind the unattempted-age gauge would walk past all of them
+		// from the oldest end on every metrics scrape.
+		`DROP INDEX IF EXISTS idx_sightings_unattempted`,
 		`CREATE INDEX IF NOT EXISTS idx_sightings_unattempted ` +
-			`ON sightings(first_seen DESC) WHERE acquired_at IS NULL`,
+			`ON sightings(first_seen DESC) ` +
+			`WHERE acquired_at IS NULL AND claim IN ('malicious', 'suspicious')`,
 		// Sighted triage has two ordered walks: digest claims and PURL claims. The
 		// leading expression lets both seek their half of the ledger and then read
 		// first_seen in queue order, stopping as soon as the requested batch fills.
@@ -6321,9 +6332,10 @@ const sightingAcquisitionCols = `source, subject, url, note, first_seen,
 	operator, affected, claim, filename, handle, basis, relayer, published_at`
 
 func (db *DB) unattemptedSightingsPG(ctx context.Context, limit int) ([]Sighting, error) {
-	// acquired_at IS NULL matches idx_sightings_unattempted's predicate and
-	// first_seen DESC is its order, so this is an ordered index walk that stops
-	// as soon as limit rows are read -- it never sorts the backlog.
+	// Every term here matches idx_sightings_unattempted's predicate and order,
+	// so this is an ordered index walk that stops as soon as limit rows are read
+	// -- it never sorts the backlog. The `before` bound is a range start on the
+	// same index, so paging costs no more than the first read.
 	rows, err := db.pool.Query(ctx, `
 		SELECT `+sightingAcquisitionCols+`
 		FROM sightings
@@ -8922,9 +8934,20 @@ func (db *DB) bigArchiveCandidatesPG(ctx context.Context, minBytes int64, hopper
 // behind every older corroborated row, which is survivable at today's depth and
 // fatal the moment a backlog drain enqueues its predecessors.
 //
-// created_at DESC is also what idx_samples_sighted_created is declared on, with
-// this exact partial predicate, so the ordering is an index walk rather than a
-// sort over the whole corroborated population.
+// This sorts rather than walking an index, deliberately. The planner serves the
+// predicate from idx_samples_pending_sighted -- ON (id) WHERE corroborated AND
+// cleave_result IS NULL AND skip = ” AND parent = ” -- and then sorts the
+// result by created_at. Measured 2026-09-07 on the publisher: 15 rows, 0.027 ms,
+// 19 buffers.
+//
+// The tier is small by construction and stays small, because it drains: a row
+// leaves the moment it is analysed. An index on (created_at DESC) with this
+// predicate would turn the sort into a walk and save microseconds, and it is the
+// wrong trade. samples already carries 62 indexes, and its INSERT is the single
+// most expensive statement on the publisher -- 79 ms mean, 27.7% of all database
+// time, with sample_locations' INSERT another 24.6% behind it. Ingest throughput
+// is the binding constraint on npm coverage; a sort measured in microseconds on
+// a read path is not. Do not add the index.
 const sightedCandidatesSQL = `
 	SELECT sha256, path, size_bytes, file_type, created_at FROM samples
 	WHERE corroborated

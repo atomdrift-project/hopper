@@ -3901,7 +3901,7 @@ func (db *DB) migrateLiteSightingsAcquiredAt(ctx context.Context) error {
 		return nil
 	}
 	if _, err := db.lite.ExecContext(ctx,
-			`ALTER TABLE sightings ADD COLUMN acquired_at TIMESTAMP`); err != nil {
+		`ALTER TABLE sightings ADD COLUMN acquired_at TIMESTAMP`); err != nil {
 		return fmt.Errorf("hopper: add sightings.acquired_at: %w", err)
 	}
 	return nil
@@ -3911,7 +3911,8 @@ func (db *DB) migrateLiteSightingsAcquiredAt(ctx context.Context) error {
 // tried to fetch, newest first. Partial on acquired_at, so it must be built
 // after migrateLiteSightingsAcquiredAt has ensured the column exists.
 const liteSightingsUnattemptedIndex = `CREATE INDEX IF NOT EXISTS idx_sightings_unattempted ` +
-	`ON sightings(first_seen DESC) WHERE acquired_at IS NULL`
+	`ON sightings(first_seen DESC) ` +
+	`WHERE acquired_at IS NULL AND claim IN ('malicious', 'suspicious')`
 
 func (db *DB) migrateLiteSightingsKey(ctx context.Context) error {
 	var ddl string

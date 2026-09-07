@@ -203,8 +203,12 @@ ALTER TABLE sightings ADD COLUMN IF NOT EXISTS acquired_at TIMESTAMPTZ;
 -- The acquisition queue: un-attempted claims, newest first. Newest-first is
 -- deliberate -- a claim minutes old names an artifact the registry may still be
 -- serving, one from last year names bytes that are probably gone.
+-- The claim filter is part of the predicate: a vulnerability names a defect in
+-- working software, so nothing fetches one and nothing stamps one. Left in the
+-- index they would accumulate forever and be skipped on every read.
 CREATE INDEX IF NOT EXISTS idx_sightings_unattempted
-	ON sightings(first_seen DESC) WHERE acquired_at IS NULL;
+	ON sightings(first_seen DESC)
+	WHERE acquired_at IS NULL AND claim IN ('malicious', 'suspicious');
 
 -- Lookup by subject is the read path (SightingsFor): "who cited this sha/purl?".
 CREATE INDEX IF NOT EXISTS idx_sightings_subject ON sightings(subject);

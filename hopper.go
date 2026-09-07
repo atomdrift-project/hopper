@@ -6251,6 +6251,39 @@ func (db *DB) UnattemptedSightings(ctx context.Context, limit int) ([]Sighting, 
 	return db.unattemptedSightingsSQLite(ctx, limit)
 }
 
+// OldestUnattemptedSighting returns the age of the longest-waiting claim nothing
+// has tried to acquire, and false when the queue is empty.
+//
+// This is the post-mortem's own alert, expressed as a number. A claim enters
+// this state the moment a feed records it and leaves the moment anything tries
+// to fetch it, so a large value means acquisition is not draining -- which on
+// 2026-09-07 was true of 500,713 claims, silently, for the whole life of the
+// system. Nothing measured it because nothing could: the fact lived in another
+// table under a key only the consumer knew how to build.
+//
+// Cheap by construction, but only because the index predicate matches this
+// query exactly -- acquired_at IS NULL AND claim IN ('malicious','suspicious').
+// The minimum is then the last entry of an index the planner walks backwards.
+// Widen this query without widening the index and it becomes a walk from the
+// oldest end past every row the index holds but the query rejects, on every
+// metrics scrape.
+func (db *DB) OldestUnattemptedSighting(ctx context.Context) (time.Duration, bool, error) {
+	if db.pool == nil {
+		return 0, false, nil
+	}
+	var oldest *time.Time
+	err := db.pool.QueryRow(ctx, `
+		SELECT min(first_seen) FROM sightings
+		WHERE acquired_at IS NULL AND claim IN ('malicious', 'suspicious')`).Scan(&oldest)
+	if err != nil {
+		return 0, false, fmt.Errorf("hopper: oldest unattempted sighting: %w", err)
+	}
+	if oldest == nil {
+		return 0, false, nil
+	}
+	return time.Since(*oldest), true, nil
+}
+
 // MarkSightingsAttempted stamps acquired_at on each claim, so it is never
 // offered again.
 //
