@@ -192,13 +192,18 @@ CREATE TABLE IF NOT EXISTS sightings (
 	PRIMARY KEY (source, subject, affected)
 );
 
--- acquired_at records that a consumer has attempted to obtain the artifact this
--- claim names; NULL means never attempted. Set once, whatever the outcome --
--- there is no retry schedule, because a claim we could not fetch is a fact
--- rather than pending work. It lives here, next to the claim, so "which claims
--- were never attempted" is an indexed predicate instead of a reconstruction of
--- every opaque sighting_acquisitions target in application code.
-ALTER TABLE sightings ADD COLUMN IF NOT EXISTS acquired_at TIMESTAMPTZ;
+-- attempted_at records that a consumer has TRIED to obtain the artifact this
+-- claim names; NULL means never tried. Set once, whatever the outcome -- there
+-- is no retry schedule, because a claim we could not fetch is a fact rather than
+-- pending work. It lives here, next to the claim, so "which claims were never
+-- tried" is an indexed predicate instead of a reconstruction of every opaque
+-- sighting_acquisitions target in application code.
+--
+-- Named for the attempt, not the acquisition. Most claims name artifacts the
+-- registry firehoses already fetched on their own, and those are stamped when a
+-- pass notices we have them, not when the bytes arrived. When an artifact
+-- arrived is samples.created_at.
+ALTER TABLE sightings ADD COLUMN IF NOT EXISTS attempted_at TIMESTAMPTZ;
 
 -- The acquisition queue: un-attempted claims, newest first. Newest-first is
 -- deliberate -- a claim minutes old names an artifact the registry may still be
@@ -208,7 +213,7 @@ ALTER TABLE sightings ADD COLUMN IF NOT EXISTS acquired_at TIMESTAMPTZ;
 -- index they would accumulate forever and be skipped on every read.
 CREATE INDEX IF NOT EXISTS idx_sightings_acquirable
 	ON sightings(first_seen DESC)
-	WHERE acquired_at IS NULL AND claim IN ('malicious', 'suspicious');
+	WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious');
 
 -- Lookup by subject is the read path (SightingsFor): "who cited this sha/purl?".
 CREATE INDEX IF NOT EXISTS idx_sightings_subject ON sightings(subject);

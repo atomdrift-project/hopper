@@ -394,7 +394,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 			basis        TEXT NOT NULL DEFAULT 'predicted',
 			published_at DATETIME,
 			first_seen   DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-			acquired_at  TIMESTAMP,
+			attempted_at TIMESTAMP,
 			PRIMARY KEY (source, subject, affected)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_sightings_subject ON sightings(subject)`,
@@ -450,11 +450,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 	// After the key rebuild, which recreates the table from an older shape, so
 	// the column is added to whichever table survives that step. The queue index
 	// is created here too rather than in the DDL list above: it is partial on
-	// acquired_at, so it cannot be built before the column exists.
-	if err := db.migrateLiteSightingsAcquiredAt(ctx); err != nil {
+	// attempted_at, so it cannot be built before the column exists.
+	if err := db.migrateLiteSightingsAttemptedAt(ctx); err != nil {
 		return err
 	}
-	if _, err := db.lite.ExecContext(ctx, liteSightingsUnattemptedIndex); err != nil {
+	if _, err := db.lite.ExecContext(ctx, liteSightingsAcquirableIndex); err != nil {
 		return fmt.Errorf("hopper: migrate sqlite sightings queue index: %w", err)
 	}
 
@@ -3893,26 +3893,27 @@ func (db *DB) staleSamplesSQLite(ctx context.Context, prefixes []string, olderTh
 // DDL rather than by a version counter: the table either has the columns or it
 // does not, and asking it is cheaper than remembering.
 
-// migrateLiteSightingsAcquiredAt adds sightings.acquired_at to a database that
+// migrateLiteSightingsAttemptedAt adds sightings.attempted_at to a database that
 // predates it. SQLite has no ALTER TABLE ... ADD COLUMN IF NOT EXISTS, so the
 // PRAGMA is the guard -- the same idiom the samples column migrations use.
-func (db *DB) migrateLiteSightingsAcquiredAt(ctx context.Context) error {
-	if pragmaHasColumnIn(ctx, db.lite, "sightings", "acquired_at") > 0 {
+func (db *DB) migrateLiteSightingsAttemptedAt(ctx context.Context) error {
+	if pragmaHasColumnIn(ctx, db.lite, "sightings", "attempted_at") > 0 {
 		return nil
 	}
 	if _, err := db.lite.ExecContext(ctx,
-		`ALTER TABLE sightings ADD COLUMN acquired_at TIMESTAMP`); err != nil {
-		return fmt.Errorf("hopper: add sightings.acquired_at: %w", err)
+		`ALTER TABLE sightings ADD COLUMN attempted_at TIMESTAMP`); err != nil {
+		return fmt.Errorf("hopper: add sightings.attempted_at: %w", err)
 	}
 	return nil
 }
 
-// liteSightingsUnattemptedIndex is the acquisition queue: claims nothing has
-// tried to fetch, newest first. Partial on acquired_at, so it must be built
-// after migrateLiteSightingsAcquiredAt has ensured the column exists.
-const liteSightingsUnattemptedIndex = `CREATE INDEX IF NOT EXISTS idx_sightings_acquirable ` +
+// liteSightingsAcquirableIndex builds idx_sightings_acquirable: the acquisition
+// queue, claims nothing has tried to fetch, newest first. Partial on
+// attempted_at, so it must be built after migrateLiteSightingsAttemptedAt has
+// ensured the column exists.
+const liteSightingsAcquirableIndex = `CREATE INDEX IF NOT EXISTS idx_sightings_acquirable ` +
 	`ON sightings(first_seen DESC) ` +
-	`WHERE acquired_at IS NULL AND claim IN ('malicious', 'suspicious')`
+	`WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')`
 
 func (db *DB) migrateLiteSightingsKey(ctx context.Context) error {
 	var ddl string
@@ -4162,7 +4163,7 @@ func (db *DB) unattemptedSightingsSQLite(ctx context.Context, limit int) ([]Sigh
 		SELECT source, subject, url, note, first_seen,
 		       operator, affected, claim, filename, handle, basis, relayer, published_at
 		FROM sightings
-		WHERE acquired_at IS NULL AND claim IN ('malicious', 'suspicious')
+		WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')
 		ORDER BY first_seen DESC
 		LIMIT ?`, limit)
 	if err != nil {
@@ -4195,8 +4196,8 @@ func (db *DB) markSightingsAttemptedSQLite(ctx context.Context, sightings []Sigh
 	now := time.Now().UTC()
 	for _, x := range sightings {
 		if _, err := tx.ExecContext(ctx, `
-			UPDATE sightings SET acquired_at = ?
-			WHERE source = ? AND subject = ? AND affected = ? AND acquired_at IS NULL`,
+			UPDATE sightings SET attempted_at = ?
+			WHERE source = ? AND subject = ? AND affected = ? AND attempted_at IS NULL`,
 			now, x.Source, x.Subject, x.Affected); err != nil {
 			return fmt.Errorf("hopper: mark sighting attempted: %w", err)
 		}

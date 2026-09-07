@@ -6261,8 +6261,8 @@ func (db *DB) UnattemptedSightings(ctx context.Context, limit int) ([]Sighting, 
 // system. Nothing measured it because nothing could: the fact lived in another
 // table under a key only the consumer knew how to build.
 //
-// Cheap by construction, but only because idx_sightings_acquirable's predicate matches this
-// query exactly -- acquired_at IS NULL AND claim IN ('malicious','suspicious').
+// Cheap by construction, but only because idx_sightings_acquirable's predicate
+// matches this query exactly -- attempted_at IS NULL AND the same claim filter.
 // The minimum is then the last entry of an index the planner walks backwards.
 // Widen this query without widening the index and it becomes a walk from the
 // oldest end past every row the index holds but the query rejects, on every
@@ -6274,7 +6274,7 @@ func (db *DB) OldestUnattemptedSighting(ctx context.Context) (time.Duration, boo
 	var oldest *time.Time
 	err := db.pool.QueryRow(ctx, `
 		SELECT min(first_seen) FROM sightings
-		WHERE acquired_at IS NULL AND claim IN ('malicious', 'suspicious')`).Scan(&oldest)
+		WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')`).Scan(&oldest)
 	if err != nil {
 		return 0, false, fmt.Errorf("hopper: oldest unattempted sighting: %w", err)
 	}
@@ -6284,7 +6284,7 @@ func (db *DB) OldestUnattemptedSighting(ctx context.Context) (time.Duration, boo
 	return time.Since(*oldest), true, nil
 }
 
-// MarkSightingsAttempted stamps acquired_at on each claim, so it is never
+// MarkSightingsAttempted stamps attempted_at on each claim, so it is never
 // offered again.
 //
 // Called whatever the attempt produced. A claim whose artifact could not be

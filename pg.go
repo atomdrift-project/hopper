@@ -255,11 +255,19 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_sightings_recent ON sightings(first_seen DESC) WHERE claim = 'malicious'`,
 		`CREATE INDEX IF NOT EXISTS idx_sightings_acquisition_recent ` +
 			`ON sightings(first_seen DESC) WHERE claim IN ('malicious', 'suspicious')`,
-		// acquired_at records that a consumer has attempted to obtain the artifact
-		// this claim names. NULL means never attempted -- not "failed", not "due
+		// attempted_at records that a consumer has TRIED to obtain the artifact
+		// this claim names. NULL means never tried -- not "failed", not "due
 		// again": the attempt happens once and the stamp is set whatever the
 		// outcome, because a claim we could not fetch is a fact about the world
 		// rather than work to retry.
+		//
+		// Named for the attempt, not the acquisition, because that is what it
+		// holds. Most claims in the backlog name artifacts the registry firehoses
+		// already fetched independently, and those are stamped at the moment a
+		// pass notices we have them -- months after the bytes actually arrived. A
+		// column called acquired_at would have been read as provenance and been
+		// wrong by that margin for most of its rows. When an artifact arrived is
+		// samples.created_at, and it stays there.
 		//
 		// It lives on the sightings row, beside the claim it describes, rather
 		// than being inferred from sighting_acquisitions. That table is keyed by
@@ -273,7 +281,20 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		//
 		// Nullable with no default, so this is a catalog-only rewrite on a table
 		// of any size.
-		`ALTER TABLE sightings ADD COLUMN IF NOT EXISTS acquired_at TIMESTAMPTZ`,
+		`ALTER TABLE sightings ADD COLUMN IF NOT EXISTS attempted_at TIMESTAMPTZ`,
+		// Retire the earlier acquired_at spelling, carrying any stamps across
+		// first so the drop cannot lose one. Guarded on the column still
+		// existing, because this list runs on every start and an unguarded
+		// UPDATE would fail once the column is gone.
+		`DO $$
+		BEGIN
+			IF EXISTS (SELECT 1 FROM information_schema.columns
+			            WHERE table_name = 'sightings' AND column_name = 'acquired_at') THEN
+				UPDATE sightings SET attempted_at = acquired_at
+				 WHERE acquired_at IS NOT NULL AND attempted_at IS NULL;
+				ALTER TABLE sightings DROP COLUMN acquired_at;
+			END IF;
+		END $$`,
 		// The acquisition queue itself. Partial on the un-attempted rows, which
 		// is the shrinking side, and DESC because newest-first is the whole
 		// point: a claim minutes old names an artifact a registry may still be
@@ -296,7 +317,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// of the superseded name is then a one-time no-op forever after.
 		`CREATE INDEX IF NOT EXISTS idx_sightings_acquirable ` +
 			`ON sightings(first_seen DESC) ` +
-			`WHERE acquired_at IS NULL AND claim IN ('malicious', 'suspicious')`,
+			`WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')`,
 		`DROP INDEX IF EXISTS idx_sightings_unattempted`,
 		// Sighted triage has two ordered walks: digest claims and PURL claims. The
 		// leading expression lets both seek their half of the ledger and then read
@@ -6344,7 +6365,7 @@ func (db *DB) unattemptedSightingsPG(ctx context.Context, limit int) ([]Sighting
 	rows, err := db.pool.Query(ctx, `
 		SELECT `+sightingAcquisitionCols+`
 		FROM sightings
-		WHERE acquired_at IS NULL AND claim IN ('malicious', 'suspicious')
+		WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')
 		ORDER BY first_seen DESC
 		LIMIT $1`, limit)
 	if err != nil {
@@ -6364,12 +6385,12 @@ func (db *DB) markSightingsAttemptedPG(ctx context.Context, sightings []Sighting
 		sources[i], subjects[i], affected[i] = s.Source, s.Subject, s.Affected
 	}
 	_, err := db.pool.Exec(ctx, `
-		UPDATE sightings SET acquired_at = now()
+		UPDATE sightings SET attempted_at = now()
 		FROM unnest($1::text[], $2::text[], $3::text[]) AS t(source, subject, affected)
 		WHERE sightings.source = t.source
 		  AND sightings.subject = t.subject
 		  AND sightings.affected = t.affected
-		  AND sightings.acquired_at IS NULL`, sources, subjects, affected)
+		  AND sightings.attempted_at IS NULL`, sources, subjects, affected)
 	if err != nil {
 		return fmt.Errorf("hopper: mark sightings attempted: %w", err)
 	}
