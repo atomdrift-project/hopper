@@ -22,19 +22,54 @@ import (
 	"github.com/atomdrift-project/hopper/pkgparse"
 )
 
+// poolSize returns the connection budget for one consumer of the database.
+//
+// One connection for everybody except the serving API. That is a deliberate
+// inversion of what this used to do, which was hand every caller the same 32/8
+// pool reasoned about entirely from the server's workload.
+//
+// The publisher has 100 connections with 3 held back for superusers. Four
+// long-lived services at 32 apiece is 128 against a budget of 97, so the
+// cluster was permanently one busy moment from refusing everything -- and it
+// did. Measured 2026-09-07: 94 of 97 slots held, 92 of them IDLE (hopper 32,
+// promoter 26, forager 26, prism 8), while an operator running
+// `hopper reconcile-corroborated` could not get in at all. Note what those
+// numbers say. The connections were not busy. They were owned.
+//
+// So the default is the smallest thing that works, and a consumer that provably
+// needs more asks for it in its DSN rather than inheriting it by accident:
+//
+//	postgres://hopper@hopper-db/hopper?pool_max_conns=8
+//
+// A DSN that names pool_max_conns keeps exactly what it asked for, so widening
+// one service is a deploy-time change and needs no rebuild. Getting this wrong
+// now costs latency in one service; getting it wrong the old way cost everyone
+// the ability to connect.
+func poolSize(app AppName) (maxConns, minConns int32) {
+	if app == "hopper" {
+		// The serving API and the write path, and the one caller whose
+		// concurrency is real: a worker fleet polls /api/next every 2 seconds
+		// while long result-store transactions (UpdateCleaveResult can cascade
+		// into ExplodeArchiveMembers) hold a connection for seconds at a time.
+		// It keeps a warm minimum because it is always serving.
+		return 32, 8
+	}
+	// Everything else -- forager, promoter, prism, one-shot commands, ad-hoc
+	// tools. One connection, and no minimum: a client that is not serving
+	// requests has no business reserving capacity from one that is.
+	return 1, 0
+}
+
 func openPG(ctx context.Context, dsn string, app AppName) (*DB, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: parse dsn: %w", err)
 	}
-	// Sized for concurrent /api/next + /api/result + dashboard + ad-hoc psql
-	// inspection. With long result-store transactions (UpdateCleaveResult
-	// can cascade into ExplodeArchiveMembers) holding a connection for
-	// seconds, 32 was tight enough to starve the dashboard's queries.
-	// Observed steady state is ~8 in use (pool metrics), so 32 leaves ample
-	// headroom without reserving 64×work_mem on the memory-tight PG host.
-	cfg.MaxConns = 32
-	cfg.MinConns = 8
+	// Sized per consumer, because they are not alike and the publisher's budget
+	// is shared. A DSN that names pool_max_conns keeps what it asked for.
+	if !strings.Contains(dsn, "pool_max_conns") {
+		cfg.MaxConns, cfg.MinConns = poolSize(app)
+	}
 	cfg.MaxConnIdleTime = 5 * time.Minute
 	// Name the connections so pg_stat_activity can attribute them; see AppName
 	// for why this is a required argument rather than a default. Set after

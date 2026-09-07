@@ -623,7 +623,42 @@ func openDB(ctx context.Context, dsn string) (*hopper.DB, error) {
 		dsn = "postgres://hopper@hopper-db:5432/hopper"
 	}
 	slog.Info("connecting to database", "dsn", redactDSN(dsn))
-	return hopper.Open(ctx, dsn, "hopper")
+	// Named for the subcommand, not "hopper". Two reasons, both learned the hard
+	// way on 2026-09-07 when an operator could not run reconcile-corroborated
+	// against a publisher whose 97 usable slots were 94 held and 92 of them idle.
+	//
+	// It picks the right pool. poolSize gives an unrecognised name 4 connections
+	// and no minimum, which is what a one-shot task needs; under "hopper" this
+	// asked for a MINIMUM of 8 before it would start.
+	//
+	// And it tells the truth in pg_stat_activity. A maintenance command sharing
+	// the serving API's application_name is invisible: the 32 connections
+	// attributed to "hopper" could have been the server, a stuck migration, or
+	// someone's afternoon backfill, and nothing distinguished them.
+	return hopper.Open(ctx, dsn, cliAppName())
+}
+
+// cliAppName identifies the running subcommand to the database, as
+// "hopper-<subcommand>", falling back to a plain marker when there is none.
+// PostgreSQL truncates application_name at 63 bytes, which hopper.AppName
+// rejects rather than silently accepts, so the subcommand is bounded here.
+func cliAppName() hopper.AppName {
+	sub := "cli"
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+		if clean := strings.Map(func(r rune) rune {
+			if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' {
+				return r
+			}
+			return -1
+		}, strings.ToLower(os.Args[1])); clean != "" {
+			sub = clean
+		}
+	}
+	const maxSub = 40
+	if len(sub) > maxSub {
+		sub = sub[:maxSub]
+	}
+	return hopper.AppName("hopper-" + sub)
 }
 
 // cmdServeReplica runs the read-only lookup API against a local replica
