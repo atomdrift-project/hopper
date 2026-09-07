@@ -6261,7 +6261,7 @@ func (db *DB) UnattemptedSightings(ctx context.Context, limit int) ([]Sighting, 
 // system. Nothing measured it because nothing could: the fact lived in another
 // table under a key only the consumer knew how to build.
 //
-// Cheap by construction, but only because the index predicate matches this
+// Cheap by construction, but only because idx_sightings_acquirable's predicate matches this
 // query exactly -- acquired_at IS NULL AND claim IN ('malicious','suspicious').
 // The minimum is then the last entry of an index the planner walks backwards.
 // Widen this query without widening the index and it becomes a walk from the

@@ -206,7 +206,7 @@ ALTER TABLE sightings ADD COLUMN IF NOT EXISTS acquired_at TIMESTAMPTZ;
 -- The claim filter is part of the predicate: a vulnerability names a defect in
 -- working software, so nothing fetches one and nothing stamps one. Left in the
 -- index they would accumulate forever and be skipped on every read.
-CREATE INDEX IF NOT EXISTS idx_sightings_unattempted
+CREATE INDEX IF NOT EXISTS idx_sightings_acquirable
 	ON sightings(first_seen DESC)
 	WHERE acquired_at IS NULL AND claim IN ('malicious', 'suspicious');
 

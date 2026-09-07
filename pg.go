@@ -289,10 +289,15 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// so the index would end up mostly rows that can never leave it -- and
 		// the min() behind the unattempted-age gauge would walk past all of them
 		// from the oldest end on every metrics scrape.
-		`DROP INDEX IF EXISTS idx_sightings_unattempted`,
-		`CREATE INDEX IF NOT EXISTS idx_sightings_unattempted ` +
+		// A new name rather than a redefinition. DROP + CREATE IF NOT EXISTS in a
+		// migration list that runs on every start would rebuild this index on
+		// every start, and leave the acquisition queue unindexed while it did.
+		// Renaming makes CREATE IF NOT EXISTS genuinely idempotent, and the drop
+		// of the superseded name is then a one-time no-op forever after.
+		`CREATE INDEX IF NOT EXISTS idx_sightings_acquirable ` +
 			`ON sightings(first_seen DESC) ` +
 			`WHERE acquired_at IS NULL AND claim IN ('malicious', 'suspicious')`,
+		`DROP INDEX IF EXISTS idx_sightings_unattempted`,
 		// Sighted triage has two ordered walks: digest claims and PURL claims. The
 		// leading expression lets both seek their half of the ledger and then read
 		// first_seen in queue order, stopping as soon as the requested batch fills.
@@ -6332,7 +6337,7 @@ const sightingAcquisitionCols = `source, subject, url, note, first_seen,
 	operator, affected, claim, filename, handle, basis, relayer, published_at`
 
 func (db *DB) unattemptedSightingsPG(ctx context.Context, limit int) ([]Sighting, error) {
-	// Every term here matches idx_sightings_unattempted's predicate and order,
+	// Every term here matches idx_sightings_acquirable's predicate and order,
 	// so this is an ordered index walk that stops as soon as limit rows are read
 	// -- it never sorts the backlog. The `before` bound is a range start on the
 	// same index, so paging costs no more than the first read.

@@ -3910,7 +3910,7 @@ func (db *DB) migrateLiteSightingsAcquiredAt(ctx context.Context) error {
 // liteSightingsUnattemptedIndex is the acquisition queue: claims nothing has
 // tried to fetch, newest first. Partial on acquired_at, so it must be built
 // after migrateLiteSightingsAcquiredAt has ensured the column exists.
-const liteSightingsUnattemptedIndex = `CREATE INDEX IF NOT EXISTS idx_sightings_unattempted ` +
+const liteSightingsUnattemptedIndex = `CREATE INDEX IF NOT EXISTS idx_sightings_acquirable ` +
 	`ON sightings(first_seen DESC) ` +
 	`WHERE acquired_at IS NULL AND claim IN ('malicious', 'suspicious')`
 
