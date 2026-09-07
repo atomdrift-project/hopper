@@ -11,7 +11,7 @@ set -eu
 
 DATA_DIR="${DATA_DIR:-/data/samples}"
 DB="${DB:-postgres://hopper@hopper-db/hopper?sslmode=disable}"
-SOURCE="${SOURCE:-harvest}"
+SOURCE="${SOURCE:-fs}"
 API_ADDR="${API_ADDR:-0.0.0.0:8081}"
 # The dashboard has no authentication of its own — a browser cannot present a
 # bearer token — so it gets its own listener and is never the tunnel origin.

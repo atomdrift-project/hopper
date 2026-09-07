@@ -90,6 +90,80 @@ func TestAttachSidecarProvenance(t *testing.T) {
 	if s2.Provenance != nil || s2.FetchedAt != nil {
 		t.Error("missing sidecar should leave provenance/fetched_at unset")
 	}
+
+	// A corpus sidecar names no package; its fetch URL and feed record are the
+	// claims, and they win over what the path parse guessed.
+	corpus := filepath.Join(dir, "virussign.com_f8c6.vir")
+	if err := os.WriteFile(corpus, []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	corpusSidecar := `{"schema_version":"1.0","artifact":{"filename":"virussign.com_f8c6.vir"},` +
+		`"fetch":{"at":"2026-09-04T16:52:38Z","url":"http://samples.virussign.com/samples/virussign.com_20260904_LimitedFree.zip","category":"bad","collector":"forager"},` +
+		`"feed":{"source_id":"virussign","format":"virussign.v1","url":"http://samples.virussign.com/samples/virussign.com_20260904_LimitedFree.zip","at":"2026-09-04T05:07:50Z","status":"complete"}}`
+	if err := os.WriteFile(corpus+sidecarSuffix, []byte(corpusSidecar), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s3 := hopper.Sample{Feed: "malwarebazaar", Domain: "sha256", Package: "325d52fc"}
+	attachSidecarProvenance(&s3, corpus)
+	if s3.Feed != "virussign" || s3.Domain != "virussign.com" {
+		t.Errorf("feed/domain = %q/%q, want virussign/virussign.com (from sidecar)", s3.Feed, s3.Domain)
+	}
+	if s3.URL != "http://samples.virussign.com/samples/virussign.com_20260904_LimitedFree.zip" {
+		t.Errorf("URL = %q, want the sidecar's fetch url", s3.URL)
+	}
+	if s3.Package != "325d52fc" {
+		t.Errorf("Package = %q, want the path's answer kept when the sidecar names none", s3.Package)
+	}
+}
+
+// TestLoadDirAttributesIncomingCorpus walks a corpus sample the way forager
+// leaves it — bytes and a .forage.json under incoming/forager, no direct
+// insert — and expects the row to carry the feed, domain, and url a direct
+// insert of the same sidecar would.
+func TestLoadDirAttributesIncomingCorpus(t *testing.T) {
+	useTestPathLister(t)
+	ctx := t.Context()
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := hopper.Open(ctx, dbPath, "hopper-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	content := []byte("virussign daily zip member bytes")
+	sum := sha256.Sum256(content)
+	sha := hex.EncodeToString(sum[:])
+	leaf := filepath.Join(dir, "incoming", "forager", "_unknown", "virussign.com", "virussign", sha)
+	mustMkdirAll(t, leaf)
+	artifact := filepath.Join(leaf, "virussign.com_f8c6.vir")
+	mustWriteFile(t, artifact, content)
+	url := "http://samples.virussign.com/samples/virussign.com_20260904_LimitedFree.zip"
+	mustWriteFile(t, artifact+sidecarSuffix, fmt.Appendf(nil,
+		`{"schema_version":"1.0","artifact":{"filename":"virussign.com_f8c6.vir","sha256":%q},`+
+			`"fetch":{"at":"2026-09-04T16:52:38Z","url":%q,"category":"bad","collector":"forager"},`+
+			`"feed":{"source_id":"virussign","format":"virussign.v1","url":%q,"at":"2026-09-04T05:07:50Z","status":"complete"}}`,
+		sha, url, url))
+
+	loadAll(ctx, func() {}, db, nil, newWorkerTracker(), nil, nil, []struct{ dir, label string }{{dir, "unknown"}}, nil, "fs", 1, false, 0, "", nil, "", 0, false, false)
+
+	got, err := db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatalf("SampleBySHA256: %v", err)
+	}
+	if got == nil {
+		t.Fatal("corpus sample not inserted")
+	}
+	if got.Feed != "virussign" || got.Domain != "virussign.com" || got.URL != url {
+		t.Errorf("feed/domain/url = %q/%q/%q, want virussign/virussign.com/%s", got.Feed, got.Domain, got.URL, url)
+	}
+	if got.Package != sha {
+		t.Errorf("Package = %q, want the digest, as forager's direct inserts record it", got.Package)
+	}
 }
 
 func TestStartEnumerationSkipsSidecars(t *testing.T) {
@@ -1912,6 +1986,51 @@ func TestExtractPathProvenance(t *testing.T) {
 				feed:      "npmjs.org",
 				pkg:       "lodash",
 			},
+		},
+		// The incoming tree: forager's bad-feed corpora write the foraged grammar
+		// under the collector's name and rely on the walk, so the path must
+		// name the feed or the row is unattributed (2026-09-06: every virussign
+		// row in the pool had a blank feed and domain).
+		{
+			name:  "incoming corpus drop names domain and feed",
+			path:  "/srv/data/incoming/forager/_unknown/virussign.com/virussign/325d52fc/virussign.com_f8c6.vir",
+			label: "unknown",
+			want: pathProvenance{
+				domain: "virussign.com",
+				feed:   "virussign",
+				pkg:    "325d52fc",
+			},
+		},
+		{
+			// A sighting-driven fetch is filed by digest: "sha256" sits in the
+			// domain slot and must not become a download domain.
+			name:  "incoming sighted fetch keeps the digest tier out of domain",
+			path:  "/srv/data/incoming/forager/sighted/sha256/triage/0aa82d15/0aa82d15",
+			label: "unknown",
+			want: pathProvenance{
+				ecosystem: "sighted",
+				feed:      "triage",
+				pkg:       "0aa82d15",
+			},
+		},
+		// Curated datasets: the collection is the feed, whatever it holds.
+		{
+			name:  "dataset collection is the feed",
+			path:  "/srv/data/bad/datasets/various/Backstabber's Knife Collection/Backstabber's Knife Collection/samples/npm/ngx-bootstrap/20.0.6/ngx-bootstrap-20.0.6.tgz",
+			label: "bad",
+			want:  pathProvenance{feed: "backstabbers-knife-collection"},
+		},
+		{
+			name:  "dataset hash dump is the feed",
+			path:  "/srv/data/bad/datasets/various/VirusShare/VirusShare_00003bc254881091a234e81e6bb1cef0",
+			label: "bad",
+			want:  pathProvenance{feed: "virusshare"},
+		},
+		{
+			name:  "dataset group with no collection is not a feed",
+			path:  "/srv/data/bad/datasets/misc/loose.exe",
+			label: "bad",
+			want:  pathProvenance{},
 		},
 	}
 	for _, tt := range tests {

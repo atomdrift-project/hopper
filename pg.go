@@ -8585,45 +8585,86 @@ func (db *DB) feedSourcesPG(ctx context.Context, source, label string) ([]string
 	return scanPGStrings(rows)
 }
 
+// feedEcosystemsSQL builds the PostgreSQL form of FeedEcosystems as a loose
+// index scan: walk the distinct ecosystem values one index probe at a time,
+// then probe each one once for a feed-eligible row. Every probe is a handful
+// of buffers, so the cost is proportional to the number of ecosystems (~120),
+// not to the number of samples in the window.
+//
+// Measured on the replica 2026-09-07 with prism's real 72h window. The previous
+// shape (DISTINCT over an index-only scan of the window) had to visit every
+// index entry in the window — 1.46M entries plus 308k heap fetches for
+// visibility, 810k buffers per call — and on the replica, where the visibility
+// map is perpetually stale and the apply worker competes for the same disk,
+// that was 30-60 s cold. prism's loader cancels at 60 s, so the dropdown cache
+// never filled and the query re-ran back to back all day: the single largest
+// source of physical reads on the box, starving logical apply. This form reads
+// ~2k buffers and returns the identical 45 ecosystems.
+//
+// Two planner traps shape the SQL, both verified with EXPLAIN:
+//   - The recursive step must repeat the non-empty predicate explicitly. The only
+//     indexes on ecosystem are partial on that predicate, and the planner cannot
+//     prove `ecosystem > <parameter>` implies it — without the repeat it falls
+//     back to a full scan per iteration (cost 2.9e8).
+//   - The eligibility probe is a LATERAL ... LIMIT 1, not EXISTS. EXISTS is
+//     flattened into a semi-join that re-reads the whole window (cost 7e5);
+//     LIMIT inside LATERAL cannot be flattened, so it stays one index probe
+//     per ecosystem on idx_samples_eco_top_created (ecosystem, created_at DESC),
+//     whose leading entry for the ecosystem is exactly the newest row.
+//
+// parent/cleave_result/litmus_result are not filters the caller asked for —
+// they scope the list to the FEED's population (see FeedEcosystems), and they
+// match idx_samples_eco_top_created's partial predicate so the probe is
+// index-only. litmus_result is the one predicate that is not a strict feed
+// invariant: FeedQuery.requireLitmus declines it when the criticality set
+// contains 0 (benign), because the derive trigger maps a null litmus_result to
+// class 0. Checked rather than assumed — the ecosystem sets with and without
+// that predicate were both 45, difference empty — so it costs nothing today.
+// The residual exposure is an ecosystem whose only feed-eligible rows have not
+// been analyzed yet, which is absent from the dropdown until the first litmus
+// result lands and then heals itself.
+//
+// The loose scan only helps the unfiltered call, which is the only one in
+// production (prism's dropdown loader). With a source or label filter the
+// probe can no longer be satisfied from the ecosystem index alone — the
+// planner switches it to the (source, label, created_at) index and filters
+// ecosystem on the heap, so an ecosystem with no rows from that source walks
+// every row of that source. Measured 2026-09-07: >15 s even with the 72h
+// window, i.e. no better than the DISTINCT form. Filtered calls therefore keep
+// the original SQL, unchanged, rather than trade one full scan for another.
+func feedEcosystemsSQL(source, label string, since *time.Time) (string, []any) {
+	if source != "" || label != "" {
+		return `
+		SELECT DISTINCT ecosystem FROM samples
+		WHERE ($1 = '' OR source = $1) AND ($2 = '' OR label = $2) AND ecosystem != ''
+		  AND parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL
+		  AND ($3::timestamptz IS NULL OR created_at >= $3)
+		ORDER BY ecosystem`, []any{source, label, since}
+	}
+	var args []any
+	window := ""
+	if since != nil {
+		args = append(args, *since)
+		window = " AND s.created_at >= $1"
+	}
+	return `WITH RECURSIVE eco AS (
+  (SELECT ecosystem FROM samples WHERE ecosystem <> '' ORDER BY ecosystem LIMIT 1)
+  UNION ALL
+  SELECT (SELECT s.ecosystem FROM samples s WHERE s.ecosystem > eco.ecosystem AND s.ecosystem <> '' ORDER BY s.ecosystem LIMIT 1)
+  FROM eco WHERE eco.ecosystem IS NOT NULL)
+SELECT e.ecosystem FROM eco e,
+  LATERAL (SELECT 1 FROM samples s WHERE s.ecosystem = e.ecosystem AND s.ecosystem <> '' AND s.parent = '' AND s.cleave_result IS NOT NULL AND s.litmus_result IS NOT NULL` + window + ` LIMIT 1) hit
+WHERE e.ecosystem IS NOT NULL ORDER BY e.ecosystem`, args
+}
+
 func (db *DB) feedEcosystemsPG(ctx context.Context, source, label string, since time.Time) ([]string, error) {
 	var sincePtr *time.Time
 	if !since.IsZero() {
 		u := since.UTC()
 		sincePtr = &u
 	}
-	// parent/cleave_result/litmus_result are not filters the caller asked for —
-	// they are what makes this query use idx_samples_eco_top_created instead of
-	// reading the table. Its partial predicate is exactly these three plus
-	// ecosystem <> '', and a partial index is only usable when the query implies
-	// its predicate, so all of them have to be here or none of them help.
-	//
-	// Measured on the replica 2026-08-24, with prism's real 72h window: without
-	// them this is a Parallel Seq Scan costing 27,913,645 that ran 54 SECONDS per
-	// call and read 1.46 BILLION blocks (~11 TB) across 79 calls — by a wide
-	// margin the single largest source of physical reads on the box, and the
-	// bulkread traffic that was starving the logical apply worker. With them it
-	// is an Index Only Scan costing 5,711 that returns in well under a second.
-	//
-	// It is also the more correct answer. This list populates the feed's
-	// ecosystem dropdown, and every feed query carries parent = '' and
-	// cleave_result IS NOT NULL; an ecosystem outside that population renders an
-	// empty page when picked. The window narrowed from 72 entries to 45 —
-	// the 27 removed were exactly those dead-end choices.
-	//
-	// litmus_result is the one predicate that is not a strict feed invariant:
-	// FeedQuery.requireLitmus declines it when the criticality set contains 0
-	// (benign), because the derive trigger maps a null litmus_result to class 0.
-	// Checked rather than assumed — the ecosystem sets with and without that
-	// predicate were both 45, difference empty — so it costs nothing today. The
-	// residual exposure is an ecosystem whose only feed-eligible rows have not
-	// been analyzed yet, which is absent from the dropdown until the first
-	// litmus result lands and then heals itself.
-	rows, err := db.pool.Query(ctx, `
-		SELECT DISTINCT ecosystem FROM samples
-		WHERE ($1 = '' OR source = $1) AND ($2 = '' OR label = $2) AND ecosystem != ''
-		  AND parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL
-		  AND ($3::timestamptz IS NULL OR created_at >= $3)
-		ORDER BY ecosystem`, source, label, sincePtr)
+	sql, args := feedEcosystemsSQL(source, label, sincePtr)
+	rows, err := db.pool.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed ecosystems: %w", err)
 	}
@@ -8671,11 +8712,32 @@ func (db *DB) updateEcosystemsPG(ctx context.Context, mapping map[string]string)
 	return total, nil
 }
 
-func (db *DB) feedDomainsPG(ctx context.Context, source, label string) ([]string, error) {
-	rows, err := db.pool.Query(ctx, `
+// feedDomainsSQL is the domain twin of feedEcosystemsSQL: a loose index scan
+// over idx_samples_domain (partial on non-empty domain, hence the explicit repeat
+// in the recursive step). Unfiltered — prism's call — every distinct domain
+// qualifies by construction, so there is no probe at all: ~10k buffers for
+// ~2.4k domains, against 150 MB+ and 7.6 s per call for the DISTINCT scan it
+// replaces (pg_stat_statements on the replica, 2026-09-07). A source or label
+// filter keeps the original SQL for the reason given on feedEcosystemsSQL: a
+// per-domain probe with a heap filter is no faster than the DISTINCT form.
+func feedDomainsSQL(source, label string) (string, []any) {
+	if source != "" || label != "" {
+		return `
 		SELECT DISTINCT domain FROM samples
 		WHERE ($1 = '' OR source = $1) AND ($2 = '' OR label = $2) AND domain != ''
-		ORDER BY domain`, source, label)
+		ORDER BY domain`, []any{source, label}
+	}
+	return `WITH RECURSIVE dom AS (
+  (SELECT domain FROM samples WHERE domain <> '' ORDER BY domain LIMIT 1)
+  UNION ALL
+  SELECT (SELECT s.domain FROM samples s WHERE s.domain > dom.domain AND s.domain <> '' ORDER BY s.domain LIMIT 1)
+  FROM dom WHERE dom.domain IS NOT NULL)
+SELECT domain FROM dom WHERE domain IS NOT NULL ORDER BY domain`, nil
+}
+
+func (db *DB) feedDomainsPG(ctx context.Context, source, label string) ([]string, error) {
+	sql, args := feedDomainsSQL(source, label)
+	rows, err := db.pool.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed domains: %w", err)
 	}

@@ -3465,38 +3465,63 @@ func hashFile(ctx context.Context, path, label, fileType, source string, cache *
 }
 
 // attachSidecarProvenance loads the forager provenance sidecar next to an
-// artifact (if present) into the sample's provenance column and fetched_at.
-// This backfills provenance for samples that reach hopper via the reconcile
-// walk rather than forager's direct-insert. A missing or malformed sidecar is
-// the common case and silently leaves both unset; the insert conflict clause
-// preserves any provenance a prior direct-insert already wrote.
+// artifact (if present) into the sample's provenance column and projects the
+// producer's claims into the scalar columns, the way the upload handler does
+// for the same record on the wire. This is how the bad-feed corpora forager
+// drops on disk without direct-inserting (virussign, malshare, and the rest)
+// get a feed, url, and domain: the path names the feed, but only the sidecar
+// knows where the bytes were fetched from. A claim the sidecar makes wins over
+// what the path parse guessed; a claim it does not make leaves the path's
+// answer in place. A missing or malformed sidecar is the common case and
+// silently changes nothing; the insert conflict clause preserves any
+// provenance a prior direct-insert already wrote.
 func attachSidecarProvenance(s *hopper.Sample, artifactPath string) {
 	data, err := os.ReadFile(artifactPath + sidecarSuffix)
 	if err != nil || !json.Valid(data) {
 		return
 	}
-	s.Provenance = data
-	var meta struct {
-		Fetch struct {
-			At time.Time `json:"at"`
-		} `json:"fetch"`
-		Artifact struct {
-			Filename string `json:"filename"`
-			SHA256   string `json:"sha256"`
-		} `json:"artifact"`
-	}
-	if err := json.Unmarshal(data, &meta); err != nil {
+	var sc hopper.Sidecar
+	if err := json.Unmarshal(data, &sc); err != nil {
 		return
 	}
-	if !meta.Fetch.At.IsZero() {
-		s.FetchedAt = &meta.Fetch.At
+	s.Provenance = data
+	if !sc.Fetch.At.IsZero() {
+		at := sc.Fetch.At
+		s.FetchedAt = &at
 	}
 	// Prefer the producer's recorded filename over the on-disk basename: it is
 	// the original upstream name (e.g. "k.php"), immune to a transient sha-named
 	// copy a relocation may leave beside the sample. The sha256 binds the sidecar
 	// to these exact bytes, so adopt the name only when it matches what we hashed.
-	if meta.Artifact.Filename != "" && strings.EqualFold(meta.Artifact.SHA256, s.SHA256) {
-		s.Filename = meta.Artifact.Filename
+	if sc.Artifact.Filename != "" && strings.EqualFold(sc.Artifact.SHA256, s.SHA256) {
+		s.Filename = sc.Artifact.Filename
+	}
+	if sc.Fetch.URL != "" {
+		s.URL = sc.Fetch.URL
+		if domain := uploadDomain(sc.Fetch.URL); domain != unknownDomain {
+			s.Domain = domain
+		}
+	}
+	// The discovery channel: the package's feed when the producer named one,
+	// else the feed record's source — a corpus sidecar carries no package.
+	feed := sc.Package.Feed
+	if feed == "" && sc.Feed != nil {
+		feed = sc.Feed.SourceID
+	}
+	if feed != "" {
+		s.Feed = feed
+	}
+	if eco := pkgparse.NormalizeEcosystem(sc.Package.Ecosystem); eco != "" {
+		s.Ecosystem = eco
+	}
+	if sc.Package.Name != "" {
+		s.Package = sc.Package.Name
+	}
+	if sc.Package.Version != "" {
+		s.Version = sc.Package.Version
+	}
+	if sc.Package.PURL != "" {
+		s.PURLBase = pkgparse.VersionlessPURL(pkgparse.CanonicalizePURL(sc.Package.PURL))
 	}
 }
 
@@ -3640,7 +3665,10 @@ type pathProvenance struct {
 func extractPathProvenance(path, label string) pathProvenance {
 	parts := strings.Split(filepath.ToSlash(path), "/")
 	marker, idx := findLayoutMarker(parts, label)
-	if idx < 0 || idx+1 >= len(parts) {
+	if idx < 0 {
+		return datasetPathProvenance(parts)
+	}
+	if idx+1 >= len(parts) {
 		return pathProvenance{}
 	}
 	after := parts[idx+1:]
@@ -3666,6 +3694,24 @@ func extractPathProvenance(path, label string) pathProvenance {
 		return parseForagedDirs(dirs)
 	}
 	return parseHarvestDirs(dirs, label)
+}
+
+// datasetPathProvenance names the curated corpus a dataset row came from. The
+// trees are <label>/datasets/<group>/<name>/..., and the collection is the feed
+// whatever registries or file types it holds: a static corpus is one provider,
+// which is what the fairness cap and the triage queue both need to know.
+// attachDatasetMetadata refines this for the collections that ship registry
+// documents; this is the answer for the ones that do not (hash dumps, GitHub
+// grab-bags, the Datadog dataset) and until a document is read. The id is the
+// same slug attachDatasetMetadata writes, so both agree.
+func datasetPathProvenance(parts []string) pathProvenance {
+	for i, p := range parts {
+		// group, name, and at least the file itself must follow.
+		if p == "datasets" && i+3 < len(parts) {
+			return pathProvenance{feed: datasetFeedID(parts[i+2])}
+		}
+	}
+	return pathProvenance{}
 }
 
 // promotionTrees are the destinations a ruled or reviewed sample is moved into,
@@ -3697,6 +3743,10 @@ func findLayoutMarker(parts []string, label string) (marker string, idx int) {
 		switch next := parts[labelIdx+1]; {
 		case next == "foraged", next == "harvest":
 			return next, labelIdx + 1
+		case next == "forager":
+			// The incoming tree forager drops the bad-feed corpora into is the
+			// foraged grammar under the collector's own name.
+			return "foraged", labelIdx + 1
 		case isUploadProducer(next), isPromotionTree(next):
 			// Only recognized directly under the label. A producer name is an
 			// ordinary word ("scan") that could equally be a package name
@@ -3727,10 +3777,17 @@ func findLayoutMarker(parts []string, label string) (marker string, idx int) {
 func parseForagedDirs(dirs []string) pathProvenance {
 	p := pathProvenance{}
 	if len(dirs) >= 1 {
-		p.ecosystem = dirs[0]
+		p.ecosystem = unknownToEmpty(dirs[0])
 	}
 	if len(dirs) >= 2 {
 		p.domain = unknownToEmpty(dirs[1])
+		// A sighting-driven fetch has no registry, so forager files it by digest
+		// and the domain slot holds the tier name. Recording "sha256" as a
+		// download domain would give the fairness cap a source that does not
+		// exist; the sidecar's fetch URL supplies the real one.
+		if p.domain == digestTier || p.domain == "sha256" {
+			p.domain = ""
+		}
 	}
 	if len(dirs) >= 3 {
 		feed := unknownToEmpty(dirs[2])
