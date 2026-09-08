@@ -55,13 +55,16 @@ commands:
   backfill-lvl       materialize litmus model levels in small resumable batches (postgres)
   reheal-crit        repair max_crit/suspicious_count zeroed by the pre-v8 cleave trigger (postgres)
   backfill-purl      derive missing samples.purl_base from ecosystem+package (never overwrites; postgres)
+  backfill-version   recover missing samples.version from the stored location filename; run this
+                     BEFORE reconcile-corroborated (never overwrites; --dry-run; postgres)
   backfill-dataset-metadata  attach registry documents beside dataset artifacts as provenance and adopt
                      their package identity; --purge drops the documents ingested as samples (dry-run; --apply)
   repair-parents     clear samples.parent where the bytes are on disk standalone (--dry-run; postgres)
   drop-sightings     delete the named sources' claims so a re-walk can rebuild them with versions
   reconcile-corroborated  re-derive samples.corroborated from the sightings ledger in both
-                     directions; a repair tool for history and restores — the triggers
-                     keep it correct in normal operation, so this should find nothing
+                     directions, narrowing each claim to the releases it names; a repair
+                     tool for history, restores, and the version-blind marking that ran
+                     until 2026-09-08 — the triggers keep it correct in normal operation
   canonicalize-purls rewrite stored purl_base and sightings.subject spellings onto the current canonical
                      form, then re-derive samples.corroborated (batched; -dry-run; postgres)
   purge-unsupported  delete analyzed rows cleave could not classify
@@ -425,6 +428,8 @@ func run(ctx context.Context) error {
 		return cmdRepairParents(ctx)
 	case "backfill-dataset-metadata":
 		return cmdBackfillDatasetMetadata(ctx)
+	case "backfill-version":
+		return cmdBackfillVersion(ctx)
 	case "backfill-purl":
 		return cmdBackfillPURL(ctx)
 	case "backfill-claims":
@@ -4079,6 +4084,41 @@ func cmdBackfillPURL(ctx context.Context) error {
 // shipped but before the claims table existed, and the completeness sweeper
 // to run once a --pre-ident rescan wave has drained. Resumable (--start-id)
 // and idempotent; safe to re-run any time.
+// cmdBackfillVersion recovers samples.version from the stored location
+// filename. Run it before reconcile-corroborated: a package row with an
+// identity but no recorded release cannot be narrowed against an advisory's
+// affected list, so reconciling first reads "unrecorded version" as "version
+// the advisory does not name" and clears real evidence.
+func cmdBackfillVersion(ctx context.Context) error {
+	f := flag.NewFlagSet("backfill-version", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	dryRun := f.Bool("dry-run", false, "report what would be filled without writing")
+	parseFlags(f, os.Args[2:])
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	// No migration, for the same reason reconcile-corroborated skips it: this
+	// writes a column that has always existed, and taking the whole schema's
+	// DDL locks on a live cluster to change nothing is how the last
+	// maintenance command failed to run at all.
+	slog.Info("recovering samples.version from location filenames", "dry_run", *dryRun)
+	n, err := db.BackfillVersion(ctx, *dryRun)
+	if err != nil {
+		return err
+	}
+	verb := "filled"
+	if *dryRun {
+		verb = "would fill"
+	}
+	fmt.Printf("%s %d sample versions from their location filename\n", verb, n)
+	slog.Info("backfill-version complete", "rows_filled", n, "dry_run", *dryRun)
+	return nil
+}
+
 func cmdBackfillClaims(ctx context.Context) error {
 	f := flag.NewFlagSet("backfill-claims", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
@@ -4347,7 +4387,7 @@ func cmdReconcileCorroborated(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("marked %d samples a sighting cites, cleared %d with no remaining citation\n",
+	fmt.Printf("marked %d samples a sighting cites, cleared %d cited by nothing or only at another version\n",
 		marked, cleared)
 	slog.Info("corroboration reconciled", "marked", marked, "cleared", cleared)
 	return nil

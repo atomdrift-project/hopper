@@ -60,15 +60,31 @@ func pragmaHasColumnIn(ctx context.Context, db *sql.DB, table, column string) in
 // Named once because it is created from two places: the migration list, and the
 // sightings rebuild, which renames the table out from under these and drops
 // them with it.
+//
+// Dropped before each create: SQLite has no CREATE OR REPLACE TRIGGER, so
+// without the drops an existing database keeps whatever body it was built with.
+// That is how the version-blind marking of 2026-09-08 would have survived the
+// fix on every database that already existed.
 var liteSightingCorroborationTriggers = []string{
+	`DROP TRIGGER IF EXISTS sightings_corroborate_trg`,
+	`DROP TRIGGER IF EXISTS sightings_uncorroborate_trg`,
+	`DROP TRIGGER IF EXISTS sightings_resubject_trg`,
 	`CREATE TRIGGER IF NOT EXISTS sightings_corroborate_trg
 		AFTER INSERT ON sightings
 		FOR EACH ROW
 		BEGIN
 			UPDATE samples SET corroborated = 1
 			 WHERE corroborated = 0 AND sha256 = NEW.subject;
+			-- Narrowed to the releases the claim actually names; see the
+			-- Postgres trigger in schema.sql for why. SQLite has no regex, so
+			-- "names exact releases" is a GLOB and list membership is a LIKE
+			-- over a comma-delimited copy.
 			UPDATE samples SET corroborated = 1
-			 WHERE purl_base = NEW.subject AND purl_base != '' AND corroborated = 0;
+			 WHERE purl_base = NEW.subject AND purl_base != '' AND corroborated = 0
+			   AND (
+			     NOT (NEW.affected GLOB '[0-9]*')
+			     OR ',' || replace(NEW.affected, ' ', '') || ',' LIKE '%,' || version || ',%'
+			   );
 		END`,
 	// Only once the LAST citation is gone: two sources naming one package is
 	// the normal case, and dropping one must not uncorroborate the sample.
@@ -98,7 +114,11 @@ var liteSightingCorroborationTriggers = []string{
 			UPDATE samples SET corroborated = 1
 			 WHERE corroborated = 0 AND sha256 = NEW.subject;
 			UPDATE samples SET corroborated = 1
-			 WHERE purl_base = NEW.subject AND purl_base != '' AND corroborated = 0;
+			 WHERE purl_base = NEW.subject AND purl_base != '' AND corroborated = 0
+			   AND (
+			     NOT (NEW.affected GLOB '[0-9]*')
+			     OR ',' || replace(NEW.affected, ' ', '') || ',' LIKE '%,' || version || ',%'
+			   );
 		END`,
 }
 
@@ -4047,10 +4067,15 @@ func (db *DB) addSightingsSQLite(ctx context.Context, s []Sighting) (int, error)
 			subs = append(subs, subj)
 		}
 		// Flip the flag for changed subjects, guarded by corroborated = 0.
-		// Two single-column updates (never OR'd) so each hits its own index;
-		// chunked IN lists keep any single statement bounded.
+		// Single-column probes (never OR'd) so each hits its own index; chunked
+		// IN lists keep any single statement bounded.
+		//
+		// The purl_base arms narrow a package claim to the releases it actually
+		// names, matching markCorroboratedByPURL{,Version}SQL and the triggers.
+		// See those for why: a claim listing exact versions says nothing about
+		// the ones it did not list, and corroborated is not decoration.
 		const chunk = 500
-		mark := func(col string, keys []string) error {
+		mark := func(col, extra string, keys []string) error {
 			for start := 0; start < len(keys); start += chunk {
 				end := min(start+chunk, len(keys))
 				batch := keys[start:end]
@@ -4061,26 +4086,36 @@ func (db *DB) addSightingsSQLite(ctx context.Context, s []Sighting) (int, error)
 					args[i] = batch[i]
 				}
 				list := strings.Join(ph, ", ")
-				// purl_base is a partial index (purl_base != ''); include that
-				// predicate so SQLite can use it the same way Postgres does.
-				extra := ""
-				if col == "purl_base" {
-					extra = " AND purl_base != ''"
-				}
-				//nolint:gosec // G202: col is a fixed identifier; list is "?" placeholders; keys are bound args.
+				//nolint:gosec // G202: col and extra are fixed literals; list is "?" placeholders; keys are bound args.
 				if _, err := tx.ExecContext(ctx,
-					`UPDATE samples SET corroborated = 1 WHERE corroborated = 0`+extra+` AND `+
-						col+` IN (`+list+`)`, args...); err != nil {
+					`UPDATE samples SET corroborated = 1 WHERE corroborated = 0 AND `+
+						col+` IN (`+list+`)`+extra, args...); err != nil {
 					return fmt.Errorf("hopper: mark corroborated: %w", err)
 				}
 			}
 			return nil
 		}
+		// purl_base is a partial index (purl_base != ''); include that predicate
+		// so SQLite can use it the same way Postgres does.
+		const (
+			unnarrowable = ` AND purl_base != '' AND EXISTS (
+				SELECT 1 FROM sightings s
+				WHERE s.subject = samples.purl_base AND NOT (s.affected GLOB '[0-9]*')
+			)`
+			namesVersion = ` AND purl_base != '' AND EXISTS (
+				SELECT 1 FROM sightings s
+				WHERE s.subject = samples.purl_base AND s.affected GLOB '[0-9]*'
+				  AND ',' || replace(s.affected, ' ', '') || ',' LIKE '%,' || samples.version || ',%'
+			)`
+		)
 		shas, purls := splitSightingSubjects(subs)
-		if err := mark("sha256", shas); err != nil {
+		if err := mark("sha256", "", shas); err != nil {
 			return 0, err
 		}
-		if err := mark("purl_base", purls); err != nil {
+		if err := mark("purl_base", unnarrowable, purls); err != nil {
+			return 0, err
+		}
+		if err := mark("purl_base", namesVersion, purls); err != nil {
 			return 0, err
 		}
 	}

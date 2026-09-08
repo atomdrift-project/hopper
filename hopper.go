@@ -7101,7 +7101,21 @@ const corroborationBatch = 50_000
 // twenty minutes is indistinguishable from one that has hung.
 const corroborationProgressEvery = 500_000
 
-// ReconcileCorroborated unsets the flag on samples nothing cites any more.
+// ReconcileCorroborated unsets the flag on samples nothing cites any more, or
+// cites only at a version they are not.
+//
+// The second half is what makes this the repair for a real defect rather than
+// tidying. Until 2026-09-08 both marking paths were version-blind: any citation
+// of a package flagged EVERY sample of it, so one OSV advisory naming 49 exact
+// versions of @whalent/agent-core marked 0.3.410 -- which it does not list --
+// as cited. Corroborated is not decoration; it drives the sighted claim tier,
+// promoter's evidence rules and prism's feeds filter, so those rows were false
+// evidence. Running this once after deploying the narrowed marking clears them.
+//
+// A scope that cannot be narrowed still corroborates the package: ” means the
+// source did not say, '*' means every release, and a range names versions SQL
+// cannot enumerate. Only a comma list of exact releases is treated as a
+// statement about particular artifacts.
 //
 // The flag is denormalized and nothing else recomputes it, so it is rebuilt
 // here: after a drop-and-rebuild, once, when the ledger is settled. Running it
@@ -7119,13 +7133,20 @@ const corroborationProgressEvery = 500_000
 func (db *DB) ReconcileCorroborated(ctx context.Context) (cleared int64, err error) {
 	const q = `
 		WITH batch AS (
-			SELECT id, sha256, purl_base FROM samples
+			SELECT id, sha256, purl_base, version FROM samples
 			WHERE corroborated AND id > $1
 			ORDER BY id LIMIT $2
 		), stale AS (
 			SELECT b.id FROM batch b
 			WHERE NOT EXISTS (SELECT 1 FROM sightings s WHERE s.subject = b.sha256)
-			  AND NOT EXISTS (SELECT 1 FROM sightings s WHERE s.subject = b.purl_base)
+			  AND NOT EXISTS (
+				SELECT 1 FROM sightings s
+				WHERE s.subject = b.purl_base
+				  AND (
+					s.affected !~ '^[0-9]'
+					OR b.version = ANY (string_to_array(replace(s.affected, ' ', ''), ','))
+				  )
+			  )
 		), cleared AS (
 			UPDATE samples SET corroborated = false
 			WHERE id IN (SELECT id FROM stale)
@@ -7181,11 +7202,35 @@ func (db *DB) reconcileLiteBatch(ctx context.Context, cursor int64) (last, inBat
 		UPDATE samples SET corroborated = false
 		WHERE corroborated AND id > ? AND id <= ?
 		  AND NOT EXISTS (SELECT 1 FROM sightings s WHERE s.subject = samples.sha256)
-		  AND NOT EXISTS (SELECT 1 FROM sightings s WHERE s.subject = samples.purl_base)`,
+		  AND NOT EXISTS (
+			SELECT 1 FROM sightings s
+			WHERE s.subject = samples.purl_base
+			  AND (
+				NOT (s.affected GLOB '[0-9]*')
+				OR ',' || replace(s.affected, ' ', '') || ',' LIKE '%,' || samples.version || ',%'
+			  )
+		  )`,
 		cursor, last)
 	if err != nil {
 		return 0, 0, 0, err
 	}
 	dropped, _ = res.RowsAffected() //nolint:errcheck // driver reports it or does not
 	return last, inBatch, dropped, nil
+}
+
+// BackfillVersion recovers samples.version from the stored location filename for
+// package rows that carry an identity but no recorded release (see
+// backfillVersionPG). It never overwrites a version already recorded, and it is
+// the prerequisite for reconcile-corroborated: a row with no version cannot be
+// narrowed against an advisory's affected list, so reconciling first would clear
+// real evidence. Postgres-only. dryRun only reports.
+func (db *DB) BackfillVersion(ctx context.Context, dryRun bool) (int64, error) {
+	if db.pool == nil {
+		return 0, nil
+	}
+	n, err := db.backfillVersionPG(ctx, dryRun)
+	if err == nil && !dryRun && n > 0 {
+		db.flushLookups()
+	}
+	return n, err
 }

@@ -149,7 +149,15 @@ BEGIN
 	UPDATE samples SET corroborated = 1
 	 WHERE corroborated = 0 AND sha256 = NEW.subject;
 	UPDATE samples SET corroborated = 1
-	 WHERE purl_base = NEW.subject AND purl_base != '' AND corroborated = 0;
+	-- Narrowed to the releases the claim actually names; see the Postgres
+	-- trigger in schema.sql for why. SQLite has no regex, so "names exact
+	-- releases" is a GLOB, and list membership a LIKE over a comma-delimited
+	-- copy of the scope.
+	 WHERE purl_base = NEW.subject AND purl_base != '' AND corroborated = 0
+	   AND (
+	     NOT (NEW.affected GLOB '[0-9]*')
+	     OR ',' || replace(NEW.affected, ' ', '') || ',' LIKE '%,' || version || ',%'
+	   );
 END;
 
 -- Only once the LAST citation is gone: two sources naming one package is the
@@ -179,7 +187,11 @@ BEGIN
 	UPDATE samples SET corroborated = 1
 	 WHERE corroborated = 0 AND sha256 = NEW.subject;
 	UPDATE samples SET corroborated = 1
-	 WHERE purl_base = NEW.subject AND purl_base != '' AND corroborated = 0;
+	 WHERE purl_base = NEW.subject AND purl_base != '' AND corroborated = 0
+	   AND (
+	     NOT (NEW.affected GLOB '[0-9]*')
+	     OR ',' || replace(NEW.affected, ' ', '') || ',' LIKE '%,' || version || ',%'
+	   );
 END;
 
 CREATE TABLE IF NOT EXISTS workers (

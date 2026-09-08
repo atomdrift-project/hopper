@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -533,7 +534,15 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			END IF;
 			IF TG_OP <> 'DELETE' THEN
 				` + markCorroboratedOneSHASQL + `;
-				` + markCorroboratedOnePURLSQL + `;
+				-- A claim naming exact releases is evidence about those and
+				-- nothing else; anything we cannot narrow stays package-level.
+				-- Branching here rather than ORing keeps each UPDATE a
+				-- single-column index probe (TestMarkCorroboratedSQLShape).
+				IF NEW.affected ~ '^[0-9]' THEN
+					` + markCorroboratedOnePURLVersionSQL + `;
+				ELSE
+					` + markCorroboratedOnePURLSQL + `;
+				END IF;
 			END IF;
 			RETURN NULL;
 		END;
@@ -6155,9 +6164,51 @@ const (
 	markCorroboratedBySHASQL = `
 		UPDATE samples SET corroborated = true
 		WHERE NOT corroborated AND sha256 = ANY($1)`
+	// Both marking statements below narrow a package claim to the versions it
+	// actually names, which is when a claim is evidence about a PARTICULAR
+	// artifact rather than about the package.
+	//
+	// A source that names exact releases has said nothing about the ones it did
+	// not name. Marking every version of the package corroborated turns a real
+	// citation into a false one for every other release, and corroborated is not
+	// decoration: it drives the sighted claim tier, promoter's evidence rules and
+	// prism's feeds filter.
+	//
+	// Found 2026-09-08. OSV advisory MAL-2026-10722 lists 49 exact versions of
+	// @whalent/agent-core, the highest 0.3.298. Version 0.3.410 -- fetched by the
+	// npm firehose, not by any claim -- was flagged as cited by it. The same
+	// shape as the AUR false-corroboration incident.
+	//
+	// A scope we cannot narrow stays package-level, which is correct rather than
+	// lax: '' means the source did not say, '*' means every release, and a range
+	// names versions we cannot enumerate in SQL. Only a comma list of exact
+	// versions is narrowed, because only that is unambiguous.
+	// Split in two rather than ORed, so each stays a single-column index probe.
+	// See TestMarkCorroboratedSQLShape: an OR here is the /api/sightings timeout
+	// of 2026-08-17.
+	//
+	// markCorroboratedByPURLSQL handles claims whose scope cannot be narrowed --
+	// '' (the source did not say), '*' (every release), or a range we cannot
+	// enumerate in SQL. Those stay package-level, which is correct rather than
+	// lax.
 	markCorroboratedByPURLSQL = `
 		UPDATE samples SET corroborated = true
-		WHERE purl_base = ANY($1) AND purl_base <> '' AND NOT corroborated`
+		WHERE purl_base = ANY($1) AND purl_base <> '' AND NOT corroborated
+		  AND EXISTS (
+			SELECT 1 FROM sightings s
+			WHERE s.subject = samples.purl_base AND s.affected !~ '^[0-9]'
+		  )`
+
+	// markCorroboratedByPURLVersionSQL handles the narrowable case: a claim that
+	// names exact releases is evidence about those and about nothing else.
+	markCorroboratedByPURLVersionSQL = `
+		UPDATE samples SET corroborated = true
+		WHERE purl_base = ANY($1) AND purl_base <> '' AND NOT corroborated
+		  AND EXISTS (
+			SELECT 1 FROM sightings s
+			WHERE s.subject = samples.purl_base AND s.affected ~ '^[0-9]'
+			  AND samples.version = ANY (string_to_array(replace(s.affected, ' ', ''), ','))
+		  )`
 
 	markCorroboratedOneSHASQL = `
 		UPDATE samples SET corroborated = true
@@ -6165,6 +6216,10 @@ const (
 	markCorroboratedOnePURLSQL = `
 		UPDATE samples SET corroborated = true
 		WHERE purl_base = NEW.subject AND purl_base <> '' AND NOT corroborated`
+	markCorroboratedOnePURLVersionSQL = `
+		UPDATE samples SET corroborated = true
+		WHERE purl_base = NEW.subject AND purl_base <> '' AND NOT corroborated
+		  AND samples.version = ANY (string_to_array(replace(NEW.affected, ' ', ''), ','))`
 
 	clearCorroboratedOneSHASQL = `
 		UPDATE samples SET corroborated = false
@@ -6296,8 +6351,14 @@ func (db *DB) addSightingsPG(ctx context.Context, s []Sighting) (int, error) {
 				return 0, fmt.Errorf("hopper: mark corroborated: %w", err)
 			}
 		}
-		if len(purls) > 0 {
-			if _, err := tx.Exec(ctx, markCorroboratedByPURLSQL, purls); err != nil {
+		// Two purl_base arms, not one: markCorroboratedByPURLSQL only covers
+		// claims whose scope cannot be narrowed. Without the Version arm an
+		// advisory naming exact releases would corroborate nothing at all.
+		for _, sql := range []string{markCorroboratedByPURLSQL, markCorroboratedByPURLVersionSQL} {
+			if len(purls) == 0 {
+				break
+			}
+			if _, err := tx.Exec(ctx, sql, purls); err != nil {
 				return 0, fmt.Errorf("hopper: mark corroborated: %w", err)
 			}
 		}
@@ -6354,7 +6415,11 @@ func (db *DB) remarkCorroboratedPG(ctx context.Context) (int64, error) {
 		for _, step := range []struct {
 			sql  string
 			args []string
-		}{{markCorroboratedBySHASQL, shas}, {markCorroboratedByPURLSQL, purls}} {
+		}{
+			{markCorroboratedBySHASQL, shas},
+			{markCorroboratedByPURLSQL, purls},
+			{markCorroboratedByPURLVersionSQL, purls},
+		} {
 			if len(step.args) == 0 {
 				continue
 			}
@@ -9443,4 +9508,88 @@ func (db *DB) activeWorkersPG(ctx context.Context, since time.Duration) ([]Worke
 		out = append(out, w)
 	}
 	return out, rows.Err()
+}
+
+// backfillVersionPG recovers samples.version from the stored location filename
+// for package rows that have an identity but no recorded release.
+//
+// Found 2026-09-08 alongside the version-blind corroboration marking. Forager's
+// firehose fetches stored Version: pkg.Version, which is empty for a package
+// pulled by the npm publication stream rather than resolved from a claim, so
+// 1,464 corroborated npm rows carried a purl_base and no version at all. Those
+// rows cannot be narrowed against an advisory's affected list -- they look like
+// a version mismatch to reconcile-corroborated, which would clear real evidence
+// rather than false evidence. Recover the version first, then reconcile.
+//
+// The filename is the authority here because it is what the registry served:
+// @whalent-agent-core-0.3.410.tgz. pkgparse.ParseFilename is the same parser
+// forager now uses for the same fallback, so the two agree.
+//
+// Never overwrites a version already recorded, streams in id-cursor batches the
+// way backfillPURLPG does, and is idempotent: a second run finds nothing. A
+// version-only update fires no trigger and bumps no updated_at -- recording the
+// release a row always was is not a state change.
+func (db *DB) backfillVersionPG(ctx context.Context, dryRun bool) (int64, error) {
+	const batchRows = 20000
+	var updated, cursor int64
+	for {
+		rows, err := db.pool.Query(ctx, `
+			SELECT s.id, (
+				SELECT l.path FROM sample_locations l
+				WHERE l.sha256 = s.sha256 ORDER BY l.id LIMIT 1
+			) FROM samples s
+			WHERE s.id > $1 AND s.version = '' AND s.purl_base <> '' AND s.parent = ''
+			ORDER BY s.id LIMIT $2`, cursor, batchRows)
+		if err != nil {
+			return updated, fmt.Errorf("hopper: backfill version select: %w", err)
+		}
+		var ids []int64
+		var vers []string
+		var seen int
+		var maxID int64
+		for rows.Next() {
+			var id int64
+			var path *string
+			if err := rows.Scan(&id, &path); err != nil {
+				rows.Close()
+				return updated, fmt.Errorf("hopper: backfill version scan: %w", err)
+			}
+			seen++
+			maxID = id
+			if path == nil {
+				continue // no location on file: nothing to parse
+			}
+			if _, v, _ := pkgparse.ParseFilename(filepath.Base(*path)); v != "" {
+				ids = append(ids, id)
+				vers = append(vers, v)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return updated, fmt.Errorf("hopper: backfill version iterate: %w", err)
+		}
+		rows.Close()
+		if seen == 0 {
+			break
+		}
+		if len(ids) > 0 && !dryRun {
+			tag, err := db.pool.Exec(ctx, `
+				UPDATE samples s SET version = v.version
+				FROM unnest($1::bigint[], $2::text[]) AS v(id, version)
+				WHERE s.id = v.id AND s.version = ''`, ids, vers)
+			if err != nil {
+				return updated, fmt.Errorf("hopper: backfill version update: %w", err)
+			}
+			updated += tag.RowsAffected()
+		} else {
+			updated += int64(len(ids))
+		}
+		cursor = maxID
+		slog.InfoContext(ctx, "backfill version batch",
+			"through_id", cursor, "filled_total", updated, "dry_run", dryRun)
+		if seen < batchRows {
+			break
+		}
+	}
+	return updated, nil
 }

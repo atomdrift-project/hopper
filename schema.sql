@@ -253,8 +253,29 @@ BEGIN
 	IF TG_OP <> 'DELETE' THEN
 		UPDATE samples SET corroborated = true
 		 WHERE NOT corroborated AND sha256 = NEW.subject;
-		UPDATE samples SET corroborated = true
-		 WHERE purl_base = NEW.subject AND purl_base <> '' AND NOT corroborated;
+		-- A claim naming exact releases is evidence about THOSE releases and
+		-- about nothing else. Marking every version of the package turns one
+		-- real citation into a false one for every other release, and
+		-- corroborated drives the sighted claim tier, promoter's evidence rules
+		-- and prism's feeds filter.
+		--
+		-- Found 2026-09-08: OSV advisory MAL-2026-10722 lists 49 exact versions
+		-- of @whalent/agent-core, the highest 0.3.298, and version 0.3.410 --
+		-- fetched by the npm firehose, named by no claim -- was flagged as cited
+		-- by it.
+		--
+		-- Anything we cannot narrow stays package-level: '' means the source did
+		-- not say, '*' means every release, and a range names versions SQL
+		-- cannot enumerate. Branching rather than ORing keeps each UPDATE a
+		-- single-column index probe.
+		IF NEW.affected ~ '^[0-9]' THEN
+			UPDATE samples SET corroborated = true
+			 WHERE purl_base = NEW.subject AND purl_base <> '' AND NOT corroborated
+			   AND samples.version = ANY (string_to_array(replace(NEW.affected, ' ', ''), ','));
+		ELSE
+			UPDATE samples SET corroborated = true
+			 WHERE purl_base = NEW.subject AND purl_base <> '' AND NOT corroborated;
+		END IF;
 	END IF;
 	RETURN NULL;
 END;
