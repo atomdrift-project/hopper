@@ -4326,12 +4326,20 @@ type ClaimJob struct {
 	FileType string `json:"file_type"`
 
 	// Tier names the claim tier this job was drawn from ("unanalyzed",
-	// "stale_traits", …). Stamped by the API server's claimJobs, not by the
-	// tier queries, and carried here only so the hand-out age histogram can
-	// separate backlog from deliberate rescans: a stale-traits job is by
-	// definition an old row, and averaged in with fresh work it would make the
-	// backlog look permanently months behind.
-	Tier string `json:"-"`
+	// "stale_traits", "sighted", …). Stamped by the API server's claimJobs, not
+	// by the tier queries. It separates backlog from deliberate rescans in the
+	// hand-out age histogram: a stale-traits job is by definition an old row,
+	// and averaged in with fresh work it would make the backlog look
+	// permanently months behind.
+	//
+	// On the wire since 2026-09-08, because the worker needs it. Hopper spends a
+	// whole priority ladder deciding a sighted sample goes first, and the worker
+	// then re-sorts everything it was handed by shortest-job-first. With the
+	// tier withheld, that discarded the priority one step before it mattered:
+	// a 12.4 MB sighted tarball sorts last under SJF and waited out the 900s
+	// anti-starvation bound instead of starting immediately. Cheap to send, and
+	// a worker that does not understand the field simply ignores it.
+	Tier string `json:"tier,omitempty"`
 
 	SizeBytes int64 `json:"size_bytes"`
 
@@ -7369,4 +7377,78 @@ func (db *DB) ReopenAcquisitions(ctx context.Context, targets []string, onlyUnfi
 	}
 	n, _ := res.RowsAffected() //nolint:errcheck // driver reports it or does not
 	return n, nil
+}
+
+// MarkClaimHandout records that these samples were handed to a worker, once.
+//
+// The moment a worker is given work is the only point at which pickup latency
+// can be observed, and until 2026-09-08 nothing recorded it: claims live in the
+// API server's in-memory tracker, and samples.claimed_at is the live lease,
+// cleared when the result lands. So a completed sample kept no evidence of how
+// long it waited, and the objective ("a worker starts on a sighting within 15
+// seconds") had no measurement at all.
+//
+// COALESCE, so a redispatch after a lost claim does not overwrite the first
+// hand-out with a later one. One statement over the whole batch: this runs on
+// every poll from every worker, so it must not be a statement per job.
+func (db *DB) MarkClaimHandout(ctx context.Context, shas []string) error {
+	if len(shas) == 0 {
+		return nil
+	}
+	if db.pool != nil {
+		if _, err := db.pool.Exec(ctx, `
+			UPDATE samples SET claimed_first_at = now()
+			WHERE sha256 = ANY($1) AND claimed_first_at IS NULL`, shas); err != nil {
+			return fmt.Errorf("hopper: mark claim handout: %w", err)
+		}
+		return nil
+	}
+	ph := make([]string, len(shas))
+	args := make([]any, 0, len(shas)+1)
+	args = append(args, time.Now().UTC())
+	for i := range shas {
+		ph[i] = "?"
+		args = append(args, shas[i])
+	}
+	//nolint:gosec // G202: placeholders only; shas are bound args.
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET claimed_first_at = ? WHERE claimed_first_at IS NULL AND sha256 IN (`+
+			strings.Join(ph, ", ")+`)`, args...); err != nil {
+		return fmt.Errorf("hopper: mark claim handout: %w", err)
+	}
+	return nil
+}
+
+// SightedPickupLag reports the longest a sighted sample currently in flight
+// waited between entering the queue and being handed to a worker.
+//
+// Scoped to the sighted tier's own population, which the partial index
+// idx_samples_pending_sighted already serves and which stays small because it
+// drains (54 rows against a 173k backlog when this was written). That keeps a
+// per-scrape measurement off the samples heap.
+func (db *DB) SightedPickupLag(ctx context.Context) (time.Duration, error) {
+	const pg = `
+		SELECT COALESCE(EXTRACT(epoch FROM max(claimed_first_at - created_at)), 0)
+		FROM samples
+		WHERE corroborated AND cleave_result IS NULL AND skip = '' AND parent = ''
+		  AND claimed_first_at IS NOT NULL`
+	const lite = `
+		SELECT COALESCE(max((julianday(claimed_first_at) - julianday(created_at)) * 86400.0), 0)
+		FROM samples
+		WHERE corroborated AND cleave_result IS NULL AND skip = '' AND parent = ''
+		  AND claimed_first_at IS NOT NULL`
+	var seconds float64
+	var err error
+	if db.pool != nil {
+		err = db.pool.QueryRow(ctx, pg).Scan(&seconds)
+	} else {
+		err = db.lite.QueryRowContext(ctx, lite).Scan(&seconds)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("hopper: sighted pickup lag: %w", err)
+	}
+	if seconds < 0 {
+		seconds = 0
+	}
+	return time.Duration(seconds * float64(time.Second)), nil
 }

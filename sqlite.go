@@ -378,6 +378,14 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 	// External-corroboration flag + ledger (see schema.sql). SQLite mirror of the
 	// PG migration: the boolean is an INTEGER 0/1 column, maintained by
 	// AddSightings, and drives the feed's corroborated-only filter.
+	// See schema.sql: set once when a worker is first handed the sample, so
+	// (claimed_first_at - created_at) measures pickup latency.
+	if pragmaHasColumn(ctx, db.lite, "claimed_first_at") == 0 {
+		if _, err := db.lite.ExecContext(ctx,
+			`ALTER TABLE samples ADD COLUMN claimed_first_at DATETIME`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite samples.claimed_first_at: %w", err)
+		}
+	}
 	if pragmaHasColumn(ctx, db.lite, "corroborated") == 0 {
 		if _, err := db.lite.ExecContext(ctx,
 			`ALTER TABLE samples ADD COLUMN corroborated INTEGER NOT NULL DEFAULT 0`); err != nil {

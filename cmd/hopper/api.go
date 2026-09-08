@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -565,24 +566,31 @@ func (wt *workerTracker) heartbeat(name string, hb *workerHeartbeat) (newError b
 	ws.LastError = hb.lastError
 	ws.LastErrorAt = hb.lastErrorAt
 
-	// Reconcile the claim ledger against what the worker says it holds. A
-	// worker reporting no running analysis and no staged job is holding
-	// nothing, so any claim still recorded against it here belongs to a
-	// process that no longer exists: the worker restarted, or dropped its
-	// batch without ever posting a result. Such claims are worse than inert —
-	// they pin their samples away from every other worker until the lease runs
-	// out (up to maxClaimLease), and they hold an unproven worker at a claim
-	// limit of zero, a deadlock it cannot poll its way out of.
+	// Reconcile the claim ledger against what the worker says it holds. The
+	// worker is the authority: active + queue is its own count of slots running
+	// an analysis plus samples staged behind them, and it caps its own depth at
+	// 1.1x slots. Anything hopper records beyond that belongs to a batch the
+	// worker dropped without posting a result, or to a process that has since
+	// restarted. Such claims are worse than inert — they pin their samples away
+	// from every other worker until the lease runs out (up to maxClaimLease),
+	// and they hold an unproven worker at a claim limit of zero, a deadlock it
+	// cannot poll its way out of.
 	//
-	// active and queue are the worker's own counters for exactly this: slots
-	// running an analysis, and samples staged behind them. Both zero is the
-	// whole condition — a worker with a full prefetch buffer it has not
-	// started yet still reports queue > 0 and is left alone.
-	if hb.active == 0 && hb.queue == 0 && ws.ActiveClaims > 0 {
+	// Trimming to the reported total, not just resetting when it is zero. The
+	// zero case was the only one handled until 2026-09-08, so a PARTIAL drop
+	// never reconciled at all and the ledger drifted permanently high:
+	// nazgul-idle showed 232 claims against 96 slots while the worker's own
+	// depth cap put its true holding near 106. Everything reading ActiveClaims
+	// — the dashboard, claimLimit, any dispatch decision — was reading fiction.
+	//
+	// The grace still applies, and matters more here: a worker that has just
+	// been handed a batch reports it only once it has staged it, so a momentary
+	// overcount is normal and must not drop live claims.
+	if reported := hb.active + hb.queue; ws.ActiveClaims > reported {
 		if ws.HeldNothingSince.IsZero() {
 			ws.HeldNothingSince = ws.LastSeen
 		} else if ws.LastSeen.Sub(ws.HeldNothingSince) >= abandonedClaimGrace {
-			abandoned = wt.resetClaimsLocked(name)
+			abandoned = wt.trimClaimsLocked(name, reported)
 		}
 	} else {
 		ws.HeldNothingSince = time.Time{}
@@ -720,22 +728,40 @@ func (wt *workerTracker) recordResult(name string, isError bool) {
 func (wt *workerTracker) resetClaims(name string) {
 	wt.mu.Lock()
 	defer wt.mu.Unlock()
-	wt.resetClaimsLocked(name)
+	wt.trimClaimsLocked(name, 0)
 }
 
-// resetClaimsLocked is resetClaims with the lock already held. It returns how
-// many claims it dropped, so a caller acting on its own initiative — the
-// heartbeat's abandoned-claim reconciliation — can report what it did.
-func (wt *workerTracker) resetClaimsLocked(name string) int {
-	dropped := 0
+// It returns how many claims it dropped, so a caller acting on its own
+// initiative — the heartbeat's reconciliation — can report what it did.
+// trimClaimsLocked drops this worker's oldest claims until at most keep remain,
+// returning how many it released. keep of 0 releases everything.
+//
+// Oldest first: a claim the worker never mentioned is most likely the one it
+// has held longest without posting a result, and the newest claims are the ones
+// a just-handed batch has not had time to report yet.
+func (wt *workerTracker) trimClaimsLocked(name string, keep int) int {
+	if keep < 0 {
+		keep = 0
+	}
+	owned := make([]string, 0, 16)
 	for sha, c := range wt.claims {
 		if c.worker == name {
-			delete(wt.claims, sha)
-			dropped++
+			owned = append(owned, sha)
 		}
 	}
+	if len(owned) <= keep {
+		return 0
+	}
+	sort.Slice(owned, func(i, j int) bool {
+		return wt.claims[owned[i]].at.Before(wt.claims[owned[j]].at)
+	})
+	dropped := 0
+	for _, sha := range owned[:len(owned)-keep] {
+		delete(wt.claims, sha)
+		dropped++
+	}
 	if ws, ok := wt.workers[name]; ok {
-		ws.ActiveClaims = 0
+		ws.ActiveClaims = keep
 		ws.HeldNothingSince = time.Time{}
 	}
 	return dropped
@@ -2394,6 +2420,19 @@ func (s *apiServer) claimJobs(
 			continue
 		}
 		out = append(out, usable...)
+	}
+	// Record the hand-out once per poll, not once per tier: this runs on every
+	// poll from every worker. A failure here costs a measurement, never a job,
+	// so it is logged and the jobs still go out.
+	if len(out) > 0 {
+		shas := make([]string, len(out))
+		for i := range out {
+			shas[i] = out[i].SHA256
+		}
+		if err := s.db.MarkClaimHandout(ctx, shas); err != nil {
+			slog.Warn("recording claim hand-out failed; pickup latency will under-report",
+				"worker", worker, "jobs", len(shas), "error", err)
+		}
 	}
 	return out, nil
 }

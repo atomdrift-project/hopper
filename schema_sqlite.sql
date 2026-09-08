@@ -57,6 +57,8 @@ CREATE TABLE IF NOT EXISTS samples (
 
 	analyzed_at   DATETIME,
 	first_analyzed_at DATETIME,
+	-- See schema.sql: set once when a worker is first handed this sample.
+	claimed_first_at DATETIME,
 	last_error_at DATETIME,
 	mtime         DATETIME,
 	marker_mtime  DATETIME,

@@ -269,11 +269,16 @@ func TestWorkerTrackerHeartbeatKeepsClaimsWorkerStillHolds(t *testing.T) {
 		name string
 		beat workerHeartbeat
 	}{
-		// Slots busy: an in-progress scan, however long, keeps its claims.
-		{"analysing", workerHeartbeat{active: 1}},
+		// Slots busy: an in-progress scan, however long, keeps its claims. The
+		// worker accounts for the whole batch (active + queue), which is what
+		// makes them real rather than phantom.
+		{"analysing", workerHeartbeat{active: 1, queue: maxClaimCount - 1}},
 		// Nothing running yet, but a full prefetch buffer staged behind the
 		// gate. These claims are real work the worker has not started.
 		{"staged", workerHeartbeat{queue: maxClaimCount}},
+		// Reporting more than hopper recorded is still not a discrepancy to act
+		// on: the ledger is behind, not ahead.
+		{"over-reported", workerHeartbeat{active: maxClaimCount + 5}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			wt, _ := fullyClaimed(t, "w1")
@@ -297,6 +302,44 @@ func TestWorkerTrackerHeartbeatKeepsClaimsWorkerStillHolds(t *testing.T) {
 				t.Fatalf("active claims = %d, want %d", got, maxClaimCount)
 			}
 		})
+	}
+}
+
+// A worker that accounts for only part of what hopper recorded has the rest
+// trimmed, down to what it says it holds.
+//
+// Until 2026-09-08 only the both-zero case reconciled, so a partial drop never
+// did: measured that day, hopper recorded 232 claims against nazgul-idle while
+// the worker's own depth cap (1.1x its 96 slots) put its true holding near 106.
+// Every consumer of ActiveClaims — the dashboard, claimLimit, dispatch
+// decisions — was reading fiction, and the phantom claims pinned their samples
+// away from other workers until the lease expired.
+func TestWorkerTrackerHeartbeatTrimsPartiallyAccountedClaims(t *testing.T) {
+	wt, _ := fullyClaimed(t, "w1")
+
+	// The worker accounts for 4 of its 32 claims. One beat only starts the
+	// clock: a just-handed batch is reported late, and must not be trimmed.
+	held := workerHeartbeat{active: 1, queue: 3}
+	if _, abandoned := wt.heartbeat("w1", &held); abandoned != 0 {
+		t.Fatalf("first partial beat released %d claims, want 0 (grace not elapsed)", abandoned)
+	}
+	if got := wt.activeClaims("w1"); got != maxClaimCount {
+		t.Fatalf("active claims after one beat = %d, want %d", got, maxClaimCount)
+	}
+
+	// Sustained past the grace, the unaccounted claims are released.
+	backdateHeldNothing(t, wt, "w1", 2*abandonedClaimGrace)
+	beat := held
+	_, abandoned := wt.heartbeat("w1", &beat)
+	if want := maxClaimCount - 4; abandoned != want {
+		t.Fatalf("released %d claims, want %d", abandoned, want)
+	}
+	if got := wt.activeClaims("w1"); got != 4 {
+		t.Fatalf("active claims = %d, want 4 (what the worker says it holds)", got)
+	}
+	// And it can claim again, which is the deadlock this prevents.
+	if got := wt.claimLimit("w1"); got == 0 {
+		t.Fatal("claimLimit still 0 after trimming phantom claims")
 	}
 }
 

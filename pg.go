@@ -145,6 +145,7 @@ var cleaveTraitArrayKeys = []string{"traits", "find", "ts"}
 // so building all columns before any index preserves correctness.
 func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequential migration list; splitting reduces clarity
 	return []string{
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS claimed_first_at TIMESTAMPTZ`,
 		`ALTER TABLE sighting_acquisitions ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ`,
 		// Adopt the rows that predate the column. They were written when an
 		// unfinished target was simply retried after its lease, so none of them

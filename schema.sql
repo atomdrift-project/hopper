@@ -82,6 +82,12 @@ CREATE TABLE IF NOT EXISTS samples (
 	updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
 	analyzed_at   TIMESTAMPTZ,
 	first_analyzed_at TIMESTAMPTZ,
+	-- When a worker was first handed this sample. Set once and never
+	-- overwritten, so a redispatch does not erase the original hand-out.
+	-- claimed_at is the live lease and is cleared on completion; this is the
+	-- historical fact, and (claimed_first_at - created_at) is the only measure
+	-- of how long work waits to be picked up.
+	claimed_first_at TIMESTAMPTZ,
 	last_error_at TIMESTAMPTZ,
 	mtime         TIMESTAMPTZ,
 	marker_mtime  TIMESTAMPTZ,

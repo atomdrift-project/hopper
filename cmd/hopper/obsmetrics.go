@@ -34,6 +34,7 @@ type instruments struct {
 	pending, rescan, cleavePending, litmusPending metric.Int64Observable
 	unattemptedAge                                metric.Int64Observable
 	retiredNoOutcome                              metric.Int64Observable
+	sightedPickupLag                              metric.Int64Observable
 	analyzed                                      metric.Int64Observable
 	analysisRate, filesRate                       metric.Float64Observable
 	addedAge, analyzedAge, readyLag               metric.Float64Observable
@@ -330,6 +331,11 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 		// outcome is work the system has permanently given up on and will not
 		// retry, so it has to be counted or the "attempt once, ever" guarantee
 		// hides its own failures. Healthy value is zero.
+		// The objective's own number: how long a sighted sample waited between
+		// entering the queue and a worker being handed it. Distinct from
+		// unattempted_age, which is about acquisition; this is about dispatch.
+		sightedPickupLag: gauge("hopper.sightings.pickup_lag",
+			"Longest wait from queue entry to worker hand-out among sighted samples in flight.", "s"),
 		retiredNoOutcome: gauge("hopper.acquisitions.retired_without_outcome",
 			"Recovery targets claimed but never reporting success or failure; work silently abandoned.", "{target}"),
 
@@ -504,6 +510,12 @@ func (wd *webDashboard) observe(ctx context.Context, observer metric.Observer, i
 		// dashboard it appears on. The grace is well past the slowest recovery
 		// chain (mirrors, Wayback, jsDelivr, unpkg, Software Heritage,
 		// socket.dev), so an in-flight attempt is never counted.
+		if lag, err := db.SightedPickupLag(cctx); err != nil {
+			slog.Warn("sighted pickup lag unavailable this scrape", "error", err)
+		} else {
+			observer.ObserveInt64(in.sightedPickupLag, int64(lag.Seconds()))
+		}
+
 		if n, _, err := db.AcquisitionsRetiredWithoutOutcome(cctx, retiredOutcomeGrace); err != nil {
 			slog.Warn("retired-without-outcome count unavailable; the abandonment alert has no data this scrape", "error", err)
 		} else {
