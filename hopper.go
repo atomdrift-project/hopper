@@ -6291,6 +6291,47 @@ func (db *DB) OldestUnattemptedSighting(ctx context.Context) (time.Duration, boo
 	return time.Since(*oldest), true, nil
 }
 
+// AcquisitionProvider is one service artifacts are fetched from, and how much
+// un-attempted work is waiting for it.
+type AcquisitionProvider struct {
+	// Provider is the registry a package would come from (npm, pypi, cargo), or
+	// for a digest the corpus that holds the bytes (triage, bazaar, virustotal).
+	Provider string
+	Queued   int
+}
+
+// AcquisitionProviders lists the services with un-attempted claims waiting,
+// busiest first.
+//
+// The basis for draining each one separately. A single queue ordered by date
+// gives every turn to whichever provider publishes most often, however much work
+// the others have: measured 2026-09-08, 441,728 npm claims sat behind triage and
+// bazaar digests that were merely more recent, and the next 300 claims at the
+// head held no package coordinate at all. npm's gate would have drained its
+// backlog in five days.
+//
+// The providers do not compete for anything. Each has its own request gate, so
+// npm fetching at 60 packages a minute takes nothing away from a digest corpus
+// fetching at two.
+func (db *DB) AcquisitionProviders(ctx context.Context) ([]AcquisitionProvider, error) {
+	if db.pool != nil {
+		return db.acquisitionProvidersPG(ctx)
+	}
+	return db.acquisitionProvidersSQLite(ctx)
+}
+
+// UnattemptedForProvider returns one provider's un-attempted claims, newest
+// event first. See [DB.UnattemptedSightings] for what "newest" means here.
+func (db *DB) UnattemptedForProvider(ctx context.Context, provider string, limit int) ([]Sighting, error) {
+	if limit <= 0 || provider == "" {
+		return nil, nil
+	}
+	if db.pool != nil {
+		return db.unattemptedForProviderPG(ctx, provider, limit)
+	}
+	return db.unattemptedForProviderSQLite(ctx, provider, limit)
+}
+
 // OldestUnattemptedSightings returns the longest-waiting claims nothing has
 // tried to acquire, oldest first.
 //

@@ -3,6 +3,7 @@ package hopper
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -228,5 +229,69 @@ func TestQueueOrdersByEventDateNotDiscoveryDate(t *testing.T) {
 	}
 	if len(oldest) != 1 || oldest[0].Source != "stale-event" {
 		t.Errorf("oldest-first head = %+v, want last year's attack", oldest)
+	}
+}
+
+// Every provider drains from its own end of the queue.
+//
+// The providers share nothing — each has its own request gate — so npm fetching
+// at 60 packages a minute costs a digest corpus fetching at two precisely
+// nothing. A single date-ordered queue made them wait for each other anyway and
+// handed every turn to whichever publishes most often: measured 2026-09-08,
+// 441,728 npm claims sat behind triage and bazaar digests that were merely more
+// recent, and the next 300 claims at the head held no package coordinate at all.
+func TestQueueDrainsPerProvider(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	// A digest corpus publishing constantly, and npm work that is slightly older
+	// — the exact shape that starved npm.
+	var digests []Sighting
+	for i := range 30 {
+		digests = append(digests, Sighting{
+			Source: "bazaar", Claim: ClaimMalicious,
+			Subject: fmt.Sprintf("%064x", i), PublishedAt: time.Now().Add(-time.Minute),
+		})
+	}
+	if _, err := db.AddSightings(ctx, digests); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AddSightings(ctx, []Sighting{
+		{Source: "stepsecurity", Subject: "pkg:npm/blueai-cli", Affected: "0.7.0",
+			Claim: ClaimMalicious, PublishedAt: time.Now().Add(-2 * time.Hour)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	providers, err := db.AcquisitionProviders(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]int{}
+	for _, p := range providers {
+		byName[p.Provider] = p.Queued
+	}
+	if byName["npm"] != 1 || byName["bazaar"] != 30 {
+		t.Fatalf("provider queues = %v; want npm=1 bazaar=30", byName)
+	}
+
+	// The npm claim is two hours older than every digest, so a shared queue would
+	// put it thirty-first. Its own queue puts it first.
+	got, err := db.UnattemptedForProvider(ctx, "npm", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Subject != "pkg:npm/blueai-cli" {
+		t.Fatalf("npm queue = %+v, want the npm claim regardless of the digest flood", got)
+	}
+	// And a digest read never returns a package coordinate.
+	digestHead, err := db.UnattemptedForProvider(ctx, "bazaar", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range digestHead {
+		if strings.HasPrefix(s.Subject, "pkg:") {
+			t.Errorf("bazaar queue returned a package coordinate: %s", s.Subject)
+		}
 	}
 }

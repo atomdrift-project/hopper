@@ -370,6 +370,24 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_sightings_acquirable_event ` +
 			`ON sightings((COALESCE(published_at, first_seen)) DESC) ` +
 			`WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')`,
+		// Leading on the acquisition provider, so each registry can be drained
+		// from its own end of the queue instead of competing for the head of one
+		// global ordering.
+		//
+		// A single date-ordered queue starves whichever provider happens to
+		// publish less often, however much work it has. Measured 2026-09-08:
+		// 441,728 npm claims were queued behind triage and bazaar digests that
+		// were merely more recent, and npm -- whose gate would drain them in five
+		// days at 60 a minute -- was getting no turn at all. The next 300 claims
+		// at the head were digests without a single package coordinate.
+		//
+		// The expression matches acquisitionProviderSQL; the two must change
+		// together or the read stops being an index walk.
+		`CREATE INDEX IF NOT EXISTS idx_sightings_acquirable_provider ` +
+			`ON sightings(` +
+			`(CASE WHEN subject LIKE 'pkg:%' THEN split_part(split_part(subject, '/', 1), ':', 2) ELSE source END), ` +
+			`(COALESCE(published_at, first_seen)) DESC) ` +
+			`WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')`,
 		`DROP INDEX IF EXISTS idx_sightings_acquirable`,
 		`DROP INDEX IF EXISTS idx_sightings_unattempted`,
 		// Sighted triage has two ordered walks: digest claims and PURL claims. The
@@ -6423,6 +6441,55 @@ func (db *DB) unattemptedSightingsPG(ctx context.Context, limit int, source stri
 		LIMIT $1`, limit, source)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: unattempted sightings: %w", err)
+	}
+	return scanSightingRows(rows)
+}
+
+// acquisitionProviderSQL derives the service an artifact would be fetched FROM,
+// which is what the request gates are keyed on.
+//
+// For a package it is the registry named by the PURL type, whoever reported it:
+// npm serves an npm package whether stepsecurity, lpm or aikido raised the
+// claim. For a digest there is no registry, so it is the corpus that holds the
+// bytes, which is the reporting source.
+//
+// Kept as one string constant because it appears in the index definition and in
+// every query that uses it, and they stop being an index walk the moment they
+// disagree.
+const acquisitionProviderSQL = `CASE WHEN subject LIKE 'pkg:%' ` +
+	`THEN split_part(split_part(subject, '/', 1), ':', 2) ELSE source END`
+
+func (db *DB) acquisitionProvidersPG(ctx context.Context) ([]AcquisitionProvider, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT `+acquisitionProviderSQL+` AS provider, count(*)
+		FROM sightings
+		WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')
+		GROUP BY 1 ORDER BY 2 DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: acquisition providers: %w", err)
+	}
+	defer rows.Close()
+	var out []AcquisitionProvider
+	for rows.Next() {
+		var p AcquisitionProvider
+		if err := rows.Scan(&p.Provider, &p.Queued); err != nil {
+			return nil, fmt.Errorf("hopper: scan acquisition provider: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) unattemptedForProviderPG(ctx context.Context, provider string, limit int) ([]Sighting, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT `+sightingAcquisitionCols+`
+		FROM sightings
+		WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')
+		  AND `+acquisitionProviderSQL+` = $2
+		ORDER BY COALESCE(published_at, first_seen) DESC
+		LIMIT $1`, limit, provider)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: unattempted sightings for provider: %w", err)
 	}
 	return scanSightingRows(rows)
 }

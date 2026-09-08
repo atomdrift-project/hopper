@@ -4185,6 +4185,59 @@ func (db *DB) unattemptedSightingsSQLite(ctx context.Context, limit int, source 
 	return out, rows.Err()
 }
 
+// liteAcquisitionProviderSQL mirrors acquisitionProviderSQL; SQLite has no
+// split_part, so the two halves of the PURL type are cut with substr/instr.
+const liteAcquisitionProviderSQL = `CASE WHEN subject LIKE 'pkg:%' ` +
+	`THEN substr(subject, 5, instr(subject, '/') - 5) ELSE source END`
+
+func (db *DB) acquisitionProvidersSQLite(ctx context.Context) ([]AcquisitionProvider, error) {
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT `+liteAcquisitionProviderSQL+` AS provider, count(*)
+		FROM sightings
+		WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')
+		GROUP BY 1 ORDER BY 2 DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: acquisition providers: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // best-effort cleanup
+	var out []AcquisitionProvider
+	for rows.Next() {
+		var p AcquisitionProvider
+		if err := rows.Scan(&p.Provider, &p.Queued); err != nil {
+			return nil, fmt.Errorf("hopper: scan acquisition provider: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) unattemptedForProviderSQLite(ctx context.Context, provider string, limit int) ([]Sighting, error) {
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT source, subject, url, note, first_seen,
+		       operator, affected, claim, filename, handle, basis, relayer, published_at
+		FROM sightings
+		WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')
+		  AND `+liteAcquisitionProviderSQL+` = ?
+		ORDER BY COALESCE(published_at, first_seen) DESC
+		LIMIT ?`, provider, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: unattempted sightings for provider: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // best-effort cleanup
+	var out []Sighting
+	for rows.Next() {
+		var x Sighting
+		var published sql.NullTime
+		if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen,
+			&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Handle, &x.Basis, &x.Relayer, &published); err != nil {
+			return nil, fmt.Errorf("hopper: scan provider sighting: %w", err)
+		}
+		x.PublishedAt = published.Time
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+
 func (db *DB) oldestUnattemptedSightingsSQLite(ctx context.Context, limit int) ([]Sighting, error) {
 	rows, err := db.lite.QueryContext(ctx, `
 		SELECT source, subject, url, note, first_seen,
