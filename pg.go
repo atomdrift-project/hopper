@@ -69,9 +69,15 @@ func poolSize(app AppName) (maxConns, minConns int32) {
 	// Measured 2026-09-08: `hopper load` sat 45 minutes at "Migrating
 	// database", holding the migration advisory lock, its one connection idle
 	// since `SELECT pg_try_advisory_lock`. Any consumer that holds a connection
-	// and then queries needs two, so two is the floor. tryMigrationLock refuses
-	// a pool that cannot supply it rather than hanging again.
-	return 2, 0
+	// and then queries needs more than one, so one is never right.
+	//
+	// Four, not two: two was measured and still deadlocked, because the index
+	// phase nests one deeper (advisory lock, then the CONCURRENTLY build
+	// connection, then a catalog probe). invalidPGIndex now takes the held
+	// connection so the real depth is two, and the ceiling carries headroom on
+	// top so the next nesting mistake is slow rather than stopped.
+	// tryMigrationLock refuses a pool that cannot supply the depth at all.
+	return 4, 0
 }
 
 func openPG(ctx context.Context, dsn string, app AppName) (*DB, error) {
@@ -2544,7 +2550,7 @@ func (db *DB) dropIndexConcurrently(ctx context.Context, indexName string) error
 
 func (db *DB) createIndexConcurrently(ctx context.Context, ddl, indexName string) error {
 	return db.withUnlockedMigrationConn(ctx, func(conn *pgxpool.Conn) error {
-		invalid, err := db.invalidPGIndex(ctx, indexName)
+		invalid, err := db.invalidPGIndex(ctx, conn, indexName)
 		if err != nil {
 			return err
 		}
@@ -2567,9 +2573,29 @@ func (db *DB) createIndexConcurrently(ctx context.Context, ddl, indexName string
 	})
 }
 
-func (db *DB) invalidPGIndex(ctx context.Context, indexName string) (bool, error) {
+// invalidPGIndexPool is invalidPGIndex for callers that hold no connection.
+// Keep the distinction: reaching for the pool while inside
+// withUnlockedMigrationConn is what deadlocked the migration on 2026-09-08.
+func (db *DB) invalidPGIndexPool(ctx context.Context, indexName string) (bool, error) {
+	conn, err := db.pool.Acquire(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer conn.Release()
+	return db.invalidPGIndex(ctx, conn, indexName)
+}
+
+// invalidPGIndex takes the connection rather than the pool because its only
+// caller is already INSIDE withUnlockedMigrationConn, holding one. Reaching for
+// db.pool here asked for a third simultaneous connection -- the advisory-lock
+// connection, the index-build connection, and this -- which at any smaller
+// ceiling parks the migration forever on the pool semaphore with nothing
+// visible server-side. That is the 2026-09-08 hang, and it survived raising the
+// ceiling from 1 to 2 because the real depth was 3. Depth is the bug; the
+// ceiling only hides it.
+func (db *DB) invalidPGIndex(ctx context.Context, conn *pgxpool.Conn, indexName string) (bool, error) {
 	var invalid bool
-	if err := db.pool.QueryRow(ctx, `
+	if err := conn.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1
 			  FROM pg_class c
@@ -7925,7 +7951,7 @@ func (db *DB) ReindexLitmusLevel(ctx context.Context, force bool) error {
 			_, err := conn.Exec(ctx, reindex)
 			return err
 		}); err != nil {
-			if invalid, ierr := db.invalidPGIndex(ctx, name+"_ccnew"); ierr == nil && invalid {
+			if invalid, ierr := db.invalidPGIndexPool(ctx, name+"_ccnew"); ierr == nil && invalid {
 				slog.ErrorContext(ctx, "rebuild left an invalid index behind; drop it before retrying",
 					"index", name+"_ccnew", "drop", "DROP INDEX CONCURRENTLY "+name+"_ccnew")
 			}

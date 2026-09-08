@@ -52,8 +52,8 @@ func TestOnlyTheServingAPIGetsAPool(t *testing.T) {
 		"hopper-reconcile-corroborated", "hopper-cli", "hopper-migrate", "anything-else",
 	} {
 		maxC, minC := poolSize(app)
-		if maxC != 2 {
-			t.Errorf("%s may open %d connections; the default is two, widened per-DSN when measured", app, maxC)
+		if maxC != 4 {
+			t.Errorf("%s may open %d connections; the default is four, widened per-DSN when measured", app, maxC)
 		}
 		if minC != 0 {
 			t.Errorf("%s reserves %d connections; only the serving API reserves", app, minC)
@@ -75,8 +75,8 @@ func TestEveryPoolCanHoldAConnectionAndStillQuery(t *testing.T) {
 		"hopper", "hopper-load", "forager", "promoter", "prism",
 		"hopper-cli", "hopper-migrate", "anything-else",
 	} {
-		if maxC, _ := poolSize(app); maxC < 2 {
-			t.Errorf("%s pool allows %d connections; migrating holds one and queries on another, so it would deadlock", app, maxC)
+		if maxC, _ := poolSize(app); maxC < 3 {
+			t.Errorf("%s pool allows %d connections; migrating holds one, builds an index on another, and probes the catalog, so it would deadlock", app, maxC)
 		}
 	}
 }
