@@ -52,11 +52,31 @@ func TestOnlyTheServingAPIGetsAPool(t *testing.T) {
 		"hopper-reconcile-corroborated", "hopper-cli", "hopper-migrate", "anything-else",
 	} {
 		maxC, minC := poolSize(app)
-		if maxC != 1 {
-			t.Errorf("%s may open %d connections; the default is one, widened per-DSN when measured", app, maxC)
+		if maxC != 2 {
+			t.Errorf("%s may open %d connections; the default is two, widened per-DSN when measured", app, maxC)
 		}
 		if minC != 0 {
 			t.Errorf("%s reserves %d connections; only the serving API reserves", app, minC)
+		}
+	}
+}
+
+// Two is a floor, not a preference. tryMigrationLock acquires a connection and
+// holds it for the whole migration, so every statement the migration then runs
+// needs a second one from the same pool. At MaxConns=1 that second acquire
+// waits on the pool semaphore forever, and nothing is visible server-side: the
+// held connection is idle and no query is blocked.
+//
+// Measured 2026-09-08: `hopper load` sat 45 minutes at "Migrating database",
+// holding the migration advisory lock, its single connection idle since
+// SELECT pg_try_advisory_lock.
+func TestEveryPoolCanHoldAConnectionAndStillQuery(t *testing.T) {
+	for _, app := range []AppName{
+		"hopper", "hopper-load", "forager", "promoter", "prism",
+		"hopper-cli", "hopper-migrate", "anything-else",
+	} {
+		if maxC, _ := poolSize(app); maxC < 2 {
+			t.Errorf("%s pool allows %d connections; migrating holds one and queries on another, so it would deadlock", app, maxC)
 		}
 	}
 }

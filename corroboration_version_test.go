@@ -137,10 +137,11 @@ func TestLocationFilenameYieldsVersion(t *testing.T) {
 	}
 }
 
-// TestBackfillVersionNeverOverwrites is a shape guard: the recovery must fill a
-// blank version and never rewrite one already recorded, or a re-run would move
+// TestBackfillVersionOverwriteGuards is a shape guard. The recovery may fill a
+// blank version, and may trim a wheel's PEP 427 tags off one it already has.
+// It may not rewrite a version it merely parses differently: that would move
 // rows off the release the registry actually served.
-func TestBackfillVersionNeverOverwrites(t *testing.T) {
+func TestBackfillVersionOverwriteGuards(t *testing.T) {
 	src, err := os.ReadFile("pg.go")
 	if err != nil {
 		t.Fatal(err)
@@ -155,11 +156,61 @@ func TestBackfillVersionNeverOverwrites(t *testing.T) {
 		body = body[:end]
 	}
 	for _, want := range []string{
-		"s.version = '' AND s.purl_base <> ''", // only rows missing a version
-		"WHERE s.id = v.id AND s.version = ''", // and still missing it at write time
+		`fill := have == ""`,                           // arm 1: only a blank version
+		`strings.HasSuffix(base, ".whl")`,              // arm 2: wheels only
+		`strings.HasPrefix(have, want+"-")`,            // and only to trim a suffix off
+		"if !fill && !trim {",                          // everything else keeps what it has
+		"WHERE s.id = v.id AND s.version <> v.version", // no-op writes never land
 	} {
 		if !strings.Contains(body, want) {
-			t.Errorf("backfillVersionPG is missing its no-overwrite guard %q", want)
+			t.Errorf("backfillVersionPG is missing its overwrite guard %q", want)
+		}
+	}
+	if strings.Contains(body, "s.version = v.version\n\t\t\t\tFROM unnest") {
+		t.Error("backfillVersionPG must not rewrite a version it merely parses differently")
+	}
+}
+
+// TestEveryCorroborationPathNarrowsByVersion is the guard that the fix is
+// complete. There are four places that set samples.corroborated from a package
+// claim, and on 2026-09-08 three of them ignored the affected list entirely.
+// Missing any one of them is not a partial fix: the walk path alone would
+// re-flag every row reconcile-corroborated had just cleared.
+func TestEveryCorroborationPathNarrowsByVersion(t *testing.T) {
+	pg, err := os.ReadFile("pg.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema, err := os.ReadFile("schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lite, err := os.ReadFile("sqlite.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hop, err := os.ReadFile("hopper.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Each entry: the statement that marks by package identity, and the
+	// narrowing it must carry.
+	for _, tc := range []struct{ name, src, marker, narrows string }{
+		{"bulk mark (RemarkCorroborated)", string(pg), "markCorroboratedByPURLVersionSQL = `", "string_to_array(replace(s.affected"},
+		{"trigger body", string(schema), "IF NEW.affected ~ '^[0-9]' THEN", "string_to_array(replace(NEW.affected"},
+		{"walk / staged rows", string(pg), "corroborateStagedByPURLPG = `", "string_to_array(replace(g.affected"},
+		{"reconcile clear pass", string(hop), "), stale AS (", "string_to_array(replace(s.affected"},
+		{"sqlite trigger", string(lite), "sightings_corroborate_trg", "replace(NEW.affected, ' ', '')"},
+	} {
+		i := strings.Index(tc.src, tc.marker)
+		if i < 0 {
+			t.Errorf("%s: anchor %q not found; the path moved and this guard went blind", tc.name, tc.marker)
+			continue
+		}
+		window := tc.src[i:min(i+1400, len(tc.src))]
+		if !strings.Contains(window, tc.narrows) {
+			t.Errorf("%s marks by purl_base without narrowing to the versions the claim names", tc.name)
 		}
 	}
 }

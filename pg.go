@@ -56,9 +56,22 @@ func poolSize(app AppName) (maxConns, minConns int32) {
 		return 32, 8
 	}
 	// Everything else -- forager, promoter, prism, one-shot commands, ad-hoc
-	// tools. One connection, and no minimum: a client that is not serving
-	// requests has no business reserving capacity from one that is.
-	return 1, 0
+	// tools. No minimum: a client that is not serving requests has no business
+	// reserving capacity from one that is.
+	//
+	// Two, not one. One is not a smaller budget, it is a broken one:
+	// tryMigrationLock acquires a connection and HOLDS it for the whole
+	// migration, so every statement migratePG then runs needs a second. At
+	// MaxConns=1 that second acquire waits on the pool semaphore forever, and
+	// the wait is invisible from the server -- the held connection sits idle
+	// and nothing appears blocked.
+	//
+	// Measured 2026-09-08: `hopper load` sat 45 minutes at "Migrating
+	// database", holding the migration advisory lock, its one connection idle
+	// since `SELECT pg_try_advisory_lock`. Any consumer that holds a connection
+	// and then queries needs two, so two is the floor. tryMigrationLock refuses
+	// a pool that cannot supply it rather than hanging again.
+	return 2, 0
 }
 
 func openPG(ctx context.Context, dsn string, app AppName) (*DB, error) {
@@ -3268,12 +3281,24 @@ const (
 		FROM _staging st
 		WHERE s.sha256 = st.sha256 AND NOT s.corroborated AND s.cleave_result IS NULL
 		  AND EXISTS (SELECT 1 FROM sightings g WHERE g.subject = s.sha256)`
+	// Narrowed to the releases the claim names, the same rule as
+	// markCorroboratedByPURL{,Version}SQL and the sightings_corroborate trigger.
+	// This is the path a firehose or dataset walk goes through, so leaving it
+	// version-blind would re-flag the exact rows reconcile-corroborated just
+	// cleared -- 9,333 of them on 2026-09-08 -- on the very next walk.
 	corroborateStagedByPURLPG = `
 		UPDATE samples s SET corroborated = true
 		FROM _staging st
 		WHERE s.sha256 = st.sha256 AND NOT s.corroborated AND s.cleave_result IS NULL
 		  AND s.purl_base <> ''
-		  AND EXISTS (SELECT 1 FROM sightings g WHERE g.subject = s.purl_base)`
+		  AND EXISTS (
+			SELECT 1 FROM sightings g
+			WHERE g.subject = s.purl_base
+			  AND (
+				g.affected !~ '^[0-9]'
+				OR s.version = ANY (string_to_array(replace(g.affected, ' ', ''), ','))
+			  )
+		  )`
 )
 
 // insertSampleBatchPG upserts one walk batch. It deliberately runs as TWO
@@ -9525,20 +9550,29 @@ func (db *DB) activeWorkersPG(ctx context.Context, since time.Duration) ([]Worke
 // @whalent-agent-core-0.3.410.tgz. pkgparse.ParseFilename is the same parser
 // forager now uses for the same fallback, so the two agree.
 //
-// Never overwrites a version already recorded, streams in id-cursor batches the
-// way backfillPURLPG does, and is idempotent: a second run finds nothing. A
-// version-only update fires no trigger and bumps no updated_at -- recording the
-// release a row always was is not a state change.
+// It also trims a wheel whose stored version swallowed its PEP 427
+// compatibility tags -- "0.5.0-cp312-cp312-macosx_26_0_arm64" rather than
+// "0.5.0" -- which ParseFilename produced for every wheel until 2026-09-08 and
+// which 84k stored PyPI rows still carry. That is the same defect wearing a
+// different hat: a version an advisory's affected list can never match.
+//
+// Those are the only two rewrites. A version we merely parse differently is
+// left alone, because moving a row off the release the registry served is worse
+// than leaving a stale one. Streams in id-cursor batches the way backfillPURLPG
+// does, and is idempotent: a second run finds nothing. A version-only update
+// fires no trigger and bumps no updated_at -- recording the release a row
+// always was is not a state change.
 func (db *DB) backfillVersionPG(ctx context.Context, dryRun bool) (int64, error) {
 	const batchRows = 20000
 	var updated, cursor int64
 	for {
 		rows, err := db.pool.Query(ctx, `
-			SELECT s.id, (
+			SELECT s.id, s.version, (
 				SELECT l.path FROM sample_locations l
 				WHERE l.sha256 = s.sha256 ORDER BY l.id LIMIT 1
 			) FROM samples s
-			WHERE s.id > $1 AND s.version = '' AND s.purl_base <> '' AND s.parent = ''
+			WHERE s.id > $1 AND s.purl_base <> '' AND s.parent = ''
+			  AND (s.version = '' OR s.version LIKE '%-%')
 			ORDER BY s.id LIMIT $2`, cursor, batchRows)
 		if err != nil {
 			return updated, fmt.Errorf("hopper: backfill version select: %w", err)
@@ -9549,8 +9583,9 @@ func (db *DB) backfillVersionPG(ctx context.Context, dryRun bool) (int64, error)
 		var maxID int64
 		for rows.Next() {
 			var id int64
+			var have string
 			var path *string
-			if err := rows.Scan(&id, &path); err != nil {
+			if err := rows.Scan(&id, &have, &path); err != nil {
 				rows.Close()
 				return updated, fmt.Errorf("hopper: backfill version scan: %w", err)
 			}
@@ -9559,10 +9594,23 @@ func (db *DB) backfillVersionPG(ctx context.Context, dryRun bool) (int64, error)
 			if path == nil {
 				continue // no location on file: nothing to parse
 			}
-			if _, v, _ := pkgparse.ParseFilename(filepath.Base(*path)); v != "" {
-				ids = append(ids, id)
-				vers = append(vers, v)
+			base := filepath.Base(*path)
+			_, want, _ := pkgparse.ParseFilename(base)
+			if want == "" || want == have {
+				continue
 			}
+			// Two arms, and only two. Fill a blank version from the filename;
+			// or trim a wheel whose stored version swallowed its PEP 427
+			// compatibility tags. Anything else keeps what it has: rewriting a
+			// version we merely parse differently would move a row off the
+			// release the registry actually served.
+			fill := have == ""
+			trim := strings.HasSuffix(base, ".whl") && strings.HasPrefix(have, want+"-")
+			if !fill && !trim {
+				continue
+			}
+			ids = append(ids, id)
+			vers = append(vers, want)
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
@@ -9576,7 +9624,7 @@ func (db *DB) backfillVersionPG(ctx context.Context, dryRun bool) (int64, error)
 			tag, err := db.pool.Exec(ctx, `
 				UPDATE samples s SET version = v.version
 				FROM unnest($1::bigint[], $2::text[]) AS v(id, version)
-				WHERE s.id = v.id AND s.version = ''`, ids, vers)
+				WHERE s.id = v.id AND s.version <> v.version`, ids, vers)
 			if err != nil {
 				return updated, fmt.Errorf("hopper: backfill version update: %w", err)
 			}

@@ -2241,6 +2241,16 @@ func (db *DB) tryMigrationLock(ctx context.Context) (release func(), acquired bo
 	if db.pool == nil {
 		return func() {}, true, nil // SQLite: one file, one process, no contention
 	}
+	// This connection is held for the whole migration, so the pool must be able
+	// to supply a second one for the migration's own statements. At MaxConns=1
+	// it cannot, and the failure is a silent forever-wait on the pool semaphore
+	// with nothing blocked server-side -- 45 minutes of `hopper load` reporting
+	// "Migrating database" on 2026-09-08. Refuse up front and name the knob.
+	if max := db.pool.Config().MaxConns; max < 2 {
+		return nil, false, fmt.Errorf(
+			"hopper: migrating needs at least 2 connections but this pool allows %d; "+
+				"add pool_max_conns=8 to the DSN", max)
+	}
 	conn, err := db.pool.Acquire(ctx)
 	if err != nil {
 		return nil, false, fmt.Errorf("hopper: acquire migration lock connection: %w", err)

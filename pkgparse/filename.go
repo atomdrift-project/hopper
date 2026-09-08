@@ -64,6 +64,18 @@ var filenamePatterns = []*regexp.Regexp{
 	// vN, leaving "vN-" attached to the version.
 	regexp.MustCompile(`^(?P<name>.+-v\d+)-(?P<version>v\d[\w.+~-]*)\.zip$`),
 
+	// PEP 427 wheel: {distribution}-{version}(-{build})?-{python}-{abi}-
+	// {platform}.whl. Every field is hyphen-delimited, and neither the
+	// distribution nor the version may contain a hyphen (the spec escapes it to
+	// "_"), so the compatibility tags separate cleanly from the version.
+	//
+	// Before the generic rule, which treats a wheel like a tarball and captures
+	// all three tags as part of the version: "0.5.0-cp312-cp312-macosx_26_0_arm64"
+	// instead of "0.5.0". That reading is not cosmetic -- it is the version a
+	// PyPI advisory's affected list is matched against, so a wheel could never
+	// match a claim naming the release it actually is.
+	regexp.MustCompile(`^(?P<name>[^-]+)-(?P<version>\d[^-]*)(?:-\d[^-]*)?-[^-]+-[^-]+-[^-]+\.whl$`),
+
 	// Non-greedy-name patterns: tarball / wheel / crate / jar / gem /
 	// nupkg / vsix / crx / xpi / AppImage. Non-greedy `(.+?)` captures
 	// the shortest plausible name so the version captures all trailing

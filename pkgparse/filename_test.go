@@ -14,12 +14,16 @@ func TestParseFilename(t *testing.T) {
 		{"react-18.0.0-rc.0.tgz", "react", "18.0.0-rc.0"},
 		// pypi wheels and source tarballs.
 		{"requests-2.31.0.tar.gz", "requests", "2.31.0"},
-		{"flask-3.1.3-py3-none-any.whl", "flask", "3.1.3-py3-none-any"},
-		{"pyyaml-6.0.3-cp310-cp310-macosx_10_13_x86_64.whl", "pyyaml", "6.0.3-cp310-cp310-macosx_10_13_x86_64"},
-		{"numpy-1.26.0-cp312-cp312-manylinux_2_17_x86_64.whl", "numpy", "1.26.0-cp312-cp312-manylinux_2_17_x86_64"},
+		// Wheels carry PEP 427 compatibility tags after the version. These cases
+		// asserted the tags as PART of the version until 2026-09-08; that is the
+		// file's name, not its release, and it made every wheel unmatchable
+		// against an advisory's affected list. See TestWheelFilenameVersion.
+		{"flask-3.1.3-py3-none-any.whl", "flask", "3.1.3"},
+		{"pyyaml-6.0.3-cp310-cp310-macosx_10_13_x86_64.whl", "pyyaml", "6.0.3"},
+		{"numpy-1.26.0-cp312-cp312-manylinux_2_17_x86_64.whl", "numpy", "1.26.0"},
 		// jfrog pypi.
-		{"hermes_px-0.0.4-py3-none-any.whl", "hermes_px", "0.0.4-py3-none-any"},
-		{"telnyx-4.93.0-py3-none-any.whl", "telnyx", "4.93.0-py3-none-any"},
+		{"hermes_px-0.0.4-py3-none-any.whl", "hermes_px", "0.0.4"},
+		{"telnyx-4.93.0-py3-none-any.whl", "telnyx", "4.93.0"},
 		// crates.io (versions can carry build metadata via "+").
 		{"serde-1.0.193.crate", "serde", "1.0.193"},
 		{"alasco-money-1.0.0.crate", "alasco-money", "1.0.0"},
@@ -203,5 +207,30 @@ func TestVersionForName(t *testing.T) {
 				t.Errorf("VersionForName(%q, %q) = %q, want %q", tt.filename, tt.name, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestWheelFilenameVersion covers PEP 427's compatibility tags. Before the
+// dedicated wheel rule the generic tarball pattern swallowed the python, ABI and
+// platform tags into the version, so 84k stored PyPI versions read like
+// "0.5.0-cp312-cp312-macosx_26_0_arm64" and could never match an advisory's
+// affected list.
+func TestWheelFilenameVersion(t *testing.T) {
+	for _, tc := range []struct{ file, name, version string }{
+		{"pathview-0.14.2-py3-none-any.whl", "pathview", "0.14.2"},
+		{"ranbval_sdk-0.5.0-cp312-cp312-macosx_26_0_arm64.whl", "ranbval_sdk", "0.5.0"},
+		{"psevencore-2026.5.20-py2.py3-none-manylinux2014_x86_64.whl", "psevencore", "2026.5.20"},
+		// optional build tag between version and the python tag
+		{"foo-1.0-1-py3-none-any.whl", "foo", "1.0"},
+		// local version identifier survives; it may not contain a hyphen
+		{"torch-2.1.0+cu118-cp310-cp310-linux_x86_64.whl", "torch", "2.1.0+cu118"},
+		// sdists are unaffected by the new rule
+		{"requests-2.31.0.tar.gz", "requests", "2.31.0"},
+	} {
+		name, version, _ := ParseFilename(tc.file)
+		if name != tc.name || version != tc.version {
+			t.Errorf("ParseFilename(%q) = (%q, %q), want (%q, %q)",
+				tc.file, name, version, tc.name, tc.version)
+		}
 	}
 }
