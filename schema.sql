@@ -328,10 +328,12 @@ CREATE TABLE IF NOT EXISTS sighting_acquisitions (
 CREATE INDEX IF NOT EXISTS idx_sighting_acquisitions_due
 	ON sighting_acquisitions(next_attempt) WHERE NOT acquired;
 
--- Claimed but never finished, oldest first. Tiny: rows leave it the moment an
--- outcome lands, so in a healthy system it is empty.
-CREATE INDEX IF NOT EXISTS idx_sighting_acquisitions_unfinished
-	ON sighting_acquisitions(last_attempt) WHERE finished_at IS NULL;
+-- The partial index on finished_at lives in pgRuntimeMigrations, NOT here.
+-- This file is applied before the runtime migrations, and CREATE TABLE IF NOT
+-- EXISTS is a no-op on a database that already has the table -- so an index
+-- naming a column added by a later migration fails on every existing cluster.
+-- That crash-looped the production loader on 2026-09-08.
+
 
 CREATE TABLE IF NOT EXISTS workers (
 	name      TEXT PRIMARY KEY,

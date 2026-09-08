@@ -2,6 +2,8 @@ package hopper
 
 import (
 	"context"
+	"database/sql"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -189,5 +191,61 @@ func TestSightingBackfillModeSurvivesProducerBatches(t *testing.T) {
 		if len(rows[subject]) != 1 || !rows[subject][0].FirstSeen.Equal(published) {
 			t.Fatalf("%s first_seen = %+v, want %v", subject, rows[subject], published)
 		}
+	}
+}
+
+// Migrating a database whose sighting_acquisitions table predates finished_at
+// must succeed. schema.sql is applied BEFORE the runtime migrations and its
+// CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so any statement
+// there naming a column a later migration adds fails on every cluster that
+// already exists -- while passing every test that starts from an empty file.
+//
+// That shipped on 2026-09-08 and crash-looped the production loader every 18
+// seconds with `column "finished_at" does not exist (SQLSTATE 42703)`.
+func TestMigrateOverPreFinishedAtSchema(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "old.db")
+
+	// Build the table in its pre-finished_at shape, then migrate onto it.
+	old, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.ExecContext(ctx, `
+		CREATE TABLE sighting_acquisitions (
+			target       TEXT PRIMARY KEY,
+			attempts     INTEGER NOT NULL DEFAULT 0,
+			acquired     INTEGER NOT NULL DEFAULT 0,
+			last_attempt DATETIME,
+			next_attempt DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+			last_error   TEXT NOT NULL DEFAULT ''
+		)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.ExecContext(ctx,
+		`INSERT INTO sighting_acquisitions (target, attempts, acquired, last_attempt)
+		 VALUES ('pkg:npm/legacy@1.0.0', 1, 0, ?)`, time.Now().UTC().Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(ctx, path, "hopper-test")
+	if err != nil {
+		t.Fatalf("open pre-finished_at database: %v", err)
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("migrating a database that predates finished_at: %v", err)
+	}
+
+	// The adoption must have run, so the legacy row is not reported abandoned.
+	n, _, err := db.AcquisitionsRetiredWithoutOutcome(ctx, 0)
+	if err != nil {
+		t.Fatalf("AcquisitionsRetiredWithoutOutcome: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("rows predating finished_at reported as abandoned = %d, want 0", n)
 	}
 }

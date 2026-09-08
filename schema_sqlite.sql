@@ -141,8 +141,9 @@ CREATE TABLE IF NOT EXISTS sighting_acquisitions (
 CREATE INDEX IF NOT EXISTS idx_sighting_acquisitions_due
 	ON sighting_acquisitions(next_attempt) WHERE acquired = 0;
 
-CREATE INDEX IF NOT EXISTS idx_sighting_acquisitions_unfinished
-	ON sighting_acquisitions(last_attempt) WHERE finished_at IS NULL;
+-- The finished_at index is created in migrateSQLite, after the ADD COLUMN, for
+-- the same reason schema.sql does not carry it: this file runs first, and on an
+-- existing database the CREATE TABLE above is a no-op.
 
 -- SQLite mirror of schema.sql's sightings_corroborate triggers: no operation on
 -- the ledger can leave samples.corroborated behind. SQLite has no TG_OP, so the
