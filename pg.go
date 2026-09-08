@@ -172,6 +172,15 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// IS NULL) shrinks monotonically. The derive trigger fills it on
 		// every write; backfillTopTraitsPG heals pre-trigger rows.
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS top_traits TEXT`,
+		// trait_graph: JSON []TraitNode — the strongest traits plus the
+		// dependency edges between them, capped at traitGraphLimit. It exists
+		// so prism's feed can draw a sample's malecule from the same data the
+		// detail page uses; the alternative, selecting cleave_result in the
+		// feed projection, detoasts a large JSONB per row and is exactly what
+		// the slim projection was introduced to avoid. Nullable so ADD COLUMN
+		// stays metadata-only on a large table, and so the backfill gate
+		// (trait_graph IS NULL) shrinks monotonically.
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS trait_graph TEXT`,
 		// Drains itself as the top_traits backfill completes, keeping each
 		// batch's gating SELECT off the heap (same pattern as elements).
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS litmus_result JSONB`,
@@ -1635,6 +1644,27 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 						LIMIT 3
 					) AS q), '');
 			END IF;
+			-- trait_graph mirrors encodeTraitGraph: crit >= 2, crit desc then
+			-- emitted order, capped, with uses recorded by trait id so the cap
+			-- cannot leave an edge pointing at the wrong trait. Edges to
+			-- traits the cap dropped are pruned by the reader; keeping them
+			-- here would mean a second pass over the array for no gain.
+			NEW.trait_graph := COALESCE((
+				SELECT jsonb_agg(jsonb_strip_nulls(jsonb_build_object('id', q.id, 'c', q.crit, 'u', q.uses)))::text
+				FROM (
+					SELECT COALESCE(t->>'id', t->>'i') AS id,
+						   (COALESCE(t->>'crit', t->>'l'))::int AS crit,
+						   (SELECT jsonb_agg(u.id) FROM (
+								SELECT COALESCE(finds->(e::int)->>'id', finds->(e::int)->>'i') AS id
+								FROM jsonb_array_elements_text(COALESCE(t->'uses', '[]'::jsonb)) AS e
+							) AS u WHERE u.id IS NOT NULL) AS uses
+					FROM jsonb_array_elements(finds) WITH ORDINALITY AS f(t, ord)
+					WHERE COALESCE(t->>'crit', t->>'l') IS NOT NULL
+						AND (COALESCE(t->>'crit', t->>'l'))::int >= 2
+						AND COALESCE(t->>'id', t->>'i') IS NOT NULL
+					ORDER BY (COALESCE(t->>'crit', t->>'l'))::int DESC, ord
+					LIMIT 48
+				) AS q), '');
 			RETURN NEW;
 		END;
 		$$`,
@@ -1668,29 +1698,27 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// samples, so redeploys that change only the body stay lock-free — including
 		// a changed CriticalLevel, which just re-runs this and re-heals via Pass 1d.
 		// The litmus_class formula mirrors feedClassExpr / workflowSamplesPG exactly.
-		fmt.Sprintf(`CREATE OR REPLACE FUNCTION samples_derive_litmus_score() RETURNS trigger
+		`CREATE OR REPLACE FUNCTION samples_derive_litmus_score() RETURNS trigger
 		LANGUAGE plpgsql AS $$
 		BEGIN
 			NEW.litmus_score := COALESCE((NEW.litmus_result->>'prob')::double precision, 0);
 			-- litmus_result is normally the extracted ml object (flat lvl), but
 			-- archived envelopes can retain the outer {ml:{...}} wrapper. Keep
 			-- both spellings here while preserving the legacy v6/v7 l key.
+			--
+			-- THIS IS THE ONLY ENVELOPE PARSE. litmus_class below is derived from
+			-- the level this line produces, not from a second reading of the JSON:
+			-- when the class read the flat keys alone it stored hostile for every
+			-- nested envelope, whose level this line was meanwhile getting right
+			-- (26,851 rows in the 180d window, 23,786 of them at lvl = -1).
+			-- Assignment order is load-bearing; keep lvl first.
 			NEW.lvl := NULLIF(COALESCE(NEW.litmus_result->'ml'->>'lvl',
 											NEW.litmus_result->>'lvl',
 											NEW.litmus_result->>'l'), '')::integer;
-			NEW.litmus_class := COALESCE(
-				(NEW.litmus_result->>'class')::smallint,
-				CASE
-					WHEN NEW.litmus_result IS NULL THEN 0
-					WHEN COALESCE(NEW.litmus_result->>'lvl', NEW.litmus_result->>'l') IS NULL THEN 2
-					WHEN COALESCE(NEW.litmus_result->>'lvl', NEW.litmus_result->>'l')::int < 0 THEN 0
-					WHEN COALESCE(NEW.litmus_result->>'lvl', NEW.litmus_result->>'l')::int <= %d THEN 2
-					WHEN COALESCE(NEW.litmus_result->>'lvl', NEW.litmus_result->>'l')::int <= %d THEN 1
-					ELSE 0
-				END);
+			NEW.litmus_class := ` + litmusClassSQL("NEW.litmus_result", "NEW.lvl", CriticalLevel) + `;
 			RETURN NEW;
 		END;
-		$$`, CriticalLevel, SuspiciousCeiling),
+		$$`,
 		`CREATE OR REPLACE TRIGGER samples_derive_litmus_score_trg
 			BEFORE INSERT OR UPDATE OF litmus_result ON samples
 			FOR EACH ROW EXECUTE FUNCTION samples_derive_litmus_score()`,
@@ -2629,7 +2657,8 @@ const pgSampleCols = `id, sha256, source, feed, ecosystem, filename, file_type,
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime, traits_version,
 	url, domain, package, version, purl_base,
-	COALESCE(top_traits, '') AS top_traits`
+	COALESCE(top_traits, '') AS top_traits,
+	COALESCE(trait_graph, '') AS trait_graph`
 
 // pgSampleColsLight excludes all result blobs to avoid loading potentially
 // large JSON when only metadata is needed (e.g. claim queries).
@@ -2638,7 +2667,8 @@ const pgSampleColsLight = `id, sha256, source, feed, ecosystem, filename, file_t
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime, traits_version,
 	url, domain, package, version, purl_base,
-	COALESCE(top_traits, '') AS top_traits`
+	COALESCE(top_traits, '') AS top_traits,
+	COALESCE(trait_graph, '') AS trait_graph`
 
 // pgSampleColsFeed is pgSampleCols with cleave_result — the one JSONB blob the
 // feed never renders (the archive member tree, up to megabytes) — replaced by a
@@ -2656,7 +2686,8 @@ const pgSampleColsFeed = `id, sha256, source, feed, ecosystem, filename, file_ty
 	path, status, note, canonical_sha256, parent, skip, formula, elements, score, max_crit, suspicious_count,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime, traits_version,
 	url, domain, package, version, purl_base,
-	COALESCE(top_traits, '') AS top_traits`
+	COALESCE(top_traits, '') AS top_traits,
+	COALESCE(trait_graph, '') AS trait_graph`
 
 // pgSampleColsRegistryExtra appends the registry-record scalars prism renders —
 // the marketplace display title, short description (capped here so an
@@ -2682,6 +2713,7 @@ func pgSampleDest(s *Sample) []any {
 		&s.TraitsVersion,
 		&s.URL, &s.Domain, &s.Package, &s.Version, &s.PURLBase,
 		&s.TopTraits,
+		&s.TraitGraph,
 	}
 }
 
@@ -2696,6 +2728,7 @@ func pgSampleDestLight(s *Sample) []any {
 		&s.TraitsVersion,
 		&s.URL, &s.Domain, &s.Package, &s.Version, &s.PURLBase,
 		&s.TopTraits,
+		&s.TraitGraph,
 	}
 }
 
@@ -2823,29 +2856,17 @@ func (db *DB) workflowOldestPendingPG(ctx context.Context, limit int) ([]Workflo
 }
 
 func (db *DB) workflowSamplesPG(ctx context.Context, where string, limit int) ([]WorkflowSample, error) {
-	rows, err := db.pool.Query(ctx, fmt.Sprintf(`
+	rows, err := db.pool.Query(ctx, `
 		SELECT sha256, source, feed, ecosystem, filename, path,
 			created_at, updated_at, analyzed_at, COALESCE(first_analyzed_at, analyzed_at),
 			cleave_result IS NOT NULL,
 			litmus_result IS NOT NULL,
-			-- Criticality (0=benign, 1=suspicious, 2=hostile): legacy records
-			-- (v4/v5) carried class directly; v6/v7 use lvl/l (the strictest
-			-- grid level at which the file fires, or -1 for never-fires). Try
-			-- class first; otherwise derive from the level using CriticalLevel %d as
-			-- the hostile/suspicious cutoff (null is manual-mode hostile,
-			-- treated as hostile fail-safe).
-			COALESCE(
-				(litmus_result->>'class')::int,
-				CASE
-					WHEN litmus_result IS NULL THEN 0
-					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l') IS NULL THEN 2
-					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int < 0 THEN 0
-					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= %d THEN 2
-					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= %d THEN 1
-					ELSE 0
-				END
-			)
-		FROM samples `+where, CriticalLevel, CriticalLevel, SuspiciousCeiling), limit)
+			-- Criticality (0=benign, 1=suspicious, 2=hostile, null=unstated):
+			-- legacy records (v4/v5) carried class directly; everything since
+			-- states a level, which the derive trigger has already parsed into
+			-- samples.lvl. See litmusClassSQL.
+			`+litmusClassSQL("litmus_result", "lvl", CriticalLevel)+`
+		FROM samples `+where, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: workflow samples: %w", err)
 	}
@@ -2858,9 +2879,17 @@ func scanWorkflowSamplesPG(rows pgx.Rows, limit int) ([]WorkflowSample, error) {
 	for rows.Next() {
 		var s WorkflowSample
 		var analyzed, firstAnalyzed sql.NullTime
+		// Criticality is NULL for an envelope that states no verdict this
+		// package can read; it surfaces as ClassUnknown rather than as the
+		// benign zero value, which is a claim the row never made.
+		var criticality sql.NullInt32
 		if err := rows.Scan(&s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename, &s.Path,
-			&s.CreatedAt, &s.UpdatedAt, &analyzed, &firstAnalyzed, &s.HasCleave, &s.HasLitmus, &s.Criticality); err != nil {
+			&s.CreatedAt, &s.UpdatedAt, &analyzed, &firstAnalyzed, &s.HasCleave, &s.HasLitmus, &criticality); err != nil {
 			return nil, fmt.Errorf("hopper: scan workflow sample: %w", err)
+		}
+		s.Criticality = ClassUnknown
+		if criticality.Valid {
+			s.Criticality = int(criticality.Int32)
 		}
 		if analyzed.Valid {
 			s.AnalyzedAt = &analyzed.Time
@@ -7055,6 +7084,16 @@ func (db *DB) backfillPG(ctx context.Context) (BackfillStats, error) {
 	stats.Updated += tt
 	db.reportBackfill(stats.Updated, stats.Scanned)
 
+	// Pass 1f: trait_graph, the column that lets a feed row draw the same
+	// malecule the detail page draws. Self-draining like Pass 1e; a row whose
+	// max_crit is not yet healed costs an extra sweep, never a wrong graph.
+	tg, err := db.backfillTraitGraphPG(ctx, backfillBatch)
+	if err != nil {
+		return stats, err
+	}
+	stats.Updated += tg
+	db.reportBackfill(stats.Updated, stats.Scanned)
+
 	// Pass 1: elements / max_crit / suspicious_count for rows whose cleave
 	// columns predate the derive trigger. Candidate rows have cleave_result but
 	// elements wasn't derived yet AND the JSON would actually produce a
@@ -7581,17 +7620,6 @@ func (db *DB) canonicalizeSightingSubjectsPG(ctx context.Context, dryRun bool) (
 	return rewritten, nil
 }
 
-// backfillLitmusClassPG heals litmus_class for litmus-bearing rows analyzed
-// before it became a trigger-fed column (the column is nullable, so those rows
-// are NULL until healed). The samples_derive_litmus_score trigger fills it on
-// every write from here on; this drains the pre-trigger backlog in batches of
-// limit. The IS NULL gate shrinks monotonically — every UPDATE sets a non-null
-// class, so a healed row never re-enters — so unlike the litmus_score pass it
-// never re-scans the (large) already-correct set. CriticalLevel is the pinned
-// cutoff, matching the trigger and feedClassExpr's default-cutoff path; the WHERE
-// guarantees litmus_result IS NOT NULL, so the trigger's null branch is omitted.
-// No updated_at bump: healing a derived column must not reshuffle update queues.
-
 // ReplicationLag reports how far behind this instance is. `known` is false
 // when it is not a subscriber, or cannot see the answer.
 //
@@ -7696,24 +7724,97 @@ func (db *DB) backfillTopTraitsPG(ctx context.Context, limit int) (int64, error)
 	}
 }
 
-func (db *DB) backfillLitmusClassPG(ctx context.Context, limit int) (int64, error) {
+// backfillTraitGraphPG heals trait_graph for rows written before the derive
+// trigger learned the column. Two sweeps, like top_traits: a row with
+// max_crit < 2 can hold no graph entry, so it is set from that scalar without
+// touching cleave_result, and only the rest pay the detoast. The extraction
+// mirrors the trigger's (and encodeTraitGraph) — crit >= 2, crit desc then
+// emitted order, capped, edges by id — keep the three in sync. Does not bump
+// updated_at: healing a derived column is not a real change.
+func (db *DB) backfillTraitGraphPG(ctx context.Context, limit int) (int64, error) {
 	var total int64
 	for {
-		tag, err := db.pool.Exec(ctx, fmt.Sprintf(`
-			UPDATE samples SET litmus_class = COALESCE(
-				(litmus_result->>'class')::smallint,
-				CASE
-					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l') IS NULL THEN 2
-					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int < 0 THEN 0
-					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= %d THEN 2
-					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= %d THEN 1
-					ELSE 0
-				END)
+		tag, err := db.pool.Exec(ctx, `
+			UPDATE samples SET trait_graph = ''
 			WHERE sha256 IN (
 				SELECT sha256 FROM samples
-				WHERE litmus_result IS NOT NULL AND litmus_class IS NULL
+				WHERE trait_graph IS NULL AND cleave_result IS NOT NULL
+					AND max_crit < 2
 				LIMIT $1
-			)`, CriticalLevel, SuspiciousCeiling), limit)
+			)`, limit)
+		if err != nil {
+			return total, fmt.Errorf("hopper: backfill trait_graph (benign): %w", err)
+		}
+		n := tag.RowsAffected()
+		total += n
+		if n < int64(limit) {
+			break
+		}
+		slog.Info("backfill trait_graph benign batch", "batch", n, "total", total)
+	}
+	for {
+		tag, err := db.pool.Exec(ctx, `
+			UPDATE samples SET trait_graph = COALESCE((
+				SELECT jsonb_agg(jsonb_strip_nulls(jsonb_build_object('id', q.id, 'c', q.crit, 'u', q.uses)))::text
+				FROM (
+					SELECT COALESCE(t->>'id', t->>'i') AS id,
+						   (COALESCE(t->>'crit', t->>'l'))::int AS crit,
+						   (SELECT jsonb_agg(u.id) FROM (
+								SELECT COALESCE(finds.arr->(e::int)->>'id', finds.arr->(e::int)->>'i') AS id
+								FROM jsonb_array_elements_text(COALESCE(t->'uses', '[]'::jsonb)) AS e
+							) AS u WHERE u.id IS NOT NULL) AS uses
+					FROM jsonb_array_elements(finds.arr) WITH ORDINALITY AS f(t, ord)
+					WHERE COALESCE(t->>'crit', t->>'l') IS NOT NULL
+						AND (COALESCE(t->>'crit', t->>'l'))::int >= 2
+						AND COALESCE(t->>'id', t->>'i') IS NOT NULL
+					ORDER BY (COALESCE(t->>'crit', t->>'l'))::int DESC, ord
+					LIMIT 48
+				) AS q), '')
+			FROM LATERAL (
+				SELECT COALESCE(samples.cleave_result->'files'->0->'traits',
+								samples.cleave_result->'files'->0->'find',
+								samples.cleave_result->'fs'->0->'ts', '[]'::jsonb) AS arr
+			) AS finds
+			WHERE samples.sha256 IN (
+				SELECT sha256 FROM samples
+				WHERE trait_graph IS NULL AND cleave_result IS NOT NULL
+					AND max_crit >= 2
+				LIMIT $1
+			)`, limit)
+		if err != nil {
+			return total, fmt.Errorf("hopper: backfill trait_graph: %w", err)
+		}
+		n := tag.RowsAffected()
+		total += n
+		if n < int64(limit) {
+			return total, nil
+		}
+		slog.Info("backfill trait_graph batch", "batch", n, "total", total)
+	}
+}
+
+// backfillLitmusClassPG heals litmus_class for litmus-bearing rows the derive
+// trigger never saw.
+//
+// The gate is a value comparison, NOT `litmus_class IS NULL`. NULL became a
+// legitimate derived value when the ladder stopped guessing hostile for an
+// envelope that states no verdict (see litmusClassSQL and [ClassUnknown]), and
+// a NULL gate over a NULL result is a pass that never drains: the UPDATE writes
+// NULL, the row still matches, the loop runs again. Comparing against the
+// derived value ends when there is nothing left to change, which is the
+// condition the pass actually means.
+func (db *DB) backfillLitmusClassPG(ctx context.Context, limit int) (int64, error) {
+	derived := litmusClassSQL("litmus_result", "lvl", CriticalLevel)
+	var total int64
+	for {
+		tag, err := db.pool.Exec(ctx, `
+			UPDATE samples SET litmus_class = `+derived+`
+			WHERE sha256 IN (
+				SELECT sha256 FROM samples
+				WHERE litmus_result IS NOT NULL
+				  AND litmus_class IS DISTINCT FROM `+derived+`
+				LIMIT $1
+			)`, limit)
 		if err != nil {
 			return total, fmt.Errorf("hopper: backfill litmus_class: %w", err)
 		}
@@ -7843,6 +7944,10 @@ func (db *DB) BackfillLitmusLevel(ctx context.Context, batchSize int, targetDura
 				WHERE id > $1 AND litmus_result IS NOT NULL
 				ORDER BY id
 				LIMIT $2
+			-- lvl only. litmus_class is derived FROM lvl, so a pass that moved
+			-- one without the other would recreate the skew this exists to
+			-- remove; backfillPG's Pass 1d reconciles the class against the
+			-- level on every run and heals whatever this leaves behind.
 			), updated AS (
 				UPDATE samples s
 				SET lvl = NULLIF(COALESCE(
@@ -9124,6 +9229,60 @@ func (db *DB) updateEcosystemsPG(ctx context.Context, mapping map[string]string)
 		total += tag.RowsAffected()
 	}
 	return total, nil
+}
+
+func (db *DB) fileTypesMissingEcosystemPG(ctx context.Context) (map[string]int, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT file_type, COUNT(*) FROM samples
+		WHERE ecosystem = '' AND file_type <> ''
+		GROUP BY file_type
+		ORDER BY file_type`)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: file types missing ecosystem: %w", err)
+	}
+	defer rows.Close()
+	return scanPGCounts(rows)
+}
+
+func (db *DB) setEcosystemFromFileTypePG(ctx context.Context, mapping map[string]string) (int64, error) {
+	// One CASE over file_type, filtered to the mapped types via an array
+	// param so idx_samples_file_type can drive the scan instead of reading
+	// the table. Same shape as updateEcosystemsPG.
+	keys := sortedKeys(mapping)
+	var caseExpr strings.Builder
+	args := make([]any, 0, len(keys)*2+1)
+	caseExpr.WriteString("CASE file_type")
+	for _, k := range keys {
+		fmt.Fprintf(&caseExpr, " WHEN $%d THEN $%d", len(args)+1, len(args)+2)
+		args = append(args, k, mapping[k])
+	}
+	caseExpr.WriteString(" END")
+	args = append(args, keys)
+	filter := fmt.Sprintf("$%d::text[]", len(args))
+
+	// #nosec G201 -- the CASE is built from placeholders only; every value is a bound param.
+	tag, err := db.pool.Exec(ctx, "UPDATE samples SET ecosystem = "+caseExpr.String()+
+		" WHERE ecosystem = '' AND file_type = ANY("+filter+")", args...)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: set samples ecosystem from file_type: %w", err)
+	}
+	total := tag.RowsAffected()
+
+	// sample_locations has no file_type of its own, so it takes the answer
+	// from the sample row just written — scoped to the same file types, so
+	// this can never reach a location the command was not asked about. Only
+	// the type list is bound here; the CASE (and its args) belong to the
+	// statement above.
+	tag, err = db.pool.Exec(ctx, `
+		UPDATE sample_locations sl SET ecosystem = s.ecosystem
+		  FROM samples s
+		 WHERE s.sha256 = sl.sha256
+		   AND sl.ecosystem = '' AND s.ecosystem <> ''
+		   AND s.file_type = ANY($1::text[])`, keys)
+	if err != nil {
+		return total, fmt.Errorf("hopper: set sample_locations ecosystem from file_type: %w", err)
+	}
+	return total + tag.RowsAffected(), nil
 }
 
 // feedDomainsSQL is the domain twin of feedEcosystemsSQL: a loose index scan

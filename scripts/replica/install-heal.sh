@@ -126,8 +126,8 @@ Description=run hopper replica self-heal every ${INTERVAL_MIN}min
 # OnCalendar, NOT OnUnitActiveSec. OnUnitActiveSec re-arms off the SERVICE's
 # last activation, so if the service never activates after a boot the timer
 # elapses once and goes permanently dead: no next elapse, no healing, no
-# alerting, and nothing that says so except "NEXT: -" in `systemctl
-# list-timers`. That is exactly what happened on galadriel across the
+# alerting, and nothing that says so except "NEXT: -" in systemctl
+# list-timers. That is exactly what happened on galadriel across the
 # 2026-09-03 21:45 reboot — both this timer and the textfile one went dead and
 # the replica ran unmonitored for 11.5h while lag grew to 224 GB. A calendar
 # schedule re-arms unconditionally, whether or not the previous run started,
@@ -146,7 +146,7 @@ EOF
     printf '%s\n' "$tmr_body" | as_root tee "$tmr" >/dev/null || return 1
     as_root systemctl daemon-reload || return 1
     as_root systemctl enable hopper-replica-heal.timer || return 1
-    # restart, not `enable --now`: --now does nothing to a timer that is
+    # restart, not enable --now: --now does nothing to a timer that is
     # already active, so an active-but-dead timer (or one still carrying the
     # previous schedule) would survive a re-install untouched.
     as_root systemctl restart hopper-replica-heal.timer || return 1
@@ -203,7 +203,7 @@ EOF
     printf '%s\n' "$tf_tmr_body" | as_root tee "$tf_tmr" >/dev/null || return 1
     as_root systemctl daemon-reload || return 1
     as_root systemctl enable hopper-replica-textfile.timer || return 1
-    # restart, not `enable --now`: --now does nothing to a timer that is
+    # restart, not enable --now: --now does nothing to a timer that is
     # already active, so an active-but-dead timer (or one still carrying the
     # previous schedule) would survive a re-install untouched.
     as_root systemctl restart hopper-replica-textfile.timer || return 1

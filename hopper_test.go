@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -4229,14 +4230,15 @@ func TestFeedSamplesLitmusClassesV6V7(t *testing.T) {
 		litmus string
 		class  int
 	}{
-		{"v6null", `{"v":"6","l":null}`, 2},                                  // manual-mode hostile, fail-safe
+		// A null level is unknown, not hostile: it matches no class filter.
+		{"v6null", `{"v":"6","l":null}`, ClassUnknown},
 		{"v6lo", `{"v":"6","l":0}`, 2},                                       // fires at the strictest level
 		{"v6inband", fmt.Sprintf(`{"v":"6","l":%d}`, CriticalLevel/2), 2},    // well inside the hostile band
 		{"v6crit", fmt.Sprintf(`{"v":"6","l":%d}`, CriticalLevel), 2},        // at the critical line: hostile
 		{"v6susp", fmt.Sprintf(`{"v":"6","l":%d}`, CriticalLevel+1), 1},      // just above the line: suspicious
 		{"v6benign", `{"v":"6","l":-1}`, 0},                                  // never fires
 		{"v6loose", fmt.Sprintf(`{"v":"6","l":%d}`, SuspiciousCeiling+1), 0}, // above the ceiling: benign, not suspicious
-		{"v7null", `{"v":"7","lvl":null}`, 2},
+		{"v7null", `{"v":"7","lvl":null}`, ClassUnknown},
 		{"v7lo", `{"v":"7","lvl":0}`, 2},
 		{"v7crit", fmt.Sprintf(`{"v":"7","lvl":%d}`, CriticalLevel), 2},        // at the critical line: hostile
 		{"v7susp", fmt.Sprintf(`{"v":"7","lvl":%d}`, CriticalLevel+1), 1},      // just above the line: suspicious
@@ -5981,6 +5983,83 @@ func TestUpdateEcosystem(t *testing.T) {
 	}
 }
 
+// TestSetEcosystemFromFileType covers the backfill normalize-ecosystems
+// cannot do: a hash-corpus sample arrives with no registry, so its ecosystem
+// was written empty and there is no stored value for a value→value remap to
+// key off. The sample's analyzed file type is the missing answer.
+func TestSetEcosystemFromFileType(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// file_type is a generated column derived from cleave_result, so the
+	// seed rows carry the type the way a real analyzed sample does.
+	seed := func(sha, fileType, ecosystem string) {
+		t.Helper()
+		mustInsert(t, ctx, db, &Sample{
+			SHA256: sha, Source: "forager", Feed: "bazaar", Label: "bad", Ecosystem: ecosystem,
+			Path:         "bad/" + sha,
+			CleaveResult: fmt.Appendf(nil, `{"files":[{"id":0,"sha":%q,"type":%q,"depth":0}]}`, sha, fileType),
+		})
+	}
+	seed("f1", "pe", "")           // corpus PE, no ecosystem → windows
+	seed("f2", "pe", "")           // second one, same type
+	seed("f3", "macho", "")        // → macos
+	seed("f4", "pdf", "")          // → document
+	seed("f5", "zip", "")          // no platform: stays empty
+	seed("f6", "pe", "javascript") // already attributed: must not be overruled
+
+	counts, err := db.FileTypesMissingEcosystem(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// f6 has an ecosystem, so its "pe" is not part of the repairable set.
+	want := map[string]int{"pe": 2, "macho": 1, "pdf": 1, "zip": 1}
+	if !maps.Equal(counts, want) {
+		t.Fatalf("FileTypesMissingEcosystem = %v, want %v", counts, want)
+	}
+
+	// "zip" is deliberately absent from the mapping: the caller drops file
+	// types that name no platform rather than guessing at one.
+	n, err := db.SetEcosystemFromFileType(ctx, map[string]string{
+		"pe": "windows", "macho": "macos", "pdf": "document",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 4 samples (f1..f4) plus their 4 sample_locations rows.
+	if n != 8 {
+		t.Errorf("SetEcosystemFromFileType rows = %d, want 8 (4 samples + 4 locations)", n)
+	}
+
+	for sha, want := range map[string]string{
+		"f1": "windows", "f2": "windows", "f3": "macos", "f4": "document",
+		"f5": "",           // unmapped type, left alone
+		"f6": "javascript", // registry attribution is never overruled
+	} {
+		got, err := db.SampleBySHA256(ctx, sha)
+		if err != nil {
+			t.Fatalf("SampleBySHA256(%q): %v", sha, err)
+		}
+		if got.Ecosystem != want {
+			t.Errorf("%s ecosystem = %q, want %q", sha, got.Ecosystem, want)
+		}
+	}
+
+	// Re-running finds nothing left to do for the types just filled.
+	counts, err = db.FileTypesMissingEcosystem(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !maps.Equal(counts, map[string]int{"zip": 1}) {
+		t.Errorf("after backfill, FileTypesMissingEcosystem = %v, want only the unmapped zip row", counts)
+	}
+
+	// An empty mapping is a no-op rather than a malformed statement.
+	if n, err := db.SetEcosystemFromFileType(ctx, nil); err != nil || n != 0 {
+		t.Fatalf("SetEcosystemFromFileType(nil) = %d, %v; want 0, nil", n, err)
+	}
+}
+
 // TestTriageMostRecent verifies that the per-dataset limit applies globally —
 // the most recently added rows across all file types, not capped per type.
 func TestTriageMostRecent(t *testing.T) {
@@ -6590,12 +6669,18 @@ func TestLitmusClass(t *testing.T) {
 		{"", 0},                   // no litmus result
 		{`{"class":2}`, 2},        // legacy class field wins
 		{`{"class":0,"l":10}`, 0}, // ... even over a hostile-looking level
-		{`{}`, 2},                 // present envelope, no level: manual-mode hostile
-		{`{"l":-1}`, 0},           // never fires
-		{`{"l":25}`, 2},           // at the hostile cutoff (CriticalLevel)
-		{`{"l":26}`, 1},           // just past the cutoff: suspicious
-		{`{"lvl":3000}`, 1},       // at the ceiling, via the v7 'lvl' key
-		{`{"l":3001}`, 0},         // looser than SuspiciousCeiling: benign
+		// A present envelope stating no level says nothing about the verdict —
+		// scan emits a null level for benign and suspicious manual-threshold
+		// results exactly as it does for hostile ones — so it is unknown, not
+		// hostile. Nested envelopes are read here, not mistaken for level-less.
+		{`{}`, ClassUnknown},
+		{`{"ml":{"lvl":-1}}`, 0}, // archived envelope: never fires
+		{`{"ml":{"lvl":10}}`, 2}, // archived envelope: fires below the cutoff
+		{`{"l":-1}`, 0},          // never fires
+		{`{"l":25}`, 2},          // at the hostile cutoff (CriticalLevel)
+		{`{"l":26}`, 1},          // just past the cutoff: suspicious
+		{`{"lvl":3000}`, 1},      // at the ceiling, via the v7 'lvl' key
+		{`{"l":3001}`, 0},        // looser than SuspiciousCeiling: benign
 	}
 	for _, c := range cases {
 		if got := LitmusClass([]byte(c.in)); got != c.want {
@@ -7555,5 +7640,90 @@ func TestInsertSampleFirstSidecarClaimsWin(t *testing.T) {
 	}
 	if pkg != "@scope/forge" || !strings.Contains(string(prov), `"x"`) {
 		t.Errorf("settled identity rewritten: package=%q provenance=%s", pkg, prov)
+	}
+}
+
+// TestTraitGraphRoundTrip covers the column that lets prism's feed draw the
+// same malecule as the detail page: the dependency edges have to survive the
+// store, be named by trait id rather than by array index, and be pruned to
+// what the cap kept.
+func TestTraitGraphRoundTrip(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// A composite that uses two atomic traits, one of which is used twice.
+	result := []byte(`{"files":[{"sha":"g1","type":"javascript","mol":"O(C)","traits":[
+		{"id":"objectives/exfil/dns","crit":5,"uses":[1,2]},
+		{"id":"micro-behaviors/net/socket","crit":3},
+		{"id":"micro-behaviors/data/encode","crit":2},
+		{"id":"metadata/file/profile","crit":1}
+	]}]}`)
+	mustInsert(t, ctx, db, &Sample{SHA256: "g1", Source: "test", Label: "bad", Path: "bad/g1"})
+	// The analysis path is what derives the column, the same way it derives
+	// top_traits and the rest.
+	if _, err := db.StoreResult(ctx, "g1", result, nil, nil, nil, "tv1"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := db.SampleBySHA256(ctx, "g1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nodes []TraitNode
+	if err := json.Unmarshal([]byte(got.TraitGraph), &nodes); err != nil {
+		t.Fatalf("trait_graph %q: %v", got.TraitGraph, err)
+	}
+	// crit 1 is below the bar, so three entries survive, strongest first.
+	if len(nodes) != 3 {
+		t.Fatalf("trait_graph has %d entries, want 3 (crit >= 2 only): %+v", len(nodes), nodes)
+	}
+	if nodes[0].ID != "objectives/exfil/dns" || nodes[0].Crit != 5 {
+		t.Errorf("first entry = %+v, want the hostile composite", nodes[0])
+	}
+	// Edges name ids, so a capped or reordered column can never point at the
+	// wrong trait.
+	want := []string{"micro-behaviors/net/socket", "micro-behaviors/data/encode"}
+	if !slices.Equal(nodes[0].Uses, want) {
+		t.Errorf("composite uses %v, want %v", nodes[0].Uses, want)
+	}
+	for _, n := range nodes[1:] {
+		if len(n.Uses) != 0 {
+			t.Errorf("%s is atomic but carries edges %v", n.ID, n.Uses)
+		}
+	}
+}
+
+// A benign sample records no graph at all, which is what keeps the column off
+// the vast majority of rows.
+func TestTraitGraphEmptyForBenign(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	mustInsert(t, ctx, db, &Sample{SHA256: "g2", Source: "test", Label: "good", Path: "good/g2"})
+	if _, err := db.StoreResult(ctx, "g2",
+		[]byte(`{"files":[{"sha":"g2","type":"javascript","traits":[{"id":"metadata/file/profile","crit":1}]}]}`),
+		nil, nil, nil, "tv1"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.SampleBySHA256(ctx, "g2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TraitGraph != "" {
+		t.Errorf("benign sample recorded trait_graph %q, want empty", got.TraitGraph)
+	}
+}
+
+// encodeTraitGraph must not leave an edge pointing at a trait the cap dropped.
+func TestEncodeTraitGraphPrunesDanglingEdges(t *testing.T) {
+	nodes := []TraitNode{
+		{ID: "a", Crit: 5, Uses: []string{"b", "gone", "a"}},
+		{ID: "b", Crit: 3},
+	}
+	var got []TraitNode
+	if err := json.Unmarshal([]byte(encodeTraitGraph(nodes)), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got[0].Uses, []string{"b"}) {
+		t.Errorf("uses = %v, want only the edge that survived (and no self-edge)", got[0].Uses)
 	}
 }

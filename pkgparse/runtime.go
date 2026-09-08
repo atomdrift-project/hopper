@@ -5,7 +5,8 @@ import "strings"
 // runtimeMap is the single source of truth for the registry/classifier →
 // ecosystem taxonomy. Keys are the names that appear in samples.ecosystem
 // (registry names, the dir-name classifiers used by the legacy harvest
-// walker, and already-canonical values); values are the ecosystem the
+// walker, file-type tags from the hash-corpus feeds, cleave's own type
+// names, and already-canonical values); values are the ecosystem the
 // software belongs to.
 //
 // OS distributions keep their own identity (arch, fedora, alpine, debian,
@@ -20,6 +21,9 @@ import "strings"
 //	"pypi"     → "python"
 //	"aur"      → "arch"
 //	"openvsx"  → "vscode"
+//	"dll"      → "windows"   (file-type tag: no registry, so the OS answers)
+//	"macho"    → "macos"
+//	"pdf"      → "document"
 //	"datasets" → "" (junk classifier; falls through to NormalizeEcosystem
 //	                 which returns "" so callers can leave the field empty)
 //
@@ -103,6 +107,90 @@ var runtimeMap = map[string]string{
 	"jar":    "java",
 	"js":     "javascript",
 	"web":    "javascript",
+	// File-type tags. A hash-corpus provider (MalwareBazaar, tria.ge,
+	// MalShare, vx-underground) has no registry to name, so what reaches this
+	// table is the provider's own file-type tag or the sample's extension —
+	// and for a sample hopper has already analyzed, cleave's type name. Both
+	// vocabularies land here, which is why "pe" and "exe" both resolve: they
+	// are the same fact spelled by two different tools.
+	//
+	// The answer is the OS that runs the bytes, not a registry, so these are
+	// the one place the generic "windows"/"linux" values get produced. A tag
+	// that names no single platform (zip, rar, 7z, iso, html, txt, xml, json,
+	// svg, and the cross-platform scripting languages) is deliberately absent:
+	// "" is the honest answer and the column stays empty.
+	//
+	// Watch for collisions when extending this block — a key here is also a
+	// key for registries above. "pub" is Dart's registry, not Publisher;
+	// "apk" is Android's package, not Alpine's (Alpine ships as "alpine");
+	// "r" is the R language, not a file type.
+	"pe":    "windows",
+	"dll":   "windows",
+	"msi":   "windows",
+	"msp":   "windows",
+	"appx":  "windows",
+	"cab":   "windows",
+	"nsis":  "windows",
+	"lnk":   "windows",
+	"chm":   "windows",
+	"hta":   "windows",
+	"scr":   "windows",
+	"cpl":   "windows",
+	"sys":   "windows",
+	"reg":   "windows",
+	"bat":   "windows",
+	"cmd":   "windows",
+	"psm1":  "windows",
+	"psd1":  "windows",
+	"vbs":   "windows",
+	"vbe":   "windows",
+	"vba":   "windows",
+	"jse":   "windows",
+	"wsf":   "windows",
+	"pif":   "windows",
+	"batch": "windows", // cleave's name for a .bat script
+	"deb":   "linux",
+	"rpm":   "linux", // shared by fedora/opensuse/rhel: the OS is the honest answer
+	"shell": "linux", // cleave's name for a POSIX shell script; "sh" above is the legacy tag
+	"so":    "linux",
+	"macho": "macos",
+	"dmg":   "macos",
+	"apk":   "android",
+	"dex":   "android",
+	// Extension packages. These are registry artifacts, not corpus bytes, so
+	// they resolve to the marketplace that ships them — a poisoned extension
+	// is a supply-chain catch and has to keep its own sector.
+	"crx":        "chrome",
+	"xpi":        "firefox",
+	"vsix":       "vscode",
+	"java_class": "java",
+	// Documents. A maldoc's runtime is a document reader, not an operating
+	// system, so the office family and PDF get their own ecosystem rather
+	// than folding into "windows" the way the legacy "office" classifier
+	// does. "ole"/"cfb" are the container .doc and .xls ship inside.
+	"pdf":  "document",
+	"doc":  "document",
+	"docm": "document",
+	"docx": "document",
+	"dot":  "document",
+	"dotm": "document",
+	"xls":  "document",
+	"xlsb": "document",
+	"xlsm": "document",
+	"xlsx": "document",
+	"ppt":  "document",
+	"pptm": "document",
+	"pptx": "document",
+	"odt":  "document",
+	"ods":  "document",
+	"odp":  "document",
+	"rtf":  "document",
+	"one":  "document",
+	"vsd":  "document",
+	"eml":  "document",
+	"msg":  "document",
+	"ole":  "document",
+	"cfb":  "document",
 	// Already-canonical runtime names map to themselves.
 	"javascript": "javascript",
 	"python":     "python",
@@ -124,6 +212,7 @@ var runtimeMap = map[string]string{
 	"macos":      "macos",
 	"windows":    "windows",
 	"android":    "android",
+	"document":   "document",
 	"firefox":    "firefox",
 	"agent":      "agent",
 	"openclaw":   "openclaw",

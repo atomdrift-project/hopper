@@ -52,8 +52,9 @@ const maxArchiveMembers = 100_000
 // CriticalLevel is hopper's consumer-side cutoff between hostile and suspicious
 // when deriving criticality from a v6 litmus envelope's `ml.l`. `l <= CriticalLevel`
 // is hostile (fires at or below our critical line); `l > CriticalLevel` is
-// suspicious (fired only at noisier operating points); `-1` is benign; `null`
-// (manual-mode hostile) is hostile.
+// suspicious (fired only at noisier operating points); `-1` is benign; `null` is
+// [ClassUnknown] — the envelope states no level, which says nothing about the
+// verdict and so is not read as one.
 //
 // L25 is our standard operating level — the level the model is currently
 // deployed and calibrated at (scan's DEFAULT_SEVERITY_LEVEL); tightened from L50
@@ -80,15 +81,34 @@ const CriticalLevel = 25
 // cross-repo group in sync.
 const SuspiciousCeiling = 3000
 
+// ClassUnknown is the criticality of a sample whose envelope states no verdict
+// this package can read: no `class`, and no level in any live spelling.
+//
+// It is NOT hostile. The derivation returned 2 for this case for a long time,
+// on the stated grounds that a missing level meant manual-threshold mode and
+// manual mode meant hostile. The second half is untrue: scan's Model::decide
+// returns no level for benign and suspicious verdicts in that mode exactly as
+// it does for hostile ones, so the absent level says nothing about the verdict.
+// Measured 2026-09-08, the guess was also nearly unused — 4 of 1,208 sampled
+// level-less rows lacked an explicit class, the rest stating their verdict
+// outright — while it silently convicted every envelope whose level a caller
+// merely failed to parse.
+//
+// Negative so it orders below every real class: a consumer taking a maximum
+// treats it as "no evidence" without special-casing, and one testing `>= 2`
+// gets false. cyclotron reached the same value independently.
+const ClassUnknown = -1
+
 // LitmusClass derives a sample's criticality class (0=benign, 1=suspicious,
-// 2=hostile) from its litmus envelope at the default [CriticalLevel] cutoff.
-// It is the Go mirror of the SQL derivation (feedClassExpr, the
-// samples_derive_litmus_cols trigger, litmusClassSQLite — keep them in sync):
-// legacy envelopes carry 'class' directly; v6/v7 use 'lvl'/'l', the strictest
-// grid level at which the file fires. A missing level on a present envelope is
-// manual-mode hostile (fail-safe); a negative level never fires (benign);
-// <= CriticalLevel is hostile; <= SuspiciousCeiling is suspicious; looser is
-// benign. A nil, empty, or unparseable result is benign.
+// 2=hostile, [ClassUnknown]=unstated) from its litmus envelope at the default
+// [CriticalLevel] cutoff. It is the Go mirror of the SQL derivation
+// (litmusClassSQL, litmusClassSQLiteExpr — keep them in sync): legacy envelopes
+// carry 'class' directly; v6/v7 use 'lvl'/'l', the strictest grid level at which
+// the file fires, and an archived envelope nests that under 'ml'. A negative
+// level never fires (benign); <= CriticalLevel is hostile; <= SuspiciousCeiling
+// is suspicious; looser is benign. A nil, empty, or unparseable result is
+// benign — nothing was ever scored, which is a different fact from a scored
+// sample whose verdict cannot be read.
 func LitmusClass(result []byte) int {
 	if len(result) == 0 {
 		return 0
@@ -97,6 +117,9 @@ func LitmusClass(result []byte) int {
 		Class *int `json:"class"`
 		Lvl   *int `json:"lvl"`
 		L     *int `json:"l"`
+		ML    *struct {
+			Lvl *int `json:"lvl"`
+		} `json:"ml"`
 	}
 	if json.Unmarshal(result, &env) != nil {
 		return 0
@@ -105,12 +128,15 @@ func LitmusClass(result []byte) int {
 		return *env.Class
 	}
 	lvl := env.Lvl
+	if env.ML != nil && env.ML.Lvl != nil {
+		lvl = env.ML.Lvl
+	}
 	if lvl == nil {
 		lvl = env.L
 	}
 	switch {
 	case lvl == nil:
-		return 2
+		return ClassUnknown
 	case *lvl < 0:
 		return 0
 	case *lvl <= CriticalLevel:
@@ -283,9 +309,21 @@ func triageHighestRouteWhere(a, lvl, fresh string) string {
 
 // litmusLvlSQLite spells samples.lvl for the dev backend, which carries no such
 // column: SQLite recomputes it from litmus_result the same way
-// litmusClassSQLiteExpr does, keeping both v6/v7 spellings of the key.
+// samples_derive_litmus_score does, keeping every live spelling of the key.
+//
+// The nested `ml.lvl` comes first, matching the Postgres trigger. An archived
+// envelope retains its outer {ml, llm} wrapper, and a reader that knows only
+// the flat spellings finds no level in one — which is not "no level", it is a
+// parse that stopped too early. Reading it as the former is how 26,851 benign
+// samples came to be stored as hostile on the Postgres side.
+//
+// NOT the v4/v5 `level` key: measured 2026-09-08, it holds the same constant (3)
+// across classes 0, 1 and 2, so it is a format marker and not a firing level.
+// Those envelopes state their `class` outright, which is where their verdict
+// comes from.
 func litmusLvlSQLite(a string) string {
-	return `CAST(COALESCE(json_extract(` + a + `litmus_result, '$.lvl'), ` +
+	return `CAST(COALESCE(json_extract(` + a + `litmus_result, '$.ml.lvl'), ` +
+		`json_extract(` + a + `litmus_result, '$.lvl'), ` +
 		`json_extract(` + a + `litmus_result, '$.l')) AS INTEGER)`
 }
 
@@ -772,16 +810,21 @@ type Sample struct {
 	// Parent, mirroring cleave's `rel` ("", "fetched", "unpacked",
 	// "registry" — see SampleLocation.Rel). It rides into sample_locations
 	// only; the samples table does not store it.
-	LocationRel       string
-	Skip              string
-	Formula           string
-	Version           string
-	TraitsVersion     string
-	Domain            string
-	URL               string
-	Ecosystem         string
-	Feed              string
-	Source            string
+	LocationRel   string
+	Skip          string
+	Formula       string
+	Version       string
+	TraitsVersion string
+	Domain        string
+	URL           string
+	Ecosystem     string
+	Feed          string
+	Source        string
+	// TraitGraph is the sample's trait dependency graph, capped and stored as
+	// JSON []TraitNode (samples.trait_graph). It rides in the feed projection
+	// so a feed row can draw the same picture the detail page draws, without
+	// detoasting cleave_result.
+	TraitGraph        string
 	CleaveResult      []byte
 	LitmusResult      []byte
 	LLMResult         []byte
@@ -1104,12 +1147,97 @@ type TopTrait struct {
 // topTraitLimit caps the top_traits column at the few chips the feed renders.
 const topTraitLimit = 3
 
+// TraitNode is one entry in a sample's trait_graph column: a trait id, its
+// criticality, and the ids of the traits a composite rule required. Edges name
+// ids rather than array indices on purpose — the column is capped, and an
+// index into a truncated array would point at the wrong trait, while an id
+// that did not survive the cap is simply a dangling edge the reader drops.
+type TraitNode struct {
+	ID   string   `json:"id"`
+	Uses []string `json:"u,omitempty"`
+	Crit int      `json:"c"`
+}
+
+// traitGraphLimit caps the trait_graph column. Renderers budget well below
+// this (prism draws at most 30 atoms on a detail card and 16 in a feed row),
+// so the cap costs nothing visible while keeping the column small enough to
+// ride along in the feed projection — which is the whole point: the feed and
+// the detail page draw one another's picture only if they read one another's
+// data.
+const traitGraphLimit = 48
+
+// traitGraphNodes reads the dependency graph off a file's traits. The graph
+// reaches further down than the top-trait chips do: a composite's dependencies
+// are often ordinary traits, and a picture of a rule without them is a rule
+// pointing at nothing. Edges are recorded by id, since the encoder caps the
+// list and an index into a capped array names the wrong trait.
+func traitGraphNodes(traits []cleaveTraitEntry) []TraitNode {
+	var graph []TraitNode
+	for i := range traits {
+		t := &traits[i]
+		level := t.Level
+		if level == 0 {
+			level = t.OldLevel
+		}
+		id := firstNonEmptyStr(t.ID, t.OldID)
+		if level < 2 || id == "" {
+			continue
+		}
+		node := TraitNode{ID: id, Crit: level}
+		for _, u := range t.Uses {
+			if u < 0 || u >= len(traits) {
+				continue // a stale index names a trait this report does not carry
+			}
+			if to := firstNonEmptyStr(traits[u].ID, traits[u].OldID); to != "" {
+				node.Uses = append(node.Uses, to)
+			}
+		}
+		graph = append(graph, node)
+	}
+	return graph
+}
+
+// encodeTraitGraph renders the trait_graph column: the strongest traits and
+// the dependency edges between them, as compact JSON — "" when none qualify.
+// Ordered by criticality then by the order cleave emitted, matching the
+// trigger's ORDER BY so the two paths produce the same column.
+func encodeTraitGraph(nodes []TraitNode) string {
+	if len(nodes) == 0 {
+		return ""
+	}
+	slices.SortStableFunc(nodes, func(a, b TraitNode) int { return b.Crit - a.Crit })
+	if len(nodes) > traitGraphLimit {
+		nodes = nodes[:traitGraphLimit]
+	}
+	// Edges to traits the cap dropped are pruned here rather than left for
+	// every reader to filter.
+	kept := make(map[string]bool, len(nodes))
+	for _, n := range nodes {
+		kept[n.ID] = true
+	}
+	for i := range nodes {
+		uses := nodes[i].Uses[:0]
+		for _, u := range nodes[i].Uses {
+			if kept[u] && u != nodes[i].ID {
+				uses = append(uses, u)
+			}
+		}
+		nodes[i].Uses = uses
+	}
+	out, err := json.Marshal(nodes)
+	if err != nil {
+		return ""
+	}
+	return string(out)
+}
+
 // cleaveFileInfo holds per-file metadata extracted from a cleave result.
 type cleaveFileInfo struct {
 	Formula         string
 	Elements        string
 	FileType        string
 	TopTraits       string // JSON []TopTrait, "" when none; see TopTrait
+	TraitGraph      string // JSON []TraitNode, "" when none; see TraitNode
 	Score           int
 	MaxCrit         int
 	SuspiciousCount int
@@ -1125,13 +1253,17 @@ type CleaveParseResult struct {
 }
 
 type cleaveTraitEntry struct {
-	ID       string          `json:"id"`
-	OldID    string          `json:"i"`
-	Dep      json.RawMessage `json:"dep"`
-	Conf     float64         `json:"conf"`
-	OldConf  float64         `json:"c"`
-	Level    int             `json:"crit"`
-	OldLevel int             `json:"l"`
+	ID    string          `json:"id"`
+	OldID string          `json:"i"`
+	Dep   json.RawMessage `json:"dep"`
+	// Uses names the traits a composite rule required, as indices into this
+	// file's own trait array. Carried so the trait graph can record the
+	// relation by id; empty for an atomic trait.
+	Uses     []int   `json:"uses"`
+	Conf     float64 `json:"conf"`
+	OldConf  float64 `json:"c"`
+	Level    int     `json:"crit"`
+	OldLevel int     `json:"l"`
 }
 
 type cleaveCompactFileEntry struct {
@@ -1219,18 +1351,21 @@ func ParseCleaveResult(sha256 string, result []byte) CleaveParseResult {
 			if level > maxCrit {
 				maxCrit = level
 			}
+			id := firstNonEmptyStr(t.ID, t.OldID)
 			if level >= 4 {
 				suspicious++
-				if id := firstNonEmptyStr(t.ID, t.OldID); id != "" {
+				if id != "" {
 					top = append(top, TopTrait{ID: id, Crit: level, Dep: t.Dep})
 				}
 			}
 		}
+		graph := traitGraphNodes(traits)
 		fi = cleaveFileInfo{
 			Formula:         formula,
 			Elements:        stripSubscripts(formula),
 			FileType:        f.FileType,
 			TopTraits:       encodeTopTraits(top),
+			TraitGraph:      encodeTraitGraph(graph),
 			Score:           score,
 			MaxCrit:         maxCrit,
 			SuspiciousCount: suspicious,
@@ -1370,15 +1505,10 @@ type memberTrait struct {
 // envelope is parsed once (into litmus), so per-member extraction is O(1) rather
 // than the former O(N²) re-parse for every member.
 type memberEnvelope struct {
-	parent *Sample
-	litmus *litmusMemberIndex
-	files  []json.RawMessage
-	// traitsVersion is the analyzer traits revision this envelope was produced
-	// at, stamped onto every member row and re-emitted as "rev" in each
-	// member's single-file envelope. Without it an exploded member carries no
-	// version at all, and /api/known can never report its verdict current — see
-	// newMemberEnvelope for why that matters.
+	parent        *Sample
+	litmus        *litmusMemberIndex
 	traitsVersion string
+	files         []json.RawMessage
 }
 
 // newMemberEnvelope parses parent.CleaveResult into its member entries, applying
@@ -1390,11 +1520,10 @@ func newMemberEnvelope(parent *Sample) *memberEnvelope {
 	}
 
 	var report struct {
-		Files    []json.RawMessage `json:"files"`
-		OldFiles []json.RawMessage `json:"fs"`
-		// The parent's analyzer traits revision, v8 "rev" then v7 "tv".
-		TraitsVersion    string `json:"rev"`
-		OldTraitsVersion string `json:"tv"`
+		TraitsVersion    string            `json:"rev"`
+		OldTraitsVersion string            `json:"tv"`
+		Files            []json.RawMessage `json:"files"`
+		OldFiles         []json.RawMessage `json:"fs"`
 	}
 	if err := json.Unmarshal(parent.CleaveResult, &report); err != nil {
 		slog.Warn("parse cleave result for member extraction", "parent", parent.SHA256, "error", err)
@@ -1813,8 +1942,10 @@ func MaxMemberLitmusClass(envelope []byte) int {
 	if idx == nil {
 		return LitmusClass(envelope)
 	}
+	// best starts at ClassUnknown so an envelope whose members are all unstated
+	// reports that, rather than reporting the benign it never established.
 	seen := false
-	best := 0
+	best := ClassUnknown
 	consider := func(slice []byte) {
 		if len(slice) == 0 {
 			return
@@ -5874,6 +6005,47 @@ func (db *DB) DistinctEcosystems(ctx context.Context) ([]string, error) {
 	return db.distinctEcosystemsSQLite(ctx)
 }
 
+// FileTypesMissingEcosystem returns the distinct samples.file_type values
+// carried by rows whose ecosystem column is empty, with the row count for
+// each. It finds the population SetEcosystemFromFileType can repair: a
+// hash-corpus sample (MalwareBazaar, tria.ge, …) arrives with no registry to
+// name, so before the file-type half of pkgparse's table existed its ecosystem
+// was written empty and no value→value remap could ever fill it in. Analysis
+// has since typed the bytes, and that type is the missing answer.
+func (db *DB) FileTypesMissingEcosystem(ctx context.Context) (map[string]int, error) {
+	if db.pool != nil {
+		return db.fileTypesMissingEcosystemPG(ctx)
+	}
+	return db.fileTypesMissingEcosystemSQLite(ctx)
+}
+
+// SetEcosystemFromFileType fills in the ecosystem of rows that have none,
+// per mapping (file_type → ecosystem), and returns the total rows changed.
+// Rows that already carry an ecosystem are never touched: this repairs the
+// empty column, it does not overrule a registry. sample_locations rows for the
+// same sha256 are brought along so the two tables keep agreeing.
+//
+// Callers should omit mapping entries with an empty ecosystem — there is
+// nothing to write for a file type that names no platform. An empty mapping is
+// a no-op.
+func (db *DB) SetEcosystemFromFileType(ctx context.Context, mapping map[string]string) (int64, error) {
+	if len(mapping) == 0 {
+		return 0, nil
+	}
+	if db.pool != nil {
+		n, err := db.setEcosystemFromFileTypePG(ctx, mapping)
+		if err == nil && n > 0 {
+			db.flushLookups()
+		}
+		return n, err
+	}
+	n, err := db.setEcosystemFromFileTypeSQLite(ctx, mapping)
+	if err == nil && n > 0 {
+		db.flushLookups()
+	}
+	return n, err
+}
+
 // UpdateEcosystems remaps stored ecosystem values per mapping (old → new),
 // across both the samples and sample_locations tables, returning the total
 // rows changed. A new value of "" clears the column — how labels that are no
@@ -6042,36 +6214,58 @@ func (q *FeedQuery) feedDomainsFilter(param string) string {
 	return feedArrayFilter("domain", param, "::text[]", len(q.Domains))
 }
 
+// litmusClassSQL renders the criticality ladder (0=benign, 1=suspicious,
+// 2=hostile, NULL=unstated) over an ALREADY-PARSED level. It is the one
+// spelling of the ladder every Postgres caller shares — the derive trigger,
+// feedClassExpr, workflowSamplesPG and backfillLitmusClassPG — so that
+// changing the bands is one edit and none of them can drift.
+//
+// envelope is the litmus_result expression and lvl the level expression to read
+// it through (the samples.lvl column, or NEW.lvl inside the trigger). The
+// SPLIT IS THE POINT: exactly one place in this package parses an envelope for
+// a level, and everything downstream compares integers. Five copies of the
+// parse is how a nested {ml, llm} envelope came to be read as level-less by
+// four readers and correctly by the fifth.
+//
+// A missing level yields NULL, not hostile — see [ClassUnknown]. Callers
+// storing this into samples.litmus_class must therefore not use
+// `litmus_class IS NULL` as a work queue: NULL is a valid final value.
+//
+// The cutoff is an int from trusted config, inlined as a literal rather than a
+// bound parameter: a conditionally-referenced parameter would dangle untyped
+// when a caller takes the column path instead, which Postgres rejects
+// (SQLSTATE 42P18).
+func litmusClassSQL(envelope, lvl string, cutoff int) string {
+	return `COALESCE(
+				(` + envelope + `->>'class')::int,
+				CASE
+					WHEN ` + envelope + ` IS NULL THEN 0
+					WHEN ` + lvl + ` IS NULL THEN NULL
+					WHEN ` + lvl + ` < 0 THEN 0
+					WHEN ` + lvl + ` <= ` + strconv.Itoa(cutoff) + ` THEN 2
+					WHEN ` + lvl + ` <= ` + strconv.Itoa(SuspiciousCeiling) + ` THEN 1
+					ELSE 0
+				END)`
+}
+
 // feedClassExpr returns the SQL expression that yields a sample's criticality
-// class (0=benign, 1=suspicious, 2=hostile) for the feed's class filter. When
-// the query's cutoff is the default CriticalLevel it returns the trigger-
-// maintained litmus_class column, which idx_samples_eco_class_created can index
-// — turning a rare class in a large ecosystem from a per-row JSONB scan into an
-// ordered seek. A non-default [FeedQuery.CriticalLevel] re-derives the class from
-// litmus_result inline (litmus_class is pinned to CriticalLevel, so it cannot
-// answer a different cutoff). The cutoff is an int from trusted config, inlined
-// as a literal — the same approach as workflowSamplesPG — rather than a bound
-// parameter: a conditionally-referenced parameter would dangle untyped when the
-// column path is taken instead, which Postgres rejects (SQLSTATE 42P18). The
-// inline form is identical to the trigger's, workflowSamplesPG's, and
-// backfillLitmusClassPG's — including the SuspiciousCeiling cap above which a
-// firing reads benign; keep all four in sync.
+// class for the feed's class filter. When the query's cutoff is the default
+// CriticalLevel it returns the trigger-maintained litmus_class column, which
+// idx_samples_eco_class_created can index — turning a rare class in a large
+// ecosystem from a per-row JSONB scan into an ordered seek. A non-default
+// [FeedQuery.CriticalLevel] re-derives the class inline, because litmus_class is
+// pinned to CriticalLevel and cannot answer a different cutoff.
+//
+// The inline path reads samples.lvl rather than re-parsing litmus_result: the
+// column is filled by the same trigger that maintains litmus_class and its
+// backfill drained on 2026-09-02, so it answers for every stored envelope —
+// including the archived {ml, llm} shape this expression used to misread as
+// having no level at all.
 func (q *FeedQuery) feedClassExpr() string {
 	if q.criticalLevel() == CriticalLevel {
 		return "litmus_class"
 	}
-	cutoff := strconv.Itoa(q.criticalLevel())
-	ceiling := strconv.Itoa(SuspiciousCeiling)
-	return `COALESCE(
-				(litmus_result->>'class')::int,
-				CASE
-					WHEN litmus_result IS NULL THEN 0
-					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l') IS NULL THEN 2
-					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int < 0 THEN 0
-					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= ` + cutoff + ` THEN 2
-					WHEN COALESCE(litmus_result->>'lvl', litmus_result->>'l')::int <= ` + ceiling + ` THEN 1
-					ELSE 0
-				END)`
+	return litmusClassSQL("litmus_result", "lvl", q.criticalLevel())
 }
 
 // likeEscaper neutralizes the LIKE wildcards (% and _) and the escape

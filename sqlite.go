@@ -354,6 +354,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		// written by the Go result-store paths (ParseCleaveResult). Defaults
 		// to '' — pre-existing dev/test rows simply have no headline traits.
 		{"top_traits", `ALTER TABLE samples ADD COLUMN top_traits TEXT NOT NULL DEFAULT ''`},
+		// trait_graph: JSON []TraitNode — the strongest traits and the
+		// dependency edges between them, so a feed row can draw the same
+		// malecule as the detail page. Written by the same Go result-store
+		// paths; '' means "no graph recorded", and readers fall back.
+		{"trait_graph", `ALTER TABLE samples ADD COLUMN trait_graph TEXT NOT NULL DEFAULT ''`},
 	} {
 		if pragmaHasColumn(ctx, db.lite, col.name) == 0 {
 			if _, err := db.lite.ExecContext(ctx, col.ddl); err != nil {
@@ -749,7 +754,8 @@ const liteSampleCols = `id, sha256, source, feed, ecosystem,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime,
 	traits_version,
 	url, domain, package, version, purl_base,
-	COALESCE(top_traits, '') AS top_traits`
+	COALESCE(top_traits, '') AS top_traits,
+	COALESCE(trait_graph, '') AS trait_graph`
 
 // liteSampleColsLight excludes all result blobs to avoid loading large JSON
 // when only metadata is needed.
@@ -761,7 +767,8 @@ const liteSampleColsLight = `id, sha256, source, feed, ecosystem,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime,
 	traits_version,
 	url, domain, package, version, purl_base,
-	COALESCE(top_traits, '') AS top_traits`
+	COALESCE(top_traits, '') AS top_traits,
+	COALESCE(trait_graph, '') AS trait_graph`
 
 // liteSampleColsFeed is the SQLite counterpart of pgSampleColsFeed: liteSampleCols
 // with cleave_result — the one blob the feed never renders — replaced by a NULL
@@ -777,7 +784,8 @@ const liteSampleColsFeed = `id, sha256, source, feed, ecosystem,
 	created_at, updated_at, analyzed_at, first_analyzed_at, last_error_at, mtime, marker_mtime,
 	traits_version,
 	url, domain, package, version, purl_base,
-	COALESCE(top_traits, '') AS top_traits`
+	COALESCE(top_traits, '') AS top_traits,
+	COALESCE(trait_graph, '') AS trait_graph`
 
 // liteSampleColsRegistryExtra is the SQLite counterpart of pgSampleColsRegistryExtra:
 // the marketplace title, capped short description, and install count from the
@@ -805,6 +813,7 @@ func scanLiteSamplesLight(rows *sql.Rows) ([]*Sample, error) {
 			&s.TraitsVersion,
 			&s.URL, &s.Domain, &s.Package, &s.Version, &s.PURLBase,
 			&s.TopTraits,
+			&s.TraitGraph,
 		); err != nil {
 			return nil, err
 		}
@@ -911,29 +920,17 @@ func (db *DB) workflowOldestPendingSQLite(ctx context.Context, limit int) ([]Wor
 }
 
 func (db *DB) workflowSamplesSQLite(ctx context.Context, where string, limit int) ([]WorkflowSample, error) {
-	rows, err := db.lite.QueryContext(ctx, fmt.Sprintf(`
+	//nolint:gosec // G202: litmusClassSQLiteInline is a package constant and where is fixed internal SQL; no value is interpolated
+	rows, err := db.lite.QueryContext(ctx, `
 		SELECT sha256, source, feed, ecosystem, filename, path,
 			created_at, updated_at, analyzed_at, COALESCE(first_analyzed_at, analyzed_at),
 			cleave_result IS NOT NULL,
 			litmus_result IS NOT NULL,
-			-- Criticality (0=benign, 1=suspicious, 2=hostile): legacy records
-			-- carried 'class' directly; v6/v7 use 'lvl'/'l' (the strictest
-			-- grid level at which the file fires, or -1 for never-fires).
-			-- Try class first; otherwise derive from the level using CriticalLevel %d
-			-- as the hostile/suspicious cutoff (null means manual-mode
-			-- hostile and is treated as hostile fail-safe).
-			COALESCE(
-				CAST(json_extract(litmus_result, '$.class') AS INTEGER),
-				CASE
-					WHEN litmus_result IS NULL THEN 0
-					WHEN COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) IS NULL THEN 2
-					WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) < 0 THEN 0
-					WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) <= %d THEN 2
-					WHEN CAST(COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l')) AS INTEGER) <= %d THEN 1
-					ELSE 0
-				END
-			)
-		FROM samples `+where, CriticalLevel, CriticalLevel, SuspiciousCeiling), limit)
+			-- Criticality (0=benign, 1=suspicious, 2=hostile, null=unstated):
+			-- legacy records carried 'class' directly; everything since states a
+			-- level. See litmusClassSQLiteExpr.
+			`+litmusClassSQLiteInline+`
+		FROM samples `+where, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: workflow samples: %w", err)
 	}
@@ -942,9 +939,16 @@ func (db *DB) workflowSamplesSQLite(ctx context.Context, where string, limit int
 	for rows.Next() {
 		var s WorkflowSample
 		var analyzed, firstAnalyzed sqliteNullTime
+		// NULL means the envelope states no verdict this package can read; it
+		// surfaces as ClassUnknown, not as the benign zero value.
+		var criticality sql.NullInt32
 		if err := rows.Scan(&s.SHA256, &s.Source, &s.Feed, &s.Ecosystem, &s.Filename, &s.Path,
-			&s.CreatedAt, &s.UpdatedAt, &analyzed, &firstAnalyzed, &s.HasCleave, &s.HasLitmus, &s.Criticality); err != nil {
+			&s.CreatedAt, &s.UpdatedAt, &analyzed, &firstAnalyzed, &s.HasCleave, &s.HasLitmus, &criticality); err != nil {
 			return nil, fmt.Errorf("hopper: scan workflow sample: %w", err)
+		}
+		s.Criticality = ClassUnknown
+		if criticality.Valid {
+			s.Criticality = int(criticality.Int32)
 		}
 		if analyzed.Valid {
 			s.AnalyzedAt = &analyzed.Time
@@ -972,6 +976,7 @@ func scanLiteSample(row *sql.Row) (*Sample, error) {
 		&s.TraitsVersion,
 		&s.URL, &s.Domain, &s.Package, &s.Version, &s.PURLBase,
 		&s.TopTraits,
+		&s.TraitGraph,
 		&s.RegistryTitle, &s.RegistryDescription, &s.RegistryDownloads, &s.Corroborated,
 	)
 
@@ -1041,6 +1046,7 @@ func scanLiteSamplesExtra(rows *sql.Rows, extra func(*Sample) []any) ([]*Sample,
 			&s.TraitsVersion,
 			&s.URL, &s.Domain, &s.Package, &s.Version, &s.PURLBase,
 			&s.TopTraits,
+			&s.TraitGraph,
 		}
 		if extra != nil {
 			dest = append(dest, extra(s)...)
@@ -1252,12 +1258,12 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 		INSERT INTO samples (sha256, source, feed, ecosystem, filename,
 			size_bytes, label, label_source, path, status,
 			canonical_sha256, parent, skip, elements,
-			max_crit, suspicious_count, top_traits, mtime, marker_mtime,
+			max_crit, suspicious_count, top_traits, trait_graph, mtime, marker_mtime,
 			cleave_result, litmus_result, analyzed_at, first_analyzed_at, traits_version,
 			url, domain, package, version, provenance, fetched_at, purl_base,
 			corroborated)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			-- Mirrors insertSampleNewPG: the sighting usually predates the row on
 			-- this path, so the sightings trigger has nothing left to fire on.
 			EXISTS (SELECT 1 FROM sightings WHERE subject = ?)
@@ -1266,7 +1272,7 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, samplesPath, s.Status,
 		s.SHA256, samplesParent, s.Skip, s.Elements,
-		s.MaxCrit, s.SuspiciousCount, s.TopTraits, s.Mtime, s.MarkerMtime,
+		s.MaxCrit, s.SuspiciousCount, s.TopTraits, s.TraitGraph, s.Mtime, s.MarkerMtime,
 		jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult), s.AnalyzedAt, firstAnalyzedAt, s.TraitsVersion,
 		s.URL, s.Domain, s.Package, s.Version, jsonTextOrNil(s.Provenance), s.FetchedAt, s.PURLBase,
 		s.SHA256, s.PURLBase, s.PURLBase)
@@ -1367,7 +1373,7 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 	cols := []string{
 		"sha256", "source", "feed", "ecosystem", "filename",
 		"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
-		"parent", "skip", "elements", "max_crit", "suspicious_count", "top_traits",
+		"parent", "skip", "elements", "max_crit", "suspicious_count", "top_traits", "trait_graph",
 		"mtime", "marker_mtime", "cleave_result", "litmus_result", "analyzed_at", "first_analyzed_at", "traits_version",
 		"url", "domain", "package", "version", "provenance", "fetched_at", "purl_base",
 	}
@@ -1426,7 +1432,7 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 			s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 			s.SizeBytes, s.Label, s.LabelSource, samplesPath, s.Status,
 			s.SHA256, samplesParent, s.Skip, s.Elements,
-			s.MaxCrit, s.SuspiciousCount, s.TopTraits, s.Mtime, s.MarkerMtime,
+			s.MaxCrit, s.SuspiciousCount, s.TopTraits, s.TraitGraph, s.Mtime, s.MarkerMtime,
 			jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult), s.AnalyzedAt, firstAnalyzedAt, s.TraitsVersion,
 			s.URL, s.Domain, s.Package, s.Version, jsonTextOrNil(s.Provenance), s.FetchedAt, s.PURLBase,
 			s.SHA256, s.PURLBase, s.PURLBase)
@@ -2512,7 +2518,7 @@ func (db *DB) updateCleaveResultSQLite(
 	_, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET cleave_result = ?,
 			canonical_sha256 = ?, elements = ?,
-			max_crit = ?, suspicious_count = ?, top_traits = ?,
+			max_crit = ?, suspicious_count = ?, top_traits = ?, trait_graph = ?,
 			litmus_result = NULL,
 			note = '', last_error_at = NULL,
 			traits_version = ?,
@@ -2521,7 +2527,7 @@ func (db *DB) updateCleaveResultSQLite(
 			analyzed_at = ?, updated_at = ?
 		WHERE sha256 = ?`,
 		string(result), canonical, fi.Elements,
-		fi.MaxCrit, fi.SuspiciousCount, fi.TopTraits,
+		fi.MaxCrit, fi.SuspiciousCount, fi.TopTraits, fi.TraitGraph,
 		traitsVersion, n, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
@@ -2578,7 +2584,7 @@ func (db *DB) storeResultSQLite(
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE samples SET cleave_result = ?,
 			canonical_sha256 = ?, elements = ?,
-			max_crit = ?, suspicious_count = ?, top_traits = ?,
+			max_crit = ?, suspicious_count = ?, top_traits = ?, trait_graph = ?,
 			litmus_result = ?, llm_result = ?,
 			note = '', last_error_at = NULL,
 			traits_version = ?, rescan_priority = 0, rescan_requested_at = NULL,
@@ -2586,7 +2592,7 @@ func (db *DB) storeResultSQLite(
 			analyzed_at = ?, updated_at = ?
 		WHERE sha256 = ?`,
 		string(truncated), p.CanonicalSHA, p.FileInfo.Elements,
-		p.FileInfo.MaxCrit, p.FileInfo.SuspiciousCount, p.FileInfo.TopTraits,
+		p.FileInfo.MaxCrit, p.FileInfo.SuspiciousCount, p.FileInfo.TopTraits, p.FileInfo.TraitGraph,
 		jsonTextOrNil(litmusML), jsonTextOrNil(llm),
 		traitsVersion, nowStr, nowStr, nowStr, sha256); err != nil {
 		return StoreStats{}, fmt.Errorf("hopper: update parent: %w", err)
@@ -3780,14 +3786,14 @@ func (db *DB) updateSampleSQLite(ctx context.Context, sha256, status string, res
 	_, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET status = ?, cleave_result = ?,
 			canonical_sha256 = ?, elements = ?,
-			max_crit = ?, suspicious_count = ?, top_traits = ?,
+			max_crit = ?, suspicious_count = ?, top_traits = ?, trait_graph = ?,
 			litmus_result = NULL,
 			note = '', last_error_at = NULL,
 			first_analyzed_at = COALESCE(first_analyzed_at, ?),
 			analyzed_at = ?, updated_at = ?
 		WHERE sha256 = ?`,
 		status, string(result), canonical,
-		fi.Elements, fi.MaxCrit, fi.SuspiciousCount, fi.TopTraits, n, n, n, sha256)
+		fi.Elements, fi.MaxCrit, fi.SuspiciousCount, fi.TopTraits, fi.TraitGraph, n, n, n, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update sample: %w", err)
 	}
@@ -5546,27 +5552,27 @@ func (db *DB) feedSamplesCountSQLite(ctx context.Context, q *FeedQuery) (int, er
 	return n, nil
 }
 
-// litmusClassSQLite is the SQL expression yielding a sample's criticality
-// class (0=benign, 1=suspicious, 2=hostile) — SQLite has no trigger-maintained
-// litmus_class column, so every query derives it inline. Match either schema:
-// legacy `class` field, or v6 `l`/`lvl`-derived (null is manual-mode
-// hostile/2; -1 benign/0; 0..=cutoff hostile/2; cutoff < l <= ceiling
-// suspicious/1; looser is benign/0). Consumes two `?` args, cutoff then
-// ceiling — bind them before any placeholders that appear later in the query.
-// Mirrors prism's envelopeClass, PG's feedClassExpr, and [LitmusClass]; keep
-// the group in sync.
 // litmusClassSQLiteExpr renders SQLite's stand-in for the litmus_class column,
 // which is Postgres-only (a trigger materializes it there; see the migration
 // list). crit and susp are the two level thresholds, spelled either as "?"
 // placeholders or as literals — see the two bindings below.
+//
+// It is the SQLite mirror of litmusClassSQL and [LitmusClass]; keep the group in
+// sync, along with prism's envelopeClass. The level comes from litmusLvlSQLite,
+// which is this backend's single envelope parse — including the archived
+// {ml, llm} shape, whose level a flat-only reading misses entirely.
+//
+// A level-less envelope yields NULL, not hostile: see [ClassUnknown]. Callers
+// comparing this against a class filter get no match for such a row, which is
+// the right answer to "is this hostile" when nothing said so.
 func litmusClassSQLiteExpr(crit, susp string) string {
-	lvl := `COALESCE(json_extract(litmus_result, '$.lvl'), json_extract(litmus_result, '$.l'))`
+	lvl := litmusLvlSQLite("")
 	return `COALESCE(CAST(json_extract(litmus_result, '$.class') AS INTEGER), ` +
 		`CASE WHEN litmus_result IS NULL THEN 0 ` +
-		`WHEN ` + lvl + ` IS NULL THEN 2 ` +
-		`WHEN CAST(` + lvl + ` AS INTEGER) < 0 THEN 0 ` +
-		`WHEN CAST(` + lvl + ` AS INTEGER) <= ` + crit + ` THEN 2 ` +
-		`WHEN CAST(` + lvl + ` AS INTEGER) <= ` + susp + ` THEN 1 ` +
+		`WHEN ` + lvl + ` IS NULL THEN NULL ` +
+		`WHEN ` + lvl + ` < 0 THEN 0 ` +
+		`WHEN ` + lvl + ` <= ` + crit + ` THEN 2 ` +
+		`WHEN ` + lvl + ` <= ` + susp + ` THEN 1 ` +
 		`ELSE 0 END)`
 }
 
@@ -5781,6 +5787,69 @@ func (db *DB) updateEcosystemsSQLite(ctx context.Context, mapping map[string]str
 		if n, err := res.RowsAffected(); err == nil {
 			total += n
 		}
+	}
+	return total, nil
+}
+
+func (db *DB) fileTypesMissingEcosystemSQLite(ctx context.Context) (map[string]int, error) {
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT file_type, COUNT(*) FROM samples
+		WHERE ecosystem = '' AND file_type != ''
+		GROUP BY file_type
+		ORDER BY file_type`)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: file types missing ecosystem: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // best-effort cleanup
+	return scanLiteCounts(rows)
+}
+
+func (db *DB) setEcosystemFromFileTypeSQLite(ctx context.Context, mapping map[string]string) (int64, error) {
+	// One CASE over file_type, filtered to the mapped types. Bind order
+	// matches placeholder order: the CASE's (when,then) pairs first, then the
+	// IN-list types. Same shape as updateEcosystemsSQLite.
+	keys := sortedKeys(mapping)
+	var caseExpr strings.Builder
+	caseExpr.WriteString("CASE file_type")
+	args := make([]any, 0, len(keys)*3)
+	for _, k := range keys {
+		caseExpr.WriteString(" WHEN ? THEN ?")
+		args = append(args, k, mapping[k])
+	}
+	caseExpr.WriteString(" END")
+	in := make([]string, len(keys))
+	typeArgs := make([]any, len(keys))
+	for i, k := range keys {
+		in[i] = "?"
+		typeArgs[i] = k
+	}
+	filter := strings.Join(in, ",")
+
+	// #nosec G201 -- the CASE and IN list are placeholders only; every value is a bound param.
+	q := fmt.Sprintf("UPDATE samples SET ecosystem = %s WHERE ecosystem = '' AND file_type IN (%s)", caseExpr.String(), filter)
+	res, err := db.lite.ExecContext(ctx, q, append(args, typeArgs...)...)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: set samples ecosystem from file_type: %w", err)
+	}
+	var total int64
+	if n, err := res.RowsAffected(); err == nil {
+		total = n
+	}
+
+	// sample_locations has no file_type of its own, so it takes the answer
+	// from the sample row just written, scoped to the same file types.
+	// #nosec G201 -- IN list is placeholders only; every value is a bound param.
+	q = fmt.Sprintf(`
+		UPDATE sample_locations SET ecosystem =
+			(SELECT s.ecosystem FROM samples s WHERE s.sha256 = sample_locations.sha256)
+		 WHERE ecosystem = '' AND sha256 IN (
+			SELECT sha256 FROM samples WHERE ecosystem != '' AND file_type IN (%s))`, filter)
+	res, err = db.lite.ExecContext(ctx, q, typeArgs...)
+	if err != nil {
+		return total, fmt.Errorf("hopper: set sample_locations ecosystem from file_type: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil {
+		total += n
 	}
 	return total, nil
 }

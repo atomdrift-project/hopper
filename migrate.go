@@ -443,7 +443,7 @@ func eachSampleSQLite(ctx context.Context, db *DB, afterID int64, fn func(*Sampl
 			&analyzedAt, &firstAnalyzedAt, &lastErrorAt, &mtime, &markerMtime,
 			&s.TraitsVersion,
 			&s.URL, &s.Domain, &s.Package, &s.Version, &s.PURLBase,
-			&s.TopTraits); err != nil {
+			&s.TopTraits, &s.TraitGraph); err != nil {
 			return fmt.Errorf("scan sample: %w", err)
 		}
 		if cleaveResult.Valid {

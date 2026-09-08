@@ -63,3 +63,91 @@ func TestRuntimeMapValuesSelfMap(t *testing.T) {
 		}
 	}
 }
+
+// TestNormalizeEcosystemFileTypes pins the file-type half of the table: a
+// hash-corpus provider (MalwareBazaar, tria.ge, …) has no registry to name, so
+// the tag it does supply has to answer with the OS that runs the bytes.
+// Without these, every corpus sample landed with an empty ecosystem and the
+// fallout log had no dimension to filter on.
+func TestNormalizeEcosystemFileTypes(t *testing.T) {
+	tests := map[string]string{
+		// Windows-native, both spellings: cleave types a portable executable
+		// "pe", MalwareBazaar tags the same bytes "exe".
+		"pe":  "windows",
+		"exe": "windows",
+		"dll": "windows",
+		"msi": "windows",
+		"lnk": "windows",
+		"vbs": "windows",
+		"hta": "windows",
+		"PS1": "windows", // case-folded
+		// Other platforms. cleave spells a shell script "shell" and a .bat
+		// "batch"; the corpus feeds' own tags are "sh" and "bat". Both
+		// vocabularies have to land, or the sample keeps an empty ecosystem
+		// and no filter can reach it.
+		"shell": "linux",
+		"sh":    "linux",
+		"batch": "windows",
+		"bat":   "windows",
+		"rpm":   "linux",
+		// Extension packages stay with their marketplace: a poisoned
+		// extension is a supply-chain catch, not commodity malware.
+		"crx":   "chrome",
+		"xpi":   "firefox",
+		"vsix":  "vscode",
+		"elf":   "linux",
+		"deb":   "linux",
+		"macho": "macos",
+		"dmg":   "macos",
+		"apk":   "android",
+		"dex":   "android",
+		// Documents are a reader, not an OS.
+		"pdf":  "document",
+		"doc":  "document",
+		"docx": "document",
+		"xlsm": "document",
+		"rtf":  "document",
+		"ole":  "document",
+		// Platform-agnostic containers and text stay empty: "" is the honest
+		// answer, and the column is left alone rather than guessing.
+		"zip":  "",
+		"rar":  "",
+		"7z":   "",
+		"iso":  "",
+		"html": "",
+		"json": "",
+	}
+	for in, want := range tests {
+		if got := NormalizeEcosystem(in); got != want {
+			t.Errorf("NormalizeEcosystem(%q) = %q, want %q", in, got, want)
+		}
+	}
+	// A provider's tag arrives with whatever spacing the feed gave it.
+	if got := NormalizeEcosystem("  DLL  "); got != "windows" {
+		t.Errorf(`NormalizeEcosystem("  DLL  ") = %q, want "windows"`, got)
+	}
+}
+
+// TestFileTypeTagsDoNotShadowRegistries guards the one hazard in sharing a
+// table between registry names and file-type tags: several tags are spelled
+// exactly like a registry. Adding "pub" → document (Publisher) would silently
+// break Dart, and "apk" → alpine would mislabel every Android sample. If a
+// future tag collides, this test says so instead of the taxonomy quietly
+// shifting under the feed.
+func TestFileTypeTagsDoNotShadowRegistries(t *testing.T) {
+	registries := map[string]string{
+		"pub":    "dart",       // Dart's registry, not Microsoft Publisher
+		"r":      "r",          // the R language, not a file type
+		"jar":    "java",       // runtime, not a Windows payload
+		"js":     "javascript", // runtime, not a dropper script
+		"sh":     "linux",
+		"alpine": "alpine", // Alpine ships .apk files; "apk" means Android here
+		"npm":    "javascript",
+		"debian": "debian", // distro keeps its identity; only the "deb" tag folds to linux
+	}
+	for in, want := range registries {
+		if got := NormalizeEcosystem(in); got != want {
+			t.Errorf("NormalizeEcosystem(%q) = %q, want %q — a file-type tag has shadowed a registry", in, got, want)
+		}
+	}
+}

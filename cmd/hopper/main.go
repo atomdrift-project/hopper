@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
 	"net"
 	"net/http"
@@ -71,6 +72,7 @@ commands:
                      form, then re-derive samples.corroborated (batched; -dry-run; postgres)
   purge-unsupported  delete analyzed rows cleave could not classify
   normalize-ecosystems  re-canonicalize stored ecosystem labels (dry-run)
+  backfill-ecosystems   fill an empty ecosystem from the sample's analyzed file type (dry-run)
   cleanup            delete wonky samples by skip category (interactive)
   prune              drop location rows for files gone from disk, mark orphaned samples missing (run on the full mirror)
   repair-missing     re-check skip='missing' samples against known locations; revive + repoint
@@ -448,6 +450,8 @@ func run(ctx context.Context) error {
 		return cmdPurgeUnsupported(ctx)
 	case "normalize-ecosystems":
 		return cmdNormalizeEcosystems(ctx)
+	case "backfill-ecosystems":
+		return cmdBackfillEcosystems(ctx)
 	case "cleanup":
 		return cmdCleanup(ctx)
 	case "prune":
@@ -4754,6 +4758,68 @@ func cmdNormalizeEcosystems(ctx context.Context) error {
 		return err
 	}
 	slog.Info("ecosystem normalization complete", "distinct_changed", len(mapping), "cleared", cleared, "rows_updated", rows)
+	return nil
+}
+
+// cmdBackfillEcosystems fills in samples.ecosystem for rows that have none,
+// reading the answer from the sample's own analyzed file type
+// (pkgparse.NormalizeEcosystem over samples.file_type).
+//
+// It repairs the population normalize-ecosystems structurally cannot: a
+// hash-corpus sample (MalwareBazaar, tria.ge, MalShare, vx-underground) has no
+// registry to name, so before pkgparse's table learned the file-type
+// vocabulary its ecosystem was written empty — and a value→value remap has no
+// value to work from. Analysis has since typed the bytes, which is the missing
+// answer: a PE is "windows", a Mach-O "macos", a maldoc "document".
+//
+// A row that already carries an ecosystem is never touched — this fills the
+// empty column, it does not overrule a registry — and a file type that names
+// no single platform (zip, html, text) is left empty rather than guessed.
+// Dry-run by default; pass --apply to write. Idempotent and safe to re-run.
+func cmdBackfillEcosystems(ctx context.Context) error {
+	f := flag.NewFlagSet("backfill-ecosystems", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	apply := f.Bool("apply", false, "actually write rows (default is dry-run)")
+	parseFlags(f, os.Args[2:])
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	counts, err := db.FileTypesMissingEcosystem(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Build file_type → ecosystem, dropping the types that name no platform.
+	// They are reported as skipped: a big count against an unmapped type is
+	// the signal that pkgparse's file-type block is missing an entry.
+	mapping := make(map[string]string, len(counts))
+	var fillable, skipped int
+	for _, ft := range slices.Sorted(maps.Keys(counts)) {
+		eco := pkgparse.NormalizeEcosystem(ft)
+		if eco == "" {
+			skipped += counts[ft]
+			writeStdoutf("skip %-10s %8d row(s) — no ecosystem for this file type\n", ft, counts[ft])
+			continue
+		}
+		mapping[ft] = eco
+		fillable += counts[ft]
+		writeStdoutf("fill %-10s %8d row(s) -> %s\n", ft, counts[ft], eco)
+	}
+
+	if !*apply {
+		writeStdoutf("%d sample(s) across %d file type(s) would be filled, %d left empty; "+
+			"re-run with --apply to write\n", fillable, len(mapping), skipped)
+		return nil
+	}
+	rows, err := db.SetEcosystemFromFileType(ctx, mapping)
+	if err != nil {
+		return err
+	}
+	slog.Info("ecosystem backfill complete", "file_types", len(mapping), "rows_updated", rows, "left_empty", skipped)
 	return nil
 }
 
