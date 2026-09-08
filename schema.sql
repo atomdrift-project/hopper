@@ -315,11 +315,23 @@ CREATE TABLE IF NOT EXISTS sighting_acquisitions (
 	acquired     BOOLEAN NOT NULL DEFAULT false,
 	last_attempt TIMESTAMPTZ,
 	next_attempt TIMESTAMPTZ NOT NULL DEFAULT now(),
-	last_error   TEXT NOT NULL DEFAULT ''
+	last_error   TEXT NOT NULL DEFAULT '',
+	-- Set when an attempt reported an outcome, success or failure. A row with
+	-- last_attempt but no finished_at is work that was claimed and then lost --
+	-- a killed pass, a crash, a cancelled context. Since a claimed target is
+	-- terminal (see tryClaimSightingAcquisitionPG), those are the ONLY targets
+	-- that silently never get their recovery run, so they are what the
+	-- AcquisitionsRetiredWithoutOutcome alert watches.
+	finished_at  TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_sighting_acquisitions_due
 	ON sighting_acquisitions(next_attempt) WHERE NOT acquired;
+
+-- Claimed but never finished, oldest first. Tiny: rows leave it the moment an
+-- outcome lands, so in a healthy system it is empty.
+CREATE INDEX IF NOT EXISTS idx_sighting_acquisitions_unfinished
+	ON sighting_acquisitions(last_attempt) WHERE finished_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS workers (
 	name      TEXT PRIMARY KEY,

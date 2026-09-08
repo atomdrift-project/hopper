@@ -35,7 +35,15 @@ func TestRecentAcquisitionSightingsPreservesRetrievalHints(t *testing.T) {
 	}
 }
 
-func TestSightingAcquisitionLeaseRetryAndCompletion(t *testing.T) {
+// A claimed target is terminal. The recovery chain behind one target walks
+// mirrors, Wayback, jsDelivr, unpkg, Software Heritage and socket.dev, and it
+// must run at most once no matter how the pass that started it ended.
+//
+// This replaced a lease-expiry retry. Measured 2026-09-08: passes ran 27
+// minutes against a 30-minute lease on a 3-minute schedule, so unfinished
+// targets were re-claimed roughly every half hour, forever. One Wayback CDX
+// query was re-issued 52 times in a day.
+func TestSightingAcquisitionIsTerminalOnceClaimed(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
 	const target = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -44,28 +52,113 @@ func TestSightingAcquisitionLeaseRetryAndCompletion(t *testing.T) {
 	if err != nil || !claimed {
 		t.Fatalf("first claim = %v, %v; want true", claimed, err)
 	}
+	// Concurrent pass: loses the race, does no duplicate work.
 	if claimed, err = db.TryClaimSightingAcquisition(ctx, target, time.Minute); err != nil || claimed {
-		t.Fatalf("live lease claim = %v, %v; want false", claimed, err)
+		t.Fatalf("concurrent claim = %v, %v; want false", claimed, err)
 	}
 	if err := db.FinishSightingAcquisition(ctx, target, false, time.Hour, "not found"); err != nil {
 		t.Fatalf("finish failed attempt: %v", err)
 	}
 	if claimed, err = db.TryClaimSightingAcquisition(ctx, target, time.Minute); err != nil || claimed {
-		t.Fatalf("backoff claim = %v, %v; want false", claimed, err)
+		t.Fatalf("claim after failure = %v, %v; want false: a failed attempt is still an attempt", claimed, err)
 	}
+	// The old behaviour: a due next_attempt reopened the target. It must not.
 	if _, err := db.lite.ExecContext(ctx,
 		`UPDATE sighting_acquisitions SET next_attempt = ? WHERE target = ?`,
 		time.Now().Add(-time.Minute), target); err != nil {
 		t.Fatalf("expire retry: %v", err)
 	}
+	if claimed, err = db.TryClaimSightingAcquisition(ctx, target, time.Minute); err != nil || claimed {
+		t.Fatalf("claim with next_attempt in the past = %v, %v; want false", claimed, err)
+	}
+	// An operator, and only an operator, can spend the fetches again.
+	n, err := db.ReopenAcquisitions(ctx, []string{target}, false, false)
+	if err != nil || n != 1 {
+		t.Fatalf("ReopenAcquisitions = %d, %v; want 1", n, err)
+	}
 	if claimed, err = db.TryClaimSightingAcquisition(ctx, target, time.Minute); err != nil || !claimed {
-		t.Fatalf("due retry claim = %v, %v; want true", claimed, err)
+		t.Fatalf("claim after reopen = %v, %v; want true", claimed, err)
 	}
 	if err := db.FinishSightingAcquisition(ctx, target, true, 0, ""); err != nil {
 		t.Fatalf("finish success: %v", err)
 	}
-	if claimed, err = db.TryClaimSightingAcquisition(ctx, target, time.Minute); err != nil || claimed {
-		t.Fatalf("completed claim = %v, %v; want false", claimed, err)
+	// Acquired targets are never reopened: we hold the bytes.
+	if n, err = db.ReopenAcquisitions(ctx, []string{target}, false, false); err != nil || n != 0 {
+		t.Fatalf("reopen of an acquired target = %d, %v; want 0", n, err)
+	}
+}
+
+// Abandonment is a per-target fact about a lost process, NOT about a slow or
+// unsuccessful fetch.
+//
+// The distinction is the whole point of the metric. A target we genuinely
+// worked -- walked every mirror, every archive, found nothing -- reports that
+// failure, gets finished_at, and must never be counted here: it is a recovery
+// that ran, and re-running it would find nothing again. Only a target claimed
+// and then lost, because the pass died before recording an outcome, is work
+// nobody will ever redo. forager keeps the two separable by bounding one
+// target's chain (acquisitionTargetTimeout) well under this grace and writing
+// the outcome on a detached context.
+func TestRetiredWithoutOutcomeIsVisible(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	const lost = "pkg:npm/lost@1.0.0"
+	const done = "pkg:npm/done@1.0.0"
+
+	for _, target := range []string{lost, done} {
+		if ok, err := db.TryClaimSightingAcquisition(ctx, target, time.Minute); err != nil || !ok {
+			t.Fatalf("claim %s = %v, %v", target, ok, err)
+		}
+	}
+	// Only one reports an outcome; the other is the killed pass.
+	if err := db.FinishSightingAcquisition(ctx, done, false, time.Hour, "not found"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	// Backdate the lost claim. A just-claimed row is microseconds old, which is
+	// below the resolution of the age arithmetic and makes the assertion race
+	// the clock; a real one is minutes to hours old.
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE sighting_acquisitions SET last_attempt = ? WHERE target = ?`,
+		time.Now().UTC().Add(-90*time.Minute), lost); err != nil {
+		t.Fatalf("backdate lost claim: %v", err)
+	}
+
+	n, oldest, err := db.AcquisitionsRetiredWithoutOutcome(ctx, 0)
+	if err != nil {
+		t.Fatalf("AcquisitionsRetiredWithoutOutcome: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("retired without outcome = %d, want 1: only %s was lost. %s was worked "+
+			"and failed, which is a recorded outcome, not abandonment", n, lost, done)
+	}
+	if oldest < time.Hour {
+		t.Errorf("oldest age = %v, want ~90m for the backdated lost target", oldest)
+	}
+
+	// The grace period must not report an attempt that is still in flight: at a
+	// 3h grace the 90-minute-old claim is still young enough to be running.
+	if n, _, err = db.AcquisitionsRetiredWithoutOutcome(ctx, 3*time.Hour); err != nil || n != 0 {
+		t.Errorf("with a 3h grace = %d, %v; want 0: the attempt is still young", n, err)
+	}
+
+	// The preview must predict the action, through the same predicate: a
+	// dry-run that answers a different question than the delete is how an
+	// operator reopens a set they did not intend to.
+	preview, err := db.ReopenAcquisitions(ctx, nil, true, true)
+	if err != nil || preview != 1 {
+		t.Fatalf("dry-run = %d, %v; want 1", preview, err)
+	}
+	if ok, _ := db.TryClaimSightingAcquisition(ctx, lost, time.Minute); ok {
+		t.Error("dry-run reopened a target instead of only counting it")
+	}
+
+	// Reopening only the lost one leaves the failed-but-finished target alone.
+	reopened, err := db.ReopenAcquisitions(ctx, nil, true, false)
+	if err != nil || reopened != 1 {
+		t.Fatalf("ReopenAcquisitions(onlyUnfinished) = %d, %v; want 1", reopened, err)
+	}
+	if ok, err := db.TryClaimSightingAcquisition(ctx, done, time.Minute); err != nil || ok {
+		t.Errorf("finished target became claimable after an unfinished-only reopen: %v, %v", ok, err)
 	}
 }
 

@@ -61,6 +61,8 @@ commands:
                      their package identity; --purge drops the documents ingested as samples (dry-run; --apply)
   repair-parents     clear samples.parent where the bytes are on disk standalone (--dry-run; postgres)
   drop-sightings     delete the named sources' claims so a re-walk can rebuild them with versions
+  reopen-acquisitions  make recovery targets claimable again; a claimed target is otherwise
+                     terminal, so this is the ONLY retry path (--unfinished-only; --dry-run)
   reconcile-corroborated  re-derive samples.corroborated from the sightings ledger in both
                      directions, narrowing each claim to the releases it names; a repair
                      tool for history, restores, and the version-blind marking that ran
@@ -438,6 +440,8 @@ func run(ctx context.Context) error {
 		return cmdCanonicalizePURLs(ctx)
 	case "drop-sightings":
 		return cmdDropSightings(ctx)
+	case "reopen-acquisitions":
+		return cmdReopenAcquisitions(ctx)
 	case "reconcile-corroborated":
 		return cmdReconcileCorroborated(ctx)
 	case "purge-unsupported":
@@ -4357,6 +4361,46 @@ func humanBytes(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// cmdReopenAcquisitions is the deliberate counterpart to the terminal claim.
+//
+// A target that has been claimed for recovery is never retried by the system:
+// that is what makes "attempt the expensive chain once, ever" true, and it is
+// why one Wayback query stopped being re-issued 52 times a day. The cost is
+// that a pass killed mid-attempt abandons its target silently. This spends the
+// fetches again, on purpose, for targets an operator has decided are worth it.
+//
+// --unfinished-only reopens just the abandoned set -- claimed, never reported
+// an outcome -- which is the metric hopper.acquisitions.retired_without_outcome
+// counts. Without it, every unsuccessful target is reopened; that is the right
+// choice only after something changes the outcome, such as fixing a recovery
+// source. Acquired targets are never reopened: we already hold those bytes.
+func cmdReopenAcquisitions(ctx context.Context) error {
+	f := flag.NewFlagSet("reopen-acquisitions", flag.ExitOnError)
+	dsn := f.String("db", "", "database connection string")
+	unfinishedOnly := f.Bool("unfinished-only", false,
+		"reopen only targets claimed without ever reporting an outcome")
+	dryRun := f.Bool("dry-run", false, "report how many would reopen without writing")
+	parseFlags(f, os.Args[2:])
+
+	db, err := openDB(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	n, err := db.ReopenAcquisitions(ctx, f.Args(), *unfinishedOnly, *dryRun)
+	if err != nil {
+		return err
+	}
+	if *dryRun {
+		fmt.Printf("would reopen %d acquisition targets\n", n)
+		return nil
+	}
+	fmt.Printf("reopened %d acquisition targets; the next pass will attempt each once\n", n)
+	slog.Info("acquisitions reopened", "targets", n, "unfinished_only", *unfinishedOnly)
+	return nil
 }
 
 func cmdReconcileCorroborated(ctx context.Context) error {

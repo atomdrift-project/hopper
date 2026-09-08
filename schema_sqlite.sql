@@ -131,11 +131,18 @@ CREATE TABLE IF NOT EXISTS sighting_acquisitions (
 	acquired     INTEGER NOT NULL DEFAULT 0,
 	last_attempt DATETIME,
 	next_attempt DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-	last_error   TEXT NOT NULL DEFAULT ''
+	last_error   TEXT NOT NULL DEFAULT '',
+	-- Set when an attempt reported an outcome. Claimed-but-never-finished is
+	-- the only way a terminal target silently misses its recovery; see
+	-- schema.sql.
+	finished_at  DATETIME
 );
 
 CREATE INDEX IF NOT EXISTS idx_sighting_acquisitions_due
 	ON sighting_acquisitions(next_attempt) WHERE acquired = 0;
+
+CREATE INDEX IF NOT EXISTS idx_sighting_acquisitions_unfinished
+	ON sighting_acquisitions(last_attempt) WHERE finished_at IS NULL;
 
 -- SQLite mirror of schema.sql's sightings_corroborate triggers: no operation on
 -- the ledger can leave samples.corroborated behind. SQLite has no TG_OP, so the

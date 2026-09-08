@@ -455,7 +455,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 			acquired     INTEGER NOT NULL DEFAULT 0,
 			last_attempt DATETIME,
 			next_attempt DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-			last_error   TEXT NOT NULL DEFAULT ''
+			last_error   TEXT NOT NULL DEFAULT '',
+			finished_at  DATETIME
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_sighting_acquisitions_due ` +
 			`ON sighting_acquisitions(next_attempt) WHERE acquired = 0`,
@@ -463,6 +464,21 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite sighting acquisitions: %w", err)
 		}
+	}
+	// finished_at on a table that predates it. SQLite has no ADD COLUMN IF NOT
+	// EXISTS, so the PRAGMA decides. NULL for existing rows is the honest
+	// adoption value: those attempts happened before anything recorded whether
+	// they reported an outcome.
+	if pragmaHasColumnIn(ctx, db.lite, "sighting_acquisitions", "finished_at") == 0 {
+		if _, err := db.lite.ExecContext(ctx,
+			`ALTER TABLE sighting_acquisitions ADD COLUMN finished_at DATETIME`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite sighting_acquisitions.finished_at: %w", err)
+		}
+	}
+	if _, err := db.lite.ExecContext(ctx,
+		`CREATE INDEX IF NOT EXISTS idx_sighting_acquisitions_unfinished `+
+			`ON sighting_acquisitions(last_attempt) WHERE finished_at IS NULL`); err != nil {
+		return fmt.Errorf("hopper: migrate sqlite sighting_acquisitions unfinished index: %w", err)
 	}
 	if err := db.migrateLiteSightingsKey(ctx); err != nil {
 		return err
@@ -4331,13 +4347,7 @@ func (db *DB) tryClaimSightingAcquisitionSQLite(ctx context.Context, target stri
 		INSERT INTO sighting_acquisitions
 			(target, attempts, acquired, last_attempt, next_attempt)
 		VALUES (?, 1, 0, ?, ?)
-		ON CONFLICT (target) DO UPDATE
-			SET attempts = sighting_acquisitions.attempts + 1,
-			    last_attempt = excluded.last_attempt,
-			    next_attempt = excluded.next_attempt,
-			    last_error = ''
-			WHERE sighting_acquisitions.acquired = 0
-			  AND sighting_acquisitions.next_attempt <= excluded.last_attempt
+		ON CONFLICT (target) DO NOTHING
 		RETURNING 1`, target, now, until).Scan(&claimed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
@@ -4351,8 +4361,9 @@ func (db *DB) tryClaimSightingAcquisitionSQLite(ctx context.Context, target stri
 func (db *DB) finishSightingAcquisitionSQLite(ctx context.Context, target string, acquired bool, retryAfter time.Duration, lastError string) error {
 	if _, err := db.lite.ExecContext(ctx, `
 		UPDATE sighting_acquisitions
-		SET acquired = ?, next_attempt = ?, last_error = ?
-		WHERE target = ?`, acquired, time.Now().UTC().Add(retryAfter), lastError, target); err != nil {
+		SET acquired = ?, next_attempt = ?, last_error = ?, finished_at = ?
+		WHERE target = ?`, acquired, time.Now().UTC().Add(retryAfter), lastError,
+		time.Now().UTC(), target); err != nil {
 		return fmt.Errorf("hopper: finish sighting acquisition: %w", err)
 	}
 	return nil

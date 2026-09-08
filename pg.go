@@ -145,6 +145,9 @@ var cleaveTraitArrayKeys = []string{"traits", "find", "ts"}
 // so building all columns before any index preserves correctness.
 func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequential migration list; splitting reduces clarity
 	return []string{
+		`ALTER TABLE sighting_acquisitions ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ`,
+		`CREATE INDEX IF NOT EXISTS idx_sighting_acquisitions_unfinished ` +
+			`ON sighting_acquisitions(last_attempt) WHERE finished_at IS NULL`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS parent TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS skip TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS formula TEXT NOT NULL DEFAULT ''`,
@@ -6676,17 +6679,36 @@ func (db *DB) recentAcquisitionSightingsPG(ctx context.Context, since time.Time)
 }
 
 func (db *DB) tryClaimSightingAcquisitionPG(ctx context.Context, target string, lease time.Duration) (bool, error) {
+	// DO NOTHING, not DO UPDATE: a target that has ever been claimed is
+	// terminal. The row is written here, BEFORE the recovery chain runs, so the
+	// record survives whatever happens to the pass -- a cancelled context, a
+	// killed process, a crash mid-chain. That is what makes "attempt the
+	// recovery once, ever" true rather than aspirational.
+	//
+	// It replaces a lease-expiry rule (`next_attempt <= now()`) that re-opened
+	// any target whose pass did not finish inside the lease. Measured
+	// 2026-09-08: passes ran 27 minutes against a 30-minute lease and a
+	// 3-minute schedule, so targets were re-claimed on a ~30-minute cadence
+	// forever. One Wayback CDX query was re-issued 52 times in a day, and
+	// web.archive.org alone burned 9.9 hours of fetch time across 4,871
+	// requests for 1,164 distinct URLs -- all of it redoing work that had
+	// already completed and failed.
+	//
+	// Concurrency is still safe, and no lease is needed for it: two passes
+	// racing the same target both INSERT, one wins, the other conflicts and
+	// gets no row back. lease only sets next_attempt now, which is advisory --
+	// a note about when a deliberate re-open would be reasonable, not a gate.
+	//
+	// Re-opening a target is an operator action, not something the system does
+	// on its own: DELETE the row (see the `hopper reopen-acquisitions`
+	// subcommand). Anything claimed but never finished is reported by
+	// AcquisitionsRetiredWithoutOutcome so those are visible rather than lost.
 	var claimed bool
 	err := db.pool.QueryRow(ctx, `
 		INSERT INTO sighting_acquisitions
 			(target, attempts, acquired, last_attempt, next_attempt)
 		VALUES ($1, 1, false, now(), now() + ($2 * interval '1 second'))
-		ON CONFLICT (target) DO UPDATE
-			SET attempts = sighting_acquisitions.attempts + 1,
-			    last_attempt = now(), next_attempt = now() + ($2 * interval '1 second'),
-			    last_error = ''
-			WHERE NOT sighting_acquisitions.acquired
-			  AND sighting_acquisitions.next_attempt <= now()
+		ON CONFLICT (target) DO NOTHING
 		RETURNING true`, target, lease.Seconds()).Scan(&claimed)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
@@ -6700,7 +6722,8 @@ func (db *DB) tryClaimSightingAcquisitionPG(ctx context.Context, target string, 
 func (db *DB) finishSightingAcquisitionPG(ctx context.Context, target string, acquired bool, retryAfter time.Duration, lastError string) error {
 	if _, err := db.pool.Exec(ctx, `
 		UPDATE sighting_acquisitions
-		SET acquired = $2, next_attempt = now() + ($3 * interval '1 second'), last_error = $4
+		SET acquired = $2, next_attempt = now() + ($3 * interval '1 second'),
+		    last_error = $4, finished_at = now()
 		WHERE target = $1`, target, acquired, retryAfter.Seconds(), lastError); err != nil {
 		return fmt.Errorf("hopper: finish sighting acquisition: %w", err)
 	}

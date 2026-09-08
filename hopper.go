@@ -7244,3 +7244,129 @@ func (db *DB) BackfillVersion(ctx context.Context, dryRun bool) (int64, error) {
 	}
 	return n, err
 }
+
+// AcquisitionsRetiredWithoutOutcome counts targets that were claimed for a
+// recovery attempt and never reported one, and returns the age of the oldest.
+//
+// This is the alert that has to ship with the terminal claim, not after it. A
+// claimed target is terminal (see tryClaimSightingAcquisitionPG), which is what
+// makes "attempt the recovery once, ever" true -- and it is also what makes a
+// lost attempt permanent. A pass killed between the claim and the outcome
+// leaves a target that will never be tried again and says nothing about it.
+//
+// In a healthy system this is zero: the row gets finished_at the moment an
+// attempt reports success or failure. A non-zero count that persists is work
+// the system has silently given up on, and the repair is deliberate --
+// ReopenAcquisitions, run by an operator who has decided to spend the fetches.
+//
+// grace excludes attempts still legitimately in flight; pass something
+// comfortably longer than the slowest recovery chain.
+func (db *DB) AcquisitionsRetiredWithoutOutcome(ctx context.Context, grace time.Duration) (count int64, oldest time.Duration, err error) {
+	// The age is computed in SQL, not by parsing a timestamp back in Go. SQLite
+	// stores DATETIME as text and its min() aggregate hands back a different
+	// layout than the column itself ("2026-09-08 10:51:03.15+00:00" rather than
+	// RFC3339Nano), so a Go-side Parse silently yielded a zero age.
+	cutoff := time.Now().UTC().Add(-grace)
+	var ageSeconds sql.NullFloat64
+	if db.pool != nil {
+		err = db.pool.QueryRow(ctx, `
+			SELECT count(*),
+			       EXTRACT(epoch FROM now() - min(last_attempt))
+			  FROM sighting_acquisitions
+			 WHERE finished_at IS NULL AND last_attempt IS NOT NULL AND last_attempt < $1`,
+			cutoff).Scan(&count, &ageSeconds)
+	} else {
+		err = db.lite.QueryRowContext(ctx, `
+			SELECT count(*),
+			       (julianday('now') - julianday(min(last_attempt))) * 86400.0
+			  FROM sighting_acquisitions
+			 WHERE finished_at IS NULL AND last_attempt IS NOT NULL AND last_attempt < ?`,
+			cutoff).Scan(&count, &ageSeconds)
+	}
+	if err != nil {
+		return 0, 0, fmt.Errorf("hopper: count acquisitions retired without outcome: %w", err)
+	}
+	if ageSeconds.Valid && ageSeconds.Float64 > 0 {
+		oldest = time.Duration(ageSeconds.Float64 * float64(time.Second))
+	}
+	return count, oldest, nil
+}
+
+// ReopenAcquisitions deletes acquisition rows so their targets become claimable
+// again. It is the ONLY way a terminal target is retried, and it is deliberately
+// an operator action: the system never re-opens its own work, because doing so
+// on a timer is what re-ran one Wayback query 52 times in a day.
+//
+// onlyUnfinished restricts the reopen to targets that were claimed and never
+// reported an outcome -- the AcquisitionsRetiredWithoutOutcome set, which is
+// work that was lost rather than work that failed. Without it, every
+// unsuccessful target is reopened, which is the right choice only after
+// something that changes the outcome, like a recovery-source fix.
+//
+// Never reopens an acquired target: those have the bytes.
+//
+// dryRun counts what the delete would remove, through the same predicate, so
+// the preview cannot disagree with the action.
+func (db *DB) ReopenAcquisitions(ctx context.Context, targets []string, onlyUnfinished, dryRun bool) (int64, error) {
+	// NOT acquired reads the same in both dialects: SQLite has no boolean type,
+	// but the column holds 0 or 1 and NOT 0 is 1.
+	where := "NOT acquired"
+	if onlyUnfinished {
+		where += " AND finished_at IS NULL"
+	}
+
+	// One verb, chosen once, so the preview and the action can never drift onto
+	// different predicates.
+	verb := "DELETE FROM"
+	if dryRun {
+		verb = "SELECT count(*) FROM"
+	}
+
+	if db.pool != nil {
+		// A nil array means "every target", so naming none reopens all of them.
+		var named any
+		if len(targets) > 0 {
+			named = targets
+		}
+		stmt := verb + ` sighting_acquisitions WHERE ` + where +
+			` AND ($1::text[] IS NULL OR target = ANY($1))`
+		if dryRun {
+			var n int64
+			if err := db.pool.QueryRow(ctx, stmt, named).Scan(&n); err != nil {
+				return 0, fmt.Errorf("hopper: count reopenable acquisitions: %w", err)
+			}
+			return n, nil
+		}
+		tag, err := db.pool.Exec(ctx, stmt, named)
+		if err != nil {
+			return 0, fmt.Errorf("hopper: reopen acquisitions: %w", err)
+		}
+		return tag.RowsAffected(), nil
+	}
+
+	// SQLite has no array binding, so a named list becomes placeholders.
+	args := make([]any, 0, len(targets))
+	if len(targets) > 0 {
+		ph := make([]string, len(targets))
+		for i, target := range targets {
+			ph[i] = "?"
+			args = append(args, target)
+		}
+		where += " AND target IN (" + strings.Join(ph, ", ") + ")"
+	}
+	//nolint:gosec // G202: verb and where are literals plus "?" placeholders; targets are bound args.
+	stmt := verb + ` sighting_acquisitions WHERE ` + where
+	if dryRun {
+		var n int64
+		if err := db.lite.QueryRowContext(ctx, stmt, args...).Scan(&n); err != nil {
+			return 0, fmt.Errorf("hopper: count reopenable acquisitions: %w", err)
+		}
+		return n, nil
+	}
+	res, err := db.lite.ExecContext(ctx, stmt, args...)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: reopen acquisitions: %w", err)
+	}
+	n, _ := res.RowsAffected() //nolint:errcheck // driver reports it or does not
+	return n, nil
+}
