@@ -3911,8 +3911,8 @@ func (db *DB) migrateLiteSightingsAttemptedAt(ctx context.Context) error {
 // queue, claims nothing has tried to fetch, newest first. Partial on
 // attempted_at, so it must be built after migrateLiteSightingsAttemptedAt has
 // ensured the column exists.
-const liteSightingsAcquirableIndex = `CREATE INDEX IF NOT EXISTS idx_sightings_acquirable ` +
-	`ON sightings(first_seen DESC) ` +
+const liteSightingsAcquirableIndex = `CREATE INDEX IF NOT EXISTS idx_sightings_acquirable_event ` +
+	`ON sightings(COALESCE(published_at, first_seen) DESC) ` +
 	`WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')`
 
 func (db *DB) migrateLiteSightingsKey(ctx context.Context) error {
@@ -4158,14 +4158,15 @@ func (db *DB) recentAcquisitionSightingsSQLite(ctx context.Context, since time.T
 	return out, rows.Err()
 }
 
-func (db *DB) unattemptedSightingsSQLite(ctx context.Context, limit int) ([]Sighting, error) {
+func (db *DB) unattemptedSightingsSQLite(ctx context.Context, limit int, source string) ([]Sighting, error) {
 	rows, err := db.lite.QueryContext(ctx, `
 		SELECT source, subject, url, note, first_seen,
 		       operator, affected, claim, filename, handle, basis, relayer, published_at
 		FROM sightings
 		WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')
-		ORDER BY first_seen DESC
-		LIMIT ?`, limit)
+		  AND (? = '' OR source = ?)
+		ORDER BY COALESCE(published_at, first_seen) DESC
+		LIMIT ?`, source, source, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: unattempted sightings: %w", err)
 	}
@@ -4177,6 +4178,32 @@ func (db *DB) unattemptedSightingsSQLite(ctx context.Context, limit int) ([]Sigh
 		if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen,
 			&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Handle, &x.Basis, &x.Relayer, &published); err != nil {
 			return nil, fmt.Errorf("hopper: scan unattempted sighting: %w", err)
+		}
+		x.PublishedAt = published.Time
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) oldestUnattemptedSightingsSQLite(ctx context.Context, limit int) ([]Sighting, error) {
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT source, subject, url, note, first_seen,
+		       operator, affected, claim, filename, handle, basis, relayer, published_at
+		FROM sightings
+		WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')
+		ORDER BY COALESCE(published_at, first_seen) ASC
+		LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: oldest unattempted sightings: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // best-effort cleanup
+	var out []Sighting
+	for rows.Next() {
+		var x Sighting
+		var published sql.NullTime
+		if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen,
+			&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Handle, &x.Basis, &x.Relayer, &published); err != nil {
+			return nil, fmt.Errorf("hopper: scan oldest unattempted sighting: %w", err)
 		}
 		x.PublishedAt = published.Time
 		out = append(out, x)

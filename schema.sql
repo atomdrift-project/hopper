@@ -211,8 +211,13 @@ ALTER TABLE sightings ADD COLUMN IF NOT EXISTS attempted_at TIMESTAMPTZ;
 -- The claim filter is part of the predicate: a vulnerability names a defect in
 -- working software, so nothing fetches one and nothing stamps one. Left in the
 -- index they would accumulate forever and be skipped on every read.
-CREATE INDEX IF NOT EXISTS idx_sightings_acquirable
-	ON sightings(first_seen DESC)
+-- Ordered on the EVENT date, falling back to when we noticed it. first_seen is
+-- a fact about our polling, not about the threat: a backfilling source lands old
+-- attacks with new first_seen values and they outrank a genuinely fresh
+-- citation. COALESCE because coverage is partial -- 57% of the queue carried an
+-- event date on 2026-09-08, and two of the largest sources carried none.
+CREATE INDEX IF NOT EXISTS idx_sightings_acquirable_event
+	ON sightings((COALESCE(published_at, first_seen)) DESC)
 	WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious');
 
 -- Lookup by subject is the read path (SightingsFor): "who cited this sha/purl?".

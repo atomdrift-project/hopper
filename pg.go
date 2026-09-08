@@ -350,9 +350,27 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// every start, and leave the acquisition queue unindexed while it did.
 		// Renaming makes CREATE IF NOT EXISTS genuinely idempotent, and the drop
 		// of the superseded name is then a one-time no-op forever after.
-		`CREATE INDEX IF NOT EXISTS idx_sightings_acquirable ` +
-			`ON sightings(first_seen DESC) ` +
+		// Ordered on the EVENT date, falling back to when we noticed it.
+		//
+		// first_seen is when a claim reached us, which is a fact about our
+		// polling, not about the threat. A source that backfills, or one we
+		// added yesterday, lands old attacks with new first_seen values and they
+		// outrank a genuinely fresh citation. published_at is what the source
+		// says happened, and that is the thing worth acting on soonest.
+		//
+		// COALESCE rather than published_at alone because coverage is partial:
+		// measured 2026-09-08, 57% of the queue carried an event date, and two
+		// of the largest sources carried none at all (aikido 155,295 claims,
+		// datadog 50,288). For those, when we first saw it is the best evidence
+		// of when it happened that exists.
+		//
+		// The index has to carry the same expression or the planner sorts the
+		// whole partition instead of walking it -- the ORDER BY and this
+		// definition must be changed together.
+		`CREATE INDEX IF NOT EXISTS idx_sightings_acquirable_event ` +
+			`ON sightings((COALESCE(published_at, first_seen)) DESC) ` +
 			`WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')`,
+		`DROP INDEX IF EXISTS idx_sightings_acquirable`,
 		`DROP INDEX IF EXISTS idx_sightings_unattempted`,
 		// Sighted triage has two ordered walks: digest claims and PURL claims. The
 		// leading expression lets both seek their half of the ledger and then read
@@ -6392,19 +6410,34 @@ func scanSightingRows(rows pgx.Rows) ([]Sighting, error) {
 const sightingAcquisitionCols = `source, subject, url, note, first_seen,
 	operator, affected, claim, filename, handle, basis, relayer, published_at`
 
-func (db *DB) unattemptedSightingsPG(ctx context.Context, limit int) ([]Sighting, error) {
-	// Every term here matches idx_sightings_acquirable's predicate and order,
-	// so this is an ordered index walk that stops as soon as limit rows are read
-	// -- it never sorts the backlog. The `before` bound is a range start on the
-	// same index, so paging costs no more than the first read.
+func (db *DB) unattemptedSightingsPG(ctx context.Context, limit int, source string) ([]Sighting, error) {
+	// Every term here matches idx_sightings_acquirable_event's predicate and
+	// order, so this is an ordered index walk that stops as soon as limit rows
+	// are read -- it never sorts the backlog.
 	rows, err := db.pool.Query(ctx, `
 		SELECT `+sightingAcquisitionCols+`
 		FROM sightings
 		WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')
-		ORDER BY first_seen DESC
-		LIMIT $1`, limit)
+		  AND ($2 = '' OR source = $2)
+		ORDER BY COALESCE(published_at, first_seen) DESC
+		LIMIT $1`, limit, source)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: unattempted sightings: %w", err)
+	}
+	return scanSightingRows(rows)
+}
+
+func (db *DB) oldestUnattemptedSightingsPG(ctx context.Context, limit int) ([]Sighting, error) {
+	// ASC, so this walks idx_sightings_acquirable_event from the far end. Same
+	// index, same predicate, opposite direction -- no second index is needed.
+	rows, err := db.pool.Query(ctx, `
+		SELECT `+sightingAcquisitionCols+`
+		FROM sightings
+		WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')
+		ORDER BY COALESCE(published_at, first_seen) ASC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: oldest unattempted sightings: %w", err)
 	}
 	return scanSightingRows(rows)
 }

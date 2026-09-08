@@ -6241,14 +6241,21 @@ func (db *DB) RecentAcquisitionSightings(ctx context.Context, since time.Time) (
 // Only malicious and suspicious claims are offered: a vulnerability names a
 // defect in working software, and fetching every advised release would fill the
 // corpus with clean packages.
-func (db *DB) UnattemptedSightings(ctx context.Context, limit int) ([]Sighting, error) {
+// source, when non-empty, restricts the read to one feed's claims.
+//
+// That is what makes a fast lane possible. A caller that has just synced one
+// source wants the claims IT wrote, now, and asking for the queue head instead
+// would hand back whatever else happens to be newest. Filtering in the caller
+// cannot substitute: the read is a bounded LIMIT off the head, so a pass that
+// discards most of what it reads simply re-reads the same rows next time.
+func (db *DB) UnattemptedSightings(ctx context.Context, limit int, source string) ([]Sighting, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
 	if db.pool != nil {
-		return db.unattemptedSightingsPG(ctx, limit)
+		return db.unattemptedSightingsPG(ctx, limit, source)
 	}
-	return db.unattemptedSightingsSQLite(ctx, limit)
+	return db.unattemptedSightingsSQLite(ctx, limit, source)
 }
 
 // OldestUnattemptedSighting returns the age of the longest-waiting claim nothing
@@ -6282,6 +6289,30 @@ func (db *DB) OldestUnattemptedSighting(ctx context.Context) (time.Duration, boo
 		return 0, false, nil
 	}
 	return time.Since(*oldest), true, nil
+}
+
+// OldestUnattemptedSightings returns the longest-waiting claims nothing has
+// tried to acquire, oldest first.
+//
+// The mirror of [DB.UnattemptedSightings], and the reason both exist. Newest
+// first is right for a fresh citation: it names an artifact a registry may still
+// be serving, so acting on it soon is the whole point. But newest-first as the
+// ONLY rule starves the tail whenever claims arrive faster than they drain, and
+// that is the normal condition here -- measured 2026-09-08, arrivals ran 95 to
+// 508 an hour against a drain of about 100, so the queue grew and nothing older
+// than the current day was ever reached. The four packages that prompted this
+// work sat unattempted for sixteen hours with 570,000 claims in front of them.
+//
+// A caller reserves part of each batch for this, so the backlog drains at a
+// guaranteed rate whatever the feeds are doing.
+func (db *DB) OldestUnattemptedSightings(ctx context.Context, limit int) ([]Sighting, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	if db.pool != nil {
+		return db.oldestUnattemptedSightingsPG(ctx, limit)
+	}
+	return db.oldestUnattemptedSightingsSQLite(ctx, limit)
 }
 
 // MarkSightingsAttempted stamps attempted_at on each claim, so it is never
