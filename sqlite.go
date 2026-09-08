@@ -474,6 +474,14 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 			`ALTER TABLE sighting_acquisitions ADD COLUMN finished_at DATETIME`); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite sighting_acquisitions.finished_at: %w", err)
 		}
+		// Adopt rows that predate the column, inside the same one-shot branch:
+		// they were written when an unfinished target was retried after its
+		// lease, so none of them is abandoned in the new sense. See pg.go.
+		if _, err := db.lite.ExecContext(ctx,
+			`UPDATE sighting_acquisitions SET finished_at = last_attempt
+			 WHERE finished_at IS NULL AND last_attempt IS NOT NULL`); err != nil {
+			return fmt.Errorf("hopper: adopt sqlite sighting_acquisitions.finished_at: %w", err)
+		}
 	}
 	if _, err := db.lite.ExecContext(ctx,
 		`CREATE INDEX IF NOT EXISTS idx_sighting_acquisitions_unfinished `+

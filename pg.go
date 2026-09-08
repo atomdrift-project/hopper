@@ -146,6 +146,16 @@ var cleaveTraitArrayKeys = []string{"traits", "find", "ts"}
 func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequential migration list; splitting reduces clarity
 	return []string{
 		`ALTER TABLE sighting_acquisitions ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ`,
+		// Adopt the rows that predate the column. They were written when an
+		// unfinished target was simply retried after its lease, so none of them
+		// is abandoned in the new sense -- and without this all 44,276 rows on
+		// the master at 2026-09-08 would read as abandoned and the alert would
+		// fire on the whole history on its first scrape.
+		//
+		// Ledger-gated, so it runs exactly once. A second run would mark
+		// genuinely abandoned targets as finished and hide them.
+		`UPDATE sighting_acquisitions SET finished_at = last_attempt ` +
+			`WHERE finished_at IS NULL AND last_attempt IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_sighting_acquisitions_unfinished ` +
 			`ON sighting_acquisitions(last_attempt) WHERE finished_at IS NULL`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS parent TEXT NOT NULL DEFAULT ''`,
