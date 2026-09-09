@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -147,6 +148,11 @@ func (db *DB) MoveLocation(ctx context.Context, opts MoveLocationOptions) (MoveL
 	}
 	sidecarCreated, sidecarPresent, err := publishMoveSidecar(ctx, oldAbs, newAbs)
 	if err != nil {
+		// The cause, not just its cleanup: this is what stops the move, and it
+		// used to reach nobody — the caller folds it into a result record while
+		// the log carried only the rollback.
+		slog.WarnContext(ctx, "move aborted: sidecar could not be published",
+			"src", oldAbs, "dst", newAbs, "error", err)
 		if rbErr := rollbackMoveDestination(newAbs, artifactCreated, sidecarCreated); rbErr != nil {
 			// The destination keeps whatever was published before the sidecar
 			// failed; the catalog still points at the source, so the move is
@@ -162,7 +168,10 @@ func (db *DB) MoveLocation(ctx context.Context, opts MoveLocationOptions) (MoveL
 		return result, err
 	}
 	if !prepared {
-		return result, rollbackMoveDestination(newAbs, artifactCreated, sidecarCreated)
+		if err := rollbackMoveDestination(newAbs, artifactCreated, sidecarCreated); err != nil {
+			return result, fmt.Errorf("hopper: catalog rejected the move and the destination could not be rolled back: %w", err)
+		}
+		return result, errors.New("hopper: source location disappeared during move")
 	}
 	current, err = os.Stat(oldAbs)
 	if err != nil {
@@ -274,12 +283,124 @@ func publishMoveSidecar(ctx context.Context, src, dst string) (created, present 
 	if err != nil {
 		return false, true, err
 	}
-	// No donors: a sidecar records how THIS location was acquired, so two
-	// locations of the same sample legitimately hold different provenance.
-	// Linking them together would make one acquisition's history overwrite the
-	// other's. Only the artifact bytes are shareable.
+	// A destination that already holds a DIFFERENT sidecar is the ordinary
+	// collision, not a failure: a sidecar records how THIS location was
+	// acquired, so two locations of one artifact legitimately disagree. Settle
+	// it before publishing, because publishMoveFile refuses to write over bytes
+	// it cannot verify and would otherwise abort the move forever — 8,243
+	// samples were retrying that way on 2026-09-08, each attempt re-hashing
+	// both copies of the artifact.
+	if dstHash, err := hashMoveFile(dst); err == nil && dstHash != expected {
+		return false, true, resolveSidecarCollision(ctx, src, dst)
+	}
+	// No donors: only the artifact bytes are shareable. Linking two locations'
+	// sidecars together would make one acquisition's history overwrite the
+	// other's.
 	created, err = publishMoveFile(ctx, src, dst, expected, nil)
 	return created, true, err
+}
+
+// resolveSidecarCollision decides which acquisition record survives when both
+// locations have one and they differ. Oldest wins: fetch.at is when the bytes
+// were acquired, and the earliest record is the one that says how they first
+// entered the corpus — the fact a later re-download cannot restore, where the
+// newer record is reconstructible by fetching again.
+//
+// The loser is discarded. Keeping both would mean inventing a second sidecar
+// name and teaching every reader about it, to preserve a record that is, by
+// this rule, the less valuable of the two.
+//
+// An unreadable or undated record on either side loses to the destination:
+// leaving what is already published is the reversible choice, and the move
+// completes either way, which is the point.
+func resolveSidecarCollision(ctx context.Context, src, dst string) error {
+	srcAt, srcErr := sidecarFetchedAt(src)
+	dstAt, dstErr := sidecarFetchedAt(dst)
+	if srcErr != nil || dstErr != nil || srcAt.IsZero() || dstAt.IsZero() {
+		slog.InfoContext(ctx, "sidecar collision: keeping the destination's record (no comparable acquisition time)",
+			"src", src, "dst", dst, "src_error", srcErr, "dst_error", dstErr)
+		return nil
+	}
+	if !srcAt.Before(dstAt) {
+		slog.InfoContext(ctx, "sidecar collision: destination's record is older; keeping it",
+			"src", src, "dst", dst, "src_at", srcAt, "dst_at", dstAt)
+		return nil
+	}
+	if err := replaceSidecarFile(ctx, src, dst); err != nil {
+		return fmt.Errorf("hopper: adopt older sidecar: %w", err)
+	}
+	slog.InfoContext(ctx, "sidecar collision: source's record is older; it replaces the destination's",
+		"src", src, "dst", dst, "src_at", srcAt, "dst_at", dstAt)
+	return nil
+}
+
+// sidecarFetchedAt reads one provenance record's acquisition time.
+func sidecarFetchedAt(name string) (time.Time, error) {
+	data, err := os.ReadFile(name)
+	if err != nil {
+		return time.Time{}, err
+	}
+	var sc Sidecar
+	if err := json.Unmarshal(data, &sc); err != nil {
+		return time.Time{}, err
+	}
+	return sc.Fetch.At, nil
+}
+
+// replaceSidecarFile atomically replaces dst with src's contents.
+//
+// Only a sidecar takes this path. Artifact bytes are content-addressed and
+// never overwritten — a destination that hashes differently is a different
+// artifact and an error — while a sidecar is metadata about one location, whose
+// replacement is a decision rather than a corruption.
+func replaceSidecarFile(ctx context.Context, src, dst string) error {
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(dst)
+	tmp, err := os.CreateTemp(dir, movePartialPrefix+"*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		if tmpName == "" {
+			return
+		}
+		if err := os.Remove(tmpName); err != nil {
+			slog.WarnContext(ctx, "partial sidecar left behind", "tmp", tmpName, "error", err)
+		}
+	}()
+	if err := writeSidecarTemp(tmp, data, info.Mode().Perm()); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, dst); err != nil {
+		return err
+	}
+	tmpName = "" // renamed away; nothing to clean up
+	return syncMoveDir(dir)
+}
+
+// writeSidecarTemp fills and durably closes the temporary file a sidecar
+// replacement is staged in.
+func writeSidecarTemp(tmp *os.File, data []byte, mode os.FileMode) error {
+	err := tmp.Chmod(mode)
+	if err == nil {
+		_, err = tmp.Write(data)
+	}
+	if err == nil {
+		err = tmp.Sync()
+	}
+	closeErr := tmp.Close()
+	if err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 // publishMoveFile creates dst without clobbering an existing path. A same-device
@@ -801,6 +922,15 @@ func verifyMoveFile(name, expected string) error {
 	return nil
 }
 
+// rollbackMoveDestination removes whatever this move published, returning nil
+// when the destination is clean again.
+//
+// It reported the opposite until 2026-09-08: with nothing to remove it returned
+// a non-nil error, so the one caller that reads the result as "did rollback
+// fail" logged an ERROR for every rollback that worked. That was 637,441 lines
+// in 6.6 hours, all of them describing a partial copy that did not exist, while
+// the failure that actually stopped the move went unlogged. An error return
+// means the destination still holds something.
 func rollbackMoveDestination(dst string, artifact, sidecar bool) error {
 	var errs []error
 	if sidecar {
@@ -817,9 +947,6 @@ func rollbackMoveDestination(dst string, artifact, sidecar bool) error {
 		if err := syncMoveDir(filepath.Dir(dst)); err != nil {
 			errs = append(errs, err)
 		}
-	}
-	if len(errs) == 0 {
-		return errors.New("hopper: source location disappeared during move")
 	}
 	return errors.Join(errs...)
 }

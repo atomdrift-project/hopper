@@ -124,6 +124,84 @@ func TestMoveLocationMovesBundleAndCatalog(t *testing.T) {
 	}
 }
 
+// Two locations of one artifact legitimately record different acquisitions, so
+// a destination that already holds a DIFFERENT sidecar must not stop the move.
+// Oldest wins: fetch.at says when the bytes were acquired, and the earliest
+// record is the one a later re-download cannot reconstruct.
+//
+// Before 2026-09-08 this aborted the move, forever: 8,243 samples retried it
+// every few minutes, each attempt re-hashing both copies of the artifact and
+// logging an ERROR about a rollback that had nothing to roll back.
+func TestMoveLocationResolvesSidecarCollisionByAge(t *testing.T) {
+	sidecar := func(at string) []byte {
+		return []byte(`{"schema_version":"1.0","fetch":{"collector":"forager","category":"new","at":"` + at + `"}}`)
+	}
+	older, newer := sidecar("2026-08-28T03:28:00Z"), sidecar("2026-09-03T20:21:14Z")
+
+	for _, tc := range []struct {
+		name    string
+		srcCar  []byte
+		dstCar  []byte
+		wantCar []byte
+	}{
+		{"destination older keeps its own", newer, older, older},
+		{"source older replaces the destination's", older, newer, older},
+		{"undated destination is left alone", older, []byte(`{"schema_version":"1.0"}`), []byte(`{"schema_version":"1.0"}`)},
+		{"unreadable destination is left alone", older, []byte("not json"), []byte("not json")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := openTestDBContext(t, ctx)
+			root := t.TempDir()
+			oldRel := "incoming/forager/pkg/example.tgz"
+			newRel := "sighted/foraged/forager/pkg/example.tgz"
+			content := []byte("sample bytes")
+			sha := moveTestSHA(content)
+			oldAbs := filepath.Join(root, filepath.FromSlash(oldRel))
+			newAbs := filepath.Join(root, filepath.FromSlash(newRel))
+			for _, dir := range []string{filepath.Dir(oldAbs), filepath.Dir(newAbs)} {
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The same artifact is already published at the destination — the
+			// state that made these moves unfinishable.
+			for _, name := range []string{oldAbs, newAbs} {
+				if err := os.WriteFile(name, content, 0o440); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(oldAbs+ProvenanceSidecarSuffix, tc.srcCar, 0o440); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(newAbs+ProvenanceSidecarSuffix, tc.dstCar, 0o440); err != nil {
+				t.Fatal(err)
+			}
+			mustInsert(t, ctx, db, &Sample{SHA256: sha, Path: oldRel, Label: "unknown", LabelSource: "forager"})
+
+			result, err := db.MoveLocation(ctx, MoveLocationOptions{
+				DataRoot: root, SHA256: sha, OldPath: oldRel, NewPath: newRel,
+			})
+			if err != nil {
+				t.Fatalf("MoveLocation: %v", err)
+			}
+			if !result.Relocated {
+				t.Fatalf("the move did not complete: %+v", result)
+			}
+			got, err := os.ReadFile(newAbs + ProvenanceSidecarSuffix)
+			if err != nil {
+				t.Fatalf("destination sidecar: %v", err)
+			}
+			if !bytes.Equal(got, tc.wantCar) {
+				t.Errorf("destination sidecar = %s, want %s", got, tc.wantCar)
+			}
+			if _, err := os.Stat(oldAbs); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("source artifact remains: %v", err)
+			}
+		})
+	}
+}
+
 func TestMoveLocationRecoversPreparedMove(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
