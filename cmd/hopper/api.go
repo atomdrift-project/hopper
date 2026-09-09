@@ -2907,20 +2907,11 @@ const maxKnownBatch = 1024
 // the struct's pointer words sit together. JSON decoding is by tag, so the wire
 // format is unaffected.
 type knownRequest struct {
-	// TraitsVersion, when non-empty, asks which of these digests already hold
-	// an analysis at this traits version (the "rev" a scan report carries).
-	// The response's Current lists them, so a dependency-mirroring worker can
-	// skip re-posting verdicts hopper already has. Optional and additive: an
-	// old client never sends it and sees the response it always saw.
-	TraitsVersion string   `json:"traits_version"`
-	SHA256        []string `json:"sha256"`
+	SHA256 []string `json:"sha256"`
 }
 
 type knownResponse struct {
 	Known []string `json:"known"`
-	// Current is the subset of Known whose stored verdict matches the
-	// request's TraitsVersion. Present only when the request asked.
-	Current []string `json:"current,omitempty"`
 }
 
 // handleKnown answers "which of these digests do you already have?" with a
@@ -2929,6 +2920,14 @@ type knownResponse struct {
 // UI — and reads nothing but the sha256 key, making it the cheapest probe the
 // store offers. The response lists only the known digests; unknown ones are
 // simply absent.
+//
+// One question. It briefly also answered "is your verdict for this sha already
+// current?", which is a different question about a different column, and gave
+// the wrong answer for the rows that most needed it: knownRetrievableSQL scopes
+// this endpoint to bytes hopper can PRODUCE, so a reference row (rel=fetched,
+// no path) could never be reported current no matter how fresh its analysis.
+// Currency is settled at the store now, where it is ordered against the other
+// producers writing the same sha.
 func (s *apiServer) handleKnown(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
 		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
@@ -2958,18 +2957,15 @@ func (s *apiServer) handleKnown(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
-	byVersion, err := s.db.KnownSHA256Versions(ctx, valid)
+	known, err := s.db.KnownSHA256(ctx, valid)
 	if err != nil {
 		slog.Error("known: query failed", "error", err)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
 	}
-	resp := knownResponse{Known: make([]string, 0, len(byVersion))}
-	for sha, tv := range byVersion {
-		resp.Known = append(resp.Known, sha)
-		if req.TraitsVersion != "" && tv == req.TraitsVersion {
-			resp.Current = append(resp.Current, sha)
-		}
+	resp := knownResponse{Known: known}
+	if resp.Known == nil {
+		resp.Known = []string{}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
