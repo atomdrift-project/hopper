@@ -100,6 +100,33 @@ func recordLoadShed(ctx context.Context, pool string) {
 	}
 }
 
+// redundantResultCount counts stores that wrote nothing because the row already
+// held that exact analysis. This is a fleet-efficiency signal, not an incident:
+// two producers analyzing the same artifact is ordinary, and the point of
+// counting is to know the RATE — how much of the ingestion lane is spent on work
+// the corpus already had — which a per-event log line can only bury. Labeled by
+// lane so a renewing scanner and a claim worker read separately.
+var (
+	redundantResultOnce  sync.Once
+	redundantResultCount metric.Int64Counter
+)
+
+// recordRedundantResult counts one store that changed nothing. Same
+// lazy-create/no-op-on-failure contract as recordLoadShed.
+func recordRedundantResult(ctx context.Context, lane string) {
+	redundantResultOnce.Do(func() {
+		if c, err := otel.Meter(meterName).Int64Counter(
+			"hopper.result_redundant.total",
+			metric.WithDescription("Results whose analysis the corpus already held at the same analyzer version; nothing was written."),
+		); err == nil {
+			redundantResultCount = c
+		}
+	})
+	if redundantResultCount != nil {
+		redundantResultCount.Add(ctx, 1, metric.WithAttributes(attribute.String("lane", lane)))
+	}
+}
+
 // resultPhaseHist times what a result-ingestion slot is actually held on once
 // acquired: "body" (streaming + decoding the envelope off the wire) versus
 // "store" (the StoreResult transaction, retries and lock waits included). The

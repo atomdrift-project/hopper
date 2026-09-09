@@ -947,6 +947,93 @@ func TestHandleResultAcknowledgesAbsentSample(t *testing.T) {
 	}
 }
 
+// A second identical result must not be written again. The producer is told it
+// changed nothing, and the row is left exactly where the first store put it —
+// this is what makes the client-side currency probe reliable rather than
+// advisory, since only the store is ordered against other producers.
+func TestHandleResultSkipsAStoreThatWouldChangeNothing(t *testing.T) {
+	ctx := context.Background()
+	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("c", 64)
+	if err := db.InsertSample(ctx, &hopper.Sample{
+		SHA256: sha, Source: "test", Path: "pending/sample.bin", Label: "unknown",
+	}); err != nil {
+		t.Fatalf("InsertSample: %v", err)
+	}
+	raw := json.RawMessage(`{"rev":"b8c1c","fs":[{"sha":"` + sha + `","type":"elf","dp":0}]}`)
+	body, err := json.Marshal(resultRequest{
+		SHA256: sha, Worker: "worker1", Raw: raw, ML: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	api := &apiServer{db: db, tracker: newWorkerTracker(), progress: &loadProgress{}}
+	post := func() (int, bool) {
+		rec := httptest.NewRecorder()
+		api.handleResult(rec, httptest.NewRequest(http.MethodPost, "/api/result", bytes.NewReader(body)))
+		// An ordinary store answers {"ok":true}; only a skipped one names
+		// `stored`, so an absent field is a store that happened.
+		response := struct {
+			OK     bool `json:"ok"`
+			Stored bool `json:"stored"`
+		}{Stored: true}
+		if rec.Code == http.StatusOK {
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if !response.OK {
+				t.Fatalf("ok = false, body = %s", rec.Body.String())
+			}
+		}
+		return rec.Code, response.Stored
+	}
+
+	if code, _ := post(); code != http.StatusOK {
+		t.Fatalf("first store: status = %d", code)
+	}
+	first, err := db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatalf("SampleBySHA256: %v", err)
+	}
+	if len(first.CleaveResult) == 0 {
+		t.Fatal("the first result must be stored")
+	}
+
+	code, stored := post()
+	if code != http.StatusOK {
+		t.Fatalf("second store: status = %d", code)
+	}
+	if stored {
+		t.Error("the same analysis at the same version must not be written twice")
+	}
+	second, err := db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatalf("SampleBySHA256: %v", err)
+	}
+	if !second.AnalyzedAt.Equal(*first.AnalyzedAt) {
+		t.Errorf("analyzed_at moved on a store that wrote nothing: %v -> %v",
+			first.AnalyzedAt, second.AnalyzedAt)
+	}
+
+	// The analyzer moving is the whole point of the key: that store must land.
+	body = bytes.ReplaceAll(body, []byte(`"rev":"b8c1c"`), []byte(`"rev":"f6eaa"`))
+	if code, stored := post(); code != http.StatusOK || !stored {
+		t.Fatalf("a new analyzer version must be stored: status = %d stored = %v", code, stored)
+	}
+	third, err := db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatalf("SampleBySHA256: %v", err)
+	}
+	if !third.AnalyzedAt.After(*first.AnalyzedAt) {
+		t.Errorf("analyzed_at did not move for a real re-analysis: %v -> %v",
+			first.AnalyzedAt, third.AnalyzedAt)
+	}
+}
+
 func TestHandleResultRejectsRootSHAMismatch(t *testing.T) {
 	ctx := context.Background()
 	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "hopper.db"))

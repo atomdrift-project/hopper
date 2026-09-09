@@ -2635,7 +2635,7 @@ func (db *DB) invalidPGIndexPool(ctx context.Context, indexName string) (bool, e
 // visible server-side. That is the 2026-09-08 hang, and it survived raising the
 // ceiling from 1 to 2 because the real depth was 3. Depth is the bug; the
 // ceiling only hides it.
-func (db *DB) invalidPGIndex(ctx context.Context, conn *pgxpool.Conn, indexName string) (bool, error) {
+func (*DB) invalidPGIndex(ctx context.Context, conn *pgxpool.Conn, indexName string) (bool, error) {
 	var invalid bool
 	if err := conn.QueryRow(ctx, `
 		SELECT EXISTS (
@@ -3785,13 +3785,14 @@ func (db *DB) storeResultPG(
 	var priorAnalyzed sql.NullTime
 	var priorTraits, purlBase string
 	var createdAt time.Time
+	var llmMissing bool
 	if err := db.pool.QueryRow(ctx,
 		`SELECT label, label_source, source, feed, ecosystem, path, first_analyzed_at,
-		        analyzed_at, traits_version, purl_base, created_at
+		        analyzed_at, traits_version, purl_base, created_at, llm_result IS NULL
 		   FROM samples WHERE sha256 = $1`, sha256).
 		Scan(&parent.Label, &parent.LabelSource, &parent.Source, &parent.Feed,
 			&parent.Ecosystem, &parent.Path, &firstAnalyzed,
-			&priorAnalyzed, &priorTraits, &purlBase, &createdAt); err != nil {
+			&priorAnalyzed, &priorTraits, &purlBase, &createdAt, &llmMissing); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return StoreStats{}, fmt.Errorf("hopper: store result for absent sample %s: %w", sha256, ErrNotFound)
 		}
@@ -3808,6 +3809,10 @@ func (db *DB) storeResultPG(
 	stats.PriorTraitsVersion = priorTraits
 	stats.PURLBase = purlBase
 	stats.CreatedAt = createdAt
+	if unchangedStore(&stats, traitsVersion, llm, llmMissing) {
+		stats.Unchanged = true
+		return stats, nil
+	}
 
 	// Build members from the FULL envelope, inheriting the parent's identity and
 	// stamped with this analysis time so the freshness gate orders refreshes.
@@ -6448,11 +6453,11 @@ func (db *DB) addSightingsPG(ctx context.Context, s []Sighting) (int, error) {
 		// Two purl_base arms, not one: markCorroboratedByPURLSQL only covers
 		// claims whose scope cannot be narrowed. Without the Version arm an
 		// advisory naming exact releases would corroborate nothing at all.
-		for _, sql := range []string{markCorroboratedByPURLSQL, markCorroboratedByPURLVersionSQL} {
+		for _, stmt := range []string{markCorroboratedByPURLSQL, markCorroboratedByPURLVersionSQL} {
 			if len(purls) == 0 {
 				break
 			}
-			if _, err := tx.Exec(ctx, sql, purls); err != nil {
+			if _, err := tx.Exec(ctx, stmt, purls); err != nil {
 				return 0, fmt.Errorf("hopper: mark corroborated: %w", err)
 			}
 		}
@@ -6675,7 +6680,8 @@ func (db *DB) markSightingsAttemptedPG(ctx context.Context, sightings []Sighting
 	sources := make([]string, len(sightings))
 	subjects := make([]string, len(sightings))
 	affected := make([]string, len(sightings))
-	for i, s := range sightings {
+	for i := range sightings {
+		s := &sightings[i] // 224 bytes; a copy per row buys nothing
 		sources[i], subjects[i], affected[i] = s.Source, s.Subject, s.Affected
 	}
 	_, err := db.pool.Exec(ctx, `
@@ -9151,7 +9157,7 @@ func (db *DB) feedSourcesPG(ctx context.Context, source, label string) ([]string
 // every row of that source. Measured 2026-09-07: >15 s even with the 72h
 // window, i.e. no better than the DISTINCT form. Filtered calls therefore keep
 // the original SQL, unchanged, rather than trade one full scan for another.
-func feedEcosystemsSQL(source, label string, since *time.Time) (string, []any) {
+func feedEcosystemsSQL(source, label string, since *time.Time) (query string, args []any) {
 	if source != "" || label != "" {
 		return `
 		SELECT DISTINCT ecosystem FROM samples
@@ -9160,7 +9166,6 @@ func feedEcosystemsSQL(source, label string, since *time.Time) (string, []any) {
 		  AND ($3::timestamptz IS NULL OR created_at >= $3)
 		ORDER BY ecosystem`, []any{source, label, since}
 	}
-	var args []any
 	window := ""
 	if since != nil {
 		args = append(args, *since)
@@ -9172,7 +9177,10 @@ func feedEcosystemsSQL(source, label string, since *time.Time) (string, []any) {
   SELECT (SELECT s.ecosystem FROM samples s WHERE s.ecosystem > eco.ecosystem AND s.ecosystem <> '' ORDER BY s.ecosystem LIMIT 1)
   FROM eco WHERE eco.ecosystem IS NOT NULL)
 SELECT e.ecosystem FROM eco e,
-  LATERAL (SELECT 1 FROM samples s WHERE s.ecosystem = e.ecosystem AND s.ecosystem <> '' AND s.parent = '' AND s.cleave_result IS NOT NULL AND s.litmus_result IS NOT NULL` + window + ` LIMIT 1) hit
+  LATERAL (SELECT 1 FROM samples s
+            WHERE s.ecosystem = e.ecosystem AND s.ecosystem <> '' AND s.parent = ''
+              AND s.cleave_result IS NOT NULL AND s.litmus_result IS NOT NULL` + window + `
+            LIMIT 1) hit
 WHERE e.ecosystem IS NOT NULL ORDER BY e.ecosystem`, args
 }
 
@@ -9182,8 +9190,8 @@ func (db *DB) feedEcosystemsPG(ctx context.Context, source, label string, since 
 		u := since.UTC()
 		sincePtr = &u
 	}
-	sql, args := feedEcosystemsSQL(source, label, sincePtr)
-	rows, err := db.pool.Query(ctx, sql, args...)
+	query, args := feedEcosystemsSQL(source, label, sincePtr)
+	rows, err := db.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed ecosystems: %w", err)
 	}
@@ -9293,7 +9301,7 @@ func (db *DB) setEcosystemFromFileTypePG(ctx context.Context, mapping map[string
 // replaces (pg_stat_statements on the replica, 2026-09-07). A source or label
 // filter keeps the original SQL for the reason given on feedEcosystemsSQL: a
 // per-domain probe with a heap filter is no faster than the DISTINCT form.
-func feedDomainsSQL(source, label string) (string, []any) {
+func feedDomainsSQL(source, label string) (query string, args []any) {
 	if source != "" || label != "" {
 		return `
 		SELECT DISTINCT domain FROM samples
@@ -9309,8 +9317,8 @@ SELECT domain FROM dom WHERE domain IS NOT NULL ORDER BY domain`, nil
 }
 
 func (db *DB) feedDomainsPG(ctx context.Context, source, label string) ([]string, error) {
-	sql, args := feedDomainsSQL(source, label)
-	rows, err := db.pool.Query(ctx, sql, args...)
+	query, args := feedDomainsSQL(source, label)
+	rows, err := db.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: feed domains: %w", err)
 	}
@@ -9765,9 +9773,9 @@ func (db *DB) activeWorkersPG(ctx context.Context, since time.Duration) ([]Worke
 // a version mismatch to reconcile-corroborated, which would clear real evidence
 // rather than false evidence. Recover the version first, then reconcile.
 //
-// The filename is the authority here because it is what the registry served:
-// @whalent-agent-core-0.3.410.tgz. pkgparse.ParseFilename is the same parser
-// forager now uses for the same fallback, so the two agree.
+// The filename is the authority here because it is what the registry served,
+// e.g. "@whalent-agent-core-0.3.410.tgz". pkgparse.ParseFilename is the same
+// parser forager now uses for the same fallback, so the two agree.
 //
 // It also trims a wheel whose stored version swallowed its PEP 427
 // compatibility tags -- "0.5.0-cp312-cp312-macosx_26_0_arm64" rather than

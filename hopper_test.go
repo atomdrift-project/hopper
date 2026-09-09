@@ -7727,3 +7727,35 @@ func TestEncodeTraitGraphPrunesDanglingEdges(t *testing.T) {
 		t.Errorf("uses = %v, want only the edge that survived (and no self-edge)", got[0].Uses)
 	}
 }
+
+// A store that would write what the row already says must not write it: the
+// transaction is the expensive half, and skipping it is what makes the
+// producer-side currency check reliable rather than advisory.
+func TestUnchangedStoreSkipsOnlyWhatIsAlreadyThere(t *testing.T) {
+	t.Parallel()
+	renewed := func(prior string) *StoreStats {
+		return &StoreStats{PriorAnalyzedAt: time.Now().Add(-time.Minute), PriorTraitsVersion: prior}
+	}
+	interpretation := []byte(`{"interpretation":"steals credentials"}`)
+
+	if !unchangedStore(renewed("traits-1"), "traits-1", nil, true) {
+		t.Error("same analyzer, no interpretation offered: nothing to write")
+	}
+	if unchangedStore(renewed("traits-1"), "traits-2", nil, true) {
+		t.Error("the analyzer moved: the re-analysis learned something")
+	}
+	if unchangedStore(&StoreStats{}, "traits-1", nil, true) {
+		t.Error("a first analysis is never unchanged")
+	}
+	if unchangedStore(renewed(""), "traits-1", nil, true) {
+		t.Error(`an unknown stored version is "we could not tell", not a match`)
+	}
+	// The interpretation is written by a different pass than the analysis, so an
+	// interpretation the row lacks is something to learn even at the same version.
+	if unchangedStore(renewed("traits-1"), "traits-1", interpretation, true) {
+		t.Error("an interpretation the row does not hold must take the slow path")
+	}
+	if !unchangedStore(renewed("traits-1"), "traits-1", interpretation, false) {
+		t.Error("the row already holds an interpretation: still nothing to write")
+	}
+}

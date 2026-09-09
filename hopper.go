@@ -2377,10 +2377,10 @@ func (db *DB) tryMigrationLock(ctx context.Context) (release func(), acquired bo
 	// it cannot, and the failure is a silent forever-wait on the pool semaphore
 	// with nothing blocked server-side -- 45 minutes of `hopper load` reporting
 	// "Migrating database" on 2026-09-08. Refuse up front and name the knob.
-	if max := db.pool.Config().MaxConns; max < 2 {
+	if maxConns := db.pool.Config().MaxConns; maxConns < 2 {
 		return nil, false, fmt.Errorf(
 			"hopper: migrating needs at least 2 connections but this pool allows %d; "+
-				"add pool_max_conns=8 to the DSN", max)
+				"add pool_max_conns=8 to the DSN", maxConns)
 	}
 	conn, err := db.pool.Acquire(ctx)
 	if err != nil {
@@ -3951,6 +3951,36 @@ type StoreStats struct {
 
 	Members       int   // members extracted from the archive envelope (0 = not an archive)
 	MembersStored int64 // member rows inserted or freshness-refreshed in this transaction
+
+	// Unchanged reports a store that wrote nothing because the row already held
+	// this exact analysis (see [unchangedStore]). The work still happened and
+	// the claim is still finished — only the write was skipped.
+	Unchanged bool
+}
+
+// unchangedStore reports whether a store would write what the row already says,
+// so the caller can return before the parent+members transaction.
+//
+// The analyzer version is the corpus's invalidation key: it changes exactly when
+// re-analysis could learn something, which is why /v1/lookup publishes it and
+// why a producer skips re-posting a verdict already at its own version. Applying
+// the same key here is what makes that guard reliable rather than advisory — a
+// producer cannot win the race against another producer, only the store can, and
+// this is the store saying so in one indexed read instead of a multi-thousand-row
+// write. Measured 2026-09-08: 80,414 such stores in 23 hours, every one of them
+// paying the full transaction to change nothing.
+//
+// The LLM interpretation is the exception, because it is written by a different
+// pass than the analysis and can arrive for a row that already holds one: an
+// interpretation we do not have yet is something to learn, so it takes the slow
+// path.
+//
+// "Could not have learned anything" is [StoreStats.Redundant] and is not spelled
+// a second time here: a store that skips the write and a log line that says the
+// re-analysis was pointless must agree about what pointless means, or one of
+// them is wrong.
+func unchangedStore(stats *StoreStats, traitsVersion string, llm []byte, llmMissing bool) bool {
+	return stats.Redundant(traitsVersion) && (len(llm) == 0 || !llmMissing)
 }
 
 // Renewed reports whether this store replaced an existing analysis rather than
@@ -3959,7 +3989,8 @@ func (s StoreStats) Renewed() bool { return !s.PriorAnalyzedAt.IsZero() }
 
 // Redundant reports a renewal that produced the same verdict the row already
 // held, because the analyzer had not changed between the two runs. Nothing was
-// learned and the write was pure cost — the case worth alerting on.
+// learned, so nothing is written: this is what [unchangedStore] gates the fast
+// path on.
 func (s StoreStats) Redundant(traitsVersion string) bool {
 	return s.Renewed() && s.PriorTraitsVersion != "" && s.PriorTraitsVersion == traitsVersion
 }
@@ -7556,7 +7587,8 @@ func (db *DB) ReopenAcquisitions(ctx context.Context, targets []string, onlyUnfi
 		}
 		where += " AND target IN (" + strings.Join(ph, ", ") + ")"
 	}
-	//nolint:gosec // G202: verb and where are literals plus "?" placeholders; targets are bound args.
+	// Concatenation, not interpolation: verb and where are literals plus "?"
+	// placeholders, and every target is a bound argument.
 	stmt := verb + ` sighting_acquisitions WHERE ` + where
 	if dryRun {
 		var n int64

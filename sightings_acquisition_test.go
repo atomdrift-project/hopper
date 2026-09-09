@@ -150,7 +150,11 @@ func TestRetiredWithoutOutcomeIsVisible(t *testing.T) {
 	if err != nil || preview != 1 {
 		t.Fatalf("dry-run = %d, %v; want 1", preview, err)
 	}
-	if ok, _ := db.TryClaimSightingAcquisition(ctx, lost, time.Minute); ok {
+	ok, err := db.TryClaimSightingAcquisition(ctx, lost, time.Minute)
+	if err != nil {
+		t.Fatalf("TryClaimSightingAcquisition: %v", err)
+	}
+	if ok {
 		t.Error("dry-run reopened a target instead of only counting it")
 	}
 

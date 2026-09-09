@@ -18,7 +18,6 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +32,7 @@ import (
 	"github.com/codeGROOVE-dev/retry"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/klauspost/compress/zstd"
+	"golang.org/x/sync/singleflight"
 )
 
 // apiServer handles the pull-based work API. Workers poll /api/next for
@@ -48,9 +48,11 @@ type apiServer struct {
 	resultSem       chan struct{}
 	workerResultSem chan struct{}
 	extractCache    *extractCache
-	traitsVersion   atomic.Pointer[string]
-	tracker         *workerTracker
-	triageClaims    *triageClaims
+	// resultStores collapses concurrent stores of the same sha; see storeResult.
+	resultStores  singleflight.Group
+	traitsVersion atomic.Pointer[string]
+	tracker       *workerTracker
+	triageClaims  *triageClaims
 	// relay, when non-nil on a readOnly instance, proxies client-facing
 	// mutations to the primary hopper instead of refusing them, and backs the
 	// ?fresh=1 read-after-write escape hatch. Worker-loop routes are never
@@ -752,8 +754,8 @@ func (wt *workerTracker) trimClaimsLocked(name string, keep int) int {
 	if len(owned) <= keep {
 		return 0
 	}
-	sort.Slice(owned, func(i, j int) bool {
-		return wt.claims[owned[i]].at.Before(wt.claims[owned[j]].at)
+	slices.SortFunc(owned, func(a, b string) int {
+		return wt.claims[a].at.Compare(wt.claims[b].at)
 	})
 	dropped := 0
 	for _, sha := range owned[:len(owned)-keep] {
@@ -2145,9 +2147,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	// async pool" path, whose silent member loss produced truncated parents with
 	// no members (no content, permanent data loss).
 	storeStart := time.Now()
-	stats, err := retryDBAccess(ctx, "store result", req.SHA256, func(ctx context.Context) (hopper.StoreStats, error) {
-		return s.db.StoreResult(ctx, req.SHA256, req.Raw, req.ML, req.LLM, &parsed, tv)
-	})
+	stats, err := s.storeResult(ctx, &req, &parsed, tv)
 	recordResultPhase(r.Context(), "store", lane, time.Since(storeStart))
 	if err != nil {
 		if errors.Is(err, hopper.ErrNotFound) {
@@ -2183,6 +2183,11 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	// belongs to the request that delivered the result.
 	recordCommitAge(r.Context(), stats.Renewed(), stats.CreatedAt, time.Now())
 
+	if stats.Unchanged {
+		s.finishUnchanged(w, r, &req, &stats, lane, tv)
+		return
+	}
+
 	s.progress.analyzed.Add(1)
 	if stats.Members > 0 {
 		s.progress.exploded.Add(stats.MembersStored)
@@ -2204,6 +2209,49 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true}) //nolint:errcheck,errchkjson // best-effort response
 }
 
+// storeResult persists one accepted result, collapsing concurrent stores of the
+// same sha into one. Two producers analyzing the same artifact is ordinary — a
+// popular dependency is fetched by every scan on the fleet — and their stores
+// are identical, so the second waits for the first and takes its answer instead
+// of contending with it on the same rows. It is also the only thing that catches
+// a pair that raced: both consulted the corpus while it was still stale, so no
+// client-side check could have told either to stand down.
+func (s *apiServer) storeResult(
+	ctx context.Context, req *resultRequest, parsed *hopper.CleaveParseResult, tv string,
+) (hopper.StoreStats, error) {
+	shared, err, _ := s.resultStores.Do(req.SHA256, func() (any, error) {
+		return retryDBAccess(ctx, "store result", req.SHA256, func(ctx context.Context) (hopper.StoreStats, error) {
+			return s.db.StoreResult(ctx, req.SHA256, req.Raw, req.ML, req.LLM, parsed, tv)
+		})
+	})
+	stats, ok := shared.(hopper.StoreStats)
+	if !ok && err == nil {
+		return hopper.StoreStats{}, fmt.Errorf("hopper: store result %s: no stats returned", req.SHA256)
+	}
+	return stats, err
+}
+
+// finishUnchanged answers a store that wrote nothing because the row already
+// held that exact analysis. The work still happened and the claim still
+// finishes; only the write was skipped, and the producer is told so rather than
+// being left to infer a store from a bare "ok". Counted, not logged per event —
+// see recordRedundantResult.
+func (s *apiServer) finishUnchanged(
+	w http.ResponseWriter, r *http.Request,
+	req *resultRequest, stats *hopper.StoreStats, lane, tv string,
+) {
+	recordRedundantResult(r.Context(), lane)
+	claimedPath := s.tracker.release(req.SHA256)
+	s.tracker.recordResult(req.Worker, false)
+	slog.Debug("result already current; nothing stored",
+		"worker", req.Worker, "sha256", req.SHA256, "path", claimedPath,
+		"purl_base", stats.PURLBase, "traits_version", tv,
+		"previous_analysis_age", time.Since(stats.PriorAnalyzedAt).Round(time.Second).String())
+	w.Header().Set("Content-Type", "application/json")
+	//nolint:errcheck,errchkjson // best-effort response
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "stored": false, "reason": "current"})
+}
+
 // logResultRenewal says so when a store re-analyzed a sample, and does nothing
 // otherwise.
 //
@@ -2214,24 +2262,21 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 // renewal loop is a property of a coordinate, not of a digest.
 //
 // The traits version separates the two. A different one means the analyzer moved
-// and the re-analysis learned something. The same one means it could not have:
-// that is a guard that failed upstream, so it is a WARN and reaches the console
-// log, while an ordinary refresh stays at INFO in the file.
+// and the re-analysis learned something; that is an ordinary refresh and stays
+// at INFO in the file. A store that could not have learned anything no longer
+// reaches here at all — it returns at the unchanged fast path above, where it
+// is counted rather than logged. It was a WARN per event until 2026-09-08, when
+// 80,414 of them in 23 hours made the point that a steady-state rate belongs in
+// a counter: a log line per occurrence buries the incidents it sits among, and
+// gives no denominator to measure a fix against.
 func logResultRenewal(req *resultRequest, stats *hopper.StoreStats, tv string) {
 	if !stats.Renewed() {
 		return
 	}
-	args := []any{
+	slog.Info("result renewed under a new analyzer",
 		"sha256", req.SHA256, "purl_base", stats.PURLBase, "worker", req.Worker,
 		"previous_analysis_age", time.Since(stats.PriorAnalyzedAt).Round(time.Second).String(),
-		"traits_version", tv, "previous_traits_version", stats.PriorTraitsVersion,
-	}
-	if stats.Redundant(tv) {
-		slog.Warn("result renewed with no analyzer change; the re-analysis learned nothing", args...)
-		return
-	}
-
-	slog.Info("result renewed under a new analyzer", args...)
+		"traits_version", tv, "previous_traits_version", stats.PriorTraitsVersion)
 }
 
 // Claim tier names, used as the "tier" label on the hand-out age histogram and

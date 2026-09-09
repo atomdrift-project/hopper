@@ -6,6 +6,14 @@ import (
 	"time"
 )
 
+// flattened collapses every run of whitespace to one space, so the pinned
+// query text below asserts the SQL's SHAPE and not its line breaks. The traps
+// these tests exist to catch are semantic — a predicate dropped, EXISTS or
+// DISTINCT reintroduced — and none of them can hide in a re-wrap.
+func flattened(sql string) string {
+	return strings.Join(strings.Fields(sql), " ")
+}
+
 // The feed dropdown queries are loose index scans whose shape matters more
 // than usual: two planner traps (partial-index proof with parameters, and
 // EXISTS flattening) turn a ~2k-buffer query back into a full scan of the
@@ -23,7 +31,7 @@ func TestFeedEcosystemsSQL(t *testing.T) {
 		"LATERAL (SELECT 1 FROM samples s WHERE s.ecosystem = e.ecosystem AND s.ecosystem <> '' AND s.parent = '' AND s.cleave_result IS NOT NULL AND s.litmus_result IS NOT NULL AND s.created_at >= $1 LIMIT 1) hit",
 		"ORDER BY e.ecosystem",
 	} {
-		if !strings.Contains(sql, want) {
+		if !strings.Contains(flattened(sql), want) {
 			t.Errorf("SQL missing %q:\n%s", want, sql)
 		}
 	}

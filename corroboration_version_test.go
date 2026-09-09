@@ -49,7 +49,7 @@ func TestUnnarrowableClaimsStillCorroborateThePackage(t *testing.T) {
 	ctx := context.Background()
 	for _, affected := range []string{"", "*", ">= 0", "<2.0.0"} {
 		t.Run("affected="+affected, func(t *testing.T) {
-			db := openTestDB(t)
+			db := openTestDBContext(t, ctx)
 			const purl = "pkg:npm/broad"
 			s := mustVersionedSample(t, ctx, db, "c3", purl, "9.9.9")
 			if _, err := db.AddSightings(ctx, []Sighting{{

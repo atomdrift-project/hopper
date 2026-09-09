@@ -189,15 +189,19 @@ func TestQueueOrdersByEventDateNotDiscoveryDate(t *testing.T) {
 	// Recorded last, but the source says the attack is from last year.
 	old := time.Now().Add(-365 * 24 * time.Hour)
 	if _, err := db.AddSightings(ctx, []Sighting{
-		{Source: "fresh-event", Subject: "pkg:npm/todays-attack", Affected: "1.0.0",
-			Claim: ClaimMalicious, PublishedAt: time.Now().Add(-time.Minute)},
+		{
+			Source: "fresh-event", Subject: "pkg:npm/todays-attack", Affected: "1.0.0",
+			Claim: ClaimMalicious, PublishedAt: time.Now().Add(-time.Minute),
+		},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(2 * time.Millisecond)
 	if _, err := db.AddSightings(ctx, []Sighting{
-		{Source: "stale-event", Subject: "pkg:npm/last-years-attack", Affected: "2.0.0",
-			Claim: ClaimMalicious, PublishedAt: old},
+		{
+			Source: "stale-event", Subject: "pkg:npm/last-years-attack", Affected: "2.0.0",
+			Claim: ClaimMalicious, PublishedAt: old,
+		},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -257,8 +261,10 @@ func TestQueueDrainsPerProvider(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := db.AddSightings(ctx, []Sighting{
-		{Source: "stepsecurity", Subject: "pkg:npm/blueai-cli", Affected: "0.7.0",
-			Claim: ClaimMalicious, PublishedAt: time.Now().Add(-2 * time.Hour)},
+		{
+			Source: "stepsecurity", Subject: "pkg:npm/blueai-cli", Affected: "0.7.0",
+			Claim: ClaimMalicious, PublishedAt: time.Now().Add(-2 * time.Hour),
+		},
 	}); err != nil {
 		t.Fatal(err)
 	}

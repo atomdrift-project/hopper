@@ -2556,13 +2556,14 @@ func (db *DB) storeResultSQLite(
 	var firstAnalyzed, priorAnalyzed sql.NullString
 	var priorTraits, purlBase string
 	var createdAt sqliteNullTime
+	var llmMissing bool
 	if err := tx.QueryRowContext(ctx,
 		`SELECT label, label_source, source, feed, ecosystem, path, first_analyzed_at,
-		        analyzed_at, traits_version, purl_base, created_at
+		        analyzed_at, traits_version, purl_base, created_at, llm_result IS NULL
 		   FROM samples WHERE sha256 = ?`, sha256).
 		Scan(&parent.Label, &parent.LabelSource, &parent.Source, &parent.Feed,
 			&parent.Ecosystem, &parent.Path, &firstAnalyzed,
-			&priorAnalyzed, &priorTraits, &purlBase, &createdAt); err != nil {
+			&priorAnalyzed, &priorTraits, &purlBase, &createdAt, &llmMissing); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return StoreStats{}, fmt.Errorf("hopper: store result for absent sample %s: %w", sha256, ErrNotFound)
 		}
@@ -2580,6 +2581,12 @@ func (db *DB) storeResultSQLite(
 	stats.PriorTraitsVersion = priorTraits
 	stats.PURLBase = purlBase
 	stats.CreatedAt = createdAt.Time
+	// Same fast path as storeResultPG, and the same reason: the transaction
+	// below is the expensive half, and it would write what the row already says.
+	if unchangedStore(&stats, traitsVersion, llm, llmMissing) {
+		stats.Unchanged = true
+		return stats, nil
+	}
 
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE samples SET cleave_result = ?,
@@ -4347,7 +4354,8 @@ func (db *DB) markSightingsAttemptedSQLite(ctx context.Context, sightings []Sigh
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
 	now := time.Now().UTC()
-	for _, x := range sightings {
+	for i := range sightings {
+		x := &sightings[i] // 224 bytes; a copy per row buys nothing
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE sightings SET attempted_at = ?
 			WHERE source = ? AND subject = ? AND affected = ? AND attempted_at IS NULL`,
