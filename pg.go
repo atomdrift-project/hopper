@@ -3378,7 +3378,7 @@ const (
 			SELECT 1 FROM sightings g
 			WHERE g.subject = s.purl_base
 			  AND (
-				g.affected !~ '^[0-9]'
+				g.affected ~ '` + unnarrowableScope + `'
 				OR s.version = ANY (string_to_array(replace(g.affected, ' ', ''), ','))
 			  )
 		  )`

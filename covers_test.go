@@ -294,3 +294,39 @@ func TestWithVersionKeepsQualifiers(t *testing.T) {
 		}
 	}
 }
+
+// The repair tool must narrow the same way the marking does.
+//
+// TestReconcileClearsVersionMismatchedCorroboration covers this for a release
+// spelled 0.3.298, which is why the leading-digit test survived in
+// ReconcileCorroborated long after it was replaced everywhere else: every
+// release in that test begins with a digit. aikido spells composer releases
+// "v5.4.9", and for those the old rule read the claim as covering the whole
+// package and left the flag exactly where it was meant to clear it.
+func TestReconcileClearsVPrefixedVersionMismatch(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	const purl = "pkg:composer/yrodevgit/ctrx"
+	cited := mustVersionedSample(t, ctx, db, "d1", purl, "v5.4.9")
+	wrong := mustVersionedSample(t, ctx, db, "e2", purl, "v3.1.4")
+	if _, err := db.AddSightings(ctx, []Sighting{{
+		Source: "aikido", Subject: purl, Affected: "v5.4.9", Claim: ClaimMalicious,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	// The state the old marking left behind.
+	if err := setCorroborated(ctx, db, wrong, true); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.ReconcileCorroborated(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if corroborated(t, ctx, db, wrong) {
+		t.Error("v3.1.4 is named by no claim; reconcile is the repair for exactly this")
+	}
+	if !corroborated(t, ctx, db, cited) {
+		t.Error("reconcile cleared the release the claim names")
+	}
+}

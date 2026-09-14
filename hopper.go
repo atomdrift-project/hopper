@@ -7467,7 +7467,7 @@ func (db *DB) ReconcileCorroborated(ctx context.Context) (cleared int64, err err
 				SELECT 1 FROM sightings s
 				WHERE s.subject = b.purl_base
 				  AND (
-					s.affected !~ '^[0-9]'
+					s.affected ~ '` + unnarrowableScope + `'
 					OR b.version = ANY (string_to_array(replace(s.affected, ' ', ''), ','))
 				  )
 			  )
@@ -7522,6 +7522,8 @@ func (db *DB) reconcileLiteBatch(ctx context.Context, cursor int64) (last, inBat
 	if inBatch == 0 {
 		return 0, 0, 0, nil
 	}
+	//nolint:gosec // G202: liteUnnarrowableScope renders a fixed predicate from a
+	// literal column name; the only bound values are the two cursor ints.
 	res, err := db.lite.ExecContext(ctx, `
 		UPDATE samples SET corroborated = false
 		WHERE corroborated AND id > ? AND id <= ?
@@ -7530,7 +7532,7 @@ func (db *DB) reconcileLiteBatch(ctx context.Context, cursor int64) (last, inBat
 			SELECT 1 FROM sightings s
 			WHERE s.subject = samples.purl_base
 			  AND (
-				NOT (s.affected GLOB '[0-9]*')
+				`+liteUnnarrowableScope("s.affected")+`
 				OR ',' || replace(s.affected, ' ', '') || ',' LIKE '%,' || samples.version || ',%'
 			  )
 		  )`,
