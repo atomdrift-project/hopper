@@ -580,7 +580,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 				-- nothing else; anything we cannot narrow stays package-level.
 				-- Branching here rather than ORing keeps each UPDATE a
 				-- single-column index probe (TestMarkCorroboratedSQLShape).
-				IF NEW.affected ~ '^[0-9]' THEN
+				IF NEW.affected !~ '` + unnarrowableScope + `' THEN
 					` + markCorroboratedOnePURLVersionSQL + `;
 				ELSE
 					` + markCorroboratedOnePURLSQL + `;
@@ -6300,16 +6300,31 @@ const (
 	// See TestMarkCorroboratedSQLShape: an OR here is the /api/sightings timeout
 	// of 2026-08-17.
 	//
+	// unnarrowableScope is which side of that split a scope falls on: empty, or
+	// carrying a comparison operator. Its complement is a plain comma list of
+	// concrete releases.
+	//
+	// Written as one alternation rather than two ORed predicates because the
+	// shape test forbids an OR here, and matched on operators rather than on a
+	// leading digit -- the earlier spelling, '^[0-9]'. A release is not obliged
+	// to start with one: "v1.2.3" and a Go pseudo-version are exact versions
+	// that read as unnarrowable under that test, so a claim naming exactly one
+	// of them marked every release of the package. Erring the other way only
+	// under-marks, which is the direction this file already chose everywhere
+	// else.
+	//
 	// markCorroboratedByPURLSQL handles claims whose scope cannot be narrowed --
 	// '' (the source did not say), '*' (every release), or a range we cannot
 	// enumerate in SQL. Those stay package-level, which is correct rather than
 	// lax.
+	unnarrowableScope = `^\s*$|[<>=^~*]`
+
 	markCorroboratedByPURLSQL = `
 		UPDATE samples SET corroborated = true
 		WHERE purl_base = ANY($1) AND purl_base <> '' AND NOT corroborated
 		  AND EXISTS (
 			SELECT 1 FROM sightings s
-			WHERE s.subject = samples.purl_base AND s.affected !~ '^[0-9]'
+			WHERE s.subject = samples.purl_base AND s.affected ~ '` + unnarrowableScope + `'
 		  )`
 
 	// markCorroboratedByPURLVersionSQL handles the narrowable case: a claim that
@@ -6319,7 +6334,7 @@ const (
 		WHERE purl_base = ANY($1) AND purl_base <> '' AND NOT corroborated
 		  AND EXISTS (
 			SELECT 1 FROM sightings s
-			WHERE s.subject = samples.purl_base AND s.affected ~ '^[0-9]'
+			WHERE s.subject = samples.purl_base AND s.affected !~ '` + unnarrowableScope + `'
 			  AND samples.version = ANY (string_to_array(replace(s.affected, ' ', ''), ','))
 		  )`
 

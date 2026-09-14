@@ -254,6 +254,75 @@ func coversEveryRelease(s *Sighting) bool {
 	return strings.TrimSpace(s.Affected) == AllVersions
 }
 
+// Covers reports whether this claim is evidence about one particular release.
+//
+// The companion question to [coversEveryRelease], and deliberately not the same
+// one. Assess holds no version, so it asks "does this convict every release?"
+// and an unreadable scope must answer no. A caller that HAS the release in hand
+// asks the narrower question, and there an unreadable scope must answer yes:
+// the source said something about this package and nothing that lets us rule
+// this release out, so hiding the citation would lose it entirely.
+//
+// The split is why the two disagree on an empty Affected, and the disagreement
+// is the point — one decides a conviction, the other decides whether to show a
+// reader that somebody made a claim.
+//
+// Three cases:
+//
+//   - a digest subject names exact bytes, which have no releases: always true;
+//   - a scope naming concrete releases covers those and nothing else — this is
+//     the narrowing that keeps MAL-2025-6020 (is 3.3.1, 5.0.0) off is 0.1.2;
+//   - anything else — "", [AllVersions], or a range we will not guess at —
+//     stays package-level and covers whatever it is asked about.
+//
+// Mirrors markCorroboratedByPURLSQL and markCorroboratedByPURLVersionSQL, which
+// make the same split in SQL against samples.version.
+func (s *Sighting) Covers(version string) bool {
+	if isSHA256Hex(strings.ToLower(strings.TrimSpace(s.Subject))) {
+		return true
+	}
+	version = strings.TrimSpace(version)
+	named := namedVersions(s.Affected)
+	if version == "" || len(named) == 0 {
+		// Nothing to narrow with, or nothing to narrow to.
+		return true
+	}
+	return slices.Contains(named, version)
+}
+
+// namedVersions pulls the concrete releases a scope names, or nil when it names
+// none we can enumerate.
+//
+// A token is concrete when it carries no comparison operator. Tested that way
+// rather than by leading digit, which is what the SQL did until the same gap was
+// found here: "v1.2.3" and a Go pseudo-version are exact releases that do not
+// start with one, and reading them as unnarrowable marked every release of the
+// package instead of the single one named.
+//
+// A range yields nil for the whole scope rather than dropping one token,
+// because expanding "<1.3.0" needs a registry index nothing here has, and a
+// partial list would look like a complete one to the membership test.
+func namedVersions(affected string) []string {
+	var out []string
+	for v := range strings.SplitSeq(affected, ",") {
+		if v = strings.TrimSpace(v); v == "" {
+			continue
+		}
+		// "= 1.2.3" still names one immutable release; several feeds spell an
+		// exact version that way.
+		if after, ok := strings.CutPrefix(v, "="); ok && !strings.HasPrefix(v, ">=") && !strings.HasPrefix(v, "<=") {
+			if v = strings.TrimSpace(after); v == "" {
+				return nil
+			}
+		}
+		if strings.ContainsAny(v, "<>=^~* ") {
+			return nil // a range: it names no particular release
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
 // rank orders bases by how much a single one of them is worth. Unrecognized
 // values rank lowest, with Predicted, so a basis this build cannot interpret
 // can never outrank one it can.

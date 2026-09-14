@@ -65,6 +65,40 @@ func pragmaHasColumnIn(ctx context.Context, db *sql.DB, table, column string) in
 // without the drops an existing database keeps whatever body it was built with.
 // That is how the version-blind marking of 2026-09-08 would have survived the
 // fix on every database that already existed.
+// liteUnnarrowableScope is the SQLite spelling of pg.go's unnarrowableScope: a
+// claim whose scope names no particular release, so it speaks for the package.
+// col is how the sightings row is spelled where it is used — NEW.affected
+// inside a trigger, s.affected inside a subquery.
+//
+// SQLite has no regex, so the operator test is a GLOB character class rather
+// than a bracket expression, and the emptiness test is separate because GLOB
+// cannot express "or nothing at all". Both stand in for the leading-digit test
+// every SQLite copy used until the gap found in pg.go: "v1.2.3" is an exact
+// release that does not begin with a digit, and reading it as unnarrowable
+// marked every release of the package rather than the one named.
+//
+// A function because this had grown four copies — two triggers and the two
+// subqueries below — and the 2026-09-08 narrowing reached some of them and not
+// others. One spelling cannot drift from itself.
+func liteUnnarrowableScope(col string) string {
+	return `(trim(` + col + `) = '' OR ` + col + ` GLOB '*[<>=^~*]*')`
+}
+
+// The two arms addSightingsSQLite appends to its purl_base flag update. Same
+// split as markCorroboratedByPURL{,Version}SQL, and the partial-index predicate
+// (purl_base != ”) is repeated so SQLite uses the index as Postgres does.
+var (
+	liteMarkUnnarrowable = ` AND purl_base != '' AND EXISTS (
+				SELECT 1 FROM sightings s
+				WHERE s.subject = samples.purl_base AND ` + liteUnnarrowableScope("s.affected") + `
+			)`
+	liteMarkNamesVersion = ` AND purl_base != '' AND EXISTS (
+				SELECT 1 FROM sightings s
+				WHERE s.subject = samples.purl_base AND NOT ` + liteUnnarrowableScope("s.affected") + `
+				  AND ',' || replace(s.affected, ' ', '') || ',' LIKE '%,' || samples.version || ',%'
+			)`
+)
+
 var liteSightingCorroborationTriggers = []string{
 	`DROP TRIGGER IF EXISTS sightings_corroborate_trg`,
 	`DROP TRIGGER IF EXISTS sightings_uncorroborate_trg`,
@@ -82,7 +116,7 @@ var liteSightingCorroborationTriggers = []string{
 			UPDATE samples SET corroborated = 1
 			 WHERE purl_base = NEW.subject AND purl_base != '' AND corroborated = 0
 			   AND (
-			     NOT (NEW.affected GLOB '[0-9]*')
+			     ` + liteUnnarrowableScope("NEW.affected") + `
 			     OR ',' || replace(NEW.affected, ' ', '') || ',' LIKE '%,' || version || ',%'
 			   );
 		END`,
@@ -116,7 +150,7 @@ var liteSightingCorroborationTriggers = []string{
 			UPDATE samples SET corroborated = 1
 			 WHERE purl_base = NEW.subject AND purl_base != '' AND corroborated = 0
 			   AND (
-			     NOT (NEW.affected GLOB '[0-9]*')
+			     ` + liteUnnarrowableScope("NEW.affected") + `
 			     OR ',' || replace(NEW.affected, ' ', '') || ',' LIKE '%,' || version || ',%'
 			   );
 		END`,
@@ -4143,27 +4177,14 @@ func (db *DB) addSightingsSQLite(ctx context.Context, s []Sighting) (int, error)
 			}
 			return nil
 		}
-		// purl_base is a partial index (purl_base != ''); include that predicate
-		// so SQLite can use it the same way Postgres does.
-		const (
-			unnarrowable = ` AND purl_base != '' AND EXISTS (
-				SELECT 1 FROM sightings s
-				WHERE s.subject = samples.purl_base AND NOT (s.affected GLOB '[0-9]*')
-			)`
-			namesVersion = ` AND purl_base != '' AND EXISTS (
-				SELECT 1 FROM sightings s
-				WHERE s.subject = samples.purl_base AND s.affected GLOB '[0-9]*'
-				  AND ',' || replace(s.affected, ' ', '') || ',' LIKE '%,' || samples.version || ',%'
-			)`
-		)
 		shas, purls := splitSightingSubjects(subs)
 		if err := mark("sha256", "", shas); err != nil {
 			return 0, err
 		}
-		if err := mark("purl_base", unnarrowable, purls); err != nil {
+		if err := mark("purl_base", liteMarkUnnarrowable, purls); err != nil {
 			return 0, err
 		}
-		if err := mark("purl_base", namesVersion, purls); err != nil {
+		if err := mark("purl_base", liteMarkNamesVersion, purls); err != nil {
 			return 0, err
 		}
 	}
