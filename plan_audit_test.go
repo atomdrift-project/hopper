@@ -212,6 +212,46 @@ func TestPlanAuditClaimQueues(t *testing.T) {
 	t.Logf("stale_traits_candidates: ok\n%s", firstPlanLines(stale))
 }
 
+// TestPlanAuditRescanQueue covers the two statements that read the rescan queue:
+// the repair tier's claim query and the per-tier depth count.
+//
+// Both have the same failure mode and it is not a seq scan. The queue is
+// populated by bulk flagging runs, so every row in one batch shares a single
+// rescan_requested_at — the leading sort key discriminates nothing, and an
+// index that stops there forces Postgres to read EVERY queued entry, heap-fetch
+// each for score, and top-N sort the lot. That ran on every poll reaching the
+// tier, against 123,921 rows, for a LIMIT of a few hundred.
+// idx_samples_rescan_queue_q2 carries score so the walk stops at LIMIT; a Sort
+// node here means the ORDER BY and the index have drifted apart again.
+func TestPlanAuditRescanQueue(t *testing.T) {
+	db := openPlanDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	repair := explainText(t, ctx, db, `EXPLAIN `+repairCandidatesSQL, 200)
+	if planSeqScansSamples(repair) {
+		t.Errorf("repair_candidates: unexpected Seq Scan on samples:\n%s", repair)
+	}
+	if !strings.Contains(repair, "idx_samples_rescan_queue_q2") {
+		t.Errorf("repair_candidates: not using idx_samples_rescan_queue_q2:\n%s", repair)
+	}
+	if strings.Contains(repair, "Sort") {
+		t.Errorf("repair_candidates: plan sorts instead of walking the index in order; "+
+			"this is the whole-queue top-N sort the q2 index exists to remove:\n%s", repair)
+	}
+	t.Logf("repair_candidates: ok\n%s", firstPlanLines(repair))
+
+	depths := explainText(t, ctx, db, `EXPLAIN `+rescanPriorityDepthsSQL)
+	if planSeqScansSamples(depths) {
+		t.Errorf("rescan_priority_depths: unexpected Seq Scan on samples; the depth "+
+			"count must ride the queue index, not the 130M-row table:\n%s", depths)
+	}
+	if !strings.Contains(depths, "idx_samples_rescan_queue_q2") {
+		t.Errorf("rescan_priority_depths: not using idx_samples_rescan_queue_q2:\n%s", depths)
+	}
+	t.Logf("rescan_priority_depths: ok\n%s", firstPlanLines(depths))
+}
+
 func explainText(t *testing.T, ctx context.Context, db *DB, sql string, args ...any) string {
 	t.Helper()
 	rows, err := db.Pool().Query(ctx, sql, args...)

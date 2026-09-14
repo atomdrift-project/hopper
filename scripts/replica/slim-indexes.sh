@@ -200,7 +200,7 @@ idx_samples_pending_path
 idx_samples_pending_sighted
 idx_samples_pending_size
 idx_samples_reconcile_toplevel
-idx_samples_rescan_queue
+idx_samples_rescan_queue_q2
 idx_samples_review_interesting
 idx_samples_review_newest
 idx_samples_source_ecosystem

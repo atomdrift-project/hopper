@@ -53,7 +53,7 @@ type webDashboard struct {
 	progress      *loadProgress
 	tracker       *workerTracker
 	api           *apiServer // for live traits-version reads (refreshed every 2h)
-	rescanCache   *fido.Cache[string, int64]
+	rescanCache   *fido.Cache[string, hopper.RescanDepths]
 	ratesCache    *fido.Cache[string, hopper.AnalysisRates]
 	pendingCache  *fido.Cache[string, int64]
 	healthCache   *fido.Cache[string, hopper.WorkflowHealth]
@@ -178,7 +178,7 @@ func (wd *webDashboard) configure( //nolint:revive // argument-limit: dashboard 
 	wd.traitsVersion = traitsVersion
 	wd.rescanAge = rescanAge
 	wd.newestATCache = fido.New[string, time.Time](fido.Size(1), fido.TTL(dashCacheTTL))
-	wd.rescanCache = fido.New[string, int64](fido.Size(1), fido.TTL(dashCacheTTL))
+	wd.rescanCache = fido.New[string, hopper.RescanDepths](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.ratesCache = fido.New[string, hopper.AnalysisRates](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.pendingCache = fido.New[string, int64](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.seriesCache = fido.New[string, []queuePoint](fido.Size(1), fido.TTL(dashCacheTTL))
@@ -504,21 +504,27 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		})
 	}
 
-	var rescanPending int64
-	if db != nil && wd.traitsVersion != "" {
-		tv := wd.traitsVersion
-		ra := wd.rescanAge
+	// Every rescan tier, not just stale-traits. The traits version is read live
+	// from the API server rather than from wd.traitsVersion: the latter is a
+	// startup snapshot, and the 10-minute refresh that can turn the tier on
+	// later never reaches it. Gating the whole card on the snapshot is what let
+	// this render "0 pending / stale traits disabled" over a 123,921-row repair
+	// backlog that was in fact being handed out.
+	var depths hopper.RescanDepths
+	if db != nil {
+		tv, ra := wd.liveTraitsVersion(), wd.rescanAge
 		//nolint:contextcheck,errcheck // closure creates its own context; closure logs errors before returning
-		rescanPending, _ = wd.rescanCache.Fetch("rescan", func() (int64, error) {
+		depths, _ = wd.rescanCache.Fetch("rescan", func() (hopper.RescanDepths, error) {
 			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
 			defer cancel()
-			n, err := db.CountRescanPending(qctx, tv, ra)
+			d, err := db.RescanDepths(qctx, tv, ra)
 			if err != nil {
-				slog.Warn("dashboard: CountRescanPending failed", "error", err)
+				slog.Warn("dashboard: RescanDepths failed", "error", err)
 			}
-			return n, err
+			return d, err
 		})
 	}
+	rescanPending := depths.Total()
 
 	// Top-level analysis and rescan rates, measured at the DB so they count
 	// items the queue backlog is denominated in (parent = ''), not the ~80x
@@ -575,6 +581,15 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 			return n, err
 		})
 	}
+	// The other half of "not fully analyzed": rows that got a cleave verdict but
+	// no litmus (ml) envelope. Free — workflowHealth already counts it for the
+	// Workflow queues card, off the same partial index, in the round trip it was
+	// making anyway. Do NOT add a second query for this.
+	//
+	// Deliberately absent from totalExpected: these rows ARE analyzed as far as
+	// analyzedAbs is concerned, so adding them would count them on both sides of
+	// the progress fraction.
+	pendingLitmus := workflow.health.PendingLitmus
 	totalExpected := analyzedAbs + pending
 
 	wd.recordSample(sessionAnalyzed)
@@ -656,40 +671,42 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	buf.WriteString(`</div>`) // .progress
 
 	buf.WriteString(`<div class="queue-grid">`)
-	writeQueueCard(&buf, "Initial queue", fmt.Sprintf("%s pending", fmtN(pending)), func() string {
+	writeQueueCard(&buf, "Initial queue", fmt.Sprintf("%s pending", fmtN(pending+pendingLitmus)), func() string {
 		var parts []string
-		parts = append(parts, fmt.Sprintf("<em>%s</em> total", fmtN(totalExpected)))
+		// Split the headline, because the two halves are served by different
+		// tiers at very different rates: no-cleave is tiers S/U/B/1 at the top
+		// of the ladder, no-litmus reaches a worker only once something flags
+		// it into the repair tier (hopper rescan --missing-litmus), which sits
+		// below the whole unanalyzed backlog.
+		parts = append(parts, fmt.Sprintf("<em>%s</em> no cleave", fmtN(pending)))
+		if pendingLitmus > 0 {
+			parts = append(parts, fmt.Sprintf("<em>%s</em> no litmus", fmtN(pendingLitmus)))
+		}
 		if topLevelRate > 0.001 {
 			parts = append(parts, fmt.Sprintf("<em>%.2f</em>/s", topLevelRate))
 		}
 		if initialETA != "" {
-			parts = append(parts, "ETA <em>"+initialETA+"</em>")
+			// Explicitly the cleave half's ETA. topLevelRate measures analyses
+			// completing, which is what drains that half; the no-litmus half
+			// drains through the repair tier on leftover capacity, so folding
+			// it into this divisor would report an ETA that is wrong by orders
+			// of magnitude in the optimistic direction.
+			parts = append(parts, "cleave ETA <em>"+initialETA+"</em>")
 		}
 		return strings.Join(parts, " &middot; ")
 	}())
-	rescanMeta := "stale traits disabled"
-	if wd.traitsVersion != "" {
-		switch {
-		case rescanPending == 0:
-			rescanMeta = "caught up"
-		case rescanETA != "":
-			rescanMeta = "ETA <em>" + rescanETA + "</em>"
-		default:
-			// Below the floor for a meaningful ETA. Report the measured rate
-			// (rescans/hr) rather than asserting a cause — a low rate can be
-			// first-time analysis hogging the fleet OR workers starved waiting on
-			// a slow candidate query, and the dashboard can't tell which.
-			rescanMeta = fmt.Sprintf(`<span class="queue-note">barely draining &middot; %.0f/hr</span>`, rescanRate*3600)
-		}
-	}
-	writeQueueCard(&buf, "Rescan queue", fmt.Sprintf("%s pending", fmtN(rescanPending)), rescanMeta)
+	writeQueueCard(&buf, "Rescan queue", fmt.Sprintf("%s pending", fmtN(rescanPending)), rescanMeta(depths, rescanETA, rescanRate))
 
 	// Throughput tile: the rescan rate gets its own labeled home rather than
 	// hiding on the rescan card's ETA line. The headline is top-level items/s
 	// (what the queues drain in); the meta carries the much larger raw files/s
 	// (archive members included) and, when enabled, the rescan slice of it.
+	// The rescan rate is measured from analyses whose first_analyzed_at predates
+	// analyzed_at, which is true of every rescan tier — not just stale-traits.
+	// Gating its display on a traits version hid the repair tier's throughput
+	// for the same reason the card hid its depth.
 	throughputMeta := fmt.Sprintf("<em>%.0f</em> files/s", rate)
-	if wd.traitsVersion != "" {
+	if rescanRate > 0 || depths.Total() > 0 {
 		throughputMeta += fmt.Sprintf(" &middot; <em>%.2f</em> rescan/s", rescanRate)
 	}
 	writeQueueCard(&buf, "Throughput", fmt.Sprintf("%.2f items/s", topLevelRate), throughputMeta)
@@ -1027,23 +1044,38 @@ func (wd *webDashboard) pendingCount(ctx context.Context) int64 {
 	return n
 }
 
-// rescanPending returns the count of samples eligible for re-analysis under the
-// live traits version. Zero until the traits version is known.
+// liveTraitsVersion is the traits version to measure the stale-traits tier
+// against. wd.traitsVersion is only the value read at startup; the API server
+// re-reads it every 10 minutes, and claimLadder gates the tier on ITS copy. A
+// dashboard that consults the snapshot therefore reports a tier as disabled
+// while the ladder is serving it -- so prefer the live value and fall back.
+func (wd *webDashboard) liveTraitsVersion() string {
+	if wd.api != nil {
+		if v := wd.api.TraitsVersion(); v != "" {
+			return v
+		}
+	}
+	return wd.traitsVersion
+}
+
+// rescanPending returns the total depth of every re-analysis tier, for the
+// queue-depth metric series. Unlike the old stale-traits-only count it is not
+// gated on a traits version: the priority tiers exist regardless.
 func (wd *webDashboard) rescanPending(ctx context.Context) int64 {
-	if wd.db == nil || wd.rescanCache == nil || wd.traitsVersion == "" {
+	if wd.db == nil || wd.rescanCache == nil {
 		return 0
 	}
-	tv, ra := wd.traitsVersion, wd.rescanAge
-	n, _ := wd.rescanCache.Fetch("rescan", func() (int64, error) { //nolint:errcheck // cached value used on error
+	tv, ra := wd.liveTraitsVersion(), wd.rescanAge
+	d, _ := wd.rescanCache.Fetch("rescan", func() (hopper.RescanDepths, error) { //nolint:errcheck // cached value used on error
 		qctx, cancel := context.WithTimeout(ctx, dashQueryTimeout)
 		defer cancel()
-		n, err := wd.db.CountRescanPending(qctx, tv, ra)
+		d, err := wd.db.RescanDepths(qctx, tv, ra)
 		if err != nil {
-			slog.Warn("metrics: CountRescanPending failed", "error", err)
+			slog.Warn("metrics: RescanDepths failed", "error", err)
 		}
-		return n, err
+		return d, err
 	})
-	return n
+	return d.Total()
 }
 
 // analysisRates returns the top-level and rescan analysis counts over
@@ -1081,6 +1113,48 @@ func (wd *webDashboard) workflowHealth(ctx context.Context) (hopper.WorkflowHeal
 		return hopper.WorkflowHealth{}, false
 	}
 	return h, true
+}
+
+// rescanMeta is the Rescan queue card's sub-line: the per-tier split, then how
+// fast it is (or is not) draining.
+//
+// The tier breakdown is the point of the card. The three populations are
+// drained at different ladder positions by different queries, so a single total
+// with no split cannot answer the question an operator actually has, which is
+// "is the tier I care about moving". It also has to distinguish a stale-traits
+// tier that is EMPTY from one that is ABSENT: hopper drops that tier from the
+// ladder entirely when it cannot read a traits version from its analyzer, and
+// rendering that as "caught up" (or as a bare 0) is what hid a switched-off
+// tier for the whole of a 24h uptime.
+func rescanMeta(d hopper.RescanDepths, eta string, rate float64) string {
+	var parts []string
+	if d.Forced > 0 {
+		parts = append(parts, fmt.Sprintf("<em>%s</em> forced", fmtN(d.Forced)))
+	}
+	parts = append(parts, fmt.Sprintf("<em>%s</em> repair", fmtN(d.Repair)))
+	switch {
+	case !d.StaleTraitsEnabled:
+		// Not "0": the tier is not in the ladder, so its depth is unmeasured.
+		parts = append(parts, `<span class="queue-note">stale traits off</span>`)
+	case d.StaleTraits > 0:
+		parts = append(parts, fmt.Sprintf("<em>%s</em> stale traits", fmtN(d.StaleTraits)))
+	default:
+		// Enabled and empty. Says nothing, so the line stays about the tiers
+		// that do have work.
+	}
+	switch {
+	case d.Total() == 0:
+		parts = append(parts, "caught up")
+	case eta != "":
+		parts = append(parts, "ETA <em>"+eta+"</em>")
+	default:
+		// Below the floor for a meaningful ETA. Report the measured rate
+		// (rescans/hr) rather than asserting a cause — a low rate can be
+		// first-time analysis hogging the fleet OR workers starved waiting on
+		// a slow candidate query, and the dashboard can't tell which.
+		parts = append(parts, fmt.Sprintf(`<span class="queue-note">barely draining &middot; %.0f/hr</span>`, rate*3600))
+	}
+	return strings.Join(parts, " &middot; ")
 }
 
 func writeQueueCard(buf *strings.Builder, label, value, meta string) {

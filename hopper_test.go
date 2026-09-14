@@ -477,6 +477,116 @@ func TestStoreResultRecordsFetchedRel(t *testing.T) {
 	}
 }
 
+// TestMissingLitmusRepairQueue locks the litmus-null repair path. These rows are
+// the ones no claim tier can see -- every first-time tier requires
+// cleave_result IS NULL, which they fail, and nothing keys on litmus_result --
+// so the flag is the only thing that makes them reachable.
+func TestMissingLitmusRepairQueue(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	noLitmus := strings.Repeat("a", 64)   // cleave verdict, no ml → flagged
+	complete := strings.Repeat("b", 64)   // both → not
+	unanalyzed := strings.Repeat("c", 64) // neither → not (tier 1's job)
+	child := strings.Repeat("d", 64)      // member row → not
+	skipped := strings.Repeat("e", 64)    // no ml but skipped → not
+
+	insert := func(sha, skip, parent string, cleave, litmus []byte) {
+		t.Helper()
+		mustInsert(t, ctx, db, &Sample{
+			SHA256: sha, Source: "test", Label: "unknown", LabelSource: "test",
+			Path: "incoming/" + sha + ".tgz", Skip: skip, Parent: parent,
+			CleaveResult: cleave, LitmusResult: litmus,
+		})
+	}
+	cleave := []byte(`{"files":[{"sha":"x","type":"npm"}]}`)
+	ml := []byte(`{"prob":0.1}`)
+	insert(noLitmus, "", "", cleave, nil)
+	insert(complete, "", "", cleave, ml)
+	insert(unanalyzed, "", "", nil, nil)
+	insert(child, "", complete, cleave, nil)
+	insert(skipped, "skip-benign-archive-item", "", cleave, nil)
+
+	n, err := db.QueueMissingLitmusForRepair(ctx)
+	if err != nil {
+		t.Fatalf("QueueMissingLitmusForRepair: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("flagged %d samples, want only the litmus-less top-level one", n)
+	}
+	cands, err := db.RepairCandidates(ctx, 50)
+	if err != nil {
+		t.Fatalf("RepairCandidates: %v", err)
+	}
+	if len(cands) != 1 || cands[0].SHA256 != noLitmus {
+		t.Fatalf("repair candidates = %+v, want only %s", cands, noLitmus[:4])
+	}
+
+	// Re-running must not re-date the queue: a sweep that re-flagged rows every
+	// time it ran would keep pushing its own backlog behind itself.
+	again, err := db.QueueMissingLitmusForRepair(ctx)
+	if err != nil {
+		t.Fatalf("QueueMissingLitmusForRepair (rerun): %v", err)
+	}
+	if again != 0 {
+		t.Errorf("rerun flagged %d rows, want 0 (already queued)", again)
+	}
+}
+
+// TestRescanDepthsPerTier proves the depth count reports each tier separately
+// and, crucially, distinguishes a stale-traits tier that is EMPTY from one that
+// is ABSENT. Collapsing those two is what let the dashboard render "0 pending /
+// stale traits disabled" over a six-figure repair backlog that was draining.
+func TestRescanDepthsPerTier(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	repair := strings.Repeat("a", 64)
+	forced := strings.Repeat("b", 64)
+	idle := strings.Repeat("c", 64)
+
+	cleave := []byte(`{"files":[{"sha":"x","type":"npm"}]}`)
+	for _, sha := range []string{repair, forced, idle} {
+		mustInsert(t, ctx, db, &Sample{
+			SHA256: sha, Source: "test", Label: "unknown", LabelSource: "test",
+			Path: "incoming/" + sha + ".tgz", CleaveResult: cleave,
+		})
+	}
+	if _, err := db.QueueRescan(ctx, []string{repair}); err != nil {
+		t.Fatalf("QueueRescan: %v", err)
+	}
+	if err := db.RequestRescan(ctx, forced, 0); err != nil {
+		t.Fatalf("RequestRescan: %v", err)
+	}
+
+	// No traits version: the tier is not in the ladder, so its depth is
+	// unmeasured rather than zero — but the priority tiers still report.
+	off, err := db.RescanDepths(ctx, "", 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("RescanDepths (traits off): %v", err)
+	}
+	if off.StaleTraitsEnabled {
+		t.Error("StaleTraitsEnabled true with no traits version")
+	}
+	if off.Forced != 1 || off.Repair != 1 {
+		t.Errorf("depths = %+v, want Forced=1 Repair=1", off)
+	}
+	if off.Total() != 2 {
+		t.Errorf("Total() = %d, want 2; a disabled stale-traits tier must not zero the card", off.Total())
+	}
+
+	on, err := db.RescanDepths(ctx, "plan-audit-traits", 0)
+	if err != nil {
+		t.Fatalf("RescanDepths (traits on): %v", err)
+	}
+	if !on.StaleTraitsEnabled {
+		t.Error("StaleTraitsEnabled false with a traits version set")
+	}
+	if on.Forced != 1 || on.Repair != 1 {
+		t.Errorf("depths = %+v, want Forced=1 Repair=1", on)
+	}
+}
+
 // TestRepairQueue locks the repair tier end to end: QueueMissingMembersForRepair
 // flags only truncated top-level archives that lack member rows (priority 1),
 // RepairCandidates returns exactly those, and an interactive RequestRescan

@@ -1773,10 +1773,34 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`DROP INDEX IF EXISTS idx_samples_forced_rescan`,
 		`ALTER TABLE samples DROP COLUMN IF EXISTS forced_rescan_at`,
 		// Tiny partial index over queued rows only; covers both tier filters
-		// (rescan_priority = 1|2) and FIFO ordering by request time. Built
-		// CONCURRENTLY by the migration framework, so no lock.
-		`CREATE INDEX IF NOT EXISTS idx_samples_rescan_queue ` +
-			`ON samples(rescan_priority, rescan_requested_at) WHERE rescan_priority > 0`,
+		// (rescan_priority = 1|2), FIFO ordering by request time, and the
+		// worst-first tiebreak. Built CONCURRENTLY by the migration framework,
+		// so no lock.
+		//
+		// _q2 supersedes idx_samples_rescan_queue, which was keyed on
+		// (rescan_priority, rescan_requested_at) only. That could not serve
+		// repairCandidatesPG's `ORDER BY rescan_requested_at ASC, score DESC`,
+		// and the cost is not theoretical: the whole repair queue is a single
+		// bulk flagging run, so every row shares one rescan_requested_at and
+		// the leading key discriminates nothing. Postgres therefore read EVERY
+		// queued entry, heap-fetched each one for score, and top-N sorted the
+		// lot -- on every poll that reached the tier. Measured 2026-09-13:
+		// 123,921 rows for a LIMIT of a few hundred.
+		//
+		// Appending score DESC puts the index in the tier's exact ORDER BY, so
+		// the planner walks it and stops at LIMIT. The predicate also gains
+		// skip/parent so it matches what the tiers actually claim -- which is
+		// what lets RescanDepths count queued work index-only instead of
+		// heap-probing every entry to re-check two columns.
+		`CREATE INDEX IF NOT EXISTS idx_samples_rescan_queue_q2 ` +
+			`ON samples(rescan_priority, rescan_requested_at, score DESC) ` +
+			`WHERE rescan_priority > 0 AND skip = '' AND parent = ''`,
+		// Dropped only after _q2 exists above, so no poll falls between the two
+		// — the old index is the only thing keeping the repair tier off a seq
+		// scan of 130M rows. concurrentDropIndexDDL rewrites this to DROP INDEX
+		// CONCURRENTLY; a plain DROP would take ACCESS EXCLUSIVE and wait behind
+		// the replication COPY.
+		`DROP INDEX IF EXISTS idx_samples_rescan_queue`,
 
 		// Aggressive autovacuum on the hot table. Defaults wait for 20% dead
 		// tuples / 10% changed rows before kicking in, which on a 5M-row table
@@ -9517,16 +9541,109 @@ func (db *DB) forcedRescanCandidatesPG(ctx context.Context, hopperStart time.Tim
 // repairCandidatesPG returns repair-tier jobs (rescan_priority = 1), FIFO by
 // request time with worst score as tiebreak, via the idx_samples_rescan_queue
 // partial index — cheap regardless of backlog size.
+// repairCandidatesSQL is Tier 1b's statement. The WHERE and ORDER BY must stay
+// byte-identical to idx_samples_rescan_queue_q2's predicate and column list —
+// that is what the index exists for, and drift demotes the tier to a top-N sort
+// over the whole queue on every poll. plan_audit_test.go asserts the plan
+// carries no Sort node.
+const repairCandidatesSQL = `
+	SELECT sha256, path, size_bytes, file_type, created_at FROM samples
+	WHERE rescan_priority = 1 AND skip = '' AND parent = ''
+	ORDER BY rescan_requested_at ASC, score DESC
+	LIMIT $1`
+
+// rescanPriorityDepthsSQL counts queued rows per tier. Its WHERE is
+// idx_samples_rescan_queue_q2's predicate exactly, so the plan is an index-only
+// scan of the queue rather than a scan of samples.
+const rescanPriorityDepthsSQL = `
+	SELECT rescan_priority, count(*) FROM samples
+	WHERE rescan_priority > 0 AND skip = '' AND parent = ''
+	GROUP BY rescan_priority`
+
 func (db *DB) repairCandidatesPG(ctx context.Context, limit int) ([]ClaimJob, error) {
-	rows, err := db.pool.Query(ctx, `
-		SELECT sha256, path, size_bytes, file_type, created_at FROM samples
-		WHERE rescan_priority = 1 AND skip = '' AND parent = ''
-		ORDER BY rescan_requested_at ASC, score DESC
-		LIMIT $1`, limit)
+	rows, err := db.pool.Query(ctx, repairCandidatesSQL, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: repair candidates: %w", err)
 	}
 	return scanClaimRows(rows)
+}
+
+// rescanPriorityDepthsPG counts queued rows per rescan_priority. The predicate
+// is idx_samples_rescan_queue_q2's exactly, so this is an index-only scan of the
+// queue rather than a scan of samples: the queue is ~10^5 entries against a
+// 10^8-row table, and the dashboard runs this on a timer.
+func (db *DB) rescanPriorityDepthsPG(ctx context.Context) (map[int]int64, error) {
+	rows, err := db.pool.Query(ctx, rescanPriorityDepthsSQL)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: rescan priority depths: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[int]int64, 2)
+	for rows.Next() {
+		var pri int
+		var n int64
+		if err := rows.Scan(&pri, &n); err != nil {
+			return nil, fmt.Errorf("hopper: rescan priority depths: %w", err)
+		}
+		out[pri] = n
+	}
+	return out, rows.Err()
+}
+
+// queueMissingLitmusForRepairPG flags every top-level sample that has a cleave
+// verdict but no litmus (ml) envelope. Such a row is finished as far as every
+// claim tier is concerned -- they all key on cleave_result -- so without an
+// explicit flag it is never offered to anyone again, and the analysis it is
+// missing never arrives. Measured 2026-09-13: 170,991 rows, none of them from
+// the current day, i.e. an accumulated residue rather than an active leak.
+//
+// Candidate selection rides idx_samples_pending_litmus_group, whose partial
+// predicate is this one, so each batch walks the ~10^5-row queue rather than the
+// 10^8-row table.
+//
+// Batched by id cursor, like queuePreIdentForRepairPG and for the same two
+// reasons, both of which bite hard at this row count. No statement locks more
+// than one batch, so a concurrent claim poll is never stuck behind the sweep.
+// And logical replication ships a transaction as a unit: one 171k-row UPDATE
+// decodes and applies as one lump on the subscriber, which is the shape most
+// likely to spike replica lag on a link whose single-threaded decode is already
+// the binding constraint.
+//
+// It does NOT bump updated_at, deliberately -- again matching the pre-ident
+// sweep. updated_at carries five indexes on this table, so re-stamping it is
+// most of what a bulk flagging run costs in WAL and index churn, and nothing
+// reads it to decide whether a rescan is due. Resumable and idempotent: already
+// flagged rows fail the rescan_priority = 0 predicate on a re-run.
+func (db *DB) queueMissingLitmusForRepairPG(ctx context.Context) (int64, error) {
+	const batch = 20000
+	var total int64
+	var cursor int64
+	for {
+		var n int64
+		var next *int64
+		err := db.pool.QueryRow(ctx, `
+			WITH batch AS (
+				SELECT id FROM samples
+				 WHERE id > $1 AND parent = '' AND skip = '' AND rescan_priority = 0
+				   AND cleave_result IS NOT NULL AND litmus_result IS NULL
+				 ORDER BY id LIMIT $2
+			), flagged AS (
+				UPDATE samples s
+				   SET rescan_priority = 1,
+				       rescan_requested_at = COALESCE(rescan_requested_at, now())
+				  FROM batch b WHERE s.id = b.id
+			)
+			SELECT count(*), max(id) FROM batch`, cursor, batch).Scan(&n, &next)
+		if err != nil {
+			return total, fmt.Errorf("hopper: queue missing-litmus batch: %w", err)
+		}
+		total += n
+		if n < batch || next == nil {
+			return total, nil
+		}
+		cursor = *next
+		slog.Info("missing-litmus rescan progress", "cursor", cursor, "flagged", total)
+	}
 }
 
 // queueRescanPG flags specific top-level samples for repair-tier re-analysis,

@@ -4626,6 +4626,39 @@ func (db *DB) QueueMissingMembersForRepair(ctx context.Context) (int64, error) {
 	return n, err
 }
 
+// QueueMissingLitmusForRepair flags every top-level sample holding a cleave
+// verdict but no litmus (ml) envelope, so the repair tier re-analyzes it.
+//
+// These rows are invisible to the claim ladder without it. Every tier that
+// hands out first-time work keys on cleave_result IS NULL, which they fail, and
+// no tier keys on litmus_result at all — so a row that lost its ml section is
+// not "queued", it is unreachable, and stays that way indefinitely. Measured on
+// production 2026-09-13: 170,991 such rows, the oldest ~70 days, with none from
+// the current day (so an accumulated residue, not an active leak).
+//
+// Flagging is deliberately manual rather than automatic on a timer. The repair
+// tier is FIFO by request time, so a sweep that re-flagged rows each time it
+// ran would keep re-dating the same backlog and starve whatever was queued
+// behind it; and if the underlying cause is still live, a re-analysis
+// reproduces the same empty ml and the row comes straight back. Run it, watch
+// the depth fall, and investigate if it does not.
+//
+// Returns the number flagged. Rows already queued at any priority are left
+// alone, so it is safe to re-run.
+func (db *DB) QueueMissingLitmusForRepair(ctx context.Context) (int64, error) {
+	var n int64
+	var err error
+	if db.pool != nil {
+		n, err = db.queueMissingLitmusForRepairPG(ctx)
+	} else {
+		n, err = db.queueMissingLitmusForRepairSQLite(ctx)
+	}
+	if err == nil && n > 0 {
+		db.flushLookups()
+	}
+	return n, err
+}
+
 // SampleAnalyzed reports whether a sample with the given SHA-256 exists
 // in the DB and, if so, whether its cleave_result is populated. Used by
 // prism's SSE wait endpoint for sub-100ms upload→render notification: a
@@ -5454,10 +5487,86 @@ func (db *DB) CountPending(ctx context.Context) (int64, error) {
 	return n, err
 }
 
+// RescanDepths is how much re-analysis work is queued, split by the claim tier
+// that drains it. The three are genuinely different populations, not one number
+// cut three ways, so an operator surface that collapses them hides the thing it
+// is being read for.
+//
+// It exists because the dashboard's "Rescan queue" card used to be
+// [DB.CountRescanPending] alone -- the stale-traits tier -- and reported
+// "0 pending / stale traits disabled" while 123,921 rows sat in the repair
+// tier and were in fact being handed out. A card naming a whole class of work
+// and counting one tier of it is worse than no card: it reads as authoritative
+// and is wrong in the direction that stops anyone investigating.
+type RescanDepths struct {
+	// Forced is tier 0: rescan_priority = 2, an operator or prism's per-file
+	// rescan button. Drained ahead of the unanalyzed backlog.
+	Forced int64
+	// Repair is tier 1b: rescan_priority = 1, bulk background re-analysis.
+	// Drained behind the unanalyzed backlog.
+	Repair int64
+	// StaleTraits is tier 3: analyzed under a superseded traits version. Zero
+	// when the tier is not configured, which is NOT the same as "caught up" --
+	// see StaleTraitsEnabled.
+	StaleTraits int64
+	// StaleTraitsEnabled reports whether the stale-traits tier is in the claim
+	// ladder at all. False means hopper could not read a traits version from
+	// its analyzer, so the tier is absent and StaleTraits is unmeasured rather
+	// than empty. Callers must render those two states differently.
+	StaleTraitsEnabled bool
+}
+
+// Total is the whole re-analysis backlog across tiers.
+func (d RescanDepths) Total() int64 { return d.Forced + d.Repair + d.StaleTraits }
+
+// RescanDepths counts queued re-analysis work per tier. currentTraits and
+// rescanAge are the stale-traits tier's parameters; an empty currentTraits
+// leaves that tier unmeasured (StaleTraitsEnabled false) exactly as it leaves
+// it out of the claim ladder.
+//
+// The priority tiers cost one grouped index-only scan of
+// idx_samples_rescan_queue_q2, whose predicate is the tiers' own
+// (rescan_priority > 0 AND skip = ” AND parent = ”). That is the whole reason
+// the index carries skip/parent: counting is a dashboard-cadence query over a
+// 130M-row table, and re-checking two columns on the heap for every queued row
+// is the difference between an index-only scan of the queue and a probe per
+// entry.
+func (db *DB) RescanDepths(ctx context.Context, currentTraits string, rescanAge time.Duration) (RescanDepths, error) {
+	var d RescanDepths
+	byPriority, err := db.rescanPriorityDepths(ctx)
+	if err != nil {
+		return d, err
+	}
+	d.Forced, d.Repair = byPriority[2], byPriority[1]
+
+	if currentTraits == "" {
+		return d, nil
+	}
+	d.StaleTraitsEnabled = true
+	n, err := db.CountRescanPending(ctx, currentTraits, rescanAge)
+	if err != nil {
+		return d, err
+	}
+	d.StaleTraits = n
+	return d, nil
+}
+
+// rescanPriorityDepths returns queued row counts keyed by rescan_priority.
+func (db *DB) rescanPriorityDepths(ctx context.Context) (map[int]int64, error) {
+	if db.pool != nil {
+		return db.rescanPriorityDepthsPG(ctx)
+	}
+	return db.rescanPriorityDepthsSQLite(ctx)
+}
+
 // CountRescanPending returns the number of previously analyzed samples
 // eligible for re-analysis due to stale traits (matching the tier-2 claim
 // criteria: stale traits version AND analyzed longer ago than rescanAge).
 // Returns 0 if currentTraits is empty (rescan disabled).
+//
+// This is ONE tier of the rescan backlog. Operator surfaces want
+// [DB.RescanDepths]; reach for this directly only when the stale-traits
+// population specifically is the question.
 func (db *DB) CountRescanPending(ctx context.Context, currentTraits string, rescanAge time.Duration) (int64, error) {
 	if currentTraits == "" {
 		return 0, nil

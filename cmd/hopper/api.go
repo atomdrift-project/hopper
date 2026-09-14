@@ -1748,20 +1748,26 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(jobs) == 0 {
-		var rescanPending int64
-		if s.TraitsVersion() != "" {
-			if n, err := s.db.CountRescanPending(ctx, s.TraitsVersion(), s.rescanAge); err == nil {
-				rescanPending = n
-			} else {
-				slog.Debug("count rescan pending failed", "worker", worker, "error", err)
-			}
+		// Per-tier, because "the ladder gave this worker nothing" is answered
+		// by which tiers were empty, not by one total. Costs no more than the
+		// stale-traits count this replaced: that one scans millions of rows,
+		// the priority half is an index-only scan of the queue, and the
+		// stale-traits half still only runs when the tier is configured.
+		var depths hopper.RescanDepths
+		if d, err := s.db.RescanDepths(ctx, s.TraitsVersion(), s.rescanAge); err == nil {
+			depths = d
+		} else {
+			slog.Debug("rescan depths failed", "worker", worker, "error", err)
 		}
 
 		slog.Info("no work available", "worker", worker,
 			"active_claims", s.tracker.activeClaims(worker),
 			"traits_version", s.TraitsVersion(),
 			"rescan_age", s.rescanAge,
-			"rescan_pending", rescanPending,
+			"rescan_forced", depths.Forced,
+			"rescan_repair", depths.Repair,
+			"rescan_stale_traits", depths.StaleTraits,
+			"stale_traits_enabled", depths.StaleTraitsEnabled,
 			"force_rescan_prefixes", len(s.forceRescanPrefixes))
 		w.WriteHeader(http.StatusNoContent)
 		return

@@ -5999,6 +5999,45 @@ func (db *DB) queueMissingMembersForRepairSQLite(ctx context.Context) (int64, er
 	return res.RowsAffected()
 }
 
+// rescanPriorityDepthsSQLite mirrors rescanPriorityDepthsPG.
+func (db *DB) rescanPriorityDepthsSQLite(ctx context.Context) (map[int]int64, error) {
+	rows, err := db.lite.QueryContext(ctx, `
+		SELECT rescan_priority, count(*) FROM samples
+		WHERE rescan_priority > 0 AND skip = '' AND parent = ''
+		GROUP BY rescan_priority`)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: rescan priority depths: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // best-effort cleanup
+	out := make(map[int]int64, 2)
+	for rows.Next() {
+		var pri int
+		var n int64
+		if err := rows.Scan(&pri, &n); err != nil {
+			return nil, fmt.Errorf("hopper: rescan priority depths: %w", err)
+		}
+		out[pri] = n
+	}
+	return out, rows.Err()
+}
+
+// queueMissingLitmusForRepairSQLite mirrors queueMissingLitmusForRepairPG.
+func (db *DB) queueMissingLitmusForRepairSQLite(ctx context.Context) (int64, error) {
+	// No updated_at bump and no batching, both matching the PG twin: see
+	// queueMissingLitmusForRepairPG. SQLite backs local and test databases,
+	// where the population is small enough that one statement is the whole
+	// sweep.
+	res, err := db.lite.ExecContext(ctx, `
+		UPDATE samples SET rescan_priority = 1,
+		    rescan_requested_at = COALESCE(rescan_requested_at, strftime('%Y-%m-%dT%H:%M:%f','now'))
+		WHERE parent = '' AND skip = '' AND rescan_priority = 0
+		  AND cleave_result IS NOT NULL AND litmus_result IS NULL`)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: queue missing-litmus samples: %w", err)
+	}
+	return res.RowsAffected()
+}
+
 // sampleAnalyzedSQLite mirrors sampleAnalyzedPG: cheap status query that
 // avoids pulling the cleave_result blob during tight poll loops.
 func (db *DB) sampleAnalyzedSQLite(ctx context.Context, sha256 string) (exists, analyzed bool, err error) {

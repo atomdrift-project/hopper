@@ -2627,13 +2627,15 @@ func sampleQueueMetrics(
 		slog.Warn("queue metrics: count pending failed", "error", err)
 		return
 	}
+	// Every rescan tier. Gating this on traitsVersion recorded a flat zero for
+	// the whole series whenever the stale-traits tier was off, which made the
+	// rescan-depth graph agree with the (equally wrong) card instead of
+	// contradicting it.
 	var rescan int64
-	if traitsVersion != "" {
-		if n, err := db.CountRescanPending(qctx, traitsVersion, rescanAge); err == nil {
-			rescan = n
-		} else {
-			slog.Debug("queue metrics: count rescan failed", "error", err)
-		}
+	if d, err := db.RescanDepths(qctx, traitsVersion, rescanAge); err == nil {
+		rescan = d.Total()
+	} else {
+		slog.Debug("queue metrics: rescan depths failed", "error", err)
 	}
 	completed := progress.analyzed.Load()
 
@@ -2738,7 +2740,8 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 			newestAnalyzedAt, _ = db.NewestAnalyzedAt(ctx) //nolint:errcheck // best-effort; zero time is acceptable fallback
 			if lastRescanAt.IsZero() || time.Since(lastRescanAt) >= rescanRecompute {
 				qctx, cancel := context.WithTimeout(ctx, dashQueryTimeout)
-				rescanPending, _ = db.CountRescanPending(qctx, traitsVersion, rescanAge) //nolint:errcheck // best-effort; zero is acceptable fallback
+				d, _ := db.RescanDepths(qctx, traitsVersion, rescanAge) //nolint:errcheck // best-effort; zero is acceptable fallback
+				rescanPending = d.Total()
 				cancel()
 				lastRescanAt = time.Now()
 			}
@@ -4595,6 +4598,9 @@ func cmdRepairMissing(ctx context.Context) error {
 // drained behind new ingestion so it never starves fresh work. With
 // --missing-members it flags every truncated archive that has no member rows —
 // the historical data-loss backlog from the old async explosion. With
+// --missing-litmus it flags every top-level sample that has a cleave verdict but
+// no litmus (ml) envelope; those rows match no claim tier's predicate, so this
+// is the only thing that makes them reachable again. With
 // --pre-ident it flags every active top-level sample whose stored envelope
 // predates the per-file identity block (claims backfill; --types narrows the
 // sweep for a tiered rollout, --dry-run counts without flagging). Otherwise it
@@ -4604,6 +4610,7 @@ func cmdRescan(ctx context.Context) error {
 	f := flag.NewFlagSet("rescan", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
 	missingMembers := f.Bool("missing-members", false, "flag every truncated archive that has no member rows")
+	missingLitmus := f.Bool("missing-litmus", false, "flag every top-level sample with a cleave verdict but no litmus (ml) envelope")
 	preIdent := f.Bool("pre-ident", false, "flag active top-level samples analyzed before the identity-block envelope (claims backfill)")
 	types := f.String("types", "", "with --pre-ident: comma-separated file_type filter, e.g. pe,macho,elf (empty = every type)")
 	dryRun := f.Bool("dry-run", false, "with --pre-ident: count matching rows without flagging them")
@@ -4627,6 +4634,15 @@ func cmdRescan(ctx context.Context) error {
 		return nil
 	}
 
+	if *missingLitmus {
+		n, err := db.QueueMissingLitmusForRepair(ctx)
+		if err != nil {
+			return err
+		}
+		slog.Info("queued litmus-less samples for repair", "count", n)
+		return nil
+	}
+
 	if *preIdent {
 		var fileTypes []string
 		for t := range strings.SplitSeq(*types, ",") {
@@ -4644,7 +4660,7 @@ func cmdRescan(ctx context.Context) error {
 
 	shas := f.Args()
 	if len(shas) == 0 {
-		return errors.New("rescan: pass --missing-members, --pre-ident, or one or more SHA-256 arguments")
+		return errors.New("rescan: pass --missing-members, --missing-litmus, --pre-ident, or one or more SHA-256 arguments")
 	}
 	norm := make([]string, len(shas))
 	for i, s := range shas {
