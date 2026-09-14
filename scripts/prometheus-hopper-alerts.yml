@@ -161,6 +161,28 @@ groups:
           summary: "Hopper analysis has stalled"
           description: "No sample analyzed in {{ $value | printf \"%.0f\" }}s while the pending queue is non-empty."
 
+      # The rescan backlog is not draining. This is the alert the age tier was
+      # missing for its entire life: its predecessor gated itself on a traits
+      # version it could not read, returned nothing on every poll, and reported
+      # a depth of zero while doing it, so "switched off" and "caught up" were
+      # the same picture. 47% of servable samples were past 60 days before
+      # anyone noticed.
+      #
+      # Rescans are the LAST tier in the claim ladder, so a sustained zero is
+      # not necessarily a bug -- it is also what saturation upstream looks like.
+      # Either way the backlog is not being worked and someone should know which
+      # of the two it is. Six hours is long enough that an ingestion burst does
+      # not page.
+      - alert: HopperRescanNotDraining
+        expr: hopper_queue_rescan > 0 and hopper_analysis_rate_per_second{tier="rescan"} == 0
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/docs/runbook.md#hopperrescannotdraining"
+          summary: "Hopper rescan queue is not draining"
+          description: "{{ $value | printf \"%.0f\" }} samples queued for re-analysis with a zero rescan rate for 6h; the tier is starved by the tiers above it or not running."
+
       # Ingestion has stopped feeding the pipeline: no new sample added in an
       # hour. Trends a dead forager/walk upstream.
       - alert: HopperIngestionStalled

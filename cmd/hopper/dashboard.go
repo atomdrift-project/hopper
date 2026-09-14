@@ -38,10 +38,16 @@ const dashCacheTTL = 45 * time.Second
 // first-time analysis, so a short window swings between zero and a spike.
 const analysisRateWindow = 60 * time.Minute
 
-// minRescanRate is the rescans/sec below which the backlog is treated as not
-// draining: first-time analysis is consuming the whole fleet, so any ETA would
-// be a meaningless multi-year figure. ~72/hr.
-const minRescanRate = 0.02
+// etaWindow is the trailing span of sampled queue depths whose slope drives the
+// queue ETAs, and etaMinSpan/etaMinPoints are the least history that slope is
+// trusted on. Six hours smooths the bursty way rescans are serviced -- they run
+// on capacity left over after first-time analysis -- while still tracking
+// today's conditions rather than last week's.
+const (
+	etaWindow    = 6 * time.Hour
+	etaMinSpan   = time.Hour
+	etaMinPoints = 4
+)
 
 // webDashboard serves a self-contained HTML page. Auto-refreshes every 60s;
 // expensive stats are cached (dashCacheTTL) so most refreshes hit memory.
@@ -512,12 +518,12 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	// backlog that was in fact being handed out.
 	var depths hopper.RescanDepths
 	if db != nil {
-		tv, ra := wd.liveTraitsVersion(), wd.rescanAge
+		ra := wd.rescanAge
 		//nolint:contextcheck,errcheck // closure creates its own context; closure logs errors before returning
 		depths, _ = wd.rescanCache.Fetch("rescan", func() (hopper.RescanDepths, error) {
 			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
 			defer cancel()
-			d, err := db.RescanDepths(qctx, tv, ra)
+			d, err := db.RescanDepths(qctx, ra)
 			if err != nil {
 				slog.Warn("dashboard: RescanDepths failed", "error", err)
 			}
@@ -595,19 +601,12 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	wd.recordSample(sessionAnalyzed)
 	rate, nodeRateByName := wd.ratesOver(15 * time.Minute)
 
-	var initialETA string
-	if topLevelRate > 0.001 && pending > 0 {
-		initialETA = formatETA(time.Duration(float64(pending)/topLevelRate) * time.Second)
-	}
-	// Rescan ETA divides the backlog by the *measured* rescan rate, not the
-	// overall analysis rate: rescans are the lowest claim tier and only run on
-	// capacity left after first-time analysis, so the total rate overstates
-	// progress by orders of magnitude. A near-zero rate means ingestion is
-	// consuming the whole fleet and the backlog isn't draining.
-	var rescanETA string
-	if rescanRate > minRescanRate && rescanPending > 0 {
-		rescanETA = formatETA(time.Duration(float64(rescanPending)/rescanRate) * time.Second)
-	}
+	// Both ETAs come from the OBSERVED slope of the backlog, not from a
+	// throughput rate divided into a depth. See queueETA for why that model was
+	// always optimistic.
+	etaPts := wd.etaPoints(r.Context())
+	initialETA, _ := queueETA(pending, etaPts, func(p queuePoint) int64 { return p.Pending })
+	rescanETA, rescanDrain := queueETA(rescanPending, etaPts, func(p queuePoint) int64 { return p.Rescan })
 
 	pct := 0.0
 	if totalExpected > 0 {
@@ -686,16 +685,14 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 			parts = append(parts, fmt.Sprintf("<em>%.2f</em>/s", topLevelRate))
 		}
 		if initialETA != "" {
-			// Explicitly the cleave half's ETA. topLevelRate measures analyses
-			// completing, which is what drains that half; the no-litmus half
-			// drains through the repair tier on leftover capacity, so folding
-			// it into this divisor would report an ETA that is wrong by orders
-			// of magnitude in the optimistic direction.
+			// Explicitly the cleave half's ETA: it is the slope of the no-cleave
+			// depth alone. The no-litmus half drains through the repair tier on
+			// leftover capacity and has its own, much flatter, slope.
 			parts = append(parts, "cleave ETA <em>"+initialETA+"</em>")
 		}
 		return strings.Join(parts, " &middot; ")
 	}())
-	writeQueueCard(&buf, "Rescan queue", fmt.Sprintf("%s pending", fmtN(rescanPending)), rescanMeta(depths, rescanETA, rescanRate))
+	writeQueueCard(&buf, "Rescan queue", fmt.Sprintf("%s pending", fmtN(rescanPending)), rescanMeta(depths, rescanETA, rescanDrain))
 
 	// Throughput tile: the rescan rate gets its own labeled home rather than
 	// hiding on the rescan card's ETA line. The headline is top-level items/s
@@ -1044,20 +1041,6 @@ func (wd *webDashboard) pendingCount(ctx context.Context) int64 {
 	return n
 }
 
-// liveTraitsVersion is the traits version to measure the stale-traits tier
-// against. wd.traitsVersion is only the value read at startup; the API server
-// re-reads it every 10 minutes, and claimLadder gates the tier on ITS copy. A
-// dashboard that consults the snapshot therefore reports a tier as disabled
-// while the ladder is serving it -- so prefer the live value and fall back.
-func (wd *webDashboard) liveTraitsVersion() string {
-	if wd.api != nil {
-		if v := wd.api.TraitsVersion(); v != "" {
-			return v
-		}
-	}
-	return wd.traitsVersion
-}
-
 // rescanPending returns the total depth of every re-analysis tier, for the
 // queue-depth metric series. Unlike the old stale-traits-only count it is not
 // gated on a traits version: the priority tiers exist regardless.
@@ -1065,11 +1048,11 @@ func (wd *webDashboard) rescanPending(ctx context.Context) int64 {
 	if wd.db == nil || wd.rescanCache == nil {
 		return 0
 	}
-	tv, ra := wd.liveTraitsVersion(), wd.rescanAge
+	ra := wd.rescanAge
 	d, _ := wd.rescanCache.Fetch("rescan", func() (hopper.RescanDepths, error) { //nolint:errcheck // cached value used on error
 		qctx, cancel := context.WithTimeout(ctx, dashQueryTimeout)
 		defer cancel()
-		d, err := wd.db.RescanDepths(qctx, tv, ra)
+		d, err := wd.db.RescanDepths(qctx, ra)
 		if err != nil {
 			slog.Warn("metrics: RescanDepths failed", "error", err)
 		}
@@ -1126,33 +1109,31 @@ func (wd *webDashboard) workflowHealth(ctx context.Context) (hopper.WorkflowHeal
 // ladder entirely when it cannot read a traits version from its analyzer, and
 // rendering that as "caught up" (or as a bare 0) is what hid a switched-off
 // tier for the whole of a 24h uptime.
-func rescanMeta(d hopper.RescanDepths, eta string, rate float64) string {
+func rescanMeta(d hopper.RescanDepths, eta string, drain float64) string {
 	var parts []string
 	if d.Forced > 0 {
 		parts = append(parts, fmt.Sprintf("<em>%s</em> forced", fmtN(d.Forced)))
 	}
 	parts = append(parts, fmt.Sprintf("<em>%s</em> repair", fmtN(d.Repair)))
-	switch {
-	case !d.StaleTraitsEnabled:
-		// Not "0": the tier is not in the ladder, so its depth is unmeasured.
-		parts = append(parts, `<span class="queue-note">stale traits off</span>`)
-	case d.StaleTraits > 0:
-		parts = append(parts, fmt.Sprintf("<em>%s</em> stale traits", fmtN(d.StaleTraits)))
-	default:
-		// Enabled and empty. Says nothing, so the line stays about the tiers
-		// that do have work.
+	// No "off" state to render any more: the age tier is always in the ladder,
+	// so zero means caught up rather than unmeasured.
+	if d.Age > 0 {
+		parts = append(parts, fmt.Sprintf("<em>%s</em> past rescan age", fmtN(d.Age)))
 	}
 	switch {
 	case d.Total() == 0:
 		parts = append(parts, "caught up")
 	case eta != "":
 		parts = append(parts, "ETA <em>"+eta+"</em>")
+	case drain < 0:
+		// Growing. Saying so is the whole point: this is the state every
+		// previous version of this card rendered as a cheerful few hours.
+		parts = append(parts, fmt.Sprintf(`<span class="queue-note">not draining &middot; +%.0f/hr</span>`, -drain*3600))
 	default:
-		// Below the floor for a meaningful ETA. Report the measured rate
-		// (rescans/hr) rather than asserting a cause — a low rate can be
-		// first-time analysis hogging the fleet OR workers starved waiting on
-		// a slow candidate query, and the dashboard can't tell which.
-		parts = append(parts, fmt.Sprintf(`<span class="queue-note">barely draining &middot; %.0f/hr</span>`, rate*3600))
+		// Flat, or not enough history yet to call it. No cause asserted: a flat
+		// queue can be first-time analysis hogging the fleet OR workers starved
+		// on a slow candidate query, and the dashboard cannot tell which.
+		parts = append(parts, `<span class="queue-note">not draining</span>`)
 	}
 	return strings.Join(parts, " &middot; ")
 }
@@ -1465,6 +1446,85 @@ func writeMiniGraph(buf *strings.Builder, title, cur string, vals []float64, col
 // ---------------------------------------------------------------------------
 // Formatting helpers.
 // ---------------------------------------------------------------------------.
+
+// etaPoints fetches the trailing queue-depth samples the ETAs are measured from.
+// Local SQLite over a handful of rows (one sample per 5 minutes), so it is not
+// worth a cache. Returns nil when the metrics cache is unavailable, which the
+// callers render as "measuring" rather than as a number.
+func (wd *webDashboard) etaPoints(ctx context.Context) []queuePoint {
+	if wd.metrics == nil {
+		return nil
+	}
+	qctx, cancel := context.WithTimeout(ctx, dashQueryTimeout)
+	defer cancel()
+	pts, err := wd.metrics.series(qctx, time.Now().Add(-etaWindow))
+	if err != nil {
+		slog.Debug("dashboard: eta series unavailable", "error", err)
+		return nil
+	}
+	return pts
+}
+
+// queueETA reports how long a queue will take to empty, measured as the slope
+// of its own sampled depth. It returns the formatted ETA (empty when there
+// isn't one) and the observed drain rate in items/sec, positive when draining.
+//
+// WHY A SLOPE AND NOT depth/rate. Every previous version of this divided a
+// backlog by a throughput number, and every one of them read hours where the
+// truth was days. Two compounding reasons, both optimistic:
+//
+//   - The divisor counted work that does not drain THIS queue. The initial-queue
+//     ETA used the top-level analysis rate, which includes re-analyses; a rescan
+//     completing does not remove a row from the no-cleave backlog. Measured
+//     2026-09-14, rescans were 89,734 of 102,435 top-level analyses in an hour,
+//     so that divisor was 8x too large -- it reported 24s for a backlog that,
+//     against first-time analyses alone, needed 193s.
+//   - Nothing subtracted arrivals. A queue draining at 12.7k/hr while being fed
+//     at 19.6k/hr is not 40 minutes from empty, it is never empty, and no
+//     depth/rate formula can say so because the arrival term is absent.
+//
+// The slope has neither problem: it is the net of every drain and every refill,
+// whatever their source, and it needs no model of which tier serves what. A
+// queue that is not shrinking has no ETA, and says so.
+//
+// Least squares rather than endpoint difference because rescan servicing is
+// bursty -- two samples can straddle a spike and report a slope the hour does
+// not support.
+func queueETA(depth int64, points []queuePoint, at func(queuePoint) int64) (eta string, drain float64) {
+	if depth <= 0 {
+		return "", 0
+	}
+	span := time.Duration(0)
+	if len(points) >= 2 {
+		span = points[len(points)-1].T.Sub(points[0].T)
+	}
+	if len(points) < etaMinPoints || span < etaMinSpan {
+		return "", 0
+	}
+	// Times as seconds relative to the first sample, to keep the sums small.
+	base := points[0].T
+	var sumT, sumD float64
+	for _, p := range points {
+		sumT += p.T.Sub(base).Seconds()
+		sumD += float64(at(p))
+	}
+	n := float64(len(points))
+	meanT, meanD := sumT/n, sumD/n
+	var num, den float64
+	for _, p := range points {
+		dt := p.T.Sub(base).Seconds() - meanT
+		num += dt * (float64(at(p)) - meanD)
+		den += dt * dt
+	}
+	if den == 0 {
+		return "", 0
+	}
+	drain = -(num / den) // depth falling => positive drain
+	if drain <= 0 {
+		return "", drain
+	}
+	return formatETA(time.Duration(float64(depth)/drain) * time.Second), drain
+}
 
 func formatETA(d time.Duration) string {
 	d = d.Round(time.Second)

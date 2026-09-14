@@ -66,12 +66,20 @@ type apiServer struct {
 	// line per tier per interval; the condition it reports is by nature one that
 	// repeats on every poll from every worker until an operator fixes it.
 	// Pointer-bearing, so it sits with the pointers above the scalars.
-	emptyTierWarnedAt   map[string]time.Time
+	emptyTierWarnedAt map[string]time.Time
+	// depthsAt/depthsMu/depthsVal cache the rescan depths for the "no work
+	// available" log line (see cachedRescanDepths). Split across the
+	// pointer/scalar boundary this struct keeps: time.Time carries a *Location,
+	// the mutex and the counts carry nothing. Zero value is a cold cache, so an
+	// apiServer built as a bare struct literal still works.
+	depthsAt            time.Time
 	dataRoot            string
 	allowedDirs         []string
 	forceRescanPrefixes []string
 	requiredMounts      []string
 	emptyTierMu         sync.Mutex
+	depthsMu            sync.Mutex
+	depthsVal           hopper.RescanDepths
 	rescanAge           time.Duration
 	ready               atomic.Bool
 	datasetIncomplete   bool
@@ -1066,7 +1074,9 @@ const (
 	// pollers walking the same head-of-queue rows don't all collapse onto the
 	// same prefix. tryClaimBatch handles the deduplication in memory.
 	candidateOverfetch = 8
-	minCandidates      = 32
+	// noWorkDepthsTTL bounds how often the no-work log line recounts the backlog.
+	noWorkDepthsTTL = time.Minute
+	minCandidates   = 32
 
 	// workerUpsertInterval throttles DB heartbeat writes per worker so a
 	// busy worker polling several times per second doesn't generate a
@@ -1748,17 +1758,9 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(jobs) == 0 {
-		// Per-tier, because "the ladder gave this worker nothing" is answered
-		// by which tiers were empty, not by one total. Costs no more than the
-		// stale-traits count this replaced: that one scans millions of rows,
-		// the priority half is an index-only scan of the queue, and the
-		// stale-traits half still only runs when the tier is configured.
-		var depths hopper.RescanDepths
-		if d, err := s.db.RescanDepths(ctx, s.TraitsVersion(), s.rescanAge); err == nil {
-			depths = d
-		} else {
-			slog.Debug("rescan depths failed", "worker", worker, "error", err)
-		}
+		// Per-tier, because "the ladder gave this worker nothing" is answered by
+		// which tiers were empty, not by one total. Cached: see cachedRescanDepths.
+		depths := s.cachedRescanDepths(ctx, worker)
 
 		slog.Info("no work available", "worker", worker,
 			"active_claims", s.tracker.activeClaims(worker),
@@ -1766,8 +1768,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 			"rescan_age", s.rescanAge,
 			"rescan_forced", depths.Forced,
 			"rescan_repair", depths.Repair,
-			"rescan_stale_traits", depths.StaleTraits,
-			"stale_traits_enabled", depths.StaleTraitsEnabled,
+			"rescan_age_queue", depths.Age,
 			"force_rescan_prefixes", len(s.forceRescanPrefixes))
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -2297,7 +2298,7 @@ const (
 	tierUnanalyzed   = "unanalyzed"
 	tierRepair       = "repair"
 	tierPathRescan   = "path_rescan"
-	tierStaleTraits  = "stale_traits"
+	tierRescanAge    = "rescan_age"
 )
 
 // stampTier labels each claimed job with the tier it came from. The tier is
@@ -2409,11 +2410,17 @@ func (s *apiServer) claimLadder(slots int) []claimTier {
 			return s.db.ForceRescanCandidates(ctx, s.hopperStart, s.forceRescanPrefixes, n)
 		}})
 	}
-	if v := s.TraitsVersion(); v != "" {
-		ladder = append(ladder, claimTier{name: tierStaleTraits, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
-			return s.db.StaleTraitsCandidates(ctx, v, s.rescanAge, s.hopperStart, n)
-		}})
-	}
+	// Tier 3: the age-ordered rescan queue, last in the ladder. Everything above
+	// it -- fresh ingestion especially -- is offered first, so re-analysis can
+	// never starve a sample that has never been analyzed at all.
+	//
+	// Appended unconditionally. It used to be gated on a non-empty traits
+	// version, which is how the tier spent its life disabled: hopper reads that
+	// version from the litmus binary, and without one this block simply did not
+	// run. Nothing about "re-analyze what is stale" needs an analyzer version.
+	ladder = append(ladder, claimTier{name: tierRescanAge, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
+		return s.db.RescanAgeCandidates(ctx, s.rescanAge, s.hopperStart, n)
+	}})
 	out := ladder[:0]
 	for _, t := range ladder {
 		if t.minSlots == 0 || slots >= t.minSlots {
@@ -2421,6 +2428,34 @@ func (s *apiServer) claimLadder(slots int) []claimTier {
 		}
 	}
 	return out
+}
+
+// cachedRescanDepths returns the rescan backlog for the "no work available" log
+// line, recomputed at most once per noWorkDepthsTTL.
+//
+// The cache is not an optimisation, it is the difference between a log line and
+// a load problem. This runs on EVERY poll that comes back empty, from every
+// worker — exactly when the fleet polls hardest. It was free only by accident:
+// CountRescanPending used to return 0 immediately on an empty traits version,
+// which in production was always, so the count never ran. Now that the age tier
+// is always on, an uncached call here is a multi-million-row index scan per
+// poll to decorate a log line.
+//
+// Errors are logged and the previous value kept: a depth count is a diagnostic,
+// and a stale number beats failing the poll path.
+func (s *apiServer) cachedRescanDepths(ctx context.Context, worker string) hopper.RescanDepths {
+	s.depthsMu.Lock()
+	defer s.depthsMu.Unlock()
+	if time.Since(s.depthsAt) < noWorkDepthsTTL {
+		return s.depthsVal
+	}
+	d, err := s.db.RescanDepths(ctx, s.rescanAge)
+	if err != nil {
+		slog.Debug("rescan depths failed", "worker", worker, "error", err)
+		return s.depthsVal
+	}
+	s.depthsVal, s.depthsAt = d, time.Now()
+	return d
 }
 
 // claimJobs walks the priority ladder in order and returns up to count jobs

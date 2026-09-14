@@ -327,6 +327,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 	}
 	for _, ddl := range []string{
 		`DROP INDEX IF EXISTS idx_samples_forced_rescan`,
+		`CREATE INDEX IF NOT EXISTS idx_samples_rescan_age ` +
+			`ON samples(analyzed_at) ` +
+			`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_rescan_queue ` +
 			`ON samples(rescan_priority, rescan_requested_at) WHERE rescan_priority > 0`,
 		// Mirrors idx_samples_pending_sighted: the sighted claim tier. See pg.go
@@ -2520,7 +2523,7 @@ func (db *DB) updateCleaveResultSQLite(
 			canonical_sha256 = ?, elements = ?,
 			max_crit = ?, suspicious_count = ?, top_traits = ?, trait_graph = ?,
 			litmus_result = NULL,
-			note = '', last_error_at = NULL,
+			note = '', last_error_at = NULL, attempts = 0,
 			traits_version = ?,
 			rescan_priority = 0, rescan_requested_at = NULL,
 			first_analyzed_at = COALESCE(first_analyzed_at, ?),
@@ -2593,7 +2596,7 @@ func (db *DB) storeResultSQLite(
 			canonical_sha256 = ?, elements = ?,
 			max_crit = ?, suspicious_count = ?, top_traits = ?, trait_graph = ?,
 			litmus_result = ?, llm_result = ?,
-			note = '', last_error_at = NULL,
+			note = '', last_error_at = NULL, attempts = 0,
 			traits_version = ?, rescan_priority = 0, rescan_requested_at = NULL,
 			first_analyzed_at = COALESCE(first_analyzed_at, ?),
 			analyzed_at = ?, updated_at = ?
@@ -3795,7 +3798,7 @@ func (db *DB) updateSampleSQLite(ctx context.Context, sha256, status string, res
 			canonical_sha256 = ?, elements = ?,
 			max_crit = ?, suspicious_count = ?, top_traits = ?, trait_graph = ?,
 			litmus_result = NULL,
-			note = '', last_error_at = NULL,
+			note = '', last_error_at = NULL, attempts = 0,
 			first_analyzed_at = COALESCE(first_analyzed_at, ?),
 			analyzed_at = ?, updated_at = ?
 		WHERE sha256 = ?`,
@@ -6087,31 +6090,20 @@ func (db *DB) forceRescanCandidatesSQLite(ctx context.Context, hopperStart time.
 	return queryLiteCandidates(ctx, db.lite, query, args...)
 }
 
-func (db *DB) staleTraitsCandidatesSQLite(
-	ctx context.Context, currentTraits string, rescanAge time.Duration,
+func (db *DB) rescanAgeCandidatesSQLite(
+	ctx context.Context, rescanAge time.Duration,
 	hopperStart time.Time, limit int,
 ) ([]ClaimJob, error) {
-	if currentTraits == "" {
-		return nil, nil
-	}
 	staleAge := time.Now().Add(-rescanAge).UTC().Format(time.RFC3339Nano)
 	startCutoff := hopperStart.UTC().Format(time.RFC3339Nano)
 	return queryLiteCandidates(ctx, db.lite,
 		`SELECT sha256, path, size_bytes, file_type, created_at FROM samples
 		WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''
-		  AND traits_version != ?
-		  AND (corroborated = 1 OR analyzed_at < ?)
+		  AND analyzed_at < ?
 		  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
-		ORDER BY
-		  corroborated DESC,
-		  CASE
-		    WHEN label = 'good' AND (max_crit >= 5 OR suspicious_count >= 2) THEN 0
-		    WHEN label = 'bad' AND max_crit < 5 AND suspicious_count < 2 THEN 0
-		    ELSE 1
-		  END,
-		  ABS(litmus_score - 0.5),
-		  analyzed_at ASC
-		LIMIT ?`, currentTraits, staleAge, startCutoff, limit)
+		  AND attempts < ?
+		ORDER BY analyzed_at ASC
+		LIMIT ?`, staleAge, startCutoff, maxClaimAttempts, limit)
 }
 
 func queryLiteCandidates(ctx context.Context, db *sql.DB, query string, args ...any) ([]ClaimJob, error) {

@@ -534,22 +534,32 @@ func TestMissingLitmusRepairQueue(t *testing.T) {
 }
 
 // TestRescanDepthsPerTier proves the depth count reports each tier separately
-// and, crucially, distinguishes a stale-traits tier that is EMPTY from one that
-// is ABSENT. Collapsing those two is what let the dashboard render "0 pending /
-// stale traits disabled" over a six-figure repair backlog that was draining.
+// rather than collapsing them into one number. That is what let the dashboard
+// render "0 pending" over a six-figure repair backlog that was draining.
+//
+// The age tier has no enabled/disabled state to test any more: it replaced a
+// stale-traits tier that returned nothing when hopper could not read a traits
+// version from its analyzer, which is how it spent its life switched off.
 func TestRescanDepthsPerTier(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
 
 	repair := strings.Repeat("a", 64)
 	forced := strings.Repeat("b", 64)
-	idle := strings.Repeat("c", 64)
+	stale := strings.Repeat("c", 64)
+	fresh := strings.Repeat("d", 64)
 
 	cleave := []byte(`{"files":[{"sha":"x","type":"npm"}]}`)
-	for _, sha := range []string{repair, forced, idle} {
+	old := time.Now().Add(-120 * 24 * time.Hour).UTC()
+	now := time.Now().UTC()
+	for _, tc := range []struct {
+		sha      string
+		analyzed *time.Time
+	}{{repair, &now}, {forced, &now}, {stale, &old}, {fresh, &now}} {
 		mustInsert(t, ctx, db, &Sample{
-			SHA256: sha, Source: "test", Label: "unknown", LabelSource: "test",
-			Path: "incoming/" + sha + ".tgz", CleaveResult: cleave,
+			SHA256: tc.sha, Source: "test", Label: "unknown", LabelSource: "test",
+			Path: "incoming/" + tc.sha + ".tgz", CleaveResult: cleave,
+			AnalyzedAt: tc.analyzed,
 		})
 	}
 	if _, err := db.QueueRescan(ctx, []string{repair}); err != nil {
@@ -559,31 +569,19 @@ func TestRescanDepthsPerTier(t *testing.T) {
 		t.Fatalf("RequestRescan: %v", err)
 	}
 
-	// No traits version: the tier is not in the ladder, so its depth is
-	// unmeasured rather than zero — but the priority tiers still report.
-	off, err := db.RescanDepths(ctx, "", 30*24*time.Hour)
+	d, err := db.RescanDepths(ctx, 75*24*time.Hour)
 	if err != nil {
-		t.Fatalf("RescanDepths (traits off): %v", err)
+		t.Fatalf("RescanDepths: %v", err)
 	}
-	if off.StaleTraitsEnabled {
-		t.Error("StaleTraitsEnabled true with no traits version")
+	if d.Forced != 1 || d.Repair != 1 {
+		t.Errorf("depths = %+v, want Forced=1 Repair=1", d)
 	}
-	if off.Forced != 1 || off.Repair != 1 {
-		t.Errorf("depths = %+v, want Forced=1 Repair=1", off)
+	// Only the 120-day-old row is past a 75-day cutoff; the same-day rows are not.
+	if d.Age != 1 {
+		t.Errorf("Age = %d, want 1 (only the row analyzed 120 days ago)", d.Age)
 	}
-	if off.Total() != 2 {
-		t.Errorf("Total() = %d, want 2; a disabled stale-traits tier must not zero the card", off.Total())
-	}
-
-	on, err := db.RescanDepths(ctx, "plan-audit-traits", 0)
-	if err != nil {
-		t.Fatalf("RescanDepths (traits on): %v", err)
-	}
-	if !on.StaleTraitsEnabled {
-		t.Error("StaleTraitsEnabled false with a traits version set")
-	}
-	if on.Forced != 1 || on.Repair != 1 {
-		t.Errorf("depths = %+v, want Forced=1 Repair=1", on)
+	if d.Total() != 3 {
+		t.Errorf("Total() = %d, want 3", d.Total())
 	}
 }
 
@@ -2362,42 +2360,44 @@ func TestClaimJobsForceRescan(t *testing.T) {
 	}
 }
 
-func TestClaimJobsStaleTraitsOrdering(t *testing.T) {
+// The rescan tier's whole contract is oldest-first. The priority sort it
+// replaced (corroboration, then label disagreement, then litmus boundary) is
+// what let the tier re-pick the head of the same order forever and never reach
+// the tail: 47% of servable samples were past 60 days while the tier ran.
+func TestClaimJobsRescanAgeOrdering(t *testing.T) {
 	ctx := t.Context()
 	db := openTestDB(t)
 
+	// Deliberately adversarial against the old ordering: the OLDEST row is the
+	// one the priority sort would have ranked last (agrees with its label, far
+	// from the litmus boundary), so a regression to priority order fails here.
 	type sample struct {
-		sha    string
-		label  string
-		score  int
-		traits string
-		litmus string
+		sha     string
+		label   string
+		score   int
+		litmus  string
+		ageDays int
 	}
 	samples := []sample{
-		// Disagrees with label and closest to the litmus boundary: first.
-		{sha: "1111111111111111111111111111111111111111111111111111111111111111", label: "bad", score: 0, traits: "", litmus: `{"prob":0.49}`},
-		// Disagrees with label but farther from the boundary: second.
-		{sha: "2222222222222222222222222222222222222222222222222222222222222222", label: "good", score: 50, traits: `{"l":5,"c":1.0}`, litmus: `{"prob":0.10}`},
-		// Does not disagree, but is near the boundary: third.
-		{sha: "3333333333333333333333333333333333333333333333333333333333333333", label: "good", score: 0, traits: "", litmus: `{"prob":0.51}`},
-		// Does not disagree and is farther from the boundary: last.
-		{sha: "4444444444444444444444444444444444444444444444444444444444444444", label: "bad", score: 50, traits: `{"l":5,"c":1.0}`, litmus: `{"prob":0.90}`},
+		{sha: strings.Repeat("1", 64), label: "bad", score: 50, litmus: `{"prob":0.90}`, ageDays: 400},
+		{sha: strings.Repeat("2", 64), label: "good", score: 0, litmus: `{"prob":0.51}`, ageDays: 300},
+		{sha: strings.Repeat("3", 64), label: "good", score: 50, litmus: `{"prob":0.10}`, ageDays: 200},
+		{sha: strings.Repeat("4", 64), label: "bad", score: 0, litmus: `{"prob":0.49}`, ageDays: 100},
 	}
-	for _, s := range samples {
-		mustInsert(t, ctx, db, &Sample{SHA256: s.sha, Source: "test", Label: s.label, LabelSource: "test"})
-		mustAnalyzeWithTraits(t, ctx, db, s.sha, s.score, s.traits)
-		if err := db.UpdateLitmusResult(ctx, s.sha, []byte(s.litmus)); err != nil {
+	for _, sm := range samples {
+		mustInsert(t, ctx, db, &Sample{SHA256: sm.sha, Source: "test", Label: sm.label, LabelSource: "test"})
+		mustAnalyzeWithTraits(t, ctx, db, sm.sha, sm.score, "")
+		if err := db.UpdateLitmusResult(ctx, sm.sha, []byte(sm.litmus)); err != nil {
+			t.Fatal(err)
+		}
+		age := time.Now().Add(-time.Duration(sm.ageDays) * 24 * time.Hour).UTC().Format(time.RFC3339Nano)
+		if _, err := db.lite.ExecContext(ctx,
+			`UPDATE samples SET analyzed_at = ? WHERE sha256 = ?`, age, sm.sha); err != nil {
 			t.Fatal(err)
 		}
 	}
-	old := time.Now().Add(-96 * time.Hour).UTC().Format(time.RFC3339Nano)
-	if _, err := db.lite.ExecContext(ctx,
-		`UPDATE samples SET analyzed_at = ?, traits_version = 'old-traits'`,
-		old); err != nil {
-		t.Fatal(err)
-	}
 
-	jobs, err := db.StaleTraitsCandidates(ctx, "new-traits", 72*time.Hour, time.Now(), 4)
+	jobs, err := db.RescanAgeCandidates(ctx, 75*24*time.Hour, time.Now(), 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2407,18 +2407,87 @@ func TestClaimJobsStaleTraitsOrdering(t *testing.T) {
 	}
 	for i := range want {
 		if jobs[i].SHA256 != want[i] {
-			t.Fatalf("job %d sha = %s, want %s; jobs=%+v", i, jobs[i].SHA256, want[i], jobs)
+			t.Fatalf("job %d sha = %s, want %s (oldest first); jobs=%+v", i, jobs[i].SHA256, want[i], jobs)
 		}
+	}
+}
+
+// A sample that never comes back — a worker that OOMs or is killed mid-scan —
+// records no error, so its analyzed_at never moves. Under oldest-first that
+// parks it permanently at the head of the queue, where it would be re-offered
+// on every poll forever. reapStuck cannot save this tier: it only reaps rows
+// with cleave_result IS NULL, and every row here has one by definition.
+// attempts < maxClaimAttempts is the guard that makes the queue drain past it.
+func TestRescanAgeSkipsRepeatedlyFailingSample(t *testing.T) {
+	ctx := t.Context()
+	db := openTestDB(t)
+
+	const poison = "f100000000000000000000000000000000000000000000000000000000000000"
+	const healthy = "e200000000000000000000000000000000000000000000000000000000000000"
+	for _, sha := range []string{poison, healthy} {
+		mustInsert(t, ctx, db, &Sample{
+			SHA256: sha, Source: "test", Label: "unknown", LabelSource: "test",
+			Path: "incoming/" + sha + ".bin",
+		})
+		mustAnalyzeWithTraits(t, ctx, db, sha, 0, "")
+	}
+	// poison is the older of the two, so oldest-first offers it first.
+	older := time.Now().Add(-400 * 24 * time.Hour).UTC().Format(time.RFC3339Nano)
+	newer := time.Now().Add(-300 * 24 * time.Hour).UTC().Format(time.RFC3339Nano)
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET analyzed_at = ? WHERE sha256 = ?`, older, poison); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET analyzed_at = ? WHERE sha256 = ?`, newer, healthy); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs, err := db.RescanAgeCandidates(ctx, 75*24*time.Hour, time.Now(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 2 || jobs[0].SHA256 != poison {
+		t.Fatalf("premise: got %+v, want the poison sample offered first", jobs)
+	}
+
+	// Burn its claim budget the way the hot path does.
+	for range MaxClaimAttempts {
+		if err := db.IncrementAttempts(ctx, []string{poison}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	jobs, err = db.RescanAgeCandidates(ctx, 75*24*time.Hour, time.Now(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].SHA256 != healthy {
+		t.Fatalf("got %+v, want only %s; a wedged sample must not block the queue", jobs, healthy)
+	}
+
+	// A successful analysis clears the counter, so the guard cannot retire a
+	// sample permanently on attempts it has since recovered from.
+	mustAnalyzeWithTraits(t, ctx, db, poison, 0, "")
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET analyzed_at = ? WHERE sha256 = ?`, older, poison); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err = db.RescanAgeCandidates(ctx, 75*24*time.Hour, time.Now(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 2 || jobs[0].SHA256 != poison {
+		t.Fatalf("got %+v, want the recovered sample offered again", jobs)
 	}
 }
 
 // A reference-only row — a registry sidecar or a fetched dependency whose bytes
 // never reached hopper — is claimable on every other count (parent = ” by
-// design, cleave_result set, traits stale) but has no path, so no worker can be
-// served its bytes. The stale-traits tier must not hand one out: nothing would
+// design, cleave_result set, analysis old) but has no path, so no worker can be
+// served its bytes. The rescan tier must not hand one out: nothing would
 // clean up after the failed claim, since reapStuck only reaps rows with
 // cleave_result IS NULL and prune only marks 'missing' when no location survives.
-func TestStaleTraitsSkipsRowsWithNoServablePath(t *testing.T) {
+func TestRescanAgeSkipsRowsWithNoServablePath(t *testing.T) {
 	ctx := t.Context()
 	db := openTestDB(t)
 
@@ -2470,7 +2539,7 @@ func TestStaleTraitsSkipsRowsWithNoServablePath(t *testing.T) {
 		}
 	}
 
-	jobs, err := db.StaleTraitsCandidates(ctx, "new-traits", 72*time.Hour, time.Now(), 10)
+	jobs, err := db.RescanAgeCandidates(ctx, 72*time.Hour, time.Now(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}

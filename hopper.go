@@ -4465,7 +4465,7 @@ type ClaimJob struct {
 	FileType string `json:"file_type"`
 
 	// Tier names the claim tier this job was drawn from ("unanalyzed",
-	// "stale_traits", "sighted", …). Stamped by the API server's claimJobs, not
+	// "rescan_age", "sighted", …). Stamped by the API server's claimJobs, not
 	// by the tier queries. It separates backlog from deliberate rescans in the
 	// hand-out age histogram: a stale-traits job is by definition an old row,
 	// and averaged in with fresh work it would make the backlog look
@@ -4693,17 +4693,21 @@ func (db *DB) ForceRescanCandidates(ctx context.Context, hopperStart time.Time, 
 	return db.forceRescanCandidatesSQLite(ctx, hopperStart, prefixes, limit)
 }
 
-// StaleTraitsCandidates returns up to limit Tier 3 jobs: samples analyzed
-// with a different traits_version more than rescanAge ago, ordered by
-// label-disagreement priority.
-func (db *DB) StaleTraitsCandidates(
-	ctx context.Context, currentTraits string, rescanAge time.Duration,
+// RescanAgeCandidates returns up to limit Tier 3 jobs: servable samples whose
+// last analysis is older than rescanAge, oldest first.
+//
+// It takes no traits version. The predecessor did, and that parameter was a
+// kill switch: empty meant "return nothing", and hopper derives the version
+// from the litmus binary, so a deployment without one disabled the whole tier
+// silently. See rescanAgeCandidatesPG for the measurements.
+func (db *DB) RescanAgeCandidates(
+	ctx context.Context, rescanAge time.Duration,
 	hopperStart time.Time, limit int,
 ) ([]ClaimJob, error) {
 	if db.pool != nil {
-		return db.staleTraitsCandidatesPG(ctx, currentTraits, rescanAge, hopperStart, limit)
+		return db.rescanAgeCandidatesPG(ctx, rescanAge, hopperStart, limit)
 	}
-	return db.staleTraitsCandidatesSQLite(ctx, currentTraits, rescanAge, hopperStart, limit)
+	return db.rescanAgeCandidatesSQLite(ctx, rescanAge, hopperStart, limit)
 }
 
 // UpsertWorker records a worker heartbeat for dashboard display.
@@ -5505,24 +5509,18 @@ type RescanDepths struct {
 	// Repair is tier 1b: rescan_priority = 1, bulk background re-analysis.
 	// Drained behind the unanalyzed backlog.
 	Repair int64
-	// StaleTraits is tier 3: analyzed under a superseded traits version. Zero
-	// when the tier is not configured, which is NOT the same as "caught up" --
-	// see StaleTraitsEnabled.
-	StaleTraits int64
-	// StaleTraitsEnabled reports whether the stale-traits tier is in the claim
-	// ladder at all. False means hopper could not read a traits version from
-	// its analyzer, so the tier is absent and StaleTraits is unmeasured rather
-	// than empty. Callers must render those two states differently.
-	StaleTraitsEnabled bool
+	// Age is tier 3: servable samples whose last analysis is older than
+	// rescanAge. No companion "enabled" flag: unlike the stale-traits tier it
+	// replaced, this one cannot be switched off by a missing traits version, so
+	// zero here means caught up and nothing else.
+	Age int64
 }
 
 // Total is the whole re-analysis backlog across tiers.
-func (d RescanDepths) Total() int64 { return d.Forced + d.Repair + d.StaleTraits }
+func (d RescanDepths) Total() int64 { return d.Forced + d.Repair + d.Age }
 
-// RescanDepths counts queued re-analysis work per tier. currentTraits and
-// rescanAge are the stale-traits tier's parameters; an empty currentTraits
-// leaves that tier unmeasured (StaleTraitsEnabled false) exactly as it leaves
-// it out of the claim ladder.
+// RescanDepths counts queued re-analysis work per tier. rescanAge is the age
+// tier's cutoff.
 //
 // The priority tiers cost one grouped index-only scan of
 // idx_samples_rescan_queue_q2, whose predicate is the tiers' own
@@ -5531,7 +5529,7 @@ func (d RescanDepths) Total() int64 { return d.Forced + d.Repair + d.StaleTraits
 // 130M-row table, and re-checking two columns on the heap for every queued row
 // is the difference between an index-only scan of the queue and a probe per
 // entry.
-func (db *DB) RescanDepths(ctx context.Context, currentTraits string, rescanAge time.Duration) (RescanDepths, error) {
+func (db *DB) RescanDepths(ctx context.Context, rescanAge time.Duration) (RescanDepths, error) {
 	var d RescanDepths
 	byPriority, err := db.rescanPriorityDepths(ctx)
 	if err != nil {
@@ -5539,15 +5537,11 @@ func (db *DB) RescanDepths(ctx context.Context, currentTraits string, rescanAge 
 	}
 	d.Forced, d.Repair = byPriority[2], byPriority[1]
 
-	if currentTraits == "" {
-		return d, nil
-	}
-	d.StaleTraitsEnabled = true
-	n, err := db.CountRescanPending(ctx, currentTraits, rescanAge)
+	n, err := db.CountRescanPending(ctx, rescanAge)
 	if err != nil {
 		return d, err
 	}
-	d.StaleTraits = n
+	d.Age = n
 	return d, nil
 }
 
@@ -5559,35 +5553,36 @@ func (db *DB) rescanPriorityDepths(ctx context.Context) (map[int]int64, error) {
 	return db.rescanPriorityDepthsSQLite(ctx)
 }
 
-// CountRescanPending returns the number of previously analyzed samples
-// eligible for re-analysis due to stale traits (matching the tier-2 claim
-// criteria: stale traits version AND analyzed longer ago than rescanAge).
-// Returns 0 if currentTraits is empty (rescan disabled).
+// CountRescanPending returns the number of previously analyzed samples the age
+// tier can actually hand out: servable, older than rescanAge, and still inside
+// the claim-attempt budget.
+//
+// The attempts guard is here and not just in the claim query so that depth and
+// claimable stay the same number. A count that included wedged rows would show
+// a backlog nothing can drain, and HopperRescanNotDraining would then be right
+// about the symptom and useless about the cause. The cost is that a sample
+// which burns MaxClaimAttempts leaves this count silently; it keeps its last
+// good verdict and simply stops being refreshed.
 //
 // This is ONE tier of the rescan backlog. Operator surfaces want
 // [DB.RescanDepths]; reach for this directly only when the stale-traits
 // population specifically is the question.
-func (db *DB) CountRescanPending(ctx context.Context, currentTraits string, rescanAge time.Duration) (int64, error) {
-	if currentTraits == "" {
-		return 0, nil
-	}
+func (db *DB) CountRescanPending(ctx context.Context, rescanAge time.Duration) (int64, error) {
 	cutoff := time.Now().Add(-rescanAge).UTC()
 	var n int64
 	var err error
 	if db.pool != nil {
 		err = db.pool.QueryRow(ctx,
 			`SELECT count(*) FROM samples `+
-				`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' `+
-				`AND traits_version != $1 `+
-				`AND analyzed_at < $2`,
-			currentTraits, cutoff).Scan(&n)
+				`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> '' `+
+				`AND analyzed_at < $1 AND attempts < $2`,
+			cutoff, maxClaimAttempts).Scan(&n)
 	} else {
 		err = db.lite.QueryRowContext(ctx,
 			`SELECT count(*) FROM samples `+
-				`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' `+
-				`AND traits_version != ? `+
-				`AND analyzed_at < ?`,
-			currentTraits, cutoff.Format(time.RFC3339Nano)).Scan(&n)
+				`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> '' `+
+				`AND analyzed_at < ? AND attempts < ?`,
+			cutoff.Format(time.RFC3339Nano), maxClaimAttempts).Scan(&n)
 	}
 	return n, err
 }

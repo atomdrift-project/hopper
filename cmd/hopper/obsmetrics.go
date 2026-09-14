@@ -344,7 +344,7 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 	in := instruments{
 		// Queue depth and pipeline backlog.
 		pending:       gauge("hopper.queue.pending", "Samples awaiting first analysis.", "{sample}"),
-		rescan:        gauge("hopper.queue.rescan", "Samples eligible for re-analysis under the live traits version.", "{sample}"),
+		rescan:        gauge("hopper.queue.rescan", "Samples queued for re-analysis across the forced, repair and age tiers.", "{sample}"),
 		cleavePending: gauge("hopper.queue.cleave_pending", "Samples awaiting the cleave stage.", "{sample}"),
 		litmusPending: gauge("hopper.queue.litmus_pending", "Samples awaiting the litmus stage.", "{sample}"),
 		// The 2026-09-07 post-mortem's alert. A threat-feed claim nothing has

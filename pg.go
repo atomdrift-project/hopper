@@ -821,7 +821,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 				'idx_samples_unknown_newest',
 				'idx_samples_bad_miss_stale',
 				'idx_samples_stale_traits',
-				'idx_samples_stale_traits_pri2'
+				'idx_samples_rescan_age'
 			]
 			LOOP
 				SELECT pg_get_indexdef(to_regclass(idx)) INTO def;
@@ -1180,43 +1180,33 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_stale_traits ` +
 			`ON samples(traits_version, analyzed_at) ` +
 			`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''`,
-		// staleTraitsCandidatesPG orders by a priority expression (corroboration,
-		// then label-disagreement bucket, then |litmus_score-0.5|, then
-		// analyzed_at). The
-		// index above is keyed (traits_version, analyzed_at), which can't serve
-		// that ordering: with traits_version filtered by inequality (!= current),
-		// Postgres scanned every eligible row and top-N sorted the lot — ~3.8M
-		// rows / 18s per poll once the backlog aged in, starving every worker
-		// that fell through to the rescan tier. This expression index stores rows
-		// in the ORDER BY order, so the planner walks it and stops at LIMIT,
-		// applying traits_version != current and the age/cooldown as residual
-		// filters (both pass for ~all rows, so it terminates after ~LIMIT). The
-		// column expressions must stay byte-identical to the ORDER BY in
-		// staleTraitsCandidatesPG or the planner won't match them.
+		// Tier 3's age-ordered rescan queue (rescanAgeCandidatesSQL) walks this in
+		// index order and stops at LIMIT. Keyed on analyzed_at alone because that
+		// is the tier's entire ORDER BY, and the partial predicate is character-for
+		// -character the tier's own WHERE — the planner will not match it otherwise.
 		//
-		// _pri2 supersedes _pri by prepending corroborated: a stale sample an
-		// outside feed has cited is re-analyzed before one nothing has. Costs
-		// nothing at read time — the walk still stops at LIMIT, it just starts in
-		// the corroborated half and falls through to the rest once that half is
-		// exhausted, which is the same scan the old index did.
-		//
-		// A NEW NAME, not an edited definition. CREATE INDEX IF NOT EXISTS is a
-		// no-op against an existing index with a different definition: it would
-		// keep the old one, the ORDER BY below would no longer match any index,
-		// and the tier would go straight back to top-N sorting ~3.8M rows at 18s
-		// per poll. Renaming makes the swap observable instead of silent.
-		`CREATE INDEX IF NOT EXISTS idx_samples_stale_traits_pri2 ` +
-			`ON samples(` +
-			`corroborated DESC, ` +
-			`(CASE WHEN label = 'good' AND (max_crit >= 5 OR suspicious_count >= 2) THEN 0 ` +
-			`WHEN label = 'bad' AND max_crit < 5 AND suspicious_count < 2 THEN 0 ELSE 1 END), ` +
-			`(ABS(litmus_score - 0.5)), ` +
-			`analyzed_at) ` +
+		// It REPLACES idx_samples_stale_traits_pri2, a 1.9 GB expression index that
+		// stored rows in the old corroboration/label-disagreement priority order.
+		// That ordering is gone (see rescanAgeCandidatesPG), and against lifetime
+		// statistics — pg_stat_database.stats_reset is NULL on this cluster — _pri2
+		// had idx_scan = 0. It was never used once: the tier it existed for was
+		// disabled by an empty traits version and never ran. On a samples table
+		// carrying 62 indexes over 111 GB, this swap is a net -1.7 GB.
+		`CREATE INDEX IF NOT EXISTS idx_samples_rescan_age ` +
+			`ON samples(analyzed_at) ` +
 			`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''`,
-		// Dropped only after _pri2 exists above, so no poll falls between the two.
-		// concurrentDropIndexDDL rewrites this to DROP INDEX CONCURRENTLY; a plain
-		// DROP would take ACCESS EXCLUSIVE and wait behind the replication COPY.
+		// Dropped only after the replacement above exists, so no poll falls between
+		// the two. concurrentDropIndexDDL rewrites these to DROP INDEX CONCURRENTLY;
+		// a plain DROP would take ACCESS EXCLUSIVE and wait behind the replication
+		// COPY.
+		//
+		// idx_samples_stale_traits (traits_version, analyzed_at) is deliberately
+		// NOT dropped here even though this tier no longer reads it: its comment
+		// above claims other consumers, and a zero idx_scan is not proof an index
+		// is dead. Retiring it is a separate change that starts by EXPLAINing those
+		// consumers.
 		`DROP INDEX IF EXISTS idx_samples_stale_traits_pri`,
+		`DROP INDEX IF EXISTS idx_samples_stale_traits_pri2`,
 		// feedSourcesPG / feedEcosystemsPG: DISTINCT feed/ecosystem WHERE source = $1.
 		`CREATE INDEX IF NOT EXISTS idx_samples_source_feed ON samples(source, feed) WHERE feed != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_source_ecosystem ON samples(source, ecosystem) WHERE ecosystem != ''`,
@@ -3920,7 +3910,7 @@ func (db *DB) storeResultPG(
 			canonical_sha256 = $3, elements = $4,
 			max_crit = $5, suspicious_count = $6,
 			litmus_result = $7, llm_result = $8,
-			note = '', last_error_at = NULL,
+			note = '', last_error_at = NULL, attempts = 0,
 			traits_version = $9, rescan_priority = 0, rescan_requested_at = NULL,
 			first_analyzed_at = COALESCE(first_analyzed_at, $10),
 			analyzed_at = $10, updated_at = $10
@@ -4870,7 +4860,7 @@ func (db *DB) updateCleaveResultPG(
 			canonical_sha256 = $3, elements = $4,
 			max_crit = $5, suspicious_count = $6,
 			litmus_result = NULL,
-			note = '', last_error_at = NULL,
+			note = '', last_error_at = NULL, attempts = 0,
 			traits_version = $7,
 			rescan_priority = 0, rescan_requested_at = NULL,
 			first_analyzed_at = COALESCE(first_analyzed_at, now()),
@@ -6131,7 +6121,7 @@ func (db *DB) updateSamplePG(ctx context.Context, sha256, status string, result 
 			canonical_sha256 = $4, elements = $5,
 			max_crit = $6, suspicious_count = $7,
 			litmus_result = NULL,
-			note = '', last_error_at = NULL,
+			note = '', last_error_at = NULL, attempts = 0,
 			first_analyzed_at = COALESCE(first_analyzed_at, now()),
 			analyzed_at = now(), updated_at = now()
 		WHERE sha256 = $1`,
@@ -9728,59 +9718,59 @@ func (db *DB) forceRescanCandidatesPG(ctx context.Context, hopperStart time.Time
 	return scanClaimRows(rows)
 }
 
-// staleTraitsCandidatesSQL is Tier 3's statement. The ORDER BY must stay
-// byte-identical to idx_samples_stale_traits_pri2's column list — that is the
-// whole reason the index exists, and a drifted expression silently demotes the
-// tier to a top-N sort over millions of rows. Hoisted into a constant so
-// plan_audit_test.go can assert that, on real statistics, the plan carries no
-// Sort node at all.
-const staleTraitsCandidatesSQL = `
+// rescanAgeCandidatesSQL is Tier 3's statement: the age-ordered rescan queue.
+//
+// ORDER BY analyzed_at ASC walks idx_samples_rescan_age in index order and
+// stops at LIMIT, so the plan carries no Sort node. plan_audit_test.go asserts
+// that against real statistics — a drifted ORDER BY silently demotes the tier
+// to a top-N sort over millions of rows, which is what killed its predecessor.
+const rescanAgeCandidatesSQL = `
 	SELECT sha256, path, size_bytes, file_type, created_at FROM samples
 	WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''
-	  AND traits_version != $1
-	  AND (corroborated OR analyzed_at < $2)
-	  AND (note = '' OR last_error_at IS NULL OR last_error_at < $3)
-	ORDER BY
-	  corroborated DESC,
-	  CASE
-	    WHEN label = 'good' AND (max_crit >= 5 OR suspicious_count >= 2) THEN 0
-	    WHEN label = 'bad' AND max_crit < 5 AND suspicious_count < 2 THEN 0
-	    ELSE 1
-	  END,
-	  ABS(litmus_score - 0.5),
-	  analyzed_at ASC NULLS LAST
+	  AND analyzed_at < $1
+	  AND (note = '' OR last_error_at IS NULL OR last_error_at < $2)
+	  AND attempts < $3
+	ORDER BY analyzed_at ASC
 	LIMIT $4`
 
-// staleTraitsCandidatesPG returns Tier 3 work: samples analyzed with a
-// different traits_version more than rescanAge ago. Prioritizes externally
-// corroborated rows, then label disagreements and boundary-confidence rows.
+// rescanAgeCandidatesPG returns Tier 3 work: servable samples whose last
+// analysis is older than rescanAge, oldest first.
 //
-// corroborated leads the ordering because a stale verdict on a sample some feed
-// has cited is the one most worth refreshing: it is the row a reviewer will be
-// looking at. It is a sort key here rather than its own tier (as on the pending
-// side) because this tier already walks an index built in ORDER BY order, so
-// prepending a column is free — the scan simply starts in the corroborated half
-// and falls through when it runs dry.
+// WHY AGE ALONE, AND NOT traits_version. This tier used to gate on
+// `traits_version != $1` and sort by a corroboration/label-disagreement
+// priority. Both are gone, for reasons the production numbers settled on
+// 2026-09-14:
 //
-// A cited sample also SKIPS THE AGE GATE. rescanAge defaults to 30 days, so
-// without this a sample analyzed last week that a feed cites today waits three
-// more weeks before anything looks at it again — and it is the sample we now have
-// outside evidence against. The gate exists to stop the tier from churning
-// through freshly-analyzed rows; a citation is the signal that says this
-// particular row is worth the churn.
+//   - The traits version is bumped at least once a day, so
+//     `traits_version != current` is true for essentially every stored row.
+//     It admitted everything and filtered nothing. Measured by TABLESAMPLE,
+//     traits_version is empty on ~65% of analyzed rows and scattered across
+//     many values on the rest, so it never even expressed "this row was judged
+//     by the current analyzer".
+//   - Worse, it was a KILL SWITCH. Both this tier and CountRescanPending
+//     returned early on an empty currentTraits, and the claim ladder only
+//     appended the tier when the version was non-empty. hopper derives that
+//     version from the litmus binary, so any deployment without one ran with
+//     the entire rescan tier silently disabled. The evidence is in the index
+//     statistics: with pg_stat_database.stats_reset NULL (lifetime counters),
+//     idx_samples_stale_traits_pri2 — 1.9 GB, built solely to serve this
+//     tier's ORDER BY — had idx_scan = 0. It had never been used, ever. That
+//     is why 4.14M of 8.75M servable samples (47%) were past 60 days.
 //
-// What it deliberately does NOT do is re-analyze a sample the current analyzer
-// already judged: traits_version != $1 still gates every row. That is the whole
-// reason this is a relaxed predicate here rather than an auto-queue into the
-// repair tier when a sighting lands. A rescan cannot learn anything from the
-// sighting — the analyzer does not read the ledger — so its only value is a
-// changed analyzer, and re-running an unchanged one trips StoreResult's
-// Redundant() WARN ("the re-analysis learned nothing... a guard that failed
-// upstream"). Queueing those would fire that warning routinely for a legitimate
-// reason and destroy its meaning. The disagreement a citation creates against a
-// CURRENT analysis is a triage question, and TriageSighted / TriageSecondOpinion
-// already ask it — the latter gated on samples.corroborated, which the sightings
-// triggers now keep honest.
+// An age cutoff cannot be disabled by a missing binary and needs no upstream
+// system to populate a column correctly. Oldest-first is what actually drains
+// a backlog: the old priority sort re-picked the head of the same priority
+// order forever and never reached the tail.
+//
+// THE CORROBORATED BYPASS IS ALSO GONE. It let a cited sample skip the age
+// gate, which was safe only because traits_version gated the row behind it.
+// Without that gate, `corroborated OR analyzed_at < cutoff` re-admits all
+// ~81k corroborated servable rows on every single poll, re-analyzing them
+// forever and tripping StoreResult's Redundant() WARN routinely — the exact
+// outcome the old comment here argued against. A citation now reaches the
+// scanner through the sighted tier, which is where a deadline-bearing lane
+// belongs; the disagreement it creates against a current analysis is a triage
+// question that TriageSighted / TriageSecondOpinion already ask.
 //
 // path <> ” excludes rows whose bytes hopper cannot produce, the same rule
 // [triageServablePathSQL] applies to the triage queues. Reference-only rows —
@@ -9793,17 +9783,14 @@ const staleTraitsCandidatesSQL = `
 // rows with cleave_result IS NULL, and the prune path only marks 'missing' when
 // no sample_locations row survives, which these have. Measured 2026-08-23:
 // ~47% of otherwise-eligible rows, ~94% of them registry sidecars.
-func (db *DB) staleTraitsCandidatesPG(
-	ctx context.Context, currentTraits string, rescanAge time.Duration,
+func (db *DB) rescanAgeCandidatesPG(
+	ctx context.Context, rescanAge time.Duration,
 	hopperStart time.Time, limit int,
 ) ([]ClaimJob, error) {
-	if currentTraits == "" {
-		return nil, nil
-	}
-	rows, err := db.pool.Query(ctx, staleTraitsCandidatesSQL,
-		currentTraits, time.Now().Add(-rescanAge).UTC(), hopperStart.UTC(), limit)
+	rows, err := db.pool.Query(ctx, rescanAgeCandidatesSQL,
+		time.Now().Add(-rescanAge).UTC(), hopperStart.UTC(), maxClaimAttempts, limit)
 	if err != nil {
-		return nil, fmt.Errorf("hopper: stale-traits candidates: %w", err)
+		return nil, fmt.Errorf("hopper: rescan-age candidates: %w", err)
 	}
 	return scanClaimRows(rows)
 }

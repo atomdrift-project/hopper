@@ -176,10 +176,10 @@ func TestPlanAuditSamplesHotPaths(t *testing.T) {
 // Both are polled by every worker on every claim, so a plan regression here is
 // not a slow report — it is the whole fleet idling. The sighted tier must ride
 // its partial index rather than filtering the 537k-row pending set, and the
-// stale-traits tier must WALK idx_samples_stale_traits_pri2 in order: its
+// age-ordered rescan tier must WALK idx_samples_rescan_age in order: its
 // failure mode is not a seq scan but a top-N sort over millions of rows, which
-// is what cost 18s per poll before the expression index existed. A Sort node in
-// that plan means the ORDER BY and the index definition have drifted apart.
+// is what cost 18s per poll under its predecessor. A Sort node in that plan
+// means the ORDER BY and the index definition have drifted apart.
 func TestPlanAuditClaimQueues(t *testing.T) {
 	db := openPlanDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -196,20 +196,20 @@ func TestPlanAuditClaimQueues(t *testing.T) {
 	}
 	t.Logf("sighted_candidates: ok\n%s", firstPlanLines(sighted))
 
-	stale := explainText(t, ctx, db, `EXPLAIN `+staleTraitsCandidatesSQL,
-		"plan-audit-traits", start, start, 200)
-	if planSeqScansSamples(stale) {
-		t.Errorf("stale_traits_candidates: unexpected Seq Scan on samples:\n%s", stale)
+	rescan := explainText(t, ctx, db, `EXPLAIN `+rescanAgeCandidatesSQL,
+		start, start, maxClaimAttempts, 200)
+	if planSeqScansSamples(rescan) {
+		t.Errorf("rescan_age_candidates: unexpected Seq Scan on samples:\n%s", rescan)
 	}
-	if !strings.Contains(stale, "idx_samples_stale_traits_pri2") {
-		t.Errorf("stale_traits_candidates: not using idx_samples_stale_traits_pri2 "+
-			"(ORDER BY drifted from the index?):\n%s", stale)
+	if !strings.Contains(rescan, "idx_samples_rescan_age") {
+		t.Errorf("rescan_age_candidates: not using idx_samples_rescan_age "+
+			"(ORDER BY drifted from the index?):\n%s", rescan)
 	}
-	if strings.Contains(stale, "Sort") {
-		t.Errorf("stale_traits_candidates: plan sorts instead of walking the index "+
-			"in order; this is the 18s-per-poll regression:\n%s", stale)
+	if strings.Contains(rescan, "Sort") {
+		t.Errorf("rescan_age_candidates: plan sorts instead of walking the index "+
+			"in order; this is the 18s-per-poll regression:\n%s", rescan)
 	}
-	t.Logf("stale_traits_candidates: ok\n%s", firstPlanLines(stale))
+	t.Logf("rescan_age_candidates: ok\n%s", firstPlanLines(rescan))
 }
 
 // TestPlanAuditRescanQueue covers the two statements that read the rescan queue:

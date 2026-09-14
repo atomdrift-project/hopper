@@ -189,69 +189,63 @@ func TestSightedCandidatesReturnsOnlyCitedPendingWork(t *testing.T) {
 	}
 }
 
-// TestStaleTraitsPrefersCorroborated pins corroborated as the LEADING sort key
-// of the rescan tier: a stale verdict on a sample the outside world has cited is
-// refreshed before one nothing has, even when every other ranking signal favours
-// the uncited row.
+// TestRescanAgeIgnoresCorroboration pins a deliberate REMOVAL. The rescan tier
+// used to lead its sort with corroborated, and to let a cited sample skip the
+// age gate entirely.
 //
-// The uncited sample here is a label disagreement sitting on the litmus
-// boundary — the top of the old ordering. If corroboration is not leading, it
-// comes back first and this fails.
-func TestStaleTraitsPrefersCorroborated(t *testing.T) {
+// Both are gone. The bypass was only ever safe because traits_version gated the
+// row behind it; with the tier keyed on age alone, "corroborated OR old enough"
+// re-admits every cited sample on every poll, re-analyzing it forever and
+// firing StoreResult's Redundant() warning as routine noise. A citation is a
+// deadline, and deadlines are the sighted tier's job — it claims at the TOP of
+// the ladder, where this one sits at the bottom.
+func TestRescanAgeIgnoresCorroboration(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
 
 	const (
-		citedDull      = "5a55555555555555555555555555555555555555555555555555555555555555"
-		uncitedUrgent  = "5b55555555555555555555555555555555555555555555555555555555555555"
-		uncitedOrdinar = "5c55555555555555555555555555555555555555555555555555555555555555"
+		citedFresh = "5a55555555555555555555555555555555555555555555555555555555555555"
+		uncitedOld = "5b55555555555555555555555555555555555555555555555555555555555555"
 	)
-	// citedDull agrees with its label and sits far from the boundary: last by
-	// every signal except corroboration.
-	mustInsert(t, ctx, db, &Sample{SHA256: citedDull, Source: "test", Label: "bad", LabelSource: "test"})
-	mustAnalyzeWithTraits(t, ctx, db, citedDull, 50, `{"l":5,"c":1.0}`)
-	if err := db.UpdateLitmusResult(ctx, citedDull, []byte(`{"prob":0.99}`)); err != nil {
-		t.Fatal(err)
+	for _, sha := range []string{citedFresh, uncitedOld} {
+		mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test", Label: "bad", LabelSource: "test"})
+		mustAnalyzeWithTraits(t, ctx, db, sha, 0, "")
 	}
-	// uncitedUrgent disagrees with its label and is closest to the boundary.
-	mustInsert(t, ctx, db, &Sample{SHA256: uncitedUrgent, Source: "test", Label: "bad", LabelSource: "test"})
-	mustAnalyzeWithTraits(t, ctx, db, uncitedUrgent, 0, "")
-	if err := db.UpdateLitmusResult(ctx, uncitedUrgent, []byte(`{"prob":0.49}`)); err != nil {
-		t.Fatal(err)
-	}
-	mustInsert(t, ctx, db, &Sample{SHA256: uncitedOrdinar, Source: "test", Label: "good", LabelSource: "test"})
-	mustAnalyzeWithTraits(t, ctx, db, uncitedOrdinar, 0, "")
-	if err := db.UpdateLitmusResult(ctx, uncitedOrdinar, []byte(`{"prob":0.90}`)); err != nil {
-		t.Fatal(err)
-	}
-
 	if _, err := db.AddSightings(ctx, []Sighting{
-		{Source: "osv", Subject: citedDull, Note: "malware"},
+		{Source: "osv", Subject: citedFresh, Note: "malware"},
 	}); err != nil {
 		t.Fatalf("AddSightings: %v", err)
 	}
 
-	old := time.Now().Add(-96 * time.Hour).UTC().Format(time.RFC3339Nano)
+	fresh := time.Now().Add(-1 * time.Hour).UTC().Format(time.RFC3339Nano)
+	old := time.Now().Add(-400 * 24 * time.Hour).UTC().Format(time.RFC3339Nano)
 	if _, err := db.lite.ExecContext(ctx,
-		`UPDATE samples SET analyzed_at = ?, traits_version = 'old-traits'`, old); err != nil {
+		`UPDATE samples SET analyzed_at = ? WHERE sha256 = ?`, fresh, citedFresh); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET analyzed_at = ? WHERE sha256 = ?`, old, uncitedOld); err != nil {
 		t.Fatal(err)
 	}
 
-	jobs, err := db.StaleTraitsCandidates(ctx, "new-traits", 72*time.Hour, time.Now(), 3)
+	// Guard the premise: the citation did land, so this tests the absent bypass
+	// rather than an absent sighting.
+	var corroborated int
+	if err := db.lite.QueryRowContext(ctx,
+		`SELECT corroborated FROM samples WHERE sha256 = ?`, citedFresh).Scan(&corroborated); err != nil {
+		t.Fatal(err)
+	}
+	if corroborated != 1 {
+		t.Fatalf("premise: %s is not corroborated", citedFresh)
+	}
+
+	jobs, err := db.RescanAgeCandidates(ctx, 75*24*time.Hour, time.Now(), 10)
 	if err != nil {
-		t.Fatalf("StaleTraitsCandidates: %v", err)
+		t.Fatalf("RescanAgeCandidates: %v", err)
 	}
-	if len(jobs) != 3 {
-		t.Fatalf("got %d jobs, want 3: %+v", len(jobs), jobs)
-	}
-	if jobs[0].SHA256 != citedDull {
-		t.Errorf("first job = %s, want the corroborated sample %s; corroborated is not "+
-			"leading the ordering. jobs=%+v", jobs[0].SHA256, citedDull, jobs)
-	}
-	// Below the corroborated rows, the original ranking must be untouched.
-	if jobs[1].SHA256 != uncitedUrgent {
-		t.Errorf("second job = %s, want %s; the disagreement/boundary ordering was lost",
-			jobs[1].SHA256, uncitedUrgent)
+	if len(jobs) != 1 || jobs[0].SHA256 != uncitedOld {
+		t.Fatalf("got %+v, want only the old uncited sample %s; a citation must not "+
+			"pull a freshly-analyzed row back into the age queue", jobs, uncitedOld)
 	}
 }
 
@@ -313,62 +307,4 @@ func TestCorroborationSettlesInsideTheWrite(t *testing.T) {
 	if cleared != 0 {
 		t.Errorf("reconcile cleared %d after the writes already settled; want 0", cleared)
 	}
-}
-
-// TestCitedSamplesSkipTheRescanAgeGate covers the reason a sighting on an
-// already-analyzed sample does anything at all.
-//
-// rescanAge defaults to 30 days and exists to stop the tier churning through
-// freshly-analyzed rows. That gate is what made a citation land on deaf ears: a
-// sample analyzed last week that a feed cites today would wait three more weeks.
-// A citation is the signal that says this row is worth the churn.
-//
-// The last case is the guard that keeps this from becoming a rescan treadmill:
-// being cited does NOT exempt a sample from traits_version. Re-running the
-// analyzer that already judged it cannot learn anything — the analyzer does not
-// read the ledger — and StoreResult calls that renewal a failed upstream guard.
-func TestCitedSamplesSkipTheRescanAgeGate(t *testing.T) {
-	ctx := context.Background()
-	db := openTestDB(t)
-
-	const (
-		citedStale   = "7a77777777777777777777777777777777777777777777777777777777777777"
-		uncitedFresh = "7b77777777777777777777777777777777777777777777777777777777777777"
-		citedCurrent = "7c77777777777777777777777777777777777777777777777777777777777777"
-	)
-	for _, sha := range []string{citedStale, uncitedFresh, citedCurrent} {
-		mustInsert(t, ctx, db, &Sample{SHA256: sha, Source: "test", Label: "unknown", LabelSource: "test"})
-		mustAnalyze(t, ctx, db, sha, 10)
-	}
-	if _, err := db.AddSightings(ctx, []Sighting{
-		{Source: "osv", Subject: citedStale, Note: "malware"},
-		{Source: "osv", Subject: citedCurrent, Note: "malware"},
-	}); err != nil {
-		t.Fatalf("AddSightings: %v", err)
-	}
-
-	// Everything analyzed an hour ago — far inside a 30-day age gate. citedCurrent
-	// carries the analyzer we are asking about; the other two are a version behind.
-	recent := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)
-	if _, err := db.lite.ExecContext(ctx,
-		`UPDATE samples SET analyzed_at = ?, traits_version = 'old-traits'`, recent); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.lite.ExecContext(ctx,
-		`UPDATE samples SET traits_version = 'new-traits' WHERE sha256 = ?`, citedCurrent); err != nil {
-		t.Fatal(err)
-	}
-
-	jobs, err := db.StaleTraitsCandidates(ctx, "new-traits", 30*24*time.Hour, time.Now(), 10)
-	if err != nil {
-		t.Fatalf("StaleTraitsCandidates: %v", err)
-	}
-	if len(jobs) != 1 {
-		t.Fatalf("got %d jobs, want only the cited stale one: %+v", len(jobs), jobs)
-	}
-	if jobs[0].SHA256 != citedStale {
-		t.Errorf("job = %s, want %s (a citation must lift the age gate)", jobs[0].SHA256, citedStale)
-	}
-	// uncitedFresh is absent: the gate still applies to everything nothing cites.
-	// citedCurrent is absent: a citation does not buy a redundant re-analysis.
 }

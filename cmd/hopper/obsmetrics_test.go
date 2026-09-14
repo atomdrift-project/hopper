@@ -251,7 +251,7 @@ func TestSampleAgeHistograms(t *testing.T) {
 	// A day-old sample handed out from the main backlog, and a month-old one
 	// from the stale-traits tier: the two the tier label must keep apart.
 	recordClaimAge(ctx, tierUnanalyzed, now.Add(-24*time.Hour), now)
-	recordClaimAge(ctx, tierStaleTraits, now.Add(-30*24*time.Hour), now)
+	recordClaimAge(ctx, tierRescanAge, now.Add(-30*24*time.Hour), now)
 	recordClaimAge(ctx, tierUnanalyzed, time.Time{}, now) // no created_at: skipped
 	recordCommitAge(ctx, false, now.Add(-25*time.Hour), now)
 	recordCommitAge(ctx, true, now.Add(-90*24*time.Hour), now)
@@ -268,7 +268,7 @@ func TestSampleAgeHistograms(t *testing.T) {
 	for _, want := range []string{
 		`hopper_claim_sample_age_seconds_count{`,
 		`tier="unanalyzed"`,
-		`tier="stale_traits"`,
+		`tier="rescan_age"`,
 		"hopper_claim_sample_age_seconds_sum{",
 		"hopper_claim_sample_age_seconds_bucket{",
 		`hopper_commit_sample_age_seconds_count{kind="first"`,

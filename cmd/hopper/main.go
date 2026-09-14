@@ -1084,13 +1084,17 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	maxRSSGB := f.Int("max-memory-gb", 48,
 		"local atomscan worker RSS limit in GB, forwarded as --max-rss-gb (0 = auto: let atomscan self-throttle, -1 = disable in-process throttling)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
-	// 30 days, up from 5 (2026-08-24): the stale-traits tier exists to catch
-	// detector improvements, not threats — a sample cited in a feed is force-
-	// rescanned via the sightings/cyclotron path regardless of this age, and
-	// scan's corpus precheck now skips re-analysis on the same 30-day benign
-	// window. 5 days meant the tier re-churned the corpus ~6x more often than
-	// either consumer needed, and its drain competes with fresh ingestion.
-	rescanAge := f.Duration("rescan-age", 30*24*time.Hour, "minimum age before a stale-traits sample is eligible for rescan")
+	// 75 days (2026-09-14). This is now the whole rescan rubric — the tier sorts
+	// oldest-first and asks nothing else — so the number is a throughput budget,
+	// not a freshness opinion: one cycle costs servable_rows / 75 rescans a day.
+	// Measured against production that day: 8.75M servable rows, so ~117k/day,
+	// against a top-level rescan rate already running at ~544k/day. Roughly a
+	// fifth of the re-analysis the fleet does anyway, and it REPLACES the old
+	// 30-day cutoff rather than adding to it.
+	//
+	// A sample cited in a feed does not wait for this: the sighted tier claims
+	// it at the top of the ladder, on a deadline set by the registry.
+	rescanAge := f.Duration("rescan-age", 75*24*time.Hour, "minimum age since last analysis before a sample is eligible for rescan")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
 	experimentTag := f.String("experiment-tag", "", "label for experiment comparison")
@@ -1382,7 +1386,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		traitsVersion = litmusTraitsVersion(ctx, *litmusBin)
 		wd.endStage("litmus.rules")
 		if traitsVersion != "" {
-			slog.Info("traits version for rescan", "version", traitsVersion)
+			slog.Info("traits version recorded on results", "version", traitsVersion)
 		}
 		// Cleave-traits validation is no longer a one-shot gate here: it runs
 		// inside superviseLocalWorker, which retries it (and re-pulls rules)
@@ -2220,7 +2224,7 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	defer stopBackground()
 	var dashWG sync.WaitGroup
 	dashWG.Go(func() {
-		runDashboard(backgroundCtx, &progress, litmus, tracker, db, start, maxAnalyzed, len(dirs), traitsVersion, rescanAge)
+		runDashboard(backgroundCtx, &progress, litmus, tracker, db, start, maxAnalyzed, len(dirs), rescanAge)
 	})
 
 	// Local time-series cache for the dashboard queue graphs. Historical queue
@@ -2257,7 +2261,7 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	// Queue maintenance: reap poison samples and (when the cache is open)
 	// sample queue depths for the graphs, on one ticker tied to ctx.
 	dashWG.Go(func() {
-		runQueueMaintenance(backgroundCtx, db, &progress, metrics, traitsVersion, rescanAge)
+		runQueueMaintenance(backgroundCtx, db, &progress, metrics, rescanAge)
 	})
 
 	pass := &walkPass{
@@ -2582,7 +2586,7 @@ func runDirPipeline(
 // until ctx is cancelled.
 func runQueueMaintenance(
 	ctx context.Context, db *hopper.DB, progress *loadProgress,
-	metrics *metricsStore, traitsVersion string, rescanAge time.Duration,
+	metrics *metricsStore, rescanAge time.Duration,
 ) {
 	const interval = 5 * time.Minute
 	const retention = 8 * 24 * time.Hour // a little beyond the 72h graph window
@@ -2601,7 +2605,7 @@ func runQueueMaintenance(
 			slog.Info("reaped oversized samples", "count", n, "max_job_bytes", int64(hopper.MaxJobBytes))
 		}
 		if metrics != nil {
-			sampleQueueMetrics(ctx, db, progress, metrics, traitsVersion, rescanAge, retention)
+			sampleQueueMetrics(ctx, db, progress, metrics, rescanAge, retention)
 		}
 
 		select {
@@ -2621,7 +2625,7 @@ func runQueueMaintenance(
 // Best-effort throughout — a slow count just skips one sample.
 func sampleQueueMetrics(
 	ctx context.Context, db *hopper.DB, progress *loadProgress, metrics *metricsStore,
-	traitsVersion string, rescanAge, retention time.Duration,
+	rescanAge, retention time.Duration,
 ) {
 	qctx, cancel := context.WithTimeout(ctx, dashQueryTimeout)
 	defer cancel()
@@ -2631,12 +2635,12 @@ func sampleQueueMetrics(
 		slog.Warn("queue metrics: count pending failed", "error", err)
 		return
 	}
-	// Every rescan tier. Gating this on traitsVersion recorded a flat zero for
-	// the whole series whenever the stale-traits tier was off, which made the
-	// rescan-depth graph agree with the (equally wrong) card instead of
-	// contradicting it.
+	// Every rescan tier. This used to be gated on traitsVersion, which recorded
+	// a flat zero for the whole series whenever the stale-traits tier was off --
+	// which was always -- making the rescan-depth graph agree with the (equally
+	// wrong) card instead of contradicting it. The age tier has no off state.
 	var rescan int64
-	if d, err := db.RescanDepths(qctx, traitsVersion, rescanAge); err == nil {
+	if d, err := db.RescanDepths(qctx, rescanAge); err == nil {
 		rescan = d.Total()
 	} else {
 		slog.Debug("queue metrics: rescan depths failed", "error", err)
@@ -2698,7 +2702,6 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 	db *hopper.DB,
 	start time.Time,
 	maxAnalyzed, ndirs int,
-	traitsVersion string,
 	rescanAge time.Duration,
 ) {
 	interval := 10 * time.Second
@@ -2744,7 +2747,7 @@ func runDashboard( //nolint:nolintlint,gocognit,revive,maintidx // complex dashb
 			newestAnalyzedAt, _ = db.NewestAnalyzedAt(ctx) //nolint:errcheck // best-effort; zero time is acceptable fallback
 			if lastRescanAt.IsZero() || time.Since(lastRescanAt) >= rescanRecompute {
 				qctx, cancel := context.WithTimeout(ctx, dashQueryTimeout)
-				d, _ := db.RescanDepths(qctx, traitsVersion, rescanAge) //nolint:errcheck // best-effort; zero is acceptable fallback
+				d, _ := db.RescanDepths(qctx, rescanAge) //nolint:errcheck // best-effort; zero is acceptable fallback
 				rescanPending = d.Total()
 				cancel()
 				lastRescanAt = time.Now()

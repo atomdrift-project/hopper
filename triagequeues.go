@@ -143,7 +143,7 @@ const (
 	// boundary between two systems rather than to tune a queue.
 	//
 	// A sample whose cleave_result predates the current traits is a RESCAN job:
-	// hopper's own stale-traits tier walks those (see staleTraitsCandidatesPG),
+	// hopper's own age-ordered rescan tier walks those (see rescanAgeCandidatesPG),
 	// re-analyzes them, and the fresh verdict either drops the row out of a
 	// triage predicate or leaves it in on current evidence. Offering those rows
 	// to cyclotron as triage instead makes the triage fleet the rescan tier: it
@@ -152,10 +152,12 @@ const (
 	// that was 93-99% of every selection on discord, bad, fp-trait and popular —
 	// 666 selections on discord to reach two LLM passes.
 	//
-	// traits_version would express this exactly, and is what the rescan tier
-	// keys on. It cannot be used here: it is empty on 96% of rows analyzed in the
-	// last three days, so a predicate on it would select a few thousand arbitrary
-	// samples. analyzed_at is the coarse proxy, and the values differ per queue
+	// traits_version would express this exactly. It cannot be used here — nor,
+	// as of 2026-09-14, anywhere: it is empty on ~65% of analyzed rows and the
+	// version is bumped at least once a day, so a predicate on it selects either
+	// a few thousand arbitrary samples or the entire corpus. The rescan tier
+	// used to key on it and has since been rebuilt on analyzed_at for exactly
+	// this reason. analyzed_at is the coarse proxy, and the values differ per queue
 	// because the populations age at very different rates — the bad-labelled
 	// pools barely move for months, so they take a wide floor, while the
 	// unconvicted pools turn over daily and take a narrow one.
@@ -201,9 +203,9 @@ const (
 // re-examined.
 //
 // The re-analysis half is standing in for "the traits changed". traits_version
-// would say that directly and is what the rescan tier keys on, but it is empty
-// on 96% of rows analyzed in the last three days (measured 2026-09-01), so a
-// predicate over it would compare ” to ” and park everything forever. A
+// would say that directly, but it is empty on most rows (~65%, measured
+// 2026-09-14) and bumped daily besides, so a predicate over it would compare ”
+// to ” and park everything forever. The rescan tier no longer keys on it. A
 // re-analysis is the event that APPLIES current traits to a sample, so it is the
 // materialised form of the same question and the one the data supports. Revisit
 // if traits_version is ever backfilled.
@@ -214,9 +216,10 @@ const ReportCooldown = 72 * time.Hour
 //
 // MinAnalyzedAt is deliberately left zero. Bounding it would restrict the queue
 // to rows whose verdict is recent enough to trust, but the only thing that
-// refreshes a verdict is a re-scan, and the rescan tier reaches this population
-// at roughly 1.4k/day against a 1.6M backlog — a floor would gate the queue's
-// ~30/day on that, for no gain. The report drain covers the same ground from the
+// refreshes a verdict is a re-scan — a floor would gate this queue's ~30/day on
+// the rescan tier's own cadence, for no gain. (The 1.4k/day against a 1.6M
+// backlog once cited here was measured while the rescan tier was disabled
+// outright; see rescanAgeCandidatesPG.) The report drain covers the same ground from the
 // other side: a stale row that current traits already catch is judged once,
 // produces no edit, and is parked until something re-scans it.
 func staleTriageFilter(queue string) TriageFilter {
