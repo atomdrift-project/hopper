@@ -2,6 +2,7 @@ package hopper
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -92,5 +93,204 @@ func TestVPrefixedExactVersionDoesNotCorroborateOtherVersions(t *testing.T) {
 	}
 	if corroborated(t, ctx, db, uncited) {
 		t.Error("v1.2.4 was corroborated by an advisory that names only v1.2.3")
+	}
+}
+
+// A claim naming this exact release is evidence against it.
+//
+// The ledger keys package claims on the version-less purl_base, so without the
+// release in hand "MAL-2025-6020 names is 3.3.1" and "this sample is is 3.3.1"
+// are two facts that meet nowhere, and the claim can only be counted as Scoped.
+// /v1/lookup held the version and dropped it, so the most precise evidence the
+// ledger carries reached no consumer at all.
+func TestAssessReleaseCountsAClaimNamingThisRelease(t *testing.T) {
+	const purl = "pkg:npm/is"
+	rows := []Sighting{{
+		Source: "osv", Operator: "ossf-malpkgs", Subject: purl,
+		Affected: "3.3.1, 5.0.0", Claim: ClaimMalicious, Basis: BasisReviewed,
+	}}
+
+	// The release the advisory names.
+	named := AssessRelease(rows, "3.3.1")
+	if named.Scoped != 0 || len(named.Operators) != 1 {
+		t.Errorf("3.3.1 is named by the advisory: got scoped=%d operators=%v",
+			named.Scoped, named.Operators)
+	}
+	if _, ok := Floor(named.Confidence); !ok {
+		t.Errorf("a reviewed claim naming this release justifies a floor, got %v", named.Confidence)
+	}
+
+	// A release it does not name, and the version-less question, both unchanged.
+	for _, tc := range []struct{ name, version string }{
+		{"unnamed release", "0.1.2"},
+		{"no release in hand", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := AssessRelease(rows, tc.version)
+			if a.Scoped != 1 || len(a.Operators) != 0 {
+				t.Errorf("got scoped=%d operators=%v, want the claim counted as scoped only",
+					a.Scoped, a.Operators)
+			}
+			if _, ok := Floor(a.Confidence); ok {
+				t.Error("a claim that does not name this release must justify no floor")
+			}
+		})
+	}
+}
+
+// convicts must not inherit Covers's permissiveness. Covers keeps a claim whose
+// scope is unreadable so a reader still sees it; believing the same row is what
+// graded num2words 0.5.14 hostile while every source that named versions named
+// 0.5.15 and 0.5.16.
+func TestAssessReleaseRefusesScopesItCannotRead(t *testing.T) {
+	for _, affected := range []string{"", "<2.0.0", ">=1.0.0, <2.0.0"} {
+		t.Run("affected="+affected, func(t *testing.T) {
+			rows := []Sighting{{
+				Source: "osv", Operator: "ossf-malpkgs", Subject: "pkg:pypi/num2words",
+				Affected: affected, Claim: ClaimMalicious, Basis: BasisReviewed,
+			}}
+			a := AssessRelease(rows, "0.5.14")
+			if len(a.Operators) != 0 {
+				t.Errorf("affected %q must not convict 0.5.14, got operators=%v", affected, a.Operators)
+			}
+			// ...while the display rule still shows it.
+			if !rows[0].Covers("0.5.14") {
+				t.Errorf("affected %q should still be shown to a reader", affected)
+			}
+		})
+	}
+}
+
+// Assess is AssessRelease with no release in hand; a claim covering every
+// release convicts either way.
+func TestAssessIsAssessReleaseWithoutAVersion(t *testing.T) {
+	rows := []Sighting{{
+		Source: "osv", Operator: "ossf-malpkgs", Subject: "pkg:npm/evil",
+		Affected: AllVersions, Claim: ClaimMalicious, Basis: BasisReviewed,
+	}}
+	if a, b := Assess(rows), AssessRelease(rows, ""); a.Confidence != b.Confidence {
+		t.Errorf("Assess = %v, AssessRelease(_, \"\") = %v", a.Confidence, b.Confidence)
+	}
+	if len(AssessRelease(rows, "1.0.0").Operators) != 1 {
+		t.Error("an all-releases claim convicts whichever release is asked about")
+	}
+}
+
+// The poppy case, end to end through the path /v1/lookup serves.
+//
+// poppy asks about pkg:npm/is@3.3.1 — a top-10000 package, so exactly the kind
+// it promotes — and hopper splits that into a base and a version before calling
+// LookupRecord. Until the version was threaded through corroborate, a sample our
+// own analysis had not fired on came back with no fires_at while OSV named that
+// exact release malware, and poppy promoted it to the good pool.
+func TestLookupRecordUsesAClaimNamingTheRelease(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	const purl = "pkg:npm/is"
+	cited := mustVersionedSample(t, ctx, db, "b8", purl, "3.3.1")
+	clean := mustVersionedSample(t, ctx, db, "c9", purl, "0.1.2")
+
+	// Two operators, so the ladder reaches a floor on its own.
+	if _, err := db.AddSightings(ctx, []Sighting{
+		{
+			Source:   "osv",
+			Operator: "ossf-malpkgs",
+			Subject:  purl,
+			Affected: "3.3.1, 5.0.0",
+			Claim:    ClaimMalicious,
+			Basis:    BasisReviewed,
+			Note:     "MAL-2025-6020",
+		},
+		{
+			Source:   "socket",
+			Operator: "socket",
+			Subject:  purl,
+			Affected: "3.3.1",
+			Claim:    ClaimMalicious,
+			Basis:    BasisPredicted,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	named, err := db.LookupRecord(ctx, cited, purl, "3.3.1")
+	if err != nil {
+		t.Fatalf("lookup 3.3.1: %v", err)
+	}
+	if named.FiresAt == nil {
+		t.Error("two sources name 3.3.1 as malware; the lookup reported no level at all")
+	}
+
+	other, err := db.LookupRecord(ctx, clean, purl, "0.1.2")
+	if err != nil {
+		t.Fatalf("lookup 0.1.2: %v", err)
+	}
+	if other.FiresAt != nil {
+		t.Errorf("0.1.2 is named by neither source, got fires_at=%d", *other.FiresAt)
+	}
+}
+
+// An answer derived from the ledger must name the release it is about.
+//
+// Consumers file a lookup body under the coordinate it names — beamline caches
+// one under its own row.purl — so a verdict about one release reported under
+// the version-less base is handed to the next caller asking about the package.
+// Harmless while the body did not depend on the release; AssessRelease is what
+// changed that.
+func TestFromLedgerNamesTheReleaseItAnswersAbout(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	const purl = "pkg:npm/is"
+	if _, err := db.AddSightings(ctx, []Sighting{
+		{
+			Source:   "osv",
+			Operator: "ossf-malpkgs",
+			Subject:  purl,
+			Affected: "3.3.1",
+			Claim:    ClaimMalicious,
+			Basis:    BasisReviewed,
+		},
+		{
+			Source:   "socket",
+			Operator: "socket",
+			Subject:  purl,
+			Affected: "3.3.1",
+			Claim:    ClaimMalicious,
+			Basis:    BasisPredicted,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing holds these bytes, so the answer comes from the ledger alone.
+	rec, err := db.LookupRecord(ctx, "", purl, "3.3.1")
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if rec.PURL == nil || *rec.PURL != "pkg:npm/is@3.3.1" {
+		t.Errorf("record names %v, want pkg:npm/is@3.3.1", rec.PURL)
+	}
+
+	// And the package-level question is not convicted by it.
+	if _, err := db.LookupRecord(ctx, "", purl, ""); !errors.Is(err, ErrNotFound) {
+		t.Errorf("a claim scoped to 3.3.1 must not answer for the package, got %v", err)
+	}
+}
+
+func TestWithVersionKeepsQualifiers(t *testing.T) {
+	for _, tc := range []struct{ base, version, want string }{
+		{"pkg:npm/is", "3.3.1", "pkg:npm/is@3.3.1"},
+		{"pkg:npm/%40scope/pkg", "1.0.0", "pkg:npm/%40scope/pkg@1.0.0"},
+		{
+			"pkg:golang/example.com/m?repository_url=proxy.example",
+			"v1.2.3",
+			"pkg:golang/example.com/m@v1.2.3?repository_url=proxy.example",
+		},
+	} {
+		if got := withVersion(tc.base, tc.version); got != tc.want {
+			t.Errorf("withVersion(%q, %q) = %q, want %q", tc.base, tc.version, got, tc.want)
+		}
 	}
 }

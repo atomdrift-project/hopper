@@ -145,7 +145,23 @@ type Assessment struct {
 // source's Standing — because a benchmark that seeds its own ground truth
 // proves only that it agrees with itself, and two co-firing engines of ours
 // could erase their shared false positive from the next run.
-func Assess(sightings []Sighting) Assessment {
+func Assess(sightings []Sighting) Assessment { return AssessRelease(sightings, "") }
+
+// AssessRelease folds one subject's sightings into an Assessment, for a caller
+// that knows which release it is asking about.
+//
+// [Assess] is this with no release in hand, and the difference is one case: a
+// claim naming exact versions, one of which is this one. Without the version
+// that claim can only be counted as [Assessment.Scoped] — the ledger keys
+// package claims on the version-less purl_base, so "MAL-2025-6020 names is
+// 3.3.1" and "the sample is is 3.3.1" are two facts that meet nowhere.
+//
+// They met nowhere for /v1/lookup either, which HELD the version and dropped it
+// on the way in. The most precise evidence the ledger carries — several sources
+// naming one release — therefore reached no consumer: not scan, whose install
+// decision this scale ends in, and not poppy, which promoted a top-10000
+// release to the good pool while OSV named that exact release malware.
+func AssessRelease(sightings []Sighting, version string) Assessment {
 	// Folded on operator before counting, so volume from one voice cannot
 	// climb the ladder. Value is the strongest basis that operator ever
 	// claimed: a source that both hosts bytes and publishes a reviewed report
@@ -166,7 +182,7 @@ func Assess(sightings []Sighting) Assessment {
 			// package as externally disputed.
 			continue
 		}
-		if !coversEveryRelease(s) {
+		if !convicts(s, version) {
 			a.Scoped++
 			continue
 		}
@@ -254,6 +270,32 @@ func coversEveryRelease(s *Sighting) bool {
 	return strings.TrimSpace(s.Affected) == AllVersions
 }
 
+// convicts reports whether a claim is evidence AGAINST the release in hand.
+//
+// Two ways, and only two: the claim covers every release, or it names this one.
+// version may be empty, which is a caller holding no release — then only the
+// first way is open, and this is exactly [coversEveryRelease].
+//
+// Deliberately NOT [Sighting.Covers], which is the display rule and answers a
+// weaker question: Covers keeps a claim whose scope is unreadable, because a
+// reader should still see that somebody made one. Believing the same row is
+// what graded pkg:pypi/num2words@0.5.14 hostile while every source that named
+// versions named 0.5.15 and 0.5.16. A range is refused for the same reason —
+// resolving "<1.3.0" needs a registry index this does not have, and guessing
+// convicts releases nobody accused.
+//
+// So this only ever ADDS the unambiguous case to what already counted: the
+// advisory wrote this release down.
+func convicts(s *Sighting, version string) bool {
+	if coversEveryRelease(s) {
+		return true
+	}
+	if version = strings.TrimSpace(version); version == "" {
+		return false
+	}
+	return slices.Contains(namedVersions(s.Affected), version)
+}
+
 // Covers reports whether this claim is evidence about one particular release.
 //
 // The companion question to [coversEveryRelease], and deliberately not the same
@@ -321,6 +363,22 @@ func namedVersions(affected string) []string {
 		out = append(out, v)
 	}
 	return out
+}
+
+// withVersion puts a release back into a version-less PURL, ahead of any
+// qualifier tail.
+//
+// The inverse of [pkgparse.VersionlessPURL] for the shape that function
+// produces -- "body" or "body?repository_url=..." -- and not a general PURL
+// writer. [pkgparse.PURLVersion] returns the version exactly as it was spelled,
+// so for a canonical input this reproduces the canonical spelling.
+func withVersion(base, version string) string {
+	body, quals, hasQuals := strings.Cut(base, "?")
+	body += "@" + version
+	if !hasQuals {
+		return body
+	}
+	return body + "?" + quals
 }
 
 // rank orders bases by how much a single one of them is worth. Unrecognized
@@ -523,7 +581,7 @@ func (db *DB) CorroborationStats() CorroborationStats {
 // is indexed by, so the flag would save nothing and could only contribute
 // staleness — and a corroboration ledger's most dangerous wrong answer is
 // silence, which is indistinguishable from the truthful kind at the call site.
-func (db *DB) assess(ctx context.Context, subjects ...string) Assessment {
+func (db *DB) assess(ctx context.Context, version string, subjects ...string) Assessment {
 	keys := make([]string, 0, len(subjects))
 	for _, s := range subjects {
 		if s != "" {
@@ -548,7 +606,7 @@ func (db *DB) assess(ctx context.Context, subjects ...string) Assessment {
 	for _, k := range keys {
 		rows = append(rows, bySubject[k]...)
 	}
-	return Assess(rows)
+	return AssessRelease(rows, version)
 }
 
 // corroborate folds the ledger into a record built from a stored sample.
@@ -556,8 +614,8 @@ func (db *DB) assess(ctx context.Context, subjects ...string) Assessment {
 // Returns how long the result may be believed: zero when the ledger had nothing
 // to add, so an ordinary verdict keeps the long life its analysis earns, and
 // ledgerTTL once a citation is part of the answer.
-func (db *DB) corroborate(ctx context.Context, r *LookupRecord, flagged bool, subjects ...string) (*LookupRecord, time.Duration) {
-	a := db.assess(ctx, subjects...)
+func (db *DB) corroborate(ctx context.Context, r *LookupRecord, flagged bool, version string, subjects ...string) (*LookupRecord, time.Duration) {
+	a := db.assess(ctx, version, subjects...)
 	cited := len(a.Operators) > 0
 	switch {
 	case cited && !flagged:
@@ -598,8 +656,8 @@ func (db *DB) corroborate(ctx context.Context, r *LookupRecord, flagged bool, su
 // what separates a measurement from a citation, so its absence is how every
 // consumer — scan's is_verdict, beamline's cache rules, a caller's own code —
 // tells the two apart.
-func (db *DB) fromLedger(ctx context.Context, sha256, purl string) (*LookupRecord, time.Duration, error) {
-	a := db.assess(ctx, sha256, purl)
+func (db *DB) fromLedger(ctx context.Context, sha256, purl, version string) (*LookupRecord, time.Duration, error) {
+	a := db.assess(ctx, version, sha256, purl)
 	floor, ok := Floor(a.Confidence)
 	if !ok {
 		return nil, 0, ErrNotFound
@@ -617,6 +675,17 @@ func (db *DB) fromLedger(ctx context.Context, sha256, purl string) (*LookupRecor
 	}
 	if purl != "" {
 		p := purl
+		if version != "" {
+			// The release we were asked about, not the package it belongs to.
+			//
+			// Consumers file this answer under the coordinate it names --
+			// beamline caches a body under its own row.purl -- so reporting the
+			// version-less base here files a verdict about ONE release under
+			// the whole package, and the next caller asking about the package
+			// is handed it. That was harmless only while this answer did not
+			// depend on the release; [AssessRelease] is what changed that.
+			p = withVersion(purl, version)
+		}
 		r.PURL = &p
 	}
 	reason := feedReason(a)

@@ -151,11 +151,11 @@ func (db *DB) LookupRecord(ctx context.Context, sha256, base, version string) (*
 					// them, and answering "nobody has analyzed this" about a
 					// digest several of them call malware is a worse answer
 					// than saying who says so.
-					return db.fromLedger(ctx, sha256, "")
+					return db.fromLedger(ctx, sha256, "", "")
 				}
 				return nil, 0, err
 			}
-			rec, ttl := db.corroborate(ctx, recordOf(sample), sample.Corroborated, sample.SHA256, sample.PURLBase)
+			rec, ttl := db.corroborate(ctx, recordOf(sample), sample.Corroborated, sample.Version, sample.SHA256, sample.PURLBase)
 			return rec, ttl, nil
 		})
 		if err == nil {
@@ -172,11 +172,11 @@ func (db *DB) LookupRecord(ctx context.Context, sha256, base, version string) (*
 		sample, err := db.SampleByPURL(ctx, base, version)
 		if err != nil {
 			if errors.Is(err, ErrNotFound) {
-				return db.fromLedger(ctx, "", base)
+				return db.fromLedger(ctx, "", base, version)
 			}
 			return nil, 0, err
 		}
-		rec, ttl := db.corroborate(ctx, recordOf(sample), sample.Corroborated, sample.SHA256, sample.PURLBase)
+		rec, ttl := db.corroborate(ctx, recordOf(sample), sample.Corroborated, sample.Version, sample.SHA256, sample.PURLBase)
 		return rec, ttl, nil
 	})
 }
