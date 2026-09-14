@@ -2246,3 +2246,29 @@ func TestLoadAllPauseWalk(t *testing.T) {
 		t.Errorf("pauseWalk load left %d samples in the DB, want 0 (%v)", total, byLabel)
 	}
 }
+
+func TestIsForagerTemp(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		// The real orphan that reached the catalog as a 511KB "sample".
+		{".forager-3f96d1bb35fe11bd9825e665e8cbe24d.tmp", true},
+		{".forager-00000000000000000000000000000000.tmp", true},
+		{".forager-3f96d1bb35fe11bd9825e665e8cbe24d", false},      // no suffix
+		{"forager-3f96d1bb35fe11bd9825e665e8cbe24d.tmp", false},   // no dot prefix
+		{".forager-3F96D1BB35FE11BD9825E665E8CBE24D.tmp", false},  // uppercase
+		{".forager-abc.tmp", false},                               // wrong length
+		{".forager-3f96d1bb35fe11bd9825e665e8cbe24dd.tmp", false}, // too long
+		{".forager-3f96d1bb35fe11bd9825e665e8cbe24z.tmp", false},  // non-hex
+		// Real evidence that must never be mistaken for a temporary.
+		{"@hyclaw-cli-darwin-arm64-1.0.37.tgz", false},
+		{".tmp", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := isForagerTemp(tt.name); got != tt.want {
+			t.Errorf("isForagerTemp(%q) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}

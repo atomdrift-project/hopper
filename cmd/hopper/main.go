@@ -2493,6 +2493,10 @@ func runDirPipeline(
 		if isForagerSidecar(filepath.Base(lp.path)) {
 			continue
 		}
+		if isForagerTemp(filepath.Base(lp.path)) {
+			slog.Warn("skipping forager download temporary", "path", lp.path)
+			continue
+		}
 		progress.walked.Add(1)
 		storedPath := filepath.ToSlash(relativeSamplePath(filepath.Dir(target.dir), lp.path))
 		lp.label = target.label
@@ -3151,18 +3155,44 @@ func isForagerSidecar(name string) bool {
 	return false
 }
 
-// isHexSHA256Name reports whether s is exactly 64 lowercase hex digits, the
-// shape of a forager sha256-named file.
-func isHexSHA256Name(s string) bool {
-	if len(s) != 64 {
+// isForagerTemp reports whether name is one of forager's in-flight download
+// temporaries (".forager-<32 hex>.tmp"). forager writes a download into such a
+// file and hard-links it to its real name only once the body is complete, so a
+// file still carrying this name is a partial artifact by definition: the
+// process was killed mid-download and its deferred cleanup never ran. Ingesting
+// one files a truncated sample under a name derived from its random suffix,
+// which is how "@hyclaw/cli-darwin-arm64 3f96d1bb…" (511KB of a 29MB tarball)
+// entered the catalog.
+func isForagerTemp(name string) bool {
+	stem, ok := strings.CutSuffix(name, ".tmp")
+	if !ok {
+		return false
+	}
+	stem, ok = strings.CutPrefix(stem, ".forager-")
+	if !ok {
+		return false
+	}
+	return len(stem) == 32 && isLowerHex(stem)
+}
+
+// isLowerHex reports whether s is non-empty and entirely lowercase hex digits.
+func isLowerHex(s string) bool {
+	if s == "" {
 		return false
 	}
 	for i := range len(s) {
-		if c := s[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}
 	return true
+}
+
+// isHexSHA256Name reports whether s is exactly 64 lowercase hex digits, the
+// shape of a forager sha256-named file.
+func isHexSHA256Name(s string) bool {
+	return len(s) == 64 && isLowerHex(s)
 }
 
 // checkMarker looks for a sibling marker file that contradicts the given label.
