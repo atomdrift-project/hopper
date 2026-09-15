@@ -92,3 +92,52 @@ func TestDecodeJSONFromRejectsBadJSON(t *testing.T) {
 		t.Error("truncated document decoded without error")
 	}
 }
+
+// TestDecodeJSONFromSizeHints checks that a hint only affects allocation, never
+// the result — including hints that are wrong in either direction, since the
+// zstd path's hint is an estimate that cannot be verified before reading.
+func TestDecodeJSONFromSizeHints(t *testing.T) {
+	const body = `{"name":"alpha","n":42}`
+	for _, tc := range []struct {
+		name string
+		hint int64
+	}{
+		{"no hint", 0},
+		{"negative", -1},
+		{"exact", int64(len(body))},
+		{"under-estimate", 4},
+		{"over-estimate", 1 << 20},
+		{"absurd, must be capped", 1 << 40},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var v struct {
+				Name string `json:"name"`
+				N    int    `json:"n"`
+			}
+			if err := DecodeJSONFromSize(strings.NewReader(body), tc.hint, &v); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if v.Name != "alpha" || v.N != 42 {
+				t.Errorf("got %+v, want {alpha 42}", v)
+			}
+		})
+	}
+}
+
+// TestDecodeJSONFromSizeHintDoesNotOverAllocate pins the cap: a wild hint must
+// not be turned into a wild allocation.
+func TestDecodeJSONFromSizeHintDoesNotOverAllocate(t *testing.T) {
+	var v map[string]any
+	if err := DecodeJSONFromSize(strings.NewReader(`{"a":1}`), 1<<40, &v); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// The buffer that just served this decode is back in the pool; borrow it
+	// and confirm the cap bounded its capacity.
+	buf, _ := jsonBufPool.Get().(*bytes.Buffer)
+	if buf != nil {
+		defer jsonBufPool.Put(buf)
+		if buf.Cap() > MaxJSONSizeHint+(1<<20) {
+			t.Errorf("buffer capacity %d exceeds cap %d", buf.Cap(), MaxJSONSizeHint)
+		}
+	}
+}

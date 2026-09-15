@@ -1043,8 +1043,14 @@ const (
 	// so the broker's worst-case result memory scales with this — size the hopper
 	// host accordingly, or add a low-concurrency large-result lane if it bites.
 	maxResultBodyBytes = 1 << 30 // 1 GiB
-	maxTrackedWorkers  = 200
-	apiQueryTimeout    = 30 * time.Second
+	// zstdExpansionEstimate scales a compressed Content-Length into a guess at
+	// the decoded size, purely to pre-size a read buffer. Deliberately
+	// conservative: these documents compress far better than 6x, so this
+	// under-estimates and the buffer grows the rest of the way, which is the
+	// safe direction to be wrong in.
+	zstdExpansionEstimate = 6
+	maxTrackedWorkers     = 200
+	apiQueryTimeout       = 30 * time.Second
 	// sightingsStoreTimeout bounds one AddSightings attempt. Large feed
 	// snapshots can flip many samples.corroborated rows; the old shared
 	// apiQueryTimeout (30s) was too tight and timed out under load
@@ -1953,13 +1959,22 @@ type resultReader struct {
 	body      io.Reader
 	overLimit func() bool
 	cleanup   func()
+	// sizeHint estimates the decoded body size so the reader can be sized in
+	// one allocation instead of doubling up to it. Zero means unknown.
+	sizeHint int64
 }
 
 func resultBody(r *http.Request) (resultReader, error) {
 	raw := &io.LimitedReader{R: r.Body, N: maxResultBodyBytes + 1}
 	switch strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding"))) {
 	case "", "identity":
-		return resultReader{body: raw, overLimit: func() bool { return raw.N <= 0 }, cleanup: func() {}}, nil
+		// Uncompressed: Content-Length is the decoded size exactly.
+		return resultReader{
+			body:      raw,
+			overLimit: func() bool { return raw.N <= 0 },
+			cleanup:   func() {},
+			sizeHint:  r.ContentLength,
+		}, nil
 	case "zstd":
 		// Pooled, not one decoder per request. The original reasoning here was
 		// that result POSTs are infrequent enough for setup cost not to matter;
@@ -1971,7 +1986,20 @@ func resultBody(r *http.Request) (resultReader, error) {
 			return resultReader{}, err
 		}
 		out := &io.LimitedReader{R: zr, N: maxResultBodyBytes + 1}
-		return resultReader{body: out, overLimit: func() bool { return out.N <= 0 || raw.N <= 0 }, cleanup: release}, nil
+		// Compressed: Content-Length describes the wire bytes, so scale it.
+		// zstd on these result documents runs well past this ratio; a modest
+		// multiplier covers most of the growth without over-committing on a
+		// number we cannot verify, and DecodeJSONFromSize caps it regardless.
+		hint := int64(0)
+		if r.ContentLength > 0 {
+			hint = r.ContentLength * zstdExpansionEstimate
+		}
+		return resultReader{
+			body:      out,
+			overLimit: func() bool { return out.N <= 0 || raw.N <= 0 },
+			cleanup:   release,
+			sizeHint:  hint,
+		}, nil
 	default:
 		return resultReader{}, errors.New("unsupported content-encoding")
 	}
@@ -2088,7 +2116,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rb.cleanup()
 	var req resultRequest
-	if err := hopper.DecodeJSONFrom(rb.body, &req); err != nil {
+	if err := hopper.DecodeJSONFromSize(rb.body, rb.sizeHint, &req); err != nil {
 		// An over-limit body is truncated mid-document and fails the decode;
 		// report it as 413 so the worker sees the real cause instead of a
 		// generic "invalid json" 400.
