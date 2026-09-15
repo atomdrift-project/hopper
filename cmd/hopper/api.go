@@ -31,7 +31,6 @@ import (
 	"github.com/atomdrift-project/hopper/pkgparse"
 	"github.com/codeGROOVE-dev/retry"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/klauspost/compress/zstd"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -1962,15 +1961,17 @@ func resultBody(r *http.Request) (resultReader, error) {
 	case "", "identity":
 		return resultReader{body: raw, overLimit: func() bool { return raw.N <= 0 }, cleanup: func() {}}, nil
 	case "zstd":
-		// One decoder per request: result POSTs are infrequent and large, so
-		// the decoder setup is dwarfed by the decode itself. Single-threaded
-		// and low-memory keeps the per-request footprint small under bursts.
-		zr, err := zstd.NewReader(raw, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true))
+		// Pooled, not one decoder per request. The original reasoning here was
+		// that result POSTs are infrequent enough for setup cost not to matter;
+		// profiling says otherwise — at a thousand analyses a second these are
+		// the hot path, and per-request zstd.NewReader was the largest single
+		// allocation site in hopper. See [hopper.BorrowZstdReader].
+		zr, release, err := hopper.BorrowZstdReader(raw)
 		if err != nil {
 			return resultReader{}, err
 		}
 		out := &io.LimitedReader{R: zr, N: maxResultBodyBytes + 1}
-		return resultReader{body: out, overLimit: func() bool { return out.N <= 0 || raw.N <= 0 }, cleanup: zr.Close}, nil
+		return resultReader{body: out, overLimit: func() bool { return out.N <= 0 || raw.N <= 0 }, cleanup: release}, nil
 	default:
 		return resultReader{}, errors.New("unsupported content-encoding")
 	}
@@ -2069,9 +2070,13 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	// so it doesn't impose a global ReadTimeout on long-lived /data downloads.
 	// SetReadDeadline returns http.ErrNotSupported under httptest; harmless.
 	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(resultBodyTimeout)) //nolint:errcheck // optional
-	// Stream-decode rather than io.ReadAll: avoids a duplicate 128 MiB buffer
-	// per concurrent uploader. The Raw/ML json.RawMessage fields still land
-	// in memory once each, but we lose the second whole-body copy.
+	// Read through a pooled buffer. The previous note here claimed streaming
+	// avoided a duplicate whole-body buffer; it does not. json.Decoder.Decode
+	// on a single top-level value reads until that whole value sits in the
+	// decoder's own buffer, so peak memory matches reading the body outright —
+	// the only difference was that the buffer got there by repeated doubling,
+	// which profiled as the largest JSON allocation site in the process.
+	// See [hopper.DecodeJSONFrom].
 	rb, err := resultBody(r)
 	if err != nil {
 		slog.Warn("result rejected: bad content-encoding",
@@ -2082,9 +2087,8 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rb.cleanup()
-	dec := json.NewDecoder(rb.body)
 	var req resultRequest
-	if err := dec.Decode(&req); err != nil {
+	if err := hopper.DecodeJSONFrom(rb.body, &req); err != nil {
 		// An over-limit body is truncated mid-document and fails the decode;
 		// report it as 413 so the worker sees the real cause instead of a
 		// generic "invalid json" 400.

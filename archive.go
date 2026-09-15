@@ -103,8 +103,7 @@ func clearCompactionMarkers(envelope []byte, have map[string][]byte) ([]byte, er
 	} else {
 		delete(raw.obj, "omitted_files")
 	}
-	top["raw"] = mustMarshal(raw.obj)
-	return mustMarshal(top), nil
+	return marshalSection(top, "raw", raw.obj)
 }
 
 // Leaf is one archive member's analysis, factored out of its parent and keyed by
@@ -179,9 +178,11 @@ func Split(envelope []byte) (parent []byte, leaves []Leaf, err error) {
 		raw.files[i] = mustMarshal(pick(entry, refKeys))
 	}
 
-	raw.obj[raw.key] = mustMarshal(raw.files)
-	top["raw"] = mustMarshal(raw.obj)
-	return mustMarshal(top), leaves, nil
+	parentEnv, merr := marshalEnvelope(top, "raw", raw)
+	if merr != nil {
+		return nil, nil, merr
+	}
+	return parentEnv, leaves, nil
 }
 
 // splitParentOnly builds the same parent Split would (container whole, every
@@ -220,9 +221,11 @@ func splitParentOnly(envelope []byte) (parent []byte, members int, err error) {
 		members++
 	}
 
-	raw.obj[raw.key] = mustMarshal(raw.files)
-	top["raw"] = mustMarshal(raw.obj)
-	return mustMarshal(top), members, nil
+	parent, err = marshalEnvelope(top, "raw", raw)
+	if err != nil {
+		return nil, 0, err
+	}
+	return parent, members, nil
 }
 
 // Join reverses Split: it restores every member entry in the parent's raw.files
@@ -262,9 +265,7 @@ func Join(parent []byte, lookup func(sha string) (envelope []byte, ok bool)) ([]
 		raw.files[i] = restored
 	}
 
-	raw.obj[raw.key] = mustMarshal(raw.files)
-	top["raw"] = mustMarshal(raw.obj)
-	return mustMarshal(top), nil
+	return marshalEnvelope(top, "raw", raw)
 }
 
 // buildLeaf assembles a member's standalone envelope: each section's metadata
@@ -439,6 +440,62 @@ func intField(entry map[string]json.RawMessage, key string) (int, bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+// marshalEnvelope serialises an envelope whose "raw" (or "ml") section carries a
+// file list, in ONE encoder pass.
+//
+// The obvious spelling nests three marshals:
+//
+//	sec.obj[sec.key] = mustMarshal(sec.files)
+//	top[name]        = mustMarshal(sec.obj)
+//	return mustMarshal(top)
+//
+// which serialises the same bytes three times. encoding/json compacts every
+// json.RawMessage it writes, so the file list is compacted once on its own, a
+// second time as part of the section, and a third as part of the envelope — and
+// on a large archive the file list *is* the document. Profiling put this at the
+// top of hopper's allocation profile.
+//
+// Handing the encoder one tree instead lets it compact each leaf exactly once.
+// The output is byte-identical: encoding/json sorts map keys the same way for
+// map[string]any as for map[string]json.RawMessage, and compaction is
+// idempotent, so collapsing three passes into one cannot change the result.
+// TestMarshalEnvelopeMatchesNestedMarshal pins that equivalence.
+func marshalEnvelope(top map[string]json.RawMessage, name string, sec fileSection) ([]byte, error) {
+	secObj := make(map[string]any, len(sec.obj)+1)
+	for k, v := range sec.obj {
+		secObj[k] = v
+	}
+	secObj[sec.key] = sec.files
+
+	out := make(map[string]any, len(top))
+	for k, v := range top {
+		out[k] = v
+	}
+	out[name] = secObj
+
+	b, err := json.Marshal(out)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: marshal envelope: %w", err)
+	}
+	return b, nil
+}
+
+// marshalSection is marshalEnvelope for the callers that rewrite a section's
+// object without touching its file list.
+func marshalSection(top map[string]json.RawMessage, name string, obj map[string]json.RawMessage) ([]byte, error) {
+	out := make(map[string]any, len(top))
+	for k, v := range top {
+		out[k] = v
+	}
+	out[name] = obj
+
+	b, err := json.Marshal(out)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: marshal envelope: %w", err)
+	}
+	return b, nil
 }
 
 func decodeObject(b []byte) (map[string]json.RawMessage, error) {

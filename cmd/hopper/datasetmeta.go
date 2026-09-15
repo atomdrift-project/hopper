@@ -13,8 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/klauspost/compress/zstd"
-
 	"github.com/atomdrift-project/hopper"
 	"github.com/atomdrift-project/hopper/pkgparse"
 )
@@ -247,11 +245,11 @@ func readMaybeZstd(path string) ([]byte, error) {
 
 	var r io.Reader = f
 	if strings.HasSuffix(path, ".zst") {
-		zr, err := zstd.NewReader(f, zstd.WithDecoderLowmem(true), zstd.WithDecoderConcurrency(1))
+		zr, release, err := hopper.BorrowZstdReader(f)
 		if err != nil {
-			return nil, fmt.Errorf("zstd: %w", err)
+			return nil, err
 		}
-		defer zr.Close()
+		defer release()
 		r = zr
 	}
 	data, err := io.ReadAll(io.LimitReader(r, maxDatasetMetadataBytes+1))

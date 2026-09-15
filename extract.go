@@ -15,7 +15,6 @@ import (
 	"strings"
 
 	"github.com/bodgit/sevenzip"
-	"github.com/klauspost/compress/zstd"
 	"github.com/ulikunitz/xz"
 	"github.com/ulikunitz/xz/lzma"
 )
@@ -313,11 +312,7 @@ func newDecompressor(comp string, r io.Reader) (io.Reader, func(), error) {
 		}
 		return lr, func() {}, nil
 	case "zst":
-		zr, err := zstd.NewReader(r, zstd.WithDecoderLowmem(true), zstd.WithDecoderConcurrency(1))
-		if err != nil {
-			return nil, nil, fmt.Errorf("zstd: %w", err)
-		}
-		return zr, zr.Close, nil
+		return BorrowZstdReader(r)
 	case "bz2":
 		return bzip2.NewReader(r), func() {}, nil
 	}
