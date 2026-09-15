@@ -2421,9 +2421,9 @@ func (s *apiServer) claimLadder(slots int) []claimTier {
 	// prism's /fallout page, where a hostile verdict with no reasoning line is
 	// what a reader is looking at.
 	//
-	// See missingLLMCandidatesPG: this tier is only worth running once SCAN_LLM
-	// is set fleet-wide, because nothing here can route a job to a worker that
-	// actually runs the interpret pass.
+	// See missingLLMCandidatesPG: a re-analysis that returns no rationale is an
+	// ordinary outcome (the scanner does not interpret everything), and it still
+	// refreshes cleave and litmus, so the tier earns its place either way.
 	ladder = append(ladder,
 		claimTier{name: tierMissingLLM, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
 			return s.db.MissingLLMCandidates(ctx, s.hopperStart, n)

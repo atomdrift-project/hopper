@@ -1415,14 +1415,13 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 			}
 			hopperURL = "http://" + addr
 		}
-		// The interpret tier hands samples out ONCE and marks them; a fleet with
-		// no LLM endpoint consumes its whole backlog and learns nothing. hopper
-		// only knows its own local worker's config, so this is a hint, not a
-		// guarantee -- but it is the one place the misconfiguration is visible.
+		// Informational, not a fault: the interpret pass is optional and the
+		// scanner does not run it on everything anyway. Worth one line because
+		// the missing_llm tier stamps each sample it offers, so a local worker
+		// with no endpoint quietly retires rows it could never describe.
 		if *litmusLLM == "" {
-			slog.Warn("no LLM endpoint configured (--litmus-llm / $SCAN_LLM): the local worker "+
-				"stores no llm_result, and the missing_llm claim tier marks each sample it hands "+
-				"out as attempted whether or not a rationale comes back",
+			slog.Info("no LLM endpoint configured (--litmus-llm / $SCAN_LLM); the local worker "+
+				"will store no llm_result",
 				"reset", "UPDATE samples SET llm_attempted_at = NULL WHERE llm_result IS NULL")
 		}
 		litmus = newLitmusServer(litmusConfig{

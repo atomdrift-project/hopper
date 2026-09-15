@@ -2482,9 +2482,8 @@ func TestMissingLLMCandidates(t *testing.T) {
 		}
 	}
 
-	// ONE attempt each, ever. Nothing in hopper can guarantee the worker that
-	// claims these runs the interpret pass, so an unmarked sample is one this
-	// tier re-offers forever.
+	// ONE attempt each, ever. The scanner decides which samples warrant a
+	// rationale, so a row it declines would otherwise be re-offered forever.
 	if err := db.MarkLLMAttempt(ctx, []string{firedNewer}); err != nil {
 		t.Fatalf("MarkLLMAttempt: %v", err)
 	}

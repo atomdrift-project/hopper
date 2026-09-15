@@ -362,6 +362,9 @@ section{margin-bottom:2rem}
 
 /* nodes */
 table{width:100%;border-collapse:collapse}
+/* 18 columns do not fit 1180px. Without this the last column (Oldest Job)
+   painted outside the page box and was simply unreadable. */
+.tbl-wrap{overflow-x:auto;max-width:100%}
 thead th{font-size:.65rem;font-weight:600;letter-spacing:.1em;
   text-transform:uppercase;color:var(--sub);
   padding:.25rem .6rem .5rem;text-align:left;border-bottom:1px solid var(--border)}
@@ -738,11 +741,17 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	buf.WriteString(`</div>`)
 
 	// Bar — session progress only.
+	// Colour tracks the state rather than being decoration: a finished bar in
+	// warning-amber reads as a problem at a glance, which is precisely backwards.
+	barColor := "#fbbf24"
+	if pct >= 99.95 {
+		barColor = "#34d399"
+	}
 	fmt.Fprintf(&buf,
 		`<div class="track">`+
-			`<div class="fill" style="width:%.2f%%;background:#fbbf24"></div>`+
+			`<div class="fill" style="width:%.2f%%;background:%s"></div>`+
 			`</div>`,
-		pct)
+		pct, barColor)
 	buf.WriteString(`</div>`) // .progress
 
 	buf.WriteString(`<div class="card-group-label">Backlogs</div><div class="queue-grid">`)
@@ -757,11 +766,17 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		if topLevelRate > 0.001 {
 			parts = append(parts, fmt.Sprintf("<em>%s</em>/s", fmtRate(topLevelRate)))
 		}
-		if initialETA != "" {
+		switch {
+		case initialETA != "":
 			// Explicitly the cleave half's ETA: it is the slope of the no-cleave
 			// depth alone. The no-litmus half drains through the repair tier on
 			// leftover capacity and has its own, much flatter, slope.
 			parts = append(parts, "ETA <em>"+initialETA+"</em>")
+		case pending > 0 && topLevelRate > 0.001 && float64(pending)/topLevelRate < keepingUpSeconds:
+			// Steady state with a backlog the fleet clears in seconds. "No ETA"
+			// is true but reads as missing data; this is the actual condition.
+			parts = append(parts, "keeping up")
+		default:
 		}
 		if len(parts) == 0 {
 			parts = append(parts, "caught up")
@@ -846,7 +861,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 			}
 		}
 
-		buf.WriteString(`<section><div class="label">Workers</div>`)
+		buf.WriteString(`<section><div class="label">Workers</div><div class="tbl-wrap">`)
 		buf.WriteString(`<table><thead><tr>` +
 			`<th>Worker</th><th>Litmus</th><th>Traits</th><th>Tools</th>` +
 			`<th>Tasks</th><th>Seen</th><th>Rate</th>` +
@@ -1033,7 +1048,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 				htmlEscape(status),
 			)
 		}
-		buf.WriteString(`</tbody></table>`)
+		buf.WriteString(`</tbody></table></div>`)
 		if ghosts > 0 {
 			fmt.Fprintf(&buf,
 				`<div class="graph-note">%d registration(s) hidden: reported no version, tools or slots</div>`,
@@ -1359,17 +1374,23 @@ func writeSystemStatus(buf *strings.Builder, in *statusInputs) {
 	type issue struct {
 		text string
 		bad  bool // red rather than amber
+		// chronic marks a standing condition rather than something that just
+		// happened. A 138-day-old backlog is real, but promoting it to the
+		// headline on every render makes the top line permanent furniture --
+		// and a status line that never changes is one nobody reads. Acute
+		// problems own the headline; chronic ones are stated, not shouted.
+		chronic bool
 	}
 	var issues []issue
 
 	// Staleness first: a pipeline that has stopped moving outranks any backlog.
 	if !in.health.LatestAdded.IsZero() && time.Since(in.health.LatestAdded) > time.Hour {
-		issues = append(issues, issue{fmt.Sprintf("No sample ingested in %s",
-			shortDuration(time.Since(in.health.LatestAdded))), true})
+		issues = append(issues, issue{text: fmt.Sprintf("No sample ingested in %s",
+			shortDuration(time.Since(in.health.LatestAdded))), bad: true})
 	}
 	if !in.health.LatestAnalyzed.IsZero() && time.Since(in.health.LatestAnalyzed) > time.Hour {
-		issues = append(issues, issue{fmt.Sprintf("Nothing analyzed in %s",
-			shortDuration(time.Since(in.health.LatestAnalyzed))), true})
+		issues = append(issues, issue{text: fmt.Sprintf("Nothing analyzed in %s",
+			shortDuration(time.Since(in.health.LatestAnalyzed))), bad: true})
 	}
 	// Then direction: arriving faster than finishing is what turns every backlog
 	// below into a permanent one.
@@ -1380,20 +1401,32 @@ func writeSystemStatus(buf *strings.Builder, in *statusInputs) {
 			// leaving the reader to discover the cause themselves.
 			text += " (walk in progress)"
 		}
-		issues = append(issues, issue{text, !in.walking})
+		issues = append(issues, issue{text: text, bad: !in.walking})
 	}
 	// Then standing backlogs, described by age.
 	if age, ok := oldestBacklog(in.backlogs); ok && age > 7*24*time.Hour {
-		issues = append(issues, issue{fmt.Sprintf("%s files have no litmus score, oldest %s",
-			fmtN(in.pendingLitmus), shortDuration(age)), false})
+		issues = append(issues, issue{
+			text:    fmt.Sprintf("%s files have no litmus score, oldest %s", fmtN(in.pendingLitmus), shortDuration(age)),
+			chronic: true,
+		})
 	}
 
+	// Acute first: the headline is reserved for what changed.
 	cls, headline := "status-ok", "Pipeline healthy"
-	if len(issues) > 0 {
-		cls, headline = "status-warn", issues[0].text
-		if issues[0].bad {
-			cls = "status-bad"
+	promoted := -1
+	for i := range issues {
+		if !issues[i].chronic {
+			cls, headline, promoted = "status-warn", issues[i].text, i
+			if issues[i].bad {
+				cls = "status-bad"
+			}
+			break
 		}
+	}
+	if promoted < 0 && len(issues) > 0 {
+		// Nothing acute, but not all-clear either. Say that rather than either
+		// crying wolf or reporting a standing backlog as health.
+		cls, headline = "status-warn", "Healthy, with a standing backlog"
 	}
 
 	buf.WriteString(`<div class="status">`)
@@ -1416,8 +1449,10 @@ func writeSystemStatus(buf *strings.Builder, in *statusInputs) {
 		facts = append(facts, fmtN(in.rescan.Total())+" queued for re-analysis")
 	}
 	// Everything the headline did not promote still gets said, just quietly.
-	for _, is := range issues[min(1, len(issues)):] {
-		facts = append(facts, is.text)
+	for i := range issues {
+		if i != promoted {
+			facts = append(facts, issues[i].text)
+		}
 	}
 	if len(facts) > 0 {
 		fmt.Fprintf(buf, `<div class="status-facts">%s</div>`, htmlEscape(strings.Join(facts, " · ")))
@@ -1473,8 +1508,18 @@ func tierDepthSeries(tier string, points []queuePoint) []float64 {
 		return nil
 	}
 	out := make([]float64, 0, len(points))
+	var seen bool
 	for _, p := range points {
-		out = append(out, float64(pick(p)))
+		v := pick(p)
+		if v != 0 {
+			seen = true
+		}
+		out = append(out, float64(v))
+	}
+	// An all-zero history is not a trend. Drawing it produced a flat line across
+	// the cell, which reads as "measured and steady" rather than "nothing here".
+	if !seen {
+		return nil
 	}
 	return out
 }
@@ -1523,7 +1568,7 @@ func trendArrow(vals []float64) string {
 	}
 	delta := last - first
 	// A percent threshold, not an absolute one: these series span 130 to 3.4M.
-	if scale := math.Max(first, 1); math.Abs(delta)/scale < 0.02 {
+	if scale := math.Max(first, 1); math.Abs(delta)/scale < flatSeriesShare {
 		return `<span class="trend-flat">flat</span>`
 	}
 	if delta < 0 {
@@ -1590,11 +1635,15 @@ func writeClaimLadder(buf *strings.Builder, activity, depths map[string]int64, p
 		}
 
 		series := tierDepthSeries(t, points)
+		spark := ""
+		if trend := trendArrow(series); trend != "" && !strings.Contains(trend, "flat") {
+			spark = sparkline(series, "#818cf8")
+		}
 		fmt.Fprintf(buf,
 			`<tr><td>%d</td><td>%s</td><td class="hi">%s</td><td class="hi">%s</td><td>%s</td>`+
 				`<td class="ladder-cell">%s</td><td>%s</td><td>%s</td></tr>`,
 			i+1, htmlEscape(tierLabel(t)), depthCell, claimsCell, rateCell, bar,
-			sparkline(series, "#818cf8"), trendArrow(series))
+			spark, trendArrow(series))
 	}
 	buf.WriteString(`</tbody></table></section>`)
 }
@@ -1873,8 +1922,22 @@ func flowRates(points []queuePoint) flowSeries {
 		depthCur := cur.Pending + cur.Rescan
 		f.net = append(f.net, float64(depthPrev-depthCur)/dt)
 		if prev.Added > 0 && cur.Added > 0 {
-			f.in = append(f.in, max(float64(cur.Added-prev.Added), 0)/dt)
-			f.out = append(f.out, max(float64(cur.Completed-prev.Completed), 0)/dt)
+			// out is DERIVED, not measured. queuePoint.Completed is an in-memory
+			// session counter that resets to its DB baseline on every restart,
+			// so across a window spanning one it under-reports completions for
+			// the rest of that window -- the live dashboard read
+			// "Gaining ground ... net -534/s", the verdict and its own detail
+			// line disagreeing, because the verdict came from depth and the
+			// detail came from that counter.
+			//
+			// A queue's level moves by arrivals minus completions, so
+			// out = in + net follows from the two quantities that ARE reliable
+			// (a monotonic id watermark and the depth itself). Derived this way
+			// the headline and the detail cannot contradict each other: they are
+			// the same arithmetic.
+			in := max(float64(cur.Added-prev.Added), 0) / dt
+			f.in = append(f.in, in)
+			f.out = append(f.out, max(in+float64(depthPrev-depthCur)/dt, 0))
 		}
 	}
 	f.usable = len(f.net) >= 2
@@ -1897,6 +1960,16 @@ func mean(vals []float64) float64 {
 // flowLosingShare is the fraction of sampled intervals that must show the
 // backlog growing before the dashboard will call it "losing ground".
 const flowLosingShare = 0.6
+
+// flatSeriesShare is the fractional change below which a queue-depth series is
+// treated as unchanged. Shared by the ETA and the trend arrow so a queue cannot
+// read "flat" in one column and carry an ETA in another.
+const flatSeriesShare = 0.02
+
+// keepingUpSeconds is how much work-in-hand still counts as keeping up: a
+// backlog the fleet would clear this fast is a pipeline running normally, not a
+// queue to estimate.
+const keepingUpSeconds = 300
 
 // medianOf returns the median of vals without disturbing the caller's slice.
 func medianOf(vals []float64) float64 {
@@ -1993,12 +2066,12 @@ func writeFlowGraph(buf *strings.Builder, points []queuePoint, cacheReady bool) 
 	detail := fmt.Sprintf("backlog <em>%s/s</em>", fmtSigned(avgNet))
 	if f.hasRates {
 		detail = fmt.Sprintf("in <em>%s/s</em> &middot; out <em>%s/s</em> &middot; net <em>%s/s</em>",
-			fmtRate(mean(f.in)), fmtRate(mean(f.out)), fmtSigned(mean(f.out)-mean(f.in)))
+			fmtRate(mean(f.in)), fmtRate(mean(f.out)), fmtSigned(avgNet))
 	}
 	fmt.Fprintf(buf, `<div class="flow-head"><span class="%s">%s</span>`+
 		`<span class="flow-detail">%s</span></div>`, cls, htmlEscape(verdict), detail)
 
-	const w, h = 1100, 150
+	const w, h = 1100, 110
 	scale := 1.0
 	for _, v := range f.net {
 		if a := math.Abs(v); a > scale {
@@ -2021,7 +2094,7 @@ func writeFlowGraph(buf *strings.Builder, points []queuePoint, cacheReady bool) 
 	fmt.Fprintf(&area, " %.1f,%.1f", xOf(len(f.net)-1), zeroY)
 
 	fmt.Fprintf(buf, `<svg viewBox="0 0 %d %d" preserveAspectRatio="none" `+
-		`style="display:block;width:100%%;height:150px;overflow:visible">`, w, h)
+		`style="display:block;width:100%%;height:110px;overflow:visible">`, w, h)
 	fmt.Fprintf(buf, `<defs><clipPath id="flowUp"><rect x="0" y="0" width="%d" height="%.1f"/></clipPath>`+
 		`<clipPath id="flowDown"><rect x="0" y="%.1f" width="%d" height="%.1f"/></clipPath></defs>`,
 		w, zeroY, zeroY, w, float64(h)-zeroY)
@@ -2029,8 +2102,10 @@ func writeFlowGraph(buf *strings.Builder, points []queuePoint, cacheReady bool) 
 	fmt.Fprintf(buf, `<polygon points="%s" fill="#f87171" fill-opacity="0.16" clip-path="url(#flowDown)"/>`, area.String())
 	fmt.Fprintf(buf, `<polyline points="%s" fill="none" stroke="#818cf8" stroke-width="1.5" stroke-linejoin="round"/>`, line.String())
 	fmt.Fprintf(buf, `<line x1="0" y1="%.1f" x2="%d" y2="%.1f" stroke="#4e5a72" stroke-width="1"/>`, zeroY, w, zeroY)
-	fmt.Fprintf(buf, `<text x="4" y="%.1f" fill="#4e5a72" font-size="10" font-family="monospace" dy="-4">backlog shrinking</text>`, zeroY)
-	fmt.Fprintf(buf, `<text x="4" y="%.1f" fill="#4e5a72" font-size="10" font-family="monospace" dy="12">backlog growing</text>`, zeroY)
+	fmt.Fprintf(buf, `<text x="%d" y="%.1f" text-anchor="end" fill="#4e5a72" font-size="10" `+
+		`font-family="monospace" dy="-4">backlog shrinking</text>`, w-4, zeroY)
+	fmt.Fprintf(buf, `<text x="%d" y="%.1f" text-anchor="end" fill="#4e5a72" font-size="10" `+
+		`font-family="monospace" dy="12">backlog growing</text>`, w-4, zeroY)
 	buf.WriteString(`</svg>`)
 	buf.WriteString(`<div class="graph-legend">` +
 		`<span class="legend-item"><span class="legend-swatch" style="background:#34d399"></span>finishing faster than arriving</span>` +
@@ -2118,14 +2193,20 @@ func queueETA(depth int64, points []queuePoint, at func(queuePoint) int64) (eta 
 	if den == 0 {
 		return "", 0, false
 	}
+
 	drain = -(num / den) // depth falling => positive drain
 	if drain <= 0 {
 		return "", drain, true
 	}
-	// Clamp in seconds, BEFORE converting to a Duration: see etaMax.
+	// Beyond etaMax there is no estimate worth printing. Reporting the clamp
+	// itself ("~365d00h") would be a fake-precise claim about a queue whose
+	// slope is indistinguishable from noise -- and computing it unclamped
+	// overflows int64, which is how a 2,200-year backlog once rendered as
+	// "-59s". Refusing is both safer and more honest; the caller says
+	// "not draining".
 	secs := float64(depth) / drain
 	if secs >= etaMax.Seconds() {
-		return coarsenETA(etaMax), drain, true
+		return "", drain, true
 	}
 	return coarsenETA(time.Duration(secs * float64(time.Second))), drain, true
 }

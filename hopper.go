@@ -4712,8 +4712,8 @@ func (db *DB) RescanAgeCandidates(
 
 // MissingLLMCandidates returns up to limit samples that fired at a real level
 // but hold no LLM interpretation, newest first. See missingLLMCandidatesPG for
-// why "fired" is `lvl IS NOT NULL AND lvl <> -1`, and for the caveat that this
-// tier cannot ensure the worker it feeds will actually produce an llm_result.
+// why "fired" is `lvl IS NOT NULL AND lvl <> -1`, and for why a re-analysis that
+// produces no rationale is an ordinary outcome rather than a failure.
 func (db *DB) MissingLLMCandidates(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
 	if db.pool != nil {
 		return db.missingLLMCandidatesPG(ctx, hopperStart, limit)
@@ -4723,8 +4723,8 @@ func (db *DB) MissingLLMCandidates(ctx context.Context, hopperStart time.Time, l
 
 // MarkLLMAttempt records that these samples have been handed out for an
 // interpret pass. This is what holds [DB.MissingLLMCandidates] to one attempt
-// per sample: nothing in hopper can guarantee the claiming worker runs the pass,
-// so the marker bounds the cost at one wasted scan rather than a loop.
+// per sample: the scanner decides which samples warrant a rationale, so a row it
+// declines is asked once and then left alone rather than re-offered forever.
 func (db *DB) MarkLLMAttempt(ctx context.Context, shas []string) error {
 	if len(shas) == 0 {
 		return nil

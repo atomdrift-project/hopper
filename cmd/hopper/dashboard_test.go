@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"slices"
 	"strings"
 	"testing"
@@ -94,50 +95,43 @@ func TestQueueETAUsesObservedSlope(t *testing.T) {
 	}
 }
 
-// TestQueueETAClampsInsteadOfOverflowing covers the arithmetic, not the policy.
+// TestQueueETARefusesUnusableEstimates covers the arithmetic and the policy
+// together, because here they are the same decision.
+//
 // depth/drain is unbounded as drain approaches zero, and converting the result
-// straight to a Duration wraps int64 — which printed a large NEGATIVE age rather
-// than a long one. The clamp has to happen before the conversion.
-func TestQueueETAClampsInsteadOfOverflowing(t *testing.T) {
-	// 24 samples five minutes apart, falling by 1 each: a drain of ~1/300 per
-	// second against a backlog of 3.2M, i.e. ~30 years.
-	eta, drain, _ := queueETA(3_200_000, etaSeries(24, -1), pendingOf)
-	if drain <= 0 {
-		t.Fatalf("drain = %v, want positive", drain)
+// straight to a Duration wraps int64 -- a 2,200-year backlog once rendered as
+// "-59s". Printing the clamp instead ("~365d00h") would trade a wrong number for
+// a fake-precise one, so an estimate past etaMax is refused and the caller says
+// "not draining".
+//
+// The threshold is deliberately absolute rather than a relative "has this series
+// moved much" test: 0.25% of a 3.47M queue is 8,520 rows in six hours, a real
+// ~102-day drain worth reporting, while the same fraction of a 233-row queue is
+// noise. Size decides, so the guard is stated in time, not percent.
+func TestQueueETARefusesUnusableEstimates(t *testing.T) {
+	// Barely moving against a huge backlog: past etaMax, so no estimate.
+	eta, drain, measured := queueETA(3_200_000, etaSeries(24, -1), pendingOf)
+	if eta != "" {
+		t.Errorf("an unusably distant ETA must be refused, got %q", eta)
 	}
+	if !measured {
+		t.Error("refusing an estimate is still a measurement")
+	}
+	if drain <= 0 {
+		t.Errorf("drain = %v, want the measured slope reported even with no ETA", drain)
+	}
+
+	// A slow but real drain on a large queue DOES get an estimate: 24 samples
+	// falling 100 each is ~0.33/s, which against 3.2M rows is ~111 days.
+	eta, _, _ = queueETA(3_200_000, etaSeries(24, -100), pendingOf)
 	if eta == "" {
-		t.Fatal("a draining queue should still report something")
+		t.Fatal("a real multi-week drain must still be reported")
 	}
 	if strings.HasPrefix(eta, "-") {
 		t.Errorf("eta = %q: negative duration, the int64 overflow is back", eta)
 	}
-	if want := coarsenETA(etaMax); eta != want {
-		t.Errorf("eta = %q, want it clamped to %q", eta, want)
-	}
-
-	// The case that genuinely wraps int64. A least-squares fit over noisy
-	// samples yields arbitrarily small positive slopes, so this is reachable:
-	// a 3.2M backlog that nets one item lower across the whole six-hour window
-	// is ~4.6e-5/s, i.e. 6.9e10 seconds, i.e. 6.9e19 nanoseconds against an
-	// int64 ceiling of 9.2e18.
-	base := time.Now().Add(-6 * time.Hour)
-	pts := make([]queuePoint, 24)
-	for i := range pts {
-		depth := int64(3_200_000)
-		if i == len(pts)-1 {
-			depth-- // one item lower, six hours later
-		}
-		pts[i] = queuePoint{T: base.Add(time.Duration(i) * 15 * time.Minute), Pending: depth}
-	}
-	eta, drain, _ = queueETA(3_200_000, pts, pendingOf)
-	if drain <= 0 {
-		t.Fatalf("drain = %v, want a small positive slope", drain)
-	}
-	if strings.HasPrefix(eta, "-") {
-		t.Fatalf("eta = %q: negative duration, the int64 overflow is back", eta)
-	}
-	if want := coarsenETA(etaMax); eta != want {
-		t.Errorf("eta = %q, want it clamped to %q", eta, want)
+	if !strings.Contains(eta, "d") {
+		t.Errorf("eta = %q, want a multi-day estimate", eta)
 	}
 }
 
@@ -353,5 +347,94 @@ func TestFlowVerdictIgnoresWalkBursts(t *testing.T) {
 	// No data is not good news.
 	if losing, _ := flowVerdict(flowSeries{}); losing {
 		t.Error("an unusable series must not assert a verdict")
+	}
+}
+
+// TestFlowDetailAgreesWithVerdict pins the consistency the live dashboard broke.
+// It rendered "Gaining ground   in 1283/s · out 749/s · net -534/s" — the
+// headline and its own detail line disagreeing, because the verdict came from
+// queue depth while the detail came from a session counter that resets on
+// restart and therefore under-reported completions for the rest of the window.
+func TestFlowDetailAgreesWithVerdict(t *testing.T) {
+	base := time.Now().Add(-2 * time.Hour)
+	// A restart 5 samples in: Completed collapses to a fresh baseline while the
+	// arrival watermark and the depth both keep going.
+	var pts []queuePoint
+	for i := range 24 {
+		completed := int64(5_000_000 + i*300)
+		if i >= 5 {
+			completed = int64(i * 300) // counter reset
+		}
+		pts = append(pts, queuePoint{
+			T:       base.Add(time.Duration(i) * 5 * time.Minute),
+			Added:   int64(1_000_000 + i*400),
+			Pending: int64(1000 - i*2), // depth falling: we ARE gaining ground
+			Rescan:  0,
+			// Completed is the unreliable one; out must not depend on it.
+			Completed: completed,
+		})
+	}
+	f := flowRates(pts)
+	if !f.hasRates {
+		t.Fatal("expected in/out rates from a series carrying the watermark")
+	}
+	losing, net := flowVerdict(f)
+	if losing {
+		t.Errorf("depth is falling; verdict should not be losing (net=%v)", net)
+	}
+	// out - in must reproduce the same net the headline asserts, by construction.
+	if got, want := mean(f.out)-mean(f.in), mean(f.net); math.Abs(got-want) > 1e-9 {
+		t.Errorf("out-in = %v but net = %v; the detail line can contradict the headline", got, want)
+	}
+	for i, v := range f.out {
+		if v < 0 {
+			t.Errorf("out[%d] = %v, want no negative completion rate", i, v)
+		}
+	}
+}
+
+// TestSystemStatusSeparatesChronicFromAcute pins the distinction the screenshot
+// exposed: the headline read "168,906 files have no litmus score, oldest 138d"
+// on every render, and had for months. A top line that never changes is one
+// nobody reads, so a standing backlog is stated in the facts while the headline
+// stays reserved for what actually changed.
+func TestSystemStatusSeparatesChronicFromAcute(t *testing.T) {
+	fresh := hopper.WorkflowHealth{
+		LatestAdded:    time.Now().Add(-5 * time.Second),
+		LatestAnalyzed: time.Now().Add(-3 * time.Second),
+	}
+	chronic := []hopper.WorkflowBacklog{
+		{OldestPending: time.Now().Add(-138 * 24 * time.Hour)},
+	}
+
+	var buf strings.Builder
+	writeSystemStatus(&buf, &statusInputs{health: fresh, backlogs: chronic, pendingLitmus: 168906})
+	out := buf.String()
+	if strings.Contains(out, "168,906 files have no litmus score</span>") {
+		t.Error("a months-old backlog must not own the headline")
+	}
+	if !strings.Contains(out, "Healthy, with a standing backlog") {
+		t.Errorf("want the standing-backlog headline, got %q", out)
+	}
+	if strings.Contains(out, "status-ok") {
+		t.Error("a standing backlog is not an all-clear")
+	}
+	// Still reported, just not shouted.
+	if !strings.Contains(out, "168,906 files have no litmus score") {
+		t.Errorf("the backlog must still appear in the facts, got %q", out)
+	}
+
+	// An acute problem outranks it and takes the headline back.
+	var acute strings.Builder
+	writeSystemStatus(&acute, &statusInputs{
+		health:        hopper.WorkflowHealth{LatestAdded: time.Now().Add(-3 * time.Hour), LatestAnalyzed: time.Now()},
+		backlogs:      chronic,
+		pendingLitmus: 168906,
+	})
+	if !strings.Contains(acute.String(), "No sample ingested in") {
+		t.Errorf("an acute problem must own the headline, got %q", acute.String())
+	}
+	if !strings.Contains(acute.String(), "168,906 files have no litmus score") {
+		t.Errorf("the chronic condition must still be listed, got %q", acute.String())
 	}
 }

@@ -1169,7 +1169,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// a shared attempts counter cannot express this, because a successful
 		// store resets it and the sample becomes eligible again immediately.
 		// Clear it (UPDATE samples SET llm_attempted_at = NULL WHERE ...) to
-		// re-offer a population, e.g. after SCAN_LLM reaches the fleet.
+		// re-offer a population, e.g. after the interpret policy widens.
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS llm_attempted_at TIMESTAMPTZ`,
 		// Poison-sample protection: count claims that never produced a result
 		// and record skip timing. No dedicated index — the reaper's
@@ -9866,26 +9866,30 @@ const missingLLMCandidatesSQL = `
 	ORDER BY created_at DESC
 	LIMIT $2`
 
-// missingLLMCandidatesPG returns samples needing an LLM interpretation pass.
+// missingLLMCandidatesPG returns samples that could carry an LLM interpretation
+// and do not.
 //
-// IT CANNOT GUARANTEE THE CLAIMING WORKER WILL PRODUCE ONE. llm_result reaches
-// the database only through StoreResult, from a scan worker started with
-// --interpret and a SCAN_LLM endpoint (see litmusServer.workerArgs); hopper has
-// no UpdateLLMResult caller in production and no way to route a job by that
-// capability -- the advertised tool set covers archive extractors, nothing else.
-// A worker without the flag re-scans the sample, stores a result with
-// llm_result still NULL, and the row stays selected.
+// A BLANK RESULT IS A NORMAL OUTCOME, NOT A FAILURE. The interpret pass is not
+// run on every sample -- the scanner decides -- so a re-analysis that comes back
+// with llm_result still NULL usually means "this one did not warrant a
+// rationale", not that anything went wrong. Measured 2026-09-15 across 2,050
+// such rows, only 27 carried any error at all, and those were cleave-side ("Too
+// many open files"). The other 99% stored a clean result and no interpretation.
 //
-// llm_attempted_at IS NULL is what bounds that: the tier stamps every sample it
-// hands out and never offers it again, so a fleet with no interpret pass costs
-// one wasted scan per sample instead of an unbounded loop. The shared attempts
-// counter could not express this -- a successful store resets it to zero, and
-// the sample would be eligible again on the next poll forever.
+// That is also why the selector stays broad (any real firing level) rather than
+// being narrowed to the band where rationales come back most often. A re-scan of
+// one of these rows is not wasted work even when no rationale appears: it
+// refreshes cleave and litmus against the current analyzer, which is the same
+// thing the age tier would eventually do anyway. At worst it updates the data.
 //
-// The cost of "once, ever" is that samples attempted before SCAN_LLM reaches the
-// fleet are not retried afterwards. That is a deliberate trade, and the reset is
-// one statement: UPDATE samples SET llm_attempted_at = NULL WHERE llm_result IS
-// NULL.
+// llm_attempted_at IS NULL is what keeps that bounded. The tier stamps every
+// sample it hands out and never offers it again, so a sample the scanner
+// declines to interpret is asked once and then left alone instead of being
+// re-offered forever. The shared attempts counter could not express this -- a
+// successful store resets it to zero, and the row would return on the next poll.
+//
+// To re-offer a population later (a broader interpret policy, say), clear the
+// stamp: UPDATE samples SET llm_attempted_at = NULL WHERE llm_result IS NULL.
 func (db *DB) missingLLMCandidatesPG(
 	ctx context.Context, hopperStart time.Time, limit int,
 ) ([]ClaimJob, error) {
