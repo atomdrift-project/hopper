@@ -4710,6 +4710,31 @@ func (db *DB) RescanAgeCandidates(
 	return db.rescanAgeCandidatesSQLite(ctx, rescanAge, hopperStart, limit)
 }
 
+// MissingLLMCandidates returns up to limit samples that fired at a real level
+// but hold no LLM interpretation, newest first. See missingLLMCandidatesPG for
+// why "fired" is `lvl IS NOT NULL AND lvl <> -1`, and for the caveat that this
+// tier cannot ensure the worker it feeds will actually produce an llm_result.
+func (db *DB) MissingLLMCandidates(ctx context.Context, hopperStart time.Time, limit int) ([]ClaimJob, error) {
+	if db.pool != nil {
+		return db.missingLLMCandidatesPG(ctx, hopperStart, limit)
+	}
+	return db.missingLLMCandidatesSQLite(ctx, hopperStart, limit)
+}
+
+// MarkLLMAttempt records that these samples have been handed out for an
+// interpret pass. This is what holds [DB.MissingLLMCandidates] to one attempt
+// per sample: nothing in hopper can guarantee the claiming worker runs the pass,
+// so the marker bounds the cost at one wasted scan rather than a loop.
+func (db *DB) MarkLLMAttempt(ctx context.Context, shas []string) error {
+	if len(shas) == 0 {
+		return nil
+	}
+	if db.pool != nil {
+		return db.markLLMAttemptPG(ctx, shas)
+	}
+	return db.markLLMAttemptSQLite(ctx, shas)
+}
+
 // UpsertWorker records a worker heartbeat for dashboard display.
 func (db *DB) UpsertWorker(ctx context.Context, w Worker) error {
 	if db.pool != nil {
@@ -5514,10 +5539,19 @@ type RescanDepths struct {
 	// replaced, this one cannot be switched off by a missing traits version, so
 	// zero here means caught up and nothing else.
 	Age int64
+	// MissingLLM is tier 2b: samples that fired at a real level, carry no LLM
+	// rationale, and have not been offered for one yet.
+	//
+	// Counted here rather than left to its own surface because a tier absent
+	// from the depth card is a tier nobody notices has stopped -- which is
+	// precisely how its predecessor ran for months at zero. It is re-analysis
+	// work drained by the claim ladder, so it belongs in the same total the
+	// HopperRescanNotDraining alert watches.
+	MissingLLM int64
 }
 
 // Total is the whole re-analysis backlog across tiers.
-func (d RescanDepths) Total() int64 { return d.Forced + d.Repair + d.Age }
+func (d RescanDepths) Total() int64 { return d.Forced + d.Repair + d.Age + d.MissingLLM }
 
 // RescanDepths counts queued re-analysis work per tier. rescanAge is the age
 // tier's cutoff.
@@ -5542,7 +5576,40 @@ func (db *DB) RescanDepths(ctx context.Context, rescanAge time.Duration) (Rescan
 		return d, err
 	}
 	d.Age = n
+
+	llm, err := db.CountMissingLLM(ctx)
+	if err != nil {
+		return d, err
+	}
+	d.MissingLLM = llm
 	return d, nil
+}
+
+// CountMissingLLM counts samples awaiting an interpret pass, matching
+// [DB.MissingLLMCandidates] exactly so the depth and the claimable set are the
+// same number. An index-only scan of idx_samples_missing_llm, whose predicate is
+// this one.
+func (db *DB) CountMissingLLM(ctx context.Context) (int64, error) {
+	var n int64
+	var err error
+	if db.pool != nil {
+		err = db.pool.QueryRow(ctx,
+			`SELECT count(*) FROM samples `+
+				`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> '' `+
+				`AND llm_result IS NULL AND llm_attempted_at IS NULL `+
+				`AND lvl IS NOT NULL AND lvl <> -1`).Scan(&n)
+	} else {
+		lvl := litmusLvlSQLite("")
+		err = db.lite.QueryRowContext(ctx,
+			`SELECT count(*) FROM samples `+
+				`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> '' `+
+				`AND llm_result IS NULL AND llm_attempted_at IS NULL `+
+				`AND `+lvl+` IS NOT NULL AND `+lvl+` <> -1`).Scan(&n)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("hopper: count missing llm: %w", err)
+	}
+	return n, nil
 }
 
 // rescanPriorityDepths returns queued row counts keyed by rescan_priority.

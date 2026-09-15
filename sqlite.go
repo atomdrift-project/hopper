@@ -241,6 +241,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		}
 	}
 
+	if pragmaHasColumn(ctx, db.lite, "llm_attempted_at") == 0 {
+		if _, err := db.lite.ExecContext(ctx, `ALTER TABLE samples ADD COLUMN llm_attempted_at DATETIME`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite: %w", err)
+		}
+	}
 	if pragmaHasColumn(ctx, db.lite, "last_error_at") == 0 {
 		if _, err := db.lite.ExecContext(ctx, `ALTER TABLE samples ADD COLUMN last_error_at DATETIME`); err != nil {
 			return fmt.Errorf("hopper: migrate sqlite: %w", err)
@@ -6125,6 +6130,45 @@ func (db *DB) rescanAgeCandidatesSQLite(
 		  AND attempts < ?
 		ORDER BY analyzed_at ASC
 		LIMIT ?`, staleAge, startCutoff, maxClaimAttempts, limit)
+}
+
+func (db *DB) missingLLMCandidatesSQLite(
+	ctx context.Context, hopperStart time.Time, limit int,
+) ([]ClaimJob, error) {
+	startCutoff := hopperStart.UTC().Format(time.RFC3339Nano)
+	// SQLite carries no lvl column; the level lives in the litmus envelope and
+	// litmusLvlSQLite is the same extraction the rest of this backend uses.
+	lvl := litmusLvlSQLite("")
+	return queryLiteCandidates(ctx, db.lite,
+		`SELECT sha256, path, size_bytes, file_type, created_at FROM samples
+		WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''
+		  AND llm_result IS NULL
+		  AND llm_attempted_at IS NULL
+		  AND `+lvl+` IS NOT NULL AND `+lvl+` <> -1
+		  AND (note = '' OR last_error_at IS NULL OR last_error_at < ?)
+		ORDER BY created_at DESC
+		LIMIT ?`, startCutoff, limit)
+}
+
+// markLLMAttemptSQLite mirrors markLLMAttemptPG.
+func (db *DB) markLLMAttemptSQLite(ctx context.Context, shas []string) error {
+	// Guarded here and not only in the caller: strings.Repeat below takes
+	// len(shas)-1, which panics on an empty slice.
+	if len(shas) == 0 {
+		return nil
+	}
+	args := make([]any, 0, len(shas)+1)
+	args = append(args, time.Now().UTC().Format(time.RFC3339Nano))
+	for _, sha := range shas {
+		args = append(args, sha)
+	}
+	//nolint:gosec // placeholders are '?' bind markers; sha values are parameterized via args.
+	q := `UPDATE samples SET llm_attempted_at = ? WHERE sha256 IN (` +
+		strings.Repeat("?,", len(shas)-1) + `?) AND llm_attempted_at IS NULL`
+	if _, err := db.lite.ExecContext(ctx, q, args...); err != nil {
+		return fmt.Errorf("hopper: mark llm attempt: %w", err)
+	}
+	return nil
 }
 
 func queryLiteCandidates(ctx context.Context, db *sql.DB, query string, args ...any) ([]ClaimJob, error) {

@@ -210,6 +210,21 @@ func TestPlanAuditClaimQueues(t *testing.T) {
 			"in order; this is the 18s-per-poll regression:\n%s", rescan)
 	}
 	t.Logf("rescan_age_candidates: ok\n%s", firstPlanLines(rescan))
+
+	llm := explainText(t, ctx, db, `EXPLAIN `+missingLLMCandidatesSQL,
+		start, 200)
+	if planSeqScansSamples(llm) {
+		t.Errorf("missing_llm_candidates: unexpected Seq Scan on samples:\n%s", llm)
+	}
+	if !strings.Contains(llm, "idx_samples_missing_llm") {
+		t.Errorf("missing_llm_candidates: not using idx_samples_missing_llm "+
+			"(predicate drifted from the partial index?):\n%s", llm)
+	}
+	if strings.Contains(llm, "Sort") {
+		t.Errorf("missing_llm_candidates: plan sorts instead of walking the index "+
+			"in created_at order:\n%s", llm)
+	}
+	t.Logf("missing_llm_candidates: ok\n%s", firstPlanLines(llm))
 }
 
 // TestPlanAuditRescanQueue covers the two statements that read the rescan queue:

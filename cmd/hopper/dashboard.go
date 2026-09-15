@@ -49,6 +49,14 @@ const (
 	etaMinPoints = 4
 )
 
+// etaMax caps a reported ETA, and exists to keep the arithmetic in range rather
+// than to shape the display. depth/drain is unbounded as drain approaches zero:
+// a 3.2M backlog draining at 1e-4/s is 3.2e10 seconds, and 3.2e10 * 1e9 ns
+// overflows int64, so the conversion to a Duration wraps and formatETA prints a
+// large NEGATIVE age. Clamping before the conversion is what makes that
+// impossible; a queue this slow reads as "effectively never" either way.
+const etaMax = 365 * 24 * time.Hour
+
 // webDashboard serves a self-contained HTML page. Auto-refreshes every 60s;
 // expensive stats are cached (dashCacheTTL) so most refreshes hit memory.
 // Fields guarded by cfgMu are set once via configure() after the load session
@@ -605,8 +613,8 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	// throughput rate divided into a depth. See queueETA for why that model was
 	// always optimistic.
 	etaPts := wd.etaPoints(r.Context())
-	initialETA, _ := queueETA(pending, etaPts, func(p queuePoint) int64 { return p.Pending })
-	rescanETA, rescanDrain := queueETA(rescanPending, etaPts, func(p queuePoint) int64 { return p.Rescan })
+	initialETA, _, _ := queueETA(pending, etaPts, func(p queuePoint) int64 { return p.Pending })
+	rescanETA, rescanDrain, rescanMeasured := queueETA(rescanPending, etaPts, func(p queuePoint) int64 { return p.Rescan })
 
 	pct := 0.0
 	if totalExpected > 0 {
@@ -692,7 +700,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		}
 		return strings.Join(parts, " &middot; ")
 	}())
-	writeQueueCard(&buf, "Rescan queue", fmt.Sprintf("%s pending", fmtN(rescanPending)), rescanMeta(depths, rescanETA, rescanDrain))
+	writeQueueCard(&buf, "Rescan queue", fmt.Sprintf("%s pending", fmtN(rescanPending)), rescanMeta(depths, rescanETA, rescanDrain, rescanMeasured))
 
 	// Throughput tile: the rescan rate gets its own labeled home rather than
 	// hiding on the rescan card's ETA line. The headline is top-level items/s
@@ -1109,7 +1117,7 @@ func (wd *webDashboard) workflowHealth(ctx context.Context) (hopper.WorkflowHeal
 // ladder entirely when it cannot read a traits version from its analyzer, and
 // rendering that as "caught up" (or as a bare 0) is what hid a switched-off
 // tier for the whole of a 24h uptime.
-func rescanMeta(d hopper.RescanDepths, eta string, drain float64) string {
+func rescanMeta(d hopper.RescanDepths, eta string, drain float64, measured bool) string {
 	var parts []string
 	if d.Forced > 0 {
 		parts = append(parts, fmt.Sprintf("<em>%s</em> forced", fmtN(d.Forced)))
@@ -1120,11 +1128,19 @@ func rescanMeta(d hopper.RescanDepths, eta string, drain float64) string {
 	if d.Age > 0 {
 		parts = append(parts, fmt.Sprintf("<em>%s</em> past rescan age", fmtN(d.Age)))
 	}
+	if d.MissingLLM > 0 {
+		parts = append(parts, fmt.Sprintf("<em>%s</em> undescribed", fmtN(d.MissingLLM)))
+	}
 	switch {
 	case d.Total() == 0:
 		parts = append(parts, "caught up")
 	case eta != "":
 		parts = append(parts, "ETA <em>"+eta+"</em>")
+	case !measured:
+		// No slope yet -- a restart clears the sampled series. Saying "not
+		// draining" here is a false statement about a queue that may be draining
+		// fast, and it is what the live dashboard showed next to 21 rescans/sec.
+		parts = append(parts, `<span class="queue-note">measuring&hellip;</span>`)
 	case drain < 0:
 		// Growing. Saying so is the whole point: this is the state every
 		// previous version of this card rendered as a cheerful few hours.
@@ -1490,16 +1506,20 @@ func (wd *webDashboard) etaPoints(ctx context.Context) []queuePoint {
 // Least squares rather than endpoint difference because rescan servicing is
 // bursty -- two samples can straddle a spike and report a slope the hour does
 // not support.
-func queueETA(depth int64, points []queuePoint, at func(queuePoint) int64) (eta string, drain float64) {
+func queueETA(depth int64, points []queuePoint, at func(queuePoint) int64) (eta string, drain float64, measured bool) {
 	if depth <= 0 {
-		return "", 0
+		// Nothing queued: there is no slope to want, and no ETA to report.
+		return "", 0, true
 	}
 	span := time.Duration(0)
 	if len(points) >= 2 {
 		span = points[len(points)-1].T.Sub(points[0].T)
 	}
 	if len(points) < etaMinPoints || span < etaMinSpan {
-		return "", 0
+		// Not enough history to fit a line. This is NOT "not draining" -- the
+		// caller must say so differently, or a freshly restarted hopper reports
+		// a healthy queue as stalled.
+		return "", 0, false
 	}
 	// Times as seconds relative to the first sample, to keep the sums small.
 	base := points[0].T
@@ -1517,13 +1537,18 @@ func queueETA(depth int64, points []queuePoint, at func(queuePoint) int64) (eta 
 		den += dt * dt
 	}
 	if den == 0 {
-		return "", 0
+		return "", 0, false
 	}
 	drain = -(num / den) // depth falling => positive drain
 	if drain <= 0 {
-		return "", drain
+		return "", drain, true
 	}
-	return formatETA(time.Duration(float64(depth)/drain) * time.Second), drain
+	// Clamp in seconds, BEFORE converting to a Duration: see etaMax.
+	secs := float64(depth) / drain
+	if secs >= etaMax.Seconds() {
+		return formatETA(etaMax), drain, true
+	}
+	return formatETA(time.Duration(secs * float64(time.Second))), drain, true
 }
 
 func formatETA(d time.Duration) string {

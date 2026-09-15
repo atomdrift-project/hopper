@@ -197,6 +197,7 @@ idx_samples_parent
 idx_samples_pending_cleave_group
 idx_samples_pending_litmus_group
 idx_samples_pending_path
+idx_samples_missing_llm
 idx_samples_pending_sighted
 idx_samples_pending_size
 idx_samples_reconcile_toplevel

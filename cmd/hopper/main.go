@@ -1084,17 +1084,18 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	maxRSSGB := f.Int("max-memory-gb", 48,
 		"local atomscan worker RSS limit in GB, forwarded as --max-rss-gb (0 = auto: let atomscan self-throttle, -1 = disable in-process throttling)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
-	// 75 days (2026-09-14). This is now the whole rescan rubric — the tier sorts
-	// oldest-first and asks nothing else — so the number is a throughput budget,
-	// not a freshness opinion: one cycle costs servable_rows / 75 rescans a day.
-	// Measured against production that day: 8.75M servable rows, so ~117k/day,
-	// against a top-level rescan rate already running at ~544k/day. Roughly a
-	// fifth of the re-analysis the fleet does anyway, and it REPLACES the old
-	// 30-day cutoff rather than adding to it.
+	// 90 days (2026-09-15, widened from 75). This is the whole rescan rubric —
+	// the tier sorts oldest-first and asks nothing else — so the number is a
+	// throughput budget, not a freshness opinion: one cycle costs
+	// servable_rows / 90 rescans a day. Measured against production: 8.75M
+	// servable rows, so ~97k/day, against a top-level rescan rate already
+	// running at ~544k/day. Roughly a sixth of the re-analysis the fleet does
+	// anyway, and it REPLACES the old 30-day cutoff rather than adding to it.
+	// The standing backlog past 90 days was 3.21M rows.
 	//
 	// A sample cited in a feed does not wait for this: the sighted tier claims
 	// it at the top of the ladder, on a deadline set by the registry.
-	rescanAge := f.Duration("rescan-age", 75*24*time.Hour, "minimum age since last analysis before a sample is eligible for rescan")
+	rescanAge := f.Duration("rescan-age", 90*24*time.Hour, "minimum age since last analysis before a sample is eligible for rescan")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
 	experimentTag := f.String("experiment-tag", "", "label for experiment comparison")
@@ -1413,6 +1414,16 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 				addr = "127.0.0.1:" + after
 			}
 			hopperURL = "http://" + addr
+		}
+		// The interpret tier hands samples out ONCE and marks them; a fleet with
+		// no LLM endpoint consumes its whole backlog and learns nothing. hopper
+		// only knows its own local worker's config, so this is a hint, not a
+		// guarantee -- but it is the one place the misconfiguration is visible.
+		if *litmusLLM == "" {
+			slog.Warn("no LLM endpoint configured (--litmus-llm / $SCAN_LLM): the local worker "+
+				"stores no llm_result, and the missing_llm claim tier marks each sample it hands "+
+				"out as attempted whether or not a rationale comes back",
+				"reset", "UPDATE samples SET llm_attempted_at = NULL WHERE llm_result IS NULL")
 		}
 		litmus = newLitmusServer(litmusConfig{
 			Bin:        *litmusBin,

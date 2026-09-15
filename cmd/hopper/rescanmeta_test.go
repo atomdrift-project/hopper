@@ -18,7 +18,7 @@ func TestRescanMetaShowsEveryTier(t *testing.T) {
 	if prod.Total() != 123938 {
 		t.Fatalf("Total() = %d, want 123938", prod.Total())
 	}
-	meta := rescanMeta(prod, "", 0.025)
+	meta := rescanMeta(prod, "", 0.025, true)
 	for _, want := range []string{"123,921", "repair", "17", "forced"} {
 		if !strings.Contains(meta, want) {
 			t.Errorf("meta %q missing %q", meta, want)
@@ -30,8 +30,19 @@ func TestRescanMetaShowsEveryTier(t *testing.T) {
 
 	// Genuinely empty. The age tier cannot be switched off, so "caught up" is
 	// now the only honest reading of an empty queue.
-	empty := rescanMeta(hopper.RescanDepths{}, "", 0)
+	empty := rescanMeta(hopper.RescanDepths{}, "", 0, true)
 	if !strings.Contains(empty, "caught up") {
 		t.Errorf("empty enabled queue should read caught up, got %q", empty)
+	}
+
+	// Thin history must NOT read as stalled. The live dashboard rendered
+	// "not draining" beside 21 rescans/sec because a restart had cleared the
+	// sampled series and there was no slope to fit yet.
+	warming := rescanMeta(prod, "", 0, false)
+	if strings.Contains(warming, "not draining") {
+		t.Errorf("unmeasured queue reported as stalled: %q", warming)
+	}
+	if !strings.Contains(warming, "measuring") {
+		t.Errorf("unmeasured queue should say so, got %q", warming)
 	}
 }

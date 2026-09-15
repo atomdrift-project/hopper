@@ -1074,9 +1074,11 @@ const (
 	// pollers walking the same head-of-queue rows don't all collapse onto the
 	// same prefix. tryClaimBatch handles the deduplication in memory.
 	candidateOverfetch = 8
-	// noWorkDepthsTTL bounds how often the no-work log line recounts the backlog.
-	noWorkDepthsTTL = time.Minute
-	minCandidates   = 32
+	// noWorkDepthsTTL bounds how often the no-work log line recounts the backlog,
+	// and noWorkDepthsTimeout bounds how long any one of those counts may take.
+	noWorkDepthsTTL     = time.Minute
+	noWorkDepthsTimeout = 10 * time.Second
+	minCandidates       = 32
 
 	// workerUpsertInterval throttles DB heartbeat writes per worker so a
 	// busy worker polling several times per second doesn't generate a
@@ -2299,6 +2301,7 @@ const (
 	tierRepair       = "repair"
 	tierPathRescan   = "path_rescan"
 	tierRescanAge    = "rescan_age"
+	tierMissingLLM   = "missing_llm"
 )
 
 // stampTier labels each claimed job with the tier it came from. The tier is
@@ -2410,17 +2413,31 @@ func (s *apiServer) claimLadder(slots int) []claimTier {
 			return s.db.ForceRescanCandidates(ctx, s.hopperStart, s.forceRescanPrefixes, n)
 		}})
 	}
-	// Tier 3: the age-ordered rescan queue, last in the ladder. Everything above
-	// it -- fresh ingestion especially -- is offered first, so re-analysis can
-	// never starve a sample that has never been analyzed at all.
+	// Tier 2b: samples that fired but carry no LLM rationale. Above the
+	// age-ordered rescan because it is the smaller, more specific population
+	// (357,788 vs 3.21M at 2026-09-15) and the gap it fills is user-visible on
+	// prism's /fallout page, where a hostile verdict with no reasoning line is
+	// what a reader is looking at.
 	//
-	// Appended unconditionally. It used to be gated on a non-empty traits
-	// version, which is how the tier spent its life disabled: hopper reads that
-	// version from the litmus binary, and without one this block simply did not
-	// run. Nothing about "re-analyze what is stale" needs an analyzer version.
-	ladder = append(ladder, claimTier{name: tierRescanAge, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
-		return s.db.RescanAgeCandidates(ctx, s.rescanAge, s.hopperStart, n)
-	}})
+	// See missingLLMCandidatesPG: this tier is only worth running once SCAN_LLM
+	// is set fleet-wide, because nothing here can route a job to a worker that
+	// actually runs the interpret pass.
+	ladder = append(ladder,
+		claimTier{name: tierMissingLLM, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
+			return s.db.MissingLLMCandidates(ctx, s.hopperStart, n)
+		}},
+		// Tier 3: the age-ordered rescan queue, last in the ladder. Everything above
+		// it -- fresh ingestion especially -- is offered first, so re-analysis can
+		// never starve a sample that has never been analyzed at all.
+		//
+		// Appended unconditionally. It used to be gated on a non-empty traits
+		// version, which is how the tier spent its life disabled: hopper reads that
+		// version from the litmus binary, and without one this block simply did not
+		// run. Nothing about "re-analyze what is stale" needs an analyzer version.
+		claimTier{name: tierRescanAge, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
+			return s.db.RescanAgeCandidates(ctx, s.rescanAge, s.hopperStart, n)
+		}},
+	)
 	out := ladder[:0]
 	for _, t := range ladder {
 		if t.minSlots == 0 || slots >= t.minSlots {
@@ -2449,9 +2466,20 @@ func (s *apiServer) cachedRescanDepths(ctx context.Context, worker string) hoppe
 	if time.Since(s.depthsAt) < noWorkDepthsTTL {
 		return s.depthsVal
 	}
-	d, err := s.db.RescanDepths(ctx, s.rescanAge)
+	// Bounded, and bounded for a specific reason: this runs under the lock, so
+	// an unbounded count would queue every other empty poll behind one slow
+	// query. The value decorates a log line -- it is never worth making a
+	// worker wait on.
+	qctx, cancel := context.WithTimeout(ctx, noWorkDepthsTimeout)
+	defer cancel()
+	d, err := s.db.RescanDepths(qctx, s.rescanAge)
 	if err != nil {
-		slog.Debug("rescan depths failed", "worker", worker, "error", err)
+		// Stamp the failure too. Leaving depthsAt alone would retry on the very
+		// next poll from every worker, turning a struggling database into a
+		// hammered one at exactly the wrong moment.
+		s.depthsAt = time.Now()
+		slog.Warn("rescan depths unavailable; the no-work log line reports the previous value",
+			"worker", worker, "retry_in", noWorkDepthsTTL, "error", err)
 		return s.depthsVal
 	}
 	s.depthsVal, s.depthsAt = d, time.Now()
@@ -2512,8 +2540,20 @@ func (s *apiServer) claimJobs(
 	// so it is logged and the jobs still go out.
 	if len(out) > 0 {
 		shas := make([]string, len(out))
+		// The interpret tier gets one attempt per sample and no more, so the
+		// samples it served are marked as they go out rather than on the way
+		// back: nothing guarantees they come back at all, and an unmarked
+		// sample is one this tier would offer again forever.
+		var llm []string
 		for i := range out {
 			shas[i] = out[i].SHA256
+			if out[i].Tier == tierMissingLLM {
+				llm = append(llm, out[i].SHA256)
+			}
+		}
+		if err := s.db.MarkLLMAttempt(ctx, llm); err != nil {
+			slog.Warn("recording interpret attempt failed; these samples may be offered again",
+				"worker", worker, "jobs", len(llm), "error", err)
 		}
 		if err := s.db.MarkClaimHandout(ctx, shas); err != nil {
 			slog.Warn("recording claim hand-out failed; pickup latency will under-report",

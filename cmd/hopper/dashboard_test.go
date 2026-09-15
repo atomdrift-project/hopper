@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -42,12 +43,15 @@ func pendingOf(p queuePoint) int64 { return p.Pending }
 // terms of what the depth actually did.
 func TestQueueETAUsesObservedSlope(t *testing.T) {
 	// Draining by 100 every 5 minutes = 1/3 per second. 6000 deep => ~5h.
-	eta, drain := queueETA(6000, etaSeries(24, -100), pendingOf)
+	eta, drain, measured := queueETA(6000, etaSeries(24, -100), pendingOf)
 	if eta == "" {
 		t.Fatalf("a steadily draining queue must produce an ETA (drain=%v)", drain)
 	}
 	if drain <= 0 {
 		t.Errorf("drain = %v, want positive for a falling depth", drain)
+	}
+	if !measured {
+		t.Error("measured = false with a full window of samples")
 	}
 	if want := formatETA(time.Duration(float64(6000)/drain) * time.Second); eta != want {
 		t.Errorf("eta = %q, want %q", eta, want)
@@ -56,27 +60,80 @@ func TestQueueETAUsesObservedSlope(t *testing.T) {
 	// THE REGRESSION. Ingestion outruns drain, so the depth climbs. The old
 	// depth/rate model had no arrival term and reported a cheerful few hours
 	// here; the honest answer is that there is no ETA.
-	eta, drain = queueETA(50000, etaSeries(24, +500), pendingOf)
+	eta, drain, measured = queueETA(50000, etaSeries(24, +500), pendingOf)
 	if eta != "" {
 		t.Errorf("a growing queue must not report an ETA, got %q", eta)
 	}
 	if drain >= 0 {
 		t.Errorf("drain = %v, want negative for a rising depth", drain)
 	}
+	if !measured {
+		t.Error("a full window of samples must be measured even when growing")
+	}
 
 	// Flat: not draining, and not a divide-by-zero either.
-	if eta, _ = queueETA(50000, etaSeries(24, 0), pendingOf); eta != "" {
+	if eta, _, measured = queueETA(50000, etaSeries(24, 0), pendingOf); eta != "" || !measured {
 		t.Errorf("a flat queue must not report an ETA, got %q", eta)
 	}
 
 	// Too little history to call a slope: two samples ten minutes apart could
 	// straddle a burst. Silence beats a number the window cannot support.
-	if eta, _ = queueETA(6000, etaSeries(2, -100), pendingOf); eta != "" {
-		t.Errorf("insufficient history must not report an ETA, got %q", eta)
+	if eta, _, measured = queueETA(6000, etaSeries(2, -100), pendingOf); eta != "" || measured {
+		// measured=false is the whole point: rendering thin history as "not
+		// draining" told a live dashboard its queue was stalled while 21
+		// rescans/sec were landing.
+		t.Errorf("insufficient history: eta=%q measured=%v, want empty and false", eta, measured)
 	}
 
 	// An empty queue has nothing to wait for.
-	if eta, _ = queueETA(0, etaSeries(24, -100), pendingOf); eta != "" {
+	if eta, _, _ = queueETA(0, etaSeries(24, -100), pendingOf); eta != "" {
 		t.Errorf("an empty queue must not report an ETA, got %q", eta)
+	}
+}
+
+// TestQueueETAClampsInsteadOfOverflowing covers the arithmetic, not the policy.
+// depth/drain is unbounded as drain approaches zero, and converting the result
+// straight to a Duration wraps int64 — which printed a large NEGATIVE age rather
+// than a long one. The clamp has to happen before the conversion.
+func TestQueueETAClampsInsteadOfOverflowing(t *testing.T) {
+	// 24 samples five minutes apart, falling by 1 each: a drain of ~1/300 per
+	// second against a backlog of 3.2M, i.e. ~30 years.
+	eta, drain, _ := queueETA(3_200_000, etaSeries(24, -1), pendingOf)
+	if drain <= 0 {
+		t.Fatalf("drain = %v, want positive", drain)
+	}
+	if eta == "" {
+		t.Fatal("a draining queue should still report something")
+	}
+	if strings.HasPrefix(eta, "-") {
+		t.Errorf("eta = %q: negative duration, the int64 overflow is back", eta)
+	}
+	if want := formatETA(etaMax); eta != want {
+		t.Errorf("eta = %q, want it clamped to %q", eta, want)
+	}
+
+	// The case that genuinely wraps int64. A least-squares fit over noisy
+	// samples yields arbitrarily small positive slopes, so this is reachable:
+	// a 3.2M backlog that nets one item lower across the whole six-hour window
+	// is ~4.6e-5/s, i.e. 6.9e10 seconds, i.e. 6.9e19 nanoseconds against an
+	// int64 ceiling of 9.2e18.
+	base := time.Now().Add(-6 * time.Hour)
+	pts := make([]queuePoint, 24)
+	for i := range pts {
+		depth := int64(3_200_000)
+		if i == len(pts)-1 {
+			depth-- // one item lower, six hours later
+		}
+		pts[i] = queuePoint{T: base.Add(time.Duration(i) * 15 * time.Minute), Pending: depth}
+	}
+	eta, drain, _ = queueETA(3_200_000, pts, pendingOf)
+	if drain <= 0 {
+		t.Fatalf("drain = %v, want a small positive slope", drain)
+	}
+	if strings.HasPrefix(eta, "-") {
+		t.Fatalf("eta = %q: negative duration, the int64 overflow is back", eta)
+	}
+	if want := formatETA(etaMax); eta != want {
+		t.Errorf("eta = %q, want it clamped to %q", eta, want)
 	}
 }

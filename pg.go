@@ -1165,6 +1165,12 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// Traits-version rescan: find analyzed samples with stale traits.
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS traits_version TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS cyclotron_attempted_at TIMESTAMPTZ`,
+		// One interpret attempt per sample, ever. See missingLLMCandidatesSQL:
+		// a shared attempts counter cannot express this, because a successful
+		// store resets it and the sample becomes eligible again immediately.
+		// Clear it (UPDATE samples SET llm_attempted_at = NULL WHERE ...) to
+		// re-offer a population, e.g. after SCAN_LLM reaches the fleet.
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS llm_attempted_at TIMESTAMPTZ`,
 		// Poison-sample protection: count claims that never produced a result
 		// and record skip timing. No dedicated index — the reaper's
 		// "attempts >= N" sweep runs every few minutes and rides the existing
@@ -1195,6 +1201,18 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_rescan_age ` +
 			`ON samples(analyzed_at) ` +
 			`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''`,
+		// Missing-interpretation backfill (missingLLMCandidatesSQL). created_at
+		// DESC because that tier is the one backlog served newest-first.
+		//
+		// Self-draining, which is what keeps it cheap forever: llm_result landing
+		// drops the row out of the predicate and the index shrinks back. 357,788
+		// entries at 2026-09-15 against 8.8M servable rows -- the predicate, not
+		// the table, is what sizes it.
+		`CREATE INDEX IF NOT EXISTS idx_samples_missing_llm ` +
+			`ON samples(created_at DESC) ` +
+			`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> '' ` +
+			`AND llm_result IS NULL AND llm_attempted_at IS NULL ` +
+			`AND lvl IS NOT NULL AND lvl <> -1`,
 		// Dropped only after the replacement above exists, so no poll falls between
 		// the two. concurrentDropIndexDDL rewrites these to DROP INDEX CONCURRENTLY;
 		// a plain DROP would take ACCESS EXCLUSIVE and wait behind the replication
@@ -9808,6 +9826,76 @@ func (db *DB) rescanAgeCandidatesPG(
 		return nil, fmt.Errorf("hopper: rescan-age candidates: %w", err)
 	}
 	return scanClaimRows(rows)
+}
+
+// missingLLMCandidatesSQL is the missing-interpretation backfill: top-level
+// samples that FIRED at a real level but carry no LLM rationale.
+//
+// lvl IS NOT NULL AND lvl <> -1 is the "actually fired" test. Measured
+// 2026-09-15 over the servable set: 2,601,080 rows carry a NULL lvl (envelopes
+// predating the column) and 5,364,177 carry -1 (scanned, nothing fired). Neither
+// is a gap -- there is nothing for a rationale to explain. The 840,335 rows with
+// a real level are the population that can be undescribed, and 357,788 of them
+// were.
+//
+// Newest first, unlike every other backlog tier here. A rationale is read on
+// prism's /fallout page, and the thing someone is looking at is what just
+// arrived; an old undescribed sample is a gap in the archive, a new one is a gap
+// in front of a reader.
+//
+// Self-draining through the index: llm_result landing drops the row out of
+// idx_samples_missing_llm's predicate, so the index shrinks as the backlog does
+// and cannot accumulate.
+const missingLLMCandidatesSQL = `
+	SELECT sha256, path, size_bytes, file_type, created_at FROM samples
+	WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''
+	  AND llm_result IS NULL
+	  AND llm_attempted_at IS NULL
+	  AND lvl IS NOT NULL AND lvl <> -1
+	  AND (note = '' OR last_error_at IS NULL OR last_error_at < $1)
+	ORDER BY created_at DESC
+	LIMIT $2`
+
+// missingLLMCandidatesPG returns samples needing an LLM interpretation pass.
+//
+// IT CANNOT GUARANTEE THE CLAIMING WORKER WILL PRODUCE ONE. llm_result reaches
+// the database only through StoreResult, from a scan worker started with
+// --interpret and a SCAN_LLM endpoint (see litmusServer.workerArgs); hopper has
+// no UpdateLLMResult caller in production and no way to route a job by that
+// capability -- the advertised tool set covers archive extractors, nothing else.
+// A worker without the flag re-scans the sample, stores a result with
+// llm_result still NULL, and the row stays selected.
+//
+// llm_attempted_at IS NULL is what bounds that: the tier stamps every sample it
+// hands out and never offers it again, so a fleet with no interpret pass costs
+// one wasted scan per sample instead of an unbounded loop. The shared attempts
+// counter could not express this -- a successful store resets it to zero, and
+// the sample would be eligible again on the next poll forever.
+//
+// The cost of "once, ever" is that samples attempted before SCAN_LLM reaches the
+// fleet are not retried afterwards. That is a deliberate trade, and the reset is
+// one statement: UPDATE samples SET llm_attempted_at = NULL WHERE llm_result IS
+// NULL.
+func (db *DB) missingLLMCandidatesPG(
+	ctx context.Context, hopperStart time.Time, limit int,
+) ([]ClaimJob, error) {
+	rows, err := db.pool.Query(ctx, missingLLMCandidatesSQL,
+		hopperStart.UTC(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: missing-llm candidates: %w", err)
+	}
+	return scanClaimRows(rows)
+}
+
+// markLLMAttemptPG records that these samples have been offered for an
+// interpret pass, which is what keeps the tier to one attempt each.
+func (db *DB) markLLMAttemptPG(ctx context.Context, shas []string) error {
+	_, err := db.pool.Exec(ctx,
+		`UPDATE samples SET llm_attempted_at = now() WHERE sha256 = ANY($1) AND llm_attempted_at IS NULL`, shas)
+	if err != nil {
+		return fmt.Errorf("hopper: mark llm attempt: %w", err)
+	}
+	return nil
 }
 
 // pathPatterns expands each path prefix into both its exact form and its

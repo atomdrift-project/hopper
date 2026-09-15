@@ -2412,6 +2412,122 @@ func TestClaimJobsRescanAgeOrdering(t *testing.T) {
 	}
 }
 
+// TestMissingLLMCandidates pins what "needs a rationale" means. The level
+// sentinel is the whole selector: absent is an envelope predating the level and
+// -1 is "scanned, nothing fired". Neither is a gap — there is no verdict for a
+// rationale to explain — and together they were 7.97M of the 8.8M servable rows
+// measured 2026-09-15, so admitting either would turn a 358k queue into a
+// multi-million-row one that produces nothing.
+//
+// Postgres reads samples.lvl; SQLite has no such column and extracts the level
+// from the litmus envelope (litmusLvlSQLite), which is the path this exercises.
+func TestMissingLLMCandidates(t *testing.T) {
+	ctx := t.Context()
+	db := openTestDB(t)
+
+	const (
+		fired      = "a900000000000000000000000000000000000000000000000000000000000000"
+		firedNewer = "b900000000000000000000000000000000000000000000000000000000000000"
+		described  = "c900000000000000000000000000000000000000000000000000000000000000"
+		didNotFire = "d900000000000000000000000000000000000000000000000000000000000000"
+		noLevel    = "e900000000000000000000000000000000000000000000000000000000000000"
+	)
+	for _, sha := range []string{fired, firedNewer, described, didNotFire, noLevel} {
+		mustInsert(t, ctx, db, &Sample{
+			SHA256: sha, Source: "test", Label: "unknown", LabelSource: "test",
+			Path: "incoming/" + sha + ".bin",
+		})
+		mustAnalyzeWithTraits(t, ctx, db, sha, 0, "")
+	}
+	set := func(sha, litmus string, llm any, created string) {
+		t.Helper()
+		if _, err := db.lite.ExecContext(ctx,
+			`UPDATE samples SET litmus_result = ?, llm_result = ?, created_at = ? WHERE sha256 = ?`,
+			litmus, llm, created, sha); err != nil {
+			t.Fatal(err)
+		}
+	}
+	set(fired, `{"lvl":900}`, nil, "2026-09-01T00:00:00Z")
+	set(firedNewer, `{"lvl":25002}`, nil, "2026-09-10T00:00:00Z")
+	set(described, `{"lvl":900}`, `{"interpretation":"already explained"}`, "2026-09-11T00:00:00Z")
+	set(didNotFire, `{"lvl":-1}`, nil, "2026-09-12T00:00:00Z")
+	set(noLevel, `{}`, nil, "2026-09-13T00:00:00Z")
+
+	jobs, err := db.MissingLLMCandidates(ctx, time.Now(), 10)
+	if err != nil {
+		t.Fatalf("MissingLLMCandidates: %v", err)
+	}
+	// The depth count is a SEPARATE statement from the selector, so it can drift
+	// from it silently. A card reporting work the ladder cannot hand out is the
+	// exact failure this tier's predecessor shipped with, so pin them equal.
+	depth, err := db.CountMissingLLM(ctx)
+	if err != nil {
+		t.Fatalf("CountMissingLLM: %v", err)
+	}
+	if depth != int64(len(jobs)) {
+		t.Errorf("CountMissingLLM = %d but the selector offers %d; depth and "+
+			"claimable must be the same number", depth, len(jobs))
+	}
+	// Newest first, and only the two that fired without a rationale. The -1 and
+	// no-level rows are NEWER than both and would lead the ordering if admitted,
+	// so this also proves they are excluded rather than merely outranked.
+	want := []string{firedNewer, fired}
+	if len(jobs) != len(want) {
+		t.Fatalf("got %d jobs, want %d: %+v", len(jobs), len(want), jobs)
+	}
+	for i := range want {
+		if jobs[i].SHA256 != want[i] {
+			t.Errorf("job %d = %s, want %s (newest first); jobs=%+v", i, jobs[i].SHA256, want[i], jobs)
+		}
+	}
+
+	// ONE attempt each, ever. Nothing in hopper can guarantee the worker that
+	// claims these runs the interpret pass, so an unmarked sample is one this
+	// tier re-offers forever.
+	if err := db.MarkLLMAttempt(ctx, []string{firedNewer}); err != nil {
+		t.Fatalf("MarkLLMAttempt: %v", err)
+	}
+	jobs, err = db.MissingLLMCandidates(ctx, time.Now(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].SHA256 != fired {
+		t.Fatalf("got %+v, want only %s; an attempted sample must not come back", jobs, fired)
+	}
+
+	// A re-analysis that still yields no rationale must NOT re-admit it. This is
+	// exactly what a shared attempts counter got wrong -- a successful store
+	// resets it to zero -- so prove the marker survives one.
+	mustAnalyzeWithTraits(t, ctx, db, firedNewer, 0, "")
+	set(firedNewer, `{"lvl":25002}`, nil, "2026-09-10T00:00:00Z")
+	jobs, err = db.MissingLLMCandidates(ctx, time.Now(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, j := range jobs {
+		if j.SHA256 == firedNewer {
+			t.Fatalf("a re-analysed but still-undescribed sample came back: %+v", jobs)
+		}
+	}
+
+	// Clearing the marker is the documented way to re-offer a population once
+	// the fleet can actually describe them.
+	if _, err := db.lite.ExecContext(ctx,
+		`UPDATE samples SET llm_attempted_at = NULL WHERE sha256 = ?`, firedNewer); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err = db.MissingLLMCandidates(ctx, time.Now(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("got %d jobs, want 2 after clearing the marker: %+v", len(jobs), jobs)
+	}
+	if depth, err = db.CountMissingLLM(ctx); err != nil || depth != 2 {
+		t.Errorf("CountMissingLLM = %d (err %v), want 2; the count must track the marker", depth, err)
+	}
+}
+
 // A sample that never comes back — a worker that OOMs or is killed mid-scan —
 // records no error, so its analyzed_at never moves. Under oldest-first that
 // parks it permanently at the head of the queue, where it would be re-offered
