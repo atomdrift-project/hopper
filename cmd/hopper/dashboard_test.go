@@ -197,7 +197,7 @@ func TestSystemStatusPromotesTheWorstProblem(t *testing.T) {
 		t.Errorf("a stalled ingest must render red, got %q", out)
 	}
 	// The unpromoted backlog still gets said, quietly.
-	if !strings.Contains(out, "litmus-blocked") {
+	if !strings.Contains(out, "no litmus score") {
 		t.Errorf("secondary issues must still appear in the facts line, got %q", out)
 	}
 
@@ -208,5 +208,82 @@ func TestSystemStatusPromotesTheWorstProblem(t *testing.T) {
 	}})
 	if !strings.Contains(ok.String(), "Pipeline healthy") || !strings.Contains(ok.String(), "status-ok") {
 		t.Errorf("a healthy pipeline must say so plainly, got %q", ok.String())
+	}
+}
+
+// TestClaimTierOrderMatchesLadder is the guard the static order promises. The
+// ladder is built per request and its shape varies by caller, so the panel's
+// order is a hand-written list -- which means it can drift from the scheduler it
+// claims to describe, and a ladder panel in the wrong order is worse than none.
+func TestClaimTierOrderMatchesLadder(t *testing.T) {
+	s := &apiServer{
+		tracker:             newWorkerTracker(),
+		forceRescanPrefixes: []string{"incoming/"}, // make the conditional tier appear
+	}
+	// A large slot count so no tier is filtered out by minSlots.
+	var built []string
+	for _, tier := range s.claimLadder(4096) {
+		built = append(built, tier.name)
+	}
+	want := claimTierOrder()
+	if len(built) != len(want) {
+		t.Fatalf("ladder has %d tiers %v, claimTierOrder has %d %v", len(built), built, len(want), want)
+	}
+	for i := range want {
+		if built[i] != want[i] {
+			t.Errorf("position %d: ladder has %q, claimTierOrder has %q", i, built[i], want[i])
+		}
+	}
+}
+
+// TestSparklineScalesFromZero pins the scaling choice. Queue depths that drift
+// by a fraction of a percent are flat in every sense a reader cares about;
+// scaling from the series minimum would draw that as a dramatic slope.
+func TestSparklineScalesFromZero(t *testing.T) {
+	flat := []float64{3_400_000, 3_401_000, 3_400_500, 3_401_200}
+	out := sparkline(flat, "#818cf8")
+	if out == "" {
+		t.Fatal("no sparkline rendered")
+	}
+	// Every y must sit near the top of the box: values are ~100% of the max.
+	for pair := range strings.FieldsSeq(strings.SplitN(strings.SplitN(out, `points="`, 2)[1], `"`, 2)[0]) {
+		y := strings.SplitN(pair, ",", 2)[1]
+		if y[0] != '1' && y[0] != '2' {
+			t.Errorf("y=%s: a near-flat series must render flat, not swing the full box", y)
+		}
+	}
+	if got := trendArrow(flat); !strings.Contains(got, "flat") {
+		t.Errorf("trendArrow = %q, want flat for a <2%% drift", got)
+	}
+	if got := trendArrow([]float64{1000, 500}); !strings.Contains(got, "shrinking") {
+		t.Errorf("trendArrow = %q, want shrinking", got)
+	}
+	if got := trendArrow([]float64{500, 1000}); !strings.Contains(got, "growing") {
+		t.Errorf("trendArrow = %q, want growing", got)
+	}
+	if got := sparkline([]float64{5}, "#fff"); got != "" {
+		t.Errorf("a single point is not a trend, got %q", got)
+	}
+}
+
+// TestClaimLadderFlagsStarvation covers the row the panel exists for: a tier
+// with work waiting that has handed out nothing. That is the starvation case,
+// and in a strictly ordered ladder it is the expected consequence of the tiers
+// above being busy -- which is only visible if the panel says so.
+func TestClaimLadderFlagsStarvation(t *testing.T) {
+	var buf strings.Builder
+	writeClaimLadder(&buf,
+		map[string]int64{tierUnanalyzed: 900},
+		map[string]int64{tierUnanalyzed: 130, tierRescanAge: 3_100_000},
+		nil)
+	out := buf.String()
+	if !strings.Contains(out, "idle with work waiting") {
+		t.Errorf("a tier with depth and no claims must be called out:\n%s", out)
+	}
+	if !strings.Contains(out, tierLabel(tierRescanAge)) {
+		t.Errorf("every tier must appear, even idle ones:\n%s", out)
+	}
+	if !strings.Contains(out, "ladder-bar") {
+		t.Errorf("an active tier must render a share bar:\n%s", out)
 	}
 }

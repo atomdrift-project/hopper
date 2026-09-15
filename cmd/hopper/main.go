@@ -2655,9 +2655,10 @@ func sampleQueueMetrics(
 	// a flat zero for the whole series whenever the stale-traits tier was off --
 	// which was always -- making the rescan-depth graph agree with the (equally
 	// wrong) card instead of contradicting it. The age tier has no off state.
-	var rescan int64
+	var rescan, forced, repair, ageTier, missingLLM int64
 	if d, err := db.RescanDepths(qctx, rescanAge); err == nil {
 		rescan = d.Total()
+		forced, repair, ageTier, missingLLM = d.Forced, d.Repair, d.Age, d.MissingLLM
 	} else {
 		slog.Debug("queue metrics: rescan depths failed", "error", err)
 	}
@@ -2677,7 +2678,10 @@ func sampleQueueMetrics(
 	// snapshot is lost even though the values are in hand.
 	wctx, wcancel := context.WithTimeout(ctx, dashQueryTimeout)
 	defer wcancel()
-	if err := metrics.record(wctx, queuePoint{T: time.Now(), Pending: pending, Rescan: rescan, Completed: completed, Added: added}); err != nil {
+	if err := metrics.record(wctx, queuePoint{
+		T: time.Now(), Pending: pending, Rescan: rescan, Completed: completed, Added: added,
+		Forced: forced, Repair: repair, AgeTier: ageTier, MissingLLM: missingLLM,
+	}); err != nil {
 		slog.Warn("queue metrics: record failed", "error", err)
 		return
 	}

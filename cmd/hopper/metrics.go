@@ -40,6 +40,13 @@ type queuePoint struct {
 	Rescan    int64
 	Completed int64
 	Added     int64
+	// Per-tier depths, so each claim tier can carry its own trend rather than
+	// being blended into one Rescan number nobody can decompose. All four come
+	// free from the RescanDepths call the sampler already makes.
+	Forced     int64
+	Repair     int64
+	AgeTier    int64
+	MissingLLM int64
 }
 
 // metricsDBPath returns the path to the local metrics cache. HOPPER_METRICS_DB
@@ -93,13 +100,15 @@ func openMetricsStore(ctx context.Context, path string) (*metricsStore, error) {
 	// the query itself failing -- and neither answer is then safe: skip the
 	// migration and every INSERT fails, run it and it fails as a duplicate. One
 	// statement with one expected error has no such ambiguity.
-	if _, err := db.ExecContext(ctx,
-		`ALTER TABLE queue_metrics ADD COLUMN added INTEGER NOT NULL DEFAULT 0`); err != nil &&
-		!strings.Contains(err.Error(), "duplicate column") {
-		if closeErr := db.Close(); closeErr != nil {
-			slog.Debug("close metrics cache after migration error failed", "error", closeErr)
+	for _, col := range []string{"added", "forced", "repair", "age_tier", "missing_llm"} {
+		if _, err := db.ExecContext(ctx,
+			`ALTER TABLE queue_metrics ADD COLUMN `+col+` INTEGER NOT NULL DEFAULT 0`); err != nil &&
+			!strings.Contains(err.Error(), "duplicate column") {
+			if closeErr := db.Close(); closeErr != nil {
+				slog.Debug("close metrics cache after migration error failed", "error", closeErr)
+			}
+			return nil, fmt.Errorf("hopper: metrics migrate %s: %w", col, err)
 		}
-		return nil, fmt.Errorf("hopper: metrics migrate: %w", err)
 	}
 	return &metricsStore{db: db}, nil
 }
@@ -108,8 +117,11 @@ func openMetricsStore(ctx context.Context, path string) (*metricsStore, error) {
 // dedupes samples that land within the same second (INSERT OR REPLACE).
 func (m *metricsStore) record(ctx context.Context, p queuePoint) error {
 	_, err := m.db.ExecContext(ctx,
-		`INSERT OR REPLACE INTO queue_metrics (ts, pending, rescan, completed, added) VALUES (?, ?, ?, ?, ?)`,
-		p.T.UTC().Unix(), p.Pending, p.Rescan, p.Completed, p.Added)
+		`INSERT OR REPLACE INTO queue_metrics `+
+			`(ts, pending, rescan, completed, added, forced, repair, age_tier, missing_llm) `+
+			`VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.T.UTC().Unix(), p.Pending, p.Rescan, p.Completed, p.Added,
+		p.Forced, p.Repair, p.AgeTier, p.MissingLLM)
 	if err != nil {
 		return fmt.Errorf("hopper: record metric: %w", err)
 	}
@@ -119,7 +131,8 @@ func (m *metricsStore) record(ctx context.Context, p queuePoint) error {
 // series returns snapshots at or after since, oldest first.
 func (m *metricsStore) series(ctx context.Context, since time.Time) ([]queuePoint, error) {
 	rows, err := m.db.QueryContext(ctx,
-		`SELECT ts, pending, rescan, completed, added FROM queue_metrics WHERE ts >= ? ORDER BY ts`,
+		`SELECT ts, pending, rescan, completed, added, forced, repair, age_tier, missing_llm `+
+			`FROM queue_metrics WHERE ts >= ? ORDER BY ts`,
 		since.UTC().Unix())
 	if err != nil {
 		return nil, fmt.Errorf("hopper: metric series: %w", err)
@@ -129,7 +142,8 @@ func (m *metricsStore) series(ctx context.Context, since time.Time) ([]queuePoin
 	for rows.Next() {
 		var ts int64
 		var p queuePoint
-		if err := rows.Scan(&ts, &p.Pending, &p.Rescan, &p.Completed, &p.Added); err != nil {
+		if err := rows.Scan(&ts, &p.Pending, &p.Rescan, &p.Completed, &p.Added,
+			&p.Forced, &p.Repair, &p.AgeTier, &p.MissingLLM); err != nil {
 			return nil, fmt.Errorf("hopper: scan metric: %w", err)
 		}
 		p.T = time.Unix(ts, 0).UTC()

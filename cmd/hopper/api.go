@@ -67,6 +67,8 @@ type apiServer struct {
 	// repeats on every poll from every worker until an operator fixes it.
 	// Pointer-bearing, so it sits with the pointers above the scalars.
 	emptyTierWarnedAt map[string]time.Time
+	// tiers counts claims per ladder tier for the dashboard's ladder panel.
+	tiers tierActivity
 	// depthsAt/depthsMu/depthsVal cache the rescan depths for the "no work
 	// available" log line (see cachedRescanDepths). Split across the
 	// pointer/scalar boundary this struct keeps: time.Time carries a *Location,
@@ -2486,6 +2488,98 @@ func (s *apiServer) cachedRescanDepths(ctx context.Context, worker string) hoppe
 	return d
 }
 
+// tierWindowMinutes is how far back the dashboard's claim-ladder panel looks.
+const tierWindowMinutes = 15
+
+// claimTierOrder is the ladder's tier names in priority order, top first.
+//
+// A static list rather than a walk of claimLadder, because the ladder is built
+// per request and its shape depends on the caller: the big-archive tier needs a
+// worker with enough slots, and the path-rescan tier only exists when
+// --force-rescan was given. The dashboard wants the complete picture regardless
+// of who is asking. TestClaimTierOrderMatchesLadder keeps the two in step.
+func claimTierOrder() []string {
+	return []string{
+		tierSighted, tierUpload, tierForcedRescan, tierBigArchive,
+		tierUnanalyzed, tierRepair, tierPathRescan, tierMissingLLM, tierRescanAge,
+	}
+}
+
+// tierActivity counts jobs handed out per claim tier over a rolling window of
+// one-minute buckets.
+//
+// A ring of counters rather than a list of events: the claim path runs on every
+// poll from every worker, and at production rates (25/s) a fifteen-minute event
+// list is ~22,000 entries rebuilt continuously to answer a question that only
+// needs a total. Fifteen int64s per tier answer it in constant memory.
+type tierActivity struct {
+	buckets map[string][]int64
+	minute  int64
+	mu      sync.Mutex
+}
+
+// record adds n claims to the current minute's bucket for tier.
+func (t *tierActivity) record(tier string, n int, now time.Time) {
+	if n <= 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.advance(now.Unix() / 60)
+	b, ok := t.buckets[tier]
+	if !ok {
+		b = make([]int64, tierWindowMinutes)
+		if t.buckets == nil {
+			t.buckets = map[string][]int64{}
+		}
+		t.buckets[tier] = b
+	}
+	b[t.minute%tierWindowMinutes] += int64(n)
+}
+
+// advance rolls the ring forward to m, zeroing the buckets skipped over so a
+// quiet period reads as zero rather than as stale counts from a previous lap.
+// Caller holds the lock.
+func (t *tierActivity) advance(m int64) {
+	if t.minute == 0 {
+		t.minute = m
+		return
+	}
+	if m <= t.minute {
+		return
+	}
+	gap := min(m-t.minute, int64(tierWindowMinutes))
+	for i := int64(1); i <= gap; i++ {
+		idx := (t.minute + i) % tierWindowMinutes
+		for _, b := range t.buckets {
+			b[idx] = 0
+		}
+	}
+	t.minute = m
+}
+
+// snapshot totals each tier's claims across the window.
+func (t *tierActivity) snapshot(now time.Time) map[string]int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.advance(now.Unix() / 60)
+	out := make(map[string]int64, len(t.buckets))
+	for tier, b := range t.buckets {
+		var sum int64
+		for _, v := range b {
+			sum += v
+		}
+		out[tier] = sum
+	}
+	return out
+}
+
+// TierActivity reports claims per tier over the trailing window, for the
+// dashboard's claim-ladder panel.
+func (s *apiServer) TierActivity() map[string]int64 {
+	return s.tiers.snapshot(time.Now())
+}
+
 // claimJobs walks the priority ladder in order and returns up to count jobs
 // this worker can actually run. Over-fetches candidates so that contention with
 // other concurrent pollers doesn't starve a requester at the head of the queue.
@@ -2545,11 +2639,17 @@ func (s *apiServer) claimJobs(
 		// back: nothing guarantees they come back at all, and an unmarked
 		// sample is one this tier would offer again forever.
 		var llm []string
+		perTier := make(map[string]int, 4)
 		for i := range out {
 			shas[i] = out[i].SHA256
+			perTier[out[i].Tier]++
 			if out[i].Tier == tierMissingLLM {
 				llm = append(llm, out[i].SHA256)
 			}
+		}
+		now := time.Now()
+		for tier, n := range perTier {
+			s.tiers.record(tier, n, now)
 		}
 		if err := s.db.MarkLLMAttempt(ctx, llm); err != nil {
 			slog.Warn("recording interpret attempt failed; these samples may be offered again",

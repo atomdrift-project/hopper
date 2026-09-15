@@ -57,6 +57,9 @@ const (
 // impossible; a queue this slow reads as "effectively never" either way.
 const etaMax = 365 * 24 * time.Hour
 
+// flowWindow is the span the gained/lost-ground chart covers.
+const flowWindow = 6 * time.Hour
+
 // webDashboard serves a self-contained HTML page. Auto-refreshes every 60s;
 // expensive stats are cached (dashCacheTTL) so most refreshes hit memory.
 // Fields guarded by cfgMu are set once via configure() after the load session
@@ -419,6 +422,15 @@ td.warn{color:var(--amber)}
 .status-headline{font-size:1.45rem;font-weight:600;color:var(--text);letter-spacing:-.01em}
 .status-facts{font-family:var(--mono);font-size:.78rem;color:var(--sub);
   margin-top:.4rem;padding-left:1.6rem}
+
+/* claim ladder */
+.ladder-cell{width:38%;min-width:120px}
+.ladder-bar{display:inline-block;height:8px;border-radius:2px;background:var(--blue);
+  min-width:2px;vertical-align:middle}
+.spark{width:120px;height:20px;display:block}
+.trend-up{color:var(--red)}
+.trend-down{color:var(--green)}
+.trend-flat{color:var(--sub)}
 .legend-item{display:flex;align-items:center;gap:.35rem;
   font-size:.72rem;color:var(--sub);font-family:var(--mono)}
 .legend-swatch{width:12px;height:2px;border-radius:1px}
@@ -771,7 +783,20 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	// tables below are lookup tools -- useful when you already know what you are
 	// chasing, noise when you do not.
 	writeFlowGraph(&buf, queuePoints, wd.metrics != nil)
-	writeQueueGraphs(&buf, queuePoints, wd.metrics != nil)
+
+	// The claim ladder replaces the old generic Pending/Rescan/Completed
+	// sparklines. Those showed three blended series with no way to tell which
+	// tier any of them belonged to; per-tier rows carry the same trends attached
+	// to the queue they describe, in the order the scheduler actually uses.
+	if wd.api != nil {
+		writeClaimLadder(&buf, wd.api.TierActivity(), map[string]int64{
+			tierUnanalyzed:   pending,
+			tierForcedRescan: depths.Forced,
+			tierRepair:       depths.Repair,
+			tierRescanAge:    depths.Age,
+			tierMissingLLM:   depths.MissingLLM,
+		}, queuePoints)
+	}
 
 	writeWorkflowBacklogs(&buf, workflow.backlogs)
 	writeWorkflowSamples(&buf, "Recent Samples", "Newest rows seen by Hopper", workflow.latestAdded, "created")
@@ -1266,10 +1291,10 @@ func litmusMeta(pending int64, rows []hopper.WorkflowBacklog) string {
 		return "caught up"
 	}
 	if age, ok := oldestBacklog(rows); ok {
-		return fmt.Sprintf(`oldest <em>%s</em> &middot; <span class="queue-note">repair tier only</span>`,
+		return fmt.Sprintf(`oldest <em>%s</em> &middot; <span class="queue-note">served only by the repair tier</span>`,
 			htmlEscape(shortDuration(age)))
 	}
-	return `<span class="queue-note">repair tier only</span>`
+	return `<span class="queue-note">served only by the repair tier</span>`
 }
 
 // writeSystemStatus renders the one line the page exists for: is the pipeline
@@ -1314,7 +1339,7 @@ func writeSystemStatus(buf *strings.Builder, in *statusInputs) {
 	}
 	// Then standing backlogs, described by age.
 	if age, ok := oldestBacklog(in.backlogs); ok && age > 7*24*time.Hour {
-		issues = append(issues, issue{fmt.Sprintf("%s litmus-blocked, oldest %s",
+		issues = append(issues, issue{fmt.Sprintf("%s files have no litmus score, oldest %s",
 			fmtN(in.pendingLitmus), shortDuration(age)), false})
 	}
 
@@ -1348,6 +1373,180 @@ func writeSystemStatus(buf *strings.Builder, in *statusInputs) {
 		fmt.Fprintf(buf, `<div class="status-facts">%s</div>`, htmlEscape(strings.Join(facts, " · ")))
 	}
 	buf.WriteString(`</div>`)
+}
+
+// tierLabel maps a claim tier's wire name to what it actually does. The wire
+// names are load-bearing elsewhere (metrics, logs), so they are not renamed --
+// but "rescan_age" is not a sentence, and the panel exists to be read.
+func tierLabel(tier string) string {
+	switch tier {
+	case tierSighted:
+		return "Cited by a threat feed"
+	case tierUpload:
+		return "Interactive uploads"
+	case tierForcedRescan:
+		return "Rescans you asked for"
+	case tierBigArchive:
+		return "Big archives"
+	case tierUnanalyzed:
+		return "Never analyzed"
+	case tierRepair:
+		return "Repair (missing members / litmus)"
+	case tierPathRescan:
+		return "Forced by path prefix"
+	case tierMissingLLM:
+		return "Fired, but no LLM rationale"
+	case tierRescanAge:
+		return "Analysis older than the rescan age"
+	default:
+		return tier
+	}
+}
+
+// tierDepthSeries pulls one tier's depth history out of the sampled points.
+// Tiers with no recorded depth (sighted, uploads, big archives, path rescans)
+// return nil and render without a trend rather than with a flat fake one.
+func tierDepthSeries(tier string, points []queuePoint) []float64 {
+	var pick func(queuePoint) int64
+	switch tier {
+	case tierUnanalyzed:
+		pick = func(p queuePoint) int64 { return p.Pending }
+	case tierForcedRescan:
+		pick = func(p queuePoint) int64 { return p.Forced }
+	case tierRepair:
+		pick = func(p queuePoint) int64 { return p.Repair }
+	case tierRescanAge:
+		pick = func(p queuePoint) int64 { return p.AgeTier }
+	case tierMissingLLM:
+		pick = func(p queuePoint) int64 { return p.MissingLLM }
+	default:
+		return nil
+	}
+	out := make([]float64, 0, len(points))
+	for _, p := range points {
+		out = append(out, float64(pick(p)))
+	}
+	return out
+}
+
+// sparkline renders a trend small enough to sit in a table cell.
+//
+// Scaled from zero rather than from the series minimum: these are queue depths,
+// and a backlog that drifts between 3.40M and 3.41M is flat in every sense a
+// reader cares about. Min-scaling would draw that as a dramatic slope and invite
+// exactly the wrong conclusion.
+func sparkline(vals []float64, color string) string {
+	if len(vals) < 2 {
+		return ""
+	}
+	const w, h = 120.0, 20.0
+	maxVal := 1.0
+	for _, v := range vals {
+		if v > maxVal {
+			maxVal = v
+		}
+	}
+	var pts strings.Builder
+	for i, v := range vals {
+		if i > 0 {
+			pts.WriteByte(' ')
+		}
+		x := float64(i) * w / float64(len(vals)-1)
+		y := h - 1 - (v/maxVal)*(h-2)
+		fmt.Fprintf(&pts, "%.1f,%.1f", x, y)
+	}
+	return fmt.Sprintf(
+		`<svg viewBox="0 0 %.0f %.0f" preserveAspectRatio="none" class="spark">`+
+			`<polyline points="%s" fill="none" stroke="%s" stroke-width="1.5" stroke-linejoin="round"/></svg>`,
+		w, h, pts.String(), color)
+}
+
+// trendArrow says which way the series has moved over its span, in words the
+// row can be read by without consulting the sparkline's shape.
+func trendArrow(vals []float64) string {
+	if len(vals) < 2 {
+		return ""
+	}
+	first, last := vals[0], vals[len(vals)-1]
+	if first == 0 && last == 0 {
+		return ""
+	}
+	delta := last - first
+	// A percent threshold, not an absolute one: these series span 130 to 3.4M.
+	if scale := math.Max(first, 1); math.Abs(delta)/scale < 0.02 {
+		return `<span class="trend-flat">flat</span>`
+	}
+	if delta < 0 {
+		return `<span class="trend-down">&#9660; shrinking</span>`
+	}
+	return `<span class="trend-up">&#9650; growing</span>`
+}
+
+// writeClaimLadder renders every claim tier in the order workers are offered
+// them, with what each has handed out recently.
+//
+// This replaces reading the rescan card and guessing. The ladder is the system's
+// actual scheduling policy, and until now it was visible nowhere: a reader saw
+// one "Rescan queue" number that silently blended three tiers, with no way to
+// tell which of them was moving. Order is the point -- a tier starves because
+// everything above it is busy, so the row above is the explanation for the row
+// below.
+//
+// The bar is scaled to the busiest tier, so it reads as share of the fleet's
+// attention rather than as an absolute rate. A tier with depth and no claims is
+// called out: that is the starvation case, and it is the one worth seeing.
+func writeClaimLadder(buf *strings.Builder, activity, depths map[string]int64, points []queuePoint) {
+	order := claimTierOrder()
+	var busiest int64
+	for _, t := range order {
+		if n := activity[t]; n > busiest {
+			busiest = n
+		}
+	}
+
+	buf.WriteString(`<section><div class="label">Claim ladder &middot; last ` +
+		fmt.Sprintf("%dm", tierWindowMinutes) + `</div>`)
+	buf.WriteString(`<table><thead><tr><th>#</th><th>Tier</th><th>Waiting</th>` +
+		`<th>Claimed</th><th>Rate</th><th>Share of claims</th>` +
+		`<th>Trend &middot; ` + htmlEscape(shortDuration(queueGraphWindow)) + `</th><th></th>` +
+		`</tr></thead><tbody>`)
+	for i, t := range order {
+		claims := activity[t]
+		rate := float64(claims) / (tierWindowMinutes * 60)
+
+		depthCell := "&mdash;"
+		if d, ok := depths[t]; ok {
+			depthCell = fmtN(d)
+		}
+		claimsCell, rateCell := "&mdash;", "&mdash;"
+		if claims > 0 {
+			claimsCell = fmtN(claims)
+			rateCell = fmt.Sprintf("%.2f/s", rate)
+		}
+
+		// Width and opacity both track share: a faint sliver and a solid bar are
+		// distinguishable at a glance in a way two thin bars are not.
+		var bar string
+		switch {
+		case busiest > 0 && claims > 0:
+			share := float64(claims) / float64(busiest)
+			bar = fmt.Sprintf(
+				`<span class="ladder-bar" style="width:%.1f%%;opacity:%.2f"></span>`,
+				share*100, 0.35+0.65*share)
+		case depths[t] > 0:
+			bar = `<span class="queue-note">idle with work waiting</span>`
+		default:
+			bar = ""
+		}
+
+		series := tierDepthSeries(t, points)
+		fmt.Fprintf(buf,
+			`<tr><td>%d</td><td>%s</td><td class="hi">%s</td><td class="hi">%s</td><td>%s</td>`+
+				`<td class="ladder-cell">%s</td><td>%s</td><td>%s</td></tr>`,
+			i+1, htmlEscape(tierLabel(t)), depthCell, claimsCell, rateCell, bar,
+			sparkline(series, "#818cf8"), trendArrow(series))
+	}
+	buf.WriteString(`</tbody></table></section>`)
 }
 
 func writeQueueCard(buf *strings.Builder, label, value, meta string) {
@@ -1605,103 +1804,99 @@ func writeFooter(buf *strings.Builder, progress *loadProgress, walked, inserted,
 // queueGraphWindow is the trailing span the queue graphs cover.
 const queueGraphWindow = 72 * time.Hour
 
-// writeQueueGraphs renders pending depth, rescan depth, and completion
-// throughput side by side over the trailing window. All three come from the
-// database's own counts (snapshotted into the metrics cache) and share one
-// time axis, but each is scaled to its own maximum: pending (~10^5), rescan
-// (~10^6) and per-interval completions (~10^3) differ by orders of magnitude,
-// so a single shared y-axis would flatten two of the three into the baseline.
-func writeQueueGraphs(buf *strings.Builder, points []queuePoint, cacheReady bool) {
-	if len(points) < 2 {
-		// Make the empty state visible rather than silently omitting the
-		// section: distinguish a disabled cache (won't fix itself) from the
-		// normal post-restart warm-up (fills within a couple of samples).
-		buf.WriteString(`<section><div class="label">Queues &amp; throughput</div><div class="graph-note">`)
-		if cacheReady {
-			buf.WriteString(`collecting&hellip; first points appear within a few minutes`)
-		} else {
-			buf.WriteString(`metrics cache unavailable — set HOPPER_METRICS_DB to a writable path`)
-		}
-		buf.WriteString(`</div></section>`)
-		return
-	}
-	pending := make([]float64, len(points))
-	rescan := make([]float64, len(points))
-	for i, p := range points {
-		pending[i] = float64(p.Pending)
-		rescan[i] = float64(p.Rescan)
-	}
-	// Completion throughput = the count the database recorded as analyzed
-	// within each sampling interval (the difference of the cumulative analyzed
-	// count). Clamp negatives so a restart gap or counter reset reads as zero
-	// rather than a downward spike.
-	completed := make([]float64, len(points)-1)
-	for i := 1; i < len(points); i++ {
-		completed[i-1] = max(float64(points[i].Completed-points[i-1].Completed), 0)
-	}
-
-	span := points[len(points)-1].T.Sub(points[0].T)
-	step := span / time.Duration(len(points)-1)
-	last := points[len(points)-1]
-
-	buf.WriteString(`<section><div class="label">Queues &amp; throughput &middot; last `)
-	buf.WriteString(htmlEscape(shortDuration(span)))
-	buf.WriteString(`</div><div class="graph-row">`)
-	writeMiniGraph(buf, "Pending", fmtN(last.Pending), pending, "#818cf8")
-	writeMiniGraph(buf, "Rescan", fmtN(last.Rescan), rescan, "#fbbf24")
-	writeMiniGraph(buf, "Completed / "+shortDuration(step), fmtN(int64(completed[len(completed)-1])), completed, "#34d399")
-	buf.WriteString(`</div></section>`)
-}
-
-// flowSeries is the per-interval arrival and completion rates derived from the
-// sampled counters, in items/sec.
+// flowSeries is the net movement of the backlog, plus the arrival/completion
+// decomposition when the sampler has recorded enough of it.
+//
+// net is the ground gained or lost per second: positive means the backlog
+// shrank over that interval, negative means it grew.
 type flowSeries struct {
-	in, out []float64
-	usable  bool
+	net      []float64
+	in, out  []float64
+	usable   bool
+	hasRates bool
 }
 
-// flowRates differentiates the cumulative counters into rates.
+// flowRates derives the net backlog movement from the sampled queue DEPTHS, and
+// the arrival/completion rates from the cumulative counters when they are there.
 //
-// Two clamps, both for the same reason -- a counter that goes backwards is a
-// restart, not negative work. Added is max(samples.id) and never regresses, but
-// Completed is the in-memory session counter, which resets to its DB baseline on
-// every restart and would otherwise draw a cliff. A negative difference is
-// dropped rather than plotted.
+// Depth first, because depth is the honest answer and it is available
+// immediately: the backlog level already nets off every arrival and every
+// completion, whatever their source, so its slope IS "are we gaining ground".
+// The in/out decomposition is an enrichment, and it is the half that has to wait
+// -- the arrival watermark only starts accumulating when a build carrying it has
+// been up for two sample intervals. Deriving the answer from depth means a fresh
+// deploy shows the graph at once against months of existing history, instead of
+// reporting "collecting..." for ten minutes over a cache that already holds the
+// data.
 //
-// Points carrying Added == 0 predate the column (see queuePoint) and are skipped
-// on the arrivals side: plotting them would read as "ingest stopped" for exactly
-// as long as the old cache rows survive retention.
+// Two clamps on the rates, both because a counter going backwards is a restart
+// rather than negative work: Added (max(samples.id)) never regresses, but
+// Completed is an in-memory session counter that resets to its DB baseline on
+// restart. Depth needs no such clamp -- it is a level, and it may legitimately
+// move either way.
 func flowRates(points []queuePoint) flowSeries {
 	var f flowSeries
 	for i := 1; i < len(points); i++ {
 		prev, cur := points[i-1], points[i]
 		dt := cur.T.Sub(prev.T).Seconds()
-		if dt <= 0 || prev.Added == 0 || cur.Added == 0 {
+		if dt <= 0 {
 			continue
 		}
-		f.in = append(f.in, max(float64(cur.Added-prev.Added), 0)/dt)
-		f.out = append(f.out, max(float64(cur.Completed-prev.Completed), 0)/dt)
+		depthPrev := prev.Pending + prev.Rescan
+		depthCur := cur.Pending + cur.Rescan
+		f.net = append(f.net, float64(depthPrev-depthCur)/dt)
+		if prev.Added > 0 && cur.Added > 0 {
+			f.in = append(f.in, max(float64(cur.Added-prev.Added), 0)/dt)
+			f.out = append(f.out, max(float64(cur.Completed-prev.Completed), 0)/dt)
+		}
 	}
-	f.usable = len(f.in) >= 2
+	f.usable = len(f.net) >= 2
+	f.hasRates = len(f.in) >= 2
 	return f
 }
 
+// mean returns the average of vals, or zero for an empty slice.
+func mean(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, v := range vals {
+		sum += v
+	}
+	return sum / float64(len(vals))
+}
+
 // writeFlowGraph answers the one question a queue dashboard exists to answer:
-// is work arriving faster than it is finishing?
+// are we gaining ground or losing it?
 //
-// It plots NET rate (out - in) against a zero baseline rather than two lines on
-// a shared axis. Two lines make the reader do the subtraction, and at these
-// magnitudes -- arrivals and completions are usually within a few percent of
-// each other -- the gap that decides the answer is thinner than the strokes.
-// Against zero, the sign IS the answer: above the line the backlog is shrinking,
-// below it the backlog is growing.
+// It plots NET movement against a zero baseline rather than arrivals and
+// completions as two lines. Two lines make the reader do the subtraction, and at
+// these magnitudes -- arrivals and completions are usually within a few percent
+// of each other -- the gap that decides the answer is thinner than the strokes.
+// Against zero, the sign IS the answer.
+//
+// Windowed to flowWindow rather than the full graph window: a deploy that
+// changes what a queue counts (the rescan tier gaining a whole population, say)
+// puts one enormous step in the series, and over 72h that step sets the scale
+// and flattens everything else into the axis. Six hours ages it out.
 func writeFlowGraph(buf *strings.Builder, points []queuePoint, cacheReady bool) {
-	f := flowRates(points)
-	buf.WriteString(`<section><div class="label">Flow &middot; ingest vs processing</div>`)
+	cut := time.Now().Add(-flowWindow)
+	recent := points
+	for i, p := range points {
+		if !p.T.Before(cut) {
+			recent = points[i:]
+			break
+		}
+	}
+	f := flowRates(recent)
+
+	buf.WriteString(`<section><div class="label">Ground gained or lost &middot; last ` +
+		htmlEscape(shortDuration(flowWindow)) + `</div>`)
 	if !f.usable {
 		buf.WriteString(`<div class="graph-note">`)
 		if cacheReady {
-			buf.WriteString(`collecting&hellip; the flow graph needs two samples (about 10 minutes)`)
+			buf.WriteString(`collecting&hellip; two queue samples are needed (about 10 minutes)`)
 		} else {
 			buf.WriteString(`metrics cache unavailable &mdash; set HOPPER_METRICS_DB to a writable path`)
 		}
@@ -1709,54 +1904,45 @@ func writeFlowGraph(buf *strings.Builder, points []queuePoint, cacheReady bool) 
 		return
 	}
 
-	netRate := make([]float64, len(f.in))
-	var sumIn, sumOut float64
-	for i := range f.in {
-		netRate[i] = f.out[i] - f.in[i]
-		sumIn += f.in[i]
-		sumOut += f.out[i]
-	}
-	n := float64(len(f.in))
-	avgIn, avgOut := sumIn/n, sumOut/n
-	avgNet := avgOut - avgIn
-
-	// Headline first, chart second: the sentence is the finding, the chart is
-	// the evidence for it.
-	verdict, cls := "keeping up", "flow-good"
+	avgNet := mean(f.net)
+	verdict, cls := "Gaining ground", "flow-good"
 	if avgNet < 0 {
-		verdict, cls = "falling behind", "flow-bad"
+		verdict, cls = "Losing ground", "flow-bad"
 	}
-	fmt.Fprintf(buf,
-		`<div class="flow-head"><span class="%s">%s</span>`+
-			`<span class="flow-detail">in <em>%.1f/s</em> &middot; out <em>%.1f/s</em> &middot; net <em>%+.1f/s</em></span></div>`,
-		cls, verdict, avgIn, avgOut, avgNet)
+	// The in/out split when the arrival watermark has accumulated; otherwise the
+	// net alone, which is the answer either way.
+	detail := fmt.Sprintf("backlog <em>%+.1f/s</em>", avgNet)
+	if f.hasRates {
+		detail = fmt.Sprintf("in <em>%.1f/s</em> &middot; out <em>%.1f/s</em> &middot; net <em>%+.1f/s</em>",
+			mean(f.in), mean(f.out), mean(f.out)-mean(f.in))
+	}
+	fmt.Fprintf(buf, `<div class="flow-head"><span class="%s">%s</span>`+
+		`<span class="flow-detail">%s</span></div>`, cls, htmlEscape(verdict), detail)
 
 	const w, h = 1100, 150
 	scale := 1.0
-	for _, v := range netRate {
+	for _, v := range f.net {
 		if a := math.Abs(v); a > scale {
 			scale = a
 		}
 	}
 	zeroY := float64(h) / 2
-	xOf := func(i int) float64 { return float64(i) * float64(w) / float64(len(netRate)-1) }
+	xOf := func(i int) float64 { return float64(i) * float64(w) / float64(len(f.net)-1) }
 	yOf := func(v float64) float64 { return zeroY - (v/scale)*(zeroY-8) }
 
 	var area, line strings.Builder
 	fmt.Fprintf(&area, "%.1f,%.1f", xOf(0), zeroY)
-	for i, v := range netRate {
+	for i, v := range f.net {
 		if i > 0 {
 			line.WriteByte(' ')
 		}
 		fmt.Fprintf(&line, "%.1f,%.1f", xOf(i), yOf(v))
 		fmt.Fprintf(&area, " %.1f,%.1f", xOf(i), yOf(v))
 	}
-	fmt.Fprintf(&area, " %.1f,%.1f", xOf(len(netRate)-1), zeroY)
+	fmt.Fprintf(&area, " %.1f,%.1f", xOf(len(f.net)-1), zeroY)
 
 	fmt.Fprintf(buf, `<svg viewBox="0 0 %d %d" preserveAspectRatio="none" `+
 		`style="display:block;width:100%%;height:150px;overflow:visible">`, w, h)
-	// Split the same area at the zero line so the sign reads as colour without
-	// the reader consulting the axis.
 	fmt.Fprintf(buf, `<defs><clipPath id="flowUp"><rect x="0" y="0" width="%d" height="%.1f"/></clipPath>`+
 		`<clipPath id="flowDown"><rect x="0" y="%.1f" width="%d" height="%.1f"/></clipPath></defs>`,
 		w, zeroY, zeroY, w, float64(h)-zeroY)
@@ -1764,55 +1950,13 @@ func writeFlowGraph(buf *strings.Builder, points []queuePoint, cacheReady bool) 
 	fmt.Fprintf(buf, `<polygon points="%s" fill="#f87171" fill-opacity="0.16" clip-path="url(#flowDown)"/>`, area.String())
 	fmt.Fprintf(buf, `<polyline points="%s" fill="none" stroke="#818cf8" stroke-width="1.5" stroke-linejoin="round"/>`, line.String())
 	fmt.Fprintf(buf, `<line x1="0" y1="%.1f" x2="%d" y2="%.1f" stroke="#4e5a72" stroke-width="1"/>`, zeroY, w, zeroY)
-	fmt.Fprintf(buf, `<text x="4" y="%.1f" fill="#4e5a72" font-size="10" font-family="monospace" dy="-4">draining</text>`, zeroY)
-	fmt.Fprintf(buf, `<text x="4" y="%.1f" fill="#4e5a72" font-size="10" font-family="monospace" dy="12">growing</text>`, zeroY)
+	fmt.Fprintf(buf, `<text x="4" y="%.1f" fill="#4e5a72" font-size="10" font-family="monospace" dy="-4">backlog shrinking</text>`, zeroY)
+	fmt.Fprintf(buf, `<text x="4" y="%.1f" fill="#4e5a72" font-size="10" font-family="monospace" dy="12">backlog growing</text>`, zeroY)
 	buf.WriteString(`</svg>`)
 	buf.WriteString(`<div class="graph-legend">` +
 		`<span class="legend-item"><span class="legend-swatch" style="background:#34d399"></span>finishing faster than arriving</span>` +
 		`<span class="legend-item"><span class="legend-swatch" style="background:#f87171"></span>arriving faster than finishing</span>` +
 		`</div></section>`)
-}
-
-// writeMiniGraph renders one labelled area+line sparkline scaled to its own
-// max. cur is the preformatted current value shown beside the title.
-func writeMiniGraph(buf *strings.Builder, title, cur string, vals []float64, color string) {
-	const w, h, px, py = 300, 80, 0, 6
-	maxVal := 1.0
-	for _, v := range vals {
-		if v > maxVal {
-			maxVal = v
-		}
-	}
-	xOf := func(i, n int) float64 {
-		if n <= 1 {
-			return float64(px)
-		}
-		return float64(px) + float64(i)*float64(w-2*px)/float64(n-1)
-	}
-	yOf := func(v float64) float64 {
-		return float64(h-py) - (v/maxVal)*float64(h-2*py)
-	}
-	var lineSB, areaSB strings.Builder
-	fmt.Fprintf(&areaSB, "%.1f,%.1f", xOf(0, len(vals)), float64(h-py))
-	for i, v := range vals {
-		if i > 0 {
-			lineSB.WriteByte(' ')
-		}
-		fmt.Fprintf(&lineSB, "%.1f,%.1f", xOf(i, len(vals)), yOf(v))
-		fmt.Fprintf(&areaSB, " %.1f,%.1f", xOf(i, len(vals)), yOf(v))
-	}
-	fmt.Fprintf(&areaSB, " %.1f,%.1f", xOf(len(vals)-1, len(vals)), float64(h-py))
-
-	buf.WriteString(`<div class="graph-box graph-mini">`)
-	fmt.Fprintf(buf, `<div class="graph-title">%s <em>%s</em></div>`, htmlEscape(title), htmlEscape(cur))
-	fmt.Fprintf(buf, `<svg viewBox="0 0 %d %d" preserveAspectRatio="none" style="display:block;width:100%%;height:80px;overflow:visible">`, w, h)
-	y := yOf(maxVal)
-	fmt.Fprintf(buf, `<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#1a1f2e" stroke-width="1"/>`, px, y, w-px, y)
-	fmt.Fprintf(buf, `<text x="%d" y="%.1f" fill="#2d3448" font-size="9" font-family="monospace" dy="10">%s</text>`,
-		px, y, htmlEscape(fmtN(int64(maxVal))))
-	fmt.Fprintf(buf, `<polygon points="%s" fill="%s" fill-opacity="0.10"/>`, areaSB.String(), color)
-	fmt.Fprintf(buf, `<polyline points="%s" fill="none" stroke="%s" stroke-width="2" stroke-linejoin="round"/>`, lineSB.String(), color)
-	buf.WriteString(`</svg></div>`)
 }
 
 // ---------------------------------------------------------------------------
@@ -1942,10 +2086,15 @@ func fmtN(n int64) string {
 
 func shortDuration(d time.Duration) string {
 	d = d.Round(time.Second)
+	days := int(d / (24 * time.Hour))
 	h := int(d / time.Hour)
 	m := int((d % time.Hour) / time.Minute)
 	s := int((d % time.Minute) / time.Second)
 	switch {
+	// Ages here reach months (a litmus backlog measured 3311h40m on the live
+	// dashboard, which nobody reads as 138 days). Days first.
+	case days > 0:
+		return fmt.Sprintf("%dd%02dh", days, h%24)
 	case h > 0:
 		return fmt.Sprintf("%dh%02dm", h, m)
 	case m > 0:
