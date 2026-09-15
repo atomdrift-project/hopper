@@ -411,6 +411,7 @@ td.warn{color:var(--amber)}
 .graph-title em{color:var(--text);font-style:normal}
 .graph-note{font-size:.72rem;color:var(--sub);font-family:var(--mono);
   padding:.5rem 0}
+.graph-note em{font-style:normal;color:var(--text)}
 .graph-legend{display:flex;gap:1rem;padding:.5rem 0;flex-wrap:wrap}
 .flow-head{display:flex;align-items:baseline;gap:.75rem;padding-bottom:.6rem;flex-wrap:wrap}
 .flow-good{font-size:1.05rem;font-weight:600;color:var(--green)}
@@ -1599,8 +1600,17 @@ func writeClaimLadder(buf *strings.Builder, activity, depths map[string]int64, p
 		}
 	}
 
+	// The scope note is not padding. Measured 2026-09-15: the fleet completed
+	// 26.7 top-level rescans/s while this whole table accounted for ~1.9/s, a
+	// 14x gap -- the walk re-analyses files directly rather than claiming them
+	// through /api/next. Without saying so, a reader compares these rates
+	// against the Throughput card and concludes one of them is broken.
 	buf.WriteString(`<section><div class="label">Claim ladder &middot; last ` +
 		fmt.Sprintf("%dm", tierWindowMinutes) + `</div>`)
+	buf.WriteString(`<div class="graph-note">Jobs handed to workers through ` +
+		`<em>/api/next</em>, in the order they are offered. A running walk ` +
+		`re-analyses files outside this ladder, so these rates are not the ` +
+		`fleet's total throughput.</div>`)
 	buf.WriteString(`<table><thead><tr><th>#</th><th>Tier</th><th>Waiting</th>` +
 		`<th>Claimed</th><th>Rate</th><th>Share of claims</th>` +
 		`<th>Trend &middot; ` + htmlEscape(shortDuration(queueGraphWindow)) + `</th><th></th>` +
