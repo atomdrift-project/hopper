@@ -230,7 +230,18 @@ func resolveMovePath(dataRoot, rel string) (root, resolved string, err error) {
 	if dataRoot == "" {
 		return "", "", errors.New("empty data root")
 	}
-	if rel == "" || strings.Contains(rel, "\\") || path.IsAbs(rel) || path.Clean(rel) != rel {
+	// A backslash is only a path separator on Windows. On Unix it is an ordinary
+	// filename byte, and systemd escapes "-" as `\x2d` in unit names, so an
+	// exploded OS image legitimately contains files like
+	// `system-systemd\x2dcryptsetup.slice`. Rejecting those outright stranded
+	// every such member in the hot pool permanently: draino re-fed them each
+	// episode, hopper refused each one, and the pool could never drain.
+	// Containment is already guaranteed below by the cleaned-path and
+	// prefix-of-root checks, which do not depend on this.
+	if rel == "" || path.IsAbs(rel) || path.Clean(rel) != rel {
+		return "", "", fmt.Errorf("invalid relative path %q", rel)
+	}
+	if filepath.Separator == '\\' && strings.Contains(rel, "\\") {
 		return "", "", fmt.Errorf("invalid relative path %q", rel)
 	}
 	root, err = filepath.Abs(dataRoot)
