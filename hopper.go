@@ -5501,6 +5501,32 @@ func (db *DB) CountAnalyzed(ctx context.Context) (int64, error) {
 	return db.countAnalyzedSQLite(ctx)
 }
 
+// ArrivalWatermark is the highest sample id issued so far: a cumulative count of
+// everything ever ingested, including rows since deleted.
+//
+// It is the arrivals half of the dashboard's flow graph. A count(*) would answer
+// a different question (how many rows survive) and cost a scan of a 132M-row
+// table; max(id) rides the primary key backwards and returns in under a
+// millisecond, and a BIGSERIAL never goes backwards, which is exactly the
+// property a cumulative counter needs. Differences between consecutive samples
+// are the ingest rate.
+func (db *DB) ArrivalWatermark(ctx context.Context) (int64, error) {
+	var n *int64
+	var err error
+	if db.pool != nil {
+		err = db.pool.QueryRow(ctx, `SELECT max(id) FROM samples`).Scan(&n)
+	} else {
+		err = db.lite.QueryRowContext(ctx, `SELECT max(id) FROM samples`).Scan(&n)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("hopper: arrival watermark: %w", err)
+	}
+	if n == nil {
+		return 0, nil // empty table
+	}
+	return *n, nil
+}
+
 // CountPending returns the number of samples awaiting analysis
 // (matching the claim query criteria: no cleave result, not skipped, not a child).
 func (db *DB) CountPending(ctx context.Context) (int64, error) {

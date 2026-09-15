@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3" // SQLite driver for the local metrics cache.
@@ -23,14 +24,22 @@ type metricsStore struct {
 	db *sql.DB
 }
 
-// queuePoint is one sampled snapshot of the work queues. Completed is the
-// cumulative analyzed count (CountAnalyzed); per-interval throughput is the
-// difference between consecutive points.
+// queuePoint is one sampled snapshot of the work queues. Completed and Added
+// are CUMULATIVE counters, not levels: per-interval throughput is the difference
+// between consecutive points. Pending and Rescan are levels.
+//
+// Added is the arrival watermark (max(samples.id)), which is what makes the flow
+// graph possible: paired with Completed it answers "are we taking in more than
+// we finish", and neither a level nor a rate alone can. A sequence high-water
+// mark rather than a count(*) because it is O(1) on a 132M-row table and never
+// goes backwards when rows are deleted -- arrivals are what we want to count,
+// not survivors.
 type queuePoint struct {
 	T         time.Time
 	Pending   int64
 	Rescan    int64
 	Completed int64
+	Added     int64
 }
 
 // metricsDBPath returns the path to the local metrics cache. HOPPER_METRICS_DB
@@ -74,6 +83,24 @@ func openMetricsStore(ctx context.Context, path string) (*metricsStore, error) {
 		}
 		return nil, fmt.Errorf("hopper: metrics schema: %w", err)
 	}
+	// CREATE TABLE IF NOT EXISTS will not add a column to a cache that predates
+	// it, and this is a cache: an existing file must keep its history rather than
+	// be discarded for a schema bump. Older rows carry added=0, which the flow
+	// graph reads as "no arrival data" and skips.
+	//
+	// Attempted unconditionally and the "already there" error tolerated, rather
+	// than asking PRAGMA table_info first. The pragma path has a third outcome --
+	// the query itself failing -- and neither answer is then safe: skip the
+	// migration and every INSERT fails, run it and it fails as a duplicate. One
+	// statement with one expected error has no such ambiguity.
+	if _, err := db.ExecContext(ctx,
+		`ALTER TABLE queue_metrics ADD COLUMN added INTEGER NOT NULL DEFAULT 0`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		if closeErr := db.Close(); closeErr != nil {
+			slog.Debug("close metrics cache after migration error failed", "error", closeErr)
+		}
+		return nil, fmt.Errorf("hopper: metrics migrate: %w", err)
+	}
 	return &metricsStore{db: db}, nil
 }
 
@@ -81,8 +108,8 @@ func openMetricsStore(ctx context.Context, path string) (*metricsStore, error) {
 // dedupes samples that land within the same second (INSERT OR REPLACE).
 func (m *metricsStore) record(ctx context.Context, p queuePoint) error {
 	_, err := m.db.ExecContext(ctx,
-		`INSERT OR REPLACE INTO queue_metrics (ts, pending, rescan, completed) VALUES (?, ?, ?, ?)`,
-		p.T.UTC().Unix(), p.Pending, p.Rescan, p.Completed)
+		`INSERT OR REPLACE INTO queue_metrics (ts, pending, rescan, completed, added) VALUES (?, ?, ?, ?, ?)`,
+		p.T.UTC().Unix(), p.Pending, p.Rescan, p.Completed, p.Added)
 	if err != nil {
 		return fmt.Errorf("hopper: record metric: %w", err)
 	}
@@ -92,7 +119,7 @@ func (m *metricsStore) record(ctx context.Context, p queuePoint) error {
 // series returns snapshots at or after since, oldest first.
 func (m *metricsStore) series(ctx context.Context, since time.Time) ([]queuePoint, error) {
 	rows, err := m.db.QueryContext(ctx,
-		`SELECT ts, pending, rescan, completed FROM queue_metrics WHERE ts >= ? ORDER BY ts`,
+		`SELECT ts, pending, rescan, completed, added FROM queue_metrics WHERE ts >= ? ORDER BY ts`,
 		since.UTC().Unix())
 	if err != nil {
 		return nil, fmt.Errorf("hopper: metric series: %w", err)
@@ -102,7 +129,7 @@ func (m *metricsStore) series(ctx context.Context, since time.Time) ([]queuePoin
 	for rows.Next() {
 		var ts int64
 		var p queuePoint
-		if err := rows.Scan(&ts, &p.Pending, &p.Rescan, &p.Completed); err != nil {
+		if err := rows.Scan(&ts, &p.Pending, &p.Rescan, &p.Completed, &p.Added); err != nil {
 			return nil, fmt.Errorf("hopper: scan metric: %w", err)
 		}
 		p.T = time.Unix(ts, 0).UTC()

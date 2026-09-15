@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -66,5 +67,65 @@ func TestMetricsStore(t *testing.T) {
 	}
 	if len(pts) != 1 {
 		t.Fatalf("after prune len = %d, want 1", len(pts))
+	}
+}
+
+// TestMetricsStoreMigratesExistingCache proves the added column reaches a cache
+// file that predates it. CREATE TABLE IF NOT EXISTS silently does nothing to an
+// existing table, so without the ALTER every write would fail against a cache
+// carried over from the previous build -- and the graphs would stay empty for
+// exactly the reason the user could not see.
+func TestMetricsStoreMigratesExistingCache(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "queue-metrics.db")
+
+	// An old-schema cache with one row of history worth keeping.
+	old, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.ExecContext(ctx, `CREATE TABLE queue_metrics (
+		ts INTEGER PRIMARY KEY, pending INTEGER NOT NULL,
+		rescan INTEGER NOT NULL, completed INTEGER NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.ExecContext(ctx,
+		`INSERT INTO queue_metrics (ts,pending,rescan,completed) VALUES (?,?,?,?)`,
+		time.Now().Add(-time.Hour).Unix(), 5, 6, 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ms, err := openMetricsStore(ctx, path)
+	if err != nil {
+		t.Fatalf("openMetricsStore on a pre-existing cache: %v", err)
+	}
+	defer ms.close() //nolint:errcheck // test cleanup
+	if err := ms.record(ctx, queuePoint{T: time.Now(), Pending: 1, Rescan: 2, Completed: 3, Added: 4}); err != nil {
+		t.Fatalf("record after migration: %v", err)
+	}
+	pts, err := ms.series(ctx, time.Now().Add(-2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pts) != 2 {
+		t.Fatalf("got %d points, want 2; the pre-existing row must survive the migration", len(pts))
+	}
+	if pts[0].Added != 0 {
+		t.Errorf("legacy row Added = %d, want 0", pts[0].Added)
+	}
+	if pts[1].Added != 4 {
+		t.Errorf("new row Added = %d, want 4", pts[1].Added)
+	}
+
+	// Reopening must be a no-op, not a duplicate-column failure.
+	again, err := openMetricsStore(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen after migration: %v", err)
+	}
+	if err := again.close(); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -2245,9 +2245,14 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	var metrics *metricsStore
 	if wd != nil {
 		if ms, err := openMetricsStore(ctx, metricsDBPath()); err != nil {
-			slog.Warn("queue metrics cache disabled", "error", err)
+			slog.Warn("queue metrics cache disabled; the dashboard graphs will stay empty",
+				"path", metricsDBPath(), "error", err)
 		} else {
 			metrics = ms
+			// Logged because an empty graph is otherwise unattributable: the
+			// cache lives in the OS cache dir, which a service manager may put
+			// somewhere private or wipe between restarts.
+			slog.Info("queue metrics cache open", "path", metricsDBPath())
 			defer func() {
 				if err := metrics.close(); err != nil {
 					slog.Debug("close metrics cache failed", "error", err)
@@ -2657,13 +2662,22 @@ func sampleQueueMetrics(
 		slog.Debug("queue metrics: rescan depths failed", "error", err)
 	}
 	completed := progress.analyzed.Load()
+	// Arrivals. Best-effort like the rescan depths above: a missing watermark
+	// costs the flow graph one point, and dropping the whole snapshot for it
+	// would cost the queue-depth graphs a point too.
+	var added int64
+	if n, err := db.ArrivalWatermark(qctx); err == nil {
+		added = n
+	} else {
+		slog.Debug("queue metrics: arrival watermark failed", "error", err)
+	}
 
 	// Record/prune on a fresh context: a slow (or timed-out) PG count above
 	// must not carry an exhausted deadline into the local SQLite write, or the
 	// snapshot is lost even though the values are in hand.
 	wctx, wcancel := context.WithTimeout(ctx, dashQueryTimeout)
 	defer wcancel()
-	if err := metrics.record(wctx, queuePoint{T: time.Now(), Pending: pending, Rescan: rescan, Completed: completed}); err != nil {
+	if err := metrics.record(wctx, queuePoint{T: time.Now(), Pending: pending, Rescan: rescan, Completed: completed, Added: added}); err != nil {
 		slog.Warn("queue metrics: record failed", "error", err)
 		return
 	}

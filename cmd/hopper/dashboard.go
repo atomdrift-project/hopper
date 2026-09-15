@@ -331,7 +331,7 @@ body{font-family:var(--sans);background:var(--bg);color:var(--text);
 .progress-detail em{font-style:normal;color:var(--text)}
 .track{height:4px;background:var(--border);border-radius:2px;overflow:hidden;display:flex}
 .fill{height:100%;border-radius:2px;transition:width .5s ease;flex-shrink:0}
-.queue-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.75rem;margin-top:1rem}
+.queue-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:.75rem;margin-top:1rem}
 .queue-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:.8rem .9rem}
 .queue-label{font-size:.62rem;font-weight:700;letter-spacing:.11em;text-transform:uppercase;color:var(--sub);margin-bottom:.35rem}
 .queue-value{font-family:var(--mono);font-size:1.05rem;color:var(--text);font-weight:600;line-height:1.25}
@@ -403,6 +403,22 @@ td.warn{color:var(--amber)}
 .graph-note{font-size:.72rem;color:var(--sub);font-family:var(--mono);
   padding:.5rem 0}
 .graph-legend{display:flex;gap:1rem;padding:.5rem 0;flex-wrap:wrap}
+.flow-head{display:flex;align-items:baseline;gap:.75rem;padding-bottom:.6rem;flex-wrap:wrap}
+.flow-good{font-size:1.05rem;font-weight:600;color:var(--green)}
+.flow-bad{font-size:1.05rem;font-weight:600;color:var(--red)}
+.flow-detail{font-family:var(--mono);font-size:.78rem;color:var(--sub)}
+.flow-detail em{font-style:normal;color:var(--text)}
+
+/* status: the page's first and largest claim */
+.status{margin-bottom:1.75rem}
+.status-line{display:flex;align-items:center;gap:.6rem}
+.status-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.status-ok{background:var(--green);box-shadow:0 0 10px rgba(52,211,153,.5)}
+.status-warn{background:var(--amber);box-shadow:0 0 10px rgba(251,191,36,.5)}
+.status-bad{background:var(--red);box-shadow:0 0 10px rgba(248,113,113,.5)}
+.status-headline{font-size:1.45rem;font-weight:600;color:var(--text);letter-spacing:-.01em}
+.status-facts{font-family:var(--mono);font-size:.78rem;color:var(--sub);
+  margin-top:.4rem;padding-left:1.6rem}
 .legend-item{display:flex;align-items:center;gap:.35rem;
   font-size:.72rem;color:var(--sub);font-family:var(--mono)}
 .legend-swatch{width:12px;height:2px;border-radius:1px}
@@ -644,6 +660,28 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		}
 	}
 
+	var queuePoints []queuePoint
+	if wd.metrics != nil {
+		//nolint:contextcheck,errcheck // closure creates its own context; closure logs errors before returning
+		queuePoints, _ = wd.seriesCache.Fetch("series", func() ([]queuePoint, error) {
+			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
+			defer cancel()
+			pts, err := wd.metrics.series(qctx, time.Now().Add(-queueGraphWindow))
+			if err != nil {
+				slog.Warn("dashboard: queue metric series failed", "error", err)
+			}
+			return pts, err
+		})
+	}
+
+	writeSystemStatus(&buf, &statusInputs{
+		health:        workflow.health,
+		flow:          flowRates(queuePoints),
+		pendingLitmus: pendingLitmus,
+		backlogs:      workflow.backlogs,
+		rescan:        depths,
+	})
+
 	// Header + progress
 	buf.WriteString(`<div class="hdr">`)
 	buf.WriteString(`<div class="hdr-top">`)
@@ -655,12 +693,12 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	// lower-priority queue in claimJobs.
 	buf.WriteString(`<div class="progress">`)
 	buf.WriteString(`<div class="progress-stats">`)
-	fmt.Fprintf(&buf, `<span class="progress-main"><span class="progress-pct">%.0f%%</span> initial analysis</span>`, pct)
+	fmt.Fprintf(&buf, `<span class="progress-main"><span class="progress-pct">%.1f%%</span> cleave analysis</span>`, pct)
 
 	buf.WriteString(`<span class="progress-detail">`)
 	fmt.Fprintf(&buf, `<em>%s</em> / %s analyzed`, fmtN(analyzedAbs), fmtN(totalExpected))
 	if pending > 0 {
-		fmt.Fprintf(&buf, ` &middot; <em>%s</em> pending initial`, fmtN(pending))
+		fmt.Fprintf(&buf, ` &middot; <em>%s</em> awaiting cleave`, fmtN(pending))
 	}
 	// Rates live in the Throughput tile; the progress line stays about progress.
 	if initialETA != "" {
@@ -678,17 +716,14 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	buf.WriteString(`</div>`) // .progress
 
 	buf.WriteString(`<div class="queue-grid">`)
-	writeQueueCard(&buf, "Initial queue", fmt.Sprintf("%s pending", fmtN(pending+pendingLitmus)), func() string {
+	// TWO cards, not one. They were summed under "Initial queue", which put
+	// "169,458 pending" three inches below a bar reading "100% initial
+	// analysis" -- 646x apart, both labelled initial, on the same screen. They
+	// are different pipelines: no-cleave is served by tiers S/U/B/1 at the top
+	// of the ladder, no-litmus only by the repair tier below the whole
+	// unanalyzed backlog. One number cannot describe both.
+	writeQueueCard(&buf, "Cleave queue", fmt.Sprintf("%s pending", fmtN(pending)), func() string {
 		var parts []string
-		// Split the headline, because the two halves are served by different
-		// tiers at very different rates: no-cleave is tiers S/U/B/1 at the top
-		// of the ladder, no-litmus reaches a worker only once something flags
-		// it into the repair tier (hopper rescan --missing-litmus), which sits
-		// below the whole unanalyzed backlog.
-		parts = append(parts, fmt.Sprintf("<em>%s</em> no cleave", fmtN(pending)))
-		if pendingLitmus > 0 {
-			parts = append(parts, fmt.Sprintf("<em>%s</em> no litmus", fmtN(pendingLitmus)))
-		}
 		if topLevelRate > 0.001 {
 			parts = append(parts, fmt.Sprintf("<em>%.2f</em>/s", topLevelRate))
 		}
@@ -696,10 +731,14 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 			// Explicitly the cleave half's ETA: it is the slope of the no-cleave
 			// depth alone. The no-litmus half drains through the repair tier on
 			// leftover capacity and has its own, much flatter, slope.
-			parts = append(parts, "cleave ETA <em>"+initialETA+"</em>")
+			parts = append(parts, "ETA <em>"+initialETA+"</em>")
+		}
+		if len(parts) == 0 {
+			parts = append(parts, "caught up")
 		}
 		return strings.Join(parts, " &middot; ")
 	}())
+	writeQueueCard(&buf, "Litmus queue", fmt.Sprintf("%s pending", fmtN(pendingLitmus)), litmusMeta(pendingLitmus, workflow.backlogs))
 	writeQueueCard(&buf, "Rescan queue", fmt.Sprintf("%s pending", fmtN(rescanPending)), rescanMeta(depths, rescanETA, rescanDrain, rescanMeasured))
 
 	// Throughput tile: the rescan rate gets its own labeled home rather than
@@ -727,6 +766,13 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	if workflow.hasHealth {
 		writeWorkflowHealth(&buf, workflow.health)
 	}
+	// Trend before detail: the graphs answer "which way is this going", which is
+	// the question a reader has immediately after the queue counts. The sample
+	// tables below are lookup tools -- useful when you already know what you are
+	// chasing, noise when you do not.
+	writeFlowGraph(&buf, queuePoints, wd.metrics != nil)
+	writeQueueGraphs(&buf, queuePoints, wd.metrics != nil)
+
 	writeWorkflowBacklogs(&buf, workflow.backlogs)
 	writeWorkflowSamples(&buf, "Recent Samples", "Newest rows seen by Hopper", workflow.latestAdded, "created")
 	writeWorkflowSamples(&buf, "Prism Ready", "Top-level rows by first analysis completion", workflow.latestReady, "first_analyzed")
@@ -736,20 +782,6 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	// over the trailing window, all from the database's own counts (sampled
 	// into the local metrics cache). They share one time axis but each scales
 	// to its own maximum, since the three magnitudes differ by orders.
-	var queuePoints []queuePoint
-	if wd.metrics != nil {
-		//nolint:contextcheck,errcheck // closure creates its own context; closure logs errors before returning
-		queuePoints, _ = wd.seriesCache.Fetch("series", func() ([]queuePoint, error) {
-			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
-			defer cancel()
-			pts, err := wd.metrics.series(qctx, time.Now().Add(-queueGraphWindow))
-			if err != nil {
-				slog.Warn("dashboard: queue metric series failed", "error", err)
-			}
-			return pts, err
-		})
-	}
-	writeQueueGraphs(&buf, queuePoints, wd.metrics != nil)
 
 	// Workers
 	//nolint:nestif // flat per-worker cell formatting, consistent with this handler's documented long-but-flat style
@@ -774,7 +806,43 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 			`<th>Analyzed</th><th>Errors</th><th>Oldest Job</th><th></th>` +
 			`</tr></thead><tbody>`)
 
-		slices.SortFunc(workers, func(a, b namedWorkerStats) int { return strings.Compare(a.Name, b.Name) })
+		// Ghost registrations: a name that has reported no version, no tools and
+		// no slots. Production carried ten of them against nine real hosts --
+		// four sharing one IP -- so the table was majority noise and a reader
+		// could not see the two hosts that were actually down. They are counted
+		// below the table instead of occupying rows in it.
+		live := workers[:0]
+		ghosts := 0
+		for i := range workers {
+			if workers[i].Version == "" && workers[i].Traits == "" && workers[i].Slots == 0 {
+				ghosts++
+				continue
+			}
+			live = append(live, workers[i])
+		}
+		workers = live
+
+		// Worst first. Alphabetical ordering put `scan-pdx` (down 2h) and
+		// `steamdeck` (down 16h) in the middle of healthy hosts, which is the
+		// one thing this table must never do: the rows that need action have to
+		// be the rows you see first. Name breaks ties so the order is stable
+		// between refreshes.
+		severity := func(w *namedWorkerStats) int {
+			switch idle := time.Since(w.LastSeen); {
+			case idle >= workerInactiveWindow:
+				return 0
+			case idle >= workerActiveWindow:
+				return 1
+			default:
+				return 2
+			}
+		}
+		slices.SortFunc(workers, func(a, b namedWorkerStats) int {
+			if d := severity(&a) - severity(&b); d != 0 {
+				return d
+			}
+			return strings.Compare(a.Name, b.Name)
+		})
 		for i := range workers {
 			w := &workers[i]
 			idle := time.Since(w.LastSeen)
@@ -916,7 +984,13 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 				htmlEscape(status),
 			)
 		}
-		buf.WriteString(`</tbody></table></section>`)
+		buf.WriteString(`</tbody></table>`)
+		if ghosts > 0 {
+			fmt.Fprintf(&buf,
+				`<div class="graph-note">%d registration(s) hidden: reported no version, tools or slots</div>`,
+				ghosts)
+		}
+		buf.WriteString(`</section>`)
 	}
 
 	writeRecentErrors(&buf, progress)
@@ -1154,6 +1228,128 @@ func rescanMeta(d hopper.RescanDepths, eta string, drain float64, measured bool)
 	return strings.Join(parts, " &middot; ")
 }
 
+// statusInputs is everything the top-line verdict reads. Grouped into a struct
+// so the call site stays one statement rather than a tail of positional
+// arguments nobody can read.
+type statusInputs struct {
+	backlogs      []hopper.WorkflowBacklog
+	health        hopper.WorkflowHealth
+	flow          flowSeries
+	rescan        hopper.RescanDepths
+	pendingLitmus int64
+}
+
+// oldestBacklog returns the age of the oldest pending row across the backlog
+// rows, and whether there was one.
+func oldestBacklog(rows []hopper.WorkflowBacklog) (time.Duration, bool) {
+	var oldest time.Time
+	for i := range rows {
+		t := rows[i].OldestPending
+		if t.IsZero() {
+			continue
+		}
+		if oldest.IsZero() || t.Before(oldest) {
+			oldest = t
+		}
+	}
+	if oldest.IsZero() {
+		return 0, false
+	}
+	return time.Since(oldest), true
+}
+
+// litmusMeta describes the litmus backlog by AGE. Its size has barely moved in
+// months, so the size alone tells a reader nothing they can act on; "oldest
+// 71d" does.
+func litmusMeta(pending int64, rows []hopper.WorkflowBacklog) string {
+	if pending == 0 {
+		return "caught up"
+	}
+	if age, ok := oldestBacklog(rows); ok {
+		return fmt.Sprintf(`oldest <em>%s</em> &middot; <span class="queue-note">repair tier only</span>`,
+			htmlEscape(shortDuration(age)))
+	}
+	return `<span class="queue-note">repair tier only</span>`
+}
+
+// writeSystemStatus renders the one line the page exists for: is the pipeline
+// healthy right now, and if not, what is wrong.
+//
+// It is first, largest, and alone. Everything below it is evidence. The page
+// previously opened with eleven sections of equal weight and no answer to this
+// question anywhere -- a reader had to assemble it from a progress bar, four
+// cards, a health grid and a 21-column worker table, and those disagreed with
+// each other.
+//
+// Problems are ranked by what would make someone act, and only the worst is
+// promoted to the verdict; the rest trail as facts. A dashboard that reports
+// five problems at equal weight has not triaged anything.
+func writeSystemStatus(buf *strings.Builder, in *statusInputs) {
+	type issue struct {
+		text string
+		bad  bool // red rather than amber
+	}
+	var issues []issue
+
+	// Staleness first: a pipeline that has stopped moving outranks any backlog.
+	if !in.health.LatestAdded.IsZero() && time.Since(in.health.LatestAdded) > time.Hour {
+		issues = append(issues, issue{fmt.Sprintf("No sample ingested in %s",
+			shortDuration(time.Since(in.health.LatestAdded))), true})
+	}
+	if !in.health.LatestAnalyzed.IsZero() && time.Since(in.health.LatestAnalyzed) > time.Hour {
+		issues = append(issues, issue{fmt.Sprintf("Nothing analyzed in %s",
+			shortDuration(time.Since(in.health.LatestAnalyzed))), true})
+	}
+	// Then direction: arriving faster than finishing is what turns every backlog
+	// below into a permanent one.
+	if in.flow.usable {
+		var sumIn, sumOut float64
+		for i := range in.flow.in {
+			sumIn += in.flow.in[i]
+			sumOut += in.flow.out[i]
+		}
+		if avgNet := (sumOut - sumIn) / float64(len(in.flow.in)); avgNet < 0 {
+			issues = append(issues, issue{fmt.Sprintf("Falling behind by %.1f/s", -avgNet), true})
+		}
+	}
+	// Then standing backlogs, described by age.
+	if age, ok := oldestBacklog(in.backlogs); ok && age > 7*24*time.Hour {
+		issues = append(issues, issue{fmt.Sprintf("%s litmus-blocked, oldest %s",
+			fmtN(in.pendingLitmus), shortDuration(age)), false})
+	}
+
+	cls, headline := "status-ok", "Pipeline healthy"
+	if len(issues) > 0 {
+		cls, headline = "status-warn", issues[0].text
+		if issues[0].bad {
+			cls = "status-bad"
+		}
+	}
+
+	buf.WriteString(`<div class="status">`)
+	fmt.Fprintf(buf, `<div class="status-line"><span class="status-dot %s"></span>`+
+		`<span class="status-headline">%s</span></div>`, cls, htmlEscape(headline))
+
+	var facts []string
+	if !in.health.LatestAdded.IsZero() {
+		facts = append(facts, "ingest "+shortDuration(time.Since(in.health.LatestAdded))+" ago")
+	}
+	if !in.health.LatestAnalyzed.IsZero() {
+		facts = append(facts, "analysis "+shortDuration(time.Since(in.health.LatestAnalyzed))+" ago")
+	}
+	if in.rescan.Total() > 0 {
+		facts = append(facts, fmtN(in.rescan.Total())+" queued for re-analysis")
+	}
+	// Everything the headline did not promote still gets said, just quietly.
+	for _, is := range issues[min(1, len(issues)):] {
+		facts = append(facts, is.text)
+	}
+	if len(facts) > 0 {
+		fmt.Fprintf(buf, `<div class="status-facts">%s</div>`, htmlEscape(strings.Join(facts, " · ")))
+	}
+	buf.WriteString(`</div>`)
+}
+
 func writeQueueCard(buf *strings.Builder, label, value, meta string) {
 	fmt.Fprintf(buf,
 		`<div class="queue-card"><div class="queue-label">%s</div><div class="queue-value">%s</div><div class="queue-meta">%s</div></div>`,
@@ -1177,25 +1373,65 @@ func writeMetricCard(buf *strings.Builder, label, value, sub string) {
 		htmlEscape(label), htmlEscape(value), htmlEscape(sub))
 }
 
+// writeWorkflowBacklogs renders the standing backlogs ordered by AGE.
+//
+// It used to render them by count with a Cleave and a Litmus column. On
+// production every row's Cleave column was 0 -- a column of zeros -- and the
+// counts barely move from week to week, so the same five rows rendered on every
+// refresh and the section taught a reader nothing after the first look.
+//
+// Age is the signal that changes and the one that implies an action. "Oldest"
+// says how long this feed has been stuck; "last arrival" says whether anything
+// is still flowing into it, which separates a feed that is backed up from one
+// that is abandoned. A row whose newest pending item is also ancient is a frozen
+// set: nothing new is arriving and nothing is draining.
 func writeWorkflowBacklogs(buf *strings.Builder, rows []hopper.WorkflowBacklog) {
 	if len(rows) == 0 {
 		return
 	}
-	buf.WriteString(`<section><div class="label">Top Backlogs</div>`)
-	buf.WriteString(`<table><thead><tr><th>Source</th><th>Feed</th><th>Ecosystem</th>` +
-		`<th>Cleave</th><th>Litmus</th><th>Oldest</th><th>Newest</th></tr></thead><tbody>`)
-	for i := range rows {
-		r := &rows[i]
+	ordered := make([]hopper.WorkflowBacklog, len(rows))
+	copy(ordered, rows)
+	slices.SortStableFunc(ordered, func(x, y hopper.WorkflowBacklog) int {
+		a, b := x.OldestPending, y.OldestPending
+		switch {
+		case a.IsZero() && b.IsZero():
+			return 0
+		case a.IsZero():
+			return 1
+		case b.IsZero():
+			return -1
+		default:
+			return a.Compare(b)
+		}
+	})
 
+	buf.WriteString(`<section><div class="label">Backlogs by age</div>`)
+	buf.WriteString(`<table><thead><tr><th>Feed</th><th>Ecosystem</th><th>Stage</th>` +
+		`<th>Waiting</th><th>Oldest</th><th>Last arrival</th><th></th></tr></thead><tbody>`)
+	for i := range ordered {
+		r := &ordered[i]
+		// One stage per row: whichever half actually holds work. Two columns
+		// where one is always zero is a column that costs a reader attention
+		// and returns nothing.
+		stage, waiting := "litmus", r.PendingLitmus
+		if r.PendingCleave > r.PendingLitmus {
+			stage, waiting = "cleave", r.PendingCleave
+		}
+		// Frozen: nothing new has arrived in a week either, so this is not a
+		// feed that is merely busy.
+		note := ""
+		if !r.NewestPending.IsZero() && time.Since(r.NewestPending) > 7*24*time.Hour {
+			note = `<span class="queue-note">stalled</span>`
+		}
 		fmt.Fprintf(buf,
-			`<tr><td>%s</td><td>%s</td><td class="hi">%s</td><td class="hi">%s</td><td>%s</td><td>%s</td><td>%s</td></tr>`,
-			htmlEscape(dashIfEmpty(r.Source)),
+			`<tr><td>%s</td><td>%s</td><td>%s</td><td class="hi">%s</td><td class="hi">%s</td><td>%s</td><td>%s</td></tr>`,
 			htmlEscape(dashIfEmpty(r.Feed)),
 			htmlEscape(dashIfEmpty(r.Ecosystem)),
-			fmtN(r.PendingCleave),
-			fmtN(r.PendingLitmus),
+			htmlEscape(stage),
+			fmtN(waiting),
 			htmlEscape(ageValue(r.OldestPending)),
-			htmlEscape(ageValue(r.NewestPending)))
+			htmlEscape(ageValue(r.NewestPending)),
+			note)
 	}
 	buf.WriteString(`</tbody></table></section>`)
 }
@@ -1415,6 +1651,126 @@ func writeQueueGraphs(buf *strings.Builder, points []queuePoint, cacheReady bool
 	writeMiniGraph(buf, "Rescan", fmtN(last.Rescan), rescan, "#fbbf24")
 	writeMiniGraph(buf, "Completed / "+shortDuration(step), fmtN(int64(completed[len(completed)-1])), completed, "#34d399")
 	buf.WriteString(`</div></section>`)
+}
+
+// flowSeries is the per-interval arrival and completion rates derived from the
+// sampled counters, in items/sec.
+type flowSeries struct {
+	in, out []float64
+	usable  bool
+}
+
+// flowRates differentiates the cumulative counters into rates.
+//
+// Two clamps, both for the same reason -- a counter that goes backwards is a
+// restart, not negative work. Added is max(samples.id) and never regresses, but
+// Completed is the in-memory session counter, which resets to its DB baseline on
+// every restart and would otherwise draw a cliff. A negative difference is
+// dropped rather than plotted.
+//
+// Points carrying Added == 0 predate the column (see queuePoint) and are skipped
+// on the arrivals side: plotting them would read as "ingest stopped" for exactly
+// as long as the old cache rows survive retention.
+func flowRates(points []queuePoint) flowSeries {
+	var f flowSeries
+	for i := 1; i < len(points); i++ {
+		prev, cur := points[i-1], points[i]
+		dt := cur.T.Sub(prev.T).Seconds()
+		if dt <= 0 || prev.Added == 0 || cur.Added == 0 {
+			continue
+		}
+		f.in = append(f.in, max(float64(cur.Added-prev.Added), 0)/dt)
+		f.out = append(f.out, max(float64(cur.Completed-prev.Completed), 0)/dt)
+	}
+	f.usable = len(f.in) >= 2
+	return f
+}
+
+// writeFlowGraph answers the one question a queue dashboard exists to answer:
+// is work arriving faster than it is finishing?
+//
+// It plots NET rate (out - in) against a zero baseline rather than two lines on
+// a shared axis. Two lines make the reader do the subtraction, and at these
+// magnitudes -- arrivals and completions are usually within a few percent of
+// each other -- the gap that decides the answer is thinner than the strokes.
+// Against zero, the sign IS the answer: above the line the backlog is shrinking,
+// below it the backlog is growing.
+func writeFlowGraph(buf *strings.Builder, points []queuePoint, cacheReady bool) {
+	f := flowRates(points)
+	buf.WriteString(`<section><div class="label">Flow &middot; ingest vs processing</div>`)
+	if !f.usable {
+		buf.WriteString(`<div class="graph-note">`)
+		if cacheReady {
+			buf.WriteString(`collecting&hellip; the flow graph needs two samples (about 10 minutes)`)
+		} else {
+			buf.WriteString(`metrics cache unavailable &mdash; set HOPPER_METRICS_DB to a writable path`)
+		}
+		buf.WriteString(`</div></section>`)
+		return
+	}
+
+	netRate := make([]float64, len(f.in))
+	var sumIn, sumOut float64
+	for i := range f.in {
+		netRate[i] = f.out[i] - f.in[i]
+		sumIn += f.in[i]
+		sumOut += f.out[i]
+	}
+	n := float64(len(f.in))
+	avgIn, avgOut := sumIn/n, sumOut/n
+	avgNet := avgOut - avgIn
+
+	// Headline first, chart second: the sentence is the finding, the chart is
+	// the evidence for it.
+	verdict, cls := "keeping up", "flow-good"
+	if avgNet < 0 {
+		verdict, cls = "falling behind", "flow-bad"
+	}
+	fmt.Fprintf(buf,
+		`<div class="flow-head"><span class="%s">%s</span>`+
+			`<span class="flow-detail">in <em>%.1f/s</em> &middot; out <em>%.1f/s</em> &middot; net <em>%+.1f/s</em></span></div>`,
+		cls, verdict, avgIn, avgOut, avgNet)
+
+	const w, h = 1100, 150
+	scale := 1.0
+	for _, v := range netRate {
+		if a := math.Abs(v); a > scale {
+			scale = a
+		}
+	}
+	zeroY := float64(h) / 2
+	xOf := func(i int) float64 { return float64(i) * float64(w) / float64(len(netRate)-1) }
+	yOf := func(v float64) float64 { return zeroY - (v/scale)*(zeroY-8) }
+
+	var area, line strings.Builder
+	fmt.Fprintf(&area, "%.1f,%.1f", xOf(0), zeroY)
+	for i, v := range netRate {
+		if i > 0 {
+			line.WriteByte(' ')
+		}
+		fmt.Fprintf(&line, "%.1f,%.1f", xOf(i), yOf(v))
+		fmt.Fprintf(&area, " %.1f,%.1f", xOf(i), yOf(v))
+	}
+	fmt.Fprintf(&area, " %.1f,%.1f", xOf(len(netRate)-1), zeroY)
+
+	fmt.Fprintf(buf, `<svg viewBox="0 0 %d %d" preserveAspectRatio="none" `+
+		`style="display:block;width:100%%;height:150px;overflow:visible">`, w, h)
+	// Split the same area at the zero line so the sign reads as colour without
+	// the reader consulting the axis.
+	fmt.Fprintf(buf, `<defs><clipPath id="flowUp"><rect x="0" y="0" width="%d" height="%.1f"/></clipPath>`+
+		`<clipPath id="flowDown"><rect x="0" y="%.1f" width="%d" height="%.1f"/></clipPath></defs>`,
+		w, zeroY, zeroY, w, float64(h)-zeroY)
+	fmt.Fprintf(buf, `<polygon points="%s" fill="#34d399" fill-opacity="0.16" clip-path="url(#flowUp)"/>`, area.String())
+	fmt.Fprintf(buf, `<polygon points="%s" fill="#f87171" fill-opacity="0.16" clip-path="url(#flowDown)"/>`, area.String())
+	fmt.Fprintf(buf, `<polyline points="%s" fill="none" stroke="#818cf8" stroke-width="1.5" stroke-linejoin="round"/>`, line.String())
+	fmt.Fprintf(buf, `<line x1="0" y1="%.1f" x2="%d" y2="%.1f" stroke="#4e5a72" stroke-width="1"/>`, zeroY, w, zeroY)
+	fmt.Fprintf(buf, `<text x="4" y="%.1f" fill="#4e5a72" font-size="10" font-family="monospace" dy="-4">draining</text>`, zeroY)
+	fmt.Fprintf(buf, `<text x="4" y="%.1f" fill="#4e5a72" font-size="10" font-family="monospace" dy="12">growing</text>`, zeroY)
+	buf.WriteString(`</svg>`)
+	buf.WriteString(`<div class="graph-legend">` +
+		`<span class="legend-item"><span class="legend-swatch" style="background:#34d399"></span>finishing faster than arriving</span>` +
+		`<span class="legend-item"><span class="legend-swatch" style="background:#f87171"></span>arriving faster than finishing</span>` +
+		`</div></section>`)
 }
 
 // writeMiniGraph renders one labelled area+line sparkline scaled to its own

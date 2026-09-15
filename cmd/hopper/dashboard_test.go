@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/atomdrift-project/hopper"
 )
 
 func TestFormatETA(t *testing.T) {
@@ -135,5 +137,76 @@ func TestQueueETAClampsInsteadOfOverflowing(t *testing.T) {
 	}
 	if want := formatETA(etaMax); eta != want {
 		t.Errorf("eta = %q, want it clamped to %q", eta, want)
+	}
+}
+
+// TestFlowRatesSurvivesRestartsAndOldCaches covers the two ways the cumulative
+// counters lie. Completed is an in-memory session counter that resets to its DB
+// baseline on restart, and rows written before the `added` column carry zero;
+// plotting either raw draws a cliff that reads as "ingest stopped".
+func TestFlowRatesSurvivesRestartsAndOldCaches(t *testing.T) {
+	base := time.Now().Add(-time.Hour)
+	at := func(i int) time.Time { return base.Add(time.Duration(i) * 5 * time.Minute) }
+
+	// Two legacy rows (added=0), then a restart that drops Completed.
+	pts := []queuePoint{
+		{T: at(0), Added: 0, Completed: 900},
+		{T: at(1), Added: 0, Completed: 1000},
+		{T: at(2), Added: 5000, Completed: 1100},
+		{T: at(3), Added: 5300, Completed: 40}, // restart: counter reset
+		{T: at(4), Added: 5600, Completed: 340},
+		{T: at(5), Added: 5900, Completed: 640},
+	}
+	f := flowRates(pts)
+	if !f.usable {
+		t.Fatal("usable = false with three real intervals")
+	}
+	if len(f.in) != 3 {
+		t.Fatalf("len(in) = %d, want 3; legacy added=0 rows must be skipped", len(f.in))
+	}
+	for i, v := range f.out {
+		if v < 0 {
+			t.Errorf("out[%d] = %v: a counter reset must clamp to zero, not plot negative work", i, v)
+		}
+	}
+	for i, v := range f.in {
+		if v <= 0 {
+			t.Errorf("in[%d] = %v, want a positive arrival rate", i, v)
+		}
+	}
+}
+
+// TestSystemStatusPromotesTheWorstProblem pins the triage rule. A dashboard that
+// reports five problems at equal weight has not triaged anything, so the
+// headline carries the most actionable one and the rest trail as facts.
+func TestSystemStatusPromotesTheWorstProblem(t *testing.T) {
+	stale := hopper.WorkflowHealth{
+		LatestAdded:    time.Now().Add(-3 * time.Hour),
+		LatestAnalyzed: time.Now().Add(-2 * time.Second),
+	}
+	backlogs := []hopper.WorkflowBacklog{
+		{OldestPending: time.Now().Add(-71 * 24 * time.Hour), NewestPending: time.Now().Add(-33 * 24 * time.Hour)},
+	}
+	var buf strings.Builder
+	writeSystemStatus(&buf, &statusInputs{health: stale, backlogs: backlogs, pendingLitmus: 169196})
+	out := buf.String()
+	if !strings.Contains(out, "No sample ingested in") {
+		t.Errorf("a stalled ingest must be the headline, got %q", out)
+	}
+	if !strings.Contains(out, "status-bad") {
+		t.Errorf("a stalled ingest must render red, got %q", out)
+	}
+	// The unpromoted backlog still gets said, quietly.
+	if !strings.Contains(out, "litmus-blocked") {
+		t.Errorf("secondary issues must still appear in the facts line, got %q", out)
+	}
+
+	// All clear.
+	var ok strings.Builder
+	writeSystemStatus(&ok, &statusInputs{health: hopper.WorkflowHealth{
+		LatestAdded: time.Now().Add(-10 * time.Second), LatestAnalyzed: time.Now().Add(-5 * time.Second),
+	}})
+	if !strings.Contains(ok.String(), "Pipeline healthy") || !strings.Contains(ok.String(), "status-ok") {
+		t.Errorf("a healthy pipeline must say so plainly, got %q", ok.String())
 	}
 }
