@@ -323,9 +323,6 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 	if hasTraitsVersion == 0 {
 		for _, ddl := range []string{
 			`ALTER TABLE samples ADD COLUMN traits_version TEXT NOT NULL DEFAULT ''`,
-			`CREATE INDEX IF NOT EXISTS idx_samples_stale_traits ` +
-				`ON samples(traits_version, analyzed_at) ` +
-				`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = ''`,
 		} {
 			if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
 				return fmt.Errorf("hopper: migrate sqlite: %w", err)

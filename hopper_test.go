@@ -1730,8 +1730,9 @@ func TestIndexRewriteHelpers(t *testing.T) {
 	}
 	// The guard rewrites whatever partials still carry a pre-path <> ''
 	// predicate. Three left the list when good-stale/new-stale/new-interesting
-	// were retired with their queues, so the bound tracks the survivors rather
-	// than a fixed count that a retirement would break again.
+	// were retired with their queues, and idx_samples_stale_traits left when it
+	// was dropped (2026-09-15); idx_samples_missing_llm joined. The bound tracks
+	// the survivors rather than a fixed count that every retirement breaks.
 	names := indexNamesInDDL(pathDDL)
 	if len(names) < 6 {
 		t.Fatalf("path rewrite indexes = %v", names)

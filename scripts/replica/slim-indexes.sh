@@ -207,7 +207,6 @@ idx_samples_review_interesting
 idx_samples_review_newest
 idx_samples_source_ecosystem
 idx_samples_source_feed
-idx_samples_stale_traits
 idx_samples_status
 idx_samples_top_created
 idx_samples_top_ready_first_analyzed_coalesce

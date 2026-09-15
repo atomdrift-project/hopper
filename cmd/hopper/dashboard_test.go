@@ -1,6 +1,7 @@
 package main
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -55,7 +56,7 @@ func TestQueueETAUsesObservedSlope(t *testing.T) {
 	if !measured {
 		t.Error("measured = false with a full window of samples")
 	}
-	if want := formatETA(time.Duration(float64(6000)/drain) * time.Second); eta != want {
+	if want := coarsenETA(time.Duration(float64(6000) / drain * float64(time.Second))); eta != want {
 		t.Errorf("eta = %q, want %q", eta, want)
 	}
 
@@ -110,7 +111,7 @@ func TestQueueETAClampsInsteadOfOverflowing(t *testing.T) {
 	if strings.HasPrefix(eta, "-") {
 		t.Errorf("eta = %q: negative duration, the int64 overflow is back", eta)
 	}
-	if want := formatETA(etaMax); eta != want {
+	if want := coarsenETA(etaMax); eta != want {
 		t.Errorf("eta = %q, want it clamped to %q", eta, want)
 	}
 
@@ -135,7 +136,7 @@ func TestQueueETAClampsInsteadOfOverflowing(t *testing.T) {
 	if strings.HasPrefix(eta, "-") {
 		t.Fatalf("eta = %q: negative duration, the int64 overflow is back", eta)
 	}
-	if want := formatETA(etaMax); eta != want {
+	if want := coarsenETA(etaMax); eta != want {
 		t.Errorf("eta = %q, want it clamped to %q", eta, want)
 	}
 }
@@ -285,5 +286,72 @@ func TestClaimLadderFlagsStarvation(t *testing.T) {
 	}
 	if !strings.Contains(out, "ladder-bar") {
 		t.Errorf("an active tier must render a share bar:\n%s", out)
+	}
+}
+
+// TestFlowVerdictIgnoresWalkBursts is the cry-wolf guard. On 2026-09-15 the live
+// dashboard read "Falling behind by 773.1/s" in red while a walk re-inserted a
+// million rows — a routine, bounded, entirely expected operation. A verdict that
+// goes critical during normal work teaches its reader to ignore it.
+func TestFlowVerdictIgnoresWalkBursts(t *testing.T) {
+	steady := make([]float64, 24)
+	for i := range steady {
+		steady[i] = 2 // draining calmly
+	}
+	// A walk lands in the middle: three intervals of heavy insertion.
+	burst := slices.Clone(steady)
+	burst[10], burst[11], burst[12] = -800, -900, -750
+
+	if losing, _ := flowVerdict(flowSeries{net: burst, usable: true}); losing {
+		t.Error("a short burst inside a draining window must not read as losing ground")
+	}
+	// The mean is dragged negative by the burst; the median is not. That
+	// difference is the entire point of using one over the other.
+	if mean(burst) >= 0 {
+		t.Fatalf("premise: mean(burst) = %v, expected the burst to drag it negative", mean(burst))
+	}
+	if med := medianOf(burst); med <= 0 {
+		t.Errorf("medianOf(burst) = %v, want it to survive the burst", med)
+	}
+
+	// Sustained growth IS losing ground, and must still be reported -- but the
+	// RATE it reports has to be representative. Here the backlog grows steadily
+	// at 5/s with two extreme spikes; persistence correctly says "losing", and
+	// the median is what keeps the headline from claiming 200/s on the strength
+	// of two samples. This is the case the median exists for: the persistence
+	// test alone cannot tell a typical rate from an outlier-dragged one.
+	sustained := make([]float64, 24)
+	for i := range sustained {
+		sustained[i] = -5
+	}
+	sustained[3], sustained[17] = -2400, -2600
+	losing, netRate := flowVerdict(flowSeries{net: sustained, usable: true})
+	if !losing {
+		t.Error("a persistently growing backlog must read as losing ground")
+	}
+	if netRate >= 0 {
+		t.Errorf("netRate = %v, want negative", netRate)
+	}
+	if netRate < -20 {
+		t.Errorf("netRate = %v: two spikes are dictating the headline; "+
+			"a typical interval was -5/s", netRate)
+	}
+
+	// A bare majority of negative intervals is not enough on its own.
+	mixed := make([]float64, 20)
+	for i := range mixed {
+		if i%2 == 0 {
+			mixed[i] = -3
+		} else {
+			mixed[i] = 3
+		}
+	}
+	if losing, _ := flowVerdict(flowSeries{net: mixed, usable: true}); losing {
+		t.Error("an evenly split window must not read as losing ground")
+	}
+
+	// No data is not good news.
+	if losing, _ := flowVerdict(flowSeries{}); losing {
+		t.Error("an unusable series must not assert a verdict")
 	}
 }

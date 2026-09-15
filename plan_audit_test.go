@@ -123,10 +123,16 @@ func TestPlanAuditSamplesHotPaths(t *testing.T) {
 		t.Fatalf("calibration failed: OR form no longer seq-scans samples (planner changed?):\n%s", badPlan)
 	}
 
+	// args is `any` rather than []string because these statements do not all
+	// bind the same shape: the batch forms take an array for `= ANY($1)`, the
+	// single-subject trigger forms take a scalar for `sha256 = $1`. A []string
+	// has no text encoding for a scalar bind, so the EXPLAIN failed before it
+	// ever produced a plan -- the audit was not checking those two statements at
+	// all.
 	for _, tc := range []struct {
+		args any
 		name string
 		sql  string
-		args []string
 	}{
 		{
 			name: "mark_corroborated_by_sha",
@@ -152,14 +158,16 @@ func TestPlanAuditSamplesHotPaths(t *testing.T) {
 			sql: `EXPLAIN ` + strings.NewReplacer(
 				"SET corroborated = true", "SET corroborated = corroborated",
 				"NEW.subject", "$1").Replace(markCorroboratedOneSHASQL),
-			args: shas[:1],
+			// Scalar bind (sha256 = $1), not = ANY($1): a one-element slice has
+			// no text encoding and the EXPLAIN fails before it reaches a plan.
+			args: shas[0],
 		},
 		{
 			name: "mark_corroborated_one_purl",
 			sql: `EXPLAIN ` + strings.NewReplacer(
 				"SET corroborated = true", "SET corroborated = corroborated",
 				"NEW.subject", "$1").Replace(markCorroboratedOnePURLSQL),
-			args: purls[:1],
+			args: purls[0],
 		},
 	} {
 		plan := explainText(t, ctx, db, tc.sql, tc.args)

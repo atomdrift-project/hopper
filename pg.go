@@ -820,8 +820,8 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 				'idx_samples_good_repair_newest',
 				'idx_samples_unknown_newest',
 				'idx_samples_bad_miss_stale',
-				'idx_samples_stale_traits',
-				'idx_samples_rescan_age'
+				'idx_samples_rescan_age',
+				'idx_samples_missing_llm'
 			]
 			LOOP
 				SELECT pg_get_indexdef(to_regclass(idx)) INTO def;
@@ -1178,14 +1178,24 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// attempts would take a write on the hot claim path for every bump.
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS skipped_at TIMESTAMPTZ`,
-		// Covers FP/FN seed queries (falsePositivesPG, falseNegativesPG, light
-		// variants, seedCandidatesInPathsPG) ordered by impact. The detection
-		// filter (max_crit / suspicious_count) and cyclotron_attempted_at
-		// cooldown apply as residual predicates after the indexed scan.
-		// Covers SamplesInPipelineStage drain (impact-ordered mid-pipeline pull).
-		`CREATE INDEX IF NOT EXISTS idx_samples_stale_traits ` +
-			`ON samples(traits_version, analyzed_at) ` +
-			`WHERE cleave_result IS NOT NULL AND skip = '' AND parent = '' AND path <> ''`,
+		// idx_samples_stale_traits is GONE. It was 991 MB keyed on
+		// (traits_version, analyzed_at), and by 2026-09-15 nothing read it:
+		//
+		//   - Its own tier was rewritten onto analyzed_at alone, so the rescan
+		//     path stopped using it (see rescanAgeCandidatesPG).
+		//   - The comment here claimed it covered the FP/FN seed queries and the
+		//     SamplesInPipelineStage drain. It did not, and could not:
+		//     falsePositivesPG never mentions traits_version (EXPLAIN on
+		//     production picks idx_samples_label + idx_samples_class_top_created)
+		//     and samplesInPipelineStagePG filters on status alone. The comment
+		//     had drifted from some earlier index.
+		//   - pg_stat_user_indexes showed idx_scan = 1 against LIFETIME counters
+		//     (pg_stat_database.stats_reset is NULL on this cluster).
+		//
+		// All three together, not the scan count alone: a zero idx_scan is not
+		// proof an index is dead, which is why the two claimed consumers were
+		// EXPLAINed before this was removed.
+		`DROP INDEX IF EXISTS idx_samples_stale_traits`,
 		// Tier 3's age-ordered rescan queue (rescanAgeCandidatesSQL) walks this in
 		// index order and stops at LIMIT. Keyed on analyzed_at alone because that
 		// is the tier's entire ORDER BY, and the partial predicate is character-for

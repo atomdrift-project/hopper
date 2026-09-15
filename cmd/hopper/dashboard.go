@@ -334,13 +334,16 @@ body{font-family:var(--sans);background:var(--bg);color:var(--text);
 .progress-detail em{font-style:normal;color:var(--text)}
 .track{height:4px;background:var(--border);border-radius:2px;overflow:hidden;display:flex}
 .fill{height:100%;border-radius:2px;transition:width .5s ease;flex-shrink:0}
-.queue-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:.75rem;margin-top:1rem}
+.queue-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:.75rem;margin-top:.4rem}
+.card-group-label{font-size:.62rem;font-weight:700;letter-spacing:.11em;text-transform:uppercase;
+  color:var(--dim);margin-top:1.1rem}
 .queue-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:.8rem .9rem}
 .queue-label{font-size:.62rem;font-weight:700;letter-spacing:.11em;text-transform:uppercase;color:var(--sub);margin-bottom:.35rem}
 .queue-value{font-family:var(--mono);font-size:1.05rem;color:var(--text);font-weight:600;line-height:1.25}
 .queue-meta{font-family:var(--mono);font-size:.76rem;color:var(--sub);margin-top:.35rem}
 .queue-meta em{font-style:normal;color:var(--text)}
 .queue-note{color:var(--amber)}
+.queue-bad{color:var(--red)}
 .health-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.75rem}
 .metric-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:.75rem .85rem}
 .metric-label{font-size:.62rem;font-weight:700;letter-spacing:.11em;text-transform:uppercase;color:var(--sub);margin-bottom:.3rem}
@@ -409,6 +412,7 @@ td.warn{color:var(--amber)}
 .flow-head{display:flex;align-items:baseline;gap:.75rem;padding-bottom:.6rem;flex-wrap:wrap}
 .flow-good{font-size:1.05rem;font-weight:600;color:var(--green)}
 .flow-bad{font-size:1.05rem;font-weight:600;color:var(--red)}
+.flow-warn{font-size:1.05rem;font-weight:600;color:var(--amber)}
 .flow-detail{font-family:var(--mono);font-size:.78rem;color:var(--sub)}
 .flow-detail em{font-style:normal;color:var(--text)}
 
@@ -552,11 +556,17 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	// later never reaches it. Gating the whole card on the snapshot is what let
 	// this render "0 pending / stale traits disabled" over a 123,921-row repair
 	// backlog that was in fact being handed out.
+	// depthsOK is load-bearing, not decoration. A failed count leaves the struct
+	// zero-valued, and a zero rescan queue renders as "caught up" -- the one
+	// reading that would stop an operator investigating. An unavailable number
+	// must look unavailable, not healthy.
 	var depths hopper.RescanDepths
+	depthsOK := db == nil
 	if db != nil {
 		ra := wd.rescanAge
-		//nolint:contextcheck,errcheck // closure creates its own context; closure logs errors before returning
-		depths, _ = wd.rescanCache.Fetch("rescan", func() (hopper.RescanDepths, error) {
+		var err error
+		//nolint:contextcheck // closure creates its own context; closure logs errors before returning
+		depths, err = wd.rescanCache.Fetch("rescan", func() (hopper.RescanDepths, error) {
 			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
 			defer cancel()
 			d, err := db.RescanDepths(qctx, ra)
@@ -565,6 +575,9 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 			}
 			return d, err
 		})
+		// Fetch serves the last good value on error; only a cache that has never
+		// succeeded is genuinely unknown.
+		depthsOK = err == nil || depths.Total() > 0
 	}
 	rescanPending := depths.Total()
 
@@ -686,7 +699,9 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		})
 	}
 
+	walking := !progress.walkDone.Load() || inPipeline > 0
 	writeSystemStatus(&buf, &statusInputs{
+		walking:       walking,
 		health:        workflow.health,
 		flow:          flowRates(queuePoints),
 		pendingLitmus: pendingLitmus,
@@ -698,7 +713,11 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	buf.WriteString(`<div class="hdr">`)
 	buf.WriteString(`<div class="hdr-top">`)
 	buf.WriteString(`<span class="hdr-title">Hopper</span>`)
-	fmt.Fprintf(&buf, `<span class="hdr-time">%s</span>`, elapsed)
+	// Rendered-at alongside uptime: this page auto-refreshes, and a tab left
+	// open on a dead process looks exactly like a live one. The clock is the
+	// only thing that distinguishes them.
+	fmt.Fprintf(&buf, `<span class="hdr-time">up %s &middot; rendered %s</span>`,
+		htmlEscape(shortDuration(elapsed)), htmlEscape(time.Now().Format("15:04:05 MST")))
 	buf.WriteString(`</div>`)
 
 	// Initial-analysis progress — kept separate from rescan work, which is a
@@ -712,10 +731,9 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	if pending > 0 {
 		fmt.Fprintf(&buf, ` &middot; <em>%s</em> awaiting cleave`, fmtN(pending))
 	}
-	// Rates live in the Throughput tile; the progress line stays about progress.
-	if initialETA != "" {
-		fmt.Fprintf(&buf, ` &middot; initial ETA <em>%s</em>`, initialETA)
-	}
+	// The ETA lives on the Cleave card, which is the thing it describes. It was
+	// printed in both places, which reads as two independent estimates that
+	// happen to agree.
 	buf.WriteString(`</span>`)
 	buf.WriteString(`</div>`)
 
@@ -727,7 +745,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		pct)
 	buf.WriteString(`</div>`) // .progress
 
-	buf.WriteString(`<div class="queue-grid">`)
+	buf.WriteString(`<div class="card-group-label">Backlogs</div><div class="queue-grid">`)
 	// TWO cards, not one. They were summed under "Initial queue", which put
 	// "169,458 pending" three inches below a bar reading "100% initial
 	// analysis" -- 646x apart, both labelled initial, on the same screen. They
@@ -737,7 +755,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	writeQueueCard(&buf, "Cleave queue", fmt.Sprintf("%s pending", fmtN(pending)), func() string {
 		var parts []string
 		if topLevelRate > 0.001 {
-			parts = append(parts, fmt.Sprintf("<em>%.2f</em>/s", topLevelRate))
+			parts = append(parts, fmt.Sprintf("<em>%s</em>/s", fmtRate(topLevelRate)))
 		}
 		if initialETA != "" {
 			// Explicitly the cleave half's ETA: it is the slope of the no-cleave
@@ -751,7 +769,16 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		return strings.Join(parts, " &middot; ")
 	}())
 	writeQueueCard(&buf, "Litmus queue", fmt.Sprintf("%s pending", fmtN(pendingLitmus)), litmusMeta(pendingLitmus, workflow.backlogs))
-	writeQueueCard(&buf, "Rescan queue", fmt.Sprintf("%s pending", fmtN(rescanPending)), rescanMeta(depths, rescanETA, rescanDrain, rescanMeasured))
+	rescanValue := fmt.Sprintf("%s pending", fmtN(rescanPending))
+	if !depthsOK {
+		rescanValue = "unknown"
+	}
+	writeQueueCard(&buf, "Rescan queue", rescanValue, rescanMeta(depths, rescanETA, rescanDrain, rescanMeasured, depthsOK))
+
+	// Activity, not backlog. A rate and a walk's progress answer "what is
+	// happening now"; the three cards above answer "what is waiting". Rendering
+	// all five as one undifferentiated row invited reading a rate as a queue.
+	buf.WriteString(`</div><div class="card-group-label">Activity</div><div class="queue-grid">`)
 
 	// Throughput tile: the rescan rate gets its own labeled home rather than
 	// hiding on the rescan card's ETA line. The headline is top-level items/s
@@ -761,11 +788,11 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	// analyzed_at, which is true of every rescan tier — not just stale-traits.
 	// Gating its display on a traits version hid the repair tier's throughput
 	// for the same reason the card hid its depth.
-	throughputMeta := fmt.Sprintf("<em>%.0f</em> files/s", rate)
+	throughputMeta := fmt.Sprintf("<em>%s</em> files/s", fmtRate(rate))
 	if rescanRate > 0 || depths.Total() > 0 {
-		throughputMeta += fmt.Sprintf(" &middot; <em>%.2f</em> rescan/s", rescanRate)
+		throughputMeta += fmt.Sprintf(" &middot; <em>%s</em> rescan/s", fmtRate(rescanRate))
 	}
-	writeQueueCard(&buf, "Throughput", fmt.Sprintf("%.2f items/s", topLevelRate), throughputMeta)
+	writeQueueCard(&buf, "Throughput", fmtRate(topLevelRate)+" items/s", throughputMeta)
 
 	ingestMeta := fmt.Sprintf("<em>%s</em> known &middot; <em>%s</em> inserted", fmtN(progress.cacheHits.Load()), fmtN(inserted))
 	if !progress.walkDone.Load() || inPipeline > 0 {
@@ -775,9 +802,6 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	buf.WriteString(`</div>`)
 	buf.WriteString(`</div>`) // .hdr
 
-	if workflow.hasHealth {
-		writeWorkflowHealth(&buf, workflow.health)
-	}
 	// Trend before detail: the graphs answer "which way is this going", which is
 	// the question a reader has immediately after the queue counts. The sample
 	// tables below are lookup tools -- useful when you already know what you are
@@ -1216,7 +1240,7 @@ func (wd *webDashboard) workflowHealth(ctx context.Context) (hopper.WorkflowHeal
 // ladder entirely when it cannot read a traits version from its analyzer, and
 // rendering that as "caught up" (or as a bare 0) is what hid a switched-off
 // tier for the whole of a 24h uptime.
-func rescanMeta(d hopper.RescanDepths, eta string, drain float64, measured bool) string {
+func rescanMeta(d hopper.RescanDepths, eta string, drain float64, measured, known bool) string {
 	var parts []string
 	if d.Forced > 0 {
 		parts = append(parts, fmt.Sprintf("<em>%s</em> forced", fmtN(d.Forced)))
@@ -1231,6 +1255,9 @@ func rescanMeta(d hopper.RescanDepths, eta string, drain float64, measured bool)
 		parts = append(parts, fmt.Sprintf("<em>%s</em> undescribed", fmtN(d.MissingLLM)))
 	}
 	switch {
+	case !known:
+		// Never say "caught up" on a number we do not have.
+		return `<span class="queue-bad">depth unavailable &mdash; the count is failing</span>`
 	case d.Total() == 0:
 		parts = append(parts, "caught up")
 	case eta != "":
@@ -1253,6 +1280,21 @@ func rescanMeta(d hopper.RescanDepths, eta string, drain float64, measured bool)
 	return strings.Join(parts, " &middot; ")
 }
 
+// timeTitle renders an absolute timestamp for a hover title, so a relative age
+// on the page can be checked against a log line.
+func timeTitle(t time.Time) string {
+	if t.IsZero() {
+		return "no data"
+	}
+	return t.Format("2006-01-02 15:04:05 MST")
+}
+
+func writeQueueCard(buf *strings.Builder, label, value, meta string) {
+	fmt.Fprintf(buf,
+		`<div class="queue-card"><div class="queue-label">%s</div><div class="queue-value">%s</div><div class="queue-meta">%s</div></div>`,
+		htmlEscape(label), htmlEscape(value), meta)
+}
+
 // statusInputs is everything the top-line verdict reads. Grouped into a struct
 // so the call site stays one statement rather than a tail of positional
 // arguments nobody can read.
@@ -1262,6 +1304,10 @@ type statusInputs struct {
 	flow          flowSeries
 	rescan        hopper.RescanDepths
 	pendingLitmus int64
+	// walking marks a walk in progress, which inserts in bulk and legitimately
+	// outruns processing for its duration. It downgrades the flow verdict from
+	// critical to a warning and names the cause.
+	walking bool
 }
 
 // oldestBacklog returns the age of the oldest pending row across the backlog
@@ -1327,15 +1373,14 @@ func writeSystemStatus(buf *strings.Builder, in *statusInputs) {
 	}
 	// Then direction: arriving faster than finishing is what turns every backlog
 	// below into a permanent one.
-	if in.flow.usable {
-		var sumIn, sumOut float64
-		for i := range in.flow.in {
-			sumIn += in.flow.in[i]
-			sumOut += in.flow.out[i]
+	if losing, netRate := flowVerdict(in.flow); losing {
+		text := fmt.Sprintf("Losing ground: backlog growing %s/s", fmtRate(-netRate))
+		if in.walking {
+			// A walk inserts in bulk, so say what is doing it rather than
+			// leaving the reader to discover the cause themselves.
+			text += " (walk in progress)"
 		}
-		if avgNet := (sumOut - sumIn) / float64(len(in.flow.in)); avgNet < 0 {
-			issues = append(issues, issue{fmt.Sprintf("Falling behind by %.1f/s", -avgNet), true})
-		}
+		issues = append(issues, issue{text, !in.walking})
 	}
 	// Then standing backlogs, described by age.
 	if age, ok := oldestBacklog(in.backlogs); ok && age > 7*24*time.Hour {
@@ -1361,6 +1406,11 @@ func writeSystemStatus(buf *strings.Builder, in *statusInputs) {
 	}
 	if !in.health.LatestAnalyzed.IsZero() {
 		facts = append(facts, "analysis "+shortDuration(time.Since(in.health.LatestAnalyzed))+" ago")
+	}
+	if !in.health.LatestReady.IsZero() {
+		// The one fact the Workflow Health grid carried that nothing else did:
+		// how far prism's view trails ingestion.
+		facts = append(facts, "prism "+shortDuration(time.Since(in.health.LatestReady))+" behind")
 	}
 	if in.rescan.Total() > 0 {
 		facts = append(facts, fmtN(in.rescan.Total())+" queued for re-analysis")
@@ -1521,7 +1571,7 @@ func writeClaimLadder(buf *strings.Builder, activity, depths map[string]int64, p
 		claimsCell, rateCell := "&mdash;", "&mdash;"
 		if claims > 0 {
 			claimsCell = fmtN(claims)
-			rateCell = fmt.Sprintf("%.2f/s", rate)
+			rateCell = fmtRate(rate) + "/s"
 		}
 
 		// Width and opacity both track share: a faint sliver and a solid bar are
@@ -1547,29 +1597,6 @@ func writeClaimLadder(buf *strings.Builder, activity, depths map[string]int64, p
 			sparkline(series, "#818cf8"), trendArrow(series))
 	}
 	buf.WriteString(`</tbody></table></section>`)
-}
-
-func writeQueueCard(buf *strings.Builder, label, value, meta string) {
-	fmt.Fprintf(buf,
-		`<div class="queue-card"><div class="queue-label">%s</div><div class="queue-value">%s</div><div class="queue-meta">%s</div></div>`,
-		htmlEscape(label), htmlEscape(value), meta)
-}
-
-func writeWorkflowHealth(buf *strings.Builder, h hopper.WorkflowHealth) {
-	buf.WriteString(`<section><div class="label">Workflow Health</div><div class="health-grid">`)
-	writeMetricCard(buf, "Latest added", ageValue(h.LatestAdded), timeTitle(h.LatestAdded))
-	writeMetricCard(buf, "Latest analyzed", ageValue(h.LatestAnalyzed), timeTitle(h.LatestAnalyzed))
-	writeMetricCard(buf, "Prism ready", ageValue(h.LatestReady), readyLag(h.LatestAdded, h.LatestReady))
-	writeMetricCard(buf, "Workflow queues",
-		fmt.Sprintf("%s / %s", fmtN(h.PendingCleave), fmtN(h.PendingLitmus)),
-		"cleave pending / litmus pending")
-	buf.WriteString(`</div></section>`)
-}
-
-func writeMetricCard(buf *strings.Builder, label, value, sub string) {
-	fmt.Fprintf(buf,
-		`<div class="metric-card"><div class="metric-label">%s</div><div class="metric-value">%s</div><div class="metric-sub">%s</div></div>`,
-		htmlEscape(label), htmlEscape(value), htmlEscape(sub))
 }
 
 // writeWorkflowBacklogs renders the standing backlogs ordered by AGE.
@@ -1623,13 +1650,14 @@ func writeWorkflowBacklogs(buf *strings.Builder, rows []hopper.WorkflowBacklog) 
 			note = `<span class="queue-note">stalled</span>`
 		}
 		fmt.Fprintf(buf,
-			`<tr><td>%s</td><td>%s</td><td>%s</td><td class="hi">%s</td><td class="hi">%s</td><td>%s</td><td>%s</td></tr>`,
+			`<tr><td>%s</td><td>%s</td><td>%s</td><td class="hi">%s</td>`+
+				`<td class="hi" title="%s">%s</td><td title="%s">%s</td><td>%s</td></tr>`,
 			htmlEscape(dashIfEmpty(r.Feed)),
 			htmlEscape(dashIfEmpty(r.Ecosystem)),
 			htmlEscape(stage),
 			fmtN(waiting),
-			htmlEscape(ageValue(r.OldestPending)),
-			htmlEscape(ageValue(r.NewestPending)),
+			htmlEscape(timeTitle(r.OldestPending)), htmlEscape(ageValue(r.OldestPending)),
+			htmlEscape(timeTitle(r.NewestPending)), htmlEscape(ageValue(r.NewestPending)),
 			note)
 	}
 	buf.WriteString(`</tbody></table></section>`)
@@ -1697,23 +1725,6 @@ func ageValue(t time.Time) string {
 	return shortDuration(d) + " ago"
 }
 
-func timeTitle(t time.Time) string {
-	if t.IsZero() {
-		return "no data"
-	}
-	return t.Format("2006-01-02 15:04:05 MST")
-}
-
-func readyLag(added, ready time.Time) string {
-	if added.IsZero() || ready.IsZero() {
-		return "no data"
-	}
-	if !added.After(ready) {
-		return "caught up"
-	}
-	return "ready lag " + shortDuration(added.Sub(ready))
-}
-
 func sourceFeed(source, feed string) string {
 	if feed == "" {
 		return source
@@ -1746,14 +1757,30 @@ func shortSHA(sha string) string {
 
 func writeRecentErrors(buf *strings.Builder, progress *loadProgress) {
 	errs := progress.recentErrors()
+
+	// Rendered even when empty. A section that disappears on success looks
+	// identical to one that was never reached, and "no errors" is a thing an
+	// operator wants stated rather than inferred from absence.
+	buf.WriteString(`<section><div class="label">Errors</div>`)
 	if len(errs) == 0 {
+		buf.WriteString(`<div class="graph-note">none recorded this run</div></section>`)
 		return
 	}
-	buf.WriteString(`<section><div class="label">Recent Errors</div>`)
-	buf.WriteString(`<table><thead><tr><th>Time</th><th>Stage</th><th>Error</th></tr></thead><tbody>`)
+
+	// Age, not just wall-clock time. The live page listed errors from 08:23 under
+	// the heading "Recent" on a render at 11:17; three hours is a different
+	// situation from three minutes and the table was not saying which.
+	newest := errs[len(errs)-1].At
+	if age := time.Since(newest); age > time.Hour {
+		fmt.Fprintf(buf, `<div class="graph-note">nothing in the last %s &middot; showing the last %d</div>`,
+			htmlEscape(shortDuration(age.Round(time.Minute))), len(errs))
+	}
+	buf.WriteString(`<table><thead><tr><th>Age</th><th>Time</th><th>Stage</th><th>Error</th></tr></thead><tbody>`)
 	for _, e := range slices.Backward(errs) {
 		fmt.Fprintf(buf,
-			`<tr><td class="err-time">%s</td><td class="err-stage">%s</td><td class="err-msg">%s</td></tr>`,
+			`<tr><td class="err-time">%s</td><td class="err-time">%s</td>`+
+				`<td class="err-stage">%s</td><td class="err-msg">%s</td></tr>`,
+			htmlEscape(shortDuration(time.Since(e.At).Round(time.Second))),
 			htmlEscape(e.At.Format("15:04:05")),
 			htmlEscape(e.Stage),
 			htmlEscape(e.Message))
@@ -1867,6 +1894,52 @@ func mean(vals []float64) float64 {
 	return sum / float64(len(vals))
 }
 
+// flowLosingShare is the fraction of sampled intervals that must show the
+// backlog growing before the dashboard will call it "losing ground".
+const flowLosingShare = 0.6
+
+// medianOf returns the median of vals without disturbing the caller's slice.
+func medianOf(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	sorted := slices.Clone(vals)
+	slices.Sort(sorted)
+	mid := len(sorted) / 2
+	if len(sorted)%2 == 1 {
+		return sorted[mid]
+	}
+	return (sorted[mid-1] + sorted[mid]) / 2
+}
+
+// flowVerdict decides whether the backlog is genuinely losing ground, and by how
+// much.
+//
+// Median rather than mean, with a persistence test on top. A walk re-inserting a
+// million rows makes arrivals spike for as long as it runs, and on 2026-09-15
+// the live dashboard read "Falling behind by 773.1/s" in red during exactly such
+// a walk -- a routine, bounded, entirely expected operation. A verdict that goes
+// critical during normal work teaches its reader to ignore it, which costs more
+// than showing nothing would.
+//
+// The median discards the burst; requiring most intervals to agree stops one
+// sample from deciding the headline. Both are needed: a long enough burst drags
+// the median too, and a brief one can still sit at the midpoint of a short
+// window.
+func flowVerdict(f flowSeries) (losing bool, netRate float64) {
+	if !f.usable {
+		return false, 0
+	}
+	netRate = medianOf(f.net)
+	growing := 0
+	for _, v := range f.net {
+		if v < 0 {
+			growing++
+		}
+	}
+	return netRate < 0 && float64(growing)/float64(len(f.net)) >= flowLosingShare, netRate
+}
+
 // writeFlowGraph answers the one question a queue dashboard exists to answer:
 // are we gaining ground or losing it?
 //
@@ -1904,17 +1977,23 @@ func writeFlowGraph(buf *strings.Builder, points []queuePoint, cacheReady bool) 
 		return
 	}
 
-	avgNet := mean(f.net)
+	losing, avgNet := flowVerdict(f)
 	verdict, cls := "Gaining ground", "flow-good"
-	if avgNet < 0 {
+	switch {
+	case losing:
 		verdict, cls = "Losing ground", "flow-bad"
+	case avgNet < 0:
+		// Negative, but not persistently: a burst, not a trend. Named rather
+		// than rounded away, so a reader sees the dashboard noticed.
+		verdict, cls = "Holding, with bursts", "flow-warn"
+	default:
 	}
 	// The in/out split when the arrival watermark has accumulated; otherwise the
 	// net alone, which is the answer either way.
-	detail := fmt.Sprintf("backlog <em>%+.1f/s</em>", avgNet)
+	detail := fmt.Sprintf("backlog <em>%s/s</em>", fmtSigned(avgNet))
 	if f.hasRates {
-		detail = fmt.Sprintf("in <em>%.1f/s</em> &middot; out <em>%.1f/s</em> &middot; net <em>%+.1f/s</em>",
-			mean(f.in), mean(f.out), mean(f.out)-mean(f.in))
+		detail = fmt.Sprintf("in <em>%s/s</em> &middot; out <em>%s/s</em> &middot; net <em>%s/s</em>",
+			fmtRate(mean(f.in)), fmtRate(mean(f.out)), fmtSigned(mean(f.out)-mean(f.in)))
 	}
 	fmt.Fprintf(buf, `<div class="flow-head"><span class="%s">%s</span>`+
 		`<span class="flow-detail">%s</span></div>`, cls, htmlEscape(verdict), detail)
@@ -2046,9 +2125,9 @@ func queueETA(depth int64, points []queuePoint, at func(queuePoint) int64) (eta 
 	// Clamp in seconds, BEFORE converting to a Duration: see etaMax.
 	secs := float64(depth) / drain
 	if secs >= etaMax.Seconds() {
-		return formatETA(etaMax), drain, true
+		return coarsenETA(etaMax), drain, true
 	}
-	return formatETA(time.Duration(secs * float64(time.Second))), drain, true
+	return coarsenETA(time.Duration(secs * float64(time.Second))), drain, true
 }
 
 func formatETA(d time.Duration) string {
@@ -2082,6 +2161,51 @@ func fmtN(n int64) string {
 		out = append(out, byte(c)) //nolint:gosec // c is restricted to ASCII digits
 	}
 	return string(out)
+}
+
+// fmtRate formats a per-second rate with precision proportional to its
+// magnitude.
+//
+// The page was printing "27.61 items/s" for a number that swings by a fifth
+// between refreshes. Two decimals on a quantity that unstable is not precision,
+// it is a claim the data cannot support, and it invites a reader to compare
+// digits that are noise. Small rates keep their decimals because there the
+// digits are the signal.
+// fmtSigned is fmtRate with an explicit sign, for values whose direction is the
+// point.
+func fmtSigned(v float64) string {
+	if v >= 0 {
+		return "+" + fmtRate(v)
+	}
+	return fmtRate(v)
+}
+
+func fmtRate(v float64) string {
+	switch a := math.Abs(v); {
+	case a >= 100:
+		return fmt.Sprintf("%.0f", v)
+	case a >= 1:
+		return fmt.Sprintf("%.1f", v)
+	default:
+		return fmt.Sprintf("%.2f", v)
+	}
+}
+
+// coarsenETA rounds an ETA to a granularity its own error bar can support.
+//
+// The ETA comes from a least-squares slope over a few hours of samples taken
+// five minutes apart. "21h54m" spends four digits implying it knows the minute;
+// it does not, and a reader who returns in an hour and sees "20h31m" learns
+// nothing from the change. Anything measured in days or hours is rounded to the
+// hour and prefixed to say so.
+func coarsenETA(d time.Duration) string {
+	if d >= time.Hour {
+		return "~" + shortDuration(d.Round(time.Hour))
+	}
+	if d >= 10*time.Minute {
+		return "~" + shortDuration(d.Round(time.Minute))
+	}
+	return shortDuration(d)
 }
 
 func shortDuration(d time.Duration) string {

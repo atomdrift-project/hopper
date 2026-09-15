@@ -18,7 +18,7 @@ func TestRescanMetaShowsEveryTier(t *testing.T) {
 	if prod.Total() != 123938 {
 		t.Fatalf("Total() = %d, want 123938", prod.Total())
 	}
-	meta := rescanMeta(prod, "", 0.025, true)
+	meta := rescanMeta(prod, "", 0.025, true, true)
 	for _, want := range []string{"123,921", "repair", "17", "forced"} {
 		if !strings.Contains(meta, want) {
 			t.Errorf("meta %q missing %q", meta, want)
@@ -30,7 +30,7 @@ func TestRescanMetaShowsEveryTier(t *testing.T) {
 
 	// Genuinely empty. The age tier cannot be switched off, so "caught up" is
 	// now the only honest reading of an empty queue.
-	empty := rescanMeta(hopper.RescanDepths{}, "", 0, true)
+	empty := rescanMeta(hopper.RescanDepths{}, "", 0, true, true)
 	if !strings.Contains(empty, "caught up") {
 		t.Errorf("empty enabled queue should read caught up, got %q", empty)
 	}
@@ -38,11 +38,22 @@ func TestRescanMetaShowsEveryTier(t *testing.T) {
 	// Thin history must NOT read as stalled. The live dashboard rendered
 	// "not draining" beside 21 rescans/sec because a restart had cleared the
 	// sampled series and there was no slope to fit yet.
-	warming := rescanMeta(prod, "", 0, false)
+	warming := rescanMeta(prod, "", 0, false, true)
 	if strings.Contains(warming, "not draining") {
 		t.Errorf("unmeasured queue reported as stalled: %q", warming)
 	}
 	if !strings.Contains(warming, "measuring") {
 		t.Errorf("unmeasured queue should say so, got %q", warming)
+	}
+
+	// A failed count leaves the struct zero-valued, and zero renders as "caught
+	// up" -- the one reading that stops an operator investigating. Unavailable
+	// must look unavailable.
+	unknown := rescanMeta(hopper.RescanDepths{}, "", 0, true, false)
+	if strings.Contains(unknown, "caught up") {
+		t.Errorf("a failed depth count must never read as caught up: %q", unknown)
+	}
+	if !strings.Contains(unknown, "unavailable") {
+		t.Errorf("a failed depth count must say so, got %q", unknown)
 	}
 }
