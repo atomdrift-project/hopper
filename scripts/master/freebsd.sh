@@ -282,10 +282,40 @@ IFS=\$old_ifs
 pidfile="/var/run/\${name}.pid"
 command="/usr/sbin/daemon"
 # --litmus '' is intentional: the Scan worker is a separate rc.d service.
-command_args="-c -f -r -R 10 -P \${pidfile} -o \${hopper_logfile} -u hopper /usr/bin/env HOME=/home/hopper DATABASE_URL=\${hopper_db} $HOPPER_BIN load --data \${hopper_data} --db \${hopper_db} --source \${hopper_source} --api-addr \${hopper_api_bind} --dashboard-addr \${hopper_bind}$token_arg --litmus '' --cleave $CLEAVE_BIN\${mount_args}$dataset_arg"
+#
+# -H makes daemon(8) close and reopen the -o log on SIGHUP, which is what makes
+# the newsyslog(8) drop-in below actually reclaim space. Without it newsyslog
+# renames the file while daemon keeps writing to the now-unlinked inode: the
+# rotated copies look correct, the disk never frees, and the log grows without
+# bound (this is how hopper.log reached 4.7G).
+command_args="-c -f -r -H -R 10 -P \${pidfile} -o \${hopper_logfile} -u hopper /usr/bin/env HOME=/home/hopper DATABASE_URL=\${hopper_db} $HOPPER_BIN load --data \${hopper_data} --db \${hopper_db} --source \${hopper_source} --api-addr \${hopper_api_bind} --dashboard-addr \${hopper_bind}$token_arg --litmus '' --cleave $CLEAVE_BIN\${mount_args}$dataset_arg"
 
 run_rc_command "\$1"
 EOF
+
+# Log rotation. hopper logs a line per worker result and per non-fatal analysis
+# error, so an unrotated log is a steady disk leak on the same pool the samples
+# live on. Size-based rather than time-based: the volume tracks ingest activity,
+# not the clock. Signal 1 (SIGHUP) goes to the daemon(8) supervisor named by the
+# pidfile, which reopens the file because of -H above. zstd (Y) keeps the
+# compression cheap on a box whose CPU is already contended.
+#
+# Pinned to the default /var/log/hopper.log: an operator who overrides
+# hopper_logfile in rc.conf must move this drop-in to match.
+NEWSYSLOG_TMP=$(mktemp -t hopper.newsyslog.XXXXXX)
+cat >"$NEWSYSLOG_TMP" <<EOF
+# Installed by hopper scripts/master/freebsd.sh -- do not edit by hand.
+# logfilename       [owner:group]  mode count size(KB) when flags [/pid_file]        [sig_num]
+/var/log/hopper.log root:wheel     600  10    512000   *    YC   /var/run/hopper.pid 1
+EOF
+$SUDO install -d -m 0755 -o root -g wheel /usr/local/etc/newsyslog.conf.d
+if ! $SUDO cmp -s "$NEWSYSLOG_TMP" /usr/local/etc/newsyslog.conf.d/hopper.conf 2>/dev/null; then
+	log "Installing Hopper newsyslog config"
+	$SUDO install -m 0644 -o root -g wheel "$NEWSYSLOG_TMP" /usr/local/etc/newsyslog.conf.d/hopper.conf
+else
+	log "Hopper newsyslog config unchanged"
+fi
+rm -f "$NEWSYSLOG_TMP"
 
 if ! $SUDO cmp -s "$RC_TMP" "$HOPPER_RCD" 2>/dev/null; then
 	log "Installing Hopper rc.d service"
