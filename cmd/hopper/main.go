@@ -5383,16 +5383,33 @@ func isTTY() bool {
 	return (fileInfo.Mode() & os.ModeCharDevice) != 0
 }
 
+// poolWaitWarnRatio is how much of the interval may be spent waiting on the
+// pool semaphore before the snapshot is promoted to a warning. Expressed per
+// connection, since N connections can accumulate N seconds of wait per second
+// without anything being wrong. A tenth of that is generous and still catches
+// real starvation by a wide margin.
+const poolWaitWarnRatio = 0.1
+
 // logPoolStatsLoop emits a snapshot of the pgxpool every 30s. Anything other
 // than baseline numbers (acquired_conns near max, non-zero acquire_wait) is a
 // pool-saturation signal.
+//
+// Saturation is logged at WARN, not INFO, and that distinction is the whole
+// point: this process runs at WARN in production, so the INFO snapshot below
+// has never appeared in a deployed log. A starved pool was therefore invisible
+// here for as long as it existed — found instead, on 2026-09-15, by reading
+// db_pool_wait_duration_seconds_total out of /_/metrik. The routine snapshot
+// stays at INFO for -v; the condition an operator must act on escalates.
 func logPoolStatsLoop(ctx context.Context, db *hopper.DB) {
 	pool := db.Pool()
 	if pool == nil {
 		return
 	}
-	t := time.NewTicker(30 * time.Second)
+	const interval = 30 * time.Second
+	t := time.NewTicker(interval)
 	defer t.Stop()
+	var lastWait time.Duration
+	var lastEmpty int64
 	for {
 		select {
 		case <-ctx.Done():
@@ -5400,14 +5417,33 @@ func logPoolStatsLoop(ctx context.Context, db *hopper.DB) {
 		case <-t.C:
 		}
 		s := pool.Stat()
-		slog.Info("pg pool stats",
+
+		// Deltas, not totals: a counter that grew fast an hour ago should not
+		// keep firing, and a total large enough to alarm on is one that has
+		// already been ignored for a long time.
+		waitDelta := s.AcquireDuration() - lastWait
+		emptyDelta := s.EmptyAcquireCount() - lastEmpty
+		lastWait, lastEmpty = s.AcquireDuration(), s.EmptyAcquireCount()
+
+		budget := time.Duration(float64(s.MaxConns()) * poolWaitWarnRatio * float64(interval))
+		attrs := []any{
 			"acquired", s.AcquiredConns(),
 			"idle", s.IdleConns(),
 			"total", s.TotalConns(),
 			"max", s.MaxConns(),
 			"acquire_count", s.AcquireCount(),
 			"acquire_wait", s.AcquireDuration().Round(time.Millisecond),
+			"wait_last_interval", waitDelta.Round(time.Millisecond),
 			"empty_acquire", s.EmptyAcquireCount(),
-			"canceled_acquire", s.CanceledAcquireCount())
+			"empty_last_interval", emptyDelta,
+			"canceled_acquire", s.CanceledAcquireCount(),
+		}
+		if waitDelta > budget {
+			slog.WarnContext(ctx, "pg pool saturated: callers are blocking on connections",
+				append(attrs, "wait_budget", budget.Round(time.Millisecond),
+					"remedy", "raise pool_max_conns in the DSN, or poolSize for this app")...)
+			continue
+		}
+		slog.InfoContext(ctx, "pg pool stats", attrs...)
 	}
 }

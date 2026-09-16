@@ -46,13 +46,35 @@ import (
 // one service is a deploy-time change and needs no rebuild. Getting this wrong
 // now costs latency in one service; getting it wrong the old way cost everyone
 // the ability to connect.
+// ServingAppName is the app name of the long-running publisher daemon
+// (`hopper load`), the one consumer sized for real concurrency. It must match
+// what cliAppName produces for that subcommand; TestServingAppNameMatchesCLI
+// in cmd/hopper fails if the two ever drift apart again — which is exactly how
+// this branch went dead the first time.
+const ServingAppName AppName = "hopper-load"
+
 func poolSize(app AppName) (maxConns, minConns int32) {
-	if app == "hopper" {
+	// "hopper-load", not "hopper": every CLI app name is built as
+	// "hopper-<subcommand>" (see cliAppName), so the serving daemon identifies
+	// itself as "hopper-load" and a bare "hopper" matches nothing at all. This
+	// branch was dead from the day app names gained their subcommand suffix,
+	// and the daemon silently ran on the generic 4 below.
+	//
+	// Measured 2026-09-15, before the fix: max=4, 10,442 pool waits in 16m37s
+	// of uptime totalling 3,219s of blocked goroutine time — 3.2 goroutines
+	// parked on the pool semaphore at every instant — and 187 acquires
+	// cancelled outright. It was the process's hard throughput ceiling.
+	if app == ServingAppName {
 		// The serving API and the write path, and the one caller whose
 		// concurrency is real: a worker fleet polls /api/next every 2 seconds
 		// while long result-store transactions (UpdateCleaveResult can cascade
 		// into ExplodeArchiveMembers) hold a connection for seconds at a time.
 		// It keeps a warm minimum because it is always serving.
+		//
+		// Affordable because it is now the *only* consumer that asks for 32:
+		// forager pins 8 in its DSN and everything else takes the 4 below, so
+		// the publisher's ~97 usable slots carry roughly 48. The 2026-09-07
+		// outage came from handing all four services 32 apiece, not from this.
 		return 32, 8
 	}
 	// Everything else -- forager, promoter, prism, one-shot commands, ad-hoc

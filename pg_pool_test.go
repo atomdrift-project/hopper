@@ -17,7 +17,8 @@ func TestServicePoolsFitThePublisherBudget(t *testing.T) {
 	)
 
 	// Every consumer that runs continuously, plus the serving API.
-	services := []AppName{"hopper", "forager", "promoter", "prism"}
+	// ServingAppName, not a literal: see TestOnlyTheServingAPIGetsAPool.
+	services := []AppName{ServingAppName, "forager", "promoter", "prism"}
 	var ceiling, reserved int32
 	for _, app := range services {
 		maxC, minC := poolSize(app)
@@ -43,13 +44,25 @@ func TestServicePoolsFitThePublisherBudget(t *testing.T) {
 // that is not serving requests has no business holding capacity from one that
 // is. This is the inversion of the policy that locked an operator out of
 // reconcile-corroborated on 2026-09-07.
+//
+// ServingAppName rather than a literal "hopper", and that is the entire point.
+// This test used to assert poolSize("hopper"), a string no caller has ever
+// produced — cliAppName builds every name as "hopper-<subcommand>", so the real
+// daemon is "hopper-load". The branch under test was therefore dead in
+// production while this test went on passing, and the daemon ran on the generic
+// four-connection pool for as long as that was true. Measured 2026-09-15:
+// 10,442 pool waits totalling 3,219s of blocked goroutine time in a 16-minute
+// window. Assert against the constant the code actually branches on.
 func TestOnlyTheServingAPIGetsAPool(t *testing.T) {
-	if maxC, minC := poolSize("hopper"); maxC < 8 || minC == 0 {
+	if maxC, minC := poolSize(ServingAppName); maxC < 8 || minC == 0 {
 		t.Errorf("serving API pool = %d/%d; it serves a polling worker fleet and needs both", maxC, minC)
 	}
 	for _, app := range []AppName{
 		"forager", "promoter", "prism",
 		"hopper-reconcile-corroborated", "hopper-cli", "hopper-migrate", "anything-else",
+		// A bare "hopper" is not a real app name and must get the default,
+		// so that a future reader cannot mistake it for the serving daemon.
+		"hopper",
 	} {
 		maxC, minC := poolSize(app)
 		if maxC != 4 {
