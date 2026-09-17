@@ -131,7 +131,6 @@ idx_sightings_review_queue
 idx_sightings_subject
 idx_sl_child_parents
 idx_sl_containment
-idx_sl_parent_child
 idx_slh_sha256_retired
 '
 
@@ -171,6 +170,26 @@ idx_slh_sha256_retired
 # the replica until the replica catches up, and the replica catches up sooner
 # without maintaining an index nothing reads. Parking it is what unblocks the
 # repoint, not a decision against it.
+#
+# idx_sl_parent_child is PARKED, not retired: move it back to
+# REPLICA_KEEP_INDEXES and run `make replica` BEFORE any replica read path
+# starts resolving an archive's members.
+#
+# It serves `WHERE parent_sha256 = $1` (btree(parent_sha256) INCLUDE (sha256)
+# WHERE parent_sha256 <> ''), and on 2026-09-16 it had idx_scan=0 for its whole
+# lifetime on galadriel — the counter moved 0 -> 2 only because an EXPLAIN
+# touched it. It is 199 GB, the second-largest index on the replica, against a
+# 559 GB sample_locations heap on a filesystem at 99%.
+#
+# Zero scans is NOT why it is here; the caller trace is. The three consumers are
+# MembersByParent and TopMemberSHAsByParent (hopper.go), which have no callers in
+# hopper, prism, promoter or forager, and BadMembersByParent, whose only caller is
+# promoter/pkg/promoter/promote.go:1828. promoter's DSN is hopper-db (the master),
+# prism's is hopper-replica. So the index is load-bearing on the master and
+# unreachable on the replica.
+#
+# Without it the planner falls back to a seq scan of the 559 GB heap, so if a
+# members view is ever pointed at galadriel this must be rebuilt first.
 REPLICA_DROP_INDEXES='
 idx_samples_unconvicted_route_fresh
 idx_samples_good_repair_newest
@@ -214,6 +233,7 @@ idx_samples_unanalyzed_id
 idx_samples_updated_at
 idx_sl_donor
 idx_sl_incoming_seen
+idx_sl_parent_child
 idx_sl_reference
 idx_sl_sha256
 idx_sl_standalone

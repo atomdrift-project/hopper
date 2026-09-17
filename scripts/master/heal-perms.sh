@@ -30,9 +30,26 @@
 # Each pass only touches entries that are *actually* wrong — the find filters
 # select on the bit that is off — so a clean tree costs three cheap walks and
 # zero chmod/chgrp calls. GNU chgrp/chmod -c prints one line per entry it
-# changes (with the old->new transition); those lines are mirrored to the
-# journal as the per-path heal log and tallied for the summary, in one walk.
-# A clean tree logs nothing but the summary.
+# changes (with the old->new transition); those lines are tallied for the
+# summary, and printed only under HEAL_VERBOSE.
+#
+# OUTPUT CONTRACT: silent on success. Nothing reaches stdout unless
+# HEAL_VERBOSE=1; the summary goes to syslog, and only real errors go to stderr
+# (with a non-zero exit).
+#
+# This matters because the two deployments consume output very differently. The
+# systemd unit routes stdout to the journal, where a per-path line is cheap. The
+# FreeBSD periodic(8) wrapper MAILS stdout to root, where it is not: this tree is
+# never clean — forager unpacks archive members carrying the source image's modes
+# (an /etc/shadow inside a squashfs arrives 0600 root-owned), so every run heals
+# one to two million entries and mailed one line for each. On smaug that grew
+# /var/mail/root to 16 GB, on the same pool whose filling takes the host down.
+#
+#   dirs=485685  files=416586  upload_files=1326640   <- one ordinary day
+#
+# The tally is worth keeping — it is how the daily unpack-permission churn was
+# measured at all — so it goes to syslog, which both platforms retain and
+# neither mails.
 #
 # No `find -L`: every walk matches the symlink itself (a symlink is never -type
 # d or -type f), so a symlink planted in the tree cannot redirect a chmod onto
@@ -41,6 +58,8 @@
 # Env:
 #   DATA_DIR        sample root      (default /data/samples)
 #   SAMPLES_GROUP   owning group     (default samples)
+#   HEAL_VERBOSE    1 = print every healed path and the summary to stdout
+#                   (default 0: summary to syslog, stdout silent)
 set -eu
 
 PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
@@ -48,6 +67,7 @@ export PATH
 
 DATA_DIR="${DATA_DIR:-/data/samples}"
 GROUP="${SAMPLES_GROUP:-samples}"
+VERBOSE="${HEAL_VERBOSE:-0}"
 
 # GNU coreutils reports only changed entries with -c; FreeBSD provides the
 # equivalent useful output with -v. The find predicates already select only
@@ -77,6 +97,24 @@ getent group "$GROUP" >/dev/null 2>&1 || { echo "heal-perms: group does not exis
 
 log() { echo "heal-perms: $*"; }
 
+# Real failures are collected here and reported at the end. Until now every
+# chmod/chgrp ran under `2>/dev/null` with `|| true`, so an EPERM or a read-only
+# filesystem was indistinguishable from a clean run — the script could not
+# report an error even in principle. Silencing stderr wholesale was doing one
+# necessary job (see below) and one harmful one; this separates them.
+ERR_SPOOL=$(mktemp -t hopper-heal-perms.err.XXXXXX) || {
+    echo "heal-perms: cannot create error spool" >&2; exit 1; }
+trap 'rm -f "$ERR_SPOOL"' EXIT HUP INT TERM
+
+# A file that vanishes between the find and the chmod is the normal case here,
+# not a fault: draino relocates samples out of this tree continuously while the
+# walk runs, and every such race surfaces as ENOENT. Those are dropped; anything
+# else is a real error. Matching on the message is the portable option — GNU and
+# BSD chmod share the wording and neither offers a machine-readable failure mode.
+drop_benign() {
+    grep -v -e 'No such file or directory' -e 'no such file or directory' "$1" || true
+}
+
 # Capture each pass's -c change lines (chgrp/chmod print one "... changed from X
 # to Y" line per entry they touch), then print them and tally them. We can't tee
 # them to the journal mid-pipeline: under StandardOutput=journal the service's
@@ -93,12 +131,12 @@ log() { echo "heal-perms: $*"; }
 # 1. Group ownership: any entry not already in the samples group (whole tree,
 #    upload shards included). -h regroups a stray symlink as the link itself
 #    rather than following it to its target.
-grp_out=$(find "$DATA_DIR" -path "$EXCLUDE" -prune -o ! -group "$GROUP" -print0 \
-    | xargs -0 -r -n 4096 chgrp "$CHANGE_FLAG" -h "$GROUP" 2>/dev/null) || true
+grp_out=$(find "$DATA_DIR" 2>>"$ERR_SPOOL" -path "$EXCLUDE" -prune -o ! -group "$GROUP" -print0 \
+    | xargs -0 -r -n 4096 chgrp "$CHANGE_FLAG" -h "$GROUP" 2>>"$ERR_SPOOL") || true
 
 # 2. Directories not already exactly 2775 (setgid + group-writable), whole tree.
-dir_out=$(find "$DATA_DIR" -path "$EXCLUDE" -prune -o -type d ! -perm 2775 -print0 \
-    | xargs -0 -r -n 2048 chmod "$CHANGE_FLAG" 2775 2>/dev/null) || true
+dir_out=$(find "$DATA_DIR" 2>>"$ERR_SPOOL" -path "$EXCLUDE" -prune -o -type d ! -perm 2775 -print0 \
+    | xargs -0 -r -n 2048 chmod "$CHANGE_FLAG" 2775 2>>"$ERR_SPOOL") || true
 
 # 3. Regular files outside the upload trees → 0444 (read-only, world-readable).
 #    Every upload tree is pruned here and handled by pass 4. Immutability is
@@ -110,8 +148,8 @@ for tree in $UPLOAD_DIRS; do
     set -- "$@" -path "$tree"
 done
 set -- "$@" ")"
-file_out=$(find "$DATA_DIR" "$@" -prune -o -type f ! -perm 0444 -print0 \
-    | xargs -0 -r -n 4096 chmod "$CHANGE_FLAG" 0444 2>/dev/null) || true
+file_out=$(find "$DATA_DIR" 2>>"$ERR_SPOOL" "$@" -prune -o -type f ! -perm 0444 -print0 \
+    | xargs -0 -r -n 4096 chmod "$CHANGE_FLAG" 0444 2>>"$ERR_SPOOL") || true
 
 # 4. Upload sample files → 0440 (group-private; see header). Walks only the trees
 #    that exist, pruning the in-flight .tmp staging dir.
@@ -123,14 +161,37 @@ for tree in $UPLOAD_DIRS; do
 done
 upload_out=""
 if [ "$#" -gt 0 ]; then
-    upload_out=$(find "$@" -path "$EXCLUDE" -prune -o -type f ! -perm 0440 -print0 \
-        | xargs -0 -r -n 4096 chmod "$CHANGE_FLAG" 0440 2>/dev/null) || true
+    upload_out=$(find "$@" 2>>"$ERR_SPOOL" -path "$EXCLUDE" -prune -o -type f ! -perm 0440 -print0 \
+        | xargs -0 -r -n 4096 chmod "$CHANGE_FLAG" 0440 2>>"$ERR_SPOOL") || true
 fi
 
-# Per-path heal log to the journal (nothing on a clean tree).
-for o in "$grp_out" "$dir_out" "$file_out" "$upload_out"; do
-    if [ -n "$o" ]; then printf '%s\n' "$o"; fi
-done
+# Per-path heal log, opt-in only. On the FreeBSD host this is one to two million
+# lines a day straight into root's mail spool; see the OUTPUT CONTRACT above.
+if [ "$VERBOSE" = 1 ]; then
+    for o in "$grp_out" "$dir_out" "$file_out" "$upload_out"; do
+        if [ -n "$o" ]; then printf '%s\n' "$o"; fi
+    done
+fi
 
 count() { [ -z "$1" ] && { printf 0; return; }; printf '%s\n' "$1" | wc -l | tr -d '[:space:]'; }
-log "healed under $DATA_DIR (group=$GROUP): regrouped=$(count "$grp_out") dirs=$(count "$dir_out") files=$(count "$file_out") upload_files=$(count "$upload_out")"
+summary="healed under $DATA_DIR (group=$GROUP): regrouped=$(count "$grp_out") dirs=$(count "$dir_out") files=$(count "$file_out") upload_files=$(count "$upload_out")"
+
+# Syslog, not stdout: retained by the journal on systemd and by syslogd on
+# FreeBSD, mailed by neither. Under HEAL_VERBOSE it also goes to stdout, which is
+# what a hand-run invocation wants.
+logger -t hopper-heal-perms -p daemon.info "$summary" 2>/dev/null || true
+# An explicit if, not "[ ... ] && log": under set -e a false AND-OR list exits
+# the script, so the non-verbose path would return here before reporting errors
+# — the same trap the upload-tree loop above documents.
+if [ "$VERBOSE" = 1 ]; then
+    log "$summary"
+fi
+
+# The only thing that reaches stderr, and the only thing that fails the run.
+errs=$(drop_benign "$ERR_SPOOL")
+if [ -n "$errs" ]; then
+    printf '%s\n' "$errs" | sed 's/^/heal-perms: /' >&2
+    echo "heal-perms: $summary" >&2
+    exit 1
+fi
+exit 0
