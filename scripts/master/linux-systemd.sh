@@ -672,8 +672,17 @@ if (( binary_changed || unit_changed || token_changed )); then
         priv systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
         die "service failed to start; see: journalctl -u ${SERVICE_NAME} -n 50"
     fi
-else
+elif priv systemctl is-active --quiet "${SERVICE_NAME}.service"; then
     log "No changes; leaving service running"
+else
+    # Down is its own reason to act: "nothing new to install" never leaves the
+    # queue stopped -- every worker in the fleet claims its work from here.
+    reap_walkers
+    log "No changes, but ${SERVICE_NAME} is not running; starting it"
+    if ! priv systemctl start "${SERVICE_NAME}.service"; then
+        priv systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
+        die "service failed to start; see: journalctl -u ${SERVICE_NAME} -n 50"
+    fi
 fi
 
 # --- Shared memory budget (slice + sibling drop-ins) -------------------------

@@ -173,10 +173,34 @@ if [ -r "$PGPASS_SRC" ]; then
 		"$PGPASS_SRC" "/home/$SERVICE_USER/.pgpass"
 fi
 
-log "Installing binaries"
-$SUDO install -m 0755 -o root -g wheel ./hopper "$HOPPER_BIN"
-$SUDO install -m 0755 -o root -g wheel "$CLEAVE_DIR/out/cleave" "$CLEAVE_BIN"
-$SUDO install -m 0755 -o root -g wheel "$POSTDOC_DIR/target/release/postdoc" "$POSTDOC_BIN"
+# Installed only when they differ, and what differed is remembered: the
+# restart at the bottom of this script is worth an ingestion pause and a
+# dropped set of worker connections only when there is something new to run.
+# A rollout of a commit this host is already on otherwise bounced the API for
+# nothing -- and unlike a worker, hopper going away stalls the whole fleet.
+# This is what the systemd path (scripts/master/linux-systemd.sh) has always
+# done; FreeBSD reinstalled and restarted unconditionally.
+service_changed=0
+
+# install_if_changed <src> <dst> <name> — install as root, and report it.
+install_if_changed() {
+	if $SUDO cmp -s "$1" "$2" 2>/dev/null; then
+		log "$3 unchanged"
+		return 0
+	fi
+	log "Installing $2"
+	$SUDO install -m 0755 -o root -g wheel "$1" "$2"
+	service_changed=1
+}
+
+# cleave is spawned per analysis rather than held open, so a new one is picked
+# up without a restart -- but hopper is what decides when to spawn it, and the
+# two are built from the same rollout. Counted as a change: the conservative
+# answer costs one restart that may not have been needed, and the other way
+# round leaves a fleet talking to the wrong analyzer.
+install_if_changed ./hopper "$HOPPER_BIN" "Hopper binary"
+install_if_changed "$CLEAVE_DIR/out/cleave" "$CLEAVE_BIN" "cleave binary"
+install_if_changed "$POSTDOC_DIR/target/release/postdoc" "$POSTDOC_BIN" "postdoc binary"
 
 # A full corpus walk must not hold up Hopper readiness. Install the shared-tree
 # healer as a daily periodic task instead; it repairs drift from manual moves,
@@ -230,11 +254,18 @@ if [ -n "$TOKEN_SRC" ]; then
 	$SUDO install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" \
 		"/home/${SERVICE_USER}/.tok"
 	if [ -s "$TOKEN_SRC" ]; then
-		$SUDO install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_USER" \
-			"$TOKEN_SRC" "$TOKEN_DST"
+		# A rotated token needs a restart: hopper reads it once, at startup,
+		# so installing a new one without restarting leaves the old one live.
+		if $SUDO cmp -s "$TOKEN_SRC" "$TOKEN_DST" 2>/dev/null; then
+			log "API token unchanged"
+		else
+			$SUDO install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_USER" \
+				"$TOKEN_SRC" "$TOKEN_DST"
+			log "Installed API token from $TOKEN_SRC"
+			service_changed=1
+		fi
 	fi
 	$SUDO test -s "$TOKEN_DST" || die "no API token at $TOKEN_DST"
-	log "API token installed at $TOKEN_DST"
 else
 	log "TOKEN_SRC is empty — deploying an UNAUTHENTICATED work API"
 fi
@@ -319,6 +350,9 @@ rm -f "$NEWSYSLOG_TMP"
 if ! $SUDO cmp -s "$RC_TMP" "$HOPPER_RCD" 2>/dev/null; then
 	log "Installing Hopper rc.d service"
 	$SUDO install -m 0755 -o root -g wheel "$RC_TMP" "$HOPPER_RCD"
+	# Every argument the service runs with is baked into this file, so a
+	# changed flag, address or mount list arrives here and nowhere else.
+	service_changed=1
 else
 	log "Hopper rc.d service unchanged"
 fi
@@ -361,12 +395,18 @@ reap_walkers() {
 }
 
 if $SUDO service hopper status >/dev/null 2>&1; then
-	reap_walkers
-	log "Restarting Hopper"
-	$SUDO service hopper restart
+	if [ "$service_changed" -eq 0 ]; then
+		log "No changes; leaving service running"
+	else
+		reap_walkers
+		log "Restarting Hopper"
+		$SUDO service hopper restart
+	fi
 else
-	# Nothing is supervising them, so anything still walking is orphaned by
-	# definition — a stopped service cannot be the parent of a running walk.
+	# Down is its own reason to act: "nothing new to install" never leaves the
+	# queue stopped. Nothing is supervising the walkers either, so anything
+	# still walking is orphaned by definition -- a stopped service cannot be
+	# the parent of a running walk.
 	reap_walkers
 	log "Starting Hopper"
 	$SUDO service hopper start
