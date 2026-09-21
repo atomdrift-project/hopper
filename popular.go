@@ -148,8 +148,10 @@ func (db *DB) PopularPackageCount(ctx context.Context) (int, error) {
 // package whose worst finding is suspicious or hostile, worst-ranked package
 // first.
 //
-// The floor is suspiciousCrit, not notableCrit: the queue is for things that
-// look wrong, and "notable" does not. See suspiciousCrit for the measurement
+// The floor is hostile (max_crit >= 5), not suspicious and not notable: the
+// queue holds the fleet still, so its bar is what justifies that. See
+// triagePopularPop; the constant this comment used to name is 4, not 5, and the
+// wording is corrected here for the same reason as at its registration
 // that put it there — at the lower bar 92% of this population was notable-only.
 //
 // Within one package the tie is broken by cleave risk score, worst first, not
@@ -172,17 +174,33 @@ func (db *DB) PopularPackageCount(ctx context.Context) (int, error) {
 // sample removes it from the join — so callers pass ExcludeReportType to park
 // what they have already ruled on until a re-analysis makes the question worth
 // asking again.
-func (db *DB) TriagePopular(ctx context.Context, limit int, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
+// analyzedBefore is the split between popular and popular-tail: zero means no
+// upper bound, which is what the priority half passes. The two queues divide on
+// one value, so a row belongs to exactly one of them at any instant and crosses
+// between them without a migration or a second predicate to keep in step.
+func (db *DB) TriagePopular(
+	ctx context.Context, limit int, analyzedAfter, analyzedBefore time.Time, f TriageFilter,
+) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.triagePopularPG(ctx, limit, analyzedAfter, f)
+		return db.triagePopularPG(ctx, limit, analyzedAfter, analyzedBefore, f)
 	}
-	return db.triagePopularSQLite(ctx, limit, analyzedAfter, f)
+	return db.triagePopularSQLite(ctx, limit, analyzedAfter, analyzedBefore, f)
 }
 
-func (db *DB) triagePopularPG(ctx context.Context, limit int, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
-	// Freshness floor is $1; the filter clause numbers from 2.
-	extra, fargs := triageFilterClausePG(f, 2, "samples")
-	args := append([]any{analyzedAfter}, fargs...)
+func (db *DB) triagePopularPG(
+	ctx context.Context, limit int, analyzedAfter, analyzedBefore time.Time, f TriageFilter,
+) ([]*Sample, error) {
+	// Freshness floor is $1, the optional ceiling $2; the filter clause numbers
+	// after whichever of those are bound.
+	args := []any{analyzedAfter}
+	ceiling := ""
+	if !analyzedBefore.IsZero() {
+		args = append(args, analyzedBefore)
+		ceiling = `
+		   AND analyzed_at <= $2`
+	}
+	extra, fargs := triageFilterClausePG(f, len(args)+1, "samples")
+	args = append(args, fargs...)
 	args = append(args, limit)
 	// EXISTS plus a correlated ORDER BY rather than a JOIN: the shared column
 	// list is unqualified, and samples and popular_packages both have `source`,
@@ -191,7 +209,7 @@ func (db *DB) triagePopularPG(ctx context.Context, limit int, analyzedAfter time
 	// cost nothing worth restructuring the column list to avoid.
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+pgSampleColsLight+` FROM samples
-		 WHERE `+fmt.Sprintf(triagePopularWhere, "$1")+extra+`
+		 WHERE `+fmt.Sprintf(triagePopularWhere, "$1")+ceiling+extra+`
 		 ORDER BY (SELECT p.rank FROM popular_packages p WHERE p.purl_base = samples.purl_base) ASC,
 		          score DESC, id DESC
 		 LIMIT $`+strconv.Itoa(len(args)),
@@ -202,17 +220,26 @@ func (db *DB) triagePopularPG(ctx context.Context, limit int, analyzedAfter time
 	return scanPGSamplesLight(rows)
 }
 
-func (db *DB) triagePopularSQLite(ctx context.Context, limit int, analyzedAfter time.Time, f TriageFilter) ([]*Sample, error) {
-	// The freshness placeholder precedes the filter clause in SQL order, so its
-	// value leads the args; text-formatted because SQLite stores timestamps as
-	// RFC3339Nano and a bound time.Time silently matches nothing.
+func (db *DB) triagePopularSQLite(
+	ctx context.Context, limit int, analyzedAfter, analyzedBefore time.Time, f TriageFilter,
+) ([]*Sample, error) {
+	// The freshness placeholders precede the filter clause in SQL order, so
+	// their values lead the args; text-formatted because SQLite stores
+	// timestamps as RFC3339Nano and a bound time.Time silently matches nothing.
+	args := []any{analyzedAfter.UTC().Format(time.RFC3339Nano)}
+	ceiling := ""
+	if !analyzedBefore.IsZero() {
+		args = append(args, analyzedBefore.UTC().Format(time.RFC3339Nano))
+		ceiling = `
+		   AND analyzed_at <= ?`
+	}
 	extra, fargs := triageFilterClauseSQLite(f, "samples")
-	args := append([]any{analyzedAfter.UTC().Format(time.RFC3339Nano)}, fargs...)
+	args = append(args, fargs...)
 	args = append(args, limit)
 	//nolint:gosec // G202: predicates and column list are constant; filter values are parameterized via ? args
 	rows, err := db.lite.QueryContext(ctx,
 		`SELECT `+liteSampleColsLight+` FROM samples
-		 WHERE `+fmt.Sprintf(triagePopularWhere, "?")+extra+`
+		 WHERE `+fmt.Sprintf(triagePopularWhere, "?")+ceiling+extra+`
 		 ORDER BY (SELECT p.rank FROM popular_packages p WHERE p.purl_base = samples.purl_base) ASC,
 		          score DESC, id DESC
 		 LIMIT ?`,

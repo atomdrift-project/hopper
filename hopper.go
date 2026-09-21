@@ -5308,11 +5308,40 @@ func (db *DB) TriageDiscord(ctx context.Context, limit int, analyzedAfter time.T
 // creation time. A bad ruling drains by relabelling; any completed judgement
 // also writes a "sighted" report, which drains a confirmed good/unknown ruling.
 // Skipped or unservable rows are excluded because they cannot be reviewed.
-func (db *DB) TriageSighted(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+//
+// freshAfter is the boundary this queue shares with TriageSightedPinned, which
+// serves the version-pinned claims newer than it. Rows on that side are
+// excluded here so the two are disjoint; a claim crossing the boundary leaves
+// that queue and appears in this one, with nothing to migrate.
+func (db *DB) TriageSighted(ctx context.Context, limit int, freshAfter time.Time, f TriageFilter) ([]*Sample, error) {
 	if db.pool != nil {
-		return db.triageSightedPG(ctx, limit, f)
+		return db.triageSightedPG(ctx, limit, freshAfter, f)
 	}
-	return db.triageSightedSQLite(ctx, limit, f)
+	return db.triageSightedSQLite(ctx, limit, freshAfter, f)
+}
+
+// TriageSightedPinned returns samples a source has named BY VERSION inside the
+// freshAfter window and that nobody has adjudicated yet: the claim says "this
+// release is malicious", not "this package is", and it arrived today.
+//
+// It is the sharp end of the sightings ledger. Someone outside has already done
+// the identification, named the exact release, and published it in the last
+// day — so the work is confirmation rather than discovery, and every hour it
+// waits is an hour a named-bad release sits unlabelled in our corpus.
+//
+// The population is deliberately tiny, one or two rows at a time, which is what
+// lets a consumer give it precedence over its ordinary queues without starving
+// them: a queue that can be worked to empty in minutes preempts nothing for
+// long. Both bars do that work — dropping either would admit a tail.
+//
+// TriageSighted excludes exactly this set (triageSightedNotPinnedSQL), so the
+// two are disjoint, and a row that ages out of the window joins the ordinary
+// queue with no hand-off.
+func (db *DB) TriageSightedPinned(ctx context.Context, limit int, freshAfter time.Time, f TriageFilter) ([]*Sample, error) {
+	if db.pool != nil {
+		return db.triageSightedPinnedPG(ctx, limit, freshAfter, f)
+	}
+	return db.triageSightedPinnedSQLite(ctx, limit, freshAfter, f)
 }
 
 // TriageFallout returns analyzed top-level litmus-hostile samples (class 2)

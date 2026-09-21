@@ -6414,7 +6414,9 @@ func TestTriageMostRecent(t *testing.T) {
 		}},
 		{"good", db.TriageGood},
 		{"new", db.TriageNew},
-		{"sighted", db.TriageSighted},
+		{"sighted", func(ctx context.Context, n int, f TriageFilter) ([]*Sample, error) {
+			return db.TriageSighted(ctx, n, time.Now().Add(-SightedPinnedWindow), f)
+		}},
 	} {
 		got, err := tc.fetch(ctx, 2, TriageFilter{})
 		if err != nil {
@@ -6550,7 +6552,7 @@ func TestTriageThresholds(t *testing.T) {
 		t.Fatalf("AddSightings(sighted): %v", err)
 	}
 
-	sighted, err := db.TriageSighted(ctx, 100, TriageFilter{})
+	sighted, err := db.TriageSighted(ctx, 100, time.Now().Add(-SightedPinnedWindow), TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageSighted: %v", err)
 	}

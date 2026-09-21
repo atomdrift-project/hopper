@@ -144,7 +144,7 @@ func TestTriagePopularRanksByImportanceNotLabel(t *testing.T) {
 		t.Fatalf("SetPopularPackages: %v", err)
 	}
 
-	got, err := db.TriagePopular(ctx, 100, time.Time{}, TriageFilter{})
+	got, err := db.TriagePopular(ctx, 100, time.Time{}, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriagePopular: %v", err)
 	}
@@ -215,7 +215,7 @@ func TestTriagePopularBreaksTiesByRiskScore(t *testing.T) {
 		t.Fatalf("SetPopularPackages: %v", err)
 	}
 
-	got, err := db.TriagePopular(ctx, 100, time.Time{}, TriageFilter{})
+	got, err := db.TriagePopular(ctx, 100, time.Time{}, time.Time{}, TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriagePopular: %v", err)
 	}
@@ -316,5 +316,71 @@ func TestDedupePopularKeepsOrderAndLeavesCleanInputAlone(t *testing.T) {
 		if p != in[i] {
 			t.Errorf("entry %d = %+v, want %+v — clean input must pass through in order", i, p, in[i])
 		}
+	}
+}
+
+// popular and popular-tail are one population divided by one timestamp: the
+// freshest slice is what the fleet stands down for, the rest is reach. Before
+// the split these were a single number, so reaching further back meant holding
+// every other queue down for a three-week backlog.
+func TestTriagePopularSplitsFreshFromTail(t *testing.T) {
+	ctx := t.Context()
+	db := openTestDB(t)
+
+	add := func(n int, purlBase string, analyzedAt time.Time) string {
+		sha := fmt.Sprintf("%063x2", n)
+		mustInsert(t, ctx, db, &Sample{
+			SHA256: sha, Source: "test", Label: "unknown", LabelSource: "test",
+			PURLBase: purlBase, Version: "1.0.0",
+		})
+		result := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"npm","x":0,"dp":0,"ts":[{"l":5}]}]}`, sha)
+		if err := db.UpdateCleaveResult(ctx, sha, result, nil, ""); err != nil {
+			t.Fatalf("UpdateCleaveResult: %v", err)
+		}
+		if _, err := db.lite.ExecContext(ctx, `UPDATE samples SET analyzed_at = ? WHERE sha256 = ?`,
+			analyzedAt.UTC().Format(time.RFC3339Nano), sha); err != nil {
+			t.Fatalf("backdate analyzed_at: %v", err)
+		}
+		return sha
+	}
+
+	now := time.Now()
+	fresh := add(1, "pkg:npm/split-3", now.Add(-time.Hour))
+	tail := add(2, "pkg:npm/split-9", now.Add(-72*time.Hour))
+	ancient := add(3, "pkg:npm/split-11", now.Add(-40*24*time.Hour))
+
+	if err := db.SetPopularPackages(ctx, []PopularPackage{
+		{PURLBase: "pkg:npm/split-3", Ecosystem: "npm", Rank: 3, Source: "poppy"},
+		{PURLBase: "pkg:npm/split-9", Ecosystem: "npm", Rank: 9, Source: "poppy"},
+		{PURLBase: "pkg:npm/split-11", Ecosystem: "npm", Rank: 11, Source: "poppy"},
+	}); err != nil {
+		t.Fatalf("SetPopularPackages: %v", err)
+	}
+
+	priority, err := db.TriagePopular(ctx, 100, now.Add(-PopularPriorityWindow), time.Time{}, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriagePopular(priority): %v", err)
+	}
+	tailRows, err := db.TriagePopular(ctx, 100,
+		now.Add(-PopularFreshness), now.Add(-PopularPriorityWindow), TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriagePopular(tail): %v", err)
+	}
+
+	inPriority, inTail := shaSet(priority), shaSet(tailRows)
+	if !inPriority[fresh] || len(priority) != 1 {
+		t.Errorf("priority half = %d rows, want just the one analyzed inside the window", len(priority))
+	}
+	if !inTail[tail] || len(tailRows) != 1 {
+		t.Errorf("tail half = %d rows, want just the one behind the window", len(tailRows))
+	}
+	// Disjoint, and neither reaches past the outer floor.
+	for sha := range inPriority {
+		if inTail[sha] {
+			t.Errorf("%s is in both popular and popular-tail; the split must partition", sha)
+		}
+	}
+	if inPriority[ancient] || inTail[ancient] {
+		t.Error("a sample older than PopularFreshness was served by either half")
 	}
 }

@@ -3602,19 +3602,45 @@ func (db *DB) triageReviewSQLite(ctx context.Context, limit int, f TriageFilter)
 	return scanLiteSamplesLight(rows)
 }
 
-func (db *DB) triageSightedSQLite(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
+func (db *DB) triageSightedSQLite(ctx context.Context, limit int, freshAfter time.Time, f TriageFilter) ([]*Sample, error) {
 	extra, args := triageFilterClauseSQLite(f, "samples")
-	args = append(args, limit)
+	// Placeholder order is the order the `?`s appear in the statement: the
+	// filter's own, then the pinned-exclusion boundary, then the limit.
+	args = append(args, freshAfter.UTC().Format(time.RFC3339Nano), limit)
 
 	rows, err := db.lite.QueryContext(ctx,
 		triageSightedMatchCTE+`SELECT `+liteSampleColsLight+` FROM samples
+		 JOIN latest_sightings ON latest_sightings.matched_sha = samples.sha256
+		 WHERE `+triageSightedWhere+extra+fmt.Sprintf(triageSightedNotPinnedSQL, "?")+`
+		 ORDER BY latest_sightings.sighted_at DESC,
+		          samples.created_at DESC, samples.id DESC LIMIT ?`,
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage sighted: %w", err)
+	}
+	return scanLiteSamplesLight(rows)
+}
+
+// triageSightedPinnedSQLite: see TriageSightedPinned. Mirrors triageSightedPinnedPG.
+func (db *DB) triageSightedPinnedSQLite(
+	ctx context.Context, limit int, freshAfter time.Time, f TriageFilter,
+) ([]*Sample, error) {
+	// The window bounds the CTE, so it is the first placeholder here, where in
+	// the ordinary query it is the last but one.
+	args := []any{freshAfter.UTC().Format(time.RFC3339Nano)}
+	extra, fargs := triageFilterClauseSQLite(f, "samples")
+	args = append(args, fargs...)
+	args = append(args, limit)
+
+	rows, err := db.lite.QueryContext(ctx,
+		fmt.Sprintf(triageSightedPinnedMatchCTE, "?")+`SELECT `+liteSampleColsLight+` FROM samples
 		 JOIN latest_sightings ON latest_sightings.matched_sha = samples.sha256
 		 WHERE `+triageSightedWhere+extra+`
 		 ORDER BY latest_sightings.sighted_at DESC,
 		          samples.created_at DESC, samples.id DESC LIMIT ?`,
 		args...)
 	if err != nil {
-		return nil, fmt.Errorf("hopper: triage sighted: %w", err)
+		return nil, fmt.Errorf("hopper: triage sighted-pinned: %w", err)
 	}
 	return scanLiteSamplesLight(rows)
 }

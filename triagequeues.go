@@ -121,6 +121,21 @@ const (
 	// backfills through the ordinary queues.
 	FalloutWindow = 7 * 24 * time.Hour
 
+	// SightedPinnedWindow is how long a version-pinned claim stays urgent.
+	//
+	// It is the whole reason sighted-pinned can be a preempting queue in the
+	// consumer: a source naming ONE version of a package, today, is a live
+	// compromise someone has already identified for us, and the population that
+	// fits both bars at once is one or two rows. Widen this and it stops being
+	// a queue that can be worked to empty, which is the property that earns it
+	// precedence over everything else.
+	//
+	// A row ages out of it silently and into the ordinary sighted queue, which
+	// excludes exactly this window (see triageSightedNotPinnedSQL). There is no
+	// hand-off, because there is only ever one predicate: a claim is pinned and
+	// fresh, or it is not.
+	SightedPinnedWindow = 24 * time.Hour
+
 	// VersionDriftWindow bounds how far back version-drift reaches, and unlike
 	// the grace windows above it exists for a hard performance reason.
 	//
@@ -174,8 +189,32 @@ const (
 	// Separate constants only so either can be tuned without moving the other.
 	HostileFreshness = 12 * time.Hour
 	HighestFreshness = 3 * 24 * time.Hour
-	PopularFreshness = 7 * 24 * time.Hour
-	LowestFreshness  = 30 * 24 * time.Hour
+
+	// PopularFreshness bounds the popular TAIL, and is the one floor
+	// deliberately far above the ~1000 target. Popular is rank-ordered rather
+	// than recency-ordered, so depth costs it nothing: the worst-ranked
+	// package is always served first regardless of how much sits behind it,
+	// and widening the floor adds reach rather than noise. 21 days is how far
+	// back a hostile finding on a widely-installed package is still worth a
+	// pass.
+	PopularFreshness = 21 * 24 * time.Hour
+
+	// PopularPriorityWindow splits the freshest slice of popular off as its own
+	// queue, the one the rest of the fleet stands down for.
+	//
+	// The bar (max_crit >= 5, hostile) already says a row here is a live
+	// supply-chain compromise or a false positive about to reach a great many
+	// people. This says the fleet should only be held still for the ones where
+	// that is still TRUE RIGHT NOW: at a day old the package is mid-install
+	// everywhere, and at three weeks the answer matters just as much but an
+	// hour of latency no longer does.
+	//
+	// Small by construction, which is what makes preemption affordable — the
+	// same property SightedPinnedWindow is chosen for. The tail keeps the
+	// identical predicate and ordering; only the clock differs, and a row
+	// crosses from one queue to the other with nothing to hand over.
+	PopularPriorityWindow = 24 * time.Hour
+	LowestFreshness       = 30 * 24 * time.Hour
 
 	// BadFreshness is the one floor whose residual is not churn, and the only one
 	// deliberately left above the ~1000 target. Its population is known malware
@@ -358,8 +397,31 @@ var TriageQueues = map[string]Queue{
 	// it reports what the queue can actually hand out rather than the full
 	// expansion of every broad package claim across the corpus — which is the
 	// count that was too expensive to take, and the wrong number besides.
+	// Version-pinned claims newer than SightedPinnedWindow are excluded here and
+	// served by sighted-pinned instead, so the two never offer the same sha256.
 	"sighted": {Name: "sighted", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
-		return db.TriageSighted(ctx, n, queueFilter("sighted", TriageFilter{}))
+		return db.TriageSighted(ctx, n, time.Now().Add(-SightedPinnedWindow),
+			queueFilter("sighted", TriageFilter{}))
+	}},
+
+	// sighted-pinned: the sharp end of the same ledger — a source named ONE
+	// stored version of a package malicious or suspicious, within the last day,
+	// and nobody has adjudicated it → confirm it now, while the release is
+	// still being installed.
+	//
+	// It is the ordinary sighted queue's head, split off because its rows want
+	// a different response time rather than a different treatment: the work is
+	// identical, and only the clock differs. Outside has already done the
+	// identification and named the release, so this is confirmation rather than
+	// discovery, and the population that clears both bars is one or two rows.
+	// That smallness is the feature — a queue that empties in minutes can be
+	// given precedence over the rest without starving them.
+	//
+	// Drains exactly as sighted does (relabel, or a "sighted" report), and ages
+	// out of the window into sighted with nothing to hand over.
+	"sighted-pinned": {Name: "sighted-pinned", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+		return db.TriageSightedPinned(ctx, n, time.Now().Add(-SightedPinnedWindow),
+			queueFilter("sighted-pinned", TriageFilter{}))
 	}},
 
 	// review: promoter's own corroboration rule found exactly one signal on an
@@ -456,8 +518,18 @@ var TriageQueues = map[string]Queue{
 		return db.TriageStrandedPopulation(ctx, n, now.Add(-OutlierGrace), now.Add(-MissingRetry), queueFilter("stranded", TriageFilter{}))
 	}},
 
-	// popular: samples from a ranked package whose worst finding is suspicious
-	// or hostile (the suspiciousCrit floor), worst-ranked package first.
+	// popular: samples from a ranked package whose worst finding is HOSTILE
+	// (max_crit >= 5), worst-ranked package first, analyzed inside
+	// PopularPriorityWindow. Its tail is popular-tail, same predicate and same
+	// ordering, reaching back to PopularFreshness.
+	//
+	// The bar was raised from suspicious to hostile and three comments went on
+	// saying suspicious afterwards — including this one, which named the
+	// suspiciousCrit constant for a literal 5 that is not it. Corrected
+	// 2026-09-21: suspiciousCrit is 4, the floor here is 5, and a retune made
+	// against the old wording would have widened the queue the whole fleet
+	// stands down for.
+	//
 	// Deliberately NOT every sample that trips detection: "notable" findings are
 	// worth recording and not worth this queue, and on popular packages they are
 	// 92% of the population — a backlog measured in months, spent on ordinary
@@ -481,7 +553,25 @@ var TriageQueues = map[string]Queue{
 	// migration creates it empty either way, so an unpublished table reads as a
 	// permanently drained queue rather than as an error.
 	"popular": {Name: "popular", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
-		return db.TriagePopular(ctx, n, time.Now().Add(-PopularFreshness), staleTriageFilter("popular"))
+		return db.TriagePopular(ctx, n, time.Now().Add(-PopularPriorityWindow), time.Time{},
+			staleTriageFilter("popular"))
+	}},
+
+	// popular-tail: everything popular no longer reaches, which is the same
+	// population one day older. Identical predicate, identical rank ordering,
+	// and the two divide on one timestamp so they are disjoint by construction
+	// and a row crosses between them with nothing to migrate.
+	//
+	// It exists so that widening the reach back to PopularFreshness does not
+	// widen what the fleet stands down for. Before the split those were one
+	// number: reaching further back meant holding every other queue down for a
+	// three-week backlog, so the reach stayed at a week. Separating them lets
+	// the tail be as deep as is useful while preemption stays bounded to the
+	// day where an hour of latency still changes the outcome.
+	"popular-tail": {Name: "popular-tail", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+		now := time.Now()
+		return db.TriagePopular(ctx, n, now.Add(-PopularFreshness), now.Add(-PopularPriorityWindow),
+			staleTriageFilter("popular-tail"))
 	}},
 
 	// The -stale queues: the same populations as new/good, ranked

@@ -190,11 +190,16 @@ func TestTriageSightedUsesLedgerScope(t *testing.T) {
 		}
 	}
 
-	got, err := db.TriageSighted(ctx, 20, TriageFilter{})
+	got, err := db.TriageSighted(ctx, 20, time.Now().Add(-SightedPinnedWindow), TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageSighted: %v", err)
 	}
-	want := []string{exact, suspicious, digest, broad}
+	// exact and suspicious carry a version-pinned claim inside
+	// SightedPinnedWindow, so they belong to sighted-pinned and are excluded
+	// here. What is left is the whole-package claim and the digest claim: one
+	// names a name rather than a release, the other names bytes rather than a
+	// version, and neither is what the fast queue is for.
+	want := []string{digest, broad}
 	if len(got) != len(want) {
 		t.Fatalf("TriageSighted returned %d rows, want %d: %+v", len(got), len(want), got)
 	}
@@ -212,23 +217,72 @@ func TestTriageSightedUsesLedgerScope(t *testing.T) {
 		}
 	}
 
+	// The other half of the split, and the disjointness between them: every row
+	// the fast queue serves is one the ordinary queue does not, and the two
+	// together are the whole ledger-scoped population.
+	pinned, err := db.TriageSightedPinned(ctx, 20, time.Now().Add(-SightedPinnedWindow), TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageSightedPinned: %v", err)
+	}
+	wantPinned := []string{exact, suspicious}
+	if len(pinned) != len(wantPinned) {
+		t.Fatalf("TriageSightedPinned returned %d rows, want %d: %+v", len(pinned), len(wantPinned), pinned)
+	}
+	for i, sha := range wantPinned {
+		if pinned[i].SHA256 != sha {
+			t.Errorf("pinned row %d = %s, want %s (newest pinned claim first)", i, pinned[i].SHA256, sha)
+		}
+	}
+	for _, sample := range pinned {
+		if shaSet(got)[sample.SHA256] {
+			t.Errorf("%s is in both sighted and sighted-pinned; the queues must partition", sample.SHA256)
+		}
+		if why := denied[sample.SHA256]; why != "" {
+			t.Errorf("TriageSightedPinned included %s (%s)", sample.SHA256, why)
+		}
+	}
+	// An aged pinned claim is nobody's special case: it simply appears in the
+	// ordinary queue, with no migration and no second predicate.
+	aged, err := db.TriageSighted(ctx, 20, time.Now().Add(time.Minute), TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageSighted(aged window): %v", err)
+	}
+	for _, sha := range wantPinned {
+		if !shaSet(aged)[sha] {
+			t.Errorf("%s left sighted-pinned without appearing in sighted", sha)
+		}
+	}
+
 	stored, err := db.SightingsFor(ctx, []string{"pkg:npm/exact"})
 	if err != nil || len(stored["pkg:npm/exact"]) != 1 || stored["pkg:npm/exact"][0].Affected != "1.2.3" {
 		t.Fatalf("exact PURL scope was not preserved: rows=%+v err=%v", stored, err)
 	}
+	// One drain serves both queues: the report type is the queue's shared name,
+	// so a judgement made on the fast path settles the row for the slow one too.
 	if err := db.InsertReport(ctx, &Report{SHA256: exact, Type: "sighted", Provider: "test"}); err != nil {
 		t.Fatalf("InsertReport(sighted): %v", err)
 	}
-	after, err := db.TriageSighted(ctx, 20, TriageFilter{})
+	drained, err := db.TriageSightedPinned(ctx, 20, time.Now().Add(-SightedPinnedWindow), TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageSightedPinned after report: %v", err)
+	}
+	if shaSet(drained)[exact] {
+		t.Error("completed sighted report did not drain an upheld non-bad label from sighted-pinned")
+	}
+	after, err := db.TriageSighted(ctx, 20, time.Now().Add(-SightedPinnedWindow), TriageFilter{})
 	if err != nil {
 		t.Fatalf("TriageSighted after report: %v", err)
 	}
 	if shaSet(after)[exact] {
-		t.Error("completed sighted report did not drain an upheld non-bad label")
+		t.Error("a drained row reappeared in the ordinary sighted queue")
 	}
 	depth, _, err := TriageQueues["sighted"].Count(ctx, db)
 	if err != nil || depth != int64(len(after)) {
 		t.Errorf("sighted depth = %d, %v; selection has %d", depth, err, len(after))
+	}
+	pinnedDepth, _, err := TriageQueues["sighted-pinned"].Count(ctx, db)
+	if err != nil || pinnedDepth != int64(len(drained)) {
+		t.Errorf("sighted-pinned depth = %d, %v; selection has %d", pinnedDepth, err, len(drained))
 	}
 }
 

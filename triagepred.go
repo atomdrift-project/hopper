@@ -167,6 +167,28 @@ const (
 		   AND NOT EXISTS (SELECT 1 FROM reports r
 		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'sighted')`
 
+	// triageSightedNotPinnedSQL removes from the ordinary sighted queue exactly
+	// what sighted-pinned serves, leaving the two disjoint.
+	//
+	// Disjointness is not cosmetic here. The consumer runs one worker per queue
+	// against shared per-sha temporary directories, so two queues offering the
+	// same sha256 put two workers on one directory; cyclotron's select.go calls
+	// this out as the reason its queues partition. A preempting queue that
+	// overlapped the queue it preempts would also re-serve, on the slow path,
+	// the very rows it had just been given precedence to clear.
+	//
+	// Both halves of the pinned predicate appear, and must: dropping the
+	// freshness bound would strand an aged claim in neither queue, and dropping
+	// affected != '' would hide every whole-package claim from the queue that
+	// exists to work them. The timestamp is the caller's window boundary, so
+	// the two queues divide on one value rather than on two clocks.
+	triageSightedNotPinnedSQL = `
+		   AND NOT EXISTS (SELECT 1 FROM sightings sp
+		                   WHERE sp.claim IN ('malicious', 'suspicious')
+		                     AND sp.affected != '' AND sp.first_seen > %s
+		                     AND samples.purl_base != '' AND sp.subject = samples.purl_base
+		                     AND sp.affected = samples.version)`
+
 	triageNewWherePG = `label = 'unknown' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''` +
 		triageServablePathSQL + `
 		   AND suspicious_count >= 1 AND path NOT LIKE 'review/%'`
@@ -183,6 +205,33 @@ const (
 // package index lookups independent; latest_sightings then collapses multiple
 // sources and a possible digest+PURL double match to one candidate and its
 // newest evidence.
+// triageSightedPinnedMatchCTE is triageSightedMatchCTE narrowed to the claims
+// worth preempting the fleet for: a source naming ONE stored version of a
+// package, first seen inside the caller's window. %s is that boundary.
+//
+// The package arm only. A digest claim names exact bytes, which is narrower
+// than a version and is not a version number at all — and admitting one would
+// end the property this queue is built on, since a single hash-blocklist import
+// lands thousands of fresh digest claims at once and the queue would stop being
+// one that can be worked to empty.
+//
+// affected != ” is the entire distinction from the ordinary queue. An empty
+// affected claims the package as a whole, which is a claim about a name rather
+// than about a release, and is the long tail the ordinary sighted queue works.
+const triageSightedPinnedMatchCTE = `WITH pinned_sightings AS (
+		SELECT subject, affected, first_seen FROM sightings
+		 WHERE claim IN ('malicious', 'suspicious')
+		   AND affected != '' AND first_seen > %s
+	), matching_sightings AS (
+		SELECT sm.sha256 AS matched_sha, s.first_seen AS sighted_at
+		  FROM pinned_sightings s JOIN samples sm ON sm.purl_base = s.subject
+		 WHERE sm.purl_base != '' AND s.affected = sm.version
+	), latest_sightings AS (
+		SELECT matched_sha, max(sighted_at) AS sighted_at
+		  FROM matching_sightings GROUP BY matched_sha
+	)
+`
+
 const triageSightedMatchCTE = `WITH review_sightings AS (
 		SELECT subject, affected, first_seen FROM sightings
 		 WHERE claim IN ('malicious', 'suspicious')

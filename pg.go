@@ -5699,8 +5699,40 @@ func (db *DB) triageReviewPG(ctx context.Context, limit int, f TriageFilter) ([]
 	return scanPGSamplesLight(rows)
 }
 
-func (db *DB) triageSightedPG(ctx context.Context, limit int, f TriageFilter) ([]*Sample, error) {
-	extra, args := triageFilterClausePG(f, 1, "samples")
+// triageSightedPinnedPG: see TriageSightedPinned.
+//
+// Written as a plain CTE rather than in triageSightedPG's LATERAL form. That
+// shape exists to keep work proportional to the batch when the ledger slice is
+// large; here the slice is one day of version-pinned claims, which is the point
+// of the queue, so the straightforward join is both fast enough and far easier
+// to read against the SQLite twin.
+func (db *DB) triageSightedPinnedPG(
+	ctx context.Context, limit int, freshAfter time.Time, f TriageFilter,
+) ([]*Sample, error) {
+	args := []any{freshAfter}
+	extra, fargs := triageFilterClausePG(f, 2, "samples")
+	args = append(args, fargs...)
+	limitIdx := len(args) + 1
+	args = append(args, limit)
+	rows, err := db.pool.Query(ctx,
+		fmt.Sprintf(triageSightedPinnedMatchCTE, "$1")+`SELECT `+pgSampleColsLight+` FROM samples
+		 JOIN latest_sightings ON latest_sightings.matched_sha = samples.sha256
+		 WHERE `+triageSightedWhere+extra+`
+		 ORDER BY latest_sightings.sighted_at DESC,
+		          samples.created_at DESC, samples.id DESC LIMIT $`+strconv.Itoa(limitIdx),
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: triage sighted-pinned: %w", err)
+	}
+	return scanPGSamplesLight(rows)
+}
+
+func (db *DB) triageSightedPG(ctx context.Context, limit int, freshAfter time.Time, f TriageFilter) ([]*Sample, error) {
+	// $1 is the pinned-exclusion boundary, so the filter's own placeholders
+	// start at $2.
+	args := []any{freshAfter}
+	extra, fargs := triageFilterClausePG(f, 2, "samples")
+	args = append(args, fargs...)
 	limitIdx := len(args) + 1
 	// Each arm is bounded before digest/PURL matches are combined. The extra
 	// room absorbs the uncommon case where the same bytes have both identities
@@ -5757,6 +5789,7 @@ func (db *DB) triageSightedPG(ctx context.Context, limit int, f TriageFilter) ([
 		)
 		SELECT `+pgSampleColsLight+` FROM latest
 		JOIN samples ON samples.id = latest.candidate_id
+		 WHERE true`+fmt.Sprintf(triageSightedNotPinnedSQL, "$1")+`
 		 ORDER BY latest.sighted_at DESC, latest.sample_created_at DESC, latest.candidate_id DESC
 		 LIMIT $`+strconv.Itoa(limitIdx),
 		args...)
