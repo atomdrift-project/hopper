@@ -84,6 +84,13 @@ type apiServer struct {
 	rescanAge           time.Duration
 	ready               atomic.Bool
 	datasetIncomplete   bool
+	// serving marks a process that stays up to answer requests after the load
+	// finishes, rather than exiting when the walk does. It is the lifetime of
+	// the process, so it is what the background tasks (queue metrics, the
+	// poison reaper, the periodic walks) must key off — not the presence of a
+	// local litmus worker, which is an unrelated deployment choice. See
+	// loadAll.
+	serving bool
 	// readOnly marks a serve-replica instance: mutating routes answer 403 and
 	// the DB sessions run under default_transaction_read_only (see
 	// cmdServeReplica for why both layers exist).

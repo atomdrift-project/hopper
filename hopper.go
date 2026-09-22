@@ -2020,17 +2020,23 @@ const maxClaimAttempts = MaxClaimAttempts
 // IncrementAttempts bumps the claim-attempt counter for the given samples. It
 // does not touch updated_at — a claim is not progress. Called from /api/next
 // with the batch a worker just claimed.
+//
+// It deliberately does not invalidate the lookup cache. attempts is claim
+// bookkeeping and no lookup response carries it — Sample has no such field —
+// so there is nothing cached that a bump can make stale. This is how
+// MarkClaimHandout already treats claimed_first_at; invalidating here was the
+// outlier, and an expensive one: forgetSHAs takes the pool's writer lock once
+// per sha to drop its key, and for any sha that was not itself cached — the
+// common case, since most claims are of unanalyzed samples — then scans the
+// whole pool for purl keys to match. That ran on every /api/next, the hottest
+// path in the server, against a reader-biased lock whose writers must drain
+// every reader slot. The resulting convoy, not the database, is what stalled
+// /v1/lookup fleet-wide on 2026-09-22.
 func (db *DB) IncrementAttempts(ctx context.Context, shas []string) error {
-	var err error
 	if db.pool != nil {
-		err = db.incrementAttemptsPG(ctx, shas)
-	} else {
-		err = db.incrementAttemptsSQLite(ctx, shas)
+		return db.incrementAttemptsPG(ctx, shas)
 	}
-	if err == nil {
-		db.forgetSHAs(shas)
-	}
-	return err
+	return db.incrementAttemptsSQLite(ctx, shas)
 }
 
 // ShasWithProvenance returns the subset of shas whose sample row carries a

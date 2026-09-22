@@ -1645,6 +1645,9 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	api.requiredMounts = append([]string(nil), requiredReconcileMounts...)
 	api.datasetIncomplete = *datasetIncomplete
 	api.allowedDirs = allowedDirs
+	// Whether this process outlives the walk. Set before loadAll, which keys
+	// its background tasks off it.
+	api.serving = *apiAddr != ""
 
 	// Nested-archive extraction spools intermediate containers to disk before
 	// descending. The default temp location is often a tmpfs (RAM) under
@@ -1753,7 +1756,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 			"skipped_missing_sample", stats.SkippedMissingSample,
 			"skipped_invalid", stats.SkippedInvalid)
 	}
-	servingAPI := *apiAddr != ""
+	servingAPI := api.serving
 	slog.Info("file walk complete",
 		"samples", total,
 		"serving_api", servingAPI,
@@ -2227,6 +2230,16 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 		api.progress = &progress
 	}
 
+	// Does this process outlive the walk? Everything below that must run "for
+	// as long as we are up" keys off this. It used to key off litmus != nil --
+	// the presence of a hopper-supervised local scan worker -- which is an
+	// unrelated deployment choice: a host running its own atomscan service
+	// passes --litmus '' and still serves the API forever. On such a host the
+	// background tasks were cancelled the moment the startup walk finished,
+	// which silently stopped the poison reaper and the queue-metrics sampler
+	// and closed the metrics cache under the still-live dashboard.
+	serving := api != nil && api.serving
+
 	// Dashboard-side tasks share a child lifetime. In serving mode they run
 	// until ctx is cancelled; a one-shot load cancels and joins them before
 	// returning so they cannot retain the DB or process-global terminal state.
@@ -2328,7 +2341,7 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	// previous walk began) and skip reconcile, so they stay cheap; a slower full
 	// pass also reconciles pools. Both fire from one goroutine via select, so a
 	// reconcile and an ingest pass never overlap or contend on walk_staging.
-	if litmus != nil && !pauseWalk {
+	if serving && !pauseWalk {
 		go func() {
 			lastStart := initialStart
 			ingest := time.NewTicker(ingestWalkInterval)
@@ -2358,16 +2371,16 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 		}()
 	}
 
-	// If there's a litmus server, keep the dashboard running — analysis
-	// is still in progress via the pull API. The dashboard goroutine exits
-	// when ctx is cancelled (ctrl-C). Without litmus there's nothing to
-	// wait for (remote workers also need the server to stay up).
-	if litmus != nil {
-		dashWG.Wait()
-	} else {
+	// A serving process keeps its background tasks for its whole life: work
+	// still arrives over the pull API, so the queue-metrics sampler and the
+	// poison reaper must keep running and the metrics cache must stay open for
+	// the dashboard that reads it. They end when ctx does (ctrl-C). A one-shot
+	// load has nothing left to serve, so cancel and join them here — before the
+	// deferred close of the metrics cache, which they write to.
+	if !serving {
 		stopBackground()
-		dashWG.Wait()
 	}
+	dashWG.Wait()
 
 	return int(progress.inserted.Load() + progress.skipped.Load())
 }
