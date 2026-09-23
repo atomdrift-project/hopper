@@ -733,11 +733,14 @@ var ErrNotFound = errors.New("hopper: not found")
 // DB is a connection to the sample registry.
 // Backed by either PostgreSQL (pool) or SQLite (lite).
 type DB struct {
-	pool             *pgxpool.Pool
-	lite             *sql.DB
-	lookup           *fido.Cache[string, *Sample]
-	records          *fido.Cache[string, *cachedRecord]
-	backfillProgress atomic.Pointer[BackfillProgressFn]
+	pool                  *pgxpool.Pool
+	lite                  *sql.DB
+	lookup                *fido.Cache[string, *Sample]
+	records               *fido.Cache[string, *cachedRecord]
+	cacheMemory           atomic.Pointer[cacheMemorySnapshot]
+	cacheMemoryRefreshing atomic.Bool
+	cacheMemoryAttempt    atomic.Int64
+	backfillProgress      atomic.Pointer[BackfillProgressFn]
 	// app is a string, so it ends the GC's pointer-scan region rather than
 	// sitting in the middle of it: its length word is the first eight bytes
 	// the collector no longer has to walk. Hence last of the pointer-bearing

@@ -173,6 +173,28 @@ network, and scope the tunnel's ingress to the routes you mean to publish.
 Alert rules live in `scripts/prometheus-hopper-alerts.yml` and a Grafana
 dashboard in `scripts/grafana-hopper-dashboard.json`.
 
+Lookup cache metrics carry `cache="sample"` or `cache="record"`:
+`hopper_cache_entries`, `hopper_cache_capacity`,
+`hopper_cache_requests_total{source="cache"|"database"}`,
+`hopper_cache_memory_estimated_bytes`, and
+`hopper_cache_memory_sampled_at_seconds`.
+The five-minute fraction served without a database load (including coalesced
+misses) is:
+
+```promql
+sum by (instance, cache) (rate(hopper_cache_requests_total{source="cache"}[5m]))
+/
+sum by (instance, cache) (rate(hopper_cache_requests_total[5m]))
+```
+
+Memory is sampled asynchronously at most once a minute; scrapes use the last
+successful sample. `time() - hopper_cache_memory_sampled_at_seconds` exposes
+stale estimates. Estimated bytes include referenced payloads and Fido entry,
+FIFO, and bloom storage, including expired and pending-eviction entries. They
+exclude allocator rounding, xsync map/lock internals and in-flight requests;
+shared storage may be counted more than once. Use heap profiles for independent
+measurement. Existing `hopper_lookup_*` sample-cache metrics remain available.
+
 ### Dataset registry metadata
 
 Curated corpora that do not pass through forager can still carry registry

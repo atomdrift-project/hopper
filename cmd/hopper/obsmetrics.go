@@ -31,27 +31,29 @@ const metricsCollectTimeout = 8 * time.Second
 // records into. Grouping them lets the registration read as a flat manifest and
 // keeps the callback's parameter list to one pointer.
 type instruments struct {
-	pending, rescan, cleavePending, litmusPending metric.Int64Observable
-	unattemptedAge                                metric.Int64Observable
-	retiredNoOutcome                              metric.Int64Observable
-	sightedPickupLag                              metric.Int64Observable
-	analyzed                                      metric.Int64Observable
-	analysisRate, filesRate                       metric.Float64Observable
-	addedAge, analyzedAge, readyLag               metric.Float64Observable
-	walked, inserted, cacheHits, filtered, errors metric.Int64Observable
-	insertFails                                   metric.Int64Observable
-	wLastSeen, wLoad, wFilesRate                  metric.Float64Observable
-	wActive, wSlots, wQueue, wRSS                 metric.Int64Observable
-	wAnalyzed, wErrors, wErrorsRecent             metric.Int64Observable
-	wClaimed, wReleased                           metric.Int64Observable
-	wInfo                                         metric.Int64Observable
-	localUp, localRestarts                        metric.Int64Observable
-	localMem, localMemBudget                      metric.Int64Observable
-	extractInUse, extractMax                      metric.Int64Observable
-	resultInUse, resultMax                        metric.Int64Observable
-	lookupReqs                                    metric.Int64Observable
-	lookupEntries, lookupCapacity                 metric.Int64Observable
-	popularPackages                               metric.Int64Observable
+	pending, rescan, cleavePending, litmusPending                metric.Int64Observable
+	unattemptedAge                                               metric.Int64Observable
+	retiredNoOutcome                                             metric.Int64Observable
+	sightedPickupLag                                             metric.Int64Observable
+	analyzed                                                     metric.Int64Observable
+	analysisRate, filesRate                                      metric.Float64Observable
+	addedAge, analyzedAge, readyLag                              metric.Float64Observable
+	walked, inserted, cacheHits, filtered, errors                metric.Int64Observable
+	insertFails                                                  metric.Int64Observable
+	wLastSeen, wLoad, wFilesRate                                 metric.Float64Observable
+	wActive, wSlots, wQueue, wRSS                                metric.Int64Observable
+	wAnalyzed, wErrors, wErrorsRecent                            metric.Int64Observable
+	wClaimed, wReleased                                          metric.Int64Observable
+	wInfo                                                        metric.Int64Observable
+	localUp, localRestarts                                       metric.Int64Observable
+	localMem, localMemBudget                                     metric.Int64Observable
+	extractInUse, extractMax                                     metric.Int64Observable
+	resultInUse, resultMax                                       metric.Int64Observable
+	lookupReqs                                                   metric.Int64Observable
+	lookupEntries, lookupCapacity                                metric.Int64Observable
+	lookupCacheEntries, lookupCacheCapacity, lookupCacheRequests metric.Int64Observable
+	lookupCacheMemory, lookupCacheMemoryAt                       metric.Int64Observable
+	popularPackages                                              metric.Int64Observable
 }
 
 // loadShedCount counts load-shedding events: requests turned away with a
@@ -445,6 +447,11 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 			"Sample lookup entries currently held in the in-process pool.", "{entry}"),
 		lookupCapacity: gauge("hopper.lookup.capacity",
 			"Maximum sample lookup entries the in-process pool will hold.", "{entry}"),
+		lookupCacheEntries:  gauge("hopper.cache.entries", "Live lookup cache entries, by cache.", "{entry}"),
+		lookupCacheCapacity: gauge("hopper.cache.capacity", "Lookup cache capacity, by cache.", "{entry}"),
+		lookupCacheRequests: counter("hopper.cache.requests", "Lookup requests served without a database load (including coalesced misses), or loaded from the database.", "{request}"),
+		lookupCacheMemory:   gauge("hopper.cache.memory.estimated", "Estimated retained cache bytes, including expired and pending eviction entries; excludes allocator and xsync overhead and in-flight loads.", "By"),
+		lookupCacheMemoryAt: gauge("hopper.cache.memory.sampled_at", "Unix time of the last successful cache memory estimate.", "s"),
 		// Whether a publisher's ranking actually landed is otherwise only
 		// visible from the publisher's own side, which reports what it sent
 		// rather than what was stored. Those are different claims, and after a
@@ -504,6 +511,7 @@ func (wd *webDashboard) observe(ctx context.Context, observer metric.Observer, i
 		lookup("purl", ls.PURLServed, ls.PURLLoaded)
 		observer.ObserveInt64(in.lookupEntries, int64(ls.Entries))
 		observer.ObserveInt64(in.lookupCapacity, int64(ls.Capacity))
+		observeLookupCaches(observer, in, db.CacheStatistics())
 
 		cctx, cancel := context.WithTimeout(ctx, metricsCollectTimeout)
 		defer cancel()
@@ -690,4 +698,18 @@ func newDBRetryCounter(m metric.Meter) metric.Int64Counter {
 		return nil
 	}
 	return c
+}
+
+func observeLookupCaches(o metric.Observer, in *instruments, caches []hopper.CacheStats) {
+	for _, c := range caches {
+		attrs := metric.WithAttributes(attribute.String("cache", c.Name))
+		o.ObserveInt64(in.lookupCacheEntries, int64(c.Entries), attrs)
+		o.ObserveInt64(in.lookupCacheCapacity, int64(c.Capacity), attrs)
+		o.ObserveInt64(in.lookupCacheRequests, clampCount(c.Served), metric.WithAttributes(attribute.String("cache", c.Name), attribute.String("source", "cache")))
+		o.ObserveInt64(in.lookupCacheRequests, clampCount(c.Loaded), metric.WithAttributes(attribute.String("cache", c.Name), attribute.String("source", "database")))
+		if !c.MemorySampledAt.IsZero() {
+			o.ObserveInt64(in.lookupCacheMemory, clampCount(c.MemoryBytes), attrs)
+			o.ObserveInt64(in.lookupCacheMemoryAt, c.MemorySampledAt.Unix(), attrs)
+		}
+	}
 }
