@@ -2272,3 +2272,61 @@ func TestIsForagerTemp(t *testing.T) {
 		}
 	}
 }
+
+// TestFillSampleProvenanceWheel is the walk-path twin of
+// TestUploadSampleWheelIdentity: the same wheel reached through the directory
+// walk, with and without an ecosystem in its path. VersionForName ran first
+// here too, and its hyphen-tolerant version shape kept the compatibility tags.
+func TestFillSampleProvenanceWheel(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		prov                pathProvenance
+		file                string
+		wantPURL, wantVer   string
+		wantPkg, wantEcoSys string
+	}{
+		{
+			"unknown tree",
+			pathProvenance{},
+			"memoryos-2.0.34-py3-none-any.whl",
+			"pkg:pypi/memoryos", "2.0.34", "memoryos", "python",
+		},
+		{
+			"python path with name",
+			pathProvenance{ecosystem: "python", pkg: "memoryos"},
+			"memoryos-2.0.34-py3-none-any.whl",
+			"pkg:pypi/memoryos", "2.0.34", "memoryos", "python",
+		},
+		{
+			"build tag",
+			pathProvenance{ecosystem: "pypi", pkg: "memoryos"},
+			"memoryos-2.0.34-2-py3-none-any.whl",
+			"pkg:pypi/memoryos", "2.0.34", "memoryos", "python",
+		},
+		// A coordinate-tier path already named the identity; it stays.
+		{
+			"coordinate path wins",
+			pathProvenance{purl: "pkg:pypi/memoryos@2.0.34"},
+			"memoryos-2.0.34-py3-none-any.whl",
+			"pkg:pypi/memoryos", "2.0.34", "memoryos", "python",
+		},
+		// A path that says this is some other ecosystem is not overruled by a
+		// suffix: version is still split by the wheel rule, identity is left alone.
+		{
+			"foreign ecosystem",
+			pathProvenance{ecosystem: "javascript"},
+			"memoryos-2.0.34-py3-none-any.whl",
+			"", "2.0.34", "memoryos", "javascript",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &hopper.Sample{}
+			fillSampleProvenance(s, tc.prov, tc.file)
+			if s.PURLBase != tc.wantPURL || s.Version != tc.wantVer || s.Package != tc.wantPkg || s.Ecosystem != tc.wantEcoSys {
+				t.Errorf("fillSampleProvenance(%q) = (purl %q, ver %q, pkg %q, eco %q), want (%q, %q, %q, %q)",
+					tc.file, s.PURLBase, s.Version, s.Package, s.Ecosystem,
+					tc.wantPURL, tc.wantVer, tc.wantPkg, tc.wantEcoSys)
+			}
+		})
+	}
+}

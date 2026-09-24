@@ -38,8 +38,9 @@ const (
 
 func newDB() *DB {
 	return &DB{
-		lookup:  fido.New[string, *Sample](fido.Size(lookupCacheSize), fido.TTL(lookupTTL)),
-		records: newRecordCache(),
+		lookup:     fido.New[string, *Sample](fido.Size(lookupCacheSize), fido.TTL(lookupTTL)),
+		records:    newRecordCache(),
+		recordKeys: newRecordIndex(),
 	}
 }
 

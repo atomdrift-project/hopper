@@ -737,6 +737,7 @@ type DB struct {
 	lite                  *sql.DB
 	lookup                *fido.Cache[string, *Sample]
 	records               *fido.Cache[string, *cachedRecord]
+	recordKeys            *recordIndex
 	cacheMemory           atomic.Pointer[cacheMemorySnapshot]
 	cacheMemoryRefreshing atomic.Bool
 	cacheMemoryAttempt    atomic.Int64
@@ -3116,6 +3117,11 @@ func (db *DB) prepareLocationMove(
 	if err == nil {
 		db.forgetSHA(sha256)
 	}
+	// A triage ruling of bad (cyclotron's "cyclotron:sighted-pinned" and the
+	// rest arrive here via /api/triage) is the commonest conviction there is.
+	if err == nil && ok && relabel != nil && relabel.Label == labelBad {
+		db.rescanSiblingsOfConvicted(ctx, sha256)
+	}
 	return ok, err
 }
 
@@ -3938,10 +3944,46 @@ type StoreStats struct {
 	Members       int   // members extracted from the archive envelope (0 = not an archive)
 	MembersStored int64 // member rows inserted or freshness-refreshed in this transaction
 
+	// PriorMaxCrit is the max_crit the row held before this store, and
+	// ParentsRequeued how many top-level archives containing the sample were
+	// queued for re-analysis because this store raised it (see
+	// [maxParentRequeue]). Both are zero on a first analysis.
+	PriorMaxCrit    int
+	ParentsRequeued int64
+
 	// Unchanged reports a store that wrote nothing because the row already held
 	// this exact analysis (see [unchangedStore]). The work still happened and
 	// the claim is still finished — only the write was skipped.
 	Unchanged bool
+}
+
+// maxParentRequeue bounds how many containing archives one store may queue for
+// re-analysis when it raises a sample's max_crit.
+//
+// A verdict on an archive is a verdict on its members as they were read at the
+// time, so when a member's own re-analysis finds more than that — new traits
+// fire on a file that was quiet — every archive holding it is carrying a stale
+// verdict. Nothing else revisits them promptly: the age-ordered rescan tier
+// reaches an archive when its own analysis is old, not when a member's changed.
+// So a rise queues the containing top-level archives in the repair tier
+// (rescan_priority 1, FIFO behind new ingestion), in the same pass as the store.
+//
+// Bounded because containment fan-out is savagely skewed — p50 one parent, p99
+// forty, the worst shas in millions (see idx_sl_child_parents). The bound is on
+// parents READ, applied inside the subquery, so the statement is an index-only
+// walk of at most this many distinct parents whatever the fan-out; a file in
+// more archives than this is one whose archives the age tier has to reach.
+// Only a rise triggers it, so the steady state pays nothing: no statement runs
+// unless max_crit actually went up on a renewal.
+const maxParentRequeue = 256
+
+// critRose reports whether a store should requeue the archives containing the
+// sample: a renewal (a prior analysis existed to be stale against) whose
+// max_crit went up. A first analysis has no prior verdict to have gone stale,
+// and a fall or no change leaves every containing verdict at least as severe
+// as the member now warrants.
+func critRose(stats *StoreStats, newCrit int) bool {
+	return stats.Renewed() && newCrit > stats.PriorMaxCrit
 }
 
 // unchangedStore reports whether a store would write what the row already says,
@@ -3981,6 +4023,35 @@ func (s StoreStats) Redundant(traitsVersion string) bool {
 	return s.Renewed() && s.PriorTraitsVersion != "" && s.PriorTraitsVersion == traitsVersion
 }
 
+// ResultAttribution names who produced an analysis, recorded with it on the
+// sample row (samples.analyzed_by, analyzer_version, analyzer_traits) in the
+// same UPDATE that stores the verdict — no extra statement, no extra round trip.
+//
+// It exists because the question "which worker scanned this?" had no answer on
+// 2026-09-23. The workers table keeps each worker's CURRENT scanner and traits
+// versions and is overwritten on every heartbeat, so once a fleet rolled forward
+// there was no telling whether a miss on the sckit worm samples came from a
+// stale node or from the rules. The row now says, durably, for as long as the
+// verdict it describes stands: a re-analysis replaces both together, and a
+// redundant one (same traits version, nothing written — see unchangedStore)
+// leaves the original producer credited for the verdict it actually produced.
+//
+// Worker is the qualified name (name:ip) the API tracks. Version and Traits are
+// what that worker last reported in its poll — self-reported, so a record of
+// what it claimed to be running, which is what an investigation needs to check
+// against. samples.traits_version, set alongside, remains the authoritative
+// version of the rules the stored verdict was produced under (the envelope's
+// own, when it carries one).
+//
+// Archive members are not stamped: they are written through the COPY staging
+// path, and each member row already names the archive whose analysis produced
+// it (samples.parent), whose own row carries the attribution.
+type ResultAttribution struct {
+	Worker  string
+	Version string
+	Traits  string
+}
+
 // StoreResult atomically persists a worker's full analysis for a sample and,
 // when the sample is an archive, all of its members — parent and members commit
 // together or not at all. This replaces the previous "truncate the parent now,
@@ -4004,7 +4075,10 @@ func (s StoreStats) Redundant(traitsVersion string) bool {
 // error and retrying forever. This mirrors how a worker-reported "unsupported" error is
 // tombstoned, and remains the belt-and-suspenders complement to the ingest-time
 // filter; a later purge-unsupported sweep reaps these.
-func (db *DB) StoreResult(ctx context.Context, sha256 string, cleaveRaw, litmusML, llm []byte, parsed *CleaveParseResult, traitsVersion string) (StoreStats, error) {
+func (db *DB) StoreResult(
+	ctx context.Context, sha256 string, cleaveRaw, litmusML, llm []byte,
+	parsed *CleaveParseResult, traitsVersion string, by ResultAttribution,
+) (StoreStats, error) {
 	var p CleaveParseResult
 	if parsed != nil {
 		p = *parsed
@@ -4015,19 +4089,51 @@ func (db *DB) StoreResult(ctx context.Context, sha256 string, cleaveRaw, litmusM
 		slog.Info("tombstoning unsupported sample (cleave returned no file type)", "sha256", sha256)
 		return StoreStats{}, db.SetSkip(ctx, sha256, "unsupported")
 	}
-	now := time.Now().UTC()
 	var stats StoreStats
 	var err error
 	if db.pool != nil {
-		stats, err = db.storeResultPG(ctx, sha256, cleaveRaw, litmusML, llm, p, traitsVersion, now)
+		stats, err = db.storeResultPG(ctx, sha256, cleaveRaw, litmusML, llm, p, traitsVersion, by)
 	} else {
-		stats, err = db.storeResultSQLite(ctx, sha256, cleaveRaw, litmusML, llm, p, traitsVersion, now)
+		stats, err = db.storeResultSQLite(ctx, sha256, cleaveRaw, litmusML, llm, p, traitsVersion, by)
 	}
 	if err == nil {
 		db.forgetSHA(sha256)
 	}
 	return stats, err
 }
+
+// AnalysisAttribution reads back who produced sample sha256's stored verdict
+// (see [ResultAttribution]). A sample never analyzed, or analyzed before the
+// columns existed, reads as the zero value; an absent sample is ErrNotFound.
+// One primary-key probe that touches no TOASTed column.
+func (db *DB) AnalysisAttribution(ctx context.Context, sha256 string) (ResultAttribution, error) {
+	const q = `SELECT analyzed_by, analyzer_version, analyzer_traits FROM samples WHERE sha256 = `
+	var by ResultAttribution
+	var err error
+	if db.pool != nil {
+		err = db.pool.QueryRow(ctx, q+`$1`, sha256).Scan(&by.Worker, &by.Version, &by.Traits)
+		if errors.Is(err, pgx.ErrNoRows) {
+			err = ErrNotFound
+		}
+	} else {
+		err = db.lite.QueryRowContext(ctx, q+`?`, sha256).Scan(&by.Worker, &by.Version, &by.Traits)
+		if errors.Is(err, sql.ErrNoRows) {
+			err = ErrNotFound
+		}
+	}
+	if err != nil {
+		return ResultAttribution{}, fmt.Errorf("hopper: analysis attribution %s: %w", sha256, err)
+	}
+	return by, nil
+}
+
+// cleaveWriteBackAttribution is the analyzed_by recorded when a cleave envelope
+// arrives through UpdateCleaveResult (POST /api/cleave-result) rather than from
+// a claim-holding worker. That endpoint names no worker, but it does replace the
+// verdict, so leaving the previous worker's name in place would credit it with
+// an analysis it did not produce. A constant is the honest answer: the verdict
+// came from a write-back, and the request log has the rest.
+const cleaveWriteBackAttribution = "cleave-result"
 
 // UpdateCleaveResult stores analysis output for a sample.
 // Pass a pre-parsed CleaveParseResult to avoid redundant JSON parsing,
@@ -4092,12 +4198,77 @@ func (db *DB) MarkCyclotronAttempt(ctx context.Context, sha256 string) error {
 	return db.writeSHA(sha256, err)
 }
 
-// Reclassify changes a sample's label.
+// Reclassify changes a sample's label. A conviction (label bad) also queues the
+// package's stale sibling artifacts for re-analysis; see QueueSiblingRescans.
 func (db *DB) Reclassify(ctx context.Context, sha256, label, source string) error {
+	var err error
 	if db.pool != nil {
-		return db.writeSHA(sha256, db.reclassifyPG(ctx, sha256, label, source))
+		err = db.writeSHA(sha256, db.reclassifyPG(ctx, sha256, label, source))
+	} else {
+		err = db.writeSHA(sha256, db.reclassifySQLite(ctx, sha256, label, source))
 	}
-	return db.writeSHA(sha256, db.reclassifySQLite(ctx, sha256, label, source))
+	if err == nil && label == labelBad {
+		db.rescanSiblingsOfConvicted(ctx, sha256)
+	}
+	return err
+}
+
+// maxSiblingRescan bounds how many sibling artifacts one conviction queues.
+//
+// A package with one convicted release is a package whose other releases are
+// suspects: the 2026-09-23 sckit worm shipped three malicious versions of one
+// npm plugin, and whoever compromised one release of a package has usually
+// been publishing more than one. The siblings already in the corpus were
+// judged "unknown" under whatever rules were current when they arrived — often
+// older rules, and without the knowledge that the package is compromised — so
+// a conviction is exactly when their verdicts are worth re-deriving.
+//
+// Bounded because a purl_base can be enormous (a popular package accumulates
+// every release and every build of each), and a conviction must not turn into
+// a bulk rescan of it. The newest siblings are taken first: a live compromise
+// is in the releases around the one convicted, and a bound should be spent
+// there rather than on a release from years ago.
+const maxSiblingRescan = 64
+
+// QueueSiblingRescans queues, in the repair tier, the other artifacts of the
+// convicted sample's package (same purl_base: other releases, and other files
+// of the same release — an sdist beside a convicted wheel) that are still
+// labelled unknown and whose analysis is older than the conviction's evidence:
+// analyzed no later than the convicted sample, under a different (or unknown)
+// traits version. At most maxSiblingRescan, newest first; rows already queued
+// at either priority are left alone, so an interactive request is never
+// demoted. Returns the number queued.
+//
+// One set-based statement per conviction, driven by idx_samples_purl_base; a
+// sample with no purl_base has no siblings and costs a primary-key probe.
+func (db *DB) QueueSiblingRescans(ctx context.Context, sha256 string) (int64, error) {
+	var shas []string
+	var err error
+	if db.pool != nil {
+		shas, err = db.queueSiblingRescansPG(ctx, sha256)
+	} else {
+		shas, err = db.queueSiblingRescansSQLite(ctx, sha256)
+	}
+	if err != nil {
+		return 0, err
+	}
+	db.forgetSHAs(shas)
+	return int64(len(shas)), nil
+}
+
+// rescanSiblingsOfConvicted is QueueSiblingRescans for the label-writing paths:
+// best-effort, after the conviction itself has committed. The label is the
+// decision and must not fail because a follow-up did; a missed sibling rescan
+// leaves those rows exactly as they were, for the age tier to reach.
+func (db *DB) rescanSiblingsOfConvicted(ctx context.Context, sha256 string) {
+	n, err := db.QueueSiblingRescans(ctx, sha256)
+	if err != nil {
+		slog.WarnContext(ctx, "sibling rescan after conviction failed", "sha256", sha256, "error", err)
+		return
+	}
+	if n > 0 {
+		slog.InfoContext(ctx, "conviction queued sibling artifacts for rescan", "sha256", sha256, "queued", n)
+	}
 }
 
 // CascadeLabel relabels an archive (sha256) to label/source and propagates the
@@ -4128,6 +4299,9 @@ func (db *DB) CascadeLabel(ctx context.Context, sha256, label, source string) (i
 	}
 	if err == nil {
 		db.flushLookups()
+		if label == labelBad {
+			db.rescanSiblingsOfConvicted(ctx, sha256)
+		}
 	}
 	return n, err
 }
@@ -5338,10 +5512,16 @@ func (db *DB) TriageSighted(ctx context.Context, limit int, freshAfter time.Time
 // day — so the work is confirmation rather than discovery, and every hour it
 // waits is an hour a named-bad release sits unlabelled in our corpus.
 //
-// The population is deliberately tiny, one or two rows at a time, which is what
-// lets a consumer give it precedence over its ordinary queues without starving
-// them: a queue that can be worked to empty in minutes preempts nothing for
-// long. Both bars do that work — dropping either would admit a tail.
+// The population is bounded by both bars — a pinned version, inside the window
+// — and dropping either would admit a tail. It is small but not "one or two
+// rows", as this comment once claimed: a single advisory import can pin dozens
+// of releases in one go (one source listed nineteen versions of one package on
+// 2026-09-23). That is why the order matters more than the size: rows are served
+// oldest-first by first sighting, a few per package per round (see
+// sightedPinnedPerPackage), so no package can monopolize a page and no row
+// waits behind claims that arrived after it. Newest-first ordering, used until
+// 2026-09-24, did the opposite: the rows that had waited longest were the ones
+// that aged out of the window unjudged.
 //
 // TriageSighted excludes exactly this set (triageSightedNotPinnedSQL), so the
 // two are disjoint, and a row that ages out of the window joins the ordinary

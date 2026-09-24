@@ -1810,6 +1810,16 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// (also a metadata-only operation — the new queue starts empty).
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS rescan_priority SMALLINT NOT NULL DEFAULT 0`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS rescan_requested_at TIMESTAMPTZ`,
+		// Result attribution (see ResultAttribution): which worker produced the
+		// stored verdict and what scanner/traits it reported. Written in the
+		// result store's own UPDATE, so recording it costs no statement. Constant
+		// defaults keep each ADD COLUMN metadata-only on PG11+ -- a brief catalog
+		// lock, never a table rewrite -- and none is indexed: these are read when
+		// investigating a verdict, never selected on, so they add no write
+		// amplification and leave result stores HOT-eligible.
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS analyzed_by TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS analyzer_version TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS analyzer_traits TEXT NOT NULL DEFAULT ''`,
 		`DROP INDEX IF EXISTS idx_samples_forced_rescan`,
 		`ALTER TABLE samples DROP COLUMN IF EXISTS forced_rescan_at`,
 		// Tiny partial index over queued rows only; covers both tier filters
@@ -3836,8 +3846,9 @@ func (db *DB) storeMemberRowsPG(ctx context.Context, rows [][]any) (int64, error
 // for a fraction of that.
 func (db *DB) storeResultPG(
 	ctx context.Context, sha256 string, cleaveRaw, litmusML, llm []byte,
-	parsed CleaveParseResult, traitsVersion string, now time.Time,
+	parsed CleaveParseResult, traitsVersion string, by ResultAttribution,
 ) (StoreStats, error) {
+	now := time.Now().UTC()
 	// Read the identity fields members inherit from the parent. A plain read,
 	// not SELECT … FOR UPDATE: the store is an idempotent, analyzed_at-gated
 	// merge that needs no identity lock, and the worst a relabel racing this
@@ -3850,13 +3861,14 @@ func (db *DB) storeResultPG(
 	var priorTraits, purlBase string
 	var createdAt time.Time
 	var llmMissing bool
+	var priorCrit int
 	if err := db.pool.QueryRow(ctx,
 		`SELECT label, label_source, source, feed, ecosystem, path, first_analyzed_at,
-		        analyzed_at, traits_version, purl_base, created_at, llm_result IS NULL
+		        analyzed_at, traits_version, purl_base, created_at, llm_result IS NULL, max_crit
 		   FROM samples WHERE sha256 = $1`, sha256).
 		Scan(&parent.Label, &parent.LabelSource, &parent.Source, &parent.Feed,
 			&parent.Ecosystem, &parent.Path, &firstAnalyzed,
-			&priorAnalyzed, &priorTraits, &purlBase, &createdAt, &llmMissing); err != nil {
+			&priorAnalyzed, &priorTraits, &purlBase, &createdAt, &llmMissing, &priorCrit); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return StoreStats{}, fmt.Errorf("hopper: store result for absent sample %s: %w", sha256, ErrNotFound)
 		}
@@ -3871,6 +3883,7 @@ func (db *DB) storeResultPG(
 		stats.PriorAnalyzedAt = priorAnalyzed.Time
 	}
 	stats.PriorTraitsVersion = priorTraits
+	stats.PriorMaxCrit = priorCrit
 	stats.PURLBase = purlBase
 	stats.CreatedAt = createdAt
 	if unchangedStore(&stats, traitsVersion, llm, llmMissing) {
@@ -3963,11 +3976,12 @@ func (db *DB) storeResultPG(
 			note = '', last_error_at = NULL, attempts = 0,
 			traits_version = $9, rescan_priority = 0, rescan_requested_at = NULL,
 			first_analyzed_at = COALESCE(first_analyzed_at, $10),
-			analyzed_at = $10, updated_at = $10
+			analyzed_at = $10, updated_at = $10,
+			analyzed_by = $11, analyzer_version = $12, analyzer_traits = $13
 		WHERE sha256 = $1`,
 		sha256, sanitizeJSONB(truncated), parsed.CanonicalSHA,
 		parsed.FileInfo.Elements, parsed.FileInfo.MaxCrit, parsed.FileInfo.SuspiciousCount,
-		litmusVal, llmVal, traitsVersion, now)
+		litmusVal, llmVal, traitsVersion, now, by.Worker, by.Version, by.Traits)
 	if err != nil {
 		return StoreStats{}, fmt.Errorf("hopper: update parent for store %s: %w", sha256, err)
 	}
@@ -3981,7 +3995,65 @@ func (db *DB) storeResultPG(
 	if err := tx.Commit(ctx); err != nil {
 		return StoreStats{}, fmt.Errorf("hopper: commit store: %w", err)
 	}
+
+	// After the commit, never inside it: this touches other samples' rows, and
+	// holding their locks in the store transaction would put every concurrent
+	// store of one of those archives behind this one. Best-effort for the same
+	// reason — the verdict above is durable, and a missed requeue leaves the
+	// archives where they were before this change, for the age tier to reach.
+	if critRose(&stats, parsed.FileInfo.MaxCrit) {
+		n, err := db.requeueContainingParentsPG(ctx, sha256, parsed.FileInfo.MaxCrit, traitsVersion)
+		if err != nil {
+			slog.WarnContext(ctx, "requeue of archives containing a raised sample failed",
+				"sha256", sha256, "max_crit", parsed.FileInfo.MaxCrit, "error", err)
+		}
+		stats.ParentsRequeued = n
+	}
 	return stats, nil
+}
+
+// requeueContainingParentsSQLPG queues the top-level archives that contain $1
+// for re-analysis in the repair tier; see maxParentRequeue for why and why
+// bounded. $2 is the sample's new max_crit, $3 the traits version it was
+// produced under, $4 the parent bound.
+//
+// The subquery is the whole cost: DISTINCT parent_sha256 for one sha, which
+// idx_sl_child_parents (sha256, parent_sha256, id DESC) serves as an index-only
+// scan already grouped by parent, so the LIMIT stops it after $4 parents no
+// matter how many locations the sha has. Every edge counts, not only
+// containment: a fetched dependency is analyzed as part of the package that
+// declared it, so that package's verdict went stale with it just the same.
+//
+// The outer filters skip archives the rise cannot have made stale, so they are
+// not re-analyzed for nothing: one already queued (at either priority, so an
+// interactive request is never demoted), one already at least as severe as
+// this member now is, and one analyzed under the very traits version that
+// produced the rise — that analysis read this member with the same rules. The
+// last test is a coarse one (traits_version is empty on older rows, which are
+// then requeued), which errs toward the rescan.
+const requeueContainingParentsSQLPG = `
+	UPDATE samples p SET rescan_priority = 1, rescan_requested_at = now(), updated_at = now()
+	  FROM (SELECT DISTINCT parent_sha256 FROM sample_locations
+	         WHERE sha256 = $1 AND parent_sha256 <> ''
+	         LIMIT $4) c
+	 WHERE p.sha256 = c.parent_sha256
+	   AND p.parent = '' AND p.skip = '' AND p.rescan_priority = 0
+	   AND p.cleave_result IS NOT NULL
+	   AND p.max_crit < $2
+	   AND (p.traits_version = '' OR p.traits_version <> $3)
+	RETURNING p.sha256`
+
+func (db *DB) requeueContainingParentsPG(ctx context.Context, sha256 string, maxCrit int, traitsVersion string) (int64, error) {
+	rows, err := db.pool.Query(ctx, requeueContainingParentsSQLPG, sha256, maxCrit, traitsVersion, maxParentRequeue)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: requeue containing parents of %s: %w", sha256, err)
+	}
+	shas, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return 0, fmt.Errorf("hopper: requeue containing parents of %s: %w", sha256, err)
+	}
+	db.forgetSHAs(shas)
+	return int64(len(shas)), nil
 }
 
 func (db *DB) sampleBySHA256PG(ctx context.Context, sha256 string) (*Sample, error) {
@@ -4914,7 +4986,8 @@ func (db *DB) updateCleaveResultPG(
 			traits_version = $7,
 			rescan_priority = 0, rescan_requested_at = NULL,
 			first_analyzed_at = COALESCE(first_analyzed_at, now()),
-			analyzed_at = now(), updated_at = now()
+			analyzed_at = now(), updated_at = now(),
+			analyzed_by = '`+cleaveWriteBackAttribution+`', analyzer_version = '', analyzer_traits = ''
 		WHERE sha256 = $1`,
 		sha256, sanitizeJSONB(result), canonical,
 		fi.Elements, fi.MaxCrit, fi.SuspiciousCount, traitsVersion)
@@ -4979,6 +5052,39 @@ func (db *DB) updateLLMResultPG(ctx context.Context, sha256 string, result []byt
 		return fmt.Errorf("hopper: update llm result: %w", err)
 	}
 	return nil
+}
+
+// queueSiblingRescansSQLPG is QueueSiblingRescans' statement; see there. $1 is
+// the convicted sha, $2 the bound. The literal non-empty test on sib.purl_base lets
+// the planner use idx_samples_purl_base (partial on it) for the sibling probe.
+// A convicted sample never analyzed stands in as analyzed now, so its siblings
+// are compared against the time of the conviction.
+const queueSiblingRescansSQLPG = `
+	UPDATE samples s SET rescan_priority = 1, rescan_requested_at = now(), updated_at = now()
+	  FROM (SELECT sib.id
+	          FROM samples c
+	          JOIN samples sib ON sib.purl_base = c.purl_base
+	         WHERE c.sha256 = $1 AND c.purl_base <> '' AND sib.purl_base <> ''
+	           AND sib.sha256 <> c.sha256
+	           AND sib.label = 'unknown' AND sib.parent = '' AND sib.skip = ''
+	           AND sib.rescan_priority = 0 AND sib.cleave_result IS NOT NULL
+	           AND sib.analyzed_at <= COALESCE(c.analyzed_at, now())
+	           AND (sib.traits_version = '' OR sib.traits_version <> c.traits_version)
+	         ORDER BY sib.created_at DESC, sib.id DESC
+	         LIMIT $2) v
+	 WHERE s.id = v.id
+	RETURNING s.sha256`
+
+func (db *DB) queueSiblingRescansPG(ctx context.Context, sha256 string) ([]string, error) {
+	rows, err := db.pool.Query(ctx, queueSiblingRescansSQLPG, sha256, maxSiblingRescan)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: queue sibling rescans of %s: %w", sha256, err)
+	}
+	shas, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("hopper: queue sibling rescans of %s: %w", sha256, err)
+	}
+	return shas, nil
 }
 
 func (db *DB) reclassifyPG(ctx context.Context, sha256, label, source string) error {
@@ -5699,13 +5805,13 @@ func (db *DB) triageReviewPG(ctx context.Context, limit int, f TriageFilter) ([]
 	return scanPGSamplesLight(rows)
 }
 
-// triageSightedPinnedPG: see TriageSightedPinned.
+// triageSightedPinnedPG: see TriageSightedPinned and triageSightedPinnedSQL.
 //
-// Written as a plain CTE rather than in triageSightedPG's LATERAL form. That
+// Written as plain CTEs rather than in triageSightedPG's LATERAL form. That
 // shape exists to keep work proportional to the batch when the ledger slice is
 // large; here the slice is one day of version-pinned claims, which is the point
 // of the queue, so the straightforward join is both fast enough and far easier
-// to read against the SQLite twin.
+// to read against the SQLite twin — the two now share one statement.
 func (db *DB) triageSightedPinnedPG(
 	ctx context.Context, limit int, freshAfter time.Time, f TriageFilter,
 ) ([]*Sample, error) {
@@ -5715,11 +5821,7 @@ func (db *DB) triageSightedPinnedPG(
 	limitIdx := len(args) + 1
 	args = append(args, limit)
 	rows, err := db.pool.Query(ctx,
-		fmt.Sprintf(triageSightedPinnedMatchCTE, "$1")+`SELECT `+pgSampleColsLight+` FROM samples
-		 JOIN latest_sightings ON latest_sightings.matched_sha = samples.sha256
-		 WHERE `+triageSightedWhere+extra+`
-		 ORDER BY latest_sightings.sighted_at DESC,
-		          samples.created_at DESC, samples.id DESC LIMIT $`+strconv.Itoa(limitIdx),
+		triageSightedPinnedSQL("$1", extra, pgSampleColsLight, "$"+strconv.Itoa(limitIdx)),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage sighted-pinned: %w", err)
@@ -10038,8 +10140,48 @@ func (db *DB) activeWorkersPG(ctx context.Context, since time.Duration) ([]Worke
 	return out, rows.Err()
 }
 
+// versionRepair decides what backfillVersionPG may write for one row: the
+// version recovered from base (the stored filename) and, for a wheel with no
+// identity, the purl_base its name implies. ok is false when the row keeps what
+// it has.
+//
+// The version rewrites are two arms, and only two. Fill a blank version from the
+// filename; or trim a wheel whose stored version swallowed its PEP 427
+// compatibility tags. Anything else keeps what it has: rewriting a version we
+// merely parse differently would move a row off the release the registry
+// actually served. The identity arm only fills an empty purl_base, and only from
+// a wheel, whose format names the registry.
+func versionRepair(base, have, havePURL string) (version, purl string, ok bool) {
+	_, want, _ := pkgparse.ParseFilename(base)
+	if want == "" {
+		return "", "", false
+	}
+	if havePURL == "" {
+		wheelPURL, wheelVer, isWheel := pkgparse.WheelIdentity(base)
+		if !isWheel {
+			return "", "", false
+		}
+		purl, want = wheelPURL, wheelVer
+	}
+	version = have
+	fill := have == ""
+	trim := strings.HasSuffix(base, ".whl") && strings.HasPrefix(have, want+"-")
+	if fill || trim {
+		version = want
+	}
+	if !fill && !trim {
+		// The version stands. A wheel missing only its identity is still
+		// repaired -- provided the release it states is the one on the row.
+		if purl == "" || have != want {
+			return "", "", false
+		}
+	}
+	return version, purl, true
+}
+
 // backfillVersionPG recovers samples.version from the stored location filename
-// for package rows that have an identity but no recorded release.
+// for package rows that have an identity but no recorded release, and repairs
+// the wheel rows whose identity was never recorded at all.
 //
 // Found 2026-09-08 alongside the version-blind corroboration marking. Forager's
 // firehose fetches stored Version: pkg.Version, which is empty for a package
@@ -10059,61 +10201,73 @@ func (db *DB) activeWorkersPG(ctx context.Context, since time.Duration) ([]Worke
 // which 84k stored PyPI rows still carry. That is the same defect wearing a
 // different hat: a version an advisory's affected list can never match.
 //
-// Those are the only two rewrites. A version we merely parse differently is
-// left alone, because moving a row off the release the registry served is worse
-// than leaving a stale one. Streams in id-cursor batches the way backfillPURLPG
-// does, and is idempotent: a second run finds nothing. A version-only update
+// And it gives a wheel with no purl_base the identity its filename states
+// (pkgparse.WheelIdentity). Those rows were outside this sweep entirely until
+// 2026-09-24, because it only ever looked at rows that already had an identity
+// -- yet they are exactly the ones the entry-path bug produced: the sckit wheel
+// memoryos-2.0.34-py3-none-any.whl came in as an upload with no sidecar, was
+// stored with version "2.0.34-py3-none-any" and purl_base "", and so could not
+// meet the advisory naming it in any queue that joins on purl_base+version.
+// Only wheels: the format names its registry, where an sdist's does not.
+//
+// Those are the only rewrites (see versionRepair). A version we merely parse
+// differently is left alone, because moving a row off the release the registry
+// served is worse than leaving a stale one, and a purl_base already recorded is
+// never replaced. Streams in id-cursor batches the way backfillPURLPG does, and
+// is idempotent: a second run finds nothing. A version/identity-only update
 // fires no trigger and bumps no updated_at -- recording the release a row
 // always was is not a state change.
 func (db *DB) backfillVersionPG(ctx context.Context, dryRun bool) (int64, error) {
 	const batchRows = 20000
 	var updated, cursor int64
 	for {
+		// The second arm reads samples.filename rather than waiting on the
+		// location subquery to find out: the location path is still what the
+		// repair parses, but the arm needs a cheap way to say "this is a wheel"
+		// before paying for it.
 		rows, err := db.pool.Query(ctx, `
-			SELECT s.id, s.version, (
+			SELECT s.id, s.version, s.purl_base, (
 				SELECT l.path FROM sample_locations l
 				WHERE l.sha256 = s.sha256 ORDER BY l.id LIMIT 1
-			) FROM samples s
-			WHERE s.id > $1 AND s.purl_base <> '' AND s.parent = ''
-			  AND (s.version = '' OR s.version LIKE '%-%')
+			), s.filename FROM samples s
+			WHERE s.id > $1 AND s.parent = ''
+			  AND ((s.purl_base <> '' AND (s.version = '' OR s.version LIKE '%-%'))
+			    OR (s.purl_base = '' AND s.filename LIKE '%.whl'))
 			ORDER BY s.id LIMIT $2`, cursor, batchRows)
 		if err != nil {
 			return updated, fmt.Errorf("hopper: backfill version select: %w", err)
 		}
 		var ids []int64
-		var vers []string
+		var vers, purls []string
 		var seen int
 		var maxID int64
 		for rows.Next() {
 			var id int64
-			var have string
+			var have, havePURL, filename string
 			var path *string
-			if err := rows.Scan(&id, &have, &path); err != nil {
+			if err := rows.Scan(&id, &have, &havePURL, &path, &filename); err != nil {
 				rows.Close()
 				return updated, fmt.Errorf("hopper: backfill version scan: %w", err)
 			}
 			seen++
 			maxID = id
-			if path == nil {
-				continue // no location on file: nothing to parse
+			base := filename
+			if path != nil {
+				base = filepath.Base(*path)
 			}
-			base := filepath.Base(*path)
-			_, want, _ := pkgparse.ParseFilename(base)
-			if want == "" || want == have {
-				continue
+			// The identity arm was selected on samples.filename; if the
+			// location's name is not the wheel (a sha-named copy, say), the
+			// filename it was selected on is the one to read.
+			if havePURL == "" && !strings.HasSuffix(base, ".whl") {
+				base = filename
 			}
-			// Two arms, and only two. Fill a blank version from the filename;
-			// or trim a wheel whose stored version swallowed its PEP 427
-			// compatibility tags. Anything else keeps what it has: rewriting a
-			// version we merely parse differently would move a row off the
-			// release the registry actually served.
-			fill := have == ""
-			trim := strings.HasSuffix(base, ".whl") && strings.HasPrefix(have, want+"-")
-			if !fill && !trim {
+			ver, purl, ok := versionRepair(base, have, havePURL)
+			if !ok {
 				continue
 			}
 			ids = append(ids, id)
-			vers = append(vers, want)
+			vers = append(vers, ver)
+			purls = append(purls, purl)
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
@@ -10124,10 +10278,14 @@ func (db *DB) backfillVersionPG(ctx context.Context, dryRun bool) (int64, error)
 			break
 		}
 		if len(ids) > 0 && !dryRun {
+			// purl_base is only ever filled, never replaced: the CASE keeps any
+			// identity a concurrent writer recorded after the SELECT above.
 			tag, err := db.pool.Exec(ctx, `
-				UPDATE samples s SET version = v.version
-				FROM unnest($1::bigint[], $2::text[]) AS v(id, version)
-				WHERE s.id = v.id AND s.version <> v.version`, ids, vers)
+				UPDATE samples s SET version = v.version,
+					purl_base = CASE WHEN s.purl_base = '' THEN v.purl ELSE s.purl_base END
+				FROM unnest($1::bigint[], $2::text[], $3::text[]) AS v(id, version, purl)
+				WHERE s.id = v.id AND (s.version <> v.version OR (s.purl_base = '' AND v.purl <> ''))`,
+				ids, vers, purls)
 			if err != nil {
 				return updated, fmt.Errorf("hopper: backfill version update: %w", err)
 			}

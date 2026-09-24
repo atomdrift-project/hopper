@@ -224,13 +224,16 @@ func TestTriageSightedUsesLedgerScope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TriageSightedPinned: %v", err)
 	}
-	wantPinned := []string{exact, suspicious}
+	// Oldest first sighting first: suspicious was claimed an hour before
+	// exact, so it has waited longer and is served first. (Newest-first, the
+	// order until 2026-09-24, let fresh claims starve the ones already waiting.)
+	wantPinned := []string{suspicious, exact}
 	if len(pinned) != len(wantPinned) {
 		t.Fatalf("TriageSightedPinned returned %d rows, want %d: %+v", len(pinned), len(wantPinned), pinned)
 	}
 	for i, sha := range wantPinned {
 		if pinned[i].SHA256 != sha {
-			t.Errorf("pinned row %d = %s, want %s (newest pinned claim first)", i, pinned[i].SHA256, sha)
+			t.Errorf("pinned row %d = %s, want %s (oldest pinned claim first)", i, pinned[i].SHA256, sha)
 		}
 	}
 	for _, sample := range pinned {

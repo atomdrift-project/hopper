@@ -2,15 +2,19 @@ package hopper
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/atomdrift-project/hopper/pkgparse"
 	"github.com/codeGROOVE-dev/fido"
+	"github.com/jackc/pgx/v5"
 )
 
 // The rendered-record pool behind LookupRecord.
@@ -144,7 +148,7 @@ type cachedRecord struct {
 func (db *DB) LookupRecord(ctx context.Context, sha256, base, version string) (*LookupRecord, error) {
 	if sha256 != "" {
 		record, err := db.recordFor(lookupSHAKey(sha256), func() (*LookupRecord, time.Duration, error) {
-			sample, err := db.SampleBySHA256(ctx, sha256)
+			sample, err := db.recordSampleBySHA256(ctx, sha256)
 			if err != nil {
 				if errors.Is(err, ErrNotFound) {
 					// Nothing holds these bytes. Outside sources may still know
@@ -169,7 +173,7 @@ func (db *DB) LookupRecord(ctx context.Context, sha256, base, version string) (*
 		return nil, ErrNotFound
 	}
 	return db.recordFor(lookupPURLKey(base, version), func() (*LookupRecord, time.Duration, error) {
-		sample, err := db.SampleByPURL(ctx, base, version)
+		sample, err := db.recordSampleByPURL(ctx, base, version)
 		if err != nil {
 			if errors.Is(err, ErrNotFound) {
 				return db.fromLedger(ctx, "", base, version)
@@ -233,6 +237,11 @@ func (db *DB) recordFor(key string, load func() (*LookupRecord, time.Duration, e
 		if ttl > 0 {
 			entry.expires = time.Now().Add(ttl)
 		}
+		// Indexed before fido stores the entry, never after: a write landing
+		// between the two must still find the key to drop.
+		if record.SHA256 != nil && key != lookupSHAKey(*record.SHA256) {
+			db.recordKeys.add(*record.SHA256, key, db.records)
+		}
 		return entry, nil
 	})
 	if ran {
@@ -271,9 +280,13 @@ func (db *DB) forgetRecord(key string) {
 
 // forgetRecordsBySHA drops rendered records this sample backs but whose keys a
 // write cannot name — a record cached under a PURL whose sample the other pool
-// has already evicted. Called only from the branch that sweeps the sample pool
-// anyway, so it adds cost where a sweep is already being paid for rather than a
-// sweep of its own.
+// has already evicted.
+//
+// It used to find them by sweeping the whole record pool, on every result
+// store and every upload: 59% of hopper's CPU on smaug (2026-09-24, 2.9 of 4.8
+// busy cores), all of it inside a held result slot. The keys now come from
+// [recordIndex], filled as each such record is cached, so this is a handful of
+// direct deletes.
 //
 // Cached absences are deliberately left alone. Dropping them here would mean a
 // write to any row clearing every negative entry in the pool, and under steady
@@ -283,17 +296,197 @@ func (db *DB) forgetRecordsBySHA(shas map[string]struct{}) {
 	if db.records == nil || len(shas) == 0 {
 		return
 	}
-	for k, v := range db.records.Range() {
-		if v == nil || v.record == nil {
-			continue
+	for _, key := range db.recordKeys.take(shas) {
+		db.records.Delete(key)
+	}
+}
+
+// recordIndex maps a digest to the record-pool keys, other than its own sha
+// key, whose cached record names it: the PURL keys, which a write holding only
+// the digest could not otherwise reach.
+//
+// It is filled when a record is cached and emptied for a digest when that
+// digest is written. Entries whose record the pool has since evicted are
+// harmless — deleting an absent key is a no-op, and deleting one that was
+// re-cached for another digest only costs that record a reload — but they
+// would accumulate, so the index is pruned against the pool once it outgrows
+// it, which amortizes the one sweep a prune costs over a pool's worth of
+// inserts.
+type recordIndex struct {
+	mu    sync.Mutex
+	bySHA map[string]map[string]time.Time
+	n     int
+	// pruneAt is the entry count that triggers the next prune.
+	pruneAt int
+}
+
+// recordIndexMinAge is how long an entry is exempt from pruning. The index is
+// written inside the record loader, just before fido stores the entry, so for
+// that instant a live key is not yet in the pool; a prune in that window must
+// not mistake it for an evicted one.
+const recordIndexMinAge = time.Minute
+
+func newRecordIndex() *recordIndex {
+	return &recordIndex{bySHA: map[string]map[string]time.Time{}, pruneAt: 2 * recordCacheSize}
+}
+
+// add records that key's cached record names sha. pool is what a prune checks
+// entries against.
+func (ix *recordIndex) add(sha, key string, pool *fido.Cache[string, *cachedRecord]) {
+	if ix == nil {
+		return
+	}
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	keys := ix.bySHA[sha]
+	if keys == nil {
+		keys = map[string]time.Time{}
+		ix.bySHA[sha] = keys
+	}
+	if _, ok := keys[key]; !ok {
+		ix.n++
+	}
+	keys[key] = time.Now()
+	if ix.n >= ix.pruneAt && pool != nil {
+		ix.pruneLocked(pool)
+	}
+}
+
+// take removes and returns every key indexed under any of shas.
+func (ix *recordIndex) take(shas map[string]struct{}) []string {
+	if ix == nil {
+		return nil
+	}
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	var out []string
+	for sha := range shas {
+		for key := range ix.bySHA[sha] {
+			out = append(out, key)
 		}
-		if v.record.SHA256 == nil {
-			continue // a ledger-backed record names no bytes to invalidate by
-		}
-		if _, ok := shas[*v.record.SHA256]; ok {
-			db.records.Delete(k)
+		ix.n -= len(ix.bySHA[sha])
+		delete(ix.bySHA, sha)
+	}
+	return out
+}
+
+// pruneLocked drops entries whose record the pool no longer holds for that
+// digest, then sets the next threshold at twice what survived (never below
+// twice the pool) so prunes stay proportional to inserts.
+func (ix *recordIndex) pruneLocked(pool *fido.Cache[string, *cachedRecord]) {
+	live := make(map[string]string, pool.Len())
+	for k, v := range pool.Range() {
+		if v != nil && v.record != nil && v.record.SHA256 != nil {
+			live[k] = *v.record.SHA256
 		}
 	}
+	cutoff := time.Now().Add(-recordIndexMinAge)
+	for sha, keys := range ix.bySHA {
+		for key, at := range keys {
+			if live[key] != sha && at.Before(cutoff) {
+				delete(keys, key)
+				ix.n--
+			}
+		}
+		if len(keys) == 0 {
+			delete(ix.bySHA, sha)
+		}
+	}
+	ix.pruneAt = max(2*ix.n, 2*recordCacheSize)
+}
+
+// recordSampleCols is every column [recordOf] and [DB.corroborate] read, and
+// nothing else. The record path used to load the full sample row, cleave_result
+// included — 34 kB average compressed on a package row (2026-09-24), detoasted
+// and shipped to hopper on every record-cache miss only to test that it was
+// non-empty. Its presence is the one fact needed, and is selected as such.
+// Shared by both backends: every expression here is portable.
+const recordSampleCols = `sha256, ecosystem, domain, package, version, purl_base,
+	litmus_result, llm_result, traits_version, analyzed_at,
+	COALESCE(top_traits, ''), corroborated, cleave_result IS NOT NULL`
+
+// recordSampleBySHA256 loads the record projection for one digest. It bypasses
+// the sample pool on purpose: the record pool above it already caches the
+// rendered answer, so a second copy of the row — the heavy one — bought nothing
+// but eviction churn.
+func (db *DB) recordSampleBySHA256(ctx context.Context, sha256 string) (*Sample, error) {
+	query := `SELECT ` + recordSampleCols + ` FROM samples WHERE sha256 = $1`
+	if db.pool == nil {
+		query = strings.Replace(query, "$1", "?", 1)
+	}
+	return db.recordSample(ctx, query, sha256)
+}
+
+// recordSampleByPURL loads the record projection for the newest analyzed
+// top-level sample of a package identity: the same rows, predicates and order
+// as [DB.SampleByPURL], so the two cannot disagree about which release a PURL
+// names.
+func (db *DB) recordSampleByPURL(ctx context.Context, base, version string) (*Sample, error) {
+	if base == "" {
+		return nil, ErrNotFound
+	}
+	query := `SELECT ` + recordSampleCols + ` FROM samples
+		WHERE purl_base = $1
+		  AND purl_base <> ''
+		  AND litmus_result IS NOT NULL
+		  AND cleave_result IS NOT NULL
+		  AND file_type <> 'registry'`
+	args := []any{base}
+	if version != "" {
+		query += ` AND version = $2`
+		args = append(args, version)
+	}
+	if db.pool != nil {
+		query += ` ORDER BY analyzed_at DESC NULLS LAST LIMIT 1`
+	} else {
+		query = strings.NewReplacer("$1", "?", "$2", "?").Replace(query) + ` ORDER BY analyzed_at DESC LIMIT 1`
+	}
+	return db.recordSample(ctx, query, args...)
+}
+
+// recordSample runs one record-projection query. A present cleave_result is
+// reported by setting CleaveResult to a one-byte placeholder: recordOf reads
+// only its length, and nothing else ever sees this sample.
+func (db *DB) recordSample(ctx context.Context, query string, args ...any) (*Sample, error) {
+	s := &Sample{}
+	var hasCleave bool
+	var err error
+	if db.pool != nil {
+		err = db.pool.QueryRow(ctx, query, args...).Scan(
+			&s.SHA256, &s.Ecosystem, &s.Domain, &s.Package, &s.Version, &s.PURLBase,
+			&s.LitmusResult, &s.LLMResult, &s.TraitsVersion, &s.AnalyzedAt,
+			&s.TopTraits, &s.Corroborated, &hasCleave)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+	} else {
+		var litmus, llm sql.NullString
+		var analyzedAt sql.NullTime
+		err = db.lite.QueryRowContext(ctx, query, args...).Scan(
+			&s.SHA256, &s.Ecosystem, &s.Domain, &s.Package, &s.Version, &s.PURLBase,
+			&litmus, &llm, &s.TraitsVersion, &analyzedAt,
+			&s.TopTraits, &s.Corroborated, &hasCleave)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		if litmus.Valid {
+			s.LitmusResult = []byte(litmus.String)
+		}
+		if llm.Valid {
+			s.LLMResult = []byte(llm.String)
+		}
+		if analyzedAt.Valid {
+			s.AnalyzedAt = &analyzedAt.Time
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("hopper: lookup record: %w", err)
+	}
+	s.restoreJSONB()
+	if hasCleave {
+		s.CleaveResult = []byte{'1'}
+	}
+	return s, nil
 }
 
 // recordOf projects a stored sample onto the wire.

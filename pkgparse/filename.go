@@ -74,7 +74,7 @@ var filenamePatterns = []*regexp.Regexp{
 	// instead of "0.5.0". That reading is not cosmetic -- it is the version a
 	// PyPI advisory's affected list is matched against, so a wheel could never
 	// match a claim naming the release it actually is.
-	regexp.MustCompile(`^(?P<name>[^-]+)-(?P<version>\d[^-]*)(?:-\d[^-]*)?-[^-]+-[^-]+-[^-]+\.whl$`),
+	wheelPattern,
 
 	// Non-greedy-name patterns: tarball / wheel / crate / jar / gem /
 	// nupkg / vsix / crx / xpi / AppImage. Non-greedy `(.+?)` captures
@@ -144,6 +144,56 @@ func ParseFilename(filename string) (name, version, arch string) {
 	return "", "", ""
 }
 
+// wheelPattern is the PEP 427 wheel rule, shared by ParseFilename's pattern list
+// and ParseWheel so the two can never disagree about where a wheel's version
+// ends. The optional build tag must start with a digit per the spec, which is
+// what lets it sit between the version and the python tag unambiguously.
+var wheelPattern = regexp.MustCompile(`^(?P<name>[^-]+)-(?P<version>\d[^-]*)(?:-\d[^-]*)?-[^-]+-[^-]+-[^-]+\.whl$`)
+
+// ParseWheel splits a PEP 427 wheel filename,
+// {distribution}-{version}(-{build})?-{python}-{abi}-{platform}.whl, into its
+// distribution name and version. ok is false for anything that is not a
+// well-formed wheel name.
+//
+// A wheel is the one download format whose filename is a complete, unambiguous
+// identity: the spec forbids a hyphen inside either the distribution or the
+// version, so the split needs no guessing and no outside knowledge of the name.
+// That is why callers holding a wheel should prefer this over the name-anchored
+// [VersionForName], whose loose version shape happily swallows the three
+// compatibility tags ("2.0.34-py3-none-any"), and why the format alone is
+// enough to name the registry (see [WheelIdentity]).
+func ParseWheel(filename string) (name, version string, ok bool) {
+	m := wheelPattern.FindStringSubmatch(datePrefix.ReplaceAllString(filename, ""))
+	if m == nil {
+		return "", "", false
+	}
+	return m[wheelPattern.SubexpIndex("name")], m[wheelPattern.SubexpIndex("version")], true
+}
+
+// WheelIdentity returns the version-less purl_base a wheel filename implies —
+// "pkg:pypi/<PEP 503 name>", the same canonical spelling [SourcePURLIdentity]
+// and parallax produce for PyPI — and its version. ok is false when filename is
+// not a wheel.
+//
+// A .whl is only ever a Python distribution, so the registry is known from the
+// format even when nothing else about the file's origin is: an upload with no
+// producer sidecar lands in the "_unknown" tree with no ecosystem, and without
+// this its purl_base stayed empty, which hid it from every queue and sighting
+// join keyed on purl_base+version. A source distribution (.tar.gz/.zip) gets no
+// such inference: the same archive shape is every other ecosystem's tarball too,
+// so the format does not name the registry.
+func WheelIdentity(filename string) (purlBase, version string, ok bool) {
+	name, version, ok := ParseWheel(filename)
+	if !ok {
+		return "", "", false
+	}
+	purlBase, ok = SourcePURLIdentity("pypi", "", name)
+	if !ok {
+		return "", "", false
+	}
+	return purlBase, version, true
+}
+
 // archiveExtensions are the suffixes VersionForName strips before splitting,
 // compound forms first so ".tar.gz" wins over ".gz"-less ".tar".
 var archiveExtensions = []string{
@@ -186,6 +236,21 @@ var datePrefix = regexp.MustCompile(`^(?:19|20)\d\d-[01]\d-[0-3]\d-`)
 // ParseFilename's joint guess.
 func VersionForName(filename, name string) string {
 	if name == "" || filename == "" {
+		return ""
+	}
+	// A wheel's version ends at the first hyphen by spec, and the generic
+	// split below would hand back the compatibility tags as part of it
+	// ("2.0.34-py3-none-any" for memoryos-2.0.34-py3-none-any.whl), because
+	// versionShape admits hyphens for the formats that need them. Anchor on
+	// the wheel rule instead, comparing names under PEP 503 so the "_"-escaped
+	// spelling on disk matches a registry spelling with "-" or ".". A name
+	// that does not match is not this package's wheel: say so, and let the
+	// caller fall back to ParseFilename, which applies the same wheel rule.
+	if strings.HasSuffix(filename, ".whl") {
+		wheelName, version, ok := ParseWheel(filename)
+		if ok && pep503(wheelName) == pep503(name) {
+			return version
+		}
 		return ""
 	}
 	// Only formats whose filenames are exactly <name><sep><version>.<ext>.

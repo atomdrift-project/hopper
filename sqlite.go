@@ -398,6 +398,10 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		// malecule as the detail page. Written by the same Go result-store
 		// paths; '' means "no graph recorded", and readers fall back.
 		{"trait_graph", `ALTER TABLE samples ADD COLUMN trait_graph TEXT NOT NULL DEFAULT ''`},
+		// Result attribution; see ResultAttribution and the pg.go migration.
+		{"analyzed_by", `ALTER TABLE samples ADD COLUMN analyzed_by TEXT NOT NULL DEFAULT ''`},
+		{"analyzer_version", `ALTER TABLE samples ADD COLUMN analyzer_version TEXT NOT NULL DEFAULT ''`},
+		{"analyzer_traits", `ALTER TABLE samples ADD COLUMN analyzer_traits TEXT NOT NULL DEFAULT ''`},
 	} {
 		if pragmaHasColumn(ctx, db.lite, col.name) == 0 {
 			if _, err := db.lite.ExecContext(ctx, col.ddl); err != nil {
@@ -2563,11 +2567,12 @@ func (db *DB) updateCleaveResultSQLite(
 			traits_version = ?,
 			rescan_priority = 0, rescan_requested_at = NULL,
 			first_analyzed_at = COALESCE(first_analyzed_at, ?),
-			analyzed_at = ?, updated_at = ?
+			analyzed_at = ?, updated_at = ?,
+			analyzed_by = ?, analyzer_version = '', analyzer_traits = ''
 		WHERE sha256 = ?`,
 		string(result), canonical, fi.Elements,
 		fi.MaxCrit, fi.SuspiciousCount, fi.TopTraits, fi.TraitGraph,
-		traitsVersion, n, n, n, sha256)
+		traitsVersion, n, n, n, cleaveWriteBackAttribution, sha256)
 	if err != nil {
 		return fmt.Errorf("hopper: update cleave result: %w", err)
 	}
@@ -2580,8 +2585,9 @@ func (db *DB) updateCleaveResultSQLite(
 // when strictly newer, mirroring memberConflictUpdatePG.
 func (db *DB) storeResultSQLite(
 	ctx context.Context, sha256 string, cleaveRaw, litmusML, llm []byte,
-	p CleaveParseResult, traitsVersion string, now time.Time,
+	parsed CleaveParseResult, traitsVersion string, by ResultAttribution,
 ) (StoreStats, error) {
+	now := time.Now().UTC()
 	truncated := compactCleaveResultForStorage(cleaveRaw)
 	nowStr := now.UTC().Format(time.RFC3339Nano)
 
@@ -2596,13 +2602,14 @@ func (db *DB) storeResultSQLite(
 	var priorTraits, purlBase string
 	var createdAt sqliteNullTime
 	var llmMissing bool
+	var priorCrit int
 	if err := tx.QueryRowContext(ctx,
 		`SELECT label, label_source, source, feed, ecosystem, path, first_analyzed_at,
-		        analyzed_at, traits_version, purl_base, created_at, llm_result IS NULL
+		        analyzed_at, traits_version, purl_base, created_at, llm_result IS NULL, max_crit
 		   FROM samples WHERE sha256 = ?`, sha256).
 		Scan(&parent.Label, &parent.LabelSource, &parent.Source, &parent.Feed,
 			&parent.Ecosystem, &parent.Path, &firstAnalyzed,
-			&priorAnalyzed, &priorTraits, &purlBase, &createdAt, &llmMissing); err != nil {
+			&priorAnalyzed, &priorTraits, &purlBase, &createdAt, &llmMissing, &priorCrit); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return StoreStats{}, fmt.Errorf("hopper: store result for absent sample %s: %w", sha256, ErrNotFound)
 		}
@@ -2618,6 +2625,7 @@ func (db *DB) storeResultSQLite(
 		}
 	}
 	stats.PriorTraitsVersion = priorTraits
+	stats.PriorMaxCrit = priorCrit
 	stats.PURLBase = purlBase
 	stats.CreatedAt = createdAt.Time
 	// Same fast path as storeResultPG, and the same reason: the transaction
@@ -2635,19 +2643,20 @@ func (db *DB) storeResultSQLite(
 			note = '', last_error_at = NULL, attempts = 0,
 			traits_version = ?, rescan_priority = 0, rescan_requested_at = NULL,
 			first_analyzed_at = COALESCE(first_analyzed_at, ?),
-			analyzed_at = ?, updated_at = ?
+			analyzed_at = ?, updated_at = ?,
+			analyzed_by = ?, analyzer_version = ?, analyzer_traits = ?
 		WHERE sha256 = ?`,
-		string(truncated), p.CanonicalSHA, p.FileInfo.Elements,
-		p.FileInfo.MaxCrit, p.FileInfo.SuspiciousCount, p.FileInfo.TopTraits, p.FileInfo.TraitGraph,
+		string(truncated), parsed.CanonicalSHA, parsed.FileInfo.Elements,
+		parsed.FileInfo.MaxCrit, parsed.FileInfo.SuspiciousCount, parsed.FileInfo.TopTraits, parsed.FileInfo.TraitGraph,
 		jsonTextOrNil(litmusML), jsonTextOrNil(llm),
-		traitsVersion, nowStr, nowStr, nowStr, sha256); err != nil {
+		traitsVersion, nowStr, nowStr, nowStr, by.Worker, by.Version, by.Traits, sha256); err != nil {
 		return StoreStats{}, fmt.Errorf("hopper: update parent: %w", err)
 	}
 
 	parent.SHA256 = sha256
 	parent.CleaveResult = cleaveRaw
 	parent.LitmusResult = litmusML
-	parent.CanonicalSHA256 = p.CanonicalSHA
+	parent.CanonicalSHA256 = parsed.CanonicalSHA
 	parent.AnalyzedAt = &now
 	if firstAnalyzed.Valid {
 		if t, perr := time.Parse(time.RFC3339Nano, firstAnalyzed.String); perr == nil {
@@ -2748,7 +2757,82 @@ func (db *DB) storeResultSQLite(
 	if err := tx.Commit(); err != nil {
 		return StoreStats{}, fmt.Errorf("hopper: commit store: %w", err)
 	}
+	// Mirrors storeResultPG: after the commit, best-effort.
+	if critRose(&stats, parsed.FileInfo.MaxCrit) {
+		n, err := db.requeueContainingParentsSQLite(ctx, sha256, parsed.FileInfo.MaxCrit, traitsVersion)
+		if err != nil {
+			slog.WarnContext(ctx, "requeue of archives containing a raised sample failed",
+				"sha256", sha256, "max_crit", parsed.FileInfo.MaxCrit, "error", err)
+		}
+		stats.ParentsRequeued = n
+	}
 	return stats, nil
+}
+
+// queueSiblingRescansSQLite mirrors queueSiblingRescansPG.
+func (db *DB) queueSiblingRescansSQLite(ctx context.Context, sha256 string) ([]string, error) {
+	nowSQL := `strftime('%Y-%m-%dT%H:%M:%f','now')`
+	rows, err := db.lite.QueryContext(ctx, `
+		UPDATE samples SET rescan_priority = 1, rescan_requested_at = `+nowSQL+`, updated_at = `+nowSQL+`
+		 WHERE id IN (
+			SELECT sib.id
+			  FROM samples c
+			  JOIN samples sib ON sib.purl_base = c.purl_base
+			 WHERE c.sha256 = ? AND c.purl_base <> '' AND sib.purl_base <> ''
+			   AND sib.sha256 <> c.sha256
+			   AND sib.label = 'unknown' AND sib.parent = '' AND sib.skip = ''
+			   AND sib.rescan_priority = 0 AND sib.cleave_result IS NOT NULL
+			   AND sib.analyzed_at <= COALESCE(c.analyzed_at, `+nowSQL+`)
+			   AND (sib.traits_version = '' OR sib.traits_version <> c.traits_version)
+			 ORDER BY sib.created_at DESC, sib.id DESC
+			 LIMIT ?)
+		RETURNING sha256`, sha256, maxSiblingRescan)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: queue sibling rescans of %s: %w", sha256, err)
+	}
+	defer rows.Close() //nolint:errcheck // read-only cursor
+	var shas []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, fmt.Errorf("hopper: queue sibling rescans of %s: %w", sha256, err)
+		}
+		shas = append(shas, s)
+	}
+	return shas, rows.Err()
+}
+
+// requeueContainingParentsSQLite mirrors requeueContainingParentsPG; see
+// requeueContainingParentsSQLPG for the predicate.
+func (db *DB) requeueContainingParentsSQLite(ctx context.Context, sha256 string, maxCrit int, traitsVersion string) (int64, error) {
+	rows, err := db.lite.QueryContext(ctx, `
+		UPDATE samples SET rescan_priority = 1,
+		    rescan_requested_at = strftime('%Y-%m-%dT%H:%M:%f','now'),
+		    updated_at = strftime('%Y-%m-%dT%H:%M:%f','now')
+		 WHERE sha256 IN (SELECT DISTINCT parent_sha256 FROM sample_locations
+		                   WHERE sha256 = ? AND parent_sha256 <> '' LIMIT ?)
+		   AND parent = '' AND skip = '' AND rescan_priority = 0
+		   AND cleave_result IS NOT NULL
+		   AND max_crit < ?
+		   AND (traits_version = '' OR traits_version <> ?)
+		RETURNING sha256`, sha256, maxParentRequeue, maxCrit, traitsVersion)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: requeue containing parents of %s: %w", sha256, err)
+	}
+	defer rows.Close() //nolint:errcheck // read-only cursor
+	var shas []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return 0, fmt.Errorf("hopper: requeue containing parents of %s: %w", sha256, err)
+		}
+		shas = append(shas, s)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("hopper: requeue containing parents of %s: %w", sha256, err)
+	}
+	db.forgetSHAs(shas)
+	return int64(len(shas)), nil
 }
 
 // requestRescanSQLite mirrors requestRescanPG. SQLite is used for tests
@@ -3633,11 +3717,7 @@ func (db *DB) triageSightedPinnedSQLite(
 	args = append(args, limit)
 
 	rows, err := db.lite.QueryContext(ctx,
-		fmt.Sprintf(triageSightedPinnedMatchCTE, "?")+`SELECT `+liteSampleColsLight+` FROM samples
-		 JOIN latest_sightings ON latest_sightings.matched_sha = samples.sha256
-		 WHERE `+triageSightedWhere+extra+`
-		 ORDER BY latest_sightings.sighted_at DESC,
-		          samples.created_at DESC, samples.id DESC LIMIT ?`,
+		triageSightedPinnedSQL("?", extra, liteSampleColsLight, "?"),
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: triage sighted-pinned: %w", err)

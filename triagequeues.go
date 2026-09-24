@@ -126,9 +126,12 @@ const (
 	// It is the whole reason sighted-pinned can be a preempting queue in the
 	// consumer: a source naming ONE version of a package, today, is a live
 	// compromise someone has already identified for us, and the population that
-	// fits both bars at once is one or two rows. Widen this and it stops being
-	// a queue that can be worked to empty, which is the property that earns it
-	// precedence over everything else.
+	// fits both bars at once is small — tens of rows after a large advisory
+	// import, not thousands. Widen this and it stops being a queue that can be
+	// worked to empty, which is the property that earns it precedence over
+	// everything else. Inside the window rows are served oldest-first, a few per
+	// package per round (sightedPinnedPerPackage), so a row's chance of being
+	// judged before it ages out does not depend on how busy the day after it was.
 	//
 	// A row ages out of it silently and into the ordinary sighted queue, which
 	// excludes exactly this window (see triageSightedNotPinnedSQL). There is no
@@ -413,9 +416,12 @@ var TriageQueues = map[string]Queue{
 	// a different response time rather than a different treatment: the work is
 	// identical, and only the clock differs. Outside has already done the
 	// identification and named the release, so this is confirmation rather than
-	// discovery, and the population that clears both bars is one or two rows.
-	// That smallness is the feature — a queue that empties in minutes can be
-	// given precedence over the rest without starving them.
+	// discovery, and the population that clears both bars is small — though a
+	// single import can pin a package's whole release history at once. That
+	// smallness is the feature — a queue that empties quickly can be given
+	// precedence over the rest without starving them — and the order keeps it
+	// fair while it drains: oldest first sighting first, at most
+	// sightedPinnedPerPackage rows of one package per round.
 	//
 	// Drains exactly as sighted does (relabel, or a "sighted" report), and ages
 	// out of the window into sighted with nothing to hand over.

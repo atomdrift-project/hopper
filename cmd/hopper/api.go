@@ -703,6 +703,43 @@ func (wt *workerTracker) traits(name string) string {
 	return ""
 }
 
+// attribution returns what the named worker last reported running, as the
+// [hopper.ResultAttribution] stamped on the results it submits. One read lock,
+// no allocation beyond the struct: the result path calls it once per store.
+//
+// Version and traits arrive as unvalidated poll query parameters, so they are
+// bounded here, before they reach a column every stored result writes. A
+// worker the tracker no longer holds (hopper restarted between its poll and its
+// result) is still credited by name, with the versions left empty rather than
+// guessed.
+func (wt *workerTracker) attribution(name string) hopper.ResultAttribution {
+	by := hopper.ResultAttribution{Worker: name}
+	wt.mu.RLock()
+	if ws, ok := wt.workers[name]; ok {
+		by.Version, by.Traits = ws.Version, ws.Traits
+	}
+	wt.mu.RUnlock()
+	by.Version = boundedAttribution(by.Version)
+	by.Traits = boundedAttribution(by.Traits)
+	return by
+}
+
+// maxAttributionLen bounds a self-reported version string. Real values are a
+// semver or a short hash; the bound exists so a hostile or broken poll cannot
+// make every result it submits write a large string into samples.
+const maxAttributionLen = 64
+
+// boundedAttribution keeps the printable-ASCII prefix of s, up to
+// maxAttributionLen bytes — the same alphabet validWorkerName admits.
+func boundedAttribution(s string) string {
+	for i := range len(s) {
+		if i == maxAttributionLen || s[i] <= ' ' || s[i] > '~' {
+			return s[:i]
+		}
+	}
+	return s
+}
+
 func (wt *workerTracker) activeClaims(name string) int {
 	wt.mu.RLock()
 	defer wt.mu.RUnlock()
@@ -2197,7 +2234,8 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	// async pool" path, whose silent member loss produced truncated parents with
 	// no members (no content, permanent data loss).
 	storeStart := time.Now()
-	stats, err := s.storeResult(ctx, &req, &parsed, tv)
+	by := s.tracker.attribution(req.Worker)
+	stats, err := s.storeResult(ctx, &req, &parsed, tv, by)
 	recordResultPhase(r.Context(), "store", lane, time.Since(storeStart))
 	if err != nil {
 		if errors.Is(err, hopper.ErrNotFound) {
@@ -2250,10 +2288,28 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	claimedPath := s.tracker.release(req.SHA256)
 	s.tracker.recordResult(req.Worker, false)
 
+	// One line per result that actually changed a row, at INFO. The volume is
+	// bounded by what the store writes, not by what workers post: a redundant
+	// re-post (same traits version) returns at finishUnchanged above, where it
+	// is counted and logged only at DEBUG, and that was the bulk of the traffic
+	// (80k/23h on 2026-09-08). What is left is one line per new or re-analyzed
+	// verdict, which is the event worth grepping for. It carries the same
+	// attribution the row now stores (samples.analyzed_by/analyzer_version), so
+	// the log and the database answer "who produced this verdict" identically;
+	// the row is the durable record, the log the timeline around it.
 	slog.Info("result stored", "worker", req.Worker, "sha256", req.SHA256, "path", claimedPath,
+		"worker_version", by.Version, "traits_version", tv, "max_crit", parsed.FileInfo.MaxCrit,
 		"duration_ms", req.DurationMs, "active_claims", s.tracker.activeClaims(req.Worker))
 
 	logResultRenewal(&req, &stats, tv)
+	if stats.ParentsRequeued > 0 {
+		// Rare by construction (a renewal that raised max_crit), and each one
+		// sends archives back through the fleet, so it is worth a line.
+		slog.Info("raised verdict requeued containing archives",
+			"sha256", req.SHA256, "purl_base", stats.PURLBase, "worker", req.Worker,
+			"max_crit", parsed.FileInfo.MaxCrit, "previous_max_crit", stats.PriorMaxCrit,
+			"archives_requeued", stats.ParentsRequeued)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true}) //nolint:errcheck,errchkjson // best-effort response
@@ -2268,10 +2324,11 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 // client-side check could have told either to stand down.
 func (s *apiServer) storeResult(
 	ctx context.Context, req *resultRequest, parsed *hopper.CleaveParseResult, tv string,
+	by hopper.ResultAttribution,
 ) (hopper.StoreStats, error) {
 	shared, err, _ := s.resultStores.Do(req.SHA256, func() (any, error) {
 		return retryDBAccess(ctx, "store result", req.SHA256, func(ctx context.Context) (hopper.StoreStats, error) {
-			return s.db.StoreResult(ctx, req.SHA256, req.Raw, req.ML, req.LLM, parsed, tv)
+			return s.db.StoreResult(ctx, req.SHA256, req.Raw, req.ML, req.LLM, parsed, tv, by)
 		})
 	})
 	stats, ok := shared.(hopper.StoreStats)
@@ -4108,6 +4165,7 @@ func uploadSample(sha, filename, relPath string, size int64, prov *hopper.Sideca
 			sample.Version = parsedVersion
 		}
 	}
+	inferWheelIdentity(sample, filename)
 	return sample
 }
 

@@ -26,7 +26,10 @@ package hopper
 // constants that bound them, because their predicates are functions of a table
 // alias rather than constants -- see triageHighestWhere.
 
-import "strconv"
+import (
+	"fmt"
+	"strconv"
+)
 
 // The shared population predicates. Each is the exact WHERE its Triage*
 // selector uses, so the two cannot drift: the selector and the count read the
@@ -218,6 +221,12 @@ const (
 // affected != ” is the entire distinction from the ordinary queue. An empty
 // affected claims the package as a whole, which is a claim about a name rather
 // than about a release, and is the long tail the ordinary sighted queue works.
+//
+// first_sightings keeps each sample's EARLIEST pinned claim in the window, not
+// its latest: the queue is served oldest-first (see triageSightedPinnedSQL), and
+// a row's place in line is when it first became urgent. Keying on the newest
+// claim let every re-assertion by another source move a row back to the head —
+// and, worse, pushed everything already waiting behind it.
 const triageSightedPinnedMatchCTE = `WITH pinned_sightings AS (
 		SELECT subject, affected, first_seen FROM sightings
 		 WHERE claim IN ('malicious', 'suspicious')
@@ -226,11 +235,60 @@ const triageSightedPinnedMatchCTE = `WITH pinned_sightings AS (
 		SELECT sm.sha256 AS matched_sha, s.first_seen AS sighted_at
 		  FROM pinned_sightings s JOIN samples sm ON sm.purl_base = s.subject
 		 WHERE sm.purl_base != '' AND s.affected = sm.version
-	), latest_sightings AS (
-		SELECT matched_sha, max(sighted_at) AS sighted_at
+	), first_sightings AS (
+		SELECT matched_sha, min(sighted_at) AS sighted_at
 		  FROM matching_sightings GROUP BY matched_sha
 	)
 `
+
+// sightedPinnedPerPackage is how many rows of one package the pinned queue
+// serves before moving on to the next package, per round.
+//
+// The queue used to be ordered newest-sighting-first, and on 2026-09-23 that
+// failed twice over. One source listed nineteen versions of a single package in
+// one import; they arrived together, took the head of the queue together, and
+// every other package waited behind a page that was one package deep. And
+// because each fresh claim went to the front, the rows that had waited longest
+// were the ones that never reached the front: they aged out of the 24-hour
+// window unjudged and fell into the ordinary sighted queue's long tail — the
+// sckit worm releases among them.
+//
+// So the order is FIFO by package, in rounds: each package's oldest few rows,
+// packages oldest-first, then each package's next few, and so on. A package's
+// rows stay together inside a round, so one judgement pass sees its versions
+// side by side; no package can take a page from the others; and a row's wait is
+// bounded by the packages that were sighted before it, not by those after.
+const sightedPinnedPerPackage = 3
+
+// triageSightedPinnedSQL is the sighted-pinned selection for either dialect:
+// boundary is the window placeholder, extra the caller's filter clause over
+// samples, cols the projection, limit its placeholder. See
+// sightedPinnedPerPackage for the order.
+//
+// Membership is decided entirely inside pinned_candidates — the same pinned
+// match and the same triageSightedWhere as ever, so TriageSighted's exclusion
+// (triageSightedNotPinnedSQL) still partitions the two queues exactly. Only the
+// order is new, and it is computed over the candidates alone: the window keeps
+// that set to a day of version-pinned claims, so the two window functions sort
+// a few hundred rows at most, never the corpus.
+func triageSightedPinnedSQL(boundary, extra, cols, limit string) string {
+	return fmt.Sprintf(triageSightedPinnedMatchCTE, boundary) + `, pinned_candidates AS (
+		SELECT samples.id AS cand_id, samples.purl_base AS cand_purl,
+		       first_sightings.sighted_at AS cand_sighted, samples.created_at AS cand_created
+		  FROM samples JOIN first_sightings ON first_sightings.matched_sha = samples.sha256
+		 WHERE ` + triageSightedWhere + extra + `
+	), pinned_ranked AS (
+		SELECT cand_id, cand_purl,
+		       row_number() OVER (PARTITION BY cand_purl
+		                          ORDER BY cand_sighted, cand_created, cand_id) AS pkg_rank,
+		       min(cand_sighted) OVER (PARTITION BY cand_purl) AS pkg_first
+		  FROM pinned_candidates
+	)
+	SELECT ` + cols + ` FROM samples JOIN pinned_ranked ON pinned_ranked.cand_id = samples.id
+	 ORDER BY (pinned_ranked.pkg_rank - 1) / ` + strconv.Itoa(sightedPinnedPerPackage) + `,
+	          pinned_ranked.pkg_first, pinned_ranked.cand_purl, pinned_ranked.pkg_rank
+	 LIMIT ` + limit
+}
 
 const triageSightedMatchCTE = `WITH review_sightings AS (
 		SELECT subject, affected, first_seen FROM sightings

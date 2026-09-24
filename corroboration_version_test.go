@@ -138,36 +138,84 @@ func TestLocationFilenameYieldsVersion(t *testing.T) {
 }
 
 // TestBackfillVersionOverwriteGuards is a shape guard. The recovery may fill a
-// blank version, and may trim a wheel's PEP 427 tags off one it already has.
-// It may not rewrite a version it merely parses differently: that would move
-// rows off the release the registry actually served.
+// blank version, may trim a wheel's PEP 427 tags off one it already has, and may
+// fill an empty purl_base from a wheel's name. It may not rewrite a version it
+// merely parses differently, nor replace an identity already recorded: either
+// would move rows off the release the registry actually served.
 func TestBackfillVersionOverwriteGuards(t *testing.T) {
 	src, err := os.ReadFile("pg.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := string(src)
-	start := strings.Index(body, "func (db *DB) backfillVersionPG(")
-	if start < 0 {
-		t.Fatal("backfillVersionPG not found in pg.go")
+	fn := func(sig string) string {
+		t.Helper()
+		body := string(src)
+		start := strings.Index(body, sig)
+		if start < 0 {
+			t.Fatalf("%s not found in pg.go", sig)
+		}
+		body = body[start:]
+		if end := strings.Index(body, "\n}\n"); end > 0 {
+			body = body[:end]
+		}
+		return body
 	}
-	body = body[start:]
-	if end := strings.Index(body, "\n}\n"); end > 0 {
-		body = body[:end]
-	}
+	decide := fn("func versionRepair(")
 	for _, want := range []string{
-		`fill := have == ""`,                           // arm 1: only a blank version
-		`strings.HasSuffix(base, ".whl")`,              // arm 2: wheels only
-		`strings.HasPrefix(have, want+"-")`,            // and only to trim a suffix off
-		"if !fill && !trim {",                          // everything else keeps what it has
-		"WHERE s.id = v.id AND s.version <> v.version", // no-op writes never land
+		`fill := have == ""`,                // arm 1: only a blank version
+		`strings.HasSuffix(base, ".whl")`,   // arm 2: wheels only
+		`strings.HasPrefix(have, want+"-")`, // and only to trim a suffix off
+		"if !fill && !trim {",               // everything else keeps what it has
+		"pkgparse.WheelIdentity(base)",      // identity only from a wheel
+		`if havePURL == "" {`,               // and only where there is none
 	} {
-		if !strings.Contains(body, want) {
+		if !strings.Contains(decide, want) {
+			t.Errorf("versionRepair is missing its overwrite guard %q", want)
+		}
+	}
+	sweep := fn("func (db *DB) backfillVersionPG(")
+	for _, want := range []string{
+		"versionRepair(base, have, havePURL)",
+		"WHEN s.purl_base = '' THEN v.purl ELSE s.purl_base END",                                // never replace an identity
+		"WHERE s.id = v.id AND (s.version <> v.version OR (s.purl_base = '' AND v.purl <> ''))", // no-op writes never land
+	} {
+		if !strings.Contains(sweep, want) {
 			t.Errorf("backfillVersionPG is missing its overwrite guard %q", want)
 		}
 	}
-	if strings.Contains(body, "s.version = v.version\n\t\t\t\tFROM unnest") {
+	if strings.Contains(sweep, "s.version = v.version\n\t\t\t\tFROM unnest") {
 		t.Error("backfillVersionPG must not rewrite a version it merely parses differently")
+	}
+}
+
+// TestVersionRepair drives the per-row decision behind backfill-version,
+// including the sckit wheel (memoryos 2.0.34) as the entry-path bug stored it.
+func TestVersionRepair(t *testing.T) {
+	for _, tc := range []struct {
+		name, base, have, havePURL string
+		wantVer, wantPURL          string
+		wantOK                     bool
+	}{
+		{"fill blank npm", "@whalent-agent-core-0.3.410.tgz", "", "pkg:npm/%40whalent/agent-core", "0.3.410", "", true},
+		{"trim tagged wheel", "ranbval_sdk-0.5.0-cp312-cp312-macosx_26_0_arm64.whl", "0.5.0-cp312-cp312-macosx_26_0_arm64", "pkg:pypi/ranbval-sdk", "0.5.0", "", true},
+		{"sckit wheel: tagged version, no identity", "memoryos-2.0.34-py3-none-any.whl", "2.0.34-py3-none-any", "", "2.0.34", "pkg:pypi/memoryos", true},
+		{"build-tag wheel, no identity", "memoryos-2.0.34-1-py3-none-any.whl", "2.0.34-1-py3-none-any", "", "2.0.34", "pkg:pypi/memoryos", true},
+		{"correct version, identity only", "memoryos-2.0.34-py3-none-any.whl", "2.0.34", "", "2.0.34", "pkg:pypi/memoryos", true},
+		{"blank version, no identity", "memoryos-2.0.34-py3-none-any.whl", "", "", "2.0.34", "pkg:pypi/memoryos", true},
+		// Left alone:
+		{"version parsed differently", "lodash-4.17.21.tgz", "4.17.20", "pkg:npm/lodash", "", "", false},
+		{"already current", "flask-3.1.3-py3-none-any.whl", "3.1.3", "pkg:pypi/flask", "", "", false},
+		{"sdist without identity", "memoryos-2.0.34.tar.gz", "", "", "", "", false},
+		{"wheel claiming another release", "memoryos-2.0.34-py3-none-any.whl", "1.0.0", "", "", "", false},
+		{"unparseable", "evil.exe", "", "pkg:npm/x", "", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ver, purl, ok := versionRepair(tc.base, tc.have, tc.havePURL)
+			if ok != tc.wantOK || (ok && (ver != tc.wantVer || purl != tc.wantPURL)) {
+				t.Errorf("versionRepair(%q, %q, %q) = (%q, %q, %v), want (%q, %q, %v)",
+					tc.base, tc.have, tc.havePURL, ver, purl, ok, tc.wantVer, tc.wantPURL, tc.wantOK)
+			}
+		})
 	}
 }
 
@@ -212,5 +260,54 @@ func TestEveryCorroborationPathNarrowsByVersion(t *testing.T) {
 		if !strings.Contains(window, tc.narrows) {
 			t.Errorf("%s marks by purl_base without narrowing to the versions the claim names", tc.name)
 		}
+	}
+}
+
+// TestBackfillVersionRepairsWheelIdentity runs the sweep itself against
+// Postgres (backfill-version is Postgres-only): the sckit wheel as the entry
+// path stored it gains its release and identity, a build-tag wheel likewise, a
+// row whose identity is already recorded keeps it, and a second run is a no-op.
+func TestBackfillVersionRepairsWheelIdentity(t *testing.T) {
+	ctx := context.Background()
+	db := openDisposablePG(t)
+
+	insert := func(sha, file, version, purl string) string {
+		t.Helper()
+		full := (sha + strings.Repeat("0", 64))[:64]
+		mustInsert(t, ctx, db, &Sample{
+			SHA256: full, Source: "upload", Label: "unknown", LabelSource: "upload",
+			Filename: file, Package: "memoryos", Version: version, PURLBase: purl,
+			Path: "incoming/uploads/_unknown/" + file, SizeBytes: 8,
+		})
+		return full
+	}
+	sckit := insert("a1", "memoryos-2.0.34-py3-none-any.whl", "2.0.34-py3-none-any", "")
+	build := insert("b2", "memoryos-2.0.33-1-py3-none-any.whl", "2.0.33-1-py3-none-any", "")
+	kept := insert("c3", "memoryos-2.0.32-py3-none-any.whl", "2.0.32", "pkg:pypi/memoryos-legacy")
+	sdist := insert("d4", "memoryos-2.0.31.tar.gz", "2.0.31", "")
+
+	n, err := db.BackfillVersion(ctx, false)
+	if err != nil {
+		t.Fatalf("BackfillVersion: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("BackfillVersion repaired %d rows, want 2", n)
+	}
+	for sha, want := range map[string][2]string{
+		sckit: {"2.0.34", "pkg:pypi/memoryos"},
+		build: {"2.0.33", "pkg:pypi/memoryos"},
+		kept:  {"2.0.32", "pkg:pypi/memoryos-legacy"},
+		sdist: {"2.0.31", ""},
+	} {
+		var ver, purl string
+		if err := db.pool.QueryRow(ctx, `SELECT version, purl_base FROM samples WHERE sha256 = $1`, sha).Scan(&ver, &purl); err != nil {
+			t.Fatal(err)
+		}
+		if ver != want[0] || purl != want[1] {
+			t.Errorf("%s: (version, purl_base) = (%q, %q), want (%q, %q)", sha[:4], ver, purl, want[0], want[1])
+		}
+	}
+	if again, err := db.BackfillVersion(ctx, false); err != nil || again != 0 {
+		t.Errorf("second BackfillVersion = %d, %v; want 0 (idempotent)", again, err)
 	}
 }

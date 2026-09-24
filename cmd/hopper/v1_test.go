@@ -180,3 +180,92 @@ func errCode(body map[string]any) string {
 	}
 	return code
 }
+
+// TestHandleV1LookupBatch pins the multi-purl form scan's pre-fetch dependency
+// negotiation relies on. It used to answer only the first purl= as if it were
+// the whole request, so a 50-PURL batch spared the fleet at most one download.
+func TestHandleV1LookupBatch(t *testing.T) {
+	ctx := context.Background()
+	api := newV1API(t, ctx)
+	db := api.db
+
+	insert := func(sha, pkg, version string, analyze bool) {
+		t.Helper()
+		if err := db.InsertSample(ctx, &hopper.Sample{
+			SHA256: sha, Path: "incoming/" + pkg + ".tgz", Source: "forager",
+			Ecosystem: "npm", Package: pkg, Version: version,
+			PURLBase: "pkg:npm/" + pkg,
+		}); err != nil {
+			t.Fatalf("InsertSample: %v", err)
+		}
+		if !analyze {
+			return
+		}
+		cleave := []byte(`{"fs":[{"sha":"` + sha + `","type":"js","dp":0}]}`)
+		if err := db.UpdateCleaveResult(ctx, sha, cleave, nil, ""); err != nil {
+			t.Fatalf("UpdateCleaveResult: %v", err)
+		}
+		if err := db.UpdateLitmusResult(ctx, sha, []byte(`{"v":"7","prob":0.01,"lvl":-1,"eng":"2.8.0","analyzed_at":"2026-08-01T00:00:00Z"}`)); err != nil {
+			t.Fatalf("UpdateLitmusResult: %v", err)
+		}
+	}
+	insert(strings.Repeat("1", 64), "left", "1.0.0", true)
+	insert(strings.Repeat("2", 64), "right", "2.0.0", true)
+	insert(strings.Repeat("3", 64), "pending", "3.0.0", false)
+
+	get := func(purls ...string) (*httptest.ResponseRecorder, []map[string]any) {
+		t.Helper()
+		q := url.Values{"purl": purls}
+		r := httptest.NewRequest(http.MethodGet, "/v1/lookup?"+q.Encode(), http.NoBody)
+		rec := httptest.NewRecorder()
+		api.handleV1Lookup(rec, r)
+		var body []map[string]any
+		if rec.Code == http.StatusOK {
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("batch reply is not a JSON list: %s", rec.Body.Bytes())
+			}
+		}
+		return rec, body
+	}
+
+	// An unknown first purl used to 404 the whole batch; the caller's spelling
+	// ("npm/right" without pkg:) must come back byte-for-byte, since that is
+	// what a list reply is matched by.
+	rec, body := get("pkg:npm/nobody@9.9.9", "pkg:npm/left@1.0.0", "pkg:npm/pending@3.0.0", "npm/right@2.0.0")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.Bytes())
+	}
+	var got []string
+	for _, item := range body {
+		got = append(got, item["purl"].(string)+"="+item["sha256"].(string)[:1])
+	}
+	if want := []string{"pkg:npm/left@1.0.0=1", "npm/right@2.0.0=2"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("batch answered %v, want %v (unknown and unanalyzed omitted, order kept)", got, want)
+	}
+	for _, item := range body {
+		if item["fires_at"] != float64(-1) {
+			t.Errorf("%v: fires_at = %v, want -1", item["purl"], item["fires_at"])
+		}
+	}
+
+	// Nothing known is still a list, never a 404: a caller of the batch form
+	// reads one shape.
+	rec, body = get("pkg:npm/nobody@1.0.0", "pkg:npm/nobody@2.0.0")
+	if rec.Code != http.StatusOK || len(body) != 0 {
+		t.Errorf("all-unknown batch = %d %s, want 200 []", rec.Code, rec.Body.Bytes())
+	}
+
+	// The cached record must not carry the previous caller's spelling.
+	rec1, one := get("pkg:npm/left@1.0.0", "npm/left@1.0.0")
+	if rec1.Code != http.StatusOK || len(one) != 2 || one[0]["purl"] == one[1]["purl"] {
+		t.Errorf("two spellings of one package answered %s", rec1.Body.Bytes())
+	}
+
+	many := make([]string, v1LookupBatchMax+1)
+	for i := range many {
+		many[i] = "pkg:npm/left@1.0.0"
+	}
+	if rec, _ := get(many...); rec.Code != http.StatusBadRequest {
+		t.Errorf("%d purls answered %d, want 400", len(many), rec.Code)
+	}
+}

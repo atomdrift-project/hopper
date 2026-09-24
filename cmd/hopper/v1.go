@@ -36,6 +36,10 @@ func (s *apiServer) handleV1Lookup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sha := strings.TrimSpace(r.URL.Query().Get("sha256"))
+	if purls := r.URL.Query()["purl"]; len(purls) > 1 && sha == "" {
+		s.handleV1LookupBatch(w, r, purls)
+		return
+	}
 	raw := strings.TrimSpace(r.URL.Query().Get("purl"))
 	if sha == "" && raw == "" {
 		v1Error(w, http.StatusBadRequest, "missing_package", "Name an artifact with ?sha256= or ?purl=.")
@@ -93,9 +97,87 @@ func (s *apiServer) handleV1Lookup(w http.ResponseWriter, r *http.Request) {
 	// the identity they asked about, and the record's own composed PURL can
 	// differ when a digest resolves to a release named another way.
 	if canon != "" {
-		record.PURL = &canon
+		record = withPURL(record, canon)
 	}
 	v1WriteJSON(w, http.StatusOK, record)
+}
+
+// v1LookupBatchMax is the most PURLs one request may name. It is scan's batch
+// size for its pre-fetch PURL negotiation (corpus_precheck.rs chunks by 50), so
+// a conforming caller never trips it.
+const v1LookupBatchMax = 50
+
+// handleV1LookupBatch answers GET /v1/lookup?purl=…&purl=… — several packages
+// in one request, as scan's pre-fetch dependency negotiation asks.
+//
+// Always 200 with a list, holding one record per PURL the corpus has an
+// analyzed verdict for, in the order asked; unknown, held-but-unanalyzed and
+// unparseable PURLs are simply absent. Each record's purl is the caller's
+// bytes, unaltered, because a caller matches a list reply to its request by
+// that field — canonicalizing it here would silently drop every hit whose
+// spelling normalization changes.
+//
+// This route used to read only the first purl= and answer it as if it were the
+// whole request, so a 50-PURL batch skipped at most one dependency (and none at
+// all when the first was unknown, since that answered the whole batch 404).
+// Workers then fetched, analyzed and re-posted the other 49 — measured
+// 2026-09-24 as a 4.6% fleet skip rate and a renew lane that was 97% redundant.
+func (s *apiServer) handleV1LookupBatch(w http.ResponseWriter, r *http.Request, purls []string) {
+	if len(purls) > v1LookupBatchMax {
+		v1Error(w, http.StatusBadRequest, "too_many_purls",
+			"Name at most "+strconv.Itoa(v1LookupBatchMax)+" PURLs per lookup.")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), v1LookupTimeout)
+	defer cancel()
+
+	out := make([]*hopper.LookupRecord, 0, len(purls))
+	var found, unanalyzed, unknown, invalid int
+	for _, asked := range purls {
+		raw := strings.TrimSpace(asked)
+		if raw == "" {
+			invalid++
+			continue
+		}
+		if !strings.EqualFold(firstFour(raw), "pkg:") {
+			raw = "pkg:" + raw
+		}
+		canon := pkgparse.CanonicalizePURL(raw)
+		if len(canon) < 4 || !strings.EqualFold(canon[:4], "pkg:") {
+			invalid++
+			continue
+		}
+		record, err := s.db.LookupRecord(ctx, "", pkgparse.VersionlessPURL(canon), pkgparse.PURLVersion(canon))
+		switch {
+		case errors.Is(err, hopper.ErrNotFound):
+			unknown++
+			continue
+		case err != nil:
+			// One bad key must not cost the caller the rest of the batch: every
+			// absent entry falls through to an ordinary fetch on its side.
+			slog.WarnContext(r.Context(), "v1 batch lookup failed",
+				"purl", canon, "error", err, "remote", r.RemoteAddr)
+			unknown++
+			continue
+		case !record.Analyzed:
+			unanalyzed++
+			continue
+		}
+		found++
+		out = append(out, withPURL(record, asked))
+	}
+	recordPURLLookups(r.Context(), found, unanalyzed, unknown, invalid)
+	v1WriteJSON(w, http.StatusOK, out)
+}
+
+// withPURL returns a copy of a record carrying purl. The record LookupRecord
+// hands back is the one the pool holds and every concurrent caller reads, so
+// writing the caller's spelling into it in place would be a data race and would
+// answer the next caller in the previous caller's spelling.
+func withPURL(record *hopper.LookupRecord, purl string) *hopper.LookupRecord {
+	c := *record
+	c.PURL = &purl
+	return &c
 }
 
 // v1Error writes a v1 error. `code` is stable and machine-readable; `message`

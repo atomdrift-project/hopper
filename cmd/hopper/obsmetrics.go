@@ -129,6 +129,39 @@ func recordRedundantResult(ctx context.Context, lane string) {
 	}
 }
 
+// purlLookupCount counts PURLs asked of /v1/lookup's batch form by outcome.
+// Scan workers ask it before fetching a dependency, and every PURL not answered
+// "found" is a download, an analysis and a re-posted result on the fleet — so
+// the found share is the direct measure of how much dependency work the corpus
+// spares the workers.
+var (
+	purlLookupOnce  sync.Once
+	purlLookupCount metric.Int64Counter
+)
+
+// recordPURLLookups counts one batch's outcomes. Same lazy-create/no-op-on-
+// failure contract as recordLoadShed.
+func recordPURLLookups(ctx context.Context, found, unanalyzed, unknown, invalid int) {
+	purlLookupOnce.Do(func() {
+		if c, err := otel.Meter(meterName).Int64Counter(
+			"hopper.lookup_purls.total",
+			metric.WithDescription("PURLs asked of batched /v1/lookup, by outcome (found = an analyzed verdict was returned)."),
+		); err == nil {
+			purlLookupCount = c
+		}
+	})
+	if purlLookupCount == nil {
+		return
+	}
+	for outcome, n := range map[string]int{
+		"found": found, "unanalyzed": unanalyzed, "unknown": unknown, "invalid": invalid,
+	} {
+		if n > 0 {
+			purlLookupCount.Add(ctx, int64(n), metric.WithAttributes(attribute.String("outcome", outcome)))
+		}
+	}
+}
+
 // resultPhaseHist times what a result-ingestion slot is actually held on once
 // acquired: "body" (streaming + decoding the envelope off the wire) versus
 // "store" (the StoreResult transaction, retries and lock waits included). The

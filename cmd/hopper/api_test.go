@@ -2816,3 +2816,107 @@ func TestHandleSampleByPURL(t *testing.T) {
 		t.Fatalf("empty: status = %d, want 400", rec.Code)
 	}
 }
+
+// TestUploadSampleWheelIdentity is the sckit-worm upload (2026-09-23): a bare
+// memoryos-2.0.34-py3-none-any.whl with no sidecar. Before the fix it was
+// stored as package "memoryos", version "2.0.34-py3-none-any", purl_base "" —
+// invisible to the pinned-sighting queue, whose join is purl_base+version.
+func TestUploadSampleWheelIdentity(t *testing.T) {
+	t.Parallel()
+	const sha = "60d11b7004c80ae17a900094bbddd0a92273167af2b15f7597b9749d1b5edaa2"
+	for _, tc := range []struct {
+		file, wantPURL, wantVersion string
+	}{
+		{"memoryos-2.0.34-py3-none-any.whl", "pkg:pypi/memoryos", "2.0.34"},
+		// Build tag: part of the file's name, not of the release.
+		{"memoryos-2.0.34-1-py3-none-any.whl", "pkg:pypi/memoryos", "2.0.34"},
+		// PEP 503 fold of the escaped distribution name.
+		{"Memory_OS-2.0.34-cp312-cp312-manylinux_2_17_x86_64.whl", "pkg:pypi/memory-os", "2.0.34"},
+	} {
+		s := uploadSample(sha, tc.file, "incoming/uploads/_unknown/"+tc.file, 1, nil)
+		if s.PURLBase != tc.wantPURL || s.Version != tc.wantVersion {
+			t.Errorf("uploadSample(%q) = (purl %q, version %q), want (%q, %q)",
+				tc.file, s.PURLBase, s.Version, tc.wantPURL, tc.wantVersion)
+		}
+		if s.Ecosystem != "python" {
+			t.Errorf("uploadSample(%q) ecosystem = %q, want python", tc.file, s.Ecosystem)
+		}
+	}
+
+	// A producer's own identity wins; the wheel only fills gaps.
+	prov := &hopper.Sidecar{Package: hopper.PackageRef{
+		Ecosystem: "pypi", Name: "memoryos", Version: "2.0.34", PURL: "pkg:pypi/MemoryOS@2.0.34",
+	}}
+	s := uploadSample(sha, "memoryos-2.0.34-py3-none-any.whl", "incoming/uploads/x.whl", 1, prov)
+	if s.PURLBase != "pkg:pypi/memoryos" || s.Version != "2.0.34" {
+		t.Errorf("sidecar wheel upload = (%q, %q)", s.PURLBase, s.Version)
+	}
+
+	// An sdist is not inferred: .tar.gz names no registry.
+	s = uploadSample(sha, "memoryos-2.0.34.tar.gz", "incoming/uploads/_unknown/memoryos-2.0.34.tar.gz", 1, nil)
+	if s.PURLBase != "" || s.Version != "2.0.34" {
+		t.Errorf("sdist upload = (purl %q, version %q), want (\"\", \"2.0.34\")", s.PURLBase, s.Version)
+	}
+}
+
+// TestHandleResultRecordsWorkerAttribution: an accepted result is stamped with
+// the qualified worker name and the scanner/traits versions that worker last
+// reported in its poll, so "which worker produced this verdict" has a durable
+// answer after the workers table has moved on to the fleet's next versions.
+func TestHandleResultRecordsWorkerAttribution(t *testing.T) {
+	ctx := context.Background()
+	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "hopper.db"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("e", 64)
+	if err := db.InsertSample(ctx, &hopper.Sample{
+		SHA256: sha, Source: "test", Path: "pending/memoryos-2.0.34-py3-none-any.whl", Label: "unknown",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	api := &apiServer{db: db, tracker: newWorkerTracker(), progress: &loadProgress{}}
+	req := httptest.NewRequest(http.MethodPost, "/api/result", http.NoBody)
+	worker := qualifiedWorkerName("nazgul", req.RemoteAddr)
+	api.tracker.update(worker, 4, "0.9.1", "b8c1c", 0, 0, "")
+
+	body, err := json.Marshal(resultRequest{
+		SHA256: sha, Worker: "nazgul",
+		Raw: json.RawMessage(`{"rev":"b8c1c","fs":[{"sha":"` + sha + `","type":"elf","dp":0}]}`),
+		ML:  json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	api.handleResult(rec, httptest.NewRequest(http.MethodPost, "/api/result", bytes.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	got, err := db.AnalysisAttribution(ctx, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := hopper.ResultAttribution{Worker: worker, Version: "0.9.1", Traits: "b8c1c"}
+	if got != want {
+		t.Errorf("attribution = %+v, want %+v", got, want)
+	}
+}
+
+// Self-reported versions are poll query parameters, so they are bounded before
+// every result a worker submits writes them into samples.
+func TestBoundedAttribution(t *testing.T) {
+	for in, want := range map[string]string{
+		"0.9.1":                  "0.9.1",
+		"":                       "",
+		"1.0\x00evil":            "1.0",
+		"v2 with spaces":         "v2",
+		strings.Repeat("a", 200): strings.Repeat("a", maxAttributionLen),
+		"b8c1c\n" + "forged=log": "b8c1c",
+	} {
+		if got := boundedAttribution(in); got != want {
+			t.Errorf("boundedAttribution(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

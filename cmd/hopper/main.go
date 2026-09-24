@@ -3687,7 +3687,49 @@ func fillSampleProvenance(s *hopper.Sample, prov pathProvenance, filename string
 			s.Version = parsedVersion
 		}
 	}
+	inferWheelIdentity(s, filename)
 	enrichFromVendorSidecar(s)
+}
+
+// inferWheelIdentity gives a PyPI wheel the package identity its filename
+// already states, when nothing upstream supplied one. It is the last step of
+// both entry paths — the walk (fillSampleProvenance) and the upload handler
+// (uploadSample) — so it only ever fills gaps: a purl_base from a producer's
+// sidecar or a coordinate path wins, and a version a producer claimed is kept.
+//
+// The gap is real and was costly. An upload with no sidecar lands under
+// "_unknown" with no ecosystem, so purl_base stayed empty — and every triage
+// queue and sighting join keys on purl_base+version, so the 2026-09-23 sckit
+// wheel (memoryos-2.0.34-py3-none-any.whl) could not be matched against the
+// advisory naming it, even though the claims table had the right name the
+// whole time (claims are write-only by design; see claims.go).
+//
+// Only a wheel is inferred: the format is Python's alone, so the registry
+// follows from the extension. An sdist is not — .tar.gz is every ecosystem's
+// tarball — and a row whose ecosystem names something other than Python keeps
+// whatever that path or producer said rather than being overruled by a suffix.
+func inferWheelIdentity(s *hopper.Sample, filename string) {
+	purl, version, ok := pkgparse.WheelIdentity(filename)
+	if !ok {
+		return
+	}
+	switch pkgparse.NormalizeEcosystem(s.Ecosystem) {
+	case "", "python":
+	default:
+		return
+	}
+	if s.Ecosystem == "" {
+		s.Ecosystem = pkgparse.NormalizeEcosystem("pypi")
+	}
+	if s.PURLBase == "" {
+		s.PURLBase = purl
+	}
+	// A version carrying the wheel's compatibility tags is the tag-swallowing
+	// misparse, not a claim, so it is corrected; any other stored version was
+	// somebody's statement and stays.
+	if s.Version == "" || strings.HasPrefix(s.Version, version+"-") {
+		s.Version = version
+	}
 }
 
 // enrichFromVendorSidecar fills url/feed/domain on a vendor-fetched sample from

@@ -234,3 +234,73 @@ func TestWheelFilenameVersion(t *testing.T) {
 		}
 	}
 }
+
+// TestWheelIdentity pins the sckit-worm case (2026-09-23): an uploaded
+// memoryos-2.0.34-py3-none-any.whl was stored with version
+// "2.0.34-py3-none-any" and no purl_base, so the pinned-sighting triage join on
+// purl_base+version could never match the advisory naming 2.0.34. The wheel
+// name alone is the whole identity: the registry from the format, the project
+// from the distribution field under PEP 503, the release from the version field.
+func TestWheelIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		file, purl, version string
+		ok                  bool
+	}{
+		{"memoryos-2.0.34-py3-none-any.whl", "pkg:pypi/memoryos", "2.0.34", true},
+		// Build tag between version and python tag is not part of the release.
+		{"memoryos-2.0.34-1-py3-none-any.whl", "pkg:pypi/memoryos", "2.0.34", true},
+		{"My_Pkg.Name-1.0rc1-12b-cp312-cp312-manylinux_2_17_x86_64.whl", "pkg:pypi/my-pkg-name", "1.0rc1", true},
+		{"torch-2.1.0+cu118-cp310-cp310-linux_x86_64.whl", "pkg:pypi/torch", "2.1.0+cu118", true},
+		// A disclosure-date prefix is stripped the way ParseFilename strips it.
+		{"2026-09-23-memoryos-2.0.34-py3-none-any.whl", "pkg:pypi/memoryos", "2.0.34", true},
+		// Not wheels: an sdist names no registry, and a malformed wheel (too
+		// few tags) is not guessed at.
+		{"memoryos-2.0.34.tar.gz", "", "", false},
+		{"memoryos-2.0.34-py3-any.whl", "", "", false},
+		{"memoryos.whl", "", "", false},
+	} {
+		purl, version, ok := WheelIdentity(tc.file)
+		if purl != tc.purl || version != tc.version || ok != tc.ok {
+			t.Errorf("WheelIdentity(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				tc.file, purl, version, ok, tc.purl, tc.version, tc.ok)
+		}
+	}
+}
+
+// TestVersionForNameWheel is the entry-path half of the same defect. Both
+// uploadSample and fillSampleProvenance ask VersionForName first, with the
+// package name already in hand, and only fall back to ParseFilename's wheel rule
+// when it returns "". versionShape admits hyphens, so the name-anchored split
+// returned the compatibility tags as version for every wheel it was asked about.
+func TestVersionForNameWheel(t *testing.T) {
+	for _, tc := range []struct{ file, name, want string }{
+		{"memoryos-2.0.34-py3-none-any.whl", "memoryos", "2.0.34"},
+		{"memoryos-2.0.34-7-py3-none-any.whl", "memoryos", "2.0.34"},
+		// PEP 503: the escaped on-disk spelling matches the registry spelling.
+		{"hermes_px-0.0.4-py3-none-any.whl", "hermes-px", "0.0.4"},
+		{"Hermes_Px-0.0.4-py3-none-any.whl", "hermes.px", "0.0.4"},
+		// Someone else's wheel: defer to ParseFilename rather than guess.
+		{"memoryos-2.0.34-py3-none-any.whl", "requests", ""},
+		// A malformed wheel is not split on the generic rule either.
+		{"memoryos-2.0.34-py3-any.whl", "memoryos", ""},
+	} {
+		if got := VersionForName(tc.file, tc.name); got != tc.want {
+			t.Errorf("VersionForName(%q, %q) = %q, want %q", tc.file, tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestNPMScopeIdentity pins the canonical npm scope spelling the purl_base
+// joins depend on: the "@" is percent-encoded in the namespace, matching
+// parallax's pkg:npm/%40scope/name form, so a sighting for the sckit-worm
+// package (the memtensor scope's memos-cloud-openclaw-plugin) and the stored
+// sample share one key.
+func TestNPMScopeIdentity(t *testing.T) {
+	got, ok := SourcePURLIdentity("npm", "", "@memtensor/memos-cloud-openclaw-plugin")
+	if want := "pkg:npm/%40memtensor/memos-cloud-openclaw-plugin"; !ok || got != want {
+		t.Errorf("SourcePURLIdentity(npm scoped) = (%q, %v), want %q", got, ok, want)
+	}
+	if got := VersionlessPURL(CanonicalizePURL("pkg:npm/@memtensor/memos-cloud-openclaw-plugin@0.1.21")); got != "pkg:npm/%40memtensor/memos-cloud-openclaw-plugin" {
+		t.Errorf("canonical scoped npm purl_base = %q", got)
+	}
+}

@@ -54,7 +54,7 @@ func TestStoreResultProjectsClaims(t *testing.T) {
 		Package: "pkg", Version: "1.0.0", PURLBase: "pkg:npm/pkg", Domain: "npmjs.org",
 	})
 	env := identEnvelopeFor(root, exe, strings.Repeat("c", 64))
-	if _, err := db.StoreResult(ctx, root, env, nil, nil, nil, "tv1"); err != nil {
+	if _, err := db.StoreResult(ctx, root, env, nil, nil, nil, "tv1", ResultAttribution{}); err != nil {
 		t.Fatalf("StoreResult: %v", err)
 	}
 
@@ -133,7 +133,7 @@ func TestStoreResultProjectsClaims(t *testing.T) {
 	}
 
 	// Re-storing the same envelope is a pure no-op: same one claim row.
-	if _, err := db.StoreResult(ctx, root, env, nil, nil, nil, "tv1"); err != nil {
+	if _, err := db.StoreResult(ctx, root, env, nil, nil, nil, "tv1", ResultAttribution{}); err != nil {
 		t.Fatalf("StoreResult(again): %v", err)
 	}
 	var n int

@@ -330,7 +330,7 @@ func TestStoreResultAtomicMembers(t *testing.T) {
 		{"id":2,"sha":%q,"type":"javascript","depth":1,"path":"app.zip!!b.js","traits":[{"id":"net/http","crit":3,"conf":0.8}],"ctx":[{"ln":1,"addr":0,"b":"xyz"}]}
 	]}`, archive, m1, m2)
 
-	stats, err := db.StoreResult(ctx, archive, full, []byte(`{"prob":0.9}`), nil, nil, "tv1")
+	stats, err := db.StoreResult(ctx, archive, full, []byte(`{"prob":0.9}`), nil, nil, "tv1", ResultAttribution{})
 	if err != nil {
 		t.Fatalf("StoreResult: %v", err)
 	}
@@ -362,7 +362,7 @@ func TestStoreResultAtomicMembers(t *testing.T) {
 	mustInsert(t, ctx, db, &Sample{SHA256: solo, Source: "test", Label: "unknown", LabelSource: "test", Path: "x/solo.js"})
 	soloStats, err := db.StoreResult(ctx, solo,
 		fmt.Appendf(nil, `{"v":8,"files":[{"id":0,"sha":%q,"type":"javascript","depth":0,"path":"solo.js"}]}`, solo),
-		nil, nil, nil, "tv1")
+		nil, nil, nil, "tv1", ResultAttribution{})
 	if err != nil {
 		t.Fatalf("StoreResult(non-archive): %v", err)
 	}
@@ -390,7 +390,7 @@ func TestStoreResultTombstonesUnsupportedFileType(t *testing.T) {
 
 	// A result the authoritative pass could not classify: no fs[] entry for the
 	// sha → parsed file_type is empty.
-	stats, err := db.StoreResult(ctx, sha, []byte(`{"fs":[]}`), nil, nil, nil, "tv1")
+	stats, err := db.StoreResult(ctx, sha, []byte(`{"fs":[]}`), nil, nil, nil, "tv1", ResultAttribution{})
 	if err != nil {
 		t.Fatalf("StoreResult(unsupported): %v", err)
 	}
@@ -411,7 +411,7 @@ func TestStoreResultTombstonesUnsupportedFileType(t *testing.T) {
 	// is what lets a store racing a concurrent delete of the same SHA succeed
 	// instead of erroring out.
 	absent := strings.Repeat("f", 64)
-	if _, err := db.StoreResult(ctx, absent, []byte(`{"fs":[]}`), nil, nil, nil, "tv1"); err != nil {
+	if _, err := db.StoreResult(ctx, absent, []byte(`{"fs":[]}`), nil, nil, nil, "tv1", ResultAttribution{}); err != nil {
 		t.Errorf("StoreResult(unsupported, absent row) = %v, want nil", err)
 	}
 }
@@ -440,7 +440,7 @@ func TestStoreResultRecordsFetchedRel(t *testing.T) {
 		{"id":1,"sha":%q,"type":"javascript","depth":1,"path":"app.elf!!a.js"},
 		{"id":2,"sha":%q,"type":"unknown","depth":1,"path":"compatibility","pid":0,"rel":"fetched","via":"https://example.test/compatibility"}
 	]}`, archive, contained, fetched)
-	if _, err := db.StoreResult(ctx, archive, full, []byte(`{"prob":0.1}`), nil, nil, "tv1"); err != nil {
+	if _, err := db.StoreResult(ctx, archive, full, []byte(`{"prob":0.1}`), nil, nil, "tv1", ResultAttribution{}); err != nil {
 		t.Fatalf("StoreResult: %v", err)
 	}
 
@@ -2679,7 +2679,7 @@ func TestStoreResultReportsRenewals(t *testing.T) {
 	})
 	result := []byte(`{"files":[{"sha":"` + sha + `","type":"elf","depth":0}]}`)
 
-	first, err := db.StoreResult(ctx, sha, result, nil, nil, nil, "traits-1")
+	first, err := db.StoreResult(ctx, sha, result, nil, nil, nil, "traits-1", ResultAttribution{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2691,7 +2691,7 @@ func TestStoreResultReportsRenewals(t *testing.T) {
 	}
 
 	// Same analyzer: the re-run could not have learned anything.
-	same, err := db.StoreResult(ctx, sha, result, nil, nil, nil, "traits-1")
+	same, err := db.StoreResult(ctx, sha, result, nil, nil, nil, "traits-1", ResultAttribution{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2709,7 +2709,7 @@ func TestStoreResultReportsRenewals(t *testing.T) {
 	}
 
 	// Analyzer moved: a real refresh, not waste.
-	moved, err := db.StoreResult(ctx, sha, result, nil, nil, nil, "traits-2")
+	moved, err := db.StoreResult(ctx, sha, result, nil, nil, nil, "traits-2", ResultAttribution{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4193,7 +4193,7 @@ func TestFeedSamplesProjectionOmitsBlobs(t *testing.T) {
 		{"id":"metadata/pkg/minified","crit":2}]}]}`)
 	litmus := []byte(`{"class":1,"l":1}`)
 	llm := []byte(`{"summary":"benign helper"}`)
-	if _, err := db.StoreResult(ctx, "feedproj1", cleave, litmus, llm, nil, ""); err != nil {
+	if _, err := db.StoreResult(ctx, "feedproj1", cleave, litmus, llm, nil, "", ResultAttribution{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -6624,7 +6624,7 @@ func TestTriageExcludesEmptyPathReferences(t *testing.T) {
 			`{"fs":[{"sha":%q,"type":%q,"dp":0,"ts":[{"l":5},{"l":4},{"l":4},{"l":4}]}]}`,
 			sha, typ)
 		litmus := []byte(`{"class":2,"l":2}`)
-		if _, err := db.StoreResult(ctx, sha, cleave, litmus, nil, nil, ""); err != nil {
+		if _, err := db.StoreResult(ctx, sha, cleave, litmus, nil, nil, "", ResultAttribution{}); err != nil {
 			t.Fatalf("StoreResult(%s): %v", sha, err)
 		}
 	}
@@ -7958,7 +7958,7 @@ func TestTraitGraphRoundTrip(t *testing.T) {
 	mustInsert(t, ctx, db, &Sample{SHA256: "g1", Source: "test", Label: "bad", Path: "bad/g1"})
 	// The analysis path is what derives the column, the same way it derives
 	// top_traits and the rest.
-	if _, err := db.StoreResult(ctx, "g1", result, nil, nil, nil, "tv1"); err != nil {
+	if _, err := db.StoreResult(ctx, "g1", result, nil, nil, nil, "tv1", ResultAttribution{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -7998,7 +7998,7 @@ func TestTraitGraphEmptyForBenign(t *testing.T) {
 	mustInsert(t, ctx, db, &Sample{SHA256: "g2", Source: "test", Label: "good", Path: "good/g2"})
 	if _, err := db.StoreResult(ctx, "g2",
 		[]byte(`{"files":[{"sha":"g2","type":"javascript","traits":[{"id":"metadata/file/profile","crit":1}]}]}`),
-		nil, nil, nil, "tv1"); err != nil {
+		nil, nil, nil, "tv1", ResultAttribution{}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := db.SampleBySHA256(ctx, "g2")
