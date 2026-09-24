@@ -71,7 +71,7 @@ type webDashboard struct {
 	tracker       *workerTracker
 	api           *apiServer // for live traits-version reads (refreshed every 2h)
 	rescanCache   *fido.Cache[string, hopper.RescanDepths]
-	ratesCache    *fido.Cache[string, hopper.AnalysisRates]
+	rates         *rateSampler
 	pendingCache  *fido.Cache[string, int64]
 	healthCache   *fido.Cache[string, hopper.WorkflowHealth]
 	backlogCache  *fido.Cache[string, []hopper.WorkflowBacklog]
@@ -196,7 +196,7 @@ func (wd *webDashboard) configure( //nolint:revive // argument-limit: dashboard 
 	wd.rescanAge = rescanAge
 	wd.newestATCache = fido.New[string, time.Time](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.rescanCache = fido.New[string, hopper.RescanDepths](fido.Size(1), fido.TTL(dashCacheTTL))
-	wd.ratesCache = fido.New[string, hopper.AnalysisRates](fido.Size(1), fido.TTL(dashCacheTTL))
+	wd.rates = newRateSampler(db)
 	wd.pendingCache = fido.New[string, int64](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.seriesCache = fido.New[string, []queuePoint](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.healthCache = fido.New[string, hopper.WorkflowHealth](fido.Size(1), fido.TTL(dashCacheTTL))
@@ -592,16 +592,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	// the old ETAs wildly optimistic.
 	var topLevelRate, rescanRate float64
 	if db != nil {
-		//nolint:contextcheck,errcheck // closure creates its own context; closure logs errors before returning
-		rates, _ := wd.ratesCache.Fetch("rates", func() (hopper.AnalysisRates, error) {
-			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
-			defer cancel()
-			v, err := db.AnalysisRatesSince(qctx, analysisRateWindow)
-			if err != nil {
-				slog.Warn("dashboard: AnalysisRatesSince failed", "error", err)
-			}
-			return v, err
-		})
+		rates := wd.rates.get(r.Context())
 		topLevelRate = float64(rates.TopLevel) / analysisRateWindow.Seconds()
 		rescanRate = float64(rates.Rescans) / analysisRateWindow.Seconds()
 	}
@@ -1211,19 +1202,79 @@ func (wd *webDashboard) rescanPending(ctx context.Context) int64 {
 // analysisRates returns the top-level and rescan analysis counts over
 // analysisRateWindow (divide by the window for per-second rates).
 func (wd *webDashboard) analysisRates(ctx context.Context) hopper.AnalysisRates {
-	if wd.db == nil || wd.ratesCache == nil {
+	if wd.db == nil || wd.rates == nil {
 		return hopper.AnalysisRates{}
 	}
-	rates, _ := wd.ratesCache.Fetch("rates", func() (hopper.AnalysisRates, error) { //nolint:errcheck // cached value used on error
-		qctx, cancel := context.WithTimeout(ctx, dashQueryTimeout)
-		defer cancel()
-		v, err := wd.db.AnalysisRatesSince(qctx, analysisRateWindow)
-		if err != nil {
-			slog.Warn("metrics: AnalysisRatesSince failed", "error", err)
-		}
-		return v, err
-	})
-	return rates
+	return wd.rates.get(ctx)
+}
+
+// Refresh cadence and budget for the analysis-rate count. The count has no
+// cheap plan: an hour of analyzed_at spans ~1.7M exploded archive members for
+// every ~130k top-level samples, and the fastest plan measured (2026-09-24) is a
+// 4.3 s BitmapAnd over 1.2M buffers — which under load blew both the 10 s
+// dashboard budget and the 8 s metrics-scrape budget it shared with every other
+// scrape query, so it failed repeatedly, re-ran on every scrape because failures
+// are not cached, and took workflow health and the sightings gauges down with
+// it. It is an hour-wide average: refreshing it every few minutes loses nothing.
+const (
+	analysisRatesRefresh = 5 * time.Minute
+	analysisRatesTimeout = 90 * time.Second
+)
+
+// rateSampler serves the last good [hopper.AnalysisRates] immediately and
+// refreshes it in the background, so the count is never on a request's or a
+// scrape's critical path and a failed refresh keeps the previous value rather
+// than reporting zero — which the dashboard reads as "nothing is draining".
+type rateSampler struct {
+	db       *hopper.DB
+	mu       sync.Mutex
+	value    hopper.AnalysisRates
+	attempts int
+	started  time.Time
+	running  bool
+}
+
+func newRateSampler(db *hopper.DB) *rateSampler { return &rateSampler{db: db} }
+
+// get returns the current value, starting a refresh when one is due. The very
+// first call runs synchronously under ctx so a fresh process does not report
+// zero rates for a whole refresh period; every later refresh is asynchronous.
+func (rs *rateSampler) get(ctx context.Context) hopper.AnalysisRates {
+	rs.mu.Lock()
+	if rs.running || time.Since(rs.started) < analysisRatesRefresh {
+		v := rs.value
+		rs.mu.Unlock()
+		return v
+	}
+	rs.running = true
+	rs.started = time.Now()
+	first := rs.attempts == 0
+	rs.attempts++
+	rs.mu.Unlock()
+
+	if first {
+		rs.refresh(ctx)
+	} else {
+		//nolint:contextcheck // detached on purpose: outlives the request that noticed it was due
+		go rs.refresh(context.Background())
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.value
+}
+
+func (rs *rateSampler) refresh(parent context.Context) {
+	ctx, cancel := context.WithTimeout(parent, analysisRatesTimeout)
+	defer cancel()
+	v, err := rs.db.AnalysisRatesSince(ctx, analysisRateWindow)
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.running = false
+	if err != nil {
+		slog.Warn("analysis rates refresh failed; keeping the previous value", "error", err)
+		return
+	}
+	rs.value = v
 }
 
 // workflowHealth returns the workflow freshness/backlog snapshot. The bool is

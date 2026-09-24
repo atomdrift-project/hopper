@@ -820,7 +820,11 @@ func forceReadOnlyDSN(dsn string) (string, error) {
 	q := u.Query()
 	opts := strings.TrimSpace(q.Get("options") + " -c default_transaction_read_only=on")
 	q.Set("options", opts)
-	u.RawQuery = q.Encode()
+	// url.Values.Encode spells a space as '+', which pgx >= 5.11 (like libpq)
+	// passes through literally: the server then sees a startup option named
+	// "+default_transaction_read_only" and refuses the connection. Encode
+	// already escapes a literal plus as %2B, so every remaining '+' is a space.
+	u.RawQuery = strings.ReplaceAll(q.Encode(), "+", "%20")
 	return u.String(), nil
 }
 

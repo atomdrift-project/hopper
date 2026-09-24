@@ -5288,7 +5288,7 @@ func (db *DB) TriageStranded(ctx context.Context, limit int, createdBefore, miss
 // Expensive: the archive selector's `ORDER BY score DESC LIMIT strandedInnerScan`
 // is an ordered index walk that probes three times per row, and it stops early
 // only if it can fill that limit. The population is far smaller than the limit,
-// so it never can — it walks the whole of idx_samples_stranded_member every
+// so it never can — it walks the whole of the stranded member index every
 // time, measured at 17.3s against 0.6s for this. That is the classic rare-
 // predicate trap the bad/sighted selectors already carry indexes to avoid: cost
 // scales with how RARE the population is, not how large.

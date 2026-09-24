@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"math"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -436,5 +438,55 @@ func TestSystemStatusSeparatesChronicFromAcute(t *testing.T) {
 	}
 	if !strings.Contains(acute.String(), "168,906 files have no litmus score") {
 		t.Errorf("the chronic condition must still be listed, got %q", acute.String())
+	}
+}
+
+// The analysis-rate count is too expensive to run on every scrape, so it is
+// refreshed in the background — and a refresh that fails must keep the last
+// good value, not report zero (which the dashboard renders as "nothing is
+// draining" and every ETA as never).
+func TestRateSamplerKeepsLastValueOnFailure(t *testing.T) {
+	ctx := context.Background()
+	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "hopper.db"))
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	rs := newRateSampler(db)
+	rs.value = hopper.AnalysisRates{TopLevel: 7, Rescans: 3} // as if a prior refresh landed
+	rs.attempts = 1
+	if got := rs.get(ctx); got.TopLevel != 7 {
+		t.Fatalf("a due refresh must not block the caller: got %+v", got)
+	}
+	// get above started an async refresh against a live, empty DB; wait for it.
+	waitIdle := func() {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			rs.mu.Lock()
+			running := rs.running
+			rs.mu.Unlock()
+			if !running {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("refresh never finished")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	waitIdle()
+	if got := rs.get(ctx); got.TopLevel != 0 {
+		t.Fatalf("successful refresh of an empty corpus should read 0, got %+v", got)
+	}
+
+	rs.mu.Lock()
+	rs.value = hopper.AnalysisRates{TopLevel: 9}
+	rs.started = time.Time{} // due again
+	rs.mu.Unlock()
+	db.Close()
+	rs.get(ctx)
+	waitIdle()
+	if got := rs.get(ctx); got.TopLevel != 9 {
+		t.Errorf("failed refresh replaced the last good value: got %+v, want TopLevel 9", got)
 	}
 }

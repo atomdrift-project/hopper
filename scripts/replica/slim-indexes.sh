@@ -85,7 +85,7 @@ fi
 # Two consumers now, not one. prism's lookups came first; cyclotron's triage
 # queues joined when its selection moved off the master. They want different
 # indexes — prism probes single identities (purl_lookup, filename_trgm) while
-# cyclotron walks ranked populations (bad_route_fresh, stranded_member) — so
+# cyclotron walks ranked populations (bad_route_fresh, stranded_pending) — so
 # "prism does not scan it" is no longer sufficient reason to drop one.
 REPLICA_KEEP_INDEXES='
 idx_claims_name
@@ -119,7 +119,7 @@ idx_samples_purl_base
 idx_samples_purl_lookup
 idx_samples_second_newest
 idx_samples_sighted_purl
-idx_samples_stranded_member
+idx_samples_stranded_pending
 idx_samples_top_ready_created
 idx_samples_unconvicted_hostile_repair
 idx_samples_unconvicted_hostile_stale

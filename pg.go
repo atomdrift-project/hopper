@@ -806,10 +806,24 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// TriageStranded's member walk: good members with real findings,
 		// risk-score descending; parent's bad label is probed per row via
 		// the sha256 unique index (cross-row predicates can't live in a
-		// partial index). StrandedMembers reuses it via the parent column.
-		`CREATE INDEX IF NOT EXISTS idx_samples_stranded_member ` +
+		// partial index).
+		//
+		// Carries every row-local constant of triageStrandedWhere, not just the
+		// cheap ones. Its predecessor, idx_samples_stranded_member, stopped at
+		// max_crit >= 3 and left path LIKE '%!!%', max_crit >= 4 and the
+		// cyclotron exclusion as heap filters: 5.7M entries of which 59k pass,
+		// so every walk fetched ~5.7M heap rows. Measured 2026-09-24 at 33.7s
+		// and 3.76M pages read from disk (~29 GB, evicting 666k dirty buffers)
+		// for 265 rows — the stranded depth poll timed out at 30s every ~16
+		// minutes and flushed the publisher's cache each time. The predicate
+		// must stay textually identical to triageStrandedWhere's, or the planner
+		// cannot prove the index usable.
+		`CREATE INDEX IF NOT EXISTS idx_samples_stranded_pending ` +
 			`ON samples(score DESC, id DESC) ` +
-			`WHERE label = 'good' AND parent != '' AND score > 0 AND max_crit >= 3 AND cleave_result IS NOT NULL AND skip = ''`,
+			`WHERE label = 'good' AND cleave_result IS NOT NULL AND skip = '' ` +
+			`AND parent != '' AND path LIKE '%!!%' AND score > 0 AND max_crit >= 4 ` +
+			`AND label_source NOT LIKE 'cyclotron:%'`,
+		`DROP INDEX IF EXISTS idx_samples_stranded_member`,
 		// The five newest-first selectors (TriageBad/Good/New/Review/Sighted). Without
 		// these the planner walks idx_samples_top_created — which carries only
 		// parent = '' — and applies label plus the detection predicate as a
