@@ -57,6 +57,7 @@ var runtimeMap = map[string]string{
 	"chrome":    "chrome",
 	"edge":      "edge",
 	"mozilla":   "firefox",
+	"terraform": "terraform",
 	// ML model hubs.
 	"huggingface": "huggingface",
 	// Agent skills.

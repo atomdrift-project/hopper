@@ -120,7 +120,8 @@ func ecosystemType(eco string) (string, bool) {
 	case "chrome", "firefox", "wordpress", "jetbrains", "snap", "jsr", "conda",
 		"hex", "cran", "cpan", "pub", "clojars",
 		"arch", "aur", "debian", "ubuntu", "fedora", "opensuse", "rpmfusion",
-		"alpine", "wolfi", "netbsd", "freebsd", "openbsd", "clawhub", "skills_sh":
+		"alpine", "wolfi", "netbsd", "freebsd", "openbsd", "clawhub", "skills_sh",
+		"terraform":
 		return eco, true
 	// GitHub-hosted code under every label forager and the walker use for it
 	// (release downloads, actions, repo archives, and the samples.ecosystem
@@ -208,6 +209,8 @@ func domainType(dom string) (string, bool) {
 		return "clawhub", true
 	case "skills.sh":
 		return "skills_sh", true
+	case "terraform.io":
+		return "terraform", true
 	default:
 		return "", false
 	}
@@ -281,6 +284,16 @@ func buildTyped(key, name, version, arch string) (string, bool) {
 			return "", false
 		}
 		return renderPURL("github", asciiLower(parts[0]), asciiLower(parts[1]), version, ""), true
+
+	case "terraform":
+		// A Terraform provider is namespace/type, exactly, and the registry
+		// resolves both case-insensitively (kreuzwerker/docker and
+		// Kreuzwerker/Docker are one provider), so both are lowercased.
+		ns, typ, found := strings.Cut(name, "/")
+		if !found || ns == "" || typ == "" || strings.Contains(typ, "/") {
+			return "", false
+		}
+		return renderPURL(key, asciiLower(ns), asciiLower(typ), version, ""), true
 
 	case "clawhub":
 		// ClawHub skill: owner/slug when the publisher is known (slugs are not
@@ -634,7 +647,7 @@ const (
 func purlNamespaceRequirement(typ string) int {
 	switch typ {
 	case "alpm", "apk", "bitbucket", "composer", "deb", "git", "github",
-		"huggingface", "maven", "qpkg", "rpm", "swift", "vscode-extension":
+		"huggingface", "maven", "qpkg", "rpm", "swift", "terraform", "vscode-extension":
 		return purlNamespaceRequired
 	case "bazel", "bitnami", "cargo", "chrome-extension", "cocoapods", "conda", "cran",
 		"gem", "hackage", "julia", "mlflow", "nuget", "oci", "opam", "otp", "pub",
@@ -843,12 +856,16 @@ func canonicalizePURL(purl string) string {
 		return "pkg:vscode-extension/" + asciiLower(path) + addQualifier(tail, openVSXQualifier)
 	// PyPI treats '-'/'_'/'.' as one separator and names as case-insensitive
 	// (PEP 503, the registry's own equivalence); composer names are
-	// case-insensitive per spec and lowercased. npm is deliberately NOT
-	// folded: legacy mixed-case names were grandfathered in and stay distinct.
+	// case-insensitive per spec and lowercased, as are Terraform provider
+	// addresses, which the registry resolves case-insensitively. npm is
+	// deliberately NOT folded: legacy mixed-case names were grandfathered in
+	// and stay distinct.
 	case "pypi":
 		return "pkg:pypi/" + pep503(path) + tail
 	case "composer":
 		return "pkg:composer/" + asciiLower(path) + tail
+	case "terraform":
+		return "pkg:terraform/" + asciiLower(path) + tail
 	case "deb", "rpm", "apk":
 		if out := "pkg:" + typ + "/" + distroPath(typ, path, tail) + tail; out != purl {
 			return out

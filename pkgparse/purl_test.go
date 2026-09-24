@@ -60,6 +60,12 @@ func TestSourcePURLIdentity(t *testing.T) {
 		{"skills.sh two segments", "skills_sh", "skills.sh", "owner/repo", "pkg:github/owner/repo", true},
 		{"skills.sh bare name", "skills_sh", "skills.sh", "norepo", "", false},
 
+		// Terraform providers: exactly namespace/type, lowercased.
+		{"terraform eco", "terraform", "terraform.io", "Kreuzwerker/Docker", "pkg:terraform/kreuzwerker/docker", true},
+		{"terraform by domain", "", "terraform.io", "hashicorp/aws", "pkg:terraform/hashicorp/aws", true},
+		{"terraform bare type", "terraform", "terraform.io", "docker", "", false},
+		{"terraform extra segments", "terraform", "terraform.io", "a/b/c", "", false},
+
 		// Nothing resolvable → empty, never a wrong PURL.
 		{"junk no domain", "datasets", "", "something", "", false},
 		{"empty name", "python", "pypi.org", "", "", false},
@@ -191,6 +197,11 @@ func TestCanonicalizePURL(t *testing.T) {
 		{"pkg:deb/curl@7.50.3-1?arch=i386&distro=jessie", "pkg:deb/curl@7.50.3-1?arch=i386&distro=jessie"},
 		{"pkg:deb/curl@7.50.3-1?arch=amd64&distro=ubuntu-22.04", "pkg:deb/ubuntu/curl@7.50.3-1?arch=amd64&distro=ubuntu-22.04"},
 		{"pkg:alpine/musl", "pkg:apk/alpine/musl"},
+
+		// Terraform provider addresses are case-insensitive; the version is not.
+		{"pkg:terraform/Kreuzwerker/Docker@3.0.2-RC1", "pkg:terraform/kreuzwerker/docker@3.0.2-RC1"},
+		// No namespace is no provider address, so there is no canonical form.
+		{"pkg:terraform/docker@3.0.2", "pkg:terraform/docker@3.0.2"},
 
 		// A Go module whose path is a single segment has no namespace to give.
 		// The spec calls golang's namespace required; purlNamespaceRequirement

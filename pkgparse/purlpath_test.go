@@ -13,6 +13,7 @@ func TestPURLPath(t *testing.T) {
 		{"scoped npm keeps the scope as a level", "pkg:npm/%40vue/cli@5.0.8", "npm/@vue/cli/5.0.8"},
 		{"scoped npm accepts the unescaped spelling", "pkg:npm/@vue/cli@5.0.8", "npm/@vue/cli/5.0.8"},
 		{"pypi", "pkg:pypi/requests@2.31.0", "pypi/requests/2.31.0"},
+		{"terraform provider", "pkg:terraform/Kreuzwerker/docker@3.0.2", "terraform/kreuzwerker/docker/3.0.2"},
 		{"multi-segment golang namespace", "pkg:golang/github.com/foo/bar@1.2.3", "golang/github.com/foo/bar/1.2.3"},
 		{"distro vendor is a namespace", "pkg:deb/debian/curl@8.5.0", "deb/debian/curl/8.5.0"},
 		{"epoch survives in the version", "pkg:alpm/arch/containers-common@1:0.47.4-4", "alpm/arch/containers-common/1:0.47.4-4"},

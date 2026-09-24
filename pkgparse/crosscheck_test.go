@@ -140,6 +140,12 @@ func TestFletchReadsGeneratedPURLs(t *testing.T) {
 			"clawhub skill", "clawhub", "clawhub.ai", "Owner/Cool-Skill", "1.0.2", "",
 			"clawhub", "owner/cool-skill", "1.0.2", "clawhub.ai", true,
 		},
+		{
+			"terraform provider", "terraform", "terraform.io", "Kreuzwerker/Docker", "3.0.2", "",
+			// The zip's URL and digest come from the registry's download
+			// endpoint, so there is none to resolve offline (as with pypi).
+			"terraform", "kreuzwerker/docker", "3.0.2", "registry.terraform.io", false,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
