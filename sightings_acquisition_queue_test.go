@@ -226,13 +226,76 @@ func TestQueueOrdersByEventDateNotDiscoveryDate(t *testing.T) {
 		t.Errorf("queue order = %s/%s/%s; last year's attack must not outrank today's just because we logged it later",
 			got[0].Source, got[1].Source, got[2].Source)
 	}
-	// And the oldest-first read is the exact mirror.
-	oldest, err := db.OldestUnattemptedSightings(ctx, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(oldest) != 1 || oldest[0].Source != "stale-event" {
-		t.Errorf("oldest-first head = %+v, want last year's attack", oldest)
+}
+
+// The tail lane is live claims, oldest first by when they reached us, and never
+// history.
+//
+// A backfill is backdated to the source's date or the epoch, so oldest-first
+// over every claim would spend the lane on 1970 for years. On 2026-09-25 that
+// history was 454k of 618k queued claims, and its 204k epoch rows held the
+// unattempted-age gauge at 56 years while live claims from July went unfetched.
+func TestOldestUnattemptedIsLiveClaimsOnly(t *testing.T) {
+	for _, b := range testBackends {
+		t.Run(b.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := b.open(t)
+
+			if _, err := db.AddSightingsBackfill(ctx, []Sighting{
+				{Source: "history", Subject: "pkg:npm/undated-history", Affected: "1.0.0", Claim: ClaimMalicious},
+				{
+					Source: "history", Subject: "pkg:npm/dated-history", Affected: "1.0.0", Claim: ClaimMalicious,
+					PublishedAt: time.Date(2021, 11, 15, 0, 0, 0, 0, time.UTC),
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			// Recorded in this order. The second says it happened last year,
+			// which moves it in the newest-first lane but not in this one.
+			for _, s := range []Sighting{
+				{Source: "feed", Subject: "pkg:npm/first", Affected: "1.0.0", Claim: ClaimMalicious},
+				{
+					Source: "feed", Subject: "pkg:npm/second", Affected: "1.0.0", Claim: ClaimMalicious,
+					PublishedAt: time.Now().Add(-365 * 24 * time.Hour),
+				},
+				{Source: "feed", Subject: "pkg:npm/third", Affected: "1.0.0", Claim: ClaimMalicious},
+				{Source: "bazaar", Subject: fmt.Sprintf("%064x", 1), Claim: ClaimMalicious},
+			} {
+				time.Sleep(2 * time.Millisecond)
+				if _, err := db.AddSightings(ctx, []Sighting{s}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			subjects := func(rows []Sighting) string {
+				var out []string
+				for _, r := range rows {
+					out = append(out, strings.TrimPrefix(r.Subject, "pkg:npm/"))
+				}
+				return strings.Join(out, ",")
+			}
+			got, err := db.OldestUnattemptedForProvider(ctx, "npm", 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if subjects(got) != "first,second,third" {
+				t.Fatalf("npm tail = %s, want first,second,third and no history", subjects(got))
+			}
+			if err := db.MarkSightingsAttempted(ctx, got[:1]); err != nil {
+				t.Fatal(err)
+			}
+			if got, err = db.OldestUnattemptedForProvider(ctx, "npm", 1); err != nil || subjects(got) != "second" {
+				t.Fatalf("npm tail after stamping the head = %s, %v; want second", subjects(got), err)
+			}
+
+			// The gauge reads the same set, so history cannot page anyone.
+			if db.pool != nil {
+				age, ok, err := db.OldestUnattemptedSighting(ctx)
+				if err != nil || !ok || age > time.Minute {
+					t.Fatalf("OldestUnattemptedSighting = %v, %v, %v; want the live claims' age, not 1970's", age, ok, err)
+				}
+			}
+		})
 	}
 }
 

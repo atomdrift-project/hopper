@@ -4459,16 +4459,21 @@ func (db *DB) unattemptedForProviderSQLite(ctx context.Context, provider string,
 	return out, rows.Err()
 }
 
-func (db *DB) oldestUnattemptedSightingsSQLite(ctx context.Context, limit int) ([]Sighting, error) {
+// liteLiveAcquirableSQL mirrors liveAcquirableSQL. Timestamps are text here,
+// written in one format, so the epoch is spelled the way backdated stores it.
+const liteLiveAcquirableSQL = `attempted_at IS NULL AND claim IN ('malicious', 'suspicious') ` +
+	`AND first_seen <> '1970-01-01T00:00:00.000Z' AND first_seen IS NOT published_at`
+
+func (db *DB) oldestUnattemptedForProviderSQLite(ctx context.Context, provider string, limit int) ([]Sighting, error) {
 	rows, err := db.lite.QueryContext(ctx, `
 		SELECT source, subject, url, note, first_seen,
 		       operator, affected, claim, filename, handle, basis, relayer, published_at
 		FROM sightings
-		WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')
-		ORDER BY COALESCE(published_at, first_seen) ASC
-		LIMIT ?`, limit)
+		WHERE `+liteLiveAcquirableSQL+` AND `+liteAcquisitionProviderSQL+` = ?
+		ORDER BY first_seen
+		LIMIT ?`, provider, limit)
 	if err != nil {
-		return nil, fmt.Errorf("hopper: oldest unattempted sightings: %w", err)
+		return nil, fmt.Errorf("hopper: oldest unattempted sightings for provider: %w", err)
 	}
 	defer rows.Close() //nolint:errcheck // best-effort cleanup
 	var out []Sighting
@@ -4477,7 +4482,7 @@ func (db *DB) oldestUnattemptedSightingsSQLite(ctx context.Context, limit int) (
 		var published sql.NullTime
 		if err := rows.Scan(&x.Source, &x.Subject, &x.URL, &x.Note, &x.FirstSeen,
 			&x.Operator, &x.Affected, &x.Claim, &x.FileName, &x.Handle, &x.Basis, &x.Relayer, &published); err != nil {
-			return nil, fmt.Errorf("hopper: scan oldest unattempted sighting: %w", err)
+			return nil, fmt.Errorf("hopper: scan oldest provider sighting: %w", err)
 		}
 		x.PublishedAt = published.Time
 		out = append(out, x)

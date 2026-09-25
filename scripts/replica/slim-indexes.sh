@@ -224,6 +224,8 @@ idx_samples_candidate_keyset
 idx_sightings_acquisition_recent
 idx_sightings_acquirable_event
 idx_sightings_acquirable_provider
+idx_sightings_live_age
+idx_sightings_live_provider
 idx_sightings_recent
 idx_popular_rank
 idx_reports_created_at

@@ -453,6 +453,15 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			`(CASE WHEN subject LIKE 'pkg:%' THEN split_part(split_part(subject, '/', 1), ':', 2) ELSE source END), ` +
 			`(COALESCE(published_at, first_seen)) DESC) ` +
 			`WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')`,
+		// The live half of the queue, oldest first: one index for the
+		// unattempted-age gauge, one for each provider's tail lane. Both
+		// predicates are liveAcquirableSQL verbatim, or the planner cannot use
+		// them. About 1 MB each at 163k live claims; without the first, the
+		// gauge scanned the whole live queue on every 15-second collect.
+		`CREATE INDEX IF NOT EXISTS idx_sightings_live_age ` +
+			`ON sightings(first_seen) WHERE ` + liveAcquirableSQL,
+		`CREATE INDEX IF NOT EXISTS idx_sightings_live_provider ` +
+			`ON sightings((` + acquisitionProviderSQL + `), first_seen) WHERE ` + liveAcquirableSQL,
 		`DROP INDEX IF EXISTS idx_sightings_acquirable`,
 		`DROP INDEX IF EXISTS idx_sightings_unattempted`,
 		// Sighted triage has two ordered walks: digest claims and PURL claims. The
@@ -6878,6 +6887,20 @@ func (db *DB) unattemptedSightingsPG(ctx context.Context, limit int, source stri
 const acquisitionProviderSQL = `CASE WHEN subject LIKE 'pkg:%' ` +
 	`THEN split_part(split_part(subject, '/', 1), ':', 2) ELSE source END`
 
+// liveAcquirableSQL selects the acquirable claims whose first_seen is when they
+// reached us, rather than a date a backfill gave them.
+//
+// A backfill sets first_seen to exactly [backdated] of published_at: the
+// source's date, or the epoch when it has none. Those rows are history, and
+// their first_seen says nothing about how long they have waited on us. On
+// 2026-09-25 they were 454k of 618k queued claims, and 204k epoch rows held the
+// unattempted-age gauge at 56 years while acquisition ran normally.
+//
+// A backfilled row whose source later revises published_at passes as live. The
+// cost is one old claim in the tail lane, never a claim missed.
+const liveAcquirableSQL = `attempted_at IS NULL AND claim IN ('malicious', 'suspicious') ` +
+	`AND first_seen <> 'epoch' AND first_seen IS DISTINCT FROM published_at`
+
 func (db *DB) acquisitionProvidersPG(ctx context.Context) ([]AcquisitionProvider, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT `+acquisitionProviderSQL+` AS provider, count(*)
@@ -6913,17 +6936,16 @@ func (db *DB) unattemptedForProviderPG(ctx context.Context, provider string, lim
 	return scanSightingRows(rows)
 }
 
-func (db *DB) oldestUnattemptedSightingsPG(ctx context.Context, limit int) ([]Sighting, error) {
-	// ASC, so this walks idx_sightings_acquirable_event from the far end. Same
-	// index, same predicate, opposite direction -- no second index is needed.
+func (db *DB) oldestUnattemptedForProviderPG(ctx context.Context, provider string, limit int) ([]Sighting, error) {
+	// A walk of idx_sightings_live_provider that stops at limit.
 	rows, err := db.pool.Query(ctx, `
 		SELECT `+sightingAcquisitionCols+`
 		FROM sightings
-		WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')
-		ORDER BY COALESCE(published_at, first_seen) ASC
-		LIMIT $1`, limit)
+		WHERE `+liveAcquirableSQL+` AND `+acquisitionProviderSQL+` = $2
+		ORDER BY first_seen
+		LIMIT $1`, limit, provider)
 	if err != nil {
-		return nil, fmt.Errorf("hopper: oldest unattempted sightings: %w", err)
+		return nil, fmt.Errorf("hopper: oldest unattempted sightings for provider: %w", err)
 	}
 	return scanSightingRows(rows)
 }

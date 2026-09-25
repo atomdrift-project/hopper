@@ -6893,8 +6893,8 @@ func (db *DB) UnattemptedSightings(ctx context.Context, limit int, source string
 	return db.unattemptedSightingsSQLite(ctx, limit, source)
 }
 
-// OldestUnattemptedSighting returns the age of the longest-waiting claim nothing
-// has tried to acquire, and false when the queue is empty.
+// OldestUnattemptedSighting returns the age of the longest-waiting live claim
+// nothing has tried to acquire, and false when there is none.
 //
 // This is the post-mortem's own alert, expressed as a number. A claim enters
 // this state the moment a feed records it and leaves the moment anything tries
@@ -6903,20 +6903,20 @@ func (db *DB) UnattemptedSightings(ctx context.Context, limit int, source string
 // system. Nothing measured it because nothing could: the fact lived in another
 // table under a key only the consumer knew how to build.
 //
-// Cheap by construction, but only because idx_sightings_acquirable's predicate
-// matches this query exactly -- attempted_at IS NULL AND the same claim filter.
-// The minimum is then the last entry of an index the planner walks backwards.
-// Widen this query without widening the index and it becomes a walk from the
-// oldest end past every row the index holds but the query rejects, on every
-// metrics scrape.
+// Live claims only: a backfilled claim's first_seen is the source's date or the
+// epoch, which measures the source's history rather than our wait. See
+// liveAcquirableSQL.
+//
+// One index probe, because idx_sightings_live_age is keyed on first_seen under
+// exactly this predicate. Change one without the other and this becomes a scan
+// of the live queue on every metrics collect.
 func (db *DB) OldestUnattemptedSighting(ctx context.Context) (time.Duration, bool, error) {
 	if db.pool == nil {
 		return 0, false, nil
 	}
 	var oldest *time.Time
-	err := db.pool.QueryRow(ctx, `
-		SELECT min(first_seen) FROM sightings
-		WHERE attempted_at IS NULL AND claim IN ('malicious', 'suspicious')`).Scan(&oldest)
+	err := db.pool.QueryRow(ctx,
+		`SELECT min(first_seen) FROM sightings WHERE `+liveAcquirableSQL).Scan(&oldest)
 	if err != nil {
 		return 0, false, fmt.Errorf("hopper: oldest unattempted sighting: %w", err)
 	}
@@ -6967,28 +6967,31 @@ func (db *DB) UnattemptedForProvider(ctx context.Context, provider string, limit
 	return db.unattemptedForProviderSQLite(ctx, provider, limit)
 }
 
-// OldestUnattemptedSightings returns the longest-waiting claims nothing has
-// tried to acquire, oldest first.
+// OldestUnattemptedForProvider returns one provider's longest-waiting live
+// claims, oldest first.
 //
-// The mirror of [DB.UnattemptedSightings], and the reason both exist. Newest
+// The mirror of [DB.UnattemptedForProvider], and the reason both exist. Newest
 // first is right for a fresh citation: it names an artifact a registry may still
 // be serving, so acting on it soon is the whole point. But newest-first as the
 // ONLY rule starves the tail whenever claims arrive faster than they drain, and
 // that is the normal condition here -- measured 2026-09-08, arrivals ran 95 to
-// 508 an hour against a drain of about 100, so the queue grew and nothing older
-// than the current day was ever reached. The four packages that prompted this
-// work sat unattempted for sixteen hours with 570,000 claims in front of them.
-//
-// A caller reserves part of each batch for this, so the backlog drains at a
+// 508 an hour against a drain of about 100, and on 2026-09-25 live claims from
+// July were still waiting behind everything that arrived since. A caller
+// reserves part of each provider's batch for this, so the tail drains at a
 // guaranteed rate whatever the feeds are doing.
-func (db *DB) OldestUnattemptedSightings(ctx context.Context, limit int) ([]Sighting, error) {
-	if limit <= 0 {
+//
+// Live claims only, by when they reached us (see liveAcquirableSQL). Oldest
+// first over every claim would begin with 454k backfilled ones dated 1970 or
+// years back, and spend the reserve on history for years before reaching a
+// claim that is merely late.
+func (db *DB) OldestUnattemptedForProvider(ctx context.Context, provider string, limit int) ([]Sighting, error) {
+	if limit <= 0 || provider == "" {
 		return nil, nil
 	}
 	if db.pool != nil {
-		return db.oldestUnattemptedSightingsPG(ctx, limit)
+		return db.oldestUnattemptedForProviderPG(ctx, provider, limit)
 	}
-	return db.oldestUnattemptedSightingsSQLite(ctx, limit)
+	return db.oldestUnattemptedForProviderSQLite(ctx, provider, limit)
 }
 
 // MarkSightingsAttempted stamps attempted_at on each claim, so it is never
@@ -7216,15 +7219,21 @@ func (db *DB) seedTimes(ctx context.Context, s []Sighting) ([]time.Time, error) 
 		if !seeding[s[i].Source] {
 			continue
 		}
-		// What the source says, or the epoch: "this predates our records" is
-		// the honest answer when a backlog carries no dates of its own, and
-		// now() would be a lie that reads as a zero-day.
-		out[i] = s[i].PublishedAt
-		if out[i].IsZero() {
-			out[i] = time.Unix(0, 0).UTC()
-		}
+		out[i] = backdated(s[i].PublishedAt)
 	}
 	return out, nil
+}
+
+// backdated is the first_seen a backfilled claim gets: what the source says,
+// or the epoch. "This predates our records" is the honest answer when a backlog
+// carries no dates of its own, and now() would be a lie that reads as a
+// zero-day. liveAcquirableSQL recognises backfill by exactly this rule, so the
+// two change together.
+func backdated(published time.Time) time.Time {
+	if published.IsZero() {
+		return time.Unix(0, 0).UTC()
+	}
+	return published
 }
 
 // sightingSourceKnown reports whether the ledger already holds anything from a
@@ -7325,10 +7334,7 @@ func (db *DB) addSightings(ctx context.Context, s []Sighting, backfill bool) (in
 	}
 	if backfill {
 		for i := range valid {
-			valid[i].FirstSeen = valid[i].PublishedAt
-			if valid[i].FirstSeen.IsZero() {
-				valid[i].FirstSeen = time.Unix(0, 0).UTC()
-			}
+			valid[i].FirstSeen = backdated(valid[i].PublishedAt)
 		}
 	} else {
 		seeded, err := db.seedTimes(ctx, valid)
