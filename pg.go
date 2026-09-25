@@ -3604,11 +3604,31 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 }
 
 // memberConflictUpdatePG refreshes ONLY analysis columns of an existing member
-// row, and only when this archive's analysis is strictly newer. It never touches
-// label/path/skip/parent (a member must not rewrite a standalone row's identity)
-// and never blanks litmus. New members fall through to a plain INSERT. The
-// samples_derive_cleave_cols trigger re-derives file_type/max_crit/etc on the
-// cleave_result write.
+// row, and only when this archive's analysis is strictly newer AND ran under a
+// different traits version. It never touches label/path/skip/parent (a member
+// must not rewrite a standalone row's identity) and never blanks litmus. New
+// members fall through to a plain INSERT. The samples_derive_cleave_cols
+// trigger re-derives file_type/max_crit/etc on the cleave_result write.
+//
+// A refresh at the SAME traits version is skipped outright. That is
+// [StoreStats.Redundant], the rule storeResultPG already applies to the parent
+// through unchangedStore: the analyzer version is the corpus's invalidation
+// key, so a renewal under the version that produced the stored verdict learned
+// nothing. It still LOOKS like a change, because a member's cleave_result is
+// not content-addressed — files[] carries id/pid/path/depth, i.e. where this
+// particular archive contained the file — so the same sha inside rxjs@7.8.0,
+// 7.8.1 and 7.8.2 yields three byte-different envelopes and the TOAST guard
+// below can never fire. Measured 2026-09-25 against the replica's older copies:
+// 0 of 2,773 member refreshes were byte-identical, 54% were identical once that
+// occurrence context was stripped, and 74% ran at the version already stored.
+// This statement was then 74% of all master WAL and galadriel ~10 h behind.
+// Occurrence belongs to sample_locations, which tx2 in storeMemberRowsPG writes
+// for every archive regardless; rewriting the row per archive only moved "last
+// seen in" around at ~7 KB of WAL a time.
+//
+// Rescan scheduling does not strand: a pure member (non-empty parent) is never a
+// rescan-tier candidate, and a standalone row that is also a member is still
+// refreshed once per traits version, which moves about daily.
 //
 // The CASE guards are NOT cosmetic — do not "simplify" them back to a bare
 // assignment. Measured 2026-09-05, this one statement was 73.7% of ALL WAL on
@@ -3661,7 +3681,9 @@ const memberConflictUpdatePG = `ON CONFLICT (sha256) DO UPDATE SET
 		ELSE samples.traits_version
 	END,
 	updated_at = now()
-WHERE EXCLUDED.analyzed_at > samples.analyzed_at OR samples.analyzed_at IS NULL`
+WHERE samples.analyzed_at IS NULL
+   OR (EXCLUDED.analyzed_at > samples.analyzed_at
+       AND (samples.traits_version = '' OR samples.traits_version <> EXCLUDED.traits_version))`
 
 // insertMembersFromStagingPG is insertBatchStagingInsert with the member
 // conflict clause: insert new members, freshness-refresh stale ones, identity
@@ -3681,6 +3703,10 @@ WHERE EXCLUDED.analyzed_at > samples.analyzed_at OR samples.analyzed_at IS NULL`
 // that shares one queued behind the others. Measured 2026-08-23: worker-lane
 // stores averaged 175-366 s and held 93% of all ingestion-slot time, with
 // ~22 of 28 member upserts blocked on each other at any moment.
+//
+// The same-traits-version skip matters twice over here: a popular dependency's
+// row is already at the current version for nearly every archive that contains
+// it, so the join now declines it and the lock is never taken either.
 //
 // The predicate mirrors memberConflictUpdatePG's WHERE exactly, so a row is
 // filtered out here only when the conflict clause would have declined to write
@@ -3705,7 +3731,8 @@ FROM _staging st
 LEFT JOIN samples s ON s.sha256 = st.sha256
 WHERE s.sha256 IS NULL
    OR s.analyzed_at IS NULL
-   OR st.analyzed_at > s.analyzed_at
+   OR (st.analyzed_at > s.analyzed_at
+       AND (s.traits_version = '' OR s.traits_version <> st.traits_version))
 ORDER BY st.sha256
 ` + memberConflictUpdatePG
 

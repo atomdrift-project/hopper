@@ -1,7 +1,9 @@
 package hopper
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -47,11 +49,115 @@ func TestMemberUpsertPreservesUnchangedToastPointers(t *testing.T) {
 				"so an unchanged value is not rewritten", col, col)
 		}
 	}
-	// The timestamp refresh is the point of the statement and must stay
-	// unconditional — skipping it would strand rescan scheduling on a stale
-	// analyzed_at, which is a correctness change, not an optimization.
+	// Whenever the row IS written, the timestamp refresh is unconditional. What
+	// decides whether it is written at all is the traits version (see
+	// TestMemberUpsertSkipsSameTraitsVersion), never whether the JSON changed —
+	// a content-gated analyzed_at would strand rescan scheduling.
 	if !strings.Contains(memberConflictUpdatePG, "analyzed_at = EXCLUDED.analyzed_at") {
 		t.Error("memberConflictUpdatePG must still refresh analyzed_at unconditionally")
+	}
+}
+
+// The same-traits-version skip lives in TWO predicates that must agree: the
+// pre-filter join (which is what avoids taking the row lock) and the ON
+// CONFLICT WHERE (the authority, since the join reads an MVCC snapshot). If
+// only the conflict clause carried it, every popular member would still be
+// locked for the whole batch; if only the join did, a concurrent writer could
+// slip a same-version rewrite past it.
+func TestMemberUpsertPredicatesMirrorTraitsGuard(t *testing.T) {
+	for name, want := range map[string]string{
+		"insertMembersFromStagingPG pre-filter": "s.traits_version = '' OR s.traits_version <> st.traits_version",
+		"memberConflictUpdatePG WHERE":          "samples.traits_version = '' OR samples.traits_version <> EXCLUDED.traits_version",
+	} {
+		if !strings.Contains(insertMembersFromStagingPG, want) {
+			t.Errorf("%s must skip a refresh at the stored traits version (want %q)", name, want)
+		}
+	}
+}
+
+// TestMemberUpsertSkipsSameTraitsVersion pins [StoreStats.Redundant] onto
+// archive members. A popular file is a member of thousands of archives, and
+// each one used to rewrite its row — heap, ~70 indexes and a ~5 KB TOASTed
+// cleave_result — only because the envelope's occurrence context (path, depth,
+// pid) differed. Measured 2026-09-25 that was 74% of all master WAL. The
+// occurrence is still recorded, in sample_locations; the verdict is rewritten
+// only when the analyzer version moves.
+func TestMemberUpsertSkipsSameTraitsVersion(t *testing.T) {
+	for _, b := range testBackends {
+		t.Run(b.name, func(t *testing.T) {
+			ctx := t.Context()
+			db := b.open(t)
+
+			member := strings.Repeat("7", 64)
+			store := func(archiveChar, dir, tv string) StoreStats {
+				t.Helper()
+				archive := strings.Repeat(archiveChar, 64)
+				mustInsert(t, ctx, db, &Sample{
+					SHA256: archive, Source: "test", Label: "good", LabelSource: "test",
+					Path: "good/" + dir + ".tgz",
+				})
+				env := fmt.Appendf(nil, `{"v":8,"files":[
+					{"id":0,"sha":%q,"type":"tar","depth":0,"path":"%s.tgz"},
+					{"id":1,"pid":0,"sha":%q,"type":"javascript","depth":1,"path":"%s.tgz!!isPromise.ts"}
+				]}`, archive, dir, member, dir)
+				stats, err := db.StoreResult(ctx, archive, env, nil, nil, nil, tv, ResultAttribution{})
+				if err != nil {
+					t.Fatalf("StoreResult(%s @ %s): %v", dir, tv, err)
+				}
+				return stats
+			}
+			// Uncached: StoreResult invalidates only the archive's own lookup
+			// key, and this asserts what the member ROW holds.
+			row := func() *Sample {
+				t.Helper()
+				s, err := db.sampleBySHA256Uncached(ctx, member)
+				if err != nil {
+					t.Fatalf("member row: %v", err)
+				}
+				return s
+			}
+
+			store("a", "rxjs-7.8.0", "tv1")
+			first := row()
+			if first.TraitsVersion != "tv1" || first.AnalyzedAt == nil {
+				t.Fatalf("first store: traits_version=%q analyzed_at=%v", first.TraitsVersion, first.AnalyzedAt)
+			}
+
+			// Same file, another archive, same analyzer: nothing learned.
+			if st := store("b", "rxjs-7.8.1", "tv1"); st.MembersStored != 0 {
+				t.Errorf("same-version member refresh wrote %d rows, want 0", st.MembersStored)
+			}
+			same := row()
+			if !bytes.Equal(same.CleaveResult, first.CleaveResult) {
+				t.Errorf("same-version refresh rewrote cleave_result:\n was %s\n now %s", first.CleaveResult, same.CleaveResult)
+			}
+			if !same.AnalyzedAt.Equal(*first.AnalyzedAt) {
+				t.Errorf("same-version refresh moved analyzed_at %v -> %v", first.AnalyzedAt, same.AnalyzedAt)
+			}
+			// ...but the occurrence itself is still recorded.
+			locs, err := db.LocationsForSHA(ctx, member)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(locs) != 2 {
+				t.Errorf("member locations = %d, want 2 (one per containing archive): %+v", len(locs), locs)
+			}
+
+			// Analyzer moved: a real refresh.
+			if st := store("c", "rxjs-7.8.2", "tv2"); st.MembersStored != 1 {
+				t.Errorf("new-version member refresh wrote %d rows, want 1", st.MembersStored)
+			}
+			moved := row()
+			if moved.TraitsVersion != "tv2" {
+				t.Errorf("traits_version = %q, want tv2", moved.TraitsVersion)
+			}
+			if !bytes.Contains(moved.CleaveResult, []byte("rxjs-7.8.2")) {
+				t.Errorf("new-version refresh did not store the new analysis: %s", moved.CleaveResult)
+			}
+			if !moved.AnalyzedAt.After(*first.AnalyzedAt) {
+				t.Errorf("new-version refresh left analyzed_at at %v", moved.AnalyzedAt)
+			}
+		})
 	}
 }
 

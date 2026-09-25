@@ -2658,6 +2658,9 @@ func (db *DB) storeResultSQLite(
 	parent.LitmusResult = litmusML
 	parent.CanonicalSHA256 = parsed.CanonicalSHA
 	parent.AnalyzedAt = &now
+	// Mirrors storeResultPG: members inherit the version THIS analysis ran at,
+	// which the member upsert's same-version skip compares against.
+	parent.TraitsVersion = traitsVersion
 	if firstAnalyzed.Valid {
 		if t, perr := time.Parse(time.RFC3339Nano, firstAnalyzed.String); perr == nil {
 			parent.FirstAnalyzedAt = &t
@@ -2678,15 +2681,21 @@ func (db *DB) storeResultSQLite(
 				size_bytes, label, label_source, path, status, canonical_sha256,
 				parent, skip, elements, max_crit, suspicious_count, mtime, marker_mtime,
 				cleave_result, litmus_result, analyzed_at, first_analyzed_at,
-				url, domain, package, version, provenance, fetched_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				url, domain, package, version, provenance, fetched_at, traits_version)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (sha256) DO UPDATE SET
 				cleave_result = excluded.cleave_result,
 				litmus_result = COALESCE(excluded.litmus_result, samples.litmus_result),
 				analyzed_at = excluded.analyzed_at,
 				first_analyzed_at = COALESCE(samples.first_analyzed_at, excluded.first_analyzed_at),
+				traits_version = CASE
+					WHEN excluded.traits_version <> '' THEN excluded.traits_version
+					ELSE samples.traits_version
+				END,
 				updated_at = ?
-			WHERE excluded.analyzed_at > samples.analyzed_at OR samples.analyzed_at IS NULL`)
+			WHERE samples.analyzed_at IS NULL
+			   OR (excluded.analyzed_at > samples.analyzed_at
+			       AND (samples.traits_version = '' OR samples.traits_version <> excluded.traits_version))`)
 		if err != nil {
 			return StoreStats{}, fmt.Errorf("hopper: prepare member upsert: %w", err)
 		}
@@ -2714,7 +2723,7 @@ func (db *DB) storeResultSQLite(
 				m.Parent, m.Skip, m.Elements, m.MaxCrit, m.SuspiciousCount, m.Mtime, m.MarkerMtime,
 				jsonTextOrNil(m.CleaveResult), jsonTextOrNil(m.LitmusResult), m.AnalyzedAt, firstAt,
 				m.URL, m.Domain, m.Package, m.Version, jsonTextOrNil(m.Provenance), m.FetchedAt,
-				nowStr)
+				m.TraitsVersion, nowStr)
 			if err != nil {
 				return StoreStats{}, fmt.Errorf("hopper: upsert member %s: %w", m.SHA256, err)
 			}

@@ -85,7 +85,7 @@ fi
 # Two consumers now, not one. prism's lookups came first; cyclotron's triage
 # queues joined when its selection moved off the master. They want different
 # indexes — prism probes single identities (purl_lookup, filename_trgm) while
-# cyclotron walks ranked populations (bad_route_fresh, stranded_pending) — so
+# cyclotron walks ranked populations (stranded_pending, the *_newest queues) — so
 # "prism does not scan it" is no longer sufficient reason to drop one.
 REPLICA_KEEP_INDEXES='
 idx_claims_name
@@ -93,10 +93,7 @@ idx_claims_signer
 idx_label_events_sha
 idx_reports_sha256_type_created
 idx_samples_acquit_newest
-idx_samples_bad_lvl
 idx_samples_bad_miss_newest
-idx_samples_bad_miss_stale
-idx_samples_bad_route_fresh
 idx_samples_class_top_created
 idx_samples_clean_release
 idx_samples_discord_newest
@@ -106,19 +103,15 @@ idx_samples_domain
 idx_samples_eco_class_created
 idx_samples_eco_top_created
 idx_samples_ecosystem
-idx_samples_feed
-idx_samples_feed_top_created_done
 idx_samples_filename_trgm
 idx_samples_formula_top
 idx_samples_fp_trait_newest
-idx_samples_good_route_score
 idx_samples_labeled_route
 idx_samples_package_version
 idx_samples_popular_ranked
 idx_samples_purl_base
 idx_samples_purl_lookup
 idx_samples_second_newest
-idx_samples_sighted_purl
 idx_samples_stranded_pending
 idx_samples_top_ready_created
 idx_samples_unconvicted_hostile_repair
@@ -190,8 +183,41 @@ idx_slh_sha256_retired
 #
 # Without it the planner falls back to a seq scan of the 559 GB heap, so if a
 # members view is ever pointed at galadriel this must be rebuilt first.
+#
+# Moved out of REPLICA_KEEP_INDEXES 2026-09-25 (~7.4 GB), while the replica sat
+# ~10 h behind with a single apply worker as the ceiling. Every one had zero
+# scans on galadriel across a 5-day stats window (since 2026-09-20), but the
+# caller trace is the reason, not the counter:
+#
+#   PARKED — cyclotron's triage queues. Its selection still runs against the
+#   master: the deployed cyclotron (nazgul) passes no --hopper-read-api, and
+#   galadriel's serve-replica API answered no /api/triage route in that window.
+#   Same reasoning and same restore rule as idx_samples_unconvicted_route_fresh
+#   above — move back to REPLICA_KEEP_INDEXES and `make replica` BEFORE
+#   repointing cyclotron's reads here:
+#     idx_samples_good_route_score  (2013 MB, TriageLowest's good-only walk)
+#     idx_samples_sighted_purl      (1242 MB, triageSightedWhere)
+#     idx_samples_bad_route_fresh   ( 262 MB, TriageLowest)
+#     idx_samples_bad_lvl           ( 235 MB, litmus-level bad queue)
+#     idx_samples_bad_miss_stale    ( 134 MB, bad-miss stale selector)
+#
+#   RETIRED — no replica read path can satisfy them:
+#     idx_samples_feed (2633 MB) — its consumer is feedSourcesPG, and
+#       DB.FeedSources has no caller in hopper, prism, promoter, forager,
+#       cyclotron or collimator; prism never sets FeedQuery.Feeds either.
+#     idx_samples_feed_top_created_done (868 MB) — (source, label, created_at)
+#       serves only a source/label-filtered feed or FeedEcosystems/FeedDomains
+#       call. prism never sets FeedQuery.Source or .Label and calls both
+#       dropdowns unfiltered, which take the loose-scan path.
 REPLICA_DROP_INDEXES='
 idx_samples_unconvicted_route_fresh
+idx_samples_good_route_score
+idx_samples_sighted_purl
+idx_samples_bad_route_fresh
+idx_samples_bad_lvl
+idx_samples_bad_miss_stale
+idx_samples_feed
+idx_samples_feed_top_created_done
 idx_samples_good_repair_newest
 idx_samples_unknown_newest
 idx_samples_candidate_keyset
