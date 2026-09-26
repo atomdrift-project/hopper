@@ -9,9 +9,12 @@ package main
 // instance answers them from the replica's idle disk while the primary keeps its
 // I/O for ingestion.
 //
-// Selection CLAIMS, which is why a GET has side effects here. That follows
-// /api/next, which has leased work on a GET since the beginning: the resource
-// being fetched is "work assigned to me", and fetching it is what assigns it.
+// Selection claims nothing: a GET here is a read, and repeated reads return
+// the same head. Deciding who works which sample belongs to the consumer, the
+// only party that knows when a batch starts, ends or dies. A lease here could
+// only guess at that, and did: every row a select returned was held for two
+// hours whether or not the caller batched it, so one worker reading 64 rows to
+// batch 3 locked its siblings out of a 25-row queue for the whole lease.
 
 import (
 	"context"
@@ -20,29 +23,9 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/atomdrift-project/hopper"
 )
-
-// Claim lifetime. A claim exists to stop two workers picking the same sample out
-// of the same query window, and it needs to outlive one batch: a batch is an LLM
-// pass, which runs 15-45 minutes, so this is roughly triple the worst case.
-//
-// Nothing releases a claim early and nothing needs to. When a worker finishes,
-// its ruling lands and the sample drops out of the selector's population on its
-// own — the stale claim is then holding down a row the query no longer returns,
-// which costs nothing but the map entry it is swept out of.
-const triageClaimTTL = 2 * time.Hour
-
-// triageOverfetch is how many extra candidates a select pulls beyond the limit
-// asked for, so claimed rows can be filtered out and the caller still get a full
-// batch. It mirrors the consumer-side overfetch that used to do this filtering:
-// with several workers reading the same window, the last one to arrive must
-// still find `limit` unclaimed rows below everyone else's claims. A caller that
-// comes up short simply gets fewer, so the bound degrades rather than breaks.
-const triageOverfetch = 64
 
 // triageMaxLimit caps a single select. The queues exist to feed batches of a
 // few samples each; a caller asking for thousands is either misconfigured or
@@ -52,76 +35,6 @@ const triageMaxLimit = 500
 
 // triageDefaultLimit is what a select returns when the caller names no limit.
 const triageDefaultLimit = 16
-
-// triageClaims is the in-process claim set shared by every client of this API
-// instance: sha256 → when the claim lapses.
-//
-// This is the whole of the cross-host coordination, and it is deliberately not
-// durable. A claim is only ever an optimization — losing one costs a duplicated
-// analysis, and analyses are idempotent (the ruling that lands is the same
-// either way) — so paying for durability would buy nothing a restart cannot
-// already tolerate. It also has to stay off the database: this API runs against
-// a read-only replica session, so a claim that wrote anywhere would fail closed.
-//
-// SCOPE WARNING: the claim set is per-process. Two API instances in front of the
-// same replica are two independent claim sets, and clients split across them
-// will duplicate work — which degrades to the pre-API behaviour rather than
-// breaking, but silently. Point a fleet at ONE instance, or accept the overlap
-// deliberately.
-type triageClaims struct {
-	until map[string]time.Time
-	ttl   time.Duration
-	mu    sync.Mutex
-}
-
-func newTriageClaims(ttl time.Duration) *triageClaims {
-	return &triageClaims{until: make(map[string]time.Time), ttl: ttl}
-}
-
-// claim takes the first n unclaimed samples from candidates, marking each as it
-// goes, and reports how many it passed over because someone else holds them.
-//
-// Marking during selection rather than after processing is the point: a sample
-// is spoken for from the moment it is handed out, so two callers reading the
-// same window a millisecond apart cannot both take it.
-//
-// The expiry sweep runs here, once per call, and is what bounds the map. A
-// sample that gets fixed drops out of its triage query and is never handed out
-// (nor looked up) again, so pruning only on lookup would leave one permanent
-// entry per distinct sample this process ever served.
-func (c *triageClaims) claim(candidates []*hopper.Sample, n int) (taken []*hopper.Sample, withheld int) {
-	now := time.Now()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for sha, t := range c.until {
-		if !now.Before(t) {
-			delete(c.until, sha)
-		}
-	}
-
-	lapses := now.Add(c.ttl)
-	for _, s := range candidates {
-		if len(taken) == n {
-			break
-		}
-		if t, held := c.until[s.SHA256]; held && now.Before(t) {
-			withheld++
-			continue
-		}
-		c.until[s.SHA256] = lapses
-		taken = append(taken, s)
-	}
-	return taken, withheld
-}
-
-// held reports how many claims are currently outstanding, for the log line that
-// explains a short batch.
-func (c *triageClaims) held() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.until)
-}
 
 // triageQueueInfo describes one registered queue.
 type triageQueueInfo struct {
@@ -167,9 +80,8 @@ func (s *apiServer) triageQueue(w http.ResponseWriter, r *http.Request) (hopper.
 	return q, true
 }
 
-// handleTriageSelect returns candidates from one queue.
-// GET /api/triage/{queue}?limit=N. By default the returned work is claimed;
-// preview=1 is a read-only snapshot for operator tooling and claims nothing.
+// handleTriageSelect returns the head of one queue, up to limit rows.
+// GET /api/triage/{queue}?limit=N.
 //
 // The samples are hopper.Sample values marshalled as-is. That makes the wire
 // format the struct's Go field names, which is safe precisely because this is an
@@ -191,38 +103,21 @@ func (s *apiServer) handleTriageSelect(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
 
-	candidates, err := q.Select(ctx, s.db, limit+triageOverfetch)
+	samples, err := q.Select(ctx, s.db, limit)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "triage: select failed",
 			"queue", q.Name, "limit", limit, "error", err, "remote", r.RemoteAddr)
 		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
 		return
 	}
-
-	preview := r.URL.Query().Get("preview") == "1"
-	var taken []*hopper.Sample
-	withheld := 0
-	if preview {
-		taken = candidates[:min(limit, len(candidates))]
-	} else {
-		taken, withheld = s.triageClaims.claim(candidates, limit)
-	}
 	slog.InfoContext(r.Context(), "triage select",
-		"queue", q.Name, "limit", limit, "candidates", len(candidates),
-		"returned", len(taken), "withheld", withheld, "preview", preview,
-		"claims_held", s.triageClaims.held(),
-		"remote", r.RemoteAddr)
+		"queue", q.Name, "limit", limit, "returned", len(samples), "remote", r.RemoteAddr)
 
 	writeTriageJSON(w, map[string]any{
 		"queue": q.Name,
 		// Never null: a client ranging over the result should not have to
 		// distinguish "no work" from "no field".
-		"samples": append(make([]*hopper.Sample, 0, len(taken)), taken...),
-		// withheld is how many candidates another client already holds. It is
-		// the difference between "this queue is drained" and "this queue is
-		// busy", which is otherwise indistinguishable from an empty response.
-		"withheld": withheld,
-		"preview":  preview,
+		"samples": append(make([]*hopper.Sample, 0, len(samples)), samples...),
 	})
 }
 

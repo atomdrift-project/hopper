@@ -51,7 +51,6 @@ type apiServer struct {
 	resultStores  singleflight.Group
 	traitsVersion atomic.Pointer[string]
 	tracker       *workerTracker
-	triageClaims  *triageClaims
 	// relay, when non-nil on a readOnly instance, proxies client-facing
 	// mutations to the primary hopper instead of refusing them, and backs the
 	// ?fresh=1 read-after-write escape hatch. Worker-loop routes are never
@@ -855,14 +854,6 @@ func (wt *workerTracker) all() []namedWorkerStats {
 
 // registerAPI mounts the work API routes on the given mux.
 func (s *apiServer) registerAPI(mux *http.ServeMux) {
-	// Every construction path gets a claim set, including the tests that build
-	// an apiServer literal: a nil one would panic on the first select, and the
-	// claims are process state rather than configuration, so there is nothing
-	// for a caller to decide.
-	if s.triageClaims == nil {
-		s.triageClaims = newTriageClaims(triageClaimTTL)
-	}
-
 	// Read routes: safe against any backend, including a logical-replication
 	// subscriber (serve-replica). File-serving routes need a data root; a
 	// replica API typically has no corpus on disk, and registering
@@ -895,8 +886,7 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	// to absorb, and honouring ?fresh=1 on one would put exactly that scan back
 	// on the publisher at a client's say-so. Replica lag costs a selection
 	// nothing anyway: a sample whose drain has not yet applied is handed out
-	// again, which is what the claim set and the consumer's cooldown already
-	// absorb.
+	// again, which the consumer's cooldown already absorbs.
 	mux.HandleFunc("GET /api/triage/queues", s.handleTriageQueues)
 	mux.HandleFunc("GET /api/triage/{queue}", s.handleTriageSelect)
 	mux.HandleFunc("GET /api/triage/{queue}/depth", s.handleTriageDepth)

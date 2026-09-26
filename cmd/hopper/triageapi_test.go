@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
-	"time"
 
 	"github.com/atomdrift-project/hopper"
 )
@@ -48,22 +47,21 @@ func newTriageAPI(t *testing.T, ctx context.Context) *apiServer {
 	if err := db.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	return &apiServer{db: db, tracker: newWorkerTracker(), triageClaims: newTriageClaims(triageClaimTTL)}
+	return &apiServer{db: db, tracker: newWorkerTracker()}
 }
 
 // selectFrom issues one GET /api/triage/{queue} and decodes the envelope.
-func selectFrom(t *testing.T, api *apiServer, queue, query string) (shas []string, withheld int, code int) {
+func selectFrom(t *testing.T, api *apiServer, queue, query string) (shas []string, code int) {
 	t.Helper()
 	r := httptest.NewRequest(http.MethodGet, "/api/triage/"+queue+query, http.NoBody)
 	r.SetPathValue("queue", queue)
 	rec := httptest.NewRecorder()
 	api.handleTriageSelect(rec, r)
 	if rec.Code != http.StatusOK {
-		return nil, 0, rec.Code
+		return nil, rec.Code
 	}
 	var body struct {
-		Samples  []*hopper.Sample `json:"samples"`
-		Withheld int              `json:"withheld"`
+		Samples []*hopper.Sample `json:"samples"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode select body: %v (%s)", err, rec.Body.Bytes())
@@ -71,147 +69,29 @@ func selectFrom(t *testing.T, api *apiServer, queue, query string) (shas []strin
 	for _, s := range body.Samples {
 		shas = append(shas, s.SHA256)
 	}
-	return shas, body.Withheld, rec.Code
+	return shas, rec.Code
 }
 
-// TestTriageSelectClaimsAcrossRequests is the whole reason the claim set exists:
-// two clients reading the same queue window must not be handed the same sample.
-// Before selection moved behind this API each scan host had its own in-process
-// claim, which coordinated that host's workers and nothing else.
-func TestTriageSelectClaimsAcrossRequests(t *testing.T) {
+// TestTriageSelectIsARead pins the contract: a select claims nothing, so
+// repeated selects return the same head and limit alone bounds the result.
+// Who works which sample is the consumer's to decide; the lease this replaced
+// held every returned row for two hours and stranded whole queues.
+func TestTriageSelectIsARead(t *testing.T) {
 	ctx := context.Background()
 	api := newTriageAPI(t, ctx)
 	seedUnconvictedQueue(t, ctx, api.db, 6)
 
-	first, withheld, code := selectFrom(t, api, "unconvicted-suspicious", "?limit=3")
-	if code != http.StatusOK {
-		t.Fatalf("first select: status = %d", code)
+	first, code := selectFrom(t, api, "unconvicted-suspicious", "?limit=3")
+	if code != http.StatusOK || len(first) != 3 {
+		t.Fatalf("first select = %v, status %d; want 3 samples", first, code)
 	}
-	if len(first) != 3 {
-		t.Fatalf("first select returned %d samples, want 3", len(first))
+	second, _ := selectFrom(t, api, "unconvicted-suspicious", "?limit=3")
+	if !slices.Equal(first, second) {
+		t.Errorf("second select = %v, want the same head %v", second, first)
 	}
-	if withheld != 0 {
-		t.Errorf("first select withheld = %d, want 0 (nothing claimed yet)", withheld)
-	}
-
-	second, withheld, code := selectFrom(t, api, "unconvicted-suspicious", "?limit=3")
-	if code != http.StatusOK {
-		t.Fatalf("second select: status = %d", code)
-	}
-	if len(second) != 3 {
-		t.Fatalf("second select returned %d samples, want 3", len(second))
-	}
-	if withheld != 3 {
-		t.Errorf("second select withheld = %d, want 3 (the first select's claims)", withheld)
-	}
-
-	held := map[string]bool{}
-	for _, sha := range first {
-		held[sha] = true
-	}
-	for _, sha := range second {
-		if held[sha] {
-			t.Errorf("sample %s was handed to two callers — the claim did not hold", sha)
-		}
-	}
-
-	// The population is exhausted, so a third caller gets nothing rather than a
-	// repeat. withheld is what distinguishes that from a drained queue.
-	third, withheld, _ := selectFrom(t, api, "unconvicted-suspicious", "?limit=3")
-	if len(third) != 0 {
-		t.Errorf("third select returned %d samples, want 0 (all six claimed)", len(third))
-	}
-	if withheld != 6 {
-		t.Errorf("third select withheld = %d, want 6", withheld)
-	}
-}
-
-// Preview is observational: repeated previews return the same head and do not
-// withhold it from the next real worker claim.
-func TestTriageSelectPreviewDoesNotClaim(t *testing.T) {
-	ctx := context.Background()
-	api := newTriageAPI(t, ctx)
-	seedUnconvictedQueue(t, ctx, api.db, 3)
-
-	first, withheld, code := selectFrom(t, api, "unconvicted-suspicious", "?limit=2&preview=1")
-	if code != http.StatusOK || len(first) != 2 || withheld != 0 {
-		t.Fatalf("first preview = %v withheld=%d status=%d", first, withheld, code)
-	}
-	second, withheld, _ := selectFrom(t, api, "unconvicted-suspicious", "?limit=2&preview=1")
-	if !slices.Equal(first, second) || withheld != 0 {
-		t.Fatalf("second preview = %v withheld=%d, want same %v and zero", second, withheld, first)
-	}
-	claimed, withheld, _ := selectFrom(t, api, "unconvicted-suspicious", "?limit=2")
-	if !slices.Equal(first, claimed) || withheld != 0 {
-		t.Fatalf("claim after previews = %v withheld=%d, want %v and zero", claimed, withheld, first)
-	}
-}
-
-// TestTriageClaimsExpire proves a claim is a lease, not a tombstone: a worker
-// that dies mid-batch must not strand its samples forever.
-func TestTriageClaimsExpire(t *testing.T) {
-	ctx := context.Background()
-	api := newTriageAPI(t, ctx)
-	seedUnconvictedQueue(t, ctx, api.db, 2)
-	api.triageClaims = newTriageClaims(time.Nanosecond)
-
-	first, _, _ := selectFrom(t, api, "unconvicted-suspicious", "?limit=2")
-	if len(first) != 2 {
-		t.Fatalf("first select returned %d, want 2", len(first))
-	}
-	// The TTL is a nanosecond, so both claims have already lapsed.
-	second, withheld, _ := selectFrom(t, api, "unconvicted-suspicious", "?limit=2")
-	if len(second) != 2 {
-		t.Errorf("second select returned %d, want 2 (claims should have lapsed)", len(second))
-	}
-	if withheld != 0 {
-		t.Errorf("withheld = %d, want 0", withheld)
-	}
-}
-
-// TestTriageClaimsSweepBoundsMap guards the memory bound. A sample that gets
-// fixed leaves its queue and is never selected again, so pruning only on lookup
-// would leave one permanent entry per sample the process ever served.
-func TestTriageClaimsSweepBoundsMap(t *testing.T) {
-	c := newTriageClaims(time.Nanosecond)
-	for i := range 100 {
-		s := &hopper.Sample{SHA256: fmt.Sprintf("%064x", i)}
-		if taken, _ := c.claim([]*hopper.Sample{s}, 1); len(taken) != 1 {
-			t.Fatalf("claim %d: got %d samples, want 1", i, len(taken))
-		}
-	}
-	// Every claim lapsed as it was made, so the sweep on the final call should
-	// have left only that call's own entry behind.
-	if got := c.held(); got > 1 {
-		t.Errorf("held = %d after 100 expired claims, want <= 1 — the sweep is not bounding the map", got)
-	}
-}
-
-// TestTriageClaimsWithholdsOnlyLiveClaims covers the claim/withheld accounting
-// directly, without a database in the way.
-func TestTriageClaimsWithholdsOnlyLiveClaims(t *testing.T) {
-	c := newTriageClaims(time.Hour)
-	candidates := make([]*hopper.Sample, 0, 4)
-	for i := range 4 {
-		candidates = append(candidates, &hopper.Sample{SHA256: fmt.Sprintf("%064x", i)})
-	}
-
-	taken, withheld := c.claim(candidates, 2)
-	if len(taken) != 2 || withheld != 0 {
-		t.Fatalf("first claim: taken = %d withheld = %d, want 2 and 0", len(taken), withheld)
-	}
-	// Asking again walks past the two live claims and takes the rest.
-	taken, withheld = c.claim(candidates, 2)
-	if len(taken) != 2 {
-		t.Errorf("second claim: taken = %d, want 2", len(taken))
-	}
-	if withheld != 2 {
-		t.Errorf("second claim: withheld = %d, want 2", withheld)
-	}
-	// n bounds what is taken even when more is unclaimed.
-	c2 := newTriageClaims(time.Hour)
-	if taken, _ := c2.claim(candidates, 1); len(taken) != 1 {
-		t.Errorf("bounded claim: taken = %d, want 1", len(taken))
+	all, _ := selectFrom(t, api, "unconvicted-suspicious", "?limit=64")
+	if len(all) != 6 {
+		t.Errorf("wide select returned %d samples, want all 6", len(all))
 	}
 }
 
@@ -262,7 +142,7 @@ func TestTriageSelectUnknownQueue(t *testing.T) {
 	ctx := context.Background()
 	api := newTriageAPI(t, ctx)
 
-	_, _, code := selectFrom(t, api, "nosuchqueue", "")
+	_, code := selectFrom(t, api, "nosuchqueue", "")
 	if code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", code)
 	}
@@ -292,17 +172,16 @@ func TestTriageSelectLimit(t *testing.T) {
 	seedUnconvictedQueue(t, ctx, api.db, 3)
 
 	for _, bad := range []string{"?limit=0", "?limit=-1", "?limit=abc"} {
-		if _, _, code := selectFrom(t, api, "unconvicted-suspicious", bad); code != http.StatusBadRequest {
+		if _, code := selectFrom(t, api, "unconvicted-suspicious", bad); code != http.StatusBadRequest {
 			t.Errorf("limit %q: status = %d, want 400", bad, code)
 		}
 	}
 	// Absent limit uses the default rather than erroring.
-	if _, _, code := selectFrom(t, api, "unconvicted-suspicious", ""); code != http.StatusOK {
+	if _, code := selectFrom(t, api, "unconvicted-suspicious", ""); code != http.StatusOK {
 		t.Errorf("no limit: status = %d, want 200", code)
 	}
 	// An oversized limit is clamped, not refused: the caller still gets work.
-	api.triageClaims = newTriageClaims(triageClaimTTL)
-	got, _, code := selectFrom(t, api, "unconvicted-suspicious", "?limit=100000")
+	got, code := selectFrom(t, api, "unconvicted-suspicious", "?limit=100000")
 	if code != http.StatusOK {
 		t.Fatalf("huge limit: status = %d, want 200", code)
 	}
@@ -378,11 +257,5 @@ func TestTriageRoutesAreReadOnlySafe(t *testing.T) {
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/triage", http.NoBody))
 	if rec.Code != http.StatusForbidden {
 		t.Errorf("POST /api/triage on a replica: status = %d, want 403", rec.Code)
-	}
-
-	// registerAPI must supply a claim set even when the caller did not, or the
-	// first select panics.
-	if api.triageClaims == nil {
-		t.Error("registerAPI left triageClaims nil")
 	}
 }
