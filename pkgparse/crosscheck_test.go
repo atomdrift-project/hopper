@@ -141,6 +141,16 @@ func TestFletchReadsGeneratedPURLs(t *testing.T) {
 			"clawhub", "owner/cool-skill", "1.0.2", "clawhub.ai", true,
 		},
 		{
+			// Both registries hand out the archive URL only from a version
+			// record, so there is none to resolve offline.
+			"comfyui node", "comfyui", "comfy.org", "SugarCubes", "0.15.2", "",
+			"comfyui", "SugarCubes", "0.15.2", "api.comfy.org", false,
+		},
+		{
+			"dify plugin", "dify", "dify.ai", "fr3on/eval-loop", "0.1.1", "",
+			"dify", "fr3on/eval-loop", "0.1.1", "marketplace.dify.ai", false,
+		},
+		{
 			"terraform provider", "terraform", "terraform.io", "Kreuzwerker/Docker", "3.0.2", "",
 			// The zip's URL and digest come from the registry's download
 			// endpoint, so there is none to resolve offline (as with pypi).

@@ -59,6 +59,16 @@ func TestSourcePURLIdentity(t *testing.T) {
 		{"skills.sh three segments", "skills_sh", "skills.sh", "Owner/Repo/skill-name", "pkg:github/owner/repo", true},
 		{"skills.sh two segments", "skills_sh", "skills.sh", "owner/repo", "pkg:github/owner/repo", true},
 		{"skills.sh bare name", "skills_sh", "skills.sh", "norepo", "", false},
+		// An agent plugin is the GitHub repo its marketplace pins.
+		{"agent plugin repo", "agent_plugins", "github.com", "Owner/Plugins", "pkg:github/owner/plugins", true},
+		{"agent plugin bare name", "agent_plugins", "github.com", "norepo", "", false},
+
+		// Plugin registries of ML apps: a ComfyUI node id is a single global
+		// segment; a Dify plugin is org/name.
+		{"comfyui node", "comfyui", "comfy.org", "comfyui-loopstrip", "pkg:comfyui/comfyui-loopstrip", true},
+		{"comfyui by domain", "", "comfy.org", "SugarCubes", "pkg:comfyui/SugarCubes", true},
+		{"dify plugin", "dify", "dify.ai", "Fr3on/eval-loop", "pkg:dify/fr3on/eval-loop", true},
+		{"dify bare name", "dify", "dify.ai", "eval-loop", "", false},
 
 		// Terraform providers: exactly namespace/type, lowercased.
 		{"terraform eco", "terraform", "terraform.io", "Kreuzwerker/Docker", "pkg:terraform/kreuzwerker/docker", true},

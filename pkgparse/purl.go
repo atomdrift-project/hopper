@@ -121,13 +121,14 @@ func ecosystemType(eco string) (string, bool) {
 		"hex", "cran", "cpan", "pub", "clojars",
 		"arch", "aur", "debian", "ubuntu", "fedora", "opensuse", "rpmfusion",
 		"alpine", "wolfi", "netbsd", "freebsd", "openbsd", "clawhub", "skills_sh",
-		"terraform":
+		"terraform", "comfyui", "dify":
 		return eco, true
 	// GitHub-hosted code under every label forager and the walker use for it
-	// (release downloads, actions, repo archives, and the samples.ecosystem
-	// value they all normalize to). The identity is the repository — the
-	// pkg:github type fletch fetches as a source archive.
-	case "github", "github_repo", "github_actions", "github_release":
+	// (release downloads, actions, repo archives, agent plugins pinned to a
+	// commit, and the samples.ecosystem value they all normalize to). The
+	// identity is the repository — the pkg:github type fletch fetches as a
+	// source archive.
+	case "github", "github_repo", "github_actions", "github_release", "agent_plugins":
 		return "github", true
 	// Container images under both forager registry labels ("docker" for the
 	// Docker Hub goodfeed, "oci" for ghcr/quay/generic refs) → the ratified
@@ -211,6 +212,10 @@ func domainType(dom string) (string, bool) {
 		return "skills_sh", true
 	case "terraform.io":
 		return "terraform", true
+	case "comfy.org":
+		return "comfyui", true
+	case "dify.ai":
+		return "dify", true
 	default:
 		return "", false
 	}
@@ -306,6 +311,16 @@ func buildTyped(key, name, version, arch string) (string, bool) {
 			return renderPURL(key, asciiLower(owner), asciiLower(slug), version, ""), true
 		}
 		return renderPURL(key, "", asciiLower(name), version, ""), true
+
+	case "dify":
+		// A Dify plugin is org/name, both halves required: the marketplace
+		// resolves a version only under its owning org, which it accepts
+		// only in lowercase.
+		org, plugin, found := strings.Cut(name, "/")
+		if !found || org == "" || plugin == "" || strings.Contains(plugin, "/") {
+			return "", false
+		}
+		return renderPURL(key, asciiLower(org), plugin, version, ""), true
 
 	case "oci":
 		// The ratified pkg:oci type (purl-spec types/oci-definition.json): the

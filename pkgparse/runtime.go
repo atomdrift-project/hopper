@@ -58,11 +58,14 @@ var runtimeMap = map[string]string{
 	"edge":      "edge",
 	"mozilla":   "firefox",
 	"terraform": "terraform",
-	// ML model hubs.
+	// ML model hubs and the plugin registries of the apps built on them.
 	"huggingface": "huggingface",
-	// Agent skills.
-	"skills_sh": "agent",
-	"clawhub":   "openclaw",
+	"comfyui":     "comfyui",
+	"dify":        "dify",
+	// Agent skills and plugins.
+	"skills_sh":     "agent",
+	"agent_plugins": "agent",
+	"clawhub":       "openclaw",
 	// OS targets. Distros keep their own identity; *_source variants fold
 	// into their base distro.
 	"homebrew":       "macos",
