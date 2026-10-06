@@ -5105,23 +5105,40 @@ func (db *DB) updateLLMResultPG(ctx context.Context, sha256 string, result []byt
 }
 
 // queueSiblingRescansSQLPG is QueueSiblingRescans' statement; see there. $1 is
-// the convicted sha, $2 the bound. The literal non-empty test on sib.purl_base lets
-// the planner use idx_samples_purl_base (partial on it) for the sibling probe.
-// A convicted sample never analyzed stands in as analyzed now, so its siblings
-// are compared against the time of the conviction.
+// the convicted sha, $2 the bound. A convicted sample never analyzed stands in
+// as analyzed now, so its siblings are compared against the time of the
+// conviction.
+//
+// Both CTEs are MATERIALIZED to fix the join order: the convicted row by
+// primary-key probe, then its siblings through idx_samples_purl_base (the literal
+// non-empty test matches that partial index), and only then the newest-first
+// bound. Written as one join with ORDER BY created_at … LIMIT, the planner
+// walked idx_samples_top_created over every top-level sample and stopped at the
+// bound: the statistics put purl_base at ~1,700 distinct values (1.5M in fact,
+// 2026-10), so it expected thousands of siblings per package and an early stop.
+// A real package has a handful, and the 97% of samples with no purl_base have
+// none, so the walk ran to the end — minutes of random heap reads per
+// conviction, past every caller's deadline. Materialized, a purl-less
+// conviction costs the probe and the largest package (12k rows) ~75ms.
+// purl_base's n_distinct is now pinned on production (ALTER TABLE samples ALTER
+// COLUMN purl_base SET (n_distinct = -0.0074), 2026-10-06), which fixes the
+// estimate; the CTEs keep this statement correct if the statistics drift again.
 const queueSiblingRescansSQLPG = `
+	WITH c AS MATERIALIZED (
+	       SELECT sha256, purl_base, traits_version, COALESCE(analyzed_at, now()) AS analyzed_at
+	         FROM samples
+	        WHERE sha256 = $1 AND purl_base <> ''),
+	     sib AS MATERIALIZED (
+	       SELECT s.id, s.created_at
+	         FROM c
+	         JOIN samples s ON s.purl_base = c.purl_base
+	        WHERE s.purl_base <> '' AND s.sha256 <> c.sha256
+	          AND s.label = 'unknown' AND s.parent = '' AND s.skip = ''
+	          AND s.rescan_priority = 0 AND s.cleave_result IS NOT NULL
+	          AND s.analyzed_at <= c.analyzed_at
+	          AND (s.traits_version = '' OR s.traits_version <> c.traits_version))
 	UPDATE samples s SET rescan_priority = 1, rescan_requested_at = now(), updated_at = now()
-	  FROM (SELECT sib.id
-	          FROM samples c
-	          JOIN samples sib ON sib.purl_base = c.purl_base
-	         WHERE c.sha256 = $1 AND c.purl_base <> '' AND sib.purl_base <> ''
-	           AND sib.sha256 <> c.sha256
-	           AND sib.label = 'unknown' AND sib.parent = '' AND sib.skip = ''
-	           AND sib.rescan_priority = 0 AND sib.cleave_result IS NOT NULL
-	           AND sib.analyzed_at <= COALESCE(c.analyzed_at, now())
-	           AND (sib.traits_version = '' OR sib.traits_version <> c.traits_version)
-	         ORDER BY sib.created_at DESC, sib.id DESC
-	         LIMIT $2) v
+	  FROM (SELECT id FROM sib ORDER BY created_at DESC, id DESC LIMIT $2) v
 	 WHERE s.id = v.id
 	RETURNING s.sha256`
 

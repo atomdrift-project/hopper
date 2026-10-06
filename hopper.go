@@ -4240,7 +4240,9 @@ const maxSiblingRescan = 64
 // demoted. Returns the number queued.
 //
 // One set-based statement per conviction, driven by idx_samples_purl_base; a
-// sample with no purl_base has no siblings and costs a primary-key probe.
+// sample with no purl_base has no siblings and costs a primary-key probe. (On
+// Postgres the join order has to be pinned for that to hold; see
+// queueSiblingRescansSQLPG.)
 func (db *DB) QueueSiblingRescans(ctx context.Context, sha256 string) (int64, error) {
 	var shas []string
 	var err error
