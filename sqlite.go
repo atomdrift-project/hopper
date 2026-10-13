@@ -2143,16 +2143,22 @@ func (db *DB) oldestIncomingLocationsSQLite(ctx context.Context, q IncomingQuery
 		afterSeen, afterSHA = q.After.FirstSeenAt.UTC().Format(time.RFC3339Nano), q.After.SHA256
 	}
 	unknown := q.Class == IncomingUnknown
+	cursorPredicate := "(sl.first_seen_at, sl.sha256) > (?, ?)"
+	args := []any{q.Before.UTC().Format(time.RFC3339Nano), unknown, unknown, afterSeen, afterSeen, afterSHA}
+	if q.After.Path != "" {
+		cursorPredicate = "(sl.first_seen_at, sl.sha256, sl.path) > (?, ?, ?)"
+		args = append(args, q.After.Path)
+	}
+	args = append(args, q.Limit)
 	rows, err := db.lite.QueryContext(ctx, `
 		SELECT sl.first_seen_at, sl.mtime, sl.sha256, sl.path, s.label
 		  FROM sample_locations sl JOIN samples s ON s.sha256 = sl.sha256
 		 WHERE sl.parent_sha256 = '' AND sl.path GLOB 'incoming/*'
 		   AND sl.first_seen_at < ?
 		   AND ((? AND s.label = 'unknown') OR (NOT ? AND s.label <> 'unknown'))
-		   AND (? = '' OR (sl.first_seen_at, sl.sha256) > (?, ?))
+		   AND (? = '' OR `+cursorPredicate+`)
 		 ORDER BY sl.first_seen_at, sl.sha256, sl.path LIMIT ?`,
-		q.Before.UTC().Format(time.RFC3339Nano), unknown, unknown,
-		afterSeen, afterSeen, afterSHA, q.Limit)
+		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: oldest incoming locations: %w", err)
 	}

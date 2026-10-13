@@ -4654,6 +4654,12 @@ func (db *DB) oldestIncomingLocationsPG(ctx context.Context, q IncomingQuery) ([
 		seen := q.After.FirstSeenAt.UTC()
 		afterSeen, afterSHA = &seen, q.After.SHA256
 	}
+	cursorPredicate := "(sl.first_seen_at, sl.sha256) > ($4, $5)"
+	args := []any{q.Before.UTC(), q.Class == IncomingUnknown, q.Limit, afterSeen, afterSHA}
+	if q.After.Path != "" {
+		cursorPredicate = "(sl.first_seen_at, sl.sha256, sl.path) > ($4, $5, $6)"
+		args = append(args, q.After.Path)
+	}
 	// The join is a memoized nested loop off idx_sl_incoming_seen: the index
 	// supplies the order, and each candidate costs one primary-key probe into
 	// samples. Measured 2026-09-01 on the live corpus, 12ms for 500 rows.
@@ -4665,9 +4671,9 @@ func (db *DB) oldestIncomingLocationsPG(ctx context.Context, q IncomingQuery) ([
 		 WHERE sl.parent_sha256 = '' AND sl.path LIKE 'incoming/%'
 		   AND sl.first_seen_at < $1
 		   AND (($2 AND s.label = 'unknown') OR (NOT $2 AND s.label <> 'unknown'))
-		   AND ($4::timestamptz IS NULL OR (sl.first_seen_at, sl.sha256) > ($4, $5))
+		   AND ($4::timestamptz IS NULL OR `+cursorPredicate+`)
 		 ORDER BY sl.first_seen_at, sl.sha256, sl.path LIMIT $3`,
-		q.Before.UTC(), q.Class == IncomingUnknown, q.Limit, afterSeen, afterSHA)
+		args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: oldest incoming locations: %w", err)
 	}

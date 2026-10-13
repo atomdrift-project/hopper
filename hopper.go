@@ -3041,6 +3041,7 @@ type IncomingQuery struct {
 type IncomingCursor struct {
 	FirstSeenAt time.Time
 	SHA256      string
+	Path        string
 }
 
 // IsZero reports whether the cursor is unset, meaning "start at the oldest row".

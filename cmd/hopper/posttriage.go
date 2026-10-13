@@ -66,7 +66,8 @@ type incomingLocation struct {
 }
 
 type incomingLocationsResponse struct {
-	Locations []incomingLocation `json:"locations"`
+	Locations     []incomingLocation `json:"locations"`
+	CursorVersion int                `json:"cursor_version"`
 }
 
 // handleIncomingLocations exposes a bounded, oldest-first work feed for the
@@ -118,6 +119,7 @@ func (s *apiServer) handleIncomingLocations(w http.ResponseWriter, r *http.Reque
 		}
 		after.FirstSeenAt = parsed
 		after.SHA256 = r.URL.Query().Get("after_sha")
+		after.Path = r.URL.Query().Get("after_path")
 	}
 	locations, err := s.db.OldestIncomingLocations(r.Context(), hopper.IncomingQuery{
 		Before: before, After: after, Class: class, Limit: limit,
@@ -131,7 +133,7 @@ func (s *apiServer) handleIncomingLocations(w http.ResponseWriter, r *http.Reque
 		writeJSONError(w, http.StatusInternalServerError, "server error")
 		return
 	}
-	resp := incomingLocationsResponse{Locations: make([]incomingLocation, 0, len(locations))}
+	resp := incomingLocationsResponse{Locations: make([]incomingLocation, 0, len(locations)), CursorVersion: 2}
 	for _, loc := range locations {
 		// A missing mtime no longer drops the row. It once did, back when mtime
 		// was the sort key and a NULL had no place in the order; that silently
