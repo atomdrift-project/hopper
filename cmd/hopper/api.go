@@ -900,6 +900,7 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	// against POST /api/sightings, and the stranded member list against the
 	// per-member reports the same client files through /api/report.
 	mux.HandleFunc("GET /api/sightings", s.freshOr(s.handleSightingsFor))
+	mux.HandleFunc("GET /api/sightings/ancestry", s.freshOr(s.handleSightingsAncestry))
 	mux.HandleFunc("GET /api/stranded/{sha256}", s.freshOr(s.handleStrandedMembers))
 	if s.dataRoot != "" || !s.readOnly {
 		mux.HandleFunc("GET /api/file/{sha256}", s.handleFile)

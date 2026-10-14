@@ -5632,6 +5632,10 @@ func triageFilterClausePG(f TriageFilter, startIdx int, sampleAlias string) (cla
 
 func triageFilterClausePGKey(f TriageFilter, startIdx int, sampleAlias, reportKey string) (clause string, args []any) {
 	col := func(name string) string { return sampleAlias + "." + name }
+	if len(f.ExcludeSHA256) > 0 {
+		args = append(args, f.ExcludeSHA256)
+		clause += fmt.Sprintf(" AND NOT (%s = ANY($%d::text[]))", reportKey, startIdx)
+	}
 	if f.Ecosystem != "" {
 		args = append(args, f.Ecosystem)
 		clause += fmt.Sprintf(" AND %s = $%d", col("ecosystem"), startIdx+len(args)-1)

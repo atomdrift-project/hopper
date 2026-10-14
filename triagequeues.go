@@ -59,8 +59,8 @@ import (
 // line to hold if a fourth is ever added — a CountSelect that re-states
 // membership is the drift this design exists to prevent.
 type Queue struct {
-	Select      func(ctx context.Context, db *DB, n int) ([]*Sample, error)
-	CountSelect func(ctx context.Context, db *DB, n int) ([]*Sample, error)
+	Select      func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error)
+	CountSelect func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error)
 	Name        string
 }
 
@@ -264,8 +264,8 @@ const ReportCooldown = 72 * time.Hour
 // outright; see rescanAgeCandidatesPG.) The report drain covers the same ground from the
 // other side: a stale row that current traits already catch is judged once,
 // produces no edit, and is parked until something re-scans it.
-func staleTriageFilter(queue string) TriageFilter {
-	return queueFilter(queue, TriageFilter{Order: TriageStale})
+func staleTriageFilter(queue string, excluded ...[]string) TriageFilter {
+	return queueFilter(queue, TriageFilter{Order: TriageStale}, excluded...)
 }
 
 // queueFilter stamps a queue's own name into ExcludeReportType. Every entry in
@@ -278,8 +278,11 @@ func staleTriageFilter(queue string) TriageFilter {
 // judged work forever. One helper means a new queue cannot be added without the
 // guard, and TestEveryQueueExcludesItsOwnReport proves it rather than trusting
 // the author to remember.
-func queueFilter(queue string, f TriageFilter) TriageFilter {
+func queueFilter(queue string, f TriageFilter, excluded ...[]string) TriageFilter {
 	f.ExcludeReportType = queue
+	if len(excluded) > 0 {
+		f.ExcludeSHA256 = excluded[0]
+	}
 	return f
 }
 
@@ -297,8 +300,8 @@ func queueFilter(queue string, f TriageFilter) TriageFilter {
 // tombstone. A queue added here without one re-offers work already judged.
 var TriageQueues = map[string]Queue{
 	// bad: bad-labeled samples cleave missed (false negatives) → write traits.
-	"bad": {Name: "bad", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
-		return db.TriageBad(ctx, n, time.Now().Add(-BadFreshness), queueFilter("bad", TriageFilter{}))
+	"bad": {Name: "bad", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
+		return db.TriageBad(ctx, n, time.Now().Add(-BadFreshness), queueFilter("bad", TriageFilter{}, excluded...))
 	}},
 
 	// The unconvicted pair (2026-08-30), which REPLACED good and new. Those two
@@ -321,22 +324,29 @@ var TriageQueues = map[string]Queue{
 	//
 	// Both drain themselves: the findings dropping below the tier's bar removes
 	// the row. Their -stale twins do not, and take the usual report park.
-	"unconvicted-hostile": {Name: "unconvicted-hostile", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+	"unconvicted-hostile": {Name: "unconvicted-hostile", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
 		return db.TriageUnconvictedHostile(ctx, n, time.Now().Add(-HostileFreshness),
-			queueFilter("unconvicted-hostile", TriageFilter{Order: TriageRepair}))
+			queueFilter("unconvicted-hostile", TriageFilter{Order: TriageRepair}, excluded...))
 	}},
 
-	"unconvicted-suspicious": {Name: "unconvicted-suspicious", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+	"unconvicted-suspicious": {Name: "unconvicted-suspicious", Select: func(
+		ctx context.Context, db *DB, n int, excluded ...[]string,
+	) ([]*Sample, error) {
 		return db.TriageUnconvictedSuspicious(ctx,
-			n, time.Now().Add(-SuspiciousFreshness), queueFilter("unconvicted-suspicious", TriageFilter{Order: TriageRepair}))
+			n, time.Now().Add(-SuspiciousFreshness), queueFilter("unconvicted-suspicious", TriageFilter{Order: TriageRepair}, excluded...))
 	}},
 
-	"unconvicted-hostile-stale": {Name: "unconvicted-hostile-stale", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
-		return db.TriageUnconvictedHostile(ctx, n, time.Now().Add(-HostileFreshness), staleTriageFilter("unconvicted-hostile-stale"))
+	"unconvicted-hostile-stale": {Name: "unconvicted-hostile-stale", Select: func(
+		ctx context.Context, db *DB, n int, excluded ...[]string,
+	) ([]*Sample, error) {
+		return db.TriageUnconvictedHostile(ctx, n, time.Now().Add(-HostileFreshness), staleTriageFilter("unconvicted-hostile-stale", excluded...))
 	}},
 
-	"unconvicted-suspicious-stale": {Name: "unconvicted-suspicious-stale", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
-		return db.TriageUnconvictedSuspicious(ctx, n, time.Now().Add(-SuspiciousFreshness), staleTriageFilter("unconvicted-suspicious-stale"))
+	"unconvicted-suspicious-stale": {Name: "unconvicted-suspicious-stale", Select: func(
+		ctx context.Context, db *DB, n int, excluded ...[]string,
+	) ([]*Sample, error) {
+		return db.TriageUnconvictedSuspicious(ctx, n, time.Now().Add(-SuspiciousFreshness),
+			staleTriageFilter("unconvicted-suspicious-stale", excluded...))
 	}},
 
 	// version-drift: this release fires, an earlier release of the same package
@@ -354,8 +364,8 @@ var TriageQueues = map[string]Queue{
 	// VersionDriftWindow caps the walk, so the count pays the walk's cost and no
 	// more. Read it as "candidates inside the window", which is the same thing
 	// the queue hands out.
-	"version-drift": {Name: "version-drift", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
-		return db.TriageVersionDrift(ctx, n, time.Now().Add(-VersionDriftWindow), queueFilter("version-drift", TriageFilter{}))
+	"version-drift": {Name: "version-drift", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
+		return db.TriageVersionDrift(ctx, n, time.Now().Add(-VersionDriftWindow), queueFilter("version-drift", TriageFilter{}, excluded...))
 	}},
 
 	// fp-trait: every sample in the batch fires the SAME over-firing trait — the
@@ -370,8 +380,8 @@ var TriageQueues = map[string]Queue{
 	// Newest-first within the chosen trait; the trait selection is the ranking.
 	// Self-draining: loosening it drops its samples below the max_crit floor and
 	// the next pass ranks whatever is worst then.
-	"fp-trait": {Name: "fp-trait", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
-		return db.TriageFPTrait(ctx, n, time.Now().Add(-FPTraitFreshness), queueFilter("fp-trait", TriageFilter{}))
+	"fp-trait": {Name: "fp-trait", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
+		return db.TriageFPTrait(ctx, n, time.Now().Add(-FPTraitFreshness), queueFilter("fp-trait", TriageFilter{}, excluded...))
 	}},
 
 	// discord: our rule engine and our ML ensemble disagree about the same bytes
@@ -387,8 +397,8 @@ var TriageQueues = map[string]Queue{
 	// Self-draining: whichever detector was wrong gets fixed, the two agree, and
 	// the row leaves. Newest-first — a conflict does not get more interesting
 	// with age, and both arms are narrow enough that the head keeps moving.
-	"discord": {Name: "discord", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
-		return db.TriageDiscord(ctx, n, time.Now().Add(-DiscordFreshness), queueFilter("discord", TriageFilter{}))
+	"discord": {Name: "discord", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
+		return db.TriageDiscord(ctx, n, time.Now().Add(-DiscordFreshness), queueFilter("discord", TriageFilter{}, excluded...))
 	}},
 
 	// sighted: every non-bad sample covered by a malicious or suspicious ledger
@@ -402,9 +412,9 @@ var TriageQueues = map[string]Queue{
 	// count that was too expensive to take, and the wrong number besides.
 	// Version-pinned claims newer than SightedPinnedWindow are excluded here and
 	// served by sighted-pinned instead, so the two never offer the same sha256.
-	"sighted": {Name: "sighted", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+	"sighted": {Name: "sighted", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
 		return db.TriageSighted(ctx, n, time.Now().Add(-SightedPinnedWindow),
-			queueFilter("sighted", TriageFilter{}))
+			queueFilter("sighted", TriageFilter{}, excluded...))
 	}},
 
 	// sighted-pinned: the sharp end of the same ledger — a source named ONE
@@ -425,9 +435,9 @@ var TriageQueues = map[string]Queue{
 	//
 	// Drains exactly as sighted does (relabel, or a "sighted" report), and ages
 	// out of the window into sighted with nothing to hand over.
-	"sighted-pinned": {Name: "sighted-pinned", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+	"sighted-pinned": {Name: "sighted-pinned", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
 		return db.TriageSightedPinned(ctx, n, time.Now().Add(-SightedPinnedWindow),
-			queueFilter("sighted-pinned", TriageFilter{}))
+			queueFilter("sighted-pinned", TriageFilter{}, excluded...))
 	}},
 
 	// review: promoter's own corroboration rule found exactly one signal on an
@@ -440,8 +450,8 @@ var TriageQueues = map[string]Queue{
 	// lowest. Its predicate is a plain path check, so — like discord and
 	// sighted — the selection counted is already what the queue can hand out;
 	// no CountSelect override needed.
-	"review": {Name: "review", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
-		return db.TriageReview(ctx, n, queueFilter("review", TriageFilter{}))
+	"review": {Name: "review", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
+		return db.TriageReview(ctx, n, queueFilter("review", TriageFilter{}, excluded...))
 	}},
 
 	// second: good-labeled samples whose benign label an outside source disputes
@@ -457,9 +467,9 @@ var TriageQueues = map[string]Queue{
 	// being a plain predicate over samples, so there was never a cheap count to
 	// write. It has a depth now for the reason every queue does: the depth is the
 	// selection, and there is always a selection.
-	"second": {Name: "second", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+	"second": {Name: "second", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
 		return db.TriageSecondOpinion(ctx, n, TrustedBadSources,
-			time.Now().Add(-SecondOpinionSettle), queueFilter("second", TriageFilter{}))
+			time.Now().Add(-SecondOpinionSettle), queueFilter("second", TriageFilter{}, excluded...))
 	}},
 
 	// highest: whole archives (good/unknown parents) containing a good-labeled
@@ -472,17 +482,18 @@ var TriageQueues = map[string]Queue{
 	// sibling files are what make the call cheap, and scoring a lone member out of
 	// its archive throws both away. The whole-archive scan on upload also refreshes
 	// every sibling's score for free.
-	"highest": {Name: "highest", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+	"highest": {Name: "highest", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
 		now := time.Now()
 		return db.TriageHighest(ctx,
-			n, triagePerRouteK, now.Add(-OutlierGrace), now.Add(-MissingRetry), now.Add(-HighestFreshness), queueFilter("highest", TriageFilter{}))
-	}, CountSelect: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+			n, triagePerRouteK, now.Add(-OutlierGrace), now.Add(-MissingRetry), now.Add(-HighestFreshness),
+			queueFilter("highest", TriageFilter{}, excluded...))
+	}, CountSelect: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
 		// Same query, both bounds lifted: the per-route K is a batching device
 		// (see Queue.CountSelect), so counting through it would report ~routes*K
 		// rather than the population those routes are drawn from.
 		now := time.Now()
 		return db.TriageHighest(ctx,
-			n, n, now.Add(-OutlierGrace), now.Add(-MissingRetry), now.Add(-HighestFreshness), queueFilter("highest", TriageFilter{}))
+			n, n, now.Add(-OutlierGrace), now.Add(-MissingRetry), now.Add(-HighestFreshness), queueFilter("highest", TriageFilter{}, excluded...))
 	}},
 
 	// lowest: the mirror — bad-labeled samples the ensemble scores clean,
@@ -492,15 +503,16 @@ var TriageQueues = map[string]Queue{
 	// that was never malicious, and relabelling those is as valuable as any
 	// trait. That per-file granularity is why its drain keys on the member's own
 	// sha while highest's keys on the root archive.
-	"lowest": {Name: "lowest", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+	"lowest": {Name: "lowest", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
 		now := time.Now()
 		return db.TriageLowest(ctx,
-			n, triagePerRouteK, now.Add(-OutlierGrace), now.Add(-MissingRetry), now.Add(-LowestFreshness), queueFilter("lowest", TriageFilter{}))
-	}, CountSelect: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+			n, triagePerRouteK, now.Add(-OutlierGrace), now.Add(-MissingRetry), now.Add(-LowestFreshness),
+			queueFilter("lowest", TriageFilter{}, excluded...))
+	}, CountSelect: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
 		// See highest's.
 		now := time.Now()
 		return db.TriageLowest(ctx,
-			n, n, now.Add(-OutlierGrace), now.Add(-MissingRetry), now.Add(-LowestFreshness), queueFilter("lowest", TriageFilter{}))
+			n, n, now.Add(-OutlierGrace), now.Add(-MissingRetry), now.Add(-LowestFreshness), queueFilter("lowest", TriageFilter{}, excluded...))
 	}},
 
 	// stranded: good-labeled members with real findings inside CONVICTED
@@ -516,12 +528,13 @@ var TriageQueues = map[string]Queue{
 	// measured 2026-09-02. Counting members is also 25x cheaper (0.6s against
 	// 17.3s); see TriageStrandedPopulation for why the archive shape is the
 	// expensive one.
-	"stranded": {Name: "stranded", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+	"stranded": {Name: "stranded", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
 		now := time.Now()
-		return db.TriageStranded(ctx, n, now.Add(-OutlierGrace), now.Add(-MissingRetry), queueFilter("stranded", TriageFilter{}))
-	}, CountSelect: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+		return db.TriageStranded(ctx, n, now.Add(-OutlierGrace), now.Add(-MissingRetry), queueFilter("stranded", TriageFilter{}, excluded...))
+	}, CountSelect: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
 		now := time.Now()
-		return db.TriageStrandedPopulation(ctx, n, now.Add(-OutlierGrace), now.Add(-MissingRetry), queueFilter("stranded", TriageFilter{}))
+		return db.TriageStrandedPopulation(ctx, n, now.Add(-OutlierGrace), now.Add(-MissingRetry),
+			queueFilter("stranded", TriageFilter{}, excluded...))
 	}},
 
 	// popular: samples from a ranked package whose worst finding is HOSTILE
@@ -558,9 +571,9 @@ var TriageQueues = map[string]Queue{
 	// logical replica that means the table has to be in REPLICATED_TABLES —
 	// migration creates it empty either way, so an unpublished table reads as a
 	// permanently drained queue rather than as an error.
-	"popular": {Name: "popular", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+	"popular": {Name: "popular", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
 		return db.TriagePopular(ctx, n, time.Now().Add(-PopularPriorityWindow), time.Time{},
-			staleTriageFilter("popular"))
+			staleTriageFilter("popular", excluded...))
 	}},
 
 	// popular-tail: everything popular no longer reaches, which is the same
@@ -574,10 +587,10 @@ var TriageQueues = map[string]Queue{
 	// three-week backlog, so the reach stayed at a week. Separating them lets
 	// the tail be as deep as is useful while preemption stays bounded to the
 	// day where an hour of latency still changes the outcome.
-	"popular-tail": {Name: "popular-tail", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
+	"popular-tail": {Name: "popular-tail", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
 		now := time.Now()
 		return db.TriagePopular(ctx, n, now.Add(-PopularFreshness), now.Add(-PopularPriorityWindow),
-			staleTriageFilter("popular-tail"))
+			staleTriageFilter("popular-tail", excluded...))
 	}},
 
 	// The -stale queues: the same populations as new/good, ranked
@@ -620,8 +633,8 @@ var TriageQueues = map[string]Queue{
 	// Like second, its population is defined by the ABSENCE of a sighting, which
 	// is not a countable predicate over samples alone — so its depth is the one
 	// number that always exists, its own selection counted.
-	"acquit": {Name: "acquit", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
-		return db.TriageAcquit(ctx, n, time.Now().Add(-AcquitGrace), queueFilter("acquit", TriageFilter{}))
+	"acquit": {Name: "acquit", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
+		return db.TriageAcquit(ctx, n, time.Now().Add(-AcquitGrace), queueFilter("acquit", TriageFilter{}, excluded...))
 	}},
 
 	// fallout: litmus-hostile samples (class 2 — the public fallout page's
@@ -655,8 +668,8 @@ var TriageQueues = map[string]Queue{
 	// The undescribed/uncorroborated disjunction spans the sightings ledger, so
 	// there is no single predicate to count — but there is a selection, and that
 	// is what its depth counts, bounded by FalloutWindow.
-	"fallout": {Name: "fallout", Select: func(ctx context.Context, db *DB, n int) ([]*Sample, error) {
-		return db.TriageFallout(ctx, n, time.Now().Add(-FalloutWindow), queueFilter("fallout", TriageFilter{}))
+	"fallout": {Name: "fallout", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
+		return db.TriageFallout(ctx, n, time.Now().Add(-FalloutWindow), queueFilter("fallout", TriageFilter{}, excluded...))
 	}},
 }
 

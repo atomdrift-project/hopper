@@ -5094,6 +5094,10 @@ type TriageFilter struct {
 	// as attempts.
 	AttemptReportType string
 
+	// ExcludeSHA256 skips a consumer's active claims and cooldowns before
+	// ranking and limiting results, so they cannot hide the rest of a queue.
+	ExcludeSHA256 []string
+
 	// Order ranks the queue. See TriageOrder.
 	Order       TriageOrder
 	MaxAttempts int

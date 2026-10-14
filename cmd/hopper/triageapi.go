@@ -100,10 +100,20 @@ func (s *apiServer) handleTriageSelect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var excluded []string
+	if raw := r.URL.Query().Get("exclude"); raw != "" {
+		excluded = strings.Split(raw, ",")
+		for _, sha := range excluded {
+			if !validSHA256(sha) {
+				writeJSONError(w, http.StatusBadRequest, "exclude must contain comma-separated SHA256 digests")
+				return
+			}
+		}
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
 
-	samples, err := q.Select(ctx, s.db, limit)
+	samples, err := q.Select(ctx, s.db, limit, excluded)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "triage: select failed",
 			"queue", q.Name, "limit", limit, "error", err, "remote", r.RemoteAddr)
@@ -114,7 +124,8 @@ func (s *apiServer) handleTriageSelect(w http.ResponseWriter, r *http.Request) {
 		"queue", q.Name, "limit", limit, "returned", len(samples), "remote", r.RemoteAddr)
 
 	writeTriageJSON(w, map[string]any{
-		"queue": q.Name,
+		"queue":              q.Name,
+		"exclusions_applied": true,
 		// Never null: a client ranging over the result should not have to
 		// distinguish "no work" from "no field".
 		"samples": append(make([]*hopper.Sample, 0, len(samples)), samples...),

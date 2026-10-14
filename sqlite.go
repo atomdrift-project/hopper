@@ -3,6 +3,7 @@ package hopper
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -3339,6 +3340,11 @@ func triageFilterClauseSQLite(f TriageFilter, sampleAlias string) (clause string
 
 func triageFilterClauseSQLiteKey(f TriageFilter, sampleAlias, reportKey string) (clause string, args []any) {
 	col := func(name string) string { return sampleAlias + "." + name }
+	if len(f.ExcludeSHA256) > 0 {
+		encoded, _ := json.Marshal(f.ExcludeSHA256) //nolint:errcheck,errchkjson // []string always encodes
+		args = append(args, string(encoded))
+		clause += " AND " + reportKey + " NOT IN (SELECT value FROM json_each(?))"
+	}
 	if f.Ecosystem != "" {
 		clause += " AND " + col("ecosystem") + " = ?"
 		args = append(args, f.Ecosystem)
