@@ -243,8 +243,7 @@ func releaseSlot(sem chan struct{}) {
 }
 
 // TraitsVersion returns the current canonical traits version. Safe for
-// concurrent callers; empty if not yet set or if the local litmus
-// hasn't reported a version.
+// concurrent callers; empty until the local postdoc worker reports a version.
 func (s *apiServer) TraitsVersion() string {
 	if v := s.traitsVersion.Load(); v != nil {
 		return *v
@@ -252,10 +251,8 @@ func (s *apiServer) TraitsVersion() string {
 	return ""
 }
 
-// SetTraitsVersion updates the canonical traits version. Called once at
-// startup with the initial value, and again after every periodic
-// rules-update rotation so dashboard staleness checks reflect what the
-// local litmus is actually running.
+// SetTraitsVersion updates the canonical traits version from the local
+// postdoc worker's heartbeat.
 func (s *apiServer) SetTraitsVersion(v string) {
 	s.traitsVersion.Store(&v)
 }
@@ -1763,8 +1760,14 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	worker = qualifiedWorkerName(worker, r.RemoteAddr)
-
 	p := parseNextParams(r.URL.Query())
+	// Hopper's local postdoc worker is the reference for the current traits
+	// version shown on the dashboard. Its heartbeat carries the version after
+	// postdoc refreshes Scan's rules in-process.
+	if strings.HasPrefix(worker, "local@") && p.traits != "" {
+		s.SetTraitsVersion(p.traits)
+	}
+
 	count, slots := p.count, p.slots
 
 	// Cap claims for workers that haven't returned any results yet.

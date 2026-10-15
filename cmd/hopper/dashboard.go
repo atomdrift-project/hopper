@@ -69,7 +69,7 @@ type webDashboard struct {
 	db            *hopper.DB
 	progress      *loadProgress
 	tracker       *workerTracker
-	api           *apiServer // for live traits-version reads (refreshed every 2h)
+	api           *apiServer // for live traits-version reads from the local worker
 	rescanCache   *fido.Cache[string, hopper.RescanDepths]
 	rates         *rateSampler
 	pendingCache  *fido.Cache[string, int64]
@@ -843,9 +843,8 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	//nolint:nestif // flat per-worker cell formatting, consistent with this handler's documented long-but-flat style
 	if len(workers) > 0 {
 		// latestTraits is the canonical traits version we measure each
-		// worker against. Read live from apiServer so the periodic
-		// rules-rotation refresh is reflected immediately on the next
-		// dashboard render.
+		// worker against. Read live from apiServer so postdoc's rule refresh is
+		// reflected as soon as its next heartbeat arrives.
 		latestTraits := wd.traitsVersion
 		if wd.api != nil {
 			if v := wd.api.TraitsVersion(); v != "" {

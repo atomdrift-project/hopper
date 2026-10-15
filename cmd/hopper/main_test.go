@@ -1167,11 +1167,11 @@ func TestNewLitmusServer(t *testing.T) {
 		t.Errorf("bin = %q", s.bin)
 	}
 
-	// Defaults: bin falls back to "atomscan" (the installed Atomdrift Scan binary),
+	// Defaults: bin falls back to "postdoc" (the worker/coordinator binary),
 	// workers to max(2, NumCPU/2).
 	s2 := newLitmusServer(litmusConfig{})
-	if s2.bin != "atomscan" {
-		t.Errorf("default bin = %q, want atomscan", s2.bin)
+	if s2.bin != "postdoc" {
+		t.Errorf("default bin = %q, want postdoc", s2.bin)
 	}
 	wantWorkers := max(2, runtime.NumCPU()/2)
 	if s2.Workers() != wantWorkers {
@@ -1181,18 +1181,18 @@ func TestNewLitmusServer(t *testing.T) {
 
 func TestFlagWasSet(t *testing.T) {
 	f := flag.NewFlagSet("test", flag.ContinueOnError)
-	litmus := f.String("litmus", "litmus", "")
+	postdoc := f.String("postdoc", "postdoc", "")
 	cleave := f.String("cleave", "cleave", "")
-	parseFlags(f, []string{"--litmus", "/opt/litmus"})
+	parseFlags(f, []string{"--postdoc", "/opt/postdoc"})
 
-	if !flagWasSet(f, "litmus") {
-		t.Fatal("flagWasSet(litmus) = false, want true")
+	if !flagWasSet(f, "postdoc") {
+		t.Fatal("flagWasSet(postdoc) = false, want true")
 	}
 	if flagWasSet(f, "cleave") {
 		t.Fatal("flagWasSet(cleave) = true, want false")
 	}
-	if *litmus != "/opt/litmus" {
-		t.Fatalf("litmus = %q, want /opt/litmus", *litmus)
+	if *postdoc != "/opt/postdoc" {
+		t.Fatalf("postdoc = %q, want /opt/postdoc", *postdoc)
 	}
 	if *cleave != "cleave" {
 		t.Fatalf("cleave = %q, want cleave", *cleave)

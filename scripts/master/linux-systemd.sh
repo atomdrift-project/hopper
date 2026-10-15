@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # linux-systemd.sh - Install hopper as a hardened systemd service on the local host.
 #
-# hopper runs `hopper load` which forks litmus + rizin children to analyse
+# hopper runs `hopper load` which forks postdoc + analysis children to analyse
 # samples under DATA_DIR and push results into postgres. Memory/Tasks caps
-# are sized for that workload (litmus-heavy, up to ~32 GiB RSS).
+# are sized for that workload (up to ~32 GiB RSS).
 #
 # Idempotent: re-running is safe. The service is only daemon-reloaded and
 # restarted when the binary or unit file actually changed on disk.
@@ -25,21 +25,21 @@
 #                                    (default: 0.0.0.0:8082)
 #   TOKEN_SRC token file installed for the API (empty disables authentication)
 #                 Generated on first deploy if absent. Clients — the local
-#                 atomscan worker included — read the same path.
+#                 postdoc worker included — read the same path.
 #                                    (default: ~/.tok/hopper)
 #   WORKERS   --workers              (default: 0 = defer to hopper's built-in
 #                 cap of 40; set non-zero only to override for this host)
-#   MAX_MEMORY_GB  --max-memory-gb    atomscan RSS cap in GB, forwarded as
+#   MAX_MEMORY_GB  --max-memory-gb    postdoc RSS cap in GB, forwarded as
 #                 --max-rss-gb (default: 0 = defer to hopper's built-in cap of
 #                 48 GB; -1 = disable in-process throttling)
-#   LLM       --litmus-llm  OpenAI-compatible endpoint for the local atomscan
-#                 worker's --interpret pass, matching the remote fleet's LLM
+#   LLM       --postdoc-llm OpenAI-compatible endpoint for the local postdoc
+#                 worker's interpreter, matching the remote fleet's LLM
 #                 default. Empty disables the pass (no llm_result written).
 #                                    (default: http://10.9.8.149:8000/v1)
 #   DATASET_INCOMPLETE  --dataset-incomplete  (default: 1) non-authoritative
 #                 posture: never mark locally-absent files skip='missing'.
 #                 Set 0 for a node that owns the full sample tree.
-#   PULL_DISABLE  set to 1 to skip the git pull of ../scan and ../cleave and
+#   PULL_DISABLE  set to 1 to skip the git pull of ../postdoc and ../cleave and
 #                 build the current checkouts as-is (e.g. when the remote is down)
 #   OTEL_EXPORTER_OTLP_ENDPOINT  OTLP/HTTP base for metrics (default:
 #                 http://otel:9090/api/v1/otlp)
@@ -67,7 +67,7 @@ DASH_ADDR="${DASH_ADDR:-0.0.0.0:8082}"
 # deliberately deploy an unauthenticated API on a host they trust.
 TOKEN_SRC="${TOKEN_SRC-${HOME}/.tok/hopper}"
 # Both default to 0 so the generated unit emits no --workers/--max-memory-gb and
-# the local atomscan worker's caps come solely from hopper's built-in defaults
+# the local postdoc worker's caps come solely from hopper's built-in defaults
 # (40 workers / 48 GB RAM, in cmd/hopper/main.go) — the single source of truth.
 # Set a non-zero value here only to override those caps for a specific host.
 WORKERS="${WORKERS:-0}"
@@ -77,7 +77,7 @@ MAX_MEMORY_GB="${MAX_MEMORY_GB:-0}"
 # hopper must never mark locally-absent files skip='missing'. Set
 # DATASET_INCOMPLETE=0 to deploy an authoritative node that owns the whole tree.
 DATASET_INCOMPLETE="${DATASET_INCOMPLETE:-1}"
-# Same default endpoint the scan fleet's worker installers use (their LLM var);
+# Same default endpoint the postdoc fleet's worker installers use (their LLM var);
 # keep the two in step so every worker interprets against one model.
 LLM="${LLM:-http://10.9.8.149:8000/v1}"
 PULL_DISABLE="${PULL_DISABLE:-0}"
@@ -124,11 +124,9 @@ case "$HEAL_PERMS_INTERVAL_MIN" in *[!0-9]*|'') die "HEAL_PERMS_INTERVAL_MIN mus
 # Sibling repos that ship alongside hopper. `make deploy` updates both,
 # builds them in release mode, and installs the resulting binaries into
 # TOOLS_DIR.
-readonly SCAN_SRC=../scan
+readonly POSTDOC_SRC=../postdoc
 readonly CLEAVE_SRC=../cleave
-# Atomdrift Scan installs as 'atomscan' to avoid colliding with the unrelated
-# 'litmus' WebDAV tool. ('litmus' remains the internal codename in hopper/db.)
-readonly SCAN_BIN=${TOOLS_DIR}/atomscan
+readonly POSTDOC_BIN=${TOOLS_DIR}/postdoc
 readonly CLEAVE_BIN=${TOOLS_DIR}/cleave
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -190,13 +188,12 @@ else
     log "escalation requires a password; skipping non-interactive doas capability probe"
 fi
 
-# litmus and cleave are checked out alongside hopper and built in release
-# mode during deploy. Their Makefiles drop the binary into ./out/<name>;
-# we install those artifacts into TOOLS_DIR so the service has a single,
-# hopper-owned location to exec from.
-[[ -d ${SCAN_SRC}/.git ]] || die "Atomdrift Scan source not found at ${SCAN_SRC}; check out github.com/atomdrift-project/scan there"
+# postdoc and cleave are checked out alongside hopper and built in release
+# mode during deploy. Install the artifacts into TOOLS_DIR so the service has
+# a single, hopper-owned location to exec from.
+[[ -d ${POSTDOC_SRC}/.git ]] || die "postdoc source not found at ${POSTDOC_SRC}; check out github.com/atomdrift-project/postdoc there"
 [[ -d ${CLEAVE_SRC}/.git ]] || die "cleave source not found at ${CLEAVE_SRC}; check out github.com/atomdrift-project/cleave there"
-command -v cargo >/dev/null || die "cargo not found on PATH; install the Rust toolchain to build litmus and cleave"
+command -v cargo >/dev/null || die "cargo not found on PATH; install the Rust toolchain to build postdoc and cleave"
 
 # --- Build -------------------------------------------------------------------
 
@@ -215,12 +212,12 @@ update_tool_source() {
     git -C "${dir}" pull --ff-only
 }
 
-update_tool_source scan "${SCAN_SRC}"
+update_tool_source postdoc "${POSTDOC_SRC}"
 update_tool_source cleave "${CLEAVE_SRC}"
 
-log "Building Atomdrift Scan (release)"
-make -C "${SCAN_SRC}" release >/dev/null
-[[ -x ${SCAN_SRC}/out/atomscan ]] || die "scan build did not produce ${SCAN_SRC}/out/atomscan"
+log "Building postdoc (release)"
+make -C "${POSTDOC_SRC}" release >/dev/null
+[[ -x ${POSTDOC_SRC}/target/release/postdoc ]] || die "postdoc build did not produce ${POSTDOC_SRC}/target/release/postdoc"
 
 log "Building cleave (release)"
 make -C "${CLEAVE_SRC}" release >/dev/null
@@ -283,7 +280,7 @@ else
     binary_changed=1
 fi
 
-# Install litmus and cleave into the service user's TOOLS_DIR. A change in
+# Install postdoc and cleave into the service user's TOOLS_DIR. A change in
 # either counts as a "binary change" so the service is restarted below.
 install_tool() {
     local src=$1 dst=$2 name=$3
@@ -295,7 +292,7 @@ install_tool() {
     priv install -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${src}" "${dst}"
     binary_changed=1
 }
-install_tool "${SCAN_SRC}/out/atomscan" "${SCAN_BIN}" atomscan
+install_tool "${POSTDOC_SRC}/target/release/postdoc" "${POSTDOC_BIN}" postdoc
 install_tool "${CLEAVE_SRC}/out/cleave" "${CLEAVE_BIN}" cleave
 
 # --- .pgpass (optional, from the invoking user) -----------------------------
@@ -331,7 +328,7 @@ fi
 # world-readable through ps(1) and unit files are world-readable in
 # /etc/systemd/system. It is never held in a shell variable either, so no trace
 # or error message can echo it. Clients read the same ~/.tok/hopper path; the
-# local atomscan worker inherits HOME from the unit and finds it there.
+# local postdoc worker inherits HOME from the unit and finds it there.
 token_dst="${STATE_HOME}/.tok/hopper"
 token_arg=""
 token_changed=0
@@ -372,9 +369,9 @@ TMP_FILES+=("$tmp_unit")
 workers_arg=""
 (( WORKERS > 0 )) && workers_arg=" --workers ${WORKERS}"
 
-# --max-memory-gb caps the litmus worker's RSS (forwarded as --max-rss-gb).
+# --max-memory-gb caps the postdoc worker's RSS (forwarded as --max-rss-gb).
 # Emitted for any non-zero value so the -1 "disable throttling" sentinel still
-# passes through; 0 leaves it to litmus's own self-throttling.
+# passes through; 0 leaves it to postdoc's own self-throttling.
 max_mem_arg=""
 (( MAX_MEMORY_GB != 0 )) && max_mem_arg=" --max-memory-gb ${MAX_MEMORY_GB}"
 
@@ -387,17 +384,16 @@ max_mem_arg=""
 dataset_arg=""
 [[ "${DATASET_INCOMPLETE}" != "0" ]] && dataset_arg=" --dataset-incomplete"
 
-# --litmus-llm turns on the local worker's LLM interpretation pass, the same
-# pass every remote fleet worker runs (scan's scripts/worker/* pass --interpret
-# with SCAN_LLM). Without it this worker — which claims the largest share of the
+# --postdoc-llm sets SCAN_LLM for the local worker's interpretation pass, matching
+# the remote fleet. Without it this worker — which claims the largest share of the
 # queue — stores no llm_result, leaving hostile samples with a verdict and no
 # rationale on prism's /fallout page. Set LLM= to disable.
 llm_arg=""
-[[ -n "${LLM}" ]] && llm_arg=" --litmus-llm ${LLM}"
+[[ -n "${LLM}" ]] && llm_arg=" --postdoc-llm ${LLM}"
 
 cat >"$tmp_unit" <<EOF
 [Unit]
-Description=Hopper sample ingester (spawns Atomdrift Scan workers)
+Description=Hopper sample ingester (spawns postdoc workers)
 Documentation=https://github.com/atomdrift-project/hopper
 After=network-online.target postgresql.service
 Wants=network-online.target
@@ -425,7 +421,7 @@ CacheDirectory=${SERVICE_NAME}
 CacheDirectoryMode=0750
 
 WorkingDirectory=%S/${SERVICE_NAME}
-ExecStart=${BIN_PATH} load --data ${DATA_DIR} --db ${DB} --source ${SOURCE} --api-addr ${API_ADDR} --dashboard-addr ${DASH_ADDR}${token_arg} --litmus ${SCAN_BIN} --cleave ${CLEAVE_BIN}${dataset_arg}${workers_arg}${max_mem_arg}${llm_arg}
+ExecStart=${BIN_PATH} load --data ${DATA_DIR} --db ${DB} --source ${SOURCE} --api-addr ${API_ADDR} --dashboard-addr ${DASH_ADDR}${token_arg} --postdoc ${POSTDOC_BIN} --cleave ${CLEAVE_BIN}${dataset_arg}${workers_arg}${max_mem_arg}${llm_arg}
 Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=60s

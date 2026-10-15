@@ -1079,14 +1079,14 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		"pool path below --data that must be an active mountpoint before absence is authoritative; may be repeated or comma-separated")
 	hashWorkers := f.Int("hash-workers", 8, "concurrent hash/insert workers for file walking")
 	cleaveBinFlag := f.String("cleave", "cleave", "path to cleave binary (used for file enumeration)")
-	litmusBin := f.String("litmus", "atomscan", "path to the Atomdrift Scan binary (atomscan; codename litmus; pass empty to disable)")
-	litmusWorkers := f.Int("workers", 56, "concurrent analysis workers for the local atomscan worker (0 = auto: min(2, cores/2))")
-	// Remote litmus workers self-register via the pull API; no --litmus-nodes flag needed.
-	litmusLLM := f.String("litmus-llm", os.Getenv("SCAN_LLM"),
-		"OpenAI-compatible endpoint enabling the local atomscan worker's --interpret pass, as the remote fleet runs it "+
+	postdocBin := f.String("postdoc", "postdoc", "path to the postdoc worker binary (pass empty to disable)")
+	litmusWorkers := f.Int("workers", 56, "concurrent analysis workers for the local postdoc worker (0 = auto: min(2, cores/2))")
+	// Remote postdoc workers self-register via the pull API.
+	postdocLLM := f.String("postdoc-llm", os.Getenv("SCAN_LLM"),
+		"OpenAI-compatible endpoint for the local postdoc worker's interpreter, as the remote fleet runs it "+
 			"(defaults to $SCAN_LLM; empty disables the pass and stores no llm_result)")
 	maxRSSGB := f.Int("max-memory-gb", 48,
-		"local atomscan worker RSS limit in GB, forwarded as --max-rss-gb (0 = auto: let atomscan self-throttle, -1 = disable in-process throttling)")
+		"local postdoc worker RSS limit in GB, forwarded as --max-rss-gb (0 = auto: let postdoc self-throttle, -1 = disable in-process throttling)")
 	rescan := f.Bool("rescan", false, "re-analyze samples that already have litmus results")
 	// 90 days (2026-09-15, widened from 75). This is the whole rescan rubric —
 	// the tier sorts oldest-first and asks nothing else — so the number is a
@@ -1108,7 +1108,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// attaches to its own logs (large enough that remote OTLP log sinks have
 	// rejected the push: "structured metadata too large") and filled the state
 	// dir with 14 GB on 2026-08-10. Turn it on deliberately when debugging a worker.
-	litmusVerbose := f.Bool("litmus-verbose", false, "enable debug logging in litmus server")
+	litmusVerbose := f.Bool("postdoc-verbose", false, "enable debug logging in the local postdoc worker")
 	// Two listeners, so each one carries a single access policy end to end and
 	// a route added later cannot inherit the wrong one. The API is the tunnel
 	// origin and requires a bearer token; the HTML dashboard has no token to
@@ -1147,7 +1147,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		"run a full reconcile walk on this start even if one already ran today; "+
 			"the once-a-day guard exists because a full pass can outlast the gap between restarts")
 	parseFlags(f, os.Args[2:])
-	explicitLitmusBin := flagWasSet(f, "litmus")
+	explicitPostdocBin := flagWasSet(f, "postdoc")
 	explicitCleaveBin := flagWasSet(f, "cleave")
 	if flagWasSet(f, "prune-missing-paths") {
 		slog.Warn("--prune-missing-paths is deprecated and ignored; serving no longer prunes — run `hopper prune` instead")
@@ -1356,17 +1356,17 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	prepStart := time.Now()
 
 	// Rebuild sibling tools only when Hopper is using the default tool names.
-	// If the caller supplied --litmus or --cleave, that path is authoritative
+	// If the caller supplied --postdoc or --cleave, that path is authoritative
 	// and should not be shadowed by `make install` into another location.
 	litmusBuildCh := make(chan struct{}, 1)
 	cleaveBuildCh := make(chan struct{}, 1)
 	go func() {
-		if explicitLitmusBin {
-			slog.Info("skipping litmus rebuild for explicit binary", "bin", *litmusBin)
+		if explicitPostdocBin {
+			slog.Info("skipping postdoc rebuild for explicit binary", "bin", *postdocBin)
 		} else {
-			wd.beginStage("build.scan", "Building Atomdrift Scan")
-			updateSiblingTool(ctx, "scan", "../scan")
-			wd.endStage("build.scan")
+			wd.beginStage("build.postdoc", "Building postdoc worker")
+			updateSiblingTool(ctx, "postdoc", "../postdoc")
+			wd.endStage("build.postdoc")
 		}
 		litmusBuildCh <- struct{}{}
 	}()
@@ -1383,29 +1383,16 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	<-litmusBuildCh
 	<-cleaveBuildCh
 
-	// With a freshly built binary, pull latest rules and check the version.
-	var traitsVersion string
-	if *litmusBin != "" {
-		wd.beginStage("litmus.rules", "Refreshing litmus rules")
-		refreshToolRules(ctx, "litmus", *litmusBin)
-		traitsVersion = litmusTraitsVersion(ctx, *litmusBin)
-		wd.endStage("litmus.rules")
-		if traitsVersion != "" {
-			slog.Info("traits version recorded on results", "version", traitsVersion)
-		}
-		// Cleave-traits validation is no longer a one-shot gate here: it runs
-		// inside superviseLocalWorker, which retries it (and re-pulls rules)
-		// forever so a transient failure — e.g. traits still landing after a
-		// fresh fetch — never disables the local worker.
-	}
+	// Postdoc refreshes scan's rules and models through its worker startup path.
+	// Cleave-traits validation remains a retrying gate in superviseLocalWorker.
 
-	// Start the local scan (atomscan) worker under a supervisor that never gives
+	// Start the local postdoc worker under a supervisor that never gives
 	// up: it waits for cleave traits to validate, starts the worker, and lets
 	// Monitor restart it on every crash — all in the background, so a flaky local
 	// worker never blocks ingestion (remote workers keep running). Failures
 	// surface on the dashboard banner via the server's published health.
 	var litmus *litmusServer
-	if *litmusBin != "" {
+	if *postdocBin != "" {
 		// Local worker always connects to the API over loopback. Replace
 		// 0.0.0.0 with 127.0.0.1 since 0.0.0.0 is a bind address, not a
 		// destination. It authenticates like any other client — loopback is not
@@ -1419,20 +1406,19 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 			}
 			hopperURL = "http://" + addr
 		}
-		// Informational, not a fault: the interpret pass is optional and the
-		// scanner does not run it on everything anyway. Worth one line because
+		// Informational, not a fault: interpretation is optional. Worth one line because
 		// the missing_llm tier stamps each sample it offers, so a local worker
 		// with no endpoint quietly retires rows it could never describe.
-		if *litmusLLM == "" {
-			slog.Info("no LLM endpoint configured (--litmus-llm / $SCAN_LLM); the local worker "+
+		if *postdocLLM == "" {
+			slog.Info("no LLM endpoint configured (--postdoc-llm / $SCAN_LLM); the local worker "+
 				"will store no llm_result",
 				"reset", "UPDATE samples SET llm_attempted_at = NULL WHERE llm_result IS NULL")
 		}
 		litmus = newLitmusServer(litmusConfig{
-			Bin:        *litmusBin,
+			Bin:        *postdocBin,
 			HopperURL:  hopperURL,
 			DataDir:    *dataDir,
-			LLMURL:     *litmusLLM,
+			LLMURL:     *postdocLLM,
 			MaxRSSGB:   *maxRSSGB,
 			MaxWorkers: *litmusWorkers,
 			Verbose:    *litmusVerbose,
@@ -1606,30 +1592,8 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// Claims live in workerTracker (in-memory only), so a fresh process
 	// starts with an empty claim set — nothing to clear here.
 
-	if litmus != nil {
-		// The scan worker self-updates rules every 10 minutes via its
-		// own spawn_resource_renewal_task (in worker.rs). We poll the
-		// resulting traits version on the same cadence so the dashboard's
-		// "is this worker stale?" check measures against the live local
-		// litmus, not the snapshot taken at startup. No external restart
-		// needed — the worker reloads its capability mapper in-place.
-		// 10-minute cadence trades a bit of git-pull traffic for faster
-		// rule rollout to the fleet.
-		go func() {
-			ticker := time.NewTicker(10 * time.Minute)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					if v := litmusTraitsVersion(ctx, *litmusBin); v != "" {
-						api.SetTraitsVersion(v)
-					}
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
-	}
+	// The local worker's check-ins update the canonical traits version directly;
+	// postdoc manages rule refresh inside its worker process.
 
 	loadCtx, loadCancel := context.WithCancel(ctx)
 	defer loadCancel()
@@ -1690,6 +1654,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		}
 	}
 
+	var traitsVersion string
 	api.SetTraitsVersion(traitsVersion)
 	api.rescanAge = *rescanAge
 
@@ -2236,9 +2201,9 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 
 	// Does this process outlive the walk? Everything below that must run "for
 	// as long as we are up" keys off this. It used to key off litmus != nil --
-	// the presence of a hopper-supervised local scan worker -- which is an
-	// unrelated deployment choice: a host running its own atomscan service
-	// passes --litmus '' and still serves the API forever. On such a host the
+	// the presence of a hopper-supervised local postdoc worker -- which is an
+	// unrelated deployment choice: a host running its own postdoc service
+	// passes --postdoc '' and still serves the API forever. On such a host the
 	// background tasks were cancelled the moment the startup walk finished,
 	// which silently stopped the poison reaper and the queue-metrics sampler
 	// and closed the metrics cache under the still-live dashboard.

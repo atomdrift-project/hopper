@@ -221,13 +221,10 @@ func TestSweepStaleLitmusLogsMissingDir(t *testing.T) {
 	sweepStaleLitmusLogs(filepath.Join(t.TempDir(), "absent"))
 }
 
-// TestWorkerArgsInterpret pins the LLM pass onto the local worker. It ran for
-// months without --interpret while every remote fleet worker had it, so the
-// worker claiming the largest share of the queue wrote no llm_result at all —
-// invisible at runtime, because a scan with no interpretation succeeds exactly
-// like one with it. The endpoint gate is the other half: bare --interpret aims
-// at localhost:8000 and a missing endpoint costs a health-gate wait per sample.
-func TestWorkerArgsInterpret(t *testing.T) {
+// TestWorkerArgsPostdoc pins the local worker to postdoc's compatible worker
+// interface. The LLM endpoint is supplied through SCAN_LLM; postdoc does not
+// accept Scan's removed --interpret flag.
+func TestWorkerArgsPostdoc(t *testing.T) {
 	t.Parallel()
 
 	has := slices.Contains[[]string, string]
@@ -237,12 +234,15 @@ func TestWorkerArgsInterpret(t *testing.T) {
 		LLMURL:    "http://10.9.8.149:8000/v1",
 	})
 	args := configured.workerArgs()
-	if !has(args, "--interpret") {
-		t.Errorf("configured endpoint must pass --interpret, got %v", args)
+	if len(args) == 0 || args[0] != "worker" {
+		t.Errorf("worker command missing from argv: %v", args)
+	}
+	if has(args, "--interpret") {
+		t.Errorf("postdoc worker must not receive removed --interpret flag, got %v", args)
 	}
 
 	off := newLitmusServer(litmusConfig{HopperURL: "http://127.0.0.1:8081"})
 	if args := off.workerArgs(); has(args, "--interpret") {
-		t.Errorf("no endpoint must leave --interpret off, got %v", args)
+		t.Errorf("postdoc worker must not receive --interpret, got %v", args)
 	}
 }

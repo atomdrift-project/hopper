@@ -10,7 +10,7 @@ file on one machine, install
 [Atomdrift Scan](https://github.com/atomdrift-project/scan) instead.
 
 ```text
-collectors ──► hopper ──► atomscan workers
+collectors ──► hopper ──► postdoc workers
                  │              │
                  └◄── results ──┘
                  │
@@ -20,7 +20,7 @@ collectors ──► hopper ──► atomscan workers
 ## What it provides
 
 - PostgreSQL and SQLite storage for samples, labels, provenance, and reports
-- Pull-based jobs for horizontally scaled `atomscan worker` processes
+- Pull-based jobs for horizontally scaled `postdoc worker` processes
 - A file and result API with worker liveness and retry handling
 - Local filesystem ingestion from `bad/`, `good/`, `sighted/`, `purgatory/`, `pending/`, `review/`, and hot `incoming/` pools
 - A dashboard for queue depth, workers, and analysis rates
@@ -30,7 +30,7 @@ collectors ──► hopper ──► atomscan workers
 
 - Go 1.25.4 or newer and CGO to build hopper
 - `cleave` to enumerate recognized files during ingestion
-- `atomscan` for the default local analysis worker
+- `postdoc` for the default local analysis worker
 - PostgreSQL 17 or newer for production; several corpus operations use
   `JSON_TABLE`
 
@@ -135,27 +135,20 @@ tunnel hostname.
 
 ## Native FreeBSD deployment
 
-On FreeBSD, `make deploy` installs Hopper and the Scan worker as separate
+On FreeBSD, `make deploy` installs Hopper and the postdoc worker as separate
 `rc.d` services. Hopper runs the ingestion/API process with its local worker
-disabled; `scan-worker` pulls jobs from Hopper and can read the same sample tree
-directly.
+disabled; `postdoc_worker` pulls jobs from Hopper.
 
 ```bash
 make deploy \
   DATA_DIR=/data/samples \
   DB='postgres://hopper@hopper-db/hopper?sslmode=disable' \
-  SCAN_DIR=../scan \
-  FREEBSD_WORKERS=96 \
-  FREEBSD_MAX_MEMORY_GB=0
+  POSTDOC_DIR=../postdoc
 ```
 
-`FREEBSD_MAX_MEMORY_GB=0` leaves Scan's RSS admission threshold automatic.
-
-The deploy also builds and installs `cleave`, runs Hopper migrations, refreshes
-the tool rules, and configures `hopper` to listen on port 8081. The worker is
-supervised independently, so a worker crash or memory failure does not stop the
-Hopper API. The `scan` account must be able to read `DATA_DIR`; the installer
-adds both service accounts to the `samples` group by default.
+The deploy also builds and installs `cleave` and postdoc, runs Hopper migrations,
+and configures `hopper` to listen on port 8081. The worker is supervised
+independently, so a worker crash or memory failure does not stop the Hopper API.
 
 ## Operations
 

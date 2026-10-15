@@ -1,9 +1,9 @@
 #!/bin/sh
-# freebsd.sh - Install Hopper and its separately supervised Scan worker on a
+# freebsd.sh - Install Hopper and its separately supervised postdoc worker on a
 # native FreeBSD host.
 #
-# Hopper owns ingestion and the HTTP API. Atomdrift Scan is installed as the
-# independent scan-worker rc.d service from the sibling scan checkout; it is
+# Hopper owns ingestion and the HTTP API. postdoc is installed as the
+# independent postdoc_worker rc.d service from the sibling postdoc checkout; it is
 # deliberately not a child of hopper, so an analysis OOM cannot take the API
 # down with it.
 
@@ -19,13 +19,8 @@ API_ADDR="${API_ADDR:-0.0.0.0:8081}"
 # to restrict it to an SSH forward.
 DASH_ADDR="${DASH_ADDR:-0.0.0.0:8082}"
 TOKEN_SRC="${TOKEN_SRC-${HOME}/.tok/hopper}"
-# Sized for a master that shares its box with the hopper API and forager, not
-# for a dedicated worker host. MAX_MEMORY_GB=0 would auto-resolve to 85% of
-# system RAM and starve hopper; see FREEBSD_WORKERS in the Makefile.
-WORKERS="${WORKERS:-80}"
-MAX_MEMORY_GB="${MAX_MEMORY_GB:-160}"
 LLM="${LLM:-http://10.9.8.149:8000/v1}"
-SCAN_DIR="${SCAN_DIR:-../scan}"
+POSTDOC_DIR="${POSTDOC_DIR:-../postdoc}"
 CLEAVE_DIR="${CLEAVE_DIR:-../cleave}"
 SAMPLES_GROUP="${SAMPLES_GROUP:-samples}"
 PULL_DISABLE="${PULL_DISABLE:-0}"
@@ -46,6 +41,7 @@ CF_TUNNEL_TOKEN_FILE="${CF_TUNNEL_TOKEN_FILE:-/usr/local/etc/hopper/cloudflared-
 SERVICE_USER=hopper
 HOPPER_BIN=/usr/local/bin/hopper
 CLEAVE_BIN=/usr/local/bin/cleave
+POSTDOC_BIN=/usr/local/bin/postdoc
 HOPPER_RCD=/usr/local/etc/rc.d/hopper
 HEAL_PERMS_BIN=/usr/local/sbin/hopper-heal-perms
 HEAL_PERMS_PERIODIC=/usr/local/etc/periodic/daily/480.hopper-heal-perms
@@ -70,7 +66,7 @@ log() {
 [ "$(uname -s)" = "FreeBSD" ] || die "this script is for FreeBSD"
 [ -d "$DATA_DIR" ] || die "DATA_DIR does not exist: $DATA_DIR"
 [ -f Makefile ] || die "run from the Hopper repository root"
-[ -d "$SCAN_DIR" ] || die "Scan source not found at $SCAN_DIR"
+[ -d "$POSTDOC_DIR" ] || die "postdoc source not found at $POSTDOC_DIR"
 [ -d "$CLEAVE_DIR" ] || die "cleave source not found at $CLEAVE_DIR"
 
 if command -v doas >/dev/null 2>&1; then
@@ -103,7 +99,7 @@ update_source() {
 }
 
 log "Updating sibling sources"
-update_source scan "$SCAN_DIR"
+update_source postdoc "$POSTDOC_DIR"
 update_source cleave "$CLEAVE_DIR"
 
 log "Building Hopper"
@@ -112,6 +108,10 @@ gmake build
 log "Building cleave"
 gmake -C "$CLEAVE_DIR" release >/dev/null
 [ -x "$CLEAVE_DIR/out/cleave" ] || die "cleave build did not produce $CLEAVE_DIR/out/cleave"
+
+log "Building postdoc"
+gmake -C "$POSTDOC_DIR" release >/dev/null
+[ -x "$POSTDOC_DIR/target/release/postdoc" ] || die "postdoc build did not produce $POSTDOC_DIR/target/release/postdoc"
 
 log "Ensuring Hopper service user exists"
 if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
@@ -164,13 +164,6 @@ done
 $SUDO chgrp "$SAMPLES_GROUP" "$DATA_DIR/incoming"
 $SUDO chmod 2775 "$DATA_DIR/incoming"
 
-# Create scan before invoking scan's installer so it can be added to the same
-# group before the generated rc.d service starts.
-if ! id -u scan >/dev/null 2>&1; then
-	$SUDO pw useradd scan -m -s /bin/sh -c "Atomdrift Scan Worker"
-fi
-$SUDO pw groupmod "$SAMPLES_GROUP" -m scan
-
 # Use the deploying user's pgpass when the DSN does not carry credentials.
 # Keep it in Hopper's home so both the migration command and rc.d service use
 # the same libpq lookup without putting a password in rc.conf.
@@ -183,6 +176,7 @@ fi
 log "Installing binaries"
 $SUDO install -m 0755 -o root -g wheel ./hopper "$HOPPER_BIN"
 $SUDO install -m 0755 -o root -g wheel "$CLEAVE_DIR/out/cleave" "$CLEAVE_BIN"
+$SUDO install -m 0755 -o root -g wheel "$POSTDOC_DIR/target/release/postdoc" "$POSTDOC_BIN"
 
 # A full corpus walk must not hold up Hopper readiness. Install the shared-tree
 # healer as a daily periodic task instead; it repairs drift from manual moves,
@@ -215,9 +209,14 @@ $SUDO su -l "$SERVICE_USER" -c "$CLEAVE_BIN update-rules" \
 #
 # The token is a file, never an argument or an environment variable, and is
 # never held in a shell variable — so nothing can echo it. Clients read the
-# same ~/.tok/hopper path; the Scan worker deployed below runs as this same
-# service user and finds it there.
+# same ~/.tok/hopper path; the postdoc worker deploy below installs it for its
+# service account.
 TOKEN_DST="/home/${SERVICE_USER}/.tok/hopper"
+TOKEN_FILE_SRC="$TOKEN_SRC"
+case "$TOKEN_FILE_SRC" in
+	/*) ;;
+	*) TOKEN_FILE_SRC="$(pwd)/$TOKEN_FILE_SRC" ;;
+esac
 token_arg=""
 if [ -n "$TOKEN_SRC" ]; then
 	token_arg=" --token-file $TOKEN_DST"
@@ -281,14 +280,14 @@ IFS=\$old_ifs
 
 pidfile="/var/run/\${name}.pid"
 command="/usr/sbin/daemon"
-# --litmus '' is intentional: the Scan worker is a separate rc.d service.
+# --postdoc '' is intentional: postdoc runs as a separate rc.d service.
 #
 # -H makes daemon(8) close and reopen the -o log on SIGHUP, which is what makes
 # the newsyslog(8) drop-in below actually reclaim space. Without it newsyslog
 # renames the file while daemon keeps writing to the now-unlinked inode: the
 # rotated copies look correct, the disk never frees, and the log grows without
 # bound (this is how hopper.log reached 4.7G).
-command_args="-c -f -r -H -R 10 -P \${pidfile} -o \${hopper_logfile} -u hopper /usr/bin/env HOME=/home/hopper DATABASE_URL=\${hopper_db} $HOPPER_BIN load --data \${hopper_data} --db \${hopper_db} --source \${hopper_source} --api-addr \${hopper_api_bind} --dashboard-addr \${hopper_bind}$token_arg --litmus '' --cleave $CLEAVE_BIN\${mount_args}$dataset_arg"
+command_args="-c -f -r -H -R 10 -P \${pidfile} -o \${hopper_logfile} -u hopper /usr/bin/env HOME=/home/hopper DATABASE_URL=\${hopper_db} $HOPPER_BIN load --data \${hopper_data} --db \${hopper_db} --source \${hopper_source} --api-addr \${hopper_api_bind} --dashboard-addr \${hopper_bind}$token_arg --postdoc '' --cleave $CLEAVE_BIN\${mount_args}$dataset_arg"
 
 run_rc_command "\$1"
 EOF
@@ -413,10 +412,14 @@ else
 	log "Skipping Cloudflare Tunnel (CLOUDFLARED=$CLOUDFLARED)"
 fi
 
-log "Deploying separate Scan worker"
-(cd "$SCAN_DIR" && \
-	DATA_DIR="$DATA_DIR" WORKERS="$WORKERS" MAX_RSS_GB="$MAX_MEMORY_GB" LLM="$LLM" \
-		./scripts/worker/worker-freebsd.sh "http://127.0.0.1:8081")
+if [ -n "$TOKEN_SRC" ]; then
+	log "Deploying separate postdoc worker"
+	(cd "$POSTDOC_DIR" && \
+		TOKEN_FILE="$TOKEN_FILE_SRC" LLM="$LLM" \
+			gmake deploy-worker URL="http://127.0.0.1:8081")
+else
+	log "Skipping postdoc worker: postdoc requires a Hopper token; set TOKEN_SRC to enable it"
+fi
 
 log "Deployment complete"
 log "Hopper API: http://127.0.0.1:8081"

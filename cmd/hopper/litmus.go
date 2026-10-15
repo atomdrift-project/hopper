@@ -21,8 +21,8 @@ import (
 	"github.com/atomdrift-project/hopper"
 )
 
-// litmusServer manages a local litmus worker subprocess. In pull mode,
-// litmus polls hopper's /api/next for work instead of hopper pushing
+// litmusServer manages a local postdoc worker subprocess. In pull mode,
+// postdoc polls hopper's /api/next for work instead of hopper pushing
 // requests to it.
 const (
 	restartRecoveryDelay = 15 * time.Second
@@ -40,11 +40,11 @@ const (
 	// SIGKILLed mid-walk and restarted forever, never once polling for work.
 	startupTimeout = 2 * time.Hour
 	// wedgeDumpDelay is how long the liveness watchdog waits after sending
-	// SIGUSR1 (which makes litmus dump every thread's backtrace to its log)
+	// SIGUSR1 (which makes postdoc dump every thread's backtrace to its log)
 	// before SIGKILLing a wedged worker, so the dump has time to flush.
 	wedgeDumpDelay = 10 * time.Second
 	// rssKillFactor is how far past --max-rss-gb the worker's kernel-reported
-	// memory (VmRSS+VmSwap) may grow before the watchdog kills it. litmus
+	// memory (VmRSS+VmSwap) may grow before the watchdog kills it. postdoc
 	// throttles itself against the budget, but its accounting is
 	// allocator-level and misses off-heap growth (mmap'd archives, native
 	// libs): a 2026-07-09 incident had the worker at 73 GB against a 48 GB
@@ -58,7 +58,7 @@ const (
 	// from one huge archive isn't a death sentence.
 	rssKillStrikes = 2
 	// litmusLogMaxAge bounds how long a departed worker's stdout/stderr log is
-	// kept. Every spawn opens a fresh litmus-*.log and a --verbose worker emits
+	// kept. Every spawn opens a fresh postdoc-*.log and a --verbose worker emits
 	// 0.5-1.3 GB apiece, so nothing reclaimed them: on 2026-08-10 a worker
 	// crash-looping since 08-04 had left 3,579 files totalling 14 GB. Two days
 	// keeps the previous night's crash available to debug while bounding the
@@ -75,10 +75,10 @@ type litmusServer struct {
 	tracker    *workerTracker                    // for liveness checks
 	logPath    atomic.Pointer[string]            // current worker's stdout/stderr log file
 	health     atomic.Pointer[localWorkerHealth] // published for the dashboard banner
-	bin        string                            // path to litmus binary
+	bin        string                            // path to postdoc binary
 	hopperURL  string                            // hopper API base URL for the worker to poll
 	dataDir    string                            // data root for --data-dir
-	llmURL     string                            // --interpret endpoint (SCAN_LLM); empty leaves the pass off
+	llmURL     string                            // interpreter endpoint (SCAN_LLM); empty leaves the pass off
 	workerName string                            // qualified name used to look up in tracker
 	tmpDir     string
 	pid        atomic.Int64
@@ -92,7 +92,7 @@ type litmusServer struct {
 	verbose    bool
 }
 
-// localWorkerHealth is the current state of the in-process scan (atomscan) worker,
+// localWorkerHealth is the current state of the in-process postdoc worker,
 // published for the web dashboard's status banner. since marks when the present
 // ok-state began, so a persistent failure shows a stable "down since <time>".
 // detail holds the last few log/output lines for the failure so the banner is
@@ -129,18 +129,18 @@ func (s *litmusServer) workerLogTail(n int) string {
 
 // litmusConfig holds options for starting a litmus worker.
 type litmusConfig struct {
-	Bin        string // path to the Atomdrift Scan binary (codename: litmus); default "atomscan"
+	Bin        string // path to the postdoc binary; default "postdoc"
 	HopperURL  string // hopper API URL (e.g. http://127.0.0.1:8081)
 	DataDir    string // data root for local file access
-	LLMURL     string // OpenAI-compatible endpoint for the --interpret pass; empty disables it
-	MaxRSSGB   int    // memory limit in GB (0 = let litmus decide, -1 = disable in-process throttling)
+	LLMURL     string // OpenAI-compatible endpoint for interpretation; empty disables it
+	MaxRSSGB   int    // memory limit in GB (0 = let postdoc decide, -1 = disable in-process throttling)
 	MaxWorkers int    // max concurrent analysis workers
-	Verbose    bool   // enable debug logging in litmus
+	Verbose    bool   // enable debug logging in postdoc
 }
 
 func newLitmusServer(cfg litmusConfig) *litmusServer {
 	if cfg.Bin == "" {
-		cfg.Bin = "atomscan"
+		cfg.Bin = "postdoc"
 	}
 	if cfg.MaxWorkers < 1 {
 		cfg.MaxWorkers = max(2, runtime.NumCPU()/2)
@@ -444,10 +444,10 @@ func updateSiblingTool(ctx context.Context, name, dir string) {
 	slog.Info("tool updated successfully", "tool", name, "pulled", pulled)
 }
 
-// workerArgs builds the atomscan argv for the local worker. Pure so the
+// workerArgs builds the postdoc argv for the local worker. Pure so the
 // composition is testable without spawning: the flags here are the only thing
 // that distinguishes this worker from a remote fleet one, and a missing flag is
-// invisible at runtime (see --interpret below).
+// invisible at runtime.
 func (s *litmusServer) workerArgs() []string {
 	args := []string{}
 	if s.verbose {
@@ -466,17 +466,8 @@ func (s *litmusServer) workerArgs() []string {
 	if s.maxWorkers > 0 {
 		args = append(args, "--workers", strconv.Itoa(s.maxWorkers))
 	}
-	// LLM second-opinion pass, exactly as the remote fleet runs it: the
-	// `--interpret` flag plus SCAN_LLM naming the endpoint (see scan's
-	// scripts/worker/worker-linux.sh). Without it this worker stores no
-	// llm_result at all, and since it claims the largest share of the queue
-	// that left ~half of every hostile sample with a verdict and no rationale —
-	// the gaps on prism's /fallout page. Gated on a configured endpoint rather
-	// than always-on: bare `--interpret` would aim at localhost:8000, and a
-	// missing endpoint costs a health-gate wait per sample.
-	if s.llmURL != "" {
-		args = append(args, "--interpret")
-	}
+	// Postdoc enables interpretation from SCAN_LLM itself. `--interpret` was
+	// removed from Scan's worker interface and is not accepted by postdoc.
 	return args
 }
 
@@ -959,7 +950,7 @@ func preflightCleaveValidate(ctx context.Context, bin string) (detail string, er
 			"output", lastLines(out, 30),
 		}
 		attrs = append(attrs, commandDiagnostics(cmd)...)
-		slog.Error("cleave validate failed; local scan worker startup deferred",
+		slog.Error("cleave validate failed; local postdoc worker startup deferred",
 			attrs...)
 		return lastLines(out, 3), fmt.Errorf("%w: %s", err, lastReasonLine(out))
 	}
@@ -992,7 +983,7 @@ func lastNLines(s string, n int) string {
 	return sanitizeLogString(strings.Join(lines, "\n"))
 }
 
-// superviseLocalWorker keeps the in-process scan (atomscan) worker running for the
+// superviseLocalWorker keeps the in-process postdoc worker running for the
 // life of ctx and never gives up. It loops: validate cleave traits (retrying —
 // a fresh fetch may still be landing, or may have failed, in which case it
 // re-pulls cleave's traits), then start the worker and hand off to Monitor,
@@ -1004,7 +995,7 @@ func superviseLocalWorker(ctx context.Context, litmus *litmusServer, cleaveBin s
 		if detail, err := preflightCleaveValidate(ctx, cleaveBin); err != nil {
 			delay := workerRetryDelay(attempt)
 			litmus.setHealth(false, "cleave validate failed: "+err.Error(), detail)
-			slog.Error("local scan worker not started: cleave validate failed; retrying",
+			slog.Error("local postdoc worker not started: cleave validate failed; retrying",
 				"error", err, "cleave_bin", cleaveBin, "attempt", attempt, "retry_in", delay)
 			// Re-pull cleave's traits — the bundle that just failed to validate.
 			// It must be cleave's own, not litmus': cleave resolves traits from a
@@ -1020,7 +1011,7 @@ func superviseLocalWorker(ctx context.Context, litmus *litmusServer, cleaveBin s
 		if err := litmus.Start(ctx); err != nil {
 			delay := workerRetryDelay(attempt)
 			litmus.setHealth(false, "failed to start: "+err.Error(), litmus.workerLogTail(3))
-			slog.Error("local scan worker failed to start; retrying",
+			slog.Error("local postdoc worker failed to start; retrying",
 				"error", err, "attempt", attempt, "retry_in", delay)
 			if !sleepCtx(ctx, delay) {
 				return
@@ -1031,7 +1022,7 @@ func superviseLocalWorker(ctx context.Context, litmus *litmusServer, cleaveBin s
 		// on every crash; it returns only when ctx is cancelled or Stop is called.
 		if err := litmus.Monitor(ctx); err != nil && ctx.Err() == nil {
 			litmus.setHealth(false, "monitor exited: "+err.Error(), "")
-			slog.Error("local scan worker monitor exited unexpectedly; re-validating",
+			slog.Error("local postdoc worker monitor exited unexpectedly; re-validating",
 				"error", err)
 			continue
 		}
@@ -1214,47 +1205,6 @@ func lastLines(b []byte, maxLines int) string {
 		lines = lines[len(lines)-maxLines:]
 	}
 	return sanitizeLogString(strings.Join(lines, "\n"))
-}
-
-// litmusTraitsVersion runs `litmus -f json version` and returns the
-// first 5 characters of the traits commit hash. Returns "" on any error.
-func litmusTraitsVersion(ctx context.Context, bin string) string {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, bin, "-f", "json", "version")
-	out, err := cmd.Output()
-	if err != nil {
-		stderr := ""
-		var ee *exec.ExitError
-		if errors.As(err, &ee) && len(ee.Stderr) > 0 {
-			stderr = string(ee.Stderr)
-			if len(stderr) > 256 {
-				stderr = stderr[:256]
-			}
-		}
-		slog.Warn("failed to get litmus traits version (is litmus up to date?)",
-			"bin", bin, "error", err, "stderr", stderr)
-		return ""
-	}
-
-	var v struct {
-		Traits string `json:"traits"`
-	}
-	if err := json.Unmarshal(out, &v); err != nil {
-		snippet := string(out)
-		if len(snippet) > 128 {
-			snippet = snippet[:128]
-		}
-		slog.Warn("failed to parse litmus version output", "error", err, "output", snippet)
-		return ""
-	}
-
-	if len(v.Traits) < 5 {
-		slog.Warn("litmus traits version too short", "traits", v.Traits)
-		return v.Traits
-	}
-	return v.Traits[:5]
 }
 
 // Restarts returns the number of times litmus has been restarted.
