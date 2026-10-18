@@ -3054,7 +3054,10 @@ func (db *DB) insertSampleNewPG(ctx context.Context, sample *Sample) (bool, erro
 			-- is the seq scan plan_audit_test.go guards); the purl arm is skipped
 			-- outright for the files that carry no package identity.
 			EXISTS (SELECT 1 FROM sightings WHERE subject = $1)
-			  OR ($26 <> '' AND EXISTS (SELECT 1 FROM sightings WHERE subject = $26)))
+			  OR ($26 <> '' AND EXISTS (
+				SELECT 1 FROM sightings g WHERE g.subject = $26
+				  AND (g.affected ~ '`+unnarrowableScope+`'
+				       OR $23 = ANY (string_to_array(replace(g.affected, ' ', ''), ','))))))
 		`+sampleConflictUpdatePG,
 		sample.SHA256, sample.Source, sample.Feed, sample.Ecosystem, sample.Filename,
 		sample.SizeBytes, sample.Label, sample.LabelSource, samplesPath, sample.Status,
@@ -3307,7 +3310,10 @@ SELECT DISTINCT ON (sha256)
 	-- plan_audit_test.go guards against, because the OR form seq-scans.
 	EXISTS (SELECT 1 FROM sightings g WHERE g.subject = _staging.sha256)
 	  OR (_staging.purl_base <> ''
-	      AND EXISTS (SELECT 1 FROM sightings g WHERE g.subject = _staging.purl_base))
+	      AND EXISTS (
+	          SELECT 1 FROM sightings g WHERE g.subject = _staging.purl_base
+	            AND (g.affected ~ '` + unnarrowableScope + `'
+	                 OR _staging.version = ANY (string_to_array(replace(g.affected, ' ', ''), ',')))))
 FROM _staging
 ORDER BY sha256
 ` + sampleConflictUpdatePG

@@ -87,6 +87,14 @@ if [ -n "$missing" ]; then
 	$SUDO pkg install -y $missing
 fi
 
+# Bring a sibling checkout up to date. These are checkouts, not workspaces:
+# what has to hold is "the tree is the upstream branch", and `git pull` cannot
+# promise that. When the branch has been force-pushed it aborts with "Not
+# possible to fast-forward", which fails the deploy -- and on the hopper that
+# halts the whole rollout before a single worker is touched. Fetching and
+# resetting reaches the same commit either way, and discards exactly the local
+# commits and edits a deploy host is not supposed to have. Untracked files --
+# build artifacts, caches, token files -- are left alone.
 update_source() {
 	name=$1
 	dir=$2
@@ -95,7 +103,10 @@ update_source() {
 		return
 	fi
 	log "Updating $name source"
-	git -C "$dir" pull --ff-only
+	upstream=$(git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null) ||
+		upstream=origin/main
+	git -C "$dir" fetch --prune || die "$name: git fetch failed in $dir"
+	git -C "$dir" reset --hard "$upstream" || die "$name: cannot reset $dir to $upstream"
 }
 
 log "Updating sibling sources"

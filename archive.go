@@ -120,15 +120,16 @@ type Leaf struct {
 // in *this* archive, as opposed to what the file *is*. Split strips them from
 // the leaf (so identical content dedups to identical bytes) and preserves them
 // on the reference; Join copies them back. Depth travels under "dp" (v4–v7) or
-// "depth" (v8); both are listed so either generation round-trips.
-var placementKeys = []string{"id", "dp", "depth", "path"}
+// "depth" (v8); both are listed so either generation round-trips. Parent and
+// relation/participation fields also belong to the occurrence, not the SHA leaf.
+var placementKeys = []string{"id", "dp", "depth", "path", "pid", "rel", "via", "role"}
 
 // refKeys are the fields kept on a member's parent reference: its placement plus
 // the light identity/summary fields a reader needs to list members without
 // hydrating their leaves. The heavy fields (ctx/traits/facts) are deliberately
 // absent — dropping them from the parent is the storage win. Size travels under
 // "size" (v7+) or "sz" (v4); both are kept so either generation summarizes.
-var refKeys = []string{"id", "sha", "path", "type", "dp", "depth", "size", "sz", "risk", "mol"}
+var refKeys = []string{"id", "sha", "path", "type", "dp", "depth", "size", "sz", "risk", "mol", "pid", "rel", "via", "role"}
 
 // Split decomposes an archive envelope into its parent (container plus member
 // references) and one leaf per member. A non-archive envelope — no `raw.files`,
@@ -312,6 +313,16 @@ func restoreMember(ref map[string]json.RawMessage, leafEnv []byte) (json.RawMess
 	member, err := decodeObject(raw.files[0])
 	if err != nil {
 		return nil, fmt.Errorf("leaf raw.files[0]: %w", err)
+	}
+	// References from the expanded placement plan carry structural/role fields.
+	// Their absent optional fields also mean absence: do not import a stale
+	// role, relation or locator from a pre-fix leaf. Historical references lack
+	// all four keys, so preserve their only surviving placement information.
+	for _, k := range []string{"pid", "rel", "via", "role"} {
+		if _, ok := ref[k]; ok {
+			member = drop(member, placementKeys)
+			break
+		}
 	}
 	for _, k := range placementKeys {
 		if v, ok := ref[k]; ok {

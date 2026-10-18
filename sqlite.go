@@ -1311,7 +1311,10 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 			-- Mirrors insertSampleNewPG: the sighting usually predates the row on
 			-- this path, so the sightings trigger has nothing left to fire on.
 			EXISTS (SELECT 1 FROM sightings WHERE subject = ?)
-			  OR (? != '' AND EXISTS (SELECT 1 FROM sightings WHERE subject = ?)))
+			  OR (? != '' AND EXISTS (
+				SELECT 1 FROM sightings g WHERE g.subject = ?
+				  AND (`+liteUnnarrowableScope("g.affected")+`
+				       OR ',' || replace(g.affected, ' ', '') || ',' LIKE '%,' || ? || ',%'))))
 		`+sampleConflictUpdateSQLite,
 		s.SHA256, s.Source, s.Feed, s.Ecosystem, s.Filename,
 		s.SizeBytes, s.Label, s.LabelSource, samplesPath, s.Status,
@@ -1319,7 +1322,7 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 		s.MaxCrit, s.SuspiciousCount, s.TopTraits, s.TraitGraph, s.Mtime, s.MarkerMtime,
 		jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult), s.AnalyzedAt, firstAnalyzedAt, s.TraitsVersion,
 		s.URL, s.Domain, s.Package, s.Version, jsonTextOrNil(s.Provenance), s.FetchedAt, s.PURLBase,
-		s.SHA256, s.PURLBase, s.PURLBase)
+		s.SHA256, s.PURLBase, s.PURLBase, s.Version)
 	if err != nil {
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
@@ -1414,6 +1417,24 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback is best-effort after commit // commit or rollback
 
+	inserted, err = insertBatchSamplesSQLite(ctx, tx, samples)
+	if err != nil {
+		return 0, nil, err
+	}
+	if err := markReplacedBatchSamplesSQLite(ctx, tx, samples); err != nil {
+		return 0, nil, err
+	}
+	needsAnalysis, err = stageAndCorroborateBatchSQLite(ctx, tx, samples)
+	if err != nil {
+		return 0, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, nil, fmt.Errorf("hopper: commit batch: %w", err)
+	}
+	return inserted, needsAnalysis, nil
+}
+
+func insertBatchSamplesSQLite(ctx context.Context, tx *sql.Tx, samples []*Sample) (int64, error) {
 	cols := []string{
 		"sha256", "source", "feed", "ecosystem", "filename",
 		"size_bytes", "label", "label_source", "path", "status", "canonical_sha256",
@@ -1438,14 +1459,17 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		INSERT INTO samples (%s, corroborated)
 		VALUES (%s,
 			EXISTS (SELECT 1 FROM sightings WHERE subject = ?)
-			  OR (? != '' AND EXISTS (SELECT 1 FROM sightings WHERE subject = ?)))
+			  OR (? != '' AND EXISTS (
+				SELECT 1 FROM sightings g WHERE g.subject = ?
+				  AND (`+liteUnnarrowableScope("g.affected")+`
+				       OR ',' || replace(g.affected, ' ', '') || ',' LIKE '%%,' || ? || ',%%'))))
 		`+sampleConflictUpdateSQLite,
 		strings.Join(cols, ", "),
 		strings.Join(placeholders, ", "))
 
 	stmt, err := tx.PrepareContext(ctx, query)
 	if err != nil {
-		return 0, nil, fmt.Errorf("hopper: prepare batch: %w", err)
+		return 0, fmt.Errorf("hopper: prepare batch: %w", err)
 	}
 	defer stmt.Close() //nolint:errcheck // best-effort cleanup
 
@@ -1460,12 +1484,13 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 			ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE sample_locations.ecosystem END,
 			mtime = COALESCE(excluded.mtime, sample_locations.mtime)`+locationChangedSQLite)
 	if err != nil {
-		return 0, nil, fmt.Errorf("hopper: prepare location upsert: %w", err)
+		return 0, fmt.Errorf("hopper: prepare location upsert: %w", err)
 	}
 	defer locStmt.Close() //nolint:errcheck // best-effort cleanup
 
 	logLabelTransitionsSQLite(ctx, tx, samples)
 
+	var inserted int64
 	for _, s := range samples {
 		firstAnalyzedAt := s.FirstAnalyzedAt
 		if firstAnalyzedAt == nil {
@@ -1479,30 +1504,33 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 			s.MaxCrit, s.SuspiciousCount, s.TopTraits, s.TraitGraph, s.Mtime, s.MarkerMtime,
 			jsonTextOrNil(s.CleaveResult), jsonTextOrNil(s.LitmusResult), s.AnalyzedAt, firstAnalyzedAt, s.TraitsVersion,
 			s.URL, s.Domain, s.Package, s.Version, jsonTextOrNil(s.Provenance), s.FetchedAt, s.PURLBase,
-			s.SHA256, s.PURLBase, s.PURLBase)
+			s.SHA256, s.PURLBase, s.PURLBase, s.Version)
 		if err != nil {
-			return 0, nil, fmt.Errorf("hopper: batch insert %s: %w", s.SHA256, err)
+			return 0, fmt.Errorf("hopper: batch insert %s: %w", s.SHA256, err)
 		}
 		if n, err := res.RowsAffected(); err == nil {
 			inserted += n
 		}
 		if s.MarkerMtime != nil {
 			if _, err := tx.ExecContext(ctx, `UPDATE samples SET marker_mtime = ? WHERE sha256 = ?`, s.MarkerMtime, s.SHA256); err != nil {
-				return 0, nil, fmt.Errorf("hopper: refresh marker mtime %s: %w", s.SHA256, err)
+				return 0, fmt.Errorf("hopper: refresh marker mtime %s: %w", s.SHA256, err)
 			}
 		}
 		if s.Path != "" {
 			if _, err := locStmt.ExecContext(ctx,
 				s.SHA256, s.Path, s.Parent, s.LocationRel, s.Filename, s.Source, s.Feed, s.Ecosystem, s.Mtime); err != nil {
-				return 0, nil, fmt.Errorf("hopper: upsert location %s: %w", s.SHA256, err)
+				return 0, fmt.Errorf("hopper: upsert location %s: %w", s.SHA256, err)
 			}
 		}
 	}
 
-	// Mark stale rows whose path now belongs to a different SHA256.
-	// This happens when a file is replaced on disk — the walk inserts a
-	// new row for the new content but the old row lingers in the queue
-	// and can never be analyzed because the original bytes are gone.
+	return inserted, nil
+}
+
+// markReplacedBatchSamplesSQLite marks stale rows whose path now belongs to a
+// different SHA256 after a file is replaced on disk.
+func markReplacedBatchSamplesSQLite(ctx context.Context, tx *sql.Tx, samples []*Sample) error {
+	// The old row can no longer be analyzed because the original bytes are gone.
 	for _, s := range samples {
 		if s.Path == "" {
 			continue
@@ -1512,24 +1540,27 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 			WHERE path = ? AND sha256 != ? AND skip = '' AND cleave_result IS NULL`,
 			s.Path, s.SHA256)
 		if err != nil {
-			return 0, nil, fmt.Errorf("hopper: mark replaced %s: %w", s.SHA256, err)
+			return fmt.Errorf("hopper: mark replaced %s: %w", s.SHA256, err)
 		}
 		if n, err := res.RowsAffected(); err == nil && n > 0 {
 			slog.Info("marked replaced sample", "path", s.Path, "new_sha256", s.SHA256, "replaced", n)
 		}
 	}
+	return nil
+}
 
+func stageAndCorroborateBatchSQLite(ctx context.Context, tx *sql.Tx, samples []*Sample) ([]string, error) {
 	// Find SHAs that lack analysis results.
 	if _, err := tx.ExecContext(ctx, "CREATE TEMP TABLE IF NOT EXISTS _batch_shas (sha256 TEXT)"); err != nil {
-		return 0, nil, fmt.Errorf("hopper: create batch staging: %w", err)
+		return nil, fmt.Errorf("hopper: create batch staging: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM _batch_shas"); err != nil {
-		return 0, nil, fmt.Errorf("hopper: clear batch staging: %w", err)
+		return nil, fmt.Errorf("hopper: clear batch staging: %w", err)
 	}
 
 	stagingStmt, err := tx.PrepareContext(ctx, "INSERT INTO _batch_shas (sha256) VALUES (?)")
 	if err != nil {
-		return 0, nil, fmt.Errorf("hopper: prepare batch staging: %w", err)
+		return nil, fmt.Errorf("hopper: prepare batch staging: %w", err)
 	}
 	defer func() {
 		if closeErr := stagingStmt.Close(); closeErr != nil {
@@ -1539,7 +1570,7 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 
 	for _, s := range samples {
 		if _, err := stagingStmt.ExecContext(ctx, s.SHA256); err != nil {
-			return 0, nil, fmt.Errorf("hopper: staging exec: %w", err)
+			return nil, fmt.Errorf("hopper: staging exec: %w", err)
 		}
 	}
 
@@ -1554,10 +1585,13 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		`UPDATE samples SET corroborated = 1
 		 WHERE corroborated = 0 AND cleave_result IS NULL AND purl_base != ''
 		   AND sha256 IN (SELECT sha256 FROM _batch_shas)
-		   AND EXISTS (SELECT 1 FROM sightings g WHERE g.subject = samples.purl_base)`,
+		   AND EXISTS (
+		       SELECT 1 FROM sightings g WHERE g.subject = samples.purl_base
+		         AND (` + liteUnnarrowableScope("g.affected") + `
+		              OR ',' || replace(g.affected, ' ', '') || ',' LIKE '%,' || samples.version || ',%'))`,
 	} {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
-			return 0, nil, fmt.Errorf("hopper: corroborate staged: %w", err)
+			return nil, fmt.Errorf("hopper: corroborate staged: %w", err)
 		}
 	}
 
@@ -1566,7 +1600,7 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		JOIN _batch_shas b ON s.sha256 = b.sha256
 		WHERE s.litmus_result IS NULL`)
 	if err != nil {
-		return 0, nil, fmt.Errorf("hopper: query needs analysis: %w", err)
+		return nil, fmt.Errorf("hopper: query needs analysis: %w", err)
 	}
 	defer func() {
 		if closeErr := rows.Close(); closeErr != nil {
@@ -1574,21 +1608,18 @@ func (db *DB) insertSampleBatchSQLite(ctx context.Context, samples []*Sample) (i
 		}
 	}()
 
+	var needsAnalysis []string
 	for rows.Next() {
 		var sha string
 		if err := rows.Scan(&sha); err != nil {
-			return 0, nil, fmt.Errorf("hopper: scan needs analysis: %w", err)
+			return nil, fmt.Errorf("hopper: scan needs analysis: %w", err)
 		}
 		needsAnalysis = append(needsAnalysis, sha)
 	}
 	if err := rows.Err(); err != nil {
-		return 0, nil, fmt.Errorf("hopper: rows needs analysis: %w", err)
+		return nil, fmt.Errorf("hopper: rows needs analysis: %w", err)
 	}
-
-	if err := tx.Commit(); err != nil {
-		return 0, nil, fmt.Errorf("hopper: commit batch: %w", err)
-	}
-	return inserted, needsAnalysis, nil
+	return needsAnalysis, nil
 }
 
 // refreshStaleMemberAnalysisSQLite is the SQLite twin of

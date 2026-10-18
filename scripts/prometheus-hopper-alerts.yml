@@ -181,8 +181,10 @@ groups:
         annotations:
           runbook_url: "https://github.com/atomdrift-project/hopper/blob/main/docs/runbook.md#hopperrescannotdraining"
           summary: "Hopper rescan queue is not draining"
+          # yamllint disable rule:line-length
           description: "{{ $value | printf \"%.0f\" }} samples queued for re-analysis with a zero rescan rate for 6h; the tier is starved by the tiers above it or not running."
 
+          # yamllint enable rule:line-length
       # Ingestion has stopped feeding the pipeline: no new sample added in an
       # hour. Trends a dead forager/walk upstream.
       - alert: HopperIngestionStalled
