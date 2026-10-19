@@ -131,6 +131,23 @@ It never guesses at drops/renames/true type changes (alerts + leaves disabled fo
 a human). So the generated→plain conversion in the procedure above **self-heals**
 on the next timer tick — once the updated healer is installed.
 
+The default cadence is one minute. After publisher and schema checks, a disabled
+subscription with no healable drift is automatically re-enabled too: transient
+timeouts must not leave `disable_on_error` latched indefinitely. Repeated failures
+at the same committed apply position back off for 1, 2, 4, 8, then 15 minutes;
+committed progress resets the backoff. Persistent conflicts still alert and
+require an operator. Recovery never skips a transaction or recopies existing
+tables. To hold replication disabled intentionally, first create
+`~postgres/.hopper-replica-heal/maintenance` (or `$HEAL_STATE_DIR/maintenance`);
+remove it when ready to resume. An enabled but lagging subscription is left
+running so it can drain its backlog.
+
+On systemd hosts, installation also adds a `postgresql.service` drop-in with
+`Restart=on-failure` and a 10-second delay, without a start-rate limit. This
+retries OOM/crash exits and transient startup failures while retaining existing
+mount prerequisites. The healer starts PostgreSQL if needed and times out after
+two minutes so a hung check cannot block later timer ticks.
+
 **Distributing the healer:** `install-heal.sh` *copies* `replica-heal.sh` to
 `/usr/local/bin/hopper-replica-heal.sh` and points the timer at the copy. So after
 updating the script in the repo you must re-install: `git pull` on the replica,

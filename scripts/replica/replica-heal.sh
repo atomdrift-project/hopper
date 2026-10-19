@@ -38,9 +38,9 @@
 #     of truth (not a migration list), so it consumes any future column or table
 #     add — even ones newer than anything deployed here. No hopper binary needed.
 #   * SAFE-BY-DEFAULT. It never disables a subscription merely because the
-#     publisher was unreachable; it never re-enables a subscription that was
-#     disabled for a non-schema reason; it only ever ADDs (never drops) to close
-#     a gap.
+#     publisher was unreachable; disabled subscriptions with no healable drift
+#     are retried with backoff, without skipping transactions or recopying data.
+#     Use the maintenance flag to deliberately hold a subscription disabled.
 #
 # Runs as the postgres superuser (local admin) on a schedule (systemd timer on
 # Linux, cron inside the FreeBSD jail). Idempotent; cheap when there's no drift.
@@ -142,7 +142,7 @@ fi
 
 # Publisher reads are read-only catalog lookups; credentials come from .pgpass.
 [ -f "$PGPASS" ] && export PGPASSFILE="$PGPASS"
-remote() { psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" "$@"; }
+remote() { PGCONNECT_TIMEOUT=5 psql -w -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" "$@"; }
 
 # --- Resolve the subscription ----------------------------------------------
 if [ -z "$SUBSCRIPTION" ]; then
@@ -420,13 +420,38 @@ if [ -z "$heal_ddl" ]; then
         log "ok: '$SUBSCRIPTION' enabled, schema in parity with publisher${lag_gb:+, lag ${lag_gb} GB}"
         exit 0
     fi
-    # Disabled but schema is fine → it tripped on a non-schema apply error
-    # (conflict, etc.). Re-enabling blindly could just re-loop; needs a human.
-    errcnt=$(admin -d "$LOCAL_DB" -tAc \
-        "SELECT coalesce(apply_error_count,0) FROM pg_stat_subscription_stats WHERE subname='$SUBSCRIPTION'" \
-        | tr -d '[:space:]')
-    alert warn "subscription '$SUBSCRIPTION' is DISABLED but schema is in parity — non-schema apply error (apply_error_count=${errcnt:-?}); not auto-re-enabling. Inspect logs / pg_stat_subscription_stats."
-    exit 1
+    # Timeouts also trigger disable_on_error. Retry rather than leaving a
+    # transient outage latched until an operator notices. Persistent conflicts
+    # still need a human: retry at 1, 2, 4, 8, then 15-minute intervals while
+    # the apply position is unchanged. Any committed progress resets backoff.
+    # The subscription OID prevents a recreated subscription inheriting it.
+    position=$(admin -d "$LOCAL_DB" -tAc \
+        "SELECT s.oid::text || ':' || coalesce(o.remote_lsn::text, '0/0')
+           FROM pg_subscription s LEFT JOIN pg_replication_origin_status o
+             ON o.external_id = 'pg_' || s.oid::text
+          WHERE s.subname='$SUBSCRIPTION'" | tr -d '[:space:]')
+    [ -n "$position" ] || die "cannot read apply position for '$SUBSCRIPTION'"
+    retry_file="$HEAL_STATE_DIR/retry-$SUBSCRIPTION"
+    previous=""; delay=0; next_retry=0
+    if [ -f "$retry_file" ]; then
+        read -r previous delay next_retry < "$retry_file" || true
+    fi
+    case "$delay:$next_retry" in *[!0-9:]*|:*|*:) delay=0; next_retry=0 ;; esac
+    now=$(date +%s)
+    if [ "$previous" != "$position" ]; then delay=0; next_retry=0; fi
+    if [ "$now" -lt "$next_retry" ]; then
+        alert warn "subscription '$SUBSCRIPTION' is DISABLED at $position; next retry at epoch $next_retry — repeated apply failure, inspect PostgreSQL logs"
+        exit 1
+    fi
+    delay=$((delay * 2))
+    [ "$delay" -ge 60 ] || delay=60
+    [ "$delay" -le 900 ] || delay=900
+    # Persist before ENABLE so an immediate worker failure is throttled too.
+    printf '%s %s %s\n' "$position" "$delay" "$((now + delay))" > "$retry_file"
+    admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -c "ALTER SUBSCRIPTION $SUBSCRIPTION ENABLE;" \
+        || { alert warn "could not re-enable '$SUBSCRIPTION'; retry backoff ${delay}s"; exit 1; }
+    alert info "re-enabled disabled subscription '$SUBSCRIPTION' at $position; unchanged-position retry backoff ${delay}s (maintenance flag pauses recovery)"
+    exit 0
 fi
 
 # Healable drift confirmed → heal.
@@ -478,6 +503,7 @@ if [ -n "$unhealed" ]; then
 fi
 
 log "re-enabling subscription '$SUBSCRIPTION'"
+rm -f "$HEAL_STATE_DIR/retry-$SUBSCRIPTION"
 admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -c "ALTER SUBSCRIPTION $SUBSCRIPTION ENABLE;"
 
 # A table we just created is in the publication but not yet in this

@@ -17,7 +17,7 @@
 # whenever it alerts, and metrics must keep flowing exactly then.
 #
 # Env: REMOTE_HOST, REMOTE_USER, REMOTE_DB, LOCAL_DB, PUBLICATION, SUBSCRIPTION,
-# PGPASSFILE, HEAL_ALERT_CMD (baked into the schedule), HEAL_INTERVAL_MIN (=5),
+# PGPASSFILE, HEAL_ALERT_CMD (baked into the schedule), HEAL_INTERVAL_MIN (=1),
 # TEXTFILE_INTERVAL_MIN (=1), HOST_MON_TEXTFILE_DIR (=/var/lib/host-mon/textfile),
 # REPLICA_TEXTFILE (=true; 'false' skips the metrics timer).
 
@@ -38,7 +38,7 @@ case "$TEXTFILE_INTERVAL_MIN" in *[!0-9]*|'') echo "install-heal: TEXTFILE_INTER
 [ "$TEXTFILE_INTERVAL_MIN" -ge 1 ] && [ "$TEXTFILE_INTERVAL_MIN" -le 59 ] \
     || { echo "install-heal: TEXTFILE_INTERVAL_MIN must be 1-59, got '$TEXTFILE_INTERVAL_MIN'" >&2; exit 1; }
 
-INTERVAL_MIN="${HEAL_INTERVAL_MIN:-5}"
+INTERVAL_MIN="${HEAL_INTERVAL_MIN:-1}"
 case "$INTERVAL_MIN" in *[!0-9]*|'') echo "install-heal: HEAL_INTERVAL_MIN must be an integer" >&2; exit 1 ;; esac
 [ "$INTERVAL_MIN" -ge 1 ] && [ "$INTERVAL_MIN" -le 59 ] \
     || { echo "install-heal: HEAL_INTERVAL_MIN must be 1-59, got '$INTERVAL_MIN'" >&2; exit 1; }
@@ -105,15 +105,29 @@ install_systemd() {
     ensure_pg_readable_pgpass
     envlines=$(heal_env | sed 's/^/Environment=/')
 
+    # PostgreSQL's packaged unit may have no restart policy. Recover from a
+    # killed postmaster or transient startup failure without waiting for a
+    # person; the mount prerequisites in the existing unit still apply.
+    as_root mkdir -p "$unit_dir/postgresql.service.d" || return 1
+    cat <<'EOF' | as_root tee "$unit_dir/postgresql.service.d/replica-recovery.conf" >/dev/null || return 1
+[Unit]
+StartLimitIntervalSec=0
+
+[Service]
+Restart=on-failure
+RestartSec=10s
+EOF
+
     svc_body=$(cat <<EOF
 [Unit]
-Description=hopper logical-replica schema-drift self-heal
-After=postgresql.service
-Wants=network-online.target
+Description=hopper logical-replica recovery and schema self-heal
+After=postgresql.service network-online.target
+Wants=postgresql.service network-online.target
 
 [Service]
 Type=oneshot
 User=postgres
+TimeoutStartSec=120s
 ExecStart=$HEAL
 $envlines
 EOF

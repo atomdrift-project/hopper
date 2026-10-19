@@ -86,11 +86,14 @@ log "replication health gate (max applied-data age: ${MAX_LAG_S}s)"
 HEALTH=$(PGCONNECT_TIMEOUT=5 psql -h 127.0.0.1 -U hopper -d hopper -tA <<'SQL'
 SELECT
   (SELECT count(*) FROM pg_subscription WHERE subenabled) AS enabled_subs,
-  (SELECT count(*) FROM pg_stat_subscription WHERE pid IS NOT NULL) AS apply_workers,
+  (SELECT count(*) FROM pg_stat_subscription
+    WHERE worker_type = 'apply' AND relid IS NULL AND pid IS NOT NULL) AS apply_workers,
   COALESCE((SELECT round(extract(epoch FROM now() -
       COALESCE(latest_end_time, last_msg_receipt_time)))::bigint
-      FROM pg_stat_subscription WHERE pid IS NOT NULL
-      ORDER BY 1 DESC LIMIT 1), -1) AS applied_age_s,
+      FROM pg_stat_subscription
+     WHERE worker_type = 'apply' AND relid IS NULL AND pid IS NOT NULL
+     ORDER BY COALESCE(latest_end_time, last_msg_receipt_time) DESC NULLS LAST
+     LIMIT 1), -1) AS applied_age_s,
   (SELECT count(*) FROM pg_subscription_rel WHERE srsubstate <> 'r') AS tables_syncing
 SQL
 ) || die "health gate: cannot query the local replica database"
