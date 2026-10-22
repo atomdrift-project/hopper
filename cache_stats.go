@@ -8,16 +8,16 @@ import (
 // CacheStats describes one lookup cache. Served includes coalesced misses;
 // Loaded counts database loads. Memory is an estimate, not process RSS.
 type CacheStats struct {
+	MemorySampledAt   time.Time
 	Name              string
 	Entries, Capacity int
 	Served, Loaded    uint64
 	MemoryBytes       uint64
-	MemorySampledAt   time.Time
 }
 
 type cacheMemorySnapshot struct {
-	sampleBytes, recordBytes uint64
 	sampleAt, recordAt       time.Time
+	sampleBytes, recordBytes uint64
 }
 
 // CacheStatistics never waits for a cache lock. Memory traversal runs at most
@@ -77,7 +77,12 @@ func sampleCacheBytes(key string, s *Sample) uint64 {
 		return n
 	}
 	n += uint64(unsafe.Sizeof(*s))
-	for _, v := range []string{s.PURLBase, s.Elements, s.Package, s.RegistryTitle, s.RegistryDescription, s.TopTraits, s.SHA256, s.Filename, s.FileType, s.Label, s.LabelSource, s.Path, s.Status, s.Note, s.CanonicalSHA256, s.Parent, s.LocationRel, s.Skip, s.Formula, s.Version, s.TraitsVersion, s.Domain, s.URL, s.Ecosystem, s.Feed, s.Source, s.TraitGraph} {
+	for _, v := range []string{
+		s.PURLBase, s.Elements, s.Package, s.RegistryTitle, s.RegistryDescription, s.TopTraits,
+		s.SHA256, s.Filename, s.FileType, s.Label, s.LabelSource, s.Path, s.Status, s.Note,
+		s.CanonicalSHA256, s.Parent, s.LocationRel, s.Skip, s.Formula, s.Version, s.TraitsVersion,
+		s.Domain, s.URL, s.Ecosystem, s.Feed, s.Source, s.TraitGraph,
+	} {
 		n += uint64(len(v))
 	}
 	for _, v := range [][]byte{s.CleaveResult, s.LitmusResult, s.LLMResult, s.Provenance} {

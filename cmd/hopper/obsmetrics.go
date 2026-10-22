@@ -485,8 +485,11 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 			"Maximum sample lookup entries the in-process pool will hold.", "{entry}"),
 		lookupCacheEntries:  gauge("hopper.cache.entries", "Live lookup cache entries, by cache.", "{entry}"),
 		lookupCacheCapacity: gauge("hopper.cache.capacity", "Lookup cache capacity, by cache.", "{entry}"),
-		lookupCacheRequests: counter("hopper.cache.requests", "Lookup requests served without a database load (including coalesced misses), or loaded from the database.", "{request}"),
-		lookupCacheMemory:   gauge("hopper.cache.memory.estimated", "Estimated retained cache bytes, including expired and pending eviction entries; excludes allocator and xsync overhead and in-flight loads.", "By"),
+		lookupCacheRequests: counter("hopper.cache.requests",
+			"Lookup requests served without a database load (including coalesced misses), or loaded from the database.", "{request}"),
+		lookupCacheMemory: gauge("hopper.cache.memory.estimated",
+			"Estimated retained cache bytes, including expired and pending eviction entries; "+
+				"excludes allocator and xsync overhead and in-flight loads.", "By"),
 		lookupCacheMemoryAt: gauge("hopper.cache.memory.sampled_at", "Unix time of the last successful cache memory estimate.", "s"),
 		// Whether a publisher's ranking actually landed is otherwise only
 		// visible from the publisher's own side, which reports what it sent
@@ -747,8 +750,10 @@ func observeLookupCaches(o metric.Observer, in *instruments, caches []hopper.Cac
 		attrs := metric.WithAttributes(attribute.String("cache", c.Name))
 		o.ObserveInt64(in.lookupCacheEntries, int64(c.Entries), attrs)
 		o.ObserveInt64(in.lookupCacheCapacity, int64(c.Capacity), attrs)
-		o.ObserveInt64(in.lookupCacheRequests, clampCount(c.Served), metric.WithAttributes(attribute.String("cache", c.Name), attribute.String("source", "cache")))
-		o.ObserveInt64(in.lookupCacheRequests, clampCount(c.Loaded), metric.WithAttributes(attribute.String("cache", c.Name), attribute.String("source", "database")))
+		o.ObserveInt64(in.lookupCacheRequests, clampCount(c.Served),
+			metric.WithAttributes(attribute.String("cache", c.Name), attribute.String("source", "cache")))
+		o.ObserveInt64(in.lookupCacheRequests, clampCount(c.Loaded),
+			metric.WithAttributes(attribute.String("cache", c.Name), attribute.String("source", "database")))
 		if !c.MemorySampledAt.IsZero() {
 			o.ObserveInt64(in.lookupCacheMemory, clampCount(c.MemoryBytes), attrs)
 			o.ObserveInt64(in.lookupCacheMemoryAt, c.MemorySampledAt.Unix(), attrs)

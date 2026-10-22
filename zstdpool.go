@@ -32,8 +32,8 @@ var zstdDecoderPool sync.Pool
 // the library's rule that only one stream may be decoded per decoder at a time.
 // Callers must not use the reader after releasing it.
 func BorrowZstdReader(r io.Reader) (io.Reader, func(), error) {
-	dec, _ := zstdDecoderPool.Get().(*zstd.Decoder)
-	if dec == nil {
+	dec, ok := zstdDecoderPool.Get().(*zstd.Decoder)
+	if !ok || dec == nil {
 		var err error
 		dec, err = zstd.NewReader(nil, zstd.WithDecoderLowmem(true), zstd.WithDecoderConcurrency(1))
 		if err != nil {

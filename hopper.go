@@ -733,23 +733,23 @@ var ErrNotFound = errors.New("hopper: not found")
 // DB is a connection to the sample registry.
 // Backed by either PostgreSQL (pool) or SQLite (lite).
 type DB struct {
-	pool                  *pgxpool.Pool
-	lite                  *sql.DB
-	lookup                *fido.Cache[string, *Sample]
-	records               *fido.Cache[string, *cachedRecord]
-	recordKeys            *recordIndex
-	cacheMemory           atomic.Pointer[cacheMemorySnapshot]
-	cacheMemoryRefreshing atomic.Bool
-	cacheMemoryAttempt    atomic.Int64
-	backfillProgress      atomic.Pointer[BackfillProgressFn]
+	pool             *pgxpool.Pool
+	lite             *sql.DB
+	lookup           *fido.Cache[string, *Sample]
+	records          *fido.Cache[string, *cachedRecord]
+	recordKeys       *recordIndex
+	cacheMemory      atomic.Pointer[cacheMemorySnapshot]
+	backfillProgress atomic.Pointer[BackfillProgressFn]
 	// app is a string, so it ends the GC's pointer-scan region rather than
 	// sitting in the middle of it: its length word is the first eight bytes
 	// the collector no longer has to walk. Hence last of the pointer-bearing
 	// fields, ahead of the pointer-free counters.
-	app                 AppName
-	lookupCounts        lookupCounters
-	recordCounts        recordCounters
-	corroborationCounts corroborationCounters
+	app                   AppName
+	lookupCounts          lookupCounters
+	recordCounts          recordCounters
+	corroborationCounts   corroborationCounters
+	cacheMemoryAttempt    atomic.Int64
+	cacheMemoryRefreshing atomic.Bool
 	// replicaIndexPolicy makes migrations decline secondary indexes a logical
 	// replica does not need. See SetReplicaIndexPolicy.
 	replicaIndexPolicy bool
@@ -823,7 +823,9 @@ type Sample struct {
 	URL           string
 	Ecosystem     string
 	Feed          string
-	Source        string
+	// Source is the original producer recorded when this sample was inserted.
+	// Result refreshes and re-observations preserve it.
+	Source string
 	// TraitGraph is the sample's trait dependency graph, capped and stored as
 	// JSON []TraitNode (samples.trait_graph). It rides in the feed projection
 	// so a feed row can draw the same picture the detail page draws, without
@@ -903,8 +905,9 @@ func (s *Sample) scrubNULs() {
 // single sha256 can have many locations — the same jQuery.min.js shows up
 // in thousands of npm packages, the same stub in many droppers — so path /
 // source / feed / parent are per-observation, not per-content. The row is
-// upsert-keyed on (sha256, path): re-observing the same pair refreshes mtime
-// and any field that actually changed, and writes nothing when nothing did.
+// upsert-keyed on (sha256, path): re-observing the same pair preserves its
+// original source, refreshes mutable metadata, and writes nothing when nothing
+// changed. A missing source can be filled by a later observation.
 //
 // LastSeenAt is no longer maintained — it is set once on insert and never
 // bumped. Re-stamping it on every walk rewrote nearly the whole table each
@@ -3355,8 +3358,10 @@ func (db *DB) SampleBySHA256(ctx context.Context, sha256 string) (*Sample, error
 	return db.lookupSampleBySHA256(ctx, sha256)
 }
 
-// SampleByPURL returns the newest analyzed top-level sample for a package
-// identity. base is the version-less canonical PURL (samples.purl_base);
+// SampleByPURL returns the most critical analyzed payload for a package version,
+// or the newest analyzed payload when no version is supplied. The lowest level
+// above -1 wins, then clean, then missing levels; ties prefer the newest analysis.
+// base is the version-less canonical PURL (samples.purl_base);
 // version, when non-empty, pins samples.version. This is the point lookup
 // behind GET /api/sample?purl= — not the prism feed. Returns ErrNotFound
 // when nothing matches.
@@ -4097,10 +4102,7 @@ func (db *DB) StoreResult(
 	} else {
 		stats, err = db.storeResultSQLite(ctx, sha256, cleaveRaw, litmusML, llm, p, traitsVersion, by)
 	}
-	if err == nil {
-		db.forgetSHA(sha256)
-	}
-	return stats, err
+	return stats, db.writeAnalysis(ctx, sha256, err)
 }
 
 // AnalysisAttribution reads back who produced sample sha256's stored verdict
@@ -4156,9 +4158,9 @@ func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []by
 	}
 	result = compactCleaveResultForStorage(result)
 	if db.pool != nil {
-		return db.writeSHA(sha256, db.updateCleaveResultPG(ctx, sha256, result, p.CanonicalSHA, p.FileInfo, traitsVersion))
+		return db.writeAnalysis(ctx, sha256, db.updateCleaveResultPG(ctx, sha256, result, p.CanonicalSHA, p.FileInfo, traitsVersion))
 	}
-	return db.writeSHA(sha256, db.updateCleaveResultSQLite(ctx, sha256, result, p.CanonicalSHA, p.FileInfo, traitsVersion))
+	return db.writeAnalysis(ctx, sha256, db.updateCleaveResultSQLite(ctx, sha256, result, p.CanonicalSHA, p.FileInfo, traitsVersion))
 }
 
 // UpdateLitmusResult stores the litmus classification envelope for a sample.
@@ -4167,9 +4169,9 @@ func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []by
 // the new envelope — no separate score parameter needed.
 func (db *DB) UpdateLitmusResult(ctx context.Context, sha256 string, result []byte) error {
 	if db.pool != nil {
-		return db.writeSHA(sha256, db.updateLitmusResultPG(ctx, sha256, result))
+		return db.writeAnalysis(ctx, sha256, db.updateLitmusResultPG(ctx, sha256, result))
 	}
-	return db.writeSHA(sha256, db.updateLitmusResultSQLite(ctx, sha256, result))
+	return db.writeAnalysis(ctx, sha256, db.updateLitmusResultSQLite(ctx, sha256, result))
 }
 
 // UpdateLLMResult stores the optional LLM interpretation (envelope `llm`) for a

@@ -162,6 +162,7 @@ func (s *apiServer) handleV1LookupBatch(w http.ResponseWriter, r *http.Request, 
 		case !record.Analyzed:
 			unanalyzed++
 			continue
+		default:
 		}
 		found++
 		out = append(out, withPURL(record, asked))

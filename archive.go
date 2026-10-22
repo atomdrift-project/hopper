@@ -179,7 +179,7 @@ func Split(envelope []byte) (parent []byte, leaves []Leaf, err error) {
 		raw.files[i] = mustMarshal(pick(entry, refKeys))
 	}
 
-	parentEnv, merr := marshalEnvelope(top, "raw", raw)
+	parentEnv, merr := marshalEnvelope(top, raw)
 	if merr != nil {
 		return nil, nil, merr
 	}
@@ -222,7 +222,7 @@ func splitParentOnly(envelope []byte) (parent []byte, members int, err error) {
 		members++
 	}
 
-	parent, err = marshalEnvelope(top, "raw", raw)
+	parent, err = marshalEnvelope(top, raw)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -266,7 +266,7 @@ func Join(parent []byte, lookup func(sha string) (envelope []byte, ok bool)) ([]
 		raw.files[i] = restored
 	}
 
-	return marshalEnvelope(top, "raw", raw)
+	return marshalEnvelope(top, raw)
 }
 
 // buildLeaf assembles a member's standalone envelope: each section's metadata
@@ -459,7 +459,7 @@ func intField(entry map[string]json.RawMessage, key string) (int, bool) {
 // The obvious spelling nests three marshals:
 //
 //	sec.obj[sec.key] = mustMarshal(sec.files)
-//	top[name]        = mustMarshal(sec.obj)
+//	top["raw"]       = mustMarshal(sec.obj)
 //	return mustMarshal(top)
 //
 // which serialises the same bytes three times. encoding/json compacts every
@@ -473,7 +473,7 @@ func intField(entry map[string]json.RawMessage, key string) (int, bool) {
 // map[string]any as for map[string]json.RawMessage, and compaction is
 // idempotent, so collapsing three passes into one cannot change the result.
 // TestMarshalEnvelopeMatchesNestedMarshal pins that equivalence.
-func marshalEnvelope(top map[string]json.RawMessage, name string, sec fileSection) ([]byte, error) {
+func marshalEnvelope(top map[string]json.RawMessage, sec fileSection) ([]byte, error) {
 	secObj := make(map[string]any, len(sec.obj)+1)
 	for k, v := range sec.obj {
 		secObj[k] = v
@@ -484,7 +484,7 @@ func marshalEnvelope(top map[string]json.RawMessage, name string, sec fileSectio
 	for k, v := range top {
 		out[k] = v
 	}
-	out[name] = secObj
+	out["raw"] = secObj
 
 	b, err := json.Marshal(out)
 	if err != nil {

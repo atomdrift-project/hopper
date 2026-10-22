@@ -2,6 +2,7 @@ package hopper
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"slices"
 	"strings"
@@ -69,7 +70,7 @@ func checkRecordProjection(t *testing.T, db *DB) {
 	if want, got := recordOf(full), recordOf(light); !reflect.DeepEqual(want, got) {
 		t.Errorf("purl: projection renders %+v, full row renders %+v", got, want)
 	}
-	if _, err := db.recordSampleByPURL(ctx, "pkg:npm/proj", "9.9.9"); err != ErrNotFound {
+	if _, err := db.recordSampleByPURL(ctx, "pkg:npm/proj", "9.9.9"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("unknown version: err = %v, want ErrNotFound", err)
 	}
 }

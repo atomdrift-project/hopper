@@ -260,11 +260,10 @@ func (db *DB) forgetSample(s *Sample) {
 		return
 	}
 	db.forgetSHA(s.SHA256)
-	if db.lookup == nil || s.PURLBase == "" {
-		return
+	if s.PURLBase != "" {
+		db.forget(lookupPURLKey(s.PURLBase, s.Version))
+		db.forget(lookupPURLKey(s.PURLBase, ""))
 	}
-	db.lookup.Delete(lookupPURLKey(s.PURLBase, s.Version))
-	db.lookup.Delete(lookupPURLKey(s.PURLBase, ""))
 }
 
 func (db *DB) forgetSamples(samples []*Sample) {
@@ -305,6 +304,28 @@ func (db *DB) flushLookups() {
 	if n := db.lookup.Flush(); n > 0 {
 		slog.Debug("lookup cache flushed", "entries", n)
 	}
+}
+
+// writeAnalysis invalidates a release's cached choice when any of its payloads
+// changes, including a sibling that was not the previously selected digest.
+func (db *DB) writeAnalysis(ctx context.Context, sha string, err error) error {
+	if err != nil {
+		return err
+	}
+	s := &Sample{SHA256: sha}
+	const query = `SELECT purl_base, version FROM samples WHERE sha256 = `
+	if db.pool != nil {
+		err = db.pool.QueryRow(ctx, query+`$1`, sha).Scan(&s.PURLBase, &s.Version)
+	} else {
+		err = db.lite.QueryRowContext(ctx, query+`?`, sha).Scan(&s.PURLBase, &s.Version)
+	}
+	if err != nil {
+		db.forgetSHA(sha)
+		slog.WarnContext(ctx, "cannot invalidate package lookup after analysis", "sha256", sha, "error", err)
+		return nil
+	}
+	db.forgetSample(s)
+	return nil
 }
 
 func (db *DB) writeSHA(sha string, err error) error {

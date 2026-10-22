@@ -1654,8 +1654,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		}
 	}
 
-	var traitsVersion string
-	api.SetTraitsVersion(traitsVersion)
+	api.SetTraitsVersion("")
 	api.rescanAge = *rescanAge
 
 	// Build deferred indexes in the background now that the API is serving.
@@ -1707,7 +1706,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		"next", "load samples")
 
 	total := loadAll(loadCtx, loadCancel, db, litmus, tracker, api, cache,
-		loadDirs, fileChs, *source, *hashWorkers, *rescan, *maxAnalyzed, *experimentTag, wd, traitsVersion, *rescanAge, *pauseWalk, *forceWalk)
+		loadDirs, fileChs, *source, *hashWorkers, *rescan, *maxAnalyzed, *experimentTag, wd, *rescanAge, *pauseWalk, *forceWalk)
 	if *reportsDir != "" {
 		wd.beginStage("reports.ingest", "Ingesting reports")
 		stats, err := db.IngestReportsDir(ctx, *reportsDir, "re", "cyclotron")
@@ -2174,7 +2173,6 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	maxAnalyzed int,
 	experimentTag string,
 	wd *webDashboard,
-	traitsVersion string,
 	rescanAge time.Duration,
 	pauseWalk bool,
 	forceWalk bool,
@@ -2240,7 +2238,7 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 				}
 			}()
 		}
-		wd.configure(&progress, litmus, tracker, api, db, start, maxAnalyzed, len(dirs), traitsVersion, rescanAge, metrics)
+		wd.configure(&progress, litmus, tracker, api, db, start, maxAnalyzed, len(dirs), "", rescanAge, metrics)
 	}
 
 	// Seed the progress denominators carried over from prior runs off the

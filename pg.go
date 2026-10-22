@@ -23,6 +23,13 @@ import (
 	"github.com/atomdrift-project/hopper/pkgparse"
 )
 
+// ServingAppName is the app name of the long-running publisher daemon
+// (`hopper load`), the one consumer sized for real concurrency. It must match
+// what cliAppName produces for that subcommand; TestServingAppNameMatchesCLI
+// in cmd/hopper fails if the two ever drift apart again — which is exactly how
+// this branch went dead the first time.
+const ServingAppName AppName = "hopper-load"
+
 // poolSize returns the connection budget for one consumer of the database.
 //
 // One connection for everybody except the serving API. That is a deliberate
@@ -46,13 +53,6 @@ import (
 // one service is a deploy-time change and needs no rebuild. Getting this wrong
 // now costs latency in one service; getting it wrong the old way cost everyone
 // the ability to connect.
-// ServingAppName is the app name of the long-running publisher daemon
-// (`hopper load`), the one consumer sized for real concurrency. It must match
-// what cliAppName produces for that subcommand; TestServingAppNameMatchesCLI
-// in cmd/hopper fails if the two ever drift apart again — which is exactly how
-// this branch went dead the first time.
-const ServingAppName AppName = "hopper-load"
-
 func poolSize(app AppName) (maxConns, minConns int32) {
 	// "hopper-load", not "hopper": every CLI app name is built as
 	// "hopper-<subcommand>" (see cliAppName), so the serving daemon identifies
@@ -3084,7 +3084,7 @@ func (db *DB) insertSampleNewPG(ctx context.Context, sample *Sample) (bool, erro
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 			ON CONFLICT (sha256, path) DO UPDATE SET
 				rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
-				source = CASE WHEN EXCLUDED.source <> '' THEN EXCLUDED.source ELSE sample_locations.source END,
+				source = CASE WHEN sample_locations.source = '' THEN EXCLUDED.source ELSE sample_locations.source END,
 				feed = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE sample_locations.feed END,
 				ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE sample_locations.ecosystem END,
 				mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)`+locationChangedPG,
@@ -3399,9 +3399,10 @@ func sampleStagingRows(samples []*Sample) [][]any {
 //
 // Keep the predicate aligned with the SET list it guards — a field that is set
 // but not tested here would silently stop being refreshed.
+// Source records the original producer: only fill it when previously unknown.
 const locationChangedPG = `
 	WHERE (EXCLUDED.rel <> ''       AND EXCLUDED.rel       IS DISTINCT FROM sample_locations.rel)
-	   OR (EXCLUDED.source <> ''    AND EXCLUDED.source    IS DISTINCT FROM sample_locations.source)
+	   OR (sample_locations.source = '' AND EXCLUDED.source <> '')
 	   OR (EXCLUDED.feed <> ''      AND EXCLUDED.feed      IS DISTINCT FROM sample_locations.feed)
 	   OR (EXCLUDED.ecosystem <> '' AND EXCLUDED.ecosystem IS DISTINCT FROM sample_locations.ecosystem)
 	   OR (EXCLUDED.mtime IS NOT NULL AND EXCLUDED.mtime IS DISTINCT FROM sample_locations.mtime)`
@@ -3419,7 +3420,7 @@ const locationsFromStagingPG = `
 	 WHERE path <> ''
 	ON CONFLICT (sha256, path) DO UPDATE SET
 		rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
-		source = CASE WHEN EXCLUDED.source <> '' THEN EXCLUDED.source ELSE sample_locations.source END,
+		source = CASE WHEN sample_locations.source = '' THEN EXCLUDED.source ELSE sample_locations.source END,
 		feed = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE sample_locations.feed END,
 		ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE sample_locations.ecosystem END,
 		mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)` + locationChangedPG
@@ -4157,7 +4158,7 @@ func (db *DB) sampleByPURLPG(ctx context.Context, base, version string) (*Sample
 		query += ` AND version = $2`
 		args = append(args, version)
 	}
-	query += ` ORDER BY analyzed_at DESC NULLS LAST LIMIT 1`
+	query += purlLookupOrder(version, true)
 	rows, err := db.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: sample purl %s@%s: %w", base, version, err)
@@ -4493,11 +4494,11 @@ func (db *DB) upsertLocationBatchPG(ctx context.Context, locs []*SampleLocation)
 			$5::text[], $6::text[], $7::text[], $8::text[])
 		ON CONFLICT (sha256, path) DO UPDATE SET
 			rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
-			source = CASE WHEN EXCLUDED.source <> '' THEN EXCLUDED.source ELSE sample_locations.source END,
+			source = CASE WHEN sample_locations.source = '' THEN EXCLUDED.source ELSE sample_locations.source END,
 			feed = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE sample_locations.feed END,
 			ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE sample_locations.ecosystem END
 		WHERE (EXCLUDED.rel <> ''       AND EXCLUDED.rel       IS DISTINCT FROM sample_locations.rel)
-		   OR (EXCLUDED.source <> ''    AND EXCLUDED.source    IS DISTINCT FROM sample_locations.source)
+		   OR (sample_locations.source = '' AND EXCLUDED.source <> '')
 		   OR (EXCLUDED.feed <> ''      AND EXCLUDED.feed      IS DISTINCT FROM sample_locations.feed)
 		   OR (EXCLUDED.ecosystem <> '' AND EXCLUDED.ecosystem IS DISTINCT FROM sample_locations.ecosystem)`,
 		sha, path, parent, rel, filename, source, feed, eco)

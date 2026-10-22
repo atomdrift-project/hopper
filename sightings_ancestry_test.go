@@ -17,9 +17,9 @@ func TestSightingsInAncestryChecksAlternateParentsAndGrandparents(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
-	clear, err := db.SightingsInAncestry(t.Context(), root)
-	if err != nil || !clear.Checked || len(clear.Sightings) != 0 {
-		t.Fatalf("clear cyclic ancestry = %+v, %v", clear, err)
+	checked, err := db.SightingsInAncestry(t.Context(), root)
+	if err != nil || !checked.Checked || len(checked.Sightings) != 0 {
+		t.Fatalf("clear cyclic ancestry = %+v, %v", checked, err)
 	}
 	addSightings(t, db, Sighting{Source: "triage", Subject: grand, Claim: ClaimMalicious})
 	blocked, err := db.SightingsInAncestry(t.Context(), root)
@@ -40,9 +40,9 @@ func TestSightingsInAncestryHonorsPackageVersionsAndPrimaryParent(t *testing.T) 
 		t.Fatal(err)
 	}
 	addSightings(t, db, Sighting{Source: "osv", Subject: "pkg:npm/example", Affected: "1.0", Claim: ClaimMalicious})
-	clear, err := db.SightingsInAncestry(t.Context(), root)
-	if err != nil || len(clear.Sightings) != 0 {
-		t.Fatalf("unaffected parent release = %+v, %v", clear, err)
+	checked, err := db.SightingsInAncestry(t.Context(), root)
+	if err != nil || len(checked.Sightings) != 0 {
+		t.Fatalf("unaffected parent release = %+v, %v", checked, err)
 	}
 	addSightings(t, db, Sighting{Source: "osv", Subject: "pkg:npm/example", Affected: "*", Claim: ClaimMalicious})
 	blocked, err := db.SightingsInAncestry(t.Context(), root)

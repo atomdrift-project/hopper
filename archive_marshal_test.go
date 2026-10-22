@@ -1,7 +1,9 @@
 package hopper
 
 import (
+	"bytes"
 	"encoding/json"
+	"maps"
 	"testing"
 )
 
@@ -9,14 +11,10 @@ import (
 // exists only so the test can assert the two produce identical bytes.
 func nestedMarshalEnvelope(top map[string]json.RawMessage, name string, sec fileSection) []byte {
 	obj := make(map[string]json.RawMessage, len(sec.obj)+1)
-	for k, v := range sec.obj {
-		obj[k] = v
-	}
+	maps.Copy(obj, sec.obj)
 	obj[sec.key] = mustMarshal(sec.files)
 	t2 := make(map[string]json.RawMessage, len(top))
-	for k, v := range top {
-		t2[k] = v
-	}
+	maps.Copy(t2, top)
 	t2[name] = mustMarshal(obj)
 	return mustMarshal(t2)
 }
@@ -91,11 +89,11 @@ func TestMarshalEnvelopeMatchesNestedMarshal(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			want := nestedMarshalEnvelope(tc.top, "raw", tc.sec)
-			got, err := marshalEnvelope(tc.top, "raw", tc.sec)
+			got, err := marshalEnvelope(tc.top, tc.sec)
 			if err != nil {
 				t.Fatalf("marshalEnvelope: %v", err)
 			}
-			if string(got) != string(want) {
+			if !bytes.Equal(got, want) {
 				t.Errorf("single-pass output differs:\n got: %s\nwant: %s", got, want)
 			}
 		})
@@ -114,9 +112,7 @@ func TestMarshalSectionMatchesNestedMarshal(t *testing.T) {
 	}
 
 	t2 := make(map[string]json.RawMessage, len(top))
-	for k, v := range top {
-		t2[k] = v
-	}
+	maps.Copy(t2, top)
 	t2["raw"] = mustMarshal(obj)
 	want := mustMarshal(t2)
 
@@ -124,7 +120,7 @@ func TestMarshalSectionMatchesNestedMarshal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshalSection: %v", err)
 	}
-	if string(got) != string(want) {
+	if !bytes.Equal(got, want) {
 		t.Errorf("differs:\n got: %s\nwant: %s", got, want)
 	}
 }
@@ -157,7 +153,7 @@ func BenchmarkMarshalEnvelopeSinglePass(b *testing.B) {
 	top, sec := benchSection(2000)
 	b.ReportAllocs()
 	for b.Loop() {
-		if _, err := marshalEnvelope(top, "raw", sec); err != nil {
+		if _, err := marshalEnvelope(top, sec); err != nil {
 			b.Fatal(err)
 		}
 	}

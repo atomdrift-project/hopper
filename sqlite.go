@@ -1342,7 +1342,7 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256, path) DO UPDATE SET
 				rel = CASE WHEN excluded.rel != '' THEN excluded.rel ELSE sample_locations.rel END,
-				source = CASE WHEN excluded.source != '' THEN excluded.source ELSE sample_locations.source END,
+				source = CASE WHEN sample_locations.source = '' THEN excluded.source ELSE sample_locations.source END,
 				feed = CASE WHEN excluded.feed != '' THEN excluded.feed ELSE sample_locations.feed END,
 				ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE sample_locations.ecosystem END,
 				mtime = COALESCE(excluded.mtime, sample_locations.mtime)`+locationChangedSQLite,
@@ -1479,7 +1479,7 @@ func insertBatchSamplesSQLite(ctx context.Context, tx *sql.Tx, samples []*Sample
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256, path) DO UPDATE SET
 			rel = CASE WHEN excluded.rel != '' THEN excluded.rel ELSE sample_locations.rel END,
-			source = CASE WHEN excluded.source != '' THEN excluded.source ELSE sample_locations.source END,
+			source = CASE WHEN sample_locations.source = '' THEN excluded.source ELSE sample_locations.source END,
 			feed = CASE WHEN excluded.feed != '' THEN excluded.feed ELSE sample_locations.feed END,
 			ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE sample_locations.ecosystem END,
 			mtime = COALESCE(excluded.mtime, sample_locations.mtime)`+locationChangedSQLite)
@@ -1690,7 +1690,7 @@ func (db *DB) sampleByPURLSQLite(ctx context.Context, base, version string) (*Sa
 		query += ` AND version = ?`
 		args = append(args, version)
 	}
-	query += ` ORDER BY analyzed_at DESC LIMIT 1`
+	query += purlLookupOrder(version, false)
 	rows, err := db.lite.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: sample purl %s@%s: %w", base, version, err)
@@ -1958,10 +1958,11 @@ func scanLiteRetiredLocation(row interface{ Scan(...any) error }) (*RetiredSampl
 // null-safe inequality, i.e. Postgres's IS DISTINCT FROM. Keep the predicate
 // aligned with the SET list it guards. locationChangedRelMtimeSQLite is the
 // narrower form for the two sites that only refresh rel and mtime.
+// Source records the original producer: only fill it when previously unknown.
 const (
 	locationChangedSQLite = `
 		WHERE (excluded.rel != ''       AND excluded.rel       IS NOT sample_locations.rel)
-		   OR (excluded.source != ''    AND excluded.source    IS NOT sample_locations.source)
+		   OR (sample_locations.source = '' AND excluded.source != '')
 		   OR (excluded.feed != ''      AND excluded.feed      IS NOT sample_locations.feed)
 		   OR (excluded.ecosystem != '' AND excluded.ecosystem IS NOT sample_locations.ecosystem)
 		   OR (excluded.mtime IS NOT NULL AND excluded.mtime IS NOT sample_locations.mtime)`
@@ -2001,7 +2002,7 @@ func (db *DB) upsertLocationBatchSQLite(ctx context.Context, locs []*SampleLocat
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sha256, path) DO UPDATE SET
 			rel = CASE WHEN excluded.rel != '' THEN excluded.rel ELSE sample_locations.rel END,
-			source = CASE WHEN excluded.source != '' THEN excluded.source ELSE sample_locations.source END,
+			source = CASE WHEN sample_locations.source = '' THEN excluded.source ELSE sample_locations.source END,
 			feed = CASE WHEN excluded.feed != '' THEN excluded.feed ELSE sample_locations.feed END,
 			ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE sample_locations.ecosystem END,
 			mtime = COALESCE(excluded.mtime, sample_locations.mtime)` + locationChangedSQLite

@@ -61,8 +61,8 @@ const MaxJSONSizeHint = 64 << 20 // 64 MiB
 //
 // hint <= 0 means unknown, and the buffer grows as it would have.
 func DecodeJSONFromSize(r io.Reader, hint int64, v any) error {
-	buf, _ := jsonBufPool.Get().(*bytes.Buffer)
-	if buf == nil {
+	buf, ok := jsonBufPool.Get().(*bytes.Buffer)
+	if !ok || buf == nil {
 		buf = new(bytes.Buffer)
 	}
 	buf.Reset()
@@ -83,8 +83,5 @@ func DecodeJSONFromSize(r io.Reader, hint int64, v any) error {
 	if _, err := buf.ReadFrom(r); err != nil {
 		return fmt.Errorf("read JSON: %w", err)
 	}
-	if err := json.Unmarshal(buf.Bytes(), v); err != nil {
-		return err
-	}
-	return nil
+	return json.Unmarshal(buf.Bytes(), v)
 }

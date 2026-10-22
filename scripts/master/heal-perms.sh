@@ -131,11 +131,11 @@ drop_benign() {
 # 1. Group ownership: any entry not already in the samples group (whole tree,
 #    upload shards included). -h regroups a stray symlink as the link itself
 #    rather than following it to its target.
-grp_out=$(find "$DATA_DIR" 2>>"$ERR_SPOOL" -path "$EXCLUDE" -prune -o ! -group "$GROUP" -print0 \
+grp_out=$(find "$DATA_DIR" -path "$EXCLUDE" -prune -o ! -group "$GROUP" -print0 2>>"$ERR_SPOOL" \
     | xargs -0 -r -n 4096 chgrp "$CHANGE_FLAG" -h "$GROUP" 2>>"$ERR_SPOOL") || true
 
 # 2. Directories not already exactly 2775 (setgid + group-writable), whole tree.
-dir_out=$(find "$DATA_DIR" 2>>"$ERR_SPOOL" -path "$EXCLUDE" -prune -o -type d ! -perm 2775 -print0 \
+dir_out=$(find "$DATA_DIR" -path "$EXCLUDE" -prune -o -type d ! -perm 2775 -print0 2>>"$ERR_SPOOL" \
     | xargs -0 -r -n 2048 chmod "$CHANGE_FLAG" 2775 2>>"$ERR_SPOOL") || true
 
 # 3. Regular files outside the upload trees → 0444 (read-only, world-readable).
@@ -148,7 +148,7 @@ for tree in $UPLOAD_DIRS; do
     set -- "$@" -path "$tree"
 done
 set -- "$@" ")"
-file_out=$(find "$DATA_DIR" 2>>"$ERR_SPOOL" "$@" -prune -o -type f ! -perm 0444 -print0 \
+file_out=$(find "$DATA_DIR" "$@" -prune -o -type f ! -perm 0444 -print0 2>>"$ERR_SPOOL" \
     | xargs -0 -r -n 4096 chmod "$CHANGE_FLAG" 0444 2>>"$ERR_SPOOL") || true
 
 # 4. Upload sample files → 0440 (group-private; see header). Walks only the trees
@@ -161,7 +161,7 @@ for tree in $UPLOAD_DIRS; do
 done
 upload_out=""
 if [ "$#" -gt 0 ]; then
-    upload_out=$(find "$@" 2>>"$ERR_SPOOL" -path "$EXCLUDE" -prune -o -type f ! -perm 0440 -print0 \
+    upload_out=$(find "$@" -path "$EXCLUDE" -prune -o -type f ! -perm 0440 -print0 2>>"$ERR_SPOOL" \
         | xargs -0 -r -n 4096 chmod "$CHANGE_FLAG" 0440 2>>"$ERR_SPOOL") || true
 fi
 

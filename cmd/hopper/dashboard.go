@@ -1225,11 +1225,11 @@ const (
 // scrape's critical path and a failed refresh keeps the previous value rather
 // than reporting zero — which the dashboard reads as "nothing is draining".
 type rateSampler struct {
+	started  time.Time
 	db       *hopper.DB
 	mu       sync.Mutex
 	value    hopper.AnalysisRates
 	attempts int
-	started  time.Time
 	running  bool
 }
 
@@ -1254,8 +1254,8 @@ func (rs *rateSampler) get(ctx context.Context) hopper.AnalysisRates {
 	if first {
 		rs.refresh(ctx)
 	} else {
-		//nolint:contextcheck // detached on purpose: outlives the request that noticed it was due
-		go rs.refresh(context.Background())
+		// The refresh has its own timeout and outlives this request.
+		go rs.refresh(context.WithoutCancel(ctx))
 	}
 	rs.mu.Lock()
 	defer rs.mu.Unlock()

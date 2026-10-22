@@ -313,8 +313,8 @@ func (db *DB) forgetRecordsBySHA(shas map[string]struct{}) {
 // it, which amortizes the one sweep a prune costs over a pool's worth of
 // inserts.
 type recordIndex struct {
-	mu    sync.Mutex
 	bySHA map[string]map[string]time.Time
+	mu    sync.Mutex
 	n     int
 	// pruneAt is the entry count that triggers the next prune.
 	pruneAt int
@@ -417,8 +417,25 @@ func (db *DB) recordSampleBySHA256(ctx context.Context, sha256 string) (*Sample,
 	return db.recordSample(ctx, query, sha256)
 }
 
-// recordSampleByPURL loads the record projection for the newest analyzed
-// top-level sample of a package identity: the same rows, predicates and order
+// purlLookupOrder ranks payloads within a version by the lowest firing level.
+// Clean (-1) is a fallback, not a level tighter than zero. Missing levels come
+// last; equal levels prefer the newest analysis, then a stable digest. A
+// versionless lookup retains its existing newest-analysis behavior.
+func purlLookupOrder(version string, postgres bool) string {
+	order := ""
+	if version != "" {
+		level := "lvl"
+		if !postgres {
+			level = litmusLvlSQLite("")
+		}
+		order = `CASE WHEN ` + level + ` > -1 THEN ` + level + ` END ASC NULLS LAST, ` +
+			`CASE WHEN ` + level + ` = -1 THEN 0 ELSE 1 END ASC, `
+	}
+	return ` ORDER BY ` + order + `analyzed_at DESC NULLS LAST, sha256 ASC LIMIT 1`
+}
+
+// recordSampleByPURL loads the record projection for the most critical analyzed
+// payload of a version, or the newest analysis when unversioned: the same order
 // as [DB.SampleByPURL], so the two cannot disagree about which release a PURL
 // names.
 func (db *DB) recordSampleByPURL(ctx context.Context, base, version string) (*Sample, error) {
@@ -436,11 +453,10 @@ func (db *DB) recordSampleByPURL(ctx context.Context, base, version string) (*Sa
 		query += ` AND version = $2`
 		args = append(args, version)
 	}
-	if db.pool != nil {
-		query += ` ORDER BY analyzed_at DESC NULLS LAST LIMIT 1`
-	} else {
-		query = strings.NewReplacer("$1", "?", "$2", "?").Replace(query) + ` ORDER BY analyzed_at DESC LIMIT 1`
+	if db.pool == nil {
+		query = strings.NewReplacer("$1", "?", "$2", "?").Replace(query)
 	}
+	query += purlLookupOrder(version, db.pool != nil)
 	return db.recordSample(ctx, query, args...)
 }
 

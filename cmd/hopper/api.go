@@ -2098,6 +2098,58 @@ func (s *apiServer) recordWorkerError(ctx context.Context, w http.ResponseWriter
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true}) //nolint:errcheck,errchkjson // best-effort response
 }
 
+// decodeResultRequest reads and validates a worker result within the body limits.
+func decodeResultRequest(w http.ResponseWriter, r *http.Request) *resultRequest {
+	// Slow-loris defense: bound how long the (up to maxResultBodyBytes) body may
+	// take to arrive, mirroring handleUpload. Uses the per-request response controller
+	// so it doesn't impose a global ReadTimeout on long-lived /data downloads.
+	// SetReadDeadline returns http.ErrNotSupported under httptest; harmless.
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(resultBodyTimeout)) //nolint:errcheck // optional
+	// Read through a pooled buffer. The previous note here claimed streaming
+	// avoided a duplicate whole-body buffer; it does not. json.Decoder.Decode
+	// on a single top-level value reads until that whole value sits in the
+	// decoder's own buffer, so peak memory matches reading the body outright —
+	// the only difference was that the buffer got there by repeated doubling,
+	// which profiled as the largest JSON allocation site in the process.
+	// See [hopper.DecodeJSONFrom].
+	rb, err := resultBody(r)
+	if err != nil {
+		slog.Warn("result rejected: bad content-encoding",
+			"error", err,
+			"remote", r.RemoteAddr,
+		)
+		http.Error(w, `{"error":"unsupported content-encoding"}`, http.StatusUnsupportedMediaType)
+		return nil
+	}
+	defer rb.cleanup()
+	var req resultRequest
+	if err := hopper.DecodeJSONFromSize(rb.body, rb.sizeHint, &req); err != nil {
+		// An over-limit body is truncated mid-document and fails the decode;
+		// report it as 413 so the worker sees the real cause instead of a
+		// generic "invalid json" 400.
+		if rb.overLimit() {
+			slog.Warn("result rejected: body exceeds size limit",
+				"limit_bytes", int64(maxResultBodyBytes),
+				"remote", r.RemoteAddr,
+			)
+			http.Error(w, `{"error":"result body exceeds size limit"}`, http.StatusRequestEntityTooLarge)
+			return nil
+		}
+		slog.Warn("result rejected: invalid json",
+			"error", err,
+			"remote", r.RemoteAddr,
+		)
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return nil
+	}
+	if !validSHA256(req.SHA256) || !validWorkerName(req.Worker) {
+		slog.Warn("result rejected: invalid fields", "worker", req.Worker, "sha256", req.SHA256)
+		http.Error(w, `{"error":"invalid sha256 or worker"}`, http.StatusBadRequest)
+		return nil
+	}
+	return &req
+}
+
 // handleResult receives an analysis result from a worker.
 func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
@@ -2131,51 +2183,8 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.releaseResult(renewal)
 	phaseStart := time.Now()
-	// Slow-loris defense: bound how long the (up to maxResultBodyBytes) body may
-	// take to arrive, mirroring handleUpload. Uses the per-request response controller
-	// so it doesn't impose a global ReadTimeout on long-lived /data downloads.
-	// SetReadDeadline returns http.ErrNotSupported under httptest; harmless.
-	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(resultBodyTimeout)) //nolint:errcheck // optional
-	// Read through a pooled buffer. The previous note here claimed streaming
-	// avoided a duplicate whole-body buffer; it does not. json.Decoder.Decode
-	// on a single top-level value reads until that whole value sits in the
-	// decoder's own buffer, so peak memory matches reading the body outright —
-	// the only difference was that the buffer got there by repeated doubling,
-	// which profiled as the largest JSON allocation site in the process.
-	// See [hopper.DecodeJSONFrom].
-	rb, err := resultBody(r)
-	if err != nil {
-		slog.Warn("result rejected: bad content-encoding",
-			"error", err,
-			"remote", r.RemoteAddr,
-		)
-		http.Error(w, `{"error":"unsupported content-encoding"}`, http.StatusUnsupportedMediaType)
-		return
-	}
-	defer rb.cleanup()
-	var req resultRequest
-	if err := hopper.DecodeJSONFromSize(rb.body, rb.sizeHint, &req); err != nil {
-		// An over-limit body is truncated mid-document and fails the decode;
-		// report it as 413 so the worker sees the real cause instead of a
-		// generic "invalid json" 400.
-		if rb.overLimit() {
-			slog.Warn("result rejected: body exceeds size limit",
-				"limit_bytes", int64(maxResultBodyBytes),
-				"remote", r.RemoteAddr,
-			)
-			http.Error(w, `{"error":"result body exceeds size limit"}`, http.StatusRequestEntityTooLarge)
-			return
-		}
-		slog.Warn("result rejected: invalid json",
-			"error", err,
-			"remote", r.RemoteAddr,
-		)
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
-		return
-	}
-	if !validSHA256(req.SHA256) || !validWorkerName(req.Worker) {
-		slog.Warn("result rejected: invalid fields", "worker", req.Worker, "sha256", req.SHA256)
-		http.Error(w, `{"error":"invalid sha256 or worker"}`, http.StatusBadRequest)
+	req := decodeResultRequest(w, r)
+	if req == nil {
 		return
 	}
 	recordResultPhase(r.Context(), "body", lane, time.Since(phaseStart))
@@ -2188,7 +2197,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	defer cancelStore()
 
 	if req.Error != "" {
-		s.recordWorkerError(ctx, w, &req)
+		s.recordWorkerError(ctx, w, req)
 		return
 	}
 
@@ -2229,7 +2238,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	// no members (no content, permanent data loss).
 	storeStart := time.Now()
 	by := s.tracker.attribution(req.Worker)
-	stats, err := s.storeResult(ctx, &req, &parsed, tv, by)
+	stats, err := s.storeResult(ctx, req, &parsed, tv, by)
 	recordResultPhase(r.Context(), "store", lane, time.Since(storeStart))
 	if err != nil {
 		if errors.Is(err, hopper.ErrNotFound) {
@@ -2266,7 +2275,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	recordCommitAge(r.Context(), stats.Renewed(), stats.CreatedAt, time.Now())
 
 	if stats.Unchanged {
-		s.finishUnchanged(w, r, &req, &stats, lane, tv)
+		s.finishUnchanged(w, r, req, &stats, lane, tv)
 		return
 	}
 
@@ -2295,7 +2304,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		"worker_version", by.Version, "traits_version", tv, "max_crit", parsed.FileInfo.MaxCrit,
 		"duration_ms", req.DurationMs, "active_claims", s.tracker.activeClaims(req.Worker))
 
-	logResultRenewal(&req, &stats, tv)
+	logResultRenewal(req, &stats, tv)
 	if stats.ParentsRequeued > 0 {
 		// Rare by construction (a renewal that raised max_crit), and each one
 		// sends archives back through the fleet, so it is worth a line.
@@ -2853,8 +2862,7 @@ func classifyInsertFailure(err error) insertFailCause {
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return causeContext
 	}
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
 		switch pgErr.Code {
 		case "55P03":
 			return causeLockTimeout
@@ -3603,8 +3611,7 @@ func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request
 			break
 		}
 		if err != nil {
-			var maxErr *http.MaxBytesError
-			if errors.As(err, &maxErr) {
+			if maxErr, ok := errors.AsType[*http.MaxBytesError](err); ok && maxErr != nil {
 				slog.WarnContext(r.Context(), "upload rejected: envelope exceeds size limit",
 					"remote", r.RemoteAddr, "limit", maxUploadEnvelopeBytes, "part", parts)
 				writeJSONError(w, http.StatusRequestEntityTooLarge, `{"error":"file too large"}`)
@@ -3808,8 +3815,7 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 	}
 	closeErr := tmpFile.Close()
 	if copyErr != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(copyErr, &maxErr) {
+		if maxErr, ok := errors.AsType[*http.MaxBytesError](copyErr); ok && maxErr != nil {
 			writeJSONError(w, http.StatusRequestEntityTooLarge, `{"error":"file too large"}`)
 			return
 		}

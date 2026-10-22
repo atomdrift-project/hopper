@@ -33,13 +33,13 @@ func (db *DB) SightingsInAncestry(ctx context.Context, root string) (*SightingsA
 	seen := map[string]bool{root: true}
 	for i := 0; i < len(pending); i++ {
 		sha := pending[i]
-		purl, version, parent, err := db.sightingAncestryIdentity(ctx, sha)
+		identity, err := db.sightingAncestryIdentity(ctx, sha)
 		if err != nil {
 			return nil, err
 		}
 		subjects := []string{sha}
-		if purl != "" {
-			subjects = append(subjects, purl)
+		if identity.purl != "" {
+			subjects = append(subjects, identity.purl)
 		}
 		ledger, err := db.SightingsFor(ctx, subjects)
 		if err != nil {
@@ -47,9 +47,10 @@ func (db *DB) SightingsInAncestry(ctx context.Context, root string) (*SightingsA
 		}
 		result := &SightingsAncestry{Checked: true, Sightings: []AncestrySighting{}}
 		for _, subject := range subjects {
-			for _, sighting := range ledger[subject] {
-				if subject == sha || sighting.Covers(version) {
-					result.Sightings = append(result.Sightings, AncestrySighting{SHA256: sha, Sighting: sighting})
+			for i := range ledger[subject] {
+				sighting := &ledger[subject][i]
+				if subject == sha || sighting.Covers(identity.version) {
+					result.Sightings = append(result.Sightings, AncestrySighting{SHA256: sha, Sighting: *sighting})
 				}
 			}
 		}
@@ -60,8 +61,8 @@ func (db *DB) SightingsInAncestry(ctx context.Context, root string) (*SightingsA
 		if err != nil {
 			return nil, err
 		}
-		if parent != "" {
-			parents = append(parents, parent)
+		if identity.parent != "" {
+			parents = append(parents, identity.parent)
 		}
 		for _, parent := range parents {
 			if seen[parent] {
@@ -77,51 +78,47 @@ func (db *DB) SightingsInAncestry(ctx context.Context, root string) (*SightingsA
 	return &SightingsAncestry{Checked: true, Sightings: []AncestrySighting{}}, nil
 }
 
-func (db *DB) sightingAncestryIdentity(ctx context.Context, sha string) (purl, version, parent string, err error) {
+type sightingAncestor struct {
+	purl, version, parent string
+}
+
+func (db *DB) sightingAncestryIdentity(ctx context.Context, sha string) (sightingAncestor, error) {
+	var identity sightingAncestor
+	var err error
 	const projection = `SELECT COALESCE(purl_base,''), COALESCE(version,''), COALESCE(parent,'') FROM samples WHERE sha256 = `
 	if db.pool != nil {
-		err = db.pool.QueryRow(ctx, projection+"$1", sha).Scan(&purl, &version, &parent)
+		err = db.pool.QueryRow(ctx, projection+"$1", sha).Scan(&identity.purl, &identity.version, &identity.parent)
 	} else {
-		err = db.lite.QueryRowContext(ctx, projection+"?", sha).Scan(&purl, &version, &parent)
+		err = db.lite.QueryRowContext(ctx, projection+"?", sha).Scan(&identity.purl, &identity.version, &identity.parent)
 	}
 	if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
 		err = fmt.Errorf("hopper: sightings ancestry has unknown node %s: %w", sha, ErrNotFound)
 	}
-	return purl, version, parent, err
+	return identity, err
 }
 
 func (db *DB) sightingAncestryParents(ctx context.Context, sha string) ([]string, error) {
 	const query = `SELECT DISTINCT parent_sha256 FROM sample_locations WHERE parent_sha256 <> '' AND sha256 = `
-	var rows interface {
-		Next() bool
-		Scan(...any) error
-		Err() error
-	}
-	if db.pool != nil {
-		r, err := db.pool.Query(ctx, query+"$1 LIMIT 4097", sha)
-		if err != nil {
-			return nil, err
-		}
-		defer r.Close()
-		rows = r
-	} else {
-		r, err := db.lite.QueryContext(ctx, query+"? LIMIT 4097", sha)
-		if err != nil {
-			return nil, err
-		}
-		defer r.Close()
-		rows = r
-	}
 	var parents []string
-	for rows.Next() {
-		var sha string
-		if err := rows.Scan(&sha); err != nil {
-			return nil, err
+	var err error
+	if db.pool != nil {
+		rows, queryErr := db.pool.Query(ctx, query+"$1 LIMIT 4097", sha)
+		if queryErr != nil {
+			return nil, queryErr
 		}
-		parents = append(parents, sha)
+		parents, err = scanPGStrings(rows)
+	} else {
+		rows, queryErr := db.lite.QueryContext(ctx, query+"? LIMIT 4097", sha)
+		if queryErr != nil {
+			return nil, queryErr
+		}
+		parents, err = scanLiteStrings(rows)
+	}
+	if err != nil {
+		return nil, err
 	}
 	if len(parents) > maxSightingAncestryNodes {
 		return nil, errors.New("hopper: sightings ancestry exceeds parent limit")
 	}
-	return parents, rows.Err()
+	return parents, nil
 }

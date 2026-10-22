@@ -237,7 +237,15 @@ func TestHandleV1LookupBatch(t *testing.T) {
 	}
 	var got []string
 	for _, item := range body {
-		got = append(got, item["purl"].(string)+"="+item["sha256"].(string)[:1])
+		purl, ok := item["purl"].(string)
+		if !ok {
+			t.Fatalf("invalid purl in response: %v", item)
+		}
+		sha, ok := item["sha256"].(string)
+		if !ok || sha == "" {
+			t.Fatalf("invalid sha256 in response: %v", item)
+		}
+		got = append(got, purl+"="+sha[:1])
 	}
 	if want := []string{"pkg:npm/left@1.0.0=1", "npm/right@2.0.0=2"}; strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("batch answered %v, want %v (unknown and unanalyzed omitted, order kept)", got, want)

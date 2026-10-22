@@ -304,13 +304,7 @@ func buildTyped(key, name, version, arch string) (string, bool) {
 		// ClawHub skill: owner/slug when the publisher is known (slugs are not
 		// unique across publishers), bare slug otherwise. Lowercased — the
 		// registry treats both as case-insensitive handles.
-		if owner, slug, found := strings.Cut(name, "/"); found {
-			if owner == "" || slug == "" || strings.Contains(slug, "/") {
-				return "", false
-			}
-			return renderPURL(key, asciiLower(owner), asciiLower(slug), version, ""), true
-		}
-		return renderPURL(key, "", asciiLower(name), version, ""), true
+		return buildClawhubPURL(name, version)
 
 	case "dify":
 		// A Dify plugin is org/name, both halves required: the marketplace
@@ -334,27 +328,7 @@ func buildTyped(key, name, version, arch string) (string, bool) {
 		// spec reserves version for the sha256:… digest; a mutable tag rides
 		// the tag qualifier instead (lexicographic key order: repository_url
 		// before tag).
-		ref := asciiLower(name)
-		if first, _, ok := strings.Cut(ref, "/"); !ok || !strings.ContainsAny(first, ".:") {
-			if !strings.Contains(ref, "/") {
-				ref = "library/" + ref
-			}
-			ref = "docker.io/" + ref
-		}
-		img := lastSegment(ref)
-		if img == "" {
-			return "", false
-		}
-		qualifier := "repository_url=" + escapePURL(ref)
-		digest := ""
-		if v := strings.TrimSpace(version); v != "" {
-			if strings.HasPrefix(strings.ToLower(v), "sha256:") {
-				digest = asciiLower(v)
-			} else {
-				qualifier += "&tag=" + escapePURL(v)
-			}
-		}
-		return renderPURL(key, "", img, digest, qualifier), true
+		return buildOCIPURL(name, version)
 
 	// Editor extensions → the ratified pkg:vscode-extension type; Open VSX is the
 	// same type distinguished by a repository_url qualifier (it defaults to the
@@ -394,6 +368,40 @@ func buildTyped(key, name, version, arch string) (string, bool) {
 		// cran/cpan/pub/conda/clojars): emit pkg:<key>/<name>, last segment only.
 		return renderPURL(key, "", lastSegment(name), version, ""), true
 	}
+}
+
+func buildClawhubPURL(name, version string) (string, bool) {
+	if owner, slug, found := strings.Cut(name, "/"); found {
+		if owner == "" || slug == "" || strings.Contains(slug, "/") {
+			return "", false
+		}
+		return renderPURL("clawhub", asciiLower(owner), asciiLower(slug), version, ""), true
+	}
+	return renderPURL("clawhub", "", asciiLower(name), version, ""), true
+}
+
+func buildOCIPURL(name, version string) (string, bool) {
+	ref := asciiLower(name)
+	if first, _, ok := strings.Cut(ref, "/"); !ok || !strings.ContainsAny(first, ".:") {
+		if !strings.Contains(ref, "/") {
+			ref = "library/" + ref
+		}
+		ref = "docker.io/" + ref
+	}
+	img := lastSegment(ref)
+	if img == "" {
+		return "", false
+	}
+	qualifier := "repository_url=" + escapePURL(ref)
+	digest := ""
+	if v := strings.TrimSpace(version); v != "" {
+		if strings.HasPrefix(strings.ToLower(v), "sha256:") {
+			digest = asciiLower(v)
+		} else {
+			qualifier += "&tag=" + escapePURL(v)
+		}
+	}
+	return renderPURL("oci", "", img, digest, qualifier), true
 }
 
 // distroPURL is the purl-spec rendering of a distro registry key: the type, the

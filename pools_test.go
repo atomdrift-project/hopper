@@ -133,8 +133,8 @@ func TestDecodeJSONFromSizeHintDoesNotOverAllocate(t *testing.T) {
 	}
 	// The buffer that just served this decode is back in the pool; borrow it
 	// and confirm the cap bounded its capacity.
-	buf, _ := jsonBufPool.Get().(*bytes.Buffer)
-	if buf != nil {
+	buf, ok := jsonBufPool.Get().(*bytes.Buffer)
+	if ok && buf != nil {
 		defer jsonBufPool.Put(buf)
 		if buf.Cap() > MaxJSONSizeHint+(1<<20) {
 			t.Errorf("buffer capacity %d exceeds cap %d", buf.Cap(), MaxJSONSizeHint)

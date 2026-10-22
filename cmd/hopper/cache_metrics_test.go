@@ -44,7 +44,11 @@ func TestLookupCachePrometheusMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(exporter))
-	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	t.Cleanup(func() {
+		if err := provider.Shutdown(context.Background()); err != nil {
+			t.Errorf("shut down metrics provider: %v", err)
+		}
+	})
 	wd := &webDashboard{db: db}
 	if err := wd.registerMetrics(provider.Meter(meterName)); err != nil {
 		t.Fatal(err)
