@@ -2097,7 +2097,7 @@ func (db *DB) migrateServingPG(ctx context.Context, allowRewrite bool) (func(con
 	// for the background phase.
 	var deferred []string
 	var declined int
-	for _, ddl := range pgRuntimeMigrations() {
+	for _, ddl := range db.pgMigrationsForRole() {
 		if isDeferrableIndexDDL(ddl) {
 			// In replica mode, decline the indexes slim-indexes.sh would drop
 			// anyway rather than build them first. Not recorded in the ledger:

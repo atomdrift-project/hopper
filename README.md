@@ -231,3 +231,11 @@ HOPPER_PLAN_DSN="$DATABASE_URL" go test ./... -run TestPlanAudit -count=1
 
 The bare `./hopper` command prints the maintained command list, including
 triage, cleanup, backfill, and corpus-reconciliation operations.
+
+Collimator performance iterations use the replica-only `idx_samples_training_hash`
+covering index defined in `scripts/replica/training-index.sql`. `hopper init -replica`
+builds it concurrently; ordinary primary migrations never create it.
+The replica keep policy retains it. It covers a rehashed canonical group key, row ID,
+labels, scores and file types used by sampled training, allowing the planner to
+avoid repeated full-table metadata scans. The one-time index build is separate
+from a fresh training benchmark; replication continues during the build.

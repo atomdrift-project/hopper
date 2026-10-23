@@ -55,6 +55,9 @@ func TestLookupCachePrometheusMetrics(t *testing.T) {
 		t.Fatalf("scrape failed: %d", rec.Code)
 	}
 	body := rec.Body.String()
+	if !strings.Contains(body, "hopper_sightings_investigation_wait_seconds{") {
+		t.Error("missing investigation wait metric used by the sightings alerts")
+	}
 	for _, cache := range []string{"sample", "record"} {
 		for _, metric := range []string{"hopper_cache_entries", "hopper_cache_capacity", "hopper_cache_requests_total", "hopper_cache_memory_estimated_bytes", "hopper_cache_memory_sampled_at_seconds"} {
 			if !strings.Contains(body, metric+`{cache="`+cache+`"`) {

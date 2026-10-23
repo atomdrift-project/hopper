@@ -27,7 +27,7 @@ import (
 func TestReplicaIndexPolicyIsComplete(t *testing.T) {
 	keep, drop, published := mustReplicaPolicy(t)
 
-	stmts := append(pgRuntimeMigrations(), trgmIndexDDL)
+	stmts := append(append(pgRuntimeMigrations(), pgReplicaIndexMigrations()...), trgmIndexDDL)
 	seen := map[string]bool{}
 	var unclassified []string
 
@@ -88,7 +88,7 @@ func TestReplicaIndexPolicyMatchesSlimIndexes(t *testing.T) {
 	keep, drop, published := mustReplicaPolicy(t)
 
 	checked := map[string]bool{}
-	for _, stmt := range append(pgRuntimeMigrations(), trgmIndexDDL) {
+	for _, stmt := range append(append(pgRuntimeMigrations(), pgReplicaIndexMigrations()...), trgmIndexDDL) {
 		m := createIndexRE.FindStringSubmatch(strings.TrimSpace(stmt))
 		if m == nil {
 			continue
@@ -210,4 +210,25 @@ func mustReplicaPolicy(t *testing.T) (keep, drop, published map[string]bool) {
 		t.Fatalf("REPLICATED_TABLES: %v", err)
 	}
 	return keep, drop, published
+}
+
+func TestTrainingHashIndexIsReplicaOnly(t *testing.T) {
+	const name = "idx_samples_training_hash"
+	for _, replica := range []bool{false, true} {
+		db := &DB{}
+		db.SetReplicaIndexPolicy(replica)
+		found := false
+		for _, ddl := range db.pgMigrationsForRole() {
+			if strings.Contains(ddl, name) {
+				found = true
+				skip, err := db.skipReplicaIndex(ddl)
+				if err != nil || skip {
+					t.Fatalf("training index is dropped by replica policy: skip=%v err=%v", skip, err)
+				}
+			}
+		}
+		if found != replica {
+			t.Errorf("replica=%v: training index present=%v", replica, found)
+		}
+	}
 }

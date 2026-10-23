@@ -307,6 +307,26 @@ const triageSightedMatchCTE = `WITH review_sightings AS (
 	)
 `
 
+// sightedInvestigationWaitCTE measures the same available, unjudged population
+// as sighted and sighted-pinned together. Bound the claims before matching the
+// indexed sample identities; the alert is about recent arrivals, not history.
+func sightedInvestigationWaitCTE(boundary string) string {
+	return `WITH recent_sightings AS (
+		SELECT subject, affected, first_seen FROM sightings
+		 WHERE claim IN ('malicious', 'suspicious') AND first_seen >= ` + boundary + `
+	), matching AS (
+		SELECT sm.id, s.first_seen FROM recent_sightings s JOIN samples sm ON sm.sha256 = s.subject
+		UNION ALL
+		SELECT sm.id, s.first_seen FROM recent_sightings s JOIN samples sm ON sm.purl_base = s.subject
+		 WHERE sm.purl_base <> '' AND (s.affected = '' OR s.affected = sm.version)
+	), eligible AS (
+		SELECT matching.first_seen, samples.created_at, samples.first_analyzed_at, samples.analyzed_at
+		  FROM matching JOIN samples ON samples.id = matching.id
+		 WHERE ` + triageSightedWhere + `
+	)
+`
+}
+
 // triagePopularWhere is a var rather than a const because it embeds
 // suspiciousCrit, and spelling that bound as a SQL literal here would put the
 // number in two places — the one arrangement guaranteed to drift the day

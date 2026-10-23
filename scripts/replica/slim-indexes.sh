@@ -107,6 +107,7 @@ idx_samples_filename_trgm
 idx_samples_formula_top
 idx_samples_fp_trait_newest
 idx_samples_labeled_route
+idx_samples_training_hash
 idx_samples_package_version
 idx_samples_popular_ranked
 idx_samples_purl_base

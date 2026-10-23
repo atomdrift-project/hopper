@@ -6903,27 +6903,27 @@ func (db *DB) UnattemptedSightings(ctx context.Context, limit int, source string
 // OldestUnattemptedSighting returns the age of the longest-waiting live claim
 // nothing has tried to acquire, and false when there is none.
 //
-// This is the post-mortem's own alert, expressed as a number. A claim enters
-// this state the moment a feed records it and leaves the moment anything tries
-// to fetch it, so a large value means acquisition is not draining -- which on
-// 2026-09-07 was true of 500,713 claims, silently, for the whole life of the
-// system. Nothing measured it because nothing could: the fact lived in another
-// table under a key only the consumer knew how to build.
+// Hash-only claims count only when Hopper can produce their sample bytes,
+// using the same availability predicate as KnownSHA256. A citation without
+// bytes is not an investigation backlog. Package claims still count before
+// acquisition, since a registry can withdraw the named release while it waits.
 //
 // Live claims only: a backfilled claim's first_seen is the source's date or the
 // epoch, which measures the source's history rather than our wait. See
 // liveAcquirableSQL.
 //
-// One index probe, because idx_sightings_live_age is keyed on first_seen under
-// exactly this predicate. Change one without the other and this becomes a scan
-// of the live queue on every metrics collect.
+// Walk idx_sightings_live_age from the oldest end, probing sample availability
+// by SHA until a qualifying claim is found. Do not sort or count the backlog
+// on each metrics collect.
 func (db *DB) OldestUnattemptedSighting(ctx context.Context) (time.Duration, bool, error) {
 	if db.pool == nil {
 		return 0, false, nil
 	}
 	var oldest *time.Time
 	err := db.pool.QueryRow(ctx,
-		`SELECT min(first_seen) FROM sightings WHERE `+liveAcquirableSQL).Scan(&oldest)
+		`SELECT min(first_seen) FROM sightings WHERE `+liveAcquirableSQL+`
+		 AND (subject LIKE 'pkg:%' OR EXISTS (
+		       SELECT 1 FROM samples s WHERE s.sha256 = sightings.subject`+knownRetrievableSQL+`))`).Scan(&oldest)
 	if err != nil {
 		return 0, false, fmt.Errorf("hopper: oldest unattempted sighting: %w", err)
 	}
@@ -8050,6 +8050,38 @@ func (db *DB) MarkClaimHandout(ctx context.Context, shas []string) error {
 		return fmt.Errorf("hopper: mark claim handout: %w", err)
 	}
 	return nil
+}
+
+// SightedInvestigationLag reports how long the oldest eligible sample from a
+// recent threat-feed claim has waited for a Cyclotron judgement. It uses the
+// same sample and claim predicates as the sighted queues, independent of
+// acquisition attempted_at. Missing bytes, skipped samples, unanalyzed samples,
+// bad rulings and completed sighted reviews cannot page as investigation work.
+//
+// The clock starts when the claim, sample and first analysis are all present.
+// Claims older than SightedPinnedWindow remain in the ordinary sighted queue,
+// but do not turn its historical backlog into a page about today's arrivals.
+func (db *DB) SightedInvestigationLag(ctx context.Context) (time.Duration, error) {
+	now := time.Now().UTC()
+	cutoff := now.Add(-SightedPinnedWindow)
+	var seconds float64
+	var err error
+	if db.pool != nil {
+		err = db.pool.QueryRow(ctx, sightedInvestigationWaitCTE("$1")+`
+		 SELECT COALESCE(EXTRACT(epoch FROM $2::timestamptz - min(GREATEST(
+		   first_seen, created_at, COALESCE(first_analyzed_at, analyzed_at, created_at)))), 0)
+		 FROM eligible`, cutoff, now).Scan(&seconds)
+	} else {
+		err = db.lite.QueryRowContext(ctx, sightedInvestigationWaitCTE("?")+`
+		 SELECT COALESCE((julianday(?) - min(max(
+		   julianday(first_seen), julianday(created_at),
+		   julianday(COALESCE(first_analyzed_at, analyzed_at, created_at))))) * 86400.0, 0)
+		 FROM eligible`, cutoff, now).Scan(&seconds)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("hopper: sighted investigation lag: %w", err)
+	}
+	return time.Duration(max(seconds, 0) * float64(time.Second)), nil
 }
 
 // SightedPickupLag reports the longest a sighted sample currently in flight

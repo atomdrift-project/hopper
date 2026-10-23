@@ -33,6 +33,7 @@ const metricsCollectTimeout = 8 * time.Second
 type instruments struct {
 	pending, rescan, cleavePending, litmusPending                metric.Int64Observable
 	unattemptedAge                                               metric.Int64Observable
+	sightedInvestigationLag                                      metric.Int64Observable
 	retiredNoOutcome                                             metric.Int64Observable
 	sightedPickupLag                                             metric.Int64Observable
 	analyzed                                                     metric.Int64Observable
@@ -387,7 +388,9 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 		// registry can withdraw the bytes while the claim waits, and then no
 		// amount of later effort recovers them.
 		unattemptedAge: gauge("hopper.sightings.unattempted_age",
-			"Age of the longest-waiting live threat-feed claim that nothing has tried to acquire; backfill is excluded.", "s"),
+			"Age of the longest-waiting live threat-feed claim that nothing has tried to acquire; backfill and hashes without retrievable sample bytes are excluded.", "s"),
+		sightedInvestigationLag: gauge("hopper.sightings.investigation_wait",
+			"Longest wait for judgement among available, eligible, unjudged samples with a threat-feed claim received in the last 24h; starts when the claim, sample and first analysis are all present.", "s"),
 		// The counterpart to unattempted_age, and the price of making a claimed
 		// target terminal. A target claimed for recovery and never reporting an
 		// outcome is work the system has permanently given up on and will not
@@ -573,17 +576,23 @@ func (wd *webDashboard) observe(ctx context.Context, observer metric.Observer, i
 			observer.ObserveInt64(in.unattemptedAge, int64(age.Seconds()))
 		}
 
-		// Same treatment as unattempted_age: log rather than swallow, because a
-		// silently absent series reads as "nothing abandoned" on every
-		// dashboard it appears on. The grace is well past the slowest recovery
-		// chain (mirrors, Wayback, jsDelivr, unpkg, Software Heritage,
-		// socket.dev), so an in-flight attempt is never counted.
+		if lag, err := db.SightedInvestigationLag(cctx); err != nil {
+			slog.Warn("sighted investigation wait unavailable this scrape", "error", err)
+		} else {
+			observer.ObserveInt64(in.sightedInvestigationLag, int64(lag.Seconds()))
+		}
+
 		if lag, err := db.SightedPickupLag(cctx); err != nil {
 			slog.Warn("sighted pickup lag unavailable this scrape", "error", err)
 		} else {
 			observer.ObserveInt64(in.sightedPickupLag, int64(lag.Seconds()))
 		}
 
+		// Same treatment as unattempted_age: log rather than swallow, because a
+		// silently absent series reads as "nothing abandoned" on every
+		// dashboard it appears on. The grace is well past the slowest recovery
+		// chain (mirrors, Wayback, jsDelivr, unpkg, Software Heritage,
+		// socket.dev), so an in-flight attempt is never counted.
 		if n, _, err := db.AcquisitionsRetiredWithoutOutcome(cctx, retiredOutcomeGrace); err != nil {
 			slog.Warn("retired-without-outcome count unavailable; the abandonment alert has no data this scrape", "error", err)
 		} else {

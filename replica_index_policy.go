@@ -156,3 +156,22 @@ func (db *DB) skipReplicaIndex(ddl string) (bool, error) {
 	}
 	return replicaSkipsIndexDDL(ddl)
 }
+
+// replicaTrainingIndexDDL serves collimator's deterministic hash-sampled runs.
+// Keep this out of the primary's migration list: only a replica trains models.
+// The projection is covered so repeated 1-2% iterations need not scan the heap.
+//
+//go:embed scripts/replica/training-index.sql
+var replicaTrainingIndexDDL string
+
+func pgReplicaIndexMigrations() []string {
+	return []string{strings.TrimSpace(replicaTrainingIndexDDL)}
+}
+
+func (db *DB) pgMigrationsForRole() []string {
+	migrations := pgRuntimeMigrations()
+	if db.replicaIndexPolicy {
+		migrations = append(migrations, pgReplicaIndexMigrations()...)
+	}
+	return migrations
+}
