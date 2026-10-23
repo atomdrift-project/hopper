@@ -3946,6 +3946,8 @@ type StoreStats struct {
 	// attributed to a package rather than to a bare digest. Empty for a sample
 	// with no package identity.
 	PURLBase string
+	// PURLVersion pairs with PURLBase for cache invalidation after the write.
+	PURLVersion string
 
 	Members       int   // members extracted from the archive envelope (0 = not an archive)
 	MembersStored int64 // member rows inserted or freshness-refreshed in this transaction
@@ -4102,7 +4104,12 @@ func (db *DB) StoreResult(
 	} else {
 		stats, err = db.storeResultSQLite(ctx, sha256, cleaveRaw, litmusML, llm, p, traitsVersion, by)
 	}
-	return stats, db.writeAnalysis(ctx, sha256, err)
+	if stats.Unchanged {
+		return stats, err
+	}
+	return stats, db.writeAnalysis(&Sample{
+		SHA256: sha256, PURLBase: stats.PURLBase, Version: stats.PURLVersion,
+	}, err)
 }
 
 // AnalysisAttribution reads back who produced sample sha256's stored verdict
@@ -4158,9 +4165,9 @@ func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []by
 	}
 	result = compactCleaveResultForStorage(result)
 	if db.pool != nil {
-		return db.writeAnalysis(ctx, sha256, db.updateCleaveResultPG(ctx, sha256, result, p.CanonicalSHA, p.FileInfo, traitsVersion))
+		return db.writeAnalysis(db.updateCleaveResultPG(ctx, sha256, result, p.CanonicalSHA, p.FileInfo, traitsVersion))
 	}
-	return db.writeAnalysis(ctx, sha256, db.updateCleaveResultSQLite(ctx, sha256, result, p.CanonicalSHA, p.FileInfo, traitsVersion))
+	return db.writeAnalysis(db.updateCleaveResultSQLite(ctx, sha256, result, p.CanonicalSHA, p.FileInfo, traitsVersion))
 }
 
 // UpdateLitmusResult stores the litmus classification envelope for a sample.
@@ -4169,9 +4176,9 @@ func (db *DB) UpdateCleaveResult(ctx context.Context, sha256 string, result []by
 // the new envelope — no separate score parameter needed.
 func (db *DB) UpdateLitmusResult(ctx context.Context, sha256 string, result []byte) error {
 	if db.pool != nil {
-		return db.writeAnalysis(ctx, sha256, db.updateLitmusResultPG(ctx, sha256, result))
+		return db.writeAnalysis(db.updateLitmusResultPG(ctx, sha256, result))
 	}
-	return db.writeAnalysis(ctx, sha256, db.updateLitmusResultSQLite(ctx, sha256, result))
+	return db.writeAnalysis(db.updateLitmusResultSQLite(ctx, sha256, result))
 }
 
 // UpdateLLMResult stores the optional LLM interpretation (envelope `llm`) for a

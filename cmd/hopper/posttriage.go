@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -685,7 +686,7 @@ func cmdPostTriage(ctx context.Context) error {
 	//    stale data this whole step exists to refresh. /xtriage-* relocated them
 	//    out of the triage dir, so scanning only the positional dirs would skip
 	//    them. Positional args add any extra directories to re-scan.
-	scanDirs := dedupExistingDirs(append(append(append([]string{}, misplacedGood...), misplacedBad...), f.Args()...))
+	scanDirs := dedupExistingDirs(slices.Concat(misplacedGood, misplacedBad, f.Args()))
 	switch {
 	case *noUpload:
 		// operator opted out

@@ -3,7 +3,7 @@ module github.com/atomdrift-project/hopper
 go 1.26.0
 
 require (
-	github.com/atomdrift-project/obs v0.0.0-20260819141836-f9e00a0e1174
+	github.com/atomdrift-project/obs v0.0.0-20261023154452-132705424564
 	github.com/bodgit/sevenzip v1.6.5
 	github.com/codeGROOVE-dev/fido v1.11.1-0.20260923181850-2fcd14cd89d4
 	github.com/codeGROOVE-dev/retry v1.3.1
@@ -41,7 +41,7 @@ require (
 	github.com/prometheus/client_model v0.6.3 // indirect
 	github.com/prometheus/common v0.72.1 // indirect
 	github.com/prometheus/otlptranslator v1.0.0 // indirect
-	github.com/prometheus/procfs v0.22.0 // indirect
+	github.com/prometheus/procfs v0.23.0 // indirect
 	github.com/puzpuzpuz/xsync/v4 v4.5.0 // indirect
 	github.com/spf13/afero v1.15.0 // indirect
 	github.com/stangelandcl/ppmd v0.1.1 // indirect

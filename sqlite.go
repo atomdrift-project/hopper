@@ -417,6 +417,10 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		`CREATE INDEX IF NOT EXISTS idx_samples_purl_lookup ` +
 			`ON samples (purl_base, version, analyzed_at DESC) ` +
 			`WHERE purl_base != '' AND litmus_result IS NOT NULL AND cleave_result IS NOT NULL`,
+		// Versioned lookups rank every payload of a release. This expression
+		// index matches the criticality order, including stable tie-breaks.
+		// The existing time index remains useful for versionless lookups.
+		purlCriticalIndex(false),
 		`DROP INDEX IF EXISTS idx_samples_purl_analyzed`,
 	} {
 		if _, err := db.lite.ExecContext(ctx, ddl); err != nil {
@@ -2591,13 +2595,14 @@ func markPrunedSamplesMissingSQLite(ctx context.Context, tx *sql.Tx, shas []stri
 func (db *DB) updateCleaveResultSQLite(
 	ctx context.Context, sha256 string, result []byte, canonical string,
 	fi cleaveFileInfo, traitsVersion string,
-) error {
+) (*Sample, error) {
 	// file_type, score, formula, litmus_score are GENERATED columns;
 	// setting litmus_result = NULL auto-resets litmus_score to 0.
 	n := now()
 	// The rescan queue fields clear here so the row drops out once fresh
 	// analysis lands.
-	_, err := db.lite.ExecContext(ctx, `
+	sample := &Sample{SHA256: sha256}
+	err := db.lite.QueryRowContext(ctx, `
 		UPDATE samples SET cleave_result = ?,
 			canonical_sha256 = ?, elements = ?,
 			max_crit = ?, suspicious_count = ?, top_traits = ?, trait_graph = ?,
@@ -2608,14 +2613,19 @@ func (db *DB) updateCleaveResultSQLite(
 			first_analyzed_at = COALESCE(first_analyzed_at, ?),
 			analyzed_at = ?, updated_at = ?,
 			analyzed_by = ?, analyzer_version = '', analyzer_traits = ''
-		WHERE sha256 = ?`,
+		WHERE sha256 = ? RETURNING purl_base, version`,
 		string(result), canonical, fi.Elements,
 		fi.MaxCrit, fi.SuspiciousCount, fi.TopTraits, fi.TraitGraph,
-		traitsVersion, n, n, n, cleaveWriteBackAttribution, sha256)
-	if err != nil {
-		return fmt.Errorf("hopper: update cleave result: %w", err)
+		traitsVersion, n, n, n, cleaveWriteBackAttribution, sha256).Scan(&sample.PURLBase, &sample.Version)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Updating an absent sample remains a successful no-op. Its digest
+		// key still needs invalidation, even though there is no package key.
+		return sample, nil
 	}
-	return nil
+	if err != nil {
+		return nil, fmt.Errorf("hopper: update cleave result: %w", err)
+	}
+	return sample, nil
 }
 
 // storeResultSQLite is the SQLite twin of storeResultPG: parent analysis and all
@@ -2644,11 +2654,11 @@ func (db *DB) storeResultSQLite(
 	var priorCrit int
 	if err := tx.QueryRowContext(ctx,
 		`SELECT label, label_source, source, feed, ecosystem, path, first_analyzed_at,
-		        analyzed_at, traits_version, purl_base, created_at, llm_result IS NULL, max_crit
+		        analyzed_at, traits_version, purl_base, version, created_at, llm_result IS NULL, max_crit
 		   FROM samples WHERE sha256 = ?`, sha256).
 		Scan(&parent.Label, &parent.LabelSource, &parent.Source, &parent.Feed,
 			&parent.Ecosystem, &parent.Path, &firstAnalyzed,
-			&priorAnalyzed, &priorTraits, &purlBase, &createdAt, &llmMissing, &priorCrit); err != nil {
+			&priorAnalyzed, &priorTraits, &purlBase, &parent.Version, &createdAt, &llmMissing, &priorCrit); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return StoreStats{}, fmt.Errorf("hopper: store result for absent sample %s: %w", sha256, ErrNotFound)
 		}
@@ -2666,6 +2676,7 @@ func (db *DB) storeResultSQLite(
 	stats.PriorTraitsVersion = priorTraits
 	stats.PriorMaxCrit = priorCrit
 	stats.PURLBase = purlBase
+	stats.PURLVersion = parent.Version
 	stats.CreatedAt = createdAt.Time
 	// Same fast path as storeResultPG, and the same reason: the transaction
 	// below is the expensive half, and it would write what the row already says.
@@ -2674,7 +2685,7 @@ func (db *DB) storeResultSQLite(
 		return stats, nil
 	}
 
-	if _, err := tx.ExecContext(ctx, `
+	if err := tx.QueryRowContext(ctx, `
 		UPDATE samples SET cleave_result = ?,
 			canonical_sha256 = ?, elements = ?,
 			max_crit = ?, suspicious_count = ?, top_traits = ?, trait_graph = ?,
@@ -2684,11 +2695,11 @@ func (db *DB) storeResultSQLite(
 			first_analyzed_at = COALESCE(first_analyzed_at, ?),
 			analyzed_at = ?, updated_at = ?,
 			analyzed_by = ?, analyzer_version = ?, analyzer_traits = ?
-		WHERE sha256 = ?`,
+		WHERE sha256 = ? RETURNING purl_base, version`,
 		string(truncated), parsed.CanonicalSHA, parsed.FileInfo.Elements,
 		parsed.FileInfo.MaxCrit, parsed.FileInfo.SuspiciousCount, parsed.FileInfo.TopTraits, parsed.FileInfo.TraitGraph,
 		jsonTextOrNil(litmusML), jsonTextOrNil(llm),
-		traitsVersion, nowStr, nowStr, nowStr, by.Worker, by.Version, by.Traits, sha256); err != nil {
+		traitsVersion, nowStr, nowStr, nowStr, by.Worker, by.Version, by.Traits, sha256).Scan(&stats.PURLBase, &stats.PURLVersion); err != nil {
 		return StoreStats{}, fmt.Errorf("hopper: update parent: %w", err)
 	}
 
@@ -2914,14 +2925,20 @@ func (db *DB) requestRescanSQLite(ctx context.Context, sha256 string, cooldownCu
 	return nil
 }
 
-func (db *DB) updateLitmusResultSQLite(ctx context.Context, sha256 string, result []byte) error {
-	_, err := db.lite.ExecContext(ctx, `
+func (db *DB) updateLitmusResultSQLite(ctx context.Context, sha256 string, result []byte) (*Sample, error) {
+	sample := &Sample{SHA256: sha256}
+	err := db.lite.QueryRowContext(ctx, `
 		UPDATE samples SET litmus_result = ?, updated_at = ?
-		WHERE sha256 = ?`, string(result), now(), sha256)
-	if err != nil {
-		return fmt.Errorf("hopper: update litmus result: %w", err)
+		WHERE sha256 = ? RETURNING purl_base, version`, string(result), now(), sha256).Scan(&sample.PURLBase, &sample.Version)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Updating an absent sample remains a successful no-op. Its digest
+		// key still needs invalidation, even though there is no package key.
+		return sample, nil
 	}
-	return nil
+	if err != nil {
+		return nil, fmt.Errorf("hopper: update litmus result: %w", err)
+	}
+	return sample, nil
 }
 
 func (db *DB) updateLLMResultSQLite(ctx context.Context, sha256 string, result []byte) error {

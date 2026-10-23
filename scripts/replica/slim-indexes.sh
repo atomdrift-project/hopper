@@ -111,6 +111,7 @@ idx_samples_training_hash
 idx_samples_package_version
 idx_samples_popular_ranked
 idx_samples_purl_base
+idx_samples_purl_critical
 idx_samples_purl_lookup
 idx_samples_second_newest
 idx_samples_stranded_pending

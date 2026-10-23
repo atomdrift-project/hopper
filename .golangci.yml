@@ -109,7 +109,7 @@ linters:
       # Default: [ switch ]
       check:
         - switch
-        - map
+        - mapliteral
       default-signifies-exhaustive: true
 
     fatcontext:
@@ -183,6 +183,8 @@ linters:
           arguments: [150]
         - name: nested-structs
           disabled: true
+        - name: multiline-if-init
+          disabled: true # allow scoped error checks for multiline SQL and callbacks
         - name: max-public-structs
           arguments: [10]
         - name: flag-parameter # fixes are difficult

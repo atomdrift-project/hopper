@@ -1323,6 +1323,10 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_purl_lookup ` +
 			`ON samples (purl_base, version, analyzed_at DESC NULLS LAST) ` +
 			`WHERE purl_base != '' AND litmus_result IS NOT NULL AND cleave_result IS NOT NULL`,
+		// Versioned lookups rank every payload of a release. This expression
+		// index matches the criticality order, including stable tie-breaks.
+		// The existing time index remains useful for versionless lookups.
+		purlCriticalIndex(true),
 		`DROP INDEX IF EXISTS idx_samples_purl_analyzed`,
 		// Collector provenance sidecar (forager) + artifact fetch time. JSONB so
 		// the registry/feed records inside are directly queryable.
@@ -3921,11 +3925,11 @@ func (db *DB) storeResultPG(
 	var priorCrit int
 	if err := db.pool.QueryRow(ctx,
 		`SELECT label, label_source, source, feed, ecosystem, path, first_analyzed_at,
-		        analyzed_at, traits_version, purl_base, created_at, llm_result IS NULL, max_crit
+		        analyzed_at, traits_version, purl_base, version, created_at, llm_result IS NULL, max_crit
 		   FROM samples WHERE sha256 = $1`, sha256).
 		Scan(&parent.Label, &parent.LabelSource, &parent.Source, &parent.Feed,
 			&parent.Ecosystem, &parent.Path, &firstAnalyzed,
-			&priorAnalyzed, &priorTraits, &purlBase, &createdAt, &llmMissing, &priorCrit); err != nil {
+			&priorAnalyzed, &priorTraits, &purlBase, &parent.Version, &createdAt, &llmMissing, &priorCrit); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return StoreStats{}, fmt.Errorf("hopper: store result for absent sample %s: %w", sha256, ErrNotFound)
 		}
@@ -3942,6 +3946,7 @@ func (db *DB) storeResultPG(
 	stats.PriorTraitsVersion = priorTraits
 	stats.PriorMaxCrit = priorCrit
 	stats.PURLBase = purlBase
+	stats.PURLVersion = parent.Version
 	stats.CreatedAt = createdAt
 	if unchangedStore(&stats, traitsVersion, llm, llmMissing) {
 		stats.Unchanged = true
@@ -4025,7 +4030,7 @@ func (db *DB) storeResultPG(
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback
 
-	res, err := tx.Exec(ctx, `
+	err = tx.QueryRow(ctx, `
 		UPDATE samples SET cleave_result = $2,
 			canonical_sha256 = $3, elements = $4,
 			max_crit = $5, suspicious_count = $6,
@@ -4035,14 +4040,14 @@ func (db *DB) storeResultPG(
 			first_analyzed_at = COALESCE(first_analyzed_at, $10),
 			analyzed_at = $10, updated_at = $10,
 			analyzed_by = $11, analyzer_version = $12, analyzer_traits = $13
-		WHERE sha256 = $1`,
+		WHERE sha256 = $1 RETURNING purl_base, version`,
 		sha256, sanitizeJSONB(truncated), parsed.CanonicalSHA,
 		parsed.FileInfo.Elements, parsed.FileInfo.MaxCrit, parsed.FileInfo.SuspiciousCount,
-		litmusVal, llmVal, traitsVersion, now, by.Worker, by.Version, by.Traits)
-	if err != nil {
+		litmusVal, llmVal, traitsVersion, now, by.Worker, by.Version, by.Traits).Scan(&stats.PURLBase, &stats.PURLVersion)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return StoreStats{}, fmt.Errorf("hopper: update parent for store %s: %w", sha256, err)
 	}
-	if res.RowsAffected() == 0 {
+	if errors.Is(err, pgx.ErrNoRows) {
 		// The row was deleted between the identity read and this update. Any
 		// member rows already written are reaped by pool reconcile's
 		// missing-parent cascade.
@@ -5031,7 +5036,7 @@ func (db *DB) repairMissingLocationsPG(ctx context.Context, absRoot string, appl
 func (db *DB) updateCleaveResultPG(
 	ctx context.Context, sha256 string, result []byte, canonical string,
 	fi cleaveFileInfo, traitsVersion string,
-) error {
+) (*Sample, error) {
 	// file_type, score, formula are re-derived from the new cleave_result by
 	// the samples_derive_cleave_cols trigger (UPDATE OF cleave_result fires
 	// it); litmus_score by the samples_derive_litmus_score trigger (UPDATE OF
@@ -5040,7 +5045,8 @@ func (db *DB) updateCleaveResultPG(
 	// The rescan queue (rescan_priority/rescan_requested_at) clears here so the
 	// row drops out once a worker has produced fresh analysis; without this the
 	// partial index would carry stale entries.
-	_, err := db.pool.Exec(ctx, `
+	sample := &Sample{SHA256: sha256}
+	err := db.pool.QueryRow(ctx, `
 		UPDATE samples SET cleave_result = $2,
 			canonical_sha256 = $3, elements = $4,
 			max_crit = $5, suspicious_count = $6,
@@ -5051,13 +5057,18 @@ func (db *DB) updateCleaveResultPG(
 			first_analyzed_at = COALESCE(first_analyzed_at, now()),
 			analyzed_at = now(), updated_at = now(),
 			analyzed_by = '`+cleaveWriteBackAttribution+`', analyzer_version = '', analyzer_traits = ''
-		WHERE sha256 = $1`,
+		WHERE sha256 = $1 RETURNING purl_base, version`,
 		sha256, sanitizeJSONB(result), canonical,
-		fi.Elements, fi.MaxCrit, fi.SuspiciousCount, traitsVersion)
-	if err != nil {
-		return fmt.Errorf("hopper: update cleave result: %w", err)
+		fi.Elements, fi.MaxCrit, fi.SuspiciousCount, traitsVersion).Scan(&sample.PURLBase, &sample.Version)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Updating an absent sample remains a successful no-op. Its digest
+		// key still needs invalidation, even though there is no package key.
+		return sample, nil
 	}
-	return nil
+	if err != nil {
+		return nil, fmt.Errorf("hopper: update cleave result: %w", err)
+	}
+	return sample, nil
 }
 
 // requestRescanPG queues an interactive rescan (rescan_priority = 2), drained
@@ -5091,14 +5102,20 @@ func (db *DB) requestRescanPG(ctx context.Context, sha256 string, cooldownCutoff
 	return nil
 }
 
-func (db *DB) updateLitmusResultPG(ctx context.Context, sha256 string, result []byte) error {
-	_, err := db.pool.Exec(ctx, `
+func (db *DB) updateLitmusResultPG(ctx context.Context, sha256 string, result []byte) (*Sample, error) {
+	sample := &Sample{SHA256: sha256}
+	err := db.pool.QueryRow(ctx, `
 		UPDATE samples SET litmus_result = $2, updated_at = now()
-		WHERE sha256 = $1`, sha256, sanitizeJSONB(result))
-	if err != nil {
-		return fmt.Errorf("hopper: update litmus result: %w", err)
+		WHERE sha256 = $1 RETURNING purl_base, version`, sha256, sanitizeJSONB(result)).Scan(&sample.PURLBase, &sample.Version)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Updating an absent sample remains a successful no-op. Its digest
+		// key still needs invalidation, even though there is no package key.
+		return sample, nil
 	}
-	return nil
+	if err != nil {
+		return nil, fmt.Errorf("hopper: update litmus result: %w", err)
+	}
+	return sample, nil
 }
 
 func (db *DB) updateLLMResultPG(ctx context.Context, sha256 string, result []byte) error {

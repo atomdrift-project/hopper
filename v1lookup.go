@@ -422,16 +422,33 @@ func (db *DB) recordSampleBySHA256(ctx context.Context, sha256 string) (*Sample,
 // last; equal levels prefer the newest analysis, then a stable digest. A
 // versionless lookup retains its existing newest-analysis behavior.
 func purlLookupOrder(version string, postgres bool) string {
-	order := ""
 	if version != "" {
-		level := "lvl"
-		if !postgres {
-			level = litmusLvlSQLite("")
-		}
-		order = `CASE WHEN ` + level + ` > -1 THEN ` + level + ` END ASC NULLS LAST, ` +
-			`CASE WHEN ` + level + ` = -1 THEN 0 ELSE 1 END ASC, `
+		return ` ORDER BY ` + purlCriticalOrder(postgres) + ` LIMIT 1`
 	}
-	return ` ORDER BY ` + order + `analyzed_at DESC NULLS LAST, sha256 ASC LIMIT 1`
+	return ` ORDER BY analyzed_at DESC NULLS LAST, sha256 ASC LIMIT 1`
+}
+
+// purlCriticalOrder is shared with the expression index so a versioned lookup
+// can stop at its first index entry. The first expression ranks firing, clean,
+// then unknown; the second ranks firing levels without treating -1 as hostile.
+func purlCriticalOrder(postgres bool) string {
+	level := "lvl"
+	nulls := " NULLS LAST"
+	if !postgres {
+		level = litmusLvlSQLite("")
+		// SQLite's DESC already places NULL last and its indexes do not accept
+		// explicit NULLS LAST. Keep its query and index spelling identical.
+		nulls = ""
+	}
+	return `(CASE WHEN ` + level + ` > -1 THEN 0 WHEN ` + level + ` = -1 THEN 1 ELSE 2 END), ` +
+		`(CASE WHEN ` + level + ` > -1 THEN ` + level + ` ELSE 0 END), ` +
+		`analyzed_at DESC` + nulls + `, sha256 ASC`
+}
+
+func purlCriticalIndex(postgres bool) string {
+	return `CREATE INDEX IF NOT EXISTS idx_samples_purl_critical ON samples ` +
+		`(purl_base, version, ` + purlCriticalOrder(postgres) + `) ` +
+		`WHERE purl_base <> '' AND litmus_result IS NOT NULL AND cleave_result IS NOT NULL AND file_type <> 'registry'`
 }
 
 // recordSampleByPURL loads the record projection for the most critical analyzed

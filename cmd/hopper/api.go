@@ -5010,7 +5010,7 @@ func (s *apiServer) safeFileServer() http.Handler {
 			return
 		}
 
-		f, err := os.Open(resolved)
+		f, err := os.Open(resolved) //nolint:gosec // resolved symlinks and checked containment in allowedDirs above.
 		if err != nil {
 			// /data makes no DB existence claim, so a vanished file is just 404.
 			// A non-ENOENT failure (fd exhaustion under load, transient I/O) is
