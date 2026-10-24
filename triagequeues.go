@@ -637,6 +637,12 @@ var TriageQueues = map[string]Queue{
 		return db.TriageAcquit(ctx, n, time.Now().Add(-AcquitGrace), queueFilter("acquit", TriageFilter{}, excluded...))
 	}},
 
+	// bad-shared reviews potentially mislabeled common library/resource bytes.
+	// Include members as well as roots; frequency is a review signal, not a verdict.
+	"bad-shared": {Name: "bad-shared", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
+		return db.TriageBadShared(ctx, n, queueFilter("bad-shared", TriageFilter{}, excluded...))
+	}},
+
 	// fallout: litmus-hostile samples (class 2 — the public fallout page's
 	// population) that are UNDESCRIBED or UNCORROBORATED. Undescribed is the
 	// original population: no LLM interpretation, because the reasoning pass
