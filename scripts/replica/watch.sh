@@ -1,6 +1,6 @@
 #!/bin/sh
 # watch.sh — compact live view of local hopper logical-replica health.
-# One line of subscription status plus one line per subscribed table
+# Subscription status and committed progress plus one line per subscribed table
 # (capped at 10). Read-only. Loops in portable sh: GNU watch(1) does not
 # exist on FreeBSD (watch(8) there is an unrelated tty-snooping tool).
 #
@@ -9,7 +9,8 @@
 # INTERVAL (seconds, default 60), ETA_WINDOW (seconds, default 900),
 # ONCE (true = single snapshot). History survives restarts under /tmp so
 # a 15-minute ETA average can accumulate across invocations.
-# Remote queries read ~/.pgpass; a missing publisher just blanks ETAs.
+# Requires PostgreSQL 17+ worker_type reporting.
+# Remote queries read ~/.pgpass; a missing publisher reports an unknown gap.
 
 set -u
 
@@ -66,7 +67,7 @@ fi
 SNAP="${TMPDIR:-/tmp}/hopper-replica-watch.$$.snap"
 # Persist samples across restarts so the 15-minute window survives Ctrl-C.
 hist_safe=$(printf '%s' "$SUBSCRIPTION" | tr -c 'A-Za-z0-9._-' '_')
-HIST="${TMPDIR:-/tmp}/hopper-replica-watch.${hist_safe}.hist"
+HIST="${TMPDIR:-/tmp}/hopper-replica-watch.${hist_safe}.v2.hist"
 : >>"$HIST"
 COLOR=0
 [ -t 1 ] && COLOR=1
@@ -80,9 +81,11 @@ trap cleanup EXIT INT TERM HUP
 [ -t 1 ] && [ "$ONCE" != true ] && tput civis >/dev/null 2>&1 || true
 
 # Collect one snapshot. Fields are '|' separated; kinds are the first column.
-#   SUB   name|enabled|apply_pid|last_msg_age|ready|total|latest_end_age|wait_event|received_bytes
+#   SUB   name|enabled|apply_pid|last_msg_age|ready|total|latest_end_age|wait_event|received_bytes|slot|origin_bytes|origin_lsn
+#   WORK  parallel_count|io_count|lock_count|idle_count
+#   TOUCH table|workers holding transaction write locks
 #   ERRS  apply_err|sync_err
-#   SLOT  name|active|wal_status|retained_bytes|confirmed_bytes
+#   SLOT  name|active|wal_status|retained_bytes|confirmed_bytes|publisher_bytes
 #   REM   table|rows|bytes
 #   TBL   table|state|local_rows|local_bytes|copy_bytes|copy_total|copy_tuples|sync_pid|idx_phase|analyze_phase|idx_done|idx_total|unready_idx
 #   NOW   epoch
@@ -103,11 +106,33 @@ SELECT 'SUB',
          WHERE r.srsubid = s.oid),
        COALESCE((EXTRACT(EPOCH FROM (now() - a.latest_end_time)))::bigint::text, ''),
        COALESCE((SELECT wait_event FROM pg_stat_activity WHERE pid = a.pid), ''),
-       COALESCE(pg_wal_lsn_diff(a.received_lsn, '0/0'), 0)
+       COALESCE(pg_wal_lsn_diff(a.received_lsn, '0/0'), 0),
+       s.subslotname,
+       COALESCE(pg_wal_lsn_diff(o.remote_lsn, '0/0'), 0),
+       COALESCE(o.remote_lsn::text, '')
   FROM pg_subscription s
   LEFT JOIN pg_stat_subscription a
-    ON a.subname = s.subname AND a.relid IS NULL
+    ON a.subname = s.subname AND a.worker_type = 'apply'
+  LEFT JOIN pg_replication_origin_status o ON o.external_id = 'pg_' || s.oid::text
  WHERE s.subname = :'sub';
+
+SELECT 'WORK', count(*),
+       count(*) FILTER (WHERE a.wait_event_type = 'IO'),
+       count(*) FILTER (WHERE a.wait_event_type = 'Lock'),
+       count(*) FILTER (WHERE a.wait_event_type = 'Activity')
+  FROM pg_stat_subscription w JOIN pg_stat_activity a ON a.pid = w.pid
+ WHERE w.subname = :'sub' AND w.worker_type = 'parallel apply';
+
+-- Transaction-held write locks identify tables being applied, not row progress.
+SELECT 'TOUCH', CASE WHEN n.nspname = 'public' THEN c.relname
+                    ELSE n.nspname || '.' || c.relname END,
+       count(DISTINCT w.pid)
+  FROM pg_stat_subscription w
+  JOIN pg_locks l ON l.pid = w.pid AND l.granted AND l.mode = 'RowExclusiveLock'
+  JOIN pg_class c ON c.oid = l.relation AND c.relkind IN ('r', 'p')
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE w.subname = :'sub' AND w.worker_type IN ('apply', 'parallel apply')
+ GROUP BY n.nspname, c.relname;
 SQL
 
         # PG15+; a missing view must not fail the whole snapshot.
@@ -150,7 +175,7 @@ SELECT 'TBL',
        WHERE relid = c.oid
        LIMIT 1
   ) p ON true
-  LEFT JOIN pg_stat_subscription ss ON ss.relid = c.oid
+  LEFT JOIN pg_stat_subscription ss ON ss.relid = c.oid AND ss.subid = s.oid
   LEFT JOIN LATERAL (
       SELECT phase, tuples_done, tuples_total
         FROM pg_stat_progress_create_index
@@ -168,13 +193,18 @@ SELECT 'TBL',
  ORDER BY c.relname;
 SQL
 
-        remote -v sub="$SUBSCRIPTION" -tA -F '|' <<'SQL' 2>/dev/null || true
+        slot=$(admin -d "$LOCAL_DB" -v sub="$SUBSCRIPTION" -tA <<'SQL'
+SELECT subslotname FROM pg_subscription WHERE subname = :'sub';
+SQL
+)
+        remote -v sub="$slot" -tA -F '|' <<'SQL' 2>/dev/null || true
 SELECT 'SLOT',
        slot_name,
        CASE WHEN active THEN 't' ELSE 'f' END,
        COALESCE(wal_status, ''),
        COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0),
-       COALESCE(pg_wal_lsn_diff(confirmed_flush_lsn, '0/0'), 0)
+       COALESCE(pg_wal_lsn_diff(confirmed_flush_lsn, '0/0'), 0),
+       pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')
   FROM pg_replication_slots
  WHERE slot_name = :'sub' OR slot_name LIKE 'pg\_%\_sync\_%'
  ORDER BY slot_name;
@@ -247,6 +277,8 @@ render() {
             hconf[ns] = $4 + 0
             hrecv[ns] = $5 + 0
             hend[ns] = $6 + 0
+            hgap[ns] = $7
+            horigin[ns] = $8 + 0
         } else if ($1 == "TB") {
             tb[$2 + 0, $3] = $4 + 0
             tt[$2 + 0, $3] = $5 + 0
@@ -260,20 +292,25 @@ render() {
         subname = $2; enabled = $3; apply_pid = $4
         last_age = $5; ready = $6 + 0; total = $7 + 0
         end_age = $8; wait_ev = $9; recv_bytes = $10 + 0
+        slotname = $11; origin_bytes = $12 + 0; origin_lsn = $13
         next
     }
+    $1 == "WORK" { parallel = $2; io_workers = $3; lock_workers = $4; idle_workers = $5; next }
+    $1 == "TOUCH" { touched[$2] = $3; next }
     $1 == "SLOT" {
         slot[++nslot] = $2
         slot_active[$2] = $3
         slot_wal[$2] = $4
         slot_ret[$2] = $5 + 0
         slot_conf[$2] = $6 + 0
-        if ($2 == subname) {
+        if ($2 == slotname) {
             main_slot = $2
             main_active = $3
             main_wal = $4
             main_ret = $5 + 0
             main_conf = $6 + 0
+            main_gap = ($6 + 0 > 0) ? ($7 - $6) : ""
+            if (main_gap != "" && main_gap < 0) main_gap = 0
         }
         if ($4 == "lost") lost = 1
         next
@@ -312,6 +349,8 @@ render() {
             prev_conf = hconf[oldest]
             prev_recv = hrecv[oldest]
             prev_end = hend[oldest]
+            prev_gap = hgap[oldest]
+            prev_origin = horigin[oldest]
         }
         dt = (prev_now > 0 && now > prev_now) ? (now - prev_now) : 0
         busy = 0
@@ -359,8 +398,9 @@ render() {
         apply_dead = (enabled == "t" && !apply_up && busy == 0 && total > 0)
         stale = (apply_up && last_age != "" && last_age + 0 > 120)
         # Tables can all be srsubstate=r while apply is still chewing the
-        # post-copy WAL backlog — 64MB / 45s is "caught up enough to call live".
-        lagging = (main_ret > 64*1024*1024 || (end_age != "" && end_age + 0 > 45))
+        # post-copy WAL backlog. Feedback timestamps are not data freshness.
+        # Use the confirmed gap, not the older WAL retention boundary.
+        lagging = (main_gap != "" && main_gap + 0 > 64*1024*1024)
         # Error counters are cumulative since stats_reset — show them, but
         # only siren on a live failure (slot lost, sub down, apply dead, stale).
         bad = (lost || sub_down || apply_dead || stale)
@@ -368,9 +408,8 @@ render() {
         net_bps = 0
         apply_bps = 0
         if (dt > 0) {
-            if (prev_ret > 0 && main_ret > 0) net_bps = (prev_ret - main_ret) / dt
-            if (prev_conf > 0 && main_conf > prev_conf) apply_bps = (main_conf - prev_conf) / dt
-            else if (prev_recv > 0 && recv_bytes > prev_recv) apply_bps = (recv_bytes - prev_recv) / dt
+            if (prev_gap != "" && main_gap != "") net_bps = (prev_gap - main_gap) / dt
+            if (prev_origin > 0 && origin_bytes > prev_origin) apply_bps = (origin_bytes - prev_origin) / dt
         }
 
         if (bad) {
@@ -379,6 +418,9 @@ render() {
             else if (enabled == "f") hstate = "DISABLED"
             else if (apply_dead)     hstate = "apply-down"
             else                     hstate = "stale"
+        } else if (all_ready && apply_up && main_gap == "") {
+            hicon = "⏳"
+            hstate = "gap unknown"
         } else if (all_ready && apply_up && !lagging) {
             hicon = green("✅")
             hstate = "streaming"
@@ -403,31 +445,20 @@ render() {
         if (apply_up) rest = rest (rest == "" ? "" : "  ") "apply " apply_pid
         else if (enabled == "t") rest = rest (rest == "" ? "" : "  ") "apply —"
         if (wait_ev != "") rest = rest (rest == "" ? "" : "  ") wait_ev
-        if (main_ret > 0) rest = rest (rest == "" ? "" : "  ") "lag " fmt_bytes(main_ret)
+        if (main_gap != "") rest = rest "  confirmed gap " fmt_bytes(main_gap)
+        if (main_ret > 0) rest = rest "  retained " fmt_bytes(main_ret)
         else if (main_slot == "" && nslot == 0) rest = rest (rest == "" ? "" : "  ") dim("publisher ?")
         if (end_age != "" && end_age + 0 > 5)
-            rest = rest (rest == "" ? "" : "  ") fmt_dur(end_age + 0) " behind"
+            rest = rest (rest == "" ? "" : "  ") "feedback age " fmt_dur(end_age + 0)
         if (main_active == "f" && main_slot != "") rest = rest "  slot idle"
         if (apply_err > 0) rest = rest "  apply_err=" apply_err
         if (sync_err > 0) rest = rest "  sync_err=" sync_err
         if (lagging && apply_up) {
-            if (apply_bps > 1024)
-                rest = rest "  " fmt_bytes(apply_bps) "/s"
-            caught = 0
-            if (dt > 0 && prev_end > 0 && end_age != "")
-                caught = prev_end - (end_age + 0)
             if (net_bps > 1024) {
-                e = eta_avg(main_ret / net_bps)
+                e = eta_avg(main_gap / net_bps)
                 if (e != "") rest = rest "  " e
-            } else if (caught > 0 && end_age + 0 > 0) {
-                e = eta_avg((end_age + 0) * dt / caught)
-                if (e != "") rest = rest "  " e
-            } else if (apply_bps > 1024 && main_ret > 0) {
-                e = eta_avg(main_ret / apply_bps)
-                if (e != "") rest = rest "  " e
-                if (net_bps < -1024) rest = rest "  gap widening"
-            } else if (dt >= 60 && caught <= 0 && end_age + 0 > 45) {
-                rest = rest "  not catching up"
+            } else if (dt > 0) {
+                rest = rest "  ETA — (gap not shrinking)"
             } else {
                 rest = rest "  ETA …"
             }
@@ -442,8 +473,15 @@ render() {
 
         if (subname == "") subname = "(no subscription)"
         line(hicon, subname, hstate, rest)
+        progress = origin_lsn != "" ? origin_lsn : "unknown"
+        if (dt > 0 && prev_origin > 0 && origin_bytes > 0) {
+            if (apply_bps > 0) progress = progress "  +" fmt_bytes(apply_bps) "/s WAL position"
+            else progress = progress "  unchanged over " fmt_dur(dt)
+        }
+        line("↳", "committed", progress,
+             sprintf("parallel %d: %d IO / %d lock / %d idle / %d other", parallel, io_workers, lock_workers, idle_workers, parallel - io_workers - lock_workers - idle_workers))
 
-        max_tbl = 8
+        max_tbl = ntbl > 8 ? 7 : 8
         shown = 0
         for (i = 1; i <= ntbl && shown < max_tbl; i++) {
             shown++
@@ -512,8 +550,9 @@ render() {
                 if (lrows[i] > 0) extra = extra "  ~" fmt_num(lrows[i]) " rows"
             } else if (state == "r") {
                 kind = "ok"
-                word = "ready"
+                word = "streaming"
                 extra = "~" fmt_num(lrows[i]) " rows"
+                if (touched[t] > 0) extra = extra sprintf("  apply txn: %d worker(s)", touched[t])
             } else {
                 kind = "wait"
                 word = (state == "" ? "unknown" : state)
@@ -570,12 +609,13 @@ record() {
             next
         }
         $1 == "NOW" { now = $2 + 0 }
-        $1 == "SUB" { subn = $2; recv = $10 + 0; endage = $8 + 0 }
+        $1 == "SUB" { subn = $11; recv = $10 + 0; endage = $8 + 0; origin = $12 + 0 }
         $1 == "SLOT" {
-            if ($2 == subn || (!have_main && $2 != "")) {
+            if ($2 == subn) {
                 ret = $5 + 0
                 conf = $6 + 0
-                if ($2 == subn) have_main = 1
+                gap = conf > 0 ? ($7 - conf) : ""
+                if (gap != "" && gap < 0) gap = 0
             }
         }
         $1 == "TBL" {
@@ -591,7 +631,7 @@ record() {
                 if (hts[i] >= keep_after && hts[i] < now) print line[i]
             for (i = 1; i <= nt; i++)
                 if (tts[i] >= keep_after && tts[i] < now) print tline[i]
-            print "SAMP|" now+0 "|" ret+0 "|" conf+0 "|" recv+0 "|" endage+0
+            print "SAMP|" now+0 "|" ret+0 "|" conf+0 "|" recv+0 "|" endage+0 "|" gap "|" sprintf("%.0f", origin)
             for (i = 1; i <= tn; i++)
                 print "TB|" now+0 "|" tname[i] "|" tbytes[i] "|" ttups[i]
         }

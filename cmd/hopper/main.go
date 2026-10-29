@@ -80,7 +80,8 @@ commands:
   rescan             queue files for repair-tier re-analysis (--missing-members or SHA-256 args)
   triage             fetch mislabeled samples to /var/tmp/hopper-triage
   post-triage        apply triage verdicts: re-scan, move + flip mislabeled samples
-  mv                 relabel SHA-256s (-target=good|bad|sighted|pending|review): move + flip on the master
+  mv                 relabel SHA-256s (-target=good|bad|sighted|inconclusive|dual-use|pending|review)
+  migrate-purgatory  move the legacy pool to inconclusive (dry-run; --apply; run on the corpus host)
   demote-sighted     move uncorroborated feed-claimed samples from bad/ to sighted/ (dry-run; -apply)
   cascade-backfill   propagate good/bad archive labels to their members (dry-run)
   stats              show sample counts
@@ -466,6 +467,8 @@ func run(ctx context.Context) error {
 		return cmdPostTriage(ctx)
 	case "mv":
 		return cmdMv(ctx)
+	case "migrate-purgatory":
+		return cmdMigratePurgatory(ctx)
 	case "demote-sighted":
 		return cmdDemoteSighted(ctx)
 	case "cascade-backfill":
@@ -1057,7 +1060,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	f := flag.NewFlagSet("load", flag.ExitOnError)
 	dsn := f.String("db", "", "database connection string")
 	dataDir := f.String("data", "",
-		"data directory containing bad/, good/, sighted/, incoming/, pending/, review/, or legacy unknown/ subdirectories")
+		"data directory containing bad/, good/, sighted/, inconclusive/, dual-use/, incoming/, pending/, review/, or legacy pool subdirectories")
 	source := f.String("source", hopper.SourceFilesystem,
 		"source tag for top-level rows this walk inserts that no collector already recorded "+
 			"(default \"fs\"; forager direct-inserts its own rows as \"forager\")")
@@ -1329,14 +1332,17 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	wd.beginStage("discover", "Discovering label directories")
 
 	// Discover label directories under --data. bad/, good/, sighted/ and
-	// purgatory/ map directly to classification labels. pending/, review/, legacy unknown/,
+	// inconclusive/ and dual-use/ map to classification labels. Legacy purgatory/
+	// is read as inconclusive. pending/, review/, legacy unknown/,
 	// and incoming/ are workflow/storage roots for unclassified samples.
 	var loadDirs []struct{ dir, label string }
 	for _, entry := range []struct{ name, label string }{
 		{"bad", "bad"},
 		{"good", "good"},
 		{"sighted", "sighted"},
-		{purgatoryPool, "purgatory"},
+		{inconclusivePool, "inconclusive"},
+		{dualUsePool, "dual-use"},
+		{purgatoryPool, "inconclusive"},
 		{pendingPool, "unknown"},
 		{reviewPool, "unknown"},
 		{legacyUnknownPool, "unknown"},
@@ -1348,8 +1354,10 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		}
 	}
 	if len(loadDirs) == 0 {
-		wd.failStage("discover", fmt.Sprintf("no bad/, good/, sighted/, purgatory/, pending/, review/, unknown/, or incoming/ in %s", *dataDir))
-		return fmt.Errorf("no bad/, good/, sighted/, purgatory/, pending/, review/, unknown/, or incoming/ subdirectories found in %s", *dataDir)
+		const pools = "bad/, good/, sighted/, inconclusive/, dual-use/, purgatory/, pending/, review/, unknown/, incoming/"
+		err := fmt.Errorf("no sample pool subdirectories found in %s (expected %s)", *dataDir, pools)
+		wd.failStage("discover", err.Error())
+		return err
 	}
 	wd.endStage("discover")
 

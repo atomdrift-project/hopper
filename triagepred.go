@@ -165,7 +165,7 @@ const (
 	// Digest claims name bytes and therefore need no version arm. Malicious and
 	// suspicious claims both need adjudication; vulnerability records describe a
 	// legitimate package's security defect and do not belong in a malware queue.
-	triageSightedWhere = `label != 'bad' AND cleave_result IS NOT NULL AND parent = '' AND skip = ''` +
+	triageSightedWhere = `label != 'bad' AND label IN ('good', 'unknown', 'sighted') AND cleave_result IS NOT NULL AND parent = '' AND skip = ''` +
 		triageServablePathSQL + `
 		   AND NOT EXISTS (SELECT 1 FROM reports r
 		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'sighted')`

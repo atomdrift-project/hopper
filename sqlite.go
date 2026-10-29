@@ -1212,6 +1212,7 @@ func jsonTextOrNil(b []byte) any {
 // rule-by-rule explanation of the pool-precedence label resolution.
 var sampleConflictUpdateSQLite = `ON CONFLICT (sha256) DO UPDATE SET
 	label = CASE
+		WHEN samples.label IN ('inconclusive', 'dual-use', 'purgatory') THEN samples.label
 		WHEN excluded.label_source = 'marker' THEN excluded.label
 		WHEN samples.label_source = 'marker' THEN excluded.label
 		WHEN (samples.label = 'good' AND excluded.label = 'bad')
@@ -1221,6 +1222,7 @@ var sampleConflictUpdateSQLite = `ON CONFLICT (sha256) DO UPDATE SET
 		ELSE samples.label
 	END,
 	label_source = CASE
+		WHEN samples.label IN ('inconclusive', 'dual-use', 'purgatory') THEN samples.label_source
 		WHEN excluded.label_source = 'marker' THEN 'marker'
 		WHEN samples.label_source = 'marker' THEN excluded.label_source
 		WHEN (samples.label = 'good' AND excluded.label = 'bad')
@@ -1254,6 +1256,7 @@ var sampleConflictUpdateSQLite = `ON CONFLICT (sha256) DO UPDATE SET
 	-- Label-related skips ('misclassified'/'conflict') track the resolution;
 	-- the walker also clears 'missing'/'unsupported'. Hard skips stick.
 	skip  = CASE
+		WHEN samples.label IN ('inconclusive', 'dual-use', 'purgatory') THEN samples.skip
 		WHEN excluded.label_source = 'marker' THEN 'misclassified'
 		WHEN samples.label_source = 'marker' AND samples.skip = 'misclassified' THEN ''
 		WHEN ((samples.label = 'good' AND excluded.label = 'bad')
@@ -3395,6 +3398,8 @@ func triageFilterClauseSQLite(f TriageFilter, sampleAlias string) (clause string
 
 func triageFilterClauseSQLiteKey(f TriageFilter, sampleAlias, reportKey string) (clause string, args []any) {
 	col := func(name string) string { return sampleAlias + "." + name }
+	// Reviewed exclusions also apply to otherwise label-agnostic queues.
+	clause = " AND " + col("label") + " IN ('bad', 'good', 'unknown', 'sighted')"
 	if len(f.ExcludeSHA256) > 0 {
 		encoded, _ := json.Marshal(f.ExcludeSHA256) //nolint:errcheck,errchkjson // []string always encodes
 		args = append(args, string(encoded))
@@ -5328,24 +5333,31 @@ func (db *DB) relabelFromPoolsSQLite(ctx context.Context, maxChanged int64) (int
 			SELECT sha256,
 				MAX(path LIKE 'bad/%')     AS in_bad,
 				MAX(path LIKE 'good/%')    AS in_good,
-				MAX(path LIKE 'sighted/%') AS in_sighted
+				MAX(path LIKE 'sighted/%') AS in_sighted,
+				MAX(path LIKE 'inconclusive/%' OR path LIKE 'purgatory/%') AS in_inconclusive,
+				MAX(path LIKE 'dual-use/%') AS in_dual_use
 			FROM walk_staging
 			GROUP BY sha256
 		)
 		SELECT s.sha256, s.label, s.skip,
-			CASE WHEN p.in_bad = 1 THEN 'bad'
+			CASE WHEN p.in_inconclusive = 1 THEN 'inconclusive'
+			     WHEN p.in_dual_use = 1 THEN 'dual-use'
+			     WHEN p.in_bad = 1 THEN 'bad'
 			     WHEN p.in_good = 1 THEN 'good'
 			     -- sighted/ only lifts unknown rows; it never demotes good/bad.
 			     WHEN p.in_sighted = 1 AND s.label = 'unknown' THEN 'sighted'
 			     ELSE s.label END,
-			CASE WHEN p.in_bad = 1 AND p.in_good = 1 THEN 'conflict'
+			CASE WHEN p.in_inconclusive = 1 OR p.in_dual_use = 1 THEN ''
+			     WHEN p.in_bad = 1 AND p.in_good = 1 THEN 'conflict'
 			     WHEN s.skip IN ('conflict', 'missing', 'unsupported') THEN ''
 			     ELSE s.skip END,
-			CASE WHEN p.in_bad = 1 AND p.in_good = 1 THEN 'conflict'
+			CASE WHEN p.in_inconclusive = 1 OR p.in_dual_use = 1 THEN s.label_source
+			     WHEN p.in_bad = 1 AND p.in_good = 1 THEN 'conflict'
 			     WHEN s.label_source = 'conflict' THEN ''
 			     ELSE s.label_source END
 		FROM samples s JOIN pools p ON p.sha256 = s.sha256
-		WHERE s.parent = '' AND s.label_source <> 'marker'`); err != nil {
+		WHERE s.parent = '' AND s.label_source <> 'marker'
+		  AND s.label NOT IN ('inconclusive', 'dual-use', 'purgatory')`); err != nil {
 		return 0, fmt.Errorf("hopper: relabel stage: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `

@@ -39,8 +39,10 @@ const (
 	reviewPool = hopper.PoolReview
 	// legacyUnknownPool is the pre-pending storage root retained for old rows.
 	legacyUnknownPool = hopper.PoolLegacyUnknown
-	// purgatoryPool is the greyware tree. Unlike the roots above it carries its
-	// own classification label ("purgatory"), not "unknown".
+	// Reviewed pools carry classification labels rather than workflow states.
+	inconclusivePool = hopper.PoolInconclusive
+	dualUsePool      = hopper.PoolDualUse
+	// Keep discovering the legacy tree until its locations have been migrated.
 	purgatoryPool = hopper.PoolPurgatory
 	// uploadBucket is the hot pool an upload enters. Analysis, not the producer,
 	// decides a sample's label, so every upload starts unlabelled. Draino later

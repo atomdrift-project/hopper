@@ -19,6 +19,8 @@
 # `zfs set` (probes direct/doas/sudo). Best-effort and idempotent: where it
 # can't manage ZFS — notably INSIDE a Bastille jail, whose pool lives on the
 # host — it prints how to run it on the host and exits 0 so callers don't fail.
+# REPLICA_ZFS_AUTOTRIM=preserve (default), on, or off controls the optional
+# pool-wide setting during apply. Promotion leaves that operator choice alone.
 
 set -eu
 
@@ -28,6 +30,11 @@ case "$MODE" in
     apply)  SYNC=disabled; LOGBIAS=throughput ;;
     revert) SYNC=standard; LOGBIAS=latency ;;
     *) echo "usage: $0 apply|revert [dataset ...]" >&2; exit 2 ;;
+esac
+AUTOTRIM="${REPLICA_ZFS_AUTOTRIM:-preserve}"
+case "$AUTOTRIM" in
+    preserve|on|off) ;;
+    *) echo "error: REPLICA_ZFS_AUTOTRIM must be preserve, on, or off" >&2; exit 2 ;;
 esac
 
 log() { echo "==> zfs-tune: $*"; }
@@ -103,13 +110,15 @@ for ds in $DATASETS; do
     zfs_cmd set "sync=$SYNC" "$ds"       || log "warning: failed to set sync on $ds"
     zfs_cmd set "logbias=$LOGBIAS" "$ds" || log "warning: failed to set logbias on $ds"
 done
-# NVMe-friendly pool default (role-agnostic — safe for a primary too, so no
-# revert): autotrim keeps sustained write performance up on SSD/NVMe.
-if [ "$MODE" = "apply" ]; then
+# Preserve pool maintenance policy unless explicitly overridden. Continuous
+# TRIM is not universally NVMe-friendly: on galadriel's SN8100, a controlled
+# TRIM raised read latency from ~0.086 ms to ~1.8 ms, returning to ~0.087 ms
+# when cancelled. Do not silently undo an operator's mitigation on setup.
+if [ "$MODE" = "apply" ] && [ "$AUTOTRIM" != "preserve" ]; then
     _pool=${DATASETS%% *}; _pool=${_pool%%/*}
-    if [ -n "$_pool" ] && [ "$(zpool_cmd get -H -o value autotrim "$_pool" 2>/dev/null)" != "on" ]; then
-        log "enabling autotrim on pool '$_pool' (NVMe/SSD sustained write perf)"
-        zpool_cmd set autotrim=on "$_pool" || log "warning: could not enable autotrim on $_pool"
+    if [ -n "$_pool" ] && [ "$(zpool_cmd get -H -o value autotrim "$_pool" 2>/dev/null)" != "$AUTOTRIM" ]; then
+        log "setting autotrim=$AUTOTRIM on pool '$_pool' (explicit override)"
+        zpool_cmd set "autotrim=$AUTOTRIM" "$_pool" || log "warning: could not set autotrim on $_pool"
     fi
 fi
 # shellcheck disable=SC2086 # intentional word-split of the dataset list

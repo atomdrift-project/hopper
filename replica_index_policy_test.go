@@ -27,7 +27,7 @@ import (
 func TestReplicaIndexPolicyIsComplete(t *testing.T) {
 	keep, drop, published := mustReplicaPolicy(t)
 
-	stmts := append(append(pgRuntimeMigrations(), pgReplicaIndexMigrations()...), trgmIndexDDL)
+	stmts := append(append(pgRuntimeMigrations(), pgReplicaTrainingMigrations()...), trgmIndexDDL)
 	seen := map[string]bool{}
 	var unclassified []string
 
@@ -88,7 +88,7 @@ func TestReplicaIndexPolicyMatchesSlimIndexes(t *testing.T) {
 	keep, drop, published := mustReplicaPolicy(t)
 
 	checked := map[string]bool{}
-	for _, stmt := range append(append(pgRuntimeMigrations(), pgReplicaIndexMigrations()...), trgmIndexDDL) {
+	for _, stmt := range append(append(pgRuntimeMigrations(), pgReplicaTrainingMigrations()...), trgmIndexDDL) {
 		m := createIndexRE.FindStringSubmatch(strings.TrimSpace(stmt))
 		if m == nil {
 			continue
@@ -229,6 +229,19 @@ func TestTrainingHashIndexIsReplicaOnly(t *testing.T) {
 		}
 		if found != replica {
 			t.Errorf("replica=%v: training index present=%v", replica, found)
+		}
+	}
+}
+
+func TestTrainingHashStatisticsAreReplicaOnly(t *testing.T) {
+	for _, replica := range []bool{false, true} {
+		db := &DB{}
+		db.SetReplicaIndexPolicy(replica)
+		joined := strings.Join(db.pgMigrationsForRole(), "\n")
+		for _, marker := range []string{"samples_training_hash_stats", "ANALYZE public.samples"} {
+			if strings.Contains(joined, marker) != replica {
+				t.Errorf("replica=%v: incorrect inclusion of %s", replica, marker)
+			}
 		}
 	}
 }

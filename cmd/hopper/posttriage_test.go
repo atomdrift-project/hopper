@@ -616,17 +616,23 @@ func TestRulingPlanPreservesSubpath(t *testing.T) {
 		{"bad discovery demote", "bad/foraged/" + sub, "sighted", "sighted/foraged/" + sub},
 		// The mislabeled-<label>/ buckets triagePlan writes are trees no root
 		// enumerates. They must keep everything below their pool root: with a
-		// basename they piled flat into the destination root, and purgatoryTree
-		// being the bare pool root put them in /data/samples/purgatory itself.
-		{"mislabeled to purgatory", "bad/mislabeled-good/" + sub, "purgatory", "purgatory/mislabeled-good/" + sub},
+		// basename they piled flat into the bare reviewed pool root.
+		{"legacy ruling", "bad/mislabeled-good/" + sub, "purgatory", "inconclusive/mislabeled-good/" + sub},
+		{"mislabeled to inconclusive", "bad/mislabeled-good/" + sub, "inconclusive", "inconclusive/mislabeled-good/" + sub},
+		{"mislabeled to dual-use", "bad/mislabeled-good/" + sub, "dual-use", "dual-use/mislabeled-good/" + sub},
+		{"legacy pool to dual-use", "purgatory/" + sub, "dual-use", "dual-use/" + sub},
+		{"inconclusive to dual-use", "inconclusive/" + sub, "dual-use", "dual-use/" + sub},
+		{"dual-use to inconclusive", "dual-use/" + sub, "inconclusive", "inconclusive/" + sub},
+		{"dual-use to good", "dual-use/" + sub, "good", "good/foraged-promote/" + sub},
+		{"inconclusive to bad", "inconclusive/" + sub, "bad", "bad/foraged-quarantine/" + sub},
 		{"mislabeled to sighted", "good/mislabeled-bad/" + sub, "sighted", "sighted/foraged/mislabeled-bad/" + sub},
 		{"mislabeled acquit", "bad/mislabeled-good/" + sub, "good", "good/foraged-promote/mislabeled-good/" + sub},
 		// Any other unenumerated pool tree keeps its subpath the same way.
-		{"unenumerated bad tree", "bad/cyclotron/" + sub, "purgatory", "purgatory/cyclotron/" + sub},
-		{"unenumerated sighted tree", "sighted/aur/" + sub, "purgatory", "purgatory/aur/" + sub},
+		{"unenumerated bad tree", "bad/cyclotron/" + sub, "inconclusive", "inconclusive/cyclotron/" + sub},
+		{"unenumerated sighted tree", "sighted/aur/" + sub, "dual-use", "dual-use/aur/" + sub},
 		{"unrooted", "misc/foraged-undetermined/" + sub, "good", "good/foraged-promote/foraged-undetermined/" + sub},
 		// Only a single-component path has nothing below a root to preserve.
-		{"single component", "evil-1.0.tgz", "purgatory", "purgatory/evil-1.0.tgz"},
+		{"single component", "evil-1.0.tgz", "inconclusive", "inconclusive/evil-1.0.tgz"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

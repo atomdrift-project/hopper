@@ -249,12 +249,16 @@ func TestCmdMvTargetValidation(t *testing.T) {
 	}
 }
 
-// Greyware: the sample moves into purgatory/ and takes the "purgatory" label,
-// which no training or triage selector names, so the corpus stops seeing it as
-// either class. good/datasets/ is a tree promoteSrcRoots does not enumerate, so
-// this also pins the subpath below the pool root against collapsing to a
-// basename and piling flat into purgatory/ itself.
-func TestCmdMvPurgatoryParksGreyware(t *testing.T) {
+// Reviewed classifications preserve provenance and accept retries. The legacy
+// CLI and API spelling writes inconclusive rather than a new purgatory row.
+func TestCmdMvReviewedPools(t *testing.T) {
+	for _, target := range []string{"inconclusive", "dual-use", "purgatory"} {
+		t.Run(target, func(t *testing.T) { testCmdMvReviewedPool(t, target) })
+	}
+}
+
+func testCmdMvReviewedPool(t *testing.T, target string) {
+	t.Helper()
 	ctx := t.Context()
 	root := t.TempDir()
 	db, url := mvTestServer(t, ctx, root)
@@ -262,13 +266,26 @@ func TestCmdMvPurgatoryParksGreyware(t *testing.T) {
 	oldRel := filepath.Join("good", "datasets", "PE", "dual-use.exe")
 	sha := writeMvSample(t, db, ctx, root, oldRel, "good", "greyware-bytes")
 
-	withArgs([]string{"hopper", "mv", "-url", url, "-target", "purgatory", sha}, func() {
+	withArgs([]string{"hopper", "mv", "-url", url, "-target", target, "-dry-run", sha}, func() {
+		if err := cmdMv(ctx); err != nil {
+			t.Fatalf("cmdMv preview: %v", err)
+		}
+	})
+	before, err := db.SampleBySHA256(ctx, sha)
+	if err != nil || before.Label != "good" || before.Path != oldRel {
+		t.Fatalf("preview changed sample: %+v, %v", before, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, oldRel)); err != nil {
+		t.Fatalf("preview disturbed source: %v", err)
+	}
+	withArgs([]string{"hopper", "mv", "-url", url, "-target", target, sha}, func() {
 		if err := cmdMv(ctx); err != nil {
 			t.Fatalf("cmdMv: %v", err)
 		}
 	})
 
-	wantRel := filepath.Join("purgatory", "datasets", "PE", "dual-use.exe")
+	wantLabel := hopper.CanonicalLabel(target)
+	wantRel := filepath.Join(wantLabel, "datasets", "PE", "dual-use.exe")
 	if _, err := os.Stat(filepath.Join(root, wantRel)); err != nil {
 		t.Fatalf("expected moved file at %s: %v", wantRel, err)
 	}
@@ -279,12 +296,12 @@ func TestCmdMvPurgatoryParksGreyware(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SampleBySHA256: %v", err)
 	}
-	if samp.Label != "purgatory" || samp.Path != wantRel {
+	if samp.Label != wantLabel || samp.Path != wantRel {
 		t.Fatalf("row not updated: label=%q path=%q", samp.Label, samp.Path)
 	}
 
 	// Idempotent: a re-submitted ruling is a noop, not a second move.
-	withArgs([]string{"hopper", "mv", "-url", url, "-target", "purgatory", sha}, func() {
+	withArgs([]string{"hopper", "mv", "-url", url, "-target", target, sha}, func() {
 		if err := cmdMv(ctx); err != nil {
 			t.Fatalf("cmdMv re-run: %v", err)
 		}
@@ -292,10 +309,14 @@ func TestCmdMvPurgatoryParksGreyware(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, wantRel)); err != nil {
 		t.Fatalf("re-run disturbed the parked file: %v", err)
 	}
+	// Older clients send the alias directly to the API, bypassing cmdMv.
+	resp, err := postTriage(ctx, url, triageRequest{Verdicts: []triageVerdict{{SHA256: sha, Ruling: target}}})
+	if err != nil || resp.Noop != 1 || resp.Failed != 0 {
+		t.Fatalf("API retry: %+v, %v", resp, err)
+	}
 }
 
-// A ruling still moves a sample back out, and the suffix beneath purgatory/ is
-// preserved rather than collapsed on the round trip.
+// Correcting a reviewed sample records the former label in its bucket.
 func TestCmdMvPurgatoryRoundTrip(t *testing.T) {
 	ctx := t.Context()
 	root := t.TempDir()
@@ -310,7 +331,7 @@ func TestCmdMvPurgatoryRoundTrip(t *testing.T) {
 		}
 	})
 
-	wantRel := filepath.Join("bad", "mislabeled-purgatory", "pkg.tgz")
+	wantRel := filepath.Join("bad", "mislabeled-inconclusive", "pkg.tgz")
 	if _, err := os.Stat(filepath.Join(root, wantRel)); err != nil {
 		t.Fatalf("expected moved file at %s: %v", wantRel, err)
 	}
@@ -320,5 +341,27 @@ func TestCmdMvPurgatoryRoundTrip(t *testing.T) {
 	}
 	if samp.Label != "bad" {
 		t.Fatalf("label = %q, want bad", samp.Label)
+	}
+}
+
+func TestCmdMvBetweenReviewedPools(t *testing.T) {
+	ctx := t.Context()
+	root := t.TempDir()
+	db, url := mvTestServer(t, ctx, root)
+	sha := writeMvSample(t, db, ctx, root, "inconclusive/npm/pkg.tgz", "inconclusive", "reviewed-bytes")
+	for _, target := range []string{"dual-use", "inconclusive", "sighted"} {
+		withArgs([]string{"hopper", "mv", "-url", url, "-target", target, sha}, func() {
+			if err := cmdMv(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
+		wantPath := target + "/npm/pkg.tgz"
+		if target == "sighted" {
+			wantPath = "sighted/foraged/npm/pkg.tgz"
+		}
+		sample, err := db.SampleBySHA256(ctx, sha)
+		if err != nil || sample.Label != target || sample.Path != wantPath {
+			t.Fatalf("move to %s: %+v, %v", target, sample, err)
+		}
 	}
 }

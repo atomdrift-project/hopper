@@ -124,7 +124,6 @@ idx_samples_unconvicted_susp_stale
 idx_samples_version_drift_newest
 idx_sightings_review_queue
 idx_sightings_subject
-idx_sl_child_parents
 idx_sl_containment
 idx_slh_sha256_retired
 '
@@ -211,7 +210,17 @@ idx_slh_sha256_retired
 #       serves only a source/label-filtered feed or FeedEcosystems/FeedDomains
 #       call. prism never sets FeedQuery.Source or .Label and calls both
 #       dropdowns unfiltered, which take the loose-scan path.
+# idx_sl_child_parents is PARKED on the replica (2026-10-28). Its 765 GB
+# btree accounted for 43.4 million index-block reads during apply, with zero
+# lookup scans. More importantly, ParentArchivesForChild has no production
+# caller in Hopper's read API; requeueContainingParentsPG is a primary write
+# path. pg_stat_statements recorded no sample_locations queries over the
+# nine-hour observation window on galadriel (no statement evictions).
+# Keep idx_sl_containment: read-side containment predicates still need it.
+# Restore this index BEFORE routing parent-backlink queries or direct SQL
+# consumers of that access path to the replica. The primary keeps its index.
 REPLICA_DROP_INDEXES='
+idx_sl_child_parents
 idx_samples_unconvicted_route_fresh
 idx_samples_good_route_score
 idx_samples_sighted_purl

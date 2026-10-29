@@ -148,8 +148,8 @@ func LitmusClass(result []byte) int {
 	}
 }
 
-// Pool labels, ordered by precedence: purgatory > bad > good > sighted >
-// unknown.
+// Pool labels, ordered by precedence: inconclusive = dual-use > bad > good >
+// sighted > unknown. The legacy purgatory label has the same protected rank.
 //
 // "sighted" is a feed claim pending verification: an external threat feed
 // named the package or hash (see the sightings ledger) but no independent
@@ -158,24 +158,27 @@ func LitmusClass(result []byte) int {
 // bad only by promoter's corroboration rules. "unknown" remains the
 // no-claims background pool.
 //
-// "purgatory" is greyware: dual-use tooling and unclassifiable artifacts an
-// operator has decided are neither certified-benign nor malicious, so training
-// must see them as neither. It needs no selector of its own to achieve that —
-// every training and triage selector names the labels it wants (label = 'good',
-// label IN ('unknown','sighted')) rather than excluding 'bad', so an unlisted
-// label is already outside all of them.
+// "inconclusive" means carefully reviewed without enough evidence for a firm
+// verdict. "dual-use" means reviewed tooling with legitimate and malicious
+// applications that make a binary training label inappropriate. Training must
+// see both as neither good nor bad. They need no selector to achieve that —
+// training selectors name the labels they want (label = 'good', label IN
+// ('unknown','sighted')). The shared triage filter also limits selection to
+// bad/good/unknown/sighted, including otherwise label-agnostic queues.
 //
-// It ranks above bad deliberately. The rank decides only what a *re-observation*
+// Both rank above bad deliberately. The rank decides what a *re-observation*
 // may overwrite (see sampleConflictUpdatePG), and parking a sample here is a
 // human judgement that a later forager walk or feed claim must not silently
 // undo. An explicit ruling still moves it out: /api/triage writes the label
 // through MoveLocation, which assigns directly and never consults the rank.
 const (
-	labelUnknown   = "unknown"
-	labelSighted   = "sighted"
-	labelGood      = "good"
-	labelBad       = "bad"
-	labelPurgatory = "purgatory"
+	labelUnknown      = "unknown"
+	labelSighted      = "sighted"
+	labelGood         = "good"
+	labelBad          = "bad"
+	labelInconclusive = "inconclusive"
+	labelDualUse      = "dual-use"
+	labelPurgatory    = "purgatory" // legacy; accepted on input only
 )
 
 // Unknown-class storage roots. The root records workflow and storage tier; it
@@ -187,10 +190,25 @@ const (
 	PoolLegacyUnknown = "unknown"
 )
 
-// PoolPurgatory is the greyware storage root. Unlike the pools above it is a
-// classification tree, not a workflow tree: the root and the label agree, the
-// same way sighted/ and label "sighted" do.
+// PoolInconclusive holds carefully reviewed samples without a firm verdict.
+const PoolInconclusive = "inconclusive"
+
+// PoolDualUse holds reviewed tooling with legitimate and malicious uses.
+const PoolDualUse = "dual-use"
+
+// PoolPurgatory is the legacy storage root, read as inconclusive during ingest.
+//
+// Deprecated: use PoolInconclusive for new placements.
 const PoolPurgatory = "purgatory"
+
+// CanonicalLabel translates the legacy purgatory spelling to inconclusive.
+// Other labels pass through unchanged, including an empty label.
+func CanonicalLabel(label string) string {
+	if label == labelPurgatory {
+		return labelInconclusive
+	}
+	return label
+}
 
 // ProvenanceSidecarSuffix is the suffix used by Forager's on-disk metadata
 // sidecar. A physical location move treats the artifact and this sidecar as one
@@ -499,14 +517,15 @@ func logLabelTransition(sha, path, stored, storedSrc, storedSkip, in, inSrc stri
 	}
 }
 
-// labelRank orders pool labels for precedence resolution: purgatory outranks
-// bad outranks good outranks sighted outranks unknown. Used to decide whether a
+// labelRank orders pool labels for precedence resolution: inconclusive and
+// dual-use equally outrank bad, good, sighted, and unknown. It decides whether a
 // re-observation promotes a sample. A feed claim (sighted) never overrides a
 // verified good or bad label, and nothing observed on a walk overrides an
-// operator's purgatory ruling. Keep in sync with labelRankSQL.
+// reviewed ruling. Equal ranks cannot overwrite each other on re-observation.
+// Keep in sync with labelRankSQL.
 func labelRank(label string) int {
 	switch label {
-	case labelPurgatory:
+	case labelInconclusive, labelDualUse, labelPurgatory:
 		return 4
 	case labelBad:
 		return 3
@@ -524,7 +543,8 @@ func labelRank(label string) int {
 // compile-time constant) into the upsert/relabel statements in pg.go and
 // sqlite.go so the precedence order cannot drift between Go and SQL.
 func labelRankSQL(col string) string {
-	return "(CASE " + col + " WHEN 'purgatory' THEN 4 WHEN 'bad' THEN 3 " +
+	return "(CASE " + col + " WHEN 'inconclusive' THEN 4 WHEN 'dual-use' THEN 4 " +
+		"WHEN 'purgatory' THEN 4 WHEN 'bad' THEN 3 " +
 		"WHEN 'good' THEN 2 WHEN 'sighted' THEN 1 ELSE 0 END)"
 }
 
@@ -537,6 +557,9 @@ func labelRankSQL(col string) string {
 // labels. stored* is the existing row; in*/inSrc is the incoming (already
 // marker-processed) pool observation.
 func classifyLabelTransition(stored, storedSrc, storedSkip, in, inSrc string) (category, from, to string) {
+	if labelRank(stored) == 4 {
+		return "", "", ""
+	}
 	switch {
 	case inSrc == labelSourceMarker:
 		// Rule 1: a contradicting marker is present; Go already logged it.
@@ -2627,7 +2650,7 @@ func validSample(s *Sample) bool {
 	return s.SizeBytes == 0 || s.SizeBytes >= MinSampleSize
 }
 
-// normalizeLabel rewrites an unset label to labelUnknown, the canonical
+// normalizeLabel canonicalizes the legacy alias and rewrites an unset label to labelUnknown, the canonical
 // no-claims value. Both mean "nothing has claimed this sample", but only
 // 'unknown' is selectable: every triage query matches the four pool labels
 // exactly, so a row stored as "" is invisible to all of them, to the cascade
@@ -2646,8 +2669,11 @@ func validSample(s *Sample) bool {
 // public entry points, sampleStagingRows covers the PG batch and member-staging
 // paths that bypass them, and storeResultSQLite covers the SQLite member path.
 func normalizeLabel(s *Sample) {
-	if s != nil && s.Label == "" {
-		s.Label = labelUnknown
+	if s != nil {
+		s.Label = CanonicalLabel(s.Label)
+		if s.Label == "" {
+			s.Label = labelUnknown
+		}
 	}
 }
 
@@ -3056,7 +3082,7 @@ func (c IncomingCursor) IsZero() bool { return c.FirstSeenAt.IsZero() && c.SHA25
 // it has not been judged yet, moving it to pending/ is a real cross-pool byte
 // copy, and it will be slower to re-read when a worker finally gets to it. An
 // IncomingClassified sample is finished — it already belongs in good/, bad/,
-// sighted/ or purgatory/, it is only still on the hot pool because nothing ever
+// sighted/, inconclusive/, or dual-use/, it is only still on the hot pool because nothing ever
 // relocated it, and moving it is usually free: its destination pool already
 // holds the same bytes, so the move publishes by hard link instead of copying.
 //
@@ -3111,6 +3137,11 @@ func (db *DB) DuplicateLocationSHAs(ctx context.Context, afterSHA string, limit 
 func (db *DB) prepareLocationMove(
 	ctx context.Context, sha256, oldRel, newRel string, relabel *LocationRelabel,
 ) (bool, error) {
+	if relabel != nil {
+		canonical := *relabel
+		canonical.Label = CanonicalLabel(canonical.Label)
+		relabel = &canonical
+	}
 	var ok bool
 	var err error
 	if db.pool != nil {
@@ -4211,6 +4242,7 @@ func (db *DB) MarkCyclotronAttempt(ctx context.Context, sha256 string) error {
 // Reclassify changes a sample's label. A conviction (label bad) also queues the
 // package's stale sibling artifacts for re-analysis; see QueueSiblingRescans.
 func (db *DB) Reclassify(ctx context.Context, sha256, label, source string) error {
+	label = CanonicalLabel(label)
 	var err error
 	if db.pool != nil {
 		err = db.writeSHA(sha256, db.reclassifyPG(ctx, sha256, label, source))
@@ -5067,7 +5099,9 @@ func (db *DB) BadReview(ctx context.Context, scoreThreshold, limit int) ([]*Samp
 	return db.badReviewSQLite(ctx, scoreThreshold, limit)
 }
 
-// TriageFilter optionally narrows triage queries to a specific ecosystem and/or file type.
+// TriageFilter optionally narrows triage queries to an ecosystem or file type.
+// All triage filters exclude reviewed inconclusive and dual-use classifications,
+// including legacy purgatory rows, before ranking or limiting candidates.
 type TriageFilter struct {
 	// Field order is chosen for alignment (time.Time, then strings, then the
 	// int) rather than for reading order; govet's fieldalignment enforces it.

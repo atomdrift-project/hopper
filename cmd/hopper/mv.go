@@ -25,6 +25,8 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"github.com/atomdrift-project/hopper"
 )
 
 // mvTargets maps the -target value to the field of triageVerdict that carries
@@ -33,25 +35,27 @@ import (
 //   - verdict ("good"/"bad") is the operator correction — the file moves to
 //     <target>/mislabeled-<old-label>/<basename> so the bucket records what it
 //     was rescued from, and the label flips with source "triage".
-//   - ruling ("sighted"/"purgatory"/"pending"/"review") is the classification
+//   - ruling ("sighted"/"inconclusive"/"dual-use"/"pending"/"review") is the classification
 //     flow — the file moves into that pool's tree with its source subpath
-//     preserved. "purgatory" is greyware the corpus must not train on either
+//     preserved. Reviewed inconclusive and dual-use samples must not train either
 //     way. "pending" and "review" are path-only workflow moves and the master
 //     rejects them for anything not currently labeled "unknown".
 //
 // Correcting a mislabeled sample is the first flow, which is why -target=good
 // and -target=bad send a verdict rather than the identically-spelled ruling.
 var mvTargets = map[string]string{
-	"good":      "verdict",
-	"bad":       "verdict",
-	"sighted":   "ruling",
-	"purgatory": "ruling",
-	"pending":   "ruling",
-	"review":    "ruling",
+	"good":         "verdict",
+	"bad":          "verdict",
+	"sighted":      "ruling",
+	"purgatory":    "ruling",
+	"inconclusive": "ruling",
+	"dual-use":     "ruling",
+	"pending":      "ruling",
+	"review":       "ruling",
 }
 
 func mvTargetNames() string {
-	return "good, bad, sighted, purgatory, pending, review"
+	return "good, bad, sighted, inconclusive, dual-use, pending, review (purgatory is an alias for inconclusive)"
 }
 
 func cmdMv(ctx context.Context) error {
@@ -69,7 +73,7 @@ func cmdMv(ctx context.Context) error {
 		}
 		return fmt.Errorf("mv: unknown -target %q (want one of: %s)", *target, mvTargetNames())
 	}
-	label := strings.ToLower(strings.TrimSpace(*target))
+	label := hopper.CanonicalLabel(strings.ToLower(strings.TrimSpace(*target)))
 
 	shas, err := collectMvSHAs(f.Args(), os.Stdin)
 	if err != nil {

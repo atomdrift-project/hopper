@@ -162,7 +162,7 @@ func (s *apiServer) handleIncomingLocations(w http.ResponseWriter, r *http.Reque
 //   - Verdict ("good"|"bad") is the operator post-triage flow: the file moves
 //     into a <verdict>/mislabeled-<old-label>/ bucket (basename only) and is
 //     relabeled.
-//   - Ruling ("good"|"bad"|"sighted"|"purgatory") is the remote classification flow
+//   - Ruling ("good"|"bad"|"sighted"|"inconclusive"|"dual-use") is the classification flow
 //     (promoter, or the demote-sighted backfill): the file moves into the
 //     ruling's pool tree with its source subpath preserved and is relabeled.
 //   - Ruling ("pending"|"review") is a workflow move within the unknown-class
@@ -186,11 +186,12 @@ const (
 	promoteGoodTree = "good/foraged-promote"
 	promoteBadTree  = "bad/foraged-quarantine"
 	sightedTree     = "sighted/foraged"
-	// Greyware has no discovery tree beneath it the way sighted/foraged does:
+	// Reviewed pools have no discovery tree beneath them like sighted/foraged:
 	// a sample lands here by operator judgement from anywhere in the pool, so
 	// the root is the whole destination and the subpath rule below applies
 	// unchanged.
-	purgatoryTree = purgatoryPool
+	inconclusiveTree = inconclusivePool
+	dualUseTree      = dualUsePool
 )
 
 // promoteSrcRoots are the trees a ruled sample may start from; the first
@@ -228,7 +229,9 @@ var promoteSrcRoots = []string{
 	uploadDirForager + "/",
 	promoteGoodTree + "/",
 	promoteBadTree + "/",
-	purgatoryTree + "/",
+	inconclusiveTree + "/",
+	dualUseTree + "/",
+	purgatoryPool + "/", // legacy source tree
 }
 
 // placement is a triage item's resolved destination: the new relative path and
@@ -247,15 +250,17 @@ type placement struct {
 // unrecognized ruling.
 func rulingPlan(_ *hopper.Sample, oldRel, ruling string) (placement, bool) {
 	sub := rulingSubpath(oldRel)
-	switch ruling {
+	switch hopper.CanonicalLabel(ruling) {
 	case "good":
 		return placement{newRel: filepath.Join(promoteGoodTree, sub), label: "good", source: "promoter"}, true
 	case "bad":
 		return placement{newRel: filepath.Join(promoteBadTree, sub), label: "bad", source: "promoter"}, true
 	case "sighted":
 		return placement{newRel: filepath.Join(sightedTree, sub), label: "sighted", source: "promoter"}, true
-	case "purgatory":
-		return placement{newRel: filepath.Join(purgatoryTree, sub), label: "purgatory", source: "triage"}, true
+	case "inconclusive":
+		return placement{newRel: filepath.Join(inconclusiveTree, sub), label: "inconclusive", source: "triage"}, true
+	case "dual-use":
+		return placement{newRel: filepath.Join(dualUseTree, sub), label: "dual-use", source: "triage"}, true
 	case "pending":
 		return workflowPlan(oldRel, pendingPool)
 	case "review":
@@ -272,8 +277,8 @@ func rulingPlan(_ *hopper.Sample, oldRel, ruling string) (placement, bool) {
 // That fallback is not the same as the basename. The pools grow trees nobody
 // enumerated above — the mislabeled-<label>/ buckets triagePlan itself writes,
 // for one — and a basename both discards the provenance the subpath records
-// and piles unrelated samples into the destination root. purgatoryTree is the
-// bare pool root, so there it piled them into /data/samples/purgatory itself.
+// and piles unrelated samples into the destination root. Reviewed pools use a
+// bare pool root, so their destinations need the same suffix preservation.
 // Only a single-component path has nothing left below its root to preserve.
 func rulingSubpath(oldRel string) string {
 	for _, root := range promoteSrcRoots {
@@ -385,6 +390,7 @@ func (s *apiServer) handleTriage(w http.ResponseWriter, r *http.Request) {
 // relocateTriaged resolves one exact catalog location, then delegates the
 // durable filesystem and catalog transition to hopper.DB.MoveLocation.
 func (s *apiServer) relocateTriaged(ctx context.Context, verdict triageVerdict, dryRun bool) triageResult {
+	verdict.Ruling = hopper.CanonicalLabel(verdict.Ruling)
 	res := triageResult{SHA256: verdict.SHA256}
 	sha := strings.ToLower(strings.TrimSpace(verdict.SHA256))
 	if !validSHA256(sha) {
@@ -426,7 +432,8 @@ func (s *apiServer) relocateTriaged(ctx context.Context, verdict triageVerdict, 
 			verdict.Ruling == "good" && samp.Label == "good",
 			verdict.Ruling == "bad" && samp.Label == "bad",
 			verdict.Ruling == "sighted" && samp.Label == "sighted" && strings.HasPrefix(oldRel, sightedTree+"/"),
-			verdict.Ruling == "purgatory" && samp.Label == "purgatory" && strings.HasPrefix(oldRel, purgatoryTree+"/"):
+			verdict.Ruling == "inconclusive" && samp.Label == "inconclusive" && strings.HasPrefix(oldRel, inconclusiveTree+"/"),
+			verdict.Ruling == "dual-use" && samp.Label == "dual-use" && strings.HasPrefix(oldRel, dualUseTree+"/"):
 			res.Status = "noop"
 			return res
 		}
@@ -572,7 +579,8 @@ func (*apiServer) triagePlan(samp *hopper.Sample, oldRel string, v triageVerdict
 	if v.Ruling != "" {
 		plan, ok := rulingPlan(samp, oldRel, v.Ruling)
 		if !ok {
-			return placement{}, errors.New(`ruling must be "good", "bad", "sighted", "purgatory", "pending", or "review"`)
+			return placement{}, errors.New(`ruling must be "good", "bad", "sighted", "inconclusive", "dual-use", "pending", or "review"` +
+				` ("purgatory" aliases "inconclusive")`)
 		}
 		if (v.Ruling == "pending" || v.Ruling == "review") && samp.Label != "unknown" {
 			return placement{}, errors.New(`workflow ruling requires label "unknown"`)

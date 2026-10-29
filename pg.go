@@ -2514,15 +2514,19 @@ func (db *DB) pgColumnExists(ctx context.Context, table, column string) (bool, e
 }
 
 func concurrentIndexDDL(ddl string) (string, bool) {
-	const prefix = "CREATE INDEX IF NOT EXISTS "
-	if !strings.HasPrefix(ddl, prefix) {
-		return "", false
+	// Embedded operator SQL may already request CONCURRENTLY. Route it through
+	// the same nontransactional path as indexes whose DDL we rewrite below.
+	for _, prefix := range []string{
+		"CREATE INDEX IF NOT EXISTS ",
+		"CREATE INDEX CONCURRENTLY IF NOT EXISTS ",
+	} {
+		if rest, ok := strings.CutPrefix(ddl, prefix); ok {
+			if fields := strings.Fields(rest); len(fields) > 0 {
+				return fields[0], true
+			}
+		}
 	}
-	fields := strings.Fields(ddl)
-	if len(fields) < 6 {
-		return "", false
-	}
-	return fields[5], true
+	return "", false
 }
 
 func concurrentDropIndexDDL(ddl string) (string, bool) {
@@ -3188,9 +3192,10 @@ const insertBatchStagingSessionDDL = insertBatchStagingCore
 // re-observations, used by both the single-row (insertSampleNewPG) and batch
 // (insertBatchStagingInsert) upserts so their resolution logic can't drift.
 //
-// Pool-precedence label resolution (rank: bad>good>sighted>unknown, see
+// Pool-precedence label resolution (reviewed labels > bad>good>sighted>unknown, see
 // labelRank/labelRankSQL), evaluated in order — see classifyLabelTransition
 // for the mirror used by logging:
+//  0. stored reviewed ruling         → preserve label, attribution, and skip
 //  1. incoming marker present        → take the marker's label, re-quarantine
 //  2. stored marker, none incoming   → marker gone, the directory governs again
 //  3. good+bad across pools          → resolve to bad, quarantine as 'conflict'
@@ -3202,6 +3207,7 @@ const insertBatchStagingSessionDDL = insertBatchStagingCore
 // changes a top-level label or clobbers its path on a content-hash collision.
 var sampleConflictUpdatePG = `ON CONFLICT (sha256) DO UPDATE SET
 	label = CASE
+		WHEN samples.label IN ('inconclusive', 'dual-use', 'purgatory') THEN samples.label
 		WHEN EXCLUDED.label_source = 'marker' THEN EXCLUDED.label
 		WHEN samples.label_source = 'marker' THEN EXCLUDED.label
 		WHEN (samples.label = 'good' AND EXCLUDED.label = 'bad')
@@ -3211,6 +3217,7 @@ var sampleConflictUpdatePG = `ON CONFLICT (sha256) DO UPDATE SET
 		ELSE samples.label
 	END,
 	label_source = CASE
+		WHEN samples.label IN ('inconclusive', 'dual-use', 'purgatory') THEN samples.label_source
 		WHEN EXCLUDED.label_source = 'marker' THEN 'marker'
 		WHEN samples.label_source = 'marker' THEN EXCLUDED.label_source
 		WHEN (samples.label = 'good' AND EXCLUDED.label = 'bad')
@@ -3249,6 +3256,7 @@ var sampleConflictUpdatePG = `ON CONFLICT (sha256) DO UPDATE SET
 	-- rejoins the analysis queue. Hard skips (corrupt/encrypted/replaced/
 	-- empty_path/skip-benign-archive-item) stick. See insertSampleNewPG.
 	skip  = CASE
+		WHEN samples.label IN ('inconclusive', 'dual-use', 'purgatory') THEN samples.skip
 		WHEN EXCLUDED.label_source = 'marker' THEN 'misclassified'
 		WHEN samples.label_source = 'marker' AND samples.skip = 'misclassified' THEN ''
 		WHEN ((samples.label = 'good' AND EXCLUDED.label = 'bad')
@@ -3334,6 +3342,7 @@ func logLabelTransitionsPG(ctx context.Context, tx pgx.Tx) {
 		FROM _staging st
 		JOIN samples s ON s.sha256 = st.sha256
 		WHERE st.sample_parent = '' AND s.parent = ''
+		  AND s.label NOT IN ('inconclusive', 'dual-use', 'purgatory')
 		  AND st.label_source <> 'marker'
 		  AND ((s.label_source = 'marker' AND (s.label <> st.label OR s.skip = 'misclassified'))
 		    OR (s.label_source <> 'marker'
@@ -5662,6 +5671,8 @@ func triageFilterClausePG(f TriageFilter, startIdx int, sampleAlias string) (cla
 
 func triageFilterClausePGKey(f TriageFilter, startIdx int, sampleAlias, reportKey string) (clause string, args []any) {
 	col := func(name string) string { return sampleAlias + "." + name }
+	// Reviewed exclusions also apply to otherwise label-agnostic queues.
+	clause = " AND " + col("label") + " IN ('bad', 'good', 'unknown', 'sighted')"
 	if len(f.ExcludeSHA256) > 0 {
 		args = append(args, f.ExcludeSHA256)
 		clause += fmt.Sprintf(" AND NOT (%s = ANY($%d::text[]))", reportKey, startIdx)
@@ -8820,7 +8831,9 @@ func (db *DB) relabelFromPoolsPG(ctx context.Context, maxChanged int64) (int64, 
 			SELECT sha256,
 				bool_or(path LIKE 'bad/%')     AS in_bad,
 				bool_or(path LIKE 'good/%')    AS in_good,
-				bool_or(path LIKE 'sighted/%') AS in_sighted
+				bool_or(path LIKE 'sighted/%') AS in_sighted,
+				bool_or(path LIKE 'inconclusive/%' OR path LIKE 'purgatory/%') AS in_inconclusive,
+				bool_or(path LIKE 'dual-use/%') AS in_dual_use
 			FROM walk_staging
 			GROUP BY sha256
 		),
@@ -8828,17 +8841,22 @@ func (db *DB) relabelFromPoolsPG(ctx context.Context, maxChanged int64) (int64, 
 			SELECT s.sha256, s.label AS old_label, s.skip AS old_skip,
 				-- sighted/ only lifts unknown rows (rank sighted > unknown); it
 				-- never demotes a verified good/bad label back to a feed claim.
-				CASE WHEN p.in_bad THEN 'bad' WHEN p.in_good THEN 'good'
+				CASE WHEN p.in_inconclusive THEN 'inconclusive'
+				     WHEN p.in_dual_use THEN 'dual-use'
+				     WHEN p.in_bad THEN 'bad' WHEN p.in_good THEN 'good'
 				     WHEN p.in_sighted AND s.label = 'unknown' THEN 'sighted'
 				     ELSE s.label END AS new_label,
-				CASE WHEN p.in_bad AND p.in_good THEN 'conflict'
+				CASE WHEN p.in_inconclusive OR p.in_dual_use THEN ''
+				     WHEN p.in_bad AND p.in_good THEN 'conflict'
 				     WHEN s.skip IN ('conflict', 'missing', 'unsupported') THEN ''
 				     ELSE s.skip END AS new_skip,
-				CASE WHEN p.in_bad AND p.in_good THEN 'conflict'
+				CASE WHEN p.in_inconclusive OR p.in_dual_use THEN s.label_source
+				     WHEN p.in_bad AND p.in_good THEN 'conflict'
 				     WHEN s.label_source = 'conflict' THEN ''
 				     ELSE s.label_source END AS new_source
 			FROM samples s JOIN pools p ON p.sha256 = s.sha256
 			WHERE s.parent = '' AND s.label_source <> 'marker'
+			  AND s.label NOT IN ('inconclusive', 'dual-use', 'purgatory')
 		),
 		changed AS (
 			SELECT sha256, old_label, old_skip, new_label, new_skip, new_source

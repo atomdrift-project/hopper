@@ -164,14 +164,28 @@ func (db *DB) skipReplicaIndex(ddl string) (bool, error) {
 //go:embed scripts/replica/training-index.sql
 var replicaTrainingIndexDDL string
 
-func pgReplicaIndexMigrations() []string {
-	return []string{strings.TrimSpace(replicaTrainingIndexDDL)}
+// Partial-index expression statistics do not give these route queries a usable
+// selectivity estimate. Table-level expression statistics prevent the planner
+// from treating a 1% sample as one third of the corpus.
+//
+//go:embed scripts/replica/training-statistics.sql
+var replicaTrainingStatisticsDDL string
+
+func pgReplicaTrainingMigrations() []string {
+	return []string{
+		strings.TrimSpace(replicaTrainingIndexDDL),
+		strings.TrimSpace(replicaTrainingStatisticsDDL),
+		// Schema-qualified spelling gives this one-time migration its own ledger
+		// key, distinct from the older ANALYZE samples migration. It is deferred
+		// after index creation by isDeferrableIndexDDL.
+		"ANALYZE public.samples",
+	}
 }
 
 func (db *DB) pgMigrationsForRole() []string {
 	migrations := pgRuntimeMigrations()
 	if db.replicaIndexPolicy {
-		migrations = append(migrations, pgReplicaIndexMigrations()...)
+		migrations = append(migrations, pgReplicaTrainingMigrations()...)
 	}
 	return migrations
 }

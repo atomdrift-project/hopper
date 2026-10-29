@@ -254,8 +254,9 @@ does), sized from host RAM: `shared_buffers` (~RAM/8, capped 16 GB),
 planner toward seq scans), `work_mem=64MB`, `max_parallel_workers_per_gather=4`,
 `checkpoint_timeout=30min`, `default_statistics_target=200`,
 `full_page_writes=off` (ZFS CoW → no torn pages, safe), and
-`synchronous_commit=off` (`promote.sh` restores it to `on`). `autotrim=on` and a
-deeper `vfs.zfs.vdev.async_read_max_active` are applied host-side too.
+`synchronous_commit=off` (`promote.sh` restores it to `on`). A deeper
+`vfs.zfs.vdev.async_read_max_active` is applied host-side too. Pool autotrim
+policy is preserved; see the measured TRIM interference below.
 
 **Still manual (most aggressive):** `fsync=off` trades a crash into a full
 rebuild — only worth it during a big rebuild, and `sync=disabled` at the ZFS
@@ -296,3 +297,75 @@ SELECT subname, subenabled FROM pg_subscription;
 
 A bare `SELECT` on `samples` returning `55P03` means a **table-level** lock (DDL /
 rewrite), not row contention — row locks never block plain reads.
+
+
+## Reading replica-watch during parallel apply
+
+`make replica-watch` separates the publisher's **confirmed gap** from **retained
+WAL**. Retention is measured from the slot's `restart_lsn`, which can lag behind
+confirmed progress. Catch-up status and ETA use the confirmed gap; an ETA is
+shown only while that gap shrinks over the observation window.
+
+The second line reports the subscription's replication-origin position and its
+change in WAL-position bytes per second, plus parallel-worker wait categories.
+This is not network throughput. Feedback age is the age of the last reported
+publisher end timestamp, not the age of the replica's data. An unchanged
+confirmed position can coexist with advancing local committed-origin progress.
+
+A table marked `streaming` has completed its initial copy. `apply txn: N
+worker(s)` means N apply workers hold transaction write locks on that table;
+it does not estimate rows left or identify the exact row currently executing.
+The main apply PID is selected separately from parallel workers. History uses
+a versioned filename so old retention-based samples cannot distort the new ETA.
+
+
+### Replica parent-backlink index
+
+On 2026-10-28, `idx_sl_child_parents` was parked in the replica drop list and
+removed concurrently from galadriel. It was 765 GiB in PostgreSQL's relation
+size accounting, had zero lookup scans, and dominated index-block reads while
+applying location inserts. The nine-hour statement history contained no
+`sample_locations` queries, and Hopper's read API has no caller of
+`ParentArchivesForChild`. The primary's requeue path still needs the index;
+its canonical migration and primary index are retained.
+
+Restore it before directing parent-backlink queries or direct SQL requiring
+that access path to this replica. The captured DDL is in
+`~/.hopper-replica-heal/slim-index-restore.sql`; move its name back to the keep
+list as part of that change. Rebuilding an index this size is expensive, so
+restoration must precede enabling the consumer. `idx_sl_containment` remains
+on the replica for read-side containment predicates.
+
+
+### TRIM interference on galadriel (2026-10-28)
+
+The SN8100 8 TB device had millisecond read latency while ZFS issued background
+TRIM. PostgreSQL apply workers were directly observed in 8 KiB `pread64` calls,
+blocked in `zfs_read -> zio_wait`, while updating B-tree indexes.
+
+A controlled free-space TRIM experiment reproduced the latency change:
+
+| Phase | Device read latency (10-second intervals) |
+|---|---|
+| No TRIM | 0.0866, 0.0864 ms |
+| Manual TRIM, capped at 100 MiB/s | 1.701, 1.817 ms |
+| TRIM cancelled | 0.0829, 0.0915 ms |
+
+An earlier 45-second autotrim pause reduced average read latency from 1.45 ms
+to 0.075 ms and increased committed WAL-position progress from 1.69 to
+3.06 MiB/s. These short throughput windows are workload-dependent; they do
+not establish a sustained catch-up rate. The controlled latency reversal is
+the stronger evidence for TRIM interference.
+
+Continuous autotrim is now disabled on galadriel's `tank` pool. Run free-space
+TRIM during a maintenance window; even a 100 MiB/s cap caused interference in
+this test. No recurring trim task was installed. The regular Linux fstrim timer
+is not a substitute for ZFS pool trimming. To undo the mitigation:
+
+```sh
+doas zpool set autotrim=on tank
+```
+
+`zfs-tune.sh` now preserves existing autotrim policy by default, so a replica
+setup does not re-enable it. An explicit `REPLICA_ZFS_AUTOTRIM=on` or `off`
+overrides the first pool during `apply`; `revert` leaves that policy alone.

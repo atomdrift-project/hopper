@@ -7724,24 +7724,28 @@ func TestCandidateQueriesCarryCreatedAt(t *testing.T) {
 	}
 }
 
-// Purgatory outranks every observed label so a walk or feed claim cannot undo
-// an operator's greyware ruling, and the SQL rendering must agree with the Go
-// one or the upsert and the logging path disagree about the same transition.
-func TestLabelRankPurgatoryOutranksObservations(t *testing.T) {
-	for _, lower := range []string{labelBad, labelGood, labelSighted, labelUnknown, ""} {
-		if labelRank(labelPurgatory) <= labelRank(lower) {
-			t.Fatalf("purgatory rank %d does not outrank %q (%d)",
-				labelRank(labelPurgatory), lower, labelRank(lower))
+// Reviewed labels outrank observed labels so a walk cannot undo a ruling,
+// and the SQL rendering must agree with Go so upserts and logging agree.
+func TestLabelRankReviewedOutranksObservations(t *testing.T) {
+	for _, reviewed := range []string{labelInconclusive, labelDualUse, labelPurgatory} {
+		for _, lower := range []string{labelBad, labelGood, labelSighted, labelUnknown, ""} {
+			if labelRank(reviewed) <= labelRank(lower) {
+				t.Fatalf("%s rank %d does not outrank %q (%d)",
+					reviewed, labelRank(reviewed), lower, labelRank(lower))
+			}
 		}
 	}
-	// Ordering below purgatory is unchanged.
+	if labelRank(labelInconclusive) != labelRank(labelDualUse) {
+		t.Fatal("reviewed labels must have equal precedence")
+	}
+	// Ordering below the reviewed labels is unchanged.
 	if labelRank(labelBad) <= labelRank(labelGood) ||
 		labelRank(labelGood) <= labelRank(labelSighted) ||
 		labelRank(labelSighted) <= labelRank(labelUnknown) {
 		t.Fatal("existing label precedence changed")
 	}
 	rankSQL := labelRankSQL("x")
-	for _, want := range []string{"'purgatory' THEN 4", "'bad' THEN 3", "'good' THEN 2", "'sighted' THEN 1"} {
+	for _, want := range []string{"'inconclusive' THEN 4", "'dual-use' THEN 4", "'purgatory' THEN 4", "'bad' THEN 3", "'good' THEN 2", "'sighted' THEN 1"} {
 		if !strings.Contains(rankSQL, want) {
 			t.Fatalf("labelRankSQL missing %q: %s", want, rankSQL)
 		}

@@ -22,7 +22,7 @@ collectors ──► hopper ──► postdoc workers
 - PostgreSQL and SQLite storage for samples, labels, provenance, and reports
 - Pull-based jobs for horizontally scaled `postdoc worker` processes
 - A file and result API with worker liveness and retry handling
-- Local filesystem ingestion from `bad/`, `good/`, `sighted/`, `purgatory/`, `pending/`, `review/`, and hot `incoming/` pools
+- Local filesystem ingestion from `bad/`, `good/`, `sighted/`, `inconclusive/`, `dual-use/`, `pending/`, `review/`, and hot `incoming/` pools (legacy `purgatory/` remains readable)
 - A dashboard for queue depth, workers, and analysis rates
 - Review, rescan, reconciliation, import, and backfill commands
 
@@ -54,19 +54,29 @@ Create a small labeled pool:
 samples/
 ├── bad/
 ├── good/
+├── dual-use/
+├── inconclusive/
 ├── incoming/
 ├── pending/
-├── purgatory/
 ├── review/
 └── sighted/
 ```
 
-`bad/`, `good/`, `sighted/` and `purgatory/` carry classification labels;
+`bad/`, `good/`, `sighted/`, `inconclusive/`, and `dual-use/` carry classification labels;
 `pending/`, `review/` and `incoming/` are workflow roots holding label
-`unknown`. `purgatory/` is greyware — dual-use tooling and artifacts that are
-neither certified benign nor malicious. Every training and triage selector
-names the labels it wants, so a purgatory sample is outside all of them and the
-corpus trains on it in neither direction.
+`unknown`. `inconclusive/` holds samples carefully reviewed without enough
+evidence for a confident benign or malicious verdict. `dual-use/` holds reviewed
+tooling with legitimate and malicious applications that make a binary training
+label inappropriate. Capability alone does not make every general-purpose tool
+dual-use, and does not override evidence that a particular artifact is malicious.
+Both reviewed labels are excluded from binary training and routine triage,
+including queues that otherwise compare detectors regardless of label.
+They have equal precedence above `bad`, so re-ingestion and pool reconciliation
+cannot undo a reviewed ruling or switch between them. An explicit ruling can.
+
+`purgatory` remains an input alias for `inconclusive`; new rulings write only the
+canonical label and pool. Ingestion still discovers legacy `purgatory/` as
+`inconclusive` until its catalogued locations have been migrated.
 
 `incoming/`, `pending/`, and `review/` are physical workflow roots. Samples in
 all three retain the catalog label `unknown`, and moves between them preserve
@@ -222,8 +232,10 @@ members) that were ingested as samples. Dry-run by default.
 ./hopper mv -url "$HOPPER_URL" -target=bad <sha256> <sha256>
 ./hopper mv -url "$HOPPER_URL" -target=good -dry-run < shas.txt
 
-# Park greyware where training sees it as neither class.
-./hopper mv -url "$HOPPER_URL" -target=purgatory < shas.txt
+# Record a careful but inconclusive review, outside binary training.
+./hopper mv -url "$HOPPER_URL" -target=inconclusive < shas.txt
+# Separately classify reviewed dual-use tooling.
+./hopper mv -url "$HOPPER_URL" -target=dual-use < dual-use-shas.txt
 
 # Audit hot samples queries for seq-scan regressions (needs production-like stats):
 HOPPER_PLAN_DSN="$DATABASE_URL" go test ./... -run TestPlanAudit -count=1
@@ -232,6 +244,32 @@ HOPPER_PLAN_DSN="$DATABASE_URL" go test ./... -run TestPlanAudit -count=1
 The bare `./hopper` command prints the maintained command list, including
 triage, cleanup, backfill, and corpus-reconciliation operations.
 
+To migrate the old pool, deploy the new binary first, then pause corpus ingestion
+and other movers on the full corpus host. Run the preview and apply against the
+database paired with that host's complete data root:
+
+```bash
+./hopper migrate-purgatory --db "$DATABASE_URL" --data /data/samples --dry-run
+./hopper migrate-purgatory --db "$DATABASE_URL" --data /data/samples --apply
+```
+
+The migration moves every catalogued standalone `purgatory/` observation to
+`inconclusive/`, preserving its suffix and provenance sidecar. It repairs contained
+member paths, then renames remaining `purgatory` labels, including archive members
+and samples stored outside the old pool. Attribution, skip state, and historical
+audit records are preserved; the rename adds an audit event. Each file move and
+catalog update is resumable: re-run after an interruption. Missing bytes,
+destination collisions, or samples with a newer classification are reported as
+failures and left for repair; label renaming waits until location moves succeed.
+Inspect the migration logs for affected paths. Index any uncatalogued artifacts
+with the new binary before migrating. Once migration completes, resume ingestion
+and other movers. Run separately for independent corpus hosts/catalogs; database
+replication does not move files on a replica's filesystem.
+
+Existing samples default to `inconclusive`. Move confirmed dual-use samples into
+`dual-use` with an explicit ruling after reviewing their rationale; the migration
+does not infer which ones belong there.
+
 Collimator performance iterations use the replica-only `idx_samples_training_hash`
 covering index defined in `scripts/replica/training-index.sql`. `hopper init -replica`
 builds it concurrently; ordinary primary migrations never create it.
@@ -239,3 +277,7 @@ The replica keep policy retains it. It covers a rehashed canonical group key, ro
 labels, scores and file types used by sampled training, allowing the planner to
 avoid repeated full-table metadata scans. The one-time index build is separate
 from a fresh training benchmark; replication continues during the build.
+The companion `training-statistics.sql` migration adds table-level expression
+statistics, followed by a one-time `ANALYZE public.samples`. Without those
+statistics PostgreSQL can overestimate the sampled fraction and choose the old
+route index even though the covering index exists.

@@ -967,6 +967,31 @@ func TestCmdLoadIncoming(t *testing.T) {
 	}
 }
 
+func TestCmdLoadReviewedPools(t *testing.T) {
+	useTestPathLister(t)
+	ctx := t.Context()
+	root := t.TempDir()
+	dbPath := filepath.Join(t.TempDir(), "reviewed.db")
+	for _, pool := range []string{"inconclusive", "dual-use", "purgatory"} {
+		mustMkdirAll(t, filepath.Join(root, pool, "datasets"))
+		mustWriteFile(t, filepath.Join(root, pool, "datasets", "sample.bin"), []byte("reviewed sample from "+pool))
+	}
+	withArgs([]string{
+		"hopper", "load", "-db", dbPath, "-data", root,
+		"-postdoc", "", "-cleave", "unused-test-cleave", "-dashboard-addr", "", "-api-addr", "", "-no-cache",
+	}, func() {
+		if err := cmdLoad(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+	db := mustOpenDB(t, ctx, dbPath)
+	defer db.Close()
+	counts, err := db.CountByLabel(ctx)
+	if err != nil || counts["inconclusive"] != 2 || counts["dual-use"] != 1 || counts["purgatory"] != 0 {
+		t.Fatalf("loaded reviewed labels: %+v, %v", counts, err)
+	}
+}
+
 func TestCmdLoadBothDirs(t *testing.T) {
 	useTestPathLister(t)
 	ctx := t.Context()
