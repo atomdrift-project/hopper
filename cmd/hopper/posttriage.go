@@ -445,7 +445,7 @@ func (s *apiServer) relocateTriaged(ctx context.Context, verdict triageVerdict, 
 		return res
 	}
 	res.NewPath = plan.newRel
-	if oldRel == plan.newRel {
+	if oldRel == plan.newRel && (plan.label == "" || plan.label == samp.Label) {
 		res.Status = "noop"
 		return res
 	}

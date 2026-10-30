@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -823,5 +824,80 @@ func TestHandleIncomingLocationsClassified(t *testing.T) {
 	api.handleIncomingLocations(rec, httptest.NewRequest(http.MethodGet, "/api/locations/incoming?class=sideways", http.NoBody))
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("class=sideways status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandleTriageSamePathRuling(t *testing.T) {
+	for _, corrupt := range []bool{false, true} {
+		t.Run(fmt.Sprint(corrupt), func(t *testing.T) {
+			ctx := t.Context()
+			root := t.TempDir()
+			db := mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
+			defer db.Close()
+			if err := db.Migrate(ctx); err != nil {
+				t.Fatal(err)
+			}
+			content := []byte("reviewed bytes")
+			sha := testSHA256(content)
+			rel := "inconclusive/example.bin"
+			abs := filepath.Join(root, rel)
+			if err := os.MkdirAll(filepath.Dir(abs), 0o750); err != nil {
+				t.Fatal(err)
+			}
+			actual := content
+			if corrupt {
+				actual = []byte("different bytes")
+			}
+			if err := os.WriteFile(abs, actual, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(abs+hopper.ProvenanceSidecarSuffix, []byte("provenance"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.InsertSample(ctx, &hopper.Sample{SHA256: sha, Path: rel, Label: "bad", LabelSource: "old"}); err != nil {
+				t.Fatal(err)
+			}
+			api := &apiServer{db: db, dataRoot: root, tracker: newWorkerTracker()}
+			request := triageRequest{Verdicts: []triageVerdict{{SHA256: sha, OldPath: rel, Ruling: "inconclusive", Source: "csv-review"}}, DryRun: true}
+			preview := callTriage(t, api, request)
+			if preview.Results[0].Status != "plan" {
+				t.Fatalf("preview: %+v", preview)
+			}
+			before, err := db.SampleBySHA256(ctx, sha)
+			if err != nil || before.Label != "bad" {
+				t.Fatalf("preview mutated sample: %+v %v", before, err)
+			}
+			request.DryRun = false
+			result := callTriage(t, api, request)
+			if corrupt {
+				if result.Failed != 1 {
+					t.Fatalf("accepted wrong bytes: %+v", result)
+				}
+			} else if result.Moved != 1 || result.Results[0].SourceRemoved || result.Results[0].BytesFreed != 0 {
+				t.Fatalf("ruling: %+v", result)
+			}
+			after, err := db.SampleBySHA256(ctx, sha)
+			want := "inconclusive"
+			if corrupt {
+				want = "bad"
+			}
+			if err != nil || after.Label != want || after.Path != rel {
+				t.Fatalf("sample: %+v %v", after, err)
+			}
+			data, err := os.ReadFile(abs)
+			if err != nil || !bytes.Equal(data, actual) {
+				t.Fatalf("artifact changed: %q %v", data, err)
+			}
+			data, err = os.ReadFile(abs + hopper.ProvenanceSidecarSuffix)
+			if err != nil || string(data) != "provenance" {
+				t.Fatalf("sidecar changed: %q %v", data, err)
+			}
+			if !corrupt {
+				again := callTriage(t, api, request)
+				if again.Noop != 1 {
+					t.Fatalf("retry: %+v", again)
+				}
+			}
+		})
 	}
 }

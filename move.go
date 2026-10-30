@@ -83,7 +83,7 @@ func (db *DB) MoveLocation(ctx context.Context, opts MoveLocationOptions) (MoveL
 	if !isLowerHexSHA256(sha) {
 		return result, fmt.Errorf("hopper: invalid sha256 %q", opts.SHA256)
 	}
-	if opts.OldPath == opts.NewPath {
+	if opts.OldPath == opts.NewPath && opts.Relabel == nil {
 		return result, errors.New("hopper: source and destination paths are identical")
 	}
 	root, oldAbs, err := resolveMovePath(opts.DataRoot, opts.OldPath)
@@ -134,6 +134,23 @@ func (db *DB) MoveLocation(ctx context.Context, opts MoveLocationOptions) (MoveL
 	}
 	if !os.SameFile(info, current) {
 		return result, fmt.Errorf("hopper: source changed while waiting for lock: %s", oldAbs)
+	}
+	// A renamed pool can already hold the correct bytes while the content's
+	// label still needs its ruling. Verify and audit that transition without
+	// publishing or removing the artifact or its provenance sidecar.
+	if opts.OldPath == opts.NewPath {
+		if err := verifyMoveFile(oldAbs, sha); err != nil {
+			return result, err
+		}
+		prepared, err := db.prepareLocationMove(ctx, sha, opts.OldPath, opts.NewPath, opts.Relabel)
+		if err != nil {
+			return result, err
+		}
+		if !prepared {
+			return result, errors.New("hopper: same-path ruling requires a recorded location")
+		}
+		result.Relocated = true
+		return result, nil
 	}
 
 	// Bytes identical to these may already sit inside the destination's pool —
