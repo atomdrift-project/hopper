@@ -1,5 +1,73 @@
 # Smaug rollout: inconclusive and dual-use pools
 
+## Collection review update (2026-10-29)
+
+The dataset rename has since been performed, and both `inconclusive` and
+`dual-use` datasets exist. The latest read-only service check found Hopper,
+Forager, Draino, and postdoc_worker stopped.
+
+The review artifacts are in `out/pool-review-20261029/` (generated, ignored by
+Git). `review.csv` has one row per SHA256 with current label/decider, paths,
+detected level, hostile-trait count, a decided pool, and rationale. The scope
+includes reviewed labels, legacy/current pool locations, and archive descendants:
+119,014 hashes. Five decisions have individual static inspection; the remaining
+decisions are explicitly marked best guesses. Unresolved cases default to
+inconclusive. Other good/bad pool signals inform the decision as requested.
+
+All live relocation and classification must use Hopper's built-in move API,
+`POST /api/triage` (also used by `hopper mv`). No independent SQL relabeler or
+filesystem deletion runner should apply this review. `export-pool-review-api.py`
+creates exact-location dry-run request bodies; it performs no network requests.
+
+Before applying the cleanup, address these current endpoint limitations within
+Hopper's API:
+
+- A SHA-only move can return noop when the label already agrees, despite other
+  locations being in the wrong pool. Exact `old_path` requests bypass that noop.
+- Individual moves currently derive their own destinations. Repeating them does
+  not guarantee one canonical location per SHA256; consolidation needs API-side
+  coordination using the existing verified `DB.MoveLocation` mechanism.
+- Catalog aliases under the renamed purgatory root may be missing on disk, or
+  may be ghosts from an earlier walk. Recovery must verify the surviving copy.
+- Virtual archive-member aliases must follow their containing archive while
+  preserving membership and independent labels. They are not standalone files.
+
+No live changes from the collection review have been applied. The original
+rollout instructions below describe the earlier inspected state.
+
+### Reproduce the review export
+
+The scripts require Python 3.9+ and `psql`. Use an output directory under `out/`
+for generated evidence. The database commands run read-only transactions; use
+the publisher with its location indexes for a full collection export.
+
+```sh
+mkdir -p out/pool-review
+# Set HOPPER_DB to the database DSN, using .pgpass for authentication.
+psql "$HOPPER_DB" -X -q -w -At -v ON_ERROR_STOP=1 \
+  -f scripts/pool-review-seeds.sql > out/pool-review/seeds.jsonl
+# Run this inventory on the corpus host, saving its stdout with the export.
+python3 scripts/inventory-pool-review.py --root /data/samples \
+  > out/pool-review/filesystem-inventory.jsonl
+python3 scripts/expand-pool-review.py --dsn "$HOPPER_DB" \
+  --seeds out/pool-review/seeds.jsonl --output out/pool-review/expanded-seeds.jsonl
+python3 scripts/export-pool-review.py --seeds out/pool-review/expanded-seeds.jsonl \
+  --inventory out/pool-review/filesystem-inventory.jsonl --output out/pool-review
+python3 scripts/decide-pool-review.py --directory out/pool-review
+python3 scripts/plan-pool-review.py --directory out/pool-review
+python3 scripts/export-pool-review-api.py --directory out/pool-review
+python3 -B scripts/tests/test_pool_review.py
+```
+
+Exporting can resume from `evidence.jsonl`; it retains each batch's capture
+timestamp. `--render-only` rebuilds the CSV without querying the database and
+preserves decision fields already present in that CSV. To refresh database
+evidence, use a new output directory. `decide-pool-review.py` uses collection-
+specific path and analysis heuristics, marks its decisions `best_guess`, and
+preserves rows marked `reviewed`. It is not a replacement for individual
+inspection. The preview and API export only write local files; they do not
+send requests or apply classifications.
+
 ## Scope and inspected state
 
 Replace the legacy `purgatory` label and pool with `inconclusive`, and add a
