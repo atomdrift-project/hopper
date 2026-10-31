@@ -8095,31 +8095,38 @@ func (db *DB) MarkClaimHandout(ctx context.Context, shas []string) error {
 	return nil
 }
 
-// SightedInvestigationLag reports how long the oldest eligible sample from a
-// recent threat-feed claim has waited for a Cyclotron judgement. It uses the
-// same sample and claim predicates as the sighted queues, independent of
-// acquisition attempted_at. Missing bytes, skipped samples, unanalyzed samples,
-// bad rulings and completed sighted reviews cannot page as investigation work.
+// SightedInvestigationLag reports the longest wait for judgement in the
+// sighted-pinned queue: available, eligible samples covered by an exact-version
+// malicious or suspicious package claim received within SightedPinnedWindow.
+// It shares the queue's claim matching and report filter, including completed
+// sighted-pinned reviews. Hash and whole-package claims belong to sighted.
 //
-// The clock starts when the claim, sample and first analysis are all present.
-// Claims older than SightedPinnedWindow remain in the ordinary sighted queue,
-// but do not turn its historical backlog into a page about today's arrivals.
+// The clock starts when the claim, sample and first analysis are all present,
+// independently of acquisition attempted_at.
 func (db *DB) SightedInvestigationLag(ctx context.Context) (time.Duration, error) {
 	now := time.Now().UTC()
 	cutoff := now.Add(-SightedPinnedWindow)
 	var seconds float64
 	var err error
+	filter := queueFilter("sighted-pinned", TriageFilter{})
 	if db.pool != nil {
-		err = db.pool.QueryRow(ctx, sightedInvestigationWaitCTE("$1")+`
-		 SELECT COALESCE(EXTRACT(epoch FROM $2::timestamptz - min(GREATEST(
+		extra, fargs := triageFilterClausePG(filter, 2, "samples")
+		args := append([]any{cutoff}, fargs...)
+		nowParam := "$" + strconv.Itoa(len(args)+1)
+		args = append(args, now)
+		err = db.pool.QueryRow(ctx, sightedInvestigationWaitCTE("$1", extra)+`
+		 SELECT COALESCE(EXTRACT(epoch FROM `+nowParam+`::timestamptz - min(GREATEST(
 		   first_seen, created_at, COALESCE(first_analyzed_at, analyzed_at, created_at)))), 0)
-		 FROM eligible`, cutoff, now).Scan(&seconds)
+		 FROM eligible`, args...).Scan(&seconds)
 	} else {
-		err = db.lite.QueryRowContext(ctx, sightedInvestigationWaitCTE("?")+`
+		extra, fargs := triageFilterClauseSQLite(filter, "samples")
+		args := append([]any{cutoff.Format(time.RFC3339Nano)}, fargs...)
+		args = append(args, now.Format(time.RFC3339Nano))
+		err = db.lite.QueryRowContext(ctx, sightedInvestigationWaitCTE("?", extra)+`
 		 SELECT COALESCE((julianday(?) - min(max(
 		   julianday(first_seen), julianday(created_at),
 		   julianday(COALESCE(first_analyzed_at, analyzed_at, created_at))))) * 86400.0, 0)
-		 FROM eligible`, cutoff, now).Scan(&seconds)
+		 FROM eligible`, args...).Scan(&seconds)
 	}
 	if err != nil {
 		return 0, fmt.Errorf("hopper: sighted investigation lag: %w", err)

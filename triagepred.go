@@ -307,22 +307,14 @@ const triageSightedMatchCTE = `WITH review_sightings AS (
 	)
 `
 
-// sightedInvestigationWaitCTE measures the same available, unjudged population
-// as sighted and sighted-pinned together. Bound the claims before matching the
-// indexed sample identities; the alert is about recent arrivals, not history.
-func sightedInvestigationWaitCTE(boundary string) string {
-	return `WITH recent_sightings AS (
-		SELECT subject, affected, first_seen FROM sightings
-		 WHERE claim IN ('malicious', 'suspicious') AND first_seen >= ` + boundary + `
-	), matching AS (
-		SELECT sm.id, s.first_seen FROM recent_sightings s JOIN samples sm ON sm.sha256 = s.subject
-		UNION ALL
-		SELECT sm.id, s.first_seen FROM recent_sightings s JOIN samples sm ON sm.purl_base = s.subject
-		 WHERE sm.purl_base <> '' AND (s.affected = '' OR s.affected = sm.version)
-	), eligible AS (
-		SELECT matching.first_seen, samples.created_at, samples.first_analyzed_at, samples.analyzed_at
-		  FROM matching JOIN samples ON samples.id = matching.id
-		 WHERE ` + triageSightedWhere + `
+// sightedInvestigationWaitCTE uses sighted-pinned's exact claim matching and
+// sample eligibility. extra is the queue's report filter for the SQL dialect.
+func sightedInvestigationWaitCTE(boundary, extra string) string {
+	return fmt.Sprintf(triageSightedPinnedMatchCTE, boundary) + `, eligible AS (
+		SELECT first_sightings.sighted_at AS first_seen, samples.created_at,
+		       samples.first_analyzed_at, samples.analyzed_at
+		  FROM samples JOIN first_sightings ON first_sightings.matched_sha = samples.sha256
+		 WHERE ` + triageSightedWhere + extra + `
 	)
 `
 }

@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func TestSightedInvestigationLagTracksEligibleRecentSamples(t *testing.T) {
+func TestSightedInvestigationLagTracksSightedPinned(t *testing.T) {
 	for _, b := range testBackends {
 		t.Run(b.name, func(t *testing.T) {
 			db := b.open(t)
@@ -28,15 +28,24 @@ func TestSightedInvestigationLagTracksEligibleRecentSamples(t *testing.T) {
 				if err != nil || lag < want-time.Minute || lag > want+time.Minute {
 					t.Fatalf("investigation lag = %v, %v; want approximately %v", lag, err, want)
 				}
+				rows, err := TriageQueues["sighted-pinned"].Select(ctx, db, 10)
+				if err != nil || (len(rows) == 0) != (want == 0) {
+					t.Fatalf("sighted-pinned has %d rows, %v; want empty=%v", len(rows), err, want == 0)
+				}
 			}
 
-			claim := addClaim(sha, "", 6*time.Hour)
+			addClaim(sha, "", 6*time.Hour)
 			check(0) // No sample bytes.
 			mustInsert(t, ctx, db, &Sample{SHA256: sha, Path: "pending/held.exe"})
 			check(0) // Not yet analyzed and eligible for Cyclotron.
 			mustAnalyze(t, ctx, db, sha, 0)
 			execBoth(t, ctx, db, `UPDATE samples SET created_at = $1, first_analyzed_at = $2, analyzed_at = $3 WHERE sha256 = $4`,
 				now.Add(-8*time.Hour), now.Add(-10*time.Minute), now.Add(-10*time.Minute), sha)
+			check(0) // Hash claims stay in ordinary sighted, even with ready bytes.
+			execBoth(t, ctx, db, `UPDATE samples SET purl_base = 'pkg:npm/ready', version = '1.0.0' WHERE sha256 = $1`, sha)
+			addClaim("pkg:npm/ready", "", 7*time.Hour)
+			check(0) // Whole-package claims also stay in ordinary sighted.
+			claim := addClaim("pkg:npm/ready", "1.0.0", 6*time.Hour)
 			check(10 * time.Minute) // The sample only became ready ten minutes ago.
 			execBoth(t, ctx, db, `UPDATE samples SET first_analyzed_at = $1 WHERE sha256 = $2`, now.Add(-5*time.Hour), sha)
 			check(5 * time.Hour)
@@ -67,6 +76,17 @@ func TestSightedInvestigationLagTracksEligibleRecentSamples(t *testing.T) {
 			execBoth(t, ctx, db, `UPDATE samples SET label = 'unknown', path = '' WHERE sha256 = $1`, pkg)
 			check(0)
 			execBoth(t, ctx, db, `UPDATE samples SET path = 'pending/pkg.tgz' WHERE sha256 = $1`, pkg)
+			check(4 * time.Hour)
+
+			// Completed urgent reviews drain the metric, including after a rescan
+			// while the queue's report cooldown is still active.
+			execBoth(t, ctx, db, `INSERT INTO reports (sha256, report_type, content) VALUES ($1, 'sighted-pinned', 'judgement=good')`, pkg)
+			check(0)
+			execBoth(t, ctx, db, `UPDATE samples SET analyzed_at = $1 WHERE sha256 = $2`, now.Add(time.Minute), pkg)
+			check(0)
+			execBoth(t, ctx, db, `DELETE FROM reports WHERE sha256 = $1`, pkg)
+			check(4 * time.Hour)
+			execBoth(t, ctx, db, `UPDATE sightings SET claim = 'suspicious' WHERE subject = 'pkg:npm/example'`)
 			check(4 * time.Hour)
 
 			// Historical claims stay in sighted, without paging as recent work.
