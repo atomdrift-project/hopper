@@ -213,22 +213,33 @@ func mustReplicaPolicy(t *testing.T) (keep, drop, published map[string]bool) {
 }
 
 func TestTrainingHashIndexIsReplicaOnly(t *testing.T) {
-	const name = "idx_samples_training_hash"
-	for _, replica := range []bool{false, true} {
-		db := &DB{}
-		db.SetReplicaIndexPolicy(replica)
-		found := false
-		for _, ddl := range db.pgMigrationsForRole() {
-			if strings.Contains(ddl, name) {
-				found = true
+	for _, name := range []string{"idx_samples_training_hash", "idx_samples_labeled_route"} {
+		for _, replica := range []bool{false, true} {
+			db := &DB{}
+			db.SetReplicaIndexPolicy(replica)
+			created := false
+			for _, ddl := range db.pgMigrationsForRole() {
+				if !strings.Contains(ddl, name) {
+					continue
+				}
+				if strings.HasPrefix(ddl, "DROP ") {
+					if replica {
+						t.Errorf("replica role drops %s, which its readers need", name)
+					}
+					continue
+				}
+				created = true
+				if _, ok := concurrentIndexDDL(ddl); !ok || !isDeferrableIndexDDL(ddl) {
+					t.Errorf("%s is not a deferred concurrent build: %q", name, ddl)
+				}
 				skip, err := db.skipReplicaIndex(ddl)
 				if err != nil || skip {
-					t.Fatalf("training index is dropped by replica policy: skip=%v err=%v", skip, err)
+					t.Fatalf("%s is dropped by replica policy: skip=%v err=%v", name, skip, err)
 				}
 			}
-		}
-		if found != replica {
-			t.Errorf("replica=%v: training index present=%v", replica, found)
+			if created != replica {
+				t.Errorf("replica=%v: %s created=%v", replica, name, created)
+			}
 		}
 	}
 }

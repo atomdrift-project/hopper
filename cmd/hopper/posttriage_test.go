@@ -901,3 +901,42 @@ func TestHandleTriageSamePathRuling(t *testing.T) {
 		})
 	}
 }
+
+// A sample tree carries a forager capture record beside each sample; the
+// re-scan passes --enable-sidecar so scan does not upload those records as
+// samples, and omits it for an older scan that would refuse it (and already
+// skips them).
+func TestScanUploadArgsPassSidecarFlagOnlyWhenSupported(t *testing.T) {
+	got := strings.Join(scanUploadArgs("http://h", "/d", true), " ")
+	if want := "fs --hopper http://h --enable-sidecar /d"; got != want {
+		t.Fatalf("supported: got %q, want %q", got, want)
+	}
+	got = strings.Join(scanUploadArgs("http://h", "/d", false), " ")
+	if want := "fs --hopper http://h /d"; got != want {
+		t.Fatalf("unsupported: got %q, want %q", got, want)
+	}
+}
+
+// Support is read from the scan's own help, and a scan that cannot be run is
+// an older build: the flag is never passed to a binary that did not list it.
+func TestScanSupportsSidecarsReadsTheScanHelp(t *testing.T) {
+	dir := t.TempDir()
+	fake := func(name, help string) string {
+		path := filepath.Join(dir, name)
+		script := "#!/bin/sh\ncat <<'HELP'\n" + help + "\nHELP\n"
+		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	ctx := context.Background()
+	if !scanSupportsSidecars(ctx, fake("new", "      --enable-sidecar  Treat collector capture records")) {
+		t.Fatal("a scan listing the flag must be given it")
+	}
+	if scanSupportsSidecars(ctx, fake("old", "      --registry-map <FILE>")) {
+		t.Fatal("a scan not listing the flag must not be given it")
+	}
+	if scanSupportsSidecars(ctx, filepath.Join(dir, "missing")) {
+		t.Fatal("an unrunnable scan must be treated as an older build")
+	}
+}

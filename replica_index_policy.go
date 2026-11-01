@@ -157,9 +157,27 @@ func (db *DB) skipReplicaIndex(ddl string) (bool, error) {
 	return replicaSkipsIndexDDL(ddl)
 }
 
-// replicaTrainingIndexDDL serves collimator's deterministic hash-sampled runs.
-// Keep this out of the primary's migration list: only a replica trains models.
-// The projection is covered so repeated 1-2% iterations need not scan the heap.
+// replicaTrainingIndexDDL holds the indexes only collimator reads, and
+// collimator reads only the replica. Keep them out of the primary's migration
+// list: only a replica trains models.
+//
+// idx_samples_training_hash serves the deterministic hash-sampled runs; its
+// projection is covered so repeated 1-2% iterations need not scan the heap.
+// idx_samples_labeled_route serves the per-route training-set export
+//
+//	SELECT id, sha256, label, canonical_sha256, score, file_type FROM samples
+//	 WHERE label IN ('bad','good') AND cleave_result IS NOT NULL AND skip = ''
+//	   AND id <= <snapshot> AND file_type = ANY(<route>) ORDER BY id
+//
+// (collimator data.py, stream_partitioned_metadata_grouped; its LABELED_WHERE
+// is the predicate verbatim). Without it each route was a Parallel Seq Scan of
+// ~93M rows, ~100 seconds, measured 2026-08-24. It moved here from the shared
+// list on 2026-10-23: no primary scan since 2026-09-16.
+//
+// One statement per semicolon, and no SQL comments. Spell each as
+// CREATE INDEX IF NOT EXISTS, never CONCURRENTLY: hopper defers that spelling
+// and rewrites it to a concurrent build outside a transaction, while an
+// explicit CONCURRENTLY runs inside one and fails (SQLSTATE 25001).
 //
 //go:embed scripts/replica/training-index.sql
 var replicaTrainingIndexDDL string
@@ -172,20 +190,25 @@ var replicaTrainingIndexDDL string
 var replicaTrainingStatisticsDDL string
 
 func pgReplicaTrainingMigrations() []string {
-	return []string{
-		strings.TrimSpace(replicaTrainingIndexDDL),
-		strings.TrimSpace(replicaTrainingStatisticsDDL),
-		// Schema-qualified spelling gives this one-time migration its own ledger
-		// key, distinct from the older ANALYZE samples migration. It is deferred
-		// after index creation by isDeferrableIndexDDL.
-		"ANALYZE public.samples",
+	var out []string
+	for stmt := range strings.SplitSeq(replicaTrainingIndexDDL, ";") {
+		if stmt = strings.TrimSpace(stmt); stmt != "" {
+			out = append(out, stmt+";")
+		}
 	}
+	return append(out, strings.TrimSpace(replicaTrainingStatisticsDDL), "ANALYZE public.samples")
+}
+
+// pgPrimaryIndexMigrations drops indexes that moved to the replica-only set.
+// The migration ledger is not replicated, so this must not run on the replica.
+func pgPrimaryIndexMigrations() []string {
+	return []string{`DROP INDEX IF EXISTS idx_samples_labeled_route`}
 }
 
 func (db *DB) pgMigrationsForRole() []string {
 	migrations := pgRuntimeMigrations()
 	if db.replicaIndexPolicy {
-		migrations = append(migrations, pgReplicaTrainingMigrations()...)
+		return append(migrations, pgReplicaTrainingMigrations()...)
 	}
-	return migrations
+	return append(migrations, pgPrimaryIndexMigrations()...)
 }

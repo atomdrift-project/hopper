@@ -396,12 +396,18 @@ const versionDriftCandCols = `id AS cand_id, sha256 AS cand_sha, purl_base AS ca
 // that HAVE a purl rather than all 14.5M clean benign samples, so it bitmap-scans
 // the lot and hash-joins. That mis-shape, not the probe count, is what kept the
 // queue at 25s+ after both earlier attempts to bound it.
+//
+// "Earlier" is creation order, ties broken by id: rows stored in one
+// transaction share created_at (PG's now() is the transaction's start; SQLite
+// keeps milliseconds), and a strict < would make such siblings never earlier.
+// The <= stays the index range; the id tie-break is only a filter on it.
 var versionDriftSiblingExists = `EXISTS (SELECT 1 FROM samples p
 	                WHERE p.purl_base = cand.cand_purl AND p.purl_base <> ''
 	                  AND p.sha256 <> cand.cand_sha
 	                  AND p.label = 'good' AND p.cleave_result IS NOT NULL AND p.skip = ''
 	                  AND p.max_crit < ` + strconv.Itoa(suspiciousCrit) + `
-	                  AND p.created_at < cand.cand_created)`
+	                  AND p.created_at <= cand.cand_created
+	                  AND (p.created_at < cand.cand_created OR p.id < cand.cand_id))`
 
 // cleanReleaseIndexPred is the probe's population: a benign-labelled release that
 // trips nothing and can be named by PURL. Shared with the migration so the index

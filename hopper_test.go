@@ -2969,6 +2969,37 @@ func TestMemberEnvelopeCarriesTraitsVersion(t *testing.T) {
 	}
 }
 
+// A reduced report names its fact profile in "fp". Members are stored as their
+// own rows, so each must carry it, or a reduced member reads as full facts and
+// training silently zeroes the inputs the profile dropped. "v" travels with it
+// so a member's generation is the parent's, whatever JSON type it was written as.
+func TestMemberEnvelopeCarriesSchemaAndFactProfile(t *testing.T) {
+	sha := fmt.Sprintf("%064x", 1)
+	file := fmt.Sprintf(`{"sha":%q,"type":"elf","path":"pkg/f.so","depth":1,"size":100}`, sha)
+	for _, tc := range []struct {
+		name, envelope, want string
+	}{
+		{"reduced v9", `"v":"9","fp":"azoth-0123456789abcdef",`, `{"v":"9","fp":"azoth-0123456789abcdef","files":[`},
+		{"full facts v8", `"v":"8",`, `{"v":"8","files":[`},
+		{"numeric v", `"v":7,`, `{"v":7,"files":[`},
+		{"neither", ``, `{"files":[`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := &Sample{
+				SHA256: fmt.Sprintf("%064x", 99), Source: "s", Label: "bad", Path: "bad/pkg.tar",
+				CleaveResult: []byte(`{` + tc.envelope + `"files":[` + file + `]}`),
+			}
+			members := memberSamplesFromEnvelope(parent)
+			if len(members) != 1 {
+				t.Fatalf("got %d members, want 1", len(members))
+			}
+			if got := string(members[0].CleaveResult); !strings.HasPrefix(got, tc.want) {
+				t.Errorf("member envelope = %s, want prefix %s", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestMemberEnvelopeBatchedBuildMatchesSingle(t *testing.T) {
 	mk := func(i int) string { return fmt.Sprintf("%064x", i+1) } // distinct lowercase-hex sha256
 

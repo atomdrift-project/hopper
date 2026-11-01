@@ -149,22 +149,6 @@ idx_slh_sha256_retired
 # (parseShellWordList) — every word inside the quotes is read as an index name,
 # so no comments may appear between them. Annotate above the list, as here.
 #
-# idx_samples_unconvicted_route_fresh is PARKED, not retired: move it back to
-# REPLICA_KEEP_INDEXES when cyclotron is repointed at the replica, and run
-# `make replica` to rebuild it BEFORE sending it traffic.
-#
-# It is cyclotron's ranked-queue index and cyclotron does not read galadriel
-# yet — zero scans over a 19h24m window (2026-09-05), with only prism and
-# hopper-replica holding connections. Meanwhile it is 6841 MB, 24% of the whole
-# samples index footprint on the replica, and its predicate
-# (label IN ('good','unknown') + cleave/litmus non-null) matches a large share
-# of what apply writes, because members inherit their parent's label.
-#
-# The ordering constraint that makes this temporary: cyclotron cannot move to
-# the replica until the replica catches up, and the replica catches up sooner
-# without maintaining an index nothing reads. Parking it is what unblocks the
-# repoint, not a decision against it.
-#
 # idx_sl_parent_child is PARKED, not retired: move it back to
 # REPLICA_KEEP_INDEXES and run `make replica` BEFORE any replica read path
 # starts resolving an archive's members.
@@ -193,13 +177,10 @@ idx_slh_sha256_retired
 #   PARKED — cyclotron's triage queues. Its selection still runs against the
 #   master: the deployed cyclotron (nazgul) passes no --hopper-read-api, and
 #   galadriel's serve-replica API answered no /api/triage route in that window.
-#   Same reasoning and same restore rule as idx_samples_unconvicted_route_fresh
-#   above — move back to REPLICA_KEEP_INDEXES and `make replica` BEFORE
-#   repointing cyclotron's reads here:
-#     idx_samples_good_route_score  (2013 MB, TriageLowest's good-only walk)
+#   Move back to REPLICA_KEEP_INDEXES and `make replica` BEFORE repointing
+#   cyclotron's reads here:
 #     idx_samples_sighted_purl      (1242 MB, triageSightedWhere)
 #     idx_samples_bad_route_fresh   ( 262 MB, TriageLowest)
-#     idx_samples_bad_lvl           ( 235 MB, litmus-level bad queue)
 #     idx_samples_bad_miss_stale    ( 134 MB, bad-miss stale selector)
 #
 #   RETIRED — no replica read path can satisfy them:
@@ -221,14 +202,9 @@ idx_slh_sha256_retired
 # consumers of that access path to the replica. The primary keeps its index.
 REPLICA_DROP_INDEXES='
 idx_sl_child_parents
-idx_samples_unconvicted_route_fresh
-idx_samples_good_route_score
 idx_samples_sighted_purl
 idx_samples_bad_route_fresh
-idx_samples_bad_lvl
 idx_samples_bad_miss_stale
-idx_samples_feed
-idx_samples_feed_top_created_done
 idx_samples_good_repair_newest
 idx_samples_unknown_newest
 idx_samples_candidate_keyset
@@ -245,12 +221,7 @@ idx_samples_claimable
 idx_samples_claimable_sha
 idx_samples_claimed
 idx_samples_created_at
-idx_samples_feed_source
-idx_samples_feed_source_mtime
 idx_samples_file_type
-idx_samples_formula
-idx_samples_litmus_done
-idx_samples_mtime
 idx_samples_parent
 idx_samples_pending_cleave_group
 idx_samples_pending_litmus_group
@@ -264,7 +235,6 @@ idx_samples_rescan_queue_q2
 idx_samples_review_interesting
 idx_samples_review_newest
 idx_samples_source_ecosystem
-idx_samples_source_feed
 idx_samples_status
 idx_samples_top_created
 idx_samples_top_ready_first_analyzed_coalesce
@@ -273,9 +243,6 @@ idx_samples_updated_at
 idx_sl_donor
 idx_sl_incoming_seen
 idx_sl_parent_child
-idx_sl_reference
-idx_sl_sha256
-idx_sl_standalone
 '
 
 SLIM_CONSTRAINTS='sample_locations|sample_locations_sha256_path_key'

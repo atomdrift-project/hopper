@@ -214,19 +214,11 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// fed so adding it is metadata-only on the large samples table.
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS lvl INTEGER`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent) WHERE parent != ''`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_formula ON samples(formula) WHERE formula != ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS mtime TIMESTAMPTZ`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS last_error_at TIMESTAMPTZ`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS first_analyzed_at TIMESTAMPTZ`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS marker_mtime TIMESTAMPTZ`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source ON samples(source, label, analyzed_at DESC NULLS LAST) WHERE cleave_result IS NOT NULL`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_feed_source_mtime ON samples(source, label, mtime DESC NULLS LAST) WHERE cleave_result IS NOT NULL`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_feed_top_created_done ` +
-			`ON samples(source, label, created_at DESC) ` +
-			`WHERE cleave_result IS NOT NULL AND parent = '' AND litmus_result IS NOT NULL`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_feed ON samples(feed) WHERE feed != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_ecosystem ON samples(ecosystem) WHERE ecosystem != ''`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_mtime ON samples(mtime) WHERE mtime IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_file_type ON samples(file_type)`,
 		// unanalyzedPG orders by id, so the pending set is indexed on id rather
 		// than sha256 — that lets the query avoid a sort at 100M rows.
@@ -246,10 +238,6 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// exec time. Same tiny pending-set footprint as above.
 		`CREATE INDEX IF NOT EXISTS idx_samples_pending_path ON samples(path) ` +
 			`WHERE cleave_result IS NULL AND skip = ''`,
-		// Covers falsePositivesPG / truePositivesPG / falseNegativesPG — all filter
-		// (label, score, cleave_result IS NOT NULL, status='', skip='').
-		// countAnalyzedPG: SELECT count(*) WHERE litmus_result IS NOT NULL — no index existed.
-		`CREATE INDEX IF NOT EXISTS idx_samples_litmus_done ON samples(id) WHERE litmus_result IS NOT NULL`,
 		// Pull-based work scheduling: claim tracking columns + index.
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS claimed_by TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ`,
@@ -739,10 +727,6 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// Superseded by the route-leading index above: nothing selects a global
 		// level band, and TriageLowest still ranks by score.
 		`DROP INDEX IF EXISTS idx_samples_unconvicted_lvl`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_bad_lvl ` +
-			`ON samples(lvl DESC, analyzed_at, id) ` +
-			`WHERE label = 'bad' AND lvl IS NOT NULL ` +
-			`AND cleave_result IS NOT NULL AND skip = ''`,
 		// prism's molecule view (?m=<formula>) filters the feed by an exact cleave
 		// formula — "show me everything with this structure". Without a matching
 		// index that predicate is not a seek but a filter applied while walking
@@ -754,8 +738,8 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// the single largest consumer of CPU on the box once the disk problems
 		// were fixed.
 		//
-		// Deliberately not the master's idx_samples_formula, which is a plain
-		// (formula) over every row with one, 1390 MB. Restricting to the feed's
+		// Deliberately not a plain (formula) index over every row with one,
+		// which measured 1390 MB. Restricting to the feed's
 		// own population — half the rows carry a formula, and archive members
 		// (parent <> '') are the bulk of the table — costs ~200 MB instead, and a
 		// partial index is skipped entirely when a write misses its predicate, so
@@ -772,46 +756,6 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_formula_top ` +
 			`ON samples(formula, created_at DESC) ` +
 			`WHERE formula <> '' AND parent = '' AND cleave_result IS NOT NULL`,
-		// collimator's training-set export, one call per model route:
-		//   SELECT id, sha256, label, canonical_sha256, score, file_type FROM samples
-		//    WHERE label IN ('bad','good') AND cleave_result IS NOT NULL AND skip = ''
-		//      AND id <= <snapshot> AND file_type = ANY(<route>) ORDER BY id
-		// (collimator/src/collimator/data.py, stream_partitioned_metadata_grouped;
-		// its LABELED_WHERE is this index's predicate verbatim). data.py's own
-		// comment says the route filter is meant to be "index-backed" — on the
-		// replica it was not, so each route was a Parallel Seq Scan of ~93M rows
-		// costing 27,996,830 to return 16,113 vbs rows: ~100 seconds each,
-		// measured 2026-08-24, and collimator runs the suite per route.
-		//
-		// file_type leads because that is the equality; id follows so the scan is
-		// already in the ORDER BY's order and the `id <= snapshot` pin is a range
-		// bound on the same index rather than a filter. The projection is
-		// deliberately NOT covered by INCLUDE — sha256 and canonical_sha256 are 64
-		// bytes each, which would take this from a few hundred MB to multiple GB
-		// for a heap fetch per matched row that only the matched rows pay.
-		//
-		// Not a prism index, but it belongs to the same replica: collimator reads
-		// the replica too (postgres://hopper@localhost/hopper), and a training
-		// pipeline that seq-scans the corpus once per route is exactly the kind of
-		// bulkread traffic that starves the apply worker.
-		`CREATE INDEX IF NOT EXISTS idx_samples_labeled_route ` +
-			`ON samples(file_type, id) ` +
-			`WHERE label IN ('bad', 'good') AND cleave_result IS NOT NULL AND skip = ''`,
-		// Per-route triage windows (TriageHighest/TriageLowest, 2026-08-03
-		// redesign): each file_type's top/bottom-K by litmus_score. The
-		// leading file_type key lets the per-route LATERAL walk each route's
-		// score tail as a short ordered scan. litmus_score IS NOT NULL is in
-		// the predicate (never-scanned rows rank nowhere), so no NULLS
-		// spelling gymnastics are needed for planner matching. The older
-		// class-gated idx_samples_{good_hostile,bad_clean}_score indexes
-		// stay for any remaining class-band consumers.
-		//
-		// The pair these two were is now the *_route_fresh pair below, which
-		// carries analyzed_at as a third key; only the good-only spelling
-		// survives here, for consumers still on the narrow label predicate.
-		`CREATE INDEX IF NOT EXISTS idx_samples_good_route_score ` +
-			`ON samples(file_type, litmus_score DESC) ` +
-			`WHERE label = 'good' AND litmus_score IS NOT NULL AND cleave_result IS NOT NULL AND skip = ''`,
 		// TriageStranded's member walk: good members with real findings,
 		// risk-score descending; parent's bad label is probed per row via
 		// the sha256 unique index (cross-row predicates can't live in a
@@ -1018,43 +962,11 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_discord_newest ` +
 			`ON samples(created_at DESC, id DESC) ` +
 			`WHERE ` + triageDiscordPopPG,
-		// TriageHighest's route walk, widened to the unconvicted pool (2026-08-30).
-		// The good-only partial below stays for triageLowest's mirror and for any
-		// consumer still on the narrow spelling; this is the one the widened
-		// LATERAL matches. Without it the widened query stops matching
-		// idx_samples_good_route_score and degrades to the full scan that
-		// per-route top-K exists to avoid.
-		// The same walk once it also carries a freshness floor (2026-09-02).
-		// analyzed_at is a trailing KEY, not a new leading one: the walk is still
-		// ordered by (file_type, litmus_score DESC) and still stops at the
-		// per-route K, so the ordering must not move. What the extra column buys
-		// is that `analyzed_at > $fresh` is decided FROM THE INDEX, before the
-		// heap fetch and before the reports anti-join -- which is the difference
-		// between rejecting a stale row for free and paying a page read plus a
-		// probe to reject it.
-		//
-		// Without this the queue does not merely get slower, it stops: the floor
-		// is the only predicate the walk cannot resolve early, so as the window
-		// slides past the analyzed bulk each route walks further to find its K,
-		// a route with nothing fresh walks its whole band to prove it, and the
-		// selection crosses the API's 30s budget and 500s on every poll. That is
-		// exactly how good:fp-peak went down at 05:31 on 2026-09-02, 7.5 hours
-		// after the floor shipped without this index.
-		//
-		// The floor is deliberately NOT in the partial predicate. It is immutable
-		// enough for one (a literal), but CREATE INDEX IF NOT EXISTS will not
-		// rebuild an index whose name already exists, so retuning
-		// HighestScoreFloor would silently leave a predicate that no longer
-		// matches the query. As a range bound on the second key it costs nothing
-		// anyway -- the ordered walk stops at the floor on its own.
-		`CREATE INDEX IF NOT EXISTS idx_samples_unconvicted_route_fresh ` +
-			`ON samples(file_type, litmus_score DESC, analyzed_at) ` +
-			`WHERE label IN ('good', 'unknown') AND litmus_score IS NOT NULL ` +
-			`AND cleave_result IS NOT NULL AND skip = ''`,
-		// TriageLowest's mirror. Same freshness floor, same reasoning; it has not
-		// fallen over only because LowestFreshness is 30 days against highest's 3,
-		// so ten times as many rows pass and the walk still reaches its K early.
-		// Same cliff, further from the edge.
+		// TriageLowest's route walk: each route's bad rows by litmus_score ASC,
+		// stopping at the per-route K. analyzed_at is a trailing key so the
+		// freshness floor is decided from the index, before the heap fetch and the
+		// reports anti-join; without it a route with nothing fresh walks its whole
+		// band to prove it.
 		`CREATE INDEX IF NOT EXISTS idx_samples_bad_route_fresh ` +
 			`ON samples(file_type, litmus_score ASC, analyzed_at) ` +
 			`WHERE label = 'bad' AND litmus_score IS NOT NULL ` +
@@ -1280,8 +1192,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// consumers.
 		`DROP INDEX IF EXISTS idx_samples_stale_traits_pri`,
 		`DROP INDEX IF EXISTS idx_samples_stale_traits_pri2`,
-		// feedSourcesPG / feedEcosystemsPG: DISTINCT feed/ecosystem WHERE source = $1.
-		`CREATE INDEX IF NOT EXISTS idx_samples_source_feed ON samples(source, feed) WHERE feed != ''`,
+		// feedEcosystemsPG: DISTINCT ecosystem WHERE source = $1.
 		`CREATE INDEX IF NOT EXISTS idx_samples_source_ecosystem ON samples(source, ecosystem) WHERE ecosystem != ''`,
 		// Forager direct-insert provenance. url is the canonical URL the
 		// bytes were fetched from; domain is the registered domain (eTLD+1)
@@ -1405,11 +1316,10 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// Edge type to parent_sha256 ("" contained, "fetched", "unpacked",
 		// "registry") — see SampleLocation.Rel. Metadata-only on PG 11+.
 		`ALTER TABLE sample_locations ADD COLUMN IF NOT EXISTS rel TEXT NOT NULL DEFAULT ''`,
-		// Indexes tuned for the expected read patterns.
-		// Primary lookup: "where is this sha seen?" → idx_sl_sha256.
-		// Feed/source rollups stay selective via the partial predicate.
-		// Parent lookups are rare (exploded-from query) and stay partial.
-		`CREATE INDEX IF NOT EXISTS idx_sl_sha256 ON sample_locations(sha256)`,
+		// "Where is this sha seen?" is served by the UNIQUE (sha256, path)
+		// constraint's index, whose leading key is sha256. A standalone
+		// (sha256) index was dropped 2026-11-01 as redundant with it; see the
+		// index audit list below.
 		// idx_sl_parent (parent_sha256 partial) was dropped 2026-08-22: it was
 		// fully shadowed by idx_sl_parent_child below — same key, same partial
 		// predicate, plus INCLUDE (sha256) — and idx_scan confirmed the planner
@@ -1485,31 +1395,6 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// never touches the heap.
 		`CREATE INDEX IF NOT EXISTS idx_sl_containment ON sample_locations(sha256) ` +
 			`WHERE parent_sha256 <> '' AND rel IN ` + containmentRelsSQL,
-		// The inverse of idx_sl_containment: reference edges only — a package
-		// naming a dependency, a registry sidecar. Enumerates "everything ever
-		// referenced by something" without touching the containment edges that
-		// dominate the ledger.
-		//
-		// Keyed on id with sha256 included so a paged walk is index-only. That is
-		// what lets repairReferenceParents cost the number of referenced artifacts
-		// rather than the number of archive members, and it answers "what pulled
-		// this in" for the same price.
-		`CREATE INDEX IF NOT EXISTS idx_sl_reference ON sample_locations(id) ` +
-			`INCLUDE (sha256) WHERE parent_sha256 <> '' AND rel NOT IN ` + containmentRelsSQL,
-
-		// The standalone counterpart to idx_sl_reference: ledger rows whose bytes
-		// are stored under their own sha, no archive involved. Keyed on id with
-		// sha256 included so repairStandaloneParentsPG pages it index-only, the
-		// same shape and for the same reason as the reference walk above.
-		//
-		// Every other partial index on this table covers parent_sha256 <> ''.
-		// This is the only one that answers "is this artifact stored standalone",
-		// which is what the repair asks. Without it that question is a seq scan of
-		// the whole ledger — and because the planner drives the semi-join from
-		// this side rather than from samples, it is one scan per batch, which no
-		// cursor on samples.id can prune.
-		`CREATE INDEX IF NOT EXISTS idx_sl_standalone ON sample_locations(id) ` +
-			`INCLUDE (sha256) WHERE parent_sha256 = ''`,
 
 		// Retired locations are kept outside the active ledger: serving and
 		// workflow queries stay small, while moves/prunes preserve path history.
@@ -1794,7 +1679,6 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// are not cascaded away by DROP EXPRESSION (the columns persist), but
 		// the IF NOT EXISTS keeps them correct on a fresh database too.
 		`CREATE INDEX IF NOT EXISTS idx_samples_file_type ON samples(file_type)`,
-		`CREATE INDEX IF NOT EXISTS idx_samples_formula   ON samples(formula)   WHERE formula   != ''`,
 
 		// Drives the one-time Pass 1b heal in backfillPG: rows stored under the
 		// v7 'files' key while file_type/score/formula were generated from the
@@ -2009,10 +1893,8 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// inside the destination's pool root, and links one of those instead.
 		//
 		// The question is "this sha, in this pool" — a sha256 equality plus a
-		// path prefix — and no existing index can answer it. idx_sl_sha256 is
-		// keyed on sha256 alone, so the pool filter and the LIMIT both land in
-		// Go after every location for that sha is already on the wire. The
-		// UNIQUE (sha256, path) constraint has the right key but the wrong
+		// path prefix — and no other index can answer it. The UNIQUE
+		// (sha256, path) constraint has the right key but the wrong
 		// collation: under the database's en_US.UTF-8, glibc ignores
 		// punctuation at primary strength, so 'pending/a' sorts after
 		// 'pending0' and the prefix range [pending/, pending0) matches none of
@@ -2037,6 +1919,48 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// the most of.
 		`CREATE INDEX IF NOT EXISTS idx_sl_donor ON sample_locations ` +
 			`(sha256, path COLLATE "C") WHERE parent_sha256 = ''`,
+		// Index audit 2026-10-23: no scan on the primary since stats began (at
+		// least 2026-09-16), and a caller trace found no query each could serve.
+		// concurrentDropIndexDDL rewrites these to DROP INDEX CONCURRENTLY.
+		//
+		// route_fresh and good_route_score: TriageHighest ranks by lvl since
+		// 2026-09-02 (idx_samples_unconvicted_route_lvl), and nothing else walks
+		// good or unknown rows by litmus_score. bad_lvl: nothing orders bad rows
+		// by lvl.
+		`DROP INDEX IF EXISTS idx_samples_unconvicted_route_fresh`,
+		`DROP INDEX IF EXISTS idx_samples_good_route_score`,
+		`DROP INDEX IF EXISTS idx_samples_bad_lvl`,
+		// FeedQuery's only caller is prism, on the replica, and it never sets
+		// Source or Label; FeedSources has no caller. mtime and formula had no
+		// equality or ordering consumer on Postgres (the feed's formula view uses
+		// idx_samples_formula_top).
+		`DROP INDEX IF EXISTS idx_samples_feed_source`,
+		`DROP INDEX IF EXISTS idx_samples_feed_source_mtime`,
+		`DROP INDEX IF EXISTS idx_samples_feed_top_created_done`,
+		`DROP INDEX IF EXISTS idx_samples_feed`,
+		`DROP INDEX IF EXISTS idx_samples_source_feed`,
+		`DROP INDEX IF EXISTS idx_samples_mtime`,
+		`DROP INDEX IF EXISTS idx_samples_formula`,
+		// countAnalyzedPG read this index's reltuples; it now reads pg_stats.
+		`DROP INDEX IF EXISTS idx_samples_litmus_done`,
+		// Served only repairReferenceParentsPG (one-time, done on the primary)
+		// and repairStandaloneParentsPG (manual). Both page the primary key from
+		// a cursor, so a run reads the ledger once instead of index-only.
+		`DROP INDEX IF EXISTS idx_sl_reference`,
+		`DROP INDEX IF EXISTS idx_sl_standalone`,
+		// Index audit 2026-11-01: shadowed by sample_locations_sha256_path_key,
+		// which leads with the same key. EXPLAIN on the primary showed every
+		// keyed lookup (sha256 + path or + parent_sha256) already preferring
+		// that index or idx_sl_child_parents; this one only won bare
+		// sha256 = $1 probes, which the unique index answers with the same
+		// heap fetches. Dropping it freed ~62 GB on disk and takes one
+		// random-insert btree off every sample_locations insert.
+		`DROP INDEX IF EXISTS idx_sl_sha256`,
+		// Never created by this list: idx_sl_incoming_mtime was removed from it
+		// 2026-09-01 without a drop, and idx_samples_registry_doc_junk was built by
+		// hand for the 2026-08-27 registry_doc cleanup.
+		`DROP INDEX IF EXISTS idx_sl_incoming_mtime`,
+		`DROP INDEX IF EXISTS idx_samples_registry_doc_junk`,
 	}
 }
 
@@ -4358,8 +4282,8 @@ func (db *DB) reconcileLocationParentEdgesPG(ctx context.Context, cursor int64) 
 // ledger for each, to find a comparatively tiny set. Every damaged row
 // necessarily carries a reference edge (that is what explode mis-recorded), so
 // enumerating those edges reaches exactly the same rows while doing work
-// proportional to referenced artifacts. idx_sl_reference makes the walk
-// index-only.
+// proportional to referenced artifacts. Pages are bounded by the primary key
+// from the cursor, so a full run reads the ledger once.
 //
 // The full predicate still runs per candidate, so a sha that also has a genuine
 // containment edge is left alone: the edge list finds candidates, it does not
@@ -6318,30 +6242,28 @@ func (db *DB) countByStatusPG(ctx context.Context) (map[string]int, error) {
 	return scanPGCounts(rows)
 }
 
-// countAnalyzedPG estimates the analyzed population from the catalog rather
-// than counting it.
+// countAnalyzedPG estimates the analyzed population from table statistics
+// rather than counting it: samples' reltuples times the non-null fraction of
+// litmus_result, both maintained by autoanalyze.
 //
-// idx_samples_litmus_done is partial on exactly `litmus_result IS NOT NULL`, so
-// its reltuples IS the number wanted, maintained by autovacuum for free. The
-// exact count walks every matching row even as an index-only scan: measured
-// against the live table at 238s and 34.9M buffers for 75,593,897 rows (1,060s
-// mean under load, 59,367s cumulative — one multi-minute burn per restart). The
-// catalog answered 75,730,632 for the same instant, 0.18% out.
+// The exact count walks every matching row: measured at 238s and 34.9M buffers
+// for 75,593,897 rows, one multi-minute burn per restart. This estimate was
+// within 0.7% of the partial index's reltuples it replaced (245,273,367 against
+// 247,114,752 on 2026-10-23), and that index cost 10 GB to keep one number.
 //
 // That precision is far inside what the number is for. Its one caller,
 // seedProgressBaseline, sets the denominator of a dashboard percentage and is
-// documented best-effort — a failed count there leaves the baseline at zero.
-// The throughput series counts in memory (progress.analyzed) and never re-reads
-// this, so a value lagging one autovacuum costs nothing downstream.
-//
-// reltuples is -1 on an index that has never been vacuumed or analyzed, and
-// to_regclass is NULL while the deferred migration is still building it; both
-// surface as 0, which is what the caller already does with a failure.
+// documented best-effort; a failed count there leaves the baseline at zero.
+// Before the first ANALYZE there is no pg_stats row and the estimate is 0,
+// which is what the caller already does with a failure.
 func (db *DB) countAnalyzedPG(ctx context.Context) (int64, error) {
 	var est float64
 	if err := db.pool.QueryRow(ctx,
-		`SELECT COALESCE((SELECT reltuples FROM pg_class
-		                   WHERE oid = to_regclass('idx_samples_litmus_done')), 0)`).Scan(&est); err != nil {
+		`SELECT COALESCE((SELECT c.reltuples * (1 - s.null_frac)
+		                    FROM pg_class c
+		                    JOIN pg_stats s ON s.schemaname = current_schema()
+		                     AND s.tablename = c.relname AND s.attname = 'litmus_result'
+		                   WHERE c.oid = to_regclass('samples')), 0)`).Scan(&est); err != nil {
 		return 0, fmt.Errorf("hopper: count analyzed: %w", err)
 	}
 	if est < 0 {
@@ -7819,8 +7741,8 @@ func (db *DB) canonicalizePURLBasesPG(ctx context.Context, dryRun bool) (int64, 
 // sha256), so a cursor on samples.id lands as a filter *after* that scan and
 // prunes nothing: every batch repeats the same full ledger scan and the same
 // sort, then keeps 20k rows of it. Paging the side the scan actually starts
-// from is what makes the cursor advance real work, and idx_sl_standalone makes
-// each page index-only. No batch locks more than batchRows worth of samples.
+// from is what makes the cursor advance real work: the primary key bounds each
+// page, so a full run reads the ledger once. No batch locks more than batchRows worth of samples.
 //
 // Idempotent and resumable. dryRun only counts, and counts a shade high: one
 // sha256 can hold several standalone locations, and when they fall in different
@@ -8367,10 +8289,10 @@ func (db *DB) BackfillLitmusLevel(ctx context.Context, batchSize int, targetDura
 	}
 }
 
-// litmusLevelIndexes are the partial indexes over samples.lvl, which
+// litmusLevelIndexes are the partial indexes over samples.lvl that
 // [ReindexLitmusLevel] rebuilds once the backfill that fills that column has
 // drained.
-var litmusLevelIndexes = [...]string{"idx_samples_unconvicted_route_lvl", "idx_samples_bad_lvl"}
+var litmusLevelIndexes = [...]string{"idx_samples_unconvicted_route_lvl"}
 
 // ReindexLitmusLevel rebuilds the samples.lvl indexes, once, after the backfill
 // completes. It is a no-op on a database where that has already happened.

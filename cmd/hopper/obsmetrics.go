@@ -388,9 +388,11 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 		// registry can withdraw the bytes while the claim waits, and then no
 		// amount of later effort recovers them.
 		unattemptedAge: gauge("hopper.sightings.unattempted_age",
-			"Age of the longest-waiting live threat-feed claim that nothing has tried to acquire; backfill and hashes without retrievable sample bytes are excluded.", "s"),
+			"Age of the longest-waiting live threat-feed claim that nothing has tried to acquire;"+
+				" backfill and hashes without retrievable sample bytes are excluded.", "s"),
 		sightedInvestigationLag: gauge("hopper.sightings.investigation_wait",
-			"Longest wait for judgement in sighted-pinned: available, eligible samples with an exact-version malicious or suspicious package claim received in the last 24h; starts when the claim, sample and first analysis are all present.", "s"),
+			"Longest wait for judgement in sighted-pinned: available, eligible samples with an exact-version"+
+				" malicious or suspicious package claim received in the last 24h; starts when the claim, sample and first analysis are all present.", "s"),
 		// The counterpart to unattempted_age, and the price of making a claimed
 		// target terminal. A target claimed for recovery and never reporting an
 		// outcome is work the system has permanently given up on and will not

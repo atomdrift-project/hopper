@@ -1538,6 +1538,8 @@ type memberEnvelope struct {
 	parent        *Sample
 	litmus        *litmusMemberIndex
 	traitsVersion string
+	version       json.RawMessage // the envelope's "v", carried onto each member verbatim
+	factProfile   string          // the envelope's "fp", carried onto each member
 	files         []json.RawMessage
 }
 
@@ -1550,6 +1552,8 @@ func newMemberEnvelope(parent *Sample) *memberEnvelope {
 	}
 
 	var report struct {
+		Version          json.RawMessage   `json:"v"`
+		FactProfile      string            `json:"fp"`
 		TraitsVersion    string            `json:"rev"`
 		OldTraitsVersion string            `json:"tv"`
 		Files            []json.RawMessage `json:"files"`
@@ -1603,6 +1607,8 @@ func newMemberEnvelope(parent *Sample) *memberEnvelope {
 		files:         files,
 		litmus:        newLitmusMemberIndex(parent.LitmusResult),
 		traitsVersion: traitsVersion,
+		version:       report.Version,
+		factProfile:   report.FactProfile,
 	}
 }
 
@@ -1735,15 +1741,20 @@ func (e *memberEnvelope) buildRange(start, end int) []*Sample {
 			}
 		}
 
-		// Re-emit the parent's traits revision so a member's stored envelope is
-		// self-describing: ParseCleaveResult reads "rev" back out of it, so a
+		// Re-emit the parent's envelope metadata so a member's stored envelope
+		// is self-describing: ParseCleaveResult reads "rev" back out of it, so a
 		// member that is later re-stored keeps its version instead of silently
-		// reverting to none. Omitted when unknown rather than written empty —
-		// "" is not a version, and CompactReport omits the key too.
+		// reverting to none. "v" is the schema generation the claims sweeps
+		// select on, and "fp" names the fact profile the member's facts were
+		// reduced to: without it a reduced member reads as full facts and model
+		// training silently zeroes the inputs it lacks. Each is omitted when
+		// unknown rather than written empty, as CompactReport does.
 		singleFile, err := json.Marshal(struct {
+			Version       json.RawMessage   `json:"v,omitempty"`
+			FactProfile   string            `json:"fp,omitempty"`
 			TraitsVersion string            `json:"rev,omitempty"`
 			Files         []json.RawMessage `json:"files"`
-		}{TraitsVersion: e.traitsVersion, Files: []json.RawMessage{raw}})
+		}{Version: e.version, FactProfile: e.factProfile, TraitsVersion: e.traitsVersion, Files: []json.RawMessage{raw}})
 		if err != nil {
 			continue
 		}
@@ -6781,7 +6792,7 @@ func (q *FeedQuery) packageTerm() string {
 // column, including the right NULLS placement so the planner can use the
 // matching partial index as an ordered scan rather than falling back to a
 // top-N heapsort. The column-specific NULLS clauses match the indexes
-// created in pg.go (idx_samples_feed_source / _mtime carry NULLS LAST;
+// created in pg.go (mtime and analyzed_at are nullable, so they sort NULLS LAST;
 // the created_at indexes do not — and don't need to since the column is
 // NOT NULL).
 func (q *FeedQuery) sortBy() string {

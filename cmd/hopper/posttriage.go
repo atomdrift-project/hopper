@@ -706,8 +706,9 @@ func cmdPostTriage(ctx context.Context) error {
 		if len(scanDirs) == 0 {
 			slog.Warn("nothing to re-scan: no misplaced dirs and no positional dirs exist")
 		}
+		sidecars := len(scanDirs) > 0 && scanSupportsSidecars(ctx, *scanBin)
 		for _, dir := range scanDirs {
-			if err := runScanUpload(ctx, *scanBin, *baseURL, dir); err != nil {
+			if err := runScanUpload(ctx, *scanBin, *baseURL, dir, sidecars); err != nil {
 				return fmt.Errorf("scan upload %s: %w", dir, err)
 			}
 		}
@@ -787,18 +788,52 @@ func dedupExistingDirs(dirs []string) []string {
 	return out
 }
 
-// runScanUpload shells out to `scan fs --hopper <url> <dir>`, streaming its
-// output through. `fs` is the filesystem-scan subcommand; --hopper (alias
-// --upload) renews each result on the master by POSTing to <url>/api/result.
-func runScanUpload(ctx context.Context, scanBin, baseURL, dir string) error {
+// scanSidecarFlag keeps the forager capture records in a sample tree (a
+// ProvenanceSidecarSuffix file beside each sample) from being uploaded as
+// samples of their own: under it, scan still analyzes each record but files it
+// on hopper only when hostile. Builds that predate the flag skip such records
+// outright and refuse an unknown flag, so it is passed only to a scan that
+// lists it.
+const scanSidecarFlag = "--enable-sidecar"
+
+// runScanUpload shells out to `scan fs --hopper <url> [--enable-sidecar] <dir>`,
+// streaming its output through. `fs` is the filesystem-scan subcommand;
+// --hopper (alias --upload) renews each result on the master by POSTing to
+// <url>/api/result.
+func runScanUpload(ctx context.Context, scanBin, baseURL, dir string, sidecars bool) error {
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 		return fmt.Errorf("not a directory: %s", dir)
 	}
-	writeStdoutf("scan fs --hopper %s %s\n", baseURL, dir)
-	cmd := exec.CommandContext(ctx, scanBin, "fs", "--hopper", baseURL, dir)
+	args := scanUploadArgs(baseURL, dir, sidecars)
+	writeStdoutf("scan %s\n", strings.Join(args, " "))
+	cmd := exec.CommandContext(ctx, scanBin, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// scanUploadArgs is the argument list for re-scanning dir onto baseURL, with
+// sidecar handling when the scan supports it.
+func scanUploadArgs(baseURL, dir string, sidecars bool) []string {
+	args := []string{"fs", "--hopper", baseURL}
+	if sidecars {
+		args = append(args, scanSidecarFlag)
+	}
+	return append(args, dir)
+}
+
+// scanSupportsSidecars reports whether scanBin's path scan lists
+// scanSidecarFlag in its help. A scan that cannot be asked is treated as an
+// older build without it.
+func scanSupportsSidecars(ctx context.Context, scanBin string) bool {
+	out, err := exec.CommandContext(ctx, scanBin, "fs", "--help").Output()
+	if err != nil {
+		slog.Warn("could not read scan's flags; assuming an older build", "scan", scanBin, "flag", scanSidecarFlag, "error", err)
+		return false
+	}
+	supported := bytes.Contains(out, []byte(scanSidecarFlag))
+	slog.Info("scan flag support", "scan", scanBin, "flag", scanSidecarFlag, "supported", supported)
+	return supported
 }
 
 // collectVerdicts hashes every regular, non-marker file directly under dir

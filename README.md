@@ -271,8 +271,10 @@ Existing samples default to `inconclusive`. Move confirmed dual-use samples into
 does not infer which ones belong there.
 
 Collimator performance iterations use the replica-only `idx_samples_training_hash`
-covering index defined in `scripts/replica/training-index.sql`. `hopper init -replica`
-builds it concurrently; ordinary primary migrations never create it.
+covering index defined in `scripts/replica/training-index.sql`, alongside
+`idx_samples_labeled_route` for the per-route training-set export. `hopper init -replica`
+builds them concurrently; ordinary primary migrations never create them, and drop
+`idx_samples_labeled_route` where an older primary still has it.
 The replica keep policy retains it. It covers a rehashed canonical group key, row ID,
 labels, scores and file types used by sampled training, allowing the planner to
 avoid repeated full-table metadata scans. The one-time index build is separate

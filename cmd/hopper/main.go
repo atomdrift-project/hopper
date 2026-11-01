@@ -2251,8 +2251,8 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 
 	// Seed the progress denominators carried over from prior runs off the
 	// startup critical path. CountAnalyzed/CountPending are full count(*) scans
-	// over the samples table whose supporting partial indexes
-	// (idx_samples_litmus_done, idx_samples_unanalyzed_id) may still be building
+	// over the samples table whose supporting partial index
+	// (idx_samples_unanalyzed_id) may still be building
 	// in the background after a deploy — a fresh index build can leave them
 	// taking minutes. The dashboard is already configured above, so it switches
 	// to the live view immediately and these baselines fill in once the counts
