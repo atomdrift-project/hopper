@@ -14,7 +14,7 @@ func TestBadSharedLocations(t *testing.T) {
 				sha := fmt.Sprintf("%064x", id)
 				path := fmt.Sprintf("bad/%d/0", id)
 				mustInsert(t, ctx, db, &Sample{SHA256: sha, Path: path, Label: label, Parent: parent, Skip: skip})
-				for i := 0; i < count; i++ {
+				for i := range count {
 					loc := &SampleLocation{SHA256: sha, Path: fmt.Sprintf("bad/%d/%d", id, i), ParentSHA256: parent}
 					if err := db.UpsertLocation(ctx, loc); err != nil {
 						t.Fatal(err)
@@ -44,8 +44,8 @@ func TestBadSharedLocations(t *testing.T) {
 			if len(got) != 2 || !seen[six] || !seen[member] {
 				t.Fatalf("selection: %v", seen)
 			}
-			if n, cap, err := q.Count(ctx, db); err != nil || n != 2 || cap {
-				t.Fatalf("depth: %d %v %v", n, cap, err)
+			if n, capped, err := q.Count(ctx, db); err != nil || n != 2 || capped {
+				t.Fatalf("depth: %d %v %v", n, capped, err)
 			}
 			got, err = q.Select(ctx, db, 1, []string{six})
 			if err != nil || len(got) != 1 || got[0].SHA256 != member {

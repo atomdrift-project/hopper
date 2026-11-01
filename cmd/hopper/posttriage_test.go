@@ -827,37 +827,48 @@ func TestHandleIncomingLocationsClassified(t *testing.T) {
 	}
 }
 
+// seedSamePathRuling stores a "bad" sample whose artifact (and provenance
+// sidecar) already sits at its inconclusive destination. With corrupt, the
+// bytes on disk do not hash to the sample's sha256.
+func seedSamePathRuling(t *testing.T, corrupt bool) (api *apiServer, sha, rel string, actual []byte) {
+	t.Helper()
+	ctx := t.Context()
+	root := t.TempDir()
+	db := mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
+	t.Cleanup(func() { db.Close() })
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("reviewed bytes")
+	sha = testSHA256(content)
+	rel = "inconclusive/example.bin"
+	abs := filepath.Join(root, rel)
+	if err := os.MkdirAll(filepath.Dir(abs), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	actual = content
+	if corrupt {
+		actual = []byte("different bytes")
+	}
+	if err := os.WriteFile(abs, actual, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(abs+hopper.ProvenanceSidecarSuffix, []byte("provenance"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertSample(ctx, &hopper.Sample{SHA256: sha, Path: rel, Label: "bad", LabelSource: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	return &apiServer{db: db, dataRoot: root, tracker: newWorkerTracker()}, sha, rel, actual
+}
+
 func TestHandleTriageSamePathRuling(t *testing.T) {
 	for _, corrupt := range []bool{false, true} {
 		t.Run(fmt.Sprint(corrupt), func(t *testing.T) {
 			ctx := t.Context()
-			root := t.TempDir()
-			db := mustOpenDB(t, ctx, filepath.Join(root, "hopper.db"))
-			defer db.Close()
-			if err := db.Migrate(ctx); err != nil {
-				t.Fatal(err)
-			}
-			content := []byte("reviewed bytes")
-			sha := testSHA256(content)
-			rel := "inconclusive/example.bin"
-			abs := filepath.Join(root, rel)
-			if err := os.MkdirAll(filepath.Dir(abs), 0o750); err != nil {
-				t.Fatal(err)
-			}
-			actual := content
-			if corrupt {
-				actual = []byte("different bytes")
-			}
-			if err := os.WriteFile(abs, actual, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(abs+hopper.ProvenanceSidecarSuffix, []byte("provenance"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if err := db.InsertSample(ctx, &hopper.Sample{SHA256: sha, Path: rel, Label: "bad", LabelSource: "old"}); err != nil {
-				t.Fatal(err)
-			}
-			api := &apiServer{db: db, dataRoot: root, tracker: newWorkerTracker()}
+			api, sha, rel, actual := seedSamePathRuling(t, corrupt)
+			db := api.db
+			abs := filepath.Join(api.dataRoot, rel)
 			request := triageRequest{Verdicts: []triageVerdict{{SHA256: sha, OldPath: rel, Ruling: "inconclusive", Source: "csv-review"}}, DryRun: true}
 			preview := callTriage(t, api, request)
 			if preview.Results[0].Status != "plan" {

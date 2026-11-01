@@ -43,7 +43,7 @@ const (
 	inconclusivePool = hopper.PoolInconclusive
 	dualUsePool      = hopper.PoolDualUse
 	// Keep discovering the legacy tree until its locations have been migrated.
-	purgatoryPool = hopper.PoolPurgatory
+	purgatoryPool = hopper.PoolPurgatory //nolint:staticcheck // read-only discovery of the legacy root; nothing is placed there
 	// uploadBucket is the hot pool an upload enters. Analysis, not the producer,
 	// decides a sample's label, so every upload starts unlabelled. Draino later
 	// moves old paths to pending/ without changing the suffix or verdict.
