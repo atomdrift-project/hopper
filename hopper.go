@@ -2702,12 +2702,14 @@ func (db *DB) InsertSampleNew(ctx context.Context, s *Sample) (bool, error) {
 		ok, err := db.insertSampleNewPG(ctx, s)
 		if err == nil {
 			db.forgetSample(s)
+			err = db.reconcileSampleLocations(ctx, []*Sample{s})
 		}
 		return ok, err
 	}
 	ok, err := db.insertSampleNewSQLite(ctx, s)
 	if err == nil {
 		db.forgetSample(s)
+		err = db.reconcileSampleLocations(ctx, []*Sample{s})
 	}
 	return ok, err
 }
@@ -2742,12 +2744,14 @@ func (db *DB) InsertSampleBatch(ctx context.Context, samples []*Sample) (inserte
 		n, need, err := db.insertSampleBatchPG(ctx, valid)
 		if err == nil {
 			db.forgetSamples(valid)
+			err = db.reconcileSampleLocations(ctx, valid)
 		}
 		return n, need, err
 	}
 	n, need, err := db.insertSampleBatchSQLite(ctx, valid)
 	if err == nil {
 		db.forgetSamples(valid)
+		err = db.reconcileSampleLocations(ctx, valid)
 	}
 	return n, need, err
 }
@@ -2759,10 +2763,19 @@ func (db *DB) UpsertLocation(ctx context.Context, loc *SampleLocation) error {
 	if loc == nil || loc.SHA256 == "" || loc.Path == "" || loc.SHA256 == emptySHA256 {
 		return nil
 	}
+	var err error
 	if db.pool != nil {
-		return db.upsertLocationPG(ctx, loc)
+		err = db.upsertLocationPG(ctx, loc)
+	} else {
+		err = db.upsertLocationSQLite(ctx, loc)
 	}
-	return db.upsertLocationSQLite(ctx, loc)
+	if err != nil {
+		return err
+	}
+	if outer := ArchivePathOf(loc.Path); loc.ParentSHA256 != "" && outer != "" {
+		return db.reconcileRetiredMemberPaths(ctx, []memberOrigin{{loc.ParentSHA256, outer}})
+	}
+	return nil
 }
 
 // UpsertLocationBatch records many observations in one round-trip — the same
@@ -2783,10 +2796,22 @@ func (db *DB) UpsertLocationBatch(ctx context.Context, locs []*SampleLocation) e
 	if len(valid) == 0 {
 		return nil
 	}
+	var err error
 	if db.pool != nil {
-		return db.upsertLocationBatchPG(ctx, valid)
+		err = db.upsertLocationBatchPG(ctx, valid)
+	} else {
+		err = db.upsertLocationBatchSQLite(ctx, valid)
 	}
-	return db.upsertLocationBatchSQLite(ctx, valid)
+	if err != nil {
+		return err
+	}
+	var origins []memberOrigin
+	for _, loc := range valid {
+		if outer := ArchivePathOf(loc.Path); loc.ParentSHA256 != "" && outer != "" {
+			origins = append(origins, memberOrigin{loc.ParentSHA256, outer})
+		}
+	}
+	return db.reconcileRetiredMemberPaths(ctx, origins)
 }
 
 // PathInsideArchive returns the segment of an archive-member sample's
@@ -3146,19 +3171,23 @@ func (db *DB) DuplicateLocationSHAs(ctx context.Context, afterSHA string, limit 
 }
 
 func (db *DB) prepareLocationMove(
-	ctx context.Context, sha256, oldRel, newRel string, relabel *LocationRelabel,
+	ctx context.Context, sha256, oldRel, newRel string, relabel *LocationRelabel, expectedLabel ...string,
 ) (bool, error) {
 	if relabel != nil {
 		canonical := *relabel
 		canonical.Label = CanonicalLabel(canonical.Label)
 		relabel = &canonical
 	}
+	var expected string
+	if len(expectedLabel) > 0 {
+		expected = expectedLabel[0]
+	}
 	var ok bool
 	var err error
 	if db.pool != nil {
-		ok, err = db.prepareLocationMovePG(ctx, sha256, oldRel, newRel, relabel)
+		ok, err = db.prepareLocationMovePG(ctx, sha256, oldRel, newRel, relabel, expected)
 	} else {
-		ok, err = db.prepareLocationMoveSQLite(ctx, sha256, oldRel, newRel, relabel)
+		ok, err = db.prepareLocationMoveSQLite(ctx, sha256, oldRel, newRel, relabel, expected)
 	}
 	if err == nil {
 		db.forgetSHA(sha256)
@@ -3172,6 +3201,9 @@ func (db *DB) prepareLocationMove(
 }
 
 func (db *DB) finishLocationMove(ctx context.Context, sha256, oldRel, newRel string) (bool, error) {
+	if err := db.rebaseLocationMembers(ctx, sha256, oldRel, newRel); err != nil {
+		return false, err
+	}
 	var ok bool
 	var err error
 	if db.pool != nil {

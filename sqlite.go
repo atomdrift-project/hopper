@@ -2246,13 +2246,24 @@ func (db *DB) duplicateLocationSHAsSQLite(ctx context.Context, afterSHA string, 
 }
 
 func (db *DB) prepareLocationMoveSQLite(
-	ctx context.Context, sha256, oldRel, newRel string, relabel *LocationRelabel,
+	ctx context.Context, sha256, oldRel, newRel string, relabel *LocationRelabel, expectedLabel string,
 ) (bool, error) {
 	tx, err := db.lite.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("hopper: prepare location move begin: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // commit or rollback
+
+	if expectedLabel != "" {
+		var label, skip, source string
+		if err := tx.QueryRowContext(ctx, `SELECT label, skip, label_source
+    FROM samples WHERE sha256 = ?`, sha256).Scan(&label, &skip, &source); err != nil {
+			return false, err
+		}
+		if label != expectedLabel || skip == skipConflict || source == labelSourceConflict {
+			return false, ErrLocationLabelChanged
+		}
+	}
 
 	var oldID int64
 	err = tx.QueryRowContext(ctx, `
@@ -2318,6 +2329,24 @@ func (db *DB) finishLocationMoveSQLite(ctx context.Context, sha256, oldRel, newR
 		return false, fmt.Errorf("hopper: finish location move begin: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // commit or rollback
+	memberTx := sqliteLocationSQLTx(ctx, tx)
+	if err := lockLocationParent(memberTx, sha256); err != nil {
+		return false, err
+	}
+	recorded, err := db.locationRecorded(memberTx, sha256, newRel)
+	if err != nil {
+		return false, err
+	}
+	if !recorded {
+		return false, nil
+	}
+
+	// Catch members committed since the preceding bounded batches. Later writers
+	// wait on the same parent and follow the move's history after this commits.
+	if err := rebaseMemberSQL(memberTx, sha256, oldRel, newRel, "", db.locationTimestamp()); err != nil {
+		return false, err
+	}
+
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO sample_location_history
 			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem,
@@ -2818,6 +2847,9 @@ func (db *DB) storeResultSQLite(
 
 	if err := tx.Commit(); err != nil {
 		return StoreStats{}, fmt.Errorf("hopper: commit store: %w", err)
+	}
+	if err := db.reconcileSampleLocations(ctx, members); err != nil {
+		return StoreStats{}, err
 	}
 	// Mirrors storeResultPG: after the commit, best-effort.
 	if critRose(&stats, parsed.FileInfo.MaxCrit) {

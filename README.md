@@ -283,3 +283,38 @@ The companion `training-statistics.sql` migration adds table-level expression
 statistics, followed by a one-time `ANALYZE public.samples`. Without those
 statistics PostgreSQL can overestimate the sampled fraction and choose the old
 route index even though the covering index exists.
+
+## Deduplicating local top-level files
+
+Run on the host holding the sample tree:
+
+```sh
+hopper dedupe-locations --data /data/samples --db "$DSN" --dry-run
+hopper dedupe-locations --data /data/samples --db "$DSN" --consolidate --dry-run
+hopper dedupe-locations --data /data/samples --db "$DSN" --consolidate
+```
+
+By default, duplicate top-level files on the same filesystem become hard links;
+all paths and labels remain. Separate ZFS datasets count as separate filesystems.
+Already shared inodes require no hashing or writes.
+
+With `--consolidate`, copies on other filesystems are retired in favor of the
+oldest present location in the sample's resolved label directory. Age means
+`first_seen_at`, with path as a tie-breaker, rather than file mtime. Conflicted
+classifications and samples without a matching location remain unconsolidated.
+Workflow locations (`incoming`, `pending`, `review`) are retained. Same-filesystem
+paths remain, including paths in different label directories; hard linking does
+not resolve their classification conflicts.
+
+Before removing a copy, Hopper verifies both files, applies the existing sidecar
+merge policy, repairs primary and archive-member paths, and records the retired
+physical location. Interrupted moves can be retried. Dry runs do not hash files,
+so their counts and byte savings are estimates. ZFS snapshots may delay space
+recovery. Use `--limit` for a bounded trial, `--batch` for database page size, and
+`--after` with the reported SHA to resume. Run disk deduplication before capping
+location rows, so it can still discover every recorded copy.
+
+Moves and hard-link deduplication share up to 256 advisory lock files named
+`.hopper-move-lock-XX` in the data root. These are ignored by the corpus walker
+and serialize operations on the same SHA across processes, including moves in
+opposite directions. Their count is fixed rather than growing with the corpus.

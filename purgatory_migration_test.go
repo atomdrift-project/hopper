@@ -70,6 +70,8 @@ func TestMigratePurgatory(t *testing.T) {
 			if _, err := os.Stat(filepath.Join(root, newRel)); !os.IsNotExist(err) {
 				t.Fatalf("preview created destination: %v", err)
 			}
+			// Physical moves now rebase their members; the separate repair pass has no work.
+			want.Members = 0
 			stats, err := db.MigratePurgatory(ctx, root, true)
 			if err != nil || stats != want {
 				t.Fatalf("migration = %+v, %v; want %+v", stats, err, want)
@@ -90,7 +92,7 @@ func TestMigratePurgatory(t *testing.T) {
 				t.Fatalf("source still present: %v", err)
 			}
 			var events int
-			if err := db.queryPurgatoryMigration(ctx, `SELECT count(*) FROM label_events WHERE sha256 = $1 AND to_label = 'purgatory' AND reason = 'original-review'`, []any{sha}, func(rows purgatoryMigrationRows) error {
+			if err := db.queryPurgatoryMigration(ctx, `SELECT count(*) FROM label_events WHERE sha256 = $1 AND to_label = 'purgatory' AND reason = 'original-review'`, []any{sha}, func(rows locationRows) error {
 				if rows.Next() {
 					return rows.Scan(&events)
 				}
@@ -139,6 +141,10 @@ func TestMigratePurgatoryResumesAfterArchiveMove(t *testing.T) {
 				t.Fatal(err)
 			}
 			// Represents an interruption after file cleanup and before members.
+			// Restore the stale rows left by a move performed with an older binary.
+			execBoth(t, t.Context(), db, `DELETE FROM sample_locations WHERE sha256 = $1`, member)
+			execBoth(t, t.Context(), db, `UPDATE samples SET path = $2 WHERE sha256 = $1`, member, oldRel+"!!a.js")
+			execBoth(t, t.Context(), db, `INSERT INTO sample_locations (sha256, path, parent_sha256) VALUES ($1, $2, $3)`, member, oldRel+"!!a.js", sha)
 			stats, err := db.MigratePurgatory(t.Context(), root, true)
 			if err != nil || stats != (PurgatoryMigrationStats{Members: 1, Labels: 1}) {
 				t.Fatalf("resume = %+v, %v", stats, err)

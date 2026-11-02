@@ -682,3 +682,201 @@ func TestLinkDuplicateLocations(t *testing.T) {
 		}
 	})
 }
+
+func TestMoveLocationRebasesMembers(t *testing.T) {
+	for _, backend := range testBackends {
+		t.Run(backend.name, func(t *testing.T) {
+			db := backend.open(t)
+			ctx := context.Background()
+			root := t.TempDir()
+			content := []byte("archive bytes for move")
+			sha := moveTestSHA(content)
+			oldRel, newRel := "incoming/a%_.tgz", "pending/a%_.tgz"
+			writeDedupeFile(t, root, oldRel, content)
+			mustInsert(t, ctx, db, &Sample{SHA256: sha, Path: oldRel, Label: "good"})
+			child, shared := strings.Repeat("a", 64), strings.Repeat("b", 64)
+			mustInsert(t, ctx, db, &Sample{SHA256: child, Path: oldRel + "!!nested.zip!lib.js", Parent: sha, Label: "good"})
+			mustInsert(t, ctx, db, &Sample{SHA256: shared, Path: "good/standalone.js", Label: "good"})
+			for _, loc := range []*SampleLocation{
+				{SHA256: shared, Path: oldRel + "!!shared.js", ParentSHA256: sha},
+				{SHA256: child, Path: newRel + "!!nested.zip!lib.js", ParentSHA256: sha},
+				{SHA256: child, Path: "incoming/aXX.tgz!!other.js", ParentSHA256: sha},
+			} {
+				if err := db.UpsertLocation(ctx, loc); err != nil {
+					t.Fatal(err)
+				}
+			}
+			opts := MoveLocationOptions{DataRoot: root, SHA256: sha, OldPath: oldRel, NewPath: newRel}
+			for range 2 {
+				if _, err := db.MoveLocation(ctx, opts); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s, err := db.SampleBySHA256(ctx, child)
+			if err != nil || s.Path != newRel+"!!nested.zip!lib.js" {
+				t.Fatalf("child: %+v %v", s, err)
+			}
+			s, err = db.SampleBySHA256(ctx, shared)
+			if err != nil || s.Path != "good/standalone.js" {
+				t.Fatalf("shared primary changed: %+v %v", s, err)
+			}
+			locs, err := db.LocationsForSHA(ctx, child)
+			if err != nil || len(locs) != 2 {
+				t.Fatalf("member locations: %+v %v", locs, err)
+			}
+			for _, loc := range locs {
+				if strings.HasPrefix(loc.Path, oldRel+"!!") {
+					t.Fatalf("stale member: %s", loc.Path)
+				}
+			}
+		})
+	}
+}
+
+func TestMovedArchiveRejectsStaleMemberPaths(t *testing.T) {
+	for _, backend := range testBackends {
+		t.Run(backend.name, func(t *testing.T) {
+			db := backend.open(t)
+			ctx := context.Background()
+			root := t.TempDir()
+			content := []byte("archive with delayed analysis")
+			sha := moveTestSHA(content)
+			old, middle, last := "incoming/a.tgz", "pending/a.tgz", "review/a.tgz"
+			writeDedupeFile(t, root, old, content)
+			parent := &Sample{SHA256: sha, Path: old, Label: "good"}
+			mustInsert(t, ctx, db, parent)
+			for _, pair := range [][2]string{{old, middle}, {middle, last}} {
+				if _, err := db.MoveLocation(ctx, MoveLocationOptions{DataRoot: root, SHA256: sha, OldPath: pair[0], NewPath: pair[1]}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// These observations were built using snapshots taken before either move.
+			one, two, three := strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)
+			mustInsert(t, ctx, db, &Sample{SHA256: one, Parent: sha, Path: old + "!!one.js", Label: "good"})
+			if _, _, err := db.InsertSampleBatch(ctx, []*Sample{{SHA256: two, Parent: sha, Path: middle + "!!two.js", Label: "good"}, {SHA256: three, Parent: sha, Path: old + "!!three.js", Label: "good"}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.UpsertLocation(ctx, &SampleLocation{SHA256: one, ParentSHA256: sha, Path: old + "!!four.js"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.UpsertLocationBatch(ctx, []*SampleLocation{{SHA256: one, ParentSHA256: sha, Path: middle + "!!five.js"}}); err != nil {
+				t.Fatal(err)
+			}
+			for _, child := range []string{one, two, three} {
+				locs, err := db.LocationsForSHA(ctx, child)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, loc := range locs {
+					if !strings.HasPrefix(loc.Path, last+"!!") {
+						t.Fatalf("stale member: %s", loc.Path)
+					}
+				}
+				s, err := db.SampleBySHA256(ctx, child)
+				if err != nil || !strings.HasPrefix(s.Path, last+"!!") {
+					t.Fatalf("stale primary: %+v %v", s, err)
+				}
+			}
+			// Reacquiring the source is a genuine observation, not another stale result.
+			if err := db.UpsertLocation(ctx, &SampleLocation{SHA256: sha, Path: old}); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.UpsertLocation(ctx, &SampleLocation{SHA256: one, ParentSHA256: sha, Path: old + "!!restored.js"}); err != nil {
+				t.Fatal(err)
+			}
+			locs, err := db.LocationsForSHA(ctx, one)
+			if err != nil {
+				t.Fatal(err)
+			}
+			restored := false
+			for _, loc := range locs {
+				restored = restored || loc.Path == old+"!!restored.js"
+			}
+			if !restored {
+				t.Fatal("restored source observation lost")
+			}
+		})
+	}
+}
+
+func TestOppositeMovesKeepOneCopy(t *testing.T) {
+	db := openTestDB(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	root := t.TempDir()
+	content := []byte("opposite moves must not remove both copies")
+	sha := moveTestSHA(content)
+	a, b := "incoming/a", "pending/a"
+	writeDedupeFile(t, root, a, content)
+	writeDedupeFile(t, root, b, content)
+	mustInsert(t, ctx, db, &Sample{SHA256: sha, Path: a, Label: "unknown"})
+	if err := db.UpsertLocation(ctx, &SampleLocation{SHA256: sha, Path: b}); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for _, pair := range [][2]string{{a, b}, {b, a}} {
+		go func() {
+			<-start
+			_, err := db.MoveLocation(ctx, MoveLocationOptions{DataRoot: root, SHA256: sha, OldPath: pair[0], NewPath: pair[1]})
+			errs <- err
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	locs, err := db.TopLevelLocationsForSHA(ctx, sha)
+	if err != nil || len(locs) != 1 {
+		t.Fatalf("locations: %+v %v", locs, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, locs[0].Path)); err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("survivor: %q %v", got, err)
+	}
+}
+
+func TestMoveLocationRebasesMultipleBatches(t *testing.T) {
+	for _, backend := range testBackends {
+		t.Run(backend.name, func(t *testing.T) {
+			db := backend.open(t)
+			ctx := t.Context()
+			root := t.TempDir()
+			content := []byte("archive with many repeated members")
+			sha, child := moveTestSHA(content), strings.Repeat("d", 64)
+			old, last := "incoming/big.tgz", "pending/big.tgz"
+			writeDedupeFile(t, root, old, content)
+			mustInsert(t, ctx, db, &Sample{SHA256: sha, Path: old, Label: "good"})
+			mustInsert(t, ctx, db, &Sample{SHA256: child, Path: old + "!!0000", Parent: sha, Label: "good"})
+			var locs []*SampleLocation
+			for i := 1; i < 1005; i++ {
+				locs = append(locs, &SampleLocation{SHA256: child, ParentSHA256: sha, Path: fmt.Sprintf("%s!!%04d", old, i)})
+			}
+			// An already-recorded destination must merge rather than fail uniqueness.
+			locs = append(locs, &SampleLocation{SHA256: child, ParentSHA256: sha, Path: last + "!!0777"})
+			if err := db.UpsertLocationBatch(ctx, locs); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.SampleBySHA256(ctx, child); err != nil {
+				t.Fatal(err)
+			} // warm the read cache
+			if _, err := db.MoveLocation(ctx, MoveLocationOptions{DataRoot: root, SHA256: sha, OldPath: old, NewPath: last}); err != nil {
+				t.Fatal(err)
+			}
+			after, err := db.LocationsForSHA(ctx, child)
+			if err != nil || len(after) != 1005 {
+				t.Fatalf("locations=%d, %v", len(after), err)
+			}
+			for _, loc := range after {
+				if !strings.HasPrefix(loc.Path, last+"!!") {
+					t.Fatalf("stale member: %s", loc.Path)
+				}
+			}
+			s, err := db.SampleBySHA256(ctx, child)
+			if err != nil || s.Path != last+"!!0000" {
+				t.Fatalf("primary: %+v %v", s, err)
+			}
+		})
+	}
+}

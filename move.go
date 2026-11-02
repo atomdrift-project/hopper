@@ -21,6 +21,9 @@ import (
 
 const movePartialPrefix = ".hopper-move-"
 
+// ErrLocationLabelChanged means consolidation must re-read the classification.
+var ErrLocationLabelChanged = errors.New("hopper: location classification changed or is unresolved")
+
 // LocationRelabel optionally applies a classification transition while moving
 // a physical location. A nil relabel makes the operation path-only.
 type LocationRelabel struct {
@@ -32,11 +35,13 @@ type LocationRelabel struct {
 // deterministic destination. Paths are slash-separated and relative to
 // DataRoot.
 type MoveLocationOptions struct {
-	Relabel  *LocationRelabel
-	DataRoot string
-	SHA256   string
-	OldPath  string
-	NewPath  string
+	// ExpectedLabel guards consolidation against a changed or unresolved ruling.
+	ExpectedLabel string
+	Relabel       *LocationRelabel
+	DataRoot      string
+	SHA256        string
+	OldPath       string
+	NewPath       string
 }
 
 // MoveLocationResult reports durable progress for one physical move.
@@ -95,6 +100,14 @@ func (db *DB) MoveLocation(ctx context.Context, opts MoveLocationOptions) (MoveL
 		return result, fmt.Errorf("hopper: destination path: %w", err)
 	}
 
+	// Serialize all moves of these bytes, including opposite moves whose source
+	// paths differ. Source-only locks cannot stop both sides unlinking each other.
+	contentLock, err := lockMoveContent(ctx, root, sha)
+	if err != nil {
+		return result, err
+	}
+	defer contentLock.Close() //nolint:errcheck // closing releases the advisory lock
+
 	locked, err := lockMoveSource(ctx, oldAbs)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
@@ -103,7 +116,7 @@ func (db *DB) MoveLocation(ctx context.Context, opts MoveLocationOptions) (MoveL
 		if err := verifyMoveFile(newAbs, sha); err != nil {
 			return result, fmt.Errorf("hopper: source missing and destination unusable: %w", err)
 		}
-		prepared, err := db.prepareLocationMove(ctx, sha, opts.OldPath, opts.NewPath, opts.Relabel)
+		prepared, err := db.prepareLocationMove(ctx, sha, opts.OldPath, opts.NewPath, opts.Relabel, opts.ExpectedLabel)
 		if err != nil {
 			return result, err
 		}
@@ -142,7 +155,7 @@ func (db *DB) MoveLocation(ctx context.Context, opts MoveLocationOptions) (MoveL
 		if err := verifyMoveFile(oldAbs, sha); err != nil {
 			return result, err
 		}
-		prepared, err := db.prepareLocationMove(ctx, sha, opts.OldPath, opts.NewPath, opts.Relabel)
+		prepared, err := db.prepareLocationMove(ctx, sha, opts.OldPath, opts.NewPath, opts.Relabel, opts.ExpectedLabel)
 		if err != nil {
 			return result, err
 		}
@@ -180,7 +193,7 @@ func (db *DB) MoveLocation(ctx context.Context, opts MoveLocationOptions) (MoveL
 		return result, fmt.Errorf("hopper: publish sidecar: %w", err)
 	}
 
-	prepared, err := db.prepareLocationMove(ctx, sha, opts.OldPath, opts.NewPath, opts.Relabel)
+	prepared, err := db.prepareLocationMove(ctx, sha, opts.OldPath, opts.NewPath, opts.Relabel, opts.ExpectedLabel)
 	if err != nil {
 		return result, err
 	}
@@ -273,8 +286,20 @@ func resolveMovePath(dataRoot, rel string) (root, resolved string, err error) {
 	return root, resolved, nil
 }
 
+// A fixed set of 256 walker-ignored lock files bounds the metadata footprint.
+// Flock works across processes; distinct source paths for the same content use
+// the same lock. Shared directory permissions allow other corpus users to read
+// and lock existing files without needing write access to the lock itself.
+func lockMoveContent(ctx context.Context, root, sha string) (*os.File, error) {
+	return lockMoveFile(ctx, filepath.Join(root, movePartialPrefix+"lock-"+sha[:2]), os.O_CREATE|os.O_RDONLY)
+}
+
 func lockMoveSource(ctx context.Context, name string) (*os.File, error) {
-	f, err := os.Open(name)
+	return lockMoveFile(ctx, name, os.O_RDONLY)
+}
+
+func lockMoveFile(ctx context.Context, name string, flags int) (*os.File, error) {
+	f, err := os.OpenFile(name, flags, 0o660) //nolint:gosec // G302: shared corpus users must be able to read and flock lock files
 	if err != nil {
 		return nil, err
 	}
@@ -564,6 +589,8 @@ func publishMoveFile(ctx context.Context, src, dst, expected string, donors []st
 
 // DedupeResult reports what one sample's dedupe pass did.
 type DedupeResult struct {
+	Removed    int   // cross-filesystem locations retired
+	Unresolved int   // samples lacking an unambiguous classified survivor
 	Linked     int   // redundant copies collapsed onto a survivor's inode
 	Skipped    int   // copies left alone (missing, unverifiable, already shared)
 	BytesSaved int64 // sum of the collapsed copies' sizes
@@ -598,9 +625,24 @@ type DedupeResult struct {
 // cheap but proves only that the copies are distinct inodes on one filesystem.
 func LinkDuplicateLocations(ctx context.Context, dataRoot, sha string, rels []string, dryRun bool) (DedupeResult, error) {
 	var result DedupeResult
+	if dataRoot == "" {
+		return result, errors.New("hopper: dedupe requires a non-empty data root")
+	}
 	if !isLowerHexSHA256(strings.ToLower(strings.TrimSpace(sha))) {
 		return result, fmt.Errorf("hopper: invalid sha256 %q", sha)
 	}
+	if !dryRun {
+		lockRoot, err := filepath.Abs(dataRoot)
+		if err != nil {
+			return result, err
+		}
+		contentLock, err := lockMoveContent(ctx, lockRoot, strings.ToLower(strings.TrimSpace(sha)))
+		if err != nil {
+			return result, err
+		}
+		defer contentLock.Close() //nolint:errcheck // closing releases the advisory lock
+	}
+
 	byDevice := map[uint64][]dedupeCandidate{}
 	for _, rel := range rels {
 		_, abs, err := resolveMovePath(dataRoot, rel)
