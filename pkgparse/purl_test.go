@@ -208,6 +208,26 @@ func TestCanonicalizePURL(t *testing.T) {
 		{"pkg:deb/curl@7.50.3-1?arch=amd64&distro=ubuntu-22.04", "pkg:deb/ubuntu/curl@7.50.3-1?arch=amd64&distro=ubuntu-22.04"},
 		{"pkg:alpine/musl", "pkg:apk/alpine/musl"},
 
+		// Only a repository_url whose host IS the AUR folds onto the aur
+		// namespace. A URL that merely mentions it (in its path, as a host
+		// prefix, or as userinfo) keeps its qualifier, so a foreign package
+		// can never share the genuine AUR package's key.
+		{"pkg:alpm/arch/yay?repository_url=https://aur.archlinux.org", "pkg:alpm/aur/yay"},
+		{"pkg:alpm/arch/foo?repository_url=HTTPS://AUR.ARCHLINUX.ORG", "pkg:alpm/aur/foo"},
+		{"pkg:alpm/arch/foo?repository_url=https://evil.example/aur.archlinux.org", "pkg:alpm/arch/foo?repository_url=https:%2F%2Fevil.example%2Faur.archlinux.org"},
+		{"pkg:alpm/arch/foo?repository_url=https://aur.archlinux.org.evil.example", "pkg:alpm/arch/foo?repository_url=https:%2F%2Faur.archlinux.org.evil.example"},
+		{"pkg:alpm/arch/foo?repository_url=https://aur.archlinux.org@evil.example", "pkg:alpm/arch/foo?repository_url=https:%2F%2Faur.archlinux.org%40evil.example"},
+
+		// A version misplaced after a bare-origin repository_url is moved back;
+		// a trailing "@…" anywhere else is part of the qualifier value.
+		{"pkg:alpm/aur/yay?repository_url=https://aur.archlinux.org@1.2-1", "pkg:alpm/aur/yay@1.2-1"},
+		{"pkg:alpm/aur/yay@1.0.0?repository_url=https://aur.archlinux.org@1.2-1", "pkg:alpm/aur/yay@1.0.0?repository_url=https:%2F%2Faur.archlinux.org%401.2-1"},
+
+		// A leading '@' opens a scope for every type, not only npm, and an
+		// unclosed one names no package.
+		{"pkg:composer/@scope/pkg", "pkg:composer/%40scope/pkg"},
+		{"pkg:npm/@1.0.0?repository_url=https://aur.archlinux.org@1.2-1", "pkg:npm/@1.0.0?repository_url=https://aur.archlinux.org@1.2-1"},
+
 		// Terraform provider addresses are case-insensitive; the version is not.
 		{"pkg:terraform/Kreuzwerker/Docker@3.0.2-RC1", "pkg:terraform/kreuzwerker/docker@3.0.2-RC1"},
 		// No namespace is no provider address, so there is no canonical form.

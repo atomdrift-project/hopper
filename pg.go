@@ -1320,14 +1320,29 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// Edge type to parent_sha256 ("" contained, "fetched", "unpacked",
 		// "registry") — see SampleLocation.Rel. Metadata-only on PG 11+.
 		`ALTER TABLE sample_locations ADD COLUMN IF NOT EXISTS rel TEXT NOT NULL DEFAULT ''`,
-		// "Where is this sha seen?" is served by the UNIQUE (sha256, path)
-		// constraint's index, whose leading key is sha256. A standalone
-		// (sha256) index was dropped 2026-11-01 as redundant with it; see the
-		// index audit list below.
-		// idx_sl_parent (parent_sha256 partial) was dropped 2026-08-22: it was
-		// fully shadowed by idx_sl_parent_child below — same key, same partial
-		// predicate, plus INCLUDE (sha256) — and idx_scan confirmed the planner
-		// always preferred the covering variant. 8.3 GB of pure write tax.
+		// path_key is the fixed-width stand-in for path in idx_sl_location_key.
+		// A member's path repeats its archive's whole path ("<archive>!!<member>",
+		// 181 bytes on average), so keying the unique index on the raw path cost
+		// 1.7 TB at 4.1B rows; 32 digest bytes cost about 0.75 TB.
+		//
+		// SHA-256, not md5: member paths are archive-controlled, and a crafted
+		// collision would let one location of a file hide another. Queries still
+		// test path itself next to path_key, so a collision could at worst
+		// refuse an insert, never return a wrong row.
+		//
+		// IMMUTABLE is true for this database: convert_to into the server's own
+		// encoding (UTF8) is the identity. Postgres marks convert_to STABLE only
+		// because conversions between different encodings can be redefined.
+		// The SQL-standard body is bound at creation, so index maintenance
+		// does not depend on search_path.
+		`CREATE OR REPLACE FUNCTION path_key(path TEXT) RETURNS BYTEA
+			LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+			RETURN sha256(convert_to(path, 'UTF8'))`,
+		// "Where is this sha seen?" is served by a unique index whose leading
+		// key is sha256: the (sha256, path) constraint's, and later
+		// idx_sl_location_key's. A standalone (sha256) index was dropped
+		// 2026-11-01 as redundant with it; see the index audit list below.
+		//
 		// Draino asks only for the oldest top-level hot-pool locations, ordered by
 		// when hopper first catalogued them. Keeping this partial makes that query
 		// proportional to the incoming pool rather than the full historical
@@ -1347,11 +1362,25 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// its way to the front of the drain.
 		`CREATE INDEX IF NOT EXISTS idx_sl_incoming_seen ON sample_locations(first_seen_at, sha256, path) ` +
 			`WHERE parent_sha256 = '' AND path LIKE 'incoming/%'`,
-		// Covering index for the reconcile reachability walk (cascadeMembersPG):
-		// finding a parent's child sha256 is then index-only — no heap fetch —
-		// which is what lets the BFS expand the alive set by index lookups instead
-		// of seq-scanning + sorting all of sample_locations.
-		`CREATE INDEX IF NOT EXISTS idx_sl_parent_child ON sample_locations(parent_sha256) INCLUDE (sha256) WHERE parent_sha256 <> ''`,
+		// Forward edge: an archive -> its members (BadMembersByParent,
+		// MembersByParent, the reconcile walk).
+		//
+		// Plain key, no INCLUDE (sha256). The covering predecessor
+		// idx_sl_parent_child made these lookups index-only, but INCLUDE disables
+		// btree deduplication: it cost 175 B per row, 703 GB at 4.0B rows, where
+		// a deduplicated parent key costs well under a tenth of that (8.2 GB vs
+		// 109 GB when both existed, 2026-08-22). The heap visit it saved is
+		// cheap here because an archive's members are written together: 120
+		// parents sampled 2026-11-02 averaged 12.6 rows per heap page (about 18
+		// fit), so a member list is a short contiguous run of pages, and every
+		// consumer then joins each member into samples anyway.
+		//
+		// Named idx_sl_members, not idx_sl_parent: the ledger already holds that
+		// name's DDL from before its 2026-08-22 drop, so reusing the text would
+		// be skipped as applied.
+		`CREATE INDEX IF NOT EXISTS idx_sl_members ON sample_locations(parent_sha256) WHERE parent_sha256 <> ''`,
+		// After idx_sl_members, so parent lookups are never left uncovered.
+		`DROP INDEX IF EXISTS idx_sl_parent_child`,
 		// Reverse edge for the page's "found in" backlinks
 		// (ParentArchivesForChild): a child sha -> the archives containing it.
 		//
@@ -1426,6 +1455,9 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// by a table-emptiness check so restarts are cheap no-ops; re-running
 		// the migration never re-scans the 3M-row samples table once done.
 		// ON CONFLICT DO NOTHING also guards against partial prior attempts.
+		// It names no arbiter so it does not depend on which unique index
+		// enforces (sha256, path); samples.sha256 is unique, so the SELECT
+		// cannot produce a duplicate (sha256, path) anyway.
 		`DO $$
 		BEGIN
 			IF NOT EXISTS (SELECT 1 FROM sample_locations LIMIT 1) THEN
@@ -1434,7 +1466,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 				SELECT sha256, path, parent, filename, source, feed, ecosystem, mtime, created_at, updated_at
 				  FROM samples
 				 WHERE path <> ''
-				ON CONFLICT (sha256, path) DO NOTHING;
+				ON CONFLICT DO NOTHING;
 			END IF;
 		END$$`,
 
@@ -1988,11 +2020,15 @@ const trgmIndexDDL = `CREATE INDEX IF NOT EXISTS idx_samples_filename_trgm ` +
 // cannot run while a logical-replication tablesync COPY holds ACCESS SHARE
 // (hours on samples). ANALYZE is the same class: useful, never required to
 // accept work. Startup must not die on any of these.
+//
+// CREATE UNIQUE INDEX is deferrable too, but only because no query may name
+// a unique index as an ON CONFLICT arbiter until a later release, shipped
+// once the index is valid. idx_sl_location_key is the one case.
 func isDeferrableIndexDDL(ddl string) bool {
 	s := strings.TrimSpace(ddl)
 	u := strings.ToUpper(s)
 	switch {
-	case strings.HasPrefix(s, "CREATE INDEX"), strings.HasPrefix(u, "DROP INDEX"):
+	case strings.HasPrefix(s, "CREATE INDEX"), strings.HasPrefix(s, "CREATE UNIQUE INDEX"), strings.HasPrefix(u, "DROP INDEX"):
 		return true
 	case strings.HasPrefix(u, "ANALYZE "):
 		return true
@@ -2447,6 +2483,8 @@ func concurrentIndexDDL(ddl string) (string, bool) {
 	for _, prefix := range []string{
 		"CREATE INDEX IF NOT EXISTS ",
 		"CREATE INDEX CONCURRENTLY IF NOT EXISTS ",
+		"CREATE UNIQUE INDEX IF NOT EXISTS ",
+		"CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ",
 	} {
 		if rest, ok := strings.CutPrefix(ddl, prefix); ok {
 			if fields := strings.Fields(rest); len(fields) > 0 {
@@ -2637,7 +2675,7 @@ func (db *DB) createIndexConcurrently(ctx context.Context, ddl, indexName string
 			}
 		}
 
-		ddl = strings.Replace(ddl, "CREATE INDEX IF NOT EXISTS ", "CREATE INDEX CONCURRENTLY IF NOT EXISTS ", 1)
+		ddl = strings.Replace(ddl, " INDEX IF NOT EXISTS ", " INDEX CONCURRENTLY IF NOT EXISTS ", 1)
 		start := time.Now()
 		slog.Info("executing migration ddl", "ddl", ddl)
 		if _, err := conn.Exec(ctx, ddl); err != nil {
@@ -4156,8 +4194,8 @@ func (db *DB) samplesBySHAsPG(ctx context.Context, shas []string) ([]*Sample, er
 }
 
 // topMemberSHAsByParentPG returns up to limit member SHAs of parentSHA ranked
-// by score. It reads only sha256 off idx_sl_parent_child's edge and the PK
-// join to samples, so nothing heavy detoasts here.
+// by score. It finds members through idx_sl_members and joins them to
+// samples by primary key, so nothing heavy detoasts here.
 func (db *DB) topMemberSHAsByParentPG(ctx context.Context, parentSHA string, limit int) ([]string, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT s.sha256
@@ -4494,12 +4532,19 @@ func (db *DB) donorLocationsForSHAPG(ctx context.Context, sha256, pool string, l
 	return out, rows.Err()
 }
 
+// The location probes below all spell the key twice: path_key(path) =
+// path_key($n) is what idx_sl_location_key can seek on, and path = $n keeps
+// the answer exact. Without the path_key term the planner can only seek on
+// sha256 and filter every location of it, which is millions of rows for the
+// empty file.
 func (db *DB) topLevelLocationsRecordedPG(ctx context.Context, sha256, first, second string) (firstOK, secondOK bool, err error) {
 	if err := db.pool.QueryRow(ctx, `
 		SELECT EXISTS(SELECT 1 FROM sample_locations
-		               WHERE sha256 = $1 AND path = $2 AND parent_sha256 = ''),
+		               WHERE sha256 = $1 AND path_key(path) = path_key($2)
+		                 AND path = $2 AND parent_sha256 = ''),
 		       EXISTS(SELECT 1 FROM sample_locations
-		               WHERE sha256 = $1 AND path = $3 AND parent_sha256 = '')`,
+		               WHERE sha256 = $1 AND path_key(path) = path_key($3)
+		                 AND path = $3 AND parent_sha256 = '')`,
 		sha256, first, second).Scan(&firstOK, &secondOK); err != nil {
 		return false, false, fmt.Errorf("hopper: locations recorded %s: %w", sha256, err)
 	}
@@ -4554,7 +4599,8 @@ func (db *DB) promotePrimaryLocationPG(ctx context.Context, sha256, oldPath, new
 		       updated_at = now()
 		 WHERE sha256 = $1 AND path = $2
 		   AND EXISTS (SELECT 1 FROM sample_locations
-		                WHERE sha256 = $1 AND path = $3 AND parent_sha256 = '')`,
+		                WHERE sha256 = $1 AND path_key(path) = path_key($3)
+		                  AND path = $3 AND parent_sha256 = '')`,
 		sha256, oldPath, newPath)
 	if err != nil {
 		return false, fmt.Errorf("hopper: promote primary location %s: %w", sha256, err)
@@ -4586,7 +4632,8 @@ func (db *DB) reactivatePrimaryLocationPG(ctx context.Context, sha256, path stri
 		   SET skip = '', skipped_at = NULL, updated_at = now()
 		 WHERE sha256 = $1 AND path = $2 AND skip = 'missing'
 		   AND EXISTS (SELECT 1 FROM sample_locations
-		                WHERE sha256 = $1 AND path = $2 AND parent_sha256 = '')`, sha256, path)
+		                WHERE sha256 = $1 AND path_key(path) = path_key($2)
+		                  AND path = $2 AND parent_sha256 = '')`, sha256, path)
 	if err != nil {
 		return false, fmt.Errorf("hopper: clear recovered primary location: %w", err)
 	}
@@ -4671,14 +4718,16 @@ func (db *DB) prepareLocationMovePG(
 	var oldID int64
 	err = tx.QueryRow(ctx, `
 		SELECT id FROM sample_locations
-		 WHERE sha256 = $1 AND path = $2 AND parent_sha256 = ''
+		 WHERE sha256 = $1 AND path_key(path) = path_key($2)
+		   AND path = $2 AND parent_sha256 = ''
 		 FOR UPDATE`, sha256, oldRel).Scan(&oldID)
 	oldExists := err == nil
 	if errors.Is(err, pgx.ErrNoRows) {
 		var destinationExists bool
 		if err := tx.QueryRow(ctx, `
 				SELECT EXISTS(SELECT 1 FROM sample_locations
-				 WHERE sha256 = $1 AND path = $2 AND parent_sha256 = '')`, sha256, newRel).Scan(&destinationExists); err != nil {
+				 WHERE sha256 = $1 AND path_key(path) = path_key($2)
+				   AND path = $2 AND parent_sha256 = '')`, sha256, newRel).Scan(&destinationExists); err != nil {
 			return false, fmt.Errorf("hopper: prepare location move lookup: %w", err)
 		}
 		if !destinationExists {
@@ -4741,24 +4790,29 @@ func (db *DB) finishLocationMovePG(ctx context.Context, sha256, oldRel, newRel s
 		       old.source, old.feed, old.ecosystem, old.mtime,
 		       old.first_seen_at, old.last_seen_at, now(), 'move', $3
 		  FROM sample_locations old
-		 WHERE old.sha256 = $1 AND old.path = $2 AND old.parent_sha256 = ''
+		 WHERE old.sha256 = $1 AND path_key(old.path) = path_key($2)
+		   AND old.path = $2 AND old.parent_sha256 = ''
 		   AND EXISTS (SELECT 1 FROM sample_locations new
-		                WHERE new.sha256 = $1 AND new.path = $3 AND new.parent_sha256 = '')`,
+		                WHERE new.sha256 = $1 AND path_key(new.path) = path_key($3)
+		                  AND new.path = $3 AND new.parent_sha256 = '')`,
 		sha256, oldRel, newRel); err != nil {
 		return false, fmt.Errorf("hopper: finish location move archive source: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
 		DELETE FROM sample_locations old
-		 WHERE old.sha256 = $1 AND old.path = $2 AND old.parent_sha256 = ''
+		 WHERE old.sha256 = $1 AND path_key(old.path) = path_key($2)
+		   AND old.path = $2 AND old.parent_sha256 = ''
 		   AND EXISTS (SELECT 1 FROM sample_locations new
-		                WHERE new.sha256 = $1 AND new.path = $3 AND new.parent_sha256 = '')`,
+		                WHERE new.sha256 = $1 AND path_key(new.path) = path_key($3)
+		                  AND new.path = $3 AND new.parent_sha256 = '')`,
 		sha256, oldRel, newRel); err != nil {
 		return false, fmt.Errorf("hopper: finish location move delete source: %w", err)
 	}
 	var destinationExists bool
 	if err := tx.QueryRow(ctx, `
 		SELECT EXISTS(SELECT 1 FROM sample_locations
-		 WHERE sha256 = $1 AND path = $2 AND parent_sha256 = '')`, sha256, newRel).Scan(&destinationExists); err != nil {
+		 WHERE sha256 = $1 AND path_key(path) = path_key($2)
+		   AND path = $2 AND parent_sha256 = '')`, sha256, newRel).Scan(&destinationExists); err != nil {
 		return false, fmt.Errorf("hopper: finish location move lookup: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -6287,8 +6341,8 @@ func (db *DB) relativizePathsPG(ctx context.Context, prefix string) (int64, erro
 		return 0, fmt.Errorf("hopper: relativize paths: %w", err)
 	}
 
-	// Rewrite sample_locations in three steps so the UNIQUE (sha256, path)
-	// constraint is never violated:
+	// Rewrite sample_locations in three steps so (sha256, path) uniqueness
+	// is never violated:
 	//   1. delete absolute rows whose target already exists as a distinct
 	//      relative row (the relative peer wins),
 	//   2. dedup peers that would converge on the same (sha, new-path)
@@ -6303,6 +6357,7 @@ func (db *DB) relativizePathsPG(ctx context.Context, prefix string) (int64, erro
 		   AND EXISTS (
 		       SELECT 1 FROM sample_locations x
 		        WHERE x.sha256 = sl.sha256
+		          AND path_key(x.path) = path_key(substring(sl.path from char_length($1) + 1))
 		          AND x.path   = substring(sl.path from char_length($1) + 1)
 		          AND x.id    <> sl.id
 		   )`, prefix); err != nil {
@@ -8688,7 +8743,7 @@ func (db *DB) stageLocationsPG(ctx context.Context, keys []SampleLocationKey) er
 // observeStagedLocationsPG records every staged path that the location ledger
 // does not already hold. The NOT EXISTS is what makes the pass affordable: on a
 // steady-state walk essentially every staged row is already known, and the
-// anti-join settles each one with a probe of the UNIQUE (sha256, path) index
+// anti-join settles each one with a probe of the (sha256, path) unique index
 // instead of a speculative insert that has to be created and then killed. That
 // difference is the whole cost of the step — with ON CONFLICT alone it was
 // twelve million doomed inserts per pass, which is what timed out for six days
@@ -8705,7 +8760,8 @@ func (db *DB) observeStagedLocationsPG(ctx context.Context) (int64, error) {
 		JOIN samples s ON s.sha256 = w.sha256 AND s.parent = ''
 		WHERE NOT EXISTS (
 			SELECT 1 FROM sample_locations l
-			 WHERE l.sha256 = w.sha256 AND l.path = w.path
+			 WHERE l.sha256 = w.sha256 AND path_key(l.path) = path_key(w.path)
+			   AND l.path = w.path
 		)
 		ON CONFLICT (sha256, path) DO NOTHING`)
 	if err != nil {
@@ -8981,8 +9037,8 @@ const aliveExpandBatch = 50000
 // ~105M-row sample_locations table (spilling past work_mem='4GB') on every pass
 // — hours on a host whose data blocks aren't cached — and, being one statement,
 // held a single long transaction that pinned the replication slot. The BFS
-// instead expands a bounded frontier per step using idx_sl_parent_child (an
-// index-only child lookup), dedups via the alive PK with ON CONFLICT, and
+// instead expands a bounded frontier per step using idx_sl_members (a child
+// lookup whose heap pages are contiguous per parent), dedups via the alive PK with ON CONFLICT, and
 // commits every step, so it never sorts the whole table and never holds a
 // long-open transaction. It reads only walk_staging/sample_locations, so it
 // takes no lock on samples. The temp tables omit ON COMMIT DROP so they outlive
@@ -9036,7 +9092,7 @@ func buildReconcileAliveSet(ctx context.Context, conn *pgxpool.Conn) error {
 				SELECT sl.sha256
 				FROM batch b
 				-- The redundant-looking parent_sha256 <> '' is load-bearing: it
-				-- lets the planner use the partial idx_sl_parent_child
+				-- lets the planner use the partial idx_sl_members
 				-- (WHERE parent_sha256 <> '') for an index
 				-- nested loop. Without it the planner can't prove the join keys
 				-- are non-empty and falls back to a 105M-row seq scan + sort. The

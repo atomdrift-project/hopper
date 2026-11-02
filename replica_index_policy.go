@@ -106,11 +106,12 @@ var replicaPublishedTables = sync.OnceValues(func() (map[string]bool, error) {
 // statements are likewise untouched: a migration that retires an index must
 // still retire it here.
 //
-// CREATE UNIQUE INDEX is refused explicitly even though no migration uses one
-// today. A unique index carries a correctness guarantee, not just a lookup
-// path, so declining it would silently let a replica accept rows the master
-// would reject — a different and much worse failure than a slow query. If one
-// is ever added, this policy must not be what decides to drop it.
+// CREATE UNIQUE INDEX is refused explicitly. A unique index carries a
+// correctness guarantee, not just a lookup path, so declining it here would
+// silently let a replica accept rows the master would reject: a worse
+// failure than a slow query. The one unique index hopper builds,
+// idx_sl_location_key, is kept off replicas by being in the primary-only list
+// (pgPrimaryIndexMigrations), never by this policy.
 func replicaSkipsIndexDDL(ddl string) (bool, error) {
 	trimmed := strings.TrimSpace(ddl)
 	upper := strings.ToUpper(trimmed)
@@ -199,10 +200,33 @@ func pgReplicaTrainingMigrations() []string {
 	return append(out, strings.TrimSpace(replicaTrainingStatisticsDDL), "ANALYZE public.samples")
 }
 
-// pgPrimaryIndexMigrations drops indexes that moved to the replica-only set.
-// The migration ledger is not replicated, so this must not run on the replica.
+// pgPrimaryIndexMigrations holds index DDL that only the primary runs. The
+// migration ledger is not replicated, so this must not run on the replica.
+//
+// idx_sl_location_key will replace the (sha256, path) constraint
+// sample_locations_sha256_path_key: 32 digest bytes in place of a path that
+// averages 181, about 0.75 TB against 1.7 TB at 4B rows. It is primary-only
+// because a logical replica replays rows the primary has already made unique
+// and reads nothing through it: galadriel had already dropped the old
+// constraint and recorded no sample_locations query from 2026-10-28 through
+// 2026-11-02.
+//
+// The swap takes two releases, because forager writes locations directly
+// through this package with ON CONFLICT (sha256, path), and that statement
+// fails the moment the old constraint is gone:
+//
+//  1. This release builds the index in the background (deferred, retried).
+//     Every upsert still names the old constraint, so writes are unaffected
+//     while the build runs, and nothing reads the new index yet.
+//  2. Once it is valid (pg_index.indisvalid), a second release switches the
+//     arbiters to ON CONFLICT (sha256, path_key(path)) and drops the old
+//     constraint. Deploy forager on that release before hopper, whose
+//     migration does the drop.
 func pgPrimaryIndexMigrations() []string {
-	return []string{`DROP INDEX IF EXISTS idx_samples_labeled_route`}
+	return []string{
+		`DROP INDEX IF EXISTS idx_samples_labeled_route`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_sl_location_key ON sample_locations (sha256, path_key(path))`,
+	}
 }
 
 func (db *DB) pgMigrationsForRole() []string {

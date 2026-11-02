@@ -1,6 +1,7 @@
 package pkgparse
 
 import (
+	"net/url"
 	"slices"
 	"strings"
 	"unicode"
@@ -692,11 +693,26 @@ func recoverableDistroNamespace(typ, tail string) bool {
 	}
 	if typ == "alpm" {
 		if val, _, found := cutQualifier(tail, "repository_url"); found &&
-			strings.Contains(val, "aur.archlinux.org") {
+			isAURRepositoryURL(val) {
 			return true
 		}
 	}
 	return false
+}
+
+// isAURRepositoryURL reports whether a repository_url qualifier value (in
+// its percent-encoded spelling) is hosted on the AUR. It mirrors fletch's
+// url_host_is: the host must be aur.archlinux.org, not merely mention it. A
+// substring test let "https://evil.example/aur.archlinux.org" or
+// "https://aur.archlinux.org@evil.example" fold onto the genuine AUR
+// package's key.
+func isAURRepositoryURL(val string) bool {
+	decoded, ok := unescapePURL(val)
+	if !ok {
+		return false
+	}
+	u, err := url.Parse(decoded)
+	return err == nil && strings.EqualFold(u.Hostname(), "aur.archlinux.org")
 }
 
 // chromeVersionShape reports whether v is a Chrome Web Store version: one to
@@ -723,7 +739,7 @@ func chromeVersionShape(v string) bool {
 }
 
 // splitPurlCoordinate splits rest — everything after "pkg:<type>/" — into the
-// canonical path (namespace/name, with a literal npm scope already folded to
+// canonical path (namespace/name, with a literal '@' scope already folded to
 // its escaped spelling) and tail ("@version?qualifiers", qualifier values
 // already canonicalized), or reports ok=false when rest names no coordinate
 // fletch would accept either. typ is already lowercased.
@@ -741,69 +757,36 @@ func splitPurlCoordinate(typ, rest string) (path, tail string, ok bool) {
 		}
 	}
 
-	// A version is the coordinate's rightmost '@' — except for npm, where a
-	// *leading* '@' opens a scope ("@scope/name") rather than a version, so
-	// its version (if any) is the rightmost '@' after the '/' that closes the
-	// scope. Determined up front because the repair below is only valid when
-	// the coordinate does not already carry a version of its own.
-	coordinateHasVersion := strings.Contains(coordinate, "@")
-	if typ == "npm" && strings.HasPrefix(coordinate, "@") {
-		coordinateHasVersion = false
-		if slash := strings.IndexByte(coordinate, '/'); slash >= 0 {
-			coordinateHasVersion = strings.Contains(coordinate[slash+1:], "@")
-		}
-	}
-
-	// Repair the non-spec "?qualifiers@version" ordering older exports
-	// emitted (a version appended to a qualifier-bearing purl_base): recover
-	// the trailing version and move it back before the qualifiers. Only when
-	// the coordinate has no version of its own — fletch's
-	// !coordinate_has_version gate — so a qualifier value that legitimately
-	// ends in "@something" (a repository_url with userinfo) next to an
-	// explicit version is never misread as one. The chunk after the last '@'
-	// is only a version when it is free of '='/'&'/'/', any of which would
-	// mark it as still part of the value.
-	repairedVersion := ""
-	if !coordinateHasVersion && hasQualifiers {
-		if i := strings.LastIndexByte(qualifiers, '@'); i >= 0 {
-			if v := qualifiers[i+1:]; v != "" && !strings.ContainsAny(v, "=&/") {
-				repairedVersion, qualifiers = v, qualifiers[:i]
-			}
-		}
-	}
-
+	// Split the version off the coordinate the way fletch's split_version
+	// does: at the rightmost '@', except that a coordinate never starts with
+	// its version, so a leading '@' opens a scope ("@babel/core", for any
+	// type) and the version can only follow the '/' that closes it. A scope
+	// that is never closed has no canonical form.
 	coordinate = strings.Trim(coordinate, "/")
-
-	// Split the coordinate into path and version. A repaired version already
-	// claims the version slot, so the whole coordinate — leading '@' and
-	// all — is the path (fletch's repaired_version branch bypasses the
-	// scope/version split entirely: "pkg:npm/@1.0.0?repository_url=…@1.2-1"
-	// names the package "@1.0.0", versioned "1.2-1", never an empty name
-	// plus two competing version readings).
-	var version string
-	switch {
-	case repairedVersion != "":
-		path, version = coordinate, repairedVersion
-	case typ == "npm" && strings.HasPrefix(coordinate, "@"):
+	start := 0
+	if strings.HasPrefix(coordinate, "@") {
 		slash := strings.IndexByte(coordinate, '/')
 		if slash < 0 {
-			// An unclosed scope with no recoverable version has no
-			// canonical form — pass the input through untouched.
 			return "", "", false
 		}
-		if rel := strings.LastIndexByte(coordinate[slash+1:], '@'); rel >= 0 {
-			sep := slash + 1 + rel
-			path, version = coordinate[:sep], coordinate[sep+1:]
-		} else {
-			path = coordinate
-		}
-	default:
-		if i := strings.LastIndexByte(coordinate, '@'); i >= 0 {
-			path, version = coordinate[:i], coordinate[i+1:]
-		} else {
-			path = coordinate
+		start = slash + 1
+	}
+	path = coordinate
+	var version string
+	hasVersion := false
+	if i := strings.LastIndexByte(coordinate[start:], '@'); i >= 0 {
+		path, version, hasVersion = coordinate[:start+i], coordinate[start+i+1:], true
+	}
+
+	// Repair the non-spec "?repository_url=<origin>@version" ordering one
+	// producer emitted, only when the coordinate has no version of its own
+	// (an empty "name@" counts as one, as it does for fletch).
+	if !hasVersion && hasQualifiers {
+		if quals, v, found := misplacedVersion(qualifiers); found {
+			qualifiers, version = quals, v
 		}
 	}
+
 	path = strings.Trim(path, "/")
 	// A degenerate coordinate (empty type or name) has no canonical form —
 	// the Rust twin (fletch's purl::normalize) rejects these outright — so
@@ -811,11 +794,10 @@ func splitPurlCoordinate(typ, rest string) (path, tail string, ok bool) {
 	if typ == "" || path == "" {
 		return "", "", false
 	}
-	// Fold a literal npm scope onto the escaped spelling renderPURL produces,
-	// so a purl this package generated and one pasted in by hand are the same
-	// key. Mirrors fletch's purl::normalize, which applies this to every
-	// type, not only npm: the split above already reads a leading '@' as part
-	// of the path whatever the type is, so it folds the same way here.
+	// Fold a literal scope onto the escaped spelling renderPURL produces, so
+	// a purl this package generated and one pasted in by hand are the same
+	// key. Like fletch's purl::normalize this applies to every type, since
+	// the split above reads a leading '@' as a scope whatever the type is.
 	if scope, found := strings.CutPrefix(path, "@"); found {
 		path = "%40" + scope
 	}
@@ -832,6 +814,44 @@ func splitPurlCoordinate(typ, rest string) (path, tail string, ok bool) {
 	// onto the canonical encoding before any branch inspects or rebuilds the
 	// tail, so every return path below emits one spelling.
 	return path, canonicalQualifiers(tail), true
+}
+
+// misplacedVersion mirrors fletch's misplaced_version: the version one
+// producer appended after the qualifiers of a PURL whose last qualifier was a
+// repository_url naming a bare registry origin
+// ("…?repository_url=https://aur.archlinux.org@1.0-1"). It returns the
+// qualifiers without it, and the version.
+//
+// Only that exact shape is read as a version. Anywhere else a trailing "@…"
+// belongs to a qualifier value: the userinfo of a URL
+// ("vcs_url=git+ssh://git@github.com") or a revision
+// ("vcs_url=…/repo.git@4345abcd").
+func misplacedVersion(qualifiers string) (rest, version string, ok bool) {
+	at := strings.LastIndexByte(qualifiers, '@')
+	if at < 0 {
+		return "", "", false
+	}
+	rest, version = qualifiers[:at], qualifiers[at+1:]
+	origin, found := strings.CutPrefix(rest[strings.LastIndexByte(rest, '&')+1:], "repository_url=")
+	if !found {
+		return "", "", false
+	}
+	host, found := strings.CutPrefix(origin, "https://")
+	if !found {
+		host, found = strings.CutPrefix(origin, "http://")
+	}
+	if !found || !strings.Contains(host, ".") {
+		return "", "", false
+	}
+	for i := range len(host) {
+		if c := host[i]; (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '.' && c != '-' {
+			return "", "", false
+		}
+	}
+	if version == "" || version[0] < '0' || version[0] > '9' || strings.ContainsAny(version, "=&/") {
+		return "", "", false
+	}
+	return rest, version, true
 }
 
 func canonicalizePURL(purl string) string {
@@ -902,7 +922,7 @@ func canonicalizePURL(purl string) string {
 		// dropping that qualifier. A repository_url naming anything else, and
 		// the other alpm namespaces (the official repos), are already
 		// canonical.
-		if val, rest, found := cutQualifier(tail, "repository_url"); found && strings.Contains(val, "aur.archlinux.org") {
+		if val, rest, found := cutQualifier(tail, "repository_url"); found && isAURRepositoryURL(val) {
 			return "pkg:alpm/aur/" + purlLower(lastSegment(vendored)) + rest
 		}
 		if name, found := strings.CutPrefix(vendored, "aur/"); found {
@@ -921,7 +941,7 @@ func canonicalizePURL(purl string) string {
 		// qualifier dropped — the same fold the alpm case applies, so a
 		// single pass converges to the fixed point.
 		if d.typ == "alpm" {
-			if val, rest, found := cutQualifier(tail, "repository_url"); found && strings.Contains(val, "aur.archlinux.org") {
+			if val, rest, found := cutQualifier(tail, "repository_url"); found && isAURRepositoryURL(val) {
 				ns, tail = "aur", rest
 			}
 		}

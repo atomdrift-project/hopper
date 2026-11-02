@@ -150,12 +150,13 @@ idx_slh_sha256_retired
 # (parseShellWordList) — every word inside the quotes is read as an index name,
 # so no comments may appear between them. Annotate above the list, as here.
 #
-# idx_sl_parent_child is PARKED, not retired: move it back to
-# REPLICA_KEEP_INDEXES and run `make replica` BEFORE any replica read path
-# starts resolving an archive's members.
+# idx_sl_members is PARKED, not retired: move it to REPLICA_KEEP_INDEXES and
+# run `make replica` BEFORE any replica read path starts resolving an archive's
+# members.
 #
-# It serves `WHERE parent_sha256 = $1` (btree(parent_sha256) INCLUDE (sha256)
-# WHERE parent_sha256 <> ''), and on 2026-09-16 it had idx_scan=0 for its whole
+# It serves `WHERE parent_sha256 = $1`. The notes below were measured on its
+# covering predecessor idx_sl_parent_child (same key plus INCLUDE (sha256),
+# replaced 2026-11-02), which on 2026-09-16 had idx_scan=0 for its whole
 # lifetime on galadriel — the counter moved 0 -> 2 only because an EXPLAIN
 # touched it. It is 199 GB, the second-largest index on the replica, against a
 # 559 GB sample_locations heap on a filesystem at 99%.
@@ -243,7 +244,7 @@ idx_samples_unanalyzed_id
 idx_samples_updated_at
 idx_sl_donor
 idx_sl_incoming_seen
-idx_sl_parent_child
+idx_sl_members
 '
 
 SLIM_CONSTRAINTS='sample_locations|sample_locations_sha256_path_key'

@@ -436,6 +436,15 @@ func TestPlanAuditUnconvictedQueues(t *testing.T) {
 		{
 			name: "unconvicted-hostile", where: triageUnconvictedHostileWhere,
 			order: TriageFilter{Order: TriageRepair}, index: "idx_samples_unconvicted_hostile_repair",
+			// The same trade as unconvicted-suspicious below: the freshness
+			// floor is an Index Cond on the STALE index, so the planner may
+			// read the floor's rows and top-N sort them. Measured 2026-11-02:
+			// 1,824 rows sorted in 5.6 ms, against 0.12 ms for walking the
+			// repair index. The walk is faster only while the newest rows are
+			// also the freshly analyzed ones, which the planner cannot see
+			// and nothing bounds; the floor bounds the sort. A Seq Scan is
+			// still a failure.
+			altIndex: "idx_samples_unconvicted_hostile_stale", allowSort: true,
 		},
 		{
 			name: "unconvicted-hostile-stale", where: triageUnconvictedHostileWhere,

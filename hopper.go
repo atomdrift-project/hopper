@@ -2965,8 +2965,7 @@ func (db *DB) DonorLocationsForSHA(ctx context.Context, sha256, pool string, lim
 //
 // This is the question a move's compare-and-swap actually asks — "is the path I
 // am moving from, or the one I am moving to, in the catalog" — and asking it
-// directly is why it costs two index probes against the UNIQUE (sha256, path)
-// constraint. Its caller used to answer it by pulling every location for the
+// directly is why it costs two probes of the (sha256, path) unique index. Its caller used to answer it by pulling every location for the
 // sha back and comparing paths in Go, which for a widely duplicated sha means
 // millions of rows, an on-disk sort, and gigabytes on the wire to produce two
 // booleans. Fan-out is savagely skewed — p50 is 1 location, the empty file sits
@@ -3767,7 +3766,7 @@ type ArchiveMember struct {
 // plus the total member count, joining only the light score columns so the big
 // cleave/litmus blobs are never loaded here; callers fetch those on demand for
 // just the members they render (see SamplesBySHAs). The parent_sha256 lookup is
-// served index-only by idx_sl_parent_child.
+// served by idx_sl_members.
 func (db *DB) MembersByParent(ctx context.Context, parentSHA string, limit int) (members []ArchiveMember, total int, err error) {
 	if parentSHA == "" || limit <= 0 {
 		return nil, 0, nil

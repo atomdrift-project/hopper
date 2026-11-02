@@ -260,12 +260,15 @@ func (db *DB) migratePurgatoryMember(ctx context.Context, root string, item purg
 			FROM sample_locations WHERE id = $1`, item.id, newRel); err != nil {
 			return err
 		}
+		// No arbiter named: this statement also runs on SQLite, which has no
+		// path_key. With id from the sequence, the only conflict possible is
+		// on the (sha256, path) key either backend enforces.
 		if err := exec(`INSERT INTO sample_locations
 			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem,
 			 mtime, first_seen_at, last_seen_at)
 			SELECT sha256, $2, parent_sha256, rel, filename, source, feed, ecosystem,
 			       mtime, first_seen_at, last_seen_at FROM sample_locations WHERE id = $1
-			ON CONFLICT (sha256, path) DO NOTHING`, item.id, newRel); err != nil {
+			ON CONFLICT DO NOTHING`, item.id, newRel); err != nil {
 			return err
 		}
 		if err := exec(`UPDATE samples SET path = $1, updated_at = $4
