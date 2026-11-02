@@ -68,30 +68,32 @@ func TestPGMigrationConcurrentIndexes(t *testing.T) {
 	}
 }
 
-// TestLocationKeyMigrationPhases pins the first half of the (sha256, path)
-// uniqueness swap (see pgPrimaryIndexMigrations). The new index builds in
-// the background, concurrently, on the primary only, and nothing drops the
-// old constraint yet: forager's upserts still name it.
+// TestLocationKeyMigrationPhases pins the ordering the (sha256, path)
+// uniqueness swap depends on. The arbiter index must be core DDL, because the
+// location upserts name it and would fail while it is missing. Dropping the
+// old constraint must be deferred, so a lost lock race is retried in the
+// background instead of failing startup.
 func TestLocationKeyMigrationPhases(t *testing.T) {
-	var create string
+	var create, drop string
 	for _, ddl := range pgPrimaryIndexMigrations() {
-		if strings.Contains(ddl, "idx_sl_location_key") {
+		switch {
+		case strings.Contains(ddl, "idx_sl_location_key"):
 			create = ddl
+		case strings.Contains(ddl, "sample_locations_sha256_path_key"):
+			drop = ddl
 		}
 	}
-	if create == "" {
-		t.Fatal("primary migrations do not build idx_sl_location_key")
+	if create == "" || drop == "" {
+		t.Fatalf("primary migrations lack the location key swap: create=%q drop=%q", create, drop)
 	}
-	if !isDeferrableIndexDDL(create) {
-		t.Errorf("%q must build in the background; in the core phase it blocks startup for hours", create)
+	if isDeferrableIndexDDL(create) {
+		t.Errorf("%q must run before serving: the upserts name it as their arbiter", create)
+	}
+	if !isDeferrableIndexDDL(drop) {
+		t.Errorf("%q must be deferred so a lock race cannot fail startup", drop)
 	}
 	if _, ok := concurrentIndexDDL(create); !ok {
 		t.Errorf("%q must build CONCURRENTLY; a plain build blocks every location write for hours", create)
-	}
-	for _, ddl := range append(pgRuntimeMigrations(), pgPrimaryIndexMigrations()...) {
-		if strings.Contains(ddl, "DROP CONSTRAINT") && strings.Contains(ddl, "sample_locations_sha256_path_key") {
-			t.Errorf("the old constraint must outlive every writer that names it as an arbiter: %q", ddl)
-		}
 	}
 	for _, ddl := range pgRuntimeMigrations() {
 		if strings.Contains(ddl, "idx_sl_location_key ON") {
@@ -100,23 +102,26 @@ func TestLocationKeyMigrationPhases(t *testing.T) {
 	}
 }
 
-// TestPGLocationKeyIndex checks the migrated sample_locations index set, and
-// that upserts and exact-path probes work with both unique indexes present.
+// TestPGLocationKeyIndex checks the migrated sample_locations index set and
+// that upserts and exact-path probes behave the same through
+// idx_sl_location_key as they did through the old (sha256, path) constraint.
 func TestPGLocationKeyIndex(t *testing.T) {
 	db := openDisposablePG(t)
 	ctx := t.Context()
 
-	for _, name := range []string{"idx_sl_location_key", "sample_locations_sha256_path_key", "idx_sl_members"} {
+	for _, name := range []string{"idx_sl_location_key", "idx_sl_members"} {
 		def, exists, err := db.pgIndexDef(ctx, name)
 		if err != nil || !exists {
 			t.Fatalf("%s missing after migrate: exists=%v err=%v", name, exists, err)
 		}
-		if name != "idx_sl_members" && !strings.Contains(def, "UNIQUE") {
+		if name == "idx_sl_location_key" && !strings.Contains(def, "UNIQUE") {
 			t.Errorf("%s is not unique: %s", name, def)
 		}
 	}
-	if _, exists, err := db.pgIndexDef(ctx, "idx_sl_parent_child"); err != nil || exists {
-		t.Errorf("idx_sl_parent_child should be gone after migrate: exists=%v err=%v", exists, err)
+	for _, name := range []string{"idx_sl_parent_child", "sample_locations_sha256_path_key"} {
+		if _, exists, err := db.pgIndexDef(ctx, name); err != nil || exists {
+			t.Errorf("%s should be gone after migrate: exists=%v err=%v", name, exists, err)
+		}
 	}
 
 	sha := strings.Repeat("ab", 32)

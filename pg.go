@@ -1301,6 +1301,10 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// observation fields (path, source, feed, parent, mtime) that used
 		// to live on samples and get clobbered on re-ingest live here going
 		// forward.
+		//
+		// (sha256, path) is unique, but the primary enforces it with
+		// idx_sl_location_key (see pgPrimaryIndexMigrations), not an inline
+		// constraint: a logical replica must not carry it.
 		`CREATE TABLE IF NOT EXISTS sample_locations (
 			id            BIGSERIAL PRIMARY KEY,
 			sha256        TEXT NOT NULL REFERENCES samples(sha256) ON DELETE CASCADE,
@@ -1314,8 +1318,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			ecosystem     TEXT NOT NULL DEFAULT '',
 			mtime         TIMESTAMPTZ,
 			first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-			UNIQUE (sha256, path)
+			last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		// Edge type to parent_sha256 ("" contained, "fetched", "unpacked",
 		// "registry") — see SampleLocation.Rel. Metadata-only on PG 11+.
@@ -1338,9 +1341,8 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE OR REPLACE FUNCTION path_key(path TEXT) RETURNS BYTEA
 			LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
 			RETURN sha256(convert_to(path, 'UTF8'))`,
-		// "Where is this sha seen?" is served by a unique index whose leading
-		// key is sha256: the (sha256, path) constraint's, and later
-		// idx_sl_location_key's. A standalone (sha256) index was dropped
+		// "Where is this sha seen?" is served by idx_sl_location_key, whose
+		// leading key is sha256. A standalone (sha256) index was dropped
 		// 2026-11-01 as redundant with it; see the index audit list below.
 		//
 		// Draino asks only for the oldest top-level hot-pool locations, ordered by
@@ -1455,9 +1457,9 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// by a table-emptiness check so restarts are cheap no-ops; re-running
 		// the migration never re-scans the 3M-row samples table once done.
 		// ON CONFLICT DO NOTHING also guards against partial prior attempts.
-		// It names no arbiter so it does not depend on which unique index
-		// enforces (sha256, path); samples.sha256 is unique, so the SELECT
-		// cannot produce a duplicate (sha256, path) anyway.
+		// It names no arbiter because this runs before idx_sl_location_key
+		// exists, and on replicas, which never build it; samples.sha256 is
+		// unique, so the SELECT cannot produce a duplicate (sha256, path).
 		`DO $$
 		BEGIN
 			IF NOT EXISTS (SELECT 1 FROM sample_locations LIMIT 1) THEN
@@ -2021,14 +2023,17 @@ const trgmIndexDDL = `CREATE INDEX IF NOT EXISTS idx_samples_filename_trgm ` +
 // (hours on samples). ANALYZE is the same class: useful, never required to
 // accept work. Startup must not die on any of these.
 //
-// CREATE UNIQUE INDEX is deferrable too, but only because no query may name
-// a unique index as an ON CONFLICT arbiter until a later release, shipped
-// once the index is valid. idx_sl_location_key is the one case.
+// Dropping a constraint is the same class: retiring a constraint-backed index
+// needs ACCESS EXCLUSIVE, and a migration only drops one after building
+// whatever replaces it. CREATE UNIQUE INDEX is deliberately not deferrable:
+// an ON CONFLICT arbiter must exist before the queries that name it run.
 func isDeferrableIndexDDL(ddl string) bool {
 	s := strings.TrimSpace(ddl)
 	u := strings.ToUpper(s)
 	switch {
-	case strings.HasPrefix(s, "CREATE INDEX"), strings.HasPrefix(s, "CREATE UNIQUE INDEX"), strings.HasPrefix(u, "DROP INDEX"):
+	case strings.HasPrefix(s, "CREATE INDEX"), strings.HasPrefix(u, "DROP INDEX"):
+		return true
+	case strings.HasPrefix(u, "ALTER TABLE") && strings.Contains(u, " DROP CONSTRAINT "):
 		return true
 	case strings.HasPrefix(u, "ANALYZE "):
 		return true
@@ -3056,7 +3061,7 @@ func (db *DB) insertSampleNewPG(ctx context.Context, sample *Sample) (bool, erro
 			INSERT INTO sample_locations
 				(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-			ON CONFLICT (sha256, path) DO UPDATE SET
+			ON CONFLICT (sha256, path_key(path)) DO UPDATE SET
 				rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
 				source = CASE WHEN sample_locations.source = '' THEN EXCLUDED.source ELSE sample_locations.source END,
 				feed = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE sample_locations.feed END,
@@ -3397,7 +3402,7 @@ const locationsFromStagingPG = `
 		sha256, path, parent, rel, filename, source, feed, ecosystem, mtime
 	  FROM _staging
 	 WHERE path <> ''
-	ON CONFLICT (sha256, path) DO UPDATE SET
+	ON CONFLICT (sha256, path_key(path)) DO UPDATE SET
 		rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
 		source = CASE WHEN sample_locations.source = '' THEN EXCLUDED.source ELSE sample_locations.source END,
 		feed = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE sample_locations.feed END,
@@ -4295,7 +4300,7 @@ func (db *DB) reconcileLocationParentEdgesPG(ctx context.Context, cursor int64) 
 			SELECT sha256, path, parent, filename, source, feed, ecosystem, mtime, created_at, updated_at
 			  FROM samples
 			 WHERE id > $1 AND id <= $2 AND parent <> '' AND path <> ''
-			ON CONFLICT (sha256, path) DO NOTHING`, cursor, hi); err != nil {
+			ON CONFLICT (sha256, path_key(path)) DO NOTHING`, cursor, hi); err != nil {
 			return fmt.Errorf("hopper: backfill locations: chunk (%d,%d]: %w", cursor, hi, err)
 		}
 		cursor = hi
@@ -4436,7 +4441,7 @@ func (db *DB) upsertLocationPG(ctx context.Context, loc *SampleLocation) error {
 		INSERT INTO sample_locations
 			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		ON CONFLICT (sha256, path) DO UPDATE SET
+		ON CONFLICT (sha256, path_key(path)) DO UPDATE SET
 			rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
 			mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)
 		WHERE (EXCLUDED.rel <> '' AND EXCLUDED.rel IS DISTINCT FROM sample_locations.rel)
@@ -4472,7 +4477,7 @@ func (db *DB) upsertLocationBatchPG(ctx context.Context, locs []*SampleLocation)
 			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem)
 		SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[],
 			$5::text[], $6::text[], $7::text[], $8::text[])
-		ON CONFLICT (sha256, path) DO UPDATE SET
+		ON CONFLICT (sha256, path_key(path)) DO UPDATE SET
 			rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
 			source = CASE WHEN sample_locations.source = '' THEN EXCLUDED.source ELSE sample_locations.source END,
 			feed = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE sample_locations.feed END,
@@ -4624,7 +4629,7 @@ func (db *DB) reactivatePrimaryLocationPG(ctx context.Context, sha256, path stri
 		  JOIN samples s ON s.sha256 = h.sha256 AND s.path = h.path
 		 WHERE h.sha256 = $1 AND h.path = $2 AND h.parent_sha256 = ''
 		 ORDER BY h.retired_at DESC, h.id DESC LIMIT 1
-		ON CONFLICT (sha256, path) DO NOTHING`, sha256, path); err != nil {
+		ON CONFLICT (sha256, path_key(path)) DO NOTHING`, sha256, path); err != nil {
 		return false, fmt.Errorf("hopper: restore retired primary location: %w", err)
 	}
 	tag, err := tx.Exec(ctx, `
@@ -4745,7 +4750,7 @@ func (db *DB) prepareLocationMovePG(
 		SELECT sha256, $2, parent_sha256, rel, filename, source, feed, ecosystem,
 		       mtime, first_seen_at, now()
 			  FROM sample_locations WHERE id = $1
-			ON CONFLICT (sha256, path) DO NOTHING`, oldID, newRel); err != nil {
+			ON CONFLICT (sha256, path_key(path)) DO NOTHING`, oldID, newRel); err != nil {
 			return false, fmt.Errorf("hopper: prepare destination location: %w", err)
 		}
 	}
@@ -6342,7 +6347,7 @@ func (db *DB) relativizePathsPG(ctx context.Context, prefix string) (int64, erro
 	}
 
 	// Rewrite sample_locations in three steps so (sha256, path) uniqueness
-	// is never violated:
+	// (idx_sl_location_key) is never violated:
 	//   1. delete absolute rows whose target already exists as a distinct
 	//      relative row (the relative peer wins),
 	//   2. dedup peers that would converge on the same (sha, new-path)
@@ -8743,8 +8748,8 @@ func (db *DB) stageLocationsPG(ctx context.Context, keys []SampleLocationKey) er
 // observeStagedLocationsPG records every staged path that the location ledger
 // does not already hold. The NOT EXISTS is what makes the pass affordable: on a
 // steady-state walk essentially every staged row is already known, and the
-// anti-join settles each one with a probe of the (sha256, path) unique index
-// instead of a speculative insert that has to be created and then killed. That
+// anti-join settles each one with a probe of idx_sl_location_key instead of
+// a speculative insert that has to be created and then killed. That
 // difference is the whole cost of the step — with ON CONFLICT alone it was
 // twelve million doomed inserts per pass, which is what timed out for six days
 // running and left renamed pools unlearned. ON CONFLICT stays as the guard for
@@ -8763,7 +8768,7 @@ func (db *DB) observeStagedLocationsPG(ctx context.Context) (int64, error) {
 			 WHERE l.sha256 = w.sha256 AND path_key(l.path) = path_key(w.path)
 			   AND l.path = w.path
 		)
-		ON CONFLICT (sha256, path) DO NOTHING`)
+		ON CONFLICT (sha256, path_key(path)) DO NOTHING`)
 	if err != nil {
 		return 0, err
 	}

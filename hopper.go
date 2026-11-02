@@ -2965,10 +2965,11 @@ func (db *DB) DonorLocationsForSHA(ctx context.Context, sha256, pool string, lim
 //
 // This is the question a move's compare-and-swap actually asks — "is the path I
 // am moving from, or the one I am moving to, in the catalog" — and asking it
-// directly is why it costs two probes of the (sha256, path) unique index. Its caller used to answer it by pulling every location for the
-// sha back and comparing paths in Go, which for a widely duplicated sha means
-// millions of rows, an on-disk sort, and gigabytes on the wire to produce two
-// booleans. Fan-out is savagely skewed — p50 is 1 location, the empty file sits
+// directly is why it costs two probes of idx_sl_location_key, the
+// (sha256, path) unique index. Its caller used to answer it by pulling every
+// location for the sha back and comparing paths in Go, which for a widely
+// duplicated sha means millions of rows, an on-disk sort, and gigabytes on
+// the wire to produce two booleans. Fan-out is savagely skewed — p50 is 1 location, the empty file sits
 // in ~7.2M — so any form proportional to locations is a timeout on exactly the
 // tiny ubiquitous files a hot-pool drain has the most of.
 func (db *DB) TopLevelLocationsRecorded(ctx context.Context, sha256, first, second string) (firstOK, secondOK bool, err error) {

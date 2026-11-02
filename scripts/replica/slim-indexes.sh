@@ -30,12 +30,11 @@
 # is recorded rather than inferred from silence.
 #
 # Scope / safety:
-#   * DROP INDEX CONCURRENTLY — prism readers never block; the one
-#     constraint-backed entry uses a bounded-lock retry loop.
+#   * DROP INDEX CONCURRENTLY — prism readers never block.
 #   * Never drops a PRIMARY KEY, the configured replica identity, or any
-#     constraint-backed index (those are handled via SLIM_CONSTRAINTS).
-#     Uniqueness lost with sample_locations_sha256_path_key is enforced by the
-#     master; apply replays its already-unique stream.
+#     constraint-backed index. sample_locations' (sha256, path) uniqueness is
+#     not here at all: hopper builds idx_sl_location_key on the primary only
+#     (pgPrimaryIndexMigrations), and apply replays its already-unique stream.
 #   * Only touches tables this replica actually subscribes to (pg_subscription_rel),
 #     so local-only tables keep their indexes.
 #   * Restore DDL is captured to $HEAL_STATE_DIR/slim-index-restore.sql before
@@ -50,13 +49,12 @@
 # pg_stat_user_indexes.idx_scan on a warm replica.
 #
 # Env: LOCAL_DB (=hopper), HEAL_STATE_DIR (=$HOME/.hopper-replica-heal),
-# SLIM_LOCK_TIMEOUT (=15s), REPLICA_SLIM_INDEXES (=true; 'false' skips).
+# REPLICA_SLIM_INDEXES (=true; 'false' skips).
 
 set -eu
 
 LOCAL_DB="${LOCAL_DB:-hopper}"
 HEAL_STATE_DIR="${HEAL_STATE_DIR:-$HOME/.hopper-replica-heal}"
-SLIM_LOCK_TIMEOUT="${SLIM_LOCK_TIMEOUT:-15s}"
 
 log()  { printf 'slim-indexes: %s\n' "$*"; }
 warn() { printf 'slim-indexes: WARN %s\n' "$*" >&2; }
@@ -247,8 +245,6 @@ idx_sl_incoming_seen
 idx_sl_members
 '
 
-SLIM_CONSTRAINTS='sample_locations|sample_locations_sha256_path_key'
-
 keep_csv=$(printf '%s\n' "$REPLICA_KEEP_INDEXES" | grep -v '^$' | sed "s/^/'/; s/\$/'/" | paste -sd, -)
 [ -n "$keep_csv" ] || keep_csv="''"
 
@@ -285,12 +281,6 @@ SELECT pg_get_indexdef(i.indexrelid) || ';'
  WHERE c.relname IN ($names_csv);
 SQL
 fi
-admin -d "$LOCAL_DB" -tA >>"$restore" <<'SQL' || warn "could not capture constraint restore DDL (continuing)"
-SELECT format('ALTER TABLE public.%I ADD CONSTRAINT %I %s;',
-              t.relname, con.conname, pg_get_constraintdef(con.oid))
-  FROM pg_constraint con JOIN pg_class t ON t.oid = con.conrelid
- WHERE con.conname = 'sample_locations_sha256_path_key';
-SQL
 
 dropped=0
 for idx in $targets; do
@@ -300,31 +290,6 @@ for idx in $targets; do
         || warn "drop of $idx failed (continuing)"
     dropped=$((dropped+1))
 done
-
-oldIFS=$IFS; IFS='
-'
-for pair in $SLIM_CONSTRAINTS; do
-    [ -n "$pair" ] || continue
-    tbl=${pair%%|*}; con=${pair##*|}
-    if admin -d "$LOCAL_DB" -tAc \
-        "SELECT 1 FROM pg_constraint WHERE conname='$con'" | grep -q 1; then
-        # ACCESS EXCLUSIVE needed briefly; bounded wait + retries so we slot in
-        # between apply-worker transactions instead of queueing behind them.
-        n=0
-        while [ $n -lt 20 ]; do
-            n=$((n+1))
-            if admin -d "$LOCAL_DB" -c \
-                "SET lock_timeout='$SLIM_LOCK_TIMEOUT'; ALTER TABLE public.\"$tbl\" DROP CONSTRAINT IF EXISTS \"$con\";" 2>/dev/null; then
-                log "dropped constraint $con (attempt $n)"
-                dropped=$((dropped+1))
-                break
-            fi
-            sleep 5
-        done
-        [ $n -ge 20 ] && warn "could not drop constraint $con after $n attempts — re-run later"
-    fi
-done
-IFS=$oldIFS
 
 if [ "$dropped" -gt 0 ]; then
     log "dropped $dropped master-only index(es); restore DDL appended to $restore"

@@ -203,29 +203,29 @@ func pgReplicaTrainingMigrations() []string {
 // pgPrimaryIndexMigrations holds index DDL that only the primary runs. The
 // migration ledger is not replicated, so this must not run on the replica.
 //
-// idx_sl_location_key will replace the (sha256, path) constraint
-// sample_locations_sha256_path_key: 32 digest bytes in place of a path that
-// averages 181, about 0.75 TB against 1.7 TB at 4B rows. It is primary-only
-// because a logical replica replays rows the primary has already made unique
-// and reads nothing through it: galadriel had already dropped the old
-// constraint and recorded no sample_locations query from 2026-10-28 through
-// 2026-11-02.
+// idx_sl_location_key enforces sample_locations' (sha256, path) uniqueness
+// and is the arbiter every location upsert names. It replaced the constraint
+// sample_locations_sha256_path_key, which keyed on the raw path (181 bytes
+// on average): 509 GB freshly built against 1,651 GB, at 4.1B rows on
+// 2026-11-02. It is primary-only because a logical replica replays rows the
+// primary has already made unique and reads nothing through it: galadriel
+// had dropped the old constraint and recorded no sample_locations query from
+// 2026-10-28 through 2026-11-02.
 //
-// The swap takes two releases, because forager writes locations directly
-// through this package with ON CONFLICT (sha256, path), and that statement
-// fails the moment the old constraint is gone:
+// It is core DDL, not deferred (see isDeferrableIndexDDL): the upserts name
+// it, so a fresh database must have it before serving. The previous release
+// built it in the background on the established primary, where the ledger
+// now skips it. The old constraint is dropped after it, in the deferred
+// phase, so uniqueness is never left unenforced.
 //
-//  1. This release builds the index in the background (deferred, retried).
-//     Every upsert still names the old constraint, so writes are unaffected
-//     while the build runs, and nothing reads the new index yet.
-//  2. Once it is valid (pg_index.indisvalid), a second release switches the
-//     arbiters to ON CONFLICT (sha256, path_key(path)) and drops the old
-//     constraint. Deploy forager on that release before hopper, whose
-//     migration does the drop.
+// Any other binary that writes locations through this package (forager)
+// must run a version with the path_key arbiters before this drop lands:
+// ON CONFLICT (sha256, path) fails once the old constraint is gone.
 func pgPrimaryIndexMigrations() []string {
 	return []string{
 		`DROP INDEX IF EXISTS idx_samples_labeled_route`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_sl_location_key ON sample_locations (sha256, path_key(path))`,
+		`ALTER TABLE sample_locations DROP CONSTRAINT IF EXISTS sample_locations_sha256_path_key`,
 	}
 }
 
