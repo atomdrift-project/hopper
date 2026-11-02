@@ -2,6 +2,7 @@ package hopper
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -63,4 +64,59 @@ func TestBadSharedLocations(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A shared sample behind many non-shared bad rows must still be reached. The
+// location predicate and exclusions belong before LIMIT; the expensive sample
+// metadata belongs after it. Check the real PostgreSQL planner as well as the
+// result, since a correct selector can still time out on the global index.
+func TestBadSharedCoveringPG(t *testing.T) {
+	db := openDisposablePG(t)
+	ctx := t.Context()
+	_, err := db.pool.Exec(ctx, `INSERT INTO samples (sha256,path,label,created_at)
+ SELECT lpad(to_hex(g),64,'0'), 'sample/' || g, CASE WHEN g % 32 = 0 THEN 'bad' ELSE 'unknown' END, now()-g*interval '1 second'
+ FROM generate_series(1,160000) g`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := fmt.Sprintf("%064x", 160000)
+	_, err = db.pool.Exec(ctx, `INSERT INTO sample_locations (sha256,path)
+ SELECT $1, 'location/' || g FROM generate_series(1,6) g`, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.pool.Exec(ctx, "VACUUM ANALYZE samples"); err != nil {
+		t.Fatal(err)
+	}
+	q := TriageQueues["bad-shared"]
+	got, err := q.Select(ctx, db, 1)
+	if err != nil || len(got) != 1 || got[0].SHA256 != sha {
+		t.Fatalf("late shared candidate lost: got=%v err=%v", got, err)
+	}
+	got, err = q.Select(ctx, db, 1, []string{sha})
+	if err != nil || len(got) != 0 {
+		t.Fatalf("exclusion: got=%v err=%v", got, err)
+	}
+	extra, args := triageFilterClausePG(queueFilter("bad-shared", TriageFilter{}), 1, "samples")
+	args = append(args, 64)
+	rows, err := db.pool.Query(ctx, "EXPLAIN "+triageBadSharedSQL(extra, "$2"), args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatal(err)
+		}
+		plan.WriteString(line + "\n")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan.String(), "Index Only Scan using idx_samples_bad_shared_newest") {
+		t.Fatalf("candidate walk is not covered:\n%s", plan.String())
+	}
+	t.Log(plan.String())
 }

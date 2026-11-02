@@ -94,6 +94,7 @@ idx_label_events_sha
 idx_reports_sha256_type_created
 idx_samples_acquit_newest
 idx_samples_bad_miss_newest
+idx_samples_bad_shared_newest
 idx_samples_class_top_created
 idx_samples_clean_release
 idx_samples_discord_newest

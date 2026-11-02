@@ -922,6 +922,10 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		`CREATE INDEX IF NOT EXISTS idx_samples_fp_trait_newest ` +
 			`ON samples(created_at DESC, id DESC) INCLUDE (top_traits) ` +
 			`WHERE ` + triageFPTraitPop,
+		// bad-shared includes archive members and weak detections. Existing bad
+		// indexes exclude those rows. Its covering partial avoids walking the
+		// global creation-time index over unrelated labels for every poll.
+		triageBadSharedIndexDDL,
 		// The unconvicted pair's indexes. Built FROM the selector constants
 		// rather than restated, because the neighbours above are hand-copied
 		// predicates that the comment has to beg future editors to keep
