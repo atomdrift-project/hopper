@@ -3060,7 +3060,7 @@ func (db *DB) insertSampleNewPG(ctx context.Context, sample *Sample) (bool, erro
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO sample_locations
 				(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9 WHERE `+locationAdmissionSQL("$1", "$2", "$3", "$4", true)+`
 			ON CONFLICT (sha256, path_key(path)) DO UPDATE SET
 				rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
 				source = CASE WHEN sample_locations.source = '' THEN EXCLUDED.source ELSE sample_locations.source END,
@@ -3395,13 +3395,13 @@ const locationChangedPG = `
 // ON collapses duplicates within the batch; ON CONFLICT backfills fields that
 // actually changed, without clobbering an existing mtime. Shared by the batch
 // insert and the atomic store.
-const locationsFromStagingPG = `
+var locationsFromStagingPG = `
 	INSERT INTO sample_locations
 		(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
-	SELECT DISTINCT ON (sha256, path)
-		sha256, path, parent, rel, filename, source, feed, ecosystem, mtime
-	  FROM _staging
-	 WHERE path <> ''
+	SELECT DISTINCT ON (st.sha256, st.path)
+		st.sha256, st.path, st.parent, st.rel, st.filename, st.source, st.feed, st.ecosystem, st.mtime
+	  FROM _staging st
+	 WHERE st.path <> '' AND ` + locationAdmissionSQL("st.sha256", "st.path", "st.parent", "st.rel", true) + `
 	ON CONFLICT (sha256, path_key(path)) DO UPDATE SET
 		rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
 		source = CASE WHEN sample_locations.source = '' THEN EXCLUDED.source ELSE sample_locations.source END,
@@ -4443,7 +4443,7 @@ func (db *DB) upsertLocationPG(ctx context.Context, loc *SampleLocation) error {
 	_, err := db.pool.Exec(ctx, `
 		INSERT INTO sample_locations
 			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9 WHERE `+locationAdmissionSQL("$1", "$2", "$3", "$4", true)+`
 		ON CONFLICT (sha256, path_key(path)) DO UPDATE SET
 			rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
 			mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)
@@ -4478,8 +4478,9 @@ func (db *DB) upsertLocationBatchPG(ctx context.Context, locs []*SampleLocation)
 	_, err := db.pool.Exec(ctx, `
 		INSERT INTO sample_locations
 			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem)
-		SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[],
-			$5::text[], $6::text[], $7::text[], $8::text[])
+		SELECT v.* FROM unnest($1::text[], $2::text[], $3::text[], $4::text[],
+			$5::text[], $6::text[], $7::text[], $8::text[]) AS v(sha,path,parent,rel,filename,source,feed,ecosystem)
+  WHERE `+locationAdmissionSQL("v.sha", "v.path", "v.parent", "v.rel", true)+`
 		ON CONFLICT (sha256, path_key(path)) DO UPDATE SET
 			rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
 			source = CASE WHEN sample_locations.source = '' THEN EXCLUDED.source ELSE sample_locations.source END,
@@ -9253,7 +9254,8 @@ func (db *DB) deleteAllPG(ctx context.Context) error {
 	// RESTART IDENTITY resets the id sequences so a post-reset ingest
 	// starts at 1 instead of continuing from pre-reset max.
 	_, err := db.pool.Exec(ctx,
-		`TRUNCATE samples, sample_locations, sample_location_history, reports RESTART IDENTITY CASCADE`)
+		`TRUNCATE samples, sample_locations, sample_location_history, reports RESTART IDENTITY CASCADE;
+ DELETE FROM hopper_kv WHERE key LIKE 'location-member-cap/%'`)
 	if err != nil {
 		return fmt.Errorf("hopper: delete all: %w", err)
 	}

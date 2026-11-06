@@ -46,6 +46,7 @@ type apiServer struct {
 	extractSem      chan struct{}
 	resultSem       chan struct{}
 	workerResultSem chan struct{}
+	triageSem       chan struct{}
 	extractCache    *extractCache
 	// resultStores collapses concurrent stores of the same sha; see storeResult.
 	resultStores  singleflight.Group
@@ -79,6 +80,7 @@ type apiServer struct {
 	requiredMounts      []string
 	emptyTierMu         sync.Mutex
 	depthsMu            sync.Mutex
+	triageSemOnce       sync.Once
 	depthsVal           hopper.RescanDepths
 	rescanAge           time.Duration
 	ready               atomic.Bool

@@ -284,6 +284,85 @@ statistics, followed by a one-time `ANALYZE public.samples`. Without those
 statistics PostgreSQL can overestimate the sampled fraction and choose the old
 route index even though the covering index exists.
 
+## Pruning recorded locations
+
+Run on the host holding the sample tree. The default is a read-only preview;
+`--apply` is required to delete catalog rows.
+
+```sh
+hopper prune-locations --data /data/samples --dry-run --limit-shas 10 --phase cap
+hopper prune-locations --data /data/samples --dry-run --limit 10000 --phase obsolete
+hopper prune-locations --data /data/samples --phase cap --checkpoint cap.json --apply
+hopper prune-locations --data /data/samples --phase cap --checkpoint cap.json --apply --resume
+```
+
+The cap retains at most **256 archive-member locations per good SHA256** and
+**512 per unknown SHA256**, across all archives. Other labels, including bad and
+sighted, are exempt. Conflicted samples are also exempt. Every physical location
+remains in `sample_locations` and does not count against either allowance.
+Reference edges are outside the cap. `--good-max-paths` and `--unknown-max-paths`
+set these limits; `--max-paths` optionally overrides both capped labels.
+
+Retention favors the current primary occurrence and one occurrence per distinct
+parent archive before filling spare slots with the oldest `first_seen_at`,
+breaking ties by row ID. The cap needs no filesystem stats, archive reads or
+sample hashing. Labels are rechecked while the sample row is locked before
+capped deletions. A move to an exempt label or a higher allowance protects the
+remaining rows from the old plan. Admission markers include the sample ID and
+label, so a stale marker cannot block observations after a label change.
+
+A bounded row simulation can be run with:
+
+```sh
+hopper prune-locations --data /data/samples --phase cap --dry-run --limit-rows 100000
+```
+
+This selects up to 100,000 location rows in ID order, starting after `--after-id`,
+and evaluates the same label and retention rules within that window. Its counts
+are window-scoped, not whole-database projections; occurrences outside the window
+do not consume its allowances. It uses one SELECT for a consistent snapshot,
+reports counts by label, and does not fetch sample contents. `--limit-rows` is
+available only for a cap-only preview, and cannot be used with `--apply`.
+
+Preview output reports removable location rows, physical rows retained, and
+`archive_edges_removed`: archive/member relationships for which no location
+would remain. One removed occurrence need not remove an archive relationship if
+another occurrence remains there. The current member listings, bad-member
+checks, label cascades and parent rescan targeting use `sample_locations`, so
+those relationships disappear from those readers if the cap is applied. Stored
+archive reports retain their member references, within their existing report
+limits; membership readers need migration if complete coverage is required.
+
+Apply coordinates each parent archive's deletion batches with its move lock,
+re-selecting allocated occurrences under that lock and skipping busy archives.
+Skipped archives and concurrent arrivals may leave more than 512 locations until
+a later fresh sweep. Preview takes no move locks and writes no catalog rows.
+
+The separate obsolete pass removes rows whose outer file is absent. It checks
+only the file before the first `!!`, never archive members. URLs, paths outside
+the data root, and stat errors other than absence are preserved. Use repeatable
+`--require-mount LABEL` flags for required pool mounts; an unavailable pool must
+not be treated as missing files. **Wait for disk deduplication to finish before
+applying the obsolete pass, including the default combined `--phase all`.** It
+can otherwise discard observations while an archive's member paths are moving.
+
+Neither phase deletes files, labels, analysis or samples. Obsolete primary paths
+are replaced by usable retained locations; without one their path is cleared and
+an empty skip becomes `missing`. Discarded observations are not copied into
+location history. Markers in the existing key/value table suppress new contained locations for
+capped SHAs; physical discoveries, reference edges, managed moves, exempt labels and updates to existing locations
+remain admitted.
+
+Both passes use existing indexes and bounded memory and transactions. Indexed
+counts skip SHAs below the allowance before reading their paths. Missing
+checks cache outer-file stats. `--batch` controls page size. Checkpoints advance
+after committed batches (after a complete SHA for cap), retaining the initial
+upper location-ID boundary. Newer IDs are deferred. Start recurring sweeps
+without `--resume` so they revisit previously checked paths and busy archives.
+Preview checkpoints cannot be resumed in apply mode, and checkpoints from the
+previous per-file implementation must be replaced. Combined preview estimates
+can overlap and must not be added together.
+
 ## Deduplicating local top-level files
 
 Run on the host holding the sample tree:
@@ -296,7 +375,9 @@ hopper dedupe-locations --data /data/samples --db "$DSN" --consolidate
 
 By default, duplicate top-level files on the same filesystem become hard links;
 all paths and labels remain. Separate ZFS datasets count as separate filesystems.
-Already shared inodes require no hashing or writes.
+The command trusts the database SHA256 and matching file sizes; it checks inode
+identity and modification times without reading sample contents. Use `--verify`
+to rehash bytes before replacement. Already shared inodes require no writes.
 
 With `--consolidate`, copies on other filesystems are retired in favor of the
 oldest present location in the sample's resolved label directory. Age means
@@ -306,15 +387,29 @@ Workflow locations (`incoming`, `pending`, `review`) are retained. Same-filesyst
 paths remain, including paths in different label directories; hard linking does
 not resolve their classification conflicts.
 
-Before removing a copy, Hopper verifies both files, applies the existing sidecar
+Before removing a copy, Hopper checks both files' metadata, applies the existing sidecar
 merge policy, repairs primary and archive-member paths, and records the retired
 physical location. Interrupted moves can be retried. Dry runs do not hash files,
 so their counts and byte savings are estimates. ZFS snapshots may delay space
 recovery. Use `--limit` for a bounded trial, `--batch` for database page size, and
-`--after` with the reported SHA to resume. Run disk deduplication before capping
-location rows, so it can still discover every recorded copy.
+`--after` with the reported SHA to resume. `--workers` defaults to four concurrent
+sample groups; `--workers 1` processes them serially. A failed batch retains the
+previous resume cursor so completed work can be safely retried. Finish disk deduplication before obsolete-location pruning. The per-file
+occurrence cap preserves every recorded physical copy.
 
 Moves and hard-link deduplication share up to 256 advisory lock files named
 `.hopper-move-lock-XX` in the data root. These are ignored by the corpus walker
 and serialize operations on the same SHA across processes, including moves in
 opposite directions. Their count is fixed rather than growing with the corpus.
+
+For scheduled runs, `scripts/master/dedupe-weekly.py` invokes a prebuilt binary
+with `--consolidate`, captures progress in a dated output file, and records the
+latest PID and exit status in its state directory. It uses a process lock to
+skip overlapping runs. `--initial-pid-file` also guards an initial sweep started
+outside the wrapper; `--check` validates the configuration without starting work.
+Cron should invoke the wrapper with absolute paths and run as the corpus owner.
+The installed smaug schedule is Sunday at 03:00 local time. Inspect it with
+`crontab -l`; logs and `weekly-dedupe.json` live in
+`/home/t/.local/state/hopper/`. Each weekly run starts from the beginning so it
+can find duplicates introduced anywhere in the SHA range; already shared inodes
+require no hashing or writes.

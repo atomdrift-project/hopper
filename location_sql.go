@@ -20,7 +20,7 @@ type locationRows interface {
 }
 
 func locationSQLiteSQL(query string) string {
-	return strings.NewReplacer("$1", "?1", "$2", "?2", "$3", "?3", "$4", "?4", " FOR UPDATE", "").Replace(query)
+	return strings.NewReplacer("$1", "?1", "$2", "?2", "$3", "?3", "$4", "?4", "$5", "?5", " FOR UPDATE", "").Replace(query)
 }
 
 func (db *DB) queryLocations(ctx context.Context, query string, args []any, scan func(locationRows) error) error {

@@ -24,6 +24,8 @@ const movePartialPrefix = ".hopper-move-"
 // ErrLocationLabelChanged means consolidation must re-read the classification.
 var ErrLocationLabelChanged = errors.New("hopper: location classification changed or is unresolved")
 
+var errDedupeMetadata = errors.New("hopper: dedupe metadata changed or is inconsistent")
+
 // LocationRelabel optionally applies a classification transition while moving
 // a physical location. A nil relabel makes the operation path-only.
 type LocationRelabel struct {
@@ -83,6 +85,12 @@ func isWorkflowPool(root string, legacy bool) bool {
 // old sample_locations row is retained until cleanup succeeds, making it the
 // durable retry record for every crash window without a separate moves table.
 func (db *DB) MoveLocation(ctx context.Context, opts MoveLocationOptions) (MoveLocationResult, error) {
+	return db.moveLocation(ctx, opts, true)
+}
+
+// Unverified consolidation can only adopt an existing catalogued destination;
+// it never publishes or copies sample bytes. Ordinary moves always verify.
+func (db *DB) moveLocation(ctx context.Context, opts MoveLocationOptions, verify bool) (MoveLocationResult, error) {
 	var result MoveLocationResult
 	sha := strings.ToLower(strings.TrimSpace(opts.SHA256))
 	if !isLowerHexSHA256(sha) {
@@ -108,29 +116,21 @@ func (db *DB) MoveLocation(ctx context.Context, opts MoveLocationOptions) (MoveL
 	}
 	defer contentLock.Close() //nolint:errcheck // closing releases the advisory lock
 
+	if !verify {
+		_, recorded, err := db.TopLevelLocationsRecorded(ctx, sha, opts.OldPath, opts.NewPath)
+		if err != nil {
+			return result, err
+		}
+		if !recorded {
+			return result, fmt.Errorf("%w: destination is not recorded", errDedupeMetadata)
+		}
+	}
 	locked, err := lockMoveSource(ctx, oldAbs)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return result, fmt.Errorf("hopper: lock source: %w", err)
 		}
-		if err := verifyMoveFile(newAbs, sha); err != nil {
-			return result, fmt.Errorf("hopper: source missing and destination unusable: %w", err)
-		}
-		prepared, err := db.prepareLocationMove(ctx, sha, opts.OldPath, opts.NewPath, opts.Relabel, opts.ExpectedLabel)
-		if err != nil {
-			return result, err
-		}
-		if !prepared {
-			return result, errors.New("hopper: source and destination locations are absent from catalog")
-		}
-		finished, err := db.finishLocationMove(ctx, sha, opts.OldPath, opts.NewPath)
-		if err != nil {
-			return result, err
-		}
-		result.Relocated = finished
-		pruneMoveParents(filepath.Dir(oldAbs), filepath.Join(root, filepath.FromSlash(moveRoot(opts.OldPath))))
-		logLocationMove(ctx, opts, result, true)
-		return result, nil
+		return db.recoverMissingLocationMove(ctx, opts, root, sha, verify)
 	}
 	defer locked.Close() //nolint:errcheck // closing releases the advisory lock
 
@@ -152,7 +152,7 @@ func (db *DB) MoveLocation(ctx context.Context, opts MoveLocationOptions) (MoveL
 	// label still needs its ruling. Verify and audit that transition without
 	// publishing or removing the artifact or its provenance sidecar.
 	if opts.OldPath == opts.NewPath {
-		if err := verifyMoveFile(oldAbs, sha); err != nil {
+		if _, err := checkMoveDestination(oldAbs, sha, verify); err != nil {
 			return result, err
 		}
 		prepared, err := db.prepareLocationMove(ctx, sha, opts.OldPath, opts.NewPath, opts.Relabel, opts.ExpectedLabel)
@@ -171,11 +171,21 @@ func (db *DB) MoveLocation(ctx context.Context, opts MoveLocationOptions) (MoveL
 	// promoted sample often ships inside a package that was collected earlier.
 	// Publishing by hard link instead of by copy is why moving 900 GB out of
 	// the hot pool does not also write 900 GB into tank.
-	donors := db.moveDonors(ctx, root, sha, opts.OldPath, opts.NewPath)
-	artifactCreated, err := publishMoveFile(ctx, oldAbs, newAbs, sha, donors)
+	var artifactCreated bool
+	var destinationInfo os.FileInfo
+	if verify {
+		donors := db.moveDonors(ctx, root, sha, opts.OldPath, opts.NewPath)
+		artifactCreated, err = publishMoveFile(ctx, oldAbs, newAbs, sha, donors)
+	} else {
+		destinationInfo, err = checkMoveDestination(newAbs, sha, false)
+		if err == nil && destinationInfo.Size() != info.Size() {
+			err = fmt.Errorf("%w: copies have different sizes", errDedupeMetadata)
+		}
+	}
 	if err != nil {
 		return result, fmt.Errorf("hopper: publish sample: %w", err)
 	}
+
 	sidecarCreated, sidecarPresent, err := publishMoveSidecar(ctx, oldAbs, newAbs)
 	if err != nil {
 		// The cause, not just its cleanup: this is what stops the move, and it
@@ -211,6 +221,15 @@ func (db *DB) MoveLocation(ctx context.Context, opts MoveLocationOptions) (MoveL
 		return result, fmt.Errorf("hopper: source changed during move: %s", oldAbs)
 	}
 
+	if !verify {
+		currentDestination, err := os.Lstat(newAbs)
+		if err != nil {
+			return result, err
+		}
+		if !sameDedupeFile(destinationInfo, currentDestination) || !sameDedupeFile(info, current) {
+			return result, fmt.Errorf("%w: files changed during consolidation", errDedupeMetadata)
+		}
+	}
 	if sidecarPresent {
 		if err := removeMoveFile(oldAbs + ProvenanceSidecarSuffix); err != nil {
 			return result, fmt.Errorf("hopper: remove source sidecar: %w", err)
@@ -235,6 +254,32 @@ func (db *DB) MoveLocation(ctx context.Context, opts MoveLocationOptions) (MoveL
 	result.Relocated = finished
 	pruneMoveParents(filepath.Dir(oldAbs), filepath.Join(root, filepath.FromSlash(moveRoot(opts.OldPath))))
 	logLocationMove(ctx, opts, result, false)
+	return result, nil
+}
+
+func (db *DB) recoverMissingLocationMove(
+	ctx context.Context, opts MoveLocationOptions, root, sha string, verify bool,
+) (MoveLocationResult, error) {
+	var result MoveLocationResult
+	newAbs := filepath.Join(root, filepath.FromSlash(opts.NewPath))
+	oldAbs := filepath.Join(root, filepath.FromSlash(opts.OldPath))
+	if _, err := checkMoveDestination(newAbs, sha, verify); err != nil {
+		return result, fmt.Errorf("hopper: source missing and destination unusable: %w", err)
+	}
+	prepared, err := db.prepareLocationMove(ctx, sha, opts.OldPath, opts.NewPath, opts.Relabel, opts.ExpectedLabel)
+	if err != nil {
+		return result, err
+	}
+	if !prepared {
+		return result, errors.New("hopper: source and destination locations are absent from catalog")
+	}
+	finished, err := db.finishLocationMove(ctx, sha, opts.OldPath, opts.NewPath)
+	if err != nil {
+		return result, err
+	}
+	result.Relocated = finished
+	pruneMoveParents(filepath.Dir(oldAbs), filepath.Join(root, filepath.FromSlash(moveRoot(opts.OldPath))))
+	logLocationMove(ctx, opts, result, true)
 	return result, nil
 }
 
@@ -589,7 +634,8 @@ func publishMoveFile(ctx context.Context, src, dst, expected string, donors []st
 
 // DedupeResult reports what one sample's dedupe pass did.
 type DedupeResult struct {
-	Removed    int   // cross-filesystem locations retired
+	Removed    int   // total physical and obsolete locations retired
+	Obsolete   int   // retired locations whose source file was already absent
 	Unresolved int   // samples lacking an unambiguous classified survivor
 	Linked     int   // redundant copies collapsed onto a survivor's inode
 	Skipped    int   // copies left alone (missing, unverifiable, already shared)
@@ -624,6 +670,11 @@ type DedupeResult struct {
 // dryRun reports what would be collapsed without hashing anything, so it is
 // cheap but proves only that the copies are distinct inodes on one filesystem.
 func LinkDuplicateLocations(ctx context.Context, dataRoot, sha string, rels []string, dryRun bool) (DedupeResult, error) {
+	return linkDuplicateLocations(ctx, dataRoot, sha, rels, LocationDedupeOptions{DryRun: dryRun, Verify: true})
+}
+
+func linkDuplicateLocations(ctx context.Context, dataRoot, sha string, rels []string, opts LocationDedupeOptions) (DedupeResult, error) {
+	dryRun := opts.DryRun
 	var result DedupeResult
 	if dataRoot == "" {
 		return result, errors.New("hopper: dedupe requires a non-empty data root")
@@ -650,30 +701,31 @@ func LinkDuplicateLocations(ctx context.Context, dataRoot, sha string, rels []st
 			result.Skipped++
 			continue
 		}
-		var st syscall.Stat_t
-		if err := syscall.Stat(abs, &st); err != nil {
-			// Gone, or on a filesystem this host does not have attached. Either
-			// way there is nothing here to collapse.
+		info, err := os.Lstat(abs)
+		if err != nil || !info.Mode().IsRegular() {
 			result.Skipped++
 			continue
 		}
-		if st.Mode&syscall.S_IFMT != syscall.S_IFREG {
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
 			result.Skipped++
 			continue
 		}
+
 		dev := uint64(st.Dev) //nolint:gosec,unconvert,nolintlint // Dev is int32 on Darwin and uint64 on Linux
-		byDevice[dev] = append(byDevice[dev], dedupeCandidate{abs: abs, ino: st.Ino, size: st.Size})
+		byDevice[dev] = append(byDevice[dev], dedupeCandidate{abs: abs, ino: st.Ino, size: st.Size, info: info})
 	}
 	for _, group := range byDevice {
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
-		dedupeGroup(ctx, sha, group, dryRun, &result)
+		dedupeGroup(ctx, sha, group, dryRun, opts.Verify, &result)
 	}
 	return result, nil
 }
 
 type dedupeCandidate struct {
+	info os.FileInfo
 	abs  string
 	ino  uint64
 	size int64
@@ -682,7 +734,7 @@ type dedupeCandidate struct {
 // dedupeGroup collapses one filesystem's worth of a sample's copies. Failures
 // are recorded as skips rather than errors: a sweep over millions of samples
 // must not stop because one file is unreadable.
-func dedupeGroup(ctx context.Context, sha string, group []dedupeCandidate, dryRun bool, result *DedupeResult) {
+func dedupeGroup(ctx context.Context, sha string, group []dedupeCandidate, dryRun, verify bool, result *DedupeResult) {
 	distinct := map[uint64]bool{}
 	for _, c := range group {
 		distinct[c.ino] = true
@@ -722,19 +774,27 @@ func dedupeGroup(ctx context.Context, sha string, group []dedupeCandidate, dryRu
 		return
 	}
 	defer survivor.Close() //nolint:errcheck // read-only descriptor
-	var survivorStat syscall.Stat_t
-	if err := syscall.Fstat(int(survivor.Fd()), &survivorStat); err != nil {
+	survivorInfo, err := survivor.Stat()
+	if err != nil || !sameDedupeFile(group[0].info, survivorInfo) {
 		result.Skipped += len(group)
 		return
 	}
-	if got, err := hashMoveReader(ctx, survivor); err != nil || got != sha {
-		// The survivor is not what the catalog claims. Collapsing onto it would
-		// publish these bytes over every other copy, so this group is left
-		// entirely alone for a repair pass to look at.
-		slog.WarnContext(ctx, "dedupe survivor does not match catalog; group skipped",
-			"sha256", sha, "path", group[0].abs, "error", err)
+	survivorStat, ok := survivorInfo.Sys().(*syscall.Stat_t)
+	if !ok {
 		result.Skipped += len(group)
 		return
+	}
+
+	if verify {
+		if got, err := hashMoveReader(ctx, survivor); err != nil || got != sha {
+			// The survivor is not what the catalog claims. Collapsing onto it would
+			// publish these bytes over every other copy, so this group is left
+			// entirely alone for a repair pass to look at.
+			slog.WarnContext(ctx, "dedupe survivor does not match catalog; group skipped",
+				"sha256", sha, "path", group[0].abs, "error", err)
+			result.Skipped += len(group)
+			return
+		}
 	}
 
 	for _, victim := range group[1:] {
@@ -744,7 +804,7 @@ func dedupeGroup(ctx context.Context, sha string, group []dedupeCandidate, dryRu
 		if victim.ino == survivorStat.Ino {
 			continue // already the same inode
 		}
-		saved, err := replaceWithLink(ctx, group[0].abs, victim.abs, sha, &survivorStat)
+		saved, err := replaceWithLink(ctx, group[0].abs, victim, sha, survivorInfo, verify)
 		if err != nil {
 			slog.DebugContext(ctx, "dedupe copy skipped",
 				"sha256", sha, "path", victim.abs, "error", err)
@@ -760,9 +820,22 @@ func dedupeGroup(ctx context.Context, sha string, group []dedupeCandidate, dryRu
 
 // replaceWithLink points victim at survivor's inode. See LinkDuplicateLocations
 // for why the victim is hashed first and why the link's identity is rechecked.
-func replaceWithLink(ctx context.Context, survivor, victim, sha string, survivorStat *syscall.Stat_t) (bool, error) {
-	if err := verifyMoveFile(victim, sha); err != nil {
-		return false, fmt.Errorf("victim does not match catalog: %w", err)
+func replaceWithLink(
+	ctx context.Context, survivor string, candidate dedupeCandidate, sha string,
+	survivorInfo os.FileInfo, verify bool,
+) (bool, error) {
+	victim := candidate.abs
+	current, err := os.Lstat(victim)
+	if err != nil {
+		return false, err
+	}
+	if !sameDedupeFile(candidate.info, current) || current.Size() != survivorInfo.Size() {
+		return false, errors.New("dedupe file metadata changed or sizes differ")
+	}
+	if verify {
+		if err := verifyMoveFile(victim, sha); err != nil {
+			return false, fmt.Errorf("victim does not match catalog: %w", err)
+		}
 	}
 	dir := filepath.Dir(victim)
 	tmp, err := os.CreateTemp(dir, movePartialPrefix+"*")
@@ -781,16 +854,20 @@ func replaceWithLink(ctx context.Context, survivor, victim, sha string, survivor
 	if err := os.Link(survivor, tmpName); err != nil {
 		return false, err
 	}
-	var linked syscall.Stat_t
-	if err := syscall.Stat(tmpName, &linked); err != nil {
+	linkedInfo, err := os.Lstat(tmpName)
+	if err != nil {
 		removeMoveFileBestEffort(ctx, tmpName)
 		return false, err
 	}
-	if linked.Ino != survivorStat.Ino || linked.Dev != survivorStat.Dev {
-		// The survivor's path was replaced between the hash and the link, so
-		// this link points at bytes nobody verified.
+	if !sameDedupeFile(survivorInfo, linkedInfo) {
 		removeMoveFileBestEffort(ctx, tmpName)
-		return false, errors.New("survivor path changed during dedupe")
+		return false, errors.New("survivor changed during dedupe")
+	}
+
+	current, err = os.Lstat(victim)
+	if err != nil || !sameDedupeFile(candidate.info, current) {
+		removeMoveFileBestEffort(ctx, tmpName)
+		return false, errors.New("dedupe victim changed before replacement")
 	}
 	if err := os.Rename(tmpName, victim); err != nil {
 		removeMoveFileBestEffort(ctx, tmpName)
@@ -979,6 +1056,29 @@ func hashMoveFile(name string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// sameDedupeFile checks identity and observable in-place changes without
+// reading sample bytes. Equal metadata is not a fresh content hash.
+func sameDedupeFile(before, after os.FileInfo) bool {
+	return before != nil && after != nil && after.Mode().IsRegular() &&
+		os.SameFile(before, after) && before.Size() == after.Size() && before.ModTime().Equal(after.ModTime())
+}
+
+func checkMoveDestination(name, sha string, verify bool) (os.FileInfo, error) {
+	info, err := os.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("not a regular file: %s", name)
+	}
+	if verify {
+		if err := verifyMoveFile(name, sha); err != nil {
+			return nil, err
+		}
+	}
+	return info, nil
 }
 
 func verifyMoveFile(name, expected string) error {

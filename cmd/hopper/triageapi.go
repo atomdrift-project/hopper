@@ -27,6 +27,22 @@ import (
 	"github.com/atomdrift-project/hopper"
 )
 
+// triageQuerySlots bounds expensive queue reads independently of ingestion.
+// A process-local limit reserves most of the shared DB pool for other work.
+const triageQuerySlots = 4
+
+func (s *apiServer) admitTriage(w http.ResponseWriter, r *http.Request) bool {
+	s.triageSemOnce.Do(func() { s.triageSem = make(chan struct{}, triageQuerySlots) })
+	if err := acquireSlot(r.Context(), s.triageSem); err != nil {
+		if r.Context().Err() == nil {
+			recordLoadShed(r.Context(), "triage")
+			writeRetryable(w, retryAfterBusy, `{"error":"busy: triage queries saturated"}`)
+		}
+		return false
+	}
+	return true
+}
+
 // triageMaxLimit caps a single select. The queues exist to feed batches of a
 // few samples each; a caller asking for thousands is either misconfigured or
 // trying to drain a queue into its own process, and both are better answered
@@ -110,6 +126,10 @@ func (s *apiServer) handleTriageSelect(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if !s.admitTriage(w, r) {
+		return
+	}
+	defer func() { <-s.triageSem }()
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
 
@@ -142,6 +162,10 @@ func (s *apiServer) handleTriageDepth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !s.admitTriage(w, r) {
+		return
+	}
+	defer func() { <-s.triageSem }()
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
 

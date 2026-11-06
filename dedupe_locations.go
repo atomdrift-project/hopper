@@ -11,11 +11,22 @@ import (
 	"syscall"
 )
 
+// LocationDedupeOptions controls physical deduplication. Verify=false trusts
+// catalogued SHA identities and checks file metadata without reading payloads.
+type LocationDedupeOptions struct{ Consolidate, DryRun, Verify bool }
+
 // DedupeLocations shares bytes within each filesystem. With consolidate it also
 // retires copies on other filesystems, but only when a usable location matches
 // the sample's resolved classification. Workflow directories are never retired.
 // Classification is never changed by this operation. Dry runs do not hash files.
 func (db *DB) DedupeLocations(ctx context.Context, root, sha string, consolidate, dryRun bool) (DedupeResult, error) {
+	return db.DedupeLocationsWithOptions(ctx, root, sha, LocationDedupeOptions{Consolidate: consolidate, DryRun: dryRun, Verify: true})
+}
+
+// DedupeLocationsWithOptions trusts catalogued content identities unless Verify
+// requests rehashing. Metadata checks and classification rules apply in both modes.
+func (db *DB) DedupeLocationsWithOptions(ctx context.Context, root, sha string, opts LocationDedupeOptions) (DedupeResult, error) {
+	consolidate := opts.Consolidate
 	var result DedupeResult
 	locs, err := db.TopLevelLocationsForSHA(ctx, sha)
 	if err != nil {
@@ -26,7 +37,7 @@ func (db *DB) DedupeLocations(ctx context.Context, root, sha string, consolidate
 		for _, loc := range locs {
 			rels = append(rels, loc.Path)
 		}
-		return LinkDuplicateLocations(ctx, root, sha, rels, dryRun)
+		return linkDuplicateLocations(ctx, root, sha, rels, opts)
 	}
 	var label, skip, source string
 	if consolidate {
@@ -70,13 +81,20 @@ func (db *DB) DedupeLocations(ctx context.Context, root, sha string, consolidate
 	if consolidate && plan.survivor == nil && len(candidates) > 1 {
 		result.Unresolved++
 	}
-	applied, err := db.applyLocationDedupe(ctx, root, sha, label, plan, dryRun)
+	applied, err := db.applyLocationDedupeOptions(ctx, root, sha, label, plan, opts)
 	applied.Skipped += result.Skipped
 	applied.Unresolved += result.Unresolved
 	return applied, err
 }
 
 func (db *DB) applyLocationDedupe(ctx context.Context, root, sha, label string, plan locationDedupePlan, dryRun bool) (DedupeResult, error) {
+	return db.applyLocationDedupeOptions(ctx, root, sha, label, plan, LocationDedupeOptions{DryRun: dryRun, Verify: true})
+}
+
+func (db *DB) applyLocationDedupeOptions(
+	ctx context.Context, root, sha, label string, plan locationDedupePlan, opts LocationDedupeOptions,
+) (DedupeResult, error) {
+	dryRun := opts.DryRun
 	var result DedupeResult
 	// Consolidate first: do not hard-link files on a filesystem we will discard.
 	for _, victim := range plan.remove {
@@ -84,24 +102,38 @@ func (db *DB) applyLocationDedupe(ctx context.Context, root, sha, label string, 
 			return result, err
 		}
 		if dryRun {
-			slog.InfoContext(ctx, "would retire duplicate location", "sha256", sha, "old_path", victim.location.Path,
+			message := "would retire duplicate location"
+			if victim.missing {
+				message = "would retire obsolete location"
+				result.Obsolete++
+			}
+			slog.InfoContext(ctx, message, "sha256", sha, "old_path", victim.location.Path,
 				"survivor", plan.survivor.location.Path, "label", label)
 			result.BytesSaved += victim.size
 			result.Removed++
 			continue
 		}
-		moved, err := db.MoveLocation(ctx, MoveLocationOptions{
+		moved, err := db.moveLocation(ctx, MoveLocationOptions{
 			DataRoot: root, SHA256: sha, OldPath: victim.location.Path, NewPath: plan.survivor.location.Path, ExpectedLabel: label,
-		})
+		}, opts.Verify)
 		if errors.Is(err, ErrLocationLabelChanged) {
 			result.Unresolved++
 			return result, nil
 		}
+		if errors.Is(err, errDedupeMetadata) || errors.Is(err, os.ErrNotExist) {
+			slog.WarnContext(ctx, "dedupe location skipped", "sha256", sha, "path", victim.location.Path, "error", err)
+			result.Skipped++
+			continue
+		}
+
 		if err != nil {
 			return result, err
 		}
 		if moved.Relocated {
 			result.Removed++
+			if !moved.SourceRemoved {
+				result.Obsolete++
+			}
 		}
 		result.BytesSaved += moved.BytesFreed
 	}
@@ -110,7 +142,7 @@ func (db *DB) applyLocationDedupe(ctx context.Context, root, sha, label string, 
 		for _, c := range group {
 			rels = append(rels, c.location.Path)
 		}
-		linked, err := LinkDuplicateLocations(ctx, root, sha, rels, dryRun)
+		linked, err := linkDuplicateLocations(ctx, root, sha, rels, opts)
 		if err != nil {
 			return result, err
 		}

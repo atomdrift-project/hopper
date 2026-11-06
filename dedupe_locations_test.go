@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -199,8 +200,12 @@ func TestConsolidateRecoversUnlinkedSource(t *testing.T) {
 			}
 			child := strings.Repeat("e", 64)
 			mustInsert(t, ctx, db, &Sample{SHA256: child, Parent: sha, Path: old + "!!lib.js", Label: "good"})
+			dry, err := db.DedupeLocations(ctx, root, sha, true, true)
+			if err != nil || dry.Removed != 1 || dry.Obsolete != 1 {
+				t.Fatalf("preview: %+v %v", dry, err)
+			}
 			result, err := db.DedupeLocations(ctx, root, sha, true, false)
-			if err != nil || result.Removed != 1 {
+			if err != nil || result.Removed != 1 || result.Obsolete != 1 {
 				t.Fatalf("recovery: %+v %v", result, err)
 			}
 			locs, err := db.TopLevelLocationsForSHA(ctx, sha)
@@ -246,5 +251,111 @@ func TestConsolidateCorruptSurvivorPreservesSource(t *testing.T) {
 	}
 	if got, err := os.ReadFile(src); err != nil || !bytes.Equal(got, content) {
 		t.Fatalf("source changed: %q %v", got, err)
+	}
+}
+
+func TestStatOnlyDedupeTrustsCatalogAndChecksSizes(t *testing.T) {
+	for _, verify := range []bool{false, true} {
+		t.Run(fmt.Sprintf("verify=%v", verify), func(t *testing.T) {
+			db := openTestDB(t)
+			root := t.TempDir()
+			ctx := t.Context()
+			content := []byte("known catalogued bytes")
+			other := []byte("other same size bytes!")
+			if len(content) != len(other) {
+				t.Fatal("fixture sizes must match")
+			}
+			sha := moveTestSHA(content)
+			a := writeDedupeFile(t, root, "good/a", content)
+			b := writeDedupeFile(t, root, "good/b", other)
+			mustInsert(t, ctx, db, &Sample{SHA256: sha, Path: "good/a", Label: "good"})
+			if err := db.UpsertLocation(ctx, &SampleLocation{SHA256: sha, Path: "good/b"}); err != nil {
+				t.Fatal(err)
+			}
+			result, err := db.DedupeLocationsWithOptions(ctx, root, sha, LocationDedupeOptions{Verify: verify})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ai, err := os.Stat(a)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bi, err := os.Stat(b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if os.SameFile(ai, bi) == verify {
+				t.Fatalf("same inode=%v verify=%v result=%+v", os.SameFile(ai, bi), verify, result)
+			}
+		})
+	}
+	db := openTestDB(t)
+	root := t.TempDir()
+	content := []byte("catalogued source bytes")
+	sha := moveTestSHA(content)
+	a := writeDedupeFile(t, root, "good/a", content)
+	b := writeDedupeFile(t, root, "good/b", []byte("different length"))
+	mustInsert(t, t.Context(), db, &Sample{SHA256: sha, Path: "good/a", Label: "good"})
+	if err := db.UpsertLocation(t.Context(), &SampleLocation{SHA256: sha, Path: "good/b"}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.DedupeLocationsWithOptions(t.Context(), root, sha, LocationDedupeOptions{})
+	if err != nil || result.Linked != 0 || result.Skipped != 1 {
+		t.Fatalf("size mismatch: %+v %v", result, err)
+	}
+	ai, err := os.Stat(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bi, err := os.Stat(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(ai, bi) {
+		t.Fatal("linked different sizes")
+	}
+}
+
+func TestStatOnlyConsolidationTrustsCatalog(t *testing.T) {
+	for _, backend := range testBackends {
+		t.Run(backend.name, func(t *testing.T) {
+			db := backend.open(t)
+			root := t.TempDir()
+			ctx := t.Context()
+			source, destination := []byte("catalogued source bytes"), []byte("catalogued keeper bytes")
+			if len(source) != len(destination) {
+				t.Fatal("fixture sizes must match")
+			}
+			sha := moveTestSHA(source)
+			old, last := "bad/source", "good/keeper"
+			oldAbs := writeDedupeFile(t, root, old, source)
+			lastAbs := writeDedupeFile(t, root, last, destination)
+			mustInsert(t, ctx, db, &Sample{SHA256: sha, Path: old, Label: "good", LabelSource: "test"})
+			if err := db.UpsertLocation(ctx, &SampleLocation{SHA256: sha, Path: last}); err != nil {
+				t.Fatal(err)
+			}
+			locs, err := db.TopLevelLocationsForSHA(ctx, sha)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var candidates []dedupeLocation
+			for _, loc := range locs {
+				device := uint64(1)
+				if loc.Path == last {
+					device = 2
+				}
+				candidates = append(candidates, dedupeLocation{location: loc, device: device})
+			}
+			result, err := db.applyLocationDedupeOptions(ctx, root, sha, "good", planLocationDedupe(candidates, "good", "", "test", true), LocationDedupeOptions{})
+			if err != nil || result.Removed != 1 {
+				t.Fatalf("stat-only consolidate: %+v %v", result, err)
+			}
+			if _, err := os.Stat(oldAbs); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("source remains: %v", err)
+			}
+			if got, err := os.ReadFile(lastAbs); err != nil || !bytes.Equal(got, destination) {
+				t.Fatalf("keeper changed: %q %v", got, err)
+			}
+		})
 	}
 }

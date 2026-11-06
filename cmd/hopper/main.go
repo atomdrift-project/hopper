@@ -36,6 +36,7 @@ import (
 	"github.com/atomdrift-project/hopper"
 	"github.com/atomdrift-project/hopper/pkgparse"
 	"github.com/atomdrift-project/obs"
+	"golang.org/x/sync/errgroup"
 )
 
 const usageText = `usage: hopper <command>
@@ -75,6 +76,7 @@ commands:
   backfill-ecosystems   fill an empty ecosystem from the sample's analyzed file type (dry-run)
   cleanup            delete wonky samples by skip category (interactive)
   dedupe-locations   hard-link duplicate top-level files; --consolidate also retires copies across filesystems
+  prune-locations    prune obsolete locations; cap good/unknown SHAs at 256/512 contained locations (--apply to modify)
   prune              drop location rows for files gone from disk, mark orphaned samples missing (run on the full mirror)
   repair-missing     re-check skip='missing' samples against known locations; revive + repoint
                      path if bytes are found (--dry-run by default; --apply to write)
@@ -456,6 +458,8 @@ func run(ctx context.Context) error {
 		return cmdBackfillEcosystems(ctx)
 	case "cleanup":
 		return cmdCleanup(ctx)
+	case "prune-locations":
+		return cmdPruneLocations(ctx)
 	case "prune":
 		return cmdPrune(ctx)
 	case "repair-missing":
@@ -4359,6 +4363,8 @@ func cmdDedupeLocations(ctx context.Context) error {
 	dataDir := f.String("data", "", "sample data root")
 	dryRun := f.Bool("dry-run", false, "report what would be collapsed without changing anything (does not verify contents)")
 	consolidate := f.Bool("consolidate", false, "also retire copies on other filesystems, retaining the oldest copy in the resolved label directory")
+	verify := f.Bool("verify", false, "rehash sample bytes instead of trusting catalogued SHA256 identities")
+	workers := f.Int("workers", 4, "maximum sample groups to process concurrently")
 	batch := f.Int("batch", 500, "samples to examine per database round trip")
 	limit := f.Int("limit", 0, "stop after examining this many samples (0 = no limit)")
 	after := f.String("after", "", "resume from this sha256 (exclusive)")
@@ -4373,6 +4379,9 @@ func cmdDedupeLocations(ctx context.Context) error {
 	if *batch <= 0 {
 		return errors.New("--batch must be positive")
 	}
+	if *workers <= 0 {
+		return errors.New("--workers must be positive")
+	}
 
 	db, err := openDB(ctx, *dsn)
 	if err != nil {
@@ -4380,9 +4389,10 @@ func cmdDedupeLocations(ctx context.Context) error {
 	}
 	defer db.Close()
 
-	var examined, linked, removed, unresolved, skipped int
+	var examined, linked, removed, obsolete, unresolved, skipped int
 	var saved int64
 	cursor := *after
+	started := time.Now()
 	for {
 		if err := ctx.Err(); err != nil {
 			break
@@ -4401,21 +4411,32 @@ func cmdDedupeLocations(ctx context.Context) error {
 		if len(shas) == 0 {
 			break
 		}
-		for _, sha := range shas {
-			result, err := db.DedupeLocations(ctx, *dataDir, sha, *consolidate, *dryRun)
-			if err != nil {
-				return err
-			}
-			examined++
-			linked += result.Linked
-			removed += result.Removed
-			unresolved += result.Unresolved
-			skipped += result.Skipped
-			saved += result.BytesSaved
-			cursor = sha
+		result, err := dedupeLocationBatch(ctx, shas, *workers, func(ctx context.Context, sha string) (hopper.DedupeResult, error) {
+			return db.DedupeLocationsWithOptions(ctx, *dataDir, sha, hopper.LocationDedupeOptions{
+				Consolidate: *consolidate, DryRun: *dryRun, Verify: *verify,
+			})
+		})
+		if err != nil {
+			return fmt.Errorf("dedupe batch after %q failed; resume from that cursor: %w", cursor, err)
 		}
+		examined += len(shas)
+		linked += result.Linked
+		removed += result.Removed
+		obsolete += result.Obsolete
+		unresolved += result.Unresolved
+		skipped += result.Skipped
+		saved += result.BytesSaved
+		// Advance only after the entire batch succeeds. A retry from the preceding
+		// cursor safely revisits any groups completed out of order before a failure.
+		cursor = shas[len(shas)-1]
+		rate := float64(examined) / time.Since(started).Seconds()
+
 		slog.Info("dedupe progress", "examined", examined, "linked", linked,
-			"removed", removed, "unresolved", unresolved, "skipped", skipped, "saved", humanBytes(saved), "cursor", cursor)
+			"removed", removed, "obsolete", obsolete, "unresolved", unresolved, "skipped", skipped, "saved", humanBytes(saved),
+			"workers", *workers, "verify", *verify, "samples_per_second", rate, "cursor", cursor)
+
+		fmt.Printf("dedupe: examined=%d linked=%d retired=%d obsolete=%d unresolved=%d skipped=%d saved=%s rate=%.1f/s cursor=%s\n",
+			examined, linked, removed-obsolete, obsolete, unresolved, skipped, humanBytes(saved), rate, cursor)
 	}
 
 	verb, retired := "collapsed", "retired"
@@ -4424,11 +4445,49 @@ func cmdDedupeLocations(ctx context.Context) error {
 	}
 	fmt.Printf("examined %d samples with multiple locations; %s %d copies (%s); skipped %d\n",
 		examined, verb, linked, humanBytes(saved), skipped)
-	fmt.Printf("%d cross-filesystem locations %s; %d unresolved samples left unconsolidated\n", removed, retired, unresolved)
+	fmt.Printf("%d cross-filesystem copies %s; %d obsolete location rows %s; %d unresolved samples left unconsolidated\n",
+		removed-obsolete, retired, obsolete, retired, unresolved)
 	if examined > 0 {
 		fmt.Printf("resume with --after %s\n", cursor)
 	}
 	return nil
+}
+
+// dedupeLocationBatch bounds concurrent disk I/O and joins every worker before
+// returning. Callers must advance their resume cursor only on complete success.
+func dedupeLocationBatch(
+	ctx context.Context, shas []string, workers int,
+	dedupe func(context.Context, string) (hopper.DedupeResult, error),
+) (hopper.DedupeResult, error) {
+	if workers <= 0 {
+		return hopper.DedupeResult{}, errors.New("dedupe workers must be positive")
+	}
+	results := make([]hopper.DedupeResult, len(shas))
+	group, workerCtx := errgroup.WithContext(ctx)
+	group.SetLimit(workers)
+	for i, sha := range shas {
+		group.Go(func() error {
+			if err := workerCtx.Err(); err != nil {
+				return err
+			}
+			result, err := dedupe(workerCtx, sha)
+			results[i] = result
+			return err
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return hopper.DedupeResult{}, err
+	}
+	var total hopper.DedupeResult
+	for _, r := range results {
+		total.Linked += r.Linked
+		total.Removed += r.Removed
+		total.Obsolete += r.Obsolete
+		total.Unresolved += r.Unresolved
+		total.Skipped += r.Skipped
+		total.BytesSaved += r.BytesSaved
+	}
+	return total, nil
 }
 
 // humanBytes formats a byte count in the powers-of-1024 units df -h prints, so

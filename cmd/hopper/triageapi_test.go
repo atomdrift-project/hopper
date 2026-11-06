@@ -259,3 +259,44 @@ func TestTriageRoutesAreReadOnlySafe(t *testing.T) {
 		t.Errorf("POST /api/triage on a replica: status = %d, want 403", rec.Code)
 	}
 }
+
+func TestTriageAdmissionBoundsSelectAndDepth(t *testing.T) {
+	api := newTriageAPI(t, context.Background())
+	// Initialize the gate and occupy all of its slots, as concurrent queries do.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", http.NoBody)
+	for range triageQuerySlots {
+		if !api.admitTriage(rec, req) {
+			t.Fatal("failed to acquire an available triage slot")
+		}
+	}
+	for _, depth := range []bool{false, true} {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		r := httptest.NewRequest(http.MethodGet, "/api/triage/popular", http.NoBody).WithContext(ctx)
+		r.SetPathValue("queue", "popular")
+		w := httptest.NewRecorder()
+		if depth {
+			api.handleTriageDepth(w, r)
+		} else {
+			api.handleTriageSelect(w, r)
+		}
+		if len(api.triageSem) != triageQuerySlots {
+			t.Fatal("canceled waiter changed the number of held slots")
+		}
+	}
+	busy := httptest.NewRequest(http.MethodGet, "/api/triage/popular", http.NoBody)
+	busy.SetPathValue("queue", "popular")
+	busyResponse := httptest.NewRecorder()
+	api.handleTriageSelect(busyResponse, busy)
+	if busyResponse.Code != http.StatusServiceUnavailable || busyResponse.Header().Get("Retry-After") == "" {
+		t.Fatalf("saturated select: status %d, Retry-After %q", busyResponse.Code, busyResponse.Header().Get("Retry-After"))
+	}
+	for range triageQuerySlots {
+		<-api.triageSem
+	}
+	_, code := selectFrom(t, api, "popular", "")
+	if code != http.StatusOK || len(api.triageSem) != 0 {
+		t.Fatalf("select after release: status %d, slots held %d", code, len(api.triageSem))
+	}
+}
