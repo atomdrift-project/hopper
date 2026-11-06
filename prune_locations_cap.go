@@ -36,7 +36,7 @@ func (db *DB) pruneCappedLocations(ctx context.Context, opts LocationPruneOption
 		// The partial parent index supplies SHA order without visiting physical paths.
 		shas, err := db.pruneStringPage(ctx, `SELECT sha256 FROM sample_locations
  WHERE parent_sha256<>'' AND sha256>$1 GROUP BY sha256 HAVING count(*)>$2 ORDER BY sha256 LIMIT $3`,
-			[]any{stats.AfterSHA, min(opts.GoodMaxPaths, opts.UnknownMaxPaths), size})
+			[]any{stats.AfterSHA, pruneCapFloor(opts), size})
 		if err != nil {
 			return err
 		}
@@ -50,6 +50,9 @@ func (db *DB) pruneCappedLocations(ctx context.Context, opts LocationPruneOption
 				return err
 			}
 			limit := locationLabelCap(sample.Label, sample.Skip, sample.Source, opts)
+			if !capLabelSelected(sample.Label, opts) {
+				limit = 0 // excluded from this pass; its marker and rows are left alone
+			}
 			shaOpts := opts
 			shaOpts.MaxPaths = limit
 			if limit == 0 {
@@ -105,6 +108,18 @@ func (db *DB) pruneCappedLocations(ctx context.Context, opts LocationPruneOption
 			}
 		}
 	}
+}
+
+// pruneCapFloor is the smallest allowance among the labels this pass trims;
+// only SHAs above it can be overfull.
+func pruneCapFloor(opts LocationPruneOptions) int {
+	floor := 0
+	for label, limit := range map[string]int{labelGood: opts.GoodMaxPaths, labelUnknown: opts.UnknownMaxPaths} {
+		if capLabelSelected(label, opts) && (floor == 0 || limit < floor) {
+			floor = limit
+		}
+	}
+	return floor
 }
 
 func (db *DB) pruneStringPage(ctx context.Context, query string, args []any) ([]string, error) {

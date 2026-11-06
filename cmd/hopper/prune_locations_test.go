@@ -12,7 +12,7 @@ import (
 
 func TestLocationPruneCheckpoint(t *testing.T) {
 	saved := locationPruneCheckpoint{
-		Root: t.TempDir(), MaxPaths: 0, GoodMaxPaths: 256, UnknownMaxPaths: 512, DryRun: true, Version: 4,
+		Root: t.TempDir(), MaxPaths: 0, GoodMaxPaths: 256, UnknownMaxPaths: 512, DryRun: true, Version: locationPruneCheckpointVersion, CapLabels: "good,unknown",
 		Stats: hopper.LocationPruneStats{Phase: "obsolete", AfterID: 20, ThroughID: 100},
 	}
 	name := filepath.Join(t.TempDir(), "checkpoint.json")
@@ -39,7 +39,7 @@ func TestLocationPruneCheckpoint(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			saved.Stats.Phase, saved.Stats.Complete = tc.phase, tc.complete
-			opts := hopper.LocationPruneOptions{DataRoot: saved.Root, MaxPaths: saved.MaxPaths, GoodMaxPaths: saved.GoodMaxPaths, UnknownMaxPaths: saved.UnknownMaxPaths, DryRun: true}
+			opts := hopper.LocationPruneOptions{DataRoot: saved.Root, MaxPaths: saved.MaxPaths, GoodMaxPaths: saved.GoodMaxPaths, UnknownMaxPaths: saved.UnknownMaxPaths, CapLabels: []string{"good", "unknown"}, DryRun: true}
 			got, err := resumeLocationPrune("all", &saved, &opts)
 			if err != nil || !reflect.DeepEqual(got, tc.want) || opts.ThroughID != 100 || opts.AfterID != 20 {
 				t.Fatalf("resume: %v %+v %v", got, opts, err)

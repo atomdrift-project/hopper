@@ -38,11 +38,23 @@ func (db *DB) deletePruneLocations(
 		for _, l := range observed {
 			sample := samples[l.SHA]
 			limit := locationLabelCap(sample.Label, sample.Skip, sample.Source, opts)
+			if capMode && !capLabelSelected(sample.Label, opts) {
+				limit = 0
+			}
 			if capMode && (limit == 0 || limit > opts.MaxPaths || sample.Path == l.Path) {
 				protected++
 				continue
 			}
 			eligible = append(eligible, l)
+		}
+		if !capMode {
+			ids := make([]int64, len(eligible))
+			for i, l := range eligible {
+				ids[i] = l.ID
+			}
+			if err := retirePruneArchivePaths(tx, db.pool != nil, ids, make([]string, len(eligible)), db.locationTimestamp()); err != nil {
+				return err
+			}
 		}
 		removed, err := db.deletePruneRows(tx, eligible, capMode)
 		if err != nil {

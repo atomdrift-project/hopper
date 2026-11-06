@@ -9,8 +9,19 @@ import (
 	"testing"
 )
 
+// pruneTestOptions disables the obsolete fraction cap: these fixtures remove
+// most of a tiny catalog on purpose. TestPruneLocationsSafetyCap covers it.
 func pruneTestOptions(root, phase string) LocationPruneOptions {
-	return LocationPruneOptions{DataRoot: root, Phase: phase, Batch: 7, MaxPaths: 512}
+	return LocationPruneOptions{DataRoot: root, Phase: phase, Batch: 7, MaxPaths: 512, MaxObsoleteFraction: 1}
+}
+
+// pruneTestPools gives each pool a sentinel so it reads as mounted; an empty
+// or missing pool directory protects its rows from the obsolete pass.
+func pruneTestPools(t *testing.T, root string, pools ...string) {
+	t.Helper()
+	for _, pool := range pools {
+		writeDedupeFile(t, root, pool+"/.mounted", nil)
+	}
 }
 
 func pruneTestCount(t *testing.T, db *DB, table string) int {
@@ -34,6 +45,7 @@ func TestPruneLocationsObsolete(t *testing.T) {
 			ctx := t.Context()
 			root := t.TempDir()
 			parent, child, gone, goneChild, moved, reference, outside, manual := hexSHA(1001), hexSHA(1002), hexSHA(1003), hexSHA(1004), hexSHA(1005), hexSHA(1006), hexSHA(1007), hexSHA(1008)
+			pruneTestPools(t, root, "bad")
 			// Invalid archive bytes prove that pruning only checks the outer file.
 			writeDedupeFile(t, root, "good/present.tgz", []byte("not a readable archive"))
 			writeDedupeFile(t, root, "good/new.bin", []byte("present bytes"))
@@ -84,8 +96,9 @@ func TestPruneLocationsObsolete(t *testing.T) {
 			if err != nil || len(locs) != 1 {
 				t.Fatalf("member in present archive removed: %+v %v", locs, err)
 			}
-			if pruneTestCount(t, db, "sample_location_history") != beforeHistory {
-				t.Fatal("obsolete rows copied to history")
+			// Only the containing archive's path is retired; leaf rows are not copied.
+			if got := pruneTestCount(t, db, "sample_location_history"); got != beforeHistory+1 {
+				t.Fatalf("history rows: %d, want %d (archive path only)", got, beforeHistory+1)
 			}
 			again, err := db.PruneLocations(ctx, opts)
 			if err != nil || again.Deleted != 0 {
@@ -216,6 +229,7 @@ func TestPruneLocationsResumeAndGeneration(t *testing.T) {
 			db := backend.open(t)
 			ctx := t.Context()
 			root := t.TempDir()
+			pruneTestPools(t, root, "bad")
 			for i := range 5 {
 				mustInsert(t, ctx, db, &Sample{SHA256: hexSHA(1200 + i), Path: fmt.Sprintf("bad/missing-%d", i), Label: "bad"})
 			}

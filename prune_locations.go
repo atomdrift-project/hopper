@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -29,8 +30,24 @@ type LocationPruneOptions struct {
 	GoodMaxPaths    int
 	UnknownMaxPaths int
 	PreviewRows     int64 // cap preview over a bounded ID window; never applies
-	DryRun          bool
+	// MaxObsoleteFraction aborts an obsolete apply before deleting a batch whose
+	// absent share, or the pass's cumulative absent share, exceeds it. Zero
+	// selects DefaultMaxObsoleteFraction; 1 or more disables the cap.
+	MaxObsoleteFraction float64
+	// CapLabels limits which labels the cap phase trims; empty means good and
+	// unknown. Retention limits and admission markers are unaffected.
+	CapLabels []string
+	DryRun    bool
 }
+
+// DefaultMaxObsoleteFraction matches the legacy prune safety cap: a wrong data
+// root or an unmounted pool makes most rows look absent, while ordinary churn
+// removes a small share.
+const DefaultMaxObsoleteFraction = 0.40
+
+// pruneSafetyMinVictims keeps small clusters of genuinely removed files from
+// tripping the fraction cap; a wrong root trips it within the first batch.
+const pruneSafetyMinVictims = 50
 
 // LocationPruneLabelStats describes the effects for one member label.
 type LocationPruneLabelStats struct {
@@ -51,7 +68,16 @@ type LocationPruneStats struct {
 	Scanned, Obsolete, Excess, Deleted, Protected, Uncheckable, StatCalls, CacheHits int64
 	OverfullSHAs, CappedSHAs, BusyArchives                                           int
 	PhysicalRetained, ArchivesSeen, ArchiveEdgesRemoved                              int64
-	Complete                                                                         bool
+	// SafetyTrips counts obsolete batches that exceeded MaxObsoleteFraction. An
+	// apply stops at the first; a dry run keeps counting so the preview is whole.
+	SafetyTrips int64
+	// PoolGuarded counts absent paths preserved because their top-level pool
+	// directory was missing or empty, which is how an unmounted dataset looks.
+	PoolGuarded int64
+	// Rebased counts absent member rows moved onto their archive's live path;
+	// Unmapped counts those kept because the old prefix could not be mapped.
+	Rebased, Unmapped int64
+	Complete          bool
 }
 
 type pruneLocation struct {
@@ -69,9 +95,40 @@ const (
 )
 
 type pruneChecker struct {
-	stats *LocationPruneStats
-	cache map[string]prunePresence
-	root  string
+	stats   *LocationPruneStats
+	cache   map[string]prunePresence
+	pools   map[string]bool
+	parents map[string]*pruneParent
+	root    string
+}
+
+// poolPresent reports whether the top-level directory holding resolved exists
+// and is non-empty. An unmounted dataset leaves an empty mountpoint (or none),
+// and every file under it would otherwise stat as absent. Files directly in
+// the root have no pool and always pass.
+func (c *pruneChecker) poolPresent(resolved string, fresh bool) bool {
+	rel, err := filepath.Rel(c.root, resolved)
+	if err != nil {
+		return false
+	}
+	top, _, nested := strings.Cut(rel, string(filepath.Separator))
+	if !nested {
+		return true
+	}
+	if ok, cached := c.pools[top]; cached && !fresh {
+		return ok
+	}
+	ok := false
+	if dir, err := os.Open(filepath.Join(c.root, top)); err == nil {
+		names, _ := dir.Readdirnames(1) //nolint:errcheck // an empty or unreadable pool is not present
+		ok = len(names) > 0
+		_ = dir.Close() //nolint:errcheck // read-only handle
+	}
+	if c.pools == nil {
+		c.pools = map[string]bool{}
+	}
+	c.pools[top] = ok
+	return ok
 }
 
 func (c *pruneChecker) check(path string, fresh bool) prunePresence {
@@ -94,6 +151,10 @@ func (c *pruneChecker) check(path string, fresh bool) prunePresence {
 	state := pruneUnknown
 	if errors.Is(err, os.ErrNotExist) {
 		state = pruneAbsent
+		if !c.poolPresent(resolved, fresh) {
+			c.stats.PoolGuarded++
+			state = pruneUnknown
+		}
 	} else if err == nil && info.Mode().IsRegular() {
 		state = prunePresent
 	}
@@ -126,6 +187,17 @@ func (db *DB) PruneLocations(ctx context.Context, opts LocationPruneOptions) (Lo
 	}
 	if opts.Phase != "obsolete" && opts.Phase != "cap" {
 		return stats, errors.New("hopper: prune phase must be obsolete or cap")
+	}
+	if opts.MaxObsoleteFraction < 0 {
+		return stats, errors.New("hopper: max obsolete fraction must be nonnegative")
+	}
+	for _, label := range opts.CapLabels {
+		if label != labelGood && label != labelUnknown {
+			return stats, errors.New("hopper: cap labels must be good and/or unknown")
+		}
+	}
+	if opts.MaxObsoleteFraction == 0 {
+		opts.MaxObsoleteFraction = DefaultMaxObsoleteFraction
 	}
 	root, err := filepath.Abs(opts.DataRoot)
 	if err != nil {
@@ -249,14 +321,38 @@ func (db *DB) pruneObsoleteLocations(ctx context.Context, opts LocationPruneOpti
 				}
 			}
 			victims = live
-			n, protected, err := db.deletePruneLocations(ctx, victims, false, nil, c, opts)
+		}
+		// Rebases are not losses: only rows with no live archive count toward the
+		// safety cap and the obsolete total.
+		rebases, deletes, unmapped, err := db.planObsoleteRebases(ctx, victims, c, !opts.DryRun)
+		if err != nil {
+			return err
+		}
+		stats.Unmapped += unmapped
+		safety := checkObsoleteSafety(opts, stats, len(deletes), len(batch))
+		if opts.DryRun {
+			// Preview reports every batch an apply would refuse instead of stopping.
+			if errors.As(safety, new(*PruneSafetyExceeded)) {
+				stats.SafetyTrips++
+			}
+			stats.Rebased += int64(len(rebases))
+		} else {
+			if safety != nil {
+				return safety
+			}
+			moved, err := db.rebasePruneLocations(ctx, rebases)
+			if err != nil {
+				return err
+			}
+			stats.Rebased += moved
+			n, protected, err := db.deletePruneLocations(ctx, deletes, false, nil, c, opts)
 			if err != nil {
 				return err
 			}
 			stats.Deleted += n
 			stats.Protected += protected
 		}
-		stats.Obsolete += int64(len(victims))
+		stats.Obsolete += int64(len(deletes))
 		stats.Scanned += int64(len(batch))
 		stats.AfterID = batch[len(batch)-1].ID
 		if stats.AfterID >= stats.ThroughID {
@@ -269,6 +365,34 @@ func (db *DB) pruneObsoleteLocations(ctx context.Context, opts LocationPruneOpti
 			return nil
 		}
 	}
+}
+
+// checkObsoleteSafety refuses a batch when its own absent share, or the pass's
+// cumulative share including it, exceeds the cap. The batch check stops a wrong
+// root before its first deletion; the cumulative check stops a slow drift. Both
+// ignore fewer than pruneSafetyMinVictims absent rows so small clusters of
+// genuinely removed files never trip it.
+func checkObsoleteSafety(opts LocationPruneOptions, stats *LocationPruneStats, victims, batch int) error {
+	limit := opts.MaxObsoleteFraction
+	if limit >= 1 || batch == 0 {
+		return nil
+	}
+	exceeds := func(v, total int64) bool {
+		return v > pruneSafetyMinVictims && float64(v)/float64(total) > limit
+	}
+	if exceeds(int64(victims), int64(batch)) {
+		return &PruneSafetyExceeded{Total: batch, Victims: victims, MaxFraction: limit}
+	}
+	v, total := stats.Obsolete+int64(victims), stats.Scanned+int64(batch)
+	if exceeds(v, total) {
+		return &PruneSafetyExceeded{Total: int(total), Victims: int(v), MaxFraction: limit}
+	}
+	return nil
+}
+
+// capLabelSelected reports whether the cap phase may trim this label.
+func capLabelSelected(label string, opts LocationPruneOptions) bool {
+	return len(opts.CapLabels) == 0 || slices.Contains(opts.CapLabels, label)
 }
 
 func reportLocationPrune(opts LocationPruneOptions, stats LocationPruneStats) error {

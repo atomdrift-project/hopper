@@ -42,7 +42,14 @@ func (db *DB) previewLocationWindow(ctx context.Context, opts LocationPruneOptio
  (SELECT COALESCE(max(id),$1) FROM scope)
  FROM classified c LEFT JOIN dropped d ON d.id=c.id LEFT JOIN lost_by_label e ON e.label=c.label
  GROUP BY c.label ORDER BY c.label`
-	err := db.queryLocations(ctx, query, []any{opts.AfterID, stats.ThroughID, opts.PreviewRows, opts.GoodMaxPaths, opts.UnknownMaxPaths},
+	goodCap, unknownCap := opts.GoodMaxPaths, opts.UnknownMaxPaths
+	if !capLabelSelected(labelGood, opts) {
+		goodCap = 0
+	}
+	if !capLabelSelected(labelUnknown, opts) {
+		unknownCap = 0
+	}
+	err := db.queryLocations(ctx, query, []any{opts.AfterID, stats.ThroughID, opts.PreviewRows, goodCap, unknownCap},
 		func(rows locationRows) error {
 			for rows.Next() {
 				var label string

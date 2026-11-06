@@ -342,7 +342,30 @@ The separate obsolete pass removes rows whose outer file is absent. It checks
 only the file before the first `!!`, never archive members. URLs, paths outside
 the data root, and stat errors other than absence are preserved. Use repeatable
 `--require-mount LABEL` flags for required pool mounts; an unavailable pool must
-not be treated as missing files. **Wait for disk deduplication to finish before
+not be treated as missing files. Independently of those flags, an absent path
+whose top-level pool directory is missing or empty is reported as uncheckable
+(`pool_guarded`) and kept. Before deleting each batch, apply also refuses to
+continue if more than `--max-obsolete-fraction` (default 40%) of that batch, or
+of the pass so far, is absent; fewer than 50 absent rows never trip it. A dry run
+reports such batches as `safety_trips` instead of stopping. `--force` lifts the
+cap after you have confirmed every pool is mounted.
+
+An absent archive member is not necessarily gone: if its archive was moved
+without its member rows being rebased, the bytes are still reachable through the
+archive's live copy. When the member's parent SHA has a recorded location whose
+file exists, the obsolete pass rewrites the member row (and the sample's primary
+path, if it pointed there) onto that location instead of deleting it (`rebased`).
+The old prefix is matched against the archive's recorded and retired paths; a
+member whose prefix cannot be matched is kept (`unmapped`). Rebases do not count
+toward the safety cap. Rows removed or rebased for SHAs that contain members are
+recorded in `sample_location_history` with reason `prune`, so their members stay
+mappable on a later run; leaf rows are not copied.
+
+`--cap-labels good` restricts the cap phase to good samples (the default is
+`good,unknown`). Excluded labels are left untouched, and retention limits and
+admission markers are unchanged, so a later pass can add the other label.
+
+**Wait for disk deduplication to finish before
 applying the obsolete pass, including the default combined `--phase all`.** It
 can otherwise discard observations while an archive's member paths are moving.
 

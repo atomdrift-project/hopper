@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/atomdrift-project/hopper"
@@ -20,10 +22,14 @@ type locationPruneCheckpoint struct {
 	MaxPaths        int
 	GoodMaxPaths    int
 	UnknownMaxPaths int
+	CapLabels       string
 	PreviewRows     int64
 	Version         int
 	DryRun          bool
 }
+
+// locationPruneCheckpointVersion 5 records the cap labels a pass trims.
+const locationPruneCheckpointVersion = 5
 
 func writeLocationPruneCheckpoint(name string, checkpoint *locationPruneCheckpoint) error {
 	data, err := json.MarshalIndent(checkpoint, "", "  ")
@@ -74,6 +80,10 @@ func cmdPruneLocations(ctx context.Context) error {
 	afterSHA := f.String("after-sha", "", "resume cap phase after this SHA256")
 	checkpoint := f.String("checkpoint", "", "write an atomic JSON checkpoint after completed batches")
 	resume := f.Bool("resume", false, "resume a matching --checkpoint (preview and apply checkpoints cannot be mixed)")
+	maxObsolete := f.Float64("max-obsolete-fraction", hopper.DefaultMaxObsoleteFraction,
+		"abort an obsolete apply when a batch or the pass would remove more than this share of rows")
+	capLabels := f.String("cap-labels", "good,unknown", "labels the cap phase trims (good, unknown, or both)")
+	force := f.Bool("force", false, "disable the obsolete safety cap (only after confirming every pool is mounted)")
 	var mounts stringListFlag
 	f.Var(&mounts, "require-mount", "required pool mount, relative to --data (repeatable)")
 	parseFlags(f, os.Args[2:])
@@ -98,7 +108,21 @@ func cmdPruneLocations(ctx context.Context) error {
 	if err := validateRequiredMounts(*root, mounts); err != nil {
 		return err
 	}
+	if *maxObsolete <= 0 {
+		return errors.New("--max-obsolete-fraction must be positive")
+	}
+	if *force {
+		*maxObsolete = 1
+	}
+	labels := strings.Split(*capLabels, ",")
+	for i := range labels {
+		labels[i] = strings.TrimSpace(labels[i])
+	}
+	slices.Sort(labels)
+	labels = slices.Compact(labels)
+	*capLabels = strings.Join(labels, ",")
 	opts := hopper.LocationPruneOptions{
+		MaxObsoleteFraction: *maxObsolete, CapLabels: labels,
 		DataRoot: *root, Batch: *batch, MaxPaths: *maxPaths, GoodMaxPaths: *goodMax, UnknownMaxPaths: *unknownMax,
 		PreviewRows: *previewRows, DryRun: !*apply,
 		AfterID: *afterID, ThroughID: *throughID, AfterSHA: *afterSHA, Limit: *limit, LimitSHAs: *limitSHAs,
@@ -149,27 +173,36 @@ func cmdPruneLocations(ctx context.Context) error {
 		opts.Progress = func(stats hopper.LocationPruneStats) error {
 			fmt.Printf("prune: phase=%s scanned=%d obsolete=%d excess=%d deleted=%d protected=%d uncheckable=%d stat_calls=%d cache_hits=%d "+
 				"capped_shas=%d busy_archives=%d physical_retained=%d archives_seen=%d archive_edges_removed=%d "+
-				"after_id=%d through_id=%d after_sha=%s complete=%t elapsed=%s\n",
+				"safety_trips=%d pool_guarded=%d rebased=%d unmapped=%d after_id=%d through_id=%d after_sha=%s complete=%t elapsed=%s\n",
 				stats.Phase, stats.Scanned, stats.Obsolete, stats.Excess, stats.Deleted, stats.Protected, stats.Uncheckable,
 				stats.StatCalls, stats.CacheHits,
 				stats.CappedSHAs, stats.BusyArchives, stats.PhysicalRetained, stats.ArchivesSeen, stats.ArchiveEdgesRemoved,
-				stats.AfterID, stats.ThroughID, stats.AfterSHA, stats.Complete,
+				stats.SafetyTrips, stats.PoolGuarded, stats.Rebased, stats.Unmapped, stats.AfterID, stats.ThroughID, stats.AfterSHA, stats.Complete,
 				time.Since(started).Round(time.Millisecond))
 			slog.Info("location prune progress", "phase", stats.Phase, "scanned", stats.Scanned, "obsolete", stats.Obsolete, "excess", stats.Excess,
-				"deleted", stats.Deleted, "dry_run", opts.DryRun, "after_id", stats.AfterID, "after_sha", stats.AfterSHA)
+				"deleted", stats.Deleted, "rebased", stats.Rebased, "dry_run", opts.DryRun, "after_id", stats.AfterID, "after_sha", stats.AfterSHA)
 			reportLocationPruneLabels(stats.Labels)
 			if *checkpoint != "" {
 				return writeLocationPruneCheckpoint(*checkpoint, &locationPruneCheckpoint{
 					Root: *root, MaxPaths: *maxPaths, GoodMaxPaths: *goodMax, UnknownMaxPaths: *unknownMax,
-					PreviewRows: *previewRows, DryRun: opts.DryRun, Stats: stats, Version: 4,
+					CapLabels: *capLabels, PreviewRows: *previewRows, DryRun: opts.DryRun, Stats: stats,
+					Version: locationPruneCheckpointVersion,
 				})
 			}
 			return nil
 		}
 		stats, err := db.PruneLocations(ctx, opts)
+		if errors.As(err, new(*hopper.PruneSafetyExceeded)) {
+			return fmt.Errorf("prune %s safety cap tripped after ID %d; nothing in the refused batch was deleted. "+
+				"Confirm every pool is mounted, then raise --max-obsolete-fraction or pass --force: %w", current, stats.AfterID, err)
+		}
 		if err != nil {
 			return fmt.Errorf("prune %s failed (resume after ID %d or SHA %q, through ID %d): %w",
 				current, stats.AfterID, stats.AfterSHA, stats.ThroughID, err)
+		}
+		if stats.SafetyTrips > 0 {
+			fmt.Printf("WARNING: %d batch(es) exceed the %.0f%% obsolete safety cap; an apply would stop at the first\n",
+				stats.SafetyTrips, opts.MaxObsoleteFraction*100)
 		}
 		if !stats.Complete {
 			fmt.Printf("Pass stopped at its configured limit. Resume --phase %s --after-id %d --after-sha %q --through-id %d, "+
@@ -185,11 +218,12 @@ func cmdPruneLocations(ctx context.Context) error {
 // A completed obsolete phase advances to cap when resuming the combined command.
 // The SHA cursor advances only after an entire hash has been processed.
 func resumeLocationPrune(phase string, saved *locationPruneCheckpoint, opts *hopper.LocationPruneOptions) ([]string, error) {
-	if saved.Version != 4 {
+	if saved.Version != locationPruneCheckpointVersion {
 		return nil, errors.New("checkpoint uses an earlier cap policy; start a new pass")
 	}
 	if saved.Root != opts.DataRoot || saved.MaxPaths != opts.MaxPaths || saved.GoodMaxPaths != opts.GoodMaxPaths ||
-		saved.UnknownMaxPaths != opts.UnknownMaxPaths || saved.PreviewRows != opts.PreviewRows || saved.DryRun != opts.DryRun {
+		saved.UnknownMaxPaths != opts.UnknownMaxPaths || saved.CapLabels != strings.Join(opts.CapLabels, ",") ||
+		saved.PreviewRows != opts.PreviewRows || saved.DryRun != opts.DryRun {
 		return nil, errors.New("checkpoint root, retention limit, or preview/apply mode differs")
 	}
 	if saved.Stats.Phase != "obsolete" && saved.Stats.Phase != "cap" {
