@@ -245,7 +245,11 @@ func retirePruneArchivePaths(tx locationSQLTx, postgres bool, ids []int64, succe
 		return nil
 	}
 	const columns = `(sha256,path,parent_sha256,rel,filename,source,feed,ecosystem,mtime,first_seen_at,last_seen_at,retired_at,reason,successor_path)`
-	const container = `EXISTS(SELECT 1 FROM sample_locations m WHERE m.parent_sha256=l.sha256)`
+	// The redundant <> '' lets Postgres prove idx_sl_members' partial predicate.
+	// Without it the planner hashes every row of sample_locations per batch: on
+	// 2026-11-07 the first production batch scanned all 4.5B rows (~4 TB) and
+	// was still running ten minutes later.
+	const container = `EXISTS(SELECT 1 FROM sample_locations m WHERE m.parent_sha256=l.sha256 AND m.parent_sha256<>'')`
 	if postgres {
 		return tx.exec(`INSERT INTO sample_location_history `+columns+`
   SELECT l.sha256,l.path,l.parent_sha256,l.rel,l.filename,l.source,l.feed,l.ecosystem,l.mtime,l.first_seen_at,l.last_seen_at,$3,'prune',v.successor
