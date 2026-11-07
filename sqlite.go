@@ -766,10 +766,21 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 	// current walk; reconciliation anti-joins it against samples. See the pg.go
 	// equivalent. SQLite has no UNLOGGED tables, but this DB is the local cache
 	// (not the durable store), so a plain table is fine.
+	//
+	// staged_at records when the walk saw each path; see the pg.go
+	// observeStagedLocationsPG comment. The table is scratch, rebuilt on every
+	// walk, so a copy from before the column existed is simply recreated.
+	if _, err := db.lite.ExecContext(ctx, `SELECT staged_at FROM walk_staging LIMIT 0`); err != nil &&
+		strings.Contains(err.Error(), "no such column") {
+		if _, err := db.lite.ExecContext(ctx, `DROP TABLE walk_staging`); err != nil {
+			return fmt.Errorf("hopper: migrate sqlite walk_staging: %w", err)
+		}
+	}
 	for _, ddl := range []string{
 		`CREATE TABLE IF NOT EXISTS walk_staging (
-			sha256 TEXT NOT NULL,
-			path   TEXT NOT NULL
+			sha256    TEXT NOT NULL,
+			path      TEXT NOT NULL,
+			staged_at TEXT
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_samples_reconcile_toplevel ON samples(sha256)
 			WHERE parent = '' AND (skip = '' OR skip = 'conflict')`,
@@ -5280,13 +5291,14 @@ func (db *DB) stageLocationsSQLite(ctx context.Context, keys []SampleLocationKey
 		return fmt.Errorf("hopper: begin stage: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // commit or rollback
-	stmt, err := tx.PrepareContext(ctx, `INSERT INTO walk_staging (sha256, path) VALUES (?, ?)`)
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO walk_staging (sha256, path, staged_at) VALUES (?, ?, ?)`)
 	if err != nil {
 		return fmt.Errorf("hopper: prepare stage: %w", err)
 	}
 	defer stmt.Close() //nolint:errcheck // best-effort cleanup
+	ts := now()
 	for _, k := range keys {
-		if _, err := stmt.ExecContext(ctx, k.SHA256, k.Path); err != nil {
+		if _, err := stmt.ExecContext(ctx, k.SHA256, k.Path, ts); err != nil {
 			return fmt.Errorf("hopper: stage location %s: %w", k.SHA256, err)
 		}
 	}
@@ -5309,6 +5321,14 @@ func (db *DB) observeStagedLocationsSQLite(ctx context.Context) (int64, error) {
 		WHERE NOT EXISTS (
 			SELECT 1 FROM sample_locations l
 			 WHERE l.sha256 = w.sha256 AND l.path = w.path
+		)
+		AND NOT EXISTS (
+			-- Retired after the walk saw it: see observeStagedLocationsPG.
+			-- julianday() because the two columns are written in different
+			-- text formats (RFC 3339 with Z, and strftime without).
+			SELECT 1 FROM sample_location_history h
+			 WHERE h.sha256 = w.sha256 AND h.path = w.path
+			   AND julianday(h.retired_at) >= julianday(w.staged_at)
 		)`, ts, ts)
 	if err != nil {
 		return 0, err

@@ -1876,6 +1876,11 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 			sha256 TEXT NOT NULL,
 			path   TEXT NOT NULL
 		)`,
+		// staged_at is when the walk saw the path. A walk runs for hours while
+		// moves keep committing, so a path staged before its move must not be
+		// re-learned afterwards; see observeStagedLocationsPG. now() is stable,
+		// so this ADD COLUMN takes the fast-default path and rewrites nothing.
+		`ALTER TABLE walk_staging ADD COLUMN IF NOT EXISTS staged_at TIMESTAMPTZ NOT NULL DEFAULT now()`,
 
 		// Supports the reconcile anti-join / eligible count over the active
 		// top-level working set without scanning the full samples heap.
@@ -8787,6 +8792,16 @@ func (db *DB) stageLocationsPG(ctx context.Context, keys []SampleLocationKey) er
 // twelve million doomed inserts per pass, which is what timed out for six days
 // running and left renamed pools unlearned. ON CONFLICT stays as the guard for
 // duplicates inside this one batch, which the anti-join cannot see.
+//
+// A walk takes hours, and moves keep committing while it runs. A path the walk
+// staged before a move retired it is no longer on disk, and inserting it would
+// resurrect a row whose file is gone. The second NOT EXISTS skips any staged
+// path whose location was retired after the walk saw it. On 2026-11-01 one pass
+// without it re-inserted 65,558 incoming/ rows that draino had moved to pending/
+// hours earlier, all under one first_seen_at, and draino then spent
+// pressure-relief episodes "moving" them for zero bytes freed. A file that
+// really comes back after a move is staged again later than its retirement,
+// so it is still learned.
 func (db *DB) observeStagedLocationsPG(ctx context.Context) (int64, error) {
 	tag, err := db.pool.Exec(ctx, `
 		INSERT INTO sample_locations
@@ -8800,6 +8815,11 @@ func (db *DB) observeStagedLocationsPG(ctx context.Context) (int64, error) {
 			SELECT 1 FROM sample_locations l
 			 WHERE l.sha256 = w.sha256 AND path_key(l.path) = path_key(w.path)
 			   AND l.path = w.path
+		)
+		AND NOT EXISTS (
+			SELECT 1 FROM sample_location_history h
+			 WHERE h.sha256 = w.sha256 AND h.path = w.path
+			   AND h.retired_at >= w.staged_at
 		)
 		ON CONFLICT (sha256, path_key(path)) DO NOTHING`)
 	if err != nil {

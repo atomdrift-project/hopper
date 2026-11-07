@@ -4609,7 +4609,10 @@ func (db *DB) ReconcilePools(ctx context.Context, diskPath func(string) string, 
 		return stats, fmt.Errorf("hopper: reconcile observe locations: %w", err)
 	}
 	if stats.ObservedLocations > 0 {
-		slog.Info("reconcile learned sample locations", "count", stats.ObservedLocations)
+		// Warn, not Info: production logs at warn, and this one line per walk is
+		// the only record of when a walk added locations in bulk. Without it the
+		// 2026-11-01 pass that added 65,558 stale incoming/ rows left no trace.
+		slog.Warn("reconcile learned sample locations", "count", stats.ObservedLocations)
 	}
 
 	// 2. Relabel top-level, non-marker samples from the pools their standalone

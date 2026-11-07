@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
@@ -309,8 +308,7 @@ func tryPruneArchiveLock(root, sha string) (*os.File, error) {
 	if !isLowerHexSHA256(sha) {
 		return nil, errors.New("hopper: invalid archive SHA for prune lock")
 	}
-	name := filepath.Join(root, movePartialPrefix+"lock-"+sha[:2])
-	file, err := os.OpenFile(name, os.O_CREATE|os.O_RDONLY, 0o660) //nolint:gosec // shared move lock permissions
+	file, err := os.OpenFile(moveContentLockName(root, sha), os.O_CREATE|os.O_RDONLY, 0o660) //nolint:gosec // shared move lock permissions
 	if err != nil {
 		return nil, err
 	}

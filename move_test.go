@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -878,5 +879,75 @@ func TestMoveLocationRebasesMultipleBatches(t *testing.T) {
 				t.Fatalf("primary: %+v %v", s, err)
 			}
 		})
+	}
+}
+
+// A walk stages paths for hours while moves keep committing. A path the walk
+// saw before a move retired it must not be re-learned when the walk finishes:
+// on 2026-11-01 that resurrected 65,558 incoming/ rows whose bytes were already
+// in pending/, and draino spent pressure relief "moving" them for nothing. A
+// file that genuinely reappears after the move must still be learned.
+func TestReconcileDoesNotResurrectLocationMovedDuringWalk(t *testing.T) {
+	for name, open := range map[string]func(*testing.T) *DB{"sqlite": openTestDB, "postgres": openDisposablePG} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			db := open(t)
+			root := t.TempDir()
+			oldRel := "incoming/forager/pkg/walked.tgz"
+			newRel := "pending/forager/pkg/walked.tgz"
+			content := []byte("moved while the walk was running " + name)
+			sha := moveTestSHA(content)
+			oldAbs := filepath.Join(root, filepath.FromSlash(oldRel))
+			if err := os.MkdirAll(filepath.Dir(oldAbs), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(oldAbs, content, 0o440); err != nil {
+				t.Fatal(err)
+			}
+			mustInsert(t, ctx, db, &Sample{SHA256: sha, Path: oldRel, Label: "unknown", LabelSource: "forager"})
+
+			stageWalk(t, ctx, db, loc(sha, oldRel))
+			if _, err := db.MoveLocation(ctx, MoveLocationOptions{DataRoot: root, SHA256: sha, OldPath: oldRel, NewPath: newRel}); err != nil {
+				t.Fatalf("MoveLocation: %v", err)
+			}
+			if _, err := db.ReconcilePools(ctx, func(p string) string { return filepath.Join(root, p) }, false); err != nil {
+				t.Fatalf("ReconcilePools: %v", err)
+			}
+			assertLocationPaths(t, ctx, db, sha, newRel)
+
+			// The bytes come back at the old path after the move: a later walk
+			// sees them after the retirement and must learn the path again.
+			time.Sleep(5 * time.Millisecond)
+			if err := os.MkdirAll(filepath.Dir(oldAbs), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(oldAbs, content, 0o440); err != nil {
+				t.Fatal(err)
+			}
+			stageWalk(t, ctx, db, loc(sha, oldRel), loc(sha, newRel))
+			if _, err := db.ReconcilePools(ctx, func(p string) string { return filepath.Join(root, p) }, false); err != nil {
+				t.Fatalf("ReconcilePools: %v", err)
+			}
+			assertLocationPaths(t, ctx, db, sha, oldRel, newRel)
+		})
+	}
+}
+
+func assertLocationPaths(t *testing.T, ctx context.Context, db *DB, sha string, want ...string) {
+	t.Helper()
+	locations, err := db.LocationsForSHA(ctx, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(locations))
+	for _, l := range locations {
+		if l.ParentSHA256 == "" {
+			got = append(got, l.Path)
+		}
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("top-level locations = %v, want %v", got, want)
 	}
 }

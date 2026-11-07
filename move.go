@@ -335,8 +335,21 @@ func resolveMovePath(dataRoot, rel string) (root, resolved string, err error) {
 // Flock works across processes; distinct source paths for the same content use
 // the same lock. Shared directory permissions allow other corpus users to read
 // and lock existing files without needing write access to the lock itself.
+//
+// The bucket is the sha256's last byte, not its first. Callers such as draino
+// walk the catalog in sha256 order whenever many rows share a first_seen_at, and
+// keying on the leading byte put every concurrent request in that run on the
+// same lock: on 2026-11-07 all eight of draino's in-flight moves queued on one
+// file, and the drain ran at concurrency one while the hot pool filled. Every
+// process that moves samples must agree on this key, so deploy them together.
 func lockMoveContent(ctx context.Context, root, sha string) (*os.File, error) {
-	return lockMoveFile(ctx, filepath.Join(root, movePartialPrefix+"lock-"+sha[:2]), os.O_CREATE|os.O_RDONLY)
+	return lockMoveFile(ctx, moveContentLockName(root, sha), os.O_CREATE|os.O_RDONLY)
+}
+
+// moveContentLockName is the one place the content lock's file name is built.
+// Anything that must exclude moves of a sha256 locks this file.
+func moveContentLockName(root, sha string) string {
+	return filepath.Join(root, movePartialPrefix+"lock-"+sha[len(sha)-2:])
 }
 
 func lockMoveSource(ctx context.Context, name string) (*os.File, error) {
