@@ -801,6 +801,7 @@ func (db *DB) reportBackfill(current, total int64) {
 
 // Sample is a binary in the registry.
 type Sample struct {
+	Gauntlet        *GauntletEvidence `json:",omitempty"`
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
 	FetchedAt       *time.Time
@@ -1153,13 +1154,14 @@ type WorkflowSample struct {
 
 // Report is an analysis report produced by cyclotron.
 type Report struct {
-	CreatedAt  time.Time
-	SHA256     string
-	Type       string // "re", "gap", "fpr", "second" (completed second-opinion review; TriageSecondOpinion anti-joins on it)
-	Content    string
-	Provider   string
-	ID         int64
-	DurationMS int
+	EvidenceKey string
+	CreatedAt   time.Time
+	SHA256      string
+	Type        string // "re", "gap", "fpr", "second" (completed second-opinion review; TriageSecondOpinion anti-joins on it)
+	Content     string
+	Provider    string
+	ID          int64
+	DurationMS  int
 }
 
 // TopTrait is one entry in a sample's top_traits column: a suspicious-or-worse

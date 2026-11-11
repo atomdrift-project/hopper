@@ -293,6 +293,9 @@ func TransferSamples(ctx context.Context, dst, src *DB, afterSampleID, afterRepo
 		return samples, reports, fmt.Errorf("transfer reports: %w", err)
 	}
 	slog.Info("transfer phase 2/2 complete", "reports", reports)
+	if err := TransferGauntlet(ctx, dst, src); err != nil {
+		return samples, reports, fmt.Errorf("transfer gauntlet history: %w", err)
+	}
 	return samples, reports, nil
 }
 
@@ -487,7 +490,7 @@ func eachReport(ctx context.Context, db *DB, afterID int64, fn func(*Report) err
 
 func eachReportPG(ctx context.Context, db *DB, afterID int64, fn func(*Report) error) error {
 	rows, err := db.pool.Query(ctx, `
-		SELECT id, sha256, report_type, content, provider, duration_ms, created_at
+		SELECT id, sha256, report_type, content, provider, duration_ms, created_at, evidence_key
 		FROM reports WHERE id > $1 ORDER BY id`, afterID)
 	if err != nil {
 		return fmt.Errorf("query reports: %w", err)
@@ -495,7 +498,7 @@ func eachReportPG(ctx context.Context, db *DB, afterID int64, fn func(*Report) e
 	defer rows.Close()
 	for rows.Next() {
 		r := &Report{}
-		if err := rows.Scan(&r.ID, &r.SHA256, &r.Type, &r.Content, &r.Provider, &r.DurationMS, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.SHA256, &r.Type, &r.Content, &r.Provider, &r.DurationMS, &r.CreatedAt, &r.EvidenceKey); err != nil {
 			return fmt.Errorf("scan report: %w", err)
 		}
 		if err := fn(r); err != nil {
@@ -507,7 +510,7 @@ func eachReportPG(ctx context.Context, db *DB, afterID int64, fn func(*Report) e
 
 func eachReportSQLite(ctx context.Context, db *DB, afterID int64, fn func(*Report) error) error {
 	rows, err := db.lite.QueryContext(ctx, `
-		SELECT id, sha256, report_type, content, provider, duration_ms, created_at
+		SELECT id, sha256, report_type, content, provider, duration_ms, created_at, evidence_key
 		FROM reports WHERE id > ? ORDER BY id`, afterID)
 	if err != nil {
 		return fmt.Errorf("query reports: %w", err)
@@ -515,7 +518,7 @@ func eachReportSQLite(ctx context.Context, db *DB, afterID int64, fn func(*Repor
 	defer rows.Close() //nolint:errcheck // best-effort cleanup
 	for rows.Next() {
 		r := &Report{}
-		if err := rows.Scan(&r.ID, &r.SHA256, &r.Type, &r.Content, &r.Provider, &r.DurationMS, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.SHA256, &r.Type, &r.Content, &r.Provider, &r.DurationMS, &r.CreatedAt, &r.EvidenceKey); err != nil {
 			return fmt.Errorf("scan report: %w", err)
 		}
 		if err := fn(r); err != nil {
@@ -636,21 +639,21 @@ func flushSamplesSQLite(ctx context.Context, dst *DB, samples []*Sample) (int64,
 
 // Report staging for PG COPY.
 
-var reportStagingCols = []string{"sha256", "report_type", "content", "provider", "duration_ms", "created_at"}
+var reportStagingCols = []string{"sha256", "report_type", "content", "provider", "duration_ms", "created_at", "evidence_key"}
 
 const reportStagingDDL = `CREATE TEMP TABLE _staging (
 	sha256 TEXT, report_type TEXT, content TEXT, provider TEXT,
-	duration_ms INTEGER, created_at TIMESTAMPTZ
+	duration_ms INTEGER, created_at TIMESTAMPTZ, evidence_key TEXT
 ) ON COMMIT DROP`
 
-const reportStagingInsert = `INSERT INTO reports (sha256, report_type, content, provider, duration_ms, created_at)
-SELECT sha256, report_type, content, provider, duration_ms, created_at
-FROM _staging`
+const reportStagingInsert = `INSERT INTO reports (sha256, report_type, content, provider, duration_ms, created_at, evidence_key)
+SELECT sha256, report_type, content, provider, duration_ms, created_at, evidence_key
+FROM _staging ON CONFLICT DO NOTHING`
 
 func flushReportsPG(ctx context.Context, dst *DB, reports []*Report) (int64, error) {
 	rows := make([][]any, len(reports))
 	for i, r := range reports {
-		rows[i] = []any{r.SHA256, r.Type, r.Content, r.Provider, r.DurationMS, r.CreatedAt}
+		rows[i] = []any{r.SHA256, r.Type, r.Content, r.Provider, r.DurationMS, r.CreatedAt, r.EvidenceKey}
 	}
 	return copyBatchPG(ctx, dst, reportStagingDDL, reportStagingInsert, reportStagingCols, rows)
 }
@@ -664,9 +667,9 @@ func flushReportsSQLite(ctx context.Context, dst *DB, reports []*Report) (int64,
 	var inserted int64
 	for _, r := range reports {
 		_, err := tx.ExecContext(ctx, `
-			INSERT INTO reports (sha256, report_type, content, provider, duration_ms, created_at)
-			VALUES (?, ?, ?, ?, ?, ?)`,
-			r.SHA256, r.Type, r.Content, r.Provider, r.DurationMS, r.CreatedAt)
+			INSERT INTO reports (sha256, report_type, content, provider, duration_ms, created_at, evidence_key)
+			VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
+			r.SHA256, r.Type, r.Content, r.Provider, r.DurationMS, r.CreatedAt, r.EvidenceKey)
 		if err != nil {
 			slog.Warn("skipping report", "sha256", r.SHA256, "type", r.Type, "error", err)
 			continue

@@ -436,3 +436,37 @@ The installed smaug schedule is Sunday at 03:00 local time. Inspect it with
 `/home/t/.local/state/hopper/`. Each weekly run starts from the beginning so it
 can find duplicates introduced anywhere in the SHA range; already shared inodes
 require no hashing or writes.
+
+
+## Gauntlet history
+
+`POST /api/gauntlet/runs` accepts a bounded, complete run envelope. A transaction
+stores its metadata, sample metadata and every scanner verdict. Identical
+replays are no-ops; conflicting immutable content returns 409. The authenticated
+write follows the existing primary/replica relay policy.
+`GET /api/gauntlet/runs/{id}` reconstructs a stored envelope.
+
+`hopper ingest-gauntlet --dsn /path/history.sqlite --input history.ndjson`
+imports the same envelopes directly, including into an otherwise empty database.
+Both SQLite and Postgres are supported. History has no foreign key to the live
+sample catalog and survives corpus pruning. `hopper import` transfers history
+and preserves Gauntlet review evidence keys.
+
+`gauntlet_runs`, `gauntlet_samples`, and `gauntlet_results` preserve original
+observations. `gauntlet_withdrawals` stores later withdrawal facts independently
+so arrival order cannot resurrect withdrawn observations. Presentation changes
+are preserved as source annotations in run metadata. All four tables belong in
+the replica publication; refresh existing subscriptions after deploying the
+schema and publication changes.
+
+The `gauntlet` queue considers only the latest usable, scored `ascan` observation
+per SHA. It excludes withdrawn samples, successful observations, and failures
+with a completed `gauntlet` report for the same evidence key. It uses indexed
+history and a bounded light projection of current sample metadata; large live
+analysis blobs are not fetched for queue selection.
+
+`GET /api/triage/gauntlet/depth` includes `by_failure` counts for `false_positive`
+and `miss`, alongside the usual total and cap indicator. Queue responses carry
+`Gauntlet` evidence on each sample. A completion uses `POST /api/report` with
+`type: "gauntlet"` and that sample's `evidence_key`. Keys are structured columns,
+not parsed from report prose, and cannot accidentally acknowledge newer work.

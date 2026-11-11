@@ -167,6 +167,9 @@ var cleaveTraitArrayKeys = []string{"traits", "find", "ts"}
 // so building all columns before any index preserves correctness.
 func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequential migration list; splitting reduces clarity
 	return []string{
+		gauntletSchema,
+		`ALTER TABLE reports ADD COLUMN IF NOT EXISTS evidence_key TEXT NOT NULL DEFAULT ''`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_gauntlet_evidence ON reports(sha256,evidence_key) WHERE report_type='gauntlet' AND evidence_key<>''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS claimed_first_at TIMESTAMPTZ`,
 		`ALTER TABLE sighting_acquisitions ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ`,
 		// Adopt the rows that predate the column. They were written when an

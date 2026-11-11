@@ -299,6 +299,13 @@ func queueFilter(queue string, f TriageFilter, excluded ...[]string) TriageFilte
 // only until a rescan gives it a fresh verdict; it is a cooldown, not a
 // tombstone. A queue added here without one re-offers work already judged.
 var TriageQueues = map[string]Queue{
+	"gauntlet": {Name: "gauntlet", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
+		var skip []string
+		if len(excluded) > 0 {
+			skip = excluded[0]
+		}
+		return db.TriageGauntlet(ctx, n, skip)
+	}},
 	// bad: bad-labeled samples cleave missed (false negatives) → write traits.
 	"bad": {Name: "bad", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
 		return db.TriageBad(ctx, n, time.Now().Add(-BadFreshness), queueFilter("bad", TriageFilter{}, excluded...))

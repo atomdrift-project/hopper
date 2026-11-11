@@ -163,6 +163,18 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 		return fmt.Errorf("hopper: migrate sqlite: %w", err)
 	}
 
+	if _, err := db.lite.ExecContext(ctx, gauntletSchema); err != nil {
+		return err
+	}
+	if pragmaHasColumnIn(ctx, db.lite, "reports", "evidence_key") == 0 {
+		if _, err := db.lite.ExecContext(ctx, `ALTER TABLE reports ADD COLUMN evidence_key TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if _, err := db.lite.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_gauntlet_evidence ON reports(sha256,evidence_key) WHERE report_type='gauntlet' AND evidence_key<>''`); err != nil {
+		return err
+	}
+
 	// Add columns introduced after initial schema. SQLite lacks
 	// ALTER TABLE ... IF NOT EXISTS, so check column existence via PRAGMA.
 	hasParent := pragmaHasColumn(ctx, db.lite, "parent")

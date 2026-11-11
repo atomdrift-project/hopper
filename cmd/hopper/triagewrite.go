@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -36,10 +37,11 @@ const maxTriageWriteBody = 64 << 10
 const maxCleaveResultBody = maxResultBodyBytes
 
 type reportRequest struct {
-	SHA256   string `json:"sha256"`
-	Type     string `json:"type"`
-	Provider string `json:"provider"`
-	Content  string `json:"content"`
+	EvidenceKey string `json:"evidence_key"`
+	SHA256      string `json:"sha256"`
+	Type        string `json:"type"`
+	Provider    string `json:"provider"`
+	Content     string `json:"content"`
 }
 
 // handleReport records one reports row. POST /api/report.
@@ -70,6 +72,10 @@ func (s *apiServer) handleReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reportType := strings.TrimSpace(req.Type)
+	if reportType == "gauntlet" && !validSHA256(req.EvidenceKey) {
+		writeJSONError(w, http.StatusBadRequest, `{"error":"gauntlet evidence_key is required"}`)
+		return
+	}
 	if reportType == "" {
 		// An empty type is never a drain: it anti-joins nothing, so the write
 		// would "succeed" and the sample would resurface indefinitely.
@@ -88,14 +94,23 @@ func (s *apiServer) handleReport(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	err := retryDBAccessNoValue(ctx, "insert report", sha, func(ctx context.Context) error {
-		return s.db.InsertReport(ctx, &hopper.Report{
-			SHA256:   sha,
-			Type:     reportType,
-			Provider: strings.TrimSpace(req.Provider),
-			Content:  req.Content,
-		})
+		report := &hopper.Report{
+			EvidenceKey: req.EvidenceKey,
+			SHA256:      sha,
+			Type:        reportType,
+			Provider:    strings.TrimSpace(req.Provider),
+			Content:     req.Content,
+		}
+		if reportType == "gauntlet" {
+			return s.db.CompleteGauntlet(ctx, report)
+		}
+		return s.db.InsertReport(ctx, report)
 	})
 	if err != nil {
+		if errors.Is(err, hopper.ErrGauntletEvidence) {
+			writeJSONError(w, http.StatusNotFound, `{"error":"unknown gauntlet evidence"}`)
+			return
+		}
 		// A reports row references its sample, so an integrity violation here
 		// means the sha is not one we hold — a client bug, not a server fault,
 		// and retrying it forever would never help. retryDBAccess already

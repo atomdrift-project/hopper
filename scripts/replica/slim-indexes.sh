@@ -86,6 +86,10 @@ fi
 # cyclotron walks ranked populations (stranded_pending, the *_newest queues) — so
 # "prism does not scan it" is no longer sufficient reason to drop one.
 REPLICA_KEEP_INDEXES='
+idx_reports_gauntlet_evidence
+idx_gauntlet_samples_sha
+idx_gauntlet_ascan
+idx_gauntlet_withdrawals_sha
 idx_claims_name
 idx_claims_signer
 idx_label_events_sha

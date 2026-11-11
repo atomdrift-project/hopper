@@ -45,6 +45,7 @@ commands:
   serve              start a local postgres server with hopper schema
   init               create/migrate a hopper database (sqlite or postgres)
   load               load sample files from directories
+  ingest-gauntlet    ingest historical Gauntlet run envelopes (NDJSON)
   ingest-reports     ingest cyclotron Markdown reports from a directory
   reset              delete all samples and reports (preserves schema)
   import             transfer samples between hopper databases (sqlite↔postgres)
@@ -410,6 +411,8 @@ func run(ctx context.Context) error {
 		return cmdImport(ctx)
 	case "load":
 		return cmdLoad(ctx)
+	case "ingest-gauntlet":
+		return cmdIngestGauntlet(ctx)
 	case "ingest-reports":
 		return cmdIngestReports(ctx)
 	case "dedupe-locations":

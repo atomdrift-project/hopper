@@ -9,4 +9,4 @@
 # apply cost for every index slim-indexes.sh keeps on it, so publish a table
 # only when a replica read path actually reads it.
 # shellcheck disable=SC2034
-REPLICATED_TABLES='samples reports sample_locations sightings claims label_events sample_location_history popular_packages'
+REPLICATED_TABLES='samples reports sample_locations sightings claims label_events sample_location_history popular_packages gauntlet_runs gauntlet_samples gauntlet_results gauntlet_withdrawals'

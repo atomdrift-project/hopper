@@ -169,6 +169,17 @@ func (s *apiServer) handleTriageDepth(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
 
+	if q.Name == "gauntlet" {
+		counts, capped, err := s.db.GauntletDepth(ctx)
+		if err != nil {
+			slog.ErrorContext(r.Context(), "gauntlet depth failed", "error", err)
+			writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+			return
+		}
+		writeTriageJSON(w, map[string]any{"queue": q.Name, "depth": counts["false_positive"] + counts["miss"], "capped": capped, "by_failure": counts})
+		return
+	}
+
 	depth, capped, err := q.Count(ctx, s.db)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "triage: depth failed",

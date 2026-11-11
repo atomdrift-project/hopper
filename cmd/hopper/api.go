@@ -887,6 +887,7 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	// nothing anyway: a sample whose drain has not yet applied is handed out
 	// again, which the consumer's cooldown already absorbs.
 	mux.HandleFunc("GET /api/triage/queues", s.handleTriageQueues)
+	mux.HandleFunc("GET /api/gauntlet/runs/{id}", s.freshOr(s.handleGetGauntletRun))
 	mux.HandleFunc("GET /api/triage/{queue}", s.handleTriageSelect)
 	mux.HandleFunc("GET /api/triage/{queue}/depth", s.handleTriageDepth)
 	// The two lookups a consumer needs alongside a selection. GET
@@ -945,7 +946,7 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 		clientWrites := []string{
 			"POST /api/upload", "POST /api/known", "POST /api/sightings",
 			"POST /api/popular", "POST /api/triage", "POST /api/rescan/{sha256}",
-			"POST /api/report", "POST /api/cleave-result",
+			"POST /api/report", "POST /api/gauntlet/runs", "POST /api/cleave-result",
 		}
 		if s.relay != nil {
 			for _, ep := range clientWrites {
@@ -970,6 +971,8 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/triage", s.handleTriage)
 	mux.HandleFunc("POST /api/rescan/{sha256}", s.handleRescan)
 	mux.HandleFunc("POST /api/report", s.handleReport)
+	mux.HandleFunc("POST /api/gauntlet/runs", s.handleGauntletRun)
+
 	mux.HandleFunc("POST /api/cleave-result", s.handleCleaveResult)
 }
 
