@@ -83,5 +83,5 @@ func (db *DB) previewLocationWindow(ctx context.Context, opts LocationPruneOptio
 		return err
 	}
 	stats.Complete = true
-	return reportLocationPrune(opts, *stats)
+	return reportLocationPrune(opts, stats)
 }

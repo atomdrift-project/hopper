@@ -17,8 +17,8 @@ import (
 const pruneParentLimit = 10000
 
 type pruneRebase struct {
-	loc     pruneLocation
 	newPath string
+	loc     pruneLocation
 }
 
 type pruneParent struct {
@@ -121,33 +121,40 @@ func (p *pruneParent) rebaseTarget(path string) (string, bool) {
 	return "", false
 }
 
+type obsoleteRebasePlan struct {
+	rebases  []pruneRebase
+	deletes  []pruneLocation
+	unmapped int64
+}
+
 // planObsoleteRebases splits absent rows into rebases (the archive still exists
 // elsewhere), deletions (no live copy of the archive), and rows preserved
 // because the archive is live but the old prefix cannot be mapped onto it.
 func (db *DB) planObsoleteRebases(
 	ctx context.Context, victims []pruneLocation, c *pruneChecker, fresh bool,
-) (rebases []pruneRebase, deletes []pruneLocation, unmapped int64, err error) {
+) (obsoleteRebasePlan, error) {
+	var plan obsoleteRebasePlan
 	for _, l := range victims {
 		if l.Parent == "" || !Rel(l.Rel).IsContainment() || !strings.Contains(l.Path, "!!") {
-			deletes = append(deletes, l)
+			plan.deletes = append(plan.deletes, l)
 			continue
 		}
 		parent, err := db.pruneParentInfo(ctx, l.Parent, c, fresh)
 		if err != nil {
-			return nil, nil, 0, err
+			return obsoleteRebasePlan{}, err
 		}
 		if parent.live == "" {
-			deletes = append(deletes, l)
+			plan.deletes = append(plan.deletes, l)
 			continue
 		}
 		target, ok := parent.rebaseTarget(l.Path)
 		if !ok {
-			unmapped++
+			plan.unmapped++
 			continue
 		}
-		rebases = append(rebases, pruneRebase{loc: l, newPath: target})
+		plan.rebases = append(plan.rebases, pruneRebase{loc: l, newPath: target})
 	}
-	return rebases, deletes, unmapped, nil
+	return plan, nil
 }
 
 // rebasePruneLocations moves member rows onto their archive's live path in one

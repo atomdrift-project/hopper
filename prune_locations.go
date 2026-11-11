@@ -17,10 +17,13 @@ const pruneInFileSQL = `parent_sha256 <> '' AND rel IN ` + containmentRelsSQL + 
 
 // LocationPruneOptions describes one resumable pass. DryRun performs only reads.
 type LocationPruneOptions struct {
-	Progress        func(LocationPruneStats) error
-	DataRoot        string
-	Phase           string // obsolete or cap
-	AfterSHA        string
+	Progress func(LocationPruneStats) error
+	DataRoot string
+	Phase    string // obsolete or cap
+	AfterSHA string
+	// CapLabels limits which labels the cap phase trims; empty means good and
+	// unknown. Retention limits and admission markers are unaffected.
+	CapLabels       []string
 	AfterID         int64
 	ThroughID       int64 // zero captures the current maximum ID
 	Limit           int64 // obsolete rows inspected; zero is unlimited
@@ -34,10 +37,7 @@ type LocationPruneOptions struct {
 	// absent share, or the pass's cumulative absent share, exceeds it. Zero
 	// selects DefaultMaxObsoleteFraction; 1 or more disables the cap.
 	MaxObsoleteFraction float64
-	// CapLabels limits which labels the cap phase trims; empty means good and
-	// unknown. Retention limits and admission markers are unaffected.
-	CapLabels []string
-	DryRun    bool
+	DryRun              bool
 }
 
 // DefaultMaxObsoleteFraction matches the legacy prune safety cap: a wrong data
@@ -293,7 +293,7 @@ func (db *DB) pruneObsoleteLocations(ctx context.Context, opts LocationPruneOpti
 		}
 		if len(batch) == 0 {
 			stats.Complete = true
-			return reportLocationPrune(opts, *stats)
+			return reportLocationPrune(opts, stats)
 		}
 		var victims []pruneLocation
 		for _, l := range batch {
@@ -306,65 +306,69 @@ func (db *DB) pruneObsoleteLocations(ctx context.Context, opts LocationPruneOpti
 			}
 		}
 		if !opts.DryRun {
-			// Refresh negative checks once per outer path before mutating the catalog.
-			fresh := map[string]prunePresence{}
-			live := victims[:0]
-			for _, l := range victims {
-				outer, _, _ := strings.Cut(l.Path, "!!")
-				state, ok := fresh[outer]
-				if !ok {
-					state = c.check(l.Path, true)
-					fresh[outer] = state
-				}
-				if state == pruneAbsent {
-					live = append(live, l)
-				}
-			}
-			victims = live
+			victims = refreshPruneVictims(victims, c)
 		}
 		// Rebases are not losses: only rows with no live archive count toward the
 		// safety cap and the obsolete total.
-		rebases, deletes, unmapped, err := db.planObsoleteRebases(ctx, victims, c, !opts.DryRun)
+		plan, err := db.planObsoleteRebases(ctx, victims, c, !opts.DryRun)
 		if err != nil {
 			return err
 		}
-		stats.Unmapped += unmapped
-		safety := checkObsoleteSafety(opts, stats, len(deletes), len(batch))
+		stats.Unmapped += plan.unmapped
+		safety := checkObsoleteSafety(opts, stats, len(plan.deletes), len(batch))
 		if opts.DryRun {
 			// Preview reports every batch an apply would refuse instead of stopping.
 			if errors.As(safety, new(*PruneSafetyExceeded)) {
 				stats.SafetyTrips++
 			}
-			stats.Rebased += int64(len(rebases))
+			stats.Rebased += int64(len(plan.rebases))
 		} else {
 			if safety != nil {
 				return safety
 			}
-			moved, err := db.rebasePruneLocations(ctx, rebases)
+			moved, err := db.rebasePruneLocations(ctx, plan.rebases)
 			if err != nil {
 				return err
 			}
 			stats.Rebased += moved
-			n, protected, err := db.deletePruneLocations(ctx, deletes, false, nil, c, opts)
+			n, protected, err := db.deletePruneLocations(ctx, plan.deletes, false, nil, c, opts)
 			if err != nil {
 				return err
 			}
 			stats.Deleted += n
 			stats.Protected += protected
 		}
-		stats.Obsolete += int64(len(deletes))
+		stats.Obsolete += int64(len(plan.deletes))
 		stats.Scanned += int64(len(batch))
 		stats.AfterID = batch[len(batch)-1].ID
 		if stats.AfterID >= stats.ThroughID {
 			stats.Complete = true
 		}
-		if err := reportLocationPrune(opts, *stats); err != nil {
+		if err := reportLocationPrune(opts, stats); err != nil {
 			return err
 		}
 		if stats.Complete {
 			return nil
 		}
 	}
+}
+
+// refreshPruneVictims rechecks each absent outer path before mutations.
+func refreshPruneVictims(victims []pruneLocation, c *pruneChecker) []pruneLocation {
+	fresh := map[string]prunePresence{}
+	live := victims[:0]
+	for _, l := range victims {
+		outer, _, _ := strings.Cut(l.Path, "!!")
+		state, ok := fresh[outer]
+		if !ok {
+			state = c.check(l.Path, true)
+			fresh[outer] = state
+		}
+		if state == pruneAbsent {
+			live = append(live, l)
+		}
+	}
+	return live
 }
 
 // checkObsoleteSafety refuses a batch when its own absent share, or the pass's
@@ -395,9 +399,9 @@ func capLabelSelected(label string, opts LocationPruneOptions) bool {
 	return len(opts.CapLabels) == 0 || slices.Contains(opts.CapLabels, label)
 }
 
-func reportLocationPrune(opts LocationPruneOptions, stats LocationPruneStats) error {
+func reportLocationPrune(opts LocationPruneOptions, stats *LocationPruneStats) error {
 	if opts.Progress != nil {
-		return opts.Progress(stats)
+		return opts.Progress(*stats)
 	}
 	return nil
 }

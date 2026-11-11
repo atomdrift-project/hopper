@@ -41,7 +41,7 @@ func (db *DB) pruneCappedLocations(ctx context.Context, opts LocationPruneOption
 		}
 		if len(shas) == 0 {
 			stats.Complete = true
-			return reportLocationPrune(opts, *stats)
+			return reportLocationPrune(opts, stats)
 		}
 		for _, sha := range shas {
 			sample, err := db.pruneCurrentLabel(ctx, sha)
@@ -57,7 +57,7 @@ func (db *DB) pruneCappedLocations(ctx context.Context, opts LocationPruneOption
 			if limit == 0 {
 				stats.OverfullSHAs++
 				stats.AfterSHA = sha
-				if err := reportLocationPrune(opts, *stats); err != nil {
+				if err := reportLocationPrune(opts, stats); err != nil {
 					return err
 				}
 				continue
@@ -82,31 +82,41 @@ func (db *DB) pruneCappedLocations(ctx context.Context, opts LocationPruneOption
 				stats.ArchiveEdgesRemoved += max(int64(0), plan.archives-int64(limit))
 				stats.Excess += plan.locations - int64(limit)
 				if !opts.DryRun {
-					if err := db.applyMemberCap(ctx, sha, plan.keep, shaOpts, stats, c); err != nil {
-						return err
-					}
-					if err := db.updateLocationCapMarker(ctx, pruneArchiveGroup{SHA: sha}, opts); err != nil {
+					if err := db.applyAndMarkMemberCap(ctx, sha, plan.keep, shaOpts, opts, stats, c); err != nil {
 						return err
 					}
 				}
 				stats.CappedSHAs++
-				detail := locationLabelStats(stats.Labels, sample.Label)
-				detail.AffectedSHAs++
-				detail.Rows += plan.locations
-				detail.MemberLocations += plan.locations
-				detail.EligibleLocations += plan.locations
-				detail.PhysicalLocations += physical
-				detail.Excess += plan.locations - int64(limit)
-				detail.ArchivesSeen += plan.archives
-				detail.ArchiveEdgesRemoved += max(int64(0), plan.archives-int64(limit))
+				recordCappedLocationStats(stats, sample.Label, plan, limit, physical)
 			}
 			stats.OverfullSHAs++
 			stats.AfterSHA = sha
-			if err := reportLocationPrune(opts, *stats); err != nil {
+			if err := reportLocationPrune(opts, stats); err != nil {
 				return err
 			}
 		}
 	}
+}
+
+func (db *DB) applyAndMarkMemberCap(
+	ctx context.Context, sha string, keep []pruneLocation, shaOpts, opts LocationPruneOptions, stats *LocationPruneStats, c *pruneChecker,
+) error {
+	if err := db.applyMemberCap(ctx, sha, keep, shaOpts, stats, c); err != nil {
+		return err
+	}
+	return db.updateLocationCapMarker(ctx, pruneArchiveGroup{SHA: sha}, opts)
+}
+
+func recordCappedLocationStats(stats *LocationPruneStats, label string, plan memberCapPlan, limit int, physical int64) {
+	detail := locationLabelStats(stats.Labels, label)
+	detail.AffectedSHAs++
+	detail.Rows += plan.locations
+	detail.MemberLocations += plan.locations
+	detail.EligibleLocations += plan.locations
+	detail.PhysicalLocations += physical
+	detail.Excess += plan.locations - int64(limit)
+	detail.ArchivesSeen += plan.archives
+	detail.ArchiveEdgesRemoved += max(int64(0), plan.archives-int64(limit))
 }
 
 // pruneCapFloor is the smallest allowance among the labels this pass trims;
@@ -211,7 +221,7 @@ func (db *DB) planMemberCap(ctx context.Context, sha string, opts LocationPruneO
 			plan.locations++
 			stats.Scanned++
 			if stats.Scanned%int64(opts.Batch) == 0 {
-				if err := reportLocationPrune(opts, *stats); err != nil {
+				if err := reportLocationPrune(opts, stats); err != nil {
 					return err
 				}
 			}
@@ -431,7 +441,7 @@ func (db *DB) trimPruneArchive(
 			stats.Protected += p
 		}
 		before = page[len(page)-1].ID - 1
-		if err := reportLocationPrune(opts, *stats); err != nil {
+		if err := reportLocationPrune(opts, stats); err != nil {
 			return err
 		}
 	}

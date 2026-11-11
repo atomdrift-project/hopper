@@ -450,14 +450,12 @@ func (s *apiServer) relocateTriaged(ctx context.Context, verdict triageVerdict, 
 		return res
 	}
 
-	if plan.label != "" {
-		newRel, err := s.disambiguateDest(plan.newRel, sha)
-		if err != nil {
-			res.Status, res.Error = "error", err.Error()
-			return res
-		}
-		plan.newRel, res.NewPath = newRel, newRel
+	newRel, err := s.disambiguateDest(plan.newRel, sha)
+	if err != nil {
+		res.Status, res.Error = "error", err.Error()
+		return res
 	}
+	plan.newRel, res.NewPath = newRel, newRel
 
 	oldAbs, err := s.resolveDataPath(oldRel)
 	if err != nil {
@@ -544,12 +542,11 @@ func (s *apiServer) relocateTriaged(ctx context.Context, verdict triageVerdict, 
 	return res
 }
 
-// disambiguateDest finalizes a classification destination against what is
-// already on disk. Classification destinations may already contain a different
-// package build with the same human-readable path; preserve both by suffixing
-// the basename with a deterministic SHA prefix. Workflow moves preserve the
-// exact path and treat a conflict as an invariant violation, so they never
-// come through here.
+// disambiguateDest finalizes a destination against what is already on disk.
+// Every pool, including pending and review, may already contain a different
+// package build with the same human-readable path. Preserve both by suffixing
+// the basename with a deterministic SHA prefix, independently of whether the
+// move also changes the sample's classification.
 func (s *apiServer) disambiguateDest(newRel, sha string) (string, error) {
 	newAbs, err := s.resolveDataPath(newRel)
 	if err != nil {

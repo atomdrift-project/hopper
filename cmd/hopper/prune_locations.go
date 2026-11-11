@@ -18,11 +18,11 @@ import (
 
 type locationPruneCheckpoint struct {
 	Root            string
+	CapLabels       string
 	Stats           hopper.LocationPruneStats
 	MaxPaths        int
 	GoodMaxPaths    int
 	UnknownMaxPaths int
-	CapLabels       string
 	PreviewRows     int64
 	Version         int
 	DryRun          bool

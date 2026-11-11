@@ -16,22 +16,8 @@ func (db *DB) deletePruneLocations(
 		return 0, 0, nil
 	}
 	err = db.locationTransaction(ctx, func(tx locationSQLTx) error {
-		samples := map[string]pruneSample{}
-		// Lock content rows before deleting locations. Every primary-path repair is
-		// conditional on the exact row actually removed, never an old client snapshot.
-		query := `SELECT sha256,path,parent,skip,label,label_source FROM samples
-   WHERE sha256 IN (SELECT sha256 FROM sample_locations WHERE id IN (` + pruneIDList(observed) + `))
-   ORDER BY sha256 FOR UPDATE`
-		if err := tx.query(query, nil, func(rows locationRows) error {
-			for rows.Next() {
-				var s pruneSample
-				if err := rows.Scan(&s.SHA, &s.Path, &s.Parent, &s.Skip, &s.Label, &s.Source); err != nil {
-					return err
-				}
-				samples[s.SHA] = s
-			}
-			return rows.Err()
-		}); err != nil {
+		samples, err := pruneLockSamples(tx, observed)
+		if err != nil {
 			return err
 		}
 		eligible := make([]pruneLocation, 0, len(observed))
@@ -102,6 +88,28 @@ func (db *DB) deletePruneLocations(
 		db.forgetSHA(l.SHA)
 	}
 	return deleted, protected, nil
+}
+
+func pruneLockSamples(tx locationSQLTx, observed []pruneLocation) (map[string]pruneSample, error) {
+	samples := map[string]pruneSample{}
+	// Lock content rows before deleting locations. Every primary-path repair is
+	// conditional on the exact row actually removed, never an old client snapshot.
+	query := `SELECT sha256,path,parent,skip,label,label_source FROM samples
+   WHERE sha256 IN (SELECT sha256 FROM sample_locations WHERE id IN (` + pruneIDList(observed) + `))
+   ORDER BY sha256 FOR UPDATE`
+	if err := tx.query(query, nil, func(rows locationRows) error {
+		for rows.Next() {
+			var s pruneSample
+			if err := rows.Scan(&s.SHA, &s.Path, &s.Parent, &s.Skip, &s.Label, &s.Source); err != nil {
+				return err
+			}
+			samples[s.SHA] = s
+		}
+		return rows.Err()
+	}); err != nil {
+		return nil, err
+	}
+	return samples, nil
 }
 
 func (db *DB) deletePruneRows(tx locationSQLTx, rows []pruneLocation, capMode bool) ([]pruneLocation, error) {
