@@ -27,6 +27,24 @@ const meterName = "github.com/atomdrift-project/hopper"
 // timeout.
 const metricsCollectTimeout = 8 * time.Second
 
+// Keep failures visible until a successful walk of the same kind and directory.
+// An incremental walk cannot repair a failed full walk.
+var enumerationHealth = struct {
+	failed map[enumerationKey]bool
+	mu     sync.RWMutex
+}{failed: make(map[enumerationKey]bool)}
+
+type enumerationKey struct {
+	dir  string
+	full bool
+}
+
+func setEnumerationHealth(dir string, full, healthy bool) {
+	enumerationHealth.mu.Lock()
+	defer enumerationHealth.mu.Unlock()
+	enumerationHealth.failed[enumerationKey{dir, full}] = !healthy
+}
+
 // instruments holds the observable handles enableMetrics creates and observe
 // records into. Grouping them lets the registration read as a flat manifest and
 // keeps the callback's parameter list to one pointer.
@@ -40,6 +58,7 @@ type instruments struct {
 	analysisRate, filesRate                                      metric.Float64Observable
 	addedAge, analyzedAge, readyLag                              metric.Float64Observable
 	walked, inserted, cacheHits, filtered, errors                metric.Int64Observable
+	enumerationFailed                                            metric.Int64Observable
 	insertFails                                                  metric.Int64Observable
 	wLastSeen, wLoad, wFilesRate                                 metric.Float64Observable
 	wActive, wSlots, wQueue, wRSS                                metric.Int64Observable
@@ -418,7 +437,9 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 		readyLag:    fgauge("hopper.workflow.ready_lag", "Seconds between the newest added sample and the newest prism-ready sample.", "s"),
 
 		// Walk / ingest. Process-lifetime counters; reset to zero on restart.
-		walked:    counter("hopper.walk.files", "Files enumerated by the filesystem walk this process lifetime.", "{file}"),
+		walked: counter("hopper.walk.files", "Files enumerated by the filesystem walk this process lifetime.", "{file}"),
+		enumerationFailed: gauge("hopper.walk.enumeration_failed",
+			"Whether the latest completed enumeration failed, by directory and walk kind.", ""),
 		inserted:  counter("hopper.walk.inserted", "New samples inserted this process lifetime.", "{sample}"),
 		cacheHits: counter("hopper.walk.cache_hits", "Walked files already known (hash cache hits) this process lifetime.", "{file}"),
 		filtered:  counter("hopper.walk.filtered", "Walked files skipped for being too small or too large this process lifetime.", "{file}"),
@@ -506,6 +527,19 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 	}
 
 	_, err := meter.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
+		enumerationHealth.mu.RLock()
+		for key, failed := range enumerationHealth.failed {
+			var value int64
+			if failed {
+				value = 1
+			}
+			kind := "incremental"
+			if key.full {
+				kind = "full"
+			}
+			o.ObserveInt64(in.enumerationFailed, value, metric.WithAttributes(attribute.String("dir", key.dir), attribute.String("kind", kind)))
+		}
+		enumerationHealth.mu.RUnlock()
 		wd.observe(ctx, o, &in)
 		return nil
 	}, all...)

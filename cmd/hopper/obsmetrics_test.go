@@ -97,6 +97,55 @@ func TestRegisterMetrics(t *testing.T) {
 	}
 }
 
+func TestEnumerationFailureMetric(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	exporter, err := otelprom.New(otelprom.WithRegisterer(reg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(exporter))
+	t.Cleanup(func() {
+		if err := provider.Shutdown(context.Background()); err != nil {
+			t.Logf("meter provider shutdown: %v", err)
+		}
+	})
+	if err := (&webDashboard{}).registerMetrics(provider.Meter(meterName)); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	t.Cleanup(func() {
+		enumerationHealth.mu.Lock()
+		delete(enumerationHealth.failed, enumerationKey{dir, true})
+		delete(enumerationHealth.failed, enumerationKey{dir, false})
+		enumerationHealth.mu.Unlock()
+	})
+	original := pathLister
+	t.Cleanup(func() { pathLister = original })
+	pathLister = func(context.Context, string, time.Time, func(labeledPath) bool) error { return errors.New("failed") }
+	stream := startEnumeration(t.Context(), dir, time.Time{})
+	if err := <-stream.done; err == nil {
+		t.Fatal("expected enumeration failure")
+	}
+	setEnumerationHealth(dir, false, true)
+	scrape := func() string {
+		r := httptest.NewRecorder()
+		promhttp.HandlerFor(reg, promhttp.HandlerOpts{}).ServeHTTP(r, httptest.NewRequest(http.MethodGet, "/metrics", http.NoBody))
+		return r.Body.String()
+	}
+	full := `hopper_walk_enumeration_failed{dir="` + dir + `",kind="full",`
+	if body := scrape(); !strings.Contains(metricLines(body, full), "} 1") {
+		t.Fatalf("missing failed full walk: %s", body)
+	}
+	pathLister = func(context.Context, string, time.Time, func(labeledPath) bool) error { return nil }
+	stream = startEnumeration(t.Context(), dir, time.Time{})
+	if err := <-stream.done; err != nil {
+		t.Fatal(err)
+	}
+	if body := scrape(); !strings.Contains(metricLines(body, full), "} 0") {
+		t.Fatalf("missing recovered full walk: %s", body)
+	}
+}
+
 // TestClassifyInsertFailure pins the SQLSTATE-to-cause mapping the insert
 // failure metric depends on. Lock contention (55P03 / SQLite "database is
 // locked") is the case the 2026-06-14 silent ingestion outage hinged on, so it

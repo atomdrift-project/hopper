@@ -2050,8 +2050,9 @@ const (
 	reconcileWalkInterval = 24 * time.Hour
 )
 
-// maxFileSize is the per-file byte cap applied during enumeration, hashing,
-// and analysis. Overridable via the load command's --max-file-size flag.
+// maxFileSize is the per-file byte cap applied during hashing and analysis.
+// Cleave applies its own ceiling during enumeration. Overridable via the load
+// command's --max-file-size flag.
 var maxFileSize int64 = defaultMaxFileSize
 
 // requiredReconcileMounts is populated by cmdLoad after --data is resolved.
@@ -3354,6 +3355,9 @@ func startEnumeration(ctx context.Context, dir string, newerThan time.Time) enum
 				return false
 			}
 		})
+		if ctx.Err() == nil {
+			setEnumerationHealth(dir, newerThan.IsZero(), err == nil)
+		}
 		if err != nil {
 			slog.Warn("list files failed", "dir", dir, "error", err)
 		}
@@ -3381,13 +3385,9 @@ var cleaveBinary = "cleave"
 // Cleave's stderr is captured to a buffer and only shown on failure so the
 // startup banner doesn't clutter every successful run.
 func streamCleaveIterFiles(ctx context.Context, dir string, newerThan time.Time, emit func(labeledPath) bool) error {
-	// Hopper's max file size is in bytes; cleave's --max-file-size is in
-	// megabytes and is a top-level flag that must precede the subcommand.
-	args := make([]string, 0, 6)
-	if mb := maxFileSize / (1024 * 1024); mb > 0 {
-		args = append(args, "--max-file-size", strconv.FormatInt(mb, 10))
-	}
-	args = append(args, "iter-files", dir)
+	// Cleave uses its own directory-scan ceiling; hopper enforces its
+	// configured limit when hashing each emitted file.
+	args := []string{"iter-files", dir}
 	// Incremental walk: let cleave skip files older than the cutoff by their
 	// mtime, before it reads each file's magic bytes (the costly step on a cold
 	// cache). --newer-than takes Unix seconds; requires a cleave that supports

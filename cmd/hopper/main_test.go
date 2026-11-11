@@ -1439,6 +1439,27 @@ func TestLoadSkipsReconcileAfterEnumerationFailure(t *testing.T) {
 	}
 }
 
+func TestCleaveEnumerationArguments(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "cleave")
+	// Reject any unexpected flag, just as the real CLI does.
+	script := "#!/bin/sh\n[ \"$1\" = iter-files ] && [ \"$2\" = \"$EXPECTED_DIR\" ] && [ \"$3\" = --newer-than ] && [ \"$4\" = 123 ] && [ $# = 4 ] || exit 2\nprintf '%s\\n' '{\"path\":\"sample\",\"type\":\"elf\"}'\n"
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("EXPECTED_DIR", dir)
+	old := cleaveBinary
+	cleaveBinary = binary
+	t.Cleanup(func() { cleaveBinary = old })
+	var paths []string
+	if err := streamCleaveIterFiles(t.Context(), dir, time.Unix(123, 0), func(p labeledPath) bool { paths = append(paths, p.path); return true }); err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 || paths[0] != "sample" {
+		t.Fatalf("paths = %v", paths)
+	}
+}
+
 func TestValidateRequiredMountsFailsClosed(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Mkdir(filepath.Join(root, "incoming"), 0o755); err != nil {

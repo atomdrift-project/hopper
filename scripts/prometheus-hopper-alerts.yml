@@ -37,6 +37,8 @@
 #   Walk / ingest (per-process counters):
 #     hopper_walk_files_total, hopper_walk_inserted_total,
 #     hopper_walk_cache_hits_total, hopper_walk_filtered_total, hopper_errors_total
+#   hopper_walk_enumeration_failed{dir,kind} is 1 until the same directory and
+#     walk kind completes successfully; full and incremental walks are separate.
 #   Insert failures by cause (per-process counter, subset of hopper_errors_total):
 #     hopper_insert_failures_total{cause="lock_timeout"|"statement_timeout"|
 #       "serialization"|"deadlock"|"constraint"|"data"|"connection"|"context"|"other"}
@@ -69,6 +71,20 @@
 #     http_client_request_duration_seconds_* (labeled by http_route, status)
 
 groups:
+  - name: hopper-enumeration
+    rules:
+      - alert: HopperEnumerationFailed
+        expr: hopper_walk_enumeration_failed{job="hopper"} == 1
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Hopper {{ $labels.kind }} enumeration failed for {{ $labels.dir }}"
+          description: >-
+            The latest completed enumeration failed; ingestion may be incomplete and reconciliation is disabled for that pass.
+            Check hopper logs for list files failed or cleave iter-files errors.
+            The alert clears after a successful walk of the same kind and directory.
+
   - name: hopper-liveness
     rules:
       # The process is up but the in-process scan (litmus) worker is down —
