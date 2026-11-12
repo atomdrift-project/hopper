@@ -12,7 +12,7 @@ import (
 
 func TestLocationPruneCheckpoint(t *testing.T) {
 	saved := locationPruneCheckpoint{
-		Root: t.TempDir(), MaxPaths: 0, GoodMaxPaths: 256, UnknownMaxPaths: 512, DryRun: true, Version: locationPruneCheckpointVersion, CapLabels: "good,unknown",
+		Root: t.TempDir(), DryRun: true, Version: locationPruneCheckpointVersion,
 		Stats: hopper.LocationPruneStats{Phase: "obsolete", AfterID: 20, ThroughID: 100},
 	}
 	name := filepath.Join(t.TempDir(), "checkpoint.json")
@@ -27,27 +27,23 @@ func TestLocationPruneCheckpoint(t *testing.T) {
 	if err := json.Unmarshal(data, &read); err != nil || !reflect.DeepEqual(read, saved) {
 		t.Fatalf("checkpoint: %+v, %v", read, err)
 	}
-	for _, tc := range []struct {
-		name, phase string
-		complete    bool
-		want        []string
-	}{
-		{"obsolete-incomplete", "obsolete", false, []string{"obsolete", "cap"}},
-		{"obsolete-complete", "obsolete", true, []string{"cap"}},
-		{"cap-incomplete", "cap", false, []string{"cap"}},
-		{"cap-complete", "cap", true, nil},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			saved.Stats.Phase, saved.Stats.Complete = tc.phase, tc.complete
-			opts := hopper.LocationPruneOptions{DataRoot: saved.Root, MaxPaths: saved.MaxPaths, GoodMaxPaths: saved.GoodMaxPaths, UnknownMaxPaths: saved.UnknownMaxPaths, CapLabels: []string{"good", "unknown"}, DryRun: true}
-			got, err := resumeLocationPrune("all", &saved, &opts)
-			if err != nil || !reflect.DeepEqual(got, tc.want) || opts.ThroughID != 100 || opts.AfterID != 20 {
-				t.Fatalf("resume: %v %+v %v", got, opts, err)
-			}
-			opts.DryRun = false
-			if _, err := resumeLocationPrune("all", &saved, &opts); err == nil {
-				t.Fatal("preview checkpoint accepted for applying")
-			}
-		})
+	for _, complete := range []bool{false, true} {
+		saved.Stats.Complete = complete
+		opts := hopper.LocationPruneOptions{DataRoot: saved.Root, DryRun: true}
+		got, err := resumeLocationPrune(&saved, &opts)
+		if err != nil || got != complete || opts.ThroughID != 100 || opts.AfterID != 20 {
+			t.Fatalf("resume: %v %+v %v", got, opts, err)
+		}
+		opts.DryRun = false
+		if _, err := resumeLocationPrune(&saved, &opts); err == nil {
+			t.Fatal("preview checkpoint accepted for applying")
+		}
+	}
+	for _, version := range []int{5, 6} {
+		saved.Version = version
+		opts := hopper.LocationPruneOptions{DataRoot: saved.Root, DryRun: true}
+		if _, err := resumeLocationPrune(&saved, &opts); err == nil {
+			t.Fatal("old policy checkpoint accepted")
+		}
 	}
 }

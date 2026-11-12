@@ -688,6 +688,7 @@ func testSHA256(content []byte) string {
 
 func callTriage(t *testing.T, api *apiServer, req triageRequest) triageResponse {
 	t.Helper()
+	api.ready.Store(true)
 	body, err := json.Marshal(req)
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
@@ -949,5 +950,103 @@ func TestScanSupportsSidecarsReadsTheScanHelp(t *testing.T) {
 	}
 	if scanSupportsSidecars(ctx, filepath.Join(dir, "missing")) {
 		t.Fatal("an unrunnable scan must be treated as an older build")
+	}
+}
+
+func TestTriageStartingIsRetryable(t *testing.T) {
+	for _, api := range []*apiServer{{}, {dataRoot: t.TempDir()}} {
+		rec := httptest.NewRecorder()
+		api.handleTriage(rec, httptest.NewRequest(http.MethodPost, "/api/triage", strings.NewReader(`{"verdicts":[]}`)))
+		if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
+			t.Fatalf("startup response = %d, headers=%v, body=%s", rec.Code, rec.Header(), rec.Body.String())
+		}
+	}
+}
+
+func TestTriageLongDestReservesSidecarSpace(t *testing.T) {
+	api := &apiServer{dataRoot: t.TempDir()}
+	for _, name := range []string{strings.Repeat("a", 250), strings.Repeat("\u754c", 80) + ".tgz"} {
+		sha := strings.Repeat("b", 64)
+		rel, err := api.disambiguateDest("sighted/"+name, sha)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(filepath.Base(rel))+len(hopper.ProvenanceSidecarSuffix)+13 > 255 {
+			t.Fatalf("too long: %s", rel)
+		}
+		if !strings.Contains(rel, sha[:12]) {
+			t.Fatalf("missing digest qualifier: %s", rel)
+		}
+		if strings.HasSuffix(name, ".tgz") && !strings.HasSuffix(rel, ".tgz") {
+			t.Fatalf("extension lost: %s", rel)
+		}
+	}
+}
+
+func TestTriageAbsentReconcilesOnlyAuthoritativeStorage(t *testing.T) {
+	for _, kind := range []string{"missing", "partial mirror", "mount missing", "dry run"} {
+		t.Run(kind, func(t *testing.T) {
+			root := t.TempDir()
+			db := mustOpenDB(t, t.Context(), filepath.Join(root, "db.sqlite"))
+			defer db.Close()
+			if err := db.Migrate(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			sha := testSHA256([]byte("gone"))
+			if err := db.InsertSample(t.Context(), &hopper.Sample{SHA256: sha, Path: "incoming/forager/gone.tgz", Label: "unknown"}); err != nil {
+				t.Fatal(err)
+			}
+			api := &apiServer{db: db, dataRoot: root, allowedDirs: []string{root}, datasetIncomplete: kind == "partial mirror"}
+			if kind == "mount missing" {
+				api.requiredMounts = []string{"pending"}
+			}
+			dry := kind == "dry run"
+			res := callTriage(t, api, triageRequest{Verdicts: []triageVerdict{{SHA256: sha, Ruling: "sighted"}}, DryRun: dry})
+			if res.Absent != 1 {
+				t.Fatalf("response = %+v", res)
+			}
+			sample, err := db.SampleBySHA256(t.Context(), sha)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (sample.Skip == "missing") != (kind == "missing") {
+				t.Fatalf("skip=%q", sample.Skip)
+			}
+		})
+	}
+}
+
+func TestTriageMovesLegacyLongArtifact(t *testing.T) {
+	ctx := t.Context()
+	root := t.TempDir()
+	db := mustOpenDB(t, ctx, filepath.Join(root, "db.sqlite"))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("long-named legacy content")
+	sha := testSHA256(content)
+	old := "incoming/forager/" + strings.Repeat("x", 250)
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(root, old)), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, old), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertSample(ctx, &hopper.Sample{SHA256: sha, Path: old, Label: "unknown"}); err != nil {
+		t.Fatal(err)
+	}
+	api := &apiServer{db: db, dataRoot: root, allowedDirs: []string{root}}
+	res := callTriage(t, api, triageRequest{Verdicts: []triageVerdict{{SHA256: sha, Ruling: "sighted"}}})
+	if res.Moved != 1 || res.Failed != 0 {
+		t.Fatalf("response = %+v", res)
+	}
+	sample, err := db.SampleBySHA256(ctx, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, sample.Path))
+	if err != nil || !bytes.Equal(got, content) || sample.Label != "sighted" {
+		t.Fatalf("sample=%+v, content=%q, error=%v", sample, got, err)
 	}
 }

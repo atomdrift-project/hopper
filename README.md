@@ -286,105 +286,65 @@ route index even though the covering index exists.
 
 ## Pruning recorded locations
 
-Run on the host holding the sample tree. The default is a read-only preview;
-`--apply` is required to delete catalog rows.
+Run on the host holding the fully mounted sample tree. The default is a read-only
+preview; `--apply` is required to modify catalog rows.
 
 ```sh
-hopper prune-locations --data /data/samples --dry-run --limit-shas 10 --phase cap
-hopper prune-locations --data /data/samples --dry-run --limit 10000 --phase obsolete
-hopper prune-locations --data /data/samples --phase cap --checkpoint cap.json --apply
-hopper prune-locations --data /data/samples --phase cap --checkpoint cap.json --apply --resume
+hopper prune-locations --data /data/samples --dry-run --limit 10000
+hopper prune-locations --data /data/samples --checkpoint prune.json --apply
+hopper prune-locations --data /data/samples --checkpoint prune.json --apply --resume
 ```
 
-The cap retains at most **256 archive-member locations per good SHA256** and
-**512 per unknown SHA256**, across all archives. Other labels, including bad and
-sighted, are exempt. Conflicted samples are also exempt. Every physical location
-remains in `sample_locations` and does not count against either allowance.
-Reference edges are outside the cap. `--good-max-paths` and `--unknown-max-paths`
-set these limits; `--max-paths` optionally overrides both capped labels.
+Pruning has no per-SHA, label, archive or member occurrence caps. Valid
+observations are retained regardless of their number. Ingestion records new
+observations even if old `location-member-cap/` markers remain in the key/value
+table; those markers have no effect in the updated binaries. Removed cap flags
+and `--phase cap`/`--phase all` are rejected. `--phase obsolete` remains accepted.
+Deploy the updated ingestion binaries everywhere to stop old admission policies.
 
-Retention favors the current primary occurrence and one occurrence per distinct
-parent archive before filling spare slots with the oldest `first_seen_at`,
-breaking ties by row ID. The cap needs no filesystem stats, archive reads or
-sample hashing. Labels are rechecked while the sample row is locked before
-capped deletions. A move to an exempt label or a higher allowance protects the
-remaining rows from the old plan. Admission markers include the sample ID and
-label, so a stale marker cannot block observations after a label change.
-
-A bounded row simulation can be run with:
-
-```sh
-hopper prune-locations --data /data/samples --phase cap --dry-run --limit-rows 100000
-```
-
-This selects up to 100,000 location rows in ID order, starting after `--after-id`,
-and evaluates the same label and retention rules within that window. Its counts
-are window-scoped, not whole-database projections; occurrences outside the window
-do not consume its allowances. It uses one SELECT for a consistent snapshot,
-reports counts by label, and does not fetch sample contents. `--limit-rows` is
-available only for a cap-only preview, and cannot be used with `--apply`.
-
-Preview output reports removable location rows, physical rows retained, and
-`archive_edges_removed`: archive/member relationships for which no location
-would remain. One removed occurrence need not remove an archive relationship if
-another occurrence remains there. The current member listings, bad-member
-checks, label cascades and parent rescan targeting use `sample_locations`, so
-those relationships disappear from those readers if the cap is applied. Stored
-archive reports retain their member references, within their existing report
-limits; membership readers need migration if complete coverage is required.
-
-Apply coordinates each parent archive's deletion batches with its move lock,
-re-selecting allocated occurrences under that lock and skipping busy archives.
-Skipped archives and concurrent arrivals may leave more than 512 locations until
-a later fresh sweep. Preview takes no move locks and writes no catalog rows.
-
-The separate obsolete pass removes rows whose outer file is absent. It checks
+Cleanup removes redundant observations whose outer file is proven absent. It
+preserves a child's final parent relationship, even if its archive is gone; a
+physical copy alone does not replace that traversal edge. It also preserves a
+standalone sample's final observation. These rows count as `protected`. It checks
 only the file before the first `!!`, never archive members. URLs, paths outside
-the data root, and stat errors other than absence are preserved. Use repeatable
-`--require-mount LABEL` flags for required pool mounts; an unavailable pool must
-not be treated as missing files. Independently of those flags, an absent path
-whose top-level pool directory is missing or empty is reported as uncheckable
-(`pool_guarded`) and kept. Before deleting each batch, apply also refuses to
-continue if more than `--max-obsolete-fraction` (default 40%) of that batch, or
-of the pass so far, is absent; fewer than 50 absent rows never trip it. A dry run
-reports such batches as `safety_trips` instead of stopping. `--force` lifts the
-cap after you have confirmed every pool is mounted.
+the data root, and stat errors other than absence are preserved.
 
-An absent archive member is not necessarily gone: if its archive was moved
-without its member rows being rebased, the bytes are still reachable through the
-archive's live copy. When the member's parent SHA has a recorded location whose
-file exists, the obsolete pass rewrites the member row (and the sample's primary
-path, if it pointed there) onto that location instead of deleting it (`rebased`).
-The old prefix is matched against the archive's recorded and retired paths; a
-member whose prefix cannot be matched is kept (`unmapped`). Rebases do not count
-toward the safety cap. Rows removed or rebased for SHAs that contain members are
-recorded in `sample_location_history` with reason `prune`, so their members stay
-mappable on a later run; leaf rows are not copied.
+An absent member path can belong to an archive that moved. When the parent SHA
+has a recorded live copy, cleanup rebases the member and its primary path onto
+that copy. It matches the old prefix against recorded and retired archive paths;
+ambiguous prefixes are kept as `unmapped`. Incomplete parent lookups cannot prove
+absence and are also kept. Rebases preserve parent and relation type. Existing
+destinations only absorb a source when those fields match; conflicts preserve
+the source. `rebase_duplicates` estimates merges into compatible destinations
+that already exist; `rebase_conflicts` reports preserved incompatible targets.
+Other rebases repair paths without reducing the row count.
 
-`--cap-labels good` restricts the cap phase to good samples (the default is
-`good,unknown`). Excluded labels are left untouched, and retention limits and
-admission markers are unchanged, so a later pass can add the other label.
+Use repeatable `--require-mount LABEL` flags for required pool mounts.
+Independently, absent paths under missing or empty pool directories are kept as
+uncheckable (`pool_guarded`). Apply refreshes absence before mutations and
+refuses a batch when more than `--max-obsolete-fraction` (default 40%) of that
+batch or the pass is obsolete, provided there are more than 50 victims. Preview
+reports `safety_trips` instead of stopping. `--force` disables this missing-file
+safety threshold after mount verification; relationship protection still applies.
+This threshold and `--batch`/`--limit` control execution, never retention of valid
+observations. Apply validates and locks source rows and rechecks the surviving
+relationship in each deletion transaction. Preview may overestimate removals
+across batches because it does not delete earlier batches.
 
-**Wait for disk deduplication to finish before
-applying the obsolete pass, including the default combined `--phase all`.** It
-can otherwise discard observations while an archive's member paths are moving.
+**Wait for disk deduplication and archive moves to finish before applying.**
+The obsolete pass does not hold filesystem move locks. It removes no files,
+labels, analysis or samples. Obsolete primary paths are replaced with usable
+retained locations. Without one, the primary keeps a retained relationship's
+path and parent and an empty skip becomes `missing`. Retired paths of SHAs that
+contain members are recorded in `sample_location_history` with reason `prune`
+so later member rebases remain possible. Removed leaf observations are not
+copied into history; metadata unique to obsolete observations is discarded.
 
-Neither phase deletes files, labels, analysis or samples. Obsolete primary paths
-are replaced by usable retained locations; without one their path is cleared and
-an empty skip becomes `missing`. Discarded observations are not copied into
-location history. Markers in the existing key/value table suppress new contained locations for
-capped SHAs; physical discoveries, reference edges, managed moves, exempt labels and updates to existing locations
-remain admitted.
-
-Both passes use existing indexes and bounded memory and transactions. Indexed
-counts skip SHAs below the allowance before reading their paths. Missing
-checks cache outer-file stats. `--batch` controls page size. Checkpoints advance
-after committed batches (after a complete SHA for cap), retaining the initial
+`--batch` bounds pages and transactions; `--limit` bounds rows inspected in this
+invocation. Checkpoints advance after completed batches and retain the initial
 upper location-ID boundary. Newer IDs are deferred. Start recurring sweeps
-without `--resume` so they revisit previously checked paths and busy archives.
-Preview checkpoints cannot be resumed in apply mode, and checkpoints from the
-previous per-file implementation must be replaced. Combined preview estimates
-can overlap and must not be added together.
+without `--resume` to revisit previously checked paths. Preview checkpoints
+cannot be resumed in apply mode. Earlier policy checkpoints must be replaced.
 
 ## Deduplicating local top-level files
 

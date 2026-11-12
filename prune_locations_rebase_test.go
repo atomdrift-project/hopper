@@ -1,6 +1,7 @@
 package hopper
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -52,11 +53,12 @@ func TestPruneLocationsRebaseMovedArchive(t *testing.T) {
 				t.Fatal(err)
 			}
 			before := pruneTestCount(t, db, "sample_locations")
-			opts := pruneTestOptions(root, "obsolete")
+			opts := pruneTestOptions(root)
 			opts.Batch = 2 // archive rows and members land in different batches
 			opts.DryRun = true
 			preview, err := db.PruneLocations(ctx, opts)
-			if err != nil || preview.Rebased != 4 || preview.Obsolete != 3 || preview.Unmapped != 1 {
+			if err != nil || preview.Rebased != 4 || preview.RebaseDuplicates != 1 || preview.RebaseConflicts != 0 ||
+				preview.Obsolete != 1 || preview.Protected != 2 || preview.Unmapped != 1 {
 				t.Fatalf("preview: %+v %v", preview, err)
 			}
 			if pruneTestCount(t, db, "sample_locations") != before {
@@ -66,7 +68,7 @@ func TestPruneLocationsRebaseMovedArchive(t *testing.T) {
 			opts.DryRun = false
 			// A fresh run proves the mapping does not depend on the in-memory cache.
 			stats, err := db.PruneLocations(ctx, opts)
-			if err != nil || stats.Rebased != 4 || stats.Deleted != 3 || stats.Unmapped != 1 {
+			if err != nil || stats.Rebased != 4 || stats.Deleted != 1 || stats.Protected != 2 || stats.Unmapped != 1 {
 				t.Fatalf("apply: %+v %v", stats, err)
 			}
 			for sha, want := range map[string]string{
@@ -87,7 +89,7 @@ func TestPruneLocationsRebaseMovedArchive(t *testing.T) {
 				t.Fatalf("unmapped member removed: %v", paths)
 			}
 			s, err := db.SampleBySHA256(ctx, orphan)
-			if err != nil || s.Skip != "missing" {
+			if err != nil || s.Path != "unknown/harvest/gone.whl!!o.py" || s.Skip != "" {
 				t.Fatalf("member of a vanished archive: %+v %v", s, err)
 			}
 		})
@@ -106,11 +108,41 @@ func TestPruneRebaseTarget(t *testing.T) {
 		{"staging/outer.tgz!!inner.zip!!m.js", "good/live/inner.zip!!m.js"}, // name fallback, innermost boundary
 		{"staging/inner.zip!!deep/x.zip!!m.js", "good/live/inner.zip!!deep/x.zip!!m.js"},
 		{"staging/other.zip!!m.js", ""},
+		{"staging/inner.zip!!deep/inner.zip!!m.js", ""}, // ambiguous filename fallback
 	} {
 		got, ok := p.rebaseTarget(tc.path)
 		if got != tc.want || ok != (tc.want != "") {
 			t.Errorf("%s: %q %v, want %q", tc.path, got, ok, tc.want)
 		}
+	}
+}
+
+func TestPruneTruncatedParentLookupIsNotAbsence(t *testing.T) {
+	for _, backend := range testBackends {
+		t.Run(backend.name, func(t *testing.T) {
+			db := backend.open(t)
+			ctx := t.Context()
+			root := t.TempDir()
+			parent := hexSHA(6500)
+			mustInsert(t, ctx, db, &Sample{SHA256: parent, Path: "good/old.tgz", Label: "good"})
+			locs := make([]*SampleLocation, 0, pruneParentLimit)
+			for i := range pruneParentLimit {
+				locs = append(locs, &SampleLocation{SHA256: parent, Path: fmt.Sprintf("good/missing-%d.tgz", i)})
+			}
+			if err := db.UpsertLocationBatch(ctx, locs); err != nil {
+				t.Fatal(err)
+			}
+			writeDedupeFile(t, root, "good/live.tgz", []byte("live archive"))
+			if err := db.UpsertLocation(ctx, &SampleLocation{SHA256: parent, Path: "good/live.tgz"}); err != nil {
+				t.Fatal(err)
+			}
+			stats := LocationPruneStats{}
+			checker := &pruneChecker{root: root, stats: &stats, cache: map[string]prunePresence{}}
+			plan, err := db.planObsoleteRebases(ctx, []pruneLocation{{SHA: hexSHA(6501), Parent: parent, Path: "good/old.tgz!!m.js"}}, checker, false)
+			if err != nil || len(plan.deletes) != 0 || plan.unmapped != 1 {
+				t.Fatalf("truncated lookup treated as absence: %+v %v", plan, err)
+			}
+		})
 	}
 }
 
@@ -129,7 +161,7 @@ func TestPruneLocationsRebaseAcrossRuns(t *testing.T) {
 				t.Fatal(err)
 			}
 			mustInsert(t, ctx, db, &Sample{SHA256: member, Path: oldArch + "!!m.js", Parent: archive, Label: "good"})
-			opts := pruneTestOptions(root, "obsolete")
+			opts := pruneTestOptions(root)
 			opts.Limit = 1 // first run: only the archive row
 			first, err := db.PruneLocations(ctx, opts)
 			if err != nil || first.Deleted != 1 || first.Rebased != 0 {
@@ -143,44 +175,6 @@ func TestPruneLocationsRebaseAcrossRuns(t *testing.T) {
 			}
 			if paths := pruneTestLocationPaths(t, db, member); !paths[newArch+"!!m.js"] {
 				t.Fatalf("member not rebased: %v", paths)
-			}
-		})
-	}
-}
-
-func TestPruneLocationsCapLabels(t *testing.T) {
-	for _, backend := range testBackends {
-		t.Run(backend.name, func(t *testing.T) {
-			db := backend.open(t)
-			ctx := t.Context()
-			root := t.TempDir()
-			goodArch, unknownArch := hexSHA(1901), hexSHA(1902)
-			goodChild, unknownChild := hexSHA(1903), hexSHA(1904)
-			writeDedupeFile(t, root, "good/g.tgz", []byte("g"))
-			writeDedupeFile(t, root, "good/u.tgz", []byte("u"))
-			mustInsert(t, ctx, db, &Sample{SHA256: goodArch, Path: "good/g.tgz", Label: "good"})
-			mustInsert(t, ctx, db, &Sample{SHA256: unknownArch, Path: "good/u.tgz", Label: "good"})
-			mustInsert(t, ctx, db, &Sample{SHA256: goodChild, Path: "good/g.tgz!!pinned.js", Parent: goodArch, Label: "good"})
-			mustInsert(t, ctx, db, &Sample{SHA256: unknownChild, Path: "good/u.tgz!!pinned.js", Parent: unknownArch, Label: "unknown"})
-			seedPruneOccurrences(t, db, goodChild, goodArch, "good/g.tgz", 20)
-			seedPruneOccurrences(t, db, unknownChild, unknownArch, "good/u.tgz", 20)
-			opts := LocationPruneOptions{DataRoot: root, Phase: "cap", Batch: 100, GoodMaxPaths: 5, UnknownMaxPaths: 5, CapLabels: []string{"good"}}
-			for _, dry := range []bool{true, false} {
-				opts.DryRun = dry
-				stats, err := db.PruneLocations(ctx, opts)
-				if err != nil || stats.CappedSHAs != 1 || stats.Excess != 16 {
-					t.Fatalf("dry=%v: %+v %v", dry, stats, err)
-				}
-			}
-			if got := len(pruneTestLocationPaths(t, db, goodChild)); got != 5 {
-				t.Fatalf("good member locations: %d, want 5", got)
-			}
-			if got := len(pruneTestLocationPaths(t, db, unknownChild)); got != 21 {
-				t.Fatalf("excluded unknown member trimmed: %d, want 21", got)
-			}
-			opts.CapLabels = []string{"bad"}
-			if _, err := db.PruneLocations(ctx, opts); err == nil {
-				t.Fatal("bad accepted as a cap label")
 			}
 		})
 	}

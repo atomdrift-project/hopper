@@ -77,7 +77,7 @@ commands:
   backfill-ecosystems   fill an empty ecosystem from the sample's analyzed file type (dry-run)
   cleanup            delete wonky samples by skip category (interactive)
   dedupe-locations   hard-link duplicate top-level files; --consolidate also retires copies across filesystems
-  prune-locations    prune obsolete locations; cap good/unknown SHAs at 256/512 contained locations (--apply to modify)
+  prune-locations    prune redundant/obsolete locations while preserving traversal edges (--apply to modify)
   prune              drop location rows for files gone from disk, mark orphaned samples missing (run on the full mirror)
   repair-missing     re-check skip='missing' samples against known locations; revive + repoint
                      path if bytes are found (--dry-run by default; --apply to write)

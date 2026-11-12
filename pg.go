@@ -3057,7 +3057,8 @@ func (db *DB) insertSampleNewPG(ctx context.Context, sample *Sample) (bool, erro
 		return false, fmt.Errorf("hopper: insert sample: %w", err)
 	}
 	if tag.RowsAffected() == 0 && sample.MarkerMtime != nil {
-		if _, err := tx.Exec(ctx, `UPDATE samples SET marker_mtime = $2 WHERE sha256 = $1`, sample.SHA256, sample.MarkerMtime); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE samples SET marker_mtime = $2 WHERE sha256 = $1
+			AND marker_mtime IS DISTINCT FROM $2`, sample.SHA256, sample.MarkerMtime); err != nil {
 			return false, fmt.Errorf("hopper: refresh marker mtime: %w", err)
 		}
 	}
@@ -3068,7 +3069,7 @@ func (db *DB) insertSampleNewPG(ctx context.Context, sample *Sample) (bool, erro
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO sample_locations
 				(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
-			SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9 WHERE `+locationAdmissionSQL("$1", "$2", "$3", "$4", true)+`
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 			ON CONFLICT (sha256, path_key(path)) DO UPDATE SET
 				rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
 				source = CASE WHEN sample_locations.source = '' THEN EXCLUDED.source ELSE sample_locations.source END,
@@ -3185,86 +3186,8 @@ const insertBatchStagingSessionDDL = insertBatchStagingCore
 // (parent=<archive-sha>) are excluded by the WHERE so an archive member never
 // changes a top-level label or clobbers its path on a content-hash collision.
 var sampleConflictUpdatePG = `ON CONFLICT (sha256) DO UPDATE SET
-	label = CASE
-		WHEN samples.label IN ('inconclusive', 'dual-use', 'purgatory') THEN samples.label
-		WHEN EXCLUDED.label_source = 'marker' THEN EXCLUDED.label
-		WHEN samples.label_source = 'marker' THEN EXCLUDED.label
-		WHEN (samples.label = 'good' AND EXCLUDED.label = 'bad')
-		  OR (samples.label = 'bad' AND EXCLUDED.label = 'good') THEN 'bad'
-		WHEN ` + labelRankSQL("EXCLUDED.label") + `
-		   > ` + labelRankSQL("samples.label") + ` THEN EXCLUDED.label
-		ELSE samples.label
-	END,
-	label_source = CASE
-		WHEN samples.label IN ('inconclusive', 'dual-use', 'purgatory') THEN samples.label_source
-		WHEN EXCLUDED.label_source = 'marker' THEN 'marker'
-		WHEN samples.label_source = 'marker' THEN EXCLUDED.label_source
-		WHEN (samples.label = 'good' AND EXCLUDED.label = 'bad')
-		  OR (samples.label = 'bad' AND EXCLUDED.label = 'good') THEN 'conflict'
-		WHEN ` + labelRankSQL("EXCLUDED.label") + `
-		   > ` + labelRankSQL("samples.label") + ` THEN EXCLUDED.label_source
-		ELSE samples.label_source
-	END,
-	feed  = CASE WHEN EXCLUDED.feed <> '' THEN EXCLUDED.feed ELSE samples.feed END,
-	ecosystem = CASE WHEN EXCLUDED.ecosystem <> '' THEN EXCLUDED.ecosystem ELSE samples.ecosystem END,
-	path  = CASE WHEN EXCLUDED.path  <> ''   THEN EXCLUDED.path  ELSE samples.path  END,
-	-- Track filename with path: a walk that relocates the bytes also renames the
-	-- display name, so a stale sha-named filename (left by a relocation transient)
-	-- heals to the current on-disk / sidecar-recorded name.
-	filename = CASE WHEN EXCLUDED.path <> '' THEN EXCLUDED.filename ELSE samples.filename END,
-	mtime = CASE WHEN EXCLUDED.mtime IS NOT NULL THEN EXCLUDED.mtime ELSE samples.mtime END,
-	url     = CASE WHEN samples.url     = '' THEN EXCLUDED.url     ELSE samples.url     END,
-	domain  = CASE WHEN samples.domain  = '' THEN EXCLUDED.domain  ELSE samples.domain  END,
-	-- Package identity: a blank fills, and the first sidecar to arrive wins over
-	-- a filename guess (the walk parses "forge-0.5.6.tgz" as "forge"; the
-	-- sidecar knows it is "@servicetitan/forge"). Once a row carries provenance
-	-- its identity is settled and a later observation only fills blanks.
-	package    = CASE WHEN EXCLUDED.package <> '' AND (samples.package = '' OR (samples.provenance IS NULL AND EXCLUDED.provenance IS NOT NULL))
-	             THEN EXCLUDED.package ELSE samples.package END,
-	version = CASE WHEN EXCLUDED.version <> '' AND (samples.version = '' OR (samples.provenance IS NULL AND EXCLUDED.provenance IS NOT NULL))
-	          THEN EXCLUDED.version ELSE samples.version END,
-	purl_base = CASE WHEN EXCLUDED.purl_base <> '' AND (samples.purl_base = '' OR (samples.provenance IS NULL AND EXCLUDED.provenance IS NOT NULL))
-	            THEN EXCLUDED.purl_base ELSE samples.purl_base END,
-	-- Capture-time provenance is written once — by the collector's direct-insert,
-	-- or by a walk that found a sidecar or dataset registry document beside the
-	-- file — so keep whatever is already there.
-	provenance = CASE WHEN samples.provenance IS NOT NULL THEN samples.provenance ELSE EXCLUDED.provenance END,
-	fetched_at = CASE WHEN samples.fetched_at IS NOT NULL THEN samples.fetched_at ELSE EXCLUDED.fetched_at END,
-	-- Label-related skips ('misclassified'/'conflict') track the resolution;
-	-- the walker also clears 'missing'/'unsupported' so a re-observed file
-	-- rejoins the analysis queue. Hard skips (corrupt/encrypted/replaced/
-	-- empty_path/skip-benign-archive-item) stick. See insertSampleNewPG.
-	skip  = CASE
-		WHEN samples.label IN ('inconclusive', 'dual-use', 'purgatory') THEN samples.skip
-		WHEN EXCLUDED.label_source = 'marker' THEN 'misclassified'
-		WHEN samples.label_source = 'marker' AND samples.skip = 'misclassified' THEN ''
-		WHEN ((samples.label = 'good' AND EXCLUDED.label = 'bad')
-		   OR (samples.label = 'bad' AND EXCLUDED.label = 'good'))
-		  AND samples.skip IN ('', 'misclassified', 'conflict', 'missing', 'unsupported') THEN 'conflict'
-		WHEN ` + labelRankSQL("EXCLUDED.label") + `
-		   > ` + labelRankSQL("samples.label") + `
-		  AND samples.skip IN ('misclassified', 'conflict') THEN ''
-		WHEN samples.skip IN ('missing','unsupported') THEN ''
-		ELSE samples.skip
-	END
-WHERE EXCLUDED.parent = ''
-  AND ((EXCLUDED.path  <> ''   AND samples.path  IS DISTINCT FROM EXCLUDED.path)
-    OR (EXCLUDED.mtime IS NOT NULL AND samples.mtime IS DISTINCT FROM EXCLUDED.mtime)
-    OR (EXCLUDED.feed <> '' AND samples.feed IS DISTINCT FROM EXCLUDED.feed)
-    OR (EXCLUDED.ecosystem <> '' AND samples.ecosystem IS DISTINCT FROM EXCLUDED.ecosystem)
-    OR (samples.url = '' AND EXCLUDED.url <> '')
-    OR (samples.package = '' AND EXCLUDED.package <> '')
-    OR (samples.purl_base = '' AND EXCLUDED.purl_base <> '')
-    OR (samples.provenance IS NULL AND EXCLUDED.provenance IS NOT NULL)
-    OR samples.skip IN ('missing','unsupported')
-    -- Pool-precedence transitions must fire even when path/mtime are unchanged.
-    OR (` + labelRankSQL("EXCLUDED.label") + `
-      > ` + labelRankSQL("samples.label") + `)
-    OR ((samples.label = 'good' AND EXCLUDED.label = 'bad')
-      OR (samples.label = 'bad' AND EXCLUDED.label = 'good'))
-    OR (EXCLUDED.label_source = 'marker'
-        AND (samples.label <> EXCLUDED.label OR samples.label_source <> 'marker' OR samples.skip <> 'misclassified'))
-    OR (samples.label_source = 'marker' AND EXCLUDED.label_source <> 'marker'))`
+` + sampleObservationSetPG + `
+WHERE ` + sampleObservationChangedPG
 
 // insertBatchStagingInsert upserts the staged walk rows into samples. The
 // trailing ORDER BY sha256 mirrors insertMembersFromStagingPG: walk batches and
@@ -3274,6 +3197,8 @@ WHERE EXCLUDED.parent = ''
 // the queueing itself stays orderly. Measured 2026-08-22: this statement was
 // 70% of all DB execution time with 10-deep transactionid convoys — ordering is
 // load-bearing, not cosmetic. The leading column also satisfies DISTINCT ON.
+// The join skips unchanged samples before they can take conflict locks. Its
+// predicate and the conflict guard compare the same resolved values.
 var insertBatchStagingInsert = `INSERT INTO samples (
 	sha256, source, feed, ecosystem, filename,
 	size_bytes, label, label_source, path, status,
@@ -3282,13 +3207,13 @@ var insertBatchStagingInsert = `INSERT INTO samples (
 	cleave_result, litmus_result, analyzed_at, first_analyzed_at,
 	url, domain, package, version, provenance, fetched_at, purl_base, traits_version,
 	corroborated)
-SELECT DISTINCT ON (sha256)
-	sha256, source, feed, ecosystem, filename,
-	size_bytes, label, label_source, sample_path, status,
-	canonical_sha256, sample_parent, skip, elements,
-	max_crit, suspicious_count, mtime, marker_mtime,
-	cleave_result, litmus_result, analyzed_at, first_analyzed_at,
-	url, domain, package, version, provenance, fetched_at, purl_base, traits_version,
+SELECT DISTINCT ON (st.sha256)
+	st.sha256, st.source, st.feed, st.ecosystem, st.filename,
+	st.size_bytes, st.label, st.label_source, st.sample_path, st.status,
+	st.canonical_sha256, st.sample_parent, st.skip, st.elements,
+	st.max_crit, st.suspicious_count, st.mtime, st.marker_mtime,
+	st.cleave_result, st.litmus_result, st.analyzed_at, st.first_analyzed_at,
+	st.url, st.domain, st.package, st.version, st.provenance, st.fetched_at, st.purl_base, st.traits_version,
 	-- Seeded here for the same reason insertSampleNewPG seeds it inline: the
 	-- sightings_corroborate trigger fires AFTER INSERT ON sightings, never on a
 	-- sample arriving, so a bulk import of rows a feed already named would land
@@ -3299,14 +3224,16 @@ SELECT DISTINCT ON (sha256)
 	-- Two constant-equality probes into idx_sightings_subject, evaluated per
 	-- staged row rather than OR'd across two samples columns -- the shape
 	-- plan_audit_test.go guards against, because the OR form seq-scans.
-	EXISTS (SELECT 1 FROM sightings g WHERE g.subject = _staging.sha256)
-	  OR (_staging.purl_base <> ''
+	EXISTS (SELECT 1 FROM sightings g WHERE g.subject = st.sha256)
+	  OR (st.purl_base <> ''
 	      AND EXISTS (
-	          SELECT 1 FROM sightings g WHERE g.subject = _staging.purl_base
+	          SELECT 1 FROM sightings g WHERE g.subject = st.purl_base
 	            AND (g.affected ~ '` + unnarrowableScope + `'
-	                 OR _staging.version = ANY (string_to_array(replace(g.affected, ' ', ''), ',')))))
-FROM _staging
-ORDER BY sha256
+	                 OR st.version = ANY (string_to_array(replace(g.affected, ' ', ''), ',')))))
+FROM _staging st
+LEFT JOIN samples s ON s.sha256 = st.sha256
+WHERE s.sha256 IS NULL OR (` + stagedSampleChangedPG + `)
+ORDER BY st.sha256
 ` + sampleConflictUpdatePG
 
 // logLabelTransitionsPG logs each top-level re-observation in _staging whose
@@ -3392,8 +3319,9 @@ func sampleStagingRows(samples []*Sample) [][]any {
 // Keep the predicate aligned with the SET list it guards — a field that is set
 // but not tested here would silently stop being refreshed.
 // Source records the original producer: only fill it when previously unknown.
-const locationChangedPG = `
-	WHERE (EXCLUDED.rel <> ''       AND EXCLUDED.rel       IS DISTINCT FROM sample_locations.rel)
+const locationChangedPG = "\n\tWHERE " + locationChangePredicatePG
+
+const locationChangePredicatePG = `(EXCLUDED.rel <> ''       AND EXCLUDED.rel       IS DISTINCT FROM sample_locations.rel)
 	   OR (sample_locations.source = '' AND EXCLUDED.source <> '')
 	   OR (EXCLUDED.feed <> ''      AND EXCLUDED.feed      IS DISTINCT FROM sample_locations.feed)
 	   OR (EXCLUDED.ecosystem <> '' AND EXCLUDED.ecosystem IS DISTINCT FROM sample_locations.ecosystem)
@@ -3402,14 +3330,17 @@ const locationChangedPG = `
 // locationsFromStagingPG fans _staging rows out into sample_locations. DISTINCT
 // ON collapses duplicates within the batch; ON CONFLICT backfills fields that
 // actually changed, without clobbering an existing mtime. Shared by the batch
-// insert and the atomic store.
+// insert and the atomic store. The join skips unchanged observations before
+// ON CONFLICT can lock them; the conflict guard remains authoritative for races.
 var locationsFromStagingPG = `
 	INSERT INTO sample_locations
 		(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
 	SELECT DISTINCT ON (st.sha256, st.path)
 		st.sha256, st.path, st.parent, st.rel, st.filename, st.source, st.feed, st.ecosystem, st.mtime
 	  FROM _staging st
-	 WHERE st.path <> '' AND ` + locationAdmissionSQL("st.sha256", "st.path", "st.parent", "st.rel", true) + `
+	  LEFT JOIN sample_locations l
+	    ON l.sha256 = st.sha256 AND path_key(l.path) = path_key(st.path) AND l.path = st.path
+	 WHERE st.path <> '' AND (l.id IS NULL OR (` + stagedLocationChangedPG + `))
 	ON CONFLICT (sha256, path_key(path)) DO UPDATE SET
 		rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
 		source = CASE WHEN sample_locations.source = '' THEN EXCLUDED.source ELSE sample_locations.source END,
@@ -3556,7 +3487,8 @@ func (db *DB) insertSampleBatchPG(ctx context.Context, samples []*Sample) (inser
 		SET marker_mtime = st.marker_mtime
 		FROM _staging st
 		WHERE s.sha256 = st.sha256
-			AND st.marker_mtime IS NOT NULL`); err != nil {
+			AND st.marker_mtime IS NOT NULL
+			AND s.marker_mtime IS DISTINCT FROM st.marker_mtime`); err != nil {
 		return inserted, nil, fmt.Errorf("hopper: refresh marker mtime: %w", err)
 	}
 
@@ -4451,7 +4383,7 @@ func (db *DB) upsertLocationPG(ctx context.Context, loc *SampleLocation) error {
 	_, err := db.pool.Exec(ctx, `
 		INSERT INTO sample_locations
 			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
-		SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9 WHERE `+locationAdmissionSQL("$1", "$2", "$3", "$4", true)+`
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (sha256, path_key(path)) DO UPDATE SET
 			rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
 			mtime = COALESCE(EXCLUDED.mtime, sample_locations.mtime)
@@ -4488,7 +4420,6 @@ func (db *DB) upsertLocationBatchPG(ctx context.Context, locs []*SampleLocation)
 			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem)
 		SELECT v.* FROM unnest($1::text[], $2::text[], $3::text[], $4::text[],
 			$5::text[], $6::text[], $7::text[], $8::text[]) AS v(sha,path,parent,rel,filename,source,feed,ecosystem)
-  WHERE `+locationAdmissionSQL("v.sha", "v.path", "v.parent", "v.rel", true)+`
 		ON CONFLICT (sha256, path_key(path)) DO UPDATE SET
 			rel = CASE WHEN EXCLUDED.rel <> '' THEN EXCLUDED.rel ELSE sample_locations.rel END,
 			source = CASE WHEN sample_locations.source = '' THEN EXCLUDED.source ELSE sample_locations.source END,

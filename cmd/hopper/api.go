@@ -4711,6 +4711,11 @@ func (s *apiServer) markServeMissing(ctx context.Context, sample *hopper.Sample,
 		return
 	}
 
+	if err := validateRequiredMounts(s.dataRoot, s.requiredMounts); err != nil {
+		slog.Error("sample storage not authoritative; not marking missing", "sha256", sample.SHA256, "error", err)
+		return
+	}
+
 	slog.Warn("sample bytes gone on disk; marking missing", "sha256", sample.SHA256, "path", sample.Path)
 	if merr := s.db.SetSkip(ctx, sample.SHA256, "missing"); merr != nil {
 		slog.Error("mark missing failed", "sha256", sample.SHA256, "error", merr)

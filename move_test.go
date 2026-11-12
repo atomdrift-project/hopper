@@ -951,3 +951,29 @@ func assertLocationPaths(t *testing.T, ctx context.Context, db *DB, sha string, 
 		t.Fatalf("top-level locations = %v, want %v", got, want)
 	}
 }
+
+func TestMoveLegacyLongNameWithoutSidecar(t *testing.T) {
+	ctx := t.Context()
+	db := openTestDB(t)
+	root := t.TempDir()
+	content := []byte("legacy artifact")
+	sha := moveTestSHA(content)
+	oldRel := "incoming/" + strings.Repeat("a", 250)
+	newRel := "pending/short.bin"
+	for _, dir := range []string{"incoming", "pending"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, oldRel), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustInsert(t, ctx, db, &Sample{SHA256: sha, Path: oldRel, Label: "unknown"})
+	res, err := db.MoveLocation(ctx, MoveLocationOptions{DataRoot: root, SHA256: sha, OldPath: oldRel, NewPath: newRel})
+	if err != nil || !res.Relocated {
+		t.Fatalf("move = %+v, %v", res, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, oldRel)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("source remains: %v", err)
+	}
+}

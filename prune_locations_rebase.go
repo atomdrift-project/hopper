@@ -22,9 +22,10 @@ type pruneRebase struct {
 }
 
 type pruneParent struct {
-	known map[string]bool // every recorded or retired path of the archive
-	names map[string]bool // archive file names of those paths
-	live  string          // a recorded path whose outer file exists; "" when none
+	known      map[string]bool // every recorded or retired path of the archive
+	names      map[string]bool // archive file names of those paths
+	live       string          // a recorded path whose outer file exists; "" when none
+	incomplete bool            // omitted paths make absence unproven
 }
 
 // pruneArchiveName is the file name of the innermost archive in a path:
@@ -46,7 +47,7 @@ func (p *pruneParent) remember(path string) {
 // per run; fresh re-verifies a cached live path before an apply relies on it.
 func (db *DB) pruneParentInfo(ctx context.Context, sha string, c *pruneChecker, fresh bool) (*pruneParent, error) {
 	if p, ok := c.parents[sha]; ok {
-		if !fresh || p.live == "" || c.check(p.live, true) == prunePresent {
+		if !fresh || (p.live != "" && c.check(p.live, true) == prunePresent) {
 			return p, nil
 		}
 	}
@@ -54,7 +55,7 @@ func (db *DB) pruneParentInfo(ctx context.Context, sha string, c *pruneChecker, 
 	var candidates []string
 	err := db.queryLocations(ctx, `SELECT path FROM sample_locations
  WHERE sha256=$1 AND rel IN `+containmentRelsSQL+` AND path NOT LIKE '%://%'
- ORDER BY CASE WHEN parent_sha256='' THEN 0 ELSE 1 END, first_seen_at, id LIMIT $2`, []any{sha, pruneParentLimit},
+ ORDER BY CASE WHEN parent_sha256='' THEN 0 ELSE 1 END, first_seen_at, id LIMIT $2`, []any{sha, pruneParentLimit + 1},
 		func(rows locationRows) error {
 			for rows.Next() {
 				var path string
@@ -69,7 +70,9 @@ func (db *DB) pruneParentInfo(ctx context.Context, sha string, c *pruneChecker, 
 	if err != nil {
 		return nil, err
 	}
-	err = db.queryLocations(ctx, `SELECT path FROM sample_location_history WHERE sha256=$1 LIMIT $2`, []any{sha, pruneParentLimit},
+	p.incomplete = len(candidates) > pruneParentLimit
+	historyRows := 0
+	err = db.queryLocations(ctx, `SELECT path FROM sample_location_history WHERE sha256=$1 LIMIT $2`, []any{sha, pruneParentLimit + 1},
 		func(rows locationRows) error {
 			for rows.Next() {
 				var path string
@@ -77,12 +80,14 @@ func (db *DB) pruneParentInfo(ctx context.Context, sha string, c *pruneChecker, 
 					return err
 				}
 				p.remember(path)
+				historyRows++
 			}
 			return rows.Err()
 		})
 	if err != nil {
 		return nil, err
 	}
+	p.incomplete = p.incomplete || historyRows > pruneParentLimit
 	for _, path := range candidates {
 		if c.check(path, fresh) == prunePresent {
 			p.live = path
@@ -107,18 +112,29 @@ func (p *pruneParent) rebaseTarget(path string) (string, bool) {
 	if p.live == "" {
 		return "", false
 	}
-	for _, match := range []func(string) bool{
-		func(prefix string) bool { return p.known[prefix] },
-		func(prefix string) bool { return p.names[pruneArchiveName(prefix)] },
-	} {
-		for i := strings.LastIndex(path, "!!"); i > 0; i = strings.LastIndex(path[:i], "!!") {
-			if match(path[:i]) {
-				target := p.live + path[i:]
-				return target, target != path
-			}
+	for i := strings.LastIndex(path, "!!"); i > 0; i = strings.LastIndex(path[:i], "!!") {
+		if p.known[path[:i]] {
+			target := p.live + path[i:]
+			return target, target != path
 		}
 	}
-	return "", false
+	if p.incomplete {
+		return "", false
+	}
+	boundary := -1
+	for i := strings.LastIndex(path, "!!"); i > 0; i = strings.LastIndex(path[:i], "!!") {
+		if p.names[pruneArchiveName(path[:i])] {
+			if boundary >= 0 {
+				return "", false
+			}
+			boundary = i
+		}
+	}
+	if boundary < 0 {
+		return "", false
+	}
+	target := p.live + path[boundary:]
+	return target, target != path
 }
 
 type obsoleteRebasePlan struct {
@@ -144,6 +160,10 @@ func (db *DB) planObsoleteRebases(
 			return obsoleteRebasePlan{}, err
 		}
 		if parent.live == "" {
+			if parent.incomplete {
+				plan.unmapped++
+				continue
+			}
 			plan.deletes = append(plan.deletes, l)
 			continue
 		}
@@ -157,27 +177,66 @@ func (db *DB) planObsoleteRebases(
 	return plan, nil
 }
 
+// lockPruneRebases validates sources before any retirement or path mutation.
+func lockPruneRebases(tx locationSQLTx, rebases []pruneRebase) ([]pruneRebase, error) {
+	observed := make([]pruneLocation, len(rebases))
+	for i, r := range rebases {
+		observed[i] = r.loc
+	}
+	if _, err := pruneLockSamples(tx, observed); err != nil {
+		return nil, err
+	}
+	valid, _, err := lockPruneObservations(tx, observed)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[int64]bool, len(valid))
+	for _, l := range valid {
+		byID[l.ID] = true
+	}
+	current := make([]pruneRebase, 0, len(valid))
+	for _, r := range rebases {
+		if byID[r.loc.ID] {
+			current = append(current, r)
+		}
+	}
+	return current, nil
+}
+
 // rebasePruneLocations moves member rows onto their archive's live path in one
 // transaction. Each statement is a CAS on (id, sha256, path): a row changed by
 // a concurrent move or ingest is left alone. An existing row at the target
-// absorbs the rebase; the stale row is removed either way.
+// absorbs the rebase only when its parent and relation match. A conflicting
+// destination leaves the original edge and primary path intact.
 func (db *DB) rebasePruneLocations(ctx context.Context, rebases []pruneRebase) (int64, error) {
 	if len(rebases) == 0 {
 		return 0, nil
 	}
-	ids := make([]int64, len(rebases))
-	shas := make([]string, len(rebases))
-	olds := make([]string, len(rebases))
-	news := make([]string, len(rebases))
+	ids := make([]int64, 0, len(rebases))
+	shas := make([]string, 0, len(rebases))
+	olds := make([]string, 0, len(rebases))
+	news := make([]string, 0, len(rebases))
+	locked := make([]string, len(rebases))
 	for i, r := range rebases {
-		ids[i], shas[i], olds[i], news[i] = r.loc.ID, r.loc.SHA, r.loc.Path, r.newPath
+		locked[i] = r.loc.SHA
 	}
-	locked := slices.Clone(shas)
 	slices.Sort(locked)
 	locked = slices.Compact(locked)
 	var moved int64
 	stamp := db.locationTimestamp()
 	err := db.locationTransaction(ctx, func(tx locationSQLTx) error {
+		current, err := lockPruneRebases(tx, rebases)
+		if err != nil {
+			return err
+		}
+		ids, shas, olds, news = ids[:0], shas[:0], olds[:0], news[:0]
+		for _, r := range current {
+			ids, shas = append(ids, r.loc.ID), append(shas, r.loc.SHA)
+			olds, news = append(olds, r.loc.Path), append(news, r.newPath)
+		}
+		if len(ids) == 0 {
+			return nil
+		}
 		count := func(rows locationRows) error {
 			for rows.Next() {
 				moved++
@@ -206,14 +265,33 @@ func (db *DB) rebasePruneLocations(ctx context.Context, rebases []pruneRebase) (
   ON CONFLICT DO NOTHING`, ids, shas, olds, news); err != nil {
 				return err
 			}
+			// A conflict target must remain the same edge until the source is
+			// deleted. Ingest can update its relation without a sample lock.
+			if err := tx.query(`SELECT d.id FROM unnest($1::text[],$2::text[]) AS v(sha,path)
+ JOIN sample_locations d ON d.sha256=v.sha AND path_key(d.path)=path_key(v.path) AND d.path=v.path
+ ORDER BY d.id FOR SHARE OF d`, []any{shas, news}, func(rows locationRows) error {
+				for rows.Next() {
+				}
+				return rows.Err()
+			}); err != nil {
+				return err
+			}
 			if err := tx.exec(`UPDATE samples s SET path=v.new_path, updated_at=$5
-  FROM `+victims+` WHERE s.sha256=v.sha256 AND s.path=v.path`, ids, shas, olds, news, stamp); err != nil {
+  FROM `+victims+` WHERE s.sha256=v.sha256 AND s.path=v.path
+  AND EXISTS(SELECT 1 FROM sample_locations src JOIN sample_locations dest
+    ON dest.sha256=src.sha256 AND dest.path=v.new_path AND path_key(dest.path)=path_key(v.new_path)
+    AND dest.parent_sha256=src.parent_sha256 AND dest.rel=src.rel
+    WHERE src.id=v.id AND src.sha256=v.sha256 AND src.path=v.path)`, ids, shas, olds, news, stamp); err != nil {
 				return err
 			}
 			return tx.query(`DELETE FROM sample_locations l USING `+victims+`
-  WHERE l.id=v.id AND l.sha256=v.sha256 AND l.path=v.path RETURNING l.id`, []any{ids, shas, olds, news}, count)
+  WHERE l.id=v.id AND l.sha256=v.sha256 AND l.path=v.path
+  AND EXISTS(SELECT 1 FROM sample_locations dest WHERE dest.sha256=l.sha256
+    AND dest.path=v.new_path AND path_key(dest.path)=path_key(v.new_path)
+    AND dest.parent_sha256=l.parent_sha256 AND dest.rel=l.rel)
+  RETURNING l.id`, []any{ids, shas, olds, news}, count)
 		}
-		for i := range rebases {
+		for i := range ids {
 			if err := tx.exec(`INSERT INTO sample_locations
   (sha256,path,parent_sha256,rel,filename,source,feed,ecosystem,mtime,first_seen_at,last_seen_at)
   SELECT sha256,$4,parent_sha256,rel,filename,source,feed,ecosystem,mtime,first_seen_at,last_seen_at
@@ -221,12 +299,17 @@ func (db *DB) rebasePruneLocations(ctx context.Context, rebases []pruneRebase) (
   ON CONFLICT (sha256, path) DO NOTHING`, ids[i], shas[i], olds[i], news[i]); err != nil {
 				return err
 			}
-			if err := tx.exec(`UPDATE samples SET path=$3, updated_at=$4 WHERE sha256=$1 AND path=$2`,
-				shas[i], olds[i], news[i], stamp); err != nil {
+			if err := tx.exec(`UPDATE samples SET path=$3, updated_at=$4 WHERE sha256=$1 AND path=$2
+ AND EXISTS(SELECT 1 FROM sample_locations src JOIN sample_locations dest
+ ON dest.sha256=src.sha256 AND dest.path=$3 AND dest.parent_sha256=src.parent_sha256 AND dest.rel=src.rel
+ WHERE src.id=$5 AND src.sha256=$1 AND src.path=$2)`,
+				shas[i], olds[i], news[i], stamp, ids[i]); err != nil {
 				return err
 			}
-			if err := tx.query(`DELETE FROM sample_locations WHERE id=$1 AND sha256=$2 AND path=$3 RETURNING id`,
-				[]any{ids[i], shas[i], olds[i]}, count); err != nil {
+			if err := tx.query(`DELETE FROM sample_locations WHERE id=$1 AND sha256=$2 AND path=$3
+ AND EXISTS(SELECT 1 FROM sample_locations dest WHERE dest.sha256=sample_locations.sha256
+ AND dest.path=$4 AND dest.parent_sha256=sample_locations.parent_sha256 AND dest.rel=sample_locations.rel)
+ RETURNING id`, []any{ids[i], shas[i], olds[i], news[i]}, count); err != nil {
 				return err
 			}
 		}

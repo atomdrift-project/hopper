@@ -385,7 +385,9 @@ func publishMoveSidecar(ctx context.Context, src, dst string) (created, present 
 	src += ProvenanceSidecarSuffix
 	dst += ProvenanceSidecarSuffix
 	if _, err := os.Lstat(src); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+		// An existing legacy artifact may use all NAME_MAX bytes. Its sidecar
+		// cannot exist because appending the suffix exceeds NAME_MAX.
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENAMETOOLONG) {
 			return false, false, nil
 		}
 		return false, false, err

@@ -54,6 +54,9 @@ func TestPruneLocationsSafetyCap(t *testing.T) {
 			}
 			for i := range 100 {
 				mustInsert(t, ctx, db, &Sample{SHA256: hexSHA(1500 + i), Path: fmt.Sprintf("good/gone-%d.bin", i), Label: "good"})
+				if err := db.UpsertLocation(ctx, &SampleLocation{SHA256: hexSHA(1500 + i), Path: "good/present-0.bin"}); err != nil {
+					t.Fatal(err)
+				}
 			}
 			before := pruneTestCount(t, db, "sample_locations")
 			opts := LocationPruneOptions{DataRoot: root, Phase: "obsolete", Batch: 1000, DryRun: true}
@@ -66,7 +69,7 @@ func TestPruneLocationsSafetyCap(t *testing.T) {
 			opts.DryRun = false
 			stats, err := db.PruneLocations(ctx, opts)
 			var exceeded *PruneSafetyExceeded
-			if !errors.As(err, &exceeded) || exceeded.Victims != 100 || exceeded.Total != 120 {
+			if !errors.As(err, &exceeded) || exceeded.Victims != 100 || exceeded.Total != 220 {
 				t.Fatalf("apply should refuse the batch: %+v %v", stats, err)
 			}
 			if stats.Deleted != 0 || pruneTestCount(t, db, "sample_locations") != before {
@@ -98,7 +101,7 @@ func TestPruneLocationsPoolGuard(t *testing.T) {
 			}
 			opts := LocationPruneOptions{DataRoot: root, Phase: "obsolete", Batch: 100, MaxObsoleteFraction: 1}
 			stats, err := db.PruneLocations(ctx, opts)
-			if err != nil || stats.Deleted != 2 || stats.Uncheckable != 3 || stats.PoolGuarded != 3 {
+			if err != nil || stats.Deleted != 0 || stats.Protected != 2 || stats.Uncheckable != 3 || stats.PoolGuarded != 3 {
 				t.Fatalf("guard: %+v %v", stats, err)
 			}
 			for i := range 3 {

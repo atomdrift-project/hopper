@@ -87,6 +87,7 @@ func mvTestServer(t *testing.T, ctx context.Context, root string) (db *hopper.DB
 		t.Fatalf("Migrate: %v", err)
 	}
 	api := &apiServer{db: db, dataRoot: root, tracker: newWorkerTracker()}
+	api.ready.Store(true)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/triage", api.handleTriage)
 	srv := httptest.NewServer(mux)

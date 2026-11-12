@@ -28,6 +28,55 @@ Alloy's job.
 Files in this dir: `config.alloy`, `queries.yaml`, `exporter-role.sql`,
 `hopper_alloy` (rc.d script), `alloy.env.example`, `replication-alerts.yml`.
 
+## Postgres exporter on sauron
+
+The live publisher is **minas-tirith** (`hopper-db`, `10.9.8.4`, NixOS),
+and the exporter runs in Alloy on **sauron**. The original FreeBSD installation
+instructions below describe the earlier deployment.
+
+For `PostgresExporterNotConnected` (`pg_up=0`), first read the redacted driver
+error on sauron:
+
+```sh
+ssh sauron 'tail -n 30 /usr/local/var/log/grafana-alloy.log'
+ssh sauron 'curl -fsS http://localhost:12345/api/v0/component/prometheus.exporter.postgres.publisher/metrics | grep -E "^pg_up|^pg_exporter_last_scrape_error"'
+```
+
+Config and secrets live in `/usr/local/etc/grafana-alloy/`; the launch daemon is
+`/Library/LaunchDaemons/com.atomdrift.grafana-alloy.plist`. Keep the DSN password
+out of command output. Authentication errors require checking the configured
+DSN and publisher HBA rule; `hopper_exporter` is admitted from a specific host,
+so moving Alloy requires updating the publisher rule.
+
+`the database system is in recovery mode` / `not yet accepting connections`
+(`57P03`) means the publisher is unavailable. Inspect minas-tirith before
+changing exporter credentials:
+
+```sh
+ssh minas-tirith 'sudo -n systemctl status postgresql --no-pager; sudo -n zfs list; sudo -n cat /var/lib/postgresql/18/current_logfiles'
+```
+
+Read the current log named by `current_logfiles` beneath
+`/var/lib/postgresql/18/`. Check free space **on that dataset**, using
+`sudo -n df -h /var/lib/postgresql/18` and `sudo -n zfs list`.
+
+On **2026-11-11**, snapshot retention filled `tank`. PostgreSQL stopped serving
+connections, and galadriel disabled its subscription after the publisher's WAL
+sender failed with `No space left on device`. The installed snapshot script was
+outdated and exited on snapshot failure before pruning. The fix in the
+`zfs-backups` repository prunes before snapshot creation and again after success.
+The service now uses `tank 2 90`: keep the newest two snapshots, preserve
+unreplicated snapshots below 90% pool capacity, and allow emergency pruning
+at or above that threshold. Replication holds are never forced. The persistent
+unit is declared in `/etc/nixos/zfs-snap.nix`; the script is
+`/etc/zrepl/zfs-recursive-snap.sh`.
+
+After reclaiming space, verify WAL recovery progresses and the publisher
+accepts connections. Then re-enable any disabled subscription, confirm its LSN
+advances, and verify the exporter reports `pg_up 1` with
+`pg_exporter_last_scrape_error 0`. A subscription disable can be a consequence
+of publisher failure; read its apply error before changing subscriber schema.
+
 ## 1. Monitoring role on the publisher
 
 Run as a superuser on hopper-db (least-priv; does **not** touch the app role):

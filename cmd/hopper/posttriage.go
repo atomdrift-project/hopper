@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/atomdrift-project/hopper"
 )
@@ -345,8 +346,8 @@ func (s *apiServer) handleTriage(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusForbidden, err.Error())
 		return
 	}
-	if s.dataRoot == "" {
-		writeJSONError(w, http.StatusServiceUnavailable, "data root not configured")
+	if !s.ready.Load() || s.db == nil || s.dataRoot == "" {
+		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
 		return
 	}
 
@@ -495,6 +496,16 @@ func (s *apiServer) relocateTriaged(ctx context.Context, verdict triageVerdict, 
 		return res
 	}
 	if !oldExists && !newExists {
+		// Use the same alternate-location recovery and authoritative-missing path
+		// as file serving. A stale primary must not be offered on every sweep.
+		if !dryRun && verdict.OldPath == "" {
+			f, _, fileErr := s.openKnownSampleFile(ctx, samp, "triage")
+			if f != nil {
+				res.Status, res.Error = "error", recoveredFileResult(f.Close())
+				return res
+			}
+			s.markServeMissing(ctx, samp, fileErr)
+		}
 		res.Status, res.Error = "absent", "bytes not on this host; re-submit once the full corpus is attached"
 		return res
 	}
@@ -542,12 +553,34 @@ func (s *apiServer) relocateTriaged(ctx context.Context, verdict triageVerdict, 
 	return res
 }
 
+func recoveredFileResult(err error) string {
+	if err != nil {
+		return "close recovered file: " + err.Error()
+	}
+	return "primary location recovered; retry ruling"
+}
+
 // disambiguateDest finalizes a destination against what is already on disk.
 // Every pool, including pending and review, may already contain a different
 // package build with the same human-readable path. Preserve both by suffixing
 // the basename with a deterministic SHA prefix, independently of whether the
 // move also changes the sample's classification.
 func (s *apiServer) disambiguateDest(newRel, sha string) (string, error) {
+	// Reserve space for both the digest qualifier and provenance suffix.
+	// Existing forager files can have basenames too long to append a sidecar.
+	dir, base := filepath.Split(newRel)
+	const maxBase = 255 - len(hopper.ProvenanceSidecarSuffix) - 26
+	if len(base) > maxBase {
+		ext := filepath.Ext(base)
+		if len(ext) > 16 {
+			ext = ""
+		}
+		cut := maxBase - len(ext)
+		for cut > 0 && !utf8.RuneStart(base[cut]) {
+			cut--
+		}
+		newRel = filepath.Join(dir, base[:cut]+"."+sha[:12]+ext)
+	}
 	newAbs, err := s.resolveDataPath(newRel)
 	if err != nil {
 		return "", err

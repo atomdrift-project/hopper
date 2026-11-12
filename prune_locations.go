@@ -5,34 +5,20 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
 )
 
-const locationCapPrefix = "location-member-cap/"
-
-const pruneInFileSQL = `parent_sha256 <> '' AND rel IN ` + containmentRelsSQL + ` AND path LIKE '%!!%' AND path NOT LIKE '%://%'`
-
 // LocationPruneOptions describes one resumable pass. DryRun performs only reads.
 type LocationPruneOptions struct {
-	Progress func(LocationPruneStats) error
-	DataRoot string
-	Phase    string // obsolete or cap
-	AfterSHA string
-	// CapLabels limits which labels the cap phase trims; empty means good and
-	// unknown. Retention limits and admission markers are unaffected.
-	CapLabels       []string
-	AfterID         int64
-	ThroughID       int64 // zero captures the current maximum ID
-	Limit           int64 // obsolete rows inspected; zero is unlimited
-	LimitSHAs       int   // overfull SHAs inspected; zero is unlimited
-	Batch           int
-	MaxPaths        int // optional override for both capped labels
-	GoodMaxPaths    int
-	UnknownMaxPaths int
-	PreviewRows     int64 // cap preview over a bounded ID window; never applies
+	Progress  func(LocationPruneStats) error
+	DataRoot  string
+	Phase     string // empty or obsolete; cap pruning is no longer supported
+	AfterID   int64
+	ThroughID int64 // zero captures the current maximum ID
+	Limit     int64 // rows inspected; zero is unlimited
+	Batch     int
 	// MaxObsoleteFraction aborts an obsolete apply before deleting a batch whose
 	// absent share, or the pass's cumulative absent share, exceeds it. Zero
 	// selects DefaultMaxObsoleteFraction; 1 or more disables the cap.
@@ -49,25 +35,11 @@ const DefaultMaxObsoleteFraction = 0.40
 // tripping the fraction cap; a wrong root trips it within the first batch.
 const pruneSafetyMinVictims = 50
 
-// LocationPruneLabelStats describes the effects for one member label.
-type LocationPruneLabelStats struct {
-	Rows, MemberLocations, EligibleLocations, PhysicalLocations, Excess, ArchivesSeen, ArchiveEdgesRemoved, AffectedSHAs int64
-}
-
-// LocationPruneLabels separates eligible labels from protected labels.
-type LocationPruneLabels struct {
-	Good, Unknown, Bad, Other LocationPruneLabelStats
-}
-
 // LocationPruneStats describes completed batches; cursors advance after commit.
 type LocationPruneStats struct {
-	Labels                                                                           *LocationPruneLabels
-	Phase                                                                            string
-	AfterSHA                                                                         string
-	AfterID, ThroughID                                                               int64
-	Scanned, Obsolete, Excess, Deleted, Protected, Uncheckable, StatCalls, CacheHits int64
-	OverfullSHAs, CappedSHAs, BusyArchives                                           int
-	PhysicalRetained, ArchivesSeen, ArchiveEdgesRemoved                              int64
+	Phase                                                                    string
+	AfterID, ThroughID                                                       int64
+	Scanned, Obsolete, Deleted, Protected, Uncheckable, StatCalls, CacheHits int64
 	// SafetyTrips counts obsolete batches that exceeded MaxObsoleteFraction. An
 	// apply stops at the first; a dry run keeps counting so the preview is whole.
 	SafetyTrips int64
@@ -77,7 +49,10 @@ type LocationPruneStats struct {
 	// Rebased counts absent member rows moved onto their archive's live path;
 	// Unmapped counts those kept because the old prefix could not be mapped.
 	Rebased, Unmapped int64
-	Complete          bool
+	// Preview-only target checks: duplicates merge existing identical edges;
+	// conflicting parent/relation targets leave the source intact.
+	RebaseDuplicates, RebaseConflicts int64
+	Complete                          bool
 }
 
 type pruneLocation struct {
@@ -165,36 +140,26 @@ func (c *pruneChecker) check(path string, fresh bool) prunePresence {
 	return state
 }
 
-// PruneLocations removes absent observations or caps contained locations globally
-// per content hash. Physical locations never count toward the cap. It never
-// removes files, reads archive members, changes labels, or copies discarded rows
-// into history. New IDs after ThroughID are left for a subsequent pass.
+// PruneLocations removes proven obsolete observations while retaining the final
+// parent edge or standalone observation. Members of live archives are rebased
+// instead. Valid occurrences are never trimmed to a numeric retention limit.
+// It never removes files, changes labels, or processes IDs after ThroughID.
 func (db *DB) PruneLocations(ctx context.Context, opts LocationPruneOptions) (LocationPruneStats, error) {
-	opts = normalizeLocationCaps(opts)
-	stats := LocationPruneStats{
-		Labels: &LocationPruneLabels{}, Phase: opts.Phase, AfterID: opts.AfterID, AfterSHA: opts.AfterSHA, ThroughID: opts.ThroughID,
+	if opts.Phase == "" {
+		opts.Phase = "obsolete"
 	}
+	stats := LocationPruneStats{Phase: opts.Phase, AfterID: opts.AfterID, ThroughID: opts.ThroughID}
 	if opts.DataRoot == "" {
 		return stats, errors.New("hopper: prune-locations requires a data root")
 	}
-	if opts.Batch <= 0 || opts.Batch > 10000 || opts.MaxPaths < 0 || opts.MaxPaths > 4096 ||
-		opts.GoodMaxPaths < 1 || opts.GoodMaxPaths > 4096 || opts.UnknownMaxPaths < 1 || opts.UnknownMaxPaths > 4096 || opts.PreviewRows < 0 ||
-		opts.AfterID < 0 || opts.ThroughID < 0 || opts.Limit < 0 || opts.LimitSHAs < 0 {
-		return stats, errors.New("hopper: invalid prune limits (batch 1..10000, max-paths 1..4096, nonnegative cursors and limits)")
+	if opts.Batch <= 0 || opts.Batch > 10000 || opts.AfterID < 0 || opts.ThroughID < 0 || opts.Limit < 0 {
+		return stats, errors.New("hopper: invalid prune limits (batch 1..10000, nonnegative cursors and limits)")
 	}
-	if opts.PreviewRows > 0 && (!opts.DryRun || opts.Phase != "cap") {
-		return stats, errors.New("hopper: --limit-rows requires a cap-only dry run")
-	}
-	if opts.Phase != "obsolete" && opts.Phase != "cap" {
-		return stats, errors.New("hopper: prune phase must be obsolete or cap")
+	if opts.Phase != "obsolete" {
+		return stats, errors.New("hopper: only obsolete pruning is supported; cap pruning was removed because it discards valid observations")
 	}
 	if opts.MaxObsoleteFraction < 0 {
 		return stats, errors.New("hopper: max obsolete fraction must be nonnegative")
-	}
-	for _, label := range opts.CapLabels {
-		if label != labelGood && label != labelUnknown {
-			return stats, errors.New("hopper: cap labels must be good and/or unknown")
-		}
 	}
 	if opts.MaxObsoleteFraction == 0 {
 		opts.MaxObsoleteFraction = DefaultMaxObsoleteFraction
@@ -226,19 +191,7 @@ func (db *DB) PruneLocations(ctx context.Context, opts LocationPruneOptions) (Lo
 		}
 	}
 	checker := &pruneChecker{root: root, cache: make(map[string]prunePresence), stats: &stats}
-	if !opts.DryRun && opts.Phase == "cap" {
-		if err := db.prepareLocationCapPolicy(ctx, opts); err != nil {
-			return stats, err
-		}
-	}
-	switch {
-	case opts.Phase == "obsolete":
-		err = db.pruneObsoleteLocations(ctx, opts, &stats, checker)
-	case opts.PreviewRows > 0:
-		err = db.previewLocationWindow(ctx, opts, &stats)
-	default:
-		err = db.pruneCappedLocations(ctx, opts, &stats, checker)
-	}
+	err = db.pruneObsoleteLocations(ctx, opts, &stats, checker)
 	return stats, err
 }
 
@@ -267,7 +220,7 @@ func scanPruneLocation(rows locationRows) (pruneLocation, error) {
 
 const pruneLocationColumns = `id,sha256,path,parent_sha256,rel,first_seen_at`
 
-func (db *DB) pruneObsoleteLocations(ctx context.Context, opts LocationPruneOptions, stats *LocationPruneStats, c *pruneChecker) error {
+func (db *DB) pruneObsoleteLocations(ctx context.Context, opts LocationPruneOptions, stats *LocationPruneStats, checker *pruneChecker) error {
 	for {
 		size := int64(opts.Batch)
 		if opts.Limit > 0 {
@@ -297,7 +250,7 @@ func (db *DB) pruneObsoleteLocations(ctx context.Context, opts LocationPruneOpti
 		}
 		var victims []pruneLocation
 		for _, l := range batch {
-			switch c.check(l.Path, false) {
+			switch checker.check(l.Path, false) {
 			case pruneAbsent:
 				victims = append(victims, l)
 			case pruneUnknown:
@@ -306,22 +259,40 @@ func (db *DB) pruneObsoleteLocations(ctx context.Context, opts LocationPruneOpti
 			}
 		}
 		if !opts.DryRun {
-			victims = refreshPruneVictims(victims, c)
+			victims = refreshPruneVictims(victims, checker)
 		}
 		// Rebases are not losses: only rows with no live archive count toward the
 		// safety cap and the obsolete total.
-		plan, err := db.planObsoleteRebases(ctx, victims, c, !opts.DryRun)
+		plan, err := db.planObsoleteRebases(ctx, victims, checker, !opts.DryRun)
 		if err != nil {
 			return err
 		}
 		stats.Unmapped += plan.unmapped
+		// Keep the final relationship even when every recorded outer file is
+		// absent. It is still needed to traverse the content graph.
+		query := locationSQLTx{query: func(q string, args []any, scan func(locationRows) error) error {
+			return db.queryLocations(ctx, q, args, scan)
+		}}
+		var protected int64
+		plan.deletes, protected, err = protectPruneRelationships(query, plan.deletes, false)
+		if err != nil {
+			return err
+		}
+		stats.Protected += protected
 		safety := checkObsoleteSafety(opts, stats, len(plan.deletes), len(batch))
 		if opts.DryRun {
 			// Preview reports every batch an apply would refuse instead of stopping.
 			if errors.As(safety, new(*PruneSafetyExceeded)) {
 				stats.SafetyTrips++
 			}
-			stats.Rebased += int64(len(plan.rebases))
+			duplicates, conflicts, err := db.previewPruneRebaseTargets(ctx, plan.rebases)
+			if err != nil {
+				return err
+			}
+			stats.RebaseDuplicates += duplicates
+			stats.RebaseConflicts += conflicts
+			stats.Rebased += int64(len(plan.rebases)) - conflicts
+			stats.Protected += conflicts
 		} else {
 			if safety != nil {
 				return safety
@@ -331,7 +302,7 @@ func (db *DB) pruneObsoleteLocations(ctx context.Context, opts LocationPruneOpti
 				return err
 			}
 			stats.Rebased += moved
-			n, protected, err := db.deletePruneLocations(ctx, plan.deletes, false, nil, c, opts)
+			n, protected, err := db.deletePruneLocations(ctx, plan.deletes, checker)
 			if err != nil {
 				return err
 			}
@@ -392,11 +363,6 @@ func checkObsoleteSafety(opts LocationPruneOptions, stats *LocationPruneStats, v
 		return &PruneSafetyExceeded{Total: int(total), Victims: int(v), MaxFraction: limit}
 	}
 	return nil
-}
-
-// capLabelSelected reports whether the cap phase may trim this label.
-func capLabelSelected(label string, opts LocationPruneOptions) bool {
-	return len(opts.CapLabels) == 0 || slices.Contains(opts.CapLabels, label)
 }
 
 func reportLocationPrune(opts LocationPruneOptions, stats *LocationPruneStats) error {

@@ -1367,8 +1367,7 @@ func (db *DB) insertSampleNewSQLite(ctx context.Context, s *Sample) (bool, error
 	}
 	if s.Path != "" {
 		if _, err := tx.ExecContext(ctx, locationUpsertSQLite,
-			s.SHA256, s.Path, s.Parent, s.LocationRel, s.Filename, s.Source, s.Feed, s.Ecosystem, s.Mtime,
-			locationCapKey(s.SHA256, s.Path)); err != nil {
+			s.SHA256, s.Path, s.Parent, s.LocationRel, s.Filename, s.Source, s.Feed, s.Ecosystem, s.Mtime); err != nil {
 			return false, fmt.Errorf("hopper: upsert location: %w", err)
 		}
 	}
@@ -1531,8 +1530,7 @@ func insertBatchSamplesSQLite(ctx context.Context, tx *sql.Tx, samples []*Sample
 		}
 		if s.Path != "" {
 			if _, err := locStmt.ExecContext(ctx,
-				s.SHA256, s.Path, s.Parent, s.LocationRel, s.Filename, s.Source, s.Feed, s.Ecosystem, s.Mtime,
-				locationCapKey(s.SHA256, s.Path)); err != nil {
+				s.SHA256, s.Path, s.Parent, s.LocationRel, s.Filename, s.Source, s.Feed, s.Ecosystem, s.Mtime); err != nil {
 				return 0, fmt.Errorf("hopper: upsert location %s: %w", s.SHA256, err)
 			}
 		}
@@ -1987,17 +1985,16 @@ const (
 )
 
 // locationUpsertSQLite and locationUpsertRelMtimeSQLite insert one
-// sample_locations row subject to the member-cap admission predicate. Bind
+// sample_locations row. Bind
 // ?1..?9 to sha256, path, parent_sha256, rel, filename, source, feed,
-// ecosystem, mtime and ?10 to locationCapKey(sha256, path). The full form
+// ecosystem and mtime. The full form
 // refreshes every observed column; the RelMtime form only rel and mtime.
 // Built once from fixed internal fragments; no input is ever interpolated.
 var (
-	//nolint:gosec // G202: fixed internal fragments; all values are bound parameters.
 	locationUpsertSQLite = `
 		INSERT INTO sample_locations
 			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
-		SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 WHERE ` + locationAdmissionSQL("?1", "?2", "?3", "?4", false) + `
+		VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
 		ON CONFLICT (sha256, path) DO UPDATE SET
 			rel = CASE WHEN excluded.rel != '' THEN excluded.rel ELSE sample_locations.rel END,
 			source = CASE WHEN sample_locations.source = '' THEN excluded.source ELSE sample_locations.source END,
@@ -2005,11 +2002,10 @@ var (
 			ecosystem = CASE WHEN excluded.ecosystem != '' THEN excluded.ecosystem ELSE sample_locations.ecosystem END,
 			mtime = COALESCE(excluded.mtime, sample_locations.mtime)` + locationChangedSQLite
 
-	//nolint:gosec // G202: fixed internal fragments; all values are bound parameters.
 	locationUpsertRelMtimeSQLite = `
 		INSERT INTO sample_locations
 			(sha256, path, parent_sha256, rel, filename, source, feed, ecosystem, mtime)
-		SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 WHERE ` + locationAdmissionSQL("?1", "?2", "?3", "?4", false) + `
+		VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
 		ON CONFLICT (sha256, path) DO UPDATE SET
 			rel = CASE WHEN excluded.rel != '' THEN excluded.rel ELSE sample_locations.rel END,
 			mtime = COALESCE(excluded.mtime, sample_locations.mtime)` + locationChangedRelMtimeSQLite
@@ -2018,7 +2014,7 @@ var (
 func (db *DB) upsertLocationSQLite(ctx context.Context, loc *SampleLocation) error {
 	_, err := db.lite.ExecContext(ctx, locationUpsertRelMtimeSQLite,
 		loc.SHA256, loc.Path, loc.ParentSHA256, loc.Rel, loc.Filename,
-		loc.Source, loc.Feed, loc.Ecosystem, loc.Mtime, locationCapKey(loc.SHA256, loc.Path))
+		loc.Source, loc.Feed, loc.Ecosystem, loc.Mtime)
 	if err != nil {
 		return fmt.Errorf("hopper: upsert location %s: %w", loc.SHA256, err)
 	}
@@ -2035,7 +2031,7 @@ func (db *DB) upsertLocationBatchSQLite(ctx context.Context, locs []*SampleLocat
 	defer tx.Rollback() //nolint:errcheck // commit or rollback
 	for _, l := range locs {
 		if _, err := tx.ExecContext(ctx, locationUpsertSQLite, l.SHA256, l.Path, l.ParentSHA256, l.Rel,
-			l.Filename, l.Source, l.Feed, l.Ecosystem, l.Mtime, locationCapKey(l.SHA256, l.Path)); err != nil {
+			l.Filename, l.Source, l.Feed, l.Ecosystem, l.Mtime); err != nil {
 			return fmt.Errorf("hopper: upsert location %s: %w", l.SHA256, err)
 		}
 	}
@@ -2828,8 +2824,7 @@ func (db *DB) storeResultSQLite(
 			}
 			if m.Path != "" {
 				if _, err := locStmt.ExecContext(ctx,
-					m.SHA256, m.Path, m.Parent, m.LocationRel, m.Filename, m.Source, m.Feed, m.Ecosystem, m.Mtime,
-					locationCapKey(m.SHA256, m.Path)); err != nil {
+					m.SHA256, m.Path, m.Parent, m.LocationRel, m.Filename, m.Source, m.Feed, m.Ecosystem, m.Mtime); err != nil {
 					return StoreStats{}, fmt.Errorf("hopper: upsert member location %s: %w", m.SHA256, err)
 				}
 			}
