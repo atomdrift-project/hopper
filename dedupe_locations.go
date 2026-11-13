@@ -41,7 +41,7 @@ func (db *DB) DedupeLocationsWithOptions(ctx context.Context, root, sha string, 
 	}
 	var label, skip, source string
 	if consolidate {
-		err := db.queryLocations(ctx, `SELECT label, skip, label_source FROM samples WHERE sha256 = $1`, []any{sha}, func(rows locationRows) error {
+		err := db.queryLocations(ctx, `SELECT label, skip, label_source FROM samples WHERE sha256 = $1`, []any{sha}, func(rows sqlRows) error {
 			if !rows.Next() {
 				return fmt.Errorf("hopper: sample %s is absent", sha)
 			}
@@ -113,7 +113,7 @@ func (db *DB) applyLocationDedupeOptions(
 			result.Removed++
 			continue
 		}
-		moved, err := db.moveLocation(ctx, MoveLocationOptions{
+		moved, err := moveLocation(ctx, db, MoveLocationOptions{
 			DataRoot: root, SHA256: sha, OldPath: victim.location.Path, NewPath: plan.survivor.location.Path, ExpectedLabel: label,
 		}, opts.Verify)
 		if errors.Is(err, ErrLocationLabelChanged) {

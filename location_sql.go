@@ -12,8 +12,9 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// locationRows is the read-only intersection of sql.Rows and pgx.Rows.
-type locationRows interface {
+// sqlRows is the read-only intersection of sql.Rows and pgx.Rows, so one
+// visitor serves either backend: the location and gauntlet queries use it.
+type sqlRows interface {
 	Next() bool
 	Scan(...any) error
 	Err() error
@@ -23,7 +24,7 @@ func locationSQLiteSQL(query string) string {
 	return strings.NewReplacer("$1", "?1", "$2", "?2", "$3", "?3", "$4", "?4", "$5", "?5", " FOR UPDATE", "").Replace(query)
 }
 
-func (db *DB) queryLocations(ctx context.Context, query string, args []any, scan func(locationRows) error) error {
+func (db *DB) queryLocations(ctx context.Context, query string, args []any, scan func(sqlRows) error) error {
 	if db.pool != nil {
 		rows, err := db.pool.Query(ctx, query, args...)
 		if err != nil {
@@ -48,13 +49,13 @@ func (db *DB) queryLocations(ctx context.Context, query string, args []any, scan
 
 type locationSQLTx struct {
 	exec  func(string, ...any) error
-	query func(string, []any, func(locationRows) error) error
+	query func(string, []any, func(sqlRows) error) error
 }
 
 func pgLocationSQLTx(ctx context.Context, tx pgx.Tx) locationSQLTx {
 	return locationSQLTx{
 		exec: func(q string, args ...any) error { _, err := tx.Exec(ctx, q, args...); return err },
-		query: func(q string, args []any, scan func(locationRows) error) error {
+		query: func(q string, args []any, scan func(sqlRows) error) error {
 			rows, err := tx.Query(ctx, q, args...)
 			if err != nil {
 				return err
@@ -74,7 +75,7 @@ func sqliteLocationSQLTx(ctx context.Context, tx *sql.Tx) locationSQLTx {
 			_, err := tx.ExecContext(ctx, locationSQLiteSQL(q), args...)
 			return err
 		},
-		query: func(q string, args []any, scan func(locationRows) error) error {
+		query: func(q string, args []any, scan func(sqlRows) error) error {
 			rows, err := tx.QueryContext(ctx, locationSQLiteSQL(q), args...)
 			if err != nil {
 				return err
@@ -122,7 +123,7 @@ func (db *DB) locationTimestamp() any {
 // writes. An ingest that commits after the final move sweep waits here, then
 // observes its retirement record and repairs the old prefix before returning.
 func lockLocationParent(tx locationSQLTx, sha string) error {
-	return tx.query(`SELECT sha256 FROM samples WHERE sha256 = $1 FOR UPDATE`, []any{sha}, func(rows locationRows) error {
+	return tx.query(`SELECT sha256 FROM samples WHERE sha256 = $1 FOR UPDATE`, []any{sha}, func(rows sqlRows) error {
 		for rows.Next() {
 			var sha string
 			if err := rows.Scan(&sha); err != nil {
@@ -173,7 +174,7 @@ func (db *DB) rebaseLocationMembers(ctx context.Context, sha, oldPath, newPath s
 	for {
 		var ids, shas []string
 		err := db.queryLocations(ctx, `SELECT id, sha256 FROM sample_locations
-   WHERE parent_sha256 = $1 AND substr(path, 1, length($2)) = $2 LIMIT 1000`, []any{sha, oldPrefix}, func(rows locationRows) error {
+   WHERE parent_sha256 = $1 AND substr(path, 1, length($2)) = $2 LIMIT 1000`, []any{sha, oldPrefix}, func(rows sqlRows) error {
 			for rows.Next() {
 				var id int64
 				var child string
@@ -227,7 +228,7 @@ func (db *DB) locationRecorded(tx locationSQLTx, sha, path string) (bool, error)
 		predicate += ` AND path_key(path) = path_key($2)`
 	}
 	var found bool
-	err := tx.query(`SELECT EXISTS(SELECT 1 FROM sample_locations WHERE `+predicate+`)`, []any{sha, path}, func(rows locationRows) error {
+	err := tx.query(`SELECT EXISTS(SELECT 1 FROM sample_locations WHERE `+predicate+`)`, []any{sha, path}, func(rows sqlRows) error {
 		if rows.Next() {
 			return rows.Scan(&found)
 		}
@@ -256,7 +257,7 @@ func (db *DB) reconcileRetiredMemberPaths(ctx context.Context, origins []memberO
 			}
 			err = tx.query(`SELECT sha256 FROM sample_locations
     WHERE parent_sha256 = $1 AND substr(path,1,length($2)) = $2`,
-				[]any{origin.sha, origin.path + "!!"}, func(rows locationRows) error {
+				[]any{origin.sha, origin.path + "!!"}, func(rows sqlRows) error {
 					for rows.Next() {
 						var child string
 						if err := rows.Scan(&child); err != nil {
@@ -299,7 +300,7 @@ func (db *DB) activeMoveSuccessor(tx locationSQLTx, origin memberOrigin) (string
 		var next string
 		err = tx.query(`SELECT successor_path FROM sample_location_history
    WHERE sha256 = $1 AND path = $2 AND parent_sha256 = '' AND reason = 'move'
-   ORDER BY retired_at DESC, id DESC LIMIT 1`, []any{origin.sha, current}, func(rows locationRows) error {
+   ORDER BY retired_at DESC, id DESC LIMIT 1`, []any{origin.sha, current}, func(rows sqlRows) error {
 			if rows.Next() {
 				return rows.Scan(&next)
 			}

@@ -37,7 +37,7 @@ func TestHandleReportDrainsAQueue(t *testing.T) {
 		t.Fatalf("unconvicted-suspicious-stale returned %d rows before the drain, want 1", len(before))
 	}
 
-	rec := postJSON(t, api.handleReport, "/api/report",
+	rec := postJSON(t, api.handleReport, "/v1/triage/reports",
 		`{"sha256":"`+sha+`","type":"unconvicted-suspicious-stale","provider":"test","content":"judgement=confirmed"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.Bytes())
@@ -72,14 +72,14 @@ func TestHandleReportRejectsBadInput(t *testing.T) {
 		"missing type": `{"sha256":"` + sha + `"}`,
 		"bad json":     `{`,
 	} {
-		if rec := postJSON(t, api.handleReport, "/api/report", body); rec.Code != http.StatusBadRequest {
+		if rec := postJSON(t, api.handleReport, "/v1/triage/reports", body); rec.Code != http.StatusBadRequest {
 			t.Errorf("%s: status = %d, want 400", name, rec.Code)
 		}
 	}
 
 	// An unrecognized type is warned about, not refused: "re", "gap" and "fpr"
 	// are other producers' and the set is open.
-	rec := postJSON(t, api.handleReport, "/api/report", `{"sha256":"`+sha+`","type":"gap"}`)
+	rec := postJSON(t, api.handleReport, "/v1/triage/reports", `{"sha256":"`+sha+`","type":"gap"}`)
 	if rec.Code != http.StatusOK {
 		t.Errorf("unknown-but-legitimate type: status = %d, want 200", rec.Code)
 	}
@@ -160,7 +160,7 @@ func TestTriageWritesRefusedOnReplica(t *testing.T) {
 	mux := http.NewServeMux()
 	(&apiServer{readOnly: true}).registerAPI(mux)
 
-	for _, path := range []string{"/api/report", "/api/cleave-result"} {
+	for _, path := range []string{"/v1/triage/reports", "/api/cleave-result"} {
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`)))
 		if rec.Code != http.StatusForbidden {
@@ -171,7 +171,7 @@ func TestTriageWritesRefusedOnReplica(t *testing.T) {
 	// And they ARE served on a primary, or the refusal above proves nothing.
 	primary := http.NewServeMux()
 	(&apiServer{}).registerAPI(primary)
-	for _, path := range []string{"/api/report", "/api/cleave-result"} {
+	for _, path := range []string{"/v1/triage/reports", "/api/cleave-result"} {
 		r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
 		if _, pattern := primary.Handler(r); pattern == "" {
 			t.Errorf("POST %s is not routed on a primary", path)

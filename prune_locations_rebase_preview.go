@@ -19,7 +19,7 @@ func (db *DB) previewPruneRebaseTargets(ctx context.Context, rebases []pruneReba
  count(*) FILTER(WHERE d.id IS NOT NULL AND (d.parent_sha256<>v.parent OR d.rel<>v.rel))
  FROM unnest($1::text[],$2::text[],$3::text[],$4::text[]) AS v(sha,path,parent,rel)
  LEFT JOIN sample_locations d ON d.sha256=v.sha AND path_key(d.path)=path_key(v.path) AND d.path=v.path`,
-			[]any{shas, paths, parents, rels}, func(rows locationRows) error {
+			[]any{shas, paths, parents, rels}, func(rows sqlRows) error {
 				if rows.Next() {
 					return rows.Scan(&duplicates, &conflicts)
 				}
@@ -29,7 +29,7 @@ func (db *DB) previewPruneRebaseTargets(ctx context.Context, rebases []pruneReba
 	}
 	for _, r := range rebases {
 		err = db.queryLocations(ctx, `SELECT parent_sha256,rel FROM sample_locations WHERE sha256=$1 AND path=$2`,
-			[]any{r.loc.SHA, r.newPath}, func(rows locationRows) error {
+			[]any{r.loc.SHA, r.newPath}, func(rows sqlRows) error {
 				if rows.Next() {
 					var parent, rel string
 					if err := rows.Scan(&parent, &rel); err != nil {

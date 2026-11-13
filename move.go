@@ -85,12 +85,30 @@ func isWorkflowPool(root string, legacy bool) bool {
 // old sample_locations row is retained until cleanup succeeds, making it the
 // durable retry record for every crash window without a separate moves table.
 func (db *DB) MoveLocation(ctx context.Context, opts MoveLocationOptions) (MoveLocationResult, error) {
-	return db.moveLocation(ctx, opts, true)
+	return moveLocation(ctx, db, opts, true)
+}
+
+// MoveCatalog is what a move asks of a catalog: whether either end is
+// recorded, to record the destination (and any label change) before the
+// source is removed, to retire the source after, and where else the same
+// bytes sit to publish by hard link. DB is one; cmd/hopper adapts the verdict
+// schema's store to it.
+type MoveCatalog interface {
+	TopLevelLocationsRecorded(ctx context.Context, sha, first, second string) (firstOK, secondOK bool, err error)
+	PrepareLocationMove(ctx context.Context, sha, oldRel, newRel string, relabel *LocationRelabel, expectedLabel string) (bool, error)
+	FinishLocationMove(ctx context.Context, sha, oldRel, newRel string) (bool, error)
+	DonorLocationsForSHA(ctx context.Context, sha, pool string, limit int) ([]*SampleLocation, error)
+}
+
+// MoveLocation moves one physical location as DB.MoveLocation does,
+// recording it in cat.
+func MoveLocation(ctx context.Context, cat MoveCatalog, opts MoveLocationOptions) (MoveLocationResult, error) {
+	return moveLocation(ctx, cat, opts, true)
 }
 
 // Unverified consolidation can only adopt an existing catalogued destination;
 // it never publishes or copies sample bytes. Ordinary moves always verify.
-func (db *DB) moveLocation(ctx context.Context, opts MoveLocationOptions, verify bool) (MoveLocationResult, error) {
+func moveLocation(ctx context.Context, cat MoveCatalog, opts MoveLocationOptions, verify bool) (MoveLocationResult, error) {
 	var result MoveLocationResult
 	sha := strings.ToLower(strings.TrimSpace(opts.SHA256))
 	if !isLowerHexSHA256(sha) {
@@ -117,7 +135,7 @@ func (db *DB) moveLocation(ctx context.Context, opts MoveLocationOptions, verify
 	defer contentLock.Close() //nolint:errcheck // closing releases the advisory lock
 
 	if !verify {
-		_, recorded, err := db.TopLevelLocationsRecorded(ctx, sha, opts.OldPath, opts.NewPath)
+		_, recorded, err := cat.TopLevelLocationsRecorded(ctx, sha, opts.OldPath, opts.NewPath)
 		if err != nil {
 			return result, err
 		}
@@ -130,7 +148,7 @@ func (db *DB) moveLocation(ctx context.Context, opts MoveLocationOptions, verify
 		if !errors.Is(err, os.ErrNotExist) {
 			return result, fmt.Errorf("hopper: lock source: %w", err)
 		}
-		return db.recoverMissingLocationMove(ctx, opts, root, sha, verify)
+		return recoverMissingLocationMove(ctx, cat, opts, root, sha, verify)
 	}
 	defer locked.Close() //nolint:errcheck // closing releases the advisory lock
 
@@ -155,7 +173,7 @@ func (db *DB) moveLocation(ctx context.Context, opts MoveLocationOptions, verify
 		if _, err := checkMoveDestination(oldAbs, sha, verify); err != nil {
 			return result, err
 		}
-		prepared, err := db.prepareLocationMove(ctx, sha, opts.OldPath, opts.NewPath, opts.Relabel, opts.ExpectedLabel)
+		prepared, err := cat.PrepareLocationMove(ctx, sha, opts.OldPath, opts.NewPath, opts.Relabel, opts.ExpectedLabel)
 		if err != nil {
 			return result, err
 		}
@@ -174,7 +192,7 @@ func (db *DB) moveLocation(ctx context.Context, opts MoveLocationOptions, verify
 	var artifactCreated bool
 	var destinationInfo os.FileInfo
 	if verify {
-		donors := db.moveDonors(ctx, root, sha, opts.OldPath, opts.NewPath)
+		donors := moveDonors(ctx, cat, root, sha, opts.OldPath, opts.NewPath)
 		artifactCreated, err = publishMoveFile(ctx, oldAbs, newAbs, sha, donors)
 	} else {
 		destinationInfo, err = checkMoveDestination(newAbs, sha, false)
@@ -203,7 +221,7 @@ func (db *DB) moveLocation(ctx context.Context, opts MoveLocationOptions, verify
 		return result, fmt.Errorf("hopper: publish sidecar: %w", err)
 	}
 
-	prepared, err := db.prepareLocationMove(ctx, sha, opts.OldPath, opts.NewPath, opts.Relabel, opts.ExpectedLabel)
+	prepared, err := cat.PrepareLocationMove(ctx, sha, opts.OldPath, opts.NewPath, opts.Relabel, opts.ExpectedLabel)
 	if err != nil {
 		return result, err
 	}
@@ -247,7 +265,7 @@ func (db *DB) moveLocation(ctx context.Context, opts MoveLocationOptions, verify
 		return result, fmt.Errorf("hopper: sync source directory: %w", err)
 	}
 
-	finished, err := db.finishLocationMove(ctx, sha, opts.OldPath, opts.NewPath)
+	finished, err := cat.FinishLocationMove(ctx, sha, opts.OldPath, opts.NewPath)
 	if err != nil {
 		return result, err
 	}
@@ -257,8 +275,8 @@ func (db *DB) moveLocation(ctx context.Context, opts MoveLocationOptions, verify
 	return result, nil
 }
 
-func (db *DB) recoverMissingLocationMove(
-	ctx context.Context, opts MoveLocationOptions, root, sha string, verify bool,
+func recoverMissingLocationMove(
+	ctx context.Context, cat MoveCatalog, opts MoveLocationOptions, root, sha string, verify bool,
 ) (MoveLocationResult, error) {
 	var result MoveLocationResult
 	newAbs := filepath.Join(root, filepath.FromSlash(opts.NewPath))
@@ -266,14 +284,14 @@ func (db *DB) recoverMissingLocationMove(
 	if _, err := checkMoveDestination(newAbs, sha, verify); err != nil {
 		return result, fmt.Errorf("hopper: source missing and destination unusable: %w", err)
 	}
-	prepared, err := db.prepareLocationMove(ctx, sha, opts.OldPath, opts.NewPath, opts.Relabel, opts.ExpectedLabel)
+	prepared, err := cat.PrepareLocationMove(ctx, sha, opts.OldPath, opts.NewPath, opts.Relabel, opts.ExpectedLabel)
 	if err != nil {
 		return result, err
 	}
 	if !prepared {
 		return result, errors.New("hopper: source and destination locations are absent from catalog")
 	}
-	finished, err := db.finishLocationMove(ctx, sha, opts.OldPath, opts.NewPath)
+	finished, err := cat.FinishLocationMove(ctx, sha, opts.OldPath, opts.NewPath)
 	if err != nil {
 		return result, err
 	}
@@ -980,12 +998,12 @@ func publishMoveLink(ctx context.Context, donor, dst, expected, dir string) (boo
 // means minutes per move on exactly the tiny ubiquitous files a hot-pool drain
 // has the most of. A couple more than maxMoveDonors are fetched because the two
 // paths selectMoveDonors excludes may be among the first returned.
-func (db *DB) moveDonors(ctx context.Context, root, sha, oldRel, newRel string) []string {
+func moveDonors(ctx context.Context, cat MoveCatalog, root, sha, oldRel, newRel string) []string {
 	pool, _, ok := strings.Cut(newRel, "/")
 	if !ok {
 		return nil
 	}
-	locs, err := db.DonorLocationsForSHA(ctx, sha, pool, maxMoveDonors+2)
+	locs, err := cat.DonorLocationsForSHA(ctx, sha, pool, maxMoveDonors+2)
 	if err != nil {
 		slog.DebugContext(ctx, "donor lookup failed; publishing by copy",
 			"sha256", sha, "error", err)

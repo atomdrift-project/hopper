@@ -13,7 +13,7 @@ import (
 // returns the recorder.
 func postSightings(t *testing.T, api *apiServer, contentType, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/api/sightings", strings.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/v1/sightings", strings.NewReader(body))
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}

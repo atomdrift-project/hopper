@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -19,13 +20,13 @@ func cmdIngestGauntlet(ctx context.Context) error {
 		return err
 	}
 	if *dsn == "" {
-		return fmt.Errorf("--dsn is required")
+		return errors.New("--dsn is required")
 	}
 	db, err := hopper.Open(ctx, *dsn, "gauntlet-import")
 	if err != nil {
 		return err
 	}
-	defer db.Close() //nolint:errcheck // preserve ingestion errors
+	defer db.Close()
 	if err := db.Migrate(ctx); err != nil {
 		return err
 	}
@@ -35,9 +36,9 @@ func cmdIngestGauntlet(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		defer file.Close()
+		defer file.Close() //nolint:errcheck // read-only input
 		reader = file
-	} //nolint:errcheck // read-only input
+	}
 	dec := json.NewDecoder(reader)
 	inserted, duplicate := 0, 0
 	for {

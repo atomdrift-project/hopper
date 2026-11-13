@@ -149,6 +149,30 @@ func recordRedundantResult(ctx context.Context, lane string) {
 	}
 }
 
+// workPollCount counts claims by outcome: "jobs" handed some out, "empty" had
+// nothing for the worker. The empty share is how input-limited the fleet is;
+// it was read from 204s until an empty poll became a 200 with no jobs.
+var (
+	workPollOnce  sync.Once
+	workPollCount metric.Int64Counter
+)
+
+// recordWorkPoll counts one claim. Same lazy-create/no-op-on-failure contract
+// as recordLoadShed.
+func recordWorkPoll(ctx context.Context, outcome string) {
+	workPollOnce.Do(func() {
+		if c, err := otel.Meter(meterName).Int64Counter(
+			"hopper.work_polls.total",
+			metric.WithDescription("Claims by workers, by outcome: jobs handed out, or empty."),
+		); err == nil {
+			workPollCount = c
+		}
+	})
+	if workPollCount != nil {
+		workPollCount.Add(ctx, 1, metric.WithAttributes(attribute.String("outcome", outcome)))
+	}
+}
+
 // purlLookupCount counts PURLs asked of /v1/lookup's batch form by outcome.
 // Scan workers ask it before fetching a dependency, and every PURL not answered
 // "found" is a download, an analysis and a re-posted result on the fleet — so
@@ -490,7 +514,7 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 		localMemBudget: gauge("hopper.local_worker.memory_budget", "The local scan worker's configured memory budget (--max-memory-gb).", "By"),
 
 		// Archive-member extraction concurrency. in_use approaching max means
-		// /api/file member requests are queuing (or being shed with 503); the
+		// /v1/files member requests are queuing (or being shed with 503); the
 		// ratio is the saturation signal for the extraction cap.
 		extractInUse: gauge("hopper.extract.slots_in_use", "Archive-member extraction slots currently held.", "{slot}"),
 		extractMax:   gauge("hopper.extract.slots_max", "Maximum concurrent archive-member extraction slots.", "{slot}"),
@@ -739,7 +763,7 @@ func observeAge(observer metric.Observer, g metric.Float64Observable, now, t tim
 // succeeded, returns normally — so a result store that burned six lock_timeout
 // retries and thirty seconds of a worker's throughput emitted no metric at all.
 // hopper.insert.failures.total does not cover it either; that counter is fed
-// only from the walk flush, so every lock timeout on the /api/result member
+// only from the walk flush, so every lock timeout on the /v1/work/result member
 // upsert (the path that actually stalls the fleet) went unrecorded.
 //
 // The "cause" attribute reuses classifyInsertFailure's vocabulary rather than

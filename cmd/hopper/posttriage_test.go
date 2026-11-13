@@ -342,7 +342,7 @@ func TestHandleIncomingLocationsFeed(t *testing.T) {
 	}
 	api := &apiServer{db: db, dataRoot: root, tracker: newWorkerTracker()}
 	before := time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano)
-	req := httptest.NewRequest(http.MethodGet, "/api/locations/incoming?before="+before+"&limit=10", http.NoBody)
+	req := httptest.NewRequest(http.MethodGet, "/v1/storage/incoming?before="+before+"&limit=10", http.NoBody)
 	rec := httptest.NewRecorder()
 	api.handleIncomingLocations(rec, req)
 	if rec.Code != http.StatusOK {
@@ -693,7 +693,7 @@ func callTriage(t *testing.T, api *apiServer, req triageRequest) triageResponse 
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
-	r := httptest.NewRequest(http.MethodPost, "/api/triage", bytes.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/v1/triage/rulings", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 	api.handleTriage(rec, r)
 	if rec.Code != http.StatusOK {
@@ -786,7 +786,7 @@ func TestHandleIncomingLocationsClassified(t *testing.T) {
 	fetch := func(class string) incomingLocationsResponse {
 		t.Helper()
 		before := time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano)
-		url := "/api/locations/incoming?limit=10&before=" + before
+		url := "/v1/storage/incoming?limit=10&before=" + before
 		if class != "" {
 			url += "&class=" + class
 		}
@@ -822,7 +822,7 @@ func TestHandleIncomingLocationsClassified(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	api.handleIncomingLocations(rec, httptest.NewRequest(http.MethodGet, "/api/locations/incoming?class=sideways", http.NoBody))
+	api.handleIncomingLocations(rec, httptest.NewRequest(http.MethodGet, "/v1/storage/incoming?class=sideways", http.NoBody))
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("class=sideways status = %d, want 400", rec.Code)
 	}
@@ -956,7 +956,7 @@ func TestScanSupportsSidecarsReadsTheScanHelp(t *testing.T) {
 func TestTriageStartingIsRetryable(t *testing.T) {
 	for _, api := range []*apiServer{{}, {dataRoot: t.TempDir()}} {
 		rec := httptest.NewRecorder()
-		api.handleTriage(rec, httptest.NewRequest(http.MethodPost, "/api/triage", strings.NewReader(`{"verdicts":[]}`)))
+		api.handleTriage(rec, httptest.NewRequest(http.MethodPost, "/v1/triage/rulings", strings.NewReader(`{"verdicts":[]}`)))
 		if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
 			t.Fatalf("startup response = %d, headers=%v, body=%s", rec.Code, rec.Header(), rec.Body.String())
 		}

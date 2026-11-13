@@ -14,7 +14,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -24,7 +23,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/atomdrift-project/hopper"
-	"github.com/atomdrift-project/hopper/pkgparse"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -438,33 +436,11 @@ func TestWorkerTrackerOldestPerWorkerPrunesStale(t *testing.T) {
 	}
 }
 
-func TestHandleHealthzNeedsNothing(t *testing.T) {
-	// db and tracker deliberately nil: healthz is the probe that must answer
-	// even when everything behind the HTTP layer is broken, so constructing
-	// it with a gutted server is the point, not a shortcut.
-	api := &apiServer{hopperStart: time.Now().Add(-90 * time.Second)}
-	rec := httptest.NewRecorder()
-	api.handleHealthz(rec, httptest.NewRequest(http.MethodGet, "/healthz", http.NoBody))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
-	}
-	var body struct {
-		Status string `json:"status"`
-		Uptime string `json:"uptime"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("healthz body %q is not JSON: %v", rec.Body.String(), err)
-	}
-	if body.Status != "ok" || body.Uptime == "" {
-		t.Fatalf("healthz body = %+v, want status ok with uptime", body)
-	}
-}
-
 func TestHandleHeartbeatRecordsTelemetryAndConvertsAges(t *testing.T) {
 	api := &apiServer{tracker: newWorkerTracker()} // db nil: heartbeat must not touch it
 
 	req := httptest.NewRequest(http.MethodGet,
-		"/api/heartbeat?worker=nuc&slots=4&active=2&queue=3&rss_mb=512&load1=1.50"+
+		"/v1/work/heartbeat?worker=nuc&slots=4&active=2&queue=3&rss_mb=512&load1=1.50"+
 			"&fps=2.500&errs=1&oldest_s=30&done_age_s=10&err_age_s=5&err=boom&version=9.9&traits=abcde",
 		http.NoBody)
 	req.RemoteAddr = "127.0.0.1:1234" // loopback keeps the bare worker name
@@ -561,7 +537,7 @@ func TestReleaseOwnedDropsOnlyThisWorkersClaims(t *testing.T) {
 
 func TestHandleHeartbeatRejectsInvalidWorker(t *testing.T) {
 	api := &apiServer{tracker: newWorkerTracker()}
-	req := httptest.NewRequest(http.MethodGet, "/api/heartbeat?worker=bad%20name", http.NoBody)
+	req := httptest.NewRequest(http.MethodGet, "/v1/work/heartbeat?worker=bad%20name", http.NoBody)
 	rec := httptest.NewRecorder()
 	api.handleHeartbeat(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -897,7 +873,7 @@ func TestHandleResultStoresAfterRequestContextCanceled(t *testing.T) {
 
 	reqCtx, cancelReq := context.WithCancel(ctx)
 	cancelReq()
-	req := httptest.NewRequest(http.MethodPost, "/api/result", bytes.NewReader(body)).WithContext(reqCtx)
+	req := httptest.NewRequest(http.MethodPost, "/v1/work/result", bytes.NewReader(body)).WithContext(reqCtx)
 	rec := httptest.NewRecorder()
 	api := &apiServer{db: db, tracker: newWorkerTracker(), progress: &loadProgress{}}
 
@@ -929,7 +905,7 @@ func TestHandleResultAcknowledgesAbsentSample(t *testing.T) {
 		t.Fatal(err)
 	}
 	api := &apiServer{db: db, tracker: newWorkerTracker(), progress: &loadProgress{}}
-	req := httptest.NewRequest(http.MethodPost, "/api/result", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/v1/work/result", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 	api.handleResult(rec, req)
 	if rec.Code != http.StatusOK {
@@ -974,7 +950,7 @@ func TestHandleResultSkipsAStoreThatWouldChangeNothing(t *testing.T) {
 	api := &apiServer{db: db, tracker: newWorkerTracker(), progress: &loadProgress{}}
 	post := func() (int, bool) {
 		rec := httptest.NewRecorder()
-		api.handleResult(rec, httptest.NewRequest(http.MethodPost, "/api/result", bytes.NewReader(body)))
+		api.handleResult(rec, httptest.NewRequest(http.MethodPost, "/v1/work/result", bytes.NewReader(body)))
 		// An ordinary store answers {"ok":true}; only a skipped one names
 		// `stored`, so an absent field is a store that happened.
 		response := struct {
@@ -1056,7 +1032,7 @@ func TestHandleResultRejectsRootSHAMismatch(t *testing.T) {
 	}
 	api := &apiServer{db: db, tracker: newWorkerTracker(), progress: &loadProgress{}}
 	rec := httptest.NewRecorder()
-	api.handleResult(rec, httptest.NewRequest(http.MethodPost, "/api/result", bytes.NewReader(body)))
+	api.handleResult(rec, httptest.NewRequest(http.MethodPost, "/v1/work/result", bytes.NewReader(body)))
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
@@ -1100,7 +1076,7 @@ func TestHandleResultShedsLoadWhenSaturated(t *testing.T) {
 	}
 	reqCtx, cancel := context.WithCancel(ctx)
 	cancel()
-	req := httptest.NewRequest(http.MethodPost, "/api/result", bytes.NewReader(body)).WithContext(reqCtx)
+	req := httptest.NewRequest(http.MethodPost, "/v1/work/result", bytes.NewReader(body)).WithContext(reqCtx)
 	rec := httptest.NewRecorder()
 
 	api.handleResult(rec, req)
@@ -1144,7 +1120,7 @@ func TestResultBody(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			r := httptest.NewRequest(http.MethodPost, "/api/result", bytes.NewReader(tc.body))
+			r := httptest.NewRequest(http.MethodPost, "/v1/work/result", bytes.NewReader(tc.body))
 			if tc.encoding != "" {
 				r.Header.Set("Content-Encoding", tc.encoding)
 			}
@@ -1309,7 +1285,7 @@ func TestCheckBrowserCSRF(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			r := httptest.NewRequest(http.MethodPost, "/api/upload", http.NoBody)
+			r := httptest.NewRequest(http.MethodPost, "/v1/intake/upload", http.NoBody)
 			if tc.fetchSite != "" {
 				r.Header.Set("Sec-Fetch-Site", tc.fetchSite)
 			}
@@ -1528,7 +1504,7 @@ func mustJSON(t *testing.T, v any) []byte {
 
 func postUpload(t *testing.T, api *apiServer, body *bytes.Buffer, contentType string) *httptest.ResponseRecorder {
 	t.Helper()
-	r := httptest.NewRequest(http.MethodPost, "/api/upload", body)
+	r := httptest.NewRequest(http.MethodPost, "/v1/intake/upload", body)
 	r.Header.Set("Content-Type", contentType)
 	w := httptest.NewRecorder()
 	api.handleUpload(w, r)
@@ -1773,7 +1749,7 @@ func TestHandleUploadCoordinateCollision(t *testing.T) {
 // TestHandleUploadKeepsKnownBytesInPlace proves an upload of a digest hopper
 // already holds refreshes the row without laying down a second copy — even when
 // the new sidecar would route those bytes into an entirely different tree. It is
-// what keeps a layout change, or a producer that skips the /api/known probe,
+// what keeps a layout change, or a producer that skips the /v1/intake/held probe,
 // from duplicating the corpus.
 func TestHandleUploadKeepsKnownBytesInPlace(t *testing.T) {
 	t.Parallel()
@@ -1825,7 +1801,7 @@ func provenanceOnlyUpload(t *testing.T, prov []byte) (body *bytes.Buffer, conten
 	return &buf, mw.FormDataContentType()
 }
 
-// postDepResult posts a dependency verdict to /api/result keyed by content sha,
+// postDepResult posts a dependency verdict to /v1/work/result keyed by content sha,
 // with a real cleave report (fileType keeps StoreResult from deleting the row on
 // an empty FileType). Returns the stored cleave_result for difference checks.
 func postDepResult(t *testing.T, api *apiServer, sha, fileType string, lvl int) []byte {
@@ -1836,7 +1812,7 @@ func postDepResult(t *testing.T, api *apiServer, sha, fileType string, lvl int) 
 	if err != nil {
 		t.Fatalf("marshal result: %v", err)
 	}
-	r := httptest.NewRequest(http.MethodPost, "/api/result", bytes.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/v1/work/result", bytes.NewReader(body))
 	w := httptest.NewRecorder()
 	api.handleResult(w, r)
 	if w.Code != http.StatusOK {
@@ -1954,7 +1930,7 @@ func TestHandleKnown(t *testing.T) {
 	missing := strings.Repeat("c", 64)
 
 	reqBody := mustJSON(t, knownRequest{SHA256: append(append([]string{}, have...), missing, "NOT-HEX")})
-	r := httptest.NewRequest(http.MethodPost, "/api/known", bytes.NewReader(reqBody))
+	r := httptest.NewRequest(http.MethodPost, "/v1/intake/held", bytes.NewReader(reqBody))
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	api.handleKnown(w, r)
@@ -1989,7 +1965,7 @@ func TestHandleKnownBatchCap(t *testing.T) {
 		shas[i] = strings.Repeat("a", 64)
 	}
 	reqBody := mustJSON(t, knownRequest{SHA256: shas})
-	r := httptest.NewRequest(http.MethodPost, "/api/known", bytes.NewReader(reqBody))
+	r := httptest.NewRequest(http.MethodPost, "/v1/intake/held", bytes.NewReader(reqBody))
 	w := httptest.NewRecorder()
 	api.handleKnown(w, r)
 	if w.Code != http.StatusRequestEntityTooLarge {
@@ -2044,8 +2020,8 @@ func TestHandleUploadMultipartRejections(t *testing.T) {
 		if w.Code != http.StatusRequestEntityTooLarge {
 			t.Errorf("code=%d body=%s want 413", w.Code, w.Body.String())
 		}
-		if !strings.Contains(w.Body.String(), "provenance too large") {
-			t.Errorf("body=%s want provenance too large", w.Body.String())
+		if !strings.Contains(w.Body.String(), `"code":"provenance_too_large"`) {
+			t.Errorf("body=%s want code provenance_too_large", w.Body.String())
 		}
 	})
 
@@ -2139,7 +2115,7 @@ func TestHandleResultMissingRespectsDatasetIncomplete(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Marshal: %v", err)
 			}
-			req := httptest.NewRequest(http.MethodPost, "/api/result", bytes.NewReader(body))
+			req := httptest.NewRequest(http.MethodPost, "/v1/work/result", bytes.NewReader(body))
 			rec := httptest.NewRecorder()
 			api := &apiServer{
 				db: db, tracker: newWorkerTracker(), progress: &loadProgress{},
@@ -2235,7 +2211,7 @@ func TestHandleRescan(t *testing.T) {
 	}
 
 	post := func(target string) *httptest.ResponseRecorder {
-		r := httptest.NewRequest(http.MethodPost, "/api/rescan/"+target, http.NoBody)
+		r := httptest.NewRequest(http.MethodPost, "/v1/work/rescan/"+target, http.NoBody)
 		r.SetPathValue("sha256", target)
 		rec := httptest.NewRecorder()
 		api.handleRescan(rec, r)
@@ -2267,7 +2243,7 @@ func TestHandleRescan(t *testing.T) {
 
 	// DB still starting (db nil): 503.
 	starting := &apiServer{}
-	r := httptest.NewRequest(http.MethodPost, "/api/rescan/"+sha, http.NoBody)
+	r := httptest.NewRequest(http.MethodPost, "/v1/work/rescan/"+sha, http.NoBody)
 	r.SetPathValue("sha256", sha)
 	rec = httptest.NewRecorder()
 	starting.handleRescan(rec, r)
@@ -2315,7 +2291,7 @@ func TestHandleFileMarksMissing(t *testing.T) {
 
 	get := func(t *testing.T, srv *apiServer, sha string) int {
 		t.Helper()
-		r := httptest.NewRequest(http.MethodGet, "/api/file/"+sha, http.NoBody)
+		r := httptest.NewRequest(http.MethodGet, "/v1/files/"+sha, http.NoBody)
 		r.SetPathValue("sha256", sha)
 		rec := httptest.NewRecorder()
 		srv.handleFile(rec, r)
@@ -2404,7 +2380,7 @@ func TestHandleFileReactivatesPrunedPrimaryLocation(t *testing.T) {
 	}
 
 	api := &apiServer{db: db, dataRoot: root, allowedDirs: []string{resolvedRoot}, tracker: newWorkerTracker()}
-	r := httptest.NewRequest(http.MethodGet, "/api/file/"+sha, http.NoBody)
+	r := httptest.NewRequest(http.MethodGet, "/v1/files/"+sha, http.NoBody)
 	r.SetPathValue("sha256", sha)
 	rec := httptest.NewRecorder()
 	api.handleFile(rec, r)
@@ -2466,7 +2442,7 @@ func TestHandleFileFallsBackAndHealsPrimaryPath(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(previousLogger) })
 
 	api := &apiServer{db: db, dataRoot: root, allowedDirs: []string{resolvedRoot}, tracker: newWorkerTracker()}
-	r := httptest.NewRequest(http.MethodGet, "/api/file/"+sha, http.NoBody)
+	r := httptest.NewRequest(http.MethodGet, "/v1/files/"+sha, http.NoBody)
 	r.SetPathValue("sha256", sha)
 	rec := httptest.NewRecorder()
 	api.handleFile(rec, r)
@@ -2517,7 +2493,7 @@ func TestHandleFileFallbackMarksMissingOnlyAfterAllLocationsFail(t *testing.T) {
 		}
 	}
 	api := &apiServer{db: db, dataRoot: root, allowedDirs: []string{resolvedRoot}, tracker: newWorkerTracker()}
-	r := httptest.NewRequest(http.MethodGet, "/api/file/"+sha, http.NoBody)
+	r := httptest.NewRequest(http.MethodGet, "/v1/files/"+sha, http.NoBody)
 	r.SetPathValue("sha256", sha)
 	rec := httptest.NewRecorder()
 	api.handleFile(rec, r)
@@ -2562,7 +2538,7 @@ func TestHandleNextFallsBackBeforeMarkingClaimMissing(t *testing.T) {
 	}
 
 	api := &apiServer{db: db, dataRoot: root, allowedDirs: []string{resolvedRoot}, tracker: newWorkerTracker()}
-	r := httptest.NewRequest(http.MethodGet, "/api/next?worker=tester&count=1&slots=1", http.NoBody)
+	r := httptest.NewRequest(http.MethodGet, "/v1/work/next?worker=tester&count=1&slots=1", http.NoBody)
 	rec := httptest.NewRecorder()
 	api.handleNext(rec, r)
 	if rec.Code != http.StatusOK {
@@ -2639,7 +2615,7 @@ func TestHandleArchiveMemberFallsBackToKnownParentLocation(t *testing.T) {
 	}
 
 	api := &apiServer{db: db, dataRoot: root, allowedDirs: []string{resolvedRoot}, tracker: newWorkerTracker()}
-	r := httptest.NewRequest(http.MethodGet, "/api/file/"+childSHA, http.NoBody)
+	r := httptest.NewRequest(http.MethodGet, "/v1/files/"+childSHA, http.NoBody)
 	r.SetPathValue("sha256", childSHA)
 	rec := httptest.NewRecorder()
 	api.handleFile(rec, r)
@@ -2649,171 +2625,6 @@ func TestHandleArchiveMemberFallsBackToKnownParentLocation(t *testing.T) {
 	parent, err := db.SampleBySHA256(ctx, parentSHA)
 	if err != nil || parent.Path != validPath {
 		t.Fatalf("healed parent = %+v, %v", parent, err)
-	}
-}
-
-func TestHandleSample(t *testing.T) {
-	ctx := context.Background()
-	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "hopper.db"))
-	defer db.Close()
-	if err := db.Migrate(ctx); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
-	api := &apiServer{db: db, tracker: newWorkerTracker()}
-
-	analyzed := strings.Repeat("a", 64)
-	pending := strings.Repeat("b", 64)
-	missing := strings.Repeat("c", 64)
-
-	for _, s := range []*hopper.Sample{
-		{SHA256: analyzed, Path: "incoming/a.bin", Source: "", PURLBase: "pkg:npm/left-pad", Version: "1.3.0"},
-		{SHA256: pending, Path: "incoming/b.bin", Source: ""},
-	} {
-		if err := db.InsertSample(ctx, s); err != nil {
-			t.Fatalf("InsertSample: %v", err)
-		}
-	}
-	cleave := []byte(`{"fs":[{"sha":"` + analyzed + `","type":"js","dp":0}]}`)
-	if err := db.UpdateCleaveResult(ctx, analyzed, cleave, nil, ""); err != nil {
-		t.Fatalf("UpdateCleaveResult: %v", err)
-	}
-	if err := db.UpdateLitmusResult(ctx, analyzed, []byte(`{"v":"7","prob":0.01,"lvl":-1}`)); err != nil {
-		t.Fatalf("UpdateLitmusResult: %v", err)
-	}
-
-	get := func(sha string) *httptest.ResponseRecorder {
-		t.Helper()
-		r := httptest.NewRequest(http.MethodGet, "/api/sample/"+sha, http.NoBody)
-		r.SetPathValue("sha256", sha)
-		rec := httptest.NewRecorder()
-		api.handleSample(rec, r)
-		return rec
-	}
-
-	rec := get(analyzed)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("analyzed: status = %d body = %s", rec.Code, rec.Body.Bytes())
-	}
-	if rec.Header().Get("X-Sha256") != analyzed {
-		t.Errorf("X-Sha256 = %q", rec.Header().Get("X-Sha256"))
-	}
-	var env map[string]json.RawMessage
-	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
-		t.Fatalf("envelope json: %v", err)
-	}
-	if _, ok := env["ml"]; !ok {
-		t.Fatalf("envelope missing ml: %s", rec.Body.Bytes())
-	}
-
-	// A sample we hold but have not analyzed is "accepted, still working" —
-	// distinguishable from a 404 we know nothing about and from a 200 with a
-	// verdict, which is what lets a caller decide to wait.
-	if rec := get(pending); rec.Code != http.StatusAccepted {
-		t.Fatalf("pending: status = %d, want 202", rec.Code)
-	}
-	if rec := get(missing); rec.Code != http.StatusNotFound {
-		t.Fatalf("missing: status = %d, want 404", rec.Code)
-	}
-	if rec := get("nope"); rec.Code != http.StatusBadRequest {
-		t.Fatalf("invalid sha: status = %d, want 400", rec.Code)
-	}
-}
-
-func TestHandleSampleByPURL(t *testing.T) {
-	ctx := context.Background()
-	db := mustOpenDB(t, ctx, filepath.Join(t.TempDir(), "hopper.db"))
-	defer db.Close()
-	if err := db.Migrate(ctx); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
-	api := &apiServer{db: db, tracker: newWorkerTracker()}
-
-	sha := strings.Repeat("d", 64)
-	if err := db.InsertSample(ctx, &hopper.Sample{
-		SHA256: sha, Path: "incoming/left-pad.tgz", Source: "forager",
-		PURLBase: "pkg:npm/left-pad", Version: "1.3.0",
-	}); err != nil {
-		t.Fatalf("InsertSample: %v", err)
-	}
-	cleave := []byte(`{"fs":[{"sha":"` + sha + `","type":"js","dp":0}]}`)
-	if err := db.UpdateCleaveResult(ctx, sha, cleave, nil, ""); err != nil {
-		t.Fatalf("UpdateCleaveResult: %v", err)
-	}
-	if err := db.UpdateLitmusResult(ctx, sha, []byte(`{"v":"7","prob":0.01,"lvl":-1}`)); err != nil {
-		t.Fatalf("UpdateLitmusResult: %v", err)
-	}
-
-	get := func(purl string) *httptest.ResponseRecorder {
-		t.Helper()
-		r := httptest.NewRequest(http.MethodGet, "/api/sample?purl="+url.QueryEscape(purl), http.NoBody)
-		rec := httptest.NewRecorder()
-		api.handleSampleByPURL(rec, r)
-		return rec
-	}
-
-	rec := get("pkg:npm/left-pad@1.3.0")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("versioned: status = %d body = %s", rec.Code, rec.Body.Bytes())
-	}
-	if rec.Header().Get("X-Sha256") != sha {
-		t.Errorf("X-Sha256 = %q, want %s", rec.Header().Get("X-Sha256"), sha)
-	}
-	var env map[string]json.RawMessage
-	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
-		t.Fatalf("envelope json: %v", err)
-	}
-	if _, ok := env["ml"]; !ok {
-		t.Fatalf("envelope missing ml: %s", rec.Body.Bytes())
-	}
-	if _, ok := env["raw"]; !ok {
-		t.Fatalf("envelope missing raw (cleave): %s", rec.Body.Bytes())
-	}
-
-	if rec := get("pkg:npm/left-pad"); rec.Code != http.StatusOK {
-		t.Fatalf("versionless: status = %d, want 200", rec.Code)
-	}
-
-	// A scoped npm name carries an '@' that is namespace, not version. Split on
-	// the last one and base becomes "pkg:npm/" — a coordinate no row holds — so
-	// every scoped package 404s, versioned and versionless alike.
-	//
-	// Seeded through the same canonicalization the upload path applies (see
-	// handleUpload's purl_base projection) rather than a hardcoded spelling, so
-	// this asserts the property that matters — what ingest stores is what a
-	// lookup finds — and keeps holding if the canonical spelling of a scope
-	// ever changes again.
-	scoped := strings.Repeat("e", 64)
-	scopedBase := pkgparse.VersionlessPURL(pkgparse.CanonicalizePURL("pkg:npm/@zynkit/jwtbytes@0.5.2"))
-	if scopedBase == "" || strings.HasSuffix(scopedBase, "/") {
-		t.Fatalf("scoped purl_base collapsed to %q — the scope was read as a version", scopedBase)
-	}
-	if err := db.InsertSample(ctx, &hopper.Sample{
-		SHA256: scoped, Path: "incoming/jwtbytes.tgz", Source: "forager",
-		PURLBase: scopedBase, Version: "0.5.2",
-	}); err != nil {
-		t.Fatalf("InsertSample: %v", err)
-	}
-	if err := db.UpdateCleaveResult(ctx, scoped,
-		[]byte(`{"fs":[{"sha":"`+scoped+`","type":"js","dp":0}]}`), nil, ""); err != nil {
-		t.Fatalf("UpdateCleaveResult: %v", err)
-	}
-	if err := db.UpdateLitmusResult(ctx, scoped, []byte(`{"v":"7","prob":0.01,"lvl":-1}`)); err != nil {
-		t.Fatalf("UpdateLitmusResult: %v", err)
-	}
-	for _, purl := range []string{"pkg:npm/@zynkit/jwtbytes@0.5.2", "pkg:npm/@zynkit/jwtbytes"} {
-		rec := get(purl)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("scoped %s: status = %d, want 200", purl, rec.Code)
-		}
-		if rec.Header().Get("X-Sha256") != scoped {
-			t.Errorf("scoped %s: X-Sha256 = %q, want %s", purl, rec.Header().Get("X-Sha256"), scoped)
-		}
-	}
-	if rec := get("pkg:npm/no-such-package@1.0.0"); rec.Code != http.StatusNotFound {
-		t.Fatalf("miss: status = %d, want 404", rec.Code)
-	}
-	if rec := get(""); rec.Code != http.StatusBadRequest {
-		t.Fatalf("empty: status = %d, want 400", rec.Code)
 	}
 }
 
@@ -2877,7 +2688,7 @@ func TestHandleResultRecordsWorkerAttribution(t *testing.T) {
 		t.Fatal(err)
 	}
 	api := &apiServer{db: db, tracker: newWorkerTracker(), progress: &loadProgress{}}
-	req := httptest.NewRequest(http.MethodPost, "/api/result", http.NoBody)
+	req := httptest.NewRequest(http.MethodPost, "/v1/work/result", http.NoBody)
 	worker := qualifiedWorkerName("nazgul", req.RemoteAddr)
 	api.tracker.update(worker, 4, "0.9.1", "b8c1c", 0, 0, "")
 
@@ -2890,7 +2701,7 @@ func TestHandleResultRecordsWorkerAttribution(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := httptest.NewRecorder()
-	api.handleResult(rec, httptest.NewRequest(http.MethodPost, "/api/result", bytes.NewReader(body)))
+	api.handleResult(rec, httptest.NewRequest(http.MethodPost, "/v1/work/result", bytes.NewReader(body)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}

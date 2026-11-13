@@ -24,7 +24,7 @@ func pruneTestPools(t *testing.T, root string, pools ...string) {
 func pruneTestCount(t *testing.T, db *DB, table string) int {
 	t.Helper()
 	var count int
-	if err := db.queryLocations(t.Context(), `SELECT count(*) FROM `+table, nil, func(rows locationRows) error {
+	if err := db.queryLocations(t.Context(), `SELECT count(*) FROM `+table, nil, func(rows sqlRows) error {
 		if rows.Next() {
 			return rows.Scan(&count)
 		}

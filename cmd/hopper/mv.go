@@ -11,7 +11,7 @@ package main
 // they already had.
 //
 // So this takes the identifiers directly and sends the same request to the
-// same endpoint. The master does the work: POST /api/triage moves the on-disk
+// same endpoint. The master does the work: POST /v1/triage/rulings moves the on-disk
 // artifact into its corrected pool bucket and flips the DB label in one
 // operation, which is why "mv" is the honest name — a relabel here is a move,
 // and a move is a relabel. Nothing is copied over the wire.

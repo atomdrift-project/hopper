@@ -56,7 +56,7 @@ func (db *DB) pruneParentInfo(ctx context.Context, sha string, c *pruneChecker, 
 	err := db.queryLocations(ctx, `SELECT path FROM sample_locations
  WHERE sha256=$1 AND rel IN `+containmentRelsSQL+` AND path NOT LIKE '%://%'
  ORDER BY CASE WHEN parent_sha256='' THEN 0 ELSE 1 END, first_seen_at, id LIMIT $2`, []any{sha, pruneParentLimit + 1},
-		func(rows locationRows) error {
+		func(rows sqlRows) error {
 			for rows.Next() {
 				var path string
 				if err := rows.Scan(&path); err != nil {
@@ -73,7 +73,7 @@ func (db *DB) pruneParentInfo(ctx context.Context, sha string, c *pruneChecker, 
 	p.incomplete = len(candidates) > pruneParentLimit
 	historyRows := 0
 	err = db.queryLocations(ctx, `SELECT path FROM sample_location_history WHERE sha256=$1 LIMIT $2`, []any{sha, pruneParentLimit + 1},
-		func(rows locationRows) error {
+		func(rows sqlRows) error {
 			for rows.Next() {
 				var path string
 				if err := rows.Scan(&path); err != nil {
@@ -237,7 +237,7 @@ func (db *DB) rebasePruneLocations(ctx context.Context, rebases []pruneRebase) (
 		if len(ids) == 0 {
 			return nil
 		}
-		count := func(rows locationRows) error {
+		count := func(rows sqlRows) error {
 			for rows.Next() {
 				moved++
 			}
@@ -250,7 +250,7 @@ func (db *DB) rebasePruneLocations(ctx context.Context, rebases []pruneRebase) (
 			// Same lock order as deletePruneLocations: content rows by SHA. SQLite
 			// write transactions are already serialized.
 			if err := tx.query(`SELECT sha256 FROM samples WHERE sha256=ANY($1) ORDER BY sha256 FOR UPDATE`,
-				[]any{locked}, func(rows locationRows) error {
+				[]any{locked}, func(rows sqlRows) error {
 					for rows.Next() {
 					}
 					return rows.Err()
@@ -269,7 +269,7 @@ func (db *DB) rebasePruneLocations(ctx context.Context, rebases []pruneRebase) (
 			// deleted. Ingest can update its relation without a sample lock.
 			if err := tx.query(`SELECT d.id FROM unnest($1::text[],$2::text[]) AS v(sha,path)
  JOIN sample_locations d ON d.sha256=v.sha AND path_key(d.path)=path_key(v.path) AND d.path=v.path
- ORDER BY d.id FOR SHARE OF d`, []any{shas, news}, func(rows locationRows) error {
+ ORDER BY d.id FOR SHARE OF d`, []any{shas, news}, func(rows sqlRows) error {
 				for rows.Next() {
 				}
 				return rows.Err()

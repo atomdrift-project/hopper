@@ -17,7 +17,7 @@ package main
 // bad/foraged-quarantine/ (evidence-confirmed). Run promoter immediately
 // after -apply so hostile rows return to the bad pool within one pass.
 //
-// Demotion goes through the master's /api/triage ruling "sighted"
+// Demotion goes through the master's /v1/triage/rulings ruling "sighted"
 // (EXDEV-safe file move bad/foraged/X -> sighted/foraged/X + DB relabel +
 // label_events audit, per-row idempotent). Archive members of demoted parents
 // are demoted in a DB-only pass (members have no standalone file), and each
@@ -104,7 +104,7 @@ func cmdDemoteSighted(ctx context.Context) error {
 	dsn := f.String("db", "", "database DSN (default: $DATABASE_URL)")
 	baseURL := f.String("url", "http://hopper-api:8081/", "hopper master API base URL") //nolint:revive // unsecure-url-scheme: internal cluster HTTP
 	apply := f.Bool("apply", false, "apply the demotions (default: dry-run report only)")
-	batch := f.Int("batch", 1000, "verdicts per /api/triage request")
+	batch := f.Int("batch", 1000, "verdicts per /v1/triage/rulings request")
 	manifest := f.String("manifest", "demote-sighted-manifest.jsonl", "append per-row move results here (the rollback record)")
 	parseFlags(f, os.Args[2:])
 

@@ -56,7 +56,7 @@ func openPlanDB(t *testing.T) *DB {
 
 // TestMarkCorroboratedSQLShape always runs: the mark-corroborated statements
 // must stay single-column. Reintroducing `sha256 = ANY OR purl_base = ANY`
-// is exactly the /api/sightings timeout we hit on 2026-08-17.
+// is exactly the /v1/sightings timeout we hit on 2026-08-17.
 func TestMarkCorroboratedSQLShape(t *testing.T) {
 	for _, tc := range []struct {
 		name, sql string
@@ -113,7 +113,7 @@ func TestPlanAuditSamplesHotPaths(t *testing.T) {
 	purls := planAuditPURLs(500)
 	mixed := append(append([]string{}, shas...), purls...)
 
-	// Calibration: the OR form that timed out /api/sightings must still seq-scan.
+	// Calibration: the OR form that timed out /v1/sightings must still seq-scan.
 	// If the planner ever stops doing that, the positive checks below lose their
 	// meaning and we should revisit rather than silently pass.
 	badPlan := explainText(t, ctx, db,

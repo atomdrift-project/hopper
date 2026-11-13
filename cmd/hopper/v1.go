@@ -23,8 +23,8 @@ const v1LookupTimeout = 5 * time.Second
 // handleV1Lookup answers what the corpus knows about one artifact.
 //
 // GET /v1/lookup?sha256=…&purl=… — either key, or both. 200 with the record,
-// 404 when nothing is stored, 202 when the bytes are held but nothing has
-// analyzed them yet.
+// whose state is "pending" when the bytes are held but nothing has analyzed
+// them yet; 404 when nothing is stored.
 //
 // No threshold parameter and no decision: turning a level into allow/block
 // belongs to whoever holds the policy, and a second implementation of that one
@@ -32,7 +32,7 @@ const v1LookupTimeout = 5 * time.Second
 // stored; see [hopper.LookupRecord].
 func (s *apiServer) handleV1Lookup(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
-		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
+		writeRetryable(w, retryAfterStarting, "starting", "Starting.")
 		return
 	}
 	sha := strings.TrimSpace(r.URL.Query().Get("sha256"))
@@ -69,7 +69,7 @@ func (s *apiServer) handleV1Lookup(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), v1LookupTimeout)
 	defer cancel()
 
-	record, err := s.db.LookupRecord(ctx, strings.ToLower(sha), base, version)
+	record, err := s.lookup(ctx, strings.ToLower(sha), base, version)
 	if err != nil {
 		if errors.Is(err, hopper.ErrNotFound) {
 			v1Error(w, http.StatusNotFound, "unknown_artifact", "Nothing stored for that artifact.")
@@ -78,18 +78,6 @@ func (s *apiServer) handleV1Lookup(w http.ResponseWriter, r *http.Request) {
 		slog.ErrorContext(r.Context(), "v1 lookup failed",
 			"sha256", sha, "purl", canon, "error", err, "remote", r.RemoteAddr)
 		v1Error(w, http.StatusInternalServerError, "internal", "Lookup failed.")
-		return
-	}
-
-	// Held, but nobody has looked at it. 202 rather than an empty 200: an
-	// answer is coming for this key, which is worth waiting on rather than
-	// reading as "we looked and there was nothing".
-	if !record.Analyzed {
-		if record.SHA256 != nil {
-			w.Header().Set("X-Sha256", *record.SHA256)
-		}
-		w.Header().Set("Retry-After", strconv.Itoa(sampleQueuedRetryAfter))
-		w.WriteHeader(http.StatusAccepted)
 		return
 	}
 
@@ -110,7 +98,7 @@ const v1LookupBatchMax = 50
 // handleV1LookupBatch answers GET /v1/lookup?purl=…&purl=… — several packages
 // in one request, as scan's pre-fetch dependency negotiation asks.
 //
-// Always 200 with a list, holding one record per PURL the corpus has an
+// Always 200 with {"records": […]}, one record per PURL the corpus has an
 // analyzed verdict for, in the order asked; unknown, held-but-unanalyzed and
 // unparseable PURLs are simply absent. Each record's purl is the caller's
 // bytes, unaltered, because a caller matches a list reply to its request by
@@ -147,7 +135,7 @@ func (s *apiServer) handleV1LookupBatch(w http.ResponseWriter, r *http.Request, 
 			invalid++
 			continue
 		}
-		record, err := s.db.LookupRecord(ctx, "", pkgparse.VersionlessPURL(canon), pkgparse.PURLVersion(canon))
+		record, err := s.lookup(ctx, "", pkgparse.VersionlessPURL(canon), pkgparse.PURLVersion(canon))
 		switch {
 		case errors.Is(err, hopper.ErrNotFound):
 			unknown++
@@ -159,7 +147,7 @@ func (s *apiServer) handleV1LookupBatch(w http.ResponseWriter, r *http.Request, 
 				"purl", canon, "error", err, "remote", r.RemoteAddr)
 			unknown++
 			continue
-		case !record.Analyzed:
+		case record.State != hopper.StateAnalyzed:
 			unanalyzed++
 			continue
 		default:
@@ -168,7 +156,7 @@ func (s *apiServer) handleV1LookupBatch(w http.ResponseWriter, r *http.Request, 
 		out = append(out, withPURL(record, asked))
 	}
 	recordPURLLookups(r.Context(), found, unanalyzed, unknown, invalid)
-	v1WriteJSON(w, http.StatusOK, out)
+	v1WriteJSON(w, http.StatusOK, map[string]any{"records": out})
 }
 
 // withPURL returns a copy of a record carrying purl. The record LookupRecord
@@ -181,12 +169,23 @@ func withPURL(record *hopper.LookupRecord, purl string) *hopper.LookupRecord {
 	return &c
 }
 
-// v1Error writes a v1 error. `code` is stable and machine-readable; `message`
-// is for people and may be reworded freely.
-func v1Error(w http.ResponseWriter, status int, code, message string) {
-	v1WriteJSON(w, status, map[string]any{
-		"error": map[string]string{"code": code, "message": message},
-	})
+// v1Error writes the API's one error object:
+//
+//	{"error": {"code": "…", "message": "…", …details}}
+//
+// code is stable and machine-readable; message is for people and may be
+// reworded freely. details are key/value pairs added to the object, such as
+// "max" for a batch limit or "use" for a retired path. An error is never
+// cached.
+func v1Error(w http.ResponseWriter, status int, code, message string, details ...any) {
+	body := map[string]any{"code": code, "message": message}
+	for i := 0; i+1 < len(details); i += 2 {
+		if k, ok := details[i].(string); ok {
+			body[k] = details[i+1]
+		}
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	v1WriteJSON(w, status, map[string]any{"error": body})
 }
 
 func v1WriteJSON(w http.ResponseWriter, status int, body any) {

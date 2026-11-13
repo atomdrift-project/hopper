@@ -3,8 +3,8 @@ package main
 // triageapi.go serves the triage queues: the work-selection half of what used
 // to be a direct database connection from every scan host.
 //
-// Three routes, all reads — GET /api/triage/queues (the registry),
-// GET /api/triage/{queue} (candidates), GET /api/triage/{queue}/depth (backlog).
+// Two routes, both reads: GET /v1/triage/{queue} (candidates) and
+// GET /v1/triage/{queue}/depth (backlog).
 // They are registered on the read-safe side of registerAPI, so a serve-replica
 // instance answers them from the replica's idle disk while the primary keeps its
 // I/O for ingestion.
@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/atomdrift-project/hopper"
+	"github.com/atomdrift-project/hopper/store"
 )
 
 // triageQuerySlots bounds expensive queue reads independently of ingestion.
@@ -36,7 +37,7 @@ func (s *apiServer) admitTriage(w http.ResponseWriter, r *http.Request) bool {
 	if err := acquireSlot(r.Context(), s.triageSem); err != nil {
 		if r.Context().Err() == nil {
 			recordLoadShed(r.Context(), "triage")
-			writeRetryable(w, retryAfterBusy, `{"error":"busy: triage queries saturated"}`)
+			writeRetryable(w, retryAfterBusy, "busy_triage_queries_saturated", "Busy: triage queries saturated.")
 		}
 		return false
 	}
@@ -52,52 +53,34 @@ const triageMaxLimit = 500
 // triageDefaultLimit is what a select returns when the caller names no limit.
 const triageDefaultLimit = 16
 
-// triageQueueInfo describes one registered queue.
-type triageQueueInfo struct {
-	Name string `json:"name"`
-	// Depth reports whether this queue can answer /depth. Always true since
-	// 2026-09-02: a depth is the queue's own selection counted, and every queue
-	// has a selection. Kept on the wire because a client pinned to an older
-	// hopper still reads it, and "every queue has one" is a cheap thing to keep
-	// saying explicitly.
-	Depth bool `json:"depth"`
-}
-
-// handleTriageQueues lists the registry, so a client can validate its own
-// per-queue policy tables against the queues that actually exist rather than
-// against a copy that drifts. GET /api/triage/queues.
-func (*apiServer) handleTriageQueues(w http.ResponseWriter, _ *http.Request) {
-	names := hopper.TriageQueueNames()
-	out := make([]triageQueueInfo, 0, len(names))
-	for _, name := range names {
-		out = append(out, triageQueueInfo{Name: name, Depth: true})
-	}
-	writeTriageJSON(w, map[string]any{"queues": out})
-}
-
 // triageQueue resolves the {queue} path value against the registry, answering
 // the request and reporting false when it is unknown or the DB is not up.
 func (s *apiServer) triageQueue(w http.ResponseWriter, r *http.Request) (hopper.Queue, bool) {
-	if s.db == nil {
-		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
+	if s.db == nil && s.results == nil {
+		writeRetryable(w, retryAfterStarting, "starting", "Starting.")
 		return hopper.Queue{}, false
 	}
 	name := strings.ToLower(strings.TrimSpace(r.PathValue("queue")))
+	if s.results != nil {
+		if !triageKnown(name) {
+			v1Error(w, http.StatusNotFound, "unknown_queue", "No such triage queue.", "queues", store.TriageQueueNames())
+			return hopper.Queue{}, false
+		}
+		return hopper.Queue{Name: name}, true
+	}
 	q, ok := hopper.TriageQueues[name]
 	if !ok {
 		// 404 naming the valid set: an operator typo here is otherwise
 		// invisible, and the caller already needs the registry to know what to
 		// ask for. A []string cannot fail to marshal.
-		valid, _ := json.Marshal(hopper.TriageQueueNames()) //nolint:errcheck,errchkjson // a []string cannot fail to marshal
-		writeJSONError(w, http.StatusNotFound,
-			`{"error":"unknown queue","queues":`+string(valid)+`}`)
+		v1Error(w, http.StatusNotFound, "unknown_queue", "No such triage queue.", "queues", hopper.TriageQueueNames())
 		return hopper.Queue{}, false
 	}
 	return q, true
 }
 
 // handleTriageSelect returns the head of one queue, up to limit rows.
-// GET /api/triage/{queue}?limit=N.
+// GET /v1/triage/{queue}?limit=N.
 //
 // The samples are hopper.Sample values marshalled as-is. That makes the wire
 // format the struct's Go field names, which is safe precisely because this is an
@@ -121,7 +104,7 @@ func (s *apiServer) handleTriageSelect(w http.ResponseWriter, r *http.Request) {
 		excluded = strings.Split(raw, ",")
 		for _, sha := range excluded {
 			if !validSHA256(sha) {
-				writeJSONError(w, http.StatusBadRequest, "exclude must contain comma-separated SHA256 digests")
+				v1Error(w, http.StatusBadRequest, "invalid_exclude", "exclude must hold comma-separated SHA256 digests.")
 				return
 			}
 		}
@@ -133,11 +116,17 @@ func (s *apiServer) handleTriageSelect(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
 
-	samples, err := q.Select(ctx, s.db, limit, excluded)
+	var samples []*hopper.Sample
+	var err error
+	if s.results != nil {
+		samples, err = s.triageSelectStore(ctx, q.Name, limit, excluded)
+	} else {
+		samples, err = q.Select(ctx, s.db, limit, excluded)
+	}
 	if err != nil {
 		slog.ErrorContext(r.Context(), "triage: select failed",
 			"queue", q.Name, "limit", limit, "error", err, "remote", r.RemoteAddr)
-		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
 		return
 	}
 	slog.InfoContext(r.Context(), "triage select",
@@ -152,7 +141,7 @@ func (s *apiServer) handleTriageSelect(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleTriageDepth reports one queue's backlog. GET /api/triage/{queue}/depth.
+// handleTriageDepth reports one queue's backlog. GET /v1/triage/{queue}/depth.
 // Every queue can answer: a depth is the queue's own selection run to
 // hopper.TriageDepthCap and counted, so there is no longer a "no countable
 // population" case to 404 on.
@@ -169,14 +158,26 @@ func (s *apiServer) handleTriageDepth(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
 
+	if s.results != nil {
+		body, err := s.triageDepthStore(ctx, q.Name)
+		if err != nil {
+			slog.ErrorContext(r.Context(), "triage: depth failed", "queue", q.Name, "error", err, "remote", r.RemoteAddr)
+			v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
+			return
+		}
+		writeTriageJSON(w, body)
+		return
+	}
 	if q.Name == "gauntlet" {
 		counts, capped, err := s.db.GauntletDepth(ctx)
 		if err != nil {
 			slog.ErrorContext(r.Context(), "gauntlet depth failed", "error", err)
-			writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+			v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
 			return
 		}
-		writeTriageJSON(w, map[string]any{"queue": q.Name, "depth": counts["false_positive"] + counts["miss"], "capped": capped, "by_failure": counts})
+		writeTriageJSON(w, map[string]any{
+			"queue": q.Name, "depth": counts["false_positive"] + counts["miss"], "capped": capped, "by_failure": counts,
+		})
 		return
 	}
 
@@ -184,7 +185,7 @@ func (s *apiServer) handleTriageDepth(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		slog.ErrorContext(r.Context(), "triage: depth failed",
 			"queue", q.Name, "error", err, "remote", r.RemoteAddr)
-		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
 		return
 	}
 	writeTriageJSON(w, map[string]any{
@@ -206,7 +207,7 @@ func triageLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
 	}
 	n, err := strconv.Atoi(raw)
 	if err != nil || n < 1 {
-		writeJSONError(w, http.StatusBadRequest, `{"error":"limit must be a positive integer"}`)
+		v1Error(w, http.StatusBadRequest, "invalid_limit", "Limit must be a positive integer.")
 		return 0, false
 	}
 	return min(n, triageMaxLimit), true
@@ -230,7 +231,7 @@ func writeTriageJSON(w http.ResponseWriter, body any) {
 const maxSightingSubjects = 256
 
 // handleSightingsFor returns the corroboration ledger for a set of subjects,
-// keyed by subject. GET /api/sightings?subject=<sha256-or-purl>&subject=...
+// keyed by subject. GET /v1/sightings?subject=<sha256-or-purl>&subject=...
 //
 // A GET sharing a path with the POST that RECORDS sightings, which is the
 // honest pairing: same resource, one method reads it and the other appends to
@@ -238,17 +239,17 @@ const maxSightingSubjects = 256
 // read a consumer makes against a replica, and every POST is refused there.
 func (s *apiServer) handleSightingsFor(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
-		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
+		writeRetryable(w, retryAfterStarting, "starting", "Starting.")
 		return
 	}
 	subjects := r.URL.Query()["subject"]
 	if len(subjects) == 0 {
-		writeJSONError(w, http.StatusBadRequest, `{"error":"at least one subject is required"}`)
+		v1Error(w, http.StatusBadRequest, "missing_subject", "At least one subject is required.")
 		return
 	}
 	if len(subjects) > maxSightingSubjects {
-		writeJSONError(w, http.StatusRequestEntityTooLarge,
-			`{"error":"too many subjects (max `+strconv.Itoa(maxSightingSubjects)+`)"}`)
+		v1Error(w, http.StatusRequestEntityTooLarge, "too_many_subjects",
+			"At most "+strconv.Itoa(maxSightingSubjects)+" subjects per request.", "max", maxSightingSubjects)
 		return
 	}
 	// Normalize a sha256 subject to lowercase to match stored digests; a PURL is
@@ -263,11 +264,17 @@ func (s *apiServer) handleSightingsFor(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
 
-	bySubject, err := s.db.SightingsFor(ctx, subjects)
+	var bySubject map[string][]hopper.Sighting
+	var err error
+	if s.results != nil {
+		bySubject, err = s.sightingsFromStore(ctx, subjects)
+	} else {
+		bySubject, err = s.db.SightingsFor(ctx, subjects)
+	}
 	if err != nil {
 		slog.ErrorContext(r.Context(), "sightings lookup failed",
 			"subjects", len(subjects), "error", err, "remote", r.RemoteAddr)
-		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
 		return
 	}
 	// Never null, for the same reason the select envelope is not: a client
@@ -276,45 +283,4 @@ func (s *apiServer) handleSightingsFor(w http.ResponseWriter, r *http.Request) {
 		bySubject = map[string][]hopper.Sighting{}
 	}
 	writeTriageJSON(w, map[string]any{"by_subject": bySubject})
-}
-
-// handleStrandedMembers returns the good-labeled members of a convicted archive
-// that still await an individual verdict. GET /api/stranded/{sha256}.
-//
-// The stranded queue's unit of work is the archive but its verdicts and its
-// drain are per member, so a consumer needs the member list separately from the
-// row it selected.
-//
-// The blob columns are cleared before the response is written. StrandedMembers
-// selects the FULL projection, so each member carries its own cleave envelope —
-// the archive member tree, megabytes for a large package — and a consumer needs
-// only sha, path, size and the two scores. Sending them would multiply the
-// response by orders of magnitude for data nothing reads.
-func (s *apiServer) handleStrandedMembers(w http.ResponseWriter, r *http.Request) {
-	if s.db == nil {
-		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
-		return
-	}
-	sha := strings.ToLower(strings.TrimSpace(r.PathValue("sha256")))
-	if !validSHA256(sha) {
-		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid sha256"}`)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
-	defer cancel()
-
-	members, err := s.db.StrandedMembers(ctx, sha)
-	if err != nil {
-		slog.ErrorContext(r.Context(), "stranded members lookup failed",
-			"sha256", sha, "error", err, "remote", r.RemoteAddr)
-		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
-		return
-	}
-	for _, m := range members {
-		m.CleaveResult, m.LitmusResult, m.LLMResult, m.Provenance = nil, nil, nil, nil
-	}
-	writeTriageJSON(w, map[string]any{
-		"members": append(make([]*hopper.Sample, 0, len(members)), members...),
-	})
 }

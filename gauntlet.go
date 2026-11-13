@@ -20,6 +20,12 @@ var gauntletSchema string
 // GauntletRun is one immutable batch of benchmark observations. An empty
 // ObservedAt means the original scan time could not be recovered from history.
 // Source identifies the original document, not the machine importing it.
+//
+// The field order is the JSON key order, which a stored run's digest hashes
+// (storeGauntletRun): reordering it would make every stored run conflict
+// with its own replay.
+//
+//nolint:govet // fieldalignment: the order is part of the stored digest
 type GauntletRun struct {
 	ID          string                   `json:"id"`
 	Producer    string                   `json:"producer"`
@@ -41,7 +47,10 @@ type GauntletRules struct {
 	Models  string `json:"models,omitempty"`
 }
 
-// GauntletSample preserves a run member independently of the live sample catalog.
+// GauntletSample preserves a run member independently of the live sample
+// catalog. Its field order is part of the run's digest, as GauntletRun's is.
+//
+//nolint:govet // fieldalignment: the order is part of the stored digest
 type GauntletSample struct {
 	SHA256   string           `json:"sha256"`
 	Label    string           `json:"label"`
@@ -69,8 +78,13 @@ type GauntletEvidence struct {
 	Result     json.RawMessage `json:"result"`
 }
 
-var ErrGauntletConflict = errors.New("gauntlet run identity has different content")
-var ErrGauntletEvidence = errors.New("unknown gauntlet evidence")
+var (
+	// ErrGauntletConflict reports a run whose identity is already stored
+	// with different content; the stored observations stand.
+	ErrGauntletConflict = errors.New("gauntlet run identity has different content")
+	// ErrGauntletEvidence reports a review of evidence no stored result holds.
+	ErrGauntletEvidence = errors.New("unknown gauntlet evidence")
+)
 
 // GauntletTime makes lexical timestamp ordering agree with chronological order.
 func GauntletTime(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.000000000Z") }
@@ -81,7 +95,9 @@ func gauntletHashBytes(b []byte) string {
 }
 
 func gauntletHashStrings(parts []string) string {
-	b, _ := json.Marshal(parts) // []string has no failing JSON encodings
+	// Run ids are this hash of this encoding, so it cannot change. A []string
+	// always encodes.
+	b, _ := json.Marshal(parts) //nolint:errcheck,errchkjson // a []string always encodes
 	return gauntletHashBytes(b)
 }
 
@@ -104,8 +120,10 @@ func gauntletEvidenceKey(run GauntletRun, s GauntletSample, r GauntletResult) st
 	if version == "" || rules.Traits == "" || rules.Models == "" {
 		fallback = run.ID
 	}
-	return gauntletHashStrings([]string{s.SHA256, r.Scanner, s.Label, r.Status,
-		version, rules.Channel, rules.Traits, rules.Models, fallback})
+	return gauntletHashStrings([]string{
+		s.SHA256, r.Scanner, s.Label, r.Status,
+		version, rules.Channel, rules.Traits, rules.Models, fallback,
+	})
 }
 
 func validGauntletSHA(s string) bool {
@@ -147,37 +165,8 @@ func NormalizeGauntletRun(in GauntletRun) (GauntletRun, error) {
 		default:
 			return r, fmt.Errorf("invalid cohort label %q", s.Label)
 		}
-		if len(s.Metadata) == 0 {
-			s.Metadata = json.RawMessage(`{}`)
-		}
-		var meta map[string]json.RawMessage
-		if err := json.Unmarshal(s.Metadata, &meta); err != nil || meta == nil {
-			return r, errors.New("sample metadata must be an object")
-		}
-		s.Metadata, _ = json.Marshal(meta)
-		s.Results = slices.Clone(s.Results)
-		slices.SortFunc(s.Results, func(a, b GauntletResult) int { return strings.Compare(a.Scanner, b.Scanner) })
-		for j := range s.Results {
-			v := &s.Results[j]
-			if v.Scanner == "" || len(v.Scanner) > 100 || (j > 0 && s.Results[j-1].Scanner == v.Scanner) {
-				return r, errors.New("invalid or duplicate scanner")
-			}
-			switch v.Status {
-			case "benign", "detected", "skipped", "error", "nodata":
-			default:
-				return r, fmt.Errorf("invalid status %q", v.Status)
-			}
-			var payload map[string]json.RawMessage
-			if err := json.Unmarshal(v.Payload, &payload); err != nil || payload == nil {
-				return r, errors.New("verdict payload must be an object")
-			}
-			for key, want := range map[string]string{"scanner": v.Scanner, "status": v.Status} {
-				var got string
-				if json.Unmarshal(payload[key], &got) != nil || got != want {
-					return r, fmt.Errorf("verdict payload %s disagrees with result", key)
-				}
-			}
-			v.Payload, _ = json.Marshal(payload)
+		if err := normalizeGauntletSample(s); err != nil {
+			return r, err
 		}
 	}
 	r.Annotations = slices.Clone(r.Annotations)
@@ -186,7 +175,11 @@ func NormalizeGauntletRun(in GauntletRun) (GauntletRun, error) {
 		if err := json.Unmarshal(b, &object); err != nil || object == nil {
 			return r, errors.New("annotation must be an object")
 		}
-		r.Annotations[i], _ = json.Marshal(object)
+		c, err := json.Marshal(object)
+		if err != nil {
+			return r, fmt.Errorf("annotation: %w", err)
+		}
+		r.Annotations[i] = c
 	}
 
 	r.Withdrawn = slices.Clone(r.Withdrawn)
@@ -198,6 +191,52 @@ func NormalizeGauntletRun(in GauntletRun) (GauntletRun, error) {
 		}
 	}
 	return r, nil
+}
+
+// normalizeGauntletSample canonicalizes one sample of a run in place: its
+// metadata re-encoded, its results sorted by scanner and checked.
+func normalizeGauntletSample(s *GauntletSample) error {
+	if len(s.Metadata) == 0 {
+		s.Metadata = json.RawMessage(`{}`)
+	}
+	var meta map[string]json.RawMessage
+	if err := json.Unmarshal(s.Metadata, &meta); err != nil || meta == nil {
+		return errors.New("sample metadata must be an object")
+	}
+	b, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("sample metadata: %w", err)
+	}
+	s.Metadata = b
+	s.Results = slices.Clone(s.Results)
+	slices.SortFunc(s.Results, func(a, b GauntletResult) int { return strings.Compare(a.Scanner, b.Scanner) })
+	for j := range s.Results {
+		v := &s.Results[j]
+		if v.Scanner == "" || len(v.Scanner) > 100 || (j > 0 && s.Results[j-1].Scanner == v.Scanner) {
+			return errors.New("invalid or duplicate scanner")
+		}
+		switch v.Status {
+		case "benign", "detected", "skipped", "error", "nodata":
+		default:
+			return fmt.Errorf("invalid status %q", v.Status)
+		}
+		var payload map[string]json.RawMessage
+		if err := json.Unmarshal(v.Payload, &payload); err != nil || payload == nil {
+			return errors.New("verdict payload must be an object")
+		}
+		for key, want := range map[string]string{"scanner": v.Scanner, "status": v.Status} {
+			var got string
+			if json.Unmarshal(payload[key], &got) != nil || got != want {
+				return fmt.Errorf("verdict payload %s disagrees with result", key)
+			}
+		}
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("verdict payload: %w", err)
+		}
+		v.Payload = b
+	}
+	return nil
 }
 
 type gauntletRow interface{ Scan(...any) error }
@@ -215,7 +254,9 @@ func (db *DB) StoreGauntletRun(ctx context.Context, in GauntletRun) (bool, error
 			return false, err
 		}
 		defer tx.Rollback(ctx) //nolint:errcheck // commit or rollback below owns the transaction
-		fresh, err := storeGauntletRun(r, func(q string, a ...any) error { _, err := tx.Exec(ctx, q, a...); return err }, func(q string, a ...any) gauntletRow { return tx.QueryRow(ctx, q, a...) })
+		fresh, err := storeGauntletRun(r,
+			func(q string, a ...any) error { _, err := tx.Exec(ctx, q, a...); return err },
+			func(q string, a ...any) gauntletRow { return tx.QueryRow(ctx, q, a...) })
 		if err != nil {
 			return false, err
 		}
@@ -226,7 +267,9 @@ func (db *DB) StoreGauntletRun(ctx context.Context, in GauntletRun) (bool, error
 		return false, err
 	}
 	defer tx.Rollback() //nolint:errcheck // commit or rollback owns the transaction
-	fresh, err := storeGauntletRun(r, func(q string, a ...any) error { _, err := tx.ExecContext(ctx, q, a...); return err }, func(q string, a ...any) gauntletRow { return tx.QueryRowContext(ctx, q, a...) })
+	fresh, err := storeGauntletRun(r,
+		func(q string, a ...any) error { _, err := tx.ExecContext(ctx, q, a...); return err },
+		func(q string, a ...any) gauntletRow { return tx.QueryRowContext(ctx, q, a...) })
 	if err != nil {
 		return false, err
 	}
@@ -241,7 +284,10 @@ func storeGauntletRun(r GauntletRun, exec func(string, ...any) error, row func(s
 	digest := gauntletHashBytes(payload)
 	meta := r
 	meta.Samples = nil
-	b, _ := json.Marshal(meta)
+	b, err := json.Marshal(meta)
+	if err != nil {
+		return false, err
+	}
 	// A unique insert serializes competing submissions before the digest check.
 	var inserted string
 	err = row(`INSERT INTO gauntlet_runs(id,producer,observed_at,source,digest,metadata)
@@ -260,12 +306,14 @@ func storeGauntletRun(r GauntletRun, exec func(string, ...any) error, row func(s
 		return false, nil
 	}
 	for _, s := range r.Samples {
-		err := exec(`INSERT INTO gauntlet_samples(run_id,sha256,label,eligible,metadata) VALUES($1,$2,$3,$4,$5)`, r.ID, s.SHA256, s.Label, s.Eligible, string(s.Metadata))
+		err := exec(`INSERT INTO gauntlet_samples(run_id,sha256,label,eligible,metadata) VALUES($1,$2,$3,$4,$5)`,
+			r.ID, s.SHA256, s.Label, s.Eligible, string(s.Metadata))
 		if err != nil {
 			return false, err
 		}
 		for _, v := range s.Results {
-			err := exec(`INSERT INTO gauntlet_results(run_id,sha256,scanner,status,evidence_key,payload) VALUES($1,$2,$3,$4,$5,$6)`, r.ID, s.SHA256, v.Scanner, v.Status, gauntletEvidenceKey(r, s, v), string(v.Payload))
+			err := exec(`INSERT INTO gauntlet_results(run_id,sha256,scanner,status,evidence_key,payload) VALUES($1,$2,$3,$4,$5,$6)`,
+				r.ID, s.SHA256, v.Scanner, v.Status, gauntletEvidenceKey(r, s, v), string(v.Payload))
 			if err != nil {
 				return false, err
 			}
@@ -281,13 +329,7 @@ func storeGauntletRun(r GauntletRun, exec func(string, ...any) error, row func(s
 
 // History statements deliberately use the common SQL subset. Only transaction
 // and row plumbing differ between Postgres and SQLite.
-type gauntletRows interface {
-	Next() bool
-	Scan(...any) error
-	Err() error
-}
-
-func (db *DB) queryGauntlet(ctx context.Context, q string, args []any, visit func(gauntletRows) error) error {
+func (db *DB) queryGauntlet(ctx context.Context, q string, args []any, visit func(sqlRows) error) error {
 	if db.pool != nil {
 		rows, err := db.pool.Query(ctx, q, args...)
 		if err != nil {
@@ -310,10 +352,12 @@ func (db *DB) queryGauntlet(ctx context.Context, q string, args []any, visit fun
 	return rows.Err()
 }
 
+// GauntletRun returns the stored run with id, its samples and their results;
+// sql.ErrNoRows when there is none.
 func (db *DB) GauntletRun(ctx context.Context, id string) (*GauntletRun, error) {
 	var r GauntletRun
 	found := false
-	err := db.queryGauntlet(ctx, `SELECT metadata FROM gauntlet_runs WHERE id=$1`, []any{id}, func(rows gauntletRows) error {
+	err := db.queryGauntlet(ctx, `SELECT metadata FROM gauntlet_runs WHERE id=$1`, []any{id}, func(rows sqlRows) error {
 		if !rows.Next() {
 			return nil
 		}
@@ -331,35 +375,37 @@ func (db *DB) GauntletRun(ctx context.Context, id string) (*GauntletRun, error) 
 		return nil, sql.ErrNoRows
 	}
 	bySHA := map[string]int{}
-	err = db.queryGauntlet(ctx, `SELECT sha256,label,eligible,metadata FROM gauntlet_samples WHERE run_id=$1 ORDER BY sha256`, []any{id}, func(rows gauntletRows) error {
-		for rows.Next() {
-			var s GauntletSample
-			var b string
-			if err := rows.Scan(&s.SHA256, &s.Label, &s.Eligible, &b); err != nil {
-				return err
+	err = db.queryGauntlet(ctx, `SELECT sha256,label,eligible,metadata FROM gauntlet_samples WHERE run_id=$1 ORDER BY sha256`,
+		[]any{id}, func(rows sqlRows) error {
+			for rows.Next() {
+				var s GauntletSample
+				var b string
+				if err := rows.Scan(&s.SHA256, &s.Label, &s.Eligible, &b); err != nil {
+					return err
+				}
+				s.Metadata = json.RawMessage(b)
+				bySHA[s.SHA256] = len(r.Samples)
+				r.Samples = append(r.Samples, s)
 			}
-			s.Metadata = json.RawMessage(b)
-			bySHA[s.SHA256] = len(r.Samples)
-			r.Samples = append(r.Samples, s)
-		}
-		return nil
-	})
+			return nil
+		})
 	if err != nil {
 		return nil, err
 	}
-	err = db.queryGauntlet(ctx, `SELECT sha256,scanner,status,payload FROM gauntlet_results WHERE run_id=$1 ORDER BY sha256,scanner`, []any{id}, func(rows gauntletRows) error {
-		for rows.Next() {
-			var sha, b string
-			var v GauntletResult
-			if err := rows.Scan(&sha, &v.Scanner, &v.Status, &b); err != nil {
-				return err
+	err = db.queryGauntlet(ctx, `SELECT sha256,scanner,status,payload FROM gauntlet_results WHERE run_id=$1 ORDER BY sha256,scanner`,
+		[]any{id}, func(rows sqlRows) error {
+			for rows.Next() {
+				var sha, b string
+				var v GauntletResult
+				if err := rows.Scan(&sha, &v.Scanner, &v.Status, &b); err != nil {
+					return err
+				}
+				v.Payload = json.RawMessage(b)
+				i := bySHA[sha]
+				r.Samples[i].Results = append(r.Samples[i].Results, v)
 			}
-			v.Payload = json.RawMessage(b)
-			i := bySHA[sha]
-			r.Samples[i].Results = append(r.Samples[i].Results, v)
-		}
-		return nil
-	})
+			return nil
+		})
 	return &r, err
 }
 
@@ -379,21 +425,26 @@ const gauntletCandidatesSQL = `WITH ranked AS (
  AND ((c.label='good' AND c.status='detected') OR (c.label='bad' AND c.status='benign'))
  AND NOT EXISTS(SELECT 1 FROM reports p WHERE p.sha256=c.sha256 AND p.report_type='gauntlet' AND p.evidence_key=c.evidence_key)`
 
+// TriageGauntlet returns up to n files a published gauntlet run saw atomscan
+// misjudge, oldest observation first, leaving out excluded digests; each
+// carries the observation it answers in Sample.Gauntlet.
 func (db *DB) TriageGauntlet(ctx context.Context, n int, excluded []string) ([]*Sample, error) {
 	args := []any{}
-	q := gauntletCandidatesSQL
+	var b strings.Builder
+	b.WriteString(gauntletCandidatesSQL)
 	for _, sha := range excluded {
 		args = append(args, sha)
-		q += fmt.Sprintf(" AND c.sha256<>$%d", len(args))
+		fmt.Fprintf(&b, " AND c.sha256<>$%d", len(args))
 	}
 	args = append(args, n)
-	q += fmt.Sprintf(" ORDER BY c.observed_at,c.sha256 LIMIT $%d", len(args))
+	fmt.Fprintf(&b, " ORDER BY c.observed_at,c.sha256 LIMIT $%d", len(args))
+	q := b.String()
 	type candidate struct {
 		sha string
 		e   GauntletEvidence
 	}
 	var picks []candidate
-	err := db.queryGauntlet(ctx, q, args, func(rows gauntletRows) error {
+	err := db.queryGauntlet(ctx, q, args, func(rows sqlRows) error {
 		for rows.Next() {
 			var c candidate
 			var payload, metadata string
@@ -417,37 +468,15 @@ func (db *DB) TriageGauntlet(ctx context.Context, n int, excluded []string) ([]*
 		return []*Sample{}, nil
 	}
 	// Fetch one bounded light projection, never the large analysis blobs.
-	args = nil
-	placeholders := make([]string, 0, len(picks))
+	shas := make([]string, len(picks))
 	evidence := map[string]*GauntletEvidence{}
 	for i := range picks {
-		p := &picks[i]
-		args = append(args, p.sha)
-		placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
-		evidence[p.sha] = &p.e
+		shas[i] = picks[i].sha
+		evidence[picks[i].sha] = &picks[i].e
 	}
-	where := " FROM samples WHERE sha256 IN (" + strings.Join(placeholders, ",") + ")"
-	var samples []*Sample
-	if db.pool != nil {
-		rows, err := db.pool.Query(ctx, "SELECT "+pgSampleColsLight+where, args...)
-		if err != nil {
-			return nil, err
-		}
-		samples, err = scanPGSamplesLight(rows)
-		rows.Close()
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		rows, err := db.lite.QueryContext(ctx, "SELECT "+liteSampleColsLight+where, args...)
-		if err != nil {
-			return nil, err
-		}
-		samples, err = scanLiteSamplesLight(rows)
-		_ = rows.Close()
-		if err != nil {
-			return nil, err
-		}
+	samples, err := db.lightSamples(ctx, shas)
+	if err != nil {
+		return nil, err
 	}
 	bySHA := map[string]*Sample{}
 	for _, s := range samples {
@@ -455,12 +484,37 @@ func (db *DB) TriageGauntlet(ctx context.Context, n int, excluded []string) ([]*
 		bySHA[s.SHA256] = s
 	}
 	out := make([]*Sample, 0, len(samples))
-	for _, p := range picks {
-		if s := bySHA[p.sha]; s != nil {
+	for i := range picks {
+		if s := bySHA[picks[i].sha]; s != nil {
 			out = append(out, s)
 		}
 	}
 	return out, nil
+}
+
+// lightSamples returns the light projection of the samples with these
+// digests, which are passed as one argument: an array to Postgres, a JSON
+// array to SQLite.
+func (db *DB) lightSamples(ctx context.Context, shas []string) ([]*Sample, error) {
+	if db.pool != nil {
+		rows, err := db.pool.Query(ctx, `SELECT `+pgSampleColsLight+` FROM samples WHERE sha256 = ANY($1)`, shas)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		return scanPGSamplesLight(rows)
+	}
+	list, err := json.Marshal(shas)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := db.lite.QueryContext(ctx,
+		`SELECT `+liteSampleColsLight+` FROM samples WHERE sha256 IN (SELECT value FROM json_each(?))`, string(list))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck // read-only rows
+	return scanLiteSamplesLight(rows)
 }
 
 // CompleteGauntlet records a review only for evidence that actually belongs to
@@ -470,7 +524,8 @@ func (db *DB) CompleteGauntlet(ctx context.Context, r *Report) error {
 		return errors.New("gauntlet completion requires an evidence key")
 	}
 	var exists bool
-	err := db.queryGauntlet(ctx, `SELECT 1 FROM gauntlet_results WHERE sha256=$1 AND scanner='ascan' AND evidence_key=$2 LIMIT 1`, []any{r.SHA256, r.EvidenceKey}, func(rows gauntletRows) error { exists = rows.Next(); return nil })
+	err := db.queryGauntlet(ctx, `SELECT 1 FROM gauntlet_results WHERE sha256=$1 AND scanner='ascan' AND evidence_key=$2 LIMIT 1`,
+		[]any{r.SHA256, r.EvidenceKey}, func(rows sqlRows) error { exists = rows.Next(); return nil })
 	if err != nil {
 		return err
 	}
@@ -491,7 +546,7 @@ func (db *DB) CompleteGauntlet(ctx context.Context, r *Report) error {
 // Separate withdrawal facts make transfer order irrelevant.
 func TransferGauntlet(ctx context.Context, dst, src *DB) error {
 	var ids []string
-	err := src.queryGauntlet(ctx, `SELECT id FROM gauntlet_runs ORDER BY observed_at,id`, nil, func(rows gauntletRows) error {
+	err := src.queryGauntlet(ctx, `SELECT id FROM gauntlet_runs ORDER BY observed_at,id`, nil, func(rows sqlRows) error {
 		for rows.Next() {
 			var id string
 			if err := rows.Scan(&id); err != nil {
@@ -518,10 +573,10 @@ func TransferGauntlet(ctx context.Context, dst, src *DB) error {
 
 // GauntletDepth counts the same eligible evidence as selection, without fetching
 // live analysis blobs or constructing a Sample for each row just to count it.
-func (db *DB) GauntletDepth(ctx context.Context) (map[string]int64, bool, error) {
-	counts := map[string]int64{"false_positive": 0, "miss": 0}
+func (db *DB) GauntletDepth(ctx context.Context) (counts map[string]int64, capped bool, err error) {
+	counts = map[string]int64{"false_positive": 0, "miss": 0}
 	q := `SELECT label,count(*) FROM (` + gauntletCandidatesSQL + ` ORDER BY c.observed_at,c.sha256 LIMIT $1) pending GROUP BY label`
-	err := db.queryGauntlet(ctx, q, []any{TriageDepthCap}, func(rows gauntletRows) error {
+	err = db.queryGauntlet(ctx, q, []any{TriageDepthCap}, func(rows sqlRows) error {
 		for rows.Next() {
 			var label string
 			var count int64

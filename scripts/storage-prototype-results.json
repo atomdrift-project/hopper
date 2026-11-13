@@ -1,0 +1,865 @@
+{
+  "captured_at": "2026-11-12T02:16:54.176037+00:00",
+  "purpose": "Local storage prototype; no production schema changes",
+  "target": "Integer sample references, parent placements, shared relative strings stored once in a dictionary heap with digest lookup keys, filename overrides only when needed",
+  "methodology": [
+    "Six package cohorts contain all existing direct-child locations for the selected catalog identities. Versions lacking locations contribute no member rows.",
+    "Lodash and Next.js were exported in sequential five-identity batches, not one database snapshot. Other cohorts use one COPY statement. Concurrent production changes are possible.",
+    "ESLint and other timed-out exports were excluded; successful retries replaced partial files.",
+    "Broad sample uses TABLESAMPLE SYSTEM(0.001), seed 905. Page clustering and missing reuse make its distinct-path fraction unsuitable for population extrapolation.",
+    "All five layouts retain original metadata, timestamps, relationship types, and embedded locator strings. Every original column reconstructed exactly.",
+    "Dictionary layouts include the full parent-placement and relative-path table/index costs. Indexes are freshly built; production bloat is not modeled.",
+    "Identity-only text and binary tables are measured separately. They are not full samples tables and their bytes are excluded from effective location-layout totals.",
+    "Parent placements and sample IDs are synthetic local mappings. A production migration must resolve real IDs, preserve location uniqueness and extraction semantics, and handle unresolved parents.",
+    "A dictionary stores each relative string once in its heap; its unique text index also contains the string. This is counted in the measurements. No directory-component interning was attempted.",
+    "Space scenarios multiply each cohort bytes/location by the primary estimated row count. They are sensitivity scenarios, not estimates of global path cardinality.",
+    "Space scenarios assume no ZFS compression savings and exclude WAL, change capture, sort space, growth, snapshot retention, and reserve. Ingestion throughput was not benchmarked.",
+    "A second measured dictionary uses a unique 32-byte path digest index, avoiding the full-string index copy. Exact-string verification and explicit collision rejection are requirements for a production writer; no writer is implemented here."
+  ],
+  "production_inventory": {
+    "relations": {
+      "samples": {
+        "heap_bytes": 428034973696,
+        "index_bytes": 219129339904,
+        "total_bytes": 3427156500480,
+        "estimated_rows": 309918592
+      },
+      "sample_locations": {
+        "heap_bytes": 2335963234304,
+        "index_bytes": 2323110256640,
+        "total_bytes": 4659719610368,
+        "estimated_rows": 4875045376
+      }
+    },
+    "captured_at": "2026-11-12T02:14:53.806937+00:00",
+    "database_bytes": 8133595600575
+  },
+  "zfs": {
+    "tank": {
+      "used_bytes": 6370402148352,
+      "available_bytes": 1171560427520,
+      "referenced_bytes": 98304
+    },
+    "tank/pgdata": {
+      "used_bytes": 6256897572864,
+      "available_bytes": 1171560427520,
+      "referenced_bytes": 5993858764800
+    },
+    "tank/pgwal": {
+      "used_bytes": 108053389312,
+      "available_bytes": 1171560427520,
+      "referenced_bytes": 50363469824
+    }
+  },
+  "measurements": [
+    {
+      "rows": 1887,
+      "cohort": "express",
+      "postgres": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.3.34.2), 64-bit",
+      "relations": {
+        "legacy": {
+          "heap_bytes": 647168,
+          "index_bytes": 802816,
+          "total_bytes": 1490944
+        },
+        "integer_ids": {
+          "heap_bytes": 434176,
+          "index_bytes": 401408,
+          "total_bytes": 876544
+        },
+        "binary_hashes": {
+          "heap_bytes": 524288,
+          "index_bytes": 573440,
+          "total_bytes": 1138688
+        },
+        "identity_text": {
+          "heap_bytes": 90112,
+          "index_bytes": 131072,
+          "total_bytes": 262144
+        },
+        "identity_bytes": {
+          "heap_bytes": 65536,
+          "index_bytes": 106496,
+          "total_bytes": 212992
+        },
+        "relative_paths": {
+          "heap_bytes": 16384,
+          "index_bytes": 49152,
+          "total_bytes": 106496
+        },
+        "relative_inline": {
+          "heap_bytes": 262144,
+          "index_bytes": 417792,
+          "total_bytes": 720896
+        },
+        "parent_locations": {
+          "heap_bytes": 16384,
+          "index_bytes": 32768,
+          "total_bytes": 90112
+        },
+        "relative_interned": {
+          "heap_bytes": 229376,
+          "index_bytes": 368640,
+          "total_bytes": 638976
+        },
+        "relative_paths_digest": {
+          "heap_bytes": 16384,
+          "index_bytes": 49152,
+          "total_bytes": 73728
+        }
+      },
+      "parent_contents": 52,
+      "parent_placements": 115,
+      "sample_identities": 777,
+      "filename_overrides": 0,
+      "average_full_path_bytes": 91.68,
+      "distinct_relative_paths": 222,
+      "reconstruction_verified": true,
+      "versions_with_locations": 52,
+      "average_relative_path_bytes": 23.19,
+      "effective_location_layouts": {
+        "legacy": {
+          "location_bytes": 1490944,
+          "supporting_table_bytes": 0,
+          "total_bytes": 1490944,
+          "bytes_per_location": 790.113
+        },
+        "binary_hashes": {
+          "location_bytes": 1138688,
+          "supporting_table_bytes": 0,
+          "total_bytes": 1138688,
+          "bytes_per_location": 603.438
+        },
+        "integer_ids": {
+          "location_bytes": 876544,
+          "supporting_table_bytes": 0,
+          "total_bytes": 876544,
+          "bytes_per_location": 464.517
+        },
+        "relative_inline": {
+          "location_bytes": 720896,
+          "supporting_table_bytes": 90112,
+          "total_bytes": 811008,
+          "bytes_per_location": 429.787
+        },
+        "relative_interned": {
+          "location_bytes": 638976,
+          "supporting_table_bytes": 196608,
+          "total_bytes": 835584,
+          "bytes_per_location": 442.811
+        },
+        "relative_interned_digest": {
+          "location_bytes": 638976,
+          "supporting_table_bytes": 163840,
+          "total_bytes": 802816,
+          "bytes_per_location": 425.446
+        }
+      },
+      "space_scenario": {
+        "projected_replacement_bytes": 2158722795686,
+        "free_space_after_replacement_before_overheads": -987162368166
+      },
+      "dictionary_savings_over_inline_percent": -3.03,
+      "digest_dictionary_savings_over_inline_percent": 1.01,
+      "digest_dictionary_space_scenario": {
+        "projected_replacement_bytes": 2074066999777
+      }
+    },
+    {
+      "rows": 6916,
+      "cohort": "react",
+      "postgres": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.3.34.2), 64-bit",
+      "relations": {
+        "legacy": {
+          "heap_bytes": 2629632,
+          "index_bytes": 2711552,
+          "total_bytes": 5382144
+        },
+        "integer_ids": {
+          "heap_bytes": 1818624,
+          "index_bytes": 1138688,
+          "total_bytes": 2998272
+        },
+        "binary_hashes": {
+          "heap_bytes": 2162688,
+          "index_bytes": 1859584,
+          "total_bytes": 4063232
+        },
+        "identity_text": {
+          "heap_bytes": 212992,
+          "index_bytes": 270336,
+          "total_bytes": 524288
+        },
+        "identity_bytes": {
+          "heap_bytes": 155648,
+          "index_bytes": 196608,
+          "total_bytes": 393216
+        },
+        "relative_paths": {
+          "heap_bytes": 40960,
+          "index_bytes": 81920,
+          "total_bytes": 163840
+        },
+        "relative_inline": {
+          "heap_bytes": 1048576,
+          "index_bytes": 1204224,
+          "total_bytes": 2293760
+        },
+        "parent_locations": {
+          "heap_bytes": 40960,
+          "index_bytes": 57344,
+          "total_bytes": 139264
+        },
+        "relative_interned": {
+          "heap_bytes": 786432,
+          "index_bytes": 966656,
+          "total_bytes": 1794048
+        },
+        "relative_paths_digest": {
+          "heap_bytes": 65536,
+          "index_bytes": 81920,
+          "total_bytes": 155648
+        }
+      },
+      "parent_contents": 157,
+      "parent_placements": 260,
+      "sample_identities": 1929,
+      "filename_overrides": 0,
+      "average_full_path_bytes": 117.1,
+      "distinct_relative_paths": 429,
+      "reconstruction_verified": true,
+      "versions_with_locations": 157,
+      "average_relative_path_bytes": 36.99,
+      "effective_location_layouts": {
+        "legacy": {
+          "location_bytes": 5382144,
+          "supporting_table_bytes": 0,
+          "total_bytes": 5382144,
+          "bytes_per_location": 778.216
+        },
+        "binary_hashes": {
+          "location_bytes": 4063232,
+          "supporting_table_bytes": 0,
+          "total_bytes": 4063232,
+          "bytes_per_location": 587.512
+        },
+        "integer_ids": {
+          "location_bytes": 2998272,
+          "supporting_table_bytes": 0,
+          "total_bytes": 2998272,
+          "bytes_per_location": 433.527
+        },
+        "relative_inline": {
+          "location_bytes": 2293760,
+          "supporting_table_bytes": 139264,
+          "total_bytes": 2433024,
+          "bytes_per_location": 351.796
+        },
+        "relative_interned": {
+          "location_bytes": 1794048,
+          "supporting_table_bytes": 303104,
+          "total_bytes": 2097152,
+          "bytes_per_location": 303.232
+        },
+        "relative_interned_digest": {
+          "location_bytes": 1794048,
+          "supporting_table_bytes": 294912,
+          "total_bytes": 2088960,
+          "bytes_per_location": 302.047
+        }
+      },
+      "space_scenario": {
+        "projected_replacement_bytes": 1478269398550,
+        "free_space_after_replacement_before_overheads": -306708971030
+      },
+      "dictionary_savings_over_inline_percent": 13.8,
+      "digest_dictionary_savings_over_inline_percent": 14.14,
+      "digest_dictionary_space_scenario": {
+        "projected_replacement_bytes": 1472494908712
+      }
+    },
+    {
+      "rows": 18323,
+      "cohort": "babel",
+      "postgres": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.3.34.2), 64-bit",
+      "relations": {
+        "legacy": {
+          "heap_bytes": 6815744,
+          "index_bytes": 6766592,
+          "total_bytes": 13623296
+        },
+        "integer_ids": {
+          "heap_bytes": 4718592,
+          "index_bytes": 2818048,
+          "total_bytes": 7577600
+        },
+        "binary_hashes": {
+          "heap_bytes": 5316608,
+          "index_bytes": 4587520,
+          "total_bytes": 9945088
+        },
+        "identity_text": {
+          "heap_bytes": 344064,
+          "index_bytes": 409600,
+          "total_bytes": 794624
+        },
+        "identity_bytes": {
+          "heap_bytes": 245760,
+          "index_bytes": 294912,
+          "total_bytes": 581632
+        },
+        "relative_paths": {
+          "heap_bytes": 49152,
+          "index_bytes": 90112,
+          "total_bytes": 180224
+        },
+        "relative_inline": {
+          "heap_bytes": 2678784,
+          "index_bytes": 2973696,
+          "total_bytes": 5693440
+        },
+        "parent_locations": {
+          "heap_bytes": 40960,
+          "index_bytes": 65536,
+          "total_bytes": 147456
+        },
+        "relative_interned": {
+          "heap_bytes": 2162688,
+          "index_bytes": 2318336,
+          "total_bytes": 4521984
+        },
+        "relative_paths_digest": {
+          "heap_bytes": 65536,
+          "index_bytes": 81920,
+          "total_bytes": 155648
+        }
+      },
+      "parent_contents": 162,
+      "parent_placements": 377,
+      "sample_identities": 3110,
+      "filename_overrides": 0,
+      "average_full_path_bytes": 96.65,
+      "distinct_relative_paths": 548,
+      "reconstruction_verified": true,
+      "versions_with_locations": 162,
+      "average_relative_path_bytes": 36.31,
+      "effective_location_layouts": {
+        "legacy": {
+          "location_bytes": 13623296,
+          "supporting_table_bytes": 0,
+          "total_bytes": 13623296,
+          "bytes_per_location": 743.508
+        },
+        "binary_hashes": {
+          "location_bytes": 9945088,
+          "supporting_table_bytes": 0,
+          "total_bytes": 9945088,
+          "bytes_per_location": 542.765
+        },
+        "integer_ids": {
+          "location_bytes": 7577600,
+          "supporting_table_bytes": 0,
+          "total_bytes": 7577600,
+          "bytes_per_location": 413.557
+        },
+        "relative_inline": {
+          "location_bytes": 5693440,
+          "supporting_table_bytes": 147456,
+          "total_bytes": 5840896,
+          "bytes_per_location": 318.774
+        },
+        "relative_interned": {
+          "location_bytes": 4521984,
+          "supporting_table_bytes": 327680,
+          "total_bytes": 4849664,
+          "bytes_per_location": 264.676
+        },
+        "relative_interned_digest": {
+          "location_bytes": 4521984,
+          "supporting_table_bytes": 303104,
+          "total_bytes": 4825088,
+          "bytes_per_location": 263.335
+        }
+      },
+      "space_scenario": {
+        "projected_replacement_bytes": 1290309013718,
+        "free_space_after_replacement_before_overheads": -118748586198
+      },
+      "dictionary_savings_over_inline_percent": 16.97,
+      "digest_dictionary_savings_over_inline_percent": 17.39,
+      "digest_dictionary_space_scenario": {
+        "projected_replacement_bytes": 1283770285608
+      }
+    },
+    {
+      "rows": 67999,
+      "cohort": "lodash",
+      "postgres": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.3.34.2), 64-bit",
+      "relations": {
+        "legacy": {
+          "heap_bytes": 22020096,
+          "index_bytes": 24444928,
+          "total_bytes": 46505984
+        },
+        "integer_ids": {
+          "heap_bytes": 14155776,
+          "index_bytes": 10027008,
+          "total_bytes": 24223744
+        },
+        "binary_hashes": {
+          "heap_bytes": 17825792,
+          "index_bytes": 16482304,
+          "total_bytes": 34349056
+        },
+        "identity_text": {
+          "heap_bytes": 425984,
+          "index_bytes": 499712,
+          "total_bytes": 966656
+        },
+        "identity_bytes": {
+          "heap_bytes": 303104,
+          "index_bytes": 352256,
+          "total_bytes": 696320
+        },
+        "relative_paths": {
+          "heap_bytes": 229376,
+          "index_bytes": 270336,
+          "total_bytes": 540672
+        },
+        "relative_inline": {
+          "heap_bytes": 8912896,
+          "index_bytes": 10649600,
+          "total_bytes": 19603456
+        },
+        "parent_locations": {
+          "heap_bytes": 16384,
+          "index_bytes": 32768,
+          "total_bytes": 90112
+        },
+        "relative_interned": {
+          "heap_bytes": 8388608,
+          "index_bytes": 8175616,
+          "total_bytes": 16605184
+        },
+        "relative_paths_digest": {
+          "heap_bytes": 262144,
+          "index_bytes": 319488,
+          "total_bytes": 589824
+        }
+      },
+      "parent_contents": 44,
+      "parent_placements": 106,
+      "sample_identities": 3891,
+      "filename_overrides": 0,
+      "average_full_path_bytes": 77.82,
+      "distinct_relative_paths": 3440,
+      "reconstruction_verified": true,
+      "versions_with_locations": 44,
+      "average_relative_path_bytes": 21.24,
+      "effective_location_layouts": {
+        "legacy": {
+          "location_bytes": 46505984,
+          "supporting_table_bytes": 0,
+          "total_bytes": 46505984,
+          "bytes_per_location": 683.922
+        },
+        "binary_hashes": {
+          "location_bytes": 34349056,
+          "supporting_table_bytes": 0,
+          "total_bytes": 34349056,
+          "bytes_per_location": 505.141
+        },
+        "integer_ids": {
+          "location_bytes": 24223744,
+          "supporting_table_bytes": 0,
+          "total_bytes": 24223744,
+          "bytes_per_location": 356.237
+        },
+        "relative_inline": {
+          "location_bytes": 19603456,
+          "supporting_table_bytes": 90112,
+          "total_bytes": 19693568,
+          "bytes_per_location": 289.616
+        },
+        "relative_interned": {
+          "location_bytes": 16605184,
+          "supporting_table_bytes": 630784,
+          "total_bytes": 17235968,
+          "bytes_per_location": 253.474
+        },
+        "relative_interned_digest": {
+          "location_bytes": 16605184,
+          "supporting_table_bytes": 679936,
+          "total_bytes": 17285120,
+          "bytes_per_location": 254.197
+        }
+      },
+      "space_scenario": {
+        "projected_replacement_bytes": 1235696496997,
+        "free_space_after_replacement_before_overheads": -64136069477
+      },
+      "dictionary_savings_over_inline_percent": 12.48,
+      "digest_dictionary_savings_over_inline_percent": 12.23,
+      "digest_dictionary_space_scenario": {
+        "projected_replacement_bytes": 1239220346323
+      }
+    },
+    {
+      "rows": 74817,
+      "cohort": "typescript",
+      "postgres": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.3.34.2), 64-bit",
+      "relations": {
+        "legacy": {
+          "heap_bytes": 28835840,
+          "index_bytes": 26968064,
+          "total_bytes": 55844864
+        },
+        "integer_ids": {
+          "heap_bytes": 19922944,
+          "index_bytes": 11034624,
+          "total_bytes": 30998528
+        },
+        "binary_hashes": {
+          "heap_bytes": 23592960,
+          "index_bytes": 18153472,
+          "total_bytes": 41787392
+        },
+        "identity_text": {
+          "heap_bytes": 1024000,
+          "index_bytes": 1155072,
+          "total_bytes": 2220032
+        },
+        "identity_bytes": {
+          "heap_bytes": 720896,
+          "index_bytes": 794624,
+          "total_bytes": 1556480
+        },
+        "relative_paths": {
+          "heap_bytes": 245760,
+          "index_bytes": 294912,
+          "total_bytes": 581632
+        },
+        "relative_inline": {
+          "heap_bytes": 11010048,
+          "index_bytes": 11722752,
+          "total_bytes": 22773760
+        },
+        "parent_locations": {
+          "heap_bytes": 57344,
+          "index_bytes": 81920,
+          "total_bytes": 180224
+        },
+        "relative_interned": {
+          "heap_bytes": 8388608,
+          "index_bytes": 9011200,
+          "total_bytes": 17440768
+        },
+        "relative_paths_digest": {
+          "heap_bytes": 262144,
+          "index_bytes": 262144,
+          "total_bytes": 532480
+        }
+      },
+      "parent_contents": 236,
+      "parent_placements": 420,
+      "sample_identities": 9327,
+      "filename_overrides": 0,
+      "average_full_path_bytes": 119.81,
+      "distinct_relative_paths": 2735,
+      "reconstruction_verified": true,
+      "versions_with_locations": 236,
+      "average_relative_path_bytes": 36.39,
+      "effective_location_layouts": {
+        "legacy": {
+          "location_bytes": 55844864,
+          "supporting_table_bytes": 0,
+          "total_bytes": 55844864,
+          "bytes_per_location": 746.419
+        },
+        "binary_hashes": {
+          "location_bytes": 41787392,
+          "supporting_table_bytes": 0,
+          "total_bytes": 41787392,
+          "bytes_per_location": 558.528
+        },
+        "integer_ids": {
+          "location_bytes": 30998528,
+          "supporting_table_bytes": 0,
+          "total_bytes": 30998528,
+          "bytes_per_location": 414.325
+        },
+        "relative_inline": {
+          "location_bytes": 22773760,
+          "supporting_table_bytes": 180224,
+          "total_bytes": 22953984,
+          "bytes_per_location": 306.802
+        },
+        "relative_interned": {
+          "location_bytes": 17440768,
+          "supporting_table_bytes": 761856,
+          "total_bytes": 18202624,
+          "bytes_per_location": 243.295
+        },
+        "relative_interned_digest": {
+          "location_bytes": 17440768,
+          "supporting_table_bytes": 712704,
+          "total_bytes": 18153472,
+          "bytes_per_location": 242.638
+        }
+      },
+      "space_scenario": {
+        "projected_replacement_bytes": 1186075597288,
+        "free_space_after_replacement_before_overheads": -14515169768
+      },
+      "dictionary_savings_over_inline_percent": 20.7,
+      "digest_dictionary_savings_over_inline_percent": 20.91,
+      "digest_dictionary_space_scenario": {
+        "projected_replacement_bytes": 1182872872902
+      }
+    },
+    {
+      "rows": 2680489,
+      "cohort": "nextjs",
+      "postgres": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.3.34.2), 64-bit",
+      "relations": {
+        "legacy": {
+          "heap_bytes": 1062207488,
+          "index_bytes": 957800448,
+          "total_bytes": 2020327424
+        },
+        "integer_ids": {
+          "heap_bytes": 749731840,
+          "index_bytes": 390586368,
+          "total_bytes": 1140555776
+        },
+        "binary_hashes": {
+          "heap_bytes": 882376704,
+          "index_bytes": 644349952,
+          "total_bytes": 1527005184
+        },
+        "identity_text": {
+          "heap_bytes": 14901248,
+          "index_bytes": 16277504,
+          "total_bytes": 31219712
+        },
+        "identity_bytes": {
+          "heap_bytes": 10485760,
+          "index_bytes": 11165696,
+          "total_bytes": 21692416
+        },
+        "relative_paths": {
+          "heap_bytes": 3997696,
+          "index_bytes": 4366336,
+          "total_bytes": 8404992
+        },
+        "relative_inline": {
+          "heap_bytes": 435159040,
+          "index_bytes": 415006720,
+          "total_bytes": 850321408
+        },
+        "parent_locations": {
+          "heap_bytes": 49152,
+          "index_bytes": 81920,
+          "total_bytes": 172032
+        },
+        "relative_interned": {
+          "heap_bytes": 300417024,
+          "index_bytes": 317497344,
+          "total_bytes": 618037248
+        },
+        "relative_paths_digest": {
+          "heap_bytes": 4194304,
+          "index_bytes": 3375104,
+          "total_bytes": 7577600
+        }
+      },
+      "parent_contents": 290,
+      "parent_placements": 441,
+      "sample_identities": 136409,
+      "filename_overrides": 0,
+      "average_full_path_bytes": 116.44,
+      "distinct_relative_paths": 40993,
+      "reconstruction_verified": true,
+      "versions_with_locations": 290,
+      "average_relative_path_bytes": 55.65,
+      "effective_location_layouts": {
+        "legacy": {
+          "location_bytes": 2020327424,
+          "supporting_table_bytes": 0,
+          "total_bytes": 2020327424,
+          "bytes_per_location": 753.716
+        },
+        "binary_hashes": {
+          "location_bytes": 1527005184,
+          "supporting_table_bytes": 0,
+          "total_bytes": 1527005184,
+          "bytes_per_location": 569.674
+        },
+        "integer_ids": {
+          "location_bytes": 1140555776,
+          "supporting_table_bytes": 0,
+          "total_bytes": 1140555776,
+          "bytes_per_location": 425.503
+        },
+        "relative_inline": {
+          "location_bytes": 850321408,
+          "supporting_table_bytes": 172032,
+          "total_bytes": 850493440,
+          "bytes_per_location": 317.29
+        },
+        "relative_interned": {
+          "location_bytes": 618037248,
+          "supporting_table_bytes": 8577024,
+          "total_bytes": 626614272,
+          "bytes_per_location": 233.769
+        },
+        "relative_interned_digest": {
+          "location_bytes": 618037248,
+          "supporting_table_bytes": 7749632,
+          "total_bytes": 625786880,
+          "bytes_per_location": 233.46
+        }
+      },
+      "space_scenario": {
+        "projected_replacement_bytes": 1139632734643,
+        "free_space_after_replacement_before_overheads": 31927692877
+      },
+      "dictionary_savings_over_inline_percent": 26.32,
+      "digest_dictionary_savings_over_inline_percent": 26.42,
+      "digest_dictionary_space_scenario": {
+        "projected_replacement_bytes": 1138127944455
+      }
+    },
+    {
+      "rows": 48649,
+      "cohort": "broad",
+      "postgres": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.3.34.2), 64-bit",
+      "relations": {
+        "legacy": {
+          "heap_bytes": 23068672,
+          "index_bytes": 21061632,
+          "total_bytes": 44171264
+        },
+        "integer_ids": {
+          "heap_bytes": 17301504,
+          "index_bytes": 7872512,
+          "total_bytes": 25214976
+        },
+        "binary_hashes": {
+          "heap_bytes": 19922944,
+          "index_bytes": 13942784,
+          "total_bytes": 33906688
+        },
+        "identity_text": {
+          "heap_bytes": 5210112,
+          "index_bytes": 5709824,
+          "total_bytes": 10960896
+        },
+        "identity_bytes": {
+          "heap_bytes": 3670016,
+          "index_bytes": 3932160,
+          "total_bytes": 7643136
+        },
+        "relative_paths": {
+          "heap_bytes": 4775936,
+          "index_bytes": 5251072,
+          "total_bytes": 10067968
+        },
+        "relative_inline": {
+          "heap_bytes": 8912896,
+          "index_bytes": 8331264,
+          "total_bytes": 17285120
+        },
+        "parent_locations": {
+          "heap_bytes": 622592,
+          "index_bytes": 376832,
+          "total_bytes": 1040384
+        },
+        "relative_interned": {
+          "heap_bytes": 5775360,
+          "index_bytes": 6586368,
+          "total_bytes": 12402688
+        },
+        "relative_paths_digest": {
+          "heap_bytes": 5242880,
+          "index_bytes": 3751936,
+          "total_bytes": 9003008
+        }
+      },
+      "parent_contents": 3757,
+      "parent_placements": 3757,
+      "sample_identities": 47642,
+      "filename_overrides": 413,
+      "average_full_path_bytes": 176.9,
+      "distinct_relative_paths": 45622,
+      "reconstruction_verified": true,
+      "versions_with_locations": 0,
+      "average_relative_path_bytes": 61.98,
+      "effective_location_layouts": {
+        "legacy": {
+          "location_bytes": 44171264,
+          "supporting_table_bytes": 0,
+          "total_bytes": 44171264,
+          "bytes_per_location": 907.958
+        },
+        "binary_hashes": {
+          "location_bytes": 33906688,
+          "supporting_table_bytes": 0,
+          "total_bytes": 33906688,
+          "bytes_per_location": 696.966
+        },
+        "integer_ids": {
+          "location_bytes": 25214976,
+          "supporting_table_bytes": 0,
+          "total_bytes": 25214976,
+          "bytes_per_location": 518.304
+        },
+        "relative_inline": {
+          "location_bytes": 17285120,
+          "supporting_table_bytes": 1040384,
+          "total_bytes": 18325504,
+          "bytes_per_location": 376.688
+        },
+        "relative_interned": {
+          "location_bytes": 12402688,
+          "supporting_table_bytes": 11108352,
+          "total_bytes": 23511040,
+          "bytes_per_location": 483.279
+        },
+        "relative_interned_digest": {
+          "location_bytes": 12402688,
+          "supporting_table_bytes": 10043392,
+          "total_bytes": 22446080,
+          "bytes_per_location": 461.388
+        }
+      },
+      "space_scenario": {
+        "projected_replacement_bytes": 2356007047153,
+        "free_space_after_replacement_before_overheads": -1184446619633
+      },
+      "dictionary_savings_over_inline_percent": -28.3,
+      "digest_dictionary_savings_over_inline_percent": -22.49,
+      "digest_dictionary_space_scenario": {
+        "projected_replacement_bytes": 2249288957909
+      }
+    }
+  ],
+  "fixture_validation": {
+    "file": "scripts/testdata/storage-prototype.csv",
+    "rows": 5,
+    "reconstruction_verified": true,
+    "cases": [
+      "physical root",
+      "anonymous embedded PE with hexadecimal offset",
+      "nested archive member",
+      "base64+gzip decoded locator",
+      "unresolved parent retained inline"
+    ]
+  },
+  "decision": {
+    "long_term_layout": "relative_interned_digest",
+    "logical_string_ownership": "Relative locator strings belong to the dictionary; locations reference IDs. Reconstruct full paths and derive filenames, retaining only genuine overrides. Remove compatibility copies after readers migrate.",
+    "migration_space": "Do not start a full replacement-table build on the primary at the recorded free space. Even the Next.js scenario leaves insufficient room for WAL, catch-up writes, retained snapshots and operational reserve.",
+    "next_step": "Finalize the compact target and peak-space budget; arrange additional durable staging capacity or a measured partition-at-a-time migration before production backfill."
+  }
+}

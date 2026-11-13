@@ -286,8 +286,8 @@ func TestConvictionQueuesStaleSiblings(t *testing.T) {
 			execBoth(t, ctx, db, `UPDATE samples SET rescan_priority = 2 WHERE sha256 = $1`, asked)
 
 			// The conviction as cyclotron makes it: a triage ruling of bad.
-			if ok, err := db.prepareLocationMove(ctx, convicted, "test/"+convicted, "bad/foraged-quarantine/"+convicted,
-				&LocationRelabel{Label: labelBad, Source: "cyclotron:sighted-pinned"}); err != nil || !ok {
+			if ok, err := db.PrepareLocationMove(ctx, convicted, "test/"+convicted, "bad/foraged-quarantine/"+convicted,
+				&LocationRelabel{Label: labelBad, Source: "cyclotron:sighted-pinned"}, ""); err != nil || !ok {
 				t.Fatalf("prepareLocationMove = %v, %v", ok, err)
 			}
 			want := map[string]int{

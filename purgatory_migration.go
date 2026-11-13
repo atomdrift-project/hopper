@@ -100,7 +100,7 @@ type purgatoryMigrationItem struct {
 	id     int64
 }
 
-func (db *DB) queryPurgatoryMigration(ctx context.Context, query string, args []any, scan func(locationRows) error) error {
+func (db *DB) queryPurgatoryMigration(ctx context.Context, query string, args []any, scan func(sqlRows) error) error {
 	if db.pool != nil {
 		rows, err := db.pool.Query(ctx, query, args...)
 		if err != nil {
@@ -140,7 +140,7 @@ func (db *DB) purgatoryMigrationBatch(ctx context.Context, after int64, members,
 			WHERE label = 'purgatory' AND id > $1 ORDER BY id LIMIT 1000`
 	}
 	var batch []purgatoryMigrationItem
-	err := db.queryPurgatoryMigration(ctx, query, []any{after}, func(rows locationRows) error {
+	err := db.queryPurgatoryMigration(ctx, query, []any{after}, func(rows sqlRows) error {
 		for rows.Next() {
 			var item purgatoryMigrationItem
 			if err := rows.Scan(&item.id, &item.sha, &item.path, &item.parent); err != nil {
@@ -219,7 +219,7 @@ func (db *DB) migratePurgatoryMember(ctx context.Context, root string, item purg
 		UNION
 		SELECT sha256 FROM sample_location_history
 		 WHERE path = $1 AND parent_sha256 = '' AND successor_path = $2 AND reason = 'move'`,
-		[]any{oldArchive, newArchive}, func(rows locationRows) error {
+		[]any{oldArchive, newArchive}, func(rows sqlRows) error {
 			for rows.Next() {
 				var found string
 				if err := rows.Scan(&found); err != nil {

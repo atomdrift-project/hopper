@@ -1,4 +1,4 @@
-.PHONY: build test clean deploy deploy-linux deploy-freebsd rollout-replica-bastille replica rebuild-replica diagnose-replica replica-watch promote-replica install-precommit help
+.PHONY: build test clean deploy deploy-linux deploy-freebsd rollout-replica-bastille replica rebuild-replica diagnose-replica replica-watch promote-replica install-precommit help test-pg-stop
 
 DATA_DIR  ?= /data/samples
 DB        ?= postgres://hopper@hopper-db/hopper?sslmode=disable
@@ -73,8 +73,26 @@ install-precommit:
 	chmod +x $(shell git rev-parse --git-path hooks)/pre-commit
 	@echo "Pre-commit hook installed."
 
+# test runs every test hopper has, the database tests and the load test
+# (cmd/hopper TestLoadIngestsAndServesWorker) among them. It uses
+# HOPPER_TEST_PG_DSN when set, and otherwise a throwaway Postgres cluster
+# under out/test-pg (scripts/test-pg.sh). The load test runs `hopper load` with
+# a postdoc worker. postdoc is HOPPER_TEST_POSTDOC_BIN, else the one on PATH,
+# else built from the checkout at POSTDOC_DIR (cargo build is incremental, and
+# a binary left there can predate hopper's API); cleave is
+# HOPPER_TEST_CLEAVE_BIN or the one on PATH. Without them the run fails.
 test:
-	go test ./...
+	@dsn="$${HOPPER_TEST_PG_DSN:-$$(scripts/test-pg.sh)}" && \
+	postdoc="$${HOPPER_TEST_POSTDOC_BIN:-$$(command -v postdoc || true)}" && \
+	if [ -z "$$postdoc" ] && [ -f "$(POSTDOC_DIR)/Cargo.toml" ]; then \
+		echo "building postdoc in $(POSTDOC_DIR) for the load test"; \
+		(cd "$(POSTDOC_DIR)" && cargo build --quiet --bin postdoc) && \
+		postdoc="$$(cd "$(POSTDOC_DIR)" && pwd)/target/debug/postdoc"; \
+	fi && \
+		HOPPER_TEST_PG_DSN="$$dsn" HOPPER_TEST_POSTDOC_BIN="$$postdoc" HOPPER_TEST_INTEGRATION=require go test ./...
+
+test-pg-stop:
+	scripts/test-pg.sh stop
 
 deploy:
 	@case "$$(uname -s)" in \

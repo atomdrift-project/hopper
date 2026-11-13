@@ -156,7 +156,7 @@ func TestUploadRefreshesRowFromAnotherWriter(t *testing.T) {
 // production. forager and a scan worker reach the same artifact independently,
 // and only forager's sidecar carries the discovery Feed — how the package was
 // first seen. forager skips bytes for a sha hopper already holds, so this fires
-// when its /api/known probe and its upload straddle another producer's insert:
+// when its /v1/intake/held probe and its upload straddle another producer's insert:
 // it sends bytes + a Feed-carrying sidecar for a sha that just became known.
 //
 // forager has no provenance-only shape (pkg/forager/upload.go always writes both

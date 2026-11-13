@@ -2918,7 +2918,7 @@ func TestExplodeArchiveMembers(t *testing.T) {
 // litmus slice — as building them all at once. It also guards the parse-once
 // litmus index: every member must resolve a distinct, non-empty litmus result.
 // TestMemberEnvelopeCarriesTraitsVersion pins the traits version onto exploded
-// members. /api/known reports a stored verdict "current" only when
+// members. /v1/intake/held reports a stored verdict "current" only when
 // samples.traits_version matches the producer's, and scan skips re-posting
 // exactly those. Members used to inherit no version at all, so they were never
 // current, so every archive containing a popular dependency re-posted its
@@ -5159,7 +5159,7 @@ func TestApplyCleanupBatches(t *testing.T) {
 		// mustInsert gives every sample a synthetic non-empty path —
 		// InsertSample rejects an empty one, same as production's real
 		// upload path. The rows this stage targets never went through that
-		// path at all (they were verdict-only /api/result posts), so force
+		// path at all (they were verdict-only /v1/work/result posts), so force
 		// the state directly, the same way TestPurgeUnsupported simulates a
 		// historical row shape InsertSample wouldn't produce.
 		if _, err := db.lite.ExecContext(ctx, `UPDATE samples SET path = '' WHERE sha256 = ?`, sha); err != nil {
@@ -5337,7 +5337,7 @@ func TestScrubNULs(t *testing.T) {
 func loc(sha, path string) SampleLocationKey { return SampleLocationKey{SHA256: sha, Path: path} }
 
 // stageWalk resets the staging table and records the given files as present in
-// the current walk, exactly as runDirPipeline streams them in during a real
+// the current walk, exactly as runDir streams them in during a real
 // walk. Files not listed are, by definition, not present this walk.
 func stageWalk(t *testing.T, ctx context.Context, db *DB, present ...SampleLocationKey) {
 	t.Helper()
@@ -6599,7 +6599,7 @@ func TestTriageThresholds(t *testing.T) {
 // registry sidecars and fetched deps, which [containmentColumns] stores with
 // samples.path ” — never enter the queues cyclotron polls. Without this they
 // match TriageNew (suspicious_count from the exploded stub) and burn a HEAD
-// /api/file probe each cycle for bytes hopper will never serve.
+// /v1/files probe each cycle for bytes hopper will never serve.
 func TestTriageExcludesEmptyPathReferences(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)

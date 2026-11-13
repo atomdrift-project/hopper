@@ -12,7 +12,7 @@ func lockPruneObservations(tx locationSQLTx, observed []pruneLocation) ([]pruneL
 	}
 	var valid []pruneLocation
 	err := tx.query(`SELECT `+pruneLocationColumns+` FROM sample_locations
- WHERE id IN (`+pruneIDList(observed)+`) ORDER BY id FOR UPDATE`, nil, func(rows locationRows) error {
+ WHERE id IN (`+pruneIDList(observed)+`) ORDER BY id FOR UPDATE`, nil, func(rows sqlRows) error {
 		for rows.Next() {
 			current, err := scanPruneLocation(rows)
 			if err != nil {
@@ -56,7 +56,7 @@ func protectPruneRelationships(tx locationSQLTx, victims []pruneLocation, lockSu
  WHERE l.id IN (`+ids+`) AND NOT EXISTS (
  SELECT 1 FROM sample_locations survivor WHERE survivor.sha256=l.sha256
  AND `+scope+` AND survivor.id NOT IN (`+ids+`)`+survivorLock+`)
- GROUP BY `+group, nil, func(rows locationRows) error {
+ GROUP BY `+group, nil, func(rows sqlRows) error {
 		for rows.Next() {
 			var id int64
 			if err := rows.Scan(&id); err != nil {

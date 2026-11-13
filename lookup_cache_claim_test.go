@@ -11,7 +11,7 @@ import (
 // carries either — Sample has no such field — so a bump cannot make a cached
 // entry wrong. MarkClaimHandout already treats claimed_first_at this way;
 // IncrementAttempts was the outlier, and an expensive one. It ran forgetSHAs
-// on every batch /api/next hands out, which for each sha takes the pool's
+// on every batch /v1/work/next hands out, which for each sha takes the pool's
 // writer lock to drop its key and then, for any sha that was not itself
 // cached, scans the whole pool looking for purl keys to match — all on the
 // hottest path in the server, against a reader-biased lock whose writers must

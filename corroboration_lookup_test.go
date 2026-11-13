@@ -65,9 +65,9 @@ func TestLookupRecordDerivesALevelForAnArtifactNobodyHasAnalyzed(t *testing.T) {
 			t.Errorf("reason names a source (%q): %q", name, *rec.Reason)
 		}
 	}
-	// Answerable now — there is no analysis coming for this key, so the 202
-	// that means "come back" would be a lie.
-	if !rec.Analyzed {
+	// Answerable now: there is no analysis coming for this key, so pending,
+	// which means "come back", would be a lie.
+	if rec.State != StateAnalyzed {
 		t.Error("a derived record must answer rather than promise one")
 	}
 }

@@ -19,7 +19,7 @@ func TestSightingsAncestryAPIRequiresCompleteKnownLineage(t *testing.T) {
 	sha := strings.Repeat("a", 64)
 	api := &apiServer{db: db}
 	request := func(query string) *httptest.ResponseRecorder {
-		r := httptest.NewRequest(http.MethodGet, "/api/sightings/ancestry?"+query, http.NoBody)
+		r := httptest.NewRequest(http.MethodGet, "/v1/sightings/ancestry?"+query, http.NoBody)
 		w := httptest.NewRecorder()
 		api.handleSightingsAncestry(w, r)
 		return w

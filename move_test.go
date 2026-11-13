@@ -226,7 +226,7 @@ func TestMoveLocationRecoversPreparedMove(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustInsert(t, ctx, db, &Sample{SHA256: sha, Path: oldRel, Label: "unknown"})
-	prepared, err := db.prepareLocationMove(ctx, sha, oldRel, newRel, nil)
+	prepared, err := db.PrepareLocationMove(ctx, sha, oldRel, newRel, nil, "")
 	if err != nil || !prepared {
 		t.Fatalf("prepareLocationMove = %v, %v", prepared, err)
 	}

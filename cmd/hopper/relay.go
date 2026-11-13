@@ -18,8 +18,8 @@ package main
 //     renewal is gone for good). A relay that "helpfully" retried or queued
 //     would mint duplicate stores during publisher hiccups.
 //
-//  2. The worker firehose stays out. GET /api/next, GET /api/heartbeat and
-//     POST /api/result keep answering 403 here even with the relay enabled:
+//  2. The worker firehose stays out. POST /v1/work/next, POST /v1/work/heartbeat and
+//     POST /v1/work/result keep answering 403 here even with the relay enabled:
 //     result envelopes are the publisher's hot ingest path, and routing them
 //     client → replica → publisher would double-ship every body through this
 //     box for zero benefit. Workers are fleet config, not casual clients —
@@ -103,8 +103,8 @@ func newWriteRelay(base string, tokenFile string) (http.Handler, error) {
 			// streamed through untouched and never lands here.
 			slog.WarnContext(r.Context(), "write relay: primary unreachable",
 				"method", r.Method, "path", r.URL.Path, "error", err)
-			writeJSONError(w, http.StatusBadGateway,
-				`{"error":"primary hopper unreachable via relay; retry later or address the primary directly"}`)
+			v1Error(w, http.StatusBadGateway, "primary_unreachable",
+				"The primary hopper is unreachable through the relay; retry later or address the primary directly.")
 		},
 	}
 	return proxy, nil

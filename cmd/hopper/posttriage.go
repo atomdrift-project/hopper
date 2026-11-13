@@ -33,7 +33,7 @@ import (
 //     shelling out to `scan --hopper <url> <dir>` so the corrected verdicts
 //     land before the labels flip;
 //  2. hashes each misplaced file and POSTs {sha256, verdict} to the master's
-//     /api/triage, which moves the on-disk artifact into its corrected pool
+//     /v1/triage/rulings, which moves the on-disk artifact into its corrected pool
 //     bucket (<verdict>/mislabeled-<old-label>/) and flips the DB label.
 //
 // The client is deliberately thin and stateless: it ships SHA-256s, never
@@ -46,7 +46,7 @@ import (
 const (
 	defaultMisplacedGood = "/tmp/triage/misplaced-good"
 	defaultMisplacedBad  = "/tmp/triage/misplaced-bad"
-	// maxTriageVerdicts caps a single /api/triage request. Triage runs move
+	// maxTriageVerdicts caps a single /v1/triage/rulings request. Triage runs move
 	// dozens of files; this is a generous backstop against a malformed batch.
 	maxTriageVerdicts    = 10_000
 	maxIncomingLocations = 1_000
@@ -91,7 +91,7 @@ func (s *apiServer) handleIncomingLocations(w http.ResponseWriter, r *http.Reque
 	if raw := r.URL.Query().Get("before"); raw != "" {
 		parsed, err := time.Parse(time.RFC3339Nano, raw)
 		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, "invalid before timestamp")
+			v1Error(w, http.StatusBadRequest, "invalid_before", "before is not an RFC 3339 timestamp.")
 			return
 		}
 		before = parsed
@@ -100,7 +100,7 @@ func (s *apiServer) handleIncomingLocations(w http.ResponseWriter, r *http.Reque
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		parsed, err := strconv.Atoi(raw)
 		if err != nil || parsed <= 0 || parsed > maxIncomingLocations {
-			writeJSONError(w, http.StatusBadRequest, "limit must be between 1 and 1000")
+			v1Error(w, http.StatusBadRequest, "invalid_limit", "limit must be between 1 and 1000.", "max", 1000)
 			return
 		}
 		limit = parsed
@@ -116,7 +116,7 @@ func (s *apiServer) handleIncomingLocations(w http.ResponseWriter, r *http.Reque
 	if raw := r.URL.Query().Get("after_seen"); raw != "" {
 		parsed, err := time.Parse(time.RFC3339Nano, raw)
 		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, "invalid after_seen timestamp")
+			v1Error(w, http.StatusBadRequest, "invalid_after_seen", "after_seen is not an RFC 3339 timestamp.")
 			return
 		}
 		after.FirstSeenAt = parsed
@@ -127,12 +127,12 @@ func (s *apiServer) handleIncomingLocations(w http.ResponseWriter, r *http.Reque
 		Before: before, After: after, Class: class, Limit: limit,
 	})
 	if errors.Is(err, hopper.ErrNotFound) || (err != nil && strings.Contains(err.Error(), "unknown incoming class")) {
-		writeJSONError(w, http.StatusBadRequest, `class must be "unknown" or "classified"`)
+		v1Error(w, http.StatusBadRequest, "invalid_class", `class must be "unknown" or "classified".`)
 		return
 	}
 	if err != nil {
 		slog.Error("list incoming locations failed", "error", err)
-		writeJSONError(w, http.StatusInternalServerError, "server error")
+		v1Error(w, http.StatusInternalServerError, "internal", "Listing incoming locations failed.")
 		return
 	}
 	resp := incomingLocationsResponse{Locations: make([]incomingLocation, 0, len(locations)), CursorVersion: 2}
@@ -307,7 +307,7 @@ func workflowPlan(oldRel, dstRoot string) (placement, bool) {
 	return placement{newRel: filepath.FromSlash(newRel)}, true
 }
 
-// triageRequest is the JSON body for POST /api/triage.
+// triageRequest is the JSON body for POST /v1/triage/rulings.
 type triageRequest struct {
 	Verdicts []triageVerdict `json:"verdicts"`
 	DryRun   bool            `json:"dry_run"`
@@ -329,7 +329,7 @@ type triageResult struct {
 	SourceRemoved bool   `json:"source_removed,omitempty"`
 }
 
-// triageResponse is the JSON body returned by POST /api/triage.
+// triageResponse is the JSON body returned by POST /v1/triage/rulings.
 type triageResponse struct {
 	Results []triageResult `json:"results"`
 	Moved   int            `json:"moved"`
@@ -343,11 +343,11 @@ type triageResponse struct {
 // is in relocateTriaged.
 func (s *apiServer) handleTriage(w http.ResponseWriter, r *http.Request) {
 	if err := checkBrowserCSRF(r); err != nil {
-		writeJSONError(w, http.StatusForbidden, err.Error())
+		v1Error(w, http.StatusForbidden, "cross_site", err.Error())
 		return
 	}
-	if !s.ready.Load() || s.db == nil || s.dataRoot == "" {
-		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
+	if !s.ready.Load() || (s.db == nil && s.results == nil) || s.dataRoot == "" {
+		writeRetryable(w, retryAfterStarting, "starting", "Starting.")
 		return
 	}
 
@@ -355,16 +355,16 @@ func (s *apiServer) handleTriage(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(io.LimitReader(r.Body, 4<<20)) // verdicts are tiny; 4 MiB is plenty
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "decode body: "+err.Error())
+		v1Error(w, http.StatusBadRequest, "invalid_body", "The body is not a ruling request: "+err.Error())
 		return
 	}
 	if len(req.Verdicts) == 0 {
-		writeJSONError(w, http.StatusBadRequest, "no verdicts")
+		v1Error(w, http.StatusBadRequest, "no_verdicts", "The request holds no verdicts.")
 		return
 	}
 	if len(req.Verdicts) > maxTriageVerdicts {
-		writeJSONError(w, http.StatusRequestEntityTooLarge,
-			fmt.Sprintf("too many verdicts: %d > %d", len(req.Verdicts), maxTriageVerdicts))
+		v1Error(w, http.StatusRequestEntityTooLarge, "too_many_verdicts",
+			fmt.Sprintf("At most %d verdicts per request.", maxTriageVerdicts), "max", maxTriageVerdicts)
 		return
 	}
 
@@ -389,7 +389,8 @@ func (s *apiServer) handleTriage(w http.ResponseWriter, r *http.Request) {
 }
 
 // relocateTriaged resolves one exact catalog location, then delegates the
-// durable filesystem and catalog transition to hopper.DB.MoveLocation.
+// durable filesystem and catalog transition to hopper.MoveLocation, recorded
+// in s.catalog().
 func (s *apiServer) relocateTriaged(ctx context.Context, verdict triageVerdict, dryRun bool) triageResult {
 	verdict.Ruling = hopper.CanonicalLabel(verdict.Ruling)
 	res := triageResult{SHA256: verdict.SHA256}
@@ -404,7 +405,7 @@ func (s *apiServer) relocateTriaged(ctx context.Context, verdict triageVerdict, 
 		return res
 	}
 
-	samp, err := s.db.SampleBySHA256(ctx, sha)
+	samp, err := s.triageSample(ctx, sha)
 	if errors.Is(err, hopper.ErrNotFound) {
 		res.Status = "not_found"
 		return res
@@ -474,7 +475,7 @@ func (s *apiServer) relocateTriaged(ctx context.Context, verdict triageVerdict, 
 		// only whether either end of the move is catalogued, and a sha that is
 		// duplicated across millions of paths must not make that question
 		// proportional to its fan-out. See TopLevelLocationsRecorded.
-		oldRecorded, newRecorded, err := s.db.TopLevelLocationsRecorded(ctx, sha, oldRel, plan.newRel)
+		oldRecorded, newRecorded, err := s.catalog().TopLevelLocationsRecorded(ctx, sha, oldRel, plan.newRel)
 		if err != nil {
 			res.Status, res.Error = "error", "lookup locations: "+err.Error()
 			return res
@@ -496,15 +497,11 @@ func (s *apiServer) relocateTriaged(ctx context.Context, verdict triageVerdict, 
 		return res
 	}
 	if !oldExists && !newExists {
-		// Use the same alternate-location recovery and authoritative-missing path
-		// as file serving. A stale primary must not be offered on every sweep.
 		if !dryRun && verdict.OldPath == "" {
-			f, _, fileErr := s.openKnownSampleFile(ctx, samp, "triage")
-			if f != nil {
-				res.Status, res.Error = "error", recoveredFileResult(f.Close())
+			if recovered := s.recoverAbsent(ctx, samp); recovered != "" {
+				res.Status, res.Error = "error", recovered
 				return res
 			}
-			s.markServeMissing(ctx, samp, fileErr)
 		}
 		res.Status, res.Error = "absent", "bytes not on this host; re-submit once the full corpus is attached"
 		return res
@@ -532,7 +529,7 @@ func (s *apiServer) relocateTriaged(ctx context.Context, verdict triageVerdict, 
 	if plan.label != "" && plan.label != samp.Label {
 		relabel = &hopper.LocationRelabel{Label: plan.label, Source: plan.source}
 	}
-	result, err := s.db.MoveLocation(ctx, hopper.MoveLocationOptions{
+	result, err := hopper.MoveLocation(ctx, s.catalog(), hopper.MoveLocationOptions{
 		DataRoot: s.dataRoot,
 		SHA256:   sha,
 		OldPath:  oldRel,
@@ -551,6 +548,24 @@ func (s *apiServer) relocateTriaged(ctx context.Context, verdict triageVerdict, 
 	res.SourceRemoved = result.SourceRemoved
 	res.Status = "moved"
 	return res
+}
+
+// recoverAbsent looks for a file whose recorded path is empty where file
+// serving would, and marks it missing when it is not found, so a stale path
+// is not offered on every sweep. It returns the error to report when the
+// bytes turned up elsewhere, "" when they did not. The legacy catalog can
+// look at its other recorded paths; serving files from the verdict schema is
+// not ported yet, so there it does nothing.
+func (s *apiServer) recoverAbsent(ctx context.Context, samp *hopper.Sample) string {
+	if s.results != nil {
+		return ""
+	}
+	f, _, err := s.openKnownSampleFile(ctx, samp, "triage")
+	if f != nil {
+		return recoveredFileResult(f.Close())
+	}
+	s.markServeMissing(ctx, samp, err)
+	return ""
 }
 
 func recoveredFileResult(err error) string {
@@ -715,7 +730,7 @@ func cmdPostTriage(ctx context.Context) error {
 		misplacedBad = stringListFlag{defaultMisplacedBad}
 	}
 
-	// 1. Push corrected analysis up the existing /api/result path first, so the
+	// 1. Push corrected analysis up the existing /v1/work/result path first, so the
 	//    fresh verdicts are stored before the labels flip. Remote-native: scan
 	//    already talks to the master over HTTP.
 	//
@@ -829,7 +844,7 @@ const scanSidecarFlag = "--enable-sidecar"
 // runScanUpload shells out to `scan fs --hopper <url> [--enable-sidecar] <dir>`,
 // streaming its output through. `fs` is the filesystem-scan subcommand;
 // --hopper (alias --upload) renews each result on the master by POSTing to
-// <url>/api/result.
+// <url>/v1/work/result.
 func runScanUpload(ctx context.Context, scanBin, baseURL, dir string, sidecars bool) error {
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 		return fmt.Errorf("not a directory: %s", dir)
@@ -917,7 +932,7 @@ func postTriage(ctx context.Context, baseURL string, req triageRequest) (*triage
 	if err != nil {
 		return nil, err
 	}
-	url := strings.TrimRight(baseURL, "/") + "/api/triage"
+	url := strings.TrimRight(baseURL, "/") + "/v1/triage/rulings"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -925,7 +940,7 @@ func postTriage(ctx context.Context, baseURL string, req triageRequest) (*triage
 	httpReq.Header.Set("Content-Type", "application/json")
 	// Marks the request as a non-browser client for the CSRF guard.
 	httpReq.Header.Set("Sec-Fetch-Site", "same-origin")
-	// /api/triage requires a bearer token on a master deployed with
+	// /v1/triage/rulings requires a bearer token on a master deployed with
 	// --token-file, loopback callers included.
 	authorizeRequest(httpReq)
 	client := &http.Client{Timeout: 5 * time.Minute}
@@ -936,7 +951,7 @@ func postTriage(ctx context.Context, baseURL string, req triageRequest) (*triage
 	defer resp.Body.Close() //nolint:errcheck // best-effort close
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10)) //nolint:errcheck // diagnostic only
-		return nil, fmt.Errorf("/api/triage: %s: %s", resp.Status, strings.TrimSpace(string(msg)))
+		return nil, fmt.Errorf("/v1/triage/rulings: %s: %s", resp.Status, strings.TrimSpace(string(msg)))
 	}
 	var out triageResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {

@@ -15,7 +15,7 @@ import (
 // extractCache keeps decompressed copies of compressed-tar archive parents on
 // disk so the members of one archive are decompressed once, not once per member
 // request. tar.xz/tar.zst/tar.gz/tar.bz2 are not seekable, so without this every
-// GET /api/file member fetch re-runs the whole (CPU-bound) decompressor from
+// GET /v1/files member fetch re-runs the whole (CPU-bound) decompressor from
 // byte 0 — O(N×M) work for N members of an M-byte archive, which saturates the
 // extraction slots and times clients out. The cache makes the steady state O(M):
 // the first member pays the decompression, the rest stream straight off the

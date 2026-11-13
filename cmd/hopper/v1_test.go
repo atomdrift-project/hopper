@@ -143,9 +143,9 @@ func TestHandleV1Lookup(t *testing.T) {
 	})
 }
 
-// A sample hopper holds but nothing has looked at is 202, not an empty 200:
-// there is an answer coming for this key, and that is worth waiting on rather
-// than reading as "we looked and found nothing".
+// A sample hopper holds but nothing has looked at answers state "pending",
+// with its digest: there is an answer coming for this key, and that is worth
+// waiting on rather than reading as "we looked and found nothing".
 func TestHandleV1LookupHeldButUnanalyzed(t *testing.T) {
 	ctx := context.Background()
 	api := newV1API(t, ctx)
@@ -161,11 +161,15 @@ func TestHandleV1LookupHeldButUnanalyzed(t *testing.T) {
 	rec := httptest.NewRecorder()
 	api.handleV1Lookup(rec, r)
 
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want 202", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if rec.Header().Get("Retry-After") == "" {
-		t.Error("202 must say when to come back")
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body: %v", err)
+	}
+	if body["state"] != hopper.StatePending || body["sha256"] != sha {
+		t.Errorf("state %v, sha256 %v: want pending and the digest held", body["state"], body["sha256"])
 	}
 }
 
@@ -219,13 +223,15 @@ func TestHandleV1LookupBatch(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, "/v1/lookup?"+q.Encode(), http.NoBody)
 		rec := httptest.NewRecorder()
 		api.handleV1Lookup(rec, r)
-		var body []map[string]any
+		var reply struct {
+			Records []map[string]any `json:"records"`
+		}
 		if rec.Code == http.StatusOK {
-			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-				t.Fatalf("batch reply is not a JSON list: %s", rec.Body.Bytes())
+			if err := json.Unmarshal(rec.Body.Bytes(), &reply); err != nil || reply.Records == nil {
+				t.Fatalf("batch reply is not {\"records\": […]}: %s", rec.Body.Bytes())
 			}
 		}
-		return rec, body
+		return rec, reply.Records
 	}
 
 	// An unknown first purl used to 404 the whole batch; the caller's spelling

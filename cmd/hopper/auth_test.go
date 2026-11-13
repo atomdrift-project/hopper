@@ -95,7 +95,7 @@ func TestAuthMiddlewareRequiresTokenFromLoopback(t *testing.T) {
 	reached := false
 	h := authMiddleware(testDigest(t), okHandler(&reached))
 
-	req := httptest.NewRequest(http.MethodGet, "/api/next", http.NoBody)
+	req := httptest.NewRequest(http.MethodGet, "/v1/work/next", http.NoBody)
 	req.RemoteAddr = "127.0.0.1:54321"
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -126,7 +126,7 @@ func TestAuthMiddlewareRejectsBadCredentials(t *testing.T) {
 	} {
 		reached := false
 		h := authMiddleware(testDigest(t), okHandler(&reached))
-		req := httptest.NewRequest(http.MethodPost, "/api/result", http.NoBody)
+		req := httptest.NewRequest(http.MethodPost, "/v1/work/result", http.NoBody)
 		if header != "" {
 			req.Header.Set("Authorization", header)
 		}
@@ -146,7 +146,7 @@ func TestAuthMiddlewareAcceptsValidToken(t *testing.T) {
 	for _, header := range []string{"Bearer " + testToken, "bearer " + testToken} {
 		reached := false
 		h := authMiddleware(testDigest(t), okHandler(&reached))
-		req := httptest.NewRequest(http.MethodGet, "/api/next", http.NoBody)
+		req := httptest.NewRequest(http.MethodGet, "/v1/work/next", http.NoBody)
 		req.Header.Set("Authorization", header)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -175,13 +175,13 @@ func TestAuthMiddlewareExemptsProbes(t *testing.T) {
 // sharing a prefix with a probe.
 func TestAuthMiddlewareExemptionIsExact(t *testing.T) {
 	for _, path := range []string{
-		"/healthz/../api/next",
+		"/healthz/../v1/work/next",
 		"/healthzz",
 		"/healthz/x",
 		"/_/healthz",
 		"/_/metrikk",
 		"/",
-		"/api/next",
+		"/v1/work/next",
 	} {
 		reached := false
 		h := authMiddleware(testDigest(t), okHandler(&reached))
@@ -205,7 +205,7 @@ func TestAuthMiddlewareNilDigestIsPassthrough(t *testing.T) {
 	if got := authMiddleware(nil, inner); fmt.Sprintf("%p", got) != fmt.Sprintf("%p", inner) {
 		t.Error("nil digest should return the handler unwrapped")
 	}
-	req := httptest.NewRequest(http.MethodGet, "/api/next", http.NoBody)
+	req := httptest.NewRequest(http.MethodGet, "/v1/work/next", http.NoBody)
 	rec := httptest.NewRecorder()
 	authMiddleware(nil, inner).ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || !reached {
@@ -221,7 +221,7 @@ func TestAuthorizeRequestSatisfiesTheMiddleware(t *testing.T) {
 	t.Cleanup(func() { clientToken = restore })
 	clientToken = func() string { return testToken }
 
-	req := httptest.NewRequest(http.MethodPost, "/api/triage", http.NoBody)
+	req := httptest.NewRequest(http.MethodPost, "/v1/triage/rulings", http.NoBody)
 	authorizeRequest(req)
 	if got := req.Header.Get("Authorization"); got != "Bearer "+testToken {
 		t.Fatalf("Authorization = %q", got)
@@ -242,7 +242,7 @@ func TestAuthorizeRequestWithoutATokenSendsNoHeader(t *testing.T) {
 	t.Cleanup(func() { clientToken = restore })
 	clientToken = func() string { return "" }
 
-	req := httptest.NewRequest(http.MethodGet, "/api/file/abc", http.NoBody)
+	req := httptest.NewRequest(http.MethodGet, "/v1/files/abc", http.NoBody)
 	authorizeRequest(req)
 	if got, ok := req.Header["Authorization"]; ok {
 		t.Errorf("Authorization set without a token: %q", got)

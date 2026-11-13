@@ -32,7 +32,6 @@ const minTokenLen = 16
 // authExemptPaths are the routes reachable without a bearer token. Matched
 // exactly: a prefix match would exempt every route sharing the prefix.
 var authExemptPaths = map[string]bool{
-	"/healthz":  true,
 	"/_/health": true,
 	"/_/ready":  true,
 	"/_/metrik": true,
@@ -117,7 +116,7 @@ func authMiddleware(digest *tokenDigest, next http.Handler) http.Handler {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			// One message for missing and invalid alike, so the endpoint is not
 			// an oracle for whether a guessed token exists.
-			http.Error(w, `{"error":"missing or invalid bearer token"}`, http.StatusUnauthorized)
+			v1Error(w, http.StatusUnauthorized, "unauthenticated", "Missing or invalid bearer token.")
 			return
 		}
 		next.ServeHTTP(w, r)

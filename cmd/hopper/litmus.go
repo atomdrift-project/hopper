@@ -22,7 +22,7 @@ import (
 )
 
 // litmusServer manages a local postdoc worker subprocess. In pull mode,
-// postdoc polls hopper's /api/next for work instead of hopper pushing
+// postdoc polls hopper's /v1/work/next for work instead of hopper pushing
 // requests to it.
 const (
 	restartRecoveryDelay = 15 * time.Second
@@ -71,7 +71,11 @@ const (
 )
 
 type litmusServer struct {
-	cmd        *exec.Cmd
+	cmd *exec.Cmd
+	// exit is cmd's one waiter: Wait may be called once per process, and a
+	// second concurrent call can block forever, so everything that waits for
+	// the worker to exit waits on this instead.
+	exit       *procExit
 	tracker    *workerTracker                    // for liveness checks
 	logPath    atomic.Pointer[string]            // current worker's stdout/stderr log file
 	health     atomic.Pointer[localWorkerHealth] // published for the dashboard banner
@@ -228,13 +232,20 @@ func sanitizeLogString(s string) string {
 // killGroup sends sig to the process group led by pid. Litmus is started
 // with Setpgid so its rizin/yara children share the group; signaling the
 // group guarantees we don't leak descendants when tearing the worker down.
-// ESRCH (group already gone) is treated as success.
+// ESRCH (group already gone) is treated as success. When the group cannot be
+// signalled as a whole (macOS answers EPERM for some groups), the leader is
+// signalled on its own, so a caller waiting on it is not left waiting forever.
 func killGroup(reason string, pid int, sig syscall.Signal, attrs ...any) {
 	if pid <= 0 {
 		return
 	}
-	if err := syscall.Kill(-pid, sig); err != nil && !errors.Is(err, syscall.ESRCH) {
-		slog.Warn(reason, append(attrs, "pid", pid, "signal", sig.String(), "error", err)...)
+	err := syscall.Kill(-pid, sig)
+	if err == nil || errors.Is(err, syscall.ESRCH) {
+		return
+	}
+	slog.Warn(reason, append(attrs, "pid", pid, "signal", sig.String(), "error", err)...)
+	if err := syscall.Kill(pid, sig); err != nil && !errors.Is(err, syscall.ESRCH) {
+		slog.Warn(reason+" (leader)", append(attrs, "pid", pid, "signal", sig.String(), "error", err)...)
 	}
 }
 
@@ -512,7 +523,7 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 		closeLogFile(logFile.Name(), logFile)
 		return fmt.Errorf("start litmus: %w", err)
 	}
-	s.cmd = cmd
+	s.cmd, s.exit = cmd, waitFor(cmd)
 	// Stamp the spawn time before publishing the pid so the watchdog never
 	// pairs a fresh pid with a previous process's spawn time.
 	s.spawnedAt.Store(time.Now().UnixNano())
@@ -542,13 +553,14 @@ func (s *litmusServer) startLocked(ctx context.Context) error {
 		"args", sanitizeLogString(strings.Join(args, " ")))
 
 	// Brief startup check: if the process crashes immediately, report it.
-	time.Sleep(500 * time.Millisecond)
-	if cmd.ProcessState != nil {
+	select {
+	case <-s.exit.done:
 		closeLogFile(logFile.Name(), logFile)
-		s.cmd = nil
+		s.cmd, s.exit = nil, nil
 		s.pid.Store(0)
 		s.spawnedAt.Store(0)
 		return errors.New("litmus worker exited immediately")
+	case <-time.After(500 * time.Millisecond):
 	}
 
 	slog.Info("litmus worker started", "pid", cmd.Process.Pid)
@@ -568,10 +580,17 @@ func (s *litmusServer) Stop() {
 	if s.cmd != nil && s.cmd.Process != nil {
 		slog.Info("stopping litmus server", "pid", s.cmd.Process.Pid, "url", s.hopperURL)
 		killGroup("failed to kill litmus group during stop", s.cmd.Process.Pid, syscall.SIGKILL, "url", s.hopperURL)
-		if err := s.cmd.Wait(); err != nil {
-			slog.Debug("litmus exited during stop", "pid", s.cmd.Process.Pid, "error", err)
+		select {
+		case <-s.exit.done:
+			if s.exit.err != nil {
+				slog.Debug("litmus exited during stop", "pid", s.cmd.Process.Pid, "error", s.exit.err)
+			}
+		case <-time.After(10 * time.Second):
+			// Cleanup must end: a worker that outlives SIGKILL is the
+			// operator's to find, by the pid logged here.
+			slog.Error("litmus did not exit after SIGKILL; leaving it", "pid", s.cmd.Process.Pid)
 		}
-		s.cmd = nil
+		s.cmd, s.exit = nil, nil
 		s.pid.Store(0)
 		slog.Info("litmus server stopped")
 	}
@@ -853,25 +872,38 @@ func procMemoryBytes(pid int) (uint64, error) {
 
 func (s *litmusServer) waitExit(ctx context.Context) error {
 	s.mu.Lock()
-	cmd := s.cmd
+	cmd, exit := s.cmd, s.exit
 	s.mu.Unlock()
-	if cmd == nil {
+	if cmd == nil || exit == nil {
 		return errors.New("no process")
 	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
 	select {
-	case err := <-done:
-		// Clear cmd so we don't double-Wait on the same process.
+	case <-exit.done:
 		s.mu.Lock()
 		if s.cmd == cmd {
-			s.cmd = nil
+			s.cmd, s.exit = nil, nil
 		}
 		s.mu.Unlock()
-		return err
+		return exit.err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// procExit is a started process's exit, awaited once.
+type procExit struct {
+	done chan struct{} // closed when the process has exited and been reaped
+	err  error         // Wait's error; read only after done is closed
+}
+
+// waitFor starts cmd's one call to Wait.
+func waitFor(cmd *exec.Cmd) *procExit {
+	e := &procExit{done: make(chan struct{})}
+	go func() {
+		e.err = cmd.Wait()
+		close(e.done)
+	}()
+	return e
 }
 
 // extractCanonicalSHA computes the minimum SHA256 across files in the raw cleave report.
@@ -986,13 +1018,19 @@ func lastNLines(s string, n int) string {
 // superviseLocalWorker keeps the in-process postdoc worker running for the
 // life of ctx and never gives up. It loops: validate cleave traits (retrying —
 // a fresh fetch may still be landing, or may have failed, in which case it
-// re-pulls cleave's traits), then start the worker and hand off to Monitor,
+// re-pulls cleave's traits) unless validate is false, then start the worker
+// and hand off to Monitor,
 // which restarts it on every crash. Every failure is logged and published to the
 // dashboard banner via setHealth; the worker is never permanently disabled and
 // never blocks ingestion — remote workers keep analyzing regardless.
-func superviseLocalWorker(ctx context.Context, litmus *litmusServer, cleaveBin string) {
+func superviseLocalWorker(ctx context.Context, litmus *litmusServer, cleaveBin string, validate bool) {
+	preflight := preflightCleaveValidate
+	if !validate {
+		slog.Warn("starting the local postdoc worker without cleave validate (--no-cleave-validate)")
+		preflight = func(context.Context, string) (string, error) { return "", nil }
+	}
 	for attempt := 1; ctx.Err() == nil; attempt++ {
-		if detail, err := preflightCleaveValidate(ctx, cleaveBin); err != nil {
+		if detail, err := preflight(ctx, cleaveBin); err != nil {
 			delay := workerRetryDelay(attempt)
 			litmus.setHealth(false, "cleave validate failed: "+err.Error(), detail)
 			slog.Error("local postdoc worker not started: cleave validate failed; retrying",

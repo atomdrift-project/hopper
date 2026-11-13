@@ -180,7 +180,7 @@ func (db *DB) PruneLocations(ctx context.Context, opts LocationPruneOptions) (Lo
 		return stats, errors.New("hopper: data root is not a directory")
 	}
 	if stats.ThroughID == 0 {
-		err = db.queryLocations(ctx, `SELECT COALESCE(max(id),0) FROM sample_locations`, nil, func(rows locationRows) error {
+		err = db.queryLocations(ctx, `SELECT COALESCE(max(id),0) FROM sample_locations`, nil, func(rows sqlRows) error {
 			if rows.Next() {
 				return rows.Scan(&stats.ThroughID)
 			}
@@ -209,7 +209,7 @@ func pruneSeen(value any) time.Time {
 	return time.Time{}
 }
 
-func scanPruneLocation(rows locationRows) (pruneLocation, error) {
+func scanPruneLocation(rows sqlRows) (pruneLocation, error) {
 	var l pruneLocation
 	var seen any
 	dest := []any{&l.ID, &l.SHA, &l.Path, &l.Parent, &l.Rel, &seen}
@@ -231,7 +231,7 @@ func (db *DB) pruneObsoleteLocations(ctx context.Context, opts LocationPruneOpti
 		}
 		var batch []pruneLocation
 		err := db.queryLocations(ctx, `SELECT `+pruneLocationColumns+` FROM sample_locations
-   WHERE id > $1 AND id <= $2 ORDER BY id LIMIT $3`, []any{stats.AfterID, stats.ThroughID, size}, func(rows locationRows) error {
+   WHERE id > $1 AND id <= $2 ORDER BY id LIMIT $3`, []any{stats.AfterID, stats.ThroughID, size}, func(rows sqlRows) error {
 			for rows.Next() {
 				l, err := scanPruneLocation(rows)
 				if err != nil {
@@ -270,7 +270,7 @@ func (db *DB) pruneObsoleteLocations(ctx context.Context, opts LocationPruneOpti
 		stats.Unmapped += plan.unmapped
 		// Keep the final relationship even when every recorded outer file is
 		// absent. It is still needed to traverse the content graph.
-		query := locationSQLTx{query: func(q string, args []any, scan func(locationRows) error) error {
+		query := locationSQLTx{query: func(q string, args []any, scan func(sqlRows) error) error {
 			return db.queryLocations(ctx, q, args, scan)
 		}}
 		var protected int64

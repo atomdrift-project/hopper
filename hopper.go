@@ -46,7 +46,7 @@ const skipBenignArchiveItem = "skip-benign-archive-item"
 // maxArchiveMembers bounds how many members a single archive explosion will
 // insert (see ExplodeArchiveMembers). Real archives — even large containers or
 // monorepo tarballs — stay well under this; the cap exists so one oversized or
-// crafted cleave result can't fan a single /api/result into millions of rows.
+// crafted cleave result can't fan a single /v1/work/result into millions of rows.
 const maxArchiveMembers = 100_000
 
 // CriticalLevel is hopper's consumer-side cutoff between hostile and suspicious
@@ -169,7 +169,7 @@ func LitmusClass(result []byte) int {
 // Both rank above bad deliberately. The rank decides what a *re-observation*
 // may overwrite (see sampleConflictUpdatePG), and parking a sample here is a
 // human judgement that a later forager walk or feed claim must not silently
-// undo. An explicit ruling still moves it out: /api/triage writes the label
+// undo. An explicit ruling still moves it out: /v1/triage/rulings writes the label
 // through MoveLocation, which assigns directly and never consults the rank.
 const (
 	labelUnknown      = "unknown"
@@ -1571,7 +1571,7 @@ func newMemberEnvelope(parent *Sample) *memberEnvelope {
 	}
 
 	// Carry the traits version onto the members. This is load-bearing, not
-	// bookkeeping: /api/known reports a verdict "current" only when the stored
+	// bookkeeping: /v1/intake/held reports a verdict "current" only when the stored
 	// samples.traits_version matches the producer's, and scan skips re-posting
 	// exactly those. Exploded members used to inherit no version, so they were
 	// never current, so every archive containing a popular dependency re-posted
@@ -2061,7 +2061,7 @@ const MaxClaimAttempts = 8
 const maxClaimAttempts = MaxClaimAttempts
 
 // IncrementAttempts bumps the claim-attempt counter for the given samples. It
-// does not touch updated_at — a claim is not progress. Called from /api/next
+// does not touch updated_at — a claim is not progress. Called from /v1/work/next
 // with the batch a worker just claimed.
 //
 // It deliberately does not invalidate the lookup cache. attempts is claim
@@ -2071,7 +2071,7 @@ const maxClaimAttempts = MaxClaimAttempts
 // outlier, and an expensive one: forgetSHAs takes the pool's writer lock once
 // per sha to drop its key, and for any sha that was not itself cached — the
 // common case, since most claims are of unanalyzed samples — then scans the
-// whole pool for purl keys to match. That ran on every /api/next, the hottest
+// whole pool for purl keys to match. That ran on every /v1/work/next, the hottest
 // path in the server, against a reader-biased lock whose writers must drain
 // every reader slot. The resulting convoy, not the database, is what stalled
 // /v1/lookup fleet-wide on 2026-09-22.
@@ -2117,7 +2117,7 @@ func (db *DB) ReapStuck(ctx context.Context) (int64, error) {
 }
 
 // MaxJobBytes is the largest sample any scan worker will analyze (workers
-// advertise the same value as max_bytes on /api/next and reject anything
+// advertise the same value as max_bytes on /v1/work/next and reject anything
 // larger). Kept in sync with MAX_JOB_BYTES in scan's worker.
 const MaxJobBytes = 16 * 1024 * 1024 * 1024
 
@@ -3172,17 +3172,13 @@ func (db *DB) DuplicateLocationSHAs(ctx context.Context, afterSHA string, limit 
 	return db.duplicateLocationSHAsSQLite(ctx, afterSHA, limit)
 }
 
-func (db *DB) prepareLocationMove(
-	ctx context.Context, sha256, oldRel, newRel string, relabel *LocationRelabel, expectedLabel ...string,
+func (db *DB) PrepareLocationMove(
+	ctx context.Context, sha256, oldRel, newRel string, relabel *LocationRelabel, expected string,
 ) (bool, error) {
 	if relabel != nil {
 		canonical := *relabel
 		canonical.Label = CanonicalLabel(canonical.Label)
 		relabel = &canonical
-	}
-	var expected string
-	if len(expectedLabel) > 0 {
-		expected = expectedLabel[0]
 	}
 	var ok bool
 	var err error
@@ -3195,14 +3191,14 @@ func (db *DB) prepareLocationMove(
 		db.forgetSHA(sha256)
 	}
 	// A triage ruling of bad (cyclotron's "cyclotron:sighted-pinned" and the
-	// rest arrive here via /api/triage) is the commonest conviction there is.
+	// rest arrive here via /v1/triage/rulings) is the commonest conviction there is.
 	if err == nil && ok && relabel != nil && relabel.Label == labelBad {
 		db.rescanSiblingsOfConvicted(ctx, sha256)
 	}
 	return ok, err
 }
 
-func (db *DB) finishLocationMove(ctx context.Context, sha256, oldRel, newRel string) (bool, error) {
+func (db *DB) FinishLocationMove(ctx context.Context, sha256, oldRel, newRel string) (bool, error) {
 	if err := db.rebaseLocationMembers(ctx, sha256, oldRel, newRel); err != nil {
 		return false, err
 	}
@@ -3497,7 +3493,7 @@ const knownRetrievableSQL = `
 // Reference edges (rel=registry / rel=fetched) deliberately leave samples.path
 // empty via [containmentColumns] — there is nothing on disk and nothing to
 // extract — and without this filter triage queues hand those SHAs to cyclotron,
-// which HEAD-probes /api/file and logs a permanent "outside allowed directories"
+// which HEAD-probes /v1/files and logs a permanent "outside allowed directories"
 // WARN for every one. Unaliased samples rows only; aliased forms spell
 // `<alias>.path <> ”` inline. Partial indexes that back these selectors must
 // carry the same predicate or the planner will not match them.
@@ -4758,7 +4754,7 @@ type ClaimJob struct {
 	SizeBytes int64 `json:"size_bytes"`
 
 	// HasProvenance reports whether hopper holds a provenance sidecar for this
-	// sample, so the worker fetches /api/provenance/{sha256} for its registry
+	// sample, so the worker fetches /v1/files/{sha256}/provenance for its registry
 	// record only when there is one — avoiding a wasted round-trip on the
 	// majority of samples that carry none. Stamped per claim batch, not selected
 	// by each tier query. Omitted from the wire when false.
@@ -7251,7 +7247,7 @@ func digestWearingAPURL(subject string) (string, bool) {
 // purl_base keys. Mark-corroborated updates MUST hit each column separately:
 // a single `sha256 = ANY(...) OR purl_base = ANY(...)` predicate forces a
 // sequential scan of samples (tens of millions of rows), which blows the
-// /api/sightings timeout. PK / idx_samples_purl_base look-ups stay cheap.
+// /v1/sightings timeout. PK / idx_samples_purl_base look-ups stay cheap.
 func splitSightingSubjects(subs []string) (shas, purls []string) {
 	for _, s := range subs {
 		if isSHA256Hex(s) {
@@ -7374,7 +7370,13 @@ func (db *DB) AddSightingsBackfill(ctx context.Context, s []Sighting) (int, erro
 	return db.addSightings(ctx, s, true)
 }
 
-func (db *DB) addSightings(ctx context.Context, s []Sighting, backfill bool) (int, error) {
+// PrepareSightings applies the ledger's rules to sightings before they are
+// stored, by either store: an exact versioned PURL scopes its claim to that
+// version, subjects are normalized, an unscoped claim on pkg:pypi/litellm is
+// refused, invalid rows are dropped, an unsaid claim is malicious, a source
+// with no operator speaks for its own family, relayer defaults to the
+// writer's name, and a repeated (source, subject, affected) keeps its first.
+func PrepareSightings(s []Sighting, relayer string) ([]Sighting, error) {
 	// Dedupe by the full key within the batch — first occurrence wins.
 	// Producers naturally repeat it (two versions of one package share a
 	// purl_base; normalization can collapse two spellings into one subject),
@@ -7385,7 +7387,7 @@ func (db *DB) addSightings(ctx context.Context, s []Sighting, backfill bool) (in
 	for i := range s {
 		x := s[i]
 		if x.Relayer == "" {
-			x.Relayer = string(db.app)
+			x.Relayer = relayer
 		}
 		// A producer may supply an exact versioned PURL directly. The ledger
 		// keys package identity on its version-less base, so preserve the
@@ -7399,7 +7401,7 @@ func (db *DB) addSightings(ctx context.Context, s []Sighting, backfill bool) (in
 		x.Subject = normalizeSubject(x.Subject)
 		scope := strings.TrimSpace(x.Affected)
 		if x.Subject == "pkg:pypi/litellm" && (scope == "" || scope == AllVersions) {
-			return 0, fmt.Errorf("%w: source=%q relayer=%q", ErrUnscopedLiteLLM, x.Source, x.Relayer)
+			return nil, fmt.Errorf("%w: source=%q relayer=%q", ErrUnscopedLiteLLM, x.Source, x.Relayer)
 		}
 		if !x.valid() {
 			continue
@@ -7426,6 +7428,14 @@ func (db *DB) addSightings(ctx context.Context, s []Sighting, backfill bool) (in
 		}
 		seen[key] = struct{}{}
 		valid = append(valid, x)
+	}
+	return valid, nil
+}
+
+func (db *DB) addSightings(ctx context.Context, s []Sighting, backfill bool) (int, error) {
+	valid, err := PrepareSightings(s, string(db.app))
+	if err != nil {
+		return 0, err
 	}
 	if len(valid) == 0 {
 		return 0, nil

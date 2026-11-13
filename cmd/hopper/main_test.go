@@ -373,7 +373,7 @@ func TestWalkFilesSkipsMarkers(t *testing.T) {
 	mustWriteFile(t, filepath.Join(dir, "._other.exe.BAD"), nil)
 	mustWriteFile(t, filepath.Join(dir, "legit.bin"), []byte("another sample!"))
 
-	// runDirPipeline drops marker files via isMarkerFile; exercise the
+	// runDir drops marker files via isMarkerFile; exercise the
 	// same filter here by walking the lister directly.
 	var got []string
 	err := pathLister(t.Context(), dir, time.Time{}, func(lp labeledPath) bool {

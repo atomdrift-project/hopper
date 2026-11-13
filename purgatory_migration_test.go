@@ -92,7 +92,7 @@ func TestMigratePurgatory(t *testing.T) {
 				t.Fatalf("source still present: %v", err)
 			}
 			var events int
-			if err := db.queryPurgatoryMigration(ctx, `SELECT count(*) FROM label_events WHERE sha256 = $1 AND to_label = 'purgatory' AND reason = 'original-review'`, []any{sha}, func(rows locationRows) error {
+			if err := db.queryPurgatoryMigration(ctx, `SELECT count(*) FROM label_events WHERE sha256 = $1 AND to_label = 'purgatory' AND reason = 'original-review'`, []any{sha}, func(rows sqlRows) error {
 				if rows.Next() {
 					return rows.Scan(&events)
 				}

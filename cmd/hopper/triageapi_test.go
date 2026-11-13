@@ -50,10 +50,10 @@ func newTriageAPI(t *testing.T, ctx context.Context) *apiServer {
 	return &apiServer{db: db, tracker: newWorkerTracker()}
 }
 
-// selectFrom issues one GET /api/triage/{queue} and decodes the envelope.
+// selectFrom issues one GET /v1/triage/{queue} and decodes the envelope.
 func selectFrom(t *testing.T, api *apiServer, queue, query string) (shas []string, code int) {
 	t.Helper()
-	r := httptest.NewRequest(http.MethodGet, "/api/triage/"+queue+query, http.NoBody)
+	r := httptest.NewRequest(http.MethodGet, "/v1/triage/"+queue+query, http.NoBody)
 	r.SetPathValue("queue", queue)
 	rec := httptest.NewRecorder()
 	api.handleTriageSelect(rec, r)
@@ -95,49 +95,6 @@ func TestTriageSelectIsARead(t *testing.T) {
 	}
 }
 
-// TestTriageQueuesListsRegistry proves the endpoint a client validates its own
-// per-queue policy tables against reports the real registry, including which
-// queues can answer /depth.
-func TestTriageQueuesListsRegistry(t *testing.T) {
-	api := &apiServer{}
-	rec := httptest.NewRecorder()
-	api.handleTriageQueues(rec, httptest.NewRequest(http.MethodGet, "/api/triage/queues", http.NoBody))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d", rec.Code)
-	}
-	var body struct {
-		Queues []struct {
-			Name  string `json:"name"`
-			Depth bool   `json:"depth"`
-		} `json:"queues"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("decode: %v (%s)", err, rec.Body.Bytes())
-	}
-	if len(body.Queues) != len(hopper.TriageQueues) {
-		t.Fatalf("listed %d queues, registry has %d", len(body.Queues), len(hopper.TriageQueues))
-	}
-	for i, q := range body.Queues {
-		reg, ok := hopper.TriageQueues[q.Name]
-		if !ok {
-			t.Errorf("listed unknown queue %q", q.Name)
-			continue
-		}
-		if reg.Select == nil {
-			t.Errorf("queue %q: registry entry has no Select", q.Name)
-		}
-		// Every registered queue can answer a depth: it is the selection counted.
-		if !q.Depth {
-			t.Errorf("queue %q: depth = false, want true", q.Name)
-		}
-		// Sorted, because a client's worker start order derives from this list
-		// and Go randomizes map iteration.
-		if i > 0 && body.Queues[i-1].Name >= q.Name {
-			t.Errorf("queues are not sorted: %q before %q", body.Queues[i-1].Name, q.Name)
-		}
-	}
-}
-
 func TestTriageSelectUnknownQueue(t *testing.T) {
 	ctx := context.Background()
 	api := newTriageAPI(t, ctx)
@@ -148,18 +105,20 @@ func TestTriageSelectUnknownQueue(t *testing.T) {
 	}
 
 	// The 404 names the valid set, so an operator typo is self-correcting.
-	r := httptest.NewRequest(http.MethodGet, "/api/triage/nosuchqueue", http.NoBody)
+	r := httptest.NewRequest(http.MethodGet, "/v1/triage/nosuchqueue", http.NoBody)
 	r.SetPathValue("queue", "nosuchqueue")
 	rec := httptest.NewRecorder()
 	api.handleTriageSelect(rec, r)
 	var body struct {
-		Queues []string `json:"queues"`
+		Error struct {
+			Queues []string `json:"queues"`
+		} `json:"error"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode: %v (%s)", err, rec.Body.Bytes())
 	}
-	if len(body.Queues) != len(hopper.TriageQueues) {
-		t.Errorf("404 body listed %d queues, registry has %d", len(body.Queues), len(hopper.TriageQueues))
+	if len(body.Error.Queues) != len(hopper.TriageQueues) {
+		t.Errorf("404 body listed %d queues, registry has %d", len(body.Error.Queues), len(hopper.TriageQueues))
 	}
 }
 
@@ -197,7 +156,7 @@ func TestTriageDepth(t *testing.T) {
 
 	depth := func(queue string) *httptest.ResponseRecorder {
 		t.Helper()
-		r := httptest.NewRequest(http.MethodGet, "/api/triage/"+queue+"/depth", http.NoBody)
+		r := httptest.NewRequest(http.MethodGet, "/v1/triage/"+queue+"/depth", http.NoBody)
 		r.SetPathValue("queue", queue)
 		rec := httptest.NewRecorder()
 		api.handleTriageDepth(rec, r)
@@ -245,18 +204,18 @@ func TestTriageRoutesAreReadOnlySafe(t *testing.T) {
 	mux := http.NewServeMux()
 	api.registerAPI(mux)
 
-	for _, path := range []string{"/api/triage/queues", "/api/triage/new", "/api/triage/new/depth"} {
+	for _, path := range []string{"/api/triage/queues", "/v1/triage/new", "/v1/triage/new/depth"} {
 		r := httptest.NewRequest(http.MethodGet, path, http.NoBody)
 		if _, pattern := mux.Handler(r); pattern == "" {
 			t.Errorf("%s is not routed on a read-only replica", path)
 		}
 	}
 
-	// The ruling endpoint shares the /api/triage prefix and must still refuse.
+	// The ruling endpoint shares the /v1/triage/rulings prefix and must still refuse.
 	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/triage", http.NoBody))
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/triage/rulings", http.NoBody))
 	if rec.Code != http.StatusForbidden {
-		t.Errorf("POST /api/triage on a replica: status = %d, want 403", rec.Code)
+		t.Errorf("POST /v1/triage/rulings on a replica: status = %d, want 403", rec.Code)
 	}
 }
 
@@ -273,7 +232,7 @@ func TestTriageAdmissionBoundsSelectAndDepth(t *testing.T) {
 	for _, depth := range []bool{false, true} {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		r := httptest.NewRequest(http.MethodGet, "/api/triage/popular", http.NoBody).WithContext(ctx)
+		r := httptest.NewRequest(http.MethodGet, "/v1/triage/popular", http.NoBody).WithContext(ctx)
 		r.SetPathValue("queue", "popular")
 		w := httptest.NewRecorder()
 		if depth {
@@ -285,7 +244,7 @@ func TestTriageAdmissionBoundsSelectAndDepth(t *testing.T) {
 			t.Fatal("canceled waiter changed the number of held slots")
 		}
 	}
-	busy := httptest.NewRequest(http.MethodGet, "/api/triage/popular", http.NoBody)
+	busy := httptest.NewRequest(http.MethodGet, "/v1/triage/popular", http.NoBody)
 	busy.SetPathValue("queue", "popular")
 	busyResponse := httptest.NewRecorder()
 	api.handleTriageSelect(busyResponse, busy)

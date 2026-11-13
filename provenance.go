@@ -9,7 +9,7 @@ import (
 
 // SidecarSchemaVersion is the version of the provenance sidecar format. It is
 // the same record forager writes next to every downloaded sample and the same
-// envelope an upload carries to POST /api/upload. Bump only on incompatible
+// envelope an upload carries to POST /v1/intake/upload. Bump only on incompatible
 // changes; readers and the upload validator dispatch on it.
 const SidecarSchemaVersion = "1.0"
 

@@ -5,14 +5,14 @@ package main
 // the cleave verdict written back after a re-scan.
 //
 // They exist so a scan host needs no database credential at all. Everything
-// else it does already went through this API — bytes via /api/file, rulings via
-// /api/triage, corroboration via /api/sightings — and these two were the
+// else it does already went through this API — bytes via /v1/files, rulings via
+// /v1/triage/rulings, corroboration via /v1/sightings — and these two were the
 // remainder, reached over a direct Postgres connection because there was
 // nowhere else to send them.
 //
 // Both are writes, so both live behind the read-only refusal on a replica: a
 // consumer reads its work from a serve-replica instance and sends these to the
-// primary, which is the same split prism has used for /api/rescan.
+// primary, which is the same split prism has used for /v1/work/rescan.
 
 import (
 	"context"
@@ -44,7 +44,7 @@ type reportRequest struct {
 	Content     string `json:"content"`
 }
 
-// handleReport records one reports row. POST /api/report.
+// handleReport records one reports row. POST /v1/triage/reports.
 //
 // This is a queue's DRAIN, which is why the type matters more than it looks: a
 // review or -stale selector anti-joins on a report whose type is the queue's
@@ -54,32 +54,32 @@ type reportRequest struct {
 // warns on one it does not recognize, so a typo shows up in the logs on the
 // first write rather than as an unexplained backlog weeks later.
 func (s *apiServer) handleReport(w http.ResponseWriter, r *http.Request) {
-	if s.db == nil {
-		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
+	if s.db == nil && s.results == nil {
+		writeRetryable(w, retryAfterStarting, "starting", "Starting.")
 		return
 	}
 
 	var req reportRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxTriageWriteBody+1)).Decode(&req); err != nil {
 		slog.WarnContext(r.Context(), "report rejected: invalid json", "remote", r.RemoteAddr, "error", err)
-		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid json"}`)
+		v1Error(w, http.StatusBadRequest, "invalid_json", "Invalid json.")
 		return
 	}
 
 	sha := strings.ToLower(strings.TrimSpace(req.SHA256))
 	if !validSHA256(sha) {
-		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid sha256"}`)
+		v1Error(w, http.StatusBadRequest, "invalid_sha256", "Invalid sha256.")
 		return
 	}
 	reportType := strings.TrimSpace(req.Type)
 	if reportType == "gauntlet" && !validSHA256(req.EvidenceKey) {
-		writeJSONError(w, http.StatusBadRequest, `{"error":"gauntlet evidence_key is required"}`)
+		v1Error(w, http.StatusBadRequest, "missing_evidence_key", "Gauntlet evidence_key is required.")
 		return
 	}
 	if reportType == "" {
 		// An empty type is never a drain: it anti-joins nothing, so the write
 		// would "succeed" and the sample would resurface indefinitely.
-		writeJSONError(w, http.StatusBadRequest, `{"error":"type is required"}`)
+		v1Error(w, http.StatusBadRequest, "type_is_required", "Type is required.")
 		return
 	}
 	if _, known := hopper.TriageQueues[reportType]; !known && reportType != hopper.ReportTypeMissing {
@@ -93,6 +93,10 @@ func (s *apiServer) handleReport(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), apiQueryTimeout)
 	defer cancel()
 
+	if s.results != nil {
+		s.fileReport(ctx, w, r, sha, reportType, &req)
+		return
+	}
 	err := retryDBAccessNoValue(ctx, "insert report", sha, func(ctx context.Context) error {
 		report := &hopper.Report{
 			EvidenceKey: req.EvidenceKey,
@@ -108,7 +112,7 @@ func (s *apiServer) handleReport(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		if errors.Is(err, hopper.ErrGauntletEvidence) {
-			writeJSONError(w, http.StatusNotFound, `{"error":"unknown gauntlet evidence"}`)
+			v1Error(w, http.StatusNotFound, "unknown_gauntlet_evidence", "Unknown gauntlet evidence.")
 			return
 		}
 		// A reports row references its sample, so an integrity violation here
@@ -119,12 +123,12 @@ func (s *apiServer) handleReport(w http.ResponseWriter, r *http.Request) {
 		if classifyInsertFailure(err) == causeConstraint {
 			slog.WarnContext(r.Context(), "report rejected: no such sample",
 				"sha256", sha, "type", reportType, "remote", r.RemoteAddr)
-			writeJSONError(w, http.StatusNotFound, `{"error":"unknown sample"}`)
+			v1Error(w, http.StatusNotFound, "unknown_sample", "Unknown sample.")
 			return
 		}
 		slog.ErrorContext(r.Context(), "report: insert failed",
 			"sha256", sha, "type", reportType, "error", err, "remote", r.RemoteAddr)
-		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
 		return
 	}
 	slog.InfoContext(r.Context(), "report recorded",
@@ -139,7 +143,7 @@ type cleaveResultRequest struct {
 
 // handleCleaveResult stores a re-scanned cleave verdict. POST /api/cleave-result.
 //
-// Deliberately narrow, and NOT a thin alias for /api/result. That endpoint takes
+// Deliberately narrow, and NOT a thin alias for /v1/work/result. That endpoint takes
 // a whole analysis envelope — raw, ml and llm together — because it serves a
 // scan worker submitting everything it produced. A triage consumer has only
 // re-run cleave; it has no ML and no interpretation to send, and routing it
@@ -157,7 +161,7 @@ type cleaveResultRequest struct {
 // a caller is never told its write-back landed when the row is gone.
 func (s *apiServer) handleCleaveResult(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
-		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
+		writeRetryable(w, retryAfterStarting, "starting", "Starting.")
 		return
 	}
 
@@ -165,24 +169,24 @@ func (s *apiServer) handleCleaveResult(w http.ResponseWriter, r *http.Request) {
 	var req cleaveResultRequest
 	if err := json.NewDecoder(body).Decode(&req); err != nil {
 		slog.WarnContext(r.Context(), "cleave result rejected: invalid json", "remote", r.RemoteAddr, "error", err)
-		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid json"}`)
+		v1Error(w, http.StatusBadRequest, "invalid_json", "Invalid json.")
 		return
 	}
 
 	sha := strings.ToLower(strings.TrimSpace(req.SHA256))
 	if !validSHA256(sha) {
-		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid sha256"}`)
+		v1Error(w, http.StatusBadRequest, "invalid_sha256", "Invalid sha256.")
 		return
 	}
 	if len(req.Result) == 0 {
 		// Refused rather than passed through: an empty envelope parses to no
 		// file type, which UpdateCleaveResult treats as a delete. A caller that
 		// forgot to attach its scan must not thereby remove the sample.
-		writeJSONError(w, http.StatusBadRequest, `{"error":"result is required"}`)
+		v1Error(w, http.StatusBadRequest, "result_is_required", "Result is required.")
 		return
 	}
 
-	// resultStoreTimeout and a detached context, matching /api/result: this is
+	// resultStoreTimeout and a detached context, matching /v1/work/result: this is
 	// the same document written to the same column, and a disconnect must not
 	// abort it partway.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), resultStoreTimeout)
@@ -196,7 +200,7 @@ func (s *apiServer) handleCleaveResult(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		slog.ErrorContext(r.Context(), "cleave result: store failed",
 			"sha256", sha, "error", err, "remote", r.RemoteAddr)
-		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
 		return
 	}
 

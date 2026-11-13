@@ -75,7 +75,7 @@ func pruneLockSamples(tx locationSQLTx, observed []pruneLocation) (map[string]pr
 	query := `SELECT sha256,path,parent,skip,label,label_source FROM samples
    WHERE sha256 IN (SELECT sha256 FROM sample_locations WHERE id IN (` + pruneIDList(observed) + `))
    ORDER BY sha256 FOR UPDATE`
-	if err := tx.query(query, nil, func(rows locationRows) error {
+	if err := tx.query(query, nil, func(rows sqlRows) error {
 		for rows.Next() {
 			var s pruneSample
 			if err := rows.Scan(&s.SHA, &s.Path, &s.Parent, &s.Skip, &s.Label, &s.Source); err != nil {
@@ -105,7 +105,7 @@ func (db *DB) deletePruneRows(tx locationSQLTx, rows []pruneLocation) ([]pruneLo
 		paths[i] = l.Path
 	}
 	var deleted []pruneLocation
-	scan := func(result locationRows) error {
+	scan := func(result sqlRows) error {
 		for result.Next() {
 			var id int64
 			if err := result.Scan(&id); err != nil {
@@ -138,7 +138,7 @@ func pruneReplacement(tx locationSQLTx, sha string, c *pruneChecker) (pruneLocat
 	var chosen pruneLocation
 	for _, predicate := range []string{`parent_sha256 = ''`, `parent_sha256 <> '' AND rel IN ` + containmentRelsSQL} {
 		err := tx.query(`SELECT `+pruneLocationColumns+` FROM sample_locations
- WHERE sha256=$1 AND `+predicate, []any{sha}, func(rows locationRows) error {
+ WHERE sha256=$1 AND `+predicate, []any{sha}, func(rows sqlRows) error {
 			for rows.Next() {
 				l, err := scanPruneLocation(rows)
 				if err != nil {
@@ -172,7 +172,7 @@ func (db *DB) repairPrunedPrimary(tx locationSQLTx, s pruneSample, replacement p
 		// denormalized parent pointer while marking the lack of usable bytes.
 		for _, predicate := range []string{` AND parent_sha256<>''`, ``} {
 			query := `SELECT ` + pruneLocationColumns + ` FROM sample_locations WHERE sha256=$1` + predicate + ` LIMIT 1`
-			if err := tx.query(query, []any{s.SHA}, func(rows locationRows) error {
+			if err := tx.query(query, []any{s.SHA}, func(rows sqlRows) error {
 				if rows.Next() {
 					var err error
 					replacement, err = scanPruneLocation(rows)

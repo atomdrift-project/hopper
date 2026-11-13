@@ -174,7 +174,7 @@ func TestLookupRecordIsForgottenWhenTheSampleChanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LookupRecord: %v", err)
 	}
-	if first.Analyzed {
+	if first.State != StatePending {
 		t.Fatal("a sample nothing has looked at reported itself analyzed")
 	}
 
@@ -186,7 +186,7 @@ func TestLookupRecordIsForgottenWhenTheSampleChanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LookupRecord after analysis: %v", err)
 	}
-	if !after.Analyzed {
+	if after.State != StateAnalyzed {
 		t.Fatal("the record still says unanalyzed after a verdict landed")
 	}
 	if after.FiresAt == nil || *after.FiresAt != 3 {

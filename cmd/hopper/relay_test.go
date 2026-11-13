@@ -61,16 +61,16 @@ func newReplicaMux(t *testing.T, relayBase, relayTokenFile string) *http.ServeMu
 func TestReplicaWithoutRelayRefusesAllMutations(t *testing.T) {
 	mux := newReplicaMux(t, "", "")
 	for _, ep := range []struct{ method, path string }{
-		{http.MethodGet, "/api/next"},
-		{http.MethodGet, "/api/heartbeat"},
-		{http.MethodPost, "/api/result"},
-		{http.MethodPost, "/api/upload"},
-		{http.MethodPost, "/api/known"},
-		{http.MethodPost, "/api/sightings"},
-		{http.MethodPost, "/api/popular"},
-		{http.MethodPost, "/api/triage"},
-		{http.MethodPost, "/api/rescan/" + strings.Repeat("a", 64)},
-		{http.MethodPost, "/api/report"},
+		{http.MethodPost, "/v1/work/next"},
+		{http.MethodPost, "/v1/work/heartbeat"},
+		{http.MethodPost, "/v1/work/result"},
+		{http.MethodPost, "/v1/intake/upload"},
+		{http.MethodPost, "/v1/intake/held"},
+		{http.MethodPost, "/v1/sightings"},
+		{http.MethodPost, "/v1/intake/popular"},
+		{http.MethodPost, "/v1/triage/rulings"},
+		{http.MethodPost, "/v1/work/rescan/" + strings.Repeat("a", 64)},
+		{http.MethodPost, "/v1/triage/reports"},
 		{http.MethodPost, "/api/cleave-result"},
 	} {
 		w := httptest.NewRecorder()
@@ -86,7 +86,7 @@ func TestReplicaWithoutRelayRefusesAllMutations(t *testing.T) {
 // the rest — the point of which is that a scan host can address ONE URL for
 // its selections and its judgements both.
 func TestRelayProxiesTriageWrites(t *testing.T) {
-	for _, path := range []string{"/api/report", "/api/cleave-result"} {
+	for _, path := range []string{"/v1/triage/reports", "/api/cleave-result"} {
 		primary, rec := newRelayPrimary(t, http.StatusOK, `{"status":"recorded"}`)
 		mux := newReplicaMux(t, primary.URL, "")
 
@@ -109,7 +109,7 @@ func TestRelayProxiesClientWritesVerbatim(t *testing.T) {
 	primary, rec := newRelayPrimary(t, http.StatusCreated, `{"stored":true}`)
 	mux := newReplicaMux(t, primary.URL, "")
 
-	req := httptest.NewRequest(http.MethodPost, "/api/upload?feed=osv", strings.NewReader("payload-bytes"))
+	req := httptest.NewRequest(http.MethodPost, "/v1/intake/upload?feed=osv", strings.NewReader("payload-bytes"))
 	req.Header.Set("Authorization", "Bearer client-token")
 	req.Header.Set(laneHeader, "renew")
 	req.RemoteAddr = "10.9.8.60:41234"
@@ -122,8 +122,8 @@ func TestRelayProxiesClientWritesVerbatim(t *testing.T) {
 	if w.Body.String() != `{"stored":true}` {
 		t.Errorf("relayed body = %q, want primary's body verbatim", w.Body.String())
 	}
-	if rec.method != http.MethodPost || rec.path != "/api/upload" || rec.query != "feed=osv" {
-		t.Errorf("primary saw %s %s?%s, want POST /api/upload?feed=osv", rec.method, rec.path, rec.query)
+	if rec.method != http.MethodPost || rec.path != "/v1/intake/upload" || rec.query != "feed=osv" {
+		t.Errorf("primary saw %s %s?%s, want POST /v1/intake/upload?feed=osv", rec.method, rec.path, rec.query)
 	}
 	if rec.body != "payload-bytes" {
 		t.Errorf("primary saw body %q, want payload-bytes", rec.body)
@@ -147,7 +147,7 @@ func TestRelayPropagatesPrimaryShedVerbatim(t *testing.T) {
 	mux := newReplicaMux(t, primary.URL, "")
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/triage", strings.NewReader("{}")))
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/triage/rulings", strings.NewReader("{}")))
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("shed status = %d, want the primary's 503 verbatim", w.Code)
 	}
@@ -158,7 +158,7 @@ func TestRelayPropagatesPrimaryShedVerbatim(t *testing.T) {
 
 // TestRelayNeverServesWorkerRoutes: rule 2 — the worker loop is refused even
 // with a healthy relay configured, so result envelopes cannot double-hop
-// through the replica. The one carve-out is the renew lane on /api/result:
+// through the replica. The one carve-out is the renew lane on /v1/work/result:
 // single-artifact renewals relay so a serve host can use the replica URL for
 // everything, while an undeclared (worker-lane) result stays refused.
 func TestRelayNeverServesWorkerRoutes(t *testing.T) {
@@ -166,9 +166,9 @@ func TestRelayNeverServesWorkerRoutes(t *testing.T) {
 	mux := newReplicaMux(t, primary.URL, "")
 
 	for _, ep := range []struct{ method, path string }{
-		{http.MethodGet, "/api/next"},
-		{http.MethodGet, "/api/heartbeat"},
-		{http.MethodPost, "/api/result"},
+		{http.MethodPost, "/v1/work/next"},
+		{http.MethodPost, "/v1/work/heartbeat"},
+		{http.MethodPost, "/v1/work/result"},
 	} {
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, httptest.NewRequest(ep.method, ep.path, http.NoBody))
@@ -181,15 +181,15 @@ func TestRelayNeverServesWorkerRoutes(t *testing.T) {
 	}
 
 	// The renew lane relays.
-	req := httptest.NewRequest(http.MethodPost, "/api/result", strings.NewReader("{}"))
+	req := httptest.NewRequest(http.MethodPost, "/v1/work/result", strings.NewReader("{}"))
 	req.Header.Set(laneHeader, "renew")
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Errorf("renew-lane result via relay = %d, want the primary's 200", w.Code)
 	}
-	if rec.path != "/api/result" || rec.lane != "renew" {
-		t.Errorf("primary saw (%s, lane=%s), want /api/result with the renew lane intact", rec.path, rec.lane)
+	if rec.path != "/v1/work/result" || rec.lane != "renew" {
+		t.Errorf("primary saw (%s, lane=%s), want /v1/work/result with the renew lane intact", rec.path, rec.lane)
 	}
 
 	// Without a relay, the renew lane is refused like everything else.
@@ -211,11 +211,11 @@ func TestRelayUnreachablePrimaryIs502(t *testing.T) {
 
 	mux := newReplicaMux(t, deadURL, "")
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/known", strings.NewReader("{}")))
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/intake/held", strings.NewReader("{}")))
 	if w.Code != http.StatusBadGateway {
 		t.Fatalf("unreachable primary = %d, want 502", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), "primary hopper unreachable") {
+	if !strings.Contains(w.Body.String(), `"code":"primary_unreachable"`) {
 		t.Errorf("502 body = %q, want the relay's own error", w.Body.String())
 	}
 }
@@ -230,7 +230,7 @@ func TestRelayTokenFileReplacesAuthorization(t *testing.T) {
 	}
 	mux := newReplicaMux(t, primary.URL, tokPath)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/sightings", strings.NewReader("{}"))
+	req := httptest.NewRequest(http.MethodPost, "/v1/sightings", strings.NewReader("{}"))
 	req.Header.Set("Authorization", "Bearer replica-local-token")
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)

@@ -1,0 +1,6 @@
+"purl_base","version","parent_catalog_id","id","sha256","path","parent_sha256","rel","filename","source","feed","ecosystem","mtime","first_seen_at","last_seen_at"
+"","","0","1","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","pool/host.exe","","","host.exe","","","",,"2026-01-01T00:00:00Z","2026-01-01T00:00:00Z"
+"","","0","2","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","pool/host.exe!!embedded:pe@0x12000","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","","embedded:pe@0x12000","","","",,"2026-01-01T00:00:00Z","2026-01-01T00:00:00Z"
+"","","0","3","cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","pool/host.exe!!embedded:pe@0x12000!!inner.bin","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","","inner.bin","","","",,"2026-01-01T00:00:00Z","2026-01-01T00:00:00Z"
+"","","0","4","dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","pool/host.exe##base64+gzip@1234","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","","","","","",,"2026-01-01T00:00:00Z","2026-01-01T00:00:00Z"
+"","","0","5","eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","missing.zip!!member.js","","","member.js","","","",,"2026-01-01T00:00:00Z","2026-01-01T00:00:00Z"

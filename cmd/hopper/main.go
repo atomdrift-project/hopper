@@ -35,6 +35,7 @@ import (
 
 	"github.com/atomdrift-project/hopper"
 	"github.com/atomdrift-project/hopper/pkgparse"
+	"github.com/atomdrift-project/hopper/store"
 	"github.com/atomdrift-project/obs"
 	"golang.org/x/sync/errgroup"
 )
@@ -336,7 +337,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "log: %s\n", logPath) //nolint:forbidigo // startup info before slog is configured
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	// SIGTERM is how systemd, rc scripts and a deploy stop hopper; it shuts
+	// down as an interrupt does, so deferred cleanup runs and the local
+	// worker, in a process group of its own, is stopped rather than orphaned.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 
 	// Init OTel. DisableSlog so we keep the stderr+file fan-out built by
 	// setupLogging and just add the OTLP sink as one more handler.
@@ -357,7 +361,7 @@ func main() {
 	// Force-exit on a second interrupt so cleanup can't hang forever.
 	go func() {
 		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, os.Interrupt)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 		<-sigCh // first is handled by NotifyContext
 		<-sigCh // second means "exit now"
 		slog.Warn("forced exit on second interrupt")
@@ -475,6 +479,8 @@ func run(ctx context.Context) error {
 		return cmdPostTriage(ctx)
 	case "mv":
 		return cmdMv(ctx)
+	case "migrate":
+		return cmdMigrate(ctx)
 	case "migrate-purgatory":
 		return cmdMigratePurgatory(ctx)
 	case "demote-sighted":
@@ -686,7 +692,7 @@ func cliAppName() hopper.AppName {
 }
 
 // cmdServeReplica runs the read-only lookup API against a local replica
-// database — GET /api/sample, /api/sample/{sha}, /api/provenance and friends,
+// database (/v1/lookup, /v1/files/{sha256}/provenance and the other reads),
 // with every mutating route answering 403. It exists so read traffic
 // (beamline's purl lookups above all) rides the replica's idle disk instead of
 // competing with ingestion on the publisher: measured 2026-08-22, the
@@ -710,7 +716,7 @@ func cmdServeReplica(ctx context.Context) error {
 	tokenFile := f.String("token-file", "",
 		"file holding the bearer token the API requires; empty serves unauthenticated (loopback binds only)")
 	dataDir := f.String("data", "",
-		"optional corpus root for /api/file and /data/; empty disables byte serving")
+		"optional corpus root for /v1/files and /data/; empty disables byte serving")
 	relayTo := f.String("relay-writes-to", "",
 		"primary hopper base URL (e.g. http://hopper-api:8081); when set, client-facing mutations are "+
 			"proxied there verbatim instead of answering 403, and lookups honor ?fresh=1 — see relay.go. "+
@@ -1112,6 +1118,9 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// it at the top of the ladder, on a deadline set by the registry.
 	rescanAge := f.Duration("rescan-age", 90*24*time.Hour, "minimum age since last analysis before a sample is eligible for rescan")
 	noCache := f.Bool("no-cache", false, "disable hash cache (re-read every file)")
+	noCleaveValidate := f.Bool("no-cleave-validate", false,
+		"start the local postdoc worker without first running `cleave validate` over the whole rule set, which takes "+
+			"minutes; for tests and development, never production")
 	maxAnalyzed := f.Int("max-analyzed", 0, "stop after N successful analyses (0 = unlimited)")
 	experimentTag := f.String("experiment-tag", "", "label for experiment comparison")
 	// Off by default: --verbose makes the worker log a DEBUG line per analyzed
@@ -1127,7 +1136,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// read-only and useless bound to loopback on a headless master, so it
 	// binds every interface and relies on the network around it. Pass
 	// --dashboard-addr 127.0.0.1:8082 (or --local) to put it back on loopback.
-	// Loopback by default: this listener serves /api/upload, /api/file and
+	// Loopback by default: this listener serves /v1/intake/upload, /v1/files and
 	// /data, and is unauthenticated unless --token-file is passed, so an
 	// ad-hoc `hopper load` must not put it on every interface by accident. A
 	// master serving remote workers sets the address explicitly — the deploy
@@ -1141,6 +1150,8 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	localOnly := f.Bool("local", false, "listen only on loopback for dashboard and worker API")
 	maxFileMB := f.Int64("max-file-size", defaultMaxFileSize/(1024*1024), "skip files larger than this many MiB")
 	reportsDir := f.String("reports-dir", "", "cyclotron reports directory to ingest (<sha>.md, optional)")
+	storeSchema := f.String("store", "",
+		"schema holding the verdict tables (created when empty); when set, the walk, results, claims and triage use them")
 	var forceRescanDirs stringListFlag
 	f.Var(&forceRescanDirs, "force-rescan", "directory prefix to force re-analysis for; may be repeated or comma-separated")
 	// Maintenance lever, born 2026-08-21: the startup walk's staging upserts and
@@ -1443,7 +1454,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		litmus.workerName = "local"
 		litmus.setHealth(false, "starting", "")
 		defer litmus.Stop()
-		go superviseLocalWorker(ctx, litmus, *cleaveBinFlag)
+		go superviseLocalWorker(ctx, litmus, *cleaveBinFlag, !*noCleaveValidate)
 	}
 
 	// Run independent startup work in parallel: hash cache load, DB
@@ -1549,7 +1560,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	}()
 
 	// Remote litmus workers now self-register via the pull API.
-	// No dialing needed — they poll /api/next when ready.
+	// No dialing needed — they poll /v1/work/next when ready.
 
 	// Collect results. Order doesn't matter — each blocks until ready.
 	slog.Info("waiting for hash cache")
@@ -1625,6 +1636,15 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	}
 	// dataDir was already resolved (symlinks + absolute) at startup.
 	api.db = db
+	if *storeSchema != "" {
+		st, pool, err := openStore(ctx, *dsn, *storeSchema)
+		if err != nil {
+			return err
+		}
+		defer pool.Close()
+		api.results = st
+		slog.Info("verdict store open", "schema", *storeSchema)
+	}
 	api.dataRoot = *dataDir
 	api.requiredMounts = append([]string(nil), requiredReconcileMounts...)
 	api.datasetIncomplete = *datasetIncomplete
@@ -1689,7 +1709,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	}
 
 	// Archive members are now persisted atomically with the parent in
-	// StoreResult (the /api/result handler), so there's no background expansion
+	// StoreResult (the /v1/work/result handler), so there's no background expansion
 	// pool to start or drain.
 
 	// Reap orphaned upload temp files left by a previous crash. No-op when
@@ -1702,7 +1722,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// tunnel on loopback, putting the internet on the other side of it. So
 	// warn whenever there is no token, wherever it is bound.
 	if *apiAddr != "" && apiToken == nil {
-		slog.Warn("no --token-file: /api/*, /api/upload, /api/file, and /data are unauthenticated",
+		slog.Warn("no --token-file: /api/*, /v1/intake/upload, /v1/files, and /data are unauthenticated",
 			"addr", *apiAddr,
 			"recommendation", "pass --token-file, or run with --local on a host you trust")
 	}
@@ -2078,7 +2098,10 @@ var (
 // the state every pass shares. Extracted from loadAll so the pass logic — which
 // runs once at startup and then on two tickers — reads on its own.
 type walkPass struct {
-	db            *hopper.DB
+	db *hopper.DB
+	// results, when set, is where the walk records what it finds, instead
+	// of the legacy samples table.
+	results       *store.Store
 	cache         *hashCache
 	progress      *loadProgress
 	start         time.Time
@@ -2104,7 +2127,11 @@ func (p *walkPass) run(ctx context.Context, chs []enumerationStream, cutoff time
 	// cause of unbounded walk_staging growth).
 	stageOK := false
 	if reconcile {
-		if err := p.db.StartWalkStaging(ctx); err != nil {
+		start := p.db.StartWalkStaging
+		if p.results != nil {
+			start = p.results.StartWalk
+		}
+		if err := start(ctx); err != nil {
 			slog.Error("walk staging clear failed; skipping reconcile this pass", "error", err)
 		} else {
 			stageOK = true
@@ -2141,7 +2168,7 @@ func (p *walkPass) run(ctx context.Context, chs []enumerationStream, cutoff time
 			case <-ctx.Done():
 				return
 			}
-			pipeErrs <- runDirPipeline(ctx, p.db, d, p.source, p.cache, p.progress, stream.paths, stageOK)
+			pipeErrs <- p.runDir(ctx, d, stream.paths, stageOK)
 		})
 	}
 	pipeWG.Wait()
@@ -2165,10 +2192,20 @@ func (p *walkPass) run(ctx context.Context, chs []enumerationStream, cutoff time
 	// Reconcile the derived label/skip cache against the pools, but only
 	// after a complete staged walk — a cancelled (partial) walk would make
 	// present files look missing.
-	if stageOK && walkComplete && ctx.Err() == nil {
+	switch {
+	case stageOK && walkComplete && ctx.Err() == nil && p.results != nil:
+		started := time.Now()
+		for _, stream := range chs {
+			if stream.started.Before(started) {
+				started = stream.started
+			}
+		}
+		reconcileStore(ctx, p.results, started, p.dirs, p.markMissing)
+	case stageOK && walkComplete && ctx.Err() == nil:
 		reconcilePools(ctx, p.db, p.dirs, p.markMissing)
-	} else if stageOK && ctx.Err() == nil {
+	case stageOK && ctx.Err() == nil:
 		slog.Warn("skipping authoritative reconcile after incomplete walk")
+	default:
 	}
 
 	logLoadSummary(p.start, p.experimentTag, p.dirs, p.progress)
@@ -2209,7 +2246,7 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	var progress loadProgress
 	progress.analyzeDurationMin.Store(math.MaxInt64)
 
-	// Wire the API server's progress pointer so /api/result can update counters.
+	// Wire the API server's progress pointer so /v1/work/result can update counters.
 	if api != nil {
 		api.progress = &progress
 	}
@@ -2275,9 +2312,19 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	dashWG.Go(func() {
 		runQueueMaintenance(backgroundCtx, db, &progress, metrics, rescanAge)
 	})
+	if api != nil && api.results != nil {
+		dashWG.Go(func() {
+			sweepStale(backgroundCtx, api.results, rescanAge)
+		})
+	}
 
+	// The walk records into the verdict schema when the API does.
+	var results *store.Store
+	if api != nil {
+		results = api.results
+	}
 	pass := &walkPass{
-		db: db, cache: cache, progress: &progress, dirs: dirs, source: source,
+		db: db, results: results, cache: cache, progress: &progress, dirs: dirs, source: source,
 		experimentTag: experimentTag, start: start, nworkers: nworkers, markMissing: markMissing,
 	}
 
@@ -2407,14 +2454,56 @@ func reconcilePools(ctx context.Context, db *hopper.DB, dirs []struct{ dir, labe
 	}
 }
 
+// reconcileStore is reconcilePools on the verdict schema: the paths the walk
+// saw are learned, labels follow pools, and paths the walk did not see and
+// that are gone from disk are retired, within the same breakers. started is
+// when the walk began listing: what the catalog recorded since is newer.
+func reconcileStore(ctx context.Context, st *store.Store, started time.Time, dirs []struct{ dir, label string }, markMissing bool) {
+	dataRoot := filepath.Dir(dirs[0].dir)
+	if err := validateRequiredMounts(dataRoot, requiredReconcileMounts); err != nil {
+		slog.Error("reconcile skipped: sample storage is not authoritative", "error", err)
+		return
+	}
+	onDisk := func(path string) bool {
+		_, err := os.Stat(sampleDiskPath(dataRoot, filepath.FromSlash(path)))
+		return err == nil
+	}
+	got, err := st.Reconcile(ctx, started, onDisk, markMissing)
+	if err != nil {
+		slog.Error("reconcile pools failed", "error", err)
+		return
+	}
+	if got != (store.Reconciled{}) {
+		slog.Info("reconciled pools", "learned", got.Learned, "relabeled", got.Relabeled,
+			"retired", got.Retired, "unlisted", got.Unlisted)
+	}
+}
+
 // walkStager batches every standalone file seen this walk into walk_staging,
 // which ReconcilePools anti-joins against samples to find moved/missing files.
 // Appending to an unlogged staging table is far cheaper than the per-file
 // last_seen_at UPDATE it replaces (millions of indexed writes per walk).
 type walkStager struct {
 	err   error
-	db    *hopper.DB
+	stage func(context.Context, []hopper.SampleLocationKey) error
 	batch []hopper.SampleLocationKey
+}
+
+// stagerFor stages into the verdict schema when a results store is set, else
+// into the legacy tables.
+func stagerFor(db *hopper.DB, results *store.Store) *walkStager {
+	if results == nil {
+		return &walkStager{stage: db.StageLocations}
+	}
+	return &walkStager{stage: func(ctx context.Context, keys []hopper.SampleLocationKey) error {
+		shas, paths := make([][]byte, 0, len(keys)), make([]string, 0, len(keys))
+		for _, k := range keys {
+			if sum, err := hex.DecodeString(k.SHA256); err == nil {
+				shas, paths = append(shas, sum), append(paths, k.Path)
+			}
+		}
+		return results.StageWalk(ctx, shas, paths)
+	}}
 }
 
 func (s *walkStager) add(ctx context.Context, sha, path string) {
@@ -2428,7 +2517,7 @@ func (s *walkStager) flush(ctx context.Context) {
 	if len(s.batch) == 0 || s.err != nil {
 		return
 	}
-	if err := s.db.StageLocations(ctx, s.batch); err != nil {
+	if err := s.stage(ctx, s.batch); err != nil {
 		s.err = fmt.Errorf("stage %d locations: %w", len(s.batch), err)
 		if ctx.Err() == nil {
 			slog.Warn("stage locations failed", "error", err, "batch_size", len(s.batch))
@@ -2437,20 +2526,12 @@ func (s *walkStager) flush(ctx context.Context) {
 	s.batch = s.batch[:0]
 }
 
-// runDirPipeline is the hash→batch→insert pipeline for one labeled directory,
+// runDir is the hash→batch→insert pipeline for one labeled directory,
 // fed by a pre-started enumeration channel. Everything runs sequentially in
 // this one goroutine so batches stay coherent without cross-goroutine plumbing;
 // parallelism comes from running one instance per directory.
-func runDirPipeline(
-	ctx context.Context,
-	db *hopper.DB,
-	target struct{ dir, label string },
-	source string,
-	cache *hashCache,
-	progress *loadProgress,
-	fileCh <-chan labeledPath,
-	stage bool,
-) error {
+func (p *walkPass) runDir(ctx context.Context, target struct{ dir, label string }, fileCh <-chan labeledPath, stage bool) error {
+	db, results, source, cache, progress := p.db, p.results, p.source, p.cache, p.progress
 	batch := make([]*hopper.Sample, 0, loadBatchSize)
 	batchKeys := make([]cacheKey, 0, loadBatchSize)
 	pathBySha := make(map[string]string, loadBatchSize)
@@ -2462,14 +2543,27 @@ func runDirPipeline(
 	// incremental walk must not record a partial present-set.
 	var stager *walkStager
 	if stage {
-		stager = &walkStager{db: db}
+		stager = stagerFor(db, results)
 	}
 
 	flush := func() {
 		if len(batch) == 0 {
 			return
 		}
-		n, _, err := db.InsertSampleBatch(ctx, batch)
+		var (
+			n, queued int64
+			err       error
+		)
+		if results != nil {
+			var got store.Ingested
+			got, err = ingest(ctx, results, batch, store.QueueNew)
+			n, queued = got.New, got.Queued
+		} else {
+			// Only newly inserted rows; needsAnalysis also includes pre-existing
+			// unanalyzed samples, which would double-count on each periodic re-walk.
+			n, _, err = db.InsertSampleBatch(ctx, batch)
+			queued = n
+		}
 		if err != nil {
 			pipelineErr = errors.Join(pipelineErr, fmt.Errorf("insert batch in %s: %w", target.dir, err))
 			if ctx.Err() == nil {
@@ -2483,9 +2577,7 @@ func runDirPipeline(
 		}
 		progress.inserted.Add(n)
 		progress.skipped.Add(int64(len(batch)) - n)
-		// Only newly inserted rows; needsAnalysis also includes pre-existing
-		// unanalyzed samples, which would double-count on each periodic re-walk.
-		progress.queued.Add(n)
+		progress.queued.Add(queued)
 
 		// Mark entries as inserted in the hash cache so future startups
 		// can skip the DB round-trip entirely.
@@ -3329,13 +3421,15 @@ func isStagingPath(path string) bool {
 // callers must also receive a nil error from done before using the walk to infer
 // absence.
 type enumerationStream struct {
-	paths <-chan labeledPath
-	done  <-chan error
+	started time.Time // when the listing began: what it lists is as of then or later
+	paths   <-chan labeledPath
+	done    <-chan error
 }
 
 // startEnumeration streams files under dir. A non-zero newerThan makes the
 // enumeration incremental: only files modified at or after it are emitted.
 func startEnumeration(ctx context.Context, dir string, newerThan time.Time) enumerationStream {
+	started := time.Now()
 	ch := make(chan labeledPath, 4096)
 	done := make(chan error, 1)
 	go func() {
@@ -3367,7 +3461,7 @@ func startEnumeration(ctx context.Context, dir string, newerThan time.Time) enum
 		done <- err
 		close(done)
 	}()
-	return enumerationStream{paths: ch, done: done}
+	return enumerationStream{started: started, paths: ch, done: done}
 }
 
 // cleaveBinary is the path (or name, for $PATH lookup) of the cleave binary
@@ -3723,7 +3817,7 @@ func inferWheelIdentity(s *hopper.Sample, filename string) {
 // when forager isn't direct-inserting (and after a from-scratch DR walk).
 //
 // Called while s.Path is still the absolute on-disk path (hashFile sets it
-// before runDirPipeline rewrites it to the stored relative path), so the
+// before runDir rewrites it to the stored relative path), so the
 // sidecar sibling resolves correctly.
 func enrichFromVendorSidecar(s *hopper.Sample) {
 	if s.SHA256 == "" || s.Path == "" {
@@ -3865,7 +3959,7 @@ func datasetPathProvenance(parts []string) pathProvenance {
 }
 
 // promotionTrees are the destinations a ruled or reviewed sample is moved into,
-// by promoter's own passes or by /api/triage. Each preserves the subpath the
+// by promoter's own passes or by /v1/triage/rulings. Each preserves the subpath the
 // sample had in its discovery tree (see rulingPlan), so its provenance is still
 // written in the path — just one level deeper than where it started.
 var promotionTrees = []string{
@@ -5277,7 +5371,7 @@ func cmdTriage(ctx context.Context) error {
 			}
 			dest := filepath.Join(destDir, name)
 
-			apiURL := strings.TrimRight(*baseURL, "/") + "/api/file/" + s.SHA256
+			apiURL := strings.TrimRight(*baseURL, "/") + "/v1/files/" + s.SHA256
 			detail, ok := fetchSample(ctx, client, apiURL, dest)
 			if !ok {
 				writeStdoutf("  err %-64s  %s\n", s.SHA256, detail)
@@ -5329,7 +5423,7 @@ func fetchSample(ctx context.Context, client *http.Client, fileURL, dest string)
 			cancel()
 			return "bad request: " + err.Error(), false
 		}
-		// /api/file requires a bearer token on a master deployed with
+		// /v1/files requires a bearer token on a master deployed with
 		// --token-file, loopback callers included.
 		authorizeRequest(req)
 		resp, err := client.Do(req)

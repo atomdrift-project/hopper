@@ -628,6 +628,26 @@ func (db *DB) corroborate(ctx context.Context, r *LookupRecord, flagged bool, ve
 		// the two that mean something.
 	}
 
+	measured := r.FiresAt
+	if !corroborateWith(r, a) {
+		return r, 0
+	}
+	if measured != nil && *measured != *r.FiresAt {
+		db.corroborationCounts.tightened.Add(1)
+	}
+	return r, ledgerTTL
+}
+
+// Corroborate folds what the ledger's rows say about an artifact into its
+// record, built from our own analysis of the release version, and reports
+// whether they added anything. The rule is the one lookup has always
+// applied: the ledger's confidence, one rung higher when our own analysis
+// fired, sets a floor (Floor) that tightens the measured level.
+func Corroborate(r *LookupRecord, rows []Sighting, version string) bool {
+	return corroborateWith(r, AssessRelease(rows, version))
+}
+
+func corroborateWith(r *LookupRecord, a Assessment) bool {
 	confidence := a.Confidence
 	// Our own analysis, when it fired, is a second and independent voice.
 	// fired() is deliberately the same band scan calls suspicious-or-worse: a
@@ -637,37 +657,57 @@ func (db *DB) corroborate(ctx context.Context, r *LookupRecord, flagged bool, ve
 	}
 	floor, ok := Floor(confidence)
 	if !ok {
-		return r, 0
+		return false
 	}
-	if lvl := tighten(r.FiresAt, floor); r.FiresAt == nil || lvl != *r.FiresAt {
-		if r.FiresAt != nil {
-			db.corroborationCounts.tightened.Add(1)
-		}
-		r.FiresAt = &lvl
-	}
+	lvl := tighten(r.FiresAt, floor)
+	r.FiresAt = &lvl
 	r.Findings = append(r.Findings, feedFinding(a))
-	return r, ledgerTTL
+	return true
 }
 
-// fromLedger builds a record for an artifact nothing has analyzed, out of what
-// outside sources say about it. ErrNotFound when they say nothing.
+// Convicts reports whether the ledger's rows alone grade the release version
+// hostile at the default budget (CriticalLevel), and at what level: the rungs
+// that reach hostile, not the ones that reach only suspicious. It is what
+// lets a cited dependency or member raise the file that points at or holds it.
+func Convicts(rows []Sighting, version string) (int, bool) {
+	lvl, ok := Floor(AssessRelease(rows, version).Confidence)
+	return lvl, ok && lvl <= CriticalLevel
+}
+
+// fromLedger is FromLedger over the legacy ledger. ErrNotFound when the
+// sources say nothing.
+func (db *DB) fromLedger(ctx context.Context, sha256, purl, version string) (*LookupRecord, time.Duration, error) {
+	r := fromAssessment(db.assess(ctx, version, sha256, purl), sha256, purl, version)
+	if r == nil {
+		return nil, 0, ErrNotFound
+	}
+	db.corroborationCounts.derived.Add(1)
+	return r, ledgerTTL, nil
+}
+
+// FromLedger builds the record of an artifact nothing has analyzed out of
+// what the ledger's rows say about it, or nil when they say nothing that
+// reaches a level.
 //
 // EngineVersion and AnalyzedAt stay nil, and that is the contract: an engine is
 // what separates a measurement from a citation, so its absence is how every
 // consumer — scan's is_verdict, beamline's cache rules, a caller's own code —
 // tells the two apart.
-func (db *DB) fromLedger(ctx context.Context, sha256, purl, version string) (*LookupRecord, time.Duration, error) {
-	a := db.assess(ctx, version, sha256, purl)
+func FromLedger(rows []Sighting, sha256, purl, version string) *LookupRecord {
+	return fromAssessment(AssessRelease(rows, version), sha256, purl, version)
+}
+
+func fromAssessment(a Assessment, sha256, purl, version string) *LookupRecord {
 	floor, ok := Floor(a.Confidence)
 	if !ok {
-		return nil, 0, ErrNotFound
+		return nil
 	}
 	r := &LookupRecord{
 		Findings: []LookupFinding{feedFinding(a)},
 		FiresAt:  &floor,
-		// Answerable now. Analyzed selects the 202 that means "an answer is
-		// coming for this key", and none is: nothing holds these bytes.
-		Analyzed: true,
+		// Answerable now, from the feeds: nothing holds these bytes, so no
+		// analysis is coming that pending would promise.
+		State: StateAnalyzed,
 	}
 	if sha256 != "" {
 		d := sha256
@@ -690,6 +730,5 @@ func (db *DB) fromLedger(ctx context.Context, sha256, purl, version string) (*Lo
 	}
 	reason := feedReason(a)
 	r.Reason = &reason
-	db.corroborationCounts.derived.Add(1)
-	return r, ledgerTTL, nil
+	return r
 }

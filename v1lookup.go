@@ -3,6 +3,7 @@ package hopper
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/atomdrift-project/hopper/pkgparse"
+	"github.com/atomdrift-project/hopper/store"
 	"github.com/codeGROOVE-dev/fido"
 	"github.com/jackc/pgx/v5"
 )
@@ -98,10 +100,43 @@ type LookupRecord struct {
 	AnalyzedAt    *string         `json:"analyzed_at"`
 	Reason        *string         `json:"reason"`
 	Findings      []LookupFinding `json:"findings"`
-	// Analyzed is false when the corpus holds the bytes but nothing has looked
-	// at them. Not serialized: it selects the 202 the handler answers with.
-	Analyzed bool `json:"-"`
+	// State is StateAnalyzed, or StatePending when the corpus holds the bytes
+	// but nothing has looked at them yet: an answer is coming for this key.
+	State string `json:"state"`
+	// RaisedBy lists what made the level tighter than the artifact's own: a
+	// release or URL it points at, or a file it holds, that atomscan holds
+	// hostile or the ledger convicts. Absent when nothing did.
+	RaisedBy []LookupRaiser `json:"raised_by,omitempty"`
+	// RaisedTruncated reports that a bound stopped the search for raisers:
+	// more existed than were examined or listed.
+	RaisedTruncated bool `json:"raised_truncated,omitempty"`
 }
+
+// LookupRaiser is one thing that raised a record.
+type LookupRaiser struct {
+	SHA256  *string `json:"sha256,omitempty"`
+	FiresAt *int    `json:"fires_at"`
+	// Kind is dependency, command or url_fetch for a reference, member for a
+	// file the artifact holds.
+	Kind    string `json:"kind"`
+	Name    string `json:"name,omitempty"`
+	Version string `json:"version,omitempty"`
+	// Why is RaisedDetected when atomscan holds it hostile, RaisedCorroborated
+	// when the ledger convicts it.
+	Why string `json:"why"`
+}
+
+// Why a raiser raised.
+const (
+	RaisedDetected     = "detected"
+	RaisedCorroborated = "corroborated"
+)
+
+// The states of a [LookupRecord].
+const (
+	StateAnalyzed = "analyzed"
+	StatePending  = "pending"
+)
 
 // LookupFinding is one of the artifact's strongest traits. crit is 4
 // suspicious, 5 hostile; id is stable and descriptive enough to show someone.
@@ -522,6 +557,52 @@ func (db *DB) recordSample(ctx context.Context, query string, args ...any) (*Sam
 	return s, nil
 }
 
+// RecordOfStore projects a verdict-store record onto the wire, as recordOf
+// does a legacy sample.
+func RecordOfStore(r *store.Record) *LookupRecord {
+	sha := hex.EncodeToString(r.SHA256)
+	out := &LookupRecord{SHA256: &sha, FiresAt: r.FiresAt, Findings: []LookupFinding{}, State: StatePending}
+	if r.Analyzed {
+		out.State = StateAnalyzed
+	}
+	for _, f := range r.Findings {
+		out.Findings = append(out.Findings, LookupFinding{ID: f.ID, Crit: f.Crit})
+	}
+	if strings.HasPrefix(r.Name, "pkg:") {
+		// The version goes before any qualifier, as a PURL spells it.
+		purl := r.Name
+		if r.Version != "" {
+			purl = withVersion(r.Name, r.Version)
+		}
+		out.PURL = &purl
+	}
+	for dst, v := range map[**string]string{&out.EngineVersion: r.Engine, &out.TraitsVersion: r.Ruleset, &out.Reason: r.Reason} {
+		if v != "" {
+			*dst = &v
+		}
+	}
+	if !r.ScannedAt.IsZero() {
+		at := r.ScannedAt.UTC().Format(time.RFC3339)
+		out.AnalyzedAt = &at
+	}
+	return out
+}
+
+// SightingsOfStore converts the verdict store's ledger rows for the rule
+// that weighs them.
+func SightingsOfStore(rows []store.Sighting) []Sighting {
+	out := make([]Sighting, len(rows))
+	for i := range rows {
+		g := &rows[i]
+		out[i] = Sighting{
+			FirstSeen: g.FirstSeen, PublishedAt: g.PublishedAt, Source: g.Source, Relayer: g.Relayer,
+			Operator: g.Operator, Subject: g.Subject, Affected: g.Affected, URL: g.URL, Note: g.Note,
+			FileName: g.FileName, Handle: g.Handle, Claim: SightingClaim(g.Claim), Basis: Basis(g.Basis),
+		}
+	}
+	return out
+}
+
 // recordOf projects a stored sample onto the wire.
 //
 // Deliberately never reads CleaveResult. It is the largest column hopper holds
@@ -532,7 +613,10 @@ func recordOf(s *Sample) *LookupRecord {
 	r := &LookupRecord{
 		SHA256:   &sha,
 		Findings: findingsOf(s.TopTraits),
-		Analyzed: len(s.LitmusResult) > 0 || len(s.LLMResult) > 0 || len(s.CleaveResult) > 0,
+		State:    StatePending,
+	}
+	if len(s.LitmusResult) > 0 || len(s.LLMResult) > 0 || len(s.CleaveResult) > 0 {
+		r.State = StateAnalyzed
 	}
 	// Composed from the sample's own coordinates, never PURLBase + "@" +
 	// Version: PURLBase keeps a repository_url qualifier, so appending a

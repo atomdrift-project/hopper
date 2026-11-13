@@ -29,14 +29,16 @@ import (
 
 	"github.com/atomdrift-project/hopper"
 	"github.com/atomdrift-project/hopper/pkgparse"
+	"github.com/atomdrift-project/hopper/scanresult"
+	"github.com/atomdrift-project/hopper/store"
 	"github.com/codeGROOVE-dev/retry"
 	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/sync/singleflight"
 )
 
-// apiServer handles the pull-based work API. Workers poll /api/next for
-// jobs, submit results via /api/result, hand back claims they are not going to
-// analyze via /api/release, and fetch file content from /api/file/{sha256}.
+// apiServer handles the pull-based work API. Workers claim jobs from
+// /v1/work/next, keep their leases with /v1/work/heartbeat, submit results to
+// /v1/work/result, and fetch file content from /v1/files/{sha256}.
 // Sample data lives in the database; per-job claim state lives in
 // workerTracker (see below).
 type apiServer struct {
@@ -48,6 +50,9 @@ type apiServer struct {
 	workerResultSem chan struct{}
 	triageSem       chan struct{}
 	extractCache    *extractCache
+	// results, when set, stores results in the verdict schema instead of
+	// through db.StoreResult; see results.go. Unset until the migration.
+	results *store.Store
 	// resultStores collapses concurrent stores of the same sha; see storeResult.
 	resultStores  singleflight.Group
 	traitsVersion atomic.Pointer[string]
@@ -535,7 +540,7 @@ func (wt *workerTracker) update(name string, slots int, version, traits string, 
 	ws.Tools = tools
 }
 
-// heartbeat records a dedicated /api/heartbeat check-in. It refreshes the same
+// heartbeat records a dedicated /v1/work/heartbeat check-in. It refreshes the same
 // liveness signals as update plus the worker's self-reported local-queue
 // telemetry, which the work-claim path can't supply. ActiveClaims/TotalClaimed/
 // LastClaimed stay owned by tryClaimBatch and release; do not bump them here.
@@ -614,7 +619,7 @@ func (wt *workerTracker) heartbeat(name string, hb *workerHeartbeat) (newError b
 	return newError, abandoned
 }
 
-// workerHeartbeat is the parsed payload of one /api/heartbeat request. Timestamps
+// workerHeartbeat is the parsed payload of one /v1/work/heartbeat request. Timestamps
 // are already converted from the worker's relative ages to absolute hopper-clock
 // times at receipt, so the dashboard can render them with time.Since.
 type workerHeartbeat struct { //nolint:govet // embedded-first ordering over fieldalignment's pointer-packing
@@ -636,7 +641,7 @@ type workerHeartbeat struct { //nolint:govet // embedded-first ordering over fie
 	errorsRecent     int
 }
 
-// lastSeenSignals are the liveness fields shared by /api/next and /api/heartbeat.
+// lastSeenSignals are the liveness fields shared by /v1/work/next and /v1/work/heartbeat.
 type lastSeenSignals struct {
 	version string
 	traits  string
@@ -650,7 +655,7 @@ type lastSeenSignals struct {
 // named worker should be re-persisted, and stamps the time if so. The DB row
 // is purely for crash inspection — the dashboard reads from this tracker —
 // so it can lag the in-memory view by a few tens of seconds without harm.
-// Without this throttle every /api/next does a WAL-flushed write.
+// Without this throttle every /v1/work/next does a WAL-flushed write.
 func (wt *workerTracker) shouldUpsertWorker(name string, interval time.Duration) bool {
 	wt.mu.Lock()
 	defer wt.mu.Unlock()
@@ -851,60 +856,42 @@ func (wt *workerTracker) all() []namedWorkerStats {
 	return out
 }
 
-// registerAPI mounts the work API routes on the given mux.
+// registerAPI mounts the API on the given mux: the tree in MIGRATION_PLAN.md
+// ("API: one /v1/ surface"), named for what each route is and grouped by how
+// it is used, and the retired paths, which answer 410 (retired).
 func (s *apiServer) registerAPI(mux *http.ServeMux) {
+	registerRetired(mux)
 	// Read routes: safe against any backend, including a logical-replication
 	// subscriber (serve-replica). File-serving routes need a data root; a
-	// replica API typically has no corpus on disk, and registering
-	// safeFileServer with an empty root would be a path-containment bug
-	// waiting to happen, so they exist only when there are bytes to serve.
-	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	// replica API typically has no corpus on disk, so they exist only when
+	// there are bytes to serve.
 	mux.HandleFunc("GET /_/replica", s.handleReplicaStatus)
-	// Process counters only. Deliberately NOT folded into /healthz, which says
-	// of itself that it touches no database and must stay a liveness check
-	// rather than growing into a diagnostics page.
-	mux.HandleFunc("GET /_/corroboration", s.handleCorroborationStatus)
-	// Lookup routes answer from the local (replica) database; freshOr adds the
+	// Point lookups answer from the local (replica) database; freshOr adds the
 	// ?fresh=1 / X-Hopper-Fresh escape hatch that routes one read to the
 	// primary when a client needs to see its own just-relayed write (a no-op
-	// wrapper when no relay is configured — including on the primary itself).
-	mux.HandleFunc("GET /api/sample/{sha256}", s.freshOr(s.handleSample))
-	mux.HandleFunc("GET /api/sample", s.freshOr(s.handleSampleByPURL))
+	// wrapper when no relay is configured, including on the primary itself).
 	mux.HandleFunc("GET /v1/lookup", s.freshOr(s.handleV1Lookup))
-	mux.HandleFunc("GET /api/provenance/{sha256}", s.freshOr(s.handleProvenance))
-	mux.HandleFunc("GET /api/locations/incoming", s.handleIncomingLocations)
-	// Triage selection. GET /api/triage/{queue} does not collide with the
-	// POST /api/triage ruling route below (different method, different depth),
-	// and the literal /queues outranks the {queue} wildcard by ServeMux
-	// precedence — which does mean a queue named "queues" would be
-	// unreachable, so do not register one.
+	mux.HandleFunc("GET /v1/files/{sha256}/provenance", s.freshOr(s.handleProvenance))
+	mux.HandleFunc("GET /v1/storage/incoming", s.handleIncomingLocations)
+	// Triage selection. GET /v1/triage/{queue} does not collide with the POST
+	// routes below, and the literal rulings and reports outrank the {queue}
+	// wildcard, so no queue may take either name.
 	//
-	// Deliberately NOT wrapped in freshOr, unlike the point lookups above. A
-	// selection walks a ranked population and a depth is a capped COUNT over a
-	// hundred-million-row table — they are the heavy reads this process exists
-	// to absorb, and honouring ?fresh=1 on one would put exactly that scan back
-	// on the publisher at a client's say-so. Replica lag costs a selection
-	// nothing anyway: a sample whose drain has not yet applied is handed out
-	// again, which the consumer's cooldown already absorbs.
-	mux.HandleFunc("GET /api/triage/queues", s.handleTriageQueues)
-	mux.HandleFunc("GET /api/gauntlet/runs/{id}", s.freshOr(s.handleGetGauntletRun))
-	mux.HandleFunc("GET /api/triage/{queue}", s.handleTriageSelect)
-	mux.HandleFunc("GET /api/triage/{queue}/depth", s.handleTriageDepth)
-	// The two lookups a consumer needs alongside a selection. GET
-	// /api/sightings reads the resource POST /api/sightings appends to; it has
-	// to be a GET rather than a POST carrying a subject list, because a replica
-	// refuses every POST and this is a read.
-	//
-	// Both take freshOr: they are point lookups in the same family as
-	// /api/provenance, and both are genuine read-after-write pairs — sightings
-	// against POST /api/sightings, and the stranded member list against the
-	// per-member reports the same client files through /api/report.
-	mux.HandleFunc("GET /api/sightings", s.freshOr(s.handleSightingsFor))
-	mux.HandleFunc("GET /api/sightings/ancestry", s.freshOr(s.handleSightingsAncestry))
-	mux.HandleFunc("GET /api/stranded/{sha256}", s.freshOr(s.handleStrandedMembers))
+	// Not wrapped in freshOr, unlike the point lookups: a selection walks a
+	// ranked population and a depth is a capped count, the heavy reads a
+	// replica exists to absorb, and honouring ?fresh=1 would put them back on
+	// the publisher at a client's say-so. Replica lag costs a selection
+	// nothing: a file whose drain has not applied is handed out again, which
+	// the consumer's cooldown absorbs.
+	mux.HandleFunc("GET /v1/triage/{queue}", s.handleTriageSelect)
+	mux.HandleFunc("GET /v1/triage/{queue}/depth", s.handleTriageDepth)
+	// The ledger: a GET reads it by subject (a replica refuses every POST, and
+	// this is a read), a POST appends. Both lookups are read-after-write pairs
+	// with what the same client posts, hence freshOr.
+	mux.HandleFunc("GET /v1/sightings", s.freshOr(s.handleSightingsFor))
+	mux.HandleFunc("GET /v1/sightings/ancestry", s.freshOr(s.handleSightingsAncestry))
 	if s.dataRoot != "" || !s.readOnly {
-		mux.HandleFunc("GET /api/file/{sha256}", s.handleFile)
-		mux.Handle("GET /data/", s.safeFileServer())
+		mux.HandleFunc("GET /v1/files/{sha256}", s.handleFile)
 	}
 
 	if s.readOnly {
@@ -914,65 +901,57 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 		// session-level default_transaction_read_only guard is the backstop;
 		// this is the front door: no mutating route ever touches the local DB.
 		//
-		// The worker loop is refused even with the relay enabled: result
-		// envelopes are the publisher's hot ingest path, and double-shipping
-		// them through this box helps no one (relay.go rule 2). Workers point
-		// at the primary directly.
+		// The work loop is refused even with the relay enabled: results are
+		// the publisher's hot ingest path, and double-shipping them through
+		// this box helps no one (relay.go rule 2). Workers point at the
+		// primary directly.
 		//
-		// POST /api/result is split by lane: the renew lane (single-artifact
-		// renewals from `atomscan serve --hopper`, low-rate and further thinned
-		// by the currency skip) relays, so a host like cyclotron can point its
-		// ENTIRE stack at this one URL; the worker lane — the firehose — is
-		// refused as before.
-		for _, ep := range []string{"GET /api/next", "GET /api/heartbeat", "POST /api/release"} {
+		// POST /v1/work/result is split by lane: the renew lane (single-artifact
+		// renewals from `atomscan serve --hopper`, low-rate) relays, so a host
+		// like cyclotron can point its whole stack at this one URL; the worker
+		// lane, the firehose, is refused.
+		for _, ep := range []string{"POST /v1/work/next", "POST /v1/work/heartbeat"} {
 			mux.HandleFunc(ep, handleWorkerRouteRefusal)
 		}
-		mux.HandleFunc("POST /api/result", func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("POST /v1/work/result", func(w http.ResponseWriter, r *http.Request) {
 			if s.relay != nil && renewalLane(r) {
 				s.relay.ServeHTTP(w, r)
 				return
 			}
 			handleWorkerRouteRefusal(w, r)
 		})
-		// Client-facing mutations: proxied verbatim to the primary when the
-		// relay is configured, refused with the classic 403 otherwise.
-		//
-		// /api/report and /api/cleave-result belong here rather than with the
-		// worker loop despite also coming from a scan host. They are a triage
-		// consumer's per-judgement writes — one drain row and one re-scanned
-		// envelope per sample it actually worked, at tens per day — not the
-		// ingest firehose rule 2 keeps out. Relaying them is what lets a
-		// cyclotron point its whole stack at one URL.
+		// Client-facing writes: proxied verbatim to the primary when the relay
+		// is configured, refused with 403 otherwise. A triage consumer's
+		// reports and re-scanned results are per-judgement writes at tens a
+		// day, not the ingest firehose rule 2 keeps out; relaying them is what
+		// lets a cyclotron point its whole stack at one URL.
 		clientWrites := []string{
-			"POST /api/upload", "POST /api/known", "POST /api/sightings",
-			"POST /api/popular", "POST /api/triage", "POST /api/rescan/{sha256}",
-			"POST /api/report", "POST /api/gauntlet/runs", "POST /api/cleave-result",
+			"POST /v1/intake/upload", "POST /v1/intake/held", "POST /v1/intake/popular",
+			"POST /v1/sightings", "POST /v1/triage/rulings", "POST /v1/triage/reports",
+			"POST /v1/work/rescan/{sha256}", "POST /api/cleave-result",
 		}
-		if s.relay != nil {
-			for _, ep := range clientWrites {
+		for _, ep := range clientWrites {
+			if s.relay != nil {
 				mux.Handle(ep, s.relay)
-			}
-		} else {
-			for _, ep := range clientWrites {
+			} else {
 				mux.HandleFunc(ep, handleReadOnlyRefusal)
 			}
 		}
 		return
 	}
 
-	mux.HandleFunc("GET /api/next", s.handleNext)
-	mux.HandleFunc("GET /api/heartbeat", s.handleHeartbeat)
-	mux.HandleFunc("POST /api/release", s.handleRelease)
-	mux.HandleFunc("POST /api/result", s.handleResult)
-	mux.HandleFunc("POST /api/upload", s.handleUpload)
-	mux.HandleFunc("POST /api/known", s.handleKnown)
-	mux.HandleFunc("POST /api/sightings", s.handleSightings)
-	mux.HandleFunc("POST /api/popular", s.handlePopular)
-	mux.HandleFunc("POST /api/triage", s.handleTriage)
-	mux.HandleFunc("POST /api/rescan/{sha256}", s.handleRescan)
-	mux.HandleFunc("POST /api/report", s.handleReport)
-	mux.HandleFunc("POST /api/gauntlet/runs", s.handleGauntletRun)
-
+	mux.HandleFunc("POST /v1/work/next", s.handleNext)
+	mux.HandleFunc("POST /v1/work/heartbeat", s.handleHeartbeat)
+	mux.HandleFunc("POST /v1/work/result", s.handleResult)
+	mux.HandleFunc("POST /v1/work/rescan/{sha256}", s.handleRescan)
+	mux.HandleFunc("POST /v1/intake/upload", s.handleUpload)
+	mux.HandleFunc("POST /v1/intake/held", s.handleKnown)
+	mux.HandleFunc("POST /v1/intake/popular", s.handlePopular)
+	mux.HandleFunc("POST /v1/sightings", s.handleSightings)
+	mux.HandleFunc("POST /v1/triage/rulings", s.handleTriage)
+	mux.HandleFunc("POST /v1/triage/reports", s.handleReport)
+	// Stays until cyclotron's re-scan becomes a version 8 result through
+	// /v1/work/result (MIGRATION_PLAN.md).
 	mux.HandleFunc("POST /api/cleave-result", s.handleCleaveResult)
 }
 
@@ -980,29 +959,15 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 // 403 rather than 405: the method is fine, the server will never allow it, and
 // clients must not retry (a 503 would invite exactly that).
 func handleReadOnlyRefusal(w http.ResponseWriter, _ *http.Request) {
-	writeJSONError(w, http.StatusForbidden, `{"error":"read-only replica; writes go to the primary hopper"}`)
+	v1Error(w, http.StatusForbidden, "read_only_replica", "Read-only replica; writes go to the primary hopper.")
 }
 
 // handleWorkerRouteRefusal answers the worker-loop routes on a read-only
 // replica, relay or no relay: workers are fleet config and belong on the
 // primary (see relay.go rule 2). Same 403-not-405 reasoning as above.
 func handleWorkerRouteRefusal(w http.ResponseWriter, _ *http.Request) {
-	writeJSONError(w, http.StatusForbidden, `{"error":"worker routes are never served or relayed by a replica; point workers at the primary hopper"}`)
-}
-
-// handleHealthz is a liveness probe that deliberately touches nothing — no
-// database, no locks, no allocation-heavy path — so it answers exactly when
-// the HTTP serving loop itself is healthy and times out exactly when it
-// isn't. During the 2026-07-09 memory-pressure incident every existing
-// endpoint needed a DB pool or the dashboard render to diagnose remotely;
-// this gives monitors and humans a probe whose failure isolates the fault to
-// the process/server layer.
-func (s *apiServer) handleHealthz(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{ //nolint:errcheck,errchkjson // best-effort response
-		"status": "ok",
-		"uptime": time.Since(s.hopperStart).Round(time.Second).String(),
-	})
+	v1Error(w, http.StatusForbidden, "worker_route_on_replica",
+		"Worker routes are never served or relayed by a replica; point workers at the primary hopper.")
 }
 
 // handleReplicaStatus reports how current this instance's data is, and whether
@@ -1093,7 +1058,7 @@ const (
 	// apiQueryTimeout (30s) was too tight and timed out under load
 	// (2026-08-17). Each attempt gets a fresh budget; see sightingsAttempts.
 	sightingsStoreTimeout = 5 * time.Minute
-	// sightingsAttempts is how many times /api/sightings retries AddSightings
+	// sightingsAttempts is how many times /v1/sightings retries AddSightings
 	// on a transient failure (lock timeout, brief outage, per-attempt
 	// deadline). Permanent PG errors and a canceled request stop immediately.
 	sightingsAttempts  = 3
@@ -1129,7 +1094,7 @@ const (
 	// matching write storm to the workers table.
 	workerUpsertInterval = 30 * time.Second
 
-	// maxUploadBytes caps the artifact bytes in an /api/upload. Raised from
+	// maxUploadBytes caps the artifact bytes in an /v1/intake/upload. Raised from
 	// 100 MiB to 8 GiB on 2026-08-27: registry dependencies routinely exceed
 	// 100 MiB (tensorflow wheels, platform-specific npm binaries, AUR
 	// packages, AppImages) and were failing outright — hopper's Content-Length
@@ -1151,7 +1116,7 @@ const (
 	// reasonable across filesystems; longer names are truncated, never
 	// rejected, so users still get an analysis.
 	uploadFilenameMax = 200
-	// uploadBodyTimeout caps how long the body of a single /api/upload may
+	// uploadBodyTimeout caps how long the body of a single /v1/intake/upload may
 	// take to arrive. Defends against slow-loris streams that hold a temp
 	// file open while dripping bytes under maxUploadBytes. Scaled up
 	// alongside maxUploadBytes (2026-08-27): 5 minutes was sized for a
@@ -1160,7 +1125,7 @@ const (
 	// upload down to ~4.5 MB/s, well below LAN speeds, while still bounding
 	// a truly stalled connection.
 	uploadBodyTimeout = 30 * time.Minute
-	// resultBodyTimeout caps how long the body of a single /api/result may
+	// resultBodyTimeout caps how long the body of a single /v1/work/result may
 	// take to arrive — the same slow-loris defense as uploadBodyTimeout, but
 	// roomier because a result body may reach maxResultBodyBytes (1 GiB
 	// decompressed, though zstd-compressed far smaller on the wire). Workers run
@@ -1519,13 +1484,13 @@ func interleaveBySizeClass(cands []hopper.ClaimJob) []hopper.ClaimJob {
 }
 
 // handleHeartbeat records a worker check-in without claiming work. The claim
-// path (/api/next) only contacts hopper when a worker has buffer room, so a
+// path (/v1/work/next) only contacts hopper when a worker has buffer room, so a
 // saturated worker can vanish from the dashboard for minutes; this endpoint
 // gives every worker a fixed-cadence liveness signal carrying RSS, load, queue
 // depth, and local-queue telemetry. Heartbeats are display-only and are never
 // persisted to the DB — the worker recomputes everything each beat, so a DB
 // write would be pure load with no recovery value.
-// GET /api/heartbeat?worker=nuc&slots=4&active=3&queue=2&fps=1.5&version=0.8.2&...
+// POST /v1/work/heartbeat?worker=nuc&slots=4&active=3&queue=2&fps=1.5&version=0.8.2&...
 // parseActiveSHAs splits a heartbeat's comma-separated in-progress-sha list,
 // keeping only well-formed sha256s and bounding the count (by the max a worker
 // could hold) so a malformed or hostile heartbeat can't drive an unbounded walk.
@@ -1543,68 +1508,20 @@ func parseActiveSHAs(list string) []string {
 	return out
 }
 
-// handleRelease returns claims a worker is giving back without a result.
-//
-// The embedded idle worker in `atomscan serve` sheds staged queue work the
-// moment an interactive request arrives, so the claims it was holding must go
-// back to the queue immediately rather than waiting out claimExpiry or the
-// abandonedClaimGrace sweep — neither of which can fire while the same process
-// is busy analyzing (both need the worker to report holding nothing).
-//
-// Idempotent: a sha this worker does not hold is silently skipped, so a retry
-// after a partial failure is safe.
-func (s *apiServer) handleRelease(w http.ResponseWriter, r *http.Request) {
-	if s.db == nil {
-		http.Error(w, `{"error":"starting"}`, http.StatusServiceUnavailable)
-		return
-	}
-	worker := r.URL.Query().Get("worker")
-	if !validWorkerName(worker) {
-		slog.WarnContext(r.Context(), "release rejected: invalid worker name",
-			"worker", worker, "remote", r.RemoteAddr)
-		http.Error(w, `{"error":"invalid worker name"}`, http.StatusBadRequest)
-		return
-	}
-	worker = qualifiedWorkerName(worker, r.RemoteAddr)
-	// Same comma-separated form and 32-sha cap as the heartbeat's active_shas:
-	// a release batch is bounded by the worker's slot count either way.
-	shas := parseActiveSHAs(r.URL.Query().Get("shas"))
-	if len(shas) == 0 {
-		http.Error(w, `{"error":"no valid sha256 in shas"}`, http.StatusBadRequest)
-		return
-	}
-	// Drop the in-memory claims first: that is what gates re-handout, and it
-	// tells us which shas this worker actually held. The DB rows are cleared
-	// after, so a failure there leaves a row whose claimed_at simply ages out
-	// rather than a claim this worker still appears to hold.
-	dropped := s.tracker.releaseOwned(worker, shas)
-	released := 0
-	for _, sha := range dropped {
-		if err := s.db.ReleaseSampleClaim(r.Context(), sha, worker); err != nil {
-			slog.WarnContext(r.Context(), "release: claim row not cleared; it will age out",
-				"worker", worker, "sha256", sha, "error", err)
-			continue
-		}
-		released++
-	}
-	slog.InfoContext(r.Context(), "worker released claims",
-		"worker", worker, "asked", len(shas), "dropped", len(dropped), "released", released)
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
-	fmt.Fprintf(w, `{"released":%d,"dropped":%d}`, released, len(dropped)) //nolint:errcheck // best-effort response
-}
-
 func (s *apiServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
-	worker := r.URL.Query().Get("worker")
+	if !parseWorkForm(w, r) {
+		return
+	}
+	worker := r.Form.Get("worker")
 	if !validWorkerName(worker) {
 		slog.WarnContext(r.Context(), "heartbeat rejected: invalid worker name",
 			"worker", worker, "remote", r.RemoteAddr)
-		http.Error(w, `{"error":"invalid worker name"}`, http.StatusBadRequest)
+		v1Error(w, http.StatusBadRequest, "invalid_worker_name", "Invalid worker name.")
 		return
 	}
 	worker = qualifiedWorkerName(worker, r.RemoteAddr)
 
-	q := r.URL.Query()
+	q := r.Form
 	now := time.Now()
 	hb := workerHeartbeat{
 		lastSeenSignals: lastSeenSignals{
@@ -1707,7 +1624,7 @@ func queryAgeBefore(q url.Values, name string, now time.Time) (time.Time, bool) 
 	return now.Add(-time.Duration(secs) * time.Second), true
 }
 
-// nextParams is a worker's self-description from an /api/next query string:
+// nextParams is a worker's self-description from an /v1/work/next query string:
 // how much work it wants, what it can run, and how loaded it is. Split out of
 // handleNext because it is nine independent "parse, validate, or fall back to a
 // default" clauses with no branching between them — inline they were half the
@@ -1750,22 +1667,38 @@ func parseNextParams(q url.Values) nextParams {
 	return p
 }
 
-// handleNext claims work items for a worker.
-// GET /api/next?worker=nuc&count=3&slots=4&version=0.8.2&traits=abc123.
+// parseWorkForm reads a work route's parameters, which come as a form body
+// (or, equally, in the query): worker=nuc&count=3&slots=4&version=0.8.2&….
+// It answers 400 itself and reports false when the form cannot be read.
+func parseWorkForm(w http.ResponseWriter, r *http.Request) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	if err := r.ParseForm(); err != nil {
+		v1Error(w, http.StatusBadRequest, "invalid_form", "The parameters could not be read as a form.")
+		return false
+	}
+	return true
+}
+
+// handleNext claims work items for a worker. POST /v1/work/next with the
+// worker's parameters as a form; 200 with {"jobs": […]}, empty when there is
+// nothing for it.
 func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
-		http.Error(w, `{"error":"starting"}`, http.StatusServiceUnavailable)
+		v1Error(w, http.StatusServiceUnavailable, "starting", "Starting.")
 		return
 	}
-	worker := r.URL.Query().Get("worker")
+	if !parseWorkForm(w, r) {
+		return
+	}
+	worker := r.Form.Get("worker")
 	if !validWorkerName(worker) {
 		slog.WarnContext(r.Context(), "next rejected: invalid worker name",
 			"worker", worker, "remote", r.RemoteAddr)
-		http.Error(w, `{"error":"invalid worker name"}`, http.StatusBadRequest)
+		v1Error(w, http.StatusBadRequest, "invalid_worker_name", "Invalid worker name.")
 		return
 	}
 	worker = qualifiedWorkerName(worker, r.RemoteAddr)
-	p := parseNextParams(r.URL.Query())
+	p := parseNextParams(r.Form)
 	// Hopper's local postdoc worker is the reference for the current traits
 	// version shown on the dashboard. Its heartbeat carries the version after
 	// postdoc refreshes Scan's rules in-process.
@@ -1780,7 +1713,8 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("unproven worker at active claim limit, waiting for results",
 			"worker", worker, "active", s.tracker.activeClaims(worker))
 		s.tracker.update(worker, slots, p.version, p.traits, p.rssMB, p.load1, p.tools)
-		w.WriteHeader(http.StatusNoContent)
+		recordWorkPoll(r.Context(), "empty")
+		v1WriteJSON(w, http.StatusOK, map[string]any{"jobs": []any{}})
 		return
 	} else if count > limit {
 		count = limit
@@ -1805,10 +1739,16 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	jobs, err := s.claimJobs(ctx, worker, count, p.toolCaps, p.maxBytes, slots)
 	if err != nil {
 		slog.Error("claim jobs failed", "worker", worker, "error", err)
-		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		v1Error(w, http.StatusInternalServerError, "internal", "Internal.")
 		return
 	}
 
+	if len(jobs) == 0 && s.results != nil {
+		s.logQueueEmpty(ctx, worker)
+		recordWorkPoll(r.Context(), "empty")
+		v1WriteJSON(w, http.StatusOK, map[string]any{"jobs": []any{}})
+		return
+	}
 	if len(jobs) == 0 {
 		// Per-tier, because "the ladder gave this worker nothing" is answered by
 		// which tiers were empty, not by one total. Cached: see cachedRescanDepths.
@@ -1822,7 +1762,8 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 			"rescan_repair", depths.Repair,
 			"rescan_age_queue", depths.Age,
 			"force_rescan_prefixes", len(s.forceRescanPrefixes))
-		w.WriteHeader(http.StatusNoContent)
+		recordWorkPoll(r.Context(), "empty")
+		v1WriteJSON(w, http.StatusOK, map[string]any{"jobs": []any{}})
 		return
 	}
 
@@ -1833,25 +1774,29 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	// worker never report a result, so the attempt counter is the only signal
 	// that catches them; the reaper skips a sample once it crosses
 	// hopper.MaxClaimAttempts. Best-effort: a failed bump must not deny work.
-	claimedSHAs := make([]string, len(jobs))
-	for i := range jobs {
-		claimedSHAs[i] = jobs[i].SHA256
-	}
-	if err := s.db.IncrementAttempts(ctx, claimedSHAs); err != nil {
-		slog.Warn("increment claim attempts failed",
-			"worker", worker, "count", len(claimedSHAs), "error", err)
-	}
-
-	// Stamp which claimed samples carry a provenance sidecar, so the worker
-	// fetches the registry record (/api/provenance/{sha256}) only for those.
-	// Best-effort: on a probe failure HasProvenance stays false and the
-	// worker simply skips the fetch — it never blocks handing out work.
-	if withProv, err := s.db.ShasWithProvenance(ctx, claimedSHAs); err != nil {
-		slog.Warn("provenance presence probe failed",
-			"worker", worker, "count", len(claimedSHAs), "error", err)
-	} else {
+	// With the queue, its lease counted the hand-out and its read said which
+	// files carry provenance; neither needs a write or a probe here.
+	if s.results == nil {
+		claimedSHAs := make([]string, len(jobs))
 		for i := range jobs {
-			jobs[i].HasProvenance = withProv[jobs[i].SHA256]
+			claimedSHAs[i] = jobs[i].SHA256
+		}
+		if err := s.db.IncrementAttempts(ctx, claimedSHAs); err != nil {
+			slog.Warn("increment claim attempts failed",
+				"worker", worker, "count", len(claimedSHAs), "error", err)
+		}
+
+		// Stamp which claimed samples carry a provenance sidecar, so the worker
+		// fetches the registry record (/v1/files/{sha256}/provenance) only for those.
+		// Best-effort: on a probe failure HasProvenance stays false and the
+		// worker simply skips the fetch — it never blocks handing out work.
+		if withProv, err := s.db.ShasWithProvenance(ctx, claimedSHAs); err != nil {
+			slog.Warn("provenance presence probe failed",
+				"worker", worker, "count", len(claimedSHAs), "error", err)
+		} else {
+			for i := range jobs {
+				jobs[i].HasProvenance = withProv[jobs[i].SHA256]
+			}
 		}
 	}
 
@@ -1880,10 +1825,8 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 			"path", j.Path, "size", j.SizeBytes, "active_claims", active)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]any{"jobs": jobs}); err != nil {
-		slog.Error("failed to encode claim response", "error", err)
-	}
+	recordWorkPoll(r.Context(), "jobs")
+	v1WriteJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
 }
 
 // validateClaimJobs drops jobs whose bytes are not servable before a worker is
@@ -1908,14 +1851,22 @@ func (s *apiServer) validateClaimJobs(ctx context.Context, jobs []hopper.ClaimJo
 		if j.Path == "" || j.Path == "." {
 			slog.Warn("skipping job with empty path",
 				"worker", worker, "sha256", j.SHA256)
-			if err := s.db.SetSkip(ctx, j.SHA256, "empty_path"); err != nil {
-				slog.Error("mark empty_path failed", "sha256", j.SHA256, "error", err)
-			}
+			s.markUnavailable(ctx, j.SHA256, j.Path, "empty_path")
 			unclaimSHAs = append(unclaimSHAs, j.SHA256)
 			continue
 		}
 		location := &hopper.Sample{SHA256: j.SHA256, Path: j.Path}
-		f, info, err := s.openKnownSampleFile(ctx, location, worker)
+		var (
+			f    *os.File
+			info os.FileInfo
+			err  error
+		)
+		if s.results != nil {
+			f, info, err = s.openClaimedFromStore(ctx, &j)
+			location.Path = j.Path
+		} else {
+			f, info, err = s.openKnownSampleFile(ctx, location, worker)
+		}
 		if err != nil {
 			if s.datasetIncomplete {
 				// Local disk is not authoritative in this mode — the file being
@@ -1950,9 +1901,7 @@ func (s *apiServer) validateClaimJobs(ctx context.Context, jobs []hopper.ClaimJo
 
 			slog.Warn("claimed file unavailable on all known paths",
 				"worker", worker, "sha256", j.SHA256, "path", j.Path, "skip", skip, "error", err)
-			if err := s.db.SetSkip(ctx, j.SHA256, skip); err != nil {
-				slog.Error("mark unavailable sample failed", "sha256", j.SHA256, "skip", skip, "error", err)
-			}
+			s.markUnavailable(ctx, j.SHA256, j.Path, skip)
 			unclaimSHAs = append(unclaimSHAs, j.SHA256)
 			continue
 		}
@@ -1962,19 +1911,17 @@ func (s *apiServer) validateClaimJobs(ctx context.Context, jobs []hopper.ClaimJo
 			slog.Warn("claimed file size mismatch — file was likely replaced",
 				"worker", worker, "sha256", j.SHA256, "path", j.Path,
 				"db_size", j.SizeBytes, "disk_size", info.Size())
-			if err := s.db.SetSkip(ctx, j.SHA256, "corrupt"); err != nil {
-				slog.Error("mark corrupt failed", "sha256", j.SHA256, "error", err)
-			}
+			s.markUnavailable(ctx, j.SHA256, j.Path, "corrupt")
 			unclaimSHAs = append(unclaimSHAs, j.SHA256)
 			continue
 		}
 		validated = append(validated, j)
 	}
-	s.tracker.releaseMany(unclaimSHAs)
+	s.releaseClaims(ctx, unclaimSHAs)
 	return validated
 }
 
-// resultRequest is the JSON body for POST /api/result.
+// resultRequest is the JSON body for POST /v1/work/result.
 type resultRequest struct {
 	SHA256     string          `json:"sha256"`
 	Worker     string          `json:"worker"`
@@ -2123,7 +2070,7 @@ func decodeResultRequest(w http.ResponseWriter, r *http.Request) *resultRequest 
 			"error", err,
 			"remote", r.RemoteAddr,
 		)
-		http.Error(w, `{"error":"unsupported content-encoding"}`, http.StatusUnsupportedMediaType)
+		v1Error(w, http.StatusUnsupportedMediaType, "unsupported_content_encoding", "Unsupported content-encoding.")
 		return nil
 	}
 	defer rb.cleanup()
@@ -2137,19 +2084,19 @@ func decodeResultRequest(w http.ResponseWriter, r *http.Request) *resultRequest 
 				"limit_bytes", int64(maxResultBodyBytes),
 				"remote", r.RemoteAddr,
 			)
-			http.Error(w, `{"error":"result body exceeds size limit"}`, http.StatusRequestEntityTooLarge)
+			v1Error(w, http.StatusRequestEntityTooLarge, "result_too_large", "Result body exceeds size limit.")
 			return nil
 		}
 		slog.Warn("result rejected: invalid json",
 			"error", err,
 			"remote", r.RemoteAddr,
 		)
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		v1Error(w, http.StatusBadRequest, "invalid_json", "Invalid json.")
 		return nil
 	}
 	if !validSHA256(req.SHA256) || !validWorkerName(req.Worker) {
 		slog.Warn("result rejected: invalid fields", "worker", req.Worker, "sha256", req.SHA256)
-		http.Error(w, `{"error":"invalid sha256 or worker"}`, http.StatusBadRequest)
+		v1Error(w, http.StatusBadRequest, "invalid_sha256_or_worker", "Invalid sha256 or worker.")
 		return nil
 	}
 	return &req
@@ -2158,7 +2105,7 @@ func decodeResultRequest(w http.ResponseWriter, r *http.Request) *resultRequest 
 // handleResult receives an analysis result from a worker.
 func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
-		http.Error(w, `{"error":"starting"}`, http.StatusServiceUnavailable)
+		v1Error(w, http.StatusServiceUnavailable, "starting", "Starting.")
 		return
 	}
 	// Bound concurrent ingestions before reading the body: each result expands
@@ -2179,7 +2126,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 			slog.WarnContext(r.Context(), "result shed: ingestion slots saturated",
 				"lane", lane, "remote", r.RemoteAddr, "wait", slotAcquireWait.String())
 		}
-		writeRetryable(w, retryAfterBusy, `{"error":"busy: result ingestion saturated"}`)
+		writeRetryable(w, retryAfterBusy, "busy_result_ingestion_saturated", "Busy: result ingestion saturated.")
 		return
 	}
 	if waited := time.Since(waitStart); waited > slotWaitLogThreshold {
@@ -2187,6 +2134,10 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 			"lane", lane, "remote", r.RemoteAddr, "waited_ms", waited.Milliseconds())
 	}
 	defer s.releaseResult(renewal)
+	if s.results != nil {
+		s.storeVerdicts(w, r, lane)
+		return
+	}
 	phaseStart := time.Now()
 	req := decodeResultRequest(w, r)
 	if req == nil {
@@ -2216,7 +2167,7 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("result rejected: cleave root sha mismatch",
 			"worker", req.Worker, "claimed_sha256", req.SHA256,
 			"reported_sha256", parsed.RootSHA, "path", claimedPath)
-		writeJSONError(w, http.StatusUnprocessableEntity, `{"error":"cleave result root sha256 does not match claimed sample"}`)
+		v1Error(w, http.StatusUnprocessableEntity, "sha256_mismatch", "Cleave result root sha256 does not match claimed sample.")
 		return
 	}
 
@@ -2266,11 +2217,11 @@ func (s *apiServer) handleResult(w http.ResponseWriter, r *http.Request) {
 		s.tracker.release(req.SHA256)
 		s.tracker.recordResult(req.Worker, true)
 		s.progress.recordErrorf(1, "store", "store result: %s: %v", req.SHA256, err)
-		errMsg := `{"error":"store result failed"}`
+		msg := "Storing the result failed."
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			errMsg = `{"error":"store result failed: database write context was canceled or timed out"}`
+			msg = "Storing the result failed: the database write was canceled or timed out."
 		}
-		http.Error(w, errMsg, http.StatusInternalServerError)
+		v1Error(w, http.StatusInternalServerError, "store_failed", msg)
 		return
 	}
 
@@ -2699,7 +2650,11 @@ func (s *apiServer) claimJobs(
 	ctx context.Context, worker string, count int, tools *workerToolSet, maxBytes int64, slots int,
 ) ([]hopper.ClaimJob, error) {
 	var out []hopper.ClaimJob
-	for _, tier := range s.claimLadder(slots) {
+	ladder := s.claimLadder(slots)
+	if s.results != nil {
+		ladder = s.queueLadder(slots, maxBytes)
+	}
+	for _, tier := range ladder {
 		want := count - len(out)
 		if want <= 0 {
 			break
@@ -2720,6 +2675,9 @@ func (s *apiServer) claimJobs(
 			cands = interleaveBySizeClass(cands)
 		}
 		claimed := stampTier(s.tracker.tryClaimBatch(cands, worker, claimExpiry, want), tier.name)
+		if s.results != nil {
+			claimed = s.leaseClaimed(ctx, claimed, worker)
+		}
 		if len(claimed) == 0 {
 			continue
 		}
@@ -2736,7 +2694,8 @@ func (s *apiServer) claimJobs(
 	// Record the hand-out once per poll, not once per tier: this runs on every
 	// poll from every worker. A failure here costs a measurement, never a job,
 	// so it is logged and the jobs still go out.
-	if len(out) > 0 {
+	// The queue lease above is the hand-out record when there is a queue.
+	if len(out) > 0 && s.results == nil {
 		shas := make([]string, len(out))
 		// The interpret tier gets one attempt per sample and no more, so the
 		// samples it served are marked as they go out rather than on the way
@@ -2915,6 +2874,9 @@ func retryDBAccess[T any](ctx context.Context, op, shaHex string, fn func(contex
 				errors.Is(err, context.Canceled) ||
 				errors.Is(err, context.DeadlineExceeded) ||
 				errors.Is(err, hopper.ErrNotFound) ||
+				errors.Is(err, store.ErrNotFound) ||
+				errors.Is(err, store.ErrGauntletEvidence) ||
+				errors.Is(err, scanresult.ErrMalformed) ||
 				permanentPGError(err) {
 				return v, retry.Unrecoverable(err)
 			}
@@ -2966,8 +2928,8 @@ func validSHA256(s string) bool {
 	return true
 }
 
-// uploadResponse is the JSON body returned by POST /api/upload.
-// uploadResponse answers /api/upload. ProvenanceApplied separates the two things
+// uploadResponse is the JSON body returned by POST /v1/intake/upload.
+// uploadResponse answers /v1/intake/upload. ProvenanceApplied separates the two things
 // an upload can accomplish — storing bytes and refreshing metadata — so a
 // producer can tell a sidecar that landed from one that did not. Without it a
 // re-send of known bytes and a genuine first store are indistinguishable 200s.
@@ -3055,20 +3017,6 @@ func sanitizeUploadFilename(raw string) string {
 		out = out[:cut] + ext
 	}
 	return out
-}
-
-// writeJSONError emits a JSON error body with the correct Content-Type and
-// no-store cache directives. The stdlib http.Error otherwise overrides
-// Content-Type to text/plain, and leaves caching to intermediary defaults.
-func writeJSONError(w http.ResponseWriter, code int, body string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(code)
-	// gosec G705: not an XSS vector — Content-Type is application/json with
-	// X-Content-Type-Options: nosniff (set above), so the body is never
-	// interpreted as HTML; the only interpolated values are JSON-escaped.
-	_, _ = io.WriteString(w, body) //nolint:errcheck // best-effort response; see above
 }
 
 // recoverMiddleware turns a handler panic into a logged 500 rather than an
@@ -3182,7 +3130,7 @@ func (s *apiServer) resolveDataPath(rel string) (string, error) {
 // Idempotent — re-uploading the same content returns the existing sample,
 // with already_analyzed=true if cleave_result is populated.
 //
-// maxKnownBatch caps the digests one /api/known request may probe. Bounds the
+// maxKnownBatch caps the digests one /v1/intake/held request may probe. Bounds the
 // query and the response, and keeps the batch well under SQLite's bound-param
 // limit. A bulk producer chunks larger work into successive requests.
 const maxKnownBatch = 1024
@@ -3198,12 +3146,12 @@ type knownResponse struct {
 	Known []string `json:"known"`
 }
 
-// handleKnown answers "which of these digests do you already have?" with a
+// handleKnown answers "which of these digests do you already hold?" with a
 // single index-only lookup, so a producer can skip transferring bytes hopper
-// holds. It is unauthenticated — sample existence is already visible in the web
-// UI — and reads nothing but the sha256 key, making it the cheapest probe the
-// store offers. The response lists only the known digests; unknown ones are
-// simply absent.
+// holds. POST /v1/intake/held. It takes the API token like every route but
+// the /_/ probes, and reads nothing but the sha256 key, making it the
+// cheapest probe the store offers. The response lists only the held digests;
+// the rest are simply absent.
 //
 // One question. It briefly also answered "is your verdict for this sha already
 // current?", which is a different question about a different column, and gave
@@ -3214,20 +3162,21 @@ type knownResponse struct {
 // producers writing the same sha.
 func (s *apiServer) handleKnown(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
-		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
+		writeRetryable(w, retryAfterStarting, "starting", "Starting.")
 		return
 	}
 	// Bound the body: maxKnownBatch 64-hex strings plus JSON framing, generously.
 	var req knownRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxKnownBatch*72+1024)).Decode(&req); err != nil {
 		slog.WarnContext(r.Context(), "known rejected: invalid json", "remote", r.RemoteAddr, "error", err)
-		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid json"}`)
+		v1Error(w, http.StatusBadRequest, "invalid_json", "Invalid json.")
 		return
 	}
 	if len(req.SHA256) > maxKnownBatch {
 		slog.WarnContext(r.Context(), "known rejected: too many digests",
 			"remote", r.RemoteAddr, "count", len(req.SHA256), "max", maxKnownBatch)
-		writeJSONError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(`{"error":"too many digests (max %d)"}`, maxKnownBatch))
+		v1Error(w, http.StatusRequestEntityTooLarge, "too_many_digests",
+			fmt.Sprintf("At most %d digests per request.", maxKnownBatch), "max", maxKnownBatch)
 		return
 	}
 	// Keep only well-formed lowercase-hex digests; a malformed entry can never
@@ -3244,7 +3193,7 @@ func (s *apiServer) handleKnown(w http.ResponseWriter, r *http.Request) {
 	known, err := s.db.KnownSHA256(ctx, valid)
 	if err != nil {
 		slog.Error("known: query failed", "error", err)
-		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
 		return
 	}
 	resp := knownResponse{Known: known}
@@ -3258,7 +3207,7 @@ func (s *apiServer) handleKnown(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp) //nolint:errcheck,errchkjson // best-effort response
 }
 
-// maxSightingsBatch caps the records one /api/sightings request may carry.
+// maxSightingsBatch caps the records one /v1/sightings request may carry.
 // Producers pushing a large feed snapshot (Aikido, OSV) chunk into requests of
 // at most this size; the store upserts each request in its own transaction.
 const maxSightingsBatch = 50000
@@ -3331,7 +3280,7 @@ type sightingsResponse struct {
 //
 // Body is either a JSON array ([{source,subject,url,note},…]) for the small
 // trickle, or NDJSON (one object per line, Content-Type application/x-ndjson)
-// for streaming a large feed. Like /api/result and /api/rescan it is internal
+// for streaming a large feed. Like /v1/work/result and /v1/work/rescan it is internal
 // and unauthenticated; hopper-api is not publicly reachable.
 //
 // 200 {"changed":N}; 400 on malformed JSON; 413 when the batch exceeds
@@ -3355,7 +3304,7 @@ type popularRequest struct {
 	} `json:"packages"`
 }
 
-// POST /api/popular — record which package identities are worth extra scrutiny.
+// POST /v1/intake/popular — record which package identities are worth extra scrutiny.
 //
 // The body is one source's whole ranking. Entries are keyed on the version-less
 // PURL, so a mark covers releases that do not exist yet; see the
@@ -3363,22 +3312,22 @@ type popularRequest struct {
 // sighting.
 func (s *apiServer) handlePopular(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
-		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
+		writeRetryable(w, retryAfterStarting, "starting", "Starting.")
 		return
 	}
 	var req popularRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxPopularBody+1)).Decode(&req); err != nil {
 		slog.WarnContext(r.Context(), "popular rejected: invalid json", "remote", r.RemoteAddr, "error", err)
-		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid json"}`)
+		v1Error(w, http.StatusBadRequest, "invalid_json", "Invalid json.")
 		return
 	}
 	if req.Source == "" {
-		writeJSONError(w, http.StatusBadRequest, `{"error":"source is required"}`)
+		v1Error(w, http.StatusBadRequest, "source_is_required", "Source is required.")
 		return
 	}
 	if len(req.Packages) > maxPopularBatch {
-		writeJSONError(w, http.StatusRequestEntityTooLarge,
-			fmt.Sprintf(`{"error":"too many packages (max %d)"}`, maxPopularBatch))
+		v1Error(w, http.StatusRequestEntityTooLarge, "too_many_packages",
+			fmt.Sprintf("At most %d packages per request.", maxPopularBatch), "max", maxPopularBatch)
 		return
 	}
 
@@ -3401,7 +3350,7 @@ func (s *apiServer) handlePopular(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.db.SetPopularPackages(r.Context(), pkgs); err != nil {
 		slog.ErrorContext(r.Context(), "popular publish failed", "remote", r.RemoteAddr, "error", err)
-		writeJSONError(w, http.StatusInternalServerError, `{"error":"internal"}`)
+		v1Error(w, http.StatusInternalServerError, "internal", "Internal.")
 		return
 	}
 	slog.InfoContext(r.Context(), "popular packages recorded",
@@ -3419,7 +3368,7 @@ func (s *apiServer) handlePopular(w http.ResponseWriter, r *http.Request) {
 
 func (s *apiServer) handleSightings(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
-		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
+		writeRetryable(w, retryAfterStarting, "starting", "Starting.")
 		return
 	}
 
@@ -3433,13 +3382,14 @@ func (s *apiServer) handleSightings(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		slog.WarnContext(r.Context(), "sightings rejected: invalid json", "remote", r.RemoteAddr, "error", err)
-		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid json"}`)
+		v1Error(w, http.StatusBadRequest, "invalid_json", "Invalid json.")
 		return
 	}
 	if len(reqs) > maxSightingsBatch {
 		slog.WarnContext(r.Context(), "sightings rejected: batch too large",
 			"remote", r.RemoteAddr, "count", len(reqs), "max", maxSightingsBatch)
-		writeJSONError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(`{"error":"too many sightings (max %d)"}`, maxSightingsBatch))
+		v1Error(w, http.StatusRequestEntityTooLarge, "too_many_sightings",
+			fmt.Sprintf("At most %d sightings per request.", maxSightingsBatch), "max", maxSightingsBatch)
 		return
 	}
 
@@ -3465,11 +3415,11 @@ func (s *apiServer) handleSightings(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, hopper.ErrUnscopedLiteLLM) {
 			slog.ErrorContext(r.Context(), "sightings: FATAL integrity violation", "error", err, "remote", r.RemoteAddr)
-			writeJSONError(w, http.StatusBadRequest, `{"error":"unscoped litellm sighting rejected"}`)
+			v1Error(w, http.StatusBadRequest, "unscoped_litellm_sighting_rejected", "Unscoped litellm sighting rejected.")
 			return
 		}
 		slog.ErrorContext(r.Context(), "sightings: store failed", "error", err, "remote", r.RemoteAddr)
-		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
 		return
 	}
 	slog.InfoContext(r.Context(), "sightings recorded", "received", len(sightings), "changed", changed, "remote", r.RemoteAddr)
@@ -3489,7 +3439,13 @@ func (s *apiServer) storeSightings(ctx context.Context, sightings []hopper.Sight
 		func() (int, error) {
 			attemptCtx, cancel := context.WithTimeout(ctx, sightingsStoreTimeout)
 			defer cancel()
-			n, err := s.db.AddSightings(attemptCtx, sightings)
+			var n int
+			var err error
+			if s.results != nil {
+				n, err = s.addSightingsToStore(attemptCtx, sightings)
+			} else {
+				n, err = s.db.AddSightings(attemptCtx, sightings)
+			}
 			if err == nil {
 				return n, nil
 			}
@@ -3541,11 +3497,11 @@ func decodeSightingsNDJSON(r io.Reader) ([]sightingRequest, error) {
 
 func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
-		writeJSONError(w, http.StatusServiceUnavailable, `{"error":"starting"}`)
+		v1Error(w, http.StatusServiceUnavailable, "starting", "Starting.")
 		return
 	}
 	if s.dataRoot == "" {
-		writeJSONError(w, http.StatusServiceUnavailable, `{"error":"no data root configured"}`)
+		v1Error(w, http.StatusServiceUnavailable, "no_data_root_configured", "No data root configured.")
 		return
 	}
 
@@ -3555,18 +3511,18 @@ func (s *apiServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("upload rejected: csrf guard", "reason", err,
 			"sec_fetch_site", r.Header.Get("Sec-Fetch-Site"),
 			"origin", r.Header.Get("Origin"), "remote", r.RemoteAddr)
-		writeJSONError(w, http.StatusForbidden, `{"error":"forbidden"}`)
+		v1Error(w, http.StatusForbidden, "forbidden", "Forbidden.")
 		return
 	}
 
 	// Content-Length pre-check. Lets us reject oversized uploads before
 	// allocating a temp file. ContentLength is -1 when unknown (chunked).
 	if r.ContentLength > maxUploadEnvelopeBytes {
-		writeJSONError(w, http.StatusRequestEntityTooLarge, `{"error":"file too large"}`)
+		v1Error(w, http.StatusRequestEntityTooLarge, "file_too_large", "File too large.")
 		return
 	}
 	if r.ContentLength == 0 {
-		writeJSONError(w, http.StatusBadRequest, `{"error":"empty body"}`)
+		v1Error(w, http.StatusBadRequest, "empty_body", "Empty body.")
 		return
 	}
 
@@ -3603,7 +3559,7 @@ func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		slog.WarnContext(r.Context(), "upload rejected: cannot read multipart body",
 			"remote", r.RemoteAddr, "error", err, "content_type", r.Header.Get("Content-Type"))
-		writeJSONError(w, http.StatusBadRequest, `{"error":"malformed multipart body"}`)
+		v1Error(w, http.StatusBadRequest, "malformed_multipart_body", "Malformed multipart body.")
 		return
 	}
 
@@ -3619,12 +3575,12 @@ func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request
 			if maxErr, ok := errors.AsType[*http.MaxBytesError](err); ok && maxErr != nil {
 				slog.WarnContext(r.Context(), "upload rejected: envelope exceeds size limit",
 					"remote", r.RemoteAddr, "limit", maxUploadEnvelopeBytes, "part", parts)
-				writeJSONError(w, http.StatusRequestEntityTooLarge, `{"error":"file too large"}`)
+				v1Error(w, http.StatusRequestEntityTooLarge, "file_too_large", "File too large.")
 				return
 			}
 			slog.WarnContext(r.Context(), "upload rejected: malformed multipart stream",
 				"remote", r.RemoteAddr, "error", err, "part", parts)
-			writeJSONError(w, http.StatusBadRequest, `{"error":"malformed multipart body"}`)
+			v1Error(w, http.StatusBadRequest, "malformed_multipart_body", "Malformed multipart body.")
 			return
 		}
 		parts++
@@ -3632,7 +3588,7 @@ func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request
 			_ = part.Close() //nolint:errcheck // best-effort
 			slog.WarnContext(r.Context(), "upload rejected: too many parts",
 				"remote", r.RemoteAddr, "max", maxParts)
-			writeJSONError(w, http.StatusBadRequest, `{"error":"too many parts"}`)
+			v1Error(w, http.StatusBadRequest, "too_many_parts", "Too many parts.")
 			return
 		}
 
@@ -3648,13 +3604,13 @@ func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request
 			if rerr != nil {
 				slog.WarnContext(r.Context(), "upload rejected: provenance read failed",
 					"remote", r.RemoteAddr, "error", rerr)
-				writeJSONError(w, http.StatusBadRequest, `{"error":"provenance read failed"}`)
+				v1Error(w, http.StatusBadRequest, "provenance_read_failed", "Provenance read failed.")
 				return
 			}
 			if len(buf) > uploadProvenanceMaxBytes {
 				slog.WarnContext(r.Context(), "upload rejected: provenance exceeds size limit",
 					"remote", r.RemoteAddr, "limit", uploadProvenanceMaxBytes)
-				writeJSONError(w, http.StatusRequestEntityTooLarge, `{"error":"provenance too large"}`)
+				v1Error(w, http.StatusRequestEntityTooLarge, "provenance_too_large", "Provenance too large.")
 				return
 			}
 			var sc hopper.Sidecar
@@ -3667,7 +3623,7 @@ func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request
 					"error", err,
 					"bytes", len(buf),
 					"snippet", snippet(buf, 512))
-				writeJSONError(w, http.StatusBadRequest, `{"error":"invalid provenance json"}`)
+				v1Error(w, http.StatusBadRequest, "invalid_provenance_json", "Invalid provenance json.")
 				return
 			}
 			// Finalize first so an over-cap Raw is trimmed rather than rejected,
@@ -3682,7 +3638,7 @@ func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request
 					"sha256", sc.Artifact.SHA256,
 					"collector", sc.Fetch.Collector,
 					"purl", sc.Package.PURL)
-				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf(`{"error":%q}`, "invalid provenance: "+err.Error()))
+				v1Error(w, http.StatusBadRequest, "invalid_provenance", "The provenance sidecar is invalid: "+err.Error())
 				return
 			}
 			prov = &sc
@@ -3690,7 +3646,7 @@ func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request
 			if prov == nil {
 				slog.WarnContext(r.Context(), "upload rejected: file part precedes provenance",
 					"remote", r.RemoteAddr)
-				writeJSONError(w, http.StatusBadRequest, `{"error":"provenance part must precede file part"}`)
+				v1Error(w, http.StatusBadRequest, "provenance_after_file", "Provenance part must precede file part.")
 				return
 			}
 			// storeUpload consumes the part stream and writes the response.
@@ -3710,7 +3666,7 @@ func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request
 	}
 	slog.WarnContext(r.Context(), "upload rejected: no file or provenance part",
 		"remote", r.RemoteAddr, "parts", parts)
-	writeJSONError(w, http.StatusBadRequest, `{"error":"missing file part"}`)
+	v1Error(w, http.StatusBadRequest, "missing_file_part", "Missing file part.")
 }
 
 // refreshProvenance merges an incoming sidecar onto whatever the row already
@@ -3754,7 +3710,7 @@ func (s *apiServer) refreshProvenance(ctx context.Context, prov *hopper.Sidecar)
 //
 // A digest hopper has no row for is a 404, not a 200: there is nothing to attach
 // the sidecar to, so reporting success would tell the producer its metadata had
-// landed when the request changed nothing. Producers negotiate with /api/known
+// landed when the request changed nothing. Producers negotiate with /v1/intake/held
 // first, so this fires only when the row went away in between — which is worth a
 // log line rather than a silent no-op.
 func (s *apiServer) storeProvenanceOnly(w http.ResponseWriter, r *http.Request, prov *hopper.Sidecar) {
@@ -3765,13 +3721,13 @@ func (s *apiServer) storeProvenanceOnly(w http.ResponseWriter, r *http.Request, 
 	applied, err := s.refreshProvenance(ctx, prov)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "upload: set provenance", "sha256", sha, "error", err)
-		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
 		return
 	}
 	if !applied {
 		slog.WarnContext(r.Context(), "provenance backfill rejected: no such sample",
 			"sha256", sha, "collector", prov.Fetch.Collector, "purl", prov.Package.PURL, "remote", r.RemoteAddr)
-		writeJSONError(w, http.StatusNotFound, `{"error":"unknown sample"}`)
+		v1Error(w, http.StatusNotFound, "unknown_sample", "Unknown sample.")
 		return
 	}
 	slog.InfoContext(r.Context(), "provenance set", "sha256", sha, "applied", applied)
@@ -3795,18 +3751,18 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 	tmpDir, err := s.resolveDataPath(filepath.Join(uploadDir, ".tmp"))
 	if err != nil {
 		slog.ErrorContext(r.Context(), "upload: resolve tmp dir", "error", err)
-		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
 		return
 	}
 	if err := mkdirSharedAll(tmpDir); err != nil {
 		slog.ErrorContext(r.Context(), "upload: mkdir tmp", "error", err)
-		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
 		return
 	}
 	tmpFile, err := os.CreateTemp(tmpDir, "up-*")
 	if err != nil {
 		slog.ErrorContext(r.Context(), "upload: create temp", "error", err)
-		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
 		return
 	}
 	tmpPath := tmpFile.Name()
@@ -3821,34 +3777,34 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 	closeErr := tmpFile.Close()
 	if copyErr != nil {
 		if maxErr, ok := errors.AsType[*http.MaxBytesError](copyErr); ok && maxErr != nil {
-			writeJSONError(w, http.StatusRequestEntityTooLarge, `{"error":"file too large"}`)
+			v1Error(w, http.StatusRequestEntityTooLarge, "file_too_large", "File too large.")
 			return
 		}
 		// Read-deadline expiration surfaces as a net.Error with Timeout()=true.
 		var netErr net.Error
 		if errors.As(copyErr, &netErr) && netErr.Timeout() {
 			slog.WarnContext(r.Context(), "upload: body read timeout", "bytes", written, "remote", r.RemoteAddr)
-			writeJSONError(w, http.StatusRequestTimeout, `{"error":"upload timeout"}`)
+			v1Error(w, http.StatusRequestTimeout, "upload_timeout", "Upload timeout.")
 			return
 		}
 
 		slog.WarnContext(r.Context(), "upload: stream copy failed", "error", copyErr, "bytes", written, "remote", r.RemoteAddr)
-		writeJSONError(w, http.StatusBadRequest, `{"error":"upload failed"}`)
+		v1Error(w, http.StatusBadRequest, "upload_failed", "Upload failed.")
 		return
 	}
 	if closeErr != nil {
 		slog.ErrorContext(r.Context(), "upload: temp close", "error", closeErr)
-		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
 		return
 	}
 	if syncErr != nil {
 		slog.ErrorContext(r.Context(), "upload: temp sync", "error", syncErr)
-		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
 		return
 	}
 	if written == 0 {
 		slog.WarnContext(r.Context(), "upload rejected: empty body", "remote", r.RemoteAddr)
-		writeJSONError(w, http.StatusBadRequest, `{"error":"empty body"}`)
+		v1Error(w, http.StatusBadRequest, "empty_body", "Empty body.")
 		return
 	}
 	// Below hopper.MinSampleSize there is nothing to classify, and the DB layer
@@ -3856,7 +3812,7 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 	// 200 as "stored".
 	if written < hopper.MinSampleSize {
 		slog.WarnContext(r.Context(), "upload rejected: file too small", "bytes", written, "remote", r.RemoteAddr)
-		writeJSONError(w, http.StatusBadRequest, `{"error":"file too small"}`)
+		v1Error(w, http.StatusBadRequest, "file_too_small", "File too small.")
 		return
 	}
 
@@ -3866,7 +3822,7 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 	// tampered or mispaired provenance/file pair can't be stored as if matched.
 	if prov != nil && prov.Artifact.SHA256 != sha {
 		slog.WarnContext(r.Context(), "upload: provenance sha mismatch", "claimed", prov.Artifact.SHA256, "actual", sha, "remote", r.RemoteAddr)
-		writeJSONError(w, http.StatusBadRequest, `{"error":"content does not match provenance sha256"}`)
+		v1Error(w, http.StatusBadRequest, "sha256_mismatch", "Content does not match provenance sha256.")
 		return
 	}
 
@@ -3882,18 +3838,12 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 	// placeUpload keeps bytes hopper already holds exactly where they are, so
 	// re-sending a known sample — under a rotating filename, or with provenance
 	// that would route it elsewhere entirely — never spawns a second copy.
-	existing, err := retryDBAccess(ctx, "upload sample lookup", sha, func(ctx context.Context) (*hopper.Sample, error) {
-		return s.db.SampleBySHA256(ctx, sha)
-	})
-	if err != nil && !errors.Is(err, hopper.ErrNotFound) {
-		slog.WarnContext(r.Context(), "upload: existing sample lookup", "sha256", sha, "error", err)
-	}
-	alreadyAnalyzed := existing != nil && len(existing.CleaveResult) > 0
+	existing, alreadyAnalyzed := s.uploadExisting(ctx, sha)
 
 	relPath, err := s.placeUpload(r.Context(), tmpPath, sha, filename, prov, existing)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "upload: store bytes", "sha256", sha, "error", err)
-		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
 		return
 	}
 	filename = filepath.Base(relPath)
@@ -3905,15 +3855,21 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 	sample := uploadSample(sha, filename, relPath, written, prov)
 	storeCtx, cancelStore := context.WithTimeout(context.WithoutCancel(r.Context()), uploadStoreTimeout)
 	defer cancelStore()
+	var ingested store.Ingested
 	if err := retryDBAccessNoValue(storeCtx, "upload sample insert", sha, func(ctx context.Context) error {
+		if s.results != nil {
+			var err error
+			ingested, err = ingest(ctx, s.results, []*hopper.Sample{sample}, store.QueueUpload)
+			return err
+		}
 		return s.db.InsertSample(ctx, sample)
 	}); err != nil {
 		s.progress.recordInsertFailure(1, err)
 		slog.Error("upload: insert sample", "sha256", sha, "error", err)
-		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
 		return
 	}
-	if existing != nil && existing.Path != "" && existing.Path != relPath {
+	if s.results == nil && existing != nil && existing.Path != "" && existing.Path != relPath {
 		healed, healErr := s.db.PromotePrimaryLocation(storeCtx, sha, existing.Path, relPath)
 		if healErr != nil {
 			slog.Error("upload: promote verified replacement location",
@@ -3939,14 +3895,7 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 	// the redundant write is not worth reasoning about; an observed result is.
 	// Best-effort: the bytes and the row are already durable, so a failed refresh
 	// is reported, not fatal.
-	var provApplied bool
-	if prov != nil {
-		applied, refreshErr := s.refreshProvenance(storeCtx, prov)
-		if refreshErr != nil {
-			slog.Error("upload: refresh provenance", "sha256", sha, "error", refreshErr)
-		}
-		provApplied = applied
-	}
+	provApplied := s.uploadProvenance(storeCtx, sha, prov, ingested)
 
 	slog.Info("upload accepted",
 		"sha256", sha, "size", written, "filename", filename,
@@ -3964,13 +3913,54 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 	})
 }
 
+// uploadExisting returns what is already known of an upload's digest: the
+// file, if any, and whether it has been analyzed. A failed lookup is logged
+// and answers as unknown: the upload proceeds, and the insert is idempotent.
+func (s *apiServer) uploadExisting(ctx context.Context, sha string) (*hopper.Sample, bool) {
+	var analyzed bool
+	existing, err := retryDBAccess(ctx, "upload sample lookup", sha, func(ctx context.Context) (*hopper.Sample, error) {
+		if s.results != nil {
+			held, ok, err := s.heldInStore(ctx, sha)
+			analyzed = ok
+			return held, err
+		}
+		return s.db.SampleBySHA256(ctx, sha)
+	})
+	if err != nil && !errors.Is(err, hopper.ErrNotFound) {
+		slog.WarnContext(ctx, "upload: existing sample lookup", "sha256", sha, "error", err)
+	}
+	if s.results == nil {
+		analyzed = existing != nil && len(existing.CleaveResult) > 0
+	}
+	return existing, analyzed
+}
+
+// uploadProvenance reports whether an upload's sidecar was applied. The
+// verdict store took it with the arrival, on a new row or one whose identity
+// it filled in (an arrival only fills what is missing); the legacy row is
+// refreshed here. Best-effort: the bytes and the row are already durable.
+func (s *apiServer) uploadProvenance(ctx context.Context, sha string, prov *hopper.Sidecar, ingested store.Ingested) bool {
+	switch {
+	case prov == nil:
+		return false
+	case s.results != nil:
+		return ingested.New+ingested.Updated > 0
+	default:
+		applied, err := s.refreshProvenance(ctx, prov)
+		if err != nil {
+			slog.Error("upload: refresh provenance", "sha256", sha, "error", err)
+		}
+		return applied
+	}
+}
+
 // placeUpload publishes the spooled bytes and returns the path to record on the
 // row, relative to the data root and slash-separated.
 //
 // Bytes hopper already holds stay exactly where they are: an upload of a known
 // digest refreshes the row's provenance without laying down a second copy under
 // whatever path this handler would choose today. Producers negotiate with
-// /api/known before sending, so a re-send is rare — but the guarantee belongs on
+// /v1/intake/held before sending, so a re-send is rare — but the guarantee belongs on
 // this side of the trust boundary rather than in every client, and it is what
 // keeps a layout change from duplicating the corpus.
 //
@@ -4279,123 +4269,19 @@ func trimClientError(msg string) string {
 	return msg
 }
 
-// handleSample returns the stored analysis envelope for a sha256.
-// GET /api/sample/{sha256}
-//
-// 200 is hopper.Envelope (ml / llm / raw as stored). 204 means the row exists
-// but has not been analyzed yet. 404 is unknown. Parent archive envelopes are
-// not reassembled — beamline wants the stored columns, fast.
-func (s *apiServer) handleSample(w http.ResponseWriter, r *http.Request) {
-	if s.db == nil {
-		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
-		return
-	}
-	sha := r.PathValue("sha256")
-	if !validSHA256(sha) {
-		http.Error(w, `{"error":"invalid sha256"}`, http.StatusBadRequest)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
-	defer cancel()
-
-	sample, err := s.db.SampleBySHA256(ctx, sha)
-	if err != nil {
-		if errors.Is(err, hopper.ErrNotFound) {
-			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
-		} else {
-			slog.ErrorContext(r.Context(), "sample: lookup failed",
-				"sha256", sha, "error", err, "remote", r.RemoteAddr)
-			http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
-		}
-		return
-	}
-	writeSampleEnvelope(w, sample)
-}
-
-// handleSampleByPURL returns the newest analyzed top-level sample for a PURL.
-// GET /api/sample?purl=pkg:...
-//
-// This is a point lookup (SampleByPURL), not the prism feed. The feed query
-// walks analyzed_at and omits cleave_result; beamline needs both a seek on
-// purl_base and a full envelope (ml / llm / raw).
-func (s *apiServer) handleSampleByPURL(w http.ResponseWriter, r *http.Request) {
-	if s.db == nil {
-		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
-		return
-	}
-	raw := strings.TrimSpace(r.URL.Query().Get("purl"))
-	if raw == "" {
-		http.Error(w, `{"error":"missing purl"}`, http.StatusBadRequest)
-		return
-	}
-	canon := pkgparse.CanonicalizePURL(raw)
-	if len(canon) < 4 || !strings.EqualFold(canon[:4], "pkg:") {
-		http.Error(w, `{"error":"not a package URL"}`, http.StatusBadRequest)
-		return
-	}
-	base := pkgparse.VersionlessPURL(canon)
-	version := pkgparse.PURLVersion(canon)
-
-	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
-	defer cancel()
-
-	sample, err := s.db.SampleByPURL(ctx, base, version)
-	if err != nil {
-		if errors.Is(err, hopper.ErrNotFound) {
-			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
-			return
-		}
-		slog.ErrorContext(r.Context(), "sample: purl lookup failed",
-			"purl", canon, "error", err, "remote", r.RemoteAddr)
-		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
-		return
-	}
-	writeSampleEnvelope(w, sample)
-}
-
-// sampleQueuedRetryAfter is what an unanalyzed sample tells a caller to wait.
-// A queue this deep is measured in minutes, but a caller that polls is usually
-// waiting on a user, so this is the shortest interval that is not a busy-wait.
-const sampleQueuedRetryAfter = 5
-
-func writeSampleEnvelope(w http.ResponseWriter, sample *hopper.Sample) {
-	if len(sample.LitmusResult) == 0 && len(sample.CleaveResult) == 0 && len(sample.LLMResult) == 0 {
-		// 202, not 204. We have the bytes and nothing has looked at them yet,
-		// which is "accepted, still working" — 204 says "success, nothing to
-		// send", and a caller cannot tell that apart from a sample we hold and
-		// know to be empty. The distinction matters because it is the one case
-		// worth waiting on rather than giving up on.
-		w.Header().Set("X-Sha256", sample.SHA256)
-		w.Header().Set("Retry-After", strconv.Itoa(sampleQueuedRetryAfter))
-		w.WriteHeader(http.StatusAccepted)
-		return
-	}
-	env := hopper.Envelope(sample)
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("X-Sha256", sample.SHA256)
-	// gosec taints env and sample.SHA256 through the DB from the request's
-	// purl: env is machine-generated JSON served as application/json with
-	// nosniff (never interpreted as markup), and SHA256 is a stored hash.
-	if _, err := w.Write(env); err != nil { //nolint:gosec // JSON is served with nosniff, never interpreted as markup
-		slog.Warn("write sample envelope failed", "sha256", sample.SHA256, "error", err)
-	}
-}
-
 // handleProvenance serves the provenance sidecar a sample was ingested with, so
 // a worker can apply its registry record (and a forensic reader can inspect the
-// raw upstream documents) without re-fetching. GET /api/provenance/{sha256}.
-// 204 when the sample exists but carries no sidecar; 404 when it is unknown. The
-// sidecar is fixed for a content-addressed sha256, so the response is cacheable.
+// raw upstream documents) without re-fetching. GET /v1/files/{sha256}/provenance.
+// 404 with code no_provenance when the file carries no sidecar, and with
+// unknown_artifact when it is unknown. The sidecar is fixed for a content-addressed sha256, so the response is cacheable.
 func (s *apiServer) handleProvenance(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
-		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
+		writeRetryable(w, retryAfterStarting, "starting", "Starting.")
 		return
 	}
 	sha := r.PathValue("sha256")
 	if !validSHA256(sha) {
-		http.Error(w, `{"error":"invalid sha256"}`, http.StatusBadRequest)
+		v1Error(w, http.StatusBadRequest, "invalid_sha256", "Invalid sha256.")
 		return
 	}
 
@@ -4403,18 +4289,17 @@ func (s *apiServer) handleProvenance(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	prov, err := s.db.ProvenanceBySHA256(ctx, sha)
-	if err != nil {
-		if errors.Is(err, hopper.ErrNotFound) {
-			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
-		} else {
-			slog.ErrorContext(r.Context(), "provenance: lookup failed",
-				"sha256", sha, "error", err, "remote", r.RemoteAddr)
-			http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
-		}
+	switch {
+	case errors.Is(err, hopper.ErrNotFound):
+		v1Error(w, http.StatusNotFound, "unknown_artifact", "Nothing stored for that sha256.")
 		return
-	}
-	if len(prov) == 0 {
-		w.WriteHeader(http.StatusNoContent)
+	case err != nil:
+		slog.ErrorContext(r.Context(), "provenance: lookup failed",
+			"sha256", sha, "error", err, "remote", r.RemoteAddr)
+		v1Error(w, http.StatusInternalServerError, "internal", "Provenance lookup failed.")
+		return
+	case len(prov) == 0:
+		v1Error(w, http.StatusNotFound, "no_provenance", "The file was stored without a provenance sidecar.")
 		return
 	}
 
@@ -4429,7 +4314,7 @@ func (s *apiServer) handleProvenance(w http.ResponseWriter, r *http.Request) {
 }
 
 // rescanRequestCooldown is the minimum age of the most recent analysis before a
-// manual re-queue via POST /api/rescan is accepted. It bounds re-queue storms
+// manual re-queue via POST /v1/work/rescan is accepted. It bounds re-queue storms
 // for a single sample, enforced atomically in RequestRescan's UPDATE. prism
 // applies a matching UI cooldown before offering its rescan button and caps the
 // aggregate request rate; keep the two values in sync if either changes.
@@ -4439,35 +4324,35 @@ const rescanRequestCooldown = 15 * time.Minute
 // clears its cached analysis fields so the next worker poll picks it up as Tier
 // 1 (unanalyzed) work. This is the write side of prism's rescan button — prism
 // reads from a replica but routes the write here so it lands on the master,
-// keeping every write funneled through hopper. Like /api/result it is an
+// keeping every write funneled through hopper. Like /v1/work/result it is an
 // internal, worker-facing endpoint; hopper-api is not publicly reachable.
 //
-// POST /api/rescan/{sha256}. 200 {"status":"queued"} on success; 409 when the
+// POST /v1/work/rescan/{sha256}. 200 {"status":"queued"} on success; 409 when the
 // sample is not eligible (unknown, an archive child, skipped, or analyzed
 // within rescanRequestCooldown); 503 while the DB is still starting; 500 on an
 // unexpected store error.
 func (s *apiServer) handleRescan(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
-		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
+		writeRetryable(w, retryAfterStarting, "starting", "Starting.")
 		return
 	}
 	sha := strings.ToLower(r.PathValue("sha256"))
 	if !validSHA256(sha) {
-		writeJSONError(w, http.StatusBadRequest, `{"error":"invalid sha256"}`)
+		v1Error(w, http.StatusBadRequest, "invalid_sha256", "Invalid sha256.")
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
 
-	if err := s.db.RequestRescan(ctx, sha, rescanRequestCooldown); err != nil {
+	if err := s.requestRescan(ctx, sha); err != nil {
 		if errors.Is(err, hopper.ErrRescanNotEligible) {
-			writeJSONError(w, http.StatusConflict, `{"error":"not eligible"}`)
+			v1Error(w, http.StatusConflict, "not_eligible", "Not eligible.")
 			return
 		}
 		slog.ErrorContext(r.Context(), "rescan: request failed",
 			"sha256", sha, "error", err, "remote", r.RemoteAddr)
-		writeJSONError(w, http.StatusInternalServerError, `{"error":"server error"}`)
+		v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
 		return
 	}
 	slog.InfoContext(r.Context(), "rescan queued", "sha256", sha, "remote", r.RemoteAddr)
@@ -4477,30 +4362,34 @@ func (s *apiServer) handleRescan(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleFile serves file content for remote workers.
-// GET /api/file/{sha256}.
+// GET /v1/files/{sha256}.
 func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
-		writeRetryable(w, retryAfterStarting, `{"error":"starting"}`)
+		writeRetryable(w, retryAfterStarting, "starting", "Starting.")
 		return
 	}
 	sha := r.PathValue("sha256")
 	if !validSHA256(sha) {
-		http.Error(w, `{"error":"invalid sha256"}`, http.StatusBadRequest)
+		v1Error(w, http.StatusBadRequest, "invalid_sha256", "Invalid sha256.")
 		return
 	}
 	setDownloadDeadline(w) // bound stalled-client writes for both member and top-level serves
 
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
+	if s.results != nil {
+		s.serveFileFromStore(ctx, w, r, sha)
+		return
+	}
 
 	sample, err := s.db.SampleBySHA256(ctx, sha)
 	if err != nil {
 		if errors.Is(err, hopper.ErrNotFound) {
-			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			v1Error(w, http.StatusNotFound, "not_found", "Not found.")
 		} else {
 			slog.ErrorContext(r.Context(), "file: sample lookup failed",
 				"sha256", sha, "error", err, "remote", r.RemoteAddr)
-			http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+			v1Error(w, http.StatusInternalServerError, "internal", "Internal.")
 		}
 		return
 	}
@@ -4517,10 +4406,10 @@ func (s *apiServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.markServeMissing(ctx, sample, err)
 		if errors.Is(err, errSamplePathRejected) || errors.Is(err, errSampleNotRegular) {
-			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			v1Error(w, http.StatusNotFound, "not_found", "Not found.")
 			return
 		}
-		writeMissingSampleFile(w, err, `{"error":"sample file gone"}`)
+		writeMissingSampleFile(w, err, "file_gone", "The file is no longer on disk.")
 		return
 	}
 	defer f.Close() //nolint:errcheck // best-effort close
@@ -4535,42 +4424,46 @@ var (
 	errSampleNotRegular   = errors.New("sample path is not a regular file")
 )
 
+// openSamplePath opens a stored path under the data root, refusing one that
+// resolves outside the allowed pools or is not a regular file.
+func (s *apiServer) openSamplePath(storedPath string) (*os.File, os.FileInfo, error) {
+	diskPath := sampleDiskPath(s.dataRoot, filepath.FromSlash(storedPath))
+	resolved, err := filepath.EvalSymlinks(diskPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	allowed := false
+	for _, dir := range s.allowedDirs {
+		if strings.HasPrefix(resolved, dir+string(filepath.Separator)) || resolved == dir {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return nil, nil, fmt.Errorf("%w: %s", errSamplePathRejected, resolved)
+	}
+	f, err := os.Open(resolved)
+	if err != nil {
+		return nil, nil, err
+	}
+	stat, err := f.Stat()
+	if err != nil {
+		f.Close() //nolint:errcheck,gosec // abandoning the handle; the stat error is what matters
+		return nil, nil, err
+	}
+	if !stat.Mode().IsRegular() {
+		f.Close() //nolint:errcheck,gosec // abandoning a handle we will not serve from
+		return nil, nil, fmt.Errorf("%w: %s", errSampleNotRegular, resolved)
+	}
+	return f, stat, nil
+}
+
 // openKnownSampleFile opens the canonical path first. Only if that fails does
 // it query the active top-level location ledger and try each distinct path in
 // newest-first order. A successful fallback compare-and-swaps samples.path so
 // later requests return to the one-query fast path.
 func (s *apiServer) openKnownSampleFile(ctx context.Context, sample *hopper.Sample, remote string) (*os.File, os.FileInfo, error) {
-	open := func(storedPath string) (*os.File, os.FileInfo, error) {
-		diskPath := sampleDiskPath(s.dataRoot, filepath.FromSlash(storedPath))
-		resolved, err := filepath.EvalSymlinks(diskPath)
-		if err != nil {
-			return nil, nil, err
-		}
-		allowed := false
-		for _, dir := range s.allowedDirs {
-			if strings.HasPrefix(resolved, dir+string(filepath.Separator)) || resolved == dir {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			return nil, nil, fmt.Errorf("%w: %s", errSamplePathRejected, resolved)
-		}
-		f, err := os.Open(resolved)
-		if err != nil {
-			return nil, nil, err
-		}
-		stat, err := f.Stat()
-		if err != nil {
-			f.Close() //nolint:errcheck,gosec // abandoning the handle; the stat error is what matters
-			return nil, nil, err
-		}
-		if !stat.Mode().IsRegular() {
-			f.Close() //nolint:errcheck,gosec // abandoning a handle we will not serve from
-			return nil, nil, fmt.Errorf("%w: %s", errSampleNotRegular, resolved)
-		}
-		return f, stat, nil
-	}
+	open := s.openSamplePath
 
 	f, stat, primaryErr := open(sample.Path)
 	if primaryErr == nil {
@@ -4682,9 +4575,9 @@ const (
 
 // writeRetryable writes a 503 with a Retry-After header, so the retryable signal
 // carries an explicit backoff, not just the status class.
-func writeRetryable(w http.ResponseWriter, retryAfterSec int, body string) {
+func writeRetryable(w http.ResponseWriter, retryAfterSec int, code, message string) {
 	w.Header().Set("Retry-After", strconv.Itoa(retryAfterSec))
-	http.Error(w, body, http.StatusServiceUnavailable)
+	v1Error(w, http.StatusServiceUnavailable, code, message)
 }
 
 // markServeMissing flips a top-level sample to skip='missing' when a serve
@@ -4692,7 +4585,7 @@ func writeRetryable(w http.ResponseWriter, retryAfterSec int, body string) {
 // skipped rows (promoter's candidate walks, gauntlet's cohorts) stop offering
 // a file no client can download — one wasted fetch total instead of one per
 // client per pass until the next reconcile walk notices the deletion (hours).
-// Mirrors /api/next's claim validation: only ENOENT marks (transient I/O
+// Mirrors /v1/work/next's claim validation: only ENOENT marks (transient I/O
 // errors stay retryable), dataset-incomplete mode never marks (local disk is
 // not authoritative there), and an existing skip is preserved. A vanished
 // dataRoot (unmounted volume) makes every file ENOENT, so marking also
@@ -4728,12 +4621,12 @@ func (s *apiServer) markServeMissing(ctx context.Context, sample *hopper.Sample,
 // ("existed, now gone") is more precise than 404. Anything else — fd exhaustion
 // (EMFILE) under load, a transient mount/I-O blip — is retryable → 503, so a
 // caller does not permanently abandon a file that is merely briefly unreachable.
-func writeMissingSampleFile(w http.ResponseWriter, err error, goneJSON string) {
+func writeMissingSampleFile(w http.ResponseWriter, err error, code, message string) {
 	if errors.Is(err, os.ErrNotExist) {
-		http.Error(w, goneJSON, http.StatusGone)
+		v1Error(w, http.StatusGone, code, message)
 		return
 	}
-	writeRetryable(w, retryAfterTransient, `{"error":"temporarily unavailable"}`)
+	writeRetryable(w, retryAfterTransient, "temporarily_unavailable", "Temporarily unavailable.")
 }
 
 // downloadWriteTimeout bounds a single file-serving response. Generous enough
@@ -4756,7 +4649,7 @@ func setDownloadDeadline(w http.ResponseWriter) {
 // a policy ceiling, not a memory guard. The size check is pre-write against the
 // member's declared size and the copy is LimitReader-bounded, so a large (or
 // lying) member can't blow up RAM. Whole-file serving (/data and top-level
-// /api/file) is uncapped; this only limits extract-from-archive requests.
+// /v1/files) is uncapped; this only limits extract-from-archive requests.
 const archiveMemberMaxBytes = 250 << 20 // 250 MiB
 
 // serveArchiveMember resolves child to its parent on disk, reads the parent,
@@ -4766,12 +4659,12 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 	parent, err := s.db.SampleBySHA256(ctx, child.Parent)
 	if err != nil {
 		if errors.Is(err, hopper.ErrNotFound) {
-			http.Error(w, `{"error":"parent not found"}`, http.StatusNotFound)
+			v1Error(w, http.StatusNotFound, "parent_not_found", "Parent not found.")
 			return
 		}
 		slog.ErrorContext(ctx, "archive-member: parent lookup failed",
 			"sha256", sha, "parent_sha", child.Parent, "error", err, "remote", r.RemoteAddr)
-		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		v1Error(w, http.StatusInternalServerError, "internal", "Internal.")
 		return
 	}
 	innerPath := hopper.PathInsideArchive(child.Path)
@@ -4785,7 +4678,7 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 
 		slog.Warn("archive-member unservable: child path has no archive delimiter",
 			"sha256", sha, "parent_sha", child.Parent, "child_path", child.Path)
-		http.Error(w, `{"error":"child has no archive-relative path"}`, http.StatusUnprocessableEntity)
+		v1Error(w, http.StatusUnprocessableEntity, "no_member_path", "Child has no archive-relative path.")
 		return
 	}
 
@@ -4793,18 +4686,25 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 	if err != nil {
 		s.markServeMissing(ctx, parent, err)
 		if errors.Is(err, errSamplePathRejected) {
-			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			v1Error(w, http.StatusNotFound, "not_found", "Not found.")
 			return
 		}
 		if errors.Is(err, errSampleNotRegular) {
-			http.Error(w, `{"error":"parent not a file"}`, http.StatusUnprocessableEntity)
+			v1Error(w, http.StatusUnprocessableEntity, "parent_not_a_file", "Parent not a file.")
 			return
 		}
-		writeMissingSampleFile(w, err, `{"error":"parent file gone"}`)
+		writeMissingSampleFile(w, err, "parent_gone", "The archive holding the file is no longer on disk.")
 		return
 	}
 	defer f.Close() //nolint:errcheck // best-effort close
+	s.streamOpenedMember(ctx, w, r, f, stat, parent, innerPath, sha)
+}
 
+// streamOpenedMember serves the member at innerPath of the open archive f,
+// whose sample is parent.
+func (s *apiServer) streamOpenedMember(ctx context.Context, w http.ResponseWriter, r *http.Request,
+	f *os.File, stat os.FileInfo, parent *hopper.Sample, innerPath, sha string,
+) {
 	// Presence probe: everything a HEAD can truthfully answer is already
 	// settled — the member row exists, its path carries an archive delimiter,
 	// and the parent's bytes are on disk and readable. Extracting to serve a
@@ -4844,12 +4744,12 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 			recordLoadShed(ctx, "extract")
 			slog.WarnContext(ctx, "extract shed: slots saturated (cache build)",
 				"sha256", sha, "parent_sha", parent.SHA256, "remote", r.RemoteAddr)
-			writeRetryable(w, retryAfterBusy, `{"error":"busy: extraction slots exhausted"}`)
+			writeRetryable(w, retryAfterBusy, "busy_extraction_slots_exhausted", "Busy: extraction slots exhausted.")
 			return
 		case errors.Is(cerr, context.Canceled), errors.Is(cerr, context.DeadlineExceeded):
 			// Client gave up or the request deadline fired mid-build; nothing
 			// useful to send, but answer retryable in case the socket is alive.
-			writeRetryable(w, retryAfterBusy, `{"error":"busy: extraction slots exhausted"}`)
+			writeRetryable(w, retryAfterBusy, "busy_extraction_slots_exhausted", "Busy: extraction slots exhausted.")
 			return
 		default:
 			// The one-time decompression failed: a corrupt or unsupported codec
@@ -4870,7 +4770,7 @@ func (s *apiServer) serveArchiveMember(ctx context.Context, w http.ResponseWrite
 			slog.WarnContext(ctx, "extract shed: slots saturated",
 				"sha256", sha, "parent_sha", parent.SHA256, "remote", r.RemoteAddr)
 		}
-		writeRetryable(w, retryAfterBusy, `{"error":"busy: extraction slots exhausted"}`)
+		writeRetryable(w, retryAfterBusy, "busy_extraction_slots_exhausted", "Busy: extraction slots exhausted.")
 		return
 	}
 	if waited := time.Since(waitStart); waited > slotWaitLogThreshold {
@@ -4903,15 +4803,15 @@ func streamMember(ctx context.Context, w http.ResponseWriter, src io.ReaderAt, s
 func writeExtractError(ctx context.Context, w http.ResponseWriter, err error, innerPath, sha string, parent *hopper.Sample) {
 	switch {
 	case errors.Is(err, hopper.ErrArchiveMemberNotFound):
-		http.Error(w, `{"error":"not found in archive"}`, http.StatusNotFound)
+		v1Error(w, http.StatusNotFound, "not_found_in_archive", "Not found in archive.")
 	case errors.Is(err, hopper.ErrArchiveMemberTooLarge):
 
 		slog.Info("archive-member over size cap",
 			"sha256", sha, "parent_sha", parent.SHA256, "parent_type", parent.FileType,
 			"inner_path", innerPath, "cap_bytes", archiveMemberMaxBytes)
-		http.Error(w, `{"error":"file too large"}`, http.StatusRequestEntityTooLarge)
+		v1Error(w, http.StatusRequestEntityTooLarge, "file_too_large", "File too large.")
 	case errors.Is(err, hopper.ErrArchiveEncrypted):
-		http.Error(w, `{"error":"encrypted archive: could not decrypt with known passwords"}`, http.StatusUnprocessableEntity)
+		v1Error(w, http.StatusUnprocessableEntity, "encrypted_archive", "Encrypted archive: could not decrypt with known passwords.")
 	case errors.Is(err, hopper.ErrUnsupportedArchive):
 		// Log the container type so the coverage gap is visible: which
 		// parent/nested archive formats workers want but hopper can't serve.
@@ -4919,7 +4819,7 @@ func writeExtractError(ctx context.Context, w http.ResponseWriter, err error, in
 		slog.Info("archive-member unsupported container",
 			"sha256", sha, "parent_sha", parent.SHA256, "parent_type", parent.FileType,
 			"inner_path", innerPath, "error", err)
-		http.Error(w, `{"error":"unsupported archive type"}`, http.StatusUnsupportedMediaType)
+		v1Error(w, http.StatusUnsupportedMediaType, "unsupported_archive_type", "Unsupported archive type.")
 	case isClientGone(ctx, err):
 		// The client closed the connection mid-stream (broken pipe / reset) or its
 		// request context expired. Not a server fault, and bytes may already be on
@@ -4932,7 +4832,7 @@ func writeExtractError(ctx context.Context, w http.ResponseWriter, err error, in
 
 		slog.Info("archive-member extraction: corrupt archive",
 			"sha256", sha, "parent_sha", parent.SHA256, "error", err)
-		http.Error(w, `{"error":"corrupt archive"}`, http.StatusUnprocessableEntity)
+		v1Error(w, http.StatusUnprocessableEntity, "corrupt_archive", "Corrupt archive.")
 	default:
 		// The parent is open and readable (checked above), so a remaining
 		// extraction failure is a property of the archive data — a corrupt codec
@@ -4946,7 +4846,7 @@ func writeExtractError(ctx context.Context, w http.ResponseWriter, err error, in
 			"sha256", sha, "parent_sha", parent.SHA256, "error", err)
 		// Headers may already be sent if the failure was mid-stream; in that case
 		// http.Error's WriteHeader is a no-op and only logs.
-		http.Error(w, `{"error":"extraction failed"}`, http.StatusUnprocessableEntity)
+		v1Error(w, http.StatusUnprocessableEntity, "extraction_failed", "Extraction failed.")
 	}
 }
 
@@ -4973,78 +4873,6 @@ func stripDataRoot(dbPath, prefix string) string {
 			return rel
 		}
 	}
-	// Return as-is; the /api/file/{sha256} download fallback can still serve it.
+	// Return as-is; the /v1/files/{sha256} download fallback can still serve it.
 	return dbPath
-}
-
-// safeFileServer returns an HTTP handler that serves files from dataRoot
-// by relative path (e.g. GET /data/bad/sample.bin). This avoids the DB
-// lookup that /api/file/{sha256} requires — workers already know the
-// relative path from /api/next.
-//
-// Symlinks are resolved and the final path is checked against allowedDirs,
-// matching the security model of handleFile.
-func (s *apiServer) safeFileServer() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		setDownloadDeadline(w) // bound stalled-client writes on /data/ downloads
-		relPath := strings.TrimPrefix(r.URL.Path, "/data/")
-		if relPath == "" || relPath[0] == '/' {
-			http.NotFound(w, r)
-			return
-		}
-		// Clean the path and reject anything that escapes the root.
-		cleaned := filepath.Clean(filepath.FromSlash(relPath))
-		if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
-			http.NotFound(w, r)
-			return
-		}
-
-		absPath := filepath.Join(s.dataRoot, cleaned)
-		resolved, err := filepath.EvalSymlinks(absPath)
-		if err != nil {
-			http.NotFound(w, r)
-			return
-		}
-
-		allowed := false
-		for _, dir := range s.allowedDirs {
-			if strings.HasPrefix(resolved, dir+string(filepath.Separator)) || resolved == dir {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			slog.Warn("data request blocked: path outside allowed directories",
-				"rel", relPath, "resolved", resolved)
-			http.NotFound(w, r)
-			return
-		}
-
-		f, err := os.Open(resolved) //nolint:gosec // resolved symlinks and checked containment in allowedDirs above.
-		if err != nil {
-			// /data makes no DB existence claim, so a vanished file is just 404.
-			// A non-ENOENT failure (fd exhaustion under load, transient I/O) is
-			// retryable (503) — don't tell a caller a present file is gone.
-			if errors.Is(err, os.ErrNotExist) {
-				http.NotFound(w, r)
-			} else {
-				writeRetryable(w, retryAfterTransient, "temporarily unavailable")
-			}
-			return
-		}
-		defer f.Close() //nolint:errcheck // best-effort close
-		stat, err := f.Stat()
-		if err != nil {
-			writeRetryable(w, retryAfterTransient, "temporarily unavailable")
-			return
-		}
-		if stat.IsDir() {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/octet-stream")
-		// Content-addressed by sha256 (the path embeds the hash), so cache forever.
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-		http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
-	})
 }

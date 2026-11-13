@@ -1,0 +1,1514 @@
+{
+  "scope": "Local observation-writer prototype; not integrated into production and not a deployment or migration plan.",
+  "hardware": "Apple M4 Max, darwin/arm64",
+  "postgres": {
+    "version": "18.6 (Homebrew)",
+    "shared_buffers_bytes": 134217728,
+    "fsync": "on",
+    "synchronous_commit": "on",
+    "full_page_writes": "on",
+    "wal_compression": "off"
+  },
+  "input": {
+    "cohort": "TypeScript",
+    "export_script": "scripts/storage-prototype-fetch.sql",
+    "local_csv": "/tmp/hopper-schema-prototype/typescript.csv",
+    "csv_sha256": "1170df0bbdb0ca3197353a63d95fcbbf6f0d4b3f113bfcc6a910b55a3fd33676",
+    "rows_per_batch": 1000,
+    "selection": "First 1000 exported rows; modified deterministically per scenario by storageBatch."
+  },
+  "method": {
+    "iterations_per_trial": 20,
+    "trials_per_case": 3,
+    "parallel_repeat_workers": 4,
+    "cache": "Warm OS cache; fresh schema per case; explicit CHECKPOINT before timing. No cold-cache or long-running saturation measurement.",
+    "baseline": "Actual Hopper locationsFromStagingPG; text SHA identity table and seven location indexes.",
+    "compact": "Binary SHA identity table; bigint references; shared relative paths and parent placements; seven location indexes.",
+    "included": "COPY staging, identity resolution, dictionary resolution, location writes and commit. Storage includes used tables, their indexes and TOAST.",
+    "excluded": "Analysis JSON, labels, queues, their indexes, input construction and schema creation. Identity-only samples tables on both sides.",
+    "wal": "Cluster-wide WAL insert LSN difference; no other experiment intentionally running. Includes temp-table catalog churn and checkpoint effects.",
+    "locks": "pg_stat_activity Lock wait samples every 10ms, not measured wait durations; zero samples does not prove absence of waits.",
+    "summary": "Median of each metric over three trials; metrics printed by Go benchmark are rounded. For parallel_repeat ns/op is aggregate elapsed/batch, not individual batch latency."
+  },
+  "scenarios": {
+    "new": "New sample and parent identities, new archive prefixes and new relative paths every batch.",
+    "shared_paths": "Seed once, then new sample and parent identities and archive prefixes with the same relative paths.",
+    "repeat": "Seed once, then submit the exact same observations.",
+    "relocated_archive": "Seed once, then retain sample/parent identities and relative paths but use a new archive prefix each batch.",
+    "parallel_repeat": "Seed once, then four concurrent workers submit identical batches."
+  },
+  "design_notes": [
+    "Relative strings are stored once, indexed by a 32-byte digest; exact string equality is checked before commit. Filename defaults to the locator, with an override only when different.",
+    "The writer preserves legacy uniqueness on (sample, full path), including when a later observation claims a different parent. This requires a full_path_key in the compact row and unique index.",
+    "The earlier storage-only prototype used a different uniqueness layout. These measurements also include identities and incrementally maintained indexes; do not directly compare their bytes/location values.",
+    "Repeat fast path verifies the full reconstructed path and metadata and skips dictionary writes and location upserts. No last_seen heartbeat update is performed, matching the current writer.",
+    "Anonymous embedded byte offsets and decoder suffixes remain verbatim. Splitting only occurs at the last !! with a known parent SHA; unresolved and decoded-only paths remain inline.",
+    "Parent placements still store full prefixes. This is not recursive normalization of nested ancestors or every string in Hopper.",
+    "No dictionary cache, garbage collection, migration/backfill, or production reader integration is included."
+  ],
+  "limits": [
+    "A small warm-cache observation-layer benchmark cannot establish billion-row production throughput or total Hopper database size.",
+    "On the small fresh-table test, compact insert latency remains 3-16% higher despite less storage and WAL. Larger-table diagnostics favored compact, but plan sensitivity precludes a general throughput claim.",
+    "Repeated observations avoid persistent row changes and row locks but still generate WAL from transaction/temp-table catalog work; this is not zero-write ingestion.",
+    "Repeat storage measurements use only the 1000-row seed, so fixed relation overhead is prominent.",
+    "Short lock sampling is not a contention stress test; regression tests separately hold existing rows locked while repeating observations.",
+    "Unchanged observations are deduplicated, not retained as an append-only observation history.",
+    "Overlapping conflicting batches with different metadata have not been exhaustively stress-tested; production retry policy remains out of scope."
+  ],
+  "reproduce": {
+    "database": "Create a disposable local Unix-socket database named hopper_schema_prototype; benchmark user needs schema creation and CHECKPOINT privileges.",
+    "environment": [
+      "HOPPER_STORAGE_DSN=<local Unix-socket DSN>",
+      "HOPPER_STORAGE_CSV=<complete cohort CSV>"
+    ],
+    "benchmark": "go test . -run '^$' -bench '^BenchmarkStorageWriter$' -benchtime=20x -count=3",
+    "tests": "go test ./internal/storageproto -count=1",
+    "race": "go test -race ./internal/storageproto -count=3",
+    "full_suite": "Set HOPPER_TEST_PG_DSN to local postgres database as well, then go test ./...",
+    "preload": "Set HOPPER_STORAGE_PRELOAD_BATCHES=100 to load 100,000 unrelated observations and ANALYZE each layout before benchmarking; setup excluded from timing."
+  },
+  "median_results": {
+    "new": {
+      "legacy": {
+        "iterations": 20,
+        "ns/op": 25771633.0,
+        "WAL-B/obs": 1793.0,
+        "lock-polls": 51.0,
+        "lock-wait-samples": 0.0,
+        "obs/s": 38802.0,
+        "p50-ms/batch": 26.76,
+        "p95-ms/batch": 34.25,
+        "stored-B/location": 1118.0
+      },
+      "compact": {
+        "iterations": 20,
+        "ns/op": 29784458.0,
+        "WAL-B/obs": 1225.0,
+        "lock-polls": 59.0,
+        "lock-wait-samples": 0.0,
+        "obs/s": 33575.0,
+        "p50-ms/batch": 29.76,
+        "p95-ms/batch": 31.09,
+        "stored-B/location": 568.1
+      },
+      "compact_vs_legacy_percent": {
+        "throughput_change": -13.5,
+        "wal_reduction": 31.7,
+        "storage_reduction": 49.2,
+        "mean_elapsed_time_change": 15.6
+      }
+    },
+    "shared_paths": {
+      "legacy": {
+        "iterations": 20,
+        "ns/op": 26138498.0,
+        "WAL-B/obs": 1842.0,
+        "lock-polls": 52.0,
+        "lock-wait-samples": 0.0,
+        "obs/s": 38258.0,
+        "p50-ms/batch": 26.96,
+        "p95-ms/batch": 34.75,
+        "stored-B/location": 1120.0
+      },
+      "compact": {
+        "iterations": 20,
+        "ns/op": 26858896.0,
+        "WAL-B/obs": 1021.0,
+        "lock-polls": 53.0,
+        "lock-wait-samples": 0.0,
+        "obs/s": 37232.0,
+        "p50-ms/batch": 26.88,
+        "p95-ms/batch": 28.7,
+        "stored-B/location": 463.4
+      },
+      "compact_vs_legacy_percent": {
+        "throughput_change": -2.7,
+        "wal_reduction": 44.6,
+        "storage_reduction": 58.6,
+        "mean_elapsed_time_change": 2.8
+      }
+    },
+    "repeat": {
+      "legacy": {
+        "iterations": 20,
+        "ns/op": 7007788.0,
+        "WAL-B/obs": 47.77,
+        "lock-polls": 14.0,
+        "lock-wait-samples": 0.0,
+        "obs/s": 142698.0,
+        "p50-ms/batch": 6.751,
+        "p95-ms/batch": 7.572,
+        "stored-B/location": 1155.0
+      },
+      "compact": {
+        "iterations": 20,
+        "ns/op": 6108302.0,
+        "WAL-B/obs": 38.88,
+        "lock-polls": 12.0,
+        "lock-wait-samples": 0.0,
+        "obs/s": 163712.0,
+        "p50-ms/batch": 5.897,
+        "p95-ms/batch": 6.504,
+        "stored-B/location": 860.2
+      },
+      "compact_vs_legacy_percent": {
+        "throughput_change": 14.7,
+        "wal_reduction": 18.6,
+        "storage_reduction": 25.5,
+        "mean_elapsed_time_change": -12.8
+      }
+    },
+    "relocated_archive": {
+      "legacy": {
+        "iterations": 20,
+        "ns/op": 23555190.0,
+        "WAL-B/obs": 1477.0,
+        "lock-polls": 47.0,
+        "lock-wait-samples": 0.0,
+        "obs/s": 42453.0,
+        "p50-ms/batch": 23.95,
+        "p95-ms/batch": 31.41,
+        "stored-B/location": 860.9
+      },
+      "compact": {
+        "iterations": 20,
+        "ns/op": 25411892.0,
+        "WAL-B/obs": 826.8,
+        "lock-polls": 50.0,
+        "lock-wait-samples": 0.0,
+        "obs/s": 39352.0,
+        "p50-ms/batch": 25.36,
+        "p95-ms/batch": 27.12,
+        "stored-B/location": 362.8
+      },
+      "compact_vs_legacy_percent": {
+        "throughput_change": -7.3,
+        "wal_reduction": 44.0,
+        "storage_reduction": 57.9,
+        "mean_elapsed_time_change": 7.9
+      }
+    },
+    "parallel_repeat": {
+      "legacy": {
+        "iterations": 20,
+        "ns/op": 2337352.0,
+        "WAL-B/obs": 48.84,
+        "lock-polls": 4.0,
+        "lock-wait-samples": 0.0,
+        "obs/s": 427835.0,
+        "p50-ms/batch": 8.568,
+        "p95-ms/batch": 12.54,
+        "stored-B/location": 1155.0
+      },
+      "compact": {
+        "iterations": 20,
+        "ns/op": 2239498.0,
+        "WAL-B/obs": 41.46,
+        "lock-polls": 4.0,
+        "lock-wait-samples": 0.0,
+        "obs/s": 446529.0,
+        "p50-ms/batch": 8.134,
+        "p95-ms/batch": 12.23,
+        "stored-B/location": 860.2
+      },
+      "compact_vs_legacy_percent": {
+        "throughput_change": 4.4,
+        "wal_reduction": 15.1,
+        "storage_reduction": 25.5,
+        "mean_elapsed_time_change": -4.2
+      }
+    }
+  },
+  "raw_trials": {
+    "new": {
+      "legacy": [
+        {
+          "iterations": 20,
+          "ns/op": 25771633.0,
+          "WAL-B/obs": 1793.0,
+          "lock-polls": 51.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 38802.0,
+          "p50-ms/batch": 26.76,
+          "p95-ms/batch": 34.27,
+          "stored-B/location": 1118.0
+        },
+        {
+          "iterations": 20,
+          "ns/op": 25718065.0,
+          "WAL-B/obs": 1789.0,
+          "lock-polls": 51.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 38883.0,
+          "p50-ms/batch": 27.11,
+          "p95-ms/batch": 33.96,
+          "stored-B/location": 1118.0
+        },
+        {
+          "iterations": 20,
+          "ns/op": 25855873.0,
+          "WAL-B/obs": 1794.0,
+          "lock-polls": 51.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 38676.0,
+          "p50-ms/batch": 26.55,
+          "p95-ms/batch": 34.25,
+          "stored-B/location": 1118.0
+        }
+      ],
+      "compact": [
+        {
+          "iterations": 20,
+          "ns/op": 30252756.0,
+          "WAL-B/obs": 1228.0,
+          "lock-polls": 60.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 33055.0,
+          "p50-ms/batch": 30.28,
+          "p95-ms/batch": 32.14,
+          "stored-B/location": 568.1
+        },
+        {
+          "iterations": 20,
+          "ns/op": 29784458.0,
+          "WAL-B/obs": 1224.0,
+          "lock-polls": 59.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 33575.0,
+          "p50-ms/batch": 29.76,
+          "p95-ms/batch": 31.09,
+          "stored-B/location": 568.1
+        },
+        {
+          "iterations": 20,
+          "ns/op": 29518794.0,
+          "WAL-B/obs": 1225.0,
+          "lock-polls": 59.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 33877.0,
+          "p50-ms/batch": 29.59,
+          "p95-ms/batch": 30.95,
+          "stored-B/location": 568.1
+        }
+      ]
+    },
+    "shared_paths": {
+      "legacy": [
+        {
+          "iterations": 20,
+          "ns/op": 26166500.0,
+          "WAL-B/obs": 1842.0,
+          "lock-polls": 52.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 38217.0,
+          "p50-ms/batch": 27.24,
+          "p95-ms/batch": 34.18,
+          "stored-B/location": 1120.0
+        },
+        {
+          "iterations": 20,
+          "ns/op": 26138498.0,
+          "WAL-B/obs": 1844.0,
+          "lock-polls": 52.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 38258.0,
+          "p50-ms/batch": 26.96,
+          "p95-ms/batch": 34.75,
+          "stored-B/location": 1120.0
+        },
+        {
+          "iterations": 20,
+          "ns/op": 26074062.0,
+          "WAL-B/obs": 1842.0,
+          "lock-polls": 52.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 38352.0,
+          "p50-ms/batch": 26.24,
+          "p95-ms/batch": 35.24,
+          "stored-B/location": 1120.0
+        }
+      ],
+      "compact": [
+        {
+          "iterations": 20,
+          "ns/op": 26794835.0,
+          "WAL-B/obs": 1023.0,
+          "lock-polls": 53.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 37321.0,
+          "p50-ms/batch": 26.88,
+          "p95-ms/batch": 28.7,
+          "stored-B/location": 463.4
+        },
+        {
+          "iterations": 20,
+          "ns/op": 27334110.0,
+          "WAL-B/obs": 1021.0,
+          "lock-polls": 54.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 36584.0,
+          "p50-ms/batch": 27.99,
+          "p95-ms/batch": 30.56,
+          "stored-B/location": 463.4
+        },
+        {
+          "iterations": 20,
+          "ns/op": 26858896.0,
+          "WAL-B/obs": 1021.0,
+          "lock-polls": 53.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 37232.0,
+          "p50-ms/batch": 26.56,
+          "p95-ms/batch": 28.52,
+          "stored-B/location": 463.4
+        }
+      ]
+    },
+    "repeat": {
+      "legacy": [
+        {
+          "iterations": 20,
+          "ns/op": 7007788.0,
+          "WAL-B/obs": 47.17,
+          "lock-polls": 14.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 142698.0,
+          "p50-ms/batch": 6.73,
+          "p95-ms/batch": 7.572,
+          "stored-B/location": 1155.0
+        },
+        {
+          "iterations": 20,
+          "ns/op": 6992160.0,
+          "WAL-B/obs": 47.77,
+          "lock-polls": 13.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 143017.0,
+          "p50-ms/batch": 6.751,
+          "p95-ms/batch": 7.307,
+          "stored-B/location": 1155.0
+        },
+        {
+          "iterations": 20,
+          "ns/op": 7064819.0,
+          "WAL-B/obs": 48.86,
+          "lock-polls": 14.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 141546.0,
+          "p50-ms/batch": 6.902,
+          "p95-ms/batch": 7.756,
+          "stored-B/location": 1155.0
+        }
+      ],
+      "compact": [
+        {
+          "iterations": 20,
+          "ns/op": 6048848.0,
+          "WAL-B/obs": 38.59,
+          "lock-polls": 12.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 165321.0,
+          "p50-ms/batch": 5.897,
+          "p95-ms/batch": 6.2,
+          "stored-B/location": 860.2
+        },
+        {
+          "iterations": 20,
+          "ns/op": 6108302.0,
+          "WAL-B/obs": 38.92,
+          "lock-polls": 12.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 163712.0,
+          "p50-ms/batch": 5.877,
+          "p95-ms/batch": 6.607,
+          "stored-B/location": 860.2
+        },
+        {
+          "iterations": 20,
+          "ns/op": 6244971.0,
+          "WAL-B/obs": 38.88,
+          "lock-polls": 12.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 160129.0,
+          "p50-ms/batch": 6.097,
+          "p95-ms/batch": 6.504,
+          "stored-B/location": 860.2
+        }
+      ]
+    },
+    "relocated_archive": {
+      "legacy": [
+        {
+          "iterations": 20,
+          "ns/op": 23555190.0,
+          "WAL-B/obs": 1479.0,
+          "lock-polls": 47.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 42453.0,
+          "p50-ms/batch": 23.95,
+          "p95-ms/batch": 31.6,
+          "stored-B/location": 860.9
+        },
+        {
+          "iterations": 20,
+          "ns/op": 23862912.0,
+          "WAL-B/obs": 1476.0,
+          "lock-polls": 47.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 41906.0,
+          "p50-ms/batch": 24.14,
+          "p95-ms/batch": 30.84,
+          "stored-B/location": 860.9
+        },
+        {
+          "iterations": 20,
+          "ns/op": 23494169.0,
+          "WAL-B/obs": 1477.0,
+          "lock-polls": 46.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 42564.0,
+          "p50-ms/batch": 23.34,
+          "p95-ms/batch": 31.41,
+          "stored-B/location": 860.9
+        }
+      ],
+      "compact": [
+        {
+          "iterations": 20,
+          "ns/op": 25268621.0,
+          "WAL-B/obs": 827.2,
+          "lock-polls": 50.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 39575.0,
+          "p50-ms/batch": 25.22,
+          "p95-ms/batch": 27.12,
+          "stored-B/location": 362.8
+        },
+        {
+          "iterations": 20,
+          "ns/op": 25411892.0,
+          "WAL-B/obs": 826.8,
+          "lock-polls": 50.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 39352.0,
+          "p50-ms/batch": 25.36,
+          "p95-ms/batch": 27.18,
+          "stored-B/location": 362.8
+        },
+        {
+          "iterations": 20,
+          "ns/op": 25481121.0,
+          "WAL-B/obs": 825.9,
+          "lock-polls": 50.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 39245.0,
+          "p50-ms/batch": 25.51,
+          "p95-ms/batch": 26.7,
+          "stored-B/location": 362.8
+        }
+      ]
+    },
+    "parallel_repeat": {
+      "legacy": [
+        {
+          "iterations": 20,
+          "ns/op": 2751719.0,
+          "WAL-B/obs": 48.84,
+          "lock-polls": 5.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 363409.0,
+          "p50-ms/batch": 8.35,
+          "p95-ms/batch": 17.9,
+          "stored-B/location": 1155.0
+        },
+        {
+          "iterations": 20,
+          "ns/op": 2337352.0,
+          "WAL-B/obs": 54.5,
+          "lock-polls": 4.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 427835.0,
+          "p50-ms/batch": 8.568,
+          "p95-ms/batch": 12.54,
+          "stored-B/location": 1155.0
+        },
+        {
+          "iterations": 20,
+          "ns/op": 2322612.0,
+          "WAL-B/obs": 47.82,
+          "lock-polls": 4.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 430550.0,
+          "p50-ms/batch": 8.629,
+          "p95-ms/batch": 12.25,
+          "stored-B/location": 1155.0
+        }
+      ],
+      "compact": [
+        {
+          "iterations": 20,
+          "ns/op": 2240906.0,
+          "WAL-B/obs": 41.91,
+          "lock-polls": 4.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 446248.0,
+          "p50-ms/batch": 8.279,
+          "p95-ms/batch": 12.25,
+          "stored-B/location": 860.2
+        },
+        {
+          "iterations": 20,
+          "ns/op": 2123856.0,
+          "WAL-B/obs": 37.55,
+          "lock-polls": 4.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 470842.0,
+          "p50-ms/batch": 7.644,
+          "p95-ms/batch": 12.1,
+          "stored-B/location": 860.2
+        },
+        {
+          "iterations": 20,
+          "ns/op": 2239498.0,
+          "WAL-B/obs": 41.46,
+          "lock-polls": 4.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 446529.0,
+          "p50-ms/batch": 8.134,
+          "p95-ms/batch": 12.23,
+          "stored-B/location": 860.2
+        }
+      ]
+    }
+  },
+  "validation": {
+    "full_suite": "Passed after final query changes with HOPPER_STORAGE_DSN and HOPPER_TEST_PG_DSN set.",
+    "regressions": [
+      "Locator and metadata round-trip",
+      "No xmin/ctid changes for repeated observations",
+      "Existing parent association retained for identical full path",
+      "Entire transaction rolled back on forced digest collision",
+      "Concurrent dictionary and full-path collision handling",
+      "Repeated observations succeed with stored rows locked elsewhere",
+      "Mixed new/changed/unchanged batch skips locked unchanged rows",
+      "Relative paths longer than a B-tree text key",
+      "Digest collisions entirely within one batch",
+      "Colliding parent claim in duplicate observation checked before deduplication",
+      "Unchanged and enriched duplicate observations preserve enrichment in either input order"
+    ],
+    "lint": "No findings in prototype files. Repository-wide lint reports 40 issues in existing gauntlet and related code.",
+    "race_detector": "Passed all prototype tests under -race, three repetitions after final query changes."
+  },
+  "previous_writer": {
+    "description": "Before indexed dictionary resolution and combined validation. Same hardware and settings, separate session; absolute timings are not controlled between sessions. Compare each compact/legacy pair within its run.",
+    "median_results": {
+      "new": {
+        "legacy": {
+          "iterations": 20,
+          "ns/op": 35868921.0,
+          "WAL-B/obs": 1791.0,
+          "lock-polls": 71.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 27879.0,
+          "p50-ms/batch": 36.42,
+          "p95-ms/batch": 47.97,
+          "stored-B/location": 1118.0
+        },
+        "compact": {
+          "iterations": 20,
+          "ns/op": 65650648.0,
+          "WAL-B/obs": 1226.0,
+          "lock-polls": 131.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 15232.0,
+          "p50-ms/batch": 65.98,
+          "p95-ms/batch": 84.71,
+          "stored-B/location": 568.1
+        },
+        "compact_vs_legacy_percent": {
+          "throughput_change": -45.4,
+          "wal_reduction": 31.5,
+          "storage_reduction": 49.2,
+          "mean_elapsed_time_change": 83.0
+        }
+      },
+      "shared_paths": {
+        "legacy": {
+          "iterations": 20,
+          "ns/op": 37029540.0,
+          "WAL-B/obs": 1846.0,
+          "lock-polls": 74.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 27005.0,
+          "p50-ms/batch": 38.4,
+          "p95-ms/batch": 48.44,
+          "stored-B/location": 1120.0
+        },
+        "compact": {
+          "iterations": 20,
+          "ns/op": 45654960.0,
+          "WAL-B/obs": 1023.0,
+          "lock-polls": 91.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 21903.0,
+          "p50-ms/batch": 45.69,
+          "p95-ms/batch": 48.99,
+          "stored-B/location": 463.4
+        },
+        "compact_vs_legacy_percent": {
+          "throughput_change": -18.9,
+          "wal_reduction": 44.6,
+          "storage_reduction": 58.6,
+          "mean_elapsed_time_change": 23.3
+        }
+      },
+      "repeat": {
+        "legacy": {
+          "iterations": 20,
+          "ns/op": 10009952.0,
+          "WAL-B/obs": 48.88,
+          "lock-polls": 20.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 99901.0,
+          "p50-ms/batch": 9.763,
+          "p95-ms/batch": 10.27,
+          "stored-B/location": 1155.0
+        },
+        "compact": {
+          "iterations": 20,
+          "ns/op": 8629335.0,
+          "WAL-B/obs": 38.34,
+          "lock-polls": 17.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 115884.0,
+          "p50-ms/batch": 8.423,
+          "p95-ms/batch": 8.762,
+          "stored-B/location": 860.2
+        },
+        "compact_vs_legacy_percent": {
+          "throughput_change": 16.0,
+          "wal_reduction": 21.6,
+          "storage_reduction": 25.5,
+          "mean_elapsed_time_change": -13.8
+        }
+      },
+      "relocated_archive": {
+        "legacy": {
+          "iterations": 20,
+          "ns/op": 33385081.0,
+          "WAL-B/obs": 1477.0,
+          "lock-polls": 66.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 29953.0,
+          "p50-ms/batch": 33.6,
+          "p95-ms/batch": 44.26,
+          "stored-B/location": 860.9
+        },
+        "compact": {
+          "iterations": 20,
+          "ns/op": 41998856.0,
+          "WAL-B/obs": 827.2,
+          "lock-polls": 83.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 23810.0,
+          "p50-ms/batch": 42.07,
+          "p95-ms/batch": 44.02,
+          "stored-B/location": 362.8
+        },
+        "compact_vs_legacy_percent": {
+          "throughput_change": -20.5,
+          "wal_reduction": 44.0,
+          "storage_reduction": 57.9,
+          "mean_elapsed_time_change": 25.8
+        }
+      },
+      "parallel_repeat": {
+        "legacy": {
+          "iterations": 20,
+          "ns/op": 3143410.0,
+          "WAL-B/obs": 50.43,
+          "lock-polls": 6.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 318126.0,
+          "p50-ms/batch": 11.32,
+          "p95-ms/batch": 17.19,
+          "stored-B/location": 1155.0
+        },
+        "compact": {
+          "iterations": 20,
+          "ns/op": 2926990.0,
+          "WAL-B/obs": 39.11,
+          "lock-polls": 5.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 341648.0,
+          "p50-ms/batch": 10.61,
+          "p95-ms/batch": 17.26,
+          "stored-B/location": 860.2
+        },
+        "compact_vs_legacy_percent": {
+          "throughput_change": 7.4,
+          "wal_reduction": 22.4,
+          "storage_reduction": 25.5,
+          "mean_elapsed_time_change": -6.9
+        }
+      }
+    },
+    "raw_trials": {
+      "new": {
+        "legacy": [
+          {
+            "iterations": 20,
+            "ns/op": 35868921.0,
+            "WAL-B/obs": 1791.0,
+            "lock-polls": 71.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 27879.0,
+            "p50-ms/batch": 36.42,
+            "p95-ms/batch": 47.61,
+            "stored-B/location": 1118.0
+          },
+          {
+            "iterations": 20,
+            "ns/op": 36147242.0,
+            "WAL-B/obs": 1789.0,
+            "lock-polls": 72.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 27665.0,
+            "p50-ms/batch": 36.72,
+            "p95-ms/batch": 47.97,
+            "stored-B/location": 1118.0
+          },
+          {
+            "iterations": 20,
+            "ns/op": 35811923.0,
+            "WAL-B/obs": 1791.0,
+            "lock-polls": 71.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 27924.0,
+            "p50-ms/batch": 35.93,
+            "p95-ms/batch": 48.65,
+            "stored-B/location": 1118.0
+          }
+        ],
+        "compact": [
+          {
+            "iterations": 20,
+            "ns/op": 65197956.0,
+            "WAL-B/obs": 1391.0,
+            "lock-polls": 130.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 15338.0,
+            "p50-ms/batch": 65.73,
+            "p95-ms/batch": 84.54,
+            "stored-B/location": 568.1
+          },
+          {
+            "iterations": 20,
+            "ns/op": 65650648.0,
+            "WAL-B/obs": 1225.0,
+            "lock-polls": 131.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 15232.0,
+            "p50-ms/batch": 65.98,
+            "p95-ms/batch": 85.2,
+            "stored-B/location": 568.1
+          },
+          {
+            "iterations": 20,
+            "ns/op": 65920927.0,
+            "WAL-B/obs": 1226.0,
+            "lock-polls": 131.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 15170.0,
+            "p50-ms/batch": 68.74,
+            "p95-ms/batch": 84.71,
+            "stored-B/location": 568.1
+          }
+        ]
+      },
+      "shared_paths": {
+        "legacy": [
+          {
+            "iterations": 20,
+            "ns/op": 36992898.0,
+            "WAL-B/obs": 1846.0,
+            "lock-polls": 73.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 27032.0,
+            "p50-ms/batch": 37.85,
+            "p95-ms/batch": 49.36,
+            "stored-B/location": 1120.0
+          },
+          {
+            "iterations": 20,
+            "ns/op": 37316671.0,
+            "WAL-B/obs": 1846.0,
+            "lock-polls": 74.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 26798.0,
+            "p50-ms/batch": 39.22,
+            "p95-ms/batch": 48.41,
+            "stored-B/location": 1120.0
+          },
+          {
+            "iterations": 20,
+            "ns/op": 37029540.0,
+            "WAL-B/obs": 1848.0,
+            "lock-polls": 74.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 27005.0,
+            "p50-ms/batch": 38.4,
+            "p95-ms/batch": 48.44,
+            "stored-B/location": 1120.0
+          }
+        ],
+        "compact": [
+          {
+            "iterations": 20,
+            "ns/op": 45654960.0,
+            "WAL-B/obs": 1024.0,
+            "lock-polls": 91.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 21903.0,
+            "p50-ms/batch": 45.49,
+            "p95-ms/batch": 48.99,
+            "stored-B/location": 463.4
+          },
+          {
+            "iterations": 20,
+            "ns/op": 45741812.0,
+            "WAL-B/obs": 1021.0,
+            "lock-polls": 91.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 21862.0,
+            "p50-ms/batch": 45.69,
+            "p95-ms/batch": 49.05,
+            "stored-B/location": 463.4
+          },
+          {
+            "iterations": 20,
+            "ns/op": 45516506.0,
+            "WAL-B/obs": 1023.0,
+            "lock-polls": 91.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 21970.0,
+            "p50-ms/batch": 45.96,
+            "p95-ms/batch": 48.93,
+            "stored-B/location": 463.4
+          }
+        ]
+      },
+      "repeat": {
+        "legacy": [
+          {
+            "iterations": 20,
+            "ns/op": 10019481.0,
+            "WAL-B/obs": 48.88,
+            "lock-polls": 20.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 99806.0,
+            "p50-ms/batch": 9.763,
+            "p95-ms/batch": 10.6,
+            "stored-B/location": 1155.0
+          },
+          {
+            "iterations": 20,
+            "ns/op": 9977365.0,
+            "WAL-B/obs": 50.69,
+            "lock-polls": 19.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 100227.0,
+            "p50-ms/batch": 9.761,
+            "p95-ms/batch": 10.27,
+            "stored-B/location": 1155.0
+          },
+          {
+            "iterations": 20,
+            "ns/op": 10009952.0,
+            "WAL-B/obs": 47.44,
+            "lock-polls": 20.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 99901.0,
+            "p50-ms/batch": 9.776,
+            "p95-ms/batch": 10.1,
+            "stored-B/location": 1155.0
+          }
+        ],
+        "compact": [
+          {
+            "iterations": 20,
+            "ns/op": 8638873.0,
+            "WAL-B/obs": 37.95,
+            "lock-polls": 17.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 115756.0,
+            "p50-ms/batch": 8.423,
+            "p95-ms/batch": 8.749,
+            "stored-B/location": 860.2
+          },
+          {
+            "iterations": 20,
+            "ns/op": 8602433.0,
+            "WAL-B/obs": 38.34,
+            "lock-polls": 17.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 116246.0,
+            "p50-ms/batch": 8.356,
+            "p95-ms/batch": 8.893,
+            "stored-B/location": 860.2
+          },
+          {
+            "iterations": 20,
+            "ns/op": 8629335.0,
+            "WAL-B/obs": 39.59,
+            "lock-polls": 17.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 115884.0,
+            "p50-ms/batch": 8.449,
+            "p95-ms/batch": 8.762,
+            "stored-B/location": 860.2
+          }
+        ]
+      },
+      "relocated_archive": {
+        "legacy": [
+          {
+            "iterations": 20,
+            "ns/op": 33768835.0,
+            "WAL-B/obs": 1478.0,
+            "lock-polls": 67.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 29613.0,
+            "p50-ms/batch": 33.68,
+            "p95-ms/batch": 43.94,
+            "stored-B/location": 860.9
+          },
+          {
+            "iterations": 20,
+            "ns/op": 33385081.0,
+            "WAL-B/obs": 1477.0,
+            "lock-polls": 66.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 29953.0,
+            "p50-ms/batch": 33.47,
+            "p95-ms/batch": 44.37,
+            "stored-B/location": 860.9
+          },
+          {
+            "iterations": 20,
+            "ns/op": 33106506.0,
+            "WAL-B/obs": 1477.0,
+            "lock-polls": 66.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 30206.0,
+            "p50-ms/batch": 33.6,
+            "p95-ms/batch": 44.26,
+            "stored-B/location": 860.9
+          }
+        ],
+        "compact": [
+          {
+            "iterations": 20,
+            "ns/op": 41842433.0,
+            "WAL-B/obs": 825.7,
+            "lock-polls": 83.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 23899.0,
+            "p50-ms/batch": 41.81,
+            "p95-ms/batch": 44.02,
+            "stored-B/location": 362.8
+          },
+          {
+            "iterations": 20,
+            "ns/op": 41998856.0,
+            "WAL-B/obs": 827.2,
+            "lock-polls": 83.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 23810.0,
+            "p50-ms/batch": 42.07,
+            "p95-ms/batch": 44.25,
+            "stored-B/location": 362.8
+          },
+          {
+            "iterations": 20,
+            "ns/op": 42195708.0,
+            "WAL-B/obs": 828.2,
+            "lock-polls": 84.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 23699.0,
+            "p50-ms/batch": 42.52,
+            "p95-ms/batch": 44.02,
+            "stored-B/location": 362.8
+          }
+        ]
+      },
+      "parallel_repeat": {
+        "legacy": [
+          {
+            "iterations": 20,
+            "ns/op": 3099533.0,
+            "WAL-B/obs": 49.7,
+            "lock-polls": 6.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 322629.0,
+            "p50-ms/batch": 11.23,
+            "p95-ms/batch": 16.67,
+            "stored-B/location": 1155.0
+          },
+          {
+            "iterations": 20,
+            "ns/op": 3143410.0,
+            "WAL-B/obs": 51.82,
+            "lock-polls": 6.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 318126.0,
+            "p50-ms/batch": 11.32,
+            "p95-ms/batch": 17.19,
+            "stored-B/location": 1155.0
+          },
+          {
+            "iterations": 20,
+            "ns/op": 3745117.0,
+            "WAL-B/obs": 50.43,
+            "lock-polls": 7.0,
+            "lock-wait-samples": 1.0,
+            "obs/s": 267014.0,
+            "p50-ms/batch": 11.46,
+            "p95-ms/batch": 24.23,
+            "stored-B/location": 1155.0
+          }
+        ],
+        "compact": [
+          {
+            "iterations": 20,
+            "ns/op": 2926990.0,
+            "WAL-B/obs": 37.16,
+            "lock-polls": 5.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 341648.0,
+            "p50-ms/batch": 10.61,
+            "p95-ms/batch": 17.85,
+            "stored-B/location": 860.2
+          },
+          {
+            "iterations": 20,
+            "ns/op": 3085065.0,
+            "WAL-B/obs": 41.28,
+            "lock-polls": 6.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 324142.0,
+            "p50-ms/batch": 11.29,
+            "p95-ms/batch": 15.8,
+            "stored-B/location": 860.2
+          },
+          {
+            "iterations": 20,
+            "ns/op": 2854106.0,
+            "WAL-B/obs": 39.11,
+            "lock-polls": 5.0,
+            "lock-wait-samples": 0.0,
+            "obs/s": 350372.0,
+            "p50-ms/batch": 9.681,
+            "p95-ms/batch": 17.26,
+            "stored-B/location": 860.2
+          }
+        ]
+      }
+    }
+  },
+  "optimization": {
+    "finding": "Plans scanned and rehashed the complete relative_paths dictionary during anti-joins, ID resolution, and separate validation.",
+    "change": "Use scalar unique-key lookups for relative-path existence and ID resolution. Resolve and check exact strings once; reject missing IDs before inserting locations. Check every staged row before deduplicating, and filter unchanged rows before deduplication to preserve metadata enrichment.",
+    "schema_change": false,
+    "profile_before": [
+      {
+        "pid": "65539",
+        "statements": {
+          "INSERT INTO locations AS l": {
+            "count": 20,
+            "mean_ms": 16.18,
+            "total_ms": 323.603
+          },
+          "CREATE TEMP TABLE _resolved ON COMMIT DROP AS": {
+            "count": 20,
+            "mean_ms": 16.008,
+            "total_ms": 320.156
+          },
+          "SELECT EXISTS(": {
+            "count": 60,
+            "mean_ms": 3.96,
+            "total_ms": 237.611
+          },
+          "INSERT INTO relative_paths(path)": {
+            "count": 20,
+            "mean_ms": 10.823,
+            "total_ms": 216.467
+          },
+          "INSERT INTO identities(sha256)": {
+            "count": 20,
+            "mean_ms": 3.323,
+            "total_ms": 66.465
+          },
+          "copy \"_staging\" ( \"sha256\", \"parent\", \"path\", \"filename\", \"rel\", \"source\", \"feed\", \"ecosystem\", \"mtime\", \"sha\", \"parent_sha\", \"parent_path\", \"relative_path\" ) from stdin binary;": {
+            "count": 20,
+            "mean_ms": 2.959,
+            "total_ms": 59.18
+          },
+          "INSERT INTO parent_locations(sample_id,path)": {
+            "count": 20,
+            "mean_ms": 0.947,
+            "total_ms": 18.944
+          },
+          "commit": {
+            "count": 20,
+            "mean_ms": 0.905,
+            "total_ms": 18.104
+          },
+          "CREATE TEMP TABLE _staging(": {
+            "count": 20,
+            "mean_ms": 0.506,
+            "total_ms": 10.117
+          }
+        }
+      },
+      {
+        "pid": "65543",
+        "statements": {
+          "INSERT INTO locations AS l": {
+            "count": 20,
+            "mean_ms": 16.647,
+            "total_ms": 332.947
+          },
+          "CREATE TEMP TABLE _resolved ON COMMIT DROP AS": {
+            "count": 20,
+            "mean_ms": 10.418,
+            "total_ms": 208.359
+          },
+          "SELECT EXISTS(": {
+            "count": 60,
+            "mean_ms": 1.934,
+            "total_ms": 116.067
+          },
+          "INSERT INTO identities(sha256)": {
+            "count": 20,
+            "mean_ms": 3.445,
+            "total_ms": 68.909
+          },
+          "copy \"_staging\" ( \"sha256\", \"parent\", \"path\", \"filename\", \"rel\", \"source\", \"feed\", \"ecosystem\", \"mtime\", \"sha\", \"parent_sha\", \"parent_path\", \"relative_path\" ) from stdin binary;": {
+            "count": 20,
+            "mean_ms": 2.988,
+            "total_ms": 59.754
+          },
+          "INSERT INTO relative_paths(path)": {
+            "count": 20,
+            "mean_ms": 2.76,
+            "total_ms": 55.206
+          },
+          "INSERT INTO parent_locations(sample_id,path)": {
+            "count": 20,
+            "mean_ms": 0.959,
+            "total_ms": 19.188
+          },
+          "commit": {
+            "count": 20,
+            "mean_ms": 0.824,
+            "total_ms": 16.473
+          },
+          "CREATE TEMP TABLE _staging(": {
+            "count": 20,
+            "mean_ms": 0.529,
+            "total_ms": 10.573
+          }
+        }
+      },
+      {
+        "pid": "65547",
+        "statements": {
+          "SELECT NOT EXISTS(": {
+            "count": 20,
+            "mean_ms": 3.643,
+            "total_ms": 72.852
+          },
+          "copy \"_staging\" ( \"sha256\", \"parent\", \"path\", \"filename\", \"rel\", \"source\", \"feed\", \"ecosystem\", \"mtime\", \"sha\", \"parent_sha\", \"parent_path\", \"relative_path\" ) from stdin binary;": {
+            "count": 20,
+            "mean_ms": 2.856,
+            "total_ms": 57.12
+          },
+          "CREATE TEMP TABLE _staging(": {
+            "count": 20,
+            "mean_ms": 0.51,
+            "total_ms": 10.203
+          },
+          "commit": {
+            "count": 20,
+            "mean_ms": 0.405,
+            "total_ms": 8.097
+          }
+        }
+      }
+    ],
+    "profile_method": "Separate log_min_duration_statement=0 run, 20 batches each of new/shared_paths/repeat compact. Timings grouped by SQL first line, excluding parse/bind. SELECT EXISTS combines dictionary and full-path checks. auto_explain confirmed full dictionary scans.",
+    "reproduction_dsn_parameters": {
+      "log_min_duration_statement": "0",
+      "session_preload_libraries": "auto_explain",
+      "auto_explain.log_min_duration": "5",
+      "auto_explain.log_analyze": "on",
+      "auto_explain.log_timing": "off",
+      "auto_explain.log_buffers": "on"
+    },
+    "comparison_caution": "The later legacy baseline was also faster than the earlier run. Do not attribute all before/after wall-clock reduction to this code; use the within-run compact/legacy ratios.",
+    "profile_after": {
+      "pid": "72398",
+      "statements": {
+        "INSERT INTO locations AS l": {
+          "count": 20,
+          "mean_ms": 11.601,
+          "total_ms": 232.019
+        },
+        "CREATE TEMP TABLE _resolved ON COMMIT DROP AS": {
+          "count": 20,
+          "mean_ms": 5.538,
+          "total_ms": 110.767
+        },
+        "INSERT INTO relative_paths(path)": {
+          "count": 20,
+          "mean_ms": 3.68,
+          "total_ms": 73.593
+        },
+        "INSERT INTO identities(sha256)": {
+          "count": 20,
+          "mean_ms": 2.473,
+          "total_ms": 49.45
+        },
+        "copy \"_staging\" ( \"sha256\", \"parent\", \"path\", \"filename\", \"rel\", \"source\", \"feed\", \"ecosystem\", \"mtime\", \"sha\", \"parent_sha\", \"parent_path\", \"relative_path\" ) from stdin binary;": {
+          "count": 20,
+          "mean_ms": 2.256,
+          "total_ms": 45.11
+        },
+        "SELECT EXISTS(": {
+          "count": 40,
+          "mean_ms": 0.948,
+          "total_ms": 37.904
+        },
+        "commit": {
+          "count": 20,
+          "mean_ms": 0.774,
+          "total_ms": 15.474
+        },
+        "INSERT INTO parent_locations(sample_id,path)": {
+          "count": 20,
+          "mean_ms": 0.716,
+          "total_ms": 14.31
+        },
+        "CREATE TEMP TABLE _staging(": {
+          "count": 20,
+          "mean_ms": 0.419,
+          "total_ms": 8.381
+        }
+      },
+      "last_resolution_plan": "2026-11-12 07:12:16.570 EST [72398] LOG:  duration: 5.221 ms  plan:\n\tQuery Text: CREATE TEMP TABLE _resolved ON COMMIT DROP AS\n\t WITH samples AS MATERIALIZED (\n\t SELECT st.path,st.filename,st.rel,st.source,st.feed,st.ecosystem,st.mtime,st.parent_path,st.relative_path,\n\t (SELECT id FROM identities WHERE sha256=st.sha) AS sample_id,\n\t (SELECT id FROM identities WHERE sha256=st.parent_sha) AS parent_sample_id FROM _staging st)\n\t SELECT\n\t st.sample_id,st.parent_sample_id,\n\t (SELECT id FROM parent_locations p WHERE p.sample_id=st.parent_sample_id\n\t AND path_key(p.path)=path_key(st.parent_path) AND p.path=st.parent_path) AS parent_location_id,\n\t (SELECT id FROM relative_paths r\n\t WHERE path_key(r.path)=path_key(st.relative_path) AND r.path=st.relative_path) AS relative_path_id,\n\t st.path AS full_path,path_key(st.path) AS full_path_key,\n\t CASE WHEN st.relative_path IS NULL THEN st.path END AS path,\n\t CASE WHEN st.filename=coalesce(st.relative_path,st.path) THEN NULL ELSE st.filename END AS filename_override,\n\t st.rel,st.source,st.feed,st.ecosystem,st.mtime\n\t FROM samples st\n\tCTE Scan on samples st  (cost=40547.84..82809.92 rows=2432 width=296) (actual rows=1000.00 loops=1)\n\t  Storage: Memory  Maximum Storage: 367kB\n\t  Buffers: shared hit=12000, local hit=128\n\t  CTE samples\n\t    ->  Seq Scan on _staging st_1  (cost=0.00..40547.84 rows=2432 width=280) (actual rows=1000.00 loops=1)\n\t          Buffers: shared hit=6000, local hit=128\n\t          SubPlan 1\n\t            ->  Index Scan using identities_sha256_key on identities  (cost=0.29..8.30 rows=1 width=8) (actual rows=1.00 loops=1000)\n\t                  Index Cond: (sha256 = st_1.sha)\n\t                  Index Searches: 1000\n\t                  Buffers: shared hit=3000\n\t          SubPlan 2\n\t            ->  Index Scan using identities_sha256_key on identities identities_1  (cost=0.29..8.30 rows=1 width=8) (actual rows=1.00 loops=1000)\n\t                  Index Cond: (sha256 = st_1.parent_sha)\n\t                  Index Searches: 1000\n\t                  Buffers: shared hit=3000\n\t  SubPlan 4\n\t    ->  Index Scan using parent_locations_key on parent_locations p  (cost=0.53..8.55 rows=1 width=8) (actual rows=1.00 loops=1000)\n\t          Index Cond: ((sample_id = st.parent_sample_id) AND (path_key(path) = path_key(st.parent_path)))\n\t          Filter: (path = st.parent_path)\n\t          Index Searches: 1000\n\t          Buffers: shared hit=3000\n\t  SubPlan 5\n\t    ->  Index Scan using relative_paths_key on relative_paths r  (cost=0.54..8.55 rows=1 width=8) (actual rows=1.00 loops=1000)\n\t          Index Cond: (path_key(path) = path_key(st.relative_path))\n\t          Filter: (path = st.relative_path)\n\t          Index Searches: 1000\n\t          Buffers: shared hit=3000\n"
+    },
+    "profile_after_method": "Separate 20-batch new/compact run with statement timing and auto_explain enabled. Plan instrumentation changes elapsed times; profile identifies operations, while uninstrumented benchmarks supply comparisons."
+  },
+  "containment_reuse_audit": {
+    "source": "Previously exported complete local npm cohort CSVs. No new production queries.",
+    "method": "For rows with a parent SHA and !!, split at the last !! and group by (parent SHA, exact relative locator, child SHA). Count distinct physical prefixes and metadata values per group.",
+    "results": {
+      "typescript": {
+        "child_rows": 74803,
+        "distinct_content_edges": 54893,
+        "parents_at_multiple_prefixes": 129,
+        "edges_at_multiple_prefixes": 15201,
+        "repeated_edges_with_variation_by_field": {
+          "rel": 0,
+          "filename": 0,
+          "source": 330,
+          "feed": 3683,
+          "ecosystem": 13409,
+          "mtime": 0,
+          "first_seen_at": 15201,
+          "last_seen_at": 15201
+        },
+        "parent_relative_pairs_with_multiple_children": 583
+      },
+      "react": {
+        "child_rows": 6916,
+        "distinct_content_edges": 4681,
+        "parents_at_multiple_prefixes": 78,
+        "edges_at_multiple_prefixes": 1744,
+        "repeated_edges_with_variation_by_field": {
+          "rel": 0,
+          "filename": 0,
+          "source": 53,
+          "feed": 380,
+          "ecosystem": 1474,
+          "mtime": 0,
+          "first_seen_at": 1744,
+          "last_seen_at": 1744
+        },
+        "parent_relative_pairs_with_multiple_children": 5
+      },
+      "express": {
+        "child_rows": 1875,
+        "distinct_content_edges": 1143,
+        "parents_at_multiple_prefixes": 30,
+        "edges_at_multiple_prefixes": 381,
+        "repeated_edges_with_variation_by_field": {
+          "rel": 0,
+          "filename": 0,
+          "source": 10,
+          "feed": 229,
+          "ecosystem": 301,
+          "mtime": 0,
+          "first_seen_at": 381,
+          "last_seen_at": 381
+        },
+        "parent_relative_pairs_with_multiple_children": 6
+      },
+      "babel": {
+        "child_rows": 18219,
+        "distinct_content_edges": 12136,
+        "parents_at_multiple_prefixes": 130,
+        "edges_at_multiple_prefixes": 4101,
+        "repeated_edges_with_variation_by_field": {
+          "rel": 0,
+          "filename": 0,
+          "source": 25,
+          "feed": 2784,
+          "ecosystem": 2297,
+          "mtime": 0,
+          "first_seen_at": 4101,
+          "last_seen_at": 4101
+        },
+        "parent_relative_pairs_with_multiple_children": 143
+      },
+      "lodash": {
+        "child_rows": 67999,
+        "distinct_content_edges": 32300,
+        "parents_at_multiple_prefixes": 31,
+        "edges_at_multiple_prefixes": 17003,
+        "repeated_edges_with_variation_by_field": {
+          "rel": 0,
+          "filename": 0,
+          "source": 1051,
+          "feed": 10471,
+          "ecosystem": 12322,
+          "mtime": 0,
+          "first_seen_at": 17003,
+          "last_seen_at": 17003
+        },
+        "parent_relative_pairs_with_multiple_children": 1
+      }
+    },
+    "conclusion": "Content-edge sharing could reduce relationship duplication, but placement-specific source/feed/ecosystem/timestamps must be preserved. Multiple child hashes occur under some identical parent/locator pairs, so parent+relative_path alone cannot identify a unique child.",
+    "limits": "This counts candidate edges only, not net storage or writer performance. Completeness, extractor version, relationship type, conflicting children and placement-specific metadata need explicit handling before manifest-level repeat skipping. Different npm versions with different parent bytes still need their own content edges; path strings can remain shared."
+  },
+  "larger_table_check": {
+    "preload_observations": 100000,
+    "preload_relative_paths": 60800,
+    "iterations": 20,
+    "trials": 1,
+    "statistics": "ANALYZE both layouts after preloading; CHECKPOINT before measurement. Setup excluded from timing.",
+    "results": {
+      "new": {
+        "legacy": {
+          "iterations": 20,
+          "ns/op": 116315433.0,
+          "WAL-B/obs": 3911.0,
+          "lock-polls": 232.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 8597.0,
+          "p50-ms/batch": 141.0,
+          "p95-ms/batch": 148.4,
+          "stored-B/location": 1120.0
+        },
+        "compact": {
+          "iterations": 20,
+          "ns/op": 58724721.0,
+          "WAL-B/obs": 3074.0,
+          "lock-polls": 117.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 17029.0,
+          "p50-ms/batch": 58.37,
+          "p95-ms/batch": 61.81,
+          "stored-B/location": 555.2
+        }
+      },
+      "shared_paths": {
+        "legacy": {
+          "iterations": 20,
+          "ns/op": 110457858.0,
+          "WAL-B/obs": 3949.0,
+          "lock-polls": 220.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 9053.0,
+          "p50-ms/batch": 139.4,
+          "p95-ms/batch": 152.8,
+          "stored-B/location": 1119.0
+        },
+        "compact": {
+          "iterations": 20,
+          "ns/op": 55915696.0,
+          "WAL-B/obs": 1218.0,
+          "lock-polls": 111.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 17884.0,
+          "p50-ms/batch": 55.91,
+          "p95-ms/batch": 57.64,
+          "stored-B/location": 535.3
+        }
+      }
+    },
+    "exploratory_without_explicit_analyze": {
+      "new": {
+        "legacy": {
+          "iterations": 20,
+          "ns/op": 140927238.0,
+          "WAL-B/obs": 3932.0,
+          "lock-polls": 281.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 7096.0,
+          "p50-ms/batch": 139.4,
+          "p95-ms/batch": 153.0,
+          "stored-B/location": 1120.0
+        },
+        "compact": {
+          "iterations": 20,
+          "ns/op": 34662598.0,
+          "WAL-B/obs": 1606.0,
+          "lock-polls": 69.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 28850.0,
+          "p50-ms/batch": 34.07,
+          "p95-ms/batch": 35.11,
+          "stored-B/location": 555.0
+        }
+      },
+      "shared_paths": {
+        "legacy": {
+          "iterations": 20,
+          "ns/op": 146903408.0,
+          "WAL-B/obs": 3949.0,
+          "lock-polls": 293.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 6807.0,
+          "p50-ms/batch": 149.0,
+          "p95-ms/batch": 155.9,
+          "stored-B/location": 1119.0
+        },
+        "compact": {
+          "iterations": 20,
+          "ns/op": 32469519.0,
+          "WAL-B/obs": 1215.0,
+          "lock-polls": 64.0,
+          "lock-wait-samples": 0.0,
+          "obs/s": 30798.0,
+          "p50-ms/batch": 31.6,
+          "p95-ms/batch": 37.76,
+          "stored-B/location": 535.3
+        }
+      }
+    },
+    "limits": "Single-trial diagnostic on small warm-cache tables, not a scale validation. Timing and WAL are sensitive to statistics, plan choice, and checkpoint full-page images. Storage includes the preloaded entirely-new-path workload, so it is not directly comparable to the unseeded shared_paths storage result."
+  }
+}

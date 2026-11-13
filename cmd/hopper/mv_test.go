@@ -89,7 +89,7 @@ func mvTestServer(t *testing.T, ctx context.Context, root string) (db *hopper.DB
 	api := &apiServer{db: db, dataRoot: root, tracker: newWorkerTracker()}
 	api.ready.Store(true)
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/triage", api.handleTriage)
+	mux.HandleFunc("POST /v1/triage/rulings", api.handleTriage)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return db, srv.URL

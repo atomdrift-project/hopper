@@ -171,7 +171,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error { //nolint:gocognit,maint
 			return err
 		}
 	}
-	if _, err := db.lite.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_gauntlet_evidence ON reports(sha256,evidence_key) WHERE report_type='gauntlet' AND evidence_key<>''`); err != nil {
+	if _, err := db.lite.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_gauntlet_evidence ON reports(sha256,evidence_key)
+		WHERE report_type='gauntlet' AND evidence_key<>''`); err != nil {
 		return err
 	}
 

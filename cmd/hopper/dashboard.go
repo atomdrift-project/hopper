@@ -953,7 +953,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 				oldestStr = fmt.Sprintf("%s (%s)", filepath.Base(claim.Path), shortDuration(age))
 			}
 
-			// Worker-reported local-queue telemetry (from /api/heartbeat).
+			// Worker-reported local-queue telemetry (from /v1/work/heartbeat).
 			queueStr := "—"
 			if w.Queue > 0 {
 				if !w.OldestQueueSince.IsZero() {
@@ -1653,12 +1653,12 @@ func writeClaimLadder(buf *strings.Builder, activity, depths map[string]int64, p
 	// The scope note is not padding. Measured 2026-09-15: the fleet completed
 	// 26.7 top-level rescans/s while this whole table accounted for ~1.9/s, a
 	// 14x gap -- the walk re-analyses files directly rather than claiming them
-	// through /api/next. Without saying so, a reader compares these rates
+	// through /v1/work/next. Without saying so, a reader compares these rates
 	// against the Throughput card and concludes one of them is broken.
 	buf.WriteString(`<section><div class="label">Claim ladder &middot; last ` +
 		fmt.Sprintf("%dm", tierWindowMinutes) + `</div>`)
 	buf.WriteString(`<div class="graph-note">Jobs handed to workers through ` +
-		`<em>/api/next</em>, in the order they are offered. A running walk ` +
+		`<em>/v1/work/next</em>, in the order they are offered. A running walk ` +
 		`re-analyses files outside this ladder, so these rates are not the ` +
 		`fleet's total throughput.</div>`)
 	buf.WriteString(`<table><thead><tr><th>#</th><th>Tier</th><th>Waiting</th>` +

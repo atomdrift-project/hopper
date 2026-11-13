@@ -66,7 +66,7 @@ func poolSize(app AppName) (maxConns, minConns int32) {
 	// cancelled outright. It was the process's hard throughput ceiling.
 	if app == ServingAppName {
 		// The serving API and the write path, and the one caller whose
-		// concurrency is real: a worker fleet polls /api/next every 2 seconds
+		// concurrency is real: a worker fleet polls /v1/work/next every 2 seconds
 		// while long result-store transactions (UpdateCleaveResult can cascade
 		// into ExplodeArchiveMembers) hold a connection for seconds at a time.
 		// It keeps a warm minimum because it is always serving.
@@ -169,7 +169,8 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 	return []string{
 		gauntletSchema,
 		`ALTER TABLE reports ADD COLUMN IF NOT EXISTS evidence_key TEXT NOT NULL DEFAULT ''`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_gauntlet_evidence ON reports(sha256,evidence_key) WHERE report_type='gauntlet' AND evidence_key<>''`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_gauntlet_evidence ON reports(sha256,evidence_key)
+			WHERE report_type='gauntlet' AND evidence_key<>''`,
 		`ALTER TABLE samples ADD COLUMN IF NOT EXISTS claimed_first_at TIMESTAMPTZ`,
 		`ALTER TABLE sighting_acquisitions ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ`,
 		// Adopt the rows that predate the column. They were written when an
@@ -230,7 +231,7 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// big-slot workers, ORDER BY size_bytes DESC. Without this index the
 		// planner scanned a fat index and sorted — 4.5s/call, #5 by total
 		// exec time (pg_stat_statements, 2026-08-22) — inside every
-		// /api/next poll from a capable worker. Pending-set-only, so it
+		// /v1/work/next poll from a capable worker. Pending-set-only, so it
 		// stays a few MB regardless of corpus size.
 		`CREATE INDEX IF NOT EXISTS idx_samples_pending_size ON samples(size_bytes DESC) ` +
 			`WHERE cleave_result IS NULL AND skip = '' AND parent = ''`,
@@ -1273,19 +1274,19 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// for minutes; this form is near-invisible.
 		`DO $$
 		BEGIN
-			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'samples_sha256_hex') THEN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'samples_sha256_hex' AND conrelid = 'samples'::regclass) THEN
 				ALTER TABLE samples ADD CONSTRAINT samples_sha256_hex
 					CHECK (sha256 ~ '^[0-9a-f]{64}$') NOT VALID;
 			END IF;
-			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'samples_parent_hex') THEN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'samples_parent_hex' AND conrelid = 'samples'::regclass) THEN
 				ALTER TABLE samples ADD CONSTRAINT samples_parent_hex
 					CHECK (parent = '' OR parent ~ '^[0-9a-f]{64}$') NOT VALID;
 			END IF;
-			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'samples_canonical_sha256_hex') THEN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'samples_canonical_sha256_hex' AND conrelid = 'samples'::regclass) THEN
 				ALTER TABLE samples ADD CONSTRAINT samples_canonical_sha256_hex
 					CHECK (canonical_sha256 = '' OR canonical_sha256 ~ '^[0-9a-f]{64}$') NOT VALID;
 			END IF;
-			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'reports_sha256_hex') THEN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'reports_sha256_hex' AND conrelid = 'reports'::regclass) THEN
 				ALTER TABLE reports ADD CONSTRAINT reports_sha256_hex
 					CHECK (sha256 ~ '^[0-9a-f]{64}$') NOT VALID;
 			END IF;
@@ -3612,7 +3613,7 @@ const memberConflictUpdatePG = `ON CONFLICT (sha256) DO UPDATE SET
 	END,
 	analyzed_at = EXCLUDED.analyzed_at,
 	first_analyzed_at = COALESCE(samples.first_analyzed_at, EXCLUDED.first_analyzed_at),
-	-- Cheap scalar, but the one /api/known actually reads: it reports a verdict
+	-- Cheap scalar, but the one /v1/intake/held actually reads: it reports a verdict
 	-- "current" only when this matches the producer's version, and scan skips
 	-- re-posting exactly those. Never blank a known version with an unknown one
 	-- — "" is "we could not tell", not "no version".
@@ -6543,7 +6544,7 @@ const (
 	// prism's feeds filter.
 	//
 	// Found 2026-09-08. OSV advisory MAL-2026-10722 lists 49 exact versions of
-	// @whalent/agent-core, the highest 0.3.298. Version 0.3.410 -- fetched by the
+	//	@whalent/agent-core,	the highest 0.3.298. Version 0.3.410 -- fetched by the
 	// npm firehose, not by any claim -- was flagged as cited by it. The same
 	// shape as the AUR false-corroboration incident.
 	//
@@ -6552,7 +6553,7 @@ const (
 	// names versions we cannot enumerate in SQL. Only a comma list of exact
 	// versions is narrowed, because only that is unambiguous.
 	// Split in two rather than ORed, so each stays a single-column index probe.
-	// See TestMarkCorroboratedSQLShape: an OR here is the /api/sightings timeout
+	// See TestMarkCorroboratedSQLShape: an OR here is the /v1/sightings timeout
 	// of 2026-08-17.
 	//
 	// unnarrowableScope is which side of that split a scope falls on: empty, or
@@ -8543,7 +8544,7 @@ func (db *DB) setSkipPG(ctx context.Context, sha256, skip string) error {
 // incrementAttemptsPG bumps the claim-attempt counter for the given samples.
 // It deliberately does not touch updated_at: a claim is not progress, and
 // bumping updated_at would corrupt the oldest-pending view. Called from the
-// /api/next hot path with the batch a worker just claimed.
+// /v1/work/next hot path with the batch a worker just claimed.
 func (db *DB) incrementAttemptsPG(ctx context.Context, shas []string) error {
 	if len(shas) == 0 {
 		return nil
