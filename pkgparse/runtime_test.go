@@ -1,6 +1,9 @@
 package pkgparse
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 func TestNormalizeEcosystem(t *testing.T) {
 	tests := map[string]string{
@@ -149,5 +152,46 @@ func TestFileTypeTagsDoNotShadowRegistries(t *testing.T) {
 		if got := NormalizeEcosystem(in); got != want {
 			t.Errorf("NormalizeEcosystem(%q) = %q, want %q — a file-type tag has shadowed a registry", in, got, want)
 		}
+	}
+}
+
+// Every package URL type the resolver hands out names its runtime ecosystem,
+// including the three whose registry runtimeMap spells another way.
+func TestPURLEcosystem(t *testing.T) {
+	for typ, want := range map[string]string{
+		"npm": "javascript", "pypi": "python", "gem": "ruby", "cargo": "rust", "golang": "go",
+		"maven": "java", "nuget": "dotnet", "composer": "php", "github": "github", "oci": "container",
+		"GEM": "ruby", "nonsense": "",
+	} {
+		if got := PURLEcosystem(typ); got != want {
+			t.Errorf("PURLEcosystem(%q) = %q, want %q", typ, got, want)
+		}
+	}
+}
+
+// A filter on an ecosystem matches its registries, its package URL types and
+// its file types, and each spelling maps back to it.
+func TestEcosystemSpellings(t *testing.T) {
+	ruby := EcosystemSpellings("ruby")
+	for _, want := range []string{"gem", "rubygems", "ruby"} {
+		if !slices.Contains(ruby, want) {
+			t.Errorf("EcosystemSpellings(ruby) = %q, missing %q", ruby, want)
+		}
+	}
+	windows := EcosystemSpellings("windows")
+	for _, want := range []string{"pe", "winget"} {
+		if !slices.Contains(windows, want) {
+			t.Errorf("EcosystemSpellings(windows) = %q, missing %q", windows, want)
+		}
+	}
+	for _, eco := range []string{"ruby", "windows", "javascript"} {
+		for _, k := range EcosystemSpellings(eco) {
+			if NormalizeEcosystem(k) != eco && PURLEcosystem(k) != eco {
+				t.Errorf("%q is listed for %s but maps to %q", k, eco, NormalizeEcosystem(k))
+			}
+		}
+	}
+	if got := EcosystemSpellings("no such ecosystem"); got != nil {
+		t.Errorf("unknown ecosystem: %q, want nil", got)
 	}
 }

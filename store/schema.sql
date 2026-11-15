@@ -60,6 +60,9 @@ CREATE INDEX samples_name    ON samples (name_id, id) WHERE name_id IS NOT NULL;
 -- citation does, so these cost almost nothing to keep.
 -- second: good files a sighting names.
 CREATE INDEX samples_cited_good ON samples (id) WHERE label = 'good' AND cited;
+-- The files some sighting names, newest first: a feed of corroborated files
+-- (prism) walks it down. About 0.1% of samples.
+CREATE INDEX samples_cited ON samples (id) WHERE cited;
 -- acquit: bad files whose provenance names no feed (fetched, not reported).
 CREATE INDEX samples_acquit ON samples (id)
 	WHERE label = 'bad' AND jsonb_typeof(provenance) = 'object' AND NOT provenance ? 'feed';

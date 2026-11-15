@@ -267,7 +267,7 @@ func (s *apiServer) handleSightingsFor(w http.ResponseWriter, r *http.Request) {
 	var bySubject map[string][]hopper.Sighting
 	var err error
 	if s.results != nil {
-		bySubject, err = s.sightingsFromStore(ctx, subjects)
+		bySubject, err = hopper.SightingsFromStore(ctx, s.results, subjects)
 	} else {
 		bySubject, err = s.db.SightingsFor(ctx, subjects)
 	}

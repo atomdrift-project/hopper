@@ -1,6 +1,9 @@
 package pkgparse
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 // runtimeMap is the single source of truth for the registry/classifier →
 // ecosystem taxonomy. Keys are the names that appear in samples.ecosystem
@@ -240,4 +243,37 @@ func NormalizeEcosystem(s string) string {
 		return ""
 	}
 	return runtimeMap[s]
+}
+
+// purlTypeAliases spells the package URL types whose registry goes by
+// another name in runtimeMap.
+var purlTypeAliases = map[string]string{"gem": "rubygems", "cargo": "crates", "composer": "packagist"}
+
+// PURLEcosystem returns the runtime ecosystem of a package URL type ("npm",
+// "gem", …), or "" for a type it does not know.
+func PURLEcosystem(purlType string) string {
+	t := strings.ToLower(purlType)
+	if alias, ok := purlTypeAliases[t]; ok {
+		t = alias
+	}
+	return NormalizeEcosystem(t)
+}
+
+// EcosystemSpellings returns every name that maps to the runtime ecosystem
+// eco, under NormalizeEcosystem or PURLEcosystem: the package URL types and
+// file types a filter on eco matches. Nil for an unknown ecosystem.
+func EcosystemSpellings(eco string) []string {
+	var out []string
+	for k := range runtimeMap {
+		if NormalizeEcosystem(k) == eco {
+			out = append(out, k)
+		}
+	}
+	for t := range purlTypeAliases {
+		if PURLEcosystem(t) == eco {
+			out = append(out, t)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
