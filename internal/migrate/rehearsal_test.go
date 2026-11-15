@@ -52,6 +52,9 @@ func TestMigrationRehearsal(t *testing.T) {
 	for reason, n := range r.Failures {
 		t.Errorf("refused %d: %s", n, reason)
 	}
+	if r.Filled == 0 {
+		t.Error("no member took its excerpt's entry as its report")
+	}
 
 	checks, err := Verify(ctx, pool, opt)
 	if err != nil {

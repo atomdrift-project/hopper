@@ -28,6 +28,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"slices"
@@ -117,6 +118,40 @@ func excerpt(top map[string]json.RawMessage) bool {
 	_, has := first["pid"]
 	return has
 }
+
+// ExcerptReport returns the version 8 report of the file a legacy excerpt
+// (Converted.Excerpt) describes: its entry rebuilt as Convert builds a
+// member's report from its archive's, except that a source in another file of
+// that archive is dropped, since the excerpt does not say which file it was.
+// Nil for a registry sidecar, which is provenance, and for an entry in the
+// version 4 to 6 shape: Convert gives neither a report. The migration gives it to members whose stored report is their
+// molecule alone, which is all an archive's report kept of them once legacy
+// hopper had cut their entries out.
+func ExcerptReport(raw json.RawMessage) ([]byte, error) {
+	top := map[string]json.RawMessage{}
+	if err := json.Unmarshal(raw, &top); err != nil {
+		return nil, fmt.Errorf("v7result: raw: %w", err)
+	}
+	if !excerpt(top) {
+		return nil, ErrNotExcerpt
+	}
+	entries, err := decodeEntries(top)
+	if err != nil {
+		return nil, err
+	}
+	e := entries[0]
+	if e.Rel == "registry" || e.Type == "registry" {
+		return nil, nil // provenance, which the sample's own row holds; Convert leaves sidecars out too
+	}
+	c := &converter{out: &Converted{Omitted: map[string]int{}}, shas: map[int64]string{}}
+	if e.ID != nil {
+		c.shas[*e.ID] = e.SHA // its own sources stay, citing nothing
+	}
+	return c.report(e)
+}
+
+// ErrNotExcerpt is ExcerptReport's answer to a report that is a scan.
+var ErrNotExcerpt = errors.New("v7result: not an excerpt")
 
 // entry is the part of a report's file entry the conversion reads.
 type entry struct {

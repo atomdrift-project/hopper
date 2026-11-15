@@ -86,7 +86,8 @@ func cmdMigrate(ctx context.Context) error {
 	if r != nil {
 		writeStdoutf("names %d, samples %d, results %d (%d files, %d refused), locations %d\n",
 			r.Names, r.Samples, r.Converted, r.Files, r.Failed, r.Locations)
-		writeStdoutf("excerpts %d not converted, %d of their rows dropped\n", r.Excerpts, r.Dropped)
+		writeStdoutf("excerpts %d not converted, %d of their rows dropped, %d members' reports filled from them\n",
+			r.Excerpts, r.Dropped, r.Filled)
 		writeStdoutf("sightings %d (%d respelled), reports %d, carried %d, cited %d, queued %d\n",
 			r.Sightings, r.Respelled, r.Reports, r.Carried, r.Marked, r.Queued)
 		for _, reason := range slices.Sorted(maps.Keys(r.Failures)) {

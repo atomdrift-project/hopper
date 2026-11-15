@@ -51,6 +51,7 @@ type Report struct {
 	Failed    int64          // results refused (Failures)
 	Excerpts  int64          // legacy results that were excerpts of another file's scan, not converted
 	Dropped   int64          // excerpts' sample rows that nothing else accounted for
+	Filled    int64          // members given their excerpt's entry as their report
 	Locations int64          // paths copied
 	Sightings int64          // ledger rows copied
 	Respelled int64          // package subjects whose spelling changed
@@ -110,6 +111,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opt Options) (*Report, error) 
 		{m.paths, "paths"},
 		{m.carried, "carried"},
 		{m.post, "post"},
+		{m.reports, "reports"},
 	} {
 		done, err := m.kv(ctx, "migrate:"+s.name)
 		if err != nil {
@@ -971,5 +973,64 @@ func (m *migration) post(ctx context.Context) error {
 			return fmt.Errorf("%s: %w", sql, err)
 		}
 	}
+	return nil
+}
+
+// reports gives each member its legacy excerpt's entry as its report where
+// the report it has is its molecule alone (Store.FillReports). From
+// 2026-06-18 legacy hopper cut each member's entry out of its archive's
+// report, keeping only its molecule there, and stored the entry on the
+// member's own row: the excerpt convert does not convert is the one copy of
+// what the archive's scan found in the member. The candidates are the files
+// atomscan judged that were never scanned on their own (no scans row) and
+// kept a legacy result.
+func (m *migration) reports(ctx context.Context) error {
+	return m.ranges(ctx, "reports", "samples", m.reportRange)
+}
+
+// atomscanID is atomscan's row in the scanners table.
+const atomscanID = 1
+
+// reportRange fills the reports of the candidates among legacy ids (lo, hi].
+func (m *migration) reportRange(ctx context.Context, lo, hi int64) error {
+	rows, err := m.pool.Query(ctx, `SELECT l.id, l.cleave_result::text
+		FROM verdicts v JOIN `+m.from+`.samples l ON l.id = v.sample_id
+		WHERE v.sample_id > $1 AND v.sample_id <= $2 AND v.scanner_id = $3
+		  AND NOT EXISTS (SELECT 1 FROM scans sc WHERE sc.sample_id = v.sample_id)
+		  AND l.parent = '' AND l.cleave_result IS NOT NULL`, lo, hi, atomscanID)
+	if err != nil {
+		return fmt.Errorf("reports: %w", err)
+	}
+	reports := map[int64][]byte{}
+	for rows.Next() {
+		var (
+			id  int64
+			raw string
+		)
+		if err := rows.Scan(&id, &raw); err != nil {
+			rows.Close()
+			return fmt.Errorf("reports: %w", err)
+		}
+		report, err := v7result.ExcerptReport(json.RawMessage(raw))
+		switch {
+		case errors.Is(err, v7result.ErrNotExcerpt):
+		case err != nil:
+			m.mu.Lock()
+			m.report.Failures["excerpt unreadable as a report"]++
+			m.mu.Unlock()
+		case report != nil:
+			reports[id] = report
+		default:
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("reports: %w", err)
+	}
+	n, err := m.st.FillReports(ctx, reports)
+	if err != nil {
+		return fmt.Errorf("reports: %w", err)
+	}
+	m.count(&m.report.Filled, n)
 	return nil
 }

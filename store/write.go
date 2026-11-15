@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"math/rand/v2"
 	"reflect"
 	"slices"
 	"time"
@@ -75,6 +77,14 @@ func (st *Store) Write(ctx context.Context, files []scanresult.File) (Stats, err
 		}
 		slog.WarnContext(ctx, "store: write: retrying", "artifact", hex.EncodeToString(files[0].SHA256),
 			"attempt", attempt, "code", pgErr.Code, "error", pgErr.Message)
+		// Writers that deadlocked on the same rows and retried at once would
+		// meet again; a random wait, growing with each attempt, parts them.
+		wait := time.Duration(rand.Int64N(int64(retryWait << attempt))) //nolint:gosec // jitter, not a secret
+		select {
+		case <-ctx.Done():
+			return stats, ctx.Err()
+		case <-time.After(wait):
+		}
 	}
 }
 
@@ -87,8 +97,15 @@ const (
 
 // writeAttempts bounds how often Write tries a result that lost a deadlock:
 // the writers lock in one order, so a deadlock is rare, and the transaction
-// that survives it has gone on by the next try.
-const writeAttempts = 5
+// that survives it has gone on by the next try. Before each retry it waits a
+// random time up to retryWait doubled per attempt (at most 3.2 s before the
+// last, 6.4 s in all): the production migration, 16 to 32 writers on the files popular
+// archives share, lost one result to five deadlocks in a row twice in four
+// hours when retries followed at once.
+const (
+	writeAttempts = 8
+	retryWait     = 25 * time.Millisecond
+)
 
 // write is one attempt at Write.
 func (st *Store) write(ctx context.Context, files []scanresult.File) (Stats, error) {
@@ -134,6 +151,7 @@ type writer struct {
 	settled []bool    // member files[i] holds an opinion formed by this scan's time or later
 	thinner []bool    // member files[i]'s line would replace a richer opinion with a looser one
 	same    []bool    // files[i]'s line is the stored opinion, and would write nothing (sameAs)
+	stale   []int     // files whose type or size the scan sets, as first read; lock sets them
 	// reclaim is set when the scanned artifact's own opinion replaces a newer
 	// one that came from an archive's line and would have been held back had
 	// the two arrived in order (heldBack): its rows are written as formed at
@@ -170,9 +188,11 @@ func (w *writer) late(ctx context.Context) (bool, error) {
 	return late, nil
 }
 
-// samples makes sure every file has a row with the type the scan gave it, and
-// learns its id. Rows are inserted in digest order so two writers naming the
-// same new files cannot deadlock.
+// samples makes sure every file has a row, and learns its id and what is
+// stored about it. Rows are inserted in digest order so two writers naming the
+// same new files cannot deadlock. The files whose type or size the scan sets
+// are noted, and set by lock, which takes every sample row the write changes
+// in one statement.
 func (w *writer) samples(ctx context.Context) error {
 	shas, sizes, types := make([][]byte, len(w.files)), make([]int64, len(w.files)), make([]string, len(w.files))
 	for i := range w.files {
@@ -195,29 +215,8 @@ func (w *writer) samples(ctx context.Context) error {
 	for i := range all {
 		all[i] = i
 	}
-	stale, err := w.read(ctx, all)
-	if err != nil || len(stale) == 0 {
-		return err
-	}
-	staleIDs, staleTypes, staleSizes := make([]int64, len(stale)), make([]string, len(stale)), make([]int64, len(stale))
-	for j, i := range stale {
-		staleIDs[j], staleTypes[j], staleSizes[j] = w.ids[i], types[i], sizes[i]
-	}
-	// A file hopper learned of before it was scanned (ingest knows a path, and
-	// perhaps a size, not a type) takes its type and size from the scan. Only
-	// the rows that differ are touched, in digest order, as every writer of
-	// samples takes them, so that two cannot deadlock.
-	tag, err = w.tx.Exec(ctx, `WITH held AS (
-			SELECT id FROM samples WHERE id = ANY($1) ORDER BY sha256 FOR NO KEY UPDATE)
-		UPDATE samples s SET file_type = coalesce(nullif(u.type, ''), s.file_type),
-			size_bytes = coalesce(s.size_bytes, nullif(u.size, 0))
-		FROM unnest($1::bigint[], $2::text[], $3::bigint[]) AS u(id, type, size), held
-		WHERE s.id = u.id AND s.id = held.id`, staleIDs, staleTypes, staleSizes)
-	if err != nil {
-		return fmt.Errorf("sample types: %w", err)
-	}
-	w.stats.Retyped = tag.RowsAffected()
-	return nil
+	w.stale, err = w.read(ctx, all)
+	return err
 }
 
 // read learns, for the files at idx, their ids and what decides whether a
@@ -505,7 +504,7 @@ func (w *writer) verdicts(ctx context.Context) error {
 	// is the stored opinion is not locked (sameAs), so a file every archive
 	// reads alike stays free (TestWriteRaceKeepsRicherVerdict).
 	changing := w.changing(r)
-	if err := w.lock(ctx, changing); err != nil {
+	if err := w.lock(ctx, maps.Clone(changing)); err != nil {
 		return err
 	}
 	if r, err = w.rows(changing); err != nil {
@@ -679,11 +678,19 @@ func (w *writer) changing(r *verdictRows) map[int64]bool {
 	return ids
 }
 
-// lock takes the sample rows of the files a write will change, in digest
-// order as every writer of samples takes them, and reads those files again.
-// Another writer changing one of them holds the same lock, so what read
-// decides now stands until this write commits.
+// lock takes the sample rows of the files a write will change: those whose
+// opinion it writes (ids) and those whose type or size the scan sets (stale).
+// It takes them in one statement, in digest order. A transaction that took
+// some rows in one statement and the rest in another would hold a row while
+// waiting for one of lower digest, which a writer that took them the other
+// way round holds: a deadlock, and the production migration lost results to
+// it until the two were one. It then reads those files again, so what read
+// decides now stands until this write commits (another writer changing one
+// holds the same lock), and sets the types and sizes the scan gives.
 func (w *writer) lock(ctx context.Context, ids map[int64]bool) error {
+	for _, i := range w.stale {
+		ids[w.ids[i]] = true
+	}
 	locked := make([]int64, 0, len(ids))
 	var idx []int
 	for i, id := range w.ids {
@@ -694,8 +701,25 @@ func (w *writer) lock(ctx context.Context, ids map[int64]bool) error {
 	if _, err := w.tx.Exec(ctx, `SELECT 1 FROM samples WHERE id = ANY($1) ORDER BY sha256 FOR NO KEY UPDATE`, locked); err != nil {
 		return fmt.Errorf("lock: %w", err)
 	}
-	_, err := w.read(ctx, idx)
-	return err
+	stale, err := w.read(ctx, idx)
+	if err != nil || len(stale) == 0 {
+		return err
+	}
+	// A file hopper learned of before it was scanned (ingest knows a path, and
+	// perhaps a size, not a type) takes its type and size from the scan.
+	staleIDs, staleTypes, staleSizes := make([]int64, len(stale)), make([]string, len(stale)), make([]int64, len(stale))
+	for j, i := range stale {
+		staleIDs[j], staleTypes[j], staleSizes[j] = w.ids[i], w.files[i].Type, w.files[i].Size
+	}
+	tag, err := w.tx.Exec(ctx, `UPDATE samples s SET file_type = coalesce(nullif(u.type, ''), s.file_type),
+			size_bytes = coalesce(s.size_bytes, nullif(u.size, 0))
+		FROM unnest($1::bigint[], $2::text[], $3::bigint[]) AS u (id, type, size)
+		WHERE s.id = u.id`, staleIDs, staleTypes, staleSizes)
+	if err != nil {
+		return fmt.Errorf("sample types: %w", err)
+	}
+	w.stats.Retyped = tag.RowsAffected()
+	return nil
 }
 
 // reformed returns the members whose jurors r changes: their atomscan row is

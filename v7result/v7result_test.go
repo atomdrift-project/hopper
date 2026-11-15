@@ -567,3 +567,30 @@ func TestConvertTellsExcerpts(t *testing.T) {
 		}
 	}
 }
+
+// An excerpt's entry becomes the member's own report: placement gone, its own
+// sources kept citing nothing, and a source in another file of the archive it
+// was cut from dropped, since the excerpt cannot say which file that was.
+func TestExcerptReport(t *testing.T) {
+	sha := strings.Repeat("ab", 32)
+	raw := `{"v":"7","files":[{"id":3,"pid":0,"dp":1,"path":"pkg.tgz!!x.js","sha":"` + sha + `","size":10,"type":"javascript",
+		"ident":{"name":{"value":"x"}},"mol":"Os","traits":[{"id":"t","crit":4,"from":[{"file":3,"line":2},{"file":0,"line":5}]}]}]}`
+	report, err := ExcerptReport(json.RawMessage(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"mol":"Os","traits":[{"crit":4,"from":[{"line":2}],"id":"t"}]}`; string(report) != want {
+		t.Errorf("report %s, want %s", report, want)
+	}
+	if _, err := ExcerptReport(json.RawMessage(`{"v":"7","files":[{"id":0,"sha":"` + sha + `"}]}`)); err == nil {
+		t.Error("a scan's report is not an excerpt")
+	}
+	sidecar, err := ExcerptReport(json.RawMessage(`{"v":"7","files":[{"id":2,"pid":0,"rel":"registry","type":"registry","sha":"` + sha + `","traits":[{"id":"t","crit":2}]}]}`))
+	if err != nil || sidecar != nil {
+		t.Errorf("a registry sidecar: %s %v, want no report: it is provenance", sidecar, err)
+	}
+	old, err := ExcerptReport(json.RawMessage(`{"v":"5","fs":[{"id":1,"pid":0,"sha":"` + sha + `","ts":[{"i":"t","l":4}]}]}`))
+	if err != nil || old != nil {
+		t.Errorf("a version 5 excerpt: %s %v, want no report, as a member of such a report gets", old, err)
+	}
+}
