@@ -76,20 +76,28 @@ func TestMigrationRehearsal(t *testing.T) {
 		t.Logf("triage %-28s %d", queue, len(got))
 	}
 
-	// Converting again in order, by one worker, corrects only what the
-	// parallel run stored out of order: a member two workers stored at once
-	// from archives a little apart in time. Converting a third time writes
-	// nothing: every verdict keeps its row version (a frozen row reports
-	// xmin 2, which is not a write).
+	// Converting again in order, by one worker, corrects what the parallel
+	// run stored out of order. A member's reading is rewritten only when it
+	// changes or a newer scan under another ruleset or 30 days on confirms it
+	// (store's refreshAge), so a newer scan that agrees within that leaves no
+	// trace, and an older one stored after it can put its own time, engine
+	// and report on the row. Decided 2026-11-13 as acceptable: the class,
+	// level and outcome a lookup serves must come out the same, and no row
+	// may appear or vanish; the rest is bounded at 1% of rows and corrects
+	// itself on the next scan of an archive holding the member. Converting a
+	// third time writes nothing: every verdict keeps its row version (a
+	// frozen row reports xmin 2, which is not a write).
 	var verdicts int64
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM verdicts`).Scan(&verdicts); err != nil {
 		t.Fatal(err)
 	}
 	for pass := 2; pass <= 3; pass++ {
-		changed := reconvert(ctx, t, pool, Options{From: "public", To: "verdict", Workers: 1, Batch: opt.Batch}, r.Converted)
-		t.Logf("pass %d, one worker: %d of %d verdicts changed", pass, changed, verdicts)
+		changed, served := reconvert(ctx, t, pool, Options{From: "public", To: "verdict", Workers: 1, Batch: opt.Batch}, r.Converted)
+		t.Logf("pass %d, one worker: %d of %d verdicts changed, %d of them in what a lookup serves", pass, changed, verdicts, served)
 		switch {
-		case pass == 2 && changed*1000 > verdicts:
+		case pass == 2 && served != 0:
+			t.Errorf("pass 2 changed %d verdicts' class, level or outcome, or added or removed a row: storing out of order changed a verdict", served)
+		case pass == 2 && changed*100 > verdicts:
 			t.Errorf("pass 2 changed %d of %d verdicts: more than out-of-order storage explains", changed, verdicts)
 		case pass == 3 && changed != 0:
 			t.Errorf("pass 3 changed %d verdicts: converting is not idempotent", changed)
@@ -129,12 +137,14 @@ func report(ctx context.Context, t *testing.T, pool *pgxpool.Pool, r *Report) {
 }
 
 // reconvert runs the conversion stage again and returns how many verdict
-// rows it rewrote, removed or added.
-func reconvert(ctx context.Context, t *testing.T, pool *pgxpool.Pool, opt Options, want int64) int64 {
+// rows it rewrote, removed or added, and how many of those changed what a
+// lookup serves: a row added or removed, or one whose class, level or
+// outcome changed.
+func reconvert(ctx context.Context, t *testing.T, pool *pgxpool.Pool, opt Options, want int64) (changed, served int64) {
 	t.Helper()
 	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS rehearsal_versions;
 		CREATE TABLE rehearsal_versions AS SELECT sample_id, scanner_id, xmin::text AS x,
-			formed_at, class, fires_at, ruleset, digest, summary FROM verdicts`); err != nil {
+			formed_at, outcome, class, fires_at, ruleset, digest, summary FROM verdicts`); err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
@@ -171,7 +181,6 @@ func reconvert(ctx context.Context, t *testing.T, pool *pgxpool.Pool, opt Option
 		t.Fatal(err)
 	}
 	defer rows.Close()
-	var changed int64
 	for rows.Next() {
 		var (
 			kind, scanner   string
@@ -188,7 +197,17 @@ func reconvert(ctx context.Context, t *testing.T, pool *pgxpool.Pool, opt Option
 		t.Fatal(err)
 	}
 	logRewrites(ctx, t, pool)
-	return changed
+	if err := pool.QueryRow(ctx, `SELECT
+			(SELECT count(*) FROM rehearsal_versions o JOIN verdicts v USING (sample_id, scanner_id)
+			 WHERE (o.outcome, o.class, o.fires_at) IS DISTINCT FROM (v.outcome, v.class, v.fires_at))
+			+ (SELECT count(*) FROM rehearsal_versions o WHERE NOT EXISTS
+			   (SELECT 1 FROM verdicts v WHERE v.sample_id = o.sample_id AND v.scanner_id = o.scanner_id))
+			+ (SELECT count(*) FROM verdicts v WHERE NOT EXISTS
+			   (SELECT 1 FROM rehearsal_versions o WHERE o.sample_id = v.sample_id AND o.scanner_id = v.scanner_id))`).
+		Scan(&served); err != nil {
+		t.Fatal(err)
+	}
+	return changed, served
 }
 
 // logRewrites logs which columns the rewritten rows changed, with one

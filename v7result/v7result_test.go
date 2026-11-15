@@ -179,11 +179,115 @@ func TestConvertOldestReport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Files) != 1 || got.Files[0].Report != nil || got.Files[0].ReportLine != nil || got.Omitted["report older than version 6"] != 1 {
+	if len(got.Files) != 1 || got.Files[0].Report != nil || got.Files[0].ReportLine != nil || got.Omitted["report in the version 4 to 6 shape"] != 1 {
 		t.Fatalf("files %+v, omitted %v; want one file with no report", got.Files, got.Omitted)
 	}
 	if !strings.Contains(string(got.Files[0].Verdict), `"class":"benign"`) || got.Files[0].Jurors["ml"] == nil {
 		t.Errorf("verdict %s, jurors %v", got.Files[0].Verdict, got.Files[0].Jurors)
+	}
+}
+
+// A version 4 archive, shaped as production holds them (a gem with its
+// checksums and data tarball): its files, sizes and placements convert, and
+// a member's own traits judge it, though no report is passed on.
+func TestConvertVersion4Archive(t *testing.T) {
+	sha := map[string]string{}
+	for _, n := range []string{"gem", "checksums", "data", "script"} {
+		sha[n] = digest(n)
+	}
+	root := "/data/samples/gem/active-press/0.1.0/active-press-0.1.0.gem"
+	got, err := Convert(&Result{
+		At: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), SHA256: sha["gem"], Worker: "w1",
+		Raw: json.RawMessage(fmt.Sprintf(`{"v":"4","tv":"60d49","fs":[
+			{"id":0,"sha":%q,"path":%q,"type":"gem","sz":9000,"x":1,"f":"H2"},
+			{"id":1,"dp":1,"sha":%q,"path":%q,"type":"gz","sz":297},
+			{"id":2,"dp":1,"sha":%q,"path":%q,"type":"gz","sz":4000},
+			{"id":3,"dp":2,"sha":%q,"path":%q,"type":"ruby","sz":94,"ss":[[8,"spec_helper"]],"ts":[
+				{"c":0.9,"d":"Downloads and runs a payload","e":["iplogger"],"i":"objectives/command-and-control/dropper::ruby-iplogger-dropper","l":5},
+				{"c":0.8,"d":"Very short file","e":["text.total_lines = 5.00"],"i":"metadata/package/metrics::file-under-12-lines","l":1}]}]}`,
+			sha["gem"], root, sha["checksums"], root+"!!checksums.yaml.gz", sha["data"], root+"!!data.tar.gz",
+			sha["script"], root+"!!data.tar.gz!!lib/x.rb")),
+	}, level)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scanresult.Check(got.Files); err != nil {
+		t.Fatalf("the converted result does not pass the version 8 checks: %v", err)
+	}
+	idx := map[string]int{}
+	for i, f := range got.Files {
+		idx[hex.EncodeToString(f.SHA256)] = i
+	}
+	if len(got.Files) != 4 {
+		t.Fatalf("%d files, want the gem and its 3 members", len(got.Files))
+	}
+	contents := func(name string) []string {
+		f := got.Files[idx[sha[name]]]
+		var out []string
+		for i, c := range f.Children {
+			out = append(out, f.Paths[i]+"="+hex.EncodeToString(got.Files[c].SHA256)[:6])
+		}
+		return out
+	}
+	for name, want := range map[string][]string{
+		"gem":  {"checksums.yaml.gz=" + sha["checksums"][:6], "data.tar.gz=" + sha["data"][:6]},
+		"data": {"lib/x.rb=" + sha["script"][:6]},
+	} {
+		if c := contents(name); !slices.Equal(c, want) {
+			t.Errorf("%s contents %v, want %v", name, c, want)
+		}
+	}
+	script := got.Files[idx[sha["script"]]]
+	if script.Size != 94 || script.Type != "ruby" {
+		t.Errorf("script size %d, type %q: want 94, ruby", script.Size, script.Type)
+	}
+	if v := string(script.Verdict); !strings.Contains(v, `"class":"hostile"`) || !strings.Contains(v, "ruby-iplogger-dropper") {
+		t.Errorf("script verdict %s: want hostile on its crit 5 dropper finding", v)
+	}
+	for i, f := range got.Files {
+		if f.Report != nil || f.ReportLine != nil {
+			t.Errorf("file %d carries a report in the version 4 shape", i)
+		}
+	}
+}
+
+// TestConvertVersion7Find converts a version 7 report from before cleave's
+// v8 format, which spelled the findings "find" and the identity "idn". The
+// entry is a real packed .NET executable's, cut down.
+func TestConvertVersion7Find(t *testing.T) {
+	sha := digest("dotnet")
+	got, err := Convert(&Result{
+		At: time.Date(2026, 5, 2, 3, 4, 5, 0, time.UTC), SHA256: sha, Worker: "w1",
+		Raw: json.RawMessage(fmt.Sprintf(`{"v":"7","tv":"3ee62","files":[{"id":0,"sha":%q,"path":"/data/samples/nuget/x/GCNI32.dll",
+			"type":"pe","size":807100,"mol":"O2","risk":110,"fact":{"id":"pe"},
+			"idn":{"name":{"value":"GCNI32.dll","source":"pe.version.original_filename","verified":false},"trust":"unsigned",
+				"version":{"value":"8.11","source":"pe.version.file_version","verified":false}},
+			"find":[
+				{"id":"objectives/anti-static/pack/runtime::dotnet-packed-stub","conf":0.88,"crit":4,"desc":"Packed .NET stub"},
+				{"id":"objectives/anti-static/pack/entropy::dotnet-encrypted-text-section","conf":0.9,"crit":4,"desc":"Encrypted .text section"},
+				{"id":"micro-behaviors/data/db/linq::linq-queries","conf":0.7,"crit":3,"desc":"LINQ queries"}]}]}`, sha)),
+	}, level)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scanresult.Check(got.Files); err != nil {
+		t.Fatalf("the converted result does not pass the version 8 checks: %v", err)
+	}
+	if len(got.Files) != 1 {
+		t.Fatalf("%d files, want 1", len(got.Files))
+	}
+	f := got.Files[0]
+	if fl := string(f.Jurors["floor"]); !strings.Contains(fl, `"class":"hostile"`) || !strings.Contains(fl, `"suspicious":2`) {
+		t.Errorf("floor %s: want hostile on two crit 4 findings", fl)
+	}
+	if v := string(f.Verdict); !strings.Contains(v, `"class":"hostile"`) || !strings.Contains(v, "dotnet-packed-stub") {
+		t.Errorf("verdict %s: want hostile, citing its strongest findings", v)
+	}
+	if !strings.Contains(string(f.Ident), "GCNI32.dll") {
+		t.Errorf("ident %s: want the idn block", f.Ident)
+	}
+	if strings.Contains(string(f.Report), `"idn"`) {
+		t.Errorf("report %s keeps the identity, which moved to the file line", f.Report)
 	}
 }
 
@@ -434,5 +538,32 @@ func TestConvertClipsInterpretation(t *testing.T) {
 	}
 	if !strings.Contains(string(got.Files[0].Verdict), `"reason":"éé`) {
 		t.Errorf("verdict %s lost the reason", got.Files[0].Verdict)
+	}
+}
+
+// A legacy excerpt (a member's line cut out of an archive's report and
+// stored on the member's row) is told apart from a scan by its first entry
+// naming a parent, under files or, in older reports, fs. A pid that is null
+// still names one, as the migration's SQL test (`? 'pid'`) read it.
+func TestConvertTellsExcerpts(t *testing.T) {
+	sha := strings.Repeat("ab", 32)
+	for raw, want := range map[string]bool{
+		`{"files":[{"id":7,"pid":3,"depth":2,"sha":"` + sha + `"}]}`:          true,
+		`{"files":[{"id":7,"pid":null,"sha":"` + sha + `"}]}`:                 true,
+		`{"fs":[{"id":7,"pid":3,"sha":"` + sha + `"}]}`:                       true,
+		`{"files":[{"id":0,"depth":0,"sha":"` + sha + `","type":""}]}`:        false,
+		`{"files":[{"id":0,"sha":"` + sha + `"},{"id":1,"pid":0,"sha":"x"}]}`: false,
+		`{"files":[]}`: false,
+	} {
+		got, err := Convert(&Result{SHA256: sha, Raw: json.RawMessage(raw)}, level)
+		if want {
+			if err != nil || !got.Excerpt || len(got.Files) != 0 {
+				t.Errorf("%s: %+v, %v; want an excerpt with no files", raw, got, err)
+			}
+			continue
+		}
+		if err == nil && got.Excerpt {
+			t.Errorf("%s: an excerpt; want a scan", raw)
+		}
 	}
 }

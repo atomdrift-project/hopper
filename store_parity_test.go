@@ -6,6 +6,7 @@ import (
 	"os"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -158,10 +159,21 @@ func TestRehearsalLookupParity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := pool.Query(ctx, legacySampleColumns+` FROM public.samples l
+	// HOPPER_PARITY_SAMPLE, a percentage, compares the files on that share of
+	// legacy's pages: a full-size migration (galadriel's) holds tens of
+	// millions.
+	from, args := ` FROM public.samples l`, []any{}
+	if p := strings.TrimSpace(os.Getenv("HOPPER_PARITY_SAMPLE")); p != "" {
+		pct, err := strconv.ParseFloat(p, 64)
+		if err != nil || pct <= 0 || pct > 100 {
+			t.Fatalf("HOPPER_PARITY_SAMPLE %q: want a percentage above 0, at most 100", p)
+		}
+		from, args = ` FROM public.samples l TABLESAMPLE SYSTEM ($1)`, append(args, pct)
+	}
+	rows, err := pool.Query(ctx, legacySampleColumns+from+`
 		WHERE l.parent = '' AND l.cleave_result IS NOT NULL
 		  AND NOT coalesce(coalesce(l.cleave_result->'files', l.cleave_result->'fs')->0 ? 'pid', false)
-		ORDER BY l.id`)
+		ORDER BY l.id`, args...)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -275,7 +275,7 @@ code for the rehearsal and for production:
 | `queue` | — | files on disk with no atomscan verdict, at `QueueNew`, excerpts' files among them; the sweep queues the stale |
 | `reports` | `reports` | `sample_id` by `decode(sha256)` |
 | `sightings` | `sightings` | as is; package subjects re-spelled with `nameOf` (the rehearsal counts how many change) |
-| `label_events`, `popular_packages`, `sighting_acquisitions`, `hopper_kv`, `gauntlet_*` | the same tables | as is |
+| `label_events`, `popular_packages`, `sighting_acquisitions`, `gauntlet_*` | the same tables | as is; `hopper_kv` is not carried: legacy's keys mark repairs of the legacy tables done |
 | `samples.cited` | — | `Store.Recite` |
 | `scans.flagged` | — | the writer sets it; files labelled bad are flagged after the load |
 
@@ -311,18 +311,18 @@ Not carried:
 ### Stages
 
 1. **Preflight.** Measure free space against part 3's per-sample sizes.
-   Check `temp_tablespaces = 'pgtemp'`, `wal_compression = zstd`,
-   `maintenance_work_mem` and checkpoint spacing. Settle the inactive
-   replication slot (below).
+   Check `temp_tablespaces = 'pgtemp'`, `maintenance_work_mem` and
+   checkpoint spacing; with `full_page_writes = off` (ZFS) WAL compression
+   does nothing. No replication slot may be holding WAL (production's was
+   dropped 2026-11-13). Pause zrepl's snapshots of the database datasets.
 2. **Tables.** Create `verdict` with its tables, keys, functions and the GIN
    index on `contents` (with a pending list for the load); the writer needs
    the keys for its conflict clauses and the GIN index to find what holds a
-   file. The other secondary indexes come at stage 5. The foreign keys left
-   (PLAN.md: the hot-path ones are gone) are checked as rows load; the
-   rehearsal measures whether that is worth deferring.
-3. **Copy.** `names`, then `samples` in id ranges (members too, ids kept),
-   then moving the samples sequence past the largest legacy id: the writer
-   creates the rows of members legacy never held.
+   file. The other secondary indexes come at stage 5. The foreign keys are
+   dropped for the load and their definitions kept in `migrate_fkeys`.
+3. **Copy.** `names`, then `samples` in id ranges on every worker (members
+   too, ids kept), then moving the samples sequence past the largest legacy
+   id: the writer creates the rows of members legacy never held.
 4. **Convert.** Parallel workers take consecutive batches of the analyzed
    top-level rows in analysis-time order, oldest first, as live uploads
    arrive, excerpts left out, and convert and write. A freshly loaded verdict has no old class, so nothing
@@ -336,10 +336,12 @@ Not carried:
    the tables carried as they are, the reports, and the ledger respelled.
    Then the secondary indexes (parallel maintenance workers), and the GIN
    index told to skip its pending list.
-6. **Derive.** Drop the excerpts' rows nothing accounts for, then
-   `VACUUM` samples; `Recite`; flag the scans of files labelled bad; fill the
-   queue; set each identity sequence past its largest id (`names`,
-   `samples`, `reports`, `label_events`); `ANALYZE`.
+6. **Derive.** Drop the excerpts' rows nothing accounts for; `Recite`; flag
+   the scans of files labelled bad; fill the queue; set each identity
+   sequence past its largest id (`names`, `samples`, `reports`,
+   `label_events`); add the foreign keys back, each validated; rebuild the
+   keys the load filled out of order; `VACUUM` samples; `ANALYZE`. Each step
+   logs its time.
 7. **Validate.**
    - Every legacy sample has a row with its id and digest, but for
      dropped excerpts, and no dropped excerpt had anything accounting for it.
@@ -356,16 +358,47 @@ Not carried:
     its files at once, though zrepl snapshots on `tank` hold the space until
     nazgul replicates past them.
 
+### Runbook (galadriel, then minas-tirith)
+
+On galadriel, from a commit, with the pre-migration snapshot taken:
+
+1. Pause zrepl's snapshots of `tank/pgdata` (and `tank/pgwal` where it is
+   separate).
+2. Build and copy: `GOOS=linux GOARCH=amd64 go build -o out/hopper-linux ./cmd/hopper`.
+3. Migrate, logging to a file:
+   `hopper migrate --db 'postgres:///hopper?host=/var/run/postgresql' --workers 16 --maintenance-mem 8GB --maintenance-workers 8`.
+   Sixteen workers on galadriel's 128 cores mirror what minas-tirith's 32
+   can run, so the duration predicts production's outage; more workers
+   would make the dress rehearsal faster and the prediction worse. The run
+   is resumable: rerun the same command after an interruption.
+4. `hopper migrate --verify` with the same `--db`: every check must be 0.
+5. Lookup parity against the result: `TestRehearsalLookupParity` with
+   `HOPPER_REHEARSAL_DSN` at galadriel's database and `HOPPER_PARITY_SAMPLE=0.1`
+   (a tenth of a percent of legacy's pages, tens of thousands of files); it
+   only reads. Then each triage queue's depth.
+6. Record the sizes and each stage's time here; resume zrepl and take one
+   snapshot.
+
+On minas-tirith the same, after stopping hopper, with `--production`; then
+start the new binary with `--store`.
+
 ### Replica
 
 `galadriel` subscribes to the publication `hopper_replica`, which covers the
-legacy tables. Its subscription is disabled, and production's slot
-`hopper_replica_galadriel` is inactive and holding WAL (461 MB behind when
-last measured). It would hold every byte the load writes.
+legacy tables. Its subscription is disabled. Production's slot
+`hopper_replica_galadriel` was dropped on 2026-11-13: inactive, it had come
+to hold 644 GB of WAL and would have held every byte the load writes.
+galadriel's legacy subscription cannot resume; its tables are a snapshot as
+of when it was disabled, which the dress rehearsal migrates.
 
 The plan:
 
-- drop or advance that slot before stage 3 (a decision below);
+- migrate galadriel's own snapshot first, as a full-size dress rehearsal,
+  then production;
+- on both hosts, pause zrepl's snapshots of the database datasets for the
+  run and take one afterwards: a snapshot taken mid-run pins the WAL,
+  sort files and replaced indexes the load writes and frees (the dropped
+  slot's 644 GB stayed on disk under `tank/pgwal`'s snapshots);
 - create a publication of the verdict tables after stage 7;
 - give galadriel a new subscription into its own `verdict` schema (an
   initial copy of about 1.5 TB);
@@ -495,11 +528,102 @@ which 12,196 are excerpts. Every check above passes.
     Sep 29 and Nov 7 kept Oct 18's reading from `3.0.0-beta.0`. The second
     pass's rewrites fell from 12 to 0 at 10,000, for 1.5% more verdict space
     and 15% more conversion time. `TestWriteAgreeingNewerScanRefreshes`.
+  - Speed (2026-11-13), measured at 25,000 results: 1 m 46 s became about
+    30 s.
+    - The excerpt cleanup tested `refs` with one `OR`, a nested loop over
+      every ref for every excerpt: 6 minutes at 50,000 results, growing with
+      the square, and at full size it would not have finished. Split into
+      two tests it is a hash anti-join (1.7 s). Each post step now logs its
+      time.
+    - The ranged stages (samples, locations, paths) run on the workers, as
+      the conversion does; at full size they read 308M legacy samples and
+      4.86B placements. The conversion's spans shrink so that every worker
+      has work at any size.
+    - The foreign keys are dropped for the load and added back, validated,
+      at the end (`migrate_fkeys`): each insert had probed and locked the
+      sample it names. Conversion at 8 workers: 40 s to 24 s.
+    - A member's juror is listed as gone only when it has a row.
+    - `--verify` lists the excerpts once instead of reading every legacy
+      report three times.
+  - A writer race the 16-worker rehearsal found (2026-11-13): a file's own
+    scan and an archive's thinner line for it, stored at once, could lose the
+    richer verdict, since held back, settled and reclaim were decided from a
+    read made before another writer committed. Seen on a UPX payload
+    (`bc2613fe…`) whose own scan said L12 with findings and an LLM reason,
+    and whose packed executable's line said L25: the parallel pass kept L25.
+    The writer now locks the sample rows of the files it will change, in
+    digest order, and decides again (`writer.lock`); a file whose line is
+    the stored opinion is not locked (`sameAs`), so files every archive
+    reads alike do not serialize writers. A lost deadlock is retried.
+    `TestWriteRaceKeepsRicherVerdict` reproduces both orders.
+  - The rehearsal's second pass may move a member's time, engine and report
+    (an agreeing newer scan within 30 days leaves no trace), bounded at 1%
+    of rows; what a lookup serves (class, level, outcome, rows present) must
+    not change at all. Decided 2026-11-13.
   - Not changed: the `contents_parents` GIN index, 42 bytes an edge, is no
     smaller rebuilt (almost every member sits in one archive) and serves four
     readers; WAL compression, which does nothing with
     `full_page_writes = off` (ZFS) as on galadriel; probabilities left
     unrounded, since after the drop few ml rows remain.
+
+### Galadriel (2026-11-13 to 2026-11-14)
+
+The full-size dress rehearsal, migrated with the build of 2731a34 and its
+working tree as of 2026-11-13, 16 workers until the last 700,000 results,
+then 32.
+
+- **Interrupted twice, resumed both times.** At 08:24 the GPU fell off the bus
+  (Xid 79) and the watchdog rebooted the host; at 14:27 it rebooted again on
+  a false alarm, `nvidia-smi` failing after a driver upgrade had replaced the
+  userspace tools under the loaded module. Crash recovery emptied that
+  build's unlogged working tables, so each resume rebuilt the conversion
+  order (4 h 10 m, one statement reading every legacy report). The working
+  tables are logged now, and the order is built in parallel without reading
+  the reports; conversion refuses to resume into an order that is gone.
+- **Stage times:** names 10 m, samples 31 m, conversion about 11 h in all
+  (11.8M results in 9 h 19 m at 16 workers, the last 1M in 2 h 17 m;
+  the newest results convert slowest), locations 28 m, paths 19 m, carried
+  1 m, post 1 h 47 m (the excerpt cleanup 28 m, the queue 22 m, the foreign
+  keys 37 m, `verdicts_sample_id_fkey` 16 m of it).
+- **Counts:** 12,851,387 results, 15 refused (each row's report describes
+  another file); 46,157,256 excerpts not converted, 42,770,845 of their rows
+  dropped; 268,932,653 samples (legacy's 311,130,883, less the dropped
+  excerpts, plus 572,615 members legacy never held a row for); 981,578
+  sightings (18 respelled), 291,015 reports, 5,966,206 label events, 57,010
+  popular packages, all equal to legacy; every bad and good label carried
+  (9,373,573 and 19,364,451); 1,144,595 files queued; 208,172 cited.
+- **Conversion rate, measured on the newest results:** 138 results/s at 16
+  workers, 171 at 32. At 32, 41% of the backends' time is spent waiting for
+  another writer's row lock, so more workers buy little. Each result costs
+  about 44 ms of the migration's CPU and 52 ms of PostgreSQL's.
+- **Audit, a 0.1% sample of legacy rows (310,804):** no row is gone but
+  excerpts, and no dropped excerpt had a label, name or path; labels equal
+  legacy's (purgatory as inconclusive); every analyzed top-level file has
+  atomscan's verdict and a scan. Legacy's `max_crit` is the worst trait
+  anywhere in a scan and atomscan's class is the ML level of one file, so
+  the two disagree by design; the trait reading is the floor juror's.
+- **Lookup parity at 0.1% (12,863 records):** the listed differences, plus 19
+  records whose `fires_at` legacy showed empty where the store serves -1 and
+  14 with an engine version legacy did not show: in the one traced, the file
+  was read again, by a newer engine, as a member of a later archive, and the
+  store serves that newer reading.
+- **Found and fixed for production:** version 7 reports written before
+  cleave's v8 format (2026-06-16) spell the findings `find` and the identity
+  `idn`, and the converter read neither: those files lost their floor juror,
+  the findings their verdict cites, and their identity claims (the report
+  itself was kept). About 240,000 results; in a sample of 592, 100 gain a
+  floor (52 hostile, 48 suspicious) and 45 an identity, and none fails to
+  convert. Galadriel's own copy keeps the gap. `TestConvertVersion7Find`.
+  The same build also reads version 4 to 6 reports' file lists (`fs`),
+  which galadriel's build did not: about 22% of results, whose members
+  had no verdicts.
+- **`--verify` at full size:** two checks would not have finished. The
+  excerpt test was `IN (SELECT id FROM verify_excerpts)`: 46 million ids do
+  not hash in `work_mem`, so the list was searched again for each of 311
+  million legacy rows; it is `EXISTS` now, an anti-join. The check that no
+  dropped excerpt was accounted for OR'd its accounts, each a subplan run
+  per excerpt, and galadriel's `sample_locations` has no index on `sha256`;
+  each account is its own semi-join now, one scan of the placements.
 
 ## 4. Pipeline: forager → hopper → postdoc → cyclotron on the migrated data
 

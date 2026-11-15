@@ -67,7 +67,7 @@ type migration struct {
 	report *Report
 	from   string // quoted
 	opt    Options
-	mu     sync.Mutex // guards report.Failures, Failed, Converted, Files
+	mu     sync.Mutex // guards report.Failures, Failed, Converted, Files, Samples, Locations
 }
 
 // Run migrates. The pool's search_path must be opt.To alone, so that the
@@ -171,7 +171,61 @@ func (m *migration) tables(ctx context.Context) error {
 	if _, err := m.pool.Exec(ctx, pre); err != nil {
 		return fmt.Errorf("migrate: tables: %w", err)
 	}
+	// The foreign keys are added back once the load is done (keys): each row
+	// a writer inserts would otherwise probe samples and lock the row it
+	// names, a write and a WAL record of its own. Nothing relies on them
+	// during the load: it keeps the members no list names (KeepOrphans), and
+	// the excerpt cleanup tests every table that names a sample.
+	if _, err := m.pool.Exec(ctx, `CREATE TABLE migrate_fkeys AS
+			SELECT conname::text AS name, conrelid::regclass::text AS tbl, pg_get_constraintdef(oid) AS def
+			FROM pg_constraint WHERE contype = 'f' AND connamespace = current_schema()::regnamespace`); err != nil {
+		return fmt.Errorf("migrate: tables: foreign keys: %w", err)
+	}
+	if _, err := m.pool.Exec(ctx, `DO $$ DECLARE k record; BEGIN
+			FOR k IN SELECT name, tbl FROM migrate_fkeys LOOP
+				EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', k.tbl, k.name);
+			END LOOP; END $$`); err != nil {
+		return fmt.Errorf("migrate: tables: foreign keys: %w", err)
+	}
 	return nil
+}
+
+// keys adds back the foreign keys tables dropped for the load, validating
+// each, one transaction apiece so that a restart adds only the rest.
+func (m *migration) keys(ctx context.Context) error {
+	var pending bool
+	if err := m.pool.QueryRow(ctx, `SELECT to_regclass('migrate_fkeys') IS NOT NULL`).Scan(&pending); err != nil || !pending {
+		return err
+	}
+	rows, err := m.pool.Query(ctx, `SELECT name, tbl, def FROM migrate_fkeys ORDER BY tbl, name`)
+	if err != nil {
+		return err
+	}
+	type fkey struct{ name, table, def string }
+	keys, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (fkey, error) {
+		var k fkey
+		err := row.Scan(&k.name, &k.table, &k.def)
+		return k, err
+	})
+	if err != nil {
+		return err
+	}
+	for _, k := range keys {
+		start := time.Now()
+		err := pgx.BeginFunc(ctx, m.pool, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, `ALTER TABLE `+k.table+` ADD CONSTRAINT `+pgx.Identifier{k.name}.Sanitize()+` `+k.def); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `DELETE FROM migrate_fkeys WHERE name = $1 AND tbl = $2`, k.name, k.table)
+			return err
+		})
+		if err != nil {
+			return fmt.Errorf("foreign key %s on %s: %w", k.name, k.table, err)
+		}
+		slog.InfoContext(ctx, "migrate: post step", "step", "foreign key "+k.name, "took", time.Since(start).Round(time.Millisecond))
+	}
+	_, err = m.pool.Exec(ctx, `DROP TABLE migrate_fkeys`)
+	return err
 }
 
 func (m *migration) kv(ctx context.Context, key string) (string, error) {
@@ -194,28 +248,86 @@ func (m *migration) setKV(ctx context.Context, key, value string) error {
 	return nil
 }
 
-// ranges calls step on each range of a legacy table's ids not yet done, in
-// order, recording each as done. step gets the range (lo, hi]; a range
-// starts at the next id there is, so gaps in the ids cost nothing.
+// ranges calls step on each range of a legacy table's ids not yet done, on
+// opt.Workers workers. step gets the range (lo, hi]; a range ends opt.Batch
+// ids past the next id there is, so gaps in the ids cost nothing. Ranges are
+// disjoint, so their statements touch disjoint legacy rows.
 func (m *migration) ranges(ctx context.Context, name, table string, step func(ctx context.Context, lo, hi int64) error) error {
 	from, last, err := m.span(ctx, name, table)
 	if err != nil {
 		return err
 	}
-	for lo := from; lo < last; {
-		if lo, err = m.nextID(ctx, table, lo); err != nil || lo >= last {
-			return err
+	next := func(ctx context.Context, lo int64) (int64, error) {
+		n, err := m.nextID(ctx, table, lo)
+		if err != nil || n >= last {
+			return last, err
 		}
-		hi := min(lo+m.opt.Batch, last)
-		if err := step(ctx, lo, hi); err != nil {
-			return err
+		return min(n+m.opt.Batch, last), nil
+	}
+	return m.parallel(ctx, "migrate:"+name+":through", from, last, next, step)
+}
+
+// parallel runs step on each span (lo, hi] from from to last, as next cuts
+// them, on opt.Workers workers, and records under key the end of the spans
+// below which every span is done. A restart resumes there, so it redoes at
+// most a span a worker, which writes nothing a second time. The first error
+// stops every worker.
+func (m *migration) parallel(ctx context.Context, key string, from, last int64,
+	next func(ctx context.Context, lo int64) (int64, error), step func(ctx context.Context, lo, hi int64) error,
+) error {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	type span struct{ lo, hi int64 }
+	work := make(chan span)
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		pending = map[int64]int64{} // finished spans not yet contiguous: lo → hi
+		done    = from
+	)
+	finish := func(s span) error {
+		mu.Lock()
+		defer mu.Unlock()
+		pending[s.lo] = s.hi
+		moved := false
+		for hi, ok := pending[done]; ok; hi, ok = pending[done] {
+			delete(pending, done)
+			done, moved = hi, true
+		}
+		if !moved {
+			return nil
+		}
+		return m.setKV(ctx, key, strconv.FormatInt(done, 10))
+	}
+	for range m.opt.Workers {
+		wg.Go(func() {
+			for s := range work {
+				err := step(ctx, s.lo, s.hi)
+				if err == nil {
+					err = finish(s)
+				}
+				if err != nil {
+					cancel(err)
+					return
+				}
+			}
+		})
+	}
+	for lo := from; lo < last && ctx.Err() == nil; {
+		hi, err := next(ctx, lo)
+		if err != nil {
+			cancel(err)
+			break
+		}
+		select {
+		case work <- span{lo, hi}:
+		case <-ctx.Done():
 		}
 		lo = hi
-		if err := m.setKV(ctx, "migrate:"+name+":through", strconv.FormatInt(hi, 10)); err != nil {
-			return err
-		}
 	}
-	return nil
+	close(work)
+	wg.Wait()
+	return context.Cause(ctx)
 }
 
 // nextID is the id just before the first row of a legacy table after lo, or
@@ -252,8 +364,14 @@ func (m *migration) span(ctx context.Context, name, table string) (from, last in
 
 // names interns every legacy release name, spelled as the store spells one,
 // and keeps a map from the legacy spelling for the samples stage.
+//
+// The migration's working tables (migrate_names, migrate_times,
+// migrate_order, migrate_excerpts) are logged, like the progress that points
+// into them: crash recovery empties an unlogged table and keeps the progress,
+// so a resume would skip work it believes done. On galadriel a host reboot
+// mid-convert did exactly that to the lists.
 func (m *migration) names(ctx context.Context) error {
-	if _, err := m.pool.Exec(ctx, `CREATE UNLOGGED TABLE IF NOT EXISTS migrate_names (
+	if _, err := m.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS migrate_names (
 		purl_base text PRIMARY KEY, name_id bigint NOT NULL)`); err != nil {
 		return err
 	}
@@ -316,7 +434,7 @@ func (m *migration) samples(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		m.report.Samples += tag.RowsAffected()
+		m.count(&m.report.Samples, tag.RowsAffected())
 		return nil
 	})
 	if err != nil {
@@ -336,6 +454,7 @@ type legacyResult struct {
 	// topTraits is the legacy row's top_traits: the strongest findings of its
 	// own entry, which legacy kept for reports the converter cannot read.
 	topTraits string
+	id        int64
 }
 
 // scanTime is when a legacy result was formed: the later of the row's
@@ -351,7 +470,7 @@ const scanTime = `coalesce(greatest(l.analyzed_at,
 	     THEN (coalesce(l.litmus_result->'ml', l.litmus_result)->>'analyzed_at')::timestamptz END),
 	l.last_error_at, l.created_at)`
 
-// convertBatch is how many results one converter takes at a time: small, so
+// convertBatch is the most results one converter takes at a time: small, so
 // that the results being stored at once are close together in time.
 const convertBatch = 1_000
 
@@ -372,96 +491,98 @@ const convertBatch = 1_000
 // Its first line has a parent (pid), where a scan's first line is the
 // scanned artifact. Its file keeps its row and labels, and is queued for a
 // scan of its own if it is on disk; one that nothing accounts for is dropped
-// at the end (post). The excerpts are listed in migrate_excerpts.
+// at the end (post). The converters tell the excerpts apart as they read
+// each report (v7result.Converted.Excerpt) and list them in migrate_excerpts.
 func (m *migration) convert(ctx context.Context) error {
-	if _, err := m.pool.Exec(ctx, `CREATE UNLOGGED TABLE IF NOT EXISTS migrate_order (
+	if _, err := m.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS migrate_order (
 			seq bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id bigint NOT NULL);
-		CREATE UNLOGGED TABLE IF NOT EXISTS migrate_excerpts (id bigint PRIMARY KEY)`); err != nil {
+		CREATE TABLE IF NOT EXISTS migrate_excerpts (id bigint PRIMARY KEY)`); err != nil {
 		return err
 	}
 	var last int64
 	if err := m.pool.QueryRow(ctx, `SELECT coalesce(max(seq), 0) FROM migrate_order`).Scan(&last); err != nil {
 		return err
 	}
-	if last == 0 {
-		// Both lists are made by one statement, so a restart finds both or
-		// neither.
-		if err := m.pool.QueryRow(ctx, `WITH legacy AS (
-				SELECT l.id, `+scanTime+` AS at,
-				       coalesce(coalesce(l.cleave_result->'files', l.cleave_result->'fs')->0 ? 'pid', false) AS excerpt
-				FROM `+m.from+`.samples l
-				WHERE l.parent = '' AND l.sha256 ~ '^[0-9a-f]{64}$' AND (l.cleave_result IS NOT NULL OR l.skip = 'timeout')
-			), excerpts AS (
-				INSERT INTO migrate_excerpts (id) SELECT id FROM legacy WHERE excerpt RETURNING id
-			), ordered AS (
-				INSERT INTO migrate_order (id) SELECT id FROM legacy WHERE NOT excerpt ORDER BY at, id RETURNING seq
-			)
-			SELECT (SELECT count(*) FROM ordered), (SELECT count(*) FROM excerpts)`).Scan(&last, &m.report.Excerpts); err != nil {
-			return err
-		}
-	}
-	from := int64(0)
 	through, err := m.kv(ctx, "migrate:convert:through")
 	if err != nil {
 		return err
 	}
+	if last == 0 {
+		// Progress counts positions in the list; a list made again need not
+		// put them where they were.
+		if through != "" {
+			return fmt.Errorf("convert progress is at %s but migrate_order is empty: the list it counts in is gone", through)
+		}
+		if last, err = m.order(ctx); err != nil {
+			return err
+		}
+	}
+	from := int64(0)
 	if through != "" {
 		if from, err = strconv.ParseInt(through, 10, 64); err != nil {
 			return fmt.Errorf("progress %q: %w", through, err)
 		}
 	}
-	ctx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
-	type span struct{ lo, hi int64 }
-	work := make(chan span)
-	var (
-		wg      sync.WaitGroup
-		mu      sync.Mutex
-		pending = map[int64]int64{} // finished batches not yet contiguous: lo → hi
-		done    = from
-	)
-	finish := func(s span) error {
-		mu.Lock()
-		defer mu.Unlock()
-		pending[s.lo] = s.hi
-		moved := false
-		for hi, ok := pending[done]; ok; hi, ok = pending[done] {
-			delete(pending, done)
-			done, moved = hi, true
-		}
-		if !moved {
-			return nil
-		}
-		return m.setKV(ctx, "migrate:convert:through", strconv.FormatInt(done, 10))
-	}
-	for range m.opt.Workers {
-		wg.Go(func() {
-			for s := range work {
-				err := m.convertRange(ctx, s.lo, s.hi)
-				if err == nil {
-					err = finish(s)
-				}
-				if err != nil {
-					cancel(err)
-					return
-				}
-			}
-		})
-	}
+	// Spans of convertBatch, or fewer results when that would leave workers
+	// idle: a small migration (a rehearsal) still gets 16 spans a worker.
+	batch := max(min(convertBatch, (last-from)/int64(16*m.opt.Workers)), 1)
 	started := time.Now()
-	for lo := from; lo < last && ctx.Err() == nil; lo += convertBatch {
-		select {
-		case work <- span{lo, min(lo+convertBatch, last)}:
-		case <-ctx.Done():
-		}
-		if n := (lo - from) / convertBatch; n > 0 && n%100 == 0 {
+	next := func(_ context.Context, lo int64) (int64, error) {
+		if n := (lo - from) / batch; n > 0 && n%100 == 0 {
 			slog.InfoContext(ctx, "migrate: converting", "done", lo, "of", last,
 				"converted", m.converted(), "elapsed", time.Since(started).Round(time.Second))
 		}
+		return min(lo+batch, last), nil
 	}
-	close(work)
-	wg.Wait()
-	return context.Cause(ctx)
+	return m.parallel(ctx, "migrate:convert:through", from, last, next, m.convertRange)
+}
+
+// order lists the analyzed top-level rows in time order (migrate_order) and
+// returns how many. Their times come from a narrow pass over the legacy rows,
+// in id ranges on every worker, that never reads a report: on galadriel the
+// one statement that also told the excerpts apart read 2.5 TB of reports to
+// do it, an hour on one core. The converters tell them apart instead, from
+// the report they read anyway (v7result.Converted.Excerpt). The list itself
+// is one statement, so a restart finds it whole or empty.
+func (m *migration) order(ctx context.Context) (int64, error) {
+	// A list begun and not finished leaves migrate_times, and its progress,
+	// to resume; without the table, the progress is a finished list's.
+	var resume bool
+	if err := m.pool.QueryRow(ctx, `SELECT to_regclass('migrate_times') IS NOT NULL`).Scan(&resume); err != nil {
+		return 0, err
+	}
+	if !resume {
+		if _, err := m.pool.Exec(ctx, `DELETE FROM hopper_kv WHERE key = 'migrate:times:through';
+			CREATE TABLE migrate_times (id bigint PRIMARY KEY, at timestamptz NOT NULL)`); err != nil {
+			return 0, err
+		}
+	}
+	err := m.ranges(ctx, "times", "samples", func(ctx context.Context, lo, hi int64) error {
+		_, err := m.pool.Exec(ctx, `INSERT INTO migrate_times (id, at)
+			SELECT l.id, `+scanTime+` FROM `+m.from+`.samples l
+			WHERE l.id > $1 AND l.id <= $2 AND l.parent = '' AND l.sha256 ~ '^[0-9a-f]{64}$'
+			  AND (l.cleave_result IS NOT NULL OR l.skip = 'timeout')
+			ON CONFLICT (id) DO NOTHING`, lo, hi)
+		return err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("times: %w", err)
+	}
+	var n int64
+	if err := m.pool.QueryRow(ctx, `WITH ordered AS (
+			INSERT INTO migrate_order (id) SELECT id FROM migrate_times ORDER BY at, id RETURNING seq)
+		SELECT count(*) FROM ordered`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("order: %w", err)
+	}
+	_, err = m.pool.Exec(ctx, `DROP TABLE migrate_times`)
+	return n, err
+}
+
+// count adds n to a field of the report that workers share.
+func (m *migration) count(field *int64, n int64) {
+	m.mu.Lock()
+	*field += n
+	m.mu.Unlock()
 }
 
 func (m *migration) converted() int64 {
@@ -476,7 +597,7 @@ func (m *migration) converted() int64 {
 // stored as that failed verdict, so the age sweep retries it rather than the
 // queue at once.
 func (m *migration) convertRange(ctx context.Context, lo, hi int64) error {
-	rows, err := m.pool.Query(ctx, `SELECT l.sha256, l.cleave_result::text, l.litmus_result::text, l.llm_result::text,
+	rows, err := m.pool.Query(ctx, `SELECT l.id, l.sha256, l.cleave_result::text, l.litmus_result::text, l.llm_result::text,
 			coalesce(l.traits_version, ''), `+scanTime+`, l.skip, coalesce(l.top_traits, '')
 		FROM migrate_order o JOIN `+m.from+`.samples l ON l.id = o.id
 		WHERE o.seq > $1 AND o.seq <= $2
@@ -486,16 +607,21 @@ func (m *migration) convertRange(ctx context.Context, lo, hi int64) error {
 	}
 	results, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (legacyResult, error) {
 		var r legacyResult
-		err := row.Scan(&r.sha256, &r.raw, &r.mlSection, &r.interp, &r.ruleset, &r.at, &r.skip, &r.topTraits)
+		err := row.Scan(&r.id, &r.sha256, &r.raw, &r.mlSection, &r.interp, &r.ruleset, &r.at, &r.skip, &r.topTraits)
 		return r, err
 	})
 	if err != nil {
 		return err
 	}
+	var excerpts []int64
 	for _, r := range results {
-		files, err := r.files()
+		files, excerpt, err := r.files()
 		if err != nil {
 			m.refuse(ctx, r.sha256, err)
+			continue
+		}
+		if excerpt {
+			excerpts = append(excerpts, r.id)
 			continue
 		}
 		if _, err := m.st.Write(ctx, files); err != nil {
@@ -510,24 +636,33 @@ func (m *migration) convertRange(ctx context.Context, lo, hi int64) error {
 		m.report.Files += int64(len(files))
 		m.mu.Unlock()
 	}
+	if len(excerpts) == 0 {
+		return nil
+	}
+	tag, err := m.pool.Exec(ctx, `INSERT INTO migrate_excerpts (id) SELECT unnest($1::bigint[]) ON CONFLICT DO NOTHING`, excerpts)
+	if err != nil {
+		return fmt.Errorf("excerpts: %w", err)
+	}
+	m.count(&m.report.Excerpts, tag.RowsAffected())
 	return nil
 }
 
-// files is the result as the writer takes it.
-func (r *legacyResult) files() ([]scanresult.File, error) {
+// files is the result as the writer takes it; excerpt is set, and files
+// left empty, for a legacy excerpt (convert).
+func (r *legacyResult) files() (files []scanresult.File, excerpt bool, err error) {
 	if r.raw == nil {
 		sha, err := hex.DecodeString(r.sha256)
 		return []scanresult.File{{
 			SHA256: sha, Verdict: json.RawMessage(`{"outcome":"timeout"}`),
 			Scan: scanresult.Stamp{At: r.at.UTC(), Ruleset: r.ruleset, Worker: "migrate"},
-		}}, err
+		}}, false, err
 	}
 	c, err := v7result.Convert(&v7result.Result{
 		At: r.at.UTC(), SHA256: r.sha256, Worker: "migrate", Ruleset: r.ruleset,
 		ML: raw(r.mlSection), LLM: raw(r.interp), Raw: raw(r.raw),
 	}, hopper.CriticalLevel)
-	if err != nil {
-		return nil, err
+	if err != nil || c.Excerpt {
+		return nil, err == nil, err
 	}
 	// The result was formed at scanTime; the converter would take the ML
 	// section's own, which an analysis that reused it leaves older.
@@ -535,14 +670,14 @@ func (r *legacyResult) files() ([]scanresult.File, error) {
 		c.Files[i].Scan.At = r.at.UTC()
 	}
 	if err := r.keepTopTraits(c.Files); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return c.Files, nil
+	return c.Files, false, nil
 }
 
 // keepTopTraits gives the scanned file's verdict the findings legacy kept
-// in top_traits when the converter read none: a report older than version 6,
-// whose traits it does not parse, still carried them, and lookup showed them.
+// in top_traits when the converter read none: a report with no file list
+// still carried them, and lookup showed them.
 func (r *legacyResult) keepTopTraits(files []scanresult.File) error {
 	if len(files) == 0 || files[0].Verdict == nil || r.topTraits == "" {
 		return nil
@@ -624,7 +759,7 @@ func (m *migration) locations(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		m.report.Locations += tag.RowsAffected()
+		m.count(&m.report.Locations, tag.RowsAffected())
 		return nil
 	})
 }
@@ -645,7 +780,7 @@ func (m *migration) paths(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		m.report.Locations += tag.RowsAffected()
+		m.count(&m.report.Locations, tag.RowsAffected())
 		return nil
 	})
 }
@@ -822,8 +957,12 @@ func (m *migration) post(ctx context.Context) error {
 	// samples_sha256_key measured a quarter smaller. Built once more over the
 	// finished tables, they start packed, and verdicts' stays so: new ids
 	// only grow.
+	if err := m.keys(ctx); err != nil {
+		return err
+	}
 	for _, sql := range []string{
 		`DROP TABLE IF EXISTS migrate_names`, `DROP TABLE IF EXISTS migrate_order`, `DROP TABLE IF EXISTS migrate_excerpts`,
+		`DROP TABLE IF EXISTS migrate_times`,
 		`REINDEX INDEX verdicts_pkey`, `REINDEX INDEX samples_sha256_key`, `REINDEX INDEX samples_pkey`,
 		`REINDEX INDEX refs_pkey`, `REINDEX INDEX claims_pkey`, `REINDEX INDEX locations_pkey`,
 		`VACUUM (ANALYZE) samples`, `ANALYZE`,

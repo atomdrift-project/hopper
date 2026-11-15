@@ -8,11 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"reflect"
 	"slices"
 	"time"
 
 	"github.com/atomdrift-project/hopper/scanresult"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -63,6 +66,32 @@ func (st *Store) Write(ctx context.Context, files []scanresult.File) (Stats, err
 	if err := scanresult.Check(files); err != nil {
 		return Stats{}, fmt.Errorf("store: write: %w", err)
 	}
+	for attempt := 1; ; attempt++ {
+		stats, err := st.write(ctx, files)
+		var pgErr *pgconn.PgError
+		if err == nil || attempt == writeAttempts || !errors.As(err, &pgErr) ||
+			(pgErr.Code != deadlockDetected && pgErr.Code != serializationFailure) {
+			return stats, err
+		}
+		slog.WarnContext(ctx, "store: write: retrying", "artifact", hex.EncodeToString(files[0].SHA256),
+			"attempt", attempt, "code", pgErr.Code, "error", pgErr.Message)
+	}
+}
+
+// The SQLSTATEs of a transaction PostgreSQL chose to abort for another's
+// sake: it can be tried again as it was.
+const (
+	deadlockDetected     = "40P01"
+	serializationFailure = "40001"
+)
+
+// writeAttempts bounds how often Write tries a result that lost a deadlock:
+// the writers lock in one order, so a deadlock is rare, and the transaction
+// that survives it has gone on by the next try.
+const writeAttempts = 5
+
+// write is one attempt at Write.
+func (st *Store) write(ctx context.Context, files []scanresult.File) (Stats, error) {
 	w := &writer{files: files, enc: st.enc, keepOrphans: st.KeepOrphans}
 	w.stats.Files = len(files)
 	err := pgx.BeginFunc(ctx, st.pool, func(tx pgx.Tx) error {
@@ -73,6 +102,9 @@ func (st *Store) Write(ctx context.Context, files []scanresult.File) (Stats, err
 		if late, err := w.late(ctx); err != nil || late {
 			w.stats.Late = late
 			return err
+		}
+		if st.afterRead != nil {
+			st.afterRead()
 		}
 		for _, step := range []func(context.Context) error{
 			w.verdicts, w.stamp, w.claims, w.contents, w.refs, w.queue,
@@ -95,11 +127,13 @@ type writer struct {
 	enc     *zstd.Encoder
 	rose    map[int64]string // sample id to the class it rose to
 	files   []scanresult.File
-	ids     []int64 // sample id of files[i]
-	own     []bool  // files[i] holds an opinion only a scan of the file itself gives
-	scanned []bool  // files[i] has been scanned on its own: it has a scans row
-	settled []bool  // member files[i] holds an opinion formed by this scan's time or later
-	thinner []bool  // member files[i]'s line would replace a richer opinion with a looser one
+	ids     []int64   // sample id of files[i]
+	own     []bool    // files[i] holds an opinion only a scan of the file itself gives
+	stored  [][]int16 // the jurors files[i] has rows for, as samples read them
+	scanned []bool    // files[i] has been scanned on its own: it has a scans row
+	settled []bool    // member files[i] holds an opinion formed by this scan's time or later
+	thinner []bool    // member files[i]'s line would replace a richer opinion with a looser one
+	same    []bool    // files[i]'s line is the stored opinion, and would write nothing (sameAs)
 	// reclaim is set when the scanned artifact's own opinion replaces a newer
 	// one that came from an archive's line and would have been held back had
 	// the two arrived in order (heldBack): its rows are written as formed at
@@ -154,56 +188,20 @@ func (w *writer) samples(ctx context.Context) error {
 	}
 	w.stats.NewSamples = tag.RowsAffected()
 
-	rows, err := w.tx.Query(ctx, `SELECT u.ord, s.id,
-			EXISTS (SELECT 1 FROM verdicts v WHERE v.sample_id = s.id AND v.scanner_id = ANY($2)),
-			EXISTS (SELECT 1 FROM scans c WHERE c.sample_id = s.id),
-			coalesce(a.formed_at >= $6, false),
-			(u.type <> '' AND s.file_type IS DISTINCT FROM u.type) OR (s.size_bytes IS NULL AND u.size > 0),
-			a.class::text, a.fires_at, coalesce(a.summary->>'reason', '') <> '', coalesce(a.summary ? 'top', false),
-			a.formed_at
-		FROM unnest($1::bytea[], $3::text[], $4::bigint[]) WITH ORDINALITY AS u(sha, type, size, ord)
-		JOIN samples s ON s.sha256 = u.sha
-		LEFT JOIN verdicts a ON a.sample_id = s.id AND a.scanner_id = $5`,
-		shas, []int16{jurors["llm"], jurors["drift_heuristic"], jurors["drift_llm"]}, types, sizes,
-		atomscan, w.files[0].Scan.At)
-	if err != nil {
-		return fmt.Errorf("sample ids: %w", err)
-	}
 	n := len(w.files)
-	w.ids, w.own, w.scanned = make([]int64, n), make([]bool, n), make([]bool, n)
-	w.settled, w.thinner = make([]bool, n), make([]bool, n)
-	var (
-		ord, id                       int64
-		own, scanned, settled, retype bool
-		stored                        storedOpinion
-		stale                         []int64
-		staleTypes                    []string
-		staleSizes                    []int64
-	)
-	if _, err := pgx.ForEachRow(rows, []any{
-		&ord, &id, &own, &scanned, &settled, &retype,
-		&stored.class, &stored.firesAt, &stored.reason, &stored.top, &stored.formedAt,
-	}, func() error {
-		w.ids[ord-1], w.own[ord-1], w.scanned[ord-1], w.settled[ord-1] = id, own, scanned, settled && ord > 1
-		old, hasOld := stored.facts()
-		line, hasLine := factsOf(w.files[ord-1].Verdict)
-		switch {
-		case !hasOld || !hasLine:
-		case ord > 1:
-			w.thinner[ord-1] = heldBack(old, line)
-		case stored.formedAt.After(w.files[0].Scan.At) && heldBack(line, old):
-			w.reclaim = *stored.formedAt
-		default:
-		}
-		if retype {
-			stale, staleTypes, staleSizes = append(stale, id), append(staleTypes, types[ord-1]), append(staleSizes, sizes[ord-1])
-		}
-		return nil
-	}); err != nil {
-		return fmt.Errorf("sample ids: %w", err)
+	w.ids, w.own, w.stored, w.scanned = make([]int64, n), make([]bool, n), make([][]int16, n), make([]bool, n)
+	w.settled, w.thinner, w.same = make([]bool, n), make([]bool, n), make([]bool, n)
+	all := make([]int, n)
+	for i := range all {
+		all[i] = i
 	}
-	if len(stale) == 0 {
-		return nil
+	stale, err := w.read(ctx, all)
+	if err != nil || len(stale) == 0 {
+		return err
+	}
+	staleIDs, staleTypes, staleSizes := make([]int64, len(stale)), make([]string, len(stale)), make([]int64, len(stale))
+	for j, i := range stale {
+		staleIDs[j], staleTypes[j], staleSizes[j] = w.ids[i], types[i], sizes[i]
 	}
 	// A file hopper learned of before it was scanned (ingest knows a path, and
 	// perhaps a size, not a type) takes its type and size from the scan. Only
@@ -214,12 +212,83 @@ func (w *writer) samples(ctx context.Context) error {
 		UPDATE samples s SET file_type = coalesce(nullif(u.type, ''), s.file_type),
 			size_bytes = coalesce(s.size_bytes, nullif(u.size, 0))
 		FROM unnest($1::bigint[], $2::text[], $3::bigint[]) AS u(id, type, size), held
-		WHERE s.id = u.id AND s.id = held.id`, stale, staleTypes, staleSizes)
+		WHERE s.id = u.id AND s.id = held.id`, staleIDs, staleTypes, staleSizes)
 	if err != nil {
 		return fmt.Errorf("sample types: %w", err)
 	}
 	w.stats.Retyped = tag.RowsAffected()
 	return nil
+}
+
+// read learns, for the files at idx, their ids and what decides whether a
+// line replaces the stored opinion: the jurors stored, whether the file was
+// scanned on its own, and atomscan's stored verdict (settled, thinner,
+// reclaim). It returns the files among them whose type or size the scan
+// sets. Run first over every file, unlocked, and again under lock over the
+// files the write will change (lock), so that it decides from what is
+// stored when it writes.
+func (w *writer) read(ctx context.Context, idx []int) (stale []int, err error) {
+	shas, types, sizes := make([][]byte, len(idx)), make([]string, len(idx)), make([]int64, len(idx))
+	for j, i := range idx {
+		shas[j], types[j], sizes[j] = w.files[i].SHA256, w.files[i].Type, w.files[i].Size
+	}
+	juror := make([]int16, 0, len(jurors))
+	for _, id := range jurors {
+		juror = append(juror, id)
+	}
+	rows, err := w.tx.Query(ctx, `SELECT u.ord, s.id,
+			ARRAY(SELECT v.scanner_id FROM verdicts v WHERE v.sample_id = s.id AND v.scanner_id = ANY($2)),
+			EXISTS (SELECT 1 FROM scans c WHERE c.sample_id = s.id),
+			coalesce(a.formed_at >= $6, false),
+			(u.type <> '' AND s.file_type IS DISTINCT FROM u.type) OR (s.size_bytes IS NULL AND u.size > 0),
+			a.class::text, a.fires_at, coalesce(a.summary->>'reason', '') <> '', coalesce(a.summary ? 'top', false),
+			a.formed_at, a.outcome::text, a.ruleset, a.digest, a.summary - 'eng'
+		FROM unnest($1::bytea[], $3::text[], $4::bigint[]) WITH ORDINALITY AS u(sha, type, size, ord)
+		JOIN samples s ON s.sha256 = u.sha
+		LEFT JOIN verdicts a ON a.sample_id = s.id AND a.scanner_id = $5`,
+		shas, juror, types, sizes, atomscan, w.files[0].Scan.At)
+	if err != nil {
+		return nil, fmt.Errorf("sample ids: %w", err)
+	}
+	var (
+		ord, id                  int64
+		held                     []int16
+		scanned, settled, retype bool
+		stored                   storedOpinion
+	)
+	if _, err := pgx.ForEachRow(rows, []any{
+		&ord, &id, &held, &scanned, &settled, &retype,
+		&stored.class, &stored.firesAt, &stored.reason, &stored.top, &stored.formedAt,
+		&stored.outcome, &stored.ruleset, &stored.digest, &stored.summary,
+	}, func() error {
+		i := idx[ord-1]
+		own := slices.ContainsFunc(held, func(s int16) bool {
+			return s == jurors["llm"] || s == jurors["drift_heuristic"] || s == jurors["drift_llm"]
+		})
+		w.ids[i], w.own[i], w.stored[i] = id, own, held
+		w.scanned[i], w.settled[i], w.thinner[i] = scanned, settled && i > 0, false
+		w.same[i] = len(held) == 0 && w.sameAs(i, &stored)
+		if i == 0 {
+			w.reclaim = time.Time{}
+		}
+		old, hasOld := stored.facts()
+		line, hasLine := factsOf(w.files[i].Verdict)
+		switch {
+		case !hasOld || !hasLine:
+		case i > 0:
+			w.thinner[i] = heldBack(old, line)
+		case stored.formedAt.After(w.files[0].Scan.At) && heldBack(line, old):
+			w.reclaim = *stored.formedAt
+		default:
+		}
+		if retype {
+			stale = append(stale, i)
+		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("sample ids: %w", err)
+	}
+	return stale, nil
 }
 
 // formed is the time file i's opinion rows are written as formed: the scan's,
@@ -237,8 +306,63 @@ type storedOpinion struct {
 	class    *string // nil when there is no stored verdict, or it reached no class
 	formedAt *time.Time
 	firesAt  *int
-	reason   bool // it carries a reason: the interpretation a person reads
-	top      bool // it carries findings
+	outcome  *string
+	ruleset  *string
+	digest   []byte
+	summary  []byte // without the engine, which no comparison reads
+	reason   bool   // it carries a reason: the interpretation a person reads
+	top      bool   // it carries findings
+}
+
+// sameAs reports whether file i's atomscan line is certainly the stored
+// opinion, so that storing it writes nothing (upsertChanged): the same
+// outcome, class, level, report and summary, under the same ruleset, the
+// stored one formed no more than refreshAge before this scan. Any doubt
+// answers false; the write then locks the file and decides under the lock.
+// A line with a juror to store is never the same, nor a file with juror
+// rows (read): whether they change is the insert's to say.
+func (w *writer) sameAs(i int, s *storedOpinion) bool {
+	f := &w.files[i]
+	for name := range f.Jurors {
+		if w.speaks(i, name) {
+			return false
+		}
+	}
+	if f.Verdict == nil || len(f.Scanners) > 0 || s.formedAt == nil || s.outcome == nil ||
+		s.ruleset == nil || *s.ruleset != f.Scan.Ruleset || !bytes.Equal(s.digest, f.Report) ||
+		s.formedAt.Before(f.Scan.At.Add(-refreshWindow)) {
+		return false
+	}
+	var head struct {
+		FiresAt *int   `json:"fires_at"`
+		Outcome string `json:"outcome"`
+		Class   string `json:"class"`
+	}
+	var line map[string]any
+	if json.Unmarshal(f.Verdict, &head) != nil || json.Unmarshal(f.Verdict, &line) != nil {
+		return false
+	}
+	switch {
+	case cmp.Or(head.Outcome, "ok") != *s.outcome,
+		s.class == nil && head.Class != "" || s.class != nil && *s.class != head.Class,
+		(head.FiresAt == nil) != (s.firesAt == nil) || head.FiresAt != nil && *head.FiresAt != *s.firesAt:
+		return false
+	default:
+	}
+	delete(line, "outcome")
+	delete(line, "class")
+	delete(line, "fires_at")
+	if f.Scan.Level != 0 && f.Scan.Level != impliedLevel {
+		line["level"] = float64(f.Scan.Level)
+	}
+	var stored map[string]any
+	if s.summary != nil && json.Unmarshal(s.summary, &stored) != nil {
+		return false
+	}
+	if len(line) == 0 && len(stored) == 0 {
+		return true
+	}
+	return reflect.DeepEqual(line, stored)
 }
 
 func (o *storedOpinion) facts() (opinionFacts, bool) {
@@ -370,128 +494,36 @@ func (w *writer) stamp(ctx context.Context) error {
 // for being absent: whether a scanner runs depends on the uploading host, not
 // on the file, so only the scanner's own report replaces its row.
 func (w *writer) verdicts(ctx context.Context) error {
-	var (
-		lead, held   opinionRows // atomscan's and other scanners' rows; jurors' rows
-		goneIDs      []int64
-		goneScanners []int16
-		goneTimes    []time.Time
-	)
-	file := make(map[int64]int, len(w.files)) // sample id to index in files
-	w.outcome = make([]conclusion, len(w.files))
-	for i := range w.files {
-		f := &w.files[i]
-		if f.Report != nil {
-			// Until the write stores it: every report it does not is one
-			// already stored, or one of a member it leaves alone.
-			w.stats.ReportsUnchanged++
-		}
-		if f.Verdict == nil {
-			continue
-		}
-		if i > 0 && (w.own[i] || w.settled[i] || w.thinner[i]) {
-			// The LLM or isomer has judged this file in a scan of its own,
-			// which read everything a member's line can say and more; or
-			// another archive's scan, as recent as this one or more, formed
-			// its opinion; or the stored opinion says more than this line
-			// (heldBack). The file keeps it: replacing it here
-			// would only be undone, and two archives scanned in the same second
-			// would undo each other on every pass.
-			w.stats.Deferred++
-			continue
-		}
-		w.stats.Judged++
-		file[w.ids[i]] = i
-		var verdict struct {
-			Outcome string `json:"outcome"`
-			Error   string `json:"error"`
-		}
-		if err := json.Unmarshal(f.Verdict, &verdict); err != nil {
-			return fmt.Errorf("file %d: verdict: %w", i, err)
-		}
-		w.outcome[i] = conclusion{cmp.Or(verdict.Outcome, "ok"), verdict.Error}
-		if w.outcome[i].outcome == "ok" {
-			// Only a scan that succeeded speaks for its jurors, and a
-			// member's line only for the jurors a member's line can carry.
-			for name, scanner := range jurors {
-				if !w.speaks(i, name) && (i == 0 || name == "floor" || name == "ml") {
-					goneIDs, goneScanners = append(goneIDs, w.ids[i]), append(goneScanners, scanner)
-					goneTimes = append(goneTimes, w.formed(i))
-				}
-			}
-		}
-		if err := w.scannerRows(i, &lead); err != nil {
-			return err
-		}
-		// What the scan says about itself rides on atomscan's row: the engine,
-		// and the level it ran at when that is not the one implied. The worker
-		// is logged with the result and not stored.
-		level := f.Scan.Level
-		if level == impliedLevel {
-			level = 0
-		}
-		extra, err := json.Marshal(struct {
-			Engine string `json:"eng,omitempty"`
-			Level  int    `json:"level,omitempty"`
-		}{f.Scan.Engine, level})
-		if err != nil {
-			return err
-		}
-		// Every report is compressed, though most are stored already: the
-		// insert compares digests and keeps the stored copy when they match.
-		var detail []byte
-		if f.ReportLine != nil {
-			detail = w.enc.EncodeAll(f.ReportLine, nil)
-		}
-		lead.add(w.ids[i], atomscan, string(f.Verdict), f.Scan.Ruleset, string(extra), w.formed(i), f.Report, detail)
-		for name, opinion := range f.Jurors {
-			if w.speaks(i, name) {
-				held.add(w.ids[i], jurors[name], string(opinion), f.Scan.Ruleset, "{}", w.formed(i), nil, nil)
-			}
-		}
-	}
 	w.rose = map[int64]string{}
-	if len(lead.ids) == 0 {
+	r, err := w.rows(nil)
+	if err != nil {
+		return err
+	}
+	// Decide again under lock: whether a line is held back, settled or
+	// reclaims depends on rows another writer may be changing, and the
+	// insert's own conflict test covers only formed_at. A file whose line
+	// is the stored opinion is not locked (sameAs), so a file every archive
+	// reads alike stays free (TestWriteRaceKeepsRicherVerdict).
+	changing := w.changing(r)
+	if err := w.lock(ctx, changing); err != nil {
+		return err
+	}
+	if r, err = w.rows(changing); err != nil {
+		return err
+	}
+	w.stats.Judged, w.stats.Deferred, w.stats.ReportsUnchanged = r.judged, r.deferred, r.reports
+	if len(r.lead.ids) == 0 {
 		return nil
 	}
-	at := w.files[0].Scan.At
-
-	// A member's jurors are part of its opinion: when this scan changes them,
-	// atomscan's row is rewritten too, so its formed_at says when the whole
-	// opinion last changed, and a scan older than that (another archive's,
-	// holding the same member) changes none of it. Without this, a newer
-	// scan that dropped a member's juror and an older one that names it
-	// would undo each other on every pass. The scanned artifact needs none
-	// of this: its results are ordered by its lock (late).
-	rows, err := w.tx.Query(ctx, `SELECT DISTINCT x.sample_id FROM (
-			SELECT u.sample_id FROM unnest($1::bigint[], $2::smallint[], $3::jsonb[]) AS u(sample_id, scanner_id, opinion)
-			LEFT JOIN verdicts v ON v.sample_id = u.sample_id AND v.scanner_id = u.scanner_id
-			WHERE v.sample_id IS NULL OR (v.outcome, v.class, v.fires_at, v.summary) IS DISTINCT FROM
-			      (coalesce((u.opinion->>'outcome')::outcome, 'ok'), (u.opinion->>'class')::class,
-			       (u.opinion->>'fires_at')::smallint, u.opinion - 'outcome' - 'class' - 'fires_at')
-			UNION ALL
-			SELECT g.sample_id FROM unnest($4::bigint[], $5::smallint[]) AS g(sample_id, scanner_id)
-			JOIN verdicts v ON v.sample_id = g.sample_id AND v.scanner_id = g.scanner_id) x
-		WHERE x.sample_id <> $8
-		  AND NOT EXISTS (SELECT 1 FROM verdicts a WHERE a.sample_id = x.sample_id AND a.scanner_id = $6 AND a.formed_at > $7)`,
-		held.ids, held.scanners, held.opinions, goneIDs, goneScanners, atomscan, at, w.ids[0])
+	reformed, err := w.reformed(ctx, r)
 	if err != nil {
-		return fmt.Errorf("jurors: %w", err)
-	}
-	reformed, err := pgx.CollectRows(rows, pgx.RowTo[int64])
-	if err != nil {
-		return fmt.Errorf("jurors: %w", err)
-	}
-
-	// The scanners whose last good row a failed scan leaves standing.
-	lasting := []int16{atomscan}
-	for _, scanner := range outside {
-		lasting = append(lasting, scanner)
+		return err
 	}
 	// atomscan's and the other scanners' rows first, then the jurors': every
 	// writer takes them in that order, each part in key order, so two cannot
 	// deadlock.
-	n, err := w.upsert(ctx, &lead, lasting, reformed, func(id int64, old []byte, rose bool, class *string) {
-		if report := w.files[file[id]].Report; report != nil && !bytes.Equal(old, report) {
+	n, err := w.upsert(ctx, &r.lead, reformed, func(id int64, old []byte, rose bool, class *string) {
+		if report := w.files[r.file[id]].Report; report != nil && !bytes.Equal(old, report) {
 			w.stats.Reports++
 			w.stats.ReportsUnchanged--
 		}
@@ -505,11 +537,11 @@ func (w *writer) verdicts(ctx context.Context) error {
 		return fmt.Errorf("verdicts: %w", err)
 	}
 	w.stats.Verdicts = n
-	if n, err = w.upsert(ctx, &held, lasting, nil, nil); err != nil {
+	if n, err = w.upsert(ctx, &r.held, nil, nil); err != nil {
 		return fmt.Errorf("jurors: %w", err)
 	}
 	w.stats.Verdicts += n
-	if len(goneIDs) == 0 {
+	if len(r.gone.ids) == 0 {
 		return nil
 	}
 	tag, err := w.tx.Exec(ctx, `DELETE FROM verdicts d USING (
@@ -519,13 +551,193 @@ func (w *writer) verdicts(ctx context.Context) error {
 			WHERE v.formed_at <= g.at
 			  AND NOT EXISTS (SELECT 1 FROM verdicts a WHERE a.sample_id = v.sample_id AND a.scanner_id = $4 AND a.formed_at > g.at)
 			ORDER BY 1, 2 FOR UPDATE OF v) k
-		WHERE d.sample_id = k.sample_id AND d.scanner_id = k.scanner_id`, goneIDs, goneScanners, goneTimes, atomscan)
+		WHERE d.sample_id = k.sample_id AND d.scanner_id = k.scanner_id`, r.gone.ids, r.gone.scanners, r.gone.times, atomscan)
 	if err != nil {
 		return fmt.Errorf("stale jurors: %w", err)
 	}
 	w.stats.JurorsRemoved = tag.RowsAffected()
 	return nil
 }
+
+// verdictRows is what one pass over the files would store.
+type verdictRows struct {
+	file       map[int64]int // sample id to index in files
+	lead, held opinionRows   // atomscan's and other scanners' rows; jurors' rows
+	gone       struct {      // juror rows to drop, and the time each scan formed
+		ids      []int64
+		scanners []int16
+		times    []time.Time
+	}
+	judged, deferred, reports int
+}
+
+// rows builds the verdict rows the files' lines would store, from what read
+// decided, and records what the scan concluded about each file. With only
+// set, the rows of other files are left out: they would change nothing.
+func (w *writer) rows(only map[int64]bool) (*verdictRows, error) {
+	r := &verdictRows{file: make(map[int64]int, len(w.files))}
+	w.outcome = make([]conclusion, len(w.files))
+	for i := range w.files {
+		f := &w.files[i]
+		if f.Report != nil {
+			// Until the write stores it: every report it does not is one
+			// already stored, or one of a member it leaves alone.
+			r.reports++
+		}
+		if f.Verdict == nil {
+			continue
+		}
+		if i > 0 && (w.own[i] || w.settled[i] || w.thinner[i]) {
+			// The LLM or isomer has judged this file in a scan of its own,
+			// which read everything a member's line can say and more; or
+			// another archive's scan, as recent as this one or more, formed
+			// its opinion; or the stored opinion says more than this line
+			// (heldBack). The file keeps it: replacing it here would only be
+			// undone, and two archives scanned in the same second would undo
+			// each other on every pass.
+			r.deferred++
+			continue
+		}
+		r.judged++
+		var verdict struct {
+			Outcome string `json:"outcome"`
+			Error   string `json:"error"`
+		}
+		if err := json.Unmarshal(f.Verdict, &verdict); err != nil {
+			return nil, fmt.Errorf("file %d: verdict: %w", i, err)
+		}
+		w.outcome[i] = conclusion{cmp.Or(verdict.Outcome, "ok"), verdict.Error}
+		if only != nil && !only[w.ids[i]] {
+			continue
+		}
+		r.file[w.ids[i]] = i
+		if err := w.fileRows(i, r); err != nil {
+			return nil, err
+		}
+	}
+	return r, nil
+}
+
+// fileRows adds file i's rows to r: atomscan's, the other scanners', its
+// jurors', and the jurors it no longer names.
+func (w *writer) fileRows(i int, r *verdictRows) error {
+	f := &w.files[i]
+	if w.outcome[i].outcome == "ok" {
+		// Only a scan that succeeded speaks for its jurors, and a member's
+		// line only for the jurors a member's line can carry. A juror with
+		// no row has nothing to remove: most members have none, and listing
+		// every one cost a probe each.
+		for name, scanner := range jurors {
+			if !w.speaks(i, name) && (i == 0 || name == "floor" || name == "ml") && slices.Contains(w.stored[i], scanner) {
+				r.gone.ids, r.gone.scanners = append(r.gone.ids, w.ids[i]), append(r.gone.scanners, scanner)
+				r.gone.times = append(r.gone.times, w.formed(i))
+			}
+		}
+	}
+	if err := w.scannerRows(i, &r.lead); err != nil {
+		return err
+	}
+	// What the scan says about itself rides on atomscan's row: the engine,
+	// and the level it ran at when that is not the one implied. The worker
+	// is logged with the result and not stored.
+	level := f.Scan.Level
+	if level == impliedLevel {
+		level = 0
+	}
+	extra, err := json.Marshal(struct {
+		Engine string `json:"eng,omitempty"`
+		Level  int    `json:"level,omitempty"`
+	}{f.Scan.Engine, level})
+	if err != nil {
+		return err
+	}
+	// Every report is compressed, though most are stored already: the
+	// insert compares digests and keeps the stored copy when they match.
+	var detail []byte
+	if f.ReportLine != nil {
+		detail = w.enc.EncodeAll(f.ReportLine, nil)
+	}
+	r.lead.add(w.ids[i], atomscan, string(f.Verdict), f.Scan.Ruleset, string(extra), w.formed(i), f.Report, detail)
+	for name, opinion := range f.Jurors {
+		if w.speaks(i, name) {
+			r.held.add(w.ids[i], jurors[name], string(opinion), f.Scan.Ruleset, "{}", w.formed(i), nil, nil)
+		}
+	}
+	return nil
+}
+
+// changing returns the files whose rows r would write: every judged file
+// but those whose line is the stored opinion (sameAs), and the scanned
+// artifact always.
+func (w *writer) changing(r *verdictRows) map[int64]bool {
+	ids := map[int64]bool{w.ids[0]: true}
+	for id, i := range r.file {
+		if !w.same[i] {
+			ids[id] = true
+		}
+	}
+	return ids
+}
+
+// lock takes the sample rows of the files a write will change, in digest
+// order as every writer of samples takes them, and reads those files again.
+// Another writer changing one of them holds the same lock, so what read
+// decides now stands until this write commits.
+func (w *writer) lock(ctx context.Context, ids map[int64]bool) error {
+	locked := make([]int64, 0, len(ids))
+	var idx []int
+	for i, id := range w.ids {
+		if ids[id] {
+			locked, idx = append(locked, id), append(idx, i)
+		}
+	}
+	if _, err := w.tx.Exec(ctx, `SELECT 1 FROM samples WHERE id = ANY($1) ORDER BY sha256 FOR NO KEY UPDATE`, locked); err != nil {
+		return fmt.Errorf("lock: %w", err)
+	}
+	_, err := w.read(ctx, idx)
+	return err
+}
+
+// reformed returns the members whose jurors r changes: their atomscan row is
+// rewritten too, so its formed_at says when the whole opinion last changed,
+// and a scan older than that (another archive's, holding the same member)
+// changes none of it. Without this, a newer scan that dropped a member's
+// juror and an older one that names it would undo each other on every pass.
+// The scanned artifact needs none of this: its results are ordered by its
+// lock (late).
+func (w *writer) reformed(ctx context.Context, r *verdictRows) ([]int64, error) {
+	rows, err := w.tx.Query(ctx, `SELECT DISTINCT x.sample_id FROM (
+			SELECT u.sample_id FROM unnest($1::bigint[], $2::smallint[], $3::jsonb[]) AS u(sample_id, scanner_id, opinion)
+			LEFT JOIN verdicts v ON v.sample_id = u.sample_id AND v.scanner_id = u.scanner_id
+			WHERE v.sample_id IS NULL OR (v.outcome, v.class, v.fires_at, v.summary) IS DISTINCT FROM
+			      (coalesce((u.opinion->>'outcome')::outcome, 'ok'), (u.opinion->>'class')::class,
+			       (u.opinion->>'fires_at')::smallint, u.opinion - 'outcome' - 'class' - 'fires_at')
+			UNION ALL
+			SELECT g.sample_id FROM unnest($4::bigint[], $5::smallint[]) AS g(sample_id, scanner_id)
+			JOIN verdicts v ON v.sample_id = g.sample_id AND v.scanner_id = g.scanner_id) x
+		WHERE x.sample_id <> $8
+		  AND NOT EXISTS (SELECT 1 FROM verdicts a WHERE a.sample_id = x.sample_id AND a.scanner_id = $6 AND a.formed_at > $7)`,
+		r.held.ids, r.held.scanners, r.held.opinions, r.gone.ids, r.gone.scanners, atomscan, w.files[0].Scan.At, w.ids[0])
+	if err != nil {
+		return nil, fmt.Errorf("jurors: %w", err)
+	}
+	reformed, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return nil, fmt.Errorf("jurors: %w", err)
+	}
+	return reformed, nil
+}
+
+// lasting are the scanners whose last good row a failed scan leaves
+// standing: atomscan, and the scanners that are not atomdrift's.
+var lasting = func() []int16 {
+	l := []int16{atomscan}
+	for _, scanner := range outside {
+		l = append(l, scanner)
+	}
+	slices.Sort(l)
+	return l
+}()
 
 // scannerRows adds file i's rows from the scanners that are not atomdrift's.
 // The engine rides beside the finding, as atomscan's does.
@@ -592,11 +804,37 @@ func (o *opinionRows) add(id int64, scanner int16, opinion, ruleset, extra strin
 	o.times, o.digests, o.details = append(o.times, at), append(o.digests, digest), append(o.details, detail)
 }
 
+// upsertRows is the rows an upsert stores, each opinion split into its
+// columns, beside the stored row (v). Its parameters are upsert's:
+// $1–$7 and $11 the rows, $8 lasting, $9 atomscan, $10 reformed.
+const upsertRows = `FROM (SELECT u.sample_id, u.scanner_id, coalesce((u.opinion->>'outcome')::outcome, 'ok') AS outcome,
+	             (u.opinion->>'class')::class AS class, (u.opinion->>'fires_at')::smallint AS fires_at,
+	             u.ruleset, u.at, u.digest, u.detail,
+	             (u.opinion - 'outcome' - 'class' - 'fires_at') || u.extra AS summary
+	      FROM unnest($1::bigint[], $2::smallint[], $3::jsonb[], $4::text[], $5::timestamptz[], $6::bytea[], $7::jsonb[], $11::bytea[])
+	          AS u(sample_id, scanner_id, opinion, ruleset, at, digest, extra, detail)) u
+	LEFT JOIN verdicts v ON v.sample_id = u.sample_id AND v.scanner_id = u.scanner_id`
+
+// upsertChanged keeps the rows of upsertRows that would change the stored
+// row (upsert). sameAs is its Go form for a line that writes nothing.
+const upsertChanged = `NOT EXISTS (SELECT 1 FROM verdicts a WHERE a.sample_id = u.sample_id AND a.scanner_id = $9 AND a.formed_at > u.at)
+	AND (v.sample_id IS NULL
+	  OR ((v.scanner_id <> ALL($8) OR u.outcome = 'ok' OR v.outcome <> 'ok') AND v.formed_at <= u.at
+	      AND ((v.outcome, v.class, v.fires_at, v.digest, v.summary - 'eng')
+	           IS DISTINCT FROM (u.outcome, u.class, u.fires_at, u.digest, u.summary - 'eng')
+	           OR (v.formed_at < u.at AND (v.ruleset <> u.ruleset OR v.formed_at < u.at - ` + refreshAge + `))
+	           OR (u.scanner_id = $9 AND u.sample_id = ANY($10)))))`
+
 // refreshAge is how old a stored opinion may grow before a newer scan that
 // agrees with it, under the same ruleset, writes its own time on the row:
 // scan's DEFAULT_MAX_AGE_DAYS, the age past which it stops trusting a
 // benign verdict from hopper in place of analyzing the bytes again.
-const refreshAge = `interval '30 days'`
+// Hours, not days: a day across a change of clocks is not 24 hours, and
+// sameAs must draw the same line.
+const refreshAge = `interval '720 hours'`
+
+// refreshWindow is refreshAge for Go's comparisons (sameAs).
+const refreshWindow = 720 * time.Hour
 
 // upsert writes the rows of o that differ from the stored ones, and the
 // atomscan rows of the files in reformed whatever they hold (their jurors
@@ -618,7 +856,7 @@ const refreshAge = `interval '30 days'`
 // A row whose digest is unchanged keeps its stored report, so a large one in
 // TOAST is not written again. written, if given, is told of each atomscan
 // row written. upsert returns how many rows it wrote.
-func (w *writer) upsert(ctx context.Context, o *opinionRows, lasting []int16, reformed []int64,
+func (w *writer) upsert(ctx context.Context, o *opinionRows, reformed []int64,
 	written func(id int64, oldDigest []byte, rose bool, class *string),
 ) (int64, error) {
 	if len(o.ids) == 0 {
@@ -627,20 +865,8 @@ func (w *writer) upsert(ctx context.Context, o *opinionRows, lasting []int16, re
 	rows, err := w.tx.Query(ctx, `INSERT INTO verdicts
 			(sample_id, formed_at, outcome, class, scanner_id, fires_at, ruleset, digest, summary, detail)
 		SELECT u.sample_id, u.at, u.outcome, u.class, u.scanner_id, u.fires_at, u.ruleset, u.digest, u.summary, u.detail
-		FROM (SELECT u.sample_id, u.scanner_id, coalesce((u.opinion->>'outcome')::outcome, 'ok') AS outcome,
-		             (u.opinion->>'class')::class AS class, (u.opinion->>'fires_at')::smallint AS fires_at,
-		             u.ruleset, u.at, u.digest, u.detail,
-		             (u.opinion - 'outcome' - 'class' - 'fires_at') || u.extra AS summary
-		      FROM unnest($1::bigint[], $2::smallint[], $3::jsonb[], $4::text[], $5::timestamptz[], $6::bytea[], $7::jsonb[], $11::bytea[])
-		          AS u(sample_id, scanner_id, opinion, ruleset, at, digest, extra, detail)) u
-		LEFT JOIN verdicts v ON v.sample_id = u.sample_id AND v.scanner_id = u.scanner_id
-		WHERE NOT EXISTS (SELECT 1 FROM verdicts a WHERE a.sample_id = u.sample_id AND a.scanner_id = $9 AND a.formed_at > u.at)
-		  AND (v.sample_id IS NULL
-		    OR ((v.scanner_id <> ALL($8) OR u.outcome = 'ok' OR v.outcome <> 'ok') AND v.formed_at <= u.at
-		        AND ((v.outcome, v.class, v.fires_at, v.digest, v.summary - 'eng')
-		             IS DISTINCT FROM (u.outcome, u.class, u.fires_at, u.digest, u.summary - 'eng')
-		             OR (v.formed_at < u.at AND (v.ruleset <> u.ruleset OR v.formed_at < u.at - `+refreshAge+`))
-		             OR (u.scanner_id = $9 AND u.sample_id = ANY($10)))))
+		`+upsertRows+`
+		WHERE `+upsertChanged+`
 		ORDER BY u.sample_id, u.scanner_id
 		ON CONFLICT (sample_id, scanner_id) DO UPDATE SET
 			formed_at = EXCLUDED.formed_at, outcome = EXCLUDED.outcome, class = EXCLUDED.class,

@@ -9,8 +9,14 @@
 // Each file's report is rebuilt in the version 8 shape, as scan builds it: the
 // file's own entry, with nothing that says where it sat and every source in
 // another file cited by its sha256. Members and references move out of the
-// report into contents and refs. Reports older than version 6 use another
-// schema and are left out; their verdicts and jurors are still converted.
+// report into contents and refs. Versions 4 to 6 list the files under "fs"
+// with shorter keys (sz for size, dp for depth, ts for the traits, each
+// {i: id, l: criticality}); their files, placements and verdicts convert the
+// same way, but their reports are left out rather than passed on in a shape
+// no version 8 reader knows. Version 7 reports written before cleave's v8
+// format spell the findings "find" and the identity "idn"; both are read as
+// their later names, and those reports are passed on as they were written. A
+// report with no file list at all is judged as the scanned file alone.
 // Version 7 does not separate the trait floor from the model, so the floor
 // juror here is a stand-in computed from the file's own findings with hopper's
 // conviction bar: one finding at crit 5 or two at crit 4 convict.
@@ -62,6 +68,12 @@ type Converted struct {
 	// Omitted counts what was left out and why, for the caller to log.
 	Omitted map[string]int
 	Files   []scanresult.File
+	// Excerpt is set, and Files left empty, when the report is not a scan
+	// but an excerpt of another file's: legacy hopper cut each member's
+	// line out of an archive's report and stored it on the member's own
+	// row. Its first entry has a parent (pid), where a scan's first entry is
+	// the scanned artifact.
+	Excerpt bool
 }
 
 // The interpreter's text is the worker's to send at any length; these bound
@@ -86,6 +98,26 @@ func clip(s string, n int) string {
 	return s[:n]
 }
 
+// excerpt reports whether a report's first file entry, under files (or fs
+// where there is no files), names a parent (Converted.Excerpt). Only that
+// entry is decoded.
+func excerpt(top map[string]json.RawMessage) bool {
+	list, ok := top["files"]
+	if !ok {
+		list = top["fs"]
+	}
+	dec := json.NewDecoder(bytes.NewReader(list))
+	if t, err := dec.Token(); err != nil || t != json.Delim('[') || !dec.More() {
+		return false
+	}
+	var first map[string]json.RawMessage
+	if dec.Decode(&first) != nil {
+		return false
+	}
+	_, has := first["pid"]
+	return has
+}
+
 // entry is the part of a report's file entry the conversion reads.
 type entry struct {
 	ID    *int64 `json:"id"`
@@ -101,17 +133,28 @@ type entry struct {
 		Kind string `json:"kind"`
 	} `json:"refs"`
 	Traits []trait `json:"traits"`
+	// Find is the traits as version 7 spelled them until cleave's v8 format
+	// renamed the key (decodeEntries).
+	Find []trait `json:"find"`
+	// TS is the traits as versions 4 to 6 spell them (decodeEntries).
+	TS []struct {
+		I string `json:"i"`
+		L int    `json:"l"`
+	} `json:"ts"`
 	// Ident is the file's identity block. It moves to the file line.
 	Ident json.RawMessage `json:"ident"`
+	Idn   json.RawMessage `json:"idn"` // identity, as version 7 spelled it before "ident"
 	raw   json.RawMessage
 	Size  int64 `json:"size"`
+	Sz    int64 `json:"sz"` // size, versions 4 to 6
+	old   bool  // listed under "fs": versions 4 to 6
 }
 
 // placement is what a version 8 report never carries: sha, size, type and
 // ident are on the file line, and the rest say where the file sat, which would
 // make the same bytes report differently from every archive that holds them.
-// It is PLACEMENT_KEYS in scan's src/engine/v8.rs.
-var placement = []string{"id", "pid", "depth", "dp", "path", "rel", "via", "role", "sha", "size", "type", "ident"}
+// It is PLACEMENT_KEYS in scan's src/engine/v8.rs, with version 7's "idn".
+var placement = []string{"id", "pid", "depth", "dp", "path", "rel", "via", "role", "sha", "size", "type", "ident", "idn"}
 
 type trait struct {
 	ID string `json:"id"`
@@ -214,6 +257,9 @@ func Convert(r *Result, level int) (*Converted, error) {
 	if err := json.Unmarshal(r.Raw, &top); err != nil {
 		return nil, fmt.Errorf("v7result: raw: %w", err)
 	}
+	if excerpt(top) {
+		return &Converted{Omitted: map[string]int{}, Excerpt: true}, nil
+	}
 	var sec ml
 	if len(r.ML) > 0 {
 		if err := json.Unmarshal(r.ML, &sec); err != nil {
@@ -261,12 +307,11 @@ func Convert(r *Result, level int) (*Converted, error) {
 	}
 	root := rootEntry(entries)
 	if root == nil {
-		// v4/v5 reports use single-letter keys and carry no member
-		// identities: keep the report whole and judge the file alone.
+		// No file list: judge the file alone.
 		if _, err := c.file(r.SHA256, 0, ""); err != nil {
 			return nil, err
 		}
-		c.out.Omitted["report older than version 6"]++
+		c.out.Omitted["report without a file list"]++
 		c.judge(0, &sec, nil, &in, nil, nil)
 		return c.finish(scan)
 	}
@@ -308,20 +353,39 @@ func Convert(r *Result, level int) (*Converted, error) {
 	return c.finish(scan)
 }
 
+// decodeEntries reads the report's file list: "files", or "fs" in versions 4
+// to 6, whose size and traits it carries over to the fields the newer
+// spelling fills.
 func decodeEntries(top map[string]json.RawMessage) ([]*entry, error) {
-	raw, ok := top["files"]
+	key := "files"
+	raw, ok := top[key]
 	if !ok {
-		return nil, nil
+		key = "fs"
+		if raw, ok = top[key]; !ok {
+			return nil, nil
+		}
 	}
 	var files []json.RawMessage
 	if err := json.Unmarshal(raw, &files); err != nil {
-		return nil, fmt.Errorf("v7result: files: %w", err)
+		return nil, fmt.Errorf("v7result: %s: %w", key, err)
 	}
 	entries := make([]*entry, 0, len(files))
 	for i, f := range files {
-		e := &entry{raw: f}
+		e := &entry{raw: f, old: key == "fs"}
 		if err := json.Unmarshal(f, e); err != nil {
-			return nil, fmt.Errorf("v7result: files[%d]: %w", i, err)
+			return nil, fmt.Errorf("v7result: %s[%d]: %w", key, i, err)
+		}
+		e.Size = cmp.Or(e.Size, e.Sz)
+		if e.Ident == nil {
+			e.Ident = e.Idn
+		}
+		if e.Traits == nil {
+			e.Traits = e.Find
+		}
+		if e.Traits == nil {
+			for _, t := range e.TS {
+				e.Traits = append(e.Traits, trait{ID: t.I, Crit: t.L})
+			}
 		}
 		e.Traits = slices.DeleteFunc(e.Traits, func(t trait) bool { return t.Dep != nil })
 		entries = append(entries, e)
@@ -572,8 +636,13 @@ func (c *converter) judge(i int, root *ml, mf *mlFile, in *llm, traits []trait, 
 // one: the entry without placement and without the dependency verdicts pinned
 // onto it, each source in another file cited by that file's sha256 and a
 // source in this file by nothing, a source naming no file dropped, and keys
-// sorted at every level. Numbers keep their text.
+// sorted at every level. Numbers keep their text. A version 4 to 6 entry has
+// none (see the package comment).
 func (c *converter) report(e *entry) ([]byte, error) {
+	if e.old {
+		c.out.Omitted["report in the version 4 to 6 shape"]++
+		return nil, nil
+	}
 	d := json.NewDecoder(bytes.NewReader(e.raw))
 	d.UseNumber()
 	var obj map[string]any

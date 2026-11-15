@@ -97,6 +97,10 @@ type Store struct {
 	pool *pgxpool.Pool
 	enc  *zstd.Encoder // reports are compressed here, not by PostgreSQL
 	dec  *zstd.Decoder
+	// afterRead, when set, is called in each Write after it has read what is
+	// stored and before it locks anything to write: a test's hook for
+	// interleaving two writers. Nil outside tests.
+	afterRead func()
 	// KeepOrphans, set before the Store is used, keeps the verdicts of
 	// members a write leaves in no archive's list. The migration sets it:
 	// version 7 reports list different members of the same nested
