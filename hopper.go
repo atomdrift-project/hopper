@@ -2384,10 +2384,17 @@ func (db *DB) Close() {
 func (db *DB) Pool() *pgxpool.Pool { return db.pool }
 
 // migrationLockKey serialises schema migration across every process that
-// touches one database. Any hopper migrating this cluster must use this key.
+// migrates one schema: the lock taken is this key hashed with the schema the
+// connection migrates (migrationLock), so hoppers sharing a schema exclude
+// one another while separate schemas in one database, such as the tests'
+// disposable ones, never do. A process that loses the lock skips migrating,
+// and losing it to a different schema would leave its own uncreated.
 //
 // The value spells "HOPPER"; it is arbitrary and only has to be agreed.
 const migrationLockKey int64 = 0x484F50504552
+
+// migrationLock is the advisory lock key for the connection's schema.
+const migrationLock = `hashtextextended(current_schema(), $1)`
 
 // errMigrationLocked reports that another process is already migrating.
 var errMigrationLocked = errors.New("hopper: another process holds the migration lock")
@@ -2436,7 +2443,7 @@ func (db *DB) tryMigrationLock(ctx context.Context) (release func(), acquired bo
 		return nil, false, fmt.Errorf("hopper: acquire migration lock connection: %w", err)
 	}
 	var got bool
-	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, migrationLockKey).Scan(&got); err != nil {
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(`+migrationLock+`)`, migrationLockKey).Scan(&got); err != nil {
 		conn.Release()
 		return nil, false, fmt.Errorf("hopper: take migration lock: %w", err)
 	}
@@ -2449,7 +2456,7 @@ func (db *DB) tryMigrationLock(ctx context.Context) (release func(), acquired bo
 		// is unwinding a cancelled context, or it lingers until the pool
 		// eventually recycles the connection.
 		if _, uerr := conn.Exec(context.WithoutCancel(ctx),
-			`SELECT pg_advisory_unlock($1)`, migrationLockKey); uerr != nil {
+			`SELECT pg_advisory_unlock(`+migrationLock+`)`, migrationLockKey); uerr != nil {
 			slog.Warn("failed to release migration lock; dropping connection", "error", uerr)
 			conn.Conn().Close(context.WithoutCancel(ctx)) //nolint:errcheck,gosec // discarding the tainted conn
 		}

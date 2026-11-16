@@ -3505,8 +3505,10 @@ var cleaveBinary = "cleave"
 // startup banner doesn't clutter every successful run.
 func streamCleaveIterFiles(ctx context.Context, dir string, newerThan time.Time, emit func(labeledPath) bool) error {
 	// Cleave uses its own directory-scan ceiling; hopper enforces its
-	// configured limit when hashing each emitted file.
-	args := []string{"iter-files", dir}
+	// configured limit when hashing each emitted file. --json is spelled out:
+	// under any other format cleave opens stdout with its version banner,
+	// which ends the decode below before the first record.
+	args := []string{"iter-files", "--json", dir}
 	// Incremental walk: let cleave skip files older than the cutoff by their
 	// mtime, before it reads each file's magic bytes (the costly step on a cold
 	// cache). --newer-than takes Unix seconds; requires a cleave that supports

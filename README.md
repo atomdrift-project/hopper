@@ -145,9 +145,9 @@ tunnel hostname.
 
 ## Native FreeBSD deployment
 
-On FreeBSD, `make deploy` installs Hopper and the postdoc worker as separate
-`rc.d` services. Hopper runs the ingestion/API process with its local worker
-disabled; `postdoc_worker` pulls jobs from Hopper.
+On FreeBSD, `make deploy` installs Hopper as an `rc.d` service that supervises
+postdoc as its local worker, as on Linux. A `postdoc_worker` service left by an
+earlier deploy is stopped and disabled.
 
 ```bash
 make deploy \

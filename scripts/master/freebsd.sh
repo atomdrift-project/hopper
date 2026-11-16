@@ -1,11 +1,12 @@
 #!/bin/sh
-# freebsd.sh - Install Hopper and its separately supervised postdoc worker on a
-# native FreeBSD host.
+# freebsd.sh - Install Hopper and its local postdoc worker on a native FreeBSD
+# host.
 #
-# Hopper owns ingestion and the HTTP API. postdoc is installed as the
-# independent postdoc_worker rc.d service from the sibling postdoc checkout; it is
-# deliberately not a child of hopper, so an analysis OOM cannot take the API
-# down with it.
+# Hopper owns ingestion and the HTTP API, and supervises postdoc, built from the
+# sibling postdoc checkout, as its local worker (--postdoc), as the Linux master
+# does. postdoc is a child process: an analysis OOM kills it, not the API, and
+# hopper restarts it. Earlier deploys ran it as a separate postdoc_worker rc.d
+# service; this one retires that service.
 
 set -eu
 
@@ -244,14 +245,8 @@ $SUDO su -l "$SERVICE_USER" -c "$CLEAVE_BIN update-rules" \
 #
 # The token is a file, never an argument or an environment variable, and is
 # never held in a shell variable — so nothing can echo it. Clients read the
-# same ~/.tok/hopper path; the postdoc worker deploy below installs it for its
-# service account.
+# same ~/.tok/hopper path; the local postdoc worker reads hopper's own copy.
 TOKEN_DST="/home/${SERVICE_USER}/.tok/hopper"
-TOKEN_FILE_SRC="$TOKEN_SRC"
-case "$TOKEN_FILE_SRC" in
-	/*) ;;
-	*) TOKEN_FILE_SRC="$(pwd)/$TOKEN_FILE_SRC" ;;
-esac
 token_arg=""
 if [ -n "$TOKEN_SRC" ]; then
 	token_arg=" --token-file $TOKEN_DST"
@@ -286,6 +281,10 @@ RC_TMP=$(mktemp -t hopper.rcd.XXXXXX)
 
 dataset_arg=""
 [ "$DATASET_INCOMPLETE" != 0 ] && dataset_arg=" --dataset-incomplete"
+# --postdoc-llm points the local worker's interpretation pass at the same
+# endpoint the postdoc fleet uses. Set LLM= to disable it.
+llm_arg=""
+[ -n "$LLM" ] && llm_arg=" --postdoc-llm $LLM"
 
 cat >"$RC_TMP" <<EOF
 #!/bin/sh
@@ -322,14 +321,12 @@ IFS=\$old_ifs
 
 pidfile="/var/run/\${name}.pid"
 command="/usr/sbin/daemon"
-# --postdoc '' is intentional: postdoc runs as a separate rc.d service.
-#
 # -H makes daemon(8) close and reopen the -o log on SIGHUP, which is what makes
 # the newsyslog(8) drop-in below actually reclaim space. Without it newsyslog
 # renames the file while daemon keeps writing to the now-unlinked inode: the
 # rotated copies look correct, the disk never frees, and the log grows without
 # bound (this is how hopper.log reached 4.7G).
-command_args="-c -f -r -H -R 10 -P \${pidfile} -o \${hopper_logfile} -u hopper /usr/bin/env HOME=/home/hopper DATABASE_URL=\${hopper_db} $HOPPER_BIN load --data \${hopper_data} --db \${hopper_db} --source \${hopper_source} --api-addr \${hopper_api_bind} --dashboard-addr \${hopper_bind}$token_arg --postdoc '' --cleave $CLEAVE_BIN\${mount_args}$dataset_arg"
+command_args="-c -f -r -H -R 10 -P \${pidfile} -o \${hopper_logfile} -u hopper /usr/bin/env HOME=/home/hopper DATABASE_URL=\${hopper_db} $HOPPER_BIN load --data \${hopper_data} --db \${hopper_db} --source \${hopper_source} --api-addr \${hopper_api_bind} --dashboard-addr \${hopper_bind}$token_arg --postdoc $POSTDOC_BIN$llm_arg --cleave $CLEAVE_BIN\${mount_args}$dataset_arg"
 
 run_rc_command "\$1"
 EOF
@@ -368,6 +365,20 @@ else
 	log "Hopper rc.d service unchanged"
 fi
 $SUDO sysrc hopper_enable=YES >/dev/null
+
+# The third-party scanners postdoc checks at startup, set up for the account
+# that now runs it (clamd's socket group, among others).
+log "Ensuring postdoc's scanners for $SERVICE_USER"
+SERVICE_USER="$SERVICE_USER" sh "$POSTDOC_DIR/scripts/deploy-scanners.sh"
+
+# Earlier deploys ran postdoc as its own postdoc_worker service. Two workers
+# would poll one queue, the old one on a binary nothing updates, so it is
+# stopped and disabled before hopper starts its own.
+if [ -f /usr/local/etc/rc.d/postdoc_worker ]; then
+	log "Retiring the separate postdoc_worker service; hopper supervises postdoc now"
+	$SUDO service postdoc_worker onestop >/dev/null 2>&1 || true
+	$SUDO sysrc -x postdoc_worker_enable >/dev/null 2>&1 || true
+fi
 
 # Walkers left behind by the process we are about to replace.
 #
@@ -461,15 +472,6 @@ if [ "$want_tunnel" = 1 ]; then
 		./scripts/master/cloudflared.sh "http://127.0.0.1:$ready_port"
 else
 	log "Skipping Cloudflare Tunnel (CLOUDFLARED=$CLOUDFLARED)"
-fi
-
-if [ -n "$TOKEN_SRC" ]; then
-	log "Deploying separate postdoc worker"
-	(cd "$POSTDOC_DIR" && \
-		TOKEN_FILE="$TOKEN_FILE_SRC" LLM="$LLM" \
-			gmake deploy-worker URL="http://127.0.0.1:8081")
-else
-	log "Skipping postdoc worker: postdoc requires a Hopper token; set TOKEN_SRC to enable it"
 fi
 
 log "Deployment complete"

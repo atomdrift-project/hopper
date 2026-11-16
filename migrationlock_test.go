@@ -57,3 +57,23 @@ func TestMigrationLockIsExclusive(t *testing.T) {
 	}
 	releaseSecond()
 }
+
+// The lock is per schema: a migrator of one schema never turns away a
+// migrator of another, whose schema would otherwise go uncreated (two test
+// packages migrating their disposable schemas at once).
+func TestMigrationLockIsPerSchema(t *testing.T) {
+	first, second := openDisposablePG(t), openDisposablePG(t)
+	release, acquired, err := first.tryMigrationLock(t.Context())
+	if err != nil || !acquired {
+		t.Fatalf("first schema's lock: %v, %v", acquired, err)
+	}
+	defer release()
+	releaseSecond, got, err := second.tryMigrationLock(t.Context())
+	if err != nil {
+		t.Fatalf("second schema's lock: %v", err)
+	}
+	if !got {
+		t.Fatal("migrating one schema turned away the migrator of another")
+	}
+	releaseSecond()
+}

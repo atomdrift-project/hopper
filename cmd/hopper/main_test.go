@@ -1443,7 +1443,7 @@ func TestCleaveEnumerationArguments(t *testing.T) {
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "cleave")
 	// Reject any unexpected flag, just as the real CLI does.
-	script := "#!/bin/sh\n[ \"$1\" = iter-files ] && [ \"$2\" = \"$EXPECTED_DIR\" ] && [ \"$3\" = --newer-than ] && [ \"$4\" = 123 ] && [ $# = 4 ] || exit 2\nprintf '%s\\n' '{\"path\":\"sample\",\"type\":\"elf\"}'\n"
+	script := "#!/bin/sh\n[ \"$1\" = iter-files ] && [ \"$2\" = --json ] && [ \"$3\" = \"$EXPECTED_DIR\" ] && [ \"$4\" = --newer-than ] && [ \"$5\" = 123 ] && [ $# = 5 ] || exit 2\nprintf '%s\\n' '{\"path\":\"sample\",\"type\":\"elf\"}'\n"
 	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}

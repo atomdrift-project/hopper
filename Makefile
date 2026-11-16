@@ -42,7 +42,7 @@ help:
 	@echo "  make lint                   Run linters"
 	@echo "  make clean                  Clean build artifacts"
 	@echo "  make install-precommit      Install the git pre-commit hook (test + lint + go.mod)"
-	@echo "  make deploy                 Install Hopper and its separate postdoc worker"
+	@echo "  make deploy                 Install Hopper with its local postdoc worker"
 	@echo "                              (reaps corpus walkers left by the previous run"
 	@echo "                               before restarting; they outlive an abrupt stop)"
 	@echo "                              (DATA_DIR=$(DATA_DIR) DB=... SOURCE=$(SOURCE)"
