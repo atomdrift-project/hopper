@@ -984,7 +984,8 @@ func (m *migration) post(ctx context.Context) error {
 // member's own row: the excerpt convert does not convert is the one copy of
 // what the archive's scan found in the member. The candidates are the files
 // atomscan judged that were never scanned on their own (no scans row) and
-// kept a legacy result.
+// kept a legacy result, whether legacy held them as a member row (parent
+// set) or as a top-level excerpt row: both carry the member's own entry.
 func (m *migration) reports(ctx context.Context) error {
 	return m.ranges(ctx, "reports", "samples", m.reportRange)
 }
@@ -998,7 +999,7 @@ func (m *migration) reportRange(ctx context.Context, lo, hi int64) error {
 		FROM verdicts v JOIN `+m.from+`.samples l ON l.id = v.sample_id
 		WHERE v.sample_id > $1 AND v.sample_id <= $2 AND v.scanner_id = $3
 		  AND NOT EXISTS (SELECT 1 FROM scans sc WHERE sc.sample_id = v.sample_id)
-		  AND l.parent = '' AND l.cleave_result IS NOT NULL`, lo, hi, atomscanID)
+		  AND l.cleave_result IS NOT NULL`, lo, hi, atomscanID)
 	if err != nil {
 		return fmt.Errorf("reports: %w", err)
 	}
