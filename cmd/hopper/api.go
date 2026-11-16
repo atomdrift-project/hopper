@@ -927,7 +927,9 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 		// lets a cyclotron point its whole stack at one URL.
 		clientWrites := []string{
 			"POST /v1/intake/upload", "POST /v1/intake/held", "POST /v1/intake/popular",
-			"POST /v1/sightings", "POST /v1/triage/rulings", "POST /v1/triage/reports",
+			"POST /v1/sightings", "POST /v1/sightings/attempted", "POST /v1/sightings/retract",
+			"POST /v1/acquisitions/claim", "POST /v1/acquisitions/finish",
+			"POST /v1/triage/rulings", "POST /v1/triage/reports",
 			"POST /v1/work/rescan/{sha256}", "POST /api/cleave-result",
 		}
 		for _, ep := range clientWrites {
@@ -948,6 +950,10 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/intake/held", s.handleKnown)
 	mux.HandleFunc("POST /v1/intake/popular", s.handlePopular)
 	mux.HandleFunc("POST /v1/sightings", s.handleSightings)
+	mux.HandleFunc("POST /v1/sightings/attempted", s.handleSightingKeys(markAttempted))
+	mux.HandleFunc("POST /v1/sightings/retract", s.handleSightingKeys(retract))
+	mux.HandleFunc("POST /v1/acquisitions/claim", s.handleAcquisitionClaim)
+	mux.HandleFunc("POST /v1/acquisitions/finish", s.handleAcquisitionFinish)
 	mux.HandleFunc("POST /v1/triage/rulings", s.handleTriage)
 	mux.HandleFunc("POST /v1/triage/reports", s.handleReport)
 	// Stays until cyclotron's re-scan becomes a version 8 result through
@@ -1729,7 +1735,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 	// Persist worker heartbeat to DB for crash recovery, throttled. The
 	// dashboard reads live worker state from the in-memory tracker; the DB
 	// row is only for post-crash inspection.
-	if s.tracker.shouldUpsertWorker(worker, workerUpsertInterval) {
+	if s.results == nil && s.tracker.shouldUpsertWorker(worker, workerUpsertInterval) {
 		wk := hopper.Worker{Name: worker, Slots: slots, Version: p.version, Traits: p.traits}
 		if err := s.db.UpsertWorker(ctx, wk); err != nil {
 			slog.Debug("upsert worker failed", "worker", worker, "error", err)
@@ -3161,7 +3167,7 @@ type knownResponse struct {
 // Currency is settled at the store now, where it is ordered against the other
 // producers writing the same sha.
 func (s *apiServer) handleKnown(w http.ResponseWriter, r *http.Request) {
-	if s.db == nil {
+	if s.db == nil && s.results == nil {
 		writeRetryable(w, retryAfterStarting, "starting", "Starting.")
 		return
 	}
@@ -3190,7 +3196,7 @@ func (s *apiServer) handleKnown(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
-	known, err := s.db.KnownSHA256(ctx, valid)
+	known, err := s.held(ctx, valid)
 	if err != nil {
 		slog.Error("known: query failed", "error", err)
 		v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
@@ -3229,6 +3235,9 @@ type sightingRequest struct {
 	Affected string `json:"affected"`
 	Claim    string `json:"claim"`
 	FileName string `json:"filename"`
+	// Handle is the source's own id for what it saw (triage's analysis id),
+	// which an acquirer uses to fetch from the source directly.
+	Handle string `json:"handle"`
 	// Basis is how the source arrived at the claim — 'predicted', 'hosted' or
 	// 'reviewed'. An omitted or unrecognized value is stored as 'predicted',
 	// the weakest, so a producer too old to send it under-counts confidence
@@ -3311,7 +3320,7 @@ type popularRequest struct {
 // popular_packages migration for why this is a table of its own rather than a
 // sighting.
 func (s *apiServer) handlePopular(w http.ResponseWriter, r *http.Request) {
-	if s.db == nil {
+	if s.db == nil && s.results == nil {
 		writeRetryable(w, retryAfterStarting, "starting", "Starting.")
 		return
 	}
@@ -3348,7 +3357,7 @@ func (s *apiServer) handlePopular(w http.ResponseWriter, r *http.Request) {
 			Rank:      p.Rank,
 		})
 	}
-	if err := s.db.SetPopularPackages(r.Context(), pkgs); err != nil {
+	if err := s.setPopular(r.Context(), pkgs); err != nil {
 		slog.ErrorContext(r.Context(), "popular publish failed", "remote", r.RemoteAddr, "error", err)
 		v1Error(w, http.StatusInternalServerError, "internal", "Internal.")
 		return
@@ -3405,13 +3414,16 @@ func (s *apiServer) handleSightings(w http.ResponseWriter, r *http.Request) {
 		sightings[i] = hopper.Sighting{
 			Source: req.Source, Subject: subject, URL: req.URL, Note: req.Note,
 			Relayer: req.Relayer, Operator: req.Operator, Affected: req.Affected,
-			Claim: hopper.SightingClaim(req.Claim), FileName: req.FileName,
+			Claim: hopper.SightingClaim(req.Claim), FileName: req.FileName, Handle: req.Handle,
 			Basis:       sightingBasis(req.Basis),
 			PublishedAt: parseSightingTime(req.PublishedAt),
 		}
 	}
 
-	changed, err := s.storeSightings(r.Context(), sightings, r.RemoteAddr)
+	// backfill=1 marks a source's walk of its history: its claims are dated
+	// when the source made them, not now (hopper.AddSightingsBackfill).
+	backfill := r.URL.Query().Get("backfill") == "1"
+	changed, err := s.storeSightings(r.Context(), sightings, backfill, r.RemoteAddr)
 	if err != nil {
 		if errors.Is(err, hopper.ErrUnscopedLiteLLM) {
 			slog.ErrorContext(r.Context(), "sightings: FATAL integrity violation", "error", err, "remote", r.RemoteAddr)
@@ -3422,7 +3434,7 @@ func (s *apiServer) handleSightings(w http.ResponseWriter, r *http.Request) {
 		v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
 		return
 	}
-	slog.InfoContext(r.Context(), "sightings recorded", "received", len(sightings), "changed", changed, "remote", r.RemoteAddr)
+	slog.InfoContext(r.Context(), "sightings recorded", "received", len(sightings), "changed", changed, "backfill", backfill, "remote", r.RemoteAddr)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -3434,16 +3446,19 @@ func (s *apiServer) handleSightings(w http.ResponseWriter, r *http.Request) {
 // backoff. Each attempt gets its own sightingsStoreTimeout budget, so a slow
 // snapshot does not consume the whole allowance on the first try; ctx bounds
 // the retries as a whole.
-func (s *apiServer) storeSightings(ctx context.Context, sightings []hopper.Sighting, remote string) (int, error) {
+func (s *apiServer) storeSightings(ctx context.Context, sightings []hopper.Sighting, backfill bool, remote string) (int, error) {
 	return retry.DoWithData(
 		func() (int, error) {
 			attemptCtx, cancel := context.WithTimeout(ctx, sightingsStoreTimeout)
 			defer cancel()
 			var n int
 			var err error
-			if s.results != nil {
-				n, err = s.addSightingsToStore(attemptCtx, sightings)
-			} else {
+			switch {
+			case s.results != nil:
+				n, err = s.addSightingsToStore(attemptCtx, sightings, backfill)
+			case backfill:
+				n, err = s.db.AddSightingsBackfill(attemptCtx, sightings)
+			default:
 				n, err = s.db.AddSightings(attemptCtx, sightings)
 			}
 			if err == nil {
@@ -3687,7 +3702,7 @@ func (s *apiServer) handleUploadMultipart(w http.ResponseWriter, r *http.Request
 func (s *apiServer) refreshProvenance(ctx context.Context, prov *hopper.Sidecar) (bool, error) {
 	sha := prov.Artifact.SHA256 // Validate() guarantees 64 lowercase hex
 	toStore := prov
-	if existingRaw, err := s.db.ProvenanceBySHA256(ctx, sha); err == nil && len(existingRaw) > 0 {
+	if existingRaw, err := s.provenance(ctx, sha); err == nil && len(existingRaw) > 0 {
 		var existing hopper.Sidecar
 		if err := json.Unmarshal(existingRaw, &existing); err == nil {
 			existing.MergeRefresh(prov)
@@ -3701,7 +3716,7 @@ func (s *apiServer) refreshProvenance(ctx context.Context, prov *hopper.Sidecar)
 	// Reuse the upload projection (provenance JSONB + scalar identity columns,
 	// including purl_base); SetProvenance only reads those, never the
 	// path/label/source fields, so the existing row's bytes and verdict are safe.
-	return s.db.SetProvenance(ctx, uploadSample(sha, toStore.Artifact.Filename, "", toStore.Artifact.SizeBytes, toStore))
+	return s.setProvenance(ctx, uploadSample(sha, toStore.Artifact.Filename, "", toStore.Artifact.SizeBytes, toStore))
 }
 
 // storeProvenanceOnly attaches or refreshes a provenance sidecar on a sample
@@ -4275,7 +4290,7 @@ func trimClientError(msg string) string {
 // 404 with code no_provenance when the file carries no sidecar, and with
 // unknown_artifact when it is unknown. The sidecar is fixed for a content-addressed sha256, so the response is cacheable.
 func (s *apiServer) handleProvenance(w http.ResponseWriter, r *http.Request) {
-	if s.db == nil {
+	if s.db == nil && s.results == nil {
 		writeRetryable(w, retryAfterStarting, "starting", "Starting.")
 		return
 	}
@@ -4288,7 +4303,7 @@ func (s *apiServer) handleProvenance(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), apiQueryTimeout)
 	defer cancel()
 
-	prov, err := s.db.ProvenanceBySHA256(ctx, sha)
+	prov, err := s.provenance(ctx, sha)
 	switch {
 	case errors.Is(err, hopper.ErrNotFound):
 		v1Error(w, http.StatusNotFound, "unknown_artifact", "Nothing stored for that sha256.")

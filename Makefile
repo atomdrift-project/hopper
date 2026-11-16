@@ -55,7 +55,8 @@ help:
 	@echo "                               REBUILD=true for a destructive re-copy of a wedged jail,"
 	@echo "                               BULK_MAINT_MEM=8GB to speed index rebuilds on a big box)"
 	@echo "  make replica                Configure local postgres as a logical replica of the"
-	@echo "                              upstream hopper DB (idempotent + resumable; reads ~/.pgpass)"
+	@echo "                              upstream hopper DB's verdict tables"
+	@echo "                              (idempotent + resumable; reads ~/.pgpass)"
 	@echo "  make rebuild-replica        Tear down a wedged replica (invalidated slot or"
 	@echo "                              apply conflict) and rebuild from scratch —"
 	@echo "                              TRUNCATEs + full re-copy (FORCE=true)"
@@ -122,11 +123,13 @@ deploy-freebsd:
 rollout-replica-bastille:
 	@./scripts/replica/freebsd-bastille.sh "$(RUN)"
 
-replica: build
-	@HOPPER='$(CURDIR)/hopper' ./scripts/replica/setup.sh
+# The replica needs no hopper build: setup.sh makes the verdict schema from
+# store/schema.sql with psql.
+replica:
+	@./scripts/replica/setup.sh
 
-rebuild-replica: build
-	@HOPPER='$(CURDIR)/hopper' ./scripts/replica/rebuild.sh
+rebuild-replica:
+	@./scripts/replica/rebuild.sh
 
 diagnose-replica:
 	@./scripts/replica/diagnose.sh

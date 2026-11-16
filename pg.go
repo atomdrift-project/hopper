@@ -314,8 +314,8 @@ func pgRuntimeMigrations() []string { //nolint:revive,maintidx // long sequentia
 		// whichever landed last.
 		//
 		// It stays a PRIMARY KEY rather than becoming a unique index because
-		// sightings is a PUBLISHED table (see scripts/replica/
-		// replicated-tables.sh): logical replication needs a replica identity
+		// sightings was a PUBLISHED table until the 2026-11-15 migration:
+		// logical replication needs a replica identity
 		// for every UPDATE and DELETE, and a primary key is the one every
 		// other table here uses. A plain unique index would have left this
 		// table's identity unset and broken apply on the replica.
@@ -2078,21 +2078,8 @@ func (db *DB) migrateServingPG(ctx context.Context, allowRewrite bool) (func(con
 	// Core DDL (columns, tables, cleanup) runs now; index builds are collected
 	// for the background phase.
 	var deferred []string
-	var declined int
 	for _, ddl := range db.pgMigrationsForRole() {
 		if isDeferrableIndexDDL(ddl) {
-			// In replica mode, decline the indexes slim-indexes.sh would drop
-			// anyway rather than build them first. Not recorded in the ledger:
-			// see SetReplicaIndexPolicy.
-			skip, err := db.skipReplicaIndex(ddl)
-			if err != nil {
-				return nil, fmt.Errorf("hopper: migrate: %w", err)
-			}
-			if skip {
-				declined++
-				slog.Debug("replica index policy: declining index", "ddl", ddl)
-				continue
-			}
 			deferred = append(deferred, ddl)
 			continue
 		}
@@ -2106,22 +2093,7 @@ func (db *DB) migrateServingPG(ctx context.Context, allowRewrite bool) (func(con
 		slog.Warn("optional migration skipped; continuing without it", "ddl", trgmExtensionDDL, "error", err)
 		trgmReady = false
 	}
-	// The trgm index sits on a published table, so it answers to the same
-	// replica policy as every other index — it is built in the closure below,
-	// but the decision belongs here with its peers.
-	buildTrgmIndex := trgmReady
-	if buildTrgmIndex {
-		skip, err := db.skipReplicaIndex(trgmIndexDDL)
-		if err != nil {
-			return nil, fmt.Errorf("hopper: migrate: %w", err)
-		}
-		if skip {
-			declined++
-			buildTrgmIndex = false
-		}
-	}
-	slog.Info("core migrations applied",
-		"deferred_indexes", len(deferred), "declined_replica_indexes", declined)
+	slog.Info("core migrations applied", "deferred_indexes", len(deferred))
 
 	return func(ctx context.Context) error {
 		for _, ddl := range deferred {
@@ -2132,7 +2104,7 @@ func (db *DB) migrateServingPG(ctx context.Context, allowRewrite bool) (func(con
 				return fmt.Errorf("hopper: migrate index: %w", err)
 			}
 		}
-		if buildTrgmIndex {
+		if trgmReady {
 			if err := db.execPGMigrationDDL(ctx, trgmIndexDDL, allowRewrite); err != nil {
 				slog.Warn("optional migration skipped; continuing without it", "ddl", trgmIndexDDL, "error", err)
 			}
@@ -7931,7 +7903,7 @@ func (db *DB) canonicalizeSightingSubjectsPG(ctx context.Context, dryRun bool) (
 // first cut of this took the age of the newest row — `max(updated_at)` — on the
 // reasoning that a reader wants to know whether its answer is current, and that
 // idx_samples_updated_at made it an index-only scan. It does, on the publisher.
-// The replica *drops* that index on purpose (it is in REPLICA_DROP_INDEXES),
+// The replica *dropped* that index on purpose (the legacy slim-indexes policy),
 // so on the one machine where the query actually runs it was a sequential scan
 // of the whole samples table, and every call timed out. The lesson is narrower
 // than "use the right view": a replica does not have the publisher's schema,

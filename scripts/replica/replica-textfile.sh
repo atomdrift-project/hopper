@@ -17,22 +17,20 @@
 # rules rather than replacing them: keep those as the backstop for "the replica
 # is gone", and alert on staleness here via node_textfile_mtime_seconds.
 #
-# Overridable via env: LOCAL_DB, SUBSCRIPTION (auto-detected), REMOTE_HOST,
-# REMOTE_USER, REMOTE_DB, PGPASSFILE, HOST_MON_TEXTFILE_DIR, SLIM_INDEXES_SH.
+# Overridable via env: LOCAL_DB, SUBSCRIPTION (auto-detected), PUBLICATION,
+# REMOTE_HOST, REMOTE_USER, REMOTE_DB, PGPASSFILE, HOST_MON_TEXTFILE_DIR.
 
 set -eu
 
 LOCAL_DB="${LOCAL_DB:-hopper}"
 SUBSCRIPTION="${SUBSCRIPTION:-}"
+PUBLICATION="${PUBLICATION:-hopper_replica}"
 REMOTE_HOST="${REMOTE_HOST:-hopper-db}"
 REMOTE_USER="${REMOTE_USER:-hopper}"
 REMOTE_DB="${REMOTE_DB:-hopper}"
 OUT_DIR="${HOST_MON_TEXTFILE_DIR:-${NODE_EXPORTER_TEXTFILE_DIR:-/var/lib/host-mon/textfile}}"
 TMP="${OUT_DIR}/hopper-replica.prom.$$"
 OUT="${OUT_DIR}/hopper-replica.prom"
-
-SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-SLIM_INDEXES_SH="${SLIM_INDEXES_SH:-$SCRIPT_DIR/slim-indexes.sh}"
 
 # Same local-admin ladder as replica-heal.sh. Unlike the healer we exit 0 on
 # no access: a missing metrics file is a staleness alert, not a crash loop.
@@ -72,43 +70,22 @@ tbl_ready=$(num "$(q "SELECT count(*)::int FROM pg_subscription_rel r
                        JOIN pg_subscription s ON s.oid = r.srsubid
                       WHERE s.subname = '$SUBSCRIPTION' AND r.srsubstate = 'r'")")
 
-# --- Index policy drift -----------------------------------------------------
-# The keep list in slim-indexes.sh is the single source of truth for which
-# indexes this replica is supposed to carry (see TestReplicaIndexPolicyIsComplete).
-# 'missing' is the signal that 'make replica' has not been run since the master
-# gained an index; 'extra' means slim-indexes.sh has not been run since one
-# appeared. Both are silent today — that is exactly why they drifted.
-policy_known=0
-policy_missing=0
-policy_extra=0
-if [ -r "$SLIM_INDEXES_SH" ]; then
-    keep=$(sed -n "/^REPLICA_KEEP_INDEXES='/,/^'/p" "$SLIM_INDEXES_SH" \
-           | grep -vE "^REPLICA_KEEP_INDEXES='|^'" | grep -v '^$' || true)
-    if [ -n "$keep" ]; then
-        policy_known=1
-        keep_csv=$(printf '%s\n' "$keep" | sed "s/^/'/; s/\$/'/" | paste -sd, -)
-        policy_missing=$(num "$(q "SELECT count(*)::int FROM (VALUES ($(printf '%s' "$keep_csv" | sed "s/,/),(/g"))) AS w(name)
-             WHERE NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                                WHERE c.relkind = 'i' AND n.nspname = 'public' AND c.relname = w.name)")")
-        policy_extra=$(num "$(q "SELECT count(*)::int
-              FROM pg_index i
-              JOIN pg_class c ON c.oid = i.indexrelid
-              JOIN pg_class t ON t.oid = i.indrelid
-              JOIN pg_namespace n ON n.oid = t.relnamespace
-             WHERE n.nspname = 'public'
-               AND i.indrelid IN (SELECT srrelid FROM pg_subscription_rel)
-               AND NOT i.indisprimary AND NOT i.indisreplident
-               AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conindid = i.indexrelid)
-               AND c.relname NOT IN ($keep_csv)")")
-    fi
-fi
-
-# --- Lag vs the publisher ---------------------------------------------------
+# --- Lag and index parity vs the publisher ----------------------------------
 # Optional: a blank publisher just leaves lag absent (and reachable=0) rather
 # than failing the whole emit, so subscription state still reaches the alerts
 # when the publisher is the thing that is down.
+#
+# Index parity: the replica carries every index the publisher has on a
+# published table (readers query it as they would the publisher). DDL does not
+# replicate, so an index added upstream never arrives on its own, and one left
+# out by an interrupted fast-sync rebuild stays out. Indexes are compared by
+# schema.table.name: 'missing' are the publisher's absent here, 'extra' are
+# this replica's on subscribed tables that the publisher lacks.
 pub_reachable=0
 lag_bytes=""
+index_known=0
+index_missing=0
+index_extra=0
 if [ -n "${PGPASSFILE:-}" ] || [ -r "$HOME/.pgpass" ]; then
     recv=$(q "SELECT latest_end_lsn FROM pg_stat_subscription WHERE subname = '$SUBSCRIPTION' AND relid IS NULL")
     if [ -n "$recv" ]; then
@@ -118,6 +95,33 @@ if [ -n "${PGPASSFILE:-}" ] || [ -r "$HOME/.pgpass" ]; then
             ''|*[!0-9-]*) lag_bytes="" ;;
             *) pub_reachable=1 ;;
         esac
+    fi
+    remote_idx=$(PGCONNECT_TIMEOUT=5 psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" -tAX \
+        -v pub="$PUBLICATION" 2>/dev/null <<'SQL' | LC_ALL=C sort -u || true
+SELECT i.schemaname || '.' || i.tablename || '.' || i.indexname
+  FROM pg_indexes i
+  JOIN pg_publication_tables p ON p.schemaname = i.schemaname AND p.tablename = i.tablename
+ WHERE p.pubname = :'pub';
+SQL
+    )
+    # Every published table has a primary key, so an empty local list means
+    # the query failed or nothing is subscribed yet: unknown, not all missing.
+    local_idx=$(admin -d "$LOCAL_DB" -tAX -v sub="$SUBSCRIPTION" 2>/dev/null <<'SQL' | LC_ALL=C sort -u || true
+SELECT n.nspname || '.' || t.relname || '.' || c.relname
+  FROM pg_index i
+  JOIN pg_class c ON c.oid = i.indexrelid
+  JOIN pg_class t ON t.oid = i.indrelid
+  JOIN pg_namespace n ON n.oid = t.relnamespace
+ WHERE i.indrelid IN (SELECT r.srrelid FROM pg_subscription_rel r
+                        JOIN pg_subscription s ON s.oid = r.srsubid
+                       WHERE s.subname = :'sub');
+SQL
+    )
+    if [ -n "$remote_idx" ] && [ -n "$local_idx" ]; then
+        index_known=1
+        # grep -c prints the count and exits 1 when it is 0.
+        index_missing=$(printf '%s\n' "$remote_idx" | grep -cvxF "$local_idx" || true)
+        index_extra=$(printf '%s\n' "$local_idx" | grep -cvxF "$remote_idx" || true)
     fi
 fi
 
@@ -147,17 +151,17 @@ mkdir -p "$OUT_DIR"
   printf '# TYPE hopper_replica_tables_ready gauge\n'
   printf 'hopper_replica_tables_ready{subscription="%s"} %s\n' "$SUB" "$tbl_ready"
 
-  printf '# HELP hopper_replica_index_policy_known 1 if the slim-indexes keep list was readable\n'
+  printf '# HELP hopper_replica_index_policy_known 1 if the publisher and local index lists were readable\n'
   printf '# TYPE hopper_replica_index_policy_known gauge\n'
-  printf 'hopper_replica_index_policy_known %s\n' "$policy_known"
+  printf 'hopper_replica_index_policy_known %s\n' "$index_known"
 
-  printf '# HELP hopper_replica_index_policy_missing Keep-list indexes absent locally (make replica is overdue)\n'
+  printf '# HELP hopper_replica_index_policy_missing Publisher indexes on published tables absent from this replica\n'
   printf '# TYPE hopper_replica_index_policy_missing gauge\n'
-  printf 'hopper_replica_index_policy_missing %s\n' "$policy_missing"
+  printf 'hopper_replica_index_policy_missing %s\n' "$(num "$index_missing")"
 
-  printf '# HELP hopper_replica_index_policy_extra Indexes on subscribed tables the keep list does not name (slim-indexes is overdue)\n'
+  printf '# HELP hopper_replica_index_policy_extra Indexes on subscribed tables that the publisher does not have\n'
   printf '# TYPE hopper_replica_index_policy_extra gauge\n'
-  printf 'hopper_replica_index_policy_extra %s\n' "$policy_extra"
+  printf 'hopper_replica_index_policy_extra %s\n' "$(num "$index_extra")"
 
   printf '# HELP hopper_replica_publisher_reachable 1 if the publisher answered a lag query\n'
   printf '# TYPE hopper_replica_publisher_reachable gauge\n'

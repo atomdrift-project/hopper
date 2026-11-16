@@ -85,11 +85,10 @@ if [ "$need_restart" -eq 1 ]; then
 fi
 
 log "Installing replica dependencies"
-# postgresql${PGVER}-contrib provides pg_trgm; without it hopper init logs
-# "extension pg_trgm is not available" and silently skips the trigram index
-# the publisher has, leaving the replica's schema subtly behind.
+# gmake runs the replica targets; nothing in the jail builds hopper: setup.sh
+# creates the schema from store/schema.sql with psql.
 doas bastille pkg "$RUN" install -y \
-    git go gmake sqlite3 \
+    gmake \
     postgresql"${PGVER}"-server postgresql"${PGVER}"-client postgresql"${PGVER}"-contrib
 
 log "Selecting PostgreSQL ${PGVER} data directory"
@@ -151,12 +150,12 @@ ECS_MB=$(( _mem_mb * 3 / 5 ))
 log "PG memory sizing: shared_buffers=${SB_MB}MB effective_cache_size=${ECS_MB}MB (host RAM ${_mem_mb}MB)"
 PG_TUNING_TMP="/tmp/hopper-replica-pg.sql"
 doas bastille cmd "$RUN" tee "$PG_TUNING_TMP" >/dev/null <<SQLEOF
--- Listen on all the jail's addresses so BOTH localhost (hopper init / the
--- healer / psql -h localhost) and the external IP (readers like prism) work.
+-- Listen on all the jail's addresses so BOTH localhost (the healer /
+-- psql -h localhost) and the external IP (readers like prism) work.
 -- pg_hba above still gates auth (local peer + 127.0.0.1/::1 + 10.0.0.0/8 hopper),
 -- so '*' only controls which interfaces are bound, not who may connect. Without
--- this, a box left on listen_addresses=<jail-ip> refuses hopper init's localhost
--- DSN with "connection refused".
+-- this, a box left on listen_addresses=<jail-ip> refuses localhost connections
+-- with "connection refused".
 ALTER SYSTEM SET listen_addresses = '*';
 ALTER SYSTEM SET wal_level = 'logical';
 ALTER SYSTEM SET max_replication_slots = '10';
@@ -262,12 +261,11 @@ fi
 # derive the canonical hopper_replica_<hostname>.
 sub_env=""
 [ -n "$SUBSCRIPTION" ] && sub_env="SUBSCRIPTION='$SUBSCRIPTION' "
-# Forward fast-sync knobs (bulkload.sh) and the slim-index opt-out when the
-# operator set them, e.g. BULK_MAINT_MEM=8GB on a big-RAM jail or
-# REPLICA_SLIM_INDEXES=false to keep the full master index set.
+# Forward fast-sync knobs (bulkload.sh) and the replica schema when the
+# operator set them, e.g. BULK_MAINT_MEM=8GB on a big-RAM jail.
 # ZFS_TUNE=false: the host handled ZFS.
 bulk_env=""
-for _v in FAST_SYNC BULK_MAINT_MEM BULK_MAX_PARALLEL_MAINT BULK_MAX_WAL BULK_POLL_SECS REPLICA_SLIM_INDEXES; do
+for _v in FAST_SYNC BULK_MAINT_MEM BULK_MAX_PARALLEL_MAINT BULK_MAX_WAL BULK_POLL_SECS REPLICA_SCHEMA; do
     eval "_val=\${$_v:-}"
     [ -n "$_val" ] && bulk_env="$bulk_env $_v='$_val'"
 done

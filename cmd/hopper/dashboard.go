@@ -18,6 +18,7 @@ import (
 	"github.com/codeGROOVE-dev/fido"
 
 	"github.com/atomdrift-project/hopper"
+	"github.com/atomdrift-project/hopper/store"
 )
 
 // dashQueryTimeout bounds each dashboard stat query. The counts/aggregations
@@ -65,30 +66,33 @@ const flowWindow = 6 * time.Hour
 // Fields guarded by cfgMu are set once via configure() after the load session
 // begins; the handler renders a startup-status page until then.
 type webDashboard struct {
-	start         time.Time
-	db            *hopper.DB
-	progress      *loadProgress
-	tracker       *workerTracker
-	api           *apiServer // for live traits-version reads from the local worker
-	rescanCache   *fido.Cache[string, hopper.RescanDepths]
-	rates         *rateSampler
-	pendingCache  *fido.Cache[string, int64]
-	healthCache   *fido.Cache[string, hopper.WorkflowHealth]
-	backlogCache  *fido.Cache[string, []hopper.WorkflowBacklog]
-	samplesCache  *fido.Cache[string, []hopper.WorkflowSample]
-	seriesCache   *fido.Cache[string, []queuePoint]
-	newestATCache *fido.Cache[string, time.Time]
-	metrics       *metricsStore
-	litmus        *litmusServer
-	traitsVersion string
-	samples       []throughputSample
-	stages        []*startupStage
-	maxAnalyzed   int
-	ndirs         int
-	rescanAge     time.Duration
-	cfgMu         sync.RWMutex
-	mu            sync.Mutex
-	stagesMu      sync.Mutex
+	start        time.Time
+	db           *hopper.DB
+	progress     *loadProgress
+	tracker      *workerTracker
+	api          *apiServer // for live traits-version reads from the local worker
+	rescanCache  *fido.Cache[string, hopper.RescanDepths]
+	rates        *rateSampler
+	pendingCache *fido.Cache[string, int64]
+	healthCache  *fido.Cache[string, hopper.WorkflowHealth]
+	// storeHealthCache holds the verdict store's corpus gauges (observeStore).
+	storeHealthCache *fido.Cache[string, *store.Health]
+	storeWorkCache   *fido.Cache[string, *store.Work]
+	backlogCache     *fido.Cache[string, []hopper.WorkflowBacklog]
+	samplesCache     *fido.Cache[string, []hopper.WorkflowSample]
+	seriesCache      *fido.Cache[string, []queuePoint]
+	newestATCache    *fido.Cache[string, time.Time]
+	metrics          *metricsStore
+	litmus           *litmusServer
+	traitsVersion    string
+	samples          []throughputSample
+	stages           []*startupStage
+	maxAnalyzed      int
+	ndirs            int
+	rescanAge        time.Duration
+	cfgMu            sync.RWMutex
+	mu               sync.Mutex
+	stagesMu         sync.Mutex
 }
 
 // startupStage represents one named init step rendered on the bootstrap page.
@@ -200,6 +204,8 @@ func (wd *webDashboard) configure( //nolint:revive // argument-limit: dashboard 
 	wd.pendingCache = fido.New[string, int64](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.seriesCache = fido.New[string, []queuePoint](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.healthCache = fido.New[string, hopper.WorkflowHealth](fido.Size(1), fido.TTL(dashCacheTTL))
+	wd.storeHealthCache = fido.New[string, *store.Health](fido.Size(1), fido.TTL(dashCacheTTL))
+	wd.storeWorkCache = fido.New[string, *store.Work](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.backlogCache = fido.New[string, []hopper.WorkflowBacklog](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.samplesCache = fido.New[string, []hopper.WorkflowSample](fido.Size(3), fido.TTL(dashCacheTTL))
 }
@@ -521,9 +527,28 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	progress := wd.progress
 	tracker := wd.tracker
 	db := wd.db
+	api := wd.api
 	start := wd.start
 	_ = wd.maxAnalyzed // reserved for future use
 	wd.cfgMu.RUnlock()
+
+	// With the verdict store open, the corpus figures come from it; the
+	// legacy tables stop moving once it holds the corpus.
+	var (
+		st     *store.Store
+		health *store.Health
+	)
+	if api != nil && api.results != nil {
+		st = api.results
+		qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
+		h, err := wd.storeHealth(qctx, st)
+		cancel()
+		if err != nil {
+			slog.Warn("dashboard: store health failed", "error", err)
+		} else {
+			health = h
+		}
+	}
 
 	if progress == nil {
 		wd.renderStartup(w)
@@ -541,7 +566,10 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		oldestClaims = tracker.oldestPerWorker(staleClaimAge)
 	}
 	var newestAnalyzedAt time.Time
-	if db != nil {
+	switch {
+	case health != nil:
+		newestAnalyzedAt = health.LatestScanned
+	case db != nil && st == nil:
 		//nolint:contextcheck,errcheck // closure creates its own context; closure logs errors before returning
 		newestAnalyzedAt, _ = wd.newestATCache.Fetch("newest", func() (time.Time, error) {
 			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
@@ -552,6 +580,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 			}
 			return t, err
 		})
+	default:
 	}
 
 	// Every rescan tier, not just stale-traits. The traits version is read live
@@ -566,7 +595,10 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	// must look unavailable, not healthy.
 	var depths hopper.RescanDepths
 	depthsOK := db == nil
-	if db != nil {
+	switch {
+	case health != nil:
+		depths, depthsOK = rescanDepthsOf(health.Depths), true
+	case db != nil && st == nil:
 		ra := wd.rescanAge
 		var err error
 		//nolint:contextcheck // closure creates its own context; closure logs errors before returning
@@ -582,6 +614,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		// Fetch serves the last good value on error; only a cache that has never
 		// succeeded is genuinely unknown.
 		depthsOK = err == nil || depths.Total() > 0
+	default:
 	}
 	rescanPending := depths.Total()
 
@@ -591,15 +624,30 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	// included. Dividing a top-level backlog by a files/sec rate is what made
 	// the old ETAs wildly optimistic.
 	var topLevelRate, rescanRate float64
-	if db != nil {
+	switch {
+	case health != nil:
+		topLevelRate = float64(health.Scanned-health.Rescanned) / analysisRateWindow.Seconds()
+		rescanRate = float64(health.Rescanned) / analysisRateWindow.Seconds()
+	case db != nil && st == nil:
 		rates := wd.rates.get(r.Context())
 		topLevelRate = float64(rates.TopLevel) / analysisRateWindow.Seconds()
 		rescanRate = float64(rates.Rescans) / analysisRateWindow.Seconds()
+	default:
 	}
 
 	var workflow dashboardWorkflow
-	if db != nil {
+	switch {
+	case st != nil:
+		qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
+		work, err := wd.storeWork(qctx, st)
+		cancel()
+		if err != nil {
+			slog.Warn("dashboard: store work lists failed", "error", err)
+		}
+		workflow = storeWorkflow(health, work)
+	case db != nil:
 		workflow = wd.fetchWorkflow(r.Context(), db)
+	default:
 	}
 
 	elapsed := time.Since(start).Round(time.Second)
@@ -619,7 +667,10 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	// the old estimate only ever grew (and read ~30k high). The analyzed/total
 	// denominator follows from the live count.
 	var pending int64
-	if db != nil {
+	switch {
+	case health != nil:
+		pending = firstScansOf(health.Depths)
+	case db != nil && st == nil:
 		//nolint:contextcheck,errcheck // closure creates its own context; closure logs errors before returning
 		pending, _ = wd.pendingCache.Fetch("pending", func() (int64, error) {
 			qctx, cancel := context.WithTimeout(r.Context(), dashQueryTimeout)
@@ -630,6 +681,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 			}
 			return n, err
 		})
+	default:
 	}
 	// The other half of "not fully analyzed": rows that got a cleave verdict but
 	// no litmus (ml) envelope. Free — workflowHealth already counts it for the

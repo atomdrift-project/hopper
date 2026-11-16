@@ -4,7 +4,7 @@
 #
 # WHY: initial tablesync COPYs every row into a table that ALREADY has all its
 # indexes, so the subscriber maintains each secondary B-tree per row. On a
-# large, heavily-indexed table (hopper's sample_locations: 200M+ rows, 8
+# large, heavily-indexed table (the legacy sample_locations: 200M+ rows, 8
 # indexes / 130GB of index) that per-row random-write maintenance — not the
 # network — dominates: the copy runs for *days* and DECELERATES as the indexes
 # grow, pinning the publisher's WAL the whole time (risking the
@@ -12,14 +12,18 @@
 # copy is far cheaper (one sorted parallel pass per index).
 #
 # So, when a real copy is about to happen, setup.sh calls us to:
-#   1. save each replicated table's non-primary index + unique-constraint DDL,
+#   1. save each replicated table's (REPLICA_SCHEMA.<table>) non-primary index
+#      + unique-constraint DDL,
 #   2. DROP those indexes — keeping the PRIMARY KEY, which is the replica
 #      identity that streamed UPDATE/DELETE need during post-copy catch-up,
 #   3. relax a few bulk-hostile GUCs (bigger checkpoints, parallel index
 #      builds, autovacuum paused) — reloadable only, NO restart, and
 #   4. after the copy, rebuild each table's indexes as soon as THAT table
-#      reaches 'ready' (so sample_locations' indexes build while the bigger
-#      samples table is still copying), then restore the GUCs and ANALYZE.
+#      reaches 'ready' (so a smaller table's indexes build while a bigger one
+#      is still copying), then restore the GUCs and ANALYZE.
+#
+# The rebuilt set is exactly what the table carried before the drop — on a
+# schema setup.sh just made, every index store/schema.sql defines.
 #
 # NOT handled here (deliberately): restart-only knobs (fsync,
 # full_page_writes, shared_buffers) and host-level ZFS tuning (sync=disabled).
@@ -29,9 +33,10 @@
 #
 # Relies on the caller (setup.sh) having defined: admin() [psql as a local
 # superuser], pg_sh() [run a command as the postgres OS user], log(), and the
-# vars LOCAL_DB, SUBSCRIPTION, and (optionally) HEAL_DIR. State files live in
-# postgres's world, so all reads/writes of them go through admin()'s \copy or
-# pg_sh. Enabled by default; FAST_SYNC=false skips everything.
+# vars LOCAL_DB, SUBSCRIPTION, REPLICA_SCHEMA, and (optionally) HEAL_DIR. State
+# files live in postgres's world, so all reads/writes of them go through
+# admin()'s \copy or pg_sh. Enabled by default; FAST_SYNC=false skips
+# everything.
 
 FAST_SYNC="${FAST_SYNC:-true}"
 # maintenance_work_mem for the post-copy index builds. Bigger = fewer merge
@@ -84,13 +89,15 @@ _bulk_valid_table() {
 _bulk_dump_reindex() {
     _bt="$1"; _bf="$2"
     admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
-\copy (SELECT stmt FROM (SELECT regexp_replace(pg_get_indexdef(i.indexrelid), '^CREATE (UNIQUE )?INDEX ', 'CREATE \1INDEX IF NOT EXISTS ')||';' AS stmt, 1 AS ord, pg_relation_size(i.indexrelid) AS sz FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname='public' AND t.relname='$_bt' AND NOT i.indisprimary UNION ALL SELECT 'DO \$do\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='||quote_literal('public.'||t.relname)||'::regclass AND conname='||quote_literal(c.relname)||') THEN ALTER TABLE public.'||quote_ident(t.relname)||' ADD CONSTRAINT '||quote_ident(c.relname)||' UNIQUE USING INDEX '||quote_ident(c.relname)||'; END IF; END \$do\$;', 2, 0 FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_constraint k ON k.conindid=i.indexrelid AND k.contype='u' WHERE n.nspname='public' AND t.relname='$_bt') q ORDER BY ord, sz DESC) TO '$_bf'
+\copy (SELECT stmt FROM (SELECT regexp_replace(pg_get_indexdef(i.indexrelid), '^CREATE (UNIQUE )?INDEX ', 'CREATE \1INDEX IF NOT EXISTS ')||';' AS stmt, 1 AS ord, pg_relation_size(i.indexrelid) AS sz FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname='$REPLICA_SCHEMA' AND t.relname='$_bt' AND NOT i.indisprimary UNION ALL SELECT 'DO \$do\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='||quote_literal('$REPLICA_SCHEMA.'||t.relname)||'::regclass AND conname='||quote_literal(c.relname)||') THEN ALTER TABLE $REPLICA_SCHEMA.'||quote_ident(t.relname)||' ADD CONSTRAINT '||quote_ident(c.relname)||' UNIQUE USING INDEX '||quote_ident(c.relname)||'; END IF; END \$do\$;', 2, 0 FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_constraint k ON k.conindid=i.indexrelid AND k.contype='u' WHERE n.nspname='$REPLICA_SCHEMA' AND t.relname='$_bt') q ORDER BY ord, sz DESC) TO '$_bf'
 SQL
 }
 
 # _bulk_drop_indexes TABLE — drop every non-primary index on TABLE, using
-# ALTER TABLE ... DROP CONSTRAINT for constraint-backed (UNIQUE) indexes and
-# DROP INDEX for plain ones. Done server-side in one DO block.
+# ALTER TABLE ... DROP CONSTRAINT for UNIQUE constraints and DROP INDEX for
+# plain ones. Done server-side in one DO block. Only UNIQUE constraints are
+# dropped because only they are restored (_bulk_dump_reindex): the DROP INDEX
+# of any other constraint's index fails and the index is kept.
 _bulk_drop_indexes() {
     _bt="$1"
     admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
@@ -103,19 +110,18 @@ BEGIN
           JOIN pg_class c ON c.oid = i.indexrelid
           JOIN pg_class t ON t.oid = i.indrelid
           JOIN pg_namespace n ON n.oid = t.relnamespace
-          LEFT JOIN pg_constraint k ON k.conindid = i.indexrelid AND k.contype IN ('u','x')
-         WHERE n.nspname = 'public' AND t.relname = '$_bt' AND NOT i.indisprimary
+          LEFT JOIN pg_constraint k ON k.conindid = i.indexrelid AND k.contype = 'u'
+         WHERE n.nspname = '$REPLICA_SCHEMA' AND t.relname = '$_bt' AND NOT i.indisprimary
     LOOP
         -- Drop each index in its own subtransaction so one failure doesn't
         -- roll back the whole batch. Notably a UNIQUE constraint that a foreign
-        -- key depends on (e.g. samples_sha256_key, referenced by
-        -- sample_locations) can't be dropped — catch it, keep that one index,
+        -- key depends on can't be dropped — catch it, keep that one index,
         -- and still drop all the others (the bulk of the copy-cost win).
         BEGIN
             IF r.con IS NOT NULL THEN
-                EXECUTE format('ALTER TABLE public.%I DROP CONSTRAINT %I', '$_bt', r.con);
+                EXECUTE format('ALTER TABLE %I.%I DROP CONSTRAINT %I', '$REPLICA_SCHEMA', '$_bt', r.con);
             ELSE
-                EXECUTE format('DROP INDEX IF EXISTS public.%I', r.idx);
+                EXECUTE format('DROP INDEX IF EXISTS %I.%I', '$REPLICA_SCHEMA', r.idx);
             END IF;
         EXCEPTION WHEN OTHERS THEN
             RAISE WARNING 'bulkload: keeping %.% (could not drop: %)', '$_bt', coalesce(r.con, r.idx), SQLERRM;
@@ -139,7 +145,7 @@ bulkload_defer() {
         _bulk_valid_table "$_t" || { log "fast-sync: skipping non-simple table name '$_t'"; continue; }
         _f="$_sd/reindex.$(_bulk_safe "$_t").sql"
         _bulk_dump_reindex "$_t" "$_f"
-        # Skip tables with nothing to defer (e.g. reports: PK only).
+        # Skip tables with nothing to defer (e.g. hopper_kv: PK only).
         if ! pg_sh "test -s '$_f'" 2>/dev/null; then
             pg_sh "rm -f '$_f'" 2>/dev/null || true
             continue
@@ -206,7 +212,7 @@ _bulk_srsubstate() {
            JOIN pg_subscription s ON s.oid = r.srsubid
            JOIN pg_class c ON c.oid = r.srrelid
            JOIN pg_namespace n ON n.oid = c.relnamespace
-          WHERE s.subname = '$SUBSCRIPTION' AND n.nspname = 'public' AND c.relname = '$1'" \
+          WHERE s.subname = '$SUBSCRIPTION' AND n.nspname = '$REPLICA_SCHEMA' AND c.relname = '$1'" \
         2>/dev/null | tr -d '[:space:]'
 }
 
@@ -217,7 +223,7 @@ _bulk_reindex_one() {
     pg_sh "test -f '$_bf'" 2>/dev/null || return 0
     log "fast-sync: '$_bt' copy done — rebuilding its indexes (parallel, maintenance_work_mem=$BULK_MAINT_MEM)"
     if admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -f "$_bf" >/dev/null; then
-        admin -d "$LOCAL_DB" -c "ANALYZE public.$_bt" >/dev/null 2>&1 || true
+        admin -d "$LOCAL_DB" -c "ANALYZE $REPLICA_SCHEMA.$_bt" >/dev/null 2>&1 || true
         pg_sh "rm -f '$_bf'" 2>/dev/null || true
         log "fast-sync: '$_bt' indexes rebuilt"
     else

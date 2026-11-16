@@ -5,6 +5,39 @@ This is the operational checklist for changing a **derived column** on `samples`
 replicas healthy across such a change. It exists because one such change — done
 the naive way — froze the primary for 44 minutes and silently disabled a replica.
 
+## What a replica carries (since 2026-11-15)
+
+A replica copies the **verdict schema**, not the legacy tables in `public`,
+which have been frozen since the 2026-11-15 migration and are no longer
+published. The rules and procedures below were learned on the legacy `samples`
+table; they apply to any large published table.
+
+- **The set:** `REPLICATED_TABLES` in schema `REPLICA_SCHEMA` (`verdict`), in
+  `scripts/replica/replicated-tables.sh` — every table `store/schema.sql`
+  creates except the UNLOGGED `walk_staging`, which a publication cannot carry.
+  `TestReplicatedTablesAreTheVerdictSchema` fails when the two disagree.
+- **The publication:** `setup.sh` reconciles `hopper_replica` on the publisher
+  to exactly that list (`ALTER PUBLICATION … SET TABLE`, only when it differs).
+- **The schema:** on a replica without `verdict.samples`, `setup.sh` runs
+  `store/schema.sql` with psql into schema `verdict` owned by `hopper`, in one
+  transaction — what hopper's `openStore` does on an empty database. The schema
+  has no migrations: an existing one is never altered by `setup.sh`. A column
+  the publisher gains is added by `replica-heal.sh`; an index or constraint
+  change is applied by hand, as on the publisher.
+- **The indexes:** every index `store/schema.sql` defines. The legacy
+  slim-index policy (`slim-indexes.sh`, `REPLICA_KEEP_INDEXES`) is gone. A fresh
+  copy drops the secondary indexes first and rebuilds them as each table
+  finishes (`bulkload.sh`, below). `replica-textfile.sh` reports indexes the
+  publisher has on published tables that the replica lacks
+  (`hopper_replica_index_policy_missing`), and the reverse (`…_extra`).
+- **The subscription:** `copy_data`, `binary = true`, `streaming = parallel`,
+  `disable_on_error = true`.
+- **No hopper build:** `make replica` / `make rebuild-replica` need only psql
+  and this checkout; `store/schema.sql` must match what the publisher runs.
+- **Promotion:** `promote.sh` publishes the same tables locally and moves the
+  identity sequences (`names`, `samples`, `reports`, `label_events`) past the
+  copied rows, which logical replication does not carry.
+
 ## The four rules that make this safe
 
 1. **Never run a table-rewriting statement on `samples`.** Adding/recreating a
@@ -49,9 +82,9 @@ the naive way — froze the primary for 44 minutes and silently disabled a repli
 
    Before adding one, check the cost with:
    `SELECT indexrelname, idx_scan, last_idx_scan, pg_size_pretty(pg_relation_size(indexrelid)) FROM pg_stat_user_indexes WHERE relname='samples' ORDER BY idx_scan;`
-   and remember that **`idx_scan = 0` is not proof an index is dead** — indexes
-   in `REPLICA_KEEP_INDEXES` read zero on the master because prism reads them on
-   the *replica*, and a tier that is merely switched off reads zero too. `EXPLAIN`
+   and remember that **`idx_scan = 0` is not proof an index is dead** — an
+   index prism reads only on the *replica* reads zero on the master, and a tier
+   that is merely switched off reads zero too. `EXPLAIN`
    the application's real SQL text before dropping anything.
 
    Measured outcome, so nobody repeats it expecting more: that diet cut samples'
@@ -103,7 +136,7 @@ now-plain column.
 1. **Deploy the new `hopper` binary to every host that can run
    `init`/`import`** — primary and all replicas — *before* converting. (Old
    binaries re-trigger the rewrite once the column is plain.) `make deploy` on the
-   primary; on replicas, `git pull` then `make replica` (or copy the binary).
+   primary; on replicas, `git pull` then `make build` (or copy the binary).
 2. **Quiesce the primary** (`systemctl stop hopper.service`) so the `DROP
    EXPRESSION` takes its brief `ACCESS EXCLUSIVE` instantly instead of stalling
    behind live writers. Cancel any long reconcile holding IO.
@@ -151,7 +184,7 @@ two minutes so a hung check cannot block later timer ticks.
 **Distributing the healer:** `install-heal.sh` *copies* `replica-heal.sh` to
 `/usr/local/bin/hopper-replica-heal.sh` and points the timer at the copy. So after
 updating the script in the repo you must re-install: `git pull` on the replica,
-then `scripts/replica/install-heal.sh` (light — no rebuild, no `hopper init`, no
+then `scripts/replica/install-heal.sh` (light — no rebuild, no schema work, no
 subscription disable), or a full `make replica`.
 
 ## Fast (re)build: deferred-index bulk copy
@@ -173,9 +206,10 @@ default, runs an **index-deferred bulk copy** (`scripts/replica/bulkload.sh`):
    `max_parallel_maintenance_workers`, `max_wal_size`, `autovacuum=off`,
    `synchronous_commit=off`, `wal_compression=off`);
 3. lets the copy run index-light, then **rebuilds each table's indexes in
-   parallel the moment that table finishes** (so `sample_locations`' indexes
-   build while the bigger `samples` is still copying), `ANALYZE`s, and restores
-   the GUCs.
+   parallel the moment that table finishes** (so a smaller table's indexes
+   build while a bigger one is still copying), `ANALYZE`s, and restores
+   the GUCs. What it rebuilds is what it dropped: on a fresh `verdict` schema,
+   every index `store/schema.sql` defines.
 
 Because it rebuilds after the copy, `setup.sh` now **blocks until the copy
 completes** when it deferred anything (a steady-state reconcile defers nothing
@@ -234,7 +268,7 @@ the operator, so `df` would fail and silently take the safe branch forever.
 The parallelism cap is set with `ALTER ROLE`, not `ALTER SYSTEM`, so it applies
 to prism/beamline/cyclotron logins and deliberately *overrides* the cluster-wide
 `max_parallel_workers_per_gather=4` that `freebsd-bastille.sh` sets below;
-`hopper init`'s index builds read `max_parallel_maintenance_workers` and are
+`bulkload.sh`'s index builds read `max_parallel_maintenance_workers` and are
 untouched. Override with `REPLICA_MAX_PARALLEL_PER_GATHER=<n>`. `promote.sh`
 RESETs it — a primary has no apply worker to protect and does run the reporting
 queries parallelism exists for.
@@ -317,24 +351,6 @@ worker(s)` means N apply workers hold transaction write locks on that table;
 it does not estimate rows left or identify the exact row currently executing.
 The main apply PID is selected separately from parallel workers. History uses
 a versioned filename so old retention-based samples cannot distort the new ETA.
-
-
-### Replica parent-backlink index
-
-On 2026-10-28, `idx_sl_child_parents` was parked in the replica drop list and
-removed concurrently from galadriel. It was 765 GiB in PostgreSQL's relation
-size accounting, had zero lookup scans, and dominated index-block reads while
-applying location inserts. The nine-hour statement history contained no
-`sample_locations` queries, and Hopper's read API has no caller of
-`ParentArchivesForChild`. The primary's requeue path still needs the index;
-its canonical migration and primary index are retained.
-
-Restore it before directing parent-backlink queries or direct SQL requiring
-that access path to this replica. The captured DDL is in
-`~/.hopper-replica-heal/slim-index-restore.sql`; move its name back to the keep
-list as part of that change. Rebuilding an index this size is expensive, so
-restoration must precede enabling the consumer. `idx_sl_containment` remains
-on the replica for read-side containment predicates.
 
 
 ### TRIM interference on galadriel (2026-10-28)

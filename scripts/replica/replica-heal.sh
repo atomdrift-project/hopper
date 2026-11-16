@@ -23,10 +23,13 @@
 # Design / scope (read before extending):
 #   * LIVENESS, not parity. The job is "every published column exists locally
 #     with a compatible type, in a table apply can write" so the worker can run.
-#     Full canonical schema (secondary indexes, CHECK/FK constraints, NOT NULL
-#     backfills) remains 'hopper init's job at deploy time; this heal is the
-#     gap-filler between deploys. What it adds — a column, or a bare table with
-#     its PK — gets reconciled to canonical by the next 'make replica'.
+#     The canonical schema (secondary indexes, CHECK/FK constraints, NOT NULL)
+#     is store/schema.sql, which setup.sh runs only on a replica without the
+#     schema: the verdict schema has no migrations, so a change to it reaches
+#     an existing replica by hand, as it reaches the publisher. This heal is
+#     what keeps apply running until then. What it adds — a column, or a bare
+#     table with its PK — is the publisher's definition minus indexes and
+#     constraints; bring those over with the rest of the change.
 #   * BOUNDED, LOSSLESS HEALS ONLY — the three cases above, and nothing else.
 #     ADD COLUMN (nullable / non-volatile default), ALTER COLUMN ... DROP
 #     EXPRESSION, and CREATE TABLE (empty, from the publisher's catalog) are all
@@ -458,7 +461,7 @@ fi
 [ -n "$created_tables" ]  && log "new published table(s) on '$SUBSCRIPTION': creating locally from publisher catalog:$created_tables"
 [ -n "$missing_names" ]   && log "additive drift on '$SUBSCRIPTION': adding missing column(s):$missing_names"
 [ -n "$generated_names" ] && log "generated/plain drift on '$SUBSCRIPTION': converting to plain (DROP EXPRESSION):$generated_names"
-[ -n "$pk_missing" ]      && alert warn "created table(s) have NO primary key on the publisher:$pk_missing — apply of UPDATE/DELETE will fail until a REPLICA IDENTITY is set; run 'make replica' to apply canonical schema."
+[ -n "$pk_missing" ]      && alert warn "created table(s) have NO primary key on the publisher:$pk_missing — apply of UPDATE/DELETE will fail until a REPLICA IDENTITY is set by hand."
 
 # Disable during DDL so the apply worker's locks don't fight it. (If it was
 # disabled by disable_on_error, this is a no-op.)
@@ -498,7 +501,7 @@ done
 IFS=$oldIFS
 
 if [ -n "$unhealed" ]; then
-    alert warn "after heal, these published columns are still missing or generated locally:$unhealed — subscription '$SUBSCRIPTION' left DISABLED. Run 'make replica'."
+    alert warn "after heal, these published columns are still missing or generated locally:$unhealed — subscription '$SUBSCRIPTION' left DISABLED. Compare the local table with the publisher's by hand; make diagnose-replica shows the apply error."
     exit 1
 fi
 
@@ -520,7 +523,7 @@ if [ -n "$created_tables" ]; then
 fi
 
 if [ -n "$notnull_unenforced" ]; then
-    alert warn "healed drift, but added these NULLABLE despite publisher NOT NULL (no reproducible default):$notnull_unenforced — run 'make replica' to apply the canonical migration/backfill."
+    alert warn "healed drift, but added these NULLABLE despite publisher NOT NULL (no reproducible default):$notnull_unenforced — apply the publisher's NOT NULL by hand once the column is filled."
 elif [ -z "$pk_missing" ]; then
     clear_alert
 fi

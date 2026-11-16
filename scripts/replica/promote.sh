@@ -8,8 +8,10 @@
 #   1. Verify the local replica is caught up to the publisher.
 #   2. Drop the subscription locally (dissociated from the remote slot).
 #   3. Drop the now-orphan replication slot on the publisher.
-#   4. Verify the schema migrations (sample_locations) are in place.
-#   5. Show a manual checklist for /etc/hosts + worker reconfig.
+#   4. Publish the replicated tables from here.
+#   5. Move the identity sequences past the copied rows.
+#   6. Revert the disposable-replica tuning.
+#   7. Show a manual checklist for /etc/hosts + worker reconfig.
 #
 # Idempotent: re-running after success is a no-op. Intended to be run
 # on the replica box (the one that's becoming the new primary).
@@ -127,63 +129,60 @@ fi
 
 # --- 4. Make this database publishable ------------------------------------
 
-log "Ensuring local publication '$SUBSCRIPTION' publishes: $REPLICATED_TABLES"
-pub_exists=$(admin -d "$LOCAL_DB" -tAc \
-    "SELECT 1 FROM pg_publication WHERE pubname = '$SUBSCRIPTION'" | tr -d '[:space:]')
-if [ "$pub_exists" != "1" ]; then
-    admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -v pub="$SUBSCRIPTION" <<'SQL'
-CREATE PUBLICATION :"pub";
-SQL
-fi
-
+log "Ensuring local publication '$SUBSCRIPTION' publishes $REPLICA_SCHEMA: $REPLICATED_TABLES"
+published=''
 for table in $REPLICATED_TABLES; do
     table_exists=$(admin -d "$LOCAL_DB" -tAc \
-        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = '$table'" \
-        | tr -d '[:space:]')
-    [ "$table_exists" = "1" ] || die "expected replicated table public.$table is missing; run 'make replica' or './hopper init' first"
-
-    pub_has_table=$(admin -d "$LOCAL_DB" -tAc \
-        "SELECT 1 FROM pg_publication_tables WHERE pubname = '$SUBSCRIPTION' AND schemaname = 'public' AND tablename = '$table'" \
-        | tr -d '[:space:]')
-    if [ "$pub_has_table" != "1" ]; then
-        admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -v pub="$SUBSCRIPTION" <<SQL
-ALTER PUBLICATION :"pub" ADD TABLE public.$table;
-SQL
-    fi
+        "SELECT to_regclass('$REPLICA_SCHEMA.$table') IS NOT NULL" | tr -d '[:space:]')
+    [ "$table_exists" = "t" ] || die "expected replicated table $REPLICA_SCHEMA.$table is missing; this is not a complete replica"
+    published="$published, $REPLICA_SCHEMA.$table"
 done
+published=${published#, }
+pub_exists=$(admin -d "$LOCAL_DB" -tAc \
+    "SELECT 1 FROM pg_publication WHERE pubname = '$SUBSCRIPTION'" | tr -d '[:space:]')
+if [ "$pub_exists" = "1" ]; then
+    admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -c \
+        "ALTER PUBLICATION \"$SUBSCRIPTION\" SET TABLE $published"
+else
+    admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -c \
+        "CREATE PUBLICATION \"$SUBSCRIPTION\" FOR TABLE $published"
+fi
 
 log "Granting hopper role REPLICATION for future subscribers"
 admin -v ON_ERROR_STOP=1 -v role="$LOCAL_USER" <<'SQL'
 ALTER ROLE :"role" WITH REPLICATION;
 SQL
 
-# --- 5. Verify/backfill the new schema is in place ------------------------
-# Bail loudly if sample_locations migration hasn't run yet — we'd be
-# promoting an incomplete DB.
-
-log "Verifying sample_locations migration applied"
-if ! admin -d "$LOCAL_DB" -tAc \
-        "SELECT 1 FROM information_schema.tables WHERE table_name = 'sample_locations'" | grep -q 1; then
-    die "sample_locations table missing. Run 'make replica' or './hopper init' first, then re-run this script."
-fi
-
-loc_count=$(admin -d "$LOCAL_DB" -tAc "SELECT count(*) FROM sample_locations" | tr -d '[:space:]')
-sample_count=$(admin -d "$LOCAL_DB" -tAc "SELECT count(*) FROM samples WHERE path <> ''" | tr -d '[:space:]')
-log "sample_locations rows:     $loc_count"
-log "samples with non-empty path: $sample_count"
-if [ "$loc_count" -lt "$sample_count" ]; then
-    log "Backfilling sample_locations from samples"
-    admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 <<'SQL'
-INSERT INTO sample_locations
-    (sha256, path, parent_sha256, filename, source, feed, ecosystem, mtime, first_seen_at, last_seen_at)
-SELECT sha256, path, parent, filename, source, feed, ecosystem, mtime, created_at, updated_at
-  FROM samples
- WHERE path <> ''
-ON CONFLICT (sha256, path) DO NOTHING;
+# --- 5. Move the identity sequences past the copied rows -------------------
+# Logical replication copies rows, never sequence state: every identity column
+# here (samples.id, names.id, reports.id, label_events.id) still has its
+# sequence where schema.sql left it, and the first insert on the new primary
+# would collide with a copied row. Set each to its column's max. Idempotent: a
+# re-run sets the same values, and a promoted primary's own inserts only ever
+# move max forward.
+log "Moving $REPLICA_SCHEMA identity sequences past the copied rows"
+admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 <<SQL
+DO \$\$
+DECLARE
+    r    record;
+    top  bigint;
+BEGIN
+    FOR r IN
+        SELECT c.oid::regclass AS tbl, a.attname AS col
+          FROM pg_attribute a
+          JOIN pg_class c ON c.oid = a.attrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = '$REPLICA_SCHEMA' AND c.relkind = 'r'
+           AND a.attidentity <> '' AND NOT a.attisdropped
+    LOOP
+        EXECUTE format('SELECT max(%I) FROM %s', r.col, r.tbl) INTO top;
+        IF top IS NOT NULL THEN
+            PERFORM setval(pg_get_serial_sequence(r.tbl::text, r.col), top);
+            RAISE NOTICE 'sequence for %.% set to %', r.tbl, r.col, top;
+        END IF;
+    END LOOP;
+END \$\$;
 SQL
-    loc_count=$(admin -d "$LOCAL_DB" -tAc "SELECT count(*) FROM sample_locations" | tr -d '[:space:]')
-    log "sample_locations rows after backfill: $loc_count"
-fi
 
 # --- 6. Revert disposable-replica tuning ----------------------------------
 # A read replica trades durability for throughput; a primary must be durable.
@@ -206,20 +205,6 @@ log "Restoring $LOCAL_USER parallelism to the cluster default"
 admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
     -c "ALTER ROLE \"$LOCAL_USER\" RESET max_parallel_workers_per_gather" >/dev/null \
     || log "warning: could not reset $LOCAL_USER parallelism — do it by hand"
-# Rebuild the master-only indexes slim-indexes.sh dropped — a primary's write
-# pipeline (worker queues, ingest lookups) needs them, a read replica didn't.
-# Best-effort: CREATE INDEX over TB-scale tables takes hours, so run it here
-# where the operator is watching rather than leaving the new primary quietly
-# queue-less. The DDL file only exists if slim-indexes.sh ever ran.
-SLIM_RESTORE="${HEAL_STATE_DIR:-$HOME/.hopper-replica-heal}/slim-index-restore.sql"
-if [ -f "$SLIM_RESTORE" ]; then
-    log "Rebuilding master-only indexes dropped for replica duty (this can take hours)"
-    if admin -d "$LOCAL_DB" -f "$SLIM_RESTORE"; then
-        mv "$SLIM_RESTORE" "$SLIM_RESTORE.applied" || log "warning: could not archive applied index restore: $SLIM_RESTORE"
-    else
-        log "warning: index rebuild failed or partial — re-run by hand: psql -d $LOCAL_DB -f $SLIM_RESTORE"
-    fi
-fi
 
 # ZFS: sync=disabled -> standard. Best-effort and a no-op inside a jail (see the
 # manual note below) or on non-ZFS boxes.
@@ -252,9 +237,9 @@ What's left (manual):
   3. Resume hopper workers (forager, analyzers). They should now connect
      to THIS host via the updated 'hopper' hostname.
 
-  4. Smoke-test: run a tiny ingest and confirm it shows up in BOTH tables:
-       psql -h hopper -U hopper -d hopper -c 'SELECT count(*) FROM samples'
-       psql -h hopper -U hopper -d hopper -c 'SELECT count(*) FROM sample_locations'
+  4. Smoke-test: run a tiny ingest and confirm it shows up:
+       psql -h hopper -U hopper -d hopper -c 'SELECT max(id) FROM $REPLICA_SCHEMA.samples'
+       psql -h hopper -U hopper -d hopper -c 'SELECT count(*) FROM $REPLICA_SCHEMA.locations'
 
   5. Optional: set up reverse replication so the old primary becomes the
      warm replica going forward (publish from here, subscribe there).

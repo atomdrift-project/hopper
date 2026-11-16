@@ -210,22 +210,22 @@ groups:
           summary: "{{ $labels.subscription }} has tables not in 'ready' state"
           description: "{{ $value }} of {{ $labels.subscription }}'s tables are still copying/syncing after 6h on {{ $labels.host }} — a stuck tablesync holds its own slot and its own WAL." # yamllint disable-line rule:line-length
 
-      # Index drift: the replica keeps a deliberately minimal index set
-      # (scripts/replica/slim-indexes.sh). DDL does not replicate, so a
-      # master-side index never arrives on its own — 'make replica' has to run.
-      # This is what silently diverged to 14 indexes vs the master's 77.
+      # Index drift: the replica carries every index the publisher has on a
+      # published table (replica-textfile.sh compares the two by name). DDL
+      # does not replicate, so a master-side index never arrives on its own,
+      # and an interrupted fast-sync rebuild leaves its indexes out.
       - alert: ReplicaIndexPolicyDrift
         expr: hopper_replica_index_policy_missing > 0
         for: 6h
         labels: { severity: warning }
         annotations:
-          summary: "Replica {{ $labels.host }} is missing {{ $value }} policy index(es)"
-          description: "{{ $value }} index(es) named by REPLICA_KEEP_INDEXES are absent — 'make replica' has not run since hopper gained them, so prism read paths are unindexed. Run 'make replica' on {{ $labels.host }}." # yamllint disable-line rule:line-length
+          summary: "Replica {{ $labels.host }} is missing {{ $value }} publisher index(es)"
+          description: "{{ $value }} index(es) the publisher has on published tables are absent on {{ $labels.host }}, so replica readers scan where the publisher would not. Create them from the publisher's definitions (pg_indexes), or finish an interrupted fast-sync rebuild from the healer's bulkload state dir." # yamllint disable-line rule:line-length
 
       - alert: ReplicaIndexPolicyExtra
         expr: hopper_replica_index_policy_extra > 0
         for: 24h
         labels: { severity: warning }
         annotations:
-          summary: "Replica {{ $labels.host }} carries {{ $value }} unslimmed index(es)"
-          description: "{{ $value }} index(es) on subscribed tables are not in the keep list — on a logical replica every one is maintained per applied row. Run scripts/replica/slim-indexes.sh on {{ $labels.host }}." # yamllint disable-line rule:line-length
+          summary: "Replica {{ $labels.host }} carries {{ $value }} index(es) the publisher lacks"
+          description: "{{ $value }} index(es) on subscribed tables of {{ $labels.host }} are not on the publisher — on a logical replica every one is maintained per applied row. Drop them, or add them upstream if a reader needs them." # yamllint disable-line rule:line-length

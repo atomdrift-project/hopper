@@ -15,9 +15,10 @@
 #   1. Disable + drop the local subscription (slot_name = NONE so DROP
 #      doesn't block trying to reach the dead remote slot).
 #   2. TRUNCATE every locally-present table in the publisher's publication
-#      (RESTART IDENTITY CASCADE).
+#      (RESTART IDENTITY CASCADE). Every one must be in REPLICA_SCHEMA.
 #   3. Re-run setup.sh with COPY_DATA=true, which drops any orphan remote
-#      slot, recreates the subscription, and triggers a fresh full copy.
+#      slot, recreates the subscription, and triggers a fresh full copy (its
+#      fast-sync drops the secondary indexes for the copy and rebuilds them).
 #
 # Idempotent: safe to re-run if interrupted. Re-running after success just
 # re-copies again (the subscription is dropped and recreated each time).
@@ -58,7 +59,9 @@ case "$FORCE" in
     *) die "rebuild is destructive (TRUNCATEs + full re-copy). Re-run with FORCE=true to proceed." ;;
 esac
 
-SCRIPT_DIR=$(dirname "$0")
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/replicated-tables.sh"
 
 # --- Admin access probe ----------------------------------------------------
 # Same ladder as setup.sh / promote.sh so this works on FreeBSD (doas/sudo),
@@ -89,7 +92,7 @@ fi
 
 # Read the publisher's current publication before dropping the subscription.
 # This keeps the destructive reset in step with the actual publication rather
-# than a stale hand-maintained list (notably, this includes sightings).
+# than this checkout's list, which setup.sh reconciles the publication to after.
 if ! published_tables=$(psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" \
         -tA -F '|' -c \
         "SELECT schemaname, tablename
@@ -103,21 +106,19 @@ fi
 truncate_tables=''
 while IFS='|' read -r schema table; do
     [ -n "$schema" ] || continue
-    case "$schema" in
-        public) ;;
-        *) die "publication '$PUBLICATION' contains unsupported schema '$schema'; rebuild expects public tables" ;;
-    esac
+    [ "$schema" = "$REPLICA_SCHEMA" ] \
+        || die "publication '$PUBLICATION' contains $schema.$table; rebuild expects only $REPLICA_SCHEMA tables (run make replica first to reconcile the publication)"
     case "$table" in
         ""|[!A-Za-z_]*|*[!A-Za-z0-9_]*)
             die "publication '$PUBLICATION' contains unsupported table name '$table'" ;;
     esac
 
     local_table=$(admin -d "$LOCAL_DB" -tAc \
-        "SELECT to_regclass('public.$table') IS NOT NULL" | tr -d '[:space:]')
+        "SELECT to_regclass('$schema.$table') IS NOT NULL" | tr -d '[:space:]')
     if [ "$local_table" = "t" ]; then
-        truncate_tables="$truncate_tables public.$table,"
+        truncate_tables="$truncate_tables $schema.$table,"
     else
-        log "Published table '$schema.$table' is not local yet; setup.sh will create it"
+        log "Published table '$schema.$table' is not local; setup.sh refuses to subscribe until it exists"
     fi
 done <<EOF
 $published_tables
@@ -152,15 +153,16 @@ else
 fi
 
 # --- 2. Clear the replicated tables ----------------------------------------
-# RESTART IDENTITY resets id sequences. CASCADE also clears local FK-dependent
-# tables that are not themselves published (for example claims -> samples).
+# RESTART IDENTITY resets id sequences. CASCADE also clears any local
+# FK-dependent table that is not itself published.
 log "Truncating published tables:$truncate_tables (full re-copy follows)"
 admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -c \
     "TRUNCATE $truncate_tables RESTART IDENTITY CASCADE;"
 
 # --- 3. Recreate the subscription with a fresh full copy -------------------
-# setup.sh recreates the role/db (no-ops here), reconciles the publication,
-# drops any orphan remote slot, and CREATE SUBSCRIPTION ... copy_data=true.
+# setup.sh recreates the role/db/schema (no-ops here), reconciles the
+# publication, drops any orphan remote slot, and CREATE SUBSCRIPTION ...
+# copy_data=true.
 log "Re-running setup.sh for a fresh copy (COPY_DATA=true)"
 COPY_DATA=true \
     REMOTE_HOST="$REMOTE_HOST" \

@@ -235,7 +235,8 @@ hopper_pg_table_stats:
         pg_postmaster_start_time()))::bigint                      AS vacuum_age_seconds
     FROM pg_class c
     JOIN pg_stat_user_tables s ON s.relid = c.oid
-    WHERE c.relname IN ('samples', 'sample_locations', 'reports', 'sightings')
+    WHERE s.schemaname = 'verdict'
+      AND c.relname IN ('samples', 'verdicts', 'scans', 'locations', 'queue', 'reports', 'sightings')
   master: true
   metrics:
     - table: { usage: "LABEL", description: "Table name" }

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"testing"
 	"time"
 )
@@ -307,6 +308,11 @@ func TestTransferSamples_Idempotent(t *testing.T) {
 		t.Errorf("second transfer = %d, want 0 (idempotent)", s2)
 	}
 }
+
+// createIndexRE matches the CREATE INDEX forms hopper's migration list uses,
+// capturing the index name and the table it targets.
+var createIndexRE = regexp.MustCompile(
+	`(?is)CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?([a-z0-9_]+)\s+ON\s+(?:public\.)?([a-z0-9_]+)`)
 
 // ReindexLitmusLevel names the indexes it rebuilds as string constants, so a
 // rename in the migration DDL would leave it silently rebuilding nothing —

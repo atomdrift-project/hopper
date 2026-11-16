@@ -142,13 +142,92 @@ func SightingsFromStore(ctx context.Context, st *store.Store, subjects []string)
 	return out, nil
 }
 
+// SightingsInAncestryFromStore answers /v1/sightings/ancestry from the
+// verdict store: the sightings that name the file with digest root, or any
+// archive holding it, by digest or by a release they cover. The nearest files
+// with any are the answer, one witness being enough to refuse calling the
+// file benign. An unknown file is ErrNotFound; an ancestry too large to walk is an
+// error, never a clear answer.
+func SightingsInAncestryFromStore(ctx context.Context, st *store.Store, root string) (*SightingsAncestry, error) {
+	digest, err := hex.DecodeString(root)
+	if err != nil {
+		return nil, fmt.Errorf("sightings ancestry: %w", err)
+	}
+	chain, err := st.Ancestry(ctx, digest)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, fmt.Errorf("sightings ancestry: unknown file %s: %w", root, ErrNotFound)
+	}
+	if err != nil {
+		return nil, err
+	}
+	subjects := make([]string, 0, 2*len(chain))
+	for _, a := range chain {
+		subjects = append(subjects, hex.EncodeToString(a.SHA256))
+		if a.Name != "" {
+			subjects = append(subjects, a.Name)
+		}
+	}
+	ledger, err := SightingsFromStore(ctx, st, subjects)
+	if err != nil {
+		return nil, err
+	}
+	out := &SightingsAncestry{Checked: true, Sightings: []AncestrySighting{}}
+	for i, a := range chain {
+		if len(out.Sightings) > 0 && a.Depth > chain[i-1].Depth {
+			break
+		}
+		sha := hex.EncodeToString(a.SHA256)
+		for j := range ledger[sha] {
+			out.Sightings = append(out.Sightings, AncestrySighting{SHA256: sha, Sighting: ledger[sha][j]})
+		}
+		if a.Name == "" {
+			continue
+		}
+		for j := range ledger[a.Name] {
+			if s := &ledger[a.Name][j]; s.Covers(a.Version) {
+				out.Sightings = append(out.Sightings, AncestrySighting{SHA256: sha, Sighting: *s})
+			}
+		}
+	}
+	return out, nil
+}
+
 // AddSightingsToStore records sightings in the verdict store's ledger by the
 // rules the legacy ledger applies (PrepareSightings), relayed by relayer:
-// /v1/sightings's write.
+// /v1/sightings's write. A source's first bulk arrival is its backlog, not
+// news, and is dated as BackfillSightingsToStore dates it (see seedTimes).
 func AddSightingsToStore(ctx context.Context, st *store.Store, sightings []Sighting, relayer string) (int, error) {
+	return addSightingsToStore(ctx, st, sightings, relayer, false)
+}
+
+// BackfillSightingsToStore is AddSightingsToStore for a source's walk of its
+// history: every claim is dated when the source published it, or the epoch,
+// and a claim stored already moves back to that date.
+func BackfillSightingsToStore(ctx context.Context, st *store.Store, sightings []Sighting, relayer string) (int, error) {
+	return addSightingsToStore(ctx, st, sightings, relayer, true)
+}
+
+func addSightingsToStore(ctx context.Context, st *store.Store, sightings []Sighting, relayer string, backfill bool) (int, error) {
 	prepared, err := PrepareSightings(sightings, relayer)
 	if err != nil {
 		return 0, err
+	}
+	backlog := map[string]bool{}
+	if !backfill {
+		bulk := map[string]int{}
+		for i := range prepared {
+			bulk[prepared[i].Source]++
+		}
+		for source, n := range bulk {
+			if n < sightingSeedBatch {
+				continue
+			}
+			known, err := st.SourceKnown(ctx, source)
+			if err != nil {
+				return 0, err
+			}
+			backlog[source] = !known
+		}
 	}
 	rows := make([]store.Sighting, len(prepared))
 	for i := range prepared {
@@ -157,6 +236,9 @@ func AddSightingsToStore(ctx context.Context, st *store.Store, sightings []Sight
 			PublishedAt: g.PublishedAt, Source: g.Source, Relayer: g.Relayer, Operator: g.Operator,
 			Subject: g.Subject, Affected: g.Affected, URL: g.URL, Note: g.Note, FileName: g.FileName,
 			Handle: g.Handle, Claim: string(g.Claim), Basis: string(g.Basis),
+		}
+		if backfill || backlog[g.Source] {
+			rows[i].FirstSeen = backdated(g.PublishedAt)
 		}
 	}
 	return st.AddSightings(ctx, rows)

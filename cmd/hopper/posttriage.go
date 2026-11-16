@@ -123,7 +123,7 @@ func (s *apiServer) handleIncomingLocations(w http.ResponseWriter, r *http.Reque
 		after.SHA256 = r.URL.Query().Get("after_sha")
 		after.Path = r.URL.Query().Get("after_path")
 	}
-	locations, err := s.db.OldestIncomingLocations(r.Context(), hopper.IncomingQuery{
+	locations, err := s.incoming(r.Context(), hopper.IncomingQuery{
 		Before: before, After: after, Class: class, Limit: limit,
 	})
 	if errors.Is(err, hopper.ErrNotFound) || (err != nil && strings.Contains(err.Error(), "unknown incoming class")) {

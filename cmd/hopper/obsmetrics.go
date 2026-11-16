@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/atomdrift-project/hopper"
+	"github.com/atomdrift-project/hopper/store"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -616,67 +617,10 @@ func (wd *webDashboard) observe(ctx context.Context, observer metric.Observer, i
 		cctx, cancel := context.WithTimeout(ctx, metricsCollectTimeout)
 		defer cancel()
 
-		if n, err := db.PopularPackageCount(cctx); err == nil {
-			observer.ObserveInt64(in.popularPackages, int64(n))
-		}
-		observer.ObserveInt64(in.pending, wd.pendingCount(cctx))
-		observer.ObserveInt64(in.rescan, wd.rescanPending(cctx))
-
-		// Zero when the queue is empty, which is the healthy reading and the one
-		// an alert threshold treats correctly. Reporting nothing instead would
-		// leave the series stale at its last bad value after a drain.
-		//
-		// An error is logged rather than swallowed. This is the series behind the
-		// post-mortem's own alert, and the condition most likely to break it --
-		// a publisher too loaded to answer within metricsCollectTimeout -- is
-		// exactly when it needs to fire. A silently absent series reads as
-		// "nothing to report" on every dashboard it appears on.
-		if age, ok, err := db.OldestUnattemptedSighting(cctx); err != nil {
-			slog.Warn("unattempted-sighting age unavailable; the acquisition alert has no data this scrape", "error", err)
+		if api != nil && api.results != nil {
+			wd.observeStore(cctx, observer, in, api.results, now)
 		} else {
-			if !ok {
-				age = 0
-			}
-			observer.ObserveInt64(in.unattemptedAge, int64(age.Seconds()))
-		}
-
-		if lag, err := db.SightedInvestigationLag(cctx); err != nil {
-			slog.Warn("sighted investigation wait unavailable this scrape", "error", err)
-		} else {
-			observer.ObserveInt64(in.sightedInvestigationLag, int64(lag.Seconds()))
-		}
-
-		if lag, err := db.SightedPickupLag(cctx); err != nil {
-			slog.Warn("sighted pickup lag unavailable this scrape", "error", err)
-		} else {
-			observer.ObserveInt64(in.sightedPickupLag, int64(lag.Seconds()))
-		}
-
-		// Same treatment as unattempted_age: log rather than swallow, because a
-		// silently absent series reads as "nothing abandoned" on every
-		// dashboard it appears on. The grace is well past the slowest recovery
-		// chain (mirrors, Wayback, jsDelivr, unpkg, Software Heritage,
-		// socket.dev), so an in-flight attempt is never counted.
-		if n, _, err := db.AcquisitionsRetiredWithoutOutcome(cctx, retiredOutcomeGrace); err != nil {
-			slog.Warn("retired-without-outcome count unavailable; the abandonment alert has no data this scrape", "error", err)
-		} else {
-			observer.ObserveInt64(in.retiredNoOutcome, n)
-		}
-
-		rates := wd.analysisRates(cctx)
-		observer.ObserveFloat64(in.analysisRate, float64(rates.TopLevel)/analysisRateWindow.Seconds(),
-			metric.WithAttributes(attribute.String("tier", "toplevel")))
-		observer.ObserveFloat64(in.analysisRate, float64(rates.Rescans)/analysisRateWindow.Seconds(),
-			metric.WithAttributes(attribute.String("tier", "rescan")))
-
-		if h, ok := wd.workflowHealth(cctx); ok {
-			observer.ObserveInt64(in.cleavePending, h.PendingCleave)
-			observer.ObserveInt64(in.litmusPending, h.PendingLitmus)
-			observeAge(observer, in.addedAge, now, h.LatestAdded)
-			observeAge(observer, in.analyzedAge, now, h.LatestAnalyzed)
-			if !h.LatestAdded.IsZero() && !h.LatestReady.IsZero() {
-				observer.ObserveFloat64(in.readyLag, max(h.LatestAdded.Sub(h.LatestReady).Seconds(), 0))
-			}
+			wd.observeLegacy(cctx, observer, in, db, now)
 		}
 	}
 
@@ -818,6 +762,113 @@ func observeLookupCaches(o metric.Observer, in *instruments, caches []hopper.Cac
 		if !c.MemorySampledAt.IsZero() {
 			o.ObserveInt64(in.lookupCacheMemory, clampCount(c.MemoryBytes), attrs)
 			o.ObserveInt64(in.lookupCacheMemoryAt, c.MemorySampledAt.Unix(), attrs)
+		}
+	}
+}
+
+// observeStore records the corpus gauges from the verdict store, in place of
+// the legacy tables' (which stop moving once the store holds the corpus). One
+// read serves them all, cached for dashCacheTTL: the ledger's unacquired age
+// reads the whole ledger, a few seconds a scrape could not afford.
+func (wd *webDashboard) observeStore(ctx context.Context, observer metric.Observer, in *instruments, st *store.Store, now time.Time) {
+	h, err := wd.storeHealth(ctx, st)
+	if err != nil {
+		slog.Warn("store health unavailable; the corpus gauges have no data this scrape", "error", err)
+		return
+	}
+	var pending, rescan int64
+	for p, n := range h.Depths {
+		switch p {
+		case store.QueueRequested, store.QueueRepair, store.QueueStale:
+			rescan += n
+		default:
+			pending += n
+		}
+	}
+	observer.ObserveInt64(in.popularPackages, h.Popular)
+	observer.ObserveInt64(in.pending, pending)
+	observer.ObserveInt64(in.rescan, rescan)
+	observer.ObserveInt64(in.cleavePending, pending)
+	var unacquired time.Duration
+	if !h.OldestUnacquired.IsZero() {
+		unacquired = now.Sub(h.OldestUnacquired)
+	}
+	observer.ObserveInt64(in.unattemptedAge, int64(unacquired.Seconds()))
+	observer.ObserveInt64(in.sightedInvestigationLag, int64(h.SightedWait.Seconds()))
+	observer.ObserveInt64(in.retiredNoOutcome, h.Unfinished)
+	observer.ObserveFloat64(in.analysisRate, float64(h.Scanned-h.Rescanned)/analysisRateWindow.Seconds(),
+		metric.WithAttributes(attribute.String("tier", "toplevel")))
+	observer.ObserveFloat64(in.analysisRate, float64(h.Rescanned)/analysisRateWindow.Seconds(),
+		metric.WithAttributes(attribute.String("tier", "rescan")))
+	observeAge(observer, in.addedAge, now, h.LatestArrived)
+	observeAge(observer, in.analyzedAge, now, h.LatestScanned)
+	if !h.LatestArrived.IsZero() && !h.LatestScanned.IsZero() {
+		observer.ObserveFloat64(in.readyLag, max(h.LatestArrived.Sub(h.LatestScanned).Seconds(), 0))
+	}
+}
+
+// observeLegacy records the corpus gauges from the legacy tables.
+func (wd *webDashboard) observeLegacy(cctx context.Context, observer metric.Observer, in *instruments, db *hopper.DB, now time.Time) {
+	if n, err := db.PopularPackageCount(cctx); err == nil {
+		observer.ObserveInt64(in.popularPackages, int64(n))
+	}
+	observer.ObserveInt64(in.pending, wd.pendingCount(cctx))
+	observer.ObserveInt64(in.rescan, wd.rescanPending(cctx))
+
+	// Zero when the queue is empty, which is the healthy reading and the one
+	// an alert threshold treats correctly. Reporting nothing instead would
+	// leave the series stale at its last bad value after a drain.
+	//
+	// An error is logged rather than swallowed. This is the series behind the
+	// post-mortem's own alert, and the condition most likely to break it --
+	// a publisher too loaded to answer within metricsCollectTimeout -- is
+	// exactly when it needs to fire. A silently absent series reads as
+	// "nothing to report" on every dashboard it appears on.
+	if age, ok, err := db.OldestUnattemptedSighting(cctx); err != nil {
+		slog.Warn("unattempted-sighting age unavailable; the acquisition alert has no data this scrape", "error", err)
+	} else {
+		if !ok {
+			age = 0
+		}
+		observer.ObserveInt64(in.unattemptedAge, int64(age.Seconds()))
+	}
+
+	if lag, err := db.SightedInvestigationLag(cctx); err != nil {
+		slog.Warn("sighted investigation wait unavailable this scrape", "error", err)
+	} else {
+		observer.ObserveInt64(in.sightedInvestigationLag, int64(lag.Seconds()))
+	}
+
+	if lag, err := db.SightedPickupLag(cctx); err != nil {
+		slog.Warn("sighted pickup lag unavailable this scrape", "error", err)
+	} else {
+		observer.ObserveInt64(in.sightedPickupLag, int64(lag.Seconds()))
+	}
+
+	// Same treatment as unattempted_age: log rather than swallow, because a
+	// silently absent series reads as "nothing abandoned" on every
+	// dashboard it appears on. The grace is well past the slowest recovery
+	// chain (mirrors, Wayback, jsDelivr, unpkg, Software Heritage,
+	// socket.dev), so an in-flight attempt is never counted.
+	if n, _, err := db.AcquisitionsRetiredWithoutOutcome(cctx, retiredOutcomeGrace); err != nil {
+		slog.Warn("retired-without-outcome count unavailable; the abandonment alert has no data this scrape", "error", err)
+	} else {
+		observer.ObserveInt64(in.retiredNoOutcome, n)
+	}
+
+	rates := wd.analysisRates(cctx)
+	observer.ObserveFloat64(in.analysisRate, float64(rates.TopLevel)/analysisRateWindow.Seconds(),
+		metric.WithAttributes(attribute.String("tier", "toplevel")))
+	observer.ObserveFloat64(in.analysisRate, float64(rates.Rescans)/analysisRateWindow.Seconds(),
+		metric.WithAttributes(attribute.String("tier", "rescan")))
+
+	if h, ok := wd.workflowHealth(cctx); ok {
+		observer.ObserveInt64(in.cleavePending, h.PendingCleave)
+		observer.ObserveInt64(in.litmusPending, h.PendingLitmus)
+		observeAge(observer, in.addedAge, now, h.LatestAdded)
+		observeAge(observer, in.analyzedAge, now, h.LatestAnalyzed)
+		if !h.LatestAdded.IsZero() && !h.LatestReady.IsZero() {
+			observer.ObserveFloat64(in.readyLag, max(h.LatestAdded.Sub(h.LatestReady).Seconds(), 0))
 		}
 	}
 }

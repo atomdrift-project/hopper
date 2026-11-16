@@ -773,8 +773,8 @@ type DB struct {
 	corroborationCounts   corroborationCounters
 	cacheMemoryAttempt    atomic.Int64
 	cacheMemoryRefreshing atomic.Bool
-	// replicaIndexPolicy makes migrations decline secondary indexes a logical
-	// replica does not need. See SetReplicaIndexPolicy.
+	// replicaIndexPolicy makes migrations build a logical replica's legacy
+	// index set. See SetReplicaIndexPolicy.
 	replicaIndexPolicy bool
 }
 

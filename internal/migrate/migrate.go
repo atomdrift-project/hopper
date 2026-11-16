@@ -112,6 +112,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opt Options) (*Report, error) 
 		{m.carried, "carried"},
 		{m.post, "post"},
 		{m.reports, "reports"},
+		{m.owner, "owner"},
 	} {
 		done, err := m.kv(ctx, "migrate:"+s.name)
 		if err != nil {
@@ -1033,4 +1034,41 @@ func (m *migration) reportRange(ctx context.Context, lo, hi int64) error {
 	}
 	m.count(&m.report.Filled, n)
 	return nil
+}
+
+// owner gives the new schema, and every table, type and function in it, to
+// the role that owns the legacy tables: hopper's services connect as that
+// role, and read and write the new tables as they did the old. A migration
+// run as another role (postgres, say) would otherwise leave them unable to
+// see the schema at all. A table's indexes and sequences go with it.
+func (m *migration) owner(ctx context.Context) error {
+	_, err := m.pool.Exec(ctx, `DO $$
+		DECLARE
+			owner text := (SELECT c.relowner::regrole::text FROM pg_class c
+				WHERE c.oid = to_regclass(`+quoteLiteral(m.from+".samples")+`));
+			r record;
+		BEGIN
+			IF owner IS NULL OR owner = current_user THEN
+				RETURN;
+			END IF;
+			EXECUTE format('ALTER SCHEMA %I OWNER TO %s', current_schema(), owner);
+			FOR r IN SELECT c.oid::regclass AS name FROM pg_class c
+				WHERE c.relnamespace = current_schema()::regnamespace AND c.relkind IN ('r', 'p') LOOP
+				EXECUTE format('ALTER TABLE %s OWNER TO %s', r.name, owner);
+			END LOOP;
+			FOR r IN SELECT t.oid::regtype AS name FROM pg_type t
+				WHERE t.typnamespace = current_schema()::regnamespace AND t.typtype = 'e' LOOP
+				EXECUTE format('ALTER TYPE %s OWNER TO %s', r.name, owner);
+			END LOOP;
+			FOR r IN SELECT p.oid::regprocedure AS name FROM pg_proc p
+				WHERE p.pronamespace = current_schema()::regnamespace LOOP
+				EXECUTE format('ALTER FUNCTION %s OWNER TO %s', r.name, owner);
+			END LOOP;
+		END $$`)
+	return err
+}
+
+// quoteLiteral quotes s as an SQL string literal.
+func quoteLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }

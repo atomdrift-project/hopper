@@ -721,6 +721,7 @@ func cmdServeReplica(ctx context.Context) error {
 		"primary hopper base URL (e.g. http://hopper-api:8081); when set, client-facing mutations are "+
 			"proxied there verbatim instead of answering 403, and lookups honor ?fresh=1 — see relay.go. "+
 			"Worker routes are never relayed.")
+	storeSchema := f.String("store", "verdict", "schema holding the verdict tables; empty answers from the legacy tables")
 	relayTokenFile := f.String("relay-token-file", "",
 		"file holding a bearer token for the primary; when set the relay replaces the inbound "+
 			"Authorization header with it (for deployments where replica and primary tokens differ). "+
@@ -767,6 +768,15 @@ func cmdServeReplica(ctx context.Context) error {
 		db:          db,
 		tracker:     newWorkerTracker(),
 		readOnly:    true,
+	}
+	if *storeSchema != "" && db.Pool() != nil {
+		st, pool, serr := openStore(ctx, roDSN, *storeSchema)
+		if serr != nil {
+			return fmt.Errorf("serve-replica: %w", serr)
+		}
+		defer pool.Close()
+		api.results = st
+		slog.Info("verdict store open", "schema", *storeSchema)
 	}
 	if *relayTo != "" {
 		relay, rerr := newWriteRelay(*relayTo, *relayTokenFile)
@@ -937,8 +947,8 @@ func cmdInit(ctx context.Context) error {
 	f := flag.NewFlagSet("init", flag.ExitOnError)
 	dsn := f.String("db", "", "database (postgres:// DSN or sqlite file path)")
 	replica := f.Bool("replica", false,
-		"target is a logical replica: skip secondary indexes it does not need "+
-			"(the allowlist in scripts/replica/slim-indexes.sh decides)")
+		"target is a legacy-table replica: build the training indexes rather than the primary-only ones "+
+			"(a verdict replica keeps every index store/schema.sql defines; see scripts/replica)")
 	parseFlags(f, os.Args[2:])
 
 	db, err := openDB(ctx, *dsn)
@@ -1150,8 +1160,9 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	localOnly := f.Bool("local", false, "listen only on loopback for dashboard and worker API")
 	maxFileMB := f.Int64("max-file-size", defaultMaxFileSize/(1024*1024), "skip files larger than this many MiB")
 	reportsDir := f.String("reports-dir", "", "cyclotron reports directory to ingest (<sha>.md, optional)")
-	storeSchema := f.String("store", "",
-		"schema holding the verdict tables (created when empty); when set, the walk, results, claims and triage use them")
+	storeSchema := f.String("store", "verdict",
+		"schema holding the verdict tables (created when empty); the walk, results, claims and triage use them. "+
+			"Empty, or a SQLite --db, uses the legacy tables instead")
 	var forceRescanDirs stringListFlag
 	f.Var(&forceRescanDirs, "force-rescan", "directory prefix to force re-analysis for; may be repeated or comma-separated")
 	// Maintenance lever, born 2026-08-21: the startup walk's staging upserts and
@@ -1636,7 +1647,9 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	}
 	// dataDir was already resolved (symlinks + absolute) at startup.
 	api.db = db
-	if *storeSchema != "" {
+	// The verdict tables are PostgreSQL's alone; a SQLite database (a
+	// development corpus, the tests) keeps the legacy tables.
+	if *storeSchema != "" && db.Pool() != nil {
 		st, pool, err := openStore(ctx, *dsn, *storeSchema)
 		if err != nil {
 			return err
@@ -2295,6 +2308,12 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 		wd.configure(&progress, litmus, tracker, api, db, start, maxAnalyzed, len(dirs), "", rescanAge, metrics)
 	}
 
+	// The verdict store, when the API holds one: the walk, the queue graphs
+	// and the progress baseline read it.
+	var results *store.Store
+	if api != nil {
+		results = api.results
+	}
 	// Seed the progress denominators carried over from prior runs off the
 	// startup critical path. CountAnalyzed/CountPending are full count(*) scans
 	// over the samples table whose supporting partial index
@@ -2304,25 +2323,21 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	// to the live view immediately and these baselines fill in once the counts
 	// return; until then the session delta is simply measured from zero.
 	dashWG.Go(func() {
-		seedProgressBaseline(backgroundCtx, db, &progress)
+		seedProgressBaseline(backgroundCtx, db, results, &progress)
 	})
 
 	// Queue maintenance: reap poison samples and (when the cache is open)
 	// sample queue depths for the graphs, on one ticker tied to ctx.
 	dashWG.Go(func() {
-		runQueueMaintenance(backgroundCtx, db, &progress, metrics, rescanAge)
+		runQueueMaintenance(backgroundCtx, db, results, &progress, metrics, rescanAge)
 	})
-	if api != nil && api.results != nil {
+	if results != nil {
 		dashWG.Go(func() {
-			sweepStale(backgroundCtx, api.results, rescanAge)
+			sweepStale(backgroundCtx, results, rescanAge)
 		})
 	}
 
 	// The walk records into the verdict schema when the API does.
-	var results *store.Store
-	if api != nil {
-		results = api.results
-	}
 	pass := &walkPass{
 		db: db, results: results, cache: cache, progress: &progress, dirs: dirs, source: source,
 		experimentTag: experimentTag, start: start, nworkers: nworkers, markMissing: markMissing,
@@ -2689,7 +2704,7 @@ func (p *walkPass) runDir(ctx context.Context, target struct{ dir, label string 
 // immediately so the graphs and reaper don't wait a full interval, then ticks
 // until ctx is cancelled.
 func runQueueMaintenance(
-	ctx context.Context, db *hopper.DB, progress *loadProgress,
+	ctx context.Context, db *hopper.DB, st *store.Store, progress *loadProgress,
 	metrics *metricsStore, rescanAge time.Duration,
 ) {
 	const interval = 5 * time.Minute
@@ -2698,18 +2713,23 @@ func runQueueMaintenance(
 	defer ticker.Stop()
 
 	for {
-		if n, err := db.ReapStuck(ctx); err != nil {
-			slog.Warn("reap stuck samples failed", "error", err)
-		} else if n > 0 {
-			slog.Info("reaped stuck samples", "count", n, "max_attempts", hopper.MaxClaimAttempts)
-		}
-		if n, err := db.ReapOversized(ctx); err != nil {
-			slog.Warn("reap oversized samples failed", "error", err)
-		} else if n > 0 {
-			slog.Info("reaped oversized samples", "count", n, "max_job_bytes", int64(hopper.MaxJobBytes))
+		// The verdict store's queue retires a file handed out too often by
+		// itself (queue_next leaves it out); the reapers are the legacy
+		// tables'.
+		if st == nil {
+			if n, err := db.ReapStuck(ctx); err != nil {
+				slog.Warn("reap stuck samples failed", "error", err)
+			} else if n > 0 {
+				slog.Info("reaped stuck samples", "count", n, "max_attempts", hopper.MaxClaimAttempts)
+			}
+			if n, err := db.ReapOversized(ctx); err != nil {
+				slog.Warn("reap oversized samples failed", "error", err)
+			} else if n > 0 {
+				slog.Info("reaped oversized samples", "count", n, "max_job_bytes", int64(hopper.MaxJobBytes))
+			}
 		}
 		if metrics != nil {
-			sampleQueueMetrics(ctx, db, progress, metrics, rescanAge, retention)
+			sampleQueueMetrics(ctx, db, st, progress, metrics, rescanAge, retention)
 		}
 
 		select {
@@ -2728,34 +2748,29 @@ func runQueueMaintenance(
 // minutes blew the query timeout and stopped every sample from being recorded.
 // Best-effort throughout — a slow count just skips one sample.
 func sampleQueueMetrics(
-	ctx context.Context, db *hopper.DB, progress *loadProgress, metrics *metricsStore,
+	ctx context.Context, db *hopper.DB, st *store.Store, progress *loadProgress, metrics *metricsStore,
 	rescanAge, retention time.Duration,
 ) {
 	qctx, cancel := context.WithTimeout(ctx, dashQueryTimeout)
 	defer cancel()
 
-	pending, err := db.CountPending(qctx)
+	pending, d, err := queueDepths(qctx, db, st, rescanAge)
 	if err != nil {
-		slog.Warn("queue metrics: count pending failed", "error", err)
+		slog.Warn("queue metrics: queue depths failed", "error", err)
 		return
 	}
 	// Every rescan tier. This used to be gated on traitsVersion, which recorded
 	// a flat zero for the whole series whenever the stale-traits tier was off --
 	// which was always -- making the rescan-depth graph agree with the (equally
 	// wrong) card instead of contradicting it. The age tier has no off state.
-	var rescan, forced, repair, ageTier, missingLLM int64
-	if d, err := db.RescanDepths(qctx, rescanAge); err == nil {
-		rescan = d.Total()
-		forced, repair, ageTier, missingLLM = d.Forced, d.Repair, d.Age, d.MissingLLM
-	} else {
-		slog.Debug("queue metrics: rescan depths failed", "error", err)
-	}
+	rescan := d.Total()
+	forced, repair, ageTier, missingLLM := d.Forced, d.Repair, d.Age, d.MissingLLM
 	completed := progress.analyzed.Load()
 	// Arrivals. Best-effort like the rescan depths above: a missing watermark
 	// costs the flow graph one point, and dropping the whole snapshot for it
 	// would cost the queue-depth graphs a point too.
 	var added int64
-	if n, err := db.ArrivalWatermark(qctx); err == nil {
+	if n, err := arrivalWatermark(qctx, db, st); err == nil {
 		added = n
 	} else {
 		slog.Debug("queue metrics: arrival watermark failed", "error", err)
@@ -2786,8 +2801,8 @@ func sampleQueueMetrics(
 // before this returns aren't clobbered: the session delta stays correct
 // throughout — measured from zero until the baseline lands, then from it.
 // Best-effort: a failed count leaves the baseline at its zero value.
-func seedProgressBaseline(ctx context.Context, db *hopper.DB, progress *loadProgress) {
-	n, err := db.CountAnalyzed(ctx)
+func seedProgressBaseline(ctx context.Context, db *hopper.DB, st *store.Store, progress *loadProgress) {
+	n, err := countAnalyzed(ctx, db, st)
 	if err != nil {
 		slog.Debug("seed baseline: count analyzed failed", "error", err)
 		return
@@ -2797,7 +2812,14 @@ func seedProgressBaseline(ctx context.Context, db *hopper.DB, progress *loadProg
 
 	// Without the pending count the denominator reflects all prior work, so
 	// pre-existing unanalyzed samples can't push analyzed past queued (>100%).
-	pending, err := db.CountPending(ctx)
+	var pending int64
+	if st == nil {
+		pending, err = db.CountPending(ctx)
+	} else {
+		var depths map[store.Priority]int64
+		depths, _, err = st.Depths(ctx)
+		pending = firstScansOf(depths)
+	}
 	if err != nil {
 		slog.Debug("seed baseline: count pending failed", "error", err)
 		progress.queued.Add(n)

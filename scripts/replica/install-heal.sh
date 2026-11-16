@@ -29,7 +29,6 @@ HEAL="$SCRIPT_DIR/replica-heal.sh"
 chmod +x "$HEAL" 2>/dev/null || true
 
 TEXTFILE_SRC="$SCRIPT_DIR/replica-textfile.sh"
-SLIM_SRC="$SCRIPT_DIR/slim-indexes.sh"
 TEXTFILE_DIR="${HOST_MON_TEXTFILE_DIR:-/var/lib/host-mon/textfile}"
 TEXTFILE_INTERVAL_MIN="${TEXTFILE_INTERVAL_MIN:-1}"
 case "$TEXTFILE_INTERVAL_MIN" in *[!0-9]*|'') echo "install-heal: TEXTFILE_INTERVAL_MIN must be an integer" >&2; exit 1 ;; esac
@@ -55,11 +54,10 @@ heal_env() {
     done
 }
 
-# The emitter needs the publisher coordinates (for lag) and the textfile dir.
-# It reads the keep list from slim-indexes.sh next to itself, so both are
-# installed to the same directory below.
+# The emitter needs the publisher coordinates and publication (for lag and
+# index parity) and the textfile dir.
 textfile_env() {
-    for v in REMOTE_HOST REMOTE_USER REMOTE_DB LOCAL_DB SUBSCRIPTION PGPASSFILE; do
+    for v in REMOTE_HOST REMOTE_USER REMOTE_DB LOCAL_DB PUBLICATION SUBSCRIPTION PGPASSFILE; do
         eval "val=\${$v:-}"
         [ -n "${val:-}" ] && printf '%s=%s\n' "$v" "$val"
     done
@@ -288,18 +286,11 @@ if [ "$HEAL" != "$INSTALL_PATH" ]; then
     fi
 fi
 
-# The emitter and the slim-indexes policy travel with the healer: the emitter
-# reads REPLICA_KEEP_INDEXES from slim-indexes.sh sitting next to it, so both
-# must land in the same postgres-readable directory.
+# The emitter travels with the healer, to the same postgres-readable place.
 TEXTFILE_EXEC="${REPLICA_TEXTFILE_INSTALL_PATH:-/usr/local/bin/hopper-replica-textfile.sh}"
 if [ -f "$TEXTFILE_SRC" ]; then
     if as_root install -D -m 0755 "$TEXTFILE_SRC" "$TEXTFILE_EXEC" 2>/dev/null; then
         log "installed metrics emitter -> $TEXTFILE_EXEC"
-        if [ -f "$SLIM_SRC" ]; then
-            slim_dst="$(dirname "$TEXTFILE_EXEC")/slim-indexes.sh"
-            as_root install -D -m 0755 "$SLIM_SRC" "$slim_dst" 2>/dev/null \
-                || warn "could not copy slim-indexes.sh to $slim_dst — index-policy metrics will be absent"
-        fi
     else
         warn "could not copy replica-textfile.sh to $TEXTFILE_EXEC — metrics will not be scheduled"
         TEXTFILE_EXEC=""

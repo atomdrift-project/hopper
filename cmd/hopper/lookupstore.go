@@ -17,7 +17,11 @@ func (s *apiServer) lookup(ctx context.Context, sha, base, version string) (*hop
 }
 
 // addSightingsToStore records sightings in the verdict store's ledger, by
-// the same rules the legacy ledger applies (hopper.AddSightingsToStore).
-func (s *apiServer) addSightingsToStore(ctx context.Context, sightings []hopper.Sighting) (int, error) {
+// the same rules the legacy ledger applies (hopper.AddSightingsToStore), or
+// as a source's history (hopper.BackfillSightingsToStore).
+func (s *apiServer) addSightingsToStore(ctx context.Context, sightings []hopper.Sighting, backfill bool) (int, error) {
+	if backfill {
+		return hopper.BackfillSightingsToStore(ctx, s.results, sightings, string(cliAppName()))
+	}
 	return hopper.AddSightingsToStore(ctx, s.results, sightings, string(cliAppName()))
 }

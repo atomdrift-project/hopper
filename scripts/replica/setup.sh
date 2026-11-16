@@ -1,10 +1,17 @@
 #!/bin/sh
 # setup-replica.sh — configure local PostgreSQL as a logical replica of a
-# remote hopper instance. Idempotent and resumable: re-running reconciles
-# schema/publication state, resumes after disable_on_error (init + ENABLE),
+# remote hopper instance's verdict tables. Idempotent and resumable: re-running
+# reconciles schema/publication state, resumes after disable_on_error (ENABLE),
 # resumes post-COPY catch-up (srsubstate f/s), and safely retries an
 # interrupted mid-COPY (truncate those tables, then tablesync again).
 # Lost replication slots still need rebuild-replica.
+#
+# The replicated set is REPLICATED_TABLES in schema REPLICA_SCHEMA
+# (replicated-tables.sh). A replica without that schema gets it from
+# store/schema.sql, the same DDL hopper runs on an empty database, owned by
+# LOCAL_USER; its secondary indexes are dropped for the initial copy and rebuilt
+# after it (bulkload.sh), so the replica ends with every index schema.sql
+# defines.
 #
 # Assumes:
 #   * Local postgres is running (pg_isready ok) but otherwise unconfigured.
@@ -12,12 +19,11 @@
 #         hopper:*:hopper:hopper:<password>
 #   * Admin access to the local cluster is reachable via either
 #     `psql -U postgres` or `sudo -u postgres psql` (the script probes both).
-#   * The hopper binary is built (./hopper) or installed on $PATH.
+#   * store/schema.sql is the publisher's: the same checkout its hopper runs.
 #
 # Overridable via env: REMOTE_HOST, REMOTE_USER, REMOTE_DB, LOCAL_DB,
-# LOCAL_USER, PUBLICATION, SUBSCRIPTION, COPY_DATA, PGPASSFILE,
-# ZFS_TUNE, REPLICA_TUNE, REPLICA_MAX_PARALLEL_PER_GATHER,
-# REPLICA_SLIM_INDEXES.
+# LOCAL_USER, PUBLICATION, SUBSCRIPTION, COPY_DATA, PGPASSFILE, SCHEMA_SQL,
+# REPLICA_SCHEMA, ZFS_TUNE, REPLICA_TUNE, REPLICA_MAX_PARALLEL_PER_GATHER.
 
 set -eu
 
@@ -37,8 +43,11 @@ default_sub_suffix=$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -
 SUBSCRIPTION="${SUBSCRIPTION:-hopper_replica_${default_sub_suffix}}"
 COPY_DATA="${COPY_DATA:-true}"
 SETUP_EXACT_COUNTS="${SETUP_EXACT_COUNTS:-false}"
-LEGACY_PUBLICATION="${LEGACY_PUBLICATION:-hopper_training}"
 PGPASS="${PGPASSFILE:-$HOME/.pgpass}"
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+SCHEMA_SQL="${SCHEMA_SQL:-$SCRIPT_DIR/../../store/schema.sql}"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/replicated-tables.sh"
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
@@ -52,7 +61,7 @@ validate_ident() {
 
 validate_ident PUBLICATION "$PUBLICATION"
 validate_ident SUBSCRIPTION "$SUBSCRIPTION"
-validate_ident LEGACY_PUBLICATION "$LEGACY_PUBLICATION"
+validate_ident LOCAL_USER "$LOCAL_USER"
 case "$COPY_DATA" in
     true|false) ;;
     *) die "COPY_DATA must be true or false, got '$COPY_DATA'" ;;
@@ -62,6 +71,7 @@ esac
 command -v pg_isready >/dev/null 2>&1 || die "pg_isready not found; install postgres client tools"
 pg_isready -q || die "local postgres is not reachable — start it first"
 [ -f "$PGPASS" ] || die "$PGPASS not found; add the upstream entry first"
+[ -r "$SCHEMA_SQL" ] || die "$SCHEMA_SQL not found; run from a hopper checkout or set SCHEMA_SQL"
 # libpq ignores .pgpass unless perms are 0600.
 chmod 600 "$PGPASS"
 
@@ -102,7 +112,7 @@ REMOTE_PW=$(awk -F: -v h="$REMOTE_HOST" -v u="$REMOTE_USER" -v d="$REMOTE_DB" '
 
 # --- Publisher reachability preflight --------------------------------------
 # Fail fast if the publisher is unreachable, instead of doing all the local
-# schema work (role/db/hopper init) and only discovering the dead upstream at
+# schema work (role/db/schema) and only discovering the dead upstream at
 # the publication step. DNS misses are common in fresh jails: a jail's
 # /etc/hosts does not inherit the host's 'hopper-db' entry.
 log "Checking publisher $REMOTE_HOST is reachable"
@@ -129,15 +139,15 @@ fi
 # --- Guard: never run replica setup against the primary --------------------
 # A replica is a SUBSCRIBER; the publisher (primary) is the only cluster that
 # hosts the publication. If this local cluster already has it, we are ON the
-# primary — and proceeding would run 'hopper init' (schema migrations) against
-# the live database every replica streams from. Refuse before any change. A
+# primary — and proceeding would run DDL (truncates, index drops) against the
+# live database every replica streams from. Refuse before any change. A
 # fresh replica has no such database/publication yet, so this is a no-op there.
 guard_db=$(admin -tAc "SELECT 1 FROM pg_database WHERE datname = '$LOCAL_DB'" | tr -d '[:space:]')
 if [ "$guard_db" = "1" ]; then
     guard_pub=$(admin -d "$LOCAL_DB" -tAc \
         "SELECT 1 FROM pg_publication WHERE pubname = '$PUBLICATION'" | tr -d '[:space:]')
     [ "$guard_pub" = "1" ] && die "local database '$LOCAL_DB' hosts publication '$PUBLICATION' — this cluster is the PRIMARY/publisher, not a replica.
-       Refusing replica setup against the primary (it would migrate the live publisher's schema).
+       Refusing replica setup against the primary (it would run replica DDL on the live publisher).
        Run this on an actual replica, or correct REMOTE_HOST/LOCAL_DB."
 fi
 
@@ -198,35 +208,12 @@ CREATE DATABASE :"db" OWNER :"owner";
 SQL
 fi
 
-# --- Schema via hopper init (idempotent; uses migration tracking) ---------
-# init applies the schema migrations the subscriber needs to match the
-# publisher (the schema-parity gate below depends on this being current). A
-# STALE binary silently skips migrations added after it was built, leaving the
-# replica missing columns the publisher sends — the exact failure that wedges
-# the subscription. The Makefile passes HOPPER as the just-built binary so
-# `make replica` always inits with current migrations; honor it first, and
-# warn loudly if we fall back to a possibly-stale `hopper` on PATH.
-if [ -n "${HOPPER:-}" ]; then
-    [ -x "$HOPPER" ] || die "HOPPER='$HOPPER' is not an executable — run 'make build'"
-elif [ -x ./hopper ]; then
-    HOPPER=./hopper
-elif command -v hopper >/dev/null 2>&1; then
-    HOPPER=hopper
-    log "warning: using 'hopper' from PATH ($(command -v hopper)) — if it predates a schema migration, init will silently skip it. Prefer 'make replica' (rebuilds first)."
-else
-    die "hopper binary not found — run 'make build' first"
-fi
-
 # --- Self-heal coordination ------------------------------------------------
 # install-heal.sh (called at the end) schedules replica-heal.sh to run as
 # postgres and auto-fix additive schema drift. While THIS script disables the
 # subscription to run DDL, raise a maintenance flag the healer honors so they
 # don't race. pg_sh runs a command as the postgres OS user (same escalation as
 # admin()) so files land where the healer — also postgres — reads them.
-SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-# shellcheck disable=SC1091
-. "$SCRIPT_DIR/replicated-tables.sh"
-REPLICATED_TABLES_SQL=$(printf "'%s'," "$REPLICATED_TABLES" | sed 's/,$//')
 if [ -z "$ESCALATE" ]; then
     pg_sh() { sh -c "$1"; }
 else
@@ -235,10 +222,10 @@ else
 fi
 
 # A disabled subscription is a resume case, not a hard fail: disable_on_error
-# often means schema drift that hopper init below will fix, or a mid-COPY
+# often means a primary-key drift that the reconcile below fixes, or a mid-COPY
 # conflict that the truncate+tablesync path retries. The subscription block
-# re-ENABLEs after migration; if apply fails again the final health check
-# exits nonzero. Lost slots still die later with a rebuild-replica pointer.
+# re-ENABLEs after the DDL; if apply fails again the final health check exits
+# nonzero. Lost slots still die later with a rebuild-replica pointer.
 existing_sub_enabled=$(admin -d "$LOCAL_DB" -tAc \
     "SELECT subenabled FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" \
     | tr -d '[:space:]')
@@ -260,9 +247,9 @@ trap 'bulkload_cleanup; maint_off' EXIT
 
 # Readers may remain connected while setup reconciles the replica. Most runs
 # have no schema work to do, and rejecting every active query made an
-# idempotent repair unnecessarily disruptive. If DDL really conflicts with a
-# reader, hopper init's bounded lock_timeout below reports that specific
-# conflict instead of this script refusing all client activity up front.
+# idempotent repair unnecessarily disruptive. DDL that really conflicts with a
+# reader waits for it (the primary-key reconcile gives up after 30s and says
+# which table) instead of this script refusing all client activity up front.
 
 # Classify per-table tablesync state so re-running make replica is safe:
 #
@@ -277,27 +264,27 @@ trap 'bulkload_cleanup; maint_off' EXIT
 RETRY_TRUNCATE=''
 catching_up=''
 partial_tables=$(admin -d "$LOCAL_DB" -tA -F '|' -c \
-    "SELECT c.relname, r.srsubstate
+    "SELECT n.nspname, c.relname, r.srsubstate
        FROM pg_subscription_rel r
        JOIN pg_subscription s ON s.oid = r.srsubid
        JOIN pg_class c ON c.oid = r.srrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE s.subname = '$SUBSCRIPTION'
-      ORDER BY c.relname")
-while IFS='|' read -r table state; do
+      ORDER BY n.nspname, c.relname")
+while IFS='|' read -r schema table state; do
     [ -n "$table" ] || continue
-    case "$table" in
-        *[!A-Za-z0-9_]*) die "unexpected table name from pg_subscription_rel: '$table'" ;;
-    esac
+    validate_ident "subscribed schema" "$schema"
+    validate_ident "subscribed table" "$table"
     case "$state" in
         r) continue ;;
         f|s)
-            catching_up="$catching_up $table(state=$state)"
+            catching_up="$catching_up $schema.$table(state=$state)"
             ;;
         i|d)
             has_rows=$(admin -d "$LOCAL_DB" -tAc \
-                "SELECT EXISTS (SELECT 1 FROM public.$table LIMIT 1)" | tr -d '[:space:]')
+                "SELECT EXISTS (SELECT 1 FROM $schema.$table LIMIT 1)" | tr -d '[:space:]')
             if [ "$has_rows" = 't' ]; then
-                RETRY_TRUNCATE="$RETRY_TRUNCATE $table"
+                RETRY_TRUNCATE="$RETRY_TRUNCATE $schema.$table"
             fi
             ;;
         *)
@@ -355,7 +342,7 @@ if [ "${REPLICA_TUNE:-true}" = "true" ]; then
     # apply worker doing 8 KB random reads. Capping it at 0 makes a heavy
     # report slower and leaves apply able to make progress; that is the right
     # trade on a box whose reason to exist is being current. Set on the role
-    # rather than the cluster so maintenance (hopper init's index builds, which
+    # rather than the cluster so maintenance (bulkload.sh's index builds, which
     # read max_parallel_maintenance_workers instead) is untouched, and so the
     # value applies to prism/beamline/cyclotron connections at login.
     case "${REPLICA_MAX_PARALLEL_PER_GATHER:=0}" in
@@ -481,23 +468,17 @@ SELECT pg_reload_conf();
 SQL
 fi
 
-# Refuse to stack on top of a hung hopper init — each new run would just
-# queue behind the first one's lock waits and make things worse.
-if command -v pgrep >/dev/null 2>&1 && pgrep -f 'hopper init' >/dev/null 2>&1; then
-    die "another 'hopper init' is already running (pid $(pgrep -f 'hopper init' | tr '\n' ' ')) — kill it first: pkill -9 -f 'hopper init'"
-fi
-
 # If a subscription exists, its apply + tablesync workers hold locks on the
-# replicated tables. hopper init's DDL (CREATE INDEX, ALTER TABLE, etc.)
-# would block on those locks. Disable the subscription and forcibly
-# terminate every logical-replication worker before running DDL. Check by
-# existence, not subenabled — a wedged worker from a prior run can outlive
-# a DISABLE and still be holding locks even though the sub reads disabled.
-# The subscription block below re-ENABLEs it after the migration finishes.
+# replicated tables. The DDL below (TRUNCATE, primary-key reconcile, the
+# fast-sync index drops) would block on those locks. Disable the subscription
+# and forcibly terminate every logical-replication worker before running DDL.
+# Check by existence, not subenabled — a wedged worker from a prior run can
+# outlive a DISABLE and still be holding locks even though the sub reads
+# disabled. The subscription block below re-ENABLEs it after the DDL.
 if admin -d "$LOCAL_DB" -tAc \
         "SELECT 1 FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" \
         | grep -q 1; then
-    log "Stopping replica subscription during schema migration"
+    log "Stopping replica subscription during schema reconcile"
     admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -v sub="$SUBSCRIPTION" <<'SQL'
 ALTER SUBSCRIPTION :"sub" DISABLE;
 SQL
@@ -525,11 +506,7 @@ fi
 # table hits duplicate keys. Avoid CASCADE so a ready sibling table is not
 # wiped via FK; if truncate fails, fall back to rebuild-replica.
 if [ -n "${RETRY_TRUNCATE:-}" ]; then
-    trunc_list=''
-    for t in $RETRY_TRUNCATE; do
-        trunc_list="$trunc_list public.$t,"
-    done
-    trunc_list=${trunc_list%,}
+    trunc_list=$(printf '%s' "$RETRY_TRUNCATE" | sed 's/ /, /g')
     log "Truncating interrupted mid-COPY tables: $trunc_list"
     if ! admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -c \
             "TRUNCATE $trunc_list RESTART IDENTITY;"; then
@@ -537,96 +514,81 @@ if [ -n "${RETRY_TRUNCATE:-}" ]; then
     fi
 fi
 
-# Set lock_timeout via DSN (pgx honors query-string GUCs reliably); keeps
-# hopper init from hanging forever if something else holds a table lock.
-# -replica makes init consult the same REPLICA_KEEP_INDEXES allowlist that
-# slim-indexes.sh applies below, so the master-only indexes are never built here
-# in the first place. Without it init builds the full canonical set and
-# slim-indexes.sh drops it moments later — a round trip that is not free on a
-# multi-hundred-GB sample_locations, and that on 2026-08-21 consumed the last
-# of the replica's disk and broke apply with ENOSPC.
+# --- Replica schema --------------------------------------------------------
+# The verdict schema has no migrations: store/schema.sql is the whole of it,
+# and hopper's openStore runs it once on a database without it. Do the same
+# here, owned by LOCAL_USER like the publisher's, and checked by the samples
+# table as openStore checks. One transaction, so an interrupted create leaves
+# nothing behind for the check to mistake for a schema. Fed on stdin because
+# the escalated psql may not be able to read the operator's checkout. psql
+# rather than a hopper subcommand: no command creates the schema without also
+# starting a server, and this keeps the replica free of a hopper build.
 #
-# Probed rather than passed blindly: an older hopper on PATH would exit(2) on
-# the unknown flag, and retrying on failure would be indistinguishable from a
-# genuine init error.
-if "$HOPPER" init -h 2>&1 | grep -q -- '-replica'; then
-    REPLICA_INIT_FLAG=-replica
+# A schema that exists is never altered here: a column the publisher gained
+# since is added by replica-heal.sh, and the parity gate below refuses to
+# subscribe while one is missing.
+schema_ready=$(admin -d "$LOCAL_DB" -tAc \
+    "SELECT to_regclass('$REPLICA_SCHEMA.samples') IS NOT NULL" | tr -d '[:space:]')
+if [ "$schema_ready" = "t" ]; then
+    log "Schema '$REPLICA_SCHEMA' already exists — leaving its DDL alone"
 else
-    REPLICA_INIT_FLAG=
-    log "warning: $HOPPER predates 'init -replica' — the replica will bulk-build indexes slim-indexes.sh then drops; rebuild with 'make replica'"
+    log "Creating schema '$REPLICA_SCHEMA' owned by '$LOCAL_USER' from $SCHEMA_SQL"
+    {
+        printf 'BEGIN;\n'
+        printf 'CREATE SCHEMA IF NOT EXISTS %s AUTHORIZATION "%s";\n' "$REPLICA_SCHEMA" "$LOCAL_USER"
+        printf 'SET LOCAL ROLE "%s";\n' "$LOCAL_USER"
+        printf 'SET LOCAL search_path = %s;\n' "$REPLICA_SCHEMA"
+        cat "$SCHEMA_SQL"
+        printf '\nCOMMIT;\n'
+    } | admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -q >/dev/null \
+        || die "could not create schema '$REPLICA_SCHEMA' from $SCHEMA_SQL"
 fi
-
-log "Running '$HOPPER init${REPLICA_INIT_FLAG:+ $REPLICA_INIT_FLAG}' to ensure schema (lock_timeout=30s)"
-# shellcheck disable=SC2086 # REPLICA_INIT_FLAG is a single literal flag or empty
-"$HOPPER" init $REPLICA_INIT_FLAG -db "postgres://$LOCAL_USER@localhost/$LOCAL_DB?sslmode=disable&lock_timeout=30s"
-
-# Drop the master-only worker-queue/ingest indexes a read replica never scans.
-# With 'init -replica' above this is now a no-op on a fresh replica (they were
-# never built); it remains the backstop that reconciles a replica created before
-# that flag existed, or one whose policy changed since. REPLICA_SLIM_INDEXES=false
-# opts out; promote.sh restores them if this replica is ever promoted to primary.
-log "Slimming replica indexes (REPLICA_SLIM_INDEXES=${REPLICA_SLIM_INDEXES:-true})"
-LOCAL_DB="$LOCAL_DB" "$SCRIPT_DIR/slim-indexes.sh" \
-    || log "warning: slim-indexes failed (continuing — replica keeps full index set)"
 
 # --- Remote publication ----------------------------------------------------
 # Reconcile the publisher before creating or refreshing the local
-# subscription. A subscription can have a healthy apply worker even when its
-# publication has no tables, so make the publication/table membership explicit.
-log "Ensuring remote publication '$PUBLICATION' publishes: $REPLICATED_TABLES"
+# subscription: the publication carries exactly REPLICATED_TABLES. A
+# subscription can have a healthy apply worker even when its publication has no
+# tables, so make the membership explicit. SET TABLE also drops what the list
+# no longer names (the legacy public tables, retired 2026-11-15); a subscriber
+# forgets a dropped table on its next REFRESH and keeps its rows. Only issued
+# when the membership differs, so a steady-state run takes no DDL lock on the
+# publisher.
+log "Ensuring remote publication '$PUBLICATION' publishes exactly $REPLICA_SCHEMA.{$(printf '%s' "$REPLICATED_TABLES" | tr ' ' ',')}"
 psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" \
     -v ON_ERROR_STOP=1 <<SQL
-DO \$$
+DO \$\$
 DECLARE
-    target_pub text := '$PUBLICATION';
-    old_pub    text := '$LEGACY_PUBLICATION';
-    t          text;
-    replicated text[] := ARRAY[$REPLICATED_TABLES_SQL];
+    target_pub text   := '$PUBLICATION';
+    want       text[] := ARRAY(SELECT format('%I.%I', '$REPLICA_SCHEMA', t)
+                                 FROM unnest(regexp_split_to_array(trim('$REPLICATED_TABLES'), '\s+')) t
+                                ORDER BY 1);
+    have       text[];
 BEGIN
-    IF target_pub <> old_pub
-       AND EXISTS (SELECT 1 FROM pg_publication WHERE pubname = old_pub)
-       AND NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = target_pub) THEN
-        EXECUTE format('ALTER PUBLICATION %I RENAME TO %I', old_pub, target_pub);
-    END IF;
-
     IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = target_pub) THEN
         EXECUTE format('CREATE PUBLICATION %I', target_pub);
+        RAISE NOTICE 'created publication %', target_pub;
     END IF;
-
-    FOREACH t IN ARRAY replicated LOOP
-        IF EXISTS (
-            SELECT 1
-              FROM pg_class c
-              JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE n.nspname = 'public'
-               AND c.relname = t
-               AND c.relkind IN ('r', 'p')
-        ) AND NOT EXISTS (
-            SELECT 1
-              FROM pg_publication_tables
-             WHERE pubname = target_pub
-               AND schemaname = 'public'
-               AND tablename = t
-        ) THEN
-            EXECUTE format('ALTER PUBLICATION %I ADD TABLE public.%I', target_pub, t);
-            RAISE NOTICE 'added table % to publication %', t, target_pub;
-        END IF;
-    END LOOP;
-END \$$;
+    have := ARRAY(SELECT format('%I.%I', schemaname, tablename)
+                    FROM pg_publication_tables
+                   WHERE pubname = target_pub
+                   ORDER BY 1);
+    IF have IS DISTINCT FROM want THEN
+        EXECUTE format('ALTER PUBLICATION %I SET TABLE %s', target_pub, array_to_string(want, ', '));
+        RAISE NOTICE 'publication % was % and now publishes %', target_pub, have, want;
+    END IF;
+END \$\$;
 SQL
 
 # --- Schema parity gate ----------------------------------------------------
 # A logical subscriber must have every column on every table the publisher
-# replicates. If it
-# doesn't, the tablesync/apply worker dies on startup with "missing replicated
-# column" and the launcher restarts it forever — a crash loop that pins the
-# publisher's replication slot and retains WAL on the master without bound
-# (it never advances restart_lsn because the initial copy never commits).
-# 'hopper init' above is meant to bring the local schema current, but a stale
-# hopper binary — one built before a newer column's migration was added —
-# silently skips that migration and leaves the gap. Detect it here, before we
-# create/refresh the subscription, instead of discovering it later as a wedged
-# replica that's quietly eating the master's disk.
+# replicates. If it doesn't, the tablesync/apply worker dies on startup with
+# "missing replicated column" and the launcher restarts it forever — a crash
+# loop that pins the publisher's replication slot and retains WAL on the master
+# without bound (it never advances restart_lsn because the initial copy never
+# commits). A schema made from an older store/schema.sql than the publisher's
+# leaves exactly that gap. Detect it here, before we create/refresh the
+# subscription, instead of discovering it later as a wedged replica that's
+# quietly eating the master's disk.
 #
 # Published column set: pg_publication_tables.attnames lists exactly the
 # columns the publisher sends (all of them when the publication has no column
@@ -667,10 +629,11 @@ EOF
 
 if [ -n "$missing" ]; then
     die "local published table(s) are missing replicated column(s):$missing
-       The local schema is behind the publisher — the hopper binary that ran
-       'init' is likely stale (built before these columns' migrations existed).
-       Rebuild it and re-run:  make build && make replica (or use
-       make rebuild-replica FORCE=true if this subscription is disabled)
+       The local schema '$REPLICA_SCHEMA' is behind the publisher: it was made
+       from an older store/schema.sql than the publisher runs. With a
+       subscription, scripts/replica/replica-heal.sh adds published columns from
+       the publisher's catalog; otherwise update this checkout, drop the empty
+       schema (DROP SCHEMA $REPLICA_SCHEMA CASCADE) and re-run make replica.
        Skipping CREATE/REFRESH SUBSCRIPTION: subscribing now would crash-loop
        the apply worker and retain WAL on the publisher without bound."
 fi
@@ -758,7 +721,7 @@ BULK_DEFERRED=''
 if [ "$FAST_SYNC" = "true" ] && [ "$COPY_DATA" = "true" ]; then
     pub_tables=$(psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" -tAc \
         "SELECT tablename FROM pg_publication_tables
-          WHERE pubname = '$PUBLICATION' AND schemaname = 'public'" 2>/dev/null)
+          WHERE pubname = '$PUBLICATION' AND schemaname = '$REPLICA_SCHEMA'" 2>/dev/null)
     to_copy=''
     for t in $pub_tables; do
         state=''
@@ -768,7 +731,7 @@ if [ "$FAST_SYNC" = "true" ] && [ "$COPY_DATA" = "true" ]; then
                    JOIN pg_subscription s ON s.oid = r.srsubid
                    JOIN pg_class c ON c.oid = r.srrelid
                    JOIN pg_namespace n ON n.oid = c.relnamespace
-                  WHERE s.subname = '$SUBSCRIPTION' AND n.nspname = 'public'
+                  WHERE s.subname = '$SUBSCRIPTION' AND n.nspname = '$REPLICA_SCHEMA'
                     AND c.relname = '$t'" | tr -d '[:space:]')
         fi
         case "$state" in
@@ -827,8 +790,10 @@ ALTER SUBSCRIPTION :"sub" SET PUBLICATION :"pub" WITH (refresh = false);
 -- this workload's big full-table backfill migrations — and applies them via
 -- parallel apply workers instead of spooling to disk and replaying at commit
 -- (a single ~300 GB backfill txn stalled apply feedback for hours on
--- 2026-07-13 under plain streaming=on).
-ALTER SUBSCRIPTION :"sub" SET (disable_on_error = true, streaming = parallel);
+-- 2026-07-13 under plain streaming=on). binary=true ships rows in binary
+-- form (both sides run the same schema.sql types), cheaper to encode and
+-- apply than text.
+ALTER SUBSCRIPTION :"sub" SET (disable_on_error = true, streaming = parallel, binary = true);
 ALTER SUBSCRIPTION :"sub" ENABLE;
 ALTER SUBSCRIPTION :"sub" REFRESH PUBLICATION WITH (copy_data = $COPY_DATA);
 SQL
@@ -856,7 +821,7 @@ SQL
 CREATE SUBSCRIPTION :"sub"
     CONNECTION :'conn'
     PUBLICATION :"pub"
-    WITH (copy_data = $COPY_DATA, disable_on_error = true, streaming = parallel);
+    WITH (copy_data = $COPY_DATA, binary = true, disable_on_error = true, streaming = parallel);
 SQL
 fi
 

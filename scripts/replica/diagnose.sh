@@ -3,7 +3,7 @@
 # replication pair so a stuck sync is obvious at a glance. Read-only.
 #
 # Overridable via env: REMOTE_HOST, REMOTE_USER, REMOTE_DB, LOCAL_DB,
-# SUBSCRIPTION (auto-detected from pg_subscription when unset).
+# PUBLICATION, SUBSCRIPTION (auto-detected from pg_subscription when unset).
 # Remote queries read ~/.pgpass for credentials.
 
 set -u
@@ -12,6 +12,7 @@ REMOTE_HOST="${REMOTE_HOST:-hopper-db}"
 REMOTE_USER="${REMOTE_USER:-hopper}"
 REMOTE_DB="${REMOTE_DB:-hopper}"
 LOCAL_DB="${LOCAL_DB:-hopper}"
+PUBLICATION="${PUBLICATION:-hopper_replica}"
 SUBSCRIPTION="${SUBSCRIPTION:-}"
 EXACT_COUNTS="${EXACT_COUNTS:-false}"
 
@@ -167,11 +168,13 @@ SELECT application_name, client_addr, state, sync_state,
   FROM pg_stat_replication;
 SQL
 
-section "remote: row counts (for comparison)"
-remote -tA <<'SQL' | sed 's/^/  /'
-SELECT relname || ': ' || n_live_tup || ' rows (est)'
-  FROM pg_stat_user_tables
- ORDER BY relname;
+section "remote: row counts of published tables (for comparison)"
+remote -v pub="$PUBLICATION" -tA <<'SQL' | sed 's/^/  /'
+SELECT quote_ident(s.schemaname) || '.' || quote_ident(s.relname) || ': ' || s.n_live_tup || ' rows (est)'
+  FROM pg_stat_user_tables s
+  JOIN pg_publication_tables p ON p.schemaname = s.schemaname AND p.tablename = s.relname
+ WHERE p.pubname = :'pub'
+ ORDER BY s.relname;
 SQL
 
 # ---------------------------------------------------------------------------

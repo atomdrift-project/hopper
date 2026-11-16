@@ -15,7 +15,7 @@ import (
 // is emitted only after the full parent walk succeeds. Unknown ancestry is an
 // error, not a clear reputation. Consumers can safely fail closed on old servers.
 func (s *apiServer) handleSightingsAncestry(w http.ResponseWriter, r *http.Request) {
-	if s.db == nil {
+	if s.db == nil && s.results == nil {
 		writeRetryable(w, retryAfterStarting, "starting", "Starting.")
 		return
 	}
@@ -38,7 +38,7 @@ func (s *apiServer) handleSightingsAncestry(w http.ResponseWriter, r *http.Reque
 		if _, done := bySHA[sha]; done {
 			continue
 		}
-		result, err := s.db.SightingsInAncestry(ctx, sha)
+		result, err := s.sightingsInAncestry(ctx, sha)
 		if err != nil {
 			if errors.Is(err, hopper.ErrNotFound) {
 				v1Error(w, http.StatusNotFound, "unknown_artifact", "Unknown file or ancestor.")

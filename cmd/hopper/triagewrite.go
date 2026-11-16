@@ -160,7 +160,7 @@ type cleaveResultRequest struct {
 // something introduced here. It is reported as "deleted" rather than "stored" so
 // a caller is never told its write-back landed when the row is gone.
 func (s *apiServer) handleCleaveResult(w http.ResponseWriter, r *http.Request) {
-	if s.db == nil {
+	if s.db == nil && s.results == nil {
 		writeRetryable(w, retryAfterStarting, "starting", "Starting.")
 		return
 	}
@@ -191,6 +191,10 @@ func (s *apiServer) handleCleaveResult(w http.ResponseWriter, r *http.Request) {
 	// abort it partway.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), resultStoreTimeout)
 	defer cancel()
+	if s.results != nil {
+		s.rescanForCleave(ctx, w, sha, r.RemoteAddr)
+		return
+	}
 
 	parsed := hopper.ParseCleaveResult(sha, req.Result)
 	deleted := parsed.FileInfo.FileType == ""

@@ -5,6 +5,7 @@
 # exist on FreeBSD (watch(8) there is an unrelated tty-snooping tool).
 #
 # Overridable via env: REMOTE_HOST, REMOTE_USER, REMOTE_DB, LOCAL_DB,
+# REPLICA_SCHEMA (replicated-tables.sh; its tables print unqualified),
 # SUBSCRIPTION (auto-detected from pg_subscription when unset),
 # INTERVAL (seconds, default 60), ETA_WINDOW (seconds, default 900),
 # ONCE (true = single snapshot). History survives restarts under /tmp so
@@ -22,6 +23,9 @@ SUBSCRIPTION="${SUBSCRIPTION:-}"
 INTERVAL="${INTERVAL:-60}"
 ETA_WINDOW="${ETA_WINDOW:-900}"
 ONCE="${ONCE:-false}"
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/replicated-tables.sh"
 
 # A pipe or file isn't a dashboard — print one frame and exit.
 if [ ! -t 1 ]; then
@@ -94,7 +98,7 @@ collect() {
     {
         printf 'NOW|%s\n' "$now"
 
-        admin -d "$LOCAL_DB" -v sub="$SUBSCRIPTION" -tA -F '|' <<'SQL'
+        admin -d "$LOCAL_DB" -v sub="$SUBSCRIPTION" -v schema="$REPLICA_SCHEMA" -tA -F '|' <<'SQL'
 SELECT 'SUB',
        s.subname,
        CASE WHEN s.subenabled THEN 't' ELSE 'f' END,
@@ -124,7 +128,7 @@ SELECT 'WORK', count(*),
  WHERE w.subname = :'sub' AND w.worker_type = 'parallel apply';
 
 -- Transaction-held write locks identify tables being applied, not row progress.
-SELECT 'TOUCH', CASE WHEN n.nspname = 'public' THEN c.relname
+SELECT 'TOUCH', CASE WHEN n.nspname = :'schema' THEN c.relname
                     ELSE n.nspname || '.' || c.relname END,
        count(DISTINCT w.pid)
   FROM pg_stat_subscription w
@@ -147,9 +151,9 @@ SQL
             *)    printf 'ERRS|0|0\n' ;;
         esac
 
-        admin -d "$LOCAL_DB" -v sub="$SUBSCRIPTION" -tA -F '|' <<'SQL'
+        admin -d "$LOCAL_DB" -v sub="$SUBSCRIPTION" -v schema="$REPLICA_SCHEMA" -tA -F '|' <<'SQL'
 SELECT 'TBL',
-       CASE WHEN n.nspname = 'public' THEN c.relname
+       CASE WHEN n.nspname = :'schema' THEN c.relname
             ELSE n.nspname || '.' || c.relname END,
        r.srsubstate,
        COALESCE(st.n_live_tup, 0),
@@ -210,13 +214,13 @@ SELECT 'SLOT',
  ORDER BY slot_name;
 SQL
 
-        remote -tA -F '|' <<'SQL' 2>/dev/null || true
+        remote -v schema="$REPLICA_SCHEMA" -tA -F '|' <<'SQL' 2>/dev/null || true
 SELECT 'REM',
        relname,
        COALESCE(n_live_tup, 0),
        COALESCE(pg_table_size(relid), 0)
   FROM pg_stat_user_tables
- WHERE schemaname = 'public'
+ WHERE schemaname = :'schema'
  ORDER BY relname;
 SQL
     } >"$SNAP"

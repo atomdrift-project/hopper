@@ -82,13 +82,16 @@ runs the same with the legacy tables gone. The work:
   | `/v1/work/next` | postdoc | done: `claimJobs` is on the store, and `validateClaimJobs` opens a claimed file at its path or any other the store records (`openClaimedFromStore`), forgetting those it is not at |
   | `/v1/work/heartbeat` | postdoc | a heartbeat extends the lease through `Store.Lease` (release is gone) |
   | `/v1/files/{sha256}` | postdoc, cyclotron, gauntlet, prism | done (`filestore.go`, `Store.Source`): a file's own paths, newest first, forgetting each it is no longer at; a member out of a located archive that lists it |
-  | `/v1/files/{sha256}/provenance` | postdoc, cyclotron | port: `samples.provenance` |
+  | `/v1/files/{sha256}/provenance` | postdoc, cyclotron | done: `Store.Provenance`; a sidecar sent alone refreshes it through `Store.SetProvenance` |
   | `/v1/lookup` | postdoc, poppy, scan | done (`lookupstore.go`): the record (`BySHA256`/`ByRelease`), the ledger's word on it (`hopper.Corroborate`), raised by what it points at or holds that atomscan holds hostile or the ledger convicts at a hostile rung (`Raise`, `hopper.Convicts`), listed in `raised_by` with `why` |
   | `/v1/intake/upload` (from postdoc's `/v1/analyze`) | postdoc, scan, forager | done: `Store.Ingest` with source `upload` at `QueueUpload`, the sidecar with it; a held digest is found in the store (`heldInStore`). `/v1/analyze` itself is postdoc's route, behind beamline; hopper's part of it is this upload, `/v1/intake/held` and the renewal through `/v1/work/result` |
-  | `/v1/intake/held` | scan, forager | port: a sample with a location |
-  | `/v1/sightings` | cyclotron, gauntlet, promoter | done: writes through `hopper.PrepareSightings` (the legacy rules, shared) and `Store.AddSightings`, which marks the files named (`Cite`); reads from the store's ledger |
-  | `/v1/sightings/ancestry` | cyclotron | port: the joins to `samples` change |
-  | `/api/cleave-result` | cyclotron | becomes a version 8 result through `/v1/work/result`, once a juror a body does not name is no statement |
+  | `/v1/intake/held` | scan, forager | done: `Store.Held`, a file at a path, or one an archive at a path lists |
+  | `/v1/intake/popular` | poppy | done: `Store.SetPopular` |
+  | `/v1/storage/incoming` | draino | done: `Store.Incoming`, keyset on (seen_at, path) |
+  | `/v1/sightings` | cyclotron, gauntlet, promoter, forager | done: writes through `hopper.PrepareSightings` (the legacy rules, shared) and `Store.AddSightings`, which marks the files named (`Cite`); reads from the store's ledger. `?backfill=1` dates a source's history (`BackfillSightingsToStore`), and a source's first bulk arrival is backdated as legacy's `seedTimes` did |
+  | `/v1/sightings/attempted`, `/v1/sightings/retract`, `/v1/acquisitions/claim`, `/v1/acquisitions/finish` | forager | done (`ledgerapi.go`): the acquirers' writes, which forager made with SQL; it reads its queues with read-only SQL |
+  | `/v1/sightings/ancestry` | cyclotron | done: `Store.Ancestry` up `contents`, then `hopper.SightingsInAncestryFromStore` |
+  | `/api/cleave-result` | cyclotron | with the store, queues a whole scan (`Store.Rescan`) rather than writing a cleave-only result over the jurors; becomes a version 8 result through `/v1/work/result` once a juror a body does not name is no statement |
 
 - **Claim tiers with no store equivalent.** `tierPathRescan` becomes a
   rescan of a path prefix (`locations.path` is `COLLATE "C"`, so a prefix
@@ -126,8 +129,13 @@ one bearer token.
 /v1/intake/upload                 POST  bytes and their sidecar
 /v1/intake/popular                POST  which packages deserve scrutiny (poppy)
 
-/v1/sightings                     GET by subject, POST to append
+/v1/sightings                     GET by subject, POST to append (?backfill=1 for a source's history)
 /v1/sightings/ancestry            GET   sightings on a file or any archive holding it
+/v1/sightings/attempted           POST  claims an acquirer has tried, by key
+/v1/sightings/retract             POST  claims a source withdrew, by key
+
+/v1/acquisitions/claim            POST  claim a fetch target, once ever
+/v1/acquisitions/finish           POST  how it ended
 
 /v1/triage/{queue}                GET   select (the stranded queue's items carry their members)
 /v1/triage/{queue}/depth          GET   a capped count
