@@ -817,7 +817,7 @@ func cmdServeReplica(ctx context.Context) error {
 		slog.Warn("serve-replica: pool stats registration", "error", err)
 	}
 
-	handler := recoverMiddleware(obs.Middleware(authMiddleware(apiToken, mux)))
+	handler := recoverMiddleware(obs.Middleware(authMiddleware(apiToken, agentMiddleware(mux))))
 	slog.Info("read-only replica API listening",
 		"addr", *apiAddr, "authenticated", apiToken != nil, "bytes", api.dataRoot != "",
 		"relay", *relayTo)
@@ -1323,9 +1323,11 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 
 	// The API listener: the tunnel origin, and the only one that authenticates.
 	// Auth sits inside obs.Middleware so rejected requests are still traced and
-	// counted, and inside recoverMiddleware so a panic anywhere is logged.
+	// counted, and inside recoverMiddleware so a panic anywhere is logged. The
+	// user-agent check sits inside auth: only a caller holding the token learns
+	// it must also name itself.
 	if *apiAddr != "" {
-		handler := recoverMiddleware(obs.Middleware(authMiddleware(apiToken, apiMux)))
+		handler := recoverMiddleware(obs.Middleware(authMiddleware(apiToken, agentMiddleware(apiMux))))
 		if err := startHTTPServer(ctx, *apiAddr, handler); err != nil {
 			return fmt.Errorf("work API: %w", err)
 		}

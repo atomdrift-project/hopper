@@ -52,6 +52,30 @@ func TestRetiredPaths(t *testing.T) {
 	}
 }
 
+// A retired call names its caller: Cloudflare's address for the client behind
+// a tunnel that cloudflared relays over loopback, the connection's otherwise,
+// and never a header from a remote connection.
+func TestCallerAddr(t *testing.T) {
+	for _, c := range []struct {
+		remote, header, want string
+	}{
+		{"127.0.0.1:5000", "203.0.113.7", "203.0.113.7"},
+		{"[::1]:5000", "2001:db8::1", "2001:db8::1"},
+		{"127.0.0.1:5000", "", "127.0.0.1"},
+		{"127.0.0.1:5000", "not an address", "127.0.0.1"},
+		{"10.9.8.5:5000", "203.0.113.7", "10.9.8.5"},
+	} {
+		r := httptest.NewRequest(http.MethodGet, "/api/next", http.NoBody)
+		r.RemoteAddr = c.remote
+		if c.header != "" {
+			r.Header.Set("Cf-Connecting-Ip", c.header)
+		}
+		if got := callerAddr(r); got != c.want {
+			t.Errorf("callerAddr(%s, %q) = %q, want %q", c.remote, c.header, got, c.want)
+		}
+	}
+}
+
 func TestThrottle(t *testing.T) {
 	th := &throttle{every: time.Minute, last: map[string]time.Time{}}
 	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)

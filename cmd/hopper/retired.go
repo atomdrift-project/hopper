@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -57,20 +58,49 @@ func registerRetired(mux *http.ServeMux) {
 // it fails at once, names itself in the log, and does not retry: 410 is
 // final. The count covers every request; the log, at most one a minute for
 // each route and client, so a polling fleet cannot flood it.
+//
+// A client is told apart by more than its user agent, which many send empty:
+// by the worker name the work routes carry, and by its own address rather
+// than cloudflared's when it came through the tunnel (callerAddr).
 func serveRetired(w http.ResponseWriter, r *http.Request, pattern, use string) {
 	ctx := r.Context()
 	recordRetired(ctx, pattern)
 	agent := r.UserAgent()
-	if retiredLog.due(pattern+"\x00"+agent, time.Now()) {
+	caller := callerAddr(r)
+	worker := r.URL.Query().Get("worker")
+	if len(worker) > maxLoggedWorker {
+		worker = worker[:maxLoggedWorker]
+	}
+	if retiredLog.due(pattern+"\x00"+agent+"\x00"+caller+"\x00"+worker, time.Now()) {
 		slog.WarnContext(ctx, "retired API path called",
 			"route", pattern, "method", r.Method, "path", r.URL.Path, "use", use,
-			"user_agent", agent, "remote", r.RemoteAddr)
+			"user_agent", agent, "worker", worker, "caller", caller, "remote", r.RemoteAddr)
 	}
 	if use == "" {
 		v1Error(w, http.StatusGone, "retired", "This path is no longer served.")
 		return
 	}
 	v1Error(w, http.StatusGone, "retired", "This path moved to "+use+".", "use", use)
+}
+
+// maxLoggedWorker bounds the client-chosen worker name a log line carries.
+const maxLoggedWorker = 64
+
+// callerAddr is the address a request came from: the client's own, as
+// Cloudflare reports it, for one cloudflared relayed over loopback, and the
+// connection's otherwise. It identifies callers in logs and is trusted for
+// nothing else; a local process can set the header too.
+func callerAddr(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		if forwarded := net.ParseIP(r.Header.Get("Cf-Connecting-Ip")); forwarded != nil {
+			return forwarded.String()
+		}
+	}
+	return host
 }
 
 // throttle remembers when each key was last let through.
@@ -89,8 +119,8 @@ func (t *throttle) due(key string, now time.Time) bool {
 	if last, ok := t.last[key]; ok && now.Sub(last) < t.every {
 		return false
 	}
-	// Keys carry a user agent, which the client chooses: forget them all
-	// rather than grow without bound.
+	// Keys carry a user agent and a worker name, which the client chooses:
+	// forget them all rather than grow without bound.
 	if len(t.last) >= 1024 {
 		clear(t.last)
 	}

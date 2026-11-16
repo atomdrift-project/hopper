@@ -425,6 +425,7 @@ func (h *loadProcess) get(ctx context.Context, path string, out any) int {
 	if err != nil {
 		h.t.Fatal(err)
 	}
+	req.Header.Set("User-Agent", "hopper-load-test/1")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		h.t.Fatal(err)
@@ -484,6 +485,7 @@ func (h *loadProcess) post(ctx context.Context, path, contentType string, body [
 		h.t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("User-Agent", "hopper-load-test/1")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		h.t.Fatal(err)

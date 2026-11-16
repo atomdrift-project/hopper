@@ -131,9 +131,11 @@ func authMiddleware(digest *tokenDigest, next http.Handler) http.Handler {
 var clientToken = hopper.APIToken
 
 // authorizeRequest attaches this host's bearer token to an outgoing API
-// request. A host with no token sends none — the master answers 401 if it
-// wanted one, which is a clearer failure than a silently anonymous call.
+// request, and the user agent the API requires of every client. A host with
+// no token sends none — the master answers 401 if it wanted one, which is a
+// clearer failure than a silently anonymous call.
 func authorizeRequest(r *http.Request) {
+	r.Header.Set("User-Agent", clientAgent)
 	if token := clientToken(); token != "" {
 		r.Header.Set("Authorization", "Bearer "+token)
 	}
