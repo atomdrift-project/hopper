@@ -28,6 +28,9 @@ DASH_ADDR ?= 0.0.0.0:8082
 WORKERS       ?= 60
 MAX_MEMORY_GB ?= 72
 POSTDOC_DIR   ?= ../postdoc
+# Third-party scanners the local postdoc runs (FreeBSD): none, or any of
+# clamav,malcontent,guarddog, which the deploy then installs.
+SCANNERS      ?= none
 # Cloudflare Tunnel (FreeBSD only). "auto" installs and starts cloudflared when
 # CF_TUNNEL_TOKEN is passed or a token from an earlier deploy is on disk; 0
 # skips it. CF_TUNNEL_TOKEN is read from the environment, never from here, so
@@ -117,7 +120,7 @@ deploy-replica: build
 deploy-freebsd:
 	DATA_DIR='$(DATA_DIR)' DB='$(DB)' SOURCE='$(SOURCE)' \
 	API_ADDR='$(API_ADDR)' DASH_ADDR='$(DASH_ADDR)' POSTDOC_DIR='$(POSTDOC_DIR)' LLM='$(LLM)' \
-	CLOUDFLARED='$(CLOUDFLARED)' \
+	SCANNERS='$(SCANNERS)' CLOUDFLARED='$(CLOUDFLARED)' \
 		./scripts/master/freebsd.sh
 
 rollout-replica-bastille:

@@ -21,6 +21,11 @@ API_ADDR="${API_ADDR:-0.0.0.0:8081}"
 DASH_ADDR="${DASH_ADDR:-0.0.0.0:8082}"
 TOKEN_SRC="${TOKEN_SRC-${HOME}/.tok/hopper}"
 LLM="${LLM:-http://10.9.8.149:8000/v1}"
+# The third-party scanners the local postdoc runs (clamav,malcontent,guarddog,
+# or a subset). Off by default, as postdoc's own deploys are: postdoc refuses
+# to start without every scanner it is asked for, so naming one here also
+# installs it.
+SCANNERS="${SCANNERS:-none}"
 POSTDOC_DIR="${POSTDOC_DIR:-../postdoc}"
 CLEAVE_DIR="${CLEAVE_DIR:-../cleave}"
 SAMPLES_GROUP="${SAMPLES_GROUP:-samples}"
@@ -326,7 +331,7 @@ command="/usr/sbin/daemon"
 # renames the file while daemon keeps writing to the now-unlinked inode: the
 # rotated copies look correct, the disk never frees, and the log grows without
 # bound (this is how hopper.log reached 4.7G).
-command_args="-c -f -r -H -R 10 -P \${pidfile} -o \${hopper_logfile} -u hopper /usr/bin/env HOME=/home/hopper DATABASE_URL=\${hopper_db} $HOPPER_BIN load --data \${hopper_data} --db \${hopper_db} --source \${hopper_source} --api-addr \${hopper_api_bind} --dashboard-addr \${hopper_bind}$token_arg --postdoc $POSTDOC_BIN$llm_arg --cleave $CLEAVE_BIN\${mount_args}$dataset_arg"
+command_args="-c -f -r -H -R 10 -P \${pidfile} -o \${hopper_logfile} -u hopper /usr/bin/env HOME=/home/hopper DATABASE_URL=\${hopper_db} POSTDOC_SCANNERS=$SCANNERS $HOPPER_BIN load --data \${hopper_data} --db \${hopper_db} --source \${hopper_source} --api-addr \${hopper_api_bind} --dashboard-addr \${hopper_bind}$token_arg --postdoc $POSTDOC_BIN$llm_arg --cleave $CLEAVE_BIN\${mount_args}$dataset_arg"
 
 run_rc_command "\$1"
 EOF
@@ -367,9 +372,13 @@ fi
 $SUDO sysrc hopper_enable=YES >/dev/null
 
 # The third-party scanners postdoc checks at startup, set up for the account
-# that now runs it (clamd's socket group, among others).
-log "Ensuring postdoc's scanners for $SERVICE_USER"
-SERVICE_USER="$SERVICE_USER" sh "$POSTDOC_DIR/scripts/deploy-scanners.sh"
+# that runs it (clamd's socket group, among others).
+if [ "$SCANNERS" != none ]; then
+	log "Ensuring postdoc's scanners ($SCANNERS) for $SERVICE_USER"
+	SCANNERS="$SCANNERS" SERVICE_USER="$SERVICE_USER" sh "$POSTDOC_DIR/scripts/deploy-scanners.sh"
+else
+	log "Third-party scanners off (SCANNERS=none)"
+fi
 
 # Earlier deploys ran postdoc as its own postdoc_worker service. Two workers
 # would poll one queue, the old one on a binary nothing updates, so it is
