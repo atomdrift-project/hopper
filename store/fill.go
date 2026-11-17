@@ -5,17 +5,21 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // FillReports stores reports, by sample id, for files atomscan judged whose
 // stored report says no more than their molecule (a molecule and a risk): all
 // an archive's report kept of its members once legacy hopper had cut their
 // entries out of it. What the stored report says that the new one does not is
-// kept. A file with a fuller report, or no atomscan verdict, is left as it is,
+// kept. A file with a fuller report (one too long to read, too), or no atomscan
+// verdict, is left as it is,
 // as is one whose report changed since it was read. It returns how many it
 // filled. The migration fills members' reports from the legacy excerpts so.
 func (st *Store) FillReports(ctx context.Context, reports map[int64][]byte) (int64, error) {
@@ -56,6 +60,9 @@ func (st *Store) FillReports(ctx context.Context, reports map[int64][]byte) (int
 		}
 		if s.detail != nil {
 			old, err := st.dec.DecodeAll(s.detail, nil)
+			if errors.Is(err, zstd.ErrDecoderSizeExceeded) {
+				continue // longer than any line the store takes: no molecule alone
+			}
 			if err != nil {
 				return 0, fmt.Errorf("store: fill report of sample %d: %w", s.id, err)
 			}

@@ -136,3 +136,39 @@ func TestFillVerdicts(t *testing.T) {
 		t.Errorf("a second call stored %d, %v", n, err)
 	}
 }
+
+// A stored report too long for the decoder is a fuller report, not a reason to
+// stop: it is left as it is, and the rest of the batch is filled.
+func TestFillReportsLeavesOversizedReport(t *testing.T) {
+	st := open(t)
+	ctx := t.Context()
+	r := archive()
+	r.reports[1] = `{"mol":"Os","risk":3}`
+	r.files[1]["report"] = sum(r.reports[1])
+	r.write(ctx, t, st)
+	pkg, err := st.Sample(ctx, digestOf("package bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := st.Sample(ctx, digestOf("script bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	huge := st.enc.EncodeAll(bytes.Repeat([]byte("a"), 65<<20), nil)
+	if _, err := st.pool.Exec(ctx, `UPDATE verdicts SET detail = $2, digest = $3 WHERE sample_id = $1 AND scanner_id = 1`,
+		pkg.ID, huge, digestOf("huge")); err != nil {
+		t.Fatal(err)
+	}
+	full := `{"traits":[{"crit":4,"id":"x::from-the-excerpt"}]}`
+	n, err := st.FillReports(ctx, map[int64][]byte{pkg.ID: []byte(full), script.ID: []byte(full)})
+	if err != nil {
+		t.Fatalf("an oversized stored report stopped the fill: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("filled %d, want the member alone", n)
+	}
+	var stored []byte
+	if err := st.pool.QueryRow(ctx, `SELECT detail FROM verdicts WHERE sample_id = $1 AND scanner_id = 1`, pkg.ID).Scan(&stored); err != nil || !bytes.Equal(stored, huge) {
+		t.Errorf("the oversized report changed (%v)", err)
+	}
+}
