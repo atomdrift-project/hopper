@@ -190,7 +190,7 @@ func ExcerptReport(raw json.RawMessage) ([]byte, error) {
 // ExcerptReport builds it, and its verdict, judged as Convert judges a member
 // the machine-learning model did not cover: on its findings alone, the trait
 // floor's reading standing as the class, and no level measured (fires_at
-// unset). The line carries no scan stamp; the caller dates it. Nil for a
+// unset). The line carries no scan stamp; the caller dates it. ErrSidecar for a
 // registry sidecar, which is provenance; ErrNotExcerpt for a scan's report.
 func ExcerptFile(raw json.RawMessage, level int) (*scanresult.File, error) {
 	top := map[string]json.RawMessage{}
@@ -206,7 +206,7 @@ func ExcerptFile(raw json.RawMessage, level int) (*scanresult.File, error) {
 	}
 	e := entries[0]
 	if e.Rel == "registry" || e.Type == "registry" {
-		return nil, nil
+		return nil, ErrSidecar
 	}
 	c := &converter{
 		out:   &Converted{Omitted: map[string]int{}},
@@ -229,6 +229,10 @@ func ExcerptFile(raw json.RawMessage, level int) (*scanresult.File, error) {
 
 // ErrNotExcerpt is ExcerptReport's answer to a report that is a scan.
 var ErrNotExcerpt = errors.New("v7result: not an excerpt")
+
+// ErrSidecar is ExcerptFile's answer to a registry sidecar. A sidecar is
+// provenance the sample's own row holds; Convert leaves sidecars out too.
+var ErrSidecar = errors.New("v7result: registry sidecar")
 
 // entry is the part of a report's file entry the conversion reads.
 type entry struct {

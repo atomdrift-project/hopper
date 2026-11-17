@@ -119,7 +119,7 @@ func TestFillVerdicts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(reports[one.ID]) != string(report) {
+	if !bytes.Equal(reports[one.ID], report) {
 		t.Errorf("report %s, want %s", reports[one.ID], report)
 	}
 	if _, ok := reports[two.ID]; ok {

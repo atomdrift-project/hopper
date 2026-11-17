@@ -1282,7 +1282,7 @@ func parseWorkerTools(values []string) (string, *workerToolSet) {
 		}
 	}
 	canonical := make([]string, 0, len(tools))
-	for _, name := range []string{"rizin", "upx", "innoextract", "7z"} {
+	for _, name := range []string{"upx", "innoextract", "7z"} {
 		if tools[name] {
 			canonical = append(canonical, name)
 		}
@@ -1301,9 +1301,6 @@ func workerCanAnalyzeFile(fileType, filePath string, tools *workerToolSet) bool 
 	ft := normalizeFileType(fileType)
 	if ft == "" && filePath == "" {
 		return true
-	}
-	if requiresTool(ft, filePath, "rizin") && !(*tools)["rizin"] {
-		return false
 	}
 	if requiresTool(ft, filePath, "upx") && !(*tools)["upx"] {
 		return false
@@ -1324,28 +1321,37 @@ func normalizeFileType(fileType string) string {
 	return ft
 }
 
-func requiresTool(fileType, filePath, tool string) bool {
-	switch tool {
-	case "rizin":
-		return isNativeBinaryFileType(fileType)
-	case "upx":
-		return fileType == "elf" || fileType == "pe"
-	case "innoextract":
-		return fileType == "msi" || hasFileExtension(filePath, ".msi", ".msp") || fileType == "pe"
-	case "7z":
-		return fileType == "pe"
-	default:
-		return false
-	}
+// toolFileTypes lists, per external tool, the file types that cannot be
+// analyzed without it.
+var toolFileTypes = map[string][]string{
+	"upx":         {"elf", "pe"},
+	"innoextract": {"msi", "pe"},
+	"7z":          {"pe"},
 }
 
-func isNativeBinaryFileType(fileType string) bool {
-	switch fileType {
-	case "elf", "pe", "macho", "mach_o":
+func requiresTool(fileType, filePath, tool string) bool {
+	if slices.Contains(toolFileTypes[tool], fileType) {
 		return true
-	default:
-		return false
 	}
+	return tool == "innoextract" && hasFileExtension(filePath, ".msi", ".msp")
+}
+
+// unservableTypes returns the file types the worker's tools cannot analyze, so
+// candidate queries can leave them out. A nil set (a worker that reports no
+// tools) can run everything. Files that [requiresTool] picks out by extension
+// alone are not covered; filterCandidatesByWorkerTools still drops those.
+func (t *workerToolSet) unservableTypes() []string {
+	if t == nil {
+		return nil
+	}
+	var skip []string
+	for tool, types := range toolFileTypes {
+		if !(*t)[tool] {
+			skip = append(skip, types...)
+		}
+	}
+	slices.Sort(skip)
+	return slices.Compact(skip)
 }
 
 func hasFileExtension(filePath string, exts ...string) bool {
@@ -2658,7 +2664,7 @@ func (s *apiServer) claimJobs(
 	var out []hopper.ClaimJob
 	ladder := s.claimLadder(slots)
 	if s.results != nil {
-		ladder = s.queueLadder(slots, maxBytes)
+		ladder = s.queueLadder(slots, maxBytes, tools.unservableTypes())
 	}
 	for _, tier := range ladder {
 		want := count - len(out)

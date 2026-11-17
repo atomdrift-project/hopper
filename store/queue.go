@@ -91,10 +91,16 @@ func (st *Store) Rescan(ctx context.Context, sha256 []byte, since time.Time) (bo
 }
 
 // Candidates returns up to n files of one priority that may be handed out
-// now, no larger than maxBytes when it is positive. It reads; [Store.Lease]
-// claims. A file with nowhere on disk to read it from is not a candidate, nor,
-// for a worker with a size limit, one whose size is not known.
-func (st *Store) Candidates(ctx context.Context, p Priority, n int, maxBytes int64) ([]Job, error) {
+// now, no larger than maxBytes when it is positive and none of skipTypes. It
+// reads; [Store.Lease] claims. A file with nowhere on disk to read it from is
+// not a candidate, nor, for a worker with a size limit, one whose size is not
+// known. skipTypes are the file types the worker cannot run, excluded here so
+// that files it can never take do not fill the n rows it is shown and hide the
+// ones behind them. A file whose type is not yet known is never skipped.
+func (st *Store) Candidates(ctx context.Context, p Priority, n int, maxBytes int64, skipTypes []string) ([]Job, error) {
+	if skipTypes == nil {
+		skipTypes = []string{} // a NULL array would make the comparison below match nothing
+	}
 	order := "q.retry_at NULLS FIRST, q.queued_at"
 	if p == QueueSighted {
 		order = "q.retry_at NULLS FIRST, q.queued_at DESC" // small; sorted, not walked
@@ -108,8 +114,9 @@ func (st *Store) Candidates(ctx context.Context, p Priority, n int, maxBytes int
 		WHERE q.priority = $1 AND q.attempts < 8
 		  AND (q.retry_at IS NULL OR q.retry_at <= now())
 		  AND ($2::bigint <= 0 OR s.size_bytes <= $2::bigint)
+		  AND coalesce(s.file_type, '') <> ALL($4::text[])
 		ORDER BY `+order+`
-		LIMIT $3`, int16(p), maxBytes, n)
+		LIMIT $3`, int16(p), maxBytes, n, skipTypes)
 	if err != nil {
 		return nil, fmt.Errorf("store: candidates: %w", err)
 	}

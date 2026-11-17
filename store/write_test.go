@@ -254,10 +254,10 @@ func TestUnknownSize(t *testing.T) {
 	st := open(t)
 	ctx := t.Context()
 	ingest(ctx, t, st, QueueNew, Arrival{SHA256: digestOf("package bytes"), Path: "pool/pkg.tgz"})
-	if jobs, err := st.Candidates(ctx, QueueNew, 10, 1<<20); err != nil || len(jobs) != 0 {
+	if jobs, err := st.Candidates(ctx, QueueNew, 10, 1<<20, nil); err != nil || len(jobs) != 0 {
 		t.Errorf("candidates %+v, %v: a file of unknown size went to a limited worker", jobs, err)
 	}
-	if jobs, err := st.Candidates(ctx, QueueNew, 10, 0); err != nil || len(jobs) != 1 {
+	if jobs, err := st.Candidates(ctx, QueueNew, 10, 0, nil); err != nil || len(jobs) != 1 {
 		t.Errorf("candidates %+v, %v: an unlimited worker should take it", jobs, err)
 	}
 	if got := archive().write(ctx, t, st); got.Retyped != 1 {

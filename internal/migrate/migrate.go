@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
 	"slices"
 	"strconv"
@@ -1039,12 +1040,12 @@ func (m *migration) reportRange(ctx context.Context, lo, hi int64) error {
 			// A member's own entry. A scan's, were it one, is not its report.
 			report, err := v7result.ExcerptReport(json.RawMessage(raw))
 			switch {
-			case errors.Is(err, v7result.ErrNotExcerpt):
+			case errors.Is(err, v7result.ErrNotExcerpt), report == nil && err == nil:
 			case err != nil:
 				m.mu.Lock()
 				m.report.Failures["excerpt unreadable as a report"]++
 				m.mu.Unlock()
-			case report != nil:
+			default:
 				reports[id] = report
 			}
 			continue
@@ -1056,9 +1057,7 @@ func (m *migration) reportRange(ctx context.Context, lo, hi int64) error {
 			m.mu.Unlock()
 			continue
 		}
-		for digest, report := range lines {
-			bySHA[digest] = report
-		}
+		maps.Copy(bySHA, lines)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -1147,7 +1146,7 @@ func (m *migration) excerptVerdictRange(ctx context.Context, lo, hi int64) error
 		}
 		f, err := v7result.ExcerptFile(json.RawMessage(raw), hopper.CriticalLevel)
 		switch {
-		case errors.Is(err, v7result.ErrNotExcerpt), err == nil && f == nil:
+		case errors.Is(err, v7result.ErrNotExcerpt), errors.Is(err, v7result.ErrSidecar):
 		case err != nil:
 			m.mu.Lock()
 			m.report.Failures["excerpt unreadable as a verdict"]++
@@ -1177,7 +1176,9 @@ func rulesetOf(raw string) string {
 		Rev string `json:"rev"`
 		TV  string `json:"tv"`
 	}
-	_ = json.Unmarshal([]byte(raw), &top)
+	if err := json.Unmarshal([]byte(raw), &top); err != nil {
+		return ""
+	}
 	return cmp.Or(top.Rev, top.TV)
 }
 
@@ -1192,9 +1193,9 @@ func legacyReports(raw, sha string) (map[string][]byte, error) {
 		return nil, err
 	}
 	lines := make(map[string][]byte, len(files))
-	for _, f := range files {
-		if len(f.ReportLine) > 0 {
-			lines[hex.EncodeToString(f.SHA256)] = f.ReportLine
+	for i := range files {
+		if len(files[i].ReportLine) > 0 {
+			lines[hex.EncodeToString(files[i].SHA256)] = files[i].ReportLine
 		}
 	}
 	return lines, nil

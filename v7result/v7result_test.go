@@ -701,7 +701,7 @@ func TestExcerptFile(t *testing.T) {
 	if _, err := ExcerptFile(json.RawMessage(`{"v":"7","files":[{"id":0,"sha":"`+sha+`"}]}`), level); !errors.Is(err, ErrNotExcerpt) {
 		t.Errorf("a scan: %v, want ErrNotExcerpt", err)
 	}
-	if f, err := ExcerptFile(json.RawMessage(`{"v":"7","files":[{"id":2,"pid":0,"rel":"registry","type":"registry","sha":"`+sha+`"}]}`), level); f != nil || err != nil {
-		t.Errorf("a sidecar: %v, %v", f, err)
+	if f, err := ExcerptFile(json.RawMessage(`{"v":"7","files":[{"id":2,"pid":0,"rel":"registry","type":"registry","sha":"`+sha+`"}]}`), level); f != nil || !errors.Is(err, ErrSidecar) {
+		t.Errorf("a sidecar: %v, %v; want ErrSidecar", f, err)
 	}
 }

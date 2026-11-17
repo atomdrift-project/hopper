@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -562,19 +563,19 @@ func TestWorkerToolParsingDistinguishesLegacyFromEmptyReport(t *testing.T) {
 }
 
 func TestWorkerCanAnalyzeFileTypeRequiresReportedTools(t *testing.T) {
-	tools := workerToolSet{"rizin": true, "upx": true, "innoextract": true, "7z": true}
+	tools := workerToolSet{"upx": true, "innoextract": true, "7z": true}
 	for _, ft := range []string{"elf", "pe", "macho", "java_class", "python_bytecode", "msi", "cab", "sevenz"} {
 		if !workerCanAnalyzeFileType(ft, &tools) {
 			t.Fatalf("fully equipped worker rejected %s", ft)
 		}
 	}
 
-	noUPX := workerToolSet{"rizin": true, "innoextract": true, "7z": true}
+	noUPX := workerToolSet{"innoextract": true, "7z": true}
 	if workerCanAnalyzeFileType("elf", &noUPX) || workerCanAnalyzeFileType("pe", &noUPX) {
 		t.Fatal("missing upx should block elf and pe")
 	}
 
-	noInno := workerToolSet{"rizin": true, "upx": true, "7z": true}
+	noInno := workerToolSet{"upx": true, "7z": true}
 	if workerCanAnalyzeFileType("msi", &noInno) || workerCanAnalyzeFileType("pe", &noInno) {
 		t.Fatal("missing innoextract should block msi and pe")
 	}
@@ -582,18 +583,12 @@ func TestWorkerCanAnalyzeFileTypeRequiresReportedTools(t *testing.T) {
 		t.Fatal("missing innoextract should block MSI paths even when file type is OLE")
 	}
 
-	noRizin := workerToolSet{"upx": true, "innoextract": true, "7z": true}
-	if workerCanAnalyzeFileType("elf", &noRizin) || workerCanAnalyzeFileType("macho", &noRizin) {
-		t.Fatal("missing rizin should block native binary formats")
-	}
-	if !workerCanAnalyzeFileType("java_class", &noRizin) || !workerCanAnalyzeFileType("python_bytecode", &noRizin) {
-		t.Fatal("missing rizin should not block bytecode formats")
-	}
-	if !workerCanAnalyzeFileType("python", &noRizin) {
-		t.Fatal("missing rizin should not block non-binary script formats")
+	// No file type depends on any tool beyond upx, innoextract and 7z.
+	if !workerCanAnalyzeFileType("python", &tools) {
+		t.Fatal("fully equipped worker rejected python")
 	}
 
-	no7z := workerToolSet{"rizin": true, "upx": true, "innoextract": true}
+	no7z := workerToolSet{"upx": true, "innoextract": true}
 	if !workerCanAnalyzeFileType("cab", &no7z) || !workerCanAnalyzeFileType("seven_z", &no7z) {
 		t.Fatal("missing 7z should not block library-backed 7z/cab archive formats")
 	}
@@ -2728,6 +2723,30 @@ func TestBoundedAttribution(t *testing.T) {
 	} {
 		if got := boundedAttribution(in); got != want {
 			t.Errorf("boundedAttribution(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestUnservableTypes(t *testing.T) {
+	if got := (*workerToolSet)(nil).unservableTypes(); got != nil {
+		t.Errorf("a worker reporting no tools can run everything; got skip list %v", got)
+	}
+	all := workerToolSet{"upx": true, "innoextract": true, "7z": true}
+	if got := all.unservableTypes(); len(got) != 0 {
+		t.Errorf("fully equipped worker skips %v", got)
+	}
+	noUPX := workerToolSet{"innoextract": true, "7z": true}
+	if got := noUPX.unservableTypes(); !slices.Equal(got, []string{"elf", "pe"}) {
+		t.Errorf("without upx skips %v, want [elf pe]", got)
+	}
+	none := workerToolSet{}
+	if got := none.unservableTypes(); !slices.Equal(got, []string{"elf", "msi", "pe"}) {
+		t.Errorf("with no tools skips %v, want [elf msi pe] with pe listed once", got)
+	}
+	// Every type it skips is one workerCanAnalyzeFileType refuses.
+	for _, ft := range none.unservableTypes() {
+		if workerCanAnalyzeFileType(ft, &none) {
+			t.Errorf("%s is skipped in SQL but accepted by the Go filter", ft)
 		}
 	}
 }

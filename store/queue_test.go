@@ -71,15 +71,15 @@ func TestQueueClaims(t *testing.T) {
 	enqueue(ctx, t, st, QueueNew, small, nowhere)
 	enqueue(ctx, t, st, QueueBigArchive, big)
 
-	jobs, err := st.Candidates(ctx, QueueNew, 10, 0)
+	jobs, err := st.Candidates(ctx, QueueNew, 10, 0, nil)
 	if err != nil || len(jobs) != 1 || jobs[0].Path != "pool/small" {
 		t.Fatalf("candidates %+v, %v: want the small file only; the other has nowhere to be read from", jobs, err)
 	}
-	if jobs, err := st.Candidates(ctx, QueueBigArchive, 10, 1<<20); err != nil || len(jobs) != 0 {
+	if jobs, err := st.Candidates(ctx, QueueBigArchive, 10, 1<<20, nil); err != nil || len(jobs) != 0 {
 		t.Errorf("candidates %+v, %v: a file over the worker's limit was offered", jobs, err)
 	}
 	// postdoc advertises its limit in bytes; 16 GiB does not fit 32 bits.
-	if jobs, err := st.Candidates(ctx, QueueBigArchive, 10, 16<<30); err != nil || len(jobs) != 1 {
+	if jobs, err := st.Candidates(ctx, QueueBigArchive, 10, 16<<30, nil); err != nil || len(jobs) != 1 {
 		t.Errorf("candidates %+v, %v: want the big file under a 16 GiB limit", jobs, err)
 	}
 
@@ -91,13 +91,13 @@ func TestQueueClaims(t *testing.T) {
 	if again, err := st.Lease(ctx, got, hour); err != nil || len(again) != 0 {
 		t.Errorf("a second lease of a leased file got %v, %v", again, err)
 	}
-	if jobs, err := st.Candidates(ctx, QueueNew, 10, 0); err != nil || len(jobs) != 0 {
+	if jobs, err := st.Candidates(ctx, QueueNew, 10, 0, nil); err != nil || len(jobs) != 0 {
 		t.Errorf("a leased file is still a candidate: %+v, %v", jobs, err)
 	}
 	if err := st.Release(ctx, got); err != nil {
 		t.Fatal(err)
 	}
-	if jobs, err := st.Candidates(ctx, QueueNew, 10, 0); err != nil || len(jobs) != 1 {
+	if jobs, err := st.Candidates(ctx, QueueNew, 10, 0, nil); err != nil || len(jobs) != 1 {
 		t.Errorf("a released file is not a candidate: %+v, %v", jobs, err)
 	}
 
@@ -110,7 +110,7 @@ func TestQueueClaims(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if jobs, err := st.Candidates(ctx, QueueNew, 10, 0); err != nil || len(jobs) != 0 {
+	if jobs, err := st.Candidates(ctx, QueueNew, 10, 0, nil); err != nil || len(jobs) != 0 {
 		t.Errorf("a stuck file is still a candidate: %+v, %v", jobs, err)
 	}
 	if depths, stuck, err := st.Depths(ctx); err != nil || stuck != 1 || depths[QueueBigArchive] != 1 {
@@ -119,7 +119,7 @@ func TestQueueClaims(t *testing.T) {
 	if ok, err := st.Rescan(ctx, small, time.Now()); err != nil || !ok {
 		t.Fatalf("rescan of a stuck file: %v, %v", ok, err)
 	}
-	if jobs, err := st.Candidates(ctx, QueueRequested, 10, 0); err != nil || len(jobs) != 1 {
+	if jobs, err := st.Candidates(ctx, QueueRequested, 10, 0, nil); err != nil || len(jobs) != 1 {
 		t.Errorf("a requested rescan of a stuck file is not a candidate: %+v, %v", jobs, err)
 	}
 }
@@ -316,4 +316,40 @@ func TestQueueSweepStale(t *testing.T) {
 			t.Errorf("record %+v, %v: want last scanned 19:00", rec, err)
 		}
 	})
+}
+
+// A worker that cannot run some file types must not be shown them: they would
+// fill the n candidates it is offered, queued ahead of everything else, and
+// hide the files behind that it could take. A file whose type is not known yet
+// is still offered.
+func TestCandidatesSkipTypes(t *testing.T) {
+	st := open(t)
+	ctx := t.Context()
+	if _, err := st.pool.Exec(ctx, `INSERT INTO samples (sha256, size_bytes, file_type) VALUES
+		($1, 10, 'pe'), ($2, 10, 'elf'), ($3, 10, 'npm'), ($4, 10, NULL)`,
+		digestOf("exe"), digestOf("so"), digestOf("pkg"), digestOf("untyped")); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"exe", "so", "pkg", "untyped"} {
+		place(ctx, t, st, digestOf(name), "pool/"+name)
+		enqueue(ctx, t, st, QueueNew, digestOf(name))
+	}
+	// Queued first, the native files head the queue.
+	if _, err := st.pool.Exec(ctx, `UPDATE queue SET queued_at = now() - interval '1 day'
+		WHERE sample_id IN (SELECT id FROM samples WHERE file_type IN ('pe', 'elf'))`); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs, err := st.Candidates(ctx, QueueNew, 2, 0, []string{"pe", "elf"})
+	if err != nil || len(jobs) != 2 {
+		t.Fatalf("candidates %+v, %v: want the two files the worker can run", jobs, err)
+	}
+	for _, j := range jobs {
+		if j.FileType == "pe" || j.FileType == "elf" {
+			t.Errorf("offered %s file %s to a worker that cannot run it", j.FileType, j.Path)
+		}
+	}
+	if jobs, err := st.Candidates(ctx, QueueNew, 10, 0, nil); err != nil || len(jobs) != 4 {
+		t.Errorf("candidates %+v, %v: a worker with no limits should be offered all four", jobs, err)
+	}
 }

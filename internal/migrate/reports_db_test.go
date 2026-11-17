@@ -41,7 +41,9 @@ func TestReportRange(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.WithoutCancel(ctx), "DROP SCHEMA "+schema+", "+legacy+" CASCADE")
+		if _, err := pool.Exec(context.WithoutCancel(ctx), "DROP SCHEMA "+schema+", "+legacy+" CASCADE"); err != nil {
+			t.Errorf("drop schemas: %v", err)
+		}
 		pool.Close()
 	})
 	for _, q := range []string{
@@ -61,22 +63,12 @@ func TestReportRange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	enc, err := zstd.NewWriter(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
 	dig := func(name string) []byte { s := sha256.Sum256([]byte(name)); return s[:] }
 	hexed := func(name string) string { return fmt.Sprintf("%x", dig(name)) }
 
 	stub := `{"mol":"Os","risk":4}`
 	full := `{"mol":"Os","risk":2,"traits":[{"crit":2,"id":"t::full"}]}`
-	type sample struct {
-		name   string
-		report string // the stored report; "" for none
-		scan   bool
-		legacy string // the legacy cleave_result, "" for no row
-	}
-	samples := map[int64]sample{
+	samples := map[int64]reportSample{
 		1: {"gem", "", true, `{"v":"4","tv":"60d49","fs":[
 			{"id":0,"sha":"` + hexed("gem") + `","path":"/d/x.gem","type":"gem","sz":900,"x":1,"f":"H2"},
 			{"id":1,"dp":1,"sha":"` + hexed("rb") + `","path":"/d/x.gem!!lib/x.rb","type":"ruby","sz":94,"ts":[{"c":0.9,"d":"d","i":"t::dropper","l":5}]}]}`},
@@ -91,37 +83,7 @@ func TestReportRange(t *testing.T) {
 		7: {"scanned", "", false, `{"v":"7","files":[{"id":0,"sha":"` + hexed("scanned") + `","size":10,"type":"elf","mol":"Os","risk":9}]}`},
 		8: {"sidecar", "", false, `{"v":"7","files":[{"id":2,"pid":0,"rel":"registry","type":"registry","sha":"` + hexed("sidecar") + `","traits":[{"id":"t","crit":2}]}]}`},
 	}
-	noVerdict := map[int64]bool{6: true, 7: true, 8: true}
-	for id, s := range samples {
-		if _, err := pool.Exec(ctx, `INSERT INTO samples (id, sha256, size_bytes, file_type, label) VALUES ($1, $2, 10, 'x', 'bad')`, id, dig(s.name)); err != nil {
-			t.Fatal(err)
-		}
-		if noVerdict[id] {
-			if _, err := pool.Exec(ctx, `INSERT INTO `+legacy+`.samples (id, sha256, cleave_result, traits_version, analyzed_at) VALUES ($1, $2, $3::jsonb, 'legacy1', '2026-05-02 03:04:05+00')`, id, hexed(s.name), s.legacy); err != nil {
-				t.Fatal(err)
-			}
-			continue
-		}
-		var detail, digest []byte
-		if s.report != "" {
-			sum := sha256.Sum256([]byte(s.report))
-			detail, digest = enc.EncodeAll([]byte(s.report), nil), sum[:]
-		}
-		if _, err := pool.Exec(ctx, `INSERT INTO verdicts (sample_id, formed_at, outcome, class, scanner_id, fires_at, ruleset, digest, detail)
-			VALUES ($1, now(), 'ok', 'benign', 1, -1, 'r', $2, $3)`, id, digest, detail); err != nil {
-			t.Fatal(err)
-		}
-		if s.scan {
-			if _, err := pool.Exec(ctx, `INSERT INTO scans (sample_id, scanned_at, ruleset) VALUES ($1, now(), 'r')`, id); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if s.legacy != "" {
-			if _, err := pool.Exec(ctx, `INSERT INTO `+legacy+`.samples (id, sha256, cleave_result) VALUES ($1, $2, $3::jsonb)`, id, hexed(s.name), s.legacy); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
+	seedReportSamples(t, ctx, pool, legacy, samples, map[int64]bool{6: true, 7: true, 8: true})
 	m := &migration{
 		pool: pool, st: st, from: pgx.Identifier{legacy}.Sanitize(), opt: Options{From: legacy, To: schema, Workers: 1, Batch: 100},
 		report: &Report{Took: map[string]time.Duration{}, Failures: map[string]int{}},
@@ -195,5 +157,56 @@ func TestReportRange(t *testing.T) {
 	}
 	if err := m.excerptVerdictRange(ctx, 0, 10); err != nil || m.report.Recovered != 1 {
 		t.Errorf("a second run: recovered %d, %v", m.report.Recovered, err)
+	}
+}
+
+// reportSample is a legacy row, and the verdict already stored for it, that
+// TestReportRange loads. An empty legacy is no legacy row; an empty report is
+// a verdict with none.
+type reportSample struct {
+	name   string
+	report string
+	scan   bool
+	legacy string
+}
+
+// seedReportSamples inserts samples and, where the row was judged, its verdict.
+func seedReportSamples(t *testing.T, ctx context.Context, pool *pgxpool.Pool, legacy string, samples map[int64]reportSample, noVerdict map[int64]bool) {
+	t.Helper()
+	enc, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, s := range samples {
+		sum := sha256.Sum256([]byte(s.name))
+		hexed := fmt.Sprintf("%x", sum[:])
+		if _, err := pool.Exec(ctx, `INSERT INTO samples (id, sha256, size_bytes, file_type, label) VALUES ($1, $2, 10, 'x', 'bad')`, id, sum[:]); err != nil {
+			t.Fatal(err)
+		}
+		if noVerdict[id] {
+			if _, err := pool.Exec(ctx, `INSERT INTO `+legacy+`.samples (id, sha256, cleave_result, traits_version, analyzed_at) VALUES ($1, $2, $3::jsonb, 'legacy1', '2026-05-02 03:04:05+00')`, id, hexed, s.legacy); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		var detail, digest []byte
+		if s.report != "" {
+			reportSum := sha256.Sum256([]byte(s.report))
+			detail, digest = enc.EncodeAll([]byte(s.report), nil), reportSum[:]
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO verdicts (sample_id, formed_at, outcome, class, scanner_id, fires_at, ruleset, digest, detail)
+			VALUES ($1, now(), 'ok', 'benign', 1, -1, 'r', $2, $3)`, id, digest, detail); err != nil {
+			t.Fatal(err)
+		}
+		if s.scan {
+			if _, err := pool.Exec(ctx, `INSERT INTO scans (sample_id, scanned_at, ruleset) VALUES ($1, now(), 'r')`, id); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if s.legacy != "" {
+			if _, err := pool.Exec(ctx, `INSERT INTO `+legacy+`.samples (id, sha256, cleave_result) VALUES ($1, $2, $3::jsonb)`, id, hexed, s.legacy); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 }

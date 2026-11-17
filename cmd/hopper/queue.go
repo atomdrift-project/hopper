@@ -132,11 +132,12 @@ func refillStale(ctx context.Context, st *store.Store, after store.Cursor, befor
 }
 
 // queueLadder is claimLadder for the queue. maxBytes is the worker's per-file
-// cap, applied in the query so files over it never crowd out ones under it.
-func (s *apiServer) queueLadder(slots int, maxBytes int64) []claimTier {
+// cap and skipTypes the file types its tools cannot run; both are applied in
+// the query so files the worker can never take do not crowd out ones it can.
+func (s *apiServer) queueLadder(slots int, maxBytes int64, skipTypes []string) []claimTier {
 	tier := func(name string, p store.Priority) claimTier {
 		return claimTier{name: name, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
-			jobs, err := s.results.Candidates(ctx, p, n, maxBytes)
+			jobs, err := s.results.Candidates(ctx, p, n, maxBytes, skipTypes)
 			out := make([]hopper.ClaimJob, len(jobs))
 			for i, j := range jobs {
 				out[i] = hopper.ClaimJob{
