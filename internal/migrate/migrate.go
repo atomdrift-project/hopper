@@ -8,6 +8,7 @@
 package migrate
 
 import (
+	"cmp"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -37,6 +38,10 @@ type Options struct {
 	To      string // schema the verdict tables are built in; the pool's search_path
 	Workers int    // parallel converters
 	Batch   int64  // legacy ids per range
+	// ExcerptVerdicts also gives a verdict to files that only a legacy excerpt
+	// judged (the excerptverdicts stage). Off, as the plan decided: they wait
+	// for a scan of their own.
+	ExcerptVerdicts bool
 }
 
 // Report counts what a run did. Counts are of this run: a stage skipped as
@@ -52,6 +57,7 @@ type Report struct {
 	Excerpts  int64          // legacy results that were excerpts of another file's scan, not converted
 	Dropped   int64          // excerpts' sample rows that nothing else accounted for
 	Filled    int64          // members given their excerpt's entry as their report
+	Recovered int64          // files given the verdict and report of their legacy excerpt (ExcerptVerdicts)
 	Locations int64          // paths copied
 	Sightings int64          // ledger rows copied
 	Respelled int64          // package subjects whose spelling changed
@@ -100,10 +106,11 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opt Options) (*Report, error) 
 	if err := m.tables(ctx); err != nil {
 		return m.report, err
 	}
-	for _, s := range []struct {
+	type stage struct {
 		run  func(context.Context) error
 		name string
-	}{
+	}
+	stages := []stage{
 		{m.names, "names"},
 		{m.samples, "samples"},
 		{m.convert, "convert"},
@@ -112,8 +119,12 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opt Options) (*Report, error) 
 		{m.carried, "carried"},
 		{m.post, "post"},
 		{m.reports, "reports"},
-		{m.owner, "owner"},
-	} {
+	}
+	if opt.ExcerptVerdicts {
+		stages = append(stages, stage{m.excerptVerdicts, "excerptverdicts"})
+	}
+	stages = append(stages, stage{m.owner, "owner"})
+	for _, s := range stages {
 		done, err := m.kv(ctx, "migrate:"+s.name)
 		if err != nil {
 			return m.report, err
@@ -977,15 +988,22 @@ func (m *migration) post(ctx context.Context) error {
 	return nil
 }
 
-// reports gives each member its legacy excerpt's entry as its report where
-// the report it has is its molecule alone (Store.FillReports). From
-// 2026-06-18 legacy hopper cut each member's entry out of its archive's
-// report, keeping only its molecule there, and stored the entry on the
-// member's own row: the excerpt convert does not convert is the one copy of
-// what the archive's scan found in the member. The candidates are the files
-// atomscan judged that were never scanned on their own (no scans row) and
-// kept a legacy result, whether legacy held them as a member row (parent
+// reports gives a file its legacy report where the one it has is missing, or
+// its molecule alone (Store.FillReports). Two kinds of file lack one.
+//
+// A member, from 2026-06-18: legacy hopper cut each member's entry out of its
+// archive's report, keeping only its molecule there, and stored the entry on
+// the member's own row. The excerpt convert does not convert is the one copy
+// of what the archive's scan found in the member. The candidates are the
+// files atomscan judged that were never scanned on their own (no scans row)
+// and kept a legacy result, whether legacy held them as a member row (parent
 // set) or as a top-level excerpt row: both carry the member's own entry.
+//
+// A scanned file, or a member of one, whose report was in the version 4 to 6
+// shape: convert passed no report on for those, and the archive's members
+// took their lines from the same results. The legacy result is converted
+// again, for its reports alone, and each file in it that has none takes its
+// line (see legacyReports).
 func (m *migration) reports(ctx context.Context) error {
 	return m.ranges(ctx, "reports", "samples", m.reportRange)
 }
@@ -995,39 +1013,59 @@ const atomscanID = 1
 
 // reportRange fills the reports of the candidates among legacy ids (lo, hi].
 func (m *migration) reportRange(ctx context.Context, lo, hi int64) error {
-	rows, err := m.pool.Query(ctx, `SELECT l.id, l.cleave_result::text
+	rows, err := m.pool.Query(ctx, `SELECT l.id, l.sha256, l.cleave_result::text,
+			NOT EXISTS (SELECT 1 FROM scans sc WHERE sc.sample_id = v.sample_id)
 		FROM verdicts v JOIN `+m.from+`.samples l ON l.id = v.sample_id
 		WHERE v.sample_id > $1 AND v.sample_id <= $2 AND v.scanner_id = $3
-		  AND NOT EXISTS (SELECT 1 FROM scans sc WHERE sc.sample_id = v.sample_id)
-		  AND l.cleave_result IS NOT NULL`, lo, hi, atomscanID)
+		  AND l.cleave_result IS NOT NULL
+		  AND (v.detail IS NULL OR NOT EXISTS (SELECT 1 FROM scans sc WHERE sc.sample_id = v.sample_id))`,
+		lo, hi, atomscanID)
 	if err != nil {
 		return fmt.Errorf("reports: %w", err)
 	}
 	reports := map[int64][]byte{}
+	bySHA := map[string][]byte{} // reports of files a scan's result lists, by digest
 	for rows.Next() {
 		var (
-			id  int64
-			raw string
+			id        int64
+			sha, raw  string
+			unscanned bool
 		)
-		if err := rows.Scan(&id, &raw); err != nil {
+		if err := rows.Scan(&id, &sha, &raw, &unscanned); err != nil {
 			rows.Close()
 			return fmt.Errorf("reports: %w", err)
 		}
-		report, err := v7result.ExcerptReport(json.RawMessage(raw))
-		switch {
-		case errors.Is(err, v7result.ErrNotExcerpt):
-		case err != nil:
+		if unscanned {
+			// A member's own entry. A scan's, were it one, is not its report.
+			report, err := v7result.ExcerptReport(json.RawMessage(raw))
+			switch {
+			case errors.Is(err, v7result.ErrNotExcerpt):
+			case err != nil:
+				m.mu.Lock()
+				m.report.Failures["excerpt unreadable as a report"]++
+				m.mu.Unlock()
+			case report != nil:
+				reports[id] = report
+			}
+			continue
+		}
+		lines, err := legacyReports(raw, sha)
+		if err != nil {
 			m.mu.Lock()
-			m.report.Failures["excerpt unreadable as a report"]++
+			m.report.Failures["scan unreadable as reports"]++
 			m.mu.Unlock()
-		case report != nil:
-			reports[id] = report
-		default:
+			continue
+		}
+		for digest, report := range lines {
+			bySHA[digest] = report
 		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("reports: %w", err)
+	}
+	if err := m.reportsOfDigests(ctx, bySHA, reports); err != nil {
+		return err
 	}
 	n, err := m.st.FillReports(ctx, reports)
 	if err != nil {
@@ -1035,6 +1073,131 @@ func (m *migration) reportRange(ctx context.Context, lo, hi int64) error {
 	}
 	m.count(&m.report.Filled, n)
 	return nil
+}
+
+// reportsOfDigests adds to reports, by sample id, the report of each digest
+// in bySHA that names a sample. A file's own excerpt, where it has one, wins:
+// it is that file's entry, where a scan's line for it may be cut down.
+func (m *migration) reportsOfDigests(ctx context.Context, bySHA map[string][]byte, reports map[int64][]byte) error {
+	digests := make([][]byte, 0, len(bySHA))
+	for hexed := range bySHA {
+		if sum, err := hex.DecodeString(hexed); err == nil {
+			digests = append(digests, sum)
+		}
+	}
+	for chunk := range slices.Chunk(digests, 10_000) {
+		rows, err := m.pool.Query(ctx, `SELECT id, sha256 FROM samples WHERE sha256 = ANY ($1)`, chunk)
+		if err != nil {
+			return fmt.Errorf("reports: %w", err)
+		}
+		for rows.Next() {
+			var (
+				id  int64
+				sum []byte
+			)
+			if err := rows.Scan(&id, &sum); err != nil {
+				rows.Close()
+				return fmt.Errorf("reports: %w", err)
+			}
+			if _, has := reports[id]; !has {
+				reports[id] = bySHA[hex.EncodeToString(sum)]
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("reports: %w", err)
+		}
+	}
+	return nil
+}
+
+// excerptVerdicts gives each file that has no atomscan verdict, and whose
+// legacy row is a member's excerpt, the verdict and report that excerpt
+// carries (Store.FillVerdicts). The plan dropped excerpts, leaving such a
+// file to a scan of its own (queued); this keeps the one analysis there is of
+// it until then. The verdict is judged on the excerpt's findings alone, as
+// v7result.ExcerptFile says, and formed at the excerpt's own analysis time,
+// so any scan of the file replaces it. Opt-in: Options.ExcerptVerdicts.
+func (m *migration) excerptVerdicts(ctx context.Context) error {
+	return m.ranges(ctx, "excerptverdicts", "samples", m.excerptVerdictRange)
+}
+
+// excerptVerdictRange recovers the verdicts of the files among legacy ids
+// (lo, hi] that have none.
+func (m *migration) excerptVerdictRange(ctx context.Context, lo, hi int64) error {
+	rows, err := m.pool.Query(ctx, `SELECT l.id, l.cleave_result::text, coalesce(l.traits_version, ''), `+scanTime+`
+		FROM `+m.from+`.samples l
+		WHERE l.id > $1 AND l.id <= $2 AND l.cleave_result IS NOT NULL
+		  AND EXISTS (SELECT 1 FROM samples s WHERE s.id = l.id)
+		  AND NOT EXISTS (SELECT 1 FROM verdicts v WHERE v.sample_id = l.id AND v.scanner_id = $3)`,
+		lo, hi, atomscanID)
+	if err != nil {
+		return fmt.Errorf("excerpt verdicts: %w", err)
+	}
+	var verdicts []store.Verdict
+	for rows.Next() {
+		var (
+			id           int64
+			raw, ruleset string
+			at           time.Time
+		)
+		if err := rows.Scan(&id, &raw, &ruleset, &at); err != nil {
+			rows.Close()
+			return fmt.Errorf("excerpt verdicts: %w", err)
+		}
+		f, err := v7result.ExcerptFile(json.RawMessage(raw), hopper.CriticalLevel)
+		switch {
+		case errors.Is(err, v7result.ErrNotExcerpt), err == nil && f == nil:
+		case err != nil:
+			m.mu.Lock()
+			m.report.Failures["excerpt unreadable as a verdict"]++
+			m.mu.Unlock()
+		default:
+			verdicts = append(verdicts, store.Verdict{
+				ID: id, At: at.UTC(), Opinion: f.Verdict, Ruleset: cmp.Or(rulesetOf(raw), ruleset), Report: f.ReportLine,
+			})
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("excerpt verdicts: %w", err)
+	}
+	n, err := m.st.FillVerdicts(ctx, verdicts)
+	if err != nil {
+		return fmt.Errorf("excerpt verdicts: %w", err)
+	}
+	m.count(&m.report.Recovered, n)
+	return nil
+}
+
+// rulesetOf is the traits version a legacy report names itself ("rev", or
+// "tv" before version 7), as v7result.Convert reads it; empty if none.
+func rulesetOf(raw string) string {
+	var top struct {
+		Rev string `json:"rev"`
+		TV  string `json:"tv"`
+	}
+	_ = json.Unmarshal([]byte(raw), &top)
+	return cmp.Or(top.Rev, top.TV)
+}
+
+// legacyReports converts the legacy result of a scanned file as convert does,
+// and returns the report of each file in it that has one, by digest (hex): the
+// scanned file's and its members'. A result that is an excerpt, or has no
+// reports, returns none.
+func legacyReports(raw, sha string) (map[string][]byte, error) {
+	r := legacyResult{raw: &raw, sha256: sha, at: time.Now()}
+	files, excerpt, err := r.files()
+	if err != nil || excerpt {
+		return nil, err
+	}
+	lines := make(map[string][]byte, len(files))
+	for _, f := range files {
+		if len(f.ReportLine) > 0 {
+			lines[hex.EncodeToString(f.SHA256)] = f.ReportLine
+		}
+	}
+	return lines, nil
 }
 
 // owner gives the new schema, and every table, type and function in it, to

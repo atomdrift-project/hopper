@@ -35,6 +35,7 @@ func cmdMigrate(ctx context.Context) error {
 	workers := f.Int("workers", runtime.NumCPU()/2, "parallel converters")
 	batch := f.Int64("batch", 50_000, "legacy sample ids per range")
 	production := f.Bool("production", false, "allow the production database (hopper-db)")
+	excerptVerdicts := f.Bool("excerpt-verdicts", false, "also give the files only a legacy excerpt judged that excerpt's verdict and report")
 	verify := f.Bool("verify", false, "only check a finished migration; write nothing")
 	maintMem := f.String("maintenance-mem", "4GB", "maintenance_work_mem for the index builds")
 	maintWorkers := f.Int("maintenance-workers", 8, "max_parallel_maintenance_workers for the index builds")
@@ -65,7 +66,7 @@ func cmdMigrate(ctx context.Context) error {
 		return fmt.Errorf("migrate: %w", err)
 	}
 	defer pool.Close()
-	opt := migrate.Options{From: *from, To: *to, Workers: *workers, Batch: *batch}
+	opt := migrate.Options{From: *from, To: *to, Workers: *workers, Batch: *batch, ExcerptVerdicts: *excerptVerdicts}
 	if *verify {
 		checks, err := migrate.Verify(ctx, pool, opt)
 		failed := 0

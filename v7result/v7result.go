@@ -12,8 +12,9 @@
 // report into contents and refs. Versions 4 to 6 list the files under "fs"
 // with shorter keys (sz for size, dp for depth, ts for the traits, each
 // {i: id, l: criticality}); their files, placements and verdicts convert the
-// same way, but their reports are left out rather than passed on in a shape
-// no version 8 reader knows. Version 7 reports written before cleave's v8
+// same way, and their reports are passed on as written, minus placement, in
+// those short keys (cleave's metrics "ms", strings "ss", findings "ts", ...).
+// Version 7 reports written before cleave's v8
 // format spell the findings "find" and the identity "idn"; both are read as
 // their later names, and those reports are passed on as they were written. A
 // report with no file list at all is judged as the scanned file alone.
@@ -99,40 +100,74 @@ func clip(s string, n int) string {
 	return s[:n]
 }
 
-// excerpt reports whether a report's first file entry, under files (or fs
-// where there is no files), names a parent (Converted.Excerpt). Only that
-// entry is decoded.
-func excerpt(top map[string]json.RawMessage) bool {
+// firstEntry is a report's first file entry, under files (or fs where there
+// is no files); only that entry is decoded. Nil when there is none.
+func firstEntry(top map[string]json.RawMessage) map[string]json.RawMessage {
 	list, ok := top["files"]
 	if !ok {
 		list = top["fs"]
 	}
 	dec := json.NewDecoder(bytes.NewReader(list))
 	if t, err := dec.Token(); err != nil || t != json.Delim('[') || !dec.More() {
-		return false
+		return nil
 	}
 	var first map[string]json.RawMessage
 	if dec.Decode(&first) != nil {
+		return nil
+	}
+	return first
+}
+
+// excerpt reports whether a report's first file entry names a parent
+// (Converted.Excerpt).
+func excerpt(top map[string]json.RawMessage) bool {
+	_, has := firstEntry(top)["pid"]
+	return has
+}
+
+// nested reports whether a report's first file entry sits below the root
+// of what was scanned: its depth ("depth", or "dp" before version 7) is above
+// zero.
+func nested(first map[string]json.RawMessage) bool {
+	for _, key := range []string{"depth", "dp"} {
+		var d int
+		if json.Unmarshal(first[key], &d) == nil && d > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// memberLine reports whether a legacy report is a member's entry cut out of
+// an archive's: its first entry names a parent, or sits below the root
+// though it names none. Legacy hopper's excerpts of the second kind carry a
+// depth of 1 to 3 and a path through the archive ("a.tgz!!b/c"), and no pid.
+// Only a row hopper never scanned on its own can be asked: a scan of a file
+// has depth 0, and so has a member legacy analyzed alone.
+func memberLine(top map[string]json.RawMessage) bool {
+	first := firstEntry(top)
+	if first == nil {
 		return false
 	}
-	_, has := first["pid"]
-	return has
+	_, pid := first["pid"]
+	return pid || nested(first)
 }
 
 // ExcerptReport returns the version 8 report of the file a legacy excerpt
 // (Converted.Excerpt) describes: its entry rebuilt as Convert builds a
 // member's report from its archive's, except that a source in another file of
 // that archive is dropped, since the excerpt does not say which file it was.
-// Nil for a registry sidecar, which is provenance, and for an entry in the
-// version 4 to 6 shape: Convert gives neither a report. The migration gives it to members whose stored report is their
-// molecule alone, which is all an archive's report kept of them once legacy
-// hopper had cut their entries out.
+// Nil for a registry sidecar, which is provenance. The migration gives it to
+// members whose stored report is their molecule alone, which is all an
+// archive's report kept of them once legacy hopper had cut their entries out.
+// A member line is an entry naming a parent or nested below the root
+// (memberLine); a scan's report is not one (ErrNotExcerpt).
 func ExcerptReport(raw json.RawMessage) ([]byte, error) {
 	top := map[string]json.RawMessage{}
 	if err := json.Unmarshal(raw, &top); err != nil {
 		return nil, fmt.Errorf("v7result: raw: %w", err)
 	}
-	if !excerpt(top) {
+	if !memberLine(top) {
 		return nil, ErrNotExcerpt
 	}
 	entries, err := decodeEntries(top)
@@ -148,6 +183,48 @@ func ExcerptReport(raw json.RawMessage) ([]byte, error) {
 		c.shas[*e.ID] = e.SHA // its own sources stay, citing nothing
 	}
 	return c.report(e)
+}
+
+// ExcerptFile returns the file line of the file a legacy member line
+// (memberLine) describes, for a file no scan has judged: its report, as
+// ExcerptReport builds it, and its verdict, judged as Convert judges a member
+// the machine-learning model did not cover: on its findings alone, the trait
+// floor's reading standing as the class, and no level measured (fires_at
+// unset). The line carries no scan stamp; the caller dates it. Nil for a
+// registry sidecar, which is provenance; ErrNotExcerpt for a scan's report.
+func ExcerptFile(raw json.RawMessage, level int) (*scanresult.File, error) {
+	top := map[string]json.RawMessage{}
+	if err := json.Unmarshal(raw, &top); err != nil {
+		return nil, fmt.Errorf("v7result: raw: %w", err)
+	}
+	if !memberLine(top) {
+		return nil, ErrNotExcerpt
+	}
+	entries, err := decodeEntries(top)
+	if err != nil {
+		return nil, err
+	}
+	e := entries[0]
+	if e.Rel == "registry" || e.Type == "registry" {
+		return nil, nil
+	}
+	c := &converter{
+		out:   &Converted{Omitted: map[string]int{}},
+		index: map[string]int{}, members: map[int][]member{}, shas: map[int64]string{}, level: level,
+	}
+	if e.ID != nil {
+		c.shas[*e.ID] = e.SHA
+	}
+	i, err := c.file(e.SHA, e.Size, e.Type)
+	if err != nil {
+		return nil, err
+	}
+	report, err := c.report(e)
+	if err != nil {
+		return nil, err
+	}
+	c.judge(i, nil, nil, nil, e.Traits, report)
+	return &c.out.Files[i], nil
 }
 
 // ErrNotExcerpt is ExcerptReport's answer to a report that is a scan.
@@ -189,7 +266,7 @@ type entry struct {
 // ident are on the file line, and the rest say where the file sat, which would
 // make the same bytes report differently from every archive that holds them.
 // It is PLACEMENT_KEYS in scan's src/engine/v8.rs, with version 7's "idn".
-var placement = []string{"id", "pid", "depth", "dp", "path", "rel", "via", "role", "sha", "size", "type", "ident", "idn"}
+var placement = []string{"id", "pid", "depth", "dp", "path", "rel", "via", "role", "sha", "size", "sz", "type", "ident", "idn"}
 
 type trait struct {
 	ID string `json:"id"`
@@ -671,13 +748,10 @@ func (c *converter) judge(i int, root *ml, mf *mlFile, in *llm, traits []trait, 
 // one: the entry without placement and without the dependency verdicts pinned
 // onto it, each source in another file cited by that file's sha256 and a
 // source in this file by nothing, a source naming no file dropped, and keys
-// sorted at every level. Numbers keep their text. A version 4 to 6 entry has
-// none (see the package comment).
+// sorted at every level. Numbers keep their text. A version 4 to 6 entry's
+// is its content as written, in the short keys, less placement (see the
+// package comment).
 func (c *converter) report(e *entry) ([]byte, error) {
-	if e.old {
-		c.out.Omitted["report in the version 4 to 6 shape"]++
-		return nil, nil
-	}
 	d := json.NewDecoder(bytes.NewReader(e.raw))
 	d.UseNumber()
 	var obj map[string]any
@@ -686,6 +760,11 @@ func (c *converter) report(e *entry) ([]byte, error) {
 	}
 	for _, key := range placement {
 		delete(obj, key)
+	}
+	if e.old {
+		// Versions 4 to 6 spell their findings "ts" and cite no other file
+		// by id: nothing to rewrite, only placement to take out.
+		return encodeReport(obj, e.SHA)
 	}
 	if traits, ok := obj["traits"].([]any); ok {
 		traits = slices.DeleteFunc(traits, func(t any) bool {
@@ -713,11 +792,17 @@ func (c *converter) report(e *entry) ([]byte, error) {
 			c.cite(declared, e.SHA)
 		}
 	}
+	return encodeReport(obj, e.SHA)
+}
+
+// encodeReport is obj as scan writes a report line: keys sorted, HTML left
+// unescaped.
+func encodeReport(obj map[string]any, sha string) ([]byte, error) {
 	var b bytes.Buffer
 	enc := json.NewEncoder(&b)
-	enc.SetEscapeHTML(false) // as scan writes it
+	enc.SetEscapeHTML(false)
 	if err := enc.Encode(obj); err != nil {
-		return nil, fmt.Errorf("v7result: report of %s: %w", e.SHA, err)
+		return nil, fmt.Errorf("v7result: report of %s: %w", sha, err)
 	}
 	return bytes.TrimSuffix(b.Bytes(), []byte("\n")), nil
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -167,20 +168,28 @@ func TestConvert(t *testing.T) {
 }
 
 // The oldest reports use another schema. Their verdict and jurors are
-// converted; the report is left out rather than passed on in a shape no
-// version 8 reader knows.
+// converted, and the report is passed on as written in its short keys, less
+// placement.
 func TestConvertOldestReport(t *testing.T) {
 	sha := digest("old")
 	got, err := Convert(&Result{
 		At: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), SHA256: sha, Worker: "w1",
-		ML:  json.RawMessage(`{"prob":0.1,"lvl":-1}`),
-		Raw: json.RawMessage(`{"v":"5","fs":[{"id":0,"sz":10,"sha":"` + sha + `","path":"x","type":"unknown"}],"tv":"60d49"}`),
+		ML: json.RawMessage(`{"prob":0.1,"lvl":-1}`),
+		Raw: json.RawMessage(`{"v":"5","fs":[{"id":0,"sz":10,"dp":0,"sha":"` + sha + `","path":"x","type":"unknown",
+			"f":"H2","ms":{"file":{"size":10.0}},"ts":[{"c":0.9,"d":"a finding","i":"t::x","l":2}]}],"tv":"60d49"}`),
 	}, level)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Files) != 1 || got.Files[0].Report != nil || got.Files[0].ReportLine != nil || got.Omitted["report in the version 4 to 6 shape"] != 1 {
-		t.Fatalf("files %+v, omitted %v; want one file with no report", got.Files, got.Omitted)
+	if len(got.Files) != 1 || got.Files[0].Report == nil || got.Files[0].ReportLine == nil {
+		t.Fatalf("files %+v; want one file with a report", got.Files)
+	}
+	want := `{"f":"H2","ms":{"file":{"size":10.0}},"ts":[{"c":0.9,"d":"a finding","i":"t::x","l":2}]}`
+	if string(got.Files[0].ReportLine) != want {
+		t.Errorf("report %s, want %s", got.Files[0].ReportLine, want)
+	}
+	if err := scanresult.Check(got.Files); err != nil {
+		t.Errorf("the converted result does not pass the version 8 checks: %v", err)
 	}
 	if !strings.Contains(string(got.Files[0].Verdict), `"class":"benign"`) || got.Files[0].Jurors["ml"] == nil {
 		t.Errorf("verdict %s, jurors %v", got.Files[0].Verdict, got.Files[0].Jurors)
@@ -189,7 +198,8 @@ func TestConvertOldestReport(t *testing.T) {
 
 // A version 4 archive, shaped as production holds them (a gem with its
 // checksums and data tarball): its files, sizes and placements convert, and
-// a member's own traits judge it, though no report is passed on.
+// a member's own traits judge it, and each file's report is passed on as
+// written, less placement.
 func TestConvertVersion4Archive(t *testing.T) {
 	sha := map[string]string{}
 	for _, n := range []string{"gem", "checksums", "data", "script"} {
@@ -245,9 +255,22 @@ func TestConvertVersion4Archive(t *testing.T) {
 		t.Errorf("script verdict %s: want hostile on its crit 5 dropper finding", v)
 	}
 	for i, f := range got.Files {
-		if f.Report != nil || f.ReportLine != nil {
-			t.Errorf("file %d carries a report in the version 4 shape", i)
+		if f.Report == nil || f.ReportLine == nil {
+			t.Errorf("file %d has no report", i)
+			continue
 		}
+		var line map[string]json.RawMessage
+		if err := json.Unmarshal(f.ReportLine, &line); err != nil {
+			t.Errorf("file %d: report %s: %v", i, f.ReportLine, err)
+		}
+		for _, k := range placement {
+			if _, has := line[k]; has {
+				t.Errorf("file %d: report keeps placement key %q: %s", i, k, f.ReportLine)
+			}
+		}
+	}
+	if line := string(script.ReportLine); !strings.Contains(line, `"ss":[[8,"spec_helper"]]`) || !strings.Contains(line, `"ts":[`) {
+		t.Errorf("script report %s lost its strings or findings", line)
 	}
 }
 
@@ -589,8 +612,83 @@ func TestExcerptReport(t *testing.T) {
 	if err != nil || sidecar != nil {
 		t.Errorf("a registry sidecar: %s %v, want no report: it is provenance", sidecar, err)
 	}
-	old, err := ExcerptReport(json.RawMessage(`{"v":"5","fs":[{"id":1,"pid":0,"sha":"` + sha + `","ts":[{"i":"t","l":4}]}]}`))
-	if err != nil || old != nil {
-		t.Errorf("a version 5 excerpt: %s %v, want no report, as a member of such a report gets", old, err)
+	old, err := ExcerptReport(json.RawMessage(`{"v":"5","fs":[{"id":1,"pid":0,"sz":9,"dp":1,"sha":"` + sha + `","ts":[{"i":"t","l":4}]}]}`))
+	if want := `{"ts":[{"i":"t","l":4}]}`; err != nil || string(old) != want {
+		t.Errorf("a version 5 excerpt: %s %v, want %s", old, err, want)
+	}
+}
+
+// Legacy excerpts of members whose parent was not kept have a depth above
+// zero and no pid. They are member lines all the same; a scan, at depth 0,
+// is not, with or without a depth key.
+func TestExcerptReportWithoutPid(t *testing.T) {
+	sha := strings.Repeat("ab", 32)
+	for _, raw := range []string{
+		`{"v":"7","files":[{"id":7429,"depth":2,"path":"a.tgz!!b.zst!!c.ko","sha":"` + sha + `","size":10,"type":"elf","mol":"Os","risk":4,"traits":[{"id":"t","crit":2}]}]}`,
+		`{"v":"5","fs":[{"id":7,"dp":1,"path":"a.gem!!c.rb","sha":"` + sha + `","sz":10,"type":"ruby","ts":[{"i":"t","l":2}]}]}`,
+	} {
+		report, err := ExcerptReport(json.RawMessage(raw))
+		if err != nil || len(report) == 0 {
+			t.Errorf("%s: report %s, %v; want the member's report", raw, report, err)
+			continue
+		}
+		var line map[string]json.RawMessage
+		if err := json.Unmarshal(report, &line); err != nil {
+			t.Errorf("%s: report %s: %v", raw, report, err)
+		}
+		for _, k := range placement {
+			if _, has := line[k]; has {
+				t.Errorf("%s: report %s keeps placement key %q", raw, report, k)
+			}
+		}
+	}
+	for _, raw := range []string{
+		`{"v":"7","files":[{"id":0,"depth":0,"sha":"` + sha + `","traits":[{"id":"t","crit":2}]}]}`,
+		`{"v":"7","files":[{"id":0,"sha":"` + sha + `","traits":[{"id":"t","crit":2}]}]}`,
+		`{"v":"5","fs":[{"id":0,"dp":0,"sha":"` + sha + `","ts":[{"i":"t","l":2}]}]}`,
+		`{"v":"7","files":[]}`,
+	} {
+		if report, err := ExcerptReport(json.RawMessage(raw)); !errors.Is(err, ErrNotExcerpt) {
+			t.Errorf("%s: %s, %v; want ErrNotExcerpt", raw, report, err)
+		}
+	}
+	// Convert still takes a top-level row for a scan unless it names a parent:
+	// the member rows the migration backfills are not its to convert.
+	got, err := Convert(&Result{SHA256: sha, Worker: "w1", Raw: json.RawMessage(
+		`{"v":"7","files":[{"id":7429,"depth":2,"path":"a.tgz!!c.ko","sha":"` + sha + `","size":10,"type":"elf"}]}`)}, level)
+	if err == nil && got.Excerpt {
+		t.Error("Convert called a depth 2 entry with no pid an excerpt; only a named parent does")
+	}
+}
+
+// A member line with no scan to judge it is judged on its findings alone: a
+// hostile floor (one finding at crit 5) convicts it, no level is measured,
+// and the report is its entry less placement. A member with nothing of note
+// is benign; a scan's report, and a sidecar, give none.
+func TestExcerptFile(t *testing.T) {
+	sha := strings.Repeat("cd", 32)
+	hostile, err := ExcerptFile(json.RawMessage(`{"v":"7","files":[{"id":9,"depth":2,"path":"a.tgz!!x.js","sha":"`+sha+`","size":10,"type":"javascript",
+		"mol":"Os","risk":9,"traits":[{"id":"objectives::dropper","crit":5,"desc":"d"}]}]}`), level)
+	if err != nil || hostile == nil {
+		t.Fatalf("hostile member: %v, %v", hostile, err)
+	}
+	if v := string(hostile.Verdict); !strings.Contains(v, `"class":"hostile"`) || strings.Contains(v, "fires_at") {
+		t.Errorf("verdict %s, want hostile with no level measured", hostile.Verdict)
+	}
+	if hostile.Size != 10 || hostile.Type != "javascript" || hex.EncodeToString(hostile.SHA256) != sha {
+		t.Errorf("file %+v", hostile)
+	}
+	if want := `{"mol":"Os","risk":9,"traits":[{"crit":5,"desc":"d","id":"objectives::dropper"}]}`; string(hostile.ReportLine) != want {
+		t.Errorf("report %s, want %s", hostile.ReportLine, want)
+	}
+	quiet, err := ExcerptFile(json.RawMessage(`{"v":"5","fs":[{"id":3,"dp":1,"path":"a.gem!!b","sha":"`+sha+`","sz":4,"type":"ruby","ts":[{"i":"t::x","l":1}]}]}`), level)
+	if err != nil || quiet == nil || !strings.Contains(string(quiet.Verdict), `"class":"benign"`) {
+		t.Errorf("quiet member: %+v, %v", quiet, err)
+	}
+	if _, err := ExcerptFile(json.RawMessage(`{"v":"7","files":[{"id":0,"sha":"`+sha+`"}]}`), level); !errors.Is(err, ErrNotExcerpt) {
+		t.Errorf("a scan: %v, want ErrNotExcerpt", err)
+	}
+	if f, err := ExcerptFile(json.RawMessage(`{"v":"7","files":[{"id":2,"pid":0,"rel":"registry","type":"registry","sha":"`+sha+`"}]}`), level); f != nil || err != nil {
+		t.Errorf("a sidecar: %v, %v", f, err)
 	}
 }

@@ -625,6 +625,41 @@ then 32.
   The same build also reads version 4 to 6 reports' file lists (`fs`),
   which galadriel's build did not: about 22% of results, whose members
   had no verdicts.
+- **Reports the first full run left out (found 2026-11-16 by collimator's
+  training read, fixed in the `reports` stage).** Two gaps, together about a
+  third of the labeled samples collimator trained on before the migration
+  (2.6M samples have a verdict and no report; many more members hold a stub):
+  - Version 4 to 6 results converted their files, verdicts and placements but
+    passed on no report, so a scanned file, and every member taking its line
+    from the same result, had a verdict with no `detail`. Those reports are now
+    passed on as written, minus placement (`id`, `dp`, `sz`, `sha`, `path`,
+    `type`), in their short keys. Scanned between 2026-04 and 2026-06-09 for
+    the most part. collimator's `features.py` reads the short keys.
+  - The member backfill took an excerpt for a member's only when its first entry
+    named a parent (`pid`). Legacy also cut member lines with a depth of 1 to 3,
+    a path through the archive (`a.tgz!!b/c`) and no `pid`: 22% of the
+    training rows of a frozen 2026-10-23 corpus, 32% of its ELF. They kept the
+    molecule-only stub their archive's line left. `ExcerptReport` now also
+    takes a first entry nested below the root (`depth`/`dp` above 0); a scan,
+    at depth 0, is still not one. `Convert` is unchanged: only the backfill
+    reads this wider test, and only for rows never scanned on their own.
+  The `reports` stage covers both (`reportRange`), reading the legacy rows
+  again; it only fills a `detail` that is missing or a molecule alone, so it is
+  safe to re-run: delete `migrate:reports` and `migrate:reports:through` from
+  `hopper_kv` and run the migration again against the legacy schema.
+  `TestReportRange`, `TestLegacyReports*`, `TestExcerptReportWithoutPid`.
+  - **Optional, `--excerpt-verdicts`:** files that only a legacy excerpt
+    judged have no verdict at all (about 10% of the legacy ELF training rows,
+    11% of a 20,000-row sample of the frozen corpus), so nothing is there to
+    fill. The plan decided on 2026-11-13 to leave them to a scan of their own;
+    this stage keeps the one analysis there is until that scan. It stores
+    atomscan's verdict and report for each (`Store.FillVerdicts`): judged on the
+    excerpt's findings alone, as `Convert` judges a member the model did not
+    cover (the trait floor's class; `fires_at` unset), formed at the excerpt's
+    own analysis time under the ruleset it names, with no scans row. It never
+    replaces a verdict, and a scan of the file replaces it. Off by default; run
+    it with `migrate --excerpt-verdicts` (kv keys `migrate:excerptverdicts` and
+    `:through`). `ExcerptFile`, `TestFillVerdicts`, `TestReportRange`.
 - **`--verify` at full size:** two checks would not have finished. The
   excerpt test was `IN (SELECT id FROM verify_excerpts)`: 46 million ids do
   not hash in `work_mem`, so the list was searched again for each of 311

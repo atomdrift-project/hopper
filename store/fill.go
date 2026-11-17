@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"time"
 )
 
 // FillReports stores reports, by sample id, for files atomscan judged whose
@@ -107,4 +108,57 @@ func underMolecule(old, report []byte) ([]byte, bool) {
 		return nil, false
 	}
 	return bytes.TrimSuffix(b.Bytes(), []byte("\n")), true
+}
+
+// Verdict is atomscan's opinion of a file nothing has judged, as the migration
+// recovers it from a legacy excerpt (FillVerdicts).
+type Verdict struct {
+	At      time.Time       // when the opinion was formed
+	Opinion json.RawMessage // atomscan's object: outcome, class, fires_at, the strongest findings
+	Ruleset string
+	Report  []byte // the report line, or nil
+	ID      int64  // the sample
+}
+
+// FillVerdicts stores atomscan's verdict, and report, for files that have
+// none: the opinion of a file legacy hopper analyzed as a member and no scan
+// has judged since. A file that already has an atomscan verdict keeps it,
+// whatever its age, and a sample that does not exist takes none. The scan
+// that does judge the file later replaces what is stored here, which is
+// formed at the excerpt's time. It returns how many it stored. No scans row
+// is written: the file has not been scanned on its own.
+func (st *Store) FillVerdicts(ctx context.Context, verdicts []Verdict) (int64, error) {
+	if len(verdicts) == 0 {
+		return 0, nil
+	}
+	var (
+		ids              []int64
+		opinions         []string
+		rulesets         []string
+		times            []time.Time
+		digests, details [][]byte
+	)
+	for _, v := range verdicts {
+		ids, opinions, rulesets, times = append(ids, v.ID), append(opinions, string(v.Opinion)), append(rulesets, v.Ruleset), append(times, v.At)
+		if len(v.Report) == 0 {
+			digests, details = append(digests, nil), append(details, nil)
+			continue
+		}
+		sum := sha256.Sum256(v.Report)
+		digests, details = append(digests, sum[:]), append(details, st.enc.EncodeAll(v.Report, nil))
+	}
+	tag, err := st.pool.Exec(ctx, `INSERT INTO verdicts
+			(sample_id, formed_at, outcome, class, scanner_id, fires_at, ruleset, digest, summary, detail)
+		SELECT u.sample_id, u.at, coalesce((u.opinion->>'outcome')::outcome, 'ok'), (u.opinion->>'class')::class, $1,
+		       (u.opinion->>'fires_at')::smallint, u.ruleset, u.digest, u.opinion - 'outcome' - 'class' - 'fires_at', u.detail
+		FROM unnest($2::bigint[], $3::jsonb[], $4::text[], $5::timestamptz[], $6::bytea[], $7::bytea[])
+		    AS u (sample_id, opinion, ruleset, at, digest, detail)
+		WHERE EXISTS (SELECT 1 FROM samples s WHERE s.id = u.sample_id)
+		ORDER BY u.sample_id
+		ON CONFLICT (sample_id, scanner_id) DO NOTHING`,
+		atomscan, ids, opinions, rulesets, times, digests, details)
+	if err != nil {
+		return 0, fmt.Errorf("store: fill verdicts: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
