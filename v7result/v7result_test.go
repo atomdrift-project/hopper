@@ -567,14 +567,20 @@ func TestConvertClipsInterpretation(t *testing.T) {
 // A legacy excerpt (a member's line cut out of an archive's report and
 // stored on the member's row) is told apart from a scan by its first entry
 // naming a parent, under files or, in older reports, fs. A pid that is null
-// still names one, as the migration's SQL test (`? 'pid'`) read it.
+// still names one, as the migration's SQL test (`? 'pid'`) read it. A depth
+// and no pid is not one: Convert leaves that row as a scan. ExcerptReport
+// takes it as a member line (legacy wrote many of those, about 8.5% of
+// member rows sampled in production).
 func TestConvertTellsExcerpts(t *testing.T) {
 	sha := strings.Repeat("ab", 32)
 	for raw, want := range map[string]bool{
 		`{"files":[{"id":7,"pid":3,"depth":2,"sha":"` + sha + `"}]}`:          true,
 		`{"files":[{"id":7,"pid":null,"sha":"` + sha + `"}]}`:                 true,
 		`{"fs":[{"id":7,"pid":3,"sha":"` + sha + `"}]}`:                       true,
+		`{"files":[{"id":7,"depth":2,"sha":"` + sha + `"}]}`:                  false,
+		`{"fs":[{"id":7,"dp":1,"sha":"` + sha + `"}]}`:                        false,
 		`{"files":[{"id":0,"depth":0,"sha":"` + sha + `","type":""}]}`:        false,
+		`{"files":[{"id":0,"depth":null,"sha":"` + sha + `"}]}`:               false,
 		`{"files":[{"id":0,"sha":"` + sha + `"},{"id":1,"pid":0,"sha":"x"}]}`: false,
 		`{"files":[]}`: false,
 	} {
@@ -607,6 +613,13 @@ func TestExcerptReport(t *testing.T) {
 	}
 	if _, err := ExcerptReport(json.RawMessage(`{"v":"7","files":[{"id":0,"sha":"` + sha + `"}]}`)); err == nil {
 		t.Error("a scan's report is not an excerpt")
+	}
+	// Shaped like legacy row 2628445540: a kernel module two archives deep,
+	// with no pid. Its entry is the member's whole report, not a stub.
+	deep, err := ExcerptReport(json.RawMessage(`{"v":"7","files":[{"id":4,"depth":2,"path":"a.pkg.tar.zst!!lm85.ko.zst!!lm85.ko","sha":"` + sha + `",
+		"type":"elf","mol":"Os","facts":{"elf.class":64},"traits":[{"id":"t","crit":3}]}]}`))
+	if want := `{"facts":{"elf.class":64},"mol":"Os","traits":[{"crit":3,"id":"t"}]}`; err != nil || string(deep) != want {
+		t.Errorf("a member with a depth and no pid: %s %v, want %s", deep, err, want)
 	}
 	sidecar, err := ExcerptReport(json.RawMessage(`{"v":"7","files":[{"id":2,"pid":0,"rel":"registry","type":"registry","sha":"` + sha + `","traits":[{"id":"t","crit":2}]}]}`))
 	if err != nil || sidecar != nil {
