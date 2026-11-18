@@ -111,7 +111,15 @@ const (
 func (st *Store) write(ctx context.Context, files []scanresult.File) (Stats, error) {
 	w := &writer{files: files, enc: st.enc, keepOrphans: st.KeepOrphans}
 	w.stats.Files = len(files)
-	err := pgx.BeginFunc(ctx, st.pool, func(tx pgx.Tx) error {
+	start := time.Now()
+	conn, err := st.pool.Acquire(ctx)
+	recordWritePhase(ctx, "acquire", time.Since(start), err)
+	if err != nil {
+		return Stats{}, fmt.Errorf("store: write: %w", err)
+	}
+	defer conn.Release()
+	start = time.Now()
+	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
 		w.tx = tx
 		if err := w.samples(ctx); err != nil {
 			return err
@@ -132,6 +140,7 @@ func (st *Store) write(ctx context.Context, files []scanresult.File) (Stats, err
 		}
 		return nil
 	})
+	recordWritePhase(ctx, "transaction", time.Since(start), err)
 	if err != nil {
 		return Stats{}, fmt.Errorf("store: write: %w", err)
 	}

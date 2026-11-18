@@ -48,6 +48,7 @@ SERVICE_USER=hopper
 HOPPER_BIN=/usr/local/bin/hopper
 CLEAVE_BIN=/usr/local/bin/cleave
 POSTDOC_BIN=/usr/local/bin/postdoc
+POSTDOC_LAUNCHER=/usr/local/sbin/hopper-postdoc
 HOPPER_RCD=/usr/local/etc/rc.d/hopper
 HEAL_PERMS_BIN=/usr/local/sbin/hopper-heal-perms
 HEAL_PERMS_PERIODIC=/usr/local/etc/periodic/daily/480.hopper-heal-perms
@@ -218,6 +219,7 @@ install_if_changed() {
 install_if_changed ./hopper "$HOPPER_BIN" "Hopper binary"
 install_if_changed "$CLEAVE_DIR/out/cleave" "$CLEAVE_BIN" "cleave binary"
 install_if_changed "$POSTDOC_DIR/target/release/postdoc" "$POSTDOC_BIN" "postdoc binary"
+install_if_changed scripts/master/postdoc-cpuset.sh "$POSTDOC_LAUNCHER" "Postdoc launcher"
 
 # A full corpus walk must not hold up Hopper readiness. Install the shared-tree
 # healer as a daily periodic task instead; it repairs drift from manual moves,
@@ -313,6 +315,11 @@ load_rc_config \$name
 : \${hopper_bind:="$DASH_ADDR"}
 : \${hopper_logfile:="/var/log/hopper.log"}
 : \${hopper_required_mounts:="$REQUIRED_MOUNTS"}
+# Optional FreeBSD cpuset CPU list for the local Postdoc process tree.
+: \${hopper_postdoc_cpus:=""}
+# Empty keeps the Hopper binary's defaults.
+: \${hopper_result_slots:=""}
+: \${hopper_store_max_conns:=""}
 
 mount_args=""
 old_ifs=\$IFS
@@ -331,7 +338,7 @@ command="/usr/sbin/daemon"
 # renames the file while daemon keeps writing to the now-unlinked inode: the
 # rotated copies look correct, the disk never frees, and the log grows without
 # bound (this is how hopper.log reached 4.7G).
-command_args="-c -f -r -H -R 10 -P \${pidfile} -o \${hopper_logfile} -u hopper /usr/bin/env HOME=/home/hopper DATABASE_URL=\${hopper_db} POSTDOC_SCANNERS=$SCANNERS $HOPPER_BIN load --data \${hopper_data} --db \${hopper_db} --source \${hopper_source} --api-addr \${hopper_api_bind} --dashboard-addr \${hopper_bind}$token_arg --postdoc $POSTDOC_BIN$llm_arg --cleave $CLEAVE_BIN\${mount_args}$dataset_arg"
+command_args="-c -f -r -H -R 10 -P \${pidfile} -o \${hopper_logfile} -u hopper /usr/bin/env HOME=/home/hopper DATABASE_URL=\${hopper_db} POSTDOC_SCANNERS=$SCANNERS HOPPER_POSTDOC_CPUS=\${hopper_postdoc_cpus} $HOPPER_BIN load --data \${hopper_data} --db \${hopper_db} --source \${hopper_source} --api-addr \${hopper_api_bind} --dashboard-addr \${hopper_bind}$token_arg --postdoc $POSTDOC_LAUNCHER$llm_arg --cleave $CLEAVE_BIN\${mount_args}$dataset_arg \${hopper_result_slots:+--result-slots=\$hopper_result_slots} \${hopper_store_max_conns:+--store-max-conns=\$hopper_store_max_conns}"
 
 run_rc_command "\$1"
 EOF

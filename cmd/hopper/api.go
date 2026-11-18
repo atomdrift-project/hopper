@@ -860,19 +860,37 @@ func (wt *workerTracker) all() []namedWorkerStats {
 // ("API: one /v1/ surface"), named for what each route is and grouped by how
 // it is used, and the retired paths, which answer 410 (retired).
 func (s *apiServer) registerAPI(mux *http.ServeMux) {
+	s.registerAPIRoutes(mux, mux.HandleFunc)
+}
+
+// registerLoadAPI keeps the listener and health probes available during load,
+// but publishes the API handlers only after their dependencies are ready.
+func (s *apiServer) registerLoadAPI(mux *http.ServeMux) {
+	s.registerAPIRoutes(mux, func(pattern string, next func(http.ResponseWriter, *http.Request)) {
+		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+			if !s.ready.Load() {
+				writeRetryable(w, retryAfterStarting, "starting", "Starting.")
+				return
+			}
+			next(w, r)
+		})
+	})
+}
+
+func (s *apiServer) registerAPIRoutes(mux *http.ServeMux, handle func(string, func(http.ResponseWriter, *http.Request))) {
 	registerRetired(mux)
 	// Read routes: safe against any backend, including a logical-replication
 	// subscriber (serve-replica). File-serving routes need a data root; a
 	// replica API typically has no corpus on disk, so they exist only when
 	// there are bytes to serve.
-	mux.HandleFunc("GET /_/replica", s.handleReplicaStatus)
+	handle("GET /_/replica", s.handleReplicaStatus)
 	// Point lookups answer from the local (replica) database; freshOr adds the
 	// ?fresh=1 / X-Hopper-Fresh escape hatch that routes one read to the
 	// primary when a client needs to see its own just-relayed write (a no-op
 	// wrapper when no relay is configured, including on the primary itself).
-	mux.HandleFunc("GET /v1/lookup", s.freshOr(s.handleV1Lookup))
-	mux.HandleFunc("GET /v1/files/{sha256}/provenance", s.freshOr(s.handleProvenance))
-	mux.HandleFunc("GET /v1/storage/incoming", s.handleIncomingLocations)
+	handle("GET /v1/lookup", s.freshOr(s.handleV1Lookup))
+	handle("GET /v1/files/{sha256}/provenance", s.freshOr(s.handleProvenance))
+	handle("GET /v1/storage/incoming", s.handleIncomingLocations)
 	// Triage selection. GET /v1/triage/{queue} does not collide with the POST
 	// routes below, and the literal rulings and reports outrank the {queue}
 	// wildcard, so no queue may take either name.
@@ -883,15 +901,15 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 	// the publisher at a client's say-so. Replica lag costs a selection
 	// nothing: a file whose drain has not applied is handed out again, which
 	// the consumer's cooldown absorbs.
-	mux.HandleFunc("GET /v1/triage/{queue}", s.handleTriageSelect)
-	mux.HandleFunc("GET /v1/triage/{queue}/depth", s.handleTriageDepth)
+	handle("GET /v1/triage/{queue}", s.handleTriageSelect)
+	handle("GET /v1/triage/{queue}/depth", s.handleTriageDepth)
 	// The ledger: a GET reads it by subject (a replica refuses every POST, and
 	// this is a read), a POST appends. Both lookups are read-after-write pairs
 	// with what the same client posts, hence freshOr.
-	mux.HandleFunc("GET /v1/sightings", s.freshOr(s.handleSightingsFor))
-	mux.HandleFunc("GET /v1/sightings/ancestry", s.freshOr(s.handleSightingsAncestry))
+	handle("GET /v1/sightings", s.freshOr(s.handleSightingsFor))
+	handle("GET /v1/sightings/ancestry", s.freshOr(s.handleSightingsAncestry))
 	if s.dataRoot != "" || !s.readOnly {
-		mux.HandleFunc("GET /v1/files/{sha256}", s.handleFile)
+		handle("GET /v1/files/{sha256}", s.handleFile)
 	}
 
 	if s.readOnly {
@@ -911,9 +929,9 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 		// like cyclotron can point its whole stack at this one URL; the worker
 		// lane, the firehose, is refused.
 		for _, ep := range []string{"POST /v1/work/next", "POST /v1/work/heartbeat"} {
-			mux.HandleFunc(ep, handleWorkerRouteRefusal)
+			handle(ep, handleWorkerRouteRefusal)
 		}
-		mux.HandleFunc("POST /v1/work/result", func(w http.ResponseWriter, r *http.Request) {
+		handle("POST /v1/work/result", func(w http.ResponseWriter, r *http.Request) {
 			if s.relay != nil && renewalLane(r) {
 				s.relay.ServeHTTP(w, r)
 				return
@@ -936,29 +954,29 @@ func (s *apiServer) registerAPI(mux *http.ServeMux) {
 			if s.relay != nil {
 				mux.Handle(ep, s.relay)
 			} else {
-				mux.HandleFunc(ep, handleReadOnlyRefusal)
+				handle(ep, handleReadOnlyRefusal)
 			}
 		}
 		return
 	}
 
-	mux.HandleFunc("POST /v1/work/next", s.handleNext)
-	mux.HandleFunc("POST /v1/work/heartbeat", s.handleHeartbeat)
-	mux.HandleFunc("POST /v1/work/result", s.handleResult)
-	mux.HandleFunc("POST /v1/work/rescan/{sha256}", s.handleRescan)
-	mux.HandleFunc("POST /v1/intake/upload", s.handleUpload)
-	mux.HandleFunc("POST /v1/intake/held", s.handleKnown)
-	mux.HandleFunc("POST /v1/intake/popular", s.handlePopular)
-	mux.HandleFunc("POST /v1/sightings", s.handleSightings)
-	mux.HandleFunc("POST /v1/sightings/attempted", s.handleSightingKeys(markAttempted))
-	mux.HandleFunc("POST /v1/sightings/retract", s.handleSightingKeys(retract))
-	mux.HandleFunc("POST /v1/acquisitions/claim", s.handleAcquisitionClaim)
-	mux.HandleFunc("POST /v1/acquisitions/finish", s.handleAcquisitionFinish)
-	mux.HandleFunc("POST /v1/triage/rulings", s.handleTriage)
-	mux.HandleFunc("POST /v1/triage/reports", s.handleReport)
+	handle("POST /v1/work/next", s.handleNext)
+	handle("POST /v1/work/heartbeat", s.handleHeartbeat)
+	handle("POST /v1/work/result", s.handleResult)
+	handle("POST /v1/work/rescan/{sha256}", s.handleRescan)
+	handle("POST /v1/intake/upload", s.handleUpload)
+	handle("POST /v1/intake/held", s.handleKnown)
+	handle("POST /v1/intake/popular", s.handlePopular)
+	handle("POST /v1/sightings", s.handleSightings)
+	handle("POST /v1/sightings/attempted", s.handleSightingKeys(markAttempted))
+	handle("POST /v1/sightings/retract", s.handleSightingKeys(retract))
+	handle("POST /v1/acquisitions/claim", s.handleAcquisitionClaim)
+	handle("POST /v1/acquisitions/finish", s.handleAcquisitionFinish)
+	handle("POST /v1/triage/rulings", s.handleTriage)
+	handle("POST /v1/triage/reports", s.handleReport)
 	// Stays until cyclotron's re-scan becomes a version 8 result through
 	// /v1/work/result (MIGRATION_PLAN.md).
-	mux.HandleFunc("POST /api/cleave-result", s.handleCleaveResult)
+	handle("POST /api/cleave-result", s.handleCleaveResult)
 }
 
 // handleReadOnlyRefusal answers every mutating route on a read-only replica.

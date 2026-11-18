@@ -498,15 +498,23 @@ func (h *loadProcess) post(ctx context.Context, path, contentType string, body [
 	return resp.StatusCode
 }
 
-// log is hopper's output and log file, for a failure message: every line
-// about the worker or cleave and every warning and error, then the log's tail.
+// log includes hopper's output, its recent diagnostics, and the latest worker log.
 func (h *loadProcess) log() string {
 	logFile, _ := os.ReadFile(filepath.Join(h.home, "Library", "Logs", "hopper", "hopper.log")) //nolint:errcheck // absent on Linux
 	if len(logFile) == 0 {
 		logFile, _ = os.ReadFile(filepath.Join(h.home, ".local", "state", "hopper", "hopper.log")) //nolint:errcheck // absent on macOS
 	}
 	var picked strings.Builder
+	var worker struct {
+		Log string `json:"log"`
+	}
 	for line := range strings.Lines(string(logFile)) {
+		if strings.Contains(line, `"msg":"starting litmus worker"`) {
+			_ = json.Unmarshal([]byte(line), &worker) //nolint:errcheck // diagnostics only
+		}
+		if strings.Contains(line, `"msg":"executing migration ddl"`) {
+			continue
+		}
 		if strings.Contains(line, `"level":"ERROR"`) || strings.Contains(line, `"level":"WARN"`) ||
 			strings.Contains(line, "litmus") || strings.Contains(line, "postdoc") || strings.Contains(line, "cleave") {
 			picked.WriteString(line)
@@ -518,8 +526,12 @@ func (h *loadProcess) log() string {
 		}
 		return b
 	}
-	return "--- output ---\n" + tail(h.out.String(), 8<<10) + "\n--- worker, cleave, warnings and errors ---\n" +
+	logs := "--- output ---\n" + tail(h.out.String(), 8<<10) + "\n--- worker, cleave, warnings and errors ---\n" +
 		tail(picked.String(), 24<<10) + "\n--- log tail ---\n" + tail(string(logFile), 4<<10)
+	if workerLog, err := os.ReadFile(worker.Log); err == nil {
+		logs += "\n--- postdoc log tail ---\n" + tail(string(workerLog), 8<<10)
+	}
+	return logs
 }
 
 func indexOf(args []string, flag string) int {

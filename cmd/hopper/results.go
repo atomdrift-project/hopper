@@ -63,12 +63,14 @@ func (s *apiServer) storeVerdicts(w http.ResponseWriter, r *http.Request, lane s
 	}
 	switch {
 	case errors.Is(err, scanresult.ErrMalformed):
+		recordVerdictResult(ctx, lane, "rejected")
 		slog.WarnContext(r.Context(), "result rejected", "worker", res.worker, "sha256", res.sha256,
 			"path", claimedPath, "error", err)
 		s.progress.recordErrorf(1, "store", "result rejected: %s: %v", res.sha256, err)
 		v1Error(w, http.StatusUnprocessableEntity, "result_rejected_malformed", "Result rejected: malformed.")
 		return
 	case err != nil:
+		recordVerdictResult(ctx, lane, "error")
 		logResultStoreError(r.Context(), ctx, "store result failed after accepting worker result", res.sha256, err)
 		s.progress.recordErrorf(1, "store", "store result: %s: %v", res.sha256, err)
 		v1Error(w, http.StatusInternalServerError, "store_result_failed", "Store result failed.")
@@ -78,6 +80,7 @@ func (s *apiServer) storeVerdicts(w http.ResponseWriter, r *http.Request, lane s
 
 	stored := stats.Changed()
 	if stored {
+		recordVerdictResult(ctx, lane, "stored")
 		s.progress.analyzed.Add(1)
 		slog.InfoContext(r.Context(), "result stored", "worker", res.worker, "sha256", res.sha256, "path", claimedPath,
 			"files", stats.Files, "judged", stats.Judged, "deferred", stats.Deferred, "new_samples", stats.NewSamples, "retyped", stats.Retyped,
@@ -87,6 +90,11 @@ func (s *apiServer) storeVerdicts(w http.ResponseWriter, r *http.Request, lane s
 			"contents", stats.Contents, "orphaned", stats.Orphaned, "refs", stats.Refs, "refs_removed", stats.RefsRemoved,
 			"duration_ms", res.ms, "store_ms", time.Since(start).Milliseconds())
 	} else {
+		outcome := "unchanged"
+		if res.missing {
+			outcome = "missing"
+		}
+		recordVerdictResult(ctx, lane, outcome)
 		recordRedundantResult(r.Context(), lane)
 		slog.DebugContext(r.Context(), "result already current; nothing stored",
 			"worker", res.worker, "sha256", res.sha256, "path", claimedPath, "files", stats.Files, "late", stats.Late)

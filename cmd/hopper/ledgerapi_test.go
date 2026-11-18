@@ -3,10 +3,43 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestLoadAPIStartup(t *testing.T) {
+	api := &apiServer{}
+	mux := http.NewServeMux()
+	api.registerLoadAPI(mux)
+
+	for _, route := range []string{
+		"/v1/acquisitions/claim", "/v1/acquisitions/finish",
+		"/v1/sightings/attempted", "/v1/sightings/retract", "/v1/work/result",
+	} {
+		r := httptest.NewRequest(http.MethodPost, route, http.NoBody)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, r)
+		if w.Code != http.StatusServiceUnavailable || w.Header().Get("Retry-After") != "5" ||
+			!strings.Contains(w.Body.String(), `"code":"starting"`) {
+			t.Errorf("%s: got status %d, headers %v, body %s", route, w.Code, w.Header(), w.Body)
+		}
+		if r.Pattern != "POST "+route {
+			t.Errorf("%s: matched pattern %q, want the route for HTTP metrics", route, r.Pattern)
+		}
+	}
+
+	if status, _ := call(t, mux.ServeHTTP, http.MethodGet, "/api/next", "", nil); status != http.StatusGone {
+		t.Errorf("retired route during startup: got %d, want 410", status)
+	}
+
+	api.ready.Store(true)
+	if status, body := call(t, mux.ServeHTTP, http.MethodPost, "/v1/acquisitions/claim", "", nil); status != http.StatusNotImplemented ||
+		!strings.Contains(body, "needs_verdict_store") {
+		t.Errorf("ready legacy API: got %d %s, want the permanent Store requirement", status, body)
+	}
+}
 
 // An acquirer's writes go through hopper: claims marked attempted and
 // retracted by key, sightings backfilled with their source's dates, and a

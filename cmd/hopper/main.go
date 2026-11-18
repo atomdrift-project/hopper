@@ -770,7 +770,7 @@ func cmdServeReplica(ctx context.Context) error {
 		readOnly:    true,
 	}
 	if *storeSchema != "" && db.Pool() != nil {
-		st, pool, serr := openStore(ctx, roDSN, *storeSchema)
+		st, pool, serr := openStore(ctx, roDSN, *storeSchema, defaultStoreMaxConns)
 		if serr != nil {
 			return fmt.Errorf("serve-replica: %w", serr)
 		}
@@ -1163,6 +1163,10 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	storeSchema := f.String("store", "verdict",
 		"schema holding the verdict tables (created when empty); the walk, results, claims and triage use them. "+
 			"Empty, or a SQLite --db, uses the legacy tables instead")
+	resultSlots := f.Int("result-slots", min(32, max(2, runtime.NumCPU())),
+		"maximum concurrent result uploads including decoding and storage")
+	storeMaxConns := f.Int("store-max-conns", int(defaultStoreMaxConns),
+		"maximum PostgreSQL connections for the verdict Store")
 	var forceRescanDirs stringListFlag
 	f.Var(&forceRescanDirs, "force-rescan", "directory prefix to force re-analysis for; may be repeated or comma-separated")
 	// Maintenance lever, born 2026-08-21: the startup walk's staging upserts and
@@ -1180,6 +1184,12 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		"run a full reconcile walk on this start even if one already ran today; "+
 			"the once-a-day guard exists because a full pass can outlast the gap between restarts")
 	parseFlags(f, os.Args[2:])
+	if *resultSlots < 2 {
+		return errors.New("--result-slots must be at least 2")
+	}
+	if *storeMaxConns < 1 || *storeMaxConns > 1<<31-1 {
+		return errors.New("--store-max-conns must be a positive 32-bit integer")
+	}
 	explicitPostdocBin := flagWasSet(f, "postdoc")
 	explicitCleaveBin := flagWasSet(f, "cleave")
 	if flagWasSet(f, "prune-missing-paths") {
@@ -1283,7 +1293,6 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// is self-defeating past the point where the store path saturates. The next
 	// real gains are in store duration (lock contention in the member upsert;
 	// index-descent I/O), not here.
-	resultSlots := min(32, max(2, runtime.NumCPU()))
 	// Cap concurrent archive-member extractions to the CPU count (decompression
 	// is CPU-bound), clamped so a many-core host can't pile up unbounded disk
 	// spooling from a request burst.
@@ -1295,15 +1304,16 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 		// several times its size), not CPU-bound, so cap it tighter than
 		// extraction: enough for steady throughput, low enough that a burst of
 		// large archive results can't blow up the heap.
-		resultSem: make(chan struct{}, resultSlots),
+		resultSem: make(chan struct{}, *resultSlots),
 		// Worker results take a slot from this smaller pool as well, which
 		// keeps resultReservedSlots of resultSem available to `serve --hopper`
 		// renewals. A worker result that is shed goes back on the queue and is
 		// dispatched again; a shed renewal is gone for good, so the two must
 		// not compete on equal terms. See laneRenew in api.go.
-		workerResultSem: make(chan struct{}, resultSlots-min(resultReservedSlots, resultSlots-1)),
+		workerResultSem: make(chan struct{}, *resultSlots-min(resultReservedSlots, *resultSlots-1)),
 	} // db, progress, and allowedDirs are set after initialization
-	api.registerAPI(apiMux)
+	slog.Info("result admission configured", "slots", cap(api.resultSem), "worker_slots", cap(api.workerResultSem))
+	api.registerLoadAPI(apiMux)
 	apiMux.HandleFunc("GET /_/health", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok")) //nolint:errcheck // best-effort HTTP response
 	})
@@ -1652,13 +1662,16 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// The verdict tables are PostgreSQL's alone; a SQLite database (a
 	// development corpus, the tests) keeps the legacy tables.
 	if *storeSchema != "" && db.Pool() != nil {
-		st, pool, err := openStore(ctx, *dsn, *storeSchema)
+		st, pool, err := openStore(ctx, *dsn, *storeSchema, int32(*storeMaxConns))
 		if err != nil {
 			return err
 		}
 		defer pool.Close()
 		api.results = st
-		slog.Info("verdict store open", "schema", *storeSchema)
+		if err := obs.PoolStats("hopper-store", pool); err != nil {
+			slog.Warn("Store pool stats registration", "error", err)
+		}
+		slog.Info("verdict store open", "schema", *storeSchema, "max_conns", pool.Config().MaxConns)
 	}
 	api.dataRoot = *dataDir
 	api.requiredMounts = append([]string(nil), requiredReconcileMounts...)
@@ -1731,7 +1744,6 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	// the directory doesn't exist yet.
 	api.sweepUploadTmp()
 
-	api.ready.Store(true)
 	// An unauthenticated API is open to anyone who can reach the socket. A
 	// loopback bind is not evidence of safety: cloudflared terminates the
 	// tunnel on loopback, putting the internet on the other side of it. So
@@ -2261,9 +2273,11 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	var progress loadProgress
 	progress.analyzeDurationMin.Store(math.MaxInt64)
 
-	// Wire the API server's progress pointer so /v1/work/result can update counters.
+	// Publish the wired dependencies, including the progress counters used
+	// by /v1/work/result, before any API handler can run.
 	if api != nil {
 		api.progress = &progress
+		api.ready.Store(true)
 	}
 
 	// Does this process outlive the walk? Everything below that must run "for

@@ -240,6 +240,23 @@ func recordResultPhase(ctx context.Context, phase, lane string, d time.Duration)
 	}
 }
 
+var verdictResultCounter = sync.OnceValue(func() metric.Int64Counter {
+	c, err := otel.Meter(meterName).Int64Counter(
+		"hopper.verdict_results.total",
+		metric.WithDescription("Verdict result uploads that reached storage, by lane and outcome."),
+	)
+	if err != nil {
+		return nil
+	}
+	return c
+})
+
+func recordVerdictResult(ctx context.Context, lane, outcome string) {
+	if c := verdictResultCounter(); c != nil {
+		c.Add(ctx, 1, metric.WithAttributes(attribute.String("lane", lane), attribute.String("outcome", outcome)))
+	}
+}
+
 // Sample-age histograms answer "how far behind is the queue" in the one unit
 // that survives a change in throughput: how old the work itself is. Queue depth
 // cannot answer it — a 500k backlog drained in SHA-pivot order and a 500k

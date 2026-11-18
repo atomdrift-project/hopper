@@ -9,7 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// storePoolMaxConns is the verdict-store cap. pgx otherwise defaults MaxConns
+// defaultStoreMaxConns is the verdict Store's default cap. pgx otherwise defaults MaxConns
 // to NumCPU. On smaug that is 128, and this second pool (application_name
 // hopper-load-store) opened 42 sessions and held them next to hopper-load and
 // forager until hopper-db (max_connections 100) refused new ones, 2026-11-17.
@@ -21,13 +21,13 @@ import (
 // store on the same DSN as the serving pool, and that parameter is how the
 // serving pool is widened. Honoring it here would hand the store the serving
 // size again.
-const storePoolMaxConns int32 = 4
+const defaultStoreMaxConns int32 = 4
 
 // openStore opens the verdict tables in schema, on the database dsn names,
 // creating them when the schema has none: a fresh install starts empty, and
 // a migrated one (`hopper migrate`) already has them.
-func openStore(ctx context.Context, dsn, schema string) (*store.Store, *pgxpool.Pool, error) {
-	cfg, err := storePoolConfig(dsn)
+func openStore(ctx context.Context, dsn, schema string, maxConns int32) (*store.Store, *pgxpool.Pool, error) {
+	cfg, err := storePoolConfig(dsn, maxConns)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -58,7 +58,7 @@ func openStore(ctx context.Context, dsn, schema string) (*store.Store, *pgxpool.
 // storePoolConfig parses dsn and sizes the verdict-store pool. The
 // application_name suffix keeps these sessions distinct from the serving pool
 // in pg_stat_activity.
-func storePoolConfig(dsn string) (*pgxpool.Config, error) {
+func storePoolConfig(dsn string, maxConns int32) (*pgxpool.Config, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("store: %w", err)
@@ -67,7 +67,7 @@ func storePoolConfig(dsn string) (*pgxpool.Config, error) {
 		cfg.ConnConfig.RuntimeParams = map[string]string{}
 	}
 	cfg.ConnConfig.RuntimeParams["application_name"] = string(cliAppName()) + "-store"
-	cfg.MaxConns = storePoolMaxConns
+	cfg.MaxConns = maxConns
 	cfg.MinConns = 0
 	return cfg, nil
 }
