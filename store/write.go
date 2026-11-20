@@ -36,7 +36,6 @@ type Stats struct {
 	Reports          int64 // reports stored
 	ReportsUnchanged int   // reports whose stored copy already matched
 	Contents         int64 // containers whose member list was written or removed
-	Orphaned         int64 // members no archive lists any more, whose verdicts were dropped
 	Refs             int64 // references added or changed
 	RefsRemoved      int64
 	Requeued         int64 // containing archives queued for repair
@@ -50,7 +49,7 @@ type Stats struct {
 // bookkeeping, not knowledge, and does not count.
 func (s *Stats) Changed() bool {
 	return s.NewSamples+s.Retyped+s.Verdicts+s.Stamped+s.JurorsRemoved+s.Claims+s.ClaimsRemoved+s.Reports+
-		s.Contents+s.Orphaned+s.Refs+s.RefsRemoved+s.Requeued > 0
+		s.Contents+s.Refs+s.RefsRemoved+s.Requeued > 0
 }
 
 // Write stores what a scan concluded about files, all of it or none. files[0]
@@ -109,7 +108,7 @@ const (
 
 // write is one attempt at Write.
 func (st *Store) write(ctx context.Context, files []scanresult.File) (Stats, error) {
-	w := &writer{files: files, enc: st.enc, keepOrphans: st.KeepOrphans}
+	w := &writer{files: files, enc: st.enc}
 	w.stats.Files = len(files)
 	start := time.Now()
 	conn, err := st.pool.Acquire(ctx)
@@ -168,9 +167,6 @@ type writer struct {
 	reclaim time.Time
 	outcome []conclusion // what this scan concluded about files[i]
 	stats   Stats
-	// keepOrphans leaves members no list names any more as they are
-	// (Store.KeepOrphans).
-	keepOrphans bool
 }
 
 // conclusion is the outcome of a verdict, and its error text when it failed.
@@ -988,9 +984,10 @@ func (w *writer) claims(ctx context.Context) error {
 	return nil
 }
 
-// contents writes the member list of each file that states one, then drops
-// what hopper believed about members that no list names any more. A list is
-// stored in path order, so the same members always compare equal.
+// contents writes the member list of each file that states one. A list is
+// stored in path order, so the same members always compare equal. The list
+// may omit files because of the upload cap, so each member keeps its own
+// verdicts, report, claim and member list when it drops out.
 //
 // The scanned artifact's own list is replaced as its verdict is: late has
 // already refused an older scan of it. A member's list is replaced only by a
@@ -1009,14 +1006,11 @@ func (w *writer) contents(ctx context.Context) error {
 	slices.SortFunc(order, func(a, b int) int { return cmp.Compare(w.ids[a], w.ids[b]) })
 	at := w.files[0].Scan.At
 	batch := &pgx.Batch{}
-	kept := make([]map[int64]bool, 0, len(order)) // the members each queued statement leaves listed
 	for _, i := range order {
 		f := &w.files[i]
 		if len(f.Children) == 0 {
 			batch.Queue(`UPDATE contents SET child_ids = '{}', paths = '{}', listed_at = $2
-				WHERE parent_id = $1 AND (listed_at < $2 OR ($3 AND listed_at = $2)) AND cardinality(child_ids) > 0
-				RETURNING old.child_ids`, w.ids[i], at, i == 0)
-			kept = append(kept, nil)
+				WHERE parent_id = $1 AND (listed_at < $2 OR ($3 AND listed_at = $2)) AND cardinality(child_ids) > 0`, w.ids[i], at, i == 0)
 			continue
 		}
 		type member struct {
@@ -1029,45 +1023,26 @@ func (w *writer) contents(ctx context.Context) error {
 		}
 		slices.SortFunc(list, func(a, b member) int { return cmp.Or(cmp.Compare(a.path, b.path), cmp.Compare(a.id, b.id)) })
 		children, paths := make([]int64, len(list)), make([]string, len(list))
-		listed := make(map[int64]bool, len(list))
 		for j, m := range list {
 			children[j], paths[j] = m.id, m.path
-			listed[m.id] = true
 		}
-		// The list it replaces comes back with the write; it is NULL for a
-		// container seen for the first time. An unchanged list, or a stored
-		// one this scan does not replace, is left out before the insert, so it
-		// is neither written nor locked.
+		// Skip unchanged lists and lists from a newer scan before the insert
+		// to avoid locking their rows.
 		batch.Queue(`INSERT INTO contents (parent_id, listed_at, child_ids, paths)
 			SELECT $1, $4, $2, $3 WHERE NOT EXISTS (SELECT 1 FROM contents WHERE parent_id = $1
 				AND (listed_at > $4 OR (listed_at = $4 AND NOT $5) OR (child_ids = $2 AND paths = $3)))
 			ON CONFLICT (parent_id) DO UPDATE
 				SET listed_at = EXCLUDED.listed_at, child_ids = EXCLUDED.child_ids, paths = EXCLUDED.paths
 			WHERE (contents.listed_at < EXCLUDED.listed_at OR ($5 AND contents.listed_at = EXCLUDED.listed_at))
-			  AND (contents.child_ids, contents.paths) IS DISTINCT FROM (EXCLUDED.child_ids, EXCLUDED.paths)
-			RETURNING old.child_ids`,
+			  AND (contents.child_ids, contents.paths) IS DISTINCT FROM (EXCLUDED.child_ids, EXCLUDED.paths)`,
 			w.ids[i], children, paths, at, i == 0)
-		kept = append(kept, listed)
 	}
 	if batch.Len() == 0 {
 		return nil
 	}
-	var left []int64 // members a list named before this write and does not now
 	results := w.tx.SendBatch(ctx, batch)
-	for _, listed := range kept {
-		rows, err := results.Query()
-		if err != nil {
-			return errors.Join(fmt.Errorf("contents: %w", err), results.Close())
-		}
-		var old []int64
-		tag, err := pgx.ForEachRow(rows, []any{&old}, func() error {
-			for _, id := range old {
-				if !listed[id] {
-					left = append(left, id)
-				}
-			}
-			return nil
-		})
+	for range batch.Len() {
+		tag, err := results.Exec()
 		if err != nil {
 			return errors.Join(fmt.Errorf("contents: %w", err), results.Close())
 		}
@@ -1075,64 +1050,6 @@ func (w *writer) contents(ctx context.Context) error {
 	}
 	if err := results.Close(); err != nil {
 		return fmt.Errorf("contents: %w", err)
-	}
-	if w.keepOrphans {
-		return nil
-	}
-	return w.orphans(ctx, left)
-}
-
-// orphans drops the verdicts and claims of files that have just left an
-// archive's member list and that nothing else accounts for. Scan uploads a member only while
-// it has something to say about it, so a member that drops out has been
-// found unremarkable, or has fallen below the upload's cap; hopper holds no
-// bytes to scan it again, and without this its last verdict would stand for
-// good.
-//
-// A file is left alone if another archive still lists it, or if it is a file
-// in its own right: one with a location, a name, a URL or provenance. An
-// orphaned container gives up its own member list too, so its members are
-// considered in turn. The sample row stays: its id may be in a list another
-// writer is committing.
-//
-// The candidates' sample rows are locked first, in digest order as every
-// writer of samples takes them: a writer giving one of them a verdict holds
-// a key lock on the row until it commits, so this waits for it, and the test
-// that follows, a statement of its own, sees the list that writer committed.
-func (w *writer) orphans(ctx context.Context, left []int64) error {
-	for len(left) > 0 {
-		slices.Sort(left)
-		left = slices.Compact(left)
-		if _, err := w.tx.Exec(ctx, `SELECT 1 FROM samples WHERE id = ANY($1) ORDER BY sha256 FOR UPDATE`, left); err != nil {
-			return fmt.Errorf("orphaned members: %w", err)
-		}
-		var n int64
-		// Verdict rows are taken in key order, as every writer takes them.
-		err := w.tx.QueryRow(ctx, `WITH orphan AS (
-				SELECT s.id FROM samples s
-				WHERE s.id = ANY($1) AND s.name_id IS NULL AND s.url IS NULL AND s.provenance IS NULL
-				  AND NOT EXISTS (SELECT 1 FROM locations l WHERE l.sample_id = s.id)
-				  AND NOT EXISTS (SELECT 1 FROM contents c WHERE c.child_ids @> ARRAY[s.id])
-			), v AS (
-				DELETE FROM verdicts d USING (
-					SELECT sample_id, scanner_id FROM verdicts WHERE sample_id IN (SELECT id FROM orphan)
-					ORDER BY sample_id, scanner_id FOR UPDATE) k
-				WHERE d.sample_id = k.sample_id AND d.scanner_id = k.scanner_id
-				RETURNING d.sample_id
-			), i AS (
-				DELETE FROM claims d USING (
-					SELECT sample_id FROM claims WHERE sample_id IN (SELECT id FROM orphan)
-					ORDER BY sample_id FOR UPDATE) k
-				WHERE d.sample_id = k.sample_id
-			), c AS (
-				DELETE FROM contents WHERE parent_id IN (SELECT id FROM orphan) RETURNING child_ids
-			)
-			SELECT (SELECT count(DISTINCT sample_id) FROM v),
-			       ARRAY(SELECT DISTINCT m FROM c, unnest(c.child_ids) AS m)`, left).Scan(&n, &left)
-		if err != nil {
-			return fmt.Errorf("orphaned members: %w", err)
-		}
-		w.stats.Orphaned += n
 	}
 	return nil
 }

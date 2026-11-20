@@ -99,7 +99,6 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opt Options) (*Report, error) 
 	if err != nil {
 		return nil, err
 	}
-	st.KeepOrphans = true
 	m := &migration{
 		pool: pool, st: st, from: pgx.Identifier{opt.From}.Sanitize(), opt: opt,
 		report: &Report{Took: map[string]time.Duration{}, Failures: map[string]int{}},
@@ -189,8 +188,8 @@ func (m *migration) tables(ctx context.Context) error {
 	// The foreign keys are added back once the load is done (keys): each row
 	// a writer inserts would otherwise probe samples and lock the row it
 	// names, a write and a WAL record of its own. Nothing relies on them
-	// during the load: it keeps the members no list names (KeepOrphans), and
-	// the excerpt cleanup tests every table that names a sample.
+	// during the load: the writer retains unlisted members, and the excerpt
+	// cleanup tests every table that names a sample.
 	if _, err := m.pool.Exec(ctx, `CREATE TABLE migrate_fkeys AS
 			SELECT conname::text AS name, conrelid::regclass::text AS tbl, pg_get_constraintdef(oid) AS def
 			FROM pg_constraint WHERE contype = 'f' AND connamespace = current_schema()::regnamespace`); err != nil {

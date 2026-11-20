@@ -19,8 +19,7 @@ CREATE TABLE names (
 -- vacuums of billion-row tables. The keys that would be taken on every scan,
 -- enqueue or ingest of a common name are left out where the referenced rows
 -- are never deleted (names, samples) or fixed (scanners, held by a CHECK).
--- The rest stay, and verdicts' key on samples is load-bearing: the orphan
--- cleanup in write.go waits on it.
+-- The remaining keys enforce references to their sample rows.
 
 -- What the bytes are, what we believe about them, where they came from.
 CREATE TABLE samples (

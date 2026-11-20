@@ -489,7 +489,7 @@ which 12,196 are excerpts. Every check above passes.
     the parent's excerpt, that waits for its own scan (1 hostile in 3,825).
 - **Writer changes the rehearsal forced:** conversion in time order (a
   member's opinion records when it last changed, so the newest archive must
-  come last); `Store.KeepOrphans` during the migration; a member's opinion
+  come last); retention of unlisted members during the migration; a member's opinion
   changed only by a strictly newer scan; and a member list with its own
   time (`contents.listed_at`), replaced only by a newer list, not by a newer
   verdict of its archive; and a member's line that replaces a stored

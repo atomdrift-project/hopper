@@ -243,11 +243,9 @@ Decisions still open:
   by name and by signer) move to `claims` plus `samples.name_id` when the
   readers are ported. Migration: fill `claims` from the stored reports'
   `ident` blocks, not from the legacy `claims` table, which lacks the block.
-- [x] A member that leaves every archive's list loses its verdicts, in the
-  writer and in the same transaction (`orphans` in `write.go`,
-  `TestWriteOrphans`). Not a background prune: that cannot tell an orphaned
-  member from a top-level file whose bytes went missing. The `samples` row
-  stays; see `PLAN.md`, "Contents".
+- [x] Replacing an archive's member list preserves the omitted members'
+  verdicts and reports. See `TestWriteRetainsUnlistedMembers` and
+  `PLAN.md`, "Contents".
 - [x] Lookup raise from our own detection (`PLAN.md`, "Raising a class at
   lookup"): measured, then built as `Store.Raise` and `Record.RaiseBy`
   (`store/raise.go`, `TestRaise`, `TestRaiseBounds`,

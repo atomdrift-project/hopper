@@ -87,7 +87,7 @@ func (s *apiServer) storeVerdicts(w http.ResponseWriter, r *http.Request, lane s
 			"verdicts", stats.Verdicts, "stamped", stats.Stamped, "jurors_removed", stats.JurorsRemoved,
 			"claims", stats.Claims, "claims_removed", stats.ClaimsRemoved,
 			"reports", stats.Reports, "reports_unchanged", stats.ReportsUnchanged,
-			"contents", stats.Contents, "orphaned", stats.Orphaned, "refs", stats.Refs, "refs_removed", stats.RefsRemoved,
+			"contents", stats.Contents, "refs", stats.Refs, "refs_removed", stats.RefsRemoved,
 			"duration_ms", res.ms, "store_ms", time.Since(start).Milliseconds())
 	} else {
 		outcome := "unchanged"

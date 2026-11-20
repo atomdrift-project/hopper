@@ -101,12 +101,6 @@ type Store struct {
 	// stored and before it locks anything to write: a test's hook for
 	// interleaving two writers. Nil outside tests.
 	afterRead func()
-	// KeepOrphans, set before the Store is used, keeps the verdicts of
-	// members a write leaves in no archive's list. The migration sets it:
-	// version 7 reports list different members of the same nested
-	// container from each archive that holds it, so a list rewritten from
-	// another archive's report says nothing about the members it lacks.
-	KeepOrphans bool
 }
 
 // New returns a Store that uses pool. The caller owns the pool.

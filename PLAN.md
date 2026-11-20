@@ -372,7 +372,7 @@ format is specified in `../scan/JSON_PLAN.md`, which another agent implements
 in scan while this side is built. Built and tested locally so far: the
 schema changes, the references rules, and the verdict-row rules below.
 Also built: a member's line is ignored for a file that holds an `llm` or
-drift row; a member that leaves every list loses its verdicts. Not built:
+drift row. Members retain their verdicts after leaving an archive's list. Not built:
 everything under
 "Raising a class at lookup", and the two requeues. `PLAN_TODO.md` has the
 list.
@@ -471,26 +471,12 @@ feed the known-good filter, which reads top-level files only.
 - The cap cannot hide a member from the archive's verdict; scan folds every
   member in before retention cuts. In the local export it keeps 68% of
   100,770 member rows and touches 58 of 5,600 archives.
-- **A member that leaves every list loses its verdicts.** The addendum's
-  defect is real: a member convicted under one ruleset and quiet under the
-  next drops out of the upload, and hopper holds no bytes to rescan it. The
-  fix is not more rows. When a result replaces an archive's member list, the
-  writer takes the members that left it and, for each that no other archive
-  lists and that is not a file in its own right (no location, name, URL or
-  provenance), deletes its verdict rows and reports in the same transaction.
-  An orphaned container gives up its own list, so its members are considered
-  in turn. Built (`orphans` in `write.go`, `Stats.Orphaned`).
-  - This is done in the writer and not as a background prune because a
-    prune cannot tell an orphaned member from a top-level file whose bytes
-    went missing: both are "no location, listed nowhere". The writer knows
-    the file was a member, because it just left a list.
-  - The `samples` row stays. Deleting it would need every writer to lock
-    the sample rows it names, or a list being committed elsewhere could be
-    left holding a dead id; a row lock per file per upload is the churn this
-    schema exists to avoid. What remains is a row with no verdict, and a
-    lookup by that hash answers "known, not analyzed".
-  - A member still listed by an archive that has not been rescanned keeps
-    its old verdict until that archive is; rescan by age bounds that, at `--rescan-age`.
+- **A member keeps its analysis when an archive stops listing it.** A
+  newer upload can omit a member because it became unremarkable or fell
+  below the upload cap. The writer replaces the archive's list and retains
+  the omitted member's verdicts, report and identity claim for hash lookups
+  and training. An omitted nested archive retains its own last reported
+  member list.
 - `contents` is therefore not a function of the parent's bytes. It is
   rewritten when a ruleset changes which members are kept: one row and its
   GIN entries per affected archive.
@@ -1046,7 +1032,7 @@ CREATE INDEX claims_signer ON claims (signer) WHERE signer <> '';
   read the file and found no block removes the row; a failed scan, or a line
   with no verdict, leaves it. A member's line is ignored for a file with a
   scan of its own, as its verdict is.
-- **An orphaned member gives up its claim** with its verdicts.
+- An archive's member-list update leaves the omitted members' claims available.
 - **The legacy converter sets claims and never removes them.** A version 7
   report older than the identity block says nothing by leaving it out.
   Version 7 reports keep the block inside them as well.
@@ -1312,8 +1298,7 @@ by `CHECK (scanner_id BETWEEN 1 AND 9)` instead of a key on nine rows every
 new verdict would lock (`TestScannerCheck` keeps the two in step); `refs →
 names`, `samples → names` (every ingest of a common package's files) and
 `queue → samples` (every enqueue) have no key, since names and samples are
-never deleted. The other keys stay; `verdicts → samples` is load-bearing,
-as the orphan cleanup waits on it.
+never deleted. The other keys enforce references to their sample rows.
 
 ## Objective and current scope
 

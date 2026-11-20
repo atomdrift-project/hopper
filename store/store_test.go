@@ -348,8 +348,8 @@ func TestWriteReplaces(t *testing.T) {
 			t.Errorf("%d contents rows, %v; want only the other package's", n, err)
 		}
 		// The other package still lists the script, so what is known of it stands.
-		if rec, err := st.BySHA256(ctx, script); err != nil || !rec.Analyzed || got.Orphaned != 0 {
-			t.Errorf("record %+v, %v, orphaned %d: a member another archive lists lost its verdict", rec, err, got.Orphaned)
+		if rec, err := st.BySHA256(ctx, script); err != nil || !rec.Analyzed {
+			t.Errorf("record %+v, %v: a member another archive lists lost its verdict", rec, err)
 		}
 	})
 }
@@ -525,81 +525,65 @@ func TestWriteRefs(t *testing.T) {
 	})
 }
 
-// A member is uploaded only while scan has something to say about it. Once no
-// archive lists it, what hopper believed about it goes: there are no bytes to
-// scan it again, so nothing else would ever correct it.
-func TestWriteOrphans(t *testing.T) {
+// Replacing a member list retains the analysis of each omitted member.
+func TestWriteRetainsUnlistedMembers(t *testing.T) {
 	st := open(t)
 	ctx := t.Context()
-	benign := map[string]any{"outcome": "ok", "class": "benign", "fires_at": -1}
-	hostile := map[string]any{"outcome": "ok", "class": "hostile", "fires_at": 12}
-	type at struct {
-		path  string
-		child int // index of the member's own file line
-	}
-	file := func(name string, verdict map[string]any, members ...at) map[string]any {
-		f := map[string]any{"sha256": sum(name), "size": 10, "type": "tar", "verdict": verdict}
-		if len(members) > 0 {
-			children, paths := []int{}, []string{}
-			for _, m := range members {
-				children, paths = append(children, m.child), append(paths, m.path)
-			}
-			f["contents"] = map[string]any{"children": children, "paths": paths}
+	memberReport := `{"traits":[{"id":"test::leaf","crit":5}]}`
+	file := func(name, class string) map[string]any {
+		return map[string]any{
+			"sha256": sum(name), "size": 10, "type": "tar",
+			"verdict": map[string]any{"outcome": "ok", "class": class},
 		}
-		return f
 	}
-	upload := func(files ...map[string]any) Stats {
+	upload := func(hour int, reports []string, files ...map[string]any) Stats {
 		t.Helper()
-		r := &result{files: files, header: fmt.Sprintf(
-			`{"v":8,"scan":{"engine":"3.0.0","ruleset":"r1","level":25,"worker":"w1","at":"2026-11-12T15:00:00Z","ms":40},"files":%d}`, len(files))}
+		r := &result{files: files, reports: reports, header: fmt.Sprintf(
+			`{"v":8,"scan":{"engine":"3.0.0","ruleset":"r1","level":25,"worker":"w1","at":"2026-11-12T%02d:00:00Z","ms":40},"files":%d}`, hour, len(files))}
 		return r.write(ctx, t, st)
 	}
-	analyzed := func(name string) bool {
+	memberCount := func(name string) int {
 		t.Helper()
-		h := sha256.Sum256([]byte(name))
-		rec, err := st.BySHA256(ctx, h[:])
+		var count int
+		err := st.pool.QueryRow(ctx, `SELECT cardinality(c.child_ids)
+			FROM contents c JOIN samples s ON s.id = c.parent_id WHERE s.sha256 = $1`, digestOf(name)).Scan(&count)
 		if err != nil {
-			t.Fatalf("%s: %v", name, err)
+			t.Fatalf("members of %s: %v", name, err)
 		}
-		return rec.Analyzed
+		return count
 	}
 
-	// Two archives hold the same script; one also holds a nested archive
-	// with a file of its own.
-	upload(file("a", hostile, at{"x.js", 1}, at{"inner.tar", 2}), file("script", hostile),
-		file("inner", hostile, at{"y.js", 3}), file("leaf", hostile))
-	upload(file("b", hostile, at{"lib/x.js", 1}), file("script", hostile))
+	root := file("root", "hostile")
+	root["contents"] = map[string]any{"children": []int{1, 2}, "paths": []string{"inner.tar", "script.js"}}
+	inner := file("inner", "hostile")
+	inner["contents"] = map[string]any{"children": []int{3}, "paths": []string{"leaf.js"}}
+	leaf := file("leaf", "hostile")
+	leaf["report"] = sum(memberReport)
+	upload(15, []string{memberReport}, root, inner, file("script", "hostile"), leaf)
 
-	// Under a later ruleset nothing in a is worth uploading.
-	if got := upload(file("a", benign)); got.Orphaned != 0 {
-		t.Fatalf("stats %+v: no member list was stated, so none was replaced", got)
+	if got := upload(16, nil, file("root", "benign")); got.Contents != 0 || memberCount("root") != 2 {
+		t.Fatalf("a scan without a member list changed it: %+v", got)
 	}
-	a := file("a", benign)
-	a["contents"] = map[string]any{"children": []int{}, "paths": []string{}}
-	got := upload(a)
-	if got.Orphaned != 2 || got.Contents != 1 {
-		t.Errorf("stats %+v, want the nested archive and its file orphaned, and one list removed", got)
+	root = file("root", "benign")
+	root["contents"] = map[string]any{"children": []int{1}, "paths": []string{"script.js"}}
+	if got := upload(17, nil, root, file("script", "hostile")); got.Contents != 1 || memberCount("root") != 1 {
+		t.Fatalf("expected the root's list to shrink to one member: %+v", got)
 	}
-	if analyzed("inner") || analyzed("leaf") {
-		t.Error("a member no archive lists kept its verdict")
+	root["contents"] = map[string]any{"children": []int{}, "paths": []string{}}
+	if got := upload(18, nil, root); got.Contents != 1 || memberCount("root") != 0 {
+		t.Fatalf("expected the root's member list to be empty: %+v", got)
 	}
-	if !analyzed("script") {
-		t.Error("a member another archive still lists lost its verdict")
+	if got := memberCount("inner"); got != 1 {
+		t.Errorf("nested archive has %d members, want 1", got)
 	}
-	var n int
-	if err := st.pool.QueryRow(ctx, `SELECT count(*) FROM contents WHERE cardinality(child_ids) > 0`).Scan(&n); err != nil || n != 1 {
-		t.Errorf("%d member lists, %v; want b's alone: an orphaned container gives up its own", n, err)
+	for _, name := range []string{"inner", "leaf", "script"} {
+		rec, err := st.BySHA256(ctx, digestOf(name))
+		if err != nil || !rec.Analyzed || rec.Class != "hostile" {
+			t.Errorf("stored verdict of %s: %+v, %v", name, rec, err)
+		}
 	}
-
-	// A file in its own right is not a member to be forgotten.
-	if _, err := st.pool.Exec(ctx, `INSERT INTO locations (path, sample_id)
-		SELECT 'incoming/x.js', id FROM samples WHERE sha256 = $1`, digestOf("script")); err != nil {
-		t.Fatal(err)
-	}
-	b := file("b", benign)
-	b["contents"] = map[string]any{"children": []int{}, "paths": []string{}}
-	if got := upload(b); got.Orphaned != 0 || !analyzed("script") {
-		t.Errorf("stats %+v: a file with a location of its own lost its verdict", got)
+	if report, err := st.Report(ctx, digestOf("leaf")); err != nil || string(report) != memberReport {
+		t.Errorf("stored leaf report = %q, %v, want %s", report, err, memberReport)
 	}
 }
 
@@ -801,7 +785,7 @@ func TestWriteClaims(t *testing.T) {
 		}
 	})
 
-	t.Run("a member no archive lists any more gives up its claim", func(t *testing.T) {
+	t.Run("a member no archive lists keeps its claim", func(t *testing.T) {
 		later(19)
 		r.files[1]["ident"] = map[string]any{"name": map[string]any{"value": "Updater"}}
 		r.write(ctx, t, st)
@@ -809,11 +793,11 @@ func TestWriteClaims(t *testing.T) {
 			"sha256": hexOf(pkg), "size": 4000, "type": "npm", "verdict": map[string]any{"outcome": "ok", "class": "benign", "fires_at": -1},
 			"contents": map[string]any{"children": []int{}, "paths": []string{}}, "ident": r.files[0]["ident"],
 		}}}
-		if got := alone.write(ctx, t, st); got.Orphaned != 1 {
-			t.Errorf("stats %+v, want the script orphaned", got)
+		if got := alone.write(ctx, t, st); got.Contents != 1 || got.ClaimsRemoved != 0 {
+			t.Errorf("stats %+v, want one list updated and zero claims removed", got)
 		}
-		if _, held := claimOf(script); held {
-			t.Error("an orphaned member kept its claim")
+		if got, held := claimOf(script); !held || got.name != "Updater" {
+			t.Errorf("unlisted script claim %+v, present %t, want Updater", got, held)
 		}
 		if _, held := claimOf(pkg); !held {
 			t.Error("the archive lost its own claim")
