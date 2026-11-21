@@ -22,8 +22,11 @@ type Health struct {
 	// Depths counts queued files by priority; Stuck those handed out too
 	// often without a result.
 	Depths map[Priority]int64
-	// SightedWait is how long the longest-waiting cited file has been queued
-	// for its first scan.
+	// SightedWait is how long the longest-waiting file sighted-pinned offers
+	// has waited, counted from when its claim, the file and its first
+	// analysis were all present. Zero when the queue is empty: files whose
+	// retries ran out, or that no exact-version claim of the last day names,
+	// are not work this queue can do.
 	SightedWait time.Duration
 	// Scanned counts scans made since the time asked for; Rescanned those of
 	// files that arrived before it, which is as near as the store comes to
@@ -57,18 +60,24 @@ func (st *Store) Health(ctx context.Context, since, unfinishedBefore time.Time) 
 			(SELECT count(*) FROM scans WHERE scanned_at >= $1),
 			(SELECT count(*) FROM scans sc JOIN samples s ON s.id = sc.sample_id
 			 WHERE sc.scanned_at >= $1 AND s.created_at < $1),
-			(SELECT extract(epoch FROM now() - min(queued_at)) FROM queue WHERE priority = $2),
 			(SELECT min(g.first_seen) FROM sightings g WHERE `+liveUnacquired+`
 			   AND (starts_with(g.subject, 'pkg:') OR EXISTS (SELECT 1 FROM samples s
 			     JOIN locations l ON l.sample_id = s.id
 			     WHERE s.sha256 = CASE WHEN g.subject ~ '^[0-9a-f]{64}$' THEN decode(g.subject, 'hex') END))),
 			(SELECT count(*) FROM sighting_acquisitions
-			 WHERE finished_at IS NULL AND last_attempt IS NOT NULL AND last_attempt < $3),
+			 WHERE finished_at IS NULL AND last_attempt IS NOT NULL AND last_attempt < $2),
 			(SELECT count(*) FROM popular_packages)`,
-		since, int16(QueueSighted), unfinishedBefore).Scan(&arrived, &scanned, &h.Scanned, &h.Rescanned,
-		&sightedWait, &unacquired, &h.Unfinished, &h.Popular)
+		since, unfinishedBefore).Scan(&arrived, &scanned, &h.Scanned, &h.Rescanned,
+		&unacquired, &h.Unfinished, &h.Popular)
 	if err != nil {
 		return nil, fmt.Errorf("store: health: %w", err)
+	}
+	// Its own query: the candidate clause binds $1 as the queue's report type.
+	err = st.pool.QueryRow(ctx, sightedPinnedCandidates+`
+		SELECT extract(epoch FROM now() - min(greatest(sighted, created_at, coalesce(scanned_at, created_at)))) FROM c`,
+		"sighted-pinned", [][]byte{}).Scan(&sightedWait)
+	if err != nil {
+		return nil, fmt.Errorf("store: health: sighted wait: %w", err)
 	}
 	for _, t := range []struct {
 		dst *time.Time

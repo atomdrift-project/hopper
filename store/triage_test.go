@@ -648,3 +648,57 @@ func TestFileReport(t *testing.T) {
 		t.Errorf("%d gauntlet reviews, %v; want the repeat to record nothing", n, err)
 	}
 }
+
+// SightedWait is the investigation-wait gauge behind a page. It must measure
+// what sighted-pinned offers and nothing else: a queue row at the sighted
+// priority that no exact-version claim of the last day names (a digest claim,
+// a whole-package claim, a file whose retries ran out) once pinned the gauge
+// at days and paged for work the queue could not do.
+func TestHealthSightedWait(t *testing.T) {
+	st := open(t)
+	ctx := t.Context()
+	rel := func(bytes, pkg, version string) *fixture {
+		return with(base(bytes, "good"), func(f *fixture) { f.pkg, f.version = pkg, version })
+	}
+	world(ctx, t, st, base("digest named", "good"), rel("whole 1.0", "pkg:npm/w", "1.0"), rel("pinned 1.0", "pkg:npm/p", "1.0"))
+	wait := func() time.Duration {
+		t.Helper()
+		h, err := st.Health(ctx, time.Now().Add(-time.Hour), time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h.SightedWait
+	}
+	sight := func(subject, affected string, age time.Duration) {
+		t.Helper()
+		if _, err := st.pool.Exec(ctx, `INSERT INTO sightings (source, subject, affected, first_seen) VALUES ('feed', $1, $2, $3)`,
+			subject, affected, time.Now().Add(-age)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Claims that are not exact-version claims of the last day, and a queue
+	// row at the sighted priority with its retries spent and days of age.
+	sight(hexOf(digestOf("digest named")), "", 6*hour)
+	sight("pkg:npm/w", "", 6*hour)
+	if _, err := st.pool.Exec(ctx, `UPDATE queue SET priority = $1, queued_at = now() - interval '5 days', attempts = 8
+		WHERE sample_id IN (SELECT id FROM samples WHERE sha256 = $2)`, int16(QueueSighted), digestOf("digest named")); err != nil {
+		t.Fatal(err)
+	}
+	if got := wait(); got != 0 {
+		t.Fatalf("wait %v with no pinned claim, want 0", got)
+	}
+
+	// An exact-version claim of the last day on a judged file that arrived
+	// and was scanned long before it: the clock starts at the claim.
+	sight("pkg:npm/p", "1.0", 10*hour)
+	if _, err := st.pool.Exec(ctx, `UPDATE samples SET created_at = now() - interval '30 hours' WHERE sha256 = $1`, digestOf("pinned 1.0")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(ctx, `UPDATE scans SET scanned_at = now() - interval '30 hours'
+		WHERE sample_id IN (SELECT id FROM samples WHERE sha256 = $1)`, digestOf("pinned 1.0")); err != nil {
+		t.Fatal(err)
+	}
+	if got := wait(); got < 10*hour-time.Minute || got > 10*hour+time.Minute {
+		t.Errorf("wait %v, want about 10h from the claim", got)
+	}
+}
