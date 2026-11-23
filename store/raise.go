@@ -62,7 +62,8 @@ type Cited struct {
 //
 // A reference is resolved one hop, at the version scan pinned. A URL raises
 // when the newest file held under it is hostile, or the bytes it served when
-// scanned are. Files are walked through contents to raiseDepth levels. A file
+// scanned are. A reference back to the file itself cannot raise it. Files are
+// walked through contents to raiseDepth levels. A file
 // labelled good never raises: the label is the brake on a false positive in a
 // popular package, which would otherwise make every declarer hostile.
 func (st *Store) Raise(ctx context.Context, id int64) (*Raised, error) {
@@ -120,23 +121,23 @@ func (st *Store) raisingRefs(ctx context.Context, id int64) (by []Raiser, trunca
 			      ORDER BY name_id, version, kind LIMIT $3) r
 			CROSS JOIN LATERAL (
 				SELECT x.sha256, x.fires_at FROM (
-					SELECT s.sha256, v.fires_at
+					SELECT s.id, s.sha256, v.fires_at
 					FROM samples s
 					JOIN verdicts v ON v.sample_id = s.id AND v.scanner_id = $2 AND v.class = 'hostile'
 					WHERE r.kind <> 'url_fetch' AND s.name_id = r.name_id AND s.version = r.version AND s.label <> 'good'
 					UNION ALL
-					SELECT s.sha256, v.fires_at
+					SELECT s.id, s.sha256, v.fires_at
 					FROM (SELECT id, sha256, label FROM samples
 					      WHERE r.kind = 'url_fetch' AND name_id = r.name_id AND version = r.version
 					      ORDER BY id DESC LIMIT 1) s
 					JOIN verdicts v ON v.sample_id = s.id AND v.scanner_id = $2 AND v.class = 'hostile'
 					WHERE s.label <> 'good'
 					UNION ALL
-					SELECT s.sha256, v.fires_at
+					SELECT s.id, s.sha256, v.fires_at
 					FROM samples s
 					JOIN verdicts v ON v.sample_id = s.id AND v.scanner_id = $2 AND v.class = 'hostile'
 					WHERE r.kind = 'url_fetch' AND s.sha256 = r.fetched AND s.label <> 'good'
-				) x LIMIT 1) h
+				) x WHERE x.id <> $1 LIMIT 1) h
 			ORDER BY r.name_id, r.version, r.kind
 			LIMIT $4) hit
 		JOIN names n ON n.id = hit.name_id
@@ -243,8 +244,12 @@ func (st *Store) cited(ctx context.Context, id int64, reach []int64, by []Raiser
 	rows, err := st.pool.Query(ctx, sightingColumns+`, r.kind::text, n.name, r.version, r.fetched
 		FROM (SELECT name_id, version, kind, fetched FROM refs WHERE sample_id = $1
 		      ORDER BY name_id, version, kind LIMIT $2) r
+		JOIN samples subject ON subject.id = $1
 		JOIN names n ON n.id = r.name_id
-		JOIN sightings g ON g.subject = n.name OR g.subject = encode(r.fetched, 'hex')
+		JOIN sightings g ON (g.subject = n.name AND
+			(r.name_id, r.version) IS DISTINCT FROM (subject.name_id, subject.version))
+			OR g.subject = encode(r.fetched, 'hex')
+		WHERE r.fetched IS DISTINCT FROM subject.sha256
 		ORDER BY n.name, r.version, r.kind
 		LIMIT $3`, id, raiseRefs, ledgerRows)
 	if err != nil {

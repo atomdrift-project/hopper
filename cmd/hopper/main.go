@@ -1351,6 +1351,7 @@ func cmdLoad(ctx context.Context) error { //nolint:nolintlint,revive,maintidx,go
 	if *dashAddr != "" {
 		wd = &webDashboard{}
 		dashMux := http.NewServeMux()
+		dashMux.HandleFunc("GET /workers.json", wd.workersJSON)
 		dashMux.HandleFunc("/", wd.handler)
 		if err := startHTTPServer(ctx, *dashAddr, recoverMiddleware(obs.Middleware(dashMux))); err != nil {
 			slog.Warn("web dashboard disabled", "error", err)

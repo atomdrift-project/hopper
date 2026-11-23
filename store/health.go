@@ -22,11 +22,10 @@ type Health struct {
 	// Depths counts queued files by priority; Stuck those handed out too
 	// often without a result.
 	Depths map[Priority]int64
-	// SightedWait is how long the longest-waiting file sighted-pinned offers
-	// has waited, counted from when its claim, the file and its first
-	// analysis were all present. Zero when the queue is empty: files whose
-	// retries ran out, or that no exact-version claim of the last day names,
-	// are not work this queue can do.
+	// SightedWait is how long the longest-waiting file in the sighted-pinned
+	// triage queue has waited for judgement (see sightedPinnedWait). It is
+	// not the scan queue: a row stuck there is never handed out again, so
+	// its age only grows, and it is counted in Stuck instead.
 	SightedWait time.Duration
 	// Scanned counts scans made since the time asked for; Rescanned those of
 	// files that arrived before it, which is as near as the store comes to
@@ -50,7 +49,6 @@ const liveUnacquired = `g.attempted_at IS NULL AND g.claim IN ('malicious', 'sus
 func (st *Store) Health(ctx context.Context, since, unfinishedBefore time.Time) (*Health, error) {
 	var h Health
 	var arrived, scanned, unacquired *time.Time
-	var sightedWait *float64
 	// A digest claim counts only when hopper holds the bytes it names:
 	// citing what nobody has is not work an acquirer can do.
 	err := st.pool.QueryRow(ctx, `SELECT
@@ -72,13 +70,6 @@ func (st *Store) Health(ctx context.Context, since, unfinishedBefore time.Time) 
 	if err != nil {
 		return nil, fmt.Errorf("store: health: %w", err)
 	}
-	// Its own query: the candidate clause binds $1 as the queue's report type.
-	err = st.pool.QueryRow(ctx, sightedPinnedCandidates+`
-		SELECT extract(epoch FROM now() - min(greatest(sighted, created_at, coalesce(scanned_at, created_at)))) FROM c`,
-		"sighted-pinned", [][]byte{}).Scan(&sightedWait)
-	if err != nil {
-		return nil, fmt.Errorf("store: health: sighted wait: %w", err)
-	}
 	for _, t := range []struct {
 		dst *time.Time
 		src *time.Time
@@ -87,8 +78,8 @@ func (st *Store) Health(ctx context.Context, since, unfinishedBefore time.Time) 
 			*t.dst = t.src.UTC()
 		}
 	}
-	if sightedWait != nil {
-		h.SightedWait = time.Duration(*sightedWait * float64(time.Second))
+	if h.SightedWait, err = st.sightedPinnedWait(ctx); err != nil {
+		return nil, err
 	}
 	if h.Depths, h.Stuck, err = st.Depths(ctx); err != nil {
 		return nil, err

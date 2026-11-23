@@ -50,7 +50,7 @@ func setEnumerationHealth(dir string, full, healthy bool) {
 // records into. Grouping them lets the registration read as a flat manifest and
 // keeps the callback's parameter list to one pointer.
 type instruments struct {
-	pending, rescan, cleavePending, litmusPending                metric.Int64Observable
+	pending, rescan, cleavePending, litmusPending, stuck         metric.Int64Observable
 	unattemptedAge                                               metric.Int64Observable
 	sightedInvestigationLag                                      metric.Int64Observable
 	retiredNoOutcome                                             metric.Int64Observable
@@ -444,6 +444,11 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 		rescan:        gauge("hopper.queue.rescan", "Samples queued for re-analysis across the forced, repair and age tiers.", "{sample}"),
 		cleavePending: gauge("hopper.queue.cleave_pending", "Samples awaiting the cleave stage.", "{sample}"),
 		litmusPending: gauge("hopper.queue.litmus_pending", "Samples awaiting the litmus stage.", "{sample}"),
+		// Store only. A row handed out 8 times without a result leaves the
+		// queue's hand-out index and is never offered again, but stays in the
+		// table, so nothing else counts it and nothing retries it.
+		stuck: gauge("hopper.queue.stuck",
+			"Queued scans handed out 8 times without a result; never handed out again until requeued.", "{sample}"),
 		// The 2026-09-07 post-mortem's alert. A threat-feed claim nothing has
 		// tried to fetch is the one failure that costs artifacts outright: a
 		// registry can withdraw the bytes while the claim waits, and then no
@@ -452,9 +457,9 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 			"Age of the longest-waiting live threat-feed claim that nothing has tried to acquire;"+
 				" backfill and hashes without retrievable sample bytes are excluded.", "s"),
 		sightedInvestigationLag: gauge("hopper.sightings.investigation_wait",
-			"Longest wait for judgement in sighted-pinned: available, eligible samples with an exact-version"+
-				" malicious or suspicious package claim received in the last 24h; starts when the claim, sample and"+
-				" first analysis are all present.", "s"),
+			"Longest wait for judgement in sighted-pinned: available, analyzed, eligible samples with an exact-version"+
+				" malicious or suspicious package claim received in the last 24h; starts when the claim and sample are"+
+				" both present (legacy tables: and the first analysis).", "s"),
 		// The counterpart to unattempted_age, and the price of making a claimed
 		// target terminal. A target claimed for recovery and never reporting an
 		// outcome is work the system has permanently given up on and will not
@@ -806,6 +811,7 @@ func (wd *webDashboard) observeStore(ctx context.Context, observer metric.Observ
 	observer.ObserveInt64(in.pending, pending)
 	observer.ObserveInt64(in.rescan, rescan)
 	observer.ObserveInt64(in.cleavePending, pending)
+	observer.ObserveInt64(in.stuck, h.Stuck)
 	var unacquired time.Duration
 	if !h.OldestUnacquired.IsZero() {
 		unacquired = now.Sub(h.OldestUnacquired)

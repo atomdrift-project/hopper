@@ -460,6 +460,61 @@ func TestTriageSighted(t *testing.T) {
 	}
 }
 
+// The sighted-pinned wait measures the files the queue would hand out, from
+// when both the claim and the bytes were here, and nothing else.
+func TestSightedPinnedWait(t *testing.T) {
+	st := open(t)
+	ctx := t.Context()
+	wait := func(want time.Duration, why string) {
+		t.Helper()
+		got, err := st.sightedPinnedWait(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got < want-time.Minute || got > want+time.Minute {
+			t.Errorf("wait %v, want %v: %s", got, want, why)
+		}
+	}
+	wait(0, "an empty queue waits for nothing")
+
+	rel := func(bytes, pkg string, change func(*fixture)) *fixture {
+		return with(base(bytes, "good"), func(f *fixture) {
+			f.pkg, f.version = pkg, "1"
+			change(f)
+		})
+	}
+	world(ctx, t, st,
+		rel("claimed after arrival", "pkg:npm/a", func(*fixture) {}),
+		rel("arrived after claim", "pkg:npm/b", func(f *fixture) { f.created = 2 * hour }),
+		rel("old claim", "pkg:npm/c", func(*fixture) {}),
+		rel("whole package", "pkg:npm/d", func(*fixture) {}),
+		rel("never scanned", "pkg:npm/e", func(f *fixture) { f.scanned, f.atomscan = 0, "" }),
+		rel("reviewed", "pkg:npm/f", func(*fixture) {}),
+	)
+	now := time.Now()
+	for _, s := range []struct {
+		subject, affected string
+		ago               time.Duration
+	}{
+		{"pkg:npm/a", "1", 5 * hour},
+		{"pkg:npm/b", "1", 10 * hour},
+		{"pkg:npm/c", "1", 30 * hour},
+		{"pkg:npm/d", "", 20 * hour},
+		{"pkg:npm/e", "1", 20 * hour},
+		{"pkg:npm/f", "1", 20 * hour},
+	} {
+		if _, err := st.pool.Exec(ctx, `INSERT INTO sightings (source, subject, affected, first_seen) VALUES ('feed', $1, $2, $3)`,
+			s.subject, s.affected, now.Add(-s.ago)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	report(ctx, t, st, "reviewed", "sighted-pinned", 30*time.Minute)
+	wait(5*hour, "the claim came after the bytes; older, whole-package, unscanned and reviewed files do not count")
+
+	report(ctx, t, st, "claimed after arrival", "sighted-pinned", 0)
+	wait(2*hour, "the bytes came after the claim")
+}
+
 func TestTriageGauntlet(t *testing.T) {
 	st := open(t)
 	ctx := t.Context()

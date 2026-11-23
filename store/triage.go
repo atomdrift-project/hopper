@@ -432,12 +432,32 @@ func sighted(ctx context.Context, st *Store, queue string, n int, excluded [][]b
 		queue, excluded, n, sightedOverfetch)
 }
 
+// sightedPinnedFiles is sighted-pinned's membership, c: every file the queue
+// would hand out, with when its earliest exact-version claim of the last day
+// was seen. sightedPinned orders it and sightedPinnedWait measures it, so the
+// alert on the queue cannot drift from the queue. $1 and $2 are
+// triageShared's.
+var sightedPinnedFiles = `WITH m AS (
+			SELECT s.id, min(g.first_seen) AS sighted FROM sightings g
+			JOIN names n ON n.name = g.subject
+			JOIN samples s ON s.name_id = n.id AND s.version = ANY (exact_versions(g.affected))
+			WHERE g.claim IN ('malicious', 'suspicious') AND starts_with(g.subject, 'pkg:')
+			  AND g.first_seen > now() - interval '24 hours'
+			GROUP BY s.id
+		), c AS (
+			SELECT m.id, m.sighted, s.name_id, s.created_at FROM m
+			JOIN samples s ON s.id = m.id
+			JOIN verdicts a ON a.sample_id = s.id AND a.scanner_id = 1
+			LEFT JOIN scans sc ON sc.sample_id = s.id
+			WHERE ` + sightedCandidate + `
+		)`
+
 // sightedPinned: releases a claim of the last day names by exact version
 // (exact_versions()),
 // a few of each package per round so one package's long list does not crowd
 // out the rest.
 func sightedPinned(ctx context.Context, st *Store, queue string, n int, excluded [][]byte, _ int) ([]int64, error) {
-	return st.sampleIDs(ctx, sightedPinnedCandidates+`, r AS (
+	return st.sampleIDs(ctx, sightedPinnedFiles+`, r AS (
 			SELECT id, name_id, row_number() OVER (PARTITION BY name_id ORDER BY sighted, created_at, id) AS rank,
 			       min(sighted) OVER (PARTITION BY name_id) AS first
 			FROM c
@@ -446,26 +466,28 @@ func sightedPinned(ctx context.Context, st *Store, queue string, n int, excluded
 		queue, excluded, n, pinnedPerPackage)
 }
 
-// sightedPinnedCandidates is the WITH clause naming the files sighted-pinned
-// may serve, as c(id, sighted, name_id, created_at, scanned_at): files a claim
-// of the last day names by exact version that are judged, on disk, settled
-// and not already reported on. Binds $1 (queue), $2 (excluded digests). The
-// queue and the investigation-wait gauge (Health) both read it, so the alert
-// measures exactly the work the queue offers.
-var sightedPinnedCandidates = `WITH m AS (
-			SELECT s.id, min(g.first_seen) AS sighted FROM sightings g
-			JOIN names n ON n.name = g.subject
-			JOIN samples s ON s.name_id = n.id AND s.version = ANY (exact_versions(g.affected))
-			WHERE g.claim IN ('malicious', 'suspicious') AND starts_with(g.subject, 'pkg:')
-			  AND g.first_seen > now() - interval '24 hours'
-			GROUP BY s.id
-		), c AS (
-			SELECT m.id, m.sighted, s.name_id, s.created_at, sc.scanned_at FROM m
-			JOIN samples s ON s.id = m.id
-			JOIN verdicts a ON a.sample_id = s.id AND a.scanner_id = 1
-			LEFT JOIN scans sc ON sc.sample_id = s.id
-			WHERE ` + sightedCandidate + `
-		)`
+// sightedPinnedWait is how long the longest-waiting file sighted-pinned would
+// hand out has waited for judgement; zero when it would hand out none.
+//
+// The clock starts once both the claim and the bytes are here. It cannot
+// start at the first scan, as the legacy measure did: the store keeps no
+// such time. scans and atomscan's verdict both move with every rescan, and a
+// new ruleset rescans everything, so a clock started there would be reset by
+// a deploy and hide a stalled queue. Only files atomscan has judged are in
+// the queue, so a cited file's first scan is counted; it is the first thing
+// the scan queue hands out.
+func (st *Store) sightedPinnedWait(ctx context.Context) (time.Duration, error) {
+	var seconds *float64
+	if err := st.pool.QueryRow(ctx, sightedPinnedFiles+`
+		SELECT extract(epoch FROM now() - min(greatest(sighted, created_at))) FROM c`,
+		"sighted-pinned", [][]byte{}).Scan(&seconds); err != nil {
+		return 0, fmt.Errorf("store: sighted-pinned wait: %w", err)
+	}
+	if seconds == nil {
+		return 0, nil
+	}
+	return time.Duration(max(*seconds, 0) * float64(time.Second)), nil
+}
 
 // gauntlet returns the files whose newest usable gauntlet observation says
 // atomscan misjudged them: a good file detected, or a bad one passed. The

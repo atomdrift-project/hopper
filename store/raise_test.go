@@ -181,6 +181,52 @@ func TestRaise(t *testing.T) {
 	})
 }
 
+func TestRaiseOmitsSelfReferences(t *testing.T) {
+	st := open(t)
+	ctx := t.Context()
+
+	const (
+		name  = "pkg:github/example/project"
+		root  = "project source archive"
+		older = "older project release"
+		alias = "https://example.com/archive"
+	)
+	release(ctx, t, st, root, name, "", "")
+	release(ctx, t, st, older, name, "v1.0.0", "")
+	judge(ctx, t, st, older, "hostile", 7, nil, nil)
+	judge(ctx, t, st, root, "hostile", 3, nil, []map[string]any{
+		{"kind": "dependency", "name": name},
+		{"kind": "dependency", "name": name, "version": "v1.0.0"},
+		{"kind": "url_fetch", "name": alias, "sha256": sum(root)},
+	})
+	if _, err := st.pool.Exec(ctx, `INSERT INTO sightings (source, subject, operator, affected, claim, basis)
+		VALUES ('test', $1, 'test', '', 'malicious', 'hosted'),
+		       ('test', $2, 'test', '', 'malicious', 'hosted')`, name, sum(root)); err != nil {
+		t.Fatal(err)
+	}
+	_, raised := raise(ctx, t, st, root)
+	if got := what(raised); !slices.Equal(got, []string{"dependency:" + name + "@v1.0.0"}) {
+		t.Errorf("raised by %v, want only the older release", got)
+	}
+	if len(raised.Cited) != 0 {
+		t.Errorf("unexpected self citations: %+v", raised.Cited)
+	}
+
+	const (
+		url     = "https://example.com/latest"
+		served  = "previously served URL bytes"
+		current = "latest URL bytes"
+	)
+	release(ctx, t, st, served, url, "", "")
+	release(ctx, t, st, current, url, "", "")
+	judge(ctx, t, st, served, "hostile", 9, nil, nil)
+	judge(ctx, t, st, current, "hostile", 3, nil,
+		[]map[string]any{{"kind": "url_fetch", "name": url}})
+	if _, got := raise(ctx, t, st, current); len(got.By) != 0 {
+		t.Errorf("latest URL raised by %v, want no fallback to older bytes", what(got))
+	}
+}
+
 func TestRaiseBounds(t *testing.T) {
 	st := open(t)
 	ctx := t.Context()

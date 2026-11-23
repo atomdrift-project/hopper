@@ -72,4 +72,22 @@ func TestHealth(t *testing.T) {
 	if n, err := st.Scanned(ctx); err != nil || n != 1 {
 		t.Errorf("scanned %d, %v; want 1", n, err)
 	}
+
+	// A cited file whose scan failed 8 times is never handed out again. It
+	// is stuck, and its age in the scan queue is no wait for judgement: on
+	// 2026-11-22 six such rows paged as a six-day sighted-pinned wait.
+	stuck := digestOf("cited, stuck")
+	ingest(ctx, t, st, QueueSighted, Arrival{SHA256: stuck, Size: 10, Path: "incoming/stuck"})
+	if _, err := st.pool.Exec(ctx, `UPDATE queue SET attempts = 8, queued_at = now() - interval '6 days'
+		WHERE sample_id = (SELECT id FROM samples WHERE sha256 = $1)`, stuck); err != nil {
+		t.Fatal(err)
+	}
+	h, err = st.Health(ctx, before, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Stuck != 1 || h.SightedWait != 0 || h.Depths[QueueSighted] != 0 {
+		t.Errorf("stuck %d, sighted wait %v, sighted depth %d; want the row counted as stuck and nowhere else",
+			h.Stuck, h.SightedWait, h.Depths[QueueSighted])
+	}
 }

@@ -26,6 +26,8 @@
 #     hopper_queue_rescan               samples eligible for re-analysis
 #     hopper_queue_cleave_pending       samples awaiting the cleave stage
 #     hopper_queue_litmus_pending       samples awaiting the litmus stage
+#     hopper_queue_stuck                queued scans handed out 8 times without a
+#                                       result (verdict store); never offered again
 #   Throughput:
 #     hopper_analyzed_total             cumulative samples analyzed (DB + session)
 #     hopper_analysis_rate_per_second   {tier="toplevel"|"rescan"} analyses/sec
