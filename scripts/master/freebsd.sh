@@ -320,6 +320,8 @@ load_rc_config \$name
 # Empty keeps the Hopper binary's defaults.
 : \${hopper_result_slots:=""}
 : \${hopper_store_max_conns:=""}
+# Local postdoc worker memory budget in GB (--max-memory-gb). smaug: 96 of 256.
+: \${hopper_max_memory_gb:=""}
 
 mount_args=""
 old_ifs=\$IFS
@@ -338,7 +340,7 @@ command="/usr/sbin/daemon"
 # renames the file while daemon keeps writing to the now-unlinked inode: the
 # rotated copies look correct, the disk never frees, and the log grows without
 # bound (this is how hopper.log reached 4.7G).
-command_args="-c -f -r -H -R 10 -P \${pidfile} -o \${hopper_logfile} -u hopper /usr/bin/env HOME=/home/hopper DATABASE_URL=\${hopper_db} POSTDOC_SCANNERS=$SCANNERS HOPPER_POSTDOC_CPUS=\${hopper_postdoc_cpus} $HOPPER_BIN load --data \${hopper_data} --db \${hopper_db} --source \${hopper_source} --api-addr \${hopper_api_bind} --dashboard-addr \${hopper_bind}$token_arg --postdoc $POSTDOC_LAUNCHER$llm_arg --cleave $CLEAVE_BIN\${mount_args}$dataset_arg \${hopper_result_slots:+--result-slots=\$hopper_result_slots} \${hopper_store_max_conns:+--store-max-conns=\$hopper_store_max_conns}"
+command_args="-c -f -r -H -R 10 -P \${pidfile} -o \${hopper_logfile} -u hopper /usr/bin/env HOME=/home/hopper DATABASE_URL=\${hopper_db} POSTDOC_SCANNERS=$SCANNERS HOPPER_POSTDOC_CPUS=\${hopper_postdoc_cpus} $HOPPER_BIN load --data \${hopper_data} --db \${hopper_db} --source \${hopper_source} --api-addr \${hopper_api_bind} --dashboard-addr \${hopper_bind}$token_arg --postdoc $POSTDOC_LAUNCHER$llm_arg --cleave $CLEAVE_BIN\${mount_args}$dataset_arg \${hopper_result_slots:+--result-slots=\$hopper_result_slots} \${hopper_store_max_conns:+--store-max-conns=\$hopper_store_max_conns} \${hopper_max_memory_gb:+--max-memory-gb=\$hopper_max_memory_gb}"
 
 run_rc_command "\$1"
 EOF

@@ -723,6 +723,7 @@ func (s *litmusServer) livenessWatchdog(ctx context.Context) {
 	// restart never inherits the previous process's strikes.
 	var breachPID, breaches int
 	var lastLogSweep time.Time
+	var warnedUnmeasurable bool
 	for {
 		select {
 		case <-ticker.C:
@@ -749,6 +750,14 @@ func (s *litmusServer) livenessWatchdog(ctx context.Context) {
 			limit := uint64(float64(budget) * rssKillFactor)
 			mem, err := procMemoryBytes(pid)
 			switch {
+			case errors.Is(err, errors.ErrUnsupported):
+				// Say so once: on smaug (FreeBSD, no /proc) this check failed
+				// silently for months, which read exactly like "never over budget".
+				if !warnedUnmeasurable {
+					warnedUnmeasurable = true
+					slog.Warn("cannot measure local litmus worker memory on this platform; budget is not enforced",
+						"worker", s.workerName, "os", runtime.GOOS, "budget_gb", s.maxRSSGB)
+				}
 			case err != nil:
 				// Process may have just exited; Monitor handles that.
 			case mem > limit:
@@ -836,38 +845,6 @@ func (s *litmusServer) dumpAndKill(ctx context.Context, pid int, killMsg string)
 	}
 	s.mu.Unlock()
 	return true
-}
-
-// procMemoryBytes returns pid's VmRSS+VmSwap from /proc — the kernel's own
-// accounting, immune to allocator-level undercounting inside the process.
-// Swap is included because the service cgroup runs with a small swap quota:
-// pages a bloated worker pushed there still hold the budget it was given.
-func procMemoryBytes(pid int) (uint64, error) {
-	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/status")
-	if err != nil {
-		return 0, err
-	}
-	var kb uint64
-	seen := false
-	for line := range strings.Lines(string(data)) {
-		if !strings.HasPrefix(line, "VmRSS:") && !strings.HasPrefix(line, "VmSwap:") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		v, err := strconv.ParseUint(fields[1], 10, 64) // value is in kB
-		if err != nil {
-			return 0, fmt.Errorf("parse %q: %w", strings.TrimSpace(line), err)
-		}
-		kb += v
-		seen = true
-	}
-	if !seen {
-		return 0, errors.New("no VmRSS line in /proc status")
-	}
-	return kb << 10, nil
 }
 
 func (s *litmusServer) waitExit(ctx context.Context) error {

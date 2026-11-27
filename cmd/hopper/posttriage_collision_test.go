@@ -26,6 +26,7 @@ func TestHandleTriageCollisionsAcrossPools(t *testing.T) {
 		{"dual-use", "dual-use", "", "dual-use/scan/pkg/github/stbenjam/skillsaw/v0/skillsaw@v0", "dual-use", "triage"},
 		{"pending", "pending", "", "pending/scan/pkg/github/stbenjam/skillsaw/v0/skillsaw@v0", "unknown", "forager"},
 		{"review", "review", "", "review/scan/pkg/github/stbenjam/skillsaw/v0/skillsaw@v0", "unknown", "forager"},
+		{"broken", "broken", "", "review/broken/scan/pkg/github/stbenjam/skillsaw/v0/skillsaw@v0", "unknown", "forager"},
 		{"verdict-good", "", "good", "good/mislabeled-unknown/skillsaw@v0", "good", "triage"},
 		{"verdict-bad", "", "bad", "bad/mislabeled-unknown/skillsaw@v0", "bad", "triage"},
 	} {

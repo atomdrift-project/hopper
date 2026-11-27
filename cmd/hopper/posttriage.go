@@ -246,8 +246,8 @@ type placement struct {
 // rulingPlan resolves a promoter ruling to its placement: the destination path
 // (subpath preserved beneath the ruling's tree) plus the label change to apply.
 // "sighted" demotes a feed-claimed sample out of bad/ into the sighted pool,
-// pending re-promotion by evidence. "pending" and "review" are path-only
-// workflow moves inside label="unknown" storage. ok is false for an
+// pending re-promotion by evidence. "pending", "review" and "broken" are
+// path-only workflow moves inside label="unknown" storage. ok is false for an
 // unrecognized ruling.
 func rulingPlan(_ *hopper.Sample, oldRel, ruling string) (placement, bool) {
 	sub := rulingSubpath(oldRel)
@@ -263,9 +263,11 @@ func rulingPlan(_ *hopper.Sample, oldRel, ruling string) (placement, bool) {
 	case "dual-use":
 		return placement{newRel: filepath.Join(dualUseTree, sub), label: "dual-use", source: "triage"}, true
 	case "pending":
-		return workflowPlan(oldRel, pendingPool)
+		return workflowPlan(oldRel, pendingPool, false)
 	case "review":
-		return workflowPlan(oldRel, reviewPool)
+		return workflowPlan(oldRel, reviewPool, false)
+	case "broken":
+		return workflowPlan(oldRel, reviewPool, true)
 	}
 	return placement{}, false
 }
@@ -299,13 +301,30 @@ func rulingSubpath(oldRel string) string {
 // workflowPlan moves an unknown-class sample between workflow pools while
 // preserving the source suffix below the workflow root. It deliberately has no
 // producer-specific cases: review/foraged is just review/<suffix>.
-func workflowPlan(oldRel, dstRoot string) (placement, bool) {
+//
+// broken files the sample under review/broken/<suffix>: the review subtree for
+// samples whose analysis repeatedly took the scanner down. It is part of the
+// review queue, so a human sees it, and outside every tree promoter walks, so
+// it is not re-sent to the scanner that died on it. The broken/ component is dropped
+// before it is (re)applied, so re-filing never nests it and any other workflow
+// move takes the sample back to its ordinary <pool>/<suffix>.
+func workflowPlan(oldRel, dstRoot string, broken bool) (placement, bool) {
 	newRel, err := hopper.RebasePoolPath(filepath.ToSlash(oldRel), dstRoot)
 	if err != nil {
 		return placement{}, false
 	}
-	return placement{newRel: filepath.FromSlash(newRel)}, true
+	suffix := strings.TrimPrefix(strings.TrimPrefix(newRel, dstRoot+"/"), brokenDir+"/")
+	if suffix == "" {
+		return placement{}, false
+	}
+	if broken {
+		suffix = brokenDir + "/" + suffix
+	}
+	return placement{newRel: filepath.FromSlash(dstRoot + "/" + suffix)}, true
 }
+
+// brokenDir is the review/ subtree the "broken" ruling files samples under.
+const brokenDir = "broken"
 
 // triageRequest is the JSON body for POST /v1/triage/rulings.
 type triageRequest struct {
@@ -624,10 +643,10 @@ func (*apiServer) triagePlan(samp *hopper.Sample, oldRel string, v triageVerdict
 	if v.Ruling != "" {
 		plan, ok := rulingPlan(samp, oldRel, v.Ruling)
 		if !ok {
-			return placement{}, errors.New(`ruling must be "good", "bad", "sighted", "inconclusive", "dual-use", "pending", or "review"` +
+			return placement{}, errors.New(`ruling must be "good", "bad", "sighted", "inconclusive", "dual-use", "pending", "review", or "broken"` +
 				` ("purgatory" aliases "inconclusive")`)
 		}
-		if (v.Ruling == "pending" || v.Ruling == "review") && samp.Label != "unknown" {
+		if (v.Ruling == "pending" || v.Ruling == "review" || v.Ruling == "broken") && samp.Label != "unknown" {
 			return placement{}, errors.New(`workflow ruling requires label "unknown"`)
 		}
 		// A client-supplied source attributes the relabel to its author (e.g.

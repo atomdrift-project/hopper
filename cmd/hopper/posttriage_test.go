@@ -657,6 +657,11 @@ func TestRulingPlanPreservesSubpath(t *testing.T) {
 		{"review to pending", "review/foraged/" + sub, "pending", "pending/foraged/" + sub},
 		{"incoming to review", "incoming/scan/sha/example.com/ab/cd/hash/pkg.tgz", "review", "review/scan/sha/example.com/ab/cd/hash/pkg.tgz"},
 		{"legacy review not special", "unknown/foraged-review/" + sub, "review", "review/foraged-review/" + sub},
+		{"pending to broken", "pending/scan/sha/github.com/1c/22/hash/v4.0.2.tar.gz", "broken", "review/broken/scan/sha/github.com/1c/22/hash/v4.0.2.tar.gz"},
+		{"review to broken", "review/foraged/" + sub, "broken", "review/broken/foraged/" + sub},
+		{"broken again does not nest", "review/broken/foraged/" + sub, "broken", "review/broken/foraged/" + sub},
+		{"broken back to pending", "review/broken/foraged/" + sub, "pending", "pending/foraged/" + sub},
+		{"broken back to review", "review/broken/foraged/" + sub, "review", "review/foraged/" + sub},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, ok := rulingPlan(nil, tc.oldRel, tc.ruling)
