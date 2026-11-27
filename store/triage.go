@@ -494,6 +494,8 @@ func (st *Store) sightedPinnedWait(ctx context.Context) (time.Duration, error) {
 // newest observation is chosen before the test, so an old miss does not
 // come back after a newer run shows it fixed. A review answers one
 // observation (its evidence key) for good; a withdrawn good file is left out.
+// The newest observations go first: they judge the rules now deployed, so a
+// backfill of old runs cannot bury what the latest runs found.
 func (st *Store) gauntlet(ctx context.Context, n int, excluded [][]byte) ([]Candidate, error) {
 	rows, err := st.pool.Query(ctx, `WITH ranked AS (
 			SELECT g.run_id, g.sha256, g.label, v.status, v.evidence_key, v.payload, r.observed_at, r.metadata,
@@ -515,7 +517,7 @@ func (st *Store) gauntlet(ctx context.Context, n int, excluded [][]byte) ([]Cand
 		  AND NOT EXISTS (SELECT 1 FROM reports p WHERE p.sample_id = s.id AND p.report_type = 'gauntlet'
 		                  AND p.evidence_key = c.evidence_key)
 		  AND s.sha256 <> ALL ($1::bytea[])
-		ORDER BY c.observed_at, c.sha256 LIMIT $2`, excluded, n)
+		ORDER BY c.observed_at DESC, c.sha256 LIMIT $2`, excluded, n)
 	if err != nil {
 		return nil, fmt.Errorf("store: triage gauntlet: %w", err)
 	}

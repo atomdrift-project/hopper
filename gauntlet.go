@@ -455,7 +455,7 @@ const gauntletCandidatesSQL = `WITH ranked AS (
  AND NOT EXISTS(SELECT 1 FROM reports p WHERE p.sha256=c.sha256 AND p.report_type='gauntlet' AND p.evidence_key=c.evidence_key)`
 
 // TriageGauntlet returns up to n files a published gauntlet run saw atomscan
-// misjudge, oldest observation first, leaving out excluded digests; each
+// misjudge, newest observation first, leaving out excluded digests; each
 // carries the observation it answers in Sample.Gauntlet.
 func (db *DB) TriageGauntlet(ctx context.Context, n int, excluded []string) ([]*Sample, error) {
 	args := []any{}
@@ -466,7 +466,7 @@ func (db *DB) TriageGauntlet(ctx context.Context, n int, excluded []string) ([]*
 		fmt.Fprintf(&b, " AND c.sha256<>$%d", len(args))
 	}
 	args = append(args, n)
-	fmt.Fprintf(&b, " ORDER BY c.observed_at,c.sha256 LIMIT $%d", len(args))
+	fmt.Fprintf(&b, " ORDER BY c.observed_at DESC,c.sha256 LIMIT $%d", len(args))
 	q := b.String()
 	type candidate struct {
 		sha string
@@ -604,7 +604,7 @@ func TransferGauntlet(ctx context.Context, dst, src *DB) error {
 // live analysis blobs or constructing a Sample for each row just to count it.
 func (db *DB) GauntletDepth(ctx context.Context) (counts map[string]int64, capped bool, err error) {
 	counts = map[string]int64{"false_positive": 0, "miss": 0}
-	q := `SELECT label,count(*) FROM (` + gauntletCandidatesSQL + ` ORDER BY c.observed_at,c.sha256 LIMIT $1) pending GROUP BY label`
+	q := `SELECT label,count(*) FROM (` + gauntletCandidatesSQL + ` ORDER BY c.observed_at DESC,c.sha256 LIMIT $1) pending GROUP BY label`
 	err = db.queryGauntlet(ctx, q, []any{TriageDepthCap}, func(rows sqlRows) error {
 		for rows.Next() {
 			var label string

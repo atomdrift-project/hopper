@@ -556,13 +556,14 @@ func TestTriageGauntlet(t *testing.T) {
 		SELECT id, 'gauntlet', 'x', 'run1/' || encode(sha256, 'hex') FROM samples WHERE sha256 = $1`, digestOf("reviewed")); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := queued(ctx, t, st, "gauntlet", names...), []string{"good, detected", "bad, passed"}; !slices.Equal(got, want) {
+	// Newest observation first: run2's miss before run1's false positive.
+	if got, want := queued(ctx, t, st, "gauntlet", names...), []string{"bad, passed", "good, detected"}; !slices.Equal(got, want) {
 		t.Errorf("gauntlet %q, want %q", got, want)
 	}
 	got, err := st.Triage(ctx, "gauntlet", 1, nil)
-	if err != nil || len(got) != 1 || got[0].Gauntlet == nil || got[0].Gauntlet.Key != "run1/"+hexOf(digestOf("good, detected")) ||
-		got[0].Gauntlet.Expected != "good" || string(got[0].Gauntlet.Metadata) == "" {
-		t.Errorf("first gauntlet candidate %+v, %v: want the run's evidence with it", got, err)
+	if err != nil || len(got) != 1 || got[0].Gauntlet == nil || got[0].Gauntlet.Key != "run2/"+hexOf(digestOf("bad, passed")) ||
+		got[0].Gauntlet.Expected != "bad" || string(got[0].Gauntlet.Metadata) == "" {
+		t.Errorf("first gauntlet candidate %+v, %v: want the newest run's evidence with it", got, err)
 	}
 }
 
