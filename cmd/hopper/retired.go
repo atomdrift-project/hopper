@@ -43,7 +43,7 @@ var retired = map[string]string{
 	"/api/triage/{queue}/depth": "/v1/triage/{queue}/depth",
 	"/api/report":               "/v1/triage/reports",
 	"/api/stranded/{sha256}":    "",
-	"/api/gauntlet/runs":        "",
+	"/api/gauntlet/runs":        "/v1/gauntlet/runs",
 	"/api/gauntlet/runs/{id}":   "",
 }
 

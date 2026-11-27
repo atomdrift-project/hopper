@@ -153,7 +153,8 @@ one bearer token.
 | `GET /data/{path}` | goes; `/v1/files/{sha256}` (a ruling already checks the catalogued path) | collimator script |
 | `GET /api/stranded/{sha256}` | goes into `/v1/triage/stranded` | cyclotron |
 | `POST /api/cleave-result` | `/v1/work/result`, once a juror a body does not name is no statement, as a scanner is; the writer drops it today, which is why this route exists | cyclotron |
-| `POST /api/release`, `GET /api/triage/queues`, `GET`/`POST /api/gauntlet/runs`, `GET /_/corroboration` | go: no caller | — |
+| `POST /api/gauntlet/runs` | `/v1/gauntlet/runs` (`Store.AddGauntletRun`) | gauntlet |
+| `POST /api/release`, `GET /api/triage/queues`, `GET /api/gauntlet/runs/{id}`, `GET /_/corroboration` | go: no caller | — |
 | every other `/api/…` | its place in the tree | as found by `rg` |
 
 **Wire rules** (from a review against Google's AIPs):

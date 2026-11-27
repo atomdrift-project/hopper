@@ -12,6 +12,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/atomdrift-project/hopper/store"
 )
 
 //go:embed gauntlet_schema.sql
@@ -239,12 +241,50 @@ func normalizeGauntletSample(s *GauntletSample) error {
 	return nil
 }
 
+// PrepareGauntletRun normalizes a run and lays it out as the rows it is kept
+// in: the digest an identical replay must match, and each result's evidence
+// key. Both backends write from it, so they agree on every key a review
+// answers.
+func PrepareGauntletRun(in GauntletRun) (store.GauntletRun, error) {
+	r, err := NormalizeGauntletRun(in)
+	if err != nil {
+		return store.GauntletRun{}, err
+	}
+	payload, err := json.Marshal(r)
+	if err != nil {
+		return store.GauntletRun{}, err
+	}
+	meta := r
+	meta.Samples = nil
+	metadata, err := json.Marshal(meta)
+	if err != nil {
+		return store.GauntletRun{}, err
+	}
+	out := store.GauntletRun{
+		ID: r.ID, Producer: r.Producer, ObservedAt: r.ObservedAt, Source: r.Source,
+		Digest: gauntletHashBytes(payload), Metadata: string(metadata),
+		Samples: make([]store.GauntletSample, len(r.Samples)), Withdrawn: r.Withdrawn,
+	}
+	for i, s := range r.Samples {
+		results := make([]store.GauntletResult, len(s.Results))
+		for j, v := range s.Results {
+			results[j] = store.GauntletResult{
+				Scanner: v.Scanner, Status: v.Status, EvidenceKey: gauntletEvidenceKey(r, s, v), Payload: string(v.Payload),
+			}
+		}
+		out.Samples[i] = store.GauntletSample{
+			SHA256: s.SHA256, Label: s.Label, Eligible: s.Eligible, Metadata: string(s.Metadata), Results: results,
+		}
+	}
+	return out, nil
+}
+
 type gauntletRow interface{ Scan(...any) error }
 
 // StoreGauntletRun commits a whole batch or none of it. An identical retry is a
 // no-op; a conflicting retry never overwrites the original observations.
 func (db *DB) StoreGauntletRun(ctx context.Context, in GauntletRun) (bool, error) {
-	r, err := NormalizeGauntletRun(in)
+	r, err := PrepareGauntletRun(in)
 	if err != nil {
 		return false, err
 	}
@@ -276,22 +316,11 @@ func (db *DB) StoreGauntletRun(ctx context.Context, in GauntletRun) (bool, error
 	return fresh, tx.Commit()
 }
 
-func storeGauntletRun(r GauntletRun, exec func(string, ...any) error, row func(string, ...any) gauntletRow) (bool, error) {
-	payload, err := json.Marshal(r)
-	if err != nil {
-		return false, err
-	}
-	digest := gauntletHashBytes(payload)
-	meta := r
-	meta.Samples = nil
-	b, err := json.Marshal(meta)
-	if err != nil {
-		return false, err
-	}
+func storeGauntletRun(r store.GauntletRun, exec func(string, ...any) error, row func(string, ...any) gauntletRow) (bool, error) {
 	// A unique insert serializes competing submissions before the digest check.
 	var inserted string
-	err = row(`INSERT INTO gauntlet_runs(id,producer,observed_at,source,digest,metadata)
- VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(id) DO NOTHING RETURNING id`, r.ID, r.Producer, r.ObservedAt, r.Source, digest, string(b)).Scan(&inserted)
+	err := row(`INSERT INTO gauntlet_runs(id,producer,observed_at,source,digest,metadata)
+ VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(id) DO NOTHING RETURNING id`, r.ID, r.Producer, r.ObservedAt, r.Source, r.Digest, r.Metadata).Scan(&inserted)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
@@ -300,20 +329,20 @@ func storeGauntletRun(r GauntletRun, exec func(string, ...any) error, row func(s
 		if err := row(`SELECT digest FROM gauntlet_runs WHERE id=$1`, r.ID).Scan(&stored); err != nil {
 			return false, err
 		}
-		if stored != digest {
+		if stored != r.Digest {
 			return false, ErrGauntletConflict
 		}
 		return false, nil
 	}
 	for _, s := range r.Samples {
 		err := exec(`INSERT INTO gauntlet_samples(run_id,sha256,label,eligible,metadata) VALUES($1,$2,$3,$4,$5)`,
-			r.ID, s.SHA256, s.Label, s.Eligible, string(s.Metadata))
+			r.ID, s.SHA256, s.Label, s.Eligible, s.Metadata)
 		if err != nil {
 			return false, err
 		}
 		for _, v := range s.Results {
 			err := exec(`INSERT INTO gauntlet_results(run_id,sha256,scanner,status,evidence_key,payload) VALUES($1,$2,$3,$4,$5,$6)`,
-				r.ID, s.SHA256, v.Scanner, v.Status, gauntletEvidenceKey(r, s, v), string(v.Payload))
+				r.ID, s.SHA256, v.Scanner, v.Status, v.EvidenceKey, v.Payload)
 			if err != nil {
 				return false, err
 			}

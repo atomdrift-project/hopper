@@ -400,11 +400,11 @@ require no hashing or writes.
 
 ## Gauntlet history
 
-`POST /api/gauntlet/runs` accepts a bounded, complete run envelope. A transaction
-stores its metadata, sample metadata and every scanner verdict. Identical
-replays are no-ops; conflicting immutable content returns 409. The authenticated
-write follows the existing primary/replica relay policy.
-`GET /api/gauntlet/runs/{id}` reconstructs a stored envelope.
+`POST /v1/gauntlet/runs` accepts a bounded, complete run envelope and answers
+`{"id", "inserted"}`. A transaction stores its metadata, sample metadata and
+every scanner verdict, in the verdict schema when the results store is
+configured. Identical replays are no-ops; conflicting immutable content returns
+409. The authenticated write follows the existing primary/replica relay policy.
 
 `hopper ingest-gauntlet --dsn /path/history.sqlite --input history.ndjson`
 imports the same envelopes directly, including into an otherwise empty database.
