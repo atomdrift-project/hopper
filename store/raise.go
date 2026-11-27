@@ -241,15 +241,21 @@ func (st *Store) cited(ctx context.Context, id int64, reach []int64, by []Raiser
 		}
 		out[i].Sightings = append(out[i].Sightings, g)
 	}
+	// A reference back to the file itself cannot raise it, so self-references
+	// are settled inside the LIMITed subquery, against the file's own row. The
+	// LIMIT keeps the planner from flattening it: with the subject joined at
+	// the outer level instead, the generic plan pgx's prepared statements
+	// settle on walked names_name_key end to end for the ORDER BY — 4.2M names,
+	// 7s a lookup against a 5s budget — and /v1/lookup failed 4–10% of the
+	// time from 2026-11-23.
 	rows, err := st.pool.Query(ctx, sightingColumns+`, r.kind::text, n.name, r.version, r.fetched
-		FROM (SELECT name_id, version, kind, fetched FROM refs WHERE sample_id = $1
-		      ORDER BY name_id, version, kind LIMIT $2) r
-		JOIN samples subject ON subject.id = $1
+		FROM (SELECT f.name_id, f.version, f.kind, f.fetched,
+		             (f.name_id, f.version) IS NOT DISTINCT FROM (s.name_id, s.version) AS own
+		      FROM refs f JOIN samples s ON s.id = f.sample_id
+		      WHERE f.sample_id = $1 AND f.fetched IS DISTINCT FROM s.sha256
+		      ORDER BY f.name_id, f.version, f.kind LIMIT $2) r
 		JOIN names n ON n.id = r.name_id
-		JOIN sightings g ON (g.subject = n.name AND
-			(r.name_id, r.version) IS DISTINCT FROM (subject.name_id, subject.version))
-			OR g.subject = encode(r.fetched, 'hex')
-		WHERE r.fetched IS DISTINCT FROM subject.sha256
+		JOIN sightings g ON (g.subject = n.name AND NOT r.own) OR g.subject = encode(r.fetched, 'hex')
 		ORDER BY n.name, r.version, r.kind
 		LIMIT $3`, id, raiseRefs, ledgerRows)
 	if err != nil {
