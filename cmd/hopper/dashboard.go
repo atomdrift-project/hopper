@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"html"
@@ -76,7 +77,7 @@ type webDashboard struct {
 	pendingCache *fido.Cache[string, int64]
 	healthCache  *fido.Cache[string, hopper.WorkflowHealth]
 	// storeHealthCache holds the verdict store's corpus gauges (observeStore).
-	storeHealthCache *fido.Cache[string, *store.Health]
+	storeHealthCache *fido.Cache[string, *corpusReading]
 	storeWorkCache   *fido.Cache[string, *store.Work]
 	backlogCache     *fido.Cache[string, []hopper.WorkflowBacklog]
 	samplesCache     *fido.Cache[string, []hopper.WorkflowSample]
@@ -204,7 +205,7 @@ func (wd *webDashboard) configure( //nolint:revive // argument-limit: dashboard 
 	wd.pendingCache = fido.New[string, int64](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.seriesCache = fido.New[string, []queuePoint](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.healthCache = fido.New[string, hopper.WorkflowHealth](fido.Size(1), fido.TTL(dashCacheTTL))
-	wd.storeHealthCache = fido.New[string, *store.Health](fido.Size(1), fido.TTL(dashCacheTTL))
+	wd.storeHealthCache = fido.New[string, *corpusReading](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.storeWorkCache = fido.New[string, *store.Work](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.backlogCache = fido.New[string, []hopper.WorkflowBacklog](fido.Size(1), fido.TTL(dashCacheTTL))
 	wd.samplesCache = fido.New[string, []hopper.WorkflowSample](fido.Size(3), fido.TTL(dashCacheTTL))
@@ -536,7 +537,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	// legacy tables stop moving once it holds the corpus.
 	var (
 		st     *store.Store
-		health *store.Health
+		health *corpusReading
 	)
 	if api != nil && api.results != nil {
 		st = api.results
@@ -618,19 +619,18 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	}
 	rescanPending := depths.Total()
 
-	// Top-level analysis and rescan rates, measured at the DB so they count
-	// items the queue backlog is denominated in (parent = ''), not the ~80x
-	// larger files/sec the fleet reports once exploded archive members are
-	// included. Dividing a top-level backlog by a files/sec rate is what made
-	// the old ETAs wildly optimistic.
-	var topLevelRate, rescanRate float64
+	// First-scan and rescan rates in items the queues are denominated in, not
+	// the ~80x larger files/sec the fleet reports once archive members are
+	// included. From the store they are the queued scans results completed,
+	// by why each file was queued (corpusReading); from the legacy tables, the
+	// analyses whose first analysis was or was not this one.
+	var firstRate, rescanRate float64
 	switch {
 	case health != nil:
-		topLevelRate = float64(health.Scanned-health.Rescanned) / analysisRateWindow.Seconds()
-		rescanRate = float64(health.Rescanned) / analysisRateWindow.Seconds()
+		firstRate, rescanRate = health.flows[classFirst].out, health.flows[classRescan].out
 	case db != nil && st == nil:
 		rates := wd.rates.get(r.Context())
-		topLevelRate = float64(rates.TopLevel) / analysisRateWindow.Seconds()
+		firstRate = float64(rates.TopLevel-rates.Rescans) / analysisRateWindow.Seconds()
 		rescanRate = float64(rates.Rescans) / analysisRateWindow.Seconds()
 	default:
 	}
@@ -644,7 +644,11 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		if err != nil {
 			slog.Warn("dashboard: store work lists failed", "error", err)
 		}
-		workflow = storeWorkflow(health, work)
+		var h *store.Health
+		if health != nil {
+			h = health.Health
+		}
+		workflow = storeWorkflow(h, work)
 	case db != nil:
 		workflow = wd.fetchWorkflow(r.Context(), db)
 	default:
@@ -683,26 +687,31 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 		})
 	default:
 	}
-	// The other half of "not fully analyzed": rows that got a cleave verdict but
-	// no litmus (ml) envelope. Free — workflowHealth already counts it for the
-	// Workflow queues card, off the same partial index, in the round trip it was
-	// making anyway. Do NOT add a second query for this.
-	//
-	// Deliberately absent from totalExpected: these rows ARE analyzed as far as
-	// analyzedAbs is concerned, so adding them would count them on both sides of
-	// the progress fraction.
-	pendingLitmus := workflow.health.PendingLitmus
 	totalExpected := analyzedAbs + pending
 
 	wd.recordSample(sessionAnalyzed)
 	rate, nodeRateByName := wd.ratesOver(15 * time.Minute)
 
-	// Both ETAs come from the OBSERVED slope of the backlog, not from a
-	// throughput rate divided into a depth. See queueETA for why that model was
-	// always optimistic.
-	etaPts := wd.etaPoints(r.Context())
-	initialETA, _, _ := queueETA(pending, etaPts, func(p queuePoint) int64 { return p.Pending })
-	rescanETA, rescanDrain, rescanMeasured := queueETA(rescanPending, etaPts, func(p queuePoint) int64 { return p.Rescan })
+	// The ETAs. From the store, each queue's own arrivals and completions over
+	// one span: its depth over completions net of arrivals (drainMeta). The
+	// legacy tables count neither, so there they are the observed slope of the
+	// backlog (queueETA).
+	var cleaveMeta, rescanCardMeta string
+	switch {
+	case health != nil:
+		cleaveMeta = drainMeta(pending, health.flows[classFirst])
+		rescanCardMeta = strings.Join(append(rescanTiers(depths), drainMeta(rescanPending, health.flows[classRescan])), " &middot; ")
+	case st != nil:
+		// Never say "caught up" on a number we do not have.
+		cleaveMeta = `<span class="queue-bad">depth unavailable &mdash; the store's health is failing</span>`
+		rescanCardMeta = rescanMeta(depths, "", 0, false, false)
+	default:
+		etaPts := wd.etaPoints(r.Context())
+		initialETA, _, _ := queueETA(pending, etaPts, func(p queuePoint) int64 { return p.Pending })
+		rescanETA, rescanDrain, rescanMeasured := queueETA(rescanPending, etaPts, func(p queuePoint) int64 { return p.Rescan })
+		cleaveMeta = slopeMeta(pending, firstRate, initialETA)
+		rescanCardMeta = rescanMeta(depths, rescanETA, rescanDrain, rescanMeasured, depthsOK)
+	}
 
 	pct := 0.0
 	if totalExpected > 0 {
@@ -748,12 +757,12 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 
 	walking := !progress.walkDone.Load() || inPipeline > 0
 	writeSystemStatus(&buf, &statusInputs{
-		walking:       walking,
-		health:        workflow.health,
-		flow:          flowRates(queuePoints),
-		pendingLitmus: pendingLitmus,
-		backlogs:      workflow.backlogs,
-		rescan:        depths,
+		walking:  walking,
+		health:   workflow.health,
+		flow:     flowRates(queuePoints),
+		pending:  pending,
+		backlogs: workflow.backlogs,
+		rescan:   depths,
 	})
 
 	// Header + progress
@@ -799,59 +808,31 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	buf.WriteString(`</div>`) // .progress
 
 	buf.WriteString(`<div class="card-group-label">Backlogs</div><div class="queue-grid">`)
-	// TWO cards, not one. They were summed under "Initial queue", which put
-	// "169,458 pending" three inches below a bar reading "100% initial
-	// analysis" -- 646x apart, both labelled initial, on the same screen. They
-	// are different pipelines: no-cleave is served by tiers S/U/B/1 at the top
-	// of the ladder, no-litmus only by the repair tier below the whole
-	// unanalyzed backlog. One number cannot describe both.
-	writeQueueCard(&buf, "Cleave queue", fmt.Sprintf("%s pending", fmtN(pending)), func() string {
-		var parts []string
-		if topLevelRate > 0.001 {
-			parts = append(parts, fmt.Sprintf("<em>%s</em>/s", fmtRate(topLevelRate)))
-		}
-		switch {
-		case initialETA != "":
-			// Explicitly the cleave half's ETA: it is the slope of the no-cleave
-			// depth alone. The no-litmus half drains through the repair tier on
-			// leftover capacity and has its own, much flatter, slope.
-			parts = append(parts, "ETA <em>"+initialETA+"</em>")
-		case pending > 0 && topLevelRate > 0.001 && float64(pending)/topLevelRate < keepingUpSeconds:
-			// Steady state with a backlog the fleet clears in seconds. "No ETA"
-			// is true but reads as missing data; this is the actual condition.
-			parts = append(parts, "keeping up")
-		default:
-		}
-		if len(parts) == 0 {
-			parts = append(parts, "caught up")
-		}
-		return strings.Join(parts, " &middot; ")
-	}())
-	writeQueueCard(&buf, "Litmus queue", fmt.Sprintf("%s pending", fmtN(pendingLitmus)), litmusMeta(pendingLitmus, workflow.backlogs))
+	// One card per queue class: first scans and rescans drain at different
+	// ladder positions, each with its own arrivals, so one number cannot
+	// describe both. (A third card counted files with no litmus score; that
+	// stage no longer runs.)
+	writeQueueCard(&buf, "Cleave queue", fmt.Sprintf("%s pending", fmtN(pending)), cleaveMeta)
 	rescanValue := fmt.Sprintf("%s pending", fmtN(rescanPending))
 	if !depthsOK {
 		rescanValue = "unknown"
 	}
-	writeQueueCard(&buf, "Rescan queue", rescanValue, rescanMeta(depths, rescanETA, rescanDrain, rescanMeasured, depthsOK))
+	writeQueueCard(&buf, "Rescan queue", rescanValue, rescanCardMeta)
 
 	// Activity, not backlog. A rate and a walk's progress answer "what is
-	// happening now"; the three cards above answer "what is waiting". Rendering
+	// happening now"; the cards above answer "what is waiting". Rendering
 	// all five as one undifferentiated row invited reading a rate as a queue.
 	buf.WriteString(`</div><div class="card-group-label">Activity</div><div class="queue-grid">`)
 
-	// Throughput tile: the rescan rate gets its own labeled home rather than
-	// hiding on the rescan card's ETA line. The headline is top-level items/s
-	// (what the queues drain in); the meta carries the much larger raw files/s
-	// (archive members included) and, when enabled, the rescan slice of it.
-	// The rescan rate is measured from analyses whose first_analyzed_at predates
-	// analyzed_at, which is true of every rescan tier — not just stale-traits.
-	// Gating its display on a traits version hid the repair tier's throughput
-	// for the same reason the card hid its depth.
-	throughputMeta := fmt.Sprintf("<em>%s</em> files/s", fmtRate(rate))
-	if rescanRate > 0 || depths.Total() > 0 {
-		throughputMeta += fmt.Sprintf(" &middot; <em>%s</em> rescan/s", fmtRate(rescanRate))
-	}
-	writeQueueCard(&buf, "Throughput", fmtRate(topLevelRate)+" items/s", throughputMeta)
+	// Throughput tile. The headline is items/s, what the queues drain in,
+	// split into first scans and rescans by why each file was queued; the meta
+	// carries the much larger raw files/s (archive members included). The
+	// split used to call every scan of a file older than the rate window a
+	// rescan, which with a weeks-deep first-scan queue was nearly every first
+	// scan: the fleet read as mostly rescanning while it was mostly not.
+	throughputMeta := fmt.Sprintf("<em>%s</em> first/s &middot; <em>%s</em> rescan/s &middot; <em>%s</em> files/s",
+		fmtRate(firstRate), fmtRate(rescanRate), fmtRate(rate))
+	writeQueueCard(&buf, "Throughput", fmtRate(firstRate+rescanRate)+" items/s", throughputMeta)
 
 	ingestMeta := fmt.Sprintf("<em>%s</em> known &middot; <em>%s</em> inserted", fmtN(progress.cacheHits.Load()), fmtN(inserted))
 	if !progress.walkDone.Load() || inPipeline > 0 {
@@ -865,7 +846,7 @@ func (wd *webDashboard) handler(w http.ResponseWriter, r *http.Request) { //noli
 	// the question a reader has immediately after the queue counts. The sample
 	// tables below are lookup tools -- useful when you already know what you are
 	// chasing, noise when you do not.
-	writeFlowGraph(&buf, queuePoints, wd.metrics != nil)
+	writeFlowGraph(&buf, queuePoints, wd.metrics != nil, st == nil)
 
 	// The claim ladder replaces the old generic Pending/Rescan/Completed
 	// sparklines. Those showed three blended series with no way to tell which
@@ -1359,19 +1340,7 @@ func (wd *webDashboard) workflowHealth(ctx context.Context) (hopper.WorkflowHeal
 // rendering that as "caught up" (or as a bare 0) is what hid a switched-off
 // tier for the whole of a 24h uptime.
 func rescanMeta(d hopper.RescanDepths, eta string, drain float64, measured, known bool) string {
-	var parts []string
-	if d.Forced > 0 {
-		parts = append(parts, fmt.Sprintf("<em>%s</em> forced", fmtN(d.Forced)))
-	}
-	parts = append(parts, fmt.Sprintf("<em>%s</em> repair", fmtN(d.Repair)))
-	// No "off" state to render any more: the age tier is always in the ladder,
-	// so zero means caught up rather than unmeasured.
-	if d.Age > 0 {
-		parts = append(parts, fmt.Sprintf("<em>%s</em> past rescan age", fmtN(d.Age)))
-	}
-	if d.MissingLLM > 0 {
-		parts = append(parts, fmt.Sprintf("<em>%s</em> undescribed", fmtN(d.MissingLLM)))
-	}
+	parts := rescanTiers(d)
 	switch {
 	case !known:
 		// Never say "caught up" on a number we do not have.
@@ -1398,6 +1367,47 @@ func rescanMeta(d hopper.RescanDepths, eta string, drain float64, measured, know
 	return strings.Join(parts, " &middot; ")
 }
 
+// slopeMeta is the legacy Cleave queue card's sub-line: the first-analysis
+// rate, then the ETA the backlog's slope gives (queueETA), "keeping up" when
+// the fleet clears it in seconds, or "caught up".
+func slopeMeta(pending int64, rate float64, eta string) string {
+	var parts []string
+	if rate > 0.001 {
+		parts = append(parts, fmt.Sprintf("<em>%s</em>/s", fmtRate(rate)))
+	}
+	switch {
+	case eta != "":
+		parts = append(parts, "ETA <em>"+eta+"</em>")
+	case pending > 0 && rate > 0.001 && float64(pending)/rate < keepingUpSeconds:
+		// Steady state with a backlog the fleet clears in seconds. "No ETA"
+		// is true but reads as missing data; this is the actual condition.
+		parts = append(parts, "keeping up")
+	default:
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "caught up")
+	}
+	return strings.Join(parts, " &middot; ")
+}
+
+// rescanTiers is the rescan queue's depth by tier, for its card.
+func rescanTiers(d hopper.RescanDepths) []string {
+	var parts []string
+	if d.Forced > 0 {
+		parts = append(parts, fmt.Sprintf("<em>%s</em> forced", fmtN(d.Forced)))
+	}
+	parts = append(parts, fmt.Sprintf("<em>%s</em> repair", fmtN(d.Repair)))
+	// No "off" state to render any more: the age tier is always in the ladder,
+	// so zero means caught up rather than unmeasured.
+	if d.Age > 0 {
+		parts = append(parts, fmt.Sprintf("<em>%s</em> past rescan age", fmtN(d.Age)))
+	}
+	if d.MissingLLM > 0 {
+		parts = append(parts, fmt.Sprintf("<em>%s</em> undescribed", fmtN(d.MissingLLM)))
+	}
+	return parts
+}
+
 // timeTitle renders an absolute timestamp for a hover title, so a relative age
 // on the page can be checked against a log line.
 func timeTitle(t time.Time) string {
@@ -1417,11 +1427,11 @@ func writeQueueCard(buf *strings.Builder, label, value, meta string) {
 // so the call site stays one statement rather than a tail of positional
 // arguments nobody can read.
 type statusInputs struct {
-	backlogs      []hopper.WorkflowBacklog
-	health        hopper.WorkflowHealth
-	flow          flowSeries
-	rescan        hopper.RescanDepths
-	pendingLitmus int64
+	backlogs []hopper.WorkflowBacklog
+	health   hopper.WorkflowHealth
+	flow     flowSeries
+	rescan   hopper.RescanDepths
+	pending  int64 // files awaiting a first scan
 	// walking marks a walk in progress, which inserts in bulk and legitimately
 	// outruns processing for its duration. It downgrades the flow verdict from
 	// critical to a warning and names the cause.
@@ -1445,20 +1455,6 @@ func oldestBacklog(rows []hopper.WorkflowBacklog) (time.Duration, bool) {
 		return 0, false
 	}
 	return time.Since(oldest), true
-}
-
-// litmusMeta describes the litmus backlog by AGE. Its size has barely moved in
-// months, so the size alone tells a reader nothing they can act on; "oldest
-// 71d" does.
-func litmusMeta(pending int64, rows []hopper.WorkflowBacklog) string {
-	if pending == 0 {
-		return "caught up"
-	}
-	if age, ok := oldestBacklog(rows); ok {
-		return fmt.Sprintf(`oldest <em>%s</em> &middot; <span class="queue-note">served only by the repair tier</span>`,
-			htmlEscape(shortDuration(age)))
-	}
-	return `<span class="queue-note">served only by the repair tier</span>`
 }
 
 // writeSystemStatus renders the one line the page exists for: is the pipeline
@@ -1509,7 +1505,7 @@ func writeSystemStatus(buf *strings.Builder, in *statusInputs) {
 	// Then standing backlogs, described by age.
 	if age, ok := oldestBacklog(in.backlogs); ok && age > 7*24*time.Hour {
 		issues = append(issues, issue{
-			text:    fmt.Sprintf("%s files have no litmus score, oldest %s", fmtN(in.pendingLitmus), shortDuration(age)),
+			text:    fmt.Sprintf("%s files await a first scan, oldest %s", fmtN(in.pending), shortDuration(age)),
 			chronic: true,
 		})
 	}
@@ -1793,17 +1789,10 @@ func writeWorkflowBacklogs(buf *strings.Builder, rows []hopper.WorkflowBacklog) 
 	})
 
 	buf.WriteString(`<section><div class="label">Backlogs by age</div>`)
-	buf.WriteString(`<table><thead><tr><th>Feed</th><th>Ecosystem</th><th>Stage</th>` +
+	buf.WriteString(`<table><thead><tr><th>Feed</th><th>Ecosystem</th>` +
 		`<th>Waiting</th><th>Oldest</th><th>Last arrival</th><th></th></tr></thead><tbody>`)
 	for i := range ordered {
 		r := &ordered[i]
-		// One stage per row: whichever half actually holds work. Two columns
-		// where one is always zero is a column that costs a reader attention
-		// and returns nothing.
-		stage, waiting := "litmus", r.PendingLitmus
-		if r.PendingCleave > r.PendingLitmus {
-			stage, waiting = "cleave", r.PendingCleave
-		}
 		// Frozen: nothing new has arrived in a week either, so this is not a
 		// feed that is merely busy.
 		note := ""
@@ -1811,12 +1800,11 @@ func writeWorkflowBacklogs(buf *strings.Builder, rows []hopper.WorkflowBacklog) 
 			note = `<span class="queue-note">stalled</span>`
 		}
 		fmt.Fprintf(buf,
-			`<tr><td>%s</td><td>%s</td><td>%s</td><td class="hi">%s</td>`+
+			`<tr><td>%s</td><td>%s</td><td class="hi">%s</td>`+
 				`<td class="hi" title="%s">%s</td><td title="%s">%s</td><td>%s</td></tr>`,
-			htmlEscape(dashIfEmpty(r.Feed)),
+			htmlEscape(dashIfEmpty(cmp.Or(uploadLabel(r.Source, r.Feed), r.Feed))),
 			htmlEscape(dashIfEmpty(r.Ecosystem)),
-			htmlEscape(stage),
-			fmtN(waiting),
+			fmtN(r.PendingCleave),
 			htmlEscape(timeTitle(r.OldestPending)), htmlEscape(ageValue(r.OldestPending)),
 			htmlEscape(timeTitle(r.NewestPending)), htmlEscape(ageValue(r.NewestPending)),
 			note)
@@ -1884,13 +1872,6 @@ func ageValue(t time.Time) string {
 	}
 	d := max(time.Since(t), 0)
 	return shortDuration(d) + " ago"
-}
-
-func sourceFeed(source, feed string) string {
-	if feed == "" {
-		return source
-	}
-	return source + "/" + feed
 }
 
 func dashIfEmpty(s string) string {
@@ -2138,7 +2119,15 @@ func flowVerdict(f flowSeries) (losing bool, netRate float64) {
 // changes what a queue counts (the rescan tier gaining a whole population, say)
 // puts one enormous step in the series, and over 72h that step sets the scale
 // and flattens everything else into the axis. Six hours ages it out.
-func writeFlowGraph(buf *strings.Builder, points []queuePoint, cacheReady bool) {
+//
+// arrivals says whether the sampled id watermark counts the queue's arrivals,
+// which it does for the legacy tables only. The store hands out an id to
+// every file a result names, known or not, and most of those files are
+// archive members that never enter the queue: its watermark ran at 870/s
+// beside a queue taking in a few, and an in/out split drawn from it said the
+// fleet scanned 870 files a second. The store's cards carry measured
+// arrivals and completions instead (drainMeta).
+func writeFlowGraph(buf *strings.Builder, points []queuePoint, cacheReady, arrivals bool) {
 	cut := time.Now().Add(-flowWindow)
 	recent := points
 	for i, p := range points {
@@ -2176,7 +2165,7 @@ func writeFlowGraph(buf *strings.Builder, points []queuePoint, cacheReady bool) 
 	// The in/out split when the arrival watermark has accumulated; otherwise the
 	// net alone, which is the answer either way.
 	detail := fmt.Sprintf("backlog <em>%s/s</em>", fmtSigned(avgNet))
-	if f.hasRates {
+	if f.hasRates && arrivals {
 		detail = fmt.Sprintf("in <em>%s/s</em> &middot; out <em>%s/s</em> &middot; net <em>%s/s</em>",
 			fmtRate(mean(f.in)), fmtRate(mean(f.out)), fmtSigned(avgNet))
 	}

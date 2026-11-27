@@ -149,8 +149,9 @@ func storable(s string) string {
 // Ingest records files hopper has been shown, all of them or none: each
 // file's row, its path, and a place in the queue at the given priority for
 // any that nothing has scanned yet. A file a sighting names is queued as
-// Sighted whatever that priority is. Showing hopper the same file at the same
-// path again writes nothing.
+// Sighted whatever that priority is, and one of a package some source has
+// called malicious as Compromised unless that priority is higher. Showing
+// hopper the same file at the same path again writes nothing.
 //
 // Nothing an arrival carries can fail the batch at the database, where it
 // would fail the same way on every retry: text is stored without the bytes
@@ -315,6 +316,9 @@ func (st *Store) Ingest(ctx context.Context, arrivals []Arrival, priority Priori
 					-- Named by a feed: labelled sighted by its pool, or named
 					-- in the sightings ledger.
 					WHEN s.label = 'sighted' OR named(s.sha256, s.name_id, s.version) THEN $2::smallint
+					-- Of a package some source has called malicious, unless
+					-- queued higher already for the asking (an upload).
+					WHEN $3::smallint > $8::smallint AND `+compromised+` THEN $8::smallint
 					WHEN $3::smallint = $4::smallint AND s.size_bytes > $5 THEN $6::smallint
 					ELSE $3::smallint END AS priority
 				FROM samples s
@@ -325,7 +329,8 @@ func (st *Store) Ingest(ctx context.Context, arrivals []Arrival, priority Priori
 			ORDER BY w.id
 			ON CONFLICT (sample_id) DO UPDATE SET priority = EXCLUDED.priority
 			WHERE queue.priority > EXCLUDED.priority`,
-			shas, int16(QueueSighted), int16(priority), int16(QueueNew), int64(bigFile), int16(QueueBigArchive), atomscan)
+			shas, int16(QueueSighted), int16(priority), int16(QueueNew), int64(bigFile), int16(QueueBigArchive), atomscan,
+			int16(QueueCompromised))
 		if err != nil {
 			return fmt.Errorf("queue: %w", err)
 		}

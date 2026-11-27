@@ -34,15 +34,25 @@ func queueDepths(ctx context.Context, db *hopper.DB, st *store.Store, rescanAge 
 
 // rescanDepthsOf is the queue's rescans by tier.
 func rescanDepthsOf(depths map[store.Priority]int64) hopper.RescanDepths {
-	return hopper.RescanDepths{Forced: depths[store.QueueRequested], Repair: depths[store.QueueRepair], Age: depths[store.QueueStale]}
+	return hopper.RescanDepths{
+		Forced: depths[store.QueueRequested], MissingLLM: depths[store.QueueDescribe],
+		Repair: depths[store.QueueRepair], Age: depths[store.QueueStale],
+	}
 }
 
-// storeHealth reads the store's health, cached for dashCacheTTL and shared by
-// the dashboard and the metrics scrape.
-func (wd *webDashboard) storeHealth(ctx context.Context, st *store.Store) (*store.Health, error) {
-	now := time.Now()
-	return wd.storeHealthCache.Fetch("health", func() (*store.Health, error) {
-		return st.Health(ctx, now.Add(-analysisRateWindow), now.Add(-retiredOutcomeGrace))
+// storeHealth reads the store's health and the queue's flows, cached for
+// dashCacheTTL and shared by the dashboard and the metrics scrape. The flows
+// are measured in the same breath as the store counts the files queued since
+// they start, so that both halves of an arrival rate cover one span.
+func (wd *webDashboard) storeHealth(ctx context.Context, st *store.Store) (*corpusReading, error) {
+	return wd.storeHealthCache.Fetch("health", func() (*corpusReading, error) {
+		now := time.Now()
+		since := completedScans.since(now)
+		h, err := st.Health(ctx, since, now.Add(-retiredOutcomeGrace))
+		if err != nil {
+			return nil, err
+		}
+		return &corpusReading{Health: h, flows: completedScans.flows(h.Queued, since, time.Now())}, nil
 	})
 }
 
@@ -54,9 +64,16 @@ func (wd *webDashboard) storeWork(ctx context.Context, st *store.Store) (*store.
 	})
 }
 
-// firstScansOf sums the queue's first scans.
+// firstScansOf sums the queue's first scans: every priority that is not a
+// rescan.
 func firstScansOf(depths map[store.Priority]int64) int64 {
-	return depths[store.QueueSighted] + depths[store.QueueUpload] + depths[store.QueueBigArchive] + depths[store.QueueNew]
+	var n int64
+	for p, d := range depths {
+		if !p.IsRescan() {
+			n += d
+		}
+	}
+	return n
 }
 
 // arrivalWatermark is the highest sample id issued, the arrivals half of the

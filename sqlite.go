@@ -922,9 +922,8 @@ func (db *DB) workflowHealthSQLite(ctx context.Context) (WorkflowHealth, error) 
 				WHERE parent = '' AND cleave_result IS NOT NULL AND litmus_result IS NOT NULL
 					AND COALESCE(first_analyzed_at, analyzed_at) IS NOT NULL
 				ORDER BY COALESCE(first_analyzed_at, analyzed_at) DESC LIMIT 1),
-			(SELECT count(*) FROM samples WHERE parent = '' AND skip = '' AND cleave_result IS NULL),
-			(SELECT count(*) FROM samples WHERE parent = '' AND skip = '' AND cleave_result IS NOT NULL AND litmus_result IS NULL)`,
-	).Scan(&latestAdded, &latestUpdated, &latestAnalyzed, &latestReady, &h.PendingCleave, &h.PendingLitmus)
+			(SELECT count(*) FROM samples WHERE parent = '' AND skip = '' AND cleave_result IS NULL)`,
+	).Scan(&latestAdded, &latestUpdated, &latestAnalyzed, &latestReady, &h.PendingCleave)
 	if err != nil {
 		return h, fmt.Errorf("hopper: workflow health: %w", err)
 	}
@@ -937,25 +936,11 @@ func (db *DB) workflowHealthSQLite(ctx context.Context) (WorkflowHealth, error) 
 
 func (db *DB) workflowBacklogsSQLite(ctx context.Context, limit int) ([]WorkflowBacklog, error) {
 	rows, err := db.lite.QueryContext(ctx, `
-		SELECT source, feed, ecosystem,
-			min(updated_at), max(updated_at),
-			sum(pending_cleave), sum(pending_litmus)
-		FROM (
-			SELECT source, feed, ecosystem, updated_at,
-				1 AS pending_cleave,
-				0 AS pending_litmus
-			FROM samples
-			WHERE parent = '' AND skip = '' AND cleave_result IS NULL
-			UNION ALL
-			SELECT source, feed, ecosystem, updated_at,
-				0 AS pending_cleave,
-				1 AS pending_litmus
-			FROM samples
-			WHERE parent = '' AND skip = ''
-			  AND cleave_result IS NOT NULL AND litmus_result IS NULL
-		) pending
+		SELECT source, feed, ecosystem, min(updated_at), max(updated_at), count(*)
+		FROM samples
+		WHERE parent = '' AND skip = '' AND cleave_result IS NULL
 		GROUP BY source, feed, ecosystem
-		ORDER BY (sum(pending_cleave) + sum(pending_litmus)) DESC
+		ORDER BY count(*) DESC
 		LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: workflow backlogs: %w", err)
@@ -965,7 +950,7 @@ func (db *DB) workflowBacklogsSQLite(ctx context.Context, limit int) ([]Workflow
 	for rows.Next() {
 		var b WorkflowBacklog
 		var oldest, newest sql.NullTime
-		if err := rows.Scan(&b.Source, &b.Feed, &b.Ecosystem, &oldest, &newest, &b.PendingCleave, &b.PendingLitmus); err != nil {
+		if err := rows.Scan(&b.Source, &b.Feed, &b.Ecosystem, &oldest, &newest, &b.PendingCleave); err != nil {
 			return nil, fmt.Errorf("hopper: scan workflow backlog: %w", err)
 		}
 		b.OldestPending = nullTime(oldest)

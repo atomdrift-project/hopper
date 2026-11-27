@@ -8,30 +8,41 @@ import (
 )
 
 // TestReplicatedTablesAreTheVerdictSchema fails when store/schema.sql gains a
-// table that scripts/replica/replicated-tables.sh does not publish, or the list
-// names one schema.sql no longer creates. A replica carries every verdict
-// table except the unlogged ones, which a publication cannot carry; a table
-// left off the list would be silently absent on the replica, and setup.sh
-// reconciles the publication to exactly this list.
+// table that scripts/replica/replicated-tables.sh neither publishes nor
+// names as unreplicated, or a list names one schema.sql no longer creates. A
+// replica carries every verdict table except the unlogged ones, which a
+// publication cannot carry, and those UNREPLICATED_TABLES names; a table left
+// off both lists would be silently absent on the replica, and setup.sh
+// reconciles the publication to exactly REPLICATED_TABLES.
 func TestReplicatedTablesAreTheVerdictSchema(t *testing.T) {
 	src, err := os.ReadFile("scripts/replica/replicated-tables.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, rest, found := strings.Cut(string(src), "\nREPLICATED_TABLES='")
-	if !found {
-		t.Fatal("REPLICATED_TABLES='...' not found in replicated-tables.sh")
-	}
-	list, _, found := strings.Cut(rest, "'")
-	if !found {
-		t.Fatal("REPLICATED_TABLES is not closed by a single quote")
-	}
-	published := map[string]bool{}
-	for name := range strings.FieldsSeq(list) {
-		if published[name] {
-			t.Errorf("REPLICATED_TABLES names %s twice", name)
+	tables := func(variable string) map[string]bool {
+		t.Helper()
+		_, rest, found := strings.Cut(string(src), "\n"+variable+"='")
+		if !found {
+			t.Fatalf("%s='...' not found in replicated-tables.sh", variable)
 		}
-		published[name] = true
+		list, _, found := strings.Cut(rest, "'")
+		if !found {
+			t.Fatalf("%s is not closed by a single quote", variable)
+		}
+		names := map[string]bool{}
+		for name := range strings.FieldsSeq(list) {
+			if names[name] {
+				t.Errorf("%s names %s twice", variable, name)
+			}
+			names[name] = true
+		}
+		return names
+	}
+	published, unpublished := tables("REPLICATED_TABLES"), tables("UNREPLICATED_TABLES")
+	for name := range unpublished {
+		if published[name] {
+			t.Errorf("%s is both replicated and unreplicated", name)
+		}
 	}
 
 	schema, err := os.ReadFile("store/schema.sql")
@@ -50,13 +61,18 @@ func TestReplicatedTablesAreTheVerdictSchema(t *testing.T) {
 		t.Fatal("parsed no CREATE TABLE from store/schema.sql — its shape changed")
 	}
 	for name := range logged {
-		if !published[name] {
-			t.Errorf("store/schema.sql creates %s but REPLICATED_TABLES does not publish it", name)
+		if !published[name] && !unpublished[name] {
+			t.Errorf("store/schema.sql creates %s but REPLICATED_TABLES does not publish it, nor UNREPLICATED_TABLES leave it out", name)
 		}
 	}
 	for name := range published {
 		if !logged[name] {
 			t.Errorf("REPLICATED_TABLES names %s, which store/schema.sql does not create", name)
+		}
+	}
+	for name := range unpublished {
+		if !logged[name] {
+			t.Errorf("UNREPLICATED_TABLES names %s, which store/schema.sql does not create as a logged table", name)
 		}
 	}
 }

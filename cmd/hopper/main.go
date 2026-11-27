@@ -2357,7 +2357,7 @@ func loadAll( //nolint:nolintlint,revive // many params reflect the many subsyst
 	})
 	if results != nil {
 		dashWG.Go(func() {
-			sweepStale(backgroundCtx, results, rescanAge)
+			sweepRescans(backgroundCtx, results, rescanAge)
 		})
 	}
 

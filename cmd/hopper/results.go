@@ -78,6 +78,7 @@ func (s *apiServer) storeVerdicts(w http.ResponseWriter, r *http.Request, lane s
 	default:
 	}
 
+	recordCompletedScans(ctx, stats.Completed)
 	stored := stats.Changed()
 	if stored {
 		recordVerdictResult(ctx, lane, "stored")
@@ -87,7 +88,8 @@ func (s *apiServer) storeVerdicts(w http.ResponseWriter, r *http.Request, lane s
 			"verdicts", stats.Verdicts, "stamped", stats.Stamped, "jurors_removed", stats.JurorsRemoved,
 			"claims", stats.Claims, "claims_removed", stats.ClaimsRemoved,
 			"reports", stats.Reports, "reports_unchanged", stats.ReportsUnchanged,
-			"contents", stats.Contents, "refs", stats.Refs, "refs_removed", stats.RefsRemoved,
+			"contents", stats.Contents, "refs", stats.Refs, "refs_removed", stats.RefsRemoved, "dequeued", len(stats.Completed),
+			"described", stats.Described, "llm_input_dropped", stats.LLMInputDropped,
 			"duration_ms", res.ms, "store_ms", time.Since(start).Milliseconds())
 	} else {
 		outcome := "unchanged"

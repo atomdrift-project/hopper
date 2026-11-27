@@ -49,19 +49,28 @@ func TestSighted(t *testing.T) {
 		t.Fatalf("priorities %v, want %v", got, want)
 	}
 
+	// A claim raises the releases it names to sighted, and the package's
+	// other releases waiting for a first scan to compromised.
 	for _, tc := range []struct {
 		name, subject, affected string
-		raised                  []string
+		raised, compromised     []string
 	}{
-		{"a digest raises that file", hexOf(digestOf("loose")), "", []string{"loose"}},
-		{"a claim naming exact versions raises only those", "pkg:npm/evil", "1.0.1, 1.0.2", []string{"evil 1.0.1", "evil 1.0.2"}},
-		{"one version written with = is exact too", "pkg:npm/other", "= 9.9.9", nil},
-		{"a range cannot be narrowed, so the package is raised", "pkg:npm/ranged", ">=2", []string{"ranged 2.0.0"}},
-		{"a claim with no versions raises every release", "pkg:npm/evil", "", []string{"evil 1.0.0"}},
-		{"a file already scanned is left where it is", hexOf(digestOf("scanned")), "", nil},
+		{"a digest raises that file", hexOf(digestOf("loose")), "", []string{"loose"}, nil},
+		{
+			"a claim naming exact versions raises only those", "pkg:npm/evil", "1.0.1, 1.0.2",
+			[]string{"evil 1.0.1", "evil 1.0.2"},
+			[]string{"evil 1.0.0"},
+		},
+		{"one version written with = is exact too", "pkg:npm/other", "= 9.9.9", nil, []string{"other 1.0.0"}},
+		{"a range cannot be narrowed, so the package is raised", "pkg:npm/ranged", ">=2", []string{"ranged 2.0.0"}, nil},
+		{"a claim with no versions raises every release", "pkg:npm/evil", "", []string{"evil 1.0.0"}, nil},
+		{"a file already scanned is left where it is", hexOf(digestOf("scanned")), "", nil, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sight(ctx, t, st, "feed-"+tc.name, tc.subject, tc.affected)
+			for _, bytes := range tc.compromised {
+				want[hexOf(digestOf(bytes))] = QueueCompromised
+			}
 			for _, bytes := range tc.raised {
 				want[hexOf(digestOf(bytes))] = QueueSighted
 			}
@@ -93,7 +102,7 @@ func TestSighted(t *testing.T) {
 		arrive("late 2.0.0", "pkg:pypi/late", "2.0.0")
 		want[hexOf(digestOf("late digest"))] = QueueSighted
 		want[hexOf(digestOf("late 3.0.0"))] = QueueSighted
-		want[hexOf(digestOf("late 2.0.0"))] = QueueNew
+		want[hexOf(digestOf("late 2.0.0"))] = QueueCompromised // another release of a package called malicious
 		if got := priorities(ctx, t, st); !maps.Equal(got, want) {
 			t.Errorf("priorities %v, want %v", got, want)
 		}

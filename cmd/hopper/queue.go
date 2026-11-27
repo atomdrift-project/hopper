@@ -78,13 +78,15 @@ const (
 	sweepInterval = time.Minute // between ticks
 )
 
-// sweepStale keeps the rescan-by-age tier supplied until ctx is done. The
-// place it has reached is not kept across a restart: a file rescanned since
-// is not old any more, so starting over costs reads and queues nothing twice.
-func sweepStale(ctx context.Context, st *store.Store, rescanAge time.Duration) {
+// sweepRescans keeps the rescan tiers that are found by reading scans
+// supplied until ctx is done: rescans by age, and files to describe
+// (store.QueueDescribe). The places they have reached are not kept across a
+// restart: a file rescanned since is not owed the rescan any more, so
+// starting over costs reads and queues nothing twice.
+func sweepRescans(ctx context.Context, st *store.Store, rescanAge time.Duration) {
 	ticker := time.NewTicker(sweepInterval)
 	defer ticker.Stop()
-	var after store.Cursor
+	var after, described store.Cursor
 	for {
 		next, queued, err := refillStale(ctx, st, after, time.Now().Add(-rescanAge))
 		switch {
@@ -96,6 +98,7 @@ func sweepStale(ctx context.Context, st *store.Store, rescanAge time.Duration) {
 		default:
 		}
 		after = next
+		described = sweepDescribe(ctx, st, described)
 		select {
 		case <-ctx.Done():
 			return
@@ -131,41 +134,123 @@ func refillStale(ctx context.Context, st *store.Store, after store.Cursor, befor
 	return after, queued, nil
 }
 
+// sweepDescribe does one tick of the describe sweep: it drops the rows no
+// longer owed a description and the LLM inputs older than a week
+// (store.ExpireDescribe), then queues the files owed one from after, at most
+// describePages statements (store.SweepDescribe), and returns where the next
+// tick continues.
+func sweepDescribe(ctx context.Context, st *store.Store, after store.Cursor) store.Cursor {
+	dropped, inputs, err := st.ExpireDescribe(ctx)
+	if err != nil && ctx.Err() == nil {
+		slog.WarnContext(ctx, "describe expiry failed; trying again next tick", "error", err)
+	}
+	from := after
+	var queued int64
+	for range describePages {
+		next, n, err := st.SweepDescribe(ctx, after, sweepPage)
+		if err != nil {
+			if ctx.Err() == nil {
+				slog.WarnContext(ctx, "describe sweep failed; trying again next tick", "after", after.At, "error", err)
+			}
+			break
+		}
+		queued, after = queued+n, next
+		if after == (store.Cursor{}) {
+			break
+		}
+	}
+	if queued > 0 || dropped > 0 || inputs > 0 {
+		slog.InfoContext(ctx, "describe sweep", "queued", queued, "dropped", dropped, "llm_inputs_expired", inputs,
+			"from", from.At, "to", after.At, "pass_complete", after == store.Cursor{})
+	}
+	return after
+}
+
+// describePages bounds the statements one tick of the describe sweep runs.
+// A week of flagged scans was a few tens of thousands, a pass a tick or two;
+// the describable scans (store/describe.go) add those the LLM gate admitted
+// that the floor and the model call benign, so a pass may take a few more.
+// The bound is for a burst.
+const describePages = 20
+
+// Shares of a batch, of what is left of it when the ladder reaches the tier
+// (claimTier.restShare).
+const (
+	// compromisedShare caps the first scans of packages called malicious
+	// before. A project taken over once may have thousands of releases on
+	// disk, and every one of them is queued at this level; a quarter keeps
+	// them moving without stopping every other first scan.
+	compromisedShare = 0.25
+	// describeShare caps the files to describe. Each is a whole scan again
+	// for one line of text, so a tenth: enough for the week's flagged
+	// scans that came back undescribed, far from enough to slow first scans.
+	// A file whose LLM input hopper holds costs only the LLM call, and is
+	// handed out first within the share (store.Candidates); the share is not
+	// raised for them, since every describe still calls the LLM endpoint,
+	// the scarcer resource, and a tenth already drains the level in a day
+	// or two.
+	describeShare = 0.1
+	// newestShare is the part of the unanalyzed backlog's share served from
+	// its newest end; the oldest end has the rest. The backlog drains over
+	// weeks, so oldest first alone would have a package published today
+	// wait behind all of it, and newest first alone would leave the oldest
+	// files to wait forever.
+	newestShare = 0.5
+)
+
 // queueLadder is claimLadder for the queue. maxBytes is the worker's per-file
 // cap and skipTypes the file types its tools cannot run; both are applied in
 // the query so files the worker can never take do not crowd out ones it can.
-func (s *apiServer) queueLadder(slots int, maxBytes int64, skipTypes []string) []claimTier {
-	tier := func(name string, p store.Priority) claimTier {
+// A worker without an LLM (llm false) is handed no files to describe: it
+// would scan them again and describe nothing.
+//
+// The unanalyzed backlog is served from both ends, newest first and then
+// oldest first, each its own tier. The second reads the queue after the
+// first has leased what it took, so no file is handed out twice; each
+// interleaves its size classes.
+func (s *apiServer) queueLadder(slots int, maxBytes int64, skipTypes []string, llm bool) []claimTier {
+	type read func(context.Context, store.Priority, int, int64, []string) ([]store.Job, error)
+	tier := func(name string, p store.Priority, from read) claimTier {
 		return claimTier{name: name, candidates: func(ctx context.Context, n int) ([]hopper.ClaimJob, error) {
-			jobs, err := s.results.Candidates(ctx, p, n, maxBytes, skipTypes)
+			jobs, err := from(ctx, p, n, maxBytes, skipTypes)
 			out := make([]hopper.ClaimJob, len(jobs))
 			for i, j := range jobs {
 				out[i] = hopper.ClaimJob{
 					CreatedAt: j.QueuedAt, SHA256: j.SHA256, Path: j.Path, FileType: j.FileType,
-					SizeBytes: j.SizeBytes, HasProvenance: j.HasProvenance,
+					SizeBytes: j.SizeBytes, HasProvenance: j.HasProvenance, HasLLMInput: j.HasLLMInput,
 				}
 			}
 			return out, err
 		}}
 	}
-	sighted := tier(tierSighted, store.QueueSighted)
+	oldest, newest := s.results.Candidates, s.results.NewestCandidates
+	sighted := tier(tierSighted, store.QueueSighted, oldest)
 	sighted.maxShare = sightedMaxShare
-	big := tier(tierBigArchive, store.QueueBigArchive)
+	compromised := tier(tierCompromised, store.QueueCompromised, newest)
+	compromised.restShare = compromisedShare
+	describe := tier(tierMissingLLM, store.QueueDescribe, oldest)
+	describe.restShare = describeShare
+	big := tier(tierBigArchive, store.QueueBigArchive, oldest)
 	big.minSlots = bigArchiveMinSlots
-	fresh := tier(tierUnanalyzed, store.QueueNew)
-	fresh.interleave = true
+	freshest := tier(tierUnanalyzedNewest, store.QueueNew, newest)
+	freshest.interleave, freshest.restShare = true, newestShare
+	backlog := tier(tierUnanalyzed, store.QueueNew, oldest)
+	backlog.interleave = true
 	ladder := []claimTier{
 		sighted,
-		tier(tierUpload, store.QueueUpload),
-		tier(tierForcedRescan, store.QueueRequested),
+		tier(tierUpload, store.QueueUpload, oldest),
+		compromised,
+		tier(tierForcedRescan, store.QueueRequested, oldest),
+		describe,
 		big,
-		fresh,
-		tier(tierRepair, store.QueueRepair),
-		tier(tierRescanAge, store.QueueStale),
+		freshest,
+		backlog,
+		tier(tierRepair, store.QueueRepair, oldest),
+		tier(tierRescanAge, store.QueueStale, oldest),
 	}
 	out := ladder[:0]
 	for _, t := range ladder {
-		if t.minSlots == 0 || slots >= t.minSlots {
+		if (t.minSlots == 0 || slots >= t.minSlots) && (llm || t.name != tierMissingLLM) {
 			out = append(out, t)
 		}
 	}
@@ -244,7 +329,8 @@ func (s *apiServer) logQueueEmpty(ctx context.Context, worker string) {
 	}
 	slog.Info("no work available", "worker", worker, "active_claims", s.tracker.activeClaims(worker),
 		"sighted", depths[store.QueueSighted], "upload", depths[store.QueueUpload],
-		"requested", depths[store.QueueRequested], "big_archive", depths[store.QueueBigArchive],
+		"compromised", depths[store.QueueCompromised], "requested", depths[store.QueueRequested],
+		"describe", depths[store.QueueDescribe], "big_archive", depths[store.QueueBigArchive],
 		"new", depths[store.QueueNew], "repair", depths[store.QueueRepair], "stale", depths[store.QueueStale],
 		"stuck", stuck)
 }

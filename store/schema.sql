@@ -228,15 +228,26 @@ CREATE INDEX refs_referrers ON refs (name_id, version, sample_id);
 -- flagged says the scan left something for triage: atomscan, the floor or
 -- the model is not benign, or the file is labelled bad. About 2% of scans
 -- in production; the triage queues with a time window start from them.
+--
+-- llm_admission is what scan's LLM gate decided of the artifact in the last
+-- scan that reached a verdict: required, optional or none (not admitted).
+-- NULL when that scan did not say (a worker from before 2026-11-27, or one
+-- that ran no gate). The describe queue follows it (store/describe.go).
 CREATE TABLE scans (
-	sample_id  bigint PRIMARY KEY REFERENCES samples,
-	scanned_at timestamptz NOT NULL,
-	ruleset    text NOT NULL,
-	engine     text NOT NULL DEFAULT '',
-	flagged    boolean NOT NULL DEFAULT false
+	sample_id     bigint PRIMARY KEY REFERENCES samples,
+	scanned_at    timestamptz NOT NULL,
+	ruleset       text NOT NULL,
+	engine        text NOT NULL DEFAULT '',
+	flagged       boolean NOT NULL DEFAULT false,
+	llm_admission text CHECK (llm_admission IN ('none', 'optional', 'required'))
 ) WITH (autovacuum_vacuum_scale_factor = 0.02);
 CREATE INDEX scans_age ON scans (scanned_at, sample_id);
 CREATE INDEX scans_flagged ON scans (scanned_at, sample_id) WHERE flagged;
+-- The scans whose files may be owed a description, which the describe sweep
+-- walks (store/describe.go, describable): admitted ones, and flagged ones
+-- that do not say.
+CREATE INDEX scans_describable ON scans (scanned_at, sample_id)
+	WHERE (llm_admission IN ('optional', 'required') OR (llm_admission IS NULL AND flagged));
 
 -- Files we hold on disk. A path names one file.
 CREATE TABLE locations (
@@ -273,6 +284,33 @@ CREATE TABLE queue (
 -- be seen. Queries spell the 8 out, as the planner needs to match this
 -- predicate.
 CREATE INDEX queue_next ON queue (priority, retry_at NULLS FIRST, queued_at) WHERE attempts < 8;
+-- The same rows newest arrival first (Store.NewestCandidates): the first
+-- scans of files just published wait behind no backlog.
+CREATE INDEX queue_newest ON queue (priority, retry_at NULLS FIRST, sample_id DESC) WHERE attempts < 8;
+
+-- When each file was last queued to be described by an LLM (QueueDescribe),
+-- so a file a worker could not describe is not queued again within the week.
+-- Rows older than that are deleted by the sweep that reads them. Unlogged,
+-- and so not replicated: a crash that empties it costs at most one more scan
+-- of each file it held.
+CREATE UNLOGGED TABLE llm_attempts (
+	sample_id bigint      PRIMARY KEY, -- samples.id; no key, see above
+	at        timestamptz NOT NULL DEFAULT now()
+);
+
+-- What postdoc's LLM pass needs to describe a file, uploaded by a worker
+-- whose LLM pass did not run (store/llminput.go): a worker with an LLM handed
+-- the file to describe runs that pass alone instead of scanning it again.
+-- Opaque to hopper, at most 16 MiB. Deleted when an LLM describes the file,
+-- and after a week. Logged, unlike llm_attempts, so a restart keeps a week of
+-- uploads; not published to replicas (UNREPLICATED_TABLES in
+-- scripts/replica/replicated-tables.sh): bulk bytes no replica reader asks
+-- for, and a replica promoted without them rescans instead.
+CREATE TABLE llm_inputs (
+	sample_id bigint      PRIMARY KEY, -- samples.id; no key, see above
+	stored_at timestamptz NOT NULL DEFAULT now(),
+	input     bytea       COMPRESSION lz4 NOT NULL
+);
 
 -- What outside sources say about a file or a package: the sightings ledger.
 -- It is keyed by text, a lowercase sha256 or a package URL without its

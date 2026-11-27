@@ -25,12 +25,14 @@
 #     hopper_queue_pending              samples awaiting first analysis
 #     hopper_queue_rescan               samples eligible for re-analysis
 #     hopper_queue_cleave_pending       samples awaiting the cleave stage
-#     hopper_queue_litmus_pending       samples awaiting the litmus stage
 #     hopper_queue_stuck                queued scans handed out 8 times without a
 #                                       result (verdict store); never offered again
 #   Throughput:
 #     hopper_analyzed_total             cumulative samples analyzed (DB + session)
-#     hopper_analysis_rate_per_second   {tier="toplevel"|"rescan"} analyses/sec
+#     hopper_analysis_rate_per_second   {tier="first"|"rescan"} queued scans completed/sec
+#                                       over the last hour (less since a restart),
+#                                       by why the file was queued
+#     hopper_queue_completed_total      {class="first"|"rescan"} queued scans completed
 #     hopper_files_rate_per_second      fleet files/sec over the trailing 15m
 #   Freshness / lag (gauges, seconds):
 #     hopper_workflow_added_age_seconds      since the newest added sample

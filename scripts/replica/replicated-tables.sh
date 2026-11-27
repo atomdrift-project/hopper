@@ -11,9 +11,12 @@
 # schema the publisher's hopper writes (its --store), created by setup.sh from
 # store/schema.sql.
 #
-# Every verdict table except walk_staging: it is UNLOGGED scratch space, and a
-# publication cannot carry an unlogged table. The legacy tables in public have
-# been frozen since the 2026-11-15 migration and are not published.
+# Every verdict table except the UNLOGGED ones (a publication cannot carry an
+# unlogged table) and UNREPLICATED_TABLES: logged operational state that only
+# the primary's hopper reads, and that a promoted replica can start without.
+# setup.sh still creates them on the replica, from store/schema.sql, empty.
+# The legacy tables in public have been frozen since the 2026-11-15 migration
+# and are not published.
 # shellcheck disable=SC2034
 REPLICA_SCHEMA="${REPLICA_SCHEMA:-verdict}"
 case "$REPLICA_SCHEMA" in
@@ -24,3 +27,9 @@ case "$REPLICA_SCHEMA" in
 esac
 # shellcheck disable=SC2034
 REPLICATED_TABLES='names samples scanners verdicts claims contents refs scans locations queue sightings sighting_acquisitions reports popular_packages gauntlet_runs gauntlet_samples gauntlet_results gauntlet_withdrawals label_events hopper_kv'
+# llm_inputs: up to 16 MiB of opaque bytes per file, kept a week at most,
+# written and read only by workers through the primary. Shipping it would
+# carry bulk bytes no replica reader asks for; a replica promoted without it
+# describes those files by scanning them again.
+# shellcheck disable=SC2034
+UNREPLICATED_TABLES='llm_inputs'

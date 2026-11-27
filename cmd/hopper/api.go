@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"mime"
 	"net"
 	"net/http"
@@ -33,6 +35,8 @@ import (
 	"github.com/atomdrift-project/hopper/store"
 	"github.com/codeGROOVE-dev/retry"
 	"github.com/jackc/pgx/v5/pgconn"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -942,13 +946,16 @@ func (s *apiServer) registerAPIRoutes(mux *http.ServeMux, handle func(string, fu
 		// is configured, refused with 403 otherwise. A triage consumer's
 		// reports and re-scanned results are per-judgement writes at tens a
 		// day, not the ingest firehose rule 2 keeps out; relaying them is what
-		// lets a cyclotron point its whole stack at one URL.
+		// lets a cyclotron point its whole stack at one URL. The LLM input
+		// read goes with its write: llm_inputs is kept on the primary alone
+		// (not published), so the replica has none to serve.
 		clientWrites := []string{
 			"POST /v1/intake/upload", "POST /v1/intake/held", "POST /v1/intake/popular",
 			"POST /v1/sightings", "POST /v1/sightings/attempted", "POST /v1/sightings/retract",
 			"POST /v1/acquisitions/claim", "POST /v1/acquisitions/finish", "POST /v1/acquisitions/release",
 			"POST /v1/triage/rulings", "POST /v1/triage/reports", "POST /v1/gauntlet/runs",
 			"POST /v1/work/rescan/{sha256}", "POST /api/cleave-result",
+			"PUT /v1/files/{sha256}/llm-input", "GET /v1/files/{sha256}/llm-input",
 		}
 		for _, ep := range clientWrites {
 			if s.relay != nil {
@@ -964,6 +971,8 @@ func (s *apiServer) registerAPIRoutes(mux *http.ServeMux, handle func(string, fu
 	handle("POST /v1/work/heartbeat", s.handleHeartbeat)
 	handle("POST /v1/work/result", s.handleResult)
 	handle("POST /v1/work/rescan/{sha256}", s.handleRescan)
+	handle("PUT /v1/files/{sha256}/llm-input", s.handleSetLLMInput)
+	handle("GET /v1/files/{sha256}/llm-input", s.handleLLMInput)
 	handle("POST /v1/intake/upload", s.handleUpload)
 	handle("POST /v1/intake/held", s.handleKnown)
 	handle("POST /v1/intake/popular", s.handlePopular)
@@ -1671,13 +1680,18 @@ type nextParams struct {
 	rssMB    int // worker's self-reported RSS
 	load1    float64
 	maxBytes int64 // largest file the worker will accept; 0 means no cap
+	// llm is false when the worker said it has no LLM to describe a file
+	// with (llm=0), so it is handed none to describe (store.QueueDescribe).
+	// postdoc does not say yet, and a worker that does not is taken to have
+	// one.
+	llm bool
 }
 
 // parseNextParams reads those fields from q. Every field has a working default,
 // so a malformed or absent value degrades to it rather than rejecting the poll:
 // a worker that gets its load average wrong should still be given work.
 func parseNextParams(q url.Values) nextParams {
-	p := nextParams{count: 1, slots: 1, version: q.Get("version"), traits: q.Get("traits")}
+	p := nextParams{count: 1, slots: 1, version: q.Get("version"), traits: q.Get("traits"), llm: q.Get("llm") != "0"}
 	if n, err := strconv.Atoi(q.Get("count")); err == nil && n > 0 {
 		p.count = min(n, maxClaimCount)
 	}
@@ -1768,7 +1782,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	jobs, err := s.claimJobs(ctx, worker, count, p.toolCaps, p.maxBytes, slots)
+	jobs, err := s.claimJobs(ctx, worker, count, p.toolCaps, p.maxBytes, slots, p.llm)
 	if err != nil {
 		slog.Error("claim jobs failed", "worker", worker, "error", err)
 		v1Error(w, http.StatusInternalServerError, "internal", "Internal.")
@@ -1853,7 +1867,7 @@ func (s *apiServer) handleNext(w http.ResponseWriter, r *http.Request) {
 
 	active := s.tracker.activeClaims(worker)
 	for _, j := range jobs {
-		slog.Info("claimed", "worker", worker, "sha256", j.SHA256,
+		slog.Info("claimed", "worker", worker, "sha256", j.SHA256, "tier", j.Tier,
 			"path", j.Path, "size", j.SizeBytes, "active_claims", active)
 	}
 
@@ -2387,10 +2401,15 @@ const (
 	tierSighted      = "sighted"
 	tierBigArchive   = "big_archive"
 	tierUnanalyzed   = "unanalyzed"
-	tierRepair       = "repair"
-	tierPathRescan   = "path_rescan"
-	tierRescanAge    = "rescan_age"
-	tierMissingLLM   = "missing_llm"
+	// The queue's first scans of packages called malicious before, and the
+	// newest end of its unanalyzed backlog (queueLadder); "unanalyzed" there
+	// is the oldest end.
+	tierCompromised      = "compromised"
+	tierUnanalyzedNewest = "unanalyzed_newest"
+	tierRepair           = "repair"
+	tierPathRescan       = "path_rescan"
+	tierRescanAge        = "rescan_age"
+	tierMissingLLM       = "missing_llm"
 )
 
 // stampTier labels each claimed job with the tier it came from. The tier is
@@ -2429,6 +2448,13 @@ type claimTier struct {
 	// a cap alone would leave it queued behind whatever ran first. See
 	// sightedMaxShare.
 	maxShare float64
+	// restShare, when non-zero, caps the tier at this fraction of what is
+	// left of the batch when the ladder reaches it, rounded up or down at
+	// random in proportion, so that the share holds on average for any
+	// batch: a saturated worker polls for a slot or two at a time, and a
+	// share of one slot rounded to a whole slot either way would hand the
+	// tier all of them or none.
+	restShare float64
 }
 
 // sightedMaxShare is the fraction of a poll's batch the sighted tier may take.
@@ -2679,12 +2705,12 @@ func (s *apiServer) TierActivity() map[string]int64 {
 // uselessly, that there were no jobs. Priority means "offered first", not
 // "allowed to block everything behind it when it has nothing to give".
 func (s *apiServer) claimJobs(
-	ctx context.Context, worker string, count int, tools *workerToolSet, maxBytes int64, slots int,
+	ctx context.Context, worker string, count int, tools *workerToolSet, maxBytes int64, slots int, llm bool,
 ) ([]hopper.ClaimJob, error) {
 	var out []hopper.ClaimJob
 	ladder := s.claimLadder(slots)
 	if s.results != nil {
-		ladder = s.queueLadder(slots, maxBytes, tools.unservableTypes())
+		ladder = s.queueLadder(slots, maxBytes, tools.unservableTypes(), llm)
 	}
 	for _, tier := range ladder {
 		want := count - len(out)
@@ -2697,6 +2723,16 @@ func (s *apiServer) claimJobs(
 		// poll silently loses the lane the cap exists to protect.
 		if tier.maxShare > 0 {
 			want = min(want, max(1, int(float64(count)*tier.maxShare)))
+		}
+		if tier.restShare > 0 {
+			share := float64(want) * tier.restShare
+			want = int(share)
+			if rand.Float64() < share-float64(want) { //nolint:gosec // apportioning work, not a secret
+				want++
+			}
+			if want == 0 {
+				continue
+			}
 		}
 		cands, err := tier.candidates(ctx, max(want*candidateOverfetch, minCandidates))
 		if err != nil {
@@ -3894,6 +3930,11 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 	// retries doesn't orphan the on-disk file behind a missing row; matches
 	// handleResult's persistence model.
 	sample := uploadSample(sha, filename, relPath, written, prov)
+	// Who sent it, beside the source that marks the trust boundary, goes in
+	// the location's feed, unless the producer named the channel it found the
+	// file by (forager's feeds), which says more.
+	uploader := uploaderOf(r)
+	sample.Feed = cmp.Or(sample.Feed, uploader)
 	storeCtx, cancelStore := context.WithTimeout(context.WithoutCancel(r.Context()), uploadStoreTimeout)
 	defer cancelStore()
 	var ingested store.Ingested
@@ -3938,8 +3979,12 @@ func (s *apiServer) storeUpload(w http.ResponseWriter, r *http.Request, src io.R
 	// is reported, not fatal.
 	provApplied := s.uploadProvenance(storeCtx, sha, prov, ingested)
 
+	if c := uploadsCounter(); c != nil {
+		c.Add(r.Context(), 1, metric.WithAttributes(attribute.String("uploader", cmp.Or(uploader, "none"))))
+	}
 	slog.Info("upload accepted",
-		"sha256", sha, "size", written, "filename", filename,
+		"sha256", sha, "size", written, "filename", filename, "uploader", uploader,
+		"origin", snippet([]byte(r.Header.Get(originHeader)), 64), "user_agent", snippet([]byte(r.UserAgent()), 256),
 		"has_provenance", prov != nil, "provenance_applied", provApplied,
 		"already_analyzed", alreadyAnalyzed, "remote", r.RemoteAddr)
 
@@ -4148,61 +4193,6 @@ func applySidecarClaims(sample *hopper.Sample, prov *hopper.Sidecar) {
 	// Canonicalized first, so a purl_base is written in one spelling no matter
 	// which form the (possibly older) uploading client used.
 	sample.PURLBase = pkgparse.VersionlessPURL(pkgparse.CanonicalizePURL(prov.Package.PURL))
-}
-
-// uploadSample builds the row for a stored upload. Source is always "upload"
-// (the trust-boundary marker, distinct from a co-located forager's trusted
-// "forager" direct-insert) and Label is always "unknown" — neither is taken
-// from the producer. When provenance is present, its scalar claims fill the
-// descriptive columns and the finalized sidecar is preserved verbatim in the
-// provenance JSONB.
-func uploadSample(sha, filename, relPath string, size int64, prov *hopper.Sidecar) *hopper.Sample {
-	// An uploaded artifact is observed now — nothing else records when it
-	// arrived, and the row is only as old as this write. mtime is what the
-	// promotion queue ages against, so leaving it NULL kept every upload out of
-	// promotion entirely rather than merely young: a row with no mtime never
-	// satisfies the age gate, no matter how long it sits.
-	now := time.Now().UTC()
-	sample := &hopper.Sample{
-		SHA256:      sha,
-		Source:      "upload",
-		Filename:    filename,
-		Path:        relPath,
-		Label:       "unknown",
-		LabelSource: "upload",
-		SizeBytes:   size,
-		Mtime:       &now,
-	}
-	if prov != nil {
-		// Capture time when the producer recorded one: a dependency fetched from a
-		// registry was published before we saw it, and the age gate should measure
-		// from when the bytes existed, not from when they reached us.
-		if !prov.Fetch.At.IsZero() {
-			at := prov.Fetch.At
-			sample.Mtime = &at
-		}
-		if provJSON, err := json.Marshal(prov); err == nil {
-			sample.Provenance = provJSON
-		}
-		applySidecarClaims(sample, prov)
-	}
-	// Fill name/version gaps from the filename, mirroring the walker's
-	// fillSampleProvenance: producer claims win, the parse only fills blanks.
-	// Uploaded dependencies often carry a version-less PURL ("pkg:npm/pg")
-	// whose release is visible only in the filename ("pg-8.23.0.tgz").
-	parsedName, parsedVersion, _ := pkgparse.ParseFilename(filename)
-	if sample.Package == "" {
-		sample.Package = parsedName
-	}
-	if sample.Version == "" {
-		if v := pkgparse.VersionForName(filename, sample.Package); v != "" {
-			sample.Version = v
-		} else {
-			sample.Version = parsedVersion
-		}
-	}
-	inferWheelIdentity(sample, filename)
-	return sample
 }
 
 // sweepUploadTmp removes orphaned upload temp files older than uploadTmpMaxAge.

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -166,7 +167,7 @@ func TestWrite(t *testing.T) {
 		// Six opinions, five rows: the model's benign reading of the member,
 		// which has no scan of its own, is not stored (writer.speaks).
 		want := Stats{Files: 2, Judged: 2, NewSamples: 2, Verdicts: 5, Stamped: 1, Reports: 2, Contents: 1, Refs: 1}
-		if got != want {
+		if !reflect.DeepEqual(got, want) {
 			t.Errorf("stats %+v, want %+v", got, want)
 		}
 		rec, err := st.BySHA256(ctx, pkg)
@@ -199,7 +200,7 @@ func TestWrite(t *testing.T) {
 		}
 		// Five rows refreshed, no report rewritten: each digest is unchanged.
 		want := Stats{Files: 2, Judged: 2, Verdicts: 5, Stamped: 1, ReportsUnchanged: 2}
-		if got != want {
+		if !reflect.DeepEqual(got, want) {
 			t.Errorf("stats %+v, want %+v", got, want)
 		}
 		rec, err := st.BySHA256(ctx, pkg)
@@ -221,7 +222,7 @@ func TestWrite(t *testing.T) {
 	t.Run("a new engine is recorded with the scan, not on the verdict", func(t *testing.T) {
 		r.header = strings.Replace(r.header, `"engine":"3.0.0"`, `"engine":"3.0.1"`, 1)
 		// The member's row now holds this scan's time: settled, left alone.
-		if got, want := r.write(ctx, t, st), (Stats{Files: 2, Judged: 1, Deferred: 1, Stamped: 1, ReportsUnchanged: 2}); got != want {
+		if got, want := r.write(ctx, t, st), (Stats{Files: 2, Judged: 1, Deferred: 1, Stamped: 1, ReportsUnchanged: 2}); !reflect.DeepEqual(got, want) {
 			t.Errorf("stats %+v, want %+v", got, want)
 		}
 		if rec, err := st.BySHA256(ctx, pkg); err != nil || rec.Engine != "3.0.1" {
@@ -233,7 +234,7 @@ func TestWrite(t *testing.T) {
 	})
 
 	t.Run("the same upload again writes nothing", func(t *testing.T) {
-		if got, want := r.write(ctx, t, st), (Stats{Files: 2, Judged: 1, Deferred: 1, ReportsUnchanged: 2}); got != want {
+		if got, want := r.write(ctx, t, st), (Stats{Files: 2, Judged: 1, Deferred: 1, ReportsUnchanged: 2}); !reflect.DeepEqual(got, want) {
 			t.Errorf("stats %+v, want %+v", got, want)
 		}
 	})
@@ -242,7 +243,7 @@ func TestWrite(t *testing.T) {
 	// has to show there even when it found nothing new.
 	t.Run("a later scan with the same result, from another worker, is recorded", func(t *testing.T) {
 		r.header = strings.NewReplacer(`"worker":"w1"`, `"worker":"w2"`, "T16:00:00Z", "T17:00:00Z").Replace(r.header)
-		if got, want := r.write(ctx, t, st), (Stats{Files: 2, Judged: 2, Stamped: 1, ReportsUnchanged: 2}); got != want {
+		if got, want := r.write(ctx, t, st), (Stats{Files: 2, Judged: 2, Stamped: 1, ReportsUnchanged: 2}); !reflect.DeepEqual(got, want) {
 			t.Errorf("stats %+v, want %+v", got, want)
 		}
 		if rec, err := st.BySHA256(ctx, pkg); err != nil || rec.ScannedAt.Hour() != 17 {
@@ -258,7 +259,7 @@ func TestWrite(t *testing.T) {
 	// the member's atomscan row too (TestWriteMemberJurorsFollowNewestScan).
 	t.Run("a member's changed juror rewrites that juror and the member's opinion", func(t *testing.T) {
 		r.files[1]["ml"] = map[string]any{"class": "suspicious", "fires_at": 900, "prob": 0.61}
-		if got, want := r.write(ctx, t, st), (Stats{Files: 2, Judged: 2, Verdicts: 2, ReportsUnchanged: 2}); got != want {
+		if got, want := r.write(ctx, t, st), (Stats{Files: 2, Judged: 2, Verdicts: 2, ReportsUnchanged: 2}); !reflect.DeepEqual(got, want) {
 			t.Errorf("stats %+v, want %+v", got, want)
 		}
 	})
@@ -268,7 +269,7 @@ func TestWrite(t *testing.T) {
 	t.Run("a juror that no longer fires loses its row", func(t *testing.T) {
 		r.header = strings.Replace(r.header, "T17:00:00Z", "T18:00:00Z", 1)
 		delete(r.files[1], "floor")
-		if got, want := r.write(ctx, t, st), (Stats{Files: 2, Judged: 2, Verdicts: 1, Stamped: 1, JurorsRemoved: 1, ReportsUnchanged: 2}); got != want {
+		if got, want := r.write(ctx, t, st), (Stats{Files: 2, Judged: 2, Verdicts: 1, Stamped: 1, JurorsRemoved: 1, ReportsUnchanged: 2}); !reflect.DeepEqual(got, want) {
 			t.Errorf("stats %+v, want %+v", got, want)
 		}
 	})
@@ -277,7 +278,7 @@ func TestWrite(t *testing.T) {
 		r.header = strings.Replace(r.header, "T18:00:00Z", "T19:00:00Z", 1)
 		r.reports[1] = `{"traits":[{"id":"b::fetch-exec","crit":5},{"id":"c::new","crit":3}]}`
 		r.files[1]["report"] = sum(r.reports[1])
-		if got, want := r.write(ctx, t, st), (Stats{Files: 2, Judged: 2, Verdicts: 1, Stamped: 1, Reports: 1, ReportsUnchanged: 1}); got != want {
+		if got, want := r.write(ctx, t, st), (Stats{Files: 2, Judged: 2, Verdicts: 1, Stamped: 1, Reports: 1, ReportsUnchanged: 1}); !reflect.DeepEqual(got, want) {
 			t.Errorf("stats %+v, want %+v", got, want)
 		}
 		report, err := st.Report(ctx, script)
@@ -325,7 +326,7 @@ func TestWriteReplaces(t *testing.T) {
 				{"sha256": r.files[1]["sha256"], "size": 300, "type": "javascript"},
 			},
 		}
-		if got, want := named.write(ctx, t, st), (Stats{Files: 2, NewSamples: 1, Contents: 1}); got != want {
+		if got, want := named.write(ctx, t, st), (Stats{Files: 2, NewSamples: 1, Contents: 1}); !reflect.DeepEqual(got, want) {
 			t.Errorf("stats %+v, want %+v", got, want)
 		}
 		rec, err := st.BySHA256(ctx, script)
@@ -372,7 +373,7 @@ func TestWriteFailedScan(t *testing.T) {
 		}}}
 		// The scan is recorded (the file stops looking overdue), but a
 		// failed scan's time is bookkeeping, not a stamp of what is known.
-		if got, want := failed.write(ctx, t, st), (Stats{Files: 1, Judged: 1}); got != want {
+		if got, want := failed.write(ctx, t, st), (Stats{Files: 1, Judged: 1}); !reflect.DeepEqual(got, want) {
 			t.Errorf("stats %+v, want %+v", got, want)
 		}
 		var recorded bool
@@ -399,11 +400,11 @@ func TestWriteFailedScan(t *testing.T) {
 			"sha256": sum("opaque bytes"), "size": 77,
 			"verdict": map[string]any{"outcome": "unsupported", "error": "unknown file type"},
 		}}}
-		if got, want := failed.write(ctx, t, st), (Stats{Files: 1, Judged: 1, NewSamples: 1, Verdicts: 1}); got != want {
+		if got, want := failed.write(ctx, t, st), (Stats{Files: 1, Judged: 1, NewSamples: 1, Verdicts: 1}); !reflect.DeepEqual(got, want) {
 			t.Errorf("stats %+v, want %+v", got, want)
 		}
 		failed.files[0]["verdict"] = map[string]any{"outcome": "ok", "class": "benign", "fires_at": -1}
-		if got, want := failed.write(ctx, t, st), (Stats{Files: 1, Judged: 1, Verdicts: 1}); got != want {
+		if got, want := failed.write(ctx, t, st), (Stats{Files: 1, Judged: 1, Verdicts: 1}); !reflect.DeepEqual(got, want) {
 			t.Errorf("stats %+v, want %+v", got, want)
 		}
 	})
@@ -432,7 +433,7 @@ func TestWriteMemberWithOwnScan(t *testing.T) {
 	}
 	// The model's benign reading, left unstored on the archive's line, is
 	// kept now that the file is scanned on its own.
-	if got, want := alone.write(ctx, t, st), (Stats{Files: 1, Judged: 1, Verdicts: 3, Stamped: 1, ReportsUnchanged: 1}); got != want {
+	if got, want := alone.write(ctx, t, st), (Stats{Files: 1, Judged: 1, Verdicts: 3, Stamped: 1, ReportsUnchanged: 1}); !reflect.DeepEqual(got, want) {
 		t.Errorf("scanned alone: stats %+v, want %+v (the verdict, the llm row and the ml row)", got, want)
 	}
 
@@ -445,7 +446,7 @@ func TestWriteMemberWithOwnScan(t *testing.T) {
 	r.reports[1] = `{"traits":[]}`
 	r.files[1]["report"] = sum(r.reports[1])
 	// Written: the archive's scan and its llm row. Nothing of the script's.
-	if got, want := r.write(ctx, t, st), (Stats{Files: 2, Judged: 1, Deferred: 1, Verdicts: 1, Stamped: 1, ReportsUnchanged: 2}); got != want {
+	if got, want := r.write(ctx, t, st), (Stats{Files: 2, Judged: 1, Deferred: 1, Verdicts: 1, Stamped: 1, ReportsUnchanged: 2}); !reflect.DeepEqual(got, want) {
 		t.Errorf("archive rescan: stats %+v, want %+v", got, want)
 	}
 	rec, err := st.BySHA256(ctx, script)
@@ -461,10 +462,17 @@ func TestWriteMemberWithOwnScan(t *testing.T) {
 		t.Errorf("report %q, %v: the member's line replaced the file's own report", report, err)
 	}
 
-	// The archive's own llm row is the archive's to lose.
+	// The archive's own llm row is the archive's to lose, and only a line
+	// that finds the archive benign loses it: a flagged line without one is
+	// a worker that did not ask an LLM (writer.fileRows).
 	delete(r.files[0], "llm")
-	if got, want := r.write(ctx, t, st), (Stats{Files: 2, Judged: 1, Deferred: 1, JurorsRemoved: 1, ReportsUnchanged: 2}); got != want {
-		t.Errorf("archive without llm: stats %+v, want %+v", got, want)
+	if got, want := r.write(ctx, t, st), (Stats{Files: 2, Judged: 1, Deferred: 1, ReportsUnchanged: 2}); !reflect.DeepEqual(got, want) {
+		t.Errorf("hostile archive without llm: stats %+v, want %+v", got, want)
+	}
+	r.files[0]["verdict"] = map[string]any{"outcome": "ok", "class": "benign", "fires_at": -1}
+	r.files[0]["floor"] = map[string]any{"class": "benign", "fires_at": -1}
+	if got := r.write(ctx, t, st); got.JurorsRemoved != 1 {
+		t.Errorf("benign archive without llm: stats %+v, want its llm row removed", got)
 	}
 }
 

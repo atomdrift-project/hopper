@@ -23,6 +23,11 @@ import (
 
 // Stats counts what one [Store.Write] changed.
 type Stats struct {
+	// Completed are the queued scans the result took off the queue: the
+	// files it reached a verdict on that were waiting for a scan, the
+	// artifact and any member queued in its own right. A failed scan
+	// completes none; its file waits out a back-off and is tried again.
+	Completed        []QueuedScan
 	Files            int   // files named
 	Judged           int   // files whose verdict this result spoke for
 	Deferred         int   // members left to their own scan, or to another archive's as recent or more
@@ -39,9 +44,21 @@ type Stats struct {
 	Refs             int64 // references added or changed
 	RefsRemoved      int64
 	Requeued         int64 // containing archives queued for repair
+	Described        int64 // the artifact queued to be described: the LLM gate admitted it, and no LLM said why (QueueDescribe)
+	// LLMInputDropped is set when the result described the artifact and so
+	// deleted the input stored for its LLM pass (llm_inputs).
+	LLMInputDropped bool
 	// Late is set when a later scan of the artifact is already recorded: the
 	// result is stale, and nothing but unknown files' rows was written.
 	Late bool
+}
+
+// QueuedScan is a queue row a result completed: when the file was queued
+// and at which priority, which says whether this was its first scan or a
+// rescan (Priority.IsRescan).
+type QueuedScan struct {
+	QueuedAt time.Time
+	Priority Priority
 }
 
 // Changed reports whether the write changed what is known: a row beyond the
@@ -131,7 +148,7 @@ func (st *Store) write(ctx context.Context, files []scanresult.File) (Stats, err
 			st.afterRead()
 		}
 		for _, step := range []func(context.Context) error{
-			w.verdicts, w.stamp, w.claims, w.contents, w.refs, w.queue,
+			w.verdicts, w.stamp, w.claims, w.contents, w.refs, w.queue, w.describe,
 		} {
 			if err := step(ctx); err != nil {
 				return err
@@ -169,9 +186,11 @@ type writer struct {
 	stats   Stats
 }
 
-// conclusion is the outcome of a verdict, and its error text when it failed.
+// conclusion is the outcome of a verdict, its class, and its error text when
+// it failed.
 type conclusion struct {
 	outcome string // "" when the file was only named
+	class   string // "" when the scan reached none
 	err     string
 }
 
@@ -447,25 +466,49 @@ func heldBack(older, newer opinionFacts) bool {
 // It also records whether the scan left something for triage (scans.flagged):
 // atomscan, the floor or the model not benign, or a bad label. Runs after the
 // verdicts step, so it reads what this scan concluded.
+//
+// And what scan's LLM gate decided of the artifact (scans.llm_admission), as
+// its verdict object says: kept, like the ruleset, from the last scan that
+// reached a verdict, and NULL when that scan does not say. A word hopper does
+// not know is logged and stored as not saying, so a newer worker's file falls
+// back to the older rule rather than failing its upload.
 func (w *writer) stamp(ctx context.Context) error {
 	scan, outcome := w.files[0].Scan, w.outcome[0].outcome
 	if outcome == "" {
 		return nil // the artifact's line carries no verdict: nothing was concluded
 	}
-	tag, err := w.tx.Exec(ctx, `INSERT INTO scans (sample_id, scanned_at, ruleset, engine, flagged)
+	var (
+		admission *string
+		v         struct {
+			LLMAdmission string `json:"llm_admission"`
+		}
+	)
+	if outcome == "ok" && json.Unmarshal(w.files[0].Verdict, &v) == nil {
+		switch v.LLMAdmission {
+		case "":
+		case "required", "optional", "none":
+			admission = &v.LLMAdmission
+		default:
+			slog.WarnContext(ctx, "store: write: unknown llm_admission, stored as not known",
+				"artifact", hex.EncodeToString(w.files[0].SHA256), "llm_admission", v.LLMAdmission)
+		}
+	}
+	tag, err := w.tx.Exec(ctx, `INSERT INTO scans (sample_id, scanned_at, ruleset, engine, flagged, llm_admission)
 		SELECT $1, $2, coalesce(v.ruleset, $3), coalesce(v.summary->>'eng', $4),
 		       EXISTS (SELECT 1 FROM verdicts f WHERE f.sample_id = $1 AND f.scanner_id = ANY($7) AND f.class <> 'benign')
-		       OR EXISTS (SELECT 1 FROM samples s WHERE s.id = $1 AND s.label = 'bad')
+		       OR EXISTS (SELECT 1 FROM samples s WHERE s.id = $1 AND s.label = 'bad'),
+		       $8::text
 		FROM (VALUES (1)) AS one
 		LEFT JOIN verdicts v ON NOT $5 AND v.sample_id = $1 AND v.scanner_id = $6 AND v.outcome = 'ok'
 		ON CONFLICT (sample_id) DO UPDATE SET scanned_at = EXCLUDED.scanned_at, flagged = EXCLUDED.flagged,
 			ruleset = CASE WHEN $5 THEN EXCLUDED.ruleset ELSE scans.ruleset END,
-			engine  = CASE WHEN $5 THEN EXCLUDED.engine ELSE scans.engine END
+			engine  = CASE WHEN $5 THEN EXCLUDED.engine ELSE scans.engine END,
+			llm_admission = CASE WHEN $5 THEN EXCLUDED.llm_admission ELSE scans.llm_admission END
 		WHERE scans.scanned_at < EXCLUDED.scanned_at
 		   OR (scans.scanned_at = EXCLUDED.scanned_at AND $5
 		       AND (scans.ruleset, scans.engine) IS DISTINCT FROM (EXCLUDED.ruleset, EXCLUDED.engine))`,
 		w.ids[0], scan.At, scan.Ruleset, scan.Engine, outcome == "ok", atomscan,
-		[]int16{atomscan, jurors["floor"], jurors["ml"]})
+		[]int16{atomscan, jurors["floor"], jurors["ml"]}, admission)
 	if err != nil {
 		return fmt.Errorf("stamp: %w", err)
 	}
@@ -605,12 +648,13 @@ func (w *writer) rows(only map[int64]bool) (*verdictRows, error) {
 		r.judged++
 		var verdict struct {
 			Outcome string `json:"outcome"`
+			Class   string `json:"class"`
 			Error   string `json:"error"`
 		}
 		if err := json.Unmarshal(f.Verdict, &verdict); err != nil {
 			return nil, fmt.Errorf("file %d: verdict: %w", i, err)
 		}
-		w.outcome[i] = conclusion{cmp.Or(verdict.Outcome, "ok"), verdict.Error}
+		w.outcome[i] = conclusion{cmp.Or(verdict.Outcome, "ok"), verdict.Class, verdict.Error}
 		if only != nil && !only[w.ids[i]] {
 			continue
 		}
@@ -624,6 +668,15 @@ func (w *writer) rows(only map[int64]bool) (*verdictRows, error) {
 
 // fileRows adds file i's rows to r: atomscan's, the other scanners', its
 // jurors', and the jurors it no longer names.
+//
+// The LLM's description of a flagged artifact is not among those: a worker
+// with no LLM sends none, nor does one whose call is still out (postdoc
+// amends the result when it returns), so a flagged line without one says
+// nothing of the LLM, and a stored description stands until a line that
+// carries the LLM's opinion replaces it. A line that finds the artifact
+// benign drops it, as it always did: the LLM is asked to explain a flagged
+// verdict (no worker asks it of a benign one), so what it wrote explains a
+// verdict this scan no longer reaches.
 func (w *writer) fileRows(i int, r *verdictRows) error {
 	f := &w.files[i]
 	if w.outcome[i].outcome == "ok" {
@@ -631,7 +684,11 @@ func (w *writer) fileRows(i int, r *verdictRows) error {
 		// line only for the jurors a member's line can carry. A juror with
 		// no row has nothing to remove: most members have none, and listing
 		// every one cost a probe each.
+		flagged := w.outcome[i].class == "hostile" || w.outcome[i].class == "suspicious"
 		for name, scanner := range jurors {
+			if name == "llm" && flagged {
+				continue
+			}
 			if !w.speaks(i, name) && (i == 0 || name == "floor" || name == "ml") && slices.Contains(w.stored[i], scanner) {
 				r.gone.ids, r.gone.scanners = append(r.gone.ids, w.ids[i]), append(r.gone.scanners, scanner)
 				r.gone.times = append(r.gone.times, w.formed(i))

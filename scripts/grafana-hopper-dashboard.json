@@ -184,7 +184,7 @@
         "overrides": []
       },
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } },
-      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "hopper_analysis_rate_per_second{job=\"$job\", tier=\"toplevel\"}" } ]
+      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "hopper_analysis_rate_per_second{job=\"$job\", tier=\"first\"}" } ]
     },
     {
       "type": "stat",
@@ -268,7 +268,6 @@
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "hopper_queue_pending{job=\"$job\"}", "legendFormat": "pending" },
         { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "hopper_queue_cleave_pending{job=\"$job\"}", "legendFormat": "cleave" },
-        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "hopper_queue_litmus_pending{job=\"$job\"}", "legendFormat": "litmus" },
         { "refId": "D", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "hopper_queue_rescan{job=\"$job\"}", "legendFormat": "rescan" }
       ]
     },
@@ -289,8 +288,8 @@
       },
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "mean"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "hopper_analysis_rate_per_second{job=\"$job\", tier=\"toplevel\"}", "legendFormat": "analyses/s toplevel" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "hopper_analysis_rate_per_second{job=\"$job\", tier=\"rescan\"}", "legendFormat": "analyses/s rescan" },
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "hopper_analysis_rate_per_second{job=\"$job\", tier=\"first\"}", "legendFormat": "first scans/s" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "hopper_analysis_rate_per_second{job=\"$job\", tier=\"rescan\"}", "legendFormat": "rescans/s" },
         { "refId": "C", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "hopper_files_rate_per_second{job=\"$job\"}", "legendFormat": "fleet files/s" },
         { "refId": "D", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(hopper_analyzed_total{job=\"$job\"}[5m]))", "legendFormat": "analyzed_total rate" }
       ]
@@ -364,8 +363,7 @@
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "deriv(hopper_queue_pending{job=\"$job\"}[10m])", "legendFormat": "pending /s" },
         { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "deriv(hopper_queue_rescan{job=\"$job\"}[10m])", "legendFormat": "rescan /s" },
-        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "deriv(hopper_queue_cleave_pending{job=\"$job\"}[10m])", "legendFormat": "cleave /s" },
-        { "refId": "D", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "deriv(hopper_queue_litmus_pending{job=\"$job\"}[10m])", "legendFormat": "litmus /s" }
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "deriv(hopper_queue_cleave_pending{job=\"$job\"}[10m])", "legendFormat": "cleave /s" }
       ]
     },
     {

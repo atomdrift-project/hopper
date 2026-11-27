@@ -19,19 +19,20 @@ type Health struct {
 	// OldestUnacquired is when the longest-waiting live claim no acquirer
 	// has tried was made (see liveUnacquired); zero when there is none.
 	OldestUnacquired time.Time
-	// Depths counts queued files by priority; Stuck those handed out too
-	// often without a result.
+	// Depths counts queued files by priority; Stuck (below) those handed out
+	// too often without a result.
 	Depths map[Priority]int64
+	// Queued counts, by priority, the files queued since the time asked for
+	// that are still queued, stuck ones too: the arrivals the queue has not
+	// yet served. With the queued scans results completed since then that
+	// were queued after it (Stats.Completed), it is everything that arrived.
+	Queued map[Priority]int64
+	Stuck  int64
 	// SightedWait is how long the longest-waiting file in the sighted-pinned
 	// triage queue has waited for judgement (see sightedPinnedWait). It is
 	// not the scan queue: a row stuck there is never handed out again, so
 	// its age only grows, and it is counted in Stuck instead.
 	SightedWait time.Duration
-	// Scanned counts scans made since the time asked for; Rescanned those of
-	// files that arrived before it, which is as near as the store comes to
-	// telling a rescan from a first scan (it keeps a file's latest scan).
-	Scanned, Rescanned int64
-	Stuck              int64
 	// Unfinished counts acquisitions claimed before the time asked for that
 	// never recorded how they ended.
 	Unfinished int64
@@ -44,7 +45,7 @@ type Health struct {
 const liveUnacquired = `g.attempted_at IS NULL AND g.claim IN ('malicious', 'suspicious')
 	AND g.first_seen <> 'epoch' AND g.first_seen IS DISTINCT FROM g.published_at`
 
-// Health reads the corpus's health: scans counted since since, and
+// Health reads the corpus's health: files queued since since, and
 // acquisitions unfinished if claimed before unfinishedBefore.
 func (st *Store) Health(ctx context.Context, since, unfinishedBefore time.Time) (*Health, error) {
 	var h Health
@@ -55,18 +56,14 @@ func (st *Store) Health(ctx context.Context, since, unfinishedBefore time.Time) 
 			(SELECT s.created_at FROM samples s
 			 WHERE EXISTS (SELECT 1 FROM locations l WHERE l.sample_id = s.id) ORDER BY s.id DESC LIMIT 1),
 			(SELECT max(scanned_at) FROM scans),
-			(SELECT count(*) FROM scans WHERE scanned_at >= $1),
-			(SELECT count(*) FROM scans sc JOIN samples s ON s.id = sc.sample_id
-			 WHERE sc.scanned_at >= $1 AND s.created_at < $1),
 			(SELECT min(g.first_seen) FROM sightings g WHERE `+liveUnacquired+`
 			   AND (starts_with(g.subject, 'pkg:') OR EXISTS (SELECT 1 FROM samples s
 			     JOIN locations l ON l.sample_id = s.id
 			     WHERE s.sha256 = CASE WHEN g.subject ~ '^[0-9a-f]{64}$' THEN decode(g.subject, 'hex') END))),
 			(SELECT count(*) FROM sighting_acquisitions
-			 WHERE finished_at IS NULL AND last_attempt IS NOT NULL AND last_attempt < $2),
+			 WHERE finished_at IS NULL AND last_attempt IS NOT NULL AND last_attempt < $1),
 			(SELECT count(*) FROM popular_packages)`,
-		since, unfinishedBefore).Scan(&arrived, &scanned, &h.Scanned, &h.Rescanned,
-		&unacquired, &h.Unfinished, &h.Popular)
+		unfinishedBefore).Scan(&arrived, &scanned, &unacquired, &h.Unfinished, &h.Popular)
 	if err != nil {
 		return nil, fmt.Errorf("store: health: %w", err)
 	}
@@ -81,8 +78,30 @@ func (st *Store) Health(ctx context.Context, since, unfinishedBefore time.Time) 
 	if h.SightedWait, err = st.sightedPinnedWait(ctx); err != nil {
 		return nil, err
 	}
-	if h.Depths, h.Stuck, err = st.Depths(ctx); err != nil {
-		return nil, err
+	// One pass over the queue for its depths and its arrivals.
+	rows, err := st.pool.Query(ctx, `SELECT priority, attempts >= 8, count(*), count(*) FILTER (WHERE queued_at >= $1)
+		FROM queue GROUP BY 1, 2`, since)
+	if err != nil {
+		return nil, fmt.Errorf("store: health: queue: %w", err)
+	}
+	h.Depths, h.Queued = make(map[Priority]int64), make(map[Priority]int64)
+	var (
+		p        Priority
+		stuck    bool
+		n, fresh int64
+	)
+	if _, err := pgx.ForEachRow(rows, []any{&p, &stuck, &n, &fresh}, func() error {
+		if stuck {
+			h.Stuck += n
+		} else {
+			h.Depths[p] += n
+		}
+		if fresh > 0 {
+			h.Queued[p] += fresh
+		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("store: health: queue: %w", err)
 	}
 	return &h, nil
 }
@@ -135,9 +154,6 @@ type Work struct {
 	Arrived, Scanned, Waiting []WorkFile // newest arrivals, newest scans, longest waiting
 }
 
-// firstScans are the priorities of files never scanned.
-var firstScans = []int16{int16(QueueSighted), int16(QueueUpload), int16(QueueBigArchive), int16(QueueNew)}
-
 // workFile selects a WorkFile for samples s, by its newest location.
 const workFile = `SELECT s.created_at, sc.scanned_at, coalesce(l.source, ''), coalesce(l.feed, ''), coalesce(l.path, ''),
 		coalesce(s.provenance->'artifact'->>'filename', ''), coalesce(s.file_type, ''), coalesce(v.class::text, ''), s.sha256, %s
@@ -154,8 +170,8 @@ func (st *Store) Work(ctx context.Context, limit int) (*Work, error) {
 	rows, err := st.pool.Query(ctx, `SELECT coalesce(l.source, ''), coalesce(l.feed, ''), count(*), min(q.queued_at), max(q.queued_at)
 		FROM queue q
 		LEFT JOIN LATERAL (SELECT source, feed FROM locations WHERE sample_id = q.sample_id ORDER BY seen_at DESC LIMIT 1) l ON true
-		WHERE q.priority = ANY($1)
-		GROUP BY 1, 2 ORDER BY 3 DESC LIMIT $2`, firstScans, limit)
+		WHERE q.priority <> ALL($1)
+		GROUP BY 1, 2 ORDER BY 3 DESC LIMIT $2`, rescans, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: work: backlogs: %w", err)
 	}
@@ -176,11 +192,11 @@ func (st *Store) Work(ctx context.Context, limit int) (*Work, error) {
 		{&w.Scanned, "scanned", fmt.Sprintf(workFile, "NULL::timestamptz", `(SELECT sample_id FROM scans ORDER BY scanned_at DESC LIMIT $1) n
 			JOIN samples s ON s.id = n.sample_id`) + ` ORDER BY sc.scanned_at DESC`},
 		{&w.Waiting, "waiting", fmt.Sprintf(workFile, "q.queued_at", `(SELECT sample_id, queued_at FROM queue
-			WHERE priority = ANY($2) ORDER BY queued_at LIMIT $1) q JOIN samples s ON s.id = q.sample_id`) + ` ORDER BY q.queued_at`},
+			WHERE priority <> ALL($2) ORDER BY queued_at LIMIT $1) q JOIN samples s ON s.id = q.sample_id`) + ` ORDER BY q.queued_at`},
 	} {
 		args := []any{limit}
 		if list.name == "waiting" {
-			args = append(args, firstScans)
+			args = append(args, rescans)
 		}
 		rows, err := st.pool.Query(ctx, list.from, args...)
 		if err != nil {

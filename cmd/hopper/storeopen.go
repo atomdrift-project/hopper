@@ -26,7 +26,9 @@ const defaultStoreMaxConns int32 = 4
 
 // openStore opens the verdict tables in schema, on the database dsn names,
 // creating them when the schema has none: a fresh install starts empty, and
-// a migrated one (`hopper migrate`) already has them.
+// a migrated one (`hopper migrate`) already has them. Tables made from an
+// older schema.sql are upgraded (store.Upgrade), unless the session is
+// read-only.
 func openStore(ctx context.Context, dsn, schema string, maxConns int32) (*store.Store, *pgxpool.Pool, error) {
 	cfg, err := storePoolConfig(dsn, maxConns)
 	if err != nil {
@@ -49,6 +51,9 @@ func openStore(ctx context.Context, dsn, schema string, maxConns int32) (*store.
 		return nil, nil, fmt.Errorf("store: schema %s: %w", schema, err)
 	}
 	st, err := store.New(pool)
+	if err == nil {
+		err = st.Upgrade(ctx)
+	}
 	if err != nil {
 		pool.Close()
 		return nil, nil, err

@@ -1121,7 +1121,6 @@ type WorkflowHealth struct {
 	LatestAnalyzed time.Time
 	LatestReady    time.Time
 	PendingCleave  int64
-	PendingLitmus  int64
 }
 
 // WorkflowBacklog groups pending work by source/feed/ecosystem.
@@ -1132,7 +1131,6 @@ type WorkflowBacklog struct {
 	Feed          string
 	Ecosystem     string
 	PendingCleave int64
-	PendingLitmus int64
 }
 
 // WorkflowSample is a light sample row for dashboard recency tables.
@@ -4766,6 +4764,14 @@ type ClaimJob struct {
 	// majority of samples that carry none. Stamped per claim batch, not selected
 	// by each tier query. Omitted from the wire when false.
 	HasProvenance bool `json:"has_provenance,omitempty"`
+
+	// HasLLMInput reports, on a job of tier "missing_llm", that hopper holds
+	// the input a worker's LLM pass needs for this sample, uploaded by the
+	// worker that scanned it without one: fetch it from
+	// /v1/files/{sha256}/llm-input and run the LLM pass alone instead of the
+	// whole analysis. Stamped by the queue's read of that tier only; false on
+	// every other tier. Omitted from the wire when false.
+	HasLLMInput bool `json:"has_llm_input,omitempty"`
 }
 
 // Worker is a litmus worker's latest heartbeat data.

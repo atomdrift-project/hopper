@@ -185,7 +185,7 @@ func TestSystemStatusPromotesTheWorstProblem(t *testing.T) {
 		{OldestPending: time.Now().Add(-71 * 24 * time.Hour), NewestPending: time.Now().Add(-33 * 24 * time.Hour)},
 	}
 	var buf strings.Builder
-	writeSystemStatus(&buf, &statusInputs{health: stale, backlogs: backlogs, pendingLitmus: 169196})
+	writeSystemStatus(&buf, &statusInputs{health: stale, backlogs: backlogs, pending: 169196})
 	out := buf.String()
 	if !strings.Contains(out, "No sample ingested in") {
 		t.Errorf("a stalled ingest must be the headline, got %q", out)
@@ -194,7 +194,7 @@ func TestSystemStatusPromotesTheWorstProblem(t *testing.T) {
 		t.Errorf("a stalled ingest must render red, got %q", out)
 	}
 	// The unpromoted backlog still gets said, quietly.
-	if !strings.Contains(out, "no litmus score") {
+	if !strings.Contains(out, "await a first scan") {
 		t.Errorf("secondary issues must still appear in the facts line, got %q", out)
 	}
 
@@ -410,9 +410,9 @@ func TestSystemStatusSeparatesChronicFromAcute(t *testing.T) {
 	}
 
 	var buf strings.Builder
-	writeSystemStatus(&buf, &statusInputs{health: fresh, backlogs: chronic, pendingLitmus: 168906})
+	writeSystemStatus(&buf, &statusInputs{health: fresh, backlogs: chronic, pending: 168906})
 	out := buf.String()
-	if strings.Contains(out, "168,906 files have no litmus score</span>") {
+	if strings.Contains(out, "168,906 files await a first scan</span>") {
 		t.Error("a months-old backlog must not own the headline")
 	}
 	if !strings.Contains(out, "Healthy, with a standing backlog") {
@@ -422,21 +422,21 @@ func TestSystemStatusSeparatesChronicFromAcute(t *testing.T) {
 		t.Error("a standing backlog is not an all-clear")
 	}
 	// Still reported, just not shouted.
-	if !strings.Contains(out, "168,906 files have no litmus score") {
+	if !strings.Contains(out, "168,906 files await a first scan") {
 		t.Errorf("the backlog must still appear in the facts, got %q", out)
 	}
 
 	// An acute problem outranks it and takes the headline back.
 	var acute strings.Builder
 	writeSystemStatus(&acute, &statusInputs{
-		health:        hopper.WorkflowHealth{LatestAdded: time.Now().Add(-3 * time.Hour), LatestAnalyzed: time.Now()},
-		backlogs:      chronic,
-		pendingLitmus: 168906,
+		health:   hopper.WorkflowHealth{LatestAdded: time.Now().Add(-3 * time.Hour), LatestAnalyzed: time.Now()},
+		backlogs: chronic,
+		pending:  168906,
 	})
 	if !strings.Contains(acute.String(), "No sample ingested in") {
 		t.Errorf("an acute problem must own the headline, got %q", acute.String())
 	}
-	if !strings.Contains(acute.String(), "168,906 files have no litmus score") {
+	if !strings.Contains(acute.String(), "168,906 files await a first scan") {
 		t.Errorf("the chronic condition must still be listed, got %q", acute.String())
 	}
 }

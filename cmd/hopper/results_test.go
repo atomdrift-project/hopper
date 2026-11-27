@@ -247,13 +247,13 @@ func TestQueueHandout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	jobs, err := api.claimJobs(ctx, "w1", 4, nil, 0, 8)
-	if err != nil || len(jobs) != 1 || jobs[0].SHA256 != pkg || jobs[0].Path != "pool/pkg.tgz" || jobs[0].Tier != tierUnanalyzed {
+	jobs, err := api.claimJobs(ctx, "w1", 4, nil, 0, 8, true)
+	if err != nil || len(jobs) != 1 || jobs[0].SHA256 != pkg || jobs[0].Path != "pool/pkg.tgz" || jobs[0].Tier != tierUnanalyzedNewest {
 		t.Fatalf("claim %+v, %v", jobs, err)
 	}
 	// Another hopper, with its own tracker, sees the lease.
 	other := &apiServer{db: api.db, results: st, tracker: newWorkerTracker(), progress: &loadProgress{}}
-	if jobs, err := other.claimJobs(ctx, "w2", 4, nil, 0, 8); err != nil || len(jobs) != 0 {
+	if jobs, err := other.claimJobs(ctx, "w2", 4, nil, 0, 8, true); err != nil || len(jobs) != 0 {
 		t.Errorf("a leased file was handed out again: %+v, %v", jobs, err)
 	}
 
@@ -275,7 +275,7 @@ func TestQueueHandout(t *testing.T) {
 	if ok, err := st.Rescan(ctx, rawPkg, time.Now()); err != nil || !ok {
 		t.Fatalf("rescan: %v, %v", ok, err)
 	}
-	if jobs, err := api.claimJobs(ctx, "w1", 4, nil, 0, 8); err != nil || len(jobs) != 1 {
+	if jobs, err := api.claimJobs(ctx, "w1", 4, nil, 0, 8, true); err != nil || len(jobs) != 1 {
 		t.Fatalf("claim %+v, %v", jobs, err)
 	}
 	missing, err := json.Marshal(resultRequest{SHA256: pkg, Worker: "w1", Error: "Path does not exist: pool/pkg.tgz"})
@@ -332,7 +332,7 @@ func TestIngestAndRescan(t *testing.T) {
 	if code := rescan(sha); code != http.StatusOK {
 		t.Errorf("rescan: %d, want 200", code)
 	}
-	jobs, err := api.claimJobs(ctx, "w1", 4, nil, 0, 8)
+	jobs, err := api.claimJobs(ctx, "w1", 4, nil, 0, 8, true)
 	if err != nil || len(jobs) != 1 || jobs[0].SHA256 != sha || jobs[0].Path != walked[0].Path || jobs[0].Tier != tierForcedRescan {
 		t.Errorf("claim %+v, %v; want the file handed out as a requested rescan", jobs, err)
 	}
@@ -377,7 +377,7 @@ func TestRefillStale(t *testing.T) {
 	if next, queued, err := refillStale(ctx, st, store.Cursor{}, scanned.Add(time.Hour)); err != nil || queued != 1 || next != (store.Cursor{}) {
 		t.Errorf("cutoff after the scan: next %+v, queued %d, %v; want the file queued", next, queued, err)
 	}
-	jobs, err := api.claimJobs(ctx, "w1", 4, nil, 0, 8)
+	jobs, err := api.claimJobs(ctx, "w1", 4, nil, 0, 8, true)
 	if err != nil || len(jobs) != 1 || jobs[0].SHA256 != pkg || jobs[0].Tier != tierRescanAge {
 		t.Errorf("claim %+v, %v; want the file handed out as a rescan by age", jobs, err)
 	}
@@ -584,7 +584,7 @@ func TestClaimOpensAnotherCopy(t *testing.T) {
 			t.Fatalf("%s: %v", sql, err)
 		}
 	}
-	jobs, err := api.claimJobs(ctx, "w1", 4, nil, 0, 8)
+	jobs, err := api.claimJobs(ctx, "w1", 4, nil, 0, 8, true)
 	if err != nil || len(jobs) != 1 || jobs[0].Path != "mirror/x.bin" {
 		t.Fatalf("claim %+v, %v: want the job at the mirror's copy", jobs, err)
 	}

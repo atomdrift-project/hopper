@@ -50,7 +50,7 @@ func setEnumerationHealth(dir string, full, healthy bool) {
 // records into. Grouping them lets the registration read as a flat manifest and
 // keeps the callback's parameter list to one pointer.
 type instruments struct {
-	pending, rescan, cleavePending, litmusPending, stuck         metric.Int64Observable
+	pending, rescan, cleavePending, stuck                        metric.Int64Observable
 	unattemptedAge                                               metric.Int64Observable
 	sightedInvestigationLag                                      metric.Int64Observable
 	retiredNoOutcome                                             metric.Int64Observable
@@ -257,6 +257,45 @@ func recordVerdictResult(ctx context.Context, lane, outcome string) {
 	}
 }
 
+// queueCompletedCounter counts the queued scans results complete, by class:
+// "first" for a file queued for its first scan, "rescan" for one queued to
+// be scanned again (store.Priority.IsRescan). Its rate is the fleet's
+// throughput in the units the queues drain in, unbroken by restarts, as the
+// analysis-rate gauge is not.
+var queueCompletedCounter = sync.OnceValue(func() metric.Int64Counter {
+	c, err := otel.Meter(meterName).Int64Counter(
+		"hopper.queue.completed",
+		metric.WithDescription("Queued scans results completed, by class: first scan or rescan."),
+		metric.WithUnit("{scan}"),
+	)
+	if err != nil {
+		return nil
+	}
+	return c
+})
+
+// recordCompletedScans counts the queued scans one result completed, in the
+// counter and in the dashboard's tally.
+func recordCompletedScans(ctx context.Context, completed []store.QueuedScan) {
+	if len(completed) == 0 {
+		return
+	}
+	completedScans.add(time.Now(), completed)
+	c := queueCompletedCounter()
+	if c == nil {
+		return
+	}
+	var n [len(scanClasses)]int64
+	for _, q := range completed {
+		n[classOf(q.Priority)]++
+	}
+	for class, k := range n {
+		if k > 0 {
+			c.Add(ctx, k, metric.WithAttributes(attribute.String("class", scanClasses[class])))
+		}
+	}
+}
+
 // Sample-age histograms answer "how far behind is the queue" in the one unit
 // that survives a change in throughput: how old the work itself is. Queue depth
 // cannot answer it — a 500k backlog drained in SHA-pivot order and a 500k
@@ -443,7 +482,6 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 		pending:       gauge("hopper.queue.pending", "Samples awaiting first analysis.", "{sample}"),
 		rescan:        gauge("hopper.queue.rescan", "Samples queued for re-analysis across the forced, repair and age tiers.", "{sample}"),
 		cleavePending: gauge("hopper.queue.cleave_pending", "Samples awaiting the cleave stage.", "{sample}"),
-		litmusPending: gauge("hopper.queue.litmus_pending", "Samples awaiting the litmus stage.", "{sample}"),
 		// Store only. A row handed out 8 times without a result leaves the
 		// queue's hand-out index and is never offered again, but stays in the
 		// table, so nothing else counts it and nothing retries it.
@@ -474,9 +512,15 @@ func (wd *webDashboard) registerMetrics(meter metric.Meter) error {
 			"Recovery targets claimed but never reporting success or failure; work silently abandoned.", "{target}"),
 
 		// Throughput. analyzed is a process-lifetime monotonic total.
-		analyzed:     counter("hopper.analyzed", "Cumulative samples analyzed (database total at startup plus this session).", "{sample}"),
-		analysisRate: fgauge("hopper.analysis.rate", "Top-level analyses per second over the rate window, by tier.", "{sample}/s"),
-		filesRate:    fgauge("hopper.files.rate", "Files analyzed per second across the fleet over the trailing 15 minutes.", "{file}/s"),
+		analyzed: counter("hopper.analyzed", "Cumulative samples analyzed (database total at startup plus this session).", "{sample}"),
+		// tier is "first" or "rescan": why the file was queued, by the
+		// priority of the queue row the result completed. It was "toplevel"
+		// and "rescan" split by whether the file arrived before the window,
+		// which counted nearly every first scan as a rescan.
+		analysisRate: fgauge("hopper.analysis.rate",
+			"Queued scans completed per second over the rate window (less since a restart), by tier: first scan or rescan.",
+			"{sample}/s"),
+		filesRate: fgauge("hopper.files.rate", "Files analyzed per second across the fleet over the trailing 15 minutes.", "{file}/s"),
 
 		// Freshness / lag, in seconds. A rising value means that stage stalled.
 		addedAge:    fgauge("hopper.workflow.added_age", "Seconds since the most recently added sample.", "s"),
@@ -798,18 +842,17 @@ func (wd *webDashboard) observeStore(ctx context.Context, observer metric.Observ
 		slog.Warn("store health unavailable; the corpus gauges have no data this scrape", "error", err)
 		return
 	}
-	var pending, rescan int64
+	var pending, rescans int64
 	for p, n := range h.Depths {
-		switch p {
-		case store.QueueRequested, store.QueueRepair, store.QueueStale:
-			rescan += n
-		default:
+		if p.IsRescan() {
+			rescans += n
+		} else {
 			pending += n
 		}
 	}
 	observer.ObserveInt64(in.popularPackages, h.Popular)
 	observer.ObserveInt64(in.pending, pending)
-	observer.ObserveInt64(in.rescan, rescan)
+	observer.ObserveInt64(in.rescan, rescans)
 	observer.ObserveInt64(in.cleavePending, pending)
 	observer.ObserveInt64(in.stuck, h.Stuck)
 	var unacquired time.Duration
@@ -819,10 +862,13 @@ func (wd *webDashboard) observeStore(ctx context.Context, observer metric.Observ
 	observer.ObserveInt64(in.unattemptedAge, int64(unacquired.Seconds()))
 	observer.ObserveInt64(in.sightedInvestigationLag, int64(h.SightedWait.Seconds()))
 	observer.ObserveInt64(in.retiredNoOutcome, h.Unfinished)
-	observer.ObserveFloat64(in.analysisRate, float64(h.Scanned-h.Rescanned)/analysisRateWindow.Seconds(),
-		metric.WithAttributes(attribute.String("tier", "toplevel")))
-	observer.ObserveFloat64(in.analysisRate, float64(h.Rescanned)/analysisRateWindow.Seconds(),
-		metric.WithAttributes(attribute.String("tier", "rescan")))
+	// Absent until the flows span flowMinSpan, as after a restart: a rate
+	// over the first seconds is a burst, and zero is a false "nothing scans".
+	for c, f := range h.flows {
+		if f.span > 0 {
+			observer.ObserveFloat64(in.analysisRate, f.out, metric.WithAttributes(attribute.String("tier", scanClasses[c])))
+		}
+	}
 	observeAge(observer, in.addedAge, now, h.LatestArrived)
 	observeAge(observer, in.analyzedAge, now, h.LatestScanned)
 	if !h.LatestArrived.IsZero() && !h.LatestScanned.IsZero() {
@@ -880,14 +926,13 @@ func (wd *webDashboard) observeLegacy(cctx context.Context, observer metric.Obse
 	}
 
 	rates := wd.analysisRates(cctx)
-	observer.ObserveFloat64(in.analysisRate, float64(rates.TopLevel)/analysisRateWindow.Seconds(),
-		metric.WithAttributes(attribute.String("tier", "toplevel")))
+	observer.ObserveFloat64(in.analysisRate, float64(rates.TopLevel-rates.Rescans)/analysisRateWindow.Seconds(),
+		metric.WithAttributes(attribute.String("tier", scanClasses[classFirst])))
 	observer.ObserveFloat64(in.analysisRate, float64(rates.Rescans)/analysisRateWindow.Seconds(),
-		metric.WithAttributes(attribute.String("tier", "rescan")))
+		metric.WithAttributes(attribute.String("tier", scanClasses[classRescan])))
 
 	if h, ok := wd.workflowHealth(cctx); ok {
 		observer.ObserveInt64(in.cleavePending, h.PendingCleave)
-		observer.ObserveInt64(in.litmusPending, h.PendingLitmus)
 		observeAge(observer, in.addedAge, now, h.LatestAdded)
 		observeAge(observer, in.analyzedAge, now, h.LatestAnalyzed)
 		if !h.LatestAdded.IsZero() && !h.LatestReady.IsZero() {

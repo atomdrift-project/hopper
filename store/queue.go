@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -11,28 +12,71 @@ import (
 
 // Priority orders queued work: lower is handed out first. The order is the
 // claim ladder hopper served from samples before the queue existed.
+//
+// The values are stored in queue rows and compared as numbers, by every
+// writer that raises a row and by least() when a file is queued twice, so a
+// level keeps its value for good. They are spaced so that a new level fits
+// between two others without rewriting the rows; until 2026-11-27 they were
+// 0 to 6, and [Store.Upgrade] remaps rows written then.
 type Priority int16
 
 const (
 	// QueueSighted is a file a feed has cited. The registry may withdraw it
 	// within hours, so it goes first, newest first.
-	QueueSighted Priority = iota
+	QueueSighted Priority = 0
 	// QueueUpload is a file someone is waiting on a page for.
-	QueueUpload
+	QueueUpload Priority = 10
+	// QueueCompromised is a first scan of a file whose package some source
+	// has called malicious, in any release (see compromised): a project
+	// taken over once is the likeliest to be taken over again, and the
+	// release that proves it may be withdrawn as fast as a sighted one. It
+	// is below an upload, which a person is waiting on, and above a rescan
+	// an operator asked for, which re-checks a file that already has a
+	// verdict, where this file has none.
+	QueueCompromised Priority = 15
 	// QueueRequested is a rescan an operator asked for.
-	QueueRequested
+	QueueRequested Priority = 20
+	// QueueDescribe is a rescan of a file scanned in the last week that
+	// scan's LLM gate admitted and no LLM has described (see
+	// owedDescription): files scan would have sent to the LLM, missing the
+	// line that says why. A rescan, so below the one an operator asked for; above the
+	// first scans of QueueBigArchive and QueueNew all the same, because they
+	// are never empty, and a level below them would never be reached. Its
+	// share of a batch is capped instead, so first scans keep the rest.
+	QueueDescribe Priority = 25
 	// QueueBigArchive is a first scan of a file over bigFile, offered only to
 	// workers large enough for it.
-	QueueBigArchive
+	QueueBigArchive Priority = 30
 	// QueueNew is a first scan.
-	QueueNew
+	QueueNew Priority = 40
 	// QueueRepair is an archive holding a file that got worse since it was
 	// scanned.
-	QueueRepair
+	QueueRepair Priority = 50
 	// QueueStale is a file whose verdict predates the ruleset or the rescan
 	// age.
-	QueueStale
+	QueueStale Priority = 60
 )
+
+// IsRescan reports whether p queues a file to be scanned again: a scan an
+// operator asked for, a description owed, a repair, or a verdict gone stale.
+// Every other priority is a first scan, so a first-scan priority added later
+// counts as one without being listed here; a rescan priority must be added.
+func (p Priority) IsRescan() bool {
+	return slices.Contains(rescans, int16(p))
+}
+
+// rescans are the priorities of files queued to be scanned again, as the
+// queries take them: a first scan is any priority not among them.
+var rescans = []int16{int16(QueueRequested), int16(QueueDescribe), int16(QueueRepair), int16(QueueStale)}
+
+// compromised is true of the file s when some source has called its package
+// malicious, in any release: a claim about the package's name (a package URL
+// without its version, or a URL), not about these bytes, so a claim that
+// names this release exactly makes the file sighted instead (named()). A
+// suspicious claim does not count: capability feeds and policy blocks call
+// popular packages suspicious wholesale. Two index probes.
+const compromised = `EXISTS (SELECT 1 FROM names n JOIN sightings g ON g.subject = n.name
+	WHERE n.id = s.name_id AND g.claim = 'malicious')`
 
 // bigFile is the size above which a first scan is queued as BigArchive.
 const bigFile = 1 << 30
@@ -66,6 +110,10 @@ type Job struct {
 	SizeBytes     int64
 	Priority      Priority
 	HasProvenance bool
+	// HasLLMInput is set on a file to describe whose LLM input hopper holds
+	// (llminput.go): the worker runs the LLM pass alone. It is read only for
+	// QueueDescribe, and false at every other priority.
+	HasLLMInput bool
 }
 
 // Rescan queues a scan a person asked for of the file with digest sha256, and
@@ -97,16 +145,49 @@ func (st *Store) Rescan(ctx context.Context, sha256 []byte, since time.Time) (bo
 // known. skipTypes are the file types the worker cannot run, excluded here so
 // that files it can never take do not fill the n rows it is shown and hide the
 // ones behind them. A file whose type is not yet known is never skipped.
+//
+// Files never handed out come first, in the order they were queued (the
+// newest first when sighted), then those whose retry time has come. Files to
+// describe whose LLM input hopper holds come before all others of their
+// level: describing them costs an LLM call, not a scan. After them, those the
+// LLM gate admitted as required, whose description can change the verdict,
+// come before those it admitted as optional.
 func (st *Store) Candidates(ctx context.Context, p Priority, n int, maxBytes int64, skipTypes []string) ([]Job, error) {
-	if skipTypes == nil {
-		skipTypes = []string{} // a NULL array would make the comparison below match nothing
-	}
 	order := "q.retry_at NULLS FIRST, q.queued_at"
 	if p == QueueSighted {
 		order = "q.retry_at NULLS FIRST, q.queued_at DESC" // small; sorted, not walked
 	}
+	return st.queued(ctx, order, p, n, maxBytes, skipTypes)
+}
+
+// NewestCandidates is [Store.Candidates] read from the other end: files
+// never handed out, the one hopper first saw last first, then those whose
+// retry time has come. Newest is by arrival, samples.id, which is handed out
+// as hopper first records a file and stays with it. queued_at does not: a
+// file queued again after it lost its last path and was shown once more is
+// no newer for it, and a mount coming back would re-queue its whole backlog
+// at the front. The queue_newest index serves the order.
+func (st *Store) NewestCandidates(ctx context.Context, p Priority, n int, maxBytes int64, skipTypes []string) ([]Job, error) {
+	return st.queued(ctx, "q.retry_at NULLS FIRST, q.sample_id DESC", p, n, maxBytes, skipTypes)
+}
+
+// queued is Candidates in the given order. A file to describe is read with
+// whether its LLM input is held, and those that have one go first, then the
+// required admissions: the level is small, a week of admitted scans left
+// undescribed, so it is sorted, not walked. No other level pays for the
+// probes.
+func (st *Store) queued(ctx context.Context, order string, p Priority, n int, maxBytes int64, skipTypes []string) ([]Job, error) {
+	if skipTypes == nil {
+		skipTypes = []string{} // a NULL array would make the comparison below match nothing
+	}
+	input := "false"
+	if p == QueueDescribe {
+		input = "EXISTS (SELECT 1 FROM llm_inputs i WHERE i.sample_id = q.sample_id)"
+		order = "has_input DESC, EXISTS (SELECT 1 FROM scans sc WHERE sc.sample_id = q.sample_id AND sc.llm_admission = 'required') DESC, " + order
+	}
 	rows, err := st.pool.Query(ctx, `SELECT encode(s.sha256, 'hex'), l.path,
-			coalesce(s.size_bytes, 0), coalesce(s.file_type, ''), q.queued_at, s.provenance IS NOT NULL
+			coalesce(s.size_bytes, 0), coalesce(s.file_type, ''), q.queued_at, s.provenance IS NOT NULL,
+			`+input+` AS has_input
 		FROM queue q
 		JOIN samples s ON s.id = q.sample_id
 		CROSS JOIN LATERAL (SELECT path FROM locations
@@ -122,7 +203,7 @@ func (st *Store) Candidates(ctx context.Context, p Priority, n int, maxBytes int
 	}
 	jobs, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Job, error) {
 		j := Job{Priority: p}
-		err := row.Scan(&j.SHA256, &j.Path, &j.SizeBytes, &j.FileType, &j.QueuedAt, &j.HasProvenance)
+		err := row.Scan(&j.SHA256, &j.Path, &j.SizeBytes, &j.FileType, &j.QueuedAt, &j.HasProvenance, &j.HasLLMInput)
 		return j, err
 	})
 	if err != nil {
@@ -204,7 +285,7 @@ func (st *Store) Depths(ctx context.Context) (depths map[Priority]int64, stuck i
 	if err != nil {
 		return nil, 0, fmt.Errorf("store: depths: %w", err)
 	}
-	depths = make(map[Priority]int64, int(QueueStale)+1)
+	depths = make(map[Priority]int64, 8)
 	var (
 		p       Priority
 		isStuck bool
@@ -297,9 +378,14 @@ func (w *writer) queue(ctx context.Context) error {
 		}
 	}
 	if len(done) > 0 {
-		if _, err := w.tx.Exec(ctx, `DELETE FROM queue q USING (
+		rows, err := w.tx.Query(ctx, `DELETE FROM queue q USING (
 				SELECT sample_id FROM queue WHERE sample_id = ANY($1) ORDER BY sample_id FOR UPDATE) k
-			WHERE q.sample_id = k.sample_id`, done); err != nil {
+			WHERE q.sample_id = k.sample_id
+			RETURNING q.queued_at, q.priority`, done)
+		if err != nil {
+			return fmt.Errorf("queue: %w", err)
+		}
+		if w.stats.Completed, err = pgx.AppendRows(w.stats.Completed, rows, pgx.RowToStructByPos[QueuedScan]); err != nil {
 			return fmt.Errorf("queue: %w", err)
 		}
 	}
@@ -345,17 +431,22 @@ func (w *writer) queue(ctx context.Context) error {
 }
 
 // QueueUnscanned queues a first scan of every file on disk that atomscan has
-// not judged and that is not already queued, as ingest would have: a big
-// file as QueueBigArchive, anything else as QueueNew. It reads every sample,
-// so it is for a migration or a repair, not a hot path.
+// not judged and that is not already queued, as ingest would have: a file a
+// feed has cited as QueueSighted, a file of a compromised package as
+// QueueCompromised, a big file as QueueBigArchive, anything else as
+// QueueNew. It reads every sample, so it is for a migration or a repair, not
+// a hot path.
 func (st *Store) QueueUnscanned(ctx context.Context) (int64, error) {
 	tag, err := st.pool.Exec(ctx, `INSERT INTO queue (sample_id, priority)
-		SELECT s.id, CASE WHEN s.size_bytes > $1 THEN $2::smallint ELSE $3::smallint END
+		SELECT s.id, CASE WHEN s.label = 'sighted' OR named(s.sha256, s.name_id, s.version) THEN $6::smallint
+			WHEN `+compromised+` THEN $5::smallint
+			WHEN s.size_bytes > $1 THEN $2::smallint ELSE $3::smallint END
 		FROM samples s
 		WHERE EXISTS (SELECT 1 FROM locations l WHERE l.sample_id = s.id)
 		  AND NOT EXISTS (SELECT 1 FROM verdicts v WHERE v.sample_id = s.id AND v.scanner_id = $4)
 		ORDER BY s.id
-		ON CONFLICT (sample_id) DO NOTHING`, int64(bigFile), int16(QueueBigArchive), int16(QueueNew), atomscan)
+		ON CONFLICT (sample_id) DO NOTHING`,
+		int64(bigFile), int16(QueueBigArchive), int16(QueueNew), atomscan, int16(QueueCompromised), int16(QueueSighted))
 	if err != nil {
 		return 0, fmt.Errorf("store: queue unscanned: %w", err)
 	}

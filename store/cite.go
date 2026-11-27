@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -28,8 +29,10 @@ type Claim struct {
 }
 
 // Cite marks the files the claims name, and moves those still waiting for
-// their first scan to the front of the queue: a registry may withdraw a named
-// package within hours. The sighting writer calls it once its claims have
+// their first scan to the front of the queue: a registry may withdraw a
+// named package within hours. The first scans of the rest of a package that
+// some claim now calls malicious, in any release, move up to
+// QueueCompromised. The sighting writer calls it once its claims have
 // committed.
 func (st *Store) Cite(ctx context.Context, claims []Claim) error {
 	if len(claims) == 0 {
@@ -51,12 +54,43 @@ func (st *Store) Cite(ctx context.Context, claims []Claim) error {
 	if err := st.cite(ctx, ids); err != nil {
 		return fmt.Errorf("store: cite: %w", err)
 	}
+	if err := st.compromise(ctx, subjects); err != nil {
+		return fmt.Errorf("store: cite: %w", err)
+	}
 	return nil
 }
 
-// cite marks the files among ids that some sighting names, and raises those
-// still waiting for their first scan to QueueSighted. Rows are taken in the
-// order every writer takes them: samples by digest, queue by id.
+// compromise raises to QueueCompromised the queued first scans (QueueNew,
+// QueueBigArchive) of the files of each package among subjects that some
+// claim in the ledger calls malicious (see compromised). It asks the ledger
+// rather than the claims it was given, so a package called malicious by
+// another source before is raised as well, and a digest names no package.
+func (st *Store) compromise(ctx context.Context, subjects []string) error {
+	tag, err := st.pool.Exec(ctx, `UPDATE queue q SET priority = $2 FROM (
+			SELECT q.sample_id FROM names n
+			JOIN samples s ON s.name_id = n.id
+			JOIN queue q ON q.sample_id = s.id
+			WHERE n.name = ANY($1) AND q.priority IN ($3, $4)
+			  AND EXISTS (SELECT 1 FROM sightings g WHERE g.subject = n.name AND g.claim = 'malicious')
+			ORDER BY q.sample_id FOR UPDATE OF q) k
+		WHERE q.sample_id = k.sample_id`,
+		subjects, int16(QueueCompromised), int16(QueueBigArchive), int16(QueueNew))
+	if err != nil {
+		return fmt.Errorf("compromise: %w", err)
+	}
+	if n := tag.RowsAffected(); n > 0 {
+		slog.InfoContext(ctx, "store: first scans of a package called malicious raised", "files", n,
+			"priority", int(QueueCompromised))
+	}
+	return nil
+}
+
+// cite marks the files among ids that some sighting names, and queues as
+// QueueSighted those on disk still waiting for their first scan: raised if
+// they are queued, queued if they are not (a row removed by hand, say).
+// Rows are taken in the order every writer takes them:
+// samples by digest, queue by id. A file already queued at least this high
+// is left out before the insert, so it locks no queue row.
 func (st *Store) cite(ctx context.Context, ids []int64) error {
 	if len(ids) == 0 {
 		return nil
@@ -68,11 +102,15 @@ func (st *Store) cite(ctx context.Context, ids []int64) error {
 				SELECT id FROM samples WHERE id IN (SELECT id FROM n) AND NOT cited ORDER BY sha256 FOR NO KEY UPDATE) k
 			WHERE s.id = k.id
 		)
-		UPDATE queue q SET priority = $2 FROM (
-			SELECT sample_id FROM queue WHERE sample_id IN (SELECT id FROM n) AND priority > $2
-			  AND NOT EXISTS (SELECT 1 FROM verdicts v WHERE v.sample_id = queue.sample_id AND v.scanner_id = $3)
-			ORDER BY sample_id FOR UPDATE) k
-		WHERE q.sample_id = k.sample_id`, ids, int16(QueueSighted), atomscan)
+		INSERT INTO queue (sample_id, priority)
+		SELECT n.id, $2 FROM n
+		LEFT JOIN queue q ON q.sample_id = n.id
+		WHERE (q.sample_id IS NULL OR q.priority > $2)
+		  AND NOT EXISTS (SELECT 1 FROM verdicts v WHERE v.sample_id = n.id AND v.scanner_id = $3)
+		  AND EXISTS (SELECT 1 FROM locations l WHERE l.sample_id = n.id)
+		ORDER BY n.id
+		ON CONFLICT (sample_id) DO UPDATE SET priority = EXCLUDED.priority
+		WHERE queue.priority > EXCLUDED.priority`, ids, int16(QueueSighted), atomscan)
 	if err != nil {
 		return fmt.Errorf("cite: %w", err)
 	}

@@ -701,7 +701,7 @@ func TestClaimJobsBigArchiveDistribution(t *testing.T) {
 	// (1) A sub-16-slot worker draining small work one job at a time is never
 	// handed the ISO.
 	for i := range 50 {
-		jobs, err := api.claimJobs(ctx, "small", 1, nil, 0, 8)
+		jobs, err := api.claimJobs(ctx, "small", 1, nil, 0, 8, true)
 		if err != nil {
 			t.Fatalf("small claim %d: %v", i, err)
 		}
@@ -714,7 +714,7 @@ func TestClaimJobsBigArchiveDistribution(t *testing.T) {
 
 	// (2) A capable worker's first single-job poll claims the ISO up front,
 	// despite the tiny poll window.
-	jobs, err := api.claimJobs(ctx, "big", 1, nil, 0, 16)
+	jobs, err := api.claimJobs(ctx, "big", 1, nil, 0, 16, true)
 	if err != nil {
 		t.Fatalf("big claim: %v", err)
 	}
@@ -791,7 +791,7 @@ func TestClaimJobsUnservableTierFallsThrough(t *testing.T) {
 		dataRoot: root, allowedDirs: []string{resolvedPool},
 	}
 
-	jobs, err := api.claimJobs(ctx, "w", dead, nil, 0, 4)
+	jobs, err := api.claimJobs(ctx, "w", dead, nil, 0, 4, true)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
