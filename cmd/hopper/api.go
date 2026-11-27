@@ -946,7 +946,7 @@ func (s *apiServer) registerAPIRoutes(mux *http.ServeMux, handle func(string, fu
 		clientWrites := []string{
 			"POST /v1/intake/upload", "POST /v1/intake/held", "POST /v1/intake/popular",
 			"POST /v1/sightings", "POST /v1/sightings/attempted", "POST /v1/sightings/retract",
-			"POST /v1/acquisitions/claim", "POST /v1/acquisitions/finish",
+			"POST /v1/acquisitions/claim", "POST /v1/acquisitions/finish", "POST /v1/acquisitions/release",
 			"POST /v1/triage/rulings", "POST /v1/triage/reports", "POST /v1/gauntlet/runs",
 			"POST /v1/work/rescan/{sha256}", "POST /api/cleave-result",
 		}
@@ -972,6 +972,7 @@ func (s *apiServer) registerAPIRoutes(mux *http.ServeMux, handle func(string, fu
 	handle("POST /v1/sightings/retract", s.handleSightingKeys(retract))
 	handle("POST /v1/acquisitions/claim", s.handleAcquisitionClaim)
 	handle("POST /v1/acquisitions/finish", s.handleAcquisitionFinish)
+	handle("POST /v1/acquisitions/release", s.handleAcquisitionRelease)
 	handle("POST /v1/triage/rulings", s.handleTriage)
 	handle("POST /v1/triage/reports", s.handleReport)
 	handle("POST /v1/gauntlet/runs", s.handleGauntletRun)

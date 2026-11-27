@@ -15,7 +15,7 @@ func TestLoadAPIStartup(t *testing.T) {
 	api.registerLoadAPI(mux)
 
 	for _, route := range []string{
-		"/v1/acquisitions/claim", "/v1/acquisitions/finish",
+		"/v1/acquisitions/claim", "/v1/acquisitions/finish", "/v1/acquisitions/release",
 		"/v1/sightings/attempted", "/v1/sightings/retract", "/v1/work/result",
 	} {
 		r := httptest.NewRequest(http.MethodPost, route, http.NoBody)
@@ -127,5 +127,26 @@ func TestLedgerRoutes(t *testing.T) {
 	}
 	if _, out := send("/v1/acquisitions/finish", `{"target":"never-claimed"}`); !strings.Contains(out, `"finished":false`) {
 		t.Errorf("finish of an unclaimed target: %s", out)
+	}
+
+	// A claim cut off by a shutdown is given back and can be claimed again; a
+	// finished one is never released.
+	if _, out := send("/v1/acquisitions/release", `{"target":"https://example.test/a.tgz"}`); !strings.Contains(out, `"released":false`) {
+		t.Errorf("release of a finished target: %s, want refused", out)
+	}
+	cut := `{"target":"  https://example.test/cut.tgz ","lease_seconds":1800}`
+	if _, out := send("/v1/acquisitions/claim", cut); !strings.Contains(out, `"claimed":true`) {
+		t.Errorf("claim: %s", out)
+	}
+	if code, out := send("/v1/acquisitions/release", cut); code != http.StatusOK || !strings.Contains(out, `"released":true`) {
+		t.Errorf("release of an unfinished claim: %d %s", code, out)
+	}
+	if _, out := send("/v1/acquisitions/claim", cut); !strings.Contains(out, `"claimed":true`) {
+		t.Errorf("claim after release: %s, want claimable again", out)
+	}
+	for _, body := range []string{`{"target":""}`, `{"target":"` + strings.Repeat("x", maxAcquisitionTarget+1) + `"}`, `{`} {
+		if code, _ := send("/v1/acquisitions/release", body); code != http.StatusBadRequest {
+			t.Errorf("release %.40s: %d, want 400", body, code)
+		}
 	}
 }

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -219,7 +220,8 @@ func (st *Store) SourceKnown(ctx context.Context, source string) (bool, error) {
 // caller, and reports whether it did. A target is claimed once ever: a
 // second claim, whether the first finished or not, is refused, so a fetch
 // that failed is not repeated by every pass. lease is when a person might
-// reasonably open it again; nothing reopens it by itself.
+// reasonably open it again; nothing reopens it by itself. Only the claimant
+// may give back a claim it could not finish (ReleaseAcquisition).
 func (st *Store) ClaimAcquisition(ctx context.Context, target string, lease time.Duration) (bool, error) {
 	tag, err := st.pool.Exec(ctx, `INSERT INTO sighting_acquisitions (target, attempts, last_attempt, next_attempt)
 		VALUES ($1, 1, now(), now() + make_interval(secs => $2))
@@ -241,4 +243,115 @@ func (st *Store) FinishAcquisition(ctx context.Context, target string, acquired 
 		return false, fmt.Errorf("store: finish acquisition: %w", err)
 	}
 	return tag.RowsAffected() == 1, nil
+}
+
+// ReleaseAcquisition gives back a claim on target that its acquirer took but
+// could not see through, because it was shutting down, so that target can be
+// claimed again rather than reported as abandoned. Only a claim with no
+// outcome is released: a finished or acquired row is another pass's completed
+// work and is never erased. It reports whether a claim was released.
+func (st *Store) ReleaseAcquisition(ctx context.Context, target string) (bool, error) {
+	tag, err := st.pool.Exec(ctx, `DELETE FROM sighting_acquisitions
+		WHERE target = $1 AND finished_at IS NULL AND NOT acquired`, target)
+	if err != nil {
+		return false, fmt.Errorf("store: release acquisition: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// Reopened counts what ReopenAcquisitions changed, or would change.
+type Reopened struct {
+	// Targets is how many acquisition claims were deleted.
+	Targets int64
+	// Sightings is how many claims were offered to acquirers again.
+	Sightings int64
+	// Unmapped is how many of the targets name no ledger subject, so no
+	// claim was offered again for them.
+	Unmapped int64
+}
+
+// ReopenAcquisitions deletes the acquisition claims on targets, or on every
+// target when none is named, so each can be claimed again, and offers the
+// sightings they came from to acquirers again. Short of a claimant releasing
+// a claim it never finished (ReleaseAcquisition), it is the only way a claimed
+// target is retried, and it is an operator's to take (see ClaimAcquisition).
+// An acquired target is never reopened: hopper holds its bytes.
+// onlyUnfinished keeps to targets claimed without an outcome ever recorded,
+// work lost with the pass that claimed it rather than work that failed.
+//
+// Deleting the claim is not enough. An acquirer reads only claims never
+// attempted, and it stamps attempted the claims whose target another pass
+// holds, so a target whose pass died has had its claims stamped by the next.
+// Reopened alone, nothing would offer it again. So in the same transaction
+// the malicious and suspicious claims about each target's subject lose their
+// stamp. That is coarser than the target: a subject's other releases come
+// back too, and cost an acquirer one read, since their targets are still
+// claimed and it stamps them again.
+//
+// dryRun counts the same rows through the same predicates, writing nothing.
+func (st *Store) ReopenAcquisitions(ctx context.Context, targets []string, onlyUnfinished, dryRun bool) (Reopened, error) {
+	where := `NOT acquired AND ($1::text[] IS NULL OR target = ANY ($1))`
+	if onlyUnfinished {
+		where += ` AND finished_at IS NULL`
+	}
+	const stamped = `subject = ANY ($1) AND attempted_at IS NOT NULL AND claim IN ('malicious', 'suspicious')`
+	reopen := `DELETE FROM sighting_acquisitions WHERE ` + where + ` RETURNING target`
+	requeue := `WITH u AS (UPDATE sightings SET attempted_at = NULL WHERE ` + stamped + ` RETURNING 1)
+		SELECT count(*) FROM u`
+	if dryRun {
+		reopen = `SELECT target FROM sighting_acquisitions WHERE ` + where
+		requeue = `SELECT count(*) FROM sightings WHERE ` + stamped
+	}
+	// A nil array is "every target"; an empty one would be none.
+	var named any
+	if len(targets) > 0 {
+		named = targets
+	}
+
+	var r Reopened
+	err := pgx.BeginFunc(ctx, st.pool, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, reopen, named)
+		if err != nil {
+			return err
+		}
+		reopened, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return err
+		}
+		r.Targets = int64(len(reopened))
+		subjects := make([]string, 0, len(reopened))
+		for _, target := range reopened {
+			if s := acquisitionSubject(target); s != "" {
+				subjects = append(subjects, s)
+			} else {
+				r.Unmapped++
+			}
+		}
+		if len(subjects) == 0 {
+			return nil
+		}
+		slices.Sort(subjects)
+		return tx.QueryRow(ctx, requeue, slices.Compact(subjects)).Scan(&r.Sightings)
+	})
+	if err != nil {
+		return Reopened{}, fmt.Errorf("store: reopen acquisitions: %w", err)
+	}
+	return r, nil
+}
+
+// acquisitionSubject returns the ledger subject an acquisition target was
+// made from, spelled as the ledger spells it, or "" for a target that names
+// none. A target is the acquirer's spelling, and forager's are "sha256:" and
+// a digest, or a package URL with a release ("@1.2.3", "@*" for every
+// release, "@HEAD"), a tag qualifier, or a "#review-current" marker for a
+// marketplace's current build. NameOf takes off all but the marker.
+func acquisitionSubject(target string) string {
+	if digest, ok := strings.CutPrefix(target, "sha256:"); ok {
+		return strings.ToLower(digest)
+	}
+	if !strings.HasPrefix(target, "pkg:") {
+		return ""
+	}
+	base, _ := strings.CutSuffix(target, "#review-current")
+	return NameOf(base)
 }

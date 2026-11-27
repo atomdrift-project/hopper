@@ -65,8 +65,9 @@ commands:
                      their package identity; --purge drops the documents ingested as samples (dry-run; --apply)
   repair-parents     clear samples.parent where the bytes are on disk standalone (--dry-run; postgres)
   drop-sightings     delete the named sources' claims so a re-walk can rebuild them with versions
-  reopen-acquisitions  make recovery targets claimable again; a claimed target is otherwise
-                     terminal, so this is the ONLY retry path (--unfinished-only; --dry-run)
+  reopen-acquisitions  make recovery targets claimable again and re-queue their sightings; a
+                     claimed target is otherwise terminal, so this is the ONLY retry path
+                     (--unfinished-only; --dry-run; --store)
   reconcile-corroborated  re-derive samples.corroborated from the sightings ledger in both
                      directions, narrowing each claim to the releases it names; a repair
                      tool for history, restores, and the version-blind marking that ran
@@ -645,13 +646,19 @@ func redactDSN(dsn string) string {
 	return u.Redacted()
 }
 
-func openDB(ctx context.Context, dsn string) (*hopper.DB, error) {
+// databaseDSN returns dsn, else $DATABASE_URL, else the production database.
+func databaseDSN(dsn string) string {
 	if dsn == "" {
 		dsn = os.Getenv("DATABASE_URL")
 	}
 	if dsn == "" {
 		dsn = "postgres://hopper@hopper-db:5432/hopper"
 	}
+	return dsn
+}
+
+func openDB(ctx context.Context, dsn string) (*hopper.DB, error) {
+	dsn = databaseDSN(dsn)
 	slog.Info("connecting to database", "dsn", redactDSN(dsn))
 	// Named for the subcommand, not "hopper". Two reasons, both learned the hard
 	// way on 2026-09-07 when an operator could not run reconcile-corroborated
@@ -4655,30 +4662,41 @@ func humanBytes(n int64) string {
 // counts. Without it, every unsuccessful target is reopened; that is the right
 // choice only after something changes the outcome, such as fixing a recovery
 // source. Acquired targets are never reopened: we already hold those bytes.
+//
+// It works on the verdict tables, where forager's claims and the queue it
+// drains live, and offers each target's sightings again (see
+// store.ReopenAcquisitions): a claim forager has stamped attempted is never
+// read again, so deleting the claim alone would reopen nothing.
 func cmdReopenAcquisitions(ctx context.Context) error {
 	f := flag.NewFlagSet("reopen-acquisitions", flag.ExitOnError)
-	dsn := f.String("db", "", "database connection string")
+	dsn := f.String("db", "", "database connection string (default: $DATABASE_URL)")
+	schema := f.String("store", "verdict", "schema holding the verdict tables")
 	unfinishedOnly := f.Bool("unfinished-only", false,
 		"reopen only targets claimed without ever reporting an outcome")
 	dryRun := f.Bool("dry-run", false, "report how many would reopen without writing")
 	parseFlags(f, os.Args[2:])
 
-	db, err := openDB(ctx, *dsn)
+	st, pool, err := openExistingStore(ctx, databaseDSN(*dsn), *schema)
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer pool.Close()
 
-	n, err := db.ReopenAcquisitions(ctx, f.Args(), *unfinishedOnly, *dryRun)
+	r, err := st.ReopenAcquisitions(ctx, f.Args(), *unfinishedOnly, *dryRun)
 	if err != nil {
 		return err
 	}
 	if *dryRun {
-		fmt.Printf("would reopen %d acquisition targets\n", n)
-		return nil
+		writeStdoutf("would reopen %d acquisition targets and offer %d sightings again\n", r.Targets, r.Sightings)
+	} else {
+		writeStdoutf("reopened %d acquisition targets and offered %d sightings again; "+
+			"the next pass will attempt each target once\n", r.Targets, r.Sightings)
 	}
-	fmt.Printf("reopened %d acquisition targets; the next pass will attempt each once\n", n)
-	slog.Info("acquisitions reopened", "targets", n, "unfinished_only", *unfinishedOnly)
+	if r.Unmapped > 0 {
+		writeStdoutf("%d targets name no sighting subject; no pass will offer them\n", r.Unmapped)
+	}
+	slog.Info("acquisitions reopened", "targets", r.Targets, "sightings", r.Sightings,
+		"unmapped", r.Unmapped, "unfinished_only", *unfinishedOnly, "dry_run", *dryRun, "schema", *schema)
 	return nil
 }
 

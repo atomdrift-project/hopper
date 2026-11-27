@@ -21,6 +21,7 @@ import (
 //	POST /v1/sightings/retract    [{"source","subject","affected"}, ...] → {"changed": n}
 //	POST /v1/acquisitions/claim   {"target","lease_seconds"}             → {"claimed": bool}
 //	POST /v1/acquisitions/finish  {"target","acquired","retry_after_seconds","error"} → {"finished": bool}
+//	POST /v1/acquisitions/release {"target"}                             → {"released": bool}
 
 // Bounds on what one request may carry. A key is three short strings; a
 // target is a URL or a package coordinate.
@@ -164,4 +165,27 @@ func (s *apiServer) handleAcquisitionFinish(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	writeTriageJSON(w, map[string]bool{"finished": finished})
+}
+
+// handleAcquisitionRelease gives back a claim the caller took and could not
+// finish because it was shutting down, so the target is claimed again by a
+// later pass instead of being reported as abandoned. A finished or acquired
+// target is never released (store.ReleaseAcquisition).
+func (s *apiServer) handleAcquisitionRelease(w http.ResponseWriter, r *http.Request) {
+	req, ok := s.decodeAcquisition(w, r)
+	if !ok {
+		return
+	}
+	// Detached: the caller is shutting down and may hang up, and a release
+	// that lands after it has gone is still the right outcome.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), apiQueryTimeout)
+	defer cancel()
+	released, err := s.results.ReleaseAcquisition(ctx, req.Target)
+	if err != nil {
+		slog.ErrorContext(ctx, "acquisition release failed", "target", req.Target, "error", err, "remote", r.RemoteAddr)
+		v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")
+		return
+	}
+	slog.InfoContext(ctx, "acquisition release", "target", req.Target, "released", released, "remote", r.RemoteAddr)
+	writeTriageJSON(w, map[string]bool{"released": released})
 }

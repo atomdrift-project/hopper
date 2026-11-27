@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/atomdrift-project/hopper/store"
@@ -42,6 +43,36 @@ func openStore(ctx context.Context, dsn, schema string, maxConns int32) (*store.
 		if _, err = pool.Exec(ctx, `CREATE SCHEMA IF NOT EXISTS `+pgx.Identifier{schema}.Sanitize()); err == nil {
 			_, err = pool.Exec(ctx, store.Schema)
 		}
+	}
+	if err != nil {
+		pool.Close()
+		return nil, nil, fmt.Errorf("store: schema %s: %w", schema, err)
+	}
+	st, err := store.New(pool)
+	if err != nil {
+		pool.Close()
+		return nil, nil, err
+	}
+	return st, pool, nil
+}
+
+// openExistingStore opens the verdict tables in schema for a maintenance
+// command. Unlike openStore it never creates them: a mistyped schema is an
+// error, not a fresh empty store for the command to report success against.
+func openExistingStore(ctx context.Context, dsn, schema string) (*store.Store, *pgxpool.Pool, error) {
+	cfg, err := storePoolConfig(dsn, defaultStoreMaxConns)
+	if err != nil {
+		return nil, nil, err
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("store: %w", err)
+	}
+	var exists bool
+	err = pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, pgx.Identifier{schema, "samples"}.Sanitize()).Scan(&exists)
+	if err == nil && !exists {
+		err = errors.New("holds no verdict tables")
 	}
 	if err != nil {
 		pool.Close()
