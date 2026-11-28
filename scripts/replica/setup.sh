@@ -135,6 +135,22 @@ else
         esac
     fi
 fi
+# pg_isready answers "accepting connections" even when every non-superuser
+# slot is taken, so log in for real before changing anything locally (the
+# subscription stop below included). 2026-11-27: the first real login was the
+# publication step, after the subscription had already been stopped.
+if ! login=$(psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" -XtAc 'SELECT 1' 2>&1); then
+    case "$login" in
+        *"connection slots are reserved"*|*"too many clients"*)
+            die "publisher '$REMOTE_HOST' has no connection slots left for '$REMOTE_USER'.
+       Some client holds them all; on the publisher, as a superuser:
+         SELECT usename, application_name, client_addr, state, count(*)
+           FROM pg_stat_activity WHERE backend_type = 'client backend'
+          GROUP BY 1,2,3,4 ORDER BY 5 DESC;" ;;
+        *)
+            die "cannot log in to publisher '$REMOTE_HOST' as '$REMOTE_USER': $login" ;;
+    esac
+fi
 
 # --- Guard: never run replica setup against the primary --------------------
 # A replica is a SUBSCRIBER; the publisher (primary) is the only cluster that

@@ -95,12 +95,9 @@ func openExistingStore(ctx context.Context, dsn, schema string) (*store.Store, *
 // application_name suffix keeps these sessions distinct from the serving pool
 // in pg_stat_activity.
 func storePoolConfig(dsn string, maxConns int32) (*pgxpool.Config, error) {
-	cfg, err := pgxpool.ParseConfig(dsn)
+	cfg, err := store.ParsePoolConfig(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("store: %w", err)
-	}
-	if cfg.ConnConfig.RuntimeParams == nil {
-		cfg.ConnConfig.RuntimeParams = map[string]string{}
+		return nil, err
 	}
 	cfg.ConnConfig.RuntimeParams["application_name"] = string(cliAppName()) + "-store"
 	cfg.MaxConns = maxConns
