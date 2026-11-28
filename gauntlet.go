@@ -454,13 +454,57 @@ const gauntletCandidatesSQL = `WITH ranked AS (
  AND ((c.label='good' AND c.status='detected') OR (c.label='bad' AND c.status='benign'))
  AND NOT EXISTS(SELECT 1 FROM reports p WHERE p.sha256=c.sha256 AND p.report_type='gauntlet' AND p.evidence_key=c.evidence_key)`
 
+// GauntletSpan bounds a gauntlet selection by the newest usable observation's
+// observed_at: After is exclusive, Before inclusive, and a zero time leaves
+// that side open.
+type GauntletSpan struct {
+	After, Before time.Time
+}
+
+// IsGauntletQueue reports whether name is one of the gauntlet queues, which
+// carry their observation with each sample and drain through the
+// evidence-keyed "gauntlet" report.
+func IsGauntletQueue(name string) bool {
+	return name == "gauntlet" || name == "gauntlet-72h"
+}
+
+// GauntletBounds is the span of observations the named gauntlet queue holds
+// at now: gauntlet-72h the last GauntletWindow, gauntlet everything older.
+func GauntletBounds(queue string, now time.Time) GauntletSpan {
+	cut := now.Add(-GauntletWindow)
+	if queue == "gauntlet-72h" {
+		return GauntletSpan{After: cut}
+	}
+	return GauntletSpan{Before: cut}
+}
+
+// gauntletSpanSQL appends span's bounds to a gauntletCandidatesSQL query as
+// parameters following args. observed_at is GauntletTime's fixed-width UTC
+// text, so it orders as text; Postgres is told to compare bytes, since a
+// locale collation may not.
+func (db *DB) gauntletSpanSQL(b *strings.Builder, args []any, span GauntletSpan) []any {
+	col := "c.observed_at"
+	if db.pool != nil {
+		col += ` COLLATE "C"`
+	}
+	if !span.After.IsZero() {
+		args = append(args, GauntletTime(span.After))
+		fmt.Fprintf(b, " AND %s>$%d", col, len(args))
+	}
+	if !span.Before.IsZero() {
+		args = append(args, GauntletTime(span.Before))
+		fmt.Fprintf(b, " AND %s<=$%d", col, len(args))
+	}
+	return args
+}
+
 // TriageGauntlet returns up to n files a published gauntlet run saw atomscan
-// misjudge, newest observation first, leaving out excluded digests; each
-// carries the observation it answers in Sample.Gauntlet.
-func (db *DB) TriageGauntlet(ctx context.Context, n int, excluded []string) ([]*Sample, error) {
-	args := []any{}
+// misjudge, newest observation first, within span and leaving out excluded
+// digests; each carries the observation it answers in Sample.Gauntlet.
+func (db *DB) TriageGauntlet(ctx context.Context, n int, span GauntletSpan, excluded []string) ([]*Sample, error) {
 	var b strings.Builder
 	b.WriteString(gauntletCandidatesSQL)
+	args := db.gauntletSpanSQL(&b, nil, span)
 	for _, sha := range excluded {
 		args = append(args, sha)
 		fmt.Fprintf(&b, " AND c.sha256<>$%d", len(args))
@@ -602,10 +646,14 @@ func TransferGauntlet(ctx context.Context, dst, src *DB) error {
 
 // GauntletDepth counts the same eligible evidence as selection, without fetching
 // live analysis blobs or constructing a Sample for each row just to count it.
-func (db *DB) GauntletDepth(ctx context.Context) (counts map[string]int64, capped bool, err error) {
+func (db *DB) GauntletDepth(ctx context.Context, span GauntletSpan) (counts map[string]int64, capped bool, err error) {
 	counts = map[string]int64{"false_positive": 0, "miss": 0}
-	q := `SELECT label,count(*) FROM (` + gauntletCandidatesSQL + ` ORDER BY c.observed_at DESC,c.sha256 LIMIT $1) pending GROUP BY label`
-	err = db.queryGauntlet(ctx, q, []any{TriageDepthCap}, func(rows sqlRows) error {
+	var b strings.Builder
+	b.WriteString(`SELECT label,count(*) FROM (` + gauntletCandidatesSQL)
+	args := db.gauntletSpanSQL(&b, nil, span)
+	args = append(args, TriageDepthCap)
+	fmt.Fprintf(&b, ` ORDER BY c.observed_at DESC,c.sha256 LIMIT $%d) pending GROUP BY label`, len(args))
+	err = db.queryGauntlet(ctx, b.String(), args, func(rows sqlRows) error {
 		for rows.Next() {
 			var label string
 			var count int64

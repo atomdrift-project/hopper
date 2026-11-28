@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/atomdrift-project/hopper"
 	"github.com/atomdrift-project/hopper/store"
@@ -168,8 +169,8 @@ func (s *apiServer) handleTriageDepth(w http.ResponseWriter, r *http.Request) {
 		writeTriageJSON(w, body)
 		return
 	}
-	if q.Name == "gauntlet" {
-		counts, capped, err := s.db.GauntletDepth(ctx)
+	if hopper.IsGauntletQueue(q.Name) {
+		counts, capped, err := s.db.GauntletDepth(ctx, hopper.GauntletBounds(q.Name, time.Now()))
 		if err != nil {
 			slog.ErrorContext(r.Context(), "gauntlet depth failed", "error", err)
 			v1Error(w, http.StatusInternalServerError, "server_error", "Server error.")

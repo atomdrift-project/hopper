@@ -48,8 +48,17 @@ const (
 	popularTailWindow = 21 * day
 	highestWindow     = 3 * day
 	lowestWindow      = 30 * day
-	createdWindow     = 7 * day // version-drift and fallout: files created this recently
+	createdWindow     = 7 * day  // version-drift: files created this recently
+	falloutWindow     = 3 * day  // fallout: files created this recently
+	reviewWindow      = 3 * day  // review-72h: files created this recently; review-30d the rest
+	reviewFreshness   = 30 * day // review-30d: files created this recently
+	gauntletWindow    = 3 * day  // gauntlet-72h: observations this recent; gauntlet the rest
 )
+
+// gauntletQueues are the queues Store.gauntlet reads, each true when it holds
+// the observations of the last gauntletWindow and false when it holds the
+// older ones. Both drain through the one evidence-keyed "gauntlet" report.
+var gauntletQueues = map[string]bool{"gauntlet-72h": true, "gauntlet": false}
 
 // Candidate is one file a triage queue hands out: what a worker needs to
 // fetch it and to say what was decided about it.
@@ -87,8 +96,10 @@ type GauntletPick struct {
 
 // TriageQueueNames returns every queue name, sorted.
 func TriageQueueNames() []string {
-	names := make([]string, 0, len(triageQueues)+1)
-	names = append(names, "gauntlet") // Store.gauntlet, which carries its observations
+	names := make([]string, 0, len(triageQueues)+len(gauntletQueues))
+	for name := range gauntletQueues { // Store.gauntlet, which carries its observations
+		names = append(names, name)
+	}
 	for name := range triageQueues {
 		names = append(names, name)
 	}
@@ -102,8 +113,8 @@ func (st *Store) Triage(ctx context.Context, queue string, n int, excluded [][]b
 	if excluded == nil {
 		excluded = [][]byte{} // a NULL array would exclude everything
 	}
-	if queue == "gauntlet" {
-		return st.gauntlet(ctx, n, excluded)
+	if recent, ok := gauntletQueues[queue]; ok {
+		return st.gauntlet(ctx, n, recent, excluded)
 	}
 	selectIDs, ok := triageQueues[queue]
 	if !ok {
@@ -122,8 +133,8 @@ func (st *Store) Triage(ctx context.Context, queue string, n int, excluded [][]b
 // per-type bound so the count is the population rather than one batch.
 func (st *Store) TriageDepth(ctx context.Context, queue string) (depth int64, capped bool, err error) {
 	var n int
-	if queue == "gauntlet" {
-		picks, err := st.gauntlet(ctx, TriageDepthCap, [][]byte{})
+	if recent, ok := gauntletQueues[queue]; ok {
+		picks, err := st.gauntlet(ctx, TriageDepthCap, recent, [][]byte{})
 		if err != nil {
 			return 0, false, err
 		}
@@ -222,7 +233,23 @@ var (
 	popular = `s.label_source IS DISTINCT FROM 'conflict' AND ` + floorHostile + ` >= 1 AND ` + popularPackage
 )
 
-// triageQueues holds every queue but gauntlet: files a published gauntlet run
+// hostileReviewPark retires a file fallout, review-72h, review-30d or
+// highest has judged from the first three: each asks whether a hostile call
+// stands, so one answer settles it for the others, and a file ageing from
+// review-72h into review-30d is not judged twice. highest asks it of the
+// model's call, the one these files mostly owe their place to.
+const hostileReviewPark = `NOT EXISTS (SELECT 1 FROM reports r WHERE r.sample_id = s.id
+		                AND r.report_type IN ('review-72h', 'review-30d', 'fallout', 'highest'))`
+
+// hostileReview is the review queues' membership over files created in the
+// window ($4).
+var hostileReview = triageSettled + ` AND a.class = 'hostile' AND s.label <> 'bad'
+		AND coalesce(s.file_type, '') <> 'registry'
+		AND s.created_at > now() - $4::interval
+		AND ` + hostileReviewPark + `
+		AND NOT EXISTS (SELECT 1 FROM contents c WHERE c.child_ids @> ARRAY[s.id])`
+
+// triageQueues holds every queue but the gauntlet pair: files a published gauntlet run
 // saw atomscan misjudge, read by Store.gauntlet, which carries the
 // observation with each file.
 var triageQueues = map[string]triageQueue{
@@ -237,10 +264,13 @@ var triageQueues = map[string]triageQueue{
 	"unconvicted-hostile-stale":    windowed(hostileWindow, unconvictedHostile, stale),
 	"unconvicted-suspicious-stale": windowed(suspiciousWindow, unconvictedSuspicious, stale),
 
-	// discord: the floor and the model disagree about the same bytes.
-	"discord": windowed(discordWindow, triageSettled+` AND m.class IS NOT NULL
-		AND ((`+floorHostile+` >= 1 AND m.class = 'benign')
-		  OR (`+floorHostile+` = 0 AND `+floorSuspicious+` = 0 AND m.class = 'hostile'))`, newest),
+	// discord: the floor convicts and the model calls it benign. The other
+	// direction -- the model hostile, the floor silent -- is not asked here:
+	// it is 98% of that disagreement, nearly all unlabelled packages, and its
+	// work is the label the model is retrained on, which highest owns (good or
+	// unknown, ranked per file type and package) and bad owns for bad files.
+	// Asking it in three queues judged the same files three times.
+	"discord": windowed(discordWindow, triageSettled+` AND m.class = 'benign' AND `+floorHostile+` >= 1`, newest),
 
 	// popular: a popular package the floor convicts; the tail is the same
 	// files scanned one to 21 days ago. Ordered by the package's rank, then
@@ -250,15 +280,25 @@ var triageQueues = map[string]triageQueue{
 	"popular-tail": windowed(popularTailWindow, popular+` AND sc.scanned_at <= now() - interval '24 hours'`,
 		popularOrder),
 
-	// fallout: the model calls it hostile and either no LLM explained it or
-	// nobody outside cited it. Files created in the last week, outside any
-	// archive; one report retires a file for good.
-	"fallout": windowed(createdWindow, triageSettled+` AND m.class = 'hostile' AND coalesce(s.file_type, '') <> 'registry'
+	// fallout: atomscan calls it hostile (the class prism's Fallout log reads)
+	// and either no LLM explained it or nobody outside cited it. Files created
+	// in the last three days, outside any archive; one report retires a file
+	// for good. The describe queue's fallout band asks for the explanation
+	// first (describe.go); this is the backstop.
+	"fallout": windowed(falloutWindow, triageSettled+` AND a.class = 'hostile' AND coalesce(s.file_type, '') <> 'registry'
 		AND s.created_at > now() - $4::interval
 		AND (NOT named(s.sha256, s.name_id, s.version) OR NOT EXISTS (SELECT 1 FROM verdicts lv WHERE lv.sample_id = s.id AND lv.scanner_id = 4
 		                               AND coalesce(lv.summary->>'reason', '') <> ''))
-		AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.sample_id = s.id AND r.report_type = 'fallout')
+		AND `+hostileReviewPark+`
 		AND NOT EXISTS (SELECT 1 FROM contents c WHERE c.child_ids @> ARRAY[s.id])`, newest),
+
+	// review-72h and review-30d: prism's /review list -- atomscan calls it
+	// hostile and it is not labelled bad -- split at reviewWindow by creation.
+	// Outside any archive; a report from either, or from fallout, retires a
+	// file for good.
+	"review-72h": windowed(reviewWindow, hostileReview, newest),
+	"review-30d": windowed(reviewFreshness, hostileReview+
+		fmt.Sprintf(` AND s.created_at <= now() - interval '%d hours'`, int(reviewWindow.Hours())), newest),
 
 	"fp-trait":      fpTrait,
 	"version-drift": versionDrift,
@@ -325,22 +365,29 @@ func versionDrift(ctx context.Context, st *Store, queue string, n int, excluded 
 
 // outlier is the shape highest and lowest share: per file type, the k files
 // whose model reading (score: a numeric SQL expression, NULL for none) is
-// most extreme, best first, then round by round across types. A report
+// most extreme, best first, then round by round across types. Within a type,
+// every package's most extreme release comes before any package's second:
+// releases of one package are near-copies (go modules average five each), so
+// a second label from the same package teaches the model little, and a pass
+// that reaches more packages labels more of what it gets wrong. A file with no
+// package is its own. A report
 // retires a file for good; a "missing" report (the bytes could not be
 // served) parks it for 96 hours. Files created in the last 48 hours are left
 // for the other queues to settle first.
 func outlier(where, score string, window time.Duration) triageQueue {
 	return func(ctx context.Context, st *Store, queue string, n int, excluded [][]byte, k int) ([]int64, error) {
 		return st.sampleIDs(ctx, `WITH c AS (
-			SELECT s.id, coalesce(s.file_type, '') AS route,
+			SELECT s.id, coalesce(s.file_type, '') AS route, coalesce(s.name_id, -s.id) AS pkg,
 			       `+score+` AS score`+triageRecent+`
 			  AND `+triageShared+` AND `+triageServable+` AND `+triageSettled+` AND `+where+`
 			  AND s.created_at < now() - interval '48 hours'
 			  AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.sample_id = s.id
 			                  AND (r.report_type = $1 OR (r.report_type = 'missing' AND r.created_at > now() - interval '96 hours')))
-		), r AS (
-			SELECT id, score, row_number() OVER (PARTITION BY route ORDER BY score, id DESC) AS rank
+		), p AS (
+			SELECT id, route, score, row_number() OVER (PARTITION BY pkg ORDER BY score, id DESC) AS release
 			FROM c WHERE score IS NOT NULL AND score >= 0
+		), r AS (
+			SELECT id, score, row_number() OVER (PARTITION BY route ORDER BY release, score, id DESC) AS rank FROM p
 		)
 		SELECT id FROM r WHERE rank <= $5 ORDER BY rank, score, id DESC LIMIT $3`,
 			queue, excluded, n, window, k)
@@ -492,11 +539,13 @@ func (st *Store) sightedPinnedWait(ctx context.Context) (time.Duration, error) {
 // gauntlet returns the files whose newest usable gauntlet observation says
 // atomscan misjudged them: a good file detected, or a bad one passed. The
 // newest observation is chosen before the test, so an old miss does not
-// come back after a newer run shows it fixed. A review answers one
+// come back after a newer run shows it fixed. recent keeps the files whose
+// observation is inside gauntletWindow, !recent the ones outside it; the
+// test is on that newest observation, so a file is in exactly one queue. A review answers one
 // observation (its evidence key) for good; a withdrawn good file is left out.
 // The newest observations go first: they judge the rules now deployed, so a
 // backfill of old runs cannot bury what the latest runs found.
-func (st *Store) gauntlet(ctx context.Context, n int, excluded [][]byte) ([]Candidate, error) {
+func (st *Store) gauntlet(ctx context.Context, n int, recent bool, excluded [][]byte) ([]Candidate, error) {
 	rows, err := st.pool.Query(ctx, `WITH ranked AS (
 			SELECT g.run_id, g.sha256, g.label, v.status, v.evidence_key, v.payload, r.observed_at, r.metadata,
 			       row_number() OVER (PARTITION BY g.sha256 ORDER BY r.observed_at DESC, g.run_id DESC) AS rank
@@ -517,7 +566,8 @@ func (st *Store) gauntlet(ctx context.Context, n int, excluded [][]byte) ([]Cand
 		  AND NOT EXISTS (SELECT 1 FROM reports p WHERE p.sample_id = s.id AND p.report_type = 'gauntlet'
 		                  AND p.evidence_key = c.evidence_key)
 		  AND s.sha256 <> ALL ($1::bytea[])
-		ORDER BY c.observed_at DESC, c.sha256 LIMIT $2`, excluded, n)
+		  AND (c.observed_at::timestamptz > now() - $3::interval) = $4
+		ORDER BY c.observed_at DESC, c.sha256 LIMIT $2`, excluded, n, gauntletWindow, recent)
 	if err != nil {
 		return nil, fmt.Errorf("store: triage gauntlet: %w", err)
 	}

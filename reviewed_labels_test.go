@@ -91,12 +91,14 @@ func TestReviewedLabelsExcludedFromRoutineQueues(t *testing.T) {
 					purl := fmt.Sprintf("pkg:npm/reviewed-%d-%d", i, j)
 					mustInsert(t, ctx, db, &Sample{SHA256: sha, Path: label + "/" + sha, Label: label, PURLBase: purl, Version: "1.0"})
 					mustAnalyzeWithTraits(t, ctx, db, sha, 6, fmt.Sprintf(`{"l":%d,"c":1.0}`, crit))
-					class, lvl := 2, 0
+					// The ML-hostile file is fallout's, inside FalloutWindow; the
+					// rule-convicted one is past AcquitGrace, so acquit is tested too.
+					class, lvl, age := 2, 0, 60*time.Hour
 					if crit == 5 {
-						class, lvl = 0, -1
+						class, lvl, age = 0, -1, 4*24*time.Hour
 					}
 					setLitmus(t, ctx, db, sha, class, lvl, 0.5)
-					execBoth(t, ctx, db, `UPDATE samples SET created_at = $1 WHERE sha256 = $2`, time.Now().Add(-4*24*time.Hour), sha)
+					execBoth(t, ctx, db, `UPDATE samples SET created_at = $1 WHERE sha256 = $2`, time.Now().Add(-age), sha)
 					if label == "purgatory" {
 						execBoth(t, ctx, db, `UPDATE samples SET label = 'purgatory' WHERE sha256 = $1`, sha)
 					}

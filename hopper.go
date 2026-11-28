@@ -5678,7 +5678,9 @@ func (db *DB) TriageSightedPinned(ctx context.Context, limit int, freshAfter tim
 // "fallout" are skipped permanently — the reviewer files it on a completed
 // judgement, which covers samples whose interpret pass errors (large renders
 // overflow the endpoint) and would otherwise re-select every cooldown until
-// they aged out of the createdAfter window.
+// they aged out of the createdAfter window. A review-72h or review-30d report
+// parks a row the same way: those queues judge the same hostile call (see
+// hostileReviewParkSQL).
 // Registry sidecars are excluded (file_type), empty paths are excluded
 // ([triageServablePathSQL] — covers fetched deps that share the same
 // unservable shape), and containment is judged by the sample_locations ledger,

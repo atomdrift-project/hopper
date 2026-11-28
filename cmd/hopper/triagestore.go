@@ -75,7 +75,7 @@ func candidateSample(c *store.Candidate) *hopper.Sample {
 // triageDepthStore is a queue's depth from the verdict schema. The gauntlet
 // queue also reports its depth by kind of failure, as it always has.
 func (s *apiServer) triageDepthStore(ctx context.Context, name string) (map[string]any, error) {
-	if name != "gauntlet" {
+	if !hopper.IsGauntletQueue(name) {
 		depth, capped, err := s.results.TriageDepth(ctx, name)
 		return map[string]any{"queue": name, "depth": depth, "capped": capped}, err
 	}

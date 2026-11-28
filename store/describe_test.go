@@ -401,3 +401,79 @@ func TestSweepDescribeFollowsTheGate(t *testing.T) {
 		t.Errorf("the sweep's page does not read scans_describable:\n%s", strings.Join(plan, "\n"))
 	}
 }
+
+// The files prism publishes are described first and retried within hours: a
+// hostile file of the last 72 hours (Fallout), and a suspicious-or-worse file
+// a malicious claim names, of the last 24 hours (Malware). Older ones, and a
+// fresh suspicious file nobody accuses, wait their turn and a week between
+// attempts.
+func TestDescribeUrgentBands(t *testing.T) {
+	st := open(t)
+	ctx := t.Context()
+	scanned := time.Now().Add(-2 * time.Hour) // past describeGrace
+	for name, file := range map[string]struct {
+		class string
+		age   time.Duration
+	}{
+		"fresh hostile":   {"hostile", time.Hour},
+		"old hostile":     {"hostile", 5 * 24 * time.Hour},
+		"fresh accused":   {"suspicious", time.Hour},
+		"day-old accused": {"suspicious", 30 * time.Hour},
+		"fresh unaccused": {"suspicious", time.Hour},
+	} {
+		release(ctx, t, st, name, "", "", "")
+		scanAt(ctx, t, st, name, file.class, scanned, false)
+		if _, err := st.pool.Exec(ctx, `UPDATE samples SET created_at = now() - $2::interval WHERE sha256 = $1`,
+			digestOf(name), file.age); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{"fresh accused", "day-old accused"} {
+		claim(ctx, t, st, "osm", hexOf(digestOf(name)), "", "malicious")
+	}
+	urgent := []string{hexOf(digestOf("fresh hostile")), hexOf(digestOf("fresh accused"))}
+	sweep := func() int64 {
+		t.Helper()
+		var queued int64
+		var after Cursor
+		for {
+			next, q, err := st.SweepDescribe(ctx, after, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			queued += q
+			if after = next; after == (Cursor{}) {
+				return queued
+			}
+		}
+	}
+	if _, err := st.pool.Exec(ctx, `DELETE FROM queue; DELETE FROM llm_attempts`); err != nil {
+		t.Fatal(err)
+	}
+	if q := sweep(); q != 5 {
+		t.Fatalf("sweep queued %d, want all 5", q)
+	}
+	jobs, err := st.Candidates(ctx, QueueDescribe, 10, 0, nil)
+	if err != nil || len(jobs) != 5 {
+		t.Fatalf("candidates %+v, %v", jobs, err)
+	}
+	first := []string{jobs[0].SHA256, jobs[1].SHA256}
+	slices.Sort(first)
+	slices.Sort(urgent)
+	if !slices.Equal(first, urgent) {
+		t.Errorf("first two to describe %v, want the urgent %v", first, urgent)
+	}
+
+	// Handed out and back undescribed, four hours ago: only the urgent ones
+	// are queued again.
+	if _, err := st.pool.Exec(ctx, `DELETE FROM queue; UPDATE llm_attempts SET at = now() - interval '4 hours'`); err != nil {
+		t.Fatal(err)
+	}
+	if q := sweep(); q != 2 {
+		t.Errorf("retry sweep queued %d, want the 2 urgent files", q)
+	}
+	got := slices.Sorted(maps.Keys(describing(ctx, t, st)))
+	if !slices.Equal(got, urgent) {
+		t.Errorf("queued again %v, want %v", got, urgent)
+	}
+}

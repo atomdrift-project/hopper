@@ -6202,9 +6202,7 @@ func (db *DB) triageFalloutPG(ctx context.Context, limit int, createdAfter time.
 		   AND skip = '' AND file_type <> 'registry'`+triageServablePathSQL+`
 		   AND created_at > $1
 		   AND ((llm_result IS NULL OR COALESCE(llm_result->>'interpretation', '') = '')
-		        OR NOT corroborated)
-		   AND NOT EXISTS (SELECT 1 FROM reports r
-		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'fallout')
+		        OR NOT corroborated)`+hostileReviewParkSQL+`
 		   AND `+uncontainedSQL+extra+`
 		 `+triageOrderSQL(f)+` LIMIT $`+strconv.Itoa(len(args)),
 		args...)

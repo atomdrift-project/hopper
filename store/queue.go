@@ -148,10 +148,11 @@ func (st *Store) Rescan(ctx context.Context, sha256 []byte, since time.Time) (bo
 //
 // Files never handed out come first, in the order they were queued (the
 // newest first when sighted), then those whose retry time has come. Files to
-// describe whose LLM input hopper holds come before all others of their
-// level: describing them costs an LLM call, not a scan. After them, those the
-// LLM gate admitted as required, whose description can change the verdict,
-// come before those it admitted as optional.
+// describe that prism publishes (describeUrgent) come before all others of
+// their level, then those whose LLM input hopper holds: describing them costs
+// an LLM call, not a scan. After them, those the LLM gate admitted as
+// required, whose description can change the verdict, come before those it
+// admitted as optional.
 func (st *Store) Candidates(ctx context.Context, p Priority, n int, maxBytes int64, skipTypes []string) ([]Job, error) {
 	order := "q.retry_at NULLS FIRST, q.queued_at"
 	if p == QueueSighted {
@@ -172,8 +173,8 @@ func (st *Store) NewestCandidates(ctx context.Context, p Priority, n int, maxByt
 }
 
 // queued is Candidates in the given order. A file to describe is read with
-// whether its LLM input is held, and those that have one go first, then the
-// required admissions: the level is small, a week of admitted scans left
+// whether its LLM input is held; the urgent ones (describeUrgent) go first,
+// then those with an input, then the required admissions: the level is small, a week of admitted scans left
 // undescribed, so it is sorted, not walked. No other level pays for the
 // probes.
 func (st *Store) queued(ctx context.Context, order string, p Priority, n int, maxBytes int64, skipTypes []string) ([]Job, error) {
@@ -183,7 +184,8 @@ func (st *Store) queued(ctx context.Context, order string, p Priority, n int, ma
 	input := "false"
 	if p == QueueDescribe {
 		input = "EXISTS (SELECT 1 FROM llm_inputs i WHERE i.sample_id = q.sample_id)"
-		order = "has_input DESC, EXISTS (SELECT 1 FROM scans sc WHERE sc.sample_id = q.sample_id AND sc.llm_admission = 'required') DESC, " + order
+		order = describeUrgent("q.sample_id") + " DESC, has_input DESC, " +
+			"EXISTS (SELECT 1 FROM scans sc WHERE sc.sample_id = q.sample_id AND sc.llm_admission = 'required') DESC, " + order
 	}
 	rows, err := st.pool.Query(ctx, `SELECT encode(s.sha256, 'hex'), l.path,
 			coalesce(s.size_bytes, 0), coalesce(s.file_type, ''), q.queued_at, s.provenance IS NOT NULL,

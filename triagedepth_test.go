@@ -233,6 +233,101 @@ func TestTriageFalloutTakesUndescribedOrUncorroborated(t *testing.T) {
 	}
 }
 
+// review-72h and review-30d are prism's /review list split at ReviewWindow:
+// litmus-hostile, top-level, not labeled bad. The two must be disjoint, and a
+// judgement from either one -- or from fallout, which asks the same question of
+// the same class -- must park the sample in all three.
+func TestReviewQueuesMirrorPrismReview(t *testing.T) {
+	for _, backend := range testBackends {
+		t.Run(backend.name, func(t *testing.T) { reviewQueuesMirrorPrismReview(t, backend.open(t)) })
+	}
+}
+
+func reviewQueuesMirrorPrismReview(t *testing.T, db *DB) {
+	t.Helper()
+	ctx := t.Context()
+	now := time.Now().UTC()
+
+	var n int
+	add := func(label string, class int, age time.Duration) string {
+		n++
+		sha := fmt.Sprintf("%063x2", n)
+		mustInsert(t, ctx, db, &Sample{
+			SHA256: sha, Source: "test", Label: label, LabelSource: "test",
+			Path: fmt.Sprintf("npm/r%d.tgz", n),
+		})
+		res := fmt.Appendf(nil, `{"fs":[{"sha":%q,"type":"npm","x":1,"dp":0,"ts":[{"l":5}]}]}`, sha)
+		if err := db.UpdateCleaveResult(ctx, sha, res, nil, ""); err != nil {
+			t.Fatalf("UpdateCleaveResult: %v", err)
+		}
+		litmus := fmt.Appendf(nil, `{"lvl":0,"prob":0.99,"class":%d}`, class)
+		if err := db.UpdateLitmusResult(ctx, sha, litmus); err != nil {
+			t.Fatalf("UpdateLitmusResult: %v", err)
+		}
+		execBoth(t, ctx, db, `UPDATE samples SET created_at = $1 WHERE sha256 = $2`, now.Add(-age), sha)
+		return sha
+	}
+	park := func(sha, reportType string) {
+		if err := db.InsertReport(ctx, &Report{SHA256: sha, Type: reportType, Content: "test"}); err != nil {
+			t.Fatalf("InsertReport: %v", err)
+		}
+	}
+
+	fresh := add("unknown", 2, time.Hour)
+	freshGood := add("good", 2, 2*time.Hour)
+	old := add("unknown", 2, 5*24*time.Hour)
+	freshBad := add("bad", 2, time.Hour)                // known malware: Malware's list, not Review's
+	freshSusp := add("unknown", 1, time.Hour)           // suspicious, not hostile
+	expired := add("unknown", 2, 40*24*time.Hour)       // past ReviewFreshness
+	parkedOwn := add("unknown", 2, 3*time.Hour)         // judged by review-72h
+	parkedCrossed := add("unknown", 2, 4*24*time.Hour)  // judged inside the window, now in review-30d
+	parkedFallout := add("unknown", 2, 10*24*time.Hour) // judged by fallout
+	park(parkedOwn, "review-72h")
+	park(parkedCrossed, "review-72h")
+	park(parkedFallout, "fallout")
+
+	selectQueue := func(name string) map[string]bool {
+		rows, err := TriageQueues[name].Select(ctx, db, 100)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		got := map[string]bool{}
+		for _, s := range rows {
+			got[s.SHA256] = true
+		}
+		return got
+	}
+	short, long := selectQueue("review-72h"), selectQueue("review-30d")
+
+	for sha, want := range map[string]struct{ short, long bool }{
+		fresh:         {short: true},
+		freshGood:     {short: true},
+		old:           {long: true},
+		freshBad:      {},
+		freshSusp:     {},
+		expired:       {},
+		parkedOwn:     {},
+		parkedCrossed: {},
+		parkedFallout: {},
+	} {
+		if short[sha] != want.short || long[sha] != want.long {
+			t.Errorf("sample %s: review-72h=%v review-30d=%v, want %v/%v",
+				sha[len(sha)-2:], short[sha], long[sha], want.short, want.long)
+		}
+	}
+
+	// The park runs both ways: a review judgement settles fallout too.
+	falloutRows, err := db.TriageFallout(ctx, 100, time.Time{}, TriageFilter{})
+	if err != nil {
+		t.Fatalf("TriageFallout: %v", err)
+	}
+	for _, s := range falloutRows {
+		if s.SHA256 == parkedOwn {
+			t.Error("fallout selected a sample review-72h already judged")
+		}
+	}
+}
+
 // A sighting whose subject is a digest dressed as a package must be stored as
 // the digest, both on the way in and when the canonicaliser sweeps what is
 // already there. This is the ledger side of forager's sightingSubject bug: the

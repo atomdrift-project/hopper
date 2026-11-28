@@ -59,6 +59,47 @@ const owedDescription = `EXISTS (SELECT 1 FROM scans sc WHERE sc.sample_id = c.s
 	AND NOT EXISTS (SELECT 1 FROM verdicts v WHERE v.sample_id = c.sample_id AND v.scanner_id = 4 AND v.outcome = 'ok')
 	AND EXISTS (SELECT 1 FROM locations l WHERE l.sample_id = c.sample_id)`
 
+// The files prism publishes are owed their description sooner than the rest:
+// a hostile catch is held off the Fallout log until an LLM has said why, and
+// a Malware row without one is a verdict with no reason given. Two bands, by
+// creation time, so they stay small:
+//
+//   - fallout: atomscan calls it hostile, it is a top-level file and not a
+//     registry sidecar, and it arrived within describeFalloutWindow, about the
+//     log's newest half-week.
+//   - malware: it arrived within describeMalwareWindow, is top-level, and is on
+//     the Malware list: labelled bad and hostile, or not labelled good,
+//     suspicious or worse, and named by a malicious or suspicious claim.
+//
+// An urgent file goes ahead of the rest of the describe level, and a failed
+// attempt is retried after describeUrgentRetry rather than a week on, since a
+// week is longer than either band. It is still a describe job (QueueDescribe),
+// so the worker treats it as one, and describeShare still caps the level.
+const (
+	describeFalloutWindow = `interval '72 hours'`
+	describeMalwareWindow = `interval '24 hours'`
+	describeUrgentRetry   = `interval '3 hours'`
+)
+
+// describeUrgent is true of the file whose id is the SQL expression id when
+// it is in one of the urgent bands above. The claim test is the Malware
+// list's: a digest claim, or a package claim covering this release.
+func describeUrgent(id string) string {
+	return `EXISTS (SELECT 1 FROM samples s JOIN verdicts a ON a.sample_id = s.id AND a.scanner_id = 1
+		WHERE s.id = ` + id + `
+		  AND NOT EXISTS (SELECT 1 FROM contents ct WHERE ct.child_ids @> ARRAY[s.id])
+		  AND ((a.class = 'hostile' AND coalesce(s.file_type, '') <> 'registry'
+		        AND s.created_at > now() - ` + describeFalloutWindow + `)
+		    OR (s.created_at > now() - ` + describeMalwareWindow + `
+		        AND ((s.label = 'bad' AND a.class = 'hostile')
+		          OR (s.label <> 'good' AND a.class IN ('suspicious', 'hostile')
+		              AND (EXISTS (SELECT 1 FROM sightings g WHERE g.subject = encode(s.sha256, 'hex')
+		                           AND g.claim IN ('malicious', 'suspicious'))
+		                OR EXISTS (SELECT 1 FROM names n JOIN sightings g ON g.subject = n.name
+		                           WHERE n.id = s.name_id AND g.claim IN ('malicious', 'suspicious')
+		                             AND covers(g.affected, s.version))))))))`
+}
+
 // describable is the predicate of the scans_describable index: the scans
 // whose files owedDescription may hold, the gate's admissions and, where the
 // scan did not say, the flagged scans, which hold every file atomscan calls
@@ -67,15 +108,18 @@ const owedDescription = `EXISTS (SELECT 1 FROM scans sc WHERE sc.sample_id = c.s
 const describable = `(llm_admission IN ('optional', 'required') OR (llm_admission IS NULL AND flagged))`
 
 // queueDescribe queues as QueueDescribe the files of c (sample_id) owed a
-// description and not queued to be described within describeWindow, handed
+// description and not queued to be described within describeWindow (within
+// describeUrgentRetry for an urgent one: see describeUrgent), handed
 // out no sooner than $1 from now, and records the attempt (llm_attempts). A
 // file queued higher is left where it is; one queued lower is raised.
 // QueueDescribe is $2.
-const queueDescribe = `, queued AS (
+var queueDescribe = `, queued AS (
 		INSERT INTO queue (sample_id, priority, retry_at)
 		SELECT c.sample_id, $2::smallint, now() + $1::interval FROM c
 		WHERE ` + owedDescription + `
-		  AND NOT EXISTS (SELECT 1 FROM llm_attempts a WHERE a.sample_id = c.sample_id AND a.at > now() - ` + describeWindow + `)
+		  AND NOT EXISTS (SELECT 1 FROM llm_attempts a WHERE a.sample_id = c.sample_id
+		                  AND a.at > now() - CASE WHEN ` + describeUrgent("c.sample_id") + `
+		                                          THEN ` + describeUrgentRetry + ` ELSE ` + describeWindow + ` END)
 		ORDER BY c.sample_id
 		ON CONFLICT (sample_id) DO UPDATE SET priority = EXCLUDED.priority, retry_at = EXCLUDED.retry_at
 		WHERE queue.priority > EXCLUDED.priority

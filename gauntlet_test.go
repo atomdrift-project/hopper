@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -58,7 +59,7 @@ func gauntletHistoryAndReview(t *testing.T, db *DB) {
 	mustInsert(t, ctx, db, &Sample{SHA256: r.Samples[0].SHA256, Label: "good", Path: "good/sample"})
 	selectN := func(want int) *Sample {
 		t.Helper()
-		rows, err := db.TriageGauntlet(ctx, 10, nil)
+		rows, err := db.TriageGauntlet(ctx, 10, GauntletSpan{}, nil)
 		if err != nil || len(rows) != want {
 			t.Fatalf("select want %d: %d %v", want, len(rows), err)
 		}
@@ -67,7 +68,7 @@ func gauntletHistoryAndReview(t *testing.T, db *DB) {
 		}
 		return nil
 	}
-	counts, _, err := db.GauntletDepth(ctx)
+	counts, _, err := db.GauntletDepth(ctx, GauntletSpan{})
 	if err != nil || counts["false_positive"] != 1 || counts["miss"] != 0 {
 		t.Fatalf("depth: %v %v", counts, err)
 	}
@@ -75,7 +76,7 @@ func gauntletHistoryAndReview(t *testing.T, db *DB) {
 	if first.Gauntlet == nil || first.Gauntlet.Expected != "good" {
 		t.Fatal("missing selection evidence")
 	}
-	if rows, err := db.TriageGauntlet(ctx, 10, []string{first.SHA256}); err != nil || len(rows) != 0 {
+	if rows, err := db.TriageGauntlet(ctx, 10, GauntletSpan{}, []string{first.SHA256}); err != nil || len(rows) != 0 {
 		t.Fatalf("exclusion: %v %v", rows, err)
 	}
 	review := &Report{SHA256: first.SHA256, Type: "gauntlet", EvidenceKey: first.Gauntlet.Key, Content: "confirmed", Provider: "test"}
@@ -134,7 +135,7 @@ func TestGauntletWithdrawalAndUnknownTime(t *testing.T) {
 			if _, err := db.StoreGauntletRun(ctx, r); err != nil {
 				t.Fatal(err)
 			}
-			rows, err := db.TriageGauntlet(ctx, 10, nil)
+			rows, err := db.TriageGauntlet(ctx, 10, GauntletSpan{}, nil)
 			if err != nil || len(rows) != 0 {
 				t.Fatalf("withdrawn: %v %v", rows, err)
 			}
@@ -144,7 +145,7 @@ func TestGauntletWithdrawalAndUnknownTime(t *testing.T) {
 			if _, err := db.StoreGauntletRun(ctx, bad); err != nil {
 				t.Fatal(err)
 			}
-			rows, err = db.TriageGauntlet(ctx, 10, nil)
+			rows, err = db.TriageGauntlet(ctx, 10, GauntletSpan{}, nil)
 			if err != nil || len(rows) != 1 {
 				t.Fatalf("new hostile miss was suppressed: %v %v", rows, err)
 			}
@@ -162,7 +163,7 @@ func TestGauntletWithdrawalAndUnknownTime(t *testing.T) {
 			if _, err := db.StoreGauntletRun(ctx, undated); err != nil {
 				t.Fatal(err)
 			}
-			rows, err = db.TriageGauntlet(ctx, 10, nil)
+			rows, err = db.TriageGauntlet(ctx, 10, GauntletSpan{}, nil)
 			if err != nil || len(rows) != 0 {
 				t.Fatalf("undated: %v %v", rows, err)
 			}
@@ -203,7 +204,7 @@ func TestGauntletHistoryTransferPreservesReviewCoverage(t *testing.T) {
 	if _, err := src.StoreGauntletRun(ctx, r); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := src.TriageGauntlet(ctx, 1, nil)
+	rows, err := src.TriageGauntlet(ctx, 1, GauntletSpan{}, nil)
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("select: %v", err)
 	}
@@ -217,7 +218,7 @@ func TestGauntletHistoryTransferPreservesReviewCoverage(t *testing.T) {
 	if err != nil || len(got.Samples[0].Results) != 2 {
 		t.Fatalf("history transfer: %v", err)
 	}
-	rows, err = dst.TriageGauntlet(ctx, 1, nil)
+	rows, err = dst.TriageGauntlet(ctx, 1, GauntletSpan{}, nil)
 	if err != nil || len(rows) != 0 {
 		t.Fatalf("review coverage was lost: %v", err)
 	}
@@ -251,6 +252,53 @@ func TestGauntletConcurrentReplay(t *testing.T) {
 			}
 			if inserted != 1 {
 				t.Fatalf("concurrent submissions inserted %d runs", inserted)
+			}
+		})
+	}
+}
+
+// gauntlet-72h and gauntlet split on the newest usable observation's time, so
+// a file a recent run saw misjudged is in the head only, even when an older
+// run saw the same miss, and each queue's depth counts only its own files.
+func TestGauntletQueuesSplitOnObservation(t *testing.T) {
+	for _, backend := range testBackends {
+		t.Run(backend.name, func(t *testing.T) {
+			db := backend.open(t)
+			ctx := t.Context()
+			now := time.Now()
+			run := func(n int, sha string, at time.Time) {
+				t.Helper()
+				r := historyRun(n, "good", "detected")
+				r.ObservedAt, r.Samples[0].SHA256 = GauntletTime(at), sha
+				r.ID = GauntletRunID(r.Producer, r.ObservedAt, r.Source)
+				if _, err := db.StoreGauntletRun(ctx, r); err != nil {
+					t.Fatal(err)
+				}
+			}
+			old, renewed, fresh := fmt.Sprintf("%064x", 0xa), fmt.Sprintf("%064x", 0xb), fmt.Sprintf("%064x", 0xc)
+			run(1, old, now.Add(-10*24*time.Hour))
+			run(2, renewed, now.Add(-11*24*time.Hour))
+			run(3, renewed, now.Add(-time.Hour))
+			run(4, fresh, now.Add(-2*time.Hour))
+			for _, sha := range []string{old, renewed, fresh} {
+				mustInsert(t, ctx, db, &Sample{SHA256: sha, Label: "good", Path: "good/" + sha[60:]})
+			}
+			for queue, want := range map[string][]string{"gauntlet-72h": {renewed, fresh}, "gauntlet": {old}} {
+				rows, err := TriageQueues[queue].Select(ctx, db, 10)
+				if err != nil {
+					t.Fatalf("%s: %v", queue, err)
+				}
+				got := make([]string, len(rows))
+				for i, s := range rows {
+					got[i] = s.SHA256
+				}
+				if !slices.Equal(got, want) {
+					t.Errorf("%s selected %v, want %v (newest observation first)", queue, got, want)
+				}
+				counts, _, err := db.GauntletDepth(ctx, GauntletBounds(queue, now))
+				if err != nil || counts["false_positive"] != int64(len(want)) {
+					t.Errorf("%s depth %v, %v; want %d", queue, counts, err, len(want))
+				}
 			}
 		})
 	}

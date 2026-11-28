@@ -120,7 +120,9 @@ func TestFletchReadsGeneratedPURLs(t *testing.T) {
 		},
 		{
 			"github repo", "github_repo", "github.com", "EvilOrg/BadRepo", "", "",
-			"github", "evilorg/badrepo", "", "api.github.com", true,
+			// Token-free, fletch routes to the public commit feed rather
+			// than the metered REST API.
+			"github", "evilorg/badrepo", "", "github.com/evilorg/badrepo", true,
 		},
 		{
 			// A tag rides the tag qualifier, so fletch reads no version; the

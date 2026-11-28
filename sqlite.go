@@ -3941,9 +3941,7 @@ func (db *DB) triageFalloutSQLite(ctx context.Context, limit int, createdAfter t
 		   AND skip = '' AND file_type <> 'registry'`+triageServablePathSQL+`
 		   AND created_at > ?
 		   AND ((llm_result IS NULL OR COALESCE(json_extract(llm_result, '$.interpretation'), '') = '')
-		        OR NOT corroborated)
-		   AND NOT EXISTS (SELECT 1 FROM reports r
-		                   WHERE r.sha256 = samples.sha256 AND r.report_type = 'fallout')
+		        OR NOT corroborated)`+hostileReviewParkSQL+`
 		   AND parent = '' AND NOT EXISTS (
 		     SELECT 1 FROM sample_locations sl
 		      WHERE sl.sha256 = samples.sha256

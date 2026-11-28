@@ -213,29 +213,36 @@ func TestTriageWindowed(t *testing.T) {
 			queue: "discord",
 			files: []*fixture{
 				with(base("rules hostile, model benign", "good"), func(f *fixture) { f.floor = []int{1, 0}; f.ml = "benign"; f.mlFires = -1 }),
-				with(base("model hostile, rules silent", "bad"), func(f *fixture) { f.ml = "hostile"; f.created = 80 * hour }),
+				// highest's and bad's: the label is the work, and they own it.
+				with(base("model hostile, rules silent", "unknown"), func(f *fixture) { f.ml = "hostile"; f.created = 80 * hour }),
 				with(base("both hostile", "bad"), func(f *fixture) { f.floor = []int{1, 0}; f.ml = "hostile" }),
 				with(base("model hostile, one crit 4", "bad"), func(f *fixture) { f.floor = []int{0, 1}; f.ml = "hostile" }),
 			},
-			want: []string{"rules hostile, model benign", "model hostile, rules silent"},
+			want: []string{"rules hostile, model benign"},
 		},
 		{
 			queue: "fallout",
 			files: []*fixture{
-				with(base("unexplained", "unknown"), func(f *fixture) { f.ml = "hostile"; f.created = 24 * hour }),
+				with(base("unexplained", "unknown"), func(f *fixture) { f.atomscan = "hostile"; f.created = 24 * hour }),
 				with(base("explained but uncited", "unknown"), func(f *fixture) {
-					f.ml = "hostile"
+					f.atomscan = "hostile"
 					f.created = 30 * hour
 					f.llmReason = "Runs a dropper."
 				}),
-				with(base("created last week", "unknown"), func(f *fixture) { f.ml = "hostile"; f.created = 8 * 24 * hour }),
-				with(base("retired", "unknown"), func(f *fixture) { f.ml = "hostile"; f.created = 24 * hour }),
-				with(base("inside an archive", "unknown"), func(f *fixture) { f.ml = "hostile"; f.created = 24 * hour }),
+				with(base("created last week", "unknown"), func(f *fixture) { f.atomscan = "hostile"; f.created = 8 * 24 * hour }),
+				with(base("four days old", "unknown"), func(f *fixture) { f.atomscan = "hostile"; f.created = 4 * 24 * hour }),
+				with(base("model hostile only", "unknown"), func(f *fixture) { f.ml = "hostile"; f.created = 24 * hour }),
+				with(base("retired", "unknown"), func(f *fixture) { f.atomscan = "hostile"; f.created = 24 * hour }),
+				with(base("judged by review", "unknown"), func(f *fixture) { f.atomscan = "hostile"; f.created = 24 * hour }),
+				with(base("judged by highest", "unknown"), func(f *fixture) { f.atomscan = "hostile"; f.created = 24 * hour }),
+				with(base("inside an archive", "unknown"), func(f *fixture) { f.atomscan = "hostile"; f.created = 24 * hour }),
 				base("holder", "unknown"),
 			},
 			after: func(ctx context.Context, t *testing.T, st *Store) {
 				t.Helper()
 				report(ctx, t, st, "retired", "fallout", 100*hour)
+				report(ctx, t, st, "judged by review", "review-72h", 100*hour)
+				report(ctx, t, st, "judged by highest", "highest", 100*hour)
 				if _, err := st.pool.Exec(ctx, `INSERT INTO contents (parent_id, listed_at, child_ids, paths)
 					SELECT h.id, now(), ARRAY[m.id], ARRAY['a'] FROM samples h, samples m WHERE h.sha256 = $1 AND m.sha256 = $2`,
 					digestOf("holder"), digestOf("inside an archive")); err != nil {
@@ -243,6 +250,37 @@ func TestTriageWindowed(t *testing.T) {
 				}
 			},
 			want: []string{"unexplained", "explained but uncited"},
+		},
+		{
+			queue: "review-72h",
+			files: []*fixture{
+				with(base("fresh unknown", "unknown"), func(f *fixture) { f.atomscan = "hostile"; f.created = 2 * hour }),
+				with(base("fresh good", "good"), func(f *fixture) { f.atomscan = "hostile"; f.created = 30 * hour }),
+				with(base("fresh bad", "bad"), func(f *fixture) { f.atomscan = "hostile"; f.created = 2 * hour }),
+				with(base("fresh suspicious", "unknown"), func(f *fixture) { f.atomscan = "suspicious"; f.created = 2 * hour }),
+				with(base("older", "unknown"), func(f *fixture) { f.atomscan = "hostile"; f.created = 5 * 24 * hour }),
+				with(base("judged by fallout", "unknown"), func(f *fixture) { f.atomscan = "hostile"; f.created = 2 * hour }),
+			},
+			after: func(ctx context.Context, t *testing.T, st *Store) {
+				t.Helper()
+				report(ctx, t, st, "judged by fallout", "fallout", 100*hour)
+			},
+			want: []string{"fresh unknown", "fresh good"},
+		},
+		{
+			queue: "review-30d",
+			files: []*fixture{
+				with(base("older", "unknown"), func(f *fixture) { f.atomscan = "hostile"; f.created = 5 * 24 * hour }),
+				with(base("last month", "good"), func(f *fixture) { f.atomscan = "hostile"; f.created = 20 * 24 * hour }),
+				with(base("fresh", "unknown"), func(f *fixture) { f.atomscan = "hostile"; f.created = 2 * hour }),
+				with(base("too old", "unknown"), func(f *fixture) { f.atomscan = "hostile"; f.created = 40 * 24 * hour }),
+				with(base("judged while fresh", "unknown"), func(f *fixture) { f.atomscan = "hostile"; f.created = 4 * 24 * hour }),
+			},
+			after: func(ctx context.Context, t *testing.T, st *Store) {
+				t.Helper()
+				report(ctx, t, st, "judged while fresh", "review-72h", 30*hour)
+			},
+			want: []string{"older", "last month"},
 		},
 	} {
 		t.Run(tc.queue, func(t *testing.T) {
@@ -346,6 +384,30 @@ func TestTriageOutliers(t *testing.T) {
 	}
 	if got, want := queued(ctx, t, st, "lowest", names...), []string{"bad unsure", "bad sure"}; !slices.Equal(got, want) {
 		t.Errorf("lowest %q, want %q", got, want)
+	}
+}
+
+// Within a file type, every package's tightest release comes before any
+// package's second: releases of one package are near-copies, so a pass that
+// reaches more packages labels more of what the model gets wrong.
+func TestTriageOutliersOnePackageAtATime(t *testing.T) {
+	st := open(t)
+	ctx := t.Context()
+	release := func(bytes, pkg string, fires int) *fixture {
+		return with(base(bytes, "unknown"), func(f *fixture) {
+			f.fileType, f.ml, f.mlFires, f.mlProb, f.pkg, f.version = "go_module", "hostile", fires, 0.9, pkg, bytes
+		})
+	}
+	names := world(ctx, t, st,
+		release("a v1", "pkg:golang/a", 1),
+		release("a v2", "pkg:golang/a", 2),
+		release("a v3", "pkg:golang/a", 3),
+		release("b v1", "pkg:golang/b", 9),
+		with(base("loose", "unknown"), func(f *fixture) { f.fileType, f.ml, f.mlFires, f.mlProb = "go_module", "hostile", 5, 0.9 }),
+	)
+	want := []string{"a v1", "loose", "b v1", "a v2", "a v3"}
+	if got := queued(ctx, t, st, "highest", names...); !slices.Equal(got, want) {
+		t.Errorf("highest %q, want %q: one release of each package, tightest first, before any second", got, want)
 	}
 }
 
@@ -519,7 +581,7 @@ func TestTriageGauntlet(t *testing.T) {
 	st := open(t)
 	ctx := t.Context()
 	names := world(ctx, t, st, base("good, detected", "good"), base("bad, passed", "bad"), base("fixed since", "good"),
-		base("withdrawn", "good"), base("reviewed", "good"))
+		base("withdrawn", "good"), base("reviewed", "good"), base("fresh miss", "bad"))
 	runs := []struct {
 		id, at string
 		rows   [][3]string // sha bytes, expected label, status
@@ -531,6 +593,8 @@ func TestTriageGauntlet(t *testing.T) {
 			{"reviewed", "good", "detected"},
 		}},
 		{"run2", "2026-11-02T00:00:00Z", [][3]string{{"bad, passed", "bad", "benign"}, {"fixed since", "good", "benign"}}},
+		// Inside gauntletWindow: gauntlet-72h's, not gauntlet's.
+		{"run3", time.Now().Add(-time.Hour).UTC().Format("2006-01-02T15:04:05.000000000Z"), [][3]string{{"fresh miss", "bad", "benign"}}},
 	}
 	for _, r := range runs {
 		if _, err := st.pool.Exec(ctx, `INSERT INTO gauntlet_runs VALUES ($1, 'gauntlet', $2, 'test', 'd', '{"rules":{"ascan":{"version":"r9"}}}')`,
@@ -559,6 +623,12 @@ func TestTriageGauntlet(t *testing.T) {
 	// Newest observation first: run2's miss before run1's false positive.
 	if got, want := queued(ctx, t, st, "gauntlet", names...), []string{"bad, passed", "good, detected"}; !slices.Equal(got, want) {
 		t.Errorf("gauntlet %q, want %q", got, want)
+	}
+	if got, want := queued(ctx, t, st, "gauntlet-72h", names...), []string{"fresh miss"}; !slices.Equal(got, want) {
+		t.Errorf("gauntlet-72h %q, want %q", got, want)
+	}
+	if depth, _, err := st.TriageDepth(ctx, "gauntlet-72h"); err != nil || depth != 1 {
+		t.Errorf("gauntlet-72h depth %d, %v; want 1", depth, err)
 	}
 	got, err := st.Triage(ctx, "gauntlet", 1, nil)
 	if err != nil || len(got) != 1 || got[0].Gauntlet == nil || got[0].Gauntlet.Key != "run2/"+hexOf(digestOf("bad, passed")) ||
@@ -595,9 +665,9 @@ func TestTriageCandidatesAndDepth(t *testing.T) {
 	if _, err := st.Triage(ctx, "no-such-queue", 1, nil); err == nil {
 		t.Error("an unknown queue was accepted")
 	}
-	// The legacy registry's 21 queues, less bad-shared and stranded (PLAN.md).
-	if n := len(TriageQueueNames()); n != 19 {
-		t.Errorf("%d queues, want 19", n)
+	// The legacy registry's 24 queues, less bad-shared and stranded (PLAN.md).
+	if n := len(TriageQueueNames()); n != 22 {
+		t.Errorf("%d queues, want 22", n)
 	}
 }
 

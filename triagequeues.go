@@ -115,11 +115,29 @@ const (
 	OutlierGrace = 48 * time.Hour
 
 	// FalloutWindow bounds how far back the fallout queue reaches. Selection is
-	// newest-first, so widening it only adds tail: the freshest gaps are always
-	// worked ahead of older ones. Matches the 7 days the public fallout page
-	// renders — the queue covers exactly what the page shows, and anything older
-	// backfills through the ordinary queues.
-	FalloutWindow = 7 * 24 * time.Hour
+	// newest-first, so widening it only adds tail. Three days, not the public
+	// page's week: the head of the log is where an unexplained or unbacked
+	// hostile call is read most, and the describe queue's fallout band
+	// (store/describe.go) asks for a description over the same 72 hours, so
+	// this queue is the backstop for what that band could not get described.
+	FalloutWindow = 72 * time.Hour
+
+	// ReviewWindow splits prism's /review population at three days: review-72h
+	// holds rows created inside it, review-30d the rows older than it back to
+	// ReviewFreshness. The split is the popular/popular-tail one -- the same
+	// predicate and order on both sides, so a row crosses between them with
+	// nothing to hand over -- and exists so the consumer can give the fresh
+	// head precedence without standing the fleet down for a month of backlog.
+	ReviewWindow = 72 * time.Hour
+
+	// GauntletWindow splits the gauntlet queue the same way, on the newest
+	// usable observation's observed_at: gauntlet-72h holds misjudgements a run
+	// observed inside it, gauntlet everything older. Fresh observations judge
+	// the rules now deployed; a backfill of old runs lands in the tail.
+	GauntletWindow = 72 * time.Hour
+
+	// ReviewFreshness is how far back review-30d reaches.
+	ReviewFreshness = 30 * 24 * time.Hour
 
 	// SightedPinnedWindow is how long a version-pinned claim stays urgent.
 	//
@@ -280,10 +298,16 @@ func staleTriageFilter(queue string, excluded ...[]string) TriageFilter {
 // the author to remember.
 func queueFilter(queue string, f TriageFilter, excluded ...[]string) TriageFilter {
 	f.ExcludeReportType = queue
-	if len(excluded) > 0 {
-		f.ExcludeSHA256 = excluded[0]
-	}
+	f.ExcludeSHA256 = firstExcluded(excluded)
 	return f
+}
+
+// firstExcluded is the optional exclusion list a Queue's Select receives.
+func firstExcluded(excluded [][]string) []string {
+	if len(excluded) > 0 {
+		return excluded[0]
+	}
+	return nil
 }
 
 // TriageQueues is the registry. Keys are the wire names, which are load-bearing
@@ -299,12 +323,15 @@ func queueFilter(queue string, f TriageFilter, excluded ...[]string) TriageFilte
 // only until a rescan gives it a fresh verdict; it is a cooldown, not a
 // tombstone. A queue added here without one re-offers work already judged.
 var TriageQueues = map[string]Queue{
+	// gauntlet-72h and gauntlet: files a published gauntlet run saw atomscan
+	// misjudge, split at GauntletWindow. Both drain through the one
+	// evidence-keyed "gauntlet" report, so a row that ages from the head into
+	// the tail carries its review with it.
+	"gauntlet-72h": {Name: "gauntlet-72h", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
+		return db.TriageGauntlet(ctx, n, GauntletBounds("gauntlet-72h", time.Now()), firstExcluded(excluded))
+	}},
 	"gauntlet": {Name: "gauntlet", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
-		var skip []string
-		if len(excluded) > 0 {
-			skip = excluded[0]
-		}
-		return db.TriageGauntlet(ctx, n, skip)
+		return db.TriageGauntlet(ctx, n, GauntletBounds("gauntlet", time.Now()), firstExcluded(excluded))
 	}},
 	// bad: bad-labeled samples cleave missed (false negatives) → write traits.
 	"bad": {Name: "bad", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
@@ -683,6 +710,25 @@ var TriageQueues = map[string]Queue{
 	// is what its depth counts, bounded by FalloutWindow.
 	"fallout": {Name: "fallout", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
 		return db.TriageFallout(ctx, n, time.Now().Add(-FalloutWindow), queueFilter("fallout", TriageFilter{}, excluded...))
+	}},
+
+	// review-72h and review-30d: prism's /review list, "hostile, but not known
+	// malware" -- litmus-hostile, top-level, labeled anything but bad -- split at
+	// ReviewWindow into a short-term head and a long-term tail. Disjoint by
+	// construction: both divide on one created_at timestamp.
+	//
+	// They overlap fallout (also litmus-hostile, but label-agnostic and only the
+	// undescribed or uncorroborated rows), so all three share one permanent
+	// report park (hostileReviewParkSQL): whichever judges a sample first settles
+	// it for the other two. A bad ruling drains via the label predicate.
+	"review-72h": {Name: "review-72h", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
+		return db.TriageHostileReview(ctx, n, time.Now().Add(-ReviewWindow), time.Time{},
+			queueFilter("review-72h", TriageFilter{}, excluded...))
+	}},
+	"review-30d": {Name: "review-30d", Select: func(ctx context.Context, db *DB, n int, excluded ...[]string) ([]*Sample, error) {
+		now := time.Now()
+		return db.TriageHostileReview(ctx, n, now.Add(-ReviewFreshness), now.Add(-ReviewWindow),
+			queueFilter("review-30d", TriageFilter{}, excluded...))
 	}},
 }
 
