@@ -61,7 +61,7 @@ num() { case "${1:-}" in ''|*[!0-9-]*) echo 0 ;; *) echo "$1" ;; esac; }
 
 enabled=$(num "$(q "SELECT subenabled::int FROM pg_subscription WHERE subname = '$SUBSCRIPTION'")")
 worker=$(num "$(q "SELECT count(*)::int FROM pg_stat_subscription
-                    WHERE subname = '$SUBSCRIPTION' AND pid IS NOT NULL AND relid IS NULL")")
+                    WHERE subname = '$SUBSCRIPTION' AND worker_type = 'apply' AND pid IS NOT NULL AND relid IS NULL")")
 apply_err=$(num "$(q "SELECT apply_error_count::bigint FROM pg_stat_subscription_stats WHERE subname = '$SUBSCRIPTION'")")
 sync_err=$(num "$(q "SELECT sync_error_count::bigint FROM pg_stat_subscription_stats WHERE subname = '$SUBSCRIPTION'")")
 tbl_total=$(num "$(q "SELECT count(*)::int FROM pg_subscription_rel r
@@ -87,7 +87,7 @@ index_known=0
 index_missing=0
 index_extra=0
 if [ -n "${PGPASSFILE:-}" ] || [ -r "$HOME/.pgpass" ]; then
-    recv=$(q "SELECT latest_end_lsn FROM pg_stat_subscription WHERE subname = '$SUBSCRIPTION' AND relid IS NULL")
+    recv=$(q "SELECT latest_end_lsn FROM pg_stat_subscription WHERE subname = '$SUBSCRIPTION' AND worker_type = 'apply' AND relid IS NULL")
     if [ -n "$recv" ]; then
         lag_bytes=$(PGCONNECT_TIMEOUT=5 psql -h "$REMOTE_HOST" -U "$REMOTE_USER" -d "$REMOTE_DB" -tAX \
             -c "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '$recv')::bigint" 2>/dev/null | head -n 1 || true)

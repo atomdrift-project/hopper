@@ -79,7 +79,7 @@ else
     log "Checking replica catch-up vs $REMOTE_HOST"
     remote_lsn=$(remote -tAc "SELECT pg_current_wal_lsn()" | tr -d '[:space:]')
     local_lsn=$(admin -d "$LOCAL_DB" -tAc \
-        "SELECT latest_end_lsn FROM pg_stat_subscription WHERE subname = '$SUBSCRIPTION' AND relid IS NULL" | tr -d '[:space:]')
+        "SELECT latest_end_lsn FROM pg_stat_subscription WHERE subname = '$SUBSCRIPTION' AND worker_type = 'apply' AND relid IS NULL" | tr -d '[:space:]')
     gap_bytes=$(admin -d "$LOCAL_DB" -tAc \
         "SELECT pg_wal_lsn_diff('$remote_lsn'::pg_lsn, '$local_lsn'::pg_lsn)" | tr -d '[:space:]')
     log "publisher wal_lsn:   $remote_lsn"

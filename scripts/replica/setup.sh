@@ -862,7 +862,7 @@ SELECT format('pid=%s received_lsn=%s latest_end_lsn=%s',
               COALESCE(received_lsn::text,   '0/0'),
               COALESCE(latest_end_lsn::text, '0/0'))
   FROM pg_stat_subscription
-  WHERE subname = :'sub' AND relid IS NULL AND pid IS NOT NULL;
+  WHERE subname = :'sub' AND worker_type = 'apply' AND relid IS NULL AND pid IS NOT NULL;
 SQL
     )
     [ -n "$apply_status" ] && break
@@ -961,7 +961,7 @@ final_enabled=$(admin -d "$LOCAL_DB" -tAc \
     "SELECT subenabled FROM pg_subscription WHERE subname = '$SUBSCRIPTION'" \
     | tr -d '[:space:]')
 final_apply=$(admin -d "$LOCAL_DB" -tAc \
-    "SELECT 1 FROM pg_stat_subscription WHERE subname = '$SUBSCRIPTION' AND relid IS NULL AND pid IS NOT NULL" \
+    "SELECT 1 FROM pg_stat_subscription WHERE subname = '$SUBSCRIPTION' AND worker_type = 'apply' AND relid IS NULL AND pid IS NOT NULL" \
     | tr -d '[:space:]')
 if [ "$final_enabled" != 't' ] || [ "$final_apply" != '1' ]; then
     log "FAILED: final replication health check failed (enabled=$final_enabled apply_worker=${final_apply:-absent})"
