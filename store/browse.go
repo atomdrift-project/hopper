@@ -593,8 +593,9 @@ func (st *Store) idAt(ctx context.Context, t time.Time) (int64, error) {
 }
 
 // feedSQL builds Feed's statement. Each filter is a literal predicate with its
-// value bound, so a generic plan still sees which ones apply. ids is the
-// window's id range (idAt).
+// value bound, so a generic plan still sees which ones apply; the label alone
+// is spelled out, for its selectivity (see there). ids is the window's id
+// range (idAt).
 func feedSQL(filter *FeedQuery, ids idRange) (query string, args []any) {
 	bind := func(v any) string {
 		args = append(args, v)
@@ -653,11 +654,15 @@ func feedSQL(filter *FeedQuery, ids idRange) (query string, args []any) {
 		}
 	}
 	if filter.Label != "" {
-		// The enum, not its text, so samples_label can serve it. A name the
-		// enum lacks matches nothing, as comparing text did, rather than
-		// failing the cast.
+		// The enum, not its text, so samples_label can serve it, and spelled
+		// as a literal rather than bound: a generic plan takes any label for a
+		// fifth of samples, where good is 7% and bad 3%, and on galadriel
+		// (2026-11-28) walked samples_pkey instead, 88.8 s for a label=good
+		// page at offset 1000 against 7.7 s with the label in the text. Only
+		// a name from the enum's fixed set is spelled out; one the enum lacks
+		// matches nothing, as comparing text did, rather than failing the cast.
 		if labels[filter.Label] {
-			where = append(where, "s.label = "+bind(filter.Label)+"::label")
+			where = append(where, "s.label = '"+filter.Label+"'")
 		} else {
 			where = append(where, "false")
 		}

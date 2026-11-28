@@ -78,6 +78,20 @@ func (st *Store) QueueGoModules(ctx context.Context, before time.Time, limit int
 	if limit <= 0 {
 		return 0, fmt.Errorf("store: queue go modules: limit must be positive, got %d", limit)
 	}
+	// A queue a hopper from before 2026-11-27 still serves holds priorities 0
+	// to 6, and to that hopper QueueRequested's 20 sorts after every first
+	// scan: queued so, nothing would be handed out until the next deploy
+	// respaced the rest (Upgrade, respace). The test is respace's own, stuck
+	// rows included, so the two agree on which numbering a queue is in. It
+	// happened, 2026-11-28.
+	var unspaced bool
+	if err := st.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM queue WHERE priority BETWEEN 1 AND 6)`).Scan(&unspaced); err != nil {
+		return 0, fmt.Errorf("store: queue go modules: %w", err)
+	}
+	if unspaced {
+		return 0, errors.New("store: queue go modules: the queue still holds priorities from before the 2026-11-27 respacing, so the hopper serving it would hand these out last; deploy hopper first")
+	}
 	// Inserted in id order, as QueueSiblings does, so concurrent enqueues
 	// take their key locks in one order.
 	tag, err := st.pool.Exec(ctx, `INSERT INTO queue (sample_id, priority)

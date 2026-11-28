@@ -78,3 +78,30 @@ func TestWriteRetypesZipToGoModule(t *testing.T) {
 		t.Errorf("file_type %q, %v; want go_module", fileType, err)
 	}
 }
+
+// A queue still in the 0-to-6 numbering is refused: the hopper serving it
+// would sort QueueRequested's 20 after every first scan.
+func TestQueueGoModulesRefusesUnspacedQueue(t *testing.T) {
+	st := open(t)
+	ctx := t.Context()
+	world(ctx, t, st,
+		with(base("module", "unknown"), func(f *fixture) {
+			f.fileType, f.pkg, f.scanned = "zip", "pkg:golang/example.com/m", 48*hour
+		}),
+		base("first scan", "unknown"),
+	)
+	enqueue(ctx, t, st, Priority(4), digestOf("first scan")) // the old QueueNew
+	cutoff := time.Now().Add(-30 * hour)
+	if n, err := st.QueueGoModules(ctx, cutoff, 10, false); err == nil || n != 0 {
+		t.Fatalf("queued %d, err %v; want a refusal", n, err)
+	}
+	if n, err := st.QueueGoModules(ctx, cutoff, 10, true); err != nil || n != 1 {
+		t.Fatalf("dry run %d, %v; want it to count regardless", n, err)
+	}
+	if err := st.respace(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := st.QueueGoModules(ctx, cutoff, 10, false); err != nil || n != 1 {
+		t.Fatalf("after respace queued %d, %v; want 1", n, err)
+	}
+}

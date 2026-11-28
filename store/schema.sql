@@ -56,8 +56,8 @@ CREATE TABLE samples (
 -- The files of one label in id order, under any label. A feed filtered by
 -- label (prism, FeedQuery.Label) merges it with scans' key instead of reading
 -- every sample between two scanned ones: measured 2026-11-28 on galadriel, a
--- label=good page read 7.4M samples rows for 50. Not partial: prism binds the
--- label, and a generic plan cannot prove a partial predicate from a parameter.
+-- label=good page read 7.4M samples rows for 50 (0.6 s with it). Not partial:
+-- a feed may ask for any label, unknown included.
 CREATE INDEX samples_label ON samples (label, id);
 -- The labeled corpus by file type, in id order: collimator's per-route training
 -- pass (data.py, _corpus: LABELED_WHERE AND s.file_type = ANY(route) AND
