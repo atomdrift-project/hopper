@@ -1,61 +1,20 @@
 package hopper
 
-import (
-	_ "embed"
-	"strings"
-)
-
-// SetReplicaIndexPolicy selects the index set of a database that is a logical
-// replica's: migrations then build the training indexes only a replica
-// carries (pgReplicaTrainingMigrations) instead of the primary-only ones
-// (pgPrimaryIndexMigrations). Off by default: a primary must build its own.
+// SetReplicaIndexPolicy marks a database as a logical replica's: migrations
+// then leave out the primary-only index DDL (pgPrimaryIndexMigrations). Off by
+// default: a primary must build its own.
 //
 // It concerns the legacy tables alone. Since 2026-11-15 a replica copies the
 // verdict schema (scripts/replica/replicated-tables.sh) and carries every
 // index store/schema.sql defines; nothing here builds or declines those.
+//
+// Until 2026-11-28 it also built the replica-only training indexes
+// idx_samples_training_hash and idx_samples_labeled_route on public.samples,
+// for collimator. Collimator has read the verdict schema since the
+// migration, where store/schema.sql's samples_labeled_route serves its
+// per-route pass on every database, and the legacy tables no longer
+// replicate, so a fresh replica no longer builds them.
 func (db *DB) SetReplicaIndexPolicy(on bool) { db.replicaIndexPolicy = on }
-
-// replicaTrainingIndexDDL holds the indexes only collimator reads, and
-// collimator reads only the replica. Keep them out of the primary's migration
-// list: only a replica trains models.
-//
-// idx_samples_training_hash serves the deterministic hash-sampled runs; its
-// projection is covered so repeated 1-2% iterations need not scan the heap.
-// idx_samples_labeled_route serves the per-route training-set export
-//
-//	SELECT id, sha256, label, canonical_sha256, score, file_type FROM samples
-//	 WHERE label IN ('bad','good') AND cleave_result IS NOT NULL AND skip = ''
-//	   AND id <= <snapshot> AND file_type = ANY(<route>) ORDER BY id
-//
-// (collimator data.py, stream_partitioned_metadata_grouped; its LABELED_WHERE
-// is the predicate verbatim). Without it each route was a Parallel Seq Scan of
-// ~93M rows, ~100 seconds, measured 2026-08-24. It moved here from the shared
-// list on 2026-10-23: no primary scan since 2026-09-16.
-//
-// One statement per semicolon, and no SQL comments. Spell each as
-// CREATE INDEX IF NOT EXISTS, never CONCURRENTLY: hopper defers that spelling
-// and rewrites it to a concurrent build outside a transaction, while an
-// explicit CONCURRENTLY runs inside one and fails (SQLSTATE 25001).
-//
-//go:embed scripts/replica/training-index.sql
-var replicaTrainingIndexDDL string
-
-// Partial-index expression statistics do not give these route queries a usable
-// selectivity estimate. Table-level expression statistics prevent the planner
-// from treating a 1% sample as one third of the corpus.
-//
-//go:embed scripts/replica/training-statistics.sql
-var replicaTrainingStatisticsDDL string
-
-func pgReplicaTrainingMigrations() []string {
-	var out []string
-	for stmt := range strings.SplitSeq(replicaTrainingIndexDDL, ";") {
-		if stmt = strings.TrimSpace(stmt); stmt != "" {
-			out = append(out, stmt+";")
-		}
-	}
-	return append(out, strings.TrimSpace(replicaTrainingStatisticsDDL), "ANALYZE public.samples")
-}
 
 // pgPrimaryIndexMigrations holds index DDL that only the primary runs. The
 // migration ledger is not replicated, so this must not run on the replica.
@@ -89,7 +48,7 @@ func pgPrimaryIndexMigrations() []string {
 func (db *DB) pgMigrationsForRole() []string {
 	migrations := pgRuntimeMigrations()
 	if db.replicaIndexPolicy {
-		return append(migrations, pgReplicaTrainingMigrations()...)
+		return migrations
 	}
 	return append(migrations, pgPrimaryIndexMigrations()...)
 }

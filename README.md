@@ -225,6 +225,11 @@ members) that were ingested as samples. Dry-run by default.
 ./hopper false-positives --db "$DATABASE_URL"
 ./hopper false-negatives --db "$DATABASE_URL"
 ./hopper rescan --db "$DATABASE_URL" <sha256>
+# Rescan Go module zips scanned before go_module was recognized, as operator
+# rescans in the verdict queue (newest first, 1000 per run by default;
+# --dry-run counts the backlog).
+./hopper rescan --db "$DATABASE_URL" --go-modules --dry-run
+./hopper rescan --db "$DATABASE_URL" --go-modules --limit 1000
 ./hopper import --from old.db --db "$DATABASE_URL"
 
 # Relabel by SHA-256. The master moves the bytes into the corrected pool
@@ -270,19 +275,13 @@ Existing samples default to `inconclusive`. Move confirmed dual-use samples into
 `dual-use` with an explicit ruling after reviewing their rationale; the migration
 does not infer which ones belong there.
 
-Collimator performance iterations use the replica-only `idx_samples_training_hash`
-covering index defined in `scripts/replica/training-index.sql`, alongside
-`idx_samples_labeled_route` for the per-route training-set export. `hopper init -replica`
-builds them concurrently; ordinary primary migrations never create them, and drop
-`idx_samples_labeled_route` where an older primary still has it.
-The replica keep policy retains it. It covers a rehashed canonical group key, row ID,
-labels, scores and file types used by sampled training, allowing the planner to
-avoid repeated full-table metadata scans. The one-time index build is separate
-from a fresh training benchmark; replication continues during the build.
-The companion `training-statistics.sql` migration adds table-level expression
-statistics, followed by a one-time `ANALYZE public.samples`. Without those
-statistics PostgreSQL can overestimate the sampled fraction and choose the old
-route index even though the covering index exists.
+Collimator reads the verdict schema. Its per-route training-set export uses
+`samples_labeled_route` (`file_type, id` over the labeled corpus) and prism's
+label-filtered feeds use `samples_label`; both are in `store/schema.sql`, so the
+primary and every replica carry them, and `Store.Upgrade` builds them
+concurrently on an older primary. The replica-only training indexes that
+`hopper init -replica` once built on the legacy `public.samples` were retired on
+2026-11-28: those tables no longer replicate and nothing reads them.
 
 ## Pruning recorded locations
 

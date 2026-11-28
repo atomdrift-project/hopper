@@ -653,7 +653,14 @@ func feedSQL(filter *FeedQuery, ids idRange) (query string, args []any) {
 		}
 	}
 	if filter.Label != "" {
-		where = append(where, "s.label::text = "+bind(filter.Label))
+		// The enum, not its text, so samples_label can serve it. A name the
+		// enum lacks matches nothing, as comparing text did, rather than
+		// failing the cast.
+		if labels[filter.Label] {
+			where = append(where, "s.label = "+bind(filter.Label)+"::label")
+		} else {
+			where = append(where, "false")
+		}
 	}
 	if filter.Cited {
 		where = append(where, "s.cited")

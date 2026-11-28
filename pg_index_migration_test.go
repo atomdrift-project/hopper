@@ -15,7 +15,7 @@ func TestConcurrentIndexDDL(t *testing.T) {
 		{"explicit concurrent", "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_test ON samples(id)", "idx_test"},
 		{"unique", "CREATE UNIQUE INDEX IF NOT EXISTS idx_test ON samples(id)", "idx_test"},
 		{"explicit concurrent unique", "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_test ON samples(id)", "idx_test"},
-		{"embedded training index", strings.TrimSpace(replicaTrainingIndexDDL), "idx_samples_training_hash"},
+		{"partial covering", "CREATE INDEX IF NOT EXISTS idx_test ON samples (file_type, id) INCLUDE (sha256) WHERE label IN ('bad', 'good')", "idx_test"},
 		{"missing name", "CREATE INDEX IF NOT EXISTS ", ""},
 		{"other migration", "ANALYZE samples", ""},
 	} {
@@ -29,24 +29,16 @@ func TestConcurrentIndexDDL(t *testing.T) {
 }
 
 // TestPGMigrationConcurrentIndexes builds indexes through the migration path
-// twice each, checking the result is valid and recorded in the ledger. It
-// runs the replica training indexes one statement at a time, exactly as
-// pgReplicaTrainingMigrations splits them, plus an explicit CONCURRENTLY
-// spelling, which concurrentIndexDDL must route outside a transaction too.
+// twice each, checking the result is valid and recorded in the ledger: a
+// partial covering index in the spelling migrations defer, and an explicit
+// CONCURRENTLY spelling, which concurrentIndexDDL must route outside a
+// transaction too.
 func TestPGMigrationConcurrentIndexes(t *testing.T) {
 	db := openDisposablePG(t)
 	ctx := t.Context()
 
-	var stmts []string
-	for _, ddl := range pgReplicaTrainingMigrations() {
-		if _, ok := concurrentIndexDDL(ddl); ok {
-			// Target this test's isolated schema.
-			stmts = append(stmts, strings.ReplaceAll(ddl, "public.samples", "samples"))
-		}
-	}
-	if len(stmts) == 0 {
-		t.Fatal("pgReplicaTrainingMigrations yielded no index DDL")
-	}
+	stmts := []string{`CREATE INDEX IF NOT EXISTS idx_samples_partial_covering ON samples (file_type, id)
+		INCLUDE (sha256, label) WHERE label IN ('bad', 'good') AND skip = ''`}
 	stmts = append(stmts, `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_samples_explicit_concurrent ON samples (id)`)
 
 	for _, ddl := range stmts {

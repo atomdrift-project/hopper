@@ -6,6 +6,32 @@ Updated: 2026-11-12. Design and migration rationale: [PLAN.md](PLAN.md).
 writes to production until the migration (2026-11-12). The schema is settled in
 the prototype; hopper itself is not yet ported to it.**
 
+## Legacy tables: drop on 2027-01-01
+
+Decided 2026-11-28. The legacy tables (`schema.sql`, and those `pg.go`'s
+runtime migrations add beside them) are dropped on 2027-01-01. Workers already
+claim from the verdict store's queue whenever serve runs with `--store` (the
+default), so anything that writes only the legacy tables does nothing in
+production today.
+
+Still on the legacy tables, to port or retire before the drop:
+
+- [ ] File serving's recovery and "missing" marker, the hash cache's "already
+  inserted" mark, and the upload handler's lookup of a known file (`PLAN.md`,
+  "Labels and moves").
+- [ ] The CLIs that change labels: `demote-sighted`, `migrate-purgatory`, marker
+  resolution, `cascade-backfill`.
+- [ ] Every `rescan` mode except `--go-modules`: `--missing-members`,
+  `--missing-litmus`, `--pre-ident` and the SHA-256 form set the legacy
+  `rescan_priority`, which no claim reads under `--store`.
+- [ ] The backfill CLIs that read or heal the legacy columns (`backfill`,
+  `backfill-*`, `reheal-crit`, `repair-parents`), and the legacy halves of the
+  dashboard and metrics (`observeLegacy`, the legacy corpus counts).
+- [ ] `internal/migrate`, which reads the legacy tables to build the verdict
+  schema: keep it only while a rebuild from them is still wanted.
+- [ ] Decide what replaces the SQLite backend (`schema_sqlite.sql`), which is the
+  legacy schema and backs local databases and most root-package tests.
+
 ## Completed
 
 - [x] Inspect production schema and storage read-only; save the inventory and

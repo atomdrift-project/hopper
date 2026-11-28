@@ -4884,8 +4884,16 @@ func cmdRepairMissing(ctx context.Context) error {
 	return nil
 }
 
-// cmdRescan queues files for re-analysis in the repair tier (rescan_priority=1),
-// drained behind new ingestion so it never starves fresh work. With
+// cmdRescan queues files for re-analysis. With --go-modules it queues, in the
+// verdict store's queue, up to --limit Go-named files still typed "zip" whose
+// last scan predates scan's go_module type, as an operator's rescan
+// (store.QueueRequested): see rescanGoModules.
+//
+// Every other mode writes the legacy tables' repair tier (rescan_priority=1),
+// drained behind new ingestion so it never starves fresh work. Workers claim
+// from the verdict store's queue when serve runs with --store (the default),
+// so those modes are inert there, and they go with the legacy tables on
+// 2027-01-01 (PLAN_TODO.md, "Legacy tables"). With
 // --missing-members it flags every truncated archive that has no member rows —
 // the historical data-loss backlog from the old async explosion. With
 // --missing-litmus it flags every top-level sample that has a cleave verdict but
@@ -4903,8 +4911,21 @@ func cmdRescan(ctx context.Context) error {
 	missingLitmus := f.Bool("missing-litmus", false, "flag every top-level sample with a cleave verdict but no litmus (ml) envelope")
 	preIdent := f.Bool("pre-ident", false, "flag active top-level samples analyzed before the identity-block envelope (claims backfill)")
 	types := f.String("types", "", "with --pre-ident: comma-separated file_type filter, e.g. pe,macho,elf (empty = every type)")
-	dryRun := f.Bool("dry-run", false, "with --pre-ident: count matching rows without flagging them")
+	goModules := f.Bool("go-modules", false, "queue Go-named files still typed zip, scanned before go_module was recognized, as operator rescans in the verdict store")
+	limit := f.Int("limit", 1000, "with --go-modules: queue at most this many files, newest first")
+	before := f.String("before", "", "with --go-modules: scan cutoff, RFC3339 or YYYY-MM-DD (default: earliest go_module scan on record)")
+	storeSchema := f.String("store", "verdict", "with --go-modules: schema holding the verdict tables")
+	dryRun := f.Bool("dry-run", false, "with --pre-ident or --go-modules: count matching rows without queueing them")
 	parseFlags(f, os.Args[2:])
+
+	if *goModules {
+		st, pool, err := openExistingStore(ctx, databaseDSN(*dsn), *storeSchema)
+		if err != nil {
+			return err
+		}
+		defer pool.Close()
+		return rescanGoModules(ctx, st, *before, *limit, *dryRun)
+	}
 
 	db, err := openDB(ctx, *dsn)
 	if err != nil {
@@ -4950,7 +4971,7 @@ func cmdRescan(ctx context.Context) error {
 
 	shas := f.Args()
 	if len(shas) == 0 {
-		return errors.New("rescan: pass --missing-members, --missing-litmus, --pre-ident, or one or more SHA-256 arguments")
+		return errors.New("rescan: pass --missing-members, --missing-litmus, --pre-ident, --go-modules, or one or more SHA-256 arguments")
 	}
 	norm := make([]string, len(shas))
 	for i, s := range shas {
@@ -4965,6 +4986,44 @@ func cmdRescan(ctx context.Context) error {
 		return err
 	}
 	slog.Info("queued samples for repair-tier rescan", "requested", len(norm), "queued", n)
+	return nil
+}
+
+// rescanGoModules runs rescan --go-modules. Without --before it refuses to run
+// until some Go-named file has been typed go_module: none means no worker's
+// scan recognizes the type, so every rescan would store "zip" again and move
+// the file past the cutoff, out of reach of any later run.
+func rescanGoModules(ctx context.Context, st *store.Store, before string, limit int, dryRun bool) error {
+	var cutoff time.Time
+	if before != "" {
+		var err error
+		if cutoff, err = time.Parse(time.RFC3339, before); err != nil {
+			if cutoff, err = time.Parse(time.DateOnly, before); err != nil {
+				return fmt.Errorf("rescan: --before %q: want RFC3339 or YYYY-MM-DD", before)
+			}
+		}
+	} else {
+		start, ok, err := st.GoModuleScanStart(ctx)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("rescan: no Go-named file is typed go_module yet, so no worker's scan recognizes it; upgrade the fleet first, or pass --before")
+		}
+		cutoff = start
+	}
+	if !dryRun && limit <= 0 {
+		return fmt.Errorf("rescan: --limit must be positive, got %d", limit)
+	}
+	n, err := st.QueueGoModules(ctx, cutoff, limit, dryRun)
+	if err != nil {
+		return err
+	}
+	if dryRun {
+		slog.Info("go-module rescan dry-run", "matched", n, "before", cutoff.Format(time.RFC3339))
+		return nil
+	}
+	slog.Info("queued go-module candidates as operator rescans", "queued", n, "limit", limit, "before", cutoff.Format(time.RFC3339))
 	return nil
 }
 

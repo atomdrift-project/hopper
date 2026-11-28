@@ -47,7 +47,24 @@ CREATE TABLE samples (
 	-- reads this (second, which checks the ledger again) a wasted row.
 	-- Readers that want the exact answer ask named().
 	cited        boolean NOT NULL DEFAULT false
-);
+-- Vacuumed every ~1% of inserts rather than the default 20% (~55M rows at
+-- 2026-11 sizes): index-only scans of samples rely on its visibility map, and
+-- a logical replica's copy, filled by tablesync and then only appended to,
+-- would otherwise go weeks without one, longer when a restart zeroes the
+-- counter.
+) WITH (autovacuum_vacuum_insert_scale_factor = 0.01);
+-- The files of one label in id order, under any label. A feed filtered by
+-- label (prism, FeedQuery.Label) merges it with scans' key instead of reading
+-- every sample between two scanned ones: measured 2026-11-28 on galadriel, a
+-- label=good page read 7.4M samples rows for 50. Not partial: prism binds the
+-- label, and a generic plan cannot prove a partial predicate from a parameter.
+CREATE INDEX samples_label ON samples (label, id);
+-- The labeled corpus by file type, in id order: collimator's per-route training
+-- pass (data.py, _corpus: LABELED_WHERE AND s.file_type = ANY(route) AND
+-- s.id <= snapshot ORDER BY s.id). Without it each route walked all ~273M
+-- samples by id to keep a few hundred thousand. About 11% of samples.
+-- Collimator spells the labels as literals, so the predicate matches.
+CREATE INDEX samples_labeled_route ON samples (file_type, id) WHERE label IN ('bad', 'good');
 -- Ends in id so the newest file under a name (a URL fetched again) is the
 -- last entry for it.
 CREATE INDEX samples_release ON samples (name_id, version, id) WHERE name_id IS NOT NULL;
@@ -189,7 +206,7 @@ CREATE TABLE contents (
 	paths     text[]   COMPRESSION lz4 NOT NULL,
 	CHECK (cardinality(child_ids) = cardinality(paths)),
 	CHECK (cardinality(child_ids) BETWEEN 0 AND 100000)
-);
+) WITH (autovacuum_vacuum_insert_scale_factor = 0.01); -- as samples
 -- Which archives hold this file. fastupdate is off so a lookup never has to
 -- scan a pending list; inserts measured no slower without it.
 CREATE INDEX contents_parents ON contents USING gin (child_ids) WITH (fastupdate = off);
@@ -259,7 +276,7 @@ CREATE TABLE locations (
 	feed      text,
 	mtime     timestamptz,
 	seen_at   timestamptz NOT NULL DEFAULT now()
-);
+) WITH (autovacuum_vacuum_insert_scale_factor = 0.01); -- as samples
 CREATE INDEX locations_sample ON locations (sample_id);
 
 -- Work owed; a row exists only while pending, so the table stays small however

@@ -357,11 +357,19 @@ SQL
         # step's business, and it will be created with defaults there.
         printf '%s\n' "$local_tables" | grep -qxF "$qt" || continue
         if ! printf '%s\n' "$local_reloptions" | grep -qxF "$qt|$opts"; then
+            # Bounded like the column DDL: ALTER TABLE SET queues behind any
+            # VACUUM or CREATE INDEX CONCURRENTLY on the table, which can hold
+            # its lock for an hour. Unbounded, each run's ALTER waited past the
+            # unit's TimeoutStartSec, and systemd killing psql left the backend
+            # queued: one more orphan per run, and every later step of every
+            # run skipped (galadriel, 2026-11-28). A run that times out leaves
+            # the drift for the next.
             if admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 \
+                    -c "SET lock_timeout = '$HEAL_LOCK_TIMEOUT'" \
                     -c "ALTER TABLE $qt SET ($opts);" >/dev/null 2>&1; then
                 reloption_names="$reloption_names $qt"
             else
-                alert warn "could not apply publisher storage parameters to $qt ($opts) — autovacuum on the replica will use server defaults, which on a large replicated table can mean it never runs at all"
+                alert warn "could not apply publisher storage parameters to $qt ($opts) yet (lock busy or rejected; retried next run) — until then autovacuum on the replica uses server defaults, which on a large replicated table can mean it never runs at all"
             fi
         fi
     done

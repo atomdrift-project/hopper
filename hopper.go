@@ -744,6 +744,13 @@ func isHex(c byte) bool {
 	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
 
+// LEGACY: the tables schemaPG and schemaSQLite create are to be dropped on
+// 2027-01-01 (decided 2026-11-28); the verdict schema (store/schema.sql)
+// replaces them. PLAN_TODO.md, "Legacy tables", lists what still reads them.
+// The marker lives here, not in schema.sql, because that file's text is its
+// migration id (migrationID): any edit, a comment included, re-runs it on
+// every legacy database.
+//
 //go:embed schema.sql
 var schemaPG string
 

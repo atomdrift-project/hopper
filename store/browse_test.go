@@ -124,6 +124,9 @@ func TestFeedFilters(t *testing.T) {
 	if _, err := st.pool.Exec(ctx, `UPDATE samples SET file_type = 'pe' WHERE sha256 = $1`, digestOf("suspicious exe")); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := st.pool.Exec(ctx, `UPDATE samples SET label = 'good' WHERE sha256 = $1`, digestOf("benign npm")); err != nil {
+		t.Fatal(err)
+	}
 	cite := Sighting{Source: "feed", Operator: "feed", Subject: hexOf(digestOf("hostile npm")), Claim: "malicious", Basis: "reviewed"}
 	if _, err := st.AddSightings(ctx, []Sighting{cite}); err != nil {
 		t.Fatal(err)
@@ -167,6 +170,9 @@ func TestFeedFilters(t *testing.T) {
 		{"by digest", FeedQuery{Search: hexOf(digestOf("member"))}, []string{"member"}},
 		{"by a substring of the path", FeedQuery{Search: "POOL/BENIGN"}, []string{"benign npm"}},
 		{"cited", FeedQuery{Cited: true}, []string{"hostile npm"}},
+		{"by label", FeedQuery{Label: "good"}, []string{"benign npm"}},
+		{"by a label nothing holds", FeedQuery{Label: "dual-use"}, nil},
+		{"by a label the enum lacks", FeedQuery{Label: "nonsense"}, nil},
 		{"a page", FeedQuery{TopLevel: true, Limit: 2, Offset: 1}, []string{"suspicious exe", "benign npm"}},
 		{"a window that has nothing", FeedQuery{Until: time.Now().Add(-time.Hour)}, nil},
 		{"a window that has everything", FeedQuery{Since: hourAgo, Until: inAnHour}, all},

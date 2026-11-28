@@ -77,42 +77,22 @@ func TestReplicatedTablesAreTheVerdictSchema(t *testing.T) {
 	}
 }
 
-func TestTrainingHashIndexIsReplicaOnly(t *testing.T) {
-	for _, name := range []string{"idx_samples_training_hash", "idx_samples_labeled_route"} {
-		for _, replica := range []bool{false, true} {
-			db := &DB{}
-			db.SetReplicaIndexPolicy(replica)
-			created := false
-			for _, ddl := range db.pgMigrationsForRole() {
-				if !strings.Contains(ddl, name) {
-					continue
-				}
-				if strings.HasPrefix(ddl, "DROP ") {
-					if replica {
-						t.Errorf("replica role drops %s, which its readers need", name)
-					}
-					continue
-				}
-				created = true
-				if _, ok := concurrentIndexDDL(ddl); !ok || !isDeferrableIndexDDL(ddl) {
-					t.Errorf("%s is not a deferred concurrent build: %q", name, ddl)
-				}
-			}
-			if created != replica {
-				t.Errorf("replica=%v: %s created=%v", replica, name, created)
-			}
-		}
-	}
-}
-
-func TestTrainingHashStatisticsAreReplicaOnly(t *testing.T) {
+// TestReplicaRoleOmitsPrimaryIndexes pins what the policy still decides: the
+// primary-only DDL runs on a primary and never on a replica, and neither role
+// builds the retired training indexes on the legacy public.samples.
+func TestReplicaRoleOmitsPrimaryIndexes(t *testing.T) {
 	for _, replica := range []bool{false, true} {
 		db := &DB{}
 		db.SetReplicaIndexPolicy(replica)
 		joined := strings.Join(db.pgMigrationsForRole(), "\n")
-		for _, marker := range []string{"samples_training_hash_stats", "ANALYZE public.samples"} {
-			if strings.Contains(joined, marker) != replica {
-				t.Errorf("replica=%v: incorrect inclusion of %s", replica, marker)
+		for _, ddl := range pgPrimaryIndexMigrations() {
+			if strings.Contains(joined, ddl) == replica {
+				t.Errorf("replica=%v: incorrect inclusion of %q", replica, ddl)
+			}
+		}
+		for _, retired := range []string{"idx_samples_training_hash", "samples_training_hash_stats", "ANALYZE public.samples"} {
+			if strings.Contains(joined, retired) {
+				t.Errorf("replica=%v: migrations still name %s", replica, retired)
 			}
 		}
 	}

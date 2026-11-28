@@ -217,13 +217,22 @@ _bulk_srsubstate() {
 }
 
 # _bulk_reindex_one TABLE — rebuild TABLE's indexes from its saved DDL file and
-# ANALYZE it, then drop the file. No-op if the file is gone (already rebuilt).
+# VACUUM (ANALYZE) it, then drop the file. No-op if the file is gone (already
+# rebuilt).
+#
+# VACUUM, not ANALYZE alone: tablesync's COPY leaves every page unmarked in the
+# visibility map and every tuple without hint bits, and an append-mostly table
+# may not reach autovacuum's insert threshold for weeks. Until then each
+# index-only scan reads the heap and the first reader of each page writes it
+# back. Measured on galadriel 2026-11-28, 13 days after its load: samples,
+# contents and locations 0% all-visible. TOAST is skipped: no index-only scan
+# reads it, and verdicts' alone is over a terabyte.
 _bulk_reindex_one() {
     _bt="$1"; _bf="$(_bulk_state_dir)/reindex.$(_bulk_safe "$1").sql"
     pg_sh "test -f '$_bf'" 2>/dev/null || return 0
     log "fast-sync: '$_bt' copy done — rebuilding its indexes (parallel, maintenance_work_mem=$BULK_MAINT_MEM)"
     if admin -d "$LOCAL_DB" -v ON_ERROR_STOP=1 -f "$_bf" >/dev/null; then
-        admin -d "$LOCAL_DB" -c "ANALYZE $REPLICA_SCHEMA.$_bt" >/dev/null 2>&1 || true
+        admin -d "$LOCAL_DB" -c "VACUUM (ANALYZE, PROCESS_TOAST false) $REPLICA_SCHEMA.$_bt" >/dev/null 2>&1 || true
         pg_sh "rm -f '$_bf'" 2>/dev/null || true
         log "fast-sync: '$_bt' indexes rebuilt"
     else

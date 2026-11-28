@@ -55,6 +55,77 @@ func (st *Store) Upgrade(ctx context.Context) error {
 		}
 		slog.InfoContext(ctx, "store: upgrade: created", "relation", step.name, "took", time.Since(start).Round(time.Millisecond))
 	}
+	// 2026-11-28: samples by label (prism's label feeds) and the labeled corpus
+	// by file type (collimator's per-route pass). samples takes inserts from
+	// every collector, so these build concurrently rather than holding off
+	// its writers for the minutes a build takes at production size; they were
+	// built by hand on the primary and galadriel the same day, so there this
+	// finds them and builds nothing.
+	for _, step := range []struct{ name, ddl string }{
+		{"samples_label", `CREATE INDEX CONCURRENTLY samples_label ON samples (label, id)`},
+		{"samples_labeled_route", `CREATE INDEX CONCURRENTLY samples_labeled_route ON samples (file_type, id)
+			WHERE label IN ('bad', 'good')`},
+	} {
+		if err := st.concurrentIndex(ctx, step.name, step.ddl); err != nil {
+			return fmt.Errorf("store: upgrade: %s: %w", step.name, err)
+		}
+	}
+	// 2026-11-28: insert-driven vacuum at 1% for the tables that are mostly
+	// appended to (schema.sql, samples). Storage parameters are not
+	// replicated; a logical replica is set by hand or made from schema.sql.
+	for _, table := range []string{"samples", "contents", "locations"} {
+		if err := st.insertVacuum(ctx, table); err != nil {
+			return fmt.Errorf("store: upgrade: %s: %w", table, err)
+		}
+	}
+	return nil
+}
+
+// concurrentIndex builds an index with ddl, a CREATE INDEX CONCURRENTLY, unless
+// a valid one named name exists. A concurrent build that fails or is
+// interrupted leaves its index behind, invalid: maintained by every write
+// and read by no query. That one is dropped and built again, where a test of
+// existence alone would keep it forever.
+func (st *Store) concurrentIndex(ctx context.Context, name, ddl string) error {
+	var exists, valid bool
+	if err := st.pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL,
+		coalesce((SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)), false)`, name).Scan(&exists, &valid); err != nil {
+		return err
+	}
+	if valid {
+		return nil
+	}
+	if exists {
+		slog.WarnContext(ctx, "store: upgrade: rebuilding invalid index", "index", name)
+		if _, err := st.pool.Exec(ctx, `DROP INDEX CONCURRENTLY `+pgx.Identifier{name}.Sanitize()); err != nil {
+			return fmt.Errorf("drop invalid: %w", err)
+		}
+	}
+	start := time.Now()
+	if _, err := st.pool.Exec(ctx, ddl); err != nil {
+		return err
+	}
+	slog.InfoContext(ctx, "store: upgrade: created", "relation", name, "took", time.Since(start).Round(time.Millisecond))
+	return nil
+}
+
+// insertVacuum sets table's autovacuum_vacuum_insert_scale_factor to
+// schema.sql's 0.01 where it is not already. ALTER TABLE SET takes a lock
+// that blocks neither reads nor writes.
+func (st *Store) insertVacuum(ctx context.Context, table string) error {
+	const opt = "autovacuum_vacuum_insert_scale_factor=0.01"
+	var set bool
+	if err := st.pool.QueryRow(ctx, `SELECT coalesce($2 = ANY (reloptions), false) FROM pg_class
+		WHERE oid = to_regclass($1)`, table, opt).Scan(&set); err != nil {
+		return err
+	}
+	if set {
+		return nil
+	}
+	if _, err := st.pool.Exec(ctx, `ALTER TABLE `+pgx.Identifier{table}.Sanitize()+` SET (`+opt+`)`); err != nil {
+		return err
+	}
+	slog.InfoContext(ctx, "store: upgrade: set", "table", table, "option", opt)
 	return nil
 }
 

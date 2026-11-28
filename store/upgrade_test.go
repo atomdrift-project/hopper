@@ -121,3 +121,72 @@ func TestUpgrade(t *testing.T) {
 		t.Errorf("a second upgrade moved rows: %v, want %v", got, want)
 	}
 }
+
+// Upgrade gives samples made before 2026-11-28 the label and route indexes
+// and the insert-driven vacuum setting, exactly as schema.sql spells them,
+// rebuilds an index a failed concurrent build left invalid, and leaves a
+// valid one alone.
+func TestUpgradeSamplesIndexes(t *testing.T) {
+	st := open(t)
+	ctx := t.Context()
+	defs := func() map[string]string {
+		t.Helper()
+		rows, err := st.pool.Query(ctx, `SELECT 'samples_label', pg_get_indexdef('samples_label'::regclass)
+			UNION ALL SELECT 'samples_labeled_route', pg_get_indexdef('samples_labeled_route'::regclass)
+			UNION ALL SELECT relname, array_to_string(reloptions, ',') FROM pg_class
+			WHERE oid IN ('samples'::regclass, 'contents'::regclass, 'locations'::regclass)`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		out := map[string]string{}
+		for rows.Next() {
+			var k, v string
+			if err := rows.Scan(&k, &v); err != nil {
+				t.Fatal(err)
+			}
+			out[k] = v
+		}
+		return out
+	}
+	fresh := defs()
+	if len(fresh) != 5 {
+		t.Fatalf("schema.sql made %v", fresh)
+	}
+	if _, err := st.pool.Exec(ctx, `DROP INDEX samples_label; DROP INDEX samples_labeled_route;
+		ALTER TABLE samples RESET (autovacuum_vacuum_insert_scale_factor);
+		ALTER TABLE contents RESET (autovacuum_vacuum_insert_scale_factor);
+		ALTER TABLE locations RESET (autovacuum_vacuum_insert_scale_factor)`); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := st.Upgrade(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := defs(); !maps.Equal(got, fresh) {
+			t.Fatalf("upgraded:\n%v\nfresh:\n%v", got, fresh)
+		}
+	}
+
+	// What an interrupted CREATE INDEX CONCURRENTLY leaves. Marking it by hand
+	// needs a superuser; a test database without one cannot stage it.
+	if _, err := st.pool.Exec(ctx, `UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'samples_label'::regclass`); err != nil {
+		t.Skipf("cannot mark an index invalid here: %v", err)
+	}
+	var before uint32
+	if err := st.pool.QueryRow(ctx, `SELECT 'samples_label'::regclass::oid`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Upgrade(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var after uint32
+	var valid bool
+	if err := st.pool.QueryRow(ctx, `SELECT indexrelid::oid, indisvalid FROM pg_index
+		WHERE indexrelid = 'samples_label'::regclass`).Scan(&after, &valid); err != nil {
+		t.Fatal(err)
+	}
+	if after == before || !valid {
+		t.Fatalf("invalid index not rebuilt: oid %d -> %d, valid=%v", before, after, valid)
+	}
+}
