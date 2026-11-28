@@ -213,17 +213,18 @@ func TestTriageWindowed(t *testing.T) {
 			queue: "discord",
 			files: []*fixture{
 				with(base("rules hostile, model benign", "good"), func(f *fixture) { f.floor = []int{1, 0}; f.ml = "benign"; f.mlFires = -1 }),
-				// highest's and bad's: the label is the work, and they own it.
-				with(base("model hostile, rules silent", "unknown"), func(f *fixture) { f.ml = "hostile"; f.created = 80 * hour }),
+				with(base("model hostile, rules silent", "bad"), func(f *fixture) { f.ml = "hostile"; f.created = 80 * hour }),
 				with(base("both hostile", "bad"), func(f *fixture) { f.floor = []int{1, 0}; f.ml = "hostile" }),
 				with(base("model hostile, one crit 4", "bad"), func(f *fixture) { f.floor = []int{0, 1}; f.ml = "hostile" }),
 			},
-			want: []string{"rules hostile, model benign"},
+			want: []string{"rules hostile, model benign", "model hostile, rules silent"},
 		},
 		{
 			queue: "fallout",
 			files: []*fixture{
-				with(base("unexplained", "unknown"), func(f *fixture) { f.atomscan = "hostile"; f.created = 24 * hour }),
+				// Past the describe queue's head start; the next is still inside it.
+				with(base("unexplained", "unknown"), func(f *fixture) { f.atomscan = "hostile"; f.created = 24 * hour; f.scanned = 13 * hour }),
+				with(base("unexplained, just scanned", "unknown"), func(f *fixture) { f.atomscan = "hostile"; f.created = 24 * hour }),
 				with(base("explained but uncited", "unknown"), func(f *fixture) {
 					f.atomscan = "hostile"
 					f.created = 30 * hour
@@ -382,7 +383,73 @@ func TestTriageOutliers(t *testing.T) {
 	if got, want := queued(ctx, t, st, "highest", names...), []string{"js 5", "py 7", "js 50"}; !slices.Equal(got, want) {
 		t.Errorf("highest %q, want %q: the tightest per file type first, round by round", got, want)
 	}
-	if got, want := queued(ctx, t, st, "lowest", names...), []string{"bad unsure", "bad sure"}; !slices.Equal(got, want) {
+	if got, want := queued(ctx, t, st, "lowest", names...), []string{"bad unsure"}; !slices.Equal(got, want) {
+		t.Errorf("lowest %q, want %q: a bad file the model is sure of is no miss", got, want)
+	}
+}
+
+// discord ranks its disagreements like the outliers: a floor conviction the
+// model ignores first, then the model-only files by the model's
+// probability, one release per package before any second, round by round
+// across file types. It and highest honour each other's reports.
+func TestTriageDiscordRanking(t *testing.T) {
+	st := open(t)
+	ctx := t.Context()
+	modelOnly := func(bytes, pkg string, prob float64) *fixture {
+		return with(base(bytes, "unknown"), func(f *fixture) {
+			f.fileType, f.ml, f.mlFires, f.mlProb, f.pkg, f.version = "go_module", "hostile", 3, prob, pkg, bytes
+		})
+	}
+	names := world(ctx, t, st,
+		with(base("floor convicts", "unknown"), func(f *fixture) {
+			f.fileType, f.floor, f.ml, f.mlFires, f.mlProb = "npm", []int{1, 0}, "benign", -1, 0.01
+		}),
+		modelOnly("a v1", "pkg:golang/a", 0.9),
+		modelOnly("a v2", "pkg:golang/a", 0.8),
+		modelOnly("a v3", "pkg:golang/a", 0.7),
+		modelOnly("b v1", "pkg:golang/b", 0.6),
+		modelOnly("ruled by highest", "pkg:golang/c", 0.95),
+	)
+	report(ctx, t, st, "ruled by highest", "highest", 200*24*hour)
+	want := []string{"floor convicts", "a v1", "b v1", "a v2", "a v3"}
+	if got := queued(ctx, t, st, "discord", names...); !slices.Equal(got, want) {
+		t.Errorf("discord %q, want %q", got, want)
+	}
+	report(ctx, t, st, "a v1", "discord", 100*hour)
+	if got := queued(ctx, t, st, "highest", names...); slices.Contains(got, "a v1") || slices.Contains(got, "ruled by highest") {
+		t.Errorf("highest %q: a file discord or highest has ruled on is not asked again", got)
+	}
+}
+
+// lowest asks only about the bad files a type's model misses: below 0.5 and
+// in the type's bottom 5%, in a type the model scores at all. Working the
+// bottom does not lower the cut, so the queue drains rather than promoting
+// the next slice.
+func TestTriageLowestBand(t *testing.T) {
+	st := open(t)
+	ctx := t.Context()
+	bad := func(bytes, fileType string, prob float64) *fixture {
+		return with(base(bytes, "bad"), func(f *fixture) {
+			f.fileType, f.ml, f.mlFires, f.mlProb = fileType, "benign", -1, prob
+		})
+	}
+	var files []*fixture
+	// npm: twenty files the model mostly convicts, and one it misses.
+	for i := range 19 {
+		files = append(files, bad(fmt.Sprintf("npm %d", i), "npm", 0.9+float64(i)/1000))
+	}
+	files = append(files, bad("npm missed", "npm", 0.01), bad("npm worked", "npm", 0.005))
+	// pe: the bottom is still confident, so nothing is a miss.
+	for i := range 20 {
+		files = append(files, bad(fmt.Sprintf("pe %d", i), "pe", 0.85+float64(i)/100))
+	}
+	// c: the model does not read it; every file sits near zero.
+	for i := range 20 {
+		files = append(files, bad(fmt.Sprintf("c %d", i), "c", 0.0001))
+	}
+	names := world(ctx, t, st, files...)
+	report(ctx, t, st, "npm worked", "lowest", 200*24*hour)
+	if got, want := queued(ctx, t, st, "lowest", names...), []string{"npm missed"}; !slices.Equal(got, want) {
 		t.Errorf("lowest %q, want %q", got, want)
 	}
 }
@@ -471,6 +538,57 @@ func TestTriageAcquitSecondReview(t *testing.T) {
 	}
 	if got, want := queued(ctx, t, st, "review", names...), []string{"under review"}; !slices.Equal(got, want) {
 		t.Errorf("review %q, want %q", got, want)
+	}
+}
+
+// Nothing but the review queue drains review/, so benign files stay in it,
+// behind the riskier ones: atomscan's class first, then the floor's hostile
+// and suspicious counts, then the model's probability.
+func TestTriageReviewByRisk(t *testing.T) {
+	st := open(t)
+	ctx := t.Context()
+	under := func(bytes, class string, floor []int, prob float64) *fixture {
+		return with(base(bytes, "unknown"), func(f *fixture) {
+			f.path, f.atomscan, f.floor, f.ml, f.mlProb = "review/"+bytes, class, floor, "benign", prob
+		})
+	}
+	names := world(ctx, t, st,
+		under("benign", "benign", nil, 0.1),
+		under("suspicious", "suspicious", []int{0, 2}, 0.3),
+		under("hostile, one rule", "hostile", []int{1, 0}, 0.2),
+		under("hostile, two rules", "hostile", []int{2, 0}, 0.2),
+		under("hostile, one rule, surer model", "hostile", []int{1, 0}, 0.9),
+	)
+	want := []string{"hostile, two rules", "hostile, one rule, surer model", "hostile, one rule", "suspicious", "benign"}
+	if got := queued(ctx, t, st, "review", names...); !slices.Equal(got, want) {
+		t.Errorf("review %q, want %q", got, want)
+	}
+}
+
+// A file only the tria.ge sandbox accuses waits behind every other claim,
+// however new its own; another source's claim on the same file lifts it.
+func TestTriageSightedSandboxLast(t *testing.T) {
+	st := open(t)
+	ctx := t.Context()
+	names := world(ctx, t, st, base("sandbox only", "unknown"), base("feed", "unknown"), base("sandbox and feed", "unknown"))
+	now := time.Now()
+	for _, c := range []struct {
+		source, bytes string
+		ago           time.Duration
+	}{
+		{"triage", "sandbox only", hour},
+		{"urlhaus", "feed", 48 * hour},
+		{"triage", "sandbox and feed", hour},
+		{"urlhaus", "sandbox and feed", 24 * hour},
+	} {
+		if _, err := st.pool.Exec(ctx, `INSERT INTO sightings (source, subject, operator, claim, first_seen) VALUES ($1, $2, $1, 'malicious', $3)`,
+			c.source, hexOf(digestOf(c.bytes)), now.Add(-c.ago)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{"sandbox and feed", "feed", "sandbox only"}
+	if got := queued(ctx, t, st, "sighted", names...); !slices.Equal(got, want) {
+		t.Errorf("sighted %q, want %q", got, want)
 	}
 }
 

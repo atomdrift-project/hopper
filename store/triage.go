@@ -48,11 +48,19 @@ const (
 	popularTailWindow = 21 * day
 	highestWindow     = 3 * day
 	lowestWindow      = 30 * day
-	createdWindow     = 7 * day  // version-drift: files created this recently
-	falloutWindow     = 3 * day  // fallout: files created this recently
-	reviewWindow      = 3 * day  // review-72h: files created this recently; review-30d the rest
-	reviewFreshness   = 30 * day // review-30d: files created this recently
-	gauntletWindow    = 3 * day  // gauntlet-72h: observations this recent; gauntlet the rest
+	createdWindow     = 7 * day // version-drift: files created this recently
+	falloutWindow     = 3 * day // fallout: files created this recently
+
+	// falloutDescribeHeadStart is how long after its scan an undescribed
+	// fallout file waits before this queue takes it: the describe queue's
+	// fallout band asks for the description an hour after the scan and retries
+	// every three hours (describe.go), a single LLM call where this queue is a
+	// whole agent session. Twelve hours is four tries. A described file that
+	// nobody outside has cited is taken at once.
+	falloutDescribeHeadStart = "12 hours"
+	reviewWindow             = 3 * day  // review-72h: files created this recently; review-30d the rest
+	reviewFreshness          = 30 * day // review-30d: files created this recently
+	gauntletWindow           = 3 * day  // gauntlet-72h: observations this recent; gauntlet the rest
 )
 
 // gauntletQueues are the queues Store.gauntlet reads, each true when it holds
@@ -264,13 +272,7 @@ var triageQueues = map[string]triageQueue{
 	"unconvicted-hostile-stale":    windowed(hostileWindow, unconvictedHostile, stale),
 	"unconvicted-suspicious-stale": windowed(suspiciousWindow, unconvictedSuspicious, stale),
 
-	// discord: the floor convicts and the model calls it benign. The other
-	// direction -- the model hostile, the floor silent -- is not asked here:
-	// it is 98% of that disagreement, nearly all unlabelled packages, and its
-	// work is the label the model is retrained on, which highest owns (good or
-	// unknown, ranked per file type and package) and bad owns for bad files.
-	// Asking it in three queues judged the same files three times.
-	"discord": windowed(discordWindow, triageSettled+` AND m.class = 'benign' AND `+floorHostile+` >= 1`, newest),
+	"discord": discord,
 
 	// popular: a popular package the floor convicts; the tail is the same
 	// files scanned one to 21 days ago. Ordered by the package's rank, then
@@ -287,8 +289,10 @@ var triageQueues = map[string]triageQueue{
 	// first (describe.go); this is the backstop.
 	"fallout": windowed(falloutWindow, triageSettled+` AND a.class = 'hostile' AND coalesce(s.file_type, '') <> 'registry'
 		AND s.created_at > now() - $4::interval
-		AND (NOT named(s.sha256, s.name_id, s.version) OR NOT EXISTS (SELECT 1 FROM verdicts lv WHERE lv.sample_id = s.id AND lv.scanner_id = 4
-		                               AND coalesce(lv.summary->>'reason', '') <> ''))
+		AND CASE WHEN EXISTS (SELECT 1 FROM verdicts lv WHERE lv.sample_id = s.id AND lv.scanner_id = 4
+		                      AND coalesce(lv.summary->>'reason', '') <> '')
+		         THEN NOT named(s.sha256, s.name_id, s.version)
+		         ELSE sc.scanned_at <= now() - interval '`+falloutDescribeHeadStart+`' END
 		AND `+hostileReviewPark+`
 		AND NOT EXISTS (SELECT 1 FROM contents c WHERE c.child_ids @> ARRAY[s.id])`, newest),
 
@@ -306,12 +310,13 @@ var triageQueues = map[string]triageQueue{
 	// file type. The archive's own ml row has its members folded in, so a
 	// member that fires brings its archive here, as legacy collapsed members
 	// onto it.
-	"highest": outlier(`s.label IN ('good', 'unknown')`, `m.fires_at`, highestWindow),
-	// lowest: bad files the model is least sure of, per file type. Top-level
-	// files only: legacy also took bad members, which rule 8 mostly no longer
-	// creates.
+	// highest and discord honour each other's reports: see discord.
+	"highest": outlier(`s.label IN ('good', 'unknown')`, `m.fires_at`, highestWindow, false, "discord"),
+	// lowest: bad files the model is least sure of, per file type, held to
+	// the ones it actually misses (lowestBand). Top-level files only: legacy
+	// also took bad members, which rule 8 mostly no longer creates.
 	"lowest": outlier(`s.label = 'bad'`,
-		`CASE WHEN jsonb_typeof(m.summary->'prob') = 'number' THEN (m.summary->'prob')::numeric END`, lowestWindow),
+		`CASE WHEN jsonb_typeof(m.summary->'prob') = 'number' THEN (m.summary->'prob')::numeric END`, lowestWindow, true, ""),
 	"acquit":         acquit,
 	"second":         second,
 	"review":         review,
@@ -363,6 +368,64 @@ func versionDrift(ctx context.Context, st *Store, queue string, n int, excluded 
 		queue, excluded, n, createdWindow, driftCandidates)
 }
 
+// discord: the floor and the model disagree about the same bytes, either way
+// round -- the floor convicts and the model calls it benign, or the model
+// calls it hostile and the floor finds nothing -- in the last day's scans.
+// Which detector is wrong is the question: a wrong floor wants a trait
+// loosened, a wrong model wants the label it is retrained on, and a right
+// model the floor missed wants a trait written.
+//
+// The model-only side is almost all of it (98% on 2026-11-28, mostly
+// unlabelled go modules), so it is ranked like the outliers: round by round
+// across file types, every package's strongest disagreement before any
+// package's second, the strongest first within a round. A floor conviction
+// the model ignores counts its hostile findings, which put it ahead of any
+// model-only file, scored by the model's probability.
+//
+// highest asks the label question of the same model-only files, so the two
+// honour each other's reports: a highest ruling settles the label (and a bad
+// one hands the file to bad, which writes the trait), and a discord one
+// answers highest.
+func discord(ctx context.Context, st *Store, queue string, n int, excluded [][]byte, _ int) ([]int64, error) {
+	return st.sampleIDs(ctx, `WITH c AS MATERIALIZED (
+			SELECT s.id, coalesce(s.file_type, '') AS route, coalesce(s.name_id, -s.id) AS pkg, s.created_at,
+			       CASE WHEN `+floorHostile+` >= 1 THEN `+floorHostile+` ELSE `+num("m.summary->'prob'")+` END AS strength
+			`+triageRecent+`
+			  AND `+triageShared+` AND `+triageServable+` AND `+triageSettled+`
+			  AND ((`+floorHostile+` >= 1 AND m.class = 'benign')
+			    OR (`+floorHostile+` = 0 AND `+floorSuspicious+` = 0 AND m.class = 'hostile'))
+			  AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.sample_id = s.id AND r.report_type = 'highest')
+		), p AS (
+			SELECT id, route, strength, created_at,
+			       row_number() OVER (PARTITION BY pkg ORDER BY strength DESC, created_at DESC, id DESC) AS release
+			FROM c
+		), r AS (
+			SELECT id, strength, created_at,
+			       row_number() OVER (PARTITION BY route ORDER BY release, strength DESC, created_at DESC, id DESC) AS rank
+			FROM p
+		)
+		SELECT id FROM r ORDER BY rank, strength DESC, created_at DESC, id DESC LIMIT $3`,
+		queue, excluded, n, discordWindow)
+}
+
+// lowestBand is what keeps lowest finite: of a file type's bad files, only
+// those the model scores below both bandCeiling (it leans benign) and the
+// type's bandPercentile (the type's own bottom) are asked about, and only in
+// a type the model scores at all, which a median at or above scoredMedian
+// says. Measured 2026-11-28: types like c, text, ne and json put half their
+// bad files near 0 -- the model does not read them, and a label there trains
+// nothing -- while pe's bottom 5% still scored 0.89, which is no miss. The
+// band took the queue from 86,742 files to 2,238 over 65 types.
+//
+// The percentiles are taken over every bad file of the type in the window,
+// worked or not, so working the bottom does not lower the cut and promote
+// the next slice in: the queue drains.
+const (
+	bandCeiling    = `0.5`
+	bandPercentile = `0.05`
+	scoredMedian   = `0.05`
+)
+
 // outlier is the shape highest and lowest share: per file type, the k files
 // whose model reading (score: a numeric SQL expression, NULL for none) is
 // most extreme, best first, then round by round across types. Within a type,
@@ -374,23 +437,38 @@ func versionDrift(ctx context.Context, st *Store, queue string, n int, excluded 
 // retires a file for good; a "missing" report (the bytes could not be
 // served) parks it for 96 hours. Files created in the last 48 hours are left
 // for the other queues to settle first.
-func outlier(where, score string, window time.Duration) triageQueue {
+//
+// band holds a queue to the files below lowestBand's cut for their file type;
+// a report of type parkedBy, when set, retires a file as the queue's own does.
+func outlier(where, score string, window time.Duration, band bool, parkedBy string) triageQueue {
+	open := `c.open`
+	if band {
+		open += ` AND c.route IN (SELECT route FROM t WHERE p50 >= ` + scoredMedian + `)
+			AND c.score <= (SELECT cut FROM t WHERE t.route = c.route)`
+	}
 	return func(ctx context.Context, st *Store, queue string, n int, excluded [][]byte, k int) ([]int64, error) {
-		return st.sampleIDs(ctx, `WITH c AS (
+		return st.sampleIDs(ctx, `WITH c AS MATERIALIZED (
 			SELECT s.id, coalesce(s.file_type, '') AS route, coalesce(s.name_id, -s.id) AS pkg,
-			       `+score+` AS score`+triageRecent+`
-			  AND `+triageShared+` AND `+triageServable+` AND `+triageSettled+` AND `+where+`
+			       `+score+` AS score,
+			       (`+triageShared+`
+			        AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.sample_id = s.id
+			                        AND (r.report_type IN ($1, $6)
+			                          OR (r.report_type = 'missing' AND r.created_at > now() - interval '96 hours')))) AS open
+			`+triageRecent+`
+			  AND `+triageServable+` AND `+triageSettled+` AND `+where+`
 			  AND s.created_at < now() - interval '48 hours'
-			  AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.sample_id = s.id
-			                  AND (r.report_type = $1 OR (r.report_type = 'missing' AND r.created_at > now() - interval '96 hours')))
+		), t AS (
+			SELECT route, percentile_cont(0.5) WITHIN GROUP (ORDER BY score) AS p50,
+			       least(`+bandCeiling+`, percentile_cont(`+bandPercentile+`) WITHIN GROUP (ORDER BY score)) AS cut
+			FROM c WHERE score IS NOT NULL AND score >= 0 GROUP BY route
 		), p AS (
 			SELECT id, route, score, row_number() OVER (PARTITION BY pkg ORDER BY score, id DESC) AS release
-			FROM c WHERE score IS NOT NULL AND score >= 0
+			FROM c WHERE score IS NOT NULL AND score >= 0 AND `+open+`
 		), r AS (
 			SELECT id, score, row_number() OVER (PARTITION BY route ORDER BY release, score, id DESC) AS rank FROM p
 		)
 		SELECT id FROM r WHERE rank <= $5 ORDER BY rank, score, id DESC LIMIT $3`,
-			queue, excluded, n, window, k)
+			queue, excluded, n, window, k, parkedBy)
 	}
 }
 
@@ -431,14 +509,25 @@ func second(ctx context.Context, st *Store, queue string, n int, excluded [][]by
 		queue, excluded, n, trustedSources)
 }
 
-// review: unknown files someone put under review/.
+// review: unknown files someone put under review/. Nothing but this queue
+// drains the pool, so every class stays in it, ordered by risk: atomscan's
+// class (hostile, suspicious, benign), then the floor's hostile and
+// suspicious counts, then the model's probability, newest first among equals.
+// (cleave's own risk score is not stored.) Promoter files only files a month
+// old or more here, so the newest are about a month old.
 func review(ctx context.Context, st *Store, queue string, n int, excluded [][]byte, _ int) ([]int64, error) {
 	return st.sampleIDs(ctx, `SELECT s.id
 		FROM (SELECT DISTINCT sample_id FROM locations WHERE path LIKE 'review/%') l
 		JOIN samples s ON s.id = l.sample_id
 		JOIN verdicts a ON a.sample_id = s.id AND a.scanner_id = 1
 		LEFT JOIN scans sc ON sc.sample_id = s.id
-		WHERE s.label = 'unknown' AND a.outcome = 'ok' AND `+triageSettled+` AND `+triageShared+newest+` LIMIT $3`,
+		LEFT JOIN verdicts f ON f.sample_id = s.id AND f.scanner_id = 2
+		LEFT JOIN verdicts m ON m.sample_id = s.id AND m.scanner_id = 3
+		WHERE s.label = 'unknown' AND a.outcome = 'ok' AND `+triageSettled+` AND `+triageShared+`
+		ORDER BY CASE a.class WHEN 'hostile' THEN 0 WHEN 'suspicious' THEN 1 ELSE 2 END,
+		         `+floorHostile+` DESC, `+floorSuspicious+` DESC, `+num("m.summary->'prob'")+` DESC,
+		         s.created_at DESC, s.id DESC
+		LIMIT $3`,
 		queue, excluded, n)
 }
 
@@ -452,13 +541,23 @@ var sightedCandidate = `s.label IN ('good', 'unknown', 'sighted') AND ` + triage
 // sighted: every file a malicious or suspicious claim names, newest claim
 // first, to verify the claim (covers() decides which releases a claim
 // names). Files sighted-pinned serves are left to it.
+//
+// A file only the tria.ge sandbox accuses (sandboxSource) comes after every
+// other: a sandbox verdict on whatever someone submitted for detonation is the
+// weakest claim the ledger holds, and on 2026-11-28 it was the only claim on
+// 23,554 of the 37,883 digest-claimed files here, so newest-first served
+// almost nothing else. Any other claim on the same file lifts it.
 func sighted(ctx context.Context, st *Store, queue string, n int, excluded [][]byte, _ int) ([]int64, error) {
 	const files = ` JOIN verdicts a ON a.sample_id = s.id AND a.scanner_id = 1 LEFT JOIN scans sc ON sc.sample_id = s.id`
+	digest := `SELECT x.id, g.first_seen FROM sightings g
+			CROSS JOIN LATERAL (SELECT s.id FROM samples s` + files + `
+				WHERE s.sha256 = decode(g.subject, 'hex') AND ` + sightedCandidate + `) x
+			WHERE g.claim IN ('malicious', 'suspicious') AND NOT starts_with(g.subject, 'pkg:') AND g.subject ~ '^[0-9a-f]{64}$'`
 	return st.sampleIDs(ctx, `WITH digests AS (
-			SELECT x.id, g.first_seen FROM sightings g
-			CROSS JOIN LATERAL (SELECT s.id FROM samples s`+files+`
-				WHERE s.sha256 = decode(g.subject, 'hex') AND `+sightedCandidate+`) x
-			WHERE g.claim IN ('malicious', 'suspicious') AND NOT starts_with(g.subject, 'pkg:') AND g.subject ~ '^[0-9a-f]{64}$'
+			`+digest+` AND g.source <> $5
+			ORDER BY g.first_seen DESC LIMIT $3::int + $4::int
+		), sandbox AS (
+			`+digest+` AND g.source = $5
 			ORDER BY g.first_seen DESC LIMIT $3::int + $4::int
 		), packages AS (
 			SELECT x.id, g.first_seen FROM sightings g
@@ -468,16 +567,22 @@ func sighted(ctx context.Context, st *Store, queue string, n int, excluded [][]b
 			WHERE g.claim IN ('malicious', 'suspicious') AND starts_with(g.subject, 'pkg:')
 			ORDER BY g.first_seen DESC LIMIT $3::int + $4::int
 		), latest AS (
-			SELECT DISTINCT ON (id) id, first_seen FROM (SELECT id, first_seen FROM digests UNION ALL SELECT id, first_seen FROM packages) u
-			ORDER BY id, first_seen DESC
+			SELECT DISTINCT ON (id) id, sandboxed, first_seen FROM (
+				SELECT id, false AS sandboxed, first_seen FROM digests
+				UNION ALL SELECT id, false, first_seen FROM packages
+				UNION ALL SELECT id, true, first_seen FROM sandbox) u
+			ORDER BY id, sandboxed, first_seen DESC
 		)
 		SELECT l.id FROM latest l JOIN samples s ON s.id = l.id
 		WHERE NOT EXISTS (SELECT 1 FROM names n JOIN sightings sp ON sp.subject = n.name
 		                  WHERE n.id = s.name_id AND sp.claim IN ('malicious', 'suspicious')
 		                    AND s.version = ANY (exact_versions(sp.affected)) AND sp.first_seen > now() - interval '24 hours')
-		ORDER BY l.first_seen DESC, s.created_at DESC, s.id DESC LIMIT $3`,
-		queue, excluded, n, sightedOverfetch)
+		ORDER BY l.sandboxed, l.first_seen DESC, s.created_at DESC, s.id DESC LIMIT $3`,
+		queue, excluded, n, sightedOverfetch, sandboxSource)
 }
+
+// sandboxSource is the tria.ge sandbox's name in the sightings ledger.
+const sandboxSource = "triage"
 
 // sightedPinnedFiles is sighted-pinned's membership, c: every file the queue
 // would hand out, with when its earliest exact-version claim of the last day
