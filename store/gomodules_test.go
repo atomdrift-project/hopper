@@ -19,7 +19,7 @@ func TestQueueGoModules(t *testing.T) {
 	}
 	// Stored in this order, so ids rise down the list: "newest" is last.
 	world(ctx, t, st,
-		with(goZip("typed", 30*hour), func(f *fixture) { f.fileType = "go_module" }), // the first go_module scan
+		with(goZip("typed", 48*hour), func(f *fixture) { f.fileType = "go_module" }), // already retyped
 		goZip("oldest", 48*hour),
 		goZip("middle", 48*hour),
 		goZip("rescanned", hour), // scanned since the cutoff
@@ -31,14 +31,7 @@ func TestQueueGoModules(t *testing.T) {
 	)
 	enqueue(ctx, t, st, QueueNew, digestOf("already queued"))
 
-	start, ok, err := st.GoModuleScanStart(ctx)
-	if err != nil || !ok {
-		t.Fatalf("GoModuleScanStart: %v, ok %t", err, ok)
-	}
-	if d := time.Since(start); d < 29*hour || d > 31*hour {
-		t.Fatalf("scan start %v ago, want the go_module file's 30h", d.Round(time.Minute))
-	}
-
+	start := time.Now().Add(-30 * hour) // the cutoff
 	matched, err := st.QueueGoModules(ctx, start, 0, true)
 	if err != nil || matched != 3 {
 		t.Fatalf("dry run matched %d, %v; want oldest, middle and newest", matched, err)
@@ -62,15 +55,6 @@ func TestQueueGoModules(t *testing.T) {
 	}
 	if n, err = st.QueueGoModules(ctx, start, 10, false); err != nil || n != 0 {
 		t.Errorf("rerun queued %d, %v; want 0", n, err)
-	}
-}
-
-func TestGoModuleScanStartNone(t *testing.T) {
-	st := open(t)
-	ctx := t.Context()
-	world(ctx, t, st, with(base("zip", "unknown"), func(f *fixture) { f.fileType, f.pkg = "zip", "pkg:golang/example.com/m" }))
-	if _, ok, err := st.GoModuleScanStart(ctx); err != nil || ok {
-		t.Fatalf("GoModuleScanStart with no go_module file: ok %t, %v; want ok false", ok, err)
 	}
 }
 

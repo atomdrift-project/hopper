@@ -16,33 +16,34 @@ import (
 	"time"
 )
 
-// goNamed selects the samples published under a Go module name. names is a
-// few million rows, so filtering it whole and joining samples_name from the
-// survivors is cheaper than any walk of samples.
-const goNamed = `FROM names n
-	JOIN samples s ON s.name_id = n.id
+// GoModuleRollout is when the fleet's scan had come to recognize go_module, and
+// the default cutoff for QueueGoModules. Measured on galadriel 2026-11-28 over
+// Go-named top-level files, by week of last scan: go_module first appears the
+// week of 2026-10-19 (bar one in July), and from the week of 2026-11-02 only a
+// few hundred a week are still typed zip, against tens of thousands of
+// go_module. Since 2026-11-16, engine 3.x typed 456k go_module and ~320 zip.
+//
+// A fixed date, not one derived per run: a zip that is not a module is
+// rescanned once, and only a cutoff that stays put keeps its new scan from
+// matching again. Nor the earliest go_module scan: bare go.mod files are typed
+// go_module too, and one from July would put the cutoff before nearly every
+// zip.
+var GoModuleRollout = time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
+
+// goZips selects the scanned samples published under a Go module name and
+// typed zip.
+//
+// One samples_name probe per Go name (~314k of ~4.3M names, 2.6M samples).
+// OFFSET 0 keeps the subquery from being flattened: flattened, the planner
+// misjudges how many samples a name holds and merge-joins names against the
+// whole of samples_name in name order, reading samples rows of every name
+// in between. On galadriel that ran past three minutes; probing per name,
+// a full count takes 40-95s.
+const goZips = `FROM names n
+	CROSS JOIN LATERAL (SELECT s.id FROM samples s
+		WHERE s.name_id = n.id AND s.file_type = 'zip' OFFSET 0) s
 	JOIN scans sc ON sc.sample_id = s.id
 	WHERE starts_with(n.name, 'pkg:golang/')`
-
-// GoModuleScanStart returns the earliest last scan of any Go-named file typed
-// go_module: an estimate of when the fleet began recognizing the type. ok is
-// false when there is none, meaning no worker's scan recognizes it yet.
-//
-// The estimate only errs late, since the earliest such file may have been
-// scanned again since, and late is the safe side: a zip scanned between the
-// true rollout and this time is rescanned once for nothing, and its new scan
-// then puts it past the cutoff for good.
-func (st *Store) GoModuleScanStart(ctx context.Context) (t time.Time, ok bool, err error) {
-	var at *time.Time
-	if err := st.pool.QueryRow(ctx, `SELECT min(sc.scanned_at) `+goNamed+`
-		AND s.file_type = 'go_module'`).Scan(&at); err != nil {
-		return time.Time{}, false, fmt.Errorf("store: go_module scan start: %w", err)
-	}
-	if at == nil {
-		return time.Time{}, false, nil
-	}
-	return at.UTC(), true, nil
-}
 
 // QueueGoModules queues as QueueRequested up to limit Go-named files still
 // typed "zip" whose last scan predates before, newest first, and returns how
@@ -63,8 +64,8 @@ func (st *Store) QueueGoModules(ctx context.Context, before time.Time, limit int
 	if before.IsZero() {
 		return 0, errors.New("store: queue go modules: no cutoff")
 	}
-	const candidates = goNamed + `
-		AND s.file_type = 'zip' AND sc.scanned_at < $1
+	const candidates = goZips + `
+		AND sc.scanned_at < $1
 		AND EXISTS (SELECT 1 FROM locations l WHERE l.sample_id = s.id)
 		AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.sample_id = s.id)`
 	if dryRun {

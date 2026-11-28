@@ -4913,7 +4913,7 @@ func cmdRescan(ctx context.Context) error {
 	types := f.String("types", "", "with --pre-ident: comma-separated file_type filter, e.g. pe,macho,elf (empty = every type)")
 	goModules := f.Bool("go-modules", false, "queue Go-named files still typed zip, scanned before go_module was recognized, as operator rescans in the verdict store")
 	limit := f.Int("limit", 1000, "with --go-modules: queue at most this many files, newest first")
-	before := f.String("before", "", "with --go-modules: scan cutoff, RFC3339 or YYYY-MM-DD (default: earliest go_module scan on record)")
+	before := f.String("before", store.GoModuleRollout.Format(time.DateOnly), "with --go-modules: queue only files last scanned before this, RFC3339 or YYYY-MM-DD (default: when the fleet came to recognize go_module); keep it fixed across runs")
 	storeSchema := f.String("store", "verdict", "with --go-modules: schema holding the verdict tables")
 	dryRun := f.Bool("dry-run", false, "with --pre-ident or --go-modules: count matching rows without queueing them")
 	parseFlags(f, os.Args[2:])
@@ -4989,28 +4989,18 @@ func cmdRescan(ctx context.Context) error {
 	return nil
 }
 
-// rescanGoModules runs rescan --go-modules. Without --before it refuses to run
-// until some Go-named file has been typed go_module: none means no worker's
-// scan recognizes the type, so every rescan would store "zip" again and move
-// the file past the cutoff, out of reach of any later run.
+// rescanGoModules runs rescan --go-modules. The cutoff must not move between
+// runs: a zip that is not a module is rescanned once, and its new scan keeps it
+// out of later runs only while it is later than the cutoff (store.GoModuleRollout).
 func rescanGoModules(ctx context.Context, st *store.Store, before string, limit int, dryRun bool) error {
-	var cutoff time.Time
-	if before != "" {
-		var err error
-		if cutoff, err = time.Parse(time.RFC3339, before); err != nil {
-			if cutoff, err = time.Parse(time.DateOnly, before); err != nil {
-				return fmt.Errorf("rescan: --before %q: want RFC3339 or YYYY-MM-DD", before)
-			}
+	cutoff, err := time.Parse(time.RFC3339, before)
+	if err != nil {
+		if cutoff, err = time.Parse(time.DateOnly, before); err != nil {
+			return fmt.Errorf("rescan: --before %q: want RFC3339 or YYYY-MM-DD", before)
 		}
-	} else {
-		start, ok, err := st.GoModuleScanStart(ctx)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return errors.New("rescan: no Go-named file is typed go_module yet, so no worker's scan recognizes it; upgrade the fleet first, or pass --before")
-		}
-		cutoff = start
+	}
+	if cutoff.After(time.Now()) {
+		return fmt.Errorf("rescan: --before %s is in the future", before)
 	}
 	if !dryRun && limit <= 0 {
 		return fmt.Errorf("rescan: --limit must be positive, got %d", limit)
